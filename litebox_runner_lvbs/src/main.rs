@@ -410,7 +410,7 @@ unsafe extern "C" fn common_start(is_bsp: bool) -> ! {
 /// context set up by `hvcall_enable_vp_vtl`.
 #[expect(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn _start() -> ! {
+pub unsafe extern "C" fn _start(possible_cpus: u64, mem_pa: u64, mem_size: u64) -> ! {
     unsafe {
         // Phase 1a: Fix GOT entries from link-time (base 0x0) to PA-based VAs.
         // The binary is linked at address 0x0 but loaded by VTL0 at an arbitrary
@@ -418,8 +418,9 @@ pub unsafe extern "C" fn _start() -> ! {
         // that globals and function pointers resolve correctly under the
         // identity map (VA == PA) that VTL0 left us with.
         apply_relocations();
-
+        parse_boot_info(possible_cpus as u32, mem_pa, mem_size);
         remap_to_high_canonical();
+        
     }
 }
 
@@ -428,8 +429,6 @@ unsafe extern "C" fn kernel_main(is_bsp: bool) -> ! {
         serial_println!("==============================");
         serial_println!(" Hello from LiteBox for LVBS! ");
         serial_println!("==============================");
-
-        parse_boot_info();
     }
 
     let platform = litebox_runner_lvbs::init(is_bsp);
