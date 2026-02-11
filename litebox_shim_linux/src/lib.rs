@@ -291,6 +291,10 @@ impl<FS: ShimFS> LinuxShim<FS> {
     ) -> Result<transport::ShimTransport, Errno> {
         transport::ShimTransport::connect(self.0.clone(), addr)
     }
+
+    pub fn litebox(&self) -> &LiteBox<Platform> {
+        &self.0.litebox
+    }
 }
 
 pub struct LoadedProgram<FS: ShimFS> {
