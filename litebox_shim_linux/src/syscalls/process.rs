@@ -508,6 +508,11 @@ fn wake_robust_list(
 impl<FS: ShimFS> Task<FS> {
     /// Called when the task is exiting.
     pub(crate) fn prepare_for_exit(&mut self) {
+        // If this is a vfork child, unblock the parent before tearing down.
+        if let Some(fc) = &self.fork_context {
+            fc.vfork_done.signal();
+        }
+
         self.thread.detach_from_process();
 
         if let Some(clear_child_tid) = self.thread.clear_child_tid.take() {
@@ -819,7 +824,6 @@ impl<FS: ShimFS> Task<FS> {
 
         // Supported flags for the fork path. Reject anything else.
         let fork_supported_flags = CloneFlags::VFORK
-            | CloneFlags::PARENT
             // Ignored since we don't support sysv semaphores anyway.
             | CloneFlags::SYSVSEM;
         if flags.intersects(!fork_supported_flags) {
@@ -860,7 +864,11 @@ impl<FS: ShimFS> Task<FS> {
         // 3. Allocate a TID for the child (also serves as PID on the guest side).
         let child_tid = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);
 
-        // 4. Create the child Task with vfork sharing: uses the parent's
+        // 4. Create the vfork synchronization primitive. The parent will block
+        //    on this after spawning the child; the child signals it on exec/exit.
+        let vfork_done = Arc::new(crate::VforkDone::new(self.wait_cx().waker().clone()));
+
+        // 5. Create the child Task with vfork sharing: uses the parent's
         //    ProcessState temporarily. The child's own partition is recorded in
         //    ForkContext for later use by execve().
         let child_thread = ThreadState::new_process(child_tid);
@@ -890,6 +898,7 @@ impl<FS: ShimFS> Task<FS> {
                         signals: self.signals.clone_for_new_task(),
                         fork_context: Some(crate::ForkContext {
                             address_space_id: child_as_id,
+                            vfork_done: vfork_done.clone(),
                         }),
                     },
                 }),
@@ -906,7 +915,12 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::ENOMEM);
         }
 
-        // TODO (Step 2.4c): block parent here (vfork semantics).
+        // 6. Block parent until child execs or exits (vfork semantics).
+        //    Like Linux's TASK_UNINTERRUPTIBLE wait: keep blocking even if
+        //    interrupted, because parent and child share the same guest stack.
+        while !vfork_done.is_done() {
+            let _ = self.wait_cx().wait_until(|| vfork_done.is_done());
+        }
 
         // Parent returns child's PID.
         Ok(usize::try_from(child_tid).unwrap())
