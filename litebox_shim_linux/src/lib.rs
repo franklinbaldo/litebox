@@ -200,14 +200,24 @@ impl<FS: ShimFS> LinuxShimBuilder<FS> {
     /// Panics if the file system has not been set with [`set_fs`](Self::set_fs)
     /// before calling this method.
     pub fn build(self) -> LinuxShim<FS> {
+        use litebox::platform::AddressSpaceProvider;
+
         let mut net = Network::new(&self.litebox);
         net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
+
+        // Allocate the init process's address space (slot 0 on userland).
+        let init_as_id = self
+            .platform
+            .create_address_space()
+            .expect("init process address space allocation must succeed");
+        let as_range = self
+            .platform
+            .address_space_range(init_as_id)
+            .expect("init address space range must be valid");
+
         let process_state = Arc::new(ProcessState {
-            pm: PageManager::new(
-                &self.litebox,
-                <Platform as litebox::platform::PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MIN
-                    ..<Platform as litebox::platform::PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MAX,
-            ),
+            pm: PageManager::new(&self.litebox, as_range),
+            address_space_id: init_as_id,
         });
         let global = Arc::new(GlobalState {
             platform: self.platform,
@@ -288,6 +298,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
+                fork_context: None,
             },
         };
         entrypoints.task.load_program(
@@ -1260,6 +1271,21 @@ struct GlobalState<FS: ShimFS> {
 struct ProcessState {
     /// The page manager for managing this process's virtual memory.
     pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
+    /// The address space ID for this process (VA partition on userland).
+    address_space_id: <Platform as litebox::platform::AddressSpaceProvider>::AddressSpaceId,
+}
+
+/// Context for a vfork child process.
+///
+/// Stored in the child's `Task` after `do_fork`. The child temporarily uses
+/// the **parent's** `ProcessState` (vfork sharing). When the child calls
+/// `execve()`, it creates its own `ProcessState` using the partition range
+/// from `address_space_id`. When it calls `_exit()`, the partition is released.
+#[expect(dead_code, reason = "fields used in Steps 2.4c / 2.5")]
+struct ForkContext {
+    /// The child's own address space ID (VA partition on userland).
+    address_space_id: <Platform as litebox::platform::AddressSpaceProvider>::AddressSpaceId,
+    // TODO (Step 2.4c): vfork_done synchronization primitive to unblock parent.
 }
 
 struct Task<FS: ShimFS> {
@@ -1287,6 +1313,13 @@ struct Task<FS: ShimFS> {
     files: RefCell<Arc<syscalls::file::FilesState<FS>>>,
     /// Signal state
     signals: syscalls::signal::SignalState,
+    /// Fork context for vfork children. `None` for the initial process and
+    /// for threads. Set when `do_fork` creates a child process.
+    #[expect(
+        dead_code,
+        reason = "read in Steps 2.4c / 2.5 for execve and vfork_done"
+    )]
+    fork_context: Option<ForkContext>,
 }
 
 impl<FS: ShimFS> Drop for Task<FS> {
@@ -1328,6 +1361,7 @@ mod test_utils {
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
+                fork_context: None,
                 process_state: self.process_state,
                 global: self.global,
             }
@@ -1355,6 +1389,7 @@ mod test_utils {
                 fs: self.fs.clone(),
                 files: self.files.clone(),
                 signals: self.signals.clone_for_new_task(),
+                fork_context: None,
             };
             Some(task)
         }
