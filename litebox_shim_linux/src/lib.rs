@@ -739,6 +739,18 @@ impl<FS: ShimFS> Task<FS> {
                 self.sys_exit_group(status);
                 Ok(0)
             }
+            SyscallRequest::Wait4 {
+                pid,
+                wstatus,
+                options,
+                rusage,
+            } => self.sys_wait4(pid, wstatus, options, rusage),
+            SyscallRequest::Waitid {
+                idtype,
+                id,
+                infop,
+                options,
+            } => self.sys_waitid(idtype, id, infop, options),
             SyscallRequest::Execve {
                 pathname,
                 argv,

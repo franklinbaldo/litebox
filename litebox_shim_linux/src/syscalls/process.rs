@@ -515,6 +515,33 @@ impl<FS: ShimFS> Task<FS> {
 
         self.thread.detach_from_process();
 
+        // If this was the last thread in the process, notify the core registry
+        // and release the VA partition.
+        if self.thread.process.nr_threads() == 0 {
+            use litebox::platform::AddressSpaceProvider;
+
+            let exit_status = {
+                let inner = self.thread.process.inner.lock();
+                match inner.exit_status {
+                    ExitStatus::Exit(code) => i32::from(code),
+                    ExitStatus::Signal(sig) => sig.as_i32() + 128,
+                }
+            };
+            self.global
+                .litebox
+                .process_registry()
+                .exit_process(self.process_id, exit_status);
+
+            // Release the process's VA partition. For a vfork child that
+            // hasn't exec'd, destroy the child's reserved partition (from
+            // fork_context), not the parent's shared ProcessState.
+            let as_id = match self.fork_context.get_mut() {
+                Some(fc) => fc.address_space_id,
+                None => self.process_state.borrow().address_space_id,
+            };
+            let _ = self.global.platform.destroy_address_space(as_id);
+        }
+
         if let Some(clear_child_tid) = self.thread.clear_child_tid.take() {
             // Clear the child TID if requested
             // TODO: if we are the last thread, we don't need to clear it
@@ -541,6 +568,153 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_exit_group(&self, status: i32) {
         // Tear down occurs similarly to `sys_exit`.
         self.exit_group(ExitStatus::Exit(status.truncate()));
+    }
+
+    /// Handle syscall `wait4`.
+    ///
+    /// `wait4(pid, wstatus, options, rusage)`:
+    /// - `pid > 0`: wait for specific child
+    /// - `pid == -1`: wait for any child
+    /// - `pid == 0`: wait for any child in same process group
+    /// - `pid < -1`: wait for any child in process group `-pid`
+    pub(crate) fn sys_wait4(
+        &self,
+        pid: i32,
+        wstatus: Option<crate::MutPtr<i32>>,
+        options: i32,
+        _rusage: Option<crate::MutPtr<u8>>,
+    ) -> Result<usize, Errno> {
+        use litebox::process::{ProcessId, WaitOptions, WaitTarget};
+
+        let target = match pid {
+            p if p > 0 => WaitTarget::Pid(ProcessId(p.try_into().map_err(|_| Errno::EINVAL)?)),
+            -1 => WaitTarget::AnyChild,
+            0 => {
+                // Same process group — for now, treat as any child.
+                WaitTarget::AnyChild
+            }
+            p => {
+                let group_id = (-p).try_into().map_err(|_| Errno::EINVAL)?;
+                WaitTarget::ProcessGroup(litebox::process::ProcessGroupId(group_id))
+            }
+        };
+
+        let wait_options = WaitOptions::from_bits(options.cast_unsigned()).ok_or_else(|| {
+            log_unsupported!("wait4 with unsupported options: {:#x}", options);
+            Errno::EINVAL
+        })?;
+
+        let result = self.global.litebox.process_registry().wait_for_child(
+            self.process_id,
+            target,
+            wait_options,
+        );
+
+        match result {
+            Ok(wr) => {
+                if let Some(ptr) = wstatus {
+                    // Encode status as Linux wait status: (exit_code & 0xff) << 8
+                    let encoded = (wr.status & 0xff) << 8;
+                    let _ = ptr.write_at_offset(0, encoded);
+                }
+                Ok(wr.pid.0 as usize)
+            }
+            Err(litebox::process::WaitError::WouldBlock) => Ok(0),
+            Err(
+                litebox::process::WaitError::NoChildren
+                | litebox::process::WaitError::NoSuchProcess,
+            ) => Err(Errno::ECHILD),
+        }
+    }
+
+    /// Handle syscall `waitid`.
+    ///
+    /// `waitid(idtype, id, infop, options)`:
+    /// - `idtype == P_PID`: wait for child with PID `id`
+    /// - `idtype == P_PGID`: wait for child in process group `id`
+    /// - `idtype == P_ALL`: wait for any child
+    pub(crate) fn sys_waitid(
+        &self,
+        idtype: u32,
+        id: u32,
+        infop: Option<crate::MutPtr<u8>>,
+        options: i32,
+    ) -> Result<usize, Errno> {
+        use litebox::process::{ProcessId, WaitOptions, WaitTarget};
+
+        const P_PID: u32 = 1;
+        const P_PGID: u32 = 2;
+        const P_ALL: u32 = 0;
+        // waitid uses WEXITED (4) to wait for exited children.
+        const WEXITED: u32 = 4;
+        const WNOWAIT: u32 = 0x0100_0000;
+
+        let target = match idtype {
+            P_PID => WaitTarget::Pid(ProcessId(id)),
+            P_PGID => WaitTarget::ProcessGroup(litebox::process::ProcessGroupId(id)),
+            P_ALL => WaitTarget::AnyChild,
+            _ => return Err(Errno::EINVAL),
+        };
+
+        // Map waitid options to WaitOptions. waitid uses WEXITED instead of
+        // an implicit "wait for exit".
+        let raw_opts = options.cast_unsigned();
+        if raw_opts & WNOWAIT != 0 {
+            log_unsupported!("waitid with WNOWAIT");
+            return Err(Errno::EINVAL);
+        }
+        if raw_opts & WEXITED == 0 {
+            // Not waiting for exited children — we only support WEXITED.
+            log_unsupported!("waitid without WEXITED");
+            return Err(Errno::EINVAL);
+        }
+        let mut wait_options = WaitOptions::empty();
+        if raw_opts & WaitOptions::WNOHANG.bits() != 0 {
+            wait_options |= WaitOptions::WNOHANG;
+        }
+
+        let result = self.global.litebox.process_registry().wait_for_child(
+            self.process_id,
+            target,
+            wait_options,
+        );
+
+        match result {
+            Ok(wr) => {
+                // Fill siginfo_t structure at infop if provided.
+                // siginfo_t is 128 bytes on x86_64. We fill the relevant fields:
+                //   si_signo (offset 0, i32) = SIGCHLD (17)
+                //   si_errno (offset 4, i32) = 0
+                //   si_code  (offset 8, i32) = CLD_EXITED (1)
+                //   si_pid   (offset 12, i32) = child pid
+                //   si_uid   (offset 16, i32) = 0
+                //   si_status(offset 20, i32) = exit status
+                if let Some(ptr) = infop {
+                    const SIGCHLD: i32 = 17;
+                    const CLD_EXITED: i32 = 1;
+                    let si_ptr: crate::MutPtr<i32> = crate::MutPtr::from_usize(ptr.as_usize());
+                    let _ = si_ptr.write_at_offset(0, SIGCHLD); // si_signo
+                    let _ = si_ptr.write_at_offset(1, 0); // si_errno
+                    let _ = si_ptr.write_at_offset(2, CLD_EXITED); // si_code
+                    let _ = si_ptr.write_at_offset(3, wr.pid.0.cast_signed()); // si_pid
+                    let _ = si_ptr.write_at_offset(4, 0); // si_uid
+                    let _ = si_ptr.write_at_offset(5, wr.status); // si_status
+                }
+                Ok(0) // waitid returns 0 on success
+            }
+            Err(litebox::process::WaitError::WouldBlock) => {
+                // WNOHANG: zero out infop and return 0.
+                if let Some(ptr) = infop {
+                    let si_ptr: crate::MutPtr<i32> = crate::MutPtr::from_usize(ptr.as_usize());
+                    let _ = si_ptr.write_at_offset(0, 0); // si_signo = 0
+                }
+                Ok(0)
+            }
+            Err(
+                litebox::process::WaitError::NoChildren
+                | litebox::process::WaitError::NoSuchProcess,
+            ) => Err(Errno::ECHILD),
+        }
     }
 }
 

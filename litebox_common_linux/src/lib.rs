@@ -2264,6 +2264,18 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         new_value: Platform::RawConstPointer<ItimerVal>,
         old_value: Option<Platform::RawMutPointer<ItimerVal>>,
     },
+    Wait4 {
+        pid: i32,
+        wstatus: Option<Platform::RawMutPointer<i32>>,
+        options: i32,
+        rusage: Option<Platform::RawMutPointer<u8>>,
+    },
+    Waitid {
+        idtype: u32,
+        id: u32,
+        infop: Option<Platform::RawMutPointer<u8>>,
+        options: i32,
+    },
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
@@ -2517,6 +2529,8 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::getpeername => sys_req!(Getpeername { sockfd, addr:*, addrlen:* }),
             Sysno::exit => sys_req!(Exit { status }),
             Sysno::exit_group => sys_req!(ExitGroup { status }),
+            Sysno::wait4 => sys_req!(Wait4 { pid, wstatus:*, options, rusage:* }),
+            Sysno::waitid => sys_req!(Waitid { idtype, id, infop:*, options }),
             Sysno::uname => sys_req!(Uname { buf:* }),
             Sysno::fcntl => {
                 let cmd: i32 = ctx.sys_req_arg(1);
