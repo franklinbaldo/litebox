@@ -103,6 +103,7 @@ impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
             if unsafe {
                 self.task
                     .process_state
+                    .borrow()
                     .pm
                     .handle_page_fault(info.cr2, info.error_code.into())
             }
@@ -279,7 +280,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.global.clone(),
-                process_state: self.process_state.clone(),
+                process_state: self.process_state.clone().into(),
                 thread: syscalls::process::ThreadState::new_process(pid),
                 wait_state: wait::WaitState::new(self.global.platform),
                 process_id: litebox::process::ProcessId::INIT,
@@ -297,7 +298,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
-                fork_context: None,
+                fork_context: RefCell::new(None),
             },
         };
         entrypoints.task.load_program(
@@ -1300,7 +1301,6 @@ impl VforkDone {
 /// from `address_space_id`. When it calls `_exit()`, the partition is released.
 struct ForkContext {
     /// The child's own address space ID (VA partition on userland).
-    #[expect(dead_code, reason = "read in Step 2.5 for execve")]
     address_space_id: <Platform as litebox::platform::AddressSpaceProvider>::AddressSpaceId,
     /// Signals the parent to resume after the vfork child execs or exits.
     vfork_done: Arc<VforkDone>,
@@ -1309,7 +1309,9 @@ struct ForkContext {
 struct Task<FS: ShimFS> {
     global: Arc<GlobalState<FS>>,
     /// Per-process state shared across threads in the same process.
-    process_state: Arc<ProcessState>,
+    /// `RefCell` to support swapping to the child's own state on `execve`
+    /// after a vfork.
+    process_state: RefCell<Arc<ProcessState>>,
     wait_state: wait::WaitState,
     thread: syscalls::process::ThreadState,
     /// The process identity from the core ProcessRegistry.
@@ -1332,8 +1334,9 @@ struct Task<FS: ShimFS> {
     /// Signal state
     signals: syscalls::signal::SignalState,
     /// Fork context for vfork children. `None` for the initial process and
-    /// for threads. Set when `do_fork` creates a child process.
-    fork_context: Option<ForkContext>,
+    /// for threads. Set when `do_fork` creates a child process. `RefCell`
+    /// because `sys_execve` consumes it via `take()` through `&self`.
+    fork_context: RefCell<Option<ForkContext>>,
 }
 
 impl<FS: ShimFS> Drop for Task<FS> {
@@ -1375,8 +1378,8 @@ mod test_utils {
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
-                fork_context: None,
-                process_state: self.process_state,
+                fork_context: RefCell::new(None),
+                process_state: self.process_state.into(),
                 global: self.global,
             }
         }
@@ -1403,7 +1406,7 @@ mod test_utils {
                 fs: self.fs.clone(),
                 files: self.files.clone(),
                 signals: self.signals.clone_for_new_task(),
-                fork_context: None,
+                fork_context: RefCell::new(None),
             };
             Some(task)
         }

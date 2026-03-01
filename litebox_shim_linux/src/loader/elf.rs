@@ -74,7 +74,7 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for ElfFile<'_, FS> {
     fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error> {
         // Use the process's VA range start as the hint so PIE binaries land
         // within the correct partition for child processes.
-        let hint = self.task.process_state.pm.addr_min();
+        let hint = self.task.process_state.borrow().pm.addr_min();
 
         // Allocate a mapping large enough that even if it's maximally misaligned we can
         // still fit `len` bytes.
@@ -206,7 +206,7 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
         mut aux: AuxVec,
     ) -> Result<ElfLoadInfo, ElfLoaderError> {
         let global = &self.main.file.task.global;
-        let process_state = &self.main.file.task.process_state;
+        let process_state = self.main.file.task.process_state.borrow();
 
         // Reject ET_EXEC binaries whose fixed load addresses fall outside the
         // process's VA partition (e.g., a child process in a higher slot).
