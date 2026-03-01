@@ -776,6 +776,7 @@ impl<FS: ShimFS> Task<FS> {
                         fs: fs.into(),
                         files: self.files.clone(), // TODO: !CLONE_FILES support
                         signals: self.signals.clone_for_new_task(),
+                        fork_context: None,
                     },
                 }),
             )
@@ -791,18 +792,24 @@ impl<FS: ShimFS> Task<FS> {
         Ok(usize::try_from(child_tid).unwrap())
     }
 
-    /// Fork path: create a new child process.
+    /// Fork path: create a new child process (vfork semantics on userland).
     ///
-    /// Currently a scaffold that returns `ENOSYS`. The full implementation
-    /// (child process creation, vfork blocking) is wired in Steps 2.4b/c.
-    #[expect(unused_variables, reason = "scaffold for Step 2.4b")]
+    /// The child temporarily shares the parent's `ProcessState` (PM, files,
+    /// signals, etc.). A VA partition is allocated for the child but remains
+    /// empty until `execve()` loads a new binary into it.
+    ///
+    /// **Note:** Step 2.4c adds parent blocking (vfork semantics). Until then,
+    /// both parent and child run concurrently on the same guest stack, which
+    /// is only safe if the child immediately calls `execve()` or `_exit()`.
     fn do_fork(
         &self,
         ctx: &litebox_common_linux::PtRegs,
         args: &litebox_common_linux::CloneArgs,
         flags: CloneFlags,
-        clone3: bool,
+        _clone3: bool,
     ) -> Result<usize, Errno> {
+        use litebox::platform::AddressSpaceProvider;
+
         // Linux clone flag compatibility: CLONE_SIGHAND requires CLONE_VM,
         // and CLONE_THREAD requires CLONE_SIGHAND. Since the fork path has
         // !CLONE_VM, neither SIGHAND nor THREAD may be set.
@@ -810,13 +817,99 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
 
-        litebox::log_println!(
-            self.global.platform,
-            "fork detected (flags={:?}, exit_signal={}), not yet implemented",
-            flags,
-            args.exit_signal
-        );
-        Err(Errno::ENOSYS)
+        // Supported flags for the fork path. Reject anything else.
+        let fork_supported_flags = CloneFlags::VFORK
+            | CloneFlags::PARENT
+            // Ignored since we don't support sysv semaphores anyway.
+            | CloneFlags::SYSVSEM;
+        if flags.intersects(!fork_supported_flags) {
+            log_unsupported!(
+                "fork with unsupported flags: {:?}",
+                flags & !fork_supported_flags
+            );
+            return Err(Errno::EINVAL);
+        }
+
+        // 1. Register child process in the core ProcessRegistry.
+        let exit_signal = i32::try_from(args.exit_signal).map_err(|_| Errno::EINVAL)?;
+        let child_process_id = self
+            .global
+            .litebox
+            .process_registry()
+            .create_process(Some(self.process_id), exit_signal)
+            .map_err(|_| Errno::ENOMEM)?;
+
+        // 2. Fork address space: allocate a VA partition for the child.
+        let parent_as_id = self.process_state.address_space_id;
+        let forked = self
+            .global
+            .platform
+            .fork_address_space(parent_as_id)
+            .map_err(|_| {
+                self.global
+                    .litebox
+                    .process_registry()
+                    .remove_process(child_process_id);
+                Errno::ENOMEM
+            })?;
+        let child_as_id = match forked {
+            litebox::platform::address_space::ForkedAddressSpace::SharedWithParent(id)
+            | litebox::platform::address_space::ForkedAddressSpace::Independent(id) => id,
+        };
+
+        // 3. Allocate a TID for the child (also serves as PID on the guest side).
+        let child_tid = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);
+
+        // 4. Create the child Task with vfork sharing: uses the parent's
+        //    ProcessState temporarily. The child's own partition is recorded in
+        //    ForkContext for later use by execve().
+        let child_thread = ThreadState::new_process(child_tid);
+        child_thread.init_state.set(ThreadInitState::NewThread {
+            stack: None, // vfork: use parent's stack
+            tls: None,   // inherit parent's TLS
+            set_child_tid: None,
+        });
+
+        let r = unsafe {
+            self.global.platform.spawn_thread(
+                ctx,
+                Box::new(NewThreadArgs {
+                    task: Task {
+                        global: self.global.clone(),
+                        process_state: self.process_state.clone(), // vfork: share parent's PM
+                        wait_state: crate::wait::WaitState::new(self.global.platform),
+                        thread: child_thread,
+                        process_id: child_process_id,
+                        pid: child_tid,
+                        ppid: self.pid,
+                        tid: child_tid,
+                        credentials: self.credentials.clone(),
+                        comm: self.comm.clone(),
+                        fs: self.fs.clone(),
+                        files: self.files.clone(),
+                        signals: self.signals.clone_for_new_task(),
+                        fork_context: Some(crate::ForkContext {
+                            address_space_id: child_as_id,
+                        }),
+                    },
+                }),
+            )
+        };
+
+        if let Err(err) = r {
+            litebox::log_println!(self.global.platform, "failed to spawn fork child: {}", err);
+            let _ = self.global.platform.destroy_address_space(child_as_id);
+            self.global
+                .litebox
+                .process_registry()
+                .remove_process(child_process_id);
+            return Err(Errno::ENOMEM);
+        }
+
+        // TODO (Step 2.4c): block parent here (vfork semantics).
+
+        // Parent returns child's PID.
+        Ok(usize::try_from(child_tid).unwrap())
     }
 
     /// Handle syscall `set_tid_address`.

@@ -296,6 +296,34 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
         Ok(new_pid)
     }
 
+    /// Remove a process that was never started (e.g., fork setup failed).
+    ///
+    /// This undoes [`create_process`](Self::create_process): removes the
+    /// process from its parent's child list and drops the entry. The process
+    /// must be in [`ProcessState::Running`] and have no children of its own.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` is not in the registry, has children, or is not `Running`.
+    pub fn remove_process(&self, id: ProcessId) {
+        let mut table = self.table.write();
+        let entry = table.remove(&id).expect("process must exist");
+        assert!(
+            matches!(entry.context.state, ProcessState::Running),
+            "can only remove a running process"
+        );
+        assert!(
+            entry.children.is_empty(),
+            "cannot remove a process with children"
+        );
+        // Remove from parent's child list.
+        if let Some(parent_pid) = entry.context.parent {
+            if let Some(parent_entry) = table.get_mut(&parent_pid) {
+                parent_entry.children.retain(|&c| c != id);
+            }
+        }
+    }
+
     /// Mark a process as exited with the given status.
     ///
     /// The process transitions to [`ProcessState::Zombie`]. Its children are
@@ -839,6 +867,20 @@ mod tests {
         // Second root should return an error.
         let result = registry.create_process(None, 0);
         assert_eq!(result, Err(CreateProcessError::InitAlreadyExists));
+    }
+
+    #[test]
+    fn test_remove_process_cleans_up() {
+        let (_platform, registry) = setup();
+        let parent = registry.create_process(None, 0).unwrap();
+        let child = registry.create_process(Some(parent), 17).unwrap();
+
+        // Remove the child before it starts running.
+        registry.remove_process(child);
+
+        // Parent should have no children to wait for.
+        let result = registry.wait_for_child(parent, WaitTarget::AnyChild, WaitOptions::WNOHANG);
+        assert_eq!(result, Err(WaitError::NoChildren));
     }
 
     #[test]
