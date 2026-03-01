@@ -129,7 +129,9 @@ FD table (per-process, `struct files_struct`):
 - Linux-style integer FD table mapping `fd: u32` → `Descriptor<FS>` enum
   variants (`LiteBoxRawFd`, `Eventfd`, `Epoll`, `Unix`).
 - `RawDescriptorStorage` bridges shim FD integers to core `TypedFd` handles.
-- Currently held via `RefCell<Arc<FilesState>>` in each `Task`.
+- Currently held via `RefCell<Arc<FilesState>>` in each `Task`. The
+  `RefCell` wrapper is correct (single-thread-per-task invariant) and does
+  not need changing.
 
 **FD resolution path:**
 `fd (u32)` → shim `Descriptor` → `RawDescriptorStorage` → core `TypedFd`
@@ -142,8 +144,10 @@ FD table (per-process, `struct files_struct`):
 - On `CLONE_FILES`: share the `Arc<FilesState>` (same FD table, like threads).
 - On `execve()`: close FDs marked `O_CLOEXEC` in the process's `FilesState`.
 
-**Required refactoring:** `FilesState` must change from `RefCell<Arc<...>>`
-to `Arc<RwLock<...>>` to support independent copies across processes.
+**Required refactoring:** `Descriptor`, `Descriptors`, `RawDescriptorStorage`,
+and `FilesState` must implement clone-for-fork semantics (sharing underlying
+`Arc` file objects while copying the FD-number mapping and `close_on_exec`
+flags).
 
 ### 2.4 Shared vs. Per-Process State
 
@@ -676,10 +680,12 @@ testing) without shim changes.
   handlers.
 
 **Step 1.2 — Per-process FD table (Shim)**
-- Change shim's `FilesState<FS>` from `RefCell<Arc<...>>` to
-  `Arc<RwLock<...>>` to support independent copies across processes.
-- Thread "current process" through FD syscall handlers to resolve the
-  per-process `FilesState` instead of a shared one.
+- Implement `clone_for_fork()` on `FilesState<FS>`, `Descriptors<FS>`,
+  `Descriptor<FS>`, and `RawDescriptorStorage` — sharing underlying `Arc`
+  file objects (POSIX shared-file-description semantics) while copying the
+  FD-number mapping and `close_on_exec` flags.
+- The `RefCell<Arc<FilesState>>` wrapper in `Task` is correct as-is
+  (single-thread-per-task invariant holds) — no change needed.
 - Core `Descriptors<Platform>` stays in `LiteBoxX` (global open-file-object
   registry) — **no extraction needed**.
 
@@ -750,11 +756,13 @@ for it, and get its exit status. This is the "run a shell command" milestone.
 - Stack setup (argv, envp, auxv) targets the child's address space.
 
 **Step 2.4 — sys_fork / sys_clone wiring (Shim)**
+- Thread "current process" (`ProcessId`) through FD and other syscall
+  handlers to resolve per-process state instead of a shared one.
 - Detect fork-like `clone()` calls (no `CLONE_VM`, no `CLONE_THREAD`).
 - Create child process via core (`ProcessRegistry::create_child`).
 - Fork address space via platform (`fork_address_space`).
-- Clone `FilesState` (shared `DescriptorEntry` Arc references — POSIX
-  file description sharing).
+- Clone `FilesState` via `clone_for_fork()` (shared `DescriptorEntry` Arc
+  references — POSIX file description sharing).
 - Copy signal dispositions, store `exit_signal`.
 - On userland: parent blocked (vfork semantics) until child execs/exits.
 - On kernel (`Independent`): both run concurrently.

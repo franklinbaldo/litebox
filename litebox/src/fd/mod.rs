@@ -517,6 +517,15 @@ struct StoredFd {
     x: Arc<OwnedFd>,
     subsystem_entry_type_id: core::any::TypeId,
 }
+
+impl Clone for StoredFd {
+    fn clone(&self) -> Self {
+        Self {
+            x: Arc::clone(&self.x),
+            subsystem_entry_type_id: self.subsystem_entry_type_id,
+        }
+    }
+}
 impl StoredFd {
     fn new<Subsystem: FdEnabledSubsystem>(fd: TypedFd<Subsystem>) -> Self {
         Self {
@@ -535,6 +544,16 @@ impl RawDescriptorStorage {
     /// Create a new raw descriptor store.
     pub fn new() -> Self {
         Self { stored_fds: vec![] }
+    }
+
+    /// Clone the descriptor storage for `fork()`.
+    ///
+    /// The underlying file objects are shared via `Arc`, matching POSIX
+    /// shared-file-description semantics after fork.
+    pub fn clone_for_fork(&self) -> Self {
+        Self {
+            stored_fds: self.stored_fds.clone(),
+        }
     }
 
     /// Get the corresponding integer value of the provided `fd`.
