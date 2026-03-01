@@ -594,7 +594,9 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Creates a new thread or process.
     ///
-    /// Note we currently only support creating threads with the VM, FS, and FILES flags set.
+    /// Thread creation requires `CLONE_VM | CLONE_THREAD | CLONE_SIGHAND | CLONE_FILES`.
+    /// Fork-like calls (`!CLONE_VM && !CLONE_THREAD`) create a new process
+    /// (currently returns `ENOSYS` — wired in Step 2.4b).
     fn do_clone(
         &self,
         ctx: &litebox_common_linux::PtRegs,
@@ -623,7 +625,31 @@ impl<FS: ShimFS> Task<FS> {
             flags.remove(CloneFlags::DETACHED);
         }
 
-        let required_clone_flags =
+        if cgroup != 0 {
+            log_unsupported!("clone with cgroup");
+            return Err(Errno::EINVAL);
+        }
+
+        if set_tid != 0 || set_tid_size != 0 {
+            log_unsupported!("clone with set_tid");
+            return Err(Errno::EINVAL);
+        }
+
+        // Note `exit_signal` is ignored for threads; validated for fork.
+        if exit_signal > MAX_SIGNAL_NUMBER {
+            return Err(Errno::EINVAL);
+        }
+
+        // Detect fork-like clone: new process (!CLONE_VM, !CLONE_THREAD).
+        let is_fork = !flags.contains(CloneFlags::VM) && !flags.contains(CloneFlags::THREAD);
+
+        if is_fork {
+            return self.do_fork(ctx, args, flags, clone3);
+        }
+
+        // --- Thread clone path (existing behavior) ---
+
+        let thread_required_flags =
             CloneFlags::VM | CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::FILES;
 
         let supported_clone_flags = CloneFlags::VM
@@ -646,26 +672,11 @@ impl<FS: ShimFS> Task<FS> {
             );
             return Err(Errno::EINVAL);
         }
-        if !flags.contains(required_clone_flags) {
+        if !flags.contains(thread_required_flags) {
             log_unsupported!(
                 "clone with missing required flags: {:?}",
-                required_clone_flags & !flags
+                thread_required_flags & !flags
             );
-            return Err(Errno::EINVAL);
-        }
-
-        if cgroup != 0 {
-            log_unsupported!("clone with cgroup");
-            return Err(Errno::EINVAL);
-        }
-
-        if set_tid != 0 || set_tid_size != 0 {
-            log_unsupported!("clone with set_tid");
-            return Err(Errno::EINVAL);
-        }
-
-        // Note `exit_signal` is ignored because we don't support `fork` yet; we just validate it.
-        if exit_signal > MAX_SIGNAL_NUMBER {
             return Err(Errno::EINVAL);
         }
 
@@ -778,6 +789,34 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         Ok(usize::try_from(child_tid).unwrap())
+    }
+
+    /// Fork path: create a new child process.
+    ///
+    /// Currently a scaffold that returns `ENOSYS`. The full implementation
+    /// (child process creation, vfork blocking) is wired in Steps 2.4b/c.
+    #[expect(unused_variables, reason = "scaffold for Step 2.4b")]
+    fn do_fork(
+        &self,
+        ctx: &litebox_common_linux::PtRegs,
+        args: &litebox_common_linux::CloneArgs,
+        flags: CloneFlags,
+        clone3: bool,
+    ) -> Result<usize, Errno> {
+        // Linux clone flag compatibility: CLONE_SIGHAND requires CLONE_VM,
+        // and CLONE_THREAD requires CLONE_SIGHAND. Since the fork path has
+        // !CLONE_VM, neither SIGHAND nor THREAD may be set.
+        if flags.contains(CloneFlags::SIGHAND) {
+            return Err(Errno::EINVAL);
+        }
+
+        litebox::log_println!(
+            self.global.platform,
+            "fork detected (flags={:?}, exit_signal={}), not yet implemented",
+            flags,
+            args.exit_signal
+        );
+        Err(Errno::ENOSYS)
     }
 
     /// Handle syscall `set_tid_address`.
