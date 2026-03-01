@@ -746,16 +746,12 @@ processes.
 **Goal:** A guest can `fork()` + `exec()` to create a child process, wait
 for it, and get its exit status. This is the "run a shell command" milestone.
 
-**Step 2.1 — AddressSpaceProvider implementations (Platform)**
-- Linux userland: VA space partitioning with fixed-size partitions.
+**Step 2.1 — AddressSpaceProvider: Linux userland (Platform)**
+- VA space partitioning with fixed-size partitions.
   `create_address_space()` claims a partition from the free-list.
   `fork_address_space()` → `SharedWithParent(id)`.
   Use `MAP_FIXED_NOREPLACE` for all allocations within partition.
-- LVBS: Wrap existing `PageTableManager` behind `AddressSpaceProvider`.
-  `create_address_space()` → `create_task_page_table()`.
-  `activate_address_space()` → `load_task()`.
-  `fork_address_space()` → COW-copy → `Independent(id)`.
-- Other platforms: stub implementations.
+- LVBS implementation deferred to Phase 3.
 
 **Step 2.2 — Process creation API (Core)**
 - `ProcessRegistry::create_child(parent)` → allocates PID, creates
@@ -859,6 +855,14 @@ and job control work.
 - Kernel: COW fork via `fork_address_space()` → `Independent(id)`.
   Both run concurrently.
 - Test and document the behavioral difference.
+
+**Step 3.6 — AddressSpaceProvider: LVBS (Platform)**
+- Wrap existing `PageTableManager` behind `AddressSpaceProvider`.
+  `create_address_space()` → `create_task_page_table()`.
+  `activate_address_space()` → `load_task()`.
+  `fork_address_space()` → COW-copy → `Independent(id)`.
+- Other kernel platforms (linux_kernel, windows_userland): implement or
+  extend stubs as needed.
 
 **End state:** Full multi-process support — shells, build systems, daemons
 with process trees, signal-based job control.
