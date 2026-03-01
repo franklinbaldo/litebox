@@ -705,11 +705,19 @@ testing) without shim changes.
   behavior).
 
 **Step 1.4 — Per-process state in shim (Shim only)**
-- Wire Linux shim's signal dispositions, brk, thread list into per-process
-  context.
-- The shim's `GlobalState` holds the shared `LiteBox` instance; per-process
-  state (`FilesState`, `PageManager`, signals, brk) is held separately,
-  keyed by the current process context.
+- Introduce `ProcessState` struct holding per-process `PageManager`.
+  Threads of the same process share `Arc<ProcessState>`.
+- Move `pm` from `GlobalState` to `ProcessState`. `GlobalState` retains
+  truly global state (LiteBox, filesystem, network, futex, pipes, etc.).
+- `LinuxShim` becomes a named-field struct holding `Arc<GlobalState>` +
+  `Arc<ProcessState>` (for the initial process).
+- `Task` gains an `Arc<ProcessState>` field; all `self.global.pm`
+  references become `self.process_state.pm`.
+- Thread clone inherits the parent's `Arc<ProcessState>`.
+- **Deferred to Phase 2 (Step 2.4):** Moving `FilesState`, signal
+  handlers, `credentials`, and `comm` into `ProcessState`. These are
+  already per-task via `Arc`/`RefCell` and will move when fork creates
+  child processes that need independent copies.
 
 **Step 1.5 — LiteBox restructuring (Core)**
 - `LiteBox<Platform>` becomes the shared kernel: filesystem, network, pipes,
@@ -762,8 +770,10 @@ for it, and get its exit status. This is the "run a shell command" milestone.
 - Stack setup (argv, envp, auxv) targets the child's address space.
 
 **Step 2.4 — sys_fork / sys_clone wiring (Shim)**
-- Thread "current process" (`ProcessId`) through FD and other syscall
-  handlers to resolve per-process state instead of a shared one.
+- Complete the per-process state extraction deferred from Step 1.4:
+  move `FilesState`, signal handlers, `credentials`, and `comm` into
+  `ProcessState`. Thread "current process" (`ProcessId`) through FD and
+  other syscall handlers to resolve per-process state.
 - Detect fork-like `clone()` calls (no `CLONE_VM`, no `CLONE_THREAD`).
 - Create child process via core (`ProcessRegistry::create_child`).
 - Fork address space via platform (`fork_address_space`).
