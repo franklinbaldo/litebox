@@ -72,13 +72,17 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for ElfFile<'_, FS> {
     type Error = Errno;
 
     fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error> {
+        // Use the process's VA range start as the hint so PIE binaries land
+        // within the correct partition for child processes.
+        let hint = self.task.process_state.pm.addr_min();
+
         // Allocate a mapping large enough that even if it's maximally misaligned we can
         // still fit `len` bytes.
         let mapping_len = len + (align.max(PAGE_SIZE) - PAGE_SIZE);
         let mapping_ptr = self
             .task
             .sys_mmap(
-                super::DEFAULT_LOW_ADDR,
+                hint,
                 mapping_len,
                 litebox_common_linux::ProtFlags::PROT_NONE,
                 litebox_common_linux::MapFlags::MAP_ANONYMOUS
@@ -204,6 +208,16 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
         let global = &self.main.file.task.global;
         let process_state = &self.main.file.task.process_state;
 
+        // Reject ET_EXEC binaries whose fixed load addresses fall outside the
+        // process's VA partition (e.g., a child process in a higher slot).
+        if let Some(fixed_range) = self.main.parsed.fixed_load_range() {
+            let pm_min = process_state.pm.addr_min();
+            let pm_max = process_state.pm.addr_max();
+            if fixed_range.start < pm_min || fixed_range.end > pm_max {
+                return Err(ElfLoaderError::OutOfRange);
+            }
+        }
+
         // Load the main ELF file first so that it gets privileged addresses.
         let info = self
             .main
@@ -272,6 +286,8 @@ pub enum ElfLoaderError {
     InvalidStackAddr,
     #[error("failed to mmap")]
     MappingError(#[from] MappingError),
+    #[error("ET_EXEC load addresses outside process VA range")]
+    OutOfRange,
 }
 
 impl From<ElfLoaderError> for litebox_common_linux::errno::Errno {
@@ -283,6 +299,7 @@ impl From<ElfLoaderError> for litebox_common_linux::errno::Errno {
                 litebox_common_linux::errno::Errno::ENOMEM
             }
             ElfLoaderError::LoadError(e) => e.into(),
+            ElfLoaderError::OutOfRange => litebox_common_linux::errno::Errno::ENOEXEC,
         }
     }
 }

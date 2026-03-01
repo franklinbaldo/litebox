@@ -363,6 +363,32 @@ impl ElfParsedFile {
             .filter(|ph| ph.p_type == elf::abi::PT_LOAD)
     }
 
+    /// For `ET_EXEC` binaries, returns the page-aligned VA range that will be
+    /// mapped (lowest `p_vaddr` to highest `p_vaddr + p_memsz`).
+    ///
+    /// Returns `None` for `ET_DYN` (PIE) binaries, whose load address is
+    /// determined dynamically by [`MapMemory::reserve`].
+    ///
+    /// Callers can use this to reject non-PIE binaries whose fixed addresses
+    /// fall outside the target process's VA partition.
+    pub fn fixed_load_range(&self) -> Option<core::ops::Range<usize>> {
+        if self.header.e_type != elf::abi::ET_EXEC {
+            return None;
+        }
+        let mut min = usize::MAX;
+        let mut max = 0usize;
+        for ph in self.pt_loads() {
+            min = min.min(ph.p_vaddr.truncate());
+            let end: usize = ph.p_vaddr.checked_add(ph.p_memsz)?.truncate();
+            max = max.max(end);
+        }
+        if min >= max {
+            return None;
+        }
+        let aligned_max = max.checked_next_multiple_of(PAGE_SIZE)?;
+        Some(page_align_down(min)..aligned_max)
+    }
+
     /// Load the ELF file into memory.
     pub fn load<M: MapMemory>(
         &self,
