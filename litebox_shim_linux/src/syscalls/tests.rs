@@ -38,7 +38,7 @@ pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task<crate:
     });
     let tar_ro_fs = litebox::fs::tar_ro::FileSystem::new(litebox, TEST_TAR_FILE.into());
     shim_builder.set_fs(shim_builder.default_fs(in_mem_fs, tar_ro_fs));
-    shim_builder.build().0.new_test_task()
+    shim_builder.build().new_test_task()
 }
 
 #[test]

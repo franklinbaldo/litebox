@@ -102,7 +102,7 @@ impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
         if info.kernel_mode && info.exception == litebox::shim::Exception::PAGE_FAULT {
             if unsafe {
                 self.task
-                    .global
+                    .process_state
                     .pm
                     .handle_page_fault(info.cr2, info.error_code.into())
             }
@@ -201,13 +201,15 @@ impl<FS: ShimFS> LinuxShimBuilder<FS> {
     pub fn build(self) -> LinuxShim<FS> {
         let mut net = Network::new(&self.litebox);
         net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
-        let global = Arc::new(GlobalState {
-            platform: self.platform,
+        let process_state = Arc::new(ProcessState {
             pm: PageManager::new(
                 &self.litebox,
                 <Platform as litebox::platform::PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MIN
                     ..<Platform as litebox::platform::PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MAX,
             ),
+        });
+        let global = Arc::new(GlobalState {
+            platform: self.platform,
             fs: self
                 .fs
                 .expect("File system must be set before calling build"),
@@ -220,14 +222,24 @@ impl<FS: ShimFS> LinuxShimBuilder<FS> {
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
         });
-        LinuxShim(global)
+        LinuxShim {
+            global,
+            process_state,
+        }
     }
 }
 
-pub struct LinuxShim<FS: ShimFS>(Arc<GlobalState<FS>>);
+pub struct LinuxShim<FS: ShimFS> {
+    global: Arc<GlobalState<FS>>,
+    /// Per-process state for the initial process.
+    process_state: Arc<ProcessState>,
+}
 impl<FS: ShimFS> Clone for LinuxShim<FS> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self {
+            global: self.global.clone(),
+            process_state: self.process_state.clone(),
+        }
     }
 }
 
@@ -251,14 +263,15 @@ impl<FS: ShimFS> LinuxShim<FS> {
         } = task;
 
         let files = Arc::new(syscalls::file::FilesState::new());
-        files.initialize_stdio_in_shared_descriptors_table(&self.0);
+        files.initialize_stdio_in_shared_descriptors_table(&self.global);
 
         let entrypoints = crate::LinuxShimEntrypoints {
             _not_send: core::marker::PhantomData,
             task: Task {
-                global: self.0.clone(),
+                global: self.global.clone(),
+                process_state: self.process_state.clone(),
                 thread: syscalls::process::ThreadState::new_process(pid),
-                wait_state: wait::WaitState::new(self.0.platform),
+                wait_state: wait::WaitState::new(self.global.platform),
                 process_id: litebox::process::ProcessId::INIT,
                 pid,
                 ppid,
@@ -288,9 +301,14 @@ impl<FS: ShimFS> LinuxShim<FS> {
         })
     }
 
-    /// Get the global page manager
+    /// Returns the page manager for the initial (PID 1) process.
+    ///
+    /// This is intended for use by runners during early boot (ELF loading,
+    /// page-fault handling) before multi-process support is active. Child
+    /// processes will have their own `PageManager` inside their
+    /// `ProcessState`; callers should not use this accessor for them.
     pub fn page_manager(&self) -> &PageManager<Platform, PAGE_SIZE> {
-        &self.0.pm
+        &self.process_state.pm
     }
 
     /// Perform queued network interactions with the outside world.
@@ -299,7 +317,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
     pub fn perform_network_interaction(
         &self,
     ) -> litebox::net::PlatformInteractionReinvocationAdvice {
-        self.0.net.lock().perform_platform_interaction()
+        self.global.net.lock().perform_platform_interaction()
     }
 }
 
@@ -1199,8 +1217,6 @@ struct GlobalState<FS: ShimFS> {
     platform: &'static Platform,
     /// The LiteBox instance used throughout the shim.
     litebox: litebox::LiteBox<Platform>,
-    /// The page manager for managing virtual memory.
-    pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
     /// The filesystem implementation.
     fs: FS,
     /// The futex manager for handling futex operations.
@@ -1220,8 +1236,21 @@ struct GlobalState<FS: ShimFS> {
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<FS>>,
 }
 
+/// Per-process state shared by all threads in a process.
+///
+/// Each process has its own `ProcessState` (wrapped in `Arc` so threads of the
+/// same process share it). When multi-process support is complete, forking
+/// will create a new `ProcessState` with a per-process `PageManager`
+/// initialized to the child's VA sub-range.
+struct ProcessState {
+    /// The page manager for managing this process's virtual memory.
+    pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
+}
+
 struct Task<FS: ShimFS> {
     global: Arc<GlobalState<FS>>,
+    /// Per-process state shared across threads in the same process.
+    process_state: Arc<ProcessState>,
     wait_state: wait::WaitState,
     thread: syscalls::process::ThreadState,
     /// The process identity from the core ProcessRegistry.
@@ -1258,16 +1287,17 @@ mod test_utils {
     extern crate std;
     use super::*;
 
-    impl<FS: ShimFS> GlobalState<FS> {
-        /// Make a new task with default values for testing.
-        pub(crate) fn new_test_task(self: Arc<Self>) -> Task<FS> {
+    impl<FS: ShimFS> LinuxShim<FS> {
+        /// Create a new task with default values for testing.
+        pub(crate) fn new_test_task(self) -> Task<FS> {
             let pid = self
+                .global
                 .next_thread_id
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let files = Arc::new(syscalls::file::FilesState::new());
-            files.initialize_stdio_in_shared_descriptors_table(&self);
+            files.initialize_stdio_in_shared_descriptors_table(&self.global);
             Task {
-                wait_state: wait::WaitState::new(self.platform),
+                wait_state: wait::WaitState::new(self.global.platform),
                 thread: syscalls::process::ThreadState::new_process(pid),
                 process_id: litebox::process::ProcessId::INIT,
                 pid,
@@ -1283,7 +1313,8 @@ mod test_utils {
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
-                global: self,
+                process_state: self.process_state,
+                global: self.global,
             }
         }
     }
@@ -1298,6 +1329,7 @@ mod test_utils {
             let task = Task {
                 wait_state: wait::WaitState::new(self.global.platform),
                 global: self.global.clone(),
+                process_state: self.process_state.clone(),
                 thread: self.thread.new_thread(tid)?,
                 process_id: self.process_id,
                 pid: self.pid,
