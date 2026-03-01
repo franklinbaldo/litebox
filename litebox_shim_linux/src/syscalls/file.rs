@@ -78,7 +78,6 @@ impl<FS: ShimFS> FilesState<FS> {
     /// (via `Arc`) with the parent. This matches POSIX fork semantics: the
     /// child gets its own FD number space but file descriptions (offsets,
     /// flags) are shared.
-    #[expect(dead_code, reason = "scaffolding for fork in Phase 2")]
     pub fn clone_for_fork(&self) -> Self {
         Self {
             file_descriptors: litebox::sync::RwLock::new(self.file_descriptors.read().clone()),

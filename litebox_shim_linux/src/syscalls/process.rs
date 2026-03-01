@@ -509,7 +509,7 @@ impl<FS: ShimFS> Task<FS> {
     /// Called when the task is exiting.
     pub(crate) fn prepare_for_exit(&mut self) {
         // If this is a vfork child, unblock the parent before tearing down.
-        if let Some(fc) = &self.fork_context {
+        if let Some(fc) = self.fork_context.get_mut() {
             fc.vfork_done.signal();
         }
 
@@ -781,7 +781,7 @@ impl<FS: ShimFS> Task<FS> {
                         fs: fs.into(),
                         files: self.files.clone(), // TODO: !CLONE_FILES support
                         signals: self.signals.clone_for_new_task(),
-                        fork_context: None,
+                        fork_context: core::cell::RefCell::new(None),
                     },
                 }),
             )
@@ -844,7 +844,7 @@ impl<FS: ShimFS> Task<FS> {
             .map_err(|_| Errno::ENOMEM)?;
 
         // 2. Fork address space: allocate a VA partition for the child.
-        let parent_as_id = self.process_state.address_space_id;
+        let parent_as_id = self.process_state.borrow().address_space_id;
         let forked = self
             .global
             .platform
@@ -896,10 +896,10 @@ impl<FS: ShimFS> Task<FS> {
                         fs: self.fs.clone(),
                         files: self.files.clone(),
                         signals: self.signals.clone_for_new_task(),
-                        fork_context: Some(crate::ForkContext {
+                        fork_context: core::cell::RefCell::new(Some(crate::ForkContext {
                             address_space_id: child_as_id,
                             vfork_done: vfork_done.clone(),
-                        }),
+                        })),
                     },
                 }),
             )
@@ -1501,10 +1501,40 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EBUSY);
         }
 
-        // Close CLOEXEC descriptors
+        // If this is a vfork child, detach from the parent's shared state.
+        // This must happen before close_on_exec/release_memory so mutations
+        // only affect the child's own copies.
+        if let Some(fc) = self.fork_context.borrow_mut().take() {
+            use litebox::platform::AddressSpaceProvider;
+
+            // Switch to the child's own VA partition.
+            let child_range = self
+                .global
+                .platform
+                .address_space_range(fc.address_space_id)
+                .expect("child address space must be valid");
+            let child_ps = Arc::new(crate::ProcessState {
+                pm: litebox::mm::PageManager::new(&self.global.litebox, child_range),
+                address_space_id: fc.address_space_id,
+            });
+            self.process_state.replace(child_ps);
+
+            // Unshare file descriptors and fs state. During the vfork window
+            // these were shared with the parent (who is blocked), but after
+            // exec the child must have independent copies.
+            let new_files = Arc::new(self.files.borrow().clone_for_fork());
+            self.files.replace(new_files);
+            let new_fs: Arc<_> = Arc::new(self.fs.borrow().as_ref().clone());
+            self.fs.replace(new_fs);
+
+            // Unblock the parent — the child now has its own state.
+            fc.vfork_done.signal();
+        }
+
+        // Close CLOEXEC descriptors (now on the child's own FD table).
         self.close_on_exec();
 
-        // unmmap all memory mappings and reset brk
+        // Unmap all memory mappings and reset brk.
         if let Some(robust_list) = self.thread.robust_list.take() {
             let _ = wake_robust_list(robust_list);
         }
@@ -1514,7 +1544,7 @@ impl<FS: ShimFS> Task<FS> {
 
         // Don't release reserved mappings.
         let release = |_r: Range<usize>, vm: VmFlags| !vm.is_empty();
-        unsafe { self.process_state.pm.release_memory(release) }
+        unsafe { self.process_state.borrow().pm.release_memory(release) }
             .expect("failed to release memory mappings");
 
         litebox_platform_multiplex::Platform::clear_guest_thread_local_storage(

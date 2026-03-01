@@ -45,7 +45,7 @@ impl<FS: ShimFS> Task<FS> {
         op: impl FnOnce(MutPtr<u8>) -> Result<usize, MappingError>,
     ) -> Result<MutPtr<u8>, MappingError> {
         litebox_common_linux::mm::do_mmap(
-            &self.process_state.pm,
+            &self.process_state.borrow().pm,
             suggested_addr,
             len,
             prot,
@@ -303,7 +303,7 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `munmap`
     #[inline]
     pub(crate) fn sys_munmap(&self, addr: crate::MutPtr<u8>, len: usize) -> Result<(), Errno> {
-        litebox_common_linux::mm::sys_munmap(&self.process_state.pm, addr, len)
+        litebox_common_linux::mm::sys_munmap(&self.process_state.borrow().pm, addr, len)
     }
 
     /// Handle syscall `mprotect`
@@ -314,7 +314,7 @@ impl<FS: ShimFS> Task<FS> {
         len: usize,
         prot: ProtFlags,
     ) -> Result<(), Errno> {
-        litebox_common_linux::mm::sys_mprotect(&self.process_state.pm, addr, len, prot)
+        litebox_common_linux::mm::sys_mprotect(&self.process_state.borrow().pm, addr, len, prot)
     }
 
     #[inline]
@@ -327,7 +327,7 @@ impl<FS: ShimFS> Task<FS> {
         new_addr: usize,
     ) -> Result<crate::MutPtr<u8>, Errno> {
         litebox_common_linux::mm::sys_mremap(
-            &self.process_state.pm,
+            &self.process_state.borrow().pm,
             old_addr,
             old_size,
             new_size,
@@ -339,7 +339,7 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `brk`
     #[inline]
     pub(crate) fn sys_brk(&self, addr: MutPtr<u8>) -> Result<usize, Errno> {
-        litebox_common_linux::mm::sys_brk(&self.process_state.pm, addr)
+        litebox_common_linux::mm::sys_brk(&self.process_state.borrow().pm, addr)
     }
 
     /// Handle syscall `madvise`
@@ -350,7 +350,7 @@ impl<FS: ShimFS> Task<FS> {
         len: usize,
         advice: litebox_common_linux::MadviseBehavior,
     ) -> Result<(), Errno> {
-        litebox_common_linux::mm::sys_madvise(&self.process_state.pm, addr, len, advice)
+        litebox_common_linux::mm::sys_madvise(&self.process_state.borrow().pm, addr, len, advice)
     }
 }
 
@@ -571,8 +571,8 @@ mod tests {
         // LiteBox's page manager is not aware of the global allocator's allocations.
         // With partitioned VA ranges, the guest range may be much smaller than the host's
         // preferred mmap range, so we use MAP_FIXED_NOREPLACE with a hint inside the guest range.
-        let pm_min = task.process_state.pm.addr_min();
-        let pm_max = task.process_state.pm.addr_max();
+        let pm_min = task.process_state.borrow().pm.addr_min();
+        let pm_max = task.process_state.borrow().pm.addr_max();
         let mut search_addr = pm_min + 0x1000_0000; // start 256 MiB into the partition
         let addr = loop {
             if search_addr >= pm_max {
