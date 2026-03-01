@@ -720,9 +720,12 @@ testing) without shim changes.
   child processes that need independent copies.
 
 **Step 1.5 — LiteBox restructuring (Core)**
-- `LiteBox<Platform>` becomes the shared kernel: filesystem, network, pipes,
-  futex, process registry, and core `Descriptors` (stays here).
 - Add `ProcessRegistry` to `LiteBoxX`.
+- `LiteBox::new()` creates the init process (PID 1) in the registry
+  automatically, mirroring how Linux creates PID 1 during kernel boot
+  before any user code runs. The shim loads the user program into this
+  pre-existing process.
+- Add `process_registry()` public accessor on `LiteBox`.
 - Retain the `enforce_singleton_litebox_instance` assertion — `LiteBox`
   remains a singleton. It no longer owns per-process state, but it IS
   still "the kernel."
