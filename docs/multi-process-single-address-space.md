@@ -714,10 +714,15 @@ testing) without shim changes.
 - `Task` gains an `Arc<ProcessState>` field; all `self.global.pm`
   references become `self.process_state.pm`.
 - Thread clone inherits the parent's `Arc<ProcessState>`.
-- **Deferred to Phase 2 (Step 2.4):** Moving `FilesState`, signal
-  handlers, `credentials`, and `comm` into `ProcessState`. These are
-  already per-task via `Arc`/`RefCell` and will move when fork creates
-  child processes that need independent copies.
+- **Deferred note from Step 1.4:** Moving `FilesState`, signal handlers,
+  `credentials`, and `comm` into `ProcessState` was considered but
+  rejected. Following the Linux kernel model, these remain as independent
+  `Arc`-wrapped pointers in `Task` (analogous to `task_struct` holding
+  `files_struct*`, `sighand_struct*`, `cred*`). `ProcessState` stays lean —
+  only `PageManager` (analogous to `mm_struct`), the one structure that is
+  always shared by all threads in a process and never independently
+  shareable. Fork orchestration in `sys_clone` clones or shares each `Arc`
+  based on clone flags.
 
 **Step 1.5 — LiteBox restructuring (Core)**
 - Add `ProcessRegistry` to `LiteBoxX`.
@@ -772,19 +777,45 @@ for it, and get its exit status. This is the "run a shell command" milestone.
 - Stack setup (argv, envp, auxv) targets the child's address space.
 
 **Step 2.4 — sys_fork / sys_clone wiring (Shim)**
-- Complete the per-process state extraction deferred from Step 1.4:
-  move `FilesState`, signal handlers, `credentials`, and `comm` into
-  `ProcessState`. Thread "current process" (`ProcessId`) through FD and
-  other syscall handlers to resolve per-process state.
-- Detect fork-like `clone()` calls (no `CLONE_VM`, no `CLONE_THREAD`).
-- Create child process via core (`ProcessRegistry::create_child`).
-- Fork address space via platform (`fork_address_space`).
-- Clone `FilesState` via `clone_for_fork()` (shared `DescriptorEntry` Arc
-  references — POSIX file description sharing).
-- Copy signal dispositions, store `exit_signal`.
-- On userland: parent blocked (vfork semantics) until child execs/exits.
-- On kernel (`Independent`): both run concurrently.
-- Parent returns child PID; child returns 0.
+
+Per-process state architecture decision: `ProcessState` remains lean
+(only `PageManager`), following the Linux kernel model. `Task` holds
+independent `Arc`-wrapped pointers to `FilesState`, `SignalHandlers`,
+`Credentials`, etc. — each independently shareable/clonable at clone time.
+
+On userland, fork uses **vfork semantics**: the child shares the parent's
+entire state (same `ProcessState`, same Arcs) until it calls `execve()`
+or `_exit()`. The parent blocks. The child's own VA partition is allocated
+but empty until `execve()` loads a new binary into it.
+
+Sub-steps:
+
+*Step 2.4a — Fork detection in sys_clone:*
+- Add a new code path in `sys_clone` for fork-like calls
+  (`!CLONE_VM && !CLONE_THREAD`).
+- Distinguish fork (new process) from thread clone (same process).
+- Scaffold the fork path: detect, log, return `ENOSYS` initially.
+- Enforce Linux flag compatibility: `CLONE_SIGHAND` requires `CLONE_VM`.
+- **Deferred:** `CLONE_VM` without `CLONE_THREAD` (share address space,
+  separate process) and `CLONE_VFORK` (glibc's `vfork()` uses
+  `CLONE_VM | CLONE_VFORK`) currently fall to the thread path and fail.
+  Handle in Step 2.4b or 2.4c.
+
+*Step 2.4b — Child process creation:*
+- In the fork path, orchestrate:
+  1. `ProcessRegistry::create_process(Some(parent), SIGCHLD)` → child PID.
+  2. `platform.fork_address_space(parent_id)` → child partition.
+  3. Create child `Task` with vfork sharing: child uses the **parent's**
+     `ProcessState` (PM, files, signals, etc.) temporarily.
+  4. Parent returns child PID; child returns 0.
+- The child `Task` holds both a reference to the parent's `ProcessState`
+  (for immediate use) and the child's partition ID (for later `execve`).
+
+*Step 2.4c — vfork parent blocking:*
+- After fork, the parent blocks on a per-process synchronization
+  primitive (e.g., a futex/condvar in `ProcessState` or `Task`).
+- The child unblocks the parent when it calls `execve()` or `_exit()`.
+- Wire the unblock into `sys_execve` and `sys_exit_group` paths.
 
 **Step 2.5 — sys_execve scoping (Shim)**
 - Scope `execve()` to the calling process's state:
