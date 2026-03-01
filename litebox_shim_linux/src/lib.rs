@@ -1260,17 +1260,50 @@ struct ProcessState {
     address_space_id: <Platform as litebox::platform::AddressSpaceProvider>::AddressSpaceId,
 }
 
+/// One-shot synchronization primitive for vfork parent blocking.
+///
+/// The parent creates this before spawning the child and calls [`wait`](Self::wait)
+/// after the spawn succeeds. The child holds a clone and calls [`signal`](Self::signal)
+/// when it execs or exits, unblocking the parent.
+struct VforkDone {
+    done: core::sync::atomic::AtomicBool,
+    /// Waker for the parent thread — calling `wake()` causes the parent's
+    /// `wait_until` loop to re-evaluate the done flag.
+    parent_waker: litebox::event::wait::Waker<Platform>,
+}
+
+impl VforkDone {
+    fn new(parent_waker: litebox::event::wait::Waker<Platform>) -> Self {
+        Self {
+            done: core::sync::atomic::AtomicBool::new(false),
+            parent_waker,
+        }
+    }
+
+    /// Called by the child when it execs or exits.
+    fn signal(&self) {
+        self.done.store(true, Ordering::Release);
+        self.parent_waker.wake();
+    }
+
+    /// Returns `true` once the child has called [`signal`](Self::signal).
+    fn is_done(&self) -> bool {
+        self.done.load(Ordering::Acquire)
+    }
+}
+
 /// Context for a vfork child process.
 ///
 /// Stored in the child's `Task` after `do_fork`. The child temporarily uses
 /// the **parent's** `ProcessState` (vfork sharing). When the child calls
 /// `execve()`, it creates its own `ProcessState` using the partition range
 /// from `address_space_id`. When it calls `_exit()`, the partition is released.
-#[expect(dead_code, reason = "fields used in Steps 2.4c / 2.5")]
 struct ForkContext {
     /// The child's own address space ID (VA partition on userland).
+    #[expect(dead_code, reason = "read in Step 2.5 for execve")]
     address_space_id: <Platform as litebox::platform::AddressSpaceProvider>::AddressSpaceId,
-    // TODO (Step 2.4c): vfork_done synchronization primitive to unblock parent.
+    /// Signals the parent to resume after the vfork child execs or exits.
+    vfork_done: Arc<VforkDone>,
 }
 
 struct Task<FS: ShimFS> {
@@ -1300,10 +1333,6 @@ struct Task<FS: ShimFS> {
     signals: syscalls::signal::SignalState,
     /// Fork context for vfork children. `None` for the initial process and
     /// for threads. Set when `do_fork` creates a child process.
-    #[expect(
-        dead_code,
-        reason = "read in Steps 2.4c / 2.5 for execve and vfork_done"
-    )]
     fork_context: Option<ForkContext>,
 }
 
