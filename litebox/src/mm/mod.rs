@@ -44,6 +44,16 @@ impl<Platform, const ALIGN: usize> PageManager<Platform, ALIGN>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
+    /// Lower bound (inclusive) of the managed VA range.
+    pub fn addr_min(&self) -> usize {
+        self.addr_min
+    }
+
+    /// Upper bound (exclusive) of the managed VA range.
+    pub fn addr_max(&self) -> usize {
+        self.addr_max
+    }
+
     /// Create a new `PageManager` instance for the given VA `range`.
     ///
     /// For a single-process setup (or the initial process), pass the full

@@ -753,12 +753,15 @@ for it, and get its exit status. This is the "run a shell command" milestone.
   Use `MAP_FIXED_NOREPLACE` for all allocations within partition.
 - LVBS implementation deferred to Phase 3.
 
-**Step 2.2 — Process creation API (Core)**
-- `ProcessRegistry::create_child(parent)` → allocates PID, creates
-  `ProcessContext` (with `pgid = parent.pgid, sid = parent.sid,
-  exit_signal = SIGCHLD`), records parent-child link.
-- Returns `ProcessId` for the caller to associate with per-process
-  resources (FD table, PageManager).
+**Step 2.2 — Process creation API (Core)** ✅ Already covered by Step 1.1a.
+- `ProcessRegistry::create_process(parent, exit_signal)` already allocates a
+  PID, creates `ProcessContext` (inheriting `pgid`/`sid` from parent), and
+  records the parent-child link.
+- A separate `create_child` wrapper was considered but deemed unnecessary:
+  the shim's `sys_fork`/`sys_clone` (Step 2.4) is the natural orchestration
+  point that composes process creation + VA partition allocation + FD table
+  cloning. Keeping `ProcessRegistry` focused on identity/lifecycle avoids
+  coupling it to `AddressSpaceProvider`.
 
 **Step 2.3 — ELF loading into a target process (Shim)**
 - Parameterize the ELF loader to load into a given process's `PageManager`.
