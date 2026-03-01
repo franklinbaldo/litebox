@@ -24,7 +24,7 @@ use crate::sync::{RawSyncPrimitivesProvider, RwLock};
 ///
 /// Process IDs are monotonically allocated starting from 1 and never reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ProcessId(u32);
+pub struct ProcessId(pub u32);
 
 impl ProcessId {
     /// The initial guest process.
@@ -38,7 +38,7 @@ impl ProcessId {
 
 /// A process group identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ProcessGroupId(u32);
+pub struct ProcessGroupId(pub u32);
 
 impl ProcessGroupId {
     /// Returns the raw numeric value.
