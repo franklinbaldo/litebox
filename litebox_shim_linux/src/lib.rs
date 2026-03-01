@@ -19,6 +19,7 @@ use alloc::vec::Vec;
 
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
+use core::sync::atomic::Ordering;
 use litebox::{
     LiteBox,
     fd::TypedFd,
@@ -378,6 +379,14 @@ struct Descriptors<FS: ShimFS> {
     descriptors: Vec<Option<Descriptor<FS>>>,
 }
 
+impl<FS: ShimFS> Clone for Descriptors<FS> {
+    fn clone(&self) -> Self {
+        Self {
+            descriptors: self.descriptors.clone(),
+        }
+    }
+}
+
 impl<FS: ShimFS> Descriptors<FS> {
     fn new() -> Self {
         Self {
@@ -508,6 +517,38 @@ enum Descriptor<FS: ShimFS> {
         file: alloc::sync::Arc<syscalls::unix::UnixSocket<FS>>,
         close_on_exec: core::sync::atomic::AtomicBool,
     },
+}
+
+impl<FS: ShimFS> Clone for Descriptor<FS> {
+    /// Clone a descriptor for `fork()`. The underlying file objects are shared
+    /// via `Arc` (matching POSIX shared-file-description semantics).
+    /// `close_on_exec` flags are copied by value.
+    fn clone(&self) -> Self {
+        match self {
+            Descriptor::LiteBoxRawFd(raw) => Descriptor::LiteBoxRawFd(*raw),
+            Descriptor::Eventfd {
+                file,
+                close_on_exec,
+            } => Descriptor::Eventfd {
+                file: file.clone(),
+                close_on_exec: close_on_exec.load(Ordering::Relaxed).into(),
+            },
+            Descriptor::Epoll {
+                file,
+                close_on_exec,
+            } => Descriptor::Epoll {
+                file: file.clone(),
+                close_on_exec: close_on_exec.load(Ordering::Relaxed).into(),
+            },
+            Descriptor::Unix {
+                file,
+                close_on_exec,
+            } => Descriptor::Unix {
+                file: file.clone(),
+                close_on_exec: close_on_exec.load(Ordering::Relaxed).into(),
+            },
+        }
+    }
 }
 
 /// A strongly-typed FD.
