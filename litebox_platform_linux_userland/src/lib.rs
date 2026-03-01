@@ -366,6 +366,12 @@ impl LinuxUserland {
 
 impl litebox::platform::Provider for LinuxUserland {}
 
+impl litebox::platform::AddressSpaceProvider for LinuxUserland {
+    // All methods default to `Err(NotSupported)` — real implementation comes
+    // in Phase 2 when userland multi-process VA partitioning is added.
+    type AddressSpaceId = u32;
+}
+
 /// Runs a guest thread using the provided shim and the given initial context.
 ///
 /// This will run until the thread terminates or returns.

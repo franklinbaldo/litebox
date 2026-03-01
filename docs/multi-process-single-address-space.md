@@ -337,7 +337,7 @@ let pm = PageManager::new(&litebox, range);
 
 // Multi-process:
 let as_id = platform.create_address_space()?;
-let range = platform.address_space_range(as_id);
+let range = platform.address_space_range(as_id)?;
 let pm = PageManager::new(&litebox, range);
 ```
 
@@ -353,7 +353,10 @@ space.
 ### 4.1 Trait Definition
 
 A new **optional** South interface trait for managing per-process address
-spaces:
+spaces. All methods provide a default implementation that returns
+`Err(AddressSpaceError::NotSupported)`, so platforms that do not yet
+support multi-process need only specify the `AddressSpaceId` associated
+type. The trait is a supertrait of `Provider`.
 
 ```rust
 pub enum ForkedAddressSpace<Id> {
@@ -364,7 +367,7 @@ pub enum ForkedAddressSpace<Id> {
 }
 
 pub trait AddressSpaceProvider {
-    type AddressSpaceId: Copy + Eq + Send + Sync;
+    type AddressSpaceId: Copy + Eq + Send + Sync + Debug;
 
     /// Create a new empty address space for a new process.
     fn create_address_space(&self) -> Result<Self::AddressSpaceId, AddressSpaceError>;
@@ -415,7 +418,10 @@ pub trait AddressSpaceProvider {
     /// Get the VA range available to this address space.
     /// Kernel: full TASK_ADDR_MIN..TASK_ADDR_MAX.
     /// Userland: a partition of the total range.
-    fn address_space_range(&self, id: Self::AddressSpaceId) -> Range<usize>;
+    fn address_space_range(
+        &self,
+        id: Self::AddressSpaceId,
+    ) -> Result<Range<usize>, AddressSpaceError>;
 }
 ```
 
