@@ -255,6 +255,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 global: self.0.clone(),
                 thread: syscalls::process::ThreadState::new_process(pid),
                 wait_state: wait::WaitState::new(self.0.platform),
+                process_id: litebox::process::ProcessId::INIT,
                 pid,
                 ppid,
                 tid: pid,
@@ -1193,6 +1194,8 @@ struct Task<FS: ShimFS> {
     global: Arc<GlobalState<FS>>,
     wait_state: wait::WaitState,
     thread: syscalls::process::ThreadState,
+    /// The process identity from the core ProcessRegistry.
+    process_id: litebox::process::ProcessId,
     /// Process ID
     pid: i32,
     /// Parent Process ID
@@ -1236,6 +1239,7 @@ mod test_utils {
             Task {
                 wait_state: wait::WaitState::new(self.platform),
                 thread: syscalls::process::ThreadState::new_process(pid),
+                process_id: litebox::process::ProcessId::INIT,
                 pid,
                 ppid: 0,
                 tid: pid,
@@ -1265,6 +1269,7 @@ mod test_utils {
                 wait_state: wait::WaitState::new(self.global.platform),
                 global: self.global.clone(),
                 thread: self.thread.new_thread(tid)?,
+                process_id: self.process_id,
                 pid: self.pid,
                 ppid: self.ppid,
                 tid,

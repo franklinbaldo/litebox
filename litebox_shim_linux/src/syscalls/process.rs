@@ -325,6 +325,12 @@ impl<FS: ShimFS> Task<FS> {
         &self.thread.process
     }
 
+    /// Returns the core [`ProcessId`](litebox::process::ProcessId) for this task's process.
+    #[expect(dead_code, reason = "scaffolding for multi-process steps 1.2+")]
+    pub(crate) fn current_process_id(&self) -> litebox::process::ProcessId {
+        self.process_id
+    }
+
     /// Set the current task's command name.
     pub(crate) fn set_task_comm(&self, comm: &[u8]) {
         let mut new_comm = [0u8; litebox_common_linux::TASK_COMM_LEN];
@@ -749,6 +755,7 @@ impl<FS: ShimFS> Task<FS> {
                         global: self.global.clone(),
                         wait_state: crate::wait::WaitState::new(self.global.platform),
                         thread,
+                        process_id: self.process_id,
                         pid: self.pid,
                         tid: child_tid,
                         ppid: self.ppid,
