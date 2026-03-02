@@ -1498,6 +1498,96 @@ impl<FS: ShimFS> Task<FS> {
         self.ppid
     }
 
+    /// Handle syscall `getpgid`. If `pid == 0`, return caller's pgid.
+    pub(crate) fn sys_getpgid(&self, pid: i32) -> Result<u32, Errno> {
+        if pid < 0 {
+            return Err(Errno::EINVAL);
+        }
+        use litebox::process::ProcessId;
+        let target = if pid == 0 {
+            self.process_id
+        } else {
+            ProcessId(pid as u32)
+        };
+        self.global
+            .litebox
+            .process_registry()
+            .get_pgid(target)
+            .map(|pgid| pgid.as_u32())
+            .ok_or(Errno::ESRCH)
+    }
+
+    /// Handle syscall `setpgid`. pid==0 means self, pgid==0 means use pid as pgid.
+    ///
+    /// NOTE: Linux returns EACCES when a parent calls setpgid on a child that
+    /// has already exec'd. We intentionally omit this check. Under our vfork
+    /// model the parent is blocked until the child execs, so the parent can
+    /// only call setpgid *after* exec — making EACCES the only possible
+    /// outcome on real Linux. Shells make this call for race-avoidance and
+    /// tolerate failure, so being more permissive here is harmless.
+    pub(crate) fn sys_setpgid(&self, pid: i32, pgid: i32) -> Result<(), Errno> {
+        if pid < 0 || pgid < 0 {
+            return Err(Errno::EINVAL);
+        }
+        use litebox::process::{ProcessGroupId, ProcessId, SetPgidError};
+        let caller = self.process_id;
+        let target = if pid == 0 {
+            caller
+        } else {
+            ProcessId(pid as u32)
+        };
+        let target_pgid = if pgid == 0 {
+            ProcessGroupId::from(target)
+        } else {
+            ProcessGroupId(pgid as u32)
+        };
+        match self
+            .global
+            .litebox
+            .process_registry()
+            .set_pgid(caller, target, target_pgid)
+        {
+            Some(Ok(())) => Ok(()),
+            Some(Err(SetPgidError::NotPermitted)) => Err(Errno::EPERM),
+            Some(Err(SetPgidError::NoSuchGroup)) => Err(Errno::EPERM),
+            None => Err(Errno::ESRCH),
+        }
+    }
+
+    /// Handle syscall `getsid`. If `pid == 0`, return caller's sid.
+    pub(crate) fn sys_getsid(&self, pid: i32) -> Result<u32, Errno> {
+        if pid < 0 {
+            return Err(Errno::EINVAL);
+        }
+        use litebox::process::ProcessId;
+        let target = if pid == 0 {
+            self.process_id
+        } else {
+            ProcessId(pid as u32)
+        };
+        self.global
+            .litebox
+            .process_registry()
+            .get_sid(target)
+            .map(|sid| sid.as_u32())
+            .ok_or(Errno::ESRCH)
+    }
+
+    /// Handle syscall `setsid`. Creates a new session with caller as leader.
+    pub(crate) fn sys_setsid(&self) -> Result<u32, Errno> {
+        use litebox::process::SetsidError;
+        match self
+            .global
+            .litebox
+            .process_registry()
+            .setsid(self.process_id)
+        {
+            Some(Ok(sid)) => Ok(sid.as_u32()),
+            Some(Err(SetsidError::AlreadyGroupLeader)) => Err(Errno::EPERM),
+            None => Err(Errno::ESRCH),
+        }
+    }
+
     /// Handle syscall `getuid`.
     pub(crate) fn sys_getuid(&self) -> u32 {
         self.credentials.uid

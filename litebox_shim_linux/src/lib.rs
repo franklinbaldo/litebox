@@ -1204,6 +1204,10 @@ impl<FS: ShimFS> Task<FS> {
             }
             SyscallRequest::Getpid => Ok(self.sys_getpid().reinterpret_as_unsigned() as usize),
             SyscallRequest::Getppid => Ok(self.sys_getppid().reinterpret_as_unsigned() as usize),
+            SyscallRequest::Getpgid { pid } => self.sys_getpgid(pid).map(|v| v as usize),
+            SyscallRequest::Setpgid { pid, pgid } => self.sys_setpgid(pid, pgid).map(|()| 0),
+            SyscallRequest::Getsid { pid } => self.sys_getsid(pid).map(|v| v as usize),
+            SyscallRequest::Setsid => self.sys_setsid().map(|v| v as usize),
             SyscallRequest::Getuid => Ok(self.sys_getuid() as usize),
             SyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
             SyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),
