@@ -977,15 +977,20 @@ impl<FS: ShimFS> Task<FS> {
         Ok(usize::try_from(child_tid).unwrap())
     }
 
-    /// Fork path: create a new child process (vfork semantics on userland).
+    /// Fork path: create a new child process.
     ///
-    /// The child temporarily shares the parent's `ProcessState` (PM, files,
-    /// signals, etc.). A VA partition is allocated for the child but remains
-    /// empty until `execve()` loads a new binary into it.
+    /// The behavior depends on the platform's `fork_address_space()` result:
     ///
-    /// **Note:** Step 2.4c adds parent blocking (vfork semantics). Until then,
-    /// both parent and child run concurrently on the same guest stack, which
-    /// is only safe if the child immediately calls `execve()` or `_exit()`.
+    /// * **`SharedWithParent`** (userland): vfork semantics — the child shares
+    ///   the parent's `ProcessState` (address space) but gets an independent
+    ///   FD table at fork time. The parent blocks until the child calls
+    ///   `execve()` or `_exit()`. On `execve`, the child detaches into its
+    ///   own VA partition. The child may safely do `dup2`/`close` between
+    ///   fork and exec without affecting the parent.
+    ///
+    /// * **`Independent`** (kernel): real fork — the platform creates a CoW
+    ///   copy of the address space. The child gets its own `ProcessState` and
+    ///   FD table at fork time, and the parent continues immediately.
     fn do_fork(
         &self,
         ctx: &litebox_common_linux::PtRegs,
@@ -1019,8 +1024,10 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
 
-        // The fork path always uses vfork semantics (child runs on parent's
-        // stack). Reject requests for a separate child stack.
+        // Reject requests for a separate child stack. With vfork (userland)
+        // the child runs on the parent's stack; with independent fork (kernel)
+        // the child's stack is CoW-copied. Either way, an explicit stack
+        // pointer is not applicable for the fork path.
         if args.stack != 0 || args.stack_size != 0 {
             log_unsupported!("fork with explicit child stack");
             return Err(Errno::EINVAL);
@@ -1048,24 +1055,74 @@ impl<FS: ShimFS> Task<FS> {
                     .remove_process(child_process_id);
                 Errno::ENOMEM
             })?;
-        let child_as_id = match forked {
+        let child_as_id = match &forked {
             litebox::platform::address_space::ForkedAddressSpace::SharedWithParent(id)
-            | litebox::platform::address_space::ForkedAddressSpace::Independent(id) => id,
+            | litebox::platform::address_space::ForkedAddressSpace::Independent(id) => *id,
         };
+        let is_shared = matches!(
+            forked,
+            litebox::platform::address_space::ForkedAddressSpace::SharedWithParent(_)
+        );
 
         // 3. Allocate a TID for the child (also serves as PID on the guest side).
         let child_tid = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);
 
-        // 4. Create the vfork synchronization primitive. The parent will block
-        //    on this after spawning the child; the child signals it on exec/exit.
-        let vfork_done = Arc::new(crate::VforkDone::new(self.wait_cx().waker().clone()));
+        // 4. Build per-fork-mode state: vfork (shared with parent) vs
+        //    independent (kernel CoW).
+        let (child_process_state, child_files, child_fork_context, vfork_done) = if is_shared {
+            // Userland / shared: child temporarily uses parent's ProcessState
+            // (address space). ForkContext records the child's reserved
+            // partition and the synchronization primitive. On exec, the child
+            // will detach (create own ProcessState).
+            //
+            // FD table is duplicated now so the child can safely do dup2/close
+            // between fork and exec without corrupting the parent's FD state.
+            let vfork_done = Arc::new(crate::VforkDone::new(self.wait_cx().waker().clone()));
+            let fc = crate::ForkContext {
+                address_space_id: child_as_id,
+                vfork_done: vfork_done.clone(),
+            };
+            let child_files_state = Arc::new(
+                self.files
+                    .borrow()
+                    .clone_for_fork(&mut self.global.litebox.descriptor_table_mut()),
+            );
+            (
+                self.process_state.clone(),                  // share parent's PM
+                core::cell::RefCell::new(child_files_state), // independent FD table
+                Some(fc),
+                Some(vfork_done),
+            )
+        } else {
+            // Kernel / independent: child has its own CoW address space from
+            // the platform. Create an independent ProcessState and duplicate
+            // the FD table now (not deferred to exec).
+            let child_range = self
+                .global
+                .platform
+                .address_space_range(child_as_id)
+                .expect("child address space must be valid");
+            let child_ps = Arc::new(crate::ProcessState {
+                pm: litebox::mm::PageManager::new(&self.global.litebox, child_range),
+                address_space_id: child_as_id,
+            });
+            let child_files_state = Arc::new(
+                self.files
+                    .borrow()
+                    .clone_for_fork(&mut self.global.litebox.descriptor_table_mut()),
+            );
+            (
+                core::cell::RefCell::new(child_ps),          // own ProcessState
+                core::cell::RefCell::new(child_files_state), // own FD table
+                None,                                        // no ForkContext
+                None,                                        // no vfork sync
+            )
+        };
 
-        // 5. Create the child Task with vfork sharing: uses the parent's
-        //    ProcessState temporarily. The child's own partition is recorded in
-        //    ForkContext for later use by execve().
+        // 5. Create the child Task.
         let child_thread = ThreadState::new_process(child_tid);
         child_thread.init_state.set(ThreadInitState::NewThread {
-            stack: None, // vfork: use parent's stack
+            stack: None, // vfork: parent's stack; independent: CoW copy
             tls: None,   // inherit parent's TLS
             set_child_tid: None,
         });
@@ -1076,7 +1133,7 @@ impl<FS: ShimFS> Task<FS> {
                 Box::new(NewThreadArgs {
                     task: Task {
                         global: self.global.clone(),
-                        process_state: self.process_state.clone(), // vfork: share parent's PM
+                        process_state: child_process_state,
                         wait_state: crate::wait::WaitState::new(self.global.platform),
                         thread: child_thread,
                         process_id: child_process_id,
@@ -1086,12 +1143,9 @@ impl<FS: ShimFS> Task<FS> {
                         credentials: self.credentials.clone(),
                         comm: self.comm.clone(),
                         fs: self.fs.clone(),
-                        files: self.files.clone(),
+                        files: child_files,
                         signals: self.signals.clone_for_new_task(),
-                        fork_context: core::cell::RefCell::new(Some(crate::ForkContext {
-                            address_space_id: child_as_id,
-                            vfork_done: vfork_done.clone(),
-                        })),
+                        fork_context: core::cell::RefCell::new(child_fork_context),
                     },
                 }),
             )
@@ -1107,11 +1161,14 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::ENOMEM);
         }
 
-        // 6. Block parent until child execs or exits (vfork semantics).
-        //    Like Linux's TASK_UNINTERRUPTIBLE wait: keep blocking even if
-        //    interrupted, because parent and child share the same guest stack.
-        while !vfork_done.is_done() {
-            let _ = self.wait_cx().wait_until(|| vfork_done.is_done());
+        // 6. For vfork (shared), block the parent until child execs or exits.
+        //    For independent fork, the parent continues immediately.
+        if let Some(vd) = vfork_done {
+            // Like Linux's TASK_UNINTERRUPTIBLE wait: keep blocking even if
+            // interrupted, because parent and child share the same guest stack.
+            while !vd.is_done() {
+                let _ = self.wait_cx().wait_until(|| vd.is_done());
+            }
         }
 
         // Parent returns child's PID.
@@ -1801,18 +1858,9 @@ impl<FS: ShimFS> Task<FS> {
             });
             self.process_state.replace(child_ps);
 
-            // Unshare file descriptors and fs state. During the vfork window
-            // these were shared with the parent (who is blocked), but after
-            // exec the child must have independent copies. Each raw fd is
-            // duplicated in the global descriptor table so the child gets
-            // independent OwnedFd handles (closing an fd in one process must
-            // not mark it closed in the other).
-            let new_files = Arc::new(
-                self.files
-                    .borrow()
-                    .clone_for_fork(&mut self.global.litebox.descriptor_table_mut()),
-            );
-            self.files.replace(new_files);
+            // Unshare fs state. During the vfork window this was shared with
+            // the parent (who is blocked), but after exec the child must have
+            // its own copy. FD table was already duplicated at fork time.
             let new_fs: Arc<_> = Arc::new(self.fs.borrow().as_ref().clone());
             self.fs.replace(new_fs);
 
