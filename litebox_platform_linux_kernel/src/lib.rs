@@ -155,7 +155,6 @@ pub struct RawMutex<Host: HostInterface> {
 unsafe impl<Host: HostInterface> Send for RawMutex<Host> {}
 unsafe impl<Host: HostInterface> Sync for RawMutex<Host> {}
 
-/// TODO: common mutex implementation could be moved to a shared crate
 impl<Host: HostInterface> litebox::platform::RawMutex for RawMutex<Host> {
     const INIT: Self = Self::new();
 
@@ -236,6 +235,7 @@ impl<Host: HostInterface> TimeProvider for LinuxKernel<Host> {
     }
 
     fn current_time(&self) -> Self::SystemTime {
+        use litebox::platform::Instant as _;
         // Derive the current system time from the monotonic clock elapsed
         // since boot, avoiding repeated host calls.
         //
