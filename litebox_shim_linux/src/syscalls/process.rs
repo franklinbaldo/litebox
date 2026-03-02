@@ -539,7 +539,11 @@ impl<FS: ShimFS> Task<FS> {
                 Some(fc) => fc.address_space_id,
                 None => self.process_state.borrow().address_space_id,
             };
-            let _ = self.global.platform.destroy_address_space(as_id);
+            let r = self.global.platform.destroy_address_space(as_id);
+            debug_assert!(
+                r.is_ok(),
+                "failed to destroy address space {as_id:?}: {r:?}"
+            );
         }
 
         if let Some(clear_child_tid) = self.thread.clear_child_tid.take() {
@@ -819,8 +823,10 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
 
-        // Detect fork-like clone: new process (!CLONE_VM, !CLONE_THREAD).
-        let is_fork = !flags.contains(CloneFlags::VM) && !flags.contains(CloneFlags::THREAD);
+        // Detect fork-like clone: new process (!CLONE_THREAD).
+        // This includes both fork (!CLONE_VM) and vfork (CLONE_VM | CLONE_VFORK).
+        let is_fork = !flags.contains(CloneFlags::THREAD)
+            && (!flags.contains(CloneFlags::VM) || flags.contains(CloneFlags::VFORK));
 
         if is_fork {
             return self.do_fork(ctx, args, flags, clone3);
@@ -998,6 +1004,11 @@ impl<FS: ShimFS> Task<FS> {
 
         // Supported flags for the fork path. Reject anything else.
         let fork_supported_flags = CloneFlags::VFORK
+            | CloneFlags::VM
+            // glibc's fork() passes these tid-related flags.
+            | CloneFlags::CHILD_SETTID
+            | CloneFlags::CHILD_CLEARTID
+            | CloneFlags::PARENT_SETTID
             // Ignored since we don't support sysv semaphores anyway.
             | CloneFlags::SYSVSEM;
         if flags.intersects(!fork_supported_flags) {
@@ -1005,6 +1016,13 @@ impl<FS: ShimFS> Task<FS> {
                 "fork with unsupported flags: {:?}",
                 flags & !fork_supported_flags
             );
+            return Err(Errno::EINVAL);
+        }
+
+        // The fork path always uses vfork semantics (child runs on parent's
+        // stack). Reject requests for a separate child stack.
+        if args.stack != 0 || args.stack_size != 0 {
+            log_unsupported!("fork with explicit child stack");
             return Err(Errno::EINVAL);
         }
 

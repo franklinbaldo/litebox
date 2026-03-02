@@ -546,6 +546,25 @@ pattern (shells, build systems, daemons).
 This is a documented, platform-specific limitation. Such programs work
 correctly on kernel platforms (true COW fork).
 
+On userland, all processes share a single host page table. Each process
+gets a different VA partition (e.g., 1 TiB slots on x86_64). A `fork()`
+cannot give the child the same virtual addresses as the parent — only
+different ones. Since all internal pointers (stack return addresses, heap
+pointers, globals) in the parent's memory reference the parent's VA range,
+a simple memory copy into the child's range would leave the child with
+dangling pointers. True address-space duplication requires per-process page
+tables (kernel platforms).
+
+**Consequence for glibc `fork()` wrapper:** Glibc's `fork()` calls
+`clone(CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID | SIGCHLD)` and expects
+the child to return from `clone` with its own stack copy. The child-side
+code runs atfork handlers and other setup before returning to the caller.
+On userland, we treat all fork-like clones as vfork (shared stack, parent
+blocked), so the child's post-fork glibc code corrupts the parent's stack.
+**Glibc `fork()` is therefore not supported on userland.** Use `vfork()`
++ `execve()` (or `_exit()`) instead, which is the POSIX-sanctioned pattern
+for the fork+exec use case.
+
 #### Userland: fork + exec (Optimized Spawn Path)
 
 The sequence for `fork()` followed by `execve()`:
