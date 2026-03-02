@@ -357,6 +357,47 @@ fn test_fork_exec_waitpid() {
     );
 }
 
+/// End-to-end test for cross-process pipes: parent creates pipe, child
+/// writes through it after vfork+exec, parent reads after waitpid.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_pipe_cross_process() {
+    let unique_name = "pipe_cross_process_rewriter";
+    let target = common::compile(
+        "./tests/multiprocess/pipe_cross_process.c",
+        unique_name,
+        false, // dynamic (PIE)
+        false,
+    );
+    let output = Runner::new(Backend::Rewriter, &target, unique_name).output();
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("[OK]"),
+        "pipe_cross_process test failed:\n{output_str}",
+    );
+}
+
+/// Verify that pipe2(O_CLOEXEC) fds are properly closed in the child
+/// after vfork+exec (i.e., the FD_CLOEXEC metadata is preserved across
+/// fork-time fd duplication).
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_pipe_cloexec() {
+    let unique_name = "pipe_cloexec_rewriter";
+    let target = common::compile(
+        "./tests/multiprocess/pipe_cloexec.c",
+        unique_name,
+        false, // dynamic (PIE)
+        false,
+    );
+    let output = Runner::new(Backend::Rewriter, &target, unique_name).output();
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("[OK]"),
+        "pipe_cloexec test failed:\n{output_str}",
+    );
+}
+
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn run_python(args: &[&str]) -> String {
     let output = std::process::Command::new("python3")

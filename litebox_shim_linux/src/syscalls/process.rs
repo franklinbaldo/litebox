@@ -1713,8 +1713,15 @@ impl<FS: ShimFS> Task<FS> {
 
             // Unshare file descriptors and fs state. During the vfork window
             // these were shared with the parent (who is blocked), but after
-            // exec the child must have independent copies.
-            let new_files = Arc::new(self.files.borrow().clone_for_fork());
+            // exec the child must have independent copies. Each raw fd is
+            // duplicated in the global descriptor table so the child gets
+            // independent OwnedFd handles (closing an fd in one process must
+            // not mark it closed in the other).
+            let new_files = Arc::new(
+                self.files
+                    .borrow()
+                    .clone_for_fork(&mut self.global.litebox.descriptor_table_mut()),
+            );
             self.files.replace(new_files);
             let new_fs: Arc<_> = Arc::new(self.fs.borrow().as_ref().clone());
             self.fs.replace(new_fs);
