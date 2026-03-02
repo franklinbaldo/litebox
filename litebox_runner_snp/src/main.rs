@@ -127,73 +127,6 @@ pub extern "C" fn sandbox_kernel_init(
     litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::return_to_host();
 }
 
-/// Pre-defined file paths to load from host for testing purposes.
-/// Will remove this after we migrate 9p fs from VSBox to LiteBox, as we can directly access host files then.
-#[cfg(debug_assertions)]
-const HOST_FILE_PATHS: &[&str] = &[
-    "/out/hello",
-    "/out/efault",
-    "/out/thread_exit",
-    "/out/tcp_server",
-    // Add more paths as needed
-];
-
-/// Load pre-set files from host into the in-memory filesystem
-///
-/// This is a temporary solution before we migrate 9p fs from VSBox to LiteBox.
-#[cfg(debug_assertions)]
-fn load_host_files_into_fs<Platform: litebox::sync::RawSyncPrimitivesProvider>(
-    in_mem_fs: &mut litebox::fs::in_mem::FileSystem<Platform>,
-) {
-    use litebox::fs::FileSystem;
-
-    in_mem_fs.with_root_privileges(|fs| {
-        // Create /out directory if needed
-        let _ = fs.mkdir(
-            "/out",
-            litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
-        );
-
-        for path in HOST_FILE_PATHS {
-            match litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::load_file_from_host(path) {
-                Ok(data) if !data.is_empty() => {
-                    // Create parent directories if needed
-                    if let Some(parent) = path.rsplit_once('/').map(|(p, _)| p)
-                        && !parent.is_empty() {
-                            let _ = fs.mkdir(
-                                parent,
-                                litebox::fs::Mode::RWXU
-                                    | litebox::fs::Mode::RWXG
-                                    | litebox::fs::Mode::RWXO,
-                            );
-                        }
-
-                    // Create and initialize the file
-                    let mode =
-                        litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO; // executable
-                    let flags = litebox::fs::OFlags::CREAT | litebox::fs::OFlags::WRONLY;
-                    if let Ok(fd) = fs.open(path, flags, mode) {
-                        fs.initialize_primarily_read_heavy_file(&fd, data.into());
-                        let _ = fs.close(&fd);
-                    }
-                }
-                Ok(_) => {
-                    // Empty file, skip
-                    litebox::log_println!(
-                        litebox_platform_multiplex::platform(),
-                        "File is empty, skipping\n"
-                    );
-                }
-                Err(e) => {
-                    let s = format_args!("Failed to load file {path}: {e}\n").to_string();
-                    // File not available from host or too large, skip
-                    litebox::log_println!(litebox_platform_multiplex::platform(), &s);
-                }
-            }
-        }
-    });
-}
-
 /// Initializes the sandbox process.
 #[unsafe(no_mangle)]
 pub extern "C" fn sandbox_process_init(
@@ -265,7 +198,6 @@ pub extern "C" fn sandbox_process_init(
             }
         }
     });
-    load_host_files_into_fs(&mut in_mem_fs);
 
     let socket_addr = core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
         core::net::Ipv4Addr::new(10, 0, 0, 1),
