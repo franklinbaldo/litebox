@@ -175,7 +175,7 @@ impl<FS: ShimFS> Task<FS> {
                 // SAFETY: ptr is the freshly CoW-mapped region of exactly `len` bytes with
                 // `permissions`.
                 unsafe {
-                    self.global.pm.register_existing_mapping(
+                    self.process_state.borrow().pm.register_existing_mapping(
                         range,
                         permissions,
                         true,

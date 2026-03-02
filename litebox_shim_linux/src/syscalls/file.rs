@@ -1509,7 +1509,10 @@ impl<FS: ShimFS> Task<FS> {
             _ => {
                 #[cfg(debug_assertions)]
                 litebox::log_println!(self.global.platform, "\n\n\n{:?}\n\n\n", arg);
-                todo!()
+                // Return ENOTTY for unsupported ioctls rather than panicking.
+                // Complex programs (e.g., bash) probe terminal capabilities and
+                // handle ENOTTY gracefully.
+                Err(Errno::ENOTTY)
             }
         }
     }

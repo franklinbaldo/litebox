@@ -889,7 +889,7 @@ pub(crate) struct InternalFd {
 ///
 /// Note: this indicates ownership over the descriptor itself, but not necessarily the underlying
 /// entry, since there might be duplicates to the underlying entry.
-struct OwnedFd {
+pub(crate) struct OwnedFd {
     raw: u32,
     closed: AtomicBool,
 }
