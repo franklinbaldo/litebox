@@ -336,6 +336,27 @@ fn test_runner_with_ls() {
     }
 }
 
+/// End-to-end test for fork → exec → waitpid lifecycle.
+/// Compiled as dynamic (PIE) because child processes get a different VA
+/// partition and ET_EXEC binaries have hardcoded addresses in slot 0.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_fork_exec_waitpid() {
+    let unique_name = "fork_exec_wait_rewriter";
+    let target = common::compile(
+        "./tests/multiprocess/fork_exec_wait.c",
+        unique_name,
+        false, // dynamic (PIE)
+        false,
+    );
+    let output = Runner::new(Backend::Rewriter, &target, unique_name).output();
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("[OK]"),
+        "fork_exec_wait test failed:\n{output_str}",
+    );
+}
+
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn run_python(args: &[&str]) -> String {
     let output = std::process::Command::new("python3")

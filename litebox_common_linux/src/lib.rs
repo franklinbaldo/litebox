@@ -2772,6 +2772,37 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 };
                 SyscallRequest::Clone { args }
             }
+            // fork() and vfork() are legacy wrappers around clone().
+            Sysno::fork => SyscallRequest::Clone {
+                args: CloneArgs {
+                    flags: CloneFlags::empty(),
+                    exit_signal: signal::Signal::SIGCHLD.as_i32() as u64,
+                    stack: 0,
+                    parent_tid: 0,
+                    child_tid: 0,
+                    pidfd: 0,
+                    stack_size: 0,
+                    tls: 0,
+                    set_tid: 0,
+                    set_tid_size: 0,
+                    cgroup: 0,
+                },
+            },
+            Sysno::vfork => SyscallRequest::Clone {
+                args: CloneArgs {
+                    flags: CloneFlags::VM.union(CloneFlags::VFORK),
+                    exit_signal: signal::Signal::SIGCHLD.as_i32() as u64,
+                    stack: 0,
+                    parent_tid: 0,
+                    child_tid: 0,
+                    pidfd: 0,
+                    stack_size: 0,
+                    tls: 0,
+                    set_tid: 0,
+                    set_tid_size: 0,
+                    cgroup: 0,
+                },
+            },
             Sysno::clone3 => {
                 debug_assert_eq!(
                     ctx.sys_req_arg::<usize>(1),
