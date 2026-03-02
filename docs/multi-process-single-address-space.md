@@ -557,13 +557,23 @@ tables (kernel platforms).
 
 **Consequence for glibc `fork()` wrapper:** Glibc's `fork()` calls
 `clone(CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID | SIGCHLD)` and expects
-the child to return from `clone` with its own stack copy. The child-side
-code runs atfork handlers and other setup before returning to the caller.
-On userland, we treat all fork-like clones as vfork (shared stack, parent
-blocked), so the child's post-fork glibc code corrupts the parent's stack.
-**Glibc `fork()` is therefore not supported on userland.** Use `vfork()`
-+ `execve()` (or `_exit()`) instead, which is the POSIX-sanctioned pattern
-for the fork+exec use case.
+the child to return from `clone` with its own stack copy. On userland, we
+treat all fork-like clones as vfork (shared stack, parent blocked). The
+child's post-fork code in glibc (atfork handlers, etc.) runs while the
+parent is blocked, so stack corruption does not occur. However, the child
+**must** call `execve()` or `_exit()` — any attempt to return from `fork()`
+and continue normal execution with independent memory will fail because the
+child has no independent address space. In practice this means glibc
+`fork()` + `execve()` works correctly on userland, but `fork()` without
+`execve()` does not. Programs that fork children which do not exec (e.g.,
+daemon-style double-fork, `fork()`-based parallelism) require kernel
+platforms.
+
+**Post-fork child operations:** Between `fork()` and `execve()`, the child
+may safely perform async-signal-safe operations that go through the shim:
+`dup2()`, `close()`, `setpgid()`, `sigprocmask()`, `chdir()`. These modify
+per-task shim state and do not corrupt the shared guest memory. This covers
+the standard shell job-control setup pattern.
 
 #### Userland: fork + exec (Optimized Spawn Path)
 
@@ -608,8 +618,31 @@ The shim inspects `clone()` flags to determine behavior:
 |---|---|
 | `CLONE_VM \| CLONE_THREAD \| CLONE_SIGHAND \| CLONE_FILES` | Thread creation (existing behavior) |
 | No `CLONE_VM`, no `CLONE_THREAD` | Fork: vfork semantics on userland, COW on kernel |
-| `CLONE_VFORK` | vfork semantics on all platforms |
-| `CLONE_VM` without `CLONE_THREAD` | CLONE_VM: share address space, separate process (like Linux) |
+| `CLONE_VM \| CLONE_VFORK` (no `CLONE_THREAD`) | vfork semantics on all platforms (glibc `vfork()`) |
+| `CLONE_VM` without `CLONE_THREAD` or `CLONE_VFORK` | **Unsupported** (returns `EINVAL`). This would create a process sharing the parent's address space without blocking the parent — a rarely used Linux feature with no standard libc wrapper. |
+
+**Platform-driven fork behavior:** The shim's `do_fork` does not hard-code
+whether to use vfork or real fork semantics. Instead, it calls
+`fork_address_space()` and branches on the result:
+
+- `SharedWithParent(id)`: Child temporarily shares the parent's
+  `ProcessState` (address space) but gets an independent FD table at fork
+  time. Parent blocks (`VforkDone`). On `execve()`, the child detaches
+  into its own VA partition.
+- `Independent(id)`: Child gets its own `ProcessState` and duplicated FD
+  table at fork time. Parent continues immediately. No `ForkContext`.
+
+This keeps the shim platform-agnostic — the platform's return value drives
+the behavior.
+
+#### Fork Limitations Summary
+
+| Limitation | Platforms | Details |
+|---|---|---|
+| `fork()` without `execve()` | Userland only | Child shares parent's address space; independent memory not available. Use kernel platforms for fork-without-exec workloads. |
+| `CLONE_VM` without `CLONE_THREAD` or `CLONE_VFORK` | All | Returns `EINVAL`. No standard libc function uses this combination. |
+| `setpgid()` after child `execve()` | All | Returns success instead of `EACCES`. Harmless — shells tolerate this for race-avoidance. |
+| `fork()` + long-running child pre-exec code | Userland only | Parent is blocked during child's pre-exec phase. Acceptable for typical fork+exec patterns (shells, build systems). |
 
 ### 5.2 execve
 
