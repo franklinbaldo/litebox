@@ -375,6 +375,7 @@ fn default_fs(
 }
 
 // Special override so that `GETFL` can return stdio-specific flags
+#[derive(Clone, Copy)]
 pub(crate) struct StdioStatusFlags(litebox::fs::OFlags);
 
 impl<FS: ShimFS> syscalls::file::FilesState<FS> {
@@ -524,10 +525,13 @@ impl<FS: ShimFS> Task<FS> {
             .descriptors
             .iter_mut()
             .for_each(|slot| {
-                if let Some(desc) = slot.take()
-                    && let Ok(flags) = desc.get_file_descriptor_flags(&self.global, &files)
-                {
-                    if flags.contains(litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC) {
+                if let Some(desc) = slot.take() {
+                    let is_cloexec = desc
+                        .get_file_descriptor_flags(&self.global, &files)
+                        .is_ok_and(|f| {
+                            f.contains(litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC)
+                        });
+                    if is_cloexec {
                         let _ = self.do_close(desc);
                     } else {
                         *slot = Some(desc);
