@@ -115,8 +115,8 @@ pub enum WaitTarget {
     ProcessGroup(ProcessGroupId),
 }
 
-/// Options for `waitpid`-style calls (matches Linux flag values).
 bitflags::bitflags! {
+    /// Options for `waitpid`-style calls (matches Linux flag values).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct WaitOptions: u32 {
         /// Return immediately if no child has exited.

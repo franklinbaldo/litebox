@@ -105,7 +105,14 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     let buf = &mut buf[..input_binary.len()];
 
     // Parse the ELF and extract all metadata we need, then drop the borrow so we can mutate buf.
-    let (arch, dl_sysinfo_int80, text_sections, control_transfer_targets, trampoline_base_addr) = {
+    let (
+        arch,
+        dl_sysinfo_int80,
+        text_sections,
+        control_transfer_targets,
+        trampoline_base_addr,
+        fork_to_vfork_patch,
+    ) = {
         let file = object::File::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
 
         let arch = match file {
@@ -130,12 +137,15 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
 
         let trampoline_base_addr = find_addr_for_trampoline_code(&file);
 
+        let fork_to_vfork_patch = find_fork_vfork_patch(&file, &text_sections);
+
         (
             arch,
             dl_sysinfo_int80,
             text_sections,
             control_transfer_targets,
             trampoline_base_addr,
+            fork_to_vfork_patch,
         )
     };
 
@@ -173,6 +183,17 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
 
     if !syscall_insns_found {
         return Err(Error::NoSyscallInstructionsFound);
+    }
+
+    // Patch fork → vfork: overwrite the first bytes of __libc_fork with a
+    // JMP to __libc_vfork. This prevents glibc's fork wrapper from running
+    // post-fork handlers that corrupt shared state under vfork semantics.
+    if let Some((fork_file_offset, rel32)) = fork_to_vfork_patch {
+        let off = fork_file_offset as usize;
+        if off + 5 <= buf.len() {
+            buf[off] = 0xE9; // JMP rel32
+            buf[off + 1..off + 5].copy_from_slice(&rel32.to_le_bytes());
+        }
     }
 
     // Build output: [patched ELF][padding to page boundary][trampoline code][header]
@@ -479,6 +500,62 @@ fn get_symbols(file: &object::File<'_>) -> Option<u64> {
                 .filter(|name| *name == "_dl_sysinfo_int80")
                 .map(|_| sym.address())
         })
+}
+
+/// Find fork and vfork symbols in the ELF and compute the patch needed to
+/// redirect fork → vfork. Returns `Some((fork_file_offset, jmp_rel32))` if
+/// both symbols are found, or `None` if this binary doesn't export fork.
+fn find_fork_vfork_patch(
+    file: &object::File<'_>,
+    text_sections: &[TextSectionInfo],
+) -> Option<(u64, i32)> {
+    use object::ObjectSymbol as _;
+
+    // Search both .dynsym and .symtab for fork/vfork.
+    let mut fork_vaddr = None;
+    let mut vfork_vaddr = None;
+
+    for sym in file.dynamic_symbols().chain(file.symbols()) {
+        if sym.kind() != object::SymbolKind::Text {
+            continue;
+        }
+        let name = match sym.name() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        match name {
+            "fork" | "__libc_fork" if fork_vaddr.is_none() => {
+                fork_vaddr = Some(sym.address());
+            }
+            "vfork" | "__libc_vfork" | "__vfork" if vfork_vaddr.is_none() => {
+                vfork_vaddr = Some(sym.address());
+            }
+            _ => {}
+        }
+    }
+
+    let fork_vaddr = fork_vaddr?;
+    let vfork_vaddr = vfork_vaddr?;
+
+    // Convert fork's vaddr to a file offset using the text sections.
+    let fork_file_offset = text_sections.iter().find_map(|s| {
+        let section_end = s.vaddr + s.size;
+        if fork_vaddr >= s.vaddr && fork_vaddr < section_end {
+            Some(s.file_offset + (fork_vaddr - s.vaddr))
+        } else {
+            None
+        }
+    })?;
+
+    // Compute the relative offset for a JMP rel32 instruction.
+    // JMP rel32 encodes: target = rip_after_jmp + rel32
+    // rip_after_jmp = fork_vaddr + 5 (size of JMP rel32 instruction)
+    let rel32 = i64::try_from(vfork_vaddr)
+        .ok()?
+        .checked_sub(i64::try_from(fork_vaddr).ok()? + 5)?;
+    let rel32 = i32::try_from(rel32).ok()?;
+
+    Some((fork_file_offset, rel32))
 }
 
 fn get_control_transfer_targets(

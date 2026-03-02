@@ -644,6 +644,34 @@ the behavior.
 | `setpgid()` after child `execve()` | All | Returns success instead of `EACCES`. Harmless — shells tolerate this for race-avoidance. |
 | `fork()` + long-running child pre-exec code | Userland only | Parent is blocked during child's pre-exec phase. Acceptable for typical fork+exec patterns (shells, build systems). |
 
+#### Fork→Vfork Libc Patch (Userland)
+
+On userland platforms, the syscall rewriter patches `__libc_fork` in libc.so
+to jump directly to `__libc_vfork`. This is a 5-byte `JMP rel32` instruction
+at the entry point of `__libc_fork`, redirecting to `__libc_vfork`'s code.
+
+**Why:** glibc's `__libc_fork` wrapper (~0x490 bytes) runs post-fork handlers
+that modify global state (`_rtld_global`, `__fork_generation`, lock resets).
+In the shared-address-space model, these modifications corrupt the parent's
+globals. glibc's `__libc_vfork` wrapper (~0x39 bytes) is minimal — it only
+issues the vfork syscall and checks the return value.
+
+**Mechanism:** The rewriter finds `fork`/`__libc_fork` and `vfork`/`__libc_vfork`
+symbols in the ELF's dynamic symbol table, computes the relative offset, and
+patches the first 5 bytes of `__libc_fork` with `E9 <rel32>`. This catches
+all callers (both external via PLT and internal direct calls within libc).
+
+**Calling convention compatibility:** `vfork()` saves the return address in
+`%rdi` (via `pop %rdi`) before the syscall and restores it after (`push %rdi`).
+When called from `fork()`'s call site (which used `call fork@plt`), the return
+address is already on the stack for `vfork` to pop.
+
+**Writable page snapshot/restore:** Even with the fork→vfork patch, the child
+still runs on the parent's guest stack and may modify globals between fork-return
+and execve. The shim snapshots all writable guest VMAs before spawning the child
+and restores them after the child signals vfork_done. This snapshot must be taken
+*before* `spawn_thread` to capture clean, pre-modification state.
+
 ### 5.2 execve
 
 `execve()` operates on the **calling process's** per-process state:

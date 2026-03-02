@@ -576,6 +576,82 @@ fn test_tun_with_tcp_socket() {
     child.join().unwrap();
 }
 
+/// Stage an additional host binary (+ its dependencies, rewritten) into
+/// the guest filesystem tar directory. Used to make binaries like `cat`
+/// available for bash to exec.
+#[cfg(target_arch = "x86_64")]
+fn stage_host_binary(tar_dir: &Path, binary_name: &str, guest_path: &str) {
+    let host_path = run_which(binary_name);
+    let dir_path = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+
+    // Rewrite the binary itself.
+    let rewritten = dir_path.join(format!("{binary_name}.hooked"));
+    let success = common::rewrite_with_cache(&host_path, &rewritten, &[]);
+    assert!(success, "failed to rewrite {binary_name}");
+
+    // Copy rewritten binary to guest filesystem.
+    let dest = tar_dir.join(&guest_path[1..]); // strip leading '/'
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::copy(&rewritten, &dest).unwrap();
+
+    // Rewrite and stage any dependencies not already present.
+    let deps = common::find_dependencies(host_path.to_str().unwrap());
+    for dep in &deps {
+        let dep_path = Path::new(dep.as_str());
+        let dep_dest = tar_dir.join(&dep[1..]);
+        if dep_dest.exists() {
+            continue; // already staged by the main binary
+        }
+        if let Some(parent) = dep_dest.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let success = common::rewrite_with_cache(dep_path, &dep_dest, &[]);
+        assert!(success, "failed to rewrite dependency {dep}");
+    }
+}
+
+/// Run bash with a simple echo (builtin). Tests that bash can start and
+/// execute a command on LiteBox userland.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_bash_echo() {
+    let bash_path = run_which("bash");
+    let output = Runner::new(Backend::Rewriter, &bash_path, "bash_echo_rewriter")
+        .args(["--norc", "--noprofile", "-c", "echo hello-from-bash"])
+        .output();
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("hello-from-bash"),
+        "bash echo test failed:\n{output_str}",
+    );
+}
+
+/// Run bash piping echo (builtin) into /bin/cat (fork+exec). Tests the
+/// full multi-process stack: fork, exec, pipes, waitpid.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_bash_pipe_cat() {
+    let bash_path = run_which("bash");
+    let output = Runner::new(Backend::Rewriter, &bash_path, "bash_pipe_cat_rewriter")
+        .args([
+            "--norc",
+            "--noprofile",
+            "-c",
+            "echo hello-pipe-test | /bin/cat",
+        ])
+        .with_fs_path(|tar_dir| {
+            stage_host_binary(tar_dir, "cat", "/bin/cat");
+        })
+        .output();
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("hello-pipe-test"),
+        "bash pipe+cat test failed:\n{output_str}",
+    );
+}
+
 /// Test network performance with iperf3
 ///
 /// To run it with release build and see output, use:

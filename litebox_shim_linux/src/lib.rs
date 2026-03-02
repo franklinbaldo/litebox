@@ -114,6 +114,14 @@ impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
                 return ContinueOperation::Terminate;
             }
         }
+        // CoW fault: write (error_code bit 1) to a present (bit 0) read-only
+        // page that we protected for vfork snapshotting.
+        if info.exception == litebox::shim::Exception::PAGE_FAULT && (info.error_code & 0x3) == 0x3
+        {
+            if self.task.try_handle_cow_fault(info.cr2) {
+                return ContinueOperation::Resume;
+            }
+        }
         self.enter_shim(false, ctx, |task, _ctx| task.handle_exception_request(info))
     }
 
@@ -539,6 +547,93 @@ impl<FS: ShimFS> Task<FS> {
                 }
             });
     }
+
+    /// Close ALL open file descriptors. Called during process exit to release
+    /// resources (e.g., pipe write ends) so that readers see EOF.
+    fn close_all_fds(&self) {
+        let files = self.files.borrow();
+        files
+            .file_descriptors
+            .write()
+            .descriptors
+            .iter_mut()
+            .for_each(|slot| {
+                if let Some(desc) = slot.take() {
+                    let _ = self.do_close(desc);
+                }
+            });
+    }
+
+    /// Handle a potential CoW page fault during vfork.
+    ///
+    /// If this task is a vfork child with active CoW protection and the fault
+    /// address falls in a protected range, snapshot the faulting page and
+    /// restore write permission so the child can continue. Returns `true` if
+    /// the fault was handled.
+    fn try_handle_cow_fault(&self, fault_addr: usize) -> bool {
+        let fc_ref = self.fork_context.borrow();
+        let Some(fc) = fc_ref.as_ref() else {
+            return false;
+        };
+        let Some(cow) = fc.cow_state.as_ref() else {
+            return false;
+        };
+
+        let page_addr = fault_addr & !(PAGE_SIZE - 1);
+
+        // Check if the faulting page is within a CoW-protected range and get
+        // the original permissions for that range.
+        let orig_perms = cow
+            .protected_ranges
+            .iter()
+            .find(|&&(base, len, _)| page_addr >= base && page_addr < base + len)
+            .map(|&(_, _, perms)| perms);
+        let Some(orig_perms) = orig_perms else {
+            return false;
+        };
+
+        // Snapshot the original page content before allowing writes.
+        let mut dirty = cow.dirty_pages.lock();
+
+        let page_range = page_addr..page_addr + PAGE_SIZE;
+
+        // Skip if already snapshotted (e.g., repeated fault due to racing).
+        if dirty.iter().any(|(addr, _)| *addr == page_addr) {
+            // SAFETY: page is mapped; we are restoring its original perm.
+            return unsafe { cow_update_permissions(self.global.platform, page_range, orig_perms) };
+        }
+
+        // Copy original page content.
+        let mut buf = vec![0u8; PAGE_SIZE];
+        // SAFETY: page is mapped (present=1 in error code); read is safe.
+        unsafe {
+            core::ptr::copy_nonoverlapping(page_addr as *const u8, buf.as_mut_ptr(), PAGE_SIZE);
+        }
+        dirty.push((page_addr, buf));
+
+        // Restore original permissions (including WRITE and possibly EXEC).
+        // SAFETY: page was originally writable; restoring original perm.
+        unsafe { cow_update_permissions(self.global.platform, page_range, orig_perms) }
+    }
+}
+
+/// Call `update_permissions` with the correct `PAGE_SIZE` const generic.
+/// Returns `true` on success, `false` on failure (so the fault is not
+/// considered handled and will escalate to process termination).
+///
+/// # Safety
+///
+/// Caller must ensure the range is mapped and the permission change is sound.
+unsafe fn cow_update_permissions(
+    platform: &Platform,
+    range: core::ops::Range<usize>,
+    perms: litebox::platform::page_mgmt::MemoryRegionPermissions,
+) -> bool {
+    use litebox::platform::PageManagementProvider;
+    unsafe {
+        <Platform as PageManagementProvider<PAGE_SIZE>>::update_permissions(platform, range, perms)
+    }
+    .is_ok()
 }
 
 enum Descriptor<FS: ShimFS> {
@@ -1313,6 +1408,24 @@ impl VforkDone {
     }
 }
 
+/// Copy-on-write state for vfork memory protection.
+///
+/// Before spawning a vfork child, the parent marks all writable guest pages
+/// read-only and records them here. When the child writes to a protected page,
+/// the exception handler snapshots the original page content, restores write
+/// permission, and lets the child continue. After the child execs or exits,
+/// the parent restores only the dirtied pages and re-enables write on all.
+struct CowState {
+    /// Pages that were made read-only (base address, length, original permissions).
+    protected_ranges: Vec<(
+        usize,
+        usize,
+        litebox::platform::page_mgmt::MemoryRegionPermissions,
+    )>,
+    /// Per-page snapshots taken on first write: (page-aligned addr, original content).
+    dirty_pages: litebox::sync::Mutex<Platform, Vec<(usize, Vec<u8>)>>,
+}
+
 /// Context for a vfork child process.
 ///
 /// Stored in the child's `Task` after `do_fork`. The child temporarily uses
@@ -1324,6 +1437,8 @@ struct ForkContext {
     address_space_id: <Platform as litebox::platform::AddressSpaceProvider>::AddressSpaceId,
     /// Signals the parent to resume after the vfork child execs or exits.
     vfork_done: Arc<VforkDone>,
+    /// CoW state shared with the parent for lazy page snapshotting.
+    cow_state: Option<Arc<CowState>>,
 }
 
 struct Task<FS: ShimFS> {
