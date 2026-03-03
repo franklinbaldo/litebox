@@ -89,12 +89,20 @@ impl PartitionState {
         self.allocated.len()
     }
 
-    /// Claim the next free slot. Returns the slot index or `None` if full.
-    fn allocate(&mut self) -> Option<u32> {
-        for (i, slot) in self.allocated.iter_mut().enumerate() {
-            if !*slot {
-                *slot = true;
-                return Some(i as u32);
+    /// Claim the next free slot whose VA range has no host allocations.
+    ///
+    /// Calls `probe` on each candidate slot's range. If `probe` returns `true`
+    /// (clean), the slot is allocated. Slots where `probe` returns `false` are
+    /// skipped (not marked allocated — they may become usable later).
+    fn allocate_probed(&mut self, probe: impl Fn(core::ops::Range<usize>) -> bool) -> Option<u32> {
+        let num_slots = self.num_slots();
+        for i in 0..num_slots {
+            if !self.allocated[i] {
+                let range = Self::compute_range(i as u32, num_slots);
+                if probe(range) {
+                    self.allocated[i] = true;
+                    return Some(i as u32);
+                }
             }
         }
         None
@@ -123,12 +131,48 @@ impl PartitionState {
 
     /// Return the VA range for the given slot, clipped to `VA_MIN..va_max`.
     fn range_of(&self, slot: u32) -> core::ops::Range<usize> {
+        Self::compute_range(slot, self.num_slots())
+    }
+
+    /// Compute the VA range for a slot given the total number of slots.
+    fn compute_range(slot: u32, num_slots: usize) -> core::ops::Range<usize> {
         let base = (slot as usize) * va_partitions::PARTITION_SIZE;
-        let va_max = self.num_slots() * va_partitions::PARTITION_SIZE;
+        let va_max = num_slots * va_partitions::PARTITION_SIZE;
         let start = base.max(va_partitions::VA_MIN);
         let end = (base + va_partitions::PARTITION_SIZE).min(va_max);
         start..end
     }
+}
+
+/// Probe a VA range with `VirtualQuery` to check for host allocations.
+///
+/// Returns `true` if the entire range is free (`MEM_FREE`), meaning no
+/// host DLLs, heap, or system allocations occupy it. Used at partition
+/// allocation time to skip slots with ASLR-placed host mappings.
+fn is_va_range_clean(range: core::ops::Range<usize>) -> bool {
+    let mut addr = range.start;
+    while addr < range.end {
+        let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+        let ok = unsafe {
+            Win32_Memory::VirtualQuery(
+                addr as *const c_void,
+                &raw mut mbi,
+                core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+            ) != 0
+        };
+        if !ok {
+            // VirtualQuery failed — treat as unclean to be safe.
+            return false;
+        }
+        if mbi.State != Win32_Memory::MEM_FREE {
+            return false;
+        }
+        addr = mbi.BaseAddress as usize + mbi.RegionSize;
+        if addr == 0 {
+            break;
+        }
+    }
+    true
 }
 
 /// The userland Windows platform.
@@ -438,7 +482,7 @@ impl litebox::platform::AddressSpaceProvider for WindowsUserland {
         self.partitions
             .lock()
             .unwrap()
-            .allocate()
+            .allocate_probed(is_va_range_clean)
             .ok_or(litebox::platform::address_space::AddressSpaceError::NoSpace)
     }
 
@@ -450,6 +494,25 @@ impl litebox::platform::AddressSpaceProvider for WindowsUserland {
             return Err(litebox::platform::address_space::AddressSpaceError::InvalidId);
         }
         Ok(())
+    }
+
+    fn fork_address_space(
+        &self,
+        parent: Self::AddressSpaceId,
+    ) -> Result<
+        litebox::platform::address_space::ForkedAddressSpace<Self::AddressSpaceId>,
+        litebox::platform::address_space::AddressSpaceError,
+    > {
+        // Validate parent and allocate child under a single lock to avoid
+        // TOCTOU races (the Linux impl drops and re-acquires the lock).
+        let mut partitions = self.partitions.lock().unwrap();
+        if !partitions.is_allocated(parent) {
+            return Err(litebox::platform::address_space::AddressSpaceError::InvalidId);
+        }
+        let child = partitions
+            .allocate_probed(is_va_range_clean)
+            .ok_or(litebox::platform::address_space::AddressSpaceError::NoSpace)?;
+        Ok(litebox::platform::address_space::ForkedAddressSpace::SharedWithParent(child))
     }
 
     fn activate_address_space(
