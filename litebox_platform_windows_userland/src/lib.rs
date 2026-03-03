@@ -1788,6 +1788,18 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         Ok(())
     }
 
+    /// Returns host memory regions that are reserved or committed at boot time.
+    ///
+    /// These are scanned once during `WindowsUserland::new()` via `VirtualQuery`
+    /// and remain static for the platform's lifetime. The `PageManager` for each
+    /// child process clamps these to its partition VA range automatically
+    /// (see `Vmem::new()` in `litebox/src/mm/linux.rs`).
+    ///
+    /// **Known limitation:** Post-boot host allocations (lazy `LoadLibrary`,
+    /// thread stacks, heap growth) are not reflected here. The partition-time
+    /// `VirtualQuery` probing in `allocate_probed(is_va_range_clean)` provides
+    /// a runtime safety net at partition creation time, but not at every
+    /// individual page allocation.
     fn reserved_pages(&self) -> impl Iterator<Item = &std::ops::Range<usize>> {
         self.reserved_pages.iter()
     }

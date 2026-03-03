@@ -349,7 +349,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
         &self,
         addr: core::net::SocketAddr,
     ) -> Result<transport::ShimTransport, Errno> {
-        transport::ShimTransport::connect(self.0.clone(), addr)
+        transport::ShimTransport::connect(self.global.clone(), addr)
     }
 }
 
