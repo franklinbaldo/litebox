@@ -48,6 +48,89 @@ thread_local! {
     static THREAD_FS_BASE: Cell<usize> = const { Cell::new(0) };
 }
 
+/// VA-partition constants for multi-process support.
+///
+/// Each guest process is assigned a non-overlapping 1 TiB VA partition.
+/// The number of partitions is determined at runtime from the platform's
+/// actual maximum user-mode address.
+mod va_partitions {
+    /// Size of each VA partition (1 TiB).
+    pub const PARTITION_SIZE: usize = 1 << 40;
+
+    /// The lowest usable guest address (matches `TASK_ADDR_MIN`).
+    pub const VA_MIN: usize = 0x1_0000;
+}
+
+/// Hardcoded upper bound for guest VA (one-past-the-end).
+///
+/// This must not exceed `GetSystemInfo().lpMaximumApplicationAddress + 1`.
+/// A `debug_assert` in `WindowsUserland::new()` validates this at runtime.
+const TASK_ADDR_MAX: usize = 0x7FFF_FFFE_F000;
+
+/// Tracks which VA partition slots are allocated.
+///
+/// Uses `Vec<bool>` so the number of slots can be determined at runtime
+/// from `GetSystemInfo().lpMaximumApplicationAddress`.
+struct PartitionState {
+    allocated: alloc::vec::Vec<bool>,
+}
+
+impl PartitionState {
+    /// Create a new partition state sized for the given VA range.
+    fn new(va_max: usize) -> Self {
+        let num_slots = va_max / va_partitions::PARTITION_SIZE;
+        Self {
+            allocated: alloc::vec![false; num_slots],
+        }
+    }
+
+    /// Number of partition slots.
+    fn num_slots(&self) -> usize {
+        self.allocated.len()
+    }
+
+    /// Claim the next free slot. Returns the slot index or `None` if full.
+    fn allocate(&mut self) -> Option<u32> {
+        for (i, slot) in self.allocated.iter_mut().enumerate() {
+            if !*slot {
+                *slot = true;
+                return Some(i as u32);
+            }
+        }
+        None
+    }
+
+    /// Release a previously allocated slot.
+    ///
+    /// Returns `false` if the slot is out of range or not currently allocated.
+    fn deallocate(&mut self, slot: u32) -> bool {
+        let idx = slot as usize;
+        if idx >= self.num_slots() {
+            return false;
+        }
+        if !self.allocated[idx] {
+            return false;
+        }
+        self.allocated[idx] = false;
+        true
+    }
+
+    /// Returns `true` if the given slot is currently allocated.
+    fn is_allocated(&self, slot: u32) -> bool {
+        let idx = slot as usize;
+        idx < self.num_slots() && self.allocated[idx]
+    }
+
+    /// Return the VA range for the given slot, clipped to `VA_MIN..va_max`.
+    fn range_of(&self, slot: u32) -> core::ops::Range<usize> {
+        let base = (slot as usize) * va_partitions::PARTITION_SIZE;
+        let va_max = self.num_slots() * va_partitions::PARTITION_SIZE;
+        let start = base.max(va_partitions::VA_MIN);
+        let end = (base + va_partitions::PARTITION_SIZE).min(va_max);
+        start..end
+    }
+}
+
 /// The userland Windows platform.
 ///
 /// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
@@ -55,6 +138,7 @@ thread_local! {
 pub struct WindowsUserland {
     reserved_pages: alloc::vec::Vec<core::ops::Range<usize>>,
     sys_info: std::sync::RwLock<Win32_SysInfo::SYSTEM_INFO>,
+    partitions: Mutex<PartitionState>,
 }
 
 impl core::fmt::Debug for WindowsUserland {
@@ -222,28 +306,48 @@ impl WindowsUserland {
         let mut sys_info = Win32_SysInfo::SYSTEM_INFO::default();
         Self::get_system_information(&mut sys_info);
 
-        // TODO(chuqi): Currently we just print system information for
-        // `TASK_ADDR_MIN` and `TASK_ADDR_MAX`.
-        // Will remove these prints once we have a better way to replace
-        // the current `const` values in PageManagementProvider.
+        let va_min = sys_info.lpMinimumApplicationAddress as usize;
+        let va_max = sys_info.lpMaximumApplicationAddress as usize;
         #[cfg(debug_assertions)]
         {
             println!("System information.");
-            println!(
-                "=> Max user address: {:#x}",
-                sys_info.lpMaximumApplicationAddress as usize
-            );
-            println!(
-                "=> Min user address: {:#x}",
-                sys_info.lpMinimumApplicationAddress as usize
-            );
+            println!("=> Max user address: {va_max:#x}");
+            println!("=> Min user address: {va_min:#x}");
         }
+
+        // Validate that the hardcoded PageManagementProvider constants are
+        // consistent with the runtime values from GetSystemInfo. These run
+        // once at startup, so assert! (not debug_assert!) is appropriate.
+        assert!(
+            va_min <= va_partitions::VA_MIN,
+            "runtime lpMinimumApplicationAddress ({va_min:#x}) is above \
+             VA_MIN ({:#x})",
+            va_partitions::VA_MIN,
+        );
+        // va_max from GetSystemInfo is the last usable byte (inclusive).
+        // TASK_ADDR_MAX is one-past-the-end, so compare without overflow.
+        assert!(
+            TASK_ADDR_MAX - 1 <= va_max,
+            "hardcoded TASK_ADDR_MAX ({TASK_ADDR_MAX:#x}) exceeds runtime \
+             lpMaximumApplicationAddress ({va_max:#x})",
+        );
+
+        // +1 to convert from inclusive last-byte to exclusive upper bound.
+        // Safe: on 64-bit Windows, va_max is always well below usize::MAX.
+        let partitions = PartitionState::new(va_max + 1);
+        #[cfg(debug_assertions)]
+        println!(
+            "=> VA partitions: {} slots of {} bytes each",
+            partitions.num_slots(),
+            va_partitions::PARTITION_SIZE,
+        );
 
         let reserved_pages = Self::read_memory_maps();
 
         let platform = Self {
             reserved_pages,
             sys_info: std::sync::RwLock::new(sys_info),
+            partitions: Mutex::new(partitions),
         };
 
         // Initialize it's own fs-base (for the main thread)
@@ -331,14 +435,20 @@ impl litebox::platform::AddressSpaceProvider for WindowsUserland {
     fn create_address_space(
         &self,
     ) -> Result<Self::AddressSpaceId, litebox::platform::address_space::AddressSpaceError> {
-        // Single-process stub: always return slot 0.
-        Ok(0)
+        self.partitions
+            .lock()
+            .unwrap()
+            .allocate()
+            .ok_or(litebox::platform::address_space::AddressSpaceError::NoSpace)
     }
 
     fn destroy_address_space(
         &self,
-        _id: Self::AddressSpaceId,
+        id: Self::AddressSpaceId,
     ) -> Result<(), litebox::platform::address_space::AddressSpaceError> {
+        if !self.partitions.lock().unwrap().deallocate(id) {
+            return Err(litebox::platform::address_space::AddressSpaceError::InvalidId);
+        }
         Ok(())
     }
 
@@ -352,12 +462,13 @@ impl litebox::platform::AddressSpaceProvider for WindowsUserland {
 
     fn address_space_range(
         &self,
-        _id: Self::AddressSpaceId,
+        id: Self::AddressSpaceId,
     ) -> Result<core::ops::Range<usize>, litebox::platform::address_space::AddressSpaceError> {
-        // These match the TASK_ADDR constants in PageManagementProvider.
-        const TASK_ADDR_MIN: usize = 0x1_0000;
-        const TASK_ADDR_MAX: usize = 0x7FFF_FFFE_F000;
-        Ok(TASK_ADDR_MIN..TASK_ADDR_MAX)
+        let partitions = self.partitions.lock().unwrap();
+        if !partitions.is_allocated(id) {
+            return Err(litebox::platform::address_space::AddressSpaceError::InvalidId);
+        }
+        Ok(partitions.range_of(id))
     }
 }
 
@@ -1398,12 +1509,8 @@ macro_rules! debug_assert_alignment {
 }
 
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for WindowsUserland {
-    // TODO(chuqi): These are currently "magic numbers" grabbed from my Windows 11 SystemInformation.
-    // The actual values should be determined by `GetSystemInfo()`.
-    //
-    // NOTE: make sure the values are PAGE_ALIGNED.
-    const TASK_ADDR_MIN: usize = 0x1_0000;
-    const TASK_ADDR_MAX: usize = 0x7FFF_FFFE_F000;
+    const TASK_ADDR_MIN: usize = va_partitions::VA_MIN;
+    const TASK_ADDR_MAX: usize = TASK_ADDR_MAX;
     fn allocate_pages(
         &self,
         suggested_range: core::ops::Range<usize>,
