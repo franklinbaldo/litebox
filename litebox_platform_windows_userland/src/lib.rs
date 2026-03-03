@@ -326,9 +326,39 @@ impl WindowsUserland {
 impl litebox::platform::Provider for WindowsUserland {}
 
 impl litebox::platform::AddressSpaceProvider for WindowsUserland {
-    // All methods default to `Err(NotSupported)` — real implementation comes
-    // when Windows multi-process support is added.
     type AddressSpaceId = u32;
+
+    fn create_address_space(
+        &self,
+    ) -> Result<Self::AddressSpaceId, litebox::platform::address_space::AddressSpaceError> {
+        // Single-process stub: always return slot 0.
+        Ok(0)
+    }
+
+    fn destroy_address_space(
+        &self,
+        _id: Self::AddressSpaceId,
+    ) -> Result<(), litebox::platform::address_space::AddressSpaceError> {
+        Ok(())
+    }
+
+    fn activate_address_space(
+        &self,
+        _id: Self::AddressSpaceId,
+    ) -> Result<(), litebox::platform::address_space::AddressSpaceError> {
+        // No-op on userland — all processes share the host address space.
+        Ok(())
+    }
+
+    fn address_space_range(
+        &self,
+        _id: Self::AddressSpaceId,
+    ) -> Result<core::ops::Range<usize>, litebox::platform::address_space::AddressSpaceError> {
+        // These match the TASK_ADDR constants in PageManagementProvider.
+        const TASK_ADDR_MIN: usize = 0x1_0000;
+        const TASK_ADDR_MAX: usize = 0x7FFF_FFFE_F000;
+        Ok(TASK_ADDR_MIN..TASK_ADDR_MAX)
+    }
 }
 
 /// Runs a guest thread using the provided shim and the given initial context.
