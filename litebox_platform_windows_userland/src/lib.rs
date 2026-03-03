@@ -1895,6 +1895,45 @@ unsafe extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext<'_>) 
     thread_ctx.call_shim(|shim, ctx, _interrupt| shim.syscall(ctx));
 }
 
+/// Check whether the page at `addr` is committed (has physical storage).
+///
+/// Uses `VirtualQuery` to inspect the page state. Returns `true` only for
+/// `MEM_COMMIT` pages; `MEM_RESERVE` and `MEM_FREE` return `false`.
+fn is_page_committed(addr: usize) -> bool {
+    let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+    // Safety: VirtualQuery reads kernel VA metadata; the address may be
+    // unmapped but VirtualQuery still succeeds (returns MEM_FREE).
+    let ok = unsafe {
+        Win32_Memory::VirtualQuery(
+            addr as *const c_void,
+            &raw mut mbi,
+            core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+        ) != 0
+    };
+    ok && mbi.State == Win32_Memory::MEM_COMMIT
+}
+
+/// Synthesize a Linux-style x86 page-fault error code from Windows
+/// exception information.
+///
+/// Bits:
+/// - 0: present (page committed but access denied)
+/// - 1: write fault
+/// - 2: user-mode (always set)
+/// - 4: instruction fetch (DEP)
+///
+/// `read_write_flag` is `ExceptionInformation[0]` from
+/// `EXCEPTION_ACCESS_VIOLATION`: 0 = read, 1 = write, 8 = DEP.
+fn synthesize_pf_error_code(is_present: bool, read_write_flag: usize) -> u32 {
+    (if is_present { 1 } else { 0 })
+        | match read_write_flag {
+            0 => 0,      // read fault
+            8 => 1 << 4, // DEP (instruction fetch)
+            _ => 1 << 1, // write fault
+        }
+        | 4 // bit 2: user-mode
+}
+
 unsafe extern "C-unwind" fn exception_handler(
     thread_ctx: &mut ThreadContext<'_>,
     exception_record: &EXCEPTION_RECORD,
@@ -1908,39 +1947,8 @@ unsafe extern "C-unwind" fn exception_handler(
                 // This is probably a #GP, not a #PF.
                 (Exception::GENERAL_PROTECTION_FAULT, 0, 0)
             } else {
-                // Synthesize a Linux-style x86 page-fault error code:
-                //   bit 0: present (page is committed but access denied)
-                //   bit 1: write fault
-                //   bit 2: user-mode
-                //   bit 4: instruction fetch (DEP)
-                //
-                // Windows EXCEPTION_ACCESS_VIOLATION does not distinguish
-                // "page present but permission denied" from "page not
-                // present". Use VirtualQuery to determine if the faulting
-                // page is committed (present). This is required for CoW
-                // fault detection: the shim checks (error_code & 0x3) == 0x3
-                // (present + write).
-                let is_present = {
-                    let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
-                    // Safety: VirtualQuery reads kernel VA metadata; the
-                    // faulting_address may be unmapped but that's fine —
-                    // VirtualQuery still succeeds and returns MEM_FREE.
-                    let ok = unsafe {
-                        Win32_Memory::VirtualQuery(
-                            faulting_address as *const c_void,
-                            &raw mut mbi,
-                            core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
-                        ) != 0
-                    };
-                    ok && mbi.State == Win32_Memory::MEM_COMMIT
-                };
-                let error_code = (if is_present { 1 } else { 0 }) // bit 0: present
-                    | match read_write_flag {
-                        0 => 0,          // read fault
-                        8 => 1 << 4,     // DEP (instruction fetch)
-                        _ => 1 << 1,     // write fault
-                    }
-                    | 4; // bit 2: user-mode
+                let is_present = is_page_committed(faulting_address);
+                let error_code = synthesize_pf_error_code(is_present, read_write_flag);
                 (Exception::PAGE_FAULT, error_code, faulting_address)
             }
         }
@@ -2193,5 +2201,174 @@ mod tests {
         .unwrap()
         .as_usize();
         assert_ne!(addr3, addr + 0x4000);
+    }
+
+    // -- Step 3.2: error-code synthesis tests --
+
+    #[test]
+    fn test_synthesize_pf_error_code() {
+        use super::synthesize_pf_error_code;
+
+        // Write to committed (present) page → CoW case: bits 0+1+2 = 0b111 = 0x7
+        assert_eq!(synthesize_pf_error_code(true, 1), 0x7);
+        // Shim CoW check: (error_code & 0x3) == 0x3
+        assert_eq!(synthesize_pf_error_code(true, 1) & 0x3, 0x3);
+
+        // Write to unmapped page: bits 1+2 = 0b110 = 0x6
+        assert_eq!(synthesize_pf_error_code(false, 1), 0x6);
+        assert_ne!(synthesize_pf_error_code(false, 1) & 0x3, 0x3);
+
+        // Read, committed page: bits 0+2 = 0b101 = 0x5
+        assert_eq!(synthesize_pf_error_code(true, 0), 0x5);
+
+        // Read, unmapped page: bit 2 only = 0b100 = 0x4
+        assert_eq!(synthesize_pf_error_code(false, 0), 0x4);
+
+        // DEP, committed page: bits 0+4+2 = 0x15
+        assert_eq!(synthesize_pf_error_code(true, 8), 0x15);
+
+        // DEP, uncommitted page: bits 4+2 = 0x14
+        assert_eq!(synthesize_pf_error_code(false, 8), 0x14);
+    }
+
+    #[test]
+    fn test_is_page_committed_states() {
+        use super::is_page_committed;
+
+        // Committed page → true
+        let addr = unsafe {
+            super::VirtualAlloc2(
+                super::GetCurrentProcess(),
+                core::ptr::null_mut(),
+                0x1000,
+                super::Win32_Memory::MEM_COMMIT | super::Win32_Memory::MEM_RESERVE,
+                super::Win32_Memory::PAGE_READWRITE,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        assert!(!addr.is_null());
+        assert!(is_page_committed(addr as usize));
+
+        // Change to read-only — still committed
+        let mut old_protect = 0u32;
+        let ok = unsafe {
+            super::VirtualProtect(
+                addr,
+                0x1000,
+                super::Win32_Memory::PAGE_READONLY,
+                &mut old_protect,
+            ) != 0
+        };
+        assert!(ok);
+        assert!(is_page_committed(addr as usize));
+
+        // Free the page → not committed
+        let ok = unsafe { super::VirtualFree(addr, 0, super::Win32_Memory::MEM_RELEASE) != 0 };
+        assert!(ok);
+        assert!(!is_page_committed(addr as usize));
+
+        // Reserved-only (no commit) → not committed
+        let reserved = unsafe {
+            super::VirtualAlloc2(
+                super::GetCurrentProcess(),
+                core::ptr::null_mut(),
+                0x1000,
+                super::Win32_Memory::MEM_RESERVE,
+                super::Win32_Memory::PAGE_READWRITE,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        assert!(!reserved.is_null());
+        assert!(!is_page_committed(reserved as usize));
+        let ok = unsafe { super::VirtualFree(reserved, 0, super::Win32_Memory::MEM_RELEASE) != 0 };
+        assert!(ok);
+    }
+
+    // -- Step 3.3: VirtualProtect round-trip tests --
+
+    #[test]
+    fn test_virtualprotect_cow_roundtrip() {
+        let addr = unsafe {
+            super::VirtualAlloc2(
+                super::GetCurrentProcess(),
+                core::ptr::null_mut(),
+                0x1000,
+                super::Win32_Memory::MEM_COMMIT | super::Win32_Memory::MEM_RESERVE,
+                super::Win32_Memory::PAGE_READWRITE,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        assert!(!addr.is_null());
+
+        let mut old_protect = 0u32;
+
+        // RW → RO
+        assert_ne!(
+            unsafe {
+                super::VirtualProtect(
+                    addr,
+                    0x1000,
+                    super::Win32_Memory::PAGE_READONLY,
+                    &mut old_protect,
+                )
+            },
+            0
+        );
+        // RO → RW
+        assert_ne!(
+            unsafe {
+                super::VirtualProtect(
+                    addr,
+                    0x1000,
+                    super::Win32_Memory::PAGE_READWRITE,
+                    &mut old_protect,
+                )
+            },
+            0
+        );
+
+        // XRW → XR
+        assert_ne!(
+            unsafe {
+                super::VirtualProtect(
+                    addr,
+                    0x1000,
+                    super::Win32_Memory::PAGE_EXECUTE_READWRITE,
+                    &mut old_protect,
+                )
+            },
+            0
+        );
+        assert_ne!(
+            unsafe {
+                super::VirtualProtect(
+                    addr,
+                    0x1000,
+                    super::Win32_Memory::PAGE_EXECUTE_READ,
+                    &mut old_protect,
+                )
+            },
+            0
+        );
+        // XR → XRW
+        assert_ne!(
+            unsafe {
+                super::VirtualProtect(
+                    addr,
+                    0x1000,
+                    super::Win32_Memory::PAGE_EXECUTE_READWRITE,
+                    &mut old_protect,
+                )
+            },
+            0
+        );
+
+        assert_ne!(
+            unsafe { super::VirtualFree(addr, 0, super::Win32_Memory::MEM_RELEASE) },
+            0
+        );
     }
 }
