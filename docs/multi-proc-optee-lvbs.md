@@ -305,39 +305,30 @@ if non-OP-TEE runners would also need it)
 
 ### Step 3f: Thin Runner Adapter
 
-**Files:** `litebox_runner_lvbs/src/lib.rs`
+**Status:** Achieved through Steps 3c–3e.
 
-- Runner's `optee_smc_handler()` becomes:
-  ```rust
-  fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
-      let (smc_args, msg_args, phys_addr) = parse_smc_request(smc_args_addr)?;
-      let executor = LvbsExecutor;       // impl TaExecutor
-      let writer = LvbsResponseWriter;   // impl TaResponseWriter
+The original plan envisioned `TaExecutor` and `TaResponseWriter` trait callbacks
+that would let the shim own the full session lifecycle. These traits were
+intentionally skipped (Step 3b eliminated) because:
 
-      let result = match msg_args.cmd {
-          OpenSession => session_mgr.handle_open_session(
-              &executor, &writer, ta_uuid, params, client,
-              &mut msg_args, phys_addr,
-          ),
-          InvokeCommand => session_mgr.handle_invoke_command(
-              &executor, &writer, session_id, cmd_id, params,
-              &mut msg_args, phys_addr,
-          ),
-          CloseSession => session_mgr.handle_close_session(
-              &executor, &writer, session_id,
-              &mut msg_args, phys_addr,
-          ),
-          _ => handle_non_ta_msg_args(&msg_args),
-      };
-      // Response already written by shim (inside with_address_space).
-      // Address space already deactivated by with_address_space RAII guard.
-      build_smc_response(smc_args, result)
-  }
-  ```
-- Runner implements `TaExecutor` (wrapping `run_thread_ref`/`reenter_thread_ref`)
-  and `TaResponseWriter` (wrapping `NormalWorldMutPtr`).
-- All OP-TEE protocol logic, session management, concurrency control, and
-  error handling are in the shim.
+1. Only one platform (LVBS) uses the OP-TEE runner, so trait abstractions add
+   complexity without near-term benefit.
+2. VTL0 response writing must happen inside `with_ta_address_space` (memref
+   params require TA page table active), which creates a natural boundary
+   between shim (TA execution) and runner (address space + VTL0 writes).
+
+**What was achieved:**
+- The LVBS runner no longer imports `GuestExecutionProvider` — all TA execution
+  flows through four shim methods: `run_open_session`, `reenter_open_session`,
+  `run_invoke_command`, `run_close_session`.
+- The runner no longer uses `UserConstPtr` or `RawConstPointer` — TA user-space
+  memory is only accessed inside the shim.
+- The runner's role is now limited to: SMC parsing/dispatch, address space
+  management (create/activate/destroy via `AddressSpaceProvider`), session
+  management (register/unregister/lookup), VTL0 physical memory writes, and
+  TargetDead cleanup.
+- The shim's role is: TA loading (ldelf), TA execution (run_thread/reenter_thread),
+  TA output param readback, and user mapping lifecycle (release_user_mappings).
 
 ## Notes and Considerations
 
