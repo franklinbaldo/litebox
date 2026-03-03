@@ -560,6 +560,47 @@ impl OpteeShim {
             ta_params,
         })
     }
+
+    /// Run the CloseSession entry point on an existing TA instance.
+    ///
+    /// Loads an empty TA context for `TA_CloseSessionEntryPoint` and runs it.
+    /// Per OP-TEE, CloseSession always succeeds (the entry point returns void).
+    ///
+    /// Does NOT release user mappings — the caller decides whether to tear down
+    /// the instance based on remaining session count.
+    ///
+    /// # Safety
+    ///
+    /// Must be called inside the TA's active address space scope.
+    pub unsafe fn run_close_session(
+        &self,
+        loaded_program: &LoadedProgram,
+        session_id: u32,
+    ) -> Result<(), CloseSessionError> {
+        use litebox::platform::GuestExecutionProvider;
+        let platform = self.0.platform;
+
+        let entrypoints = loaded_program
+            .entrypoints
+            .as_ref()
+            .ok_or(CloseSessionError::NoEntrypoints)?;
+
+        // Load TA context for CloseSession (no params, no cmd_id)
+        entrypoints
+            .load_ta_context(
+                &[],
+                Some(session_id),
+                litebox_common_optee::UteeEntryFunc::CloseSession as u32,
+                None,
+            )
+            .map_err(|_| CloseSessionError::ContextLoadFailed)?;
+
+        // Run TA_CloseSessionEntryPoint (returns void — we ignore the return code)
+        let mut ctx = litebox_common_linux::PtRegs::default();
+        unsafe { platform.reenter_thread(entrypoints, &mut ctx) };
+
+        Ok(())
+    }
 }
 
 /// Result of a successful new-instance OpenSession (TA returned Success).
@@ -628,6 +669,17 @@ pub enum InvokeCommandError {
     /// Failed to read TA output params from user-space memory after a
     /// successful InvokeCommand return.
     ParamsReadFailed,
+}
+
+/// Errors from the CloseSession shim handler.
+///
+/// User mappings are NOT released on any error path — the caller
+/// decides whether to tear down the instance.
+pub enum CloseSessionError {
+    /// The loaded program has no entrypoints.
+    NoEntrypoints,
+    /// Failed to load TA context (prepare params for entry).
+    ContextLoadFailed,
 }
 
 impl OpteeShimEntrypoints {

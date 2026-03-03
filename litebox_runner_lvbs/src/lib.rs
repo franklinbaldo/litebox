@@ -11,7 +11,6 @@ use alloc::vec;
 use core::{ops::Neg, panic::PanicInfo};
 use litebox::{
     mm::linux::PAGE_SIZE,
-    platform::GuestExecutionProvider,
     utils::{ReinterpretSignedExt, TruncateExt},
 };
 use litebox_common_linux::errno::Errno;
@@ -902,30 +901,14 @@ fn handle_close_session(
     let as_id = instance.address_space_id;
 
     // Run CloseSession entry point inside the TA's address space.
-    // write_msg_args_to_normal_world must be called inside because it reads TA user memory.
     with_ta_address_space(as_id, || {
-        // Load TA context for CloseSession (no params, no cmd_id) - pass actual session_id
-        instance
-            .loaded_program
-            .entrypoints
-            .as_ref()
-            .unwrap()
-            .load_ta_context(
-                &[],
-                Some(session_id),
-                UteeEntryFunc::CloseSession as u32,
-                None,
-            )
-            .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
-
-        // Run the TA entry function (TA_CloseSessionEntryPoint)
-        let mut ctx = litebox_common_linux::PtRegs::default();
+        // Safety: we are inside the TA's address space scope.
         unsafe {
-            litebox_platform_multiplex::platform().reenter_thread(
-                instance.loaded_program.entrypoints.as_ref().unwrap(),
-                &mut ctx,
-            );
+            instance
+                .shim
+                .run_close_session(&instance.loaded_program, session_id)
         }
+        .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
 
         // CloseSession always succeeds (TA_CloseSessionEntryPoint returns void)
         write_msg_args_to_normal_world(
