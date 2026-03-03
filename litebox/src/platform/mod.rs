@@ -53,10 +53,53 @@ pub trait Provider:
 {
 }
 
-/// Thread management provider.
-pub trait ThreadProvider: RawPointerProvider {
-    /// Execution context for the current thread of the guest program.
+/// Guest-code execution provider.
+///
+/// This trait provides the low-level mechanism for entering and resuming
+/// guest code. Platforms that can host guest execution implement this.
+///
+/// This trait is a supertrait of [`ThreadProvider`]: any platform that can
+/// manage multiple threads must also provide execution. However, a platform
+/// may implement `GuestExecutionProvider` alone if it supports running guest
+/// code but not managing multiple threads (e.g., a bare-metal VTL-switching
+/// platform like LVBS).
+pub trait GuestExecutionProvider: RawPointerProvider {
+    /// Execution context for the guest (e.g., `PtRegs` on x86_64).
     type ExecutionContext;
+
+    /// Enter guest code for the first time.
+    ///
+    /// Sets up the initial thread state and jumps to the guest entry point.
+    /// Returns when the guest terminates (the shim returns
+    /// [`ContinueOperation::Terminate`](crate::shim::ContinueOperation::Terminate)).
+    ///
+    /// # Safety
+    ///
+    /// `ctx` must contain a valid initial guest context (entry point, stack
+    /// pointer, etc.).
+    unsafe fn run_thread(
+        &self,
+        shim: &dyn crate::shim::EnterShim<ExecutionContext = Self::ExecutionContext>,
+        ctx: &mut Self::ExecutionContext,
+    );
+
+    /// Re-enter guest code after a previous syscall or exception was handled.
+    ///
+    /// Resumes the guest from the state in `ctx`. Returns when the guest
+    /// terminates.
+    ///
+    /// # Safety
+    ///
+    /// `ctx` must contain a valid guest context from a previous exit.
+    unsafe fn reenter_thread(
+        &self,
+        shim: &dyn crate::shim::EnterShim<ExecutionContext = Self::ExecutionContext>,
+        ctx: &mut Self::ExecutionContext,
+    );
+}
+
+/// Thread management provider.
+pub trait ThreadProvider: GuestExecutionProvider {
     /// Error type for [`ThreadProvider::spawn_thread`].
     type ThreadSpawnError: core::error::Error;
     type ThreadHandle: 'static + Send + Sync;

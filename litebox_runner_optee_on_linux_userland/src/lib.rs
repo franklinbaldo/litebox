@@ -3,6 +3,7 @@
 
 use anyhow::Result;
 use clap::Parser;
+use litebox::platform::GuestExecutionProvider;
 use litebox_common_optee::{TeeUuid, UteeEntryFunc, UteeParamOwned};
 use litebox_platform_multiplex::Platform;
 use litebox_shim_optee::session::allocate_session_id;
@@ -138,10 +139,8 @@ fn run_ta_with_default_commands(
                 .unwrap();
             let entrypoints = loaded_program.entrypoints.as_ref().unwrap();
             unsafe {
-                litebox_platform_linux_userland::run_thread_ref(
-                    entrypoints,
-                    &mut litebox_common_linux::PtRegs::default(),
-                );
+                litebox_platform_multiplex::platform()
+                    .run_thread(entrypoints, &mut litebox_common_linux::PtRegs::default());
             }
 
             // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with
@@ -153,10 +152,8 @@ fn run_ta_with_default_commands(
                     panic!("Failed to load TA context");
                 });
             unsafe {
-                litebox_platform_linux_userland::reenter_thread(
-                    entrypoints,
-                    &mut litebox_common_linux::PtRegs::default(),
-                );
+                litebox_platform_multiplex::platform()
+                    .reenter_thread(entrypoints, &mut litebox_common_linux::PtRegs::default());
             }
         } else if func_id == UteeEntryFunc::CloseSession {
         }

@@ -1204,8 +1204,27 @@ impl ThreadHandle {
     }
 }
 
-impl litebox::platform::ThreadProvider for LinuxUserland {
+impl litebox::platform::GuestExecutionProvider for LinuxUserland {
     type ExecutionContext = litebox_common_linux::PtRegs;
+
+    unsafe fn run_thread(
+        &self,
+        shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+        ctx: &mut litebox_common_linux::PtRegs,
+    ) {
+        run_thread_inner(shim, ctx, false);
+    }
+
+    unsafe fn reenter_thread(
+        &self,
+        shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+        ctx: &mut litebox_common_linux::PtRegs,
+    ) {
+        run_thread_inner(shim, ctx, true);
+    }
+}
+
+impl litebox::platform::ThreadProvider for LinuxUserland {
     type ThreadSpawnError = std::io::Error;
     type ThreadHandle = ThreadHandle;
 

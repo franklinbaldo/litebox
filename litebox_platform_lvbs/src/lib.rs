@@ -1346,6 +1346,28 @@ impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<
     }
 }
 
+impl<Host: HostInterface> litebox::platform::GuestExecutionProvider for LinuxKernel<Host> {
+    type ExecutionContext = litebox_common_linux::PtRegs;
+
+    unsafe fn run_thread(
+        &self,
+        shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+        ctx: &mut litebox_common_linux::PtRegs,
+    ) {
+        crate::arch::write_kernel_gsbase_msr(VirtAddr::zero());
+        run_thread_inner(shim, ctx, false);
+    }
+
+    unsafe fn reenter_thread(
+        &self,
+        shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+        ctx: &mut litebox_common_linux::PtRegs,
+    ) {
+        crate::arch::write_kernel_gsbase_msr(VirtAddr::zero());
+        run_thread_inner(shim, ctx, true);
+    }
+}
+
 impl<Host: HostInterface> litebox::platform::AddressSpaceProvider for LinuxKernel<Host> {
     type AddressSpaceId = usize;
 

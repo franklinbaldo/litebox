@@ -11,7 +11,7 @@ use alloc::vec;
 use core::{ops::Neg, panic::PanicInfo};
 use litebox::{
     mm::linux::PAGE_SIZE,
-    platform::RawConstPointer,
+    platform::{GuestExecutionProvider, RawConstPointer},
     utils::{ReinterpretSignedExt, TruncateExt},
 };
 use litebox_common_linux::errno::Errno;
@@ -534,10 +534,10 @@ fn open_session_single_instance(
             )
             .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
 
-        // Run the TA's OpenSession entry point using reference-based reenter
+        // Run the TA's OpenSession entry point
         let mut ctx = litebox_common_linux::PtRegs::default();
         unsafe {
-            litebox_platform_lvbs::reenter_thread_ref(
+            litebox_platform_multiplex::platform().reenter_thread(
                 instance.loaded_program.entrypoints.as_ref().unwrap(),
                 &mut ctx,
             );
@@ -704,13 +704,11 @@ fn open_session_new_instance(
                 ta_flags.is_single_instance()
             );
 
-            // Run ldelf to load the TA using reference-based run to avoid moving the shim
+            // Run ldelf to load the TA
             let mut ldelf_ctx = litebox_common_linux::PtRegs::default();
             unsafe {
-                litebox_platform_lvbs::run_thread_ref(
-                    loaded_program.entrypoints.as_ref().unwrap(),
-                    &mut ldelf_ctx,
-                );
+                litebox_platform_multiplex::platform()
+                    .run_thread(loaded_program.entrypoints.as_ref().unwrap(), &mut ldelf_ctx);
             }
 
             // Check ldelf return code (TA_CreateEntryPoint result)
@@ -757,13 +755,11 @@ fn open_session_new_instance(
                     OpteeSmcReturnCode::EBadCmd
                 })?;
 
-            // Run the TA entry function using reference-based reenter to avoid moving the shim
+            // Run the TA entry function
             let mut ctx = litebox_common_linux::PtRegs::default();
             unsafe {
-                litebox_platform_lvbs::reenter_thread_ref(
-                    loaded_program.entrypoints.as_ref().unwrap(),
-                    &mut ctx,
-                );
+                litebox_platform_multiplex::platform()
+                    .reenter_thread(loaded_program.entrypoints.as_ref().unwrap(), &mut ctx);
             }
 
             // Read TA output parameters from the stack buffer
@@ -917,10 +913,10 @@ fn handle_invoke_command(
             )
             .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
 
-        // Run the TA entry function using reference-based reenter to avoid moving the shim
+        // Run the TA entry function
         let mut ctx = litebox_common_linux::PtRegs::default();
         unsafe {
-            litebox_platform_lvbs::reenter_thread_ref(
+            litebox_platform_multiplex::platform().reenter_thread(
                 instance.loaded_program.entrypoints.as_ref().unwrap(),
                 &mut ctx,
             );
@@ -1049,7 +1045,7 @@ fn handle_close_session(
         // Run the TA entry function (TA_CloseSessionEntryPoint)
         let mut ctx = litebox_common_linux::PtRegs::default();
         unsafe {
-            litebox_platform_lvbs::reenter_thread_ref(
+            litebox_platform_multiplex::platform().reenter_thread(
                 instance.loaded_program.entrypoints.as_ref().unwrap(),
                 &mut ctx,
             );

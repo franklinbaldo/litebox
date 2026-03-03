@@ -227,8 +227,30 @@ pub fn handle_syscall(pt_regs: &mut litebox_common_linux::PtRegs) -> ! {
     }
 }
 
-impl litebox::platform::ThreadProvider for SnpLinuxKernel {
+impl litebox::platform::GuestExecutionProvider for SnpLinuxKernel {
     type ExecutionContext = litebox_common_linux::PtRegs;
+
+    unsafe fn run_thread(
+        &self,
+        _shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+        _ctx: &mut litebox_common_linux::PtRegs,
+    ) {
+        // SNP uses a different execution model: `run_thread` (free function)
+        // takes ownership of a boxed shim and never returns (-> !).
+        // The ref-based trait methods are not applicable to this platform.
+        unimplemented!("SNP uses ownership-based run_thread, not ref-based")
+    }
+
+    unsafe fn reenter_thread(
+        &self,
+        _shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+        _ctx: &mut litebox_common_linux::PtRegs,
+    ) {
+        unimplemented!("SNP uses ownership-based run_thread, not ref-based")
+    }
+}
+
+impl litebox::platform::ThreadProvider for SnpLinuxKernel {
     type ThreadSpawnError = litebox_common_linux::errno::Errno;
     type ThreadHandle = u32;
 

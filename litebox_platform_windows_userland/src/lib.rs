@@ -721,8 +721,33 @@ fn thread_start(
     run_thread_inner(shim.as_ref(), &mut ctx);
 }
 
-impl litebox::platform::ThreadProvider for WindowsUserland {
+impl litebox::platform::GuestExecutionProvider for WindowsUserland {
     type ExecutionContext = litebox_common_linux::PtRegs;
+
+    unsafe fn run_thread(
+        &self,
+        shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+        ctx: &mut litebox_common_linux::PtRegs,
+    ) {
+        run_thread_inner(shim, ctx);
+    }
+
+    // Note: Windows `run_thread_inner` does not currently accept a reenter
+    // flag — the assembly always enters via `init_handler` (→ `shim.init()`).
+    // This is acceptable because no OP-TEE runner targets Windows today. If
+    // Windows ever needs init-vs-reenter distinction, `run_thread_inner` and
+    // the assembly must be updated to thread through a reenter flag (like
+    // Linux userland does).
+    unsafe fn reenter_thread(
+        &self,
+        shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+        ctx: &mut litebox_common_linux::PtRegs,
+    ) {
+        run_thread_inner(shim, ctx);
+    }
+}
+
+impl litebox::platform::ThreadProvider for WindowsUserland {
     type ThreadSpawnError = std::io::Error;
     type ThreadHandle = ThreadHandle;
 

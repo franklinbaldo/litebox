@@ -5,7 +5,7 @@
 //! OP-TEE TAs need clients to work with that this Linux userland runner lacks.
 //! Instead, these tests use pre-defined JSON-formatted command sequences to test TAs.
 
-use litebox::platform::RawConstPointer;
+use litebox::platform::{GuestExecutionProvider, RawConstPointer};
 use litebox::utils::TruncateExt;
 use litebox_common_optee::{TeeParamType, UteeEntryFunc, UteeParamOwned, UteeParams};
 use litebox_shim_optee::session::allocate_session_id;
@@ -65,10 +65,8 @@ pub fn run_ta_with_test_commands(
             let info = ta_info.as_mut().unwrap();
             let mut ctx = litebox_common_linux::PtRegs::default();
             unsafe {
-                litebox_platform_linux_userland::run_thread_ref(
-                    info.entrypoints.as_ref().unwrap(),
-                    &mut ctx,
-                );
+                litebox_platform_multiplex::platform()
+                    .run_thread(info.entrypoints.as_ref().unwrap(), &mut ctx);
             }
             assert!(
                 ctx.rax == 0,
@@ -91,10 +89,8 @@ pub fn run_ta_with_test_commands(
                 });
             let mut ctx = litebox_common_linux::PtRegs::default();
             unsafe {
-                litebox_platform_linux_userland::reenter_thread(
-                    info.entrypoints.as_ref().unwrap(),
-                    &mut ctx,
-                );
+                litebox_platform_multiplex::platform()
+                    .reenter_thread(info.entrypoints.as_ref().unwrap(), &mut ctx);
             }
             assert!(
                 ctx.rax == 0,
