@@ -107,7 +107,7 @@ pub const MAX_TA_INSTANCES: usize = 16;
 /// is shared across all sessions. The TA is loaded once and stays in memory until
 /// the last session closes (or with `TA_FLAG_INSTANCE_KEEP_ALIVE`, until explicit destroy).
 ///
-/// Each instance has its own task page table that provides memory isolation from other TAs.
+/// Each instance has its own address space that provides memory isolation from other TAs.
 pub struct TaInstance {
     /// The shim must be kept alive to keep the loaded program's memory mappings valid.
     pub shim: OpteeShim,
@@ -115,8 +115,8 @@ pub struct TaInstance {
     /// Boxed to keep it at a fixed heap address - the Task inside must not be moved
     /// after initialization because it contains internal state that may not survive moves.
     pub loaded_program: alloc::boxed::Box<LoadedProgram>,
-    /// The task page table ID associated with this TA instance.
-    pub task_page_table_id: usize,
+    /// The address space ID associated with this TA instance.
+    pub address_space_id: usize,
 }
 
 // SAFETY: TaInstance is protected by SpinMutex and try_lock (`SessionEntry`)
