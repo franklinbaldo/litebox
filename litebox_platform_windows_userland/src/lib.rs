@@ -331,13 +331,15 @@ impl WindowsUserland {
 impl litebox::platform::Provider for WindowsUserland {}
 
 impl litebox::platform::SignalProvider for WindowsUserland {
-    fn take_pending_signals(&self, mut f: impl FnMut(litebox::shim::Signal)) {
+    type Signal = litebox_common_linux::signal::Signal;
+
+    fn take_pending_signals(&self, mut f: impl FnMut(Self::Signal)) {
         let bits = get_tls_ptr().map_or(0, |p| {
             unsafe { &*p }
                 .pending_host_signals
                 .swap(0, Ordering::SeqCst)
         });
-        let sigs = litebox::shim::SigSet::from_u64(u64::from(bits));
+        let sigs = litebox_common_linux::signal::SigSet::from_u64(u64::from(bits));
         for signal in sigs {
             f(signal);
         }
@@ -832,7 +834,7 @@ unsafe extern "system" fn ctrl_c_handler(ctrl_type: u32) -> i32 {
     let thread = ACTIVE_THREADS.lock().unwrap().first().cloned();
 
     if let Some(thread) = thread {
-        thread.deliver_signal(litebox::shim::Signal::SIGINT);
+        thread.deliver_signal(litebox_common_linux::signal::Signal::SIGINT);
     }
 
     1 // TRUE — we handled it
@@ -909,8 +911,8 @@ impl ThreadHandle {
 
     /// Sets a pending signal on this thread, wakes it from any condvar wait,
     /// and interrupts it so the shim processes the signal promptly.
-    fn deliver_signal(&self, signal: litebox::shim::Signal) {
-        let bit: u32 = 1 << (signal.as_raw() - 1);
+    fn deliver_signal(&self, signal: litebox_common_linux::signal::Signal) {
+        let bit: u32 = 1 << (signal.as_i32() - 1);
 
         // Set the pending signal bit and wake the condvar in one lock scope.
         {
@@ -1133,20 +1135,18 @@ fn is_in_ntdll_or_this(ip: usize) -> bool {
 impl litebox::platform::RawMutexProvider for WindowsUserland {
     type RawMutex = RawMutex;
 
-    fn on_interruptible_wait_start(&self, waker: &litebox::event::wait::Waker<Self>)
+    fn update_waker(&self, waker: Option<litebox::event::wait::Waker<Self>>)
     where
         Self: litebox::sync::RawSyncPrimitivesProvider,
     {
         if let Some(tls) = get_tls_ptr().map(|p| unsafe { &*p }) {
-            tls.waiting_waker
-                .store(std::ptr::from_ref(waker).cast_mut(), Ordering::Release);
-        }
-    }
-
-    fn on_interruptible_wait_end(&self) {
-        if let Some(tls) = get_tls_ptr().map(|p| unsafe { &*p }) {
-            tls.waiting_waker
-                .store(std::ptr::null_mut(), Ordering::Release);
+            let waker_ptr = waker.map_or(std::ptr::null_mut(), |w| Box::into_raw(Box::new(w)));
+            let old = tls.waiting_waker.swap(waker_ptr, Ordering::AcqRel);
+            if !old.is_null() {
+                // SAFETY: old pointer was created by Box::into_raw in a previous
+                // call to update_waker.
+                unsafe { drop(Box::from_raw(old)) };
+            }
         }
     }
 }
