@@ -11,7 +11,7 @@ use alloc::vec;
 use core::{ops::Neg, panic::PanicInfo};
 use litebox::{
     mm::linux::PAGE_SIZE,
-    platform::{GuestExecutionProvider, RawConstPointer},
+    platform::GuestExecutionProvider,
     utils::{ReinterpretSignedExt, TruncateExt},
 };
 use litebox_common_linux::errno::Errno;
@@ -45,7 +45,7 @@ use litebox_shim_optee::msg_handler::{
 use litebox_shim_optee::session::{
     MAX_TA_INSTANCES, SessionIdGuard, SessionManager, TaInstance, allocate_session_id,
 };
-use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, UserConstPtr};
+use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr};
 use once_cell::race::OnceBox;
 use spin::mutex::SpinMutex;
 
@@ -793,44 +793,29 @@ fn handle_invoke_command(
     // Run the TA command inside its address space.
     // write_msg_args_to_normal_world must be called inside because it reads TA user memory.
     let return_code = with_ta_address_space(as_id, || {
-        // Load TA context with parameters and cmd_id - pass actual session_id
-        let entrypoints_ref = instance.loaded_program.entrypoints.as_ref().unwrap();
-        entrypoints_ref
-            .load_ta_context(
+        // Safety: we are inside the TA's address space scope.
+        let result = unsafe {
+            instance.shim.run_invoke_command(
+                &instance.loaded_program,
                 params.as_slice(),
-                Some(session_id),
-                UteeEntryFunc::InvokeCommand as u32,
-                Some(cmd_id),
+                session_id,
+                cmd_id,
             )
-            .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
-
-        // Run the TA entry function
-        let mut ctx = litebox_common_linux::PtRegs::default();
-        unsafe {
-            litebox_platform_multiplex::platform().reenter_thread(
-                instance.loaded_program.entrypoints.as_ref().unwrap(),
-                &mut ctx,
-            );
         }
+        .map_err(|e| match e {
+            litebox_shim_optee::InvokeCommandError::ParamsReadFailed => {
+                OpteeSmcReturnCode::EBadAddr
+            }
+            _ => OpteeSmcReturnCode::EBadCmd,
+        })?;
 
-        // params_address is constant - stack buffer is reused across invocations
-        let params_address = instance
-            .loaded_program
-            .params_address
-            .ok_or(OpteeSmcReturnCode::EBadAddr)?;
-        let ta_params = UserConstPtr::<UteeParams>::from_usize(params_address)
-            .read_at_offset(0)
-            .ok_or(OpteeSmcReturnCode::EBadAddr)?;
-
-        let return_code: u32 = ctx.rax.truncate();
-        let return_code = TeeResult::try_from(return_code).unwrap_or(TeeResult::GenericError);
-
+        let return_code = result.return_code;
         write_msg_args_to_normal_world(
             msg_args,
             msg_args_phys_addr,
             return_code,
             None,
-            Some(&ta_params),
+            result.ta_params.as_ref(),
             Some(&ta_req_info),
         )?;
 

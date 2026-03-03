@@ -491,6 +491,75 @@ impl OpteeShim {
             ta_params,
         })
     }
+
+    /// Run an InvokeCommand entry point on an existing TA instance.
+    ///
+    /// Loads the TA context with the given params and command ID, runs the
+    /// TA entry point, and reads output params from user-space memory.
+    ///
+    /// Does NOT release user mappings on any path (the instance stays alive).
+    ///
+    /// # Safety
+    ///
+    /// Must be called inside the TA's active address space scope.
+    pub unsafe fn run_invoke_command(
+        &self,
+        loaded_program: &LoadedProgram,
+        params: &[litebox_common_optee::UteeParamOwned],
+        session_id: u32,
+        cmd_id: u32,
+    ) -> Result<InvokeCommandResult, InvokeCommandError> {
+        use litebox::platform::GuestExecutionProvider;
+        let platform = self.0.platform;
+
+        let entrypoints = loaded_program
+            .entrypoints
+            .as_ref()
+            .ok_or(InvokeCommandError::NoEntrypoints)?;
+
+        // Load TA context for InvokeCommand
+        entrypoints
+            .load_ta_context(
+                params,
+                Some(session_id),
+                litebox_common_optee::UteeEntryFunc::InvokeCommand as u32,
+                Some(cmd_id),
+            )
+            .map_err(|_| InvokeCommandError::ContextLoadFailed)?;
+
+        // Run TA InvokeCommand entry point
+        let mut ctx = litebox_common_linux::PtRegs::default();
+        unsafe { platform.reenter_thread(entrypoints, &mut ctx) };
+
+        let return_code: u32 = ctx.rax.truncate();
+        let return_code = TeeResult::try_from(return_code).unwrap_or(TeeResult::GenericError);
+
+        // Read TA output params — best-effort for error, hard failure for success.
+        // `params_address` is constant across invocations (stack buffer is reused).
+        let ta_params = match loaded_program.params_address {
+            Some(addr) => {
+                UserConstPtr::<litebox_common_optee::UteeParams>::from_usize(addr).read_at_offset(0)
+            }
+            None => None,
+        };
+
+        if return_code != TeeResult::Success {
+            return Ok(InvokeCommandResult {
+                return_code,
+                ta_params,
+            });
+        }
+
+        // Success path: params read must succeed if params_address was set.
+        if loaded_program.params_address.is_some() && ta_params.is_none() {
+            return Err(InvokeCommandError::ParamsReadFailed);
+        }
+
+        Ok(InvokeCommandResult {
+            return_code,
+            ta_params,
+        })
+    }
 }
 
 /// Result of a successful new-instance OpenSession (TA returned Success).
@@ -537,6 +606,28 @@ pub enum OpenSessionError {
         return_code: TeeResult,
         ta_params: Option<litebox_common_optee::UteeParams>,
     },
+}
+
+/// Result of an InvokeCommand call.
+pub struct InvokeCommandResult {
+    /// The TA's return code.
+    pub return_code: TeeResult,
+    /// TA output params copied from user-space memory.
+    pub ta_params: Option<litebox_common_optee::UteeParams>,
+}
+
+/// Errors from the InvokeCommand shim handler.
+///
+/// User mappings are NOT released on any error path — the TA instance
+/// stays alive for future commands.
+pub enum InvokeCommandError {
+    /// The loaded program has no entrypoints.
+    NoEntrypoints,
+    /// Failed to load TA context (prepare params for entry).
+    ContextLoadFailed,
+    /// Failed to read TA output params from user-space memory after a
+    /// successful InvokeCommand return.
+    ParamsReadFailed,
 }
 
 impl OpteeShimEntrypoints {
