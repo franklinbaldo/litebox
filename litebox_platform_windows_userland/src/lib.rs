@@ -1908,7 +1908,39 @@ unsafe extern "C-unwind" fn exception_handler(
                 // This is probably a #GP, not a #PF.
                 (Exception::GENERAL_PROTECTION_FAULT, 0, 0)
             } else {
-                let error_code = 4 | if read_write_flag == 0 { 0 } else { 1 << 1 }; // PF error code: bit 1 = write
+                // Synthesize a Linux-style x86 page-fault error code:
+                //   bit 0: present (page is committed but access denied)
+                //   bit 1: write fault
+                //   bit 2: user-mode
+                //   bit 4: instruction fetch (DEP)
+                //
+                // Windows EXCEPTION_ACCESS_VIOLATION does not distinguish
+                // "page present but permission denied" from "page not
+                // present". Use VirtualQuery to determine if the faulting
+                // page is committed (present). This is required for CoW
+                // fault detection: the shim checks (error_code & 0x3) == 0x3
+                // (present + write).
+                let is_present = {
+                    let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+                    // Safety: VirtualQuery reads kernel VA metadata; the
+                    // faulting_address may be unmapped but that's fine —
+                    // VirtualQuery still succeeds and returns MEM_FREE.
+                    let ok = unsafe {
+                        Win32_Memory::VirtualQuery(
+                            faulting_address as *const c_void,
+                            &raw mut mbi,
+                            core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+                        ) != 0
+                    };
+                    ok && mbi.State == Win32_Memory::MEM_COMMIT
+                };
+                let error_code = (if is_present { 1 } else { 0 }) // bit 0: present
+                    | match read_write_flag {
+                        0 => 0,          // read fault
+                        8 => 1 << 4,     // DEP (instruction fetch)
+                        _ => 1 << 1,     // write fault
+                    }
+                    | 4; // bit 2: user-mode
                 (Exception::PAGE_FAULT, error_code, faulting_address)
             }
         }
