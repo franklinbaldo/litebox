@@ -446,7 +446,9 @@ impl LinuxUserland {
 impl litebox::platform::Provider for LinuxUserland {}
 
 impl litebox::platform::SignalProvider for LinuxUserland {
-    fn take_pending_signals(&self, mut f: impl FnMut(litebox::shim::Signal)) {
+    type Signal = litebox_common_linux::signal::Signal;
+
+    fn take_pending_signals(&self, mut f: impl FnMut(Self::Signal)) {
         let sigs = take_pending_host_signals();
         for sig in sigs {
             f(sig);
@@ -455,7 +457,7 @@ impl litebox::platform::SignalProvider for LinuxUserland {
 }
 
 /// Atomically takes the per-thread pending host signal bitmask.
-fn take_pending_host_signals() -> litebox::shim::SigSet {
+fn take_pending_host_signals() -> litebox_common_linux::signal::SigSet {
     // Atomically swap the per-thread pending signals with zero.
     // Only the low 32 bits are used (covers traditional signals 1-31).
     let lo: u32;
@@ -467,7 +469,7 @@ fn take_pending_host_signals() -> litebox::shim::SigSet {
             options(nostack)
         );
     }
-    litebox::shim::SigSet::from_u64(u64::from(lo))
+    litebox_common_linux::signal::SigSet::from_u64(u64::from(lo))
 }
 
 /// Runs a guest thread using the provided shim and the given initial context.
@@ -1178,27 +1180,21 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
 impl litebox::platform::RawMutexProvider for LinuxUserland {
     type RawMutex = RawMutex;
 
-    fn on_interruptible_wait_start(&self, waker: &litebox::event::wait::Waker<Self>)
+    fn update_waker(&self, waker: Option<litebox::event::wait::Waker<Self>>)
     where
         Self: litebox::sync::RawSyncPrimitivesProvider,
     {
-        let waker_ptr = waker as *const litebox::event::wait::Waker<Self>;
+        let mut waker_ptr = waker.map_or(std::ptr::null_mut(), |w| Box::into_raw(Box::new(w)));
         unsafe {
             core::arch::asm!(
-                concat!("mov ", tls!("wait_waker_addr"), ", {}"),
-                in(reg) waker_ptr,
-                options(nostack, preserves_flags),
+                concat!("xchg ", tls!("wait_waker_addr"), ", {}"),
+                inout(reg) waker_ptr,
+                options(nostack),
             );
         }
-    }
-
-    fn on_interruptible_wait_end(&self) {
-        unsafe {
-            core::arch::asm!(
-                concat!("mov ", tls!("wait_waker_addr"), ", {zero}"),
-                zero = in(reg) 0usize,
-                options(nostack, preserves_flags),
-            );
+        if !waker_ptr.is_null() {
+            // SAFETY: old waker_ptr was created by Box::into_raw in a previous call to update_waker.
+            unsafe { drop(Box::from_raw(waker_ptr)) };
         }
     }
 }
@@ -2540,8 +2536,8 @@ fn try_wake_wait_waker(waker_addr: usize) {
 ///
 /// Must be called from a signal handler on a guest thread whose saved host TLS
 /// segment register is valid.
-unsafe fn record_pending_signal(signal: litebox::shim::Signal) {
-    let mask: u32 = 1u32 << (signal.as_raw() - 1);
+unsafe fn record_pending_signal(signal: litebox_common_linux::signal::Signal) {
+    let mask: u32 = 1u32 << (signal.as_i32() - 1);
     unsafe {
         core::arch::asm!(
             concat!("lock or DWORD PTR ", saved_tls!("pending_host_signals"), ", {mask:e}"),
@@ -2587,11 +2583,8 @@ unsafe fn interrupt_signal_handler(
     // TODO: no realtime signal support for now.
     if signum > 0 && signum < 32 {
         // Only record signals that can be forwarded to the guest as
-        // litebox::shim::Signal. Unknown signals are silently dropped.
+        // litebox_common_linux::signal::Signal. Unknown signals are silently dropped.
         let Ok(signal) = litebox_common_linux::signal::Signal::try_from(signum) else {
-            return;
-        };
-        let Ok(signal) = litebox::shim::Signal::try_from(signal) else {
             return;
         };
 

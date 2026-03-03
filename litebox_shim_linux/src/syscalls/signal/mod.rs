@@ -605,12 +605,7 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
-    pub(crate) fn take_pending_signals(&self, sig: litebox::shim::Signal) {
-        let signal = match sig {
-            litebox::shim::Signal::SIGALRM => litebox_common_linux::signal::Signal::SIGALRM,
-            litebox::shim::Signal::SIGINT => litebox_common_linux::signal::Signal::SIGINT,
-            _ => unimplemented!(),
-        };
+    pub(crate) fn queue_signals(&self, signal: litebox_common_linux::signal::Signal) {
         self.send_shared_signal(signal, siginfo_kill(signal));
     }
 
