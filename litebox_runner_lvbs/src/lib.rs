@@ -518,45 +518,17 @@ fn open_session_single_instance(
 
     // Run the TA's OpenSession entry point inside its address space.
     // write_msg_args_to_normal_world must be called inside the address space
-    // because update_optee_msg_args reads TA user-space memory.
+    // because update_optee_msg_args dereferences TA memref addresses.
     let return_code = with_ta_address_space(as_id, || {
-        // Load TA context with parameters for OpenSession - pass actual session_id
-        instance
-            .loaded_program
-            .entrypoints
-            .as_ref()
-            .ok_or(OpteeSmcReturnCode::EBadCmd)?
-            .load_ta_context(
-                params,
-                Some(runner_session_id),
-                UteeEntryFunc::OpenSession as u32,
-                None,
-            )
-            .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
-
-        // Run the TA's OpenSession entry point
-        let mut ctx = litebox_common_linux::PtRegs::default();
-        unsafe {
-            litebox_platform_multiplex::platform().reenter_thread(
-                instance.loaded_program.entrypoints.as_ref().unwrap(),
-                &mut ctx,
-            );
+        // Safety: we are inside the TA's address space scope.
+        let reuse_result = unsafe {
+            instance
+                .shim
+                .reenter_open_session(&instance.loaded_program, params, runner_session_id)
         }
+        .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
 
-        // Read TA output parameters from the stack buffer
-        let params_address = instance
-            .loaded_program
-            .params_address
-            .ok_or(OpteeSmcReturnCode::EBadAddr)?;
-        let ta_params = UserConstPtr::<UteeParams>::from_usize(params_address)
-            .read_at_offset(0)
-            .ok_or(OpteeSmcReturnCode::EBadAddr)?;
-
-        // Check the return code from the TA's OpenSession entry point
-        let return_code: u32 = ctx.rax.truncate();
-        let return_code = TeeResult::try_from(return_code).unwrap_or(TeeResult::GenericError);
-
-        // Write response while still in TA address space (accesses user memory)
+        let return_code = reuse_result.return_code;
         write_msg_args_to_normal_world(
             msg_args,
             msg_args_phys_addr,
@@ -566,7 +538,7 @@ fn open_session_single_instance(
             } else {
                 None
             },
-            Some(&ta_params),
+            reuse_result.ta_params.as_ref(),
             Some(ta_req_info),
         )?;
 
@@ -629,21 +601,6 @@ fn open_session_single_instance(
     Ok(())
 }
 
-/// Outcome of the `open_session_new_instance` closure that runs inside
-/// the TA's address space. Distinguishes success from "error but the
-/// response has already been written to normal world".
-enum OpenSessionOutcome {
-    /// TA loaded and OpenSession entry point succeeded.
-    Success {
-        program: Box<litebox_shim_optee::LoadedProgram>,
-        flags: litebox_common_optee::TaFlags,
-    },
-    /// An error occurred but the error response was already written
-    /// to normal world via `write_msg_args_to_normal_world`.
-    /// The caller should destroy the address space and return `Ok(())`.
-    Responded,
-}
-
 /// Create a new TA instance for a session.
 ///
 /// If ldelf loading or OpenSession entry point fails, the address space is torn down.
@@ -674,191 +631,125 @@ fn open_session_new_instance(
         OpteeSmcReturnCode::EBusy
     })?;
 
-    // Load ldelf and TA - Box immediately to keep at fixed heap address
+    // Create shim and run the TA lifecycle inside the address space.
+    // write_msg_args_to_normal_world must be called inside the address space
+    // because update_optee_msg_args dereferences TA memref addresses.
     let shim = litebox_shim_optee::OpteeShimBuilder::new().build();
 
-    // Everything that accesses TA user-space memory runs inside the address space.
-    let result = with_ta_address_space(
-        as_id,
-        || -> Result<OpenSessionOutcome, OpteeSmcReturnCode> {
-            let loaded_program = Box::new(
-                shim.load_ldelf(
-                    LDELF_BINARY,
-                    ta_uuid,
-                    Some(TA_BINARY),
-                    client_identity,
-                    runner_session_id,
-                )
-                .map_err(|_| {
-                    // Safety: load_ldelf failed; no user-space references will be held afterwards.
-                    unsafe { shim.release_user_mappings() };
-                    OpteeSmcReturnCode::ENomem
-                })?,
-            );
+    let result = with_ta_address_space(as_id, || {
+        // Safety: we are inside the TA's address space scope.
+        let shim_result = unsafe {
+            shim.run_open_session(
+                LDELF_BINARY,
+                ta_uuid,
+                Some(TA_BINARY),
+                client_identity,
+                runner_session_id,
+                params,
+            )
+        };
 
-            let ta_flags = loaded_program.ta_flags;
-
-            debug_serial_println!(
-                "TA flags: {:?}, single_instance={}",
-                ta_flags,
-                ta_flags.is_single_instance()
-            );
-
-            // Run ldelf to load the TA
-            let mut ldelf_ctx = litebox_common_linux::PtRegs::default();
-            unsafe {
-                litebox_platform_multiplex::platform()
-                    .run_thread(loaded_program.entrypoints.as_ref().unwrap(), &mut ldelf_ctx);
-            }
-
-            // Check ldelf return code (TA_CreateEntryPoint result)
-            let ldelf_return_code: u32 = ldelf_ctx.rax.truncate();
-            let ldelf_return_code =
-                TeeResult::try_from(ldelf_return_code).unwrap_or(TeeResult::GenericError);
-            if ldelf_return_code != TeeResult::Success {
+        match shim_result {
+            Ok(open_result) => {
                 debug_serial_println!(
-                    "ldelf/TA_CreateEntryPoint failed: return_code={:?}",
-                    ldelf_return_code
+                    "TA flags: {:?}, single_instance={}",
+                    open_result.ta_flags,
+                    open_result.ta_flags.is_single_instance()
                 );
-                // Safety: We are about to tear down this TA instance;
-                // no references to user-space memory will be held afterwards.
-                unsafe { shim.release_user_mappings() };
-
-                // Write error response back to normal world
                 write_msg_args_to_normal_world(
                     msg_args,
                     msg_args_phys_addr,
-                    ldelf_return_code,
-                    None, // No session ID on failure
-                    None,
+                    TeeResult::Success,
+                    Some(runner_session_id),
+                    open_result.ta_params.as_ref(),
                     Some(ta_req_info),
                 )?;
-
-                return Ok(OpenSessionOutcome::Responded);
+                Ok(Some(open_result))
             }
-
-            // Load TA context with parameters for OpenSession - pass actual session_id
-            loaded_program
-                .entrypoints
-                .as_ref()
-                .ok_or(OpteeSmcReturnCode::EBadCmd)?
-                .load_ta_context(
-                    params,
-                    Some(runner_session_id),
-                    UteeEntryFunc::OpenSession as u32,
-                    None,
-                )
-                .map_err(|_| {
-                    // Safety: We are about to tear down this TA instance;
-                    // no references to user-space memory will be held afterwards.
-                    unsafe { shim.release_user_mappings() };
-                    OpteeSmcReturnCode::EBadCmd
-                })?;
-
-            // Run the TA entry function
-            let mut ctx = litebox_common_linux::PtRegs::default();
-            unsafe {
-                litebox_platform_multiplex::platform()
-                    .reenter_thread(loaded_program.entrypoints.as_ref().unwrap(), &mut ctx);
-            }
-
-            // Read TA output parameters from the stack buffer
-            let params_address = loaded_program
-                .params_address
-                .ok_or(OpteeSmcReturnCode::EBadAddr)?;
-            let ta_params = UserConstPtr::<UteeParams>::from_usize(params_address)
-                .read_at_offset(0)
-                .ok_or(OpteeSmcReturnCode::EBadAddr)?;
-
-            // Check the return code from the TA's OpenSession entry point
-            let return_code: u32 = ctx.rax.truncate();
-            let return_code = TeeResult::try_from(return_code).unwrap_or(TeeResult::GenericError);
-
-            // Per OP-TEE OS: if OpenSession fails, tear down the instance
-            // Reference: tee_ta_open_session() in tee_ta_manager.c
-            if return_code != TeeResult::Success {
+            Err(litebox_shim_optee::OpenSessionError::LdelfFailed(return_code)) => {
                 debug_serial_println!(
-                    "OpenSession failed on new instance: return_code={:?}",
+                    "ldelf/TA_CreateEntryPoint failed: return_code={:?}",
                     return_code
                 );
-
-                // Write error response back to normal world
                 write_msg_args_to_normal_world(
                     msg_args,
                     msg_args_phys_addr,
                     return_code,
-                    None, // No session ID on failure
-                    Some(&ta_params),
+                    None,
+                    None,
                     Some(ta_req_info),
                 )?;
+                Ok(None)
+            }
+            Err(litebox_shim_optee::OpenSessionError::TaOpenSessionFailed {
+                return_code,
+                ta_params,
+            }) => {
+                debug_serial_println!(
+                    "OpenSession failed on new instance: return_code={:?}",
+                    return_code
+                );
+                write_msg_args_to_normal_world(
+                    msg_args,
+                    msg_args_phys_addr,
+                    return_code,
+                    None,
+                    ta_params.as_ref(),
+                    Some(ta_req_info),
+                )?;
+                Ok(None)
+            }
+            Err(litebox_shim_optee::OpenSessionError::LoadFailed(_)) => {
+                Err(OpteeSmcReturnCode::ENomem)
+            }
+            Err(
+                litebox_shim_optee::OpenSessionError::NoEntrypoints
+                | litebox_shim_optee::OpenSessionError::ContextLoadFailed
+                | litebox_shim_optee::OpenSessionError::ParamsReadFailed,
+            ) => Err(OpteeSmcReturnCode::EBadCmd),
+        }
+    })?;
 
-                // Safety: We are about to tear down this TA instance;
-                // no references to user-space memory will be held afterwards.
-                unsafe { shim.release_user_mappings() };
+    // Outside address space scope: only session registration and cleanup
+    // (no TA user-space memory access needed).
+    match result {
+        Ok(Some(open_result)) => {
+            let instance = Arc::new(SpinMutex::new(TaInstance {
+                shim,
+                loaded_program: open_result.loaded_program,
+                address_space_id: as_id,
+            }));
 
-                return Ok(OpenSessionOutcome::Responded);
+            if open_result.ta_flags.is_single_instance() {
+                session_manager().cache_single_instance(ta_uuid, instance.clone());
             }
 
-            // Write success response back to normal world (while still in TA address space)
-            write_msg_args_to_normal_world(
-                msg_args,
-                msg_args_phys_addr,
-                return_code,
-                Some(runner_session_id),
-                Some(&ta_params),
-                Some(ta_req_info),
-            )?;
+            session_manager().register_session(
+                runner_session_id,
+                instance.clone(),
+                ta_uuid,
+                open_result.ta_flags,
+            );
 
-            Ok(OpenSessionOutcome::Success {
-                program: loaded_program,
-                flags: ta_flags,
-            })
-        },
-    )?;
-
-    // Handle the closure outcome
-    let (loaded_program, ta_flags) = match result {
-        Ok(OpenSessionOutcome::Success { program, flags }) => (program, flags),
-        Ok(OpenSessionOutcome::Responded) => {
-            // Error response already written to normal world inside the closure.
-            // Safety: the Responded path already released user-space references
-            // inside the closure; teardown is safe and release_user_mappings is
-            // idempotent (no-op on second call).
-            unsafe { teardown_ta_address_space(&shim, as_id) };
-            return Ok(());
+            debug_serial_println!(
+                "OpenSession complete on new instance: session_id={}",
+                runner_session_id
+            );
+            Ok(())
+        }
+        Ok(None) => {
+            // Error response already written; destroy AS.
+            // Shim released user mappings on all error paths (see OpenSessionError doc).
+            let _ = destroy_ta_address_space(as_id);
+            Ok(())
         }
         Err(e) => {
-            // Unhandled error; no response was written.
-            // Safety: no references to user-space memory are held after the
-            // closure exits. teardown ensures user pages are released (some
-            // error paths inside the closure don't call release_user_mappings).
-            unsafe { teardown_ta_address_space(&shim, as_id) };
-            return Err(e);
+            // Internal error; no VTL0 response written.
+            // Shim released user mappings on all error paths (see OpenSessionError doc).
+            let _ = destroy_ta_address_space(as_id);
+            Err(e)
         }
-    };
-
-    // Success: create TA instance - loaded_program is already boxed, no move happens
-    let instance = Arc::new(SpinMutex::new(TaInstance {
-        shim,
-        loaded_program,
-        address_space_id: as_id,
-    }));
-
-    // Cache single-instance TAs for future sessions
-    if ta_flags.is_single_instance() {
-        session_manager().cache_single_instance(ta_uuid, instance.clone());
     }
-
-    // Register session (runner_session_id already allocated above)
-    session_manager().register_session(runner_session_id, instance.clone(), ta_uuid, ta_flags);
-
-    debug_serial_println!(
-        "OpenSession complete: session_id={}, single_instance={}",
-        runner_session_id,
-        ta_flags.is_single_instance()
-    );
-
-    Ok(())
 }
 
 /// Handle InvokeCommand.
@@ -1134,13 +1025,15 @@ fn handle_close_session(
 ///
 /// # Security Note
 ///
-/// This function accesses TA userspace memory via `update_optee_msg_args` to copy out
-/// output parameters. It must be called **inside** `with_ta_address_space` scope,
+/// This function may access TA userspace memory via `update_optee_msg_args`
+/// to copy out memref output parameters. It must be called **inside**
+/// `with_ta_address_space` scope when `ta_params` contains memref outputs,
 /// otherwise the userspace memory references become invalid.
 ///
 /// # Panics
 ///
-/// Panics if called while the base page table is active (i.e., not in a TA context).
+/// Debug-panics if called while the base page table is active (i.e., not in
+/// a TA context) and `ta_params` is `Some`.
 #[inline]
 fn write_msg_args_to_normal_world(
     msg_args: &mut OpteeMsgArgs,
@@ -1150,17 +1043,17 @@ fn write_msg_args_to_normal_world(
     ta_params: Option<&UteeParams>,
     ta_req_info: Option<&litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>>,
 ) -> Result<(), OpteeSmcReturnCode> {
-    // Ensure we're on a task page table, not the base page table.
-    // Accessing TA userspace memory requires the TA's page table to be active.
+    // Ensure we're on a task page table when TA params need to be read.
     // Note: uses LVBS-specific `page_table_manager()` directly — this is acceptable
     // because this function is part of the LVBS runner (not portable to other platforms).
-    debug_assert!(
-        !litebox_platform_multiplex::platform()
-            .page_table_manager()
-            .is_base_page_table_active(),
-        "write_msg_args_to_normal_world called on base page table"
-    );
-
+    if ta_params.is_some() {
+        debug_assert!(
+            !litebox_platform_multiplex::platform()
+                .page_table_manager()
+                .is_base_page_table_active(),
+            "write_msg_args_to_normal_world called with ta_params on base page table"
+        );
+    }
     // Per OP-TEE: origin is TEE only if panicked (TARGET_DEAD), otherwise TrustedApp
     let origin = if return_code == TeeResult::TargetDead {
         TeeOrigin::Tee

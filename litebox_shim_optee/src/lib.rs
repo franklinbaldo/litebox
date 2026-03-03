@@ -300,6 +300,243 @@ impl OpteeShim {
             let _ = self.page_manager().release_memory(release);
         }
     }
+
+    /// Run the TA loading and OpenSession entry point sequence.
+    ///
+    /// This method orchestrates the core TA lifecycle for a **new** instance:
+    /// 1. Load ldelf + TA binary → `LoadedProgram`
+    /// 2. Run ldelf (`TA_CreateEntryPoint`)
+    /// 3. Load TA context with OpenSession params
+    /// 4. Run TA OpenSession entry point
+    /// 5. Read and copy TA output params from user-space memory
+    ///
+    /// The caller is responsible for:
+    /// - Creating and activating the address space (this method must run inside
+    ///   `with_address_space`)
+    /// - Writing the response to the host (VTL0/normal world)
+    /// - Registering the session on success
+    /// - Tearing down the address space on failure
+    ///
+    /// On failure, this method calls `release_user_mappings` before returning.
+    ///
+    /// # Safety
+    ///
+    /// Must be called inside an active address space scope (e.g., inside
+    /// `with_address_space`). The caller must ensure that no references to
+    /// TA user-space memory outlive the address space scope.
+    pub unsafe fn run_open_session(
+        &self,
+        ldelf_bin: &[u8],
+        ta_uuid: litebox_common_optee::TeeUuid,
+        ta_bin: Option<&[u8]>,
+        client_identity: Option<TeeIdentity>,
+        session_id: u32,
+        params: &[litebox_common_optee::UteeParamOwned],
+    ) -> Result<OpenSessionNewResult, OpenSessionError> {
+        use litebox::platform::GuestExecutionProvider;
+        let platform = self.0.platform;
+
+        // Step 1: Load ldelf + TA
+        let loaded_program = alloc::boxed::Box::new(
+            self.load_ldelf(ldelf_bin, ta_uuid, ta_bin, client_identity, session_id)
+                .map_err(|e| {
+                    // Safety: load_ldelf failed; no user-space references will be held.
+                    unsafe { self.release_user_mappings() };
+                    OpenSessionError::LoadFailed(e)
+                })?,
+        );
+
+        let ta_flags = loaded_program.ta_flags;
+        let entrypoints = loaded_program.entrypoints.as_ref().ok_or_else(|| {
+            // Safety: entrypoints missing; no TA code ran.
+            unsafe { self.release_user_mappings() };
+            OpenSessionError::NoEntrypoints
+        })?;
+
+        // Step 2: Run ldelf (TA_CreateEntryPoint)
+        let mut ldelf_ctx = litebox_common_linux::PtRegs::default();
+        unsafe { platform.run_thread(entrypoints, &mut ldelf_ctx) };
+
+        let ldelf_return_code: u32 = ldelf_ctx.rax.truncate();
+        let ldelf_return_code =
+            TeeResult::try_from(ldelf_return_code).unwrap_or(TeeResult::GenericError);
+        if ldelf_return_code != TeeResult::Success {
+            // Safety: ldelf failed; tearing down user mappings.
+            unsafe { self.release_user_mappings() };
+            return Err(OpenSessionError::LdelfFailed(ldelf_return_code));
+        }
+
+        // Step 3: Load TA context for OpenSession
+        entrypoints
+            .load_ta_context(
+                params,
+                Some(session_id),
+                litebox_common_optee::UteeEntryFunc::OpenSession as u32,
+                None,
+            )
+            .map_err(|_| {
+                // Safety: TA context loading failed; tearing down.
+                unsafe { self.release_user_mappings() };
+                OpenSessionError::ContextLoadFailed
+            })?;
+
+        // Step 4: Run TA OpenSession entry point
+        let mut ctx = litebox_common_linux::PtRegs::default();
+        unsafe { platform.reenter_thread(entrypoints, &mut ctx) };
+
+        let return_code: u32 = ctx.rax.truncate();
+        let return_code = TeeResult::try_from(return_code).unwrap_or(TeeResult::GenericError);
+
+        // If OpenSession failed, read params on a best-effort basis (for the
+        // error response) and release user mappings.
+        if return_code != TeeResult::Success {
+            let ta_params = loaded_program.params_address.and_then(|addr| {
+                UserConstPtr::<litebox_common_optee::UteeParams>::from_usize(addr).read_at_offset(0)
+            });
+            // Safety: OpenSession failed; tearing down user mappings.
+            unsafe { self.release_user_mappings() };
+            return Err(OpenSessionError::TaOpenSessionFailed {
+                return_code,
+                ta_params,
+            });
+        }
+
+        // Step 5: Read TA output params (copy from user-space memory).
+        // On the success path, a read failure is a hard error — the caller
+        // cannot report success without the TA's output params.
+        let ta_params = match loaded_program.params_address {
+            Some(addr) => Some(
+                UserConstPtr::<litebox_common_optee::UteeParams>::from_usize(addr)
+                    .read_at_offset(0)
+                    .ok_or_else(|| {
+                        // Safety: params read failed; tearing down user mappings.
+                        unsafe { self.release_user_mappings() };
+                        OpenSessionError::ParamsReadFailed
+                    })?,
+            ),
+            None => None,
+        };
+
+        Ok(OpenSessionNewResult {
+            loaded_program,
+            ta_flags,
+            ta_params,
+        })
+    }
+
+    /// Reenter an existing TA instance for an OpenSession call on a
+    /// single-instance TA.
+    ///
+    /// The caller must hold the `TaInstance` lock and have activated the
+    /// instance's address space before calling this.
+    ///
+    /// # Safety
+    ///
+    /// Must be called inside the TA's active address space scope.
+    pub unsafe fn reenter_open_session(
+        &self,
+        loaded_program: &LoadedProgram,
+        params: &[litebox_common_optee::UteeParamOwned],
+        session_id: u32,
+    ) -> Result<ReuseInstanceResult, OpenSessionError> {
+        use litebox::platform::GuestExecutionProvider;
+        let platform = self.0.platform;
+
+        let entrypoints = loaded_program
+            .entrypoints
+            .as_ref()
+            .ok_or(OpenSessionError::NoEntrypoints)?;
+
+        // Load TA context for OpenSession
+        entrypoints
+            .load_ta_context(
+                params,
+                Some(session_id),
+                litebox_common_optee::UteeEntryFunc::OpenSession as u32,
+                None,
+            )
+            .map_err(|_| OpenSessionError::ContextLoadFailed)?;
+
+        // Run TA OpenSession entry point
+        let mut ctx = litebox_common_linux::PtRegs::default();
+        unsafe { platform.reenter_thread(entrypoints, &mut ctx) };
+
+        let return_code: u32 = ctx.rax.truncate();
+        let return_code = TeeResult::try_from(return_code).unwrap_or(TeeResult::GenericError);
+
+        // Read TA output params — best-effort for error, hard failure for success.
+        // For single-instance reuse we do NOT release user mappings on failure
+        // (the existing instance's memory must be preserved).
+        let ta_params = match loaded_program.params_address {
+            Some(addr) => {
+                UserConstPtr::<litebox_common_optee::UteeParams>::from_usize(addr).read_at_offset(0)
+            }
+            None => None,
+        };
+
+        if return_code != TeeResult::Success {
+            return Ok(ReuseInstanceResult {
+                return_code,
+                ta_params,
+            });
+        }
+
+        // Success path: params read must succeed if params_address was set.
+        if loaded_program.params_address.is_some() && ta_params.is_none() {
+            return Err(OpenSessionError::ParamsReadFailed);
+        }
+
+        Ok(ReuseInstanceResult {
+            return_code,
+            ta_params,
+        })
+    }
+}
+
+/// Result of a successful new-instance OpenSession (TA returned Success).
+pub struct OpenSessionNewResult {
+    /// The loaded TA program (boxed to keep at fixed heap address).
+    pub loaded_program: alloc::boxed::Box<LoadedProgram>,
+    /// TA flags (single-instance, multi-session, etc.)
+    pub ta_flags: TaFlags,
+    /// TA output params copied from user-space memory.
+    pub ta_params: Option<litebox_common_optee::UteeParams>,
+}
+
+/// Result of a reuse-instance OpenSession on a single-instance TA.
+pub struct ReuseInstanceResult {
+    /// The TA's return code from OpenSession.
+    pub return_code: TeeResult,
+    /// TA output params copied from user-space memory.
+    pub ta_params: Option<litebox_common_optee::UteeParams>,
+}
+
+/// Errors from the OpenSession shim handler.
+///
+/// **Cleanup invariant:** For methods on new instances (`run_open_session`),
+/// all error variants guarantee that user mappings have been released before
+/// returning. The caller only needs to destroy the address space.
+/// For methods on existing instances (`reenter_open_session`), user mappings
+/// are NOT released (the existing instance's memory must be preserved).
+pub enum OpenSessionError {
+    /// ldelf/TA binary loading failed.
+    LoadFailed(loader::elf::ElfLoaderError),
+    /// The loaded program has no entrypoints.
+    NoEntrypoints,
+    /// ldelf's TA_CreateEntryPoint returned an error.
+    LdelfFailed(TeeResult),
+    /// Failed to load TA context (prepare params for entry).
+    ContextLoadFailed,
+    /// Failed to read TA output params from user-space memory after a
+    /// successful OpenSession return.
+    ParamsReadFailed,
+    /// The TA's OpenSession entry point returned an error.
+    /// The TA output params (if available) are included so the runner
+    /// can write them back to the host.
+    TaOpenSessionFailed {
+        return_code: TeeResult,
+        ta_params: Option<litebox_common_optee::UteeParams>,
+    },
 }
 
 impl OpteeShimEntrypoints {
