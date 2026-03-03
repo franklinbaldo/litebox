@@ -359,7 +359,10 @@ if non-OP-TEE runners would also need it)
 - **Fork/COW deferred:** `fork_address_space` stays `NotSupported` for LVBS.
   When we implement multi-TA fork, we'll add COW page table copy.
 - **Multi-TA calls:** TA-to-TA calls (`TEE_OpenTASession`) are not currently
-  supported. The `with_address_space` pattern naturally nests if added later.
+  supported. The `with_address_space` implementation currently assumes the
+  caller is in the base address space and does **not** support nesting. If
+  TA-to-TA calls are added, the RAII guard must save/restore the previous CR3
+  instead of unconditionally calling `load_base()`.
 - **TA lifecycle state machine:** A TA instance goes through: Created → Loaded →
   OpenSession → (InvokeCommand)* → CloseSession → Destroyed. After Step 3,
   the shim owns all state transitions. The runner only owns the

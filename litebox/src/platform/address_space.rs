@@ -42,6 +42,10 @@ pub enum AddressSpaceError {
     /// created, etc.).
     #[error("invalid address space id")]
     InvalidId,
+    /// The address space is currently active and cannot be modified or
+    /// destroyed. The caller should switch away first.
+    #[error("address space is currently active")]
+    Busy,
     /// The platform does not support this operation.
     #[error("operation not supported by this platform")]
     NotSupported,
@@ -74,6 +78,14 @@ pub trait AddressSpaceProvider {
     /// Destroy an address space, releasing all associated resources.
     ///
     /// After this call, `id` is invalid and must not be reused.
+    ///
+    /// # Preconditions
+    ///
+    /// The caller must ensure that:
+    /// - All user-space memory mappings in this address space have been
+    ///   released (e.g., via `PageManager::release_memory`).
+    /// - The address space is not currently active (switch away first).
+    /// - No references or pointers to memory in this address space are held.
     fn destroy_address_space(&self, id: Self::AddressSpaceId) -> Result<(), AddressSpaceError> {
         let _ = id;
         Err(AddressSpaceError::NotSupported)
@@ -111,6 +123,13 @@ pub trait AddressSpaceProvider {
     /// On kernel platforms implementations **must** restore the prior address
     /// space even if `f` panics (use a guard / RAII pattern). Userland
     /// platforms may keep this as a thin wrapper.
+    ///
+    /// # Default Implementation
+    ///
+    /// The default calls [`activate_address_space`](Self::activate_address_space)
+    /// but does **not** restore the prior address space on return. Platforms
+    /// where `activate_address_space` has side effects (e.g., CR3 writes)
+    /// **must** override this method with a proper RAII guard.
     fn with_address_space<R>(
         &self,
         id: Self::AddressSpaceId,

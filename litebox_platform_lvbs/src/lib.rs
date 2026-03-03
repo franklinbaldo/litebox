@@ -16,7 +16,7 @@ use litebox::platform::{
     DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider,
     Punchthrough, PunchthroughProvider, PunchthroughToken, RawMutex as _, RawMutexProvider,
     RawPointerProvider, StdioProvider, TimeProvider, UnblockedOrTimedOut,
-    page_mgmt::DeallocationError,
+    address_space::AddressSpaceError, page_mgmt::DeallocationError,
 };
 use litebox::{
     mm::linux::{PAGE_SIZE, PageRange},
@@ -1347,9 +1347,91 @@ impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<
 }
 
 impl<Host: HostInterface> litebox::platform::AddressSpaceProvider for LinuxKernel<Host> {
-    // All methods default to `Err(NotSupported)` — real implementation comes
-    // when LVBS multi-process (separate page tables) is added.
-    type AddressSpaceId = u32;
+    type AddressSpaceId = usize;
+
+    fn create_address_space(&self) -> Result<Self::AddressSpaceId, AddressSpaceError> {
+        self.page_table_manager
+            .create_task_page_table()
+            // create_task_page_table currently only fails with ENOMEM.
+            .map_err(|_| AddressSpaceError::NoSpace)
+    }
+
+    fn destroy_address_space(&self, id: Self::AddressSpaceId) -> Result<(), AddressSpaceError> {
+        debug_assert_ne!(id, BASE_PAGE_TABLE_ID, "cannot destroy the base page table");
+        // Safety: the trait contract requires that the caller has released all
+        // user mappings and that no references to the address space's memory
+        // are held. The delete_task_page_table method checks that the page
+        // table is not currently active (CR3 check).
+        unsafe {
+            self.page_table_manager
+                .delete_task_page_table(id)
+                .map_err(|e| match e {
+                    Errno::EBUSY => AddressSpaceError::Busy,
+                    _ => AddressSpaceError::InvalidId,
+                })
+        }
+    }
+
+    fn activate_address_space(&self, id: Self::AddressSpaceId) -> Result<(), AddressSpaceError> {
+        debug_assert_ne!(
+            id, BASE_PAGE_TABLE_ID,
+            "use with_address_space instead of activating the base page table"
+        );
+        // Safety: the trait contract requires that the caller ensures the
+        // target page table contains valid mappings for all memory that will
+        // be accessed after the switch.
+        unsafe {
+            self.page_table_manager
+                .load_task(id)
+                .map_err(|_| AddressSpaceError::InvalidId)
+        }
+    }
+
+    fn with_address_space<R>(
+        &self,
+        id: Self::AddressSpaceId,
+        f: impl FnOnce() -> R,
+    ) -> Result<R, AddressSpaceError> {
+        self.activate_address_space(id)?;
+
+        // RAII guard: restore the base page table when the scope exits,
+        // even if `f` panics.
+        //
+        // NOTE: This assumes the caller is in the base address space and
+        // does NOT support nesting (e.g., with_address_space(A, || {
+        // with_address_space(B, ...) })). When TA-to-TA calls are added,
+        // this must save/restore the previous CR3 instead of hardcoding
+        // load_base().
+        struct RestoreBaseGuard<'a>(&'a PageTableManager);
+        impl Drop for RestoreBaseGuard<'_> {
+            fn drop(&mut self) {
+                // Safety: the base page table always contains valid kernel
+                // mappings. Restoring it is safe at any point.
+                unsafe { self.0.load_base() };
+            }
+        }
+        let _guard = RestoreBaseGuard(&self.page_table_manager);
+
+        Ok(f())
+    }
+
+    fn address_space_range(
+        &self,
+        id: Self::AddressSpaceId,
+    ) -> Result<core::ops::Range<usize>, AddressSpaceError> {
+        // All LVBS task address spaces share the same user VA range (each has
+        // its own page table covering the full canonical low half). Validate
+        // that the ID is a known task page table.
+        if id == BASE_PAGE_TABLE_ID {
+            return Err(AddressSpaceError::InvalidId);
+        }
+        let task_pts = self.page_table_manager.task_page_tables.lock();
+        if task_pts.contains_key(&id) {
+            Ok(USER_ADDR_MIN..USER_ADDR_MAX)
+        } else {
+            Err(AddressSpaceError::InvalidId)
+        }
+    }
 }
 
 #[cfg(feature = "optee_syscall")]
