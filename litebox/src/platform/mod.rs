@@ -254,15 +254,13 @@ pub trait RawMutexProvider {
 
     /// Updates the waker for the current thread's interruptible wait.
     ///
-    /// Called by [`WaitContext::start_wait`] with `Some(waker)` when the current thread
-    /// enters an interruptible wait, and by [`WaitContext::end_wait`] with
+    /// Called by `WaitContext::start_wait` with `Some(waker)` when the current thread
+    /// enters an interruptible wait, and by `WaitContext::end_wait` with
     /// `None` when it leaves. The thread in an interruptible wait can be unblocked
     /// by [`Waker::wake`].
     ///
     /// This is a no-op by default.
     ///
-    /// [`WaitContext::start_wait`]: crate::event::wait::WaitContext::start_wait
-    /// [`WaitContext::end_wait`]: crate::event::wait::WaitContext::end_wait
     /// [`Waker::wake`]: crate::event::wait::Waker::wake
     #[allow(unused_variables)]
     fn update_waker(&self, waker: Option<crate::event::wait::Waker<Self>>)
