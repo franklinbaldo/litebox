@@ -3,11 +3,15 @@
 
 //! Signal handling syscalls and support.
 
+#[cfg(target_arch = "aarch64")]
+mod aarch64;
 #[cfg(target_arch = "x86")]
 pub(crate) mod x86;
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 
+#[cfg(target_arch = "aarch64")]
+use aarch64 as arch;
 use litebox_common_linux::signal::SignalDisposition;
 #[cfg(target_arch = "x86")]
 use x86 as arch;
@@ -27,10 +31,10 @@ use litebox::{
     utils::ReinterpretUnsignedExt as _,
 };
 use litebox_common_linux::signal::{
-    MINSIGSTKSZ, NSIG, SI_KERNEL, SI_USER, SIG_DFL, SIG_IGN, SaFlags, SigAction, SigAltStack,
-    SigSet, Siginfo, SiginfoData, SigmaskHow, Signal, SsFlags, Ucontext,
+    SaFlags, SigAction, SigAltStack, SigSet, Siginfo, SiginfoData, SigmaskHow, Signal, SsFlags,
+    Ucontext, MINSIGSTKSZ, NSIG, SIG_DFL, SIG_IGN, SI_KERNEL, SI_USER,
 };
-use litebox_common_linux::{PtRegs, errno::Errno};
+use litebox_common_linux::{errno::Errno, PtRegs};
 use litebox_platform_multiplex::Platform;
 
 pub(crate) struct SignalState {
@@ -56,7 +60,7 @@ impl SignalState {
                 sp: 0,
                 flags: SsFlags::DISABLE,
                 size: 0,
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(target_pointer_width = "64")]
                 __pad: 0,
             }),
             last_exception: Cell::new(litebox::shim::ExceptionInfo {
@@ -81,7 +85,7 @@ impl SignalState {
                 flags: SsFlags::DISABLE,
                 sp: 0,
                 size: 0,
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(target_pointer_width = "64")]
                 __pad: 0,
             }
             .into(),
@@ -106,7 +110,7 @@ impl SignalState {
                 restorer: 0,
                 flags: SaFlags::empty(),
                 mask: SigSet::empty(),
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(target_pointer_width = "64")]
                 __pad: 0,
             };
         }
@@ -161,7 +165,7 @@ impl SignalHandlers {
                         restorer: 0,
                         flags: SaFlags::empty(),
                         mask: SigSet::empty(),
-                        #[cfg(target_arch = "x86_64")]
+                        #[cfg(target_pointer_width = "64")]
                         __pad: 0,
                     },
                     immutable: i == SignalHandlersInner::sig_index(Signal::SIGKILL)
@@ -273,7 +277,7 @@ fn siginfo_exception(signal: Signal, fault_address: usize) -> Siginfo {
         signo: signal.as_i32(),
         errno: 0,
         code: SI_KERNEL,
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(target_pointer_width = "64")]
         __pad: 0,
         data: SiginfoData::new_addr(fault_address),
     }
@@ -286,7 +290,7 @@ fn siginfo_kill(signal: Signal) -> Siginfo {
         signo: signal.as_i32(),
         errno: 0,
         code: SI_USER,
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(target_pointer_width = "64")]
         __pad: 0,
         data: SiginfoData::new_zeroed(),
     }
@@ -318,7 +322,7 @@ impl SignalState {
                 sp: ss.sp,
                 flags: ss.flags & SsFlags::AUTODISARM,
                 size: ss.size,
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(target_pointer_width = "64")]
                 __pad: 0,
             });
             Ok(())
@@ -331,7 +335,7 @@ impl SignalState {
             sp: 0,
             flags: SsFlags::DISABLE,
             size: 0,
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(target_pointer_width = "64")]
             __pad: 0,
         });
     }
@@ -600,7 +604,7 @@ impl<FS: ShimFS> Task<FS> {
             signo: signal.as_i32(),
             errno: 0,
             code: SI_KERNEL,
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(target_pointer_width = "64")]
             __pad: 0,
             data: SiginfoData::new_zeroed(),
         };
@@ -631,7 +635,7 @@ impl<FS: ShimFS> Task<FS> {
                 restorer: 0,
                 flags: SaFlags::empty(),
                 mask: SigSet::empty(),
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(target_pointer_width = "64")]
                 __pad: 0,
             };
             // Don't allow further changes to this action.
