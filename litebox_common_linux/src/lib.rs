@@ -330,6 +330,36 @@ pub struct FileStat {
     pub __unused: [u32; 2],
 }
 
+/// Linux's `stat` struct for aarch64
+/// Uses the generic `struct stat` layout from <asm-generic/stat.h>
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+#[derive(Clone, Default, PartialEq, Debug, FromBytes, IntoBytes)]
+pub struct FileStat {
+    pub st_dev: u64,
+    pub st_ino: u64,
+    pub st_mode: u32,
+    pub st_nlink: u32,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub st_rdev: u64,
+    #[expect(clippy::pub_underscore_fields)]
+    pub __pad1: u64,
+    pub st_size: i64,
+    pub st_blksize: i32,
+    #[expect(clippy::pub_underscore_fields)]
+    pub __pad2: i32,
+    pub st_blocks: i64,
+    pub st_atime: i64,
+    pub st_atime_nsec: i64,
+    pub st_mtime: i64,
+    pub st_mtime_nsec: i64,
+    pub st_ctime: i64,
+    pub st_ctime_nsec: i64,
+    #[expect(clippy::pub_underscore_fields)]
+    pub __unused: [u32; 2],
+}
+
 /// Linux's `stat64` struct
 #[cfg(target_arch = "x86")]
 #[repr(C, packed)]
@@ -447,9 +477,10 @@ impl From<litebox::fs::FileStatus> for FileStat {
             st_rdev: rdev
                 .map(|r| <_>::try_from(r.get()).unwrap())
                 .unwrap_or_default(),
-            #[allow(clippy::cast_possible_wrap)]
-            st_size: size,
-            st_blksize: blksize,
+            #[allow(clippy::cast_possible_wrap, clippy::unnecessary_cast)]
+            st_size: size as _,
+            #[allow(clippy::cast_possible_wrap, clippy::unnecessary_cast)]
+            st_blksize: blksize as _,
             st_blocks: 0,
             ..Default::default()
         }
@@ -772,7 +803,7 @@ cfg_if::cfg_if! {
     if #[cfg(all(target_arch = "x86"))] {
         pub type time_t = i32;
         pub type suseconds_t = u32;
-    } else if #[cfg(all(target_arch = "x86_64"))] {
+    } else if #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))] {
         pub type time_t = i64;
         pub type suseconds_t = u64;
     } else {
@@ -3048,6 +3079,23 @@ pub struct PtRegs {
     pub xss: usize,
 }
 
+/// Context saved when entering the kernel
+///
+/// pt_regs from [Linux](https://elixir.bootlin.com/linux/v5.19.17/source/arch/arm64/include/asm/ptrace.h#L178)
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+#[derive(Clone, Debug, Default)]
+pub struct PtRegs {
+    /// General-purpose registers x0-x30
+    pub regs: [usize; 31],
+    /// Stack pointer
+    pub sp: usize,
+    /// Program counter (return address after syscall)
+    pub pc: usize,
+    /// Processor state (PSTATE/CPSR)
+    pub pstate: usize,
+}
+
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 pub const EFLAGS_DF: usize = 0x400;
 
@@ -3088,6 +3136,24 @@ impl PtRegs {
         }
     }
 
+    /// Get the `idx`th syscall argument.
+    ///
+    /// # Panics
+    ///
+    /// If `idx` is greater than 5, this function will panic.
+    #[cfg(target_arch = "aarch64")]
+    pub fn syscall_arg(&self, idx: usize) -> usize {
+        match idx {
+            0 => self.regs[0],
+            1 => self.regs[1],
+            2 => self.regs[2],
+            3 => self.regs[3],
+            4 => self.regs[4],
+            5 => self.regs[5],
+            _ => panic!("Invalid syscall argument index: {}", idx),
+        }
+    }
+
     // (Private-only, only to be used via `SyscallRequest::try_from_raw`), get the `idx`th syscall
     // argument, reinterpret-truncated to the necessary type.
     fn sys_req_arg<T: ReinterpretTruncatedFromUsize>(&self, idx: usize) -> T {
@@ -3109,6 +3175,12 @@ impl PtRegs {
     #[cfg(target_arch = "x86")]
     pub fn get_ip(&self) -> usize {
         self.eip
+    }
+
+    /// Get the instruction pointer (IP)
+    #[cfg(target_arch = "aarch64")]
+    pub fn get_ip(&self) -> usize {
+        self.pc
     }
 }
 
@@ -3219,6 +3291,10 @@ impl<T: FromBytes, P: RawConstPointer<T>>
     ReinterpretUsizeAsPtr<core::marker::PhantomData<(bool, T)>> for Option<P>
 {
     fn reinterpret_usize_as_ptr(v: usize) -> Self {
-        if v == 0 { None } else { Some(P::from_usize(v)) }
+        if v == 0 {
+            None
+        } else {
+            Some(P::from_usize(v))
+        }
     }
 }
