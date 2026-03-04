@@ -1561,6 +1561,11 @@ impl<'a> litebox::platform::PunchthroughToken for PunchthroughToken<'a> {
             PunchthroughSyscall::SetThreadArea { user_desc } => {
                 set_thread_area(user_desc).map_err(litebox::platform::PunchthroughError::Failure)
             }
+            #[cfg(target_arch = "aarch64")]
+            PunchthroughSyscall::SetTpidr { value } => {
+                set_guest_tpidr(value);
+                Ok(0)
+            }
             PunchthroughSyscall::_Phantom(_, _, infallible) => match infallible {},
         }
     }

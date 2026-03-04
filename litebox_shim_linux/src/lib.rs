@@ -1018,7 +1018,7 @@ impl<FS: ShimFS> Task<FS> {
                     .ok_or(Errno::EFAULT)
                     .map(|()| 0)
             }),
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             SyscallRequest::Newfstatat {
                 dirfd,
                 pathname,
@@ -1057,10 +1057,10 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Clone { args } => self.sys_clone(ctx, &args),
             SyscallRequest::Clone3 { args } => self.sys_clone3(ctx, args),
             SyscallRequest::SetThreadArea { user_desc } => {
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
                 {
                     let _ = user_desc;
-                    Err(Errno::ENOSYS) // x86_64 does not support set_thread_area
+                    Err(Errno::ENOSYS) // x86_64/aarch64 does not support set_thread_area
                 }
                 #[cfg(target_arch = "x86")]
                 {

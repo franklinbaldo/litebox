@@ -547,6 +547,13 @@ type ThreadLocalDescriptor = MutPtr<u8>;
 #[cfg(target_arch = "x86")]
 type ThreadLocalDescriptor = litebox_common_linux::UserDesc;
 
+/// A descriptor for thread-local storage (TLS).
+///
+/// On `aarch64`, this is the raw TPIDR_EL0 value (a usize) that will be
+/// set as the guest's thread-local storage base.
+#[cfg(target_arch = "aarch64")]
+type ThreadLocalDescriptor = usize;
+
 struct NewThreadArgs<FS: ShimFS> {
     /// Task struct that maintains all per-thread data
     task: Task<FS>,
@@ -686,6 +693,8 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 desc
             };
+            #[cfg(target_arch = "aarch64")]
+            let desc = addr;
             Some(desc)
         } else {
             None
@@ -1459,6 +1468,15 @@ impl<FS: ShimFS> Task<FS> {
                         xss: 0x2b, // __USER_DS
                     };
                 }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    *ctx = litebox_common_linux::PtRegs {
+                        regs: [0; 31],
+                        sp: load_info.user_stack_top,
+                        pc: load_info.entry_point,
+                        pstate: 0,
+                    };
+                }
             }
             ThreadInitState::NewThread {
                 tls,
@@ -1480,6 +1498,13 @@ impl<FS: ShimFS> Task<FS> {
                     }
                     ctx.eax = 0;
                 }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    if let Some(stack) = stack {
+                        ctx.sp = stack;
+                    }
+                    ctx.regs[0] = 0; // x0 = clone return value
+                }
 
                 // Set the TLS for the new thread.
                 if let Some(tls) = tls {
@@ -1494,6 +1519,18 @@ impl<FS: ShimFS> Task<FS> {
                         use litebox::platform::RawConstPointer as _;
                         self.sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize()))
                             .unwrap();
+                    }
+
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        let punchthrough =
+                            litebox_common_linux::PunchthroughSyscall::SetTpidr { value: tls };
+                        let token = self
+                            .global
+                            .platform
+                            .get_punchthrough_token_for(punchthrough)
+                            .expect("Failed to get punchthrough token for SetTpidr");
+                        token.execute().map(|_| ()).unwrap();
                     }
                 }
 
