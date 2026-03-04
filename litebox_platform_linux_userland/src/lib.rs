@@ -124,8 +124,9 @@ impl LinuxUserland {
             .map(|tun_device_name| {
                 let tun_path = b"/dev/net/tun\0";
                 let tun_fd = unsafe {
-                    syscalls::syscall3(
-                        syscalls::Sysno::open,
+                    syscalls::syscall4(
+                        syscalls::Sysno::openat,
+                        (-100isize) as usize, // AT_FDCWD
                         tun_path.as_ptr() as usize,
                         (litebox::fs::OFlags::RDWR
                             | litebox::fs::OFlags::CLOEXEC
@@ -253,8 +254,9 @@ impl LinuxUserland {
         // whenever it get more pages from the host.
         let path = "/proc/self/maps";
         let fd = unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::open,
+            syscalls::syscall4(
+                syscalls::Sysno::openat,
+                (-100isize) as usize, // AT_FDCWD
                 path.as_ptr() as usize,
                 OFlags::RDONLY.bits() as usize,
                 0,
@@ -1881,8 +1883,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             std::ffi::CString::new(file_path.as_os_str().as_encoded_bytes()).unwrap();
         // TODO(jb): We should likely be storing pre-opened FDs, right?
         let fd = unsafe {
-            syscalls::syscall4(
-                syscalls::Sysno::open,
+            syscalls::syscall5(
+                syscalls::Sysno::openat,
+                (-100isize) as usize, // AT_FDCWD
                 file_path_cstr.as_ptr() as usize,
                 OFlags::RDONLY.bits() as usize,
                 0,
@@ -2047,13 +2050,25 @@ extern "C-unwind" fn exception_handler(
     error: usize,
     cr2: usize,
 ) {
-    let info = litebox::shim::ExceptionInfo {
-        exception: litebox::shim::Exception(trapno.try_into().unwrap()),
-        error_code: error.try_into().unwrap(),
-        cr2,
-        kernel_mode: false,
-    };
-    thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info));
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        let info = litebox::shim::ExceptionInfo {
+            exception: litebox::shim::Exception(trapno.try_into().unwrap()),
+            error_code: error.try_into().unwrap(),
+            cr2,
+            kernel_mode: false,
+        };
+        thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info));
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _ = trapno;
+        let info = litebox::shim::ExceptionInfo {
+            fault_address: cr2,
+            esr: error as u64,
+        };
+        thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info));
+    }
 }
 
 extern "C-unwind" fn interrupt_handler(thread_ctx: &mut ThreadContext) {
