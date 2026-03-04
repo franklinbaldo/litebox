@@ -9,6 +9,8 @@ CFLAGS ?= -Wall -Werror -fPIC -shared -nostdlib
 ARCH ?= $(shell uname -m)
 ifeq ($(ARCH),x86_64)
     CFLAGS += -m64
+else ifeq ($(ARCH),aarch64)
+    # No extra flags needed for aarch64
 else
     $(error Unsupported target architecture: $(ARCH))
 endif

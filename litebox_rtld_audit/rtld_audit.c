@@ -11,10 +11,11 @@
 // Value 0x30584f424554494c is "LITEBOX0" in little-endian (bytes: 'L','I','T','E','B','O','X','0')
 #define TRAMPOLINE_MAGIC ((uint64_t)0x30584f424554494c)
 
-#if !defined(__x86_64__)
-# error "rtld_audit.c: build target must be x86_64"
+#if !defined(__x86_64__) && !defined(__aarch64__)
+# error "rtld_audit.c: build target must be x86_64 or aarch64"
 #endif
 
+#ifdef __x86_64__
 // Linux syscall numbers (x86_64)
 #define SYS_openat 257
 #define SYS_read 0
@@ -25,12 +26,29 @@
 #define SYS_mprotect 10
 #define SYS_munmap 11
 #define SYS_exit_group 231
+#elif defined(__aarch64__)
+// Linux syscall numbers (aarch64)
+#define SYS_openat 56
+#define SYS_read 63
+#define SYS_write 64
+#define SYS_close 57
+#define SYS_newfstatat 79
+#define SYS_mmap 222
+#define SYS_mprotect 226
+#define SYS_munmap 215
+#define SYS_exit_group 94
+#endif
 #define AT_FDCWD -100
 
-// Maximum valid userspace address (48-bit address space)
+#ifdef __x86_64__
+// Maximum valid userspace address (47-bit address space)
 #define MAX_USERSPACE_ADDR 0x7FFFFFFFFFFFUL
+#elif defined(__aarch64__)
+// Maximum valid userspace address (48-bit VA space)
+#define MAX_USERSPACE_ADDR 0xFFFFFFFFFFFFUL
+#endif
 
-// Trampoline header layout for x86_64: magic(8) + file_offset(8) + vaddr(8) + size(8) = 32 bytes
+// Trampoline header layout: magic(8) + file_offset(8) + vaddr(8) + size(8) = 32 bytes
 struct __attribute__((packed)) TrampolineHeader {
   uint64_t magic;
   uint64_t file_offset;
@@ -61,6 +79,7 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5,
   if (!syscall_entry)
     return -1;
 
+#ifdef __x86_64__
   register long rax __asm__("rax") = num;
   register long rdi __asm__("rdi") = a1;
   register long rsi __asm__("rsi") = a2;
@@ -77,12 +96,36 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5,
                      "r"(r10), "r"(r8), "r"(r9)
                    : "rcx", "r11", "memory");
   return rax;
+#elif defined(__aarch64__)
+  register long x8 __asm__("x8") = num;
+  register long x0 __asm__("x0") = a1;
+  register long x1 __asm__("x1") = a2;
+  register long x2 __asm__("x2") = a3;
+  register long x3 __asm__("x3") = a4;
+  register long x4 __asm__("x4") = a5;
+  register long x5 __asm__("x5") = a6;
+
+  __asm__ volatile(
+    "stp x16, x30, [sp, #-16]!\n"
+    "adr x30, 1f\n"
+    "mov x16, %[entry]\n"
+    "br x16\n"
+    "1:\n"
+    "ldp x16, x30, [sp], #16\n"
+    : "+r"(x0)
+    : [entry] "r"(syscall_entry), "r"(x1), "r"(x2), "r"(x3),
+      "r"(x4), "r"(x5), "r"(x8)
+    : "memory"
+  );
+  return x0;
+#endif
 }
 
 /* Re-implement some utility functions and re-define the structures to avoid
  * dependency on libc. */
 
 // Define the FileStat structure
+#ifdef __x86_64__
 struct FileStat {
   unsigned long st_dev;
   unsigned long st_ino;
@@ -105,6 +148,31 @@ struct FileStat {
   unsigned long st_ctime_nsec;
   long __unused[3];
 };
+#elif defined(__aarch64__)
+// ARM64 uses the asm-generic stat layout
+struct FileStat {
+  unsigned long st_dev;
+  unsigned long st_ino;
+  unsigned int  st_mode;
+  unsigned int  st_nlink;
+  unsigned int  st_uid;
+  unsigned int  st_gid;
+  unsigned long st_rdev;
+  unsigned long __pad1;
+  long          st_size;
+  int           st_blksize;
+  int           __pad2;
+  long          st_blocks;
+  unsigned long st_atime;
+  unsigned long st_atime_nsec;
+  unsigned long st_mtime;
+  unsigned long st_mtime_nsec;
+  unsigned long st_ctime;
+  unsigned long st_ctime_nsec;
+  unsigned int  __unused4;
+  unsigned int  __unused5;
+};
+#endif
 
 int memcmp(const void *s1, const void *s2, size_t n) {
   const unsigned char *p1 = s1;
@@ -270,7 +338,12 @@ unsigned int la_objopen(struct link_map *map,
   }
 
   struct FileStat st;
+#ifdef __x86_64__
   if (do_syscall(SYS_fstat, fd, (long)&st, 0, 0, 0, 0) < 0) {
+#elif defined(__aarch64__)
+  #define AT_EMPTY_PATH 0x1000
+  if (do_syscall(SYS_newfstatat, fd, (long)"", (long)&st, AT_EMPTY_PATH, 0, 0) < 0) {
+#endif
     syscall_print("[audit] fstat failed\n", 21);
     do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
     return 0;
@@ -283,7 +356,7 @@ unsigned int la_objopen(struct link_map *map,
     return 0;
   }
 
-  // The trampoline header is at the end of the file (last 32 bytes for x86_64).
+  // The trampoline header is at the end of the file (last 32 bytes).
   // File layout: [ELF][padding][trampoline code][header]
   // Read the last page that contains the header.
   long header_offset = file_size - sizeof(struct TrampolineHeader);
