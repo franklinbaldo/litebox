@@ -9,8 +9,8 @@ fn main() {
     let mut make_cmd = std::process::Command::new("make");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();
-    if target_arch != "x86_64" {
-        // XXX: Currently 32-bit x86 is unsupported (unimplemented), skip building
+    if target_arch != "x86_64" && target_arch != "aarch64" {
+        // Skip building for unsupported architectures (e.g. 32-bit x86)
         return;
     }
     make_cmd
