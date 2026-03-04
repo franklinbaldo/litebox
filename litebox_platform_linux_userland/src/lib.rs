@@ -1423,6 +1423,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     const TASK_ADDR_MAX: usize = 0xC000_0000; // 3 GiB (see arch/x86/include/asm/page_32_types.h)
     #[cfg(all(target_arch = "x86", feature = "x86_on_x64"))]
     const TASK_ADDR_MAX: usize = 0xFFFF_F000; // Note running 32-bit programs on x86_64 kernel has a different limit than native x86
+    #[cfg(target_arch = "aarch64")]
+    const TASK_ADDR_MAX: usize = 0x0000_FFFF_FFFF_F000; // 48-bit VA space
 
     fn allocate_pages(
         &self,

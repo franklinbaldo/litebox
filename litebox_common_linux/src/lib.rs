@@ -1051,6 +1051,42 @@ pub unsafe fn wrgsbase(gs_base: usize) {
     }
 }
 
+/// Read the TPIDR_EL0 register (user-space thread pointer)
+///
+/// ## Safety
+///
+/// The caller must ensure that reading this register has no unsafe side
+/// effects in the current context.
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn read_tpidr_el0() -> usize {
+    let ret: usize;
+    unsafe {
+        core::arch::asm!(
+            "mrs {}, tpidr_el0",
+            out(reg) ret,
+            options(nostack, nomem, preserves_flags)
+        );
+    }
+    ret
+}
+
+/// Write the TPIDR_EL0 register (user-space thread pointer)
+///
+/// ## Safety
+///
+/// The caller must ensure that this write operation has no unsafe side
+/// effects, as the TPIDR_EL0 register is used for thread-local storage.
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn write_tpidr_el0(val: usize) {
+    unsafe {
+        core::arch::asm!(
+            "msr tpidr_el0, {}",
+            in(reg) val,
+            options(nostack, nomem, preserves_flags)
+        );
+    }
+}
+
 /// Reads the current FS segment selector
 #[cfg(target_arch = "x86")]
 pub fn rdfss() -> u16 {
@@ -2934,7 +2970,7 @@ impl<Platform: litebox::platform::RawPointerProvider> TimeParam<Platform> {
 
     /// Return a `TimeParam` for the old timespec pointer type, which is
     /// architecture dependent.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub fn timespec_old(tp: Option<Platform::RawMutPointer<Timespec>>) -> Self {
         Self::timespec64(tp)
     }
