@@ -12,11 +12,13 @@
 //! However, as an explicit goal, it is intended to provide low-overhead hooking of syscalls,
 //! without needing to undergo a user-kernel transition.
 //!
-//! This crate currently only supports x86-64 (i.e., amd64) ELFs.
+//! This crate supports x86-64 (amd64), x86-32 (i386), and AArch64 (arm64) ELFs.
+
+mod arm64;
 
 use std::collections::HashSet;
 
-use object::read::elf::{ElfFile, ProgramHeader as _};
+use object::read::elf::{ElfFile, FileHeader as _, ProgramHeader as _};
 use object::read::{Object as _, ObjectSection as _, ObjectSymbol as _};
 use thiserror::Error;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
@@ -109,7 +111,14 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
         let file = object::File::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
 
         let arch = match file {
-            object::File::Elf64(_) => Arch::X86_64,
+            object::File::Elf64(ref elf) => {
+                let endian = elf.endian();
+                match elf.elf_header().e_machine(endian) {
+                    object::elf::EM_X86_64 => Arch::X86_64,
+                    object::elf::EM_AARCH64 => Arch::Aarch64,
+                    _ => return Err(Error::UnsupportedObjectFile),
+                }
+            }
             object::File::Elf32(_) => Arch::X86_32,
             _ => return Err(Error::UnsupportedObjectFile),
         };
@@ -126,7 +135,12 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
             return Err(Error::AlreadyHooked);
         }
 
-        let control_transfer_targets = get_control_transfer_targets(arch, &*buf, &text_sections)?;
+        // Control transfer targets only needed for x86 (ARM64 doesn't borrow neighbors)
+        let control_transfer_targets = if arch != Arch::Aarch64 {
+            get_control_transfer_targets(arch, &*buf, &text_sections)?
+        } else {
+            HashSet::new()
+        };
 
         let trampoline_base_addr = find_addr_for_trampoline_code(&file);
 
@@ -139,41 +153,48 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
         )
     };
 
-    // Build the trampoline code (without header - header goes at the end)
-    // The code starts with the syscall entry point placeholder
-    let mut trampoline_data = vec![];
     let trampoline = trampoline.unwrap_or(0);
-    if arch == Arch::X86_64 {
-        trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
+
+    // Dispatch to arch-specific hooking logic
+    let (trampoline_data, _syscall_insns_found) = if arch == Arch::Aarch64 {
+        arm64::hook_syscalls_aarch64(buf, &text_sections, trampoline_base_addr, trampoline)?
     } else {
-        let trampoline = u32::try_from(trampoline).map_err(|_| Error::TrampolineAddressTooLarge)?;
-        trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
-    }
-
-    // Patch syscalls in-place in buf
-    let mut syscall_insns_found = false;
-    for s in &text_sections {
-        let section_data = section_slice_mut(buf, s)?;
-        match hook_syscalls_in_section(
-            arch,
-            &control_transfer_targets,
-            s.vaddr,
-            section_data,
-            trampoline_base_addr,
-            dl_sysinfo_int80,
-            &mut trampoline_data,
-        ) {
-            Ok(()) => {
-                syscall_insns_found = true;
-            }
-            Err(Error::NoSyscallInstructionsFound) => {}
-            Err(e) => return Err(e),
+        // x86 path: build trampoline data and patch sections
+        let mut trampoline_data = vec![];
+        if arch == Arch::X86_64 {
+            trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
+        } else {
+            let trampoline =
+                u32::try_from(trampoline).map_err(|_| Error::TrampolineAddressTooLarge)?;
+            trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
         }
-    }
 
-    if !syscall_insns_found {
-        return Err(Error::NoSyscallInstructionsFound);
-    }
+        let mut syscall_insns_found = false;
+        for s in &text_sections {
+            let section_data = section_slice_mut(buf, s)?;
+            match hook_syscalls_in_section(
+                arch,
+                &control_transfer_targets,
+                s.vaddr,
+                section_data,
+                trampoline_base_addr,
+                dl_sysinfo_int80,
+                &mut trampoline_data,
+            ) {
+                Ok(()) => {
+                    syscall_insns_found = true;
+                }
+                Err(Error::NoSyscallInstructionsFound) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        if !syscall_insns_found {
+            return Err(Error::NoSyscallInstructionsFound);
+        }
+
+        (trampoline_data, syscall_insns_found)
+    };
 
     // Build output: [patched ELF][padding to page boundary][trampoline code][header]
     let mut out = buf.to_vec();
@@ -189,7 +210,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
 
     // Build the header (goes at the end of the file)
     // The entry point placeholder is at offset 0 of the trampoline code, not in the header.
-    if arch == Arch::X86_64 {
+    if arch == Arch::X86_64 || arch == Arch::Aarch64 {
         let header = TrampolineHeader64 {
             magic: *TRAMPOLINE_MAGIC,
             file_offset: trampoline_file_offset,
@@ -248,7 +269,7 @@ fn text_sections(file: &object::File<'_>) -> Result<Vec<TextSectionInfo>> {
 /// Check if the binary is already hooked by looking for TRAMPOLINE_MAGIC at the end of the file.
 fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
     let header_size = match arch {
-        Arch::X86_64 => size_of::<TrampolineHeader64>(),
+        Arch::X86_64 | Arch::Aarch64 => size_of::<TrampolineHeader64>(),
         Arch::X86_32 => size_of::<TrampolineHeader32>(),
     };
 
@@ -264,7 +285,7 @@ fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
     }
 
     let (file_offset, vaddr, trampoline_size) = match arch {
-        Arch::X86_64 => {
+        Arch::X86_64 | Arch::Aarch64 => {
             let header = TrampolineHeader64::read_from_bytes(header).unwrap();
             (header.file_offset, header.vaddr, header.trampoline_size)
         }
@@ -298,6 +319,7 @@ fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
 enum Arch {
     X86_32,
     X86_64,
+    Aarch64,
 }
 
 /// (private) Hook all syscalls in `section`, possibly extending `trampoline_data` to do so.
@@ -333,6 +355,7 @@ fn hook_syscalls_in_section(
                     continue;
                 }
             }
+            Arch::Aarch64 => unreachable!("x86 hook function not used for AArch64"),
         }
 
         let replace_end = inst.next_ip();
@@ -409,11 +432,11 @@ fn hook_syscalls_in_section(
             trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
             trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
             trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-            // The offset should point to the entry at offset 0
-            // After PUSH(1) + CALL(5) + POP(1) + opcode(2) = 9 bytes
-            // EAX = base + (len_before_PUSH + 6) = base + (current_len - 9 + 6) = base + (current_len - 3)
-            // We want: EAX + offset = base + 0
-            // So: offset = -(current_len - 3)
+                                                              // The offset should point to the entry at offset 0
+                                                              // After PUSH(1) + CALL(5) + POP(1) + opcode(2) = 9 bytes
+                                                              // EAX = base + (len_before_PUSH + 6) = base + (current_len - 9 + 6) = base + (current_len - 3)
+                                                              // We want: EAX + offset = base + 0
+                                                              // So: offset = -(current_len - 3)
             let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 3);
             trampoline_data.extend_from_slice(&disp32.to_le_bytes());
             // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
@@ -521,6 +544,7 @@ fn decode_section_instructions(
     let bitness = match arch {
         Arch::X86_32 => 32,
         Arch::X86_64 => 64,
+        Arch::Aarch64 => unreachable!("iced-x86 decoder not used for AArch64"),
     };
 
     let mut instructions = Vec::new();
@@ -669,11 +693,11 @@ fn hook_syscall_and_after(
         trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
         trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
         trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-        // The offset should point to the entry at offset 0
-        // After PUSH(1) + CALL(5) + POP(1) + opcode(2) = 9 bytes
-        // EAX = base + (len_before_PUSH + 6) = base + (current_len - 9 + 6) = base + (current_len - 3)
-        // We want: EAX + offset = base + 0
-        // So: offset = -(current_len - 3)
+                                                          // The offset should point to the entry at offset 0
+                                                          // After PUSH(1) + CALL(5) + POP(1) + opcode(2) = 9 bytes
+                                                          // EAX = base + (len_before_PUSH + 6) = base + (current_len - 9 + 6) = base + (current_len - 3)
+                                                          // We want: EAX + offset = base + 0
+                                                          // So: offset = -(current_len - 3)
         let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 3);
         trampoline_data.extend_from_slice(&disp32.to_le_bytes());
         // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
@@ -793,11 +817,11 @@ fn hook_syscall_before_and_after(
     trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
     trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
     trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-    // The offset should point to the entry at offset 0
-    // After PUSH(1) + CALL(5) + POP(1) + opcode(2) = 9 bytes
-    // EAX = base + (len_before_PUSH + 6) = base + (current_len - 9 + 6) = base + (current_len - 3)
-    // We want: EAX + offset = base + 0
-    // So: offset = -(current_len - 3)
+                                                      // The offset should point to the entry at offset 0
+                                                      // After PUSH(1) + CALL(5) + POP(1) + opcode(2) = 9 bytes
+                                                      // EAX = base + (len_before_PUSH + 6) = base + (current_len - 9 + 6) = base + (current_len - 3)
+                                                      // We want: EAX + offset = base + 0
+                                                      // So: offset = -(current_len - 3)
     let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 3);
     trampoline_data.extend_from_slice(&disp32.to_le_bytes());
     // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
