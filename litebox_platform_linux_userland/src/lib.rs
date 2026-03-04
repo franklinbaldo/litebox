@@ -2510,25 +2510,6 @@ unsafe fn next_signal_handler(
     }
 }
 
-/// Async-signal-safe wake of a thread blocked in an interruptible wait.
-///
-/// This is the signal-handler counterpart of `WaitStateInner::wake()`: it
-/// CAS's the condvar from WAITING to WOKEN and issues a futex wake so the
-/// blocked thread returns from `futex_wait`.
-///
-/// `waker_addr` is the raw address read from the `wait_waker_addr` TLS
-/// variable (0 means no waker is registered).
-fn try_wake_wait_waker(waker_addr: usize) {
-    if waker_addr == 0 {
-        return;
-    }
-    // SAFETY: waker_addr points to a valid Waker<LinuxUserland> whose
-    // lifetime spans the entire interruptible wait, set by
-    // RawMutexProvider::on_interruptible_wait_start.
-    let waker = unsafe { &*(waker_addr as *const litebox::event::wait::Waker<LinuxUserland>) };
-    waker.wake();
-}
-
 /// Records a pending host signal in the `.tbss` bitmask and wakes any condvar
 /// the thread is blocked on.
 ///
@@ -2553,7 +2534,14 @@ unsafe fn record_pending_signal(signal: litebox_common_linux::signal::Signal) {
             options(nostack, preserves_flags)
         );
     }
-    try_wake_wait_waker(waker_addr);
+    if waker_addr == 0 {
+        return;
+    }
+    // SAFETY: if `waker_addr` is not zero, that means the current thread is suspended
+    // to handle this signal and it points to a valid Waker whose lifetime spans the
+    // entire interruptible wait, set by [`RawMutexProvider::update_waker`].
+    let waker = unsafe { &*(waker_addr as *const litebox::event::wait::Waker<LinuxUserland>) };
+    waker.wake();
 }
 
 /// Signal handler for interrupt signals.

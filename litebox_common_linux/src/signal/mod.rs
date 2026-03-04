@@ -168,7 +168,7 @@ impl SigSet {
         }
         let bit = self.0.trailing_zeros();
         self.0 &= !(1u64 << bit);
-        // bit is 0–62, so bit + 1 is 1–63 — always valid.
+        // bit is 0–63
         Some(Signal((bit + 1).cast_signed()))
     }
 

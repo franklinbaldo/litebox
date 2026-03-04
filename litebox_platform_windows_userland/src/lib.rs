@@ -419,9 +419,6 @@ struct TlsState {
     pending_host_signals: AtomicU32,
     /// Pointer to the `Waker` currently being waited on, or null if not
     /// waiting.
-    ///
-    /// Set by [`RawMutexProvider::on_interruptible_wait_start`] and cleared by
-    /// [`RawMutexProvider::on_interruptible_wait_end`].
     waiting_waker: std::sync::atomic::AtomicPtr<litebox::event::wait::Waker<WindowsUserland>>,
 }
 
@@ -857,7 +854,6 @@ thread_local! {
 
 /// Global registry of all active managed thread handles.
 ///
-/// The Ctrl+C handler picks a thread from this list to deliver SIGINT.
 /// Threads are registered in [`ThreadHandle::run_with_handle`] and
 /// removed when the guard drops.
 ///
@@ -925,9 +921,11 @@ impl ThreadHandle {
 
                 let waker = tls.waiting_waker.load(Ordering::Acquire);
                 if !waker.is_null() {
-                    // Safety: `waker` points to a valid `Waker<WindowsUserland>`
-                    // whose lifetime spans the interruptible wait, set by
-                    // `RawMutexProvider::on_interruptible_wait_start`.
+                    // SAFETY: `waker` was heap-allocated via `Box::into_raw` in
+                    // `update_waker`. It remains valid here because
+                    // `update_waker` acquires this same `ThreadHandleInner`
+                    // mutex before freeing the old pointer, and we hold that
+                    // mutex now.
                     let waker = unsafe { &*waker };
                     waker.wake();
                 }
@@ -1143,9 +1141,18 @@ impl litebox::platform::RawMutexProvider for WindowsUserland {
             let waker_ptr = waker.map_or(std::ptr::null_mut(), |w| Box::into_raw(Box::new(w)));
             let old = tls.waiting_waker.swap(waker_ptr, Ordering::AcqRel);
             if !old.is_null() {
-                // SAFETY: old pointer was created by Box::into_raw in a previous
-                // call to update_waker.
-                unsafe { drop(Box::from_raw(old)) };
+                // Synchronize with `deliver_signal`, which may be concurrently
+                // reading the old waker pointer on another thread while holding
+                // the `ThreadHandleInner` mutex. Acquiring the same mutex here
+                // ensures that `deliver_signal` has finished using the pointer
+                // before we free it.
+                CURRENT_THREAD_HANDLE.with_borrow(|handle| {
+                    let _guard = handle.as_ref().map(|handle| handle.0.lock().unwrap());
+                    // SAFETY: old pointer was created by Box::into_raw in a previous
+                    // call to update_waker. No other thread can be accessing it now
+                    // because we synchronized via the ThreadHandleInner mutex above.
+                    unsafe { drop(Box::from_raw(old)) };
+                });
             }
         }
     }
