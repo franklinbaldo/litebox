@@ -7,6 +7,12 @@ use zerocopy::{FromBytes, IntoBytes};
 
 /// sigcontext for aarch64
 /// See: https://elixir.bootlin.com/linux/v5.19.17/source/arch/arm64/include/uapi/asm/sigcontext.h
+///
+/// Note: The kernel's `__reserved` field has `__attribute__((__aligned__(16)))`,
+/// giving the overall struct a 16-byte alignment requirement.  This alignment
+/// is enforced via explicit padding in `Ucontext` rather than via `repr(align(16))`
+/// here, because `align(16)` would add trailing padding that conflicts with
+/// zerocopy's `IntoBytes` derive.
 #[repr(C)]
 #[derive(Clone, FromBytes, IntoBytes)]
 pub struct Sigcontext {

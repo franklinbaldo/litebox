@@ -1088,6 +1088,21 @@ pub unsafe fn write_tpidr_el0(val: usize) {
     }
 }
 
+/// Global address of the ARM64 TLS lookup table.
+/// Set by the loader when mapping the trampoline. Read by the platform
+/// to register per-thread host TLS entries before entering guest code.
+#[cfg(target_arch = "aarch64")]
+pub static HOST_TLS_TABLE_ADDR: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Global address of the ARM64 sigreturn trampoline (2 instructions:
+/// `MOV X8, #139; SVC #0`) inside the rewritten binary. Set by the
+/// loader when mapping the trampoline. Used by signal delivery when
+/// the guest doesn't set `SA_RESTORER` (which glibc on aarch64 never does).
+#[cfg(target_arch = "aarch64")]
+pub static SIGRETURN_TRAMPOLINE_ADDR: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
 /// Reads the current FS segment selector
 #[cfg(target_arch = "x86")]
 pub fn rdfss() -> u16 {

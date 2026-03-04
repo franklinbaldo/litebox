@@ -116,21 +116,10 @@ impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
                 }
             }
         }
-        #[cfg(target_arch = "aarch64")]
-        {
-            // On aarch64, the platform sends us faults that need page fault handling.
-            // Try the page fault handler first; if it succeeds, resume.
-            if unsafe {
-                self.task
-                    .global
-                    .pm
-                    .handle_page_fault(info.fault_address, 0u64)
-            }
-            .is_ok()
-            {
-                return ContinueOperation::Resume;
-            }
-        }
+        // On aarch64 userland, the host kernel handles demand paging (stack
+        // growth, lazy allocation) transparently.  All guest exceptions are
+        // forwarded to `handle_exception_request` which delivers the
+        // appropriate signal to the guest.
         self.enter_shim(false, ctx, |task, _ctx| task.handle_exception_request(info))
     }
 

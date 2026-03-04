@@ -468,7 +468,8 @@ impl<FS: ShimFS> Task<FS> {
 
         self.signals.set_signal_mask(uctx.sigmask);
 
-        Ok(arch::restore_sigcontext(ctx, &uctx.mcontext))
+        let ret = arch::restore_sigcontext(ctx, &uctx.mcontext);
+        Ok(ret)
     }
 
     pub(crate) fn sys_rt_sigaction(
@@ -630,10 +631,8 @@ impl<FS: ShimFS> Task<FS> {
         let handlers = self.signals.handlers.borrow();
         let mut inner = handlers.inner.lock();
         let handler = &mut inner[signal];
-        if force_exit
-            || self.signals.blocked.get().contains(signal)
-            || handler.action.sigaction == SIG_IGN
-        {
+        let blocked = self.signals.blocked.get().contains(signal);
+        if force_exit || blocked || handler.action.sigaction == SIG_IGN {
             let mut blocked = self.signals.blocked.get();
             blocked.remove(signal);
             self.signals.set_signal_mask(blocked);
@@ -671,10 +670,20 @@ impl<FS: ShimFS> Task<FS> {
         };
         #[cfg(target_arch = "aarch64")]
         let (signal, fault_address) = {
-            // On aarch64, use ESR EC field (bits 26:31) to determine the exception class.
-            // For now, map all exceptions to SIGSEGV and use the fault address.
-            let _ec = (info.esr >> 26) & 0x3F;
-            (Signal::SIGSEGV, info.fault_address)
+            // On the userland platform, the ESR field carries the host signal
+            // number (set by exception_signal_handler → exception_handler).
+            // Map it to the corresponding guest signal.
+            // Signal numbers on Linux aarch64: SIGSEGV=11, SIGBUS=7,
+            // SIGFPE=8, SIGILL=4, SIGTRAP=5.
+            let signal = match info.esr as i32 {
+                11 => Signal::SIGSEGV,
+                7 => Signal::SIGBUS,
+                8 => Signal::SIGFPE,
+                4 => Signal::SIGILL,
+                5 => Signal::SIGTRAP,
+                _ => Signal::SIGSEGV, // fallback
+            };
+            (signal, info.fault_address)
         };
         self.signals.last_exception.set(*info);
         self.force_signal_with_info(signal, false, siginfo_exception(signal, fault_address));

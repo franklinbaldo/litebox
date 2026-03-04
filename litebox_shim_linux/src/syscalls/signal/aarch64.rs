@@ -21,10 +21,14 @@ struct SignalFrame {
 
 /// Returns the address of the Ucontext on the guest stack.
 ///
-/// On ARM64 signal delivery, x2 is set to point to the ucontext.
-/// `sys_rt_sigreturn` reads the ucontext from this address.
+/// On ARM64 signal delivery, the signal frame (starting with `Ucontext`)
+/// is placed at `sp`.  When the handler returns via the sigreturn
+/// trampoline (LR → `MOV X8, #139; SVC #0`), SP should still point to
+/// the signal frame.  The `x2` register (which held the ucontext pointer
+/// on handler entry) may have been clobbered during handler execution,
+/// so we use SP instead.
 pub(super) fn uctx_addr(ctx: &PtRegs) -> usize {
-    ctx.regs[2]
+    ctx.sp
 }
 
 pub(super) fn sp(ctx: &PtRegs) -> usize {
@@ -53,10 +57,22 @@ impl SignalState {
         action: &SigAction,
         ctx: &mut PtRegs,
     ) -> Result<(), DeliverFault> {
-        // TODO(aarch64): use sigreturn trampoline from rewriter when SA_RESTORER is not set
-        if !action.flags.contains(SaFlags::RESTORER) {
-            return Err(DeliverFault);
-        }
+        // Determine the restorer (sigreturn stub) address.
+        // On aarch64, glibc does NOT set SA_RESTORER; instead, the kernel
+        // normally provides sigreturn via the vDSO.  For litebox, we use the
+        // sigreturn trampoline (`MOV X8, #139; SVC #0`) that the rewriter
+        // embeds at trampoline offset 16.
+        let restorer = if action.flags.contains(SaFlags::RESTORER) {
+            action.restorer
+        } else {
+            let addr = litebox_common_linux::SIGRETURN_TRAMPOLINE_ADDR
+                .load(core::sync::atomic::Ordering::Acquire);
+            if addr == 0 {
+                // No sigreturn trampoline available (not using rewriter).
+                return Err(DeliverFault);
+            }
+            addr
+        };
 
         let frame = SignalFrame {
             ucontext: Ucontext {
@@ -66,6 +82,7 @@ impl SignalState {
                 sigmask: self.blocked.get(),
                 __unused: [0; 1024 / 8
                     - core::mem::size_of::<litebox_common_linux::signal::SigSet>()],
+                __align_pad: [0; 8],
                 mcontext: Sigcontext {
                     fault_address: 0,
                     regs: core::array::from_fn(|i| ctx.regs[i] as u64),
@@ -89,7 +106,7 @@ impl SignalState {
         ctx.regs[1] = frame_addr.wrapping_add(offset_of!(SignalFrame, siginfo));
         ctx.regs[2] = frame_addr.wrapping_add(offset_of!(SignalFrame, ucontext));
         // x30 (LR) = return address (restorer)
-        ctx.regs[30] = action.restorer;
+        ctx.regs[30] = restorer;
 
         // ARM64 has no direction flag equivalent to clear.
 

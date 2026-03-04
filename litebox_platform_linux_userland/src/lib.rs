@@ -899,7 +899,7 @@ unsafe extern "C-unwind" fn run_thread_arch(
     // At entry:
     //   x18 = host TLS base (from trampoline's per-thread table lookup)
     //   x30 = guest return address (after the rewritten SVC)
-    //   Guest stack: [SP+0]=saved_x16, [SP+8]=saved_x17, [SP+16]=saved_x30
+    //   Guest stack: [SP+0]=saved_x16, [SP+8]=saved_x17, [SP+16]=saved_x30, [SP+24]=guest_tpidr
     //   SP was decremented by 32 by trampoline
     //   x0-x15, x19-x29 = guest register values
     //   (x16, x17 were clobbered by trampoline; originals on guest stack)
@@ -911,6 +911,14 @@ syscall_callback:
     movz x16, #:tprel_g1:in_guest
     movk x16, #:tprel_g0_nc:in_guest
     strb wzr, [x18, x16]
+
+    // Save guest TPIDR (from trampoline stack slot) to guest_tpidr TLS var.
+    // This ensures switch_to_guest restores the correct TPIDR, even if
+    // the guest changed it via MSR TPIDR_EL0.
+    ldr x17, [sp, #24]
+    movz x16, #:tprel_g1:guest_tpidr
+    movk x16, #:tprel_g0_nc:guest_tpidr
+    str x17, [x18, x16]
 
     // Restore host TPIDR_EL0.
     msr tpidr_el0, x18
@@ -2091,13 +2099,70 @@ extern "C-unwind" fn exception_handler(
     }
     #[cfg(target_arch = "aarch64")]
     {
-        let _ = trapno;
+        let _ = error; // unused on aarch64; signal number is in trapno
         let info = litebox::shim::ExceptionInfo {
             fault_address: cr2,
-            esr: error as u64,
+            // On the userland platform, `trapno` carries the signal number
+            // (set by exception_signal_handler) and `error` is unused.
+            // Pack the signal number into the ESR field so the shim can map
+            // the exception to the correct guest signal.
+            esr: trapno as u64,
         };
         thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info));
     }
+}
+
+/// Update the TLS lookup table with the current thread's (guest_tpidr, host_tls) entry.
+///
+/// Called before entering guest code on aarch64. The trampoline's per-SVC
+/// snippets use this table to find the host TLS base on syscall entry.
+#[cfg(target_arch = "aarch64")]
+fn update_host_tls_entry() {
+    use core::sync::atomic::Ordering;
+
+    let table_addr = litebox_common_linux::HOST_TLS_TABLE_ADDR.load(Ordering::Acquire);
+    if table_addr == 0 {
+        return; // No TLS table allocated (not using rewriter-based trampoline)
+    }
+
+    // Read current host TPIDR_EL0 (= host TLS base)
+    let host_tls: usize;
+    unsafe {
+        core::arch::asm!("mrs {}, tpidr_el0", out(reg) host_tls, options(nostack, preserves_flags));
+    }
+
+    // Read guest_tpidr from our thread-local
+    let guest_tpidr = get_guest_tpidr();
+
+    let sentinel: u64 = 0xFFFFFFFFFFFFFFFF;
+    let table = table_addr as *mut u64;
+
+    // Scan table for existing entry or free slot
+    let mut free_slot: Option<*mut u64> = None;
+    for i in 0..256 {
+        let entry = unsafe { table.add(i * 2) };
+        let stored_guest_tpidr = unsafe { entry.read_volatile() };
+
+        if stored_guest_tpidr == guest_tpidr as u64 {
+            // Update existing entry
+            unsafe { entry.add(1).write_volatile(host_tls as u64) };
+            return;
+        }
+
+        if stored_guest_tpidr == sentinel && free_slot.is_none() {
+            free_slot = Some(entry);
+        }
+    }
+
+    // No existing entry found; use first free slot
+    if let Some(slot) = free_slot {
+        unsafe {
+            slot.write_volatile(guest_tpidr as u64);
+            slot.add(1).write_volatile(host_tls as u64);
+        }
+    }
+    // If table is full, we can't add — the trampoline will not find a match.
+    // This is a programming error but we don't panic to avoid crashing in hot path.
 }
 
 extern "C-unwind" fn interrupt_handler(thread_ctx: &mut ThreadContext) {
@@ -2140,7 +2205,11 @@ impl ThreadContext<'_> {
         }
         let op = f(self.shim, self.ctx);
         match op {
-            ContinueOperation::Resume => unsafe { switch_to_guest(self.ctx) },
+            ContinueOperation::Resume => {
+                #[cfg(target_arch = "aarch64")]
+                update_host_tls_entry();
+                unsafe { switch_to_guest(self.ctx) }
+            }
             ContinueOperation::Terminate => {}
         }
     }
@@ -2276,6 +2345,11 @@ fn register_exception_handlers() {
 /// signal handlers can recover the base address by masking SP.
 #[cfg(target_arch = "aarch64")]
 const ALT_STACK_ALLOC_SIZE: usize = 0x10000; // 64 KiB
+
+/// Magic value stored at `aligned_base + ALT_STACK_ALLOC_SIZE - 16` to validate
+/// that a signal handler is running on our custom alt-stack.
+#[cfg(target_arch = "aarch64")]
+const ALT_STACK_MAGIC: usize = 0x4C49_5445_424F_5821; // "LITEBOX!"
 
 /// Runs `f` with an alternate signal stack set up (x86/x86_64 version).
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
@@ -2415,6 +2489,11 @@ fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
     let host_tls_slot = (aligned_base + ALT_STACK_ALLOC_SIZE - 8) as *mut usize;
     unsafe { core::ptr::write_volatile(host_tls_slot, host_tls) };
 
+    // Store magic value at aligned_base + ALT_STACK_ALLOC_SIZE - 16
+    // so signal handlers can verify they are on our custom alt-stack.
+    let magic_slot = (aligned_base + ALT_STACK_ALLOC_SIZE - 16) as *mut usize;
+    unsafe { core::ptr::write_volatile(magic_slot, ALT_STACK_MAGIC) };
+
     // ss_size is reduced by guard_page_size and 16 (for host_tls + pad slots)
     // to prevent signal frames from clobbering the host_tls slot.
     let usable_size = ALT_STACK_ALLOC_SIZE - guard_page_size - 16;
@@ -2437,6 +2516,15 @@ fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
         );
     }
     let _restore_guard = litebox::utils::defer(|| unsafe {
+        // Clear the magic value BEFORE restoring the old sigaltstack.
+        // This closes the race window: once magic is cleared, any signal
+        // delivered (even if still on this memory region) will see the
+        // invalid magic and safely return None from signal_handler_exit_guest.
+        let magic_slot = (aligned_base + ALT_STACK_ALLOC_SIZE - 16) as *mut usize;
+        core::ptr::write_volatile(magic_slot, 0);
+        // Ensure the write is visible before we restore the old alt-stack.
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
         let r = libc::sigaltstack(&raw const oss, std::ptr::null_mut());
         assert!(
             r >= 0,
@@ -2555,24 +2643,58 @@ fn signal_handler_exit_guest(
 /// Clears `in_guest` and optionally sets `interrupt`. If `in_guest` was
 /// previously set, returns the guest context pointer.
 ///
-/// # Safety assumption
-/// This function assumes the signal is running on the power-of-2 aligned
-/// alt-stack set up by `with_signal_alt_stack`. If called from a thread
-/// without an alt-stack, the SP bitmask will produce an arbitrary address
-/// and the `read_volatile` may fault. The `host_tls == 0` check guards
-/// against reading garbage, but cannot protect against unmapped memory.
+/// # Safety
+/// Uses `sigaltstack(NULL, &ss)` to verify we're on the custom alt-stack before
+/// accessing the SP-derived aligned base. This avoids faulting on unmapped memory
+/// when the signal is delivered on a non-alt-stack.
 #[cfg(target_arch = "aarch64")]
 fn signal_handler_exit_guest(
     _context: &libc::ucontext_t,
     set_interrupt: bool,
 ) -> Option<*mut litebox_common_linux::PtRegs> {
     unsafe {
-        // Recover host TLS from the alt-stack layout.
-        // Signal handler runs on the alt-stack which is power-of-2 aligned.
-        // host_tls is stored at aligned_base + ALT_STACK_ALLOC_SIZE - 8.
+        // First, check if we're actually on the alt-stack using a raw
+        // sigaltstack syscall (NOT the libc wrapper, which may touch TLS/errno
+        // and TPIDR_EL0 may still point to guest TLS at this point).
+        let mut current_ss: libc::stack_t = core::mem::zeroed();
+        let ret: i64;
+        core::arch::asm!(
+            "mov x8, #132",  // __NR_sigaltstack
+            "mov x0, #0",    // ss = NULL (query only)
+            "mov x1, {oss}", // old_ss = &current_ss
+            "svc #0",
+            "mov {ret}, x0",
+            oss = in(reg) &raw mut current_ss,
+            ret = out(reg) ret,
+            out("x0") _,
+            out("x1") _,
+            out("x8") _,
+            // Mark all caller-saved registers that SVC might clobber
+            out("x2") _, out("x3") _, out("x4") _, out("x5") _,
+            out("x6") _, out("x7") _, out("x9") _, out("x10") _,
+            out("x11") _, out("x12") _, out("x13") _, out("x14") _,
+            out("x15") _, out("x16") _, out("x17") _,
+            options(nostack),
+        );
+        if ret != 0 || current_ss.ss_flags & libc::SS_ONSTACK == 0 {
+            // Not on our alt-stack (or syscall failed). Return None without
+            // touching any SP-derived addresses.
+            return None;
+        }
+
+        // We're on the alt-stack. Recover host TLS from the layout.
+        // The alt-stack is power-of-2 aligned, so mask SP to get the base.
         let sp_val: usize;
         core::arch::asm!("mov {}, sp", out(reg) sp_val, options(nostack, nomem));
         let aligned_base = sp_val & !(ALT_STACK_ALLOC_SIZE - 1);
+
+        // Double-check with magic value (belt and suspenders).
+        let magic_ptr = (aligned_base + ALT_STACK_ALLOC_SIZE - 16) as *const usize;
+        let magic = core::ptr::read_volatile(magic_ptr);
+        if magic != ALT_STACK_MAGIC {
+            return None;
+        }
+
         let host_tls_ptr = (aligned_base + ALT_STACK_ALLOC_SIZE - 8) as *const usize;
         let host_tls = core::ptr::read_volatile(host_tls_ptr);
 
@@ -2581,6 +2703,10 @@ fn signal_handler_exit_guest(
         }
 
         // Restore host TPIDR_EL0.
+        // NOTE: We read current TPIDR_EL0 first (before restoring host value)
+        // so we can save the guest TPIDR below if needed.
+        let current_tpidr: usize;
+        core::arch::asm!("mrs {}, tpidr_el0", out(reg) current_tpidr, options(nostack, nomem));
         litebox_common_linux::write_tpidr_el0(host_tls);
 
         // Read and clear in_guest.
@@ -2596,6 +2722,15 @@ fn signal_handler_exit_guest(
         if was_in_guest == 0 {
             return None;
         }
+
+        // Save the guest TPIDR_EL0 to the host-side `guest_tpidr` TLS variable.
+        // This ensures that when `update_host_tls_entry` is later called (e.g.
+        // from `call_shim` on Resume after an interrupt), it reads the correct
+        // current guest TPIDR and can find the matching entry in the TLS lookup
+        // table. Only do this when we were in guest code (was_in_guest != 0),
+        // because otherwise current_tpidr is already the host TLS value.
+        let guest_tpidr_ptr = (host_tls as *mut usize).byte_offset(tls_offset_guest_tpidr());
+        core::ptr::write_volatile(guest_tpidr_ptr, current_tpidr);
 
         let ctx_top_ptr =
             (host_tls as *const usize).byte_offset(tls_offset_guest_context_top());
@@ -2643,6 +2778,21 @@ fn tls_offset_guest_context_top() -> isize {
         core::arch::asm!(
             "movz {}, #:tprel_g1:guest_context_top",
             "movk {0}, #:tprel_g0_nc:guest_context_top",
+            out(reg) offset,
+            options(pure, nomem, nostack, preserves_flags)
+        );
+    }
+    offset
+}
+
+/// Helper to get the TLS offset of `guest_tpidr` for aarch64.
+#[cfg(target_arch = "aarch64")]
+fn tls_offset_guest_tpidr() -> isize {
+    let offset: isize;
+    unsafe {
+        core::arch::asm!(
+            "movz {}, #:tprel_g1:guest_tpidr",
+            "movk {0}, #:tprel_g0_nc:guest_tpidr",
             out(reg) offset,
             options(pure, nomem, nostack, preserves_flags)
         );
@@ -2850,11 +3000,14 @@ unsafe extern "C" fn exception_signal_handler(
     // On aarch64, there are no REG_TRAPNO/REG_ERR/REG_CR2 equivalents.
     // Map the signal number to a pseudo trap number and use fault_address.
     #[cfg(target_arch = "aarch64")]
-    let (trapno, err, cr2) = (
-        signum as isize,                           // use signal number as trap number
-        0isize,                                     // no error code concept on ARM64
-        sigctx.fault_address as isize,             // fault address
-    );
+    let (trapno, err, cr2) = {
+        let fault_addr = sigctx.fault_address;
+        (
+            signum as isize,                           // use signal number as trap number
+            0isize,                                     // no error code concept on ARM64
+            fault_addr as isize,                       // fault address
+        )
+    };
     set_signal_return(context, exception_callback, 0, trapno, err, cr2);
 }
 
@@ -2993,6 +3146,8 @@ unsafe fn interrupt_signal_handler(
     // Cases 3 and 4: jump to interrupt handler.
     set_signal_return(context, interrupt_callback, 0, 0, 0, 0);
 }
+
+
 
 impl litebox::platform::CrngProvider for LinuxUserland {
     fn fill_bytes_crng(&self, buf: &mut [u8]) {

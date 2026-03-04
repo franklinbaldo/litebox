@@ -19,7 +19,11 @@ void* yield_thread(void* arg) {
 
 void* spin_thread(void* arg) {
     for (;;) {
+#if defined(__x86_64__) || defined(__i386__)
         __asm__ __volatile__("pause");
+#elif defined(__aarch64__)
+        __asm__ __volatile__("yield");
+#endif
     }
 }
 

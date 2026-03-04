@@ -19,12 +19,12 @@ static void segv_handler(int sig, siginfo_t *info, void *ucontext) {
     if (info) {
         printf("  Fault address: %p\n", info->si_addr);
         if (info->si_addr == (void *)0xdeadbeef) {
-#if defined(__x86_64__)
+#if defined(__aarch64__)
+            ctx->uc_mcontext.pc = (uintptr_t)recover_ip;
+#elif defined(__x86_64__)
             ctx->uc_mcontext.gregs[REG_RIP] = (greg_t)recover_ip;
 #elif defined(__i386__)
             ctx->uc_mcontext.gregs[REG_EIP] = (greg_t)recover_ip;
-#elif defined(__aarch64__)
-            ctx->uc_mcontext.pc = (uintptr_t)recover_ip;
 #else
             /* Unsupported arch: fail fast */
             _exit(3);

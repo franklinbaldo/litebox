@@ -45,6 +45,8 @@ pub struct MappingInfo {
     pub phdrs_addr: usize,
     /// The number of program headers.
     pub num_phdrs: usize,
+    /// Address of the TLS lookup table for ARM64 trampoline (0 if not applicable).
+    pub tls_table_addr: usize,
 }
 
 impl MappingInfo {
@@ -473,6 +475,7 @@ impl ElfParsedFile {
             entry_point: base_addr.wrapping_add(self.header.e_entry.truncate()),
             phdrs_addr,
             num_phdrs: self.header.e_phnum.into(),
+            tls_table_addr: 0,
         };
 
         if self.trampoline.is_some() {
@@ -511,6 +514,50 @@ impl ElfParsedFile {
             trampoline_start,
             &trampoline.syscall_entry_point.to_ne_bytes(),
         )?;
+
+        // On aarch64, allocate a TLS lookup table and write its address at
+        // trampoline offset 8. The per-SVC trampoline snippets use this table
+        // to map guest TPIDR values to host TLS base addresses.
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Allocate a 4096-byte (one page) TLS lookup table.
+            // The table has 256 entries of 16 bytes each: [guest_tpidr: u64, host_tls: u64].
+            // Initialize all entries with sentinel value (guest_tpidr = 0xFFFFFFFFFFFFFFFF).
+            let tls_table_size = 4096; // PAGE_SIZE
+            let tls_table_addr = info.brk.max(trampoline_end); // allocate after all mapped regions
+            let tls_table_end = page_align_up(tls_table_addr + tls_table_size);
+
+            mapper
+                .map_zero(
+                    tls_table_addr,
+                    tls_table_end - tls_table_addr,
+                    &Protection {
+                        read: true,
+                        write: true,
+                        execute: false,
+                    },
+                )
+                .map_err(ElfLoadError::Map)?;
+
+            // Initialize sentinel values: set all guest_tpidr fields to 0xFFFFFFFFFFFFFFFF
+            let sentinel: u64 = 0xFFFFFFFFFFFFFFFF;
+            for i in 0..256 {
+                let entry_addr = tls_table_addr + i * 16;
+                mem.write(entry_addr, &sentinel.to_ne_bytes())?;
+                // host_tls field (entry_addr + 8) is already 0 from map_zero
+            }
+
+            // Write the TLS table address at trampoline offset 8
+            mem.write(trampoline_start + 8, &tls_table_addr.to_ne_bytes())?;
+
+            info.tls_table_addr = tls_table_addr;
+            crate::HOST_TLS_TABLE_ADDR.store(tls_table_addr, core::sync::atomic::Ordering::Release);
+            // Store the sigreturn trampoline address (at trampoline_start + 16)
+            // for use by signal delivery when SA_RESTORER is not set.
+            crate::SIGRETURN_TRAMPOLINE_ADDR
+                .store(trampoline_start + 16, core::sync::atomic::Ordering::Release);
+            info.brk = info.brk.max(tls_table_end);
+        }
 
         // Now that the write is done, protect the trampoline code as
         // read+execute only.
@@ -552,6 +599,7 @@ impl ElfParsedFile {
             entry_point: 0,
             phdrs_addr: 0,
             num_phdrs: 0,
+            tls_table_addr: 0,
         };
         self.load_trampoline(mapper, mem, &mut info)
     }
@@ -604,7 +652,7 @@ pub trait MapMemory {
     ///
     /// Fails if any of the parameters are not page-aligned.
     fn protect(&mut self, address: usize, len: usize, prot: &Protection)
-    -> Result<(), Self::Error>;
+        -> Result<(), Self::Error>;
 }
 
 /// Trait for reading and writing memory that has been mapped via [`MapMemory`].

@@ -91,11 +91,12 @@ pub fn compile(src_path: &str, unique_name: &str, exec_or_lib: bool, nolibc: boo
     if nolibc {
         args.push("-nostdlib");
     }
-    args.push(match std::env::consts::ARCH {
-        "x86_64" => "-m64",
-        "x86" => "-m32",
+    match std::env::consts::ARCH {
+        "x86_64" => args.push("-m64"),
+        "x86" => args.push("-m32"),
+        "aarch64" => {} // native aarch64 gcc needs no -m flag
         _ => unimplemented!(),
-    });
+    }
 
     // Create command string for caching
     let mut command_parts = vec!["gcc"];

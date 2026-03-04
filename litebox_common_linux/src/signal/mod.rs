@@ -302,6 +302,11 @@ pub struct Ucontext {
 /// On aarch64, the `uc_sigmask` field comes before `uc_mcontext`, and there
 /// is padding to accommodate glibc's 1024-bit sigset_t.
 ///
+/// The kernel's `struct sigcontext` has 16-byte alignment (due to the
+/// `__aligned__(16)` attribute on `__reserved`).  After `uc_sigmask` +
+/// `__unused` (128 bytes total, ending at offset 168), 8 bytes of padding
+/// are needed to align `uc_mcontext` to offset 176 (a multiple of 16).
+///
 /// See: <https://elixir.bootlin.com/linux/v5.19.17/source/arch/arm64/include/uapi/asm/ucontext.h>
 #[cfg(target_arch = "aarch64")]
 #[repr(C)]
@@ -313,6 +318,9 @@ pub struct Ucontext {
     pub sigmask: SigSet,
     /// Padding: glibc uses a 1024-bit sigset_t (128 bytes), kernel uses 64-bit (8 bytes).
     pub __unused: [u8; 1024 / 8 - core::mem::size_of::<SigSet>()],
+    /// Alignment padding: mcontext (Sigcontext) requires 16-byte alignment.
+    /// After __unused, we're at offset 168; this pads to offset 176.
+    pub __align_pad: [u8; 8],
     pub mcontext: Sigcontext,
 }
 
