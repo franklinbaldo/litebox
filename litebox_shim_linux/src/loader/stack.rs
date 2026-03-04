@@ -10,8 +10,8 @@ use litebox::{
 };
 
 use crate::{
-    MutPtr,
     loader::auxv::{AuxKey, AuxVec},
+    MutPtr,
 };
 
 /// The stack layout for the user process. This is used to set up the stack

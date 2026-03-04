@@ -103,6 +103,8 @@ const MACHINE: u16 = if cfg!(target_arch = "x86_64") {
     elf::abi::EM_X86_64
 } else if cfg!(target_arch = "x86") {
     elf::abi::EM_386
+} else if cfg!(target_arch = "aarch64") {
+    elf::abi::EM_AARCH64
 } else {
     panic!("unsupported arch")
 };
@@ -602,7 +604,7 @@ pub trait MapMemory {
     ///
     /// Fails if any of the parameters are not page-aligned.
     fn protect(&mut self, address: usize, len: usize, prot: &Protection)
-        -> Result<(), Self::Error>;
+    -> Result<(), Self::Error>;
 }
 
 /// Trait for reading and writing memory that has been mapped via [`MapMemory`].

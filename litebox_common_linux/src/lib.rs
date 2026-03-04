@@ -6,6 +6,7 @@
 #![no_std]
 #![allow(non_camel_case_types)]
 
+use core::ffi::c_char;
 use core::time::Duration;
 use int_enum::IntEnum;
 use litebox::{
@@ -1924,7 +1925,7 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         fd: i32,
     },
     Stat {
-        pathname: Platform::RawConstPointer<i8>,
+        pathname: Platform::RawConstPointer<c_char>,
         buf: Platform::RawMutPointer<FileStat>,
     },
     Fstat {
@@ -1932,15 +1933,15 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         buf: Platform::RawMutPointer<FileStat>,
     },
     Lstat {
-        pathname: Platform::RawConstPointer<i8>,
+        pathname: Platform::RawConstPointer<c_char>,
         buf: Platform::RawMutPointer<FileStat>,
     },
     Mkdir {
-        pathname: Platform::RawConstPointer<i8>,
+        pathname: Platform::RawConstPointer<c_char>,
         mode: u32,
     },
     Chdir {
-        pathname: Platform::RawConstPointer<i8>,
+        pathname: Platform::RawConstPointer<c_char>,
     },
     Mmap {
         addr: usize,
@@ -2028,7 +2029,7 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         iovcnt: usize,
     },
     Access {
-        pathname: Platform::RawConstPointer<i8>,
+        pathname: Platform::RawConstPointer<c_char>,
         mode: AccessFlags,
     },
     Madvise {
@@ -2170,19 +2171,19 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         arg: ArchPrctlArg<Platform>,
     },
     Readlink {
-        pathname: Platform::RawConstPointer<i8>,
+        pathname: Platform::RawConstPointer<c_char>,
         buf: Platform::RawMutPointer<u8>,
         bufsiz: usize,
     },
     Readlinkat {
         dirfd: i32,
-        pathname: Platform::RawConstPointer<i8>,
+        pathname: Platform::RawConstPointer<c_char>,
         buf: Platform::RawMutPointer<u8>,
         bufsiz: usize,
     },
     Openat {
         dirfd: i32,
-        pathname: Platform::RawConstPointer<i8>,
+        pathname: Platform::RawConstPointer<c_char>,
         flags: litebox::fs::OFlags,
         mode: litebox::fs::Mode,
     },
@@ -2192,20 +2193,20 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     },
     Unlinkat {
         dirfd: i32,
-        pathname: Platform::RawConstPointer<i8>,
+        pathname: Platform::RawConstPointer<c_char>,
         flags: AtFlags,
     },
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     Newfstatat {
         dirfd: i32,
-        pathname: Platform::RawConstPointer<i8>,
+        pathname: Platform::RawConstPointer<c_char>,
         buf: Platform::RawMutPointer<FileStat>,
         flags: AtFlags,
     },
     #[cfg(target_arch = "x86")]
     Fstatat64 {
         dirfd: i32,
-        pathname: Platform::RawConstPointer<i8>,
+        pathname: Platform::RawConstPointer<c_char>,
         buf: Platform::RawMutPointer<FileStat64>,
         flags: AtFlags,
     },
@@ -2313,9 +2314,9 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         args: FutexArgs<Platform>,
     },
     Execve {
-        pathname: Platform::RawConstPointer<i8>,
-        argv: Platform::RawConstPointer<Platform::RawConstPointer<i8>>,
-        envp: Platform::RawConstPointer<Platform::RawConstPointer<i8>>,
+        pathname: Platform::RawConstPointer<c_char>,
+        argv: Platform::RawConstPointer<Platform::RawConstPointer<c_char>>,
+        envp: Platform::RawConstPointer<Platform::RawConstPointer<c_char>>,
     },
     Umask {
         mask: u32,

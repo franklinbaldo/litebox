@@ -1289,19 +1289,19 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `execve`.
     pub(crate) fn sys_execve(
         &self,
-        pathname: crate::ConstPtr<i8>,
-        argv: crate::ConstPtr<crate::ConstPtr<i8>>,
-        envp: crate::ConstPtr<crate::ConstPtr<i8>>,
+        pathname: crate::ConstPtr<core::ffi::c_char>,
+        argv: crate::ConstPtr<crate::ConstPtr<core::ffi::c_char>>,
+        envp: crate::ConstPtr<crate::ConstPtr<core::ffi::c_char>>,
         ctx: &mut litebox_common_linux::PtRegs,
     ) -> Result<usize, Errno> {
         fn copy_vector(
-            mut base: crate::ConstPtr<crate::ConstPtr<i8>>,
+            mut base: crate::ConstPtr<crate::ConstPtr<core::ffi::c_char>>,
             _which: &str,
         ) -> Result<alloc::vec::Vec<alloc::ffi::CString>, Errno> {
             let mut out = alloc::vec::Vec::new();
             let mut total = 0usize;
             for _ in 0..MAX_VEC {
-                let p: crate::ConstPtr<i8> = {
+                let p: crate::ConstPtr<core::ffi::c_char> = {
                     // read pointer-sized entries
                     match base.read_at_offset(0) {
                         Some(ptr) => ptr,

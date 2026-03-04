@@ -3,7 +3,7 @@
 
 //! This module contains the loader for the LiteBox shim.
 
-#![cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#![cfg(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64"))]
 pub mod auxv;
 pub mod elf;
 mod stack;

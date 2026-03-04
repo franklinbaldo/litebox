@@ -24,9 +24,10 @@ use crate::{ConstPtr, MutPtr, ShimFS, Task};
 use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use litebox::shim::Exception;
 use litebox::{
     platform::{RawConstPointer as _, RawMutPointer as _},
-    shim::Exception,
     sync::Mutex,
     utils::ReinterpretUnsignedExt as _,
 };
@@ -63,11 +64,17 @@ impl SignalState {
                 #[cfg(target_pointer_width = "64")]
                 __pad: 0,
             }),
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             last_exception: Cell::new(litebox::shim::ExceptionInfo {
                 exception: litebox::shim::Exception(0),
                 error_code: 0,
                 cr2: 0,
                 kernel_mode: false,
+            }),
+            #[cfg(target_arch = "aarch64")]
+            last_exception: Cell::new(litebox::shim::ExceptionInfo {
+                fault_address: 0,
+                esr: 0,
             }),
         }
     }
@@ -644,19 +651,30 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     pub(crate) fn handle_exception_request(&self, info: &litebox::shim::ExceptionInfo) {
-        let signal = match info.exception {
-            Exception::DIVIDE_ERROR => Signal::SIGFPE,
-            Exception::BREAKPOINT => Signal::SIGTRAP,
-            Exception::INVALID_OPCODE => Signal::SIGILL,
-            // Page faults and unknown exceptions map to SIGSEGV. There may be
-            // more appropriate signals in some other cases (e.g., SIGBUS).
-            _ => Signal::SIGSEGV,
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        let (signal, fault_address) = {
+            let signal = match info.exception {
+                Exception::DIVIDE_ERROR => Signal::SIGFPE,
+                Exception::BREAKPOINT => Signal::SIGTRAP,
+                Exception::INVALID_OPCODE => Signal::SIGILL,
+                // Page faults and unknown exceptions map to SIGSEGV. There may be
+                // more appropriate signals in some other cases (e.g., SIGBUS).
+                _ => Signal::SIGSEGV,
+            };
+            // For page faults, provide the faulting address.
+            let fault_address = if info.exception == Exception::PAGE_FAULT {
+                info.cr2
+            } else {
+                0
+            };
+            (signal, fault_address)
         };
-        // For page faults, provide the faulting address.
-        let fault_address = if info.exception == Exception::PAGE_FAULT {
-            info.cr2
-        } else {
-            0
+        #[cfg(target_arch = "aarch64")]
+        let (signal, fault_address) = {
+            // On aarch64, use ESR EC field (bits 26:31) to determine the exception class.
+            // For now, map all exceptions to SIGSEGV and use the fault address.
+            let _ec = (info.esr >> 26) & 0x3F;
+            (Signal::SIGSEGV, info.fault_address)
         };
         self.signals.last_exception.set(*info);
         self.force_signal_with_info(signal, false, siginfo_exception(signal, fault_address));

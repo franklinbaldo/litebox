@@ -95,15 +95,13 @@ fn register_seccomp_filter() {
             libc::SYS_mmap,
             vec![
                 // A backdoor to allow invoking mmap.
-                SeccompRule::new(vec![
-                    SeccompCondition::new(
-                        3,
-                        SeccompCmpArgLen::Dword,
-                        SeccompCmpOp::MaskedEq(u64::from(super::MMAP_FLAG_MAGIC)),
-                        u64::from(super::MMAP_FLAG_MAGIC),
-                    )
-                    .unwrap(),
-                ])
+                SeccompRule::new(vec![SeccompCondition::new(
+                    3,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::MaskedEq(u64::from(super::MMAP_FLAG_MAGIC)),
+                    u64::from(super::MMAP_FLAG_MAGIC),
+                )
+                .unwrap()])
                 .unwrap(),
             ],
         ),
@@ -113,18 +111,16 @@ fn register_seccomp_filter() {
             libc::SYS_rt_sigaction,
             vec![
                 // Allow rt_sigaction for non-SIGSYS signals
-                SeccompRule::new(vec![
-                    SeccompCondition::new(
-                        0,
-                        SeccompCmpArgLen::Dword,
-                        SeccompCmpOp::Ne,
-                        litebox_common_linux::signal::Signal::SIGSYS
-                            .as_i32()
-                            .try_into()
-                            .unwrap(),
-                    )
-                    .unwrap(),
-                ])
+                SeccompRule::new(vec![SeccompCondition::new(
+                    0,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::Ne,
+                    litebox_common_linux::signal::Signal::SIGSYS
+                        .as_i32()
+                        .try_into()
+                        .unwrap(),
+                )
+                .unwrap()])
                 .unwrap(),
                 SeccompRule::new(vec![
                     // The second argument `act` is null, so it does not change the signal handler.

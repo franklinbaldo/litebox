@@ -483,9 +483,12 @@ fn set_guest_tpidr(value: usize) {
     unsafe {
         core::arch::asm! {
             "mrs {tmp}, tpidr_el0",
-            "str {val}, [{tmp}, #:tprel:guest_tpidr]",
+            "movz {tmp2}, #:tprel_g1:guest_tpidr",
+            "movk {tmp2}, #:tprel_g0_nc:guest_tpidr",
+            "str {val}, [{tmp}, {tmp2}]",
             val = in(reg) value,
             tmp = out(reg) _,
+            tmp2 = out(reg) _,
             options(nostack, preserves_flags)
         }
     }
@@ -497,9 +500,12 @@ fn get_guest_tpidr() -> usize {
     unsafe {
         core::arch::asm! {
             "mrs {tmp}, tpidr_el0",
-            "ldr {val}, [{tmp}, #:tprel:guest_tpidr]",
+            "movz {tmp2}, #:tprel_g1:guest_tpidr",
+            "movk {tmp2}, #:tprel_g0_nc:guest_tpidr",
+            "ldr {val}, [{tmp}, {tmp2}]",
             val = out(reg) value,
             tmp = out(reg) _,
+            tmp2 = out(reg) _,
             options(nostack, preserves_flags)
         }
     }
@@ -871,9 +877,13 @@ unsafe extern "C-unwind" fn run_thread_arch(
     // Save host sp and guest context top in TLS.
     mrs x8, tpidr_el0
     mov x9, sp
-    str x9, [x8, #:tprel:host_sp]
+    movz x10, #:tprel_g1:host_sp
+    movk x10, #:tprel_g0_nc:host_sp
+    str x9, [x8, x10]
     add x9, x1, #{GUEST_CONTEXT_SIZE}
-    str x9, [x8, #:tprel:guest_context_top]
+    movz x10, #:tprel_g1:guest_context_top
+    movk x10, #:tprel_g0_nc:guest_context_top
+    str x9, [x8, x10]
 
     // Call init_handler or reenter_handler based on reenter flag (in w2).
     cbnz w2, 1f
@@ -898,7 +908,9 @@ unsafe extern "C-unwind" fn run_thread_arch(
 syscall_callback:
     // Clear in_guest flag. Must be first instruction to match the
     // expectations of interrupt_signal_handler.
-    strb wzr, [x18, #:tprel:in_guest]
+    movz x16, #:tprel_g1:in_guest
+    movk x16, #:tprel_g0_nc:in_guest
+    strb wzr, [x18, x16]
 
     // Restore host TPIDR_EL0.
     msr tpidr_el0, x18
@@ -906,7 +918,9 @@ syscall_callback:
     // Load guest_context_top and compute PtRegs base address.
     // We'll build PtRegs ending at guest_context_top, starting at
     // guest_context_top - GUEST_CONTEXT_SIZE.
-    ldr x16, [x18, #:tprel:guest_context_top]
+    movz x16, #:tprel_g1:guest_context_top
+    movk x16, #:tprel_g0_nc:guest_context_top
+    ldr x16, [x18, x16]
     sub x16, x16, #{GUEST_CONTEXT_SIZE}
     // x16 = base of PtRegs. We can now use x16 freely since the
     // trampoline already saved the guest's x16.
@@ -957,7 +971,9 @@ syscall_callback:
 
     // Switch to host stack.
     mrs x18, tpidr_el0
-    ldr x0, [x18, #:tprel:host_sp]
+    movz x0, #:tprel_g1:host_sp
+    movk x0, #:tprel_g0_nc:host_sp
+    ldr x0, [x18, x0]
     mov sp, x0
 
     // Call syscall_handler. x0 = thread_ctx (on host stack).
@@ -969,7 +985,9 @@ syscall_callback:
 exception_callback:
     // Restore host stack.
     mrs x18, tpidr_el0
-    ldr x9, [x18, #:tprel:host_sp]
+    movz x9, #:tprel_g1:host_sp
+    movk x9, #:tprel_g0_nc:host_sp
+    ldr x9, [x18, x9]
     mov sp, x9
 
     ldr x0, [sp]                  // thread_ctx
@@ -979,7 +997,9 @@ exception_callback:
 interrupt_callback:
     // Restore host stack.
     mrs x18, tpidr_el0
-    ldr x9, [x18, #:tprel:host_sp]
+    movz x9, #:tprel_g1:host_sp
+    movk x9, #:tprel_g0_nc:host_sp
+    ldr x9, [x18, x9]
     mov sp, x9
 
     ldr x0, [sp]                  // thread_ctx
@@ -1148,13 +1168,22 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         // `switch_to_guest_end` and will set `interrupt` and jump to
         // `interrupt_callback`.
         "mrs x18, tpidr_el0",
-        "mov w17, #1",
-        "strb w17, [x18, #:tprel:in_guest]",
-        "ldrb w17, [x18, #:tprel:interrupt]",
+        // Compute TLS offset for in_guest and set it to 1.
+        "movz x17, #:tprel_g1:in_guest",
+        "movk x17, #:tprel_g0_nc:in_guest",
+        "add x17, x18, x17",
+        "mov w16, #1",
+        "strb w16, [x17]",
+        // Compute TLS offset for interrupt and check it.
+        "movz x17, #:tprel_g1:interrupt",
+        "movk x17, #:tprel_g0_nc:interrupt",
+        "ldrb w17, [x18, x17]",
         "cbnz w17, interrupt_callback",
 
-        // Save guest_tpidr to TPIDR_EL0 before jumping to guest.
-        "ldr x17, [x18, #:tprel:guest_tpidr]",
+        // Load guest_tpidr from TLS.
+        "movz x17, #:tprel_g1:guest_tpidr",
+        "movk x17, #:tprel_g0_nc:guest_tpidr",
+        "ldr x17, [x18, x17]",
 
         // Load guest PC into x18 (we'll branch to it after restoring all regs).
         // x0 = ctx pointer to PtRegs.

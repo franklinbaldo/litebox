@@ -64,6 +64,8 @@ const SYS_INFO: litebox_common_linux::Utsname = litebox_common_linux::Utsname {
     machine: to_fixed_size_array::<65>("x86_64"),
     #[cfg(target_arch = "x86")]
     machine: to_fixed_size_array::<65>("x86"),
+    #[cfg(target_arch = "aarch64")]
+    machine: to_fixed_size_array::<65>("aarch64"),
     domainname: to_fixed_size_array::<65>(""),
 };
 
@@ -90,6 +92,8 @@ impl<FS: ShimFS> Task<FS> {
             totalram: 4 * 1024 * 1024 * 1024,
             #[cfg(target_arch = "x86")]
             totalram: 3 * 1024 * 1024 * 1024,
+            #[cfg(target_arch = "aarch64")]
+            totalram: 4 * 1024 * 1024 * 1024,
             freeram: 2 * 1024 * 1024 * 1024,
             sharedram: 0, // We don't support shared memory
             bufferram: 0,

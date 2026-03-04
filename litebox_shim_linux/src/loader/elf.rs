@@ -10,12 +10,12 @@ use litebox::{
     platform::{RawConstPointer as _, SystemInfoProvider as _},
     utils::{ReinterpretSignedExt, TruncateExt},
 };
-use litebox_common_linux::{MapFlags, errno::Errno, loader::ElfParsedFile};
+use litebox_common_linux::{errno::Errno, loader::ElfParsedFile, MapFlags};
 use thiserror::Error;
 
 use crate::{
-    MutPtr,
     loader::auxv::{AuxKey, AuxVec},
+    MutPtr,
 };
 
 use super::stack::UserStack;

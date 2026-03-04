@@ -99,18 +99,36 @@ impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
         ctx: &mut Self::ExecutionContext,
         info: &litebox::shim::ExceptionInfo,
     ) -> ContinueOperation {
-        if info.kernel_mode && info.exception == litebox::shim::Exception::PAGE_FAULT {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if info.kernel_mode && info.exception == litebox::shim::Exception::PAGE_FAULT {
+                if unsafe {
+                    self.task
+                        .global
+                        .pm
+                        .handle_page_fault(info.cr2, info.error_code.into())
+                }
+                .is_ok()
+                {
+                    return ContinueOperation::Resume;
+                } else {
+                    return ContinueOperation::Terminate;
+                }
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // On aarch64, the platform sends us faults that need page fault handling.
+            // Try the page fault handler first; if it succeeds, resume.
             if unsafe {
                 self.task
                     .global
                     .pm
-                    .handle_page_fault(info.cr2, info.error_code.into())
+                    .handle_page_fault(info.fault_address, 0u64)
             }
             .is_ok()
             {
                 return ContinueOperation::Resume;
-            } else {
-                return ContinueOperation::Terminate;
             }
         }
         self.enter_shim(false, ctx, |task, _ctx| task.handle_exception_request(info))
@@ -637,6 +655,10 @@ impl<FS: ShimFS> Task<FS> {
         {
             ctx.rax = return_value;
         }
+        #[cfg(target_arch = "aarch64")]
+        {
+            ctx.regs[0] = return_value;
+        }
     }
 
     fn do_syscall(&self, ctx: &mut litebox_common_linux::PtRegs) -> Result<usize, Errno> {
@@ -651,6 +673,8 @@ impl<FS: ShimFS> Task<FS> {
         let syscall_number = ctx.orig_eax;
         #[cfg(target_arch = "x86_64")]
         let syscall_number = ctx.orig_rax;
+        #[cfg(target_arch = "aarch64")]
+        let syscall_number = ctx.regs[8];
         let request =
             SyscallRequest::<Platform>::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
 
