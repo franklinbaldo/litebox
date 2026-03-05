@@ -439,7 +439,7 @@ where
         // safe (it probably is fine, but the following sequence of steps ensures we are
         // staying in a very safe subset).
         let bytes: *mut [c_char] = Box::into_raw(bytes);
-        let bytes: *mut [u8] = bytes as *mut [u8];
+        let bytes: *mut [u8] = bytes;
         let bytes: Box<[u8]> = unsafe { Box::from_raw(bytes) };
         let bytes: Vec<u8> = Vec::from(bytes);
         alloc::ffi::CString::from_vec_with_nul(bytes).ok()

@@ -15,6 +15,7 @@ use zerocopy::{FromBytes, IntoBytes};
 /// zerocopy's `IntoBytes` derive.
 #[repr(C)]
 #[derive(Clone, FromBytes, IntoBytes)]
+#[allow(clippy::pub_underscore_fields)]
 pub struct Sigcontext {
     pub fault_address: u64,
     pub regs: [u64; 31],

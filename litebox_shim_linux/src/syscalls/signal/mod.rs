@@ -675,13 +675,14 @@ impl<FS: ShimFS> Task<FS> {
             // Map it to the corresponding guest signal.
             // Signal numbers on Linux aarch64: SIGSEGV=11, SIGBUS=7,
             // SIGFPE=8, SIGILL=4, SIGTRAP=5.
+            #[allow(clippy::cast_possible_truncation)]
             let signal = match info.esr as i32 {
-                11 => Signal::SIGSEGV,
                 7 => Signal::SIGBUS,
-                8 => Signal::SIGFPE,
                 4 => Signal::SIGILL,
                 5 => Signal::SIGTRAP,
-                _ => Signal::SIGSEGV, // fallback
+                8 => Signal::SIGFPE,
+                // 11 (SIGSEGV) and any unknown signal fall through here.
+                _ => Signal::SIGSEGV,
             };
             (signal, info.fault_address)
         };

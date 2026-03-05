@@ -136,10 +136,10 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
         }
 
         // Control transfer targets only needed for x86 (ARM64 doesn't borrow neighbors)
-        let control_transfer_targets = if arch != Arch::Aarch64 {
-            get_control_transfer_targets(arch, &*buf, &text_sections)?
-        } else {
+        let control_transfer_targets = if arch == Arch::Aarch64 {
             HashSet::new()
+        } else {
+            get_control_transfer_targets(arch, &*buf, &text_sections)?
         };
 
         let trampoline_base_addr = find_addr_for_trampoline_code(&file);
@@ -195,6 +195,16 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
 
         (trampoline_data, syscall_insns_found)
     };
+
+    // For AArch64, extend the last PT_LOAD segment's p_memsz to cover the trampoline
+    // virtual address range. When the dynamic linker (ld.so) loads a shared library, it
+    // reserves address space based on the span of all PT_LOAD segments. By extending
+    // p_memsz (but not p_filesz), we make ld.so include the trampoline region in its
+    // initial reservation. This prevents rtld_audit's MAP_FIXED mmap of the trampoline
+    // from clobbering adjacent libraries' mappings.
+    if arch == Arch::Aarch64 {
+        extend_last_ptload_memsz(buf, trampoline_base_addr, trampoline_data.len() as u64);
+    }
 
     // Build output: [patched ELF][padding to page boundary][trampoline code][header]
     let mut out = buf.to_vec();
@@ -491,6 +501,46 @@ where
         .map(|ph| ph.p_vaddr(endian).into() + ph.p_memsz(endian).into())
         .max()
         .unwrap()
+}
+
+/// Extend the last PT_LOAD segment's `p_memsz` in the raw ELF bytes so that it covers
+/// the trampoline region at `[trampoline_vaddr, trampoline_vaddr + trampoline_size)`.
+///
+/// This only extends `p_memsz`, not `p_filesz`, creating a BSS-like region. The dynamic
+/// linker will include this extended range in its initial address space reservation,
+/// ensuring `MAP_FIXED` of the trampoline doesn't collide with adjacent shared libraries.
+#[allow(clippy::cast_possible_truncation)]
+fn extend_last_ptload_memsz(buf: &mut [u8], trampoline_vaddr: u64, trampoline_size: u64) {
+    // Parse ELF64 header fields we need
+    let e_phoff = u64::from_le_bytes(buf[32..40].try_into().unwrap()) as usize;
+    let e_phentsize = u16::from_le_bytes(buf[54..56].try_into().unwrap()) as usize;
+    let e_phnum = u16::from_le_bytes(buf[56..58].try_into().unwrap()) as usize;
+
+    // Find the last PT_LOAD segment
+    let mut last_load_idx = None;
+    for i in 0..e_phnum {
+        let ph_offset = e_phoff + i * e_phentsize;
+        let p_type = u32::from_le_bytes(buf[ph_offset..ph_offset + 4].try_into().unwrap());
+        if p_type == object::elf::PT_LOAD {
+            last_load_idx = Some(i);
+        }
+    }
+
+    let Some(idx) = last_load_idx else { return };
+    let ph_offset = e_phoff + idx * e_phentsize;
+
+    // Elf64_Phdr layout: p_type(4) p_flags(4) p_offset(8) p_vaddr(8) p_paddr(8) p_filesz(8) p_memsz(8) p_align(8)
+    // p_vaddr is at +16, p_memsz is at +40
+    let p_vaddr = u64::from_le_bytes(buf[ph_offset + 16..ph_offset + 24].try_into().unwrap());
+    let p_memsz = u64::from_le_bytes(buf[ph_offset + 40..ph_offset + 48].try_into().unwrap());
+
+    let trampoline_end_aligned = (trampoline_vaddr + trampoline_size).next_multiple_of(0x1000);
+    let seg_end = p_vaddr + p_memsz;
+
+    if trampoline_end_aligned > seg_end {
+        let new_memsz = trampoline_end_aligned - p_vaddr;
+        buf[ph_offset + 40..ph_offset + 48].copy_from_slice(&new_memsz.to_le_bytes());
+    }
 }
 
 fn get_symbols(file: &object::File<'_>) -> Option<u64> {

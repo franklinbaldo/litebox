@@ -8,16 +8,16 @@
 use alloc::string::String;
 
 use crate::{
-    LiteBox,
     fs::{
-        FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
         errors::{
             ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
             ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
         },
+        FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
     },
     path::Arg,
     platform::{StdioOutStream, StdioReadError, StdioWriteError},
+    LiteBox,
 };
 
 /// Block size for stdio devices
@@ -145,10 +145,10 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
 }
 
 impl<
-    Platform: crate::sync::RawSyncPrimitivesProvider
-        + crate::platform::StdioProvider
-        + crate::platform::CrngProvider,
-> super::FileSystem for FileSystem<Platform>
+        Platform: crate::sync::RawSyncPrimitivesProvider
+            + crate::platform::StdioProvider
+            + crate::platform::CrngProvider,
+    > super::FileSystem for FileSystem<Platform>
 {
     fn open(
         &self,

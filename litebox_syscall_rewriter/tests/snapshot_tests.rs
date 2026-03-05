@@ -41,11 +41,13 @@ fn run_snapshot_test(input: &[u8], snapshot: &str) {
 }
 
 #[test]
+#[cfg_attr(not(target_arch = "x86_64"), ignore = "x86_64-only snapshot test")]
 fn snapshot_test_hello_world_x86_64() {
     run_snapshot_test(HELLO_INPUT_64, "hello-diff");
 }
 
 #[test]
+#[cfg_attr(not(target_arch = "x86_64"), ignore = "x86-only snapshot test")]
 fn snapshot_test_hello_world_x86() {
     run_snapshot_test(HELLO_INPUT_32, "hello-32-diff");
 }

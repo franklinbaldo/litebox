@@ -126,7 +126,7 @@ impl LinuxUserland {
                 let tun_fd = unsafe {
                     syscalls::syscall4(
                         syscalls::Sysno::openat,
-                        (-100isize) as usize, // AT_FDCWD
+                        (-100isize).cast_unsigned(), // AT_FDCWD
                         tun_path.as_ptr() as usize,
                         (litebox::fs::OFlags::RDWR
                             | litebox::fs::OFlags::CLOEXEC
@@ -256,7 +256,7 @@ impl LinuxUserland {
         let fd = unsafe {
             syscalls::syscall4(
                 syscalls::Sysno::openat,
-                (-100isize) as usize, // AT_FDCWD
+                (-100isize).cast_unsigned(), // AT_FDCWD
                 path.as_ptr() as usize,
                 OFlags::RDONLY.bits() as usize,
                 0,
@@ -1922,7 +1922,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         let fd = unsafe {
             syscalls::syscall5(
                 syscalls::Sysno::openat,
-                (-100isize) as usize, // AT_FDCWD
+                (-100isize).cast_unsigned(), // AT_FDCWD
                 file_path_cstr.as_ptr() as usize,
                 OFlags::RDONLY.bits() as usize,
                 0,
@@ -2903,6 +2903,7 @@ fn copy_signal_context(regs: &mut litebox_common_linux::PtRegs, context: &libc::
 /// Copies register state from a Linux signal context to a LiteBox PtRegs
 /// structure (aarch64 version).
 #[cfg(target_arch = "aarch64")]
+#[allow(clippy::cast_possible_truncation)]
 fn copy_signal_context(regs: &mut litebox_common_linux::PtRegs, context: &libc::ucontext_t) {
     let mctx = &context.uc_mcontext;
     for i in 0..31 {
@@ -2953,6 +2954,7 @@ fn set_signal_return(
 
 /// Updates a Linux signal context to return to `f` with the given arguments (aarch64).
 #[cfg(target_arch = "aarch64")]
+#[allow(clippy::cast_sign_loss)]
 fn set_signal_return(
     context: &mut libc::ucontext_t,
     f: unsafe extern "C" fn(),
@@ -3000,6 +3002,7 @@ unsafe extern "C" fn exception_signal_handler(
     // On aarch64, there are no REG_TRAPNO/REG_ERR/REG_CR2 equivalents.
     // Map the signal number to a pseudo trap number and use fault_address.
     #[cfg(target_arch = "aarch64")]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let (trapno, err, cr2) = {
         let fault_addr = sigctx.fault_address;
         (
@@ -3030,6 +3033,7 @@ unsafe fn next_signal_handler(
                 context.uc_mcontext.gregs[libc::REG_EIP as usize].reinterpret_as_unsigned() as usize
             }
             #[cfg(target_arch = "aarch64")]
+            #[allow(clippy::cast_possible_truncation)]
             {
                 context.uc_mcontext.pc as usize
             }
@@ -3113,6 +3117,7 @@ unsafe fn interrupt_signal_handler(
     #[cfg(target_arch = "x86")]
     let ip = context.uc_mcontext.gregs[libc::REG_EIP as usize].reinterpret_as_unsigned() as usize;
     #[cfg(target_arch = "aarch64")]
+    #[allow(clippy::cast_possible_truncation)]
     let ip = context.uc_mcontext.pc as usize;
 
     // Case 1: at the beginning of the syscall handler.

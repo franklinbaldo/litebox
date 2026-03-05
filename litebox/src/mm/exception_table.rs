@@ -16,6 +16,7 @@
 //!
 //! New fallible functions should follow the pattern established by [`memcpy_fallible`].
 
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 use crate::utils::TruncateExt as _;
 
 #[cfg(any(target_os = "linux", target_os = "none"))]
@@ -124,6 +125,7 @@ pub unsafe fn memcpy_fallible(dst: *mut u8, src: *const u8, size: usize) -> Resu
     Ok(())
 }
 
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 macro_rules! read_fn {
     ($name:ident, $ty:ty, $mov_instr:expr) => {
         /// Reads a value from the given `src` pointer in a fallible manner.
@@ -176,6 +178,7 @@ read_fn!(read_u64_fallible, u64, "mov {dest:r}, qword ptr [{src}]");
 /// `src` must be valid for reads or a pointer that's guaranteed to be
 /// in non-Rust memory.
 #[cfg(target_arch = "aarch64")]
+#[allow(clippy::cast_possible_truncation)]
 pub unsafe fn read_u8_fallible(src: *const u8) -> Result<u8, Fault> {
     let value: usize;
     let failed: u32;
@@ -204,6 +207,7 @@ pub unsafe fn read_u8_fallible(src: *const u8) -> Result<u8, Fault> {
 /// `src` must be valid for reads or a pointer that's guaranteed to be
 /// in non-Rust memory.
 #[cfg(target_arch = "aarch64")]
+#[allow(clippy::cast_possible_truncation)]
 pub unsafe fn read_u16_fallible(src: *const u16) -> Result<u16, Fault> {
     let value: usize;
     let failed: u32;
@@ -232,6 +236,7 @@ pub unsafe fn read_u16_fallible(src: *const u16) -> Result<u16, Fault> {
 /// `src` must be valid for reads or a pointer that's guaranteed to be
 /// in non-Rust memory.
 #[cfg(target_arch = "aarch64")]
+#[allow(clippy::cast_possible_truncation)]
 pub unsafe fn read_u32_fallible(src: *const u32) -> Result<u32, Fault> {
     let value: usize;
     let failed: u32;
@@ -282,6 +287,7 @@ pub unsafe fn read_u64_fallible(src: *const u64) -> Result<u64, Fault> {
     }
 }
 
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 macro_rules! write_fn {
     ($name:ident, $ty:ty, $mov_instr:expr) => {
         /// Writes a value to the given `dest` pointer in a fallible manner.
@@ -357,7 +363,7 @@ pub unsafe fn write_u8_fallible(dest: *mut u8, value: u8) -> Result<(), Fault> {
             "strb {src:w}, [{dest}]",
             "3:",
             ex_table_entry!("2b", "3b", "{fault}"),
-            src = in(reg) value as u32,
+            src = in(reg) u32::from(value),
             dest = in(reg) dest,
             fault = label { return Err(Fault) }
         }
@@ -378,7 +384,7 @@ pub unsafe fn write_u16_fallible(dest: *mut u16, value: u16) -> Result<(), Fault
             "strh {src:w}, [{dest}]",
             "3:",
             ex_table_entry!("2b", "3b", "{fault}"),
-            src = in(reg) value as u32,
+            src = in(reg) u32::from(value),
             dest = in(reg) dest,
             fault = label { return Err(Fault) }
         }
@@ -399,7 +405,7 @@ pub unsafe fn write_u32_fallible(dest: *mut u32, value: u32) -> Result<(), Fault
             "str {src:w}, [{dest}]",
             "3:",
             ex_table_entry!("2b", "3b", "{fault}"),
-            src = in(reg) value as u32,
+            src = in(reg) value,
             dest = in(reg) dest,
             fault = label { return Err(Fault) }
         }

@@ -1057,6 +1057,20 @@ impl<FS: ShimFS> Task<FS> {
                         .map(|()| 0)
                 })
             }),
+            SyscallRequest::Statx {
+                dirfd,
+                pathname,
+                flags,
+                mask: _,
+                buf,
+            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                self.sys_newfstatat(dirfd, path, flags).and_then(|stat| {
+                    let statx: litebox_common_linux::Statx = stat.into();
+                    buf.write_at_offset(0, statx)
+                        .ok_or(Errno::EFAULT)
+                        .map(|()| 0)
+                })
+            }),
             SyscallRequest::Eventfd2 { initval, flags } => {
                 syscall!(sys_eventfd2(initval, flags))
             }

@@ -9,7 +9,7 @@ use alloc::{
     vec,
 };
 use litebox::{
-    event::{Events, wait::WaitError},
+    event::{wait::WaitError, Events},
     fd::{FdEnabledSubsystem, MetadataError, TypedFd},
     fs::{Mode, OFlags, SeekWhence},
     path,
@@ -17,8 +17,8 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
-    AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, IoReadVec,
-    IoWriteVec, IoctlArg, TimeParam, errno::Errno,
+    errno::Errno, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
+    IoReadVec, IoWriteVec, IoctlArg, TimeParam,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -958,7 +958,10 @@ impl<FS: ShimFS> Task<FS> {
         pathname: impl path::Arg,
         flags: AtFlags,
     ) -> Result<FileStat, Errno> {
-        let current_support_flags = AtFlags::AT_EMPTY_PATH;
+        let current_support_flags = AtFlags::AT_EMPTY_PATH
+            | AtFlags::AT_SYMLINK_NOFOLLOW
+            | AtFlags::AT_NO_AUTOMOUNT
+            | AtFlags::AT_STATX_SYNC_TYPE;
         if flags.contains(current_support_flags.complement()) {
             todo!("unsupported flags");
         }
@@ -1222,8 +1225,8 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle syscall `chdir`
     pub fn sys_chdir(&self, pathname: impl path::Arg) -> Result<(), Errno> {
-        use litebox::fs::FileType;
         use litebox::fs::errors::{FileStatusError, PathError};
+        use litebox::fs::FileType;
         use litebox::path::Arg as _;
 
         // Resolve relative paths against CWD, then normalize (handle `.` / `..`).

@@ -21,6 +21,7 @@
 #define SYS_read 0
 #define SYS_write 1
 #define SYS_close 3
+#define SYS_lseek 8
 #define SYS_fstat 5
 #define SYS_mmap 9
 #define SYS_mprotect 10
@@ -32,6 +33,7 @@
 #define SYS_read 63
 #define SYS_write 64
 #define SYS_close 57
+#define SYS_lseek 62
 #define SYS_newfstatat 79
 #define SYS_mmap 222
 #define SYS_mprotect 226
@@ -59,17 +61,26 @@ struct __attribute__((packed)) TrampolineHeader {
 // Linux flags
 #define MAP_PRIVATE 0x02
 #define MAP_FIXED 0x10
+#define MAP_ANONYMOUS 0x20
 #define PROT_READ 0x1
 #define PROT_WRITE 0x2
 #define PROT_EXEC 0x4
+#define SEEK_SET 0
 
 typedef long (*syscall_stub_t)(void);
 static syscall_stub_t syscall_entry = 0;
+#ifdef __aarch64__
+// TLS lookup table pointer from the trampoline (offset 8).
+// Used by do_syscall to look up the host TLS base before calling the callback,
+// since the callback (syscall_callback) expects x18 = host TLS.
+static uint64_t tls_table_ptr = 0;
+#endif
 static char interp[256] = {0}; // Buffer for interpreter path
 
+// Debug output (only enabled when DEBUG is defined at build time)
 #ifdef DEBUG
 #define syscall_print(str, len)                                                \
-  do_syscall(SYS_write, 1, (long)(str), len, 0, 0, 0)
+  do_syscall(SYS_write, 2, (long)(str), len, 0, 0, 0)
 #else
 #define syscall_print(str, len)
 #endif
@@ -105,17 +116,48 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5,
   register long x4 __asm__("x4") = a5;
   register long x5 __asm__("x5") = a6;
 
+  // The syscall_callback (syscall_entry) expects x18 = host TLS base.
+  // The trampoline snippets normally do a TLS table lookup to set x18,
+  // but do_syscall jumps directly to the callback. We must replicate
+  // the trampoline's TLS lookup here:
+  //   1. Save guest state (x16, x17, x30, guest TPIDR) on stack
+  //   2. Read current TPIDR_EL0 (= guest TLS)
+  //   3. Scan TLS table for matching guest_tpidr entry
+  //   4. Set x18 = host TLS from matched entry
+  //   5. Set x30 = return address, then BR to callback
+  //
+  // The TLS table has 16-byte entries: [guest_tpidr(8), host_tls(8)].
+  // Sentinel entry has guest_tpidr = 0xFFFFFFFFFFFFFFFF.
+  uint64_t tls_table = tls_table_ptr;
   __asm__ volatile(
-    "stp x16, x30, [sp, #-16]!\n"
-    "adr x30, 1f\n"
-    "mov x16, %[entry]\n"
-    "br x16\n"
-    "1:\n"
-    "ldp x16, x30, [sp], #16\n"
+    "sub  sp, sp, #32\n"
+    "str  x16, [sp, #0]\n"
+    "str  x17, [sp, #8]\n"
+    "str  x30, [sp, #16]\n"
+    "mrs  x18, tpidr_el0\n"         // x18 = guest TPIDR
+    "str  x18, [sp, #24]\n"         // save guest TPIDR on stack
+    "mov  x17, %[tls_table]\n"      // x17 = TLS table base
+    "cbz  x17, 2f\n"                // skip lookup if table ptr is NULL
+    "1:\n"                           // .Lloop
+    "ldr  x16, [x17, #0]\n"         // x16 = entry.guest_tpidr
+    "cmn  x16, #1\n"                // sentinel (0xFFFFFFFFFFFFFFFF)?
+    "b.eq 2f\n"                      // -> done (no match)
+    "cmp  x16, x18\n"               // match current TPIDR?
+    "b.eq 3f\n"                      // -> found
+    "add  x17, x17, #16\n"          // next entry
+    "b    1b\n"                      // -> loop
+    "3:\n"                           // .Lfound
+    "ldr  x18, [x17, #8]\n"         // x18 = host TLS base
+    "2:\n"                           // .Ldone
+    "adr  x30, 4f\n"                // x30 = return address
+    "mov  x16, %[entry]\n"
+    "br   x16\n"                     // jump to syscall_callback
+    "4:\n"                           // return point
     : "+r"(x0)
-    : [entry] "r"(syscall_entry), "r"(x1), "r"(x2), "r"(x3),
+    : [entry] "r"(syscall_entry), [tls_table] "r"(tls_table),
+      "r"(x1), "r"(x2), "r"(x3),
       "r"(x4), "r"(x5), "r"(x8)
-    : "memory"
+    : "x16", "x17", "x18", "x30", "memory"
   );
   return x0;
 #endif
@@ -245,8 +287,18 @@ void print_hex(uint64_t data) {
 /// The trampoline is already mapped by the litebox loader at (base + vaddr).
 /// The entry point is at offset 0 of the mapped trampoline. The litebox loader
 /// already validated the magic when parsing the file header.
+///
+/// On aarch64, the rewriter extends the last PT_LOAD's p_memsz to cover the
+/// trampoline region. The trampoline vaddr is align_up(max original p_memsz end),
+/// but the in-memory program headers show the EXTENDED p_memsz. We scan pages
+/// starting from align_up(max p_filesz end) looking for the callback pointer
+/// (non-zero qword) which the litebox loader writes at trampoline offset 0.
+/// BSS pages between filesz and the trampoline are zero-filled.
+///
+/// On x86_64, p_memsz is not extended, so align_up(max p_memsz end) works directly.
 int parse_object(const struct link_map *map) {
-  unsigned long max_addr = 0;
+  unsigned long max_memsz_end = 0;
+  unsigned long max_filesz_end = 0;
   Elf64_Ehdr *eh = (Elf64_Ehdr *)map->l_addr;
   if (memcmp(eh->e_ident,
              "\x7f"
@@ -258,24 +310,53 @@ int parse_object(const struct link_map *map) {
   Elf64_Phdr *phdrs = (Elf64_Phdr *)((char *)map->l_addr + eh->e_phoff);
   for (int i = 0; i < eh->e_phnum; i++) {
     if (phdrs[i].p_type == PT_LOAD) {
-      unsigned long vaddr_end = (phdrs[i].p_vaddr + phdrs[i].p_memsz);
-      if (vaddr_end > max_addr) {
-        max_addr = vaddr_end;
-      }
+      unsigned long memsz_end = phdrs[i].p_vaddr + phdrs[i].p_memsz;
+      unsigned long filesz_end = phdrs[i].p_vaddr + phdrs[i].p_filesz;
+      if (memsz_end > max_memsz_end) max_memsz_end = memsz_end;
+      if (filesz_end > max_filesz_end) max_filesz_end = filesz_end;
     } else if (phdrs[i].p_type == PT_INTERP) {
       strncpy(interp, (char *)map->l_addr + phdrs[i].p_vaddr,
               sizeof(interp) - 1);
       interp[sizeof(interp) - 1] = '\0'; // Ensure null termination
     }
   }
-  max_addr = align_up(max_addr, 0x1000);
-  void *trampoline_addr = (void *)map->l_addr + max_addr;
+
+#ifdef __aarch64__
+  // On aarch64, the rewriter extended p_memsz to cover the trampoline,
+  // so max_memsz_end points past the trampoline. The trampoline is between
+  // the file-backed data (filesz) and the extended memsz. Scan pages from
+  // align_up(max_filesz_end) looking for the callback pointer (non-zero).
+  unsigned long scan_start = align_up(max_filesz_end, 0x1000);
+  unsigned long scan_end = align_up(max_memsz_end, 0x1000);
+  void *trampoline_addr = 0;
+  for (unsigned long offset = scan_start; offset < scan_end; offset += 0x1000) {
+    uint64_t val = read_u64((const char *)map->l_addr + offset);
+    if (val != 0) {
+      trampoline_addr = (void *)map->l_addr + offset;
+      break;
+    }
+  }
+  if (!trampoline_addr) {
+    syscall_print("[audit] trampoline not found in scan\n", 37);
+    return 1;
+  }
+#else
+  // On x86_64, p_memsz is not extended, so the trampoline is right after.
+  unsigned long tramp_start = align_up(max_memsz_end, 0x1000);
+  void *trampoline_addr = (void *)map->l_addr + tramp_start;
+#endif
+
   // The trampoline code has the syscall entry point at offset 0.
   syscall_entry = (syscall_stub_t)read_u64(trampoline_addr);
   if (syscall_entry == 0) {
     syscall_print("[audit] syscall entry is null\n", 30);
     return 1;
   }
+#ifdef __aarch64__
+  // Read the TLS lookup table pointer at offset 8.
+  // This is written by the litebox loader at trampoline_start + 8.
+  tls_table_ptr = read_u64((const char *)trampoline_addr + 8);
+#endif
   print_hex((uint64_t)syscall_entry);
   return 0;
 }
@@ -435,19 +516,70 @@ unsigned int la_objopen(struct link_map *map,
     return 0;
   }
 
-  // Use MAP_FIXED to place the trampoline at the exact required address.
-  // The loader ensures this range is not used by other mappings.
+  syscall_print("[audit] tramp base=", 19);
+  print_hex(map->l_addr);
+  syscall_print("[audit] tramp vaddr=", 20);
+  print_hex(tramp_vaddr);
+  syscall_print("[audit] tramp_addr=", 19);
+  print_hex(tramp_addr);
+  syscall_print("[audit] tramp_size_raw=", 23);
+  print_hex(tramp_size_raw);
+  syscall_print("[audit] tramp_size_aligned=", 27);
+  print_hex(tramp_size);
+  syscall_print("[audit] file_offset=", 20);
+  print_hex(tramp_file_offset);
+
+  // Map the trampoline at the expected address using MAP_FIXED.
+  // The rewriter extended the last PT_LOAD segment's p_memsz to cover the
+  // trampoline region, so ld.so's initial reservation already includes this
+  // address range (as PROT_NONE pages). MAP_FIXED safely replaces those pages.
   void *mapped =
       (void *)do_syscall(SYS_mmap, tramp_addr, tramp_size,
-                         PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, fd, tramp_file_offset);
+                         PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
   if ((uintptr_t)mapped >= (uintptr_t)-4096) {
-    syscall_print("[audit] mmap failed for trampoline\n", 35);
+    syscall_print("[audit] mmap MAP_FIXED failed\n", 30);
+    do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
+    return 0;
+  }
+  syscall_print("[audit] mmap OK at ", 19);
+  print_hex((uint64_t)(uintptr_t)mapped);
+
+  // Seek to the trampoline data in the file and read it into the mapping.
+  long seek_ret = do_syscall(SYS_lseek, fd, tramp_file_offset, SEEK_SET, 0, 0, 0);
+  if (seek_ret < 0) {
+    syscall_print("[audit] lseek failed\n", 21);
+    do_syscall(SYS_munmap, (long)mapped, tramp_size, 0, 0, 0, 0);
     do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
     return 0;
   }
 
+  // Read trampoline data (may need multiple read calls for large trampolines)
+  uint64_t total_read = 0;
+  while (total_read < tramp_size_raw) {
+    long n = do_syscall(SYS_read, fd, (long)((char *)mapped + total_read),
+                        tramp_size_raw - total_read, 0, 0, 0);
+    if (n <= 0) {
+      syscall_print("[audit] read trampoline data failed\n", 36);
+      do_syscall(SYS_munmap, (long)mapped, tramp_size, 0, 0, 0, 0);
+      do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
+      return 0;
+    }
+    total_read += n;
+  }
+  syscall_print("[audit] read OK, total_read=", 28);
+  print_hex(total_read);
+
   // Write the syscall entry point at the start of the trampoline code
   __builtin_memcpy((char *)mapped, (const void *)&syscall_entry, 8);
+#ifdef __aarch64__
+  // Write the TLS lookup table pointer at offset 8 of the trampoline.
+  // The per-SVC trampoline snippets load this to look up the host TLS base.
+  // This pointer was obtained from the main binary's trampoline in parse_object.
+  if (tls_table_ptr != 0) {
+    __builtin_memcpy((char *)mapped + 8, (const void *)&tls_table_ptr, 8);
+  }
+#endif
   do_syscall(SYS_mprotect, (long)mapped, tramp_size, PROT_READ | PROT_EXEC, 0,
              0, 0);
   syscall_print("[audit] trampoline patched and protected\n", 41);

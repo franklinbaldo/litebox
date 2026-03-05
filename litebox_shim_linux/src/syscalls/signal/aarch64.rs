@@ -114,6 +114,7 @@ impl SignalState {
     }
 }
 
+#[allow(clippy::cast_possible_truncation)]
 pub(super) fn restore_sigcontext(
     ctx: &mut PtRegs,
     sigctx: &litebox_common_linux::signal::aarch64::Sigcontext,

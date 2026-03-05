@@ -30,18 +30,17 @@ use core::ops::Range;
 use hashbrown::HashMap;
 
 use crate::{
-    LiteBox,
     fs::{DirEntry, FileType},
     path::Arg as _,
-    sync,
+    sync, LiteBox,
 };
 
 use super::{
-    Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
     errors::{
         ChmodError, ChownError, CloseError, MkdirError, OpenError, PathError, ReadDirError,
         ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
     },
+    Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
 };
 
 /// Just a random constant that is distinct from other file systems. In this case, it is

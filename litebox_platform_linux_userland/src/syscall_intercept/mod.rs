@@ -17,6 +17,7 @@ pub(crate) fn init_sys_intercept() {
 }
 
 #[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
 pub(crate) fn init_sys_intercept() {
     // Syscall interception on aarch64 is handled by the rewriter backend.
     // No seccomp/systrap setup needed.

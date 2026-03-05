@@ -11,11 +11,12 @@ use alloc::vec::Vec;
 use rangemap::RangeMap;
 use thiserror::Error;
 
-use crate::platform::PageManagementProvider;
-use crate::platform::RawConstPointer;
 use crate::platform::page_mgmt::AllocationError;
+use crate::platform::page_mgmt::DeallocationError;
 use crate::platform::page_mgmt::FixedAddressBehavior;
 use crate::platform::page_mgmt::MemoryRegionPermissions;
+use crate::platform::PageManagementProvider;
+use crate::platform::RawConstPointer;
 
 /// Page size in bytes
 pub const PAGE_SIZE: usize = 4096;
@@ -472,16 +473,31 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 if self.vmas.overlaps(&(start..end)) {
                     if self.vmas.gaps(&(start..end)).next().is_some() {
                         // The range is partially overlapping with existing
-                        // mappings. If we call into the platform with
-                        // `Replace`, then it may overwrite external mappings
-                        // that are not managed by us.
-                        //
-                        // FUTURE: support this case, either by splitting this
-                        // into multiple allocate calls or by separating VA
-                        // allocation from page backing.
-                        return Err(AllocationError::AddressPartiallyInUse);
+                        // mappings. We remove the overlapping portions first,
+                        // then allocate the full range as NoReplace.
+                        let overlapping: Vec<Range<usize>> = self
+                            .vmas
+                            .overlapping(&(start..end))
+                            .map(|(r, _)| {
+                                // Clamp to our target range
+                                r.start.max(start)..r.end.min(end)
+                            })
+                            .collect();
+                        for r in &overlapping {
+                            unsafe {
+                                match self.platform.deallocate_pages(r.clone()) {
+                                    // Not a real error — pages may not have been
+                                    // populated yet (e.g. lazy allocation).
+                                    Ok(()) | Err(DeallocationError::AlreadyUnallocated) => {}
+                                    Err(_) => return Err(AllocationError::OutOfMemory),
+                                }
+                            }
+                        }
+                        self.vmas.remove(start..end);
+                        FixedAddressBehavior::NoReplace
+                    } else {
+                        FixedAddressBehavior::Replace
                     }
-                    FixedAddressBehavior::Replace
                 } else {
                     // There are no mappings managed by us, so just treat this
                     // as NoReplace.

@@ -64,7 +64,7 @@ impl<FS: ShimFS> litebox_common_linux::loader::ReadAt for &'_ ElfFile<'_, FS> {
     }
 
     fn size(&mut self) -> Result<u64, Self::Error> {
-        Ok(self.task.sys_fstat(self.fd)?.st_size as u64)
+        Ok(self.task.sys_fstat(self.fd)?.st_size.cast_unsigned())
     }
 }
 

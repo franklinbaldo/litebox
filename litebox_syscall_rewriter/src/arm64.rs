@@ -113,12 +113,13 @@ const SNIPPETS_START_OFFSET: usize = SIGRETURN_SNIPPET_OFFSET + SVC_SNIPPET_SIZE
 ///
 /// The offset must be a multiple of 4 and within ±128MB (signed 26-bit instruction count).
 /// Encoding: `[31:26] = 0b000101`, `[25:0] = signed offset / 4`
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn encode_b(offset: i64) -> Option<u32> {
     if offset % 4 != 0 {
         return None;
     }
     let imm26 = offset >> 2;
-    if imm26 < -(1 << 25) || imm26 >= (1 << 25) {
+    if !(-(1 << 25)..(1 << 25)).contains(&imm26) {
         return None;
     }
     Some(0x14000000 | ((imm26 as u32) & 0x03FF_FFFF))
@@ -129,8 +130,9 @@ fn encode_b(offset: i64) -> Option<u32> {
 /// The immediate is a signed 21-bit byte offset (NOT instruction-aligned).
 /// The encoding splits the immediate: `immlo` in bits [30:29], `immhi` in bits [23:5].
 #[allow(dead_code)]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn encode_adr(rd: u8, offset: i64) -> Option<u32> {
-    if offset < -(1 << 20) || offset >= (1 << 20) {
+    if !(-(1 << 20)..(1 << 20)).contains(&offset) {
         return None;
     }
     let imm = offset as u32;
@@ -145,8 +147,9 @@ fn encode_adr(rd: u8, offset: i64) -> Option<u32> {
 /// The PC is rounded down to a 4KB boundary, then the page offset is added.
 /// Range: ±4GB.
 /// The encoding splits the immediate: `immlo` in bits [30:29], `immhi` in bits [23:5].
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn encode_adrp(rd: u8, page_offset: i64) -> Option<u32> {
-    if page_offset < -(1 << 20) || page_offset >= (1 << 20) {
+    if !(-(1 << 20)..(1 << 20)).contains(&page_offset) {
         return None;
     }
     let imm = page_offset as u32;
@@ -160,12 +163,13 @@ fn encode_adrp(rd: u8, page_offset: i64) -> Option<u32> {
 ///
 /// Loads 8 bytes from a PC-relative address. The offset must be 4-byte aligned
 /// and within ±1MB (signed 19-bit instruction count).
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn encode_ldr_literal(rt: u8, offset: i64) -> Option<u32> {
     if offset % 4 != 0 {
         return None;
     }
     let imm19 = offset >> 2;
-    if imm19 < -(1 << 18) || imm19 >= (1 << 18) {
+    if !(-(1 << 18)..(1 << 18)).contains(&imm19) {
         return None;
     }
     // opc=01 (64-bit), V=0, imm19, Rt
@@ -206,7 +210,7 @@ fn encode_sub_sp_imm(imm12: u16) -> Option<u32> {
 ///
 /// Encoding: size=11, V=0, opc=00 (STR), imm12=imm_bytes/8, Rn, Rt
 fn encode_str_imm_unsigned(rt: u8, rn: u8, imm_bytes: u16) -> Option<u32> {
-    if imm_bytes % 8 != 0 {
+    if !imm_bytes.is_multiple_of(8) {
         return None;
     }
     let imm12 = imm_bytes / 8;
@@ -226,7 +230,7 @@ fn encode_str_imm_unsigned(rt: u8, rn: u8, imm_bytes: u16) -> Option<u32> {
 ///
 /// Encoding: size=11, V=0, opc=01 (LDR), imm12=imm_bytes/8, Rn, Rt
 fn encode_ldr_imm_unsigned(rt: u8, rn: u8, imm_bytes: u16) -> Option<u32> {
-    if imm_bytes % 8 != 0 {
+    if !imm_bytes.is_multiple_of(8) {
         return None;
     }
     let imm12 = imm_bytes / 8;
@@ -280,12 +284,13 @@ fn encode_cmn_imm(rn: u8, imm12: u16) -> Option<u32> {
 /// Condition codes: EQ=0x0, NE=0x1, etc.
 ///
 /// Encoding: `[31:25]=0101010_0`, `[23:5]=imm19`, `[4]=0`, `[3:0]=cond`
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn encode_b_cond(cond: u8, offset: i64) -> Option<u32> {
     if offset % 4 != 0 {
         return None;
     }
     let imm19 = offset >> 2;
-    if imm19 < -(1 << 18) || imm19 >= (1 << 18) {
+    if !(-(1 << 18)..(1 << 18)).contains(&imm19) {
         return None;
     }
     // 0101010_0_imm19_0_cond
@@ -366,6 +371,7 @@ enum PatchKind {
 ///
 /// ARM64 instructions are always 4-byte aligned, so we scan in 4-byte steps.
 /// Returns patch sites sorted by file offset.
+#[allow(clippy::cast_possible_truncation)]
 fn find_patch_sites(sections: &[TextSectionInfo], buf: &[u8]) -> Result<Vec<PatchSite>> {
     let mut sites = Vec::new();
 
@@ -435,10 +441,39 @@ pub(crate) fn hook_syscalls_aarch64(
     // Find all SVC #0 and MSR TPIDR_EL0 sites
     let sites = find_patch_sites(text_sections, buf)?;
 
-    // Must have at least one SVC for the callback mechanism to work
+    // Check if there are any SVC instructions to patch
     let has_svc = sites.iter().any(|s| s.kind == PatchKind::Svc);
     if !has_svc {
-        return Err(Error::NoSyscallInstructionsFound);
+        // No SVC instructions found. Produce a minimal trampoline containing just
+        // the callback address slot, TLS table pointer, and the sigreturn preamble.
+        // This is needed for dynamically linked binaries where all syscalls are in
+        // shared libraries — the rtld_audit library reads the callback address from
+        // the main binary's trampoline region (via parse_object), so we must provide
+        // a valid trampoline even when there are no instructions to patch.
+        let mut trampoline_data: Vec<u8> = Vec::new();
+        // Offset 0: syscall_callback address (8 bytes)
+        trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
+        // Offset 8: TLS lookup table pointer (8 bytes, initially 0)
+        trampoline_data.extend_from_slice(&0u64.to_le_bytes());
+        // Offset 16: sigreturn preamble — MOV X8, #139; B .+4
+        trampoline_data.extend_from_slice(&encode_movz_x(8, NR_RT_SIGRETURN).to_le_bytes());
+        let b_to_snippet = encode_b(4).expect("offset +4 always valid");
+        trampoline_data.extend_from_slice(&b_to_snippet.to_le_bytes());
+        // Offset 24: sigreturn SVC snippet (76 bytes)
+        let sigret_snippet_vaddr = trampoline_base_addr + SIGRETURN_SNIPPET_OFFSET as u64;
+        let sigret_dummy_site = PatchSite {
+            file_offset: 0,
+            vaddr: sigret_snippet_vaddr,
+            kind: PatchKind::Svc,
+        };
+        emit_svc_snippet(
+            &mut trampoline_data,
+            sigret_snippet_vaddr,
+            SIGRETURN_SNIPPET_OFFSET,
+            trampoline_base_addr,
+            &sigret_dummy_site,
+        )?;
+        return Ok((trampoline_data, false));
     }
 
     // Build trampoline data
@@ -512,7 +547,7 @@ pub(crate) fn hook_syscalls_aarch64(
         }
 
         // Patch original instruction with B <snippet>
-        let b_offset = snippet_vaddr as i64 - site.vaddr as i64;
+        let b_offset = snippet_vaddr.cast_signed() - site.vaddr.cast_signed();
         let b_insn = encode_b(b_offset).ok_or_else(|| {
             Error::DisassemblyFailure(format!(
                 "Branch offset {:#x} out of ±128MB range for site at {:#x}. \
@@ -531,6 +566,7 @@ pub(crate) fn hook_syscalls_aarch64(
 ///
 /// This snippet saves registers, looks up the host TLS from the TLS table,
 /// then jumps to the syscall callback.
+#[allow(clippy::cast_possible_wrap)]
 fn emit_svc_snippet(
     trampoline_data: &mut Vec<u8>,
     snippet_vaddr: u64,
@@ -584,7 +620,7 @@ fn emit_svc_snippet(
     // [6] LDR X17, [PC, #offset_to_tls_table_ptr]
     let ldr_tls_vaddr = insn_vaddr(insn_idx);
     let tls_table_vaddr = trampoline_base_addr + HEADER_TLS_TABLE_OFFSET as u64;
-    let ldr_tls_offset = tls_table_vaddr as i64 - ldr_tls_vaddr as i64;
+    let ldr_tls_offset = tls_table_vaddr.cast_signed() - ldr_tls_vaddr.cast_signed();
     let ldr_tls_insn = encode_ldr_literal(17, ldr_tls_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
             "LDR literal offset {:#x} out of range for TLS table load at SVC {:#x}",
@@ -692,7 +728,7 @@ fn emit_svc_snippet(
     // [17] LDR X16, [PC, #offset_to_callback]
     let ldr_cb_vaddr = insn_vaddr(insn_idx);
     let callback_vaddr = trampoline_base_addr + HEADER_CALLBACK_OFFSET as u64;
-    let ldr_cb_offset = callback_vaddr as i64 - ldr_cb_vaddr as i64;
+    let ldr_cb_offset = callback_vaddr.cast_signed() - ldr_cb_vaddr.cast_signed();
     let ldr_cb_insn = encode_ldr_literal(16, ldr_cb_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
             "LDR literal offset {:#x} out of ±1MB range for SVC at {:#x}",
@@ -724,6 +760,7 @@ fn emit_svc_snippet(
 ///
 /// Uses scratch registers X16, X17, X30 (all saved/restored on the stack).
 /// The new TPIDR value is stored at `[SP, #24]` to avoid register conflicts.
+#[allow(clippy::cast_possible_wrap)]
 fn emit_msr_tpidr_snippet(
     trampoline_data: &mut Vec<u8>,
     snippet_vaddr: u64,
@@ -837,7 +874,7 @@ fn emit_msr_tpidr_snippet(
     // [7] LDR X17, [PC, #offset_to_tls_table_ptr]
     let ldr_tls_vaddr = insn_vaddr(insn_idx);
     let tls_table_vaddr = trampoline_base_addr + HEADER_TLS_TABLE_OFFSET as u64;
-    let ldr_tls_offset = tls_table_vaddr as i64 - ldr_tls_vaddr as i64;
+    let ldr_tls_offset = tls_table_vaddr.cast_signed() - ldr_tls_vaddr.cast_signed();
     let ldr_tls_insn = encode_ldr_literal(17, ldr_tls_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
             "LDR literal offset {:#x} out of range for TLS table load at MSR {:#x}",
@@ -967,7 +1004,7 @@ fn emit_msr_tpidr_snippet(
 
     // [23] B <return_addr> — branch back to instruction after original MSR
     let b_ret_vaddr = insn_vaddr(insn_idx);
-    let b_ret_offset = (site.vaddr + 4) as i64 - b_ret_vaddr as i64;
+    let b_ret_offset = (site.vaddr + 4).cast_signed() - b_ret_vaddr.cast_signed();
     let b_ret = encode_b(b_ret_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
             "B offset {:#x} out of ±128MB range for return from MSR at {:#x}",
@@ -1559,7 +1596,7 @@ mod tests {
         let adrp_base = adrp_vaddr & !0xFFF;
         let return_addr = 0x1008u64;
         let return_page = return_addr & !0xFFF;
-        let page_offset = (return_page as i64 - adrp_base as i64) >> 12;
+        let page_offset = (return_page.cast_signed() - adrp_base.cast_signed()) >> 12;
         assert_eq!(insn_at(15), encode_adrp(30, page_offset).unwrap());
 
         // [16] ADD X30, X30, #<pageoff>
@@ -1643,7 +1680,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hook_no_svc_returns_error() {
+    fn test_hook_no_svc_returns_minimal_trampoline() {
         let nop: u32 = 0xD503201F;
         let mut buf = vec![0u8; 8];
         buf[0..4].copy_from_slice(&nop.to_le_bytes());
@@ -1656,7 +1693,13 @@ mod tests {
         }];
 
         let result = hook_syscalls_aarch64(&mut buf, &sections, 0x2000, 0);
-        assert!(matches!(result, Err(Error::NoSyscallInstructionsFound)));
+        let (trampoline_data, has_svc) = result.expect("should succeed with minimal trampoline");
+        assert!(!has_svc, "should report no SVC found");
+        // Minimal trampoline: callback(8) + TLS ptr(8) + sigret preamble(8) + sigret SVC snippet
+        assert!(
+            trampoline_data.len() >= SNIPPETS_START_OFFSET,
+            "minimal trampoline should include sigreturn snippet"
+        );
     }
 
     #[test]
@@ -2104,8 +2147,10 @@ mod tests {
     }
 
     #[test]
-    fn test_hook_msr_only_returns_error() {
-        // A binary with only MSR TPIDR_EL0 and no SVC should return an error
+    fn test_hook_msr_only_produces_minimal_trampoline() {
+        // A binary with only MSR TPIDR_EL0 and no SVC should produce a minimal
+        // trampoline (no MSR sites are patched without at least one SVC, since the
+        // TLS table requires the callback mechanism).
         let msr_insn = encode_msr_tpidr_el0(19);
         let mut buf = vec![0u8; 8];
         buf[0..4].copy_from_slice(&msr_insn.to_le_bytes());
@@ -2117,6 +2162,17 @@ mod tests {
         }];
 
         let result = hook_syscalls_aarch64(&mut buf, &sections, 0x2000, 0);
-        assert!(matches!(result, Err(Error::NoSyscallInstructionsFound)));
+        let (trampoline_data, has_svc) = result.expect("should succeed with minimal trampoline");
+        assert!(!has_svc, "should report no SVC found");
+        // MSR instruction should NOT be patched (no SVC means no callback mechanism)
+        assert_eq!(
+            u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+            msr_insn,
+            "MSR instruction should be left unpatched"
+        );
+        assert!(
+            trampoline_data.len() >= SNIPPETS_START_OFFSET,
+            "minimal trampoline should include sigreturn snippet"
+        );
     }
 }

@@ -417,6 +417,143 @@ impl From<FileStat> for FileStat64 {
     }
 }
 
+/// Linux's `statx_timestamp` struct
+#[repr(C)]
+#[derive(Clone, Default, Debug, FromBytes, IntoBytes)]
+pub struct StatxTimestamp {
+    pub tv_sec: i64,
+    pub tv_nsec: u32,
+    #[expect(clippy::pub_underscore_fields)]
+    pub __reserved: i32,
+}
+
+/// Linux's `statx` struct returned by the `statx(2)` syscall
+#[repr(C)]
+#[derive(Clone, Default, Debug, FromBytes, IntoBytes)]
+pub struct Statx {
+    /// Mask of bits indicating filled fields
+    pub stx_mask: u32,
+    /// Block size for filesystem I/O
+    pub stx_blksize: u32,
+    /// Extra file attribute indicators
+    pub stx_attributes: u64,
+    /// Number of hard links
+    pub stx_nlink: u32,
+    /// User ID of owner
+    pub stx_uid: u32,
+    /// Group ID of owner
+    pub stx_gid: u32,
+    /// File type and mode
+    pub stx_mode: u16,
+    #[expect(clippy::pub_underscore_fields)]
+    pub __spare0: [u16; 1],
+    /// Inode number
+    pub stx_ino: u64,
+    /// Total size in bytes
+    pub stx_size: u64,
+    /// Number of 512B blocks allocated
+    pub stx_blocks: u64,
+    /// Mask to show what's supported in stx_attributes
+    pub stx_attributes_mask: u64,
+    /// Last access timestamp
+    pub stx_atime: StatxTimestamp,
+    /// Creation timestamp
+    pub stx_btime: StatxTimestamp,
+    /// Last status change timestamp
+    pub stx_ctime: StatxTimestamp,
+    /// Last modification timestamp
+    pub stx_mtime: StatxTimestamp,
+    /// Major device number (if special file)
+    pub stx_rdev_major: u32,
+    /// Minor device number (if special file)
+    pub stx_rdev_minor: u32,
+    /// Major device number of filesystem
+    pub stx_dev_major: u32,
+    /// Minor device number of filesystem
+    pub stx_dev_minor: u32,
+    /// Mount ID
+    pub stx_mnt_id: u64,
+    /// Direct I/O alignment
+    pub stx_dio_mem_align: u32,
+    /// Direct I/O offset alignment
+    pub stx_dio_offset_align: u32,
+    #[expect(clippy::pub_underscore_fields)]
+    pub __spare3: [u64; 12],
+}
+
+/// STATX_* mask bits
+pub const STATX_TYPE: u32 = 0x0001;
+pub const STATX_MODE: u32 = 0x0002;
+pub const STATX_NLINK: u32 = 0x0004;
+pub const STATX_UID: u32 = 0x0008;
+pub const STATX_GID: u32 = 0x0010;
+pub const STATX_ATIME: u32 = 0x0020;
+pub const STATX_MTIME: u32 = 0x0040;
+pub const STATX_CTIME: u32 = 0x0080;
+pub const STATX_INO: u32 = 0x0100;
+pub const STATX_SIZE: u32 = 0x0200;
+pub const STATX_BLOCKS: u32 = 0x0400;
+pub const STATX_BASIC_STATS: u32 = 0x07ff;
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::unnecessary_cast
+)]
+impl From<FileStat> for Statx {
+    fn from(stat: FileStat) -> Self {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        let mode = stat.st_mode as u16;
+        #[cfg(target_arch = "x86")]
+        let mode = stat.st_mode as u16;
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        let dev = stat.st_dev;
+        #[cfg(target_arch = "x86")]
+        let dev = u64::from(stat.st_dev);
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        let ino = stat.st_ino;
+        #[cfg(target_arch = "x86")]
+        let ino = u64::from(stat.st_ino);
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        let rdev = stat.st_rdev;
+        #[cfg(target_arch = "x86")]
+        let rdev = u64::from(stat.st_rdev);
+        Statx {
+            stx_mask: STATX_BASIC_STATS,
+            stx_blksize: stat.st_blksize as u32,
+            stx_attributes: 0,
+            stx_nlink: stat.st_nlink as u32,
+            stx_uid: stat.st_uid,
+            stx_gid: stat.st_gid,
+            stx_mode: mode,
+            stx_ino: ino,
+            stx_size: stat.st_size as u64,
+            stx_blocks: stat.st_blocks as u64,
+            stx_attributes_mask: 0,
+            stx_atime: StatxTimestamp {
+                tv_sec: stat.st_atime as i64,
+                tv_nsec: stat.st_atime_nsec as u32,
+                ..Default::default()
+            },
+            stx_mtime: StatxTimestamp {
+                tv_sec: stat.st_mtime as i64,
+                tv_nsec: stat.st_mtime_nsec as u32,
+                ..Default::default()
+            },
+            stx_ctime: StatxTimestamp {
+                tv_sec: stat.st_ctime as i64,
+                tv_nsec: stat.st_ctime_nsec as u32,
+                ..Default::default()
+            },
+            stx_rdev_major: (rdev >> 8) as u32,
+            stx_rdev_minor: (rdev & 0xff) as u32,
+            stx_dev_major: (dev >> 8) as u32,
+            stx_dev_minor: (dev & 0xff) as u32,
+            ..Default::default()
+        }
+    }
+}
+
 /// Linux's `iovec` struct for `writev`
 #[derive(FromBytes, IntoBytes)]
 #[repr(C, packed)]
@@ -480,7 +617,11 @@ impl From<litebox::fs::FileStatus> for FileStat {
                 .unwrap_or_default(),
             #[allow(clippy::cast_possible_wrap, clippy::unnecessary_cast)]
             st_size: size as _,
-            #[allow(clippy::cast_possible_wrap, clippy::unnecessary_cast)]
+            #[allow(
+                clippy::cast_possible_wrap,
+                clippy::cast_possible_truncation,
+                clippy::unnecessary_cast
+            )]
             st_blksize: blksize as _,
             st_blocks: 0,
             ..Default::default()
@@ -2225,6 +2366,13 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         buf: Platform::RawMutPointer<FileStat64>,
         flags: AtFlags,
     },
+    Statx {
+        dirfd: i32,
+        pathname: Platform::RawConstPointer<c_char>,
+        flags: AtFlags,
+        mask: u32,
+        buf: Platform::RawMutPointer<Statx>,
+    },
     Eventfd2 {
         initval: u32,
         flags: EfdFlags,
@@ -2907,8 +3055,9 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             #[cfg(not(target_arch = "aarch64"))]
             Sysno::alarm => sys_req!(Alarm { seconds }),
             Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
+            Sysno::statx => sys_req!(Statx { dirfd, pathname:*, flags, mask, buf:* }),
             // Noisy unsupported syscalls.
-            Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
+            Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
                 return Err(errno::Errno::ENOSYS);
             }
             sysno => {

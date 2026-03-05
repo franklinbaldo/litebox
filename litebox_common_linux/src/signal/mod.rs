@@ -311,6 +311,7 @@ pub struct Ucontext {
 #[cfg(target_arch = "aarch64")]
 #[repr(C)]
 #[derive(Clone, FromBytes, IntoBytes)]
+#[allow(clippy::pub_underscore_fields)]
 pub struct Ucontext {
     pub flags: usize,
     pub link: usize, // *mut Ucontext,

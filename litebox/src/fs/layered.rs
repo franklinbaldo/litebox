@@ -9,10 +9,10 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use hashbrown::{HashMap, HashSet};
 
-use crate::LiteBox;
 use crate::fd::{InternalFd, TypedFd};
 use crate::path::Arg;
 use crate::sync;
+use crate::LiteBox;
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
@@ -70,8 +70,11 @@ pub struct FileSystem<
     node_info_lookup: sync::RwLock<Platform, HashMap<NodeInfo, usize>>,
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower: super::FileSystem>
-    FileSystem<Platform, Upper, Lower>
+impl<
+        Platform: sync::RawSyncPrimitivesProvider,
+        Upper: super::FileSystem,
+        Lower: super::FileSystem,
+    > FileSystem<Platform, Upper, Lower>
 {
     /// Construct a new `FileSystem` instance
     #[must_use]
@@ -432,16 +435,19 @@ pub enum MigrationError {
     PathError(#[from] PathError),
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower: super::FileSystem>
-    super::private::Sealed for FileSystem<Platform, Upper, Lower>
+impl<
+        Platform: sync::RawSyncPrimitivesProvider,
+        Upper: super::FileSystem,
+        Lower: super::FileSystem,
+    > super::private::Sealed for FileSystem<Platform, Upper, Lower>
 {
 }
 
 impl<
-    Platform: sync::RawSyncPrimitivesProvider,
-    Upper: super::FileSystem + 'static,
-    Lower: super::FileSystem + 'static,
-> super::FileSystem for FileSystem<Platform, Upper, Lower>
+        Platform: sync::RawSyncPrimitivesProvider,
+        Upper: super::FileSystem + 'static,
+        Lower: super::FileSystem + 'static,
+    > super::FileSystem for FileSystem<Platform, Upper, Lower>
 {
     fn open(
         &self,
