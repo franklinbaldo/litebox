@@ -233,12 +233,8 @@ fn find_c_test_files(dir: &str) -> Vec<PathBuf> {
 }
 
 // our rtld_audit does not support x86 yet
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
 #[test]
-#[cfg_attr(
-    target_arch = "aarch64",
-    ignore = "Pre-existing SIGSEGV in execve/thread_exit tests on aarch64"
-)]
 fn test_dynamic_lib_with_rewriter() {
     for path in find_c_test_files("./tests") {
         let stem = path
