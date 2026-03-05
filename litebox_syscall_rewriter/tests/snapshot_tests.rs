@@ -26,6 +26,7 @@ fn objdump(binary: &[u8]) -> String {
 
 const HELLO_INPUT_64: &[u8] = include_bytes!("hello");
 const HELLO_INPUT_32: &[u8] = include_bytes!("hello-32");
+const HELLO_INPUT_AARCH64: &[u8] = include_bytes!("hello-aarch64");
 
 fn run_snapshot_test(input: &[u8], snapshot: &str) {
     let output = litebox_syscall_rewriter::hook_syscalls_in_elf(input, None).unwrap();
@@ -50,4 +51,10 @@ fn snapshot_test_hello_world_x86_64() {
 #[cfg_attr(not(target_arch = "x86_64"), ignore = "x86-only snapshot test")]
 fn snapshot_test_hello_world_x86() {
     run_snapshot_test(HELLO_INPUT_32, "hello-32-diff");
+}
+
+#[test]
+#[cfg_attr(not(target_arch = "aarch64"), ignore = "aarch64-only snapshot test")]
+fn snapshot_test_hello_world_aarch64() {
+    run_snapshot_test(HELLO_INPUT_AARCH64, "hello-aarch64-diff");
 }
