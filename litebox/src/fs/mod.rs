@@ -222,12 +222,12 @@ bitflags! {
         /// `O_CREAT`: if path does not exist, create it as a regular file
         const CREAT = 0x40;
         /// `O_DIRECT`: try to minimize cache effects of I/O for this file
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
         const DIRECT = 0x4000;
         #[cfg(target_arch = "aarch64")]
         const DIRECT = 0x10000;
         /// `O_DIRECTORY`: fail if not a directory
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
         const DIRECTORY = 0x10000;
         #[cfg(target_arch = "aarch64")]
         const DIRECTORY = 0x4000;
@@ -237,7 +237,7 @@ bitflags! {
         /// `O_EXCL`: exclusive use
         const EXCL = 0x80;
         /// `O_LARGEFILE`: allow large file support
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
         const LARGEFILE = 0x8000;
         #[cfg(target_arch = "aarch64")]
         const LARGEFILE = 0x20000;
@@ -246,7 +246,7 @@ bitflags! {
         /// `O_NOCTTY`: do not assign controlling terminal
         const NOCTTY = 0x100;
         /// `O_NOFOLLOW`: fail if the path does not point to a regular file
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
         const NOFOLLOW = 0x20000;
         #[cfg(target_arch = "aarch64")]
         const NOFOLLOW = 0x8000;
@@ -261,7 +261,7 @@ bitflags! {
         /// integrity completion provided by `O_DSYNC`.)
         const SYNC = 0x101000;
         /// `O_TMPFILE`: create an unnamed temporary file
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
         const TMPFILE = 0x410000;
         #[cfg(target_arch = "aarch64")]
         const TMPFILE = 0x404000;

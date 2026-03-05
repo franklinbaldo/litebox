@@ -1025,6 +1025,11 @@ fn emit_msr_tpidr_snippet(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::cast_lossless,
+    clippy::cast_possible_wrap,
+    clippy::manual_range_contains
+)]
 mod tests {
     use super::*;
 

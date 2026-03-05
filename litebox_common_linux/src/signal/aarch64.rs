@@ -6,7 +6,7 @@
 use zerocopy::{FromBytes, IntoBytes};
 
 /// sigcontext for aarch64
-/// See: https://elixir.bootlin.com/linux/v5.19.17/source/arch/arm64/include/uapi/asm/sigcontext.h
+/// See: <https://elixir.bootlin.com/linux/v5.19.17/source/arch/arm64/include/uapi/asm/sigcontext.h>
 ///
 /// Note: The kernel's `__reserved` field has `__attribute__((__aligned__(16)))`,
 /// giving the overall struct a 16-byte alignment requirement.  This alignment

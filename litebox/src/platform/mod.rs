@@ -439,7 +439,10 @@ where
         // safe (it probably is fine, but the following sequence of steps ensures we are
         // staying in a very safe subset).
         let bytes: *mut [c_char] = Box::into_raw(bytes);
-        let bytes: *mut [u8] = bytes;
+        // SAFETY: c_char and u8 have the same size and alignment; the pointer
+        // metadata (length) is preserved by the cast.
+        #[allow(clippy::unnecessary_cast)]
+        let bytes: *mut [u8] = bytes as *mut [u8];
         let bytes: Box<[u8]> = unsafe { Box::from_raw(bytes) };
         let bytes: Vec<u8> = Vec::from(bytes);
         alloc::ffi::CString::from_vec_with_nul(bytes).ok()

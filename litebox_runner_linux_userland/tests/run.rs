@@ -49,10 +49,10 @@ impl Runner {
 
         // create tar file containing all dependencies
         let tar_dir = dir_path.join(format!("tar_files_{unique_name}"));
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
         let dirs_to_create: &[&str] = &["lib64", "lib/x86_64-linux-gnu", "lib32"];
         #[cfg(target_arch = "aarch64")]
-        let dirs_to_create: &[&str] = &["lib", "usr/lib"];
+        let dirs_to_create: &[&str] = &["lib", "usr/lib", "lib/aarch64-linux-gnu"];
         for dir in dirs_to_create {
             std::fs::create_dir_all(tar_dir.join(dir)).unwrap();
         }
@@ -99,7 +99,14 @@ impl Runner {
             // See https://man7.org/linux/man-pages/man8/ld.so.8.html for how ld works.
             // Alternatively, we could add a `/etc/ld.so.cache` file to the rootfs.
             "--env",
-            "LD_LIBRARY_PATH=/lib64:/lib32:/lib:/usr/lib:/usr/lib/aarch64-linux-gnu:/lib/aarch64-linux-gnu",
+            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+            {
+                "LD_LIBRARY_PATH=/lib64:/lib32:/lib"
+            },
+            #[cfg(target_arch = "aarch64")]
+            {
+                "LD_LIBRARY_PATH=/lib64:/lib32:/lib:/usr/lib:/usr/lib/aarch64-linux-gnu:/lib/aarch64-linux-gnu"
+            },
             "--env",
             "HOME=/",
         ]);
@@ -120,6 +127,10 @@ impl Runner {
         self
     }
 
+    #[cfg_attr(
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        expect(dead_code)
+    )]
     fn envs(&mut self, envs: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) -> &mut Self {
         for env in envs {
             self.env(env);
@@ -132,6 +143,10 @@ impl Runner {
         self
     }
 
+    #[cfg_attr(
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        expect(dead_code)
+    )]
     fn args(&mut self, args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) -> &mut Self {
         for arg in args {
             self.arg(arg);
@@ -144,6 +159,10 @@ impl Runner {
         self
     }
 
+    #[cfg_attr(
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        expect(dead_code)
+    )]
     fn with_fs_path(&mut self, f: impl FnOnce(&Path)) -> &mut Self {
         f(&self.tar_dir);
         self
@@ -153,6 +172,10 @@ impl Runner {
         self.run_inner(false);
     }
 
+    #[cfg_attr(
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        expect(dead_code)
+    )]
     #[must_use]
     fn output(&mut self) -> Vec<u8> {
         self.run_inner(true)
@@ -225,7 +248,10 @@ fn test_dynamic_lib_with_rewriter() {
 }
 
 #[test]
-#[ignore = "Pre-existing SIGSEGV in execve/thread_exit tests on aarch64"]
+#[cfg_attr(
+    target_arch = "aarch64",
+    ignore = "Pre-existing SIGSEGV in execve/thread_exit tests on aarch64"
+)]
 fn test_static_exec_with_rewriter() {
     for path in find_c_test_files("./tests") {
         let stem = path
@@ -254,6 +280,7 @@ fn test_dynamic_lib_with_seccomp() {
 }
 
 /// Get the path of a program using `which`
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn run_which(prog: &str) -> std::path::PathBuf {
     let prog_path_str = std::process::Command::new("which")
         .arg(prog)
@@ -287,6 +314,7 @@ console.log(content);
         .run();
 }
 
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn test_node_with_rewriter() {
     const HELLO_WORLD_JS: &str = r"
@@ -306,6 +334,7 @@ console.log(content);
         .run();
 }
 
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn test_runner_with_ls() {
     let ls_path = run_which("ls");
@@ -315,42 +344,66 @@ fn test_runner_with_ls() {
 
     let output_str = String::from_utf8_lossy(&output);
     let normalized = output_str.split_whitespace().collect::<Vec<_>>();
-    #[cfg(target_arch = "x86_64")]
-    let expected_entries = [".", "..", "lib", "lib64"];
-    #[cfg(target_arch = "aarch64")]
-    let expected_entries = [".", "..", "lib", "usr"];
-    for each in expected_entries {
-        assert!(
-            normalized.contains(&each),
-            "unexpected ls output:\n{output_str}\n{each} not found",
-        );
-    }
 
-    // test `ls` subdir — use arch-appropriate library path
-    #[cfg(target_arch = "x86_64")]
-    let (lib_subdir, expected_libs) = (
-        "/lib/x86_64-linux-gnu",
-        &[".", "..", "libc.so.6", "libpcre2-8.so.0", "libselinux.so.1"][..],
-    );
-    #[cfg(target_arch = "aarch64")]
-    let (lib_subdir, expected_libs) =
-        ("/usr/lib", &[".", "..", "libc.so.6", "libselinux.so.1"][..]);
-
-    let output = Runner::new(Backend::Rewriter, &ls_path, "ls_lib_rewriter")
-        .args(["-a", lib_subdir])
-        .output();
-
-    let output_str = String::from_utf8_lossy(&output);
-    let normalized = output_str.split_whitespace().collect::<Vec<_>>();
-    for each in expected_libs {
+    // Determine expected root entries dynamically: always expect "." and "..",
+    // plus derive top-level dirs from actual library dependency paths.
+    let libs = common::find_dependencies(ls_path.to_str().unwrap());
+    let mut expected_entries: Vec<&str> = vec![".", ".."];
+    // Collect the unique top-level directory names from dependency paths (e.g. "/lib/..." → "lib", "/usr/lib/..." → "usr")
+    let top_level_dirs: std::collections::BTreeSet<String> = libs
+        .iter()
+        .filter_map(|p| p.strip_prefix('/'))
+        .filter_map(|p| p.split('/').next())
+        .map(String::from)
+        .collect();
+    let top_level_refs: Vec<&str> = top_level_dirs.iter().map(String::as_str).collect();
+    expected_entries.extend(&top_level_refs);
+    for each in &expected_entries {
         assert!(
             normalized.contains(each),
             "unexpected ls output:\n{output_str}\n{each} not found",
         );
     }
+
+    // test `ls` subdir — find the directory that contains libc.so.6
+    let libc_dir = libs
+        .iter()
+        .find(|p| p.contains("libc.so.6"))
+        .map(|p| {
+            let path = std::path::Path::new(p.as_str());
+            path.parent().unwrap().to_str().unwrap().to_string()
+        })
+        .expect("libc.so.6 not found in dependencies");
+
+    // Collect expected libs in that directory (just the filenames of staged libs that live there)
+    let mut expected_libs: Vec<String> = vec![".".into(), "..".into()];
+    for lib in &libs {
+        if let Some(parent) = std::path::Path::new(lib.as_str()).parent()
+            && parent.to_str().unwrap() == libc_dir
+            && let Some(name) = std::path::Path::new(lib.as_str()).file_name()
+        {
+            expected_libs.push(name.to_str().unwrap().to_string());
+        }
+    }
+
+    let output = Runner::new(Backend::Rewriter, &ls_path, "ls_lib_rewriter")
+        .args(["-a", &libc_dir])
+        .output();
+
+    let output_str = String::from_utf8_lossy(&output);
+    let normalized = output_str.split_whitespace().collect::<Vec<_>>();
+    for each in &expected_libs {
+        assert!(
+            normalized.contains(&each.as_str()),
+            "unexpected ls output:\n{output_str}\n{each} not found",
+        );
+    }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    target_os = "linux"
+))]
 fn run_python(args: &[&str]) -> String {
     let output = std::process::Command::new("python3")
         .args(args)
@@ -360,7 +413,10 @@ fn run_python(args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    target_os = "linux"
+))]
 fn has_origin_in_libs(binary_path: &Path) -> bool {
     let output = std::process::Command::new("readelf")
         .args(["-d", binary_path.to_str().unwrap()])
@@ -382,7 +438,10 @@ fn has_origin_in_libs(binary_path: &Path) -> bool {
     false
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    target_os = "linux"
+))]
 #[test]
 fn test_runner_with_python() {
     const HELLO_WORLD_PY: &str = "print(\"Hello, World from litebox!\")";
@@ -552,6 +611,7 @@ fn test_tun_with_tcp_socket() {
 /// ```
 /// cargo test --package litebox_runner_linux_userland --test run --release -- test_tun_and_runner_with_iperf3 --exact --nocapture
 /// ```
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn test_tun_and_runner_with_iperf3() {
     const NUM_CLIENTS: usize = 1;

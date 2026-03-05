@@ -14,6 +14,7 @@
 //!
 //! This crate supports x86-64 (amd64), x86-32 (i386), and AArch64 (arm64) ELFs.
 
+#[cfg(target_arch = "aarch64")]
 mod arm64;
 
 use std::collections::HashSet;
@@ -157,7 +158,14 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
 
     // Dispatch to arch-specific hooking logic
     let (trampoline_data, _syscall_insns_found) = if arch == Arch::Aarch64 {
-        arm64::hook_syscalls_aarch64(buf, &text_sections, trampoline_base_addr, trampoline)?
+        #[cfg(target_arch = "aarch64")]
+        {
+            arm64::hook_syscalls_aarch64(buf, &text_sections, trampoline_base_addr, trampoline)?
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            unreachable!("AArch64 ELF cannot be loaded on non-aarch64 host")
+        }
     } else {
         // x86 path: build trampoline data and patch sections
         let mut trampoline_data = vec![];

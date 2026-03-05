@@ -518,13 +518,21 @@ impl From<FileStat> for Statx {
         let rdev = stat.st_rdev;
         #[cfg(target_arch = "x86")]
         let rdev = u64::from(stat.st_rdev);
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        let uid = stat.st_uid;
+        #[cfg(target_arch = "x86")]
+        let uid = u32::from(stat.st_uid);
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        let gid = stat.st_gid;
+        #[cfg(target_arch = "x86")]
+        let gid = u32::from(stat.st_gid);
         Statx {
             stx_mask: STATX_BASIC_STATS,
             stx_blksize: stat.st_blksize as u32,
             stx_attributes: 0,
             stx_nlink: stat.st_nlink as u32,
-            stx_uid: stat.st_uid,
-            stx_gid: stat.st_gid,
+            stx_uid: uid,
+            stx_gid: gid,
             stx_mode: mode,
             stx_ino: ino,
             stx_size: stat.st_size as u64,
