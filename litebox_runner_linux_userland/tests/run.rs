@@ -333,10 +333,8 @@ fn test_runner_with_ls() {
         &[".", "..", "libc.so.6", "libpcre2-8.so.0", "libselinux.so.1"][..],
     );
     #[cfg(target_arch = "aarch64")]
-    let (lib_subdir, expected_libs) = (
-        "/usr/lib",
-        &[".", "..", "libc.so.6", "libselinux.so.1"][..],
-    );
+    let (lib_subdir, expected_libs) =
+        ("/usr/lib", &[".", "..", "libc.so.6", "libselinux.so.1"][..]);
 
     let output = Runner::new(Backend::Rewriter, &ls_path, "ls_lib_rewriter")
         .args(["-a", lib_subdir])

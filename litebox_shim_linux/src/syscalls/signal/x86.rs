@@ -7,8 +7,8 @@ use core::mem::offset_of;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_common_linux::{
-    signal::{x86::Sigcontext, SaFlags, SigAction, SigSet, Siginfo, Signal, Ucontext},
     PtRegs,
+    signal::{SaFlags, SigAction, SigSet, Siginfo, Signal, Ucontext, x86::Sigcontext},
 };
 use zerocopy::{FromBytes, IntoBytes};
 

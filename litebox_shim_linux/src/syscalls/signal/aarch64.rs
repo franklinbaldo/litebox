@@ -1,14 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::syscalls::signal::{DeliverFault, SignalState};
 use crate::MutPtr;
+use crate::syscalls::signal::{DeliverFault, SignalState};
 use core::mem::offset_of;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::ReinterpretUnsignedExt as _;
 use litebox_common_linux::{
-    signal::{aarch64::Sigcontext, SaFlags, SigAction, Siginfo, Ucontext},
     PtRegs,
+    signal::{SaFlags, SigAction, Siginfo, Ucontext, aarch64::Sigcontext},
 };
 use zerocopy::{FromBytes, IntoBytes};
 

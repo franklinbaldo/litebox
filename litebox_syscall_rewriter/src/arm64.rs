@@ -1225,7 +1225,7 @@ mod tests {
         // Verify Rd=SP and Rn=SP
         assert_eq!(insn & 0x1F, 31); // Rd
         assert_eq!((insn >> 5) & 0x1F, 31); // Rn
-                                            // Verify imm12
+        // Verify imm12
         assert_eq!((insn >> 10) & 0xFFF, 32);
     }
 
@@ -1317,7 +1317,7 @@ mod tests {
         assert_eq!(insn & 0x1F, 31); // Rd = XZR
         assert_eq!((insn >> 5) & 0x1F, 16); // Rn
         assert_eq!((insn >> 16) & 0x1F, 18); // Rm
-                                             // Verify top bits: 111_01011_00_0
+        // Verify top bits: 111_01011_00_0
         assert_eq!(insn & 0xFFE0_FC00, 0xEB00_0000);
     }
 
@@ -1328,7 +1328,7 @@ mod tests {
         assert_eq!(insn & 0x1F, 31); // Rd = XZR
         assert_eq!((insn >> 5) & 0x1F, 16); // Rn
         assert_eq!((insn >> 10) & 0xFFF, 1); // imm12
-                                             // Verify opcode: 1_0_1_10001_00 = 0xB1000000
+        // Verify opcode: 1_0_1_10001_00 = 0xB1000000
         assert_eq!(insn & 0xFF00_0000, 0xB100_0000);
     }
 

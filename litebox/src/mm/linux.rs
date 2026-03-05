@@ -11,12 +11,12 @@ use alloc::vec::Vec;
 use rangemap::RangeMap;
 use thiserror::Error;
 
+use crate::platform::PageManagementProvider;
+use crate::platform::RawConstPointer;
 use crate::platform::page_mgmt::AllocationError;
 use crate::platform::page_mgmt::DeallocationError;
 use crate::platform::page_mgmt::FixedAddressBehavior;
 use crate::platform::page_mgmt::MemoryRegionPermissions;
-use crate::platform::PageManagementProvider;
-use crate::platform::RawConstPointer;
 
 /// Page size in bytes
 pub const PAGE_SIZE: usize = 4096;

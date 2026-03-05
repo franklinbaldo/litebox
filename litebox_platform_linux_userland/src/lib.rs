@@ -5,7 +5,10 @@
 
 // Restrict this crate to only work on Linux. For now, we are restricting this to only x86/x86-64
 // Linux, but we _may_ allow for more in the future, if we find it useful to do so.
-#![cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64")))]
+#![cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64")
+))]
 
 use std::cell::Cell;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -1187,16 +1190,13 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         "movk x17, #:tprel_g0_nc:interrupt",
         "ldrb w17, [x18, x17]",
         "cbnz w17, interrupt_callback",
-
         // Load guest_tpidr from TLS.
         "movz x17, #:tprel_g1:guest_tpidr",
         "movk x17, #:tprel_g0_nc:guest_tpidr",
         "ldr x17, [x18, x17]",
-
         // Load guest PC into x18 (we'll branch to it after restoring all regs).
         // x0 = ctx pointer to PtRegs.
-        "ldr x16, [x0, #256]",          // x16 = PtRegs.pc (guest PC)
-
+        "ldr x16, [x0, #256]", // x16 = PtRegs.pc (guest PC)
         // Restore guest registers from PtRegs.
         // We need to restore x0-x15, x19-x30, sp.
         // x16 = guest PC (scratch), x17 = guest_tpidr, x18 = host TLS (will be overwritten)
@@ -1217,23 +1217,17 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         "ldp x25, x26, [x0, #200]",
         "ldp x27, x28, [x0, #216]",
         "ldr x29, [x0, #232]",
-        "ldr x30, [x0, #240]",          // guest LR (x30)
-
+        "ldr x30, [x0, #240]", // guest LR (x30)
         // Load guest SP.
-        "ldr x18, [x0, #248]",          // temporarily hold guest SP in x18
-
+        "ldr x18, [x0, #248]", // temporarily hold guest SP in x18
         // Restore guest x1 (x0 still needed as base pointer).
         "ldr x1, [x0, #8]",
-
         // Switch to guest TPIDR_EL0.
         "msr tpidr_el0, x17",
-
         // Set guest SP.
         "mov sp, x18",
-
         // Now load guest x0 (overwriting ctx pointer — last step).
         "ldr x0, [x0, #0]",
-
         // x16 = guest PC. Branch to it.
         "br x16",
         "switch_to_guest_end:",
@@ -1483,7 +1477,10 @@ impl litebox::platform::TimeProvider for LinuxUserland {
         unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, t.as_mut_ptr()) };
         let t = unsafe { t.assume_init() };
         Instant {
-            #[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), expect(clippy::useless_conversion))]
+            #[cfg_attr(
+                any(target_arch = "x86_64", target_arch = "aarch64"),
+                expect(clippy::useless_conversion)
+            )]
             inner: Duration::new(
                 t.tv_sec.reinterpret_as_unsigned().into(),
                 t.tv_nsec.reinterpret_as_unsigned().truncate(),
@@ -1496,7 +1493,10 @@ impl litebox::platform::TimeProvider for LinuxUserland {
         unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, t.as_mut_ptr()) };
         let t = unsafe { t.assume_init() };
         SystemTime {
-            #[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), expect(clippy::useless_conversion))]
+            #[cfg_attr(
+                any(target_arch = "x86_64", target_arch = "aarch64"),
+                expect(clippy::useless_conversion)
+            )]
             inner: Duration::new(
                 t.tv_sec.reinterpret_as_unsigned().into(),
                 t.tv_nsec.reinterpret_as_unsigned().truncate(),
@@ -2732,10 +2732,9 @@ fn signal_handler_exit_guest(
         let guest_tpidr_ptr = (host_tls as *mut usize).byte_offset(tls_offset_guest_tpidr());
         core::ptr::write_volatile(guest_tpidr_ptr, current_tpidr);
 
-        let ctx_top_ptr =
-            (host_tls as *const usize).byte_offset(tls_offset_guest_context_top());
-        let guest_context_top = core::ptr::read_volatile(ctx_top_ptr)
-            as *mut litebox_common_linux::PtRegs;
+        let ctx_top_ptr = (host_tls as *const usize).byte_offset(tls_offset_guest_context_top());
+        let guest_context_top =
+            core::ptr::read_volatile(ctx_top_ptr) as *mut litebox_common_linux::PtRegs;
         Some(guest_context_top.offset(-1))
     }
 }
@@ -3006,9 +3005,9 @@ unsafe extern "C" fn exception_signal_handler(
     let (trapno, err, cr2) = {
         let fault_addr = sigctx.fault_address;
         (
-            signum as isize,                           // use signal number as trap number
-            0isize,                                     // no error code concept on ARM64
-            fault_addr as isize,                       // fault address
+            signum as isize,     // use signal number as trap number
+            0isize,              // no error code concept on ARM64
+            fault_addr as isize, // fault address
         )
     };
     set_signal_return(context, exception_callback, 0, trapno, err, cr2);
@@ -3151,8 +3150,6 @@ unsafe fn interrupt_signal_handler(
     // Cases 3 and 4: jump to interrupt handler.
     set_signal_return(context, interrupt_callback, 0, 0, 0, 0);
 }
-
-
 
 impl litebox::platform::CrngProvider for LinuxUserland {
     fn fill_bytes_crng(&self, buf: &mut [u8]) {

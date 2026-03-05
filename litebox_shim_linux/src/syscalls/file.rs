@@ -9,7 +9,7 @@ use alloc::{
     vec,
 };
 use litebox::{
-    event::{wait::WaitError, Events},
+    event::{Events, wait::WaitError},
     fd::{FdEnabledSubsystem, MetadataError, TypedFd},
     fs::{Mode, OFlags, SeekWhence},
     path,
@@ -17,8 +17,8 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
-    errno::Errno, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
-    IoReadVec, IoWriteVec, IoctlArg, TimeParam,
+    AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, IoReadVec,
+    IoWriteVec, IoctlArg, TimeParam, errno::Errno,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -1225,8 +1225,8 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle syscall `chdir`
     pub fn sys_chdir(&self, pathname: impl path::Arg) -> Result<(), Errno> {
-        use litebox::fs::errors::{FileStatusError, PathError};
         use litebox::fs::FileType;
+        use litebox::fs::errors::{FileStatusError, PathError};
         use litebox::path::Arg as _;
 
         // Resolve relative paths against CWD, then normalize (handle `.` / `..`).

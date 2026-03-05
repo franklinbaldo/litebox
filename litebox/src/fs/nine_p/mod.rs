@@ -15,14 +15,14 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use thiserror::Error;
 
+use crate::fs::OFlags;
 use crate::fs::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
     ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
 };
 use crate::fs::nine_p::fcall::Rlerror;
-use crate::fs::OFlags;
 use crate::path::Arg;
-use crate::{sync, LiteBox};
+use crate::{LiteBox, sync};
 
 mod client;
 mod fcall;

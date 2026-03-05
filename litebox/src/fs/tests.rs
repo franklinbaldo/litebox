@@ -2,10 +2,10 @@
 // Licensed under the MIT license.
 
 mod in_mem {
+    use crate::LiteBox;
     use crate::fs::in_mem;
     use crate::fs::{FileSystem as _, Mode, OFlags};
     use crate::platform::mock::MockPlatform;
-    use crate::LiteBox;
     use alloc::vec;
     use alloc::vec::Vec;
     extern crate std;
@@ -859,10 +859,10 @@ mod in_mem {
 }
 
 mod tar_ro {
+    use crate::LiteBox;
     use crate::fs::tar_ro;
     use crate::fs::{FileSystem as _, Mode, OFlags};
     use crate::platform::mock::MockPlatform;
-    use crate::LiteBox;
     use alloc::vec;
     use alloc::vec::Vec;
     extern crate std;
@@ -1012,10 +1012,10 @@ mod tar_ro {
 }
 
 mod layered {
-    use crate::fs::{in_mem, layered, tar_ro};
-    use crate::fs::{FileSystem as _, FileType, Mode, OFlags};
-    use crate::platform::mock::MockPlatform;
     use crate::LiteBox;
+    use crate::fs::{FileSystem as _, FileType, Mode, OFlags};
+    use crate::fs::{in_mem, layered, tar_ro};
+    use crate::platform::mock::MockPlatform;
     use alloc::vec;
     use alloc::vec::Vec;
     extern crate std;
@@ -1885,9 +1885,9 @@ mod layered {
 }
 
 mod stdio {
+    use crate::LiteBox;
     use crate::fs::{FileSystem as _, Mode, OFlags};
     use crate::platform::mock::MockPlatform;
-    use crate::LiteBox;
     use alloc::vec;
     extern crate std;
 
@@ -1954,11 +1954,11 @@ mod stdio {
 }
 
 mod layered_stdio {
-    use crate::fs::layered::LayeringSemantics;
-    use crate::fs::{devices, in_mem, layered};
-    use crate::fs::{FileSystem as _, Mode, OFlags};
-    use crate::platform::mock::MockPlatform;
     use crate::LiteBox;
+    use crate::fs::layered::LayeringSemantics;
+    use crate::fs::{FileSystem as _, Mode, OFlags};
+    use crate::fs::{devices, in_mem, layered};
+    use crate::platform::mock::MockPlatform;
     use alloc::vec;
     extern crate std;
 

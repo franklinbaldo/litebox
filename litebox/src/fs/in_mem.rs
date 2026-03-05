@@ -8,9 +8,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 
+use crate::LiteBox;
 use crate::path::Arg;
 use crate::sync;
-use crate::LiteBox;
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,

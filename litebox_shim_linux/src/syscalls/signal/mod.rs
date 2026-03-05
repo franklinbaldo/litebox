@@ -32,10 +32,10 @@ use litebox::{
     utils::ReinterpretUnsignedExt as _,
 };
 use litebox_common_linux::signal::{
-    SaFlags, SigAction, SigAltStack, SigSet, Siginfo, SiginfoData, SigmaskHow, Signal, SsFlags,
-    Ucontext, MINSIGSTKSZ, NSIG, SIG_DFL, SIG_IGN, SI_KERNEL, SI_USER,
+    MINSIGSTKSZ, NSIG, SI_KERNEL, SI_USER, SIG_DFL, SIG_IGN, SaFlags, SigAction, SigAltStack,
+    SigSet, Siginfo, SiginfoData, SigmaskHow, Signal, SsFlags, Ucontext,
 };
-use litebox_common_linux::{errno::Errno, PtRegs};
+use litebox_common_linux::{PtRegs, errno::Errno};
 use litebox_platform_multiplex::Platform;
 
 pub(crate) struct SignalState {

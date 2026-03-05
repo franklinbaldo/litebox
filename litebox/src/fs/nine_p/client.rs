@@ -11,9 +11,9 @@ use core::sync::atomic::{AtomicU16, Ordering};
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 use crate::utils::id_pool::IdPool;
 
+use super::Error;
 use super::fcall::{self, Fcall, FcallStr, GetattrMask, TaggedFcall};
 use super::transport::{self, Read, Write};
-use super::Error;
 
 /// Fid generator with thread-safe access
 struct FidGenerator<Platform: RawSyncPrimitivesProvider> {
