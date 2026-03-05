@@ -1375,6 +1375,15 @@ impl<FS: ShimFS> Task<FS> {
             ctx.xgs.truncate(),
         );
 
+        // Reset the aarch64 TLS table and sigreturn trampoline global addresses.
+        // release_memory() above unmapped the pages backing these, so the stale
+        // addresses must be cleared before load_program() re-allocates them.
+        #[cfg(target_arch = "aarch64")]
+        {
+            litebox_common_linux::HOST_TLS_TABLE_ADDR.store(0, Ordering::Release);
+            litebox_common_linux::SIGRETURN_TRAMPOLINE_ADDR.store(0, Ordering::Release);
+        }
+
         self.load_program(loader, argv_vec, envp_vec)
             .expect("TODO: terminate the process cleanly");
 

@@ -233,7 +233,7 @@ fn find_c_test_files(dir: &str) -> Vec<PathBuf> {
 }
 
 // our rtld_audit does not support x86 yet
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn test_dynamic_lib_with_rewriter() {
     for path in find_c_test_files("./tests") {
@@ -241,6 +241,16 @@ fn test_dynamic_lib_with_rewriter() {
             .file_stem()
             .and_then(|s| s.to_str())
             .expect("failed to get file stem");
+
+        // TODO(aarch64): thread_exit triggers SIGSEGV during multi-threaded exit
+        // because the interrupt signal handler does not yet handle the case where
+        // a thread is mid-trampoline (see "FUTURE: handle trampoline code" comment
+        // in litebox_platform_linux_userland).
+        #[cfg(target_arch = "aarch64")]
+        if stem == "thread_exit" {
+            continue;
+        }
+
         let unique_name = format!("{stem}_rewriter");
         let target = common::compile(path.to_str().unwrap(), &unique_name, false, false);
         Runner::new(Backend::Rewriter, &target, &unique_name).run();
@@ -248,16 +258,20 @@ fn test_dynamic_lib_with_rewriter() {
 }
 
 #[test]
-#[cfg_attr(
-    target_arch = "aarch64",
-    ignore = "Pre-existing SIGSEGV in execve/thread_exit tests on aarch64"
-)]
 fn test_static_exec_with_rewriter() {
     for path in find_c_test_files("./tests") {
         let stem = path
             .file_stem()
             .and_then(|s| s.to_str())
             .expect("failed to get file stem");
+
+        // TODO(aarch64): thread_exit triggers SIGSEGV during multi-threaded exit
+        // (same root cause as in test_dynamic_lib_with_rewriter above).
+        #[cfg(target_arch = "aarch64")]
+        if stem == "thread_exit" {
+            continue;
+        }
+
         let unique_name = format!("{stem}_exec_rewriter");
         let target = common::compile(path.to_str().unwrap(), &unique_name, true, false);
         Runner::new(Backend::Rewriter, &target, &unique_name).run();
