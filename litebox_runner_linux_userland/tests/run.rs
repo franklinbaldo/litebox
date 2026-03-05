@@ -233,7 +233,7 @@ fn find_c_test_files(dir: &str) -> Vec<PathBuf> {
 }
 
 // our rtld_audit does not support x86 yet
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn test_dynamic_lib_with_rewriter() {
     for path in find_c_test_files("./tests") {
