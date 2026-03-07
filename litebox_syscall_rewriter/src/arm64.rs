@@ -22,68 +22,95 @@ const NR_RT_SIGRETURN: u16 = 139;
 const MSR_TPIDR_EL0_MASK: u32 = 0xFFFF_FFE0;
 const MSR_TPIDR_EL0_BITS: u32 = 0xD51B_D040;
 
-/// Number of instructions in each per-SVC trampoline snippet.
+// ============================================================
+// Shared trampoline layout constants
+// ============================================================
+
+/// Number of instructions in the shared SVC handler (14 insns, 56 bytes).
 ///
-/// Layout (19 instructions, 76 bytes):
 /// ```text
-///  [0] SUB SP, SP, #32
-///  [1] STR X16, [SP, #0]
-///  [2] STR X17, [SP, #8]
-///  [3] STR X30, [SP, #16]
-///  [4] MRS X18, TPIDR_EL0
-///  [5] STR X18, [SP, #24]       ; save guest TPIDR for syscall_callback
-///  [6] LDR X17, [PC, #off]     ; TLS table ptr from trampoline offset 8
-///  [7] LDR X16, [X17, #0]      ; .Lloop
-///  [8] CMN X16, #1
-///  [9] B.EQ .Ldone              ; -> [15]
-/// [10] CMP X16, X18
-/// [11] B.EQ .Lfound             ; -> [14]
-/// [12] ADD X17, X17, #16
-/// [13] B .Lloop                 ; -> [7]
-/// [14] LDR X18, [X17, #8]      ; .Lfound
-/// [15] ADRP X30, <return_page>  ; .Ldone
-/// [16] ADD X30, X30, #<pageoff> ; return_addr = site.vaddr + 4
-/// [17] LDR X16, [PC, #off]     ; callback from trampoline offset 0
-/// [18] BR X16
+///  [0] MRS  X18, TPIDR_EL0
+///  [1] STR  X18, [SP, #24]       ; save guest TPIDR
+///  [2] LDR  X17, [PC, #off]      ; TLS table ptr from header offset 8
+///  [3] LDR  X16, [X17, #0]       ; .Lloop
+///  [4] CMN  X16, #1              ; sentinel?
+///  [5] B.EQ .Ldone               ; -> [11]
+///  [6] CMP  X16, X18             ; match guest TPIDR?
+///  [7] B.EQ .Lfound              ; -> [10]
+///  [8] ADD  X17, X17, #16        ; next entry
+///  [9] B    .Lloop               ; -> [3]
+/// [10] LDR  X18, [X17, #8]       ; .Lfound: host TLS
+/// [11] LDR  X16, [PC, #off]      ; .Ldone: callback addr from header offset 0
+/// [12] BR   X16                   ; jump to callback
+/// [13] NOP                        ; pad to 56 bytes (14 insns) for alignment
 /// ```
-const SVC_SNIPPET_INSN_COUNT: usize = 19;
+const SHARED_SVC_HANDLER_INSN_COUNT: usize = 14;
 
-/// Size in bytes of each per-SVC trampoline snippet.
-const SVC_SNIPPET_SIZE: usize = SVC_SNIPPET_INSN_COUNT * 4; // 76
+/// Size in bytes of the shared SVC handler.
+const SHARED_SVC_HANDLER_SIZE: usize = SHARED_SVC_HANDLER_INSN_COUNT * 4; // 56
 
-/// Number of instructions in each per-MSR TPIDR_EL0 trampoline snippet.
+/// Number of instructions in each per-site SVC gate (6 insns, 24 bytes).
 ///
-/// Layout (24 instructions, 96 bytes):
 /// ```text
-///  [0] SUB SP, SP, #32
-///  [1] STR X16, [SP, #0]
-///  [2] STR X17, [SP, #8]
-///  [3] STR X30, [SP, #16]
-///  [4] <store new TPIDR to [SP, #24]>   ; varies by Xt (insn 1 of 2)
-///  [5] <store new TPIDR to [SP, #24]>   ; varies by Xt (insn 2 of 2, may be NOP)
-///  [6] MRS X16, TPIDR_EL0              ; X16 = old guest TPIDR
-///  [7] LDR X17, [PC, #off]             ; X17 = TLS table ptr
-///  [8] LDR X30, [X17, #0]              ; .Lloop: load guest_tpidr
-///  [9] CMN X30, #1                     ; sentinel?
-/// [10] B.EQ .Ldone                     ; -> [17]
-/// [11] CMP X30, X16                    ; match old TPIDR?
-/// [12] B.EQ .Lfound                    ; -> [15]
-/// [13] ADD X17, X17, #16              ; next entry
-/// [14] B .Lloop                        ; -> [8]
-/// [15] LDR X30, [SP, #24]             ; .Lfound: new tpidr value
-/// [16] STR X30, [X17, #0]             ; update table entry's guest_tpidr
-/// [17] LDR X30, [SP, #24]             ; .Ldone: new tpidr value
-/// [18] MSR TPIDR_EL0, X30             ; execute actual MSR
-/// [19] LDR X30, [SP, #16]             ; restore X30
-/// [20] LDR X17, [SP, #8]              ; restore X17
-/// [21] LDR X16, [SP, #0]              ; restore X16
-/// [22] ADD SP, SP, #32
-/// [23] B <return_addr>                 ; branch back
+/// [0] SUB  SP, SP, #32
+/// [1] STP  X16, X17, [SP]        ; save X16, X17
+/// [2] STR  X30, [SP, #16]        ; save guest LR
+/// [3] ADRP X30, <return_page>    ; return addr = site.vaddr + 4 (high bits)
+/// [4] ADD  X30, X30, #<pageoff>  ; return addr (low 12 bits)
+/// [5] B    <shared_svc_handler>  ; branch to shared handler
 /// ```
-const MSR_SNIPPET_INSN_COUNT: usize = 24;
+const SVC_GATE_INSN_COUNT: usize = 6;
 
-/// Size in bytes of each per-MSR TPIDR_EL0 trampoline snippet.
-const MSR_SNIPPET_SIZE: usize = MSR_SNIPPET_INSN_COUNT * 4; // 96
+/// Size in bytes of each per-site SVC gate.
+const SVC_GATE_SIZE: usize = SVC_GATE_INSN_COUNT * 4; // 24
+
+/// Number of instructions in the shared MSR handler (16 insns, 64 bytes).
+///
+/// ```text
+///  [0] STR  X30, [SP, #32]       ; save BL return addr
+///  [1] MRS  X16, TPIDR_EL0       ; old guest TPIDR
+///  [2] LDR  X17, [PC, #off]      ; TLS table ptr from header offset 8
+///  [3] LDR  X30, [X17, #0]       ; .Lloop (X30 as scratch)
+///  [4] CMN  X30, #1              ; sentinel?
+///  [5] B.EQ .Ldone               ; -> [11]
+///  [6] CMP  X30, X16             ; match old TPIDR?
+///  [7] B.EQ .Lfound              ; -> [10]
+///  [8] ADD  X17, X17, #16        ; next entry
+///  [9] B    .Lloop               ; -> [3]
+/// [10] LDR  X16, [SP, #24]       ; .Lfound: new TPIDR from stack
+/// [11] STR  X16, [X17, #0]       ; update table entry
+/// [12] LDR  X16, [SP, #24]       ; .Ldone: new TPIDR
+/// [13] MSR  TPIDR_EL0, X16       ; execute actual MSR
+/// [14] LDR  X30, [SP, #32]       ; restore BL return addr
+/// [15] RET                        ; return to gate epilogue
+/// ```
+const SHARED_MSR_HANDLER_INSN_COUNT: usize = 16;
+
+/// Size in bytes of the shared MSR handler.
+const SHARED_MSR_HANDLER_SIZE: usize = SHARED_MSR_HANDLER_INSN_COUNT * 4; // 64
+
+/// Number of instructions in each per-site MSR gate (general case: 9 insns, 36 bytes).
+///
+/// ```text
+/// [0] SUB  SP, SP, #48           ; 48-byte frame
+/// [1] STP  X16, X17, [SP]        ; save X16, X17
+/// [2] STR  X30, [SP, #16]        ; save guest LR
+/// [3] STR  Xt,  [SP, #24]        ; store new TPIDR value (varies by Xt)
+/// [4] BL   shared_msr_handler    ; call shared handler
+/// [5] LDP  X16, X17, [SP]        ; restore X16, X17
+/// [6] LDR  X30, [SP, #16]        ; restore guest LR
+/// [7] ADD  SP, SP, #48           ; deallocate frame
+/// [8] B    <return_addr>          ; branch back to site.vaddr + 4
+/// ```
+///
+/// Special register cases (X16, X17, X30) use 10 instructions (40 bytes).
+const MSR_GATE_INSN_COUNT: usize = 9;
+
+/// Size in bytes of each per-site MSR gate (general case).
+const MSR_GATE_SIZE: usize = MSR_GATE_INSN_COUNT * 4; // 36
+
+/// Size in bytes of each per-site MSR gate for special registers (X16, X17, X30).
+const MSR_GATE_SPECIAL_SIZE: usize = (MSR_GATE_INSN_COUNT + 1) * 4; // 40
 
 /// ARM64 NOP instruction.
 const NOP: u32 = 0xD503201F;
@@ -98,12 +125,18 @@ const HEADER_TLS_TABLE_OFFSET: usize = 8;
 #[allow(dead_code)] // Documenting the layout; used by tests
 const HEADER_SIGRETURN_OFFSET: usize = 16;
 
-/// Offset where the sigreturn SVC snippet begins (full 76-byte SVC snippet).
+/// Offset where the sigreturn SVC gate begins (24 bytes).
 /// Called from the sigreturn preamble at offset 16 via `B .+8`.
-const SIGRETURN_SNIPPET_OFFSET: usize = 24;
+const SIGRETURN_GATE_OFFSET: usize = 24;
 
-/// Offset where per-site snippets begin (after sigreturn SVC snippet).
-const SNIPPETS_START_OFFSET: usize = SIGRETURN_SNIPPET_OFFSET + SVC_SNIPPET_SIZE;
+/// Offset where the shared SVC handler begins.
+const SHARED_SVC_HANDLER_OFFSET: usize = SIGRETURN_GATE_OFFSET + SVC_GATE_SIZE; // 48
+
+/// Offset where the shared MSR handler begins.
+const SHARED_MSR_HANDLER_OFFSET: usize = SHARED_SVC_HANDLER_OFFSET + SHARED_SVC_HANDLER_SIZE; // 104
+
+/// Offset where per-site gates begin (after shared MSR handler).
+const GATES_START_OFFSET: usize = SHARED_MSR_HANDLER_OFFSET + SHARED_MSR_HANDLER_SIZE; // 168
 
 // ============================================================
 // Instruction encoders
@@ -343,6 +376,84 @@ fn encode_mov_reg(rd: u8, rm: u8) -> u32 {
     0xAA00_03E0 | (u32::from(rm) << 16) | u32::from(rd)
 }
 
+/// Encode `STP Xt1, Xt2, [Xn, #imm]` (store pair, 64-bit, signed offset).
+///
+/// Stores two 64-bit registers to memory at base + signed immediate offset.
+/// The offset must be a multiple of 8 and within [-512, 504].
+///
+/// Encoding: opc=10, V=0, L=0 (store), imm7=offset/8, Rt2, Rn, Rt
+fn encode_stp_offset(rt: u8, rt2: u8, rn: u8, imm_bytes: i16) -> Option<u32> {
+    if imm_bytes % 8 != 0 {
+        return None;
+    }
+    let imm7 = imm_bytes / 8;
+    if !(-64..=63).contains(&imm7) {
+        return None;
+    }
+    #[allow(clippy::cast_sign_loss)] // Masked to 7 bits; sign bit is intentionally truncated
+    let imm7_u = (imm7 as u32) & 0x7F;
+    // 10_101_0_010_0_imm7_Rt2_Rn_Rt
+    // = 0xA9000000 | (imm7 << 15) | (Rt2 << 10) | (Rn << 5) | Rt
+    Some(
+        0xA900_0000
+            | (imm7_u << 15)
+            | (u32::from(rt2) << 10)
+            | (u32::from(rn) << 5)
+            | u32::from(rt),
+    )
+}
+
+/// Encode `LDP Xt1, Xt2, [Xn, #imm]` (load pair, 64-bit, signed offset).
+///
+/// Loads two 64-bit values from memory at base + signed immediate offset.
+/// The offset must be a multiple of 8 and within [-512, 504].
+///
+/// Encoding: opc=10, V=0, L=1 (load), imm7=offset/8, Rt2, Rn, Rt
+fn encode_ldp_offset(rt: u8, rt2: u8, rn: u8, imm_bytes: i16) -> Option<u32> {
+    if imm_bytes % 8 != 0 {
+        return None;
+    }
+    let imm7 = imm_bytes / 8;
+    if !(-64..=63).contains(&imm7) {
+        return None;
+    }
+    #[allow(clippy::cast_sign_loss)] // Masked to 7 bits; sign bit is intentionally truncated
+    let imm7_u = (imm7 as u32) & 0x7F;
+    // 10_101_0_010_1_imm7_Rt2_Rn_Rt
+    // = 0xA9400000 | (imm7 << 15) | (Rt2 << 10) | (Rn << 5) | Rt
+    Some(
+        0xA940_0000
+            | (imm7_u << 15)
+            | (u32::from(rt2) << 10)
+            | (u32::from(rn) << 5)
+            | u32::from(rt),
+    )
+}
+
+/// Encode `BL` (branch with link) instruction to a PC-relative offset.
+///
+/// The offset must be a multiple of 4 and within ±128MB (signed 26-bit instruction count).
+/// Encoding: `[31:26] = 0b100101`, `[25:0] = signed offset / 4`
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn encode_bl(offset: i64) -> Option<u32> {
+    if offset % 4 != 0 {
+        return None;
+    }
+    let imm26 = offset >> 2;
+    if !(-(1 << 25)..(1 << 25)).contains(&imm26) {
+        return None;
+    }
+    Some(0x94000000 | ((imm26 as u32) & 0x03FF_FFFF))
+}
+
+/// Encode `RET {Xn}` (return from subroutine).
+///
+/// Branches to the address in the specified register (default X30).
+/// Encoding: `0xD65F0000 | (Rn << 5)`
+fn encode_ret(rn: u8) -> u32 {
+    0xD65F_0000 | (u32::from(rn) << 5)
+}
+
 // ============================================================
 // SVC site scanning
 // ============================================================
@@ -414,23 +525,23 @@ fn find_patch_sites(sections: &[TextSectionInfo], buf: &[u8]) -> Result<Vec<Patc
 /// Hook all `SVC #0` instructions in an AArch64 ELF binary.
 ///
 /// This function:
-/// 1. Scans for SVC #0 instructions in executable sections
-/// 2. Builds trampoline code with a sigreturn stub and per-SVC snippets
-/// 3. Patches each SVC #0 with a `B` (branch) to its trampoline snippet
+/// 1. Scans for SVC #0 and MSR TPIDR_EL0 instructions in executable sections
+/// 2. Builds a shared trampoline with header, shared handlers, and per-site gates
+/// 3. Patches each instruction with a `B` (branch) to its per-site gate
 ///
 /// Returns `(trampoline_data, found_any_syscalls)`.
 ///
 /// # Trampoline layout
 ///
 /// ```text
-/// Offset 0:     syscall_callback address (8 bytes, initially 0 or provided)
-/// Offset 8:     TLS lookup table pointer (8 bytes, initially 0, filled at load time)
-/// Offset 16:    Sigreturn trampoline (8 bytes = 2 instructions):
-///                 MOV X8, #139     // __NR_rt_sigreturn
-///                 SVC #0           // (NOT patched — it's in the trampoline)
-/// Offset 24+:   Per-site trampoline snippets:
-///                 - SVC sites: 68 bytes each (17 instructions)
-///                 - MSR TPIDR_EL0 sites: 96 bytes each (24 instructions)
+/// Offset 0:     [8 bytes]   syscall_callback address
+/// Offset 8:     [8 bytes]   TLS lookup table pointer
+/// Offset 16:    [8 bytes]   Sigreturn preamble (MOV X8, #139 + B .+4)
+/// Offset 24:    [24 bytes]  Sigreturn SVC gate
+/// Offset 48:    [56 bytes]  Shared SVC handler
+/// Offset 104:   [64 bytes]  Shared MSR handler
+/// Offset 168:   Per-site SVC gates (24 bytes each)
+///               Per-site MSR gates (36-40 bytes each)
 /// ```
 pub(crate) fn hook_syscalls_aarch64(
     buf: &mut [u8],
@@ -444,8 +555,8 @@ pub(crate) fn hook_syscalls_aarch64(
     // Check if there are any SVC instructions to patch
     let has_svc = sites.iter().any(|s| s.kind == PatchKind::Svc);
     if !has_svc {
-        // No SVC instructions found. Produce a minimal trampoline containing just
-        // the callback address slot, TLS table pointer, and the sigreturn preamble.
+        // No SVC instructions found. Produce a minimal trampoline containing
+        // the full shared layout (header + sigreturn gate + shared handlers).
         // This is needed for dynamically linked binaries where all syscalls are in
         // shared libraries — the rtld_audit library reads the callback address from
         // the main binary's trampoline region (via parse_object), so we must provide
@@ -457,22 +568,47 @@ pub(crate) fn hook_syscalls_aarch64(
         trampoline_data.extend_from_slice(&0u64.to_le_bytes());
         // Offset 16: sigreturn preamble — MOV X8, #139; B .+4
         trampoline_data.extend_from_slice(&encode_movz_x(8, NR_RT_SIGRETURN).to_le_bytes());
-        let b_to_snippet = encode_b(4).expect("offset +4 always valid");
-        trampoline_data.extend_from_slice(&b_to_snippet.to_le_bytes());
-        // Offset 24: sigreturn SVC snippet (76 bytes)
-        let sigret_snippet_vaddr = trampoline_base_addr + SIGRETURN_SNIPPET_OFFSET as u64;
+        let b_to_gate = encode_b(4).expect("offset +4 always valid");
+        trampoline_data.extend_from_slice(&b_to_gate.to_le_bytes());
+
+        debug_assert_eq!(trampoline_data.len(), SIGRETURN_GATE_OFFSET);
+
+        // Offset 24: sigreturn SVC gate (24 bytes)
+        // rt_sigreturn never returns, so the return address doesn't matter —
+        // we use the gate's own address as a dummy.
+        let sigret_gate_vaddr = trampoline_base_addr + SIGRETURN_GATE_OFFSET as u64;
         let sigret_dummy_site = PatchSite {
             file_offset: 0,
-            vaddr: sigret_snippet_vaddr,
+            vaddr: sigret_gate_vaddr,
             kind: PatchKind::Svc,
         };
-        emit_svc_snippet(
+        emit_svc_gate(
             &mut trampoline_data,
-            sigret_snippet_vaddr,
-            SIGRETURN_SNIPPET_OFFSET,
+            SIGRETURN_GATE_OFFSET,
             trampoline_base_addr,
             &sigret_dummy_site,
         )?;
+
+        debug_assert_eq!(trampoline_data.len(), SHARED_SVC_HANDLER_OFFSET);
+
+        // Offset 48: shared SVC handler (56 bytes)
+        emit_shared_svc_handler(
+            &mut trampoline_data,
+            SHARED_SVC_HANDLER_OFFSET,
+            trampoline_base_addr,
+        )?;
+
+        debug_assert_eq!(trampoline_data.len(), SHARED_MSR_HANDLER_OFFSET);
+
+        // Offset 104: shared MSR handler (64 bytes)
+        emit_shared_msr_handler(
+            &mut trampoline_data,
+            SHARED_MSR_HANDLER_OFFSET,
+            trampoline_base_addr,
+        )?;
+
+        debug_assert_eq!(trampoline_data.len(), GATES_START_OFFSET);
+
         return Ok((trampoline_data, false));
     }
 
@@ -488,57 +624,64 @@ pub(crate) fn hook_syscalls_aarch64(
     // Offset 16: sigreturn preamble
     // MOV X8, #NR_RT_SIGRETURN (= 139)
     trampoline_data.extend_from_slice(&encode_movz_x(8, NR_RT_SIGRETURN).to_le_bytes());
-    // B .+4 — branch forward to the sigreturn SVC snippet at offset 24
-    // (We can't use a raw SVC #0 here because on aarch64 with the rewriter
-    // backend there's no seccomp filter, so the SVC would go directly to the
-    // host kernel which would fail. Instead we branch to a full SVC snippet
-    // that goes through the litebox callback.)
-    // The B instruction is at offset 20, snippet is at offset 24, delta = 4.
-    let b_to_snippet = encode_b(4).expect("offset +4 always valid");
-    trampoline_data.extend_from_slice(&b_to_snippet.to_le_bytes());
+    // B .+4 — branch forward to the sigreturn SVC gate at offset 24
+    let b_to_gate = encode_b(4).expect("offset +4 always valid");
+    trampoline_data.extend_from_slice(&b_to_gate.to_le_bytes());
 
-    debug_assert_eq!(trampoline_data.len(), SIGRETURN_SNIPPET_OFFSET);
+    debug_assert_eq!(trampoline_data.len(), SIGRETURN_GATE_OFFSET);
 
-    // Offset 24: sigreturn SVC snippet (76 bytes)
-    // This is a full SVC snippet that routes through the syscall callback.
-    // rt_sigreturn never returns, so the return address doesn't matter —
-    // we use the snippet's own address as a dummy.
-    let sigret_snippet_vaddr = trampoline_base_addr + SIGRETURN_SNIPPET_OFFSET as u64;
+    // Offset 24: sigreturn SVC gate (24 bytes)
+    let sigret_gate_vaddr = trampoline_base_addr + SIGRETURN_GATE_OFFSET as u64;
     let sigret_dummy_site = PatchSite {
-        file_offset: 0, // unused — we don't patch any original instruction for this
-        vaddr: sigret_snippet_vaddr, // return_addr = vaddr + 4, but rt_sigreturn never returns
+        file_offset: 0,
+        vaddr: sigret_gate_vaddr,
         kind: PatchKind::Svc,
     };
-    emit_svc_snippet(
+    emit_svc_gate(
         &mut trampoline_data,
-        sigret_snippet_vaddr,
-        SIGRETURN_SNIPPET_OFFSET,
+        SIGRETURN_GATE_OFFSET,
         trampoline_base_addr,
         &sigret_dummy_site,
     )?;
 
-    debug_assert_eq!(trampoline_data.len(), SNIPPETS_START_OFFSET);
+    debug_assert_eq!(trampoline_data.len(), SHARED_SVC_HANDLER_OFFSET);
 
-    // Generate per-site trampoline snippets and patch original code
+    // Offset 48: shared SVC handler (56 bytes)
+    emit_shared_svc_handler(
+        &mut trampoline_data,
+        SHARED_SVC_HANDLER_OFFSET,
+        trampoline_base_addr,
+    )?;
+
+    debug_assert_eq!(trampoline_data.len(), SHARED_MSR_HANDLER_OFFSET);
+
+    // Offset 104: shared MSR handler (64 bytes)
+    emit_shared_msr_handler(
+        &mut trampoline_data,
+        SHARED_MSR_HANDLER_OFFSET,
+        trampoline_base_addr,
+    )?;
+
+    debug_assert_eq!(trampoline_data.len(), GATES_START_OFFSET);
+
+    // Generate per-site gates and patch original code
     for site in &sites {
-        let snippet_offset = trampoline_data.len();
-        let snippet_vaddr = trampoline_base_addr + snippet_offset as u64;
+        let gate_offset = trampoline_data.len();
+        let gate_vaddr = trampoline_base_addr + gate_offset as u64;
 
         match site.kind {
             PatchKind::Svc => {
-                emit_svc_snippet(
+                emit_svc_gate(
                     &mut trampoline_data,
-                    snippet_vaddr,
-                    snippet_offset,
+                    gate_offset,
                     trampoline_base_addr,
                     site,
                 )?;
             }
             PatchKind::MsrTpidr(rt) => {
-                emit_msr_tpidr_snippet(
+                emit_msr_gate(
                     &mut trampoline_data,
-                    snippet_vaddr,
-                    snippet_offset,
+                    gate_offset,
                     trampoline_base_addr,
                     site,
                     rt,
@@ -546,13 +689,13 @@ pub(crate) fn hook_syscalls_aarch64(
             }
         }
 
-        // Patch original instruction with B <snippet>
-        let b_offset = snippet_vaddr.cast_signed() - site.vaddr.cast_signed();
+        // Patch original instruction with B <gate>
+        let b_offset = gate_vaddr.cast_signed() - site.vaddr.cast_signed();
         let b_insn = encode_b(b_offset).ok_or_else(|| {
             Error::DisassemblyFailure(format!(
-                "Branch offset {:#x} out of ±128MB range for site at {:#x}. \
+                "Branch offset {b_offset:#x} out of ±128MB range for site at {:#x}. \
                  Binary too large for direct branch patching.",
-                b_offset, site.vaddr
+                site.vaddr
             ))
         })?;
 
@@ -562,54 +705,33 @@ pub(crate) fn hook_syscalls_aarch64(
     Ok((trampoline_data, true))
 }
 
-/// Emit a per-SVC trampoline snippet (17 instructions, 68 bytes).
+/// Emit the shared SVC handler (14 instructions, 56 bytes).
 ///
-/// This snippet saves registers, looks up the host TLS from the TLS table,
-/// then jumps to the syscall callback.
+/// This handler is shared by all SVC gates. It looks up the host TLS from
+/// the TLS table, saves the guest TPIDR, and jumps to the syscall callback.
+///
+/// At entry (from per-site SVC gate):
+/// - SP decremented by 32, with `[0]=X16, [8]=X17, [16]=guest_LR` already saved
+/// - X30 = guest return address (set by gate via ADRP+ADD)
+/// - All other registers = live guest values
+///
+/// This handler fills `[SP, #24]` with guest TPIDR, loads host TLS into X18,
+/// and branches to the callback via the address at trampoline offset 0.
 #[allow(clippy::cast_possible_wrap)]
-fn emit_svc_snippet(
+fn emit_shared_svc_handler(
     trampoline_data: &mut Vec<u8>,
-    snippet_vaddr: u64,
-    snippet_offset: usize,
+    handler_offset: usize,
     trampoline_base_addr: u64,
-    site: &PatchSite,
 ) -> Result<()> {
+    let handler_vaddr = trampoline_base_addr + handler_offset as u64;
     let mut insn_idx: usize = 0;
-    let insn_vaddr = |idx: usize| -> u64 { snippet_vaddr + (idx as u64) * 4 };
+    let insn_vaddr = |idx: usize| -> u64 { handler_vaddr + (idx as u64) * 4 };
 
-    // [0] SUB SP, SP, #32
-    trampoline_data.extend_from_slice(&encode_sub_sp_imm(32).expect("imm12=32 fits").to_le_bytes());
-    insn_idx += 1;
-
-    // [1] STR X16, [SP, #0]
-    trampoline_data.extend_from_slice(
-        &encode_str_imm_unsigned(16, 31, 0)
-            .expect("offset 0 valid")
-            .to_le_bytes(),
-    );
-    insn_idx += 1;
-
-    // [2] STR X17, [SP, #8]
-    trampoline_data.extend_from_slice(
-        &encode_str_imm_unsigned(17, 31, 8)
-            .expect("offset 8 valid")
-            .to_le_bytes(),
-    );
-    insn_idx += 1;
-
-    // [3] STR X30, [SP, #16]
-    trampoline_data.extend_from_slice(
-        &encode_str_imm_unsigned(30, 31, 16)
-            .expect("offset 16 valid")
-            .to_le_bytes(),
-    );
-    insn_idx += 1;
-
-    // [4] MRS X18, TPIDR_EL0
+    // [0] MRS X18, TPIDR_EL0
     trampoline_data.extend_from_slice(&encode_mrs_tpidr_el0(18).to_le_bytes());
     insn_idx += 1;
 
-    // [5] STR X18, [SP, #24] — save guest TPIDR so syscall_callback can read it
+    // [1] STR X18, [SP, #24] — save guest TPIDR
     trampoline_data.extend_from_slice(
         &encode_str_imm_unsigned(18, 31, 24)
             .expect("offset 24 valid")
@@ -617,20 +739,19 @@ fn emit_svc_snippet(
     );
     insn_idx += 1;
 
-    // [6] LDR X17, [PC, #offset_to_tls_table_ptr]
+    // [2] LDR X17, [PC, #offset_to_tls_table_ptr]
     let ldr_tls_vaddr = insn_vaddr(insn_idx);
     let tls_table_vaddr = trampoline_base_addr + HEADER_TLS_TABLE_OFFSET as u64;
     let ldr_tls_offset = tls_table_vaddr.cast_signed() - ldr_tls_vaddr.cast_signed();
     let ldr_tls_insn = encode_ldr_literal(17, ldr_tls_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
-            "LDR literal offset {:#x} out of range for TLS table load at SVC {:#x}",
-            ldr_tls_offset, site.vaddr
+            "LDR literal offset {ldr_tls_offset:#x} out of range for shared SVC handler TLS load"
         ))
     })?;
     trampoline_data.extend_from_slice(&ldr_tls_insn.to_le_bytes());
     insn_idx += 1;
 
-    // [7] .Lloop: LDR X16, [X17, #0]
+    // [3] .Lloop: LDR X16, [X17, #0]
     let loop_idx = insn_idx;
     trampoline_data.extend_from_slice(
         &encode_ldr_imm_unsigned(16, 17, 0)
@@ -639,39 +760,37 @@ fn emit_svc_snippet(
     );
     insn_idx += 1;
 
-    // [8] CMN X16, #1
+    // [4] CMN X16, #1
     trampoline_data.extend_from_slice(&encode_cmn_imm(16, 1).expect("imm12=1 fits").to_le_bytes());
     insn_idx += 1;
 
-    // [9] B.EQ .Ldone -> instruction [15]
-    let done_idx = 15usize;
+    // [5] B.EQ .Ldone -> [11]
+    let done_idx = 11usize;
     let beq_done_offset = (done_idx as i64 - insn_idx as i64) * 4;
     let beq_done = encode_b_cond(COND_EQ, beq_done_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
-            "B.EQ offset {:#x} out of range for SVC at {:#x}",
-            beq_done_offset, site.vaddr
+            "B.EQ offset {beq_done_offset:#x} out of range in shared SVC handler"
         ))
     })?;
     trampoline_data.extend_from_slice(&beq_done.to_le_bytes());
     insn_idx += 1;
 
-    // [10] CMP X16, X18
+    // [6] CMP X16, X18
     trampoline_data.extend_from_slice(&encode_cmp_reg(16, 18).to_le_bytes());
     insn_idx += 1;
 
-    // [11] B.EQ .Lfound -> instruction [14]
-    let found_idx = 14usize;
+    // [7] B.EQ .Lfound -> [10]
+    let found_idx = 10usize;
     let beq_found_offset = (found_idx as i64 - insn_idx as i64) * 4;
     let beq_found = encode_b_cond(COND_EQ, beq_found_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
-            "B.EQ offset {:#x} out of range for SVC at {:#x}",
-            beq_found_offset, site.vaddr
+            "B.EQ offset {beq_found_offset:#x} out of range in shared SVC handler"
         ))
     })?;
     trampoline_data.extend_from_slice(&beq_found.to_le_bytes());
     insn_idx += 1;
 
-    // [12] ADD X17, X17, #16
+    // [8] ADD X17, X17, #16
     trampoline_data.extend_from_slice(
         &encode_add_imm(17, 17, 16)
             .expect("imm12=16 fits")
@@ -679,18 +798,17 @@ fn emit_svc_snippet(
     );
     insn_idx += 1;
 
-    // [13] B .Lloop -> instruction [7]
+    // [9] B .Lloop -> [3]
     let b_loop_offset = (loop_idx as i64 - insn_idx as i64) * 4;
     let b_loop = encode_b(b_loop_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
-            "B offset {:#x} out of range for loop at SVC {:#x}",
-            b_loop_offset, site.vaddr
+            "B offset {b_loop_offset:#x} out of range in shared SVC handler loop"
         ))
     })?;
     trampoline_data.extend_from_slice(&b_loop.to_le_bytes());
     insn_idx += 1;
 
-    // [14] .Lfound: LDR X18, [X17, #8]
+    // [10] .Lfound: LDR X18, [X17, #8]
     debug_assert_eq!(insn_idx, found_idx);
     trampoline_data.extend_from_slice(
         &encode_ldr_imm_unsigned(18, 17, 8)
@@ -699,24 +817,88 @@ fn emit_svc_snippet(
     );
     insn_idx += 1;
 
-    // [15] .Ldone: ADRP X30, <return_page>
-    //      return_addr = instruction after the original SVC = site.vaddr + 4
+    // [11] .Ldone: LDR X16, [PC, #offset_to_callback]
     debug_assert_eq!(insn_idx, done_idx);
+    let ldr_cb_vaddr = insn_vaddr(insn_idx);
+    let callback_vaddr = trampoline_base_addr + HEADER_CALLBACK_OFFSET as u64;
+    let ldr_cb_offset = callback_vaddr.cast_signed() - ldr_cb_vaddr.cast_signed();
+    let ldr_cb_insn = encode_ldr_literal(16, ldr_cb_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "LDR literal offset {ldr_cb_offset:#x} out of range for shared SVC handler callback"
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&ldr_cb_insn.to_le_bytes());
+    insn_idx += 1;
+
+    // [12] BR X16
+    trampoline_data.extend_from_slice(&encode_br(16).to_le_bytes());
+    insn_idx += 1;
+
+    // [13] NOP (pad to 14 instructions for alignment)
+    trampoline_data.extend_from_slice(&NOP.to_le_bytes());
+    insn_idx += 1;
+
+    debug_assert_eq!(insn_idx, SHARED_SVC_HANDLER_INSN_COUNT);
+    debug_assert_eq!(
+        trampoline_data.len() - handler_offset,
+        SHARED_SVC_HANDLER_SIZE,
+        "Shared SVC handler size mismatch"
+    );
+
+    Ok(())
+}
+
+/// Emit a per-site SVC gate (6 instructions, 24 bytes).
+///
+/// This gate saves registers, sets the return address, and branches to
+/// the shared SVC handler.
+#[allow(clippy::cast_possible_wrap)]
+fn emit_svc_gate(
+    trampoline_data: &mut Vec<u8>,
+    gate_offset: usize,
+    trampoline_base_addr: u64,
+    site: &PatchSite,
+) -> Result<()> {
+    let gate_vaddr = trampoline_base_addr + gate_offset as u64;
+    let mut insn_idx: usize = 0;
+    let insn_vaddr = |idx: usize| -> u64 { gate_vaddr + (idx as u64) * 4 };
+
+    // [0] SUB SP, SP, #32
+    trampoline_data.extend_from_slice(&encode_sub_sp_imm(32).expect("imm12=32 fits").to_le_bytes());
+    insn_idx += 1;
+
+    // [1] STP X16, X17, [SP]
+    trampoline_data.extend_from_slice(
+        &encode_stp_offset(16, 17, 31, 0)
+            .expect("offset 0 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [2] STR X30, [SP, #16]
+    trampoline_data.extend_from_slice(
+        &encode_str_imm_unsigned(30, 31, 16)
+            .expect("offset 16 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [3] ADRP X30, <return_page>
     let return_addr = site.vaddr + 4;
     let adrp_vaddr = insn_vaddr(insn_idx);
-    let adrp_base = adrp_vaddr & !0xFFF; // PC page-aligned
+    let adrp_base = adrp_vaddr & !0xFFF;
     let return_page = return_addr & !0xFFF;
     let page_offset = (return_page as i64 - adrp_base as i64) >> 12;
     let adrp_insn = encode_adrp(30, page_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
-            "ADRP page offset {:#x} out of ±4GB range for SVC at {:#x}",
-            page_offset, site.vaddr
+            "ADRP page offset {page_offset:#x} out of ±4GB range for SVC gate at {:#x}",
+            site.vaddr
         ))
     })?;
     trampoline_data.extend_from_slice(&adrp_insn.to_le_bytes());
     insn_idx += 1;
 
-    // [16] ADD X30, X30, #<pageoff>
+    // [4] ADD X30, X30, #<pageoff>
     let pageoff = (return_addr & 0xFFF) as u16;
     trampoline_data.extend_from_slice(
         &encode_add_imm(30, 30, pageoff)
@@ -725,166 +907,74 @@ fn emit_svc_snippet(
     );
     insn_idx += 1;
 
-    // [17] LDR X16, [PC, #offset_to_callback]
-    let ldr_cb_vaddr = insn_vaddr(insn_idx);
-    let callback_vaddr = trampoline_base_addr + HEADER_CALLBACK_OFFSET as u64;
-    let ldr_cb_offset = callback_vaddr.cast_signed() - ldr_cb_vaddr.cast_signed();
-    let ldr_cb_insn = encode_ldr_literal(16, ldr_cb_offset).ok_or_else(|| {
+    // [5] B <shared_svc_handler>
+    let b_vaddr = insn_vaddr(insn_idx);
+    let handler_vaddr = trampoline_base_addr + SHARED_SVC_HANDLER_OFFSET as u64;
+    let b_offset = handler_vaddr.cast_signed() - b_vaddr.cast_signed();
+    let b_insn = encode_b(b_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
-            "LDR literal offset {:#x} out of ±1MB range for SVC at {:#x}",
-            ldr_cb_offset, site.vaddr
+            "B offset {b_offset:#x} out of range for SVC gate -> shared handler at {:#x}",
+            site.vaddr
         ))
     })?;
-    trampoline_data.extend_from_slice(&ldr_cb_insn.to_le_bytes());
+    trampoline_data.extend_from_slice(&b_insn.to_le_bytes());
     insn_idx += 1;
 
-    // [17] BR X16
-    trampoline_data.extend_from_slice(&encode_br(16).to_le_bytes());
-    insn_idx += 1;
-
-    debug_assert_eq!(insn_idx, SVC_SNIPPET_INSN_COUNT);
+    debug_assert_eq!(insn_idx, SVC_GATE_INSN_COUNT);
     debug_assert_eq!(
-        trampoline_data.len() - snippet_offset,
-        SVC_SNIPPET_SIZE,
-        "SVC snippet size mismatch"
+        trampoline_data.len() - gate_offset,
+        SVC_GATE_SIZE,
+        "SVC gate size mismatch"
     );
 
     Ok(())
 }
 
-/// Emit a per-MSR TPIDR_EL0 trampoline snippet (24 instructions, 96 bytes).
+/// Emit the shared MSR handler (16 instructions, 64 bytes).
 ///
-/// This snippet intercepts `MSR TPIDR_EL0, Xt` instructions, updating the TLS
-/// lookup table to reflect the new guest TPIDR value so subsequent SVC trampoline
-/// lookups will find the correct host TLS.
+/// This handler is shared by all MSR gates. It updates the TLS table to
+/// reflect the new guest TPIDR value and executes the actual MSR instruction.
 ///
-/// Uses scratch registers X16, X17, X30 (all saved/restored on the stack).
-/// The new TPIDR value is stored at `[SP, #24]` to avoid register conflicts.
+/// At entry (from per-site MSR gate via BL):
+/// - SP decremented by 48, with frame:
+///   `[0]=X16, [8]=X17, [16]=guest_LR, [24]=new_TPIDR`
+/// - X30 = return-to-gate address (from BL)
+/// - [SP, #32] available for saving BL return address
 #[allow(clippy::cast_possible_wrap)]
-fn emit_msr_tpidr_snippet(
+fn emit_shared_msr_handler(
     trampoline_data: &mut Vec<u8>,
-    snippet_vaddr: u64,
-    snippet_offset: usize,
+    handler_offset: usize,
     trampoline_base_addr: u64,
-    site: &PatchSite,
-    rt: u8,
 ) -> Result<()> {
+    let handler_vaddr = trampoline_base_addr + handler_offset as u64;
     let mut insn_idx: usize = 0;
-    let insn_vaddr = |idx: usize| -> u64 { snippet_vaddr + (idx as u64) * 4 };
+    let insn_vaddr = |idx: usize| -> u64 { handler_vaddr + (idx as u64) * 4 };
 
-    // [0] SUB SP, SP, #32
-    trampoline_data.extend_from_slice(&encode_sub_sp_imm(32).expect("imm12=32 fits").to_le_bytes());
-    insn_idx += 1;
-
-    // [1] STR X16, [SP, #0]
+    // [0] STR X30, [SP, #32] — save BL return addr
     trampoline_data.extend_from_slice(
-        &encode_str_imm_unsigned(16, 31, 0)
-            .expect("offset 0 valid")
+        &encode_str_imm_unsigned(30, 31, 32)
+            .expect("offset 32 valid")
             .to_le_bytes(),
     );
     insn_idx += 1;
 
-    // [2] STR X17, [SP, #8]
-    trampoline_data.extend_from_slice(
-        &encode_str_imm_unsigned(17, 31, 8)
-            .expect("offset 8 valid")
-            .to_le_bytes(),
-    );
-    insn_idx += 1;
-
-    // [3] STR X30, [SP, #16]
-    trampoline_data.extend_from_slice(
-        &encode_str_imm_unsigned(30, 31, 16)
-            .expect("offset 16 valid")
-            .to_le_bytes(),
-    );
-    insn_idx += 1;
-
-    // [4]-[5] Store the new TPIDR value (from Xt) to [SP, #24].
-    // This is 2 instructions (fixed size) to keep snippets aligned.
-    // For registers that were already saved to the stack, we reload from
-    // their save slots. For XZR (reg 31), we store zero.
-    match rt {
-        16 => {
-            // Xt = X16: reload from [SP, #0] into X30, then store to [SP, #24]
-            trampoline_data.extend_from_slice(
-                &encode_ldr_imm_unsigned(30, 31, 0)
-                    .expect("valid")
-                    .to_le_bytes(),
-            );
-            trampoline_data.extend_from_slice(
-                &encode_str_imm_unsigned(30, 31, 24)
-                    .expect("valid")
-                    .to_le_bytes(),
-            );
-        }
-        17 => {
-            // Xt = X17: reload from [SP, #8] into X30, then store to [SP, #24]
-            trampoline_data.extend_from_slice(
-                &encode_ldr_imm_unsigned(30, 31, 8)
-                    .expect("valid")
-                    .to_le_bytes(),
-            );
-            trampoline_data.extend_from_slice(
-                &encode_str_imm_unsigned(30, 31, 24)
-                    .expect("valid")
-                    .to_le_bytes(),
-            );
-        }
-        30 => {
-            // Xt = X30: reload from [SP, #16] into X16, then store to [SP, #24]
-            // (X16 is already saved, so we can use it as scratch)
-            trampoline_data.extend_from_slice(
-                &encode_ldr_imm_unsigned(16, 31, 16)
-                    .expect("valid")
-                    .to_le_bytes(),
-            );
-            trampoline_data.extend_from_slice(
-                &encode_str_imm_unsigned(16, 31, 24)
-                    .expect("valid")
-                    .to_le_bytes(),
-            );
-        }
-        31 => {
-            // Xt = XZR: store zero to [SP, #24]
-            // STR XZR, [SP, #24] — register 31 in STR context is XZR
-            trampoline_data.extend_from_slice(
-                &encode_str_imm_unsigned(31, 31, 24)
-                    .expect("valid")
-                    .to_le_bytes(),
-            );
-            trampoline_data.extend_from_slice(&NOP.to_le_bytes());
-        }
-        _ => {
-            // Xt = any other register (0-15 excluding 16, 18-29): STR Xt, [SP, #24] + NOP
-            trampoline_data.extend_from_slice(
-                &encode_str_imm_unsigned(rt, 31, 24)
-                    .expect("valid")
-                    .to_le_bytes(),
-            );
-            trampoline_data.extend_from_slice(&NOP.to_le_bytes());
-        }
-    }
-    insn_idx += 2;
-
-    // [6] MRS X16, TPIDR_EL0 — read old guest TPIDR
+    // [1] MRS X16, TPIDR_EL0
     trampoline_data.extend_from_slice(&encode_mrs_tpidr_el0(16).to_le_bytes());
     insn_idx += 1;
 
-    // [7] LDR X17, [PC, #offset_to_tls_table_ptr]
+    // [2] LDR X17, [PC, #offset_to_tls_table_ptr]
     let ldr_tls_vaddr = insn_vaddr(insn_idx);
     let tls_table_vaddr = trampoline_base_addr + HEADER_TLS_TABLE_OFFSET as u64;
     let ldr_tls_offset = tls_table_vaddr.cast_signed() - ldr_tls_vaddr.cast_signed();
     let ldr_tls_insn = encode_ldr_literal(17, ldr_tls_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
-            "LDR literal offset {:#x} out of range for TLS table load at MSR {:#x}",
-            ldr_tls_offset, site.vaddr
+            "LDR literal offset {ldr_tls_offset:#x} out of range for shared MSR handler TLS load"
         ))
     })?;
     trampoline_data.extend_from_slice(&ldr_tls_insn.to_le_bytes());
     insn_idx += 1;
 
-    // [8] .Lloop: LDR X30, [X17, #0] — load guest_tpidr from table entry
+    // [3] .Lloop: LDR X30, [X17, #0] (X30 as scratch)
     let loop_idx = insn_idx;
     trampoline_data.extend_from_slice(
         &encode_ldr_imm_unsigned(30, 17, 0)
@@ -893,39 +983,37 @@ fn emit_msr_tpidr_snippet(
     );
     insn_idx += 1;
 
-    // [9] CMN X30, #1 — sentinel check
+    // [4] CMN X30, #1
     trampoline_data.extend_from_slice(&encode_cmn_imm(30, 1).expect("imm12=1 fits").to_le_bytes());
     insn_idx += 1;
 
-    // [10] B.EQ .Ldone -> instruction [17]
-    let done_idx = 17usize;
+    // [5] B.EQ .Ldone -> [12]
+    let done_idx = 12usize;
     let beq_done_offset = (done_idx as i64 - insn_idx as i64) * 4;
     let beq_done = encode_b_cond(COND_EQ, beq_done_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
-            "B.EQ offset {:#x} out of range for MSR at {:#x}",
-            beq_done_offset, site.vaddr
+            "B.EQ offset {beq_done_offset:#x} out of range in shared MSR handler"
         ))
     })?;
     trampoline_data.extend_from_slice(&beq_done.to_le_bytes());
     insn_idx += 1;
 
-    // [11] CMP X30, X16 — match old TPIDR?
+    // [6] CMP X30, X16
     trampoline_data.extend_from_slice(&encode_cmp_reg(30, 16).to_le_bytes());
     insn_idx += 1;
 
-    // [12] B.EQ .Lfound -> instruction [15]
-    let found_idx = 15usize;
+    // [7] B.EQ .Lfound -> [10]
+    let found_idx = 10usize;
     let beq_found_offset = (found_idx as i64 - insn_idx as i64) * 4;
     let beq_found = encode_b_cond(COND_EQ, beq_found_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
-            "B.EQ offset {:#x} out of range for MSR at {:#x}",
-            beq_found_offset, site.vaddr
+            "B.EQ offset {beq_found_offset:#x} out of range in shared MSR handler"
         ))
     })?;
     trampoline_data.extend_from_slice(&beq_found.to_le_bytes());
     insn_idx += 1;
 
-    // [13] ADD X17, X17, #16 — next entry
+    // [8] ADD X17, X17, #16
     trampoline_data.extend_from_slice(
         &encode_add_imm(17, 17, 16)
             .expect("imm12=16 fits")
@@ -933,48 +1021,198 @@ fn emit_msr_tpidr_snippet(
     );
     insn_idx += 1;
 
-    // [14] B .Lloop -> instruction [8]
+    // [9] B .Lloop -> [3]
     let b_loop_offset = (loop_idx as i64 - insn_idx as i64) * 4;
     let b_loop = encode_b(b_loop_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
-            "B offset {:#x} out of range for loop at MSR {:#x}",
-            b_loop_offset, site.vaddr
+            "B offset {b_loop_offset:#x} out of range in shared MSR handler loop"
         ))
     })?;
     trampoline_data.extend_from_slice(&b_loop.to_le_bytes());
     insn_idx += 1;
 
-    // [15] .Lfound: LDR X30, [SP, #24] — load new TPIDR value
+    // [10] .Lfound: LDR X16, [SP, #24] — new TPIDR from stack
     debug_assert_eq!(insn_idx, found_idx);
     trampoline_data.extend_from_slice(
-        &encode_ldr_imm_unsigned(30, 31, 24)
+        &encode_ldr_imm_unsigned(16, 31, 24)
             .expect("offset 24 valid")
             .to_le_bytes(),
     );
     insn_idx += 1;
 
-    // [16] STR X30, [X17, #0] — update table entry's guest_tpidr to new value
+    // [11] STR X16, [X17, #0] — update table entry
     trampoline_data.extend_from_slice(
-        &encode_str_imm_unsigned(30, 17, 0)
+        &encode_str_imm_unsigned(16, 17, 0)
             .expect("offset 0 valid")
             .to_le_bytes(),
     );
     insn_idx += 1;
 
-    // [17] .Ldone: LDR X30, [SP, #24] — load new TPIDR value
+    // [12] .Ldone: LDR X16, [SP, #24] — new TPIDR
     debug_assert_eq!(insn_idx, done_idx);
     trampoline_data.extend_from_slice(
-        &encode_ldr_imm_unsigned(30, 31, 24)
+        &encode_ldr_imm_unsigned(16, 31, 24)
             .expect("offset 24 valid")
             .to_le_bytes(),
     );
     insn_idx += 1;
 
-    // [18] MSR TPIDR_EL0, X30 — execute the actual MSR with new value
-    trampoline_data.extend_from_slice(&encode_msr_tpidr_el0(30).to_le_bytes());
+    // [13] MSR TPIDR_EL0, X16
+    trampoline_data.extend_from_slice(&encode_msr_tpidr_el0(16).to_le_bytes());
     insn_idx += 1;
 
-    // [19] LDR X30, [SP, #16] — restore X30
+    // [14] LDR X30, [SP, #32] — restore BL return addr
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(30, 31, 32)
+            .expect("offset 32 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [15] RET
+    trampoline_data.extend_from_slice(&encode_ret(30).to_le_bytes());
+    insn_idx += 1;
+
+    debug_assert_eq!(insn_idx, SHARED_MSR_HANDLER_INSN_COUNT);
+    debug_assert_eq!(
+        trampoline_data.len() - handler_offset,
+        SHARED_MSR_HANDLER_SIZE,
+        "Shared MSR handler size mismatch"
+    );
+
+    Ok(())
+}
+
+/// Compute the size of a per-site MSR gate for the given source register.
+///
+/// Special registers (X16, X17, X30) need an extra instruction to reload
+/// the saved value before storing to `[SP, #24]`, resulting in 40 bytes.
+/// All other registers (including XZR) use 36 bytes.
+fn msr_gate_size(rt: u8) -> usize {
+    match rt {
+        16 | 17 | 30 => MSR_GATE_SPECIAL_SIZE,
+        _ => MSR_GATE_SIZE,
+    }
+}
+
+/// Emit a per-site MSR gate (9-10 instructions, 36-40 bytes).
+///
+/// This gate saves registers, stores the new TPIDR value, calls the shared
+/// MSR handler via BL, restores registers, and branches back to guest code.
+#[allow(clippy::cast_possible_wrap)]
+fn emit_msr_gate(
+    trampoline_data: &mut Vec<u8>,
+    gate_offset: usize,
+    trampoline_base_addr: u64,
+    site: &PatchSite,
+    rt: u8,
+) -> Result<()> {
+    let gate_vaddr = trampoline_base_addr + gate_offset as u64;
+    let gate_size = msr_gate_size(rt);
+    let gate_insn_count = gate_size / 4;
+    let mut insn_idx: usize = 0;
+    let insn_vaddr = |idx: usize| -> u64 { gate_vaddr + (idx as u64) * 4 };
+
+    // [0] SUB SP, SP, #48
+    trampoline_data.extend_from_slice(&encode_sub_sp_imm(48).expect("imm12=48 fits").to_le_bytes());
+    insn_idx += 1;
+
+    // [1] STP X16, X17, [SP]
+    trampoline_data.extend_from_slice(
+        &encode_stp_offset(16, 17, 31, 0)
+            .expect("offset 0 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [2] STR X30, [SP, #16]
+    trampoline_data.extend_from_slice(
+        &encode_str_imm_unsigned(30, 31, 16)
+            .expect("offset 16 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [3] (or [3]-[4] for special regs) Store the new TPIDR value to [SP, #24]
+    match rt {
+        16 => {
+            // X16 already saved at [SP, #0]: reload into scratch, store to [SP, #24]
+            trampoline_data.extend_from_slice(
+                &encode_ldr_imm_unsigned(30, 31, 0)
+                    .expect("valid")
+                    .to_le_bytes(),
+            );
+            insn_idx += 1;
+            trampoline_data.extend_from_slice(
+                &encode_str_imm_unsigned(30, 31, 24)
+                    .expect("valid")
+                    .to_le_bytes(),
+            );
+            insn_idx += 1;
+        }
+        17 => {
+            // X17 already saved at [SP, #8]
+            trampoline_data.extend_from_slice(
+                &encode_ldr_imm_unsigned(30, 31, 8)
+                    .expect("valid")
+                    .to_le_bytes(),
+            );
+            insn_idx += 1;
+            trampoline_data.extend_from_slice(
+                &encode_str_imm_unsigned(30, 31, 24)
+                    .expect("valid")
+                    .to_le_bytes(),
+            );
+            insn_idx += 1;
+        }
+        30 => {
+            // X30 already saved at [SP, #16]: use X16 as scratch (already saved)
+            trampoline_data.extend_from_slice(
+                &encode_ldr_imm_unsigned(16, 31, 16)
+                    .expect("valid")
+                    .to_le_bytes(),
+            );
+            insn_idx += 1;
+            trampoline_data.extend_from_slice(
+                &encode_str_imm_unsigned(16, 31, 24)
+                    .expect("valid")
+                    .to_le_bytes(),
+            );
+            insn_idx += 1;
+        }
+        _ => {
+            // General case: STR Xt, [SP, #24] (reg 31 = XZR in STR context)
+            trampoline_data.extend_from_slice(
+                &encode_str_imm_unsigned(rt, 31, 24)
+                    .expect("valid")
+                    .to_le_bytes(),
+            );
+            insn_idx += 1;
+        }
+    }
+
+    // [next] BL shared_msr_handler
+    let bl_vaddr = insn_vaddr(insn_idx);
+    let handler_vaddr = trampoline_base_addr + SHARED_MSR_HANDLER_OFFSET as u64;
+    let bl_offset = handler_vaddr.cast_signed() - bl_vaddr.cast_signed();
+    let bl_insn = encode_bl(bl_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "BL offset {bl_offset:#x} out of range for MSR gate -> shared handler at {:#x}",
+            site.vaddr
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&bl_insn.to_le_bytes());
+    insn_idx += 1;
+
+    // [next] LDP X16, X17, [SP]
+    trampoline_data.extend_from_slice(
+        &encode_ldp_offset(16, 17, 31, 0)
+            .expect("offset 0 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [next] LDR X30, [SP, #16]
     trampoline_data.extend_from_slice(
         &encode_ldr_imm_unsigned(30, 31, 16)
             .expect("offset 16 valid")
@@ -982,43 +1220,27 @@ fn emit_msr_tpidr_snippet(
     );
     insn_idx += 1;
 
-    // [20] LDR X17, [SP, #8] — restore X17
-    trampoline_data.extend_from_slice(
-        &encode_ldr_imm_unsigned(17, 31, 8)
-            .expect("offset 8 valid")
-            .to_le_bytes(),
-    );
+    // [next] ADD SP, SP, #48
+    trampoline_data.extend_from_slice(&encode_add_sp_imm(48).expect("imm12=48 fits").to_le_bytes());
     insn_idx += 1;
 
-    // [21] LDR X16, [SP, #0] — restore X16
-    trampoline_data.extend_from_slice(
-        &encode_ldr_imm_unsigned(16, 31, 0)
-            .expect("offset 0 valid")
-            .to_le_bytes(),
-    );
-    insn_idx += 1;
-
-    // [22] ADD SP, SP, #32
-    trampoline_data.extend_from_slice(&encode_add_sp_imm(32).expect("imm12=32 fits").to_le_bytes());
-    insn_idx += 1;
-
-    // [23] B <return_addr> — branch back to instruction after original MSR
-    let b_ret_vaddr = insn_vaddr(insn_idx);
-    let b_ret_offset = (site.vaddr + 4).cast_signed() - b_ret_vaddr.cast_signed();
-    let b_ret = encode_b(b_ret_offset).ok_or_else(|| {
+    // [next] B <return_addr>
+    let ret_vaddr = insn_vaddr(insn_idx);
+    let ret_offset = (site.vaddr + 4).cast_signed() - ret_vaddr.cast_signed();
+    let ret_insn = encode_b(ret_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
-            "B offset {:#x} out of ±128MB range for return from MSR at {:#x}",
-            b_ret_offset, site.vaddr
+            "B offset {ret_offset:#x} out of ±128MB range for return from MSR gate at {:#x}",
+            site.vaddr
         ))
     })?;
-    trampoline_data.extend_from_slice(&b_ret.to_le_bytes());
+    trampoline_data.extend_from_slice(&ret_insn.to_le_bytes());
     insn_idx += 1;
 
-    debug_assert_eq!(insn_idx, MSR_SNIPPET_INSN_COUNT);
+    debug_assert_eq!(insn_idx, gate_insn_count);
     debug_assert_eq!(
-        trampoline_data.len() - snippet_offset,
-        MSR_SNIPPET_SIZE,
-        "MSR snippet size mismatch"
+        trampoline_data.len() - gate_offset,
+        gate_size,
+        "MSR gate size mismatch"
     );
 
     Ok(())
@@ -1507,16 +1729,26 @@ mod tests {
 
     #[test]
     fn test_snippet_size_constant() {
-        assert_eq!(SVC_SNIPPET_SIZE, 76);
-        assert_eq!(SVC_SNIPPET_INSN_COUNT, 19);
-        assert_eq!(MSR_SNIPPET_SIZE, 96);
-        assert_eq!(MSR_SNIPPET_INSN_COUNT, 24);
+        // Shared SVC handler: 14 instructions, 56 bytes
+        assert_eq!(SHARED_SVC_HANDLER_SIZE, 56);
+        assert_eq!(SHARED_SVC_HANDLER_INSN_COUNT, 14);
+        // Per-site SVC gate: 6 instructions, 24 bytes
+        assert_eq!(SVC_GATE_SIZE, 24);
+        assert_eq!(SVC_GATE_INSN_COUNT, 6);
+        // Shared MSR handler: 16 instructions, 64 bytes
+        assert_eq!(SHARED_MSR_HANDLER_SIZE, 64);
+        assert_eq!(SHARED_MSR_HANDLER_INSN_COUNT, 16);
+        // Per-site MSR gate: 9 instructions (general), 36 bytes
+        assert_eq!(MSR_GATE_SIZE, 36);
+        assert_eq!(MSR_GATE_INSN_COUNT, 9);
+        // Per-site MSR gate (special regs): 10 instructions, 40 bytes
+        assert_eq!(MSR_GATE_SPECIAL_SIZE, 40);
     }
 
     #[test]
     fn test_snippet_instruction_layout() {
         // Generate a trampoline with one SVC and verify every instruction
-        // in the snippet matches the expected encoding.
+        // in the per-site SVC gate and shared SVC handler.
         let nop: u32 = 0xD503201F;
         let mut buf = vec![0u8; 16];
         buf[0..4].copy_from_slice(&nop.to_le_bytes());
@@ -1536,86 +1768,115 @@ mod tests {
         let (td, _) =
             hook_syscalls_aarch64(&mut buf, &sections, trampoline_base, callback_addr).unwrap();
 
-        // Snippet starts at offset 24
-        let snippet_start = SNIPPETS_START_OFFSET;
-        let snippet_vaddr = trampoline_base + snippet_start as u64;
+        // === Per-site SVC gate at GATES_START_OFFSET (6 instructions) ===
+        let gate_start = GATES_START_OFFSET;
+        let gate_vaddr = trampoline_base + gate_start as u64;
 
-        // Helper to read instruction at snippet-relative index
-        let insn_at = |idx: usize| -> u32 {
-            let off = snippet_start + idx * 4;
+        let gate_insn_at = |idx: usize| -> u32 {
+            let off = gate_start + idx * 4;
             u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
         };
 
         // [0] SUB SP, SP, #32
-        assert_eq!(insn_at(0), encode_sub_sp_imm(32).unwrap());
+        assert_eq!(gate_insn_at(0), encode_sub_sp_imm(32).unwrap());
 
-        // [1] STR X16, [SP, #0]
-        assert_eq!(insn_at(1), encode_str_imm_unsigned(16, 31, 0).unwrap());
+        // [1] STP X16, X17, [SP]
+        assert_eq!(gate_insn_at(1), encode_stp_offset(16, 17, 31, 0).unwrap());
 
-        // [2] STR X17, [SP, #8]
-        assert_eq!(insn_at(2), encode_str_imm_unsigned(17, 31, 8).unwrap());
+        // [2] STR X30, [SP, #16]
+        assert_eq!(
+            gate_insn_at(2),
+            encode_str_imm_unsigned(30, 31, 16).unwrap()
+        );
 
-        // [3] STR X30, [SP, #16]
-        assert_eq!(insn_at(3), encode_str_imm_unsigned(30, 31, 16).unwrap());
-
-        // [4] MRS X18, TPIDR_EL0
-        assert_eq!(insn_at(4), encode_mrs_tpidr_el0(18));
-
-        // [5] STR X18, [SP, #24] — save guest TPIDR
-        assert_eq!(insn_at(5), encode_str_imm_unsigned(18, 31, 24).unwrap());
-
-        // [6] LDR X17, [PC, #offset_to_tls_table_ptr]
-        // TLS table ptr at trampoline offset 8, LDR at snippet_vaddr + 24
-        let ldr_tls_vaddr = snippet_vaddr + 24;
-        let tls_offset = (trampoline_base + 8) as i64 - ldr_tls_vaddr as i64;
-        assert_eq!(insn_at(6), encode_ldr_literal(17, tls_offset).unwrap());
-
-        // [7] LDR X16, [X17, #0] (.Lloop)
-        assert_eq!(insn_at(7), encode_ldr_imm_unsigned(16, 17, 0).unwrap());
-
-        // [8] CMN X16, #1
-        assert_eq!(insn_at(8), encode_cmn_imm(16, 1).unwrap());
-
-        // [9] B.EQ .Ldone -> [15], offset = (15-9)*4 = +24
-        assert_eq!(insn_at(9), encode_b_cond(COND_EQ, 24).unwrap());
-
-        // [10] CMP X16, X18
-        assert_eq!(insn_at(10), encode_cmp_reg(16, 18));
-
-        // [11] B.EQ .Lfound -> [14], offset = (14-11)*4 = +12
-        assert_eq!(insn_at(11), encode_b_cond(COND_EQ, 12).unwrap());
-
-        // [12] ADD X17, X17, #16
-        assert_eq!(insn_at(12), encode_add_imm(17, 17, 16).unwrap());
-
-        // [13] B .Lloop -> [7], offset = (7-13)*4 = -24
-        assert_eq!(insn_at(13), encode_b(-24).unwrap());
-
-        // [14] LDR X18, [X17, #8] (.Lfound)
-        assert_eq!(insn_at(14), encode_ldr_imm_unsigned(18, 17, 8).unwrap());
-
-        // [15] ADRP X30, <return_page> (.Ldone)
+        // [3] ADRP X30, <return_page>
         // return_addr = 0x1004 + 4 = 0x1008
-        // ADRP at snippet_vaddr + 60
-        let adrp_vaddr = snippet_vaddr + 60;
+        let adrp_vaddr = gate_vaddr + 3 * 4;
         let adrp_base = adrp_vaddr & !0xFFF;
         let return_addr = 0x1008u64;
         let return_page = return_addr & !0xFFF;
         let page_offset = (return_page.cast_signed() - adrp_base.cast_signed()) >> 12;
-        assert_eq!(insn_at(15), encode_adrp(30, page_offset).unwrap());
+        assert_eq!(gate_insn_at(3), encode_adrp(30, page_offset).unwrap());
 
-        // [16] ADD X30, X30, #<pageoff>
+        // [4] ADD X30, X30, #<pageoff>
         let pageoff = (return_addr & 0xFFF) as u16;
-        assert_eq!(insn_at(16), encode_add_imm(30, 30, pageoff).unwrap());
+        assert_eq!(gate_insn_at(4), encode_add_imm(30, 30, pageoff).unwrap());
 
-        // [17] LDR X16, [PC, #offset_to_callback]
-        // callback at trampoline offset 0, LDR at snippet_vaddr + 68
-        let ldr_cb_vaddr = snippet_vaddr + 68;
+        // [5] B <shared_svc_handler>
+        let b_vaddr = gate_vaddr + 5 * 4;
+        let handler_vaddr = trampoline_base + SHARED_SVC_HANDLER_OFFSET as u64;
+        let b_offset = handler_vaddr as i64 - b_vaddr as i64;
+        assert_eq!(gate_insn_at(5), encode_b(b_offset).unwrap());
+
+        // === Shared SVC handler at SHARED_SVC_HANDLER_OFFSET (14 instructions) ===
+        let handler_start = SHARED_SVC_HANDLER_OFFSET;
+        let handler_vaddr = trampoline_base + handler_start as u64;
+
+        let handler_insn_at = |idx: usize| -> u32 {
+            let off = handler_start + idx * 4;
+            u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
+        };
+
+        // [0] MRS X18, TPIDR_EL0
+        assert_eq!(handler_insn_at(0), encode_mrs_tpidr_el0(18));
+
+        // [1] STR X18, [SP, #24]
+        assert_eq!(
+            handler_insn_at(1),
+            encode_str_imm_unsigned(18, 31, 24).unwrap()
+        );
+
+        // [2] LDR X17, [PC, #offset_to_tls_table_ptr]
+        let ldr_tls_vaddr = handler_vaddr + 2 * 4;
+        let tls_offset = (trampoline_base + 8) as i64 - ldr_tls_vaddr as i64;
+        assert_eq!(
+            handler_insn_at(2),
+            encode_ldr_literal(17, tls_offset).unwrap()
+        );
+
+        // [3] LDR X16, [X17, #0] (.Lloop)
+        assert_eq!(
+            handler_insn_at(3),
+            encode_ldr_imm_unsigned(16, 17, 0).unwrap()
+        );
+
+        // [4] CMN X16, #1
+        assert_eq!(handler_insn_at(4), encode_cmn_imm(16, 1).unwrap());
+
+        // [5] B.EQ .Ldone -> [11]: offset = (11-5)*4 = 24
+        assert_eq!(handler_insn_at(5), encode_b_cond(COND_EQ, 24).unwrap());
+
+        // [6] CMP X16, X18
+        assert_eq!(handler_insn_at(6), encode_cmp_reg(16, 18));
+
+        // [7] B.EQ .Lfound -> [10]: offset = (10-7)*4 = 12
+        assert_eq!(handler_insn_at(7), encode_b_cond(COND_EQ, 12).unwrap());
+
+        // [8] ADD X17, X17, #16
+        assert_eq!(handler_insn_at(8), encode_add_imm(17, 17, 16).unwrap());
+
+        // [9] B .Lloop -> [3]: offset = (3-9)*4 = -24
+        assert_eq!(handler_insn_at(9), encode_b(-24).unwrap());
+
+        // [10] LDR X18, [X17, #8] (.Lfound)
+        assert_eq!(
+            handler_insn_at(10),
+            encode_ldr_imm_unsigned(18, 17, 8).unwrap()
+        );
+
+        // [11] LDR X16, [PC, #offset_to_callback] (.Ldone)
+        let ldr_cb_vaddr = handler_vaddr + 11 * 4;
         let cb_offset = trampoline_base as i64 - ldr_cb_vaddr as i64;
-        assert_eq!(insn_at(17), encode_ldr_literal(16, cb_offset).unwrap());
+        assert_eq!(
+            handler_insn_at(11),
+            encode_ldr_literal(16, cb_offset).unwrap()
+        );
 
-        // [18] BR X16
-        assert_eq!(insn_at(18), encode_br(16));
+        // [12] BR X16
+        assert_eq!(handler_insn_at(12), encode_br(16));
+
+        // [13] NOP
+        assert_eq!(handler_insn_at(13), NOP);
     }
 
     // ============================================================
@@ -1660,23 +1921,18 @@ mod tests {
         // Verify sigreturn preamble at offset 16
         let sigreturn_mov = u32::from_le_bytes(trampoline_data[16..20].try_into().unwrap());
         assert_eq!(sigreturn_mov, encode_movz_x(8, NR_RT_SIGRETURN));
-        // Offset 20: B .+8 (branch forward to sigreturn SVC snippet at offset 24)
+        // Offset 20: B .+4 (branch forward to sigreturn SVC gate at offset 24)
         let sigreturn_b = u32::from_le_bytes(trampoline_data[20..24].try_into().unwrap());
         assert_eq!(sigreturn_b, encode_b(4).unwrap());
 
-        // Sigreturn SVC snippet (76 bytes) at offset 24, then per-site snippets at offset 100
-        // Total: 100 (header+sigreturn) + 76 (per-site snippet) = 176
-        assert_eq!(
-            trampoline_data.len(),
-            SNIPPETS_START_OFFSET + SVC_SNIPPET_SIZE
-        );
+        // Total: GATES_START_OFFSET (168) + 1 SVC gate (24) = 192
+        assert_eq!(trampoline_data.len(), GATES_START_OFFSET + SVC_GATE_SIZE);
 
         // Verify the original SVC was patched with a B instruction
         let patched = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-        // B to per-site snippet at 0x2000 + SNIPPETS_START_OFFSET = 0x2064
-        // offset = 0x2064 - 0x1004 = 0x1060
-        let snippet_vaddr = trampoline_base + SNIPPETS_START_OFFSET as u64;
-        let expected_b = encode_b(snippet_vaddr as i64 - 0x1004i64).unwrap();
+        // B to per-site gate at 0x2000 + GATES_START_OFFSET
+        let gate_vaddr = trampoline_base + GATES_START_OFFSET as u64;
+        let expected_b = encode_b(gate_vaddr as i64 - 0x1004i64).unwrap();
         assert_eq!(patched, expected_b);
 
         // Verify surrounding instructions are untouched
@@ -1700,10 +1956,11 @@ mod tests {
         let result = hook_syscalls_aarch64(&mut buf, &sections, 0x2000, 0);
         let (trampoline_data, has_svc) = result.expect("should succeed with minimal trampoline");
         assert!(!has_svc, "should report no SVC found");
-        // Minimal trampoline: callback(8) + TLS ptr(8) + sigret preamble(8) + sigret SVC snippet
-        assert!(
-            trampoline_data.len() >= SNIPPETS_START_OFFSET,
-            "minimal trampoline should include sigreturn snippet"
+        // Minimal trampoline: header(16) + sigret preamble(8) + sigret gate(24) + shared SVC(56) + shared MSR(64) = 168
+        assert_eq!(
+            trampoline_data.len(),
+            GATES_START_OFFSET,
+            "minimal trampoline should be exactly GATES_START_OFFSET bytes"
         );
     }
 
@@ -1730,10 +1987,10 @@ mod tests {
 
         assert!(found);
 
-        // 24 (header) + 76 (snippet1) + 76 (snippet2) = 176
+        // GATES_START_OFFSET (168) + 2 * SVC_GATE_SIZE (24) = 216
         assert_eq!(
             trampoline_data.len(),
-            SNIPPETS_START_OFFSET + 2 * SVC_SNIPPET_SIZE
+            GATES_START_OFFSET + 2 * SVC_GATE_SIZE
         );
 
         // Both SVCs should be patched
@@ -1744,22 +2001,21 @@ mod tests {
         assert_eq!(patched1 & 0xFC00_0000, 0x1400_0000);
         assert_eq!(patched2 & 0xFC00_0000, 0x1400_0000);
 
-        // Verify they branch to different targets (different snippets)
+        // Verify they branch to different targets (different gates)
         assert_ne!(patched1, patched2);
 
-        // Verify snippet 1 targets offset 24 and snippet 2 targets offset 24+76=100
-        let snippet1_vaddr = trampoline_base + SNIPPETS_START_OFFSET as u64;
-        let snippet2_vaddr =
-            trampoline_base + SNIPPETS_START_OFFSET as u64 + SVC_SNIPPET_SIZE as u64;
+        // Verify gate 1 at GATES_START_OFFSET and gate 2 at GATES_START_OFFSET + SVC_GATE_SIZE
+        let gate1_vaddr = trampoline_base + GATES_START_OFFSET as u64;
+        let gate2_vaddr = trampoline_base + GATES_START_OFFSET as u64 + SVC_GATE_SIZE as u64;
 
-        let expected_b1 = encode_b(snippet1_vaddr as i64 - 0x1004i64).unwrap();
-        let expected_b2 = encode_b(snippet2_vaddr as i64 - 0x1010i64).unwrap();
+        let expected_b1 = encode_b(gate1_vaddr as i64 - 0x1004i64).unwrap();
+        let expected_b2 = encode_b(gate2_vaddr as i64 - 0x1010i64).unwrap();
         assert_eq!(patched1, expected_b1);
         assert_eq!(patched2, expected_b2);
     }
 
     #[test]
-    fn test_sigreturn_preamble_branches_to_snippet() {
+    fn test_sigreturn_preamble_branches_to_gate() {
         let mut buf = vec![0u8; 8];
         buf[0..4].copy_from_slice(&SVC_0.to_le_bytes());
 
@@ -1779,21 +2035,21 @@ mod tests {
             "sigreturn preamble should set X8 = 139"
         );
 
-        // Offset 20: B .+4 (branch to sigreturn SVC snippet at offset 24)
+        // Offset 20: B .+4 (branch to sigreturn SVC gate at offset 24)
         let sigreturn_b = u32::from_le_bytes(trampoline_data[20..24].try_into().unwrap());
         assert_eq!(
             sigreturn_b,
             encode_b(4).unwrap(),
-            "sigreturn preamble should branch forward to SVC snippet"
+            "sigreturn preamble should branch forward to SVC gate"
         );
 
-        // Verify the sigreturn SVC snippet starts at offset 24 (SIGRETURN_SNIPPET_OFFSET)
-        // It should begin with SUB SP, SP, #32 (the standard SVC snippet prologue)
+        // Verify the sigreturn SVC gate starts at offset 24 (SIGRETURN_GATE_OFFSET)
+        // It should begin with SUB SP, SP, #32 (the standard SVC gate prologue)
         let sigret_prologue = u32::from_le_bytes(trampoline_data[24..28].try_into().unwrap());
         assert_eq!(
             sigret_prologue,
             encode_sub_sp_imm(32).unwrap(),
-            "sigreturn SVC snippet should start with SUB SP, SP, #32"
+            "sigreturn SVC gate should start with SUB SP, SP, #32"
         );
     }
 
@@ -1876,7 +2132,7 @@ mod tests {
             encode_movz_x(8, NR_RT_SIGRETURN)
         );
 
-        // Offset 20-23: B .+8 (branch to sigreturn SVC snippet)
+        // Offset 20-23: B .+4 (branch to sigreturn SVC gate)
         assert_eq!(
             u32::from_le_bytes(
                 td[HEADER_SIGRETURN_OFFSET + 4..HEADER_SIGRETURN_OFFSET + 8]
@@ -1886,15 +2142,18 @@ mod tests {
             encode_b(4).unwrap()
         );
 
-        // Offset 24: sigreturn SVC snippet (76 bytes)
-        // Then per-site snippets start at offset 100
-        assert_eq!(td.len(), SNIPPETS_START_OFFSET + SVC_SNIPPET_SIZE);
+        // Offset 24: sigreturn SVC gate (24 bytes)
+        // Offset 48: shared SVC handler (56 bytes)
+        // Offset 104: shared MSR handler (64 bytes)
+        // Offset 168: per-site gates start
+        // Total: GATES_START_OFFSET + SVC_GATE_SIZE = 192
+        assert_eq!(td.len(), GATES_START_OFFSET + SVC_GATE_SIZE);
     }
 
     #[test]
     fn test_tls_loop_branch_offsets() {
-        // Verify that the TLS lookup loop branches have correct offsets.
-        // This test verifies the critical branch targets within the loop.
+        // Verify that the TLS lookup loop branches have correct offsets
+        // in the shared SVC handler.
         let mut buf = vec![0u8; 8];
         buf[0..4].copy_from_slice(&SVC_0.to_le_bytes());
 
@@ -1906,24 +2165,25 @@ mod tests {
 
         let (td, _) = hook_syscalls_aarch64(&mut buf, &sections, 0x2000, 0).unwrap();
 
+        // Read instructions from the shared SVC handler at SHARED_SVC_HANDLER_OFFSET
         let insn_at = |idx: usize| -> u32 {
-            let off = SNIPPETS_START_OFFSET + idx * 4;
+            let off = SHARED_SVC_HANDLER_OFFSET + idx * 4;
             u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
         };
 
-        // [9] B.EQ .Ldone -> [15]: offset = (15-9)*4 = 24
-        let beq_done = insn_at(9);
+        // [5] B.EQ .Ldone -> [11]: offset = (11-5)*4 = 24
+        let beq_done = insn_at(5);
         let imm19 = (beq_done >> 5) & 0x7_FFFF;
         assert_eq!(imm19, 6); // 24/4 = 6
         assert_eq!(beq_done & 0xF, 0); // cond = EQ
 
-        // [11] B.EQ .Lfound -> [14]: offset = (14-11)*4 = 12
-        let beq_found = insn_at(11);
+        // [7] B.EQ .Lfound -> [10]: offset = (10-7)*4 = 12
+        let beq_found = insn_at(7);
         let imm19 = (beq_found >> 5) & 0x7_FFFF;
         assert_eq!(imm19, 3); // 12/4 = 3
 
-        // [13] B .Lloop -> [7]: offset = (7-13)*4 = -24
-        let b_loop = insn_at(13);
+        // [9] B .Lloop -> [3]: offset = (3-9)*4 = -24
+        let b_loop = insn_at(9);
         let imm26 = b_loop & 0x03FF_FFFF;
         // -24/4 = -6, as 26-bit unsigned: 0x03FFFFFA
         assert_eq!(imm26, 0x03FF_FFFA);
@@ -1960,11 +2220,8 @@ mod tests {
     #[test]
     fn test_hook_svc_and_msr_trampoline_sizes() {
         let (td, _, _) = hook_with_svc_and_msr(19);
-        // Header (24) + SVC snippet (76) + MSR snippet (96) = 196
-        assert_eq!(
-            td.len(),
-            SNIPPETS_START_OFFSET + SVC_SNIPPET_SIZE + MSR_SNIPPET_SIZE
-        );
+        // GATES_START_OFFSET (168) + SVC gate (24) + MSR gate for X19 (36) = 228
+        assert_eq!(td.len(), GATES_START_OFFSET + SVC_GATE_SIZE + MSR_GATE_SIZE);
     }
 
     #[test]
@@ -1980,175 +2237,200 @@ mod tests {
     }
 
     #[test]
-    fn test_msr_snippet_prologue() {
+    fn test_msr_gate_prologue() {
         let (td, _, _) = hook_with_svc_and_msr(19);
-        // MSR snippet starts after the SVC snippet
-        let msr_start = SNIPPETS_START_OFFSET + SVC_SNIPPET_SIZE;
+        // MSR gate starts after the SVC gate
+        let msr_start = GATES_START_OFFSET + SVC_GATE_SIZE;
         let insn_at = |idx: usize| -> u32 {
             let off = msr_start + idx * 4;
             u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
         };
 
-        // [0] SUB SP, SP, #32
-        assert_eq!(insn_at(0), encode_sub_sp_imm(32).unwrap());
-        // [1] STR X16, [SP, #0]
-        assert_eq!(insn_at(1), encode_str_imm_unsigned(16, 31, 0).unwrap());
-        // [2] STR X17, [SP, #8]
-        assert_eq!(insn_at(2), encode_str_imm_unsigned(17, 31, 8).unwrap());
-        // [3] STR X30, [SP, #16]
-        assert_eq!(insn_at(3), encode_str_imm_unsigned(30, 31, 16).unwrap());
+        // [0] SUB SP, SP, #48
+        assert_eq!(insn_at(0), encode_sub_sp_imm(48).unwrap());
+        // [1] STP X16, X17, [SP]
+        assert_eq!(insn_at(1), encode_stp_offset(16, 17, 31, 0).unwrap());
+        // [2] STR X30, [SP, #16]
+        assert_eq!(insn_at(2), encode_str_imm_unsigned(30, 31, 16).unwrap());
     }
 
     #[test]
-    fn test_msr_snippet_store_new_tpidr_generic_reg() {
-        // MSR TPIDR_EL0, X19 — generic register, should be STR X19, [SP, #24] + NOP
+    fn test_msr_gate_store_new_tpidr_generic_reg() {
+        // MSR TPIDR_EL0, X19 — generic register, should be STR X19, [SP, #24]
         let (td, _, _) = hook_with_svc_and_msr(19);
-        let msr_start = SNIPPETS_START_OFFSET + SVC_SNIPPET_SIZE;
+        let msr_start = GATES_START_OFFSET + SVC_GATE_SIZE;
         let insn_at = |idx: usize| -> u32 {
             let off = msr_start + idx * 4;
             u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
         };
 
-        // [4] STR X19, [SP, #24]
-        assert_eq!(insn_at(4), encode_str_imm_unsigned(19, 31, 24).unwrap());
-        // [5] NOP
-        assert_eq!(insn_at(5), NOP);
+        // [3] STR X19, [SP, #24]
+        assert_eq!(insn_at(3), encode_str_imm_unsigned(19, 31, 24).unwrap());
     }
 
     #[test]
-    fn test_msr_snippet_store_new_tpidr_x16() {
+    fn test_msr_gate_store_new_tpidr_x16() {
         // MSR TPIDR_EL0, X16 — saved reg, must reload from [SP, #0]
         let (td, _, _) = hook_with_svc_and_msr(16);
-        let msr_start = SNIPPETS_START_OFFSET + SVC_SNIPPET_SIZE;
+        // X16 is a special register, so MSR gate is 40 bytes
+        let msr_start = GATES_START_OFFSET + SVC_GATE_SIZE;
         let insn_at = |idx: usize| -> u32 {
             let off = msr_start + idx * 4;
             u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
         };
 
-        // [4] LDR X30, [SP, #0] (reload X16's original value into X30)
-        assert_eq!(insn_at(4), encode_ldr_imm_unsigned(30, 31, 0).unwrap());
-        // [5] STR X30, [SP, #24]
-        assert_eq!(insn_at(5), encode_str_imm_unsigned(30, 31, 24).unwrap());
+        // [3] LDR X30, [SP, #0] (reload X16's original value into X30)
+        assert_eq!(insn_at(3), encode_ldr_imm_unsigned(30, 31, 0).unwrap());
+        // [4] STR X30, [SP, #24]
+        assert_eq!(insn_at(4), encode_str_imm_unsigned(30, 31, 24).unwrap());
     }
 
     #[test]
-    fn test_msr_snippet_store_new_tpidr_x17() {
+    fn test_msr_gate_store_new_tpidr_x17() {
         // MSR TPIDR_EL0, X17 — saved reg, must reload from [SP, #8]
         let (td, _, _) = hook_with_svc_and_msr(17);
-        let msr_start = SNIPPETS_START_OFFSET + SVC_SNIPPET_SIZE;
+        // X17 is a special register, so MSR gate is 40 bytes
+        let msr_start = GATES_START_OFFSET + SVC_GATE_SIZE;
         let insn_at = |idx: usize| -> u32 {
             let off = msr_start + idx * 4;
             u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
         };
 
-        // [4] LDR X30, [SP, #8] (reload X17's original value into X30)
-        assert_eq!(insn_at(4), encode_ldr_imm_unsigned(30, 31, 8).unwrap());
-        // [5] STR X30, [SP, #24]
-        assert_eq!(insn_at(5), encode_str_imm_unsigned(30, 31, 24).unwrap());
+        // [3] LDR X30, [SP, #8] (reload X17's original value into X30)
+        assert_eq!(insn_at(3), encode_ldr_imm_unsigned(30, 31, 8).unwrap());
+        // [4] STR X30, [SP, #24]
+        assert_eq!(insn_at(4), encode_str_imm_unsigned(30, 31, 24).unwrap());
     }
 
     #[test]
-    fn test_msr_snippet_store_new_tpidr_x30() {
+    fn test_msr_gate_store_new_tpidr_x30() {
         // MSR TPIDR_EL0, X30 — saved reg, must reload from [SP, #16]
         let (td, _, _) = hook_with_svc_and_msr(30);
-        let msr_start = SNIPPETS_START_OFFSET + SVC_SNIPPET_SIZE;
+        // X30 is a special register, so MSR gate is 40 bytes
+        let msr_start = GATES_START_OFFSET + SVC_GATE_SIZE;
         let insn_at = |idx: usize| -> u32 {
             let off = msr_start + idx * 4;
             u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
         };
 
-        // [4] LDR X16, [SP, #16] (reload X30's original value into X16)
-        assert_eq!(insn_at(4), encode_ldr_imm_unsigned(16, 31, 16).unwrap());
-        // [5] STR X16, [SP, #24]
-        assert_eq!(insn_at(5), encode_str_imm_unsigned(16, 31, 24).unwrap());
+        // [3] LDR X16, [SP, #16] (reload X30's original value into X16)
+        assert_eq!(insn_at(3), encode_ldr_imm_unsigned(16, 31, 16).unwrap());
+        // [4] STR X16, [SP, #24]
+        assert_eq!(insn_at(4), encode_str_imm_unsigned(16, 31, 24).unwrap());
     }
 
     #[test]
-    fn test_msr_snippet_store_new_tpidr_xzr() {
+    fn test_msr_gate_store_new_tpidr_xzr() {
         // MSR TPIDR_EL0, XZR (reg 31) — store zero
         let (td, _, _) = hook_with_svc_and_msr(31);
-        let msr_start = SNIPPETS_START_OFFSET + SVC_SNIPPET_SIZE;
+        let msr_start = GATES_START_OFFSET + SVC_GATE_SIZE;
         let insn_at = |idx: usize| -> u32 {
             let off = msr_start + idx * 4;
             u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
         };
 
-        // [4] STR XZR, [SP, #24] (reg 31 = XZR in STR context)
-        assert_eq!(insn_at(4), encode_str_imm_unsigned(31, 31, 24).unwrap());
-        // [5] NOP
-        assert_eq!(insn_at(5), NOP);
+        // [3] STR XZR, [SP, #24] (reg 31 = XZR in STR context)
+        assert_eq!(insn_at(3), encode_str_imm_unsigned(31, 31, 24).unwrap());
     }
 
     #[test]
-    fn test_msr_snippet_loop_and_epilogue() {
-        // Verify the full MSR snippet instruction layout for the loop and epilogue
+    fn test_msr_gate_bl_and_epilogue() {
+        // Verify the full MSR gate instruction layout: BL to shared handler + epilogue
         let (td, _, trampoline_base) = hook_with_svc_and_msr(19);
-        let msr_start = SNIPPETS_START_OFFSET + SVC_SNIPPET_SIZE;
-        let snippet_vaddr = trampoline_base + msr_start as u64;
+        let msr_start = GATES_START_OFFSET + SVC_GATE_SIZE;
+        let gate_vaddr = trampoline_base + msr_start as u64;
         let insn_at = |idx: usize| -> u32 {
             let off = msr_start + idx * 4;
             u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
         };
 
-        // [6] MRS X16, TPIDR_EL0
-        assert_eq!(insn_at(6), encode_mrs_tpidr_el0(16));
+        // [0] SUB SP, SP, #48  (already tested in prologue test)
+        // [1] STP X16, X17, [SP]
+        // [2] STR X30, [SP, #16]
+        // [3] STR X19, [SP, #24]
 
-        // [7] LDR X17, [PC, #offset_to_tls_table]
-        let ldr_tls_vaddr = snippet_vaddr + 7 * 4;
-        let tls_offset = (trampoline_base + 8) as i64 - ldr_tls_vaddr as i64;
-        assert_eq!(insn_at(7), encode_ldr_literal(17, tls_offset).unwrap());
+        // [4] BL shared_msr_handler
+        let bl_vaddr = gate_vaddr + 4 * 4;
+        let handler_vaddr = trampoline_base + SHARED_MSR_HANDLER_OFFSET as u64;
+        let bl_offset = handler_vaddr as i64 - bl_vaddr as i64;
+        assert_eq!(insn_at(4), encode_bl(bl_offset).unwrap());
 
-        // [8] .Lloop: LDR X30, [X17, #0]
-        assert_eq!(insn_at(8), encode_ldr_imm_unsigned(30, 17, 0).unwrap());
+        // [5] LDP X16, X17, [SP]
+        assert_eq!(insn_at(5), encode_ldp_offset(16, 17, 31, 0).unwrap());
 
-        // [9] CMN X30, #1
-        assert_eq!(insn_at(9), encode_cmn_imm(30, 1).unwrap());
+        // [6] LDR X30, [SP, #16]
+        assert_eq!(insn_at(6), encode_ldr_imm_unsigned(30, 31, 16).unwrap());
 
-        // [10] B.EQ .Ldone -> [17]: offset = (17-10)*4 = 28
-        assert_eq!(insn_at(10), encode_b_cond(COND_EQ, 28).unwrap());
+        // [7] ADD SP, SP, #48
+        assert_eq!(insn_at(7), encode_add_sp_imm(48).unwrap());
 
-        // [11] CMP X30, X16
-        assert_eq!(insn_at(11), encode_cmp_reg(30, 16));
-
-        // [12] B.EQ .Lfound -> [15]: offset = (15-12)*4 = 12
-        assert_eq!(insn_at(12), encode_b_cond(COND_EQ, 12).unwrap());
-
-        // [13] ADD X17, X17, #16
-        assert_eq!(insn_at(13), encode_add_imm(17, 17, 16).unwrap());
-
-        // [14] B .Lloop -> [8]: offset = (8-14)*4 = -24
-        assert_eq!(insn_at(14), encode_b(-24).unwrap());
-
-        // [15] .Lfound: LDR X30, [SP, #24]
-        assert_eq!(insn_at(15), encode_ldr_imm_unsigned(30, 31, 24).unwrap());
-
-        // [16] STR X30, [X17, #0]
-        assert_eq!(insn_at(16), encode_str_imm_unsigned(30, 17, 0).unwrap());
-
-        // [17] .Ldone: LDR X30, [SP, #24]
-        assert_eq!(insn_at(17), encode_ldr_imm_unsigned(30, 31, 24).unwrap());
-
-        // [18] MSR TPIDR_EL0, X30
-        assert_eq!(insn_at(18), encode_msr_tpidr_el0(30));
-
-        // [19] LDR X30, [SP, #16]
-        assert_eq!(insn_at(19), encode_ldr_imm_unsigned(30, 31, 16).unwrap());
-
-        // [20] LDR X17, [SP, #8]
-        assert_eq!(insn_at(20), encode_ldr_imm_unsigned(17, 31, 8).unwrap());
-
-        // [21] LDR X16, [SP, #0]
-        assert_eq!(insn_at(21), encode_ldr_imm_unsigned(16, 31, 0).unwrap());
-
-        // [22] ADD SP, SP, #32
-        assert_eq!(insn_at(22), encode_add_sp_imm(32).unwrap());
-
-        // [23] B <return_addr>
+        // [8] B <return_addr>
         // MSR was at vaddr 0x1008, return to 0x100C
-        // B insn is at snippet_vaddr + 23*4
-        let b_ret_vaddr = snippet_vaddr + 23 * 4;
+        let b_ret_vaddr = gate_vaddr + 8 * 4;
         let expected_offset = 0x100Ci64 - b_ret_vaddr as i64;
-        assert_eq!(insn_at(23), encode_b(expected_offset).unwrap());
+        assert_eq!(insn_at(8), encode_b(expected_offset).unwrap());
+    }
+
+    #[test]
+    fn test_shared_msr_handler_layout() {
+        // Verify the full shared MSR handler instruction layout
+        let (td, _, trampoline_base) = hook_with_svc_and_msr(19);
+        let handler_start = SHARED_MSR_HANDLER_OFFSET;
+        let handler_vaddr = trampoline_base + handler_start as u64;
+        let insn_at = |idx: usize| -> u32 {
+            let off = handler_start + idx * 4;
+            u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
+        };
+
+        // [0] STR X30, [SP, #32]
+        assert_eq!(insn_at(0), encode_str_imm_unsigned(30, 31, 32).unwrap());
+
+        // [1] MRS X16, TPIDR_EL0
+        assert_eq!(insn_at(1), encode_mrs_tpidr_el0(16));
+
+        // [2] LDR X17, [PC, #offset_to_tls_table]
+        let ldr_tls_vaddr = handler_vaddr + 2 * 4;
+        let tls_offset = (trampoline_base + 8) as i64 - ldr_tls_vaddr as i64;
+        assert_eq!(insn_at(2), encode_ldr_literal(17, tls_offset).unwrap());
+
+        // [3] .Lloop: LDR X30, [X17, #0]
+        assert_eq!(insn_at(3), encode_ldr_imm_unsigned(30, 17, 0).unwrap());
+
+        // [4] CMN X30, #1
+        assert_eq!(insn_at(4), encode_cmn_imm(30, 1).unwrap());
+
+        // [5] B.EQ .Ldone -> [12]: offset = (12-5)*4 = 28
+        assert_eq!(insn_at(5), encode_b_cond(COND_EQ, 28).unwrap());
+
+        // [6] CMP X30, X16
+        assert_eq!(insn_at(6), encode_cmp_reg(30, 16));
+
+        // [7] B.EQ .Lfound -> [10]: offset = (10-7)*4 = 12
+        assert_eq!(insn_at(7), encode_b_cond(COND_EQ, 12).unwrap());
+
+        // [8] ADD X17, X17, #16
+        assert_eq!(insn_at(8), encode_add_imm(17, 17, 16).unwrap());
+
+        // [9] B .Lloop -> [3]: offset = (3-9)*4 = -24
+        assert_eq!(insn_at(9), encode_b(-24).unwrap());
+
+        // [10] .Lfound: LDR X16, [SP, #24]
+        assert_eq!(insn_at(10), encode_ldr_imm_unsigned(16, 31, 24).unwrap());
+
+        // [11] STR X16, [X17, #0]
+        assert_eq!(insn_at(11), encode_str_imm_unsigned(16, 17, 0).unwrap());
+
+        // [12] .Ldone: LDR X16, [SP, #24]
+        assert_eq!(insn_at(12), encode_ldr_imm_unsigned(16, 31, 24).unwrap());
+
+        // [13] MSR TPIDR_EL0, X16
+        assert_eq!(insn_at(13), encode_msr_tpidr_el0(16));
+
+        // [14] LDR X30, [SP, #32]
+        assert_eq!(insn_at(14), encode_ldr_imm_unsigned(30, 31, 32).unwrap());
+
+        // [15] RET
+        assert_eq!(insn_at(15), encode_ret(30));
     }
 
     #[test]
@@ -2175,9 +2457,10 @@ mod tests {
             msr_insn,
             "MSR instruction should be left unpatched"
         );
-        assert!(
-            trampoline_data.len() >= SNIPPETS_START_OFFSET,
-            "minimal trampoline should include sigreturn snippet"
+        assert_eq!(
+            trampoline_data.len(),
+            GATES_START_OFFSET,
+            "minimal trampoline should be exactly GATES_START_OFFSET bytes"
         );
     }
 }
