@@ -44,3 +44,12 @@ Notes from a previous attempt:
 * Implement fix at runtime/loader level, not test level:
   - Proper token-aware resolution handling for slash DT_NEEDED
 ```
+
+Another attempt to debug this claimed this:
+```
+Potential the root cause:
+- AT_EXECFN is defined but never set in the auxiliary vector
+- readlink("/proc/self/exe") returns ENOENT (only /proc/self/fd/{0,1,2} is handled)
+- The loaded binary is at the "wrong" location, since the path is for the host file system, rather than positioned at the "correct" place inside the internal LiteBox file system.
+```
+
