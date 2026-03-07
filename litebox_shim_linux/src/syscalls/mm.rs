@@ -45,7 +45,7 @@ impl<FS: ShimFS> Task<FS> {
         op: impl FnOnce(MutPtr<u8>) -> Result<usize, MappingError>,
     ) -> Result<MutPtr<u8>, MappingError> {
         litebox_common_linux::mm::do_mmap(
-            &self.process_state.pm,
+            &self.process_state.borrow().pm,
             suggested_addr,
             len,
             prot,
@@ -175,7 +175,7 @@ impl<FS: ShimFS> Task<FS> {
                 // SAFETY: ptr is the freshly CoW-mapped region of exactly `len` bytes with
                 // `permissions`.
                 unsafe {
-                    self.process_state.pm.register_existing_mapping(
+                    self.process_state.borrow().pm.register_existing_mapping(
                         range,
                         permissions,
                         true,
@@ -303,7 +303,7 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `munmap`
     #[inline]
     pub(crate) fn sys_munmap(&self, addr: crate::MutPtr<u8>, len: usize) -> Result<(), Errno> {
-        litebox_common_linux::mm::sys_munmap(&self.process_state.pm, addr, len)
+        litebox_common_linux::mm::sys_munmap(&self.process_state.borrow().pm, addr, len)
     }
 
     /// Handle syscall `mprotect`
@@ -314,7 +314,7 @@ impl<FS: ShimFS> Task<FS> {
         len: usize,
         prot: ProtFlags,
     ) -> Result<(), Errno> {
-        litebox_common_linux::mm::sys_mprotect(&self.process_state.pm, addr, len, prot)
+        litebox_common_linux::mm::sys_mprotect(&self.process_state.borrow().pm, addr, len, prot)
     }
 
     #[inline]
@@ -327,7 +327,7 @@ impl<FS: ShimFS> Task<FS> {
         new_addr: usize,
     ) -> Result<crate::MutPtr<u8>, Errno> {
         litebox_common_linux::mm::sys_mremap(
-            &self.process_state.pm,
+            &self.process_state.borrow().pm,
             old_addr,
             old_size,
             new_size,
@@ -339,7 +339,7 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `brk`
     #[inline]
     pub(crate) fn sys_brk(&self, addr: MutPtr<u8>) -> Result<usize, Errno> {
-        litebox_common_linux::mm::sys_brk(&self.process_state.pm, addr)
+        litebox_common_linux::mm::sys_brk(&self.process_state.borrow().pm, addr)
     }
 
     /// Handle syscall `madvise`
@@ -350,7 +350,7 @@ impl<FS: ShimFS> Task<FS> {
         len: usize,
         advice: litebox_common_linux::MadviseBehavior,
     ) -> Result<(), Errno> {
-        litebox_common_linux::mm::sys_madvise(&self.process_state.pm, addr, len, advice)
+        litebox_common_linux::mm::sys_madvise(&self.process_state.borrow().pm, addr, len, advice)
     }
 }
 
@@ -569,7 +569,16 @@ mod tests {
         let mut data = alloc::vec::Vec::new();
         // Find an address that is allocated to the global allocator but not in reserved regions.
         // LiteBox's page manager is not aware of the global allocator's allocations.
+        // With partitioned VA ranges, the guest range may be much smaller than the host's
+        // preferred mmap range, so we use MAP_FIXED_NOREPLACE with a hint inside the guest range.
+        let pm_min = task.process_state.borrow().pm.addr_min();
+        let pm_max = task.process_state.borrow().pm.addr_max();
+        let mut search_addr = pm_min + 0x1000_0000; // start 256 MiB into the partition
         let addr = loop {
+            if search_addr >= pm_max {
+                // Could not find a suitable address — skip the test.
+                return;
+            }
             #[allow(
                 unused_variables,
                 reason = "the following features are mutually exclusive"
@@ -583,19 +592,27 @@ mod tests {
             };
             #[cfg(feature = "platform_linux_userland")]
             let addr = {
+                // Use MAP_FIXED_NOREPLACE at a specific address within the guest range
+                // so we get a host allocation that the guest PM doesn't know about.
                 let addr = unsafe {
                     libc::mmap(
-                        core::ptr::null_mut(),
+                        search_addr as *mut libc::c_void,
                         0x10_000,
                         libc::PROT_READ | libc::PROT_WRITE,
-                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
                         -1,
                         0,
                     )
                 } as usize;
+                if addr == usize::MAX {
+                    // MAP_FIXED_NOREPLACE failed (address occupied), try next page.
+                    search_addr += 0x10_000;
+                    continue;
+                }
                 data.push(alloc::vec::Vec::<u8>::from(unsafe {
                     core::slice::from_raw_parts(addr as *const u8, 0x10_000)
                 }));
+                search_addr = addr + 0x10_000; // advance for next iteration if needed
                 addr
             };
 

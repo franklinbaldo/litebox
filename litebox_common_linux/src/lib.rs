@@ -2264,6 +2264,18 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         new_value: Platform::RawConstPointer<ItimerVal>,
         old_value: Option<Platform::RawMutPointer<ItimerVal>>,
     },
+    Wait4 {
+        pid: i32,
+        wstatus: Option<Platform::RawMutPointer<i32>>,
+        options: i32,
+        rusage: Option<Platform::RawMutPointer<u8>>,
+    },
+    Waitid {
+        idtype: u32,
+        id: u32,
+        infop: Option<Platform::RawMutPointer<u8>>,
+        options: i32,
+    },
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
@@ -2517,6 +2529,8 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::getpeername => sys_req!(Getpeername { sockfd, addr:*, addrlen:* }),
             Sysno::exit => sys_req!(Exit { status }),
             Sysno::exit_group => sys_req!(ExitGroup { status }),
+            Sysno::wait4 => sys_req!(Wait4 { pid, wstatus:*, options, rusage:* }),
+            Sysno::waitid => sys_req!(Waitid { idtype, id, infop:*, options }),
             Sysno::uname => sys_req!(Uname { buf:* }),
             Sysno::fcntl => {
                 let cmd: i32 = ctx.sys_req_arg(1);
@@ -2758,6 +2772,39 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 };
                 SyscallRequest::Clone { args }
             }
+            // fork() and vfork() are legacy wrappers around clone().
+            Sysno::fork => SyscallRequest::Clone {
+                args: CloneArgs {
+                    flags: CloneFlags::empty(),
+                    #[allow(clippy::cast_sign_loss)]
+                    exit_signal: signal::Signal::SIGCHLD.as_i32() as u64,
+                    stack: 0,
+                    parent_tid: 0,
+                    child_tid: 0,
+                    pidfd: 0,
+                    stack_size: 0,
+                    tls: 0,
+                    set_tid: 0,
+                    set_tid_size: 0,
+                    cgroup: 0,
+                },
+            },
+            Sysno::vfork => SyscallRequest::Clone {
+                args: CloneArgs {
+                    flags: CloneFlags::VM.union(CloneFlags::VFORK),
+                    #[allow(clippy::cast_sign_loss)]
+                    exit_signal: signal::Signal::SIGCHLD.as_i32() as u64,
+                    stack: 0,
+                    parent_tid: 0,
+                    child_tid: 0,
+                    pidfd: 0,
+                    stack_size: 0,
+                    tls: 0,
+                    set_tid: 0,
+                    set_tid_size: 0,
+                    cgroup: 0,
+                },
+            },
             Sysno::clone3 => {
                 debug_assert_eq!(
                     ctx.sys_req_arg::<usize>(1),

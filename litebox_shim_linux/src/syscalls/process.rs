@@ -508,7 +508,43 @@ fn wake_robust_list(
 impl<FS: ShimFS> Task<FS> {
     /// Called when the task is exiting.
     pub(crate) fn prepare_for_exit(&mut self) {
+        // If this is a vfork child, unblock the parent before tearing down.
+        if let Some(fc) = self.fork_context.get_mut() {
+            fc.vfork_done.signal();
+        }
+
         self.thread.detach_from_process();
+
+        // If this was the last thread in the process, notify the core registry
+        // and release the VA partition.
+        if self.thread.process.nr_threads() == 0 {
+            use litebox::platform::AddressSpaceProvider;
+
+            let exit_status = {
+                let inner = self.thread.process.inner.lock();
+                match inner.exit_status {
+                    ExitStatus::Exit(code) => i32::from(code),
+                    ExitStatus::Signal(sig) => sig.as_i32() + 128,
+                }
+            };
+            self.global
+                .litebox
+                .process_registry()
+                .exit_process(self.process_id, exit_status);
+
+            // Release the process's VA partition. For a vfork child that
+            // hasn't exec'd, destroy the child's reserved partition (from
+            // fork_context), not the parent's shared ProcessState.
+            let as_id = match self.fork_context.get_mut() {
+                Some(fc) => fc.address_space_id,
+                None => self.process_state.borrow().address_space_id,
+            };
+            let r = self.global.platform.destroy_address_space(as_id);
+            debug_assert!(
+                r.is_ok(),
+                "failed to destroy address space {as_id:?}: {r:?}"
+            );
+        }
 
         if let Some(clear_child_tid) = self.thread.clear_child_tid.take() {
             // Clear the child TID if requested
@@ -536,6 +572,153 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_exit_group(&self, status: i32) {
         // Tear down occurs similarly to `sys_exit`.
         self.exit_group(ExitStatus::Exit(status.truncate()));
+    }
+
+    /// Handle syscall `wait4`.
+    ///
+    /// `wait4(pid, wstatus, options, rusage)`:
+    /// - `pid > 0`: wait for specific child
+    /// - `pid == -1`: wait for any child
+    /// - `pid == 0`: wait for any child in same process group
+    /// - `pid < -1`: wait for any child in process group `-pid`
+    pub(crate) fn sys_wait4(
+        &self,
+        pid: i32,
+        wstatus: Option<crate::MutPtr<i32>>,
+        options: i32,
+        _rusage: Option<crate::MutPtr<u8>>,
+    ) -> Result<usize, Errno> {
+        use litebox::process::{ProcessId, WaitOptions, WaitTarget};
+
+        let target = match pid {
+            p if p > 0 => WaitTarget::Pid(ProcessId(p.try_into().map_err(|_| Errno::EINVAL)?)),
+            -1 => WaitTarget::AnyChild,
+            0 => {
+                // Same process group — for now, treat as any child.
+                WaitTarget::AnyChild
+            }
+            p => {
+                let group_id = (-p).try_into().map_err(|_| Errno::EINVAL)?;
+                WaitTarget::ProcessGroup(litebox::process::ProcessGroupId(group_id))
+            }
+        };
+
+        let wait_options = WaitOptions::from_bits(options.cast_unsigned()).ok_or_else(|| {
+            log_unsupported!("wait4 with unsupported options: {:#x}", options);
+            Errno::EINVAL
+        })?;
+
+        let result = self.global.litebox.process_registry().wait_for_child(
+            self.process_id,
+            target,
+            wait_options,
+        );
+
+        match result {
+            Ok(wr) => {
+                if let Some(ptr) = wstatus {
+                    // Encode status as Linux wait status: (exit_code & 0xff) << 8
+                    let encoded = (wr.status & 0xff) << 8;
+                    let _ = ptr.write_at_offset(0, encoded);
+                }
+                Ok(wr.pid.0 as usize)
+            }
+            Err(litebox::process::WaitError::WouldBlock) => Ok(0),
+            Err(
+                litebox::process::WaitError::NoChildren
+                | litebox::process::WaitError::NoSuchProcess,
+            ) => Err(Errno::ECHILD),
+        }
+    }
+
+    /// Handle syscall `waitid`.
+    ///
+    /// `waitid(idtype, id, infop, options)`:
+    /// - `idtype == P_PID`: wait for child with PID `id`
+    /// - `idtype == P_PGID`: wait for child in process group `id`
+    /// - `idtype == P_ALL`: wait for any child
+    pub(crate) fn sys_waitid(
+        &self,
+        idtype: u32,
+        id: u32,
+        infop: Option<crate::MutPtr<u8>>,
+        options: i32,
+    ) -> Result<usize, Errno> {
+        use litebox::process::{ProcessId, WaitOptions, WaitTarget};
+
+        const P_PID: u32 = 1;
+        const P_PGID: u32 = 2;
+        const P_ALL: u32 = 0;
+        // waitid uses WEXITED (4) to wait for exited children.
+        const WEXITED: u32 = 4;
+        const WNOWAIT: u32 = 0x0100_0000;
+
+        let target = match idtype {
+            P_PID => WaitTarget::Pid(ProcessId(id)),
+            P_PGID => WaitTarget::ProcessGroup(litebox::process::ProcessGroupId(id)),
+            P_ALL => WaitTarget::AnyChild,
+            _ => return Err(Errno::EINVAL),
+        };
+
+        // Map waitid options to WaitOptions. waitid uses WEXITED instead of
+        // an implicit "wait for exit".
+        let raw_opts = options.cast_unsigned();
+        if raw_opts & WNOWAIT != 0 {
+            log_unsupported!("waitid with WNOWAIT");
+            return Err(Errno::EINVAL);
+        }
+        if raw_opts & WEXITED == 0 {
+            // Not waiting for exited children — we only support WEXITED.
+            log_unsupported!("waitid without WEXITED");
+            return Err(Errno::EINVAL);
+        }
+        let mut wait_options = WaitOptions::empty();
+        if raw_opts & WaitOptions::WNOHANG.bits() != 0 {
+            wait_options |= WaitOptions::WNOHANG;
+        }
+
+        let result = self.global.litebox.process_registry().wait_for_child(
+            self.process_id,
+            target,
+            wait_options,
+        );
+
+        match result {
+            Ok(wr) => {
+                // Fill siginfo_t structure at infop if provided.
+                // siginfo_t is 128 bytes on x86_64. We fill the relevant fields:
+                //   si_signo (offset 0, i32) = SIGCHLD (17)
+                //   si_errno (offset 4, i32) = 0
+                //   si_code  (offset 8, i32) = CLD_EXITED (1)
+                //   si_pid   (offset 12, i32) = child pid
+                //   si_uid   (offset 16, i32) = 0
+                //   si_status(offset 20, i32) = exit status
+                if let Some(ptr) = infop {
+                    const SIGCHLD: i32 = 17;
+                    const CLD_EXITED: i32 = 1;
+                    let si_ptr: crate::MutPtr<i32> = crate::MutPtr::from_usize(ptr.as_usize());
+                    let _ = si_ptr.write_at_offset(0, SIGCHLD); // si_signo
+                    let _ = si_ptr.write_at_offset(1, 0); // si_errno
+                    let _ = si_ptr.write_at_offset(2, CLD_EXITED); // si_code
+                    let _ = si_ptr.write_at_offset(3, wr.pid.0.cast_signed()); // si_pid
+                    let _ = si_ptr.write_at_offset(4, 0); // si_uid
+                    let _ = si_ptr.write_at_offset(5, wr.status); // si_status
+                }
+                Ok(0) // waitid returns 0 on success
+            }
+            Err(litebox::process::WaitError::WouldBlock) => {
+                // WNOHANG: zero out infop and return 0.
+                if let Some(ptr) = infop {
+                    let si_ptr: crate::MutPtr<i32> = crate::MutPtr::from_usize(ptr.as_usize());
+                    let _ = si_ptr.write_at_offset(0, 0); // si_signo = 0
+                }
+                Ok(0)
+            }
+            Err(
+                litebox::process::WaitError::NoChildren
+                | litebox::process::WaitError::NoSuchProcess,
+            ) => Err(Errno::ECHILD),
+        }
     }
 }
 
@@ -594,7 +777,9 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Creates a new thread or process.
     ///
-    /// Note we currently only support creating threads with the VM, FS, and FILES flags set.
+    /// Thread creation requires `CLONE_VM | CLONE_THREAD | CLONE_SIGHAND | CLONE_FILES`.
+    /// Fork-like calls (`!CLONE_VM && !CLONE_THREAD`) create a new process
+    /// (currently returns `ENOSYS` — wired in Step 2.4b).
     fn do_clone(
         &self,
         ctx: &litebox_common_linux::PtRegs,
@@ -623,7 +808,33 @@ impl<FS: ShimFS> Task<FS> {
             flags.remove(CloneFlags::DETACHED);
         }
 
-        let required_clone_flags =
+        if cgroup != 0 {
+            log_unsupported!("clone with cgroup");
+            return Err(Errno::EINVAL);
+        }
+
+        if set_tid != 0 || set_tid_size != 0 {
+            log_unsupported!("clone with set_tid");
+            return Err(Errno::EINVAL);
+        }
+
+        // Note `exit_signal` is ignored for threads; validated for fork.
+        if exit_signal > MAX_SIGNAL_NUMBER {
+            return Err(Errno::EINVAL);
+        }
+
+        // Detect fork-like clone: new process (!CLONE_THREAD).
+        // This includes both fork (!CLONE_VM) and vfork (CLONE_VM | CLONE_VFORK).
+        let is_fork = !flags.contains(CloneFlags::THREAD)
+            && (!flags.contains(CloneFlags::VM) || flags.contains(CloneFlags::VFORK));
+
+        if is_fork {
+            return self.do_fork(ctx, args, flags, clone3);
+        }
+
+        // --- Thread clone path (existing behavior) ---
+
+        let thread_required_flags =
             CloneFlags::VM | CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::FILES;
 
         let supported_clone_flags = CloneFlags::VM
@@ -646,26 +857,11 @@ impl<FS: ShimFS> Task<FS> {
             );
             return Err(Errno::EINVAL);
         }
-        if !flags.contains(required_clone_flags) {
+        if !flags.contains(thread_required_flags) {
             log_unsupported!(
                 "clone with missing required flags: {:?}",
-                required_clone_flags & !flags
+                thread_required_flags & !flags
             );
-            return Err(Errno::EINVAL);
-        }
-
-        if cgroup != 0 {
-            log_unsupported!("clone with cgroup");
-            return Err(Errno::EINVAL);
-        }
-
-        if set_tid != 0 || set_tid_size != 0 {
-            log_unsupported!("clone with set_tid");
-            return Err(Errno::EINVAL);
-        }
-
-        // Note `exit_signal` is ignored because we don't support `fork` yet; we just validate it.
-        if exit_signal > MAX_SIGNAL_NUMBER {
             return Err(Errno::EINVAL);
         }
 
@@ -765,6 +961,7 @@ impl<FS: ShimFS> Task<FS> {
                         fs: fs.into(),
                         files: self.files.clone(), // TODO: !CLONE_FILES support
                         signals: self.signals.clone_for_new_task(),
+                        fork_context: core::cell::RefCell::new(None),
                     },
                 }),
             )
@@ -777,6 +974,147 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::ENOMEM);
         }
 
+        Ok(usize::try_from(child_tid).unwrap())
+    }
+
+    /// Fork path: create a new child process (vfork semantics on userland).
+    ///
+    /// The child temporarily shares the parent's `ProcessState` (PM, files,
+    /// signals, etc.). A VA partition is allocated for the child but remains
+    /// empty until `execve()` loads a new binary into it.
+    ///
+    /// **Note:** Step 2.4c adds parent blocking (vfork semantics). Until then,
+    /// both parent and child run concurrently on the same guest stack, which
+    /// is only safe if the child immediately calls `execve()` or `_exit()`.
+    fn do_fork(
+        &self,
+        ctx: &litebox_common_linux::PtRegs,
+        args: &litebox_common_linux::CloneArgs,
+        flags: CloneFlags,
+        _clone3: bool,
+    ) -> Result<usize, Errno> {
+        use litebox::platform::AddressSpaceProvider;
+
+        // Linux clone flag compatibility: CLONE_SIGHAND requires CLONE_VM,
+        // and CLONE_THREAD requires CLONE_SIGHAND. Since the fork path has
+        // !CLONE_VM, neither SIGHAND nor THREAD may be set.
+        if flags.contains(CloneFlags::SIGHAND) {
+            return Err(Errno::EINVAL);
+        }
+
+        // Supported flags for the fork path. Reject anything else.
+        let fork_supported_flags = CloneFlags::VFORK
+            | CloneFlags::VM
+            // glibc's fork() passes these tid-related flags.
+            | CloneFlags::CHILD_SETTID
+            | CloneFlags::CHILD_CLEARTID
+            | CloneFlags::PARENT_SETTID
+            // Ignored since we don't support sysv semaphores anyway.
+            | CloneFlags::SYSVSEM;
+        if flags.intersects(!fork_supported_flags) {
+            log_unsupported!(
+                "fork with unsupported flags: {:?}",
+                flags & !fork_supported_flags
+            );
+            return Err(Errno::EINVAL);
+        }
+
+        // The fork path always uses vfork semantics (child runs on parent's
+        // stack). Reject requests for a separate child stack.
+        if args.stack != 0 || args.stack_size != 0 {
+            log_unsupported!("fork with explicit child stack");
+            return Err(Errno::EINVAL);
+        }
+
+        // 1. Register child process in the core ProcessRegistry.
+        let exit_signal = i32::try_from(args.exit_signal).map_err(|_| Errno::EINVAL)?;
+        let child_process_id = self
+            .global
+            .litebox
+            .process_registry()
+            .create_process(Some(self.process_id), exit_signal)
+            .map_err(|_| Errno::ENOMEM)?;
+
+        // 2. Fork address space: allocate a VA partition for the child.
+        let parent_as_id = self.process_state.borrow().address_space_id;
+        let forked = self
+            .global
+            .platform
+            .fork_address_space(parent_as_id)
+            .map_err(|_| {
+                self.global
+                    .litebox
+                    .process_registry()
+                    .remove_process(child_process_id);
+                Errno::ENOMEM
+            })?;
+        let child_as_id = match forked {
+            litebox::platform::address_space::ForkedAddressSpace::SharedWithParent(id)
+            | litebox::platform::address_space::ForkedAddressSpace::Independent(id) => id,
+        };
+
+        // 3. Allocate a TID for the child (also serves as PID on the guest side).
+        let child_tid = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);
+
+        // 4. Create the vfork synchronization primitive. The parent will block
+        //    on this after spawning the child; the child signals it on exec/exit.
+        let vfork_done = Arc::new(crate::VforkDone::new(self.wait_cx().waker().clone()));
+
+        // 5. Create the child Task with vfork sharing: uses the parent's
+        //    ProcessState temporarily. The child's own partition is recorded in
+        //    ForkContext for later use by execve().
+        let child_thread = ThreadState::new_process(child_tid);
+        child_thread.init_state.set(ThreadInitState::NewThread {
+            stack: None, // vfork: use parent's stack
+            tls: None,   // inherit parent's TLS
+            set_child_tid: None,
+        });
+
+        let r = unsafe {
+            self.global.platform.spawn_thread(
+                ctx,
+                Box::new(NewThreadArgs {
+                    task: Task {
+                        global: self.global.clone(),
+                        process_state: self.process_state.clone(), // vfork: share parent's PM
+                        wait_state: crate::wait::WaitState::new(self.global.platform),
+                        thread: child_thread,
+                        process_id: child_process_id,
+                        pid: child_tid,
+                        ppid: self.pid,
+                        tid: child_tid,
+                        credentials: self.credentials.clone(),
+                        comm: self.comm.clone(),
+                        fs: self.fs.clone(),
+                        files: self.files.clone(),
+                        signals: self.signals.clone_for_new_task(),
+                        fork_context: core::cell::RefCell::new(Some(crate::ForkContext {
+                            address_space_id: child_as_id,
+                            vfork_done: vfork_done.clone(),
+                        })),
+                    },
+                }),
+            )
+        };
+
+        if let Err(err) = r {
+            litebox::log_println!(self.global.platform, "failed to spawn fork child: {}", err);
+            let _ = self.global.platform.destroy_address_space(child_as_id);
+            self.global
+                .litebox
+                .process_registry()
+                .remove_process(child_process_id);
+            return Err(Errno::ENOMEM);
+        }
+
+        // 6. Block parent until child execs or exits (vfork semantics).
+        //    Like Linux's TASK_UNINTERRUPTIBLE wait: keep blocking even if
+        //    interrupted, because parent and child share the same guest stack.
+        while !vfork_done.is_done() {
+            let _ = self.wait_cx().wait_until(|| vfork_done.is_done());
+        }
+
+        // Parent returns child's PID.
         Ok(usize::try_from(child_tid).unwrap())
     }
 
@@ -1355,10 +1693,40 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EBUSY);
         }
 
-        // Close CLOEXEC descriptors
+        // If this is a vfork child, detach from the parent's shared state.
+        // This must happen before close_on_exec/release_memory so mutations
+        // only affect the child's own copies.
+        if let Some(fc) = self.fork_context.borrow_mut().take() {
+            use litebox::platform::AddressSpaceProvider;
+
+            // Switch to the child's own VA partition.
+            let child_range = self
+                .global
+                .platform
+                .address_space_range(fc.address_space_id)
+                .expect("child address space must be valid");
+            let child_ps = Arc::new(crate::ProcessState {
+                pm: litebox::mm::PageManager::new(&self.global.litebox, child_range),
+                address_space_id: fc.address_space_id,
+            });
+            self.process_state.replace(child_ps);
+
+            // Unshare file descriptors and fs state. During the vfork window
+            // these were shared with the parent (who is blocked), but after
+            // exec the child must have independent copies.
+            let new_files = Arc::new(self.files.borrow().clone_for_fork());
+            self.files.replace(new_files);
+            let new_fs: Arc<_> = Arc::new(self.fs.borrow().as_ref().clone());
+            self.fs.replace(new_fs);
+
+            // Unblock the parent — the child now has its own state.
+            fc.vfork_done.signal();
+        }
+
+        // Close CLOEXEC descriptors (now on the child's own FD table).
         self.close_on_exec();
 
-        // unmmap all memory mappings and reset brk
+        // Unmap all memory mappings and reset brk.
         if let Some(robust_list) = self.thread.robust_list.take() {
             let _ = wake_robust_list(robust_list);
         }
@@ -1368,7 +1736,7 @@ impl<FS: ShimFS> Task<FS> {
 
         // Don't release reserved mappings.
         let release = |_r: Range<usize>, vm: VmFlags| !vm.is_empty();
-        unsafe { self.process_state.pm.release_memory(release) }
+        unsafe { self.process_state.borrow().pm.release_memory(release) }
             .expect("failed to release memory mappings");
 
         litebox_platform_multiplex::Platform::clear_guest_thread_local_storage(
