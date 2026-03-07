@@ -61,6 +61,37 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         }
     }
 
+    /// Duplicate an entry given only its raw index, returning a new [`OwnedFd`]
+    /// that independently tracks its closed state.
+    ///
+    /// This is used by [`RawDescriptorStorage::clone_for_fork`] so that parent
+    /// and child processes get independent `OwnedFd` instances that share the
+    /// underlying file description (via `Arc`).
+    ///
+    /// Per-fd metadata (e.g. `FD_CLOEXEC`) is cloned from the source entry,
+    /// matching POSIX fork semantics where the child inherits the parent's
+    /// per-fd flags.
+    ///
+    /// Returns `None` if the fd is already closed.
+    pub(crate) fn duplicate_raw_fd(&mut self, raw: &OwnedFd) -> Option<OwnedFd> {
+        let idx = self
+            .entries
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or_else(|| {
+                self.entries.push(None);
+                self.entries.len() - 1
+            });
+        let src = self.entries[raw.as_usize()?].as_ref().unwrap();
+        let new_ind_entry = IndividualEntry {
+            x: Arc::clone(&src.x),
+            metadata: src.metadata.clone(),
+        };
+        let old = self.entries[idx].replace(new_ind_entry);
+        assert!(old.is_none());
+        Some(OwnedFd::new(idx))
+    }
+
     /// Create a duplicate of the provided `fd`.
     ///
     /// This newly-created FD shares all behavior with the existing FD, including (for example)
@@ -453,7 +484,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     ) -> Option<T>
     where
         Subsystem: FdEnabledSubsystem,
-        T: core::any::Any + Send + Sync,
+        T: core::any::Any + Clone + Send + Sync,
     {
         self.entries[fd.x.as_usize()?]
             .as_ref()
@@ -482,7 +513,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     ) -> Option<T>
     where
         Subsystem: FdEnabledSubsystem,
-        T: core::any::Any + Send + Sync,
+        T: core::any::Any + Clone + Send + Sync,
     {
         self.entries[fd.x.as_usize()?]
             .as_mut()
@@ -548,12 +579,35 @@ impl RawDescriptorStorage {
 
     /// Clone the descriptor storage for `fork()`.
     ///
-    /// The underlying file objects are shared via `Arc`, matching POSIX
+    /// Each stored fd is duplicated in the global `Descriptors` table so that
+    /// the child gets an independent `OwnedFd` (with its own `closed` flag).
+    /// The underlying file descriptions are shared via `Arc`, matching POSIX
     /// shared-file-description semantics after fork.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any stored fd has already been closed in `global_dt`.
     #[must_use]
-    pub fn clone_for_fork(&self) -> Self {
+    pub fn clone_for_fork<Platform: RawSyncPrimitivesProvider>(
+        &self,
+        global_dt: &mut Descriptors<Platform>,
+    ) -> Self {
         Self {
-            stored_fds: self.stored_fds.clone(),
+            stored_fds: self
+                .stored_fds
+                .iter()
+                .map(|slot| {
+                    slot.as_ref().map(|stored| {
+                        let new_owned = global_dt
+                            .duplicate_raw_fd(&stored.x)
+                            .expect("fd should not be closed during fork");
+                        StoredFd {
+                            x: Arc::new(new_owned),
+                            subsystem_entry_type_id: stored.subsystem_entry_type_id,
+                        }
+                    })
+                })
+                .collect(),
         }
     }
 
@@ -840,7 +894,7 @@ pub(crate) struct InternalFd {
 ///
 /// Note: this indicates ownership over the descriptor itself, but not necessarily the underlying
 /// entry, since there might be duplicates to the underlying entry.
-struct OwnedFd {
+pub(crate) struct OwnedFd {
     raw: u32,
     closed: AtomicBool,
 }

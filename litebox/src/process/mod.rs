@@ -156,6 +156,23 @@ pub enum CreateProcessError {
     /// A root (init) process already exists; only one is allowed.
     InitAlreadyExists,
 }
+
+/// Errors from [`ProcessRegistry::set_pgid`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetPgidError {
+    /// Caller does not have permission (not self or child, different session,
+    /// or target is a session leader).
+    NotPermitted,
+    /// The specified process group does not exist in this session.
+    NoSuchGroup,
+}
+
+/// Errors from [`ProcessRegistry::setsid`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetsidError {
+    /// The caller is already a process group leader.
+    AlreadyGroupLeader,
+}
 // ---------------------------------------------------------------------------
 // Wait notification channel (futex-based)
 // ---------------------------------------------------------------------------
@@ -522,6 +539,98 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
     /// Returns the number of processes currently tracked (including zombies).
     pub fn process_count(&self) -> usize {
         self.table.read().len()
+    }
+
+    /// Get the process group ID of a process.
+    pub fn get_pgid(&self, id: ProcessId) -> Option<ProcessGroupId> {
+        self.with_context(id, |ctx| ctx.pgid)
+    }
+
+    /// Set the process group ID of a process.
+    ///
+    /// `target` is the process to modify, `pgid` is the new process group.
+    /// Returns `Ok(())` on success. Errors:
+    /// - `None` if `target` does not exist
+    /// - `Err(SetPgidError::*)` for permission/validity failures
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal lock is poisoned.
+    pub fn set_pgid(
+        &self,
+        caller: ProcessId,
+        target: ProcessId,
+        pgid: ProcessGroupId,
+    ) -> Option<Result<(), SetPgidError>> {
+        let mut table = self.table.write();
+        // Target must exist.
+        let entry = table.get(&target)?;
+
+        // Can only change pgid of self or a direct child.
+        let is_self = target == caller;
+        let is_child = entry.context.parent == Some(caller);
+        if !is_self && !is_child {
+            return Some(Err(SetPgidError::NotPermitted));
+        }
+
+        // Target must be in the same session as caller.
+        let caller_sid = table.get(&caller)?.context.sid;
+        if entry.context.sid != caller_sid {
+            return Some(Err(SetPgidError::NotPermitted));
+        }
+
+        // Cannot change pgid of a session leader.
+        let target_sid = SessionId::from(target);
+        if entry.context.sid == target_sid {
+            return Some(Err(SetPgidError::NotPermitted));
+        }
+
+        // If setting to a specific pgid (not target's own), the target group
+        // must already exist in the same session. We check if any process in
+        // the table has that pgid and the same session.
+        let target_pid_as_pgid = ProcessGroupId::from(target);
+        if pgid != target_pid_as_pgid {
+            let group_exists = table
+                .values()
+                .any(|e| e.context.pgid == pgid && e.context.sid == caller_sid);
+            if !group_exists {
+                return Some(Err(SetPgidError::NoSuchGroup));
+            }
+        }
+
+        table.get_mut(&target).unwrap().context.pgid = pgid;
+        Some(Ok(()))
+    }
+
+    /// Get the session ID of a process.
+    pub fn get_sid(&self, id: ProcessId) -> Option<SessionId> {
+        self.with_context(id, |ctx| ctx.sid)
+    }
+
+    /// Create a new session with `caller` as the session leader and sole
+    /// member of a new process group.
+    ///
+    /// Returns the new session ID (== caller's pid) on success.
+    /// Fails with `Err(())` if caller is already a process group leader.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal lock is poisoned.
+    pub fn setsid(&self, caller: ProcessId) -> Option<Result<SessionId, SetsidError>> {
+        let mut table = self.table.write();
+        let entry = table.get(&caller)?;
+
+        // Fail if caller is already a process group leader (pgid == pid).
+        if entry.context.pgid == ProcessGroupId::from(caller) {
+            return Some(Err(SetsidError::AlreadyGroupLeader));
+        }
+
+        let new_sid = SessionId::from(caller);
+        let new_pgid = ProcessGroupId::from(caller);
+        let entry = table.get_mut(&caller).unwrap();
+        entry.context.sid = new_sid;
+        entry.context.pgid = new_pgid;
+        Some(Ok(new_sid))
     }
 
     /// Check if a child PID matches the given wait target.
@@ -899,6 +1008,160 @@ mod tests {
         assert!(
             registry.with_context(child, |_| ()).is_none(),
             "child should have been auto-reaped"
+        );
+    }
+
+    #[test]
+    fn test_get_pgid_and_sid() {
+        let (_platform, registry) = setup();
+        let init = registry.create_process(None, 0).unwrap();
+        let child = registry.create_process(Some(init), 17).unwrap();
+
+        // Init: pgid == pid, sid == pid
+        assert_eq!(registry.get_pgid(init), Some(ProcessGroupId::from(init)));
+        assert_eq!(registry.get_sid(init), Some(SessionId::from(init)));
+
+        // Child inherits parent's pgid and sid
+        assert_eq!(registry.get_pgid(child), Some(ProcessGroupId::from(init)));
+        assert_eq!(registry.get_sid(child), Some(SessionId::from(init)));
+
+        // Non-existent process
+        assert_eq!(registry.get_pgid(ProcessId(999)), None);
+        assert_eq!(registry.get_sid(ProcessId(999)), None);
+    }
+
+    #[test]
+    fn test_setpgid_self() {
+        let (_platform, registry) = setup();
+        let init = registry.create_process(None, 0).unwrap();
+        let child = registry.create_process(Some(init), 17).unwrap();
+
+        // Child creates its own process group
+        assert_eq!(
+            registry.set_pgid(child, child, ProcessGroupId::from(child)),
+            Some(Ok(()))
+        );
+        assert_eq!(registry.get_pgid(child), Some(ProcessGroupId::from(child)));
+    }
+
+    #[test]
+    fn test_setpgid_child() {
+        let (_platform, registry) = setup();
+        let init = registry.create_process(None, 0).unwrap();
+        let child = registry.create_process(Some(init), 17).unwrap();
+
+        // Parent sets child's pgid to child's own pid (create new group)
+        assert_eq!(
+            registry.set_pgid(init, child, ProcessGroupId::from(child)),
+            Some(Ok(()))
+        );
+        assert_eq!(registry.get_pgid(child), Some(ProcessGroupId::from(child)));
+    }
+
+    #[test]
+    fn test_setpgid_join_existing_group() {
+        let (_platform, registry) = setup();
+        let init = registry.create_process(None, 0).unwrap();
+        let child1 = registry.create_process(Some(init), 17).unwrap();
+        let child2 = registry.create_process(Some(init), 17).unwrap();
+
+        // child1 creates its own group
+        registry
+            .set_pgid(child1, child1, ProcessGroupId::from(child1))
+            .unwrap()
+            .unwrap();
+
+        // child2 joins child1's group
+        registry
+            .set_pgid(child2, child2, ProcessGroupId::from(child1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            registry.get_pgid(child2),
+            Some(ProcessGroupId::from(child1))
+        );
+    }
+
+    #[test]
+    fn test_setpgid_nonexistent_group() {
+        let (_platform, registry) = setup();
+        let init = registry.create_process(None, 0).unwrap();
+        let child = registry.create_process(Some(init), 17).unwrap();
+
+        // Try to join a group that doesn't exist
+        assert_eq!(
+            registry.set_pgid(child, child, ProcessGroupId(999)),
+            Some(Err(SetPgidError::NoSuchGroup))
+        );
+    }
+
+    #[test]
+    fn test_setpgid_session_leader_fails() {
+        let (_platform, registry) = setup();
+        let init = registry.create_process(None, 0).unwrap();
+
+        // Init is a session leader (sid == pid), cannot change pgid
+        assert_eq!(
+            registry.set_pgid(init, init, ProcessGroupId(999)),
+            Some(Err(SetPgidError::NotPermitted))
+        );
+    }
+
+    #[test]
+    fn test_setpgid_not_child_fails() {
+        let (_platform, registry) = setup();
+        let init = registry.create_process(None, 0).unwrap();
+        let child1 = registry.create_process(Some(init), 17).unwrap();
+        let child2 = registry.create_process(Some(init), 17).unwrap();
+
+        // child1 tries to set child2's pgid — not permitted (not parent)
+        assert_eq!(
+            registry.set_pgid(child1, child2, ProcessGroupId::from(child2)),
+            Some(Err(SetPgidError::NotPermitted))
+        );
+    }
+
+    #[test]
+    fn test_setsid() {
+        let (_platform, registry) = setup();
+        let init = registry.create_process(None, 0).unwrap();
+        let child = registry.create_process(Some(init), 17).unwrap();
+
+        // Child inherits init's pgid, so pgid != child's pid → can setsid
+        let sid = registry.setsid(child).unwrap().unwrap();
+        assert_eq!(sid, SessionId::from(child));
+        assert_eq!(registry.get_sid(child), Some(SessionId::from(child)));
+        assert_eq!(registry.get_pgid(child), Some(ProcessGroupId::from(child)));
+    }
+
+    #[test]
+    fn test_setsid_already_group_leader() {
+        let (_platform, registry) = setup();
+        let init = registry.create_process(None, 0).unwrap();
+        let child = registry.create_process(Some(init), 17).unwrap();
+
+        // Make child a group leader first
+        registry
+            .set_pgid(child, child, ProcessGroupId::from(child))
+            .unwrap()
+            .unwrap();
+
+        // setsid should fail — child is already a process group leader
+        assert_eq!(
+            registry.setsid(child),
+            Some(Err(SetsidError::AlreadyGroupLeader))
+        );
+    }
+
+    #[test]
+    fn test_setsid_init_fails() {
+        let (_platform, registry) = setup();
+        let init = registry.create_process(None, 0).unwrap();
+
+        // Init is always a group leader (pgid == pid)
+        assert_eq!(
+            registry.setsid(init),
+            Some(Err(SetsidError::AlreadyGroupLeader))
         );
     }
 }

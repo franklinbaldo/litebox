@@ -14,7 +14,9 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use litebox::event::wait::WaitError;
+use litebox::mm::linux::PAGE_SIZE;
 use litebox::mm::linux::VmFlags;
+use litebox::platform::PageManagementProvider;
 use litebox::platform::RawMutPointer as _;
 use litebox::platform::ThreadProvider;
 use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
@@ -515,10 +517,14 @@ impl<FS: ShimFS> Task<FS> {
 
         self.thread.detach_from_process();
 
-        // If this was the last thread in the process, notify the core registry
-        // and release the VA partition.
+        // If this was the last thread in the process, close all open FDs and
+        // notify the core registry.
         if self.thread.process.nr_threads() == 0 {
             use litebox::platform::AddressSpaceProvider;
+
+            // Close all remaining open file descriptors. This is essential for
+            // releasing resources like pipe write ends so that readers see EOF.
+            self.close_all_fds();
 
             let exit_status = {
                 let inner = self.thread.process.inner.lock();
@@ -535,9 +541,16 @@ impl<FS: ShimFS> Task<FS> {
             // Release the process's VA partition. For a vfork child that
             // hasn't exec'd, destroy the child's reserved partition (from
             // fork_context), not the parent's shared ProcessState.
-            let as_id = match self.fork_context.get_mut() {
-                Some(fc) => fc.address_space_id,
-                None => self.process_state.borrow().address_space_id,
+            let as_id = if let Some(fc) = self.fork_context.get_mut() {
+                fc.address_space_id
+            } else {
+                // Release all user memory mappings before destroying the
+                // address space. This is safe because the process is
+                // exiting and no threads remain to access this memory.
+                let ps = self.process_state.borrow();
+                unsafe { ps.pm.release_memory(|_, _| true) }
+                    .expect("failed to release memory on exit");
+                ps.address_space_id
             };
             let r = self.global.platform.destroy_address_space(as_id);
             debug_assert!(
@@ -778,8 +791,8 @@ impl<FS: ShimFS> Task<FS> {
     /// Creates a new thread or process.
     ///
     /// Thread creation requires `CLONE_VM | CLONE_THREAD | CLONE_SIGHAND | CLONE_FILES`.
-    /// Fork-like calls (`!CLONE_VM && !CLONE_THREAD`) create a new process
-    /// (currently returns `ENOSYS` — wired in Step 2.4b).
+    /// Fork-like calls (`!CLONE_VM && !CLONE_THREAD`) create a new child process
+    /// via `do_fork`.
     fn do_clone(
         &self,
         ctx: &litebox_common_linux::PtRegs,
@@ -977,15 +990,20 @@ impl<FS: ShimFS> Task<FS> {
         Ok(usize::try_from(child_tid).unwrap())
     }
 
-    /// Fork path: create a new child process (vfork semantics on userland).
+    /// Fork path: create a new child process.
     ///
-    /// The child temporarily shares the parent's `ProcessState` (PM, files,
-    /// signals, etc.). A VA partition is allocated for the child but remains
-    /// empty until `execve()` loads a new binary into it.
+    /// The behavior depends on the platform's `fork_address_space()` result:
     ///
-    /// **Note:** Step 2.4c adds parent blocking (vfork semantics). Until then,
-    /// both parent and child run concurrently on the same guest stack, which
-    /// is only safe if the child immediately calls `execve()` or `_exit()`.
+    /// * **`SharedWithParent`** (userland): vfork semantics — the child shares
+    ///   the parent's `ProcessState` (address space) but gets an independent
+    ///   FD table at fork time. The parent blocks until the child calls
+    ///   `execve()` or `_exit()`. On `execve`, the child detaches into its
+    ///   own VA partition. The child may safely do `dup2`/`close` between
+    ///   fork and exec without affecting the parent.
+    ///
+    /// * **`Independent`** (kernel): real fork — the platform creates a CoW
+    ///   copy of the address space. The child gets its own `ProcessState` and
+    ///   FD table at fork time, and the parent continues immediately.
     fn do_fork(
         &self,
         ctx: &litebox_common_linux::PtRegs,
@@ -1019,8 +1037,10 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
 
-        // The fork path always uses vfork semantics (child runs on parent's
-        // stack). Reject requests for a separate child stack.
+        // Reject requests for a separate child stack. With vfork (userland)
+        // the child runs on the parent's stack; with independent fork (kernel)
+        // the child's stack is CoW-copied. Either way, an explicit stack
+        // pointer is not applicable for the fork path.
         if args.stack != 0 || args.stack_size != 0 {
             log_unsupported!("fork with explicit child stack");
             return Err(Errno::EINVAL);
@@ -1048,25 +1068,153 @@ impl<FS: ShimFS> Task<FS> {
                     .remove_process(child_process_id);
                 Errno::ENOMEM
             })?;
-        let child_as_id = match forked {
+        let child_as_id = match &forked {
             litebox::platform::address_space::ForkedAddressSpace::SharedWithParent(id)
-            | litebox::platform::address_space::ForkedAddressSpace::Independent(id) => id,
+            | litebox::platform::address_space::ForkedAddressSpace::Independent(id) => *id,
         };
+        let is_shared = matches!(
+            forked,
+            litebox::platform::address_space::ForkedAddressSpace::SharedWithParent(_)
+        );
 
         // 3. Allocate a TID for the child (also serves as PID on the guest side).
         let child_tid = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);
 
-        // 4. Create the vfork synchronization primitive. The parent will block
-        //    on this after spawning the child; the child signals it on exec/exit.
-        let vfork_done = Arc::new(crate::VforkDone::new(self.wait_cx().waker().clone()));
+        // 4. Build per-fork-mode state: vfork (shared with parent) vs
+        //    independent (kernel CoW).
+        let (child_process_state, child_files, child_fork_context, vfork_done, cow_state) =
+            if is_shared {
+                // Userland / shared: child temporarily uses parent's ProcessState
+                // (address space). ForkContext records the child's reserved
+                // partition and the synchronization primitive. On exec, the child
+                // will detach (create own ProcessState).
+                //
+                // FD table is duplicated now so the child can safely do dup2/close
+                // between fork and exec without corrupting the parent's FD state.
+                let vfork_done = Arc::new(crate::VforkDone::new(self.wait_cx().waker().clone()));
+                let child_files_state = Arc::new(
+                    self.files
+                        .borrow()
+                        .clone_for_fork(&mut self.global.litebox.descriptor_table_mut()),
+                );
 
-        // 5. Create the child Task with vfork sharing: uses the parent's
-        //    ProcessState temporarily. The child's own partition is recorded in
-        //    ForkContext for later use by execve().
+                // Set up CoW protection: mark all writable guest pages read-only.
+                // The child's exception handler will snapshot individual pages on
+                // first write, and the parent restores them after vfork_done.
+                let cow_state = {
+                    use litebox::platform::page_mgmt::MemoryRegionPermissions;
+
+                    let mappings = self.process_state.borrow().pm.mappings();
+                    let mut protected = alloc::vec::Vec::new();
+                    for (range, flags) in &mappings {
+                        if !flags.contains(VmFlags::VM_WRITE) {
+                            continue;
+                        }
+                        let len = range.end - range.start;
+                        let orig_perms = {
+                            let mut p = MemoryRegionPermissions::READ;
+                            if flags.contains(VmFlags::VM_EXEC) {
+                                p |= MemoryRegionPermissions::EXEC;
+                            }
+                            // VM_WRITE is the original perm we are temporarily removing
+                            p | MemoryRegionPermissions::WRITE
+                        };
+                        // Remove write permission without updating VMA tracking.
+                        let ro_perms = orig_perms & !MemoryRegionPermissions::WRITE;
+                        // SAFETY: pages are mapped; child not yet spawned.
+                        let ok = unsafe {
+                            <crate::Platform as PageManagementProvider<PAGE_SIZE>>::update_permissions(
+                                self.global.platform,
+                                range.start..range.end,
+                                ro_perms,
+                            )
+                            .is_ok()
+                        };
+                        if !ok {
+                            // Undo protections applied so far and abort fork.
+                            for &(base, len, perms) in &protected {
+                                unsafe {
+                                    <crate::Platform as PageManagementProvider<
+                                        PAGE_SIZE,
+                                    >>::update_permissions(
+                                        self.global.platform,
+                                        base..base + len,
+                                        perms,
+                                    )
+                                    .expect("CoW setup rollback: failed to restore permissions");
+                                }
+                            }
+                            return Err(Errno::ENOMEM);
+                        }
+                        protected.push((range.start, len, orig_perms));
+                    }
+                    Arc::new(crate::CowState {
+                        protected_ranges: protected,
+                        dirty_pages: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
+                    })
+                };
+
+                let fc = crate::ForkContext {
+                    address_space_id: child_as_id,
+                    vfork_done: vfork_done.clone(),
+                    cow_state: Some(cow_state.clone()),
+                };
+                (
+                    self.process_state.clone(),                  // share parent's PM
+                    core::cell::RefCell::new(child_files_state), // independent FD table
+                    Some(fc),
+                    Some(vfork_done),
+                    Some(cow_state),
+                )
+            } else {
+                // Kernel / independent: child has its own CoW address space from
+                // the platform. Create an independent ProcessState and duplicate
+                // the FD table now (not deferred to exec).
+                let child_range = self
+                    .global
+                    .platform
+                    .address_space_range(child_as_id)
+                    .expect("child address space must be valid");
+                let child_ps = Arc::new(crate::ProcessState {
+                    pm: litebox::mm::PageManager::new(&self.global.litebox, child_range),
+                    address_space_id: child_as_id,
+                });
+                let child_files_state = Arc::new(
+                    self.files
+                        .borrow()
+                        .clone_for_fork(&mut self.global.litebox.descriptor_table_mut()),
+                );
+                (
+                    core::cell::RefCell::new(child_ps),          // own ProcessState
+                    core::cell::RefCell::new(child_files_state), // own FD table
+                    None,                                        // no ForkContext
+                    None,                                        // no vfork sync
+                    None,                                        // no CoW state
+                )
+            };
+
+        // 5a. Create the child Task.
+        // The child needs the parent's guest TLS (fsbase). On a new host
+        // thread, the per-thread guest_fsbase is zero, so we must explicitly
+        // pass the parent's value.
+        #[cfg(target_arch = "x86_64")]
+        let parent_tls = {
+            let punchthrough = litebox_common_linux::PunchthroughSyscall::GetFsBase;
+            let token = self
+                .global
+                .platform
+                .get_punchthrough_token_for(punchthrough)
+                .expect("GetFsBase punchthrough");
+            let fsbase = token.execute().expect("GetFsBase execute");
+            Some(crate::MutPtr::<u8>::from_usize(fsbase))
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let parent_tls = None;
+
         let child_thread = ThreadState::new_process(child_tid);
         child_thread.init_state.set(ThreadInitState::NewThread {
-            stack: None, // vfork: use parent's stack
-            tls: None,   // inherit parent's TLS
+            stack: None,     // vfork: parent's stack; independent: CoW copy
+            tls: parent_tls, // inherit parent's guest TLS
             set_child_tid: None,
         });
 
@@ -1076,7 +1224,7 @@ impl<FS: ShimFS> Task<FS> {
                 Box::new(NewThreadArgs {
                     task: Task {
                         global: self.global.clone(),
-                        process_state: self.process_state.clone(), // vfork: share parent's PM
+                        process_state: child_process_state,
                         wait_state: crate::wait::WaitState::new(self.global.platform),
                         thread: child_thread,
                         process_id: child_process_id,
@@ -1086,12 +1234,9 @@ impl<FS: ShimFS> Task<FS> {
                         credentials: self.credentials.clone(),
                         comm: self.comm.clone(),
                         fs: self.fs.clone(),
-                        files: self.files.clone(),
+                        files: child_files,
                         signals: self.signals.clone_for_new_task(),
-                        fork_context: core::cell::RefCell::new(Some(crate::ForkContext {
-                            address_space_id: child_as_id,
-                            vfork_done: vfork_done.clone(),
-                        })),
+                        fork_context: core::cell::RefCell::new(child_fork_context),
                     },
                 }),
             )
@@ -1104,14 +1249,61 @@ impl<FS: ShimFS> Task<FS> {
                 .litebox
                 .process_registry()
                 .remove_process(child_process_id);
+            // On failure, restore write permissions if CoW was set up.
+            if let Some(cow) = &cow_state {
+                for &(base, len, orig_perms) in &cow.protected_ranges {
+                    unsafe {
+                        <crate::Platform as PageManagementProvider<PAGE_SIZE>>::update_permissions(
+                            self.global.platform,
+                            base..base + len,
+                            orig_perms,
+                        )
+                        .expect("CoW spawn-failure cleanup: failed to restore permissions");
+                    }
+                }
+            }
             return Err(Errno::ENOMEM);
         }
 
-        // 6. Block parent until child execs or exits (vfork semantics).
-        //    Like Linux's TASK_UNINTERRUPTIBLE wait: keep blocking even if
-        //    interrupted, because parent and child share the same guest stack.
-        while !vfork_done.is_done() {
-            let _ = self.wait_cx().wait_until(|| vfork_done.is_done());
+        // 6. For vfork (shared), block the parent until child execs or exits.
+        //    For independent fork, the parent continues immediately.
+        if let Some(vd) = vfork_done {
+            // Like Linux's TASK_UNINTERRUPTIBLE wait: keep blocking even if
+            // interrupted, because parent and child share the same guest stack.
+            while !vd.is_done() {
+                let _ = self.wait_cx().wait_until(|| vd.is_done());
+            }
+
+            // Restore dirty pages and re-enable write permissions.
+            if let Some(cow) = &cow_state {
+                // First, restore the original content of any pages the child
+                // modified (snapshotted on first write by the CoW fault handler).
+                let dirty = cow.dirty_pages.lock();
+                for (page_addr, original_data) in dirty.iter() {
+                    // SAFETY: child has finished; parent owns the address space.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            original_data.as_ptr(),
+                            *page_addr as *mut u8,
+                            PAGE_SIZE,
+                        );
+                    }
+                }
+                drop(dirty);
+
+                // Then, restore the original write permissions on all ranges.
+                for &(base, len, orig_perms) in &cow.protected_ranges {
+                    // SAFETY: restoring original permissions.
+                    unsafe {
+                        <crate::Platform as PageManagementProvider<PAGE_SIZE>>::update_permissions(
+                            self.global.platform,
+                            base..base + len,
+                            orig_perms,
+                        )
+                        .expect("CoW restore: failed to re-enable write permissions");
+                    }
+                }
+            }
         }
 
         // Parent returns child's PID.
@@ -1211,7 +1403,12 @@ impl<FS: ShimFS> Task<FS> {
             | litebox_common_linux::RlimitResource::STACK => {
                 self.thread.process.limits.get_rlimit(resource)
             }
-            _ => unimplemented!("Unsupported resource for get_rlimit: {:?}", resource),
+            // Return "unlimited" for resources we don't actively track.
+            // Bash and other programs query these at startup (NPROC, AS, etc.).
+            _ => litebox_common_linux::Rlimit {
+                rlim_cur: usize::MAX,
+                rlim_max: usize::MAX,
+            },
         };
         if let Some(new_limit) = new_limit {
             if new_limit.rlim_cur > new_limit.rlim_max {
@@ -1498,6 +1695,99 @@ impl<FS: ShimFS> Task<FS> {
         self.ppid
     }
 
+    /// Handle syscall `getpgid`. If `pid == 0`, return caller's pgid.
+    pub(crate) fn sys_getpgid(&self, pid: i32) -> Result<u32, Errno> {
+        use litebox::process::ProcessId;
+
+        if pid < 0 {
+            return Err(Errno::EINVAL);
+        }
+        let target = if pid == 0 {
+            self.process_id
+        } else {
+            ProcessId(pid.cast_unsigned())
+        };
+        self.global
+            .litebox
+            .process_registry()
+            .get_pgid(target)
+            .map(litebox::process::ProcessGroupId::as_u32)
+            .ok_or(Errno::ESRCH)
+    }
+
+    /// Handle syscall `setpgid`. pid==0 means self, pgid==0 means use pid as pgid.
+    ///
+    /// NOTE: Linux returns EACCES when a parent calls setpgid on a child that
+    /// has already exec'd. We intentionally omit this check. Under our vfork
+    /// model the parent is blocked until the child execs, so the parent can
+    /// only call setpgid *after* exec — making EACCES the only possible
+    /// outcome on real Linux. Shells make this call for race-avoidance and
+    /// tolerate failure, so being more permissive here is harmless.
+    #[allow(clippy::similar_names)]
+    pub(crate) fn sys_setpgid(&self, pid: i32, pgid: i32) -> Result<(), Errno> {
+        use litebox::process::{ProcessGroupId, ProcessId, SetPgidError};
+
+        if pid < 0 || pgid < 0 {
+            return Err(Errno::EINVAL);
+        }
+        let caller = self.process_id;
+        let target = if pid == 0 {
+            caller
+        } else {
+            ProcessId(pid.cast_unsigned())
+        };
+        let target_pgid = if pgid == 0 {
+            ProcessGroupId::from(target)
+        } else {
+            ProcessGroupId(pgid.cast_unsigned())
+        };
+        match self
+            .global
+            .litebox
+            .process_registry()
+            .set_pgid(caller, target, target_pgid)
+        {
+            Some(Ok(())) => Ok(()),
+            Some(Err(SetPgidError::NotPermitted | SetPgidError::NoSuchGroup)) => Err(Errno::EPERM),
+            None => Err(Errno::ESRCH),
+        }
+    }
+
+    /// Handle syscall `getsid`. If `pid == 0`, return caller's sid.
+    pub(crate) fn sys_getsid(&self, pid: i32) -> Result<u32, Errno> {
+        use litebox::process::ProcessId;
+
+        if pid < 0 {
+            return Err(Errno::EINVAL);
+        }
+        let target = if pid == 0 {
+            self.process_id
+        } else {
+            ProcessId(pid.cast_unsigned())
+        };
+        self.global
+            .litebox
+            .process_registry()
+            .get_sid(target)
+            .map(litebox::process::SessionId::as_u32)
+            .ok_or(Errno::ESRCH)
+    }
+
+    /// Handle syscall `setsid`. Creates a new session with caller as leader.
+    pub(crate) fn sys_setsid(&self) -> Result<u32, Errno> {
+        use litebox::process::SetsidError;
+        match self
+            .global
+            .litebox
+            .process_registry()
+            .setsid(self.process_id)
+        {
+            Some(Ok(sid)) => Ok(sid.as_u32()),
+            Some(Err(SetsidError::AlreadyGroupLeader)) => Err(Errno::EPERM),
+            None => Err(Errno::ESRCH),
+        }
+    }
+
     /// Handle syscall `getuid`.
     pub(crate) fn sys_getuid(&self) -> u32 {
         self.credentials.uid
@@ -1711,11 +2001,9 @@ impl<FS: ShimFS> Task<FS> {
             });
             self.process_state.replace(child_ps);
 
-            // Unshare file descriptors and fs state. During the vfork window
-            // these were shared with the parent (who is blocked), but after
-            // exec the child must have independent copies.
-            let new_files = Arc::new(self.files.borrow().clone_for_fork());
-            self.files.replace(new_files);
+            // Unshare fs state. During the vfork window this was shared with
+            // the parent (who is blocked), but after exec the child must have
+            // its own copy. FD table was already duplicated at fork time.
             let new_fs: Arc<_> = Arc::new(self.fs.borrow().as_ref().clone());
             self.fs.replace(new_fs);
 
