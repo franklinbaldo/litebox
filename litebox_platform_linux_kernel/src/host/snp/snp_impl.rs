@@ -203,13 +203,16 @@ pub unsafe fn run_thread(
 }
 
 fn exit_thread() -> ! {
-    ACTIVE_THREAD_COUNT.fetch_sub(1, Ordering::Release);
-
     let tls = current().unwrap().tls.cast::<ThreadState>();
     if !tls.is_null() {
         let tls = unsafe { Box::from_raw(tls) };
         drop(tls);
     }
+    // `ACTIVE_THREAD_COUNT` is used in [`all_threads_exited`] to determine when all threads have exited,
+    // and the network backgroun worker relies on it to know when to stop. So we need to decrement it after
+    // we drop the TLS because the destructor of the TLS (e.g., 9p fs) still need access to network.
+    ACTIVE_THREAD_COUNT.fetch_sub(1, Ordering::Release);
+
     let r = HostSnpInterface::syscalls(SyscallN::<1, NR_SYSCALL_EXIT> { args: [0] });
     unreachable!("thread has exited: {:?}", r);
 }
@@ -655,6 +658,31 @@ impl litebox::platform::CrngProvider for SnpLinuxKernel {
         let mut random = RANDOM.lock();
         for b in buf.chunks_mut(8) {
             b.copy_from_slice(&random.next_u64().to_ne_bytes()[..b.len()]);
+        }
+    }
+}
+
+impl litebox::platform::SignalProvider for SnpLinuxKernel {
+    type Signal = litebox_common_linux::signal::Signal;
+
+    fn take_pending_signals(&self, mut f: impl FnMut(Self::Signal)) {
+        let current = current().unwrap();
+        let pending_signals: u64;
+        // SAFETY: `current.pending_signals` is a naturally-aligned `u64` that
+        // may be written by the host at any time, so we use `xchg` to perform
+        // an atomic read-and-clear.
+        unsafe {
+            asm!(
+                "xor {tmp}, {tmp}",
+                "xchg [{addr}], {tmp}",
+                addr = in(reg) core::ptr::addr_of_mut!(current.pending_signals),
+                tmp = out(reg) pending_signals,
+                options(nostack),
+            );
+        }
+        let sigs = litebox_common_linux::signal::SigSet::from_u64(pending_signals);
+        for sig in sigs {
+            f(sig);
         }
     }
 }
