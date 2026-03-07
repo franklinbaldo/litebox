@@ -324,6 +324,12 @@ impl<FS: ShimFS> GlobalState<FS> {
         optval: ConstPtr<u8>,
         optlen: usize,
     ) -> Result<(), Errno> {
+        // Deferred TCP option to apply after releasing the descriptor table lock.
+        // This avoids a deadlock: `with_socket_options_mut` holds
+        // `descriptor_table_mut()`, and `net.lock().set_tcp_option()` internally
+        // calls `descriptor_table()`, which would self-deadlock on the RwLock.
+        let mut deferred_tcp_option: Option<litebox::net::TcpOptionData> = None;
+
         match self.setsockopt_common(optname, optval, optlen, |so, value| {
             self.with_socket_options_mut(fd, |opt| {
                 match (so, value) {
@@ -347,30 +353,16 @@ impl<FS: ShimFS> GlobalState<FS> {
                     }
                     (SocketOption::KEEPALIVE, SocketOptionValue::U32(val)) => {
                         let keep_alive = val != 0;
-                        if let Err(err) = self.net.lock().set_tcp_option(
-                            fd,
-                            if keep_alive {
-                                // default time interval is 2 hours
-                                litebox::net::TcpOptionData::KEEPALIVE(Some(
-                                    core::time::Duration::from_secs(2 * 60 * 60),
-                                ))
-                            } else {
-                                litebox::net::TcpOptionData::KEEPALIVE(None)
-                            },
-                        ) {
-                            match err {
-                                litebox::net::errors::SetTcpOptionError::InvalidFd => {
-                                    return Err(Errno::EBADF);
-                                }
-                                litebox::net::errors::SetTcpOptionError::NotTcpSocket => {
-                                    unimplemented!(
-                                        "SO_KEEPALIVE is not supported for non-TCP sockets"
-                                    )
-                                }
-                                _ => unimplemented!(),
-                            }
-                        }
                         opt.keep_alive = keep_alive;
+                        // Defer the net.lock() call to avoid deadlock with
+                        // the descriptor table write lock we currently hold.
+                        deferred_tcp_option = Some(if keep_alive {
+                            litebox::net::TcpOptionData::KEEPALIVE(Some(
+                                core::time::Duration::from_secs(2 * 60 * 60),
+                            ))
+                        } else {
+                            litebox::net::TcpOptionData::KEEPALIVE(None)
+                        });
                     }
                     _ => unreachable!(),
                 }
@@ -378,7 +370,24 @@ impl<FS: ShimFS> GlobalState<FS> {
             })
         }) {
             Err(Errno::ENOPROTOOPT) => {} // fallthrough to handle other options
-            other => return other,
+            other => {
+                // Apply deferred TCP option now that the descriptor table lock
+                // is released.
+                if let Some(tcp_opt) = deferred_tcp_option {
+                    if let Err(err) = self.net.lock().set_tcp_option(fd, tcp_opt) {
+                        match err {
+                            litebox::net::errors::SetTcpOptionError::InvalidFd => {
+                                return Err(Errno::EBADF);
+                            }
+                            litebox::net::errors::SetTcpOptionError::NotTcpSocket => {
+                                unimplemented!("SO_KEEPALIVE is not supported for non-TCP sockets")
+                            }
+                            _ => unimplemented!(),
+                        }
+                    }
+                }
+                return other;
+            }
         }
 
         match optname {
