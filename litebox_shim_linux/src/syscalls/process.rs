@@ -1102,56 +1102,95 @@ impl<FS: ShimFS> Task<FS> {
                 // Set up CoW protection: mark all writable guest pages read-only.
                 // The child's exception handler will snapshot individual pages on
                 // first write, and the parent restores them after vfork_done.
+                //
+                // On Windows, lazy CoW via page faults is not viable: the
+                // exception dispatcher, allocator metadata, and globals all
+                // live in the shared address space. A fault in the CoW handler
+                // itself would be fatal. Instead, eagerly snapshot every
+                // writable page before spawning the child.
                 let cow_state = {
-                    use litebox::platform::page_mgmt::MemoryRegionPermissions;
-
                     let mappings = self.process_state.borrow().pm.mappings();
+                    let mut eager_dirty = alloc::vec::Vec::<(usize, alloc::vec::Vec<u8>)>::new();
+
+                    // On Windows, eagerly snapshot all writable pages and
+                    // leave them writable. The restore path treats these
+                    // identically to lazily-snapshotted dirty pages.
+                    //
+                    // On non-Windows, use lazy CoW: mark writable pages
+                    // read-only and snapshot individual pages on first write.
+                    #[cfg(not(target_os = "windows"))]
                     let mut protected = alloc::vec::Vec::new();
+                    #[cfg(target_os = "windows")]
+                    let protected = alloc::vec::Vec::new();
+
                     for (range, flags) in &mappings {
                         if !flags.contains(VmFlags::VM_WRITE) {
                             continue;
                         }
-                        let len = range.end - range.start;
-                        let orig_perms = {
-                            let mut p = MemoryRegionPermissions::READ;
-                            if flags.contains(VmFlags::VM_EXEC) {
-                                p |= MemoryRegionPermissions::EXEC;
-                            }
-                            // VM_WRITE is the original perm we are temporarily removing
-                            p | MemoryRegionPermissions::WRITE
-                        };
-                        // Remove write permission without updating VMA tracking.
-                        let ro_perms = orig_perms & !MemoryRegionPermissions::WRITE;
-                        // SAFETY: pages are mapped; child not yet spawned.
-                        let ok = unsafe {
-                            <crate::Platform as PageManagementProvider<PAGE_SIZE>>::update_permissions(
-                                self.global.platform,
-                                range.start..range.end,
-                                ro_perms,
-                            )
-                            .is_ok()
-                        };
-                        if !ok {
-                            // Undo protections applied so far and abort fork.
-                            for &(base, len, perms) in &protected {
+
+                        #[cfg(target_os = "windows")]
+                        {
+                            for page_addr in (range.start..range.end).step_by(PAGE_SIZE) {
+                                let mut buf = alloc::vec![0u8; PAGE_SIZE];
+                                // SAFETY: pages are committed; child not yet
+                                // spawned so content is stable.
                                 unsafe {
-                                    <crate::Platform as PageManagementProvider<
+                                    core::ptr::copy_nonoverlapping(
+                                        page_addr as *const u8,
+                                        buf.as_mut_ptr(),
                                         PAGE_SIZE,
-                                    >>::update_permissions(
-                                        self.global.platform,
-                                        base..base + len,
-                                        perms,
-                                    )
-                                    .expect("CoW setup rollback: failed to restore permissions");
+                                    );
                                 }
+                                eager_dirty.push((page_addr, buf));
                             }
-                            return Err(Errno::ENOMEM);
                         }
-                        protected.push((range.start, len, orig_perms));
+
+                        #[cfg(not(target_os = "windows"))]
+                        {
+                            use litebox::platform::page_mgmt::MemoryRegionPermissions;
+
+                            let len = range.end - range.start;
+                            let orig_perms = {
+                                let mut p = MemoryRegionPermissions::READ;
+                                if flags.contains(VmFlags::VM_EXEC) {
+                                    p |= MemoryRegionPermissions::EXEC;
+                                }
+                                // VM_WRITE is the original perm we are temporarily removing
+                                p | MemoryRegionPermissions::WRITE
+                            };
+                            // Remove write permission without updating VMA tracking.
+                            let ro_perms = orig_perms & !MemoryRegionPermissions::WRITE;
+                            // SAFETY: pages are mapped; child not yet spawned.
+                            let ok = unsafe {
+                                <crate::Platform as PageManagementProvider<PAGE_SIZE>>::update_permissions(
+                                    self.global.platform,
+                                    range.start..range.end,
+                                    ro_perms,
+                                )
+                                .is_ok()
+                            };
+                            if !ok {
+                                // Undo protections applied so far and abort fork.
+                                for &(base, len, perms) in &protected {
+                                    unsafe {
+                                        <crate::Platform as PageManagementProvider<
+                                            PAGE_SIZE,
+                                        >>::update_permissions(
+                                            self.global.platform,
+                                            base..base + len,
+                                            perms,
+                                        )
+                                        .expect("CoW setup rollback: failed to restore permissions");
+                                    }
+                                }
+                                return Err(Errno::ENOMEM);
+                            }
+                            protected.push((range.start, len, orig_perms));
+                        }
                     }
                     Arc::new(crate::CowState {
                         protected_ranges: protected,
-                        dirty_pages: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
+                        dirty_pages: litebox::sync::Mutex::new(eager_dirty),
                     })
                 };
 
