@@ -691,6 +691,12 @@ pub enum UnixProtocol {
 #[derive(Debug, IntEnum, Clone, Copy)]
 pub enum IpOption {
     TOS = 1,
+    /// IP_MTU_DISCOVER
+    MTU_DISCOVER = 10,
+    /// IP_RECVERR – enable extended reliable error reporting on UDP sockets.
+    RECVERR = 11,
+    /// IP_PKTINFO
+    PKTINFO = 8,
 }
 
 #[repr(u32)]

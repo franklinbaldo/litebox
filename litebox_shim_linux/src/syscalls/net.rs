@@ -40,6 +40,11 @@ use crate::{
     syscalls::unix::{CSockUnixAddr, UnixSocket, UnixSocketAddr},
 };
 
+/// Linux default for `TCP_KEEPIDLE` (seconds before first keep-alive probe).
+const DEFAULT_TCP_KEEPIDLE_SECS: u32 = 7200;
+/// Linux default for `TCP_KEEPCNT` (number of unacknowledged probes before drop).
+const DEFAULT_TCP_KEEPCNT: u32 = 9;
+
 macro_rules! convert_flags {
     ($src:expr, $src_type:ty, $dst_type:ty, $($flag:ident),+ $(,)?) => {
         {
@@ -393,6 +398,11 @@ impl<FS: ShimFS> GlobalState<FS> {
         match optname {
             SocketOptionName::IP(ip) => match ip {
                 litebox_common_linux::IpOption::TOS => return Err(Errno::EOPNOTSUPP),
+                // Silently accept IP_RECVERR, IP_MTU_DISCOVER, IP_PKTINFO
+                // (used by glibc's DNS resolver; not yet tracked).
+                litebox_common_linux::IpOption::RECVERR
+                | litebox_common_linux::IpOption::MTU_DISCOVER
+                | litebox_common_linux::IpOption::PKTINFO => return Ok(()),
             },
             SocketOptionName::Socket(so) => match so {
                 // handled by `setsockopt_common`
@@ -570,7 +580,10 @@ impl<FS: ShimFS> GlobalState<FS> {
 
         let val: u32 = match optname {
             SocketOptionName::IP(ipopt) => match ipopt {
-                litebox_common_linux::IpOption::TOS => return Err(Errno::EOPNOTSUPP),
+                litebox_common_linux::IpOption::TOS
+                | litebox_common_linux::IpOption::RECVERR
+                | litebox_common_linux::IpOption::MTU_DISCOVER
+                | litebox_common_linux::IpOption::PKTINFO => return Err(Errno::EOPNOTSUPP),
             },
             SocketOptionName::Socket(sopt) => match sopt {
                 // handled by `getsockopt_common`
@@ -615,8 +628,8 @@ impl<FS: ShimFS> GlobalState<FS> {
                     }
                     TcpOption::KEEPCNT => {
                         // smoltcp doesn't track probe count; return Linux
-                        // default (9 probes).
-                        9u32
+                        // default.
+                        DEFAULT_TCP_KEEPCNT
                     }
                     TcpOption::KEEPIDLE => {
                         // Return the keep-alive interval as KEEPIDLE (smoltcp
@@ -628,7 +641,7 @@ impl<FS: ShimFS> GlobalState<FS> {
                         else {
                             unreachable!()
                         };
-                        interval.map_or(7200, |d| d.as_secs().try_into().unwrap())
+                        interval.map_or(DEFAULT_TCP_KEEPIDLE_SECS, |d| d.as_secs().try_into().unwrap())
                     }
                     TcpOption::INFO => {
                         return Err(Errno::EOPNOTSUPP);
