@@ -300,18 +300,23 @@ Some instruction classes that need attention:
 
 ### Conditional compilation
 
-The X18 and TPIDR_EL0 rewriting is Windows-specific. Use `#[cfg]` gates:
+The X18 rewriting is needed on both Windows and macOS (both reserve X18). The
+TPIDR_EL0 memory virtualization is Windows-specific (macOS uses TPIDR_EL0 like
+Linux, so the existing TLS table swap applies). Use `#[cfg]` gates:
 
 ```rust
-#[cfg(target_os = "windows")]
+#[cfg(not(target_os = "linux"))]
 fn find_x18_sites(code: &[u8], base_vaddr: u64) -> Vec<PatchSite> { ... }
 
-#[cfg(target_os = "windows")]
+#[cfg(not(target_os = "linux"))]
 fn emit_x18_gate(...) -> Result<(), Error> { ... }
+
+#[cfg(target_os = "windows")]
+fn find_tpidr_read_sites(code: &[u8], base_vaddr: u64) -> Vec<PatchSite> { ... }
 ```
 
 The Linux rewriter is unchanged. The `hook_syscalls_aarch64` function
-conditionally includes X18/TPIDR rewriting when targeting Windows.
+conditionally includes X18/TPIDR rewriting based on the target OS.
 
 ### Testing strategy
 
@@ -344,3 +349,30 @@ conditionally includes X18/TPIDR rewriting when targeting Windows.
 
 4. **Multi-region support**: Same >128MB binary concern as Linux. Deferred for
    the same reason -- no real-world binaries this large.
+
+## macOS ARM64 (Apple Silicon) -- future target
+
+macOS also reserves X18 (Apple's ABI forbids application use). The X18
+virtualization from this design applies directly.
+
+However, macOS differs from Windows on TPIDR_EL0: Darwin uses TPIDR_EL0 for
+thread-local storage, same as Linux. So the TPIDR handling follows the Linux
+model (TLS table swap), not the Windows model (memory virtualization).
+
+macOS is a hybrid of the two:
+
+| Aspect              | Linux         | Windows              | macOS                |
+|---------------------|---------------|----------------------|----------------------|
+| TPIDR_EL0           | TLS swap      | Memory virtualization| TLS swap (like Linux)|
+| X18                 | Free GPR      | Virtualize (TEB)     | Virtualize (reserved)|
+| TLS table           | Yes           | No                   | Yes                  |
+| Per-thread anchor   | TPIDR_EL0     | X18 (TEB)            | Investigate X18 usage|
+
+Open question for macOS: what does Apple use X18 for? If it points to stable
+per-thread data (like Windows TEB), it could serve as the trampoline anchor
+alongside the TLS table. If Apple's X18 usage is opaque, the trampoline must
+use TPIDR_EL0 as the anchor (like Linux) while also virtualizing X18 -- meaning
+both the TLS loop and X18 gates are needed simultaneously.
+
+Implementation deferred. The X18 gate machinery built for Windows will be
+reusable on macOS.
