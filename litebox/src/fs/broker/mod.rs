@@ -516,6 +516,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: BrokerTransport> super::FileS
         Ok(())
     }
 
+    fn rename(
+        &self,
+        _old_path: impl Arg,
+        _new_path: impl Arg,
+    ) -> Result<(), super::errors::RenameError> {
+        // Rename is not yet supported over the broker transport.
+        Err(super::errors::RenameError::ReadOnlyFileSystem)
+    }
+
     fn read_dir(
         &self,
         fd: &crate::fd::TypedFd<Self>,
