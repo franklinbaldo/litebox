@@ -210,8 +210,8 @@ mod partition_tests {
     }
 
     #[test]
-    #[allow(clippy::cast_possible_truncation)]
     fn last_slot_clipped_to_va_max() {
+        #[allow(clippy::cast_possible_truncation)]
         let last = (va_partitions::NUM_SLOTS - 1) as u32;
         let range = PartitionState::range_of(last);
         assert!(range.end <= va_partitions::VA_MAX);
@@ -238,13 +238,14 @@ mod partition_tests {
     }
 
     #[test]
-    #[allow(clippy::cast_possible_truncation)]
     fn deallocate_rejects_invalid() {
         let mut state = PartitionState::new();
         // Unallocated slot
         assert!(!state.deallocate(0));
         // Out-of-bounds slot
-        assert!(!state.deallocate(va_partitions::NUM_SLOTS as u32));
+        #[allow(clippy::cast_possible_truncation)]
+        let out_of_bounds = va_partitions::NUM_SLOTS as u32;
+        assert!(!state.deallocate(out_of_bounds));
 
         let s0 = state.allocate().unwrap();
         assert!(state.deallocate(s0));
@@ -253,7 +254,6 @@ mod partition_tests {
     }
 
     #[test]
-    #[allow(clippy::cast_possible_truncation)]
     fn is_allocated_tracks_state() {
         let mut state = PartitionState::new();
         assert!(!state.is_allocated(0));
@@ -262,7 +262,9 @@ mod partition_tests {
         assert!(state.deallocate(s0));
         assert!(!state.is_allocated(s0));
         // Out of bounds
-        assert!(!state.is_allocated(va_partitions::NUM_SLOTS as u32));
+        #[allow(clippy::cast_possible_truncation)]
+        let num_slots = va_partitions::NUM_SLOTS as u32;
+        assert!(!state.is_allocated(num_slots));
     }
 
     #[test]
@@ -275,9 +277,10 @@ mod partition_tests {
     }
 
     #[test]
-    #[allow(clippy::cast_possible_truncation)]
     fn partitions_do_not_overlap() {
-        for i in 0..(va_partitions::NUM_SLOTS as u32 - 1) {
+        #[allow(clippy::cast_possible_truncation)]
+        let num_slots = va_partitions::NUM_SLOTS as u32;
+        for i in 0..(num_slots - 1) {
             let a = PartitionState::range_of(i);
             let b = PartitionState::range_of(i + 1);
             assert!(a.end <= b.start, "slot {i} and {} overlap", i + 1);
@@ -285,10 +288,11 @@ mod partition_tests {
     }
 
     #[test]
-    #[allow(clippy::cast_possible_truncation)]
     fn partition_ranges_are_page_aligned() {
         const PAGE_SIZE: usize = 4096;
-        for i in 0..va_partitions::NUM_SLOTS as u32 {
+        #[allow(clippy::cast_possible_truncation)]
+        let num_slots = va_partitions::NUM_SLOTS as u32;
+        for i in 0..num_slots {
             let range = PartitionState::range_of(i);
             assert_eq!(range.start % PAGE_SIZE, 0, "slot {i} start not aligned");
             assert_eq!(range.end % PAGE_SIZE, 0, "slot {i} end not aligned");
