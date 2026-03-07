@@ -1098,59 +1098,87 @@ impl<FS: ShimFS> Task<FS> {
                         .clone_for_fork(&mut self.global.litebox.descriptor_table_mut()),
                 );
 
-                // Set up CoW protection: mark all writable guest pages read-only.
-                // The child's exception handler will snapshot individual pages on
-                // first write, and the parent restores them after vfork_done.
+                // Set up CoW protection for vfork memory sharing.
+                //
+                // The strategy is determined by the platform via
+                // `EAGER_COW_FOR_VFORK`. Platforms where the exception handler
+                // shares the guest address space must use eager snapshots;
+                // others use lazy CoW (mark writable pages read-only and
+                // snapshot on first write fault).
                 let cow_state = {
-                    use litebox::platform::page_mgmt::MemoryRegionPermissions;
-
                     let mappings = self.process_state.borrow().pm.mappings();
+                    let mut eager_dirty = alloc::vec::Vec::<(usize, alloc::vec::Vec<u8>)>::new();
                     let mut protected = alloc::vec::Vec::new();
+
                     for (range, flags) in &mappings {
                         if !flags.contains(VmFlags::VM_WRITE) {
                             continue;
                         }
-                        let len = range.end - range.start;
-                        let orig_perms = {
-                            let mut p = MemoryRegionPermissions::READ;
-                            if flags.contains(VmFlags::VM_EXEC) {
-                                p |= MemoryRegionPermissions::EXEC;
-                            }
-                            // VM_WRITE is the original perm we are temporarily removing
-                            p | MemoryRegionPermissions::WRITE
-                        };
-                        // Remove write permission without updating VMA tracking.
-                        let ro_perms = orig_perms & !MemoryRegionPermissions::WRITE;
-                        // SAFETY: pages are mapped; child not yet spawned.
-                        let ok = unsafe {
-                            <crate::Platform as PageManagementProvider<PAGE_SIZE>>::update_permissions(
-                                self.global.platform,
-                                range.start..range.end,
-                                ro_perms,
-                            )
-                            .is_ok()
-                        };
-                        if !ok {
-                            // Undo protections applied so far and abort fork.
-                            for &(base, len, perms) in &protected {
+
+                        if <crate::Platform as AddressSpaceProvider>::EAGER_COW_FOR_VFORK {
+                            // Eagerly snapshot all writable pages and leave
+                            // them writable. The restore path treats these
+                            // identically to lazily-snapshotted dirty pages.
+                            for page_addr in (range.start..range.end).step_by(PAGE_SIZE) {
+                                let mut buf = alloc::vec![0u8; PAGE_SIZE];
+                                // SAFETY: pages are committed; child not yet
+                                // spawned so content is stable.
                                 unsafe {
-                                    <crate::Platform as PageManagementProvider<
+                                    core::ptr::copy_nonoverlapping(
+                                        page_addr as *const u8,
+                                        buf.as_mut_ptr(),
                                         PAGE_SIZE,
-                                    >>::update_permissions(
-                                        self.global.platform,
-                                        base..base + len,
-                                        perms,
-                                    )
-                                    .expect("CoW setup rollback: failed to restore permissions");
+                                    );
                                 }
+                                eager_dirty.push((page_addr, buf));
                             }
-                            return Err(Errno::ENOMEM);
+                        } else {
+                            // Lazy CoW: mark writable pages read-only and
+                            // snapshot individual pages on first write fault.
+                            use litebox::platform::page_mgmt::MemoryRegionPermissions;
+
+                            let len = range.end - range.start;
+                            let orig_perms = {
+                                let mut p = MemoryRegionPermissions::READ;
+                                if flags.contains(VmFlags::VM_EXEC) {
+                                    p |= MemoryRegionPermissions::EXEC;
+                                }
+                                // VM_WRITE is the original perm we are temporarily removing
+                                p | MemoryRegionPermissions::WRITE
+                            };
+                            // Remove write permission without updating VMA tracking.
+                            let ro_perms = orig_perms & !MemoryRegionPermissions::WRITE;
+                            // SAFETY: pages are mapped; child not yet spawned.
+                            let ok = unsafe {
+                                <crate::Platform as PageManagementProvider<PAGE_SIZE>>::update_permissions(
+                                    self.global.platform,
+                                    range.start..range.end,
+                                    ro_perms,
+                                )
+                                .is_ok()
+                            };
+                            if !ok {
+                                // Undo protections applied so far and abort fork.
+                                for &(base, len, perms) in &protected {
+                                    unsafe {
+                                        <crate::Platform as PageManagementProvider<
+                                            PAGE_SIZE,
+                                        >>::update_permissions(
+                                            self.global.platform,
+                                            base..base + len,
+                                            perms,
+                                        )
+                                        .expect("CoW setup rollback: failed to restore permissions");
+                                    }
+                                }
+                                return Err(Errno::ENOMEM);
+                            }
+                            protected.push((range.start, len, orig_perms));
                         }
-                        protected.push((range.start, len, orig_perms));
                     }
                     Arc::new(crate::CowState {
                         protected_ranges: protected,
-                        dirty_pages: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
+                        dirty_pages: litebox::sync::Mutex::new(eager_dirty),
                     })
                 };
 
@@ -1697,8 +1725,7 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle syscall `getpgid`. If `pid == 0`, return caller's pgid.
     pub(crate) fn sys_getpgid(&self, pid: i32) -> Result<u32, Errno> {
-        use litebox::process::ProcessId;
-
+        use litebox::process::{ProcessGroupId, ProcessId};
         if pid < 0 {
             return Err(Errno::EINVAL);
         }
@@ -1711,7 +1738,7 @@ impl<FS: ShimFS> Task<FS> {
             .litebox
             .process_registry()
             .get_pgid(target)
-            .map(litebox::process::ProcessGroupId::as_u32)
+            .map(ProcessGroupId::as_u32)
             .ok_or(Errno::ESRCH)
     }
 
@@ -1726,7 +1753,6 @@ impl<FS: ShimFS> Task<FS> {
     #[allow(clippy::similar_names)]
     pub(crate) fn sys_setpgid(&self, pid: i32, pgid: i32) -> Result<(), Errno> {
         use litebox::process::{ProcessGroupId, ProcessId, SetPgidError};
-
         if pid < 0 || pgid < 0 {
             return Err(Errno::EINVAL);
         }
@@ -1755,8 +1781,7 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle syscall `getsid`. If `pid == 0`, return caller's sid.
     pub(crate) fn sys_getsid(&self, pid: i32) -> Result<u32, Errno> {
-        use litebox::process::ProcessId;
-
+        use litebox::process::{ProcessId, SessionId};
         if pid < 0 {
             return Err(Errno::EINVAL);
         }
@@ -1769,7 +1794,7 @@ impl<FS: ShimFS> Task<FS> {
             .litebox
             .process_registry()
             .get_sid(target)
-            .map(litebox::process::SessionId::as_u32)
+            .map(SessionId::as_u32)
             .ok_or(Errno::ESRCH)
     }
 
