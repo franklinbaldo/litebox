@@ -72,9 +72,9 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for ElfFile<'_, FS> {
     type Error = Errno;
 
     fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error> {
-        // Use the process's VA range start as the hint so PIE binaries land
-        // within the correct partition for child processes.
-        let hint = self.task.process_state.borrow().pm.addr_min();
+        // Start PIE binaries at a fixed offset into the partition so that the
+        // low addresses remain unmapped (NULL-dereference guard region).
+        let hint = self.task.process_state.borrow().pm.addr_min() + super::PIE_LOAD_OFFSET;
 
         // Allocate a mapping large enough that even if it's maximally misaligned we can
         // still fit `len` bytes.
