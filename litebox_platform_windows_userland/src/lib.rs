@@ -1785,9 +1785,17 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 if state == Win32_Memory::MEM_FREE {
                     return Ok(true);
                 }
-                unsafe {
-                    VirtualFree(r.start as *mut c_void, r.len(), Win32_Memory::MEM_DECOMMIT);
-                }
+                let ret = unsafe {
+                    VirtualFree(r.start as *mut c_void, r.len(), Win32_Memory::MEM_DECOMMIT)
+                };
+                debug_assert_ne!(
+                    ret,
+                    0,
+                    "VirtualFree(MEM_DECOMMIT) failed on child partition region {:p}-{:p}: {}",
+                    r.start as *mut c_void,
+                    r.end as *mut c_void,
+                    std::io::Error::last_os_error()
+                );
                 Ok(true)
             },
         )
