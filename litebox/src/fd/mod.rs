@@ -23,6 +23,9 @@ use crate::utilities::anymap::AnyMap;
 mod tests;
 
 /// Storage of file descriptors and their entries.
+///
+/// Entries are stored type-erased and retrieved via [`TypedFd`] tokens tied to a specific
+/// [`FdEnabledSubsystem`]. Obtain a mutable reference via [`crate::LiteBox::descriptor_table_mut`].
 pub struct Descriptors<Platform: RawSyncPrimitivesProvider> {
     entries: Vec<Option<IndividualEntry<Platform>>>,
 }
@@ -36,8 +39,15 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         Self { entries: vec![] }
     }
 
-    /// Insert `entry` into the descriptor table, returning an `OwnedFd` to this entry.
-    pub(crate) fn insert<Subsystem: FdEnabledSubsystem>(
+    /// Insert `entry` into the descriptor table, returning a [`TypedFd`] token for this entry.
+    ///
+    /// The caller is responsible for storing the returned [`TypedFd`] (possibly via
+    /// [`RawDescriptorStorage::fd_into_raw_integer`]).
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "panic is impossible due to type invariants"
+    )]
+    pub fn insert<Subsystem: FdEnabledSubsystem>(
         &mut self,
         entry: impl Into<Subsystem::Entry>,
     ) -> TypedFd<Subsystem> {
@@ -104,7 +114,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// have been cleared out).
     ///
     /// If the `fd` was already closed out, then (obviously) it does not return an entry.
-    pub(crate) fn remove<Subsystem: FdEnabledSubsystem>(
+    pub fn remove<Subsystem: FdEnabledSubsystem>(
         &mut self,
         fd: &TypedFd<Subsystem>,
     ) -> Option<Subsystem::Entry> {
@@ -288,7 +298,11 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// Use the entry at `fd` as read-only.
     ///
     /// If the `fd` has been closed, then skips applying `f` and returns `None`.
-    pub(crate) fn with_entry<Subsystem, F, R>(&self, fd: &TypedFd<Subsystem>, f: F) -> Option<R>
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "panic is impossible due to type invariants"
+    )]
+    pub fn with_entry<Subsystem, F, R>(&self, fd: &TypedFd<Subsystem>, f: F) -> Option<R>
     where
         Subsystem: FdEnabledSubsystem,
         F: FnOnce(&Subsystem::Entry) -> R,
@@ -303,6 +317,10 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// Use the entry at `fd` as mutably.
     ///
     /// If the `fd` has been closed, then skips applying `f` and returns `None`.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "panic is impossible due to type invariants"
+    )]
     pub(crate) fn with_entry_mut<Subsystem, F, R>(&self, fd: &TypedFd<Subsystem>, f: F) -> Option<R>
     where
         Subsystem: FdEnabledSubsystem,
@@ -313,6 +331,32 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         // somewhere.
         let mut entry = self.entries[fd.x.as_usize()?].as_ref().unwrap().write();
         Some(f(entry.as_subsystem_mut::<Subsystem>()))
+    }
+
+    /// Obtain a handle to the underlying entry without holding the descriptor table lock.
+    pub fn entry_handle<Subsystem: FdEnabledSubsystem>(
+        &self,
+        fd: &TypedFd<Subsystem>,
+    ) -> Option<EntryHandle<Platform>> {
+        let entry = self.entries[fd.x.as_usize()?].as_ref()?;
+        Some(EntryHandle(Arc::clone(&entry.x)))
+    }
+
+    /// Obtain handles for all entries matching a subsystem without holding the table lock.
+    pub(crate) fn entry_handles<Subsystem: FdEnabledSubsystem>(
+        &self,
+    ) -> Vec<EntryHandle<Platform>> {
+        self.entries
+            .iter()
+            .filter_map(|entry| {
+                let entry = entry.as_ref()?;
+                if entry.read().matches_subsystem::<Subsystem>() {
+                    Some(EntryHandle(Arc::clone(&entry.x)))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Use the entry at `internal_fd` as mutably.
@@ -492,6 +536,24 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     }
 }
 
+/// A handle to a descriptor entry that can be used without the table lock.
+pub struct EntryHandle<Platform: RawSyncPrimitivesProvider>(Arc<RwLock<Platform, DescriptorEntry>>);
+impl<Platform: RawSyncPrimitivesProvider> EntryHandle<Platform> {
+    pub fn with_entry<Subsystem, R>(&self, f: impl FnOnce(&Subsystem::Entry) -> R) -> R
+    where
+        Subsystem: FdEnabledSubsystem,
+    {
+        f(self.0.read().as_subsystem::<Subsystem>())
+    }
+
+    pub fn with_entry_mut<Subsystem, R>(&self, f: impl FnOnce(&mut Subsystem::Entry) -> R) -> R
+    where
+        Subsystem: FdEnabledSubsystem,
+    {
+        f(self.0.write().as_subsystem_mut::<Subsystem>())
+    }
+}
+
 /// Result of a [`Descriptors::close_and_duplicate_if_shared`] operation
 pub(crate) enum CloseResult<Subsystem: FdEnabledSubsystem> {
     /// The FD was the last reference and has been closed, returning the entry
@@ -624,6 +686,14 @@ impl RawDescriptorStorage {
         drop(underlying);
         Ok(ret)
     }
+
+    /// Iterate over the raw integer indices of all currently occupied slots.
+    pub fn iter_raw_fds(&self) -> impl Iterator<Item = usize> + '_ {
+        self.stored_fds
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, slot)| slot.as_ref().map(|_| idx))
+    }
 }
 
 macro_rules! multi_subsystem_generic {
@@ -696,14 +766,13 @@ impl RawDescriptorStorage {
     multi_subsystem_generic! {invoke_matching_subsystem_4, typed_fd_at_raw_4, f1 S1, f2 S2, f3 S3, f4 S4}
 }
 
-/// LiteBox subsystems that support having file descriptors.
+/// A LiteBox subsystem that stores its state in the file descriptor table.
 pub trait FdEnabledSubsystem: Sized {
-    #[doc(hidden)]
+    /// The per-FD entry type stored in the descriptor table for this subsystem.
     type Entry: FdEnabledSubsystemEntry + 'static;
 }
 
-/// Entries for a specific [`FdEnabledSubsystem`]
-#[doc(hidden)]
+/// A per-FD entry stored in the descriptor table for a [`FdEnabledSubsystem`].
 pub trait FdEnabledSubsystemEntry: Send + Sync + core::any::Any {}
 
 /// Possible errors from [`RawDescriptorStorage::fd_from_raw_integer`] and
@@ -763,7 +832,7 @@ impl DescriptorEntry {
     /// # Panics
     ///
     /// Panics if invalid for the particular subsystem.
-    fn as_subsystem<Subsystem: FdEnabledSubsystem>(&self) -> &Subsystem::Entry {
+    pub(crate) fn as_subsystem<Subsystem: FdEnabledSubsystem>(&self) -> &Subsystem::Entry {
         (self.entry.as_ref() as &dyn core::any::Any)
             .downcast_ref()
             .unwrap()

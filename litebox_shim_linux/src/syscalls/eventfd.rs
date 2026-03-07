@@ -12,11 +12,14 @@ use litebox::{
         polling::{Pollee, TryOpError},
         wait::WaitContext,
     },
+    fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry},
     fs::OFlags,
     platform::TimeProvider,
     sync::RawSyncPrimitivesProvider,
 };
 use litebox_common_linux::{EfdFlags, errno::Errno};
+
+use crate::Platform;
 
 pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     counter: litebox::sync::Mutex<Platform, u64>,
@@ -25,6 +28,12 @@ pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider + TimeProvider> 
     semaphore: bool,
     pollee: Pollee<Platform>,
 }
+
+pub(crate) struct EventfdSubsystem;
+impl FdEnabledSubsystem for EventfdSubsystem {
+    type Entry = EventFile<Platform>;
+}
+impl FdEnabledSubsystemEntry for EventFile<Platform> {}
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     pub(crate) fn new(count: u64, flags: EfdFlags) -> Self {

@@ -513,41 +513,45 @@ where
 
     /// Close all finished sockets that are marked as closed but waiting for pending data to be sent
     fn close_pending_sockets(&mut self) {
-        for (_, mut handle) in self
+        let handles = self
             .litebox
-            .descriptor_table_mut()
-            .iter_mut::<Network<Platform>>()
-        {
-            let socket_handle = &mut handle.entry;
-            if socket_handle.consider_closed {
-                // check if there is pending data to be sent
-                if let Some(proxy) = &socket_handle.proxy
-                    && proxy.has_pending_tx()
-                {
-                    continue;
-                }
+            .descriptor_table()
+            .entry_handles::<Network<Platform>>();
+        for handle in handles {
+            handle.with_entry_mut::<Network<Platform>, _>(|socket_handle| {
+                let socket_handle = &mut socket_handle.entry;
+                if socket_handle.consider_closed {
+                    // check if there is pending data to be sent
+                    if let Some(proxy) = &socket_handle.proxy
+                        && proxy.has_pending_tx()
+                    {
+                        return;
+                    }
 
-                let closed = socket_handle.with_socket_mut(
-                    &mut self.socket_set,
-                    |tcp_socket| {
-                        let has_pending_data = tcp_socket.may_send() && tcp_socket.send_queue() > 0;
-                        if !has_pending_data {
-                            tcp_socket.close();
-                        }
-                        !has_pending_data
-                    },
-                    |udp_socket| {
-                        let has_pending_data = udp_socket.is_open() && udp_socket.send_queue() > 0;
-                        if !has_pending_data {
-                            udp_socket.close();
-                        }
-                        !has_pending_data
-                    },
-                );
-                if closed {
-                    socket_handle.consider_closed = false;
+                    let closed = socket_handle.with_socket_mut(
+                        &mut self.socket_set,
+                        |tcp_socket| {
+                            let has_pending_data =
+                                tcp_socket.may_send() && tcp_socket.send_queue() > 0;
+                            if !has_pending_data {
+                                tcp_socket.close();
+                            }
+                            !has_pending_data
+                        },
+                        |udp_socket| {
+                            let has_pending_data =
+                                udp_socket.is_open() && udp_socket.send_queue() > 0;
+                            if !has_pending_data {
+                                udp_socket.close();
+                            }
+                            !has_pending_data
+                        },
+                    );
+                    if closed {
+                        socket_handle.consider_closed = false;
+                    }
                 }
-            }
+            });
         }
     }
 

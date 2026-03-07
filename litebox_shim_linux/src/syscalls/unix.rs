@@ -20,6 +20,7 @@ use litebox::{
         polling::{Pollee, TryOpError},
         wait::WaitContext,
     },
+    fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry},
     fs::{Mode, OFlags, errors::OpenError},
     sync::{Mutex, RwLock},
     utils::TruncateExt as _,
@@ -55,6 +56,12 @@ pub(crate) enum UnixSocketAddr {
     /// Abstract namespace socket (not backed by filesystem)
     Abstract(Vec<u8>),
 }
+
+pub(crate) struct UnixSubsystem<FS: ShimFS>(core::marker::PhantomData<FS>);
+impl<FS: ShimFS> FdEnabledSubsystem for UnixSubsystem<FS> {
+    type Entry = UnixSocket<FS>;
+}
+impl<FS: ShimFS> FdEnabledSubsystemEntry for UnixSocket<FS> {}
 
 /// A bound Unix socket address with associated resources.
 ///
