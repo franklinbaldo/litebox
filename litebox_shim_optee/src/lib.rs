@@ -142,7 +142,11 @@ impl OpteeShimBuilder {
     pub fn build(self) -> OpteeShim {
         let global = Arc::new(GlobalState {
             platform: self.platform,
-            pm: PageManager::new(&self.litebox),
+            pm: PageManager::new(
+                &self.litebox,
+                <Platform as litebox::platform::PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MIN
+                    ..<Platform as litebox::platform::PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MAX,
+            ),
             _litebox: self.litebox,
             ta_uuid_map: TaUuidMap::new(),
         });

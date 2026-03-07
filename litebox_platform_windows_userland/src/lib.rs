@@ -325,6 +325,12 @@ impl WindowsUserland {
 
 impl litebox::platform::Provider for WindowsUserland {}
 
+impl litebox::platform::AddressSpaceProvider for WindowsUserland {
+    // All methods default to `Err(NotSupported)` — real implementation comes
+    // when Windows multi-process support is added.
+    type AddressSpaceId = u32;
+}
+
 /// Runs a guest thread using the provided shim and the given initial context.
 ///
 /// This will run until the thread terminates.

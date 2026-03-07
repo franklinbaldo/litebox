@@ -34,16 +34,31 @@ where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
     vmem: RwLock<Platform, Vmem<Platform, ALIGN>>,
+    /// Lower bound (inclusive) of the VA range (cached for lock-free checks).
+    addr_min: usize,
+    /// Upper bound (exclusive) of the VA range (cached for lock-free checks).
+    addr_max: usize,
 }
 
 impl<Platform, const ALIGN: usize> PageManager<Platform, ALIGN>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
-    /// Create a new `PageManager` instance.
-    pub fn new(litebox: &LiteBox<Platform>) -> Self {
-        let vmem = RwLock::new(linux::Vmem::new(litebox.x.platform));
-        Self { vmem }
+    /// Create a new `PageManager` instance for the given VA `range`.
+    ///
+    /// For a single-process setup (or the initial process), pass the full
+    /// platform range `Platform::TASK_ADDR_MIN..Platform::TASK_ADDR_MAX`.
+    /// For child processes, pass the sub-range obtained from
+    /// [`AddressSpaceProvider::address_space_range()`](crate::platform::AddressSpaceProvider::address_space_range).
+    pub fn new(litebox: &LiteBox<Platform>, range: Range<usize>) -> Self {
+        let addr_min = range.start;
+        let addr_max = range.end;
+        let vmem = RwLock::new(linux::Vmem::new(litebox.x.platform, range));
+        Self {
+            vmem,
+            addr_min,
+            addr_max,
+        }
     }
 
     /// Create a mapping with the given flags.
@@ -672,7 +687,7 @@ where
         error_code: u64,
     ) -> Result<(), PageFaultError> {
         let fault_addr = fault_addr & !(ALIGN - 1);
-        if !(Platform::TASK_ADDR_MIN..Platform::TASK_ADDR_MAX).contains(&fault_addr) {
+        if !(self.addr_min..self.addr_max).contains(&fault_addr) {
             return Err(PageFaultError::AccessError("Invalid address"));
         }
 
@@ -680,7 +695,7 @@ where
         // Find the range closest to the fault address
         let (start, vma) = {
             let (r, vma) = vmem
-                .overlapping(fault_addr..Platform::TASK_ADDR_MAX)
+                .overlapping(fault_addr..vmem.addr_max())
                 .next()
                 .ok_or(PageFaultError::AccessError("no mapping"))?;
             (r.start, *vma)
@@ -692,7 +707,7 @@ where
             }
 
             if !vmem
-                .overlapping(Platform::TASK_ADDR_MIN..fault_addr)
+                .overlapping(vmem.addr_min()..fault_addr)
                 .next_back()
                 .is_none_or(|(prev_range, prev_vma)| {
                     // Enforce gap between stack and other preceding non-stack mappings.
