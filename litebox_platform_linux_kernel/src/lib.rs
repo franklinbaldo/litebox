@@ -89,6 +89,12 @@ impl<Host: HostInterface> litebox::platform::SignalProvider for LinuxKernel<Host
     type Signal = litebox_common_linux::signal::Signal;
 }
 
+impl<Host: HostInterface> litebox::platform::AddressSpaceProvider for LinuxKernel<Host> {
+    // All methods default to `Err(NotSupported)` — real implementation comes
+    // when kernel-mode multi-process (separate page tables) is added.
+    type AddressSpaceId = u32;
+}
+
 // TODO: implement pointer validation to ensure the pointers are in user space.
 type UserConstPtr<T> = litebox::platform::common_providers::userspace_pointers::UserConstPtr<
     litebox::platform::common_providers::userspace_pointers::NoValidation,

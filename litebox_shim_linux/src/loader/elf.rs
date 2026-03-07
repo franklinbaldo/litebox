@@ -202,6 +202,7 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
         mut aux: AuxVec,
     ) -> Result<ElfLoadInfo, ElfLoaderError> {
         let global = &self.main.file.task.global;
+        let process_state = &self.main.file.task.process_state;
 
         // Load the main ELF file first so that it gets privileged addresses.
         let info = self
@@ -220,7 +221,7 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
             None
         };
 
-        global.pm.set_initial_brk(info.brk);
+        process_state.pm.set_initial_brk(info.brk);
         aux.insert(AuxKey::AT_PAGESZ, PAGE_SIZE);
         aux.insert(AuxKey::AT_PHDR, info.phdrs_addr);
         aux.insert(AuxKey::AT_PHENT, info.phent_size());
@@ -236,7 +237,7 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
         let sp = unsafe {
             let length = litebox::mm::linux::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
                 .expect("DEFAULT_STACK_SIZE is not page-aligned");
-            global
+            process_state
                 .pm
                 .create_stack_pages(None, length, CreatePagesFlags::empty())
                 .map_err(ElfLoaderError::MappingError)?

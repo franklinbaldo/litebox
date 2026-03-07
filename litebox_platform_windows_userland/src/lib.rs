@@ -349,6 +349,12 @@ impl litebox::platform::SignalProvider for WindowsUserland {
     }
 }
 
+impl litebox::platform::AddressSpaceProvider for WindowsUserland {
+    // All methods default to `Err(NotSupported)` — real implementation comes
+    // when Windows multi-process support is added.
+    type AddressSpaceId = u32;
+}
+
 /// Ensures the module-wide TLS slot index ([`TLS_INDEX`]) has been allocated.
 ///
 /// This must be called before any code that reads `TLS_INDEX`. Both

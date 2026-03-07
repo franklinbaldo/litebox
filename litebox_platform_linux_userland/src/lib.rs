@@ -472,6 +472,13 @@ fn take_pending_host_signals() -> litebox_common_linux::signal::SigSet {
     litebox_common_linux::signal::SigSet::from_u64(u64::from(lo))
 }
 
+impl litebox::platform::AddressSpaceProvider for LinuxUserland {
+    // All methods default to `Err(NotSupported)` — real implementation comes
+    // in Phase 2 when userland multi-process VA partitioning is added.
+    type AddressSpaceId = u32;
+}
+}
+
 /// Runs a guest thread using the provided shim and the given initial context.
 ///
 /// This will run until the thread terminates or returns.

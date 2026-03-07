@@ -325,6 +325,12 @@ impl<FS: ShimFS> Task<FS> {
         &self.thread.process
     }
 
+    /// Returns the core [`ProcessId`](litebox::process::ProcessId) for this task's process.
+    #[expect(dead_code, reason = "scaffolding for multi-process steps 1.2+")]
+    pub(crate) fn current_process_id(&self) -> litebox::process::ProcessId {
+        self.process_id
+    }
+
     /// Set the current task's command name.
     pub(crate) fn set_task_comm(&self, comm: &[u8]) {
         let mut new_comm = [0u8; litebox_common_linux::TASK_COMM_LEN];
@@ -747,8 +753,10 @@ impl<FS: ShimFS> Task<FS> {
                 Box::new(NewThreadArgs {
                     task: Task {
                         global: self.global.clone(),
+                        process_state: self.process_state.clone(),
                         wait_state: crate::wait::WaitState::new(self.global.platform),
                         thread,
+                        process_id: self.process_id,
                         pid: self.pid,
                         tid: child_tid,
                         ppid: self.ppid,
@@ -1222,7 +1230,7 @@ impl<FS: ShimFS> Task<FS> {
                 let Some(count) = core::num::NonZeroU32::new(count) else {
                     return Ok(0);
                 };
-                self.global.futex_manager.wake(addr, count, None)? as usize
+                self.global.futex_manager.wake(addr, count, None, 0)? as usize
             }
             FutexArgs::Wait {
                 addr,
@@ -1237,6 +1245,7 @@ impl<FS: ShimFS> Task<FS> {
                     addr,
                     val,
                     None,
+                    0,
                 )?;
                 0
             }
@@ -1264,6 +1273,7 @@ impl<FS: ShimFS> Task<FS> {
                     addr,
                     val,
                     core::num::NonZeroU32::new(bitmask),
+                    0,
                 )?;
                 0
             }
@@ -1358,7 +1368,7 @@ impl<FS: ShimFS> Task<FS> {
 
         // Don't release reserved mappings.
         let release = |_r: Range<usize>, vm: VmFlags| !vm.is_empty();
-        unsafe { self.global.pm.release_memory(release) }
+        unsafe { self.process_state.pm.release_memory(release) }
             .expect("failed to release memory mappings");
 
         litebox_platform_multiplex::Platform::clear_guest_thread_local_storage(
