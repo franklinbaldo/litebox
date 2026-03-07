@@ -1238,7 +1238,7 @@ impl<FS: ShimFS> Task<FS> {
         let abs_path = resolved.normalized().map_err(|_| Errno::EINVAL)?;
 
         // Verify the path exists and is a directory.
-        match self.global.fs.file_status(abs_path.as_str()) {
+        match self.files.borrow().fs.file_status(abs_path.as_str()) {
             Ok(status) => {
                 if status.file_type != FileType::Directory {
                     return Err(Errno::ENOTDIR);

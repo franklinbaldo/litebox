@@ -10,7 +10,7 @@ mod globals;
 
 extern crate alloc;
 
-use alloc::{borrow::ToOwned, string::ToString};
+use alloc::borrow::ToOwned;
 use litebox::{
     fs::FileSystem as _,
     utils::{ReinterpretUnsignedExt as _, TruncateExt as _},
@@ -24,7 +24,7 @@ type DefaultFS = litebox::fs::layered::FileSystem<
     litebox::fs::layered::FileSystem<
         Platform,
         litebox::fs::devices::FileSystem<Platform>,
-        litebox::fs::nine_p::FileSystem<Platform, litebox_shim_linux::nine_p::ShimTransport>,
+        litebox::fs::nine_p::FileSystem<Platform, litebox_shim_linux::transport::ShimTransport>,
     >,
 >;
 
@@ -184,18 +184,14 @@ pub extern "C" fn sandbox_process_init(
     };
 
     let shim = &raw const SHIM;
+    #[allow(clippy::missing_panics_doc)]
     let shim = unsafe { (*shim).as_ref().expect("initialized") };
     let litebox = shim.litebox();
     let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
     in_mem_fs.with_root_privileges(|fs| {
         let mode = litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO;
-        if let Err(err) = fs.mkdir("/tmp", mode) {
-            match err {
-                litebox::fs::errors::MkdirError::AlreadyExists => {
-                    fs.chmod("/tmp", mode).expect("Failed to call chmod");
-                }
-                _ => panic!("failed to create /tmp"),
-            }
+        if let Err(litebox::fs::errors::MkdirError::AlreadyExists) = fs.mkdir("/tmp", mode) {
+            let _ = fs.chmod("/tmp", mode);
         }
     });
 
@@ -203,11 +199,22 @@ pub extern "C" fn sandbox_process_init(
         core::net::Ipv4Addr::new(10, 0, 0, 1),
         8888,
     ));
-    let transport = shim
-        .tcp_connection(socket_addr)
-        .expect("failed to connect to 9p server");
-    let nine_p = litebox::fs::nine_p::FileSystem::new(litebox, transport, 65536, "root", "/tmp")
-        .expect("failed to create 9P filesystem");
+    let Ok(transport) = shim.tcp_connection(socket_addr) else {
+        ghcb_prints("failed to connect to 9p server");
+        litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
+            globals::SM_SEV_TERM_SET,
+            globals::SM_TERM_GENERAL,
+        );
+    };
+    let Ok(nine_p) =
+        litebox::fs::nine_p::FileSystem::new(litebox, transport, 65536, "root", "/tmp")
+    else {
+        ghcb_prints("failed to create 9P filesystem");
+        litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
+            globals::SM_SEV_TERM_SET,
+            globals::SM_TERM_GENERAL,
+        );
+    };
     let dev_stdio = litebox::fs::devices::FileSystem::new(litebox);
     let default_fs = litebox::fs::layered::FileSystem::new(
         litebox,
@@ -223,7 +230,6 @@ pub extern "C" fn sandbox_process_init(
     let fs = alloc::sync::Arc::new(default_fs);
 
     // Loading a program may trigger page faults, so we need to set SHIM before this.
-    #[allow(clippy::missing_panics_doc)]
     let program = match shim.load_program(fs, platform.init_task(boot_params), &program, argv, envp)
     {
         Ok(program) => program,
