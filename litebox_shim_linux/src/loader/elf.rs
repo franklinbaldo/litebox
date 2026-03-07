@@ -253,6 +253,11 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
         })
     }
 
+    /// Returns the full path used to load this ELF.
+    pub fn path(&self) -> &str {
+        self.path
+    }
+
     /// Returns the command name from the ELF path.
     pub fn comm(&self) -> &[u8] {
         self.path.rsplit('/').next().unwrap_or("unknown").as_bytes()

@@ -32,6 +32,8 @@ pub(crate) struct FsState {
     ///
     /// Must end with a '/'.
     cwd: litebox::sync::RwLock<Platform, String>,
+    /// The path to the current executable (returned by `/proc/self/exe`).
+    exe_path: litebox::sync::RwLock<Platform, String>,
 }
 
 impl Clone for FsState {
@@ -39,6 +41,7 @@ impl Clone for FsState {
         Self {
             umask: self.umask.load(Ordering::Relaxed).into(),
             cwd: litebox::sync::RwLock::new(self.cwd.read().clone()),
+            exe_path: litebox::sync::RwLock::new(self.exe_path.read().clone()),
         }
     }
 }
@@ -48,11 +51,16 @@ impl FsState {
         Self {
             umask: (Mode::WGRP | Mode::WOTH).bits().into(),
             cwd: litebox::sync::RwLock::new(String::from("/")),
+            exe_path: litebox::sync::RwLock::new(String::new()),
         }
     }
 
     fn umask(&self) -> Mode {
         Mode::from_bits_retain(self.umask.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn set_exe_path(&self, path: String) {
+        *self.exe_path.write() = path;
     }
 }
 
@@ -689,6 +697,13 @@ impl<FS: ShimFS> Task<FS> {
                 1 => return Ok("/dev/stdout".to_string()),
                 2 => return Ok("/dev/stderr".to_string()),
                 _ => unimplemented!(),
+            }
+        }
+
+        if fullpath == "/proc/self/exe" {
+            let exe = self.fs.borrow().exe_path.read().clone();
+            if !exe.is_empty() {
+                return Ok(exe);
             }
         }
 

@@ -1387,6 +1387,7 @@ impl<FS: ShimFS> Task<FS> {
 
         let load_info = loader.load(argv, envp, self.init_auxv())?;
 
+        self.fs.borrow().set_exe_path(loader.path().into());
         self.set_task_comm(loader.comm());
 
         self.thread
