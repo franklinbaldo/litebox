@@ -406,6 +406,8 @@ impl<FS: ShimFS> GlobalState<FS> {
                 SocketOption::RCVBUF | SocketOption::SNDBUF => return Err(Errno::EOPNOTSUPP),
                 // Socket does not support these options
                 SocketOption::TYPE | SocketOption::PEERCRED => return Err(Errno::ENOPROTOOPT),
+                // SO_ERROR is read-only
+                SocketOption::ERROR => return Err(Errno::ENOPROTOOPT),
             },
             SocketOptionName::TCP(to) => match to {
                 TcpOption::CONGESTION => {
@@ -428,7 +430,32 @@ impl<FS: ShimFS> GlobalState<FS> {
                         },
                     )?;
                 }
-                TcpOption::KEEPCNT | TcpOption::KEEPIDLE | TcpOption::INFO => {
+                TcpOption::KEEPCNT => {
+                    // smoltcp doesn't support fine-grained keep-alive probe
+                    // counts. Accept and ignore the value so applications that
+                    // set it (e.g., curl) don't fail.
+                    let _val: u32 = super::read_from_user(optval, size_of::<u32>())?;
+                }
+                TcpOption::KEEPIDLE => {
+                    // smoltcp uses a single keep-alive interval (set via
+                    // TCP_KEEPINTVL / SO_KEEPALIVE). Accept KEEPIDLE and
+                    // forward it as the keep-alive interval so the setting
+                    // takes effect.
+                    let val: u32 = super::read_from_user(optval, size_of::<u32>())?;
+                    if val == 0 {
+                        return Err(Errno::EINVAL);
+                    }
+                    self.net
+                        .lock()
+                        .set_tcp_option(
+                            fd,
+                            litebox::net::TcpOptionData::KEEPALIVE(Some(
+                                core::time::Duration::from_secs(u64::from(val)),
+                            )),
+                        )
+                        .expect("set TCP_KEEPALIVE should succeed");
+                }
+                TcpOption::INFO => {
                     return Err(Errno::EOPNOTSUPP);
                 }
                 TcpOption::NODELAY | TcpOption::CORK => {
@@ -560,6 +587,9 @@ impl<FS: ShimFS> GlobalState<FS> {
                     litebox::net::SOCKET_BUFFER_SIZE.truncate()
                 }
                 SocketOption::PEERCRED => return Err(Errno::ENOPROTOOPT),
+                // SO_ERROR returns (and clears) the pending socket error.
+                // We don't track pending errors yet, so always report 0.
+                SocketOption::ERROR => 0,
             },
             SocketOptionName::TCP(tcpopt) => {
                 match tcpopt {
@@ -583,7 +613,24 @@ impl<FS: ShimFS> GlobalState<FS> {
                             .ok_or(Errno::EFAULT)?;
                         return Ok(len);
                     }
-                    TcpOption::KEEPCNT | TcpOption::KEEPIDLE | TcpOption::INFO => {
+                    TcpOption::KEEPCNT => {
+                        // smoltcp doesn't track probe count; return Linux
+                        // default (9 probes).
+                        9u32
+                    }
+                    TcpOption::KEEPIDLE => {
+                        // Return the keep-alive interval as KEEPIDLE (smoltcp
+                        // doesn't distinguish idle vs interval).
+                        let TcpOptionData::KEEPALIVE(interval) = self
+                            .net
+                            .lock()
+                            .get_tcp_option(fd, litebox::net::TcpOptionName::KEEPALIVE)?
+                        else {
+                            unreachable!()
+                        };
+                        interval.map_or(7200, |d| d.as_secs().try_into().unwrap())
+                    }
+                    TcpOption::INFO => {
                         return Err(Errno::EOPNOTSUPP);
                     }
                     TcpOption::KEEPINTVL => {
@@ -1578,7 +1625,7 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EBADF);
         };
         let optname = SocketOptionName::try_from(level, optname).ok_or_else(|| {
-            log_unsupported!("setsockopt(level = {level}, optname = {optname})");
+            log_unsupported!("getsockopt(level = {level}, optname = {optname})");
             Errno::EINVAL
         })?;
         let len = optlen.read_at_offset(0).ok_or(Errno::EFAULT)?;
