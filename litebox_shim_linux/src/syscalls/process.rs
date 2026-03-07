@@ -1077,8 +1077,19 @@ impl<FS: ShimFS> Task<FS> {
             litebox::platform::address_space::ForkedAddressSpace::SharedWithParent(_)
         );
 
-        // 3. Allocate a TID for the child (also serves as PID on the guest side).
-        let child_tid = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);
+        // 3. Allocate a TID for the child. For the initial thread of a
+        //    forked process, pid == tid == the ProcessId assigned by the
+        //    registry. This ensures getpid(), gettid(), and the value
+        //    returned by fork() to the parent all agree, so waitpid()
+        //    can find the child.
+        let child_pid = i32::try_from(child_process_id.0).map_err(|_| {
+            self.global
+                .litebox
+                .process_registry()
+                .remove_process(child_process_id);
+            Errno::EAGAIN
+        })?;
+        let child_tid = child_pid;
 
         // 4. Build per-fork-mode state: vfork (shared with parent) vs
         //    independent (kernel CoW).
@@ -1239,7 +1250,7 @@ impl<FS: ShimFS> Task<FS> {
         #[cfg(not(target_arch = "x86_64"))]
         let parent_tls = None;
 
-        let child_thread = ThreadState::new_process(child_tid);
+        let child_thread = ThreadState::new_process(child_pid);
         child_thread.init_state.set(ThreadInitState::NewThread {
             stack: None,     // vfork: parent's stack; independent: CoW copy
             tls: parent_tls, // inherit parent's guest TLS
@@ -1256,7 +1267,7 @@ impl<FS: ShimFS> Task<FS> {
                         wait_state: crate::wait::WaitState::new(self.global.platform),
                         thread: child_thread,
                         process_id: child_process_id,
-                        pid: child_tid,
+                        pid: child_pid,
                         ppid: self.pid,
                         tid: child_tid,
                         credentials: self.credentials.clone(),
@@ -1335,7 +1346,7 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         // Parent returns child's PID.
-        Ok(usize::try_from(child_tid).unwrap())
+        Ok(usize::try_from(child_pid).unwrap())
     }
 
     /// Handle syscall `set_tid_address`.
