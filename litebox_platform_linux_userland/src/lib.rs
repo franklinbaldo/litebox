@@ -2629,7 +2629,7 @@ fn signal_handler_exit_guest(
             guest_context_top = out(reg) guest_context_top,
             options(nostack, preserves_flags)
         };
-        Some(guest_context_top.offset(-1))
+        Some(guest_context_top.sub(1))
     }
 }
 
@@ -2735,7 +2735,7 @@ fn signal_handler_exit_guest(
         let ctx_top_ptr = (host_tls as *const usize).byte_offset(tls_offset_guest_context_top());
         let guest_context_top =
             core::ptr::read_volatile(ctx_top_ptr) as *mut litebox_common_linux::PtRegs;
-        Some(guest_context_top.offset(-1))
+        Some(guest_context_top.sub(1))
     }
 }
 
