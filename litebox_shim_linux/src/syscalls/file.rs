@@ -77,12 +77,17 @@ impl<FS: ShimFS> FilesState<FS> {
     /// Creates an independent FD table that shares the underlying file objects
     /// (via `Arc`) with the parent. This matches POSIX fork semantics: the
     /// child gets its own FD number space but file descriptions (offsets,
-    /// flags) are shared.
-    pub fn clone_for_fork(&self) -> Self {
+    /// flags) are shared. Each raw fd is duplicated in the global descriptor
+    /// table so the child's `OwnedFd` instances are independent from the
+    /// parent's.
+    pub fn clone_for_fork(
+        &self,
+        global_dt: &mut litebox::fd::Descriptors<litebox_platform_multiplex::Platform>,
+    ) -> Self {
         Self {
             file_descriptors: litebox::sync::RwLock::new(self.file_descriptors.read().clone()),
             raw_descriptor_store: litebox::sync::RwLock::new(
-                self.raw_descriptor_store.read().clone_for_fork(),
+                self.raw_descriptor_store.read().clone_for_fork(global_dt),
             ),
         }
     }
@@ -1504,7 +1509,10 @@ impl<FS: ShimFS> Task<FS> {
             _ => {
                 #[cfg(debug_assertions)]
                 litebox::log_println!(self.global.platform, "\n\n\n{:?}\n\n\n", arg);
-                todo!()
+                // Return ENOTTY for unsupported ioctls rather than panicking.
+                // Complex programs (e.g., bash) probe terminal capabilities and
+                // handle ENOTTY gracefully.
+                Err(Errno::ENOTTY)
             }
         }
     }
