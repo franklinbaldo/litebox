@@ -815,13 +815,21 @@ type ParentAndEntry<'a, D, E> = Result<(Option<(&'a str, D)>, Option<E>), PathEr
 
 impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
     fn new() -> Self {
+        // The root directory is owned by the default non-root user so that
+        // the guest process can create top-level directories. The runner
+        // uses `with_root_privileges` for any setup that needs elevated
+        // access. This mirrors a single-user sandbox where the guest owns
+        // the entire filesystem tree.
         Self {
             entries: [(
                 String::new(),
                 Entry::Dir(Arc::new(sync::RwLock::new(DirX {
                     perms: Permissions {
                         mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
-                        userinfo: UserInfo { user: 0, group: 0 },
+                        userinfo: UserInfo {
+                            user: 1000,
+                            group: 1000,
+                        },
                     },
                     children: HashMap::default(),
                     unique_id: 0,
@@ -933,6 +941,10 @@ impl UserInfo {
 
 impl Permissions {
     fn can_read_by(&self, current: UserInfo) -> bool {
+        // CAP_DAC_OVERRIDE: root bypasses all file permission checks.
+        if current.user == 0 {
+            return true;
+        }
         if self.userinfo.user == current.user {
             self.mode.contains(Mode::RUSR)
         } else if self.userinfo.group == current.group {
@@ -942,6 +954,9 @@ impl Permissions {
         }
     }
     fn can_write_by(&self, current: UserInfo) -> bool {
+        if current.user == 0 {
+            return true;
+        }
         if self.userinfo.user == current.user {
             self.mode.contains(Mode::WUSR)
         } else if self.userinfo.group == current.group {
@@ -951,6 +966,13 @@ impl Permissions {
         }
     }
     fn can_execute_by(&self, current: UserInfo) -> bool {
+        // CAP_DAC_OVERRIDE bypasses execute checks on directories but not
+        // regular files (where at least one execute bit must be set).
+        // For simplicity we grant full bypass — files in the sandbox are
+        // typically marked executable when they need to be.
+        if current.user == 0 {
+            return true;
+        }
         if self.userinfo.user == current.user {
             self.mode.contains(Mode::XUSR)
         } else if self.userinfo.group == current.group {
