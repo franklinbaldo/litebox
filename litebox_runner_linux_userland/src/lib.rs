@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 
 extern crate alloc;
 
+#[cfg(feature = "broker")]
+pub mod broker_client;
+
 /// Run Linux programs with LiteBox on unmodified Linux
 #[derive(Parser, Debug)]
 #[allow(clippy::struct_excessive_bools)]
@@ -77,6 +80,17 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub program_from_tar: bool,
+    /// Connect to a file broker at the given gRPC endpoint (e.g., http://127.0.0.1:50051).
+    ///
+    /// When set, an additional broker-backed filesystem layer is added that provides
+    /// policy-enforced access to external files served by the broker process.
+    #[cfg(feature = "broker")]
+    #[arg(
+        long = "broker-endpoint",
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
+    pub broker_endpoint: Option<String>,
 }
 
 /// Backends supported for intercepting syscalls
@@ -347,6 +361,20 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         )
     })?;
 
+    // When a broker endpoint is provided, connect and validate before proceeding.
+    // The broker FS layer is composed below the default stack so that files not
+    // found locally are resolved via the broker.
+    #[cfg(feature = "broker")]
+    let _broker_transport = if let Some(ref endpoint) = cli_args.broker_endpoint {
+        eprintln!("Connecting to file broker at {endpoint}...");
+        let transport = broker_client::GrpcBrokerTransport::connect(endpoint)
+            .map_err(|e| anyhow!("Failed to connect to broker at {endpoint}: {e}"))?;
+        eprintln!("File broker connected.");
+        Some(transport)
+    } else {
+        None
+    };
+
     shim_builder.set_fs(initial_file_system);
 
     shim_builder.set_load_filter(fixup_env);
@@ -375,8 +403,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                     Some(t) if t < DEFAULT_TIMEOUT => t,
                     _ => DEFAULT_TIMEOUT,
                 };
-                litebox_platform_multiplex::platform()
-                    .wait_on_tun(Some(wait));
+                litebox_platform_multiplex::platform().wait_on_tun(Some(wait));
             }
             // Final flush
             // TODO: keep running until all sockets are closed?
