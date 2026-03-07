@@ -352,27 +352,100 @@ conditionally includes X18/TPIDR rewriting based on the target OS.
 
 ## macOS ARM64 (Apple Silicon) -- future target
 
-macOS also reserves X18 (Apple's ABI forbids application use). The X18
-virtualization from this design applies directly.
+### XNU kernel source findings
 
-However, macOS differs from Windows on TPIDR_EL0: Darwin uses TPIDR_EL0 for
-thread-local storage, same as Linux. So the TPIDR handling follows the Linux
-model (TLS table swap), not the Windows model (memory virtualization).
+Analysis of XNU source (`osfmk/arm64/locore.s`, `osfmk/arm64/pcb.c`) reveals
+that macOS ARM64 differs significantly from both our earlier assumptions and
+from Windows ARM64.
 
-macOS is a hybrid of the two:
+#### X18 is NOT a reserved platform register on macOS
 
-| Aspect              | Linux         | Windows              | macOS                |
-|---------------------|---------------|----------------------|----------------------|
-| TPIDR_EL0           | TLS swap      | Memory virtualization| TLS swap (like Linux)|
-| X18                 | Free GPR      | Virtualize (TEB)     | Virtualize (reserved)|
-| TLS table           | Yes           | No                   | Yes                  |
-| Per-thread anchor   | TPIDR_EL0     | X18 (TEB)            | Investigate X18 usage|
+Contrary to initial assumption, Apple does **not** reserve X18 as a platform
+register in the way Windows does (TEB pointer). XNU's `pcb.c` shows:
 
-Open question for macOS: what does Apple use X18 for? If it points to stable
-per-thread data (like Windows TEB), it could serve as the trampoline anchor
-alongside the TLS table. If Apple's X18 usage is opaque, the trampoline must
-use TPIDR_EL0 as the anchor (like Linux) while also virtualizing X18 -- meaning
-both the TLS loop and X18 gates are needed simultaneously.
+- X18 preservation across context switches is **opt-in**, controlled by the
+  per-thread flag `ARM_MACHINE_THREAD_PRESERVE_X18`.
+- This flag is only set for:
+  - **Rosetta (x86_64 translation) tasks** -- because x86_64 translated code
+    may depend on X18 being preserved.
+  - Tasks that explicitly set `task->preserve_x18`.
+  - 32-bit tasks.
+- For normal native ARM64 tasks, **X18 is not preserved** across context
+  switches.
+- On devices with `__ARM_KERNEL_PROTECT__` (most Apple Silicon), the kernel
+  exception entry path **destructively clobbers X18** to switch TTBR0_EL1
+  (page table base register) for kernel/user ASID isolation.
+- The kernel also **zeroes X18** on EL0 exception entry (`mov x18, #0` in
+  `locore.s`) to prevent leaking kernel data to userspace saved state.
 
-Implementation deferred. The X18 gate machinery built for Windows will be
-reusable on macOS.
+This means a Linux guest binary's use of X18 as a GPR is compatible with macOS
+-- the kernel doesn't expect X18 to hold any particular value. **No X18
+rewriting is needed on macOS.**
+
+However, litebox must ensure its own X18 usage (if any) accounts for the kernel
+trashing X18 on every syscall/exception entry. If the trampoline or callback
+uses X18, the value will not survive a kernel round-trip.
+
+#### TPIDR_EL0 is likely unused by macOS userspace
+
+Apple uses **TPIDRRO_EL0** (the read-only variant) for thread-local storage,
+not TPIDR_EL0. The `machine_thread_set_tsd_base` function in `pcb.c`:
+
+```c
+thread->machine.cthread_self = tsd_base;
+if (thread == current_thread()) {
+    set_tpidrro(tsd_base);  // writes TPIDRRO_EL0, not TPIDR_EL0
+}
+```
+
+Apple's libpthread reads TLS via `MRS Xn, TPIDRRO_EL0`. This means TPIDR_EL0
+(the read-write variant) may be entirely free on macOS.
+
+If TPIDR_EL0 is free and the kernel saves/restores it on context switches, the
+Linux guest can use it natively for its own TLS -- no TLS table swap needed, no
+MSR rewriting needed.
+
+**Open question**: Does XNU save/restore TPIDR_EL0 on context switches? The
+save/restore logic is in the `SPILL_REGISTERS` macro (defined in
+`exception_asm.h`, not in the files we analyzed). If the kernel does NOT
+save/restore TPIDR_EL0, multi-threaded guests would see TPIDR_EL0 corruption
+across preemptions.
+
+If XNU does not save/restore TPIDR_EL0, litebox could potentially request this
+via the `preserve_x18`-style mechanism, or manage the save/restore itself at
+guest entry/exit points.
+
+### Revised platform comparison
+
+| Aspect              | Linux            | Windows               | macOS (Apple Silicon)       |
+|---------------------|------------------|-----------------------|-----------------------------|
+| X18                 | Free GPR         | TEB pointer, must virtualize | Volatile, kernel trashes it. No rewriting needed |
+| TPIDR_EL0           | TLS (host+guest) | Reserved, may trap    | Likely unused by userspace (Apple uses TPIDRRO_EL0) |
+| TPIDRRO_EL0         | CPU number       | CPU number            | TLS base (set by kernel)    |
+| TLS table needed    | Yes              | No                    | Probably not (if TPIDR_EL0 is free) |
+| X18 rewriting       | No               | Yes (pervasive)       | No                          |
+| MSR TPIDR_EL0 rewrite | Yes (writes)  | Yes (reads + writes)  | Probably not needed         |
+| Trampoline anchor   | TPIDR_EL0        | X18 (TEB)             | TPIDR_EL0 (if kernel preserves it) |
+
+macOS may be the **simplest** target: if TPIDR_EL0 is free and preserved by
+the kernel, the rewriter only needs to handle SVC interception -- identical to
+a Linux rewriter without the TLS table complexity.
+
+### Remaining investigation
+
+1. **Verify TPIDR_EL0 kernel save/restore**: Check XNU's `exception_asm.h`
+   `SPILL_REGISTERS` macro and `machine_switch_context` for TPIDR_EL0 handling.
+   Alternatively, write a test program on macOS that sets TPIDR_EL0 per-thread
+   and verifies it survives preemption.
+
+2. **Verify TPIDR_EL0 is not used by macOS libraries**: Confirm that no macOS
+   system library reads/writes TPIDR_EL0 (as opposed to TPIDRRO_EL0).
+
+3. **`preserve_x18` API**: Investigate whether litebox can set
+   `task->preserve_x18` on macOS if needed for any reason. The XNU code shows
+   this is a per-task flag checked in `machine_thread_process_signature`.
+
+4. **Kernel Protect impact**: On `__ARM_KERNEL_PROTECT__` devices, the kernel
+   uses X18 as scratch during exception entry (TTBR switching). Verify this
+   doesn't affect the trampoline -- since the trampoline runs in userspace
+   before any SVC, X18 should still be in the guest's state at that point.
