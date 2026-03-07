@@ -116,7 +116,9 @@ struct vsbox_task {
 	uint64_t status;
 	uint64_t alt_stack;
 	uint64_t robust_list;
-	unsigned long flags; // task_struct->thread_info->flags in Linux
+	/// Bitmask of dequeued signals forwarded from VMPL0.
+	/// Bit (1 << (signo - 1)) is set for each pending signal.
+	uint64_t pending_signals;
 	uint64_t mem_map; // VData<MemMAP>
 	/// Thread ID - the internal kernel "pid"
 	uint32_t pid;
