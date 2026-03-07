@@ -189,6 +189,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     // JMP to __libc_vfork. This prevents glibc's fork wrapper from running
     // post-fork handlers that corrupt shared state under vfork semantics.
     if let Some((fork_file_offset, rel32)) = fork_to_vfork_patch {
+        #[allow(clippy::cast_possible_truncation)]
         let off = fork_file_offset as usize;
         if off + 5 <= buf.len() {
             buf[off] = 0xE9; // JMP rel32
@@ -519,10 +520,7 @@ fn find_fork_vfork_patch(
         if sym.kind() != object::SymbolKind::Text {
             continue;
         }
-        let name = match sym.name() {
-            Ok(n) => n,
-            Err(_) => continue,
-        };
+        let Ok(name) = sym.name() else { continue };
         match name {
             "fork" | "__libc_fork" if fork_vaddr.is_none() => {
                 fork_vaddr = Some(sym.address());

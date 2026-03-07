@@ -328,7 +328,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             range.end,
         );
         assert!(
-            range.start % ALIGN == 0 && range.end % ALIGN == 0,
+            range.start.is_multiple_of(ALIGN) && range.end.is_multiple_of(ALIGN),
             "Vmem: range bounds must be aligned to {ALIGN} bytes ({:#x}..{:#x})",
             range.start,
             range.end,
@@ -973,8 +973,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // top down
         // 1. check [last_end, TASK_SIZE_MAX)
         let (low_limit, high_limit) = (self.addr_min, self.addr_max - length.as_usize());
-        debug_assert!(self.addr_min % ALIGN == 0);
-        debug_assert!(self.addr_max % ALIGN == 0);
+        debug_assert!(self.addr_min.is_multiple_of(ALIGN));
+        debug_assert!(self.addr_max.is_multiple_of(ALIGN));
         let last_end = self.vmas.last_range_value().map_or(low_limit, |r| r.0.end);
         if last_end <= high_limit {
             return Some(high_limit);

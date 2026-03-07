@@ -117,11 +117,11 @@ impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
         }
         // CoW fault: write (error_code bit 1) to a present (bit 0) read-only
         // page that we protected for vfork snapshotting.
-        if info.exception == litebox::shim::Exception::PAGE_FAULT && (info.error_code & 0x3) == 0x3
+        if info.exception == litebox::shim::Exception::PAGE_FAULT
+            && (info.error_code & 0x3) == 0x3
+            && self.task.try_handle_cow_fault(info.cr2)
         {
-            if self.task.try_handle_cow_fault(info.cr2) {
-                return ContinueOperation::Resume;
-            }
+            return ContinueOperation::Resume;
         }
         self.enter_shim(false, ctx, |task, _ctx| task.handle_exception_request(info))
     }

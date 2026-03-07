@@ -2792,6 +2792,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::fork => SyscallRequest::Clone {
                 args: CloneArgs {
                     flags: CloneFlags::empty(),
+                    #[allow(clippy::cast_sign_loss)]
                     exit_signal: signal::Signal::SIGCHLD.as_i32() as u64,
                     stack: 0,
                     parent_tid: 0,
@@ -2807,6 +2808,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::vfork => SyscallRequest::Clone {
                 args: CloneArgs {
                     flags: CloneFlags::VM.union(CloneFlags::VFORK),
+                    #[allow(clippy::cast_sign_loss)]
                     exit_signal: signal::Signal::SIGCHLD.as_i32() as u64,
                     stack: 0,
                     parent_tid: 0,

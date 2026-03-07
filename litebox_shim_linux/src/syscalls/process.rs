@@ -541,17 +541,16 @@ impl<FS: ShimFS> Task<FS> {
             // Release the process's VA partition. For a vfork child that
             // hasn't exec'd, destroy the child's reserved partition (from
             // fork_context), not the parent's shared ProcessState.
-            let as_id = match self.fork_context.get_mut() {
-                Some(fc) => fc.address_space_id,
-                None => {
-                    // Release all user memory mappings before destroying the
-                    // address space. This is safe because the process is
-                    // exiting and no threads remain to access this memory.
-                    let ps = self.process_state.borrow();
-                    unsafe { ps.pm.release_memory(|_, _| true) }
-                        .expect("failed to release memory on exit");
-                    ps.address_space_id
-                }
+            let as_id = if let Some(fc) = self.fork_context.get_mut() {
+                fc.address_space_id
+            } else {
+                // Release all user memory mappings before destroying the
+                // address space. This is safe because the process is
+                // exiting and no threads remain to access this memory.
+                let ps = self.process_state.borrow();
+                unsafe { ps.pm.release_memory(|_, _| true) }
+                    .expect("failed to release memory on exit");
+                ps.address_space_id
             };
             let r = self.global.platform.destroy_address_space(as_id);
             debug_assert!(
@@ -1099,37 +1098,27 @@ impl<FS: ShimFS> Task<FS> {
                         .clone_for_fork(&mut self.global.litebox.descriptor_table_mut()),
                 );
 
-                // Set up CoW protection: mark all writable guest pages read-only.
-                // The child's exception handler will snapshot individual pages on
-                // first write, and the parent restores them after vfork_done.
+                // Set up CoW protection for vfork memory sharing.
                 //
-                // On Windows, lazy CoW via page faults is not viable: the
-                // exception dispatcher, allocator metadata, and globals all
-                // live in the shared address space. A fault in the CoW handler
-                // itself would be fatal. Instead, eagerly snapshot every
-                // writable page before spawning the child.
+                // The strategy is determined by the platform via
+                // `EAGER_COW_FOR_VFORK`. Platforms where the exception handler
+                // shares the guest address space must use eager snapshots;
+                // others use lazy CoW (mark writable pages read-only and
+                // snapshot on first write fault).
                 let cow_state = {
                     let mappings = self.process_state.borrow().pm.mappings();
                     let mut eager_dirty = alloc::vec::Vec::<(usize, alloc::vec::Vec<u8>)>::new();
-
-                    // On Windows, eagerly snapshot all writable pages and
-                    // leave them writable. The restore path treats these
-                    // identically to lazily-snapshotted dirty pages.
-                    //
-                    // On non-Windows, use lazy CoW: mark writable pages
-                    // read-only and snapshot individual pages on first write.
-                    #[cfg(not(target_os = "windows"))]
                     let mut protected = alloc::vec::Vec::new();
-                    #[cfg(target_os = "windows")]
-                    let protected = alloc::vec::Vec::new();
 
                     for (range, flags) in &mappings {
                         if !flags.contains(VmFlags::VM_WRITE) {
                             continue;
                         }
 
-                        #[cfg(target_os = "windows")]
-                        {
+                        if <crate::Platform as AddressSpaceProvider>::EAGER_COW_FOR_VFORK {
+                            // Eagerly snapshot all writable pages and leave
+                            // them writable. The restore path treats these
+                            // identically to lazily-snapshotted dirty pages.
                             for page_addr in (range.start..range.end).step_by(PAGE_SIZE) {
                                 let mut buf = alloc::vec![0u8; PAGE_SIZE];
                                 // SAFETY: pages are committed; child not yet
@@ -1143,10 +1132,9 @@ impl<FS: ShimFS> Task<FS> {
                                 }
                                 eager_dirty.push((page_addr, buf));
                             }
-                        }
-
-                        #[cfg(not(target_os = "windows"))]
-                        {
+                        } else {
+                            // Lazy CoW: mark writable pages read-only and
+                            // snapshot individual pages on first write fault.
                             use litebox::platform::page_mgmt::MemoryRegionPermissions;
 
                             let len = range.end - range.start;
@@ -1737,20 +1725,20 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle syscall `getpgid`. If `pid == 0`, return caller's pgid.
     pub(crate) fn sys_getpgid(&self, pid: i32) -> Result<u32, Errno> {
+        use litebox::process::{ProcessGroupId, ProcessId};
         if pid < 0 {
             return Err(Errno::EINVAL);
         }
-        use litebox::process::ProcessId;
         let target = if pid == 0 {
             self.process_id
         } else {
-            ProcessId(pid as u32)
+            ProcessId(pid.cast_unsigned())
         };
         self.global
             .litebox
             .process_registry()
             .get_pgid(target)
-            .map(|pgid| pgid.as_u32())
+            .map(ProcessGroupId::as_u32)
             .ok_or(Errno::ESRCH)
     }
 
@@ -1762,21 +1750,22 @@ impl<FS: ShimFS> Task<FS> {
     /// only call setpgid *after* exec — making EACCES the only possible
     /// outcome on real Linux. Shells make this call for race-avoidance and
     /// tolerate failure, so being more permissive here is harmless.
+    #[allow(clippy::similar_names)]
     pub(crate) fn sys_setpgid(&self, pid: i32, pgid: i32) -> Result<(), Errno> {
+        use litebox::process::{ProcessGroupId, ProcessId, SetPgidError};
         if pid < 0 || pgid < 0 {
             return Err(Errno::EINVAL);
         }
-        use litebox::process::{ProcessGroupId, ProcessId, SetPgidError};
         let caller = self.process_id;
         let target = if pid == 0 {
             caller
         } else {
-            ProcessId(pid as u32)
+            ProcessId(pid.cast_unsigned())
         };
         let target_pgid = if pgid == 0 {
             ProcessGroupId::from(target)
         } else {
-            ProcessGroupId(pgid as u32)
+            ProcessGroupId(pgid.cast_unsigned())
         };
         match self
             .global
@@ -1785,28 +1774,27 @@ impl<FS: ShimFS> Task<FS> {
             .set_pgid(caller, target, target_pgid)
         {
             Some(Ok(())) => Ok(()),
-            Some(Err(SetPgidError::NotPermitted)) => Err(Errno::EPERM),
-            Some(Err(SetPgidError::NoSuchGroup)) => Err(Errno::EPERM),
+            Some(Err(SetPgidError::NotPermitted | SetPgidError::NoSuchGroup)) => Err(Errno::EPERM),
             None => Err(Errno::ESRCH),
         }
     }
 
     /// Handle syscall `getsid`. If `pid == 0`, return caller's sid.
     pub(crate) fn sys_getsid(&self, pid: i32) -> Result<u32, Errno> {
+        use litebox::process::{ProcessId, SessionId};
         if pid < 0 {
             return Err(Errno::EINVAL);
         }
-        use litebox::process::ProcessId;
         let target = if pid == 0 {
             self.process_id
         } else {
-            ProcessId(pid as u32)
+            ProcessId(pid.cast_unsigned())
         };
         self.global
             .litebox
             .process_registry()
             .get_sid(target)
-            .map(|sid| sid.as_u32())
+            .map(SessionId::as_u32)
             .ok_or(Errno::ESRCH)
     }
 

@@ -492,6 +492,11 @@ impl litebox::platform::Provider for WindowsUserland {}
 impl litebox::platform::AddressSpaceProvider for WindowsUserland {
     type AddressSpaceId = u32;
 
+    // The Windows exception dispatcher, allocator metadata, and globals all
+    // live in the shared address space. A CoW page fault inside the handler
+    // would be fatal, so we must eagerly snapshot all writable pages.
+    const EAGER_COW_FOR_VFORK: bool = true;
+
     fn create_address_space(
         &self,
     ) -> Result<Self::AddressSpaceId, litebox::platform::address_space::AddressSpaceError> {

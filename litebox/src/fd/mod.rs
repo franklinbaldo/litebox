@@ -583,6 +583,11 @@ impl RawDescriptorStorage {
     /// the child gets an independent `OwnedFd` (with its own `closed` flag).
     /// The underlying file descriptions are shared via `Arc`, matching POSIX
     /// shared-file-description semantics after fork.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any stored fd has already been closed in `global_dt`.
+    #[must_use]
     pub fn clone_for_fork<Platform: RawSyncPrimitivesProvider>(
         &self,
         global_dt: &mut Descriptors<Platform>,

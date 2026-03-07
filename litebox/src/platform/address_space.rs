@@ -121,6 +121,19 @@ pub trait AddressSpaceProvider {
         Ok(result)
     }
 
+    /// Whether the platform requires eager copy-on-write snapshots during
+    /// vfork instead of lazy page-fault-driven CoW.
+    ///
+    /// When `true`, the shim eagerly copies all writable guest pages before
+    /// spawning the vfork child and restores them after the child execs or
+    /// exits. When `false` (the default), the shim marks writable pages
+    /// read-only and lazily snapshots individual pages on first write fault.
+    ///
+    /// Platforms where the exception/fault handler shares the guest address
+    /// space (e.g., Windows userland) must set this to `true` because a
+    /// CoW fault inside the handler itself would be fatal.
+    const EAGER_COW_FOR_VFORK: bool = false;
+
     /// Return the VA range available to the given address space.
     ///
     /// * Kernel: the full `TASK_ADDR_MIN..TASK_ADDR_MAX`.

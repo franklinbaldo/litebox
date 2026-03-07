@@ -334,10 +334,10 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
             "cannot remove a process with children"
         );
         // Remove from parent's child list.
-        if let Some(parent_pid) = entry.context.parent {
-            if let Some(parent_entry) = table.get_mut(&parent_pid) {
-                parent_entry.children.retain(|&c| c != id);
-            }
+        if let Some(parent_pid) = entry.context.parent
+            && let Some(parent_entry) = table.get_mut(&parent_pid)
+        {
+            parent_entry.children.retain(|&c| c != id);
         }
     }
 
@@ -552,6 +552,10 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
     /// Returns `Ok(())` on success. Errors:
     /// - `None` if `target` does not exist
     /// - `Err(SetPgidError::*)` for permission/validity failures
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal lock is poisoned.
     pub fn set_pgid(
         &self,
         caller: ProcessId,
@@ -608,6 +612,10 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
     ///
     /// Returns the new session ID (== caller's pid) on success.
     /// Fails with `Err(())` if caller is already a process group leader.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal lock is poisoned.
     pub fn setsid(&self, caller: ProcessId) -> Option<Result<SessionId, SetsidError>> {
         let mut table = self.table.write();
         let entry = table.get(&caller)?;
@@ -902,7 +910,7 @@ mod tests {
         let (_platform, registry) = setup();
         let init = registry.create_process(None, 0).unwrap();
         let child1 = registry.create_process(Some(init), 17).unwrap();
-        let child2 = registry.create_process(Some(init), 17).unwrap();
+        let _child2 = registry.create_process(Some(init), 17).unwrap();
 
         // Both children inherit init's pgid (which is ProcessGroupId(1))
         let init_pgid = ProcessGroupId::from(init);
@@ -1104,11 +1112,11 @@ mod tests {
         let (_platform, registry) = setup();
         let init = registry.create_process(None, 0).unwrap();
         let child1 = registry.create_process(Some(init), 17).unwrap();
-        let _child2 = registry.create_process(Some(init), 17).unwrap();
+        let child2 = registry.create_process(Some(init), 17).unwrap();
 
-        // child1 tries to set _child2's pgid — not permitted (not parent)
+        // child1 tries to set child2's pgid — not permitted (not parent)
         assert_eq!(
-            registry.set_pgid(child1, _child2, ProcessGroupId::from(_child2)),
+            registry.set_pgid(child1, child2, ProcessGroupId::from(child2)),
             Some(Err(SetPgidError::NotPermitted))
         );
     }
