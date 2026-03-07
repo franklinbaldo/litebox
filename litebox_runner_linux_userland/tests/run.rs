@@ -376,10 +376,9 @@ fn test_runner_with_python() {
 
     if has_origin_in_libs(&python_path) {
         println!(
-            "Skipping test: Python executable at {} uses $ORIGIN in library paths",
+            "NOTE: Python executable at {} uses $ORIGIN in library paths",
             python_path.display()
         );
-        return;
     }
 
     let python_home = run_python(&["-c", "import sys; print(sys.prefix);"]);
