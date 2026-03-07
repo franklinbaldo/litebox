@@ -46,6 +46,9 @@ pub struct LinuxUserland {
     /// CoW-eligible memory regions. Maps start address of the static slice, to the info needed to
     /// re-mmap the file.
     cow_regions: std::sync::RwLock<std::collections::BTreeMap<usize, CowRegionInfo>>,
+    /// VA partition allocator for multi-process support (x86_64 only).
+    #[cfg(target_arch = "x86_64")]
+    partitions: std::sync::Mutex<PartitionState>,
 }
 
 impl core::fmt::Debug for LinuxUserland {
@@ -106,6 +109,191 @@ pub union Ifru {
     // pub ifru_slave: [i8; IF_NAMESIZE],
     // pub ifru_newname: [i8; IF_NAMESIZE],
     // pub ifru_data: *mut i8,
+}
+
+/// VA partition management for multi-process support on x86_64.
+///
+/// The total userland VA range is divided into fixed-size, non-overlapping
+/// partitions. Each process gets one partition. A simple bitvec tracks which
+/// slots are in use.
+#[cfg(target_arch = "x86_64")]
+mod va_partitions {
+    /// Size of each VA partition (1 TiB).
+    pub const PARTITION_SIZE: usize = 1 << 40;
+
+    /// The lowest usable guest address (matches `TASK_ADDR_MIN`).
+    pub const VA_MIN: usize = 0x1_0000;
+
+    /// One past the highest usable guest address (matches `TASK_ADDR_MAX`).
+    pub const VA_MAX: usize = 0x7FFF_FFFF_F000;
+
+    /// Total number of partition slots that fit in the VA range.
+    ///
+    /// Slot `i` covers `i * PARTITION_SIZE .. (i + 1) * PARTITION_SIZE`,
+    /// clipped to `VA_MIN..VA_MAX`.
+    pub const NUM_SLOTS: usize = VA_MAX / PARTITION_SIZE; // 127 on x86_64
+}
+
+/// Mutable state for the VA partition allocator.
+#[cfg(target_arch = "x86_64")]
+struct PartitionState {
+    /// Bit `i` is `true` if slot `i` is allocated.
+    allocated: [bool; va_partitions::NUM_SLOTS],
+}
+
+#[cfg(target_arch = "x86_64")]
+impl PartitionState {
+    fn new() -> Self {
+        Self {
+            allocated: [false; va_partitions::NUM_SLOTS],
+        }
+    }
+
+    /// Claim the next free slot. Returns the slot index or `None` if full.
+    #[allow(clippy::cast_possible_truncation)]
+    fn allocate(&mut self) -> Option<u32> {
+        for (i, slot) in self.allocated.iter_mut().enumerate() {
+            if !*slot {
+                *slot = true;
+                return Some(i as u32);
+            }
+        }
+        None
+    }
+
+    /// Release a previously allocated slot.
+    ///
+    /// Returns `false` if the slot is out of range or not currently allocated.
+    fn deallocate(&mut self, slot: u32) -> bool {
+        let idx = slot as usize;
+        if idx >= va_partitions::NUM_SLOTS {
+            return false;
+        }
+        if !self.allocated[idx] {
+            return false;
+        }
+        self.allocated[idx] = false;
+        true
+    }
+
+    /// Returns `true` if the given slot is currently allocated.
+    fn is_allocated(&self, slot: u32) -> bool {
+        let idx = slot as usize;
+        idx < va_partitions::NUM_SLOTS && self.allocated[idx]
+    }
+
+    /// Return the VA range for the given slot, clipped to `VA_MIN..VA_MAX`.
+    fn range_of(slot: u32) -> core::ops::Range<usize> {
+        let base = (slot as usize) * va_partitions::PARTITION_SIZE;
+        let start = base.max(va_partitions::VA_MIN);
+        let end = (base + va_partitions::PARTITION_SIZE).min(va_partitions::VA_MAX);
+        start..end
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod partition_tests {
+    use super::*;
+
+    #[test]
+    fn slot_0_range_starts_at_va_min() {
+        let range = PartitionState::range_of(0);
+        assert_eq!(range.start, va_partitions::VA_MIN);
+        assert_eq!(range.end, va_partitions::PARTITION_SIZE);
+    }
+
+    #[test]
+    fn slot_1_range() {
+        let range = PartitionState::range_of(1);
+        assert_eq!(range.start, va_partitions::PARTITION_SIZE);
+        assert_eq!(range.end, 2 * va_partitions::PARTITION_SIZE);
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn last_slot_clipped_to_va_max() {
+        let last = (va_partitions::NUM_SLOTS - 1) as u32;
+        let range = PartitionState::range_of(last);
+        assert!(range.end <= va_partitions::VA_MAX);
+        assert!(range.start < range.end);
+    }
+
+    #[test]
+    fn allocate_returns_sequential_slots() {
+        let mut state = PartitionState::new();
+        assert_eq!(state.allocate(), Some(0));
+        assert_eq!(state.allocate(), Some(1));
+        assert_eq!(state.allocate(), Some(2));
+    }
+
+    #[test]
+    fn deallocate_reuses_slot() {
+        let mut state = PartitionState::new();
+        let s0 = state.allocate().unwrap();
+        let s1 = state.allocate().unwrap();
+        assert!(state.deallocate(s0));
+        // Next allocate should reuse slot 0
+        assert_eq!(state.allocate(), Some(s0));
+        assert!(state.deallocate(s1));
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn deallocate_rejects_invalid() {
+        let mut state = PartitionState::new();
+        // Unallocated slot
+        assert!(!state.deallocate(0));
+        // Out-of-bounds slot
+        assert!(!state.deallocate(va_partitions::NUM_SLOTS as u32));
+
+        let s0 = state.allocate().unwrap();
+        assert!(state.deallocate(s0));
+        // Double-free
+        assert!(!state.deallocate(s0));
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn is_allocated_tracks_state() {
+        let mut state = PartitionState::new();
+        assert!(!state.is_allocated(0));
+        let s0 = state.allocate().unwrap();
+        assert!(state.is_allocated(s0));
+        assert!(state.deallocate(s0));
+        assert!(!state.is_allocated(s0));
+        // Out of bounds
+        assert!(!state.is_allocated(va_partitions::NUM_SLOTS as u32));
+    }
+
+    #[test]
+    fn exhaust_all_slots() {
+        let mut state = PartitionState::new();
+        for _ in 0..va_partitions::NUM_SLOTS {
+            assert!(state.allocate().is_some());
+        }
+        assert_eq!(state.allocate(), None);
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn partitions_do_not_overlap() {
+        for i in 0..(va_partitions::NUM_SLOTS as u32 - 1) {
+            let a = PartitionState::range_of(i);
+            let b = PartitionState::range_of(i + 1);
+            assert!(a.end <= b.start, "slot {i} and {} overlap", i + 1);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn partition_ranges_are_page_aligned() {
+        const PAGE_SIZE: usize = 4096;
+        for i in 0..va_partitions::NUM_SLOTS as u32 {
+            let range = PartitionState::range_of(i);
+            assert_eq!(range.start % PAGE_SIZE, 0, "slot {i} start not aligned");
+            assert_eq!(range.end % PAGE_SIZE, 0, "slot {i} end not aligned");
+        }
+    }
 }
 
 impl LinuxUserland {
@@ -179,6 +367,8 @@ impl LinuxUserland {
             reserved_pages,
             vdso_address,
             cow_regions: std::sync::RwLock::new(std::collections::BTreeMap::new()),
+            #[cfg(target_arch = "x86_64")]
+            partitions: std::sync::Mutex::new(PartitionState::new()),
         };
         Box::leak(Box::new(platform))
     }
@@ -367,9 +557,65 @@ impl LinuxUserland {
 impl litebox::platform::Provider for LinuxUserland {}
 
 impl litebox::platform::AddressSpaceProvider for LinuxUserland {
-    // All methods default to `Err(NotSupported)` — real implementation comes
-    // in Phase 2 when userland multi-process VA partitioning is added.
+    /// Slot index into the VA partition table.
     type AddressSpaceId = u32;
+
+    #[cfg(target_arch = "x86_64")]
+    fn create_address_space(
+        &self,
+    ) -> Result<Self::AddressSpaceId, litebox::platform::address_space::AddressSpaceError> {
+        self.partitions
+            .lock()
+            .unwrap()
+            .allocate()
+            .ok_or(litebox::platform::address_space::AddressSpaceError::NoSpace)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn destroy_address_space(
+        &self,
+        id: Self::AddressSpaceId,
+    ) -> Result<(), litebox::platform::address_space::AddressSpaceError> {
+        if !self.partitions.lock().unwrap().deallocate(id) {
+            return Err(litebox::platform::address_space::AddressSpaceError::InvalidId);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn fork_address_space(
+        &self,
+        parent: Self::AddressSpaceId,
+    ) -> Result<
+        litebox::platform::address_space::ForkedAddressSpace<Self::AddressSpaceId>,
+        litebox::platform::address_space::AddressSpaceError,
+    > {
+        if !self.partitions.lock().unwrap().is_allocated(parent) {
+            return Err(litebox::platform::address_space::AddressSpaceError::InvalidId);
+        }
+        let child = self.create_address_space()?;
+        Ok(litebox::platform::address_space::ForkedAddressSpace::SharedWithParent(child))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn activate_address_space(
+        &self,
+        _id: Self::AddressSpaceId,
+    ) -> Result<(), litebox::platform::address_space::AddressSpaceError> {
+        // No-op on userland — all processes share the host address space.
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn address_space_range(
+        &self,
+        id: Self::AddressSpaceId,
+    ) -> Result<core::ops::Range<usize>, litebox::platform::address_space::AddressSpaceError> {
+        if !self.partitions.lock().unwrap().is_allocated(id) {
+            return Err(litebox::platform::address_space::AddressSpaceError::InvalidId);
+        }
+        Ok(PartitionState::range_of(id))
+    }
 }
 
 /// Runs a guest thread using the provided shim and the given initial context.

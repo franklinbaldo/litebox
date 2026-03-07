@@ -104,6 +104,7 @@ impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
             if unsafe {
                 self.task
                     .process_state
+                    .borrow()
                     .pm
                     .handle_page_fault(info.cr2, info.error_code.into())
             }
@@ -200,14 +201,24 @@ impl<FS: ShimFS> LinuxShimBuilder<FS> {
     /// Panics if the file system has not been set with [`set_fs`](Self::set_fs)
     /// before calling this method.
     pub fn build(self) -> LinuxShim<FS> {
+        use litebox::platform::AddressSpaceProvider;
+
         let mut net = Network::new(&self.litebox);
         net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
+
+        // Allocate the init process's address space (slot 0 on userland).
+        let init_as_id = self
+            .platform
+            .create_address_space()
+            .expect("init process address space allocation must succeed");
+        let as_range = self
+            .platform
+            .address_space_range(init_as_id)
+            .expect("init address space range must be valid");
+
         let process_state = Arc::new(ProcessState {
-            pm: PageManager::new(
-                &self.litebox,
-                <Platform as litebox::platform::PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MIN
-                    ..<Platform as litebox::platform::PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MAX,
-            ),
+            pm: PageManager::new(&self.litebox, as_range),
+            address_space_id: init_as_id,
         });
         let global = Arc::new(GlobalState {
             platform: self.platform,
@@ -270,7 +281,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.global.clone(),
-                process_state: self.process_state.clone(),
+                process_state: self.process_state.clone().into(),
                 thread: syscalls::process::ThreadState::new_process(pid),
                 wait_state: wait::WaitState::new(self.global.platform),
                 process_id: litebox::process::ProcessId::INIT,
@@ -288,6 +299,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
+                fork_context: RefCell::new(None),
             },
         };
         entrypoints.task.load_program(
@@ -727,6 +739,18 @@ impl<FS: ShimFS> Task<FS> {
                 self.sys_exit_group(status);
                 Ok(0)
             }
+            SyscallRequest::Wait4 {
+                pid,
+                wstatus,
+                options,
+                rusage,
+            } => self.sys_wait4(pid, wstatus, options, rusage),
+            SyscallRequest::Waitid {
+                idtype,
+                id,
+                infop,
+                options,
+            } => self.sys_waitid(idtype, id, infop, options),
             SyscallRequest::Execve {
                 pathname,
                 argv,
@@ -1260,12 +1284,61 @@ struct GlobalState<FS: ShimFS> {
 struct ProcessState {
     /// The page manager for managing this process's virtual memory.
     pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
+    /// The address space ID for this process (VA partition on userland).
+    address_space_id: <Platform as litebox::platform::AddressSpaceProvider>::AddressSpaceId,
+}
+
+/// One-shot synchronization primitive for vfork parent blocking.
+///
+/// The parent creates this before spawning the child and calls [`wait`](Self::wait)
+/// after the spawn succeeds. The child holds a clone and calls [`signal`](Self::signal)
+/// when it execs or exits, unblocking the parent.
+struct VforkDone {
+    done: core::sync::atomic::AtomicBool,
+    /// Waker for the parent thread — calling `wake()` causes the parent's
+    /// `wait_until` loop to re-evaluate the done flag.
+    parent_waker: litebox::event::wait::Waker<Platform>,
+}
+
+impl VforkDone {
+    fn new(parent_waker: litebox::event::wait::Waker<Platform>) -> Self {
+        Self {
+            done: core::sync::atomic::AtomicBool::new(false),
+            parent_waker,
+        }
+    }
+
+    /// Called by the child when it execs or exits.
+    fn signal(&self) {
+        self.done.store(true, Ordering::Release);
+        self.parent_waker.wake();
+    }
+
+    /// Returns `true` once the child has called [`signal`](Self::signal).
+    fn is_done(&self) -> bool {
+        self.done.load(Ordering::Acquire)
+    }
+}
+
+/// Context for a vfork child process.
+///
+/// Stored in the child's `Task` after `do_fork`. The child temporarily uses
+/// the **parent's** `ProcessState` (vfork sharing). When the child calls
+/// `execve()`, it creates its own `ProcessState` using the partition range
+/// from `address_space_id`. When it calls `_exit()`, the partition is released.
+struct ForkContext {
+    /// The child's own address space ID (VA partition on userland).
+    address_space_id: <Platform as litebox::platform::AddressSpaceProvider>::AddressSpaceId,
+    /// Signals the parent to resume after the vfork child execs or exits.
+    vfork_done: Arc<VforkDone>,
 }
 
 struct Task<FS: ShimFS> {
     global: Arc<GlobalState<FS>>,
     /// Per-process state shared across threads in the same process.
-    process_state: Arc<ProcessState>,
+    /// `RefCell` to support swapping to the child's own state on `execve`
+    /// after a vfork.
+    process_state: RefCell<Arc<ProcessState>>,
     wait_state: wait::WaitState,
     thread: syscalls::process::ThreadState,
     /// The process identity from the core ProcessRegistry.
@@ -1287,6 +1360,10 @@ struct Task<FS: ShimFS> {
     files: RefCell<Arc<syscalls::file::FilesState<FS>>>,
     /// Signal state
     signals: syscalls::signal::SignalState,
+    /// Fork context for vfork children. `None` for the initial process and
+    /// for threads. Set when `do_fork` creates a child process. `RefCell`
+    /// because `sys_execve` consumes it via `take()` through `&self`.
+    fork_context: RefCell<Option<ForkContext>>,
 }
 
 impl<FS: ShimFS> Drop for Task<FS> {
@@ -1328,7 +1405,8 @@ mod test_utils {
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
-                process_state: self.process_state,
+                fork_context: RefCell::new(None),
+                process_state: self.process_state.into(),
                 global: self.global,
             }
         }
@@ -1355,6 +1433,7 @@ mod test_utils {
                 fs: self.fs.clone(),
                 files: self.files.clone(),
                 signals: self.signals.clone_for_new_task(),
+                fork_context: RefCell::new(None),
             };
             Some(task)
         }
