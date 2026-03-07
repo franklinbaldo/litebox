@@ -369,8 +369,14 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                         }
                     }
                 };
+                // Cap the wait: poll_at may be very large (e.g. 60s TCP timer)
+                // but we must drain socket channel ring buffers promptly.
+                let wait = match timeout {
+                    Some(t) if t < DEFAULT_TIMEOUT => t,
+                    _ => DEFAULT_TIMEOUT,
+                };
                 litebox_platform_multiplex::platform()
-                    .wait_on_tun(Some(timeout.unwrap_or(DEFAULT_TIMEOUT)));
+                    .wait_on_tun(Some(wait));
             }
             // Final flush
             // TODO: keep running until all sockets are closed?
