@@ -119,6 +119,12 @@ int memcmp(const void *s1, const void *s2, size_t n) {
   return 0;
 }
 
+size_t strlen(const char *s) {
+  const char *p = s;
+  while (*p) p++;
+  return (size_t)(p - s);
+}
+
 int strcmp(const char *s1, const char *s2) {
   while (*s1 && (*s1 == *s2)) {
     s1++;
@@ -243,7 +249,7 @@ unsigned int la_objopen(struct link_map *map,
       return 0;
     }
     syscall_print("[audit] ld is patched by libOS: \n", 33);
-    syscall_print(path, 32);
+    syscall_print(path, strlen(path));
     syscall_print("\n", 1);
     return 0; // ld.so is patched by libOS
   }
@@ -256,7 +262,7 @@ unsigned int la_objopen(struct link_map *map,
 
   // Other shared libraries
   syscall_print("[audit] la_objopen: path=", 25);
-  syscall_print(path, 32);
+  syscall_print(path, strlen(path));
   syscall_print("\n", 1);
 
   if (!syscall_entry) {
