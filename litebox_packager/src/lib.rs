@@ -34,6 +34,14 @@ pub struct CliArgs {
     #[arg(long = "include", value_name = "HOST_PATH:TAR_PATH")]
     pub include: Vec<String>,
 
+    /// Include extra ELF files in the tar **with** syscall rewriting.
+    /// Use this for shared libraries that are loaded at runtime via `dlopen`
+    /// (e.g., NSS modules like `libnss_dns.so.2`) and therefore not discovered
+    /// by the automatic dependency scan.
+    /// Format: HOST_PATH:TAR_PATH (same as `--include`).
+    #[arg(long = "rewrite-include", value_name = "HOST_PATH:TAR_PATH")]
+    pub rewrite_include: Vec<String>,
+
     /// Skip rewriting specific files (by their absolute path on the host).
     #[arg(long = "no-rewrite", value_name = "PATH")]
     pub no_rewrite: Vec<PathBuf>,
@@ -90,7 +98,13 @@ pub fn run(args: CliArgs) -> anyhow::Result<()> {
         .map(|s| parse_include(s))
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    for inc in &includes {
+    let rewrite_includes: Vec<IncludeEntry> = args
+        .rewrite_include
+        .iter()
+        .map(|s| parse_include(s))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    for inc in includes.iter().chain(&rewrite_includes) {
         if !inc.host_path.exists() {
             bail!("included file does not exist: {}", inc.host_path.display());
         }
@@ -182,6 +196,34 @@ pub fn run(args: CliArgs) -> anyhow::Result<()> {
         tar_entries.push(TarEntry {
             tar_path: inc.tar_path.clone(),
             data,
+            mode,
+        });
+    }
+
+    // Include extra ELF files **with** rewriting (for dlopen'd libraries).
+    for inc in &rewrite_includes {
+        if !added_tar_paths.insert(inc.tar_path.clone()) {
+            bail!(
+                "duplicate tar path from --rewrite-include: '{}' (already present)",
+                inc.tar_path
+            );
+        }
+        let data = std::fs::read(&inc.host_path)
+            .with_context(|| format!("failed to read {}", inc.host_path.display()))?;
+        let mode = std::fs::metadata(&inc.host_path)
+            .map(|m| m.mode())
+            .unwrap_or(0o755);
+        let rewritten = rewrite_elf(&data, &inc.host_path, args.verbose)?;
+        if args.verbose {
+            eprintln!(
+                "  rewrite-including {} as {}",
+                inc.host_path.display(),
+                inc.tar_path
+            );
+        }
+        tar_entries.push(TarEntry {
+            tar_path: inc.tar_path.clone(),
+            data: rewritten,
             mode,
         });
     }
