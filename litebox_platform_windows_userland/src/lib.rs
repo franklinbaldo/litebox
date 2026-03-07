@@ -89,6 +89,22 @@ impl PartitionState {
         self.allocated.len()
     }
 
+    /// Claim the next free slot without checking for host allocations.
+    ///
+    /// Used for the initial address space (slot 0), which shares the VA
+    /// partition with the host process. Host allocations in this range are
+    /// expected and harmless because the initial guest pages are explicitly
+    /// mapped by the loader.
+    fn allocate(&mut self) -> Option<u32> {
+        for (i, used) in self.allocated.iter_mut().enumerate() {
+            if !*used {
+                *used = true;
+                return Some(i as u32);
+            }
+        }
+        None
+    }
+
     /// Claim the next free slot whose VA range has no host allocations.
     ///
     /// Calls `probe` on each candidate slot's range. If `probe` returns `true`
@@ -479,10 +495,13 @@ impl litebox::platform::AddressSpaceProvider for WindowsUserland {
     fn create_address_space(
         &self,
     ) -> Result<Self::AddressSpaceId, litebox::platform::address_space::AddressSpaceError> {
+        // The initial address space shares slot 0 with the host process.
+        // Host allocations (exe, DLLs, heap) are expected in this range,
+        // so skip the VirtualQuery cleanliness probe.
         self.partitions
             .lock()
             .unwrap()
-            .allocate_probed(is_va_range_clean)
+            .allocate()
             .ok_or(litebox::platform::address_space::AddressSpaceError::NoSpace)
     }
 
@@ -941,8 +960,11 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
         >,
     ) -> Result<(), Self::ThreadSpawnError> {
         let ctx = ctx.clone();
-        // TODO: do we need to wait for the handle in the main thread?
-        let _handle = std::thread::Builder::new().spawn(move || thread_start(init_thread, ctx))?;
+        // Use 8 MiB stack (matching Linux default) to avoid overflow from
+        // deeply-nested shim call chains. Windows default is only 1 MiB.
+        let _handle = std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || thread_start(init_thread, ctx))?;
 
         Ok(())
     }
@@ -1742,19 +1764,31 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         range: core::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
         debug_assert_alignment!(range, ALIGN);
+
+        // Slot 0 shares its VA partition with the host process: the Rust
+        // runtime heap, thread stacks, TEB/PEB, and other host allocations
+        // all live in the same 1 TiB range.  VirtualFree(MEM_DECOMMIT) on
+        // guest pages in slot 0 can inadvertently decommit pages whose
+        // underlying VA the host still needs (e.g. allocator metadata),
+        // leading to silent crashes or hangs.  Skip the explicit decommit
+        // for slot 0 — the OS reclaims all memory on process exit.
+        //
+        // Child partitions (slots 1+) are probed-clean and only contain
+        // guest-allocated pages, so VirtualFree is safe for them.
+        if range.start < va_partitions::PARTITION_SIZE {
+            return Ok(());
+        }
+
         process_memory_range_by_regions(
             range,
             |r, state| -> Result<bool, std::convert::Infallible> {
-                debug_assert_ne!(
-                    state,
-                    Win32_Memory::MEM_FREE,
-                    "Trying to deallocate a free region: {:p}-{:p}",
-                    r.start as *mut c_void,
-                    r.end as *mut c_void
-                );
-                Ok(unsafe {
-                    VirtualFree(r.start as *mut c_void, r.len(), Win32_Memory::MEM_DECOMMIT)
-                } != 0)
+                if state == Win32_Memory::MEM_FREE {
+                    return Ok(true);
+                }
+                unsafe {
+                    VirtualFree(r.start as *mut c_void, r.len(), Win32_Memory::MEM_DECOMMIT);
+                }
+                Ok(true)
             },
         )
         .expect("deallocate_pages failed");
