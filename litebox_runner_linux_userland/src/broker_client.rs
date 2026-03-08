@@ -43,10 +43,11 @@ impl GrpcBrokerTransport {
 ///
 /// Attempts to parse the errno from the status message; defaults to EIO (5).
 fn status_to_remote_error(status: tonic::Status) -> RemoteError {
-    // Try to extract an errno from the message (e.g., "errno:2").
+    // Extract errno from messages formatted as "errno:N ..." by the server.
     let errno = status
         .message()
         .strip_prefix("errno:")
+        .and_then(|s| s.split_whitespace().next())
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(5); // EIO
     RemoteError { errno }

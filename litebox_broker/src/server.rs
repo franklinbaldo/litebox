@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -94,6 +94,26 @@ impl FileBrokerService {
         Ok(canonical)
     }
 
+    /// Resolve a path that may not exist yet (e.g., for `O_CREAT` / `mkdir`).
+    ///
+    /// Canonicalizes the parent directory and joins the leaf component,
+    /// ensuring the result stays within the root jail.
+    fn resolve_path_for_create(&self, relative: &str) -> Result<PathBuf, Status> {
+        let relative = relative.trim_start_matches('/');
+        let candidate = self.root.join(relative);
+        let parent = candidate
+            .parent()
+            .ok_or_else(|| Status::invalid_argument("errno:22 no parent directory"))?;
+        let leaf = candidate
+            .file_name()
+            .ok_or_else(|| Status::invalid_argument("errno:22 no file name"))?;
+        let canonical_parent = parent.canonicalize().map_err(io_err_to_status)?;
+        if !canonical_parent.starts_with(&self.root) {
+            return Err(Status::permission_denied("errno:1 path escapes root"));
+        }
+        Ok(canonical_parent.join(leaf))
+    }
+
     /// Check policy and return `Err(Status)` on denial.
     fn check_policy(&self, action: Action, path: Option<&Path>) -> Result<(), Status> {
         if self.policy.check(action, path) == Decision::Deny {
@@ -134,12 +154,20 @@ impl FileBrokerService {
 
         // Quick ELF magic check.
         if content.len() < 4 || &content[..4] != b"\x7fELF" {
+            // Not an ELF — restore file position so subsequent reads work.
+            let _ = file.seek(SeekFrom::Start(0));
             return None;
         }
 
         // Attempt to rewrite. The rewriter returns Err for files it can't
         // patch (wrong arch, already hooked, no syscalls, etc.).
-        let patched = litebox_syscall_rewriter::hook_syscalls_in_elf(&content, None).ok()?;
+        let patched = match litebox_syscall_rewriter::hook_syscalls_in_elf(&content, None) {
+            Ok(p) => p,
+            Err(_) => {
+                let _ = file.seek(SeekFrom::Start(0));
+                return None;
+            }
+        };
         tracing::info!(
             path = %path.display(),
             original_size = content.len(),
@@ -173,11 +201,18 @@ impl FileBroker for FileBrokerService {
         request: Request<proto::OpenRequest>,
     ) -> Result<Response<proto::OpenResponse>, Status> {
         let req = request.into_inner();
-        let resolved = self.resolve_path(&req.path)?;
+        let flags = req.flags;
+        let has_creat = flags & 0x40 != 0;
+
+        // Use parent-only resolution for O_CREAT since the file may not exist.
+        let resolved = if has_creat {
+            self.resolve_path_for_create(&req.path)?
+        } else {
+            self.resolve_path(&req.path)?
+        };
         self.check_policy(Action::Open, Some(&resolved))?;
 
         let mut opts = fs::OpenOptions::new();
-        let flags = req.flags;
 
         // Map Linux O_* flags to Rust OpenOptions.
         let access_mode = flags & 0x3;
@@ -275,11 +310,15 @@ impl FileBroker for FileBrokerService {
             return Ok(Response::new(proto::ReadResponse { data: buf }));
         }
 
+        // Use pread semantics for offset-based reads (preserves file position).
         if let Some(offset) = req.offset {
-            entry
+            let mut buf = vec![0u8; req.count as usize];
+            let n = entry
                 .file
-                .seek(SeekFrom::Start(offset))
+                .read_at(&mut buf, offset)
                 .map_err(io_err_to_status)?;
+            buf.truncate(n);
+            return Ok(Response::new(proto::ReadResponse { data: buf }));
         }
         let mut buf = vec![0u8; req.count as usize];
         let n = entry.file.read(&mut buf).map_err(io_err_to_status)?;
@@ -300,13 +339,15 @@ impl FileBroker for FileBrokerService {
 
         self.check_policy(Action::Write, Some(&entry.path))?;
 
-        if let Some(offset) = req.offset {
+        // Use pwrite semantics for offset-based writes (preserves file position).
+        let n = if let Some(offset) = req.offset {
             entry
                 .file
-                .seek(SeekFrom::Start(offset))
-                .map_err(io_err_to_status)?;
-        }
-        let n = entry.file.write(&req.data).map_err(io_err_to_status)?;
+                .write_at(&req.data, offset)
+                .map_err(io_err_to_status)?
+        } else {
+            entry.file.write(&req.data).map_err(io_err_to_status)?
+        };
 
         Ok(Response::new(proto::WriteResponse { count: n as u64 }))
     }
@@ -428,15 +469,7 @@ impl FileBroker for FileBrokerService {
         request: Request<proto::MkdirRequest>,
     ) -> Result<Response<proto::MkdirResponse>, Status> {
         let req = request.into_inner();
-        // For mkdir the target doesn't exist yet, so resolve the parent.
-        let relative = req.path.trim_start_matches('/');
-        let target = self.root.join(relative);
-        if let Some(parent) = target.parent() {
-            let canonical_parent = parent.canonicalize().map_err(io_err_to_status)?;
-            if !canonical_parent.starts_with(&self.root) {
-                return Err(Status::permission_denied("errno:1 path escapes root"));
-            }
-        }
+        let target = self.resolve_path_for_create(&req.path)?;
         self.check_policy(Action::Mkdir, Some(&target))?;
 
         fs::create_dir(&target).map_err(io_err_to_status)?;

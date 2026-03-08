@@ -378,6 +378,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: BrokerTransport> super::FileS
             .litebox
             .descriptor_table()
             .with_entry(fd, |desc| desc.entry.remote_fd);
+        // Remove the local descriptor entry first.
+        self.litebox.descriptor_table_mut().remove(fd);
         if let Some(remote_fd) = remote_fd {
             // Best-effort close on the broker side.
             let _ = self.transport.close(remote_fd);

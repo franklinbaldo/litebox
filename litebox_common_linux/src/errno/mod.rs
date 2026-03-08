@@ -366,7 +366,7 @@ impl From<litebox::fs::errors::FileStatusError> for Errno {
         match value {
             litebox::fs::errors::FileStatusError::PathError(path_error) => path_error.into(),
             litebox::fs::errors::FileStatusError::ClosedFd => Errno::EBADF,
-            litebox::fs::errors::FileStatusError::Io | _ => Errno::EIO,
+            _ => Errno::EIO,
         }
     }
 }
