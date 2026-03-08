@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+litebox_syscall_rewriter = { path = "../litebox_syscall_rewriter" }
 prost = "0.13"
 tokio = { version = "1", features = ["full"] }
 tonic = "0.12"
