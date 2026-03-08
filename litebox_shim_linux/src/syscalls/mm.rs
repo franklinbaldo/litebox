@@ -261,31 +261,56 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         // Allocate the trampoline region if not yet done.
+        let addr_usize = mapped_addr.as_usize();
         if !state.trampoline_mapped {
             let tramp_addr = state.trampoline_addr;
-            // Allocate a page-sized RW region for trampoline stubs.
-            // Use MAP_FIXED since reserve() / ensure_space_after already
-            // reserved PROT_NONE space at this address.
-            if self
+
+            // Try MAP_FIXED first — works when ensure_space_after reserved
+            // PROT_NONE space (shared libraries). Falls back to a hint-based
+            // allocation for the ElfLoader path where no headroom is reserved.
+            let actual_addr = self
                 .do_mmap_anonymous(
                     Some(tramp_addr),
                     PAGE_SIZE,
                     ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
                     MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
                 )
-                .is_err()
-            {
-                return; // Failed to allocate trampoline region
+                .or_else(|_| {
+                    // Fallback: hint-based allocation (no MAP_FIXED).
+                    self.do_mmap_anonymous(
+                        Some(tramp_addr),
+                        PAGE_SIZE,
+                        ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                        MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
+                    )
+                });
+            let actual_addr = match actual_addr {
+                Ok(ptr) => ptr.as_usize(),
+                Err(_) => return,
+            };
+
+            // Verify the trampoline is within JMP rel32 range (±2GB) of the code.
+            let distance = if actual_addr > addr_usize {
+                actual_addr - addr_usize
+            } else {
+                addr_usize - actual_addr
+            };
+            if distance > 0x7FFF_0000 {
+                // Too far — unmap and bail.
+                let _ = self.sys_munmap(MutPtr::<u8>::from_usize(actual_addr), PAGE_SIZE);
+                return;
             }
+
+            state.trampoline_addr = actual_addr;
+
             // Write the 8-byte syscall entry point at the start.
-            let entry_ptr = MutPtr::<u8>::from_usize(tramp_addr);
+            let entry_ptr = MutPtr::<u8>::from_usize(actual_addr);
             let _ = entry_ptr.copy_from_slice(0, &syscall_entry.to_le_bytes());
             state.trampoline_cursor = 8; // stubs start after the 8-byte entry
             state.trampoline_mapped = true;
         }
 
         // Make the code segment writable for in-place patching.
-        let addr_usize = mapped_addr.as_usize();
         if self
             .sys_mprotect(
                 mapped_addr,
