@@ -254,9 +254,9 @@ impl<FS: ShimFS> Task<FS> {
         };
 
         if state.pre_patched {
-            // Pre-patched binary: map trampoline from file and write entry point.
-            // This is handled by the existing loader path (parse_trampoline +
-            // load_trampoline), so we skip it here for now.
+            // Pre-patched binary: the trampoline data is mapped by the
+            // existing loader (load_trampoline / load_secondary_trampoline).
+            // No runtime patching needed.
             return;
         }
 
