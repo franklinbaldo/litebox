@@ -176,10 +176,6 @@ impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
         let file = ElfFile::new(task, path).map_err(ElfLoaderError::OpenError)?;
         let mut parsed = litebox_common_linux::loader::ElfParsedFile::parse(&mut &file)
             .map_err(ElfLoaderError::ParseError)?;
-        // Non-fatal: unpatched binaries have no trampoline section.
-        // The mmap hook in mm.rs patches their syscalls at load time.
-        // Pre-patched binaries still get their trampoline parsed and loaded
-        // by the existing load_trampoline() path.
         let _ = parsed.parse_trampoline(&mut &file, task.global.platform.get_syscall_entry_point());
         Ok(Self { file, parsed })
     }

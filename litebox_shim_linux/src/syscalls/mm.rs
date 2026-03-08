@@ -290,7 +290,7 @@ impl<FS: ShimFS> Task<FS> {
                 let tramp_len = align_up(state.trampoline_file_size, PAGE_SIZE);
 
                 // Allocate RW region at the trampoline address.
-                if self
+                let alloc_result = self
                     .do_mmap_anonymous(
                         Some(tramp_addr),
                         tramp_len,
@@ -304,9 +304,8 @@ impl<FS: ShimFS> Task<FS> {
                             ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
                             MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
                         )
-                    })
-                    .is_err()
-                {
+                    });
+                if alloc_result.is_err() {
                     return;
                 }
 
