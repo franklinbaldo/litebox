@@ -14,7 +14,14 @@
 //!
 //! This crate currently only supports x86-64 (i.e., amd64) ELFs.
 
-use std::collections::HashSet;
+#![cfg_attr(not(feature = "std"), no_std)]
+extern crate alloc;
+
+use alloc::collections::BTreeSet;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
 
 use object::read::elf::{ElfFile, ProgramHeader as _};
 use object::read::{Object as _, ObjectSection as _, ObjectSymbol as _};
@@ -43,7 +50,7 @@ pub enum Error {
     TrampolineAddressTooLarge,
 }
 
-type Result<T> = std::result::Result<T, Error>;
+type Result<T> = core::result::Result<T, Error>;
 
 /// The magic bytes used to identify the trampoline data.
 /// This is checked by the loader to verify that the trampoline is valid.
@@ -326,7 +333,7 @@ enum Arch {
 #[allow(clippy::too_many_arguments)]
 fn hook_syscalls_in_section(
     arch: Arch,
-    control_transfer_targets: &HashSet<u64>,
+    control_transfer_targets: &BTreeSet<u64>,
     section_base_addr: u64,
     section_data: &mut [u8],
     trampoline_base_addr: u64,
@@ -560,8 +567,8 @@ fn get_control_transfer_targets(
     arch: Arch,
     input_binary: &[u8],
     text_sections: &[TextSectionInfo],
-) -> Result<HashSet<u64>> {
-    let mut control_transfer_targets = HashSet::new();
+) -> Result<BTreeSet<u64>> {
+    let mut control_transfer_targets = BTreeSet::new();
     for s in text_sections {
         let section_data = section_slice(input_binary, s)?;
         let instructions = decode_section_instructions(arch, section_data, s.vaddr)?;
@@ -670,7 +677,7 @@ fn section_slice_mut<'a>(buf: &'a mut [u8], section: &TextSectionInfo) -> Result
 #[allow(clippy::too_many_arguments)]
 fn hook_syscall_and_after(
     arch: Arch,
-    control_transfer_targets: &HashSet<u64>,
+    control_transfer_targets: &BTreeSet<u64>,
     section_base_addr: u64,
     section_data: &mut [u8],
     trampoline_base_addr: u64,
@@ -688,7 +695,6 @@ fn hook_syscall_and_after(
             && control_transfer_targets.contains(&next_inst.ip())
         {
             // If the next instruction is a control transfer target, we don't want to cross it
-            println!("Skipping control transfer target at {:#x}", next_inst.ip());
             break;
         }
         // Check if the instruction does control transfer
@@ -790,7 +796,7 @@ fn hook_syscall_and_after(
 #[allow(clippy::too_many_arguments)]
 fn hook_syscall_before_and_after(
     arch: Arch,
-    control_transfer_targets: &HashSet<u64>,
+    control_transfer_targets: &BTreeSet<u64>,
     section_base_addr: u64,
     section_data: &mut [u8],
     trampoline_base_addr: u64,
