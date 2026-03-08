@@ -641,7 +641,9 @@ impl<FS: ShimFS> GlobalState<FS> {
                         else {
                             unreachable!()
                         };
-                        interval.map_or(DEFAULT_TCP_KEEPIDLE_SECS, |d| d.as_secs().try_into().unwrap())
+                        interval.map_or(DEFAULT_TCP_KEEPIDLE_SECS, |d| {
+                            d.as_secs().try_into().unwrap()
+                        })
                     }
                     TcpOption::INFO => {
                         return Err(Errno::EOPNOTSUPP);

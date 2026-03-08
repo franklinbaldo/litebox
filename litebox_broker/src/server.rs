@@ -20,10 +20,31 @@ use crate::policy::{Action, Decision, Policy};
 use crate::proto::file_broker_server::FileBroker;
 use crate::proto::{self};
 
+/// Convert an [`std::io::Error`] into a [`tonic::Status`] whose message
+/// carries the raw OS errno in a machine-parseable `"errno:N"` prefix.
+///
+/// The client-side [`status_to_remote_error`](super) function extracts this
+/// integer so the sandbox receives the correct POSIX error code.
+fn io_err_to_status(e: std::io::Error) -> Status {
+    let errno = e.raw_os_error().unwrap_or(5); // default to EIO
+    Status::internal(format!("errno:{errno} {e}"))
+}
+
+/// Convert a permission-denied policy check into a `tonic::Status` with
+/// the EPERM errno.
+fn policy_denied_status(action: Action) -> Status {
+    Status::permission_denied(format!("errno:1 {action:?} denied by policy"))
+}
+
 /// State for a single open file descriptor on the broker side.
 struct OpenFile {
     file: fs::File,
     path: PathBuf,
+    /// If the file was ELF-patched, contains the full rewritten bytes
+    /// (shared across FDs opened read-only for the same path).
+    patched_data: Option<Arc<Vec<u8>>>,
+    /// Current read offset within `patched_data` (used for sequential reads).
+    patched_offset: u64,
 }
 
 /// Implementation of the `FileBroker` gRPC service.
@@ -36,17 +57,24 @@ pub struct FileBrokerService {
     open_files: Mutex<HashMap<u64, OpenFile>>,
     /// Monotonically increasing FDID counter.
     next_fd: AtomicU64,
+    /// When true, ELF files are rewritten at open time to hook syscalls.
+    rewrite_syscalls: bool,
+    /// Cache of patched ELF data, keyed by canonical path. Only populated
+    /// for read-only opens; writable opens bypass the cache entirely.
+    elf_cache: Mutex<HashMap<PathBuf, Arc<Vec<u8>>>>,
 }
 
 impl FileBrokerService {
     /// Create a new service rooted at `root` with the given `policy`.
-    pub fn new(root: PathBuf, policy: Arc<dyn Policy>) -> Self {
+    pub fn new(root: PathBuf, policy: Arc<dyn Policy>, rewrite_syscalls: bool) -> Self {
         Self {
             root,
             policy,
             open_files: Mutex::new(HashMap::new()),
             // Reserve FD 0 for the root (assigned in Mount).
             next_fd: AtomicU64::new(1),
+            rewrite_syscalls,
+            elf_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -59,11 +87,9 @@ impl FileBrokerService {
     fn resolve_path(&self, relative: &str) -> Result<PathBuf, Status> {
         let relative = relative.trim_start_matches('/');
         let candidate = self.root.join(relative);
-        let canonical = candidate
-            .canonicalize()
-            .map_err(|e| Status::not_found(format!("path resolution failed: {e}")))?;
+        let canonical = candidate.canonicalize().map_err(io_err_to_status)?;
         if !canonical.starts_with(&self.root) {
-            return Err(Status::permission_denied("path escapes root"));
+            return Err(Status::permission_denied("errno:1 path escapes root"));
         }
         Ok(canonical)
     }
@@ -71,11 +97,62 @@ impl FileBrokerService {
     /// Check policy and return `Err(Status)` on denial.
     fn check_policy(&self, action: Action, path: Option<&Path>) -> Result<(), Status> {
         if self.policy.check(action, path) == Decision::Deny {
-            return Err(Status::permission_denied(format!(
-                "{action:?} denied by policy"
-            )));
+            return Err(policy_denied_status(action));
         }
         Ok(())
+    }
+
+    /// If syscall rewriting is enabled and the file is opened read-only,
+    /// check whether `file` is an ELF and return the patched bytes with an
+    /// appended trampoline. Uses a per-path cache so repeated opens of the
+    /// same library don't re-run the rewriter.
+    ///
+    /// Returns `None` if patching is disabled, the open is writable, the
+    /// file isn't an ELF, or the rewriter cannot process it.
+    fn try_patch_elf(
+        &self,
+        file: &mut fs::File,
+        path: &Path,
+        is_read_only: bool,
+    ) -> Option<Arc<Vec<u8>>> {
+        if !self.rewrite_syscalls || !is_read_only {
+            return None;
+        }
+
+        // Check the cache first.
+        {
+            let cache = self.elf_cache.lock().unwrap();
+            if let Some(cached) = cache.get(path) {
+                return Some(Arc::clone(cached));
+            }
+        }
+
+        // Read the full file content.
+        let mut content = Vec::new();
+        file.seek(SeekFrom::Start(0)).ok()?;
+        file.read_to_end(&mut content).ok()?;
+
+        // Quick ELF magic check.
+        if content.len() < 4 || &content[..4] != b"\x7fELF" {
+            return None;
+        }
+
+        // Attempt to rewrite. The rewriter returns Err for files it can't
+        // patch (wrong arch, already hooked, no syscalls, etc.).
+        let patched = litebox_syscall_rewriter::hook_syscalls_in_elf(&content, None).ok()?;
+        tracing::info!(
+            path = %path.display(),
+            original_size = content.len(),
+            patched_size = patched.len(),
+            "patched ELF with syscall trampolines"
+        );
+
+        let arc = Arc::new(patched);
+        self.elf_cache
+            .lock()
+            .unwrap()
+            .insert(path.to_owned(), Arc::clone(&arc));
+        Some(arc)
     }
 }
 
@@ -135,9 +212,11 @@ impl FileBroker for FileBrokerService {
             opts.append(true);
         }
 
-        let file = opts
-            .open(&resolved)
-            .map_err(|e| Status::internal(format!("open failed: {e}")))?;
+        let mut file = opts.open(&resolved).map_err(io_err_to_status)?;
+
+        // Only attempt ELF patching for read-only opens (access_mode == 0).
+        let is_read_only = access_mode == 0;
+        let patched_data = self.try_patch_elf(&mut file, &resolved, is_read_only);
 
         let fd = self.alloc_fd();
         self.open_files.lock().unwrap().insert(
@@ -145,6 +224,8 @@ impl FileBroker for FileBrokerService {
             OpenFile {
                 file,
                 path: resolved,
+                patched_data,
+                patched_offset: 0,
             },
         );
 
@@ -171,21 +252,37 @@ impl FileBroker for FileBrokerService {
         let mut files = self.open_files.lock().unwrap();
         let entry = files
             .get_mut(&req.fd)
-            .ok_or_else(|| Status::not_found("bad fd"))?;
+            .ok_or_else(|| Status::not_found("errno:9 bad fd"))?;
 
         self.check_policy(Action::Read, Some(&entry.path))?;
+
+        // For patched ELFs, serve reads from the cached patched data.
+        if let Some(ref data) = entry.patched_data {
+            let offset = req.offset.unwrap_or(entry.patched_offset);
+            let data_len = data.len() as u64;
+            if offset >= data_len {
+                return Ok(Response::new(proto::ReadResponse { data: vec![] }));
+            }
+            let available = (data_len - offset) as usize;
+            let n = std::cmp::min(req.count as usize, available);
+            let buf = data[offset as usize..offset as usize + n].to_vec();
+
+            // Advance offset for sequential reads (no explicit offset).
+            if req.offset.is_none() {
+                entry.patched_offset = offset + n as u64;
+            }
+
+            return Ok(Response::new(proto::ReadResponse { data: buf }));
+        }
 
         if let Some(offset) = req.offset {
             entry
                 .file
                 .seek(SeekFrom::Start(offset))
-                .map_err(|e| Status::internal(format!("seek failed: {e}")))?;
+                .map_err(io_err_to_status)?;
         }
         let mut buf = vec![0u8; req.count as usize];
-        let n = entry
-            .file
-            .read(&mut buf)
-            .map_err(|e| Status::internal(format!("read failed: {e}")))?;
+        let n = entry.file.read(&mut buf).map_err(io_err_to_status)?;
         buf.truncate(n);
 
         Ok(Response::new(proto::ReadResponse { data: buf }))
@@ -199,7 +296,7 @@ impl FileBroker for FileBrokerService {
         let mut files = self.open_files.lock().unwrap();
         let entry = files
             .get_mut(&req.fd)
-            .ok_or_else(|| Status::not_found("bad fd"))?;
+            .ok_or_else(|| Status::not_found("errno:9 bad fd"))?;
 
         self.check_policy(Action::Write, Some(&entry.path))?;
 
@@ -207,12 +304,9 @@ impl FileBroker for FileBrokerService {
             entry
                 .file
                 .seek(SeekFrom::Start(offset))
-                .map_err(|e| Status::internal(format!("seek failed: {e}")))?;
+                .map_err(io_err_to_status)?;
         }
-        let n = entry
-            .file
-            .write(&req.data)
-            .map_err(|e| Status::internal(format!("write failed: {e}")))?;
+        let n = entry.file.write(&req.data).map_err(io_err_to_status)?;
 
         Ok(Response::new(proto::WriteResponse { count: n as u64 }))
     }
@@ -225,20 +319,35 @@ impl FileBroker for FileBrokerService {
         let mut files = self.open_files.lock().unwrap();
         let entry = files
             .get_mut(&req.fd)
-            .ok_or_else(|| Status::not_found("bad fd"))?;
+            .ok_or_else(|| Status::not_found("errno:9 bad fd"))?;
 
         self.check_policy(Action::Seek, Some(&entry.path))?;
+
+        // For patched ELFs, handle seek against the cached data.
+        if let Some(ref data) = entry.patched_data {
+            let data_len = data.len() as i64;
+            let new_offset = match req.whence {
+                0 => req.offset,                               // SEEK_SET
+                1 => entry.patched_offset as i64 + req.offset, // SEEK_CUR
+                2 => data_len + req.offset,                    // SEEK_END
+                _ => return Err(Status::invalid_argument("errno:22 invalid whence")),
+            };
+            if new_offset < 0 {
+                return Err(Status::invalid_argument("errno:22 seek before start"));
+            }
+            entry.patched_offset = new_offset as u64;
+            return Ok(Response::new(proto::SeekResponse {
+                offset: new_offset as u64,
+            }));
+        }
 
         let whence = match req.whence {
             0 => SeekFrom::Start(req.offset as u64),
             1 => SeekFrom::Current(req.offset),
             2 => SeekFrom::End(req.offset),
-            _ => return Err(Status::invalid_argument("invalid whence")),
+            _ => return Err(Status::invalid_argument("errno:22 invalid whence")),
         };
-        let pos = entry
-            .file
-            .seek(whence)
-            .map_err(|e| Status::internal(format!("seek failed: {e}")))?;
+        let pos = entry.file.seek(whence).map_err(io_err_to_status)?;
 
         Ok(Response::new(proto::SeekResponse { offset: pos }))
     }
@@ -251,14 +360,11 @@ impl FileBroker for FileBrokerService {
         let mut files = self.open_files.lock().unwrap();
         let entry = files
             .get_mut(&req.fd)
-            .ok_or_else(|| Status::not_found("bad fd"))?;
+            .ok_or_else(|| Status::not_found("errno:9 bad fd"))?;
 
         self.check_policy(Action::Truncate, Some(&entry.path))?;
 
-        entry
-            .file
-            .set_len(req.length)
-            .map_err(|e| Status::internal(format!("truncate failed: {e}")))?;
+        entry.file.set_len(req.length).map_err(io_err_to_status)?;
 
         Ok(Response::new(proto::TruncateResponse {}))
     }
@@ -273,8 +379,7 @@ impl FileBroker for FileBrokerService {
 
         use std::os::unix::fs::PermissionsExt;
         let perms = fs::Permissions::from_mode(req.mode);
-        fs::set_permissions(&resolved, perms)
-            .map_err(|e| Status::internal(format!("chmod failed: {e}")))?;
+        fs::set_permissions(&resolved, perms).map_err(io_err_to_status)?;
 
         Ok(Response::new(proto::ChmodResponse {}))
     }
@@ -287,8 +392,7 @@ impl FileBroker for FileBrokerService {
         let resolved = self.resolve_path(&req.path)?;
         self.check_policy(Action::Stat, Some(&resolved))?;
 
-        let meta =
-            fs::metadata(&resolved).map_err(|e| Status::not_found(format!("stat failed: {e}")))?;
+        let meta = fs::metadata(&resolved).map_err(io_err_to_status)?;
 
         Ok(Response::new(metadata_to_stat(&meta)))
     }
@@ -301,16 +405,22 @@ impl FileBroker for FileBrokerService {
         let files = self.open_files.lock().unwrap();
         let entry = files
             .get(&req.fd)
-            .ok_or_else(|| Status::not_found("bad fd"))?;
+            .ok_or_else(|| Status::not_found("errno:9 bad fd"))?;
 
         self.check_policy(Action::Stat, Some(&entry.path))?;
 
-        let meta = entry
-            .file
-            .metadata()
-            .map_err(|e| Status::internal(format!("fstat failed: {e}")))?;
+        let meta = entry.file.metadata().map_err(io_err_to_status)?;
 
-        Ok(Response::new(metadata_to_stat(&meta)))
+        let mut stat = metadata_to_stat(&meta);
+
+        // For patched ELFs, report the patched (larger) file size so the
+        // loader's parse_trampoline() reads the header from the correct
+        // position at the end of the file.
+        if let Some(ref data) = entry.patched_data {
+            stat.size = data.len() as u64;
+        }
+
+        Ok(Response::new(stat))
     }
 
     async fn mkdir(
@@ -322,16 +432,14 @@ impl FileBroker for FileBrokerService {
         let relative = req.path.trim_start_matches('/');
         let target = self.root.join(relative);
         if let Some(parent) = target.parent() {
-            let canonical_parent = parent
-                .canonicalize()
-                .map_err(|e| Status::not_found(format!("parent resolution failed: {e}")))?;
+            let canonical_parent = parent.canonicalize().map_err(io_err_to_status)?;
             if !canonical_parent.starts_with(&self.root) {
-                return Err(Status::permission_denied("path escapes root"));
+                return Err(Status::permission_denied("errno:1 path escapes root"));
             }
         }
         self.check_policy(Action::Mkdir, Some(&target))?;
 
-        fs::create_dir(&target).map_err(|e| Status::internal(format!("mkdir failed: {e}")))?;
+        fs::create_dir(&target).map_err(io_err_to_status)?;
 
         // Apply the requested permissions.
         use std::os::unix::fs::PermissionsExt;
@@ -351,7 +459,7 @@ impl FileBroker for FileBrokerService {
         let resolved = self.resolve_path(&req.path)?;
         self.check_policy(Action::Rmdir, Some(&resolved))?;
 
-        fs::remove_dir(&resolved).map_err(|e| Status::internal(format!("rmdir failed: {e}")))?;
+        fs::remove_dir(&resolved).map_err(io_err_to_status)?;
 
         Ok(Response::new(proto::RmdirResponse {}))
     }
@@ -364,7 +472,7 @@ impl FileBroker for FileBrokerService {
         let resolved = self.resolve_path(&req.path)?;
         self.check_policy(Action::Unlink, Some(&resolved))?;
 
-        fs::remove_file(&resolved).map_err(|e| Status::internal(format!("unlink failed: {e}")))?;
+        fs::remove_file(&resolved).map_err(io_err_to_status)?;
 
         Ok(Response::new(proto::UnlinkResponse {}))
     }
@@ -377,7 +485,7 @@ impl FileBroker for FileBrokerService {
         let files = self.open_files.lock().unwrap();
         let entry = files
             .get(&req.fd)
-            .ok_or_else(|| Status::not_found("bad fd"))?;
+            .ok_or_else(|| Status::not_found("errno:9 bad fd"))?;
 
         self.check_policy(Action::ReadDir, Some(&entry.path))?;
 
@@ -385,11 +493,9 @@ impl FileBroker for FileBrokerService {
         drop(files);
 
         let mut entries = Vec::new();
-        let read_dir = fs::read_dir(&dir_path)
-            .map_err(|e| Status::internal(format!("readdir failed: {e}")))?;
+        let read_dir = fs::read_dir(&dir_path).map_err(io_err_to_status)?;
         for dir_entry in read_dir {
-            let dir_entry =
-                dir_entry.map_err(|e| Status::internal(format!("readdir entry: {e}")))?;
+            let dir_entry = dir_entry.map_err(io_err_to_status)?;
             let ft = dir_entry.file_type().ok();
             let file_type = match ft {
                 Some(t) if t.is_dir() => proto::FileType::Directory,
