@@ -27,7 +27,12 @@ pub(crate) struct ElfPatchState {
     pub _base_addr: usize,
     /// Whether this file is already pre-patched (trampoline magic found at file tail).
     pub pre_patched: bool,
-    /// Start address of the trampoline region.
+    /// For pre-patched binaries: file offset and size of the trampoline data.
+    pub trampoline_file_offset: u64,
+    pub trampoline_file_size: usize,
+    /// For pre-patched binaries: virtual address offset of the trampoline in the ELF.
+    pub _trampoline_vaddr: usize,
+    /// Start address of the trampoline region (runtime).
     pub trampoline_addr: usize,
     /// Current write position within the trampoline (byte offset from `trampoline_addr`).
     pub trampoline_cursor: usize,
@@ -196,7 +201,19 @@ impl<FS: ShimFS> Task<FS> {
         };
 
         // Check if file is pre-patched by reading the last 32 bytes for magic
-        let pre_patched = self.check_trampoline_magic(fd);
+        let (pre_patched, tramp_file_offset, tramp_vaddr, tramp_file_size) =
+            self.check_trampoline_magic(fd);
+
+        // For pre-patched binaries, use the vaddr from the header instead.
+        let trampoline_vaddr = if pre_patched {
+            if e_type == 3 {
+                base_addr + tramp_vaddr as usize
+            } else {
+                tramp_vaddr as usize
+            }
+        } else {
+            trampoline_vaddr
+        };
 
         // Insert under lock (re-check for races).
         let ps = self.process_state.borrow();
@@ -204,6 +221,9 @@ impl<FS: ShimFS> Task<FS> {
         cache.entry(fd).or_insert(ElfPatchState {
             _base_addr: base_addr,
             pre_patched,
+            trampoline_file_offset: tramp_file_offset,
+            trampoline_file_size: tramp_file_size as usize,
+            _trampoline_vaddr: tramp_vaddr as usize,
             trampoline_addr: trampoline_vaddr,
             trampoline_cursor: 0,
             trampoline_mapped: false,
@@ -211,19 +231,27 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Check if a file has the LITEBOX trampoline magic at its tail.
-    fn check_trampoline_magic(&self, fd: i32) -> bool {
+    /// Returns (is_pre_patched, file_offset, vaddr, trampoline_size).
+    fn check_trampoline_magic(&self, fd: i32) -> (bool, u64, u64, u64) {
         let Ok(stat) = self.sys_fstat(fd) else {
-            return false;
+            return (false, 0, 0, 0);
         };
         let file_size = stat.st_size as usize;
         if file_size < 32 {
-            return false;
+            return (false, 0, 0, 0);
         }
         let mut tail = [0u8; 32];
         if self.sys_read(fd, &mut tail, Some(file_size - 32)).is_err() {
-            return false;
+            return (false, 0, 0, 0);
         }
-        &tail[0..8] == litebox_syscall_rewriter::TRAMPOLINE_MAGIC
+        if &tail[0..8] != litebox_syscall_rewriter::TRAMPOLINE_MAGIC {
+            return (false, 0, 0, 0);
+        }
+        // Parse header: magic(8) | file_offset(8) | vaddr(8) | size(8)
+        let file_offset = u64::from_le_bytes(tail[8..16].try_into().unwrap());
+        let vaddr = u64::from_le_bytes(tail[16..24].try_into().unwrap());
+        let trampoline_size = u64::from_le_bytes(tail[24..32].try_into().unwrap());
+        (true, file_offset, vaddr, trampoline_size)
     }
 
     /// Patch an executable segment in-place after it has been mapped.
@@ -254,9 +282,59 @@ impl<FS: ShimFS> Task<FS> {
         };
 
         if state.pre_patched {
-            // Pre-patched binary: the trampoline data is mapped by the
-            // existing loader (load_trampoline / load_secondary_trampoline).
-            // No runtime patching needed.
+            // Pre-patched binary: map the trampoline data from the file.
+            // The trampoline contains the rewriting stubs; we just need to
+            // map them at the correct address and write the syscall entry.
+            if !state.trampoline_mapped && state.trampoline_file_size > 0 {
+                let tramp_addr = state.trampoline_addr;
+                let tramp_len = align_up(state.trampoline_file_size, PAGE_SIZE);
+
+                // Allocate RW region at the trampoline address.
+                if self
+                    .do_mmap_anonymous(
+                        Some(tramp_addr),
+                        tramp_len,
+                        ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                        MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+                    )
+                    .or_else(|_| {
+                        self.do_mmap_anonymous(
+                            Some(tramp_addr),
+                            tramp_len,
+                            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                            MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
+                        )
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+
+                // Read trampoline data from the file.
+                let mut tramp_data = alloc::vec![0u8; state.trampoline_file_size];
+                let file_off = state.trampoline_file_offset as usize;
+                if self.sys_read(fd, &mut tramp_data, Some(file_off)).is_err() {
+                    return;
+                }
+
+                // Write syscall entry point to the first 8 bytes.
+                if tramp_data.len() >= 8 {
+                    tramp_data[..8].copy_from_slice(&syscall_entry.to_le_bytes());
+                }
+
+                // Write to the mapped region.
+                let tramp_ptr = MutPtr::<u8>::from_usize(tramp_addr);
+                let _ = tramp_ptr.copy_from_slice(0, &tramp_data);
+
+                // Protect as RX immediately.
+                let _ = self.sys_mprotect(
+                    tramp_ptr,
+                    tramp_len,
+                    ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+                );
+
+                state.trampoline_mapped = true;
+            }
             return;
         }
 
