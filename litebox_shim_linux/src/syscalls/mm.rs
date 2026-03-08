@@ -24,7 +24,7 @@ use crate::Task;
 /// has executable segments mapped via `do_mmap_file()`.
 pub(crate) struct ElfPatchState {
     /// Base virtual address of the ELF (recorded from first mmap at offset ≈ 0).
-    pub base_addr: usize,
+    pub _base_addr: usize,
     /// Whether this file is already pre-patched (trampoline magic found at file tail).
     pub pre_patched: bool,
     /// Start address of the trampoline region.
@@ -202,7 +202,7 @@ impl<FS: ShimFS> Task<FS> {
         let ps = self.process_state.borrow();
         let mut cache = ps.elf_patch_cache.lock();
         cache.entry(fd).or_insert(ElfPatchState {
-            base_addr,
+            _base_addr: base_addr,
             pre_patched,
             trampoline_addr: trampoline_vaddr,
             trampoline_cursor: 0,
@@ -359,6 +359,29 @@ impl<FS: ShimFS> Task<FS> {
             len,
             ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
         );
+    }
+
+    /// Finalize the ELF patching state for `fd`.
+    ///
+    /// If the fd has a trampoline region that was allocated (RW), mprotect it
+    /// to RX so the trampoline stubs become executable and non-writable.
+    /// The cache entry is removed regardless.
+    pub(crate) fn finalize_elf_patch(&self, fd: i32) {
+        let ps = self.process_state.borrow();
+        let state = ps.elf_patch_cache.lock().remove(&fd);
+        drop(ps);
+        if let Some(state) = state {
+            if state.trampoline_mapped && !state.pre_patched {
+                let tramp_len = align_up(state.trampoline_cursor, PAGE_SIZE);
+                if tramp_len > 0 {
+                    let _ = self.sys_mprotect(
+                        MutPtr::<u8>::from_usize(state.trampoline_addr),
+                        tramp_len,
+                        ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+                    );
+                }
+            }
+        }
     }
 
     /// Attempt to create a CoW mapping for a file with static backing data.
