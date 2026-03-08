@@ -5,11 +5,10 @@
 //! Most of these syscalls which are not backed by files are implemented in [`litebox_common_linux::mm`].
 
 use alloc::collections::BTreeMap;
-use alloc::vec::Vec;
 use litebox::{
     mm::linux::{MappingError, PAGE_SIZE, PageRange},
     platform::{
-        PageManagementProvider, RawConstPointer, RawMutPointer,
+        PageManagementProvider, RawConstPointer, RawMutPointer, SystemInfoProvider,
         page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions},
     },
 };
@@ -98,12 +97,268 @@ impl<FS: ShimFS> Task<FS> {
         fd: i32,
         offset: usize,
     ) -> Result<MutPtr<u8>, MappingError> {
-        if let Some(cow_result) =
+        let is_exec = prot.contains(ProtFlags::PROT_EXEC);
+
+        // Perform the normal mmap first (CoW or memcpy fallback).
+        let result = if let Some(cow_result) =
             self.try_cow_mmap_file(suggested_addr, len, &prot, &flags, fd, offset)
         {
-            return cow_result;
+            cow_result?
+        } else {
+            self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, fd, offset)?
+        };
+
+        // Runtime syscall rewriting: patch PROT_EXEC segments in-place.
+        if is_exec {
+            let syscall_entry = self.global.platform.get_syscall_entry_point();
+            if syscall_entry != 0 {
+                self.maybe_patch_exec_segment(result, len, fd, offset, syscall_entry);
+            }
+        } else if offset == 0 {
+            // First mmap at offset 0: record the base address for later patching.
+            self.init_elf_patch_state(fd, result.as_usize());
         }
-        self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, fd, offset)
+
+        Ok(result)
+    }
+
+    /// Initialize ELF patch state for an fd on its first mmap at offset 0.
+    ///
+    /// Reads the ELF header to determine the trampoline address (page-aligned
+    /// end of the highest PT_LOAD segment) and checks the file tail for the
+    /// trampoline magic to determine if it's pre-patched.
+    fn init_elf_patch_state(&self, fd: i32, base_addr: usize) {
+        // Quick check: skip if already initialized.
+        {
+            let ps = self.process_state.borrow();
+            if ps.elf_patch_cache.lock().contains_key(&fd) {
+                return;
+            }
+        }
+
+        // Read the ELF header (first 64 bytes covers both 32-bit and 64-bit).
+        let mut ehdr_buf = [0u8; 64];
+        if self.sys_read(fd, &mut ehdr_buf, Some(0)).is_err() {
+            return; // Not readable, skip
+        }
+
+        // Verify ELF magic
+        if &ehdr_buf[0..4] != b"\x7fELF" {
+            return; // Not an ELF file
+        }
+
+        // Parse as 64-bit ELF (runtime patching is x86-64 only).
+        // e_phoff at offset 32 (8 bytes), e_phentsize at 54 (2 bytes), e_phnum at 56 (2 bytes)
+        let e_phoff = u64::from_le_bytes(ehdr_buf[32..40].try_into().unwrap()) as usize;
+        let e_phentsize = u16::from_le_bytes(ehdr_buf[54..56].try_into().unwrap()) as usize;
+        let e_phnum = u16::from_le_bytes(ehdr_buf[56..58].try_into().unwrap()) as usize;
+        let e_type = u16::from_le_bytes(ehdr_buf[16..18].try_into().unwrap());
+
+        // Read program headers to find max PT_LOAD end
+        let phdrs_size = e_phentsize * e_phnum;
+        if phdrs_size == 0 || phdrs_size > 0x10000 {
+            return; // Sanity check
+        }
+        let mut phdrs_buf = alloc::vec![0u8; phdrs_size];
+        if self.sys_read(fd, &mut phdrs_buf, Some(e_phoff)).is_err() {
+            return;
+        }
+
+        // Find highest PT_LOAD end (p_vaddr + p_memsz)
+        let mut max_load_end: u64 = 0;
+        for i in 0..e_phnum {
+            let ph = &phdrs_buf[i * e_phentsize..][..e_phentsize];
+            let p_type = u32::from_le_bytes(ph[0..4].try_into().unwrap());
+            if p_type != 1 {
+                // PT_LOAD = 1
+                continue;
+            }
+            let p_vaddr = u64::from_le_bytes(ph[16..24].try_into().unwrap());
+            let p_memsz = u64::from_le_bytes(ph[40..48].try_into().unwrap());
+            let end = p_vaddr + p_memsz;
+            if end > max_load_end {
+                max_load_end = end;
+            }
+        }
+
+        if max_load_end == 0 {
+            return; // No PT_LOAD segments
+        }
+
+        // For ET_DYN (PIE/shared libs), p_vaddr is relative to base_addr.
+        // For ET_EXEC, p_vaddr is absolute and base_addr is 0.
+        let trampoline_vaddr = if e_type == 3 {
+            // ET_DYN
+            base_addr + (max_load_end as usize).next_multiple_of(PAGE_SIZE)
+        } else {
+            // ET_EXEC
+            (max_load_end as usize).next_multiple_of(PAGE_SIZE)
+        };
+
+        // Check if file is pre-patched by reading the last 32 bytes for magic
+        let pre_patched = self.check_trampoline_magic(fd);
+
+        // Insert under lock (re-check for races).
+        let ps = self.process_state.borrow();
+        let mut cache = ps.elf_patch_cache.lock();
+        cache.entry(fd).or_insert(ElfPatchState {
+            base_addr,
+            pre_patched,
+            trampoline_addr: trampoline_vaddr,
+            trampoline_cursor: 0,
+            trampoline_mapped: false,
+        });
+    }
+
+    /// Check if a file has the LITEBOX trampoline magic at its tail.
+    fn check_trampoline_magic(&self, fd: i32) -> bool {
+        let Ok(stat) = self.sys_fstat(fd) else {
+            return false;
+        };
+        let file_size = stat.st_size as usize;
+        if file_size < 32 {
+            return false;
+        }
+        let mut tail = [0u8; 32];
+        if self.sys_read(fd, &mut tail, Some(file_size - 32)).is_err() {
+            return false;
+        }
+        &tail[0..8] == litebox_syscall_rewriter::TRAMPOLINE_MAGIC
+    }
+
+    /// Patch an executable segment in-place after it has been mapped.
+    ///
+    /// For pre-patched binaries: maps the trampoline from the file and writes
+    /// the syscall entry point.
+    /// For unpatched binaries: calls `patch_code_segment()` to rewrite syscall
+    /// instructions and places the generated stubs in the trampoline region.
+    fn maybe_patch_exec_segment(
+        &self,
+        mapped_addr: MutPtr<u8>,
+        len: usize,
+        fd: i32,
+        offset: usize,
+        syscall_entry: usize,
+    ) {
+        // Initialize patch state if this is the first mmap for this fd.
+        // This handles the case where the first mmap IS the PROT_EXEC one
+        // (e.g., MAP_FIXED from the ElfLoader at offset 0).
+        if offset == 0 {
+            self.init_elf_patch_state(fd, mapped_addr.as_usize());
+        }
+
+        let ps = self.process_state.borrow();
+        let mut cache = ps.elf_patch_cache.lock();
+        let Some(state) = cache.get_mut(&fd) else {
+            return; // No patch state — not an ELF we're tracking
+        };
+
+        if state.pre_patched {
+            // Pre-patched binary: map trampoline from file and write entry point.
+            // This is handled by the existing loader path (parse_trampoline +
+            // load_trampoline), so we skip it here for now.
+            return;
+        }
+
+        // Allocate the trampoline region if not yet done.
+        if !state.trampoline_mapped {
+            let tramp_addr = state.trampoline_addr;
+            // Allocate a page-sized RW region for trampoline stubs.
+            // Use MAP_FIXED since reserve() / ensure_space_after already
+            // reserved PROT_NONE space at this address.
+            if self
+                .do_mmap_anonymous(
+                    Some(tramp_addr),
+                    PAGE_SIZE,
+                    ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                    MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+                )
+                .is_err()
+            {
+                return; // Failed to allocate trampoline region
+            }
+            // Write the 8-byte syscall entry point at the start.
+            let entry_ptr = MutPtr::<u8>::from_usize(tramp_addr);
+            let _ = entry_ptr.copy_from_slice(0, &syscall_entry.to_le_bytes());
+            state.trampoline_cursor = 8; // stubs start after the 8-byte entry
+            state.trampoline_mapped = true;
+        }
+
+        // Make the code segment writable for in-place patching.
+        let addr_usize = mapped_addr.as_usize();
+        if self
+            .sys_mprotect(
+                mapped_addr,
+                len,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+            )
+            .is_err()
+        {
+            return;
+        }
+
+        // Read the mapped code into a buffer, patch it, write back.
+        let Some(code_owned) = mapped_addr.to_owned_slice(len) else {
+            // Restore permissions and bail.
+            let _ = self.sys_mprotect(
+                mapped_addr,
+                len,
+                ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+            );
+            return;
+        };
+        let mut code_buf = code_owned.into_vec();
+
+        let code_vaddr = addr_usize as u64;
+        let trampoline_write_vaddr = (state.trampoline_addr + state.trampoline_cursor) as u64;
+        let syscall_entry_addr = state.trampoline_addr as u64; // entry at offset 0
+
+        match litebox_syscall_rewriter::patch_code_segment(
+            &mut code_buf,
+            code_vaddr,
+            trampoline_write_vaddr,
+            syscall_entry_addr,
+        ) {
+            Ok(stubs) if !stubs.is_empty() => {
+                // Write patched code back to the mapped region.
+                let _ = mapped_addr.copy_from_slice(0, &code_buf);
+
+                // Write stubs to the trampoline region.
+                let tramp_write_ptr =
+                    MutPtr::<u8>::from_usize(state.trampoline_addr + state.trampoline_cursor);
+                let _ = tramp_write_ptr.copy_from_slice(0, &stubs);
+                state.trampoline_cursor += stubs.len();
+
+                // Grow trampoline if needed (allocate more pages).
+                let tramp_pages_needed =
+                    (state.trampoline_cursor + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
+                let tramp_pages_mapped = if state.trampoline_mapped {
+                    PAGE_SIZE
+                } else {
+                    0
+                };
+                if tramp_pages_needed > tramp_pages_mapped {
+                    let extra_start = state.trampoline_addr + tramp_pages_mapped;
+                    let extra_len = tramp_pages_needed - tramp_pages_mapped;
+                    let _ = self.do_mmap_anonymous(
+                        Some(extra_start),
+                        extra_len,
+                        ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                        MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+                    );
+                }
+            }
+            _ => {
+                // No syscalls found or error — no patching needed.
+            }
+        }
+
+        // Restore the code segment to RX.
+        let _ = self.sys_mprotect(
+            mapped_addr,
+            len,
+            ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+        );
     }
 
     /// Attempt to create a CoW mapping for a file with static backing data.
