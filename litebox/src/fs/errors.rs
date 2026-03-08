@@ -183,6 +183,26 @@ pub enum RmdirError {
     PathError(#[from] PathError),
 }
 
+/// Possible errors from [`FileSystem::rename`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum RenameError {
+    #[error("a directory component in either path does not allow write permission")]
+    NoWritePerms,
+    #[error("old path is a directory but new path is not")]
+    IsADirectory,
+    #[error("new path is a directory but old path is not")]
+    NotADirectory,
+    #[error("new path is a non-empty directory")]
+    NotEmpty,
+    #[error("the filesystem does not support renaming")]
+    ReadOnlyFileSystem,
+    #[error("old and new are the same file")]
+    SameFile,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
 /// Possible errors from [`FileSystem::read_dir`]
 #[non_exhaustive]
 #[derive(Error, Debug)]

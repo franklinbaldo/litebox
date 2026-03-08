@@ -16,7 +16,8 @@ use crate::sync;
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ReadDirError, ReadError, RenameError, RmdirError, SeekError, TruncateError, UnlinkError,
+    WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence};
 
@@ -230,7 +231,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         // First, we make sure we've set up the ancestor directories.
                         match self.mkdir_migrating_ancestor_dirs(path) {
                             Ok(()) => {}
-                            Err(e) => unimplemented!("{e} when setting up ancestor dirs"),
+                            Err(_) => return Err(MigrationError::Io),
                         }
                         // Now we can actually open the file.
                         upper_fd = Some(
@@ -752,17 +753,32 @@ impl<
             .flatten()?;
         // Perform the actual operation
         let num_bytes = match entry.as_ref() {
-            EntryX::Upper { fd } => self.upper.read(fd, buf, offset)?,
-            EntryX::Lower { fd } => self.lower.read(fd, buf, offset)?,
+            EntryX::Upper { fd: upper_fd } => self.upper.read(upper_fd, buf, offset)?,
+            EntryX::Lower { fd: lower_fd } => {
+                // Lower-layer file descriptors are shared across all opens of the same
+                // path (see the `EntryX::Lower` fast-path in `open`). We must always
+                // provide an explicit offset to the lower layer so concurrent readers
+                // don't corrupt each other's positions.
+                let lower_offset = offset.unwrap_or_else(|| {
+                    self.litebox
+                        .descriptor_table()
+                        .get_entry(fd)
+                        .map(|e| e.entry.position.load(SeqCst))
+                        .unwrap_or(0)
+                });
+                self.lower.read(lower_fd, buf, Some(lower_offset))?
+            }
             EntryX::Tombstone => unreachable!(),
         };
-        self.litebox
-            .descriptor_table()
-            .get_entry(fd)
-            .ok_or(ReadError::ClosedFd)?
-            .entry
-            .position
-            .fetch_add(num_bytes, SeqCst);
+        if offset.is_none() {
+            self.litebox
+                .descriptor_table()
+                .get_entry(fd)
+                .ok_or(ReadError::ClosedFd)?
+                .entry
+                .position
+                .fetch_add(num_bytes, SeqCst);
+        }
         Ok(num_bytes)
     }
 
@@ -859,8 +875,33 @@ impl<
             .ok_or(SeekError::ClosedFd)?;
         // Perform the seek, and update the position info
         let position = match entry.as_ref() {
-            EntryX::Upper { fd } => self.upper.seek(fd, offset, whence)?,
-            EntryX::Lower { fd } => self.lower.seek(fd, offset, whence)?,
+            EntryX::Upper { fd: upper_fd } => self.upper.seek(upper_fd, offset, whence)?,
+            EntryX::Lower { fd: lower_fd } => {
+                // For lower-layer files the underlying fd is shared across all opens
+                // of the same path. Translate SEEK_CUR into SEEK_SET using our own
+                // tracked position so concurrent seekers don't interfere.
+                match whence {
+                    SeekWhence::RelativeToCurrentOffset => {
+                        let cur = self
+                            .litebox
+                            .descriptor_table()
+                            .get_entry(fd)
+                            .map(|e| e.entry.position.load(SeqCst))
+                            .unwrap_or(0);
+                        let effective_offset = isize::try_from(cur)
+                            .ok()
+                            .and_then(|c| c.checked_add(offset));
+                        match effective_offset {
+                            Some(o) => {
+                                self.lower
+                                    .seek(lower_fd, o, SeekWhence::RelativeToBeginning)?
+                            }
+                            None => return Err(SeekError::InvalidOffset),
+                        }
+                    }
+                    _ => self.lower.seek(lower_fd, offset, whence)?,
+                }
+            }
             EntryX::Tombstone => unreachable!(),
         };
         if let Some(e) = self.litebox.descriptor_table().get_entry(fd) {
@@ -912,10 +953,11 @@ impl<
                                             descriptor.entry.path.clone()
                                         })
                                         .ok_or(TruncateError::ClosedFd)?;
-                                    self.migrate_file_up(&path, false)
-                                        .expect("this migration should always succeed");
-
-                                    Ok(())
+                                    match self.migrate_file_up(&path, false) {
+                                        Ok(()) => Ok(()),
+                                        Err(MigrationError::Io) => Err(TruncateError::Io),
+                                        Err(_) => Err(TruncateError::Io),
+                                    }
                                 }
                                 Err(TruncateError::Io) => Err(TruncateError::Io),
                             }
@@ -1070,6 +1112,18 @@ impl<
             .entries
             .insert(path, Arc::new(EntryX::Tombstone));
         Ok(())
+    }
+
+    fn rename(
+        &self,
+        old_path: impl crate::path::Arg,
+        new_path: impl crate::path::Arg,
+    ) -> Result<(), RenameError> {
+        // Delegate rename to the upper (in-mem) layer. The layered FS currently
+        // only supports rename for files that reside entirely in the upper layer.
+        let old = self.absolute_path(old_path)?;
+        let new = self.absolute_path(new_path)?;
+        self.upper.rename(old.as_str(), new.as_str())
     }
 
     fn mkdir(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), MkdirError> {

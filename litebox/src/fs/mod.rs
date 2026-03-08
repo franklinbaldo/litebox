@@ -24,7 +24,7 @@ mod tests;
 
 use errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, ReadDirError,
-    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ReadError, RenameError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
 };
 
 /// A private module, to help support writing sealed traits. This module should _itself_ never be
@@ -119,6 +119,10 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
 
     /// Unlink a file
     fn unlink(&self, path: impl path::Arg) -> Result<(), UnlinkError>;
+
+    /// Rename (move) a file or directory
+    fn rename(&self, old_path: impl path::Arg, new_path: impl path::Arg)
+    -> Result<(), RenameError>;
 
     /// Create a new directory
     fn mkdir(&self, path: impl path::Arg, mode: Mode) -> Result<(), MkdirError>;

@@ -13,7 +13,8 @@ use crate::{
         FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
         errors::{
             ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-            ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+            ReadDirError, ReadError, RenameError, RmdirError, SeekError, TruncateError,
+            UnlinkError, WriteError,
         },
     },
     path::Arg,
@@ -245,9 +246,8 @@ impl<
                 return Ok(buf.len());
             }
         }
-        if offset.is_some() {
-            unimplemented!()
-        }
+        // Stdin is a stream device — offsets are meaningless. Ignore any
+        // explicit offset (the layered FS may supply one for concurrency safety).
         self.litebox
             .x
             .platform
@@ -261,7 +261,7 @@ impl<
         &self,
         fd: &FileFd<Platform>,
         buf: &[u8],
-        offset: Option<usize>,
+        _offset: Option<usize>,
     ) -> Result<usize, WriteError> {
         let stream = match &self
             .litebox
@@ -285,9 +285,7 @@ impl<
                 return Ok(buf.len());
             }
         };
-        if offset.is_some() {
-            unimplemented!()
-        }
+        // Stdout/stderr are stream devices — offsets are meaningless.
         self.litebox
             .x
             .platform
@@ -347,9 +345,13 @@ impl<
         unimplemented!()
     }
 
-    #[expect(unused_variables, reason = "unimplemented")]
-    fn mkdir(&self, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {
+    fn rename(&self, _old: impl Arg, _new: impl Arg) -> Result<(), RenameError> {
         unimplemented!()
+    }
+
+    #[expect(unused_variables, reason = "not supported by device filesystem")]
+    fn mkdir(&self, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {
+        Err(MkdirError::Io)
     }
 
     #[expect(unused_variables, reason = "unimplemented")]
