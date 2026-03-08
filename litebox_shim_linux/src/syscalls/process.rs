@@ -1303,6 +1303,7 @@ impl<FS: ShimFS> Task<FS> {
                     address_space_id: child_as_id,
                     thread_count: core::sync::atomic::AtomicI32::new(1),
                     active_cow: litebox::sync::Mutex::new(None),
+                    elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
                 });
                 let child_files_state = Arc::new(
                     self.files
@@ -2166,6 +2167,7 @@ impl<FS: ShimFS> Task<FS> {
                 address_space_id: fc.address_space_id,
                 thread_count: core::sync::atomic::AtomicI32::new(1),
                 active_cow: litebox::sync::Mutex::new(None),
+                elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
             });
             self.process_state.replace(child_ps);
 

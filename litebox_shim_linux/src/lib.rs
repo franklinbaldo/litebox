@@ -229,6 +229,7 @@ impl<FS: ShimFS> LinuxShimBuilder<FS> {
             address_space_id: init_as_id,
             thread_count: core::sync::atomic::AtomicI32::new(1),
             active_cow: litebox::sync::Mutex::new(None),
+            elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
         });
         let global = Arc::new(GlobalState {
             platform: self.platform,
@@ -1491,6 +1492,8 @@ struct ProcessState {
     /// before spawning the child; cleared after restore. All threads in the
     /// process check this on page faults and mprotect calls.
     active_cow: litebox::sync::Mutex<Platform, Option<Arc<CowState>>>,
+    /// Per-fd ELF patching state for the runtime syscall rewriter.
+    elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
 }
 
 /// One-shot synchronization primitive for vfork parent blocking.

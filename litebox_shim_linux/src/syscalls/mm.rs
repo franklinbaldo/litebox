@@ -4,6 +4,8 @@
 //! Implementation of memory management related syscalls, eg., `mmap`, `munmap`, etc.
 //! Most of these syscalls which are not backed by files are implemented in [`litebox_common_linux::mm`].
 
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 use litebox::{
     mm::linux::{MappingError, PAGE_SIZE, PageRange},
     platform::{
@@ -16,6 +18,26 @@ use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
 use crate::MutPtr;
 use crate::ShimFS;
 use crate::Task;
+
+/// Per-fd state for the shim's runtime ELF syscall rewriter.
+///
+/// Tracks base address and trampoline write cursor for each ELF file that
+/// has executable segments mapped via `do_mmap_file()`.
+pub(crate) struct ElfPatchState {
+    /// Base virtual address of the ELF (recorded from first mmap at offset ≈ 0).
+    pub base_addr: usize,
+    /// Whether this file is already pre-patched (trampoline magic found at file tail).
+    pub pre_patched: bool,
+    /// Start address of the trampoline region.
+    pub trampoline_addr: usize,
+    /// Current write position within the trampoline (byte offset from `trampoline_addr`).
+    pub trampoline_cursor: usize,
+    /// Whether the trampoline region has been allocated.
+    pub trampoline_mapped: bool,
+}
+
+/// Per-process collection of ELF patching state, keyed by fd number.
+pub(crate) type ElfPatchCache = BTreeMap<i32, ElfPatchState>;
 
 #[inline]
 fn align_up(addr: usize, align: usize) -> usize {
