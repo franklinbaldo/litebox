@@ -260,14 +260,19 @@ impl<FS: ShimFS> Task<FS> {
         // - Anonymous shared mappings are fully supported (no backing file concerns).
         //   Note: since fork is not yet supported, shared anonymous mappings behave
         //   identically to private ones (no cross-process sharing occurs).
-        // - File-backed shared mappings are read-only: writable permission is rejected
-        //   upfront and cannot be added later via mprotect, because writes cannot be
-        //   propagated back to the underlying file.
+        // - File-backed shared mappings with PROT_WRITE: writes cannot be propagated
+        //   back to the underlying file, so we silently downgrade to MAP_PRIVATE
+        //   semantics. This is sufficient for applications that use MAP_SHARED|PROT_WRITE
+        //   for in-process mutable mappings (e.g. SQLite WAL, logging) but don't rely
+        //   on cross-process write visibility through the mapping.
         if flags.contains(MapFlags::MAP_SHARED)
             && prot.contains(ProtFlags::PROT_WRITE)
             && !flags.contains(MapFlags::MAP_ANONYMOUS)
         {
-            todo!("MAP_SHARED with PROT_WRITE on file-backed mappings is not supported");
+            litebox::log_println!(
+                self.global.platform,
+                "WARN: MAP_SHARED|PROT_WRITE on file-backed mapping downgraded to MAP_PRIVATE"
+            );
         }
 
         if flags.intersects(
@@ -292,12 +297,14 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         let suggested_addr = if addr == 0 { None } else { Some(addr) };
-        if flags.contains(MapFlags::MAP_ANONYMOUS) {
+        let result = if flags.contains(MapFlags::MAP_ANONYMOUS) {
             self.do_mmap_anonymous(suggested_addr, aligned_len, prot, flags)
         } else {
             self.do_mmap_file(suggested_addr, aligned_len, prot, flags, fd, offset)
         }
-        .map_err(Errno::from)
+        .map_err(Errno::from);
+
+        result
     }
 
     /// Handle syscall `munmap`
@@ -307,13 +314,52 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Handle syscall `mprotect`
-    #[inline]
+    ///
+    /// CoW-aware: if a vfork child adds WRITE permission to CoW-protected
+    /// pages, snapshot them first so the parent's original content can be
+    /// restored after the child execs or exits. Parent threads just pass
+    /// through — selective CoW ensures protected pages don't overlap with
+    /// pages parent threads write to.
     pub(crate) fn sys_mprotect(
         &self,
         addr: crate::MutPtr<u8>,
         len: usize,
         prot: ProtFlags,
     ) -> Result<(), Errno> {
+        if prot.contains(ProtFlags::PROT_WRITE) && self.fork_context.borrow().is_some() {
+            let ps = self.process_state.borrow();
+            let cow_lock = ps.active_cow.lock();
+            if let Some(cow) = cow_lock.as_ref() {
+                let req_start = addr.as_usize();
+                let req_end = req_start + len;
+
+                let mut dirty = cow.dirty_pages.lock();
+                for &(base, plen, _) in &cow.protected_ranges {
+                    let prot_end = base + plen;
+                    if req_start < prot_end && req_end > base {
+                        let overlap_start = req_start.max(base);
+                        let overlap_end = req_end.min(prot_end);
+                        for page_addr in
+                            (overlap_start & !(PAGE_SIZE - 1)..overlap_end).step_by(PAGE_SIZE)
+                        {
+                            if dirty.iter().any(|(a, _)| *a == page_addr) {
+                                continue;
+                            }
+                            let mut buf = alloc::vec![0u8; PAGE_SIZE];
+                            // SAFETY: page is mapped (CoW-protected).
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    page_addr as *const u8,
+                                    buf.as_mut_ptr(),
+                                    PAGE_SIZE,
+                                );
+                            }
+                            dirty.push((page_addr, buf));
+                        }
+                    }
+                }
+            }
+        }
         litebox_common_linux::mm::sys_mprotect(&self.process_state.borrow().pm, addr, len, prot)
     }
 

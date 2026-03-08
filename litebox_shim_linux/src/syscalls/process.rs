@@ -95,7 +95,7 @@ impl Drop for ThreadState {
 }
 
 /// Thread state that can be accessed from a remote thread.
-struct ThreadRemote {
+pub(crate) struct ThreadRemote {
     /// Always set under the process `inner` lock, but can be read without
     /// locking.
     is_exiting: AtomicBool,
@@ -111,7 +111,7 @@ impl ThreadRemote {
         }
     }
 
-    fn interrupt(&self) {
+    pub(crate) fn interrupt(&self) {
         if let Some(handle) = self.handle.get() {
             handle.interrupt();
         }
@@ -124,13 +124,13 @@ pub(crate) struct Process {
     /// mutex lock.
     nr_threads:
         <litebox_platform_multiplex::Platform as litebox::platform::RawMutexProvider>::RawMutex,
-    inner: Mutex<Platform, ProcessInner>,
+    pub(crate) inner: Mutex<Platform, ProcessInner>,
     /// Resource limits for this process.
     pub(crate) limits: ResourceLimits,
 }
 
 /// The locked portion of the process state.
-struct ProcessInner {
+pub(crate) struct ProcessInner {
     /// If true, the whole process is exiting.
     group_exit: bool,
     /// If true, one thread is waiting for other threads to exit.
@@ -139,7 +139,7 @@ struct ProcessInner {
     /// `group_exit` is set.
     exit_status: ExitStatus,
     /// The thread list for the process, mapped by thread ID.
-    threads: BTreeMap<i32, Arc<ThreadRemote>>,
+    pub(crate) threads: BTreeMap<i32, Arc<ThreadRemote>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -533,10 +533,53 @@ impl<FS: ShimFS> Task<FS> {
                     ExitStatus::Signal(sig) => sig.as_i32() + 128,
                 }
             };
-            self.global
+            let exit_notification = self
+                .global
                 .litebox
                 .process_registry()
                 .exit_process(self.process_id, exit_status);
+
+            // If the core registry says the parent needs a signal (e.g.
+            // SIGCHLD), queue it so the parent's next signal-processing
+            // pass will deliver it.
+            if let Some(notif) = exit_notification {
+                use litebox_common_linux::signal::{Siginfo, SiginfoData, Signal};
+
+                if let Ok(signal) = Signal::try_from(notif.exit_signal) {
+                    const CLD_EXITED: i32 = 1;
+                    let mut data = SiginfoData { pad: [0u32; 28] };
+                    // si_pid (offset 0 in data, i32)
+                    data.pad[0] = notif.child_pid.0;
+                    // si_uid (offset 4, u32) — leave as 0
+                    // si_status (offset 8, i32)
+                    data.pad[2] = notif.exit_status as u32;
+
+                    let siginfo = Siginfo {
+                        signo: signal.as_i32(),
+                        errno: 0,
+                        code: CLD_EXITED,
+                        #[cfg(target_pointer_width = "64")]
+                        __pad: 0,
+                        data,
+                    };
+
+                    self.global
+                        .cross_process_signals
+                        .lock()
+                        .push(crate::CrossProcessSignal {
+                            target_process_id: notif.parent_pid.0,
+                            signal,
+                            siginfo,
+                        });
+
+                    // Interrupt the parent so it processes the signal.
+                    let handles = self.global.process_thread_handles.read();
+                    let parent_key = notif.parent_pid.0 as i32;
+                    if let Some(remote) = handles.get(&parent_key) {
+                        remote.interrupt();
+                    }
+                }
+            }
 
             // Release the process's VA partition. For a vfork child that
             // hasn't exec'd, destroy the child's reserved partition (from
@@ -583,7 +626,6 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     pub(crate) fn sys_exit_group(&self, status: i32) {
-        // Tear down occurs similarly to `sys_exit`.
         self.exit_group(ExitStatus::Exit(status.truncate()));
     }
 
@@ -987,6 +1029,11 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::ENOMEM);
         }
 
+        self.process_state
+            .borrow()
+            .thread_count
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
         Ok(usize::try_from(child_tid).unwrap())
     }
 
@@ -1077,8 +1124,30 @@ impl<FS: ShimFS> Task<FS> {
             litebox::platform::address_space::ForkedAddressSpace::SharedWithParent(_)
         );
 
-        // 3. Allocate a TID for the child (also serves as PID on the guest side).
-        let child_tid = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);
+        // 3. Allocate a TID for the child. For the initial thread of a
+        //    forked process, pid == tid == the ProcessId assigned by the
+        //    registry. This ensures getpid(), gettid(), and the value
+        //    returned by fork() to the parent all agree, so waitpid()
+        //    can find the child.
+        let child_pid = i32::try_from(child_process_id.0).map_err(|_| {
+            self.global
+                .litebox
+                .process_registry()
+                .remove_process(child_process_id);
+            Errno::EAGAIN
+        })?;
+        let child_tid = child_pid;
+
+        // Ensure the global clone-TID counter stays ahead of fork-allocated
+        // PIDs so that a subsequent clone() in ANY process never hands out a
+        // TID that collides with an existing process's initial thread.
+        let _ = self
+            .global
+            .next_thread_id
+            .fetch_max(child_tid + 1, Ordering::Relaxed);
+
+        // Save parent's RSP for selective stack-only restore after vfork.
+        let parent_stack_rsp: usize = ctx.rsp.try_into().unwrap_or(0);
 
         // 4. Build per-fork-mode state: vfork (shared with parent) vs
         //    independent (kernel CoW).
@@ -1098,14 +1167,31 @@ impl<FS: ShimFS> Task<FS> {
                         .clone_for_fork(&mut self.global.litebox.descriptor_table_mut()),
                 );
 
-                // Set up CoW protection for vfork memory sharing.
+                // Set up CoW protection for fork memory sharing.
                 //
-                // The strategy is determined by the platform via
-                // `EAGER_COW_FOR_VFORK`. Platforms where the exception handler
-                // shares the guest address space must use eager snapshots;
-                // others use lazy CoW (mark writable pages read-only and
-                // snapshot on first write fault).
-                let cow_state = {
+                // **Selective vs full CoW** (shim decision):
+                // - Single-threaded (thread_count ≤ 1): FULL — protect ALL
+                //   writable pages. The child may run arbitrary code between
+                //   fork and exec (POSIX allows unrestricted behavior for
+                //   single-threaded processes).
+                // - Multi-threaded: SELECTIVE — protect only the parent's
+                //   stack and well-known library data segments. POSIX
+                //   restricts the child to async-signal-safe functions,
+                //   which only touch stack, errno/TLS, and limited libc
+                //   state. Protecting all pages would risk rolling back
+                //   concurrent parent-thread modifications (condvars, heap).
+                //
+                // **Eager vs lazy** (platform decision):
+                // - Eager: copy all protected pages upfront, leave writable.
+                // - Lazy: mark pages read-only, snapshot on first write fault.
+                let is_selective = self
+                    .process_state
+                    .borrow()
+                    .thread_count
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                    > 1;
+
+                let cow_state: Option<Arc<crate::CowState>> = {
                     let mappings = self.process_state.borrow().pm.mappings();
                     let mut eager_dirty = alloc::vec::Vec::<(usize, alloc::vec::Vec<u8>)>::new();
                     let mut protected = alloc::vec::Vec::new();
@@ -1115,10 +1201,18 @@ impl<FS: ShimFS> Task<FS> {
                             continue;
                         }
 
+                        // Selective CoW: only protect the parent's stack VMA.
+                        // In the future, add libc/ld data segments here too.
+                        if is_selective {
+                            let is_parent_stack =
+                                range.start <= parent_stack_rsp && parent_stack_rsp < range.end;
+                            if !is_parent_stack {
+                                continue;
+                            }
+                        }
+
                         if <crate::Platform as AddressSpaceProvider>::EAGER_COW_FOR_VFORK {
-                            // Eagerly snapshot all writable pages and leave
-                            // them writable. The restore path treats these
-                            // identically to lazily-snapshotted dirty pages.
+                            // Eagerly snapshot pages and leave them writable.
                             for page_addr in (range.start..range.end).step_by(PAGE_SIZE) {
                                 let mut buf = alloc::vec![0u8; PAGE_SIZE];
                                 // SAFETY: pages are committed; child not yet
@@ -1143,10 +1237,8 @@ impl<FS: ShimFS> Task<FS> {
                                 if flags.contains(VmFlags::VM_EXEC) {
                                     p |= MemoryRegionPermissions::EXEC;
                                 }
-                                // VM_WRITE is the original perm we are temporarily removing
                                 p | MemoryRegionPermissions::WRITE
                             };
-                            // Remove write permission without updating VMA tracking.
                             let ro_perms = orig_perms & !MemoryRegionPermissions::WRITE;
                             // SAFETY: pages are mapped; child not yet spawned.
                             let ok = unsafe {
@@ -1158,7 +1250,6 @@ impl<FS: ShimFS> Task<FS> {
                                 .is_ok()
                             };
                             if !ok {
-                                // Undo protections applied so far and abort fork.
                                 for &(base, len, perms) in &protected {
                                     unsafe {
                                         <crate::Platform as PageManagementProvider<
@@ -1176,23 +1267,27 @@ impl<FS: ShimFS> Task<FS> {
                             protected.push((range.start, len, orig_perms));
                         }
                     }
-                    Arc::new(crate::CowState {
+                    let cow = Arc::new(crate::CowState {
+                        selective: is_selective,
                         protected_ranges: protected,
                         dirty_pages: litebox::sync::Mutex::new(eager_dirty),
-                    })
+                    });
+                    // Store CoW state in ProcessState so all threads (and the
+                    // fault handler) can access it.
+                    *self.process_state.borrow().active_cow.lock() = Some(cow.clone());
+                    Some(cow)
                 };
 
                 let fc = crate::ForkContext {
                     address_space_id: child_as_id,
                     vfork_done: vfork_done.clone(),
-                    cow_state: Some(cow_state.clone()),
                 };
                 (
                     self.process_state.clone(),                  // share parent's PM
                     core::cell::RefCell::new(child_files_state), // independent FD table
                     Some(fc),
                     Some(vfork_done),
-                    Some(cow_state),
+                    cow_state,
                 )
             } else {
                 // Kernel / independent: child has its own CoW address space from
@@ -1206,6 +1301,8 @@ impl<FS: ShimFS> Task<FS> {
                 let child_ps = Arc::new(crate::ProcessState {
                     pm: litebox::mm::PageManager::new(&self.global.litebox, child_range),
                     address_space_id: child_as_id,
+                    thread_count: core::sync::atomic::AtomicI32::new(1),
+                    active_cow: litebox::sync::Mutex::new(None),
                 });
                 let child_files_state = Arc::new(
                     self.files
@@ -1239,7 +1336,7 @@ impl<FS: ShimFS> Task<FS> {
         #[cfg(not(target_arch = "x86_64"))]
         let parent_tls = None;
 
-        let child_thread = ThreadState::new_process(child_tid);
+        let child_thread = ThreadState::new_process(child_pid);
         child_thread.init_state.set(ThreadInitState::NewThread {
             stack: None,     // vfork: parent's stack; independent: CoW copy
             tls: parent_tls, // inherit parent's guest TLS
@@ -1256,14 +1353,14 @@ impl<FS: ShimFS> Task<FS> {
                         wait_state: crate::wait::WaitState::new(self.global.platform),
                         thread: child_thread,
                         process_id: child_process_id,
-                        pid: child_tid,
+                        pid: child_pid,
                         ppid: self.pid,
                         tid: child_tid,
                         credentials: self.credentials.clone(),
                         comm: self.comm.clone(),
                         fs: self.fs.clone(),
                         files: child_files,
-                        signals: self.signals.clone_for_new_task(),
+                        signals: self.signals.clone_for_fork(),
                         fork_context: core::cell::RefCell::new(child_fork_context),
                     },
                 }),
@@ -1289,6 +1386,7 @@ impl<FS: ShimFS> Task<FS> {
                         .expect("CoW spawn-failure cleanup: failed to restore permissions");
                     }
                 }
+                *self.process_state.borrow().active_cow.lock() = None;
             }
             return Err(Errno::ENOMEM);
         }
@@ -1302,13 +1400,26 @@ impl<FS: ShimFS> Task<FS> {
                 let _ = self.wait_cx().wait_until(|| vd.is_done());
             }
 
-            // Restore dirty pages and re-enable write permissions.
+            // Restore pages modified by the child and clear CoW state.
+            //
+            // With lazy CoW, `dirty_pages` contains only child-first-write
+            // snapshots — restore all unconditionally. Parent threads never
+            // add to dirty_pages, and selective CoW ensures no page collision.
+            //
+            // With eager CoW, `dirty_pages` are upfront copies of all
+            // protected pages. Compare and restore only those that changed.
             if let Some(cow) = &cow_state {
-                // First, restore the original content of any pages the child
-                // modified (snapshotted on first write by the CoW fault handler).
                 let dirty = cow.dirty_pages.lock();
                 for (page_addr, original_data) in dirty.iter() {
-                    // SAFETY: child has finished; parent owns the address space.
+                    if <crate::Platform as AddressSpaceProvider>::EAGER_COW_FOR_VFORK {
+                        let current = unsafe {
+                            core::slice::from_raw_parts(*page_addr as *const u8, PAGE_SIZE)
+                        };
+                        if current == original_data.as_slice() {
+                            continue;
+                        }
+                    }
+                    // SAFETY: page is mapped and was originally writable.
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             original_data.as_ptr(),
@@ -1319,7 +1430,7 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 drop(dirty);
 
-                // Then, restore the original write permissions on all ranges.
+                // Restore original write permissions on lazily-protected ranges.
                 for &(base, len, orig_perms) in &cow.protected_ranges {
                     // SAFETY: restoring original permissions.
                     unsafe {
@@ -1331,11 +1442,14 @@ impl<FS: ShimFS> Task<FS> {
                         .expect("CoW restore: failed to re-enable write permissions");
                     }
                 }
+
+                // Clear the process-wide CoW state.
+                *self.process_state.borrow().active_cow.lock() = None;
             }
         }
 
         // Parent returns child's PID.
-        Ok(usize::try_from(child_tid).unwrap())
+        Ok(usize::try_from(child_pid).unwrap())
     }
 
     /// Handle syscall `set_tid_address`.
@@ -1353,6 +1467,7 @@ impl<FS: ShimFS> Task<FS> {
 // TODO: enforce the following limits:
 const RLIMIT_NOFILE_CUR: usize = 1024 * 1024;
 const RLIMIT_NOFILE_MAX: usize = 1024 * 1024;
+const RLIMIT_SIGPENDING: usize = 128;
 
 struct AtomicRlimit {
     cur: core::sync::atomic::AtomicUsize,
@@ -1388,6 +1503,14 @@ impl ResourceLimits {
         limits[litebox_common_linux::RlimitResource::STACK as usize] = AtomicRlimit {
             cur: core::sync::atomic::AtomicUsize::new(crate::loader::DEFAULT_STACK_SIZE),
             max: core::sync::atomic::AtomicUsize::new(litebox_common_linux::rlim_t::MAX),
+        };
+        // Linux defaults SIGPENDING to ~30000 (based on available memory).
+        // Use a reasonable fixed value so that cross-process signals like
+        // SIGCHLD (which have code=CLD_EXITED, subject to rlimit check)
+        // are not silently dropped.
+        limits[litebox_common_linux::RlimitResource::SIGPENDING as usize] = AtomicRlimit {
+            cur: core::sync::atomic::AtomicUsize::new(RLIMIT_SIGPENDING),
+            max: core::sync::atomic::AtomicUsize::new(RLIMIT_SIGPENDING),
         };
         Self { limits }
     }
@@ -1575,6 +1698,24 @@ impl<FS: ShimFS> Task<FS> {
                 // CLOCK_MONOTONIC_COARSE - provides faster but less precise monotonic time
                 // For simplicity, we can reuse the same monotonic time as CLOCK_MONOTONIC
                 // In a real implementation, this would typically have lower resolution
+                self.global
+                    .platform
+                    .now()
+                    .duration_since(&self.global.boot_time)
+            }
+            litebox_common_linux::ClockId::ProcessCputimeId
+            | litebox_common_linux::ClockId::ThreadCputimeId => {
+                // Approximate CPU time with monotonic time. Real implementations
+                // would track actual CPU cycles per process/thread.
+                self.global
+                    .platform
+                    .now()
+                    .duration_since(&self.global.boot_time)
+            }
+            litebox_common_linux::ClockId::MonotonicRaw
+            | litebox_common_linux::ClockId::RealtimeCoarse
+            | litebox_common_linux::ClockId::Boottime => {
+                // Map all monotonic-like clocks to our monotonic implementation.
                 self.global
                     .platform
                     .now()
@@ -2023,6 +2164,8 @@ impl<FS: ShimFS> Task<FS> {
             let child_ps = Arc::new(crate::ProcessState {
                 pm: litebox::mm::PageManager::new(&self.global.litebox, child_range),
                 address_space_id: fc.address_space_id,
+                thread_count: core::sync::atomic::AtomicI32::new(1),
+                active_cow: litebox::sync::Mutex::new(None),
             });
             self.process_state.replace(child_ps);
 
@@ -2057,8 +2200,22 @@ impl<FS: ShimFS> Task<FS> {
             ctx.xgs.truncate(),
         );
 
-        self.load_program(loader, argv_vec, envp_vec)
-            .expect("TODO: terminate the process cleanly");
+        match self.load_program(loader, argv_vec, envp_vec) {
+            Ok(()) => {}
+            Err(e) => {
+                // The old process state has already been torn down. There's
+                // no way to recover — terminate the process.
+                litebox::log_println!(
+                    self.global.platform,
+                    "execve({:?}): load_program failed: {:?} — terminating child",
+                    path,
+                    e,
+                );
+                self.exit_group(ExitStatus::Exit(127_i32.truncate()));
+                // exit_group never returns in practice; this is unreachable.
+                return Err(Errno::ENOEXEC);
+            }
+        }
 
         self.init_thread_context(ctx);
         Ok(0)
@@ -2094,6 +2251,15 @@ impl<FS: ShimFS> Task<FS> {
             .handle
             .set(Box::new(self.wait_state.thread_handle()))
             .ok();
+
+        // Register the process's main thread handle so cross-process signals
+        // (e.g. SIGCHLD) can interrupt this task. Use process_id (litebox's
+        // internal ID) which matches what ProcessRegistry returns.
+        let proc_key = self.process_id.0 as i32;
+        self.global
+            .process_thread_handles
+            .write()
+            .insert(proc_key, self.thread.remote.clone());
     }
 
     /// Initialize the thread context for a new process or thread, and perform any

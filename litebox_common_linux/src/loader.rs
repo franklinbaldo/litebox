@@ -128,6 +128,8 @@ pub enum ElfParseError<E> {
     BadTrampoline,
     #[error("Invalid trampoline version")]
     BadTrampolineVersion,
+    #[error("Binary not patched for syscall rewriting")]
+    UnpatchedBinary,
     #[error("Unsupported ELF type")]
     UnsupportedType,
     #[error("Bad interpreter")]
@@ -141,6 +143,7 @@ impl<E: Into<Errno>> From<ElfParseError<E>> for Errno {
             | ElfParseError::BadFormat
             | ElfParseError::BadTrampoline
             | ElfParseError::BadTrampolineVersion
+            | ElfParseError::UnpatchedBinary
             | ElfParseError::BadInterp
             | ElfParseError::UnsupportedType => Errno::ENOEXEC,
             ElfParseError::Io(err) => err.into(),
@@ -251,7 +254,8 @@ impl ElfParsedFile {
 
         // File must be large enough to contain the header
         if file_size < header_size as u64 {
-            return Ok(());
+            // Too small for a trampoline header — binary is unpatched.
+            return Err(ElfParseError::UnpatchedBinary);
         }
 
         // Read the header from the end of the file
@@ -267,8 +271,9 @@ impl ElfParsedFile {
             if &header_buf[0..7] == b"LITEBOX" {
                 return Err(ElfParseError::BadTrampolineVersion);
             }
-            // No trampoline found, which is OK (not all binaries are rewritten)
-            return Ok(());
+            // No trampoline found. When using the syscall rewriter backend
+            // (syscall_entry_point != 0), all binaries must be patched.
+            return Err(ElfParseError::UnpatchedBinary);
         }
 
         let (file_offset, vaddr, trampoline_size) = if cfg!(target_pointer_width = "64") {

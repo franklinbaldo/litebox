@@ -186,14 +186,17 @@ impl<FS: ShimFS> Task<FS> {
     pub fn sys_open(&self, path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
         let path = self.resolve_path(path)?;
         let mode = mode & !self.get_umask();
-        let file = self.global.fs.open(path, flags - OFlags::CLOEXEC, mode)?;
-        if flags.contains(OFlags::CLOEXEC) {
-            let None = self
-                .global
-                .litebox
-                .descriptor_table_mut()
-                .set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC)
-            else {
+        let file = self.global.fs.open(&*path, flags - OFlags::CLOEXEC, mode)?;
+        {
+            let mut dt = self.global.litebox.descriptor_table_mut();
+            if flags.contains(OFlags::CLOEXEC) {
+                let None = dt.set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC) else {
+                    unreachable!()
+                };
+            }
+            // Store access mode + status flags so F_GETFL can return them.
+            let status = flags & OFlags::STATUS_FLAGS_MASK;
+            let None = dt.set_entry_metadata(&file, crate::StdioStatusFlags(status)) else {
                 unreachable!()
             };
         }
@@ -279,6 +282,33 @@ impl<FS: ShimFS> Task<FS> {
             FsPath::Cwd => Err(Errno::EINVAL),
             FsPath::Fd(_) | FsPath::FdRelative { .. } => unimplemented!(),
         }
+    }
+
+    pub(crate) fn sys_renameat2(
+        &self,
+        olddirfd: i32,
+        oldpath: impl path::Arg,
+        newdirfd: i32,
+        newpath: impl path::Arg,
+        flags: u32,
+    ) -> Result<(), Errno> {
+        if flags != 0 {
+            // RENAME_NOREPLACE, RENAME_EXCHANGE, RENAME_WHITEOUT not yet supported
+            return Err(Errno::EINVAL);
+        }
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let old = FsPath::new(olddirfd, oldpath, get_cwd.clone())?;
+        let new = FsPath::new(newdirfd, newpath, get_cwd)?;
+        let FsPath::Absolute { path: old_path } = old else {
+            return Err(Errno::EINVAL);
+        };
+        let FsPath::Absolute { path: new_path } = new else {
+            return Err(Errno::EINVAL);
+        };
+        self.global
+            .fs
+            .rename(old_path, new_path)
+            .map_err(Errno::from)
     }
 
     /// Handle syscall `read`
@@ -399,7 +429,8 @@ impl<FS: ShimFS> Task<FS> {
             }
         };
         if let Err(Errno::EPIPE) = res {
-            unimplemented!("send SIGPIPE to the current task");
+            // TODO: send SIGPIPE to the current task.
+            // For now, just return EPIPE — most programs check the return value.
         }
         res
     }
@@ -659,7 +690,7 @@ impl<FS: ShimFS> Task<FS> {
             Descriptor::Unix { .. } => todo!(),
         };
         if let Err(Errno::EPIPE) = res {
-            unimplemented!("send SIGPIPE to the current task");
+            // TODO: send SIGPIPE to the current task.
         }
         res
     }
@@ -1373,7 +1404,7 @@ impl<FS: ShimFS> Task<FS> {
                     .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
-            IoctlArg::TCSETS(_) => Ok(0), // TODO: implement
+            IoctlArg::TCSETS(_) | IoctlArg::TCSETSW(_) | IoctlArg::TCSETSF(_) => Ok(0), // TODO: implement
             IoctlArg::TIOCGWINSZ(ws) => {
                 ws.write_at_offset(
                     0,
@@ -1488,6 +1519,8 @@ impl<FS: ShimFS> Task<FS> {
             },
             IoctlArg::TCGETS(..)
             | IoctlArg::TCSETS(..)
+            | IoctlArg::TCSETSW(..)
+            | IoctlArg::TCSETSF(..)
             | IoctlArg::TIOCGPTN(..)
             | IoctlArg::TIOCGWINSZ(..) => match desc {
                 Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
@@ -1586,7 +1619,10 @@ impl<FS: ShimFS> Task<FS> {
         _sigsetsize: usize,
     ) -> Result<usize, Errno> {
         if sigmask.is_some() {
-            todo!("sigmask not supported");
+            // TODO: Properly implement signal mask save/restore around epoll_pwait.
+            // For now, ignore the sigmask and proceed — this is sufficient for
+            // single-process workloads where signal delivery is not critical.
+            litebox::log_println!(self.global.platform, "WARN: epoll_pwait sigmask ignored");
         }
         let Ok(epfd) = u32::try_from(epfd) else {
             return Err(Errno::EBADF);

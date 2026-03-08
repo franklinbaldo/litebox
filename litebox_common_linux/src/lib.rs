@@ -588,6 +588,8 @@ pub struct Winsize {
 
 pub const TCGETS: u32 = 0x5401;
 pub const TCSETS: u32 = 0x5402;
+pub const TCSETSW: u32 = 0x5403;
+pub const TCSETSF: u32 = 0x5404;
 pub const TIOCGWINSZ: u32 = 0x5413;
 pub const FIONBIO: u32 = 0x5421;
 pub const FIOCLEX: u32 = 0x5451;
@@ -601,6 +603,10 @@ pub enum IoctlArg<Platform: litebox::platform::RawPointerProvider> {
     TCGETS(Platform::RawMutPointer<Termios>),
     /// Set the current serial port settings.
     TCSETS(Platform::RawConstPointer<Termios>),
+    /// Set the serial port settings after all output has drained.
+    TCSETSW(Platform::RawConstPointer<Termios>),
+    /// Set the serial port settings after all output has drained; also flush pending input.
+    TCSETSF(Platform::RawConstPointer<Termios>),
     /// Get window size.
     TIOCGWINSZ(Platform::RawMutPointer<Winsize>),
     /// Obtain device unit number, which can be used to generate
@@ -691,6 +697,12 @@ pub enum UnixProtocol {
 #[derive(Debug, IntEnum, Clone, Copy)]
 pub enum IpOption {
     TOS = 1,
+    /// IP_MTU_DISCOVER
+    MTU_DISCOVER = 10,
+    /// IP_RECVERR – enable extended reliable error reporting on UDP sockets.
+    RECVERR = 11,
+    /// IP_PKTINFO
+    PKTINFO = 8,
 }
 
 #[repr(u32)]
@@ -698,6 +710,7 @@ pub enum IpOption {
 pub enum SocketOption {
     REUSEADDR = 2,
     TYPE = 3,
+    ERROR = 4,
     BROADCAST = 6,
     SNDBUF = 7,
     RCVBUF = 8,
@@ -1576,7 +1589,12 @@ pub struct LinuxDirent64 {
 pub enum ClockId {
     RealTime = 0,
     Monotonic = 1,
+    ProcessCputimeId = 2,
+    ThreadCputimeId = 3,
+    MonotonicRaw = 4,
+    RealtimeCoarse = 5,
     MonotonicCoarse = 6,
+    Boottime = 7,
 }
 
 bitflags::bitflags! {
@@ -1777,6 +1795,8 @@ pub struct UserMsgHdr<Platform: litebox::platform::RawPointerProvider> {
     pub msg_name: Platform::RawConstPointer<u8>,
     /// size of socket address structure
     pub msg_namelen: u32,
+    /// Padding to match C ABI alignment of the following pointer field.
+    pub _padding1: u32,
     /// ptr to an array of `iovec` structures
     pub msg_iov: Platform::RawConstPointer<IoVec<Platform::RawMutPointer<u8>>>,
     /// number of elements in msg_iov
@@ -1787,6 +1807,8 @@ pub struct UserMsgHdr<Platform: litebox::platform::RawPointerProvider> {
     pub msg_controllen: usize,
     /// flags on received message
     pub msg_flags: SendFlags,
+    /// Padding to match C ABI struct alignment.
+    pub _padding2: u32,
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> Clone for UserMsgHdr<Platform> {
@@ -1794,11 +1816,49 @@ impl<Platform: litebox::platform::RawPointerProvider> Clone for UserMsgHdr<Platf
         Self {
             msg_name: self.msg_name,
             msg_namelen: self.msg_namelen,
+            _padding1: self._padding1,
             msg_iov: self.msg_iov,
             msg_iovlen: self.msg_iovlen,
             msg_control: self.msg_control,
             msg_controllen: self.msg_controllen,
             msg_flags: self.msg_flags,
+            _padding2: self._padding2,
+        }
+    }
+}
+
+/// Linux `struct mmsghdr` — a message header with an output field for the
+/// number of bytes transmitted.
+#[derive(FromBytes, IntoBytes)]
+#[repr(C, packed)]
+pub struct UserMmsgHdr<Platform: litebox::platform::RawPointerProvider> {
+    /// The message header.
+    pub msg_hdr: UserMsgHdr<Platform>,
+    /// Number of bytes transmitted (output only for sendmmsg).
+    pub msg_len: u32,
+    /// Padding to match C ABI struct alignment.
+    pub _padding: u32,
+}
+
+impl<Platform: litebox::platform::RawPointerProvider> core::fmt::Debug for UserMmsgHdr<Platform> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("UserMmsgHdr")
+            .field("msg_len", &{ self.msg_len })
+            .finish()
+    }
+}
+
+impl<Platform: litebox::platform::RawPointerProvider> Clone for UserMmsgHdr<Platform> {
+    fn clone(&self) -> Self {
+        // SAFETY: use read_unaligned to safely read from packed struct fields.
+        unsafe {
+            let hdr = core::ptr::read_unaligned(core::ptr::addr_of!(self.msg_hdr));
+            let len = core::ptr::read_unaligned(core::ptr::addr_of!(self.msg_len));
+            Self {
+                msg_hdr: hdr,
+                msg_len: len,
+                _padding: 0,
+            }
         }
     }
 }
@@ -2014,6 +2074,12 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         msg: Platform::RawConstPointer<UserMsgHdr<Platform>>,
         flags: SendFlags,
     },
+    Sendmmsg {
+        sockfd: i32,
+        msgvec: Platform::RawMutPointer<UserMmsgHdr<Platform>>,
+        vlen: u32,
+        flags: SendFlags,
+    },
     Recvfrom {
         sockfd: i32,
         buf: Platform::RawMutPointer<u8>,
@@ -2127,6 +2193,30 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         dirfd: i32,
         pathname: Platform::RawConstPointer<i8>,
         flags: AtFlags,
+    },
+    Renameat2 {
+        olddirfd: i32,
+        oldpath: Platform::RawConstPointer<i8>,
+        newdirfd: i32,
+        newpath: Platform::RawConstPointer<i8>,
+        flags: u32,
+    },
+    Fchmod {
+        fd: i32,
+        mode: u32,
+    },
+    Fsync {
+        fd: i32,
+    },
+    Fdatasync {
+        fd: i32,
+    },
+    /// No-op: set file timestamps (in-memory FS ignores timestamps).
+    Utimensat,
+    Fchmodat {
+        dirfd: i32,
+        pathname: Platform::RawConstPointer<i8>,
+        mode: u32,
     },
     #[cfg(target_arch = "x86_64")]
     Newfstatat {
@@ -2253,6 +2343,13 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         mask: Platform::RawMutPointer<u8>,
     },
     SchedYield,
+    SchedGetparam {
+        pid: i32,
+        param: Platform::RawMutPointer<i32>,
+    },
+    SchedGetscheduler {
+        pid: i32,
+    },
     Futex {
         args: FutexArgs<Platform>,
     },
@@ -2435,6 +2532,8 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     match cmd {
                         TCGETS => IoctlArg::TCGETS(ctx.sys_req_ptr(2)),
                         TCSETS => IoctlArg::TCSETS(ctx.sys_req_ptr(2)),
+                        TCSETSW => IoctlArg::TCSETSW(ctx.sys_req_ptr(2)),
+                        TCSETSF => IoctlArg::TCSETSF(ctx.sys_req_ptr(2)),
                         TIOCGWINSZ => IoctlArg::TIOCGWINSZ(ctx.sys_req_ptr(2)),
                         TIOCGPTN => IoctlArg::TIOCGPTN(ctx.sys_req_ptr(2)),
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),
@@ -2519,6 +2618,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::accept4 => sys_req!(Accept { sockfd, addr:*, addrlen:*, flags }),
             Sysno::sendto => sys_req!(Sendto { sockfd, buf:*, len, flags, addr:*, addrlen }),
             Sysno::sendmsg => sys_req!(Sendmsg { sockfd, msg:*, flags }),
+            Sysno::sendmmsg => sys_req!(Sendmmsg { sockfd, msgvec:*, vlen, flags }),
             Sysno::recvfrom => sys_req!(Recvfrom { sockfd, buf:*, len, flags, addr:*, addrlen:*, }),
             Sysno::bind => sys_req!(Bind { sockfd, sockaddr:*, addrlen }),
             Sysno::listen => sys_req!(Listen { sockfd, backlog }),
@@ -2749,6 +2849,22 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     flags: AtFlags::empty(),
                 }
             }
+            Sysno::renameat2 => sys_req!(Renameat2 { olddirfd,oldpath:*,newdirfd,newpath:*,flags }),
+            Sysno::renameat => SyscallRequest::Renameat2 {
+                olddirfd: ctx.sys_req_arg(0),
+                oldpath: ctx.sys_req_ptr(1),
+                newdirfd: ctx.sys_req_arg(2),
+                newpath: ctx.sys_req_ptr(3),
+                flags: 0,
+            },
+            #[cfg(target_arch = "x86_64")]
+            Sysno::rename => SyscallRequest::Renameat2 {
+                olddirfd: AT_FDCWD,
+                oldpath: ctx.sys_req_ptr(0),
+                newdirfd: AT_FDCWD,
+                newpath: ctx.sys_req_ptr(1),
+                flags: 0,
+            },
             Sysno::creat => {
                 // creat is equivalent to open with flags O_CREAT|O_WRONLY|O_TRUNC
                 SyscallRequest::Openat {
@@ -2761,6 +2877,16 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 }
             }
             Sysno::ftruncate => sys_req!(Ftruncate { fd, length }),
+            Sysno::fchmod => sys_req!(Fchmod { fd, mode }),
+            Sysno::fsync => sys_req!(Fsync { fd }),
+            Sysno::fdatasync => sys_req!(Fdatasync { fd }),
+            Sysno::fchmodat => sys_req!(Fchmodat { dirfd, pathname:*, mode }),
+            #[cfg(target_arch = "x86_64")]
+            Sysno::chmod => SyscallRequest::Fchmodat {
+                dirfd: AT_FDCWD,
+                pathname: ctx.sys_req_ptr(0),
+                mode: ctx.sys_req_arg(1),
+            },
             #[cfg(target_arch = "x86_64")]
             Sysno::newfstatat => sys_req!(Newfstatat { dirfd,pathname:*,buf:*,flags }),
             #[cfg(target_arch = "x86")]
@@ -2858,6 +2984,13 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 }
             }
             Sysno::sched_yield => SyscallRequest::SchedYield,
+            Sysno::sched_getparam => SyscallRequest::SchedGetparam {
+                pid: ctx.sys_req_arg(0),
+                param: ctx.sys_req_ptr(1),
+            },
+            Sysno::sched_getscheduler => SyscallRequest::SchedGetscheduler {
+                pid: ctx.sys_req_arg(0),
+            },
             Sysno::futex => Self::parse_futex(ctx, TimeParam::timespec_old, unsupported_einval)?,
             #[cfg(target_arch = "x86")]
             Sysno::futex_time64 => {
@@ -2867,6 +3000,10 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::umask => sys_req!(Umask { mask }),
             Sysno::alarm => sys_req!(Alarm { seconds }),
             Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
+            // utimensat: set file timestamps — no-op for in-memory FS.
+            Sysno::utimensat => {
+                return Ok(SyscallRequest::Utimensat);
+            }
             // Noisy unsupported syscalls.
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
                 return Err(errno::Errno::ENOSYS);

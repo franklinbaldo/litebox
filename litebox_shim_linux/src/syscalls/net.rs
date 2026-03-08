@@ -40,6 +40,11 @@ use crate::{
     syscalls::unix::{CSockUnixAddr, UnixSocket, UnixSocketAddr},
 };
 
+/// Linux default for `TCP_KEEPIDLE` (seconds before first keep-alive probe).
+const DEFAULT_TCP_KEEPIDLE_SECS: u32 = 7200;
+/// Linux default for `TCP_KEEPCNT` (number of unacknowledged probes before drop).
+const DEFAULT_TCP_KEEPCNT: u32 = 9;
+
 macro_rules! convert_flags {
     ($src:expr, $src_type:ty, $dst_type:ty, $($flag:ident),+ $(,)?) => {
         {
@@ -324,6 +329,12 @@ impl<FS: ShimFS> GlobalState<FS> {
         optval: ConstPtr<u8>,
         optlen: usize,
     ) -> Result<(), Errno> {
+        // Deferred TCP option to apply after releasing the descriptor table lock.
+        // This avoids a deadlock: `with_socket_options_mut` holds
+        // `descriptor_table_mut()`, and `net.lock().set_tcp_option()` internally
+        // calls `descriptor_table()`, which would self-deadlock on the RwLock.
+        let mut deferred_tcp_option: Option<litebox::net::TcpOptionData> = None;
+
         match self.setsockopt_common(optname, optval, optlen, |so, value| {
             self.with_socket_options_mut(fd, |opt| {
                 match (so, value) {
@@ -347,30 +358,16 @@ impl<FS: ShimFS> GlobalState<FS> {
                     }
                     (SocketOption::KEEPALIVE, SocketOptionValue::U32(val)) => {
                         let keep_alive = val != 0;
-                        if let Err(err) = self.net.lock().set_tcp_option(
-                            fd,
-                            if keep_alive {
-                                // default time interval is 2 hours
-                                litebox::net::TcpOptionData::KEEPALIVE(Some(
-                                    core::time::Duration::from_secs(2 * 60 * 60),
-                                ))
-                            } else {
-                                litebox::net::TcpOptionData::KEEPALIVE(None)
-                            },
-                        ) {
-                            match err {
-                                litebox::net::errors::SetTcpOptionError::InvalidFd => {
-                                    return Err(Errno::EBADF);
-                                }
-                                litebox::net::errors::SetTcpOptionError::NotTcpSocket => {
-                                    unimplemented!(
-                                        "SO_KEEPALIVE is not supported for non-TCP sockets"
-                                    )
-                                }
-                                _ => unimplemented!(),
-                            }
-                        }
                         opt.keep_alive = keep_alive;
+                        // Defer the net.lock() call to avoid deadlock with
+                        // the descriptor table write lock we currently hold.
+                        deferred_tcp_option = Some(if keep_alive {
+                            litebox::net::TcpOptionData::KEEPALIVE(Some(
+                                core::time::Duration::from_secs(2 * 60 * 60),
+                            ))
+                        } else {
+                            litebox::net::TcpOptionData::KEEPALIVE(None)
+                        });
                     }
                     _ => unreachable!(),
                 }
@@ -378,12 +375,34 @@ impl<FS: ShimFS> GlobalState<FS> {
             })
         }) {
             Err(Errno::ENOPROTOOPT) => {} // fallthrough to handle other options
-            other => return other,
+            other => {
+                // Apply deferred TCP option now that the descriptor table lock
+                // is released.
+                if let Some(tcp_opt) = deferred_tcp_option {
+                    if let Err(err) = self.net.lock().set_tcp_option(fd, tcp_opt) {
+                        match err {
+                            litebox::net::errors::SetTcpOptionError::InvalidFd => {
+                                return Err(Errno::EBADF);
+                            }
+                            litebox::net::errors::SetTcpOptionError::NotTcpSocket => {
+                                unimplemented!("SO_KEEPALIVE is not supported for non-TCP sockets")
+                            }
+                            _ => unimplemented!(),
+                        }
+                    }
+                }
+                return other;
+            }
         }
 
         match optname {
             SocketOptionName::IP(ip) => match ip {
                 litebox_common_linux::IpOption::TOS => return Err(Errno::EOPNOTSUPP),
+                // Silently accept IP_RECVERR, IP_MTU_DISCOVER, IP_PKTINFO
+                // (used by glibc's DNS resolver; not yet tracked).
+                litebox_common_linux::IpOption::RECVERR
+                | litebox_common_linux::IpOption::MTU_DISCOVER
+                | litebox_common_linux::IpOption::PKTINFO => return Ok(()),
             },
             SocketOptionName::Socket(so) => match so {
                 // handled by `setsockopt_common`
@@ -397,6 +416,8 @@ impl<FS: ShimFS> GlobalState<FS> {
                 SocketOption::RCVBUF | SocketOption::SNDBUF => return Err(Errno::EOPNOTSUPP),
                 // Socket does not support these options
                 SocketOption::TYPE | SocketOption::PEERCRED => return Err(Errno::ENOPROTOOPT),
+                // SO_ERROR is read-only
+                SocketOption::ERROR => return Err(Errno::ENOPROTOOPT),
             },
             SocketOptionName::TCP(to) => match to {
                 TcpOption::CONGESTION => {
@@ -419,7 +440,32 @@ impl<FS: ShimFS> GlobalState<FS> {
                         },
                     )?;
                 }
-                TcpOption::KEEPCNT | TcpOption::KEEPIDLE | TcpOption::INFO => {
+                TcpOption::KEEPCNT => {
+                    // smoltcp doesn't support fine-grained keep-alive probe
+                    // counts. Accept and ignore the value so applications that
+                    // set it (e.g., curl) don't fail.
+                    let _val: u32 = super::read_from_user(optval, size_of::<u32>())?;
+                }
+                TcpOption::KEEPIDLE => {
+                    // smoltcp uses a single keep-alive interval (set via
+                    // TCP_KEEPINTVL / SO_KEEPALIVE). Accept KEEPIDLE and
+                    // forward it as the keep-alive interval so the setting
+                    // takes effect.
+                    let val: u32 = super::read_from_user(optval, size_of::<u32>())?;
+                    if val == 0 {
+                        return Err(Errno::EINVAL);
+                    }
+                    self.net
+                        .lock()
+                        .set_tcp_option(
+                            fd,
+                            litebox::net::TcpOptionData::KEEPALIVE(Some(
+                                core::time::Duration::from_secs(u64::from(val)),
+                            )),
+                        )
+                        .expect("set TCP_KEEPALIVE should succeed");
+                }
+                TcpOption::INFO => {
                     return Err(Errno::EOPNOTSUPP);
                 }
                 TcpOption::NODELAY | TcpOption::CORK => {
@@ -534,7 +580,10 @@ impl<FS: ShimFS> GlobalState<FS> {
 
         let val: u32 = match optname {
             SocketOptionName::IP(ipopt) => match ipopt {
-                litebox_common_linux::IpOption::TOS => return Err(Errno::EOPNOTSUPP),
+                litebox_common_linux::IpOption::TOS
+                | litebox_common_linux::IpOption::RECVERR
+                | litebox_common_linux::IpOption::MTU_DISCOVER
+                | litebox_common_linux::IpOption::PKTINFO => return Err(Errno::EOPNOTSUPP),
             },
             SocketOptionName::Socket(sopt) => match sopt {
                 // handled by `getsockopt_common`
@@ -551,6 +600,9 @@ impl<FS: ShimFS> GlobalState<FS> {
                     litebox::net::SOCKET_BUFFER_SIZE.truncate()
                 }
                 SocketOption::PEERCRED => return Err(Errno::ENOPROTOOPT),
+                // SO_ERROR returns (and clears) the pending socket error.
+                // We don't track pending errors yet, so always report 0.
+                SocketOption::ERROR => 0,
             },
             SocketOptionName::TCP(tcpopt) => {
                 match tcpopt {
@@ -574,7 +626,26 @@ impl<FS: ShimFS> GlobalState<FS> {
                             .ok_or(Errno::EFAULT)?;
                         return Ok(len);
                     }
-                    TcpOption::KEEPCNT | TcpOption::KEEPIDLE | TcpOption::INFO => {
+                    TcpOption::KEEPCNT => {
+                        // smoltcp doesn't track probe count; return Linux
+                        // default.
+                        DEFAULT_TCP_KEEPCNT
+                    }
+                    TcpOption::KEEPIDLE => {
+                        // Return the keep-alive interval as KEEPIDLE (smoltcp
+                        // doesn't distinguish idle vs interval).
+                        let TcpOptionData::KEEPALIVE(interval) = self
+                            .net
+                            .lock()
+                            .get_tcp_option(fd, litebox::net::TcpOptionName::KEEPALIVE)?
+                        else {
+                            unreachable!()
+                        };
+                        interval.map_or(DEFAULT_TCP_KEEPIDLE_SECS, |d| {
+                            d.as_secs().try_into().unwrap()
+                        })
+                    }
+                    TcpOption::INFO => {
                         return Err(Errno::EOPNOTSUPP);
                     }
                     TcpOption::KEEPINTVL => {
@@ -1435,6 +1506,53 @@ impl<FS: ShimFS> Task<FS> {
         )
     }
 
+    /// Handle syscall `sendmmsg` — send multiple messages on a socket.
+    pub(crate) fn sys_sendmmsg(
+        &self,
+        fd: i32,
+        msgvec: MutPtr<litebox_common_linux::UserMmsgHdr<Platform>>,
+        vlen: u32,
+        flags: SendFlags,
+    ) -> Result<usize, Errno> {
+        let Ok(sockfd) = u32::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+
+        let mut sent_count = 0u32;
+        for i in 0..vlen {
+            let mmsg_ptr = MutPtr::<litebox_common_linux::UserMmsgHdr<Platform>>::from_usize(
+                msgvec.as_usize().wrapping_add(
+                    i as usize
+                        * core::mem::size_of::<litebox_common_linux::UserMmsgHdr<Platform>>(),
+                ),
+            );
+            let mmsg = ConstPtr::<litebox_common_linux::UserMmsgHdr<Platform>>::from_usize(
+                mmsg_ptr.as_usize(),
+            )
+            .read_at_offset(0)
+            .ok_or(Errno::EFAULT)?;
+
+            match self.do_sendmsg(sockfd, &mmsg.msg_hdr, flags) {
+                Ok(bytes_sent) => {
+                    // Write back the number of bytes sent for this message.
+                    let msg_len_offset =
+                        core::mem::size_of::<litebox_common_linux::UserMsgHdr<Platform>>();
+                    let msg_len_ptr =
+                        MutPtr::<u32>::from_usize(mmsg_ptr.as_usize().wrapping_add(msg_len_offset));
+                    let _ = msg_len_ptr.write_at_offset(0, bytes_sent as u32);
+                    sent_count += 1;
+                }
+                Err(e) => {
+                    if sent_count == 0 {
+                        return Err(e);
+                    }
+                    break;
+                }
+            }
+        }
+        Ok(sent_count as usize)
+    }
+
     /// Handle syscall `recvfrom`
     pub(crate) fn sys_recvfrom(
         &self,
@@ -1569,7 +1687,7 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EBADF);
         };
         let optname = SocketOptionName::try_from(level, optname).ok_or_else(|| {
-            log_unsupported!("setsockopt(level = {level}, optname = {optname})");
+            log_unsupported!("getsockopt(level = {level}, optname = {optname})");
             Errno::EINVAL
         })?;
         let len = optlen.read_at_offset(0).ok_or(Errno::EFAULT)?;
@@ -2015,11 +2133,13 @@ mod tests {
                 let hdr = litebox_common_linux::UserMsgHdr {
                     msg_name: ConstPtr::from_usize(0),
                     msg_namelen: 0,
+                    _padding1: 0,
                     msg_iov: ConstPtr::from_usize(iovec.as_ptr() as usize),
                     msg_iovlen: iovec.len(),
                     msg_control: ConstPtr::from_usize(0),
                     msg_controllen: 0,
                     msg_flags: SendFlags::empty(),
+                    _padding2: 0,
                 };
                 assert_eq!(
                     task.do_sendmsg(client_fd, &hdr, SendFlags::empty())

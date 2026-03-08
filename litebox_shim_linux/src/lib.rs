@@ -119,7 +119,7 @@ impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
         // page that we protected for vfork snapshotting.
         if info.exception == litebox::shim::Exception::PAGE_FAULT
             && (info.error_code & 0x3) == 0x3
-            && self.task.try_handle_cow_fault(info.cr2)
+            && self.task.try_handle_cow_fault(info.cr2, ctx.rip as usize)
         {
             return ContinueOperation::Resume;
         }
@@ -227,6 +227,8 @@ impl<FS: ShimFS> LinuxShimBuilder<FS> {
         let process_state = Arc::new(ProcessState {
             pm: PageManager::new(&self.litebox, as_range),
             address_space_id: init_as_id,
+            thread_count: core::sync::atomic::AtomicI32::new(1),
+            active_cow: litebox::sync::Mutex::new(None),
         });
         let global = Arc::new(GlobalState {
             platform: self.platform,
@@ -241,6 +243,8 @@ impl<FS: ShimFS> LinuxShimBuilder<FS> {
             next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
+            cross_process_signals: litebox::sync::Mutex::new(Vec::new()),
+            process_thread_handles: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
         });
         LinuxShim {
             global,
@@ -578,23 +582,23 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle a potential CoW page fault during vfork.
     ///
-    /// If this task is a vfork child with active CoW protection and the fault
-    /// address falls in a protected range, snapshot the faulting page and
-    /// restore write permission so the child can continue. Returns `true` if
-    /// the fault was handled.
-    fn try_handle_cow_fault(&self, fault_addr: usize) -> bool {
-        let fc_ref = self.fork_context.borrow();
-        let Some(fc) = fc_ref.as_ref() else {
-            return false;
-        };
-        let Some(cow) = fc.cow_state.as_ref() else {
+    /// Handle a CoW page fault during the vfork window.
+    ///
+    /// Checks the process-wide `active_cow` state (accessible by any thread).
+    /// - **Child** (has `fork_context`): snapshot the page, then re-enable write.
+    /// - **Parent thread** (no `fork_context`): log an error if selective CoW
+    ///   (parent should not be writing to protected pages), then re-enable
+    ///   write to avoid a crash.
+    fn try_handle_cow_fault(&self, fault_addr: usize, fault_rip: usize) -> bool {
+        let ps = self.process_state.borrow();
+        let cow_lock = ps.active_cow.lock();
+        let Some(cow) = cow_lock.as_ref() else {
             return false;
         };
 
         let page_addr = fault_addr & !(PAGE_SIZE - 1);
 
-        // Check if the faulting page is within a CoW-protected range and get
-        // the original permissions for that range.
+        // Check if the faulting page is within a CoW-protected range.
         let orig_perms = cow
             .protected_ranges
             .iter()
@@ -604,28 +608,47 @@ impl<FS: ShimFS> Task<FS> {
             return false;
         };
 
-        // Snapshot the original page content before allowing writes.
-        let mut dirty = cow.dirty_pages.lock();
-
+        let is_child = self.fork_context.borrow().is_some();
         let page_range = page_addr..page_addr + PAGE_SIZE;
 
-        // Skip if already snapshotted (e.g., repeated fault due to racing).
-        if dirty.iter().any(|(addr, _)| *addr == page_addr) {
-            // SAFETY: page is mapped; we are restoring its original perm.
-            return unsafe { cow_update_permissions(self.global.platform, page_range, orig_perms) };
-        }
+        if is_child {
+            // Child thread: snapshot the original content then re-enable write.
+            let mut dirty = cow.dirty_pages.lock();
 
-        // Copy original page content.
-        let mut buf = vec![0u8; PAGE_SIZE];
-        // SAFETY: page is mapped (present=1 in error code); read is safe.
-        unsafe {
-            core::ptr::copy_nonoverlapping(page_addr as *const u8, buf.as_mut_ptr(), PAGE_SIZE);
-        }
-        dirty.push((page_addr, buf));
+            if dirty.iter().any(|(addr, _)| *addr == page_addr) {
+                // Already snapshotted (repeated fault due to racing).
+                return unsafe {
+                    cow_update_permissions(self.global.platform, page_range, orig_perms)
+                };
+            }
 
-        // Restore original permissions (including WRITE and possibly EXEC).
-        // SAFETY: page was originally writable; restoring original perm.
-        unsafe { cow_update_permissions(self.global.platform, page_range, orig_perms) }
+            let mut buf = vec![0u8; PAGE_SIZE];
+            // SAFETY: page is mapped (present=1 in error code).
+            unsafe {
+                core::ptr::copy_nonoverlapping(page_addr as *const u8, buf.as_mut_ptr(), PAGE_SIZE);
+            }
+            dirty.push((page_addr, buf));
+
+            // SAFETY: restoring the page's original (writable) permissions.
+            unsafe { cow_update_permissions(self.global.platform, page_range, orig_perms) }
+        } else {
+            // Parent thread faulting on a CoW-protected page.
+            if cow.selective {
+                litebox::log_println!(
+                    self.global.platform,
+                    "WARN cow_fault: parent thread hit selective-CoW page \
+                     addr={:#x} rip={:#x} tid={}",
+                    fault_addr,
+                    fault_rip,
+                    self.tid,
+                );
+            }
+            // Re-enable write without snapshotting. No tracking needed:
+            // dirty_pages only contains child snapshots, and selective CoW
+            // ensures parent threads don't collide with child-protected pages.
+            // SAFETY: restoring the page's original (writable) permissions.
+            unsafe { cow_update_permissions(self.global.platform, page_range, orig_perms) }
+        }
     }
 }
 
@@ -826,6 +849,7 @@ impl<FS: ShimFS> Task<FS> {
         let syscall_number = ctx.orig_eax;
         #[cfg(target_arch = "x86_64")]
         let syscall_number = ctx.orig_rax;
+
         let request =
             SyscallRequest::<Platform>::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
 
@@ -860,11 +884,12 @@ impl<FS: ShimFS> Task<FS> {
                 // requested indicates EOF.
                 if count <= MAX_KERNEL_BUF_SIZE {
                     let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
-                    self.sys_read(fd, &mut kernel_buf, None).and_then(|size| {
+                    let res = self.sys_read(fd, &mut kernel_buf, None).and_then(|size| {
                         buf.copy_from_slice(0, &kernel_buf[..size])
                             .map(|()| size)
                             .ok_or(Errno::EFAULT)
-                    })
+                    });
+                    res
                 } else {
                     // If the read size is too large, we need to do some extra work to avoid OOMing.
                     // We read data in chunks and update the file offset ourselves only if the read succeeds.
@@ -1018,6 +1043,12 @@ impl<FS: ShimFS> Task<FS> {
                 addrlen,
             } => self.sys_sendto(sockfd, buf, len, flags, addr, addrlen),
             SyscallRequest::Sendmsg { sockfd, msg, flags } => self.sys_sendmsg(sockfd, msg, flags),
+            SyscallRequest::Sendmmsg {
+                sockfd,
+                msgvec,
+                vlen,
+                flags,
+            } => self.sys_sendmmsg(sockfd, msgvec, vlen, flags),
             SyscallRequest::Recvfrom {
                 sockfd,
                 buf,
@@ -1047,7 +1078,9 @@ impl<FS: ShimFS> Task<FS> {
                 optname,
                 optval,
                 optlen,
-            } => syscall!(sys_getsockopt(sockfd, level, optname, optval, optlen)),
+            } => self
+                .sys_getsockopt(sockfd, level, optname, optval, optlen)
+                .to_syscall_result(),
             SyscallRequest::Getsockname {
                 sockfd,
                 addr,
@@ -1073,7 +1106,7 @@ impl<FS: ShimFS> Task<FS> {
                 op,
                 fd,
                 event,
-            } => syscall!(sys_epoll_ctl(epfd, op, fd, event)),
+            } => self.sys_epoll_ctl(epfd, op, fd, event).to_syscall_result(),
             SyscallRequest::EpollCreate { size, flags } => {
                 // the `size` argument is ignored, but must be greater than zero;
                 if size > 0 {
@@ -1181,6 +1214,38 @@ impl<FS: ShimFS> Task<FS> {
                 flags,
             } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
                 syscall!(sys_unlinkat(dirfd, path, flags))
+            }),
+            SyscallRequest::Renameat2 {
+                olddirfd,
+                oldpath,
+                newdirfd,
+                newpath,
+                flags,
+            } => {
+                let old = oldpath.to_cstring().ok_or(Errno::EFAULT)?;
+                let new = newpath.to_cstring().ok_or(Errno::EFAULT)?;
+                syscall!(sys_renameat2(olddirfd, old, newdirfd, new, flags))
+            }
+            SyscallRequest::Fchmod { fd: _, mode: _ } => {
+                // Silently succeed; in-mem FS doesn't enforce file modes at open time.
+                Ok(0)
+            }
+            SyscallRequest::Fsync { fd: _ }
+            | SyscallRequest::Fdatasync { fd: _ }
+            | SyscallRequest::Utimensat => {
+                // No-op for in-memory FS; data is always "persisted" and timestamps are ignored.
+                Ok(0)
+            }
+            SyscallRequest::Fchmodat {
+                dirfd: _,
+                pathname,
+                mode,
+            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                self.global
+                    .fs
+                    .chmod(path, litebox::fs::Mode::from_bits_truncate(mode))
+                    .map_err(Errno::from)?;
+                Ok(0)
             }),
             SyscallRequest::Stat { pathname, buf } => {
                 pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
@@ -1332,8 +1397,19 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
             SyscallRequest::SchedYield => {
-                // Do nothing until we have more scheduler integration with the
-                // platform.
+                // Yield the host thread so other host threads (including the
+                // network worker) get a chance to run.
+                // SAFETY: sched_yield is side-effect free.
+                unsafe { ::syscalls::raw::syscall0(::syscalls::Sysno::sched_yield) };
+                Ok(0)
+            }
+            SyscallRequest::SchedGetparam { pid: _, param } => {
+                // Write sched_priority = 0 (SCHED_OTHER default).
+                param.write_at_offset(0, 0i32).ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            SyscallRequest::SchedGetscheduler { pid: _ } => {
+                // Return SCHED_OTHER (0) — the default Linux scheduler policy.
                 Ok(0)
             }
             SyscallRequest::Futex { args } => self.sys_futex(args),
@@ -1376,6 +1452,25 @@ struct GlobalState<FS: ShimFS> {
     next_thread_id: core::sync::atomic::AtomicI32,
     /// UNIX domain socket address table
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<FS>>,
+    /// Cross-process signal queue for delivering signals (e.g. SIGCHLD) between
+    /// processes. Entries are consumed by the target task during signal processing.
+    cross_process_signals: litebox::sync::Mutex<Platform, Vec<CrossProcessSignal>>,
+    /// Thread handles for each process's main thread, used to interrupt a
+    /// process when delivering a cross-process signal.
+    process_thread_handles: litebox::sync::RwLock<
+        Platform,
+        alloc::collections::BTreeMap<i32, alloc::sync::Arc<syscalls::process::ThreadRemote>>,
+    >,
+}
+
+/// A signal that needs to be delivered to a different process.
+struct CrossProcessSignal {
+    /// The target process's internal ID (ProcessId).
+    target_process_id: u32,
+    /// The signal to deliver.
+    signal: litebox_common_linux::signal::Signal,
+    /// The siginfo data.
+    siginfo: litebox_common_linux::signal::Siginfo,
 }
 
 /// Per-process state shared by all threads in a process.
@@ -1389,6 +1484,13 @@ struct ProcessState {
     pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
     /// The address space ID for this process (VA partition on userland).
     address_space_id: <Platform as litebox::platform::AddressSpaceProvider>::AddressSpaceId,
+    /// Number of active threads in this process (including the main thread).
+    /// Starts at 1 and is incremented on each `clone(CLONE_THREAD)`.
+    thread_count: core::sync::atomic::AtomicI32,
+    /// Active CoW state during a vfork window. Set by the forking thread
+    /// before spawning the child; cleared after restore. All threads in the
+    /// process check this on page faults and mprotect calls.
+    active_cow: litebox::sync::Mutex<Platform, Option<Arc<CowState>>>,
 }
 
 /// One-shot synchronization primitive for vfork parent blocking.
@@ -1425,19 +1527,30 @@ impl VforkDone {
 
 /// Copy-on-write state for vfork memory protection.
 ///
-/// Before spawning a vfork child, the parent marks all writable guest pages
-/// read-only and records them here. When the child writes to a protected page,
-/// the exception handler snapshots the original page content, restores write
-/// permission, and lets the child continue. After the child execs or exits,
-/// the parent restores only the dirtied pages and re-enables write on all.
+/// Created by the forking thread and stored in both `ProcessState` (for
+/// fault-handler access by any thread) and `ForkContext` (for the child).
+///
+/// **Selective vs full** (shim decision): Controls which pages are protected.
+/// - Full: all writable pages (single-threaded processes).
+/// - Selective: only stack + libc/ld data segments (multi-threaded).
+///
+/// **Eager vs lazy** (platform decision): Controls how pages are snapshotted.
+/// - Eager: all protected pages copied upfront, left writable.
+/// - Lazy: protected pages marked read-only, snapshotted on first fault.
 struct CowState {
-    /// Pages that were made read-only (base address, length, original permissions).
+    /// Whether this is selective CoW (multi-threaded). If true, parent
+    /// threads should NOT be writing to protected pages — a fault from a
+    /// parent thread indicates a bug or unexpected behavior.
+    selective: bool,
+    /// Pages that were CoW-protected (base address, length, original permissions).
+    /// For lazy CoW these were made read-only; for eager CoW they were copied.
     protected_ranges: Vec<(
         usize,
         usize,
         litebox::platform::page_mgmt::MemoryRegionPermissions,
     )>,
-    /// Per-page snapshots taken on first write: (page-aligned addr, original content).
+    /// Per-page snapshots taken on child's first write (lazy) or upfront (eager):
+    /// (page-aligned addr, original content).
     dirty_pages: litebox::sync::Mutex<Platform, Vec<(usize, Vec<u8>)>>,
 }
 
@@ -1452,8 +1565,6 @@ struct ForkContext {
     address_space_id: <Platform as litebox::platform::AddressSpaceProvider>::AddressSpaceId,
     /// Signals the parent to resume after the vfork child execs or exits.
     vfork_done: Arc<VforkDone>,
-    /// CoW state shared with the parent for lazy page snapshotting.
-    cow_state: Option<Arc<CowState>>,
 }
 
 struct Task<FS: ShimFS> {

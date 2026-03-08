@@ -670,6 +670,11 @@ impl litebox::platform::AddressSpaceProvider for LinuxUserland {
     /// Slot index into the VA partition table.
     type AddressSpaceId = u32;
 
+    // Lazy CoW: mark pages read-only at fork time and snapshot on first
+    // write fault. More memory-efficient than eager for processes with many
+    // writable pages since only actually-modified pages are copied.
+    const EAGER_COW_FOR_VFORK: bool = false;
+
     #[cfg(target_arch = "x86_64")]
     fn create_address_space(
         &self,

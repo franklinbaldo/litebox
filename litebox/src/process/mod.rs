@@ -104,6 +104,21 @@ pub struct ProcessContext {
 // Wait types
 // ---------------------------------------------------------------------------
 
+/// Information about a child process exit, returned by
+/// [`ProcessRegistry::exit_process`] so the caller can deliver the exit
+/// signal (typically `SIGCHLD`) to the parent.
+#[derive(Debug, Clone, Copy)]
+pub struct ExitNotification {
+    /// The parent process that should receive the signal.
+    pub parent_pid: ProcessId,
+    /// The signal number to deliver (from the child's `exit_signal`).
+    pub exit_signal: i32,
+    /// The child process that exited.
+    pub child_pid: ProcessId,
+    /// The child's exit status.
+    pub exit_status: i32,
+}
+
 /// The target of a `waitpid`-style call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitTarget {
@@ -347,11 +362,16 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
     /// reparented to PID 1 (the init process), and any zombie orphans are
     /// automatically reaped. The parent's wait channel is notified.
     ///
+    /// Returns the parent's PID and the child's exit signal (e.g. `SIGCHLD`)
+    /// if the parent is still alive. The caller can use this to deliver the
+    /// exit signal to the parent process.
+    ///
     /// # Panics
     ///
     /// Panics if `id` is not in the registry or the process has already exited.
-    pub fn exit_process(&self, id: ProcessId, status: i32) {
+    pub fn exit_process(&self, id: ProcessId, status: i32) -> Option<ExitNotification> {
         let parent_wait_channel;
+        let exit_notification;
 
         {
             let mut table = self.table.write();
@@ -361,11 +381,12 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
             // Guard against double-exit. In release builds the debug_assert
             // would be stripped, so we check unconditionally.
             if matches!(entry.context.state, ProcessState::Zombie(_)) {
-                return;
+                return None;
             }
             entry.context.state = ProcessState::Zombie(status);
 
             let parent = entry.context.parent;
+            let exit_signal = entry.context.exit_signal;
 
             // In Linux, init (PID 1) exiting is a kernel panic. In LiteBox,
             // we allow it (sandbox teardown) but skip reparenting since there
@@ -424,12 +445,27 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
                 },
                 None => None,
             };
+
+            // Build exit notification for the caller if parent is alive and
+            // the child specified a non-zero exit signal.
+            exit_notification = if parent_wait_channel.is_some() && exit_signal > 0 {
+                parent.map(|ppid| ExitNotification {
+                    parent_pid: ppid,
+                    exit_signal,
+                    child_pid: id,
+                    exit_status: status,
+                })
+            } else {
+                None
+            };
         }
 
         // Notify the parent outside the table lock.
         if let Some(wc) = parent_wait_channel {
             wc.notify();
         }
+
+        exit_notification
     }
 
     /// Wait for a child process to exit (`waitpid` semantics).

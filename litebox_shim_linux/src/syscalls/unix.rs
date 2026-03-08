@@ -1354,7 +1354,9 @@ impl<FS: ShimFS> UnixSocket<FS> {
 
         match optname {
             SocketOptionName::IP(ip) => match ip {
-                IpOption::TOS => Err(Errno::EOPNOTSUPP),
+                IpOption::TOS | IpOption::RECVERR | IpOption::MTU_DISCOVER | IpOption::PKTINFO => {
+                    Err(Errno::EOPNOTSUPP)
+                }
             },
             SocketOptionName::Socket(so) => match so {
                 // handled by `setsockopt_common`
@@ -1368,6 +1370,8 @@ impl<FS: ShimFS> UnixSocket<FS> {
                 }
                 // Don't allow changing socket type and credentials
                 SocketOption::TYPE | SocketOption::PEERCRED => Err(Errno::ENOPROTOOPT),
+                // SO_ERROR is read-only
+                SocketOption::ERROR => Err(Errno::ENOPROTOOPT),
                 // We use fixed buffer size for now
                 SocketOption::RCVBUF | SocketOption::SNDBUF => Err(Errno::EOPNOTSUPP),
             },
@@ -1402,7 +1406,9 @@ impl<FS: ShimFS> UnixSocket<FS> {
 
         let val: u32 = match optname {
             SocketOptionName::IP(ip) => match ip {
-                IpOption::TOS => return Err(Errno::EOPNOTSUPP),
+                IpOption::TOS | IpOption::RECVERR | IpOption::MTU_DISCOVER | IpOption::PKTINFO => {
+                    return Err(Errno::EOPNOTSUPP);
+                }
             },
             SocketOptionName::Socket(so) => match so {
                 // handled by `getsockopt_common`
@@ -1439,6 +1445,9 @@ impl<FS: ShimFS> UnixSocket<FS> {
                         return Err(Errno::EOPNOTSUPP);
                     }
                 },
+                // SO_ERROR returns (and clears) the pending socket error.
+                // We don't track pending errors yet, so always report 0.
+                SocketOption::ERROR => 0,
             },
             SocketOptionName::TCP(_) => return Err(Errno::EOPNOTSUPP),
         };

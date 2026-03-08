@@ -95,6 +95,30 @@ impl SignalState {
         }
     }
 
+    /// Creates signal state for a forked child process.
+    ///
+    /// Unlike [`clone_for_new_task`](Self::clone_for_new_task) (which shares
+    /// signal handlers via `Arc` for threads), fork creates a deep copy of
+    /// the handlers so the child process can modify them independently.
+    pub fn clone_for_fork(&self) -> Self {
+        Self {
+            pending: RefCell::new(PendingSignals::new()),
+            blocked: Cell::new(self.blocked.get()),
+            // Deep-copy handlers so the child's rt_sigaction doesn't affect
+            // the parent (important for vfork where both run concurrently).
+            handlers: RefCell::new(Arc::new((*self.handlers.borrow()).as_ref().clone())),
+            altstack: SigAltStack {
+                flags: SsFlags::DISABLE,
+                sp: 0,
+                size: 0,
+                #[cfg(target_arch = "x86_64")]
+                __pad: 0,
+            }
+            .into(),
+            last_exception: self.last_exception.clone(),
+        }
+    }
+
     /// Resets signal state for an `execve` call.
     pub(crate) fn reset_for_exec(&self) {
         let mut handlers = self.handlers.borrow_mut();
@@ -522,10 +546,31 @@ impl<FS: ShimFS> Task<FS> {
     fn do_kill(&self, pid: Option<i32>, tid: Option<i32>, signal: i32) -> Result<usize, Errno> {
         let signal = Signal::try_from(signal)?;
         if pid.is_none_or(|pid| pid == self.pid) && tid.is_none_or(|tid| tid == self.tid) {
+            // Sending signal to self.
             self.send_signal(signal, siginfo_kill(signal));
             Ok(0)
+        } else if pid.is_none_or(|pid| pid == self.pid) {
+            // Sending signal to a different thread in the same process.
+            // We can't enqueue the signal into the target thread's pending
+            // set (it's thread-local), but we can interrupt its wait so it
+            // gets a chance to reschedule. This is sufficient for Go's
+            // goroutine preemption (SIGURG) and other cooperative schemes.
+            if let Some(target_tid) = tid {
+                let inner = self.process().inner.lock();
+                if let Some(remote) = inner.threads.get(&target_tid) {
+                    remote.interrupt();
+                    return Ok(0);
+                }
+            }
+            Err(Errno::ESRCH)
         } else {
-            log_unsupported!("sys_{{t|tg}}kill with remote pid/tid");
+            log_unsupported!(
+                "sys_{{t|tg}}kill with remote pid (caller pid={}, tid={}, target pid={:?}, tid={:?})",
+                self.pid,
+                self.tid,
+                pid,
+                tid
+            );
             Err(Errno::ESRCH)
         }
     }
@@ -543,6 +588,25 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Deliver any pending signals.
     pub(crate) fn process_signals(&self, ctx: &mut PtRegs) {
+        // Drain cross-process signals for this process into our local pending queue.
+        {
+            let my_id = self.process_id.0;
+            let mut queue = self.global.cross_process_signals.lock();
+            let mut i = 0;
+            while i < queue.len() {
+                if queue[i].target_process_id == my_id {
+                    let sig = queue.swap_remove(i);
+                    self.signals.pending.borrow_mut().push(
+                        &self.process().limits,
+                        sig.signal,
+                        sig.siginfo,
+                    );
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
         loop {
             let blocked = self.signals.blocked.get();
             let (signal, siginfo) = {
