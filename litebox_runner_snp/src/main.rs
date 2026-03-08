@@ -272,6 +272,7 @@ pub extern "C" fn sandbox_tun_read_write() {
         if let Some(shim) = unsafe { (*shim).as_ref() } {
             break shim;
         }
+        core::hint::spin_loop();
     };
     #[cfg(debug_assertions)]
     litebox::log_println!(
