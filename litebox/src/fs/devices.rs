@@ -224,7 +224,7 @@ impl<
         &self,
         fd: &FileFd<Platform>,
         buf: &mut [u8],
-        offset: Option<usize>,
+        _offset: Option<usize>,
     ) -> Result<usize, ReadError> {
         match &self
             .litebox

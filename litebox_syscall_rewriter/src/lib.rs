@@ -177,6 +177,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
             s.vaddr,
             section_data,
             trampoline_base_addr,
+            trampoline_base_addr, // entry point is at offset 0 of trampoline
             dl_sysinfo_int80,
             &mut trampoline_data,
         ) {
@@ -241,6 +242,62 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
         out.extend_from_slice(header.as_bytes());
     }
     Ok(out)
+}
+
+/// Patch a single mapped code segment in-place, returning trampoline stubs.
+///
+/// This is the runtime counterpart to [`hook_syscalls_in_elf`]. Instead of
+/// processing a whole ELF file, it operates on a single already-mapped code
+/// region — the caller is responsible for making the region writable before
+/// calling and restoring permissions afterwards.
+///
+/// # Arguments
+///
+/// * `code` — mutable slice of the mapped code segment.
+/// * `code_vaddr` — virtual address of `code[0]` in guest memory.
+/// * `trampoline_write_vaddr` — virtual address where the returned stub bytes
+///   will be placed by the caller.
+/// * `syscall_entry_addr` — address of the 8-byte entry-point value that
+///   each stub's indirect jump targets.
+///
+/// # Returns
+///
+/// The trampoline stub bytes. The caller must copy them to
+/// `trampoline_write_vaddr`. Returns an empty `Vec` if no syscall
+/// instructions are found in `code`.
+pub fn patch_code_segment(
+    code: &mut [u8],
+    code_vaddr: u64,
+    trampoline_write_vaddr: u64,
+    syscall_entry_addr: u64,
+) -> Result<Vec<u8>> {
+    let arch = Arch::X86_64; // runtime patching is x86-64 only
+
+    // Build control-transfer targets for this segment.
+    let instructions = decode_section_instructions(arch, code, code_vaddr)?;
+    let mut control_transfer_targets = BTreeSet::new();
+    for inst in &instructions {
+        let target = inst.near_branch_target();
+        if target != 0 {
+            control_transfer_targets.insert(target);
+        }
+    }
+
+    let mut trampoline_data = Vec::new();
+    match hook_syscalls_in_section(
+        arch,
+        &control_transfer_targets,
+        code_vaddr,
+        code,
+        trampoline_write_vaddr,
+        syscall_entry_addr,
+        None, // dl_sysinfo_int80 — not applicable on x86-64
+        &mut trampoline_data,
+    ) {
+        Ok(()) => Ok(trampoline_data),
+        Err(Error::NoSyscallInstructionsFound) => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
 }
 
 /// (private) Get metadata for executable sections
@@ -330,6 +387,10 @@ enum Arch {
 }
 
 /// (private) Hook all syscalls in `section`, possibly extending `trampoline_data` to do so.
+///
+/// `trampoline_base_addr` is the virtual address corresponding to `trampoline_data[0]`.
+/// `syscall_entry_addr` is the address of the 8-byte entry-point value that each trampoline
+/// stub jumps to (via `JMP [RIP+disp32]` on x86-64 or `CALL [EAX+disp32]` on x86-32).
 #[allow(clippy::too_many_arguments)]
 fn hook_syscalls_in_section(
     arch: Arch,
@@ -337,6 +398,7 @@ fn hook_syscalls_in_section(
     section_base_addr: u64,
     section_data: &mut [u8],
     trampoline_base_addr: u64,
+    syscall_entry_addr: u64,
     dl_sysinfo_int80: Option<u64>,
     trampoline_data: &mut Vec<u8>,
 ) -> Result<()> {
@@ -393,6 +455,7 @@ fn hook_syscalls_in_section(
                 section_base_addr,
                 section_data,
                 trampoline_base_addr,
+                syscall_entry_addr,
                 trampoline_data,
                 &instructions,
                 i,
@@ -423,28 +486,29 @@ fn hook_syscalls_in_section(
                 .extend_from_slice(&(i32::try_from(jmp_back_offset).unwrap().to_le_bytes()));
 
             // Add jmp [rip + offset_to_entry_point]
-            // Entry point is at offset 0 of trampoline_data
             trampoline_data.extend_from_slice(&[0xFF, 0x25]);
-            // disp32 points to offset 0 (entry point) from current RIP
             // RIP after this instruction = trampoline_base_addr + trampoline_data.len() + 4
-            // We want: RIP + disp32 = trampoline_base_addr + 0
-            // So: disp32 = -(trampoline_data.len() + 4)
-            let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() + 4);
-            trampoline_data.extend_from_slice(&disp32.to_le_bytes());
+            // We want: RIP + disp32 = syscall_entry_addr
+            #[allow(clippy::cast_possible_wrap)]
+            let disp32 = i64::try_from(syscall_entry_addr).unwrap()
+                - i64::try_from(trampoline_base_addr).unwrap()
+                - trampoline_data.len() as i64
+                - 4;
+            trampoline_data.extend_from_slice(&(i32::try_from(disp32).unwrap().to_le_bytes()));
         } else {
             // For 32-bit, use a different approach to simulate indirect call
-            // Entry point is at offset 0 of trampoline_data
             trampoline_data.push(0x50); // PUSH EAX
             trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
             trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
             trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-            // The offset should point to the entry at offset 0
-            // After PUSH(1) + CALL(5) + POP(1) + opcode(2) = 9 bytes
-            // EAX = base + (len_before_PUSH + 6) = base + (current_len - 9 + 6) = base + (current_len - 3)
-            // We want: EAX + offset = base + 0
-            // So: offset = -(current_len - 3)
-            let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 3);
-            trampoline_data.extend_from_slice(&disp32.to_le_bytes());
+            // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
+            // We want: EAX + offset = syscall_entry_addr
+            #[allow(clippy::cast_possible_wrap)]
+            let disp32 = i64::try_from(syscall_entry_addr).unwrap()
+                - i64::try_from(trampoline_base_addr).unwrap()
+                - trampoline_data.len() as i64
+                + 3;
+            trampoline_data.extend_from_slice(&(i32::try_from(disp32).unwrap().to_le_bytes()));
             // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
             // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
 
@@ -681,6 +745,7 @@ fn hook_syscall_and_after(
     section_base_addr: u64,
     section_data: &mut [u8],
     trampoline_base_addr: u64,
+    syscall_entry_addr: u64,
     trampoline_data: &mut Vec<u8>,
     instructions: &[iced_x86::Instruction],
     inst_index: usize,
@@ -720,6 +785,7 @@ fn hook_syscall_and_after(
             section_base_addr,
             section_data,
             trampoline_base_addr,
+            syscall_entry_addr,
             trampoline_data,
             instructions,
             inst_index,
@@ -735,28 +801,29 @@ fn hook_syscall_and_after(
         trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D]); // LEA RCX, [RIP + disp32]
         trampoline_data.extend_from_slice(&6u32.to_le_bytes());
         // Add jmp [rip + offset_to_entry_point]
-        // Entry point is at offset 0 of trampoline_data
         trampoline_data.extend_from_slice(&[0xFF, 0x25]);
-        // disp32 points to offset 0 (entry point) from current RIP
         // RIP after this instruction = trampoline_base_addr + trampoline_data.len() + 4
-        // We want: RIP + disp32 = trampoline_base_addr + 0
-        // So: disp32 = -(trampoline_data.len() + 4)
-        let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() + 4);
-        trampoline_data.extend_from_slice(&disp32.to_le_bytes());
+        // We want: RIP + disp32 = syscall_entry_addr
+        #[allow(clippy::cast_possible_wrap)]
+        let disp32 = i64::try_from(syscall_entry_addr).unwrap()
+            - i64::try_from(trampoline_base_addr).unwrap()
+            - trampoline_data.len() as i64
+            - 4;
+        trampoline_data.extend_from_slice(&(i32::try_from(disp32).unwrap().to_le_bytes()));
     } else {
         // For 32-bit, use a different approach to simulate indirect call
-        // Entry point is at offset 0 of trampoline_data
         trampoline_data.push(0x50); // PUSH EAX
         trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
         trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
         trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-        // The offset should point to the entry at offset 0
-        // After PUSH(1) + CALL(5) + POP(1) + opcode(2) = 9 bytes
-        // EAX = base + (len_before_PUSH + 6) = base + (current_len - 9 + 6) = base + (current_len - 3)
-        // We want: EAX + offset = base + 0
-        // So: offset = -(current_len - 3)
-        let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 3);
-        trampoline_data.extend_from_slice(&disp32.to_le_bytes());
+        // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
+        // We want: EAX + offset = syscall_entry_addr
+        #[allow(clippy::cast_possible_wrap)]
+        let disp32 = i64::try_from(syscall_entry_addr).unwrap()
+            - i64::try_from(trampoline_base_addr).unwrap()
+            - trampoline_data.len() as i64
+            + 3;
+        trampoline_data.extend_from_slice(&(i32::try_from(disp32).unwrap().to_le_bytes()));
         // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
         // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
     }
@@ -800,6 +867,7 @@ fn hook_syscall_before_and_after(
     section_base_addr: u64,
     section_data: &mut [u8],
     trampoline_base_addr: u64,
+    syscall_entry_addr: u64,
     trampoline_data: &mut Vec<u8>,
     instructions: &[iced_x86::Instruction],
     inst_index: usize,
@@ -874,13 +942,14 @@ fn hook_syscall_before_and_after(
     trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
     trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
     trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-    // The offset should point to the entry at offset 0
-    // After PUSH(1) + CALL(5) + POP(1) + opcode(2) = 9 bytes
-    // EAX = base + (len_before_PUSH + 6) = base + (current_len - 9 + 6) = base + (current_len - 3)
-    // We want: EAX + offset = base + 0
-    // So: offset = -(current_len - 3)
-    let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 3);
-    trampoline_data.extend_from_slice(&disp32.to_le_bytes());
+    // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
+    // We want: EAX + offset = syscall_entry_addr
+    #[allow(clippy::cast_possible_wrap)]
+    let disp32 = i64::try_from(syscall_entry_addr).unwrap()
+        - i64::try_from(trampoline_base_addr).unwrap()
+        - trampoline_data.len() as i64
+        + 3;
+    trampoline_data.extend_from_slice(&(i32::try_from(disp32).unwrap().to_le_bytes()));
     // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
     // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
 
