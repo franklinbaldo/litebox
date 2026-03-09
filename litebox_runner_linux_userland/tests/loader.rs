@@ -93,7 +93,7 @@ impl TestLauncher {
         self.shim_builder.set_fs(self.fs);
         let shim = self.shim_builder.build();
         let program = shim
-            .load_program(self.platform.init_task(), executable_path, argv, envp)
+            .load_program(self.platform.init_task(), executable_path, argv, envp, None)
             .unwrap();
         unsafe {
             litebox_platform_linux_userland::run_thread(

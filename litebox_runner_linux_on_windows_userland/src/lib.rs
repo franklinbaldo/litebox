@@ -102,7 +102,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
 
     let program = shim
-        .load_program(platform.init_task(), prog_path, argv, envp)
+        .load_program(platform.init_task(), prog_path, argv, envp, None)
         .unwrap();
     unsafe {
         litebox_platform_windows_userland::run_thread(

@@ -288,6 +288,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
         path: &str,
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
+        initial_cwd: Option<alloc::string::String>,
     ) -> Result<LoadedProgram<FS>, loader::elf::ElfLoaderError> {
         let litebox_common_linux::TaskParams {
             pid,
@@ -320,7 +321,11 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 }
                 .into(),
                 comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
-                fs: Arc::new(syscalls::file::FsState::new()).into(),
+                fs: Arc::new(match initial_cwd {
+                    Some(cwd) => syscalls::file::FsState::with_cwd(cwd),
+                    None => syscalls::file::FsState::new(),
+                })
+                .into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
                 fork_context: RefCell::new(None),

@@ -51,6 +51,20 @@ impl FsState {
         }
     }
 
+    /// Create a new `FsState` with a custom initial working directory.
+    ///
+    /// The `cwd` must be an absolute path. A trailing '/' is appended if missing.
+    pub fn with_cwd(mut cwd: String) -> Self {
+        assert!(cwd.starts_with('/'), "initial CWD must be absolute");
+        if !cwd.ends_with('/') {
+            cwd.push('/');
+        }
+        Self {
+            umask: (Mode::WGRP | Mode::WOTH).bits().into(),
+            cwd: litebox::sync::RwLock::new(cwd),
+        }
+    }
+
     fn umask(&self) -> Mode {
         Mode::from_bits_retain(self.umask.load(Ordering::Relaxed))
     }

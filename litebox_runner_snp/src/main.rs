@@ -260,6 +260,7 @@ pub extern "C" fn sandbox_process_init(
         &program,
         argv,
         envp,
+        None,
     ) {
         Ok(program) => program,
         Err(err) => {

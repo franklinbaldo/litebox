@@ -597,15 +597,32 @@ impl<
         }
         // Any errors from lower level now _must_ propagate up, so we can just invoke
         // the lower level and set up the relevant descriptor upon success.
-        let entry = Arc::new(EntryX::Lower {
-            fd: self.lower.open(path.as_str(), flags, mode)?,
-        });
-        let old = self
-            .root
-            .write()
-            .entries
-            .insert(path.clone(), Arc::clone(&entry));
-        assert!(old.is_none());
+        let lower_fd = self.lower.open(path.as_str(), flags, mode)?;
+        // Insert into root entries, handling the race where another thread may have
+        // already inserted an entry for the same path between our earlier read-lock
+        // check and this write-lock acquisition.
+        let entry = {
+            let mut root = self.root.write();
+            if let Some(existing) = root.entries.get(&path) {
+                if matches!(existing.as_ref(), EntryX::Lower { .. }) {
+                    // Another thread won the race — reuse its entry and close ours.
+                    let shared = Arc::clone(existing);
+                    drop(root);
+                    let _ = self.lower.close(&lower_fd);
+                    shared
+                } else {
+                    // Tombstone or Upper inserted concurrently — shouldn't happen in
+                    // normal operation, but close the FD we opened and bail out.
+                    drop(root);
+                    let _ = self.lower.close(&lower_fd);
+                    return Err(PathError::NoSuchFileOrDirectory)?;
+                }
+            } else {
+                let entry = Arc::new(EntryX::Lower { fd: lower_fd });
+                root.entries.insert(path.clone(), Arc::clone(&entry));
+                entry
+            }
+        };
         let fd = self.litebox.descriptor_table_mut().insert(Descriptor {
             path,
             flags: original_flags,

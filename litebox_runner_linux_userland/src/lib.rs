@@ -91,6 +91,11 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub broker_endpoint: Option<String>,
+
+    /// Set the initial working directory for the sandboxed process.
+    /// Defaults to "/".
+    #[arg(long = "cwd", requires = "unstable", help_heading = "Unstable Options")]
+    pub working_directory: Option<String>,
 }
 
 /// Backends supported for intercepting syscalls
@@ -449,7 +454,13 @@ fn finish_run<FS: litebox_shim_linux::ShimFS>(
         envp
     };
 
-    let program = shim.load_program(platform.init_task(), prog_path, argv, envp)?;
+    let program = shim.load_program(
+        platform.init_task(),
+        prog_path,
+        argv,
+        envp,
+        cli_args.working_directory.clone(),
+    )?;
 
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();
