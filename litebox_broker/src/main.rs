@@ -14,7 +14,7 @@ use clap::Parser;
 use tonic::transport::Server;
 use tracing::info;
 
-use litebox_broker::policy::{AllowAllPolicy, ReadOnlyPolicy};
+use litebox_broker::policy::{AllowAllPolicy, ReadOnlyPolicy, ReadOnlyWithWritablePaths};
 use litebox_broker::proto::file_broker_server::FileBrokerServer;
 use litebox_broker::server::FileBrokerService;
 
@@ -41,6 +41,14 @@ struct Cli {
     /// Restrict the broker to read-only access (deny writes, mkdir, unlink, etc.).
     #[arg(long)]
     read_only: bool,
+
+    /// Allow write operations under these directories (can be repeated).
+    ///
+    /// When specified together with --read-only, write operations are permitted
+    /// only for paths that fall under one of these prefixes.  Without --read-only
+    /// this flag has no effect.
+    #[arg(long = "writable-path")]
+    writable_paths: Vec<PathBuf>,
 }
 
 #[tokio::main]
@@ -58,10 +66,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .canonicalize()
         .expect("root directory must exist");
 
-    info!(?root, addr = %cli.listen_addr, rewrite = cli.rewrite_syscalls, read_only = cli.read_only, "starting file broker");
+    info!(?root, addr = %cli.listen_addr, rewrite = cli.rewrite_syscalls, read_only = cli.read_only, writable_paths = ?cli.writable_paths, "starting file broker");
 
     let policy: Arc<dyn litebox_broker::policy::Policy> = if cli.read_only {
-        Arc::new(ReadOnlyPolicy)
+        if cli.writable_paths.is_empty() {
+            Arc::new(ReadOnlyPolicy)
+        } else {
+            let prefixes: Vec<PathBuf> = cli
+                .writable_paths
+                .iter()
+                .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+                .collect();
+            info!(?prefixes, "read-only with writable exceptions");
+            Arc::new(ReadOnlyWithWritablePaths::new(prefixes))
+        }
     } else {
         Arc::new(AllowAllPolicy)
     };

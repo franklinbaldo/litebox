@@ -93,3 +93,62 @@ impl Policy for AllowAllPolicy {
         Ok(())
     }
 }
+
+/// A policy that is read-only everywhere except for explicitly listed writable
+/// paths (and their children).
+///
+/// Write, Chmod, Mkdir, Rmdir, Unlink, and Truncate are permitted only when
+/// the operation's path falls under one of the configured writable prefixes.
+/// Everything else follows [`ReadOnlyPolicy`] semantics.
+#[derive(Debug)]
+pub struct ReadOnlyWithWritablePaths {
+    writable_prefixes: Vec<std::path::PathBuf>,
+}
+
+impl ReadOnlyWithWritablePaths {
+    /// Create a new policy with the given writable directory prefixes.
+    ///
+    /// Each prefix should be an absolute path.  A file operation is considered
+    /// writable when its canonicalized path starts with any of these prefixes.
+    pub fn new(writable_prefixes: Vec<std::path::PathBuf>) -> Self {
+        Self { writable_prefixes }
+    }
+
+    fn path_is_writable(&self, path: Option<&Path>) -> bool {
+        let Some(p) = path else { return false };
+        self.writable_prefixes
+            .iter()
+            .any(|prefix| p.starts_with(prefix))
+    }
+}
+
+impl Policy for ReadOnlyWithWritablePaths {
+    fn check(&self, action: Action, path: Option<&Path>) -> Decision {
+        match action {
+            // Always allow read-side operations
+            Action::Open
+            | Action::Read
+            | Action::Stat
+            | Action::ReadDir
+            | Action::Seek
+            | Action::Close => Decision::Allow,
+            // Write-side operations require the path to be under a writable prefix
+            Action::Write
+            | Action::Chmod
+            | Action::Mkdir
+            | Action::Rmdir
+            | Action::Unlink
+            | Action::Truncate => {
+                if self.path_is_writable(path) {
+                    Decision::Allow
+                } else {
+                    Decision::Deny
+                }
+            }
+        }
+    }
+
+    fn load_rules(&self, _text: &str) -> Result<(), String> {
+        Err("ReadOnlyWithWritablePaths does not support dynamic rules".into())
+    }
+}
