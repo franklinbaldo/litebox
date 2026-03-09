@@ -2160,7 +2160,12 @@ impl<FS: ShimFS> Task<FS> {
             copy_vector(envp, "envp")?
         };
 
-        let loader = crate::loader::elf::ElfLoader::new(self, path)?;
+        let loader = match crate::loader::elf::ElfLoader::new(self, path) {
+            Ok(l) => l,
+            Err(_e) => {
+                return Err(Errno::ENOENT);
+            }
+        };
 
         // After this point, the old program is torn down and failures must terminate the process.
 

@@ -2207,6 +2207,10 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         fd: i32,
         mode: u32,
     },
+    /// No-op: change file ownership (sandbox runs as single user).
+    Fchown,
+    /// No-op: change file ownership relative to dirfd (sandbox runs as single user).
+    Fchownat,
     Fsync {
         fd: i32,
     },
@@ -2880,6 +2884,12 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             }
             Sysno::ftruncate => sys_req!(Ftruncate { fd, length }),
             Sysno::fchmod => sys_req!(Fchmod { fd, mode }),
+            Sysno::fchown => SyscallRequest::Fchown,
+            Sysno::fchownat => SyscallRequest::Fchownat,
+            #[cfg(target_arch = "x86_64")]
+            Sysno::chown => SyscallRequest::Fchownat,
+            #[cfg(target_arch = "x86_64")]
+            Sysno::lchown => SyscallRequest::Fchownat,
             Sysno::fsync => sys_req!(Fsync { fd }),
             Sysno::fdatasync => sys_req!(Fdatasync { fd }),
             Sysno::fchmodat => sys_req!(Fchmodat { dirfd, pathname:*, mode }),

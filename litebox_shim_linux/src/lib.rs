@@ -69,11 +69,16 @@ impl<T: litebox::fs::FileSystem + Send + Sync + 'static> ShimFS for T {}
 
 /// On debug builds, logs that the user attempted to use an unsupported feature.
 fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {
-    use litebox::platform::DebugLogProvider as _;
+    #[cfg(debug_assertions)]
+    {
+        use litebox::platform::DebugLogProvider as _;
 
-    if cfg!(debug_assertions) {
         let msg = alloc::format!("WARNING: unsupported: {args}\n");
         litebox_platform_multiplex::platform().debug_log_print(&msg);
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = args;
     }
 }
 
@@ -491,11 +496,14 @@ impl<FS: ShimFS> Descriptors<FS> {
         min_idx: usize,
         max_idx: usize,
     ) -> Result<u32, Descriptor<FS>> {
+        #[allow(clippy::map_unwrap_or)]
         let idx = self
             .descriptors
             .iter()
+            .enumerate()
             .skip(min_idx)
-            .position(Option::is_none)
+            .find(|(_, slot)| slot.is_none())
+            .map(|(i, _)| i)
             .unwrap_or_else(|| {
                 self.descriptors.push(None);
                 self.descriptors.len() - 1
@@ -1250,8 +1258,10 @@ impl<FS: ShimFS> Task<FS> {
                 let new = newpath.to_cstring().ok_or(Errno::EFAULT)?;
                 syscall!(sys_renameat2(olddirfd, old, newdirfd, new, flags))
             }
-            SyscallRequest::Fchmod { fd: _, mode: _ } => {
-                // Silently succeed; in-mem FS doesn't enforce file modes at open time.
+            SyscallRequest::Fchmod { fd: _, mode: _ }
+            | SyscallRequest::Fchown
+            | SyscallRequest::Fchownat => {
+                // Silently succeed; sandbox runs as a single user.
                 Ok(0)
             }
             SyscallRequest::Fsync { fd: _ }

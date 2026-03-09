@@ -186,7 +186,12 @@ impl<FS: ShimFS> Task<FS> {
     pub fn sys_open(&self, path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
         let path = self.resolve_path(path)?;
         let mode = mode & !self.get_umask();
-        let file = self.global.fs.open(&*path, flags - OFlags::CLOEXEC, mode)?;
+        let file = match self.global.fs.open(&*path, flags - OFlags::CLOEXEC, mode) {
+            Ok(f) => f,
+            Err(e) => {
+                return Err(e.into());
+            }
+        };
         {
             let mut dt = self.global.litebox.descriptor_table_mut();
             if flags.contains(OFlags::CLOEXEC) {
@@ -1407,16 +1412,38 @@ impl<FS: ShimFS> Task<FS> {
     ) -> Result<u32, Errno> {
         match arg {
             IoctlArg::TCGETS(termios) => {
+                // Return realistic terminal attributes so programs (e.g. Node.js Ink)
+                // recognize this as a valid terminal rather than a broken device.
                 termios
                     .write_at_offset(
                         0,
                         litebox_common_linux::Termios {
-                            c_iflag: 0,
-                            c_oflag: 0,
-                            c_cflag: 0,
-                            c_lflag: 0,
+                            c_iflag: 0x6d02, // ICRNL | IXON | IXANY | IMAXBEL | IUTF8
+                            c_oflag: 0x0005, // OPOST | ONLCR
+                            c_cflag: 0x04bf, // CS8 | CREAD | CLOCAL | B38400
+                            c_lflag: 0x8a3b, // ECHO | ECHOE | ECHOK | ISIG | ICANON | IEXTEN | ECHOCTL | ECHOKE
                             c_line: 0,
-                            c_cc: [0; 19],
+                            c_cc: [
+                                0x03, // VINTR = Ctrl-C
+                                0x1c, // VQUIT = Ctrl-backslash
+                                0x7f, // VERASE = DEL
+                                0x15, // VKILL = Ctrl-U
+                                0x04, // VEOF = Ctrl-D
+                                0x00, // VTIME
+                                0x01, // VMIN
+                                0x00, // VSWTC
+                                0x11, // VSTART = Ctrl-Q
+                                0x13, // VSTOP = Ctrl-S
+                                0x1a, // VSUSP = Ctrl-Z
+                                0xff, // VEOL
+                                0x12, // VREPRINT = Ctrl-R
+                                0x0f, // VDISCARD = Ctrl-O
+                                0x17, // VWERASE = Ctrl-W
+                                0x16, // VLNEXT = Ctrl-V
+                                0xff, // VEOL2
+                                0x00, // padding
+                                0x00, // padding
+                            ],
                         },
                     )
                     .ok_or(Errno::EFAULT)?;
