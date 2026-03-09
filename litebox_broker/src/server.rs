@@ -64,6 +64,7 @@ pub struct FileBrokerService {
     elf_cache: Mutex<HashMap<PathBuf, Arc<Vec<u8>>>>,
 }
 
+#[allow(clippy::result_large_err)] // tonic::Status is the required gRPC error type
 impl FileBrokerService {
     /// Create a new service rooted at `root` with the given `policy`.
     pub fn new(root: PathBuf, policy: Arc<dyn Policy>, rewrite_syscalls: bool) -> Self {
@@ -216,6 +217,10 @@ impl FileBroker for FileBrokerService {
 
         // Map Linux O_* flags to Rust OpenOptions.
         let access_mode = flags & 0x3;
+        let is_write_open = access_mode == 1 || access_mode == 2 || has_creat;
+        if is_write_open {
+            self.check_policy(Action::Write, Some(&resolved))?;
+        }
         match access_mode {
             0 => {
                 opts.read(true);

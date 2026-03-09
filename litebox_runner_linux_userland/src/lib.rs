@@ -351,32 +351,8 @@ fn build_initial_fs(
         }
     });
 
-    // When using the rewriter backend, automatically include litebox_rtld_audit.so
-    match cli_args.interception_backend {
-        InterceptionBackend::Rewriter => {
-            #[cfg(not(target_arch = "x86_64"))]
-            eprintln!("WARN: litebox_rtld_audit not currently supported on non-x86_64 arch");
-            #[cfg(target_arch = "x86_64")]
-            in_mem.with_root_privileges(|fs| {
-                let rwxr_xr_x = Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH;
-                let _ = fs.mkdir("/lib", rwxr_xr_x);
-                let fd = fs
-                    .open(
-                        "/lib/litebox_rtld_audit.so",
-                        litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
-                        rwxr_xr_x,
-                    )
-                    .expect("Failed to create /lib/litebox_rtld_audit.so");
-                fs.initialize_primarily_read_heavy_file(
-                    &fd,
-                    include_bytes!(concat!(env!("OUT_DIR"), "/litebox_rtld_audit.so")).into(),
-                );
-                fs.close(&fd)
-                    .expect("Failed to close /lib/litebox_rtld_audit.so");
-            });
-        }
-        InterceptionBackend::Seccomp => {}
-    }
+    // When using the rewriter backend, the shim's mmap hook handles
+    // syscall patching at runtime — no audit library needed.
 
     let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
     Ok((in_mem, tar_ro))

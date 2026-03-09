@@ -47,6 +47,36 @@ pub trait Policy: Send + Sync {
     fn load_rules(&self, text: &str) -> Result<(), String>;
 }
 
+/// A policy that allows only read-only operations.
+///
+/// Write, Chmod, Mkdir, Rmdir, Unlink, and Truncate are denied.
+/// Open, Read, Stat, ReadDir, Seek, and Close are permitted.
+#[derive(Debug, Default)]
+pub struct ReadOnlyPolicy;
+
+impl Policy for ReadOnlyPolicy {
+    fn check(&self, action: Action, _path: Option<&Path>) -> Decision {
+        match action {
+            Action::Open
+            | Action::Read
+            | Action::Stat
+            | Action::ReadDir
+            | Action::Seek
+            | Action::Close => Decision::Allow,
+            Action::Write
+            | Action::Chmod
+            | Action::Mkdir
+            | Action::Rmdir
+            | Action::Unlink
+            | Action::Truncate => Decision::Deny,
+        }
+    }
+
+    fn load_rules(&self, _text: &str) -> Result<(), String> {
+        Err("ReadOnlyPolicy does not support dynamic rules".into())
+    }
+}
+
 /// A policy that allows every operation unconditionally.
 ///
 /// This is a development-time stub.  Replace with an Oso-backed policy for

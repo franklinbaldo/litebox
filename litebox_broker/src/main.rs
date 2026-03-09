@@ -14,7 +14,7 @@ use clap::Parser;
 use tonic::transport::Server;
 use tracing::info;
 
-use litebox_broker::policy::AllowAllPolicy;
+use litebox_broker::policy::{AllowAllPolicy, ReadOnlyPolicy};
 use litebox_broker::proto::file_broker_server::FileBrokerServer;
 use litebox_broker::server::FileBrokerService;
 
@@ -37,6 +37,10 @@ struct Cli {
     /// allowing the shim to intercept them without ptrace/seccomp overhead.
     #[arg(long)]
     rewrite_syscalls: bool,
+
+    /// Restrict the broker to read-only access (deny writes, mkdir, unlink, etc.).
+    #[arg(long)]
+    read_only: bool,
 }
 
 #[tokio::main]
@@ -54,9 +58,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .canonicalize()
         .expect("root directory must exist");
 
-    info!(?root, addr = %cli.listen_addr, rewrite = cli.rewrite_syscalls, "starting file broker");
+    info!(?root, addr = %cli.listen_addr, rewrite = cli.rewrite_syscalls, read_only = cli.read_only, "starting file broker");
 
-    let policy = Arc::new(AllowAllPolicy);
+    let policy: Arc<dyn litebox_broker::policy::Policy> = if cli.read_only {
+        Arc::new(ReadOnlyPolicy)
+    } else {
+        Arc::new(AllowAllPolicy)
+    };
     let service = FileBrokerService::new(root, policy, cli.rewrite_syscalls);
 
     Server::builder()
