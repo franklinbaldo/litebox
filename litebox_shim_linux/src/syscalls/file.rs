@@ -202,11 +202,22 @@ impl<FS: ShimFS> Task<FS> {
         }
         let files = self.files.borrow();
         let raw_fd = files.raw_descriptor_store.write().fd_into_raw_integer(file);
-        files
+        let guest_fd = files
             .file_descriptors
             .write()
             .insert(self, Descriptor::LiteBoxRawFd(raw_fd))
-            .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))
+            .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))?;
+
+        // Record fd → path for ELF patch cache and selective CoW.
+        if let Ok(s) = path.to_str() {
+            self.process_state
+                .borrow()
+                .fd_paths
+                .lock()
+                .insert(guest_fd.cast_signed(), alloc::string::String::from(s));
+        }
+
+        Ok(guest_fd)
     }
 
     /// Handle syscall `openat`
@@ -297,7 +308,7 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
         let get_cwd = || self.fs.borrow().cwd.read().clone();
-        let old = FsPath::new(olddirfd, oldpath, get_cwd.clone())?;
+        let old = FsPath::new(olddirfd, oldpath, get_cwd)?;
         let new = FsPath::new(newdirfd, newpath, get_cwd)?;
         let FsPath::Absolute { path: old_path } = old else {
             return Err(Errno::EINVAL);
@@ -541,6 +552,9 @@ impl<FS: ShimFS> Task<FS> {
         // Finalize any in-progress ELF patching for this fd (mprotect
         // trampoline RW→RX) before closing the descriptor.
         self.finalize_elf_patch(fd);
+
+        // Remove fd → path mapping.
+        self.process_state.borrow().fd_paths.lock().remove(&fd);
 
         let Ok(fd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
@@ -1413,8 +1427,8 @@ impl<FS: ShimFS> Task<FS> {
                 ws.write_at_offset(
                     0,
                     litebox_common_linux::Winsize {
-                        row: 20,
-                        col: 20,
+                        row: 40,
+                        col: 120,
                         xpixel: 0,
                         ypixel: 0,
                     },
@@ -1423,6 +1437,11 @@ impl<FS: ShimFS> Task<FS> {
                 Ok(0)
             }
             IoctlArg::TIOCGPTN(_) => Err(Errno::ENOTTY),
+            IoctlArg::FIONREAD(ptr) => {
+                // Return 0 bytes available — the read will block as normal.
+                ptr.write_at_offset(0, 0i32).ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
             _ => todo!(),
         }
     }
@@ -1521,6 +1540,13 @@ impl<FS: ShimFS> Task<FS> {
                     Ok(0)
                 }
             },
+            IoctlArg::FIONREAD(ptr) => {
+                // Return 0 bytes available for all fd types.
+                // For pipes/sockets, a proper implementation would query
+                // the actual buffer, but 0 is safe (caller will just read/poll).
+                ptr.write_at_offset(0, 0i32).ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
             IoctlArg::TCGETS(..)
             | IoctlArg::TCSETS(..)
             | IoctlArg::TCSETSW(..)
@@ -1545,7 +1571,7 @@ impl<FS: ShimFS> Task<FS> {
             },
             _ => {
                 #[cfg(debug_assertions)]
-                litebox::log_println!(self.global.platform, "\n\n\n{:?}\n\n\n", arg);
+                litebox::log_println!(self.global.platform, "ioctl: unsupported {:?}", arg);
                 // Return ENOTTY for unsupported ioctls rather than panicking.
                 // Complex programs (e.g., bash) probe terminal capabilities and
                 // handle ENOTTY gracefully.

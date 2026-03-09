@@ -592,6 +592,7 @@ pub const TCSETSW: u32 = 0x5403;
 pub const TCSETSF: u32 = 0x5404;
 pub const TIOCGWINSZ: u32 = 0x5413;
 pub const FIONBIO: u32 = 0x5421;
+pub const FIONREAD: u32 = 0x541B;
 pub const FIOCLEX: u32 = 0x5451;
 pub const TIOCGPTN: u32 = 0x80045430;
 
@@ -614,6 +615,8 @@ pub enum IoctlArg<Platform: litebox::platform::RawPointerProvider> {
     TIOCGPTN(Platform::RawMutPointer<u32>),
     /// Enables or disables non-blocking mode
     FIONBIO(Platform::RawConstPointer<i32>),
+    /// Get the number of bytes available to read
+    FIONREAD(Platform::RawMutPointer<i32>),
     /// Set close on exec
     FIOCLEX,
     Raw {
@@ -1796,7 +1799,7 @@ pub struct UserMsgHdr<Platform: litebox::platform::RawPointerProvider> {
     /// size of socket address structure
     pub msg_namelen: u32,
     /// Padding to match C ABI alignment of the following pointer field.
-    pub _padding1: u32,
+    pub padding1: u32,
     /// ptr to an array of `iovec` structures
     pub msg_iov: Platform::RawConstPointer<IoVec<Platform::RawMutPointer<u8>>>,
     /// number of elements in msg_iov
@@ -1808,7 +1811,7 @@ pub struct UserMsgHdr<Platform: litebox::platform::RawPointerProvider> {
     /// flags on received message
     pub msg_flags: SendFlags,
     /// Padding to match C ABI struct alignment.
-    pub _padding2: u32,
+    pub padding2: u32,
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> Clone for UserMsgHdr<Platform> {
@@ -1816,13 +1819,13 @@ impl<Platform: litebox::platform::RawPointerProvider> Clone for UserMsgHdr<Platf
         Self {
             msg_name: self.msg_name,
             msg_namelen: self.msg_namelen,
-            _padding1: self._padding1,
+            padding1: self.padding1,
             msg_iov: self.msg_iov,
             msg_iovlen: self.msg_iovlen,
             msg_control: self.msg_control,
             msg_controllen: self.msg_controllen,
             msg_flags: self.msg_flags,
-            _padding2: self._padding2,
+            padding2: self.padding2,
         }
     }
 }
@@ -1837,13 +1840,15 @@ pub struct UserMmsgHdr<Platform: litebox::platform::RawPointerProvider> {
     /// Number of bytes transmitted (output only for sendmmsg).
     pub msg_len: u32,
     /// Padding to match C ABI struct alignment.
-    pub _padding: u32,
+    pub padding: u32,
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> core::fmt::Debug for UserMmsgHdr<Platform> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("UserMmsgHdr")
+            .field("msg_hdr", &"<packed>")
             .field("msg_len", &{ self.msg_len })
+            .field("padding", &{ self.padding })
             .finish()
     }
 }
@@ -1857,7 +1862,7 @@ impl<Platform: litebox::platform::RawPointerProvider> Clone for UserMmsgHdr<Plat
             Self {
                 msg_hdr: hdr,
                 msg_len: len,
-                _padding: 0,
+                padding: 0,
             }
         }
     }
@@ -2537,6 +2542,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                         TIOCGWINSZ => IoctlArg::TIOCGWINSZ(ctx.sys_req_ptr(2)),
                         TIOCGPTN => IoctlArg::TIOCGPTN(ctx.sys_req_ptr(2)),
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),
+                        FIONREAD => IoctlArg::FIONREAD(ctx.sys_req_ptr(2)),
                         FIOCLEX => IoctlArg::FIOCLEX,
                         _ => IoctlArg::Raw {
                             cmd,

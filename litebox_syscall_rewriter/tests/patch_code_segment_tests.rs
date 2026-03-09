@@ -5,6 +5,7 @@ use litebox_syscall_rewriter::patch_code_segment;
 
 /// Basic test: synthetic code with `nop; nop; nop; syscall; ret`
 #[test]
+#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 fn patch_single_syscall() {
     //                     nop   nop   nop   syscall  ret
     let mut code = vec![0x90, 0x90, 0x90, 0x0F, 0x05, 0xC3];
@@ -68,7 +69,10 @@ fn no_syscalls_returns_empty() {
 /// Compare patch_code_segment against hook_syscalls_in_elf on the same binary:
 /// the .text section patches and trampoline stubs should be byte-identical.
 #[test]
+#[allow(clippy::cast_possible_truncation)]
 fn matches_hook_syscalls_in_elf() {
+    use object::read::{Object as _, ObjectSection as _};
+
     let input = include_bytes!("hello");
 
     // --- Run the whole-file API ---
@@ -90,7 +94,6 @@ fn matches_hook_syscalls_in_elf() {
 
     // --- Run the per-segment API on each executable section ---
     // We need to reproduce the same setup: parse the ELF, find .text sections.
-    use object::read::{Object as _, ObjectSection as _};
     // Align input for object::File::parse
     let mut backing = vec![0u64; input.len().div_ceil(8)];
     let buf: &mut [u8] = zerocopy::IntoBytes::as_mut_bytes(backing.as_mut_slice());

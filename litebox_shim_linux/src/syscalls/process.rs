@@ -552,7 +552,7 @@ impl<FS: ShimFS> Task<FS> {
                     data.pad[0] = notif.child_pid.0;
                     // si_uid (offset 4, u32) — leave as 0
                     // si_status (offset 8, i32)
-                    data.pad[2] = notif.exit_status as u32;
+                    data.pad[2] = notif.exit_status.cast_unsigned();
 
                     let siginfo = Siginfo {
                         signo: signal.as_i32(),
@@ -574,7 +574,7 @@ impl<FS: ShimFS> Task<FS> {
 
                     // Interrupt the parent so it processes the signal.
                     let handles = self.global.process_thread_handles.read();
-                    let parent_key = notif.parent_pid.0 as i32;
+                    let parent_key = notif.parent_pid.0.cast_signed();
                     if let Some(remote) = handles.get(&parent_key) {
                         remote.interrupt();
                     }
@@ -1136,7 +1136,7 @@ impl<FS: ShimFS> Task<FS> {
                 .remove_process(child_process_id);
             Errno::EAGAIN
         })?;
-        let child_tid = child_pid;
+        let child_initial_tid = child_pid;
 
         // Ensure the global clone-TID counter stays ahead of fork-allocated
         // PIDs so that a subsequent clone() in ANY process never hands out a
@@ -1144,10 +1144,10 @@ impl<FS: ShimFS> Task<FS> {
         let _ = self
             .global
             .next_thread_id
-            .fetch_max(child_tid + 1, Ordering::Relaxed);
+            .fetch_max(child_initial_tid + 1, Ordering::Relaxed);
 
         // Save parent's RSP for selective stack-only restore after vfork.
-        let parent_stack_rsp: usize = ctx.rsp.try_into().unwrap_or(0);
+        let parent_stack_rsp: usize = ctx.rsp;
 
         // 4. Build per-fork-mode state: vfork (shared with parent) vs
         //    independent (kernel CoW).
@@ -1192,7 +1192,20 @@ impl<FS: ShimFS> Task<FS> {
                     > 1;
 
                 let cow_state: Option<Arc<crate::CowState>> = {
-                    let mappings = self.process_state.borrow().pm.mappings();
+                    let ps = self.process_state.borrow();
+                    let mappings = ps.pm.mappings();
+
+                    // Get the main binary's .bss page range. This is the
+                    // zero-filled portion of the writable PT_LOAD segment and
+                    // contains copy-relocated glibc symbols (e.g., __environ)
+                    // that the child's fork wrapper may modify.
+                    let bss_start = ps
+                        .main_bss_start
+                        .load(core::sync::atomic::Ordering::Relaxed);
+                    let bss_end = ps.main_bss_end.load(core::sync::atomic::Ordering::Relaxed);
+
+                    drop(ps);
+
                     let mut eager_dirty = alloc::vec::Vec::<(usize, alloc::vec::Vec<u8>)>::new();
                     let mut protected = alloc::vec::Vec::new();
 
@@ -1201,12 +1214,17 @@ impl<FS: ShimFS> Task<FS> {
                             continue;
                         }
 
-                        // Selective CoW: only protect the parent's stack VMA.
-                        // In the future, add libc/ld data segments here too.
+                        // Selective CoW: protect the parent's stack and the main
+                        // binary's .bss region. Skip everything else (V8 heap,
+                        // anonymous mmaps, libc data, etc.) to avoid rolling back
+                        // legitimate parent-thread writes.
                         if is_selective {
                             let is_parent_stack =
                                 range.start <= parent_stack_rsp && parent_stack_rsp < range.end;
-                            if !is_parent_stack {
+                            let is_main_bss = bss_end > bss_start
+                                && range.start >= bss_start
+                                && range.start < bss_end;
+                            if !is_parent_stack && !is_main_bss {
                                 continue;
                             }
                         }
@@ -1304,6 +1322,9 @@ impl<FS: ShimFS> Task<FS> {
                     thread_count: core::sync::atomic::AtomicI32::new(1),
                     active_cow: litebox::sync::Mutex::new(None),
                     elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+                    fd_paths: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+                    main_bss_start: core::sync::atomic::AtomicUsize::new(0),
+                    main_bss_end: core::sync::atomic::AtomicUsize::new(0),
                 });
                 let child_files_state = Arc::new(
                     self.files
@@ -1356,7 +1377,7 @@ impl<FS: ShimFS> Task<FS> {
                         process_id: child_process_id,
                         pid: child_pid,
                         ppid: self.pid,
-                        tid: child_tid,
+                        tid: child_initial_tid,
                         credentials: self.credentials.clone(),
                         comm: self.comm.clone(),
                         fs: self.fs.clone(),
@@ -2168,6 +2189,9 @@ impl<FS: ShimFS> Task<FS> {
                 thread_count: core::sync::atomic::AtomicI32::new(1),
                 active_cow: litebox::sync::Mutex::new(None),
                 elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+                fd_paths: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+                main_bss_start: core::sync::atomic::AtomicUsize::new(0),
+                main_bss_end: core::sync::atomic::AtomicUsize::new(0),
             });
             self.process_state.replace(child_ps);
 
@@ -2257,7 +2281,7 @@ impl<FS: ShimFS> Task<FS> {
         // Register the process's main thread handle so cross-process signals
         // (e.g. SIGCHLD) can interrupt this task. Use process_id (litebox's
         // internal ID) which matches what ProcessRegistry returns.
-        let proc_key = self.process_id.0 as i32;
+        let proc_key = self.process_id.0.cast_signed();
         self.global
             .process_thread_handles
             .write()

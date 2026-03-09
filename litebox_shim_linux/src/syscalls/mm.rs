@@ -38,6 +38,9 @@ pub(crate) struct ElfPatchState {
     pub trampoline_cursor: usize,
     /// Whether the trampoline region has been allocated.
     pub trampoline_mapped: bool,
+    /// File path of the ELF (from the fd→path table, if available).
+    #[allow(dead_code)]
+    pub file_path: Option<alloc::string::String>,
 }
 
 /// Per-process collection of ELF patching state, keyed by fd number.
@@ -132,6 +135,7 @@ impl<FS: ShimFS> Task<FS> {
     /// Reads the ELF header to determine the trampoline address (page-aligned
     /// end of the highest PT_LOAD segment) and checks the file tail for the
     /// trampoline magic to determine if it's pre-patched.
+    #[allow(clippy::cast_possible_truncation)]
     fn init_elf_patch_state(&self, fd: i32, base_addr: usize) {
         // Quick check: skip if already initialized.
         {
@@ -217,6 +221,7 @@ impl<FS: ShimFS> Task<FS> {
 
         // Insert under lock (re-check for races).
         let ps = self.process_state.borrow();
+        let file_path = ps.fd_paths.lock().get(&fd).cloned();
         let mut cache = ps.elf_patch_cache.lock();
         cache.entry(fd).or_insert(ElfPatchState {
             _base_addr: base_addr,
@@ -227,6 +232,7 @@ impl<FS: ShimFS> Task<FS> {
             trampoline_addr: trampoline_vaddr,
             trampoline_cursor: 0,
             trampoline_mapped: false,
+            file_path,
         });
     }
 
@@ -236,7 +242,7 @@ impl<FS: ShimFS> Task<FS> {
         let Ok(stat) = self.sys_fstat(fd) else {
             return (false, 0, 0, 0);
         };
-        let file_size = stat.st_size as usize;
+        let file_size = stat.st_size;
         if file_size < 32 {
             return (false, 0, 0, 0);
         }
@@ -260,6 +266,7 @@ impl<FS: ShimFS> Task<FS> {
     /// the syscall entry point.
     /// For unpatched binaries: calls `patch_code_segment()` to rewrite syscall
     /// instructions and places the generated stubs in the trampoline region.
+    #[allow(clippy::cast_possible_truncation)]
     fn maybe_patch_exec_segment(
         &self,
         mapped_addr: MutPtr<u8>,
@@ -367,11 +374,7 @@ impl<FS: ShimFS> Task<FS> {
             };
 
             // Verify the trampoline is within JMP rel32 range (±2GB) of the code.
-            let distance = if actual_addr > addr_usize {
-                actual_addr - addr_usize
-            } else {
-                addr_usize - actual_addr
-            };
+            let distance = actual_addr.abs_diff(addr_usize);
             if distance > 0x7FFF_0000 {
                 // Too far — unmap and bail.
                 let _ = self.sys_munmap(MutPtr::<u8>::from_usize(actual_addr), PAGE_SIZE);
@@ -432,8 +435,7 @@ impl<FS: ShimFS> Task<FS> {
                 state.trampoline_cursor += stubs.len();
 
                 // Grow trampoline if needed (allocate more pages).
-                let tramp_pages_needed =
-                    (state.trampoline_cursor + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
+                let tramp_pages_needed = state.trampoline_cursor.div_ceil(PAGE_SIZE) * PAGE_SIZE;
                 let tramp_pages_mapped = if state.trampoline_mapped {
                     PAGE_SIZE
                 } else {
@@ -472,16 +474,17 @@ impl<FS: ShimFS> Task<FS> {
         let ps = self.process_state.borrow();
         let state = ps.elf_patch_cache.lock().remove(&fd);
         drop(ps);
-        if let Some(state) = state {
-            if state.trampoline_mapped && !state.pre_patched {
-                let tramp_len = align_up(state.trampoline_cursor, PAGE_SIZE);
-                if tramp_len > 0 {
-                    let _ = self.sys_mprotect(
-                        MutPtr::<u8>::from_usize(state.trampoline_addr),
-                        tramp_len,
-                        ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
-                    );
-                }
+        if let Some(state) = state
+            && state.trampoline_mapped
+            && !state.pre_patched
+        {
+            let tramp_len = align_up(state.trampoline_cursor, PAGE_SIZE);
+            if tramp_len > 0 {
+                let _ = self.sys_mprotect(
+                    MutPtr::<u8>::from_usize(state.trampoline_addr),
+                    tramp_len,
+                    ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+                );
             }
         }
     }
@@ -699,14 +702,13 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         let suggested_addr = if addr == 0 { None } else { Some(addr) };
-        let result = if flags.contains(MapFlags::MAP_ANONYMOUS) {
+
+        if flags.contains(MapFlags::MAP_ANONYMOUS) {
             self.do_mmap_anonymous(suggested_addr, aligned_len, prot, flags)
         } else {
             self.do_mmap_file(suggested_addr, aligned_len, prot, flags, fd, offset)
         }
-        .map_err(Errno::from);
-
-        result
+        .map_err(Errno::from)
     }
 
     /// Handle syscall `munmap`

@@ -378,17 +378,17 @@ impl<FS: ShimFS> GlobalState<FS> {
             other => {
                 // Apply deferred TCP option now that the descriptor table lock
                 // is released.
-                if let Some(tcp_opt) = deferred_tcp_option {
-                    if let Err(err) = self.net.lock().set_tcp_option(fd, tcp_opt) {
-                        match err {
-                            litebox::net::errors::SetTcpOptionError::InvalidFd => {
-                                return Err(Errno::EBADF);
-                            }
-                            litebox::net::errors::SetTcpOptionError::NotTcpSocket => {
-                                unimplemented!("SO_KEEPALIVE is not supported for non-TCP sockets")
-                            }
-                            _ => unimplemented!(),
+                if let Some(tcp_opt) = deferred_tcp_option
+                    && let Err(err) = self.net.lock().set_tcp_option(fd, tcp_opt)
+                {
+                    match err {
+                        litebox::net::errors::SetTcpOptionError::InvalidFd => {
+                            return Err(Errno::EBADF);
                         }
+                        litebox::net::errors::SetTcpOptionError::NotTcpSocket => {
+                            unimplemented!("SO_KEEPALIVE is not supported for non-TCP sockets")
+                        }
+                        _ => unimplemented!(),
                     }
                 }
                 return other;
@@ -415,9 +415,9 @@ impl<FS: ShimFS> GlobalState<FS> {
                 // We use fixed buffer size for now
                 SocketOption::RCVBUF | SocketOption::SNDBUF => return Err(Errno::EOPNOTSUPP),
                 // Socket does not support these options
-                SocketOption::TYPE | SocketOption::PEERCRED => return Err(Errno::ENOPROTOOPT),
-                // SO_ERROR is read-only
-                SocketOption::ERROR => return Err(Errno::ENOPROTOOPT),
+                SocketOption::TYPE | SocketOption::PEERCRED | SocketOption::ERROR => {
+                    return Err(Errno::ENOPROTOOPT);
+                }
             },
             SocketOptionName::TCP(to) => match to {
                 TcpOption::CONGESTION => {
@@ -1539,6 +1539,7 @@ impl<FS: ShimFS> Task<FS> {
                         core::mem::size_of::<litebox_common_linux::UserMsgHdr<Platform>>();
                     let msg_len_ptr =
                         MutPtr::<u32>::from_usize(mmsg_ptr.as_usize().wrapping_add(msg_len_offset));
+                    #[allow(clippy::cast_possible_truncation)]
                     let _ = msg_len_ptr.write_at_offset(0, bytes_sent as u32);
                     sent_count += 1;
                 }
@@ -2133,13 +2134,13 @@ mod tests {
                 let hdr = litebox_common_linux::UserMsgHdr {
                     msg_name: ConstPtr::from_usize(0),
                     msg_namelen: 0,
-                    _padding1: 0,
+                    padding1: 0,
                     msg_iov: ConstPtr::from_usize(iovec.as_ptr() as usize),
                     msg_iovlen: iovec.len(),
                     msg_control: ConstPtr::from_usize(0),
                     msg_controllen: 0,
                     msg_flags: SendFlags::empty(),
-                    _padding2: 0,
+                    padding2: 0,
                 };
                 assert_eq!(
                     task.do_sendmsg(client_fd, &hdr, SendFlags::empty())

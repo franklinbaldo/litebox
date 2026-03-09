@@ -763,8 +763,7 @@ impl<
                     self.litebox
                         .descriptor_table()
                         .get_entry(fd)
-                        .map(|e| e.entry.position.load(SeqCst))
-                        .unwrap_or(0)
+                        .map_or(0, |e| e.entry.position.load(SeqCst))
                 });
                 self.lower.read(lower_fd, buf, Some(lower_offset))?
             }
@@ -886,8 +885,7 @@ impl<
                             .litebox
                             .descriptor_table()
                             .get_entry(fd)
-                            .map(|e| e.entry.position.load(SeqCst))
-                            .unwrap_or(0);
+                            .map_or(0, |e| e.entry.position.load(SeqCst));
                         let effective_offset = isize::try_from(cur)
                             .ok()
                             .and_then(|c| c.checked_add(offset));
@@ -955,8 +953,7 @@ impl<
                                         .ok_or(TruncateError::ClosedFd)?;
                                     match self.migrate_file_up(&path, false) {
                                         Ok(()) => Ok(()),
-                                        Err(MigrationError::Io) => Err(TruncateError::Io),
-                                        Err(_) => Err(TruncateError::Io),
+                                        Err(MigrationError::Io | _) => Err(TruncateError::Io),
                                     }
                                 }
                                 Err(TruncateError::Io) => Err(TruncateError::Io),

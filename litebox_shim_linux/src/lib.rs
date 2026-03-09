@@ -100,6 +100,17 @@ impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
         ctx: &mut Self::ExecutionContext,
         info: &litebox::shim::ExceptionInfo,
     ) -> ContinueOperation {
+        // CoW fault (vfork snapshotting): check BEFORE kernel-mode page fault
+        // handler, because kernel-mode (shim) code can touch guest pages that
+        // we mprotected for CoW. bit 1 = write access.
+        if info.exception == litebox::shim::Exception::PAGE_FAULT
+            && (info.error_code & 0x2) == 0x2
+            && self
+                .task
+                .try_handle_cow_fault(info.cr2, ctx.rip, (info.error_code & 1) != 0)
+        {
+            return ContinueOperation::Resume;
+        }
         if info.kernel_mode && info.exception == litebox::shim::Exception::PAGE_FAULT {
             if unsafe {
                 self.task
@@ -114,14 +125,6 @@ impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
             } else {
                 return ContinueOperation::Terminate;
             }
-        }
-        // CoW fault: write (error_code bit 1) to a present (bit 0) read-only
-        // page that we protected for vfork snapshotting.
-        if info.exception == litebox::shim::Exception::PAGE_FAULT
-            && (info.error_code & 0x3) == 0x3
-            && self.task.try_handle_cow_fault(info.cr2, ctx.rip as usize)
-        {
-            return ContinueOperation::Resume;
         }
         self.enter_shim(false, ctx, |task, _ctx| task.handle_exception_request(info))
     }
@@ -230,6 +233,9 @@ impl<FS: ShimFS> LinuxShimBuilder<FS> {
             thread_count: core::sync::atomic::AtomicI32::new(1),
             active_cow: litebox::sync::Mutex::new(None),
             elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+            fd_paths: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+            main_bss_start: core::sync::atomic::AtomicUsize::new(0),
+            main_bss_end: core::sync::atomic::AtomicUsize::new(0),
         });
         let global = Arc::new(GlobalState {
             platform: self.platform,
@@ -590,7 +596,12 @@ impl<FS: ShimFS> Task<FS> {
     /// - **Parent thread** (no `fork_context`): log an error if selective CoW
     ///   (parent should not be writing to protected pages), then re-enable
     ///   write to avoid a crash.
-    fn try_handle_cow_fault(&self, fault_addr: usize, fault_rip: usize) -> bool {
+    fn try_handle_cow_fault(
+        &self,
+        fault_addr: usize,
+        fault_rip: usize,
+        page_present: bool,
+    ) -> bool {
         let ps = self.process_state.borrow();
         let cow_lock = ps.active_cow.lock();
         let Some(cow) = cow_lock.as_ref() else {
@@ -623,21 +634,32 @@ impl<FS: ShimFS> Task<FS> {
                 };
             }
 
-            let mut buf = vec![0u8; PAGE_SIZE];
-            // SAFETY: page is mapped (present=1 in error code).
-            unsafe {
-                core::ptr::copy_nonoverlapping(page_addr as *const u8, buf.as_mut_ptr(), PAGE_SIZE);
-            }
+            let buf = if page_present {
+                let mut buf = vec![0u8; PAGE_SIZE];
+                // SAFETY: page is present (mapped), safe to read.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        page_addr as *const u8,
+                        buf.as_mut_ptr(),
+                        PAGE_SIZE,
+                    );
+                }
+                buf
+            } else {
+                // Page not yet in page tables (demand-paged). Content is zeros.
+                vec![0u8; PAGE_SIZE]
+            };
             dirty.push((page_addr, buf));
 
             // SAFETY: restoring the page's original (writable) permissions.
             unsafe { cow_update_permissions(self.global.platform, page_range, orig_perms) }
         } else {
             // Parent thread faulting on a CoW-protected page.
+            #[cfg(debug_assertions)]
             if cow.selective {
                 litebox::log_println!(
                     self.global.platform,
-                    "WARN cow_fault: parent thread hit selective-CoW page \
+                    "cow_fault: parent thread hit selective-CoW page \
                      addr={:#x} rip={:#x} tid={}",
                     fault_addr,
                     fault_rip,
@@ -885,12 +907,12 @@ impl<FS: ShimFS> Task<FS> {
                 // requested indicates EOF.
                 if count <= MAX_KERNEL_BUF_SIZE {
                     let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
-                    let res = self.sys_read(fd, &mut kernel_buf, None).and_then(|size| {
+
+                    self.sys_read(fd, &mut kernel_buf, None).and_then(|size| {
                         buf.copy_from_slice(0, &kernel_buf[..size])
                             .map(|()| size)
                             .ok_or(Errno::EFAULT)
-                    });
-                    res
+                    })
                 } else {
                     // If the read size is too large, we need to do some extra work to avoid OOMing.
                     // We read data in chunks and update the file offset ourselves only if the read succeeds.
@@ -1494,6 +1516,17 @@ struct ProcessState {
     active_cow: litebox::sync::Mutex<Platform, Option<Arc<CowState>>>,
     /// Per-fd ELF patching state for the runtime syscall rewriter.
     elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
+    /// Maps guest fd numbers to the file path used at open time. Populated by
+    /// `sys_open` / `sys_openat`, cleared by `sys_close`. Used by the ELF
+    /// patch cache and selective CoW to identify library data segments.
+    fd_paths:
+        litebox::sync::Mutex<Platform, alloc::collections::BTreeMap<i32, alloc::string::String>>,
+    /// Page-aligned start of the main binary's `.bss` region (zero-filled
+    /// portion of the writable PT_LOAD segment). Set once during ELF loading.
+    main_bss_start: core::sync::atomic::AtomicUsize,
+    /// Page-aligned end of the main binary's `.bss` region. Set once during
+    /// ELF loading.
+    main_bss_end: core::sync::atomic::AtomicUsize,
 }
 
 /// One-shot synchronization primitive for vfork parent blocking.
@@ -1544,6 +1577,7 @@ struct CowState {
     /// Whether this is selective CoW (multi-threaded). If true, parent
     /// threads should NOT be writing to protected pages — a fault from a
     /// parent thread indicates a bug or unexpected behavior.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     selective: bool,
     /// Pages that were CoW-protected (base address, length, original permissions).
     /// For lazy CoW these were made read-only; for eager CoW they were copied.
