@@ -619,12 +619,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             if !old_is_dir && new_is_dir {
                 return Err(RenameError::IsADirectory);
             }
-            if new_is_dir {
-                if let Entry::Dir(d) = new_entry {
-                    if !d.read().children.is_empty() {
-                        return Err(RenameError::NotEmpty);
-                    }
-                }
+            if let Entry::Dir(d) = new_entry
+                && !d.read().children.is_empty()
+            {
+                return Err(RenameError::NotEmpty);
             }
         }
 

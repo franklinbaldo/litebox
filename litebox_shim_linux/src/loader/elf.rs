@@ -235,6 +235,12 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
         };
 
         process_state.pm.set_initial_brk(info.brk);
+        process_state
+            .main_bss_start
+            .store(info.bss_start, core::sync::atomic::Ordering::Relaxed);
+        process_state
+            .main_bss_end
+            .store(info.bss_end, core::sync::atomic::Ordering::Relaxed);
         aux.insert(AuxKey::AT_PAGESZ, PAGE_SIZE);
         aux.insert(AuxKey::AT_PHDR, info.phdrs_addr);
         aux.insert(AuxKey::AT_PHENT, info.phent_size());

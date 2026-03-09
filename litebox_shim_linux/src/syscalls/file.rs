@@ -1437,11 +1437,6 @@ impl<FS: ShimFS> Task<FS> {
                 Ok(0)
             }
             IoctlArg::TIOCGPTN(_) => Err(Errno::ENOTTY),
-            IoctlArg::FIONREAD(ptr) => {
-                // Return 0 bytes available — the read will block as normal.
-                ptr.write_at_offset(0, 0i32).ok_or(Errno::EFAULT)?;
-                Ok(0)
-            }
             _ => todo!(),
         }
     }
@@ -1540,13 +1535,6 @@ impl<FS: ShimFS> Task<FS> {
                     Ok(0)
                 }
             },
-            IoctlArg::FIONREAD(ptr) => {
-                // Return 0 bytes available for all fd types.
-                // For pipes/sockets, a proper implementation would query
-                // the actual buffer, but 0 is safe (caller will just read/poll).
-                ptr.write_at_offset(0, 0i32).ok_or(Errno::EFAULT)?;
-                Ok(0)
-            }
             IoctlArg::TCGETS(..)
             | IoctlArg::TCSETS(..)
             | IoctlArg::TCSETSW(..)

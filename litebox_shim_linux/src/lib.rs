@@ -666,6 +666,7 @@ impl<FS: ShimFS> Task<FS> {
                     self.tid,
                 );
             }
+            let _ = fault_rip;
             // Re-enable write without snapshotting. No tracking needed:
             // dirty_pages only contains child snapshots, and selective CoW
             // ensures parent threads don't collide with child-protected pages.

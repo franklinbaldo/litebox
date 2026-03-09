@@ -674,6 +674,7 @@ impl<FS: ShimFS> Task<FS> {
             && prot.contains(ProtFlags::PROT_WRITE)
             && !flags.contains(MapFlags::MAP_ANONYMOUS)
         {
+            #[cfg(debug_assertions)]
             litebox::log_println!(
                 self.global.platform,
                 "WARN: MAP_SHARED|PROT_WRITE on file-backed mapping downgraded to MAP_PRIVATE"

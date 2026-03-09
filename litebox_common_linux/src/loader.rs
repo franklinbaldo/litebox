@@ -45,6 +45,12 @@ pub struct MappingInfo {
     pub phdrs_addr: usize,
     /// The number of program headers.
     pub num_phdrs: usize,
+    /// Page-aligned start of the zero-filled (`.bss`) portion of the writable
+    /// PT_LOAD segment. Zero if no writable segment has a zero-filled region.
+    pub bss_start: usize,
+    /// Page-aligned end of the zero-filled (`.bss`) portion of the writable
+    /// PT_LOAD segment. Zero if no writable segment has a zero-filled region.
+    pub bss_end: usize,
 }
 
 impl MappingInfo {
@@ -432,6 +438,8 @@ impl ElfParsedFile {
         };
 
         let mut brk = 0;
+        let mut bss_start = 0;
+        let mut bss_end = 0;
         let mut phdrs_addr = 0;
         for ph in self.pt_loads() {
             let p_vaddr: usize = ph.p_vaddr.truncate();
@@ -487,6 +495,13 @@ impl ElfParsedFile {
             // Update the end address of the last PT_LOAD segment.
             brk = brk.max(load_end);
 
+            // Track the .bss region: the zero-filled portion of writable segments
+            // where copy-relocated symbols (e.g., __environ) reside.
+            if prot.write && load_end > file_end {
+                bss_start = file_end;
+                bss_end = load_end;
+            }
+
             // Track the location of the program headers in memory; this is used
             // for `AT_PHDR`.
             if ph.p_offset <= self.header.e_phoff && self.header.e_phoff < ph.p_offset + ph.p_filesz
@@ -502,6 +517,8 @@ impl ElfParsedFile {
             entry_point: base_addr.wrapping_add(self.header.e_entry.truncate()),
             phdrs_addr,
             num_phdrs: self.header.e_phnum.into(),
+            bss_start,
+            bss_end,
         };
 
         if self.trampoline.is_some() {
@@ -581,6 +598,8 @@ impl ElfParsedFile {
             entry_point: 0,
             phdrs_addr: 0,
             num_phdrs: 0,
+            bss_start: 0,
+            bss_end: 0,
         };
         self.load_trampoline(mapper, mem, &mut info)
     }
