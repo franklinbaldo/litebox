@@ -577,11 +577,11 @@ impl<
         // We must check the lower level, creating an entry if needed
         let original_flags = flags;
         let mut flags = flags;
-        // Prevent creation or truncation of files at lower level
-        flags.remove(OFlags::CREAT);
-        flags.remove(OFlags::TRUNC);
         match self.layering_semantics {
             LayeringSemantics::LowerLayerReadOnly => {
+                // Prevent creation or truncation of files at lower level
+                flags.remove(OFlags::CREAT);
+                flags.remove(OFlags::TRUNC);
                 // Switch the lower level to read-only; the other calls will take care of
                 // copying into the upper level if/when necessary.
                 flags.remove(OFlags::RDWR);
@@ -589,10 +589,8 @@ impl<
                 flags.insert(OFlags::RDONLY);
             }
             LayeringSemantics::LowerLayerWritableFiles => {
-                // Do nothing more to the flags, because we might be writing things to lower level.
-                // We just make sure that there is no creation happening, that's all :)
-                assert!(!flags.contains(OFlags::CREAT));
-                assert!(!flags.contains(OFlags::TRUNC));
+                // Preserve O_CREAT so the lower layer can create new files.
+                // O_TRUNC is also preserved — the lower layer handles it directly.
             }
         }
         // Any errors from lower level now _must_ propagate up, so we can just invoke
