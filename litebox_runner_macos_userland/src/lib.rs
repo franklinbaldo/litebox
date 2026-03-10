@@ -1,0 +1,272 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+#![cfg(all(target_os = "macos", target_arch = "aarch64"))]
+
+use anyhow::{Result, anyhow};
+use clap::Parser;
+use litebox::fs::{FileSystem as _, Mode};
+use litebox_platform_multiplex::Platform;
+use memmap2::Mmap;
+use std::path::{Path, PathBuf};
+
+extern crate alloc;
+
+/// Run Linux programs with LiteBox on macOS Apple Silicon
+#[derive(Parser, Debug)]
+pub struct CliArgs {
+    /// The program and arguments passed to it (e.g., `python3 --version`)
+    #[arg(required = true, trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
+    pub program_and_arguments: Vec<String>,
+    /// Environment variables passed to the program (`K=V` pairs; can be invoked multiple times)
+    #[arg(long = "env")]
+    pub environment_variables: Vec<String>,
+    /// Forward the existing environment variables
+    #[arg(long = "forward-env")]
+    pub forward_environment_variables: bool,
+    /// Allow using unstable options
+    #[arg(short = 'Z', long = "unstable")]
+    pub unstable: bool,
+    /// Pre-fill files into the initial file system state
+    #[arg(long = "insert-file", value_hint = clap::ValueHint::FilePath,
+          requires = "unstable", help_heading = "Unstable Options")]
+    pub insert_files: Vec<PathBuf>,
+    /// Pre-fill the files in this tar file into the initial file system state
+    #[arg(long = "initial-files", value_name = "PATH_TO_TAR", value_hint = clap::ValueHint::FilePath,
+          requires = "unstable", help_heading = "Unstable Options")]
+    pub initial_files: Option<PathBuf>,
+    /// Apply syscall-rewriter to the ELF file before running it
+    #[arg(
+        long = "rewrite-syscalls",
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
+    pub rewrite_syscalls: bool,
+}
+
+static REQUIRE_RTLD_AUDIT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+struct MmappedFile {
+    data: &'static [u8],
+    abs_path: PathBuf,
+}
+
+fn mmapped_file(path: impl AsRef<Path>) -> Result<MmappedFile> {
+    let path = path.as_ref();
+    let abs_path = std::path::absolute(path)
+        .map_err(|e| anyhow!("Could not get absolute path for {}: {}", path.display(), e))?;
+    let file = std::fs::File::open(&abs_path)?;
+    let data = Box::leak(Box::new(unsafe { Mmap::map(&file) }.map_err(|e| {
+        anyhow!("Could not read tar file at {}: {}", path.display(), e)
+    })?));
+    Ok(MmappedFile { data, abs_path })
+}
+
+/// Run Linux programs with LiteBox on macOS Apple Silicon.
+pub fn run(cli_args: CliArgs) -> Result<()> {
+    if !cli_args.insert_files.is_empty() {
+        unimplemented!(
+            "this should (hopefully soon) have a nicer interface to support loading in files"
+        )
+    }
+
+    let mut cow_eligible_regions: Vec<MmappedFile> = Vec::new();
+
+    let (ancestor_modes_and_users, prog_data): (
+        Vec<(litebox::fs::Mode, u32)>,
+        alloc::borrow::Cow<'static, [u8]>,
+    ) = {
+        let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
+        let ancestors: Vec<_> = prog.ancestors().collect();
+        let modes: Vec<_> = ancestors
+            .into_iter()
+            .rev()
+            .skip(1)
+            .map(|path| {
+                use std::os::unix::fs::MetadataExt as _;
+                let metadata = path.metadata().unwrap();
+                (
+                    litebox::fs::Mode::from_bits(metadata.mode()).unwrap(),
+                    metadata.uid(),
+                )
+            })
+            .collect();
+        let file = mmapped_file(&prog)?;
+        let data = if cli_args.rewrite_syscalls {
+            REQUIRE_RTLD_AUDIT.store(true, core::sync::atomic::Ordering::SeqCst);
+            litebox_syscall_rewriter::hook_syscalls_in_elf(file.data, None)
+                .unwrap()
+                .into()
+        } else {
+            let data = file.data.into();
+            cow_eligible_regions.push(file);
+            data
+        };
+        (modes, data)
+    };
+    let tar_data: &'static [u8] = if let Some(tar_file) = cli_args.initial_files.as_ref() {
+        if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
+            anyhow::bail!("Expected a .tar file, found {}", tar_file.display());
+        }
+        mmapped_file(tar_file)?.data
+    } else {
+        litebox::fs::tar_ro::EMPTY_TAR_FILE
+    };
+
+    let platform = Platform::new(None);
+
+    for file in cow_eligible_regions {
+        platform.register_cow_region(file.data, file.abs_path);
+    }
+
+    litebox_platform_multiplex::set_platform(platform);
+    let mut shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
+    let litebox = shim_builder.litebox();
+    let initial_file_system = {
+        let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
+        let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
+        let ancestors: Vec<_> = prog.ancestors().collect();
+        let mut prev_user = 0;
+        for (path, &mode_and_user) in ancestors
+            .into_iter()
+            .skip(1)
+            .rev()
+            .skip(1)
+            .zip(&ancestor_modes_and_users)
+        {
+            if prev_user == 0 {
+                in_mem.with_root_privileges(|fs| {
+                    fs.mkdir(path.to_str().unwrap(), mode_and_user.0).unwrap();
+                    if mode_and_user.1 != 0 {
+                        fs.chown(path.to_str().unwrap(), Some(1000), Some(1000))
+                            .unwrap();
+                    }
+                });
+            } else {
+                in_mem
+                    .mkdir(path.to_str().unwrap(), mode_and_user.0)
+                    .unwrap();
+            }
+            prev_user = mode_and_user.1;
+        }
+
+        let open_file =
+            |fs: &mut litebox::fs::in_mem::FileSystem<litebox_platform_multiplex::Platform>,
+             path,
+             mode| {
+                let fd = fs
+                    .open(
+                        path,
+                        litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
+                        mode,
+                    )
+                    .unwrap();
+                fs.initialize_primarily_read_heavy_file(&fd, prog_data.clone());
+                fs.close(&fd).unwrap();
+            };
+        let last = ancestor_modes_and_users.last().unwrap();
+        if prev_user == 0 {
+            in_mem.with_root_privileges(|fs| {
+                open_file(fs, prog.to_str().unwrap(), last.0);
+                if last.1 != 0 {
+                    fs.chown(prog.to_str().unwrap(), Some(1000), Some(1000))
+                        .unwrap();
+                }
+            });
+        } else {
+            open_file(&mut in_mem, prog.to_str().unwrap(), last.0);
+        }
+        in_mem.with_root_privileges(|fs| {
+            let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
+            if let Err(err) = fs.mkdir("/tmp", mode) {
+                match err {
+                    litebox::fs::errors::MkdirError::AlreadyExists => {
+                        fs.chmod("/tmp", mode).expect("Failed to call chmod");
+                    }
+                    _ => panic!(),
+                }
+            }
+        });
+
+        in_mem.with_root_privileges(|fs| {
+            let rwxr_xr_x = Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH;
+            let _ = fs.mkdir("/lib", rwxr_xr_x);
+            let fd = fs
+                .open(
+                    "/lib/litebox_rtld_audit.so",
+                    litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
+                    rwxr_xr_x,
+                )
+                .expect("Failed to create /lib/litebox_rtld_audit.so");
+            fs.initialize_primarily_read_heavy_file(
+                &fd,
+                include_bytes!(concat!(env!("OUT_DIR"), "/litebox_rtld_audit.so")).into(),
+            );
+            fs.close(&fd)
+                .expect("Failed to close /lib/litebox_rtld_audit.so");
+        });
+
+        let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
+        shim_builder.default_fs(in_mem, tar_ro)
+    };
+
+    let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
+    let prog_path = prog.to_str().ok_or_else(|| {
+        anyhow!(
+            "Could not convert program path {:?} to a string",
+            cli_args.program_and_arguments[0]
+        )
+    })?;
+
+    shim_builder.set_fs(initial_file_system);
+    shim_builder.set_load_filter(fixup_env);
+    let shim = shim_builder.build();
+
+    let argv = cli_args
+        .program_and_arguments
+        .iter()
+        .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
+        .collect();
+    let envp: Vec<_> = cli_args
+        .environment_variables
+        .iter()
+        .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
+        .collect();
+    let envp = if cli_args.forward_environment_variables {
+        envp.into_iter()
+            .chain(std::env::vars().map(|(k, v)| {
+                std::ffi::CString::new(
+                    k.bytes()
+                        .chain([b'='])
+                        .chain(v.bytes())
+                        .collect::<Vec<u8>>(),
+                )
+                .unwrap()
+            }))
+            .collect()
+    } else {
+        envp
+    };
+
+    let program = shim.load_program(platform.init_task(), prog_path, argv, envp)?;
+
+    unsafe {
+        litebox_platform_macos_userland::run_thread(
+            program.entrypoints,
+            &mut litebox_common_linux::PtRegs::default(),
+        );
+    }
+
+    std::process::exit(program.process.wait())
+}
+
+fn fixup_env(envp: &mut Vec<alloc::ffi::CString>) {
+    if REQUIRE_RTLD_AUDIT.load(core::sync::atomic::Ordering::SeqCst) {
+        let p = c"LD_AUDIT=/lib/litebox_rtld_audit.so";
+        let has_ld_audit = envp.iter().any(|var| var.as_c_str() == p);
+        if !has_ld_audit {
+            envp.push(p.into());
+        }
+    }
+}
