@@ -418,8 +418,11 @@ unsafe extern "C-unwind" fn run_thread_arch(
     //   x0-x15, x19-x29 = guest register values
     //   (x16, x17 were clobbered by trampoline; originals on guest stack)
     // ================================================================
+    .cfi_endproc
+
     .globl syscall_callback
 syscall_callback:
+    .cfi_startproc
     // Clear in_guest flag. Must be first instruction to match the
     // expectations of interrupt_signal_handler.
     strb wzr, [x18, #32]
@@ -495,8 +498,10 @@ syscall_callback:
     bl {syscall_handler}
     // If syscall_handler returns, the thread is done.
     b .Ldone_aarch64
+    .cfi_endproc
 
 exception_callback:
+    .cfi_startproc
     // Restore host stack.
     mrs x18, tpidr_el0
     ldr x9, [x18, #8]
@@ -505,8 +510,10 @@ exception_callback:
     ldr x0, [sp]                  // thread_ctx
     bl {exception_handler}
     b .Ldone_aarch64
+    .cfi_endproc
 
 interrupt_callback:
+    .cfi_startproc
     // Restore host stack.
     mrs x18, tpidr_el0
     ldr x9, [x18, #8]
