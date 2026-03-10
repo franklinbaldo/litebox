@@ -659,6 +659,11 @@ pub trait StdioProvider {
     fn poll_stdin_readable(&self) -> bool {
         false
     }
+
+    /// Cancel any pending `read_from_stdin()` call, causing it to return
+    /// [`StdioReadError::Closed`]. Used during process exit to unblock
+    /// threads waiting on stdin. The default is a no-op.
+    fn cancel_stdin(&self) {}
 }
 
 /// A provider for system information.

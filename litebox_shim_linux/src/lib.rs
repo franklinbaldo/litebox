@@ -864,6 +864,7 @@ impl<FS: ShimFS> Task<FS> {
             Ok(v) => v,
             Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
         };
+
         #[cfg(target_arch = "x86")]
         {
             ctx.eax = return_value;

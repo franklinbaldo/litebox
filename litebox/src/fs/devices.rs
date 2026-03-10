@@ -594,13 +594,10 @@ impl<
         }
         // Stdin is a stream device — offsets are meaningless. Ignore any
         // explicit offset (the layered FS may supply one for concurrency safety).
-        self.litebox
-            .x
-            .platform
-            .read_from_stdin(buf)
-            .map_err(|e| match e {
-                StdioReadError::Closed => unimplemented!(),
-            })
+        match self.litebox.x.platform.read_from_stdin(buf) {
+            Ok(n) => Ok(n),
+            Err(StdioReadError::Closed) => Ok(0), // EOF — terminal disconnected
+        }
     }
 
     fn write(

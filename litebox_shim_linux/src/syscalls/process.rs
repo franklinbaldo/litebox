@@ -251,7 +251,9 @@ impl<FS: ShimFS> Task<FS> {
         assert!(!inner.group_exit);
         inner.exit_status = status;
         inner.group_exit = true;
-        for thread in inner.threads.values() {
+        // Cancel blocking stdin reads so threads in host syscalls can exit.
+        self.global.platform.cancel_stdin();
+        for (&_tid, thread) in &inner.threads {
             thread.is_exiting.store(true, Ordering::Relaxed);
             thread.interrupt();
         }
@@ -267,6 +269,8 @@ impl<FS: ShimFS> Task<FS> {
             if self.is_exiting() {
                 return false;
             }
+            // Cancel blocking stdin reads so threads in host syscalls can exit.
+            self.global.platform.cancel_stdin();
             for (&tid, thread) in &inner.threads {
                 if tid == self.tid {
                     continue;
@@ -278,6 +282,7 @@ impl<FS: ShimFS> Task<FS> {
             inner.is_killing_other_threads = true;
         }
         // Wait for other threads to exit.
+        let mut iter = 0u32;
         loop {
             let n = self
                 .thread
@@ -287,6 +292,16 @@ impl<FS: ShimFS> Task<FS> {
                 .load(Ordering::Acquire);
             if n == 1 {
                 break;
+            }
+            iter += 1;
+            if iter % 1000 == 0 {
+                litebox::log_println!(
+                    self.global.platform,
+                    "kill_other_threads: tid={} waiting, nr_threads={} iter={}",
+                    self.tid,
+                    n,
+                    iter,
+                );
             }
             let _ = self.thread.process.nr_threads.block(n);
         }

@@ -128,6 +128,8 @@ pub struct LinuxUserland {
     /// VA partition allocator for multi-process support (x86_64 only).
     #[cfg(target_arch = "x86_64")]
     partitions: std::sync::Mutex<PartitionState>,
+    /// When set, pending `read_from_stdin()` calls return EOF instead of blocking.
+    stdin_cancelled: std::sync::atomic::AtomicBool,
 }
 
 impl core::fmt::Debug for LinuxUserland {
@@ -452,8 +454,16 @@ impl LinuxUserland {
             cow_regions: std::sync::RwLock::new(std::collections::BTreeMap::new()),
             #[cfg(target_arch = "x86_64")]
             partitions: std::sync::Mutex::new(PartitionState::new()),
+            stdin_cancelled: std::sync::atomic::AtomicBool::new(false),
         };
         Box::leak(Box::new(platform))
+    }
+
+    /// Cancel any pending `read_from_stdin()` call, causing it to return EOF.
+    /// Called when the guest process is exiting to unblock threads waiting on stdin.
+    pub fn cancel_stdin(&self) {
+        self.stdin_cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Register a CoW-eligible memory region backed by a file.
@@ -2091,20 +2101,68 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
 
 impl litebox::platform::StdioProvider for LinuxUserland {
     fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
-        unsafe {
-            syscalls::syscall4(
-                syscalls::Sysno::read,
-                usize::try_from(litebox_common_linux::STDIN_FILENO).unwrap(),
-                buf.as_ptr() as usize,
-                buf.len(),
-                // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::SYSCALL_ARG_MAGIC,
-            )
+        // Use poll() with a timeout instead of a blocking read, so we can
+        // check the cancel flag periodically. This allows the process to exit
+        // cleanly when exit_group or SIGINT is received while a thread is
+        // blocking on stdin.
+        loop {
+            if self
+                .stdin_cancelled
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(litebox::platform::StdioReadError::Closed);
+            }
+
+            let mut pfd = libc::pollfd {
+                fd: litebox_common_linux::STDIN_FILENO,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: poll with a valid pollfd struct and 500ms timeout.
+            let ret = unsafe { libc::poll(core::ptr::from_mut(&mut pfd), 1, 500) };
+
+            if self
+                .stdin_cancelled
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(litebox::platform::StdioReadError::Closed);
+            }
+
+            if ret < 0 {
+                let errno = unsafe { *libc::__errno_location() };
+                if errno == libc::EINTR {
+                    continue;
+                }
+                return Err(litebox::platform::StdioReadError::Closed);
+            }
+
+            if ret == 0 {
+                // Timeout — no data, loop to check cancel flag.
+                continue;
+            }
+
+            if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                return Err(litebox::platform::StdioReadError::Closed);
+            }
+
+            if pfd.revents & libc::POLLIN != 0 {
+                return unsafe {
+                    syscalls::syscall4(
+                        syscalls::Sysno::read,
+                        usize::try_from(litebox_common_linux::STDIN_FILENO).unwrap(),
+                        buf.as_ptr() as usize,
+                        buf.len(),
+                        syscall_intercept::SYSCALL_ARG_MAGIC,
+                    )
+                }
+                .map_err(|err| match err {
+                    syscalls::Errno::EPIPE | syscalls::Errno::EIO => {
+                        litebox::platform::StdioReadError::Closed
+                    }
+                    _ => panic!("unhandled error {err}"),
+                });
+            }
         }
-        .map_err(|err| match err {
-            syscalls::Errno::EPIPE => litebox::platform::StdioReadError::Closed,
-            _ => panic!("unhandled error {err}"),
-        })
     }
 
     fn write_to(
@@ -2192,6 +2250,10 @@ impl litebox::platform::StdioProvider for LinuxUserland {
         // SAFETY: poll with timeout=0 is a non-blocking check.
         let ret = unsafe { libc::poll(core::ptr::from_mut(&mut pfd), 1, 0) };
         ret > 0 && (pfd.revents & libc::POLLIN) != 0
+    }
+
+    fn cancel_stdin(&self) {
+        self.cancel_stdin();
     }
 }
 
