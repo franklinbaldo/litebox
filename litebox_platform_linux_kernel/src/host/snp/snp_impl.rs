@@ -270,12 +270,8 @@ impl litebox::platform::ThreadProvider for SnpLinuxKernel {
 }
 
 impl litebox::platform::TimerProvider for SnpLinuxKernel {
-    type TimerHandle = litebox::platform::trivial_providers::StubTimerHandle;
+    type TimerHandle = litebox::platform::trivial_providers::UnsupportedTimerHandle;
     type Signal = litebox_common_linux::signal::Signal;
-
-    fn create_timer(&self, _signal: Self::Signal) -> Self::TimerHandle {
-        todo!("TimerProvider not yet implemented for SnpLinuxKernel")
-    }
 }
 
 impl bindings::SnpVmplRequestArgs {

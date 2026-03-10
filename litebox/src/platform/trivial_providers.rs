@@ -11,16 +11,16 @@ use super::{
     RawMutPointer, TimerHandle,
 };
 
-/// A [`TimerHandle`] stub for platforms that have not yet implemented
-/// [`super::TimerProvider`]. All methods panic with `todo!()`.
-pub struct StubTimerHandle(());
+use zerocopy::{FromBytes, IntoBytes};
 
-impl TimerHandle for StubTimerHandle {
+/// A [`TimerHandle`] for [`super::TimerProvider`].
+pub enum UnsupportedTimerHandle {}
+
+impl TimerHandle for UnsupportedTimerHandle {
     fn set_timer(&self, _duration: core::time::Duration) {
-        todo!("TimerProvider not yet implemented for this platform")
+        unreachable!("TimerProvider is not supported for this platform");
     }
 }
-use zerocopy::{FromBytes, IntoBytes};
 
 /// A trivial provider, useful when no punchthrough is necessary.
 pub struct ImpossiblePunchthroughProvider {}

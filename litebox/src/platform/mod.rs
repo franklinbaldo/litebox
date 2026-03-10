@@ -112,32 +112,39 @@ pub trait ThreadProvider: RawPointerProvider {
     }
 }
 
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum TimerCreationError {
+    #[error("The platform does not support timers at all.")]
+    Unsupported,
+}
+
 /// Timer support for proactive signal delivery.
-///
-/// Platforms that support this should set [`SUPPORTS_TIMER`](Self::SUPPORTS_TIMER)
-/// to `true`.
 pub trait TimerProvider {
     /// The platform-specific timer handle type.
     type TimerHandle: TimerHandle;
     type Signal;
 
-    /// Whether this platform supports [`TimerProvider`] for proactive timer delivery.
-    const SUPPORTS_TIMER: bool = false;
-
     /// Create a new one-shot timer that delivers `signal` when it fires.
-    fn create_timer(&self, signal: Self::Signal) -> Self::TimerHandle;
+    ///
+    /// By default, this returns an error indicating that timers are not supported.
+    /// Platforms that support it should overwrite this.
+    #[expect(unused_variables, reason = "returns an error by default")]
+    fn create_timer(&self, signal: Self::Signal) -> Result<Self::TimerHandle, TimerCreationError> {
+        Err(TimerCreationError::Unsupported)
+    }
 }
 
 /// A handle to a platform timer created by [`TimerProvider::create_timer`].
-///
-/// Dropping the handle **must** cancel any pending timer and ensure that the
-/// associated callback will not fire after the drop returns.
-pub trait TimerHandle {
+pub trait TimerHandle: Sized {
     /// Arm (or re-arm) the timer to fire after `duration` elapses.
     ///
     /// If the timer is already armed, the previous deadline is replaced.
     /// A zero duration cancels the timer without firing.
     fn set_timer(&self, duration: core::time::Duration);
+
+    /// Delete the timer.
+    fn delete_timer(self) {}
 }
 
 /// Provider for consuming platform-originating signals.
