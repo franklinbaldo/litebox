@@ -1104,6 +1104,14 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         _populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
+        eprintln!(
+            "[macos-platform] allocate_pages: range={:#x}..{:#x} (len={:#x}), behavior={:?}, perms={:?}",
+            suggested_range.start,
+            suggested_range.end,
+            suggested_range.len(),
+            fixed_address_behavior,
+            initial_permissions,
+        );
         // Round the range to HOST_PAGE_SIZE boundaries for MAP_FIXED operations.
         // macOS arm64 requires 16KB-aligned addresses for all VM operations.
         // For Hint, we pass the suggested address as-is; the kernel will pick
@@ -1116,12 +1124,18 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 (aligned_start, aligned_end - aligned_start)
             }
         };
+        eprintln!(
+            "[macos-platform]   rounded: start={:#x}, len={:#x}",
+            mmap_start, mmap_len,
+        );
 
         // Emulate MAP_FIXED_NOREPLACE on macOS: probe that the range is free, then
         // use MAP_FIXED to guarantee the exact address. macOS does not honor mmap
         // address hints reliably, so a hint-only approach would spuriously fail.
         if matches!(fixed_address_behavior, FixedAddressBehavior::NoReplace) {
-            if !is_range_unmapped(mmap_start, mmap_len) {
+            let unmapped = is_range_unmapped(mmap_start, mmap_len);
+            eprintln!("[macos-platform]   NoReplace probe: is_range_unmapped={unmapped}",);
+            if !unmapped {
                 return Err(litebox::platform::page_mgmt::AllocationError::AddressInUse);
             }
         }
@@ -1153,11 +1167,18 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         };
         if r == libc::MAP_FAILED {
             let err = std::io::Error::last_os_error();
+            eprintln!(
+                "[macos-platform]   mmap FAILED: {err} (start={:#x}, len={:#x}, flags={:#x})",
+                mmap_start,
+                mmap_len,
+                macos_mmap_flags(linux_flags),
+            );
             return Err(match err.raw_os_error() {
                 Some(libc::ENOMEM) => litebox::platform::page_mgmt::AllocationError::OutOfMemory,
                 _ => panic!("unhandled mmap error {err}"),
             });
         }
+        eprintln!("[macos-platform]   mmap OK: returned {:#x}", r as usize,);
         // Return the original suggested start address (4KB-aligned) so the VMem
         // layer's bookkeeping is consistent, even though the kernel mapped a wider
         // 16KB-aligned region.
@@ -1180,6 +1201,18 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         // deallocated or replaced by a subsequent MAP_FIXED mmap.
         let aligned_start = host_page_align_up(range.start);
         let aligned_end = host_page_align_down(range.end);
+        eprintln!(
+            "[macos-platform] deallocate_pages: range={:#x}..{:#x}, rounded={:#x}..{:#x}, {}",
+            range.start,
+            range.end,
+            aligned_start,
+            aligned_end,
+            if aligned_start < aligned_end {
+                "munmap"
+            } else {
+                "SKIPPED"
+            },
+        );
         if aligned_start < aligned_end {
             let r = unsafe {
                 libc::munmap(
