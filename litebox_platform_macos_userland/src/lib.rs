@@ -1433,7 +1433,16 @@ unsafe extern "C" {
 }
 
 unsafe extern "C-unwind" fn init_handler(thread_ctx: &mut ThreadContext) {
-    thread_ctx.call_shim(|shim, ctx| shim.init(ctx));
+    eprintln!("[diag] init_handler: entering shim.init()");
+    thread_ctx.call_shim(|shim, ctx| {
+        eprintln!("[diag]   shim.init() calling...");
+        let op = shim.init(ctx);
+        eprintln!(
+            "[diag]   shim.init() returned: {:?}",
+            matches!(op, ContinueOperation::Resume)
+        );
+        op
+    });
 }
 
 unsafe extern "C-unwind" fn reenter_handler(thread_ctx: &mut ThreadContext) {
@@ -1456,6 +1465,10 @@ unsafe extern "C-unwind" fn reenter_handler(thread_ctx: &mut ThreadContext) {
 /// purposes.
 #[allow(clippy::cast_sign_loss)]
 unsafe extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext) {
+    eprintln!(
+        "[diag] syscall_handler: pc={:#x}, x8(sysno)={:#x}",
+        thread_ctx.ctx.pc, thread_ctx.ctx.regs[8]
+    );
     thread_ctx.call_shim(|shim, ctx| shim.syscall(ctx));
 }
 
@@ -1549,6 +1562,10 @@ impl ThreadContext<'_> {
         match op {
             ContinueOperation::Resume => {
                 update_host_tls_entry();
+                eprintln!(
+                    "[diag] call_shim: switching to guest, pc={:#x}, sp={:#x}",
+                    self.ctx.pc, self.ctx.sp
+                );
                 unsafe { switch_to_guest(self.ctx) }
             }
             ContinueOperation::Terminate => {}
@@ -1801,8 +1818,10 @@ fn signal_handler_exit_guest(
         let mut current_ss: libc::stack_t = core::mem::zeroed();
         let ret = libc::sigaltstack(std::ptr::null(), &raw mut current_ss);
         if ret != 0 || current_ss.ss_flags & libc::SS_ONSTACK == 0 {
-            // Not on our alt-stack (or syscall failed). Return None without
-            // touching any SP-derived addresses.
+            eprintln!(
+                "[diag] signal_handler_exit_guest: NOT on alt-stack (ret={ret}, flags={:#x})",
+                current_ss.ss_flags
+            );
             return None;
         }
 
@@ -1902,9 +1921,14 @@ unsafe extern "C" fn exception_signal_handler(
     info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
+    let pc = unsafe { (*context.uc_mcontext).__ss.__pc };
+    let far = unsafe { (*context.uc_mcontext).__es.__far };
+    eprintln!("[diag] exception_signal_handler: signum={signum}, pc={pc:#x}, far={far:#x}");
     let Some(regs) = signal_handler_exit_guest(context, false) else {
+        eprintln!("[diag]   -> not in guest, forwarding to next_signal_handler");
         return unsafe { next_signal_handler(signum, info, context) };
     };
+    eprintln!("[diag]   -> was in guest, copying context and jumping to exception_callback");
     copy_signal_context(unsafe { &mut *regs }, context);
 
     // Ensure that `run_thread_arch` is linked in so that `exception_callback` is visible.
@@ -1930,6 +1954,8 @@ unsafe fn next_signal_handler(
     info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
+    let pc = unsafe { (*context.uc_mcontext).__ss.__pc };
+    eprintln!("[diag] next_signal_handler: signum={signum}, pc={pc:#x}");
     if signum == libc::SIGSEGV {
         #[allow(clippy::cast_possible_truncation)]
         let ip: usize = unsafe { (*context.uc_mcontext).__ss.__pc as usize };
