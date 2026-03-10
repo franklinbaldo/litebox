@@ -95,9 +95,8 @@ impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::TxToken for TxToken<
     {
         let packet = &mut self.buffer[..len];
         let res = f(packet);
-        self.platform
-            .send_ip_packet(packet)
-            .expect("Sending IP packet failed");
+        // Drop the packet silently on send error — network protocols handle loss via retries.
+        let _ = self.platform.send_ip_packet(packet);
         res
     }
 }

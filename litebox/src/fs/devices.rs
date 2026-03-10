@@ -4,11 +4,18 @@
 //! Device provider for LiteBox including:
 //! 1. Standard input/output devices.
 //! 2. /dev/null device.
+//! 3. Pseudo-terminal (PTY) devices (/dev/ptmx, /dev/pts/*).
 
+use alloc::collections::VecDeque;
 use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
+use alloc::sync::Weak;
 
 use crate::{
     LiteBox,
+    event::{Events, IOPollable, observer::Observer, polling::Pollee},
     fs::{
         FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
         errors::{
@@ -18,7 +25,7 @@ use crate::{
         },
     },
     path::Arg,
-    platform::{StdioOutStream, StdioReadError, StdioWriteError},
+    platform::{StdioOutStream, StdioReadError, StdioWriteError, TimeProvider},
 };
 
 /// Block size for stdio devices
@@ -28,17 +35,18 @@ const NULL_BLOCK_SIZE: usize = 0x1000;
 /// Block size for /dev/urandom
 const URANDOM_BLOCK_SIZE: usize = 0x1000;
 
-/// Constant node information for all 3 stdio devices:
-/// ```console
-/// $ stat -L --format 'name=%-11n dev=%d ino=%i rdev=%r' /dev/stdin /dev/stdout /dev/stderr
-/// name=/dev/stdin  dev=64 ino=9 rdev=34822
-/// name=/dev/stdout dev=64 ino=9 rdev=34822
-/// name=/dev/stderr dev=64 ino=9 rdev=34822
-/// ```
+/// Constant node information for all 3 stdio devices.
+///
+/// We use rdev major=5, minor=0 (same as `/dev/tty` on Linux) rather than a
+/// PTY-slave rdev (major=136) to prevent callers from mistakenly treating
+/// the stdio stream as a PTY master (e.g., `TIOCGPTN` should fail on these).
 const STDIO_NODE_INFO: NodeInfo = NodeInfo {
     dev: 64,
     ino: 9,
-    rdev: core::num::NonZeroUsize::new(34822),
+    // major=5, minor=0 — matches /dev/tty (character device, terminal).
+    // The runner's stdin/stdout/stderr are typically PTY slave FDs inherited
+    // from the host shell, so reporting them as a terminal is correct.
+    rdev: core::num::NonZeroUsize::new(0x500),
 };
 /// Node info for /dev/null
 const NULL_NODE_INFO: NodeInfo = NodeInfo {
@@ -54,6 +62,128 @@ const URANDOM_NODE_INFO: NodeInfo = NodeInfo {
     // major=1, minor=9
     rdev: core::num::NonZeroUsize::new(0x109),
 };
+/// Node info for /dev/ptmx
+const PTMX_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 2,
+    // major=5, minor=2
+    rdev: core::num::NonZeroUsize::new(0x502),
+};
+
+/// Shared state for a single PTY pair (master ↔ slave).
+pub struct PtyPair<Platform: crate::sync::RawSyncPrimitivesProvider + TimeProvider> {
+    /// Data written to master, read by slave (input to the child process).
+    pub master_to_slave: crate::sync::Mutex<Platform, VecDeque<u8>>,
+    /// Data written to slave, read by master (output from the child process).
+    pub slave_to_master: crate::sync::Mutex<Platform, VecDeque<u8>>,
+    /// Whether the slave side has been unlocked via TIOCSPTLK.
+    pub unlocked: core::sync::atomic::AtomicBool,
+    /// Whether the slave side is open (used for EOF detection).
+    pub slave_open: core::sync::atomic::AtomicBool,
+    /// Whether the master side is open (used for EIO on slave reads).
+    pub master_open: core::sync::atomic::AtomicBool,
+    /// Pollee for notifying epoll when data is available for master reads.
+    pub master_pollee: Pollee<Platform>,
+    /// Pollee for notifying poll/select when data is available for slave reads.
+    pub slave_pollee: Pollee<Platform>,
+}
+
+/// Wrapper for polling the master side of a PTY pair.
+///
+/// Implements `IOPollable` so that epoll can monitor the PTY master fd
+/// for readability (data written by slave) and writability.
+pub struct PtyMasterPollable<Platform: crate::sync::RawSyncPrimitivesProvider + TimeProvider>(
+    pub Arc<PtyPair<Platform>>,
+);
+
+impl<Platform: crate::sync::RawSyncPrimitivesProvider + TimeProvider> IOPollable
+    for PtyMasterPollable<Platform>
+{
+    fn register_observer(&self, observer: Weak<dyn Observer<Events>>, mask: Events) {
+        self.0.master_pollee.register_observer(observer, mask);
+    }
+
+    fn check_io_events(&self) -> Events {
+        let mut events = Events::OUT; // master is always writable
+        if !self.0.slave_to_master.lock().is_empty() {
+            events |= Events::IN;
+        }
+        if !self
+            .0
+            .slave_open
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            events |= Events::HUP;
+        }
+        events
+    }
+}
+
+/// Wrapper for polling the slave side of a PTY pair.
+///
+/// Implements `IOPollable` so that poll/select can monitor the PTY slave fd
+/// for readability (data written by master) and writability.
+pub struct PtySlavePollable<Platform: crate::sync::RawSyncPrimitivesProvider + TimeProvider>(
+    pub Arc<PtyPair<Platform>>,
+);
+
+impl<Platform: crate::sync::RawSyncPrimitivesProvider + TimeProvider> IOPollable
+    for PtySlavePollable<Platform>
+{
+    fn register_observer(&self, observer: Weak<dyn Observer<Events>>, mask: Events) {
+        self.0.slave_pollee.register_observer(observer, mask);
+    }
+
+    fn check_io_events(&self) -> Events {
+        let mut events = Events::OUT; // slave is always writable
+        if !self.0.master_to_slave.lock().is_empty() {
+            events |= Events::IN;
+        }
+        if !self
+            .0
+            .master_open
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            events |= Events::HUP;
+        }
+        events
+    }
+}
+
+/// Manages all allocated PTY pairs.
+pub struct PtyManager<Platform: crate::sync::RawSyncPrimitivesProvider + TimeProvider> {
+    pairs: crate::sync::Mutex<Platform, Vec<Arc<PtyPair<Platform>>>>,
+}
+
+impl<Platform: crate::sync::RawSyncPrimitivesProvider + TimeProvider> PtyManager<Platform> {
+    fn new() -> Self {
+        Self {
+            pairs: crate::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Allocate a new PTY pair, returning its index.
+    fn alloc(&self) -> u32 {
+        let mut pairs = self.pairs.lock();
+        let idx = u32::try_from(pairs.len()).expect("PTY index overflow");
+        pairs.push(Arc::new(PtyPair {
+            master_to_slave: crate::sync::Mutex::new(VecDeque::new()),
+            slave_to_master: crate::sync::Mutex::new(VecDeque::new()),
+            unlocked: true.into(),
+            slave_open: false.into(),
+            master_open: true.into(),
+            master_pollee: Pollee::new(),
+            slave_pollee: Pollee::new(),
+        }));
+        idx
+    }
+
+    /// Get the PTY pair at `idx`.
+    pub fn get(&self, idx: u32) -> Option<Arc<PtyPair<Platform>>> {
+        self.pairs.lock().get(idx as usize).cloned()
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Device {
     Stdin,
@@ -61,21 +191,32 @@ enum Device {
     Stderr,
     Null,
     URandom,
+    /// Master side of PTY pair (index into PtyManager).
+    PtyMaster(u32),
+    /// Slave side of PTY pair (index into PtyManager).
+    PtySlave(u32),
 }
 
 /// A backing implementation for [`FileSystem`](super::FileSystem).
 ///
-/// This provider provides only `/dev/stdin`, `/dev/stdout`, and `/dev/stderr`.
+/// This provider provides `/dev/stdin`, `/dev/stdout`, `/dev/stderr`,
+/// `/dev/null`, `/dev/urandom`, and pseudo-terminal devices (`/dev/ptmx`,
+/// `/dev/pts/*`).
 pub struct FileSystem<
-    Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioProvider + 'static,
+    Platform: crate::sync::RawSyncPrimitivesProvider
+        + crate::platform::StdioProvider
+        + TimeProvider
+        + 'static,
 > {
     litebox: LiteBox<Platform>,
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
+    pty_manager: PtyManager<Platform>,
 }
 
-impl<Platform: crate::platform::StdioProvider + crate::sync::RawSyncPrimitivesProvider>
-    FileSystem<Platform>
+impl<
+    Platform: crate::platform::StdioProvider + crate::sync::RawSyncPrimitivesProvider + TimeProvider,
+> FileSystem<Platform>
 {
     /// Construct a new `FileSystem` instance
     ///
@@ -87,17 +228,42 @@ impl<Platform: crate::platform::StdioProvider + crate::sync::RawSyncPrimitivesPr
         Self {
             litebox: litebox.clone(),
             current_working_dir: "/".into(),
+            pty_manager: PtyManager::new(),
+        }
+    }
+
+    /// Get the PTY pair for a PTY device FD.
+    ///
+    /// Returns `(pair, pty_number, is_master)` if the FD refers to a PTY device.
+    pub fn get_pty_info(
+        &self,
+        fd: &FileFd<Platform>,
+    ) -> Option<(Arc<PtyPair<Platform>>, u32, bool)> {
+        let table = self.litebox.descriptor_table();
+        let entry = table.get_entry(fd)?;
+        match entry.entry {
+            Device::PtyMaster(idx) => {
+                let pair = self.pty_manager.get(idx)?;
+                Some((pair, idx, true))
+            }
+            Device::PtySlave(idx) => {
+                let pair = self.pty_manager.get(idx)?;
+                Some((pair, idx, false))
+            }
+            _ => None,
         }
     }
 }
 
-impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioProvider>
-    super::private::Sealed for FileSystem<Platform>
+impl<
+    Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioProvider + TimeProvider,
+> super::private::Sealed for FileSystem<Platform>
 {
 }
 
-impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioProvider>
-    FileSystem<Platform>
+impl<
+    Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioProvider + TimeProvider,
+> FileSystem<Platform>
 {
     // Gives the absolute path for `path`, resolving any `.` or `..`s, and making sure to account
     // for any relative paths from current working directory.
@@ -141,14 +307,42 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
                 node_info: URANDOM_NODE_INFO,
                 blksize: URANDOM_BLOCK_SIZE,
             },
+            Device::PtyMaster(n) | Device::PtySlave(n) => FileStatus {
+                file_type: FileType::CharacterDevice,
+                mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP,
+                size: 0,
+                owner: UserInfo::ROOT,
+                node_info: NodeInfo {
+                    dev: 5,
+                    // major=136, minor=n (Linux pts convention)
+                    ino: (n + 3) as usize,
+                    rdev: core::num::NonZeroUsize::new(0x8800 + n as usize),
+                },
+                blksize: STDIO_BLOCK_SIZE,
+            },
         }
+    }
+
+    /// Returns the PTY pair index if the given FD is a PTY master, or `None` otherwise.
+    pub fn get_pty_master_index(&self, fd: &FileFd<Platform>) -> Option<u32> {
+        let table = self.litebox.descriptor_table();
+        match table.get_entry(fd)?.entry {
+            Device::PtyMaster(idx) => Some(idx),
+            _ => None,
+        }
+    }
+
+    /// Returns a reference to the PTY manager for performing PTY operations.
+    pub fn pty_manager(&self) -> &PtyManager<Platform> {
+        &self.pty_manager
     }
 }
 
 impl<
     Platform: crate::sync::RawSyncPrimitivesProvider
         + crate::platform::StdioProvider
-        + crate::platform::CrngProvider,
+        + crate::platform::CrngProvider
+        + TimeProvider,
 > super::FileSystem for FileSystem<Platform>
 {
     fn open(
@@ -190,6 +384,26 @@ impl<
             }
             "/dev/null" => Device::Null,
             "/dev/urandom" => Device::URandom,
+            "/dev/ptmx" => {
+                let idx = self.pty_manager.alloc();
+                Device::PtyMaster(idx)
+            }
+            p if p.starts_with("/dev/pts/") => {
+                let num_str = &p["/dev/pts/".len()..];
+                let idx: u32 = num_str
+                    .parse()
+                    .map_err(|_| OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+                let pair = self
+                    .pty_manager
+                    .get(idx)
+                    .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+                if !pair.unlocked.load(core::sync::atomic::Ordering::Acquire) {
+                    return Err(OpenError::AccessNotAllowed);
+                }
+                pair.slave_open
+                    .store(true, core::sync::atomic::Ordering::Release);
+                Device::PtySlave(idx)
+            }
             _ => return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory)),
         };
         if open_directory {
@@ -216,6 +430,23 @@ impl<
     }
 
     fn close(&self, fd: &FileFd<Platform>) -> Result<(), CloseError> {
+        if let Some(entry) = self.litebox.descriptor_table().get_entry(fd) {
+            match entry.entry {
+                Device::PtyMaster(idx) => {
+                    if let Some(pair) = self.pty_manager.get(idx) {
+                        pair.master_open
+                            .store(false, core::sync::atomic::Ordering::Release);
+                    }
+                }
+                Device::PtySlave(idx) => {
+                    if let Some(pair) = self.pty_manager.get(idx) {
+                        pair.slave_open
+                            .store(false, core::sync::atomic::Ordering::Release);
+                    }
+                }
+                _ => {}
+            }
+        }
         self.litebox.descriptor_table_mut().remove(fd);
         Ok(())
     }
@@ -244,6 +475,46 @@ impl<
             Device::URandom => {
                 self.litebox.x.platform.fill_bytes_crng(buf);
                 return Ok(buf.len());
+            }
+            &Device::PtyMaster(idx) => {
+                // Master reads what the slave has written
+                let pair = self.pty_manager.get(idx).ok_or(ReadError::ClosedFd)?;
+                let mut ring = pair.slave_to_master.lock();
+                if ring.is_empty() {
+                    if !pair.slave_open.load(core::sync::atomic::Ordering::Acquire) {
+                        return Ok(0); // EOF — slave closed
+                    }
+                    // No data available — return EAGAIN-like behavior via Io error
+                    // The caller should retry. In practice, copilot's libuv polls this.
+                    return Err(ReadError::Io);
+                }
+                let n = core::cmp::min(buf.len(), ring.len());
+                for (i, byte) in ring.drain(..n).enumerate() {
+                    buf[i] = byte;
+                }
+                return Ok(n);
+            }
+            &Device::PtySlave(idx) => {
+                // Slave reads what the master has written
+                let pair = self.pty_manager.get(idx).ok_or(ReadError::ClosedFd)?;
+                // For slave reads, block until data is available
+                loop {
+                    {
+                        let mut ring = pair.master_to_slave.lock();
+                        if !ring.is_empty() {
+                            let n = core::cmp::min(buf.len(), ring.len());
+                            for (i, byte) in ring.drain(..n).enumerate() {
+                                buf[i] = byte;
+                            }
+                            return Ok(n);
+                        }
+                    }
+                    if !pair.master_open.load(core::sync::atomic::Ordering::Acquire) {
+                        return Ok(0); // EOF — master closed
+                    }
+                    // Brief yield before retry
+                    core::hint::spin_loop();
+                }
             }
         }
         // Stdin is a stream device — offsets are meaningless. Ignore any
@@ -284,6 +555,39 @@ impl<
                 // /dev/urandom here.
                 return Ok(buf.len());
             }
+            &Device::PtyMaster(idx) => {
+                // Master writes feed the slave's input buffer.
+                // Apply basic input line-discipline: ICRNL translates \r → \n,
+                // matching the default termios behavior expected by shells.
+                let pair = self.pty_manager.get(idx).ok_or(WriteError::ClosedFd)?;
+                {
+                    let mut ring = pair.master_to_slave.lock();
+                    for &b in buf {
+                        ring.push_back(if b == b'\r' { b'\n' } else { b });
+                    }
+                }
+                // Wake poll/select watchers on the slave side.
+                pair.slave_pollee.notify_observers(Events::IN);
+                return Ok(buf.len());
+            }
+            &Device::PtySlave(idx) => {
+                // Slave writes feed the master's read buffer.
+                // Apply basic output line-discipline: ONLCR translates \n → \r\n,
+                // matching the default termios behavior expected by terminal emulators.
+                let pair = self.pty_manager.get(idx).ok_or(WriteError::ClosedFd)?;
+                {
+                    let mut ring = pair.slave_to_master.lock();
+                    for &b in buf {
+                        if b == b'\n' {
+                            ring.push_back(b'\r');
+                        }
+                        ring.push_back(b);
+                    }
+                }
+                // Wake epoll watchers on the master side.
+                pair.master_pollee.notify_observers(Events::IN);
+                return Ok(buf.len());
+            }
         };
         // Stdout/stderr are stream devices — offsets are meaningless.
         self.litebox
@@ -308,7 +612,11 @@ impl<
             .ok_or(SeekError::ClosedFd)?
             .entry
         {
-            Device::Stdin | Device::Stdout | Device::Stderr => Err(SeekError::NonSeekable),
+            Device::Stdin
+            | Device::Stdout
+            | Device::Stderr
+            | Device::PtyMaster(_)
+            | Device::PtySlave(_) => Err(SeekError::NonSeekable),
             Device::Null | Device::URandom => {
                 // Linux allows lseek on /dev/null and returns position 0 (or sets to length 0).
                 Ok(0)
@@ -374,6 +682,50 @@ impl<
             "/dev/stderr" => Device::Stderr,
             "/dev/null" => Device::Null,
             "/dev/urandom" => Device::URandom,
+            "/dev/ptmx" => {
+                return Ok(FileStatus {
+                    file_type: FileType::CharacterDevice,
+                    mode: Mode::RUSR
+                        | Mode::WUSR
+                        | Mode::RGRP
+                        | Mode::WGRP
+                        | Mode::ROTH
+                        | Mode::WOTH,
+                    size: 0,
+                    owner: UserInfo::ROOT,
+                    node_info: PTMX_NODE_INFO,
+                    blksize: STDIO_BLOCK_SIZE,
+                });
+            }
+            p if p.starts_with("/dev/pts/") => {
+                let num_str = &p["/dev/pts/".len()..];
+                let idx: u32 = num_str
+                    .parse()
+                    .map_err(|_| FileStatusError::PathError(PathError::NoSuchFileOrDirectory))?;
+                if self.pty_manager.get(idx).is_some() {
+                    return Ok(Self::device_file_status(Device::PtySlave(idx)));
+                }
+                return Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory));
+            }
+            "/dev" | "/dev/" | "/dev/pts" | "/dev/pts/" => {
+                return Ok(FileStatus {
+                    file_type: FileType::Directory,
+                    mode: Mode::RUSR
+                        | Mode::XUSR
+                        | Mode::RGRP
+                        | Mode::XGRP
+                        | Mode::ROTH
+                        | Mode::XOTH,
+                    size: 0,
+                    owner: UserInfo::ROOT,
+                    node_info: NodeInfo {
+                        dev: 5,
+                        ino: 1,
+                        rdev: None,
+                    },
+                    blksize: 4096,
+                });
+            }
             _ => return Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory)),
         };
         Ok(Self::device_file_status(device))
@@ -388,10 +740,29 @@ impl<
             .entry;
         Ok(Self::device_file_status(device))
     }
+
+    fn get_io_pollable(
+        &self,
+        fd: &FileFd<Platform>,
+    ) -> Option<alloc::boxed::Box<dyn crate::event::IOPollable>> {
+        let table = self.litebox.descriptor_table();
+        let entry = table.get_entry(fd)?;
+        match entry.entry {
+            Device::PtyMaster(idx) => {
+                let pair = self.pty_manager.get(idx)?;
+                Some(alloc::boxed::Box::new(PtyMasterPollable(pair)))
+            }
+            Device::PtySlave(idx) => {
+                let pair = self.pty_manager.get(idx)?;
+                Some(alloc::boxed::Box::new(PtySlavePollable(pair)))
+            }
+            _ => None,
+        }
+    }
 }
 
 crate::fd::enable_fds_for_subsystem! {
-    @ Platform: { crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioProvider };
+    @ Platform: { crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioProvider + crate::platform::TimeProvider };
     FileSystem<Platform>;
     Device;
     -> FileFd<Platform>;

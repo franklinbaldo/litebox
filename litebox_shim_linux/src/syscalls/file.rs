@@ -200,12 +200,11 @@ impl<FS: ShimFS> Task<FS> {
     pub fn sys_open(&self, path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
         let path = self.resolve_path(path)?;
         let mode = mode & !self.get_umask();
-        let file = match self.global.fs.open(&*path, flags - OFlags::CLOEXEC, mode) {
-            Ok(f) => f,
-            Err(e) => {
-                return Err(e.into());
-            }
-        };
+        let file = self
+            .global
+            .fs
+            .open(&*path, flags - OFlags::CLOEXEC, mode)
+            .map_err(Errno::from)?;
         {
             let mut dt = self.global.litebox.descriptor_table_mut();
             if flags.contains(OFlags::CLOEXEC) {
@@ -352,14 +351,14 @@ impl<FS: ShimFS> Task<FS> {
         let files = self.files.borrow();
         let file_table = files.file_descriptors.read();
         let desc = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
-        match desc {
+        let result = match desc {
             Descriptor::LiteBoxRawFd(raw_fd) => {
                 let raw_fd = *raw_fd;
                 drop(file_table);
                 // We need to do this cell dance because otherwise Rust can't recognize that the two
                 // closures are mutually exclusive.
                 let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
-                files
+                let r = files
                     .run_on_raw_fd(
                         raw_fd,
                         |fd| {
@@ -384,7 +383,8 @@ impl<FS: ShimFS> Task<FS> {
                                 .map_err(Errno::from)
                         },
                     )
-                    .flatten()
+                    .flatten();
+                r
             }
             Descriptor::Epoll { .. } => Err(Errno::EINVAL),
             Descriptor::Eventfd { file, .. } => {
@@ -403,7 +403,8 @@ impl<FS: ShimFS> Task<FS> {
                 litebox_common_linux::ReceiveFlags::empty(),
                 None,
             ),
-        }
+        };
+        result
     }
 
     /// Handle syscall `write`
@@ -1422,6 +1423,7 @@ impl<FS: ShimFS> Task<FS> {
 
     fn stdio_ioctl(
         &self,
+        fd: &TypedFd<FS>,
         arg: &IoctlArg<litebox_platform_multiplex::Platform>,
     ) -> Result<u32, Errno> {
         match arg {
@@ -1463,7 +1465,14 @@ impl<FS: ShimFS> Task<FS> {
                     .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
-            IoctlArg::TCSETS(_) | IoctlArg::TCSETSW(_) | IoctlArg::TCSETSF(_) => Ok(0), // TODO: implement
+            IoctlArg::TCSETS(_)
+            | IoctlArg::TCSETSW(_)
+            | IoctlArg::TCSETSF(_)
+            | IoctlArg::TIOCSWINSZ(_)
+            | IoctlArg::TIOCSPTLK(_)
+            | IoctlArg::TIOCSCTTY
+            | IoctlArg::TIOCNOTTY
+            | IoctlArg::TIOCSPGRP(_) => Ok(0),
             IoctlArg::TIOCGWINSZ(ws) => {
                 ws.write_at_offset(
                     0,
@@ -1477,7 +1486,28 @@ impl<FS: ShimFS> Task<FS> {
                 .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
-            IoctlArg::TIOCGPTN(_) => Err(Errno::ENOTTY),
+            IoctlArg::TIOCGPTN(ptn) => {
+                // Return the PTY number from the device minor number.
+                let status = self
+                    .global
+                    .fs
+                    .fd_file_status(fd)
+                    .map_err(|_| Errno::EBADF)?;
+                let rdev = status.node_info.rdev.ok_or(Errno::ENOTTY)?;
+                let major = rdev.get() >> 8;
+                if major != 136 {
+                    return Err(Errno::ENOTTY);
+                }
+                let minor = u32::try_from(rdev.get() & 0xFF).expect("minor fits in u32");
+                ptn.write_at_offset(0, minor).ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TIOCGPGRP(pgrp) => {
+                // Return the calling thread's PID as the foreground process group.
+                pgrp.write_at_offset(0, self.sys_getpid())
+                    .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
             _ => todo!(),
         }
     }
@@ -1487,7 +1517,9 @@ impl<FS: ShimFS> Task<FS> {
             Ok(status) => {
                 // See https://www.kernel.org/doc/Documentation/admin-guide/devices.txt
                 let major = status.node_info.rdev.map_or(0, |v| v.get() >> 8);
-                Ok((136..=143).contains(&major)
+                // major 136-143: Unix98 PTY slaves (/dev/pts/*)
+                // major 5: /dev/tty (generic terminal), /dev/console, /dev/ptmx
+                Ok(((136..=143).contains(&major) || major == 5)
                     && status.file_type == litebox::fs::FileType::CharacterDevice)
             }
             Err(litebox::fs::errors::FileStatusError::ClosedFd) => Err(Errno::EBADF),
@@ -1509,6 +1541,41 @@ impl<FS: ShimFS> Task<FS> {
         let locked_file_descriptors = files.file_descriptors.read();
         let desc = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
         match arg {
+            IoctlArg::FIONREAD(out) => {
+                // Return the number of bytes available to read.
+                match desc {
+                    Descriptor::LiteBoxRawFd(raw_fd) => {
+                        files.run_on_raw_fd(
+                            *raw_fd,
+                            |_file_fd| {
+                                // File/device fds: ENOTTY (not a supported operation).
+                                Err(Errno::ENOTTY)
+                            },
+                            |socket_fd| {
+                                let proxy = self.global.get_proxy(socket_fd)?;
+                                let n = proxy.pending_rx_bytes();
+                                let n = i32::try_from(n).unwrap_or(i32::MAX);
+                                out.write_at_offset(0, n).ok_or(Errno::EFAULT)?;
+                                Ok(0u32)
+                            },
+                            |pipe_fd| {
+                                // Pipes: return actual buffered byte count.
+                                let n = self
+                                    .global
+                                    .pipes
+                                    .readable_bytes(pipe_fd)
+                                    .map_err(|_| Errno::EBADF)?;
+                                let n = i32::try_from(n).unwrap_or(i32::MAX);
+                                out.write_at_offset(0, n).ok_or(Errno::EFAULT)?;
+                                Ok(0u32)
+                            },
+                        )?
+                    }
+                    Descriptor::Eventfd { .. }
+                    | Descriptor::Epoll { .. }
+                    | Descriptor::Unix { .. } => Err(Errno::ENOTTY),
+                }
+            }
             IoctlArg::FIONBIO(arg) => {
                 let val = arg.read_at_offset(0).ok_or(Errno::EFAULT)?;
                 match desc {
@@ -1576,17 +1643,80 @@ impl<FS: ShimFS> Task<FS> {
                     Ok(0)
                 }
             },
+            IoctlArg::FIONCLEX => match desc {
+                Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
+                    *raw_fd,
+                    |fd| {
+                        let _old = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                        Ok(0)
+                    },
+                    |_fd| todo!("net"),
+                    |_fd| todo!("pipes"),
+                )?,
+                Descriptor::Eventfd { close_on_exec, .. }
+                | Descriptor::Epoll { close_on_exec, .. }
+                | Descriptor::Unix { close_on_exec, .. } => {
+                    close_on_exec.store(false, core::sync::atomic::Ordering::Relaxed);
+                    Ok(0)
+                }
+            },
+            IoctlArg::TIOCGPTPEER(open_flags) => {
+                // TIOCGPTPEER: open the slave side of a PTY master, returning a new fd.
+                // The argument contains O_RDWR|O_NOCTTY or similar open flags.
+                match desc {
+                    Descriptor::LiteBoxRawFd(raw_fd) => {
+                        let pty_idx = files.run_on_raw_fd(
+                            *raw_fd,
+                            |file_fd| {
+                                // Check the fd is a PTY master (major 136).
+                                let status = self
+                                    .global
+                                    .fs
+                                    .fd_file_status(file_fd)
+                                    .map_err(|_| Errno::EBADF)?;
+                                let rdev = status.node_info.rdev.ok_or(Errno::ENOTTY)?;
+                                let major = rdev.get() >> 8;
+                                if major != 136 {
+                                    return Err(Errno::ENOTTY);
+                                }
+                                Ok(rdev.get() & 0xFF)
+                            },
+                            |_| Err(Errno::ENOTTY),
+                            |_| Err(Errno::ENOTTY),
+                        )??;
+                        // Drop the read lock before opening (which needs write access).
+                        drop(locked_file_descriptors);
+                        drop(files);
+                        // Open the slave via the normal open path.
+                        let slave_path = alloc::format!("/dev/pts/{pty_idx}");
+                        let oflags =
+                            OFlags::from_bits_truncate(u32::try_from(open_flags).unwrap_or(0));
+                        self.sys_open(slave_path.as_str(), oflags, Mode::empty())
+                    }
+                    _ => Err(Errno::ENOTTY),
+                }
+            }
             IoctlArg::TCGETS(..)
             | IoctlArg::TCSETS(..)
             | IoctlArg::TCSETSW(..)
             | IoctlArg::TCSETSF(..)
             | IoctlArg::TIOCGPTN(..)
-            | IoctlArg::TIOCGWINSZ(..) => match desc {
+            | IoctlArg::TIOCSPTLK(..)
+            | IoctlArg::TIOCSCTTY
+            | IoctlArg::TIOCNOTTY
+            | IoctlArg::TIOCGPGRP(..)
+            | IoctlArg::TIOCSPGRP(..)
+            | IoctlArg::TIOCGWINSZ(..)
+            | IoctlArg::TIOCSWINSZ(..) => match desc {
                 Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
                     *raw_fd,
                     |fd| {
                         if self.is_stdio(fd)? {
-                            self.stdio_ioctl(&arg)
+                            self.stdio_ioctl(fd, &arg)
                         } else {
                             Err(Errno::ENOTTY)
                         }
@@ -1599,8 +1729,6 @@ impl<FS: ShimFS> Task<FS> {
                 }
             },
             _ => {
-                #[cfg(debug_assertions)]
-                litebox::log_println!(self.global.platform, "ioctl: unsupported {:?}", arg);
                 // Return ENOTTY for unsupported ioctls rather than panicking.
                 // Complex programs (e.g., bash) probe terminal capabilities and
                 // handle ENOTTY gracefully.
@@ -1677,19 +1805,41 @@ impl<FS: ShimFS> Task<FS> {
         sigmask: Option<ConstPtr<litebox_common_linux::signal::SigSet>>,
         _sigsetsize: usize,
     ) -> Result<usize, Errno> {
-        if sigmask.is_some() {
-            // TODO: Properly implement signal mask save/restore around epoll_pwait.
-            // For now, ignore the sigmask and proceed — this is sufficient for
-            // single-process workloads where signal delivery is not critical.
-            litebox::log_println!(self.global.platform, "WARN: epoll_pwait sigmask ignored");
-        }
+        // Save the current signal mask and apply the caller's mask for the
+        // duration of the wait.  This is the core semantics of epoll_pwait:
+        // atomically { set sigmask; wait; restore sigmask }.
+        //
+        // The mask restore is DEFERRED via `set_restore_mask` so that
+        // `process_signals()` (called by `prepare_to_run_guest`) can deliver
+        // newly-unblocked signals (e.g. SIGCHLD) before re-blocking them.
+        let saved_mask = if let Some(mask_ptr) = sigmask {
+            let new_mask = mask_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            let old = self.signals.get_blocked();
+            litebox::log_println!(
+                self.global.platform,
+                "DEBUG epoll_pwait: sigmask provided, old={:#018x} new={:#018x}",
+                old.as_u64(),
+                new_mask.as_u64(),
+            );
+            self.signals.set_blocked(new_mask);
+            Some(old)
+        } else {
+            None
+        };
+
         let Ok(epfd) = u32::try_from(epfd) else {
+            if let Some(old) = saved_mask {
+                self.signals.set_blocked(old);
+            }
             return Err(Errno::EBADF);
         };
         let maxevents = maxevents as usize;
         if maxevents == 0
             || maxevents > i32::MAX as usize / size_of::<litebox_common_linux::EpollEvent>()
         {
+            if let Some(old) = saved_mask {
+                self.signals.set_blocked(old);
+            }
             return Err(Errno::EINVAL);
         }
         let timeout = if timeout >= 0 {
@@ -1703,10 +1853,15 @@ impl<FS: ShimFS> Task<FS> {
             let locked_file_descriptors = files.file_descriptors.read();
             match locked_file_descriptors.get_fd(epfd).ok_or(Errno::EBADF)? {
                 Descriptor::Epoll { file, .. } => file.clone(),
-                _ => return Err(Errno::EBADF),
+                _ => {
+                    if let Some(old) = saved_mask {
+                        self.signals.set_blocked(old);
+                    }
+                    return Err(Errno::EBADF);
+                }
             }
         };
-        match epoll_file.wait(
+        let result = match epoll_file.wait(
             &self.global,
             &self.wait_cx().with_timeout(timeout),
             maxevents,
@@ -1721,7 +1876,16 @@ impl<FS: ShimFS> Task<FS> {
             }
             Err(WaitError::TimedOut) => Ok(0),
             Err(WaitError::Interrupted) => Err(Errno::EINTR),
+        };
+
+        // Defer mask restore to process_signals() so that signals unblocked
+        // by the caller's mask (like SIGCHLD) are delivered before the
+        // original mask is reinstated.
+        if let Some(old) = saved_mask {
+            self.signals.set_restore_mask(old);
         }
+
+        result
     }
 
     /// Handle syscall `ppoll`.
@@ -1733,19 +1897,35 @@ impl<FS: ShimFS> Task<FS> {
         sigmask: Option<ConstPtr<litebox_common_linux::signal::SigSet>>,
         sigsetsize: usize,
     ) -> Result<usize, Errno> {
-        if sigmask.is_some() {
+        // Save and apply the caller's signal mask for the duration of the wait,
+        // matching ppoll(2) semantics.
+        let saved_mask = if let Some(mask_ptr) = sigmask {
             if sigsetsize != core::mem::size_of::<litebox_common_linux::signal::SigSet>() {
-                // Expected via ppoll(2) manpage
-                unimplemented!()
+                return Err(Errno::EINVAL);
             }
-            unimplemented!("no sigmask support yet");
-        }
+            let new_mask = mask_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            let old = self.signals.get_blocked();
+            self.signals.set_blocked(new_mask);
+            Some(old)
+        } else {
+            None
+        };
         let timeout = timeout.read()?;
-        let nfds_signed = isize::try_from(nfds).map_err(|_| Errno::EINVAL)?;
+        let nfds_signed = isize::try_from(nfds).map_err(|_| {
+            if let Some(old) = saved_mask {
+                self.signals.set_blocked(old);
+            }
+            Errno::EINVAL
+        })?;
 
         let mut set = super::epoll::PollSet::with_capacity(nfds);
         for i in 0..nfds_signed {
-            let fd = fds.read_at_offset(i).ok_or(Errno::EFAULT)?;
+            let fd = fds.read_at_offset(i).ok_or_else(|| {
+                if let Some(old) = saved_mask {
+                    self.signals.set_blocked(old);
+                }
+                Errno::EFAULT
+            })?;
 
             let events = litebox::event::Events::from_bits_truncate(
                 fd.events.reinterpret_as_unsigned().into(),
@@ -1760,6 +1940,10 @@ impl<FS: ShimFS> Task<FS> {
         ) {
             Ok(()) => {}
             Err(WaitError::Interrupted) => {
+                // Defer mask restore for process_signals.
+                if let Some(old) = saved_mask {
+                    self.signals.set_restore_mask(old);
+                }
                 // TODO: update the remaining time.
                 return Err(Errno::EINTR);
             }
@@ -1767,6 +1951,11 @@ impl<FS: ShimFS> Task<FS> {
                 // A timeout occurred. Scan one last time.
                 set.scan(&self.global, &self.files.borrow());
             }
+        }
+
+        // Defer mask restore for process_signals.
+        if let Some(old) = saved_mask {
+            self.signals.set_restore_mask(old);
         }
 
         // Write just the revents back.
@@ -1869,9 +2058,30 @@ impl<FS: ShimFS> Task<FS> {
         timeout: TimeParam<Platform>,
         sigsetpack: Option<ConstPtr<litebox_common_linux::SigSetPack>>,
     ) -> Result<usize, Errno> {
-        if sigsetpack.is_some() {
-            unimplemented!("no sigsetpack support yet");
-        }
+        // Save the current signal mask and apply the caller's mask for the
+        // duration of the wait (same semantics as epoll_pwait / ppoll).
+        //
+        // pselect6 passes a pointer to {sigset_t *ss, size_t ss_len} where
+        // ss is itself a pointer to the actual signal mask.
+        let saved_mask = if let Some(pack_ptr) = sigsetpack {
+            let pack: litebox_common_linux::SigSetPack =
+                pack_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            if pack.size != core::mem::size_of::<litebox_common_linux::signal::SigSet>() {
+                return Err(Errno::EINVAL);
+            }
+            // pack.sigset is actually a pointer to the sigset (the u64 holds
+            // the guest address). Dereference it to read the actual mask.
+            let sigset_ptr = crate::ConstPtr::<litebox_common_linux::signal::SigSet>::from_usize(
+                pack.sigset.as_u64() as usize,
+            );
+            let new_mask = sigset_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            let old = self.signals.get_blocked();
+            self.signals.set_blocked(new_mask);
+            Some(old)
+        } else {
+            None
+        };
+
         let timeout = timeout.read()?;
         if nfds >= i32::MAX as u32
             || nfds as usize
@@ -1880,6 +2090,9 @@ impl<FS: ShimFS> Task<FS> {
                     .limits
                     .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
         {
+            if let Some(old) = saved_mask {
+                self.signals.set_blocked(old);
+            }
             return Err(Errno::EINVAL);
         }
         let len = (nfds as usize).div_ceil(core::mem::size_of::<usize>() * 8);
@@ -1902,7 +2115,15 @@ impl<FS: ShimFS> Task<FS> {
             kwritefds.as_mut(),
             kexceptfds.as_mut(),
             timeout,
-        )?;
+        );
+
+        // Defer mask restore so signals unblocked by the caller's mask are
+        // delivered before the original mask is reinstated.
+        if let Some(old) = saved_mask {
+            self.signals.set_restore_mask(old);
+        }
+
+        let count = count?;
 
         if let Some(fds) = kreadfds {
             readfds
@@ -1984,28 +2205,38 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EBADF);
         };
         let files = self.files.borrow();
+
+        if let Some(newfd_val) = newfd {
+            let Ok(newfd) = u32::try_from(newfd_val) else {
+                return Err(Errno::EBADF);
+            };
+            if oldfd == newfd {
+                // dup3(fd, fd) always returns EINVAL per POSIX.
+                if flags.is_some() {
+                    return Err(Errno::EINVAL);
+                }
+                // dup2(fd, fd): verify fd is valid, then clear CLOEXEC.
+                //
+                // POSIX says dup2(fd, fd) "does nothing", but libuv relies on
+                // inherited stdio fds surviving exec even though the parent
+                // sets CLOEXEC. Clearing CLOEXEC here matches the intent of
+                // the dup2 caller (set up this fd for the child) and prevents
+                // close-on-exec from closing stdio fds after exec.
+                let fds = files.file_descriptors.read();
+                let desc = fds.get_fd(oldfd).ok_or(Errno::EBADF)?;
+                desc.set_file_descriptor_flags(&self.global, &files, FileDescriptorFlags::empty())?;
+                return Ok(oldfd);
+            }
+        }
+
         let new_file = files
             .file_descriptors
             .read()
             .get_fd(oldfd)
             .ok_or(Errno::EBADF)
             .map(|desc| self.do_dup(desc, flags.unwrap_or(OFlags::empty())))??;
-        if let Some(newfd) = newfd {
-            // dup2/dup3
-            let Ok(newfd) = u32::try_from(newfd) else {
-                return Err(Errno::EBADF);
-            };
-            if oldfd == newfd {
-                // Different from dup3, if oldfd is a valid file descriptor, and newfd has the same value
-                // as oldfd, then dup2() does nothing.
-                return if flags.is_some() {
-                    // dup3
-                    Err(Errno::EINVAL)
-                } else {
-                    // dup2
-                    Ok(oldfd)
-                };
-            }
+        if let Some(newfd_val) = newfd {
+            let newfd = u32::try_from(newfd_val).unwrap(); // already validated above
             match files
                 .file_descriptors
                 .write()

@@ -1455,6 +1455,21 @@ impl<
             EntryX::Tombstone => unreachable!(),
         }
     }
+
+    fn get_io_pollable(
+        &self,
+        fd: &FileFd<Platform, Upper, Lower>,
+    ) -> Option<alloc::boxed::Box<dyn crate::event::IOPollable>> {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry))?;
+        match entry.as_ref() {
+            EntryX::Upper { fd } => self.upper.get_io_pollable(fd),
+            EntryX::Lower { fd } => self.lower.get_io_pollable(fd),
+            EntryX::Tombstone => None,
+        }
+    }
 }
 
 struct Descriptor<Upper: super::FileSystem + 'static, Lower: super::FileSystem + 'static> {

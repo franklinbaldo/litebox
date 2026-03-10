@@ -591,9 +591,18 @@ pub const TCSETS: u32 = 0x5402;
 pub const TCSETSW: u32 = 0x5403;
 pub const TCSETSF: u32 = 0x5404;
 pub const TIOCGWINSZ: u32 = 0x5413;
+pub const TIOCSWINSZ: u32 = 0x5414;
+pub const TIOCSCTTY: u32 = 0x540e;
+pub const TIOCGPGRP: u32 = 0x540f;
+pub const TIOCSPGRP: u32 = 0x5410;
+pub const TIOCNOTTY: u32 = 0x5422;
+pub const TIOCGPTPEER: u32 = 0x5441;
 pub const FIONBIO: u32 = 0x5421;
+pub const FIONREAD: u32 = 0x541b;
+pub const FIONCLEX: u32 = 0x5450;
 pub const FIOCLEX: u32 = 0x5451;
 pub const TIOCGPTN: u32 = 0x80045430;
+pub const TIOCSPTLK: u32 = 0x40045431;
 
 /// Commands for use with `ioctl`.
 #[non_exhaustive]
@@ -609,13 +618,31 @@ pub enum IoctlArg<Platform: litebox::platform::RawPointerProvider> {
     TCSETSF(Platform::RawConstPointer<Termios>),
     /// Get window size.
     TIOCGWINSZ(Platform::RawMutPointer<Winsize>),
+    /// Set window size.
+    TIOCSWINSZ(Platform::RawConstPointer<Winsize>),
     /// Obtain device unit number, which can be used to generate
     /// the filename of the pseudo-terminal slave device.
     TIOCGPTN(Platform::RawMutPointer<u32>),
+    /// Lock/unlock the pseudo-terminal slave device.
+    TIOCSPTLK(Platform::RawConstPointer<i32>),
+    /// Make the given terminal the controlling terminal of the calling process.
+    TIOCSCTTY,
+    /// Give up the controlling terminal.
+    TIOCNOTTY,
+    /// Open the slave side of a PTY master, returning an fd (Linux 4.13+).
+    TIOCGPTPEER(i32),
+    /// Get the process group ID of the foreground process group on this terminal.
+    TIOCGPGRP(Platform::RawMutPointer<i32>),
+    /// Set the foreground process group ID of this terminal.
+    TIOCSPGRP(Platform::RawConstPointer<i32>),
     /// Enables or disables non-blocking mode
     FIONBIO(Platform::RawConstPointer<i32>),
+    /// Get the number of bytes available in the input buffer.
+    FIONREAD(Platform::RawMutPointer<i32>),
     /// Set close on exec
     FIOCLEX,
+    /// Clear close on exec
+    FIONCLEX,
     Raw {
         cmd: u32,
         arg: Platform::RawMutPointer<u8>,
@@ -2541,9 +2568,18 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                         TCSETSW => IoctlArg::TCSETSW(ctx.sys_req_ptr(2)),
                         TCSETSF => IoctlArg::TCSETSF(ctx.sys_req_ptr(2)),
                         TIOCGWINSZ => IoctlArg::TIOCGWINSZ(ctx.sys_req_ptr(2)),
+                        TIOCSWINSZ => IoctlArg::TIOCSWINSZ(ctx.sys_req_ptr(2)),
                         TIOCGPTN => IoctlArg::TIOCGPTN(ctx.sys_req_ptr(2)),
+                        TIOCSPTLK => IoctlArg::TIOCSPTLK(ctx.sys_req_ptr(2)),
+                        TIOCSCTTY => IoctlArg::TIOCSCTTY,
+                        TIOCNOTTY => IoctlArg::TIOCNOTTY,
+                        TIOCGPTPEER => IoctlArg::TIOCGPTPEER(ctx.sys_req_arg(2)),
+                        TIOCGPGRP => IoctlArg::TIOCGPGRP(ctx.sys_req_ptr(2)),
+                        TIOCSPGRP => IoctlArg::TIOCSPGRP(ctx.sys_req_ptr(2)),
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),
+                        FIONREAD => IoctlArg::FIONREAD(ctx.sys_req_ptr(2)),
                         FIOCLEX => IoctlArg::FIOCLEX,
+                        FIONCLEX => IoctlArg::FIONCLEX,
                         _ => IoctlArg::Raw {
                             cmd,
                             arg: ctx.sys_req_ptr(2),

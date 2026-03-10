@@ -109,8 +109,13 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
         let io_pollable: &dyn IOPollable = match self {
             EpollDescriptor::Eventfd(file) => file,
             EpollDescriptor::Epoll(_file) => unimplemented!(),
-            EpollDescriptor::File(_file) => {
-                // TODO: probably polling on stdio files, return dummy events for now
+            EpollDescriptor::File(file) => {
+                // Check if the file supports async I/O polling (e.g., PTY master).
+                if let Some(io_poll) = global.fs.get_io_pollable(file) {
+                    let events = poll(&*io_poll);
+                    return Some(events);
+                }
+                // Regular files: return dummy OUT events.
                 return Some(Events::OUT & mask);
             }
             EpollDescriptor::Socket(fd) => {

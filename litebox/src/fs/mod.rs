@@ -3,6 +3,7 @@
 
 //! File-system related functionality
 
+use crate::event::IOPollable;
 use crate::fd::{FdEnabledSubsystem, TypedFd};
 use crate::path;
 
@@ -150,6 +151,15 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// Returns `None` if indicating no static backing data is available/supported.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
     fn get_static_backing_data(&self, fd: &TypedFd<Self>) -> Option<&'static [u8]> {
+        None
+    }
+
+    /// Get an `IOPollable` for a file descriptor, if the underlying device supports polling.
+    ///
+    /// Returns `Some(pollable)` for device types with async event support (e.g., PTY master),
+    /// or `None` for regular files that don't support async I/O notifications.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn get_io_pollable(&self, fd: &TypedFd<Self>) -> Option<alloc::boxed::Box<dyn IOPollable>> {
         None
     }
 }

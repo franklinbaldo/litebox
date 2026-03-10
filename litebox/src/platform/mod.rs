@@ -352,7 +352,11 @@ pub trait IPInterfaceProvider {
 /// A non-exhaustive list of errors that can be thrown by [`IPInterfaceProvider::send_ip_packet`].
 #[derive(Error, Debug)]
 #[non_exhaustive]
-pub enum SendError {}
+pub enum SendError {
+    /// The underlying device returned an I/O error. The packet was not sent.
+    #[error("I/O error on send: errno {0}")]
+    Io(i32),
+}
 
 /// A non-exhaustive list of errors that can be thrown by [`IPInterfaceProvider::receive_ip_packet`].
 #[derive(Error, Debug)]

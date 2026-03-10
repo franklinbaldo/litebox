@@ -175,6 +175,16 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
             PipeEnd::Sender(p) => Ok(f(p)),
         }
     }
+
+    /// Return the number of bytes available for reading on a pipe receiver.
+    /// Returns 0 for sender ends.
+    pub fn readable_bytes(&self, fd: &PipeFd<Platform>) -> Result<usize, errors::ClosedError> {
+        let dt = self.litebox.descriptor_table();
+        match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
+            PipeEnd::Receiver(p) => Ok(p.endpoint.rb.lock().occupied_len()),
+            PipeEnd::Sender(_) => Ok(0),
+        }
+    }
 }
 
 /// Whether a particular pipe end is the sender half or the receiver half

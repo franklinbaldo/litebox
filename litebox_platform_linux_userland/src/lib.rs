@@ -1557,9 +1557,7 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
                 }
                 Ok(())
             }
-            Err(errno) => {
-                unimplemented!("unexpected error {errno}")
-            }
+            Err(errno) => Err(litebox::platform::SendError::Io(errno.into_raw())),
         }
     }
 

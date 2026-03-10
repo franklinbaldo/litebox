@@ -887,8 +887,16 @@ impl<FS: ShimFS> Task<FS> {
         #[cfg(target_arch = "x86_64")]
         let syscall_number = ctx.orig_rax;
 
-        let request =
-            SyscallRequest::<Platform>::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
+        let request = match SyscallRequest::<Platform>::try_from_raw(
+            syscall_number,
+            ctx,
+            log_unsupported_fmt,
+        ) {
+            Ok(req) => req,
+            Err(e) => {
+                return Err(e);
+            }
+        };
 
         match request {
             SyscallRequest::Exit { status } => {
@@ -964,7 +972,9 @@ impl<FS: ShimFS> Task<FS> {
                 Some(buf) => self.sys_write(fd, &buf, None),
                 None => Err(Errno::EFAULT),
             },
-            SyscallRequest::Close { fd } => syscall!(sys_close(fd)),
+            SyscallRequest::Close { fd } => {
+                syscall!(sys_close(fd))
+            }
             SyscallRequest::Lseek { fd, offset, whence } => {
                 use litebox::utils::TruncateExt as _;
                 syscalls::file::try_into_whence(whence.truncate())
@@ -992,7 +1002,9 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::RtSigreturn => self.sys_rt_sigreturn(ctx),
             #[cfg(target_arch = "x86")]
             SyscallRequest::Sigreturn => self.sys_sigreturn(ctx),
-            SyscallRequest::Ioctl { fd, arg } => syscall!(sys_ioctl(fd, arg)),
+            SyscallRequest::Ioctl { fd, arg } => {
+                syscall!(sys_ioctl(fd, arg))
+            }
             SyscallRequest::Pread64 {
                 fd,
                 buf,
@@ -1046,7 +1058,19 @@ impl<FS: ShimFS> Task<FS> {
                 oldfd,
                 newfd,
                 flags,
-            } => syscall!(sys_dup(oldfd, newfd, flags)),
+            } => {
+                if self.process_id.0 > 10 || newfd.is_some_and(|n| n <= 2) {
+                    litebox::log_println!(
+                        self.global.platform,
+                        "DEBUG dup: pid={} old={} new={:?} flags={:?}",
+                        self.process_id.0,
+                        oldfd,
+                        newfd,
+                        flags
+                    );
+                }
+                syscall!(sys_dup(oldfd, newfd, flags))
+            }
             SyscallRequest::Socket {
                 domain,
                 type_and_flags,
@@ -1129,7 +1153,9 @@ impl<FS: ShimFS> Task<FS> {
                 addrlen,
             } => syscall!(sys_getpeername(sockfd, addr, addrlen)),
             SyscallRequest::Uname { buf } => syscall!(sys_uname(buf)),
-            SyscallRequest::Fcntl { fd, arg } => syscall!(sys_fcntl(fd, arg)),
+            SyscallRequest::Fcntl { fd, arg } => {
+                syscall!(sys_fcntl(fd, arg))
+            }
             SyscallRequest::Getcwd { buf, size: count } => {
                 let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
                 self.sys_getcwd(&mut kernel_buf).and_then(|size| {

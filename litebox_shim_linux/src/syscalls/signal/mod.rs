@@ -46,6 +46,12 @@ pub(crate) struct SignalState {
     altstack: Cell<SigAltStack>,
     /// The last exception info recorded for signal delivery.
     last_exception: Cell<litebox::shim::ExceptionInfo>,
+    /// Deferred mask restore (like Linux's TIF_RESTORE_SIGMASK).
+    ///
+    /// When set, `process_signals` will restore this mask after delivering
+    /// pending signals. Used by `epoll_pwait` / `ppoll` to atomically
+    /// unblock signals during the wait and re-block them afterwards.
+    restore_mask: Cell<Option<SigSet>>,
 }
 
 impl SignalState {
@@ -68,7 +74,24 @@ impl SignalState {
                 cr2: 0,
                 kernel_mode: false,
             }),
+            restore_mask: Cell::new(None),
         }
+    }
+
+    /// Get the current blocked signal mask.
+    pub fn get_blocked(&self) -> SigSet {
+        self.blocked.get()
+    }
+
+    /// Set the blocked signal mask.
+    pub fn set_blocked(&self, mask: SigSet) {
+        self.blocked.set(mask);
+    }
+
+    /// Schedule a deferred mask restore. The mask will be restored after the
+    /// next `process_signals` call delivers any unblocked signals.
+    pub fn set_restore_mask(&self, mask: SigSet) {
+        self.restore_mask.set(Some(mask));
     }
 
     pub fn clone_for_new_task(&self) -> Self {
@@ -92,6 +115,7 @@ impl SignalState {
             .into(),
             // Preserve last exception
             last_exception: self.last_exception.clone(),
+            restore_mask: Cell::new(None),
         }
     }
 
@@ -116,6 +140,7 @@ impl SignalState {
             }
             .into(),
             last_exception: self.last_exception.clone(),
+            restore_mask: Cell::new(None),
         }
     }
 
@@ -517,6 +542,14 @@ impl<FS: ShimFS> Task<FS> {
             }
             let old_act = handler.action;
             if let Some(act) = act {
+                if signal == Signal::SIGCHLD {
+                    litebox::log_println!(
+                        self.global.platform,
+                        "DEBUG rt_sigaction: SIGCHLD handler changed from {:#x} to {:#x}",
+                        old_act.sigaction,
+                        act.sigaction,
+                    );
+                }
                 handler.action = act;
             }
             old_act
@@ -596,6 +629,13 @@ impl<FS: ShimFS> Task<FS> {
             while i < queue.len() {
                 if queue[i].target_process_id == my_id {
                     let sig = queue.swap_remove(i);
+                    litebox::log_println!(
+                        self.global.platform,
+                        "DEBUG process_signals: drained {:?} for process {} (pid {})",
+                        sig.signal,
+                        my_id,
+                        self.pid,
+                    );
                     self.signals.pending.borrow_mut().push(
                         &self.process().limits,
                         sig.signal,
@@ -629,6 +669,13 @@ impl<FS: ShimFS> Task<FS> {
             }
 
             let action = self.signals.handlers.borrow().inner.lock()[signal].action;
+            litebox::log_println!(
+                self.global.platform,
+                "DEBUG process_signals: delivering {:?} to pid {}, action=0x{:x}",
+                signal,
+                self.pid,
+                action.sigaction as usize,
+            );
             #[expect(clippy::match_same_arms)]
             match action.sigaction {
                 SIG_DFL => {
@@ -648,17 +695,34 @@ impl<FS: ShimFS> Task<FS> {
                             );
                             self.exit_group(ExitStatus::Signal(signal));
                         }
-                        SignalDisposition::Ignore => {}
+                        SignalDisposition::Ignore => {
+                            litebox::log_println!(
+                                self.global.platform,
+                                "DEBUG process_signals: {:?} ignored (SIG_DFL + Ignore disposition)",
+                                signal,
+                            );
+                        }
                         SignalDisposition::Continue => {
                             // Stop is not supported, so continue does nothing.
                         }
                     }
                 }
-                SIG_IGN => {}
+                SIG_IGN => {
+                    litebox::log_println!(
+                        self.global.platform,
+                        "DEBUG process_signals: {:?} explicitly SIG_IGN",
+                        signal,
+                    );
+                }
                 _ => {
                     if let Err(DeliverFault) =
                         self.signals.deliver_signal(signal, &siginfo, &action, ctx)
                     {
+                        litebox::log_println!(
+                            self.global.platform,
+                            "DEBUG process_signals: {:?} delivery FAULTED",
+                            signal,
+                        );
                         // Failed to deliver signal. Inject a SIGSEGV
                         // (terminating the process if we were trying to deliver
                         // a SIGSEGV).
@@ -666,6 +730,13 @@ impl<FS: ShimFS> Task<FS> {
                     }
                 }
             }
+        }
+
+        // If a deferred mask restore is pending (set by epoll_pwait/ppoll),
+        // restore the original signal mask now that signals have been delivered
+        // with the temporarily-unblocked mask.
+        if let Some(old_mask) = self.signals.restore_mask.take() {
+            self.signals.blocked.set(old_mask);
         }
     }
 

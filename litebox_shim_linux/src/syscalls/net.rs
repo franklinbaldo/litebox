@@ -833,7 +833,10 @@ impl<FS: ShimFS> GlobalState<FS> {
         if let Err(Errno::EPIPE) = ret
             && !flags.contains(SendFlags::NOSIGNAL)
         {
-            unimplemented!("send signal SIGPIPE on EPIPE");
+            // SIGPIPE delivery: On real Linux, EPIPE without MSG_NOSIGNAL
+            // raises SIGPIPE. Most applications (including Node.js) ignore
+            // SIGPIPE via SIG_IGN, so just return EPIPE for now.
+            // TODO: actually deliver SIGPIPE to the calling process.
         }
         ret
     }
