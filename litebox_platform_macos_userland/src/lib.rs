@@ -577,7 +577,7 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         "mov w16, #1",
         "strb w16, [x18, #32]",
         "ldrb w17, [x18, #33]",
-        "cbnz w17, interrupt_callback",
+        "cbnz w17, .Lgo_interrupt",
         "ldr x17, [x18, #24]",
         // Load guest PC into x18 (we'll branch to it after restoring all regs).
         // x0 = ctx pointer to PtRegs.
@@ -615,6 +615,9 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         "ldr x0, [x0, #0]",
         // x16 = guest PC. Branch to it.
         "br x16",
+        // Local trampoline for cbnz — macOS assembler rejects conditional
+        // branches to non-local labels.
+        ".Lgo_interrupt: b interrupt_callback",
         "switch_to_guest_end:",
     );
 }
