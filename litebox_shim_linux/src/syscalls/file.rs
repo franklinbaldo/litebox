@@ -736,62 +736,62 @@ impl<FS: ShimFS> Task<FS> {
 impl<FS: ShimFS> Descriptor<FS> {
     fn stat(&self, task: &Task<FS>) -> Result<FileStat, Errno> {
         let fstat = match self {
-            Descriptor::LiteBoxRawFd(raw_fd) => {
-                let files = task.files.borrow();
-                files
-                    .run_on_raw_fd(
-                        *raw_fd,
-                        |fd| {
-                            files
-                                .fs
-                                .fd_file_status(fd)
-                                .map(FileStat::from)
-                                .map_err(Errno::from)
-                        },
-                        |_fd| {
-                            Ok(FileStat {
-                                // TODO: give correct values
-                                st_dev: 0,
-                                st_ino: 0,
-                                st_nlink: 1,
-                                st_mode: (litebox_common_linux::InodeType::Socket as u32
-                                    | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits())
+            Descriptor::LiteBoxRawFd(raw_fd) => task
+                .files
+                .borrow()
+                .run_on_raw_fd(
+                    *raw_fd,
+                    |fd| {
+                        task.files
+                            .borrow()
+                            .fs
+                            .fd_file_status(fd)
+                            .map(FileStat::from)
+                            .map_err(Errno::from)
+                    },
+                    |_fd| {
+                        Ok(FileStat {
+                            // TODO: give correct values
+                            st_dev: 0,
+                            st_ino: 0,
+                            st_nlink: 1,
+                            st_mode: (litebox_common_linux::InodeType::Socket as u32
+                                | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits())
+                            .truncate(),
+                            st_uid: 0,
+                            st_gid: 0,
+                            st_rdev: 0,
+                            st_size: 0,
+                            st_blksize: 4096,
+                            st_blocks: 0,
+                            ..Default::default()
+                        })
+                    },
+                    |fd| {
+                        let half_pipe_type = task.global.pipes.half_pipe_type(fd)?;
+                        let read_write_mode = match half_pipe_type {
+                            litebox::pipes::HalfPipeType::SenderHalf => Mode::WUSR,
+                            litebox::pipes::HalfPipeType::ReceiverHalf => Mode::RUSR,
+                        };
+                        Ok(FileStat {
+                            // TODO: give correct values
+                            st_dev: 0,
+                            st_ino: 0,
+                            st_nlink: 1,
+                            st_mode: (read_write_mode.bits()
+                                | litebox_common_linux::InodeType::NamedPipe as u32)
                                 .truncate(),
-                                st_uid: 0,
-                                st_gid: 0,
-                                st_rdev: 0,
-                                st_size: 0,
-                                st_blksize: 4096,
-                                st_blocks: 0,
-                                ..Default::default()
-                            })
-                        },
-                        |fd| {
-                            let half_pipe_type = task.global.pipes.half_pipe_type(fd)?;
-                            let read_write_mode = match half_pipe_type {
-                                litebox::pipes::HalfPipeType::SenderHalf => Mode::WUSR,
-                                litebox::pipes::HalfPipeType::ReceiverHalf => Mode::RUSR,
-                            };
-                            Ok(FileStat {
-                                // TODO: give correct values
-                                st_dev: 0,
-                                st_ino: 0,
-                                st_nlink: 1,
-                                st_mode: (read_write_mode.bits()
-                                    | litebox_common_linux::InodeType::NamedPipe as u32)
-                                    .truncate(),
-                                st_uid: 0,
-                                st_gid: 0,
-                                st_rdev: 0,
-                                st_size: 0,
-                                st_blksize: 4096,
-                                st_blocks: 0,
-                                ..Default::default()
-                            })
-                        },
-                    )
-                    .flatten()?
-            }
+                            st_uid: 0,
+                            st_gid: 0,
+                            st_rdev: 0,
+                            st_size: 0,
+                            st_blksize: 4096,
+                            st_blocks: 0,
+                            ..Default::default()
+                        })
+                    },
+                )
+                .flatten()?,
             Descriptor::Eventfd { .. } => FileStat {
                 // TODO: give correct values
                 st_dev: 0,
