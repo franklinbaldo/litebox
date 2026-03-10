@@ -1155,12 +1155,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
             } else {
                 MapFlags::empty()
             };
+        let native_flags = macos_mmap_flags(linux_flags);
         let r = unsafe {
             libc::mmap(
                 mmap_start as *mut libc::c_void,
                 mmap_len,
                 prot_flags(initial_permissions).bits(),
-                macos_mmap_flags(linux_flags),
+                native_flags,
                 -1,
                 0,
             )
@@ -1169,9 +1170,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
             let err = std::io::Error::last_os_error();
             eprintln!(
                 "[macos-platform]   mmap FAILED: {err} (start={:#x}, len={:#x}, flags={:#x})",
-                mmap_start,
-                mmap_len,
-                macos_mmap_flags(linux_flags),
+                mmap_start, mmap_len, native_flags,
             );
             return Err(match err.raw_os_error() {
                 Some(libc::ENOMEM) => litebox::platform::page_mgmt::AllocationError::OutOfMemory,
