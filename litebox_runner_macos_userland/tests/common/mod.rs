@@ -112,7 +112,7 @@ impl TestLauncher {
         );
         println!(
             "load_program correctly failed with: {}",
-            result.unwrap_err()
+            result.err().unwrap()
         );
     }
 }
