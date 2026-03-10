@@ -38,8 +38,18 @@ require_root() {
 
 up() {
     require_root
-    echo "==> Setting up TUN device ${TUN_DEV}"
-    ip tuntap add dev "${TUN_DEV}" mode tun user "$(logname 2>/dev/null || echo "${SUDO_USER:-root}")"
+
+    # Tear down first if already running (idempotent)
+    if ip link show "${TUN_DEV}" &>/dev/null; then
+        echo "==> ${TUN_DEV} already exists, tearing down first"
+        down
+    fi
+
+    local TUN_USER
+    TUN_USER="$(logname 2>/dev/null || echo "${SUDO_USER:-root}")"
+
+    echo "==> Setting up TUN device ${TUN_DEV} (owner: ${TUN_USER})"
+    ip tuntap add dev "${TUN_DEV}" mode tun user "${TUN_USER}"
     ip addr add "${TUN_ADDR}" dev "${TUN_DEV}"
     ip link set "${TUN_DEV}" up
 
@@ -66,6 +76,7 @@ up() {
 
     echo "==> Ready. dnsmasq PID=${DNSMASQ_PID}"
     echo "    Guest will use: --tun-device-name ${TUN_DEV}"
+    echo "    Runner can be invoked as regular user (no sudo needed)."
 }
 
 down() {

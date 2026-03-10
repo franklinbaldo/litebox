@@ -161,6 +161,8 @@ pub enum WaitError {
     WouldBlock,
     /// The specified process was not found in the registry.
     NoSuchProcess,
+    /// The wait was interrupted (e.g., by `exit_group` or a signal).
+    Interrupted,
 }
 
 /// Errors from [`ProcessRegistry::create_process`].
@@ -468,10 +470,26 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
         exit_notification
     }
 
+    /// Wake any threads blocked in [`wait_for_child`](Self::wait_for_child)
+    /// for the given process. Used by `exit_group` to unblock sibling threads
+    /// that are waiting on children.
+    pub fn notify_waiters(&self, pid: ProcessId) {
+        let table = self.table.read();
+        if let Some(entry) = table.get(&pid) {
+            entry.wait_channel.notify();
+        }
+    }
+
     /// Wait for a child process to exit (`waitpid` semantics).
     ///
     /// Blocks unless `WNOHANG` is set in `options`. On success, the zombie
     /// child is reaped (removed from the registry) and its status returned.
+    ///
+    /// If `is_interrupted` is provided, it is checked before each blocking
+    /// wait.  If it returns `true`, the call returns `Err(Interrupted)`
+    /// immediately.  This allows `exit_group` to break threads out of a
+    /// blocking wait by first calling [`notify_waiters`](Self::notify_waiters)
+    /// and then setting the interrupt flag.
     ///
     /// # Panics
     ///
@@ -481,6 +499,7 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
         parent: ProcessId,
         target: WaitTarget,
         options: WaitOptions,
+        is_interrupted: Option<&dyn Fn() -> bool>,
     ) -> Result<WaitResult, WaitError> {
         loop {
             let wait_channel;
@@ -531,6 +550,13 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
                     return Err(WaitError::WouldBlock);
                 }
 
+                // Check if the caller has been interrupted (e.g., exit_group).
+                if let Some(check) = is_interrupted
+                    && check()
+                {
+                    return Err(WaitError::Interrupted);
+                }
+
                 // Clone the parent's wait channel and snapshot the futex
                 // while the lock is held, so any concurrent notify() will
                 // invalidate the snapshot.
@@ -545,8 +571,14 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
                 wait_snapshot = snapshot;
             }
 
-            // Block outside the table lock until a child exits.
+            // Block outside the table lock until a child exits (or notify_waiters
+            // wakes us). Re-check is_interrupted after waking.
             wait_channel.block(wait_snapshot);
+            if let Some(check) = is_interrupted
+                && check()
+            {
+                return Err(WaitError::Interrupted);
+            }
             // Re-acquire the lock and re-check (loop).
         }
     }
@@ -795,7 +827,7 @@ mod tests {
         registry.exit_process(child, 7);
 
         let result = registry
-            .wait_for_child(parent, WaitTarget::AnyChild, WaitOptions::WNOHANG)
+            .wait_for_child(parent, WaitTarget::AnyChild, WaitOptions::WNOHANG, None)
             .expect("should reap zombie");
         assert_eq!(result.pid, child);
         assert_eq!(result.status, 7);
@@ -812,7 +844,8 @@ mod tests {
         let parent = registry.create_process(None, 0).unwrap();
         let _child = registry.create_process(Some(parent), 17).unwrap();
 
-        let result = registry.wait_for_child(parent, WaitTarget::AnyChild, WaitOptions::WNOHANG);
+        let result =
+            registry.wait_for_child(parent, WaitTarget::AnyChild, WaitOptions::WNOHANG, None);
         assert_eq!(result, Err(WaitError::WouldBlock));
     }
 
@@ -821,7 +854,8 @@ mod tests {
         let (_platform, registry) = setup();
         let parent = registry.create_process(None, 0).unwrap();
 
-        let result = registry.wait_for_child(parent, WaitTarget::AnyChild, WaitOptions::WNOHANG);
+        let result =
+            registry.wait_for_child(parent, WaitTarget::AnyChild, WaitOptions::WNOHANG, None);
         assert_eq!(result, Err(WaitError::NoChildren));
     }
 
@@ -837,7 +871,7 @@ mod tests {
 
         // Wait for child2 specifically
         let result = registry
-            .wait_for_child(parent, WaitTarget::Pid(child2), WaitOptions::WNOHANG)
+            .wait_for_child(parent, WaitTarget::Pid(child2), WaitOptions::WNOHANG, None)
             .expect("should reap child2");
         assert_eq!(result.pid, child2);
         assert_eq!(result.status, 20);
@@ -871,7 +905,7 @@ mod tests {
 
         // This should block until the child exits.
         let result = registry
-            .wait_for_child(parent, WaitTarget::AnyChild, WaitOptions::empty())
+            .wait_for_child(parent, WaitTarget::AnyChild, WaitOptions::empty(), None)
             .expect("should reap child");
         assert_eq!(result.pid, child);
         assert_eq!(result.status, 99);
@@ -936,7 +970,7 @@ mod tests {
 
         // Reap
         registry
-            .wait_for_child(init, WaitTarget::AnyChild, WaitOptions::WNOHANG)
+            .wait_for_child(init, WaitTarget::AnyChild, WaitOptions::WNOHANG, None)
             .unwrap();
         assert_eq!(registry.process_count(), 1);
     }
@@ -958,6 +992,7 @@ mod tests {
                 init,
                 WaitTarget::ProcessGroup(init_pgid),
                 WaitOptions::WNOHANG,
+                None,
             )
             .expect("should reap child in same process group");
         assert_eq!(result.pid, child1);
@@ -968,6 +1003,7 @@ mod tests {
             init,
             WaitTarget::ProcessGroup(init_pgid),
             WaitOptions::WNOHANG,
+            None,
         );
         assert_eq!(result, Err(WaitError::WouldBlock));
     }
@@ -976,7 +1012,8 @@ mod tests {
     fn test_no_such_process() {
         let (_platform, registry) = setup();
         let bogus = ProcessId(999);
-        let result = registry.wait_for_child(bogus, WaitTarget::AnyChild, WaitOptions::WNOHANG);
+        let result =
+            registry.wait_for_child(bogus, WaitTarget::AnyChild, WaitOptions::WNOHANG, None);
         assert_eq!(result, Err(WaitError::NoSuchProcess));
     }
 
@@ -1000,7 +1037,7 @@ mod tests {
         registry.exit_process(child, 99);
 
         let result = registry
-            .wait_for_child(parent, WaitTarget::AnyChild, WaitOptions::WNOHANG)
+            .wait_for_child(parent, WaitTarget::AnyChild, WaitOptions::WNOHANG, None)
             .expect("should reap zombie");
         assert_eq!(result.status, 42, "first exit status must be preserved");
     }
@@ -1024,7 +1061,8 @@ mod tests {
         registry.remove_process(child);
 
         // Parent should have no children to wait for.
-        let result = registry.wait_for_child(parent, WaitTarget::AnyChild, WaitOptions::WNOHANG);
+        let result =
+            registry.wait_for_child(parent, WaitTarget::AnyChild, WaitOptions::WNOHANG, None);
         assert_eq!(result, Err(WaitError::NoChildren));
     }
 
