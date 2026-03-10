@@ -110,6 +110,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
             anyhow::bail!("Expected a .tar file, found {}", tar_file.display());
         }
+        eprintln!(
+            "[litebox-macos-runner] Loading tar file: {}",
+            tar_file.display()
+        );
         mmapped_file(tar_file)?.data
     } else {
         litebox::fs::tar_ro::EMPTY_TAR_FILE
@@ -127,6 +131,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let initial_file_system = {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
         let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
+        eprintln!(
+            "[litebox-macos-runner] Installing binary at VFS path: {}",
+            prog.display()
+        );
         let ancestors: Vec<_> = prog.ancestors().collect();
         let mut prev_user = 0;
         for (path, &mode_and_user) in ancestors
@@ -250,7 +258,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
-    let program = shim.load_program(platform.init_task(), prog_path, argv, envp)?;
+    eprintln!("[litebox-macos-runner] Loading program: {prog_path}");
+    let program = shim
+        .load_program(platform.init_task(), prog_path, argv, envp)
+        .map_err(|e| {
+            eprintln!("[litebox-macos-runner] load_program failed: {e:#}");
+            e
+        })?;
 
     unsafe {
         litebox_platform_macos_userland::run_thread(

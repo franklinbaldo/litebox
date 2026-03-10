@@ -94,4 +94,25 @@ impl TestLauncher {
         }
         assert_eq!(program.process.wait(), 0);
     }
+
+    /// Assert that loading an ELF program fails (e.g., ET_EXEC with segments
+    /// below macOS arm64's 4GB __PAGEZERO).
+    pub fn test_load_exec_expect_failure(mut self, executable_path: &str) {
+        self.shim_builder.set_fs(self.fs);
+        let argv = vec![
+            CString::new(executable_path).unwrap(),
+            CString::new("hello").unwrap(),
+        ];
+        let envp = vec![CString::new("PATH=/bin").unwrap()];
+        let shim = self.shim_builder.build();
+        let result = shim.load_program(self.platform.init_task(), executable_path, argv, envp);
+        assert!(
+            result.is_err(),
+            "Expected load_program to fail for ET_EXEC with low load address, but it succeeded"
+        );
+        println!(
+            "load_program correctly failed with: {}",
+            result.unwrap_err()
+        );
+    }
 }

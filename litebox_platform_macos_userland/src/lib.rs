@@ -1074,7 +1074,11 @@ fn macos_mmap_flags(linux_flags: MapFlags) -> libc::c_int {
 }
 
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for MacosUserland {
-    const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
+    // macOS arm64 enforces a 4GB __PAGEZERO segment (0x0..0x100000000).
+    // Any mmap(MAP_FIXED) at addresses below 4GB fails with ENOMEM.
+    // ET_EXEC (non-PIE) binaries with load addresses below 4GB are therefore
+    // unsupported on macOS arm64. Only ET_DYN (PIE) binaries are supported.
+    const TASK_ADDR_MIN: usize = 0x1_0000_0000; // 4GB — above __PAGEZERO
     const TASK_ADDR_MAX: usize = 0x0000_FFFF_FFFF_F000; // 48-bit VA space
 
     fn allocate_pages(

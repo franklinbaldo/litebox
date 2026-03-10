@@ -108,9 +108,14 @@ int main(void) {
 }
 "#;
 
+/// ET_EXEC (non-PIE, statically linked) binaries with load addresses below 4GB
+/// are unsupported on macOS arm64 due to the mandatory 4GB `__PAGEZERO` segment.
+///
+/// This test verifies that loading such a binary fails with a clear error rather
+/// than a confusing ENOMEM from mmap.
 #[test]
 fn test_static_linked_prog_with_rewriter() {
-    println!("Running statically linked binary + rewriter test...");
+    println!("Running statically linked binary + rewriter test (expect load failure)...");
     let mut test_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     test_dir.push("tests/test-bins");
 
@@ -146,7 +151,9 @@ fn test_static_linked_prog_with_rewriter() {
 
     let mut launcher = common::TestLauncher::init_platform(&[], &[], &[]);
     launcher.install_file(executable_data, &executable_path);
-    launcher.test_load_exec_common(&executable_path);
+
+    // ET_EXEC with segments at 0x400000 (below 4GB __PAGEZERO) must fail to load.
+    launcher.test_load_exec_expect_failure(&executable_path);
 }
 
 fn run_dynamic_linked_prog_with_rewriter(
@@ -282,13 +289,17 @@ fn run_dynamic_linked_prog_with_rewriter(
     let mut command = std::process::Command::new(&binary_path);
     command.args(&args);
     println!("Running `{command:?}`");
-    let status = command
-        .status()
+    let output = command
+        .output()
         .expect("Failed to run litebox_runner_macos_userland");
-    assert!(
-        status.success(),
-        "failed to run litebox_runner_macos_userland: {status}",
-    );
+    if !output.status.success() {
+        let stdout = std::str::from_utf8(&output.stdout).unwrap_or("<non-utf8>");
+        let stderr = std::str::from_utf8(&output.stderr).unwrap_or("<non-utf8>");
+        panic!(
+            "failed to run litebox_runner_macos_userland: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status, stdout, stderr
+        );
+    }
 }
 
 #[test]
