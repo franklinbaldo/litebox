@@ -68,9 +68,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     let initial_file_system = {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
-
-        // Create /tmp so programs (e.g., fstime) can use it as a writable scratch directory.
-        // This must live in the in-mem layer rather than tar_ro, which is read-only.
         in_mem.with_root_privileges(|fs| {
             use litebox::fs::FileSystem as _;
             fs.mkdir(

@@ -4,7 +4,7 @@ Run [byte-unixbench](https://github.com/kdlucas/byte-unixbench) benchmarks nativ
 
 ## Prerequisites
 
-- The UnixBench source tree at `benchmark/byte-unixbench-6.0.0/UnixBench/` (extracted from `benchmark/v6.0.0.zip`).
+- The UnixBench source tree at `byte-unixbench-6.0.0/UnixBench/` (extracted from `v6.0.0.zip`).
 - `gcc`, `make`, `ldd`, `tar` on the host.
 - Pre-built LiteBox binaries (`litebox_runner_linux_userland` and `litebox_syscall_rewriter`).
 
@@ -17,22 +17,22 @@ cargo build --release -p litebox_runner_linux_userland -p litebox_syscall_rewrit
 
 ```bash
 # Run all benchmarks with official Run script durations/iterations, compare native vs LiteBox
-python3 benchmark/unixbench/run_unixbench.py --release
+python3 dev_bench/unixbench/run_unixbench.py --release
 
 # Run only native
-python3 benchmark/unixbench/run_unixbench.py --mode native
+python3 dev_bench/unixbench/run_unixbench.py --mode native
 
 # Run only LiteBox
-python3 benchmark/unixbench/run_unixbench.py --mode litebox --release
+python3 dev_bench/unixbench/run_unixbench.py --mode litebox --release
 
 # Pick specific benchmarks
-python3 benchmark/unixbench/run_unixbench.py --benchmarks whetstone-double execl --release
+python3 dev_bench/unixbench/run_unixbench.py --benchmarks whetstone-double execl --release
 
 # Override duration (5s) and iterations (3) for all benchmarks (quick test)
-python3 benchmark/unixbench/run_unixbench.py --duration 5 --iterations 3 --release
+python3 dev_bench/unixbench/run_unixbench.py --duration 5 --iterations 3 --release
 
 # Save results to JSON for further analysis
-python3 benchmark/unixbench/run_unixbench.py --release --output results.json
+python3 dev_bench/unixbench/run_unixbench.py --release --output results.json
 ```
 
 ## Supported Benchmarks
@@ -49,10 +49,14 @@ The following benchmarks match the official UnixBench `./Run` script invocations
 | `fsdisk` | fstime | 30s | 3 | Yes (\*) | File Copy 4096 bufsize 8000 maxblocks |
 | `pipe` | pipe | 10s | 10 | Yes | Pipe throughput |
 | `syscall` | syscall | 10s | 10 | Yes | System call overhead |
+| `context1` | context1 | 10s | 10 | Yes | Pipe-based context switching (\*\*) |
+| `spawn` | spawn | 30s | 3 | Yes | Process creation (\*\*) |
+| `shell1` | looper | 60s | 3 | Yes | Shell scripts, 1 concurrent (\*\*) |
+| `shell8` | looper | 60s | 3 | Yes | Shell scripts, 8 concurrent (\*\*) |
 
 (\*) `fstime` uses its own `SIGALRM` handler, not `timeit.c`.
 
-**Not supported** (require `fork`): `context1`, `spawn`, `shell1`, `shell8`.
+(\*\*) Requires `fork`. Runs natively but is skipped under LiteBox (reports N/A) until fork support is added.
 
 ### Notes on Alarm-based Benchmarks
 
@@ -110,13 +114,13 @@ Run `prepare_unixbench.py` on Linux/WSL to compile UnixBench, rewrite binaries, 
 
 ```bash
 # Prepare all benchmarks
-python3 benchmark/unixbench/prepare_unixbench.py --release
+python3 dev_bench/unixbench/prepare_unixbench.py --release
 
 # Prepare specific benchmarks only
-python3 benchmark/unixbench/prepare_unixbench.py --benchmarks dhry2reg pipe --release
+python3 dev_bench/unixbench/prepare_unixbench.py --benchmarks dhry2reg pipe --release
 ```
 
-This creates `benchmark/unixbench/prepared/` containing:
+This creates `dev_bench/unixbench/prepared/` containing:
 - Per-benchmark directories with `rootfs.tar` and rewritten binaries
 - A `manifest.json` describing the artifacts
 

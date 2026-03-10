@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
@@ -128,7 +129,7 @@ def main():
     parser.add_argument(
         "--output-dir", type=str, default=None,
         help="Output directory for prepared artifacts "
-             "(default: benchmark/unixbench/prepared/)",
+             "(default: dev_bench/unixbench/prepared/)",
     )
     parser.add_argument(
         "--release", action="store_true",

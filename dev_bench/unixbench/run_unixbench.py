@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
@@ -110,6 +111,15 @@ def _fsdisk_args(duration: int, tmpdir=None) -> list[str]:
     return args
 
 
+def _shell_args(concurrency: int):
+    """Return an args function for shell benchmarks (looper + multi.sh)."""
+    def fn(duration: int, tmpdir=None) -> list[str]:
+        # looper <duration> <script> <concurrency>
+        # UB_BINDIR is set in the environment so multi.sh can find tst.sh
+        return [str(duration), "multi.sh", str(concurrency)]
+    return fn
+
+
 BENCHMARKS: dict[str, BenchmarkDef] = {
     "dhry2reg": BenchmarkDef(
         "dhry2reg", "dhry2reg", _default_args,
@@ -143,17 +153,33 @@ BENCHMARKS: dict[str, BenchmarkDef] = {
         "syscall", "syscall", _default_args,
         default_duration=10, default_iterations=10, uses_alarm=True,
     ),
-    # These require fork and are not supported under LiteBox:
-    # "context1": 10s, 10 iters, requires fork
-    # "spawn": 30s, 3 iters, requires fork
-    # "shell1": looper 60 multi.sh 1, 3 iters, requires fork
-    # "shell8": looper 60 multi.sh 8, 3 iters, requires fork
+    "context1": BenchmarkDef(
+        "context1", "context1", _default_args,
+        default_duration=10, default_iterations=10,
+        uses_alarm=True, requires_fork=True,
+    ),
+    "spawn": BenchmarkDef(
+        "spawn", "spawn", _default_args,
+        default_duration=30, default_iterations=3,
+        uses_alarm=True, requires_fork=True,
+    ),
+    "shell1": BenchmarkDef(
+        "shell1", "looper", _shell_args(1),
+        default_duration=60, default_iterations=3,
+        uses_alarm=True, requires_fork=True,
+    ),
+    "shell8": BenchmarkDef(
+        "shell8", "looper", _shell_args(8),
+        default_duration=60, default_iterations=3,
+        uses_alarm=True, requires_fork=True,
+    ),
 }
 
 DEFAULT_BENCHMARKS = [
     "dhry2reg", "whetstone-double", "execl",
     "fstime", "fsbuffer", "fsdisk",
     "pipe", "syscall",
+    "context1", "spawn", "shell1", "shell8",
 ]
 
 
@@ -224,12 +250,19 @@ def run_native(
 
     env = os.environ.copy()
     env["UB_BINDIR"] = str(pgms_dir)
+    # Add pgms_dir to PATH so looper's execvp can find multi.sh/tst.sh
+    env["PATH"] = str(pgms_dir) + os.pathsep + env.get("PATH", "")
+
+    # The official Run script runs all benchmarks from testdir/ (where
+    # sort.src lives, needed by shell benchmarks via multi.sh → tst.sh).
+    testdir = pgms_dir.parent / "testdir"
 
     print(f"  Running: {binary.name} {' '.join(args)}")
     t0 = time.monotonic()
     try:
         result = subprocess.run(
-            cmd, capture_output=True, timeout=duration * 10 + 30, env=env,
+            cmd, capture_output=True, timeout=duration * 10 + 30,
+            env=env, cwd=str(testdir) if testdir.exists() else None,
         )
     except subprocess.TimeoutExpired:
         print(f"  [TIMEOUT] {bench.name}")

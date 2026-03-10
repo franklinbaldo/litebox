@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
@@ -30,6 +32,10 @@ BENCHMARK_BINARIES = {
     "fsdisk": "fstime",
     "pipe": "pipe",
     "syscall": "syscall",
+    "context1": "context1",
+    "spawn": "spawn",
+    "shell1": "looper",
+    "shell8": "looper",
 }
 
 
@@ -51,14 +57,14 @@ def find_workspace_root() -> Path:
 
 def find_unixbench_dir(workspace_root: Path) -> Path:
     """Locate the UnixBench directory."""
-    return workspace_root / "benchmark" / "unixbench" / UNIXBENCH_EXTRACTED_DIR / "UnixBench"
+    return workspace_root / "dev_bench" / "unixbench" / UNIXBENCH_EXTRACTED_DIR / "UnixBench"
 
 
 # ── Download / build helpers ───────────────────────────────────────────────
 
 def ensure_unixbench_downloaded(workspace_root: Path) -> None:
     """Download and extract UnixBench if it is not already present."""
-    bench_dir = workspace_root / "benchmark" / "unixbench"
+    bench_dir = workspace_root / "dev_bench" / "unixbench"
     bench_dir.mkdir(parents=True, exist_ok=True)
     extracted = bench_dir / UNIXBENCH_EXTRACTED_DIR
     if extracted.exists():
@@ -80,6 +86,11 @@ def ensure_unixbench_built(unixbench_dir: Path) -> None:
     """Ensure UnixBench is compiled."""
     pgms = unixbench_dir / "pgms"
     if (pgms / "dhry2reg").exists():
+        # Ensure shell scripts are executable (zip extraction may lose +x).
+        for script in ("multi.sh", "tst.sh"):
+            path = pgms / script
+            if path.exists():
+                path.chmod(path.stat().st_mode | 0o111)
         return
     print("Building UnixBench...")
     result = subprocess.run(["make"], cwd=str(unixbench_dir), capture_output=True)
@@ -87,6 +98,11 @@ def ensure_unixbench_built(unixbench_dir: Path) -> None:
         stderr = result.stderr.decode("utf-8", errors="replace")
         print(f"Failed to build UnixBench: {stderr[:500]}")
         sys.exit(1)
+    # Ensure shell scripts are executable (zip extraction may lose +x).
+    for script in ("multi.sh", "tst.sh"):
+        path = pgms / script
+        if path.exists():
+            path.chmod(path.stat().st_mode | 0o111)
     print("UnixBench built successfully.")
 
 
