@@ -135,6 +135,18 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
         };
         Some(poll(io_pollable))
     }
+
+    /// Returns `true` if this descriptor requires periodic host polling
+    /// rather than observer-based notifications.
+    fn needs_host_poll(&self, global: &GlobalState<FS>) -> bool {
+        match self {
+            EpollDescriptor::File(file) => global
+                .fs
+                .get_io_pollable(file)
+                .is_some_and(|p| p.needs_host_poll()),
+            _ => false,
+        }
+    }
 }
 
 pub(crate) struct EpollFile<FS: ShimFS> {
@@ -144,6 +156,10 @@ pub(crate) struct EpollFile<FS: ShimFS> {
     >,
     ready: Arc<ReadySet<FS>>,
     status: core::sync::atomic::AtomicU32,
+    /// Set when the interest set contains descriptors that cannot register
+    /// observers (e.g. host stdin). When true, `wait()` uses a capped timeout
+    /// so it periodically re-polls these descriptors.
+    needs_host_poll: core::sync::atomic::AtomicBool,
 }
 
 impl<FS: ShimFS> EpollFile<FS> {
@@ -152,6 +168,7 @@ impl<FS: ShimFS> EpollFile<FS> {
             interests: litebox::sync::Mutex::new(BTreeMap::new()),
             ready: Arc::new(ReadySet::new()),
             status: core::sync::atomic::AtomicU32::new(0),
+            needs_host_poll: core::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -162,16 +179,78 @@ impl<FS: ShimFS> EpollFile<FS> {
         maxevents: usize,
     ) -> Result<Vec<EpollEvent>, WaitError> {
         let mut events = Vec::new();
-        match self.ready.pollee.wait(cx, false, Events::IN, || {
-            self.ready.pop_multiple(global, maxevents, &mut events);
-            if events.is_empty() {
-                return Err(TryOpError::<Infallible>::TryAgain);
+
+        if self
+            .needs_host_poll
+            .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            // At least one descriptor requires periodic host polling (e.g.
+            // stdin). Re-scan all interests with a short timeout to detect
+            // host-side readiness changes.
+            const POLL_INTERVAL: core::time::Duration = core::time::Duration::from_millis(50);
+            loop {
+                // Re-poll every interest — this calls check_io_events()
+                // which queries the host for poll-only descriptors.
+                self.rescan_interests(global);
+
+                self.ready.pop_multiple(global, maxevents, &mut events);
+                if !events.is_empty() {
+                    return Ok(events);
+                }
+
+                // Check if the caller's deadline has already passed.
+                if let Some(remaining) = cx.remaining_timeout() {
+                    if remaining.is_zero() {
+                        return Err(WaitError::TimedOut);
+                    }
+                } else if cx.deadline().is_some() {
+                    // Deadline was set but remaining_timeout() returned None →
+                    // deadline has passed.
+                    return Err(WaitError::TimedOut);
+                }
+
+                // Sleep up to POLL_INTERVAL or until an observer fires or
+                // the caller's deadline arrives, whichever is sooner.
+                let poll_cx = cx.with_timeout(Some(POLL_INTERVAL));
+                match poll_cx.sleep() {
+                    WaitError::TimedOut => {
+                        // If the caller's deadline has passed, propagate.
+                        if cx
+                            .deadline()
+                            .is_some_and(|_| cx.remaining_timeout().is_none())
+                        {
+                            return Err(WaitError::TimedOut);
+                        }
+                        // Otherwise it was just our poll interval — continue.
+                    }
+                    e => return Err(e),
+                }
             }
-            Ok(())
-        }) {
-            Ok(()) => Ok(events),
-            Err(TryOpError::TryAgain) => unreachable!(),
-            Err(TryOpError::WaitError(e)) => Err(e),
+        } else {
+            match self.ready.pollee.wait(cx, false, Events::IN, || {
+                self.ready.pop_multiple(global, maxevents, &mut events);
+                if events.is_empty() {
+                    return Err(TryOpError::<Infallible>::TryAgain);
+                }
+                Ok(())
+            }) {
+                Ok(()) => Ok(events),
+                Err(TryOpError::TryAgain) => unreachable!(),
+                Err(TryOpError::WaitError(e)) => Err(e),
+            }
+        }
+    }
+
+    /// Re-scan all interests and push any that are ready to the ready set.
+    fn rescan_interests(&self, global: &GlobalState<FS>) {
+        let interests = self.interests.lock();
+        for entry in interests.values() {
+            if entry.is_ready.load(core::sync::atomic::Ordering::Relaxed) {
+                continue; // already in the ready set
+            }
+            if let Some((Some(_event), _)) = entry.poll(global) {
+                self.ready.push(entry);
+            }
         }
     }
 
@@ -227,6 +306,10 @@ impl<FS: ShimFS> EpollFile<FS> {
         // Add the new entry to the ready list if the file is ready
         if !events.is_empty() {
             self.ready.push(&entry);
+        }
+        if file.needs_host_poll(global) {
+            self.needs_host_poll
+                .store(true, core::sync::atomic::Ordering::Relaxed);
         }
         interests.insert(key, entry);
         Ok(())
@@ -562,15 +645,60 @@ impl PollSet {
             return Ok(());
         }
 
-        let mut register = true;
-        cx.wait_until(|| {
-            if self.scan_once(global, files, register.then_some(cx.waker())) {
+        // Check if any entry needs host polling (e.g. stdin).
+        let needs_host_poll = self.has_host_poll_fds(global, files);
+
+        if needs_host_poll {
+            const POLL_INTERVAL: core::time::Duration = core::time::Duration::from_millis(50);
+            loop {
+                if self.scan_once(global, files, None) {
+                    return Ok(());
+                }
+                let poll_cx = cx.with_timeout(Some(POLL_INTERVAL));
+                match poll_cx.sleep() {
+                    WaitError::TimedOut => {
+                        if cx
+                            .deadline()
+                            .is_some_and(|_| cx.remaining_timeout().is_none())
+                        {
+                            return Err(WaitError::TimedOut);
+                        }
+                    }
+                    e => return Err(e),
+                }
+            }
+        } else {
+            let mut register = true;
+            cx.wait_until(|| {
+                if self.scan_once(global, files, register.then_some(cx.waker())) {
+                    return true;
+                }
+                // Don't register observers again in the next iteration.
+                register = false;
+                false
+            })
+        }
+    }
+
+    /// Returns true if any entry in the poll set requires host polling.
+    fn has_host_poll_fds<FS: ShimFS>(
+        &self,
+        global: &GlobalState<FS>,
+        files: &FilesState<FS>,
+    ) -> bool {
+        let fds = files.file_descriptors.read();
+        for entry in &self.entries {
+            if entry.fd < 0 {
+                continue;
+            }
+            if let Some(file) = fds.get_fd(entry.fd.reinterpret_as_unsigned())
+                && let Ok(poll_descriptor) = EpollDescriptor::try_from(files, file)
+                && poll_descriptor.needs_host_poll(global)
+            {
                 return true;
             }
-            // Don't register observers again in the next iteration.
-            register = false;
-            false
-        })
+        }
+        false
     }
 
     /// Returns the accumulated `revents` for each entry in the poll set.

@@ -542,14 +542,7 @@ impl<FS: ShimFS> Task<FS> {
             }
             let old_act = handler.action;
             if let Some(act) = act {
-                if signal == Signal::SIGCHLD {
-                    litebox::log_println!(
-                        self.global.platform,
-                        "DEBUG rt_sigaction: SIGCHLD handler changed from {:#x} to {:#x}",
-                        old_act.sigaction,
-                        act.sigaction,
-                    );
-                }
+                if signal == Signal::SIGCHLD {}
                 handler.action = act;
             }
             old_act
@@ -629,13 +622,7 @@ impl<FS: ShimFS> Task<FS> {
             while i < queue.len() {
                 if queue[i].target_process_id == my_id {
                     let sig = queue.swap_remove(i);
-                    litebox::log_println!(
-                        self.global.platform,
-                        "DEBUG process_signals: drained {:?} for process {} (pid {})",
-                        sig.signal,
-                        my_id,
-                        self.pid,
-                    );
+
                     self.signals.pending.borrow_mut().push(
                         &self.process().limits,
                         sig.signal,
@@ -669,13 +656,7 @@ impl<FS: ShimFS> Task<FS> {
             }
 
             let action = self.signals.handlers.borrow().inner.lock()[signal].action;
-            litebox::log_println!(
-                self.global.platform,
-                "DEBUG process_signals: delivering {:?} to pid {}, action=0x{:x}",
-                signal,
-                self.pid,
-                action.sigaction as usize,
-            );
+
             #[expect(clippy::match_same_arms)]
             match action.sigaction {
                 SIG_DFL => {
@@ -695,34 +676,17 @@ impl<FS: ShimFS> Task<FS> {
                             );
                             self.exit_group(ExitStatus::Signal(signal));
                         }
-                        SignalDisposition::Ignore => {
-                            litebox::log_println!(
-                                self.global.platform,
-                                "DEBUG process_signals: {:?} ignored (SIG_DFL + Ignore disposition)",
-                                signal,
-                            );
-                        }
+                        SignalDisposition::Ignore => {}
                         SignalDisposition::Continue => {
                             // Stop is not supported, so continue does nothing.
                         }
                     }
                 }
-                SIG_IGN => {
-                    litebox::log_println!(
-                        self.global.platform,
-                        "DEBUG process_signals: {:?} explicitly SIG_IGN",
-                        signal,
-                    );
-                }
+                SIG_IGN => {}
                 _ => {
                     if let Err(DeliverFault) =
                         self.signals.deliver_signal(signal, &siginfo, &action, ctx)
                     {
-                        litebox::log_println!(
-                            self.global.platform,
-                            "DEBUG process_signals: {:?} delivery FAULTED",
-                            signal,
-                        );
                         // Failed to deliver signal. Inject a SIGSEGV
                         // (terminating the process if we were trying to deliver
                         // a SIGSEGV).

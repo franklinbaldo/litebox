@@ -650,6 +650,15 @@ pub trait StdioProvider {
     ) -> Result<u32, StdioIoctlError> {
         Err(StdioIoctlError::NotATerminal)
     }
+
+    /// Check if stdin has data available for reading without blocking.
+    ///
+    /// Returns `true` if a `read()` on stdin would return data immediately.
+    /// Used by epoll/poll to report stdin readability. The default returns
+    /// `false`.
+    fn poll_stdin_readable(&self) -> bool {
+        false
+    }
 }
 
 /// A provider for system information.

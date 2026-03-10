@@ -1936,12 +1936,6 @@ impl<FS: ShimFS> Task<FS> {
         let saved_mask = if let Some(mask_ptr) = sigmask {
             let new_mask = mask_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
             let old = self.signals.get_blocked();
-            litebox::log_println!(
-                self.global.platform,
-                "DEBUG epoll_pwait: sigmask provided, old={:#018x} new={:#018x}",
-                old.as_u64(),
-                new_mask.as_u64(),
-            );
             self.signals.set_blocked(new_mask);
             Some(old)
         } else {

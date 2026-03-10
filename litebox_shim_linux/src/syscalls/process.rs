@@ -545,15 +545,6 @@ impl<FS: ShimFS> Task<FS> {
             if let Some(notif) = exit_notification {
                 use litebox_common_linux::signal::{Siginfo, SiginfoData, Signal};
 
-                litebox::log_println!(
-                    self.global.platform,
-                    "DEBUG SIGCHLD: child {} exiting, exit_signal={}, parent={}, exit_status={}",
-                    notif.child_pid.0,
-                    notif.exit_signal,
-                    notif.parent_pid.0,
-                    notif.exit_status,
-                );
-
                 if let Ok(signal) = Signal::try_from(notif.exit_signal) {
                     const CLD_EXITED: i32 = 1;
                     let mut data = SiginfoData { pad: [0u32; 28] };
@@ -585,33 +576,12 @@ impl<FS: ShimFS> Task<FS> {
                     let handles = self.global.process_thread_handles.read();
                     let parent_key = notif.parent_pid.0.cast_signed();
                     if let Some(remote) = handles.get(&parent_key) {
-                        litebox::log_println!(
-                            self.global.platform,
-                            "DEBUG SIGCHLD: interrupting parent key={}",
-                            parent_key,
-                        );
                         remote.interrupt();
                     } else {
-                        litebox::log_println!(
-                            self.global.platform,
-                            "DEBUG SIGCHLD: NO handle for parent key={}, available keys: {:?}",
-                            parent_key,
-                            handles.keys().collect::<alloc::vec::Vec<_>>(),
-                        );
                     }
                 } else {
-                    litebox::log_println!(
-                        self.global.platform,
-                        "DEBUG SIGCHLD: invalid exit_signal {}",
-                        notif.exit_signal,
-                    );
                 }
             } else {
-                litebox::log_println!(
-                    self.global.platform,
-                    "DEBUG SIGCHLD: no exit notification for pid {}",
-                    self.process_id.0,
-                );
             }
 
             // Release the process's VA partition. For a vfork child that
@@ -653,24 +623,12 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     pub(crate) fn sys_exit(&self, status: i32) {
-        litebox::log_println!(
-            self.global.platform,
-            "DEBUG exit: pid={} status={}",
-            self.pid,
-            status
-        );
         // The `Task` will be dropped on the way out of the shim, which will
         // call `self.prepare_for_exit()`.
         self.exit_thread(status.truncate());
     }
 
     pub(crate) fn sys_exit_group(&self, status: i32) {
-        litebox::log_println!(
-            self.global.platform,
-            "DEBUG exit_group: pid={} status={}",
-            self.pid,
-            status
-        );
         self.exit_group(ExitStatus::Exit(status.truncate()));
     }
 
@@ -2205,41 +2163,9 @@ impl<FS: ShimFS> Task<FS> {
             copy_vector(envp, "envp")?
         };
 
-        // Log full command line
-        let argv_strs: alloc::vec::Vec<&str> = argv_vec
-            .iter()
-            .map(|a| a.to_str().unwrap_or("<invalid>"))
-            .collect();
-        if path.contains("bash") {
-            // Log FD table for bash spawn debugging
-            let files = self.files.borrow();
-            let ft = files.file_descriptors.read();
-            let fd_count = ft.len();
-            litebox::log_println!(
-                self.global.platform,
-                "DEBUG exec bash: pid={} fd_count={} argv={:?}",
-                self.pid,
-                fd_count,
-                argv_strs
-            );
-        } else {
-            litebox::log_println!(
-                self.global.platform,
-                "DEBUG exec: path='{}' argv={:?}",
-                path,
-                argv_strs
-            );
-        }
-
         let loader = match crate::loader::elf::ElfLoader::new(self, path) {
             Ok(l) => l,
             Err(_e) => {
-                litebox::log_println!(
-                    self.global.platform,
-                    "DEBUG exec: failed to load ELF '{}': {:?}",
-                    path,
-                    _e
-                );
                 return Err(Errno::ENOENT);
             }
         };

@@ -150,6 +150,32 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + TimeProvider> IOPollable
     }
 }
 
+/// Wrapper for polling host stdin.
+///
+/// Implements `IOPollable` by querying the host kernel to check if stdin has
+/// data available. This enables epoll/poll/select on the guest's stdin fd.
+pub struct StdinPollable(pub Arc<dyn Fn() -> bool + Send + Sync>);
+
+impl IOPollable for StdinPollable {
+    fn register_observer(&self, _observer: Weak<dyn Observer<Events>>, _mask: Events) {
+        // Stdin observers are not cached — check_io_events polls the host each
+        // time. The epoll wait loop calls scan_once repeatedly with short
+        // timeouts, so this effectively acts as level-triggered polling.
+    }
+
+    fn check_io_events(&self) -> Events {
+        let mut events = Events::OUT;
+        if (self.0)() {
+            events |= Events::IN;
+        }
+        events
+    }
+
+    fn needs_host_poll(&self) -> bool {
+        true
+    }
+}
+
 /// Manages all allocated PTY pairs.
 pub struct PtyManager<Platform: crate::sync::RawSyncPrimitivesProvider + TimeProvider> {
     pairs: crate::sync::Mutex<Platform, Vec<Arc<PtyPair<Platform>>>>,
@@ -748,6 +774,12 @@ impl<
         let table = self.litebox.descriptor_table();
         let entry = table.get_entry(fd)?;
         match entry.entry {
+            Device::Stdin => {
+                let litebox = self.litebox.clone();
+                Some(alloc::boxed::Box::new(StdinPollable(Arc::new(move || {
+                    litebox.x.platform.poll_stdin_readable()
+                }))))
+            }
             Device::PtyMaster(idx) => {
                 let pair = self.pty_manager.get(idx)?;
                 Some(alloc::boxed::Box::new(PtyMasterPollable(pair)))

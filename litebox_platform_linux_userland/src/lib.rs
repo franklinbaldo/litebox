@@ -2186,6 +2186,17 @@ impl litebox::platform::StdioProvider for LinuxUserland {
             Ok(u32::try_from(ret).unwrap_or(0))
         }
     }
+
+    fn poll_stdin_readable(&self) -> bool {
+        let mut pfd = libc::pollfd {
+            fd: 0, // stdin
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll with timeout=0 is a non-blocking check.
+        let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
+        ret > 0 && (pfd.revents & libc::POLLIN) != 0
+    }
 }
 
 unsafe extern "C" {
