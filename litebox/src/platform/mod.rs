@@ -439,12 +439,9 @@ where
         // safe (it probably is fine, but the following sequence of steps ensures we are
         // staying in a very safe subset).
         let bytes: *mut [c_char] = Box::into_raw(bytes);
-        // SAFETY: On aarch64, c_char is u8, so no cast is needed. On x86/x86_64, c_char is i8
-        // which has the same size and alignment as u8; the pointer metadata (length) is
-        // preserved by the cast.
-        #[cfg(target_arch = "aarch64")]
-        let bytes: *mut [u8] = bytes;
-        #[cfg(not(target_arch = "aarch64"))]
+        // SAFETY: c_char (whether i8 or u8) has the same size and alignment as u8;
+        // the pointer metadata (length) is preserved by the cast.
+        #[allow(clippy::unnecessary_cast)]
         let bytes: *mut [u8] = bytes as *mut [u8];
         let bytes: Box<[u8]> = unsafe { Box::from_raw(bytes) };
         let bytes: Vec<u8> = Vec::from(bytes);
