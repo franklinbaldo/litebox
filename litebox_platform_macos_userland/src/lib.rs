@@ -420,8 +420,8 @@ unsafe extern "C-unwind" fn run_thread_arch(
     // ================================================================
     .cfi_endproc
 
-    .globl syscall_callback
-syscall_callback:
+    .globl _syscall_callback
+_syscall_callback:
     .cfi_startproc
     // Clear in_guest flag. Must be first instruction to match the
     // expectations of interrupt_signal_handler.
@@ -500,8 +500,8 @@ syscall_callback:
     b .Ldone_aarch64
     .cfi_endproc
 
-    .globl exception_callback
-exception_callback:
+    .globl _exception_callback
+_exception_callback:
     .cfi_startproc
     // Restore host stack.
     mrs x18, tpidr_el0
@@ -513,8 +513,8 @@ exception_callback:
     b .Ldone_aarch64
     .cfi_endproc
 
-    .globl interrupt_callback
-interrupt_callback:
+    .globl _interrupt_callback
+_interrupt_callback:
     .cfi_startproc
     // Restore host stack.
     mrs x18, tpidr_el0
@@ -567,8 +567,8 @@ interrupt_callback:
 #[unsafe(naked)]
 unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     core::arch::naked_asm!(
-        ".globl switch_to_guest_start",
-        "switch_to_guest_start:",
+        ".globl _switch_to_guest_start",
+        "_switch_to_guest_start:",
         // Set `in_guest` now, then check if there is a pending interrupt.
         // If so, jump to the interrupt handler.
         //
@@ -620,9 +620,9 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         "br x16",
         // Local trampoline for cbnz — macOS assembler rejects conditional
         // branches to non-assembler-local labels (only numbered labels qualify).
-        "2: b interrupt_callback",
-        ".globl switch_to_guest_end",
-        "switch_to_guest_end:",
+        "2: b _interrupt_callback",
+        ".globl _switch_to_guest_end",
+        "_switch_to_guest_end:",
     );
 }
 
