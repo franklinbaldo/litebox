@@ -64,6 +64,7 @@ fn mmapped_file(path: impl AsRef<Path>) -> Result<MmappedFile> {
 }
 
 /// Run Linux programs with LiteBox on macOS Apple Silicon.
+#[allow(clippy::missing_panics_doc)]
 pub fn run(cli_args: CliArgs) -> Result<()> {
     if !cli_args.insert_files.is_empty() {
         unimplemented!(

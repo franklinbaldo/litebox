@@ -18,7 +18,7 @@ use litebox::platform::page_mgmt::{
 };
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer as _};
 use litebox::shim::ContinueOperation;
-use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt};
+use litebox::utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt};
 use litebox_common_linux::{MapFlags, ProtFlags, PunchthroughSyscall, vmap::VmapManager};
 
 use zerocopy::{FromBytes, IntoBytes};
@@ -97,10 +97,12 @@ struct ThreadControlBlock {
     _pad: [u8; 6],
 }
 
+#[allow(dead_code)]
 const fn tcb_offset_scratch() -> isize {
     0
 }
 
+#[allow(dead_code)]
 const fn tcb_offset_host_sp() -> isize {
     8
 }
@@ -203,11 +205,11 @@ impl MacosUserland {
             let kr = unsafe {
                 mach_vm_region_recurse(
                     mach_task_self(),
-                    &mut address,
-                    &mut size,
-                    &mut depth,
-                    &mut info,
-                    &mut count,
+                    &raw mut address,
+                    &raw mut size,
+                    &raw mut depth,
+                    &raw mut info,
+                    &raw mut count,
                 )
             };
             if kr != KERN_SUCCESS {
@@ -227,6 +229,7 @@ impl MacosUserland {
         clippy::missing_panics_doc,
         reason = "panicking only on failures of documented linux contracts"
     )]
+    #[allow(clippy::useless_conversion)]
     pub fn init_task(&self) -> litebox_common_linux::TaskParams {
         let tid = unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) }
             .try_into()
@@ -336,7 +339,7 @@ fn run_thread_inner(
 
 fn set_guest_tpidr(value: usize) {
     unsafe {
-        (*(litebox_common_linux::read_tpidr_el0() as *mut ThreadControlBlock)).guest_tpidr = value
+        (*(litebox_common_linux::read_tpidr_el0() as *mut ThreadControlBlock)).guest_tpidr = value;
     }
 }
 
@@ -727,15 +730,13 @@ impl RawMutex {
             return Err(ImmediatelyWokenUp);
         }
 
-        let timeout_us = timeout
-            .map(|d| u32::try_from(d.as_micros()).unwrap_or(u32::MAX))
-            .unwrap_or(0);
+        let timeout_us = timeout.map_or(0, |d| u32::try_from(d.as_micros()).unwrap_or(u32::MAX));
 
         loop {
             let ret = unsafe {
                 __ulock_wait(
                     UL_COMPARE_AND_WAIT,
-                    (&self.inner as *const AtomicU32).cast_mut().cast(),
+                    (&raw const self.inner).cast_mut().cast(),
                     u64::from(val),
                     timeout_us,
                 )
@@ -746,7 +747,7 @@ impl RawMutex {
             match std::io::Error::last_os_error().raw_os_error() {
                 Some(libc::EAGAIN) => return Err(ImmediatelyWokenUp),
                 Some(libc::ETIMEDOUT) => return Ok(UnblockedOrTimedOut::TimedOut),
-                Some(libc::EINTR) => continue,
+                Some(libc::EINTR) => {}
                 _ => panic!(
                     "Unexpected error for __ulock_wait: {}",
                     std::io::Error::last_os_error()
@@ -769,7 +770,7 @@ impl litebox::platform::RawMutex for RawMutex {
         let ret = unsafe {
             __ulock_wake(
                 UL_COMPARE_AND_WAIT | flags,
-                (&self.inner as *const AtomicU32).cast_mut().cast(),
+                (&raw const self.inner).cast_mut().cast(),
                 0,
             )
         };
@@ -780,7 +781,7 @@ impl litebox::platform::RawMutex for RawMutex {
             }
             panic!("Unexpected error for __ulock_wake: {err}");
         }
-        ret as usize
+        ret.reinterpret_as_unsigned() as usize
     }
 
     fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
@@ -1074,8 +1075,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
             libc::mmap(
                 new_range.start as *mut libc::c_void,
                 new_range.len(),
-                (libc::PROT_READ | libc::PROT_WRITE).into(),
-                (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED).into(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
                 -1,
                 0,
             )
@@ -1088,7 +1089,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         unsafe {
             core::ptr::copy_nonoverlapping(
                 old_range.start as *const u8,
-                new_ptr as *mut u8,
+                new_ptr.cast::<u8>(),
                 copy_len,
             );
         }
@@ -1151,7 +1152,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
             libc::openat(
                 libc::AT_FDCWD,
                 file_path_cstr.as_ptr(),
-                OFlags::RDONLY.bits() as libc::c_int,
+                OFlags::RDONLY.bits().reinterpret_as_signed(),
                 0,
             )
         };
