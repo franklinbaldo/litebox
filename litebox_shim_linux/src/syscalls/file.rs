@@ -372,10 +372,41 @@ impl<FS: ShimFS> Task<FS> {
                     .run_on_raw_fd(
                         raw_fd,
                         |fd| {
-                            self.global
+                            // First attempt.
+                            let result = self
+                                .global
                                 .fs
                                 .read(fd, &mut buf.borrow_mut(), offset)
-                                .map_err(Errno::from)
+                                .map_err(Errno::from);
+                            // If the read returned EIO (no data), check whether
+                            // this fd is a pollable device (e.g. PTY slave).
+                            // If so, block until data arrives or task exits.
+                            if let Err(Errno::EIO) = result
+                                && let Some(pollable) = self.global.fs.get_io_pollable(fd)
+                            {
+                                loop {
+                                    if self.is_exiting() {
+                                        return Err(Errno::EIO);
+                                    }
+                                    let events = pollable.check_io_events();
+                                    if events.contains(Events::HUP) {
+                                        return Ok(0); // EOF — master closed
+                                    }
+                                    if events.contains(Events::IN) {
+                                        match self.global.fs.read(fd, &mut buf.borrow_mut(), offset)
+                                        {
+                                            Ok(n) => return Ok(n),
+                                            Err(litebox::fs::errors::ReadError::Io) => {
+                                                core::hint::spin_loop();
+                                                continue;
+                                            }
+                                            Err(e) => return Err(Errno::from(e)),
+                                        }
+                                    }
+                                    core::hint::spin_loop();
+                                }
+                            }
+                            result
                         },
                         |fd| {
                             self.global.receive(

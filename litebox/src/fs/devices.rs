@@ -572,26 +572,22 @@ impl<
                 return Ok(n);
             }
             &Device::PtySlave(idx) => {
-                // Slave reads what the master has written
+                // Slave reads what the master has written.
+                // Returns Io (EAGAIN-equivalent) when no data is available;
+                // the shim layer handles blocking retry with interruptibility.
                 let pair = self.pty_manager.get(idx).ok_or(ReadError::ClosedFd)?;
-                // For slave reads, block until data is available
-                loop {
-                    {
-                        let mut ring = pair.master_to_slave.lock();
-                        if !ring.is_empty() {
-                            let n = core::cmp::min(buf.len(), ring.len());
-                            for (i, byte) in ring.drain(..n).enumerate() {
-                                buf[i] = byte;
-                            }
-                            return Ok(n);
-                        }
-                    }
+                let mut ring = pair.master_to_slave.lock();
+                if ring.is_empty() {
                     if !pair.master_open.load(core::sync::atomic::Ordering::Acquire) {
                         return Ok(0); // EOF — master closed
                     }
-                    // Brief yield before retry
-                    core::hint::spin_loop();
+                    return Err(ReadError::Io);
                 }
+                let n = core::cmp::min(buf.len(), ring.len());
+                for (i, byte) in ring.drain(..n).enumerate() {
+                    buf[i] = byte;
+                }
+                return Ok(n);
             }
         }
         // Stdin is a stream device — offsets are meaningless. Ignore any
