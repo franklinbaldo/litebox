@@ -25,8 +25,23 @@ use zerocopy::{FromBytes, IntoBytes};
 
 extern crate alloc;
 
+/// macOS arm64 uses 16KB pages. All kernel VM operations (mmap, munmap, mprotect)
+/// require addresses aligned to this size. Litebox tracks VMAs at 4KB (PAGE_SIZE)
+/// granularity, so the platform layer must round to HOST_PAGE_SIZE boundaries.
+const HOST_PAGE_SIZE: usize = 16384;
+
 const KERN_SUCCESS: i32 = 0;
 const VM_REGION_SUBMAP_INFO_COUNT_64: u32 = 16;
+
+/// Round `addr` down to HOST_PAGE_SIZE alignment.
+const fn host_page_align_down(addr: usize) -> usize {
+    addr & !(HOST_PAGE_SIZE - 1)
+}
+
+/// Round `addr` up to HOST_PAGE_SIZE alignment.
+const fn host_page_align_up(addr: usize) -> usize {
+    (addr + HOST_PAGE_SIZE - 1) & !(HOST_PAGE_SIZE - 1)
+}
 
 #[repr(C)]
 struct vm_region_submap_info_64 {
@@ -1089,11 +1104,24 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         _populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
+        // Round the range to HOST_PAGE_SIZE boundaries for MAP_FIXED operations.
+        // macOS arm64 requires 16KB-aligned addresses for all VM operations.
+        // For Hint, we pass the suggested address as-is; the kernel will pick
+        // a properly aligned address.
+        let (mmap_start, mmap_len) = match fixed_address_behavior {
+            FixedAddressBehavior::Hint => (suggested_range.start, suggested_range.len()),
+            FixedAddressBehavior::Replace | FixedAddressBehavior::NoReplace => {
+                let aligned_start = host_page_align_down(suggested_range.start);
+                let aligned_end = host_page_align_up(suggested_range.end);
+                (aligned_start, aligned_end - aligned_start)
+            }
+        };
+
         // Emulate MAP_FIXED_NOREPLACE on macOS: probe that the range is free, then
         // use MAP_FIXED to guarantee the exact address. macOS does not honor mmap
         // address hints reliably, so a hint-only approach would spuriously fail.
         if matches!(fixed_address_behavior, FixedAddressBehavior::NoReplace) {
-            if !is_range_unmapped(suggested_range.start, suggested_range.len()) {
+            if !is_range_unmapped(mmap_start, mmap_len) {
                 return Err(litebox::platform::page_mgmt::AllocationError::AddressInUse);
             }
         }
@@ -1115,8 +1143,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
             };
         let r = unsafe {
             libc::mmap(
-                suggested_range.start as *mut libc::c_void,
-                suggested_range.len(),
+                mmap_start as *mut libc::c_void,
+                mmap_len,
                 prot_flags(initial_permissions).bits(),
                 macos_mmap_flags(linux_flags),
                 -1,
@@ -1130,15 +1158,37 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 _ => panic!("unhandled mmap error {err}"),
             });
         }
-        Ok(UserMutPtr::from_usize(r as usize))
+        // Return the original suggested start address (4KB-aligned) so the VMem
+        // layer's bookkeeping is consistent, even though the kernel mapped a wider
+        // 16KB-aligned region.
+        match fixed_address_behavior {
+            FixedAddressBehavior::Hint => Ok(UserMutPtr::from_usize(r as usize)),
+            FixedAddressBehavior::Replace | FixedAddressBehavior::NoReplace => {
+                Ok(UserMutPtr::from_usize(suggested_range.start))
+            }
+        }
     }
 
     unsafe fn deallocate_pages(
         &self,
         range: core::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
-        let r = unsafe { libc::munmap(range.start as *mut libc::c_void, range.len()) };
-        assert_eq!(r, 0, "munmap failed: {}", std::io::Error::last_os_error());
+        // Round inward to HOST_PAGE_SIZE boundaries to avoid unmapping adjacent
+        // 4KB sub-pages that belong to other VMAs within the same 16KB host page.
+        // Sub-16KB edge portions are left mapped (as PROT_NONE from the original
+        // reserve) and will be reclaimed when the enclosing host page is fully
+        // deallocated or replaced by a subsequent MAP_FIXED mmap.
+        let aligned_start = host_page_align_up(range.start);
+        let aligned_end = host_page_align_down(range.end);
+        if aligned_start < aligned_end {
+            let r = unsafe {
+                libc::munmap(
+                    aligned_start as *mut libc::c_void,
+                    aligned_end - aligned_start,
+                )
+            };
+            assert_eq!(r, 0, "munmap failed: {}", std::io::Error::last_os_error());
+        }
         Ok(())
     }
 
@@ -1148,10 +1198,15 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         new_range: core::ops::Range<usize>,
         permissions: MemoryRegionPermissions,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::RemapError> {
+        // Round ranges outward to HOST_PAGE_SIZE for kernel VM operations.
+        let old_aligned_start = host_page_align_down(old_range.start);
+        let old_aligned_end = host_page_align_up(old_range.end);
+        let new_aligned_start = host_page_align_down(new_range.start);
+        let new_aligned_end = host_page_align_up(new_range.end);
         let new_ptr = unsafe {
             libc::mmap(
-                new_range.start as *mut libc::c_void,
-                new_range.len(),
+                new_aligned_start as *mut libc::c_void,
+                new_aligned_end - new_aligned_start,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
                 -1,
@@ -1163,29 +1218,41 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         }
 
         let copy_len = old_range.len().min(new_range.len());
+        // Copy from the original (non-aligned) start to the new mapping at the
+        // correct offset within the host page.
+        let dst = (new_range.start) as *mut u8;
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                old_range.start as *const u8,
-                new_ptr.cast::<u8>(),
-                copy_len,
-            );
+            core::ptr::copy_nonoverlapping(old_range.start as *const u8, dst, copy_len);
         }
 
         if permissions != (MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE) {
-            let r =
-                unsafe { libc::mprotect(new_ptr, new_range.len(), prot_flags(permissions).bits()) };
+            let r = unsafe {
+                libc::mprotect(
+                    new_aligned_start as *mut libc::c_void,
+                    new_aligned_end - new_aligned_start,
+                    prot_flags(permissions).bits(),
+                )
+            };
             if r != 0 {
                 unsafe {
-                    libc::munmap(new_ptr, new_range.len());
+                    libc::munmap(
+                        new_aligned_start as *mut libc::c_void,
+                        new_aligned_end - new_aligned_start,
+                    );
                 }
                 return Err(litebox::platform::page_mgmt::RemapError::OutOfMemory);
             }
         }
 
-        let r = unsafe { libc::munmap(old_range.start as *mut libc::c_void, old_range.len()) };
+        let r = unsafe {
+            libc::munmap(
+                old_aligned_start as *mut libc::c_void,
+                old_aligned_end - old_aligned_start,
+            )
+        };
         assert_eq!(r, 0, "munmap failed: {}", std::io::Error::last_os_error());
 
-        Ok(UserMutPtr::from_usize(new_ptr as usize))
+        Ok(UserMutPtr::from_usize(new_range.start))
     }
 
     unsafe fn update_permissions(
@@ -1193,10 +1260,15 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         range: core::ops::Range<usize>,
         new_permissions: MemoryRegionPermissions,
     ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
+        // Round outward to HOST_PAGE_SIZE boundaries. This is safe because
+        // mprotect within a reserved region only widens to adjacent sub-pages
+        // that are already PROT_NONE (from the enclosing reserve mapping).
+        let aligned_start = host_page_align_down(range.start);
+        let aligned_end = host_page_align_up(range.end);
         let r = unsafe {
             libc::mprotect(
-                range.start as *mut libc::c_void,
-                range.len(),
+                aligned_start as *mut libc::c_void,
+                aligned_end - aligned_start,
                 prot_flags(new_permissions).bits(),
             )
         };
@@ -1218,6 +1290,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         let Some((file_path, file_offset)) = self.lookup_cow_region(source_data) else {
             return Err(CowAllocationError::UnsupportedSourceRegion);
         };
+        // macOS arm64 requires file offsets to be HOST_PAGE_SIZE-aligned for mmap.
+        // ELF files built for Linux use 4KB alignment, which won't satisfy this.
+        if !file_offset.is_multiple_of(HOST_PAGE_SIZE) {
+            return Err(CowAllocationError::Unaligned);
+        }
         if !file_offset.is_multiple_of(ALIGN) {
             return Err(CowAllocationError::Unaligned);
         }
@@ -1235,9 +1312,19 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         };
         assert!(fd >= 0, "file should remain unchanged on host");
 
+        // Round range to HOST_PAGE_SIZE for MAP_FIXED operations.
+        let (mmap_start, mmap_len) = match fixed_address_behavior {
+            FixedAddressBehavior::Hint => (suggested_start, source_data.len()),
+            FixedAddressBehavior::Replace | FixedAddressBehavior::NoReplace => {
+                let aligned_start = host_page_align_down(suggested_start);
+                let aligned_end = host_page_align_up(suggested_start + source_data.len());
+                (aligned_start, aligned_end - aligned_start)
+            }
+        };
+
         // Emulate MAP_FIXED_NOREPLACE: probe range, then use MAP_FIXED.
         if matches!(fixed_address_behavior, FixedAddressBehavior::NoReplace)
-            && !is_range_unmapped(suggested_start, source_data.len())
+            && !is_range_unmapped(mmap_start, mmap_len)
         {
             unsafe {
                 libc::close(fd);
@@ -1256,8 +1343,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
 
         let result = unsafe {
             libc::mmap(
-                suggested_start as *mut libc::c_void,
-                source_data.len(),
+                mmap_start as *mut libc::c_void,
+                mmap_len,
                 prot_flags(permissions).bits(),
                 macos_mmap_flags(flags),
                 fd,
@@ -1272,7 +1359,15 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         if result == libc::MAP_FAILED {
             Err(CowAllocationError::InternalFailure)
         } else {
-            Ok(UserMutPtr::from_usize(result as usize))
+            // Return the original suggested_start for fixed-address operations so
+            // the VMem layer's 4KB bookkeeping is consistent, even though the
+            // kernel mapped a wider 16KB-aligned region.
+            match fixed_address_behavior {
+                FixedAddressBehavior::Hint => Ok(UserMutPtr::from_usize(result as usize)),
+                FixedAddressBehavior::Replace | FixedAddressBehavior::NoReplace => {
+                    Ok(UserMutPtr::from_usize(suggested_start))
+                }
+            }
         }
     }
 }
