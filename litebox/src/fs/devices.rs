@@ -54,6 +54,13 @@ const STDERR_NODE_INFO: NodeInfo = NodeInfo {
     ino: 11,
     rdev: core::num::NonZeroUsize::new(0x500),
 };
+/// Node info for /dev/tty (controlling terminal)
+const TTY_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 12,
+    // major=5, minor=0 — matches the controlling terminal
+    rdev: core::num::NonZeroUsize::new(0x500),
+};
 /// Node info for /dev/null
 const NULL_NODE_INFO: NodeInfo = NodeInfo {
     dev: 5,
@@ -276,6 +283,8 @@ enum Device {
     Stdin,
     Stdout,
     Stderr,
+    /// Controlling terminal (/dev/tty) — reads from stdin, writes to stdout.
+    Tty,
     Null,
     URandom,
     /// Master side of PTY pair (index into PtyManager).
@@ -394,6 +403,14 @@ impl<
                 node_info: STDERR_NODE_INFO,
                 blksize: STDIO_BLOCK_SIZE,
             },
+            Device::Tty => FileStatus {
+                file_type: FileType::CharacterDevice,
+                mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP,
+                size: 0,
+                owner: UserInfo::ROOT,
+                node_info: TTY_NODE_INFO,
+                blksize: STDIO_BLOCK_SIZE,
+            },
             Device::Null => FileStatus {
                 file_type: FileType::CharacterDevice,
                 mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
@@ -487,6 +504,7 @@ impl<
             }
             "/dev/null" => Device::Null,
             "/dev/urandom" => Device::URandom,
+            "/dev/tty" => Device::Tty,
             "/dev/ptmx" => {
                 let idx = self.pty_manager.alloc();
                 Device::PtyMaster(idx)
@@ -567,7 +585,7 @@ impl<
             .ok_or(ReadError::ClosedFd)?
             .entry
         {
-            Device::Stdin => {}
+            Device::Stdin | Device::Tty => {}
             Device::Stdout | Device::Stderr => {
                 return Err(ReadError::NotForReading);
             }
@@ -636,7 +654,7 @@ impl<
             .entry
         {
             Device::Stdin => return Err(WriteError::NotForWriting),
-            Device::Stdout => StdioOutStream::Stdout,
+            Device::Stdout | Device::Tty => StdioOutStream::Stdout,
             Device::Stderr => StdioOutStream::Stderr,
             Device::Null | Device::URandom => {
                 // /dev/null discards data: report as if written fully
@@ -735,6 +753,7 @@ impl<
             Device::Stdin
             | Device::Stdout
             | Device::Stderr
+            | Device::Tty
             | Device::PtyMaster(_)
             | Device::PtySlave(_) => Err(SeekError::NonSeekable),
             Device::Null | Device::URandom => {
@@ -800,6 +819,7 @@ impl<
             "/dev/stdin" => Device::Stdin,
             "/dev/stdout" => Device::Stdout,
             "/dev/stderr" => Device::Stderr,
+            "/dev/tty" => Device::Tty,
             "/dev/null" => Device::Null,
             "/dev/urandom" => Device::URandom,
             "/dev/ptmx" => {
@@ -868,7 +888,7 @@ impl<
         let table = self.litebox.descriptor_table();
         let entry = table.get_entry(fd)?;
         match entry.entry {
-            Device::Stdin => {
+            Device::Stdin | Device::Tty => {
                 let litebox = self.litebox.clone();
                 Some(alloc::boxed::Box::new(StdinPollable(Arc::new(move || {
                     litebox.x.platform.poll_stdin_readable()

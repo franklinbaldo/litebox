@@ -2141,12 +2141,13 @@ impl litebox::platform::StdioProvider for LinuxUserland {
                 continue;
             }
 
-            if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 && pfd.revents & libc::POLLIN == 0
+            {
                 return Err(litebox::platform::StdioReadError::Closed);
             }
 
             if pfd.revents & libc::POLLIN != 0 {
-                return unsafe {
+                let result = unsafe {
                     syscalls::syscall4(
                         syscalls::Sysno::read,
                         usize::try_from(litebox_common_linux::STDIN_FILENO).unwrap(),
@@ -2154,8 +2155,8 @@ impl litebox::platform::StdioProvider for LinuxUserland {
                         buf.len(),
                         syscall_intercept::SYSCALL_ARG_MAGIC,
                     )
-                }
-                .map_err(|err| match err {
+                };
+                return result.map_err(|err| match err {
                     syscalls::Errno::EPIPE | syscalls::Errno::EIO => {
                         litebox::platform::StdioReadError::Closed
                     }

@@ -669,10 +669,12 @@ impl<FS: ShimFS> Task<FS> {
                             // supported.
                             litebox::log_println!(
                                 self.global.platform,
-                                "-- Fatal signal {:?}: terminating task {}:{}",
+                                "-- Fatal signal {:?}: terminating task {}:{} fault_addr={:#x} error_code={:#x}",
                                 signal,
                                 self.pid,
                                 self.tid,
+                                self.signals.last_exception.get().cr2,
+                                self.signals.last_exception.get().error_code,
                             );
                             self.exit_group(ExitStatus::Signal(signal));
                         }

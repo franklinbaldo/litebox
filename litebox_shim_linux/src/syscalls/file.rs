@@ -1485,9 +1485,9 @@ impl<FS: ShimFS> Task<FS> {
             .fs
             .fd_file_status(fd)
             .map_err(|_| Errno::EBADF)?;
-        // Each stdio device has a distinct ino (stdin=9, stdout=10, stderr=11).
+        // Each stdio device has a distinct ino (stdin=9, stdout=10, stderr=11, tty=12).
         let preferred = match status.node_info.ino {
-            9 => StdioStream::Stdin,
+            9 | 12 => StdioStream::Stdin,
             10 => StdioStream::Stdout,
             _ => StdioStream::Stderr,
         };

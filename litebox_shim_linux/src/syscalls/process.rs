@@ -252,7 +252,11 @@ impl<FS: ShimFS> Task<FS> {
         inner.exit_status = status;
         inner.group_exit = true;
         // Cancel blocking stdin reads so threads in host syscalls can exit.
-        self.global.platform.cancel_stdin();
+        // Only do this for the init process; child processes should not cancel
+        // stdin for the entire sandbox.
+        if self.process_id == litebox::process::ProcessId::INIT {
+            self.global.platform.cancel_stdin();
+        }
         for (&_tid, thread) in &inner.threads {
             thread.is_exiting.store(true, Ordering::Relaxed);
             thread.interrupt();
@@ -270,7 +274,11 @@ impl<FS: ShimFS> Task<FS> {
                 return false;
             }
             // Cancel blocking stdin reads so threads in host syscalls can exit.
-            self.global.platform.cancel_stdin();
+            // Only do this for the init process; child processes should not cancel
+            // stdin for the entire sandbox.
+            if self.process_id == litebox::process::ProcessId::INIT {
+                self.global.platform.cancel_stdin();
+            }
             for (&tid, thread) in &inner.threads {
                 if tid == self.tid {
                     continue;
