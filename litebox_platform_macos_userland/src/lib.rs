@@ -355,22 +355,22 @@ fn run_thread_inner(
     let mut thread_ctx = ThreadContext { shim, ctx };
     let mut tcb = Box::new(ThreadControlBlock::default());
     ThreadHandle::run_with_handle(|| {
-        // Save original TPIDR_EL0 and install our TCB BEFORE setting up the
-        // signal alt-stack. The alt-stack stores TPIDR_EL0 as `host_tls` for
-        // signal handler recovery — it must be our TCB pointer, not the
-        // original macOS TPIDR_EL0 value (which is unrelated to our TCB).
         let original_tpidr = unsafe { litebox_common_linux::read_tpidr_el0() };
         tcb.scratch = original_tpidr;
         let tcb_ptr = &raw mut *tcb;
         let tcb_addr = tcb_ptr as usize;
-        // Set both the thread-local (for Rust code) and TPIDR_EL0 (for asm).
+        // Set the thread-local (for Rust code) now. TPIDR_EL0 is set inside
+        // the closure because macOS libc calls (mmap, sigaltstack, etc.) in
+        // with_signal_alt_stack reset TPIDR_EL0 to the pthread value.
         TCB_PTR.set(tcb_ptr);
-        unsafe { litebox_common_linux::write_tpidr_el0(tcb_addr) };
         eprintln!(
             "[diag] run_thread_inner: TCB at {:#x}, original_tpidr={:#x}, reenter={}",
             tcb_addr, original_tpidr, reenter
         );
         with_signal_alt_stack(tcb_addr, || unsafe {
+            // Set TPIDR_EL0 here, right before the asm, because macOS
+            // syscalls (inside with_signal_alt_stack setup) clobber it.
+            litebox_common_linux::write_tpidr_el0(tcb_addr);
             let tpidr_before_asm: usize;
             core::arch::asm!("mrs {}, tpidr_el0", out(reg) tpidr_before_asm, options(nostack, nomem));
             eprintln!(
