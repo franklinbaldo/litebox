@@ -254,7 +254,19 @@ impl<FS: ShimFS> Task<FS> {
         // Cancel blocking stdin reads so threads in host syscalls can exit.
         // Only do this for the init process; child processes should not cancel
         // stdin for the entire sandbox.
-        if self.process_id == litebox::process::ProcessId::INIT {
+        let is_init = self.process_id == litebox::process::ProcessId::INIT;
+        if is_init {
+            litebox::log_println!(
+                self.global.platform,
+                "[EXIT] exit_group: tid={}, nr_threads={}, tids={:?}",
+                self.tid,
+                inner.threads.len(),
+                inner
+                    .threads
+                    .keys()
+                    .copied()
+                    .collect::<alloc::vec::Vec<_>>(),
+            );
             self.global.platform.cancel_stdin();
         }
         for (&_tid, thread) in &inner.threads {
@@ -686,26 +698,47 @@ impl<FS: ShimFS> Task<FS> {
             Errno::EINVAL
         })?;
 
-        let result = self.global.litebox.process_registry().wait_for_child(
-            self.process_id,
-            target,
-            wait_options,
-        );
+        // Always use WNOHANG and poll with an interruptible sleep so that
+        // exit_group / signals can break us out of the wait.
+        let nohang_options = wait_options | WaitOptions::WNOHANG;
 
-        match result {
-            Ok(wr) => {
-                if let Some(ptr) = wstatus {
-                    // Encode status as Linux wait status: (exit_code & 0xff) << 8
-                    let encoded = (wr.status & 0xff) << 8;
-                    let _ = ptr.write_at_offset(0, encoded);
+        loop {
+            let result = self.global.litebox.process_registry().wait_for_child(
+                self.process_id,
+                target,
+                nohang_options,
+            );
+
+            match result {
+                Ok(wr) => {
+                    if let Some(ptr) = wstatus {
+                        let encoded = (wr.status & 0xff) << 8;
+                        let _ = ptr.write_at_offset(0, encoded);
+                    }
+                    return Ok(wr.pid.0 as usize);
                 }
-                Ok(wr.pid.0 as usize)
+                Err(litebox::process::WaitError::WouldBlock) => {
+                    if wait_options.contains(WaitOptions::WNOHANG) {
+                        // Caller asked for non-blocking — return 0.
+                        return Ok(0);
+                    }
+                    // Sleep interruptibly, then retry. The WaitContext sleep
+                    // is interruptible by exit_group and signals.
+                    let poll_cx = self
+                        .wait_cx()
+                        .with_timeout(Some(core::time::Duration::from_millis(50)));
+                    match poll_cx.sleep() {
+                        litebox::event::wait::WaitError::TimedOut => continue,
+                        litebox::event::wait::WaitError::Interrupted => {
+                            return Err(Errno::EINTR);
+                        }
+                    }
+                }
+                Err(
+                    litebox::process::WaitError::NoChildren
+                    | litebox::process::WaitError::NoSuchProcess,
+                ) => return Err(Errno::ECHILD),
             }
-            Err(litebox::process::WaitError::WouldBlock) => Ok(0),
-            Err(
-                litebox::process::WaitError::NoChildren
-                | litebox::process::WaitError::NoSuchProcess,
-            ) => Err(Errno::ECHILD),
         }
     }
 
@@ -755,47 +788,54 @@ impl<FS: ShimFS> Task<FS> {
             wait_options |= WaitOptions::WNOHANG;
         }
 
-        let result = self.global.litebox.process_registry().wait_for_child(
-            self.process_id,
-            target,
-            wait_options,
-        );
+        let nohang_options = wait_options | WaitOptions::WNOHANG;
 
-        match result {
-            Ok(wr) => {
-                // Fill siginfo_t structure at infop if provided.
-                // siginfo_t is 128 bytes on x86_64. We fill the relevant fields:
-                //   si_signo (offset 0, i32) = SIGCHLD (17)
-                //   si_errno (offset 4, i32) = 0
-                //   si_code  (offset 8, i32) = CLD_EXITED (1)
-                //   si_pid   (offset 12, i32) = child pid
-                //   si_uid   (offset 16, i32) = 0
-                //   si_status(offset 20, i32) = exit status
-                if let Some(ptr) = infop {
-                    const SIGCHLD: i32 = 17;
-                    const CLD_EXITED: i32 = 1;
-                    let si_ptr: crate::MutPtr<i32> = crate::MutPtr::from_usize(ptr.as_usize());
-                    let _ = si_ptr.write_at_offset(0, SIGCHLD); // si_signo
-                    let _ = si_ptr.write_at_offset(1, 0); // si_errno
-                    let _ = si_ptr.write_at_offset(2, CLD_EXITED); // si_code
-                    let _ = si_ptr.write_at_offset(3, wr.pid.0.cast_signed()); // si_pid
-                    let _ = si_ptr.write_at_offset(4, 0); // si_uid
-                    let _ = si_ptr.write_at_offset(5, wr.status); // si_status
+        loop {
+            let result = self.global.litebox.process_registry().wait_for_child(
+                self.process_id,
+                target,
+                nohang_options,
+            );
+
+            match result {
+                Ok(wr) => {
+                    if let Some(ptr) = infop {
+                        const SIGCHLD: i32 = 17;
+                        const CLD_EXITED: i32 = 1;
+                        let si_ptr: crate::MutPtr<i32> = crate::MutPtr::from_usize(ptr.as_usize());
+                        let _ = si_ptr.write_at_offset(0, SIGCHLD); // si_signo
+                        let _ = si_ptr.write_at_offset(1, 0); // si_errno
+                        let _ = si_ptr.write_at_offset(2, CLD_EXITED); // si_code
+                        let _ = si_ptr.write_at_offset(3, wr.pid.0.cast_signed()); // si_pid
+                        let _ = si_ptr.write_at_offset(4, 0); // si_uid
+                        let _ = si_ptr.write_at_offset(5, wr.status); // si_status
+                    }
+                    return Ok(0);
                 }
-                Ok(0) // waitid returns 0 on success
-            }
-            Err(litebox::process::WaitError::WouldBlock) => {
-                // WNOHANG: zero out infop and return 0.
-                if let Some(ptr) = infop {
-                    let si_ptr: crate::MutPtr<i32> = crate::MutPtr::from_usize(ptr.as_usize());
-                    let _ = si_ptr.write_at_offset(0, 0); // si_signo = 0
+                Err(litebox::process::WaitError::WouldBlock) => {
+                    if wait_options.contains(WaitOptions::WNOHANG) {
+                        if let Some(ptr) = infop {
+                            let si_ptr: crate::MutPtr<i32> =
+                                crate::MutPtr::from_usize(ptr.as_usize());
+                            let _ = si_ptr.write_at_offset(0, 0); // si_signo = 0
+                        }
+                        return Ok(0);
+                    }
+                    let poll_cx = self
+                        .wait_cx()
+                        .with_timeout(Some(core::time::Duration::from_millis(50)));
+                    match poll_cx.sleep() {
+                        litebox::event::wait::WaitError::TimedOut => continue,
+                        litebox::event::wait::WaitError::Interrupted => {
+                            return Err(Errno::EINTR);
+                        }
+                    }
                 }
-                Ok(0)
+                Err(
+                    litebox::process::WaitError::NoChildren
+                    | litebox::process::WaitError::NoSuchProcess,
+                ) => return Err(Errno::ECHILD),
             }
-            Err(
-                litebox::process::WaitError::NoChildren
-                | litebox::process::WaitError::NoSuchProcess,
-            ) => Err(Errno::ECHILD),
         }
     }
 }
