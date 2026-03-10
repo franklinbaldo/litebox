@@ -500,6 +500,7 @@ syscall_callback:
     b .Ldone_aarch64
     .cfi_endproc
 
+    .globl exception_callback
 exception_callback:
     .cfi_startproc
     // Restore host stack.
@@ -512,6 +513,7 @@ exception_callback:
     b .Ldone_aarch64
     .cfi_endproc
 
+    .globl interrupt_callback
 interrupt_callback:
     .cfi_startproc
     // Restore host stack.
@@ -565,6 +567,7 @@ interrupt_callback:
 #[unsafe(naked)]
 unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     core::arch::naked_asm!(
+        ".globl switch_to_guest_start",
         "switch_to_guest_start:",
         // Set `in_guest` now, then check if there is a pending interrupt.
         // If so, jump to the interrupt handler.
@@ -618,6 +621,7 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         // Local trampoline for cbnz — macOS assembler rejects conditional
         // branches to non-assembler-local labels (only numbered labels qualify).
         "2: b interrupt_callback",
+        ".globl switch_to_guest_end",
         "switch_to_guest_end:",
     );
 }
