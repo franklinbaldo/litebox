@@ -1485,15 +1485,25 @@ impl<FS: ShimFS> Task<FS> {
             .fs
             .fd_file_status(fd)
             .map_err(|_| Errno::EBADF)?;
-        let ino = status.node_info.ino;
-        // Stdin/Stdout/Stderr all share STDIO_NODE_INFO with the same ino.
-        // The actual Device type is stored as the descriptor table entry, but
-        // we can't access it from here. Fall back to stderr for the host ioctl
-        // since all three map to the same terminal on a real host.
-        let stream = StdioStream::Stderr;
-        // For ioctls that don't need to distinguish between streams (TCGETS,
-        // TIOCGWINSZ, etc.), any stdio fd will return the same terminal state.
-        let _ = ino;
+        // Each stdio device has a distinct ino (stdin=9, stdout=10, stderr=11).
+        let preferred = match status.node_info.ino {
+            9 => StdioStream::Stdin,
+            10 => StdioStream::Stdout,
+            _ => StdioStream::Stderr,
+        };
+
+        // Try the preferred stream first, then fall back to any stream that is
+        // actually a terminal on the host. This handles the common case where
+        // the runner's stderr (or stdout) is redirected to a log file but the
+        // guest still expects all stdio fds to behave as terminal devices.
+        let stream = if self.global.platform.is_a_tty(preferred) {
+            preferred
+        } else {
+            [StdioStream::Stdin, StdioStream::Stdout, StdioStream::Stderr]
+                .into_iter()
+                .find(|s| self.global.platform.is_a_tty(*s))
+                .ok_or(Errno::ENOTTY)?
+        };
 
         match arg {
             IoctlArg::TCGETS(termios_ptr) => {
@@ -1888,9 +1898,9 @@ impl<FS: ShimFS> Task<FS> {
             | IoctlArg::TIOCSWINSZ(..) => match desc {
                 Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
                     *raw_fd,
-                    |fd| match self.classify_terminal(fd)? {
-                        TerminalKind::HostStdio => self.host_stdio_ioctl(fd, &arg),
-                        TerminalKind::Pty => self.pty_ioctl(fd, &arg),
+                    |term_fd| match self.classify_terminal(term_fd)? {
+                        TerminalKind::HostStdio => self.host_stdio_ioctl(term_fd, &arg),
+                        TerminalKind::Pty => self.pty_ioctl(term_fd, &arg),
                         TerminalKind::NotTerminal => Err(Errno::ENOTTY),
                     },
                     |_fd| Err(Errno::ENOTTY),

@@ -35,17 +35,23 @@ const NULL_BLOCK_SIZE: usize = 0x1000;
 /// Block size for /dev/urandom
 const URANDOM_BLOCK_SIZE: usize = 0x1000;
 
-/// Constant node information for all 3 stdio devices.
-///
-/// We use rdev major=5, minor=0 (same as `/dev/tty` on Linux) rather than a
-/// PTY-slave rdev (major=136) to prevent callers from mistakenly treating
-/// the stdio stream as a PTY master (e.g., `TIOCGPTN` should fail on these).
-const STDIO_NODE_INFO: NodeInfo = NodeInfo {
+/// Constant node information for stdin.
+const STDIN_NODE_INFO: NodeInfo = NodeInfo {
     dev: 64,
     ino: 9,
     // major=5, minor=0 — matches /dev/tty (character device, terminal).
-    // The runner's stdin/stdout/stderr are typically PTY slave FDs inherited
-    // from the host shell, so reporting them as a terminal is correct.
+    rdev: core::num::NonZeroUsize::new(0x500),
+};
+/// Constant node information for stdout.
+const STDOUT_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 64,
+    ino: 10,
+    rdev: core::num::NonZeroUsize::new(0x500),
+};
+/// Constant node information for stderr.
+const STDERR_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 64,
+    ino: 11,
     rdev: core::num::NonZeroUsize::new(0x500),
 };
 /// Node info for /dev/null
@@ -364,12 +370,28 @@ impl<
 
     fn device_file_status(device: Device) -> FileStatus {
         match device {
-            Device::Stdin | Device::Stdout | Device::Stderr => FileStatus {
+            Device::Stdin => FileStatus {
                 file_type: FileType::CharacterDevice,
                 mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
                 size: 0,
                 owner: UserInfo::ROOT,
-                node_info: STDIO_NODE_INFO,
+                node_info: STDIN_NODE_INFO,
+                blksize: STDIO_BLOCK_SIZE,
+            },
+            Device::Stdout => FileStatus {
+                file_type: FileType::CharacterDevice,
+                mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
+                size: 0,
+                owner: UserInfo::ROOT,
+                node_info: STDOUT_NODE_INFO,
+                blksize: STDIO_BLOCK_SIZE,
+            },
+            Device::Stderr => FileStatus {
+                file_type: FileType::CharacterDevice,
+                mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
+                size: 0,
+                owner: UserInfo::ROOT,
+                node_info: STDERR_NODE_INFO,
                 blksize: STDIO_BLOCK_SIZE,
             },
             Device::Null => FileStatus {
