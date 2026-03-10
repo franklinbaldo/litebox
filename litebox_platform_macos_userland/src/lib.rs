@@ -6,7 +6,7 @@
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
 use std::cell::Cell;
-use std::os::fd::{AsRawFd as _, FromRawFd as _};
+use std::os::fd::AsRawFd as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::time::Duration;
@@ -18,7 +18,7 @@ use litebox::platform::page_mgmt::{
 };
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer as _};
 use litebox::shim::ContinueOperation;
-use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
+use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt};
 use litebox_common_linux::{MapFlags, ProtFlags, PunchthroughSyscall, vmap::VmapManager};
 
 use zerocopy::{FromBytes, IntoBytes};
@@ -842,7 +842,7 @@ impl litebox::platform::IPInterfaceProvider for MacosUserland {
         if n < 0 {
             return Err(match std::io::Error::last_os_error().raw_os_error() {
                 #[allow(unreachable_patterns, reason = "EAGAIN == EWOULDBLOCK")]
-                Some(libc::EWOULDBLOCK) | Some(libc::EAGAIN) => {
+                Some(libc::EWOULDBLOCK | libc::EAGAIN) => {
                     litebox::platform::ReceiveError::WouldBlock
                 }
                 _ => unimplemented!("unexpected error {}", std::io::Error::last_os_error()),
@@ -1033,10 +1033,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
             libc::mmap(
                 suggested_range.start as *mut libc::c_void,
                 suggested_range.len(),
-                prot_flags(initial_permissions)
-                    .bits()
-                    .reinterpret_as_unsigned(),
-                flags.bits().reinterpret_as_unsigned(),
+                prot_flags(initial_permissions).bits(),
+                flags.bits(),
                 -1,
                 0,
             )
@@ -1096,13 +1094,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         }
 
         if permissions != (MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE) {
-            let r = unsafe {
-                libc::mprotect(
-                    new_ptr,
-                    new_range.len(),
-                    prot_flags(permissions).bits().reinterpret_as_unsigned(),
-                )
-            };
+            let r =
+                unsafe { libc::mprotect(new_ptr, new_range.len(), prot_flags(permissions).bits()) };
             if r != 0 {
                 unsafe {
                     libc::munmap(new_ptr, new_range.len());
@@ -1126,7 +1119,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
             libc::mprotect(
                 range.start as *mut libc::c_void,
                 range.len(),
-                prot_flags(new_permissions).bits().reinterpret_as_unsigned(),
+                prot_flags(new_permissions).bits(),
             )
         };
         assert_eq!(r, 0, "mprotect failed: {}", std::io::Error::last_os_error());
@@ -1158,7 +1151,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
             libc::openat(
                 libc::AT_FDCWD,
                 file_path_cstr.as_ptr(),
-                OFlags::RDONLY.bits(),
+                OFlags::RDONLY.bits() as libc::c_int,
                 0,
             )
         };
@@ -1175,8 +1168,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
             libc::mmap(
                 suggested_start as *mut libc::c_void,
                 source_data.len(),
-                prot_flags(permissions).bits().reinterpret_as_unsigned(),
-                flags.bits().reinterpret_as_unsigned(),
+                prot_flags(permissions).bits(),
+                flags.bits(),
                 fd,
                 file_offset.try_into().unwrap(),
             )
