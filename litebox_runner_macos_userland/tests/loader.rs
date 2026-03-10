@@ -255,10 +255,19 @@ fn run_dynamic_linked_prog_with_rewriter(
     // Install the required files (e.g., scripts) to the tar directory's /out.
     install_files(tar_src_path.join("out"));
 
-    // Create tar.
+    // Create tar. Use ustar format because macOS `tar` defaults to pax, and
+    // the `tar-no-std` crate used by litebox cannot parse pax extended headers.
+    // COPYFILE_DISABLE=1 prevents macOS from adding AppleDouble `._` resource fork files.
     let tar_target_file = std::path::Path::new(&out_path).join("rootfs_rewriter.tar");
     let tar_data = std::process::Command::new("tar")
-        .args(["-cvf", tar_target_file.to_str().unwrap(), "lib", "out"])
+        .args([
+            "--format=ustar",
+            "-cvf",
+            tar_target_file.to_str().unwrap(),
+            "lib",
+            "out",
+        ])
+        .env("COPYFILE_DISABLE", "1")
         .current_dir(&tar_src_path)
         .output()
         .expect("Failed to create tar file");
