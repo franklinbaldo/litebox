@@ -13,7 +13,7 @@ use litebox::{
     fd::{FdEnabledSubsystem, MetadataError, TypedFd},
     fs::{Mode, OFlags, SeekWhence},
     path,
-    platform::{RawConstPointer, RawMutPointer},
+    platform::{RawConstPointer, RawMutPointer, StdioProvider as _},
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
@@ -24,6 +24,16 @@ use litebox_platform_multiplex::Platform;
 
 use crate::{ConstPtr, Descriptor, Descriptors, GlobalState, MutPtr, ShimFS, Task};
 use core::sync::atomic::Ordering;
+
+/// Classification of a file descriptor for terminal ioctl routing.
+enum TerminalKind {
+    /// Host stdio device (major=5) — forward ioctls to host kernel.
+    HostStdio,
+    /// PTY slave device (major=136) — handle locally.
+    Pty,
+    /// Not a terminal device.
+    NotTerminal,
+}
 
 /// Task state shared by `CLONE_FS`.
 pub(crate) struct FsState {
@@ -1421,15 +1431,141 @@ impl<FS: ShimFS> Task<FS> {
             .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))
     }
 
-    fn stdio_ioctl(
+    /// Forward a terminal ioctl to the host kernel for a stdio fd.
+    ///
+    /// Maps the fd's device type to the corresponding host stdio stream and
+    /// invokes the platform's `stdio_ioctl` punchthrough.
+    fn host_stdio_ioctl(
+        &self,
+        fd: &TypedFd<FS>,
+        arg: &IoctlArg<litebox_platform_multiplex::Platform>,
+    ) -> Result<u32, Errno> {
+        use litebox::platform::{StdioIoctlError, StdioStream};
+
+        // Determine which host stream this fd corresponds to.
+        let status = self
+            .global
+            .fs
+            .fd_file_status(fd)
+            .map_err(|_| Errno::EBADF)?;
+        let ino = status.node_info.ino;
+        // Stdin/Stdout/Stderr all share STDIO_NODE_INFO with the same ino.
+        // The actual Device type is stored as the descriptor table entry, but
+        // we can't access it from here. Fall back to stderr for the host ioctl
+        // since all three map to the same terminal on a real host.
+        let stream = StdioStream::Stderr;
+        // For ioctls that don't need to distinguish between streams (TCGETS,
+        // TIOCGWINSZ, etc.), any stdio fd will return the same terminal state.
+        let _ = ino;
+
+        match arg {
+            IoctlArg::TCGETS(termios_ptr) => {
+                let mut termios = litebox_common_linux::Termios {
+                    c_iflag: 0,
+                    c_oflag: 0,
+                    c_cflag: 0,
+                    c_lflag: 0,
+                    c_line: 0,
+                    c_cc: [0; 19],
+                };
+                let buf_ptr = core::ptr::from_mut(&mut termios).cast();
+                self.global
+                    .platform
+                    .stdio_ioctl(stream, litebox_common_linux::TCGETS, buf_ptr)
+                    .map_err(|_| Errno::ENOTTY)?;
+                termios_ptr
+                    .write_at_offset(0, termios)
+                    .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TCSETS(termios_ptr) => {
+                let termios = termios_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                let buf_ptr = core::ptr::from_ref(&termios).cast_mut().cast();
+                self.global
+                    .platform
+                    .stdio_ioctl(stream, litebox_common_linux::TCSETS, buf_ptr)
+                    .map_err(|e| match e {
+                        StdioIoctlError::NotATerminal => Errno::ENOTTY,
+                        _ => Errno::EIO,
+                    })?;
+                Ok(0)
+            }
+            IoctlArg::TCSETSW(termios_ptr) => {
+                let termios = termios_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                let buf_ptr = core::ptr::from_ref(&termios).cast_mut().cast();
+                self.global
+                    .platform
+                    .stdio_ioctl(stream, litebox_common_linux::TCSETSW, buf_ptr)
+                    .map_err(|e| match e {
+                        StdioIoctlError::NotATerminal => Errno::ENOTTY,
+                        _ => Errno::EIO,
+                    })?;
+                Ok(0)
+            }
+            IoctlArg::TCSETSF(termios_ptr) => {
+                let termios = termios_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                let buf_ptr = core::ptr::from_ref(&termios).cast_mut().cast();
+                self.global
+                    .platform
+                    .stdio_ioctl(stream, litebox_common_linux::TCSETSF, buf_ptr)
+                    .map_err(|e| match e {
+                        StdioIoctlError::NotATerminal => Errno::ENOTTY,
+                        _ => Errno::EIO,
+                    })?;
+                Ok(0)
+            }
+            IoctlArg::TIOCGWINSZ(ws_ptr) => {
+                let mut ws = litebox_common_linux::Winsize {
+                    row: 0,
+                    col: 0,
+                    xpixel: 0,
+                    ypixel: 0,
+                };
+                let buf_ptr = core::ptr::from_mut(&mut ws).cast();
+                self.global
+                    .platform
+                    .stdio_ioctl(stream, litebox_common_linux::TIOCGWINSZ, buf_ptr)
+                    .map_err(|_| Errno::ENOTTY)?;
+                ws_ptr.write_at_offset(0, ws).ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TIOCSWINSZ(ws_ptr) => {
+                let ws = ws_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                let buf_ptr = core::ptr::from_ref(&ws).cast_mut().cast();
+                self.global
+                    .platform
+                    .stdio_ioctl(stream, litebox_common_linux::TIOCSWINSZ, buf_ptr)
+                    .map_err(|e| match e {
+                        StdioIoctlError::NotATerminal => Errno::ENOTTY,
+                        _ => Errno::EIO,
+                    })?;
+                Ok(0)
+            }
+            IoctlArg::TIOCGPGRP(pgrp) => {
+                // Return the calling process's PID as the foreground process group.
+                pgrp.write_at_offset(0, self.sys_getpid())
+                    .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            // These are no-ops for stdio: TIOCSCTTY (already controlling terminal),
+            // TIOCNOTTY (detach), TIOCSPGRP (set foreground pgrp), TIOCSPTLK (unlock PTY).
+            IoctlArg::TIOCSCTTY
+            | IoctlArg::TIOCNOTTY
+            | IoctlArg::TIOCSPGRP(_)
+            | IoctlArg::TIOCSPTLK(_) => Ok(0),
+            _ => Err(Errno::ENOTTY),
+        }
+    }
+
+    /// Handle terminal ioctls for PTY slave devices (major=136).
+    fn pty_ioctl(
         &self,
         fd: &TypedFd<FS>,
         arg: &IoctlArg<litebox_platform_multiplex::Platform>,
     ) -> Result<u32, Errno> {
         match arg {
             IoctlArg::TCGETS(termios) => {
-                // Return realistic terminal attributes so programs (e.g. Node.js Ink)
-                // recognize this as a valid terminal rather than a broken device.
+                // Return realistic terminal attributes for PTY slaves.
                 termios
                     .write_at_offset(
                         0,
@@ -1440,25 +1576,8 @@ impl<FS: ShimFS> Task<FS> {
                             c_lflag: 0x8a3b, // ECHO | ECHOE | ECHOK | ISIG | ICANON | IEXTEN | ECHOCTL | ECHOKE
                             c_line: 0,
                             c_cc: [
-                                0x03, // VINTR = Ctrl-C
-                                0x1c, // VQUIT = Ctrl-backslash
-                                0x7f, // VERASE = DEL
-                                0x15, // VKILL = Ctrl-U
-                                0x04, // VEOF = Ctrl-D
-                                0x00, // VTIME
-                                0x01, // VMIN
-                                0x00, // VSWTC
-                                0x11, // VSTART = Ctrl-Q
-                                0x13, // VSTOP = Ctrl-S
-                                0x1a, // VSUSP = Ctrl-Z
-                                0xff, // VEOL
-                                0x12, // VREPRINT = Ctrl-R
-                                0x0f, // VDISCARD = Ctrl-O
-                                0x17, // VWERASE = Ctrl-W
-                                0x16, // VLNEXT = Ctrl-V
-                                0xff, // VEOL2
-                                0x00, // padding
-                                0x00, // padding
+                                0x03, 0x1c, 0x7f, 0x15, 0x04, 0x00, 0x01, 0x00, 0x11, 0x13, 0x1a,
+                                0xff, 0x12, 0x0f, 0x17, 0x16, 0xff, 0x00, 0x00,
                             ],
                         },
                     )
@@ -1487,7 +1606,6 @@ impl<FS: ShimFS> Task<FS> {
                 Ok(0)
             }
             IoctlArg::TIOCGPTN(ptn) => {
-                // Return the PTY number from the device minor number.
                 let status = self
                     .global
                     .fs
@@ -1503,24 +1621,29 @@ impl<FS: ShimFS> Task<FS> {
                 Ok(0)
             }
             IoctlArg::TIOCGPGRP(pgrp) => {
-                // Return the calling thread's PID as the foreground process group.
                 pgrp.write_at_offset(0, self.sys_getpid())
                     .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
-            _ => todo!(),
+            _ => Err(Errno::ENOTTY),
         }
     }
 
-    fn is_stdio(&self, fd: &TypedFd<FS>) -> Result<bool, Errno> {
+    /// Classify a file descriptor as a host stdio device, PTY device, or neither.
+    fn classify_terminal(&self, fd: &TypedFd<FS>) -> Result<TerminalKind, Errno> {
         match self.global.fs.fd_file_status(fd) {
             Ok(status) => {
-                // See https://www.kernel.org/doc/Documentation/admin-guide/devices.txt
+                if status.file_type != litebox::fs::FileType::CharacterDevice {
+                    return Ok(TerminalKind::NotTerminal);
+                }
                 let major = status.node_info.rdev.map_or(0, |v| v.get() >> 8);
-                // major 136-143: Unix98 PTY slaves (/dev/pts/*)
-                // major 5: /dev/tty (generic terminal), /dev/console, /dev/ptmx
-                Ok(((136..=143).contains(&major) || major == 5)
-                    && status.file_type == litebox::fs::FileType::CharacterDevice)
+                match major {
+                    // major 5: /dev/tty, /dev/console, /dev/ptmx — host stdio
+                    5 => Ok(TerminalKind::HostStdio),
+                    // major 136-143: Unix98 PTY slaves (/dev/pts/*)
+                    136..=143 => Ok(TerminalKind::Pty),
+                    _ => Ok(TerminalKind::NotTerminal),
+                }
             }
             Err(litebox::fs::errors::FileStatusError::ClosedFd) => Err(Errno::EBADF),
             Err(_) => unimplemented!(),
@@ -1714,12 +1837,10 @@ impl<FS: ShimFS> Task<FS> {
             | IoctlArg::TIOCSWINSZ(..) => match desc {
                 Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
                     *raw_fd,
-                    |fd| {
-                        if self.is_stdio(fd)? {
-                            self.stdio_ioctl(fd, &arg)
-                        } else {
-                            Err(Errno::ENOTTY)
-                        }
+                    |fd| match self.classify_terminal(fd)? {
+                        TerminalKind::HostStdio => self.host_stdio_ioctl(fd, &arg),
+                        TerminalKind::Pty => self.pty_ioctl(fd, &arg),
+                        TerminalKind::NotTerminal => Err(Errno::ENOTTY),
                     },
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),

@@ -2149,6 +2149,43 @@ impl litebox::platform::StdioProvider for LinuxUserland {
             StdioStream::Stderr => std::io::stderr().is_terminal(),
         }
     }
+
+    fn stdio_ioctl(
+        &self,
+        stream: litebox::platform::StdioStream,
+        request: u32,
+        arg: *mut u8,
+    ) -> Result<u32, litebox::platform::StdioIoctlError> {
+        use litebox::platform::{StdioIoctlError, StdioStream};
+        let host_fd: libc::c_int = match stream {
+            StdioStream::Stdin => 0,
+            StdioStream::Stdout => 1,
+            StdioStream::Stderr => 2,
+        };
+        // SAFETY: We forward the ioctl to the host kernel on the runner's actual
+        // stdio fd. The caller ensures `arg` points to a valid buffer matching the
+        // ioctl request type.
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_ioctl,
+                host_fd,
+                libc::c_ulong::from(request),
+                arg as libc::c_ulong,
+            )
+        };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::ENOTTY);
+            if err == libc::ENOTTY {
+                Err(StdioIoctlError::NotATerminal)
+            } else {
+                Err(StdioIoctlError::OsError(err))
+            }
+        } else {
+            Ok(u32::try_from(ret).unwrap_or(0))
+        }
+    }
 }
 
 unsafe extern "C" {

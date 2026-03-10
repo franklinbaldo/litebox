@@ -612,6 +612,18 @@ pub enum StdioStream {
     Stderr = 2,
 }
 
+/// A non-exhaustive list of errors from [`StdioProvider::stdio_ioctl`].
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum StdioIoctlError {
+    /// The fd is not a terminal (ENOTTY).
+    #[error("not a terminal")]
+    NotATerminal,
+    /// The operation failed with an OS error code.
+    #[error("ioctl failed: {0}")]
+    OsError(i32),
+}
+
 /// A provider of standard input/output functionality.
 pub trait StdioProvider {
     /// Read from standard input. Returns number of bytes read.
@@ -622,6 +634,22 @@ pub trait StdioProvider {
 
     /// Check if a stream is connected to a TTY.
     fn is_a_tty(&self, stream: StdioStream) -> bool;
+
+    /// Perform a terminal ioctl on a stdio stream.
+    ///
+    /// Forwards ioctl requests (TCGETS, TCSETS, TIOCGWINSZ, etc.) to the
+    /// host kernel on the runner's actual file descriptor for the given stream.
+    /// `arg` points to the ioctl data buffer (read or write depending on request).
+    ///
+    /// The default implementation returns [`StdioIoctlError::NotATerminal`].
+    fn stdio_ioctl(
+        &self,
+        _stream: StdioStream,
+        _request: u32,
+        _arg: *mut u8,
+    ) -> Result<u32, StdioIoctlError> {
+        Err(StdioIoctlError::NotATerminal)
+    }
 }
 
 /// A provider for system information.
