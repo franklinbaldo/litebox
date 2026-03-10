@@ -70,6 +70,54 @@ const PTMX_NODE_INFO: NodeInfo = NodeInfo {
     rdev: core::num::NonZeroUsize::new(0x502),
 };
 
+/// Stored terminal attributes for a PTY pair.
+///
+/// These are the raw flag values from the Linux `struct termios`.
+/// The line discipline in master/slave write checks these flags
+/// to decide whether to apply ECHO, ICRNL, ONLCR, etc.
+#[derive(Debug, Clone)]
+pub struct PtyTermios {
+    pub c_iflag: u32,
+    pub c_oflag: u32,
+    pub c_cflag: u32,
+    pub c_lflag: u32,
+    pub c_cc: [u8; 19],
+}
+
+// Linux termios flag constants used by the PTY line discipline.
+const ECHO: u32 = 0x0008;
+const ICRNL: u32 = 0x0100;
+const OPOST: u32 = 0x0001;
+const ONLCR: u32 = 0x0004;
+
+impl PtyTermios {
+    /// Default PTY termios matching a freshly opened Linux PTY.
+    fn new() -> Self {
+        Self {
+            c_iflag: 0x6d02, // ICRNL | IXON | IXANY | IMAXBEL | IUTF8
+            c_oflag: 0x0005, // OPOST | ONLCR
+            c_cflag: 0x04bf, // CS8 | CREAD | CLOCAL | B38400
+            c_lflag: 0x8a3b, // ECHO | ECHOE | ECHOK | ISIG | ICANON | IEXTEN | ECHOCTL | ECHOKE
+            c_cc: [
+                0x03, 0x1c, 0x7f, 0x15, 0x04, 0x00, 0x01, 0x00, 0x11, 0x13, 0x1a, 0xff, 0x12, 0x0f,
+                0x17, 0x16, 0xff, 0x00, 0x00,
+            ],
+        }
+    }
+
+    pub fn echo_enabled(&self) -> bool {
+        self.c_lflag & ECHO != 0
+    }
+
+    pub fn icrnl_enabled(&self) -> bool {
+        self.c_iflag & ICRNL != 0
+    }
+
+    pub fn onlcr_enabled(&self) -> bool {
+        (self.c_oflag & OPOST != 0) && (self.c_oflag & ONLCR != 0)
+    }
+}
+
 /// Shared state for a single PTY pair (master ↔ slave).
 pub struct PtyPair<Platform: crate::sync::RawSyncPrimitivesProvider + TimeProvider> {
     /// Data written to master, read by slave (input to the child process).
@@ -86,6 +134,8 @@ pub struct PtyPair<Platform: crate::sync::RawSyncPrimitivesProvider + TimeProvid
     pub master_pollee: Pollee<Platform>,
     /// Pollee for notifying poll/select when data is available for slave reads.
     pub slave_pollee: Pollee<Platform>,
+    /// Stored terminal attributes — modified by TCSETS, read by TCGETS.
+    pub termios: crate::sync::Mutex<Platform, PtyTermios>,
 }
 
 /// Wrapper for polling the master side of a PTY pair.
@@ -200,6 +250,7 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + TimeProvider> PtyManager
             master_open: true.into(),
             master_pollee: Pollee::new(),
             slave_pollee: Pollee::new(),
+            termios: crate::sync::Mutex::new(PtyTermios::new()),
         }));
         idx
     }
@@ -583,31 +634,57 @@ impl<
             }
             &Device::PtyMaster(idx) => {
                 // Master writes feed the slave's input buffer.
-                // Apply basic input line-discipline: ICRNL translates \r → \n,
-                // matching the default termios behavior expected by shells.
+                // Line discipline: ICRNL translates \r → \n (if enabled).
+                // ECHO reflects input back to master's read buffer.
                 let pair = self.pty_manager.get(idx).ok_or(WriteError::ClosedFd)?;
+                let termios = pair.termios.lock();
+                let icrnl = termios.icrnl_enabled();
+                let echo = termios.echo_enabled();
+                let onlcr = termios.onlcr_enabled();
+                drop(termios);
                 {
-                    let mut ring = pair.master_to_slave.lock();
-                    for &b in buf {
-                        ring.push_back(if b == b'\r' { b'\n' } else { b });
+                    let mut slave_ring = pair.master_to_slave.lock();
+                    if echo {
+                        let mut master_ring = pair.slave_to_master.lock();
+                        for &b in buf {
+                            let translated = if icrnl && b == b'\r' { b'\n' } else { b };
+                            slave_ring.push_back(translated);
+                            // Echo: reflect to master read, applying ONLCR.
+                            if onlcr && translated == b'\n' {
+                                master_ring.push_back(b'\r');
+                            }
+                            master_ring.push_back(translated);
+                        }
+                    } else {
+                        for &b in buf {
+                            slave_ring.push_back(if icrnl && b == b'\r' { b'\n' } else { b });
+                        }
                     }
                 }
-                // Wake poll/select watchers on the slave side.
                 pair.slave_pollee.notify_observers(Events::IN);
+                if echo {
+                    pair.master_pollee.notify_observers(Events::IN);
+                }
                 return Ok(buf.len());
             }
             &Device::PtySlave(idx) => {
                 // Slave writes feed the master's read buffer.
-                // Apply basic output line-discipline: ONLCR translates \n → \r\n,
-                // matching the default termios behavior expected by terminal emulators.
+                // Line discipline: ONLCR translates \n → \r\n (if enabled).
                 let pair = self.pty_manager.get(idx).ok_or(WriteError::ClosedFd)?;
+                let onlcr = pair.termios.lock().onlcr_enabled();
                 {
                     let mut ring = pair.slave_to_master.lock();
-                    for &b in buf {
-                        if b == b'\n' {
-                            ring.push_back(b'\r');
+                    if onlcr {
+                        for &b in buf {
+                            if b == b'\n' {
+                                ring.push_back(b'\r');
+                            }
+                            ring.push_back(b);
                         }
-                        ring.push_back(b);
+                    } else {
+                        for &b in buf {
+                            ring.push_back(b);
+                        }
                     }
                 }
                 // Wake epoll watchers on the master side.
@@ -789,6 +866,20 @@ impl<
                 Some(alloc::boxed::Box::new(PtySlavePollable(pair)))
             }
             _ => None,
+        }
+    }
+
+    fn get_pty_termios(&self, fd: &FileFd<Platform>) -> Option<PtyTermios> {
+        let (pair, _, _) = self.get_pty_info(fd)?;
+        Some(pair.termios.lock().clone())
+    }
+
+    fn set_pty_termios(&self, fd: &FileFd<Platform>, termios: PtyTermios) -> bool {
+        if let Some((pair, _, _)) = self.get_pty_info(fd) {
+            *pair.termios.lock() = termios;
+            true
+        } else {
+            false
         }
     }
 }

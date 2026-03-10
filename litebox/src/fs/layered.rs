@@ -1470,6 +1470,37 @@ impl<
             EntryX::Tombstone => None,
         }
     }
+
+    fn get_pty_termios(
+        &self,
+        fd: &FileFd<Platform, Upper, Lower>,
+    ) -> Option<super::devices::PtyTermios> {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry))?;
+        match entry.as_ref() {
+            EntryX::Upper { fd } => self.upper.get_pty_termios(fd),
+            EntryX::Lower { fd } => self.lower.get_pty_termios(fd),
+            EntryX::Tombstone => None,
+        }
+    }
+
+    fn set_pty_termios(
+        &self,
+        fd: &FileFd<Platform, Upper, Lower>,
+        termios: super::devices::PtyTermios,
+    ) -> bool {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry));
+        match entry.as_deref() {
+            Some(EntryX::Upper { fd }) => self.upper.set_pty_termios(fd, termios),
+            Some(EntryX::Lower { fd }) => self.lower.set_pty_termios(fd, termios),
+            _ => false,
+        }
+    }
 }
 
 struct Descriptor<Upper: super::FileSystem + 'static, Lower: super::FileSystem + 'static> {

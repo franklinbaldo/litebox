@@ -162,6 +162,23 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     fn get_io_pollable(&self, fd: &TypedFd<Self>) -> Option<alloc::boxed::Box<dyn IOPollable>> {
         None
     }
+
+    /// Get stored PTY termios for a file descriptor.
+    ///
+    /// Returns `Some(termios)` if the fd refers to a PTY device, `None` otherwise.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn get_pty_termios(&self, fd: &TypedFd<Self>) -> Option<devices::PtyTermios> {
+        None
+    }
+
+    /// Set stored PTY termios for a file descriptor.
+    ///
+    /// Returns `true` if the fd refers to a PTY device and the termios was updated,
+    /// `false` otherwise.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn set_pty_termios(&self, fd: &TypedFd<Self>, termios: devices::PtyTermios) -> bool {
+        false
+    }
 }
 
 bitflags! {

@@ -1563,29 +1563,43 @@ impl<FS: ShimFS> Task<FS> {
     ) -> Result<u32, Errno> {
         match arg {
             IoctlArg::TCGETS(termios) => {
-                // Return realistic terminal attributes for PTY slaves.
+                // Return stored terminal attributes for this PTY.
+                let stored = self.global.fs.get_pty_termios(fd).ok_or(Errno::ENOTTY)?;
                 termios
                     .write_at_offset(
                         0,
                         litebox_common_linux::Termios {
-                            c_iflag: 0x6d02, // ICRNL | IXON | IXANY | IMAXBEL | IUTF8
-                            c_oflag: 0x0005, // OPOST | ONLCR
-                            c_cflag: 0x04bf, // CS8 | CREAD | CLOCAL | B38400
-                            c_lflag: 0x8a3b, // ECHO | ECHOE | ECHOK | ISIG | ICANON | IEXTEN | ECHOCTL | ECHOKE
+                            c_iflag: stored.c_iflag,
+                            c_oflag: stored.c_oflag,
+                            c_cflag: stored.c_cflag,
+                            c_lflag: stored.c_lflag,
                             c_line: 0,
-                            c_cc: [
-                                0x03, 0x1c, 0x7f, 0x15, 0x04, 0x00, 0x01, 0x00, 0x11, 0x13, 0x1a,
-                                0xff, 0x12, 0x0f, 0x17, 0x16, 0xff, 0x00, 0x00,
-                            ],
+                            c_cc: stored.c_cc,
                         },
                     )
                     .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
-            IoctlArg::TCSETS(_)
-            | IoctlArg::TCSETSW(_)
-            | IoctlArg::TCSETSF(_)
-            | IoctlArg::TIOCSWINSZ(_)
+            IoctlArg::TCSETS(termios_ptr)
+            | IoctlArg::TCSETSW(termios_ptr)
+            | IoctlArg::TCSETSF(termios_ptr) => {
+                // Store the terminal attributes so future TCGETS and line
+                // discipline behaviour reflect what the application configured.
+                let t: litebox_common_linux::Termios =
+                    termios_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                let stored = litebox::fs::devices::PtyTermios {
+                    c_iflag: t.c_iflag,
+                    c_oflag: t.c_oflag,
+                    c_cflag: t.c_cflag,
+                    c_lflag: t.c_lflag,
+                    c_cc: t.c_cc,
+                };
+                if !self.global.fs.set_pty_termios(fd, stored) {
+                    return Err(Errno::ENOTTY);
+                }
+                Ok(0)
+            }
+            IoctlArg::TIOCSWINSZ(_)
             | IoctlArg::TIOCSPTLK(_)
             | IoctlArg::TIOCSCTTY
             | IoctlArg::TIOCNOTTY
