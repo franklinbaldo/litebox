@@ -823,10 +823,12 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
 
 impl litebox::platform::TimerProvider for WindowsUserland {
     type TimerHandle = TimerHandle;
+    type Signal = litebox_common_linux::signal::Signal;
 
-    const SUPPORTS_TIMER: bool = true;
-
-    fn create_timer(&self, signal: litebox::shim::Signal) -> Self::TimerHandle {
+    fn create_timer(
+        &self,
+        signal: Self::Signal,
+    ) -> Result<Self::TimerHandle, litebox::platform::TimerCreationError> {
         let ctx = Box::new(TimerCallbackContext { signal });
 
         // Create a threadpool timer with the callback registered up-front.
@@ -849,10 +851,10 @@ impl litebox::platform::TimerProvider for WindowsUserland {
             "CreateThreadpoolTimer failed: {}",
             std::io::Error::last_os_error()
         );
-        TimerHandle {
+        Ok(TimerHandle {
             tp_timer,
             _ctx: ctx,
-        }
+        })
     }
 }
 
@@ -880,6 +882,16 @@ impl Drop for TimerHandle {
 
 impl litebox::platform::TimerHandle for TimerHandle {
     fn set_timer(&self, duration: core::time::Duration) {
+        if duration.is_zero() {
+            // A zero duration cancels the timer without firing.
+            // Passing NULL as the due-time pointer tells Windows to cancel
+            // the pending callback.
+            unsafe {
+                Win32_Threading::SetThreadpoolTimer(self.tp_timer, std::ptr::null(), 0, 0);
+            }
+            return;
+        }
+
         // Due time is in 100 ns intervals; negative means relative.
         // Pack into a FILETIME for SetThreadpoolTimer.
         let due_time_100ns: i64 = {
@@ -906,7 +918,7 @@ impl litebox::platform::TimerHandle for TimerHandle {
 
 /// Context shared between the `TimerHandle` and the threadpool timer callback.
 struct TimerCallbackContext {
-    signal: litebox::shim::Signal,
+    signal: litebox_common_linux::signal::Signal,
 }
 
 /// Threadpool timer callback registered via `CreateThreadpoolTimer`.
