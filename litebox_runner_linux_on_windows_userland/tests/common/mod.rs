@@ -10,7 +10,7 @@ use litebox_platform_multiplex::Platform;
 
 pub struct TestLauncher {
     platform: &'static Platform,
-    shim_builder: litebox_shim_linux::LinuxShimBuilder<litebox_shim_linux::DefaultFS>,
+    shim_builder: litebox_shim_linux::LinuxShimBuilder,
     fs: litebox_shim_linux::DefaultFS,
 }
 
@@ -75,7 +75,7 @@ impl TestLauncher {
         self.fs.close(&fd).unwrap();
     }
 
-    pub fn test_load_exec_common(mut self, executable_path: &str) {
+    pub fn test_load_exec_common(self, executable_path: &str) {
         let fs = std::sync::Arc::new(self.fs);
         let argv = vec![
             CString::new(executable_path).unwrap(),
