@@ -35,6 +35,14 @@ macro_rules! ex_table_section {
     };
 }
 
+#[cfg(target_os = "macos")]
+macro_rules! ex_table_section {
+    () => {
+        // Mach-O section in __DATA segment
+        "__DATA,__ex_table"
+    };
+}
+
 macro_rules! ex_table_entry {
     ($start:tt, $stop:tt, $recover:tt) => {
         concat!(
@@ -433,6 +441,48 @@ fn exception_table() -> &'static [ExceptionTableEntry] {
         core::slice::from_raw_parts(
             start.cast::<ExceptionTableEntry>(),
             len / size_of::<ExceptionTableEntry>(),
+        )
+    }
+}
+
+/// Returns the exception table, found by linker-defined symbols marking the
+/// start and end of the Mach-O section.
+///
+/// macOS ld64 automatically synthesizes `section$start$` and `section$end$`
+/// symbols for custom sections. These are the Mach-O equivalent of the ELF
+/// `__start_`/`__stop_` symbols used on Linux.
+#[cfg(target_os = "macos")]
+fn exception_table() -> &'static [ExceptionTableEntry] {
+    // SAFETY: ld64 automatically defines these symbols for custom Mach-O
+    // sections. The `\x01` prefix tells LLVM to use the symbol name
+    // literally (no underscore prepended).
+    unsafe extern "C" {
+        #[link_name = "\x01section$start$__DATA$__ex_table"]
+        static START_EX_TABLE: [ExceptionTableEntry; 0];
+        #[link_name = "\x01section$end$__DATA$__ex_table"]
+        static STOP_EX_TABLE: [ExceptionTableEntry; 0];
+    }
+
+    // Ensure the section exists even if no recovery descriptors get
+    // generated.
+    //
+    // SAFETY: just a no-op asm block to force the section to be created.
+    unsafe {
+        core::arch::asm!(concat!(
+            ".pushsection ",
+            ex_table_section!(),
+            "\n",
+            ".popsection"
+        ));
+    }
+
+    // SAFETY: accessing the section as defined above.
+    unsafe {
+        core::slice::from_raw_parts(
+            START_EX_TABLE.as_ptr(),
+            STOP_EX_TABLE
+                .as_ptr()
+                .offset_from_unsigned(START_EX_TABLE.as_ptr()),
         )
     }
 }
