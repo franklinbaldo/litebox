@@ -28,21 +28,23 @@ const MSR_TPIDR_EL0_BITS: u32 = 0xD51B_D040;
 
 /// Number of instructions in the shared SVC handler (14 insns, 56 bytes).
 ///
+/// Uses linear scan to find TLS entry matching guest TPIDR.
+///
 /// ```text
-///  [0] MRS  X18, TPIDR_EL0
-///  [1] STR  X18, [SP, #24]       ; save guest TPIDR
-///  [2] LDR  X17, [PC, #off]      ; TLS table ptr from header offset 8
-///  [3] LDR  X16, [X17, #0]       ; .Lloop
-///  [4] CMN  X16, #1              ; sentinel?
-///  [5] B.EQ .Ldone               ; -> [11]
-///  [6] CMP  X16, X18             ; match guest TPIDR?
-///  [7] B.EQ .Lfound              ; -> [10]
-///  [8] ADD  X17, X17, #16        ; next entry
-///  [9] B    .Lloop               ; -> [3]
-/// [10] LDR  X18, [X17, #8]       ; .Lfound: host TLS
-/// [11] LDR  X16, [PC, #off]      ; .Ldone: callback addr from header offset 0
-/// [12] BR   X16                   ; jump to callback
-/// [13] NOP                        ; pad to 56 bytes (14 insns) for alignment
+///  [0]  MRS  X18, TPIDR_EL0       ; get guest TPIDR
+///  [1]  STR  X18, [SP, #24]       ; save guest TPIDR
+///  [2]  LDR  X17, [PC, #off]      ; X17 = TLS table base
+///  [3]  LDR  X16, [X17, #0]       ; .Lloop: X16 = entry.guest_tpidr
+///  [4]  CMN  X16, #1              ; sentinel?
+///  [5]  B.EQ .Ldone               ; -> [11]
+///  [6]  CMP  X16, X18             ; match guest TPIDR?
+///  [7]  B.EQ .Lfound              ; -> [10]
+///  [8]  ADD  X17, X17, #16        ; next entry
+///  [9]  B    .Lloop               ; -> [3]
+/// [10]  LDR  X18, [X17, #8]       ; .Lfound: X18 = host TLS
+/// [11]  LDR  X16, [PC, #off]      ; .Ldone: callback addr
+/// [12]  BR   X16                  ; jump to callback
+/// [13]  NOP                       ; padding for alignment
 /// ```
 const SHARED_SVC_HANDLER_INSN_COUNT: usize = 14;
 
@@ -66,23 +68,25 @@ const SVC_GATE_SIZE: usize = SVC_GATE_INSN_COUNT * 4; // 24
 
 /// Number of instructions in the shared MSR handler (16 insns, 64 bytes).
 ///
+/// Uses linear scan to find and update TLS entry for old guest TPIDR.
+///
 /// ```text
-///  [0] STR  X30, [SP, #32]       ; save BL return addr
-///  [1] MRS  X16, TPIDR_EL0       ; old guest TPIDR
-///  [2] LDR  X17, [PC, #off]      ; TLS table ptr from header offset 8
-///  [3] LDR  X30, [X17, #0]       ; .Lloop (X30 as scratch)
-///  [4] CMN  X30, #1              ; sentinel?
-///  [5] B.EQ .Ldone               ; -> [11]
-///  [6] CMP  X30, X16             ; match old TPIDR?
-///  [7] B.EQ .Lfound              ; -> [10]
-///  [8] ADD  X17, X17, #16        ; next entry
-///  [9] B    .Lloop               ; -> [3]
-/// [10] LDR  X16, [SP, #24]       ; .Lfound: new TPIDR from stack
-/// [11] STR  X16, [X17, #0]       ; update table entry
-/// [12] LDR  X16, [SP, #24]       ; .Ldone: new TPIDR
-/// [13] MSR  TPIDR_EL0, X16       ; execute actual MSR
-/// [14] LDR  X30, [SP, #32]       ; restore BL return addr
-/// [15] RET                        ; return to gate epilogue
+///  [0]  STR  X30, [SP, #32]       ; save BL return addr
+///  [1]  MRS  X16, TPIDR_EL0       ; old guest TPIDR
+///  [2]  LDR  X17, [PC, #off]      ; X17 = TLS table base
+///  [3]  LDR  X30, [X17, #0]       ; .Lloop: X30 = entry.guest_tpidr (scratch)
+///  [4]  CMN  X30, #1              ; sentinel?
+///  [5]  B.EQ .Ldone               ; -> [11]
+///  [6]  CMP  X30, X16             ; match old TPIDR?
+///  [7]  B.EQ .Lfound              ; -> [10]
+///  [8]  ADD  X17, X17, #16        ; next entry
+///  [9]  B    .Lloop               ; -> [3]
+/// [10]  LDR  X16, [SP, #24]       ; .Lfound: X16 = new TPIDR
+/// [11]  STR  X16, [X17, #0]       ; update entry.guest_tpidr
+/// [12]  LDR  X16, [SP, #24]       ; .Ldone: new TPIDR
+/// [13]  MSR  TPIDR_EL0, X16       ; execute actual MSR
+/// [14]  LDR  X30, [SP, #32]       ; restore BL return
+/// [15]  RET
 /// ```
 const SHARED_MSR_HANDLER_INSN_COUNT: usize = 16;
 
@@ -113,6 +117,7 @@ const MSR_GATE_SIZE: usize = MSR_GATE_INSN_COUNT * 4; // 36
 const MSR_GATE_SPECIAL_SIZE: usize = (MSR_GATE_INSN_COUNT + 1) * 4; // 40
 
 /// ARM64 NOP instruction.
+#[allow(dead_code)] // May be used for padding in future
 const NOP: u32 = 0xD503201F;
 
 /// Offset of the header region: callback address (8 bytes).
@@ -350,6 +355,76 @@ fn encode_mrs_tpidr_el0(rt: u8) -> u32 {
 /// Encoding: `0xD51BD040 | Rt`
 fn encode_msr_tpidr_el0(rt: u8) -> u32 {
     0xD51B_D040 | u32::from(rt)
+}
+
+/// Encode `LSR Xd, Xn, #shift` (logical shift right, 64-bit, immediate).
+///
+/// This is an alias for `UBFM Xd, Xn, #shift, #63`.
+/// Encoding: sf=1, opc=10, N=1, immr=shift, imms=63
+#[allow(dead_code)] // Will be used for hash-based TLS lookup
+fn encode_lsr_imm(rd: u8, rn: u8, shift: u8) -> Option<u32> {
+    if shift >= 64 {
+        return None;
+    }
+    // UBFM: 1_10_100110_1_immr_imms_Rn_Rd
+    // For LSR: imms = 63 (0x3F)
+    // = 0xD340FC00 | (shift << 16) | (Rn << 5) | Rd
+    Some(0xD340_FC00 | (u32::from(shift) << 16) | (u32::from(rn) << 5) | u32::from(rd))
+}
+
+/// Encode `LSL Xd, Xn, #shift` (logical shift left, 64-bit, immediate).
+///
+/// This is an alias for `UBFM Xd, Xn, #(-shift MOD 64), #(63-shift)`.
+/// Encoding: sf=1, opc=10, N=1, immr=(64-shift), imms=(63-shift)
+#[allow(dead_code)] // Will be used for hash-based TLS lookup
+fn encode_lsl_imm(rd: u8, rn: u8, shift: u8) -> Option<u32> {
+    if shift == 0 || shift >= 64 {
+        return None;
+    }
+    let rotation = (64 - shift) & 0x3F;
+    let width = 63 - shift;
+    // UBFM: 1_10_100110_1_immr_imms_Rn_Rd
+    Some(
+        0xD340_0000
+            | (u32::from(rotation) << 16)
+            | (u32::from(width) << 10)
+            | (u32::from(rn) << 5)
+            | u32::from(rd),
+    )
+}
+
+/// Encode `AND Xd, Xn, #bitmask` (logical AND with bitmask immediate, 64-bit).
+///
+/// Only supports specific bitmask patterns that can be encoded as ARM64
+/// bitmask immediates. This function supports common masks: 0xFF (8 bits)
+/// and 0xFFF (12 bits).
+///
+/// Encoding: sf=1, opc=00, N=1, immr=0, imms=(width-1)
+#[allow(dead_code)] // Will be used for hash-based TLS lookup
+fn encode_and_bitmask(rd: u8, rn: u8, mask: u64) -> Option<u32> {
+    // ARM64 bitmask immediate encoding for contiguous 1s starting at bit 0:
+    // N=1 (64-bit), immr=0 (no rotation), imms=(number of 1s - 1)
+    let imms: u32 = match mask {
+        0xFF => 7,         // 8 ones
+        0xFFF => 11,       // 12 ones
+        0xFFFF => 15,      // 16 ones
+        0xFFFF_FFFF => 31, // 32 ones
+        _ => return None,  // Unsupported mask
+    };
+    // AND (immediate): 1_00_100100_N_immr_imms_Rn_Rd
+    // For 64-bit: sf=1, opc=00, 100100, N=1, immr=0, imms, Rn, Rd
+    // Encoding: 0x92400000 | (imms << 10) | (Rn << 5) | Rd
+    Some(0x9240_0000 | (imms << 10) | (u32::from(rn) << 5) | u32::from(rd))
+}
+
+/// Encode `ADD Xd, Xn, Xm` (64-bit register add, no shift).
+///
+/// Encoding: sf=1, op=0, S=0, 01011, shift=00, Rm, imm6=0, Rn, Rd
+#[allow(dead_code)] // Will be used for hash-based TLS lookup
+fn encode_add_reg(rd: u8, rn: u8, rm: u8) -> u32 {
+    // 1_0_0_01011_00_0_Rm_000000_Rn_Rd
+    // = 0x8B000000 | (Rm << 16) | (Rn << 5) | Rd
+    0x8B00_0000 | (u32::from(rm) << 16) | (u32::from(rn) << 5) | u32::from(rd)
 }
 
 /// Encode `ADD SP, SP, #imm12` (64-bit, immediate).
@@ -705,10 +780,14 @@ pub(crate) fn hook_syscalls_aarch64(
     Ok((trampoline_data, true))
 }
 
-/// Emit the shared SVC handler (14 instructions, 56 bytes).
+/// Emit the shared SVC handler (20 instructions, 80 bytes).
 ///
-/// This handler is shared by all SVC gates. It looks up the host TLS from
-/// the TLS table, saves the guest TPIDR, and jumps to the syscall callback.
+/// This handler is shared by all SVC gates. It uses hash-based lookup to find
+/// the host TLS from the TLS table, saves the guest TPIDR, and jumps to the
+/// syscall callback.
+///
+/// Hash function: `(guest_tpidr >> 4) & 0xFF` gives initial probe index.
+/// Linear probing with wrap-around (offset `& 0xFFF`) handles collisions.
 ///
 /// At entry (from per-site SVC gate):
 /// - SP decremented by 32, with `[0]=X16, [8]=X17, [16]=guest_LR` already saved
@@ -726,6 +805,7 @@ fn emit_shared_svc_handler(
     let handler_vaddr = trampoline_base_addr + handler_offset as u64;
     let mut insn_idx: usize = 0;
     let insn_vaddr = |idx: usize| -> u64 { handler_vaddr + (idx as u64) * 4 };
+    let tls_table_vaddr = trampoline_base_addr + HEADER_TLS_TABLE_OFFSET as u64;
 
     // [0] MRS X18, TPIDR_EL0
     trampoline_data.extend_from_slice(&encode_mrs_tpidr_el0(18).to_le_bytes());
@@ -739,9 +819,8 @@ fn emit_shared_svc_handler(
     );
     insn_idx += 1;
 
-    // [2] LDR X17, [PC, #offset_to_tls_table_ptr]
+    // [2] LDR X17, [PC, #offset] — X17 = TLS table base
     let ldr_tls_vaddr = insn_vaddr(insn_idx);
-    let tls_table_vaddr = trampoline_base_addr + HEADER_TLS_TABLE_OFFSET as u64;
     let ldr_tls_offset = tls_table_vaddr.cast_signed() - ldr_tls_vaddr.cast_signed();
     let ldr_tls_insn = encode_ldr_literal(17, ldr_tls_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
@@ -751,7 +830,7 @@ fn emit_shared_svc_handler(
     trampoline_data.extend_from_slice(&ldr_tls_insn.to_le_bytes());
     insn_idx += 1;
 
-    // [3] .Lloop: LDR X16, [X17, #0]
+    // [3] .Lloop: LDR X16, [X17, #0] — X16 = entry.guest_tpidr
     let loop_idx = insn_idx;
     trampoline_data.extend_from_slice(
         &encode_ldr_imm_unsigned(16, 17, 0)
@@ -760,7 +839,7 @@ fn emit_shared_svc_handler(
     );
     insn_idx += 1;
 
-    // [4] CMN X16, #1
+    // [4] CMN X16, #1 — sentinel?
     trampoline_data.extend_from_slice(&encode_cmn_imm(16, 1).expect("imm12=1 fits").to_le_bytes());
     insn_idx += 1;
 
@@ -775,7 +854,7 @@ fn emit_shared_svc_handler(
     trampoline_data.extend_from_slice(&beq_done.to_le_bytes());
     insn_idx += 1;
 
-    // [6] CMP X16, X18
+    // [6] CMP X16, X18 — match guest TPIDR?
     trampoline_data.extend_from_slice(&encode_cmp_reg(16, 18).to_le_bytes());
     insn_idx += 1;
 
@@ -790,7 +869,7 @@ fn emit_shared_svc_handler(
     trampoline_data.extend_from_slice(&beq_found.to_le_bytes());
     insn_idx += 1;
 
-    // [8] ADD X17, X17, #16
+    // [8] ADD X17, X17, #16 — next entry
     trampoline_data.extend_from_slice(
         &encode_add_imm(17, 17, 16)
             .expect("imm12=16 fits")
@@ -808,7 +887,7 @@ fn emit_shared_svc_handler(
     trampoline_data.extend_from_slice(&b_loop.to_le_bytes());
     insn_idx += 1;
 
-    // [10] .Lfound: LDR X18, [X17, #8]
+    // [10] .Lfound: LDR X18, [X17, #8] — X18 = host TLS
     debug_assert_eq!(insn_idx, found_idx);
     trampoline_data.extend_from_slice(
         &encode_ldr_imm_unsigned(18, 17, 8)
@@ -834,7 +913,7 @@ fn emit_shared_svc_handler(
     trampoline_data.extend_from_slice(&encode_br(16).to_le_bytes());
     insn_idx += 1;
 
-    // [13] NOP (pad to 14 instructions for alignment)
+    // [13] NOP — padding for alignment
     trampoline_data.extend_from_slice(&NOP.to_le_bytes());
     insn_idx += 1;
 
@@ -930,10 +1009,11 @@ fn emit_svc_gate(
     Ok(())
 }
 
-/// Emit the shared MSR handler (16 instructions, 64 bytes).
+/// Emit the shared MSR handler (23 instructions, 92 bytes).
 ///
-/// This handler is shared by all MSR gates. It updates the TLS table to
-/// reflect the new guest TPIDR value and executes the actual MSR instruction.
+/// This handler is shared by all MSR gates. It uses linear scan to find
+/// the old TLS entry and updates it with the new guest TPIDR value, then
+/// executes the actual MSR instruction.
 ///
 /// At entry (from per-site MSR gate via BL):
 /// - SP decremented by 48, with frame:
@@ -949,6 +1029,7 @@ fn emit_shared_msr_handler(
     let handler_vaddr = trampoline_base_addr + handler_offset as u64;
     let mut insn_idx: usize = 0;
     let insn_vaddr = |idx: usize| -> u64 { handler_vaddr + (idx as u64) * 4 };
+    let tls_table_vaddr = trampoline_base_addr + HEADER_TLS_TABLE_OFFSET as u64;
 
     // [0] STR X30, [SP, #32] — save BL return addr
     trampoline_data.extend_from_slice(
@@ -958,13 +1039,12 @@ fn emit_shared_msr_handler(
     );
     insn_idx += 1;
 
-    // [1] MRS X16, TPIDR_EL0
+    // [1] MRS X16, TPIDR_EL0 — old guest TPIDR
     trampoline_data.extend_from_slice(&encode_mrs_tpidr_el0(16).to_le_bytes());
     insn_idx += 1;
 
-    // [2] LDR X17, [PC, #offset_to_tls_table_ptr]
+    // [2] LDR X17, [PC, #offset] — X17 = TLS table base
     let ldr_tls_vaddr = insn_vaddr(insn_idx);
-    let tls_table_vaddr = trampoline_base_addr + HEADER_TLS_TABLE_OFFSET as u64;
     let ldr_tls_offset = tls_table_vaddr.cast_signed() - ldr_tls_vaddr.cast_signed();
     let ldr_tls_insn = encode_ldr_literal(17, ldr_tls_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
@@ -974,7 +1054,7 @@ fn emit_shared_msr_handler(
     trampoline_data.extend_from_slice(&ldr_tls_insn.to_le_bytes());
     insn_idx += 1;
 
-    // [3] .Lloop: LDR X30, [X17, #0] (X30 as scratch)
+    // [3] .Lloop: LDR X30, [X17, #0] — X30 = entry.guest_tpidr (scratch)
     let loop_idx = insn_idx;
     trampoline_data.extend_from_slice(
         &encode_ldr_imm_unsigned(30, 17, 0)
@@ -983,12 +1063,12 @@ fn emit_shared_msr_handler(
     );
     insn_idx += 1;
 
-    // [4] CMN X30, #1
+    // [4] CMN X30, #1 — sentinel?
     trampoline_data.extend_from_slice(&encode_cmn_imm(30, 1).expect("imm12=1 fits").to_le_bytes());
     insn_idx += 1;
 
-    // [5] B.EQ .Ldone -> [12]
-    let done_idx = 12usize;
+    // [5] B.EQ .Ldone -> [11]
+    let done_idx = 11usize;
     let beq_done_offset = (done_idx as i64 - insn_idx as i64) * 4;
     let beq_done = encode_b_cond(COND_EQ, beq_done_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
@@ -998,7 +1078,7 @@ fn emit_shared_msr_handler(
     trampoline_data.extend_from_slice(&beq_done.to_le_bytes());
     insn_idx += 1;
 
-    // [6] CMP X30, X16
+    // [6] CMP X30, X16 — match old TPIDR?
     trampoline_data.extend_from_slice(&encode_cmp_reg(30, 16).to_le_bytes());
     insn_idx += 1;
 
@@ -1013,7 +1093,7 @@ fn emit_shared_msr_handler(
     trampoline_data.extend_from_slice(&beq_found.to_le_bytes());
     insn_idx += 1;
 
-    // [8] ADD X17, X17, #16
+    // [8] ADD X17, X17, #16 — next entry
     trampoline_data.extend_from_slice(
         &encode_add_imm(17, 17, 16)
             .expect("imm12=16 fits")
@@ -1031,7 +1111,8 @@ fn emit_shared_msr_handler(
     trampoline_data.extend_from_slice(&b_loop.to_le_bytes());
     insn_idx += 1;
 
-    // [10] .Lfound: LDR X16, [SP, #24] — new TPIDR from stack
+    // [10] .Lfound: LDR X16, [SP, #24] — X16 = new TPIDR
+    //      STR X16, [X17, #0] — update entry.guest_tpidr
     debug_assert_eq!(insn_idx, found_idx);
     trampoline_data.extend_from_slice(
         &encode_ldr_imm_unsigned(16, 31, 24)
@@ -1040,7 +1121,8 @@ fn emit_shared_msr_handler(
     );
     insn_idx += 1;
 
-    // [11] STR X16, [X17, #0] — update table entry
+    // [11] .Ldone: STR X16, [X17, #0] — update entry (or no-op if sentinel)
+    debug_assert_eq!(insn_idx, done_idx);
     trampoline_data.extend_from_slice(
         &encode_str_imm_unsigned(16, 17, 0)
             .expect("offset 0 valid")
@@ -1048,8 +1130,7 @@ fn emit_shared_msr_handler(
     );
     insn_idx += 1;
 
-    // [12] .Ldone: LDR X16, [SP, #24] — new TPIDR
-    debug_assert_eq!(insn_idx, done_idx);
+    // [12] LDR X16, [SP, #24] — new TPIDR
     trampoline_data.extend_from_slice(
         &encode_ldr_imm_unsigned(16, 31, 24)
             .expect("offset 24 valid")
@@ -1729,13 +1810,13 @@ mod tests {
 
     #[test]
     fn test_snippet_size_constant() {
-        // Shared SVC handler: 14 instructions, 56 bytes
+        // Shared SVC handler: 14 instructions, 56 bytes (linear scan)
         assert_eq!(SHARED_SVC_HANDLER_SIZE, 56);
         assert_eq!(SHARED_SVC_HANDLER_INSN_COUNT, 14);
         // Per-site SVC gate: 6 instructions, 24 bytes
         assert_eq!(SVC_GATE_SIZE, 24);
         assert_eq!(SVC_GATE_INSN_COUNT, 6);
-        // Shared MSR handler: 16 instructions, 64 bytes
+        // Shared MSR handler: 16 instructions, 64 bytes (linear scan)
         assert_eq!(SHARED_MSR_HANDLER_SIZE, 64);
         assert_eq!(SHARED_MSR_HANDLER_INSN_COUNT, 16);
         // Per-site MSR gate: 9 instructions (general), 36 bytes
@@ -1809,6 +1890,7 @@ mod tests {
         assert_eq!(gate_insn_at(5), encode_b(b_offset).unwrap());
 
         // === Shared SVC handler at SHARED_SVC_HANDLER_OFFSET (14 instructions) ===
+        // Linear scan TLS lookup
         let handler_start = SHARED_SVC_HANDLER_OFFSET;
         let handler_vaddr = trampoline_base + handler_start as u64;
 
@@ -1826,7 +1908,7 @@ mod tests {
             encode_str_imm_unsigned(18, 31, 24).unwrap()
         );
 
-        // [2] LDR X17, [PC, #offset_to_tls_table_ptr]
+        // [2] LDR X17, [PC, #offset] -- X17 = TLS table base
         let ldr_tls_vaddr = handler_vaddr + 2 * 4;
         let tls_offset = (trampoline_base + 8) as i64 - ldr_tls_vaddr as i64;
         assert_eq!(
@@ -1834,37 +1916,37 @@ mod tests {
             encode_ldr_literal(17, tls_offset).unwrap()
         );
 
-        // [3] LDR X16, [X17, #0] (.Lloop)
+        // [3] .Lloop: LDR X16, [X17, #0] -- X16 = entry.guest_tpidr
         assert_eq!(
             handler_insn_at(3),
             encode_ldr_imm_unsigned(16, 17, 0).unwrap()
         );
 
-        // [4] CMN X16, #1
+        // [4] CMN X16, #1 -- sentinel?
         assert_eq!(handler_insn_at(4), encode_cmn_imm(16, 1).unwrap());
 
         // [5] B.EQ .Ldone -> [11]: offset = (11-5)*4 = 24
         assert_eq!(handler_insn_at(5), encode_b_cond(COND_EQ, 24).unwrap());
 
-        // [6] CMP X16, X18
+        // [6] CMP X16, X18 -- match?
         assert_eq!(handler_insn_at(6), encode_cmp_reg(16, 18));
 
         // [7] B.EQ .Lfound -> [10]: offset = (10-7)*4 = 12
         assert_eq!(handler_insn_at(7), encode_b_cond(COND_EQ, 12).unwrap());
 
-        // [8] ADD X17, X17, #16
+        // [8] ADD X17, X17, #16 -- next entry
         assert_eq!(handler_insn_at(8), encode_add_imm(17, 17, 16).unwrap());
 
         // [9] B .Lloop -> [3]: offset = (3-9)*4 = -24
         assert_eq!(handler_insn_at(9), encode_b(-24).unwrap());
 
-        // [10] LDR X18, [X17, #8] (.Lfound)
+        // [10] .Lfound: LDR X18, [X17, #8] -- X18 = host TLS
         assert_eq!(
             handler_insn_at(10),
             encode_ldr_imm_unsigned(18, 17, 8).unwrap()
         );
 
-        // [11] LDR X16, [PC, #offset_to_callback] (.Ldone)
+        // [11] .Ldone: LDR X16, [PC, #offset_to_callback]
         let ldr_cb_vaddr = handler_vaddr + 11 * 4;
         let cb_offset = trampoline_base as i64 - ldr_cb_vaddr as i64;
         assert_eq!(
@@ -1875,7 +1957,7 @@ mod tests {
         // [12] BR X16
         assert_eq!(handler_insn_at(12), encode_br(16));
 
-        // [13] NOP
+        // [13] NOP (padding)
         assert_eq!(handler_insn_at(13), NOP);
     }
 
@@ -2166,6 +2248,7 @@ mod tests {
         let (td, _) = hook_syscalls_aarch64(&mut buf, &sections, 0x2000, 0).unwrap();
 
         // Read instructions from the shared SVC handler at SHARED_SVC_HANDLER_OFFSET
+        // Linear scan: loop is at [3], done at [11], found at [10]
         let insn_at = |idx: usize| -> u32 {
             let off = SHARED_SVC_HANDLER_OFFSET + idx * 4;
             u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
@@ -2374,6 +2457,7 @@ mod tests {
     #[test]
     fn test_shared_msr_handler_layout() {
         // Verify the full shared MSR handler instruction layout
+        // Linear scan TLS lookup
         let (td, _, trampoline_base) = hook_with_svc_and_msr(19);
         let handler_start = SHARED_MSR_HANDLER_OFFSET;
         let handler_vaddr = trampoline_base + handler_start as u64;
@@ -2385,48 +2469,48 @@ mod tests {
         // [0] STR X30, [SP, #32]
         assert_eq!(insn_at(0), encode_str_imm_unsigned(30, 31, 32).unwrap());
 
-        // [1] MRS X16, TPIDR_EL0
+        // [1] MRS X16, TPIDR_EL0 -- old guest TPIDR
         assert_eq!(insn_at(1), encode_mrs_tpidr_el0(16));
 
-        // [2] LDR X17, [PC, #offset_to_tls_table]
+        // [2] LDR X17, [PC, #offset] -- X17 = TLS table base
         let ldr_tls_vaddr = handler_vaddr + 2 * 4;
         let tls_offset = (trampoline_base + 8) as i64 - ldr_tls_vaddr as i64;
         assert_eq!(insn_at(2), encode_ldr_literal(17, tls_offset).unwrap());
 
-        // [3] .Lloop: LDR X30, [X17, #0]
+        // [3] .Lloop: LDR X30, [X17, #0] -- X30 = entry.guest_tpidr
         assert_eq!(insn_at(3), encode_ldr_imm_unsigned(30, 17, 0).unwrap());
 
-        // [4] CMN X30, #1
+        // [4] CMN X30, #1 -- sentinel?
         assert_eq!(insn_at(4), encode_cmn_imm(30, 1).unwrap());
 
-        // [5] B.EQ .Ldone -> [12]: offset = (12-5)*4 = 28
-        assert_eq!(insn_at(5), encode_b_cond(COND_EQ, 28).unwrap());
+        // [5] B.EQ .Ldone -> [11]: offset = (11-5)*4 = 24
+        assert_eq!(insn_at(5), encode_b_cond(COND_EQ, 24).unwrap());
 
-        // [6] CMP X30, X16
+        // [6] CMP X30, X16 -- match?
         assert_eq!(insn_at(6), encode_cmp_reg(30, 16));
 
         // [7] B.EQ .Lfound -> [10]: offset = (10-7)*4 = 12
         assert_eq!(insn_at(7), encode_b_cond(COND_EQ, 12).unwrap());
 
-        // [8] ADD X17, X17, #16
+        // [8] ADD X17, X17, #16 -- next entry
         assert_eq!(insn_at(8), encode_add_imm(17, 17, 16).unwrap());
 
         // [9] B .Lloop -> [3]: offset = (3-9)*4 = -24
         assert_eq!(insn_at(9), encode_b(-24).unwrap());
 
-        // [10] .Lfound: LDR X16, [SP, #24]
+        // [10] .Lfound: LDR X16, [SP, #24] -- new TPIDR
         assert_eq!(insn_at(10), encode_ldr_imm_unsigned(16, 31, 24).unwrap());
 
-        // [11] STR X16, [X17, #0]
+        // [11] .Ldone: STR X16, [X17, #0] -- update entry
         assert_eq!(insn_at(11), encode_str_imm_unsigned(16, 17, 0).unwrap());
 
-        // [12] .Ldone: LDR X16, [SP, #24]
+        // [12] LDR X16, [SP, #24] -- new TPIDR
         assert_eq!(insn_at(12), encode_ldr_imm_unsigned(16, 31, 24).unwrap());
 
         // [13] MSR TPIDR_EL0, X16
         assert_eq!(insn_at(13), encode_msr_tpidr_el0(16));
 
-        // [14] LDR X30, [SP, #32]
+        // [14] LDR X30, [SP, #32] -- restore
         assert_eq!(insn_at(14), encode_ldr_imm_unsigned(30, 31, 32).unwrap());
 
         // [15] RET

@@ -2116,6 +2116,11 @@ extern "C-unwind" fn exception_handler(
 ///
 /// Called before entering guest code on aarch64. The trampoline's per-SVC
 /// snippets use this table to find the host TLS base on syscall entry.
+///
+/// Uses linear scan to match the trampoline's assembly lookup.
+#[cfg(target_arch = "aarch64")]
+const TLS_TABLE_ENTRIES: usize = 256;
+
 #[cfg(target_arch = "aarch64")]
 fn update_host_tls_entry() {
     use core::sync::atomic::Ordering;
@@ -2137,32 +2142,29 @@ fn update_host_tls_entry() {
     let sentinel: u64 = 0xFFFFFFFFFFFFFFFF;
     let table = table_addr as *mut u64;
 
-    // Scan table for existing entry or free slot
-    let mut free_slot: Option<*mut u64> = None;
-    for i in 0..256 {
-        let entry = unsafe { table.add(i * 2) };
+    // Linear scan from index 0 (matches trampoline assembly lookup)
+    for index in 0..TLS_TABLE_ENTRIES {
+        let entry = unsafe { table.add(index * 2) };
         let stored_guest_tpidr = unsafe { entry.read_volatile() };
 
         if stored_guest_tpidr == guest_tpidr as u64 {
-            // Update existing entry
+            // Found existing entry - update host_tls
             unsafe { entry.add(1).write_volatile(host_tls as u64) };
             return;
         }
 
-        if stored_guest_tpidr == sentinel && free_slot.is_none() {
-            free_slot = Some(entry);
+        if stored_guest_tpidr == sentinel {
+            // Found free slot - claim it
+            unsafe {
+                entry.write_volatile(guest_tpidr as u64);
+                entry.add(1).write_volatile(host_tls as u64);
+            }
+            return;
         }
+        // Slot occupied by different thread - continue scanning
     }
 
-    // No existing entry found; use first free slot
-    if let Some(slot) = free_slot {
-        unsafe {
-            slot.write_volatile(guest_tpidr as u64);
-            slot.add(1).write_volatile(host_tls as u64);
-        }
-    }
-    // If table is full, we can't add — the trampoline will not find a match.
-    // This is a programming error but we don't panic to avoid crashing in hot path.
+    panic!("TLS table full: exceeded {TLS_TABLE_ENTRIES} concurrent threads");
 }
 
 extern "C-unwind" fn interrupt_handler(thread_ctx: &mut ThreadContext) {

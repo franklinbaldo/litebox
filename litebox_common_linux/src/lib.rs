@@ -502,27 +502,24 @@ pub const STATX_BASIC_STATS: u32 = 0x07ff;
 )]
 impl From<FileStat> for Statx {
     fn from(stat: FileStat) -> Self {
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         let mode = stat.st_mode as u16;
-        #[cfg(target_arch = "x86")]
-        let mode = stat.st_mode as u16;
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        #[cfg(not(target_arch = "x86"))]
         let dev = stat.st_dev;
         #[cfg(target_arch = "x86")]
         let dev = u64::from(stat.st_dev);
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        #[cfg(not(target_arch = "x86"))]
         let ino = stat.st_ino;
         #[cfg(target_arch = "x86")]
         let ino = u64::from(stat.st_ino);
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        #[cfg(not(target_arch = "x86"))]
         let rdev = stat.st_rdev;
         #[cfg(target_arch = "x86")]
         let rdev = u64::from(stat.st_rdev);
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        #[cfg(not(target_arch = "x86"))]
         let uid = stat.st_uid;
         #[cfg(target_arch = "x86")]
         let uid = u32::from(stat.st_uid);
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        #[cfg(not(target_arch = "x86"))]
         let gid = stat.st_gid;
         #[cfg(target_arch = "x86")]
         let gid = u32::from(stat.st_gid);

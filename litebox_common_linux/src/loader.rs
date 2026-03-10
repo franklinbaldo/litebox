@@ -525,18 +525,23 @@ impl ElfParsedFile {
         // from a different (stale) table, causing TLS lookup failures and crashes.
         #[cfg(target_arch = "aarch64")]
         {
+            // TLS lookup table layout: array of [guest_tpidr: u64, host_tls: u64] entries.
+            // Uses linear scan from index 0; trampoline assembly must use the same approach.
+            const TLS_ENTRY_SIZE: usize = 16; // [guest_tpidr: u64, host_tls: u64]
+            const TLS_TABLE_SIZE: usize = PAGE_SIZE;
+            // Supports up to 256 concurrent threads. Panics if exceeded.
+            const TLS_TABLE_ENTRIES: usize = TLS_TABLE_SIZE / TLS_ENTRY_SIZE;
+
             let existing = crate::HOST_TLS_TABLE_ADDR.load(core::sync::atomic::Ordering::Acquire);
 
             let tls_table_addr = if existing != 0 {
                 // Reuse the TLS table allocated by the first trampoline load.
                 existing
             } else {
-                // First trampoline: allocate a 4096-byte (one page) TLS lookup table.
-                // 256 entries of 16 bytes each: [guest_tpidr: u64, host_tls: u64].
+                // First trampoline: allocate a one-page TLS lookup table.
                 // Initialize all guest_tpidr fields with sentinel 0xFFFFFFFFFFFFFFFF.
-                let tls_table_size = 4096; // PAGE_SIZE
                 let addr = info.brk.max(trampoline_end);
-                let tls_table_end = page_align_up(addr + tls_table_size);
+                let tls_table_end = page_align_up(addr + TLS_TABLE_SIZE);
 
                 mapper
                     .map_zero(
@@ -551,8 +556,8 @@ impl ElfParsedFile {
                     .map_err(ElfLoadError::Map)?;
 
                 let sentinel: u64 = 0xFFFFFFFFFFFFFFFF;
-                for i in 0..256 {
-                    let entry_addr = addr + i * 16;
+                for i in 0..TLS_TABLE_ENTRIES {
+                    let entry_addr = addr + i * TLS_ENTRY_SIZE;
                     mem.write(entry_addr, &sentinel.to_ne_bytes())?;
                 }
 
