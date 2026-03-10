@@ -342,13 +342,18 @@ fn run_thread_inner(
     let mut thread_ctx = ThreadContext { shim, ctx };
     let mut tcb = Box::new(ThreadControlBlock::default());
     ThreadHandle::run_with_handle(|| {
-        with_signal_alt_stack(|| unsafe {
-            let original_tpidr = litebox_common_linux::read_tpidr_el0();
-            tcb.scratch = original_tpidr;
-            litebox_common_linux::write_tpidr_el0((&raw mut *tcb) as usize);
+        // Save original TPIDR_EL0 and install our TCB BEFORE setting up the
+        // signal alt-stack. The alt-stack stores TPIDR_EL0 as `host_tls` for
+        // signal handler recovery — it must be our TCB pointer, not the
+        // original macOS TPIDR_EL0 value (which is unrelated to our TCB).
+        let original_tpidr = unsafe { litebox_common_linux::read_tpidr_el0() };
+        tcb.scratch = original_tpidr;
+        let tcb_ptr = (&raw mut *tcb) as usize;
+        unsafe { litebox_common_linux::write_tpidr_el0(tcb_ptr) };
+        with_signal_alt_stack(tcb_ptr, || unsafe {
             run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter));
-            litebox_common_linux::write_tpidr_el0(original_tpidr);
         });
+        unsafe { litebox_common_linux::write_tpidr_el0(original_tpidr) };
     });
 }
 
@@ -1109,14 +1114,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         _populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
-        eprintln!(
-            "[macos-platform] allocate_pages: range={:#x}..{:#x} (len={:#x}), behavior={:?}, perms={:?}",
-            suggested_range.start,
-            suggested_range.end,
-            suggested_range.len(),
-            fixed_address_behavior,
-            initial_permissions,
-        );
         // Round the range to HOST_PAGE_SIZE boundaries for MAP_FIXED operations.
         // macOS arm64 requires 16KB-aligned addresses for all VM operations.
         // For Hint, we pass the suggested address as-is; the kernel will pick
@@ -1129,11 +1126,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 (aligned_start, aligned_end - aligned_start)
             }
         };
-        eprintln!(
-            "[macos-platform]   rounded: start={:#x}, len={:#x}",
-            mmap_start, mmap_len,
-        );
-
         // On Linux, NoReplace uses MAP_FIXED_NOREPLACE to atomically fail if the
         // address is already mapped. macOS has no equivalent, but we don't need a
         // host-level probe here: the VMem layer in insert_mapping() already
@@ -1172,16 +1164,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         };
         if r == libc::MAP_FAILED {
             let err = std::io::Error::last_os_error();
-            eprintln!(
-                "[macos-platform]   mmap FAILED: {err} (start={:#x}, len={:#x}, flags={:#x})",
-                mmap_start, mmap_len, native_flags,
-            );
             return Err(match err.raw_os_error() {
                 Some(libc::ENOMEM) => litebox::platform::page_mgmt::AllocationError::OutOfMemory,
                 _ => panic!("unhandled mmap error {err}"),
             });
         }
-        eprintln!("[macos-platform]   mmap OK: returned {:#x}", r as usize,);
         // Return the original suggested start address (4KB-aligned) so the VMem
         // layer's bookkeeping is consistent, even though the kernel mapped a wider
         // 16KB-aligned region.
@@ -1204,18 +1191,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         // deallocated or replaced by a subsequent MAP_FIXED mmap.
         let aligned_start = host_page_align_up(range.start);
         let aligned_end = host_page_align_down(range.end);
-        eprintln!(
-            "[macos-platform] deallocate_pages: range={:#x}..{:#x}, rounded={:#x}..{:#x}, {}",
-            range.start,
-            range.end,
-            aligned_start,
-            aligned_end,
-            if aligned_start < aligned_end {
-                "munmap"
-            } else {
-                "SKIPPED"
-            },
-        );
         if aligned_start < aligned_end {
             let r = unsafe {
                 libc::munmap(
@@ -1698,7 +1673,7 @@ const ALT_STACK_MAGIC: usize = 0x4C49_5445_424F_5821; // "LITEBOX!"
 /// ^                                       ^          ^              ^
 /// aligned_base                            SIZE-16    SIZE-8         SIZE
 /// ```
-fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
+fn with_signal_alt_stack<R>(host_tls: usize, f: impl FnOnce() -> R) -> R {
     let guard_page_size: usize = 0x1000;
     // Allocate double the size so we can find an aligned region within it.
     let alloc_size = ALT_STACK_ALLOC_SIZE * 2;
@@ -1752,7 +1727,9 @@ fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
     );
 
     // Store host TLS pointer at aligned_base + ALT_STACK_ALLOC_SIZE - 8.
-    let host_tls = unsafe { litebox_common_linux::read_tpidr_el0() };
+    // On macOS, the caller passes the TCB pointer (which is what TPIDR_EL0
+    // must be restored to in signal handlers). On Linux, this would be the
+    // system TLS pointer (read from TPIDR_EL0 before the call).
     let host_tls_slot = (aligned_base + ALT_STACK_ALLOC_SIZE - 8) as *mut usize;
     unsafe { core::ptr::write_volatile(host_tls_slot, host_tls) };
 
