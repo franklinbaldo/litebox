@@ -1015,13 +1015,43 @@ fn prot_flags(flags: MemoryRegionPermissions) -> ProtFlags {
     res
 }
 
+/// Check whether a virtual address range is free (no existing Mach VM mappings).
+///
+/// Uses `mach_vm_region_recurse` to query the first region at or after `start`.
+/// If that region starts at or beyond `start + len`, the range is unmapped.
+fn is_range_unmapped(start: usize, len: usize) -> bool {
+    let end = start + len;
+    let mut address: u64 = start as u64;
+    let mut size: u64 = 0;
+    let mut depth: u32 = 0;
+    let mut info: vm_region_submap_info_64 = unsafe { core::mem::zeroed() };
+    let mut count = VM_REGION_SUBMAP_INFO_COUNT_64;
+
+    let kr = unsafe {
+        mach_vm_region_recurse(
+            mach_task_self(),
+            &raw mut address,
+            &raw mut size,
+            &raw mut depth,
+            &raw mut info,
+            &raw mut count,
+        )
+    };
+    if kr != KERN_SUCCESS {
+        // No more regions in the address space — range is free.
+        return true;
+    }
+    // `mach_vm_region_recurse` returns the first region at or after `address`.
+    // If that region starts at or beyond our desired end, our range is free.
+    address as usize >= end
+}
+
 /// Translate Linux [`MapFlags`] to macOS `mmap` flags.
 ///
 /// macOS does not support `MAP_GROWSDOWN`, `MAP_POPULATE`, or `MAP_FIXED_NOREPLACE`.
 /// - `MAP_GROWSDOWN` and `MAP_POPULATE` are silently dropped (no macOS equivalent).
-/// - `MAP_FIXED_NOREPLACE` is **not** translated here — callers must emulate it with a
-///   two-step mmap (hint-only mmap, then check returned address). This function simply
-///   ignores the `MAP_FIXED_NOREPLACE` bit.
+/// - `MAP_FIXED_NOREPLACE` is **not** translated here — callers must emulate it
+///   separately (probe via `is_range_unmapped` + `MAP_FIXED`).
 fn macos_mmap_flags(linux_flags: MapFlags) -> libc::c_int {
     let mut result: libc::c_int = 0;
     if linux_flags.contains(MapFlags::MAP_PRIVATE) {
@@ -1036,8 +1066,8 @@ fn macos_mmap_flags(linux_flags: MapFlags) -> libc::c_int {
     if linux_flags.contains(MapFlags::MAP_FIXED) {
         result |= libc::MAP_FIXED;
     }
-    // MAP_FIXED_NOREPLACE: NOT translated here. Callers emulate via hint-only mmap +
-    // address check. See allocate_pages() and try_allocate_cow_pages().
+    // MAP_FIXED_NOREPLACE: NOT translated here. Callers emulate via
+    // is_range_unmapped() + MAP_FIXED. See allocate_pages() and try_allocate_cow_pages().
     //
     // MAP_GROWSDOWN and MAP_POPULATE have no macOS equivalent — silently drop.
     result
@@ -1055,14 +1085,23 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         _populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
+        // Emulate MAP_FIXED_NOREPLACE on macOS: probe that the range is free, then
+        // use MAP_FIXED to guarantee the exact address. macOS does not honor mmap
+        // address hints reliably, so a hint-only approach would spuriously fail.
+        if matches!(fixed_address_behavior, FixedAddressBehavior::NoReplace) {
+            if !is_range_unmapped(suggested_range.start, suggested_range.len()) {
+                return Err(litebox::platform::page_mgmt::AllocationError::AddressInUse);
+            }
+        }
         // Build Linux-style flags, then translate to macOS.
-        // For NoReplace, we do NOT pass MAP_FIXED — instead we pass the address as a hint
-        // and check the returned address afterward (macOS has no MAP_FIXED_NOREPLACE).
         let linux_flags = MapFlags::MAP_PRIVATE
             | MapFlags::MAP_ANONYMOUS
             | match fixed_address_behavior {
-                FixedAddressBehavior::Hint | FixedAddressBehavior::NoReplace => MapFlags::empty(),
-                FixedAddressBehavior::Replace => MapFlags::MAP_FIXED,
+                FixedAddressBehavior::Hint => MapFlags::empty(),
+                // NoReplace uses MAP_FIXED after the range check above.
+                FixedAddressBehavior::Replace | FixedAddressBehavior::NoReplace => {
+                    MapFlags::MAP_FIXED
+                }
             }
             | if can_grow_down {
                 // MAP_GROWSDOWN has no macOS equivalent; macos_mmap_flags drops it.
@@ -1086,17 +1125,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 Some(libc::ENOMEM) => litebox::platform::page_mgmt::AllocationError::OutOfMemory,
                 _ => panic!("unhandled mmap error {err}"),
             });
-        }
-        // Emulate MAP_FIXED_NOREPLACE: if the caller requested NoReplace and the kernel
-        // returned a different address, the requested range was already occupied. Unmap
-        // the (wrong) mapping and report AddressInUse.
-        if matches!(fixed_address_behavior, FixedAddressBehavior::NoReplace)
-            && r as usize != suggested_range.start
-        {
-            unsafe {
-                libc::munmap(r, suggested_range.len());
-            }
-            return Err(litebox::platform::page_mgmt::AllocationError::AddressInUse);
         }
         Ok(UserMutPtr::from_usize(r as usize))
     }
@@ -1203,12 +1231,23 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         };
         assert!(fd >= 0, "file should remain unchanged on host");
 
+        // Emulate MAP_FIXED_NOREPLACE: probe range, then use MAP_FIXED.
+        if matches!(fixed_address_behavior, FixedAddressBehavior::NoReplace)
+            && !is_range_unmapped(suggested_start, source_data.len())
+        {
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(CowAllocationError::InternalFailure);
+        }
+
         let mut flags = MapFlags::MAP_PRIVATE;
         match fixed_address_behavior {
-            FixedAddressBehavior::Hint | FixedAddressBehavior::NoReplace => {
-                // NoReplace: pass address as hint only (no MAP_FIXED). We check afterward.
+            FixedAddressBehavior::Hint => {}
+            // NoReplace uses MAP_FIXED after the range check above.
+            FixedAddressBehavior::Replace | FixedAddressBehavior::NoReplace => {
+                flags |= MapFlags::MAP_FIXED;
             }
-            FixedAddressBehavior::Replace => flags |= MapFlags::MAP_FIXED,
         }
 
         let result = unsafe {
@@ -1227,15 +1266,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         }
 
         if result == libc::MAP_FAILED {
-            Err(CowAllocationError::InternalFailure)
-        } else if matches!(fixed_address_behavior, FixedAddressBehavior::NoReplace)
-            && result as usize != suggested_start
-        {
-            // Emulate MAP_FIXED_NOREPLACE: kernel returned a different address,
-            // so the requested range was occupied. Unmap and report failure.
-            unsafe {
-                libc::munmap(result, source_data.len());
-            }
             Err(CowAllocationError::InternalFailure)
         } else {
             Ok(UserMutPtr::from_usize(result as usize))
