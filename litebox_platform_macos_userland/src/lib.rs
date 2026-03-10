@@ -330,7 +330,7 @@ fn run_thread_inner(
         with_signal_alt_stack(|| unsafe {
             let original_tpidr = litebox_common_linux::read_tpidr_el0();
             tcb.scratch = original_tpidr;
-            litebox_common_linux::write_tpidr_el0((&mut *tcb as *mut ThreadControlBlock) as usize);
+            litebox_common_linux::write_tpidr_el0((&raw mut *tcb) as usize);
             run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter));
             litebox_common_linux::write_tpidr_el0(original_tpidr);
         });
