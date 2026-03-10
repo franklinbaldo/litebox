@@ -31,6 +31,8 @@ cfg_if::cfg_if! {
         pub type Platform = litebox_platform_linux_userland::LinuxUserland;
     } else if #[cfg(all(feature = "platform_windows_userland", target_os = "windows"))] {
         pub type Platform = litebox_platform_windows_userland::WindowsUserland;
+    } else if #[cfg(all(feature = "platform_macos_userland", target_os = "macos"))] {
+        pub type Platform = litebox_platform_macos_userland::MacosUserland;
     } else if #[cfg(feature = "platform_lvbs")] {
         pub type Platform = litebox_platform_lvbs::host::LvbsLinuxKernel;
     } else if #[cfg(feature = "platform_linux_snp")] {
