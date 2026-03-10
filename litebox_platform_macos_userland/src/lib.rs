@@ -366,9 +366,14 @@ fn run_thread_inner(
         // Set both the thread-local (for Rust code) and TPIDR_EL0 (for asm).
         TCB_PTR.set(tcb_ptr);
         unsafe { litebox_common_linux::write_tpidr_el0(tcb_addr) };
+        eprintln!(
+            "[diag] run_thread_inner: TCB at {:#x}, original_tpidr={:#x}, reenter={}",
+            tcb_addr, original_tpidr, reenter
+        );
         with_signal_alt_stack(tcb_addr, || unsafe {
             run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter));
         });
+        eprintln!("[diag] run_thread_inner: returned from run_thread_arch");
         unsafe { litebox_common_linux::write_tpidr_el0(original_tpidr) };
         TCB_PTR.set(core::ptr::null_mut());
     });
@@ -1454,6 +1459,10 @@ unsafe extern "C" {
 }
 
 unsafe extern "C-unwind" fn init_handler(thread_ctx: &mut ThreadContext) {
+    eprintln!(
+        "[diag] init_handler: entering, ctx.pc={:#x}, ctx.sp={:#x}",
+        thread_ctx.ctx.pc, thread_ctx.ctx.sp
+    );
     thread_ctx.call_shim(|shim, ctx| shim.init(ctx));
 }
 
@@ -1477,6 +1486,10 @@ unsafe extern "C-unwind" fn reenter_handler(thread_ctx: &mut ThreadContext) {
 /// purposes.
 #[allow(clippy::cast_sign_loss)]
 unsafe extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext) {
+    eprintln!(
+        "[diag] syscall_handler: entered, ctx.pc={:#x}, ctx.regs[8]={:#x} (syscall nr)",
+        thread_ctx.ctx.pc, thread_ctx.ctx.regs[8]
+    );
     thread_ctx.call_shim(|shim, ctx| shim.syscall(ctx));
 }
 
@@ -1486,6 +1499,10 @@ extern "C-unwind" fn exception_handler(
     error: usize,
     cr2: usize,
 ) {
+    eprintln!(
+        "[diag] exception_handler: trapno={}, error={:#x}, cr2={:#x}, ctx.pc={:#x}",
+        trapno, error, cr2, thread_ctx.ctx.pc
+    );
     let _ = error; // unused on aarch64; signal number is in trapno
     let info = litebox::shim::ExceptionInfo {
         fault_address: cr2,
@@ -1507,6 +1524,7 @@ fn update_host_tls_entry() {
 
     let table_addr = litebox_common_linux::HOST_TLS_TABLE_ADDR.load(Ordering::Acquire);
     if table_addr == 0 {
+        eprintln!("[diag] update_host_tls_entry: no TLS table (addr=0)");
         return; // No TLS table allocated (not using rewriter-based trampoline)
     }
 
@@ -1518,6 +1536,11 @@ fn update_host_tls_entry() {
 
     // Read guest_tpidr from our thread-local
     let guest_tpidr = get_guest_tpidr();
+
+    eprintln!(
+        "[diag] update_host_tls_entry: table_addr={:#x}, host_tls={:#x}, guest_tpidr={:#x}",
+        table_addr, host_tls, guest_tpidr
+    );
 
     let sentinel: u64 = 0xFFFFFFFFFFFFFFFF;
     let table = table_addr as *mut u64;
@@ -1571,10 +1594,22 @@ impl ThreadContext<'_> {
         let op = f(self.shim, self.ctx);
         match op {
             ContinueOperation::Resume => {
+                eprintln!(
+                    "[diag] call_shim: Resume, about to update_host_tls_entry. ctx.pc={:#x}, ctx.sp={:#x}",
+                    self.ctx.pc, self.ctx.sp
+                );
                 update_host_tls_entry();
+                eprintln!(
+                    "[diag] call_shim: about to switch_to_guest. ctx.pc={:#x}, ctx.sp={:#x}, guest_tpidr={:#x}",
+                    self.ctx.pc,
+                    self.ctx.sp,
+                    get_guest_tpidr()
+                );
                 unsafe { switch_to_guest(self.ctx) }
             }
-            ContinueOperation::Terminate => {}
+            ContinueOperation::Terminate => {
+                eprintln!("[diag] call_shim: Terminate");
+            }
         }
     }
 }
@@ -1808,6 +1843,73 @@ fn with_signal_alt_stack<R>(host_tls: usize, f: impl FnOnce() -> R) -> R {
     f()
 }
 
+// Async-signal-safe diagnostic helpers. These avoid allocation and use
+// write(2) directly, safe to call from signal handlers.
+
+/// Write a hex value into `buf` starting at `pos`. Returns new position.
+fn write_hex(buf: &mut [u8], mut pos: usize, val: usize) -> usize {
+    if pos + 2 > buf.len() {
+        return pos;
+    }
+    buf[pos] = b'0';
+    buf[pos + 1] = b'x';
+    pos += 2;
+    if val == 0 {
+        if pos < buf.len() {
+            buf[pos] = b'0';
+            pos += 1;
+        }
+        return pos;
+    }
+    // Find the highest nibble
+    let mut started = false;
+    for i in (0..16).rev() {
+        let nibble = (val >> (i * 4)) & 0xf;
+        if nibble != 0 || started {
+            started = true;
+            if pos < buf.len() {
+                buf[pos] = b"0123456789abcdef"[nibble];
+                pos += 1;
+            }
+        }
+    }
+    pos
+}
+
+/// Copy bytes into buf at pos. Returns new position.
+fn write_bytes(buf: &mut [u8], mut pos: usize, src: &[u8]) -> usize {
+    for &b in src {
+        if pos < buf.len() {
+            buf[pos] = b;
+            pos += 1;
+        }
+    }
+    pos
+}
+
+/// Format: "{prefix}{signum}, pc={pc_hex}, far={far_hex}\n"
+fn format_signal_diag(
+    buf: &mut [u8],
+    prefix: &[u8],
+    signum: usize,
+    pc: usize,
+    far: usize,
+) -> usize {
+    let mut pos = write_bytes(buf, 0, prefix);
+    pos = write_hex(buf, pos, signum);
+    pos = write_bytes(buf, pos, b", pc=");
+    pos = write_hex(buf, pos, pc);
+    pos = write_bytes(buf, pos, b", far=");
+    pos = write_hex(buf, pos, far);
+    pos = write_bytes(buf, pos, b"\n");
+    pos
+}
+
+/// Format a simple message.
+fn format_buf(buf: &mut [u8], msg: &[u8]) -> usize {
+    write_bytes(buf, 0, msg)
+}
+
 /// Called from signal handlers to fix up thread state after potentially running
 /// in the guest (aarch64 version).
 ///
@@ -1832,6 +1934,12 @@ fn signal_handler_exit_guest(
         if ret != 0 || current_ss.ss_flags & libc::SS_ONSTACK == 0 {
             // Not on our alt-stack (or syscall failed). Return None without
             // touching any SP-derived addresses.
+            let mut buf = [0u8; 128];
+            let n = format_buf(
+                &mut buf,
+                b"[diag] signal_handler_exit_guest: not on alt-stack\n",
+            );
+            libc::write(2, buf.as_ptr() as *const libc::c_void, n);
             return None;
         }
 
@@ -1845,6 +1953,9 @@ fn signal_handler_exit_guest(
         let magic_ptr = (aligned_base + ALT_STACK_ALLOC_SIZE - 16) as *const usize;
         let magic = core::ptr::read_volatile(magic_ptr);
         if magic != ALT_STACK_MAGIC {
+            let mut buf = [0u8; 128];
+            let n = format_buf(&mut buf, b"[diag] signal_handler_exit_guest: bad magic\n");
+            libc::write(2, buf.as_ptr() as *const libc::c_void, n);
             return None;
         }
 
@@ -1852,6 +1963,9 @@ fn signal_handler_exit_guest(
         let host_tls = core::ptr::read_volatile(host_tls_ptr);
 
         if host_tls == 0 {
+            let mut buf = [0u8; 128];
+            let n = format_buf(&mut buf, b"[diag] signal_handler_exit_guest: host_tls=0\n");
+            libc::write(2, buf.as_ptr() as *const libc::c_void, n);
             return None;
         }
 
@@ -1866,6 +1980,22 @@ fn signal_handler_exit_guest(
         let in_guest_ptr = (host_tls as *mut u8).byte_offset(tcb_offset_in_guest());
         let was_in_guest = core::ptr::read_volatile(in_guest_ptr);
         core::ptr::write_volatile(in_guest_ptr, 0);
+
+        {
+            let mut buf = [0u8; 256];
+            let mut pos = write_bytes(
+                &mut buf,
+                0,
+                b"[diag] signal_handler_exit_guest: on_alt_stack, host_tls=",
+            );
+            pos = write_hex(&mut buf, pos, host_tls);
+            pos = write_bytes(&mut buf, pos, b", was_in_guest=");
+            pos = write_hex(&mut buf, pos, was_in_guest as usize);
+            pos = write_bytes(&mut buf, pos, b", current_tpidr=");
+            pos = write_hex(&mut buf, pos, current_tpidr);
+            pos = write_bytes(&mut buf, pos, b"\n");
+            libc::write(2, buf.as_ptr() as *const libc::c_void, pos);
+        }
 
         if set_interrupt {
             let interrupt_ptr = (host_tls as *mut u8).byte_offset(tcb_offset_interrupt());
@@ -1931,7 +2061,27 @@ unsafe extern "C" fn exception_signal_handler(
     info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
+    let sigctx_pre = unsafe { &*context.uc_mcontext };
+    let pc_pre = sigctx_pre.__ss.__pc as usize;
+    let far_pre = sigctx_pre.__es.__far as usize;
+    // Use write(2) directly to avoid allocator reentrancy issues in signal handler.
+    // eprintln! may allocate and is not async-signal-safe.
+    let mut buf = [0u8; 256];
+    let n = format_signal_diag(
+        &mut buf,
+        b"[diag] exception_signal_handler: signum=",
+        signum as usize,
+        pc_pre,
+        far_pre,
+    );
+    unsafe { libc::write(2, buf.as_ptr() as *const libc::c_void, n) };
+
     let Some(regs) = signal_handler_exit_guest(context, false) else {
+        let n2 = format_buf(
+            &mut buf,
+            b"[diag] exception_signal_handler: not in guest, forwarding to next_signal_handler\n",
+        );
+        unsafe { libc::write(2, buf.as_ptr() as *const libc::c_void, n2) };
         return unsafe { next_signal_handler(signum, info, context) };
     };
     copy_signal_context(unsafe { &mut *regs }, context);
@@ -1959,10 +2109,25 @@ unsafe fn next_signal_handler(
     info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
+    let mut buf = [0u8; 256];
     if signum == libc::SIGSEGV {
         #[allow(clippy::cast_possible_truncation)]
         let ip: usize = unsafe { (*context.uc_mcontext).__ss.__pc as usize };
+        let far: usize = unsafe { (*context.uc_mcontext).__es.__far as usize };
+        let n = format_signal_diag(
+            &mut buf,
+            b"[diag] next_signal_handler: SIGSEGV pc=",
+            0xb,
+            ip,
+            far,
+        );
+        unsafe { libc::write(2, buf.as_ptr() as *const libc::c_void, n) };
         if let Some(fixup_addr) = litebox::mm::exception_table::search_exception_tables(ip) {
+            let n2 = format_buf(
+                &mut buf,
+                b"[diag] next_signal_handler: found exception table fixup\n",
+            );
+            unsafe { libc::write(2, buf.as_ptr() as *const libc::c_void, n2) };
             unsafe {
                 (*context.uc_mcontext).__ss.__pc = fixup_addr as u64;
             }
@@ -1974,6 +2139,11 @@ unsafe fn next_signal_handler(
         let next_sa = &NEXT_SA[signum.reinterpret_as_unsigned() as usize];
         match next_sa.sa_sigaction {
             libc::SIG_DFL => {
+                let n3 = format_buf(
+                    &mut buf,
+                    b"[diag] next_signal_handler: dispatching to SIG_DFL -- process will die\n",
+                );
+                unsafe { libc::write(2, buf.as_ptr() as *const libc::c_void, n3) };
                 // Block this signal and raise.
                 let mut set: libc::sigset_t = core::mem::zeroed();
                 libc::sigemptyset(&raw mut set);
