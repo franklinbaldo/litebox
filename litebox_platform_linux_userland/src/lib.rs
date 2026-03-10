@@ -732,7 +732,6 @@ impl litebox::platform::AddressSpaceProvider for LinuxUserland {
         Ok(PartitionState::range_of(id))
     }
 }
-}
 
 /// Runs a guest thread using the provided shim and the given initial context.
 ///
@@ -2194,7 +2193,7 @@ impl litebox::platform::StdioProvider for LinuxUserland {
             revents: 0,
         };
         // SAFETY: poll with timeout=0 is a non-blocking check.
-        let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
+        let ret = unsafe { libc::poll(core::ptr::from_mut(&mut pfd), 1, 0) };
         ret > 0 && (pfd.revents & libc::POLLIN) != 0
     }
 }

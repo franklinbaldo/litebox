@@ -128,6 +128,7 @@ impl SignalState {
         Self {
             pending: RefCell::new(PendingSignals::new()),
             blocked: Cell::new(self.blocked.get()),
+            shared_pending: Arc::new(Mutex::new(PendingSignals::new())),
             // Deep-copy handlers so the child's rt_sigaction doesn't affect
             // the parent (important for vfork where both run concurrently).
             handlers: RefCell::new(Arc::new((*self.handlers.borrow()).as_ref().clone())),
@@ -542,7 +543,6 @@ impl<FS: ShimFS> Task<FS> {
             }
             let old_act = handler.action;
             if let Some(act) = act {
-                if signal == Signal::SIGCHLD {}
                 handler.action = act;
             }
             old_act

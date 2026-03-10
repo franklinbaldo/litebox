@@ -223,7 +223,7 @@ impl<FS: ShimFS> EpollFile<FS> {
                         }
                         // Otherwise it was just our poll interval — continue.
                     }
-                    e => return Err(e),
+                    WaitError::Interrupted => return Err(WaitError::Interrupted),
                 }
             }
         } else {
@@ -664,7 +664,7 @@ impl PollSet {
                             return Err(WaitError::TimedOut);
                         }
                     }
-                    e => return Err(e),
+                    WaitError::Interrupted => return Err(WaitError::Interrupted),
                 }
             }
         } else {

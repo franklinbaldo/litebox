@@ -361,14 +361,14 @@ impl<FS: ShimFS> Task<FS> {
         let files = self.files.borrow();
         let file_table = files.file_descriptors.read();
         let desc = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
-        let result = match desc {
+        match desc {
             Descriptor::LiteBoxRawFd(raw_fd) => {
                 let raw_fd = *raw_fd;
                 drop(file_table);
                 // We need to do this cell dance because otherwise Rust can't recognize that the two
                 // closures are mutually exclusive.
                 let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
-                let r = files
+                files
                     .run_on_raw_fd(
                         raw_fd,
                         |fd| {
@@ -393,8 +393,7 @@ impl<FS: ShimFS> Task<FS> {
                                 .map_err(Errno::from)
                         },
                     )
-                    .flatten();
-                r
+                    .flatten()
             }
             Descriptor::Epoll { .. } => Err(Errno::EINVAL),
             Descriptor::Eventfd { file, .. } => {
@@ -413,8 +412,7 @@ impl<FS: ShimFS> Task<FS> {
                 litebox_common_linux::ReceiveFlags::empty(),
                 None,
             ),
-        };
-        result
+        }
     }
 
     /// Handle syscall `write`
@@ -1966,14 +1964,13 @@ impl<FS: ShimFS> Task<FS> {
         let epoll_file = {
             let files = self.files.borrow();
             let locked_file_descriptors = files.file_descriptors.read();
-            match locked_file_descriptors.get_fd(epfd).ok_or(Errno::EBADF)? {
-                Descriptor::Epoll { file, .. } => file.clone(),
-                _ => {
-                    if let Some(old) = saved_mask {
-                        self.signals.set_blocked(old);
-                    }
-                    return Err(Errno::EBADF);
+            if let Some(Descriptor::Epoll { file, .. }) = locked_file_descriptors.get_fd(epfd) {
+                file.clone()
+            } else {
+                if let Some(old) = saved_mask {
+                    self.signals.set_blocked(old);
                 }
+                return Err(Errno::EBADF);
             }
         };
         let result = match epoll_file.wait(
@@ -2187,7 +2184,7 @@ impl<FS: ShimFS> Task<FS> {
             // pack.sigset is actually a pointer to the sigset (the u64 holds
             // the guest address). Dereference it to read the actual mask.
             let sigset_ptr = crate::ConstPtr::<litebox_common_linux::signal::SigSet>::from_usize(
-                pack.sigset.as_u64() as usize,
+                pack.sigset.as_u64().truncate(),
             );
             let new_mask = sigset_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
             let old = self.signals.get_blocked();

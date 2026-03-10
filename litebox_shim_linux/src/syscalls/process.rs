@@ -577,11 +577,8 @@ impl<FS: ShimFS> Task<FS> {
                     let parent_key = notif.parent_pid.0.cast_signed();
                     if let Some(remote) = handles.get(&parent_key) {
                         remote.interrupt();
-                    } else {
                     }
-                } else {
                 }
-            } else {
             }
 
             // Release the process's VA partition. For a vfork child that

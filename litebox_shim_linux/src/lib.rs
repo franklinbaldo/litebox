@@ -1059,7 +1059,6 @@ impl<FS: ShimFS> Task<FS> {
                 newfd,
                 flags,
             } => {
-                if self.process_id.0 > 10 || newfd.is_some_and(|n| n <= 2) {}
                 syscall!(sys_dup(oldfd, newfd, flags))
             }
             SyscallRequest::Socket {
