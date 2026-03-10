@@ -1328,9 +1328,6 @@ fn thread_start(
     let shim = init_thread.init();
 
     run_thread_inner(shim.as_ref(), &mut ctx, false);
-    // TODO: have syscall_callback return if we need to terminate the process.
-    // We should return this value to the caller so load_program can return it
-    // to the user.
 }
 
 // A handle to a platform thread.

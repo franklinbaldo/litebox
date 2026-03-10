@@ -216,6 +216,7 @@ impl From<litebox::fs::errors::ReadError> for Errno {
             litebox::fs::errors::ReadError::NotAFile => Errno::EISDIR,
             litebox::fs::errors::ReadError::NotForReading => Errno::EACCES,
             litebox::fs::errors::ReadError::Io => Errno::EIO,
+            litebox::fs::errors::ReadError::WouldBlock => Errno::EAGAIN,
             _ => unimplemented!(),
         }
     }

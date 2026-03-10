@@ -378,15 +378,17 @@ impl<FS: ShimFS> Task<FS> {
                                 .fs
                                 .read(fd, &mut buf.borrow_mut(), offset)
                                 .map_err(Errno::from);
-                            // If the read returned EIO (no data), check whether
-                            // this fd is a pollable device (e.g. PTY slave).
-                            // If so, block until data arrives or task exits.
-                            if let Err(Errno::EIO) = result
+                            // If the read returned EAGAIN (no data), check whether
+                            // this fd is a pollable device that wants blocking reads
+                            // (e.g. PTY slave). Non-blocking pollables (PTY master)
+                            // return EAGAIN immediately for epoll-driven callers.
+                            if let Err(Errno::EAGAIN) = result
                                 && let Some(pollable) = self.global.fs.get_io_pollable(fd)
+                                && pollable.should_block_read()
                             {
                                 loop {
                                     if self.is_exiting() {
-                                        return Err(Errno::EIO);
+                                        return Err(Errno::EINTR);
                                     }
                                     let events = pollable.check_io_events();
                                     if events.contains(Events::HUP) {
@@ -396,7 +398,7 @@ impl<FS: ShimFS> Task<FS> {
                                         match self.global.fs.read(fd, &mut buf.borrow_mut(), offset)
                                         {
                                             Ok(n) => return Ok(n),
-                                            Err(litebox::fs::errors::ReadError::Io) => {
+                                            Err(litebox::fs::errors::ReadError::WouldBlock) => {
                                                 core::hint::spin_loop();
                                                 continue;
                                             }
@@ -418,9 +420,15 @@ impl<FS: ShimFS> Task<FS> {
                             )
                         },
                         |fd| {
+                            let is_vfork_child = self.fork_context.borrow().is_some();
                             self.global
                                 .pipes
-                                .read(&self.wait_cx(), fd, &mut buf.borrow_mut())
+                                .read_vfork_aware(
+                                    &self.wait_cx(),
+                                    fd,
+                                    &mut buf.borrow_mut(),
+                                    is_vfork_child,
+                                )
                                 .map_err(Errno::from)
                         },
                     )
@@ -1956,7 +1964,8 @@ impl<FS: ShimFS> Task<FS> {
         } else {
             Some(event.read_at_offset(0).ok_or(Errno::EFAULT)?)
         };
-        epoll.epoll_ctl(&self.global, op, fd, &file_descriptor, event)
+        epoll.epoll_ctl(&self.global, op, fd, &file_descriptor, event)?;
+        Ok(())
     }
 
     /// Handle syscall `epoll_pwait`

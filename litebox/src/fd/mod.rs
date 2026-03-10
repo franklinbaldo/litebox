@@ -83,6 +83,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 self.entries.len() - 1
             });
         let src = self.entries[raw.as_usize()?].as_ref().unwrap();
+        src.x.read().entry.on_dup();
         let new_ind_entry = IndividualEntry {
             x: Arc::clone(&src.x),
             metadata: src.metadata.clone(),
@@ -118,9 +119,9 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 self.entries.push(None);
                 self.entries.len() - 1
             });
-        let new_ind_entry = IndividualEntry::new(Arc::clone(
-            &self.entries[fd.x.as_usize()?].as_ref().unwrap().x,
-        ));
+        let src = self.entries[fd.x.as_usize()?].as_ref().unwrap();
+        src.x.read().entry.on_dup();
+        let new_ind_entry = IndividualEntry::new(Arc::clone(&src.x));
         let old = self.entries[idx].replace(new_ind_entry);
         assert!(old.is_none());
         Some(TypedFd {
@@ -143,6 +144,10 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
             unreachable!();
         };
         fd.x.mark_as_closed();
+        // Notify the entry that one reference is being closed.
+        // For pipes, this decrements the writer/reader count and
+        // sends HUP/ERR when the last reference is closed.
+        old.x.read().entry.on_close();
         Arc::into_inner(old.x)
             .map(RwLock::into_inner)
             .map(DescriptorEntry::into_subsystem_entry::<Subsystem>)
@@ -778,7 +783,19 @@ pub trait FdEnabledSubsystem: Sized {
 
 /// Entries for a specific [`FdEnabledSubsystem`]
 #[doc(hidden)]
-pub trait FdEnabledSubsystemEntry: Send + Sync + core::any::Any {}
+pub trait FdEnabledSubsystemEntry: Send + Sync + core::any::Any {
+    /// Called when a new duplicate of this descriptor is created (via `dup`,
+    /// `dup2`, `dup3`, or `fork`). The default implementation is a no-op.
+    /// Pipe implementations use this to track the number of open writer/reader
+    /// file descriptors.
+    fn on_dup(&self) {}
+
+    /// Called when one duplicate of this descriptor is closed (even if other
+    /// duplicates still reference the same underlying entry). The default
+    /// implementation is a no-op. Pipe implementations use this to decrement
+    /// the writer/reader file descriptor count.
+    fn on_close(&self) {}
+}
 
 /// Possible errors from [`RawDescriptorStorage::fd_from_raw_integer`] and
 /// [`RawDescriptorStorage::fd_consume_raw_integer`].

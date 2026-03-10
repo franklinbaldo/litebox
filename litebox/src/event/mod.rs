@@ -55,6 +55,13 @@ pub trait IOPollable {
     fn needs_host_poll(&self) -> bool {
         false
     }
+
+    /// Returns `true` if reads on this pollable should block when no data is
+    /// available. Returns `false` for fds whose callers use epoll/poll and
+    /// expect EAGAIN to be returned immediately (e.g. PTY master).
+    fn should_block_read(&self) -> bool {
+        true
+    }
 }
 
 impl<T: IOPollable> IOPollable for alloc::sync::Arc<T> {

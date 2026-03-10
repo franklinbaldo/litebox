@@ -167,6 +167,10 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + TimeProvider> IOPollable
         }
         events
     }
+
+    fn should_block_read(&self) -> bool {
+        false
+    }
 }
 
 /// Wrapper for polling the slave side of a PTY pair.
@@ -561,9 +565,7 @@ impl<
                     if !pair.slave_open.load(core::sync::atomic::Ordering::Acquire) {
                         return Ok(0); // EOF — slave closed
                     }
-                    // No data available — return EAGAIN-like behavior via Io error
-                    // The caller should retry. In practice, copilot's libuv polls this.
-                    return Err(ReadError::Io);
+                    return Err(ReadError::WouldBlock);
                 }
                 let n = core::cmp::min(buf.len(), ring.len());
                 for (i, byte) in ring.drain(..n).enumerate() {
@@ -573,7 +575,7 @@ impl<
             }
             &Device::PtySlave(idx) => {
                 // Slave reads what the master has written.
-                // Returns Io (EAGAIN-equivalent) when no data is available;
+                // Returns WouldBlock (EAGAIN) when no data is available;
                 // the shim layer handles blocking retry with interruptibility.
                 let pair = self.pty_manager.get(idx).ok_or(ReadError::ClosedFd)?;
                 let mut ring = pair.master_to_slave.lock();
@@ -581,7 +583,7 @@ impl<
                     if !pair.master_open.load(core::sync::atomic::Ordering::Acquire) {
                         return Ok(0); // EOF — master closed
                     }
-                    return Err(ReadError::Io);
+                    return Err(ReadError::WouldBlock);
                 }
                 let n = core::cmp::min(buf.len(), ring.len());
                 for (i, byte) in ring.drain(..n).enumerate() {

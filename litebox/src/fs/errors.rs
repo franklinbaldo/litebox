@@ -48,6 +48,8 @@ pub enum ReadError {
     NotForReading,
     #[error("I/O error")]
     Io,
+    #[error("operation would block")]
+    WouldBlock,
 }
 
 /// Possible errors from [`FileSystem::write`]
