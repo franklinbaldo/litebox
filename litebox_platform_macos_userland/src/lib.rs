@@ -368,15 +368,16 @@ fn run_thread_inner(
             tcb_addr, original_tpidr, reenter
         );
         with_signal_alt_stack(tcb_addr, || unsafe {
-            // Set TPIDR_EL0 here, right before the asm, because macOS
-            // syscalls (inside with_signal_alt_stack setup) clobber it.
-            litebox_common_linux::write_tpidr_el0(tcb_addr);
-            let tpidr_before_asm: usize;
-            core::arch::asm!("mrs {}, tpidr_el0", out(reg) tpidr_before_asm, options(nostack, nomem));
+            // Diagnostics BEFORE setting TPIDR_EL0 (any eprintln/write
+            // syscall will clobber TPIDR_EL0 on macOS).
             eprintln!(
-                "[diag] run_thread_inner: inside closure, TPIDR_EL0={:#x} (expected {:#x})",
-                tpidr_before_asm, tcb_addr
+                "[diag] run_thread_inner: inside closure, about to set TPIDR_EL0={:#x}",
+                tcb_addr
             );
+            // Set TPIDR_EL0 as the VERY LAST thing before asm. No syscalls
+            // (including eprintln!) allowed between this and run_thread_arch,
+            // because macOS clobbers TPIDR_EL0 on every syscall.
+            litebox_common_linux::write_tpidr_el0(tcb_addr);
             run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter));
         });
         eprintln!("[diag] run_thread_inner: returned from run_thread_arch");
@@ -555,8 +556,11 @@ _syscall_callback:
     .globl _exception_callback
 _exception_callback:
     .cfi_startproc
+    // Restore TPIDR_EL0 from x18 (passed via ucontext on signal return,
+    // or already set from mrs at switch_to_guest entry).
+    // macOS sigreturn clobbers TPIDR_EL0, so we must restore it here.
+    msr tpidr_el0, x18
     // Restore host stack.
-    mrs x18, tpidr_el0
     ldr x9, [x18, #8]
     mov sp, x9
 
@@ -568,8 +572,10 @@ _exception_callback:
     .globl _interrupt_callback
 _interrupt_callback:
     .cfi_startproc
+    // Restore TPIDR_EL0 from x18 (passed via ucontext on signal return,
+    // or already set from mrs at switch_to_guest entry).
+    msr tpidr_el0, x18
     // Restore host stack.
-    mrs x18, tpidr_el0
     ldr x9, [x18, #8]
     mov sp, x9
 
@@ -1534,11 +1540,11 @@ fn update_host_tls_entry() {
         return; // No TLS table allocated (not using rewriter-based trampoline)
     }
 
-    // Read current host TPIDR_EL0 (= host TLS base)
-    let host_tls: usize;
-    unsafe {
-        core::arch::asm!("mrs {}, tpidr_el0", out(reg) host_tls, options(nostack, preserves_flags));
-    }
+    // On macOS, TPIDR_EL0 is clobbered by every syscall, so we cannot read
+    // it with `mrs`. Instead, derive host_tls from our thread-local TCB_PTR.
+    let tcb = TCB_PTR.get();
+    assert!(!tcb.is_null(), "update_host_tls_entry called without TCB");
+    let host_tls = tcb as usize;
 
     // Read guest_tpidr from our thread-local
     let guest_tpidr = get_guest_tpidr();
@@ -1611,7 +1617,13 @@ impl ThreadContext<'_> {
                     self.ctx.sp,
                     get_guest_tpidr()
                 );
-                unsafe { switch_to_guest(self.ctx) }
+                // Re-set TPIDR_EL0 as the VERY LAST thing before asm.
+                // macOS clobbers it on every syscall (including eprintln above).
+                let tcb = TCB_PTR.get();
+                unsafe {
+                    litebox_common_linux::write_tpidr_el0(tcb as usize);
+                    switch_to_guest(self.ctx)
+                }
             }
             ContinueOperation::Terminate => {
                 eprintln!("[diag] call_shim: Terminate");
@@ -1930,10 +1942,14 @@ fn format_buf(buf: &mut [u8], msg: &[u8]) -> usize {
 /// Uses `sigaltstack(NULL, &ss)` to verify we're on the custom alt-stack before
 /// accessing the SP-derived aligned base. This avoids faulting on unmapped memory
 /// when the signal is delivered on a non-alt-stack.
+///
+/// Returns `(guest_regs, host_tls)` if in guest, `None` otherwise. The caller
+/// needs `host_tls` to pass through `set_signal_return` → x18, because macOS
+/// sigreturn clobbers TPIDR_EL0.
 fn signal_handler_exit_guest(
     _context: &libc::ucontext_t,
     set_interrupt: bool,
-) -> Option<*mut litebox_common_linux::PtRegs> {
+) -> Option<(*mut litebox_common_linux::PtRegs, usize)> {
     unsafe {
         let mut current_ss: libc::stack_t = core::mem::zeroed();
         let ret = libc::sigaltstack(std::ptr::null(), &raw mut current_ss);
@@ -2024,7 +2040,7 @@ fn signal_handler_exit_guest(
         let ctx_top_ptr = (host_tls as *const usize).byte_offset(tcb_offset_guest_context_top());
         let guest_context_top =
             core::ptr::read_volatile(ctx_top_ptr) as *mut litebox_common_linux::PtRegs;
-        Some(guest_context_top.sub(1))
+        Some((guest_context_top.sub(1), host_tls))
     }
 }
 
@@ -2044,10 +2060,14 @@ fn copy_signal_context(regs: &mut litebox_common_linux::PtRegs, context: &libc::
 }
 
 /// Updates a Linux signal context to return to `f` with the given arguments (aarch64).
+///
+/// Also writes `host_tls` into x18 in the ucontext, so the callback asm can
+/// restore TPIDR_EL0 after sigreturn (macOS clobbers TPIDR_EL0 on sigreturn).
 #[allow(clippy::cast_sign_loss)]
 fn set_signal_return(
     context: &mut libc::ucontext_t,
     f: unsafe extern "C" fn(),
+    host_tls: usize,
     p0: isize,
     p1: isize,
     p2: isize,
@@ -2059,6 +2079,9 @@ fn set_signal_return(
     sigctx.__ss.__x[1] = p1 as u64;
     sigctx.__ss.__x[2] = p2 as u64;
     sigctx.__ss.__x[3] = p3 as u64;
+    // Pass host_tls via x18 so callback asm can restore TPIDR_EL0.
+    // macOS sigreturn clobbers TPIDR_EL0 to the pthread value.
+    sigctx.__ss.__x[18] = host_tls as u64;
 }
 
 /// Signal handler for hardware exceptions (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP).
@@ -2082,7 +2105,7 @@ unsafe extern "C" fn exception_signal_handler(
     );
     unsafe { libc::write(2, buf.as_ptr() as *const libc::c_void, n) };
 
-    let Some(regs) = signal_handler_exit_guest(context, false) else {
+    let Some((regs, host_tls)) = signal_handler_exit_guest(context, false) else {
         let n2 = format_buf(
             &mut buf,
             b"[diag] exception_signal_handler: not in guest, forwarding to next_signal_handler\n",
@@ -2106,7 +2129,7 @@ unsafe extern "C" fn exception_signal_handler(
             fault_addr as isize, // fault address
         )
     };
-    set_signal_return(context, exception_callback, 0, trapno, err, cr2);
+    set_signal_return(context, exception_callback, host_tls, 0, trapno, err, cr2);
 }
 
 /// Runs the next signal handler in the chain.
@@ -2214,7 +2237,7 @@ unsafe fn interrupt_signal_handler(
     }
 
     // Clear `in_guest` and set `interrupt`.
-    let Some(regs) = signal_handler_exit_guest(context, true) else {
+    let Some((regs, host_tls)) = signal_handler_exit_guest(context, true) else {
         // Case 2: not in guest.
         return;
     };
@@ -2231,7 +2254,7 @@ unsafe fn interrupt_signal_handler(
         copy_signal_context(unsafe { &mut *regs }, context);
     }
     // Cases 3 and 4: jump to interrupt handler.
-    set_signal_return(context, interrupt_callback, 0, 0, 0, 0);
+    set_signal_return(context, interrupt_callback, host_tls, 0, 0, 0, 0);
 }
 
 impl litebox::platform::CrngProvider for MacosUserland {
