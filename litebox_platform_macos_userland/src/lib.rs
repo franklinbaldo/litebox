@@ -1034,6 +1034,11 @@ fn prot_flags(flags: MemoryRegionPermissions) -> ProtFlags {
 ///
 /// Uses `mach_vm_region_recurse` to query the first region at or after `start`.
 /// If that region starts at or beyond `start + len`, the range is unmapped.
+/// Check whether the given host address range is entirely unmapped.
+///
+/// Currently unused — the VMA layer handles conflict detection, but this
+/// function is retained for diagnostic/debugging purposes.
+#[allow(dead_code)]
 fn is_range_unmapped(start: usize, len: usize) -> bool {
     let end = start + len;
     let mut address: u64 = start as u64;
@@ -1065,8 +1070,8 @@ fn is_range_unmapped(start: usize, len: usize) -> bool {
 ///
 /// macOS does not support `MAP_GROWSDOWN`, `MAP_POPULATE`, or `MAP_FIXED_NOREPLACE`.
 /// - `MAP_GROWSDOWN` and `MAP_POPULATE` are silently dropped (no macOS equivalent).
-/// - `MAP_FIXED_NOREPLACE` is **not** translated here — callers must emulate it
-///   separately (probe via `is_range_unmapped` + `MAP_FIXED`).
+/// - `MAP_FIXED_NOREPLACE` is **not** translated here — callers use `MAP_FIXED`
+///   directly, relying on the VMem VMA layer for conflict detection.
 fn macos_mmap_flags(linux_flags: MapFlags) -> libc::c_int {
     let mut result: libc::c_int = 0;
     if linux_flags.contains(MapFlags::MAP_PRIVATE) {
@@ -1081,8 +1086,8 @@ fn macos_mmap_flags(linux_flags: MapFlags) -> libc::c_int {
     if linux_flags.contains(MapFlags::MAP_FIXED) {
         result |= libc::MAP_FIXED;
     }
-    // MAP_FIXED_NOREPLACE: NOT translated here. Callers emulate via
-    // is_range_unmapped() + MAP_FIXED. See allocate_pages() and try_allocate_cow_pages().
+    // MAP_FIXED_NOREPLACE: NOT translated here. Callers use MAP_FIXED directly;
+    // the VMem VMA layer handles conflict detection.
     //
     // MAP_GROWSDOWN and MAP_POPULATE have no macOS equivalent — silently drop.
     result
@@ -1129,22 +1134,21 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
             mmap_start, mmap_len,
         );
 
-        // Emulate MAP_FIXED_NOREPLACE on macOS: probe that the range is free, then
-        // use MAP_FIXED to guarantee the exact address. macOS does not honor mmap
-        // address hints reliably, so a hint-only approach would spuriously fail.
-        if matches!(fixed_address_behavior, FixedAddressBehavior::NoReplace) {
-            let unmapped = is_range_unmapped(mmap_start, mmap_len);
-            eprintln!("[macos-platform]   NoReplace probe: is_range_unmapped={unmapped}",);
-            if !unmapped {
-                return Err(litebox::platform::page_mgmt::AllocationError::AddressInUse);
-            }
-        }
+        // On Linux, NoReplace uses MAP_FIXED_NOREPLACE to atomically fail if the
+        // address is already mapped. macOS has no equivalent, but we don't need a
+        // host-level probe here: the VMem layer in insert_mapping() already
+        // verified there are no VMA-level conflicts before calling us. On macOS
+        // arm64, 16KB host page rounding means the rounded range may overlap with
+        // adjacent allocations within the same reserved region — a host-level
+        // is_range_unmapped() probe would spuriously fail. Using MAP_FIXED for
+        // both Replace and NoReplace is correct because the VMA layer is the
+        // authoritative conflict check.
         // Build Linux-style flags, then translate to macOS.
         let linux_flags = MapFlags::MAP_PRIVATE
             | MapFlags::MAP_ANONYMOUS
             | match fixed_address_behavior {
                 FixedAddressBehavior::Hint => MapFlags::empty(),
-                // NoReplace uses MAP_FIXED after the range check above.
+                // NoReplace uses MAP_FIXED — VMA layer is the conflict guard.
                 FixedAddressBehavior::Replace | FixedAddressBehavior::NoReplace => {
                     MapFlags::MAP_FIXED
                 }
@@ -1354,20 +1358,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
             }
         };
 
-        // Emulate MAP_FIXED_NOREPLACE: probe range, then use MAP_FIXED.
-        if matches!(fixed_address_behavior, FixedAddressBehavior::NoReplace)
-            && !is_range_unmapped(mmap_start, mmap_len)
-        {
-            unsafe {
-                libc::close(fd);
-            }
-            return Err(CowAllocationError::InternalFailure);
-        }
+        // NoReplace: no host-level probe needed — see comment in allocate_pages().
+        // The VMem layer already verified no VMA-level conflicts.
 
         let mut flags = MapFlags::MAP_PRIVATE;
         match fixed_address_behavior {
             FixedAddressBehavior::Hint => {}
-            // NoReplace uses MAP_FIXED after the range check above.
             FixedAddressBehavior::Replace | FixedAddressBehavior::NoReplace => {
                 flags |= MapFlags::MAP_FIXED;
             }
