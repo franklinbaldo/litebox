@@ -3,37 +3,33 @@
 
 use std::path::PathBuf;
 
-const RTLD_AUDIT_DIR: &str = "../litebox_rtld_audit";
+const PREBUILT_RTLD_AUDIT_SO: &str = "../litebox_rtld_audit/litebox_rtld_audit.so";
 
 fn main() {
-    let mut make_cmd = std::process::Command::new("make");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     if target_arch != "aarch64" {
         return;
     }
-    make_cmd
-        .current_dir(RTLD_AUDIT_DIR)
-        .env("OUT_DIR", &out_dir)
-        .env("ARCH", target_arch);
-    if std::env::var("PROFILE").unwrap_or_default() == "debug" {
-        make_cmd.env("DEBUG", "1");
-    }
-    let output = make_cmd
-        .output()
-        .expect("Failed to execute make for rtld_audit");
+
+    let src = PathBuf::from(PREBUILT_RTLD_AUDIT_SO);
     assert!(
-        output.status.success(),
-        "failed to build rtld_audit.so via make:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    assert!(
-        out_dir.join("litebox_rtld_audit.so").exists(),
-        "Build failed to create necessary file"
+        src.exists(),
+        "missing prebuilt rtld_audit.so at {}. Build it on Linux first",
+        src.display()
     );
 
-    println!("cargo:rerun-if-changed={RTLD_AUDIT_DIR}/rtld_audit.c");
-    println!("cargo:rerun-if-changed={RTLD_AUDIT_DIR}/Makefile");
+    let dst = out_dir.join("litebox_rtld_audit.so");
+    std::fs::copy(&src, &dst).unwrap_or_else(|err| {
+        panic!(
+            "failed to copy prebuilt rtld_audit.so from {} to {}: {}",
+            src.display(),
+            dst.display(),
+            err
+        )
+    });
+    assert!(dst.exists(), "Build failed to create necessary file");
+
+    println!("cargo:rerun-if-changed={PREBUILT_RTLD_AUDIT_SO}");
     println!("cargo:rerun-if-changed=build.rs");
 }
