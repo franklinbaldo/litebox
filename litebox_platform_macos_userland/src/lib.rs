@@ -138,6 +138,19 @@ const fn tcb_offset_interrupt() -> isize {
     33
 }
 
+/// Thread-local pointer to the current thread's `ThreadControlBlock`.
+///
+/// On macOS, TPIDR_EL0 is only set to our TCB during guest execution (inside
+/// `run_thread_inner`). Code that runs outside that scope (e.g. during
+/// `load_program` or `clear_guest_thread_local_storage`) must use this
+/// thread-local to access the TCB instead of reading TPIDR_EL0 directly.
+///
+/// The asm fast path (run_thread_arch, switch_to_guest, syscall_callback,
+/// signal handlers) continues using TPIDR_EL0 / alt-stack slot for performance.
+thread_local! {
+    static TCB_PTR: Cell<*mut ThreadControlBlock> = const { Cell::new(core::ptr::null_mut()) };
+}
+
 impl MacosUserland {
     /// Create a new userland-Linux platform for use in `LiteBox`.
     ///
@@ -348,23 +361,31 @@ fn run_thread_inner(
         // original macOS TPIDR_EL0 value (which is unrelated to our TCB).
         let original_tpidr = unsafe { litebox_common_linux::read_tpidr_el0() };
         tcb.scratch = original_tpidr;
-        let tcb_ptr = (&raw mut *tcb) as usize;
-        unsafe { litebox_common_linux::write_tpidr_el0(tcb_ptr) };
-        with_signal_alt_stack(tcb_ptr, || unsafe {
+        let tcb_ptr = &raw mut *tcb;
+        let tcb_addr = tcb_ptr as usize;
+        // Set both the thread-local (for Rust code) and TPIDR_EL0 (for asm).
+        TCB_PTR.set(tcb_ptr);
+        unsafe { litebox_common_linux::write_tpidr_el0(tcb_addr) };
+        with_signal_alt_stack(tcb_addr, || unsafe {
             run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter));
         });
         unsafe { litebox_common_linux::write_tpidr_el0(original_tpidr) };
+        TCB_PTR.set(core::ptr::null_mut());
     });
 }
 
 fn set_guest_tpidr(value: usize) {
+    let tcb = TCB_PTR.get();
+    assert!(!tcb.is_null(), "set_guest_tpidr called without TCB");
     unsafe {
-        (*(litebox_common_linux::read_tpidr_el0() as *mut ThreadControlBlock)).guest_tpidr = value;
+        (*tcb).guest_tpidr = value;
     }
 }
 
 fn get_guest_tpidr() -> usize {
-    unsafe { (*(litebox_common_linux::read_tpidr_el0() as *mut ThreadControlBlock)).guest_tpidr }
+    let tcb = TCB_PTR.get();
+    assert!(!tcb.is_null(), "get_guest_tpidr called without TCB");
+    unsafe { (*tcb).guest_tpidr }
 }
 
 /// Runs the guest thread until it terminates.
@@ -1433,16 +1454,7 @@ unsafe extern "C" {
 }
 
 unsafe extern "C-unwind" fn init_handler(thread_ctx: &mut ThreadContext) {
-    eprintln!("[diag] init_handler: entering shim.init()");
-    thread_ctx.call_shim(|shim, ctx| {
-        eprintln!("[diag]   shim.init() calling...");
-        let op = shim.init(ctx);
-        eprintln!(
-            "[diag]   shim.init() returned: {:?}",
-            matches!(op, ContinueOperation::Resume)
-        );
-        op
-    });
+    thread_ctx.call_shim(|shim, ctx| shim.init(ctx));
 }
 
 unsafe extern "C-unwind" fn reenter_handler(thread_ctx: &mut ThreadContext) {
@@ -1465,10 +1477,6 @@ unsafe extern "C-unwind" fn reenter_handler(thread_ctx: &mut ThreadContext) {
 /// purposes.
 #[allow(clippy::cast_sign_loss)]
 unsafe extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext) {
-    eprintln!(
-        "[diag] syscall_handler: pc={:#x}, x8(sysno)={:#x}",
-        thread_ctx.ctx.pc, thread_ctx.ctx.regs[8]
-    );
     thread_ctx.call_shim(|shim, ctx| shim.syscall(ctx));
 }
 
@@ -1555,17 +1563,15 @@ impl ThreadContext<'_> {
         // Clear the interrupt flag before calling the shim, since we've handled it
         // now (by calling into the shim), and it might be set again by the shim
         // before returning.
+        let tcb = TCB_PTR.get();
+        assert!(!tcb.is_null(), "call_shim called without TCB");
         unsafe {
-            (*(litebox_common_linux::read_tpidr_el0() as *mut ThreadControlBlock)).interrupt = 0;
+            (*tcb).interrupt = 0;
         }
         let op = f(self.shim, self.ctx);
         match op {
             ContinueOperation::Resume => {
                 update_host_tls_entry();
-                eprintln!(
-                    "[diag] call_shim: switching to guest, pc={:#x}, sp={:#x}",
-                    self.ctx.pc, self.ctx.sp
-                );
                 unsafe { switch_to_guest(self.ctx) }
             }
             ContinueOperation::Terminate => {}
@@ -1600,7 +1606,13 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for MacosUserland {
     }
 
     fn clear_guest_thread_local_storage() {
-        set_guest_tpidr(0);
+        // On macOS, this may be called outside run_thread_inner (e.g. during
+        // execve handling) when no TCB is active. In that case, guest_tpidr
+        // is already zero (default), so this is a no-op.
+        let tcb = TCB_PTR.get();
+        if !tcb.is_null() {
+            unsafe { (*tcb).guest_tpidr = 0 };
+        }
     }
 }
 
@@ -1818,10 +1830,8 @@ fn signal_handler_exit_guest(
         let mut current_ss: libc::stack_t = core::mem::zeroed();
         let ret = libc::sigaltstack(std::ptr::null(), &raw mut current_ss);
         if ret != 0 || current_ss.ss_flags & libc::SS_ONSTACK == 0 {
-            eprintln!(
-                "[diag] signal_handler_exit_guest: NOT on alt-stack (ret={ret}, flags={:#x})",
-                current_ss.ss_flags
-            );
+            // Not on our alt-stack (or syscall failed). Return None without
+            // touching any SP-derived addresses.
             return None;
         }
 
@@ -1921,14 +1931,9 @@ unsafe extern "C" fn exception_signal_handler(
     info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
-    let pc = unsafe { (*context.uc_mcontext).__ss.__pc };
-    let far = unsafe { (*context.uc_mcontext).__es.__far };
-    eprintln!("[diag] exception_signal_handler: signum={signum}, pc={pc:#x}, far={far:#x}");
     let Some(regs) = signal_handler_exit_guest(context, false) else {
-        eprintln!("[diag]   -> not in guest, forwarding to next_signal_handler");
         return unsafe { next_signal_handler(signum, info, context) };
     };
-    eprintln!("[diag]   -> was in guest, copying context and jumping to exception_callback");
     copy_signal_context(unsafe { &mut *regs }, context);
 
     // Ensure that `run_thread_arch` is linked in so that `exception_callback` is visible.
@@ -1954,8 +1959,6 @@ unsafe fn next_signal_handler(
     info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
-    let pc = unsafe { (*context.uc_mcontext).__ss.__pc };
-    eprintln!("[diag] next_signal_handler: signum={signum}, pc={pc:#x}");
     if signum == libc::SIGSEGV {
         #[allow(clippy::cast_possible_truncation)]
         let ip: usize = unsafe { (*context.uc_mcontext).__ss.__pc as usize };
