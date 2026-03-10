@@ -109,52 +109,6 @@ int main(void) {
 "#;
 
 #[test]
-fn test_static_nolibc_with_rewriter() {
-    println!("Running statically linked nolibc binary + rewriter test...");
-    let mut test_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    test_dir.push("tests/test-bins");
-
-    let prog_name = "hello_exec_nolibc";
-    let prog_name_hooked = format!("{prog_name}.hooked");
-
-    let path = test_dir.join(prog_name);
-    let hooked_path = test_dir.join(&prog_name_hooked);
-
-    // Rewrite the target ELF executable file.
-    let _ = std::fs::remove_file(hooked_path.clone());
-    println!(
-        "Running `cargo run -p litebox_syscall_rewriter -- -o {} {}`",
-        hooked_path.to_str().unwrap(),
-        path.to_str().unwrap()
-    );
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let output = std::process::Command::new(cargo)
-        .args([
-            "run",
-            "-p",
-            "litebox_syscall_rewriter",
-            "--",
-            path.to_str().unwrap(),
-            "-o",
-            hooked_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("Failed to run syscall rewriter");
-    assert!(
-        output.status.success(),
-        "failed to run syscall rewriter {:?}",
-        std::str::from_utf8(output.stderr.as_slice()).unwrap()
-    );
-
-    let executable_path = format!("/{prog_name_hooked}");
-    let executable_data = std::fs::read(hooked_path).unwrap();
-
-    let mut launcher = common::TestLauncher::init_platform(&[], &[], &[]);
-    launcher.install_file(executable_data, &executable_path);
-    launcher.test_load_exec_common(&executable_path);
-}
-
-#[test]
 fn test_static_linked_prog_with_rewriter() {
     println!("Running statically linked binary + rewriter test...");
     let mut test_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));

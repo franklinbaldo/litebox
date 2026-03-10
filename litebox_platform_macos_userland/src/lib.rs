@@ -1015,6 +1015,36 @@ fn prot_flags(flags: MemoryRegionPermissions) -> ProtFlags {
     res
 }
 
+/// Translate Linux [`MapFlags`] to macOS `mmap` flags.
+///
+/// macOS does not support `MAP_GROWSDOWN`, `MAP_POPULATE`, or `MAP_FIXED_NOREPLACE`.
+/// - `MAP_GROWSDOWN` and `MAP_POPULATE` are silently dropped (no macOS equivalent).
+/// - `MAP_FIXED_NOREPLACE` is emulated with `MAP_FIXED | MAP_EXCL` (available since macOS 10.14).
+fn macos_mmap_flags(linux_flags: MapFlags) -> libc::c_int {
+    /// macOS `MAP_EXCL` — fail if the range is already mapped. Used with `MAP_FIXED`.
+    const MAP_EXCL: libc::c_int = 0x0004;
+
+    let mut result: libc::c_int = 0;
+    if linux_flags.contains(MapFlags::MAP_PRIVATE) {
+        result |= libc::MAP_PRIVATE;
+    }
+    if linux_flags.contains(MapFlags::MAP_SHARED) {
+        result |= libc::MAP_SHARED;
+    }
+    if linux_flags.contains(MapFlags::MAP_ANONYMOUS) {
+        result |= libc::MAP_ANON;
+    }
+    if linux_flags.contains(MapFlags::MAP_FIXED) {
+        result |= libc::MAP_FIXED;
+    }
+    if linux_flags.contains(MapFlags::MAP_FIXED_NOREPLACE) {
+        // Emulate MAP_FIXED_NOREPLACE with MAP_FIXED | MAP_EXCL on macOS.
+        result |= libc::MAP_FIXED | MAP_EXCL;
+    }
+    // MAP_GROWSDOWN and MAP_POPULATE have no macOS equivalent — silently drop.
+    result
+}
+
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for MacosUserland {
     const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
     const TASK_ADDR_MAX: usize = 0x0000_FFFF_FFFF_F000; // 48-bit VA space
@@ -1024,10 +1054,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         suggested_range: core::ops::Range<usize>,
         initial_permissions: MemoryRegionPermissions,
         can_grow_down: bool,
-        populate_pages_immediately: bool,
+        _populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
-        let flags = MapFlags::MAP_PRIVATE
+        // Build Linux-style flags, then translate to macOS.
+        let linux_flags = MapFlags::MAP_PRIVATE
             | MapFlags::MAP_ANONYMOUS
             | match fixed_address_behavior {
                 FixedAddressBehavior::Hint => MapFlags::empty(),
@@ -1035,12 +1066,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 FixedAddressBehavior::NoReplace => MapFlags::MAP_FIXED_NOREPLACE,
             }
             | if can_grow_down {
+                // MAP_GROWSDOWN has no macOS equivalent; macos_mmap_flags drops it.
                 MapFlags::MAP_GROWSDOWN
-            } else {
-                MapFlags::empty()
-            }
-            | if populate_pages_immediately {
-                MapFlags::MAP_POPULATE
             } else {
                 MapFlags::empty()
             };
@@ -1049,22 +1076,23 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 suggested_range.start as *mut libc::c_void,
                 suggested_range.len(),
                 prot_flags(initial_permissions).bits(),
-                flags.bits(),
+                macos_mmap_flags(linux_flags),
                 -1,
                 0,
             )
         };
         if r == libc::MAP_FAILED {
-            return Err(match std::io::Error::last_os_error().raw_os_error() {
-                Some(libc::ENOMEM) => litebox::platform::page_mgmt::AllocationError::OutOfMemory,
-                Some(libc::EEXIST) => {
-                    assert!(matches!(
-                        fixed_address_behavior,
-                        FixedAddressBehavior::NoReplace
-                    ));
+            let err = std::io::Error::last_os_error();
+            return Err(match err.raw_os_error() {
+                // On macOS, MAP_FIXED | MAP_EXCL (our MAP_FIXED_NOREPLACE emulation) returns
+                // ENOMEM when the range is already occupied. Disambiguate from real OOM.
+                Some(libc::ENOMEM)
+                    if matches!(fixed_address_behavior, FixedAddressBehavior::NoReplace) =>
+                {
                     litebox::platform::page_mgmt::AllocationError::AddressInUse
                 }
-                _ => panic!("unhandled mmap error {}", std::io::Error::last_os_error()),
+                Some(libc::ENOMEM) => litebox::platform::page_mgmt::AllocationError::OutOfMemory,
+                _ => panic!("unhandled mmap error {err}"),
             });
         }
         Ok(UserMutPtr::from_usize(r as usize))
@@ -1184,7 +1212,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 suggested_start as *mut libc::c_void,
                 source_data.len(),
                 prot_flags(permissions).bits(),
-                flags.bits(),
+                macos_mmap_flags(flags),
                 fd,
                 file_offset.try_into().unwrap(),
             )
