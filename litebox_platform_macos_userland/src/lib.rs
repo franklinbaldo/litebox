@@ -371,6 +371,12 @@ fn run_thread_inner(
             tcb_addr, original_tpidr, reenter
         );
         with_signal_alt_stack(tcb_addr, || unsafe {
+            let tpidr_before_asm: usize;
+            core::arch::asm!("mrs {}, tpidr_el0", out(reg) tpidr_before_asm, options(nostack, nomem));
+            eprintln!(
+                "[diag] run_thread_inner: inside closure, TPIDR_EL0={:#x} (expected {:#x})",
+                tpidr_before_asm, tcb_addr
+            );
             run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter));
         });
         eprintln!("[diag] run_thread_inner: returned from run_thread_arch");
