@@ -1754,11 +1754,11 @@ unsafe extern "C-unwind" fn init_handler(thread_ctx: &mut ThreadContext) {
         "[diag] init_handler: entering, ctx.pc={:#x}, ctx.sp={:#x}",
         thread_ctx.ctx.pc, thread_ctx.ctx.sp
     );
-    thread_ctx.call_shim(|shim, ctx| shim.init(ctx));
+    thread_ctx.call_shim(|shim, ctx, _interrupt| shim.init(ctx));
 }
 
 unsafe extern "C-unwind" fn reenter_handler(thread_ctx: &mut ThreadContext) {
-    thread_ctx.call_shim(|shim, ctx| shim.reenter(ctx));
+    thread_ctx.call_shim(|shim, ctx, _interrupt| shim.reenter(ctx));
 }
 
 /// Handles Linux syscalls and dispatches them to LiteBox implementations.
@@ -1781,7 +1781,7 @@ unsafe extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext) {
         "[diag] syscall_handler: entered, ctx.pc={:#x}, ctx.regs[8]={:#x} (syscall nr)",
         thread_ctx.ctx.pc, thread_ctx.ctx.regs[8]
     );
-    thread_ctx.call_shim(|shim, ctx| shim.syscall(ctx));
+    thread_ctx.call_shim(|shim, ctx, _interrupt| shim.syscall(ctx));
 }
 
 extern "C-unwind" fn exception_handler(
@@ -1799,7 +1799,7 @@ extern "C-unwind" fn exception_handler(
         fault_address: cr2,
         esr: trapno as u64,
     };
-    thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info));
+    thread_ctx.call_shim(|shim, ctx, _interrupt| shim.exception(ctx, &info));
 }
 
 /// Update the TLS lookup table with the current thread's (guest_tpidr, host_tls) entry.
@@ -1862,7 +1862,16 @@ fn update_host_tls_entry() {
 }
 
 extern "C-unwind" fn interrupt_handler(thread_ctx: &mut ThreadContext) {
-    thread_ctx.call_shim(|shim, ctx| shim.interrupt(ctx));
+    thread_ctx.call_shim(|shim, ctx, interrupt| {
+        if interrupt {
+            shim.interrupt(ctx)
+        } else {
+            // We got here just to restore TPIDR_EL0 (e.g., after an edge-page
+            // toggle), so don't bother the shim. Matches the Windows platform's
+            // approach to FS base restoration.
+            ContinueOperation::Resume
+        }
+    });
 }
 
 /// Calls `f` in order to call into a shim entrypoint.
@@ -1872,6 +1881,7 @@ impl ThreadContext<'_> {
         f: impl FnOnce(
             &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
             &mut litebox_common_linux::PtRegs,
+            bool,
         ) -> ContinueOperation,
     ) {
         // Clear the interrupt flag before calling the shim, since we've handled it
@@ -1879,10 +1889,11 @@ impl ThreadContext<'_> {
         // before returning.
         let tcb = TCB_PTR.get();
         assert!(!tcb.is_null(), "call_shim called without TCB");
+        let interrupt = unsafe { (*tcb).interrupt != 0 };
         unsafe {
             (*tcb).interrupt = 0;
         }
-        let op = f(self.shim, self.ctx);
+        let op = f(self.shim, self.ctx, interrupt);
         match op {
             ContinueOperation::Resume => {
                 eprintln!(
@@ -2519,7 +2530,28 @@ unsafe extern "C" fn exception_signal_handler(
                 tpos = write_hex(&mut tbuf, tpos, esr as usize);
                 tpos = write_bytes(&mut tbuf, tpos, b"\n");
                 unsafe { libc::write(2, tbuf.as_ptr() as *const libc::c_void, tpos) };
-                // Resume the faulting instruction — it will succeed now.
+
+                // If we're in the guest, we can't just return: macOS sigreturn
+                // clobbers TPIDR_EL0 to the pthread value. Instead, route through
+                // the interrupt path which properly restores TPIDR_EL0 via the
+                // interrupt_callback asm trampoline and resumes the faulting
+                // instruction through switch_to_guest.
+                //
+                // This matches the Windows platform's approach to FS base
+                // restoration after Windows clobbers it on context switches.
+                //
+                // If we're NOT in the guest (host code writing to an edge page,
+                // e.g. during ELF loading), just return directly — host code
+                // doesn't use TPIDR_EL0 for guest TLS.
+                if let Some((regs, host_tls)) = signal_handler_exit_guest(context, false) {
+                    copy_signal_context(unsafe { &mut *regs }, context);
+
+                    // Ensure that `run_thread_arch` is linked in so that
+                    // `interrupt_callback` is visible.
+                    let _ = run_thread_arch as *const () as usize;
+
+                    set_signal_return(context, interrupt_callback, host_tls, 0, 0, 0, 0);
+                }
                 return;
             }
             // If we couldn't toggle (unexpected EC), fall through to normal handling.
