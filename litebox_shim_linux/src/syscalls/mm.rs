@@ -251,6 +251,16 @@ impl<FS: ShimFS> Task<FS> {
         fd: i32,
         offset: usize,
     ) -> Result<MutPtr<u8>, Errno> {
+        litebox::log_println!(
+            self.global.platform,
+            "[diag] sys_mmap: addr={:#x} len={:#x} prot={:?} flags={:?} fd={} offset={:#x}",
+            addr,
+            len,
+            prot,
+            flags,
+            fd,
+            offset
+        );
         // check alignment
         if !offset.is_multiple_of(PAGE_SIZE) || !addr.is_multiple_of(PAGE_SIZE) || len == 0 {
             return Err(Errno::EINVAL);
@@ -303,6 +313,12 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `munmap`
     #[inline]
     pub(crate) fn sys_munmap(&self, addr: crate::MutPtr<u8>, len: usize) -> Result<(), Errno> {
+        litebox::log_println!(
+            self.global.platform,
+            "[diag] sys_munmap: addr={:#x} len={:#x}",
+            addr.as_usize(),
+            len
+        );
         litebox_common_linux::mm::sys_munmap(&self.global.pm, addr, len)
     }
 
@@ -314,6 +330,13 @@ impl<FS: ShimFS> Task<FS> {
         len: usize,
         prot: ProtFlags,
     ) -> Result<(), Errno> {
+        litebox::log_println!(
+            self.global.platform,
+            "[diag] sys_mprotect: addr={:#x} len={:#x} prot={:?}",
+            addr.as_usize(),
+            len,
+            prot
+        );
         litebox_common_linux::mm::sys_mprotect(&self.global.pm, addr, len, prot)
     }
 

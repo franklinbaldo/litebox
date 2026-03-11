@@ -154,6 +154,10 @@ fn ensure_edge_page(page_addr: usize, prot: libc::c_int) {
 
     let r = unsafe { libc::mprotect(page_addr as *mut libc::c_void, HOST_PAGE_SIZE, prot) };
     if r == 0 {
+        eprintln!(
+            "[diag] ensure_edge_page: {:#x} prot={} mprotect OK (content preserved)",
+            page_addr, prot
+        );
         return; // mprotect succeeded — page existed, content preserved
     }
 
@@ -182,6 +186,10 @@ fn ensure_edge_page(page_addr: usize, prot: libc::c_int) {
         "mmap MAP_FIXED edge page {:#x} failed: {}",
         page_addr,
         std::io::Error::last_os_error()
+    );
+    eprintln!(
+        "[diag] ensure_edge_page: {:#x} prot={} mmap FALLBACK (page was unmapped)",
+        page_addr, prot
     );
 }
 
@@ -1313,6 +1321,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
             "[diag] allocate_pages: range={:#x}..{:#x} perms={:?} behavior={:?}",
             suggested_range.start, suggested_range.end, initial_permissions, fixed_address_behavior
         );
+        // Backtrace for operations in the crash-suspect region
+        if suggested_range.start < 0x10ad20000 && suggested_range.end > 0x10ad00000 {
+            eprintln!(
+                "[DIAG-SUSPECT] allocate_pages touches crash region: {:#x}..{:#x}",
+                suggested_range.start, suggested_range.end
+            );
+        }
         // macOS arm64 requires 16KB-aligned addresses for all VM operations.
         // For Hint, pass the address as-is; the kernel picks a properly aligned one.
         //
@@ -1377,6 +1392,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 // code on an edge page, the fault-and-toggle handler in
                 // exception_signal_handler will flip it to RX on demand.
 
+                eprintln!(
+                    "[diag] allocate_pages interior: {:#x}..{:#x} (outer: {:#x}..{:#x})",
+                    inner_start, inner_end, outer_start, outer_end
+                );
                 // Step 1: mmap the 16KB-aligned interior with MAP_FIXED.
                 // This replaces only fully-enclosed host pages with fresh anonymous memory.
                 if inner_start < inner_end {
@@ -1443,6 +1462,45 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                     register_edge_page(outer_start);
                 }
 
+                // Zero the edge sub-pages that fall within our range but outside the
+                // interior mmap. The interior was freshly mmap'd as MAP_ANON (guaranteed
+                // zeroed), but edge sub-pages were only mprotect'd, preserving whatever
+                // stale content existed in the host page. Anonymous allocations must
+                // return zeroed memory, so we explicitly zero these edge regions.
+                //
+                // Leading edge: [suggested_range.start .. min(inner_start, suggested_range.end))
+                // Trailing edge: [max(inner_end, suggested_range.start) .. suggested_range.end)
+                let leading_zero_end = inner_start.min(suggested_range.end);
+                if suggested_range.start < leading_zero_end {
+                    unsafe {
+                        core::ptr::write_bytes(
+                            suggested_range.start as *mut u8,
+                            0,
+                            leading_zero_end - suggested_range.start,
+                        );
+                    }
+                    eprintln!(
+                        "[diag] allocate_pages: zeroed leading edge {:#x}..{:#x}",
+                        suggested_range.start, leading_zero_end
+                    );
+                }
+                let trailing_zero_start = inner_end.max(suggested_range.start);
+                if trailing_zero_start < suggested_range.end
+                    && trailing_zero_start >= leading_zero_end
+                {
+                    unsafe {
+                        core::ptr::write_bytes(
+                            trailing_zero_start as *mut u8,
+                            0,
+                            suggested_range.end - trailing_zero_start,
+                        );
+                    }
+                    eprintln!(
+                        "[diag] allocate_pages: zeroed trailing edge {:#x}..{:#x}",
+                        trailing_zero_start, suggested_range.end
+                    );
+                }
+
                 Ok(UserMutPtr::from_usize(suggested_range.start))
             }
         }
@@ -1463,6 +1521,18 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         // deallocated or replaced by a subsequent MAP_FIXED mmap.
         let aligned_start = host_page_align_up(range.start);
         let aligned_end = host_page_align_down(range.end);
+        eprintln!(
+            "[diag] deallocate_pages aligned: {:#x}..{:#x} (munmap={})",
+            aligned_start,
+            aligned_end,
+            aligned_start < aligned_end
+        );
+        if aligned_start < aligned_end && aligned_start < 0x10ad20000 && aligned_end > 0x10ad00000 {
+            eprintln!(
+                "[DIAG-SUSPECT] deallocate_pages MUNMAPS crash region: {:#x}..{:#x}",
+                aligned_start, aligned_end
+            );
+        }
         if aligned_start < aligned_end {
             let r = unsafe {
                 libc::munmap(
@@ -1481,59 +1551,131 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         new_range: core::ops::Range<usize>,
         permissions: MemoryRegionPermissions,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::RemapError> {
-        // Round ranges outward to HOST_PAGE_SIZE for kernel VM operations.
-        let old_aligned_start = host_page_align_down(old_range.start);
-        let old_aligned_end = host_page_align_up(old_range.end);
-        let new_aligned_start = host_page_align_down(new_range.start);
-        let new_aligned_end = host_page_align_up(new_range.end);
-        let new_ptr = unsafe {
-            libc::mmap(
-                new_aligned_start as *mut libc::c_void,
-                new_aligned_end - new_aligned_start,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
-                -1,
-                0,
-            )
-        };
-        if new_ptr == libc::MAP_FAILED {
-            return Err(litebox::platform::page_mgmt::RemapError::OutOfMemory);
+        eprintln!(
+            "[diag] remap_pages: old={:#x}..{:#x} new={:#x}..{:#x} perms={:?}",
+            old_range.start, old_range.end, new_range.start, new_range.end, permissions
+        );
+        if (old_range.start < 0x10ad20000 && old_range.end > 0x10ad00000)
+            || (new_range.start < 0x10ad20000 && new_range.end > 0x10ad00000)
+        {
+            eprintln!("[DIAG-SUSPECT] remap_pages touches crash region");
         }
 
-        let copy_len = old_range.len().min(new_range.len());
-        // Copy from the original (non-aligned) start to the new mapping at the
-        // correct offset within the host page.
-        let dst = (new_range.start) as *mut u8;
-        unsafe {
-            core::ptr::copy_nonoverlapping(old_range.start as *const u8, dst, copy_len);
-        }
+        // Allocate new range using the same edge-page-aware strategy as
+        // allocate_pages: inward-rounded interior mmap + edge page mprotect.
+        // This avoids clobbering neighboring sub-pages in shared 16KB host pages.
+        let new_inner_start = host_page_align_up(new_range.start);
+        let new_inner_end = host_page_align_down(new_range.end);
+        let new_outer_start = host_page_align_down(new_range.start);
+        let new_outer_end = host_page_align_up(new_range.end);
 
-        if permissions != (MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE) {
+        // Step 1: mmap the 16KB-aligned interior of the new range.
+        if new_inner_start < new_inner_end {
             let r = unsafe {
-                libc::mprotect(
-                    new_aligned_start as *mut libc::c_void,
-                    new_aligned_end - new_aligned_start,
-                    prot_flags(permissions).bits(),
+                libc::mmap(
+                    new_inner_start as *mut libc::c_void,
+                    new_inner_end - new_inner_start,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+                    -1,
+                    0,
                 )
             };
-            if r != 0 {
-                unsafe {
-                    libc::munmap(
-                        new_aligned_start as *mut libc::c_void,
-                        new_aligned_end - new_aligned_start,
-                    );
-                }
+            if r == libc::MAP_FAILED {
                 return Err(litebox::platform::page_mgmt::RemapError::OutOfMemory);
             }
         }
 
-        let r = unsafe {
-            libc::munmap(
-                old_aligned_start as *mut libc::c_void,
-                old_aligned_end - old_aligned_start,
-            )
-        };
-        assert_eq!(r, 0, "munmap failed: {}", std::io::Error::last_os_error());
+        // Step 2: Ensure edge host pages of the new range exist with RW.
+        let has_leading_edge = new_outer_start < new_inner_start;
+        let has_trailing_edge = new_inner_end < new_outer_end;
+        let leading_edge_addr = new_outer_start;
+        let trailing_edge_addr = host_page_align_down(new_range.end.saturating_sub(1));
+
+        if has_leading_edge {
+            ensure_edge_page_rw(leading_edge_addr);
+            register_edge_page(leading_edge_addr);
+        }
+        if has_trailing_edge && trailing_edge_addr != leading_edge_addr {
+            ensure_edge_page_rw(trailing_edge_addr);
+            register_edge_page(trailing_edge_addr);
+        }
+        if new_inner_start >= new_inner_end && !has_leading_edge && has_trailing_edge {
+            ensure_edge_page_rw(new_outer_start);
+            register_edge_page(new_outer_start);
+        }
+
+        // Zero edge sub-pages in the new range (anonymous memory must be zeroed).
+        let leading_zero_end = new_inner_start.min(new_range.end);
+        if new_range.start < leading_zero_end {
+            unsafe {
+                core::ptr::write_bytes(
+                    new_range.start as *mut u8,
+                    0,
+                    leading_zero_end - new_range.start,
+                );
+            }
+        }
+        let trailing_zero_start = new_inner_end.max(new_range.start);
+        if trailing_zero_start < new_range.end && trailing_zero_start >= leading_zero_end {
+            unsafe {
+                core::ptr::write_bytes(
+                    trailing_zero_start as *mut u8,
+                    0,
+                    new_range.end - trailing_zero_start,
+                );
+            }
+        }
+
+        // Step 3: Copy data from old range to new range.
+        let copy_len = old_range.len().min(new_range.len());
+        let dst = new_range.start as *mut u8;
+        unsafe {
+            core::ptr::copy_nonoverlapping(old_range.start as *const u8, dst, copy_len);
+        }
+
+        // Step 4: Apply final permissions if not already RW.
+        if permissions != (MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE) {
+            // Interior: direct mprotect with exact permissions.
+            if new_inner_start < new_inner_end {
+                let r = unsafe {
+                    libc::mprotect(
+                        new_inner_start as *mut libc::c_void,
+                        new_inner_end - new_inner_start,
+                        prot_flags(permissions).bits(),
+                    )
+                };
+                if r != 0 {
+                    // Cleanup: munmap only the interior we allocated.
+                    if new_inner_start < new_inner_end {
+                        unsafe {
+                            libc::munmap(
+                                new_inner_start as *mut libc::c_void,
+                                new_inner_end - new_inner_start,
+                            );
+                        }
+                    }
+                    return Err(litebox::platform::page_mgmt::RemapError::OutOfMemory);
+                }
+            }
+            // Edge pages: register them for fault-and-toggle handling if
+            // the permissions include EXEC. The edge pages stay RW; the
+            // signal handler will flip them to RX on demand.
+        }
+
+        // Step 5: Deallocate old range using inward rounding (same as
+        // deallocate_pages) to avoid destroying neighboring sub-pages.
+        let old_aligned_start = host_page_align_up(old_range.start);
+        let old_aligned_end = host_page_align_down(old_range.end);
+        if old_aligned_start < old_aligned_end {
+            let r = unsafe {
+                libc::munmap(
+                    old_aligned_start as *mut libc::c_void,
+                    old_aligned_end - old_aligned_start,
+                )
+            };
+            assert_eq!(r, 0, "munmap failed: {}", std::io::Error::last_os_error());
+        }
 
         Ok(UserMutPtr::from_usize(new_range.start))
     }
@@ -1547,6 +1689,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
             "[diag] update_permissions: range={:#x}..{:#x} perms={:?}",
             range.start, range.end, new_permissions
         );
+        if range.start < 0x10ad20000 && range.end > 0x10ad00000 {
+            eprintln!(
+                "[DIAG-SUSPECT] update_permissions touches crash region: {:#x}..{:#x}",
+                range.start, range.end
+            );
+        }
         // macOS arm64 16KB page handling for mprotect:
         //
         // Multiple 4KB VMAs with different permission requirements may share the
