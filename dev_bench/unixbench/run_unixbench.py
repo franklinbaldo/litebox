@@ -345,9 +345,7 @@ def _run_litebox_cmd(
     # Use a plain string (not Path) so Windows doesn't convert / to \.
     litebox_tmpdir = "/tmp" if bench.binary == "fstime" else None
     cmd += bench.args(duration, litebox_tmpdir)
-
-    display_args = ' '.join(bench.args(duration))
-    print(f"  Running: {Path(cmd[0]).name} ... {display_args}")
+    print(f"  Running: {' '.join(cmd)}")
     t0 = time.monotonic()
     # Use a shorter timeout for alarm-based benchmarks under LiteBox,
     # since if SIGALRM isn't delivered the process will hang forever.
