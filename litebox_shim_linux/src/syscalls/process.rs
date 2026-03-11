@@ -1529,7 +1529,7 @@ mod tests {
 
         // Set new FS base
         let mut new_fs_base: [u8; 16] = [0; 16];
-        let ptr = MutPtr::from_usize(new_fs_base.as_mut_ptr() as usize);
+        let ptr: MutPtr<u8> = MutPtr::from_usize(new_fs_base.as_mut_ptr() as usize);
         task.sys_arch_prctl(ArchPrctlArg::SetFs(ptr.as_usize()))
             .expect("Failed to set FS base");
 
@@ -1564,6 +1564,7 @@ mod tests {
 
     #[test]
     fn test_prctl_set_get_name() {
+        use litebox::platform::RawConstPointer as _;
         let task = crate::syscalls::tests::init_platform(None);
 
         // Prepare a null-terminated name to set
