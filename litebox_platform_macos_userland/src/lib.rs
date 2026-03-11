@@ -399,6 +399,17 @@ fn run_thread_inner(
                 "[diag] run_thread_inner: inside closure, about to set TPIDR_EL0={:#x}",
                 tcb_addr
             );
+            // Diagnostic: verify our alt-stack is still in place right before
+            // guest entry. If something between with_signal_alt_stack and here
+            // replaced it, we'll see it.
+            {
+                let mut check_ss: libc::stack_t = unsafe { std::mem::zeroed() };
+                let ret = unsafe { libc::sigaltstack(std::ptr::null(), &mut check_ss) };
+                eprintln!(
+                    "[diag] pre-guest sigaltstack check: ret={} ss_sp={:#x} ss_size={:#x} ss_flags={:#x}",
+                    ret, check_ss.ss_sp as usize, check_ss.ss_size, check_ss.ss_flags,
+                );
+            }
             // Switch MAP_JIT pages to X mode (executable) before entering guest.
             // MUST be before write_tpidr_el0 because pthread_jit_write_protect_np
             // is a libc call that clobbers TPIDR_EL0 on macOS.
@@ -1851,6 +1862,15 @@ impl ThreadContext<'_> {
                     self.ctx.sp,
                     get_guest_tpidr()
                 );
+                // Diagnostic: verify alt-stack before re-entering guest
+                {
+                    let mut check_ss: libc::stack_t = unsafe { std::mem::zeroed() };
+                    let ret = unsafe { libc::sigaltstack(std::ptr::null(), &mut check_ss) };
+                    eprintln!(
+                        "[diag] call_shim Resume sigaltstack check: ret={} ss_sp={:#x} ss_size={:#x} ss_flags={:#x}",
+                        ret, check_ss.ss_sp as usize, check_ss.ss_size, check_ss.ss_flags,
+                    );
+                }
                 // Switch MAP_JIT pages to X mode (executable) before entering guest.
                 // MUST be before write_tpidr_el0 because pthread_jit_write_protect_np
                 // is a libc call that clobbers TPIDR_EL0 on macOS.
@@ -2079,6 +2099,10 @@ fn with_signal_alt_stack<R>(host_tls: usize, f: impl FnOnce() -> R) -> R {
             std::io::Error::last_os_error(),
         );
     }
+    eprintln!(
+        "[diag] with_signal_alt_stack: set alt-stack ss_sp={:#x} ss_size={:#x}, old ss_sp={:#x} ss_size={:#x} ss_flags={:#x}",
+        alt_stack.ss_sp as usize, alt_stack.ss_size, oss.ss_sp as usize, oss.ss_size, oss.ss_flags,
+    );
     let _restore_guard = litebox::utils::defer(|| unsafe {
         // Clear the magic value BEFORE restoring the old sigaltstack.
         // This closes the race window: once magic is cleared, any signal
