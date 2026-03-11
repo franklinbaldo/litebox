@@ -1825,24 +1825,66 @@ fn update_host_tls_entry() {
     assert!(!tcb.is_null(), "update_host_tls_entry called without TCB");
     let host_tls = tcb as usize;
 
-    // Read guest_tpidr from our thread-local
-    let guest_tpidr = get_guest_tpidr();
-
-    eprintln!(
-        "[diag] update_host_tls_entry: table_addr={:#x}, host_tls={:#x}, guest_tpidr={:#x}",
-        table_addr, host_tls, guest_tpidr
-    );
-
+    // macOS-specific: sync guest_tpidr from the TLS table.
+    //
+    // On aarch64, the guest can change TPIDR_EL0 via rewritten MSR instructions.
+    // The MSR trampoline updates the TLS table entry's guest_tpidr in-place and
+    // returns directly to guest code without entering the host. This means
+    // tcb.guest_tpidr can be stale — the table has the authoritative value.
+    //
+    // On Linux, signal_handler_exit_guest reads the current TPIDR_EL0 from the
+    // register (which the kernel preserves), so the host always learns the
+    // correct value on any exception/interrupt. On macOS, TPIDR_EL0 is clobbered
+    // by the kernel on signal delivery, so we must read it back from the table.
+    //
+    // Do a reverse lookup: find the entry where host_tls matches, then read
+    // back the current guest_tpidr that the MSR trampoline wrote.
     let sentinel: u64 = 0xFFFFFFFFFFFFFFFF;
     let table = table_addr as *mut u64;
 
-    // Linear scan from index 0 (matches trampoline assembly lookup)
+    for index in 0..TLS_TABLE_ENTRIES {
+        let entry = unsafe { table.add(index * 2) };
+        let stored_guest_tpidr = unsafe { entry.read_volatile() };
+        if stored_guest_tpidr == sentinel {
+            break; // Past all occupied entries
+        }
+        let stored_host_tls = unsafe { entry.add(1).read_volatile() };
+        if stored_host_tls == host_tls as u64 {
+            // Found our entry. The MSR trampoline may have updated
+            // guest_tpidr in-place. Sync it back to the TCB.
+            let table_guest_tpidr = stored_guest_tpidr as usize;
+            let current_guest_tpidr = get_guest_tpidr();
+            if table_guest_tpidr != current_guest_tpidr {
+                eprintln!(
+                    "[diag] update_host_tls_entry: syncing guest_tpidr from TLS table: {:#x} -> {:#x}",
+                    current_guest_tpidr, table_guest_tpidr
+                );
+                set_guest_tpidr(table_guest_tpidr);
+            }
+            eprintln!(
+                "[diag] update_host_tls_entry: table_addr={:#x}, host_tls={:#x}, guest_tpidr={:#x} (from table)",
+                table_addr, host_tls, table_guest_tpidr
+            );
+            return;
+        }
+    }
+
+    // No existing entry for our host_tls. This is the first call for this
+    // thread (before any trampoline has run). Write a new entry with the
+    // current guest_tpidr.
+    let guest_tpidr = get_guest_tpidr();
+
+    eprintln!(
+        "[diag] update_host_tls_entry: new entry table_addr={:#x}, host_tls={:#x}, guest_tpidr={:#x}",
+        table_addr, host_tls, guest_tpidr
+    );
+
     for index in 0..TLS_TABLE_ENTRIES {
         let entry = unsafe { table.add(index * 2) };
         let stored_guest_tpidr = unsafe { entry.read_volatile() };
 
         if stored_guest_tpidr == guest_tpidr as u64 {
-            // Found existing entry - update host_tls
+            // Found existing entry with same guest_tpidr - update host_tls
             unsafe { entry.add(1).write_volatile(host_tls as u64) };
             return;
         }
@@ -1855,7 +1897,6 @@ fn update_host_tls_entry() {
             }
             return;
         }
-        // Slot occupied by different thread - continue scanning
     }
 
     panic!("TLS table full: exceeded {TLS_TABLE_ENTRIES} concurrent threads");
