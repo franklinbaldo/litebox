@@ -556,13 +556,13 @@ _syscall_callback:
     .globl _exception_callback
 _exception_callback:
     .cfi_startproc
-    // Restore TPIDR_EL0 from x18 (passed via ucontext on signal return,
-    // or already set from mrs at switch_to_guest entry).
-    // macOS sigreturn clobbers TPIDR_EL0, so we must restore it here.
-    msr tpidr_el0, x18
+    // Restore TPIDR_EL0 from x9 (passed via ucontext x[9] on signal return).
+    // macOS sigreturn clobbers TPIDR_EL0 AND does not restore x18
+    // (platform-reserved register on Darwin), so we use x9 instead.
+    msr tpidr_el0, x9
     // Restore host stack.
-    ldr x9, [x18, #8]
-    mov sp, x9
+    ldr x10, [x9, #8]
+    mov sp, x10
 
     ldr x0, [sp]                  // thread_ctx
     bl {exception_handler}
@@ -572,12 +572,11 @@ _exception_callback:
     .globl _interrupt_callback
 _interrupt_callback:
     .cfi_startproc
-    // Restore TPIDR_EL0 from x18 (passed via ucontext on signal return,
-    // or already set from mrs at switch_to_guest entry).
-    msr tpidr_el0, x18
+    // Restore TPIDR_EL0 from x9 (see exception_callback comment).
+    msr tpidr_el0, x9
     // Restore host stack.
-    ldr x9, [x18, #8]
-    mov sp, x9
+    ldr x10, [x9, #8]
+    mov sp, x10
 
     ldr x0, [sp]                  // thread_ctx
     bl {interrupt_handler}
@@ -678,7 +677,10 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         "br x16",
         // Local trampoline for cbnz — macOS assembler rejects conditional
         // branches to non-assembler-local labels (only numbered labels qualify).
-        "2: b _interrupt_callback",
+        // Copy x18 (host_tls from TPIDR_EL0) to x9 because interrupt_callback
+        // expects host_tls in x9 (for consistency with signal-return path).
+        "2: mov x9, x18",
+        "b _interrupt_callback",
         ".globl _switch_to_guest_end",
         "_switch_to_guest_end:",
     );
@@ -2079,9 +2081,11 @@ fn set_signal_return(
     sigctx.__ss.__x[1] = p1 as u64;
     sigctx.__ss.__x[2] = p2 as u64;
     sigctx.__ss.__x[3] = p3 as u64;
-    // Pass host_tls via x18 so callback asm can restore TPIDR_EL0.
-    // macOS sigreturn clobbers TPIDR_EL0 to the pthread value.
-    sigctx.__ss.__x[18] = host_tls as u64;
+    // Pass host_tls via x9 so callback asm can restore TPIDR_EL0.
+    // macOS sigreturn clobbers TPIDR_EL0 to the pthread value and does
+    // NOT restore x18 (platform-reserved register on Darwin ARM64).
+    // x9 is a standard caller-saved temp register that IS properly restored.
+    sigctx.__ss.__x[9] = host_tls as u64;
 }
 
 /// Signal handler for hardware exceptions (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP).
