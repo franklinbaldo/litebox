@@ -540,7 +540,22 @@ impl ElfParsedFile {
             } else {
                 // First trampoline: allocate a one-page TLS lookup table.
                 // Initialize all guest_tpidr fields with sentinel 0xFFFFFFFFFFFFFFFF.
-                let addr = info.brk.max(trampoline_end);
+                // On macOS arm64, the host page size is 16KB. The trampoline
+                // protect() call below rounds up to host page boundaries via
+                // mprotect, so if the TLS table shares a 16KB host page with
+                // the trampoline tail, the protect(r-x) will clobber the TLS
+                // table's write permission, causing SIGBUS on write. Align the
+                // TLS table to 16KB to ensure it starts on its own host page.
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                const HOST_PAGE_SIZE: usize = 16384;
+                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                const HOST_PAGE_SIZE: usize = PAGE_SIZE;
+
+                let addr = info
+                    .brk
+                    .max(trampoline_end)
+                    .next_multiple_of(HOST_PAGE_SIZE);
+
                 let tls_table_end = page_align_up(addr + TLS_TABLE_SIZE);
 
                 mapper
