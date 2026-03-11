@@ -24,6 +24,14 @@ pub fn all_threads_exited() -> bool {
     ACTIVE_THREAD_COUNT.load(Ordering::Acquire) == 0
 }
 
+/// Resets the active thread count to 1, preparing for a new process.
+///
+/// This must be called before starting a new process to ensure the thread
+/// count is correct for the new main thread.
+pub fn reset_active_thread_count() {
+    ACTIVE_THREAD_COUNT.store(1, Ordering::Release);
+}
+
 #[expect(dead_code, reason = "bindings are generated from C header files")]
 mod bindings {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));

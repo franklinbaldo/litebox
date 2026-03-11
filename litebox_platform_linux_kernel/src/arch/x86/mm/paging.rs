@@ -37,6 +37,21 @@ fn frame_to_pointer<M: MemoryProvider>(frame: PhysFrame) -> *mut PageTable {
     virt.as_mut_ptr()
 }
 
+/// # Safety
+///
+/// `p4` must point to a valid, aligned level-4 page table.
+unsafe fn create_mapped_page_table<M: MemoryProvider>(
+    p4: PhysAddr,
+) -> MappedPageTable<'static, FrameMapping<M>> {
+    assert!(p4.is_aligned(Size4KiB::SIZE));
+    let frame = PhysFrame::from_start_address(p4).unwrap();
+    let mapping = FrameMapping::<M> {
+        _provider: core::marker::PhantomData,
+    };
+    let p4_va = mapping.frame_to_pointer(frame);
+    unsafe { MappedPageTable::new(&mut *p4_va, mapping) }
+}
+
 pub struct X64PageTable<'a, M: MemoryProvider, const ALIGN: usize> {
     inner: spin::mutex::SpinMutex<MappedPageTable<'a, FrameMapping<M>>>,
 }
@@ -81,6 +96,16 @@ pub(crate) fn vmflags_to_pteflags(values: VmFlags) -> PageTableFlags {
 impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     pub(crate) unsafe fn new(item: PhysAddr) -> Self {
         unsafe { Self::init(item) }
+    }
+
+    /// Replaces the inner page table with a new one rooted at the given physical address.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `p4` points to a valid, aligned level-4 page table
+    /// and that no concurrent page table operations are in progress.
+    pub(crate) unsafe fn reset(&self, p4: PhysAddr) {
+        *self.inner.lock() = unsafe { create_mapped_page_table::<M>(p4) };
     }
 
     pub(crate) fn map_pages(
@@ -273,15 +298,8 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
 
 impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTable<'_, M, ALIGN> {
     unsafe fn init(p4: PhysAddr) -> Self {
-        assert!(p4.is_aligned(Size4KiB::SIZE));
-        let frame = PhysFrame::from_start_address(p4).unwrap();
-        let mapping = FrameMapping::<M> {
-            _provider: core::marker::PhantomData,
-        };
-        let p4_va = mapping.frame_to_pointer(frame);
-        let p4 = unsafe { &mut *p4_va };
         X64PageTable {
-            inner: unsafe { MappedPageTable::new(p4, mapping) }.into(),
+            inner: unsafe { create_mapped_page_table::<M>(p4) }.into(),
         }
     }
 

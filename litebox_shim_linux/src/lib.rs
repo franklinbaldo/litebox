@@ -295,6 +295,38 @@ impl<FS: ShimFS> LinuxShim<FS> {
     pub fn litebox(&self) -> &LiteBox<Platform> {
         &self.0.litebox
     }
+
+    /// Reset per-process state so the shim can be reused for a new process.
+    ///
+    /// This preserves shared resources (network, filesystem transport) while
+    /// releasing per-process state (memory mappings, descriptors, futex entries,
+    /// unix socket addresses, thread IDs).
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that no previous process is still running and that
+    /// released memory regions are no longer in use.
+    #[allow(clippy::missing_panics_doc)]
+    pub unsafe fn reset_for_new_process(&self) {
+        // Release all virtual memory mappings from the previous process.
+        unsafe {
+            self.0
+                .pm
+                .release_memory(|_, _| true)
+                .expect("release_memory failed");
+        }
+
+        // Clear the descriptor table (file handles, pipes, etc.)
+        self.0.litebox.descriptor_table_mut().clear();
+
+        // Reset thread ID counter (1 is used by the main thread).
+        self.0
+            .next_thread_id
+            .store(2, core::sync::atomic::Ordering::Relaxed);
+
+        // Clear unix socket address bindings.
+        self.0.unix_addr_table.write().clear();
+    }
 }
 
 pub struct LoadedProgram<FS: ShimFS> {

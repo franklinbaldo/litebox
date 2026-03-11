@@ -36,6 +36,11 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         Self { entries: vec![] }
     }
 
+    /// Remove all entries from the descriptor table.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     /// Insert `entry` into the descriptor table, returning an `OwnedFd` to this entry.
     pub(crate) fn insert<Subsystem: FdEnabledSubsystem>(
         &mut self,

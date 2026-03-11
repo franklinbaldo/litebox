@@ -136,6 +136,16 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     pub fn terminate(&self, reason_set: u64, reason_code: u64) -> ! {
         Host::terminate(reason_set, reason_code)
     }
+
+    /// Replaces the page table with a new one rooted at the given physical address.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `addr` points to a valid level-4 page table
+    /// and that no concurrent page table operations are in progress.
+    pub unsafe fn reset_page_table(&self, addr: x86_64::PhysAddr) {
+        unsafe { self.page_table.reset(addr) }
+    }
 }
 
 impl<Host: HostInterface> RawMutexProvider for LinuxKernel<Host> {

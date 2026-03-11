@@ -123,6 +123,14 @@ pub extern "C" fn sandbox_kernel_init(
 
     litebox_platform_linux_kernel::update_cpu_mhz(boot_params.cpu_khz / 1000);
 
+    // Initialize the platform once at boot time.
+    let pgd = litebox_platform_linux_kernel::arch::PhysAddr::new_truncate(
+        litebox_platform_linux_kernel::arch::instructions::cr3()
+            & !(litebox::mm::linux::PAGE_SIZE as u64 - 1),
+    );
+    let platform = litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel::new(pgd);
+    litebox_platform_multiplex::set_platform(platform);
+
     ghcb_prints("sandbox_kernel_init done\n");
     litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::return_to_host();
 }
@@ -137,55 +145,29 @@ pub extern "C" fn sandbox_process_init(
         litebox_platform_linux_kernel::arch::instructions::cr3()
             & !(litebox::mm::linux::PAGE_SIZE as u64 - 1),
     );
-    let platform = litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel::new(pgd);
+    let platform = litebox_platform_multiplex::platform();
+    unsafe { platform.reset_page_table(pgd) };
+    litebox_platform_linux_kernel::host::snp::snp_impl::reset_active_thread_count();
     #[cfg(debug_assertions)]
     litebox::log_println!(platform, "sandbox_process_init called\n");
 
-    litebox_platform_multiplex::set_platform(platform);
-    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
-    let shim = shim_builder.build();
-    unsafe { SHIM = Some(shim) };
-
-    let parse_args =
-        |params: &litebox_platform_linux_kernel::host::snp::snp_impl::vmpl2_boot_params| -> Option<(
-            alloc::string::String,
-            alloc::vec::Vec<alloc::ffi::CString>,
-            alloc::vec::Vec<alloc::ffi::CString>,
-        )> {
-            let mut argv = alloc::vec::Vec::new();
-            let mut envp = alloc::vec::Vec::new();
-
-            let argv_len = params.argv_len.reinterpret_as_unsigned() as usize;
-            let env_len = params.env_len.reinterpret_as_unsigned() as usize;
-            let total = argv_len + env_len;
-
-            let mut idx = 0;
-            while idx < total {
-                let arg = core::ffi::CStr::from_bytes_until_nul(&params.argv_and_env[idx..])
-                    .ok()?
-                    .to_owned();
-                let this_len = arg.count_bytes() + 1;
-
-                if idx < argv_len {
-                    argv.push(arg);
-                } else {
-                    envp.push(arg);
-                }
-                idx += this_len;
-            }
-            let program = argv.first().cloned()?;
-            Some((program.to_str().ok()?.to_owned(), argv, envp))
-        };
-    let Some((program, argv, envp)) = parse_args(boot_params) else {
-        litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
-            globals::SM_SEV_TERM_SET,
-            globals::SM_TERM_INVALID_PARAM,
-        );
-    };
+    // On first call, create the shim. On subsequent calls,
+    // reset per-process state and reuse the existing shim.
+    if unsafe { SHIM.is_none() } {
+        let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
+        let shim: litebox_shim_linux::LinuxShim<DefaultFS> = shim_builder.build();
+        unsafe { SHIM = Some(shim) };
+    } else {
+        let shim = &raw const SHIM;
+        let shim = unsafe { (*shim).as_ref().expect("initialized") };
+        // Safety: previous process has exited and its memory is no longer in use.
+        unsafe { shim.reset_for_new_process() };
+    }
 
     let shim = &raw const SHIM;
     #[allow(clippy::missing_panics_doc)]
     let shim = unsafe { (*shim).as_ref().expect("initialized") };
+
     let litebox = shim.litebox();
     let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
     in_mem_fs.with_root_privileges(|fs| {
@@ -228,6 +210,43 @@ pub extern "C" fn sandbox_process_init(
         litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
     );
     let fs = alloc::sync::Arc::new(default_fs);
+
+    let parse_args =
+        |params: &litebox_platform_linux_kernel::host::snp::snp_impl::vmpl2_boot_params| -> Option<(
+            alloc::string::String,
+            alloc::vec::Vec<alloc::ffi::CString>,
+            alloc::vec::Vec<alloc::ffi::CString>,
+        )> {
+            let mut argv = alloc::vec::Vec::new();
+            let mut envp = alloc::vec::Vec::new();
+
+            let argv_len = params.argv_len.reinterpret_as_unsigned() as usize;
+            let env_len = params.env_len.reinterpret_as_unsigned() as usize;
+            let total = argv_len + env_len;
+
+            let mut idx = 0;
+            while idx < total {
+                let arg = core::ffi::CStr::from_bytes_until_nul(&params.argv_and_env[idx..])
+                    .ok()?
+                    .to_owned();
+                let this_len = arg.count_bytes() + 1;
+
+                if idx < argv_len {
+                    argv.push(arg);
+                } else {
+                    envp.push(arg);
+                }
+                idx += this_len;
+            }
+            let program = argv.first().cloned()?;
+            Some((program.to_str().ok()?.to_owned(), argv, envp))
+        };
+    let Some((program, argv, envp)) = parse_args(boot_params) else {
+        litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
+            globals::SM_SEV_TERM_SET,
+            globals::SM_TERM_INVALID_PARAM,
+        );
+    };
 
     // Loading a program may trigger page faults, so we need to set SHIM before this.
     let program = match shim.load_program(fs, platform.init_task(boot_params), &program, argv, envp)
