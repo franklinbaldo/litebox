@@ -792,6 +792,9 @@ impl RawMutex {
             timeout,
         ) {
             Ok(0) => Ok(UnblockedOrTimedOut::Unblocked),
+            Err(e) if e == i32::from(crate::errno::Errno::EINTR) as isize => {
+                Ok(UnblockedOrTimedOut::Unblocked)
+            }
             Err(e) if e == i32::from(crate::errno::Errno::EAGAIN) as isize => {
                 Err(ImmediatelyWokenUp)
             }

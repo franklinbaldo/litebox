@@ -1613,10 +1613,10 @@ mod tests {
     /// Installing a custom handler for SIGINT: a background OS thread sends
     /// a real SIGINT via `libc::kill`, which should interrupt a blocking sleep
     /// with `EINTR`.
-    /// Target Linux only because it use tgkill syscall to send signal to specific thread.
-    #[cfg(all(target_os = "linux", debug_assertions))]
+    #[cfg(all(any(target_os = "linux", target_os = "freebsd"), debug_assertions))]
     #[test]
     fn test_sigint_with_custom_handler() {
+        use litebox::platform::RawConstPointer as _;
         use litebox_common_linux::signal::{SaFlags, SigAction, SigSet, Signal};
         use litebox_common_linux::{ClockId, TimerFlags, Timespec};
 
@@ -1642,13 +1642,12 @@ mod tests {
 
             // Spawn a plain OS thread that sends a real SIGINT to this
             // specific thread after a short delay, giving it time to enter nanosleep.
-            let pid = unsafe { libc::getpid() };
-            let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+            let thread = unsafe { libc::pthread_self() };
             let handle = std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 // Safety: sending a signal to a thread in our own process is always valid.
-                let ret = unsafe { libc::syscall(libc::SYS_tgkill, pid, tid, libc::SIGINT) };
-                assert_eq!(ret, 0, "tgkill failed");
+                let ret = unsafe { libc::pthread_kill(thread, libc::SIGINT) };
+                assert_eq!(ret, 0, "pthread_kill failed");
             });
 
             let mut request = Timespec {
