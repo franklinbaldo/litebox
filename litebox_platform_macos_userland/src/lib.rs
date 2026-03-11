@@ -1300,16 +1300,21 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 //
                 // IMPORTANT: Edge pages are MAP_JIT pages from the reserve. On macOS,
                 // MAP_JIT pages enforce W^X via a per-thread toggle controlled by
-                // pthread_jit_write_protect_np. mprotect(RWX) alone does NOT make them
-                // writable — the thread must also be in W mode. If the caller will
-                // write to these pages (initial_permissions includes WRITE), ensure we
-                // are in JIT write mode. During ELF loading (before run_thread), the
-                // thread defaults to X mode, so this is essential.
-                // During guest→host transitions, handlers already call jit_write_mode(),
-                // making this a harmless no-op.
-                if initial_permissions.contains(MemoryRegionPermissions::WRITE) {
-                    jit_write_mode();
-                }
+                // pthread_jit_write_protect_np. The mprotect permission acts as a MASK
+                // intersected with the current JIT toggle state:
+                //   - X mode: effective = mprotect_perms & R-X
+                //   - W mode: effective = mprotect_perms & RW-
+                //
+                // mprotect(RWX) may fail with EPERM if the current JIT toggle state
+                // doesn't allow the requested permissions. Specifically, in W mode,
+                // requesting EXEC via mprotect can be rejected by the kernel.
+                //
+                // Solution: always be in X mode when calling mprotect(RWX) on MAP_JIT
+                // pages (X mode permits the EXEC bit). Then switch to W mode afterward
+                // if the caller needs write access.
+                let needs_write = initial_permissions.contains(MemoryRegionPermissions::WRITE);
+                // Ensure X mode for mprotect(RWX) on MAP_JIT edge pages.
+                jit_exec_mode();
                 //
                 // Collect distinct edge host page addresses, then mprotect each once.
                 // Leading edge: the host page containing suggested_range.start
@@ -1370,6 +1375,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                         outer_start,
                         std::io::Error::last_os_error()
                     );
+                }
+
+                // Now that mprotect(RWX) is done (in X mode), switch to W mode
+                // if the caller needs to write to these pages. The effective
+                // permission becomes RWX & RW- = RW-.
+                if needs_write {
+                    jit_write_mode();
                 }
 
                 Ok(UserMutPtr::from_usize(suggested_range.start))
@@ -1511,8 +1523,17 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
 
         // Edge host pages: set to RWX if not fully covered by the interior.
         // Collect distinct edge page addresses, then mprotect each once.
+        //
+        // On MAP_JIT pages, mprotect(RWX) requires X mode (the kernel rejects
+        // adding EXEC in W mode). Switch to X mode before the edge mprotects.
+        // This is safe because update_permissions is called after the write
+        // callback has finished — no more writes to these pages are pending.
         let has_leading_edge = outer_start < inner_start;
         let has_trailing_edge = inner_end < outer_end;
+        let has_any_edge = has_leading_edge || has_trailing_edge;
+        if has_any_edge {
+            jit_exec_mode();
+        }
         let leading_edge_addr = outer_start;
         let trailing_edge_addr = host_page_align_down(range.end.saturating_sub(1));
 
