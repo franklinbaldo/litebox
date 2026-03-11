@@ -2194,12 +2194,17 @@ fn signal_handler_exit_guest(
         if ret != 0 || current_ss.ss_flags & libc::SS_ONSTACK == 0 {
             // Not on our alt-stack (or syscall failed). Return None without
             // touching any SP-derived addresses.
-            let mut buf = [0u8; 128];
-            let n = format_buf(
+            let mut buf = [0u8; 256];
+            let mut pos = write_bytes(
                 &mut buf,
-                b"[diag] signal_handler_exit_guest: not on alt-stack\n",
+                0,
+                b"[diag] signal_handler_exit_guest: not on alt-stack ret=",
             );
-            libc::write(2, buf.as_ptr() as *const libc::c_void, n);
+            pos = write_hex(&mut buf, pos, ret as usize);
+            pos = write_bytes(&mut buf, pos, b" flags=");
+            pos = write_hex(&mut buf, pos, current_ss.ss_flags as usize);
+            pos = write_bytes(&mut buf, pos, b"\n");
+            libc::write(2, buf.as_ptr() as *const libc::c_void, pos);
             return None;
         }
 
@@ -2209,13 +2214,42 @@ fn signal_handler_exit_guest(
         core::arch::asm!("mov {}, sp", out(reg) sp_val, options(nostack, nomem));
         let aligned_base = sp_val & !(ALT_STACK_ALLOC_SIZE - 1);
 
+        // Log alt-stack details for debugging.
+        {
+            let mut buf = [0u8; 256];
+            let mut pos = write_bytes(&mut buf, 0, b"[diag] signal_handler_exit_guest: sp=");
+            pos = write_hex(&mut buf, pos, sp_val);
+            pos = write_bytes(&mut buf, pos, b" ss_sp=");
+            pos = write_hex(&mut buf, pos, current_ss.ss_sp as usize);
+            pos = write_bytes(&mut buf, pos, b" ss_size=");
+            pos = write_hex(&mut buf, pos, current_ss.ss_size);
+            pos = write_bytes(&mut buf, pos, b" aligned_base=");
+            pos = write_hex(&mut buf, pos, aligned_base);
+            pos = write_bytes(&mut buf, pos, b"\n");
+            libc::write(2, buf.as_ptr() as *const libc::c_void, pos);
+        }
+
         // Double-check with magic value (belt and suspenders).
         let magic_ptr = (aligned_base + ALT_STACK_ALLOC_SIZE - 16) as *const usize;
         let magic = core::ptr::read_volatile(magic_ptr);
         if magic != ALT_STACK_MAGIC {
-            let mut buf = [0u8; 128];
-            let n = format_buf(&mut buf, b"[diag] signal_handler_exit_guest: bad magic\n");
-            libc::write(2, buf.as_ptr() as *const libc::c_void, n);
+            let mut buf = [0u8; 256];
+            let mut pos = write_bytes(
+                &mut buf,
+                0,
+                b"[diag] signal_handler_exit_guest: bad magic sp=",
+            );
+            pos = write_hex(&mut buf, pos, sp_val);
+            pos = write_bytes(&mut buf, pos, b" aligned_base=");
+            pos = write_hex(&mut buf, pos, aligned_base);
+            pos = write_bytes(&mut buf, pos, b" magic_ptr=");
+            pos = write_hex(&mut buf, pos, magic_ptr as usize);
+            pos = write_bytes(&mut buf, pos, b" got=");
+            pos = write_hex(&mut buf, pos, magic);
+            pos = write_bytes(&mut buf, pos, b" expected=");
+            pos = write_hex(&mut buf, pos, ALT_STACK_MAGIC);
+            pos = write_bytes(&mut buf, pos, b"\n");
+            libc::write(2, buf.as_ptr() as *const libc::c_void, pos);
             return None;
         }
 
