@@ -76,14 +76,14 @@ const SVC_GATE_SIZE: usize = SVC_GATE_INSN_COUNT * 4; // 24
 ///  [2]  LDR  X17, [PC, #off]      ; X17 = TLS table base
 ///  [3]  LDR  X30, [X17, #0]       ; .Lloop: X30 = entry.guest_tpidr (scratch)
 ///  [4]  CMN  X30, #1              ; sentinel?
-///  [5]  B.EQ .Ldone               ; -> [11]
+///  [5]  B.EQ .Lsentinel           ; -> [12] (skip STR to avoid phantom entries)
 ///  [6]  CMP  X30, X16             ; match old TPIDR?
 ///  [7]  B.EQ .Lfound              ; -> [10]
 ///  [8]  ADD  X17, X17, #16        ; next entry
 ///  [9]  B    .Lloop               ; -> [3]
 /// [10]  LDR  X16, [SP, #24]       ; .Lfound: X16 = new TPIDR
-/// [11]  STR  X16, [X17, #0]       ; update entry.guest_tpidr
-/// [12]  LDR  X16, [SP, #24]       ; .Ldone: new TPIDR
+/// [11]  STR  X16, [X17, #0]       ; update entry.guest_tpidr (only from .Lfound)
+/// [12]  LDR  X16, [SP, #24]       ; .Lsentinel: new TPIDR
 /// [13]  MSR  TPIDR_EL0, X16       ; execute actual MSR
 /// [14]  LDR  X30, [SP, #32]       ; restore BL return
 /// [15]  RET
@@ -1067,15 +1067,21 @@ fn emit_shared_msr_handler(
     trampoline_data.extend_from_slice(&encode_cmn_imm(30, 1).expect("imm12=1 fits").to_le_bytes());
     insn_idx += 1;
 
-    // [5] B.EQ .Ldone -> [11]
-    let done_idx = 11usize;
-    let beq_done_offset = (done_idx as i64 - insn_idx as i64) * 4;
-    let beq_done = encode_b_cond(COND_EQ, beq_done_offset).ok_or_else(|| {
+    // [5] B.EQ .Lsentinel -> [12]
+    //
+    // On the sentinel path (no existing entry matches the old TPIDR), skip
+    // the table update at [11]. This prevents writing a phantom entry with
+    // host_tls=0 when TPIDR_EL0 has been clobbered (e.g., by macOS signal
+    // delivery). The actual MSR TPIDR_EL0 at [13] still executes correctly
+    // since it loads the new TPIDR from [SP, #24].
+    let sentinel_idx = 12usize;
+    let beq_sentinel_offset = (sentinel_idx as i64 - insn_idx as i64) * 4;
+    let beq_sentinel = encode_b_cond(COND_EQ, beq_sentinel_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
-            "B.EQ offset {beq_done_offset:#x} out of range in shared MSR handler"
+            "B.EQ offset {beq_sentinel_offset:#x} out of range in shared MSR handler"
         ))
     })?;
-    trampoline_data.extend_from_slice(&beq_done.to_le_bytes());
+    trampoline_data.extend_from_slice(&beq_sentinel.to_le_bytes());
     insn_idx += 1;
 
     // [6] CMP X30, X16 — match old TPIDR?
@@ -1112,7 +1118,6 @@ fn emit_shared_msr_handler(
     insn_idx += 1;
 
     // [10] .Lfound: LDR X16, [SP, #24] — X16 = new TPIDR
-    //      STR X16, [X17, #0] — update entry.guest_tpidr
     debug_assert_eq!(insn_idx, found_idx);
     trampoline_data.extend_from_slice(
         &encode_ldr_imm_unsigned(16, 31, 24)
@@ -1121,8 +1126,7 @@ fn emit_shared_msr_handler(
     );
     insn_idx += 1;
 
-    // [11] .Ldone: STR X16, [X17, #0] — update entry (or no-op if sentinel)
-    debug_assert_eq!(insn_idx, done_idx);
+    // [11] STR X16, [X17, #0] — update entry.guest_tpidr (only reached from .Lfound)
     trampoline_data.extend_from_slice(
         &encode_str_imm_unsigned(16, 17, 0)
             .expect("offset 0 valid")
@@ -1130,7 +1134,8 @@ fn emit_shared_msr_handler(
     );
     insn_idx += 1;
 
-    // [12] LDR X16, [SP, #24] — new TPIDR
+    // [12] .Lsentinel: LDR X16, [SP, #24] — new TPIDR
+    debug_assert_eq!(insn_idx, sentinel_idx);
     trampoline_data.extend_from_slice(
         &encode_ldr_imm_unsigned(16, 31, 24)
             .expect("offset 24 valid")
@@ -2483,8 +2488,8 @@ mod tests {
         // [4] CMN X30, #1 -- sentinel?
         assert_eq!(insn_at(4), encode_cmn_imm(30, 1).unwrap());
 
-        // [5] B.EQ .Ldone -> [11]: offset = (11-5)*4 = 24
-        assert_eq!(insn_at(5), encode_b_cond(COND_EQ, 24).unwrap());
+        // [5] B.EQ .Lsentinel -> [12]: offset = (12-5)*4 = 28
+        assert_eq!(insn_at(5), encode_b_cond(COND_EQ, 28).unwrap());
 
         // [6] CMP X30, X16 -- match?
         assert_eq!(insn_at(6), encode_cmp_reg(30, 16));
@@ -2501,10 +2506,10 @@ mod tests {
         // [10] .Lfound: LDR X16, [SP, #24] -- new TPIDR
         assert_eq!(insn_at(10), encode_ldr_imm_unsigned(16, 31, 24).unwrap());
 
-        // [11] .Ldone: STR X16, [X17, #0] -- update entry
+        // [11] STR X16, [X17, #0] -- update entry (only from .Lfound)
         assert_eq!(insn_at(11), encode_str_imm_unsigned(16, 17, 0).unwrap());
 
-        // [12] LDR X16, [SP, #24] -- new TPIDR
+        // [12] .Lsentinel: LDR X16, [SP, #24] -- new TPIDR
         assert_eq!(insn_at(12), encode_ldr_imm_unsigned(16, 31, 24).unwrap());
 
         // [13] MSR TPIDR_EL0, X16

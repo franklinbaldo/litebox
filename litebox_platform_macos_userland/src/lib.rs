@@ -1848,7 +1848,66 @@ fn update_host_tls_entry() {
     assert!(!tcb.is_null(), "update_host_tls_entry called without TCB");
     let host_tls = tcb as usize;
 
-    // macOS-specific: sync guest_tpidr from the TLS table.
+    let sentinel: u64 = 0xFFFFFFFFFFFFFFFF;
+    let table = table_addr as *mut u64;
+
+    // Defensive cleanup: remove phantom entries with host_tls == 0.
+    //
+    // Before the MSR handler sentinel-branch fix, if TPIDR_EL0 was
+    // clobbered by macOS signal delivery, the sentinel path would
+    // unconditionally write the stale TPIDR into a new entry with
+    // host_tls=0 (from the zero-initialized page). These phantom entries
+    // cause the SVC handler to load host_tls=0 into x18, leading to
+    // SIGSEGV at far=0x20 when syscall_callback writes TCB.in_guest.
+    //
+    // Scan the table and compact out any entries with host_tls==0.
+    {
+        let mut write_idx: usize = 0;
+        let mut read_idx: usize = 0;
+        let mut removed = 0usize;
+        loop {
+            if read_idx >= TLS_TABLE_ENTRIES {
+                break;
+            }
+            let entry = unsafe { table.add(read_idx * 2) };
+            let gt = unsafe { entry.read_volatile() };
+            if gt == sentinel {
+                break;
+            }
+            let ht = unsafe { entry.add(1).read_volatile() };
+            if ht == 0 {
+                // Phantom entry — skip it
+                eprintln!(
+                    "[diag] update_host_tls_entry: removing phantom entry[{}]: guest_tpidr={:#x} host_tls=0",
+                    read_idx, gt
+                );
+                removed += 1;
+                read_idx += 1;
+                continue;
+            }
+            if write_idx != read_idx {
+                // Shift entry down
+                let dst = unsafe { table.add(write_idx * 2) };
+                unsafe {
+                    dst.write_volatile(gt);
+                    dst.add(1).write_volatile(ht);
+                }
+            }
+            write_idx += 1;
+            read_idx += 1;
+        }
+        if removed > 0 {
+            // Restore sentinel at new end
+            let sentinel_entry = unsafe { table.add(write_idx * 2) };
+            unsafe {
+                sentinel_entry.write_volatile(sentinel);
+            }
+            eprintln!(
+                "[diag] update_host_tls_entry: compacted {} phantom entries, {} entries remain",
+                removed, write_idx
+            );
+        }
+    }
     //
     // On aarch64, the guest can change TPIDR_EL0 via rewritten MSR instructions.
     // The MSR trampoline updates the TLS table entry's guest_tpidr in-place and
@@ -1862,8 +1921,6 @@ fn update_host_tls_entry() {
     //
     // Do a reverse lookup: find the entry where host_tls matches, then read
     // back the current guest_tpidr that the MSR trampoline wrote.
-    let sentinel: u64 = 0xFFFFFFFFFFFFFFFF;
-    let table = table_addr as *mut u64;
 
     // Diagnostic: dump first few TLS table entries to see what's there.
     {
@@ -1985,6 +2042,49 @@ impl ThreadContext<'_> {
                     self.ctx.sp
                 );
                 update_host_tls_entry();
+
+                // Fix stale TPIDR registers if resuming into the middle of
+                // a trampoline handler. macOS clobbers TPIDR_EL0 on signal
+                // delivery, so if a signal interrupted the guest while it
+                // was executing inside the shared SVC or MSR handler (after
+                // the MRS TPIDR_EL0 but before the handler completed), the
+                // register holding the MRS result (x18 for SVC, x16 for MSR)
+                // may contain a stale/clobbered value. Fix it up from
+                // tcb.guest_tpidr which update_host_tls_entry just synced.
+                //
+                // Trampoline layout from SIGRETURN_TRAMPOLINE_ADDR (offset 16):
+                //   base+48  .. base+104  = shared SVC handler (x18 = MRS result)
+                //   base+104 .. base+168  = shared MSR handler (x16 = MRS result)
+                {
+                    let sigret_addr = litebox_common_linux::SIGRETURN_TRAMPOLINE_ADDR
+                        .load(core::sync::atomic::Ordering::Acquire);
+                    if sigret_addr != 0 {
+                        let trampoline_base = sigret_addr - 16;
+                        let svc_handler_start = trampoline_base + 48;
+                        let svc_handler_end = trampoline_base + 104;
+                        let msr_handler_start = trampoline_base + 104;
+                        let msr_handler_end = trampoline_base + 168;
+                        let pc = self.ctx.pc;
+                        let guest_tpidr = get_guest_tpidr();
+
+                        if pc >= svc_handler_start && pc < svc_handler_end {
+                            // SVC handler: x18 holds MRS TPIDR_EL0 result at [0]
+                            eprintln!(
+                                "[diag] call_shim: fixing x18 in SVC handler: {:#x} -> {:#x} (pc={:#x})",
+                                self.ctx.regs[18], guest_tpidr, pc
+                            );
+                            self.ctx.regs[18] = guest_tpidr;
+                        } else if pc >= msr_handler_start && pc < msr_handler_end {
+                            // MSR handler: x16 holds MRS TPIDR_EL0 result at [1]
+                            eprintln!(
+                                "[diag] call_shim: fixing x16 in MSR handler: {:#x} -> {:#x} (pc={:#x})",
+                                self.ctx.regs[16], guest_tpidr, pc
+                            );
+                            self.ctx.regs[16] = guest_tpidr;
+                        }
+                    }
+                }
+
                 eprintln!(
                     "[diag] call_shim: about to switch_to_guest. ctx.pc={:#x}, ctx.sp={:#x}, guest_tpidr={:#x}",
                     self.ctx.pc,
