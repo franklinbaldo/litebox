@@ -1123,19 +1123,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Fr
         Ok(())
     }
 
-    unsafe fn remap_pages(
-        &self,
-        old_range: core::ops::Range<usize>,
-        new_range: core::ops::Range<usize>,
-        permissions: MemoryRegionPermissions,
-    ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::RemapError> {
-        unimplemented!(
-            "remap_pages is not implemented for FreeBSDUserland. old_range: {:?}, new_range: {:?}, permissions: {:?}",
-            old_range,
-            new_range,
-            permissions,
-        );
-    }
+    // remap_pages: FreeBSD lacks mremap(), so we use the default trait
+    // implementation which does allocate_pages + memcpy + deallocate_pages.
 
     unsafe fn update_permissions(
         &self,
@@ -1486,6 +1475,17 @@ unsafe extern "C" fn exception_signal_handler(
             }
             set_signal_return(context, interrupt_callback, 0, 0, 0, 0);
             return;
+        }
+        // Host-side SIGSEGV: check the exception table for fallible memory
+        // access recovery (e.g. read_u8_fallible). If we find a fixup address,
+        // redirect RIP to it so the fallible read returns an error instead of
+        // crashing.
+        if _sig == libc::SIGSEGV {
+            if let Some(fixup) = litebox::mm::exception_table::search_exception_tables(rip) {
+                let uc_mut = unsafe { &mut *(context as *mut libc::ucontext_t) };
+                uc_mut.uc_mcontext.mc_rip = fixup as i64;
+                return;
+            }
         }
         // True host exception - this is a bug. Let the default handler deal with it.
         return;
