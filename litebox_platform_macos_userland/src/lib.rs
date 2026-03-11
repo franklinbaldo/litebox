@@ -770,15 +770,25 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         "strb w16, [x18, #32]",
         "ldrb w17, [x18, #33]",
         "cbnz w17, 2f",
-        "ldr x17, [x18, #24]",
-        // Load guest PC into x18 (we'll branch to it after restoring all regs).
-        // x0 = ctx pointer to PtRegs.
-        "ldr x16, [x0, #256]", // x16 = PtRegs.pc (guest PC)
-        // Restore guest registers from PtRegs.
-        // We need to restore x0-x15, x19-x30, sp.
-        // x16 = guest PC (scratch), x17 = guest_tpidr, x18 = host TLS (will be overwritten)
+        // === Full register restore including x16, x17 ===
+        //
+        // On macOS, edge-page faults (W^X toggles) interrupt the guest at
+        // arbitrary points and resume through this path. Unlike the SVC
+        // path (where the trampoline saves/restores x16/x17), the signal
+        // handler path needs ALL registers restored exactly.
+        //
+        // Strategy: stash guest_tpidr and guest_PC below the guest SP
+        // (in the ARM64 red zone), restore ALL x0-x17/x19-x30, set SP,
+        // then use x18 (platform-reserved on macOS, never used by guest)
+        // to recover the stashed values for the final MSR + branch.
 
-        // Load guest x2-x15 first (x0, x1 last since x0=ctx pointer).
+        // Stash guest_tpidr and guest_PC below guest SP.
+        "ldr x16, [x18, #24]",  // x16 = guest_tpidr (from TCB offset 24)
+        "ldr x17, [x0, #248]",  // x17 = guest SP
+        "str x16, [x17, #-16]", // guest_SP[-16] = guest_tpidr
+        "ldr x16, [x0, #256]",  // x16 = guest PC
+        "str x16, [x17, #-8]",  // guest_SP[-8] = guest PC
+        // Restore guest x2-x17 from PtRegs (x0 still holds ctx pointer).
         "ldp x2,  x3,  [x0, #16]",
         "ldp x4,  x5,  [x0, #32]",
         "ldp x6,  x7,  [x0, #48]",
@@ -786,27 +796,27 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         "ldp x10, x11, [x0, #80]",
         "ldp x12, x13, [x0, #96]",
         "ldp x14, x15, [x0, #112]",
-        // Skip regs[16..18] — x16 has guest PC, x17 has guest_tpidr,
-        // x18 is platform-reserved
+        "ldp x16, x17, [x0, #128]", // restore guest x16, x17
+        // Restore x19-x30.
         "ldp x19, x20, [x0, #152]",
         "ldp x21, x22, [x0, #168]",
         "ldp x23, x24, [x0, #184]",
         "ldp x25, x26, [x0, #200]",
         "ldp x27, x28, [x0, #216]",
         "ldr x29, [x0, #232]",
-        "ldr x30, [x0, #240]", // guest LR (x30)
-        // Load guest SP.
-        "ldr x18, [x0, #248]", // temporarily hold guest SP in x18
-        // Restore guest x1 (x0 still needed as base pointer).
+        "ldr x30, [x0, #240]", // guest LR
+        // Restore guest SP, x1, x0.
+        "ldr x18, [x0, #248]", // x18 = guest SP (temp)
         "ldr x1, [x0, #8]",
-        // Switch to guest TPIDR_EL0.
-        "msr tpidr_el0, x17",
+        "ldr x0, [x0, #0]", // x0 no longer usable as base
         // Set guest SP.
         "mov sp, x18",
-        // Now load guest x0 (overwriting ctx pointer — last step).
-        "ldr x0, [x0, #0]",
-        // x16 = guest PC. Branch to it.
-        "br x16",
+        // Final switch: recover stashed values from below guest SP
+        // and use x18 (platform-reserved) as scratch.
+        "ldr x18, [sp, #-16]", // x18 = guest_tpidr
+        "msr tpidr_el0, x18",  // set guest TPIDR_EL0
+        "ldr x18, [sp, #-8]",  // x18 = guest PC
+        "br x18",              // jump to guest
         // Local trampoline for cbnz — macOS assembler rejects conditional
         // branches to non-assembler-local labels (only numbered labels qualify).
         // Copy x18 (host_tls from TPIDR_EL0) to x9 because interrupt_callback
