@@ -70,29 +70,77 @@ unsafe extern "C" {
 const UL_COMPARE_AND_WAIT: u32 = 1;
 const ULF_WAKE_ALL: u32 = 0x0000_0100;
 
-/// macOS MAP_JIT flag for mmap. Allocates memory that can be toggled between
-/// writable and executable per-thread using `pthread_jit_write_protect_np`.
-/// This is Apple's sanctioned W^X solution for JIT code generation.
-/// Not in the Rust `libc` crate — value from `<sys/mman.h>`.
-const MAP_JIT: libc::c_int = 0x0800;
+/// Maximum number of edge pages we track for fault-and-toggle W^X.
+///
+/// Edge pages are 16KB host pages that contain 4KB guest sub-pages with
+/// conflicting permissions (e.g., RW data + RX code). Since macOS rejects
+/// `mprotect(RWX)`, edge pages are set to either RW or RX, and permission
+/// faults are handled by toggling the permission in the signal handler.
+///
+/// Typical process: ~2-6 edge pages per loaded ELF binary. With main +
+/// interpreter + shared libraries, expect ~10-40 total.
+const MAX_EDGE_PAGES: usize = 256;
 
-unsafe extern "C" {
-    /// Toggle per-thread JIT write protection for MAP_JIT pages.
-    /// - `enabled = 1` (true): X mode — MAP_JIT pages are executable, not writable.
-    /// - `enabled = 0` (false): W mode — MAP_JIT pages are writable, not executable.
-    fn pthread_jit_write_protect_np(enabled: libc::c_int);
+/// Lock-free edge page registry for the fault-and-toggle W^X mechanism.
+///
+/// Stores 16KB-aligned addresses of edge pages. The signal handler reads
+/// this without locks (atomic loads). Writers use a simple spinlock.
+///
+/// Each entry is an AtomicUsize: 0 = empty, nonzero = 16KB-aligned address.
+static EDGE_PAGES: [std::sync::atomic::AtomicUsize; MAX_EDGE_PAGES] = {
+    // const initializer for array of AtomicUsize
+    const ZERO: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    [ZERO; MAX_EDGE_PAGES]
+};
+static EDGE_PAGE_LOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Register a 16KB host page as an edge page (has mixed RW/RX sub-pages).
+fn register_edge_page(addr: usize) {
+    debug_assert_eq!(addr % HOST_PAGE_SIZE, 0, "edge page not 16KB-aligned");
+
+    // Acquire spinlock
+    while EDGE_PAGE_LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+
+    // Check if already registered
+    for entry in &EDGE_PAGES {
+        if entry.load(Ordering::Relaxed) == addr {
+            EDGE_PAGE_LOCK.store(false, Ordering::Release);
+            return;
+        }
+    }
+
+    // Find empty slot
+    for entry in &EDGE_PAGES {
+        if entry.load(Ordering::Relaxed) == 0 {
+            entry.store(addr, Ordering::Release);
+            EDGE_PAGE_LOCK.store(false, Ordering::Release);
+            return;
+        }
+    }
+
+    EDGE_PAGE_LOCK.store(false, Ordering::Release);
+    panic!("edge page table full: exceeded {MAX_EDGE_PAGES} entries");
 }
 
-/// Enter W mode: MAP_JIT pages become writable (not executable).
-/// Call at guest→host transitions before any writes to MAP_JIT memory.
-fn jit_write_mode() {
-    unsafe { pthread_jit_write_protect_np(0) };
-}
-
-/// Enter X mode: MAP_JIT pages become executable (not writable).
-/// Call at host→guest transitions before entering guest code.
-fn jit_exec_mode() {
-    unsafe { pthread_jit_write_protect_np(1) };
+/// Check if a 16KB-aligned address is a registered edge page.
+/// Safe to call from signal handlers (lock-free reads).
+fn is_edge_page(addr: usize) -> bool {
+    let aligned = host_page_align_down(addr);
+    for entry in &EDGE_PAGES {
+        let v = entry.load(Ordering::Relaxed);
+        if v == 0 {
+            return false; // entries are packed, 0 = end
+        }
+        if v == aligned {
+            return true;
+        }
+    }
+    false
 }
 
 /// The macOS userland platform.
@@ -410,10 +458,6 @@ fn run_thread_inner(
                     ret, check_ss.ss_sp as usize, check_ss.ss_size, check_ss.ss_flags,
                 );
             }
-            // Switch MAP_JIT pages to X mode (executable) before entering guest.
-            // MUST be before write_tpidr_el0 because pthread_jit_write_protect_np
-            // is a libc call that clobbers TPIDR_EL0 on macOS.
-            jit_exec_mode();
             // Set TPIDR_EL0 as the VERY LAST thing before asm. No syscalls
             // (including eprintln!) allowed between this and run_thread_arch,
             // because macOS clobbers TPIDR_EL0 on every syscall.
@@ -1227,11 +1271,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                     } else {
                         MapFlags::empty()
                     };
-                // Add MAP_JIT to the reserve region so edge pages (which remain
-                // from this mapping after interior pages are replaced by MAP_FIXED)
-                // can use RWX via the hardware JIT toggle. Interior MAP_FIXED pages
-                // replace this mapping entirely and don't inherit MAP_JIT.
-                let native_flags = macos_mmap_flags(linux_flags) | MAP_JIT;
+                // No MAP_JIT — we follow strict W^X. Edge pages use
+                // fault-and-toggle instead (see exception_signal_handler).
+                let native_flags = macos_mmap_flags(linux_flags);
                 let r = unsafe {
                     libc::mmap(
                         suggested_range.start as *mut libc::c_void,
@@ -1259,10 +1301,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 let inner_start = host_page_align_up(suggested_range.start);
                 let inner_end = host_page_align_down(suggested_range.end);
                 let prot = prot_flags(initial_permissions).bits();
-                // Edge host pages use RWX because adjacent 4KB sub-pages from other
-                // VMAs may need different permissions. See update_permissions for rationale.
-                let prot_rwx =
-                    (ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC).bits();
+                // Edge host pages use RW because allocate_pages callers need to
+                // write content (e.g., ELF segment data). If guest later executes
+                // code on an edge page, the fault-and-toggle handler in
+                // exception_signal_handler will flip it to RX on demand.
+                let prot_rw = (ProtFlags::PROT_READ | ProtFlags::PROT_WRITE).bits();
 
                 // Step 1: mmap the 16KB-aligned interior with MAP_FIXED.
                 // This replaces only fully-enclosed host pages with fresh anonymous memory.
@@ -1292,29 +1335,14 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                     }
                 }
 
-                // Step 2: mprotect edge host pages to RWX.
+                // Step 2: mprotect edge host pages to RW (writable).
                 // These already exist (from reserve or prior mapping). mprotect changes
                 // permissions without replacing the underlying page content, so adjacent
-                // 4KB sub-pages' data is preserved. RWX ensures no conflict with
-                // whatever else shares the host page.
+                // 4KB sub-pages' data is preserved.
                 //
-                // IMPORTANT: Edge pages are MAP_JIT pages from the reserve. On macOS,
-                // MAP_JIT pages enforce W^X via a per-thread toggle controlled by
-                // pthread_jit_write_protect_np. The mprotect permission acts as a MASK
-                // intersected with the current JIT toggle state:
-                //   - X mode: effective = mprotect_perms & R-X
-                //   - W mode: effective = mprotect_perms & RW-
-                //
-                // mprotect(RWX) may fail with EPERM if the current JIT toggle state
-                // doesn't allow the requested permissions. Specifically, in W mode,
-                // requesting EXEC via mprotect can be rejected by the kernel.
-                //
-                // Solution: always be in X mode when calling mprotect(RWX) on MAP_JIT
-                // pages (X mode permits the EXEC bit). Then switch to W mode afterward
-                // if the caller needs write access.
-                let needs_write = initial_permissions.contains(MemoryRegionPermissions::WRITE);
-                // Ensure X mode for mprotect(RWX) on MAP_JIT edge pages.
-                jit_exec_mode();
+                // We use RW because allocate_pages callers typically write content
+                // (ELF segment data, anonymous zero-fill). If guest code later executes
+                // on these pages, the fault-and-toggle handler flips them to RX.
                 //
                 // Collect distinct edge host page addresses, then mprotect each once.
                 // Leading edge: the host page containing suggested_range.start
@@ -1331,7 +1359,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                         libc::mprotect(
                             leading_edge_addr as *mut libc::c_void,
                             HOST_PAGE_SIZE,
-                            prot_rwx,
+                            prot_rw,
                         )
                     };
                     assert_eq!(
@@ -1341,6 +1369,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                         leading_edge_addr,
                         std::io::Error::last_os_error()
                     );
+                    register_edge_page(leading_edge_addr);
                 }
 
                 if has_trailing_edge && trailing_edge_addr != leading_edge_addr {
@@ -1348,7 +1377,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                         libc::mprotect(
                             trailing_edge_addr as *mut libc::c_void,
                             HOST_PAGE_SIZE,
-                            prot_rwx,
+                            prot_rw,
                         )
                     };
                     assert_eq!(
@@ -1358,6 +1387,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                         trailing_edge_addr,
                         std::io::Error::last_os_error()
                     );
+                    register_edge_page(trailing_edge_addr);
                 }
 
                 // If range is sub-16KB and both start and end are within a single
@@ -1366,7 +1396,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 // this by mprotecting the enclosing host page directly.
                 if inner_start >= inner_end && !has_leading_edge && has_trailing_edge {
                     let r = unsafe {
-                        libc::mprotect(outer_start as *mut libc::c_void, HOST_PAGE_SIZE, prot_rwx)
+                        libc::mprotect(outer_start as *mut libc::c_void, HOST_PAGE_SIZE, prot_rw)
                     };
                     assert_eq!(
                         r,
@@ -1375,13 +1405,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                         outer_start,
                         std::io::Error::last_os_error()
                     );
-                }
-
-                // Now that mprotect(RWX) is done (in X mode), switch to W mode
-                // if the caller needs to write to these pages. The effective
-                // permission becomes RWX & RW- = RW-.
-                if needs_write {
-                    jit_write_mode();
+                    register_edge_page(outer_start);
                 }
 
                 Ok(UserMutPtr::from_usize(suggested_range.start))
@@ -1495,19 +1519,24 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         // starting in the same 16KB page). Since mprotect operates on whole host
         // pages, we cannot set per-4KB permissions independently.
         //
-        // Strategy:
+        // Strategy (W^X compliant — no RWX):
         // - Interior host pages (fully enclosed): set to exactly the requested permissions.
-        // - Edge host pages (partially covered): set to RWX. This is the union of all
-        //   possible permission needs (read+write for data, read+execute for code) and
-        //   ensures no occupant of the shared host page is denied access. This is safe
-        //   because the guest runs in-process (no security boundary) and the VMA layer
-        //   enforces per-4KB access semantics at a higher level.
+        // - Edge host pages (partially covered): set to RW or RX based on the
+        //   requested permissions. If EXEC is requested, use RX (the dominant need
+        //   is code execution). Otherwise use RW (data access). The fault-and-toggle
+        //   handler in exception_signal_handler will flip permissions on demand if
+        //   the other access type is needed later.
         let outer_start = host_page_align_down(range.start);
         let outer_end = host_page_align_up(range.end);
         let inner_start = host_page_align_up(range.start);
         let inner_end = host_page_align_down(range.end);
         let prot = prot_flags(new_permissions).bits();
-        let prot_rwx = (ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC).bits();
+        // Choose RX or RW for edge pages based on requested permissions.
+        let edge_prot = if new_permissions.contains(MemoryRegionPermissions::EXECUTE) {
+            (ProtFlags::PROT_READ | ProtFlags::PROT_EXEC).bits()
+        } else {
+            (ProtFlags::PROT_READ | ProtFlags::PROT_WRITE).bits()
+        };
 
         // Interior: exact permissions on fully-enclosed host pages.
         if inner_start < inner_end {
@@ -1521,19 +1550,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
             assert_eq!(r, 0, "mprotect failed: {}", std::io::Error::last_os_error());
         }
 
-        // Edge host pages: set to RWX if not fully covered by the interior.
-        // Collect distinct edge page addresses, then mprotect each once.
-        //
-        // On MAP_JIT pages, mprotect(RWX) requires X mode (the kernel rejects
-        // adding EXEC in W mode). Switch to X mode before the edge mprotects.
-        // This is safe because update_permissions is called after the write
-        // callback has finished — no more writes to these pages are pending.
+        // Edge host pages: set to RW or RX (W^X compliant) and register for
+        // fault-and-toggle handling. Collect distinct edge page addresses.
         let has_leading_edge = outer_start < inner_start;
         let has_trailing_edge = inner_end < outer_end;
-        let has_any_edge = has_leading_edge || has_trailing_edge;
-        if has_any_edge {
-            jit_exec_mode();
-        }
         let leading_edge_addr = outer_start;
         let trailing_edge_addr = host_page_align_down(range.end.saturating_sub(1));
 
@@ -1542,7 +1562,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 libc::mprotect(
                     leading_edge_addr as *mut libc::c_void,
                     HOST_PAGE_SIZE,
-                    prot_rwx,
+                    edge_prot,
                 )
             };
             assert_eq!(
@@ -1552,6 +1572,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 leading_edge_addr,
                 std::io::Error::last_os_error()
             );
+            register_edge_page(leading_edge_addr);
         }
 
         if has_trailing_edge && trailing_edge_addr != leading_edge_addr {
@@ -1559,7 +1580,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 libc::mprotect(
                     trailing_edge_addr as *mut libc::c_void,
                     HOST_PAGE_SIZE,
-                    prot_rwx,
+                    edge_prot,
                 )
             };
             assert_eq!(
@@ -1569,6 +1590,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 trailing_edge_addr,
                 std::io::Error::last_os_error()
             );
+            register_edge_page(trailing_edge_addr);
         }
 
         // If range is sub-16KB, starts at a 16KB boundary (no leading edge),
@@ -1576,7 +1598,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         // mprotecting the enclosing host page directly.
         if inner_start >= inner_end && !has_leading_edge && has_trailing_edge {
             let r = unsafe {
-                libc::mprotect(outer_start as *mut libc::c_void, HOST_PAGE_SIZE, prot_rwx)
+                libc::mprotect(outer_start as *mut libc::c_void, HOST_PAGE_SIZE, edge_prot)
             };
             assert_eq!(
                 r,
@@ -1585,6 +1607,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 outer_start,
                 std::io::Error::last_os_error()
             );
+            register_edge_page(outer_start);
         }
 
         Ok(())
@@ -1750,9 +1773,6 @@ unsafe extern "C" {
 }
 
 unsafe extern "C-unwind" fn init_handler(thread_ctx: &mut ThreadContext) {
-    // Switch MAP_JIT pages to W mode — the shim's init path loads ELF segments
-    // which writes to guest memory (including MAP_JIT edge pages).
-    jit_write_mode();
     eprintln!(
         "[diag] init_handler: entering, ctx.pc={:#x}, ctx.sp={:#x}",
         thread_ctx.ctx.pc, thread_ctx.ctx.sp
@@ -1761,8 +1781,6 @@ unsafe extern "C-unwind" fn init_handler(thread_ctx: &mut ThreadContext) {
 }
 
 unsafe extern "C-unwind" fn reenter_handler(thread_ctx: &mut ThreadContext) {
-    // Switch MAP_JIT pages to W mode — host code may write to guest memory.
-    jit_write_mode();
     thread_ctx.call_shim(|shim, ctx| shim.reenter(ctx));
 }
 
@@ -1782,9 +1800,6 @@ unsafe extern "C-unwind" fn reenter_handler(thread_ctx: &mut ThreadContext) {
 /// purposes.
 #[allow(clippy::cast_sign_loss)]
 unsafe extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext) {
-    // Switch MAP_JIT pages to W mode (writable) now that we're back in host code.
-    // This must happen before any writes to MAP_JIT memory (edge pages).
-    jit_write_mode();
     eprintln!(
         "[diag] syscall_handler: entered, ctx.pc={:#x}, ctx.regs[8]={:#x} (syscall nr)",
         thread_ctx.ctx.pc, thread_ctx.ctx.regs[8]
@@ -1798,8 +1813,6 @@ extern "C-unwind" fn exception_handler(
     error: usize,
     cr2: usize,
 ) {
-    // Switch MAP_JIT pages to W mode (writable) now that we're back in host code.
-    jit_write_mode();
     eprintln!(
         "[diag] exception_handler: trapno={}, error={:#x}, cr2={:#x}, ctx.pc={:#x}",
         trapno, error, cr2, thread_ctx.ctx.pc
@@ -1872,8 +1885,6 @@ fn update_host_tls_entry() {
 }
 
 extern "C-unwind" fn interrupt_handler(thread_ctx: &mut ThreadContext) {
-    // Switch MAP_JIT pages to W mode (writable) now that we're back in host code.
-    jit_write_mode();
     thread_ctx.call_shim(|shim, ctx| shim.interrupt(ctx));
 }
 
@@ -1917,10 +1928,6 @@ impl ThreadContext<'_> {
                         ret, check_ss.ss_sp as usize, check_ss.ss_size, check_ss.ss_flags,
                     );
                 }
-                // Switch MAP_JIT pages to X mode (executable) before entering guest.
-                // MUST be before write_tpidr_el0 because pthread_jit_write_protect_np
-                // is a libc call that clobbers TPIDR_EL0 on macOS.
-                jit_exec_mode();
                 // Re-set TPIDR_EL0 as the VERY LAST thing before asm.
                 // macOS clobbers it on every syscall (including eprintln above).
                 let tcb = TCB_PTR.get();
@@ -2477,6 +2484,69 @@ unsafe extern "C" fn exception_signal_handler(
         pos = write_hex(&mut buf, pos, info.si_code as usize);
         pos = write_bytes(&mut buf, pos, b"\n");
         unsafe { libc::write(2, buf.as_ptr() as *const libc::c_void, pos) };
+    }
+
+    // Fault-and-toggle W^X: handle permission faults on edge pages.
+    //
+    // Edge pages are 16KB host pages containing 4KB guest sub-pages with
+    // conflicting permissions. They are set to either RW or RX. When the
+    // "wrong" access type occurs, we toggle the permission and resume.
+    //
+    // This must be checked before signal_handler_exit_guest because:
+    // 1. Host code can fault on edge pages during writes (e.g., ELF loading)
+    // 2. Guest code can fault when executing code on an RW edge page
+    if signum == libc::SIGSEGV || signum == libc::SIGBUS {
+        let sigctx_edge = unsafe { &*context.uc_mcontext };
+        let far = sigctx_edge.__es.__far as usize;
+        let esr = sigctx_edge.__es.__esr as u32;
+        let ec = (esr >> 26) & 0x3F;
+
+        if is_edge_page(far) {
+            let page_addr = host_page_align_down(far);
+            // EC 0x20/0x21 = Instruction Abort → page needs EXEC → flip to RX
+            // EC 0x24/0x25 = Data Abort, check WnR (bit 6) for write → flip to RW
+            let toggled = if ec == 0x20 || ec == 0x21 {
+                // Instruction abort: guest tried to execute, page is currently RW.
+                // Flip to RX.
+                let r = unsafe {
+                    libc::mprotect(
+                        page_addr as *mut libc::c_void,
+                        HOST_PAGE_SIZE,
+                        (ProtFlags::PROT_READ | ProtFlags::PROT_EXEC).bits(),
+                    )
+                };
+                r == 0
+            } else if (ec == 0x24 || ec == 0x25) && (esr & (1 << 6)) != 0 {
+                // Data abort with WnR=1: guest/host tried to write, page is currently RX.
+                // Flip to RW.
+                let r = unsafe {
+                    libc::mprotect(
+                        page_addr as *mut libc::c_void,
+                        HOST_PAGE_SIZE,
+                        (ProtFlags::PROT_READ | ProtFlags::PROT_WRITE).bits(),
+                    )
+                };
+                r == 0
+            } else {
+                false
+            };
+
+            if toggled {
+                // Diagnostic: log the toggle (signal-safe)
+                let mut tbuf = [0u8; 128];
+                let mut tpos = write_bytes(&mut tbuf, 0, b"[diag] edge page toggle: addr=");
+                tpos = write_hex(&mut tbuf, tpos, page_addr);
+                tpos = write_bytes(&mut tbuf, tpos, b" ec=");
+                tpos = write_hex(&mut tbuf, tpos, ec as usize);
+                tpos = write_bytes(&mut tbuf, tpos, b" esr=");
+                tpos = write_hex(&mut tbuf, tpos, esr as usize);
+                tpos = write_bytes(&mut tbuf, tpos, b"\n");
+                unsafe { libc::write(2, tbuf.as_ptr() as *const libc::c_void, tpos) };
+                // Resume the faulting instruction — it will succeed now.
+                return;
+            }
+            // If we couldn't toggle (unexpected EC), fall through to normal handling.
+        }
     }
 
     let Some((regs, host_tls)) = signal_handler_exit_guest(context, false) else {
