@@ -1298,6 +1298,19 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 // 4KB sub-pages' data is preserved. RWX ensures no conflict with
                 // whatever else shares the host page.
                 //
+                // IMPORTANT: Edge pages are MAP_JIT pages from the reserve. On macOS,
+                // MAP_JIT pages enforce W^X via a per-thread toggle controlled by
+                // pthread_jit_write_protect_np. mprotect(RWX) alone does NOT make them
+                // writable — the thread must also be in W mode. If the caller will
+                // write to these pages (initial_permissions includes WRITE), ensure we
+                // are in JIT write mode. During ELF loading (before run_thread), the
+                // thread defaults to X mode, so this is essential.
+                // During guest→host transitions, handlers already call jit_write_mode(),
+                // making this a harmless no-op.
+                if initial_permissions.contains(MemoryRegionPermissions::WRITE) {
+                    jit_write_mode();
+                }
+                //
                 // Collect distinct edge host page addresses, then mprotect each once.
                 // Leading edge: the host page containing suggested_range.start
                 // Trailing edge: the host page containing suggested_range.end - 1
