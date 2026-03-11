@@ -299,12 +299,17 @@ impl From<ElfLoaderError> for litebox_common_linux::errno::Errno {
     fn from(value: ElfLoaderError) -> Self {
         match value {
             ElfLoaderError::OpenError(e) => e,
-            ElfLoaderError::ParseError(e) => e.into(),
+            // Map parse errors to ENOENT rather than ENOEXEC. Returning
+            // ENOEXEC for non-ELF files (e.g. scripts) would cause glibc to
+            // retry execution via /bin/sh, which we don't support.
+            ElfLoaderError::ParseError(_) => litebox_common_linux::errno::Errno::ENOENT,
             ElfLoaderError::InvalidStackAddr | ElfLoaderError::MappingError(_) => {
                 litebox_common_linux::errno::Errno::ENOMEM
             }
             ElfLoaderError::LoadError(e) => e.into(),
-            ElfLoaderError::OutOfRange => litebox_common_linux::errno::Errno::ENOEXEC,
+            // OutOfRange means the binary's load address doesn't fit in the
+            // current VA partition (e.g. non-PIE at 0x400000 in a child slot).
+            ElfLoaderError::OutOfRange => litebox_common_linux::errno::Errno::ENOMEM,
         }
     }
 }

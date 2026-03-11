@@ -218,6 +218,7 @@ impl<FS: ShimFS> LinuxShimBuilder<FS> {
     /// before calling this method.
     pub fn build(self) -> LinuxShim<FS> {
         use litebox::platform::AddressSpaceProvider;
+        use litebox::platform::RawMutex as _;
 
         let mut net = Network::new(&self.litebox);
         net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
@@ -241,6 +242,8 @@ impl<FS: ShimFS> LinuxShimBuilder<FS> {
             fd_paths: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
             main_bss_start: core::sync::atomic::AtomicUsize::new(0),
             main_bss_end: core::sync::atomic::AtomicUsize::new(0),
+            vfork_park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
+            vfork_parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
         });
         let global = Arc::new(GlobalState {
             platform: self.platform,
@@ -602,13 +605,10 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle a potential CoW page fault during vfork.
     ///
-    /// Handle a CoW page fault during the vfork window.
-    ///
     /// Checks the process-wide `active_cow` state (accessible by any thread).
     /// - **Child** (has `fork_context`): snapshot the page, then re-enable write.
-    /// - **Parent thread** (no `fork_context`): log an error if selective CoW
-    ///   (parent should not be writing to protected pages), then re-enable
-    ///   write to avoid a crash.
+    /// - **Parent thread** (no `fork_context`): re-enable write. Other parent
+    ///   threads should be parked; only the forking thread can reach here.
     fn try_handle_cow_fault(
         &self,
         fault_addr: usize,
@@ -667,22 +667,24 @@ impl<FS: ShimFS> Task<FS> {
             // SAFETY: restoring the page's original (writable) permissions.
             unsafe { cow_update_permissions(self.global.platform, page_range, orig_perms) }
         } else {
-            // Parent thread faulting on a CoW-protected page.
+            // Parent thread faulting on a CoW-protected page. This can
+            // happen if the forking thread's shim code touches guest
+            // memory while CoW is active. Other parent threads should be
+            // parked and unable to reach here.
             #[cfg(debug_assertions)]
-            if cow.selective {
-                litebox::log_println!(
-                    self.global.platform,
-                    "cow_fault: parent thread hit selective-CoW page \
-                     addr={:#x} rip={:#x} tid={}",
-                    fault_addr,
-                    fault_rip,
-                    self.tid,
-                );
-            }
+            litebox::log_println!(
+                self.global.platform,
+                "cow_fault: parent thread hit CoW page \
+                 addr={:#x} rip={:#x} tid={}",
+                fault_addr,
+                fault_rip,
+                self.tid,
+            );
             let _ = fault_rip;
-            // Re-enable write without snapshotting. No tracking needed:
-            // dirty_pages only contains child snapshots, and selective CoW
-            // ensures parent threads don't collide with child-protected pages.
+            // Re-enable write without snapshotting — this is the forking
+            // thread's own access; the original data is already preserved
+            // in dirty_pages (eager) or will be snapshotted by the child
+            // (lazy).
             // SAFETY: restoring the page's original (writable) permissions.
             unsafe { cow_update_permissions(self.global.platform, page_range, orig_perms) }
         }
@@ -1551,7 +1553,7 @@ struct ProcessState {
     elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
     /// Maps guest fd numbers to the file path used at open time. Populated by
     /// `sys_open` / `sys_openat`, cleared by `sys_close`. Used by the ELF
-    /// patch cache and selective CoW to identify library data segments.
+    /// patch cache to identify library paths.
     fd_paths:
         litebox::sync::Mutex<Platform, alloc::collections::BTreeMap<i32, alloc::string::String>>,
     /// Page-aligned start of the main binary's `.bss` region (zero-filled
@@ -1560,6 +1562,15 @@ struct ProcessState {
     /// Page-aligned end of the main binary's `.bss` region. Set once during
     /// ELF loading.
     main_bss_end: core::sync::atomic::AtomicUsize,
+    /// Futex for parking threads during vfork. The underlying atomic stores:
+    /// 0 = normal operation, 1 = park requested by the forking thread.
+    /// Other threads check this in `prepare_to_run_guest` and block until
+    /// the value returns to 0.
+    vfork_park: <Platform as litebox::platform::RawMutexProvider>::RawMutex,
+    /// Counter of threads that have parked. The forking thread waits on this
+    /// until the count reaches `thread_count - 1`, confirming all other
+    /// threads are safely stopped before modifying page permissions.
+    vfork_parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex,
 }
 
 /// One-shot synchronization primitive for vfork parent blocking.
@@ -1599,19 +1610,13 @@ impl VforkDone {
 /// Created by the forking thread and stored in both `ProcessState` (for
 /// fault-handler access by any thread) and `ForkContext` (for the child).
 ///
-/// **Selective vs full** (shim decision): Controls which pages are protected.
-/// - Full: all writable pages (single-threaded processes).
-/// - Selective: only stack + libc/ld data segments (multi-threaded).
+/// All other parent threads are parked during the vfork window, so FULL CoW
+/// (all writable pages) is always used regardless of thread count.
 ///
 /// **Eager vs lazy** (platform decision): Controls how pages are snapshotted.
 /// - Eager: all protected pages copied upfront, left writable.
 /// - Lazy: protected pages marked read-only, snapshotted on first fault.
 struct CowState {
-    /// Whether this is selective CoW (multi-threaded). If true, parent
-    /// threads should NOT be writing to protected pages — a fault from a
-    /// parent thread indicates a bug or unexpected behavior.
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
-    selective: bool,
     /// Pages that were CoW-protected (base address, length, original permissions).
     /// For lazy CoW these were made read-only; for eager CoW they were copied.
     protected_ranges: Vec<(

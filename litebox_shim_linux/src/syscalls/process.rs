@@ -99,6 +99,9 @@ pub(crate) struct ThreadRemote {
     /// Always set under the process `inner` lock, but can be read without
     /// locking.
     is_exiting: AtomicBool,
+    /// Set by the forking thread to request this thread to park. The thread
+    /// checks this in `check_for_interrupt` and `prepare_to_run_guest`.
+    is_suspended: AtomicBool,
     /// Handle to interrupt waits on this thread.
     handle: once_cell::race::OnceBox<litebox::event::wait::ThreadHandle<Platform>>,
 }
@@ -107,6 +110,7 @@ impl ThreadRemote {
     fn new() -> Self {
         Self {
             is_exiting: AtomicBool::new(false),
+            is_suspended: AtomicBool::new(false),
             handle: once_cell::race::OnceBox::new(),
         }
     }
@@ -135,6 +139,8 @@ pub(crate) struct ProcessInner {
     group_exit: bool,
     /// If true, one thread is waiting for other threads to exit.
     is_killing_other_threads: bool,
+    /// If true, one thread is performing a vfork and parking siblings.
+    is_forking: bool,
     /// The exit code of the last exited thread in the process. Not updated once
     /// `group_exit` is set.
     exit_status: ExitStatus,
@@ -159,6 +165,7 @@ impl Process {
                 exit_status: ExitStatus::Exit(0),
                 group_exit: false,
                 is_killing_other_threads: false,
+                is_forking: false,
                 threads: BTreeMap::from_iter([(pid, remote)]),
             }),
             limits: ResourceLimits::default(),
@@ -188,7 +195,18 @@ impl Process {
         // Allocate outside the lock.
         let remote = Arc::new(ThreadRemote::new());
         let mut inner = self.inner.lock();
-        if inner.group_exit || inner.is_killing_other_threads {
+        if inner.group_exit || inner.is_killing_other_threads || inner.is_forking {
+            return None;
+        }
+        // Reject attachment while vfork parking is active. `park_other_threads`
+        // sets `is_suspended` under this same lock, so this closes the race
+        // where clone() passed an unlocked park check but attaches after the
+        // parking snapshot.
+        if inner
+            .threads
+            .values()
+            .any(|thread| thread.is_suspended.load(Ordering::Relaxed))
+        {
             return None;
         }
         let old_thread = inner.threads.insert(tid, remote.clone());
@@ -281,6 +299,12 @@ impl<FS: ShimFS> Task<FS> {
         for (&_tid, thread) in &inner.threads {
             thread.interrupt();
         }
+        // Wake threads parked in `park_for_vfork_if_requested` so they
+        // observe `is_exiting` and break out of the park loop.
+        {
+            use litebox::platform::RawMutex as _;
+            self.process_state.borrow().vfork_park.wake_all();
+        }
     }
 
     /// Kills all other threads in the process, waiting for them to exit.
@@ -322,6 +346,12 @@ impl<FS: ShimFS> Task<FS> {
         // Wait for other threads to exit.
         let mut iter = 0u32;
         loop {
+            // If another thread started vfork parking, stop trying to exec
+            // and return to the guest so we can park at prepare_to_run_guest.
+            if self.is_suspended() {
+                self.thread.process.inner.lock().is_killing_other_threads = false;
+                return false;
+            }
             let n = self
                 .thread
                 .process
@@ -351,6 +381,11 @@ impl<FS: ShimFS> Task<FS> {
     /// guest code.
     pub fn is_exiting(&self) -> bool {
         self.thread.remote.is_exiting.load(Ordering::Relaxed)
+    }
+
+    /// Returns true if this thread has been asked to suspend for a vfork.
+    pub fn is_suspended(&self) -> bool {
+        self.thread.remote.is_suspended.load(Ordering::Relaxed)
     }
 }
 
@@ -568,6 +603,14 @@ impl<FS: ShimFS> Task<FS> {
             fc.vfork_done.signal();
         }
 
+        // If this thread was marked as suspended (by park_other_threads) and
+        // is now exiting, wake the vfork_parked_count futex so the forking
+        // thread can recompute the expected count and make progress.
+        if self.is_suspended() {
+            use litebox::platform::RawMutex as _;
+            self.process_state.borrow().vfork_parked_count.wake_all();
+        }
+
         self.thread.detach_from_process();
 
         // If this was the last thread in the process, close all open FDs and
@@ -716,12 +759,20 @@ impl<FS: ShimFS> Task<FS> {
             Errno::EINVAL
         })?;
 
-        let is_exiting = || self.is_exiting();
+        // Treat vfork suspension as an interruption so wait_for_child returns,
+        // allowing prepare_to_run_guest() to park this thread.
+        let is_interrupted = || {
+            use core::sync::atomic::Ordering;
+            let ps = self.process_state.borrow();
+            self.is_exiting()
+                || self.is_suspended()
+                || ps.vfork_park.underlying_atomic().load(Ordering::Acquire) != 0
+        };
         let result = self.global.litebox.process_registry().wait_for_child(
             self.process_id,
             target,
             wait_options,
-            Some(&is_exiting),
+            Some(&is_interrupted),
         );
 
         match result {
@@ -788,12 +839,20 @@ impl<FS: ShimFS> Task<FS> {
             wait_options |= WaitOptions::WNOHANG;
         }
 
-        let is_exiting = || self.is_exiting();
+        // Treat vfork suspension as an interruption so wait_for_child returns,
+        // allowing prepare_to_run_guest() to park this thread.
+        let is_interrupted = || {
+            use core::sync::atomic::Ordering;
+            let ps = self.process_state.borrow();
+            self.is_exiting()
+                || self.is_suspended()
+                || ps.vfork_park.underlying_atomic().load(Ordering::Acquire) != 0
+        };
         let result = self.global.litebox.process_registry().wait_for_child(
             self.process_id,
             target,
             wait_options,
-            Some(&is_exiting),
+            Some(&is_interrupted),
         );
 
         match result {
@@ -935,6 +994,17 @@ impl<FS: ShimFS> Task<FS> {
         // Note `exit_signal` is ignored for threads; validated for fork.
         if exit_signal > MAX_SIGNAL_NUMBER {
             return Err(Errno::EINVAL);
+        }
+
+        // Reject any clone/fork while vfork parking is active (or already
+        // requested for this thread). This prevents concurrent fork/clone
+        // operations from bypassing parking invariants.
+        {
+            let ps = self.process_state.borrow();
+            if self.is_suspended() || ps.vfork_park.underlying_atomic().load(Ordering::Acquire) != 0
+            {
+                return Err(Errno::EAGAIN);
+            }
         }
 
         // Detect fork-like clone: new process (!CLONE_THREAD).
@@ -1205,131 +1275,111 @@ impl<FS: ShimFS> Task<FS> {
             .next_thread_id
             .fetch_max(child_initial_tid + 1, Ordering::Relaxed);
 
-        // Save parent's RSP for selective stack-only restore after vfork.
-        let parent_stack_rsp: usize = ctx.rsp;
-
         // 4. Build per-fork-mode state: vfork (shared with parent) vs
         //    independent (kernel CoW).
-        let (child_process_state, child_files, child_fork_context, vfork_done, cow_state) =
-            if is_shared {
-                // Userland / shared: child temporarily uses parent's ProcessState
-                // (address space). ForkContext records the child's reserved
-                // partition and the synchronization primitive. On exec, the child
-                // will detach (create own ProcessState).
-                //
-                // FD table is duplicated now so the child can safely do dup2/close
-                // between fork and exec without corrupting the parent's FD state.
-                let vfork_done = Arc::new(crate::VforkDone::new(self.wait_cx().waker().clone()));
-                let child_files_state = Arc::new(
-                    self.files
-                        .borrow()
-                        .clone_for_fork(&mut self.global.litebox.descriptor_table_mut()),
-                );
-
-                // Set up CoW protection for fork memory sharing.
-                //
-                // **Selective vs full CoW** (shim decision):
-                // - Single-threaded (thread_count ≤ 1): FULL — protect ALL
-                //   writable pages. The child may run arbitrary code between
-                //   fork and exec (POSIX allows unrestricted behavior for
-                //   single-threaded processes).
-                // - Multi-threaded: SELECTIVE — protect only the parent's
-                //   stack and well-known library data segments. POSIX
-                //   restricts the child to async-signal-safe functions,
-                //   which only touch stack, errno/TLS, and limited libc
-                //   state. Protecting all pages would risk rolling back
-                //   concurrent parent-thread modifications (condvars, heap).
-                //
-                // **Eager vs lazy** (platform decision):
-                // - Eager: copy all protected pages upfront, leave writable.
-                // - Lazy: mark pages read-only, snapshot on first write fault.
-                let is_selective = self
-                    .process_state
+        //
+        // `did_park_threads` tracks whether other threads were parked,
+        // so we know whether to unpark later.
+        let (
+            child_process_state,
+            child_files,
+            child_fork_context,
+            vfork_done,
+            cow_state,
+            did_park_threads,
+        ) = if is_shared {
+            // Userland / shared: child temporarily uses parent's ProcessState
+            // (address space). ForkContext records the child's reserved
+            // partition and the synchronization primitive. On exec, the child
+            // will detach (create own ProcessState).
+            //
+            // FD table is duplicated now so the child can safely do dup2/close
+            // between fork and exec without corrupting the parent's FD state.
+            let vfork_done = Arc::new(crate::VforkDone::new(self.wait_cx().waker().clone()));
+            let child_files_state = Arc::new(
+                self.files
                     .borrow()
-                    .thread_count
-                    .load(core::sync::atomic::Ordering::Relaxed)
-                    > 1;
+                    .clone_for_fork(&mut self.global.litebox.descriptor_table_mut()),
+            );
 
-                let cow_state: Option<Arc<crate::CowState>> = {
-                    let ps = self.process_state.borrow();
-                    let mappings = ps.pm.mappings();
+            // Set up CoW protection for fork memory sharing.
+            //
+            // **Thread parking**: Before protecting pages, park all other
+            // threads in the process so that no concurrent guest execution
+            // can race with the mprotect/snapshot. This makes it safe to
+            // always use FULL CoW regardless of thread count.
+            //
+            // **Full CoW** (always): protect ALL writable pages. Since
+            // other threads are parked, there are no concurrent writes
+            // to worry about.
+            //
+            // **Eager vs lazy** (platform decision):
+            // - Eager: copy all protected pages upfront, leave writable.
+            // - Lazy: mark pages read-only, snapshot on first write fault.
+            // Park all other threads before modifying page permissions.
+            // Returns Ok(true) if threads were parked and need to be
+            // unparked later, Ok(false) if no other threads exist, or
+            // Err if another thread is already forking.
+            let Ok(did_park) = self.park_other_threads() else {
+                return Err(Errno::EAGAIN);
+            };
 
-                    // Get the main binary's .bss page range. This is the
-                    // zero-filled portion of the writable PT_LOAD segment and
-                    // contains copy-relocated glibc symbols (e.g., __environ)
-                    // that the child's fork wrapper may modify.
-                    let bss_start = ps
-                        .main_bss_start
-                        .load(core::sync::atomic::Ordering::Relaxed);
-                    let bss_end = ps.main_bss_end.load(core::sync::atomic::Ordering::Relaxed);
+            let cow_state: Option<Arc<crate::CowState>> = {
+                let ps = self.process_state.borrow();
+                let mappings = ps.pm.mappings();
+                drop(ps);
 
-                    drop(ps);
+                let mut eager_dirty = alloc::vec::Vec::<(usize, alloc::vec::Vec<u8>)>::new();
+                let mut protected = alloc::vec::Vec::new();
 
-                    let mut eager_dirty = alloc::vec::Vec::<(usize, alloc::vec::Vec<u8>)>::new();
-                    let mut protected = alloc::vec::Vec::new();
+                for (range, flags) in &mappings {
+                    if !flags.contains(VmFlags::VM_WRITE) {
+                        continue;
+                    }
 
-                    for (range, flags) in &mappings {
-                        if !flags.contains(VmFlags::VM_WRITE) {
-                            continue;
-                        }
-
-                        // Selective CoW: protect the parent's stack and the main
-                        // binary's .bss region. Skip everything else (V8 heap,
-                        // anonymous mmaps, libc data, etc.) to avoid rolling back
-                        // legitimate parent-thread writes.
-                        if is_selective {
-                            let is_parent_stack =
-                                range.start <= parent_stack_rsp && parent_stack_rsp < range.end;
-                            let is_main_bss = bss_end > bss_start
-                                && range.start >= bss_start
-                                && range.start < bss_end;
-                            if !is_parent_stack && !is_main_bss {
-                                continue;
+                    if <crate::Platform as AddressSpaceProvider>::EAGER_COW_FOR_VFORK {
+                        // Eagerly snapshot pages and leave them writable.
+                        for page_addr in (range.start..range.end).step_by(PAGE_SIZE) {
+                            let mut buf = alloc::vec![0u8; PAGE_SIZE];
+                            // SAFETY: pages are committed; all other threads
+                            // are parked so content is stable.
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    page_addr as *const u8,
+                                    buf.as_mut_ptr(),
+                                    PAGE_SIZE,
+                                );
                             }
+                            eager_dirty.push((page_addr, buf));
                         }
+                    } else {
+                        // Lazy CoW: mark writable pages read-only and
+                        // snapshot individual pages on first write fault.
+                        use litebox::platform::page_mgmt::MemoryRegionPermissions;
 
-                        if <crate::Platform as AddressSpaceProvider>::EAGER_COW_FOR_VFORK {
-                            // Eagerly snapshot pages and leave them writable.
-                            for page_addr in (range.start..range.end).step_by(PAGE_SIZE) {
-                                let mut buf = alloc::vec![0u8; PAGE_SIZE];
-                                // SAFETY: pages are committed; child not yet
-                                // spawned so content is stable.
-                                unsafe {
-                                    core::ptr::copy_nonoverlapping(
-                                        page_addr as *const u8,
-                                        buf.as_mut_ptr(),
-                                        PAGE_SIZE,
-                                    );
-                                }
-                                eager_dirty.push((page_addr, buf));
+                        let len = range.end - range.start;
+                        let orig_perms = {
+                            let mut p = MemoryRegionPermissions::READ;
+                            if flags.contains(VmFlags::VM_EXEC) {
+                                p |= MemoryRegionPermissions::EXEC;
                             }
-                        } else {
-                            // Lazy CoW: mark writable pages read-only and
-                            // snapshot individual pages on first write fault.
-                            use litebox::platform::page_mgmt::MemoryRegionPermissions;
-
-                            let len = range.end - range.start;
-                            let orig_perms = {
-                                let mut p = MemoryRegionPermissions::READ;
-                                if flags.contains(VmFlags::VM_EXEC) {
-                                    p |= MemoryRegionPermissions::EXEC;
-                                }
-                                p | MemoryRegionPermissions::WRITE
-                            };
-                            let ro_perms = orig_perms & !MemoryRegionPermissions::WRITE;
-                            // SAFETY: pages are mapped; child not yet spawned.
-                            let ok = unsafe {
-                                <crate::Platform as PageManagementProvider<PAGE_SIZE>>::update_permissions(
+                            p | MemoryRegionPermissions::WRITE
+                        };
+                        let ro_perms = orig_perms & !MemoryRegionPermissions::WRITE;
+                        // SAFETY: pages are mapped; all other threads are
+                        // parked so no concurrent writes.
+                        let ok = unsafe {
+                            <crate::Platform as PageManagementProvider<PAGE_SIZE>>::update_permissions(
                                     self.global.platform,
                                     range.start..range.end,
                                     ro_perms,
                                 )
                                 .is_ok()
-                            };
-                            if !ok {
-                                for &(base, len, perms) in &protected {
-                                    unsafe {
-                                        <crate::Platform as PageManagementProvider<
+                        };
+                        if !ok {
+                            for &(base, len, perms) in &protected {
+                                unsafe {
+                                    <crate::Platform as PageManagementProvider<
                                             PAGE_SIZE,
                                         >>::update_permissions(
                                             self.global.platform,
@@ -1337,67 +1387,74 @@ impl<FS: ShimFS> Task<FS> {
                                             perms,
                                         )
                                         .expect("CoW setup rollback: failed to restore permissions");
-                                    }
                                 }
-                                return Err(Errno::ENOMEM);
                             }
-                            protected.push((range.start, len, orig_perms));
+                            if did_park {
+                                self.unpark_other_threads();
+                            }
+                            return Err(Errno::ENOMEM);
                         }
+                        protected.push((range.start, len, orig_perms));
                     }
-                    let cow = Arc::new(crate::CowState {
-                        selective: is_selective,
-                        protected_ranges: protected,
-                        dirty_pages: litebox::sync::Mutex::new(eager_dirty),
-                    });
-                    // Store CoW state in ProcessState so all threads (and the
-                    // fault handler) can access it.
-                    *self.process_state.borrow().active_cow.lock() = Some(cow.clone());
-                    Some(cow)
-                };
-
-                let fc = crate::ForkContext {
-                    address_space_id: child_as_id,
-                    vfork_done: vfork_done.clone(),
-                };
-                (
-                    self.process_state.clone(),                  // share parent's PM
-                    core::cell::RefCell::new(child_files_state), // independent FD table
-                    Some(fc),
-                    Some(vfork_done),
-                    cow_state,
-                )
-            } else {
-                // Kernel / independent: child has its own CoW address space from
-                // the platform. Create an independent ProcessState and duplicate
-                // the FD table now (not deferred to exec).
-                let child_range = self
-                    .global
-                    .platform
-                    .address_space_range(child_as_id)
-                    .expect("child address space must be valid");
-                let child_ps = Arc::new(crate::ProcessState {
-                    pm: litebox::mm::PageManager::new(&self.global.litebox, child_range),
-                    address_space_id: child_as_id,
-                    thread_count: core::sync::atomic::AtomicI32::new(1),
-                    active_cow: litebox::sync::Mutex::new(None),
-                    elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
-                    fd_paths: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
-                    main_bss_start: core::sync::atomic::AtomicUsize::new(0),
-                    main_bss_end: core::sync::atomic::AtomicUsize::new(0),
+                }
+                let cow = Arc::new(crate::CowState {
+                    protected_ranges: protected,
+                    dirty_pages: litebox::sync::Mutex::new(eager_dirty),
                 });
-                let child_files_state = Arc::new(
-                    self.files
-                        .borrow()
-                        .clone_for_fork(&mut self.global.litebox.descriptor_table_mut()),
-                );
-                (
-                    core::cell::RefCell::new(child_ps),          // own ProcessState
-                    core::cell::RefCell::new(child_files_state), // own FD table
-                    None,                                        // no ForkContext
-                    None,                                        // no vfork sync
-                    None,                                        // no CoW state
-                )
+                // Store CoW state in ProcessState so all threads (and the
+                // fault handler) can access it.
+                *self.process_state.borrow().active_cow.lock() = Some(cow.clone());
+                Some(cow)
             };
+
+            let fc = crate::ForkContext {
+                address_space_id: child_as_id,
+                vfork_done: vfork_done.clone(),
+            };
+            (
+                self.process_state.clone(),                  // share parent's PM
+                core::cell::RefCell::new(child_files_state), // independent FD table
+                Some(fc),
+                Some(vfork_done),
+                cow_state,
+                did_park,
+            )
+        } else {
+            // Kernel / independent: child has its own CoW address space from
+            // the platform. Create an independent ProcessState and duplicate
+            // the FD table now (not deferred to exec).
+            let child_range = self
+                .global
+                .platform
+                .address_space_range(child_as_id)
+                .expect("child address space must be valid");
+            let child_ps = Arc::new(crate::ProcessState {
+                pm: litebox::mm::PageManager::new(&self.global.litebox, child_range),
+                address_space_id: child_as_id,
+                thread_count: core::sync::atomic::AtomicI32::new(1),
+                active_cow: litebox::sync::Mutex::new(None),
+                elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+                fd_paths: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+                main_bss_start: core::sync::atomic::AtomicUsize::new(0),
+                main_bss_end: core::sync::atomic::AtomicUsize::new(0),
+                vfork_park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
+                vfork_parked_count:
+                    <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
+            });
+            let child_files_state = Arc::new(
+                self.files
+                    .borrow()
+                    .clone_for_fork(&mut self.global.litebox.descriptor_table_mut()),
+            );
+            (
+                core::cell::RefCell::new(child_ps),          // own ProcessState
+                core::cell::RefCell::new(child_files_state), // own FD table
+                None,                                        // no ForkContext
+                None,                                        // no vfork sync
+                None,                                        // no CoW state
+                false,                                       // no thread parking
+            )
+        };
 
         // 5a. Create the child Task.
         // The child needs the parent's guest TLS (fsbase). On a new host
@@ -1469,6 +1526,9 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 *self.process_state.borrow().active_cow.lock() = None;
             }
+            if did_park_threads {
+                self.unpark_other_threads();
+            }
             return Err(Errno::ENOMEM);
         }
 
@@ -1484,8 +1544,8 @@ impl<FS: ShimFS> Task<FS> {
             // Restore pages modified by the child and clear CoW state.
             //
             // With lazy CoW, `dirty_pages` contains only child-first-write
-            // snapshots — restore all unconditionally. Parent threads never
-            // add to dirty_pages, and selective CoW ensures no page collision.
+            // snapshots — restore all unconditionally. All other parent
+            // threads are parked, so no concurrent writes can interfere.
             //
             // With eager CoW, `dirty_pages` are upfront copies of all
             // protected pages. Compare and restore only those that changed.
@@ -1527,6 +1587,11 @@ impl<FS: ShimFS> Task<FS> {
                 // Clear the process-wide CoW state.
                 *self.process_state.borrow().active_cow.lock() = None;
             }
+
+            // Unpark other threads now that CoW is fully restored.
+            if did_park_threads {
+                self.unpark_other_threads();
+            }
         }
 
         // Parent returns child's PID.
@@ -1542,6 +1607,156 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `gettid`.
     pub(crate) fn sys_gettid(&self) -> i32 {
         self.tid
+    }
+
+    /// Parks all threads in this process except the calling thread.
+    ///
+    /// Following the `exit_group` pattern: set per-thread `is_suspended`
+    /// flag, then interrupt all threads so they break out of waits and
+    /// reach the park check in `prepare_to_run_guest`. Waits until all
+    /// have confirmed they are parked (via `vfork_parked_count`).
+    ///
+    /// Returns:
+    /// - `Ok(true)` if threads were parked (and must be unparked later).
+    /// - `Ok(false)` if there were no other threads to park.
+    /// - `Err(())` if another thread is already forking (caller should
+    ///   return EAGAIN).
+    fn park_other_threads(&self) -> Result<bool, ()> {
+        use litebox::platform::RawMutex as _;
+
+        let ps = self.process_state.borrow();
+
+        // Determine the expected count from the authoritative thread map
+        // under the process lock. This avoids using the separate
+        // ProcessState::thread_count which may not be decremented on exit.
+        let expected;
+        {
+            let mut inner = self.thread.process.inner.lock();
+
+            // Prevent two threads from simultaneously entering park.
+            // The first thread to acquire the lock sets is_forking; the
+            // second sees it and bails out, returning false so the caller
+            // gets EAGAIN and retries after the first fork completes.
+            if inner.is_forking {
+                return Err(());
+            }
+
+            expected = u32::try_from(
+                inner
+                    .threads
+                    .len()
+                    .checked_sub(1)
+                    .expect("calling thread must be in the map"),
+            )
+            .expect("thread count must fit in u32");
+            if expected == 0 {
+                return Ok(false);
+            }
+
+            inner.is_forking = true;
+
+            // Set per-thread is_suspended flag under the lock.
+            for (&tid, thread) in &inner.threads {
+                if tid != self.tid {
+                    thread.is_suspended.store(true, Ordering::Relaxed);
+                }
+            }
+
+            // Set the process-wide park futex AFTER the per-thread flags.
+            // This ensures that a thread loading vfork_park with Acquire
+            // also observes the is_suspended store (Release pairs with
+            // the Acquire load in park_for_vfork_if_requested).
+            ps.vfork_park
+                .underlying_atomic()
+                .store(1, Ordering::Release);
+
+            // Wake threads blocked in raw futex waits (e.g., wait_for_child)
+            // so they see is_suspended when they re-check.
+            self.global
+                .litebox
+                .process_registry()
+                .notify_waiters(self.process_id);
+            for (&tid, thread) in &inner.threads {
+                if tid != self.tid {
+                    thread.interrupt();
+                }
+            }
+        }
+
+        // Wait until all other threads have parked.
+        //
+        // Recompute the expected count each iteration. A sibling may exit
+        // after the initial snapshot (without parking), which shrinks the
+        // thread map and therefore the required parked count.
+        loop {
+            let n = ps
+                .vfork_parked_count
+                .underlying_atomic()
+                .load(Ordering::Acquire);
+            let expected_now = {
+                let inner = self.thread.process.inner.lock();
+                u32::try_from(
+                    inner
+                        .threads
+                        .len()
+                        .checked_sub(1)
+                        .expect("calling thread must be in the map"),
+                )
+                .expect("thread count must fit in u32")
+            };
+            if n >= expected_now {
+                break;
+            }
+            // Wake potential raw waiters (waitpid / kill_other_threads) again
+            // so they can observe suspension and return to park.
+            self.global
+                .litebox
+                .process_registry()
+                .notify_waiters(self.process_id);
+            self.thread.process.nr_threads.wake_all();
+            let _ = ps.vfork_parked_count.block(n);
+        }
+        Ok(true)
+    }
+
+    /// Unparks all threads that were parked by [`park_other_threads`].
+    ///
+    /// Clears per-thread `is_suspended` flags and the process-wide park
+    /// futex, then wakes all parked threads and waits for them to confirm
+    /// they have resumed.
+    fn unpark_other_threads(&self) {
+        use litebox::platform::RawMutex as _;
+
+        let ps = self.process_state.borrow();
+
+        // Clear per-thread is_suspended flags and the is_forking guard.
+        {
+            let mut inner = self.thread.process.inner.lock();
+            for (&tid, thread) in &inner.threads {
+                if tid != self.tid {
+                    thread.is_suspended.store(false, Ordering::Relaxed);
+                }
+            }
+            inner.is_forking = false;
+        }
+
+        // Clear the process-wide park futex and wake all parked threads.
+        ps.vfork_park
+            .underlying_atomic()
+            .store(0, Ordering::Release);
+        ps.vfork_park.wake_all();
+
+        // Wait for all threads to acknowledge the unpark (count drops to 0).
+        loop {
+            let n = ps
+                .vfork_parked_count
+                .underlying_atomic()
+                .load(Ordering::Acquire);
+            if n == 0 {
+                break;
+            }
+            let _ = ps.vfork_parked_count.block(n);
+        }
     }
 }
 
@@ -2219,17 +2434,18 @@ impl<FS: ShimFS> Task<FS> {
             copy_vector(envp, "envp")?
         };
 
-        let loader = match crate::loader::elf::ElfLoader::new(self, path) {
-            Ok(l) => l,
-            Err(_e) => {
-                return Err(Errno::ENOENT);
-            }
-        };
+        let loader = crate::loader::elf::ElfLoader::new(self, path).map_err(Errno::from)?;
 
         // After this point, the old program is torn down and failures must terminate the process.
 
         // Kill all the other threads in this process and wait for them to exit.
         if !self.kill_other_threads() {
+            // If we were suspended for vfork parking, report EINTR so callers
+            // can retry. Otherwise preserve existing EBUSY behavior for
+            // concurrent exec/exit races.
+            if self.is_suspended() {
+                return Err(Errno::EINTR);
+            }
             // Another thread is already in the process of execve. This thread
             // will exit; return any error code.
             return Err(Errno::EBUSY);
@@ -2256,6 +2472,9 @@ impl<FS: ShimFS> Task<FS> {
                 fd_paths: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
                 main_bss_start: core::sync::atomic::AtomicUsize::new(0),
                 main_bss_end: core::sync::atomic::AtomicUsize::new(0),
+                vfork_park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
+                vfork_parked_count:
+                    <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
             });
             self.process_state.replace(child_ps);
 

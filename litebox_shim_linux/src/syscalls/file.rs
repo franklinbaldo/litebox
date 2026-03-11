@@ -236,7 +236,7 @@ impl<FS: ShimFS> Task<FS> {
             .insert(self, Descriptor::LiteBoxRawFd(raw_fd))
             .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))?;
 
-        // Record fd → path for ELF patch cache and selective CoW.
+        // Record fd → path for ELF patch cache.
         if let Ok(s) = path.to_str() {
             self.process_state
                 .borrow()
@@ -387,7 +387,10 @@ impl<FS: ShimFS> Task<FS> {
                                 && pollable.should_block_read()
                             {
                                 loop {
-                                    if self.is_exiting() {
+                                    // vfork parking needs blocked host-side loops
+                                    // to break out so prepare_to_run_guest() can
+                                    // park the thread.
+                                    if self.is_exiting() || self.is_suspended() {
                                         return Err(Errno::EINTR);
                                     }
                                     let events = pollable.check_io_events();

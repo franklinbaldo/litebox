@@ -722,9 +722,8 @@ impl<FS: ShimFS> Task<FS> {
     ///
     /// CoW-aware: if a vfork child adds WRITE permission to CoW-protected
     /// pages, snapshot them first so the parent's original content can be
-    /// restored after the child execs or exits. Parent threads just pass
-    /// through — selective CoW ensures protected pages don't overlap with
-    /// pages parent threads write to.
+    /// restored after the child execs or exits. Other parent threads are
+    /// parked during the vfork window and cannot reach here.
     pub(crate) fn sys_mprotect(
         &self,
         addr: crate::MutPtr<u8>,
