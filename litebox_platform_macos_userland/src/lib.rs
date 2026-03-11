@@ -2088,6 +2088,23 @@ fn set_signal_return(
     sigctx.__ss.__x[9] = host_tls as u64;
 }
 
+/// Translate a macOS signal number to the equivalent Linux signal number.
+///
+/// The shim's `handle_exception_request` matches against Linux signal numbers.
+/// Most exception signals have the same number on both platforms, but SIGBUS
+/// differs: macOS=10, Linux=7.
+fn macos_signal_to_linux(signum: libc::c_int) -> libc::c_int {
+    // Linux signal numbers for reference:
+    //   SIGILL=4, SIGTRAP=5, SIGBUS=7, SIGFPE=8, SIGSEGV=11
+    match signum {
+        libc::SIGBUS => 7,  // macOS SIGBUS=10 → Linux SIGBUS=7
+        libc::SIGILL => 4,  // same on both
+        libc::SIGTRAP => 5, // same on both
+        libc::SIGFPE => 8,  // same on both
+        _ => 11,            // SIGSEGV and unknown → Linux SIGSEGV=11
+    }
+}
+
 /// Signal handler for hardware exceptions (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP).
 unsafe extern "C" fn exception_signal_handler(
     signum: libc::c_int,
@@ -2127,10 +2144,16 @@ unsafe extern "C" fn exception_signal_handler(
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let (trapno, err, cr2) = {
         let fault_addr = sigctx.__es.__far;
+        // Translate macOS signal number to Linux equivalent before passing
+        // to the shim. The shim's handle_exception_request matches against
+        // Linux signal numbers (SIGBUS=7, SIGFPE=8, SIGILL=4, SIGTRAP=5,
+        // SIGSEGV=11). Most are the same on both platforms, but SIGBUS
+        // differs: macOS=10, Linux=7.
+        let linux_signum = macos_signal_to_linux(signum);
         (
-            signum as isize,     // use signal number as trap number
-            0isize,              // no error code concept on ARM64
-            fault_addr as isize, // fault address
+            linux_signum as isize, // Linux signal number as trap number
+            0isize,                // no error code concept on ARM64
+            fault_addr as isize,   // fault address
         )
     };
     set_signal_return(context, exception_callback, host_tls, 0, trapno, err, cr2);
