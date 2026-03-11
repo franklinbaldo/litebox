@@ -1194,6 +1194,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         _populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
+        eprintln!(
+            "[diag] allocate_pages: range={:#x}..{:#x} perms={:?} behavior={:?}",
+            suggested_range.start, suggested_range.end, initial_permissions, fixed_address_behavior
+        );
         // macOS arm64 requires 16KB-aligned addresses for all VM operations.
         // For Hint, pass the address as-is; the kernel picks a properly aligned one.
         //
@@ -1364,6 +1368,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         &self,
         range: core::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
+        eprintln!(
+            "[diag] deallocate_pages: range={:#x}..{:#x}",
+            range.start, range.end
+        );
         // Round inward to HOST_PAGE_SIZE boundaries to avoid unmapping adjacent
         // 4KB sub-pages that belong to other VMAs within the same 16KB host page.
         // Sub-16KB edge portions are left mapped (as PROT_NONE from the original
@@ -1451,6 +1459,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         range: core::ops::Range<usize>,
         new_permissions: MemoryRegionPermissions,
     ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
+        eprintln!(
+            "[diag] update_permissions: range={:#x}..{:#x} perms={:?}",
+            range.start, range.end, new_permissions
+        );
         // macOS arm64 16KB page handling for mprotect:
         //
         // Multiple 4KB VMAs with different permission requirements may share the
