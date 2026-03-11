@@ -1456,9 +1456,16 @@ unsafe extern "C" fn exception_signal_handler(
     let uc = unsafe { &*(context as *const libc::ucontext_t) };
     let rip = uc.uc_mcontext.mc_rip as usize;
 
-    // Check if the signal has a pending next handler (for signals we share
-    // with the application). This would be rare for FreeBSD but handle it
-    // for correctness.
+    // Before checking TLS state (which may not be initialized), check the
+    // exception table for fallible memory access recovery. This handles the
+    // case where host code (e.g. read_u8_fallible) triggers a SIGSEGV.
+    if _sig == libc::SIGSEGV {
+        if let Some(fixup) = litebox::mm::exception_table::search_exception_tables(rip) {
+            let uc_mut = unsafe { &mut *(context as *mut libc::ucontext_t) };
+            uc_mut.uc_mcontext.mc_rip = fixup as i64;
+            return;
+        }
+    }
 
     // If we are in host code (not in guest), just record the signal and return.
     let in_guest: u8;
@@ -1484,17 +1491,6 @@ unsafe extern "C" fn exception_signal_handler(
             }
             set_signal_return(context, interrupt_callback, 0, 0, 0, 0);
             return;
-        }
-        // Host-side SIGSEGV: check the exception table for fallible memory
-        // access recovery (e.g. read_u8_fallible). If we find a fixup address,
-        // redirect RIP to it so the fallible read returns an error instead of
-        // crashing.
-        if _sig == libc::SIGSEGV {
-            if let Some(fixup) = litebox::mm::exception_table::search_exception_tables(rip) {
-                let uc_mut = unsafe { &mut *(context as *mut libc::ucontext_t) };
-                uc_mut.uc_mcontext.mc_rip = fixup as i64;
-                return;
-            }
         }
         // True host exception - this is a bug. Let the default handler deal with it.
         return;
