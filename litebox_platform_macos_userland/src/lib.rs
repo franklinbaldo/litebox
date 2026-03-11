@@ -2053,17 +2053,19 @@ impl ThreadContext<'_> {
                 // tcb.guest_tpidr which update_host_tls_entry just synced.
                 //
                 // Trampoline layout from SIGRETURN_TRAMPOLINE_ADDR (offset 16):
-                //   base+48  .. base+104  = shared SVC handler (x18 = MRS result)
-                //   base+104 .. base+168  = shared MSR handler (x16 = MRS result)
+                //   base+48  .. base+120  = shared SVC handler (x18 = MRS result)
+                //   base+120 .. base+184  = shared MSR handler (x16 = MRS result)
+                // (Must match SHARED_SVC_HANDLER_OFFSET/SIZE and
+                //  SHARED_MSR_HANDLER_OFFSET/SIZE in litebox_syscall_rewriter.)
                 {
                     let sigret_addr = litebox_common_linux::SIGRETURN_TRAMPOLINE_ADDR
                         .load(core::sync::atomic::Ordering::Acquire);
                     if sigret_addr != 0 {
                         let trampoline_base = sigret_addr - 16;
                         let svc_handler_start = trampoline_base + 48;
-                        let svc_handler_end = trampoline_base + 104;
-                        let msr_handler_start = trampoline_base + 104;
-                        let msr_handler_end = trampoline_base + 168;
+                        let svc_handler_end = trampoline_base + 120;
+                        let msr_handler_start = trampoline_base + 120;
+                        let msr_handler_end = trampoline_base + 184;
                         let pc = self.ctx.pc;
                         let guest_tpidr = get_guest_tpidr();
 

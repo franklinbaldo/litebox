@@ -26,30 +26,37 @@ const MSR_TPIDR_EL0_BITS: u32 = 0xD51B_D040;
 // Shared trampoline layout constants
 // ============================================================
 
-/// Number of instructions in the shared SVC handler (14 insns, 56 bytes).
+/// Number of instructions in the shared SVC handler (18 insns, 72 bytes).
 ///
 /// Uses linear scan to find TLS entry matching guest TPIDR.
+/// On macOS, TPIDR_EL0 may be clobbered by the kernel on signal delivery,
+/// causing the scan to hit the sentinel without finding a match. The fallback
+/// path loads entry\[0\]'s host_tls and guest_tpidr as a best-effort recovery.
 ///
 /// ```text
-///  [0]  MRS  X18, TPIDR_EL0       ; get guest TPIDR
+///  [0]  MRS  X18, TPIDR_EL0       ; get guest TPIDR (may be clobbered)
 ///  [1]  STR  X18, [SP, #24]       ; save guest TPIDR
 ///  [2]  LDR  X17, [PC, #off]      ; X17 = TLS table base
 ///  [3]  LDR  X16, [X17, #0]       ; .Lloop: X16 = entry.guest_tpidr
 ///  [4]  CMN  X16, #1              ; sentinel?
-///  [5]  B.EQ .Ldone               ; -> [11]
+///  [5]  B.EQ .Lfallback           ; -> [12]
 ///  [6]  CMP  X16, X18             ; match guest TPIDR?
 ///  [7]  B.EQ .Lfound              ; -> [10]
 ///  [8]  ADD  X17, X17, #16        ; next entry
 ///  [9]  B    .Lloop               ; -> [3]
 /// [10]  LDR  X18, [X17, #8]       ; .Lfound: X18 = host TLS
-/// [11]  LDR  X16, [PC, #off]      ; .Ldone: callback addr
-/// [12]  BR   X16                  ; jump to callback
-/// [13]  NOP                       ; padding for alignment
+/// [11]  B    .Ldone               ; -> [16]
+/// [12]  LDR  X17, [PC, #off]      ; .Lfallback: reload TLS table base
+/// [13]  LDR  X16, [X17, #0]       ; X16 = entry[0].guest_tpidr
+/// [14]  STR  X16, [SP, #24]       ; fix guest_tpidr on stack
+/// [15]  LDR  X18, [X17, #8]       ; X18 = entry[0].host_tls (fallback)
+/// [16]  LDR  X16, [PC, #off]      ; .Ldone: callback addr
+/// [17]  BR   X16                  ; jump to callback
 /// ```
-const SHARED_SVC_HANDLER_INSN_COUNT: usize = 14;
+const SHARED_SVC_HANDLER_INSN_COUNT: usize = 18;
 
 /// Size in bytes of the shared SVC handler.
-const SHARED_SVC_HANDLER_SIZE: usize = SHARED_SVC_HANDLER_INSN_COUNT * 4; // 56
+const SHARED_SVC_HANDLER_SIZE: usize = SHARED_SVC_HANDLER_INSN_COUNT * 4; // 72
 
 /// Number of instructions in each per-site SVC gate (6 insns, 24 bytes).
 ///
@@ -138,10 +145,10 @@ const SIGRETURN_GATE_OFFSET: usize = 24;
 const SHARED_SVC_HANDLER_OFFSET: usize = SIGRETURN_GATE_OFFSET + SVC_GATE_SIZE; // 48
 
 /// Offset where the shared MSR handler begins.
-const SHARED_MSR_HANDLER_OFFSET: usize = SHARED_SVC_HANDLER_OFFSET + SHARED_SVC_HANDLER_SIZE; // 104
+const SHARED_MSR_HANDLER_OFFSET: usize = SHARED_SVC_HANDLER_OFFSET + SHARED_SVC_HANDLER_SIZE; // 120
 
 /// Offset where per-site gates begin (after shared MSR handler).
-const GATES_START_OFFSET: usize = SHARED_MSR_HANDLER_OFFSET + SHARED_MSR_HANDLER_SIZE; // 168
+const GATES_START_OFFSET: usize = SHARED_MSR_HANDLER_OFFSET + SHARED_MSR_HANDLER_SIZE; // 184
 
 // ============================================================
 // Instruction encoders
@@ -613,9 +620,9 @@ fn find_patch_sites(sections: &[TextSectionInfo], buf: &[u8]) -> Result<Vec<Patc
 /// Offset 8:     [8 bytes]   TLS lookup table pointer
 /// Offset 16:    [8 bytes]   Sigreturn preamble (MOV X8, #139 + B .+4)
 /// Offset 24:    [24 bytes]  Sigreturn SVC gate
-/// Offset 48:    [56 bytes]  Shared SVC handler
-/// Offset 104:   [64 bytes]  Shared MSR handler
-/// Offset 168:   Per-site SVC gates (24 bytes each)
+/// Offset 48:    [72 bytes]  Shared SVC handler (with sentinel fallback)
+/// Offset 120:   [64 bytes]  Shared MSR handler
+/// Offset 184:   Per-site SVC gates (24 bytes each)
 ///               Per-site MSR gates (36-40 bytes each)
 /// ```
 pub(crate) fn hook_syscalls_aarch64(
@@ -666,7 +673,7 @@ pub(crate) fn hook_syscalls_aarch64(
 
         debug_assert_eq!(trampoline_data.len(), SHARED_SVC_HANDLER_OFFSET);
 
-        // Offset 48: shared SVC handler (56 bytes)
+        // Offset 48: shared SVC handler (72 bytes)
         emit_shared_svc_handler(
             &mut trampoline_data,
             SHARED_SVC_HANDLER_OFFSET,
@@ -675,7 +682,7 @@ pub(crate) fn hook_syscalls_aarch64(
 
         debug_assert_eq!(trampoline_data.len(), SHARED_MSR_HANDLER_OFFSET);
 
-        // Offset 104: shared MSR handler (64 bytes)
+        // Offset 120: shared MSR handler (64 bytes)
         emit_shared_msr_handler(
             &mut trampoline_data,
             SHARED_MSR_HANDLER_OFFSET,
@@ -721,7 +728,7 @@ pub(crate) fn hook_syscalls_aarch64(
 
     debug_assert_eq!(trampoline_data.len(), SHARED_SVC_HANDLER_OFFSET);
 
-    // Offset 48: shared SVC handler (56 bytes)
+    // Offset 48: shared SVC handler (72 bytes)
     emit_shared_svc_handler(
         &mut trampoline_data,
         SHARED_SVC_HANDLER_OFFSET,
@@ -730,7 +737,7 @@ pub(crate) fn hook_syscalls_aarch64(
 
     debug_assert_eq!(trampoline_data.len(), SHARED_MSR_HANDLER_OFFSET);
 
-    // Offset 104: shared MSR handler (64 bytes)
+    // Offset 120: shared MSR handler (64 bytes)
     emit_shared_msr_handler(
         &mut trampoline_data,
         SHARED_MSR_HANDLER_OFFSET,
@@ -843,15 +850,15 @@ fn emit_shared_svc_handler(
     trampoline_data.extend_from_slice(&encode_cmn_imm(16, 1).expect("imm12=1 fits").to_le_bytes());
     insn_idx += 1;
 
-    // [5] B.EQ .Ldone -> [11]
-    let done_idx = 11usize;
-    let beq_done_offset = (done_idx as i64 - insn_idx as i64) * 4;
-    let beq_done = encode_b_cond(COND_EQ, beq_done_offset).ok_or_else(|| {
+    // [5] B.EQ .Lfallback -> [12]
+    let fallback_idx = 12usize;
+    let beq_fallback_offset = (fallback_idx as i64 - insn_idx as i64) * 4;
+    let beq_fallback = encode_b_cond(COND_EQ, beq_fallback_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
-            "B.EQ offset {beq_done_offset:#x} out of range in shared SVC handler"
+            "B.EQ offset {beq_fallback_offset:#x} out of range in shared SVC handler"
         ))
     })?;
-    trampoline_data.extend_from_slice(&beq_done.to_le_bytes());
+    trampoline_data.extend_from_slice(&beq_fallback.to_le_bytes());
     insn_idx += 1;
 
     // [6] CMP X16, X18 — match guest TPIDR?
@@ -896,7 +903,60 @@ fn emit_shared_svc_handler(
     );
     insn_idx += 1;
 
-    // [11] .Ldone: LDR X16, [PC, #offset_to_callback]
+    // [11] B .Ldone -> [16]
+    let done_idx = 16usize;
+    let b_done_offset = (done_idx as i64 - insn_idx as i64) * 4;
+    let b_done = encode_b(b_done_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "B offset {b_done_offset:#x} out of range in shared SVC handler done"
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&b_done.to_le_bytes());
+    insn_idx += 1;
+
+    // [12] .Lfallback: LDR X17, [PC, #offset] — reload TLS table base
+    //
+    // On macOS, TPIDR_EL0 is clobbered by every kernel transition (signal
+    // delivery, sigreturn, etc.), so the MRS at [0] may return a stale pthread
+    // value instead of the guest TPIDR. When no table entry matches, we fall
+    // back to entry[0] — correct for single-thread, best-effort for multi.
+    debug_assert_eq!(insn_idx, fallback_idx);
+    let fallback_ldr_vaddr = insn_vaddr(insn_idx);
+    let fallback_ldr_offset = tls_table_vaddr.cast_signed() - fallback_ldr_vaddr.cast_signed();
+    let fallback_ldr_insn =
+        encode_ldr_literal(17, fallback_ldr_offset).ok_or_else(|| {
+            Error::DisassemblyFailure(format!(
+                "LDR literal offset {fallback_ldr_offset:#x} out of range for SVC handler fallback TLS load"
+            ))
+        })?;
+    trampoline_data.extend_from_slice(&fallback_ldr_insn.to_le_bytes());
+    insn_idx += 1;
+
+    // [13] LDR X16, [X17, #0] — X16 = entry[0].guest_tpidr
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(16, 17, 0)
+            .expect("offset 0 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [14] STR X16, [SP, #24] — fix guest_tpidr on stack (replace clobbered value)
+    trampoline_data.extend_from_slice(
+        &encode_str_imm_unsigned(16, 31, 24)
+            .expect("offset 24 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [15] LDR X18, [X17, #8] — X18 = entry[0].host_tls (fallback)
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(18, 17, 8)
+            .expect("offset 8 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [16] .Ldone: LDR X16, [PC, #offset_to_callback]
     debug_assert_eq!(insn_idx, done_idx);
     let ldr_cb_vaddr = insn_vaddr(insn_idx);
     let callback_vaddr = trampoline_base_addr + HEADER_CALLBACK_OFFSET as u64;
@@ -909,12 +969,8 @@ fn emit_shared_svc_handler(
     trampoline_data.extend_from_slice(&ldr_cb_insn.to_le_bytes());
     insn_idx += 1;
 
-    // [12] BR X16
+    // [17] BR X16
     trampoline_data.extend_from_slice(&encode_br(16).to_le_bytes());
-    insn_idx += 1;
-
-    // [13] NOP — padding for alignment
-    trampoline_data.extend_from_slice(&NOP.to_le_bytes());
     insn_idx += 1;
 
     debug_assert_eq!(insn_idx, SHARED_SVC_HANDLER_INSN_COUNT);
@@ -1815,9 +1871,9 @@ mod tests {
 
     #[test]
     fn test_snippet_size_constant() {
-        // Shared SVC handler: 14 instructions, 56 bytes (linear scan)
-        assert_eq!(SHARED_SVC_HANDLER_SIZE, 56);
-        assert_eq!(SHARED_SVC_HANDLER_INSN_COUNT, 14);
+        // Shared SVC handler: 18 instructions, 72 bytes (linear scan + fallback)
+        assert_eq!(SHARED_SVC_HANDLER_SIZE, 72);
+        assert_eq!(SHARED_SVC_HANDLER_INSN_COUNT, 18);
         // Per-site SVC gate: 6 instructions, 24 bytes
         assert_eq!(SVC_GATE_SIZE, 24);
         assert_eq!(SVC_GATE_INSN_COUNT, 6);
@@ -1894,8 +1950,8 @@ mod tests {
         let b_offset = handler_vaddr as i64 - b_vaddr as i64;
         assert_eq!(gate_insn_at(5), encode_b(b_offset).unwrap());
 
-        // === Shared SVC handler at SHARED_SVC_HANDLER_OFFSET (14 instructions) ===
-        // Linear scan TLS lookup
+        // === Shared SVC handler at SHARED_SVC_HANDLER_OFFSET (18 instructions) ===
+        // Linear scan TLS lookup with sentinel fallback
         let handler_start = SHARED_SVC_HANDLER_OFFSET;
         let handler_vaddr = trampoline_base + handler_start as u64;
 
@@ -1930,8 +1986,8 @@ mod tests {
         // [4] CMN X16, #1 -- sentinel?
         assert_eq!(handler_insn_at(4), encode_cmn_imm(16, 1).unwrap());
 
-        // [5] B.EQ .Ldone -> [11]: offset = (11-5)*4 = 24
-        assert_eq!(handler_insn_at(5), encode_b_cond(COND_EQ, 24).unwrap());
+        // [5] B.EQ .Lfallback -> [12]: offset = (12-5)*4 = 28
+        assert_eq!(handler_insn_at(5), encode_b_cond(COND_EQ, 28).unwrap());
 
         // [6] CMP X16, X18 -- match?
         assert_eq!(handler_insn_at(6), encode_cmp_reg(16, 18));
@@ -1951,19 +2007,45 @@ mod tests {
             encode_ldr_imm_unsigned(18, 17, 8).unwrap()
         );
 
-        // [11] .Ldone: LDR X16, [PC, #offset_to_callback]
-        let ldr_cb_vaddr = handler_vaddr + 11 * 4;
+        // [11] B .Ldone -> [16]: offset = (16-11)*4 = 20
+        assert_eq!(handler_insn_at(11), encode_b(20).unwrap());
+
+        // [12] .Lfallback: LDR X17, [PC, #offset] -- reload TLS table base
+        let fallback_ldr_vaddr = handler_vaddr + 12 * 4;
+        let fallback_offset = (trampoline_base + 8) as i64 - fallback_ldr_vaddr as i64;
+        assert_eq!(
+            handler_insn_at(12),
+            encode_ldr_literal(17, fallback_offset).unwrap()
+        );
+
+        // [13] LDR X16, [X17, #0] -- entry[0].guest_tpidr
+        assert_eq!(
+            handler_insn_at(13),
+            encode_ldr_imm_unsigned(16, 17, 0).unwrap()
+        );
+
+        // [14] STR X16, [SP, #24] -- fix guest_tpidr on stack
+        assert_eq!(
+            handler_insn_at(14),
+            encode_str_imm_unsigned(16, 31, 24).unwrap()
+        );
+
+        // [15] LDR X18, [X17, #8] -- entry[0].host_tls (fallback)
+        assert_eq!(
+            handler_insn_at(15),
+            encode_ldr_imm_unsigned(18, 17, 8).unwrap()
+        );
+
+        // [16] .Ldone: LDR X16, [PC, #offset_to_callback]
+        let ldr_cb_vaddr = handler_vaddr + 16 * 4;
         let cb_offset = trampoline_base as i64 - ldr_cb_vaddr as i64;
         assert_eq!(
-            handler_insn_at(11),
+            handler_insn_at(16),
             encode_ldr_literal(16, cb_offset).unwrap()
         );
 
-        // [12] BR X16
-        assert_eq!(handler_insn_at(12), encode_br(16));
-
-        // [13] NOP (padding)
-        assert_eq!(handler_insn_at(13), NOP);
+        // [17] BR X16
+        assert_eq!(handler_insn_at(17), encode_br(16));
     }
 
     // ============================================================
@@ -2012,7 +2094,7 @@ mod tests {
         let sigreturn_b = u32::from_le_bytes(trampoline_data[20..24].try_into().unwrap());
         assert_eq!(sigreturn_b, encode_b(4).unwrap());
 
-        // Total: GATES_START_OFFSET (168) + 1 SVC gate (24) = 192
+        // Total: GATES_START_OFFSET (184) + 1 SVC gate (24) = 208
         assert_eq!(trampoline_data.len(), GATES_START_OFFSET + SVC_GATE_SIZE);
 
         // Verify the original SVC was patched with a B instruction
@@ -2043,7 +2125,7 @@ mod tests {
         let result = hook_syscalls_aarch64(&mut buf, &sections, 0x2000, 0);
         let (trampoline_data, has_svc) = result.expect("should succeed with minimal trampoline");
         assert!(!has_svc, "should report no SVC found");
-        // Minimal trampoline: header(16) + sigret preamble(8) + sigret gate(24) + shared SVC(56) + shared MSR(64) = 168
+        // Minimal trampoline: header(16) + sigret preamble(8) + sigret gate(24) + shared SVC(72) + shared MSR(64) = 184
         assert_eq!(
             trampoline_data.len(),
             GATES_START_OFFSET,
@@ -2074,7 +2156,7 @@ mod tests {
 
         assert!(found);
 
-        // GATES_START_OFFSET (168) + 2 * SVC_GATE_SIZE (24) = 216
+        // GATES_START_OFFSET (184) + 2 * SVC_GATE_SIZE (24) = 232
         assert_eq!(
             trampoline_data.len(),
             GATES_START_OFFSET + 2 * SVC_GATE_SIZE
@@ -2230,10 +2312,10 @@ mod tests {
         );
 
         // Offset 24: sigreturn SVC gate (24 bytes)
-        // Offset 48: shared SVC handler (56 bytes)
-        // Offset 104: shared MSR handler (64 bytes)
-        // Offset 168: per-site gates start
-        // Total: GATES_START_OFFSET + SVC_GATE_SIZE = 192
+        // Offset 48: shared SVC handler (72 bytes)
+        // Offset 120: shared MSR handler (64 bytes)
+        // Offset 184: per-site gates start
+        // Total: GATES_START_OFFSET + SVC_GATE_SIZE = 208
         assert_eq!(td.len(), GATES_START_OFFSET + SVC_GATE_SIZE);
     }
 
@@ -2253,17 +2335,17 @@ mod tests {
         let (td, _) = hook_syscalls_aarch64(&mut buf, &sections, 0x2000, 0).unwrap();
 
         // Read instructions from the shared SVC handler at SHARED_SVC_HANDLER_OFFSET
-        // Linear scan: loop is at [3], done at [11], found at [10]
+        // Linear scan: loop at [3], found at [10], fallback at [12], done at [16]
         let insn_at = |idx: usize| -> u32 {
             let off = SHARED_SVC_HANDLER_OFFSET + idx * 4;
             u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
         };
 
-        // [5] B.EQ .Ldone -> [11]: offset = (11-5)*4 = 24
-        let beq_done = insn_at(5);
-        let imm19 = (beq_done >> 5) & 0x7_FFFF;
-        assert_eq!(imm19, 6); // 24/4 = 6
-        assert_eq!(beq_done & 0xF, 0); // cond = EQ
+        // [5] B.EQ .Lfallback -> [12]: offset = (12-5)*4 = 28
+        let beq_fallback = insn_at(5);
+        let imm19 = (beq_fallback >> 5) & 0x7_FFFF;
+        assert_eq!(imm19, 7); // 28/4 = 7
+        assert_eq!(beq_fallback & 0xF, 0); // cond = EQ
 
         // [7] B.EQ .Lfound -> [10]: offset = (10-7)*4 = 12
         let beq_found = insn_at(7);
@@ -2308,7 +2390,7 @@ mod tests {
     #[test]
     fn test_hook_svc_and_msr_trampoline_sizes() {
         let (td, _, _) = hook_with_svc_and_msr(19);
-        // GATES_START_OFFSET (168) + SVC gate (24) + MSR gate for X19 (36) = 228
+        // GATES_START_OFFSET (184) + SVC gate (24) + MSR gate for X19 (36) = 244
         assert_eq!(td.len(), GATES_START_OFFSET + SVC_GATE_SIZE + MSR_GATE_SIZE);
     }
 
