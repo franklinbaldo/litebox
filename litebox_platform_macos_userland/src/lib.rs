@@ -2055,8 +2055,10 @@ impl ThreadContext<'_> {
                 // Trampoline layout from SIGRETURN_TRAMPOLINE_ADDR (offset 16):
                 //   base+48  .. base+120  = shared SVC handler (x18 = MRS result)
                 //   base+120 .. base+184  = shared MSR handler (x16 = MRS result)
-                // (Must match SHARED_SVC_HANDLER_OFFSET/SIZE and
-                //  SHARED_MSR_HANDLER_OFFSET/SIZE in litebox_syscall_rewriter.)
+                //   base+184 .. base+244  = shared MRS read handler (x16 = MRS result)
+                // (Must match SHARED_SVC_HANDLER_OFFSET/SIZE,
+                //  SHARED_MSR_HANDLER_OFFSET/SIZE, and
+                //  SHARED_MRS_READ_HANDLER_OFFSET/SIZE in litebox_syscall_rewriter.)
                 {
                     let sigret_addr = litebox_common_linux::SIGRETURN_TRAMPOLINE_ADDR
                         .load(core::sync::atomic::Ordering::Acquire);
@@ -2066,6 +2068,8 @@ impl ThreadContext<'_> {
                         let svc_handler_end = trampoline_base + 120;
                         let msr_handler_start = trampoline_base + 120;
                         let msr_handler_end = trampoline_base + 184;
+                        let mrs_read_handler_start = trampoline_base + 184;
+                        let mrs_read_handler_end = trampoline_base + 244;
                         let pc = self.ctx.pc;
                         let guest_tpidr = get_guest_tpidr();
 
@@ -2080,6 +2084,13 @@ impl ThreadContext<'_> {
                             // MSR handler: x16 holds MRS TPIDR_EL0 result at [1]
                             eprintln!(
                                 "[diag] call_shim: fixing x16 in MSR handler: {:#x} -> {:#x} (pc={:#x})",
+                                self.ctx.regs[16], guest_tpidr, pc
+                            );
+                            self.ctx.regs[16] = guest_tpidr;
+                        } else if pc >= mrs_read_handler_start && pc < mrs_read_handler_end {
+                            // MRS read handler: x16 holds MRS TPIDR_EL0 result at [1]
+                            eprintln!(
+                                "[diag] call_shim: fixing x16 in MRS read handler: {:#x} -> {:#x} (pc={:#x})",
                                 self.ctx.regs[16], guest_tpidr, pc
                             );
                             self.ctx.regs[16] = guest_tpidr;
