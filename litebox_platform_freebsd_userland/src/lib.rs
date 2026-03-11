@@ -999,9 +999,18 @@ impl litebox::platform::DebugLogProvider for FreeBSDUserland {
 // Raw pointers
 // ---------------------------------------------------------------------------
 
+type UserMutPtr<T> = litebox::platform::common_providers::userspace_pointers::UserMutPtr<
+    litebox::platform::common_providers::userspace_pointers::NoValidation,
+    T,
+>;
+type UserConstPtr<T> = litebox::platform::common_providers::userspace_pointers::UserConstPtr<
+    litebox::platform::common_providers::userspace_pointers::NoValidation,
+    T,
+>;
+
 impl litebox::platform::RawPointerProvider for FreeBSDUserland {
-    type RawConstPointer<T: FromBytes> = litebox::platform::trivial_providers::TransparentConstPtr<T>;
-    type RawMutPointer<T: FromBytes + IntoBytes> = litebox::platform::trivial_providers::TransparentMutPtr<T>;
+    type RawConstPointer<T: FromBytes> = UserConstPtr<T>;
+    type RawMutPointer<T: FromBytes + IntoBytes> = UserMutPtr<T>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1111,7 +1120,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Fr
         }
         .expect("mmap failed");
 
-        Ok(litebox::platform::trivial_providers::TransparentMutPtr::from_usize(ptr))
+        Ok(UserMutPtr::from_usize(ptr))
     }
 
     unsafe fn deallocate_pages(
