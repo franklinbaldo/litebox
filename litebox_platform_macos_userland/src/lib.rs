@@ -1842,6 +1842,24 @@ fn update_host_tls_entry() {
     let sentinel: u64 = 0xFFFFFFFFFFFFFFFF;
     let table = table_addr as *mut u64;
 
+    // Diagnostic: dump first few TLS table entries to see what's there.
+    {
+        let max_dump = 4usize;
+        for i in 0..max_dump {
+            let e = unsafe { table.add(i * 2) };
+            let gt = unsafe { e.read_volatile() };
+            if gt == sentinel {
+                eprintln!("[diag] tls_table[{}]: sentinel", i);
+                break;
+            }
+            let ht = unsafe { e.add(1).read_volatile() };
+            eprintln!(
+                "[diag] tls_table[{}]: guest_tpidr={:#x} host_tls={:#x}",
+                i, gt, ht
+            );
+        }
+    }
+
     for index in 0..TLS_TABLE_ENTRIES {
         let entry = unsafe { table.add(index * 2) };
         let stored_guest_tpidr = unsafe { entry.read_volatile() };
