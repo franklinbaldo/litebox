@@ -2743,6 +2743,30 @@ unsafe extern "C" fn exception_signal_handler(
         }
     }
 
+    // Dump instructions around the crash PC for disassembly.
+    {
+        let mctx = unsafe { &*context.uc_mcontext };
+        let crash_pc = mctx.__ss.__pc as usize;
+        // Dump 4 instructions before + the faulting instruction + 3 after (8 total).
+        let start = crash_pc.wrapping_sub(16);
+        let mut dbuf = [0u8; 256];
+        let mut dpos = write_bytes(&mut dbuf, 0, b"[diag] insn dump at pc=");
+        dpos = write_hex(&mut dbuf, dpos, crash_pc);
+        dpos = write_bytes(&mut dbuf, dpos, b" (start=");
+        dpos = write_hex(&mut dbuf, dpos, start);
+        dpos = write_bytes(&mut dbuf, dpos, b"):");
+        for i in 0..8u64 {
+            let addr = start.wrapping_add(i as usize * 4);
+            // Read the 4-byte instruction (might fault if unmapped, but
+            // crash PC should be readable code).
+            let insn = unsafe { core::ptr::read_volatile(addr as *const u32) };
+            dpos = write_bytes(&mut dbuf, dpos, b" ");
+            dpos = write_hex(&mut dbuf, dpos, insn as usize);
+        }
+        dpos = write_bytes(&mut dbuf, dpos, b"\n");
+        unsafe { libc::write(2, dbuf.as_ptr() as *const libc::c_void, dpos) };
+    }
+
     // Ensure that `run_thread_arch` is linked in so that `exception_callback` is visible.
     let _ = run_thread_arch as *const () as usize;
 
