@@ -143,6 +143,54 @@ fn is_edge_page(addr: usize) -> bool {
     false
 }
 
+/// Ensure an edge host page exists with the given permissions.
+///
+/// Tries `mprotect` first to preserve existing content from adjacent
+/// sub-pages. If that fails with ENOMEM (page was unmapped by a prior
+/// `deallocate_pages` that rounded inward), falls back to `mmap MAP_FIXED`
+/// to recreate the page as fresh anonymous memory.
+fn ensure_edge_page(page_addr: usize, prot: libc::c_int) {
+    debug_assert_eq!(page_addr % HOST_PAGE_SIZE, 0);
+
+    let r = unsafe { libc::mprotect(page_addr as *mut libc::c_void, HOST_PAGE_SIZE, prot) };
+    if r == 0 {
+        return; // mprotect succeeded — page existed, content preserved
+    }
+
+    // mprotect failed — page was unmapped. Recreate with mmap MAP_FIXED.
+    let errno = std::io::Error::last_os_error();
+    assert_eq!(
+        errno.raw_os_error(),
+        Some(libc::ENOMEM),
+        "mprotect edge page {:#x} failed with unexpected error: {}",
+        page_addr,
+        errno
+    );
+    let r = unsafe {
+        libc::mmap(
+            page_addr as *mut libc::c_void,
+            HOST_PAGE_SIZE,
+            prot,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(
+        r,
+        libc::MAP_FAILED,
+        "mmap MAP_FIXED edge page {:#x} failed: {}",
+        page_addr,
+        std::io::Error::last_os_error()
+    );
+}
+
+/// Ensure an edge host page exists with RW permissions.
+fn ensure_edge_page_rw(page_addr: usize) {
+    let prot_rw = (ProtFlags::PROT_READ | ProtFlags::PROT_WRITE).bits();
+    ensure_edge_page(page_addr, prot_rw);
+}
+
 /// The macOS userland platform.
 ///
 /// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
@@ -1305,7 +1353,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 // write content (e.g., ELF segment data). If guest later executes
                 // code on an edge page, the fault-and-toggle handler in
                 // exception_signal_handler will flip it to RX on demand.
-                let prot_rw = (ProtFlags::PROT_READ | ProtFlags::PROT_WRITE).bits();
 
                 // Step 1: mmap the 16KB-aligned interior with MAP_FIXED.
                 // This replaces only fully-enclosed host pages with fresh anonymous memory.
@@ -1335,16 +1382,16 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                     }
                 }
 
-                // Step 2: mprotect edge host pages to RW (writable).
-                // These already exist (from reserve or prior mapping). mprotect changes
-                // permissions without replacing the underlying page content, so adjacent
-                // 4KB sub-pages' data is preserved.
+                // Step 2: Ensure edge host pages exist with RW permissions.
+                // Edge pages may still exist from the reserve or prior mapping, or
+                // may have been unmapped by a prior deallocate_pages (which rounds
+                // inward to 16KB). ensure_edge_page_rw handles both cases.
                 //
                 // We use RW because allocate_pages callers typically write content
                 // (ELF segment data, anonymous zero-fill). If guest code later executes
                 // on these pages, the fault-and-toggle handler flips them to RX.
                 //
-                // Collect distinct edge host page addresses, then mprotect each once.
+                // Collect distinct edge host page addresses, then handle each once.
                 // Leading edge: the host page containing suggested_range.start
                 // Trailing edge: the host page containing suggested_range.end - 1
                 // (only if different from leading edge)
@@ -1355,56 +1402,21 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                     host_page_align_down(suggested_range.end.saturating_sub(1));
 
                 if has_leading_edge {
-                    let r = unsafe {
-                        libc::mprotect(
-                            leading_edge_addr as *mut libc::c_void,
-                            HOST_PAGE_SIZE,
-                            prot_rw,
-                        )
-                    };
-                    assert_eq!(
-                        r,
-                        0,
-                        "mprotect edge page {:#x} failed: {}",
-                        leading_edge_addr,
-                        std::io::Error::last_os_error()
-                    );
+                    ensure_edge_page_rw(leading_edge_addr);
                     register_edge_page(leading_edge_addr);
                 }
 
                 if has_trailing_edge && trailing_edge_addr != leading_edge_addr {
-                    let r = unsafe {
-                        libc::mprotect(
-                            trailing_edge_addr as *mut libc::c_void,
-                            HOST_PAGE_SIZE,
-                            prot_rw,
-                        )
-                    };
-                    assert_eq!(
-                        r,
-                        0,
-                        "mprotect edge page {:#x} failed: {}",
-                        trailing_edge_addr,
-                        std::io::Error::last_os_error()
-                    );
+                    ensure_edge_page_rw(trailing_edge_addr);
                     register_edge_page(trailing_edge_addr);
                 }
 
                 // If range is sub-16KB and both start and end are within a single
                 // host page with the start already 16KB-aligned (no leading edge),
-                // the interior is empty and no edge was mprotected above. Handle
-                // this by mprotecting the enclosing host page directly.
+                // the interior is empty and no edge was handled above. Handle
+                // this by ensuring the enclosing host page directly.
                 if inner_start >= inner_end && !has_leading_edge && has_trailing_edge {
-                    let r = unsafe {
-                        libc::mprotect(outer_start as *mut libc::c_void, HOST_PAGE_SIZE, prot_rw)
-                    };
-                    assert_eq!(
-                        r,
-                        0,
-                        "mprotect aligned sub-page {:#x} failed: {}",
-                        outer_start,
-                        std::io::Error::last_os_error()
-                    );
+                    ensure_edge_page_rw(outer_start);
                     register_edge_page(outer_start);
                 }
 
@@ -1558,55 +1570,20 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         let trailing_edge_addr = host_page_align_down(range.end.saturating_sub(1));
 
         if has_leading_edge {
-            let r = unsafe {
-                libc::mprotect(
-                    leading_edge_addr as *mut libc::c_void,
-                    HOST_PAGE_SIZE,
-                    edge_prot,
-                )
-            };
-            assert_eq!(
-                r,
-                0,
-                "mprotect edge {:#x} failed: {}",
-                leading_edge_addr,
-                std::io::Error::last_os_error()
-            );
+            ensure_edge_page(leading_edge_addr, edge_prot);
             register_edge_page(leading_edge_addr);
         }
 
         if has_trailing_edge && trailing_edge_addr != leading_edge_addr {
-            let r = unsafe {
-                libc::mprotect(
-                    trailing_edge_addr as *mut libc::c_void,
-                    HOST_PAGE_SIZE,
-                    edge_prot,
-                )
-            };
-            assert_eq!(
-                r,
-                0,
-                "mprotect edge {:#x} failed: {}",
-                trailing_edge_addr,
-                std::io::Error::last_os_error()
-            );
+            ensure_edge_page(trailing_edge_addr, edge_prot);
             register_edge_page(trailing_edge_addr);
         }
 
         // If range is sub-16KB, starts at a 16KB boundary (no leading edge),
         // and the interior is empty, no mprotect has fired yet. Handle by
-        // mprotecting the enclosing host page directly.
+        // ensuring the enclosing host page directly.
         if inner_start >= inner_end && !has_leading_edge && has_trailing_edge {
-            let r = unsafe {
-                libc::mprotect(outer_start as *mut libc::c_void, HOST_PAGE_SIZE, edge_prot)
-            };
-            assert_eq!(
-                r,
-                0,
-                "mprotect aligned sub-page {:#x} failed: {}",
-                outer_start,
-                std::io::Error::last_os_error()
-            );
+            ensure_edge_page(outer_start, edge_prot);
             register_edge_page(outer_start);
         }
 
