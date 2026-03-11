@@ -2408,6 +2408,8 @@ unsafe extern "C" fn exception_signal_handler(
     let sigctx_pre = unsafe { &*context.uc_mcontext };
     let pc_pre = sigctx_pre.__ss.__pc as usize;
     let far_pre = sigctx_pre.__es.__far as usize;
+    let sp_pre = sigctx_pre.__ss.__sp as usize;
+    let lr_pre = sigctx_pre.__ss.__lr as usize;
     // Use write(2) directly to avoid allocator reentrancy issues in signal handler.
     // eprintln! may allocate and is not async-signal-safe.
     let mut buf = [0u8; 256];
@@ -2419,6 +2421,17 @@ unsafe extern "C" fn exception_signal_handler(
         far_pre,
     );
     unsafe { libc::write(2, buf.as_ptr() as *const libc::c_void, n) };
+    // Log additional context: sp, lr, si_code
+    {
+        let mut pos = write_bytes(&mut buf, 0, b"[diag]   sp=");
+        pos = write_hex(&mut buf, pos, sp_pre);
+        pos = write_bytes(&mut buf, pos, b" lr=");
+        pos = write_hex(&mut buf, pos, lr_pre);
+        pos = write_bytes(&mut buf, pos, b" si_code=");
+        pos = write_hex(&mut buf, pos, info.si_code as usize);
+        pos = write_bytes(&mut buf, pos, b"\n");
+        unsafe { libc::write(2, buf.as_ptr() as *const libc::c_void, pos) };
+    }
 
     let Some((regs, host_tls)) = signal_handler_exit_guest(context, false) else {
         let n2 = format_buf(

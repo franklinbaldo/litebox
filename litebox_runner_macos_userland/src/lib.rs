@@ -250,7 +250,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
+    eprintln!("[diag] runner: about to call load_program");
     let program = shim.load_program(platform.init_task(), prog_path, argv, envp)?;
+    eprintln!("[diag] runner: load_program returned OK, about to call run_thread");
 
     unsafe {
         litebox_platform_macos_userland::run_thread(
