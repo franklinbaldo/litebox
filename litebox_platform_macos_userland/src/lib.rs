@@ -1897,8 +1897,10 @@ impl ThreadContext<'_> {
         match op {
             ContinueOperation::Resume => {
                 eprintln!(
-                    "[diag] call_shim: Resume, about to update_host_tls_entry. ctx.pc={:#x}, ctx.sp={:#x}",
-                    self.ctx.pc, self.ctx.sp
+                    "[diag] call_shim: Resume, ctx_ptr={:#x}, ctx.pc={:#x}, ctx.sp={:#x}",
+                    core::ptr::from_ref(self.ctx) as usize,
+                    self.ctx.pc,
+                    self.ctx.sp
                 );
                 update_host_tls_entry();
                 eprintln!(
@@ -2328,11 +2330,17 @@ fn signal_handler_exit_guest(
             return None;
         }
 
-        // Restore host TPIDR_EL0.
-        // NOTE: We read current TPIDR_EL0 first (before restoring host value)
-        // so we can save the guest TPIDR below if needed.
-        let current_tpidr: usize;
-        core::arch::asm!("mrs {}, tpidr_el0", out(reg) current_tpidr, options(nostack, nomem));
+        // Restore host TPIDR_EL0 so that subsequent Rust code and TLS accesses
+        // work correctly (though note any subsequent libc call will clobber it
+        // again on macOS).
+        //
+        // On macOS, we do NOT read TPIDR_EL0 to save the guest TPIDR because
+        // the kernel already clobbered it to the pthread value on signal
+        // delivery (and any mprotect/sigaltstack/write syscalls in the signal
+        // handler clobber it further). The correct guest TPIDR is already in
+        // `tcb.guest_tpidr`, set by the last `switch_to_guest` or
+        // `syscall_callback`. Unlike Linux (where the kernel preserves
+        // TPIDR_EL0 for signal handlers), macOS makes it unreliable here.
         litebox_common_linux::write_tpidr_el0(host_tls);
 
         // Read and clear in_guest.
@@ -2350,8 +2358,6 @@ fn signal_handler_exit_guest(
             pos = write_hex(&mut buf, pos, host_tls);
             pos = write_bytes(&mut buf, pos, b", was_in_guest=");
             pos = write_hex(&mut buf, pos, was_in_guest as usize);
-            pos = write_bytes(&mut buf, pos, b", current_tpidr=");
-            pos = write_hex(&mut buf, pos, current_tpidr);
             pos = write_bytes(&mut buf, pos, b"\n");
             libc::write(2, buf.as_ptr() as *const libc::c_void, pos);
         }
@@ -2365,14 +2371,15 @@ fn signal_handler_exit_guest(
             return None;
         }
 
-        // Save the guest TPIDR_EL0 to the host-side `guest_tpidr` TLS variable.
-        // This ensures that when `update_host_tls_entry` is later called (e.g.
-        // from `call_shim` on Resume after an interrupt), it reads the correct
-        // current guest TPIDR and can find the matching entry in the TLS lookup
-        // table. Only do this when we were in guest code (was_in_guest != 0),
-        // because otherwise current_tpidr is already the host TLS value.
-        let guest_tpidr_ptr = (host_tls as *mut usize).byte_offset(tcb_offset_guest_tpidr());
-        core::ptr::write_volatile(guest_tpidr_ptr, current_tpidr);
+        // NOTE: On macOS we do NOT update guest_tpidr here. The kernel
+        // clobbers TPIDR_EL0 to the pthread value on signal delivery, so
+        // `mrs tpidr_el0` would give the wrong value. The correct guest
+        // TPIDR is already in `tcb.guest_tpidr` from the last
+        // `switch_to_guest` (which loaded it from guest_tpidr) or from
+        // `syscall_callback` (which saved it from the trampoline stack
+        // slot). On Linux, the kernel preserves TPIDR_EL0 in signal
+        // handlers so the original code reads it here — but on macOS
+        // that's broken.
 
         let ctx_top_ptr = (host_tls as *const usize).byte_offset(tcb_offset_guest_context_top());
         let guest_context_top =
@@ -2544,7 +2551,35 @@ unsafe extern "C" fn exception_signal_handler(
                 // e.g. during ELF loading), just return directly — host code
                 // doesn't use TPIDR_EL0 for guest TLS.
                 if let Some((regs, host_tls)) = signal_handler_exit_guest(context, false) {
+                    // Diagnostic: log ucontext PC before copy and regs PC after
+                    {
+                        let uctx_pc = unsafe { (*context.uc_mcontext).__ss.__pc } as usize;
+                        let regs_pc_before = unsafe { (*regs).pc };
+                        let mut dbuf = [0u8; 256];
+                        let mut dpos = write_bytes(&mut dbuf, 0, b"[diag] toggle copy: uctx_pc=");
+                        dpos = write_hex(&mut dbuf, dpos, uctx_pc);
+                        dpos = write_bytes(&mut dbuf, dpos, b" regs_pc_before=");
+                        dpos = write_hex(&mut dbuf, dpos, regs_pc_before);
+                        dpos = write_bytes(&mut dbuf, dpos, b" regs_ptr=");
+                        dpos = write_hex(&mut dbuf, dpos, regs as usize);
+                        dpos = write_bytes(&mut dbuf, dpos, b"\n");
+                        unsafe { libc::write(2, dbuf.as_ptr() as *const libc::c_void, dpos) };
+                    }
+
                     copy_signal_context(unsafe { &mut *regs }, context);
+
+                    // Diagnostic: verify copy result
+                    {
+                        let regs_pc_after = unsafe { (*regs).pc };
+                        let regs_sp_after = unsafe { (*regs).sp };
+                        let mut dbuf = [0u8; 256];
+                        let mut dpos = write_bytes(&mut dbuf, 0, b"[diag] toggle copy done: pc=");
+                        dpos = write_hex(&mut dbuf, dpos, regs_pc_after);
+                        dpos = write_bytes(&mut dbuf, dpos, b" sp=");
+                        dpos = write_hex(&mut dbuf, dpos, regs_sp_after);
+                        dpos = write_bytes(&mut dbuf, dpos, b"\n");
+                        unsafe { libc::write(2, dbuf.as_ptr() as *const libc::c_void, dpos) };
+                    }
 
                     // Ensure that `run_thread_arch` is linked in so that
                     // `interrupt_callback` is visible.
