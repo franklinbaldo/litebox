@@ -70,6 +70,31 @@ unsafe extern "C" {
 const UL_COMPARE_AND_WAIT: u32 = 1;
 const ULF_WAKE_ALL: u32 = 0x0000_0100;
 
+/// macOS MAP_JIT flag for mmap. Allocates memory that can be toggled between
+/// writable and executable per-thread using `pthread_jit_write_protect_np`.
+/// This is Apple's sanctioned W^X solution for JIT code generation.
+/// Not in the Rust `libc` crate — value from `<sys/mman.h>`.
+const MAP_JIT: libc::c_int = 0x0800;
+
+unsafe extern "C" {
+    /// Toggle per-thread JIT write protection for MAP_JIT pages.
+    /// - `enabled = 1` (true): X mode — MAP_JIT pages are executable, not writable.
+    /// - `enabled = 0` (false): W mode — MAP_JIT pages are writable, not executable.
+    fn pthread_jit_write_protect_np(enabled: libc::c_int);
+}
+
+/// Enter W mode: MAP_JIT pages become writable (not executable).
+/// Call at guest→host transitions before any writes to MAP_JIT memory.
+fn jit_write_mode() {
+    unsafe { pthread_jit_write_protect_np(0) };
+}
+
+/// Enter X mode: MAP_JIT pages become executable (not writable).
+/// Call at host→guest transitions before entering guest code.
+fn jit_exec_mode() {
+    unsafe { pthread_jit_write_protect_np(1) };
+}
+
 /// The macOS userland platform.
 ///
 /// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
@@ -374,6 +399,10 @@ fn run_thread_inner(
                 "[diag] run_thread_inner: inside closure, about to set TPIDR_EL0={:#x}",
                 tcb_addr
             );
+            // Switch MAP_JIT pages to X mode (executable) before entering guest.
+            // MUST be before write_tpidr_el0 because pthread_jit_write_protect_np
+            // is a libc call that clobbers TPIDR_EL0 on macOS.
+            jit_exec_mode();
             // Set TPIDR_EL0 as the VERY LAST thing before asm. No syscalls
             // (including eprintln!) allowed between this and run_thread_arch,
             // because macOS clobbers TPIDR_EL0 on every syscall.
@@ -1183,7 +1212,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                     } else {
                         MapFlags::empty()
                     };
-                let native_flags = macos_mmap_flags(linux_flags);
+                // Add MAP_JIT to the reserve region so edge pages (which remain
+                // from this mapping after interior pages are replaced by MAP_FIXED)
+                // can use RWX via the hardware JIT toggle. Interior MAP_FIXED pages
+                // replace this mapping entirely and don't inherit MAP_JIT.
+                let native_flags = macos_mmap_flags(linux_flags) | MAP_JIT;
                 let r = unsafe {
                     libc::mmap(
                         suggested_range.start as *mut libc::c_void,
@@ -1660,6 +1693,9 @@ unsafe extern "C" {
 }
 
 unsafe extern "C-unwind" fn init_handler(thread_ctx: &mut ThreadContext) {
+    // Switch MAP_JIT pages to W mode — the shim's init path loads ELF segments
+    // which writes to guest memory (including MAP_JIT edge pages).
+    jit_write_mode();
     eprintln!(
         "[diag] init_handler: entering, ctx.pc={:#x}, ctx.sp={:#x}",
         thread_ctx.ctx.pc, thread_ctx.ctx.sp
@@ -1668,6 +1704,8 @@ unsafe extern "C-unwind" fn init_handler(thread_ctx: &mut ThreadContext) {
 }
 
 unsafe extern "C-unwind" fn reenter_handler(thread_ctx: &mut ThreadContext) {
+    // Switch MAP_JIT pages to W mode — host code may write to guest memory.
+    jit_write_mode();
     thread_ctx.call_shim(|shim, ctx| shim.reenter(ctx));
 }
 
@@ -1687,6 +1725,9 @@ unsafe extern "C-unwind" fn reenter_handler(thread_ctx: &mut ThreadContext) {
 /// purposes.
 #[allow(clippy::cast_sign_loss)]
 unsafe extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext) {
+    // Switch MAP_JIT pages to W mode (writable) now that we're back in host code.
+    // This must happen before any writes to MAP_JIT memory (edge pages).
+    jit_write_mode();
     eprintln!(
         "[diag] syscall_handler: entered, ctx.pc={:#x}, ctx.regs[8]={:#x} (syscall nr)",
         thread_ctx.ctx.pc, thread_ctx.ctx.regs[8]
@@ -1700,6 +1741,8 @@ extern "C-unwind" fn exception_handler(
     error: usize,
     cr2: usize,
 ) {
+    // Switch MAP_JIT pages to W mode (writable) now that we're back in host code.
+    jit_write_mode();
     eprintln!(
         "[diag] exception_handler: trapno={}, error={:#x}, cr2={:#x}, ctx.pc={:#x}",
         trapno, error, cr2, thread_ctx.ctx.pc
@@ -1772,6 +1815,8 @@ fn update_host_tls_entry() {
 }
 
 extern "C-unwind" fn interrupt_handler(thread_ctx: &mut ThreadContext) {
+    // Switch MAP_JIT pages to W mode (writable) now that we're back in host code.
+    jit_write_mode();
     thread_ctx.call_shim(|shim, ctx| shim.interrupt(ctx));
 }
 
@@ -1806,6 +1851,10 @@ impl ThreadContext<'_> {
                     self.ctx.sp,
                     get_guest_tpidr()
                 );
+                // Switch MAP_JIT pages to X mode (executable) before entering guest.
+                // MUST be before write_tpidr_el0 because pthread_jit_write_protect_np
+                // is a libc call that clobbers TPIDR_EL0 on macOS.
+                jit_exec_mode();
                 // Re-set TPIDR_EL0 as the VERY LAST thing before asm.
                 // macOS clobbers it on every syscall (including eprintln above).
                 let tcb = TCB_PTR.get();
