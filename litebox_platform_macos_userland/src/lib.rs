@@ -2672,6 +2672,77 @@ unsafe extern "C" fn exception_signal_handler(
     };
     copy_signal_context(unsafe { &mut *regs }, context);
 
+    // Dump guest register state at crash for debugging.
+    {
+        let mctx = unsafe { &*context.uc_mcontext };
+        // Dump x0-x9 (two per line)
+        for pair in 0..5u64 {
+            let i = pair * 2;
+            let mut dbuf = [0u8; 128];
+            let mut dpos = write_bytes(&mut dbuf, 0, b"[diag] crash x");
+            dpos = write_hex(&mut dbuf, dpos, i as usize);
+            dpos = write_bytes(&mut dbuf, dpos, b"=");
+            dpos = write_hex(&mut dbuf, dpos, mctx.__ss.__x[i as usize] as usize);
+            dpos = write_bytes(&mut dbuf, dpos, b" x");
+            dpos = write_hex(&mut dbuf, dpos, (i + 1) as usize);
+            dpos = write_bytes(&mut dbuf, dpos, b"=");
+            dpos = write_hex(&mut dbuf, dpos, mctx.__ss.__x[(i + 1) as usize] as usize);
+            dpos = write_bytes(&mut dbuf, dpos, b"\n");
+            unsafe { libc::write(2, dbuf.as_ptr() as *const libc::c_void, dpos) };
+        }
+        // Dump x10-x19
+        for pair in 5..10u64 {
+            let i = pair * 2;
+            let mut dbuf = [0u8; 128];
+            let mut dpos = write_bytes(&mut dbuf, 0, b"[diag] crash x");
+            dpos = write_hex(&mut dbuf, dpos, i as usize);
+            dpos = write_bytes(&mut dbuf, dpos, b"=");
+            dpos = write_hex(&mut dbuf, dpos, mctx.__ss.__x[i as usize] as usize);
+            dpos = write_bytes(&mut dbuf, dpos, b" x");
+            dpos = write_hex(&mut dbuf, dpos, (i + 1) as usize);
+            dpos = write_bytes(&mut dbuf, dpos, b"=");
+            dpos = write_hex(&mut dbuf, dpos, mctx.__ss.__x[(i + 1) as usize] as usize);
+            dpos = write_bytes(&mut dbuf, dpos, b"\n");
+            unsafe { libc::write(2, dbuf.as_ptr() as *const libc::c_void, dpos) };
+        }
+        // Dump x20-x28, fp, lr
+        for pair in 10..14u64 {
+            let i = pair * 2;
+            let mut dbuf = [0u8; 128];
+            let mut dpos = write_bytes(&mut dbuf, 0, b"[diag] crash x");
+            dpos = write_hex(&mut dbuf, dpos, i as usize);
+            dpos = write_bytes(&mut dbuf, dpos, b"=");
+            dpos = write_hex(&mut dbuf, dpos, mctx.__ss.__x[i as usize] as usize);
+            dpos = write_bytes(&mut dbuf, dpos, b" x");
+            dpos = write_hex(&mut dbuf, dpos, (i + 1) as usize);
+            dpos = write_bytes(&mut dbuf, dpos, b"=");
+            dpos = write_hex(&mut dbuf, dpos, mctx.__ss.__x[(i + 1) as usize] as usize);
+            dpos = write_bytes(&mut dbuf, dpos, b"\n");
+            unsafe { libc::write(2, dbuf.as_ptr() as *const libc::c_void, dpos) };
+        }
+        {
+            let mut dbuf = [0u8; 128];
+            let mut dpos = write_bytes(&mut dbuf, 0, b"[diag] crash x1c=");
+            dpos = write_hex(&mut dbuf, dpos, mctx.__ss.__x[28] as usize);
+            dpos = write_bytes(&mut dbuf, dpos, b" fp=");
+            dpos = write_hex(&mut dbuf, dpos, mctx.__ss.__fp as usize);
+            dpos = write_bytes(&mut dbuf, dpos, b" lr=");
+            dpos = write_hex(&mut dbuf, dpos, mctx.__ss.__lr as usize);
+            dpos = write_bytes(&mut dbuf, dpos, b"\n");
+            unsafe { libc::write(2, dbuf.as_ptr() as *const libc::c_void, dpos) };
+        }
+        // Also dump guest_tpidr from TCB for reference
+        {
+            let mut dbuf = [0u8; 128];
+            let mut dpos = write_bytes(&mut dbuf, 0, b"[diag] crash tcb.guest_tpidr=");
+            dpos = write_hex(&mut dbuf, dpos, unsafe { (*TCB_PTR.get()).guest_tpidr });
+            dpos = write_bytes(&mut dbuf, dpos, b" esr=");
+            dpos = write_hex(&mut dbuf, dpos, mctx.__es.__esr as usize);
+            dpos = write_bytes(&mut dbuf, dpos, b"\n");
+            unsafe { libc::write(2, dbuf.as_ptr() as *const libc::c_void, dpos) };
+        }
+    }
+
     // Ensure that `run_thread_arch` is linked in so that `exception_callback` is visible.
     let _ = run_thread_arch as *const () as usize;
 
