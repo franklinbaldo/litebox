@@ -1532,7 +1532,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         let inner_end = host_page_align_down(range.end);
         let prot = prot_flags(new_permissions).bits();
         // Choose RX or RW for edge pages based on requested permissions.
-        let edge_prot = if new_permissions.contains(MemoryRegionPermissions::EXECUTE) {
+        let edge_prot = if new_permissions.contains(MemoryRegionPermissions::EXEC) {
             (ProtFlags::PROT_READ | ProtFlags::PROT_EXEC).bits()
         } else {
             (ProtFlags::PROT_READ | ProtFlags::PROT_WRITE).bits()
