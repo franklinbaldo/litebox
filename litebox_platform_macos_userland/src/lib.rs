@@ -1154,67 +1154,137 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         _populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
-        // Round the range to HOST_PAGE_SIZE boundaries for MAP_FIXED operations.
         // macOS arm64 requires 16KB-aligned addresses for all VM operations.
-        // For Hint, we pass the suggested address as-is; the kernel will pick
-        // a properly aligned address.
-        let (mmap_start, mmap_len) = match fixed_address_behavior {
-            FixedAddressBehavior::Hint => (suggested_range.start, suggested_range.len()),
-            FixedAddressBehavior::Replace | FixedAddressBehavior::NoReplace => {
-                let aligned_start = host_page_align_down(suggested_range.start);
-                let aligned_end = host_page_align_up(suggested_range.end);
-                (aligned_start, aligned_end - aligned_start)
-            }
-        };
-        // On Linux, NoReplace uses MAP_FIXED_NOREPLACE to atomically fail if the
-        // address is already mapped. macOS has no equivalent, but we don't need a
-        // host-level probe here: the VMem layer in insert_mapping() already
-        // verified there are no VMA-level conflicts before calling us. On macOS
-        // arm64, 16KB host page rounding means the rounded range may overlap with
-        // adjacent allocations within the same reserved region — a host-level
-        // is_range_unmapped() probe would spuriously fail. Using MAP_FIXED for
-        // both Replace and NoReplace is correct because the VMA layer is the
-        // authoritative conflict check.
-        // Build Linux-style flags, then translate to macOS.
-        let linux_flags = MapFlags::MAP_PRIVATE
-            | MapFlags::MAP_ANONYMOUS
-            | match fixed_address_behavior {
-                FixedAddressBehavior::Hint => MapFlags::empty(),
-                // NoReplace uses MAP_FIXED — VMA layer is the conflict guard.
-                FixedAddressBehavior::Replace | FixedAddressBehavior::NoReplace => {
-                    MapFlags::MAP_FIXED
-                }
-            }
-            | if can_grow_down {
-                // MAP_GROWSDOWN has no macOS equivalent; macos_mmap_flags drops it.
-                MapFlags::MAP_GROWSDOWN
-            } else {
-                MapFlags::empty()
-            };
-        let native_flags = macos_mmap_flags(linux_flags);
-        let r = unsafe {
-            libc::mmap(
-                mmap_start as *mut libc::c_void,
-                mmap_len,
-                prot_flags(initial_permissions).bits(),
-                native_flags,
-                -1,
-                0,
-            )
-        };
-        if r == libc::MAP_FAILED {
-            let err = std::io::Error::last_os_error();
-            return Err(match err.raw_os_error() {
-                Some(libc::ENOMEM) => litebox::platform::page_mgmt::AllocationError::OutOfMemory,
-                _ => panic!("unhandled mmap error {err}"),
-            });
-        }
-        // Return the original suggested start address (4KB-aligned) so the VMem
-        // layer's bookkeeping is consistent, even though the kernel mapped a wider
-        // 16KB-aligned region.
+        // For Hint, pass the address as-is; the kernel picks a properly aligned one.
+        //
+        // For MAP_FIXED within a reserved region (the common case during ELF loading),
+        // we must avoid clobbering adjacent 4KB sub-pages that share the same 16KB
+        // host page. Two adjacent ELF LOAD segments (e.g., R+X text ending at 0x42000
+        // and RW data starting at 0x3e000) may be separated by less than 16KB. A naive
+        // outward-rounded mmap(MAP_FIXED) for one segment would replace the other's
+        // host page with fresh anonymous memory, destroying its contents.
+        //
+        // Strategy for MAP_FIXED:
+        // 1. mmap(MAP_FIXED, MAP_ANON) only the 16KB-aligned INTERIOR (round inward).
+        //    This gives fresh anonymous pages without touching neighbors.
+        // 2. mprotect the EDGE host pages (the partial 16KB pages at start/end) to the
+        //    requested permissions. These pages already exist from the enclosing reserve
+        //    (as PROT_NONE) or from a prior mapping. mprotect changes permissions
+        //    without replacing the underlying memory.
+        //
+        // This ensures that data written to adjacent 4KB sub-pages within the same
+        // 16KB host page is preserved.
         match fixed_address_behavior {
-            FixedAddressBehavior::Hint => Ok(UserMutPtr::from_usize(r as usize)),
+            FixedAddressBehavior::Hint => {
+                let linux_flags = MapFlags::MAP_PRIVATE
+                    | MapFlags::MAP_ANONYMOUS
+                    | if can_grow_down {
+                        MapFlags::MAP_GROWSDOWN
+                    } else {
+                        MapFlags::empty()
+                    };
+                let native_flags = macos_mmap_flags(linux_flags);
+                let r = unsafe {
+                    libc::mmap(
+                        suggested_range.start as *mut libc::c_void,
+                        suggested_range.len(),
+                        prot_flags(initial_permissions).bits(),
+                        native_flags,
+                        -1,
+                        0,
+                    )
+                };
+                if r == libc::MAP_FAILED {
+                    let err = std::io::Error::last_os_error();
+                    return Err(match err.raw_os_error() {
+                        Some(libc::ENOMEM) => {
+                            litebox::platform::page_mgmt::AllocationError::OutOfMemory
+                        }
+                        _ => panic!("unhandled mmap error {err}"),
+                    });
+                }
+                Ok(UserMutPtr::from_usize(r as usize))
+            }
             FixedAddressBehavior::Replace | FixedAddressBehavior::NoReplace => {
+                let outer_start = host_page_align_down(suggested_range.start);
+                let outer_end = host_page_align_up(suggested_range.end);
+                let inner_start = host_page_align_up(suggested_range.start);
+                let inner_end = host_page_align_down(suggested_range.end);
+                let prot = prot_flags(initial_permissions).bits();
+                // Edge host pages use RWX because adjacent 4KB sub-pages from other
+                // VMAs may need different permissions. See update_permissions for rationale.
+                let prot_rwx =
+                    (ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC).bits();
+
+                // Step 1: mmap the 16KB-aligned interior with MAP_FIXED.
+                // This replaces only fully-enclosed host pages with fresh anonymous memory.
+                if inner_start < inner_end {
+                    let r = unsafe {
+                        libc::mmap(
+                            inner_start as *mut libc::c_void,
+                            inner_end - inner_start,
+                            prot,
+                            macos_mmap_flags(
+                                MapFlags::MAP_PRIVATE
+                                    | MapFlags::MAP_ANONYMOUS
+                                    | MapFlags::MAP_FIXED,
+                            ),
+                            -1,
+                            0,
+                        )
+                    };
+                    if r == libc::MAP_FAILED {
+                        let err = std::io::Error::last_os_error();
+                        return Err(match err.raw_os_error() {
+                            Some(libc::ENOMEM) => {
+                                litebox::platform::page_mgmt::AllocationError::OutOfMemory
+                            }
+                            _ => panic!("unhandled mmap error {err}"),
+                        });
+                    }
+                }
+
+                // Step 2: mprotect edge host pages to RWX.
+                // These already exist (from reserve or prior mapping). mprotect changes
+                // permissions without replacing the underlying page content, so adjacent
+                // 4KB sub-pages' data is preserved. RWX ensures no conflict with
+                // whatever else shares the host page.
+
+                // Leading edge: if start isn't 16KB-aligned
+                if outer_start < inner_start && outer_start < outer_end {
+                    let r = unsafe {
+                        libc::mprotect(outer_start as *mut libc::c_void, HOST_PAGE_SIZE, prot_rwx)
+                    };
+                    assert_eq!(
+                        r,
+                        0,
+                        "mprotect edge page {:#x} failed: {}",
+                        outer_start,
+                        std::io::Error::last_os_error()
+                    );
+                }
+
+                // Trailing edge: if end isn't 16KB-aligned
+                // Skip if same host page as leading edge (single-host-page case handled above)
+                let trailing_page = if inner_end > outer_start {
+                    inner_end
+                } else {
+                    outer_start
+                };
+                if trailing_page < outer_end && trailing_page > outer_start && inner_end < outer_end
+                {
+                    let r = unsafe {
+                        libc::mprotect(trailing_page as *mut libc::c_void, HOST_PAGE_SIZE, prot_rwx)
+                    };
+                    assert_eq!(
+                        r,
+                        0,
+                        "mprotect edge page {:#x} failed: {}",
+                        trailing_page,
+                        std::io::Error::last_os_error()
+                    );
+                }
+
                 Ok(UserMutPtr::from_usize(suggested_range.start))
             }
         }
@@ -1311,19 +1381,80 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         range: core::ops::Range<usize>,
         new_permissions: MemoryRegionPermissions,
     ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
-        // Round outward to HOST_PAGE_SIZE boundaries. This is safe because
-        // mprotect within a reserved region only widens to adjacent sub-pages
-        // that are already PROT_NONE (from the enclosing reserve mapping).
-        let aligned_start = host_page_align_down(range.start);
-        let aligned_end = host_page_align_up(range.end);
-        let r = unsafe {
-            libc::mprotect(
-                aligned_start as *mut libc::c_void,
-                aligned_end - aligned_start,
-                prot_flags(new_permissions).bits(),
-            )
+        // macOS arm64 16KB page handling for mprotect:
+        //
+        // Multiple 4KB VMAs with different permission requirements may share the
+        // same 16KB host page (e.g., an RW data segment tail and an R+X trampoline
+        // starting in the same 16KB page). Since mprotect operates on whole host
+        // pages, we cannot set per-4KB permissions independently.
+        //
+        // Strategy:
+        // - Interior host pages (fully enclosed): set to exactly the requested permissions.
+        // - Edge host pages (partially covered): set to RWX. This is the union of all
+        //   possible permission needs (read+write for data, read+execute for code) and
+        //   ensures no occupant of the shared host page is denied access. This is safe
+        //   because the guest runs in-process (no security boundary) and the VMA layer
+        //   enforces per-4KB access semantics at a higher level.
+        let outer_start = host_page_align_down(range.start);
+        let outer_end = host_page_align_up(range.end);
+        let inner_start = host_page_align_up(range.start);
+        let inner_end = host_page_align_down(range.end);
+        let prot = prot_flags(new_permissions).bits();
+        let prot_rwx = (ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC).bits();
+
+        // Interior: exact permissions on fully-enclosed host pages.
+        if inner_start < inner_end {
+            let r = unsafe {
+                libc::mprotect(
+                    inner_start as *mut libc::c_void,
+                    inner_end - inner_start,
+                    prot,
+                )
+            };
+            assert_eq!(r, 0, "mprotect failed: {}", std::io::Error::last_os_error());
+        }
+
+        // Leading edge host page: set to RWX if not fully covered.
+        if outer_start < inner_start && outer_start < outer_end {
+            let r = unsafe {
+                libc::mprotect(outer_start as *mut libc::c_void, HOST_PAGE_SIZE, prot_rwx)
+            };
+            assert_eq!(
+                r,
+                0,
+                "mprotect edge {:#x} failed: {}",
+                outer_start,
+                std::io::Error::last_os_error()
+            );
+        }
+
+        // Trailing edge host page: set to RWX if not fully covered.
+        // Skip if it's the same host page as the leading edge (single-host-page case
+        // is handled above).
+        let trailing_page = if inner_end > outer_start {
+            inner_end
+        } else {
+            outer_start
         };
-        assert_eq!(r, 0, "mprotect failed: {}", std::io::Error::last_os_error());
+        if trailing_page < outer_end && trailing_page > outer_start && inner_end < outer_end {
+            let r = unsafe {
+                libc::mprotect(trailing_page as *mut libc::c_void, HOST_PAGE_SIZE, prot_rwx)
+            };
+            assert_eq!(
+                r,
+                0,
+                "mprotect edge {:#x} failed: {}",
+                trailing_page,
+                std::io::Error::last_os_error()
+            );
+        }
+
+        // Single host page case: range fits entirely within one host page,
+        // so inner_start >= inner_end and no interior was mprotected.
+        // The leading edge block above handles this (outer_start < inner_start).
+        // If the range is exactly 16KB-aligned (inner_start == outer_start),
+        // the interior block handles it. So no extra case needed.
+
         Ok(())
     }
 
@@ -1349,6 +1480,18 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         if !file_offset.is_multiple_of(ALIGN) {
             return Err(CowAllocationError::Unaligned);
         }
+        // For MAP_FIXED operations, also require the address and length to be
+        // HOST_PAGE_SIZE-aligned. If they aren't, the outward-rounded mmap would
+        // replace edge host pages' content, clobbering adjacent 4KB sub-pages.
+        // Fall back to the memcpy path which uses our edge-safe allocate_pages.
+        if matches!(
+            fixed_address_behavior,
+            FixedAddressBehavior::Replace | FixedAddressBehavior::NoReplace
+        ) && (!suggested_start.is_multiple_of(HOST_PAGE_SIZE)
+            || !source_data.len().is_multiple_of(HOST_PAGE_SIZE))
+        {
+            return Err(CowAllocationError::Unaligned);
+        }
 
         let file_path_cstr =
             std::ffi::CString::new(file_path.as_os_str().as_encoded_bytes()).unwrap();
@@ -1363,10 +1506,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         };
         assert!(fd >= 0, "file should remain unchanged on host");
 
-        // Round range to HOST_PAGE_SIZE for MAP_FIXED operations.
+        // For MAP_FIXED, the address and length are guaranteed HOST_PAGE_SIZE-aligned
+        // (we reject unaligned cases above). For Hint, pass as-is.
         let (mmap_start, mmap_len) = match fixed_address_behavior {
             FixedAddressBehavior::Hint => (suggested_start, source_data.len()),
             FixedAddressBehavior::Replace | FixedAddressBehavior::NoReplace => {
+                // These are already 16KB-aligned; the align calls are defensive.
                 let aligned_start = host_page_align_down(suggested_start);
                 let aligned_end = host_page_align_up(suggested_start + source_data.len());
                 (aligned_start, aligned_end - aligned_start)
