@@ -1522,20 +1522,20 @@ mod tests {
 
         // Save old FS base
         let mut old_fs_base = MaybeUninit::<usize>::uninit();
-        let ptr = MutPtr::from(old_fs_base.as_mut_ptr());
+        let ptr = MutPtr::from_usize(old_fs_base.as_mut_ptr() as usize);
         task.sys_arch_prctl(ArchPrctlArg::GetFs(ptr))
             .expect("Failed to get FS base");
         let old_fs_base = unsafe { old_fs_base.assume_init() };
 
         // Set new FS base
         let mut new_fs_base: [u8; 16] = [0; 16];
-        let ptr = MutPtr::from(new_fs_base.as_mut_ptr());
+        let ptr = MutPtr::from_usize(new_fs_base.as_mut_ptr() as usize);
         task.sys_arch_prctl(ArchPrctlArg::SetFs(ptr.as_usize()))
             .expect("Failed to set FS base");
 
         // Verify new FS base
         let mut current_fs_base = MaybeUninit::<usize>::uninit();
-        let ptr = MutPtr::from(current_fs_base.as_mut_ptr());
+        let ptr = MutPtr::from_usize(current_fs_base.as_mut_ptr() as usize);
         task.sys_arch_prctl(ArchPrctlArg::GetFs(ptr))
             .expect("Failed to get FS base");
         let current_fs_base = unsafe { current_fs_base.assume_init() };
@@ -1570,13 +1570,13 @@ mod tests {
         let name: &[u8] = b"litebox-test\0";
 
         // Call prctl(PR_SET_NAME, set_buf)
-        let set_ptr = crate::ConstPtr::from(name.as_ptr());
+        let set_ptr = crate::ConstPtr::from_usize(name.as_ptr() as usize);
         task.sys_prctl(litebox_common_linux::PrctlArg::SetName(set_ptr))
             .expect("sys_prctl SetName failed");
 
         // Prepare buffer for prctl(PR_GET_NAME, get_buf)
         let mut get_buf = [0u8; litebox_common_linux::TASK_COMM_LEN];
-        let get_ptr = crate::MutPtr::from(get_buf.as_mut_ptr());
+        let get_ptr = crate::MutPtr::from_usize(get_buf.as_mut_ptr() as usize);
 
         task.sys_prctl(litebox_common_linux::PrctlArg::GetName(get_ptr))
             .expect("sys_prctl GetName failed");
@@ -1588,13 +1588,13 @@ mod tests {
 
         // Test too long name
         let long_name = [b'a'; litebox_common_linux::TASK_COMM_LEN + 10];
-        let long_name_ptr = crate::ConstPtr::from(long_name.as_ptr());
+        let long_name_ptr = crate::ConstPtr::from_usize(long_name.as_ptr() as usize);
         task.sys_prctl(litebox_common_linux::PrctlArg::SetName(long_name_ptr))
             .expect("sys_prctl SetName failed");
 
         // Get the name again
         let mut get_buf = [0u8; litebox_common_linux::TASK_COMM_LEN];
-        let get_ptr = crate::MutPtr::from(get_buf.as_mut_ptr());
+        let get_ptr = crate::MutPtr::from_usize(get_buf.as_mut_ptr() as usize);
         task.sys_prctl(litebox_common_linux::PrctlArg::GetName(get_ptr))
             .expect("sys_prctl GetName failed");
         assert_eq!(
@@ -1630,7 +1630,7 @@ mod tests {
                 restorer: 0,
                 mask: SigSet::empty(),
             };
-            let act_ptr = crate::ConstPtr::from(&raw const act);
+            let act_ptr = crate::ConstPtr::from_usize(&raw const act as usize);
             task.sys_rt_sigaction(
                 Signal::SIGINT,
                 Some(act_ptr),
@@ -1657,8 +1657,8 @@ mod tests {
             let result = task.sys_clock_nanosleep(
                 ClockId::Monotonic,
                 TimerFlags::empty(),
-                litebox_common_linux::TimeParam::Timespec64(crate::MutPtr::from(
-                    &raw mut request,
+                litebox_common_linux::TimeParam::Timespec64(crate::MutPtr::from_usize(
+                    &raw mut request as usize,
                 )),
                 litebox_common_linux::TimeParam::None,
             );
