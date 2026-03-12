@@ -46,6 +46,12 @@ pub(crate) struct SignalState {
     altstack: Cell<SigAltStack>,
     /// The last exception info recorded for signal delivery.
     last_exception: Cell<litebox::shim::ExceptionInfo>,
+    /// Deferred mask restore (like Linux's TIF_RESTORE_SIGMASK).
+    ///
+    /// When set, `process_signals` will restore this mask after delivering
+    /// pending signals. Used by `epoll_pwait` / `ppoll` to atomically
+    /// unblock signals during the wait and re-block them afterwards.
+    restore_mask: Cell<Option<SigSet>>,
 }
 
 impl SignalState {
@@ -68,7 +74,24 @@ impl SignalState {
                 cr2: 0,
                 kernel_mode: false,
             }),
+            restore_mask: Cell::new(None),
         }
+    }
+
+    /// Get the current blocked signal mask.
+    pub fn get_blocked(&self) -> SigSet {
+        self.blocked.get()
+    }
+
+    /// Set the blocked signal mask.
+    pub fn set_blocked(&self, mask: SigSet) {
+        self.blocked.set(mask);
+    }
+
+    /// Schedule a deferred mask restore. The mask will be restored after the
+    /// next `process_signals` call delivers any unblocked signals.
+    pub fn set_restore_mask(&self, mask: SigSet) {
+        self.restore_mask.set(Some(mask));
     }
 
     pub fn clone_for_new_task(&self) -> Self {
@@ -92,6 +115,33 @@ impl SignalState {
             .into(),
             // Preserve last exception
             last_exception: self.last_exception.clone(),
+            restore_mask: Cell::new(None),
+        }
+    }
+
+    /// Creates signal state for a forked child process.
+    ///
+    /// Unlike [`clone_for_new_task`](Self::clone_for_new_task) (which shares
+    /// signal handlers via `Arc` for threads), fork creates a deep copy of
+    /// the handlers so the child process can modify them independently.
+    pub fn clone_for_fork(&self) -> Self {
+        Self {
+            pending: RefCell::new(PendingSignals::new()),
+            blocked: Cell::new(self.blocked.get()),
+            shared_pending: Arc::new(Mutex::new(PendingSignals::new())),
+            // Deep-copy handlers so the child's rt_sigaction doesn't affect
+            // the parent (important for vfork where both run concurrently).
+            handlers: RefCell::new(Arc::new((*self.handlers.borrow()).as_ref().clone())),
+            altstack: SigAltStack {
+                flags: SsFlags::DISABLE,
+                sp: 0,
+                size: 0,
+                #[cfg(target_arch = "x86_64")]
+                __pad: 0,
+            }
+            .into(),
+            last_exception: self.last_exception.clone(),
+            restore_mask: Cell::new(None),
         }
     }
 
@@ -522,10 +572,31 @@ impl<FS: ShimFS> Task<FS> {
     fn do_kill(&self, pid: Option<i32>, tid: Option<i32>, signal: i32) -> Result<usize, Errno> {
         let signal = Signal::try_from(signal)?;
         if pid.is_none_or(|pid| pid == self.pid) && tid.is_none_or(|tid| tid == self.tid) {
+            // Sending signal to self.
             self.send_signal(signal, siginfo_kill(signal));
             Ok(0)
+        } else if pid.is_none_or(|pid| pid == self.pid) {
+            // Sending signal to a different thread in the same process.
+            // We can't enqueue the signal into the target thread's pending
+            // set (it's thread-local), but we can interrupt its wait so it
+            // gets a chance to reschedule. This is sufficient for Go's
+            // goroutine preemption (SIGURG) and other cooperative schemes.
+            if let Some(target_tid) = tid {
+                let inner = self.process().inner.lock();
+                if let Some(remote) = inner.threads.get(&target_tid) {
+                    remote.interrupt();
+                    return Ok(0);
+                }
+            }
+            Err(Errno::ESRCH)
         } else {
-            log_unsupported!("sys_{{t|tg}}kill with remote pid/tid");
+            log_unsupported!(
+                "sys_{{t|tg}}kill with remote pid (caller pid={}, tid={}, target pid={:?}, tid={:?})",
+                self.pid,
+                self.tid,
+                pid,
+                tid
+            );
             Err(Errno::ESRCH)
         }
     }
@@ -543,6 +614,26 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Deliver any pending signals.
     pub(crate) fn process_signals(&self, ctx: &mut PtRegs) {
+        // Drain cross-process signals for this process into our local pending queue.
+        {
+            let my_id = self.process_id.0;
+            let mut queue = self.global.cross_process_signals.lock();
+            let mut i = 0;
+            while i < queue.len() {
+                if queue[i].target_process_id == my_id {
+                    let sig = queue.swap_remove(i);
+
+                    self.signals.pending.borrow_mut().push(
+                        &self.process().limits,
+                        sig.signal,
+                        sig.siginfo,
+                    );
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
         loop {
             let blocked = self.signals.blocked.get();
             let (signal, siginfo) = {
@@ -565,6 +656,7 @@ impl<FS: ShimFS> Task<FS> {
             }
 
             let action = self.signals.handlers.borrow().inner.lock()[signal].action;
+
             #[expect(clippy::match_same_arms)]
             match action.sigaction {
                 SIG_DFL => {
@@ -577,10 +669,12 @@ impl<FS: ShimFS> Task<FS> {
                             // supported.
                             litebox::log_println!(
                                 self.global.platform,
-                                "-- Fatal signal {:?}: terminating task {}:{}",
+                                "-- Fatal signal {:?}: terminating task {}:{} fault_addr={:#x} error_code={:#x}",
                                 signal,
                                 self.pid,
                                 self.tid,
+                                self.signals.last_exception.get().cr2,
+                                self.signals.last_exception.get().error_code,
                             );
                             self.exit_group(ExitStatus::Signal(signal));
                         }
@@ -602,6 +696,13 @@ impl<FS: ShimFS> Task<FS> {
                     }
                 }
             }
+        }
+
+        // If a deferred mask restore is pending (set by epoll_pwait/ppoll),
+        // restore the original signal mask now that signals have been delivered
+        // with the temporarily-unblocked mask.
+        if let Some(old_mask) = self.signals.restore_mask.take() {
+            self.signals.blocked.set(old_mask);
         }
     }
 

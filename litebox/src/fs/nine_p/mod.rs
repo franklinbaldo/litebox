@@ -800,6 +800,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             .map_err(UnlinkError::from)
     }
 
+    fn rename(
+        &self,
+        _old: impl crate::path::Arg,
+        _new: impl crate::path::Arg,
+    ) -> Result<(), super::errors::RenameError> {
+        // TODO: implement via 9P Trename/Trenameat
+        Err(super::errors::RenameError::ReadOnlyFileSystem)
+    }
+
     fn mkdir(&self, path: impl crate::path::Arg, mode: super::Mode) -> Result<(), MkdirError> {
         let path = self.absolute_path(path)?;
 

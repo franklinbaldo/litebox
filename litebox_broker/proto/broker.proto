@@ -1,0 +1,268 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+syntax = "proto3";
+
+package litebox.broker;
+
+// FileBroker provides policy-enforced file system access for sandboxed
+// processes. Inspired by gVisor's LISAFS protocol, all operations after Open
+// are FD-based to avoid path rewalking and symlink attacks.
+service FileBroker {
+    // Establish a connection and receive the root control FD.
+    rpc Mount(MountRequest) returns (MountResponse);
+
+    // Open a file relative to a directory FD, returning a new FD.
+    rpc Open(OpenRequest) returns (OpenResponse);
+
+    // Close one or more FDs on the server.
+    rpc Close(CloseRequest) returns (CloseResponse);
+
+    // Read data from an open FD at a given offset.
+    rpc Read(ReadRequest) returns (ReadResponse);
+
+    // Write data to an open FD at a given offset.
+    rpc Write(WriteRequest) returns (WriteResponse);
+
+    // Seek within an open FD.
+    rpc Seek(SeekRequest) returns (SeekResponse);
+
+    // Truncate an open FD to a specified length.
+    rpc Truncate(TruncateRequest) returns (TruncateResponse);
+
+    // Change file permissions by path relative to a directory FD.
+    rpc Chmod(ChmodRequest) returns (ChmodResponse);
+
+    // Get file status by path relative to a directory FD.
+    rpc Stat(StatRequest) returns (StatResponse);
+
+    // Get file status for an open FD.
+    rpc FdStat(FdStatRequest) returns (StatResponse);
+
+    // Create a directory relative to a directory FD.
+    rpc Mkdir(MkdirRequest) returns (MkdirResponse);
+
+    // Remove a directory relative to a directory FD.
+    rpc Rmdir(RmdirRequest) returns (RmdirResponse);
+
+    // Unlink a file relative to a directory FD.
+    rpc Unlink(UnlinkRequest) returns (UnlinkResponse);
+
+    // Read directory entries from an open directory FD.
+    rpc ReadDir(ReadDirRequest) returns (ReadDirResponse);
+
+    // Push policy rules to the broker. Must be called before file operations.
+    rpc LoadPolicy(LoadPolicyRequest) returns (LoadPolicyResponse);
+}
+
+// ---- Mount ----
+
+message MountRequest {
+    // Optional client identifier for auditing.
+    string client_id = 1;
+}
+
+message MountResponse {
+    // Server-assigned FD for the root directory.
+    uint64 root_fd = 1;
+    // Maximum message payload size the server supports.
+    uint32 max_message_size = 2;
+}
+
+// ---- Open ----
+
+message OpenRequest {
+    // Path to open, relative to the root.
+    string path = 1;
+    // Linux open flags (O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, etc.).
+    uint32 flags = 2;
+    // File creation mode (permissions), used when O_CREAT is set.
+    uint32 mode = 3;
+}
+
+message OpenResponse {
+    // Server-assigned FD for the opened file.
+    uint64 fd = 1;
+}
+
+// ---- Close ----
+
+message CloseRequest {
+    // One or more FDs to close.
+    repeated uint64 fds = 1;
+}
+
+message CloseResponse {}
+
+// ---- Read ----
+
+message ReadRequest {
+    // FD to read from.
+    uint64 fd = 1;
+    // Maximum number of bytes to read.
+    uint32 count = 2;
+    // If set, read from this offset (pread semantics).
+    // If not set, read from the FD's current offset.
+    optional uint64 offset = 3;
+}
+
+message ReadResponse {
+    // The data read from the file.
+    bytes data = 1;
+}
+
+// ---- Write ----
+
+message WriteRequest {
+    // FD to write to.
+    uint64 fd = 1;
+    // Data to write.
+    bytes data = 2;
+    // If set, write at this offset (pwrite semantics).
+    // If not set, write at the FD's current offset.
+    optional uint64 offset = 3;
+}
+
+message WriteResponse {
+    // Number of bytes actually written.
+    uint64 count = 1;
+}
+
+// ---- Seek ----
+
+message SeekRequest {
+    // FD to seek.
+    uint64 fd = 1;
+    // Offset to seek to (may be negative).
+    int64 offset = 2;
+    // SEEK_SET=0, SEEK_CUR=1, SEEK_END=2.
+    uint32 whence = 3;
+}
+
+message SeekResponse {
+    // New absolute offset after seeking.
+    uint64 offset = 1;
+}
+
+// ---- Truncate ----
+
+message TruncateRequest {
+    // FD to truncate.
+    uint64 fd = 1;
+    // New length for the file.
+    uint64 length = 2;
+}
+
+message TruncateResponse {}
+
+// ---- Chmod ----
+
+message ChmodRequest {
+    // Path relative to root.
+    string path = 1;
+    // New permission mode.
+    uint32 mode = 2;
+}
+
+message ChmodResponse {}
+
+// ---- Stat ----
+
+message StatRequest {
+    // Path relative to root.
+    string path = 1;
+}
+
+message FdStatRequest {
+    // FD to stat.
+    uint64 fd = 1;
+}
+
+// File type constants matching Linux.
+enum FileType {
+    FILE_TYPE_UNKNOWN = 0;
+    FILE_TYPE_REGULAR = 1;
+    FILE_TYPE_DIRECTORY = 2;
+    FILE_TYPE_SYMLINK = 3;
+    FILE_TYPE_CHAR_DEVICE = 4;
+    FILE_TYPE_BLOCK_DEVICE = 5;
+    FILE_TYPE_FIFO = 6;
+    FILE_TYPE_SOCKET = 7;
+}
+
+message StatResponse {
+    FileType file_type = 1;
+    uint32 mode = 2;
+    uint64 size = 3;
+    uint32 uid = 4;
+    uint32 gid = 5;
+    // Device ID.
+    uint64 dev = 6;
+    // Inode number.
+    uint64 ino = 7;
+    // Device ID for special files (0 if not applicable).
+    uint64 rdev = 8;
+    // Preferred I/O block size.
+    uint64 blksize = 9;
+}
+
+// ---- Mkdir ----
+
+message MkdirRequest {
+    // Path relative to root.
+    string path = 1;
+    // Directory permissions.
+    uint32 mode = 2;
+}
+
+message MkdirResponse {}
+
+// ---- Rmdir ----
+
+message RmdirRequest {
+    // Path relative to root.
+    string path = 1;
+}
+
+message RmdirResponse {}
+
+// ---- Unlink ----
+
+message UnlinkRequest {
+    // Path relative to root.
+    string path = 1;
+}
+
+message UnlinkResponse {}
+
+// ---- ReadDir ----
+
+message ReadDirRequest {
+    // FD of the directory to read (must be an open directory FD).
+    uint64 fd = 1;
+}
+
+message DirEntry {
+    // Entry name.
+    string name = 1;
+    // Entry file type.
+    FileType file_type = 2;
+}
+
+message ReadDirResponse {
+    repeated DirEntry entries = 1;
+}
+
+// ---- Policy ----
+
+message LoadPolicyRequest {
+    // Policy rules in a textual format (e.g., Polar/Oso policy language).
+    string policy_text = 1;
+}
+
+message LoadPolicyResponse {
+    // Whether the policy was successfully loaded.
+    bool success = 1;
+    // Error message if loading failed.
+    string error_message = 2;
+}

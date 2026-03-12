@@ -19,6 +19,7 @@ use alloc::vec::Vec;
 
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
+use core::sync::atomic::Ordering;
 use litebox::{
     LiteBox,
     fd::TypedFd,
@@ -68,11 +69,16 @@ impl<T: litebox::fs::FileSystem + Send + Sync + 'static> ShimFS for T {}
 
 /// On debug builds, logs that the user attempted to use an unsupported feature.
 fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {
-    use litebox::platform::DebugLogProvider as _;
+    #[cfg(debug_assertions)]
+    {
+        use litebox::platform::DebugLogProvider as _;
 
-    if cfg!(debug_assertions) {
         let msg = alloc::format!("WARNING: unsupported: {args}\n");
         litebox_platform_multiplex::platform().debug_log_print(&msg);
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = args;
     }
 }
 
@@ -99,10 +105,22 @@ impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
         ctx: &mut Self::ExecutionContext,
         info: &litebox::shim::ExceptionInfo,
     ) -> ContinueOperation {
+        // CoW fault (vfork snapshotting): check BEFORE kernel-mode page fault
+        // handler, because kernel-mode (shim) code can touch guest pages that
+        // we mprotected for CoW. bit 1 = write access.
+        if info.exception == litebox::shim::Exception::PAGE_FAULT
+            && (info.error_code & 0x2) == 0x2
+            && self
+                .task
+                .try_handle_cow_fault(info.cr2, ctx.rip, (info.error_code & 1) != 0)
+        {
+            return ContinueOperation::Resume;
+        }
         if info.kernel_mode && info.exception == litebox::shim::Exception::PAGE_FAULT {
             if unsafe {
                 self.task
-                    .global
+                    .process_state
+                    .borrow()
                     .pm
                     .handle_page_fault(info.cr2, info.error_code.into())
             }
@@ -184,12 +202,40 @@ impl LinuxShimBuilder {
     }
 
     /// Build the shim.
+    ///
+    /// # Panics
+    /// Panics if the platform cannot allocate an address space for the init process.
     pub fn build<FS: ShimFS>(self) -> LinuxShim<FS> {
+        use litebox::platform::AddressSpaceProvider;
+        use litebox::platform::RawMutex as _;
+
         let mut net = Network::new(&self.litebox);
         net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
+
+        // Allocate the init process's address space (slot 0 on userland).
+        let init_as_id = self
+            .platform
+            .create_address_space()
+            .expect("init process address space allocation must succeed");
+        let as_range = self
+            .platform
+            .address_space_range(init_as_id)
+            .expect("init address space range must be valid");
+
+        let process_state = Arc::new(ProcessState {
+            pm: PageManager::new(&self.litebox, as_range),
+            address_space_id: init_as_id,
+            thread_count: core::sync::atomic::AtomicI32::new(1),
+            active_cow: litebox::sync::Mutex::new(None),
+            elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+            fd_paths: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+            main_bss_start: core::sync::atomic::AtomicUsize::new(0),
+            main_bss_end: core::sync::atomic::AtomicUsize::new(0),
+            vfork_park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
+            vfork_parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
+        });
         let global = Arc::new(GlobalState {
             platform: self.platform,
-            pm: PageManager::new(&self.litebox),
             futex_manager: FutexManager::new(),
             pipes: Pipes::new(&self.litebox),
             net: litebox::sync::Mutex::new(net),
@@ -198,15 +244,27 @@ impl LinuxShimBuilder {
             next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
+            cross_process_signals: litebox::sync::Mutex::new(Vec::new()),
+            process_thread_handles: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
         });
-        LinuxShim(global)
+        LinuxShim {
+            global,
+            process_state,
+        }
     }
 }
 
-pub struct LinuxShim<FS: ShimFS>(Arc<GlobalState<FS>>);
+pub struct LinuxShim<FS: ShimFS> {
+    global: Arc<GlobalState<FS>>,
+    /// Per-process state for the initial process.
+    process_state: Arc<ProcessState>,
+}
 impl<FS: ShimFS> Clone for LinuxShim<FS> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self {
+            global: self.global.clone(),
+            process_state: self.process_state.clone(),
+        }
     }
 }
 
@@ -220,6 +278,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
         path: &str,
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
+        initial_cwd: Option<alloc::string::String>,
     ) -> Result<LoadedProgram<FS>, loader::elf::ElfLoaderError> {
         let litebox_common_linux::TaskParams {
             pid,
@@ -231,14 +290,16 @@ impl<FS: ShimFS> LinuxShim<FS> {
         } = task;
 
         let files = Arc::new(syscalls::file::FilesState::new(fs));
-        files.initialize_stdio_in_shared_descriptors_table(&self.0);
+        files.initialize_stdio_in_shared_descriptors_table(&self.global);
 
         let entrypoints = crate::LinuxShimEntrypoints {
             _not_send: core::marker::PhantomData,
             task: Task {
-                global: self.0.clone(),
+                global: self.global.clone(),
+                process_state: self.process_state.clone().into(),
                 thread: syscalls::process::ThreadState::new_process(pid),
-                wait_state: wait::WaitState::new(self.0.platform),
+                wait_state: wait::WaitState::new(self.global.platform),
+                process_id: litebox::process::ProcessId::INIT,
                 pid,
                 ppid,
                 tid: pid,
@@ -250,9 +311,14 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 }
                 .into(),
                 comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
-                fs: Arc::new(syscalls::file::FsState::new()).into(),
+                fs: Arc::new(match initial_cwd {
+                    Some(cwd) => syscalls::file::FsState::with_cwd(cwd),
+                    None => syscalls::file::FsState::new(),
+                })
+                .into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
+                fork_context: RefCell::new(None),
             },
         };
         entrypoints.task.load_program(
@@ -267,9 +333,14 @@ impl<FS: ShimFS> LinuxShim<FS> {
         })
     }
 
-    /// Get the global page manager
+    /// Returns the page manager for the initial (PID 1) process.
+    ///
+    /// This is intended for use by runners during early boot (ELF loading,
+    /// page-fault handling) before multi-process support is active. Child
+    /// processes will have their own `PageManager` inside their
+    /// `ProcessState`; callers should not use this accessor for them.
     pub fn page_manager(&self) -> &PageManager<Platform, PAGE_SIZE> {
-        &self.0.pm
+        &self.process_state.pm
     }
 
     /// Perform queued network interactions with the outside world.
@@ -278,7 +349,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
     pub fn perform_network_interaction(
         &self,
     ) -> litebox::net::PlatformInteractionReinvocationAdvice {
-        self.0.net.lock().perform_platform_interaction()
+        self.global.net.lock().perform_platform_interaction()
     }
 
     /// Establish a TCP connection to the given address.
@@ -289,11 +360,11 @@ impl<FS: ShimFS> LinuxShim<FS> {
         &self,
         addr: core::net::SocketAddr,
     ) -> Result<transport::ShimTransport, Errno> {
-        transport::ShimTransport::connect(self.0.clone(), addr)
+        transport::ShimTransport::connect(self.global.clone(), addr)
     }
 
     pub fn litebox(&self) -> &LiteBox<Platform> {
-        &self.0.litebox
+        &self.global.litebox
     }
 }
 
@@ -339,6 +410,7 @@ fn default_fs(
 }
 
 // Special override so that `GETFL` can return stdio-specific flags
+#[derive(Clone, Copy)]
 pub(crate) struct StdioStatusFlags(litebox::fs::OFlags);
 
 impl<FS: ShimFS> syscalls::file::FilesState<FS> {
@@ -375,6 +447,14 @@ type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPoin
 
 struct Descriptors<FS: ShimFS> {
     descriptors: Vec<Option<Descriptor<FS>>>,
+}
+
+impl<FS: ShimFS> Clone for Descriptors<FS> {
+    fn clone(&self) -> Self {
+        Self {
+            descriptors: self.descriptors.clone(),
+        }
+    }
 }
 
 impl<FS: ShimFS> Descriptors<FS> {
@@ -415,11 +495,14 @@ impl<FS: ShimFS> Descriptors<FS> {
         min_idx: usize,
         max_idx: usize,
     ) -> Result<u32, Descriptor<FS>> {
+        #[allow(clippy::map_unwrap_or)]
         let idx = self
             .descriptors
             .iter()
+            .enumerate()
             .skip(min_idx)
-            .position(Option::is_none)
+            .find(|(_, slot)| slot.is_none())
+            .map(|(i, _)| i)
             .unwrap_or_else(|| {
                 self.descriptors.push(None);
                 self.descriptors.len() - 1
@@ -480,10 +563,13 @@ impl<FS: ShimFS> Task<FS> {
             .descriptors
             .iter_mut()
             .for_each(|slot| {
-                if let Some(desc) = slot.take()
-                    && let Ok(flags) = desc.get_file_descriptor_flags(&self.global, &files)
-                {
-                    if flags.contains(litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC) {
+                if let Some(desc) = slot.take() {
+                    let is_cloexec = desc
+                        .get_file_descriptor_flags(&self.global, &files)
+                        .is_ok_and(|f| {
+                            f.contains(litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC)
+                        });
+                    if is_cloexec {
                         let _ = self.do_close(desc);
                     } else {
                         *slot = Some(desc);
@@ -491,6 +577,128 @@ impl<FS: ShimFS> Task<FS> {
                 }
             });
     }
+
+    /// Close ALL open file descriptors. Called during process exit to release
+    /// resources (e.g., pipe write ends) so that readers see EOF.
+    fn close_all_fds(&self) {
+        let files = self.files.borrow();
+        files
+            .file_descriptors
+            .write()
+            .descriptors
+            .iter_mut()
+            .for_each(|slot| {
+                if let Some(desc) = slot.take() {
+                    let _ = self.do_close(desc);
+                }
+            });
+    }
+
+    /// Handle a potential CoW page fault during vfork.
+    ///
+    /// Checks the process-wide `active_cow` state (accessible by any thread).
+    /// - **Child** (has `fork_context`): snapshot the page, then re-enable write.
+    /// - **Parent thread** (no `fork_context`): re-enable write. Other parent
+    ///   threads should be parked; only the forking thread can reach here.
+    fn try_handle_cow_fault(
+        &self,
+        fault_addr: usize,
+        fault_rip: usize,
+        page_present: bool,
+    ) -> bool {
+        let ps = self.process_state.borrow();
+        let cow_lock = ps.active_cow.lock();
+        let Some(cow) = cow_lock.as_ref() else {
+            return false;
+        };
+
+        let page_addr = fault_addr & !(PAGE_SIZE - 1);
+
+        // Check if the faulting page is within a CoW-protected range.
+        let orig_perms = cow
+            .protected_ranges
+            .iter()
+            .find(|&&(base, len, _)| page_addr >= base && page_addr < base + len)
+            .map(|&(_, _, perms)| perms);
+        let Some(orig_perms) = orig_perms else {
+            return false;
+        };
+
+        let is_child = self.fork_context.borrow().is_some();
+        let page_range = page_addr..page_addr + PAGE_SIZE;
+
+        if is_child {
+            // Child thread: snapshot the original content then re-enable write.
+            let mut dirty = cow.dirty_pages.lock();
+
+            if dirty.iter().any(|(addr, _)| *addr == page_addr) {
+                // Already snapshotted (repeated fault due to racing).
+                return unsafe {
+                    cow_update_permissions(self.global.platform, page_range, orig_perms)
+                };
+            }
+
+            let buf = if page_present {
+                let mut buf = vec![0u8; PAGE_SIZE];
+                // SAFETY: page is present (mapped), safe to read.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        page_addr as *const u8,
+                        buf.as_mut_ptr(),
+                        PAGE_SIZE,
+                    );
+                }
+                buf
+            } else {
+                // Page not yet in page tables (demand-paged). Content is zeros.
+                vec![0u8; PAGE_SIZE]
+            };
+            dirty.push((page_addr, buf));
+
+            // SAFETY: restoring the page's original (writable) permissions.
+            unsafe { cow_update_permissions(self.global.platform, page_range, orig_perms) }
+        } else {
+            // Parent thread faulting on a CoW-protected page. This can
+            // happen if the forking thread's shim code touches guest
+            // memory while CoW is active. Other parent threads should be
+            // parked and unable to reach here.
+            #[cfg(debug_assertions)]
+            litebox::log_println!(
+                self.global.platform,
+                "cow_fault: parent thread hit CoW page \
+                 addr={:#x} rip={:#x} tid={}",
+                fault_addr,
+                fault_rip,
+                self.tid,
+            );
+            let _ = fault_rip;
+            // Re-enable write without snapshotting — this is the forking
+            // thread's own access; the original data is already preserved
+            // in dirty_pages (eager) or will be snapshotted by the child
+            // (lazy).
+            // SAFETY: restoring the page's original (writable) permissions.
+            unsafe { cow_update_permissions(self.global.platform, page_range, orig_perms) }
+        }
+    }
+}
+
+/// Call `update_permissions` with the correct `PAGE_SIZE` const generic.
+/// Returns `true` on success, `false` on failure (so the fault is not
+/// considered handled and will escalate to process termination).
+///
+/// # Safety
+///
+/// Caller must ensure the range is mapped and the permission change is sound.
+unsafe fn cow_update_permissions(
+    platform: &Platform,
+    range: core::ops::Range<usize>,
+    perms: litebox::platform::page_mgmt::MemoryRegionPermissions,
+) -> bool {
+    use litebox::platform::PageManagementProvider;
+    unsafe {
+        <Platform as PageManagementProvider<PAGE_SIZE>>::update_permissions(platform, range, perms)
+    }
+    .is_ok()
 }
 
 enum Descriptor<FS: ShimFS> {
@@ -507,6 +715,38 @@ enum Descriptor<FS: ShimFS> {
         file: alloc::sync::Arc<syscalls::unix::UnixSocket<FS>>,
         close_on_exec: core::sync::atomic::AtomicBool,
     },
+}
+
+impl<FS: ShimFS> Clone for Descriptor<FS> {
+    /// Clone a descriptor for `fork()`. The underlying file objects are shared
+    /// via `Arc` (matching POSIX shared-file-description semantics).
+    /// `close_on_exec` flags are copied by value.
+    fn clone(&self) -> Self {
+        match self {
+            Descriptor::LiteBoxRawFd(raw) => Descriptor::LiteBoxRawFd(*raw),
+            Descriptor::Eventfd {
+                file,
+                close_on_exec,
+            } => Descriptor::Eventfd {
+                file: file.clone(),
+                close_on_exec: close_on_exec.load(Ordering::Relaxed).into(),
+            },
+            Descriptor::Epoll {
+                file,
+                close_on_exec,
+            } => Descriptor::Epoll {
+                file: file.clone(),
+                close_on_exec: close_on_exec.load(Ordering::Relaxed).into(),
+            },
+            Descriptor::Unix {
+                file,
+                close_on_exec,
+            } => Descriptor::Unix {
+                file: file.clone(),
+                close_on_exec: close_on_exec.load(Ordering::Relaxed).into(),
+            },
+        }
+    }
 }
 
 /// A strongly-typed FD.
@@ -617,6 +857,7 @@ impl<FS: ShimFS> Task<FS> {
             Ok(v) => v,
             Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
         };
+
         #[cfg(target_arch = "x86")]
         {
             ctx.eax = return_value;
@@ -639,8 +880,17 @@ impl<FS: ShimFS> Task<FS> {
         let syscall_number = ctx.orig_eax;
         #[cfg(target_arch = "x86_64")]
         let syscall_number = ctx.orig_rax;
-        let request =
-            SyscallRequest::<Platform>::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
+
+        let request = match SyscallRequest::<Platform>::try_from_raw(
+            syscall_number,
+            ctx,
+            log_unsupported_fmt,
+        ) {
+            Ok(req) => req,
+            Err(e) => {
+                return Err(e);
+            }
+        };
 
         match request {
             SyscallRequest::Exit { status } => {
@@ -651,6 +901,18 @@ impl<FS: ShimFS> Task<FS> {
                 self.sys_exit_group(status);
                 Ok(0)
             }
+            SyscallRequest::Wait4 {
+                pid,
+                wstatus,
+                options,
+                rusage,
+            } => self.sys_wait4(pid, wstatus, options, rusage),
+            SyscallRequest::Waitid {
+                idtype,
+                id,
+                infop,
+                options,
+            } => self.sys_waitid(idtype, id, infop, options),
             SyscallRequest::Execve {
                 pathname,
                 argv,
@@ -661,6 +923,7 @@ impl<FS: ShimFS> Task<FS> {
                 // requested indicates EOF.
                 if count <= MAX_KERNEL_BUF_SIZE {
                     let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
+
                     self.sys_read(fd, &mut kernel_buf, None).and_then(|size| {
                         buf.copy_from_slice(0, &kernel_buf[..size])
                             .map(|()| size)
@@ -703,7 +966,9 @@ impl<FS: ShimFS> Task<FS> {
                 Some(buf) => self.sys_write(fd, &buf, None),
                 None => Err(Errno::EFAULT),
             },
-            SyscallRequest::Close { fd } => syscall!(sys_close(fd)),
+            SyscallRequest::Close { fd } => {
+                syscall!(sys_close(fd))
+            }
             SyscallRequest::Lseek { fd, offset, whence } => {
                 use litebox::utils::TruncateExt as _;
                 syscalls::file::try_into_whence(whence.truncate())
@@ -731,7 +996,9 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::RtSigreturn => self.sys_rt_sigreturn(ctx),
             #[cfg(target_arch = "x86")]
             SyscallRequest::Sigreturn => self.sys_sigreturn(ctx),
-            SyscallRequest::Ioctl { fd, arg } => syscall!(sys_ioctl(fd, arg)),
+            SyscallRequest::Ioctl { fd, arg } => {
+                syscall!(sys_ioctl(fd, arg))
+            }
             SyscallRequest::Pread64 {
                 fd,
                 buf,
@@ -785,7 +1052,9 @@ impl<FS: ShimFS> Task<FS> {
                 oldfd,
                 newfd,
                 flags,
-            } => syscall!(sys_dup(oldfd, newfd, flags)),
+            } => {
+                syscall!(sys_dup(oldfd, newfd, flags))
+            }
             SyscallRequest::Socket {
                 domain,
                 type_and_flags,
@@ -819,6 +1088,12 @@ impl<FS: ShimFS> Task<FS> {
                 addrlen,
             } => self.sys_sendto(sockfd, buf, len, flags, addr, addrlen),
             SyscallRequest::Sendmsg { sockfd, msg, flags } => self.sys_sendmsg(sockfd, msg, flags),
+            SyscallRequest::Sendmmsg {
+                sockfd,
+                msgvec,
+                vlen,
+                flags,
+            } => self.sys_sendmmsg(sockfd, msgvec, vlen, flags),
             SyscallRequest::Recvfrom {
                 sockfd,
                 buf,
@@ -848,7 +1123,9 @@ impl<FS: ShimFS> Task<FS> {
                 optname,
                 optval,
                 optlen,
-            } => syscall!(sys_getsockopt(sockfd, level, optname, optval, optlen)),
+            } => self
+                .sys_getsockopt(sockfd, level, optname, optval, optlen)
+                .to_syscall_result(),
             SyscallRequest::Getsockname {
                 sockfd,
                 addr,
@@ -860,7 +1137,9 @@ impl<FS: ShimFS> Task<FS> {
                 addrlen,
             } => syscall!(sys_getpeername(sockfd, addr, addrlen)),
             SyscallRequest::Uname { buf } => syscall!(sys_uname(buf)),
-            SyscallRequest::Fcntl { fd, arg } => syscall!(sys_fcntl(fd, arg)),
+            SyscallRequest::Fcntl { fd, arg } => {
+                syscall!(sys_fcntl(fd, arg))
+            }
             SyscallRequest::Getcwd { buf, size: count } => {
                 let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
                 self.sys_getcwd(&mut kernel_buf).and_then(|size| {
@@ -874,7 +1153,7 @@ impl<FS: ShimFS> Task<FS> {
                 op,
                 fd,
                 event,
-            } => syscall!(sys_epoll_ctl(epfd, op, fd, event)),
+            } => self.sys_epoll_ctl(epfd, op, fd, event).to_syscall_result(),
             SyscallRequest::EpollCreate { size, flags } => {
                 // the `size` argument is ignored, but must be greater than zero;
                 if size > 0 {
@@ -982,6 +1261,41 @@ impl<FS: ShimFS> Task<FS> {
                 flags,
             } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
                 syscall!(sys_unlinkat(dirfd, path, flags))
+            }),
+            SyscallRequest::Renameat2 {
+                olddirfd,
+                oldpath,
+                newdirfd,
+                newpath,
+                flags,
+            } => {
+                let old = oldpath.to_cstring().ok_or(Errno::EFAULT)?;
+                let new = newpath.to_cstring().ok_or(Errno::EFAULT)?;
+                syscall!(sys_renameat2(olddirfd, old, newdirfd, new, flags))
+            }
+            SyscallRequest::Fchmod { fd: _, mode: _ }
+            | SyscallRequest::Fchown
+            | SyscallRequest::Fchownat => {
+                // Silently succeed; sandbox runs as a single user.
+                Ok(0)
+            }
+            SyscallRequest::Fsync { fd: _ }
+            | SyscallRequest::Fdatasync { fd: _ }
+            | SyscallRequest::Utimensat => {
+                // No-op for in-memory FS; data is always "persisted" and timestamps are ignored.
+                Ok(0)
+            }
+            SyscallRequest::Fchmodat {
+                dirfd: _,
+                pathname,
+                mode,
+            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                self.files
+                    .borrow()
+                    .fs
+                    .chmod(path, litebox::fs::Mode::from_bits_truncate(mode))
+                    .map_err(Errno::from)?;
+                Ok(0)
             }),
             SyscallRequest::Stat { pathname, buf } => {
                 pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
@@ -1100,6 +1414,10 @@ impl<FS: ShimFS> Task<FS> {
             }
             SyscallRequest::Getpid => Ok(self.sys_getpid().reinterpret_as_unsigned() as usize),
             SyscallRequest::Getppid => Ok(self.sys_getppid().reinterpret_as_unsigned() as usize),
+            SyscallRequest::Getpgid { pid } => self.sys_getpgid(pid).map(|v| v as usize),
+            SyscallRequest::Setpgid { pid, pgid } => self.sys_setpgid(pid, pgid).map(|()| 0),
+            SyscallRequest::Getsid { pid } => self.sys_getsid(pid).map(|v| v as usize),
+            SyscallRequest::Setsid => self.sys_setsid().map(|v| v as usize),
             SyscallRequest::Getuid => Ok(self.sys_getuid() as usize),
             SyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
             SyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),
@@ -1129,8 +1447,19 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
             SyscallRequest::SchedYield => {
-                // Do nothing until we have more scheduler integration with the
-                // platform.
+                // Yield the host thread so other host threads (including the
+                // network worker) get a chance to run.
+                // SAFETY: sched_yield is side-effect free.
+                unsafe { ::syscalls::raw::syscall0(::syscalls::Sysno::sched_yield) };
+                Ok(0)
+            }
+            SyscallRequest::SchedGetparam { pid: _, param } => {
+                // Write sched_priority = 0 (SCHED_OTHER default).
+                param.write_at_offset(0, 0i32).ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            SyscallRequest::SchedGetscheduler { pid: _ } => {
+                // Return SCHED_OTHER (0) — the default Linux scheduler policy.
                 Ok(0)
             }
             SyscallRequest::Futex { args } => self.sys_futex(args),
@@ -1156,8 +1485,6 @@ struct GlobalState<FS: ShimFS> {
     platform: &'static Platform,
     /// The LiteBox instance used throughout the shim.
     litebox: litebox::LiteBox<Platform>,
-    /// The page manager for managing virtual memory.
-    pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
     /// The futex manager for handling futex operations.
     futex_manager: FutexManager<Platform>,
     /// The anonymous pipe implementation.
@@ -1173,12 +1500,148 @@ struct GlobalState<FS: ShimFS> {
     next_thread_id: core::sync::atomic::AtomicI32,
     /// UNIX domain socket address table
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<FS>>,
+    /// Cross-process signal queue for delivering signals (e.g. SIGCHLD) between
+    /// processes. Entries are consumed by the target task during signal processing.
+    cross_process_signals: litebox::sync::Mutex<Platform, Vec<CrossProcessSignal>>,
+    /// Thread handles for each process's main thread, used to interrupt a
+    /// process when delivering a cross-process signal.
+    process_thread_handles: litebox::sync::RwLock<
+        Platform,
+        alloc::collections::BTreeMap<i32, alloc::sync::Arc<syscalls::process::ThreadRemote>>,
+    >,
+}
+
+/// A signal that needs to be delivered to a different process.
+struct CrossProcessSignal {
+    /// The target process's internal ID (ProcessId).
+    target_process_id: u32,
+    /// The signal to deliver.
+    signal: litebox_common_linux::signal::Signal,
+    /// The siginfo data.
+    siginfo: litebox_common_linux::signal::Siginfo,
+}
+
+/// Per-process state shared by all threads in a process.
+///
+/// Each process has its own `ProcessState` (wrapped in `Arc` so threads of the
+/// same process share it). When multi-process support is complete, forking
+/// will create a new `ProcessState` with a per-process `PageManager`
+/// initialized to the child's VA sub-range.
+struct ProcessState {
+    /// The page manager for managing this process's virtual memory.
+    pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
+    /// The address space ID for this process (VA partition on userland).
+    address_space_id: <Platform as litebox::platform::AddressSpaceProvider>::AddressSpaceId,
+    /// Number of active threads in this process (including the main thread).
+    /// Starts at 1 and is incremented on each `clone(CLONE_THREAD)`.
+    thread_count: core::sync::atomic::AtomicI32,
+    /// Active CoW state during a vfork window. Set by the forking thread
+    /// before spawning the child; cleared after restore. All threads in the
+    /// process check this on page faults and mprotect calls.
+    active_cow: litebox::sync::Mutex<Platform, Option<Arc<CowState>>>,
+    /// Per-fd ELF patching state for the runtime syscall rewriter.
+    elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
+    /// Maps guest fd numbers to the file path used at open time. Populated by
+    /// `sys_open` / `sys_openat`, cleared by `sys_close`. Used by the ELF
+    /// patch cache to identify library paths.
+    fd_paths:
+        litebox::sync::Mutex<Platform, alloc::collections::BTreeMap<i32, alloc::string::String>>,
+    /// Page-aligned start of the main binary's `.bss` region (zero-filled
+    /// portion of the writable PT_LOAD segment). Set once during ELF loading.
+    main_bss_start: core::sync::atomic::AtomicUsize,
+    /// Page-aligned end of the main binary's `.bss` region. Set once during
+    /// ELF loading.
+    main_bss_end: core::sync::atomic::AtomicUsize,
+    /// Futex for parking threads during vfork. The underlying atomic stores:
+    /// 0 = normal operation, 1 = park requested by the forking thread.
+    /// Other threads check this in `prepare_to_run_guest` and block until
+    /// the value returns to 0.
+    vfork_park: <Platform as litebox::platform::RawMutexProvider>::RawMutex,
+    /// Counter of threads that have parked. The forking thread waits on this
+    /// until the count reaches `thread_count - 1`, confirming all other
+    /// threads are safely stopped before modifying page permissions.
+    vfork_parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex,
+}
+
+/// One-shot synchronization primitive for vfork parent blocking.
+///
+/// The parent creates this before spawning the child and calls [`wait`](Self::wait)
+/// after the spawn succeeds. The child holds a clone and calls [`signal`](Self::signal)
+/// when it execs or exits, unblocking the parent.
+struct VforkDone {
+    done: core::sync::atomic::AtomicBool,
+    /// Waker for the parent thread — calling `wake()` causes the parent's
+    /// `wait_until` loop to re-evaluate the done flag.
+    parent_waker: litebox::event::wait::Waker<Platform>,
+}
+
+impl VforkDone {
+    fn new(parent_waker: litebox::event::wait::Waker<Platform>) -> Self {
+        Self {
+            done: core::sync::atomic::AtomicBool::new(false),
+            parent_waker,
+        }
+    }
+
+    /// Called by the child when it execs or exits.
+    fn signal(&self) {
+        self.done.store(true, Ordering::Release);
+        self.parent_waker.wake();
+    }
+
+    /// Returns `true` once the child has called [`signal`](Self::signal).
+    fn is_done(&self) -> bool {
+        self.done.load(Ordering::Acquire)
+    }
+}
+
+/// Copy-on-write state for vfork memory protection.
+///
+/// Created by the forking thread and stored in both `ProcessState` (for
+/// fault-handler access by any thread) and `ForkContext` (for the child).
+///
+/// All other parent threads are parked during the vfork window, so FULL CoW
+/// (all writable pages) is always used regardless of thread count.
+///
+/// **Eager vs lazy** (platform decision): Controls how pages are snapshotted.
+/// - Eager: all protected pages copied upfront, left writable.
+/// - Lazy: protected pages marked read-only, snapshotted on first fault.
+struct CowState {
+    /// Pages that were CoW-protected (base address, length, original permissions).
+    /// For lazy CoW these were made read-only; for eager CoW they were copied.
+    protected_ranges: Vec<(
+        usize,
+        usize,
+        litebox::platform::page_mgmt::MemoryRegionPermissions,
+    )>,
+    /// Per-page snapshots taken on child's first write (lazy) or upfront (eager):
+    /// (page-aligned addr, original content).
+    dirty_pages: litebox::sync::Mutex<Platform, Vec<(usize, Vec<u8>)>>,
+}
+
+/// Context for a vfork child process.
+///
+/// Stored in the child's `Task` after `do_fork`. The child temporarily uses
+/// the **parent's** `ProcessState` (vfork sharing). When the child calls
+/// `execve()`, it creates its own `ProcessState` using the partition range
+/// from `address_space_id`. When it calls `_exit()`, the partition is released.
+struct ForkContext {
+    /// The child's own address space ID (VA partition on userland).
+    address_space_id: <Platform as litebox::platform::AddressSpaceProvider>::AddressSpaceId,
+    /// Signals the parent to resume after the vfork child execs or exits.
+    vfork_done: Arc<VforkDone>,
 }
 
 struct Task<FS: ShimFS> {
     global: Arc<GlobalState<FS>>,
+    /// Per-process state shared across threads in the same process.
+    /// `RefCell` to support swapping to the child's own state on `execve`
+    /// after a vfork.
+    process_state: RefCell<Arc<ProcessState>>,
     wait_state: wait::WaitState,
     thread: syscalls::process::ThreadState,
+    /// The process identity from the core ProcessRegistry.
+    process_id: litebox::process::ProcessId,
     /// Process ID
     pid: i32,
     /// Parent Process ID
@@ -1196,6 +1659,10 @@ struct Task<FS: ShimFS> {
     files: RefCell<Arc<syscalls::file::FilesState<FS>>>,
     /// Signal state
     signals: syscalls::signal::SignalState,
+    /// Fork context for vfork children. `None` for the initial process and
+    /// for threads. Set when `do_fork` creates a child process. `RefCell`
+    /// because `sys_execve` consumes it via `take()` through `&self`.
+    fork_context: RefCell<Option<ForkContext>>,
 }
 
 impl<FS: ShimFS> Drop for Task<FS> {
@@ -1211,17 +1678,19 @@ mod test_utils {
     extern crate std;
     use super::*;
 
-    impl<FS: ShimFS> GlobalState<FS> {
-        /// Make a new task with default values for testing.
-        pub(crate) fn new_test_task(self: Arc<Self>, fs: alloc::sync::Arc<FS>) -> Task<FS> {
+    impl<FS: ShimFS> LinuxShim<FS> {
+        /// Create a new task with default values for testing.
+        pub(crate) fn new_test_task(self, fs: alloc::sync::Arc<FS>) -> Task<FS> {
             let pid = self
+                .global
                 .next_thread_id
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let files = Arc::new(syscalls::file::FilesState::new(fs));
-            files.initialize_stdio_in_shared_descriptors_table(&self);
+            files.initialize_stdio_in_shared_descriptors_table(&self.global);
             Task {
-                wait_state: wait::WaitState::new(self.platform),
+                wait_state: wait::WaitState::new(self.global.platform),
                 thread: syscalls::process::ThreadState::new_process(pid),
+                process_id: litebox::process::ProcessId::INIT,
                 pid,
                 ppid: 0,
                 tid: pid,
@@ -1235,7 +1704,9 @@ mod test_utils {
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
-                global: self,
+                fork_context: RefCell::new(None),
+                process_state: self.process_state.into(),
+                global: self.global,
             }
         }
     }
@@ -1250,7 +1721,9 @@ mod test_utils {
             let task = Task {
                 wait_state: wait::WaitState::new(self.global.platform),
                 global: self.global.clone(),
+                process_state: self.process_state.clone(),
                 thread: self.thread.new_thread(tid)?,
+                process_id: self.process_id,
                 pid: self.pid,
                 ppid: self.ppid,
                 tid,
@@ -1259,6 +1732,7 @@ mod test_utils {
                 fs: self.fs.clone(),
                 files: self.files.clone(),
                 signals: self.signals.clone_for_new_task(),
+                fork_context: RefCell::new(None),
             };
             Some(task)
         }

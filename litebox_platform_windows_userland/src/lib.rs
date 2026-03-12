@@ -48,6 +48,149 @@ thread_local! {
     static THREAD_FS_BASE: Cell<usize> = const { Cell::new(0) };
 }
 
+/// VA-partition constants for multi-process support.
+///
+/// Each guest process is assigned a non-overlapping 1 TiB VA partition.
+/// The number of partitions is determined at runtime from the platform's
+/// actual maximum user-mode address.
+mod va_partitions {
+    /// Size of each VA partition (1 TiB).
+    pub const PARTITION_SIZE: usize = 1 << 40;
+
+    /// The lowest usable guest address (matches `TASK_ADDR_MIN`).
+    pub const VA_MIN: usize = 0x1_0000;
+}
+
+/// Hardcoded upper bound for guest VA (one-past-the-end).
+///
+/// This must not exceed `GetSystemInfo().lpMaximumApplicationAddress + 1`.
+/// A `debug_assert` in `WindowsUserland::new()` validates this at runtime.
+const TASK_ADDR_MAX: usize = 0x7FFF_FFFE_F000;
+
+/// Tracks which VA partition slots are allocated.
+///
+/// Uses `Vec<bool>` so the number of slots can be determined at runtime
+/// from `GetSystemInfo().lpMaximumApplicationAddress`.
+struct PartitionState {
+    allocated: alloc::vec::Vec<bool>,
+}
+
+impl PartitionState {
+    /// Create a new partition state sized for the given VA range.
+    fn new(va_max: usize) -> Self {
+        let num_slots = va_max / va_partitions::PARTITION_SIZE;
+        Self {
+            allocated: alloc::vec![false; num_slots],
+        }
+    }
+
+    /// Number of partition slots.
+    fn num_slots(&self) -> usize {
+        self.allocated.len()
+    }
+
+    /// Claim the next free slot without checking for host allocations.
+    ///
+    /// Used for the initial address space (slot 0), which shares the VA
+    /// partition with the host process. Host allocations in this range are
+    /// expected and harmless because the initial guest pages are explicitly
+    /// mapped by the loader.
+    fn allocate(&mut self) -> Option<u32> {
+        for (i, used) in self.allocated.iter_mut().enumerate() {
+            if !*used {
+                *used = true;
+                return Some(i as u32);
+            }
+        }
+        None
+    }
+
+    /// Claim the next free slot whose VA range has no host allocations.
+    ///
+    /// Calls `probe` on each candidate slot's range. If `probe` returns `true`
+    /// (clean), the slot is allocated. Slots where `probe` returns `false` are
+    /// skipped (not marked allocated — they may become usable later).
+    fn allocate_probed(&mut self, probe: impl Fn(core::ops::Range<usize>) -> bool) -> Option<u32> {
+        let num_slots = self.num_slots();
+        for i in 0..num_slots {
+            if !self.allocated[i] {
+                let range = Self::compute_range(i as u32, num_slots);
+                if probe(range) {
+                    self.allocated[i] = true;
+                    return Some(i as u32);
+                }
+            }
+        }
+        None
+    }
+
+    /// Release a previously allocated slot.
+    ///
+    /// Returns `false` if the slot is out of range or not currently allocated.
+    fn deallocate(&mut self, slot: u32) -> bool {
+        let idx = slot as usize;
+        if idx >= self.num_slots() {
+            return false;
+        }
+        if !self.allocated[idx] {
+            return false;
+        }
+        self.allocated[idx] = false;
+        true
+    }
+
+    /// Returns `true` if the given slot is currently allocated.
+    fn is_allocated(&self, slot: u32) -> bool {
+        let idx = slot as usize;
+        idx < self.num_slots() && self.allocated[idx]
+    }
+
+    /// Return the VA range for the given slot, clipped to `VA_MIN..va_max`.
+    fn range_of(&self, slot: u32) -> core::ops::Range<usize> {
+        Self::compute_range(slot, self.num_slots())
+    }
+
+    /// Compute the VA range for a slot given the total number of slots.
+    fn compute_range(slot: u32, num_slots: usize) -> core::ops::Range<usize> {
+        let base = (slot as usize) * va_partitions::PARTITION_SIZE;
+        let va_max = num_slots * va_partitions::PARTITION_SIZE;
+        let start = base.max(va_partitions::VA_MIN);
+        let end = (base + va_partitions::PARTITION_SIZE).min(va_max);
+        start..end
+    }
+}
+
+/// Probe a VA range with `VirtualQuery` to check for host allocations.
+///
+/// Returns `true` if the entire range is free (`MEM_FREE`), meaning no
+/// host DLLs, heap, or system allocations occupy it. Used at partition
+/// allocation time to skip slots with ASLR-placed host mappings.
+fn is_va_range_clean(range: core::ops::Range<usize>) -> bool {
+    let mut addr = range.start;
+    while addr < range.end {
+        let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+        let ok = unsafe {
+            Win32_Memory::VirtualQuery(
+                addr as *const c_void,
+                &raw mut mbi,
+                core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+            ) != 0
+        };
+        if !ok {
+            // VirtualQuery failed — treat as unclean to be safe.
+            return false;
+        }
+        if mbi.State != Win32_Memory::MEM_FREE {
+            return false;
+        }
+        addr = mbi.BaseAddress as usize + mbi.RegionSize;
+        if addr == 0 {
+            break;
+        }
+    }
+    true
+}
+
 /// The userland Windows platform.
 ///
 /// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
@@ -55,6 +198,7 @@ thread_local! {
 pub struct WindowsUserland {
     reserved_pages: alloc::vec::Vec<core::ops::Range<usize>>,
     sys_info: std::sync::RwLock<Win32_SysInfo::SYSTEM_INFO>,
+    partitions: Mutex<PartitionState>,
 }
 
 impl core::fmt::Debug for WindowsUserland {
@@ -222,28 +366,48 @@ impl WindowsUserland {
         let mut sys_info = Win32_SysInfo::SYSTEM_INFO::default();
         Self::get_system_information(&mut sys_info);
 
-        // TODO(chuqi): Currently we just print system information for
-        // `TASK_ADDR_MIN` and `TASK_ADDR_MAX`.
-        // Will remove these prints once we have a better way to replace
-        // the current `const` values in PageManagementProvider.
+        let va_min = sys_info.lpMinimumApplicationAddress as usize;
+        let va_max = sys_info.lpMaximumApplicationAddress as usize;
         #[cfg(debug_assertions)]
         {
             println!("System information.");
-            println!(
-                "=> Max user address: {:#x}",
-                sys_info.lpMaximumApplicationAddress as usize
-            );
-            println!(
-                "=> Min user address: {:#x}",
-                sys_info.lpMinimumApplicationAddress as usize
-            );
+            println!("=> Max user address: {va_max:#x}");
+            println!("=> Min user address: {va_min:#x}");
         }
+
+        // Validate that the hardcoded PageManagementProvider constants are
+        // consistent with the runtime values from GetSystemInfo. These run
+        // once at startup, so assert! (not debug_assert!) is appropriate.
+        assert!(
+            va_min <= va_partitions::VA_MIN,
+            "runtime lpMinimumApplicationAddress ({va_min:#x}) is above \
+             VA_MIN ({:#x})",
+            va_partitions::VA_MIN,
+        );
+        // va_max from GetSystemInfo is the last usable byte (inclusive).
+        // TASK_ADDR_MAX is one-past-the-end, so compare without overflow.
+        assert!(
+            TASK_ADDR_MAX - 1 <= va_max,
+            "hardcoded TASK_ADDR_MAX ({TASK_ADDR_MAX:#x}) exceeds runtime \
+             lpMaximumApplicationAddress ({va_max:#x})",
+        );
+
+        // +1 to convert from inclusive last-byte to exclusive upper bound.
+        // Safe: on 64-bit Windows, va_max is always well below usize::MAX.
+        let partitions = PartitionState::new(va_max + 1);
+        #[cfg(debug_assertions)]
+        println!(
+            "=> VA partitions: {} slots of {} bytes each",
+            partitions.num_slots(),
+            va_partitions::PARTITION_SIZE,
+        );
 
         let reserved_pages = Self::read_memory_maps();
 
         let platform = Self {
             reserved_pages,
             sys_info: std::sync::RwLock::new(sys_info),
+            partitions: Mutex::new(partitions),
         };
 
         // Initialize it's own fs-base (for the main thread)
@@ -346,6 +510,76 @@ impl litebox::platform::SignalProvider for WindowsUserland {
         for signal in sigs {
             f(signal);
         }
+    }
+}
+
+impl litebox::platform::AddressSpaceProvider for WindowsUserland {
+    type AddressSpaceId = u32;
+
+    // The Windows exception dispatcher, allocator metadata, and globals all
+    // live in the shared address space. A CoW page fault inside the handler
+    // would be fatal, so we must eagerly snapshot all writable pages.
+    const EAGER_COW_FOR_VFORK: bool = true;
+
+    fn create_address_space(
+        &self,
+    ) -> Result<Self::AddressSpaceId, litebox::platform::address_space::AddressSpaceError> {
+        // The initial address space shares slot 0 with the host process.
+        // Host allocations (exe, DLLs, heap) are expected in this range,
+        // so skip the VirtualQuery cleanliness probe.
+        self.partitions
+            .lock()
+            .unwrap()
+            .allocate()
+            .ok_or(litebox::platform::address_space::AddressSpaceError::NoSpace)
+    }
+
+    fn destroy_address_space(
+        &self,
+        id: Self::AddressSpaceId,
+    ) -> Result<(), litebox::platform::address_space::AddressSpaceError> {
+        if !self.partitions.lock().unwrap().deallocate(id) {
+            return Err(litebox::platform::address_space::AddressSpaceError::InvalidId);
+        }
+        Ok(())
+    }
+
+    fn fork_address_space(
+        &self,
+        parent: Self::AddressSpaceId,
+    ) -> Result<
+        litebox::platform::address_space::ForkedAddressSpace<Self::AddressSpaceId>,
+        litebox::platform::address_space::AddressSpaceError,
+    > {
+        // Validate parent and allocate child under a single lock to avoid
+        // TOCTOU races (the Linux impl drops and re-acquires the lock).
+        let mut partitions = self.partitions.lock().unwrap();
+        if !partitions.is_allocated(parent) {
+            return Err(litebox::platform::address_space::AddressSpaceError::InvalidId);
+        }
+        let child = partitions
+            .allocate_probed(is_va_range_clean)
+            .ok_or(litebox::platform::address_space::AddressSpaceError::NoSpace)?;
+        Ok(litebox::platform::address_space::ForkedAddressSpace::SharedWithParent(child))
+    }
+
+    fn activate_address_space(
+        &self,
+        _id: Self::AddressSpaceId,
+    ) -> Result<(), litebox::platform::address_space::AddressSpaceError> {
+        // No-op on userland — all processes share the host address space.
+        Ok(())
+    }
+
+    fn address_space_range(
+        &self,
+        id: Self::AddressSpaceId,
+    ) -> Result<core::ops::Range<usize>, litebox::platform::address_space::AddressSpaceError> {
+        let partitions = self.partitions.lock().unwrap();
+        if !partitions.is_allocated(id) {
+            return Err(litebox::platform::address_space::AddressSpaceError::InvalidId);
+        }
+        Ok(partitions.range_of(id))
     }
 }
 
@@ -792,8 +1026,11 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
         >,
     ) -> Result<(), Self::ThreadSpawnError> {
         let ctx = ctx.clone();
-        // TODO: do we need to wait for the handle in the main thread?
-        let _handle = std::thread::Builder::new().spawn(move || thread_start(init_thread, ctx))?;
+        // Use 8 MiB stack (matching Linux default) to avoid overflow from
+        // deeply-nested shim call chains. Windows default is only 1 MiB.
+        let _handle = std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || thread_start(init_thread, ctx))?;
 
         Ok(())
     }
@@ -1517,12 +1754,8 @@ macro_rules! debug_assert_alignment {
 }
 
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for WindowsUserland {
-    // TODO(chuqi): These are currently "magic numbers" grabbed from my Windows 11 SystemInformation.
-    // The actual values should be determined by `GetSystemInfo()`.
-    //
-    // NOTE: make sure the values are PAGE_ALIGNED.
-    const TASK_ADDR_MIN: usize = 0x1_0000;
-    const TASK_ADDR_MAX: usize = 0x7FFF_FFFE_F000;
+    const TASK_ADDR_MIN: usize = va_partitions::VA_MIN;
+    const TASK_ADDR_MAX: usize = TASK_ADDR_MAX;
     fn allocate_pages(
         &self,
         suggested_range: core::ops::Range<usize>,
@@ -1691,19 +1924,39 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         range: core::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
         debug_assert_alignment!(range, ALIGN);
+
+        // Slot 0 shares its VA partition with the host process: the Rust
+        // runtime heap, thread stacks, TEB/PEB, and other host allocations
+        // all live in the same 1 TiB range.  VirtualFree(MEM_DECOMMIT) on
+        // guest pages in slot 0 can inadvertently decommit pages whose
+        // underlying VA the host still needs (e.g. allocator metadata),
+        // leading to silent crashes or hangs.  Skip the explicit decommit
+        // for slot 0 — the OS reclaims all memory on process exit.
+        //
+        // Child partitions (slots 1+) are probed-clean and only contain
+        // guest-allocated pages, so VirtualFree is safe for them.
+        if range.start < va_partitions::PARTITION_SIZE {
+            return Ok(());
+        }
+
         process_memory_range_by_regions(
             range,
             |r, state| -> Result<bool, std::convert::Infallible> {
-                debug_assert_ne!(
-                    state,
-                    Win32_Memory::MEM_FREE,
-                    "Trying to deallocate a free region: {:p}-{:p}",
-                    r.start as *mut c_void,
-                    r.end as *mut c_void
-                );
-                Ok(unsafe {
+                if state == Win32_Memory::MEM_FREE {
+                    return Ok(true);
+                }
+                let ret = unsafe {
                     VirtualFree(r.start as *mut c_void, r.len(), Win32_Memory::MEM_DECOMMIT)
-                } != 0)
+                };
+                debug_assert_ne!(
+                    ret,
+                    0,
+                    "VirtualFree(MEM_DECOMMIT) failed on child partition region {:p}-{:p}: {}",
+                    r.start as *mut c_void,
+                    r.end as *mut c_void,
+                    std::io::Error::last_os_error()
+                );
+                Ok(true)
             },
         )
         .expect("deallocate_pages failed");
@@ -1737,6 +1990,18 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         Ok(())
     }
 
+    /// Returns host memory regions that are reserved or committed at boot time.
+    ///
+    /// These are scanned once during `WindowsUserland::new()` via `VirtualQuery`
+    /// and remain static for the platform's lifetime. The `PageManager` for each
+    /// child process clamps these to its partition VA range automatically
+    /// (see `Vmem::new()` in `litebox/src/mm/linux.rs`).
+    ///
+    /// **Known limitation:** Post-boot host allocations (lazy `LoadLibrary`,
+    /// thread stacks, heap growth) are not reflected here. The partition-time
+    /// `VirtualQuery` probing in `allocate_probed(is_va_range_clean)` provides
+    /// a runtime safety net at partition creation time, but not at every
+    /// individual page allocation.
     fn reserved_pages(&self) -> impl Iterator<Item = &std::ops::Range<usize>> {
         self.reserved_pages.iter()
     }
@@ -1844,6 +2109,45 @@ unsafe extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext<'_>) 
     thread_ctx.call_shim(|shim, ctx, _interrupt| shim.syscall(ctx));
 }
 
+/// Check whether the page at `addr` is committed (has physical storage).
+///
+/// Uses `VirtualQuery` to inspect the page state. Returns `true` only for
+/// `MEM_COMMIT` pages; `MEM_RESERVE` and `MEM_FREE` return `false`.
+fn is_page_committed(addr: usize) -> bool {
+    let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+    // Safety: VirtualQuery reads kernel VA metadata; the address may be
+    // unmapped but VirtualQuery still succeeds (returns MEM_FREE).
+    let ok = unsafe {
+        Win32_Memory::VirtualQuery(
+            addr as *const c_void,
+            &raw mut mbi,
+            core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+        ) != 0
+    };
+    ok && mbi.State == Win32_Memory::MEM_COMMIT
+}
+
+/// Synthesize a Linux-style x86 page-fault error code from Windows
+/// exception information.
+///
+/// Bits:
+/// - 0: present (page committed but access denied)
+/// - 1: write fault
+/// - 2: user-mode (always set)
+/// - 4: instruction fetch (DEP)
+///
+/// `read_write_flag` is `ExceptionInformation[0]` from
+/// `EXCEPTION_ACCESS_VIOLATION`: 0 = read, 1 = write, 8 = DEP.
+fn synthesize_pf_error_code(is_present: bool, read_write_flag: usize) -> u32 {
+    (if is_present { 1 } else { 0 })
+        | match read_write_flag {
+            0 => 0,      // read fault
+            8 => 1 << 4, // DEP (instruction fetch)
+            _ => 1 << 1, // write fault
+        }
+        | 4 // bit 2: user-mode
+}
+
 unsafe extern "C-unwind" fn exception_handler(
     thread_ctx: &mut ThreadContext<'_>,
     exception_record: &EXCEPTION_RECORD,
@@ -1857,7 +2161,8 @@ unsafe extern "C-unwind" fn exception_handler(
                 // This is probably a #GP, not a #PF.
                 (Exception::GENERAL_PROTECTION_FAULT, 0, 0)
             } else {
-                let error_code = 4 | if read_write_flag == 0 { 0 } else { 1 << 1 }; // PF error code: bit 1 = write
+                let is_present = is_page_committed(faulting_address);
+                let error_code = synthesize_pf_error_code(is_present, read_write_flag);
                 (Exception::PAGE_FAULT, error_code, faulting_address)
             }
         }
@@ -2111,5 +2416,174 @@ mod tests {
         .unwrap()
         .as_usize();
         assert_ne!(addr3, addr + 0x4000);
+    }
+
+    // -- Step 3.2: error-code synthesis tests --
+
+    #[test]
+    fn test_synthesize_pf_error_code() {
+        use super::synthesize_pf_error_code;
+
+        // Write to committed (present) page → CoW case: bits 0+1+2 = 0b111 = 0x7
+        assert_eq!(synthesize_pf_error_code(true, 1), 0x7);
+        // Shim CoW check: (error_code & 0x3) == 0x3
+        assert_eq!(synthesize_pf_error_code(true, 1) & 0x3, 0x3);
+
+        // Write to unmapped page: bits 1+2 = 0b110 = 0x6
+        assert_eq!(synthesize_pf_error_code(false, 1), 0x6);
+        assert_ne!(synthesize_pf_error_code(false, 1) & 0x3, 0x3);
+
+        // Read, committed page: bits 0+2 = 0b101 = 0x5
+        assert_eq!(synthesize_pf_error_code(true, 0), 0x5);
+
+        // Read, unmapped page: bit 2 only = 0b100 = 0x4
+        assert_eq!(synthesize_pf_error_code(false, 0), 0x4);
+
+        // DEP, committed page: bits 0+4+2 = 0x15
+        assert_eq!(synthesize_pf_error_code(true, 8), 0x15);
+
+        // DEP, uncommitted page: bits 4+2 = 0x14
+        assert_eq!(synthesize_pf_error_code(false, 8), 0x14);
+    }
+
+    #[test]
+    fn test_is_page_committed_states() {
+        use super::is_page_committed;
+
+        // Committed page → true
+        let addr = unsafe {
+            super::VirtualAlloc2(
+                super::GetCurrentProcess(),
+                core::ptr::null_mut(),
+                0x1000,
+                super::Win32_Memory::MEM_COMMIT | super::Win32_Memory::MEM_RESERVE,
+                super::Win32_Memory::PAGE_READWRITE,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        assert!(!addr.is_null());
+        assert!(is_page_committed(addr as usize));
+
+        // Change to read-only — still committed
+        let mut old_protect = 0u32;
+        let ok = unsafe {
+            super::VirtualProtect(
+                addr,
+                0x1000,
+                super::Win32_Memory::PAGE_READONLY,
+                &mut old_protect,
+            ) != 0
+        };
+        assert!(ok);
+        assert!(is_page_committed(addr as usize));
+
+        // Free the page → not committed
+        let ok = unsafe { super::VirtualFree(addr, 0, super::Win32_Memory::MEM_RELEASE) != 0 };
+        assert!(ok);
+        assert!(!is_page_committed(addr as usize));
+
+        // Reserved-only (no commit) → not committed
+        let reserved = unsafe {
+            super::VirtualAlloc2(
+                super::GetCurrentProcess(),
+                core::ptr::null_mut(),
+                0x1000,
+                super::Win32_Memory::MEM_RESERVE,
+                super::Win32_Memory::PAGE_READWRITE,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        assert!(!reserved.is_null());
+        assert!(!is_page_committed(reserved as usize));
+        let ok = unsafe { super::VirtualFree(reserved, 0, super::Win32_Memory::MEM_RELEASE) != 0 };
+        assert!(ok);
+    }
+
+    // -- Step 3.3: VirtualProtect round-trip tests --
+
+    #[test]
+    fn test_virtualprotect_cow_roundtrip() {
+        let addr = unsafe {
+            super::VirtualAlloc2(
+                super::GetCurrentProcess(),
+                core::ptr::null_mut(),
+                0x1000,
+                super::Win32_Memory::MEM_COMMIT | super::Win32_Memory::MEM_RESERVE,
+                super::Win32_Memory::PAGE_READWRITE,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        assert!(!addr.is_null());
+
+        let mut old_protect = 0u32;
+
+        // RW → RO
+        assert_ne!(
+            unsafe {
+                super::VirtualProtect(
+                    addr,
+                    0x1000,
+                    super::Win32_Memory::PAGE_READONLY,
+                    &mut old_protect,
+                )
+            },
+            0
+        );
+        // RO → RW
+        assert_ne!(
+            unsafe {
+                super::VirtualProtect(
+                    addr,
+                    0x1000,
+                    super::Win32_Memory::PAGE_READWRITE,
+                    &mut old_protect,
+                )
+            },
+            0
+        );
+
+        // XRW → XR
+        assert_ne!(
+            unsafe {
+                super::VirtualProtect(
+                    addr,
+                    0x1000,
+                    super::Win32_Memory::PAGE_EXECUTE_READWRITE,
+                    &mut old_protect,
+                )
+            },
+            0
+        );
+        assert_ne!(
+            unsafe {
+                super::VirtualProtect(
+                    addr,
+                    0x1000,
+                    super::Win32_Memory::PAGE_EXECUTE_READ,
+                    &mut old_protect,
+                )
+            },
+            0
+        );
+        // XR → XRW
+        assert_ne!(
+            unsafe {
+                super::VirtualProtect(
+                    addr,
+                    0x1000,
+                    super::Win32_Memory::PAGE_EXECUTE_READWRITE,
+                    &mut old_protect,
+                )
+            },
+            0
+        );
+
+        assert_ne!(
+            unsafe { super::VirtualFree(addr, 0, super::Win32_Memory::MEM_RELEASE) },
+            0
+        );
     }
 }

@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 
 extern crate alloc;
 
+#[cfg(feature = "broker")]
+pub mod broker_client;
+
 /// Run Linux programs with LiteBox on unmodified Linux
 #[derive(Parser, Debug)]
 #[allow(clippy::struct_excessive_bools)]
@@ -77,6 +80,22 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub program_from_tar: bool,
+    /// Connect to a file broker at the given gRPC endpoint (e.g., http://127.0.0.1:50051).
+    ///
+    /// When set, an additional broker-backed filesystem layer is added that provides
+    /// policy-enforced access to external files served by the broker process.
+    #[cfg(feature = "broker")]
+    #[arg(
+        long = "broker-endpoint",
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
+    pub broker_endpoint: Option<String>,
+
+    /// Set the initial working directory for the sandboxed process.
+    /// Defaults to "/".
+    #[arg(long = "cwd", requires = "unstable", help_heading = "Unstable Options")]
+    pub working_directory: Option<String>,
 }
 
 /// Backends supported for intercepting syscalls
@@ -88,9 +107,6 @@ pub enum InterceptionBackend {
     /// Depend purely on rewriten syscalls to intercept them
     Rewriter,
 }
-
-static REQUIRE_RTLD_AUDIT: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
 
 struct MmappedFile {
     data: &'static [u8],
@@ -128,17 +144,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         unimplemented!(
             "this should (hopefully soon) have a nicer interface to support loading in files"
         )
-    }
-
-    // --program-from-tar loads pre-rewritten binaries that depend on litebox_rtld_audit.so,
-    // which is only injected by the rewriter backend.
-    if cli_args.program_from_tar
-        && !matches!(cli_args.interception_backend, InterceptionBackend::Rewriter)
-    {
-        anyhow::bail!(
-            "--program-from-tar requires --interception-backend=rewriter \
-             (the packaged binary is pre-rewritten and needs the audit library)"
-        );
     }
 
     // When loading from tar, the program path is a guest-internal path and must
@@ -219,122 +224,156 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     }
 
     litebox_platform_multiplex::set_platform(platform);
-    let mut shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
+
+    // When a broker endpoint is provided, create a broker-enabled FS stack.
+    // This must be a separate branch because the FS type differs at compile time.
+    #[cfg(feature = "broker")]
+    if let Some(ref endpoint) = cli_args.broker_endpoint {
+        let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
+        let litebox = shim_builder.litebox();
+        let (in_mem, tar_ro) = build_initial_fs(
+            litebox,
+            &cli_args,
+            &ancestor_modes_and_users,
+            prog_data,
+            tar_data,
+        )?;
+        let default_fs = shim_builder.default_fs(in_mem, tar_ro);
+
+        eprintln!("Connecting to file broker at {endpoint}...");
+        let transport = broker_client::GrpcBrokerTransport::connect(endpoint)
+            .map_err(|e| anyhow!("Failed to connect to broker at {endpoint}: {e}"))?;
+        eprintln!("File broker connected.");
+
+        let broker_fs = litebox::fs::broker::FileSystem::new(litebox, transport);
+        let combined = litebox::fs::layered::FileSystem::new(
+            litebox,
+            default_fs,
+            broker_fs,
+            litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
+        );
+        return finish_run(shim_builder, combined, &cli_args);
+    }
+
+    // Default path: no broker.
+    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     let litebox = shim_builder.litebox();
-    let initial_file_system = {
-        let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
+    let (in_mem, tar_ro) = build_initial_fs(
+        litebox,
+        &cli_args,
+        &ancestor_modes_and_users,
+        prog_data,
+        tar_data,
+    )?;
+    let default_fs = shim_builder.default_fs(in_mem, tar_ro);
+    finish_run(shim_builder, default_fs, &cli_args)
+}
 
-        // When loading the program from the tar, we don't need to create ancestor
-        // directories or write the program binary into the in-memory FS -- the program
-        // is already in the tar layer.
-        if let Some(prog_data) = prog_data {
-            let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
-            let ancestors: Vec<_> = prog.ancestors().collect();
-            let mut prev_user = 0;
-            for (path, &mode_and_user) in ancestors
-                .into_iter()
-                .skip(1)
-                .rev()
-                .skip(1)
-                .zip(&ancestor_modes_and_users)
-            {
-                if prev_user == 0 {
-                    // require root user
-                    in_mem.with_root_privileges(|fs| {
-                        fs.mkdir(path.to_str().unwrap(), mode_and_user.0).unwrap();
-                        if mode_and_user.1 != 0 {
-                            // This file is owned by a non-root user, so we need to set the ownership to our default user
-                            fs.chown(path.to_str().unwrap(), Some(1000), Some(1000))
-                                .unwrap();
-                        }
-                    });
-                } else {
-                    in_mem
-                        .mkdir(path.to_str().unwrap(), mode_and_user.0)
-                        .unwrap();
-                }
-                prev_user = mode_and_user.1;
-            }
+/// Build the in-memory and tar read-only file systems, including program data and /tmp.
+///
+/// This is extracted so that both the default and broker-enabled code paths can share it.
+#[allow(clippy::type_complexity)]
+fn build_initial_fs(
+    litebox: &litebox::LiteBox<Platform>,
+    cli_args: &CliArgs,
+    ancestor_modes_and_users: &[(litebox::fs::Mode, u32)],
+    prog_data: Option<alloc::borrow::Cow<'static, [u8]>>,
+    tar_data: &'static [u8],
+) -> Result<(
+    litebox::fs::in_mem::FileSystem<Platform>,
+    litebox::fs::tar_ro::FileSystem<Platform>,
+)> {
+    let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
 
-            let open_file =
-                |fs: &mut litebox::fs::in_mem::FileSystem<litebox_platform_multiplex::Platform>,
-                 path,
-                 mode| {
-                    let fd = fs
-                        .open(
-                            path,
-                            litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
-                            mode,
-                        )
-                        .unwrap();
-                    fs.initialize_primarily_read_heavy_file(&fd, prog_data);
-                    fs.close(&fd).unwrap();
-                };
-            let last = ancestor_modes_and_users.last().ok_or_else(|| {
-                anyhow!("program path has no ancestor directories (is it the root path?)")
-            })?;
+    // When loading the program from the tar, we don't need to create ancestor
+    // directories or write the program binary into the in-memory FS -- the program
+    // is already in the tar layer.
+    if let Some(prog_data) = prog_data {
+        let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
+        let ancestors: Vec<_> = prog.ancestors().collect();
+        let mut prev_user = 0;
+        for (path, &mode_and_user) in ancestors
+            .into_iter()
+            .skip(1)
+            .rev()
+            .skip(1)
+            .zip(ancestor_modes_and_users)
+        {
             if prev_user == 0 {
                 in_mem.with_root_privileges(|fs| {
-                    open_file(fs, prog.to_str().unwrap(), last.0);
-                    if last.1 != 0 {
-                        // This file is owned by a non-root user, so we need to set the ownership to our default user
-                        fs.chown(prog.to_str().unwrap(), Some(1000), Some(1000))
+                    fs.mkdir(path.to_str().unwrap(), mode_and_user.0).unwrap();
+                    if mode_and_user.1 != 0 {
+                        fs.chown(path.to_str().unwrap(), Some(1000), Some(1000))
                             .unwrap();
                     }
                 });
             } else {
-                open_file(&mut in_mem, prog.to_str().unwrap(), last.0);
+                in_mem
+                    .mkdir(path.to_str().unwrap(), mode_and_user.0)
+                    .unwrap();
             }
+            prev_user = mode_and_user.1;
         }
-        in_mem.with_root_privileges(|fs| {
-            let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
-            if let Err(err) = fs.mkdir("/tmp", mode) {
-                match err {
-                    litebox::fs::errors::MkdirError::AlreadyExists => {
-                        fs.chmod("/tmp", mode).expect("Failed to call chmod");
-                    }
-                    _ => panic!(),
+
+        let open_file =
+            |fs: &mut litebox::fs::in_mem::FileSystem<litebox_platform_multiplex::Platform>,
+             path,
+             mode| {
+                let fd = fs
+                    .open(
+                        path,
+                        litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
+                        mode,
+                    )
+                    .unwrap();
+                fs.initialize_primarily_read_heavy_file(&fd, prog_data);
+                fs.close(&fd).unwrap();
+            };
+        let last = ancestor_modes_and_users.last().ok_or_else(|| {
+            anyhow!("program path has no ancestor directories (is it the root path?)")
+        })?;
+        if prev_user == 0 {
+            in_mem.with_root_privileges(|fs| {
+                open_file(fs, prog.to_str().unwrap(), last.0);
+                if last.1 != 0 {
+                    fs.chown(prog.to_str().unwrap(), Some(1000), Some(1000))
+                        .unwrap();
                 }
-            }
-        });
-
-        // When using the rewriter backend, automatically include litebox_rtld_audit.so
-        // in the filesystem so tests and users don't need to include it in tar files
-        match cli_args.interception_backend {
-            InterceptionBackend::Rewriter => {
-                #[cfg(not(target_arch = "x86_64"))]
-                eprintln!("WARN: litebox_rtld_audit not currently supported on non-x86_64 arch");
-                #[cfg(target_arch = "x86_64")]
-                in_mem.with_root_privileges(|fs| {
-                    let rwxr_xr_x = Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH;
-                    let _ = fs.mkdir("/lib", rwxr_xr_x);
-                    let fd = fs
-                        .open(
-                            "/lib/litebox_rtld_audit.so",
-                            litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
-                            rwxr_xr_x,
-                        )
-                        .expect("Failed to create /lib/litebox_rtld_audit.so");
-                    fs.initialize_primarily_read_heavy_file(
-                        &fd,
-                        include_bytes!(concat!(env!("OUT_DIR"), "/litebox_rtld_audit.so")).into(),
-                    );
-                    fs.close(&fd)
-                        .expect("Failed to close /lib/litebox_rtld_audit.so");
-                });
-            }
-            InterceptionBackend::Seccomp => {
-                // No need to include rtld_audit.so for seccomp backend
+            });
+        } else {
+            open_file(&mut in_mem, prog.to_str().unwrap(), last.0);
+        }
+    }
+    in_mem.with_root_privileges(|fs| {
+        let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
+        if let Err(err) = fs.mkdir("/tmp", mode) {
+            match err {
+                litebox::fs::errors::MkdirError::AlreadyExists => {
+                    fs.chmod("/tmp", mode).expect("Failed to call chmod");
+                }
+                _ => panic!(),
             }
         }
+    });
 
-        let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
-        shim_builder.default_fs(in_mem, tar_ro)
-    };
+    // When using the rewriter backend, the shim's mmap hook handles
+    // syscall patching at runtime — no audit library needed.
 
-    // We need to get the file path before enabling seccomp.
-    // For --program-from-tar the path is already validated as absolute above,
-    // so use it directly instead of resolving against the host CWD.
+    let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
+    Ok((in_mem, tar_ro))
+}
+
+/// Complete the run after the file system has been composed and the shim builder is ready.
+///
+/// This is generic over the file system type so it can handle both the default and
+/// broker-enabled FS compositions.
+fn finish_run<FS: litebox_shim_linux::ShimFS>(
+    mut shim_builder: litebox_shim_linux::LinuxShimBuilder,
+    fs: FS,
+    cli_args: &CliArgs,
+) -> Result<()> {
+    let platform = litebox_platform_multiplex::platform();
+
     let prog = if cli_args.program_from_tar {
         PathBuf::from(&cli_args.program_and_arguments[0])
     } else {
@@ -347,7 +386,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         )
     })?;
 
-    let initial_file_system = std::sync::Arc::new(initial_file_system);
+    let initial_file_system = std::sync::Arc::new(fs);
 
     shim_builder.set_load_filter(fixup_env);
     let shim = shim_builder.build();
@@ -369,11 +408,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                         }
                     }
                 };
-                litebox_platform_multiplex::platform()
-                    .wait_on_tun(Some(timeout.unwrap_or(DEFAULT_TIMEOUT)));
+                let wait = match timeout {
+                    Some(t) if t < DEFAULT_TIMEOUT => t,
+                    _ => DEFAULT_TIMEOUT,
+                };
+                litebox_platform_multiplex::platform().wait_on_tun(Some(wait));
             }
-            // Final flush
-            // TODO: keep running until all sockets are closed?
             while shim.perform_network_interaction().call_again_immediately() {}
         });
         Some(child)
@@ -384,7 +424,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     match cli_args.interception_backend {
         InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),
         InterceptionBackend::Rewriter => {
-            REQUIRE_RTLD_AUDIT.store(true, core::sync::atomic::Ordering::SeqCst);
+            // The shim's mmap hook handles syscall patching at runtime —
+            // no audit library or other setup needed.
         }
     }
 
@@ -420,6 +461,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         prog_path,
         argv,
         envp,
+        cli_args.working_directory.clone(),
     )?;
 
     #[cfg(feature = "lock_tracing")]
@@ -466,13 +508,7 @@ fn pin_thread_to_cpu(cpu: usize) {
     }
 }
 
-fn fixup_env(envp: &mut Vec<alloc::ffi::CString>) {
-    // Enable the audit library to load trampoline code for rewritten binaries.
-    if REQUIRE_RTLD_AUDIT.load(core::sync::atomic::Ordering::SeqCst) {
-        let p = c"LD_AUDIT=/lib/litebox_rtld_audit.so";
-        let has_ld_audit = envp.iter().any(|var| var.as_c_str() == p);
-        if !has_ld_audit {
-            envp.push(p.into());
-        }
-    }
+fn fixup_env(_envp: &mut Vec<alloc::ffi::CString>) {
+    // No environment fixups needed — the shim's mmap hook handles
+    // syscall patching at runtime without LD_AUDIT.
 }

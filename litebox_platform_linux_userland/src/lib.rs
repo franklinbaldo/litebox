@@ -125,6 +125,11 @@ pub struct LinuxUserland {
     /// CoW-eligible memory regions. Maps start address of the static slice, to the info needed to
     /// re-mmap the file.
     cow_regions: std::sync::RwLock<std::collections::BTreeMap<usize, CowRegionInfo>>,
+    /// VA partition allocator for multi-process support (x86_64 only).
+    #[cfg(target_arch = "x86_64")]
+    partitions: std::sync::Mutex<PartitionState>,
+    /// When set, pending `read_from_stdin()` calls return EOF instead of blocking.
+    stdin_cancelled: std::sync::atomic::AtomicBool,
 }
 
 impl core::fmt::Debug for LinuxUserland {
@@ -185,6 +190,195 @@ pub union Ifru {
     // pub ifru_slave: [i8; IF_NAMESIZE],
     // pub ifru_newname: [i8; IF_NAMESIZE],
     // pub ifru_data: *mut i8,
+}
+
+/// VA partition management for multi-process support on x86_64.
+///
+/// The total userland VA range is divided into fixed-size, non-overlapping
+/// partitions. Each process gets one partition. A simple bitvec tracks which
+/// slots are in use.
+#[cfg(target_arch = "x86_64")]
+mod va_partitions {
+    /// Size of each VA partition (1 TiB).
+    pub const PARTITION_SIZE: usize = 1 << 40;
+
+    /// The lowest usable guest address (matches `TASK_ADDR_MIN`).
+    pub const VA_MIN: usize = 0x1_0000;
+
+    /// One past the highest usable guest address (matches `TASK_ADDR_MAX`).
+    pub const VA_MAX: usize = 0x7FFF_FFFF_F000;
+
+    /// Total number of partition slots that fit in the VA range.
+    ///
+    /// Slot `i` covers `i * PARTITION_SIZE .. (i + 1) * PARTITION_SIZE`,
+    /// clipped to `VA_MIN..VA_MAX`.
+    pub const NUM_SLOTS: usize = VA_MAX / PARTITION_SIZE; // 127 on x86_64
+}
+
+/// Mutable state for the VA partition allocator.
+#[cfg(target_arch = "x86_64")]
+struct PartitionState {
+    /// Bit `i` is `true` if slot `i` is allocated.
+    allocated: [bool; va_partitions::NUM_SLOTS],
+}
+
+#[cfg(target_arch = "x86_64")]
+impl PartitionState {
+    fn new() -> Self {
+        Self {
+            allocated: [false; va_partitions::NUM_SLOTS],
+        }
+    }
+
+    /// Claim the next free slot. Returns the slot index or `None` if full.
+    #[allow(clippy::cast_possible_truncation)]
+    fn allocate(&mut self) -> Option<u32> {
+        for (i, slot) in self.allocated.iter_mut().enumerate() {
+            if !*slot {
+                *slot = true;
+                return Some(i as u32);
+            }
+        }
+        None
+    }
+
+    /// Release a previously allocated slot.
+    ///
+    /// Returns `false` if the slot is out of range or not currently allocated.
+    fn deallocate(&mut self, slot: u32) -> bool {
+        let idx = slot as usize;
+        if idx >= va_partitions::NUM_SLOTS {
+            return false;
+        }
+        if !self.allocated[idx] {
+            return false;
+        }
+        self.allocated[idx] = false;
+        true
+    }
+
+    /// Returns `true` if the given slot is currently allocated.
+    fn is_allocated(&self, slot: u32) -> bool {
+        let idx = slot as usize;
+        idx < va_partitions::NUM_SLOTS && self.allocated[idx]
+    }
+
+    /// Return the VA range for the given slot, clipped to `VA_MIN..VA_MAX`.
+    fn range_of(slot: u32) -> core::ops::Range<usize> {
+        let base = (slot as usize) * va_partitions::PARTITION_SIZE;
+        let start = base.max(va_partitions::VA_MIN);
+        let end = (base + va_partitions::PARTITION_SIZE).min(va_partitions::VA_MAX);
+        start..end
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod partition_tests {
+    use super::*;
+
+    #[test]
+    fn slot_0_range_starts_at_va_min() {
+        let range = PartitionState::range_of(0);
+        assert_eq!(range.start, va_partitions::VA_MIN);
+        assert_eq!(range.end, va_partitions::PARTITION_SIZE);
+    }
+
+    #[test]
+    fn slot_1_range() {
+        let range = PartitionState::range_of(1);
+        assert_eq!(range.start, va_partitions::PARTITION_SIZE);
+        assert_eq!(range.end, 2 * va_partitions::PARTITION_SIZE);
+    }
+
+    #[test]
+    fn last_slot_clipped_to_va_max() {
+        #[allow(clippy::cast_possible_truncation)]
+        let last = (va_partitions::NUM_SLOTS - 1) as u32;
+        let range = PartitionState::range_of(last);
+        assert!(range.end <= va_partitions::VA_MAX);
+        assert!(range.start < range.end);
+    }
+
+    #[test]
+    fn allocate_returns_sequential_slots() {
+        let mut state = PartitionState::new();
+        assert_eq!(state.allocate(), Some(0));
+        assert_eq!(state.allocate(), Some(1));
+        assert_eq!(state.allocate(), Some(2));
+    }
+
+    #[test]
+    fn deallocate_reuses_slot() {
+        let mut state = PartitionState::new();
+        let s0 = state.allocate().unwrap();
+        let s1 = state.allocate().unwrap();
+        assert!(state.deallocate(s0));
+        // Next allocate should reuse slot 0
+        assert_eq!(state.allocate(), Some(s0));
+        assert!(state.deallocate(s1));
+    }
+
+    #[test]
+    fn deallocate_rejects_invalid() {
+        let mut state = PartitionState::new();
+        // Unallocated slot
+        assert!(!state.deallocate(0));
+        // Out-of-bounds slot
+        #[allow(clippy::cast_possible_truncation)]
+        let out_of_bounds = va_partitions::NUM_SLOTS as u32;
+        assert!(!state.deallocate(out_of_bounds));
+
+        let s0 = state.allocate().unwrap();
+        assert!(state.deallocate(s0));
+        // Double-free
+        assert!(!state.deallocate(s0));
+    }
+
+    #[test]
+    fn is_allocated_tracks_state() {
+        let mut state = PartitionState::new();
+        assert!(!state.is_allocated(0));
+        let s0 = state.allocate().unwrap();
+        assert!(state.is_allocated(s0));
+        assert!(state.deallocate(s0));
+        assert!(!state.is_allocated(s0));
+        // Out of bounds
+        #[allow(clippy::cast_possible_truncation)]
+        let num_slots = va_partitions::NUM_SLOTS as u32;
+        assert!(!state.is_allocated(num_slots));
+    }
+
+    #[test]
+    fn exhaust_all_slots() {
+        let mut state = PartitionState::new();
+        for _ in 0..va_partitions::NUM_SLOTS {
+            assert!(state.allocate().is_some());
+        }
+        assert_eq!(state.allocate(), None);
+    }
+
+    #[test]
+    fn partitions_do_not_overlap() {
+        #[allow(clippy::cast_possible_truncation)]
+        let num_slots = va_partitions::NUM_SLOTS as u32;
+        for i in 0..(num_slots - 1) {
+            let a = PartitionState::range_of(i);
+            let b = PartitionState::range_of(i + 1);
+            assert!(a.end <= b.start, "slot {i} and {} overlap", i + 1);
+        }
+    }
+
+    #[test]
+    fn partition_ranges_are_page_aligned() {
+        const PAGE_SIZE: usize = 4096;
+        #[allow(clippy::cast_possible_truncation)]
+        let num_slots = va_partitions::NUM_SLOTS as u32;
+        for i in 0..num_slots {
+            let range = PartitionState::range_of(i);
+            assert_eq!(range.start % PAGE_SIZE, 0, "slot {i} start not aligned");
+            assert_eq!(range.end % PAGE_SIZE, 0, "slot {i} end not aligned");
+        }
+    }
 }
 
 impl LinuxUserland {
@@ -258,8 +452,18 @@ impl LinuxUserland {
             reserved_pages,
             vdso_address,
             cow_regions: std::sync::RwLock::new(std::collections::BTreeMap::new()),
+            #[cfg(target_arch = "x86_64")]
+            partitions: std::sync::Mutex::new(PartitionState::new()),
+            stdin_cancelled: std::sync::atomic::AtomicBool::new(false),
         };
         Box::leak(Box::new(platform))
+    }
+
+    /// Cancel any pending `read_from_stdin()` call, causing it to return EOF.
+    /// Called when the guest process is exiting to unblock threads waiting on stdin.
+    pub fn cancel_stdin(&self) {
+        self.stdin_cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Register a CoW-eligible memory region backed by a file.
@@ -470,6 +674,73 @@ fn take_pending_host_signals() -> litebox_common_linux::signal::SigSet {
         );
     }
     litebox_common_linux::signal::SigSet::from_u64(u64::from(lo))
+}
+
+impl litebox::platform::AddressSpaceProvider for LinuxUserland {
+    /// Slot index into the VA partition table.
+    type AddressSpaceId = u32;
+
+    // Lazy CoW: mark pages read-only at fork time and snapshot on first
+    // write fault. More memory-efficient than eager for processes with many
+    // writable pages since only actually-modified pages are copied.
+    const EAGER_COW_FOR_VFORK: bool = false;
+
+    #[cfg(target_arch = "x86_64")]
+    fn create_address_space(
+        &self,
+    ) -> Result<Self::AddressSpaceId, litebox::platform::address_space::AddressSpaceError> {
+        self.partitions
+            .lock()
+            .unwrap()
+            .allocate()
+            .ok_or(litebox::platform::address_space::AddressSpaceError::NoSpace)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn destroy_address_space(
+        &self,
+        id: Self::AddressSpaceId,
+    ) -> Result<(), litebox::platform::address_space::AddressSpaceError> {
+        if !self.partitions.lock().unwrap().deallocate(id) {
+            return Err(litebox::platform::address_space::AddressSpaceError::InvalidId);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn fork_address_space(
+        &self,
+        parent: Self::AddressSpaceId,
+    ) -> Result<
+        litebox::platform::address_space::ForkedAddressSpace<Self::AddressSpaceId>,
+        litebox::platform::address_space::AddressSpaceError,
+    > {
+        if !self.partitions.lock().unwrap().is_allocated(parent) {
+            return Err(litebox::platform::address_space::AddressSpaceError::InvalidId);
+        }
+        let child = self.create_address_space()?;
+        Ok(litebox::platform::address_space::ForkedAddressSpace::SharedWithParent(child))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn activate_address_space(
+        &self,
+        _id: Self::AddressSpaceId,
+    ) -> Result<(), litebox::platform::address_space::AddressSpaceError> {
+        // No-op on userland — all processes share the host address space.
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn address_space_range(
+        &self,
+        id: Self::AddressSpaceId,
+    ) -> Result<core::ops::Range<usize>, litebox::platform::address_space::AddressSpaceError> {
+        if !self.partitions.lock().unwrap().is_allocated(id) {
+            return Err(litebox::platform::address_space::AddressSpaceError::InvalidId);
+        }
+        Ok(PartitionState::range_of(id))
+    }
 }
 
 /// Runs a guest thread using the provided shim and the given initial context.
@@ -1067,9 +1338,6 @@ fn thread_start(
     let shim = init_thread.init();
 
     run_thread_inner(shim.as_ref(), &mut ctx, false);
-    // TODO: have syscall_callback return if we need to terminate the process.
-    // We should return this value to the caller so load_program can return it
-    // to the user.
 }
 
 // A handle to a platform thread.
@@ -1295,9 +1563,7 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
                 }
                 Ok(())
             }
-            Err(errno) => {
-                unimplemented!("unexpected error {errno}")
-            }
+            Err(errno) => Err(litebox::platform::SendError::Io(errno.into_raw())),
         }
     }
 
@@ -1835,20 +2101,69 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
 
 impl litebox::platform::StdioProvider for LinuxUserland {
     fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
-        unsafe {
-            syscalls::syscall4(
-                syscalls::Sysno::read,
-                usize::try_from(litebox_common_linux::STDIN_FILENO).unwrap(),
-                buf.as_ptr() as usize,
-                buf.len(),
-                // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::SYSCALL_ARG_MAGIC,
-            )
+        // Use poll() with a timeout instead of a blocking read, so we can
+        // check the cancel flag periodically. This allows the process to exit
+        // cleanly when exit_group or SIGINT is received while a thread is
+        // blocking on stdin.
+        loop {
+            if self
+                .stdin_cancelled
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(litebox::platform::StdioReadError::Closed);
+            }
+
+            let mut pfd = libc::pollfd {
+                fd: litebox_common_linux::STDIN_FILENO,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: poll with a valid pollfd struct and 500ms timeout.
+            let ret = unsafe { libc::poll(core::ptr::from_mut(&mut pfd), 1, 500) };
+
+            if self
+                .stdin_cancelled
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(litebox::platform::StdioReadError::Closed);
+            }
+
+            if ret < 0 {
+                let errno = unsafe { *libc::__errno_location() };
+                if errno == libc::EINTR {
+                    continue;
+                }
+                return Err(litebox::platform::StdioReadError::Closed);
+            }
+
+            if ret == 0 {
+                // Timeout — no data, loop to check cancel flag.
+                continue;
+            }
+
+            if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 && pfd.revents & libc::POLLIN == 0
+            {
+                return Err(litebox::platform::StdioReadError::Closed);
+            }
+
+            if pfd.revents & libc::POLLIN != 0 {
+                let result = unsafe {
+                    syscalls::syscall4(
+                        syscalls::Sysno::read,
+                        usize::try_from(litebox_common_linux::STDIN_FILENO).unwrap(),
+                        buf.as_ptr() as usize,
+                        buf.len(),
+                        syscall_intercept::SYSCALL_ARG_MAGIC,
+                    )
+                };
+                return result.map_err(|err| match err {
+                    syscalls::Errno::EPIPE | syscalls::Errno::EIO => {
+                        litebox::platform::StdioReadError::Closed
+                    }
+                    _ => panic!("unhandled error {err}"),
+                });
+            }
         }
-        .map_err(|err| match err {
-            syscalls::Errno::EPIPE => litebox::platform::StdioReadError::Closed,
-            _ => panic!("unhandled error {err}"),
-        })
     }
 
     fn write_to(
@@ -1888,6 +2203,58 @@ impl litebox::platform::StdioProvider for LinuxUserland {
             StdioStream::Stdout => std::io::stdout().is_terminal(),
             StdioStream::Stderr => std::io::stderr().is_terminal(),
         }
+    }
+
+    fn stdio_ioctl(
+        &self,
+        stream: litebox::platform::StdioStream,
+        request: u32,
+        arg: *mut u8,
+    ) -> Result<u32, litebox::platform::StdioIoctlError> {
+        use litebox::platform::{StdioIoctlError, StdioStream};
+        let host_fd: libc::c_int = match stream {
+            StdioStream::Stdin => 0,
+            StdioStream::Stdout => 1,
+            StdioStream::Stderr => 2,
+        };
+        // SAFETY: We forward the ioctl to the host kernel on the runner's actual
+        // stdio fd. The caller ensures `arg` points to a valid buffer matching the
+        // ioctl request type.
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_ioctl,
+                host_fd,
+                libc::c_ulong::from(request),
+                arg as libc::c_ulong,
+            )
+        };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::ENOTTY);
+            if err == libc::ENOTTY {
+                Err(StdioIoctlError::NotATerminal)
+            } else {
+                Err(StdioIoctlError::OsError(err))
+            }
+        } else {
+            Ok(u32::try_from(ret).unwrap_or(0))
+        }
+    }
+
+    fn poll_stdin_readable(&self) -> bool {
+        let mut pfd = libc::pollfd {
+            fd: 0, // stdin
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll with timeout=0 is a non-blocking check.
+        let ret = unsafe { libc::poll(core::ptr::from_mut(&mut pfd), 1, 0) };
+        ret > 0 && (pfd.revents & libc::POLLIN) != 0
+    }
+
+    fn cancel_stdin(&self) {
+        self.cancel_stdin();
     }
 }
 

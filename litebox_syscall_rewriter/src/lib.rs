@@ -14,7 +14,14 @@
 //!
 //! This crate currently only supports x86-64 (i.e., amd64) ELFs.
 
-use std::collections::HashSet;
+#![cfg_attr(not(feature = "std"), no_std)]
+extern crate alloc;
+
+use alloc::collections::BTreeSet;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
 
 use object::read::elf::{ElfFile, ProgramHeader as _};
 use object::read::{Object as _, ObjectSection as _, ObjectSymbol as _};
@@ -43,7 +50,7 @@ pub enum Error {
     TrampolineAddressTooLarge,
 }
 
-type Result<T> = std::result::Result<T, Error>;
+type Result<T> = core::result::Result<T, Error>;
 
 /// The magic bytes used to identify the trampoline data.
 /// This is checked by the loader to verify that the trampoline is valid.
@@ -105,7 +112,14 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     let buf = &mut buf[..input_binary.len()];
 
     // Parse the ELF and extract all metadata we need, then drop the borrow so we can mutate buf.
-    let (arch, dl_sysinfo_int80, text_sections, control_transfer_targets, trampoline_base_addr) = {
+    let (
+        arch,
+        dl_sysinfo_int80,
+        text_sections,
+        control_transfer_targets,
+        trampoline_base_addr,
+        fork_to_vfork_patch,
+    ) = {
         let file = object::File::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
 
         let arch = match file {
@@ -130,12 +144,15 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
 
         let trampoline_base_addr = find_addr_for_trampoline_code(&file);
 
+        let fork_to_vfork_patch = find_fork_vfork_patch(&file, &text_sections);
+
         (
             arch,
             dl_sysinfo_int80,
             text_sections,
             control_transfer_targets,
             trampoline_base_addr,
+            fork_to_vfork_patch,
         )
     };
 
@@ -160,6 +177,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
             s.vaddr,
             section_data,
             trampoline_base_addr,
+            trampoline_base_addr, // entry point is at offset 0 of trampoline
             dl_sysinfo_int80,
             &mut trampoline_data,
         ) {
@@ -173,6 +191,18 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
 
     if !syscall_insns_found {
         return Err(Error::NoSyscallInstructionsFound);
+    }
+
+    // Patch fork → vfork: overwrite the first bytes of __libc_fork with a
+    // JMP to __libc_vfork. This prevents glibc's fork wrapper from running
+    // post-fork handlers that corrupt shared state under vfork semantics.
+    if let Some((fork_file_offset, rel32)) = fork_to_vfork_patch {
+        #[allow(clippy::cast_possible_truncation)]
+        let off = fork_file_offset as usize;
+        if off + 5 <= buf.len() {
+            buf[off] = 0xE9; // JMP rel32
+            buf[off + 1..off + 5].copy_from_slice(&rel32.to_le_bytes());
+        }
     }
 
     // Build output: [patched ELF][padding to page boundary][trampoline code][header]
@@ -212,6 +242,62 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
         out.extend_from_slice(header.as_bytes());
     }
     Ok(out)
+}
+
+/// Patch a single mapped code segment in-place, returning trampoline stubs.
+///
+/// This is the runtime counterpart to [`hook_syscalls_in_elf`]. Instead of
+/// processing a whole ELF file, it operates on a single already-mapped code
+/// region — the caller is responsible for making the region writable before
+/// calling and restoring permissions afterwards.
+///
+/// # Arguments
+///
+/// * `code` — mutable slice of the mapped code segment.
+/// * `code_vaddr` — virtual address of `code[0]` in guest memory.
+/// * `trampoline_write_vaddr` — virtual address where the returned stub bytes
+///   will be placed by the caller.
+/// * `syscall_entry_addr` — address of the 8-byte entry-point value that
+///   each stub's indirect jump targets.
+///
+/// # Returns
+///
+/// The trampoline stub bytes. The caller must copy them to
+/// `trampoline_write_vaddr`. Returns an empty `Vec` if no syscall
+/// instructions are found in `code`.
+pub fn patch_code_segment(
+    code: &mut [u8],
+    code_vaddr: u64,
+    trampoline_write_vaddr: u64,
+    syscall_entry_addr: u64,
+) -> Result<Vec<u8>> {
+    let arch = Arch::X86_64; // runtime patching is x86-64 only
+
+    // Build control-transfer targets for this segment.
+    let instructions = decode_section_instructions(arch, code, code_vaddr)?;
+    let mut control_transfer_targets = BTreeSet::new();
+    for inst in &instructions {
+        let target = inst.near_branch_target();
+        if target != 0 {
+            control_transfer_targets.insert(target);
+        }
+    }
+
+    let mut trampoline_data = Vec::new();
+    match hook_syscalls_in_section(
+        arch,
+        &control_transfer_targets,
+        code_vaddr,
+        code,
+        trampoline_write_vaddr,
+        syscall_entry_addr,
+        None, // dl_sysinfo_int80 — not applicable on x86-64
+        &mut trampoline_data,
+    ) {
+        Ok(()) => Ok(trampoline_data),
+        Err(Error::NoSyscallInstructionsFound) => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
 }
 
 /// (private) Get metadata for executable sections
@@ -301,13 +387,18 @@ enum Arch {
 }
 
 /// (private) Hook all syscalls in `section`, possibly extending `trampoline_data` to do so.
+///
+/// `trampoline_base_addr` is the virtual address corresponding to `trampoline_data[0]`.
+/// `syscall_entry_addr` is the address of the 8-byte entry-point value that each trampoline
+/// stub jumps to (via `JMP [RIP+disp32]` on x86-64 or `CALL [EAX+disp32]` on x86-32).
 #[allow(clippy::too_many_arguments)]
 fn hook_syscalls_in_section(
     arch: Arch,
-    control_transfer_targets: &HashSet<u64>,
+    control_transfer_targets: &BTreeSet<u64>,
     section_base_addr: u64,
     section_data: &mut [u8],
     trampoline_base_addr: u64,
+    syscall_entry_addr: u64,
     dl_sysinfo_int80: Option<u64>,
     trampoline_data: &mut Vec<u8>,
 ) -> Result<()> {
@@ -364,6 +455,7 @@ fn hook_syscalls_in_section(
                 section_base_addr,
                 section_data,
                 trampoline_base_addr,
+                syscall_entry_addr,
                 trampoline_data,
                 &instructions,
                 i,
@@ -394,28 +486,29 @@ fn hook_syscalls_in_section(
                 .extend_from_slice(&(i32::try_from(jmp_back_offset).unwrap().to_le_bytes()));
 
             // Add jmp [rip + offset_to_entry_point]
-            // Entry point is at offset 0 of trampoline_data
             trampoline_data.extend_from_slice(&[0xFF, 0x25]);
-            // disp32 points to offset 0 (entry point) from current RIP
             // RIP after this instruction = trampoline_base_addr + trampoline_data.len() + 4
-            // We want: RIP + disp32 = trampoline_base_addr + 0
-            // So: disp32 = -(trampoline_data.len() + 4)
-            let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() + 4);
-            trampoline_data.extend_from_slice(&disp32.to_le_bytes());
+            // We want: RIP + disp32 = syscall_entry_addr
+            #[allow(clippy::cast_possible_wrap)]
+            let disp32 = i64::try_from(syscall_entry_addr).unwrap()
+                - i64::try_from(trampoline_base_addr).unwrap()
+                - trampoline_data.len() as i64
+                - 4;
+            trampoline_data.extend_from_slice(&(i32::try_from(disp32).unwrap().to_le_bytes()));
         } else {
             // For 32-bit, use a different approach to simulate indirect call
-            // Entry point is at offset 0 of trampoline_data
             trampoline_data.push(0x50); // PUSH EAX
             trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
             trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
             trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-            // The offset should point to the entry at offset 0
-            // After PUSH(1) + CALL(5) + POP(1) + opcode(2) = 9 bytes
-            // EAX = base + (len_before_PUSH + 6) = base + (current_len - 9 + 6) = base + (current_len - 3)
-            // We want: EAX + offset = base + 0
-            // So: offset = -(current_len - 3)
-            let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 3);
-            trampoline_data.extend_from_slice(&disp32.to_le_bytes());
+            // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
+            // We want: EAX + offset = syscall_entry_addr
+            #[allow(clippy::cast_possible_wrap)]
+            let disp32 = i64::try_from(syscall_entry_addr).unwrap()
+                - i64::try_from(trampoline_base_addr).unwrap()
+                - trampoline_data.len() as i64
+                + 3;
+            trampoline_data.extend_from_slice(&(i32::try_from(disp32).unwrap().to_le_bytes()));
             // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
             // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
 
@@ -481,12 +574,65 @@ fn get_symbols(file: &object::File<'_>) -> Option<u64> {
         })
 }
 
+/// Find fork and vfork symbols in the ELF and compute the patch needed to
+/// redirect fork → vfork. Returns `Some((fork_file_offset, jmp_rel32))` if
+/// both symbols are found, or `None` if this binary doesn't export fork.
+fn find_fork_vfork_patch(
+    file: &object::File<'_>,
+    text_sections: &[TextSectionInfo],
+) -> Option<(u64, i32)> {
+    use object::ObjectSymbol as _;
+
+    // Search both .dynsym and .symtab for fork/vfork.
+    let mut fork_vaddr = None;
+    let mut vfork_vaddr = None;
+
+    for sym in file.dynamic_symbols().chain(file.symbols()) {
+        if sym.kind() != object::SymbolKind::Text {
+            continue;
+        }
+        let Ok(name) = sym.name() else { continue };
+        match name {
+            "fork" | "__libc_fork" if fork_vaddr.is_none() => {
+                fork_vaddr = Some(sym.address());
+            }
+            "vfork" | "__libc_vfork" | "__vfork" if vfork_vaddr.is_none() => {
+                vfork_vaddr = Some(sym.address());
+            }
+            _ => {}
+        }
+    }
+
+    let fork_vaddr = fork_vaddr?;
+    let vfork_vaddr = vfork_vaddr?;
+
+    // Convert fork's vaddr to a file offset using the text sections.
+    let fork_file_offset = text_sections.iter().find_map(|s| {
+        let section_end = s.vaddr + s.size;
+        if fork_vaddr >= s.vaddr && fork_vaddr < section_end {
+            Some(s.file_offset + (fork_vaddr - s.vaddr))
+        } else {
+            None
+        }
+    })?;
+
+    // Compute the relative offset for a JMP rel32 instruction.
+    // JMP rel32 encodes: target = rip_after_jmp + rel32
+    // rip_after_jmp = fork_vaddr + 5 (size of JMP rel32 instruction)
+    let rel32 = i64::try_from(vfork_vaddr)
+        .ok()?
+        .checked_sub(i64::try_from(fork_vaddr).ok()? + 5)?;
+    let rel32 = i32::try_from(rel32).ok()?;
+
+    Some((fork_file_offset, rel32))
+}
+
 fn get_control_transfer_targets(
     arch: Arch,
     input_binary: &[u8],
     text_sections: &[TextSectionInfo],
-) -> Result<HashSet<u64>> {
-    let mut control_transfer_targets = HashSet::new();
+) -> Result<BTreeSet<u64>> {
+    let mut control_transfer_targets = BTreeSet::new();
     for s in text_sections {
         let section_data = section_slice(input_binary, s)?;
         let instructions = decode_section_instructions(arch, section_data, s.vaddr)?;
@@ -595,10 +741,11 @@ fn section_slice_mut<'a>(buf: &'a mut [u8], section: &TextSectionInfo) -> Result
 #[allow(clippy::too_many_arguments)]
 fn hook_syscall_and_after(
     arch: Arch,
-    control_transfer_targets: &HashSet<u64>,
+    control_transfer_targets: &BTreeSet<u64>,
     section_base_addr: u64,
     section_data: &mut [u8],
     trampoline_base_addr: u64,
+    syscall_entry_addr: u64,
     trampoline_data: &mut Vec<u8>,
     instructions: &[iced_x86::Instruction],
     inst_index: usize,
@@ -613,7 +760,6 @@ fn hook_syscall_and_after(
             && control_transfer_targets.contains(&next_inst.ip())
         {
             // If the next instruction is a control transfer target, we don't want to cross it
-            println!("Skipping control transfer target at {:#x}", next_inst.ip());
             break;
         }
         // Check if the instruction does control transfer
@@ -639,6 +785,7 @@ fn hook_syscall_and_after(
             section_base_addr,
             section_data,
             trampoline_base_addr,
+            syscall_entry_addr,
             trampoline_data,
             instructions,
             inst_index,
@@ -654,28 +801,29 @@ fn hook_syscall_and_after(
         trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D]); // LEA RCX, [RIP + disp32]
         trampoline_data.extend_from_slice(&6u32.to_le_bytes());
         // Add jmp [rip + offset_to_entry_point]
-        // Entry point is at offset 0 of trampoline_data
         trampoline_data.extend_from_slice(&[0xFF, 0x25]);
-        // disp32 points to offset 0 (entry point) from current RIP
         // RIP after this instruction = trampoline_base_addr + trampoline_data.len() + 4
-        // We want: RIP + disp32 = trampoline_base_addr + 0
-        // So: disp32 = -(trampoline_data.len() + 4)
-        let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() + 4);
-        trampoline_data.extend_from_slice(&disp32.to_le_bytes());
+        // We want: RIP + disp32 = syscall_entry_addr
+        #[allow(clippy::cast_possible_wrap)]
+        let disp32 = i64::try_from(syscall_entry_addr).unwrap()
+            - i64::try_from(trampoline_base_addr).unwrap()
+            - trampoline_data.len() as i64
+            - 4;
+        trampoline_data.extend_from_slice(&(i32::try_from(disp32).unwrap().to_le_bytes()));
     } else {
         // For 32-bit, use a different approach to simulate indirect call
-        // Entry point is at offset 0 of trampoline_data
         trampoline_data.push(0x50); // PUSH EAX
         trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
         trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
         trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-        // The offset should point to the entry at offset 0
-        // After PUSH(1) + CALL(5) + POP(1) + opcode(2) = 9 bytes
-        // EAX = base + (len_before_PUSH + 6) = base + (current_len - 9 + 6) = base + (current_len - 3)
-        // We want: EAX + offset = base + 0
-        // So: offset = -(current_len - 3)
-        let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 3);
-        trampoline_data.extend_from_slice(&disp32.to_le_bytes());
+        // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
+        // We want: EAX + offset = syscall_entry_addr
+        #[allow(clippy::cast_possible_wrap)]
+        let disp32 = i64::try_from(syscall_entry_addr).unwrap()
+            - i64::try_from(trampoline_base_addr).unwrap()
+            - trampoline_data.len() as i64
+            + 3;
+        trampoline_data.extend_from_slice(&(i32::try_from(disp32).unwrap().to_le_bytes()));
         // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
         // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
     }
@@ -715,10 +863,11 @@ fn hook_syscall_and_after(
 #[allow(clippy::too_many_arguments)]
 fn hook_syscall_before_and_after(
     arch: Arch,
-    control_transfer_targets: &HashSet<u64>,
+    control_transfer_targets: &BTreeSet<u64>,
     section_base_addr: u64,
     section_data: &mut [u8],
     trampoline_base_addr: u64,
+    syscall_entry_addr: u64,
     trampoline_data: &mut Vec<u8>,
     instructions: &[iced_x86::Instruction],
     inst_index: usize,
@@ -793,13 +942,14 @@ fn hook_syscall_before_and_after(
     trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
     trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
     trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-    // The offset should point to the entry at offset 0
-    // After PUSH(1) + CALL(5) + POP(1) + opcode(2) = 9 bytes
-    // EAX = base + (len_before_PUSH + 6) = base + (current_len - 9 + 6) = base + (current_len - 3)
-    // We want: EAX + offset = base + 0
-    // So: offset = -(current_len - 3)
-    let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 3);
-    trampoline_data.extend_from_slice(&disp32.to_le_bytes());
+    // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
+    // We want: EAX + offset = syscall_entry_addr
+    #[allow(clippy::cast_possible_wrap)]
+    let disp32 = i64::try_from(syscall_entry_addr).unwrap()
+        - i64::try_from(trampoline_base_addr).unwrap()
+        - trampoline_data.len() as i64
+        + 3;
+    trampoline_data.extend_from_slice(&(i32::try_from(disp32).unwrap().to_le_bytes()));
     // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
     // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
 

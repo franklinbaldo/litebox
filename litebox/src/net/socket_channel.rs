@@ -203,6 +203,18 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
             NetworkProxy::Raw => false,
         }
     }
+
+    /// Return the number of bytes available to read without blocking.
+    ///
+    /// For TCP sockets this is the number of buffered bytes; for UDP it is
+    /// the number of queued datagrams (matching Linux FIONREAD semantics).
+    pub fn pending_rx_bytes(&self) -> usize {
+        match self {
+            NetworkProxy::Stream(channel) => channel.pending_rx_bytes(),
+            NetworkProxy::Datagram(channel) => channel.pending_rx_datagrams(),
+            NetworkProxy::Raw => 0,
+        }
+    }
 }
 
 /// A channel for stream (TCP) socket communication.
@@ -524,6 +536,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         self.inner.rx_available.load(Ordering::Acquire) > 0
     }
 
+    /// Return the number of bytes buffered and available for reading.
+    pub fn pending_rx_bytes(&self) -> usize {
+        self.inner.rx_available.load(Ordering::Acquire)
+    }
+
     /// Manually set the readable state.
     ///
     /// This is used for server sockets to indicate that a connection is ready to accept.
@@ -765,6 +782,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
     /// Check if the socket is readable.
     pub fn is_readable(&self) -> bool {
         self.inner.rx_count.load(Ordering::Acquire) > 0
+    }
+
+    /// Return the number of queued datagrams available for reading.
+    pub fn pending_rx_datagrams(&self) -> usize {
+        self.inner.rx_count.load(Ordering::Acquire)
     }
 
     /// Check if the socket is writable.

@@ -3,6 +3,7 @@
 
 //! File-system related functionality
 
+use crate::event::IOPollable;
 use crate::fd::{FdEnabledSubsystem, TypedFd};
 use crate::path;
 
@@ -12,6 +13,7 @@ use bitflags::bitflags;
 use core::ffi::c_uint;
 use core::num::NonZeroUsize;
 
+pub mod broker;
 pub mod devices;
 pub mod errors;
 pub mod in_mem;
@@ -24,7 +26,7 @@ mod tests;
 
 use errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, ReadDirError,
-    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ReadError, RenameError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
 };
 
 /// A private module, to help support writing sealed traits. This module should _itself_ never be
@@ -120,6 +122,10 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// Unlink a file
     fn unlink(&self, path: impl path::Arg) -> Result<(), UnlinkError>;
 
+    /// Rename (move) a file or directory
+    fn rename(&self, old_path: impl path::Arg, new_path: impl path::Arg)
+    -> Result<(), RenameError>;
+
     /// Create a new directory
     fn mkdir(&self, path: impl path::Arg, mode: Mode) -> Result<(), MkdirError>;
 
@@ -146,6 +152,32 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
     fn get_static_backing_data(&self, fd: &TypedFd<Self>) -> Option<&'static [u8]> {
         None
+    }
+
+    /// Get an `IOPollable` for a file descriptor, if the underlying device supports polling.
+    ///
+    /// Returns `Some(pollable)` for device types with async event support (e.g., PTY master),
+    /// or `None` for regular files that don't support async I/O notifications.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn get_io_pollable(&self, fd: &TypedFd<Self>) -> Option<alloc::boxed::Box<dyn IOPollable>> {
+        None
+    }
+
+    /// Get stored PTY termios for a file descriptor.
+    ///
+    /// Returns `Some(termios)` if the fd refers to a PTY device, `None` otherwise.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn get_pty_termios(&self, fd: &TypedFd<Self>) -> Option<devices::PtyTermios> {
+        None
+    }
+
+    /// Set stored PTY termios for a file descriptor.
+    ///
+    /// Returns `true` if the fd refers to a PTY device and the termios was updated,
+    /// `false` otherwise.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn set_pty_termios(&self, fd: &TypedFd<Self>, termios: devices::PtyTermios) -> bool {
+        false
     }
 }
 

@@ -108,6 +108,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             prog_path,
             argv,
             envp,
+            None,
         )
         .unwrap();
     unsafe {
@@ -116,7 +117,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             &mut litebox_common_linux::PtRegs::default(),
         );
     }
-    std::process::exit(program.process.wait())
+    let exit_code = program.process.wait();
+    std::process::exit(exit_code)
 }
 
 fn fixup_env(envp: &mut Vec<alloc::ffi::CString>) {
