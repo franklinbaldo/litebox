@@ -574,8 +574,8 @@ impl<FS: ShimFS> Task<FS> {
                     // shared pending mask that is always updated under the
                     // lock, so a stale zero means "no signals were pending
                     // at the last update."  A missed concurrent addition is
-                    // fine — it will be picked up on the next syscall
-                    // return.
+                    // fine — the host signal handler will interrupt the
+                    // guest and re-enter this function.
                     let hint = self
                         .signals
                         .shared_pending_hint
