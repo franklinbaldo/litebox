@@ -84,6 +84,14 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for ElfFile<'_, FS> {
         // Allocate a mapping large enough that even if it's maximally misaligned we can
         // still fit `len` bytes.
         let mapping_len = len + (align.max(PAGE_SIZE) - PAGE_SIZE);
+        litebox::log_println!(
+            self.task.global.platform,
+            "[diag] reserve: hint={:#x} len={:#x} align={:#x} mapping_len={:#x}",
+            self.mmap_hint,
+            len,
+            align,
+            mapping_len
+        );
         let mapping_ptr = self
             .task
             .sys_mmap(
@@ -100,6 +108,13 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for ElfFile<'_, FS> {
         let ptr = mapping_ptr.next_multiple_of(align);
         let end = ptr + len;
         let mapping_end = mapping_ptr + mapping_len;
+        litebox::log_println!(
+            self.task.global.platform,
+            "[diag] reserve: mmap returned={:#x} aligned_base={:#x} end={:#x}",
+            mapping_ptr,
+            ptr,
+            end
+        );
         if ptr != mapping_ptr {
             self.task
                 .sys_munmap(MutPtr::from_usize(mapping_ptr), ptr - mapping_ptr)?;
@@ -236,6 +251,14 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
                 // heavily before switching to mmap-based allocation.
                 const BRK_RESERVE_GAP: usize = 8 * 1024 * 1024;
                 let interp_hint = info.brk.next_multiple_of(PAGE_SIZE) + BRK_RESERVE_GAP;
+                litebox::log_println!(
+                    global.platform,
+                    "[diag] interp hint: main brk={:#x} brk_aligned={:#x} gap={:#x} hint={:#x}",
+                    info.brk,
+                    info.brk.next_multiple_of(PAGE_SIZE),
+                    BRK_RESERVE_GAP,
+                    interp_hint
+                );
                 interp.file.mmap_hint = interp_hint;
             }
 
@@ -247,6 +270,20 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
         } else {
             None
         };
+
+        // Log the key addresses for brk/interpreter collision debugging
+        #[cfg(target_arch = "aarch64")]
+        if let Some(interp_info) = &interp {
+            litebox::log_println!(
+                global.platform,
+                "[diag] layout: main base={:#x} brk={:#x} | interp base={:#x} brk={:#x} | gap={:#x}",
+                info.base_addr,
+                info.brk,
+                interp_info.base_addr,
+                interp_info.brk,
+                interp_info.base_addr.saturating_sub(info.brk)
+            );
+        }
 
         // == Diagnostic: simulate rtld_audit's parse_object scan on the main binary ==
         // This runs on the host side to verify what the guest-side parse_object would see.

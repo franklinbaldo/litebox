@@ -717,6 +717,7 @@ impl<FS: ShimFS> Task<FS> {
                 66 => "writev",
                 79 => "newfstatat",
                 80 => "fstat",
+                214 => "brk",
                 222 => "mmap",
                 226 => "mprotect",
                 215 => "munmap",
