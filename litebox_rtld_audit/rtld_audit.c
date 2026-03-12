@@ -128,26 +128,41 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5,
   //
   // The TLS table has 16-byte entries: [guest_tpidr(8), host_tls(8)].
   // Sentinel entry has guest_tpidr = 0xFFFFFFFFFFFFFFFF.
+  //
+  // Fallback: On macOS, the host kernel clobbers TPIDR_EL0 to the
+  // pthread value on preemptive context switches and signal delivery.
+  // When MRS reads a clobbered value, no TLS entry will match and the
+  // scan hits the sentinel. In that case, fall back to entry[0] —
+  // this matches the shared SVC handler's fallback behaviour in the
+  // rewritten trampoline code.
   uint64_t tls_table = tls_table_ptr;
   __asm__ volatile(
     "sub  sp, sp, #32\n"
     "str  x16, [sp, #0]\n"
     "str  x17, [sp, #8]\n"
     "str  x30, [sp, #16]\n"
-    "mrs  x18, tpidr_el0\n"         // x18 = guest TPIDR
+    "mrs  x18, tpidr_el0\n"         // x18 = guest TPIDR (may be clobbered on macOS)
     "str  x18, [sp, #24]\n"         // save guest TPIDR on stack
     "mov  x17, %[tls_table]\n"      // x17 = TLS table base
     "cbz  x17, 2f\n"                // skip lookup if table ptr is NULL
     "1:\n"                           // .Lloop
     "ldr  x16, [x17, #0]\n"         // x16 = entry.guest_tpidr
     "cmn  x16, #1\n"                // sentinel (0xFFFFFFFFFFFFFFFF)?
-    "b.eq 2f\n"                      // -> done (no match)
+    "b.eq 5f\n"                      // -> fallback to entry[0]
     "cmp  x16, x18\n"               // match current TPIDR?
     "b.eq 3f\n"                      // -> found
     "add  x17, x17, #16\n"          // next entry
     "b    1b\n"                      // -> loop
     "3:\n"                           // .Lfound
     "ldr  x18, [x17, #8]\n"         // x18 = host TLS base
+    "b    2f\n"                      // -> done
+    "5:\n"                           // .Lfallback
+    // No entry matched — TPIDR_EL0 was likely clobbered by the host.
+    // Fall back to entry[0] (correct for single-thread, best-effort for multi).
+    "mov  x17, %[tls_table]\n"      // x17 = TLS table base (reload, x17 was advanced)
+    "ldr  x16, [x17, #0]\n"         // x16 = entry[0].guest_tpidr
+    "str  x16, [sp, #24]\n"         // fix guest_tpidr on stack (replace clobbered value)
+    "ldr  x18, [x17, #8]\n"         // x18 = entry[0].host_tls
     "2:\n"                           // .Ldone
     "adr  x30, 4f\n"                // x30 = return address
     "mov  x16, %[entry]\n"
