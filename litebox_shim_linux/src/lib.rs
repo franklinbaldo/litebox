@@ -801,6 +801,14 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Access { pathname, mode } => pathname
                 .to_cstring()
                 .map_or(Err(Errno::EFAULT), |path| syscall!(sys_access(path, mode))),
+            SyscallRequest::Faccessat {
+                dirfd,
+                pathname,
+                mode,
+                flags,
+            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                syscall!(sys_faccessat(dirfd, path, mode, flags))
+            }),
             SyscallRequest::Madvise {
                 addr,
                 length,

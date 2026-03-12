@@ -2193,6 +2193,12 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         pathname: Platform::RawConstPointer<c_char>,
         mode: AccessFlags,
     },
+    Faccessat {
+        dirfd: i32,
+        pathname: Platform::RawConstPointer<c_char>,
+        mode: AccessFlags,
+        flags: AtFlags,
+    },
     Madvise {
         addr: Platform::RawMutPointer<u8>,
         length: usize,
@@ -2694,6 +2700,18 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::writev => sys_req!(Writev { fd, iovec:*, iovcnt }),
             #[cfg(not(target_arch = "aarch64"))]
             Sysno::access => sys_req!(Access { pathname:*, mode }),
+            Sysno::faccessat => SyscallRequest::Faccessat {
+                dirfd: ctx.sys_req_arg(0),
+                pathname: ctx.sys_req_ptr(1),
+                mode: ctx.sys_req_arg(2),
+                flags: AtFlags::empty(),
+            },
+            Sysno::faccessat2 => SyscallRequest::Faccessat {
+                dirfd: ctx.sys_req_arg(0),
+                pathname: ctx.sys_req_ptr(1),
+                mode: ctx.sys_req_arg(2),
+                flags: ctx.sys_req_arg(3),
+            },
             #[cfg(not(target_arch = "aarch64"))]
             Sysno::pipe => sys_req!(Pipe2 { pipefd:*, flags: { litebox::fs::OFlags::empty() } }),
             Sysno::pipe2 => sys_req!(Pipe2 { pipefd:* ,flags }),

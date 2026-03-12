@@ -675,6 +675,30 @@ impl<FS: ShimFS> Task<FS> {
         Ok(())
     }
 
+    /// Handle syscall `faccessat` / `faccessat2`
+    pub fn sys_faccessat(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        mode: litebox_common_linux::AccessFlags,
+        _flags: litebox_common_linux::AtFlags,
+    ) -> Result<(), Errno> {
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
+        match fs_path {
+            FsPath::Absolute { path } => self.sys_access(path, mode),
+            FsPath::Cwd => self.sys_access(get_cwd(), mode),
+            FsPath::Fd(_fd) => {
+                log_unsupported!("faccessat with FsPath::Fd");
+                Err(Errno::EINVAL)
+            }
+            FsPath::FdRelative { fd: _, path: _ } => {
+                log_unsupported!("faccessat with FsPath::FdRelative");
+                Err(Errno::EINVAL)
+            }
+        }
+    }
+
     /// Read the target of a symbolic link
     ///
     /// The caller must pass an absolute path.
