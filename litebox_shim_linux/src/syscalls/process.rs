@@ -305,7 +305,7 @@ impl<FS: ShimFS> Task<FS> {
         // observe `is_exiting` and break out of the park loop.
         {
             use litebox::platform::RawMutex as _;
-            self.process_state.borrow().vfork_park.wake_all();
+            self.process_state.borrow().vfork_parking.park.wake_all();
         }
     }
 
@@ -610,7 +610,11 @@ impl<FS: ShimFS> Task<FS> {
         // thread can recompute the expected count and make progress.
         if self.is_suspended() {
             use litebox::platform::RawMutex as _;
-            self.process_state.borrow().vfork_parked_count.wake_all();
+            self.process_state
+                .borrow()
+                .vfork_parking
+                .parked_count
+                .wake_all();
         }
 
         self.thread.detach_from_process();
@@ -768,7 +772,12 @@ impl<FS: ShimFS> Task<FS> {
             let ps = self.process_state.borrow();
             self.is_exiting()
                 || self.is_suspended()
-                || ps.vfork_park.underlying_atomic().load(Ordering::Acquire) != 0
+                || ps
+                    .vfork_parking
+                    .park
+                    .underlying_atomic()
+                    .load(Ordering::Acquire)
+                    != 0
         };
         let result = self.global.litebox.process_registry().wait_for_child(
             self.process_id,
@@ -848,7 +857,12 @@ impl<FS: ShimFS> Task<FS> {
             let ps = self.process_state.borrow();
             self.is_exiting()
                 || self.is_suspended()
-                || ps.vfork_park.underlying_atomic().load(Ordering::Acquire) != 0
+                || ps
+                    .vfork_parking
+                    .park
+                    .underlying_atomic()
+                    .load(Ordering::Acquire)
+                    != 0
         };
         let result = self.global.litebox.process_registry().wait_for_child(
             self.process_id,
@@ -1003,7 +1017,13 @@ impl<FS: ShimFS> Task<FS> {
         // operations from bypassing parking invariants.
         {
             let ps = self.process_state.borrow();
-            if self.is_suspended() || ps.vfork_park.underlying_atomic().load(Ordering::Acquire) != 0
+            if self.is_suspended()
+                || ps
+                    .vfork_parking
+                    .park
+                    .underlying_atomic()
+                    .load(Ordering::Acquire)
+                    != 0
             {
                 return Err(Errno::EAGAIN);
             }
@@ -1439,9 +1459,10 @@ impl<FS: ShimFS> Task<FS> {
                 fd_paths: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
                 main_bss_start: core::sync::atomic::AtomicUsize::new(0),
                 main_bss_end: core::sync::atomic::AtomicUsize::new(0),
-                vfork_park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
-                vfork_parked_count:
-                    <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
+                vfork_parking: Arc::new(crate::VforkParking {
+                    park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
+                    parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
+                }),
             });
             let child_files_state = Arc::new(
                 self.files
@@ -1668,7 +1689,8 @@ impl<FS: ShimFS> Task<FS> {
             // This ensures that a thread loading vfork_park with Acquire
             // also observes the is_suspended store (Release pairs with
             // the Acquire load in park_for_vfork_if_requested).
-            ps.vfork_park
+            ps.vfork_parking
+                .park
                 .underlying_atomic()
                 .store(1, Ordering::Release);
 
@@ -1697,7 +1719,8 @@ impl<FS: ShimFS> Task<FS> {
         // thread map and therefore the required parked count.
         loop {
             let n = ps
-                .vfork_parked_count
+                .vfork_parking
+                .parked_count
                 .underlying_atomic()
                 .load(Ordering::Acquire);
             let expected_now = {
@@ -1721,7 +1744,7 @@ impl<FS: ShimFS> Task<FS> {
                 .process_registry()
                 .notify_waiters(self.process_id);
             self.thread.process.nr_threads.wake_all();
-            let _ = ps.vfork_parked_count.block(n);
+            let _ = ps.vfork_parking.parked_count.block(n);
         }
         Ok(true)
     }
@@ -1753,21 +1776,23 @@ impl<FS: ShimFS> Task<FS> {
             .store(false, Ordering::Release);
 
         // Clear the process-wide park futex and wake all parked threads.
-        ps.vfork_park
+        ps.vfork_parking
+            .park
             .underlying_atomic()
             .store(0, Ordering::Release);
-        ps.vfork_park.wake_all();
+        ps.vfork_parking.park.wake_all();
 
         // Wait for all threads to acknowledge the unpark (count drops to 0).
         loop {
             let n = ps
-                .vfork_parked_count
+                .vfork_parking
+                .parked_count
                 .underlying_atomic()
                 .load(Ordering::Acquire);
             if n == 0 {
                 break;
             }
-            let _ = ps.vfork_parked_count.block(n);
+            let _ = ps.vfork_parking.parked_count.block(n);
         }
     }
 }
@@ -2484,9 +2509,10 @@ impl<FS: ShimFS> Task<FS> {
                 fd_paths: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
                 main_bss_start: core::sync::atomic::AtomicUsize::new(0),
                 main_bss_end: core::sync::atomic::AtomicUsize::new(0),
-                vfork_park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
-                vfork_parked_count:
-                    <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
+                vfork_parking: Arc::new(crate::VforkParking {
+                    park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
+                    parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
+                }),
             });
             self.process_state.replace(child_ps);
 

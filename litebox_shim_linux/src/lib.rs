@@ -231,8 +231,10 @@ impl LinuxShimBuilder {
             fd_paths: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
             main_bss_start: core::sync::atomic::AtomicUsize::new(0),
             main_bss_end: core::sync::atomic::AtomicUsize::new(0),
-            vfork_park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
-            vfork_parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
+            vfork_parking: Arc::new(VforkParking {
+                park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
+                parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
+            }),
         });
         let global = Arc::new(GlobalState {
             platform: self.platform,
@@ -365,6 +367,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
             self.global.clone(),
             addr,
             self.global.transport_interrupt.clone(),
+            self.process_state.vfork_parking.clone(),
         )
     }
 
@@ -1559,15 +1562,28 @@ struct ProcessState {
     /// Page-aligned end of the main binary's `.bss` region. Set once during
     /// ELF loading.
     main_bss_end: core::sync::atomic::AtomicUsize,
+    /// Shared vfork parking state, wrapped in `Arc` so that both the
+    /// syscall-boundary parking path (`park_for_vfork_if_requested`) and the
+    /// transport spin-loop parking path (`ShimTransport::park_for_vfork`) can
+    /// operate on the same underlying atomics.
+    vfork_parking: Arc<VforkParking>,
+}
+
+/// Shared vfork parking primitives.
+///
+/// This struct is `Arc`-shared between the per-process `ProcessState` and the
+/// `ShimTransport` so that threads spinning inside the 9P transport can park
+/// in-place during vfork without corrupting the TCP byte stream.
+pub(crate) struct VforkParking {
     /// Futex for parking threads during vfork. The underlying atomic stores:
     /// 0 = normal operation, 1 = park requested by the forking thread.
     /// Other threads check this in `prepare_to_run_guest` and block until
     /// the value returns to 0.
-    vfork_park: <Platform as litebox::platform::RawMutexProvider>::RawMutex,
+    pub park: <Platform as litebox::platform::RawMutexProvider>::RawMutex,
     /// Counter of threads that have parked. The forking thread waits on this
     /// until the count reaches `thread_count - 1`, confirming all other
     /// threads are safely stopped before modifying page permissions.
-    vfork_parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex,
+    pub parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex,
 }
 
 /// One-shot synchronization primitive for vfork parent blocking.

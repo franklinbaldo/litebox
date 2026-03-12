@@ -360,8 +360,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             // Clone the root fid
             self.client.clone_fid(self.root.1)
         } else {
-            let (_, fid) = self.client.walk(self.root.1, &components)?;
-            Ok(fid)
+            self.client
+                .walk(self.root.1, &components)
+                .map(|(_, fid)| fid)
         }
     }
 

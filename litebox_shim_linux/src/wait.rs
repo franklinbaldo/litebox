@@ -78,31 +78,43 @@ impl<FS: ShimFS> Task<FS> {
 
         // Fast path: check the process-wide flag first (Acquire pairs with
         // the Release store in park_other_threads).
-        if ps.vfork_park.underlying_atomic().load(Ordering::Acquire) == 0 {
+        if ps
+            .vfork_parking
+            .park
+            .underlying_atomic()
+            .load(Ordering::Acquire)
+            == 0
+        {
             return;
         }
 
         // Announce that we are parked.
-        ps.vfork_parked_count
+        ps.vfork_parking
+            .parked_count
             .underlying_atomic()
             .fetch_add(1, Ordering::Release);
-        ps.vfork_parked_count.wake_all();
+        ps.vfork_parking.parked_count.wake_all();
 
         // Block until the forking thread clears the park flag or the
         // process begins exiting (exit_group wakes vfork_park).
         loop {
-            let v = ps.vfork_park.underlying_atomic().load(Ordering::Acquire);
+            let v = ps
+                .vfork_parking
+                .park
+                .underlying_atomic()
+                .load(Ordering::Acquire);
             if v == 0 || self.is_exiting() {
                 break;
             }
-            let _ = ps.vfork_park.block(v);
+            let _ = ps.vfork_parking.park.block(v);
         }
 
         // Announce that we have unparked.
-        ps.vfork_parked_count
+        ps.vfork_parking
+            .parked_count
             .underlying_atomic()
             .fetch_sub(1, Ordering::Release);
-        ps.vfork_parked_count.wake_all();
+        ps.vfork_parking.parked_count.wake_all();
     }
 }
 

@@ -27,15 +27,22 @@ pub trait Read {
     /// Returns the number of bytes read
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, ReadError>;
 
-    /// Read exactly `buf.len()` bytes into the buffer
+    /// Read exactly `buf.len()` bytes into the buffer.
+    ///
+    /// Retries on `Interrupted` to avoid abandoning a partially-read message,
+    /// which would leave the TCP stream in an unrecoverable state.
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), ReadError> {
         let mut total_read = 0;
         while total_read < buf.len() {
-            let n = self.read(&mut buf[total_read..])?;
-            if n == 0 {
-                return Err(ReadError::Io);
+            match self.read(&mut buf[total_read..]) {
+                Ok(0) => return Err(ReadError::Io),
+                Ok(n) => total_read += n,
+                Err(ReadError::Interrupted) => {
+                    // Retry — abandoning a partial read would corrupt the stream.
+                    core::hint::spin_loop();
+                }
+                Err(e) => return Err(e),
             }
-            total_read += n;
         }
         Ok(())
     }
@@ -48,15 +55,22 @@ pub trait Write {
     /// Returns the number of bytes written
     fn write(&mut self, buf: &[u8]) -> Result<usize, WriteError>;
 
-    /// Write all bytes from the buffer
+    /// Write all bytes from the buffer.
+    ///
+    /// Retries on `Interrupted` to avoid abandoning a partially-written message,
+    /// which would leave the TCP stream in an unrecoverable state.
     fn write_all(&mut self, buf: &[u8]) -> Result<(), WriteError> {
         let mut total_written = 0;
         while total_written < buf.len() {
-            let n = self.write(&buf[total_written..])?;
-            if n == 0 {
-                return Err(WriteError::Io);
+            match self.write(&buf[total_written..]) {
+                Ok(0) => return Err(WriteError::Io),
+                Ok(n) => total_written += n,
+                Err(WriteError::Interrupted) => {
+                    // Retry — abandoning a partial write would corrupt the stream.
+                    core::hint::spin_loop();
+                }
+                Err(e) => return Err(e),
             }
-            total_written += n;
         }
         Ok(())
     }
