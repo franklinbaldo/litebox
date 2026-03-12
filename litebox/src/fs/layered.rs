@@ -262,7 +262,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         return Err(MigrationError::NotAFile);
                     }
                     ReadError::ClosedFd | ReadError::NotForReading => unreachable!(),
-                    ReadError::Io | ReadError::WouldBlock => return Err(MigrationError::Io),
+                    ReadError::Io | ReadError::WouldBlock | ReadError::Interrupted => {
+                        return Err(MigrationError::Io);
+                    }
                 },
             }
         }

@@ -50,6 +50,8 @@ pub enum ReadError {
     Io,
     #[error("operation would block")]
     WouldBlock,
+    #[error("operation was interrupted")]
+    Interrupted,
 }
 
 /// Possible errors from [`FileSystem::write`]
@@ -64,6 +66,8 @@ pub enum WriteError {
     NotForWriting,
     #[error("I/O error")]
     Io,
+    #[error("operation was interrupted")]
+    Interrupted,
 }
 
 /// Possible errors from [`FileSystem::seek`]

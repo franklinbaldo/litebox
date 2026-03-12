@@ -8,8 +8,17 @@
 
 use alloc::vec::Vec;
 
-pub struct ReadError;
-pub struct WriteError;
+#[derive(Debug)]
+pub enum ReadError {
+    Io,
+    Interrupted,
+}
+
+#[derive(Debug)]
+pub enum WriteError {
+    Io,
+    Interrupted,
+}
 
 /// Trait for reading bytes from a transport
 pub trait Read {
@@ -24,7 +33,7 @@ pub trait Read {
         while total_read < buf.len() {
             let n = self.read(&mut buf[total_read..])?;
             if n == 0 {
-                return Err(ReadError);
+                return Err(ReadError::Io);
             }
             total_read += n;
         }
@@ -45,7 +54,7 @@ pub trait Write {
         while total_written < buf.len() {
             let n = self.write(&buf[total_written..])?;
             if n == 0 {
-                return Err(WriteError);
+                return Err(WriteError::Io);
             }
             total_written += n;
         }
@@ -66,7 +75,10 @@ pub(super) fn write_message<W: Write>(
 /// Read a 9P message size header (4 bytes) and then the full message
 pub(super) fn read_to_buf<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> Result<(), super::Error> {
     buf.resize(4, 0);
-    r.read_exact(&mut buf[..]).map_err(|_| super::Error::Io)?;
+    r.read_exact(&mut buf[..]).map_err(|e| match e {
+        ReadError::Interrupted => super::Error::Interrupted,
+        ReadError::Io => super::Error::Io,
+    })?;
     let sz = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
     if sz < 7 {
         // Minimum message size: size(4) + type(1) + tag(2)
@@ -76,7 +88,10 @@ pub(super) fn read_to_buf<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> Result<(), s
         buf.reserve(sz - buf.len());
     }
     buf.resize(sz, 0);
-    r.read_exact(&mut buf[4..]).map_err(|_| super::Error::Io)
+    r.read_exact(&mut buf[4..]).map_err(|e| match e {
+        ReadError::Interrupted => super::Error::Interrupted,
+        ReadError::Io => super::Error::Io,
+    })
 }
 
 /// Read a 9P message from a transport

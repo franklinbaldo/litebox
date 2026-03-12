@@ -51,6 +51,7 @@ impl<FS: ShimFS> DropGuard for SocketDropGuard<FS> {
 pub struct ShimTransport {
     drop_guard: Box<dyn DropGuard>,
     proxy: Arc<NetworkProxy<Platform>>,
+    interrupt: Arc<core::sync::atomic::AtomicBool>,
 }
 
 impl ShimTransport {
@@ -65,6 +66,7 @@ impl ShimTransport {
     pub(crate) fn connect<FS: ShimFS>(
         global: Arc<GlobalState<FS>>,
         addr: core::net::SocketAddr,
+        interrupt: Arc<core::sync::atomic::AtomicBool>,
     ) -> Result<Self, Errno> {
         // 1. Create the raw socket.
         let sockfd = global
@@ -91,7 +93,11 @@ impl ShimTransport {
 
         let drop_guard = Box::new(SocketDropGuard { global, sockfd });
 
-        Ok(Self { drop_guard, proxy })
+        Ok(Self {
+            drop_guard,
+            proxy,
+            interrupt,
+        })
     }
 }
 
@@ -104,13 +110,16 @@ impl Drop for ShimTransport {
 impl transport::Read for ShimTransport {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, transport::ReadError> {
         loop {
+            if self.interrupt.load(core::sync::atomic::Ordering::Relaxed) {
+                return Err(transport::ReadError::Interrupted);
+            }
             match self.proxy.try_read(buf, ReceiveFlags::empty(), None) {
                 Ok(0) => {
                     // No data yet — spin until something arrives.
                     core::hint::spin_loop();
                 }
                 Ok(n) => return Ok(n),
-                Err(_) => return Err(transport::ReadError),
+                Err(_) => return Err(transport::ReadError::Io),
             }
         }
     }
@@ -119,13 +128,16 @@ impl transport::Read for ShimTransport {
 impl transport::Write for ShimTransport {
     fn write(&mut self, buf: &[u8]) -> Result<usize, transport::WriteError> {
         loop {
+            if self.interrupt.load(core::sync::atomic::Ordering::Relaxed) {
+                return Err(transport::WriteError::Interrupted);
+            }
             match self.proxy.try_write(buf, SendFlags::empty(), None) {
                 Ok(n) => return Ok(n),
                 Err(litebox::net::errors::SendError::BufferFull) => {
                     // TX ring full — spin until space opens up.
                     core::hint::spin_loop();
                 }
-                Err(_) => return Err(transport::WriteError),
+                Err(_) => return Err(transport::WriteError::Io),
             }
         }
     }
@@ -262,8 +274,12 @@ mod tests {
         server: &DiodServer,
     ) -> nine_p::FileSystem<crate::Platform, ShimTransport> {
         let addr = socket_addr([10, 0, 0, 1], server.port);
-        let transport = ShimTransport::connect(task.global.clone(), addr)
-            .expect("failed to connect to 9P server via shim network");
+        let transport = ShimTransport::connect(
+            task.global.clone(),
+            addr,
+            task.global.transport_interrupt.clone(),
+        )
+        .expect("failed to connect to 9P server via shim network");
 
         let aname = server.export_path().to_str().unwrap();
         let username = std::env::var("USER")

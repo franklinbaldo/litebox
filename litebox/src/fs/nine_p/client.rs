@@ -95,7 +95,10 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                 }),
             },
         )
-        .map_err(|_| Error::Io)?;
+        .map_err(|e| match e {
+            transport::WriteError::Interrupted => Error::Interrupted,
+            transport::WriteError::Io => Error::Io,
+        })?;
 
         let response = transport::read_message(&mut transport, &mut rbuf)?;
 
@@ -140,8 +143,12 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
 
         let mut write_state = self.write_state.lock();
         let ClientWriteState { transport, wbuf } = &mut *write_state;
-        transport::write_message(transport, wbuf, TaggedFcall { tag, fcall })
-            .map_err(|_| Error::Io)?;
+        transport::write_message(transport, wbuf, TaggedFcall { tag, fcall }).map_err(
+            |e| match e {
+                transport::WriteError::Interrupted => Error::Interrupted,
+                transport::WriteError::Io => Error::Io,
+            },
+        )?;
 
         let mut rbuf = self.rbuf.lock();
 
@@ -480,7 +487,6 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     }
 
     /// Rename a file
-    #[expect(dead_code)]
     pub(super) fn rename(
         &self,
         fid: fcall::Fid,

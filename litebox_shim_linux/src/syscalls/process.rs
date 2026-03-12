@@ -1672,6 +1672,11 @@ impl<FS: ShimFS> Task<FS> {
                 .underlying_atomic()
                 .store(1, Ordering::Release);
 
+            // Signal the transport to break out of spin loops.
+            self.global
+                .transport_interrupt
+                .store(true, Ordering::Release);
+
             // Wake threads blocked in raw futex waits (e.g., wait_for_child)
             // so they see is_suspended when they re-check.
             self.global
@@ -1741,6 +1746,11 @@ impl<FS: ShimFS> Task<FS> {
             }
             inner.is_forking = false;
         }
+
+        // Allow transport spin-loops to resume.
+        self.global
+            .transport_interrupt
+            .store(false, Ordering::Release);
 
         // Clear the process-wide park futex and wake all parked threads.
         ps.vfork_park

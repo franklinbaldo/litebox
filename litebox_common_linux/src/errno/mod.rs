@@ -217,6 +217,7 @@ impl From<litebox::fs::errors::ReadError> for Errno {
             litebox::fs::errors::ReadError::NotForReading => Errno::EACCES,
             litebox::fs::errors::ReadError::Io => Errno::EIO,
             litebox::fs::errors::ReadError::WouldBlock => Errno::EAGAIN,
+            litebox::fs::errors::ReadError::Interrupted => Errno::EINTR,
             _ => unimplemented!(),
         }
     }
@@ -228,6 +229,7 @@ impl From<litebox::fs::errors::WriteError> for Errno {
             litebox::fs::errors::WriteError::NotAFile => Errno::EISDIR,
             litebox::fs::errors::WriteError::NotForWriting => Errno::EACCES,
             litebox::fs::errors::WriteError::Io => Errno::EIO,
+            litebox::fs::errors::WriteError::Interrupted => Errno::EINTR,
             _ => unimplemented!(),
         }
     }
