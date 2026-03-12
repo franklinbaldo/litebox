@@ -980,9 +980,7 @@ where
             Protocol::Raw { protocol: _ } => unimplemented!(),
         };
 
-        if ret.is_ok()
-            && let Some(proxy) = &socket_handle.proxy
-        {
+        if let Some(proxy) = &socket_handle.proxy {
             proxy.set_state(socket_channel::SocketState::Connected);
         }
         drop(table_entry);
