@@ -530,12 +530,14 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // The `max_permissions` is tracked by `VMem::protect_mapping` and thus doesn't need to be
         // passed to `allocate_pages`.
         let _ = max_permissions;
+        let can_grow_down = vma.flags.contains(VmFlags::VM_GROWSDOWN);
+        let permissions_enum = MemoryRegionPermissions::from_bits(permissions).unwrap();
         let ret = self
             .platform
             .allocate_pages(
                 suggested_range.into(),
-                MemoryRegionPermissions::from_bits(permissions).unwrap(),
-                vma.flags.contains(VmFlags::VM_GROWSDOWN),
+                permissions_enum,
+                can_grow_down,
                 populate_pages_immediately,
                 platform_fixed_address_behavior,
             )
@@ -543,12 +545,55 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 AllocationError::AddressInUse => AllocationError::AddressInUseByPlatform,
                 other => other,
             })?;
-        let new_start = ret.as_usize();
+        let mut new_start = ret.as_usize();
+
+        // On platforms where the host kernel may ignore mmap hints (e.g. macOS),
+        // the platform can return an address different from what get_unmmaped_area
+        // chose.  If the returned address falls inside the brk reservation, future
+        // brk() calls will fail with ENOMEM.  Detect this and retry with MAP_FIXED
+        // at an address that is known-free in the VMA tree and outside the brk zone.
+        if matches!(fixed_address_behavior, FixedAddressBehavior::Hint)
+            && new_start != suggested_range.start
+            && self.brk_reserved_end > 0
+        {
+            let brk_start = self.brk.next_multiple_of(ALIGN);
+            let new_end_tentative = new_start + suggested_range.len();
+            if new_start < self.brk_reserved_end && new_end_tentative > brk_start {
+                // The platform placed the mapping inside the brk reservation.
+                // Deallocate it and retry at a safe address.
+                let bad_range = new_start..new_end_tentative;
+                unsafe {
+                    // Ignore AlreadyUnallocated — platform may not have fully
+                    // committed pages yet.
+                    let _ = self.platform.deallocate_pages(bad_range);
+                }
+                let size = suggested_range.len();
+                let safe_addr = self
+                    .find_free_above(self.brk_reserved_end, size)
+                    .ok_or(AllocationError::OutOfMemory)?;
+                let safe_range = safe_addr..(safe_addr + size);
+                let retry_ret = self
+                    .platform
+                    .allocate_pages(
+                        safe_range,
+                        permissions_enum,
+                        can_grow_down,
+                        populate_pages_immediately,
+                        FixedAddressBehavior::NoReplace,
+                    )
+                    .map_err(|err| match err {
+                        AllocationError::AddressInUse => AllocationError::AddressInUseByPlatform,
+                        other => other,
+                    })?;
+                new_start = retry_ret.as_usize();
+            }
+        }
+
         let new_end = new_start + suggested_range.len();
         self.vmas.insert(new_start..new_end, vma);
         debug_assert!(new_start >= Platform::TASK_ADDR_MIN);
         debug_assert!(new_end <= Platform::TASK_ADDR_MAX);
-        Ok(ret)
+        Ok(Platform::RawMutPointer::from_usize(new_start))
     }
 
     /// Create a new mapping in the virtual address space.
