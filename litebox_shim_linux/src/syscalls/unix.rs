@@ -507,16 +507,20 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
         let mut events = Events::empty();
         let is_read_shutdown = self.recv_channel.is_shutdown();
         let is_write_shutdown = self.connected_send_channel.is_shutdown();
-        if is_read_shutdown {
+        // Detect when the peer socket has been closed (e.g., child process exit).
+        let recv_peer_closed = self.recv_channel.is_peer_shutdown();
+        let send_peer_closed = self.connected_send_channel.is_peer_shutdown();
+
+        if is_read_shutdown || recv_peer_closed {
             events |= Events::RDHUP | Events::IN;
-            if is_write_shutdown {
+            if is_write_shutdown || send_peer_closed {
                 events |= Events::HUP;
             }
         }
         if !self.recv_channel.is_empty() {
             events |= Events::IN;
         }
-        if !self.connected_send_channel.is_full() {
+        if !send_peer_closed && !self.connected_send_channel.is_full() {
             events |= Events::OUT;
         }
         events
@@ -1118,14 +1122,16 @@ impl<FS: ShimFS> UnixDatagram<FS> {
     fn check_io_events(&self) -> Events {
         let mut events = Events::empty();
         if let Some(recv_channel) = &self.inner.read().recv_channel {
-            if recv_channel.is_shutdown() {
+            if recv_channel.is_shutdown() || recv_channel.is_peer_shutdown() {
                 events |= Events::IN | Events::RDHUP;
             } else if !recv_channel.is_empty() {
                 events |= Events::IN;
             }
         }
         if let Some((connected_send_channel, _)) = &self.inner.read().connected_send_channel {
-            if !connected_send_channel.is_full() {
+            if connected_send_channel.is_peer_shutdown() {
+                events |= Events::HUP;
+            } else if !connected_send_channel.is_full() {
                 events |= Events::OUT;
             }
         } else {

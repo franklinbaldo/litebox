@@ -112,6 +112,15 @@ impl<FS: ShimFS> litebox::event::wait::CheckForInterrupt for Task<FS> {
         self.global.platform.take_pending_signals(|sig| {
             self.queue_signals(sig);
         });
+
+        // Drain cross-process signals (e.g. SIGCHLD) into the process's
+        // shared pending queue so that `has_pending_signals()` sees them.
+        // Without this, a child exit wakes the condvar via `interrupt()` but
+        // the thread goes back to sleep because the signal is only in the
+        // global queue — causing multi-second stalls in epoll_pwait/futex
+        // waits.
+        self.drain_cross_process_signals();
+
         self.is_exiting() || self.has_pending_signals() || self.is_suspended()
     }
 }
