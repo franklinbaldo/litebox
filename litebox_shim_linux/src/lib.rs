@@ -664,6 +664,22 @@ impl<FS: ShimFS> Task<FS> {
         let syscall_number = ctx.orig_rax;
         #[cfg(target_arch = "aarch64")]
         let syscall_number = ctx.regs[8];
+
+        // Diagnostic: log raw register values for openat (syscall 56 on aarch64)
+        #[cfg(target_arch = "aarch64")]
+        if syscall_number == 56 {
+            litebox::log_println!(
+                self.global.platform,
+                "[diag] openat raw regs: x0={:#x} x1={:#x} x2={:#x} x3={:#x} x8={:#x} pc={:#x} sp={:#x}",
+                ctx.regs[0],
+                ctx.regs[1],
+                ctx.regs[2],
+                ctx.regs[3],
+                ctx.regs[8],
+                ctx.pc,
+                ctx.sp
+            );
+        }
         let request =
             SyscallRequest::<Platform>::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
 
@@ -1005,9 +1021,26 @@ impl<FS: ShimFS> Task<FS> {
                 pathname,
                 flags,
                 mode,
-            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
-                syscall!(sys_openat(dirfd, path, flags, mode))
-            }),
+            } => {
+                let ptr_val = pathname.as_usize();
+                // Probe the first byte to diagnose read failures
+                let first_byte: Option<core::ffi::c_char> = pathname.read_at_offset(0);
+                litebox::log_println!(
+                    self.global.platform,
+                    "[diag] openat dispatch: ptr={:#x} first_byte={:?}",
+                    ptr_val,
+                    first_byte
+                );
+                let cstr = pathname.to_cstring();
+                litebox::log_println!(
+                    self.global.platform,
+                    "[diag] openat dispatch: to_cstring={:?}",
+                    cstr.as_deref()
+                );
+                cstr.map_or(Err(Errno::EFAULT), |path| {
+                    syscall!(sys_openat(dirfd, path, flags, mode))
+                })
+            }
             SyscallRequest::Ftruncate { fd, length } => syscall!(sys_ftruncate(fd, length)),
             SyscallRequest::Unlinkat {
                 dirfd,

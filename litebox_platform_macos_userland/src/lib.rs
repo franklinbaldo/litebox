@@ -3091,17 +3091,19 @@ unsafe fn next_signal_handler(
     context: &mut libc::ucontext_t,
 ) {
     let mut buf = [0u8; 256];
-    if signum == libc::SIGSEGV {
+    // On macOS, memory faults can be delivered as either SIGSEGV or SIGBUS
+    // (e.g., NULL dereference on ARM64 is typically SIGBUS). Check both
+    // for exception table recovery.
+    if signum == libc::SIGSEGV || signum == libc::SIGBUS {
         #[allow(clippy::cast_possible_truncation)]
         let ip: usize = unsafe { (*context.uc_mcontext).__ss.__pc as usize };
         let far: usize = unsafe { (*context.uc_mcontext).__es.__far as usize };
-        let n = format_signal_diag(
-            &mut buf,
-            b"[diag] next_signal_handler: SIGSEGV pc=",
-            0xb,
-            ip,
-            far,
-        );
+        let diag_prefix = if signum == libc::SIGSEGV {
+            b"[diag] next_signal_handler: SIGSEGV pc=" as &[u8]
+        } else {
+            b"[diag] next_signal_handler: SIGBUS pc=" as &[u8]
+        };
+        let n = format_signal_diag(&mut buf, diag_prefix, signum as usize, ip, far);
         unsafe { libc::write(2, buf.as_ptr() as *const libc::c_void, n) };
         if let Some(fixup_addr) = litebox::mm::exception_table::search_exception_tables(ip) {
             let n2 = format_buf(
