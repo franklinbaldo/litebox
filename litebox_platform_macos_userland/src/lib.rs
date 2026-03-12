@@ -2,6 +2,95 @@
 // Licensed under the MIT license.
 
 //! A [LiteBox platform](../litebox/platform/index.html) for running LiteBox on macOS (Apple Silicon).
+//!
+//! This crate is the macOS ARM64 (aarch64) counterpart of
+//! [`litebox_platform_linux_userland`](../litebox_platform_linux_userland/index.html).
+//! Only Apple Silicon (aarch64) is supported; there is no x86_64 macOS support.
+//!
+//! # Platform differences from Linux
+//!
+//! ## TLS and TPIDR_EL0
+//!
+//! On Linux aarch64 the kernel preserves `TPIDR_EL0` across context switches
+//! and signal delivery, so LiteBox stores the thread-control-block (TCB)
+//! pointer there and recovers it with `mrs xN, tpidr_el0` in assembly
+//! trampolines.
+//!
+//! macOS uses `TPIDRRO_EL0` and `x18` (the platform-reserved register) for
+//! its own TLS.  It makes **no guarantees** about `TPIDR_EL0`: the kernel may
+//! write zero or the pthread pointer into it on any context switch or signal
+//! delivery, and `sigreturn` clobbers it to the pthread value.  Therefore:
+//!
+//! * All assembly entry points (`run_thread_arch`, `switch_to_guest`) receive
+//!   the TCB pointer as an explicit register argument instead of reading
+//!   `TPIDR_EL0`.
+//! * `write_tpidr_el0(tcb)` is still called so that `syscall_callback`'s
+//!   `msr tpidr_el0, x18` restores host TLS for Rust code, but no assembly
+//!   code **reads** `TPIDR_EL0` to recover the TCB pointer.
+//! * Signal handlers recover the host TLS pointer from the alt-stack layout
+//!   (SP-aligned base + magic cookie) rather than from `TPIDR_EL0`.
+//! * `set_signal_return` passes `host_tls` via `x9` in the signal ucontext
+//!   so the callback asm can restore `TPIDR_EL0` after `sigreturn` clobbers
+//!   it.  (`x18` cannot be used because Darwin sigreturn does not restore it.)
+//!
+//! ## Address space
+//!
+//! The macOS Mach-O `__PAGEZERO` segment occupies virtual addresses 0–4 GB,
+//! making them permanently unmappable.  All guest mappings must be placed
+//! above `TASK_ADDR_MIN = 0x1_0000_0000` (4 GB).  The vmem layer's
+//! `TASK_ADDR_MIN` constant enforces this.
+//!
+//! ## Page size (16 KB host, 4 KB guest)
+//!
+//! Apple Silicon uses 16 KB pages at the hardware and kernel level.  Litebox
+//! tracks VMAs at 4 KB (guest `PAGE_SIZE`) granularity.  The platform layer
+//! converts between the two:
+//!
+//! * `mmap`, `munmap`, `mprotect` calls round addresses/sizes to 16 KB
+//!   boundaries.
+//! * When a single 16 KB host page contains 4 KB guest sub-pages with
+//!   different permissions, the page is treated as an "edge page" and
+//!   managed via fault-and-toggle (see W^X below).
+//!
+//! ## W^X enforcement (no RWX pages)
+//!
+//! macOS enforces write-xor-execute: no page may be simultaneously writable
+//! and executable.  When a 16 KB host page contains guest sub-pages that
+//! require both RW and RX (an "edge page"), the platform sets the page to
+//! one permission and toggles on fault:
+//!
+//! * An instruction-abort (EC 0x20/0x21) flips the page from RW to RX.
+//! * A write data-abort (EC 0x24/0x25, WnR=1) flips the page from RX to RW.
+//!
+//! After toggling, if the fault occurred in the guest, the handler routes
+//! through `interrupt_callback` to properly restore `TPIDR_EL0` (which
+//! `sigreturn` clobbers) before resuming execution via `switch_to_guest`.
+//!
+//! ## Signal differences
+//!
+//! * **SIGBUS number:** macOS `SIGBUS` = 10, Linux `SIGBUS` = 7.
+//!   [`macos_signal_to_linux`] translates macOS signal numbers to their
+//!   Linux equivalents before forwarding to the shim.
+//! * **sigreturn behavior:** macOS sigreturn clobbers `TPIDR_EL0` to the
+//!   pthread value and does **not** restore `x18`.  Signal handlers must
+//!   pass `host_tls` through a caller-saved register (`x9`) in the ucontext.
+//! * **SIGBUS for NULL dereference:** On macOS ARM64, NULL pointer accesses
+//!   can arrive as SIGBUS rather than SIGSEGV.  Both exception-table
+//!   recovery and the edge-page handler check for either signal.
+//!
+//! ## brk reservation
+//!
+//! A 32 MiB region is reserved above the main binary base to serve as the
+//! guest's brk heap.  Anonymous `mmap` calls that the macOS kernel places
+//! inside this reserved zone are retried until a non-conflicting address is
+//! obtained.  See [`litebox::mm::linux::BRK_RESERVE_SIZE`].
+//!
+//! ## ELF interpreter placement
+//!
+//! On Linux the kernel's ELF loader places the interpreter.  On macOS the
+//! platform must map it manually.  The loader queries the vmem layer for a
+//! free gap above the brk reservation to avoid address collisions between
+//! the interpreter, the main binary, and the brk heap.
 
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
@@ -247,6 +336,7 @@ const fn tcb_offset_guest_context_top() -> isize {
     16
 }
 
+#[allow(dead_code)]
 const fn tcb_offset_guest_tpidr() -> isize {
     24
 }
@@ -259,15 +349,16 @@ const fn tcb_offset_interrupt() -> isize {
     33
 }
 
-/// Thread-local pointer to the current thread's `ThreadControlBlock`.
-///
-/// On macOS, TPIDR_EL0 is only set to our TCB during guest execution (inside
-/// `run_thread_inner`). Code that runs outside that scope (e.g. during
-/// `load_program` or `clear_guest_thread_local_storage`) must use this
-/// thread-local to access the TCB instead of reading TPIDR_EL0 directly.
-///
-/// The asm fast path (run_thread_arch, switch_to_guest, syscall_callback,
-/// signal handlers) continues using TPIDR_EL0 / alt-stack slot for performance.
+// Thread-local pointer to the current thread's `ThreadControlBlock`.
+//
+// On macOS, TPIDR_EL0 is only set to our TCB during guest execution (inside
+// `run_thread_inner`). Code that runs outside that scope (e.g. during
+// `load_program` or `clear_guest_thread_local_storage`) must use this
+// thread-local to access the TCB instead of reading TPIDR_EL0 directly.
+//
+// The asm fast path (run_thread_arch, switch_to_guest, syscall_callback,
+// signal handlers) receives the TCB via explicit register arguments or
+// alt-stack recovery.
 thread_local! {
     static TCB_PTR: Cell<*mut ThreadControlBlock> = const { Cell::new(core::ptr::null_mut()) };
 }
@@ -2347,73 +2438,6 @@ fn with_signal_alt_stack<R>(host_tls: usize, f: impl FnOnce() -> R) -> R {
     f()
 }
 
-// Async-signal-safe diagnostic helpers. These avoid allocation and use
-// write(2) directly, safe to call from signal handlers.
-
-/// Write a hex value into `buf` starting at `pos`. Returns new position.
-fn write_hex(buf: &mut [u8], mut pos: usize, val: usize) -> usize {
-    if pos + 2 > buf.len() {
-        return pos;
-    }
-    buf[pos] = b'0';
-    buf[pos + 1] = b'x';
-    pos += 2;
-    if val == 0 {
-        if pos < buf.len() {
-            buf[pos] = b'0';
-            pos += 1;
-        }
-        return pos;
-    }
-    // Find the highest nibble
-    let mut started = false;
-    for i in (0..16).rev() {
-        let nibble = (val >> (i * 4)) & 0xf;
-        if nibble != 0 || started {
-            started = true;
-            if pos < buf.len() {
-                buf[pos] = b"0123456789abcdef"[nibble];
-                pos += 1;
-            }
-        }
-    }
-    pos
-}
-
-/// Copy bytes into buf at pos. Returns new position.
-fn write_bytes(buf: &mut [u8], mut pos: usize, src: &[u8]) -> usize {
-    for &b in src {
-        if pos < buf.len() {
-            buf[pos] = b;
-            pos += 1;
-        }
-    }
-    pos
-}
-
-/// Format: "{prefix}{signum}, pc={pc_hex}, far={far_hex}\n"
-fn format_signal_diag(
-    buf: &mut [u8],
-    prefix: &[u8],
-    signum: usize,
-    pc: usize,
-    far: usize,
-) -> usize {
-    let mut pos = write_bytes(buf, 0, prefix);
-    pos = write_hex(buf, pos, signum);
-    pos = write_bytes(buf, pos, b", pc=");
-    pos = write_hex(buf, pos, pc);
-    pos = write_bytes(buf, pos, b", far=");
-    pos = write_hex(buf, pos, far);
-    pos = write_bytes(buf, pos, b"\n");
-    pos
-}
-
-/// Format a simple message.
-fn format_buf(buf: &mut [u8], msg: &[u8]) -> usize {
-    write_bytes(buf, 0, msg)
-}
-
 /// Called from signal handlers to fix up thread state after potentially running
 /// in the guest (aarch64 version).
 ///
@@ -2442,13 +2466,6 @@ fn signal_handler_exit_guest(
         if ret != 0 || current_ss.ss_flags & libc::SS_ONSTACK == 0 {
             // Not on our alt-stack (or syscall failed). Return None without
             // touching any SP-derived addresses.
-            let mut dbuf = [0u8; 128];
-            let mut dpos = write_bytes(&mut dbuf, 0, b"[diag] exit_guest: not on altstack ret=");
-            dpos = write_hex(&mut dbuf, dpos, ret as usize);
-            dpos = write_bytes(&mut dbuf, dpos, b" flags=");
-            dpos = write_hex(&mut dbuf, dpos, current_ss.ss_flags as usize);
-            dpos = write_bytes(&mut dbuf, dpos, b"\n");
-            libc::write(2, dbuf.as_ptr() as *const libc::c_void, dpos);
             return None;
         }
 
@@ -2462,11 +2479,6 @@ fn signal_handler_exit_guest(
         let magic_ptr = (aligned_base + ALT_STACK_ALLOC_SIZE - 16) as *const usize;
         let magic = core::ptr::read_volatile(magic_ptr);
         if magic != ALT_STACK_MAGIC {
-            let mut dbuf = [0u8; 128];
-            let mut dpos = write_bytes(&mut dbuf, 0, b"[diag] exit_guest: magic mismatch got=");
-            dpos = write_hex(&mut dbuf, dpos, magic);
-            dpos = write_bytes(&mut dbuf, dpos, b"\n");
-            libc::write(2, dbuf.as_ptr() as *const libc::c_void, dpos);
             return None;
         }
 
@@ -2474,9 +2486,6 @@ fn signal_handler_exit_guest(
         let host_tls = core::ptr::read_volatile(host_tls_ptr);
 
         if host_tls == 0 {
-            let mut dbuf = [0u8; 64];
-            let dpos = write_bytes(&mut dbuf, 0, b"[diag] exit_guest: host_tls=0\n");
-            libc::write(2, dbuf.as_ptr() as *const libc::c_void, dpos);
             return None;
         }
 
@@ -2504,11 +2513,6 @@ fn signal_handler_exit_guest(
         }
 
         if was_in_guest == 0 {
-            let mut dbuf = [0u8; 128];
-            let mut dpos = write_bytes(&mut dbuf, 0, b"[diag] exit_guest: in_guest=0 host_tls=");
-            dpos = write_hex(&mut dbuf, dpos, host_tls);
-            dpos = write_bytes(&mut dbuf, dpos, b"\n");
-            libc::write(2, dbuf.as_ptr() as *const libc::c_void, dpos);
             return None;
         }
 
@@ -2594,8 +2598,6 @@ unsafe extern "C" fn exception_signal_handler(
     info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
-    let mut buf = [0u8; 256];
-
     // Fault-and-toggle W^X: handle permission faults on edge pages.
     //
     // Edge pages are 16KB host pages containing 4KB guest sub-pages with
@@ -2670,131 +2672,9 @@ unsafe extern "C" fn exception_signal_handler(
     }
 
     let Some((regs, host_tls)) = signal_handler_exit_guest(context, false) else {
-        let n2 = format_buf(
-            &mut buf,
-            b"[diag] exception_signal_handler: not in guest, forwarding to next_signal_handler\n",
-        );
-        unsafe { libc::write(2, buf.as_ptr() as *const libc::c_void, n2) };
-        // Print faulting PC and key addresses for diagnosis.
-        unsafe {
-            let mctx = &*context.uc_mcontext;
-            let crash_pc = mctx.__ss.__pc as usize;
-            let crash_x18 = mctx.__ss.__x[18] as usize;
-            let stg_start = switch_to_guest_start as *const () as usize;
-            let stg_end = switch_to_guest_end as *const () as usize;
-            let sc_cb = syscall_callback as *const () as usize;
-            let mut dbuf2 = [0u8; 256];
-            let mut dpos = write_bytes(&mut dbuf2, 0, b"[diag] crash_pc=");
-            dpos = write_hex(&mut dbuf2, dpos, crash_pc);
-            dpos = write_bytes(&mut dbuf2, dpos, b" x18=");
-            dpos = write_hex(&mut dbuf2, dpos, crash_x18);
-            dpos = write_bytes(&mut dbuf2, dpos, b" stg=[");
-            dpos = write_hex(&mut dbuf2, dpos, stg_start);
-            dpos = write_bytes(&mut dbuf2, dpos, b"..");
-            dpos = write_hex(&mut dbuf2, dpos, stg_end);
-            dpos = write_bytes(&mut dbuf2, dpos, b"] sc_cb=");
-            dpos = write_hex(&mut dbuf2, dpos, sc_cb);
-            dpos = write_bytes(&mut dbuf2, dpos, b"\n");
-            libc::write(2, dbuf2.as_ptr() as *const libc::c_void, dpos);
-        }
         return unsafe { next_signal_handler(signum, info, context) };
     };
     copy_signal_context(unsafe { &mut *regs }, context);
-
-    // Dump guest register state at crash for debugging.
-    {
-        let mctx = unsafe { &*context.uc_mcontext };
-        // Dump x0-x9 (two per line)
-        for pair in 0..5u64 {
-            let i = pair * 2;
-            let mut dbuf = [0u8; 128];
-            let mut dpos = write_bytes(&mut dbuf, 0, b"[diag] crash x");
-            dpos = write_hex(&mut dbuf, dpos, i as usize);
-            dpos = write_bytes(&mut dbuf, dpos, b"=");
-            dpos = write_hex(&mut dbuf, dpos, mctx.__ss.__x[i as usize] as usize);
-            dpos = write_bytes(&mut dbuf, dpos, b" x");
-            dpos = write_hex(&mut dbuf, dpos, (i + 1) as usize);
-            dpos = write_bytes(&mut dbuf, dpos, b"=");
-            dpos = write_hex(&mut dbuf, dpos, mctx.__ss.__x[(i + 1) as usize] as usize);
-            dpos = write_bytes(&mut dbuf, dpos, b"\n");
-            unsafe { libc::write(2, dbuf.as_ptr() as *const libc::c_void, dpos) };
-        }
-        // Dump x10-x19
-        for pair in 5..10u64 {
-            let i = pair * 2;
-            let mut dbuf = [0u8; 128];
-            let mut dpos = write_bytes(&mut dbuf, 0, b"[diag] crash x");
-            dpos = write_hex(&mut dbuf, dpos, i as usize);
-            dpos = write_bytes(&mut dbuf, dpos, b"=");
-            dpos = write_hex(&mut dbuf, dpos, mctx.__ss.__x[i as usize] as usize);
-            dpos = write_bytes(&mut dbuf, dpos, b" x");
-            dpos = write_hex(&mut dbuf, dpos, (i + 1) as usize);
-            dpos = write_bytes(&mut dbuf, dpos, b"=");
-            dpos = write_hex(&mut dbuf, dpos, mctx.__ss.__x[(i + 1) as usize] as usize);
-            dpos = write_bytes(&mut dbuf, dpos, b"\n");
-            unsafe { libc::write(2, dbuf.as_ptr() as *const libc::c_void, dpos) };
-        }
-        // Dump x20-x28, fp, lr
-        for pair in 10..14u64 {
-            let i = pair * 2;
-            let mut dbuf = [0u8; 128];
-            let mut dpos = write_bytes(&mut dbuf, 0, b"[diag] crash x");
-            dpos = write_hex(&mut dbuf, dpos, i as usize);
-            dpos = write_bytes(&mut dbuf, dpos, b"=");
-            dpos = write_hex(&mut dbuf, dpos, mctx.__ss.__x[i as usize] as usize);
-            dpos = write_bytes(&mut dbuf, dpos, b" x");
-            dpos = write_hex(&mut dbuf, dpos, (i + 1) as usize);
-            dpos = write_bytes(&mut dbuf, dpos, b"=");
-            dpos = write_hex(&mut dbuf, dpos, mctx.__ss.__x[(i + 1) as usize] as usize);
-            dpos = write_bytes(&mut dbuf, dpos, b"\n");
-            unsafe { libc::write(2, dbuf.as_ptr() as *const libc::c_void, dpos) };
-        }
-        {
-            let mut dbuf = [0u8; 128];
-            let mut dpos = write_bytes(&mut dbuf, 0, b"[diag] crash x1c=");
-            dpos = write_hex(&mut dbuf, dpos, mctx.__ss.__x[28] as usize);
-            dpos = write_bytes(&mut dbuf, dpos, b" fp=");
-            dpos = write_hex(&mut dbuf, dpos, mctx.__ss.__fp as usize);
-            dpos = write_bytes(&mut dbuf, dpos, b" lr=");
-            dpos = write_hex(&mut dbuf, dpos, mctx.__ss.__lr as usize);
-            dpos = write_bytes(&mut dbuf, dpos, b"\n");
-            unsafe { libc::write(2, dbuf.as_ptr() as *const libc::c_void, dpos) };
-        }
-        // Also dump guest_tpidr from TCB for reference
-        {
-            let mut dbuf = [0u8; 128];
-            let mut dpos = write_bytes(&mut dbuf, 0, b"[diag] crash tcb.guest_tpidr=");
-            dpos = write_hex(&mut dbuf, dpos, unsafe { (*TCB_PTR.get()).guest_tpidr });
-            dpos = write_bytes(&mut dbuf, dpos, b" esr=");
-            dpos = write_hex(&mut dbuf, dpos, mctx.__es.__esr as usize);
-            dpos = write_bytes(&mut dbuf, dpos, b"\n");
-            unsafe { libc::write(2, dbuf.as_ptr() as *const libc::c_void, dpos) };
-        }
-    }
-
-    // Dump instructions around the crash PC for disassembly.
-    {
-        let mctx = unsafe { &*context.uc_mcontext };
-        let crash_pc = mctx.__ss.__pc as usize;
-        // Dump 4 instructions before + the faulting instruction + 3 after (8 total).
-        let start = crash_pc.wrapping_sub(16);
-        let mut dbuf = [0u8; 256];
-        let mut dpos = write_bytes(&mut dbuf, 0, b"[diag] insn dump at pc=");
-        dpos = write_hex(&mut dbuf, dpos, crash_pc);
-        dpos = write_bytes(&mut dbuf, dpos, b" (start=");
-        dpos = write_hex(&mut dbuf, dpos, start);
-        dpos = write_bytes(&mut dbuf, dpos, b"):");
-        for i in 0..8u64 {
-            let addr = start.wrapping_add(i as usize * 4);
-            // Read the 4-byte instruction (might fault if unmapped, but
-            // crash PC should be readable code).
-            let insn = unsafe { core::ptr::read_volatile(addr as *const u32) };
-            dpos = write_bytes(&mut dbuf, dpos, b" ");
-            dpos = write_hex(&mut dbuf, dpos, insn as usize);
-        }
-        dpos = write_bytes(&mut dbuf, dpos, b"\n");
-        unsafe { libc::write(2, dbuf.as_ptr() as *const libc::c_void, dpos) };
-    }
 
     // Ensure that `run_thread_arch` is linked in so that `exception_callback` is visible.
     let _ = run_thread_arch as *const () as usize;
@@ -2825,27 +2705,13 @@ unsafe fn next_signal_handler(
     info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
-    let mut buf = [0u8; 256];
     // On macOS, memory faults can be delivered as either SIGSEGV or SIGBUS
     // (e.g., NULL dereference on ARM64 is typically SIGBUS). Check both
     // for exception table recovery.
     if signum == libc::SIGSEGV || signum == libc::SIGBUS {
         #[allow(clippy::cast_possible_truncation)]
         let ip: usize = unsafe { (*context.uc_mcontext).__ss.__pc as usize };
-        let far: usize = unsafe { (*context.uc_mcontext).__es.__far as usize };
-        let diag_prefix = if signum == libc::SIGSEGV {
-            b"[diag] next_signal_handler: SIGSEGV pc=" as &[u8]
-        } else {
-            b"[diag] next_signal_handler: SIGBUS pc=" as &[u8]
-        };
-        let n = format_signal_diag(&mut buf, diag_prefix, signum as usize, ip, far);
-        unsafe { libc::write(2, buf.as_ptr() as *const libc::c_void, n) };
         if let Some(fixup_addr) = litebox::mm::exception_table::search_exception_tables(ip) {
-            let n2 = format_buf(
-                &mut buf,
-                b"[diag] next_signal_handler: found exception table fixup\n",
-            );
-            unsafe { libc::write(2, buf.as_ptr() as *const libc::c_void, n2) };
             unsafe {
                 (*context.uc_mcontext).__ss.__pc = fixup_addr as u64;
             }
@@ -2857,11 +2723,6 @@ unsafe fn next_signal_handler(
         let next_sa = &NEXT_SA[signum.reinterpret_as_unsigned() as usize];
         match next_sa.sa_sigaction {
             libc::SIG_DFL => {
-                let n3 = format_buf(
-                    &mut buf,
-                    b"[diag] next_signal_handler: dispatching to SIG_DFL -- process will die\n",
-                );
-                unsafe { libc::write(2, buf.as_ptr() as *const libc::c_void, n3) };
                 // Block this signal and raise.
                 let mut set: libc::sigset_t = core::mem::zeroed();
                 libc::sigemptyset(&raw mut set);
