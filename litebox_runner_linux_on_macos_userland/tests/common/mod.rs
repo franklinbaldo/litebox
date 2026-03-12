@@ -75,6 +75,7 @@ impl TestLauncher {
         self.fs.close(&fd).unwrap();
     }
 
+    #[allow(dead_code)]
     pub fn test_load_exec_common(mut self, executable_path: &str) {
         self.shim_builder.set_fs(self.fs);
         let argv = vec![

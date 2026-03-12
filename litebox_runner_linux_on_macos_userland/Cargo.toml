@@ -1,5 +1,5 @@
 [package]
-name = "litebox_runner_macos_userland"
+name = "litebox_runner_linux_on_macos_userland"
 version = "0.1.0"
 edition = "2024"
 

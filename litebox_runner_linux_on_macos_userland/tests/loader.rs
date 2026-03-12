@@ -278,10 +278,12 @@ fn run_dynamic_linked_prog_with_rewriter(
     );
     println!("Tar file created at: {}", tar_target_file.to_str().unwrap());
 
-    let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_macos_userland")
-        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_litebox_runner_macos_userland").to_string());
+    let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_on_macos_userland")
+        .unwrap_or_else(|_| {
+            env!("CARGO_BIN_EXE_litebox_runner_linux_on_macos_userland").to_string()
+        });
 
-    // Run litebox_runner_macos_userland with the tar file and the compiled executable.
+    // Run litebox_runner_linux_on_macos_userland with the tar file and the compiled executable.
     let mut args = vec![
         "--unstable",
         // Tell ld where to find the libraries.
@@ -300,12 +302,12 @@ fn run_dynamic_linked_prog_with_rewriter(
     println!("Running `{command:?}`");
     let output = command
         .output()
-        .expect("Failed to run litebox_runner_macos_userland");
+        .expect("Failed to run litebox_runner_linux_on_macos_userland");
     if !output.status.success() {
         let stdout = std::str::from_utf8(&output.stdout).unwrap_or("<non-utf8>");
         let stderr = std::str::from_utf8(&output.stderr).unwrap_or("<non-utf8>");
         panic!(
-            "failed to run litebox_runner_macos_userland: {}\nstdout:\n{}\nstderr:\n{}",
+            "failed to run litebox_runner_linux_on_macos_userland: {}\nstdout:\n{}\nstderr:\n{}",
             output.status, stdout, stderr
         );
     }

@@ -860,7 +860,7 @@ fix(macos): clippy and formatting fixes
 
 ## Task 12: Runner crate (optional, deferred)
 
-Create `litebox_runner_macos_userland/` — a minimal binary that wires together the macOS platform + multiplex + shim. This follows the same pattern as `litebox_runner_linux_userland/` but is deferred until the platform crate is tested on actual macOS hardware.
+Create `litebox_runner_linux_on_macos_userland/` — a minimal binary that wires together the macOS platform + multiplex + shim. This follows the same pattern as `litebox_runner_linux_userland/` but is deferred until the platform crate is tested on actual macOS hardware.
 
 ---
 
