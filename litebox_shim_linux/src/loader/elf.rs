@@ -221,6 +221,224 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
             None
         };
 
+        // == Diagnostic: simulate rtld_audit's parse_object scan on the main binary ==
+        // This runs on the host side to verify what the guest-side parse_object would see.
+        // rtld_audit's debug prints are invisible when syscall_entry==0, so we need
+        // host-side visibility into the trampoline state.
+        #[cfg(target_arch = "aarch64")]
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            use litebox_common_linux::loader::AccessMemory;
+            let base = info.base_addr;
+            litebox::log_println!(
+                global.platform,
+                "[diag] parse_object sim: main base_addr={:#x} brk={:#x} phdrs_addr={:#x} num_phdrs={} tls_table={:#x}",
+                base,
+                info.brk,
+                info.phdrs_addr,
+                info.num_phdrs,
+                info.tls_table_addr
+            );
+
+            // Read in-memory ELF header to get e_phoff and e_phnum
+            let mut ehdr = [0u8; 64]; // Elf64_Ehdr is 64 bytes
+            if (&*global.platform).read(base, &mut ehdr).is_ok() {
+                let e_phoff = u64::from_le_bytes(ehdr[32..40].try_into().unwrap()) as usize;
+                let e_phentsize = u16::from_le_bytes(ehdr[54..56].try_into().unwrap()) as usize;
+                let e_phnum = u16::from_le_bytes(ehdr[56..58].try_into().unwrap()) as usize;
+                litebox::log_println!(
+                    global.platform,
+                    "[diag] parse_object sim: e_phoff={:#x} e_phentsize={} e_phnum={}",
+                    e_phoff,
+                    e_phentsize,
+                    e_phnum
+                );
+
+                // Walk program headers like parse_object does
+                let mut max_filesz_end: usize = 0;
+                let mut max_memsz_end: usize = 0;
+                for i in 0..e_phnum {
+                    let ph_addr = base + e_phoff + i * e_phentsize;
+                    let mut phdr = [0u8; 56]; // Elf64_Phdr is 56 bytes
+                    if (&*global.platform).read(ph_addr, &mut phdr).is_ok() {
+                        let p_type = u32::from_le_bytes(phdr[0..4].try_into().unwrap());
+                        let p_vaddr = u64::from_le_bytes(phdr[16..24].try_into().unwrap()) as usize;
+                        let p_filesz =
+                            u64::from_le_bytes(phdr[32..40].try_into().unwrap()) as usize;
+                        let p_memsz = u64::from_le_bytes(phdr[40..48].try_into().unwrap()) as usize;
+                        if p_type == 1 {
+                            // PT_LOAD
+                            litebox::log_println!(
+                                global.platform,
+                                "[diag] parse_object sim: PT_LOAD[{}] p_vaddr={:#x} p_filesz={:#x} p_memsz={:#x}",
+                                i,
+                                p_vaddr,
+                                p_filesz,
+                                p_memsz
+                            );
+                            let filesz_end = p_vaddr + p_filesz;
+                            let memsz_end = p_vaddr + p_memsz;
+                            if filesz_end > max_filesz_end {
+                                max_filesz_end = filesz_end;
+                            }
+                            if memsz_end > max_memsz_end {
+                                max_memsz_end = memsz_end;
+                            }
+                        }
+                    }
+                }
+
+                // Simulate the scan: align_up(max_filesz_end, 0x1000) .. align_up(max_memsz_end, 0x1000)
+                let scan_start = (max_filesz_end + 0xFFF) & !0xFFF;
+                let scan_end = (max_memsz_end + 0xFFF) & !0xFFF;
+                litebox::log_println!(
+                    global.platform,
+                    "[diag] parse_object sim: max_filesz_end={:#x} max_memsz_end={:#x} scan_start={:#x} scan_end={:#x}",
+                    max_filesz_end,
+                    max_memsz_end,
+                    scan_start,
+                    scan_end
+                );
+
+                // Scan each 4KB page in the range, read first 8 bytes
+                let mut found_trampoline = false;
+                let mut offset = scan_start;
+                while offset < scan_end {
+                    let addr = base + offset;
+                    let mut buf = [0u8; 8];
+                    match (&*global.platform).read(addr, &mut buf) {
+                        Ok(_) => {
+                            let val = u64::from_le_bytes(buf);
+                            litebox::log_println!(
+                                global.platform,
+                                "[diag] parse_object sim: scan addr={:#x} (offset={:#x}) val={:#x}",
+                                addr,
+                                offset,
+                                val
+                            );
+                            if val != 0 && !found_trampoline {
+                                found_trampoline = true;
+                                // Also read the next 8 bytes (tls_table_ptr)
+                                let mut buf2 = [0u8; 8];
+                                if (&*global.platform).read(addr + 8, &mut buf2).is_ok() {
+                                    let tls_ptr = u64::from_le_bytes(buf2);
+                                    litebox::log_println!(
+                                        global.platform,
+                                        "[diag] parse_object sim: FOUND trampoline at {:#x}: syscall_entry={:#x} tls_table_ptr={:#x}",
+                                        addr,
+                                        val,
+                                        tls_ptr
+                                    );
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            litebox::log_println!(
+                                global.platform,
+                                "[diag] parse_object sim: scan addr={:#x} (offset={:#x}) READ FAILED",
+                                addr,
+                                offset
+                            );
+                        }
+                    }
+                    offset += 0x1000;
+                }
+                if !found_trampoline {
+                    litebox::log_println!(
+                        global.platform,
+                        "[diag] parse_object sim: NO trampoline found in scan range!"
+                    );
+                }
+            } else {
+                litebox::log_println!(
+                    global.platform,
+                    "[diag] parse_object sim: failed to read ELF header at {:#x}",
+                    base
+                );
+            }
+        }
+
+        // Also dump interpreter trampoline info
+        #[cfg(target_arch = "aarch64")]
+        #[allow(clippy::cast_possible_truncation)]
+        if let Some(interp_info) = &interp {
+            use litebox_common_linux::loader::AccessMemory;
+            let ibase = interp_info.base_addr;
+            litebox::log_println!(
+                global.platform,
+                "[diag] parse_object sim: interp base_addr={:#x} brk={:#x} tls_table={:#x}",
+                ibase,
+                interp_info.brk,
+                interp_info.tls_table_addr
+            );
+            // Read trampoline from interpreter using same scan
+            let mut ehdr = [0u8; 64];
+            if (&*global.platform).read(ibase, &mut ehdr).is_ok() {
+                let e_phoff = u64::from_le_bytes(ehdr[32..40].try_into().unwrap()) as usize;
+                let e_phentsize = u16::from_le_bytes(ehdr[54..56].try_into().unwrap()) as usize;
+                let e_phnum = u16::from_le_bytes(ehdr[56..58].try_into().unwrap()) as usize;
+                let mut max_filesz_end: usize = 0;
+                let mut max_memsz_end: usize = 0;
+                for i in 0..e_phnum {
+                    let ph_addr = ibase + e_phoff + i * e_phentsize;
+                    let mut phdr = [0u8; 56];
+                    if (&*global.platform).read(ph_addr, &mut phdr).is_ok() {
+                        let p_type = u32::from_le_bytes(phdr[0..4].try_into().unwrap());
+                        let p_vaddr = u64::from_le_bytes(phdr[16..24].try_into().unwrap()) as usize;
+                        let p_filesz =
+                            u64::from_le_bytes(phdr[32..40].try_into().unwrap()) as usize;
+                        let p_memsz = u64::from_le_bytes(phdr[40..48].try_into().unwrap()) as usize;
+                        if p_type == 1 {
+                            // PT_LOAD
+                            let filesz_end = p_vaddr + p_filesz;
+                            let memsz_end = p_vaddr + p_memsz;
+                            if filesz_end > max_filesz_end {
+                                max_filesz_end = filesz_end;
+                            }
+                            if memsz_end > max_memsz_end {
+                                max_memsz_end = memsz_end;
+                            }
+                        }
+                    }
+                }
+                let scan_start = (max_filesz_end + 0xFFF) & !0xFFF;
+                let scan_end = (max_memsz_end + 0xFFF) & !0xFFF;
+                litebox::log_println!(
+                    global.platform,
+                    "[diag] parse_object sim interp: scan_start={:#x} scan_end={:#x}",
+                    scan_start,
+                    scan_end
+                );
+                let mut offset = scan_start;
+                while offset < scan_end {
+                    let addr = ibase + offset;
+                    let mut buf = [0u8; 8];
+                    if (&*global.platform).read(addr, &mut buf).is_ok() {
+                        let val = u64::from_le_bytes(buf);
+                        if val != 0 {
+                            let mut buf2 = [0u8; 8];
+                            let tls_ptr = if (&*global.platform).read(addr + 8, &mut buf2).is_ok() {
+                                u64::from_le_bytes(buf2)
+                            } else {
+                                0
+                            };
+                            litebox::log_println!(
+                                global.platform,
+                                "[diag] parse_object sim interp: FOUND at {:#x} (offset={:#x}): entry={:#x} tls={:#x}",
+                                addr,
+                                offset,
+                                val,
+                                tls_ptr
+                            );
+                            break; // Only need to find the first one
+                        }
+                    }
+                    offset += 0x1000;
+                }
+            }
+        }
+        // == End diagnostic ==
+
         global.pm.set_initial_brk(info.brk);
         aux.insert(AuxKey::AT_PAGESZ, PAGE_SIZE);
         aux.insert(AuxKey::AT_PHDR, info.phdrs_addr);
