@@ -665,21 +665,6 @@ impl<FS: ShimFS> Task<FS> {
         #[cfg(target_arch = "aarch64")]
         let syscall_number = ctx.regs[8];
 
-        // Diagnostic: log raw register values for openat (syscall 56 on aarch64)
-        #[cfg(target_arch = "aarch64")]
-        if syscall_number == 56 {
-            litebox::log_println!(
-                self.global.platform,
-                "[diag] openat raw regs: x0={:#x} x1={:#x} x2={:#x} x3={:#x} x8={:#x} pc={:#x} sp={:#x}",
-                ctx.regs[0],
-                ctx.regs[1],
-                ctx.regs[2],
-                ctx.regs[3],
-                ctx.regs[8],
-                ctx.pc,
-                ctx.sp
-            );
-        }
         let request = match SyscallRequest::<Platform>::try_from_raw(
             syscall_number,
             ctx,
@@ -687,18 +672,6 @@ impl<FS: ShimFS> Task<FS> {
         ) {
             Ok(req) => req,
             Err(e) => {
-                // Diagnostic: log ALL syscalls that fail parsing (would otherwise be silent)
-                #[cfg(target_arch = "aarch64")]
-                litebox::log_println!(
-                    self.global.platform,
-                    "[diag] try_from_raw FAILED: nr={} (0x{:x}) => {:?} | x0={:#x} x1={:#x} x2={:#x}",
-                    syscall_number,
-                    syscall_number,
-                    e,
-                    ctx.regs[0],
-                    ctx.regs[1],
-                    ctx.regs[2]
-                );
                 return Err(e);
             }
         };
@@ -757,22 +730,6 @@ impl<FS: ShimFS> Task<FS> {
                 if count <= MAX_KERNEL_BUF_SIZE {
                     let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
                     self.sys_read(fd, &mut kernel_buf, None).and_then(|size| {
-                        // Diagnostic: log first bytes of read data for small reads
-                        // (helps verify ELF header data during ld.so's open_verify)
-                        #[cfg(target_arch = "aarch64")]
-                        if size > 0 && count <= 4096 {
-                            let preview_len = size.min(32);
-                            let preview: alloc::vec::Vec<u8> = kernel_buf[..preview_len].to_vec();
-                            litebox::log_println!(
-                                self.global.platform,
-                                "[diag] read(fd={}, count={}) => {} bytes, first {}: {:02x?}",
-                                fd,
-                                count,
-                                size,
-                                preview_len,
-                                preview
-                            );
-                        }
                         buf.copy_from_slice(0, &kernel_buf[..size])
                             .map(|()| size)
                             .ok_or(Errno::EFAULT)
@@ -1108,21 +1065,7 @@ impl<FS: ShimFS> Task<FS> {
                 flags,
                 mode,
             } => {
-                let ptr_val = pathname.as_usize();
-                // Probe the first byte to diagnose read failures
-                let first_byte: Option<core::ffi::c_char> = pathname.read_at_offset(0);
-                litebox::log_println!(
-                    self.global.platform,
-                    "[diag] openat dispatch: ptr={:#x} first_byte={:?}",
-                    ptr_val,
-                    first_byte
-                );
                 let cstr = pathname.to_cstring();
-                litebox::log_println!(
-                    self.global.platform,
-                    "[diag] openat dispatch: to_cstring={:?}",
-                    cstr.as_deref()
-                );
                 cstr.map_or(Err(Errno::EFAULT), |path| {
                     syscall!(sys_openat(dirfd, path, flags, mode))
                 })

@@ -154,10 +154,6 @@ fn ensure_edge_page(page_addr: usize, prot: libc::c_int) {
 
     let r = unsafe { libc::mprotect(page_addr as *mut libc::c_void, HOST_PAGE_SIZE, prot) };
     if r == 0 {
-        eprintln!(
-            "[diag] ensure_edge_page: {:#x} prot={} mprotect OK (content preserved)",
-            page_addr, prot
-        );
         return; // mprotect succeeded — page existed, content preserved
     }
 
@@ -186,10 +182,6 @@ fn ensure_edge_page(page_addr: usize, prot: libc::c_int) {
         "mmap MAP_FIXED edge page {:#x} failed: {}",
         page_addr,
         std::io::Error::last_os_error()
-    );
-    eprintln!(
-        "[diag] ensure_edge_page: {:#x} prot={} mmap FALLBACK (page was unmapped)",
-        page_addr, prot
     );
 }
 
@@ -492,35 +484,13 @@ fn run_thread_inner(
         // the closure because macOS libc calls (mmap, sigaltstack, etc.) in
         // with_signal_alt_stack reset TPIDR_EL0 to the pthread value.
         TCB_PTR.set(tcb_ptr);
-        eprintln!(
-            "[diag] run_thread_inner: TCB at {:#x}, original_tpidr={:#x}, reenter={}",
-            tcb_addr, original_tpidr, reenter
-        );
         with_signal_alt_stack(tcb_addr, || unsafe {
-            // Diagnostics BEFORE setting TPIDR_EL0 (any eprintln/write
-            // syscall will clobber TPIDR_EL0 on macOS).
-            eprintln!(
-                "[diag] run_thread_inner: inside closure, about to set TPIDR_EL0={:#x}",
-                tcb_addr
-            );
-            // Diagnostic: verify our alt-stack is still in place right before
-            // guest entry. If something between with_signal_alt_stack and here
-            // replaced it, we'll see it.
-            {
-                let mut check_ss: libc::stack_t = unsafe { std::mem::zeroed() };
-                let ret = unsafe { libc::sigaltstack(std::ptr::null(), &mut check_ss) };
-                eprintln!(
-                    "[diag] pre-guest sigaltstack check: ret={} ss_sp={:#x} ss_size={:#x} ss_flags={:#x}",
-                    ret, check_ss.ss_sp as usize, check_ss.ss_size, check_ss.ss_flags,
-                );
-            }
             // Set TPIDR_EL0 as the VERY LAST thing before asm. No syscalls
             // (including eprintln!) allowed between this and run_thread_arch,
             // because macOS clobbers TPIDR_EL0 on every syscall.
             litebox_common_linux::write_tpidr_el0(tcb_addr);
             run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter));
         });
-        eprintln!("[diag] run_thread_inner: returned from run_thread_arch");
         unsafe { litebox_common_linux::write_tpidr_el0(original_tpidr) };
         TCB_PTR.set(core::ptr::null_mut());
     });
@@ -1317,17 +1287,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         _populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
-        eprintln!(
-            "[diag] allocate_pages: range={:#x}..{:#x} perms={:?} behavior={:?}",
-            suggested_range.start, suggested_range.end, initial_permissions, fixed_address_behavior
-        );
-        // Backtrace for operations in the crash-suspect region
-        if suggested_range.start < 0x10ad20000 && suggested_range.end > 0x10ad00000 {
-            eprintln!(
-                "[DIAG-SUSPECT] allocate_pages touches crash region: {:#x}..{:#x}",
-                suggested_range.start, suggested_range.end
-            );
-        }
         // macOS arm64 requires 16KB-aligned addresses for all VM operations.
         // For Hint, pass the address as-is; the kernel picks a properly aligned one.
         //
@@ -1392,10 +1351,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 // code on an edge page, the fault-and-toggle handler in
                 // exception_signal_handler will flip it to RX on demand.
 
-                eprintln!(
-                    "[diag] allocate_pages interior: {:#x}..{:#x} (outer: {:#x}..{:#x})",
-                    inner_start, inner_end, outer_start, outer_end
-                );
                 // Step 1: mmap the 16KB-aligned interior with MAP_FIXED.
                 // This replaces only fully-enclosed host pages with fresh anonymous memory.
                 if inner_start < inner_end {
@@ -1479,10 +1434,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                             leading_zero_end - suggested_range.start,
                         );
                     }
-                    eprintln!(
-                        "[diag] allocate_pages: zeroed leading edge {:#x}..{:#x}",
-                        suggested_range.start, leading_zero_end
-                    );
                 }
                 let trailing_zero_start = inner_end.max(suggested_range.start);
                 if trailing_zero_start < suggested_range.end
@@ -1495,10 +1446,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                             suggested_range.end - trailing_zero_start,
                         );
                     }
-                    eprintln!(
-                        "[diag] allocate_pages: zeroed trailing edge {:#x}..{:#x}",
-                        trailing_zero_start, suggested_range.end
-                    );
                 }
 
                 Ok(UserMutPtr::from_usize(suggested_range.start))
@@ -1510,10 +1457,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         &self,
         range: core::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
-        eprintln!(
-            "[diag] deallocate_pages: range={:#x}..{:#x}",
-            range.start, range.end
-        );
         // Round inward to HOST_PAGE_SIZE boundaries to avoid unmapping adjacent
         // 4KB sub-pages that belong to other VMAs within the same 16KB host page.
         // Sub-16KB edge portions are left mapped (as PROT_NONE from the original
@@ -1521,18 +1464,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         // deallocated or replaced by a subsequent MAP_FIXED mmap.
         let aligned_start = host_page_align_up(range.start);
         let aligned_end = host_page_align_down(range.end);
-        eprintln!(
-            "[diag] deallocate_pages aligned: {:#x}..{:#x} (munmap={})",
-            aligned_start,
-            aligned_end,
-            aligned_start < aligned_end
-        );
-        if aligned_start < aligned_end && aligned_start < 0x10ad20000 && aligned_end > 0x10ad00000 {
-            eprintln!(
-                "[DIAG-SUSPECT] deallocate_pages MUNMAPS crash region: {:#x}..{:#x}",
-                aligned_start, aligned_end
-            );
-        }
         if aligned_start < aligned_end {
             let r = unsafe {
                 libc::munmap(
@@ -1551,16 +1482,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         new_range: core::ops::Range<usize>,
         permissions: MemoryRegionPermissions,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::RemapError> {
-        eprintln!(
-            "[diag] remap_pages: old={:#x}..{:#x} new={:#x}..{:#x} perms={:?}",
-            old_range.start, old_range.end, new_range.start, new_range.end, permissions
-        );
-        if (old_range.start < 0x10ad20000 && old_range.end > 0x10ad00000)
-            || (new_range.start < 0x10ad20000 && new_range.end > 0x10ad00000)
-        {
-            eprintln!("[DIAG-SUSPECT] remap_pages touches crash region");
-        }
-
         // Allocate new range using the same edge-page-aware strategy as
         // allocate_pages: inward-rounded interior mmap + edge page mprotect.
         // This avoids clobbering neighboring sub-pages in shared 16KB host pages.
@@ -1685,16 +1606,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         range: core::ops::Range<usize>,
         new_permissions: MemoryRegionPermissions,
     ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
-        eprintln!(
-            "[diag] update_permissions: range={:#x}..{:#x} perms={:?}",
-            range.start, range.end, new_permissions
-        );
-        if range.start < 0x10ad20000 && range.end > 0x10ad00000 {
-            eprintln!(
-                "[DIAG-SUSPECT] update_permissions touches crash region: {:#x}..{:#x}",
-                range.start, range.end
-            );
-        }
         // macOS arm64 16KB page handling for mprotect:
         //
         // Multiple 4KB VMAs with different permission requirements may share the
@@ -1921,10 +1832,6 @@ unsafe extern "C" {
 }
 
 unsafe extern "C-unwind" fn init_handler(thread_ctx: &mut ThreadContext) {
-    eprintln!(
-        "[diag] init_handler: entering, ctx.pc={:#x}, ctx.sp={:#x}",
-        thread_ctx.ctx.pc, thread_ctx.ctx.sp
-    );
     thread_ctx.call_shim(|shim, ctx, _interrupt| shim.init(ctx));
 }
 
@@ -1948,10 +1855,6 @@ unsafe extern "C-unwind" fn reenter_handler(thread_ctx: &mut ThreadContext) {
 /// purposes.
 #[allow(clippy::cast_sign_loss)]
 unsafe extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext) {
-    eprintln!(
-        "[diag] syscall_handler: entered, ctx.pc={:#x}, ctx.regs[8]={:#x} (syscall nr), x20={:#x}",
-        thread_ctx.ctx.pc, thread_ctx.ctx.regs[8], thread_ctx.ctx.regs[20]
-    );
     thread_ctx.call_shim(|shim, ctx, _interrupt| shim.syscall(ctx));
 }
 
@@ -1961,10 +1864,6 @@ extern "C-unwind" fn exception_handler(
     error: usize,
     cr2: usize,
 ) {
-    eprintln!(
-        "[diag] exception_handler: trapno={}, error={:#x}, cr2={:#x}, ctx.pc={:#x}",
-        trapno, error, cr2, thread_ctx.ctx.pc
-    );
     let _ = error; // unused on aarch64; signal number is in trapno
     let info = litebox::shim::ExceptionInfo {
         fault_address: cr2,
@@ -1986,7 +1885,6 @@ fn update_host_tls_entry() {
 
     let table_addr = litebox_common_linux::HOST_TLS_TABLE_ADDR.load(Ordering::Acquire);
     if table_addr == 0 {
-        eprintln!("[diag] update_host_tls_entry: no TLS table (addr=0)");
         return; // No TLS table allocated (not using rewriter-based trampoline)
     }
 
@@ -2025,10 +1923,6 @@ fn update_host_tls_entry() {
             let ht = unsafe { entry.add(1).read_volatile() };
             if ht == 0 {
                 // Phantom entry — skip it
-                eprintln!(
-                    "[diag] update_host_tls_entry: removing phantom entry[{}]: guest_tpidr={:#x} host_tls=0",
-                    read_idx, gt
-                );
                 removed += 1;
                 read_idx += 1;
                 continue;
@@ -2050,10 +1944,6 @@ fn update_host_tls_entry() {
             unsafe {
                 sentinel_entry.write_volatile(sentinel);
             }
-            eprintln!(
-                "[diag] update_host_tls_entry: compacted {} phantom entries, {} entries remain",
-                removed, write_idx
-            );
         }
     }
     //
@@ -2070,24 +1960,6 @@ fn update_host_tls_entry() {
     // Do a reverse lookup: find the entry where host_tls matches, then read
     // back the current guest_tpidr that the MSR trampoline wrote.
 
-    // Diagnostic: dump first few TLS table entries to see what's there.
-    {
-        let max_dump = 4usize;
-        for i in 0..max_dump {
-            let e = unsafe { table.add(i * 2) };
-            let gt = unsafe { e.read_volatile() };
-            if gt == sentinel {
-                eprintln!("[diag] tls_table[{}]: sentinel", i);
-                break;
-            }
-            let ht = unsafe { e.add(1).read_volatile() };
-            eprintln!(
-                "[diag] tls_table[{}]: guest_tpidr={:#x} host_tls={:#x}",
-                i, gt, ht
-            );
-        }
-    }
-
     for index in 0..TLS_TABLE_ENTRIES {
         let entry = unsafe { table.add(index * 2) };
         let stored_guest_tpidr = unsafe { entry.read_volatile() };
@@ -2101,16 +1973,8 @@ fn update_host_tls_entry() {
             let table_guest_tpidr = stored_guest_tpidr as usize;
             let current_guest_tpidr = get_guest_tpidr();
             if table_guest_tpidr != current_guest_tpidr {
-                eprintln!(
-                    "[diag] update_host_tls_entry: syncing guest_tpidr from TLS table: {:#x} -> {:#x}",
-                    current_guest_tpidr, table_guest_tpidr
-                );
                 set_guest_tpidr(table_guest_tpidr);
             }
-            eprintln!(
-                "[diag] update_host_tls_entry: table_addr={:#x}, host_tls={:#x}, guest_tpidr={:#x} (from table)",
-                table_addr, host_tls, table_guest_tpidr
-            );
             return;
         }
     }
@@ -2119,11 +1983,6 @@ fn update_host_tls_entry() {
     // thread (before any trampoline has run). Write a new entry with the
     // current guest_tpidr.
     let guest_tpidr = get_guest_tpidr();
-
-    eprintln!(
-        "[diag] update_host_tls_entry: new entry table_addr={:#x}, host_tls={:#x}, guest_tpidr={:#x}",
-        table_addr, host_tls, guest_tpidr
-    );
 
     for index in 0..TLS_TABLE_ENTRIES {
         let entry = unsafe { table.add(index * 2) };
@@ -2183,12 +2042,6 @@ impl ThreadContext<'_> {
         let op = f(self.shim, self.ctx, interrupt);
         match op {
             ContinueOperation::Resume => {
-                eprintln!(
-                    "[diag] call_shim: Resume, ctx_ptr={:#x}, ctx.pc={:#x}, ctx.sp={:#x}",
-                    core::ptr::from_ref(self.ctx) as usize,
-                    self.ctx.pc,
-                    self.ctx.sp
-                );
                 update_host_tls_entry();
 
                 // Fix stale TPIDR registers if resuming into the middle of
@@ -2222,47 +2075,14 @@ impl ThreadContext<'_> {
 
                         if pc >= svc_handler_start && pc < svc_handler_end {
                             // SVC handler: x18 holds MRS TPIDR_EL0 result at [0]
-                            eprintln!(
-                                "[diag] call_shim: fixing x18 in SVC handler: {:#x} -> {:#x} (pc={:#x})",
-                                self.ctx.regs[18], guest_tpidr, pc
-                            );
                             self.ctx.regs[18] = guest_tpidr;
                         } else if pc >= msr_handler_start && pc < msr_handler_end {
                             // MSR handler: x16 holds MRS TPIDR_EL0 result at [1]
-                            eprintln!(
-                                "[diag] call_shim: fixing x16 in MSR handler: {:#x} -> {:#x} (pc={:#x})",
-                                self.ctx.regs[16], guest_tpidr, pc
-                            );
                             self.ctx.regs[16] = guest_tpidr;
                         }
                     }
                 }
 
-                eprintln!(
-                    "[diag] call_shim: about to switch_to_guest. ctx.pc={:#x}, ctx.sp={:#x}, guest_tpidr={:#x}",
-                    self.ctx.pc,
-                    self.ctx.sp,
-                    get_guest_tpidr()
-                );
-                // Diagnostic: verify alt-stack before re-entering guest
-                {
-                    let mut check_ss: libc::stack_t = unsafe { std::mem::zeroed() };
-                    let ret = unsafe { libc::sigaltstack(std::ptr::null(), &mut check_ss) };
-                    eprintln!(
-                        "[diag] call_shim Resume sigaltstack check: ret={} ss_sp={:#x} ss_size={:#x} ss_flags={:#x}",
-                        ret, check_ss.ss_sp as usize, check_ss.ss_size, check_ss.ss_flags,
-                    );
-                }
-                // Diagnostic: dump callee-saved regs from PtRegs before
-                // switch_to_guest to verify x20 isn't corrupted.
-                eprintln!(
-                    "[diag] call_shim: pre-switch x19={:#x} x20={:#x} x21={:#x} x22={:#x} pc={:#x}",
-                    self.ctx.regs[19],
-                    self.ctx.regs[20],
-                    self.ctx.regs[21],
-                    self.ctx.regs[22],
-                    self.ctx.pc
-                );
                 // Re-set TPIDR_EL0 as the VERY LAST thing before asm.
                 // macOS clobbers it on every syscall (including eprintln above).
                 let tcb = TCB_PTR.get();
@@ -2271,9 +2091,7 @@ impl ThreadContext<'_> {
                     switch_to_guest(self.ctx)
                 }
             }
-            ContinueOperation::Terminate => {
-                eprintln!("[diag] call_shim: Terminate");
-            }
+            ContinueOperation::Terminate => {}
         }
     }
 }
@@ -2487,10 +2305,6 @@ fn with_signal_alt_stack<R>(host_tls: usize, f: impl FnOnce() -> R) -> R {
             std::io::Error::last_os_error(),
         );
     }
-    eprintln!(
-        "[diag] with_signal_alt_stack: set alt-stack ss_sp={:#x} ss_size={:#x}, old ss_sp={:#x} ss_size={:#x} ss_flags={:#x}",
-        alt_stack.ss_sp as usize, alt_stack.ss_size, oss.ss_sp as usize, oss.ss_size, oss.ss_flags,
-    );
     let _restore_guard = litebox::utils::defer(|| unsafe {
         // Clear the magic value BEFORE restoring the old sigaltstack.
         // This closes the race window: once magic is cleared, any signal
@@ -2606,17 +2420,6 @@ fn signal_handler_exit_guest(
         if ret != 0 || current_ss.ss_flags & libc::SS_ONSTACK == 0 {
             // Not on our alt-stack (or syscall failed). Return None without
             // touching any SP-derived addresses.
-            let mut buf = [0u8; 256];
-            let mut pos = write_bytes(
-                &mut buf,
-                0,
-                b"[diag] signal_handler_exit_guest: not on alt-stack ret=",
-            );
-            pos = write_hex(&mut buf, pos, ret as usize);
-            pos = write_bytes(&mut buf, pos, b" flags=");
-            pos = write_hex(&mut buf, pos, current_ss.ss_flags as usize);
-            pos = write_bytes(&mut buf, pos, b"\n");
-            libc::write(2, buf.as_ptr() as *const libc::c_void, pos);
             return None;
         }
 
@@ -2626,42 +2429,10 @@ fn signal_handler_exit_guest(
         core::arch::asm!("mov {}, sp", out(reg) sp_val, options(nostack, nomem));
         let aligned_base = sp_val & !(ALT_STACK_ALLOC_SIZE - 1);
 
-        // Log alt-stack details for debugging.
-        {
-            let mut buf = [0u8; 256];
-            let mut pos = write_bytes(&mut buf, 0, b"[diag] signal_handler_exit_guest: sp=");
-            pos = write_hex(&mut buf, pos, sp_val);
-            pos = write_bytes(&mut buf, pos, b" ss_sp=");
-            pos = write_hex(&mut buf, pos, current_ss.ss_sp as usize);
-            pos = write_bytes(&mut buf, pos, b" ss_size=");
-            pos = write_hex(&mut buf, pos, current_ss.ss_size);
-            pos = write_bytes(&mut buf, pos, b" aligned_base=");
-            pos = write_hex(&mut buf, pos, aligned_base);
-            pos = write_bytes(&mut buf, pos, b"\n");
-            libc::write(2, buf.as_ptr() as *const libc::c_void, pos);
-        }
-
         // Double-check with magic value (belt and suspenders).
         let magic_ptr = (aligned_base + ALT_STACK_ALLOC_SIZE - 16) as *const usize;
         let magic = core::ptr::read_volatile(magic_ptr);
         if magic != ALT_STACK_MAGIC {
-            let mut buf = [0u8; 256];
-            let mut pos = write_bytes(
-                &mut buf,
-                0,
-                b"[diag] signal_handler_exit_guest: bad magic sp=",
-            );
-            pos = write_hex(&mut buf, pos, sp_val);
-            pos = write_bytes(&mut buf, pos, b" aligned_base=");
-            pos = write_hex(&mut buf, pos, aligned_base);
-            pos = write_bytes(&mut buf, pos, b" magic_ptr=");
-            pos = write_hex(&mut buf, pos, magic_ptr as usize);
-            pos = write_bytes(&mut buf, pos, b" got=");
-            pos = write_hex(&mut buf, pos, magic);
-            pos = write_bytes(&mut buf, pos, b" expected=");
-            pos = write_hex(&mut buf, pos, ALT_STACK_MAGIC);
-            pos = write_bytes(&mut buf, pos, b"\n");
-            libc::write(2, buf.as_ptr() as *const libc::c_void, pos);
             return None;
         }
 
@@ -2669,9 +2440,6 @@ fn signal_handler_exit_guest(
         let host_tls = core::ptr::read_volatile(host_tls_ptr);
 
         if host_tls == 0 {
-            let mut buf = [0u8; 128];
-            let n = format_buf(&mut buf, b"[diag] signal_handler_exit_guest: host_tls=0\n");
-            libc::write(2, buf.as_ptr() as *const libc::c_void, n);
             return None;
         }
 
@@ -2692,20 +2460,6 @@ fn signal_handler_exit_guest(
         let in_guest_ptr = (host_tls as *mut u8).byte_offset(tcb_offset_in_guest());
         let was_in_guest = core::ptr::read_volatile(in_guest_ptr);
         core::ptr::write_volatile(in_guest_ptr, 0);
-
-        {
-            let mut buf = [0u8; 256];
-            let mut pos = write_bytes(
-                &mut buf,
-                0,
-                b"[diag] signal_handler_exit_guest: on_alt_stack, host_tls=",
-            );
-            pos = write_hex(&mut buf, pos, host_tls);
-            pos = write_bytes(&mut buf, pos, b", was_in_guest=");
-            pos = write_hex(&mut buf, pos, was_in_guest as usize);
-            pos = write_bytes(&mut buf, pos, b"\n");
-            libc::write(2, buf.as_ptr() as *const libc::c_void, pos);
-        }
 
         if set_interrupt {
             let interrupt_ptr = (host_tls as *mut u8).byte_offset(tcb_offset_interrupt());
@@ -2746,24 +2500,6 @@ fn copy_signal_context(regs: &mut litebox_common_linux::PtRegs, context: &libc::
     regs.sp = mctx.__ss.__sp as usize;
     regs.pc = mctx.__ss.__pc as usize;
     regs.pstate = mctx.__ss.__cpsr as usize;
-
-    // Diagnostic: dump callee-saved registers x19-x22 and x28 to track
-    // the x20=NULL crash. Uses async-signal-safe write(2).
-    unsafe {
-        let mut buf = [0u8; 256];
-        let mut pos = write_bytes(&mut buf, 0, b"[diag] copy_signal_context: pc=");
-        pos = write_hex(&mut buf, pos, regs.pc);
-        pos = write_bytes(&mut buf, pos, b" x19=");
-        pos = write_hex(&mut buf, pos, regs.regs[19]);
-        pos = write_bytes(&mut buf, pos, b" x20=");
-        pos = write_hex(&mut buf, pos, regs.regs[20]);
-        pos = write_bytes(&mut buf, pos, b" x21=");
-        pos = write_hex(&mut buf, pos, regs.regs[21]);
-        pos = write_bytes(&mut buf, pos, b" x22=");
-        pos = write_hex(&mut buf, pos, regs.regs[22]);
-        pos = write_bytes(&mut buf, pos, b"\n");
-        libc::write(2, buf.as_ptr() as *const libc::c_void, pos);
-    }
 }
 
 /// Updates a Linux signal context to return to `f` with the given arguments (aarch64).
@@ -2816,33 +2552,7 @@ unsafe extern "C" fn exception_signal_handler(
     info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
-    let sigctx_pre = unsafe { &*context.uc_mcontext };
-    let pc_pre = sigctx_pre.__ss.__pc as usize;
-    let far_pre = sigctx_pre.__es.__far as usize;
-    let sp_pre = sigctx_pre.__ss.__sp as usize;
-    let lr_pre = sigctx_pre.__ss.__lr as usize;
-    // Use write(2) directly to avoid allocator reentrancy issues in signal handler.
-    // eprintln! may allocate and is not async-signal-safe.
     let mut buf = [0u8; 256];
-    let n = format_signal_diag(
-        &mut buf,
-        b"[diag] exception_signal_handler: signum=",
-        signum as usize,
-        pc_pre,
-        far_pre,
-    );
-    unsafe { libc::write(2, buf.as_ptr() as *const libc::c_void, n) };
-    // Log additional context: sp, lr, si_code
-    {
-        let mut pos = write_bytes(&mut buf, 0, b"[diag]   sp=");
-        pos = write_hex(&mut buf, pos, sp_pre);
-        pos = write_bytes(&mut buf, pos, b" lr=");
-        pos = write_hex(&mut buf, pos, lr_pre);
-        pos = write_bytes(&mut buf, pos, b" si_code=");
-        pos = write_hex(&mut buf, pos, info.si_code as usize);
-        pos = write_bytes(&mut buf, pos, b"\n");
-        unsafe { libc::write(2, buf.as_ptr() as *const libc::c_void, pos) };
-    }
 
     // Fault-and-toggle W^X: handle permission faults on edge pages.
     //
@@ -2890,17 +2600,6 @@ unsafe extern "C" fn exception_signal_handler(
             };
 
             if toggled {
-                // Diagnostic: log the toggle (signal-safe)
-                let mut tbuf = [0u8; 128];
-                let mut tpos = write_bytes(&mut tbuf, 0, b"[diag] edge page toggle: addr=");
-                tpos = write_hex(&mut tbuf, tpos, page_addr);
-                tpos = write_bytes(&mut tbuf, tpos, b" ec=");
-                tpos = write_hex(&mut tbuf, tpos, ec as usize);
-                tpos = write_bytes(&mut tbuf, tpos, b" esr=");
-                tpos = write_hex(&mut tbuf, tpos, esr as usize);
-                tpos = write_bytes(&mut tbuf, tpos, b"\n");
-                unsafe { libc::write(2, tbuf.as_ptr() as *const libc::c_void, tpos) };
-
                 // If we're in the guest, we can't just return: macOS sigreturn
                 // clobbers TPIDR_EL0 to the pthread value. Instead, route through
                 // the interrupt path which properly restores TPIDR_EL0 via the
@@ -2914,35 +2613,7 @@ unsafe extern "C" fn exception_signal_handler(
                 // e.g. during ELF loading), just return directly — host code
                 // doesn't use TPIDR_EL0 for guest TLS.
                 if let Some((regs, host_tls)) = signal_handler_exit_guest(context, false) {
-                    // Diagnostic: log ucontext PC before copy and regs PC after
-                    {
-                        let uctx_pc = unsafe { (*context.uc_mcontext).__ss.__pc } as usize;
-                        let regs_pc_before = unsafe { (*regs).pc };
-                        let mut dbuf = [0u8; 256];
-                        let mut dpos = write_bytes(&mut dbuf, 0, b"[diag] toggle copy: uctx_pc=");
-                        dpos = write_hex(&mut dbuf, dpos, uctx_pc);
-                        dpos = write_bytes(&mut dbuf, dpos, b" regs_pc_before=");
-                        dpos = write_hex(&mut dbuf, dpos, regs_pc_before);
-                        dpos = write_bytes(&mut dbuf, dpos, b" regs_ptr=");
-                        dpos = write_hex(&mut dbuf, dpos, regs as usize);
-                        dpos = write_bytes(&mut dbuf, dpos, b"\n");
-                        unsafe { libc::write(2, dbuf.as_ptr() as *const libc::c_void, dpos) };
-                    }
-
                     copy_signal_context(unsafe { &mut *regs }, context);
-
-                    // Diagnostic: verify copy result
-                    {
-                        let regs_pc_after = unsafe { (*regs).pc };
-                        let regs_sp_after = unsafe { (*regs).sp };
-                        let mut dbuf = [0u8; 256];
-                        let mut dpos = write_bytes(&mut dbuf, 0, b"[diag] toggle copy done: pc=");
-                        dpos = write_hex(&mut dbuf, dpos, regs_pc_after);
-                        dpos = write_bytes(&mut dbuf, dpos, b" sp=");
-                        dpos = write_hex(&mut dbuf, dpos, regs_sp_after);
-                        dpos = write_bytes(&mut dbuf, dpos, b"\n");
-                        unsafe { libc::write(2, dbuf.as_ptr() as *const libc::c_void, dpos) };
-                    }
 
                     // Ensure that `run_thread_arch` is linked in so that
                     // `interrupt_callback` is visible.

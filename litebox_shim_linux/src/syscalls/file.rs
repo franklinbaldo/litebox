@@ -194,11 +194,9 @@ impl<FS: ShimFS> Task<FS> {
         flags: OFlags,
         mode: Mode,
     ) -> Result<u32, Errno> {
-        // DEBUG: log every openat call for macOS audit loading investigation
-        let path_str_for_log = pathname.as_rust_str().unwrap_or("<invalid>").to_string();
         let get_cwd = || self.fs.borrow().cwd.read().clone();
         let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
-        let result = match fs_path {
+        match fs_path {
             FsPath::Absolute { path } => self.sys_open(path, flags, mode),
             FsPath::Cwd => self.sys_open(get_cwd(), flags, mode),
             FsPath::Fd(_fd) => {
@@ -209,16 +207,7 @@ impl<FS: ShimFS> Task<FS> {
                 log_unsupported!("openat with FsPath::FdRelative");
                 Err(Errno::EINVAL)
             }
-        };
-        litebox::log_println!(
-            self.global.platform,
-            "[diag] openat: dirfd={}, path={:?}, flags={:?} => {:?}",
-            dirfd,
-            path_str_for_log,
-            flags,
-            result.as_ref().map(|fd| *fd).map_err(|e| *e)
-        );
-        result
+        }
     }
 
     /// Handle syscall `ftruncate`
