@@ -25,6 +25,10 @@ use crate::{ShimFS, Task};
 struct ElfFile<'a, FS: ShimFS> {
     task: &'a Task<FS>,
     fd: i32,
+    /// Hint address passed to mmap when reserving address space for the ELF.
+    /// Defaults to `DEFAULT_LOW_ADDR`. Can be raised to avoid placing the
+    /// interpreter in the brk growth region of the main binary.
+    mmap_hint: usize,
 }
 
 impl<'a, FS: ShimFS> ElfFile<'a, FS> {
@@ -32,7 +36,11 @@ impl<'a, FS: ShimFS> ElfFile<'a, FS> {
         let fd = task
             .sys_open(path, OFlags::RDONLY, Mode::empty())?
             .reinterpret_as_signed();
-        Ok(ElfFile { task, fd })
+        Ok(ElfFile {
+            task,
+            fd,
+            mmap_hint: super::DEFAULT_LOW_ADDR,
+        })
     }
 }
 
@@ -79,7 +87,7 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for ElfFile<'_, FS> {
         let mapping_ptr = self
             .task
             .sys_mmap(
-                super::DEFAULT_LOW_ADDR,
+                self.mmap_hint,
                 mapping_len,
                 litebox_common_linux::ProtFlags::PROT_NONE,
                 litebox_common_linux::MapFlags::MAP_ANONYMOUS
@@ -212,6 +220,25 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
 
         // Load the interpreter ELF file, if any.
         let interp = if let Some(interp) = &mut self.interp {
+            // On macOS ARM64, the default address allocator places the
+            // interpreter immediately after the main binary, leaving almost no
+            // room for brk to grow. When glibc's malloc later tries to extend
+            // the heap via brk(), it collides with the interpreter mapping and
+            // gets ENOMEM, which manifests as "malloc(): corrupted top size".
+            //
+            // Avoid this by hinting the interpreter well above the main
+            // binary's brk so the heap has room to grow.
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            {
+                // Leave 8 MiB of brk headroom (0x80_0000). This is more than
+                // enough for glibc's typical initial brk allocation (~132 KiB)
+                // and leaves a generous buffer for programs that use brk
+                // heavily before switching to mmap-based allocation.
+                const BRK_RESERVE_GAP: usize = 8 * 1024 * 1024;
+                let interp_hint = info.brk.next_multiple_of(PAGE_SIZE) + BRK_RESERVE_GAP;
+                interp.file.mmap_hint = interp_hint;
+            }
+
             Some(
                 interp
                     .parsed
