@@ -485,11 +485,14 @@ fn run_thread_inner(
         // with_signal_alt_stack reset TPIDR_EL0 to the pthread value.
         TCB_PTR.set(tcb_ptr);
         with_signal_alt_stack(tcb_addr, || unsafe {
-            // Set TPIDR_EL0 as the VERY LAST thing before asm. No syscalls
-            // (including eprintln!) allowed between this and run_thread_arch,
-            // because macOS clobbers TPIDR_EL0 on every syscall.
+            // Set TPIDR_EL0 to tcb_addr so that the trampoline's SVC
+            // handler (which runs in guest context) and syscall_callback
+            // (which restores host TLS via `msr tpidr_el0, x18`) have a
+            // valid value.  However, we pass TCB explicitly as the 4th
+            // arg to run_thread_arch because macOS can clobber TPIDR_EL0
+            // on context switches / signal delivery at any time.
             litebox_common_linux::write_tpidr_el0(tcb_addr);
-            run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter));
+            run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter), tcb_ptr);
         });
         unsafe { litebox_common_linux::write_tpidr_el0(original_tpidr) };
         TCB_PTR.set(core::ptr::null_mut());
@@ -536,6 +539,7 @@ unsafe extern "C-unwind" fn run_thread_arch(
     thread_ctx: &mut ThreadContext,
     ctx: *mut litebox_common_linux::PtRegs,
     reenter: u8,
+    tcb: *mut ThreadControlBlock,
 ) {
     core::arch::naked_asm!(
     "
@@ -556,7 +560,9 @@ unsafe extern "C-unwind" fn run_thread_arch(
     str x0, [sp]                  // save thread_ctx
 
     // Save host sp and guest context top in TCB.
-    mrs x8, tpidr_el0
+    // x3 = tcb pointer (4th argument), use it directly instead of
+    // reading TPIDR_EL0 which macOS can clobber at any time.
+    mov x8, x3
     mov x9, sp
     str x9, [x8, #8]
     add x9, x1, #{GUEST_CONTEXT_SIZE}
@@ -652,7 +658,10 @@ _syscall_callback:
     str xzr, [x16, #264]         // PtRegs.pstate
 
     // Switch to host stack.
-    mrs x18, tpidr_el0
+    // x18 already holds host_tls from the trampoline's TLS table lookup
+    // (set at syscall_callback entry), so no need to read TPIDR_EL0 here.
+    // Reading TPIDR_EL0 would be unreliable anyway since macOS can clobber
+    // it on context switches.
     ldr x0, [x18, #8]
     mov sp, x0
 
@@ -732,7 +741,10 @@ _interrupt_callback:
 /// Do not call this at a point where the stack needs to be unwound to run
 /// destructors.
 #[unsafe(naked)]
-unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
+unsafe extern "C" fn switch_to_guest(
+    ctx: &litebox_common_linux::PtRegs,
+    tcb: *mut ThreadControlBlock,
+) -> ! {
     core::arch::naked_asm!(
         ".globl _switch_to_guest_start",
         "_switch_to_guest_start:",
@@ -743,7 +755,12 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         // will see that the IP is between `switch_to_guest_start` and
         // `switch_to_guest_end` and will set `interrupt` and jump to
         // `interrupt_callback`.
-        "mrs x18, tpidr_el0",
+        //
+        // x1 = TCB pointer (passed explicitly as 2nd argument).
+        // We do NOT read TPIDR_EL0 here because macOS does not guarantee
+        // its value — the kernel can clobber it on context switches at
+        // any time.
+        "mov x18, x1",
         "mov w16, #1",
         "strb w16, [x18, #32]",
         "ldrb w17, [x18, #33]",
@@ -2083,12 +2100,17 @@ impl ThreadContext<'_> {
                     }
                 }
 
-                // Re-set TPIDR_EL0 as the VERY LAST thing before asm.
-                // macOS clobbers it on every syscall (including eprintln above).
+                // Re-set TPIDR_EL0 and pass TCB explicitly to switch_to_guest.
+                // TPIDR_EL0 is still written for the benefit of
+                // syscall_callback's `msr tpidr_el0, x18` (which
+                // restores it for Rust code), but switch_to_guest
+                // itself uses the explicit TCB argument — it does NOT
+                // read TPIDR_EL0 because macOS can clobber it on
+                // context switches at any time.
                 let tcb = TCB_PTR.get();
                 unsafe {
                     litebox_common_linux::write_tpidr_el0(tcb as usize);
-                    switch_to_guest(self.ctx)
+                    switch_to_guest(self.ctx, tcb)
                 }
             }
             ContinueOperation::Terminate => {}
@@ -2420,6 +2442,13 @@ fn signal_handler_exit_guest(
         if ret != 0 || current_ss.ss_flags & libc::SS_ONSTACK == 0 {
             // Not on our alt-stack (or syscall failed). Return None without
             // touching any SP-derived addresses.
+            let mut dbuf = [0u8; 128];
+            let mut dpos = write_bytes(&mut dbuf, 0, b"[diag] exit_guest: not on altstack ret=");
+            dpos = write_hex(&mut dbuf, dpos, ret as usize);
+            dpos = write_bytes(&mut dbuf, dpos, b" flags=");
+            dpos = write_hex(&mut dbuf, dpos, current_ss.ss_flags as usize);
+            dpos = write_bytes(&mut dbuf, dpos, b"\n");
+            libc::write(2, dbuf.as_ptr() as *const libc::c_void, dpos);
             return None;
         }
 
@@ -2433,6 +2462,11 @@ fn signal_handler_exit_guest(
         let magic_ptr = (aligned_base + ALT_STACK_ALLOC_SIZE - 16) as *const usize;
         let magic = core::ptr::read_volatile(magic_ptr);
         if magic != ALT_STACK_MAGIC {
+            let mut dbuf = [0u8; 128];
+            let mut dpos = write_bytes(&mut dbuf, 0, b"[diag] exit_guest: magic mismatch got=");
+            dpos = write_hex(&mut dbuf, dpos, magic);
+            dpos = write_bytes(&mut dbuf, dpos, b"\n");
+            libc::write(2, dbuf.as_ptr() as *const libc::c_void, dpos);
             return None;
         }
 
@@ -2440,6 +2474,9 @@ fn signal_handler_exit_guest(
         let host_tls = core::ptr::read_volatile(host_tls_ptr);
 
         if host_tls == 0 {
+            let mut dbuf = [0u8; 64];
+            let dpos = write_bytes(&mut dbuf, 0, b"[diag] exit_guest: host_tls=0\n");
+            libc::write(2, dbuf.as_ptr() as *const libc::c_void, dpos);
             return None;
         }
 
@@ -2467,6 +2504,11 @@ fn signal_handler_exit_guest(
         }
 
         if was_in_guest == 0 {
+            let mut dbuf = [0u8; 128];
+            let mut dpos = write_bytes(&mut dbuf, 0, b"[diag] exit_guest: in_guest=0 host_tls=");
+            dpos = write_hex(&mut dbuf, dpos, host_tls);
+            dpos = write_bytes(&mut dbuf, dpos, b"\n");
+            libc::write(2, dbuf.as_ptr() as *const libc::c_void, dpos);
             return None;
         }
 
@@ -2633,6 +2675,28 @@ unsafe extern "C" fn exception_signal_handler(
             b"[diag] exception_signal_handler: not in guest, forwarding to next_signal_handler\n",
         );
         unsafe { libc::write(2, buf.as_ptr() as *const libc::c_void, n2) };
+        // Print faulting PC and key addresses for diagnosis.
+        unsafe {
+            let mctx = &*context.uc_mcontext;
+            let crash_pc = mctx.__ss.__pc as usize;
+            let crash_x18 = mctx.__ss.__x[18] as usize;
+            let stg_start = switch_to_guest_start as *const () as usize;
+            let stg_end = switch_to_guest_end as *const () as usize;
+            let sc_cb = syscall_callback as *const () as usize;
+            let mut dbuf2 = [0u8; 256];
+            let mut dpos = write_bytes(&mut dbuf2, 0, b"[diag] crash_pc=");
+            dpos = write_hex(&mut dbuf2, dpos, crash_pc);
+            dpos = write_bytes(&mut dbuf2, dpos, b" x18=");
+            dpos = write_hex(&mut dbuf2, dpos, crash_x18);
+            dpos = write_bytes(&mut dbuf2, dpos, b" stg=[");
+            dpos = write_hex(&mut dbuf2, dpos, stg_start);
+            dpos = write_bytes(&mut dbuf2, dpos, b"..");
+            dpos = write_hex(&mut dbuf2, dpos, stg_end);
+            dpos = write_bytes(&mut dbuf2, dpos, b"] sc_cb=");
+            dpos = write_hex(&mut dbuf2, dpos, sc_cb);
+            dpos = write_bytes(&mut dbuf2, dpos, b"\n");
+            libc::write(2, dbuf2.as_ptr() as *const libc::c_void, dpos);
+        }
         return unsafe { next_signal_handler(signum, info, context) };
     };
     copy_signal_context(unsafe { &mut *regs }, context);
