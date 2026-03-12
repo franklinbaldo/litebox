@@ -245,12 +245,6 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             f = new_f;
             // It means that the walk failed at the nwqid-th element
             if new_len < wnames.len() {
-                if wqids
-                    .last()
-                    .is_some_and(|e| e.typ == fcall::QidType::SYMLINK)
-                {
-                    todo!("symlink");
-                }
                 let _ = self.clunk(f);
                 return Err(Error::Remote(super::ENOENT));
             }
@@ -549,5 +543,17 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     /// Use this when the fid has already been invalidated (e.g., after remove)
     pub(super) fn free_fid(&self, fid: fcall::Fid) {
         self.fids.free(fid);
+    }
+
+    /// Read the target of a symbolic link
+    pub(super) fn readlink(&self, fid: fcall::Fid) -> Result<alloc::vec::Vec<u8>, Error> {
+        self.fcall(
+            Fcall::Treadlink(fcall::Treadlink { fid }),
+            |response| match response {
+                Fcall::Rreadlink(r) => Ok(r.target.into_owned()),
+                Fcall::Rlerror(e) => Err(Error::from(e)),
+                _ => Err(Error::InvalidResponse),
+            },
+        )
     }
 }

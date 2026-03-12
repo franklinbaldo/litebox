@@ -7,34 +7,13 @@
 //! See <https://9p.io/sys/man/5/intro> and <https://github.com/chaos/diod/blob/master/protocol.md>
 
 use super::transport;
-use alloc::{borrow::Cow, vec::Vec};
 use bitflags::bitflags;
-
-/// File identifier type
-pub(super) type Fid = u32;
-
-/// Special tag which `Tversion`/`Rversion` must use as `tag`
-pub(super) const NOTAG: u16 = !0;
-
-/// Special value which `Tattach` with no auth must use as `afid`
-///
-/// If the client does not wish to authenticate the connection, or knows that authentication is
-/// not required, the afid field in the attach message should be set to `NOFID`
-pub(super) const NOFID: u32 = !0;
-
-/// Special uid which `Tauth`/`Tattach` use as `n_uname` to indicate no uid is specified
-pub(super) const NONUNAME: u32 = !0;
+use std::borrow::Cow;
 
 /// Room for `Twrite`/`Rread` header
 ///
 /// size\[4\] Tread/Twrite\[2\] tag\[2\] fid\[4\] offset\[8\] count\[4\]
-pub(super) const IOHDRSZ: u32 = 24;
-
-/// Room for readdir header
-pub(super) const READDIRHDRSZ: u32 = 24;
-
-/// Maximum elements in a single walk.
-pub(super) const MAXWELEM: usize = 13;
+pub(crate) const IOHDRSZ: u32 = 24;
 
 /// Generates a struct definition along with `encode_to` and `decode_from` methods
 /// for automatic 9P wire-format serialization.
@@ -132,7 +111,7 @@ bitflags! {
     /// Same as Linux's open flags.
     /// https://elixir.bootlin.com/linux/v6.12/source/include/net/9p/9p.h#L263
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(super) struct LOpenFlags: u32 {
+    pub(crate) struct LOpenFlags: u32 {
         const O_RDONLY    = 0;
         const O_WRONLY    = 1;
         const O_RDWR    = 2;
@@ -158,7 +137,7 @@ bitflags! {
 bitflags! {
     /// File lock type, Flock.typ
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(super) struct LockType: u8 {
+    pub(crate) struct LockType: u8 {
         const RDLOCK    = 0;
         const WRLOCK    = 1;
         const UNLOCK    = 2;
@@ -168,7 +147,7 @@ bitflags! {
 bitflags! {
     /// File lock flags, Flock.flags
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(super) struct LockFlag: u32 {
+    pub(crate) struct LockFlag: u32 {
         /// Blocking request
         const BLOCK     = 1;
         /// Reserved for future use
@@ -179,7 +158,7 @@ bitflags! {
 bitflags! {
     /// File lock status
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(super) struct LockStatus: u8 {
+    pub(crate) struct LockStatus: u8 {
         const SUCCESS   = 0;
         const BLOCKED   = 1;
         const ERROR     = 2;
@@ -195,7 +174,7 @@ bitflags! {
     /// # Protocol
     /// 9P2000/9P2000.L
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-    pub(super) struct QidType: u8 {
+    pub(crate) struct QidType: u8 {
         /// Type bit for directories
         const DIR       = 0x80;
         /// Type bit for append only files
@@ -223,7 +202,7 @@ bitflags! {
     /// # Protocol
     /// 9P2000.L
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(super) struct GetattrMask: u64 {
+    pub(crate) struct GetattrMask: u64 {
         const MODE          = 0x00000001;
         const NLINK         = 0x00000002;
         const UID           = 0x00000004;
@@ -256,7 +235,7 @@ bitflags! {
     /// # Protocol
     /// 9P2000.L
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(super) struct SetattrMask: u32 {
+    pub(crate) struct SetattrMask: u32 {
         const MODE      = 0x00000001;
         const UID       = 0x00000002;
         const GID       = 0x00000004;
@@ -270,7 +249,7 @@ bitflags! {
 }
 
 /// String type used in 9P protocol messages
-pub(super) type FcallStr<'a> = Cow<'a, [u8]>;
+pub(crate) type FcallStr<'a> = Cow<'a, [u8]>;
 
 /// Type aliases for complex generic types used as `Serializer!` fields.
 type VecFcallStr<'a> = Vec<FcallStr<'a>>;
@@ -307,8 +286,8 @@ impl_bitflags_serializer! {
 
 /// Directory entry data container
 #[derive(Clone, Debug)]
-pub(super) struct DirEntryData<'a> {
-    pub(super) data: Vec<DirEntry<'a>>,
+pub(crate) struct DirEntryData<'a> {
+    pub(crate) data: Vec<DirEntry<'a>>,
 }
 
 impl<'a> DirEntryData<'a> {
@@ -320,7 +299,7 @@ impl<'a> DirEntryData<'a> {
     fn encode_to<W: transport::Write>(&self, w: &mut W) -> Result<(), transport::WriteError> {
         encode_le(
             w,
-            u32::try_from(self.size()).map_err(|_| transport::WriteError::Io)?,
+            u32::try_from(self.size()).map_err(|_| transport::WriteError)?,
         )?;
         for e in &self.data {
             e.encode_to(w)?;
@@ -453,96 +432,86 @@ repr_enum! {
 Serializer! {
     /// Unique identifier for a file
     #[derive(Clone, Debug, Copy)]
-    pub(super) struct Qid {
-        pub(super) typ: QidType,
-        pub(super) version: u32,
-        pub(super) path: u64,
+    pub(crate) struct Qid {
+        pub(crate) typ: QidType,
+        pub(crate) version: u32,
+        pub(crate) path: u64,
     }
 }
 
 Serializer! {
     /// File system statistics
     #[derive(Clone, Debug, Copy)]
-    struct Statfs {
-        typ: u32,
-        bsize: u32,
-        blocks: u64,
-        bfree: u64,
-        bavail: u64,
-        files: u64,
-        ffree: u64,
-        fsid: u64,
-        namelen: u32,
+    pub(crate) struct Statfs {
+        pub(crate) typ: u32,
+        pub(crate) bsize: u32,
+        pub(crate) blocks: u64,
+        pub(crate) bfree: u64,
+        pub(crate) bavail: u64,
+        pub(crate) files: u64,
+        pub(crate) ffree: u64,
+        pub(crate) fsid: u64,
+        pub(crate) namelen: u32,
     }
 }
 
 Serializer! {
     /// Time structure
     #[derive(Clone, Debug, Copy, Default)]
-    pub(super) struct Time {
-        sec: u64,
-        nsec: u64,
+    pub(crate) struct Time {
+        pub(crate) sec: u64,
+        pub(crate) nsec: u64,
     }
 }
 
 Serializer! {
     /// File attributes
     #[derive(Clone, Debug, Copy)]
-    pub(super) struct Stat {
-        pub(super) mode: u32,
-        pub(super) uid: u32,
-        pub(super) gid: u32,
-        pub(super) nlink: u64,
-        pub(super) rdev: u64,
-        pub(super) size: u64,
-        pub(super) blksize: u64,
-        pub(super) blocks: u64,
-        pub(super) atime: Time,
-        pub(super) mtime: Time,
-        pub(super) ctime: Time,
-        pub(super) btime: Time,
-        pub(super) generation: u64,
-        pub(super) data_version: u64,
+    pub(crate) struct Stat {
+        pub(crate) mode: u32,
+        pub(crate) uid: u32,
+        pub(crate) gid: u32,
+        pub(crate) nlink: u64,
+        pub(crate) rdev: u64,
+        pub(crate) size: u64,
+        pub(crate) blksize: u64,
+        pub(crate) blocks: u64,
+        pub(crate) atime: Time,
+        pub(crate) mtime: Time,
+        pub(crate) ctime: Time,
+        pub(crate) btime: Time,
+        pub(crate) generation: u64,
+        pub(crate) data_version: u64,
     }
 }
 
 Serializer! {
     /// Set file attributes
     #[derive(Clone, Debug, Copy, Default)]
-    pub(super) struct SetAttr {
-        pub(super) mode: u32,
-        pub(super) uid: u32,
-        pub(super) gid: u32,
-        pub(super) size: u64,
-        pub(super) atime: Time,
-        pub(super) mtime: Time,
+    pub(crate) struct SetAttr {
+        pub(crate) mode: u32,
+        pub(crate) uid: u32,
+        pub(crate) gid: u32,
+        pub(crate) size: u64,
+        pub(crate) atime: Time,
+        pub(crate) mtime: Time,
     }
 }
 
 Serializer! {
     /// Directory entry
     #[derive(Clone, Debug)]
-    pub(super) struct DirEntry<'a> {
-        pub(super) qid: Qid,
-        pub(super) offset: u64,
-        pub(super) typ: u8,
-        pub(super) name: FcallStr<'a>,
+    pub(crate) struct DirEntry<'a> {
+        pub(crate) qid: Qid,
+        pub(crate) offset: u64,
+        pub(crate) typ: u8,
+        pub(crate) name: FcallStr<'a>,
     }
 }
 
 impl DirEntry<'_> {
-    /// Create an owned copy of this directory entry.
-    pub(super) fn into_owned(self) -> DirEntry<'static> {
-        DirEntry {
-            qid: self.qid,
-            offset: self.offset,
-            typ: self.typ,
-            name: Cow::Owned(self.name.into_owned()),
-        }
-    }
-
     /// Calculate the size of this entry when encoded
-    fn size(&self) -> u64 {
+    pub(crate) fn size(&self) -> u64 {
         (13 + 8 + 1 + 2 + self.name.len()) as u64
     }
 }
@@ -550,7 +519,7 @@ impl DirEntry<'_> {
 Serializer! {
     /// File lock request
     #[derive(Clone, Debug)]
-    pub(super) struct Flock<'a> {
+    pub(crate) struct Flock<'a> {
         typ: LockType,
         flags: LockFlag,
         start: u64,
@@ -579,8 +548,8 @@ Serializer! {
 Serializer! {
     /// Error response
     #[derive(Clone, Debug)]
-    pub(super) struct Rlerror {
-        pub(super) ecode: u32,
+    pub(crate) struct Rlerror {
+        pub(crate) ecode: u32,
     }
 }
 
@@ -593,27 +562,27 @@ impl core::fmt::Display for Rlerror {
 Serializer! {
     /// Attach request
     #[derive(Clone, Debug)]
-    pub(super) struct Tattach<'a> {
-        pub(super) fid: u32,
-        pub(super) afid: u32,
-        pub(super) uname: FcallStr<'a>,
-        pub(super) aname: FcallStr<'a>,
-        pub(super) n_uname: u32,
+    pub(crate) struct Tattach<'a> {
+        pub(crate) fid: u32,
+        pub(crate) afid: u32,
+        pub(crate) uname: FcallStr<'a>,
+        pub(crate) aname: FcallStr<'a>,
+        pub(crate) n_uname: u32,
     }
 }
 
 Serializer! {
     /// Attach response
     #[derive(Clone, Debug)]
-    pub(super) struct Rattach {
-        pub(super) qid: Qid,
+    pub(crate) struct Rattach {
+        pub(crate) qid: Qid,
     }
 }
 
 Serializer! {
     /// Statfs request
     #[derive(Clone, Debug)]
-    pub(super) struct Tstatfs {
+    pub(crate) struct Tstatfs {
         fid: u32,
     }
 }
@@ -621,54 +590,54 @@ Serializer! {
 Serializer! {
     /// Statfs response
     #[derive(Clone, Debug)]
-    pub(super) struct Rstatfs {
-        statfs: Statfs,
+    pub(crate) struct Rstatfs {
+        pub(crate) statfs: Statfs,
     }
 }
 
 Serializer! {
     /// Open request
     #[derive(Clone, Debug)]
-    pub(super) struct Tlopen {
-        pub(super) fid: u32,
-        pub(super) flags: LOpenFlags,
+    pub(crate) struct Tlopen {
+        pub(crate) fid: u32,
+        pub(crate) flags: LOpenFlags,
     }
 }
 
 Serializer! {
     /// Open response
     #[derive(Clone, Debug)]
-    pub(super) struct Rlopen {
-        pub(super) qid: Qid,
-        pub(super) iounit: u32,
+    pub(crate) struct Rlopen {
+        pub(crate) qid: Qid,
+        pub(crate) iounit: u32,
     }
 }
 
 Serializer! {
     /// Create request
     #[derive(Clone, Debug)]
-    pub(super) struct Tlcreate<'a> {
-        pub(super) fid: u32,
-        pub(super) name: FcallStr<'a>,
-        pub(super) flags: LOpenFlags,
-        pub(super) mode: u32,
-        pub(super) gid: u32,
+    pub(crate) struct Tlcreate<'a> {
+        pub(crate) fid: u32,
+        pub(crate) name: FcallStr<'a>,
+        pub(crate) flags: LOpenFlags,
+        pub(crate) mode: u32,
+        pub(crate) gid: u32,
     }
 }
 
 Serializer! {
     /// Create response
     #[derive(Clone, Debug)]
-    pub(super) struct Rlcreate {
-        pub(super) qid: Qid,
-        pub(super) iounit: u32,
+    pub(crate) struct Rlcreate {
+        pub(crate) qid: Qid,
+        pub(crate) iounit: u32,
     }
 }
 
 Serializer! {
     /// Symlink request
     #[derive(Clone, Debug)]
-    pub(super) struct Tsymlink<'a> {
+    pub(crate) struct Tsymlink<'a> {
         fid: u32,
         name: FcallStr<'a>,
         symtgt: FcallStr<'a>,
@@ -679,7 +648,7 @@ Serializer! {
 Serializer! {
     /// Symlink response
     #[derive(Clone, Debug)]
-    pub(super) struct Rsymlink {
+    pub(crate) struct Rsymlink {
         qid: Qid,
     }
 }
@@ -687,7 +656,7 @@ Serializer! {
 Serializer! {
     /// Mknod request
     #[derive(Clone, Debug)]
-    pub(super) struct Tmknod<'a> {
+    pub(crate) struct Tmknod<'a> {
         dfid: u32,
         name: FcallStr<'a>,
         mode: u32,
@@ -700,7 +669,7 @@ Serializer! {
 Serializer! {
     /// Mknod response
     #[derive(Clone, Debug)]
-    pub(super) struct Rmknod {
+    pub(crate) struct Rmknod {
         qid: Qid,
     }
 }
@@ -708,74 +677,74 @@ Serializer! {
 Serializer! {
     /// Rename request
     #[derive(Clone, Debug)]
-    pub(super) struct Trename<'a> {
-        pub(super) fid: u32,
-        pub(super) dfid: u32,
-        pub(super) name: FcallStr<'a>,
+    pub(crate) struct Trename<'a> {
+        pub(crate) fid: u32,
+        pub(crate) dfid: u32,
+        pub(crate) name: FcallStr<'a>,
     }
 }
 
 Serializer! {
     /// Rename response
     #[derive(Clone, Debug)]
-    pub(super) struct Rrename {}
+    pub(crate) struct Rrename {}
 }
 
 Serializer! {
     /// Readlink request
     #[derive(Clone, Debug)]
-    pub(super) struct Treadlink {
-        pub(super) fid: u32,
+    pub(crate) struct Treadlink {
+        pub(crate) fid: u32,
     }
 }
 
 Serializer! {
     /// Readlink response
     #[derive(Clone, Debug)]
-    pub(super) struct Rreadlink<'a> {
-        pub(super) target: FcallStr<'a>,
+    pub(crate) struct Rreadlink<'a> {
+        pub(crate) target: FcallStr<'a>,
     }
 }
 
 Serializer! {
     /// Getattr request
     #[derive(Clone, Debug)]
-    pub(super) struct Tgetattr {
-        pub(super) fid: u32,
-        pub(super) req_mask: GetattrMask,
+    pub(crate) struct Tgetattr {
+        pub(crate) fid: u32,
+        pub(crate) req_mask: GetattrMask,
     }
 }
 
 Serializer! {
     /// Getattr response
     #[derive(Clone, Debug)]
-    pub(super) struct Rgetattr {
-        pub(super) valid: GetattrMask,
-        pub(super) qid: Qid,
-        pub(super) stat: Stat,
+    pub(crate) struct Rgetattr {
+        pub(crate) valid: GetattrMask,
+        pub(crate) qid: Qid,
+        pub(crate) stat: Stat,
     }
 }
 
 Serializer! {
     /// Setattr request
     #[derive(Clone, Debug)]
-    pub(super) struct Tsetattr {
-        pub(super) fid: u32,
-        pub(super) valid: SetattrMask,
-        pub(super) stat: SetAttr,
+    pub(crate) struct Tsetattr {
+        pub(crate) fid: u32,
+        pub(crate) valid: SetattrMask,
+        pub(crate) stat: SetAttr,
     }
 }
 
 Serializer! {
     /// Setattr response
     #[derive(Clone, Debug)]
-    pub(super) struct Rsetattr {}
+    pub(crate) struct Rsetattr {}
 }
 
 Serializer! {
     /// Xattr walk request
     #[derive(Clone, Debug)]
-    pub(super) struct Txattrwalk<'a> {
+    pub(crate) struct Txattrwalk<'a> {
         fid: u32,
         new_fid: u32,
         name: FcallStr<'a>,
@@ -785,7 +754,7 @@ Serializer! {
 Serializer! {
     /// Xattr walk response
     #[derive(Clone, Debug)]
-    pub(super) struct Rxattrwalk {
+    pub(crate) struct Rxattrwalk {
         size: u64,
     }
 }
@@ -793,7 +762,7 @@ Serializer! {
 Serializer! {
     /// Xattr create request
     #[derive(Clone, Debug)]
-    pub(super) struct Txattrcreate<'a> {
+    pub(crate) struct Txattrcreate<'a> {
         fid: u32,
         name: FcallStr<'a>,
         attr_size: u64,
@@ -804,46 +773,46 @@ Serializer! {
 Serializer! {
     /// Xattr create response
     #[derive(Clone, Debug)]
-    pub(super) struct Rxattrcreate {}
+    pub(crate) struct Rxattrcreate {}
 }
 
 Serializer! {
     /// Readdir request
     #[derive(Clone, Debug)]
-    pub(super) struct Treaddir {
-        pub(super) fid: u32,
-        pub(super) offset: u64,
-        pub(super) count: u32,
+    pub(crate) struct Treaddir {
+        pub(crate) fid: u32,
+        pub(crate) offset: u64,
+        pub(crate) count: u32,
     }
 }
 
 Serializer! {
     /// Readdir response
     #[derive(Clone, Debug)]
-    pub(super) struct Rreaddir<'a> {
-        pub(super) data: DirEntryData<'a>,
+    pub(crate) struct Rreaddir<'a> {
+        pub(crate) data: DirEntryData<'a>,
     }
 }
 
 Serializer! {
     /// Fsync request
     #[derive(Clone, Debug)]
-    pub(super) struct Tfsync {
-        pub(super) fid: u32,
-        pub(super) datasync: u32,
+    pub(crate) struct Tfsync {
+        pub(crate) fid: u32,
+        pub(crate) datasync: u32,
     }
 }
 
 Serializer! {
     /// Fsync response
     #[derive(Clone, Debug)]
-    pub(super) struct Rfsync {}
+    pub(crate) struct Rfsync {}
 }
 
 Serializer! {
     /// Lock request
     #[derive(Clone, Debug)]
-    pub(super) struct Tlock<'a> {
+    pub(crate) struct Tlock<'a> {
         fid: u32,
         flock: Flock<'a>,
     }
@@ -852,7 +821,7 @@ Serializer! {
 Serializer! {
     /// Lock response
     #[derive(Clone, Debug)]
-    pub(super) struct Rlock {
+    pub(crate) struct Rlock {
         status: LockStatus,
     }
 }
@@ -860,7 +829,7 @@ Serializer! {
 Serializer! {
     /// Getlock request
     #[derive(Clone, Debug)]
-    pub(super) struct Tgetlock<'a> {
+    pub(crate) struct Tgetlock<'a> {
         fid: u32,
         flock: Getlock<'a>,
     }
@@ -869,7 +838,7 @@ Serializer! {
 Serializer! {
     /// Getlock response
     #[derive(Clone, Debug)]
-    pub(super) struct Rgetlock<'a> {
+    pub(crate) struct Rgetlock<'a> {
         flock: Getlock<'a>,
     }
 }
@@ -877,7 +846,7 @@ Serializer! {
 Serializer! {
     /// Link request
     #[derive(Clone, Debug)]
-    pub(super) struct Tlink<'a> {
+    pub(crate) struct Tlink<'a> {
         dfid: u32,
         fid: u32,
         name: FcallStr<'a>,
@@ -887,65 +856,65 @@ Serializer! {
 Serializer! {
     /// Link response
     #[derive(Clone, Debug)]
-    pub(super) struct Rlink {}
+    pub(crate) struct Rlink {}
 }
 
 Serializer! {
     /// Mkdir request
     #[derive(Clone, Debug)]
-    pub(super) struct Tmkdir<'a> {
-        pub(super) dfid: u32,
-        pub(super) name: FcallStr<'a>,
-        pub(super) mode: u32,
-        pub(super) gid: u32,
+    pub(crate) struct Tmkdir<'a> {
+        pub(crate) dfid: u32,
+        pub(crate) name: FcallStr<'a>,
+        pub(crate) mode: u32,
+        pub(crate) gid: u32,
     }
 }
 
 Serializer! {
     /// Mkdir response
     #[derive(Clone, Debug)]
-    pub(super) struct Rmkdir {
-        pub(super) qid: Qid,
+    pub(crate) struct Rmkdir {
+        pub(crate) qid: Qid,
     }
 }
 
 Serializer! {
     /// Renameat request
     #[derive(Clone, Debug)]
-    pub(super) struct Trenameat<'a> {
-        olddfid: u32,
-        oldname: FcallStr<'a>,
-        newdfid: u32,
-        newname: FcallStr<'a>,
+    pub(crate) struct Trenameat<'a> {
+        pub(crate) olddfid: u32,
+        pub(crate) oldname: FcallStr<'a>,
+        pub(crate) newdfid: u32,
+        pub(crate) newname: FcallStr<'a>,
     }
 }
 
 Serializer! {
     /// Renameat response
     #[derive(Clone, Debug)]
-    pub(super) struct Rrenameat {}
+    pub(crate) struct Rrenameat {}
 }
 
 Serializer! {
     /// Unlinkat request
     #[derive(Clone, Debug)]
-    pub(super) struct Tunlinkat<'a> {
-        pub(super) dfid: u32,
-        pub(super) name: FcallStr<'a>,
-        pub(super) flags: u32,
+    pub(crate) struct Tunlinkat<'a> {
+        pub(crate) dfid: u32,
+        pub(crate) name: FcallStr<'a>,
+        pub(crate) flags: u32,
     }
 }
 
 Serializer! {
     /// Unlinkat response
     #[derive(Clone, Debug)]
-    pub(super) struct Runlinkat {}
+    pub(crate) struct Runlinkat {}
 }
 
 Serializer! {
     /// Auth request
     #[derive(Clone, Debug)]
-    pub(super) struct Tauth<'a> {
+    pub(crate) struct Tauth<'a> {
         afid: u32,
         uname: FcallStr<'a>,
         aname: FcallStr<'a>,
@@ -956,7 +925,7 @@ Serializer! {
 Serializer! {
     /// Auth response
     #[derive(Clone, Debug)]
-    pub(super) struct Rauth {
+    pub(crate) struct Rauth {
         aqid: Qid,
     }
 }
@@ -964,25 +933,25 @@ Serializer! {
 Serializer! {
     /// Version request
     #[derive(Clone, Debug)]
-    pub(super) struct Tversion<'a> {
-        pub(super) msize: u32,
-        pub(super) version: FcallStr<'a>,
+    pub(crate) struct Tversion<'a> {
+        pub(crate) msize: u32,
+        pub(crate) version: FcallStr<'a>,
     }
 }
 
 Serializer! {
     /// Version response
     #[derive(Clone, Debug)]
-    pub(super) struct Rversion<'a> {
-        pub(super) msize: u32,
-        pub(super) version: FcallStr<'a>,
+    pub(crate) struct Rversion<'a> {
+        pub(crate) msize: u32,
+        pub(crate) version: FcallStr<'a>,
     }
 }
 
 Serializer! {
     /// Flush request
     #[derive(Clone, Debug)]
-    pub(super) struct Tflush {
+    pub(crate) struct Tflush {
         oldtag: u16,
     }
 }
@@ -990,89 +959,89 @@ Serializer! {
 Serializer! {
     /// Flush response
     #[derive(Clone, Debug)]
-    pub(super) struct Rflush {}
+    pub(crate) struct Rflush {}
 }
 
 Serializer! {
     /// Walk request
     #[derive(Clone, Debug)]
-    pub(super) struct Twalk<'a> {
-        pub(super) fid: u32,
-        pub(super) new_fid: u32,
-        pub(super) wnames: VecFcallStr<'a>,
+    pub(crate) struct Twalk<'a> {
+        pub(crate) fid: u32,
+        pub(crate) new_fid: u32,
+        pub(crate) wnames: VecFcallStr<'a>,
     }
 }
 
 Serializer! {
     /// Walk response
     #[derive(Clone, Debug)]
-    pub(super) struct Rwalk {
-        pub(super) wqids: VecQid,
+    pub(crate) struct Rwalk {
+        pub(crate) wqids: VecQid,
     }
 }
 
 Serializer! {
     /// Read request
     #[derive(Clone, Debug)]
-    pub(super) struct Tread {
-        pub(super) fid: u32,
-        pub(super) offset: u64,
-        pub(super) count: u32,
+    pub(crate) struct Tread {
+        pub(crate) fid: u32,
+        pub(crate) offset: u64,
+        pub(crate) count: u32,
     }
 }
 
 Serializer! {
     /// Read response
     #[derive(Clone, Debug)]
-    pub(super) struct Rread<'a> {
-        pub(super) data: DataBuf<'a>,
+    pub(crate) struct Rread<'a> {
+        pub(crate) data: DataBuf<'a>,
     }
 }
 
 Serializer! {
     /// Write request
     #[derive(Clone, Debug)]
-    pub(super) struct Twrite<'a> {
-        pub(super) fid: u32,
-        pub(super) offset: u64,
-        pub(super) data: DataBuf<'a>,
+    pub(crate) struct Twrite<'a> {
+        pub(crate) fid: u32,
+        pub(crate) offset: u64,
+        pub(crate) data: DataBuf<'a>,
     }
 }
 
 Serializer! {
     /// Write response
     #[derive(Clone, Debug)]
-    pub(super) struct Rwrite {
-        pub(super) count: u32,
+    pub(crate) struct Rwrite {
+        pub(crate) count: u32,
     }
 }
 
 Serializer! {
     /// Clunk request
     #[derive(Clone, Debug)]
-    pub(super) struct Tclunk {
-        pub(super) fid: u32,
+    pub(crate) struct Tclunk {
+        pub(crate) fid: u32,
     }
 }
 
 Serializer! {
     /// Clunk response
     #[derive(Clone, Debug)]
-    pub(super) struct Rclunk {}
+    pub(crate) struct Rclunk {}
 }
 
 Serializer! {
     /// Remove request
     #[derive(Clone, Debug)]
-    pub(super) struct Tremove {
-        pub(super) fid: u32,
+    pub(crate) struct Tremove {
+        pub(crate) fid: u32,
     }
 }
 
 Serializer! {
     /// Remove response
     #[derive(Clone, Debug)]
-    pub(super) struct Rremove {}
+    pub(crate) struct Rremove {}
 }
 
 // ============================================================================
@@ -1087,7 +1056,7 @@ macro_rules! fcall_types {
     ($($name:ident $(<$lt:lifetime>)?),* $(,)?) => {
         /// 9P protocol message
         #[derive(Clone, Debug)]
-        pub(super) enum Fcall<'a> {
+        pub(crate) enum Fcall<'a> {
             $($name($name $(<$lt>)?),)*
         }
 
@@ -1194,16 +1163,16 @@ fcall_types! {
 /// with their responses. The special value [`NOTAG`] is reserved for
 /// `Tversion`/`Rversion` messages.
 #[derive(Clone, Debug)]
-pub(super) struct TaggedFcall<'a> {
+pub(crate) struct TaggedFcall<'a> {
     /// Unique identifier chosen by the client to correlate a request with its response.
-    pub(super) tag: u16,
+    pub(crate) tag: u16,
     /// The 9P message payload.
-    pub(super) fcall: Fcall<'a>,
+    pub(crate) fcall: Fcall<'a>,
 }
 
 impl<'a> TaggedFcall<'a> {
     /// Encode the message to a buffer
-    pub(super) fn encode_to_buf(self, buf: &mut Vec<u8>) -> Result<(), transport::WriteError> {
+    pub(crate) fn encode_to_buf(self, buf: &mut Vec<u8>) -> Result<(), transport::WriteError> {
         let TaggedFcall { tag, fcall } = self;
 
         buf.clear();
@@ -1213,14 +1182,14 @@ impl<'a> TaggedFcall<'a> {
         encode_fcall(buf, tag, fcall)?;
 
         // Write the size at the beginning
-        let size = u32::try_from(buf.len()).map_err(|_| transport::WriteError::Io)?;
+        let size = u32::try_from(buf.len()).map_err(|_| transport::WriteError)?;
         buf[0..4].copy_from_slice(&size.to_le_bytes());
 
         Ok(())
     }
 
     /// Decode a message from a buffer
-    pub(super) fn decode(buf: &'a [u8]) -> Result<TaggedFcall<'a>, super::Error> {
+    pub(crate) fn decode(buf: &'a [u8]) -> Result<TaggedFcall<'a>, super::Error> {
         if buf.len() < 7 {
             return Err(super::Error::InvalidResponse);
         }
@@ -1278,7 +1247,7 @@ fn encode_str<W: transport::Write>(
 ) -> Result<(), transport::WriteError> {
     encode_le(
         w,
-        u16::try_from(v.len()).map_err(|_| transport::WriteError::Io)?,
+        u16::try_from(v.len()).map_err(|_| transport::WriteError)?,
     )?;
     w.write_all(v)
 }
@@ -1286,7 +1255,7 @@ fn encode_str<W: transport::Write>(
 fn encode_data_buf<W: transport::Write>(w: &mut W, v: &[u8]) -> Result<(), transport::WriteError> {
     encode_le(
         w,
-        u32::try_from(v.len()).map_err(|_| transport::WriteError::Io)?,
+        u32::try_from(v.len()).map_err(|_| transport::WriteError)?,
     )?;
     w.write_all(v)
 }
@@ -1297,7 +1266,7 @@ fn encode_vec_str<W: transport::Write>(
 ) -> Result<(), transport::WriteError> {
     encode_le(
         w,
-        u16::try_from(v.len()).map_err(|_| transport::WriteError::Io)?,
+        u16::try_from(v.len()).map_err(|_| transport::WriteError)?,
     )?;
     for s in v {
         encode_str(w, s)?;
@@ -1308,7 +1277,7 @@ fn encode_vec_str<W: transport::Write>(
 fn encode_vec_qid<W: transport::Write>(w: &mut W, v: &[Qid]) -> Result<(), transport::WriteError> {
     encode_le(
         w,
-        u16::try_from(v.len()).map_err(|_| transport::WriteError::Io)?,
+        u16::try_from(v.len()).map_err(|_| transport::WriteError)?,
     )?;
     for q in v {
         q.encode_to(w)?;

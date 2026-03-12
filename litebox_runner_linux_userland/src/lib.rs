@@ -11,9 +11,6 @@ use std::path::{Path, PathBuf};
 
 extern crate alloc;
 
-#[cfg(feature = "broker")]
-pub mod broker_client;
-
 /// Run Linux programs with LiteBox on unmodified Linux
 #[derive(Parser, Debug)]
 #[allow(clippy::struct_excessive_bools)]
@@ -80,17 +77,17 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub program_from_tar: bool,
-    /// Connect to a file broker at the given gRPC endpoint (e.g., http://127.0.0.1:50051).
+    /// Connect to a 9P file broker at the given address (e.g., 10.0.0.1:5640).
     ///
-    /// When set, an additional broker-backed filesystem layer is added that provides
-    /// policy-enforced access to external files served by the broker process.
-    #[cfg(feature = "broker")]
+    /// Requires --tun-device-name. The broker must be a 9P2000.L server listening
+    /// on the TUN gateway. All file I/O flows through the shim's network stack,
+    /// making it suspension-aware for multi-process support.
     #[arg(
-        long = "broker-endpoint",
-        requires = "unstable",
+        long = "nine-p-broker",
+        requires_all = ["unstable", "tun_device_name"],
         help_heading = "Unstable Options"
     )]
-    pub broker_endpoint: Option<String>,
+    pub nine_p_broker: Option<String>,
 
     /// Set the initial working directory for the sandboxed process.
     /// Defaults to "/".
@@ -225,37 +222,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     litebox_platform_multiplex::set_platform(platform);
 
-    // When a broker endpoint is provided, create a broker-enabled FS stack.
-    // This must be a separate branch because the FS type differs at compile time.
-    #[cfg(feature = "broker")]
-    if let Some(ref endpoint) = cli_args.broker_endpoint {
-        let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
-        let litebox = shim_builder.litebox();
-        let (in_mem, tar_ro) = build_initial_fs(
-            litebox,
-            &cli_args,
-            &ancestor_modes_and_users,
-            prog_data,
-            tar_data,
-        )?;
-        let default_fs = shim_builder.default_fs(in_mem, tar_ro);
-
-        eprintln!("Connecting to file broker at {endpoint}...");
-        let transport = broker_client::GrpcBrokerTransport::connect(endpoint)
-            .map_err(|e| anyhow!("Failed to connect to broker at {endpoint}: {e}"))?;
-        eprintln!("File broker connected.");
-
-        let broker_fs = litebox::fs::broker::FileSystem::new(litebox, transport);
-        let combined = litebox::fs::layered::FileSystem::new(
-            litebox,
-            default_fs,
-            broker_fs,
-            litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
-        );
-        return finish_run(shim_builder, combined, &cli_args);
-    }
-
-    // Default path: no broker.
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     let litebox = shim_builder.litebox();
     let (in_mem, tar_ro) = build_initial_fs(
@@ -271,7 +237,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
 /// Build the in-memory and tar read-only file systems, including program data and /tmp.
 ///
-/// This is extracted so that both the default and broker-enabled code paths can share it.
+/// This is extracted so that both the default and 9P-broker-enabled code paths can share it.
 #[allow(clippy::type_complexity)]
 fn build_initial_fs(
     litebox: &litebox::LiteBox<Platform>,
@@ -386,77 +352,101 @@ fn finish_run<FS: litebox_shim_linux::ShimFS>(
         )
     })?;
 
-    let initial_file_system = std::sync::Arc::new(fs);
-
     shim_builder.set_load_filter(fixup_env);
-    let shim = shim_builder.build();
-
-    let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
-    let net_worker = if cli_args.tun_device_name.is_some() {
-        let shim = shim.clone();
-        let shutdown_clone = shutdown.clone();
-        let child = litebox_platform_linux_userland::spawn_host_thread(move || {
-            const DEFAULT_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(5);
-            pin_thread_to_cpu(0);
-
-            while !shutdown_clone.load(core::sync::atomic::Ordering::Relaxed) {
-                let timeout = loop {
-                    match shim.perform_network_interaction() {
-                        litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately => {}
-                        litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction{ timeout } => {
-                            break timeout;
-                        }
-                    }
-                };
-                let wait = match timeout {
-                    Some(t) if t < DEFAULT_TIMEOUT => t,
-                    _ => DEFAULT_TIMEOUT,
-                };
-                litebox_platform_multiplex::platform().wait_on_tun(Some(wait));
-            }
-            while shim.perform_network_interaction().call_again_immediately() {}
-        });
-        Some(child)
-    } else {
-        None
-    };
 
     match cli_args.interception_backend {
         InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),
-        InterceptionBackend::Rewriter => {
-            // The shim's mmap hook handles syscall patching at runtime —
-            // no audit library or other setup needed.
-        }
+        InterceptionBackend::Rewriter => {}
     }
 
-    let argv = cli_args
-        .program_and_arguments
-        .iter()
-        .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
-        .collect();
-    let envp: Vec<_> = cli_args
-        .environment_variables
-        .iter()
-        .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
-        .collect();
-    let envp = if cli_args.forward_environment_variables {
-        envp.into_iter()
-            .chain(std::env::vars().map(|(k, v)| {
-                std::ffi::CString::new(
-                    k.bytes()
-                        .chain([b'='])
-                        .chain(v.bytes())
-                        .collect::<Vec<u8>>(),
-                )
-                .unwrap()
-            }))
-            .collect()
+    let argv = build_argv(cli_args);
+    let envp = build_envp(cli_args);
+
+    // If a 9P broker is requested, build shim → start network → connect 9P → layer FS.
+    // The FS type differs between branches, so each must build its own shim and run.
+    if cli_args.nine_p_broker.is_some() {
+        finish_run_with_nine_p(shim_builder, fs, cli_args, platform, prog_path, argv, envp)
     } else {
-        envp
+        let initial_file_system = std::sync::Arc::new(fs);
+        let shim = shim_builder.build();
+
+        let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let net_worker = start_network_worker(&shim, &shutdown, cli_args);
+
+        let program = shim.load_program(
+            initial_file_system,
+            platform.init_task(),
+            prog_path,
+            argv,
+            envp,
+            cli_args.working_directory.clone(),
+        )?;
+
+        run_program(program, shutdown, net_worker);
+    }
+}
+
+/// Finish running with a 9P broker providing the lower file system layer.
+///
+/// Builds the shim, starts the network worker, connects to the 9P broker,
+/// layers the resulting FS on top of the base FS, and runs the program.
+fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
+    shim_builder: litebox_shim_linux::LinuxShimBuilder,
+    base_fs: FS,
+    cli_args: &CliArgs,
+    platform: &litebox_platform_multiplex::Platform,
+    prog_path: &str,
+    argv: Vec<alloc::ffi::CString>,
+    envp: Vec<alloc::ffi::CString>,
+) -> Result<()> {
+    let broker_addr = cli_args.nine_p_broker.as_deref().unwrap();
+    let addr: core::net::SocketAddr = broker_addr
+        .parse()
+        .map_err(|e| anyhow!("Invalid 9P broker address '{broker_addr}': {e}"))?;
+
+    // Build shim — the FS type is determined by the combined layered FS below.
+    let shim = shim_builder.build();
+
+    let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let net_worker = start_network_worker(&shim, &shutdown, cli_args);
+
+    eprintln!("Connecting to 9P broker at {broker_addr}...");
+
+    // Retry connection with backoff (broker might not be listening yet)
+    let transport = {
+        let mut attempts = 0;
+        loop {
+            match shim.tcp_connection(addr) {
+                Ok(t) => break t,
+                Err(e) => {
+                    attempts += 1;
+                    if attempts >= 50 {
+                        return Err(anyhow!(
+                            "Failed to connect to 9P broker at {broker_addr} after {attempts} attempts: {e:?}"
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        }
     };
 
+    let litebox = shim.litebox();
+    let nine_p_fs = litebox::fs::nine_p::FileSystem::new(litebox, transport, 65536, "root", "/")
+        .map_err(|e| anyhow!("9P attach failed: {e:?}"))?;
+
+    eprintln!("9P broker connected.");
+
+    let combined = litebox::fs::layered::FileSystem::new(
+        litebox,
+        base_fs,
+        nine_p_fs,
+        litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
+    );
+    let combined_fs = std::sync::Arc::new(combined);
+
     let program = shim.load_program(
-        initial_file_system,
+        combined_fs,
         platform.init_task(),
         prog_path,
         argv,
@@ -464,6 +454,17 @@ fn finish_run<FS: litebox_shim_linux::ShimFS>(
         cli_args.working_directory.clone(),
     )?;
 
+    run_program(program, shutdown, net_worker);
+}
+
+/// Run the loaded program and exit with its return code.
+///
+/// This function never returns — it calls `std::process::exit()`.
+fn run_program<FS: litebox_shim_linux::ShimFS>(
+    program: litebox_shim_linux::LoadedProgram<FS>,
+    shutdown: std::sync::Arc<core::sync::atomic::AtomicBool>,
+    net_worker: Option<std::thread::JoinHandle<()>>,
+) -> ! {
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();
 
@@ -505,6 +506,72 @@ fn pin_thread_to_cpu(cpu: usize) {
         if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw const set) != 0 {
             eprintln!("Warning: Failed to pin thread to CPU core {cpu}");
         }
+    }
+}
+
+/// Start the network worker thread if a TUN device is configured.
+fn start_network_worker<FS: litebox_shim_linux::ShimFS>(
+    shim: &litebox_shim_linux::LinuxShim<FS>,
+    shutdown: &std::sync::Arc<core::sync::atomic::AtomicBool>,
+    cli_args: &CliArgs,
+) -> Option<std::thread::JoinHandle<()>> {
+    cli_args.tun_device_name.as_ref()?;
+    let shim = shim.clone();
+    let shutdown_clone = shutdown.clone();
+    let child = litebox_platform_linux_userland::spawn_host_thread(move || {
+        const DEFAULT_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(5);
+        pin_thread_to_cpu(0);
+
+        while !shutdown_clone.load(core::sync::atomic::Ordering::Relaxed) {
+            let timeout = loop {
+                match shim.perform_network_interaction() {
+                    litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately => {}
+                    litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction { timeout } => {
+                        break timeout;
+                    }
+                }
+            };
+            let wait = match timeout {
+                Some(t) if t < DEFAULT_TIMEOUT => t,
+                _ => DEFAULT_TIMEOUT,
+            };
+            litebox_platform_multiplex::platform().wait_on_tun(Some(wait));
+        }
+        while shim.perform_network_interaction().call_again_immediately() {}
+    });
+    Some(child)
+}
+
+/// Build argv from CLI args.
+fn build_argv(cli_args: &CliArgs) -> Vec<std::ffi::CString> {
+    cli_args
+        .program_and_arguments
+        .iter()
+        .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
+        .collect()
+}
+
+/// Build envp from CLI args, optionally forwarding host environment.
+fn build_envp(cli_args: &CliArgs) -> Vec<std::ffi::CString> {
+    let envp: Vec<_> = cli_args
+        .environment_variables
+        .iter()
+        .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
+        .collect();
+    if cli_args.forward_environment_variables {
+        envp.into_iter()
+            .chain(std::env::vars().map(|(k, v)| {
+                std::ffi::CString::new(
+                    k.bytes()
+                        .chain([b'='])
+                        .chain(v.bytes())
+                        .collect::<Vec<u8>>(),
+                )
+                .unwrap()
+            }))
+            .collect()
+    } else {
+        envp
     }
 }
 

@@ -13,7 +13,6 @@ use bitflags::bitflags;
 use core::ffi::c_uint;
 use core::num::NonZeroUsize;
 
-pub mod broker;
 pub mod devices;
 pub mod errors;
 pub mod in_mem;
@@ -178,6 +177,19 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
     fn set_pty_termios(&self, fd: &TypedFd<Self>, termios: devices::PtyTermios) -> bool {
         false
+    }
+
+    /// Read the target of a symbolic link.
+    ///
+    /// Returns the link target as a string. The default implementation returns
+    /// [`ReadLinkError::NotSupported`](errors::ReadLinkError::NotSupported),
+    /// since most in-memory filesystems don't have symlinks.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn read_link(
+        &self,
+        path: impl path::Arg,
+    ) -> Result<alloc::string::String, errors::ReadLinkError> {
+        Err(errors::ReadLinkError::NotSupported)
     }
 }
 

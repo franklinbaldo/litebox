@@ -833,8 +833,11 @@ impl<FS: ShimFS> Task<FS> {
             }
         }
 
-        // TODO: we do not support symbolic links other than stdio yet.
-        Err(Errno::ENOENT)
+        // Try the filesystem for symlink resolution
+        match self.files.borrow().fs.read_link(fullpath) {
+            Ok(target) => Ok(target),
+            Err(_) => Err(Errno::ENOENT),
+        }
     }
 
     /// Handle syscall `readlink`

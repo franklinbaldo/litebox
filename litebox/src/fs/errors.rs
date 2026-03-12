@@ -27,6 +27,8 @@ pub enum OpenError {
     TruncateError(#[from] TruncateError),
     #[error("I/O error")]
     Io,
+    #[error("operation was interrupted")]
+    Interrupted,
     #[error(transparent)]
     PathError(#[from] PathError),
 }
@@ -229,6 +231,20 @@ pub enum FileStatusError {
     ClosedFd,
     #[error("I/O error")]
     Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
+/// Possible errors from [`FileSystem::read_link`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum ReadLinkError {
+    #[error("not a symbolic link")]
+    NotASymlink,
+    #[error("I/O error")]
+    Io,
+    #[error("operation not supported")]
+    NotSupported,
     #[error(transparent)]
     PathError(#[from] PathError),
 }

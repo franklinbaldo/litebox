@@ -205,7 +205,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             Ok(fd) => fd,
             Err(e) => match e {
                 OpenError::AccessNotAllowed => return Err(MigrationError::NoReadPerms),
-                OpenError::Io => return Err(MigrationError::Io),
+                OpenError::Io | OpenError::Interrupted => return Err(MigrationError::Io),
                 OpenError::NoWritePerms
                 | OpenError::ReadOnlyFileSystem
                 | OpenError::AlreadyExists
@@ -538,6 +538,7 @@ impl<
             Err(e) => match &e {
                 OpenError::AccessNotAllowed
                 | OpenError::Io
+                | OpenError::Interrupted
                 | OpenError::NoWritePerms
                 | OpenError::ReadOnlyFileSystem
                 | OpenError::AlreadyExists
@@ -1206,6 +1207,7 @@ impl<
                 }
                 OpenError::NoWritePerms
                 | OpenError::AlreadyExists
+                | OpenError::Interrupted
                 | OpenError::TruncateError(_) => {
                     unreachable!()
                 }
@@ -1501,6 +1503,26 @@ impl<
             Some(EntryX::Upper { fd }) => self.upper.set_pty_termios(fd, termios),
             Some(EntryX::Lower { fd }) => self.lower.set_pty_termios(fd, termios),
             _ => false,
+        }
+    }
+
+    fn read_link(
+        &self,
+        path: impl crate::path::Arg,
+    ) -> Result<alloc::string::String, super::errors::ReadLinkError> {
+        let path = self
+            .absolute_path(path)
+            .map_err(|_| super::errors::ReadLinkError::Io)?;
+        // Try upper first, fall back to lower
+        match self.upper.read_link(&*path) {
+            Ok(target) => Ok(target),
+            Err(
+                super::errors::ReadLinkError::NotSupported
+                | super::errors::ReadLinkError::PathError(
+                    super::errors::PathError::NoSuchFileOrDirectory,
+                ),
+            ) => self.lower.read_link(path),
+            Err(e) => Err(e),
         }
     }
 }

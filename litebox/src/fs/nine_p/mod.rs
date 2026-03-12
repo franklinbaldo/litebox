@@ -80,7 +80,8 @@ impl From<Error> for OpenError {
                 ENAMETOOLONG => OpenError::PathError(PathError::InvalidPathname),
                 _ => OpenError::Io,
             },
-            Error::Io | Error::InvalidResponse | Error::Interrupted => OpenError::Io,
+            Error::Interrupted => OpenError::Interrupted,
+            Error::Io | Error::InvalidResponse => OpenError::Io,
         }
     }
 }
@@ -852,21 +853,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         let new_name = *new_components.last().unwrap();
         let parent_components = &new_components[..new_components.len() - 1];
         let dst_dir_fid = if parent_components.is_empty() {
-            match self.client.clone_fid(self.root.1) {
-                Ok(f) => f,
-                Err(_) => {
-                    let _ = self.client.clunk(src_fid);
-                    return Err(super::errors::RenameError::ReadOnlyFileSystem);
-                }
+            if let Ok(f) = self.client.clone_fid(self.root.1) {
+                f
+            } else {
+                let _ = self.client.clunk(src_fid);
+                return Err(super::errors::RenameError::ReadOnlyFileSystem);
             }
+        } else if let Ok((_, f)) = self.client.walk(self.root.1, parent_components) {
+            f
         } else {
-            match self.client.walk(self.root.1, parent_components) {
-                Ok((_, f)) => f,
-                Err(_) => {
-                    let _ = self.client.clunk(src_fid);
-                    return Err(super::errors::RenameError::ReadOnlyFileSystem);
-                }
-            }
+            let _ = self.client.clunk(src_fid);
+            return Err(super::errors::RenameError::ReadOnlyFileSystem);
         };
 
         let result = self.client.rename(src_fid, dst_dir_fid, new_name);
@@ -966,6 +963,22 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         let attr = self.client.getattr(fid, fcall::GetattrMask::ALL)?;
 
         Ok(Self::rgetattr_to_file_status(&attr)?)
+    }
+
+    fn read_link(
+        &self,
+        path: impl crate::path::Arg,
+    ) -> Result<alloc::string::String, super::errors::ReadLinkError> {
+        let abs = self
+            .absolute_path(path)
+            .map_err(super::errors::ReadLinkError::PathError)?;
+        let fid = self
+            .walk_to(&abs)
+            .map_err(|_| super::errors::ReadLinkError::Io)?;
+        let target = self.client.readlink(fid);
+        let _ = self.client.clunk(fid);
+        let target = target.map_err(|_| super::errors::ReadLinkError::Io)?;
+        alloc::string::String::from_utf8(target).map_err(|_| super::errors::ReadLinkError::Io)
     }
 }
 
