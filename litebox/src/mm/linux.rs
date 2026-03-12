@@ -303,6 +303,17 @@ pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const 
     pub(super) platform: &'static Platform,
     /// Current program break address.
     pub(super) brk: usize,
+    /// End of the reserved region above brk for future brk growth.
+    ///
+    /// When `brk` is set via [`super::PageManager::set_initial_brk`], we reserve a region
+    /// `[brk_aligned..brk_reserved_end)` so that the top-down allocator in
+    /// [`Vmem::get_unmmaped_area`] will not place hint-based anonymous mmaps in this region.
+    /// This prevents the common failure mode where anonymous mmaps fill the gap right above
+    /// brk, blocking brk growth (which manifests as `malloc(): corrupted top size`).
+    ///
+    /// This is a virtual reservation only — no platform allocation or VMA entry is created.
+    /// The `brk()` syscall handler ignores this field and grows brk normally.
+    pub(super) brk_reserved_end: usize,
     /// Virtual memory areas.
     vmas: RangeMap<usize, VmArea>,
 }
@@ -315,6 +326,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         let mut vmem = Self {
             vmas: RangeMap::new(),
             brk: 0,
+            brk_reserved_end: 0,
             platform,
         };
         for each in platform.reserved_pages() {
@@ -894,6 +906,21 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
 
     /*================================Internal Functions================================ */
 
+    /// Check if the given range overlaps with any VMA **or** the brk reservation.
+    fn range_is_occupied(&self, range: &Range<usize>) -> bool {
+        if self.vmas.overlaps(range) {
+            return true;
+        }
+        // Check overlap with brk reserved region [brk_aligned..brk_reserved_end)
+        if self.brk_reserved_end > 0 {
+            let brk_start = self.brk.next_multiple_of(ALIGN);
+            if range.start < self.brk_reserved_end && range.end > brk_start {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Get an unmapped area in the virtual address space.
     /// `suggested_range` and `fixed_addr` are the hint address and MAP_FIXED flag respectively,
     /// similar to how `mmap` works.
@@ -914,9 +941,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 return None;
             }
             if fixed_addr
-                || !self
-                    .vmas
-                    .overlaps(&(suggested_address.0..(suggested_address.0 + size)))
+                || !self.range_is_occupied(&(suggested_address.0..(suggested_address.0 + size)))
             {
                 return Some(suggested_address.0);
             }
@@ -935,7 +960,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         debug_assert!(Platform::TASK_ADDR_MIN % ALIGN == 0);
         debug_assert!(Platform::TASK_ADDR_MAX % ALIGN == 0);
         let last_end = self.vmas.last_range_value().map_or(low_limit, |r| r.0.end);
-        if last_end <= high_limit {
+        if last_end <= high_limit && !self.range_is_occupied(&(high_limit..high_limit + size)) {
             return Some(high_limit);
         }
 
@@ -957,7 +982,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 // (See [`Vmem::new`]) and thus `start` may be larger than `high_limit`.
                 continue;
             }
-            if !self.vmas.overlaps(&(start..start + size)) {
+            if !self.range_is_occupied(&(start..start + size)) {
                 return Some(start);
             }
         }

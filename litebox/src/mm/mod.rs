@@ -40,6 +40,14 @@ impl<Platform, const ALIGN: usize> PageManager<Platform, ALIGN>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
+    /// Size of the region reserved above the initial brk for future brk growth.
+    /// The top-down allocator will avoid placing hint-based anonymous mmaps in
+    /// `[brk..brk + BRK_RESERVE_SIZE)`, preventing the common failure mode where
+    /// brk growth is blocked by nearby anonymous mappings.
+    ///
+    /// 32 MiB is generous enough for typical programs while not wasting address space.
+    const BRK_RESERVE_SIZE: usize = 32 << 20; // 32 MiB
+
     /// Create a new `PageManager` instance.
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
         let vmem = RwLock::new(linux::Vmem::new(litebox.x.platform));
@@ -290,6 +298,10 @@ where
         let mut vmem = self.vmem.write();
         assert_eq!(vmem.brk, 0, "initial brk is already set");
         vmem.brk = brk;
+        // Reserve a region above brk for future brk growth so that the
+        // top-down hint-based allocator does not place anonymous mmaps there.
+        let brk_aligned = brk.next_multiple_of(linux::PAGE_SIZE);
+        vmem.brk_reserved_end = brk_aligned + Self::BRK_RESERVE_SIZE;
     }
 
     /// Set the program break to the given address.
@@ -382,6 +394,7 @@ where
         // reset brk
         let mut vmem = self.vmem.write();
         vmem.brk = 0;
+        vmem.brk_reserved_end = 0;
 
         Ok(())
     }
