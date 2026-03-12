@@ -84,14 +84,6 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for ElfFile<'_, FS> {
         // Allocate a mapping large enough that even if it's maximally misaligned we can
         // still fit `len` bytes.
         let mapping_len = len + (align.max(PAGE_SIZE) - PAGE_SIZE);
-        litebox::log_println!(
-            self.task.global.platform,
-            "[diag] reserve: hint={:#x} len={:#x} align={:#x} mapping_len={:#x}",
-            self.mmap_hint,
-            len,
-            align,
-            mapping_len
-        );
         let mapping_ptr = self
             .task
             .sys_mmap(
@@ -108,13 +100,6 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for ElfFile<'_, FS> {
         let ptr = mapping_ptr.next_multiple_of(align);
         let end = ptr + len;
         let mapping_end = mapping_ptr + mapping_len;
-        litebox::log_println!(
-            self.task.global.platform,
-            "[diag] reserve: mmap returned={:#x} aligned_base={:#x} end={:#x}",
-            mapping_ptr,
-            ptr,
-            end
-        );
         if ptr != mapping_ptr {
             self.task
                 .sys_munmap(MutPtr::from_usize(mapping_ptr), ptr - mapping_ptr)?;
@@ -235,31 +220,50 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
 
         // Load the interpreter ELF file, if any.
         let interp = if let Some(interp) = &mut self.interp {
-            // On macOS ARM64, the default address allocator places the
-            // interpreter immediately after the main binary, leaving almost no
-            // room for brk to grow. When glibc's malloc later tries to extend
-            // the heap via brk(), it collides with the interpreter mapping and
-            // gets ENOMEM, which manifests as "malloc(): corrupted top size".
+            // On macOS ARM64, the default top-down address allocator tends to
+            // place the interpreter immediately after the main binary, leaving
+            // almost no room for brk to grow.  When glibc's malloc later tries
+            // to extend the heap via brk(), it collides with the interpreter
+            // mapping and gets ENOMEM → "malloc(): corrupted top size".
             //
-            // Avoid this by hinting the interpreter well above the main
-            // binary's brk so the heap has room to grow.
+            // Additionally, the vmem VMA tree includes macOS reserved regions
+            // (dyld, shared cache, etc.) discovered at startup.  A blind
+            // brk+offset hint may land inside one of those regions, causing
+            // get_unmmaped_area to reject it and fall back to a top-down
+            // address near TASK_ADDR_MAX that macOS ignores — placing the
+            // interpreter right next to the main binary anyway.
+            //
+            // Fix: query the vmem layer for a genuinely free gap above the brk
+            // reservation zone.  This produces a hint that both the vmem
+            // allocator and the macOS kernel will accept.
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             {
-                // Leave 8 MiB of brk headroom (0x80_0000). This is more than
-                // enough for glibc's typical initial brk allocation (~132 KiB)
-                // and leaves a generous buffer for programs that use brk
-                // heavily before switching to mmap-based allocation.
-                const BRK_RESERVE_GAP: usize = 8 * 1024 * 1024;
-                let interp_hint = info.brk.next_multiple_of(PAGE_SIZE) + BRK_RESERVE_GAP;
-                litebox::log_println!(
-                    global.platform,
-                    "[diag] interp hint: main brk={:#x} brk_aligned={:#x} gap={:#x} hint={:#x}",
-                    info.brk,
-                    info.brk.next_multiple_of(PAGE_SIZE),
-                    BRK_RESERVE_GAP,
-                    interp_hint
-                );
-                interp.file.mmap_hint = interp_hint;
+                use litebox::mm::PageManager;
+                type PM = PageManager<crate::Platform, { PAGE_SIZE }>;
+
+                let brk_aligned = info.brk.next_multiple_of(PAGE_SIZE);
+                let min_addr = brk_aligned + PM::BRK_RESERVE_SIZE;
+                // 4 MiB is generous for any interpreter (ld-linux is ~300 KiB).
+                const INTERP_SIZE_ESTIMATE: usize = 4 * 1024 * 1024;
+                if let Some(hint) = global
+                    .pm
+                    .find_free_hint_above(min_addr, INTERP_SIZE_ESTIMATE)
+                {
+                    litebox::log_println!(
+                        global.platform,
+                        "[diag] interp hint: brk={:#x} min_search={:#x} found_free={:#x}",
+                        info.brk,
+                        min_addr,
+                        hint
+                    );
+                    interp.file.mmap_hint = hint;
+                } else {
+                    litebox::log_println!(
+                        global.platform,
+                        "[diag] interp hint: no free region above {:#x}, using default",
+                        min_addr
+                    );
+                }
             }
 
             Some(
@@ -284,224 +288,6 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
                 interp_info.base_addr.saturating_sub(info.brk)
             );
         }
-
-        // == Diagnostic: simulate rtld_audit's parse_object scan on the main binary ==
-        // This runs on the host side to verify what the guest-side parse_object would see.
-        // rtld_audit's debug prints are invisible when syscall_entry==0, so we need
-        // host-side visibility into the trampoline state.
-        #[cfg(target_arch = "aarch64")]
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            use litebox_common_linux::loader::AccessMemory;
-            let base = info.base_addr;
-            litebox::log_println!(
-                global.platform,
-                "[diag] parse_object sim: main base_addr={:#x} brk={:#x} phdrs_addr={:#x} num_phdrs={} tls_table={:#x}",
-                base,
-                info.brk,
-                info.phdrs_addr,
-                info.num_phdrs,
-                info.tls_table_addr
-            );
-
-            // Read in-memory ELF header to get e_phoff and e_phnum
-            let mut ehdr = [0u8; 64]; // Elf64_Ehdr is 64 bytes
-            if (&*global.platform).read(base, &mut ehdr).is_ok() {
-                let e_phoff = u64::from_le_bytes(ehdr[32..40].try_into().unwrap()) as usize;
-                let e_phentsize = u16::from_le_bytes(ehdr[54..56].try_into().unwrap()) as usize;
-                let e_phnum = u16::from_le_bytes(ehdr[56..58].try_into().unwrap()) as usize;
-                litebox::log_println!(
-                    global.platform,
-                    "[diag] parse_object sim: e_phoff={:#x} e_phentsize={} e_phnum={}",
-                    e_phoff,
-                    e_phentsize,
-                    e_phnum
-                );
-
-                // Walk program headers like parse_object does
-                let mut max_filesz_end: usize = 0;
-                let mut max_memsz_end: usize = 0;
-                for i in 0..e_phnum {
-                    let ph_addr = base + e_phoff + i * e_phentsize;
-                    let mut phdr = [0u8; 56]; // Elf64_Phdr is 56 bytes
-                    if (&*global.platform).read(ph_addr, &mut phdr).is_ok() {
-                        let p_type = u32::from_le_bytes(phdr[0..4].try_into().unwrap());
-                        let p_vaddr = u64::from_le_bytes(phdr[16..24].try_into().unwrap()) as usize;
-                        let p_filesz =
-                            u64::from_le_bytes(phdr[32..40].try_into().unwrap()) as usize;
-                        let p_memsz = u64::from_le_bytes(phdr[40..48].try_into().unwrap()) as usize;
-                        if p_type == 1 {
-                            // PT_LOAD
-                            litebox::log_println!(
-                                global.platform,
-                                "[diag] parse_object sim: PT_LOAD[{}] p_vaddr={:#x} p_filesz={:#x} p_memsz={:#x}",
-                                i,
-                                p_vaddr,
-                                p_filesz,
-                                p_memsz
-                            );
-                            let filesz_end = p_vaddr + p_filesz;
-                            let memsz_end = p_vaddr + p_memsz;
-                            if filesz_end > max_filesz_end {
-                                max_filesz_end = filesz_end;
-                            }
-                            if memsz_end > max_memsz_end {
-                                max_memsz_end = memsz_end;
-                            }
-                        }
-                    }
-                }
-
-                // Simulate the scan: align_up(max_filesz_end, 0x1000) .. align_up(max_memsz_end, 0x1000)
-                let scan_start = (max_filesz_end + 0xFFF) & !0xFFF;
-                let scan_end = (max_memsz_end + 0xFFF) & !0xFFF;
-                litebox::log_println!(
-                    global.platform,
-                    "[diag] parse_object sim: max_filesz_end={:#x} max_memsz_end={:#x} scan_start={:#x} scan_end={:#x}",
-                    max_filesz_end,
-                    max_memsz_end,
-                    scan_start,
-                    scan_end
-                );
-
-                // Scan each 4KB page in the range, read first 8 bytes
-                let mut found_trampoline = false;
-                let mut offset = scan_start;
-                while offset < scan_end {
-                    let addr = base + offset;
-                    let mut buf = [0u8; 8];
-                    match (&*global.platform).read(addr, &mut buf) {
-                        Ok(_) => {
-                            let val = u64::from_le_bytes(buf);
-                            litebox::log_println!(
-                                global.platform,
-                                "[diag] parse_object sim: scan addr={:#x} (offset={:#x}) val={:#x}",
-                                addr,
-                                offset,
-                                val
-                            );
-                            if val != 0 && !found_trampoline {
-                                found_trampoline = true;
-                                // Also read the next 8 bytes (tls_table_ptr)
-                                let mut buf2 = [0u8; 8];
-                                if (&*global.platform).read(addr + 8, &mut buf2).is_ok() {
-                                    let tls_ptr = u64::from_le_bytes(buf2);
-                                    litebox::log_println!(
-                                        global.platform,
-                                        "[diag] parse_object sim: FOUND trampoline at {:#x}: syscall_entry={:#x} tls_table_ptr={:#x}",
-                                        addr,
-                                        val,
-                                        tls_ptr
-                                    );
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            litebox::log_println!(
-                                global.platform,
-                                "[diag] parse_object sim: scan addr={:#x} (offset={:#x}) READ FAILED",
-                                addr,
-                                offset
-                            );
-                        }
-                    }
-                    offset += 0x1000;
-                }
-                if !found_trampoline {
-                    litebox::log_println!(
-                        global.platform,
-                        "[diag] parse_object sim: NO trampoline found in scan range!"
-                    );
-                }
-            } else {
-                litebox::log_println!(
-                    global.platform,
-                    "[diag] parse_object sim: failed to read ELF header at {:#x}",
-                    base
-                );
-            }
-        }
-
-        // Also dump interpreter trampoline info
-        #[cfg(target_arch = "aarch64")]
-        #[allow(clippy::cast_possible_truncation)]
-        if let Some(interp_info) = &interp {
-            use litebox_common_linux::loader::AccessMemory;
-            let ibase = interp_info.base_addr;
-            litebox::log_println!(
-                global.platform,
-                "[diag] parse_object sim: interp base_addr={:#x} brk={:#x} tls_table={:#x}",
-                ibase,
-                interp_info.brk,
-                interp_info.tls_table_addr
-            );
-            // Read trampoline from interpreter using same scan
-            let mut ehdr = [0u8; 64];
-            if (&*global.platform).read(ibase, &mut ehdr).is_ok() {
-                let e_phoff = u64::from_le_bytes(ehdr[32..40].try_into().unwrap()) as usize;
-                let e_phentsize = u16::from_le_bytes(ehdr[54..56].try_into().unwrap()) as usize;
-                let e_phnum = u16::from_le_bytes(ehdr[56..58].try_into().unwrap()) as usize;
-                let mut max_filesz_end: usize = 0;
-                let mut max_memsz_end: usize = 0;
-                for i in 0..e_phnum {
-                    let ph_addr = ibase + e_phoff + i * e_phentsize;
-                    let mut phdr = [0u8; 56];
-                    if (&*global.platform).read(ph_addr, &mut phdr).is_ok() {
-                        let p_type = u32::from_le_bytes(phdr[0..4].try_into().unwrap());
-                        let p_vaddr = u64::from_le_bytes(phdr[16..24].try_into().unwrap()) as usize;
-                        let p_filesz =
-                            u64::from_le_bytes(phdr[32..40].try_into().unwrap()) as usize;
-                        let p_memsz = u64::from_le_bytes(phdr[40..48].try_into().unwrap()) as usize;
-                        if p_type == 1 {
-                            // PT_LOAD
-                            let filesz_end = p_vaddr + p_filesz;
-                            let memsz_end = p_vaddr + p_memsz;
-                            if filesz_end > max_filesz_end {
-                                max_filesz_end = filesz_end;
-                            }
-                            if memsz_end > max_memsz_end {
-                                max_memsz_end = memsz_end;
-                            }
-                        }
-                    }
-                }
-                let scan_start = (max_filesz_end + 0xFFF) & !0xFFF;
-                let scan_end = (max_memsz_end + 0xFFF) & !0xFFF;
-                litebox::log_println!(
-                    global.platform,
-                    "[diag] parse_object sim interp: scan_start={:#x} scan_end={:#x}",
-                    scan_start,
-                    scan_end
-                );
-                let mut offset = scan_start;
-                while offset < scan_end {
-                    let addr = ibase + offset;
-                    let mut buf = [0u8; 8];
-                    if (&*global.platform).read(addr, &mut buf).is_ok() {
-                        let val = u64::from_le_bytes(buf);
-                        if val != 0 {
-                            let mut buf2 = [0u8; 8];
-                            let tls_ptr = if (&*global.platform).read(addr + 8, &mut buf2).is_ok() {
-                                u64::from_le_bytes(buf2)
-                            } else {
-                                0
-                            };
-                            litebox::log_println!(
-                                global.platform,
-                                "[diag] parse_object sim interp: FOUND at {:#x} (offset={:#x}): entry={:#x} tls={:#x}",
-                                addr,
-                                offset,
-                                val,
-                                tls_ptr
-                            );
-                            break; // Only need to find the first one
-                        }
-                    }
-                    offset += 0x1000;
-                }
-            }
-        }
-        // == End diagnostic ==
 
         global.pm.set_initial_brk(info.brk);
         aux.insert(AuxKey::AT_PAGESZ, PAGE_SIZE);

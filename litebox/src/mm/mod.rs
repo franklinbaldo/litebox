@@ -46,7 +46,7 @@ where
     /// brk growth is blocked by nearby anonymous mappings.
     ///
     /// 32 MiB is generous enough for typical programs while not wasting address space.
-    const BRK_RESERVE_SIZE: usize = 32 << 20; // 32 MiB
+    pub const BRK_RESERVE_SIZE: usize = 32 << 20; // 32 MiB
 
     /// Create a new `PageManager` instance.
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
@@ -302,6 +302,16 @@ where
         // top-down hint-based allocator does not place anonymous mmaps there.
         let brk_aligned = brk.next_multiple_of(linux::PAGE_SIZE);
         vmem.brk_reserved_end = brk_aligned + Self::BRK_RESERVE_SIZE;
+    }
+
+    /// Find a free region of at least `size` bytes at or above `min_addr`.
+    ///
+    /// Returns `None` if no suitable gap exists. This is useful for computing
+    /// mmap hints that are known-free in the vmem VMA tree (e.g. for placing
+    /// the ELF interpreter above the brk region on macOS where the host kernel
+    /// may ignore hints that fall inside pre-existing host-side mappings).
+    pub fn find_free_hint_above(&self, min_addr: usize, size: usize) -> Option<usize> {
+        self.vmem.read().find_free_above(min_addr, size)
     }
 
     /// Set the program break to the given address.

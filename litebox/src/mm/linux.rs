@@ -904,6 +904,32 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         }
     }
 
+    /// Find a free (unoccupied) region of at least `size` bytes at or above `min_addr`.
+    ///
+    /// Scans gaps in the VMA tree from `min_addr` upward, also respecting the brk
+    /// reservation. Returns `None` if no suitable gap exists below `TASK_ADDR_MAX`.
+    ///
+    /// This is used to compute mmap hints that are known-free in the vmem layer,
+    /// which matters on platforms (e.g. macOS) where the host kernel may ignore
+    /// hints that fall inside pre-existing host-side mappings.
+    pub(super) fn find_free_above(&self, min_addr: usize, size: usize) -> Option<usize> {
+        let min_addr = min_addr.next_multiple_of(ALIGN);
+        if size == 0 || min_addr.checked_add(size)? > Platform::TASK_ADDR_MAX {
+            return None;
+        }
+        let outer = min_addr..Platform::TASK_ADDR_MAX;
+        for gap in self.vmas.gaps(&outer) {
+            let start = gap.start.next_multiple_of(ALIGN);
+            if let Some(end) = start.checked_add(size)
+                && end <= gap.end
+                && !self.range_is_occupied(&(start..end))
+            {
+                return Some(start);
+            }
+        }
+        None
+    }
+
     /*================================Internal Functions================================ */
 
     /// Check if the given range overlaps with any VMA **or** the brk reservation.
