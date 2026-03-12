@@ -612,27 +612,39 @@ impl<FS: ShimFS> Task<FS> {
         !shared_pending.is_empty()
     }
 
+    /// Move cross-process signals (e.g. SIGCHLD from a child exit) from the
+    /// global queue into this process's shared pending queue so that
+    /// [`has_pending_signals`](Self::has_pending_signals) reflects them.
+    ///
+    /// Signals are placed into `shared_pending` (process-directed) rather than
+    /// thread-local `pending`, matching Linux semantics: any thread in the
+    /// process may deliver a process-directed signal.
+    ///
+    /// This is called from [`check_for_interrupt`] during waits so that a
+    /// child exit promptly interrupts `epoll_pwait`/`futex` instead of
+    /// sleeping until the timeout expires.
+    pub(crate) fn drain_cross_process_signals(&self) {
+        let my_id = self.process_id.0;
+        let mut queue = self.global.cross_process_signals.lock();
+        let mut i = 0;
+        while i < queue.len() {
+            if queue[i].target_process_id == my_id {
+                let sig = queue.swap_remove(i);
+                self.signals.shared_pending.lock().push(
+                    &self.process().limits,
+                    sig.signal,
+                    sig.siginfo,
+                );
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     /// Deliver any pending signals.
     pub(crate) fn process_signals(&self, ctx: &mut PtRegs) {
         // Drain cross-process signals for this process into our local pending queue.
-        {
-            let my_id = self.process_id.0;
-            let mut queue = self.global.cross_process_signals.lock();
-            let mut i = 0;
-            while i < queue.len() {
-                if queue[i].target_process_id == my_id {
-                    let sig = queue.swap_remove(i);
-
-                    self.signals.pending.borrow_mut().push(
-                        &self.process().limits,
-                        sig.signal,
-                        sig.siginfo,
-                    );
-                } else {
-                    i += 1;
-                }
-            }
-        }
+        self.drain_cross_process_signals();
 
         loop {
             let blocked = self.signals.blocked.get();

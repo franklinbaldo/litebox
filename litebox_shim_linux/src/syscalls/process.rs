@@ -635,6 +635,27 @@ impl<FS: ShimFS> Task<FS> {
 
         self.thread.detach_from_process();
 
+        // Maintain process_thread_handles: clean up on last-thread exit, or
+        // retarget to a surviving thread if the registered thread is leaving.
+        let proc_key = self.process_id.0.cast_signed();
+        if self.thread.process.nr_threads() == 0 {
+            // Last thread — remove the entry entirely.
+            self.global.process_thread_handles.write().remove(&proc_key);
+        } else {
+            // Process still alive. If WE were the registered thread, hand
+            // the handle to another live thread so cross-process signals
+            // (e.g. SIGCHLD) can still interrupt this process.
+            let mut handles = self.global.process_thread_handles.write();
+            if let Some(registered) = handles.get(&proc_key)
+                && Arc::ptr_eq(registered, &self.thread.remote)
+            {
+                let inner = self.thread.process.inner.lock();
+                if let Some((_tid, other)) = inner.threads.iter().next() {
+                    handles.insert(proc_key, other.clone());
+                }
+            }
+        }
+
         // If this was the last thread in the process, close all open FDs and
         // notify the core registry.
         if self.thread.process.nr_threads() == 0 {
@@ -2634,7 +2655,9 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     pub(crate) fn handle_init_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
-        self.init_thread_context(ctx);
+        // init_thread_context returns true for the process's main thread
+        // (NewProcess or initial None), false for worker threads (NewThread).
+        let is_main_thread = self.init_thread_context(ctx);
 
         // If this is a vfork child sharing the parent's address space, clear the
         // transport interrupt flag so the child's 9P operations don't trigger
@@ -2654,20 +2677,27 @@ impl<FS: ShimFS> Task<FS> {
             .ok();
 
         // Register the process's main thread handle so cross-process signals
-        // (e.g. SIGCHLD) can interrupt this task. Use process_id (litebox's
-        // internal ID) which matches what ProcessRegistry returns.
-        let proc_key = self.process_id.0.cast_signed();
-        self.global
-            .process_thread_handles
-            .write()
-            .insert(proc_key, self.thread.remote.clone());
+        // (e.g. SIGCHLD) can interrupt this task. Only the main thread should
+        // be registered — worker threads must not overwrite the entry, or
+        // signals would be routed to an arbitrary thread instead of the
+        // event-loop / main thread that is actually waiting.
+        if is_main_thread {
+            let proc_key = self.process_id.0.cast_signed();
+            self.global
+                .process_thread_handles
+                .write()
+                .insert(proc_key, self.thread.remote.clone());
+        }
     }
 
     /// Initialize the thread context for a new process or thread, and perform any
     /// other initial setup required.
-    fn init_thread_context(&self, ctx: &mut litebox_common_linux::PtRegs) {
+    ///
+    /// Returns `true` for the process's main thread (`None` or `NewProcess`),
+    /// `false` for worker threads (`NewThread`).
+    fn init_thread_context(&self, ctx: &mut litebox_common_linux::PtRegs) -> bool {
         match self.thread.init_state.take() {
-            ThreadInitState::None => {}
+            ThreadInitState::None => true,
             ThreadInitState::NewProcess(load_info) => {
                 #[cfg(target_arch = "x86_64")]
                 {
@@ -2717,6 +2747,7 @@ impl<FS: ShimFS> Task<FS> {
                         xss: 0x2b, // __USER_DS
                     };
                 }
+                true
             }
             ThreadInitState::NewThread {
                 tls,
@@ -2759,6 +2790,7 @@ impl<FS: ShimFS> Task<FS> {
                     // Set the child TID if requested.
                     let _ = child_tid_ptr.write_at_offset(0, self.tid);
                 }
+                false
             }
         }
     }
