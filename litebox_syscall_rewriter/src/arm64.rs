@@ -26,6 +26,12 @@ const MSR_TPIDR_EL0_BITS: u32 = 0xD51B_D040;
 ///
 /// Encoding: `0xD53BD04d` where `d` is the destination register (0-30 for X0-X30, 31 for XZR).
 /// We match the top 27 bits and extract the bottom 5 as the register number.
+///
+/// MRS TPIDR_EL0 is rewritten to read from the TLS table's entry[0].guest_tpidr
+/// instead of the hardware register. On macOS, the kernel can clobber TPIDR_EL0
+/// on context switches (not just signals), making native reads unreliable.
+/// Each MRS site gets a self-contained 5-instruction gate that loads directly
+/// from entry[0] — no shared handler needed.
 const MRS_TPIDR_EL0_MASK: u32 = 0xFFFF_FFE0;
 const MRS_TPIDR_EL0_BITS: u32 = 0xD53B_D040;
 
@@ -80,9 +86,12 @@ const SVC_GATE_INSN_COUNT: usize = 6;
 /// Size in bytes of each per-site SVC gate.
 const SVC_GATE_SIZE: usize = SVC_GATE_INSN_COUNT * 4; // 24
 
-/// Number of instructions in the shared MSR handler (16 insns, 64 bytes).
+/// Number of instructions in the shared MSR handler (19 insns, 76 bytes).
 ///
 /// Uses linear scan to find and update TLS entry for old guest TPIDR.
+/// On the sentinel path (no existing entry matches — e.g. macOS clobbered
+/// TPIDR_EL0), the new guest_tpidr is written to entry\[0\] so that
+/// subsequent SVC handler fallback and fault-and-reinstall reads work.
 ///
 /// ```text
 ///  [0]  STR  X30, [SP, #32]       ; save BL return addr
@@ -90,22 +99,25 @@ const SVC_GATE_SIZE: usize = SVC_GATE_INSN_COUNT * 4; // 24
 ///  [2]  LDR  X17, [PC, #off]      ; X17 = TLS table base
 ///  [3]  LDR  X30, [X17, #0]       ; .Lloop: X30 = entry.guest_tpidr (scratch)
 ///  [4]  CMN  X30, #1              ; sentinel?
-///  [5]  B.EQ .Lsentinel           ; -> [12] (skip STR to avoid phantom entries)
+///  [5]  B.EQ .Lsentinel           ; -> [13]
 ///  [6]  CMP  X30, X16             ; match old TPIDR?
 ///  [7]  B.EQ .Lfound              ; -> [10]
 ///  [8]  ADD  X17, X17, #16        ; next entry
 ///  [9]  B    .Lloop               ; -> [3]
 /// [10]  LDR  X16, [SP, #24]       ; .Lfound: X16 = new TPIDR
-/// [11]  STR  X16, [X17, #0]       ; update entry.guest_tpidr (only from .Lfound)
-/// [12]  LDR  X16, [SP, #24]       ; .Lsentinel: new TPIDR
-/// [13]  MSR  TPIDR_EL0, X16       ; execute actual MSR
-/// [14]  LDR  X30, [SP, #32]       ; restore BL return
-/// [15]  RET
+/// [11]  STR  X16, [X17, #0]       ; update entry.guest_tpidr
+/// [12]  B    .Lmsr                ; -> [16]
+/// [13]  LDR  X17, [PC, #off]      ; .Lsentinel: reload TLS table base
+/// [14]  LDR  X16, [SP, #24]       ; new TPIDR
+/// [15]  STR  X16, [X17, #0]       ; write entry[0].guest_tpidr
+/// [16]  MSR  TPIDR_EL0, X16       ; .Lmsr: execute actual MSR
+/// [17]  LDR  X30, [SP, #32]       ; restore BL return
+/// [18]  RET
 /// ```
-const SHARED_MSR_HANDLER_INSN_COUNT: usize = 16;
+const SHARED_MSR_HANDLER_INSN_COUNT: usize = 19;
 
 /// Size in bytes of the shared MSR handler.
-const SHARED_MSR_HANDLER_SIZE: usize = SHARED_MSR_HANDLER_INSN_COUNT * 4; // 64
+const SHARED_MSR_HANDLER_SIZE: usize = SHARED_MSR_HANDLER_INSN_COUNT * 4; // 76
 
 /// Number of instructions in each per-site MSR gate (general case: 9 insns, 36 bytes).
 ///
@@ -130,55 +142,29 @@ const MSR_GATE_SIZE: usize = MSR_GATE_INSN_COUNT * 4; // 36
 /// Size in bytes of each per-site MSR gate for special registers (X16, X17, X30).
 const MSR_GATE_SPECIAL_SIZE: usize = (MSR_GATE_INSN_COUNT + 1) * 4; // 40
 
-/// Number of instructions in the shared MRS read handler (15 insns, 60 bytes).
+/// Number of instructions in each per-site MRS gate (5 insns, 20 bytes).
 ///
-/// Uses linear scan to find TLS entry matching current TPIDR_EL0 (which may
-/// be clobbered on macOS). Returns the guest_tpidr in `[SP, #24]`.
+/// Reads `entry[0].guest_tpidr` directly from the TLS table — no shared handler.
+/// On macOS, TPIDR_EL0 can be clobbered by context switches, so we can't let
+/// the guest read it natively. Instead, the MSR handler writes the correct
+/// value to entry[0], and each MRS gate reads it back.
 ///
+/// General case (Xd ∉ {X16, X17}):
 /// ```text
-///  [0]  STR  X30, [SP, #32]       ; save BL return addr
-///  [1]  MRS  X16, TPIDR_EL0       ; current TPIDR (may be clobbered)
-///  [2]  LDR  X17, [PC, #off]      ; X17 = TLS table base
-///  [3]  LDR  X30, [X17, #0]       ; .Lloop: entry.guest_tpidr
-///  [4]  CMN  X30, #1              ; sentinel?
-///  [5]  B.EQ .Lfallback           ; -> [10]
-///  [6]  CMP  X30, X16             ; match?
-///  [7]  B.EQ .Lstore              ; -> [12]
-///  [8]  ADD  X17, X17, #16        ; next entry
-///  [9]  B    .Lloop               ; -> [3]
-/// [10]  LDR  X17, [PC, #off]      ; .Lfallback: reload TLS table base
-/// [11]  LDR  X30, [X17, #0]       ; entry[0].guest_tpidr
-/// [12]  STR  X30, [SP, #24]       ; .Lstore: store result for caller
-/// [13]  LDR  X30, [SP, #32]       ; restore BL return addr
-/// [14]  RET
-/// ```
-const SHARED_MRS_READ_HANDLER_INSN_COUNT: usize = 15;
-
-/// Size in bytes of the shared MRS read handler.
-const SHARED_MRS_READ_HANDLER_SIZE: usize = SHARED_MRS_READ_HANDLER_INSN_COUNT * 4; // 60
-
-/// Number of instructions in each per-site MRS read gate (general case: 9 insns, 36 bytes).
-///
-/// ```text
-/// [0] SUB  SP, SP, #48           ; 48-byte frame
-/// [1] STP  X16, X17, [SP]        ; save X16, X17
-/// [2] STR  X30, [SP, #16]        ; save guest LR
-/// [3] BL   shared_mrs_read_handler
-/// [4] LDR  Rd, [SP, #24]         ; load guest_tpidr into destination
-/// [5] LDP  X16, X17, [SP]        ; restore X16, X17
-/// [6] LDR  X30, [SP, #16]        ; restore guest LR
-/// [7] ADD  SP, SP, #48           ; deallocate frame
-/// [8] B    <return_addr>          ; branch back to site.vaddr + 4
+/// [0] STP  X16, X17, [SP, #-16]!  ; save scratch
+/// [1] LDR  X16, [PC, #off]        ; X16 = TLS table address
+/// [2] LDR  Xd,  [X16, #0]         ; Xd = entry[0].guest_tpidr
+/// [3] LDP  X16, X17, [SP], #16    ; restore scratch
+/// [4] B    <return_addr>           ; back to guest
 /// ```
 ///
-/// Special register cases (X16, X17, X30) use 10 instructions (40 bytes).
-const MRS_READ_GATE_INSN_COUNT: usize = 9;
+/// When Xd = X16: use X17 as sole scratch (STR/LDR instead of STP/LDP).
+/// When Xd = X17: use X16 as sole scratch.
+/// All cases are 5 instructions / 20 bytes.
+const MRS_GATE_INSN_COUNT: usize = 5;
 
-/// Size in bytes of each per-site MRS read gate (general case).
-const MRS_READ_GATE_SIZE: usize = MRS_READ_GATE_INSN_COUNT * 4; // 36
-
-/// Size in bytes of each per-site MRS read gate for special registers (X16, X17, X30).
-const MRS_READ_GATE_SPECIAL_SIZE: usize = (MRS_READ_GATE_INSN_COUNT + 1) * 4; // 40
+/// Size in bytes of each per-site MRS gate.
+const MRS_GATE_SIZE: usize = MRS_GATE_INSN_COUNT * 4; // 20
 
 /// ARM64 NOP instruction.
 #[allow(dead_code)] // May be used for padding in future
@@ -204,11 +190,8 @@ const SHARED_SVC_HANDLER_OFFSET: usize = SIGRETURN_GATE_OFFSET + SVC_GATE_SIZE; 
 /// Offset where the shared MSR handler begins.
 const SHARED_MSR_HANDLER_OFFSET: usize = SHARED_SVC_HANDLER_OFFSET + SHARED_SVC_HANDLER_SIZE; // 120
 
-/// Offset where the shared MRS read handler begins.
-const SHARED_MRS_READ_HANDLER_OFFSET: usize = SHARED_MSR_HANDLER_OFFSET + SHARED_MSR_HANDLER_SIZE; // 184
-
-/// Offset where per-site gates begin (after shared MRS read handler).
-const GATES_START_OFFSET: usize = SHARED_MRS_READ_HANDLER_OFFSET + SHARED_MRS_READ_HANDLER_SIZE; // 244
+/// Offset where per-site gates begin (after shared MSR handler).
+const GATES_START_OFFSET: usize = SHARED_MSR_HANDLER_OFFSET + SHARED_MSR_HANDLER_SIZE; // 196
 
 // ============================================================
 // Instruction encoders
@@ -572,6 +555,90 @@ fn encode_ldp_offset(rt: u8, rt2: u8, rn: u8, imm_bytes: i16) -> Option<u32> {
     )
 }
 
+/// Encode `STP Xt1, Xt2, [Xn, #imm]!` (store pair, 64-bit, pre-index).
+///
+/// Stores two 64-bit registers and updates the base register with base + offset.
+/// The offset must be a multiple of 8 and within [-512, 504].
+///
+/// Encoding: opc=10, V=0, type=011 (pre-index), L=0 (store), imm7=offset/8, Rt2, Rn, Rt
+fn encode_stp_pre_index(rt: u8, rt2: u8, rn: u8, imm_bytes: i16) -> Option<u32> {
+    if imm_bytes % 8 != 0 {
+        return None;
+    }
+    let imm7 = imm_bytes / 8;
+    if !(-64..=63).contains(&imm7) {
+        return None;
+    }
+    #[allow(clippy::cast_sign_loss)]
+    let imm7_u = (imm7 as u32) & 0x7F;
+    // 10_101_0_011_0_imm7_Rt2_Rn_Rt
+    // = 0xA9800000 | (imm7 << 15) | (Rt2 << 10) | (Rn << 5) | Rt
+    Some(
+        0xA980_0000
+            | (imm7_u << 15)
+            | (u32::from(rt2) << 10)
+            | (u32::from(rn) << 5)
+            | u32::from(rt),
+    )
+}
+
+/// Encode `LDP Xt1, Xt2, [Xn], #imm` (load pair, 64-bit, post-index).
+///
+/// Loads two 64-bit values then updates the base register with base + offset.
+/// The offset must be a multiple of 8 and within [-512, 504].
+///
+/// Encoding: opc=10, V=0, type=001 (post-index), L=1 (load), imm7=offset/8, Rt2, Rn, Rt
+fn encode_ldp_post_index(rt: u8, rt2: u8, rn: u8, imm_bytes: i16) -> Option<u32> {
+    if imm_bytes % 8 != 0 {
+        return None;
+    }
+    let imm7 = imm_bytes / 8;
+    if !(-64..=63).contains(&imm7) {
+        return None;
+    }
+    #[allow(clippy::cast_sign_loss)]
+    let imm7_u = (imm7 as u32) & 0x7F;
+    // 10_101_0_001_1_imm7_Rt2_Rn_Rt
+    // = 0xA8C00000 | (imm7 << 15) | (Rt2 << 10) | (Rn << 5) | Rt
+    Some(
+        0xA8C0_0000
+            | (imm7_u << 15)
+            | (u32::from(rt2) << 10)
+            | (u32::from(rn) << 5)
+            | u32::from(rt),
+    )
+}
+
+/// Encode `STR Xt, [Xn, #simm]!` (store register, 64-bit, pre-index).
+///
+/// The offset must be within [-256, 255].
+///
+/// Encoding: size=11, V=0, opc=00 (store), imm9, pre-index=11, Rn, Rt
+fn encode_str_pre_index(rt: u8, rn: u8, imm_bytes: i16) -> Option<u32> {
+    if !(-256..=255).contains(&imm_bytes) {
+        return None;
+    }
+    #[allow(clippy::cast_sign_loss)]
+    let imm9 = (imm_bytes as u32) & 0x1FF;
+    // 11_111_000_00_0_imm9_11_Rn_Rt
+    Some(0xF800_0C00 | (imm9 << 12) | (u32::from(rn) << 5) | u32::from(rt))
+}
+
+/// Encode `LDR Xt, [Xn], #simm` (load register, 64-bit, post-index).
+///
+/// The offset must be within [-256, 255].
+///
+/// Encoding: size=11, V=0, opc=01 (load), imm9, post-index=01, Rn, Rt
+fn encode_ldr_post_index(rt: u8, rn: u8, imm_bytes: i16) -> Option<u32> {
+    if !(-256..=255).contains(&imm_bytes) {
+        return None;
+    }
+    #[allow(clippy::cast_sign_loss)]
+    let imm9 = (imm_bytes as u32) & 0x1FF;
+    // 11_111_000_01_0_imm9_01_Rn_Rt
+    Some(0xF840_0400 | (imm9 << 12) | (u32::from(rn) << 5) | u32::from(rt))
+}
+
 /// Encode `BL` (branch with link) instruction to a PC-relative offset.
 ///
 /// The offset must be a multiple of 4 and within ±128MB (signed 26-bit instruction count).
@@ -620,10 +687,12 @@ enum PatchKind {
     MsrTpidr(u8),
     /// `MRS Xd, TPIDR_EL0` — thread pointer read.
     /// The `u8` is the destination register number (0-30 for X0-X30, 31 for XZR).
+    /// Rewritten to read from TLS table entry[0] instead of the hardware register.
     MrsTpidr(u8),
 }
 
-/// Scan executable sections for `SVC #0`, `MSR TPIDR_EL0, Xt`, and `MRS Xd, TPIDR_EL0` instructions.
+/// Scan executable sections for `SVC #0`, `MSR TPIDR_EL0, Xt`, and
+/// `MRS Xd, TPIDR_EL0` instructions.
 ///
 /// ARM64 instructions are always 4-byte aligned, so we scan in 4-byte steps.
 /// Returns patch sites sorted by file offset.
@@ -674,12 +743,18 @@ fn find_patch_sites(sections: &[TextSectionInfo], buf: &[u8]) -> Result<Vec<Patc
 // Main hooking function
 // ============================================================
 
-/// Hook all `SVC #0` instructions in an AArch64 ELF binary.
+/// Hook all `SVC #0`, `MSR TPIDR_EL0`, and `MRS Xd, TPIDR_EL0` instructions
+/// in an AArch64 ELF binary.
 ///
 /// This function:
-/// 1. Scans for SVC #0 and MSR TPIDR_EL0 instructions in executable sections
+/// 1. Scans for SVC #0, MSR TPIDR_EL0, and MRS TPIDR_EL0 instructions
 /// 2. Builds a shared trampoline with header, shared handlers, and per-site gates
 /// 3. Patches each instruction with a `B` (branch) to its per-site gate
+///
+/// On macOS, TPIDR_EL0 is clobbered by preemptive context switches, so both
+/// MSR (writes) and MRS (reads) must be rewritten. MSR gates update the TLS
+/// table via the shared MSR handler; MRS gates read `entry[0].guest_tpidr`
+/// directly from the TLS table.
 ///
 /// Returns `(trampoline_data, found_any_syscalls)`.
 ///
@@ -691,11 +766,10 @@ fn find_patch_sites(sections: &[TextSectionInfo], buf: &[u8]) -> Result<Vec<Patc
 /// Offset 16:    [8 bytes]   Sigreturn preamble (MOV X8, #139 + B .+4)
 /// Offset 24:    [24 bytes]  Sigreturn SVC gate
 /// Offset 48:    [72 bytes]  Shared SVC handler (with sentinel fallback)
-/// Offset 120:   [64 bytes]  Shared MSR handler
-/// Offset 184:   [60 bytes]  Shared MRS read handler
-/// Offset 244:   Per-site SVC gates (24 bytes each)
+/// Offset 120:   [76 bytes]  Shared MSR handler (with sentinel entry[0] write)
+/// Offset 196:   Per-site SVC gates (24 bytes each)
 ///               Per-site MSR gates (36-40 bytes each)
-///               Per-site MRS read gates (36-40 bytes each)
+///               Per-site MRS gates (20 bytes each)
 /// ```
 pub(crate) fn hook_syscalls_aarch64(
     buf: &mut [u8],
@@ -708,8 +782,12 @@ pub(crate) fn hook_syscalls_aarch64(
 
     // Check if there are any SVC instructions to patch
     let has_svc = sites.iter().any(|s| s.kind == PatchKind::Svc);
-    if !has_svc {
-        // No SVC instructions found. Produce a minimal trampoline containing
+    let has_tpidr_sites = sites
+        .iter()
+        .any(|s| matches!(s.kind, PatchKind::MsrTpidr(_) | PatchKind::MrsTpidr(_)));
+
+    if !has_svc && !has_tpidr_sites {
+        // No patch sites at all. Produce a minimal trampoline containing
         // the full shared layout (header + sigreturn gate + shared handlers).
         // This is needed for dynamically linked binaries where all syscalls are in
         // shared libraries — the rtld_audit library reads the callback address from
@@ -754,19 +832,10 @@ pub(crate) fn hook_syscalls_aarch64(
 
         debug_assert_eq!(trampoline_data.len(), SHARED_MSR_HANDLER_OFFSET);
 
-        // Offset 120: shared MSR handler (64 bytes)
+        // Offset 120: shared MSR handler (76 bytes)
         emit_shared_msr_handler(
             &mut trampoline_data,
             SHARED_MSR_HANDLER_OFFSET,
-            trampoline_base_addr,
-        )?;
-
-        debug_assert_eq!(trampoline_data.len(), SHARED_MRS_READ_HANDLER_OFFSET);
-
-        // Offset 184: shared MRS read handler (60 bytes)
-        emit_shared_mrs_read_handler(
-            &mut trampoline_data,
-            SHARED_MRS_READ_HANDLER_OFFSET,
             trampoline_base_addr,
         )?;
 
@@ -818,19 +887,10 @@ pub(crate) fn hook_syscalls_aarch64(
 
     debug_assert_eq!(trampoline_data.len(), SHARED_MSR_HANDLER_OFFSET);
 
-    // Offset 120: shared MSR handler (64 bytes)
+    // Offset 120: shared MSR handler (76 bytes)
     emit_shared_msr_handler(
         &mut trampoline_data,
         SHARED_MSR_HANDLER_OFFSET,
-        trampoline_base_addr,
-    )?;
-
-    debug_assert_eq!(trampoline_data.len(), SHARED_MRS_READ_HANDLER_OFFSET);
-
-    // Offset 184: shared MRS read handler (60 bytes)
-    emit_shared_mrs_read_handler(
-        &mut trampoline_data,
-        SHARED_MRS_READ_HANDLER_OFFSET,
         trampoline_base_addr,
     )?;
 
@@ -860,7 +920,7 @@ pub(crate) fn hook_syscalls_aarch64(
                 )?;
             }
             PatchKind::MrsTpidr(rd) => {
-                emit_mrs_read_gate(
+                emit_mrs_gate(
                     &mut trampoline_data,
                     gate_offset,
                     trampoline_base_addr,
@@ -883,7 +943,7 @@ pub(crate) fn hook_syscalls_aarch64(
         buf[site.file_offset..site.file_offset + 4].copy_from_slice(&b_insn.to_le_bytes());
     }
 
-    Ok((trampoline_data, true))
+    Ok((trampoline_data, has_svc))
 }
 
 /// Emit the shared SVC handler (20 instructions, 80 bytes).
@@ -1164,11 +1224,16 @@ fn emit_svc_gate(
     Ok(())
 }
 
-/// Emit the shared MSR handler (23 instructions, 92 bytes).
+/// Emit the shared MSR handler (19 instructions, 76 bytes).
 ///
 /// This handler is shared by all MSR gates. It uses linear scan to find
 /// the old TLS entry and updates it with the new guest TPIDR value, then
 /// executes the actual MSR instruction.
+///
+/// On the sentinel path (no match found — e.g. macOS clobbered TPIDR_EL0),
+/// the new guest_tpidr is written to entry\[0\] so that the SVC handler's
+/// fallback path and the signal handler's fault-and-reinstall logic can
+/// find the correct value.
 ///
 /// At entry (from per-site MSR gate via BL):
 /// - SP decremented by 48, with frame:
@@ -1222,14 +1287,13 @@ fn emit_shared_msr_handler(
     trampoline_data.extend_from_slice(&encode_cmn_imm(30, 1).expect("imm12=1 fits").to_le_bytes());
     insn_idx += 1;
 
-    // [5] B.EQ .Lsentinel -> [12]
+    // [5] B.EQ .Lsentinel -> [13]
     //
-    // On the sentinel path (no existing entry matches the old TPIDR), skip
-    // the table update at [11]. This prevents writing a phantom entry with
-    // host_tls=0 when TPIDR_EL0 has been clobbered (e.g., by macOS signal
-    // delivery). The actual MSR TPIDR_EL0 at [13] still executes correctly
-    // since it loads the new TPIDR from [SP, #24].
-    let sentinel_idx = 12usize;
+    // On the sentinel path (no existing entry matches the old TPIDR — e.g.,
+    // macOS clobbered TPIDR_EL0 on signal delivery), we still write the new
+    // guest_tpidr to entry[0] so that subsequent SVC handler fallback reads
+    // and fault-and-reinstall logic can find the correct value.
+    let sentinel_idx = 13usize;
     let beq_sentinel_offset = (sentinel_idx as i64 - insn_idx as i64) * 4;
     let beq_sentinel = encode_b_cond(COND_EQ, beq_sentinel_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
@@ -1289,8 +1353,31 @@ fn emit_shared_msr_handler(
     );
     insn_idx += 1;
 
-    // [12] .Lsentinel: LDR X16, [SP, #24] — new TPIDR
+    // [12] B .Lmsr -> [16] — skip sentinel path, go to MSR
+    let msr_idx = 16usize;
+    let b_msr_offset = (msr_idx as i64 - insn_idx as i64) * 4;
+    let b_msr = encode_b(b_msr_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "B offset {b_msr_offset:#x} out of range in shared MSR handler found->msr"
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&b_msr.to_le_bytes());
+    insn_idx += 1;
+
+    // [13] .Lsentinel: LDR X17, [PC, #offset] — reload TLS table base
     debug_assert_eq!(insn_idx, sentinel_idx);
+    let sentinel_ldr_vaddr = insn_vaddr(insn_idx);
+    let sentinel_ldr_offset = tls_table_vaddr.cast_signed() - sentinel_ldr_vaddr.cast_signed();
+    let sentinel_ldr_insn =
+        encode_ldr_literal(17, sentinel_ldr_offset).ok_or_else(|| {
+            Error::DisassemblyFailure(format!(
+                "LDR literal offset {sentinel_ldr_offset:#x} out of range for MSR handler sentinel TLS reload"
+            ))
+        })?;
+    trampoline_data.extend_from_slice(&sentinel_ldr_insn.to_le_bytes());
+    insn_idx += 1;
+
+    // [14] LDR X16, [SP, #24] — new TPIDR
     trampoline_data.extend_from_slice(
         &encode_ldr_imm_unsigned(16, 31, 24)
             .expect("offset 24 valid")
@@ -1298,11 +1385,20 @@ fn emit_shared_msr_handler(
     );
     insn_idx += 1;
 
-    // [13] MSR TPIDR_EL0, X16
+    // [15] STR X16, [X17, #0] — write entry[0].guest_tpidr
+    trampoline_data.extend_from_slice(
+        &encode_str_imm_unsigned(16, 17, 0)
+            .expect("offset 0 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [16] .Lmsr: MSR TPIDR_EL0, X16
+    debug_assert_eq!(insn_idx, msr_idx);
     trampoline_data.extend_from_slice(&encode_msr_tpidr_el0(16).to_le_bytes());
     insn_idx += 1;
 
-    // [14] LDR X30, [SP, #32] — restore BL return addr
+    // [17] LDR X30, [SP, #32] — restore BL return addr
     trampoline_data.extend_from_slice(
         &encode_ldr_imm_unsigned(30, 31, 32)
             .expect("offset 32 valid")
@@ -1310,7 +1406,7 @@ fn emit_shared_msr_handler(
     );
     insn_idx += 1;
 
-    // [15] RET
+    // [18] RET
     trampoline_data.extend_from_slice(&encode_ret(30).to_le_bytes());
     insn_idx += 1;
 
@@ -1487,183 +1583,23 @@ fn emit_msr_gate(
     Ok(())
 }
 
-/// Compute the size of a per-site MRS read gate for the given destination register.
+/// Emit a per-site MRS gate for `MRS Xd, TPIDR_EL0`.
 ///
-/// Special registers (X16, X17, X30) need an extra instruction to move the
-/// result from `[SP, #24]` through a scratch before restoring clobbers it,
-/// resulting in 40 bytes. All other registers use 36 bytes.
-fn mrs_read_gate_size(rd: u8) -> usize {
-    match rd {
-        16 | 17 | 30 => MRS_READ_GATE_SPECIAL_SIZE,
-        _ => MRS_READ_GATE_SIZE,
-    }
-}
-
-/// Emit the shared MRS read handler (15 instructions, 60 bytes).
+/// Reads `entry[0].guest_tpidr` directly from the TLS lookup table.
+/// Self-contained (no shared handler needed). 5 instructions / 20 bytes.
 ///
-/// This handler is shared by all MRS read gates. It uses linear scan to find
-/// the TLS entry whose guest_tpidr matches the current TPIDR_EL0 value, and
-/// stores the guest_tpidr into `[SP, #24]` for the caller to load.
+/// **General case (Xd ∉ {X16, X17}):**
+/// ```text
+/// [0] STP  X16, X17, [SP, #-16]!  ; save scratch
+/// [1] LDR  X16, [PC, #off]        ; X16 = TLS table address
+/// [2] LDR  Xd,  [X16, #0]         ; Xd = entry[0].guest_tpidr
+/// [3] LDP  X16, X17, [SP], #16    ; restore scratch
+/// [4] B    <return_addr>
+/// ```
 ///
-/// On macOS, TPIDR_EL0 is clobbered by the kernel, so the scan may hit the
-/// sentinel. The fallback path returns entry\[0\].guest_tpidr.
-///
-/// At entry (from per-site MRS read gate via BL):
-/// - SP decremented by 48, with frame:
-///   `[0]=X16, [8]=X17, [16]=guest_LR`
-/// - X30 = return-to-gate address (from BL)
-/// - [SP, #32] available for saving BL return address
-/// - [SP, #24] is the output slot for the guest_tpidr result
-#[allow(clippy::cast_possible_wrap)]
-fn emit_shared_mrs_read_handler(
-    trampoline_data: &mut Vec<u8>,
-    handler_offset: usize,
-    trampoline_base_addr: u64,
-) -> Result<()> {
-    let handler_vaddr = trampoline_base_addr + handler_offset as u64;
-    let mut insn_idx: usize = 0;
-    let insn_vaddr = |idx: usize| -> u64 { handler_vaddr + (idx as u64) * 4 };
-    let tls_table_vaddr = trampoline_base_addr + HEADER_TLS_TABLE_OFFSET as u64;
-
-    // [0] STR X30, [SP, #32] — save BL return addr
-    trampoline_data.extend_from_slice(
-        &encode_str_imm_unsigned(30, 31, 32)
-            .expect("offset 32 valid")
-            .to_le_bytes(),
-    );
-    insn_idx += 1;
-
-    // [1] MRS X16, TPIDR_EL0 — current TPIDR (may be clobbered)
-    trampoline_data.extend_from_slice(&encode_mrs_tpidr_el0(16).to_le_bytes());
-    insn_idx += 1;
-
-    // [2] LDR X17, [PC, #offset] — X17 = TLS table base
-    let ldr_tls_vaddr = insn_vaddr(insn_idx);
-    let ldr_tls_offset = tls_table_vaddr.cast_signed() - ldr_tls_vaddr.cast_signed();
-    let ldr_tls_insn = encode_ldr_literal(17, ldr_tls_offset).ok_or_else(|| {
-        Error::DisassemblyFailure(format!(
-            "LDR literal offset {ldr_tls_offset:#x} out of range for shared MRS read handler TLS load"
-        ))
-    })?;
-    trampoline_data.extend_from_slice(&ldr_tls_insn.to_le_bytes());
-    insn_idx += 1;
-
-    // [3] .Lloop: LDR X30, [X17, #0] — X30 = entry.guest_tpidr (scratch)
-    let loop_idx = insn_idx;
-    trampoline_data.extend_from_slice(
-        &encode_ldr_imm_unsigned(30, 17, 0)
-            .expect("offset 0 valid")
-            .to_le_bytes(),
-    );
-    insn_idx += 1;
-
-    // [4] CMN X30, #1 — sentinel?
-    trampoline_data.extend_from_slice(&encode_cmn_imm(30, 1).expect("imm12=1 fits").to_le_bytes());
-    insn_idx += 1;
-
-    // [5] B.EQ .Lfallback -> [10]
-    let fallback_idx = 10usize;
-    let beq_fallback_offset = (fallback_idx as i64 - insn_idx as i64) * 4;
-    let beq_fallback = encode_b_cond(COND_EQ, beq_fallback_offset).ok_or_else(|| {
-        Error::DisassemblyFailure(format!(
-            "B.EQ offset {beq_fallback_offset:#x} out of range in shared MRS read handler"
-        ))
-    })?;
-    trampoline_data.extend_from_slice(&beq_fallback.to_le_bytes());
-    insn_idx += 1;
-
-    // [6] CMP X30, X16 — match current TPIDR?
-    trampoline_data.extend_from_slice(&encode_cmp_reg(30, 16).to_le_bytes());
-    insn_idx += 1;
-
-    // [7] B.EQ .Lstore -> [12]
-    let store_idx = 12usize;
-    let beq_store_offset = (store_idx as i64 - insn_idx as i64) * 4;
-    let beq_store = encode_b_cond(COND_EQ, beq_store_offset).ok_or_else(|| {
-        Error::DisassemblyFailure(format!(
-            "B.EQ offset {beq_store_offset:#x} out of range in shared MRS read handler"
-        ))
-    })?;
-    trampoline_data.extend_from_slice(&beq_store.to_le_bytes());
-    insn_idx += 1;
-
-    // [8] ADD X17, X17, #16 — next entry
-    trampoline_data.extend_from_slice(
-        &encode_add_imm(17, 17, 16)
-            .expect("imm12=16 fits")
-            .to_le_bytes(),
-    );
-    insn_idx += 1;
-
-    // [9] B .Lloop -> [3]
-    let b_loop_offset = (loop_idx as i64 - insn_idx as i64) * 4;
-    let b_loop = encode_b(b_loop_offset).ok_or_else(|| {
-        Error::DisassemblyFailure(format!(
-            "B offset {b_loop_offset:#x} out of range in shared MRS read handler loop"
-        ))
-    })?;
-    trampoline_data.extend_from_slice(&b_loop.to_le_bytes());
-    insn_idx += 1;
-
-    // [10] .Lfallback: LDR X17, [PC, #offset] — reload TLS table base
-    debug_assert_eq!(insn_idx, fallback_idx);
-    let fallback_ldr_vaddr = insn_vaddr(insn_idx);
-    let fallback_ldr_offset = tls_table_vaddr.cast_signed() - fallback_ldr_vaddr.cast_signed();
-    let fallback_ldr_insn =
-        encode_ldr_literal(17, fallback_ldr_offset).ok_or_else(|| {
-            Error::DisassemblyFailure(format!(
-                "LDR literal offset {fallback_ldr_offset:#x} out of range for MRS read handler fallback TLS load"
-            ))
-        })?;
-    trampoline_data.extend_from_slice(&fallback_ldr_insn.to_le_bytes());
-    insn_idx += 1;
-
-    // [11] LDR X30, [X17, #0] — entry[0].guest_tpidr
-    trampoline_data.extend_from_slice(
-        &encode_ldr_imm_unsigned(30, 17, 0)
-            .expect("offset 0 valid")
-            .to_le_bytes(),
-    );
-    insn_idx += 1;
-
-    // [12] .Lstore: STR X30, [SP, #24] — store result for caller
-    debug_assert_eq!(insn_idx, store_idx);
-    trampoline_data.extend_from_slice(
-        &encode_str_imm_unsigned(30, 31, 24)
-            .expect("offset 24 valid")
-            .to_le_bytes(),
-    );
-    insn_idx += 1;
-
-    // [13] LDR X30, [SP, #32] — restore BL return addr
-    trampoline_data.extend_from_slice(
-        &encode_ldr_imm_unsigned(30, 31, 32)
-            .expect("offset 32 valid")
-            .to_le_bytes(),
-    );
-    insn_idx += 1;
-
-    // [14] RET
-    trampoline_data.extend_from_slice(&encode_ret(30).to_le_bytes());
-    insn_idx += 1;
-
-    debug_assert_eq!(insn_idx, SHARED_MRS_READ_HANDLER_INSN_COUNT);
-    debug_assert_eq!(
-        trampoline_data.len() - handler_offset,
-        SHARED_MRS_READ_HANDLER_SIZE,
-        "Shared MRS read handler size mismatch"
-    );
-
-    Ok(())
-}
-
-/// Emit a per-site MRS read gate (9-10 instructions, 36-40 bytes).
-///
-/// This gate saves registers, calls the shared MRS read handler via BL,
-/// loads the guest_tpidr result into the destination register, restores
-/// registers, and branches back to guest code.
-#[allow(clippy::cast_possible_wrap)]
-fn emit_mrs_read_gate(
+/// **Xd = X16:** use X17 as sole scratch
+/// **Xd = X17:** use X16 as sole scratch
+fn emit_mrs_gate(
     trampoline_data: &mut Vec<u8>,
     gate_offset: usize,
     trampoline_base_addr: u64,
@@ -1671,142 +1607,123 @@ fn emit_mrs_read_gate(
     rd: u8,
 ) -> Result<()> {
     let gate_vaddr = trampoline_base_addr + gate_offset as u64;
-    let gate_size = mrs_read_gate_size(rd);
-    let gate_insn_count = gate_size / 4;
     let mut insn_idx: usize = 0;
     let insn_vaddr = |idx: usize| -> u64 { gate_vaddr + (idx as u64) * 4 };
+    let tls_table_vaddr = trampoline_base_addr + HEADER_TLS_TABLE_OFFSET as u64;
 
-    // [0] SUB SP, SP, #48
-    trampoline_data.extend_from_slice(&encode_sub_sp_imm(48).expect("imm12=48 fits").to_le_bytes());
-    insn_idx += 1;
+    if rd == 16 {
+        // Xd = X16: use X17 as sole scratch register
+        // [0] STR X17, [SP, #-16]!
+        trampoline_data
+            .extend_from_slice(&encode_str_pre_index(17, 31, -16).unwrap().to_le_bytes());
+        insn_idx += 1;
 
-    // [1] STP X16, X17, [SP]
-    trampoline_data.extend_from_slice(
-        &encode_stp_offset(16, 17, 31, 0)
-            .expect("offset 0 valid")
-            .to_le_bytes(),
-    );
-    insn_idx += 1;
+        // [1] LDR X17, [PC, #off] — TLS table address
+        let ldr_vaddr = insn_vaddr(insn_idx);
+        let ldr_offset = tls_table_vaddr.cast_signed() - ldr_vaddr.cast_signed();
+        let ldr_insn = encode_ldr_literal(17, ldr_offset).ok_or_else(|| {
+            Error::DisassemblyFailure(format!(
+                "LDR literal offset {ldr_offset:#x} out of range for MRS gate TLS load at {:#x}",
+                site.vaddr
+            ))
+        })?;
+        trampoline_data.extend_from_slice(&ldr_insn.to_le_bytes());
+        insn_idx += 1;
 
-    // [2] STR X30, [SP, #16]
-    trampoline_data.extend_from_slice(
-        &encode_str_imm_unsigned(30, 31, 16)
-            .expect("offset 16 valid")
-            .to_le_bytes(),
-    );
-    insn_idx += 1;
+        // [2] LDR X16, [X17, #0] — entry[0].guest_tpidr
+        trampoline_data.extend_from_slice(
+            &encode_ldr_imm_unsigned(16, 17, 0)
+                .expect("offset 0 valid")
+                .to_le_bytes(),
+        );
+        insn_idx += 1;
 
-    // [3] BL shared_mrs_read_handler
-    let bl_vaddr = insn_vaddr(insn_idx);
-    let handler_vaddr = trampoline_base_addr + SHARED_MRS_READ_HANDLER_OFFSET as u64;
-    let bl_offset = handler_vaddr.cast_signed() - bl_vaddr.cast_signed();
-    let bl_insn = encode_bl(bl_offset).ok_or_else(|| {
-        Error::DisassemblyFailure(format!(
-            "BL offset {bl_offset:#x} out of range for MRS read gate -> shared handler at {:#x}",
-            site.vaddr
-        ))
-    })?;
-    trampoline_data.extend_from_slice(&bl_insn.to_le_bytes());
-    insn_idx += 1;
+        // [3] LDR X17, [SP], #16 — restore X17
+        trampoline_data
+            .extend_from_slice(&encode_ldr_post_index(17, 31, 16).unwrap().to_le_bytes());
+        insn_idx += 1;
+    } else if rd == 17 {
+        // Xd = X17: use X16 as sole scratch register
+        // [0] STR X16, [SP, #-16]!
+        trampoline_data
+            .extend_from_slice(&encode_str_pre_index(16, 31, -16).unwrap().to_le_bytes());
+        insn_idx += 1;
 
-    // [4] (or [4]-[5] for special regs) Load result from [SP, #24] into Rd
-    match rd {
-        16 => {
-            // Rd is X16 which will be restored from [SP, #0]. Load result into
-            // scratch (X30, already saved), then store to [SP, #0] so LDP restores it.
-            trampoline_data.extend_from_slice(
-                &encode_ldr_imm_unsigned(30, 31, 24)
-                    .expect("valid")
-                    .to_le_bytes(),
-            );
-            insn_idx += 1;
-            trampoline_data.extend_from_slice(
-                &encode_str_imm_unsigned(30, 31, 0)
-                    .expect("valid")
-                    .to_le_bytes(),
-            );
-            insn_idx += 1;
-        }
-        17 => {
-            // Rd is X17 which will be restored from [SP, #8]. Load result into
-            // scratch (X30, already saved), then store to [SP, #8].
-            trampoline_data.extend_from_slice(
-                &encode_ldr_imm_unsigned(30, 31, 24)
-                    .expect("valid")
-                    .to_le_bytes(),
-            );
-            insn_idx += 1;
-            trampoline_data.extend_from_slice(
-                &encode_str_imm_unsigned(30, 31, 8)
-                    .expect("valid")
-                    .to_le_bytes(),
-            );
-            insn_idx += 1;
-        }
-        30 => {
-            // Rd is X30 which will be restored from [SP, #16]. Load result into
-            // scratch (X16, already saved), then store to [SP, #16].
-            trampoline_data.extend_from_slice(
-                &encode_ldr_imm_unsigned(16, 31, 24)
-                    .expect("valid")
-                    .to_le_bytes(),
-            );
-            insn_idx += 1;
-            trampoline_data.extend_from_slice(
-                &encode_str_imm_unsigned(16, 31, 16)
-                    .expect("valid")
-                    .to_le_bytes(),
-            );
-            insn_idx += 1;
-        }
-        _ => {
-            // General case: LDR Rd, [SP, #24]
-            trampoline_data.extend_from_slice(
-                &encode_ldr_imm_unsigned(rd, 31, 24)
-                    .expect("valid")
-                    .to_le_bytes(),
-            );
-            insn_idx += 1;
-        }
+        // [1] LDR X16, [PC, #off] — TLS table address
+        let ldr_vaddr = insn_vaddr(insn_idx);
+        let ldr_offset = tls_table_vaddr.cast_signed() - ldr_vaddr.cast_signed();
+        let ldr_insn = encode_ldr_literal(16, ldr_offset).ok_or_else(|| {
+            Error::DisassemblyFailure(format!(
+                "LDR literal offset {ldr_offset:#x} out of range for MRS gate TLS load at {:#x}",
+                site.vaddr
+            ))
+        })?;
+        trampoline_data.extend_from_slice(&ldr_insn.to_le_bytes());
+        insn_idx += 1;
+
+        // [2] LDR X17, [X16, #0] — entry[0].guest_tpidr
+        trampoline_data.extend_from_slice(
+            &encode_ldr_imm_unsigned(17, 16, 0)
+                .expect("offset 0 valid")
+                .to_le_bytes(),
+        );
+        insn_idx += 1;
+
+        // [3] LDR X16, [SP], #16 — restore X16
+        trampoline_data
+            .extend_from_slice(&encode_ldr_post_index(16, 31, 16).unwrap().to_le_bytes());
+        insn_idx += 1;
+    } else {
+        // General case: Xd ∉ {X16, X17}
+        // [0] STP X16, X17, [SP, #-16]!
+        trampoline_data
+            .extend_from_slice(&encode_stp_pre_index(16, 17, 31, -16).unwrap().to_le_bytes());
+        insn_idx += 1;
+
+        // [1] LDR X16, [PC, #off] — TLS table address
+        let ldr_vaddr = insn_vaddr(insn_idx);
+        let ldr_offset = tls_table_vaddr.cast_signed() - ldr_vaddr.cast_signed();
+        let ldr_insn = encode_ldr_literal(16, ldr_offset).ok_or_else(|| {
+            Error::DisassemblyFailure(format!(
+                "LDR literal offset {ldr_offset:#x} out of range for MRS gate TLS load at {:#x}",
+                site.vaddr
+            ))
+        })?;
+        trampoline_data.extend_from_slice(&ldr_insn.to_le_bytes());
+        insn_idx += 1;
+
+        // [2] LDR Xd, [X16, #0] — entry[0].guest_tpidr
+        trampoline_data.extend_from_slice(
+            &encode_ldr_imm_unsigned(rd, 16, 0)
+                .expect("offset 0 valid")
+                .to_le_bytes(),
+        );
+        insn_idx += 1;
+
+        // [3] LDP X16, X17, [SP], #16 — restore scratch
+        trampoline_data
+            .extend_from_slice(&encode_ldp_post_index(16, 17, 31, 16).unwrap().to_le_bytes());
+        insn_idx += 1;
     }
 
-    // [next] LDP X16, X17, [SP]
-    trampoline_data.extend_from_slice(
-        &encode_ldp_offset(16, 17, 31, 0)
-            .expect("offset 0 valid")
-            .to_le_bytes(),
-    );
-    insn_idx += 1;
-
-    // [next] LDR X30, [SP, #16]
-    trampoline_data.extend_from_slice(
-        &encode_ldr_imm_unsigned(30, 31, 16)
-            .expect("offset 16 valid")
-            .to_le_bytes(),
-    );
-    insn_idx += 1;
-
-    // [next] ADD SP, SP, #48
-    trampoline_data.extend_from_slice(&encode_add_sp_imm(48).expect("imm12=48 fits").to_le_bytes());
-    insn_idx += 1;
-
-    // [next] B <return_addr>
-    let ret_vaddr = insn_vaddr(insn_idx);
-    let ret_offset = (site.vaddr + 4).cast_signed() - ret_vaddr.cast_signed();
-    let ret_insn = encode_b(ret_offset).ok_or_else(|| {
+    // [4] B <return_addr> — branch back to instruction after original MRS
+    let return_vaddr = site.vaddr + 4; // instruction after the MRS
+    let b_vaddr = insn_vaddr(insn_idx);
+    let b_offset = return_vaddr.cast_signed() - b_vaddr.cast_signed();
+    let b_insn = encode_b(b_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
-            "B offset {ret_offset:#x} out of ±128MB range for return from MRS read gate at {:#x}",
+            "B offset {b_offset:#x} out of range for MRS gate return at {:#x}",
             site.vaddr
         ))
     })?;
-    trampoline_data.extend_from_slice(&ret_insn.to_le_bytes());
+    trampoline_data.extend_from_slice(&b_insn.to_le_bytes());
     insn_idx += 1;
 
-    debug_assert_eq!(insn_idx, gate_insn_count);
+    debug_assert_eq!(insn_idx, MRS_GATE_INSN_COUNT);
     debug_assert_eq!(
         trampoline_data.len() - gate_offset,
-        gate_size,
-        "MRS read gate size mismatch"
+        MRS_GATE_SIZE,
+        "MRS gate size mismatch"
     );
 
     Ok(())
@@ -2301,14 +2218,17 @@ mod tests {
         // Per-site SVC gate: 6 instructions, 24 bytes
         assert_eq!(SVC_GATE_SIZE, 24);
         assert_eq!(SVC_GATE_INSN_COUNT, 6);
-        // Shared MSR handler: 16 instructions, 64 bytes (linear scan)
-        assert_eq!(SHARED_MSR_HANDLER_SIZE, 64);
-        assert_eq!(SHARED_MSR_HANDLER_INSN_COUNT, 16);
+        // Shared MSR handler: 19 instructions, 76 bytes (linear scan + sentinel entry[0] write)
+        assert_eq!(SHARED_MSR_HANDLER_SIZE, 76);
+        assert_eq!(SHARED_MSR_HANDLER_INSN_COUNT, 19);
         // Per-site MSR gate: 9 instructions (general), 36 bytes
         assert_eq!(MSR_GATE_SIZE, 36);
         assert_eq!(MSR_GATE_INSN_COUNT, 9);
         // Per-site MSR gate (special regs): 10 instructions, 40 bytes
         assert_eq!(MSR_GATE_SPECIAL_SIZE, 40);
+        // Per-site MRS gate: 5 instructions, 20 bytes
+        assert_eq!(MRS_GATE_SIZE, 20);
+        assert_eq!(MRS_GATE_INSN_COUNT, 5);
     }
 
     #[test]
@@ -2967,8 +2887,8 @@ mod tests {
 
     #[test]
     fn test_shared_msr_handler_layout() {
-        // Verify the full shared MSR handler instruction layout
-        // Linear scan TLS lookup
+        // Verify the full shared MSR handler instruction layout (19 instructions)
+        // Linear scan TLS lookup with sentinel entry[0] write
         let (td, _, trampoline_base) = hook_with_svc_and_msr(19);
         let handler_start = SHARED_MSR_HANDLER_OFFSET;
         let handler_vaddr = trampoline_base + handler_start as u64;
@@ -2994,8 +2914,8 @@ mod tests {
         // [4] CMN X30, #1 -- sentinel?
         assert_eq!(insn_at(4), encode_cmn_imm(30, 1).unwrap());
 
-        // [5] B.EQ .Lsentinel -> [12]: offset = (12-5)*4 = 28
-        assert_eq!(insn_at(5), encode_b_cond(COND_EQ, 28).unwrap());
+        // [5] B.EQ .Lsentinel -> [13]: offset = (13-5)*4 = 32
+        assert_eq!(insn_at(5), encode_b_cond(COND_EQ, 32).unwrap());
 
         // [6] CMP X30, X16 -- match?
         assert_eq!(insn_at(6), encode_cmp_reg(30, 16));
@@ -3015,27 +2935,43 @@ mod tests {
         // [11] STR X16, [X17, #0] -- update entry (only from .Lfound)
         assert_eq!(insn_at(11), encode_str_imm_unsigned(16, 17, 0).unwrap());
 
-        // [12] .Lsentinel: LDR X16, [SP, #24] -- new TPIDR
-        assert_eq!(insn_at(12), encode_ldr_imm_unsigned(16, 31, 24).unwrap());
+        // [12] B .Lmsr -> [16]: offset = (16-12)*4 = 16
+        assert_eq!(insn_at(12), encode_b(16).unwrap());
 
-        // [13] MSR TPIDR_EL0, X16
-        assert_eq!(insn_at(13), encode_msr_tpidr_el0(16));
+        // [13] .Lsentinel: LDR X17, [PC, #offset] -- reload TLS table base
+        let sentinel_ldr_vaddr = handler_vaddr + 13 * 4;
+        let sentinel_tls_offset = (trampoline_base + 8) as i64 - sentinel_ldr_vaddr as i64;
+        assert_eq!(
+            insn_at(13),
+            encode_ldr_literal(17, sentinel_tls_offset).unwrap()
+        );
 
-        // [14] LDR X30, [SP, #32] -- restore
-        assert_eq!(insn_at(14), encode_ldr_imm_unsigned(30, 31, 32).unwrap());
+        // [14] LDR X16, [SP, #24] -- new TPIDR
+        assert_eq!(insn_at(14), encode_ldr_imm_unsigned(16, 31, 24).unwrap());
 
-        // [15] RET
-        assert_eq!(insn_at(15), encode_ret(30));
+        // [15] STR X16, [X17, #0] -- write entry[0].guest_tpidr
+        assert_eq!(insn_at(15), encode_str_imm_unsigned(16, 17, 0).unwrap());
+
+        // [16] .Lmsr: MSR TPIDR_EL0, X16
+        assert_eq!(insn_at(16), encode_msr_tpidr_el0(16));
+
+        // [17] LDR X30, [SP, #32] -- restore
+        assert_eq!(insn_at(17), encode_ldr_imm_unsigned(30, 31, 32).unwrap());
+
+        // [18] RET
+        assert_eq!(insn_at(18), encode_ret(30));
     }
 
     #[test]
-    fn test_hook_msr_only_produces_minimal_trampoline() {
-        // A binary with only MSR TPIDR_EL0 and no SVC should produce a minimal
-        // trampoline (no MSR sites are patched without at least one SVC, since the
-        // TLS table requires the callback mechanism).
+    fn test_hook_msr_only_produces_trampoline_with_gates() {
+        // A binary with only MSR TPIDR_EL0 and no SVC should produce a
+        // trampoline with shared layout + MSR gate. The MSR instruction
+        // should be patched with a branch to the gate.
         let msr_insn = encode_msr_tpidr_el0(19);
+        let nop: u32 = 0xD503201F;
         let mut buf = vec![0u8; 8];
         buf[0..4].copy_from_slice(&msr_insn.to_le_bytes());
+        buf[4..8].copy_from_slice(&nop.to_le_bytes());
 
         let sections = vec![TextSectionInfo {
             vaddr: 0x1000,
@@ -3044,73 +2980,32 @@ mod tests {
         }];
 
         let result = hook_syscalls_aarch64(&mut buf, &sections, 0x2000, 0);
-        let (trampoline_data, has_svc) = result.expect("should succeed with minimal trampoline");
+        let (trampoline_data, has_svc) = result.expect("should succeed");
         assert!(!has_svc, "should report no SVC found");
-        // MSR instruction should NOT be patched (no SVC means no callback mechanism)
-        assert_eq!(
+        // MSR instruction should be patched (replaced with a branch)
+        assert_ne!(
             u32::from_le_bytes(buf[0..4].try_into().unwrap()),
             msr_insn,
-            "MSR instruction should be left unpatched"
+            "MSR instruction should be patched with a branch"
         );
+        // Trampoline should be larger than GATES_START_OFFSET (has an MSR gate)
         assert_eq!(
             trampoline_data.len(),
-            GATES_START_OFFSET,
-            "minimal trampoline should be exactly GATES_START_OFFSET bytes"
+            GATES_START_OFFSET + MSR_GATE_SIZE,
+            "trampoline should contain shared layout + one MSR gate"
         );
     }
 
     // ============================================================
-    // MRS TPIDR_EL0 read tests
+    // MRS TPIDR_EL0 — rewritten to read from TLS table
     // ============================================================
-
-    /// Helper to build a buffer with one SVC and one MRS TPIDR_EL0 instruction,
-    /// then hook it and return the trampoline data.
-    fn hook_with_svc_and_mrs(mrs_rd: u8) -> (Vec<u8>, Vec<u8>, u64) {
-        let nop: u32 = 0xD503201F;
-        let mrs_insn = encode_mrs_tpidr_el0(mrs_rd);
-        let mut buf = vec![0u8; 16];
-        buf[0..4].copy_from_slice(&SVC_0.to_le_bytes()); // SVC at offset 0
-        buf[4..8].copy_from_slice(&nop.to_le_bytes());
-        buf[8..12].copy_from_slice(&mrs_insn.to_le_bytes()); // MRS at offset 8
-        buf[12..16].copy_from_slice(&nop.to_le_bytes());
-
-        let sections = vec![TextSectionInfo {
-            vaddr: 0x1000,
-            file_offset: 0,
-            size: 16,
-        }];
-
-        let trampoline_base = 0x2000u64;
-        let (td, found) =
-            hook_syscalls_aarch64(&mut buf, &sections, trampoline_base, 0xCAFE).unwrap();
-        assert!(found);
-        (td, buf, trampoline_base)
-    }
+    // MRS TPIDR_EL0 is rewritten to read entry[0].guest_tpidr from the TLS
+    // table. On macOS, TPIDR_EL0 can be clobbered by preemptive context
+    // switches, so native reads are unreliable.
 
     #[test]
-    fn test_find_patch_sites_mrs_tpidr() {
-        let mrs_x0 = encode_mrs_tpidr_el0(0);
-        let nop: u32 = 0xD503201F;
-        let mut buf = vec![0u8; 12];
-        buf[0..4].copy_from_slice(&nop.to_le_bytes());
-        buf[4..8].copy_from_slice(&mrs_x0.to_le_bytes());
-        buf[8..12].copy_from_slice(&nop.to_le_bytes());
-
-        let sections = vec![TextSectionInfo {
-            vaddr: 0x1000,
-            file_offset: 0,
-            size: 12,
-        }];
-
-        let sites = find_patch_sites(&sections, &buf).unwrap();
-        assert_eq!(sites.len(), 1);
-        assert_eq!(sites[0].kind, PatchKind::MrsTpidr(0));
-        assert_eq!(sites[0].vaddr, 0x1004);
-        assert_eq!(sites[0].file_offset, 4);
-    }
-
-    #[test]
-    fn test_find_patch_sites_mixed_svc_msr_mrs() {
+    fn test_find_patch_sites_mrs_tpidr_detected() {
+        // MRS TPIDR_EL0 is detected as a patch site alongside SVC and MSR
         let nop: u32 = 0xD503201F;
         let msr_x5 = encode_msr_tpidr_el0(5);
         let mrs_x10 = encode_mrs_tpidr_el0(10);
@@ -3128,224 +3023,22 @@ mod tests {
         }];
 
         let sites = find_patch_sites(&sections, &buf).unwrap();
-        assert_eq!(sites.len(), 3);
+        assert_eq!(sites.len(), 3, "should find SVC + MSR + MRS");
         assert_eq!(sites[0].kind, PatchKind::Svc);
         assert_eq!(sites[1].kind, PatchKind::MsrTpidr(5));
         assert_eq!(sites[2].kind, PatchKind::MrsTpidr(10));
     }
 
     #[test]
-    fn test_hook_svc_and_mrs_trampoline_sizes() {
-        let (td, _, _) = hook_with_svc_and_mrs(0);
-        // GATES_START_OFFSET (244) + SVC gate (24) + MRS read gate for X0 (36) = 304
-        assert_eq!(
-            td.len(),
-            GATES_START_OFFSET + SVC_GATE_SIZE + MRS_READ_GATE_SIZE
-        );
-    }
-
-    #[test]
-    fn test_hook_mrs_patches_original_instruction() {
-        let (_, buf, _) = hook_with_svc_and_mrs(0);
-        // The MRS at offset 8 should be patched to a B instruction
-        let patched = u32::from_le_bytes(buf[8..12].try_into().unwrap());
-        assert_eq!(
-            patched & 0xFC00_0000,
-            0x1400_0000,
-            "MRS should be patched to B"
-        );
-    }
-
-    #[test]
-    fn test_mrs_read_gate_prologue() {
-        let (td, _, _) = hook_with_svc_and_mrs(0);
-        // MRS read gate starts after the SVC gate
-        let mrs_start = GATES_START_OFFSET + SVC_GATE_SIZE;
-        let insn_at = |idx: usize| -> u32 {
-            let off = mrs_start + idx * 4;
-            u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
-        };
-
-        // [0] SUB SP, SP, #48
-        assert_eq!(insn_at(0), encode_sub_sp_imm(48).unwrap());
-        // [1] STP X16, X17, [SP]
-        assert_eq!(insn_at(1), encode_stp_offset(16, 17, 31, 0).unwrap());
-        // [2] STR X30, [SP, #16]
-        assert_eq!(insn_at(2), encode_str_imm_unsigned(30, 31, 16).unwrap());
-    }
-
-    #[test]
-    fn test_mrs_read_gate_load_result_generic_reg() {
-        // MRS TPIDR_EL0 -> X0 — generic register
-        let (td, _, _) = hook_with_svc_and_mrs(0);
-        let mrs_start = GATES_START_OFFSET + SVC_GATE_SIZE;
-        let insn_at = |idx: usize| -> u32 {
-            let off = mrs_start + idx * 4;
-            u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
-        };
-
-        // [3] BL shared_mrs_read_handler (tested separately)
-        // [4] LDR X0, [SP, #24]
-        assert_eq!(insn_at(4), encode_ldr_imm_unsigned(0, 31, 24).unwrap());
-    }
-
-    #[test]
-    fn test_mrs_read_gate_load_result_x16() {
-        // MRS TPIDR_EL0 -> X16 — saved reg, need extra instruction
-        let (td, _, _) = hook_with_svc_and_mrs(16);
-        // X16 is special: MRS read gate is 40 bytes
-        let mrs_start = GATES_START_OFFSET + SVC_GATE_SIZE;
-        let insn_at = |idx: usize| -> u32 {
-            let off = mrs_start + idx * 4;
-            u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
-        };
-
-        // [4] LDR X30, [SP, #24] (load result into scratch X30)
-        assert_eq!(insn_at(4), encode_ldr_imm_unsigned(30, 31, 24).unwrap());
-        // [5] STR X30, [SP, #0] (overwrite saved X16 so LDP restores the result)
-        assert_eq!(insn_at(5), encode_str_imm_unsigned(30, 31, 0).unwrap());
-    }
-
-    #[test]
-    fn test_mrs_read_gate_load_result_x17() {
-        // MRS TPIDR_EL0 -> X17 — saved reg, need extra instruction
-        let (td, _, _) = hook_with_svc_and_mrs(17);
-        let mrs_start = GATES_START_OFFSET + SVC_GATE_SIZE;
-        let insn_at = |idx: usize| -> u32 {
-            let off = mrs_start + idx * 4;
-            u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
-        };
-
-        // [4] LDR X30, [SP, #24]
-        assert_eq!(insn_at(4), encode_ldr_imm_unsigned(30, 31, 24).unwrap());
-        // [5] STR X30, [SP, #8] (overwrite saved X17)
-        assert_eq!(insn_at(5), encode_str_imm_unsigned(30, 31, 8).unwrap());
-    }
-
-    #[test]
-    fn test_mrs_read_gate_load_result_x30() {
-        // MRS TPIDR_EL0 -> X30 — saved reg, need extra instruction
-        let (td, _, _) = hook_with_svc_and_mrs(30);
-        let mrs_start = GATES_START_OFFSET + SVC_GATE_SIZE;
-        let insn_at = |idx: usize| -> u32 {
-            let off = mrs_start + idx * 4;
-            u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
-        };
-
-        // [4] LDR X16, [SP, #24] (load result into scratch X16)
-        assert_eq!(insn_at(4), encode_ldr_imm_unsigned(16, 31, 24).unwrap());
-        // [5] STR X16, [SP, #16] (overwrite saved X30)
-        assert_eq!(insn_at(5), encode_str_imm_unsigned(16, 31, 16).unwrap());
-    }
-
-    #[test]
-    fn test_mrs_read_gate_bl_and_epilogue() {
-        // Verify the full MRS read gate layout: BL to shared handler + epilogue
-        let (td, _, trampoline_base) = hook_with_svc_and_mrs(0);
-        let mrs_start = GATES_START_OFFSET + SVC_GATE_SIZE;
-        let gate_vaddr = trampoline_base + mrs_start as u64;
-        let insn_at = |idx: usize| -> u32 {
-            let off = mrs_start + idx * 4;
-            u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
-        };
-
-        // [3] BL shared_mrs_read_handler
-        let bl_vaddr = gate_vaddr + 3 * 4;
-        let handler_vaddr = trampoline_base + SHARED_MRS_READ_HANDLER_OFFSET as u64;
-        let bl_offset = handler_vaddr as i64 - bl_vaddr as i64;
-        assert_eq!(insn_at(3), encode_bl(bl_offset).unwrap());
-
-        // [4] LDR X0, [SP, #24] (result)
-        assert_eq!(insn_at(4), encode_ldr_imm_unsigned(0, 31, 24).unwrap());
-
-        // [5] LDP X16, X17, [SP]
-        assert_eq!(insn_at(5), encode_ldp_offset(16, 17, 31, 0).unwrap());
-
-        // [6] LDR X30, [SP, #16]
-        assert_eq!(insn_at(6), encode_ldr_imm_unsigned(30, 31, 16).unwrap());
-
-        // [7] ADD SP, SP, #48
-        assert_eq!(insn_at(7), encode_add_sp_imm(48).unwrap());
-
-        // [8] B <return_addr>
-        // MRS was at vaddr 0x1008, return to 0x100C
-        let b_ret_vaddr = gate_vaddr + 8 * 4;
-        let expected_offset = 0x100Ci64 - b_ret_vaddr as i64;
-        assert_eq!(insn_at(8), encode_b(expected_offset).unwrap());
-    }
-
-    #[test]
-    fn test_shared_mrs_read_handler_layout() {
-        // Verify the full shared MRS read handler instruction layout
-        let (td, _, trampoline_base) = hook_with_svc_and_mrs(0);
-        let handler_start = SHARED_MRS_READ_HANDLER_OFFSET;
-        let handler_vaddr = trampoline_base + handler_start as u64;
-        let insn_at = |idx: usize| -> u32 {
-            let off = handler_start + idx * 4;
-            u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
-        };
-
-        // [0] STR X30, [SP, #32]
-        assert_eq!(insn_at(0), encode_str_imm_unsigned(30, 31, 32).unwrap());
-
-        // [1] MRS X16, TPIDR_EL0
-        assert_eq!(insn_at(1), encode_mrs_tpidr_el0(16));
-
-        // [2] LDR X17, [PC, #offset] -- X17 = TLS table base
-        let ldr_tls_vaddr = handler_vaddr + 2 * 4;
-        let tls_offset = (trampoline_base + 8) as i64 - ldr_tls_vaddr as i64;
-        assert_eq!(insn_at(2), encode_ldr_literal(17, tls_offset).unwrap());
-
-        // [3] .Lloop: LDR X30, [X17, #0] -- entry.guest_tpidr
-        assert_eq!(insn_at(3), encode_ldr_imm_unsigned(30, 17, 0).unwrap());
-
-        // [4] CMN X30, #1 -- sentinel?
-        assert_eq!(insn_at(4), encode_cmn_imm(30, 1).unwrap());
-
-        // [5] B.EQ .Lfallback -> [10]: offset = (10-5)*4 = 20
-        assert_eq!(insn_at(5), encode_b_cond(COND_EQ, 20).unwrap());
-
-        // [6] CMP X30, X16 -- match?
-        assert_eq!(insn_at(6), encode_cmp_reg(30, 16));
-
-        // [7] B.EQ .Lstore -> [12]: offset = (12-7)*4 = 20
-        assert_eq!(insn_at(7), encode_b_cond(COND_EQ, 20).unwrap());
-
-        // [8] ADD X17, X17, #16 -- next entry
-        assert_eq!(insn_at(8), encode_add_imm(17, 17, 16).unwrap());
-
-        // [9] B .Lloop -> [3]: offset = (3-9)*4 = -24
-        assert_eq!(insn_at(9), encode_b(-24).unwrap());
-
-        // [10] .Lfallback: LDR X17, [PC, #offset] -- reload TLS table base
-        let fallback_ldr_vaddr = handler_vaddr + 10 * 4;
-        let fallback_offset = (trampoline_base + 8) as i64 - fallback_ldr_vaddr as i64;
-        assert_eq!(
-            insn_at(10),
-            encode_ldr_literal(17, fallback_offset).unwrap()
-        );
-
-        // [11] LDR X30, [X17, #0] -- entry[0].guest_tpidr
-        assert_eq!(insn_at(11), encode_ldr_imm_unsigned(30, 17, 0).unwrap());
-
-        // [12] .Lstore: STR X30, [SP, #24] -- result
-        assert_eq!(insn_at(12), encode_str_imm_unsigned(30, 31, 24).unwrap());
-
-        // [13] LDR X30, [SP, #32] -- restore
-        assert_eq!(insn_at(13), encode_ldr_imm_unsigned(30, 31, 32).unwrap());
-
-        // [14] RET
-        assert_eq!(insn_at(14), encode_ret(30));
-    }
-
-    #[test]
-    fn test_hook_mrs_only_produces_minimal_trampoline() {
-        // A binary with only MRS TPIDR_EL0 and no SVC should produce a minimal
-        // trampoline (no MRS sites are patched without at least one SVC, since the
-        // TLS table requires the callback mechanism to be populated).
+    fn test_mrs_only_produces_trampoline_with_gates() {
+        // A binary with only MRS TPIDR_EL0 (no SVC, no MSR) should produce
+        // a trampoline with shared layout + MRS gate, and the MRS instruction
+        // should be patched with a branch to the gate.
         let mrs_insn = encode_mrs_tpidr_el0(0);
+        let nop: u32 = 0xD503201F;
         let mut buf = vec![0u8; 8];
         buf[0..4].copy_from_slice(&mrs_insn.to_le_bytes());
+        buf[4..8].copy_from_slice(&nop.to_le_bytes());
 
         let sections = vec![TextSectionInfo {
             vaddr: 0x1000,
@@ -3354,43 +3047,184 @@ mod tests {
         }];
 
         let result = hook_syscalls_aarch64(&mut buf, &sections, 0x2000, 0);
-        let (trampoline_data, has_svc) = result.expect("should succeed with minimal trampoline");
+        let (trampoline_data, has_svc) = result.expect("should succeed");
         assert!(!has_svc, "should report no SVC found");
-        // MRS instruction should NOT be patched (no SVC means no TLS table)
-        assert_eq!(
+        // MRS instruction should be patched (replaced with a branch)
+        assert_ne!(
             u32::from_le_bytes(buf[0..4].try_into().unwrap()),
             mrs_insn,
-            "MRS instruction should be left unpatched"
+            "MRS instruction should be patched with a branch"
         );
+        // Trampoline should be larger than GATES_START_OFFSET (has an MRS gate)
         assert_eq!(
             trampoline_data.len(),
-            GATES_START_OFFSET,
-            "minimal trampoline should be exactly GATES_START_OFFSET bytes"
+            GATES_START_OFFSET + MRS_GATE_SIZE,
+            "trampoline should contain shared layout + one MRS gate"
         );
     }
 
-    #[test]
-    fn test_mrs_read_gate_size_fn() {
-        // General registers
-        assert_eq!(mrs_read_gate_size(0), MRS_READ_GATE_SIZE);
-        assert_eq!(mrs_read_gate_size(1), MRS_READ_GATE_SIZE);
-        assert_eq!(mrs_read_gate_size(15), MRS_READ_GATE_SIZE);
-        assert_eq!(mrs_read_gate_size(19), MRS_READ_GATE_SIZE);
-        assert_eq!(mrs_read_gate_size(31), MRS_READ_GATE_SIZE);
+    // ============================================================
+    // MRS gate instruction-level tests
+    // ============================================================
 
-        // Special registers
-        assert_eq!(mrs_read_gate_size(16), MRS_READ_GATE_SPECIAL_SIZE);
-        assert_eq!(mrs_read_gate_size(17), MRS_READ_GATE_SPECIAL_SIZE);
-        assert_eq!(mrs_read_gate_size(30), MRS_READ_GATE_SPECIAL_SIZE);
+    /// Helper: emit an MRS gate and return the trampoline bytes.
+    fn emit_mrs_gate_helper(rd: u8) -> Vec<u8> {
+        let mut td = Vec::new();
+        let trampoline_base = 0x2000u64;
+        // Emit header (16 bytes) so TLS table pointer is at offset 8
+        td.extend_from_slice(&0u64.to_le_bytes()); // callback
+        td.extend_from_slice(&0u64.to_le_bytes()); // TLS table ptr
+
+        let gate_offset = td.len();
+        let site = PatchSite {
+            file_offset: 0,
+            vaddr: 0x1000,
+            kind: PatchKind::MrsTpidr(rd),
+        };
+        emit_mrs_gate(&mut td, gate_offset, trampoline_base, &site, rd).unwrap();
+        td
     }
 
     #[test]
-    fn test_hook_svc_and_mrs_special_reg_trampoline_sizes() {
-        // MRS TPIDR_EL0 -> X16 (special reg, 40-byte gate)
-        let (td, _, _) = hook_with_svc_and_mrs(16);
+    fn test_mrs_gate_general_reg() {
+        // General case: Xd = X0, uses STP/LDP for X16,X17
+        let td = emit_mrs_gate_helper(0);
+        let gate_start = 16; // after header
+        let insn_at = |idx: usize| -> u32 {
+            let off = gate_start + idx * 4;
+            u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
+        };
+
+        // [0] STP X16, X17, [SP, #-16]! (pre-index)
+        let stp = insn_at(0);
+        assert_eq!(stp, encode_stp_pre_index(16, 17, 31, -16).unwrap());
+
+        // [1] LDR X16, [PC, #off] — loads TLS table address
+        let ldr = insn_at(1);
+        assert_eq!(ldr & 0xFF00_0000, 0x5800_0000, "should be LDR literal");
+        assert_eq!(ldr & 0x1F, 16, "should load into X16");
+
+        // [2] LDR X0, [X16, #0] — entry[0].guest_tpidr
+        let ldr_tpidr = insn_at(2);
+        assert_eq!(
+            ldr_tpidr,
+            encode_ldr_imm_unsigned(0, 16, 0).unwrap(),
+            "should load entry[0] into X0"
+        );
+
+        // [3] LDP X16, X17, [SP], #16 (post-index)
+        let ldp = insn_at(3);
+        assert_eq!(ldp, encode_ldp_post_index(16, 17, 31, 16).unwrap());
+
+        // [4] B <return> — branches to site.vaddr + 4
+        let b_insn = insn_at(4);
+        assert_eq!(b_insn & 0xFC00_0000, 0x14000000, "should be B instruction");
+
+        // Total size = 5 instructions = 20 bytes
+        assert_eq!(td.len() - gate_start, MRS_GATE_SIZE);
+    }
+
+    #[test]
+    fn test_mrs_gate_x16() {
+        // Xd = X16: uses X17 as sole scratch (STR/LDR pre/post-index)
+        let td = emit_mrs_gate_helper(16);
+        let gate_start = 16;
+        let insn_at = |idx: usize| -> u32 {
+            let off = gate_start + idx * 4;
+            u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
+        };
+
+        // [0] STR X17, [SP, #-16]!
+        let str_insn = insn_at(0);
+        assert_eq!(str_insn, encode_str_pre_index(17, 31, -16).unwrap());
+
+        // [1] LDR X17, [PC, #off] — TLS table via X17 (scratch)
+        let ldr = insn_at(1);
+        assert_eq!(ldr & 0xFF00_0000, 0x5800_0000, "should be LDR literal");
+        assert_eq!(ldr & 0x1F, 17, "should load into X17 (scratch)");
+
+        // [2] LDR X16, [X17, #0] — entry[0].guest_tpidr into X16 (dest)
+        let ldr_tpidr = insn_at(2);
+        assert_eq!(
+            ldr_tpidr,
+            encode_ldr_imm_unsigned(16, 17, 0).unwrap(),
+            "should load entry[0] into X16 via X17"
+        );
+
+        // [3] LDR X17, [SP], #16
+        let ldr_restore = insn_at(3);
+        assert_eq!(ldr_restore, encode_ldr_post_index(17, 31, 16).unwrap());
+
+        // [4] B <return>
+        let b_insn = insn_at(4);
+        assert_eq!(b_insn & 0xFC00_0000, 0x14000000, "should be B instruction");
+
+        assert_eq!(td.len() - gate_start, MRS_GATE_SIZE);
+    }
+
+    #[test]
+    fn test_mrs_gate_x17() {
+        // Xd = X17: uses X16 as sole scratch (STR/LDR pre/post-index)
+        let td = emit_mrs_gate_helper(17);
+        let gate_start = 16;
+        let insn_at = |idx: usize| -> u32 {
+            let off = gate_start + idx * 4;
+            u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
+        };
+
+        // [0] STR X16, [SP, #-16]!
+        let str_insn = insn_at(0);
+        assert_eq!(str_insn, encode_str_pre_index(16, 31, -16).unwrap());
+
+        // [1] LDR X16, [PC, #off] — TLS table via X16 (scratch)
+        let ldr = insn_at(1);
+        assert_eq!(ldr & 0xFF00_0000, 0x5800_0000, "should be LDR literal");
+        assert_eq!(ldr & 0x1F, 16, "should load into X16 (scratch)");
+
+        // [2] LDR X17, [X16, #0] — entry[0].guest_tpidr into X17 (dest)
+        let ldr_tpidr = insn_at(2);
+        assert_eq!(
+            ldr_tpidr,
+            encode_ldr_imm_unsigned(17, 16, 0).unwrap(),
+            "should load entry[0] into X17 via X16"
+        );
+
+        // [3] LDR X16, [SP], #16
+        let ldr_restore = insn_at(3);
+        assert_eq!(ldr_restore, encode_ldr_post_index(16, 31, 16).unwrap());
+
+        // [4] B <return>
+        let b_insn = insn_at(4);
+        assert_eq!(b_insn & 0xFC00_0000, 0x14000000, "should be B instruction");
+
+        assert_eq!(td.len() - gate_start, MRS_GATE_SIZE);
+    }
+
+    #[test]
+    fn test_trampoline_size_with_svc_msr_mrs() {
+        // A binary with SVC + MSR + MRS should produce a trampoline with all gates.
+        let nop: u32 = 0xD503201F;
+        let msr_x5 = encode_msr_tpidr_el0(5);
+        let mrs_x10 = encode_mrs_tpidr_el0(10);
+        let mut buf = vec![0u8; 20];
+        buf[0..4].copy_from_slice(&SVC_0.to_le_bytes());
+        buf[4..8].copy_from_slice(&msr_x5.to_le_bytes());
+        buf[8..12].copy_from_slice(&mrs_x10.to_le_bytes());
+        buf[12..16].copy_from_slice(&nop.to_le_bytes());
+        buf[16..20].copy_from_slice(&nop.to_le_bytes());
+
+        let sections = vec![TextSectionInfo {
+            vaddr: 0x1000,
+            file_offset: 0,
+            size: 20,
+        }];
+
+        let (td, has_svc) = hook_syscalls_aarch64(&mut buf, &sections, 0x2000, 0).unwrap();
+        assert!(has_svc);
         assert_eq!(
             td.len(),
-            GATES_START_OFFSET + SVC_GATE_SIZE + MRS_READ_GATE_SPECIAL_SIZE
+            GATES_START_OFFSET + SVC_GATE_SIZE + MSR_GATE_SIZE + MRS_GATE_SIZE,
+            "trampoline should have shared layout + SVC + MSR + MRS gates"
         );
     }
 }

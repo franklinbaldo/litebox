@@ -1949,8 +1949,8 @@ unsafe extern "C-unwind" fn reenter_handler(thread_ctx: &mut ThreadContext) {
 #[allow(clippy::cast_sign_loss)]
 unsafe extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext) {
     eprintln!(
-        "[diag] syscall_handler: entered, ctx.pc={:#x}, ctx.regs[8]={:#x} (syscall nr)",
-        thread_ctx.ctx.pc, thread_ctx.ctx.regs[8]
+        "[diag] syscall_handler: entered, ctx.pc={:#x}, ctx.regs[8]={:#x} (syscall nr), x20={:#x}",
+        thread_ctx.ctx.pc, thread_ctx.ctx.regs[8], thread_ctx.ctx.regs[20]
     );
     thread_ctx.call_shim(|shim, ctx, _interrupt| shim.syscall(ctx));
 }
@@ -2202,11 +2202,12 @@ impl ThreadContext<'_> {
                 //
                 // Trampoline layout from SIGRETURN_TRAMPOLINE_ADDR (offset 16):
                 //   base+48  .. base+120  = shared SVC handler (x18 = MRS result)
-                //   base+120 .. base+184  = shared MSR handler (x16 = MRS result)
-                //   base+184 .. base+244  = shared MRS read handler (x16 = MRS result)
-                // (Must match SHARED_SVC_HANDLER_OFFSET/SIZE,
-                //  SHARED_MSR_HANDLER_OFFSET/SIZE, and
-                //  SHARED_MRS_READ_HANDLER_OFFSET/SIZE in litebox_syscall_rewriter.)
+                //   base+120 .. base+196  = shared MSR handler (x16 = MRS result)
+                //   base+196 ..           = per-site gates (SVC + MSR only)
+                // (Must match SHARED_SVC_HANDLER_OFFSET/SIZE and
+                //  SHARED_MSR_HANDLER_OFFSET/SIZE in litebox_syscall_rewriter.)
+                // NOTE: MRS TPIDR_EL0 is no longer rewritten; the platform
+                // signal handler uses fault-and-reinstall instead.
                 {
                     let sigret_addr = litebox_common_linux::SIGRETURN_TRAMPOLINE_ADDR
                         .load(core::sync::atomic::Ordering::Acquire);
@@ -2215,9 +2216,7 @@ impl ThreadContext<'_> {
                         let svc_handler_start = trampoline_base + 48;
                         let svc_handler_end = trampoline_base + 120;
                         let msr_handler_start = trampoline_base + 120;
-                        let msr_handler_end = trampoline_base + 184;
-                        let mrs_read_handler_start = trampoline_base + 184;
-                        let mrs_read_handler_end = trampoline_base + 244;
+                        let msr_handler_end = trampoline_base + 196;
                         let pc = self.ctx.pc;
                         let guest_tpidr = get_guest_tpidr();
 
@@ -2232,13 +2231,6 @@ impl ThreadContext<'_> {
                             // MSR handler: x16 holds MRS TPIDR_EL0 result at [1]
                             eprintln!(
                                 "[diag] call_shim: fixing x16 in MSR handler: {:#x} -> {:#x} (pc={:#x})",
-                                self.ctx.regs[16], guest_tpidr, pc
-                            );
-                            self.ctx.regs[16] = guest_tpidr;
-                        } else if pc >= mrs_read_handler_start && pc < mrs_read_handler_end {
-                            // MRS read handler: x16 holds MRS TPIDR_EL0 result at [1]
-                            eprintln!(
-                                "[diag] call_shim: fixing x16 in MRS read handler: {:#x} -> {:#x} (pc={:#x})",
                                 self.ctx.regs[16], guest_tpidr, pc
                             );
                             self.ctx.regs[16] = guest_tpidr;
@@ -2261,6 +2253,16 @@ impl ThreadContext<'_> {
                         ret, check_ss.ss_sp as usize, check_ss.ss_size, check_ss.ss_flags,
                     );
                 }
+                // Diagnostic: dump callee-saved regs from PtRegs before
+                // switch_to_guest to verify x20 isn't corrupted.
+                eprintln!(
+                    "[diag] call_shim: pre-switch x19={:#x} x20={:#x} x21={:#x} x22={:#x} pc={:#x}",
+                    self.ctx.regs[19],
+                    self.ctx.regs[20],
+                    self.ctx.regs[21],
+                    self.ctx.regs[22],
+                    self.ctx.pc
+                );
                 // Re-set TPIDR_EL0 as the VERY LAST thing before asm.
                 // macOS clobbers it on every syscall (including eprintln above).
                 let tcb = TCB_PTR.get();
@@ -2744,6 +2746,24 @@ fn copy_signal_context(regs: &mut litebox_common_linux::PtRegs, context: &libc::
     regs.sp = mctx.__ss.__sp as usize;
     regs.pc = mctx.__ss.__pc as usize;
     regs.pstate = mctx.__ss.__cpsr as usize;
+
+    // Diagnostic: dump callee-saved registers x19-x22 and x28 to track
+    // the x20=NULL crash. Uses async-signal-safe write(2).
+    unsafe {
+        let mut buf = [0u8; 256];
+        let mut pos = write_bytes(&mut buf, 0, b"[diag] copy_signal_context: pc=");
+        pos = write_hex(&mut buf, pos, regs.pc);
+        pos = write_bytes(&mut buf, pos, b" x19=");
+        pos = write_hex(&mut buf, pos, regs.regs[19]);
+        pos = write_bytes(&mut buf, pos, b" x20=");
+        pos = write_hex(&mut buf, pos, regs.regs[20]);
+        pos = write_bytes(&mut buf, pos, b" x21=");
+        pos = write_hex(&mut buf, pos, regs.regs[21]);
+        pos = write_bytes(&mut buf, pos, b" x22=");
+        pos = write_hex(&mut buf, pos, regs.regs[22]);
+        pos = write_bytes(&mut buf, pos, b"\n");
+        libc::write(2, buf.as_ptr() as *const libc::c_void, pos);
+    }
 }
 
 /// Updates a Linux signal context to return to `f` with the given arguments (aarch64).
