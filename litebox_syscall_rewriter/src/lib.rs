@@ -143,7 +143,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
             get_control_transfer_targets(arch, &*buf, &text_sections)?
         };
 
-        let trampoline_base_addr = find_addr_for_trampoline_code(&file);
+        let trampoline_base_addr = find_addr_for_trampoline_code(&file, arch);
 
         (
             arch,
@@ -211,7 +211,12 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     // initial reservation. This prevents rtld_audit's MAP_FIXED mmap of the trampoline
     // from clobbering adjacent libraries' mappings.
     if arch == Arch::Aarch64 {
-        extend_last_ptload_memsz(buf, trampoline_base_addr, trampoline_data.len() as u64);
+        extend_last_ptload_memsz(
+            buf,
+            trampoline_base_addr,
+            trampoline_data.len() as u64,
+            arch,
+        );
     }
 
     // Build output: [patched ELF][padding to page boundary][trampoline code][header]
@@ -485,7 +490,7 @@ fn hook_syscalls_in_section(
     Ok(())
 }
 
-fn find_addr_for_trampoline_code(file: &object::File<'_>) -> u64 {
+fn find_addr_for_trampoline_code(file: &object::File<'_>, arch: Arch) -> u64 {
     // Find the highest virtual address among all PT_LOAD segments
     let max_virtual_addr = match file {
         object::File::Elf64(elf) => max_load_segment_end(elf),
@@ -493,8 +498,13 @@ fn find_addr_for_trampoline_code(file: &object::File<'_>) -> u64 {
         _ => unreachable!(),
     };
 
-    // Round up to the nearest page (assume 0x1000 page size)
-    max_virtual_addr.next_multiple_of(0x1000)
+    // Use 16KB alignment for AArch64 to avoid edge-page W^X conflicts on
+    // hosts with 16KB pages (e.g., macOS Apple Silicon). 4KB for x86.
+    let page_size: u64 = match arch {
+        Arch::Aarch64 => 0x4000,
+        Arch::X86_64 | Arch::X86_32 => 0x1000,
+    };
+    max_virtual_addr.next_multiple_of(page_size)
 }
 
 /// Returns the highest `p_vaddr + p_memsz` among all `PT_LOAD` segments.
@@ -518,7 +528,12 @@ where
 /// linker will include this extended range in its initial address space reservation,
 /// ensuring `MAP_FIXED` of the trampoline doesn't collide with adjacent shared libraries.
 #[allow(clippy::cast_possible_truncation)]
-fn extend_last_ptload_memsz(buf: &mut [u8], trampoline_vaddr: u64, trampoline_size: u64) {
+fn extend_last_ptload_memsz(
+    buf: &mut [u8],
+    trampoline_vaddr: u64,
+    trampoline_size: u64,
+    arch: Arch,
+) {
     // Parse ELF64 header fields we need
     let e_phoff = u64::from_le_bytes(buf[32..40].try_into().unwrap()) as usize;
     let e_phentsize = u16::from_le_bytes(buf[54..56].try_into().unwrap()) as usize;
@@ -542,7 +557,13 @@ fn extend_last_ptload_memsz(buf: &mut [u8], trampoline_vaddr: u64, trampoline_si
     let p_vaddr = u64::from_le_bytes(buf[ph_offset + 16..ph_offset + 24].try_into().unwrap());
     let p_memsz = u64::from_le_bytes(buf[ph_offset + 40..ph_offset + 48].try_into().unwrap());
 
-    let trampoline_end_aligned = (trampoline_vaddr + trampoline_size).next_multiple_of(0x1000);
+    // Use 16KB alignment for AArch64 (macOS Apple Silicon has 16KB pages),
+    // 4KB for x86.
+    let page_size: u64 = match arch {
+        Arch::Aarch64 => 0x4000,
+        Arch::X86_64 | Arch::X86_32 => 0x1000,
+    };
+    let trampoline_end_aligned = (trampoline_vaddr + trampoline_size).next_multiple_of(page_size);
     let seg_end = p_vaddr + p_memsz;
 
     if trampoline_end_aligned > seg_end {

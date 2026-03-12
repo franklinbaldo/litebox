@@ -9,18 +9,18 @@ expression: diff
    400134:	d28001c2 	mov	x2, #0xe                   	// #14
    400138:	f8007023 	stur	x3, [x1, #7]
 -  40013c:	d4000001 	svc	#0x0
-+  40013c:	140003e2 	b	4010c4 <_start+0xfb4>
++  40013c:	14000fe2 	b	4040c4 <_start+0x3fb4>
    400140:	d2801588 	mov	x8, #0xac                  	// #172
 -  400144:	d4000001 	svc	#0x0
-+  400144:	140003e6 	b	4010dc <_start+0xfcc>
++  400144:	14000fe6 	b	4040dc <_start+0x3fcc>
    400148:	d2800e28 	mov	x8, #0x71                  	// #113
    40014c:	910043e1 	add	x1, sp, #0x10
    400150:	d2800000 	mov	x0, #0x0                   	// #0
 -  400154:	d4000001 	svc	#0x0
-+  400154:	140003e8 	b	4010f4 <_start+0xfe4>
++  400154:	14000fe8 	b	4040f4 <_start+0x3fe4>
    400158:	d2800ba8 	mov	x8, #0x5d                  	// #93
    40015c:	d2800000 	mov	x0, #0x0                   	// #0
 -  400160:	d4000001 	svc	#0x0
 \ No newline at end of file
-+  400160:	140003eb 	b	40110c <_start+0xffc>
++  400160:	14000feb 	b	40410c <_start+0x3ffc>
 \ No newline at end of file
