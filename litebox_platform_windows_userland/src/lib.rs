@@ -812,7 +812,6 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
         });
     }
 
-    #[cfg(debug_assertions)]
     fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
         // Ensure the module-wide TLS slot is allocated.
         ensure_tls_index();
