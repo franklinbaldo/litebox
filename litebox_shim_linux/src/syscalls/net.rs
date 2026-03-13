@@ -399,7 +399,7 @@ impl<FS: ShimFS> GlobalState<FS> {
                 // We use fixed buffer size for now
                 SocketOption::RCVBUF | SocketOption::SNDBUF => return Err(Errno::EOPNOTSUPP),
                 // Socket does not support these options
-                SocketOption::TYPE | SocketOption::PEERCRED => return Err(Errno::ENOPROTOOPT),
+                SocketOption::TYPE | SocketOption::PEERCRED | SocketOption::ERROR => return Err(Errno::ENOPROTOOPT),
             },
             SocketOptionName::TCP(to) => match to {
                 TcpOption::CONGESTION => {
@@ -508,6 +508,11 @@ impl<FS: ShimFS> GlobalState<FS> {
                     };
                     super::write_to_user(val, optval, len)
                 }
+                SocketOption::ERROR => {
+                    // SO_ERROR is read-only and self-clearing. We don't track
+                    // per-socket async errors, so always report no error.
+                    super::write_to_user(0u32, optval, len)
+                }
                 _ => Err(Errno::ENOPROTOOPT),
             },
             _ => Err(Errno::ENOPROTOOPT),
@@ -546,7 +551,8 @@ impl<FS: ShimFS> GlobalState<FS> {
                 | SocketOption::LINGER
                 | SocketOption::REUSEADDR
                 | SocketOption::KEEPALIVE
-                | SocketOption::BROADCAST => {
+                | SocketOption::BROADCAST
+                | SocketOption::ERROR => {
                     unreachable!()
                 }
                 SocketOption::TYPE => self.get_socket_type(fd)? as u32,
