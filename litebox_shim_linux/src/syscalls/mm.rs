@@ -626,6 +626,7 @@ impl<FS: ShimFS> Task<FS> {
                 if size == 0 {
                     break;
                 }
+                self.park_if_deferred();
                 // ptr is a valid pointer returned by do_mmap.
                 ptr.copy_from_slice(copied, &buffer[..size]).unwrap();
                 copied += size;

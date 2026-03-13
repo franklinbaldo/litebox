@@ -605,6 +605,22 @@ impl<FS: ShimFS> Task<FS> {
             fc.vfork_done.signal();
         }
 
+        // If this thread has a deferred park lie that was claimed (at a
+        // park_if_deferred checkpoint) but the vfork window hasn't closed yet,
+        // decrement parked_count so the forking thread isn't stuck. The
+        // deferred_lie_count was already decremented when the lie was claimed
+        // via CAS in park_if_deferred, so we only adjust parked_count here.
+        if self.deferred_vfork_park.get() {
+            use litebox::platform::RawMutex as _;
+            let ps = self.process_state.borrow();
+            ps.vfork_parking
+                .parked_count
+                .underlying_atomic()
+                .fetch_sub(1, core::sync::atomic::Ordering::Release);
+            ps.vfork_parking.parked_count.wake_all();
+            self.deferred_vfork_park.set(false);
+        }
+
         // If this thread was marked as suspended (by park_other_threads) and
         // is now exiting, wake the vfork_parked_count futex so the forking
         // thread can recompute the expected count and make progress.
@@ -1168,6 +1184,7 @@ impl<FS: ShimFS> Task<FS> {
                         files: self.files.clone(), // TODO: !CLONE_FILES support
                         signals: self.signals.clone_for_new_task(),
                         fork_context: core::cell::RefCell::new(None),
+                        deferred_vfork_park: core::cell::Cell::new(false),
                     },
                 }),
             )
@@ -1462,6 +1479,7 @@ impl<FS: ShimFS> Task<FS> {
                 vfork_parking: Arc::new(crate::VforkParking {
                     park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
                     parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
+                    deferred_lie_count: core::sync::atomic::AtomicU32::new(0),
                 }),
             });
             let child_files_state = Arc::new(
@@ -1523,6 +1541,7 @@ impl<FS: ShimFS> Task<FS> {
                         files: child_files,
                         signals: self.signals.clone_for_fork(),
                         fork_context: core::cell::RefCell::new(child_fork_context),
+                        deferred_vfork_park: core::cell::Cell::new(false),
                     },
                 }),
             )
@@ -1759,15 +1778,15 @@ impl<FS: ShimFS> Task<FS> {
 
         let ps = self.process_state.borrow();
 
-        // Clear per-thread is_suspended flags and the is_forking guard.
+        // Clear per-thread is_suspended flags (but keep is_forking until all
+        // threads have fully unparked to prevent concurrent fork races).
         {
-            let mut inner = self.thread.process.inner.lock();
+            let inner = self.thread.process.inner.lock();
             for (&tid, thread) in &inner.threads {
                 if tid != self.tid {
                     thread.is_suspended.store(false, Ordering::Relaxed);
                 }
             }
-            inner.is_forking = false;
         }
 
         // Allow transport spin-loops to resume.
@@ -1782,7 +1801,24 @@ impl<FS: ShimFS> Task<FS> {
             .store(0, Ordering::Release);
         ps.vfork_parking.park.wake_all();
 
-        // Wait for all threads to acknowledge the unpark (count drops to 0).
+        // Settle unclaimed deferred lies. Transport threads that lied
+        // (incremented parked_count without blocking) may still be spinning
+        // in the I/O loop and can't reach a park checkpoint quickly. Since
+        // the vfork window is now closed, we settle their accounting
+        // directly so we don't wait for them.
+        let remaining_lies = ps
+            .vfork_parking
+            .deferred_lie_count
+            .swap(0, Ordering::AcqRel);
+        if remaining_lies > 0 {
+            ps.vfork_parking
+                .parked_count
+                .underlying_atomic()
+                .fetch_sub(remaining_lies, Ordering::Release);
+            ps.vfork_parking.parked_count.wake_all();
+        }
+
+        // Wait for all properly-parked threads to acknowledge the unpark.
         loop {
             let n = ps
                 .vfork_parking
@@ -1793,6 +1829,12 @@ impl<FS: ShimFS> Task<FS> {
                 break;
             }
             let _ = ps.vfork_parking.parked_count.block(n);
+        }
+
+        // All threads have unparked. Now allow another fork to proceed.
+        {
+            let mut inner = self.thread.process.inner.lock();
+            inner.is_forking = false;
         }
     }
 }
@@ -2512,6 +2554,7 @@ impl<FS: ShimFS> Task<FS> {
                 vfork_parking: Arc::new(crate::VforkParking {
                     park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
                     parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
+                    deferred_lie_count: core::sync::atomic::AtomicU32::new(0),
                 }),
             });
             self.process_state.replace(child_ps);
@@ -2592,6 +2635,17 @@ impl<FS: ShimFS> Task<FS> {
 
     pub(crate) fn handle_init_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
         self.init_thread_context(ctx);
+
+        // If this is a vfork child sharing the parent's address space, clear the
+        // transport interrupt flag so the child's 9P operations don't trigger
+        // deferred-park lies. By this point the parent is blocked and all sibling
+        // threads are either truly parked or have already lied (has_lied=true).
+        if self.fork_context.borrow().is_some() {
+            self.global
+                .transport_interrupt
+                .store(false, core::sync::atomic::Ordering::Release);
+        }
+
         // Attach the thread handle so that the thread can be interrupted.
         self.thread
             .remote

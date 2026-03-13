@@ -74,6 +74,31 @@ impl<FS: ShimFS> Task<FS> {
             return;
         }
 
+        // If we have a deferred park claim from the transport spin loop,
+        // settle it here: block until vfork is done, then decrement
+        // parked_count (the lie already incremented it).
+        if self.deferred_vfork_park.get() {
+            let ps = self.process_state.borrow();
+            loop {
+                let v = ps
+                    .vfork_parking
+                    .park
+                    .underlying_atomic()
+                    .load(Ordering::Acquire);
+                if v == 0 || self.is_exiting() {
+                    break;
+                }
+                let _ = ps.vfork_parking.park.block(v);
+            }
+            ps.vfork_parking
+                .parked_count
+                .underlying_atomic()
+                .fetch_sub(1, Ordering::Release);
+            ps.vfork_parking.parked_count.wake_all();
+            self.deferred_vfork_park.set(false);
+            return;
+        }
+
         let ps = self.process_state.borrow();
 
         // Fast path: check the process-wide flag first (Acquire pairs with
@@ -88,12 +113,34 @@ impl<FS: ShimFS> Task<FS> {
             return;
         }
 
-        // Announce that we are parked.
-        ps.vfork_parking
-            .parked_count
-            .underlying_atomic()
-            .fetch_add(1, Ordering::Release);
-        ps.vfork_parking.parked_count.wake_all();
+        // Before doing a normal park (which increments parked_count), try
+        // to claim an outstanding deferred lie. If a lie exists, parked_count
+        // was already incremented by try_deferred_park — we must NOT increment
+        // again, or the forking thread would see an inflated count and proceed
+        // before all threads are truly parked.
+        let claimed_lie = loop {
+            let current = ps.vfork_parking.deferred_lie_count.load(Ordering::Acquire);
+            if current == 0 {
+                break false;
+            }
+            if ps
+                .vfork_parking
+                .deferred_lie_count
+                .compare_exchange_weak(current, current - 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break true;
+            }
+        };
+
+        if !claimed_lie {
+            // Normal park: announce that we are parked.
+            ps.vfork_parking
+                .parked_count
+                .underlying_atomic()
+                .fetch_add(1, Ordering::Release);
+            ps.vfork_parking.parked_count.wake_all();
+        }
 
         // Block until the forking thread clears the park flag or the
         // process begins exiting (exit_group wakes vfork_park).
@@ -109,7 +156,8 @@ impl<FS: ShimFS> Task<FS> {
             let _ = ps.vfork_parking.park.block(v);
         }
 
-        // Announce that we have unparked.
+        // Announce that we have unparked (whether we did a normal park or
+        // claimed a lie, we decrement parked_count).
         ps.vfork_parking
             .parked_count
             .underlying_atomic()

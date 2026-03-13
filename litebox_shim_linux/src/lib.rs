@@ -234,6 +234,7 @@ impl LinuxShimBuilder {
             vfork_parking: Arc::new(VforkParking {
                 park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
                 parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
+                deferred_lie_count: core::sync::atomic::AtomicU32::new(0),
             }),
         });
         let global = Arc::new(GlobalState {
@@ -322,6 +323,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
                 fork_context: RefCell::new(None),
+                deferred_vfork_park: Cell::new(false),
             },
         };
         entrypoints.task.load_program(
@@ -563,6 +565,74 @@ impl<FS: ShimFS> Descriptors<FS> {
 }
 
 impl<FS: ShimFS> Task<FS> {
+    /// If the current task's transport told a "deferred park lie" during a 9P
+    /// spin loop, this method claims that lie and blocks until the vfork window
+    /// closes. Must be called before any guest memory write in `do_syscall`.
+    ///
+    /// The flow:
+    /// 1. Try to claim one lie via CAS on `deferred_lie_count`.
+    /// 2. Set per-task `deferred_vfork_park = true`.
+    /// 3. Block on `park` futex until it returns to 0.
+    /// 4. Decrement `parked_count` (we were counted as parked, now we leave).
+    /// 5. Clear `deferred_vfork_park`.
+    ///
+    /// Uses CAS (not `fetch_sub`) to avoid underflow races with
+    /// `unpark_other_threads` which uses `swap(0)` to settle all remaining
+    /// unclaimed lies.
+    fn park_if_deferred(&self) {
+        use core::sync::atomic::Ordering;
+        use litebox::platform::RawMutex as _;
+
+        // The vfork child shares the parent's ProcessState (and therefore
+        // VforkParking). It must never claim a lie or block — it's the one
+        // thread allowed to run during the vfork window.
+        if self.fork_context.borrow().is_some() {
+            return;
+        }
+
+        let ps = self.process_state.borrow();
+        let parking = &ps.vfork_parking;
+
+        // Try to atomically claim one lie. CAS avoids underflow when
+        // unpark_other_threads concurrently swaps deferred_lie_count to 0.
+        loop {
+            let current = parking.deferred_lie_count.load(Ordering::Acquire);
+            if current == 0 {
+                return; // No outstanding lies (or all settled by unpark).
+            }
+            if parking
+                .deferred_lie_count
+                .compare_exchange_weak(current, current - 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break; // Successfully claimed one lie.
+            }
+        }
+
+        // We own the lie. Mark ourselves as deferred-parked so that
+        // prepare_for_exit can settle the parked_count if we exit early.
+        self.deferred_vfork_park.set(true);
+
+        // Block until the forking thread clears the park flag, or the
+        // process is exiting (exit_group wakes vfork_park).
+        loop {
+            let v = parking.park.underlying_atomic().load(Ordering::Acquire);
+            if v == 0 || self.is_exiting() {
+                break;
+            }
+            let _ = parking.park.block(v);
+        }
+
+        // We're unblocked. Decrement parked_count (we were counted as parked).
+        parking
+            .parked_count
+            .underlying_atomic()
+            .fetch_sub(1, Ordering::Release);
+        parking.parked_count.wake_all();
+
+        self.deferred_vfork_park.set(false);
+    }
+
     fn close_on_exec(&self) {
         let files = self.files.borrow();
         files
@@ -844,6 +914,7 @@ impl<FS: ShimFS> Task<FS> {
             ) {
                 Ok(0) => break, // EOF
                 Ok(size) => {
+                    self.park_if_deferred();
                     buf.copy_from_slice(read_total, &kernel_buf[..size])
                         .ok_or(Errno::EFAULT)?;
                     read_total += size;
@@ -933,6 +1004,7 @@ impl<FS: ShimFS> Task<FS> {
                     let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
 
                     self.sys_read(fd, &mut kernel_buf, None).and_then(|size| {
+                        self.park_if_deferred();
                         buf.copy_from_slice(0, &kernel_buf[..size])
                             .map(|()| size)
                             .ok_or(Errno::EFAULT)
@@ -1151,6 +1223,7 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Getcwd { buf, size: count } => {
                 let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
                 self.sys_getcwd(&mut kernel_buf).and_then(|size| {
+                    self.park_if_deferred();
                     buf.copy_from_slice(0, &kernel_buf[..size])
                         .map(|()| size)
                         .ok_or(Errno::EFAULT)
@@ -1187,6 +1260,7 @@ impl<FS: ShimFS> Task<FS> {
             } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
                 let mut kernel_buf = vec![0u8; bufsiz.min(MAX_KERNEL_BUF_SIZE)];
                 self.sys_readlink(path, &mut kernel_buf).and_then(|size| {
+                    self.park_if_deferred();
                     buf.copy_from_slice(0, &kernel_buf[..size])
                         .map(|()| size)
                         .ok_or(Errno::EFAULT)
@@ -1216,6 +1290,7 @@ impl<FS: ShimFS> Task<FS> {
                 let mut kernel_buf = vec![0u8; bufsiz.min(MAX_KERNEL_BUF_SIZE)];
                 self.sys_readlinkat(dirfd, path, &mut kernel_buf)
                     .and_then(|size| {
+                        self.park_if_deferred();
                         buf.copy_from_slice(0, &kernel_buf[..size])
                             .map(|()| size)
                             .ok_or(Errno::EFAULT)
@@ -1308,6 +1383,7 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Stat { pathname, buf } => {
                 pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
                     self.sys_stat(path).and_then(|stat| {
+                        self.park_if_deferred();
                         buf.write_at_offset(0, stat)
                             .ok_or(Errno::EFAULT)
                             .map(|()| 0)
@@ -1317,6 +1393,7 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Lstat { pathname, buf } => {
                 pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
                     self.sys_lstat(path).and_then(|stat| {
+                        self.park_if_deferred();
                         buf.write_at_offset(0, stat)
                             .ok_or(Errno::EFAULT)
                             .map(|()| 0)
@@ -1324,6 +1401,7 @@ impl<FS: ShimFS> Task<FS> {
                 })
             }
             SyscallRequest::Fstat { fd, buf } => self.sys_fstat(fd).and_then(|stat| {
+                self.park_if_deferred();
                 buf.write_at_offset(0, stat)
                     .ok_or(Errno::EFAULT)
                     .map(|()| 0)
@@ -1336,6 +1414,7 @@ impl<FS: ShimFS> Task<FS> {
                 flags,
             } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
                 self.sys_newfstatat(dirfd, path, flags).and_then(|stat| {
+                    self.park_if_deferred();
                     buf.write_at_offset(0, stat)
                         .ok_or(Errno::EFAULT)
                         .map(|()| 0)
@@ -1349,6 +1428,7 @@ impl<FS: ShimFS> Task<FS> {
                 flags,
             } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
                 self.sys_newfstatat(dirfd, path, flags).and_then(|stat| {
+                    self.park_if_deferred();
                     buf.write_at_offset(0, stat.into())
                         .ok_or(Errno::EFAULT)
                         .map(|()| 0)
@@ -1584,6 +1664,11 @@ pub(crate) struct VforkParking {
     /// until the count reaches `thread_count - 1`, confirming all other
     /// threads are safely stopped before modifying page permissions.
     pub parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex,
+    /// Number of outstanding "deferred lies" — transport spin loops that have
+    /// incremented `parked_count` without actually blocking. Each lie must be
+    /// claimed by a task via `park_if_deferred()` before it writes to guest
+    /// memory, or at the syscall boundary as a fallback.
+    pub deferred_lie_count: core::sync::atomic::AtomicU32,
 }
 
 /// One-shot synchronization primitive for vfork parent blocking.
@@ -1686,6 +1771,11 @@ struct Task<FS: ShimFS> {
     /// for threads. Set when `do_fork` creates a child process. `RefCell`
     /// because `sys_execve` consumes it via `take()` through `&self`.
     fork_context: RefCell<Option<ForkContext>>,
+    /// Set by `park_if_deferred()` when this task has claimed a deferred lie
+    /// from the transport and is now blocking at a park checkpoint. Cleared
+    /// when the task resumes after vfork completes. `Cell` because the task
+    /// owns this flag exclusively (no cross-thread sharing).
+    deferred_vfork_park: Cell<bool>,
 }
 
 impl<FS: ShimFS> Drop for Task<FS> {
@@ -1728,6 +1818,7 @@ mod test_utils {
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
                 fork_context: RefCell::new(None),
+                deferred_vfork_park: Cell::new(false),
                 process_state: self.process_state.into(),
                 global: self.global,
             }
@@ -1756,6 +1847,7 @@ mod test_utils {
                 files: self.files.clone(),
                 signals: self.signals.clone_for_new_task(),
                 fork_context: RefCell::new(None),
+                deferred_vfork_park: Cell::new(false),
             };
             Some(task)
         }

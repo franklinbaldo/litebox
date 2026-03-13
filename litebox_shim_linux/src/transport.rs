@@ -54,6 +54,11 @@ pub struct ShimTransport {
     proxy: Arc<NetworkProxy<Platform>>,
     interrupt: Arc<core::sync::atomic::AtomicBool>,
     vfork_parking: Arc<VforkParking>,
+    /// Tracks whether this transport has already "lied" (incremented
+    /// `parked_count` without blocking) during the current spin session.
+    /// Prevents double-counting when `read_exact` calls `read()` multiple
+    /// times for partial reads within a single 9P fcall.
+    has_lied: core::sync::atomic::AtomicBool,
 }
 
 impl ShimTransport {
@@ -101,6 +106,7 @@ impl ShimTransport {
             proxy,
             interrupt,
             vfork_parking,
+            has_lied: core::sync::atomic::AtomicBool::new(false),
         })
     }
 }
@@ -112,51 +118,68 @@ impl Drop for ShimTransport {
 }
 
 impl ShimTransport {
-    /// Park this thread in-place when vfork parking is requested.
+    /// Attempt a deferred park: if vfork parking is requested, announce that
+    /// we have "parked" (increment `parked_count`) but keep spinning. The
+    /// actual block happens later at a park checkpoint in `do_syscall`,
+    /// before any guest memory write.
     ///
-    /// This mirrors `park_for_vfork_if_requested()` from `wait.rs` but is
-    /// designed for the transport spin loops: the thread parks without having
-    /// consumed or produced any bytes on the TCP stream, so the 9P protocol
-    /// stays consistent.
-    fn park_for_vfork(&self) {
+    /// This avoids releasing the 9P `write_state` mutex mid-operation, which
+    /// would corrupt the protocol stream and cause deadlocks.
+    fn try_deferred_park(&self) {
         use litebox::platform::RawMutex as _;
-        // Announce that we have parked.
+
+        // Already lied in this fcall session — don't double-count.
+        if self.has_lied.load(Ordering::Relaxed) {
+            return;
+        }
+
+        // Check if vfork parking is actually requested for this process.
+        let park_val = self
+            .vfork_parking
+            .park
+            .underlying_atomic()
+            .load(Ordering::Acquire);
+        if park_val == 0 {
+            return;
+        }
+
+        // The Lie: announce parked, but keep running.
+        self.has_lied.store(true, Ordering::Relaxed);
+        self.vfork_parking
+            .deferred_lie_count
+            .fetch_add(1, Ordering::Release);
         self.vfork_parking
             .parked_count
             .underlying_atomic()
             .fetch_add(1, Ordering::Release);
-        self.vfork_parking.parked_count.wake_all();
-
-        // Block until the forking thread clears the park flag.
-        loop {
-            let v = self
-                .vfork_parking
-                .park
-                .underlying_atomic()
-                .load(Ordering::Acquire);
-            if v == 0 {
-                break;
-            }
-            let _ = self.vfork_parking.park.block(v);
-        }
-
-        // Announce that we have unparked.
-        self.vfork_parking
-            .parked_count
-            .underlying_atomic()
-            .fetch_sub(1, Ordering::Release);
         self.vfork_parking.parked_count.wake_all();
     }
 }
 
 impl transport::Read for ShimTransport {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, transport::ReadError> {
+        // If the vfork that triggered our lie is over, reset for next time.
+        if self.has_lied.load(Ordering::Relaxed) {
+            use litebox::platform::RawMutex as _;
+            let park_val = self
+                .vfork_parking
+                .park
+                .underlying_atomic()
+                .load(Ordering::Acquire);
+            if park_val == 0 {
+                self.has_lied.store(false, Ordering::Relaxed);
+            }
+        }
+
         loop {
-            // Check whether vfork parking has been requested; if so, park
-            // in-place without touching the TCP stream.
+            // If a vfork interrupt is pending, perform a deferred park (lie)
+            // instead of blocking — we must not release the write_state mutex.
+            // After the lie, fall through to try_read so the 9P operation can
+            // complete and the write_state mutex can be released. Without this,
+            // threads waiting on the mutex can never contribute to parked_count,
+            // causing park_other_threads() to deadlock.
             if self.interrupt.load(Ordering::Acquire) {
-                self.park_for_vfork();
-                continue;
+                self.try_deferred_park();
             }
             match self.proxy.try_read(buf, ReceiveFlags::empty(), None) {
                 Ok(0) => {
@@ -177,12 +200,25 @@ impl transport::Read for ShimTransport {
 
 impl transport::Write for ShimTransport {
     fn write(&mut self, buf: &[u8]) -> Result<usize, transport::WriteError> {
+        // Same has_lied reset as Read — if the vfork is over, clear the flag
+        // so we can lie again on the next vfork.
+        if self.has_lied.load(Ordering::Relaxed) {
+            use litebox::platform::RawMutex as _;
+            let park_val = self
+                .vfork_parking
+                .park
+                .underlying_atomic()
+                .load(Ordering::Acquire);
+            if park_val == 0 {
+                self.has_lied.store(false, Ordering::Relaxed);
+            }
+        }
+
         loop {
-            // Check whether vfork parking has been requested; if so, park
-            // in-place without touching the TCP stream.
+            // Same deferred park logic as read — lie, then fall through to
+            // try_write so the 9P request can finish sending.
             if self.interrupt.load(Ordering::Acquire) {
-                self.park_for_vfork();
-                continue;
+                self.try_deferred_park();
             }
             match self.proxy.try_write(buf, SendFlags::empty(), None) {
                 Ok(n) => return Ok(n),

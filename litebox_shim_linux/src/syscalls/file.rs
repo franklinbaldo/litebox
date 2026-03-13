@@ -693,6 +693,7 @@ impl<FS: ShimFS> Task<FS> {
                 Descriptor::Eventfd { .. } => todo!(),
                 Descriptor::Unix { .. } => todo!(),
             };
+            self.park_if_deferred();
             iov.iov_base
                 .copy_from_slice(0, &kernel_buffer[..size])
                 .ok_or(Errno::EFAULT)?;
@@ -2481,6 +2482,12 @@ impl<FS: ShimFS> Task<FS> {
                 let mut entries = files.fs.read_dir(file)?;
                 entries.sort_by(|a, b| a.name.cmp(&b.name));
 
+                // Buffer all dirent64 entries into a kernel-side Vec<u8> before
+                // writing to guest memory. This allows us to insert a single
+                // park checkpoint (for deferred vfork parking) before the guest
+                // write, rather than scattering them across every entry.
+                let mut kernel_buf = alloc::vec::Vec::<u8>::with_capacity(count.min(4096));
+
                 for entry in entries.iter().skip(dir_off) {
                     // include null terminator and make it aligned
                     let len = (DIRENT_STRUCT_BYTES_WITHOUT_NAME + entry.name.len() + 1)
@@ -2496,25 +2503,47 @@ impl<FS: ShimFS> Task<FS> {
                         typ: litebox_common_linux::DirentType::from(entry.file_type.clone()) as u8,
                         __name: [0; 0],
                     };
-                    let hdr_ptr = crate::MutPtr::from_usize(dirp.as_usize() + nbytes);
-                    hdr_ptr.write_at_offset(0, dirent64).ok_or(Errno::EFAULT)?;
-                    let name_ptr = crate::MutPtr::from_usize(
-                        hdr_ptr.as_usize() + DIRENT_STRUCT_BYTES_WITHOUT_NAME,
-                    );
-                    name_ptr
-                        .write_slice_at_offset(0, entry.name.as_bytes())
-                        .ok_or(Errno::EFAULT)?;
-                    // set the null terminator and padding
-                    let zeros_len = len - (DIRENT_STRUCT_BYTES_WITHOUT_NAME + entry.name.len());
-                    name_ptr
-                        .write_slice_at_offset(
-                            isize::try_from(entry.name.len()).unwrap(),
-                            &vec![0; zeros_len],
+
+                    // Append the dirent64 header as raw bytes.
+                    let hdr_bytes: &[u8] = unsafe {
+                        // SAFETY: LinuxDirent64 is repr(C) and all bit patterns
+                        // from the initialized fields are valid. We read
+                        // exactly `size_of::<LinuxDirent64>()` bytes from a
+                        // properly aligned struct.
+                        core::slice::from_raw_parts(
+                            (&raw const dirent64).cast::<u8>(),
+                            core::mem::size_of::<litebox_common_linux::LinuxDirent64>(),
                         )
-                        .ok_or(Errno::EFAULT)?;
+                    };
+                    kernel_buf.extend_from_slice(hdr_bytes);
+                    // Pad to DIRENT_STRUCT_BYTES_WITHOUT_NAME (covers the
+                    // __name[0] flexible array member offset).
+                    let hdr_size = core::mem::size_of::<litebox_common_linux::LinuxDirent64>();
+                    if hdr_size < DIRENT_STRUCT_BYTES_WITHOUT_NAME {
+                        kernel_buf.extend(core::iter::repeat_n(
+                            0u8,
+                            DIRENT_STRUCT_BYTES_WITHOUT_NAME - hdr_size,
+                        ));
+                    }
+                    // Append the name.
+                    kernel_buf.extend_from_slice(entry.name.as_bytes());
+                    // Null terminator + padding.
+                    let zeros_len = len - (DIRENT_STRUCT_BYTES_WITHOUT_NAME + entry.name.len());
+                    kernel_buf.extend(core::iter::repeat_n(0u8, zeros_len));
+
                     nbytes += len;
                     dir_off += 1;
                 }
+
+                // Park checkpoint: block for deferred vfork before guest write.
+                self.park_if_deferred();
+
+                // Single bulk write to guest memory.
+                if nbytes > 0 {
+                    dirp.copy_from_slice(0, &kernel_buf[..nbytes])
+                        .ok_or(Errno::EFAULT)?;
+                }
+
                 let _old = self
                     .global
                     .litebox
