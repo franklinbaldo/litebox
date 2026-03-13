@@ -1372,7 +1372,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
                     unreachable!()
                 }
                 // Don't allow changing socket type and credentials
-                SocketOption::TYPE | SocketOption::PEERCRED => Err(Errno::ENOPROTOOPT),
+                SocketOption::TYPE | SocketOption::PEERCRED | SocketOption::ERROR => Err(Errno::ENOPROTOOPT),
                 // We use fixed buffer size for now
                 SocketOption::RCVBUF | SocketOption::SNDBUF => Err(Errno::EOPNOTSUPP),
             },
@@ -1416,7 +1416,8 @@ impl<FS: ShimFS> UnixSocket<FS> {
                 | SocketOption::LINGER
                 | SocketOption::REUSEADDR
                 | SocketOption::KEEPALIVE
-                | SocketOption::BROADCAST => {
+                | SocketOption::BROADCAST
+                | SocketOption::ERROR => {
                     unreachable!()
                 }
                 SocketOption::TYPE => match self.inner {
