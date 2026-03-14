@@ -131,16 +131,20 @@ const MRS_GATE_INSN_COUNT: usize = 5;
 #[cfg(target_os = "linux")]
 const MRS_GATE_SIZE: usize = MRS_GATE_INSN_COUNT * 4; // 20
 
-// ---- macOS MRS gate layout (9 insns, 36 bytes, BL to shared handler) ----
-// Phase 3 will update these when the shared MRS handler is added.
-// For now, keep macOS MRS gates as 5 insns / 20 bytes (same as Linux).
+// ---- macOS MRS gate layout (9 insns, 36 bytes, BL to shared MRS handler, 48-byte frame) ----
 #[cfg(target_os = "macos")]
-const MRS_GATE_INSN_COUNT: usize = 5;
+const MRS_GATE_INSN_COUNT: usize = 9;
 #[cfg(target_os = "macos")]
-const MRS_GATE_SIZE: usize = MRS_GATE_INSN_COUNT * 4; // 20
+const MRS_GATE_SIZE: usize = MRS_GATE_INSN_COUNT * 4; // 36
+
+// ---- macOS shared MRS handler layout (TPIDRRO_EL0 → TCB → guest_tpidr → [SP+24]) ----
+#[cfg(target_os = "macos")]
+const SHARED_MRS_HANDLER_INSN_COUNT: usize = 16;
+#[cfg(target_os = "macos")]
+const SHARED_MRS_HANDLER_SIZE: usize = SHARED_MRS_HANDLER_INSN_COUNT * 4; // 64
 
 /// ARM64 NOP instruction.
-#[allow(dead_code)] // May be used for padding in future
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const NOP: u32 = 0xD503201F;
 
 /// Offset of the header region: callback address (8 bytes).
@@ -165,9 +169,19 @@ const SHARED_SVC_HANDLER_OFFSET: usize = SIGRETURN_GATE_OFFSET + SVC_GATE_SIZE;
 const SHARED_MSR_HANDLER_OFFSET: usize = SHARED_SVC_HANDLER_OFFSET + SHARED_SVC_HANDLER_SIZE;
 // Linux: 48 + 72 = 120, macOS: 52 + 68 = 120
 
-/// Offset where per-site gates begin (after shared MSR handler).
+/// Offset where the shared MRS handler begins (macOS only; Linux has no shared MRS handler).
+#[cfg(target_os = "macos")]
+const SHARED_MRS_HANDLER_OFFSET: usize = SHARED_MSR_HANDLER_OFFSET + SHARED_MSR_HANDLER_SIZE;
+// macOS: 120 + 68 = 188
+
+/// Offset where per-site gates begin (after all shared handlers).
+#[cfg(target_os = "linux")]
 const GATES_START_OFFSET: usize = SHARED_MSR_HANDLER_OFFSET + SHARED_MSR_HANDLER_SIZE;
-// Linux: 120 + 76 = 196, macOS: 120 + 68 = 188
+// Linux: 120 + 76 = 196
+
+#[cfg(target_os = "macos")]
+const GATES_START_OFFSET: usize = SHARED_MRS_HANDLER_OFFSET + SHARED_MRS_HANDLER_SIZE;
+// macOS: 188 + 64 = 252
 
 // ============================================================
 // Instruction encoders
@@ -859,6 +873,17 @@ pub(crate) fn hook_syscalls_aarch64(
             trampoline_base_addr,
         )?;
 
+        // macOS: shared MRS handler (64 bytes) between MSR handler and gates
+        #[cfg(target_os = "macos")]
+        {
+            debug_assert_eq!(trampoline_data.len(), SHARED_MRS_HANDLER_OFFSET);
+            emit_shared_mrs_handler(
+                &mut trampoline_data,
+                SHARED_MRS_HANDLER_OFFSET,
+                trampoline_base_addr,
+            )?;
+        }
+
         debug_assert_eq!(trampoline_data.len(), GATES_START_OFFSET);
 
         return Ok((trampoline_data, false));
@@ -913,6 +938,17 @@ pub(crate) fn hook_syscalls_aarch64(
         SHARED_MSR_HANDLER_OFFSET,
         trampoline_base_addr,
     )?;
+
+    // macOS: shared MRS handler (64 bytes) between MSR handler and gates
+    #[cfg(target_os = "macos")]
+    {
+        debug_assert_eq!(trampoline_data.len(), SHARED_MRS_HANDLER_OFFSET);
+        emit_shared_mrs_handler(
+            &mut trampoline_data,
+            SHARED_MRS_HANDLER_OFFSET,
+            trampoline_base_addr,
+        )?;
+    }
 
     debug_assert_eq!(trampoline_data.len(), GATES_START_OFFSET);
 
@@ -1945,7 +1981,193 @@ fn emit_shared_msr_handler_macos(
     Ok(())
 }
 
-/// Compute the size of a per-site MSR gate for the given source register.
+/// Emit the shared MRS handler (macOS only).
+///
+/// On Linux there is no shared MRS handler — the MRS gate reads entry[0].guest_tpidr
+/// inline. On macOS the handler does a TPIDRRO_EL0-keyed TLS table lookup to find
+/// the correct TCB and loads guest_tpidr from it into [SP+24] for the gate.
+#[cfg(target_os = "macos")]
+fn emit_shared_mrs_handler(
+    trampoline_data: &mut Vec<u8>,
+    handler_offset: usize,
+    trampoline_base_addr: u64,
+) -> Result<()> {
+    emit_shared_mrs_handler_macos(trampoline_data, handler_offset, trampoline_base_addr)
+}
+
+/// macOS shared MRS handler: TPIDRRO_EL0-keyed lookup, reads guest_tpidr from TCB.
+///
+/// Uses TPIDRRO_EL0 (stable per-pthread, never clobbered) as the TLS table lookup key.
+/// On match: loads host_tls (TCB ptr), reads TCB.guest_tpidr (offset 24), stores to
+/// [SP+24] for the gate to pick up. On sentinel: BRK (unknown thread = bug).
+///
+/// Called via BL from the per-site MRS gate. Gate uses a 48-byte frame with:
+///   [SP+0..15] = saved X16, X17
+///   [SP+16]    = saved X30 (guest LR)
+///   [SP+24]    = output slot (guest_tpidr)
+///   [SP+32]    = BL return address (saved by this handler)
+///
+/// ```text
+///  [0]  STR  X30, [SP, #32]       ; save BL return addr
+///  [1]  MRS  X16, TPIDRRO_EL0     ; stable lookup key
+///  [2]  LDR  X17, [PC, #off]      ; X17 = TLS table base
+///  [3]  LDR  X30, [X17, #0]       ; .Lloop: X30 = entry.tpidrro_el0
+///  [4]  CMN  X30, #1              ; sentinel?
+///  [5]  B.EQ .Ltrap               ; -> [15] (unknown thread = bug)
+///  [6]  CMP  X30, X16             ; match tpidrro?
+///  [7]  B.EQ .Lfound              ; -> [10]
+///  [8]  ADD  X17, X17, #16        ; next entry
+///  [9]  B    .Lloop               ; -> [3]
+/// [10]  LDR  X17, [X17, #8]       ; .Lfound: X17 = host_tls (TCB ptr)
+/// [11]  LDR  X16, [X17, #24]      ; X16 = TCB.guest_tpidr (offset 24)
+/// [12]  STR  X16, [SP, #24]       ; frame[24] = guest_tpidr for gate
+/// [13]  LDR  X30, [SP, #32]       ; restore BL return addr
+/// [14]  RET
+/// [15]  BRK  #1                   ; .Ltrap: unreachable
+/// ```
+#[cfg(target_os = "macos")]
+#[allow(clippy::cast_possible_wrap)]
+fn emit_shared_mrs_handler_macos(
+    trampoline_data: &mut Vec<u8>,
+    handler_offset: usize,
+    trampoline_base_addr: u64,
+) -> Result<()> {
+    let handler_vaddr = trampoline_base_addr + handler_offset as u64;
+    let mut insn_idx: usize = 0;
+    let insn_vaddr = |idx: usize| -> u64 { handler_vaddr + (idx as u64) * 4 };
+    let tls_table_vaddr = trampoline_base_addr + HEADER_TLS_TABLE_OFFSET as u64;
+
+    // [0] STR X30, [SP, #32] — save BL return addr
+    trampoline_data.extend_from_slice(
+        &encode_str_imm_unsigned(30, 31, 32)
+            .expect("offset 32 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [1] MRS X16, TPIDRRO_EL0 — stable lookup key
+    trampoline_data.extend_from_slice(&encode_mrs_tpidrro_el0(16).to_le_bytes());
+    insn_idx += 1;
+
+    // [2] LDR X17, [PC, #offset] — X17 = TLS table base
+    let ldr_tls_vaddr = insn_vaddr(insn_idx);
+    let ldr_tls_offset = tls_table_vaddr.cast_signed() - ldr_tls_vaddr.cast_signed();
+    let ldr_tls_insn = encode_ldr_literal(17, ldr_tls_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "LDR literal offset {ldr_tls_offset:#x} out of range for macOS shared MRS handler TLS load"
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&ldr_tls_insn.to_le_bytes());
+    insn_idx += 1;
+
+    // [3] .Lloop: LDR X30, [X17, #0] — X30 = entry.tpidrro_el0
+    let loop_idx = insn_idx;
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(30, 17, 0)
+            .expect("offset 0 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [4] CMN X30, #1 — sentinel?
+    trampoline_data.extend_from_slice(&encode_cmn_imm(30, 1).expect("imm12=1 fits").to_le_bytes());
+    insn_idx += 1;
+
+    // [5] B.EQ .Ltrap -> [15]
+    let trap_idx = 15usize;
+    let beq_trap_offset = (trap_idx as i64 - insn_idx as i64) * 4;
+    let beq_trap = encode_b_cond(COND_EQ, beq_trap_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "B.EQ offset {beq_trap_offset:#x} out of range in macOS shared MRS handler"
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&beq_trap.to_le_bytes());
+    insn_idx += 1;
+
+    // [6] CMP X30, X16 — match tpidrro?
+    trampoline_data.extend_from_slice(&encode_cmp_reg(30, 16).to_le_bytes());
+    insn_idx += 1;
+
+    // [7] B.EQ .Lfound -> [10]
+    let found_idx = 10usize;
+    let beq_found_offset = (found_idx as i64 - insn_idx as i64) * 4;
+    let beq_found = encode_b_cond(COND_EQ, beq_found_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "B.EQ offset {beq_found_offset:#x} out of range in macOS shared MRS handler"
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&beq_found.to_le_bytes());
+    insn_idx += 1;
+
+    // [8] ADD X17, X17, #16 — next entry
+    trampoline_data.extend_from_slice(
+        &encode_add_imm(17, 17, 16)
+            .expect("imm12=16 fits")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [9] B .Lloop -> [3]
+    let b_loop_offset = (loop_idx as i64 - insn_idx as i64) * 4;
+    let b_loop = encode_b(b_loop_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "B offset {b_loop_offset:#x} out of range in macOS shared MRS handler loop"
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&b_loop.to_le_bytes());
+    insn_idx += 1;
+
+    // [10] .Lfound: LDR X17, [X17, #8] — X17 = host_tls (TCB ptr)
+    debug_assert_eq!(insn_idx, found_idx);
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(17, 17, 8)
+            .expect("offset 8 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [11] LDR X16, [X17, #24] — X16 = TCB.guest_tpidr (offset 24)
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(16, 17, 24)
+            .expect("offset 24 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [12] STR X16, [SP, #24] — frame[24] = guest_tpidr for gate to pick up
+    trampoline_data.extend_from_slice(
+        &encode_str_imm_unsigned(16, 31, 24)
+            .expect("offset 24 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [13] LDR X30, [SP, #32] — restore BL return addr
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(30, 31, 32)
+            .expect("offset 32 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [14] RET
+    trampoline_data.extend_from_slice(&encode_ret(30).to_le_bytes());
+    insn_idx += 1;
+
+    // [15] .Ltrap: BRK #1 — unreachable (unknown thread)
+    debug_assert_eq!(insn_idx, trap_idx);
+    trampoline_data.extend_from_slice(&encode_brk(1).to_le_bytes());
+    insn_idx += 1;
+
+    debug_assert_eq!(insn_idx, SHARED_MRS_HANDLER_INSN_COUNT);
+    debug_assert_eq!(
+        trampoline_data.len() - handler_offset,
+        SHARED_MRS_HANDLER_SIZE,
+        "macOS shared MRS handler size mismatch"
+    );
+
+    Ok(())
+}
 ///
 /// Special registers (X16, X17, X30) need an extra instruction to reload
 /// the saved value before storing to `[SP, #24]`, resulting in 40 bytes.
@@ -2110,8 +2332,25 @@ fn emit_msr_gate(
 
 /// Emit a per-site MRS gate for `MRS Xd, TPIDR_EL0`.
 ///
+/// On Linux: inline TLS table read (5 instructions, 20 bytes).
+/// On macOS: BL to shared MRS handler (9 instructions, 36 bytes, 48-byte frame).
+fn emit_mrs_gate(
+    trampoline_data: &mut Vec<u8>,
+    gate_offset: usize,
+    trampoline_base_addr: u64,
+    site: &PatchSite,
+    rd: u8,
+) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    return emit_mrs_gate_linux(trampoline_data, gate_offset, trampoline_base_addr, site, rd);
+    #[cfg(target_os = "macos")]
+    return emit_mrs_gate_macos(trampoline_data, gate_offset, trampoline_base_addr, site, rd);
+}
+
+/// Linux MRS gate: inline TLS table read, 5 instructions / 20 bytes.
+///
 /// Reads `entry[0].guest_tpidr` directly from the TLS lookup table.
-/// Self-contained (no shared handler needed). 5 instructions / 20 bytes.
+/// Self-contained (no shared handler needed).
 ///
 /// **General case (Xd ∉ {X16, X17}):**
 /// ```text
@@ -2124,7 +2363,9 @@ fn emit_msr_gate(
 ///
 /// **Xd = X16:** use X17 as sole scratch
 /// **Xd = X17:** use X16 as sole scratch
-fn emit_mrs_gate(
+#[cfg(target_os = "linux")]
+#[allow(clippy::cast_possible_wrap)]
+fn emit_mrs_gate_linux(
     trampoline_data: &mut Vec<u8>,
     gate_offset: usize,
     trampoline_base_addr: u64,
@@ -2249,6 +2490,195 @@ fn emit_mrs_gate(
         trampoline_data.len() - gate_offset,
         MRS_GATE_SIZE,
         "MRS gate size mismatch"
+    );
+
+    Ok(())
+}
+
+/// macOS MRS gate: BL to shared MRS handler, 9 instructions / 36 bytes, 48-byte frame.
+///
+/// The shared handler does TPIDRRO_EL0-keyed TLS table lookup, reads TCB.guest_tpidr,
+/// and stores the result to [SP+24]. The gate then loads [SP+24] into the destination register.
+///
+/// **General case (Xd ∉ {X16, X17, X30}):**
+/// ```text
+/// [0] SUB  SP, SP, #48            ; 48-byte frame
+/// [1] STP  X16, X17, [SP]         ; save scratch
+/// [2] STR  X30, [SP, #16]         ; save LR
+/// [3] BL   <shared_mrs_handler>   ; writes guest_tpidr to [SP+24]
+/// [4] LDR  Xd,  [SP, #24]         ; Xd = guest_tpidr
+/// [5] LDP  X16, X17, [SP]         ; restore scratch
+/// [6] LDR  X30, [SP, #16]         ; restore LR
+/// [7] ADD  SP, SP, #48            ; deallocate
+/// [8] B    <return_addr>           ; back to guest
+/// ```
+///
+/// **Xd = X16:** restore X17 and X30 individually, then load X16 from [SP+24]
+/// **Xd = X17:** restore X16 and X30 individually, then load X17 from [SP+24]
+/// **Xd = X30:** restore X16,X17, load X30 from [SP+24], NOP pad to 9 insns
+#[cfg(target_os = "macos")]
+#[allow(clippy::cast_possible_wrap)]
+fn emit_mrs_gate_macos(
+    trampoline_data: &mut Vec<u8>,
+    gate_offset: usize,
+    trampoline_base_addr: u64,
+    site: &PatchSite,
+    rd: u8,
+) -> Result<()> {
+    let gate_vaddr = trampoline_base_addr + gate_offset as u64;
+    let mut insn_idx: usize = 0;
+    let insn_vaddr = |idx: usize| -> u64 { gate_vaddr + (idx as u64) * 4 };
+
+    // [0] SUB SP, SP, #48
+    trampoline_data.extend_from_slice(&encode_sub_sp_imm(48).expect("imm12=48 fits").to_le_bytes());
+    insn_idx += 1;
+
+    // [1] STP X16, X17, [SP]
+    trampoline_data.extend_from_slice(
+        &encode_stp_offset(16, 17, 31, 0)
+            .expect("offset 0 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [2] STR X30, [SP, #16]
+    trampoline_data.extend_from_slice(
+        &encode_str_imm_unsigned(30, 31, 16)
+            .expect("offset 16 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [3] BL <shared_mrs_handler>
+    let bl_vaddr = insn_vaddr(insn_idx);
+    let handler_vaddr = trampoline_base_addr + SHARED_MRS_HANDLER_OFFSET as u64;
+    let bl_offset = handler_vaddr.cast_signed() - bl_vaddr.cast_signed();
+    let bl_insn = encode_bl(bl_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "BL offset {bl_offset:#x} out of range for MRS gate -> shared MRS handler at {:#x}",
+            site.vaddr
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&bl_insn.to_le_bytes());
+    insn_idx += 1;
+
+    // [4]-[7] varies by destination register
+    match rd {
+        16 => {
+            // Xd = X16: restore X17 and X30 individually, then load X16 from [SP+24]
+            // [4] LDR X17, [SP, #8]
+            trampoline_data.extend_from_slice(
+                &encode_ldr_imm_unsigned(17, 31, 8)
+                    .expect("offset 8 valid")
+                    .to_le_bytes(),
+            );
+            insn_idx += 1;
+            // [5] LDR X30, [SP, #16]
+            trampoline_data.extend_from_slice(
+                &encode_ldr_imm_unsigned(30, 31, 16)
+                    .expect("offset 16 valid")
+                    .to_le_bytes(),
+            );
+            insn_idx += 1;
+            // [6] LDR X16, [SP, #24] — X16 = guest_tpidr
+            trampoline_data.extend_from_slice(
+                &encode_ldr_imm_unsigned(16, 31, 24)
+                    .expect("offset 24 valid")
+                    .to_le_bytes(),
+            );
+            insn_idx += 1;
+        }
+        17 => {
+            // Xd = X17: restore X16 and X30 individually, then load X17 from [SP+24]
+            // [4] LDR X16, [SP, #0]
+            trampoline_data.extend_from_slice(
+                &encode_ldr_imm_unsigned(16, 31, 0)
+                    .expect("offset 0 valid")
+                    .to_le_bytes(),
+            );
+            insn_idx += 1;
+            // [5] LDR X30, [SP, #16]
+            trampoline_data.extend_from_slice(
+                &encode_ldr_imm_unsigned(30, 31, 16)
+                    .expect("offset 16 valid")
+                    .to_le_bytes(),
+            );
+            insn_idx += 1;
+            // [6] LDR X17, [SP, #24] — X17 = guest_tpidr
+            trampoline_data.extend_from_slice(
+                &encode_ldr_imm_unsigned(17, 31, 24)
+                    .expect("offset 24 valid")
+                    .to_le_bytes(),
+            );
+            insn_idx += 1;
+        }
+        30 => {
+            // Xd = X30: restore X16,X17, load X30 from [SP+24], NOP pad
+            // [4] LDP X16, X17, [SP]
+            trampoline_data.extend_from_slice(
+                &encode_ldp_offset(16, 17, 31, 0)
+                    .expect("offset 0 valid")
+                    .to_le_bytes(),
+            );
+            insn_idx += 1;
+            // [5] LDR X30, [SP, #24] — X30 = guest_tpidr
+            trampoline_data.extend_from_slice(
+                &encode_ldr_imm_unsigned(30, 31, 24)
+                    .expect("offset 24 valid")
+                    .to_le_bytes(),
+            );
+            insn_idx += 1;
+            // [6] NOP — pad to 9 instructions for uniform gate size
+            trampoline_data.extend_from_slice(&NOP.to_le_bytes());
+            insn_idx += 1;
+        }
+        _ => {
+            // General case: Xd ∉ {X16, X17, X30}
+            // [4] LDR Xd, [SP, #24] — Xd = guest_tpidr
+            trampoline_data.extend_from_slice(
+                &encode_ldr_imm_unsigned(rd, 31, 24)
+                    .expect("offset 24 valid")
+                    .to_le_bytes(),
+            );
+            insn_idx += 1;
+            // [5] LDP X16, X17, [SP]
+            trampoline_data.extend_from_slice(
+                &encode_ldp_offset(16, 17, 31, 0)
+                    .expect("offset 0 valid")
+                    .to_le_bytes(),
+            );
+            insn_idx += 1;
+            // [6] LDR X30, [SP, #16]
+            trampoline_data.extend_from_slice(
+                &encode_ldr_imm_unsigned(30, 31, 16)
+                    .expect("offset 16 valid")
+                    .to_le_bytes(),
+            );
+            insn_idx += 1;
+        }
+    }
+
+    // [7] ADD SP, SP, #48
+    trampoline_data.extend_from_slice(&encode_add_sp_imm(48).expect("imm12=48 fits").to_le_bytes());
+    insn_idx += 1;
+
+    // [8] B <return_addr>
+    let ret_vaddr = insn_vaddr(insn_idx);
+    let ret_offset = (site.vaddr + 4).cast_signed() - ret_vaddr.cast_signed();
+    let ret_insn = encode_b(ret_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "B offset {ret_offset:#x} out of ±128MB range for return from MRS gate at {:#x}",
+            site.vaddr
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&ret_insn.to_le_bytes());
+    insn_idx += 1;
+
+    debug_assert_eq!(insn_idx, MRS_GATE_INSN_COUNT);
+    debug_assert_eq!(
+        trampoline_data.len() - gate_offset,
+        MRS_GATE_SIZE,
+        "macOS MRS gate size mismatch"
     );
 
     Ok(())
