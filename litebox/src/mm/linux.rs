@@ -671,6 +671,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     None => return Err(AllocationError::OutOfMemory),
                 };
                 let safe_range = safe_addr..(safe_addr + size);
+                // Use Hint (not NoReplace/MAP_FIXED) for the retry: the VMA
+                // tree doesn't know about all host-side mappings (e.g. dyld,
+                // system libraries), so the "safe" address may actually be
+                // occupied in the host's VM.  With Hint the platform is free
+                // to choose a genuinely available address.
                 let retry_ret = self
                     .platform
                     .allocate_pages(
@@ -678,13 +683,28 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                         permissions_enum,
                         can_grow_down,
                         populate_pages_immediately,
-                        FixedAddressBehavior::NoReplace,
+                        FixedAddressBehavior::Hint,
                     )
                     .map_err(|err| match err {
                         AllocationError::AddressInUse => AllocationError::AddressInUseByPlatform,
                         other => other,
                     })?;
                 new_start = retry_ret.as_usize();
+                #[cfg(target_os = "macos")]
+                mm_diag!("[insert_mapping] brk-zone retry returned addr={:#x}", new_start);
+                // Defensive: if the platform placed the retry ALSO inside the
+                // brk zone (shouldn't happen with a free Hint, but be safe),
+                // deallocate and fail rather than corrupt the brk region.
+                let retry_end = new_start + size;
+                if new_start < self.brk_reserved_end && retry_end > brk_start {
+                    #[cfg(target_os = "macos")]
+                    mm_diag!("[insert_mapping] brk-zone retry STILL in brk zone, giving up");
+                    let bad_range2 = new_start..retry_end;
+                    unsafe {
+                        let _ = self.platform.deallocate_pages(bad_range2);
+                    }
+                    return Err(AllocationError::OutOfMemory);
+                }
             }
         }
 
