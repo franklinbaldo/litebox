@@ -143,6 +143,26 @@ const SHARED_MRS_HANDLER_INSN_COUNT: usize = 16;
 #[cfg(target_os = "macos")]
 const SHARED_MRS_HANDLER_SIZE: usize = SHARED_MRS_HANDLER_INSN_COUNT * 4; // 64
 
+// ---- macOS shared x18 load handler (TPIDRRO_EL0 → TCB → guest_x18 → [SP+24]) ----
+#[cfg(any(target_os = "macos", test))]
+const SHARED_X18_LOAD_HANDLER_INSN_COUNT: usize = 16;
+#[cfg(any(target_os = "macos", test))]
+const SHARED_X18_LOAD_HANDLER_SIZE: usize = SHARED_X18_LOAD_HANDLER_INSN_COUNT * 4; // 64
+
+// ---- macOS shared x18 save handler (reads [SP+24] → TPIDRRO_EL0 → TCB → guest_x18) ----
+#[cfg(any(target_os = "macos", test))]
+const SHARED_X18_SAVE_HANDLER_INSN_COUNT: usize = 16;
+#[cfg(any(target_os = "macos", test))]
+const SHARED_X18_SAVE_HANDLER_SIZE: usize = SHARED_X18_SAVE_HANDLER_INSN_COUNT * 4; // 64
+
+// ---- macOS x18 gate layout ----
+#[cfg(any(target_os = "macos", test))]
+const X18_GATE_READ_INSN_COUNT: usize = 10;
+#[cfg(any(target_os = "macos", test))]
+const X18_GATE_WRITE_INSN_COUNT: usize = 10;
+#[cfg(any(target_os = "macos", test))]
+const X18_GATE_READWRITE_INSN_COUNT: usize = 12;
+
 /// ARM64 NOP instruction.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const NOP: u32 = 0xD503201F;
@@ -174,14 +194,25 @@ const SHARED_MSR_HANDLER_OFFSET: usize = SHARED_SVC_HANDLER_OFFSET + SHARED_SVC_
 const SHARED_MRS_HANDLER_OFFSET: usize = SHARED_MSR_HANDLER_OFFSET + SHARED_MSR_HANDLER_SIZE;
 // macOS: 120 + 68 = 188
 
+/// Offset where the shared x18 load handler begins (macOS only).
+#[cfg(target_os = "macos")]
+const SHARED_X18_LOAD_HANDLER_OFFSET: usize = SHARED_MRS_HANDLER_OFFSET + SHARED_MRS_HANDLER_SIZE;
+// macOS: 188 + 64 = 252
+
+/// Offset where the shared x18 save handler begins (macOS only).
+#[cfg(target_os = "macos")]
+const SHARED_X18_SAVE_HANDLER_OFFSET: usize =
+    SHARED_X18_LOAD_HANDLER_OFFSET + SHARED_X18_LOAD_HANDLER_SIZE;
+// macOS: 252 + 64 = 316
+
 /// Offset where per-site gates begin (after all shared handlers).
 #[cfg(target_os = "linux")]
 const GATES_START_OFFSET: usize = SHARED_MSR_HANDLER_OFFSET + SHARED_MSR_HANDLER_SIZE;
 // Linux: 120 + 76 = 196
 
 #[cfg(target_os = "macos")]
-const GATES_START_OFFSET: usize = SHARED_MRS_HANDLER_OFFSET + SHARED_MRS_HANDLER_SIZE;
-// macOS: 188 + 64 = 252
+const GATES_START_OFFSET: usize = SHARED_X18_SAVE_HANDLER_OFFSET + SHARED_X18_SAVE_HANDLER_SIZE;
+// macOS: 316 + 64 = 380
 
 // ============================================================
 // Instruction encoders
@@ -725,6 +756,175 @@ enum PatchKind {
     },
 }
 
+// ============================================================
+// macOS x18 detection and rewriting (cfg-gated for test too)
+// ============================================================
+
+/// Check if an ARM64 instruction references register x18.
+///
+/// Uses yaxpeax-arm to decode the instruction and inspect operands. If the decoder
+/// fails (rare), falls back to a conservative bit-field check.
+///
+/// Returns `true` if any operand is a general-purpose register with number 18,
+/// including inside memory addressing modes (base register, index register, etc.).
+#[cfg(any(target_os = "macos", test))]
+fn references_x18(insn: u32) -> bool {
+    // Fast path: if no standard register bit field contains 18, skip
+    let rd = insn & 0x1F;
+    let rn = (insn >> 5) & 0x1F;
+    let rm = (insn >> 16) & 0x1F;
+    let rt2 = (insn >> 10) & 0x1F;
+    if rd != 18 && rn != 18 && rm != 18 && rt2 != 18 {
+        return false;
+    }
+
+    // Decode with yaxpeax-arm to confirm the bit field is actually a register operand
+    use yaxpeax_arch::Decoder;
+    use yaxpeax_arm::armv8::a64::{InstDecoder, Operand};
+
+    let decoder = InstDecoder::default();
+    let word = insn.to_le_bytes();
+    let mut reader = yaxpeax_arch::U8Reader::new(&word);
+    let inst = match decoder.decode(&mut reader) {
+        Ok(inst) => inst,
+        Err(_) => {
+            // Decoder failed — use conservative bit-field check
+            return true;
+        }
+    };
+
+    // Helper: check if a register number is 18
+    fn has_x18_in_operand(op: &Operand) -> bool {
+        match op {
+            Operand::Register(_, reg) if *reg == 18 => true,
+            Operand::RegisterPair(_, reg) if *reg == 18 || *reg + 1 == 18 => true,
+            Operand::RegisterOrSP(_, reg) if *reg == 18 => true,
+            Operand::RegShift(_, _, _, reg) if *reg == 18 => true,
+            Operand::RegRegOffset(base, idx, _, _, _) if *base == 18 || *idx == 18 => true,
+            Operand::RegPreIndex(reg, _, _) if *reg == 18 => true,
+            Operand::RegPostIndex(reg, _) if *reg == 18 => true,
+            Operand::RegPostIndexReg(reg, reg2) if *reg == 18 || *reg2 == 18 => true,
+            _ => false,
+        }
+    }
+
+    inst.operands.iter().any(has_x18_in_operand)
+}
+
+/// Check if an ARM64 instruction is a store (writes to memory).
+///
+/// Uses the top byte of the instruction encoding to classify common store patterns.
+/// This is conservative — instructions not recognized as stores are treated as
+/// non-stores (loads or arithmetic), which is the safe default for read/write analysis.
+#[cfg(any(target_os = "macos", test))]
+fn is_store_instruction(insn: u32) -> bool {
+    use yaxpeax_arch::Decoder;
+    use yaxpeax_arm::armv8::a64::{InstDecoder, Opcode};
+
+    let decoder = InstDecoder::default();
+    let word = insn.to_le_bytes();
+    let mut reader = yaxpeax_arch::U8Reader::new(&word);
+    let inst = match decoder.decode(&mut reader) {
+        Ok(inst) => inst,
+        Err(_) => return false,
+    };
+
+    matches!(
+        inst.opcode,
+        Opcode::STP
+            | Opcode::STR
+            | Opcode::STUR
+            | Opcode::STRB
+            | Opcode::STURB
+            | Opcode::STRH
+            | Opcode::STURH
+            | Opcode::STLR
+            | Opcode::STLRB
+            | Opcode::STLRH
+            | Opcode::STXR
+            | Opcode::STXRB
+            | Opcode::STXRH
+            | Opcode::STLXR
+            | Opcode::STLXRB
+            | Opcode::STLXRH
+            | Opcode::STNP
+            | Opcode::STXP
+            | Opcode::STLXP
+    )
+}
+
+/// Rewrite an instruction that references x18, replacing x18 with a scratch register.
+///
+/// Returns `(rewritten_insn, scratch_reg, is_read, is_write)`.
+///
+/// Scratch register is X17 by default, or X16 if the instruction already uses X17
+/// in a non-x18 role.
+#[cfg(any(target_os = "macos", test))]
+fn rewrite_x18(insn: u32) -> (u32, u8, bool, bool) {
+    // Determine if instruction uses X17 in a non-x18 field — if so, use X16 as scratch
+    let rd = insn & 0x1F;
+    let rn = (insn >> 5) & 0x1F;
+    let rm = (insn >> 16) & 0x1F;
+    let rt2 = (insn >> 10) & 0x1F;
+
+    let uses_x17 = (rd == 17 && rd != 18)
+        || (rn == 17 && rn != 18)
+        || (rm == 17 && rm != 18)
+        || (rt2 == 17 && rt2 != 18);
+    let scratch = if uses_x17 { 16u8 } else { 17u8 };
+
+    let mut result = insn;
+    let mut is_read = false;
+    let mut is_write = false;
+
+    let is_store = is_store_instruction(insn);
+
+    // Rd (bits 4:0) — destination for most insns, but Rt (source) for stores
+    if (result & 0x1F) == 18 {
+        result = (result & !0x1F) | (scratch as u32);
+        if is_store {
+            is_read = true;
+        } else {
+            is_write = true;
+        }
+    }
+
+    // Rn (bits 9:5) — first source/base register (read)
+    if ((result >> 5) & 0x1F) == 18 {
+        result = (result & !(0x1F << 5)) | ((scratch as u32) << 5);
+        is_read = true;
+    }
+
+    // Rm (bits 20:16) — second source register (read)
+    if ((result >> 16) & 0x1F) == 18 {
+        result = (result & !(0x1F << 16)) | ((scratch as u32) << 16);
+        is_read = true;
+    }
+
+    // Rt2 (bits 14:10) — second transfer register in LDP/STP
+    if ((result >> 10) & 0x1F) == 18 {
+        result = (result & !(0x1F << 10)) | ((scratch as u32) << 10);
+        if is_store {
+            is_read = true;
+        } else {
+            is_write = true;
+        }
+    }
+
+    (result, scratch, is_read, is_write)
+}
+
+/// Compute the gate size for an x18-referencing instruction.
+#[cfg(any(target_os = "macos", test))]
+fn x18_gate_size(is_read: bool, is_write: bool) -> usize {
+    if is_read && is_write {
+        X18_GATE_READWRITE_INSN_COUNT * 4
+    } else {
+        // Both read-only and write-only are 10 insns
+        X18_GATE_READ_INSN_COUNT * 4
+    }
+}
+
 /// Scan executable sections for `SVC #0`, `MSR TPIDR_EL0, Xt`, and
 /// `MRS Xd, TPIDR_EL0` instructions.
 ///
@@ -766,6 +966,28 @@ fn find_patch_sites(sections: &[TextSectionInfo], buf: &[u8]) -> Result<Vec<Patc
                     vaddr: section.vaddr + i as u64,
                     kind: PatchKind::MrsTpidr(rd),
                 });
+            }
+            // macOS: check for x18 references (after SVC/MSR/MRS checks to avoid double-patching)
+            #[cfg(target_os = "macos")]
+            {
+                if insn != SVC_0
+                    && (insn & MSR_TPIDR_EL0_MASK) != MSR_TPIDR_EL0_BITS
+                    && (insn & MRS_TPIDR_EL0_MASK) != MRS_TPIDR_EL0_BITS
+                    && references_x18(insn)
+                {
+                    let (rewritten, scratch, is_read, is_write) = rewrite_x18(insn);
+                    sites.push(PatchSite {
+                        file_offset: start + i,
+                        vaddr: section.vaddr + i as u64,
+                        kind: PatchKind::X18Use {
+                            insn,
+                            rewritten,
+                            scratch,
+                            is_read,
+                            is_write,
+                        },
+                    });
+                }
             }
         }
     }
@@ -820,7 +1042,14 @@ pub(crate) fn hook_syscalls_aarch64(
         .iter()
         .any(|s| matches!(s.kind, PatchKind::MsrTpidr(_) | PatchKind::MrsTpidr(_)));
 
-    if !has_svc && !has_tpidr_sites {
+    #[cfg(target_os = "macos")]
+    let has_x18_sites = sites
+        .iter()
+        .any(|s| matches!(s.kind, PatchKind::X18Use { .. }));
+    #[cfg(not(target_os = "macos"))]
+    let has_x18_sites = false;
+
+    if !has_svc && !has_tpidr_sites && !has_x18_sites {
         // No patch sites at all. Produce a minimal trampoline containing
         // the full shared layout (header + sigreturn gate + shared handlers).
         // This is needed for dynamically linked binaries where all syscalls are in
@@ -880,6 +1109,28 @@ pub(crate) fn hook_syscalls_aarch64(
             emit_shared_mrs_handler(
                 &mut trampoline_data,
                 SHARED_MRS_HANDLER_OFFSET,
+                trampoline_base_addr,
+            )?;
+        }
+
+        // macOS: shared x18 load handler (64 bytes)
+        #[cfg(target_os = "macos")]
+        {
+            debug_assert_eq!(trampoline_data.len(), SHARED_X18_LOAD_HANDLER_OFFSET);
+            emit_shared_x18_load_handler(
+                &mut trampoline_data,
+                SHARED_X18_LOAD_HANDLER_OFFSET,
+                trampoline_base_addr,
+            )?;
+        }
+
+        // macOS: shared x18 save handler (64 bytes)
+        #[cfg(target_os = "macos")]
+        {
+            debug_assert_eq!(trampoline_data.len(), SHARED_X18_SAVE_HANDLER_OFFSET);
+            emit_shared_x18_save_handler(
+                &mut trampoline_data,
+                SHARED_X18_SAVE_HANDLER_OFFSET,
                 trampoline_base_addr,
             )?;
         }
@@ -950,6 +1201,28 @@ pub(crate) fn hook_syscalls_aarch64(
         )?;
     }
 
+    // macOS: shared x18 load handler (64 bytes)
+    #[cfg(target_os = "macos")]
+    {
+        debug_assert_eq!(trampoline_data.len(), SHARED_X18_LOAD_HANDLER_OFFSET);
+        emit_shared_x18_load_handler(
+            &mut trampoline_data,
+            SHARED_X18_LOAD_HANDLER_OFFSET,
+            trampoline_base_addr,
+        )?;
+    }
+
+    // macOS: shared x18 save handler (64 bytes)
+    #[cfg(target_os = "macos")]
+    {
+        debug_assert_eq!(trampoline_data.len(), SHARED_X18_SAVE_HANDLER_OFFSET);
+        emit_shared_x18_save_handler(
+            &mut trampoline_data,
+            SHARED_X18_SAVE_HANDLER_OFFSET,
+            trampoline_base_addr,
+        )?;
+    }
+
     debug_assert_eq!(trampoline_data.len(), GATES_START_OFFSET);
 
     // Generate per-site gates and patch original code
@@ -985,10 +1258,23 @@ pub(crate) fn hook_syscalls_aarch64(
                 )?;
             }
             #[cfg(target_os = "macos")]
-            PatchKind::X18Use { .. } => {
-                return Err(Error::DisassemblyFailure(
-                    "x18 gate emission not yet implemented".into(),
-                ));
+            PatchKind::X18Use {
+                rewritten,
+                scratch,
+                is_read,
+                is_write,
+                ..
+            } => {
+                emit_x18_gate(
+                    &mut trampoline_data,
+                    gate_offset,
+                    trampoline_base_addr,
+                    site,
+                    rewritten,
+                    scratch,
+                    is_read,
+                    is_write,
+                )?;
             }
         }
 
@@ -2168,6 +2454,580 @@ fn emit_shared_mrs_handler_macos(
 
     Ok(())
 }
+
+/// macOS shared x18 load handler: TPIDRRO_EL0-keyed lookup, reads guest_x18 from TCB.
+///
+/// Same TPIDRRO_EL0 scan pattern as the MRS handler, but reads TCB offset 40 (guest_x18)
+/// instead of offset 24 (guest_tpidr). Stores the loaded value to [SP+24] for the gate.
+///
+/// Called via BL from the per-site x18 gate (read case). Gate uses a 48-byte frame with:
+///   [SP+0]  = X16, [SP+8] = X17, [SP+16] = X30 (guest LR), [SP+24] = transfer slot,
+///   [SP+32] = BL return addr (saved/restored by this handler).
+///
+/// ```text
+///  [0]  STR  X30, [SP, #32]         ; save BL return addr
+///  [1]  MRS  X16, TPIDRRO_EL0       ; stable key
+///  [2]  LDR  X17, [PC, #off]        ; X17 = TLS table base
+///  [3]  LDR  X30, [X17, #0]         ; .Lloop: X30 = entry.tpidrro
+///  [4]  CMN  X30, #1                ; sentinel?
+///  [5]  B.EQ .Ltrap                 ; -> [15]
+///  [6]  CMP  X30, X16               ; match?
+///  [7]  B.EQ .Lfound                ; -> [10]
+///  [8]  ADD  X17, X17, #16          ; next entry
+///  [9]  B    .Lloop                 ; -> [3]
+/// [10]  LDR  X17, [X17, #8]         ; .Lfound: X17 = host_tls (TCB ptr)
+/// [11]  LDR  X16, [X17, #40]        ; X16 = TCB.guest_x18 (offset 40)
+/// [12]  STR  X16, [SP, #24]         ; frame[24] = guest_x18 for gate to pick up
+/// [13]  LDR  X30, [SP, #32]         ; restore BL return addr
+/// [14]  RET
+/// [15]  BRK  #1                     ; trap
+/// ```
+#[cfg(target_os = "macos")]
+#[allow(clippy::cast_possible_wrap)]
+fn emit_shared_x18_load_handler(
+    trampoline_data: &mut Vec<u8>,
+    handler_offset: usize,
+    trampoline_base_addr: u64,
+) -> Result<()> {
+    let handler_vaddr = trampoline_base_addr + handler_offset as u64;
+    let mut insn_idx: usize = 0;
+    let insn_vaddr = |idx: usize| -> u64 { handler_vaddr + (idx as u64) * 4 };
+    let tls_table_vaddr = trampoline_base_addr + HEADER_TLS_TABLE_OFFSET as u64;
+
+    // [0] STR X30, [SP, #32] — save BL return addr
+    trampoline_data.extend_from_slice(
+        &encode_str_imm_unsigned(30, 31, 32)
+            .expect("offset 32 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [1] MRS X16, TPIDRRO_EL0 — stable lookup key
+    trampoline_data.extend_from_slice(&encode_mrs_tpidrro_el0(16).to_le_bytes());
+    insn_idx += 1;
+
+    // [2] LDR X17, [PC, #offset] — X17 = TLS table base
+    let ldr_tls_vaddr = insn_vaddr(insn_idx);
+    let ldr_tls_offset = tls_table_vaddr.cast_signed() - ldr_tls_vaddr.cast_signed();
+    let ldr_tls_insn = encode_ldr_literal(17, ldr_tls_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "LDR literal offset {ldr_tls_offset:#x} out of range for macOS shared x18 load handler TLS load"
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&ldr_tls_insn.to_le_bytes());
+    insn_idx += 1;
+
+    // [3] .Lloop: LDR X30, [X17, #0] — X30 = entry.tpidrro_el0
+    let loop_idx = insn_idx;
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(30, 17, 0)
+            .expect("offset 0 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [4] CMN X30, #1 — sentinel?
+    trampoline_data.extend_from_slice(&encode_cmn_imm(30, 1).expect("imm12=1 fits").to_le_bytes());
+    insn_idx += 1;
+
+    // [5] B.EQ .Ltrap -> [15]
+    let trap_idx = 15usize;
+    let beq_trap_offset = (trap_idx as i64 - insn_idx as i64) * 4;
+    let beq_trap = encode_b_cond(COND_EQ, beq_trap_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "B.EQ offset {beq_trap_offset:#x} out of range in macOS shared x18 load handler"
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&beq_trap.to_le_bytes());
+    insn_idx += 1;
+
+    // [6] CMP X30, X16 — match tpidrro?
+    trampoline_data.extend_from_slice(&encode_cmp_reg(30, 16).to_le_bytes());
+    insn_idx += 1;
+
+    // [7] B.EQ .Lfound -> [10]
+    let found_idx = 10usize;
+    let beq_found_offset = (found_idx as i64 - insn_idx as i64) * 4;
+    let beq_found = encode_b_cond(COND_EQ, beq_found_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "B.EQ offset {beq_found_offset:#x} out of range in macOS shared x18 load handler"
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&beq_found.to_le_bytes());
+    insn_idx += 1;
+
+    // [8] ADD X17, X17, #16 — next entry
+    trampoline_data.extend_from_slice(
+        &encode_add_imm(17, 17, 16)
+            .expect("imm12=16 fits")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [9] B .Lloop -> [3]
+    let b_loop_offset = (loop_idx as i64 - insn_idx as i64) * 4;
+    let b_loop = encode_b(b_loop_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "B offset {b_loop_offset:#x} out of range in macOS shared x18 load handler loop"
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&b_loop.to_le_bytes());
+    insn_idx += 1;
+
+    // [10] .Lfound: LDR X17, [X17, #8] — X17 = host_tls (TCB ptr)
+    debug_assert_eq!(insn_idx, found_idx);
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(17, 17, 8)
+            .expect("offset 8 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [11] LDR X16, [X17, #40] — X16 = TCB.guest_x18 (offset 40)
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(16, 17, 40)
+            .expect("offset 40 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [12] STR X16, [SP, #24] — frame[24] = guest_x18 for gate to pick up
+    trampoline_data.extend_from_slice(
+        &encode_str_imm_unsigned(16, 31, 24)
+            .expect("offset 24 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [13] LDR X30, [SP, #32] — restore BL return addr
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(30, 31, 32)
+            .expect("offset 32 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [14] RET
+    trampoline_data.extend_from_slice(&encode_ret(30).to_le_bytes());
+    insn_idx += 1;
+
+    // [15] .Ltrap: BRK #1 — unreachable (unknown thread)
+    debug_assert_eq!(insn_idx, trap_idx);
+    trampoline_data.extend_from_slice(&encode_brk(1).to_le_bytes());
+    insn_idx += 1;
+
+    debug_assert_eq!(insn_idx, SHARED_X18_LOAD_HANDLER_INSN_COUNT);
+    debug_assert_eq!(
+        trampoline_data.len() - handler_offset,
+        SHARED_X18_LOAD_HANDLER_SIZE,
+        "macOS shared x18 load handler size mismatch"
+    );
+
+    Ok(())
+}
+
+/// macOS shared x18 save handler: reads [SP+24] and stores to TCB.guest_x18.
+///
+/// Same TPIDRRO_EL0 scan pattern as the load handler, but reads the new x18 value
+/// from [SP+24] and writes it to TCB offset 40 (guest_x18).
+///
+/// Called via BL from the per-site x18 gate (write case). Gate uses the same 48-byte frame.
+///
+/// ```text
+///  [0]  STR  X30, [SP, #32]         ; save BL return addr
+///  [1]  MRS  X16, TPIDRRO_EL0       ; stable key
+///  [2]  LDR  X17, [PC, #off]        ; X17 = TLS table base
+///  [3]  LDR  X30, [X17, #0]         ; .Lloop: X30 = entry.tpidrro
+///  [4]  CMN  X30, #1                ; sentinel?
+///  [5]  B.EQ .Ltrap                 ; -> [15]
+///  [6]  CMP  X30, X16               ; match?
+///  [7]  B.EQ .Lfound                ; -> [10]
+///  [8]  ADD  X17, X17, #16          ; next entry
+///  [9]  B    .Lloop                 ; -> [3]
+/// [10]  LDR  X17, [X17, #8]         ; .Lfound: X17 = host_tls (TCB ptr)
+/// [11]  LDR  X16, [SP, #24]         ; X16 = new guest_x18 value (from gate)
+/// [12]  STR  X16, [X17, #40]        ; TCB.guest_x18 = new value (offset 40)
+/// [13]  LDR  X30, [SP, #32]         ; restore BL return addr
+/// [14]  RET
+/// [15]  BRK  #1                     ; trap
+/// ```
+#[cfg(target_os = "macos")]
+#[allow(clippy::cast_possible_wrap)]
+fn emit_shared_x18_save_handler(
+    trampoline_data: &mut Vec<u8>,
+    handler_offset: usize,
+    trampoline_base_addr: u64,
+) -> Result<()> {
+    let handler_vaddr = trampoline_base_addr + handler_offset as u64;
+    let mut insn_idx: usize = 0;
+    let insn_vaddr = |idx: usize| -> u64 { handler_vaddr + (idx as u64) * 4 };
+    let tls_table_vaddr = trampoline_base_addr + HEADER_TLS_TABLE_OFFSET as u64;
+
+    // [0] STR X30, [SP, #32] — save BL return addr
+    trampoline_data.extend_from_slice(
+        &encode_str_imm_unsigned(30, 31, 32)
+            .expect("offset 32 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [1] MRS X16, TPIDRRO_EL0 — stable lookup key
+    trampoline_data.extend_from_slice(&encode_mrs_tpidrro_el0(16).to_le_bytes());
+    insn_idx += 1;
+
+    // [2] LDR X17, [PC, #offset] — X17 = TLS table base
+    let ldr_tls_vaddr = insn_vaddr(insn_idx);
+    let ldr_tls_offset = tls_table_vaddr.cast_signed() - ldr_tls_vaddr.cast_signed();
+    let ldr_tls_insn = encode_ldr_literal(17, ldr_tls_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "LDR literal offset {ldr_tls_offset:#x} out of range for macOS shared x18 save handler TLS load"
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&ldr_tls_insn.to_le_bytes());
+    insn_idx += 1;
+
+    // [3] .Lloop: LDR X30, [X17, #0] — X30 = entry.tpidrro_el0
+    let loop_idx = insn_idx;
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(30, 17, 0)
+            .expect("offset 0 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [4] CMN X30, #1 — sentinel?
+    trampoline_data.extend_from_slice(&encode_cmn_imm(30, 1).expect("imm12=1 fits").to_le_bytes());
+    insn_idx += 1;
+
+    // [5] B.EQ .Ltrap -> [15]
+    let trap_idx = 15usize;
+    let beq_trap_offset = (trap_idx as i64 - insn_idx as i64) * 4;
+    let beq_trap = encode_b_cond(COND_EQ, beq_trap_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "B.EQ offset {beq_trap_offset:#x} out of range in macOS shared x18 save handler"
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&beq_trap.to_le_bytes());
+    insn_idx += 1;
+
+    // [6] CMP X30, X16 — match tpidrro?
+    trampoline_data.extend_from_slice(&encode_cmp_reg(30, 16).to_le_bytes());
+    insn_idx += 1;
+
+    // [7] B.EQ .Lfound -> [10]
+    let found_idx = 10usize;
+    let beq_found_offset = (found_idx as i64 - insn_idx as i64) * 4;
+    let beq_found = encode_b_cond(COND_EQ, beq_found_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "B.EQ offset {beq_found_offset:#x} out of range in macOS shared x18 save handler"
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&beq_found.to_le_bytes());
+    insn_idx += 1;
+
+    // [8] ADD X17, X17, #16 — next entry
+    trampoline_data.extend_from_slice(
+        &encode_add_imm(17, 17, 16)
+            .expect("imm12=16 fits")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [9] B .Lloop -> [3]
+    let b_loop_offset = (loop_idx as i64 - insn_idx as i64) * 4;
+    let b_loop = encode_b(b_loop_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "B offset {b_loop_offset:#x} out of range in macOS shared x18 save handler loop"
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&b_loop.to_le_bytes());
+    insn_idx += 1;
+
+    // [10] .Lfound: LDR X17, [X17, #8] — X17 = host_tls (TCB ptr)
+    debug_assert_eq!(insn_idx, found_idx);
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(17, 17, 8)
+            .expect("offset 8 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [11] LDR X16, [SP, #24] — X16 = new guest_x18 value (from gate)
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(16, 31, 24)
+            .expect("offset 24 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [12] STR X16, [X17, #40] — TCB.guest_x18 = new value (offset 40)
+    trampoline_data.extend_from_slice(
+        &encode_str_imm_unsigned(16, 17, 40)
+            .expect("offset 40 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [13] LDR X30, [SP, #32] — restore BL return addr
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(30, 31, 32)
+            .expect("offset 32 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [14] RET
+    trampoline_data.extend_from_slice(&encode_ret(30).to_le_bytes());
+    insn_idx += 1;
+
+    // [15] .Ltrap: BRK #1 — unreachable (unknown thread)
+    debug_assert_eq!(insn_idx, trap_idx);
+    trampoline_data.extend_from_slice(&encode_brk(1).to_le_bytes());
+    insn_idx += 1;
+
+    debug_assert_eq!(insn_idx, SHARED_X18_SAVE_HANDLER_INSN_COUNT);
+    debug_assert_eq!(
+        trampoline_data.len() - handler_offset,
+        SHARED_X18_SAVE_HANDLER_SIZE,
+        "macOS shared x18 save handler size mismatch"
+    );
+
+    Ok(())
+}
+
+/// Emit a per-site x18 gate for instructions that reference x18 (macOS only).
+///
+/// Depending on whether x18 is read, written, or both, the gate layout varies:
+///
+/// **x18-read-only** (10 insns / 40 bytes):
+/// ```text
+/// [0] SUB  SP, SP, #48
+/// [1] STP  X16, X17, [SP]
+/// [2] STR  X30, [SP, #16]
+/// [3] BL   <shared_x18_load>      ; writes guest_x18 to [SP+24]
+/// [4] LDR  Xscratch, [SP, #24]    ; scratch = guest_x18
+/// [5] <rewritten instruction>
+/// [6] LDP  X16, X17, [SP]
+/// [7] LDR  X30, [SP, #16]
+/// [8] ADD  SP, SP, #48
+/// [9] B    <return_addr>
+/// ```
+///
+/// **x18-write-only** (10 insns / 40 bytes):
+/// ```text
+/// [0] SUB  SP, SP, #48
+/// [1] STP  X16, X17, [SP]
+/// [2] STR  X30, [SP, #16]
+/// [3] <rewritten instruction>
+/// [4] STR  Xscratch, [SP, #24]
+/// [5] BL   <shared_x18_save>
+/// [6] LDP  X16, X17, [SP]
+/// [7] LDR  X30, [SP, #16]
+/// [8] ADD  SP, SP, #48
+/// [9] B    <return_addr>
+/// ```
+///
+/// **x18-read-write** (12 insns / 48 bytes):
+/// ```text
+/// [0]  SUB  SP, SP, #48
+/// [1]  STP  X16, X17, [SP]
+/// [2]  STR  X30, [SP, #16]
+/// [3]  BL   <shared_x18_load>
+/// [4]  LDR  Xscratch, [SP, #24]
+/// [5]  <rewritten instruction>
+/// [6]  STR  Xscratch, [SP, #24]
+/// [7]  BL   <shared_x18_save>
+/// [8]  LDP  X16, X17, [SP]
+/// [9]  LDR  X30, [SP, #16]
+/// [10] ADD  SP, SP, #48
+/// [11] B    <return_addr>
+/// ```
+#[cfg(target_os = "macos")]
+#[allow(clippy::cast_possible_wrap)]
+fn emit_x18_gate(
+    trampoline_data: &mut Vec<u8>,
+    gate_offset: usize,
+    trampoline_base_addr: u64,
+    site: &PatchSite,
+    rewritten: u32,
+    scratch: u8,
+    is_read: bool,
+    is_write: bool,
+) -> Result<()> {
+    let gate_vaddr = trampoline_base_addr + gate_offset as u64;
+    let gate_size = x18_gate_size(is_read, is_write);
+    let gate_insn_count = gate_size / 4;
+    let mut insn_idx: usize = 0;
+    let insn_vaddr = |idx: usize| -> u64 { gate_vaddr + (idx as u64) * 4 };
+
+    // [0] SUB SP, SP, #48
+    trampoline_data.extend_from_slice(&encode_sub_sp_imm(48).expect("imm12=48 fits").to_le_bytes());
+    insn_idx += 1;
+
+    // [1] STP X16, X17, [SP]
+    trampoline_data.extend_from_slice(
+        &encode_stp_offset(16, 17, 31, 0)
+            .expect("offset 0 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [2] STR X30, [SP, #16]
+    trampoline_data.extend_from_slice(
+        &encode_str_imm_unsigned(30, 31, 16)
+            .expect("offset 16 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    if is_read && is_write {
+        // Read-write path: load, execute, save
+
+        // [3] BL <shared_x18_load>
+        let bl_vaddr = insn_vaddr(insn_idx);
+        let load_handler_vaddr = trampoline_base_addr + SHARED_X18_LOAD_HANDLER_OFFSET as u64;
+        let bl_offset = load_handler_vaddr.cast_signed() - bl_vaddr.cast_signed();
+        let bl_insn = encode_bl(bl_offset).ok_or_else(|| {
+            Error::DisassemblyFailure(format!(
+                "BL offset {bl_offset:#x} out of range for x18 gate -> shared x18 load handler at {:#x}",
+                site.vaddr
+            ))
+        })?;
+        trampoline_data.extend_from_slice(&bl_insn.to_le_bytes());
+        insn_idx += 1;
+
+        // [4] LDR Xscratch, [SP, #24]
+        trampoline_data.extend_from_slice(
+            &encode_ldr_imm_unsigned(scratch, 31, 24)
+                .expect("offset 24 valid")
+                .to_le_bytes(),
+        );
+        insn_idx += 1;
+
+        // [5] <rewritten instruction>
+        trampoline_data.extend_from_slice(&rewritten.to_le_bytes());
+        insn_idx += 1;
+
+        // [6] STR Xscratch, [SP, #24]
+        trampoline_data.extend_from_slice(
+            &encode_str_imm_unsigned(scratch, 31, 24)
+                .expect("offset 24 valid")
+                .to_le_bytes(),
+        );
+        insn_idx += 1;
+
+        // [7] BL <shared_x18_save>
+        let bl_vaddr = insn_vaddr(insn_idx);
+        let save_handler_vaddr = trampoline_base_addr + SHARED_X18_SAVE_HANDLER_OFFSET as u64;
+        let bl_offset = save_handler_vaddr.cast_signed() - bl_vaddr.cast_signed();
+        let bl_insn = encode_bl(bl_offset).ok_or_else(|| {
+            Error::DisassemblyFailure(format!(
+                "BL offset {bl_offset:#x} out of range for x18 gate -> shared x18 save handler at {:#x}",
+                site.vaddr
+            ))
+        })?;
+        trampoline_data.extend_from_slice(&bl_insn.to_le_bytes());
+        insn_idx += 1;
+    } else if is_read {
+        // Read-only path: load, execute
+
+        // [3] BL <shared_x18_load>
+        let bl_vaddr = insn_vaddr(insn_idx);
+        let load_handler_vaddr = trampoline_base_addr + SHARED_X18_LOAD_HANDLER_OFFSET as u64;
+        let bl_offset = load_handler_vaddr.cast_signed() - bl_vaddr.cast_signed();
+        let bl_insn = encode_bl(bl_offset).ok_or_else(|| {
+            Error::DisassemblyFailure(format!(
+                "BL offset {bl_offset:#x} out of range for x18 gate -> shared x18 load handler at {:#x}",
+                site.vaddr
+            ))
+        })?;
+        trampoline_data.extend_from_slice(&bl_insn.to_le_bytes());
+        insn_idx += 1;
+
+        // [4] LDR Xscratch, [SP, #24]
+        trampoline_data.extend_from_slice(
+            &encode_ldr_imm_unsigned(scratch, 31, 24)
+                .expect("offset 24 valid")
+                .to_le_bytes(),
+        );
+        insn_idx += 1;
+
+        // [5] <rewritten instruction>
+        trampoline_data.extend_from_slice(&rewritten.to_le_bytes());
+        insn_idx += 1;
+    } else {
+        // Write-only path: execute, save
+
+        // [3] <rewritten instruction>
+        trampoline_data.extend_from_slice(&rewritten.to_le_bytes());
+        insn_idx += 1;
+
+        // [4] STR Xscratch, [SP, #24]
+        trampoline_data.extend_from_slice(
+            &encode_str_imm_unsigned(scratch, 31, 24)
+                .expect("offset 24 valid")
+                .to_le_bytes(),
+        );
+        insn_idx += 1;
+
+        // [5] BL <shared_x18_save>
+        let bl_vaddr = insn_vaddr(insn_idx);
+        let save_handler_vaddr = trampoline_base_addr + SHARED_X18_SAVE_HANDLER_OFFSET as u64;
+        let bl_offset = save_handler_vaddr.cast_signed() - bl_vaddr.cast_signed();
+        let bl_insn = encode_bl(bl_offset).ok_or_else(|| {
+            Error::DisassemblyFailure(format!(
+                "BL offset {bl_offset:#x} out of range for x18 gate -> shared x18 save handler at {:#x}",
+                site.vaddr
+            ))
+        })?;
+        trampoline_data.extend_from_slice(&bl_insn.to_le_bytes());
+        insn_idx += 1;
+    }
+
+    // Epilogue (common to all paths)
+
+    // LDP X16, X17, [SP]
+    trampoline_data.extend_from_slice(
+        &encode_ldp_offset(16, 17, 31, 0)
+            .expect("offset 0 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // LDR X30, [SP, #16]
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(30, 31, 16)
+            .expect("offset 16 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // ADD SP, SP, #48
+    trampoline_data.extend_from_slice(&encode_add_sp_imm(48).expect("imm12=48 fits").to_le_bytes());
+    insn_idx += 1;
+
+    // B <return_addr>
+    let ret_vaddr = insn_vaddr(insn_idx);
+    let ret_offset = (site.vaddr + 4).cast_signed() - ret_vaddr.cast_signed();
+    let ret_insn = encode_b(ret_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "B offset {ret_offset:#x} out of ±128MB range for return from x18 gate at {:#x}",
+            site.vaddr
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&ret_insn.to_le_bytes());
+    insn_idx += 1;
+
+    debug_assert_eq!(insn_idx, gate_insn_count);
+    debug_assert_eq!(
+        trampoline_data.len() - gate_offset,
+        gate_size,
+        "x18 gate size mismatch"
+    );
+
+    Ok(())
+}
+
 ///
 /// Special registers (X16, X17, X30) need an extra instruction to reload
 /// the saved value before storing to `[SP, #24]`, resulting in 40 bytes.
@@ -4181,5 +5041,208 @@ mod tests {
             GATES_START_OFFSET + SVC_GATE_SIZE + MSR_GATE_SIZE + MRS_GATE_SIZE,
             "trampoline should have shared layout + SVC + MSR + MRS gates"
         );
+    }
+
+    // ============================================================
+    // x18 detection, rewriting, and gate tests
+    // ============================================================
+
+    #[test]
+    fn test_references_x18_mov_to_x18() {
+        // MOV X18, X0 => ORR X18, XZR, X0 => 0xAA0003F2
+        // Rd=18 (bits 4:0), Rn=31 (XZR), Rm=0
+        let insn: u32 = 0xAA0003F2;
+        assert!(references_x18(insn));
+    }
+
+    #[test]
+    fn test_references_x18_mov_from_x18() {
+        // MOV X0, X18 => ORR X0, XZR, X18 => 0xAA1203E0
+        // Rd=0, Rn=31 (XZR), Rm=18 (bits 20:16)
+        let insn: u32 = 0xAA1203E0;
+        assert!(references_x18(insn));
+    }
+
+    #[test]
+    fn test_references_x18_add_with_x18_base() {
+        // ADD X5, X18, #0x10 => 0x91004245
+        // Rd=5, Rn=18 (bits 9:5), imm12=0x10
+        let insn: u32 = 0x91004245;
+        assert!(references_x18(insn));
+    }
+
+    #[test]
+    fn test_references_x18_ldr_with_x18_base() {
+        // LDR X0, [X18] => 0xF9400240
+        // Rt=0, Rn=18 (bits 9:5)
+        let insn: u32 = 0xF9400240;
+        assert!(references_x18(insn));
+    }
+
+    #[test]
+    fn test_references_x18_str_x18_value() {
+        // STR X18, [X0] => 0xF9000012
+        // Rt=18 (bits 4:0), Rn=0
+        let insn: u32 = 0xF9000012;
+        assert!(references_x18(insn));
+    }
+
+    #[test]
+    fn test_references_x18_nop_no_x18() {
+        // NOP => 0xD503201F
+        let insn: u32 = 0xD503201F;
+        assert!(!references_x18(insn));
+    }
+
+    #[test]
+    fn test_references_x18_add_no_x18() {
+        // ADD X1, X2, X3 => 0x8B030041
+        let insn: u32 = 0x8B030041;
+        assert!(!references_x18(insn));
+    }
+
+    #[test]
+    fn test_references_x18_stp_with_x18_in_rt2() {
+        // STP X5, X18, [SP, #0] => Rt=5, Rt2=18, Rn=SP(31), offset=0
+        // opc=10, mode=010, imm7=0, Rt2=18, Rn=31, Rt=5
+        let insn: u32 = 0xA9004BE5;
+        assert!(references_x18(insn));
+    }
+
+    #[test]
+    fn test_is_store_instruction_str() {
+        // STR X18, [X0] => 0xF9000012
+        let insn: u32 = 0xF9000012;
+        assert!(is_store_instruction(insn));
+    }
+
+    #[test]
+    fn test_is_store_instruction_stp() {
+        // STP X5, X18, [SP, #0] => 0xA90047E5
+        let insn: u32 = 0xA90047E5;
+        assert!(is_store_instruction(insn));
+    }
+
+    #[test]
+    fn test_is_store_instruction_ldr_not_store() {
+        // LDR X0, [X18] => 0xF9400240
+        let insn: u32 = 0xF9400240;
+        assert!(!is_store_instruction(insn));
+    }
+
+    #[test]
+    fn test_is_store_instruction_add_not_store() {
+        // ADD X5, X18, #0x10 => 0x91004245
+        let insn: u32 = 0x91004245;
+        assert!(!is_store_instruction(insn));
+    }
+
+    #[test]
+    fn test_rewrite_x18_mov_to_x18() {
+        // MOV X18, X0 => Rd=18, x18 is write destination
+        let insn: u32 = 0xAA0003F2;
+        let (rewritten, scratch, is_read, is_write) = rewrite_x18(insn);
+        assert_eq!(scratch, 17, "scratch should be X17 (default)");
+        assert!(!is_read, "MOV to X18 should not set is_read");
+        assert!(is_write, "writing to X18 should set is_write");
+        // Rd should be replaced: bits 4:0 should be scratch (17)
+        assert_eq!(rewritten & 0x1F, 17);
+        // Other fields unchanged
+        assert_eq!(rewritten & !0x1F, insn & !0x1F);
+    }
+
+    #[test]
+    fn test_rewrite_x18_mov_from_x18() {
+        // MOV X0, X18 => Rm=18 (bits 20:16), x18 is read source
+        let insn: u32 = 0xAA1203E0;
+        let (rewritten, scratch, is_read, is_write) = rewrite_x18(insn);
+        assert_eq!(scratch, 17);
+        assert!(is_read, "reading from X18 should set is_read");
+        assert!(!is_write);
+        // Rm (bits 20:16) should be replaced with scratch
+        assert_eq!((rewritten >> 16) & 0x1F, 17);
+    }
+
+    #[test]
+    fn test_rewrite_x18_ldr_base_x18() {
+        // LDR X0, [X18] => Rn=18 (base register, read)
+        let insn: u32 = 0xF9400240;
+        let (rewritten, scratch, is_read, is_write) = rewrite_x18(insn);
+        assert_eq!(scratch, 17);
+        assert!(is_read, "base register X18 in LDR is a read");
+        assert!(!is_write);
+        // Rn (bits 9:5) should be replaced with scratch
+        assert_eq!((rewritten >> 5) & 0x1F, 17);
+    }
+
+    #[test]
+    fn test_rewrite_x18_str_value_x18() {
+        // STR X18, [X0] => Rt=18 (value being stored, read for stores)
+        let insn: u32 = 0xF9000012;
+        let (rewritten, scratch, is_read, is_write) = rewrite_x18(insn);
+        assert_eq!(scratch, 17);
+        assert!(is_read, "X18 as Rt in STR is a read (value being stored)");
+        assert!(!is_write);
+        // Rd/Rt (bits 4:0) should be replaced with scratch
+        assert_eq!(rewritten & 0x1F, 17);
+    }
+
+    #[test]
+    fn test_rewrite_x18_uses_x16_when_x17_in_use() {
+        // ADD X17, X18, #0 => Rd=17, Rn=18
+        // Since X17 appears in Rd (non-x18), scratch should be X16
+        let insn: u32 = 0x91000251; // ADD X17, X18, #0
+        let (rewritten, scratch, is_read, _is_write) = rewrite_x18(insn);
+        assert_eq!(
+            scratch, 16,
+            "scratch should be X16 when X17 is used by insn"
+        );
+        assert!(is_read, "Rn=X18 is a read");
+        // Rn (bits 9:5) should be replaced with scratch=16
+        assert_eq!((rewritten >> 5) & 0x1F, 16);
+    }
+
+    #[test]
+    fn test_rewrite_x18_add_base_x18_write_to_x18() {
+        // ADD X18, X18, #8 => Rd=18 (write), Rn=18 (read)
+        let insn: u32 = 0x91002252;
+        let (rewritten, scratch, is_read, is_write) = rewrite_x18(insn);
+        assert_eq!(scratch, 17);
+        assert!(is_read, "Rn=X18 is a read");
+        assert!(is_write, "Rd=X18 in non-store is a write");
+        // Both Rd and Rn should be replaced with scratch
+        assert_eq!(rewritten & 0x1F, 17, "Rd should be scratch");
+        assert_eq!((rewritten >> 5) & 0x1F, 17, "Rn should be scratch");
+    }
+
+    #[test]
+    fn test_x18_gate_size_read_only() {
+        assert_eq!(x18_gate_size(true, false), X18_GATE_READ_INSN_COUNT * 4);
+    }
+
+    #[test]
+    fn test_x18_gate_size_write_only() {
+        assert_eq!(x18_gate_size(false, true), X18_GATE_WRITE_INSN_COUNT * 4);
+    }
+
+    #[test]
+    fn test_x18_gate_size_readwrite() {
+        assert_eq!(x18_gate_size(true, true), X18_GATE_READWRITE_INSN_COUNT * 4);
+    }
+
+    #[test]
+    fn test_x18_gate_sizes_consistent() {
+        // Read-only and write-only should be the same size
+        assert_eq!(X18_GATE_READ_INSN_COUNT, X18_GATE_WRITE_INSN_COUNT);
+        // Read-write should be larger
+        assert!(X18_GATE_READWRITE_INSN_COUNT > X18_GATE_READ_INSN_COUNT);
+    }
+
+    #[test]
+    fn test_shared_x18_handler_constants() {
+        assert_eq!(SHARED_X18_LOAD_HANDLER_SIZE, 64);
+        assert_eq!(SHARED_X18_SAVE_HANDLER_SIZE, 64);
+        assert_eq!(SHARED_X18_LOAD_HANDLER_INSN_COUNT, 16);
+        assert_eq!(SHARED_X18_SAVE_HANDLER_INSN_COUNT, 16);
     }
 }

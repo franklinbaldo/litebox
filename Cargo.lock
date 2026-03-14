@@ -1141,6 +1141,7 @@ dependencies = [
  "similar",
  "tempfile",
  "thiserror",
+ "yaxpeax-arch",
  "yaxpeax-arm",
  "zerocopy",
 ]
