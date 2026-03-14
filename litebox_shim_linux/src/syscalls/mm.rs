@@ -5,13 +5,13 @@
 //! Most of these syscalls which are not backed by files are implemented in [`litebox_common_linux::mm`].
 
 use litebox::{
-    mm::linux::{MappingError, PAGE_SIZE, PageRange},
+    mm::linux::{MappingError, PageRange, PAGE_SIZE},
     platform::{
-        PageManagementProvider, RawConstPointer, RawMutPointer,
         page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions},
+        PageManagementProvider, RawConstPointer, RawMutPointer,
     },
 };
-use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
+use litebox_common_linux::{errno::Errno, MRemapFlags, MapFlags, ProtFlags};
 
 use crate::MutPtr;
 use crate::ShimFS;
@@ -292,12 +292,64 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         let suggested_addr = if addr == 0 { None } else { Some(addr) };
-        if flags.contains(MapFlags::MAP_ANONYMOUS) {
+        let result = if flags.contains(MapFlags::MAP_ANONYMOUS) {
             self.do_mmap_anonymous(suggested_addr, aligned_len, prot, flags)
         } else {
             self.do_mmap_file(suggested_addr, aligned_len, prot, flags, fd, offset)
+        };
+        // Diagnostic: on ENOMEM for hint-based anonymous mmap, dump VMA state
+        #[cfg(target_os = "macos")]
+        if result.is_err() && suggested_addr.is_none() {
+            let mappings = self.global.pm.mappings();
+            let total = mappings.len();
+            // Find largest gap between consecutive VMAs
+            let mut max_gap: usize = 0;
+            let mut max_gap_at: usize = 0;
+            for w in mappings.windows(2) {
+                let gap = w[1].0.start.saturating_sub(w[0].0.end);
+                if gap > max_gap {
+                    max_gap = gap;
+                    max_gap_at = w[0].0.end;
+                }
+            }
+            litebox::log_println!(
+                self.global.platform,
+                "[mmap ENOMEM diag] addr={:#x} len={:#x} aligned_len={:#x} prot={:?} flags={:?}",
+                addr,
+                len,
+                aligned_len,
+                prot,
+                flags
+            );
+            litebox::log_println!(
+                self.global.platform,
+                "[mmap ENOMEM diag] total_vmas={} max_gap={:#x} max_gap_at={:#x}",
+                total,
+                max_gap,
+                max_gap_at
+            );
+            // Print first 5 and last 5 VMAs
+            for (i, (range, flags)) in mappings.iter().enumerate() {
+                if i < 5 || i >= total.saturating_sub(5) {
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[mmap ENOMEM diag] VMA[{}]: {:#x}..{:#x} (size={:#x}) flags={:?}",
+                        i,
+                        range.start,
+                        range.end,
+                        range.end - range.start,
+                        flags
+                    );
+                } else if i == 5 {
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[mmap ENOMEM diag] ... ({} VMAs omitted) ...",
+                        total.saturating_sub(10)
+                    );
+                }
+            }
         }
-        .map_err(Errno::from)
+        result.map_err(Errno::from)
     }
 
     /// Handle syscall `munmap`
@@ -360,7 +412,7 @@ mod tests {
         fs::{Mode, OFlags},
         platform::{PageManagementProvider, RawConstPointer, RawMutPointer},
     };
-    use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
+    use litebox_common_linux::{errno::Errno, MRemapFlags, MapFlags, ProtFlags};
 
     use crate::syscalls::tests::init_platform;
 
@@ -759,20 +811,18 @@ mod tests {
         addr.write_slice_at_offset(0, &[0xff; 0x10]).unwrap();
 
         // Test MADV_NORMAL
-        assert!(
-            task.sys_madvise(addr, 0x2000, litebox_common_linux::MadviseBehavior::Normal)
-                .is_ok()
-        );
+        assert!(task
+            .sys_madvise(addr, 0x2000, litebox_common_linux::MadviseBehavior::Normal)
+            .is_ok());
 
         // Test MADV_DONTNEED
-        assert!(
-            task.sys_madvise(
+        assert!(task
+            .sys_madvise(
                 addr,
                 0x2000,
                 litebox_common_linux::MadviseBehavior::DontNeed
             )
-            .is_ok()
-        );
+            .is_ok());
 
         addr.to_owned_slice(0x10).unwrap().iter().for_each(|&x| {
             assert_eq!(x, 0); // Should be zeroed after MADV_DONTNEED

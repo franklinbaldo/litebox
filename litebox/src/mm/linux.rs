@@ -600,9 +600,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     let _ = self.platform.deallocate_pages(bad_range);
                 }
                 let size = suggested_range.len();
-                let safe_addr = self
-                    .find_free_above(self.brk_reserved_end, size)
-                    .ok_or(AllocationError::OutOfMemory)?;
+                let safe_addr = self.find_free_above(self.brk_reserved_end, size);
+                let safe_addr = match safe_addr {
+                    Some(a) => a,
+                    None => return Err(AllocationError::OutOfMemory),
+                };
                 let safe_range = safe_addr..(safe_addr + size);
                 let retry_ret = self
                     .platform
@@ -671,13 +673,26 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 0
             })
         .unwrap();
-        let new_addr = self
-            .get_unmmaped_area(
-                suggested_address,
-                total_length,
-                flags.contains(CreatePagesFlags::FIXED_ADDR),
-            )
-            .ok_or(AllocationError::OutOfMemory)?;
+        let is_fixed = flags.contains(CreatePagesFlags::FIXED_ADDR);
+        let new_addr = self.get_unmmaped_area(suggested_address, total_length, is_fixed);
+
+        let new_addr = match new_addr {
+            Some(addr) => addr,
+            None if is_fixed => return Err(AllocationError::OutOfMemory),
+            None => {
+                // The VMA-tree-based search found no suitable gap.  On platforms
+                // like macOS, the host kernel aggressively ignores mmap hints and
+                // finds gaps between existing host mappings on its own.  Rather
+                // than failing, delegate to the platform with a dummy hint and let
+                // it allocate wherever it can, then track the result.
+                //
+                // Use TASK_ADDR_MIN as the hint — the platform is free to ignore
+                // it, and the brk-zone retry logic in insert_mapping will
+                // re-locate if the kernel places it in the reservation.
+                Platform::TASK_ADDR_MIN
+            }
+        };
+
         // new_addr must be ALIGN aligned
         let new_range = PageRange::new(new_addr, new_addr + length.as_usize()).unwrap();
         unsafe {
@@ -685,7 +700,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 new_range,
                 vma,
                 flags.contains(CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY),
-                if flags.contains(CreatePagesFlags::FIXED_ADDR) {
+                if is_fixed {
                     if flags.contains(CreatePagesFlags::NOREPLACE) {
                         FixedAddressBehavior::NoReplace
                     } else {
@@ -1067,30 +1082,49 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             return Some(high_limit);
         }
 
-        // 2. check gaps between ranges
-        for (r, flags) in self.vmas.iter().rev() {
-            let start = r.start.checked_sub(
-                size + if flags.flags.contains(VmFlags::VM_GROWSDOWN) {
-                    // If it is a stack, we need to leave enough space for the stack to grow downwards.
-                    Self::STACK_GUARD_GAP << 1
-                } else {
-                    0
-                },
-            )?;
-            if start < low_limit {
-                return None;
+        // 2. check gaps between ranges (top-down heuristic)
+        //
+        // NOTE: The loop below tries exactly one candidate per VMA (`vma.start - size`).
+        // On macOS, `read_maps()` may insert many host-owned reserved VMAs that
+        // fragment the VMA tree in ways where those single candidates all collide
+        // with another VMA or the brk reservation, even though large gaps exist
+        // between VMAs.  The bottom-up fallback (step 3) handles that case.
+        let top_down_result = (|| {
+            for (r, flags) in self.vmas.iter().rev() {
+                let start = r.start.checked_sub(
+                    size + if flags.flags.contains(VmFlags::VM_GROWSDOWN) {
+                        // If it is a stack, we need to leave enough space for the stack to grow downwards.
+                        Self::STACK_GUARD_GAP << 1
+                    } else {
+                        0
+                    },
+                )?;
+                if start < low_limit {
+                    return None;
+                }
+                if start > high_limit {
+                    // Note we may have pre-allocated memory that are higher than `TASK_ADDR_MAX`
+                    // (See [`Vmem::new`]) and thus `start` may be larger than `high_limit`.
+                    continue;
+                }
+                if !self.range_is_occupied(&(start..start + size)) {
+                    return Some(start);
+                }
             }
-            if start > high_limit {
-                // Note we may have pre-allocated memory that are higher than `TASK_ADDR_MAX`
-                // (See [`Vmem::new`]) and thus `start` may be larger than `high_limit`.
-                continue;
-            }
-            if !self.range_is_occupied(&(start..start + size)) {
-                return Some(start);
-            }
+            None
+        })();
+
+        if top_down_result.is_some() {
+            return top_down_result;
         }
 
-        None
+        // 3. Bottom-up fallback: exhaustive gap search.
+        //
+        // The top-down heuristic only probes one address per VMA.  If all those
+        // addresses happen to be occupied (common on macOS where host VM regions
+        // are dense), we fall through to an exhaustive scan of every gap in the
+        // VMA tree from `low_limit` upward.
+        self.find_free_above(low_limit, size)
     }
 }
 

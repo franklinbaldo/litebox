@@ -9,15 +9,15 @@ use alloc::vec::Vec;
 use crate::{
     mm::linux::{CreatePagesFlags, NonZeroAddress},
     platform::{
-        PageManagementProvider, RawConstPointer,
         page_mgmt::MemoryRegionPermissions,
         trivial_providers::{TransparentConstPtr, TransparentMutPtr},
+        PageManagementProvider, RawConstPointer,
     },
 };
 use zerocopy::{FromBytes, IntoBytes};
 
 use super::linux::{
-    NonZeroPageSize, PAGE_SIZE, PageRange, VmArea, VmFlags, Vmem, VmemProtectError, VmemResizeError,
+    NonZeroPageSize, PageRange, VmArea, VmFlags, Vmem, VmemProtectError, VmemResizeError, PAGE_SIZE,
 };
 
 /// A dummy implementation of [`VmemBackend`] that does nothing.
@@ -156,15 +156,13 @@ fn test_vmm_mapping() {
         Err(VmemProtectError::InvalidRange(_))
     ));
 
-    assert!(
-        unsafe {
-            vmm.resize_mapping(
-                PageRange::new(start_addr, start_addr + 2 * PAGE_SIZE).unwrap(),
-                NonZeroPageSize::new(PAGE_SIZE * 4).unwrap(),
-            )
-        }
-        .is_ok()
-    );
+    assert!(unsafe {
+        vmm.resize_mapping(
+            PageRange::new(start_addr, start_addr + 2 * PAGE_SIZE).unwrap(),
+            NonZeroPageSize::new(PAGE_SIZE * 4).unwrap(),
+        )
+    }
+    .is_ok());
     // Grow and merge, [(0x1_0000, 0x1_c000)]
     assert_eq!(
         collect_mappings(&vmm),
@@ -182,15 +180,13 @@ fn test_vmm_mapping() {
         Err(VmemProtectError::NoAccess { .. })
     ));
 
-    assert!(
-        unsafe {
-            vmm.protect_mapping(
-                PageRange::new(start_addr + 2 * PAGE_SIZE, start_addr + 4 * PAGE_SIZE).unwrap(),
-                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
-            )
-        }
-        .is_ok()
-    );
+    assert!(unsafe {
+        vmm.protect_mapping(
+            PageRange::new(start_addr + 2 * PAGE_SIZE, start_addr + 4 * PAGE_SIZE).unwrap(),
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+        )
+    }
+    .is_ok());
     // Change permission, [(0x1_0000, 0x1_2000), (0x1_2000, 0x1_4000), (0x1_4000, 0x1_c000)]
     assert_eq!(
         collect_mappings(&vmm),
@@ -207,16 +203,14 @@ fn test_vmm_mapping() {
         unsafe { vmm.resize_mapping(r, NonZeroPageSize::new(PAGE_SIZE * 4).unwrap()) },
         Err(VmemResizeError::RangeOccupied(_))
     ));
-    assert!(
-        unsafe {
-            vmm.move_mappings(
-                r,
-                Some(NonZeroAddress::new(start_addr + 12 * PAGE_SIZE).unwrap()),
-                NonZeroPageSize::new(PAGE_SIZE * 4).unwrap(),
-            )
-        }
-        .is_ok_and(|v| v.as_usize() == start_addr + 12 * PAGE_SIZE)
-    );
+    assert!(unsafe {
+        vmm.move_mappings(
+            r,
+            Some(NonZeroAddress::new(start_addr + 12 * PAGE_SIZE).unwrap()),
+            NonZeroPageSize::new(PAGE_SIZE * 4).unwrap(),
+        )
+    }
+    .is_ok_and(|v| v.as_usize() == start_addr + 12 * PAGE_SIZE));
     assert_eq!(
         collect_mappings(&vmm),
         vec![
@@ -276,15 +270,13 @@ fn test_vmm_mapping() {
     );
 
     // shrink mapping
-    assert!(
-        unsafe {
-            vmm.resize_mapping(
-                PageRange::new(start_addr + 4 * PAGE_SIZE, start_addr + 8 * PAGE_SIZE).unwrap(),
-                NonZeroPageSize::new(2 * PAGE_SIZE).unwrap(),
-            )
-        }
-        .is_ok()
-    );
+    assert!(unsafe {
+        vmm.resize_mapping(
+            PageRange::new(start_addr + 4 * PAGE_SIZE, start_addr + 8 * PAGE_SIZE).unwrap(),
+            NonZeroPageSize::new(2 * PAGE_SIZE).unwrap(),
+        )
+    }
+    .is_ok());
     assert_eq!(
         collect_mappings(&vmm),
         vec![
