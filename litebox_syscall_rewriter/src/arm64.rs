@@ -46,6 +46,7 @@ const MRS_TPIDR_EL0_BITS: u32 = 0xD53B_D040;
 /// causing the scan to hit the sentinel without finding a match. The fallback
 /// path loads entry\[0\]'s host_tls and guest_tpidr as a best-effort recovery.
 ///
+/// Linux layout (18 insns):
 /// ```text
 ///  [0]  MRS  X18, TPIDR_EL0       ; get guest TPIDR (may be clobbered)
 ///  [1]  STR  X18, [SP, #24]       ; save guest TPIDR
@@ -66,17 +67,19 @@ const MRS_TPIDR_EL0_BITS: u32 = 0xD53B_D040;
 /// [16]  LDR  X16, [PC, #off]      ; .Ldone: callback addr
 /// [17]  BR   X16                  ; jump to callback
 /// ```
+///
+/// macOS layout (18 insns): see `emit_shared_svc_handler_macos`
 // ---- Linux shared SVC handler layout ----
 #[cfg(target_os = "linux")]
 const SHARED_SVC_HANDLER_INSN_COUNT: usize = 18;
 #[cfg(target_os = "linux")]
 const SHARED_SVC_HANDLER_SIZE: usize = SHARED_SVC_HANDLER_INSN_COUNT * 4; // 72
 
-// ---- macOS shared SVC handler layout (TPIDRRO_EL0-keyed, x18 save) ----
+// ---- macOS shared SVC handler layout (TPIDRRO_EL0-keyed, x18 save, host_tls→frame) ----
 #[cfg(target_os = "macos")]
-const SHARED_SVC_HANDLER_INSN_COUNT: usize = 17;
+const SHARED_SVC_HANDLER_INSN_COUNT: usize = 18;
 #[cfg(target_os = "macos")]
-const SHARED_SVC_HANDLER_SIZE: usize = SHARED_SVC_HANDLER_INSN_COUNT * 4; // 68
+const SHARED_SVC_HANDLER_SIZE: usize = SHARED_SVC_HANDLER_INSN_COUNT * 4; // 72
 
 // ---- Linux SVC gate layout (6 insns, 24 bytes, 32-byte frame) ----
 #[cfg(target_os = "linux")]
@@ -198,24 +201,24 @@ const SHARED_SVC_HANDLER_OFFSET: usize = SIGRETURN_GATE_OFFSET + SVC_GATE_SIZE;
 
 /// Offset where the shared MSR handler begins.
 const SHARED_MSR_HANDLER_OFFSET: usize = SHARED_SVC_HANDLER_OFFSET + SHARED_SVC_HANDLER_SIZE;
-// Linux: 48 + 72 = 120, macOS: 52 + 68 = 120
+// Linux: 48 + 72 = 120, macOS: 52 + 72 = 124
 
 /// Offset where the shared MRS handler begins (macOS only; Linux has no shared MRS handler).
 /// Under `test` on Linux, this computes from Linux MSR handler sizes (different value from macOS).
 #[cfg(any(target_os = "macos", test))]
 const SHARED_MRS_HANDLER_OFFSET: usize = SHARED_MSR_HANDLER_OFFSET + SHARED_MSR_HANDLER_SIZE;
-// macOS: 120 + 68 = 188
+// macOS: 124 + 68 = 192
 
 /// Offset where the shared x18 load handler begins (macOS only).
 #[cfg(any(target_os = "macos", test))]
 const SHARED_X18_LOAD_HANDLER_OFFSET: usize = SHARED_MRS_HANDLER_OFFSET + SHARED_MRS_HANDLER_SIZE;
-// macOS: 188 + 64 = 252
+// macOS: 192 + 64 = 256
 
 /// Offset where the shared x18 save handler begins (macOS only).
 #[cfg(any(target_os = "macos", test))]
 const SHARED_X18_SAVE_HANDLER_OFFSET: usize =
     SHARED_X18_LOAD_HANDLER_OFFSET + SHARED_X18_LOAD_HANDLER_SIZE;
-// macOS: 252 + 64 = 316
+// macOS: 256 + 64 = 320
 
 /// Offset where per-site gates begin (after all shared handlers).
 #[cfg(target_os = "linux")]
@@ -224,7 +227,7 @@ const GATES_START_OFFSET: usize = SHARED_MSR_HANDLER_OFFSET + SHARED_MSR_HANDLER
 
 #[cfg(target_os = "macos")]
 const GATES_START_OFFSET: usize = SHARED_X18_SAVE_HANDLER_OFFSET + SHARED_X18_SAVE_HANDLER_SIZE;
-// macOS: 316 + 64 = 380
+// macOS: 320 + 64 = 384
 
 // ============================================================
 // Instruction encoders
@@ -1793,19 +1796,20 @@ fn emit_shared_svc_handler_linux(
 ///  [1]  LDR  X16, [PC, #off]      ; X16 = TLS table base
 ///  [2]  LDR  X18, [X16, #0]       ; .Lloop: X18 = entry.tpidrro_el0
 ///  [3]  CMN  X18, #1              ; sentinel?
-///  [4]  B.EQ .Ltrap               ; -> [16] (unknown thread = bug)
+///  [4]  B.EQ .Ltrap               ; -> [17] (unknown thread = bug)
 ///  [5]  CMP  X18, X17             ; match tpidrro?
 ///  [6]  B.EQ .Lfound              ; -> [9]
 ///  [7]  ADD  X16, X16, #16        ; next entry
 ///  [8]  B    .Lloop               ; -> [2]
-///  [9]  LDR  X18, [X16, #8]       ; .Lfound: X18 = host_tls (TCB ptr)
-/// [10]  LDR  X17, [X18, #24]      ; X17 = TCB.guest_tpidr
+///  [9]  LDR  X16, [X16, #8]       ; .Lfound: X16 = host_tls (safe register!)
+/// [10]  LDR  X17, [X16, #24]      ; X17 = TCB.guest_tpidr
 /// [11]  STR  X17, [SP, #24]       ; frame.guest_tpidr = guest_tpidr
 /// [12]  LDR  X17, [SP, #32]       ; X17 = guest x18 (saved by gate)
-/// [13]  STR  X17, [X18, #40]      ; TCB.guest_x18 = guest x18
-/// [14]  LDR  X16, [PC, #off]      ; callback addr
-/// [15]  BR   X16                  ; jump to callback
-/// [16]  BRK  #1                   ; .Ltrap: unreachable (unknown thread)
+/// [13]  STR  X17, [X16, #40]      ; TCB.guest_x18 = guest x18
+/// [14]  STR  X16, [SP, #40]       ; host_tls → frame slot for syscall_callback
+/// [15]  LDR  X16, [PC, #off]      ; callback addr
+/// [16]  BR   X16                  ; jump to callback
+/// [17]  BRK  #1                   ; .Ltrap: unreachable (unknown thread)
 /// ```
 #[cfg(target_os = "macos")]
 #[allow(clippy::cast_possible_wrap)]
@@ -1847,8 +1851,8 @@ fn emit_shared_svc_handler_macos(
     trampoline_data.extend_from_slice(&encode_cmn_imm(18, 1).expect("imm12=1 fits").to_le_bytes());
     insn_idx += 1;
 
-    // [4] B.EQ .Ltrap -> [16]
-    let trap_idx = 16usize;
+    // [4] B.EQ .Ltrap -> [17]
+    let trap_idx = 17usize;
     let beq_trap_offset = (trap_idx as i64 - insn_idx as i64) * 4;
     let beq_trap = encode_b_cond(COND_EQ, beq_trap_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
@@ -1891,18 +1895,18 @@ fn emit_shared_svc_handler_macos(
     trampoline_data.extend_from_slice(&b_loop.to_le_bytes());
     insn_idx += 1;
 
-    // [9] .Lfound: LDR X18, [X16, #8] — X18 = host_tls (TCB ptr)
+    // [9] .Lfound: LDR X16, [X16, #8] — X16 = host_tls (safe register, survives preemption)
     debug_assert_eq!(insn_idx, found_idx);
     trampoline_data.extend_from_slice(
-        &encode_ldr_imm_unsigned(18, 16, 8)
+        &encode_ldr_imm_unsigned(16, 16, 8)
             .expect("offset 8 valid")
             .to_le_bytes(),
     );
     insn_idx += 1;
 
-    // [10] LDR X17, [X18, #24] — X17 = TCB.guest_tpidr
+    // [10] LDR X17, [X16, #24] — X17 = TCB.guest_tpidr
     trampoline_data.extend_from_slice(
-        &encode_ldr_imm_unsigned(17, 18, 24)
+        &encode_ldr_imm_unsigned(17, 16, 24)
             .expect("offset 24 valid")
             .to_le_bytes(),
     );
@@ -1924,15 +1928,23 @@ fn emit_shared_svc_handler_macos(
     );
     insn_idx += 1;
 
-    // [13] STR X17, [X18, #40] — TCB.guest_x18 = guest x18
+    // [13] STR X17, [X16, #40] — TCB.guest_x18 = guest x18
     trampoline_data.extend_from_slice(
-        &encode_str_imm_unsigned(17, 18, 40)
+        &encode_str_imm_unsigned(17, 16, 40)
             .expect("offset 40 valid")
             .to_le_bytes(),
     );
     insn_idx += 1;
 
-    // [14] LDR X16, [PC, #offset_to_callback]
+    // [14] STR X16, [SP, #40] — host_tls → frame slot for syscall_callback
+    trampoline_data.extend_from_slice(
+        &encode_str_imm_unsigned(16, 31, 40)
+            .expect("offset 40 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [15] LDR X16, [PC, #offset_to_callback]
     let ldr_cb_vaddr = insn_vaddr(insn_idx);
     let callback_vaddr = trampoline_base_addr + HEADER_CALLBACK_OFFSET as u64;
     let ldr_cb_offset = callback_vaddr.cast_signed() - ldr_cb_vaddr.cast_signed();
@@ -1944,11 +1956,11 @@ fn emit_shared_svc_handler_macos(
     trampoline_data.extend_from_slice(&ldr_cb_insn.to_le_bytes());
     insn_idx += 1;
 
-    // [15] BR X16
+    // [16] BR X16
     trampoline_data.extend_from_slice(&encode_br(16).to_le_bytes());
     insn_idx += 1;
 
-    // [16] .Ltrap: BRK #1 — unreachable (unknown thread)
+    // [17] .Ltrap: BRK #1 — unreachable (unknown thread)
     debug_assert_eq!(insn_idx, trap_idx);
     trampoline_data.extend_from_slice(&encode_brk(1).to_le_bytes());
     insn_idx += 1;

@@ -930,9 +930,10 @@ unsafe extern "C-unwind" fn run_thread_arch(
     // syscall_callback: entered from trampoline on SVC #0
     //
     // At entry:
-    //   x18 = host TLS base (from trampoline's per-thread table lookup)
+    //   x18 = UNRELIABLE (XNU may zero it via preemption; do NOT use)
     //   x30 = guest return address (after the rewritten SVC)
-    //   Guest stack: [SP+0]=saved_x16, [SP+8]=saved_x17, [SP+16]=saved_x30, [SP+24]=guest_tpidr, [SP+32]=guest_x18
+    //   Guest stack: [SP+0]=saved_x16, [SP+8]=saved_x17, [SP+16]=saved_x30,
+    //                [SP+24]=guest_tpidr, [SP+32]=guest_x18, [SP+40]=host_tls (TCB ptr)
     //   SP was decremented by 48 by trampoline
     //   x0-x15, x19-x29 = guest register values
     //   (x16, x17 were clobbered by trampoline; originals on guest stack)
@@ -942,21 +943,16 @@ unsafe extern "C-unwind" fn run_thread_arch(
     .globl _syscall_callback
 _syscall_callback:
     .cfi_startproc
-    // Save TCB pointer (x18) to stack slot [SP+40] immediately.
-    // macOS zeroes x18 on signal delivery, so we must not rely on x18
-    // surviving across instructions. All subsequent TCB accesses reload
-    // from this stack slot instead.
-    str x18, [sp, #40]
+    // Host TLS (TCB pointer) is already stored at [SP+40] by the trampoline's
+    // shared SVC handler (instruction [14]: STR X16, [SP, #40]). We load it
+    // from there instead of relying on x18, which XNU may have zeroed via
+    // preemptive context switch between the trampoline and this point.
 
-    // Clear in_guest flag. Use x17 as scratch loaded from the stack-saved
-    // TCB, NOT x18 directly, because a signal between the STR above and
-    // this instruction would zero x18.
-    ldr x17, [sp, #40]           // x17 = TCB (reload from stack)
+    // Clear in_guest flag.
+    ldr x17, [sp, #40]           // x17 = TCB (from trampoline-stored host_tls)
     strb wzr, [x17, #32]         // TCB.in_guest = 0
 
     // Save guest TPIDR (from trampoline stack slot) to guest_tpidr TLS var.
-    // Reload TCB from stack since x18 may have been clobbered by a signal
-    // between any two instructions.
     ldr x17, [sp, #40]           // x17 = TCB (reload from stack)
     ldr x16, [sp, #24]           // x16 = guest_tpidr from trampoline
     str x16, [x17, #24]          // TCB.guest_tpidr = guest_tpidr
@@ -3076,9 +3072,9 @@ unsafe fn interrupt_signal_handler(
 
     // Case 1: in the syscall_callback prologue (before in_guest is cleared).
     //
-    // syscall_callback's first instruction saves x18 to the stack, and the
-    // next two instructions reload TCB from the stack and clear in_guest.
-    // During these 3 instructions, in_guest is still 1. If the interrupt
+    // syscall_callback's first instruction loads TCB from [SP+40] (stored by
+    // the trampoline), and the second instruction clears in_guest.
+    // During these 2 instructions, in_guest is still 1. If the interrupt
     // arrives here, just return — syscall_callback will clear in_guest and
     // call into the shim which will check for interrupts.
     //
@@ -3086,7 +3082,7 @@ unsafe fn interrupt_signal_handler(
     // because it's probably fine for the shim to observe a guest context that
     // is inside the trampoline.
     let syscall_callback_addr = syscall_callback as *const () as usize;
-    if (syscall_callback_addr..syscall_callback_addr + 12).contains(&ip) {
+    if (syscall_callback_addr..syscall_callback_addr + 8).contains(&ip) {
         // No need to clear `in_guest` or set interrupt; the syscall handler will
         // clear `in_guest` and call into the shim.
         return;

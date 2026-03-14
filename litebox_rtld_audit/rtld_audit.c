@@ -149,13 +149,14 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5,
   //   [SP+16] = saved x30
   //   [SP+24] = guest_tpidr
   //   [SP+32] = guest_x18  (macOS only, not read by callback but needed for frame size)
-  //   [SP+40] = (padding)  (macOS only)
+  //   [SP+40] = host_tls   (macOS only, written by do_syscall for syscall_callback)
   //
   // Flow:
   //   1. Read TPIDRRO_EL0; if non-zero → macOS path (48B frame, TPIDRRO key, TCB tpidr)
   //      else → Linux path (32B frame, TPIDR_EL0 key on stack)
   //   2. Scan TLS table for matching entry
-  //   3. Set x18 = host_tls (TCB ptr) from matched entry
+  //   3. Store host_tls to [SP+40] for syscall_callback (macOS)
+  //      or set x18 = host_tls (Linux)
   //   4. Set x30 = return address, BR to callback
   uint64_t tls_table = tls_table_ptr;
   __asm__ volatile(
@@ -213,9 +214,10 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5,
     "add  x17, x17, #16\n"          // next entry
     "b    11b\n"                     // -> loop
     "13:\n"                          // .Lfound_macos
-    "ldr  x18, [x17, #8]\n"         // x18 = host_tls (TCB ptr)
-    "ldr  x16, [x18, #24]\n"        // x16 = TCB.guest_tpidr
+    "ldr  x17, [x17, #8]\n"         // x17 = host_tls (safe register, survives preemption)
+    "ldr  x16, [x17, #24]\n"        // x16 = TCB.guest_tpidr
     "str  x16, [sp, #24]\n"         // frame.guest_tpidr = TCB.guest_tpidr
+    "str  x17, [sp, #40]\n"         // frame.host_tls for syscall_callback
     "12:\n"                          // .Ldone_macos
     "adr  x30, 4f\n"                // x30 = return address
     "mov  x16, %[entry]\n"
