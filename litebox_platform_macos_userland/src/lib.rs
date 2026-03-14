@@ -840,6 +840,10 @@ fn run_thread_inner(
             litebox_common_linux::write_tpidr_el0(tcb_addr);
             run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter), tcb_ptr);
         });
+        // Remove our entry from the TLS table before the TCB is freed.
+        // This prevents stale entries from accumulating and exhausting
+        // the 256-entry table in long-running programs with many threads.
+        remove_host_tls_entries();
         unsafe { litebox_common_linux::write_tpidr_el0(original_tpidr) };
         TCB_PTR.set(core::ptr::null_mut());
     });
@@ -2265,16 +2269,26 @@ extern "C-unwind" fn exception_handler(
     thread_ctx.call_shim(|shim, ctx, _interrupt| shim.exception(ctx, &info));
 }
 
-/// Update the TLS lookup table with the current thread's (guest_tpidr, host_tls) entry.
+/// Update the TLS lookup table with the current thread's entry.
 ///
-/// Called before entering guest code on aarch64. The trampoline's per-SVC
-/// snippets use this table to find the host TLS base on syscall entry.
+/// Called before entering guest code on aarch64. The trampoline's shared
+/// handlers use this table to find the host TLS (TCB) base on SVC/x18/MRS/MSR entry.
 ///
 /// Uses linear scan to match the trampoline's assembly lookup.
+/// Entry format: `[key: u64, host_tls: u64]` (16 bytes per entry).
+/// Key is TPIDRRO_EL0 on macOS. Sentinel `0xFFFF_FFFF_FFFF_FFFF` marks
+/// the end of valid entries. Tombstone `0` marks freed slots that can be
+/// reclaimed.
+///
+/// Thread-safety: claiming a free slot (sentinel or tombstone) uses
+/// `AtomicU64::compare_exchange` (CAS) so that two concurrent threads
+/// cannot claim the same slot. On CAS failure, the scan retries from
+/// the beginning.
 const TLS_TABLE_ENTRIES: usize = 256;
+const TLS_TABLE_SENTINEL: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 
 fn update_host_tls_entry() {
-    use core::sync::atomic::Ordering;
+    use core::sync::atomic::{AtomicU64, Ordering};
 
     let table_addr = litebox_common_linux::HOST_TLS_TABLE_ADDR.load(Ordering::Acquire);
     if table_addr == 0 {
@@ -2286,37 +2300,125 @@ fn update_host_tls_entry() {
     let host_tls = tcb as usize;
 
     // TPIDRRO_EL0 is the lookup key — stable per-pthread, never clobbered.
-    // This replaces the old guest_tpidr-keyed approach which was fragile on
-    // macOS because TPIDR_EL0 gets clobbered on every kernel→userspace
-    // transition. With TPIDRRO_EL0 as key, phantom entry cleanup, reverse
-    // host_tls lookup, and guest_tpidr sync from table are all unnecessary.
-    // The MSR handler now writes guest_tpidr directly to TCB.
     let tpidrro = unsafe { litebox_common_linux::read_tpidrro_el0() } as u64;
 
-    let sentinel: u64 = 0xFFFFFFFFFFFFFFFF;
-    let table = table_addr as *mut u64;
+    'retry: loop {
+        let mut first_free: Option<usize> = None;
+
+        for index in 0..TLS_TABLE_ENTRIES {
+            let key_ptr = unsafe { &*((table_addr + index * 16) as *const AtomicU64) };
+
+            let stored_key = key_ptr.load(Ordering::Acquire);
+
+            if stored_key == tpidrro {
+                // Found our entry — update host_tls in case it changed.
+                let val_ptr = (table_addr + index * 16 + 8) as *mut u64;
+                unsafe { val_ptr.write_volatile(host_tls as u64) };
+                return;
+            }
+
+            if stored_key == TLS_TABLE_SENTINEL {
+                // End of table — no existing entry for our TPIDRRO_EL0.
+                if first_free.is_none() {
+                    first_free = Some(index);
+                }
+                break;
+            }
+
+            // Tombstone (key=0): freed by remove_host_tls_entries.
+            // Remember as candidate but keep scanning for existing entry.
+            if stored_key == 0 && first_free.is_none() {
+                first_free = Some(index);
+            }
+        }
+
+        // Claim the first free slot (tombstone or sentinel) via CAS.
+        let free_index = first_free.expect("TLS table full: exceeded 256 concurrent threads");
+        let key_ptr = unsafe { &*((table_addr + free_index * 16) as *const AtomicU64) };
+        let val_ptr = (table_addr + free_index * 16 + 8) as *mut u64;
+
+        // Re-read the key — it may have changed since our scan.
+        let current = key_ptr.load(Ordering::Acquire);
+
+        // Only try CAS on sentinel or tombstone slots.
+        if current != TLS_TABLE_SENTINEL && current != 0 {
+            // Slot was claimed by another thread. Rescan.
+            continue 'retry;
+        }
+
+        match key_ptr.compare_exchange(current, tpidrro, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {
+                // Claimed. Write host_tls value.
+                unsafe { val_ptr.write_volatile(host_tls as u64) };
+                return;
+            }
+            Err(_) => {
+                // CAS failed — another thread grabbed this slot. Rescan.
+                continue 'retry;
+            }
+        }
+    }
+}
+
+/// Remove the current thread's TLS table entry by writing a tombstone (key=0).
+///
+/// Called when a thread exits `run_thread_inner` to prevent stale entries
+/// from accumulating in the table. Without cleanup, the 256-entry table
+/// would eventually fill up for long-running programs that create many
+/// cumulative threads.
+///
+/// Uses tombstone value 0 (not sentinel) so that entries at higher indices
+/// remain reachable by the assembly linear scan. The assembly scanner only
+/// stops at sentinel (0xFFFF_FFFF_FFFF_FFFF), not at tombstones.
+///
+/// Only the owning thread calls this for its own TPIDRRO_EL0 key,
+/// so there is no race on the entry being removed.
+fn remove_host_tls_entries() {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    let table_addr = litebox_common_linux::HOST_TLS_TABLE_ADDR.load(Ordering::Acquire);
+    if table_addr == 0 {
+        return;
+    }
+
+    let tpidrro = unsafe { litebox_common_linux::read_tpidrro_el0() } as u64;
 
     for index in 0..TLS_TABLE_ENTRIES {
-        let entry = unsafe { table.add(index * 2) };
-        let stored_key = unsafe { entry.read_volatile() };
+        let key_ptr = unsafe { &*((table_addr + index * 16) as *const AtomicU64) };
+
+        let stored_key = key_ptr.load(Ordering::Acquire);
 
         if stored_key == tpidrro {
-            // Found our entry — update host_tls in case it changed.
-            unsafe { entry.add(1).write_volatile(host_tls as u64) };
+            // Found our entry — replace key with sentinel to free the slot.
+            // The assembly scanner will see this as end-of-table and stop,
+            // but entries beyond it are still valid (they were written with
+            // higher indices). This creates a "hole" in the table.
+            //
+            // The hole is harmless: update_host_tls_entry scans past
+            // sentinels... wait, no — the assembly scanner stops at the
+            // first sentinel. So we cannot just write a sentinel here
+            // without compacting.
+            //
+            // Instead, we use a tombstone approach: write 0 as the key.
+            // The value 0 is not a valid TPIDRRO_EL0 (macOS always sets
+            // it to the pthread TSD base, which is a high userspace address).
+            // The assembly scanner will see key=0, which won't match any
+            // thread's TPIDRRO_EL0, and will continue scanning past it
+            // (it only stops at sentinel 0xFFFF_FFFF_FFFF_FFFF).
+            //
+            // update_host_tls_entry will also scan past tombstones (key=0)
+            // and can reclaim them via CAS when claiming a new slot.
+            key_ptr.store(0, Ordering::Release);
             return;
         }
 
-        if stored_key == sentinel {
-            // Free slot — write new [tpidrro_el0, host_tls] entry.
-            unsafe {
-                entry.write_volatile(tpidrro);
-                entry.add(1).write_volatile(host_tls as u64);
-            }
+        if stored_key == TLS_TABLE_SENTINEL {
+            // Reached end of table without finding our entry. This can
+            // happen if the thread never successfully claimed a slot
+            // (e.g., table was full, or thread exited before entering guest).
             return;
         }
     }
-
-    panic!("TLS table full: exceeded {TLS_TABLE_ENTRIES} concurrent threads");
 }
 
 extern "C-unwind" fn interrupt_handler(thread_ctx: &mut ThreadContext) {
