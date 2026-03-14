@@ -2113,7 +2113,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                     prot,
                 )
             };
-            assert_eq!(r, 0, "mprotect failed: {}", std::io::Error::last_os_error());
+            if r != 0 {
+                // mprotect can fail with EACCES when the range includes pages
+                // that aren't ours (e.g., brk zone pages that weren't
+                // gap-reserved because a host mapping occupied them).  Return
+                // Unallocated so callers (like brk grow) can fall back.
+                return Err(litebox::platform::page_mgmt::PermissionUpdateError::Unallocated);
+            }
         }
 
         // Edge host pages: update per-sub-page state and compute W^X composite
