@@ -18,7 +18,7 @@ use thiserror::Error;
 /// Possible errors from [`Network::socket`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
-pub enum CreateError {
+pub enum SocketError {
     #[error("Unsupported protocol {0}")]
     UnsupportedProtocol(u8),
 }

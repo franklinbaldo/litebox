@@ -26,8 +26,8 @@ pub mod socket_channel;
 mod tests;
 
 use errors::{
-    AcceptError, BindError, CloseError, ConnectError, CreateError, ListenError, LocalAddrError,
-    ReceiveError, RemoteAddrError, SendError,
+    AcceptError, BindError, CloseError, ConnectError, ListenError, LocalAddrError, ReceiveError,
+    RemoteAddrError, SendError, SocketError,
 };
 use local_ports::{LocalPort, LocalPortAllocator};
 
@@ -725,7 +725,7 @@ where
     ///
     /// By default, the created socket has no associated proxy; to set a proxy, use
     /// [`set_socket_proxy`](Self::set_socket_proxy).
-    pub fn socket(&mut self, protocol: Protocol) -> Result<SocketFd<Platform>, CreateError> {
+    pub fn socket(&mut self, protocol: Protocol) -> Result<SocketFd<Platform>, SocketError> {
         let handle = match protocol {
             Protocol::Tcp => self.socket_set.add(tcp::Socket::new(
                 smoltcp::storage::RingBuffer::new(vec![0u8; SOCKET_BUFFER_SIZE]),
@@ -755,7 +755,7 @@ where
                 // TODO: Should we maintain a specific allow-list of protocols for raw sockets?
                 // Should we allow everything except TCP/UDP/ICMP? Should we allow everything? These
                 // questions should be resolved; for now I am disallowing everything else.
-                return Err(CreateError::UnsupportedProtocol(protocol));
+                return Err(SocketError::UnsupportedProtocol(protocol));
 
                 #[expect(
                     unreachable_code,
