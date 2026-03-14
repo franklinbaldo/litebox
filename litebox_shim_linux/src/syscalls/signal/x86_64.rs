@@ -20,6 +20,71 @@ struct SignalFrame {
     siginfo: Siginfo,
 }
 
+/// Best-effort snapshot of the live x87/SSE state via `fxsave64`.
+///
+/// This is for debugging signal-corruption hypotheses on x86_64. It captures
+/// the architectural FXSAVE area (512 bytes), which includes x87 state,
+/// MXCSR, and XMM registers, but not AVX upper halves.
+#[repr(C, align(16))]
+pub(super) struct FpStateSnapshot {
+    bytes: [u8; 512],
+}
+
+impl Default for FpStateSnapshot {
+    fn default() -> Self {
+        Self { bytes: [0; 512] }
+    }
+}
+
+pub(super) fn capture_fp_state() -> FpStateSnapshot {
+    let mut snapshot = FpStateSnapshot::default();
+    // SAFETY: `snapshot` is 16-byte aligned and points to writable memory of
+    // the required FXSAVE size.
+    unsafe {
+        core::arch::asm!(
+            "fxsave64 [{ptr}]",
+            ptr = in(reg) snapshot.bytes.as_mut_ptr(),
+            options(preserves_flags),
+        );
+    }
+    snapshot
+}
+
+pub(super) fn fpstate_hash(snapshot: &FpStateSnapshot) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &byte in &snapshot.bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    hash
+}
+
+pub(super) fn fpstate_mxcsr(snapshot: &FpStateSnapshot) -> u32 {
+    u32::from_le_bytes(snapshot.bytes[24..28].try_into().unwrap())
+}
+
+pub(super) fn fpstate_diff_summary(
+    before: &FpStateSnapshot,
+    after: &FpStateSnapshot,
+) -> (usize, [usize; 8], usize) {
+    let mut changed_bytes = 0;
+    let mut first_diffs = [0usize; 8];
+    let mut first_diff_count = 0;
+
+    for (idx, (&lhs, &rhs)) in before.bytes.iter().zip(after.bytes.iter()).enumerate() {
+        if lhs == rhs {
+            continue;
+        }
+        changed_bytes += 1;
+        if first_diff_count < first_diffs.len() {
+            first_diffs[first_diff_count] = idx;
+            first_diff_count += 1;
+        }
+    }
+
+    (changed_bytes, first_diffs, first_diff_count)
+}
+
 pub(super) fn uctx_addr(ctx: &PtRegs) -> usize {
     ctx.rsp
 }

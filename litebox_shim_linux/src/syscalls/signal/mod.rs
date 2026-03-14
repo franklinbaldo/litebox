@@ -52,6 +52,19 @@ pub(crate) struct SignalState {
     /// pending signals. Used by `epoll_pwait` / `ppoll` to atomically
     /// unblock signals during the wait and re-block them afterwards.
     restore_mask: Cell<Option<SigSet>>,
+    /// Best-effort x86_64 FXSAVE snapshot captured just before a guest signal
+    /// handler runs, so `rt_sigreturn` can compare whether FP/SSE state
+    /// changed across the handler.
+    #[cfg(target_arch = "x86_64")]
+    debug_fp_state: RefCell<Option<DebugFpState>>,
+}
+
+#[cfg(target_arch = "x86_64")]
+struct DebugFpState {
+    signal: Signal,
+    delivered_pre_rip: usize,
+    delivered_pre_rsp: usize,
+    snapshot: arch::FpStateSnapshot,
 }
 
 impl SignalState {
@@ -75,6 +88,8 @@ impl SignalState {
                 kernel_mode: false,
             }),
             restore_mask: Cell::new(None),
+            #[cfg(target_arch = "x86_64")]
+            debug_fp_state: RefCell::new(None),
         }
     }
 
@@ -92,6 +107,10 @@ impl SignalState {
     /// next `process_signals` call delivers any unblocked signals.
     pub fn set_restore_mask(&self, mask: SigSet) {
         self.restore_mask.set(Some(mask));
+    }
+
+    pub(crate) fn last_exception(&self) -> litebox::shim::ExceptionInfo {
+        self.last_exception.get()
     }
 
     pub fn clone_for_new_task(&self) -> Self {
@@ -116,6 +135,8 @@ impl SignalState {
             // Preserve last exception
             last_exception: self.last_exception.clone(),
             restore_mask: Cell::new(None),
+            #[cfg(target_arch = "x86_64")]
+            debug_fp_state: RefCell::new(None),
         }
     }
 
@@ -142,6 +163,8 @@ impl SignalState {
             .into(),
             last_exception: self.last_exception.clone(),
             restore_mask: Cell::new(None),
+            #[cfg(target_arch = "x86_64")]
+            debug_fp_state: RefCell::new(None),
         }
     }
 
@@ -166,6 +189,32 @@ impl SignalState {
             };
         }
         self.clear_sigaltstack();
+        #[cfg(target_arch = "x86_64")]
+        self.debug_fp_state.borrow_mut().take();
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn capture_debug_fp_before_delivery(
+        &self,
+        signal: Signal,
+        delivered_pre_rip: usize,
+        delivered_pre_rsp: usize,
+    ) {
+        if signal != Signal::SIGCHLD {
+            return;
+        }
+
+        self.debug_fp_state.replace(Some(DebugFpState {
+            signal,
+            delivered_pre_rip,
+            delivered_pre_rsp,
+            snapshot: arch::capture_fp_state(),
+        }));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn take_debug_fp_state(&self) -> Option<DebugFpState> {
+        self.debug_fp_state.borrow_mut().take()
     }
 }
 
@@ -397,6 +446,7 @@ impl SignalState {
         siginfo: &Siginfo,
         action: &SigAction,
         ctx: &mut PtRegs,
+        task: &Task<impl ShimFS>,
     ) -> Result<(), DeliverFault> {
         let sp = arch::sp(ctx);
         let on_alt_stack = is_on_stack(&self.altstack.get(), sp);
@@ -413,10 +463,59 @@ impl SignalState {
         let frame_addr = arch::get_signal_frame(sp, action);
 
         if (switch_stacks || on_alt_stack) && !is_on_stack(&altstack, frame_addr) {
+            litebox::log_println!(
+                task.global.platform,
+                "[SIGNAL-DELIVER-FAULT] pid={} tid={} comm={:?} signal={:?} reason=frame-outside-altstack pre_sp={:#x} frame_addr={:#x} altstack_sp={:#x} altstack_size={:#x} altstack_flags={:#x} switch_stacks={} on_alt_stack={} handler={:#x} restorer={:#x} flags={:#x}",
+                task.pid,
+                task.tid,
+                task.task_comm_preview(),
+                signal,
+                sp,
+                frame_addr,
+                altstack.sp,
+                altstack.size,
+                altstack.flags.bits(),
+                switch_stacks,
+                on_alt_stack,
+                action.sigaction,
+                action.restorer,
+                action.flags.bits(),
+            );
             return Err(DeliverFault);
         }
 
-        self.write_signal_frame(frame_addr, siginfo, action, ctx)?;
+        #[cfg(target_arch = "x86_64")]
+        let delivered_pre_rip = ctx.rip;
+        #[cfg(target_arch = "x86_64")]
+        let delivered_pre_rsp = ctx.rsp;
+
+        if self
+            .write_signal_frame(frame_addr, siginfo, action, ctx)
+            .is_err()
+        {
+            litebox::log_println!(
+                task.global.platform,
+                "[SIGNAL-DELIVER-FAULT] pid={} tid={} comm={:?} signal={:?} reason=write-frame pre_sp={:#x} frame_addr={:#x} altstack_sp={:#x} altstack_size={:#x} altstack_flags={:#x} switch_stacks={} on_alt_stack={} handler={:#x} restorer={:#x} flags={:#x}",
+                task.pid,
+                task.tid,
+                task.task_comm_preview(),
+                signal,
+                sp,
+                frame_addr,
+                altstack.sp,
+                altstack.size,
+                altstack.flags.bits(),
+                switch_stacks,
+                on_alt_stack,
+                action.sigaction,
+                action.restorer,
+                action.flags.bits(),
+            );
+            return Err(DeliverFault);
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        self.capture_debug_fp_before_delivery(signal, delivered_pre_rip, delivered_pre_rsp);
 
         let mut mask = self.blocked.get() | action.mask;
         if !action.flags.contains(SaFlags::NODEFER) {
@@ -507,6 +606,50 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EFAULT);
         };
 
+        #[cfg(target_arch = "x86_64")]
+        if let Some(debug_fp) = self.signals.take_debug_fp_state() {
+            let current_fp = arch::capture_fp_state();
+            let before_hash = arch::fpstate_hash(&debug_fp.snapshot);
+            let after_hash = arch::fpstate_hash(&current_fp);
+            let before_mxcsr = arch::fpstate_mxcsr(&debug_fp.snapshot);
+            let after_mxcsr = arch::fpstate_mxcsr(&current_fp);
+            let (changed_bytes, first_diffs, first_diff_count) =
+                arch::fpstate_diff_summary(&debug_fp.snapshot, &current_fp);
+            litebox::log_println!(
+                self.global.platform,
+                "[RT-SIGRETURN-FPSTATE] pid={} tid={} comm={:?} signal={:?} uctx={:#x} frame_fpstate={:#x} delivered_pre_rip={:#x} delivered_pre_rsp={:#x} restore_rip={:#x} restore_rsp={:#x} before_hash={:#x} after_hash={:#x} before_mxcsr={:#x} after_mxcsr={:#x} changed_bytes={} first_diffs={:?}",
+                self.pid,
+                self.tid,
+                self.task_comm_preview(),
+                debug_fp.signal,
+                uctx_addr,
+                uctx.mcontext.fpstate,
+                debug_fp.delivered_pre_rip,
+                debug_fp.delivered_pre_rsp,
+                uctx.mcontext.rip,
+                uctx.mcontext.rsp,
+                before_hash,
+                after_hash,
+                before_mxcsr,
+                after_mxcsr,
+                changed_bytes,
+                &first_diffs[..first_diff_count],
+            );
+        }
+
+        litebox::log_println!(
+            self.global.platform,
+            "[RT-SIGRETURN] pid={} tid={} comm={:?} uctx={:#x} restore_rip={:#x} restore_rsp={:#x} restore_rax={:#x} sigmask={:#x}",
+            self.pid,
+            self.tid,
+            self.task_comm_preview(),
+            uctx_addr,
+            uctx.mcontext.rip,
+            uctx.mcontext.rsp,
+            uctx.mcontext.rax,
+            uctx.sigmask.as_u64(),
+        );
+
         // Restore the alternate signal stack, ignoring errors.
         self.signals.set_sigaltstack(uctx.stack).ok();
 
@@ -552,6 +695,28 @@ impl<FS: ShimFS> Task<FS> {
             oldact_ptr
                 .write_at_offset(0, old_act)
                 .ok_or(Errno::EFAULT)?;
+        }
+
+        if matches!(
+            signal,
+            Signal::SIGSEGV | Signal::SIGBUS | Signal::SIGFPE | Signal::SIGILL | Signal::SIGTRAP
+        ) {
+            let new_act = act.unwrap_or(old_act);
+            litebox::log_println!(
+                self.global.platform,
+                "[RT-SIGACTION] pid={} tid={} comm={:?} signal={:?} set={} old_handler={:#x} old_flags={:#x} old_mask={:#x} new_handler={:#x} new_flags={:#x} new_mask={:#x}",
+                self.pid,
+                self.tid,
+                self.task_comm_preview(),
+                signal,
+                act.is_some(),
+                old_act.sigaction,
+                old_act.flags.bits(),
+                old_act.mask.as_u64(),
+                new_act.sigaction,
+                new_act.flags.bits(),
+                new_act.mask.as_u64(),
+            );
         }
 
         Ok(0)
@@ -679,6 +844,7 @@ impl<FS: ShimFS> Task<FS> {
                             // STOP is not currently supported, so treat as
                             // terminate. Core dumps are also not currently
                             // supported.
+                            self.log_fatal_signal_context(signal, ctx);
                             litebox::log_println!(
                                 self.global.platform,
                                 "-- Fatal signal {:?}: terminating task {}:{} fault_addr={:#x} error_code={:#x}",
@@ -698,8 +864,22 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 SIG_IGN => {}
                 _ => {
-                    if let Err(DeliverFault) =
-                        self.signals.deliver_signal(signal, &siginfo, &action, ctx)
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[SIGNAL-DELIVER] pid={} tid={} comm={:?} signal={:?} handler={:#x} restorer={:#x} flags={:#x} pre_rip={:#x} pre_rsp={:#x}",
+                        self.pid,
+                        self.tid,
+                        self.task_comm_preview(),
+                        signal,
+                        action.sigaction,
+                        action.restorer,
+                        action.flags.bits(),
+                        ctx.rip,
+                        ctx.rsp,
+                    );
+                    if let Err(DeliverFault) = self
+                        .signals
+                        .deliver_signal(signal, &siginfo, &action, ctx, self)
                     {
                         // Failed to deliver signal. Inject a SIGSEGV
                         // (terminating the process if we were trying to deliver
@@ -778,8 +958,17 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     fn force_signal_with_info(&self, signal: Signal, force_exit: bool, siginfo: Siginfo) {
-        assert!(matches!(signal, Signal::SIGKILL | Signal::SIGSEGV));
+        assert!(matches!(
+            signal,
+            Signal::SIGKILL
+                | Signal::SIGSEGV
+                | Signal::SIGABRT
+                | Signal::SIGBUS
+                | Signal::SIGFPE
+                | Signal::SIGILL
+        ));
 
+        let siginfo_code = siginfo.code;
         self.signals
             .pending
             .borrow_mut()
@@ -789,10 +978,29 @@ impl<FS: ShimFS> Task<FS> {
         let handlers = self.signals.handlers.borrow();
         let mut inner = handlers.inner.lock();
         let handler = &mut inner[signal];
-        if force_exit
-            || self.signals.blocked.get().contains(signal)
-            || handler.action.sigaction == SIG_IGN
-        {
+        let blocked_mask = self.signals.blocked.get();
+        let signal_blocked = blocked_mask.contains(signal);
+        let handler_ignored = handler.action.sigaction == SIG_IGN;
+        let will_rewrite_default = force_exit || signal_blocked || handler_ignored;
+        if signal == Signal::SIGSEGV || will_rewrite_default {
+            litebox::log_println!(
+                self.global.platform,
+                "[FORCE-SIGNAL] pid={} tid={} comm={:?} signal={:?} force_exit={} blocked_mask={:#x} signal_blocked={} handler={:#x} flags={:#x} immutable={} siginfo_code={} rewrite_default={}",
+                self.pid,
+                self.tid,
+                self.task_comm_preview(),
+                signal,
+                force_exit,
+                blocked_mask.as_u64(),
+                signal_blocked,
+                handler.action.sigaction,
+                handler.action.flags.bits(),
+                handler.immutable,
+                siginfo_code,
+                will_rewrite_default,
+            );
+        }
+        if will_rewrite_default {
             let mut blocked = self.signals.blocked.get();
             blocked.remove(signal);
             self.signals.set_signal_mask(blocked);
@@ -809,7 +1017,11 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
-    pub(crate) fn handle_exception_request(&self, info: &litebox::shim::ExceptionInfo) {
+    pub(crate) fn handle_exception_request(
+        &self,
+        info: &litebox::shim::ExceptionInfo,
+        ctx: &PtRegs,
+    ) {
         let signal = match info.exception {
             Exception::DIVIDE_ERROR => Signal::SIGFPE,
             Exception::BREAKPOINT => Signal::SIGTRAP,
@@ -825,6 +1037,28 @@ impl<FS: ShimFS> Task<FS> {
             0
         };
         self.signals.last_exception.set(*info);
+        if signal == Signal::SIGSEGV {
+            let handlers = self.signals.handlers.borrow();
+            let inner = handlers.inner.lock();
+            let handler = &inner[signal];
+            litebox::log_println!(
+                self.global.platform,
+                "[EXCEPTION-SIGNAL] pid={} tid={} comm={:?} signal={:?} rip={:#x} rsp={:#x} fault_addr={:#x} error_code={:#x} kernel_mode={} blocked_mask={:#x} handler={:#x} handler_flags={:#x} immutable={}",
+                self.pid,
+                self.tid,
+                self.task_comm_preview(),
+                signal,
+                ctx.rip,
+                ctx.rsp,
+                fault_address,
+                info.error_code,
+                info.kernel_mode,
+                self.signals.blocked.get().as_u64(),
+                handler.action.sigaction,
+                handler.action.flags.bits(),
+                handler.immutable,
+            );
+        }
         self.force_signal_with_info(signal, false, siginfo_exception(signal, fault_address));
     }
 }

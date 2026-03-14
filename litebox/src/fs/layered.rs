@@ -101,6 +101,21 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         self.lower.file_status(path).map(|stat| stat.file_type)
     }
 
+    /// Returns whether a lower-layer fd is safe to share across multiple layered opens.
+    ///
+    /// Regular files and directories can reuse a shared lower fd because layered descriptors track
+    /// their own offsets. Character devices often have per-open state or side effects, so each
+    /// layered open must keep its own lower fd.
+    fn lower_fd_is_shareable(&self, fd: &TypedFd<Lower>) -> bool {
+        !matches!(
+            self.lower
+                .fd_file_status(fd)
+                .expect("fresh lower fd must have file status")
+                .file_type,
+            FileType::CharacterDevice
+        )
+    }
+
     /// (private-only) Create all parent/ancestor directories for a `path`, making sure that each of
     /// these exist in the lower layer. It does _not_ set up `path` itself on the upper layer
     /// though; this is left to the callee to handle.
@@ -485,7 +500,7 @@ impl<
         let mut tombstone_removal = false;
         // If we already have an entry saying it is a tombstone, then we need to quit out early;
         // otherwise, we'll check the levels.
-        if let Some(entry) = self.root.read().entries.get(&path) {
+        if let Some(entry) = self.root.read().entries.get(&path).cloned() {
             match entry.as_ref() {
                 EntryX::Tombstone => {
                     // The file has been cleared out; it used to exist on the lower level, but we
@@ -499,17 +514,19 @@ impl<
                     }
                 }
                 EntryX::Upper { .. } => unreachable!(),
-                EntryX::Lower { .. } => {
+                EntryX::Lower { fd } => {
                     // As an optimization, since a lower-level file entry is always opened with the
                     // same flags, and since it indicates that there is no such file at the upper
                     // level, we can just return that directly (with the "real" flags being wrapped
                     // up in the layered descriptor).
-                    return Ok(self.litebox.descriptor_table_mut().insert(Descriptor {
-                        path,
-                        flags,
-                        entry: Arc::clone(entry),
-                        position: 0.into(),
-                    }));
+                    if self.lower_fd_is_shareable(fd) {
+                        return Ok(self.litebox.descriptor_table_mut().insert(Descriptor {
+                            path,
+                            flags,
+                            entry,
+                            position: 0.into(),
+                        }));
+                    }
                 }
             }
         }
@@ -599,13 +616,14 @@ impl<
         // Any errors from lower level now _must_ propagate up, so we can just invoke
         // the lower level and set up the relevant descriptor upon success.
         let lower_fd = self.lower.open(path.as_str(), flags, mode)?;
-        // Insert into root entries, handling the race where another thread may have
-        // already inserted an entry for the same path between our earlier read-lock
-        // check and this write-lock acquisition.
-        let entry = {
+        let entry = if self.lower_fd_is_shareable(&lower_fd) {
+            // Insert into root entries, handling the race where another thread may have
+            // already inserted an entry for the same path between our earlier read-lock
+            // check and this write-lock acquisition.
             let mut root = self.root.write();
             if let Some(existing) = root.entries.get(&path) {
-                if matches!(existing.as_ref(), EntryX::Lower { .. }) {
+                if matches!(existing.as_ref(), EntryX::Lower { fd } if self.lower_fd_is_shareable(fd))
+                {
                     // Another thread won the race — reuse its entry and close ours.
                     let shared = Arc::clone(existing);
                     drop(root);
@@ -623,6 +641,8 @@ impl<
                 root.entries.insert(path.clone(), Arc::clone(&entry));
                 entry
             }
+        } else {
+            Arc::new(EntryX::Lower { fd: lower_fd })
         };
         let fd = self.litebox.descriptor_table_mut().insert(Descriptor {
             path,
@@ -693,8 +713,17 @@ impl<
                 self.upper.close(&fd)
             }
             EntryX::Lower { .. } => {
-                // Lower level FDs almost always have a corresponding entry in the root. Thus, we
-                // might need to possibly clean things up from the root.
+                // Standalone lower-level descriptors (for example, character devices with per-open
+                // side effects) are not cached in `root`.
+                if !root_entries.contains_key(&path) {
+                    assert_eq!(Arc::strong_count(&entry), 1);
+                    let EntryX::Lower { fd } = Arc::into_inner(entry).unwrap() else {
+                        unreachable!()
+                    };
+                    return self.lower.close(&fd);
+                }
+                // Shared lower-level FDs have a corresponding entry in the root. Thus, we might
+                // need to possibly clean things up from the root.
                 //
                 // First, we can attempt a fast-path clean-up by quickly check if there are other
                 // FDs referring to the same file
@@ -1538,7 +1567,8 @@ struct RootDir<Upper: super::FileSystem + 'static, Lower: super::FileSystem + 's
     // keys are normalized paths; directories do not have the final `/` (thus the root would be at
     // the empty-string key "")
     //
-    // Invariant: this only stores lower+tombstone entries, no upper entries will show up here.
+    // Invariant: this only stores shareable lower+tombstone entries, no upper entries will show up
+    // here.
     entries: HashMap<String, Entry<Upper, Lower>>,
 }
 

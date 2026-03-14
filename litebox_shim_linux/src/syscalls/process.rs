@@ -269,6 +269,13 @@ impl<FS: ShimFS> Task<FS> {
         assert!(!inner.group_exit);
         inner.exit_status = status;
         inner.group_exit = true;
+        litebox::log_println!(
+            self.global.platform,
+            "[EXIT] pid={} tid={} status={:?}",
+            self.pid,
+            self.tid,
+            status,
+        );
         // Cancel blocking stdin reads so threads in host syscalls can exit.
         // Only do this for the init process; child processes should not cancel
         // stdin for the entire sandbox.
@@ -600,11 +607,6 @@ fn wake_robust_list(
 impl<FS: ShimFS> Task<FS> {
     /// Called when the task is exiting.
     pub(crate) fn prepare_for_exit(&mut self) {
-        // If this is a vfork child, unblock the parent before tearing down.
-        if let Some(fc) = self.fork_context.get_mut() {
-            fc.vfork_done.signal();
-        }
-
         // If this thread has a deferred park lie that was claimed (at a
         // park_if_deferred checkpoint) but the vfork window hasn't closed yet,
         // decrement parked_count so the forking thread isn't stuck. The
@@ -755,6 +757,12 @@ impl<FS: ShimFS> Task<FS> {
         }
         if let Some(robust_list) = self.thread.robust_list.take() {
             let _ = wake_robust_list(robust_list);
+        }
+
+        // If this is a vfork child, unblock the parent only after all exit
+        // cleanup that may touch shared guest memory has completed.
+        if let Some(fc) = self.fork_context.get_mut() {
+            fc.vfork_done.signal();
         }
     }
 
@@ -1205,6 +1213,9 @@ impl<FS: ShimFS> Task<FS> {
                         files: self.files.clone(), // TODO: !CLONE_FILES support
                         signals: self.signals.clone_for_new_task(),
                         fork_context: core::cell::RefCell::new(None),
+                        bash_vfork_probe: core::cell::RefCell::new(None),
+                        last_shell_write: core::cell::RefCell::new(None),
+                        last_syscall: core::cell::Cell::new(None),
                         deferred_vfork_park: core::cell::Cell::new(false),
                     },
                 }),
@@ -1248,6 +1259,8 @@ impl<FS: ShimFS> Task<FS> {
         _clone3: bool,
     ) -> Result<usize, Errno> {
         use litebox::platform::AddressSpaceProvider;
+
+        let bash_parent_vfork_probe = self.capture_bash_parent_vfork_probe(ctx);
 
         // Linux clone flag compatibility: CLONE_SIGHAND requires CLONE_VM,
         // and CLONE_THREAD requires CLONE_SIGHAND. Since the fork path has
@@ -1381,6 +1394,11 @@ impl<FS: ShimFS> Task<FS> {
             // unparked later, Ok(false) if no other threads exist, or
             // Err if another thread is already forking.
             let Ok(did_park) = self.park_other_threads() else {
+                litebox::log_println!(
+                    self.global.platform,
+                    "[FORK-EAGAIN] pid={} concurrent fork",
+                    self.pid,
+                );
                 return Err(Errno::EAGAIN);
             };
 
@@ -1562,6 +1580,9 @@ impl<FS: ShimFS> Task<FS> {
                         files: child_files,
                         signals: self.signals.clone_for_fork(),
                         fork_context: core::cell::RefCell::new(child_fork_context),
+                        bash_vfork_probe: core::cell::RefCell::new(None),
+                        last_shell_write: core::cell::RefCell::new(None),
+                        last_syscall: core::cell::Cell::new(None),
                         deferred_vfork_park: core::cell::Cell::new(false),
                     },
                 }),
@@ -1658,6 +1679,16 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         // Parent returns child's PID.
+        if let Some(probe) = &bash_parent_vfork_probe {
+            self.log_bash_parent_vfork_probe(child_pid, probe);
+        }
+        litebox::log_println!(
+            self.global.platform,
+            "[FORK] parent={} child={} vfork={}",
+            self.pid,
+            child_pid,
+            is_shared,
+        );
         Ok(usize::try_from(child_pid).unwrap())
     }
 
@@ -2518,6 +2549,12 @@ impl<FS: ShimFS> Task<FS> {
 
         // Copy pathname
         let Some(path_cstr) = pathname.to_cstring() else {
+            litebox::log_println!(
+                self.global.platform,
+                "[EXEC-EFAULT] pid={} pathname_addr={:#x}",
+                self.pid,
+                pathname.as_usize(),
+            );
             return Err(Errno::EFAULT);
         };
         let path = path_cstr.to_str().map_err(|_| Errno::ENOENT)?;
@@ -2534,7 +2571,32 @@ impl<FS: ShimFS> Task<FS> {
             copy_vector(envp, "envp")?
         };
 
-        let loader = crate::loader::elf::ElfLoader::new(self, path).map_err(Errno::from)?;
+        let loader = crate::loader::elf::ElfLoader::new(self, path).map_err(|e| {
+            litebox::log_println!(
+                self.global.platform,
+                "[EXEC-FAIL] pid={} path={:?} err={:?}",
+                self.pid,
+                path,
+                e,
+            );
+            Errno::from(e)
+        })?;
+
+        // Log successful exec with first few argv elements.
+        {
+            let argv_summary: alloc::vec::Vec<&str> = argv_vec
+                .iter()
+                .take(3)
+                .filter_map(|a| a.to_str().ok())
+                .collect();
+            litebox::log_println!(
+                self.global.platform,
+                "[EXEC] pid={} path={:?} argv={:?}",
+                self.pid,
+                path,
+                argv_summary,
+            );
+        }
 
         // After this point, the old program is torn down and failures must terminate the process.
 
@@ -2554,6 +2616,7 @@ impl<FS: ShimFS> Task<FS> {
         // If this is a vfork child, detach from the parent's shared state.
         // This must happen before close_on_exec/release_memory so mutations
         // only affect the child's own copies.
+        let mut vfork_done = None;
         if let Some(fc) = self.fork_context.borrow_mut().take() {
             use litebox::platform::AddressSpaceProvider;
 
@@ -2585,9 +2648,7 @@ impl<FS: ShimFS> Task<FS> {
             // its own copy. FD table was already duplicated at fork time.
             let new_fs: Arc<_> = Arc::new(self.fs.borrow().as_ref().clone());
             self.fs.replace(new_fs);
-
-            // Unblock the parent — the child now has its own state.
-            fc.vfork_done.signal();
+            vfork_done = Some(fc.vfork_done);
         }
 
         // Close CLOEXEC descriptors (now on the child's own FD table).
@@ -2614,6 +2675,9 @@ impl<FS: ShimFS> Task<FS> {
         match self.load_program(loader, argv_vec, envp_vec) {
             Ok(()) => {}
             Err(e) => {
+                if let Some(vd) = vfork_done.take() {
+                    vd.signal();
+                }
                 // The old process state has already been torn down. There's
                 // no way to recover — terminate the process.
                 litebox::log_println!(
@@ -2629,6 +2693,9 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         self.init_thread_context(ctx);
+        if let Some(vd) = vfork_done.take() {
+            vd.signal();
+        }
         Ok(0)
     }
 

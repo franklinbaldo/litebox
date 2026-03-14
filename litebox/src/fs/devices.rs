@@ -139,10 +139,12 @@ pub struct PtyPair<Platform: crate::sync::RawSyncPrimitivesProvider + TimeProvid
     pub slave_to_master: crate::sync::Mutex<Platform, VecDeque<u8>>,
     /// Whether the slave side has been unlocked via TIOCSPTLK.
     pub unlocked: core::sync::atomic::AtomicBool,
-    /// Whether the slave side is open (used for EOF detection).
-    pub slave_open: core::sync::atomic::AtomicBool,
-    /// Whether the master side is open (used for EIO on slave reads).
-    pub master_open: core::sync::atomic::AtomicBool,
+    /// Reference count of open slave FDs (used for EOF detection).
+    /// Incremented on open and FD duplication, decremented on close.
+    pub slave_open_count: core::sync::atomic::AtomicU32,
+    /// Reference count of open master FDs (used for EIO on slave reads).
+    /// Incremented on open and FD duplication, decremented on close.
+    pub master_open_count: core::sync::atomic::AtomicU32,
     /// Pollee for notifying epoll when data is available for master reads.
     pub master_pollee: Pollee<Platform>,
     /// Pollee for notifying poll/select when data is available for slave reads.
@@ -171,10 +173,11 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + TimeProvider> IOPollable
         if !self.0.slave_to_master.lock().is_empty() {
             events |= Events::IN;
         }
-        if !self
+        if self
             .0
-            .slave_open
+            .slave_open_count
             .load(core::sync::atomic::Ordering::Acquire)
+            == 0
         {
             events |= Events::HUP;
         }
@@ -206,10 +209,11 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + TimeProvider> IOPollable
         if !self.0.master_to_slave.lock().is_empty() {
             events |= Events::IN;
         }
-        if !self
+        if self
             .0
-            .master_open
+            .master_open_count
             .load(core::sync::atomic::Ordering::Acquire)
+            == 0
         {
             events |= Events::HUP;
         }
@@ -263,8 +267,8 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + TimeProvider> PtyManager
             master_to_slave: crate::sync::Mutex::new(VecDeque::new()),
             slave_to_master: crate::sync::Mutex::new(VecDeque::new()),
             unlocked: true.into(),
-            slave_open: false.into(),
-            master_open: true.into(),
+            slave_open_count: core::sync::atomic::AtomicU32::new(0),
+            master_open_count: core::sync::atomic::AtomicU32::new(1),
             master_pollee: Pollee::new(),
             slave_pollee: Pollee::new(),
             termios: crate::sync::Mutex::new(PtyTermios::new()),
@@ -462,6 +466,7 @@ impl<
     Platform: crate::sync::RawSyncPrimitivesProvider
         + crate::platform::StdioProvider
         + crate::platform::CrngProvider
+        + crate::platform::DebugLogProvider
         + TimeProvider,
 > super::FileSystem for FileSystem<Platform>
 {
@@ -479,35 +484,51 @@ impl<
         let flags = flags - OFlags::NOCTTY - OFlags::NOFOLLOW - OFlags::APPEND;
         let truncate = flags.contains(OFlags::TRUNC);
         let flags = flags - OFlags::TRUNC;
+        if flags.contains(OFlags::CREAT | OFlags::EXCL) {
+            return Err(OpenError::AlreadyExists);
+        }
+        // Existing device nodes ignore create-only metadata and large-file mode bits.
+        let flags = flags - OFlags::CREAT - OFlags::LARGEFILE;
+        let _ = mode;
         let path = self.absolute_path(path)?;
-        let device = match path.as_str() {
+        let (device, pty_pair) = match path.as_str() {
             "/dev/stdin" => {
-                if flags == OFlags::RDONLY && mode.is_empty() {
-                    Device::Stdin
+                if flags == OFlags::RDONLY || flags == OFlags::RDWR {
+                    (Device::Stdin, None)
                 } else {
-                    unimplemented!()
+                    return Err(OpenError::AccessNotAllowed);
                 }
             }
             "/dev/stdout" => {
-                if flags == OFlags::WRONLY && mode.is_empty() {
-                    Device::Stdout
+                if flags == OFlags::WRONLY || flags == OFlags::RDWR {
+                    (Device::Stdout, None)
                 } else {
-                    unimplemented!()
+                    return Err(OpenError::AccessNotAllowed);
                 }
             }
             "/dev/stderr" => {
-                if flags == OFlags::WRONLY && mode.is_empty() {
-                    Device::Stderr
+                if flags == OFlags::WRONLY || flags == OFlags::RDWR {
+                    (Device::Stderr, None)
                 } else {
-                    unimplemented!()
+                    return Err(OpenError::AccessNotAllowed);
                 }
             }
-            "/dev/null" => Device::Null,
-            "/dev/urandom" => Device::URandom,
-            "/dev/tty" => Device::Tty,
+            "/dev/null" => (Device::Null, None),
+            "/dev/urandom" => (Device::URandom, None),
+            "/dev/tty" => (Device::Tty, None),
             "/dev/ptmx" => {
+                let before_len = self.pty_manager.pairs.lock().len();
                 let idx = self.pty_manager.alloc();
-                Device::PtyMaster(idx)
+                let msg = alloc::format!(
+                    "[PTY-ALLOC] fs={:p} mgr={:p} before_len={} idx={}\n",
+                    self,
+                    &self.pty_manager,
+                    before_len,
+                    idx,
+                );
+                self.litebox.x.platform.debug_log_print(&msg);
+                let pair = self.pty_manager.get(idx).unwrap();
+                (Device::PtyMaster(idx), Some(pair))
             }
             p if p.starts_with("/dev/pts/") => {
                 let num_str = &p["/dev/pts/".len()..];
@@ -521,9 +542,9 @@ impl<
                 if !pair.unlocked.load(core::sync::atomic::Ordering::Acquire) {
                     return Err(OpenError::AccessNotAllowed);
                 }
-                pair.slave_open
-                    .store(true, core::sync::atomic::Ordering::Release);
-                Device::PtySlave(idx)
+                pair.slave_open_count
+                    .fetch_add(1, core::sync::atomic::Ordering::Release);
+                (Device::PtySlave(idx), Some(pair))
             }
             _ => return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory)),
         };
@@ -538,7 +559,10 @@ impl<
         {
             unimplemented!("Non-blocking I/O is not supported for {:?}", device);
         }
-        let fd = self.litebox.descriptor_table_mut().insert(device);
+        let fd = self.litebox.descriptor_table_mut().insert(DescriptorEntry {
+            entry: device,
+            pty_pair,
+        });
         if truncate {
             // Note: matching Linux behavior, this does not actually perform any truncation, and
             // instead, it is silently ignored if you attempt to truncate upon opening stdio.
@@ -551,23 +575,7 @@ impl<
     }
 
     fn close(&self, fd: &FileFd<Platform>) -> Result<(), CloseError> {
-        if let Some(entry) = self.litebox.descriptor_table().get_entry(fd) {
-            match entry.entry {
-                Device::PtyMaster(idx) => {
-                    if let Some(pair) = self.pty_manager.get(idx) {
-                        pair.master_open
-                            .store(false, core::sync::atomic::Ordering::Release);
-                    }
-                }
-                Device::PtySlave(idx) => {
-                    if let Some(pair) = self.pty_manager.get(idx) {
-                        pair.slave_open
-                            .store(false, core::sync::atomic::Ordering::Release);
-                    }
-                }
-                _ => {}
-            }
-        }
+        // on_close() in DescriptorEntry handles PTY refcount decrement + HUP.
         self.litebox.descriptor_table_mut().remove(fd);
         Ok(())
     }
@@ -602,7 +610,11 @@ impl<
                 let pair = self.pty_manager.get(idx).ok_or(ReadError::ClosedFd)?;
                 let mut ring = pair.slave_to_master.lock();
                 if ring.is_empty() {
-                    if !pair.slave_open.load(core::sync::atomic::Ordering::Acquire) {
+                    if pair
+                        .slave_open_count
+                        .load(core::sync::atomic::Ordering::Acquire)
+                        == 0
+                    {
                         return Ok(0); // EOF — slave closed
                     }
                     return Err(ReadError::WouldBlock);
@@ -620,7 +632,11 @@ impl<
                 let pair = self.pty_manager.get(idx).ok_or(ReadError::ClosedFd)?;
                 let mut ring = pair.master_to_slave.lock();
                 if ring.is_empty() {
-                    if !pair.master_open.load(core::sync::atomic::Ordering::Acquire) {
+                    if pair
+                        .master_open_count
+                        .load(core::sync::atomic::Ordering::Acquire)
+                        == 0
+                    {
                         return Ok(0); // EOF — master closed
                     }
                     return Err(ReadError::WouldBlock);
@@ -921,9 +937,92 @@ impl<
     }
 }
 
-crate::fd::enable_fds_for_subsystem! {
-    @ Platform: { crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioProvider + crate::platform::TimeProvider };
-    FileSystem<Platform>;
-    Device;
-    -> FileFd<Platform>;
+// Manual implementation of FD subsystem integration for devices.
+// We can't use the `enable_fds_for_subsystem!` macro here because we need
+// to override `on_dup()` and `on_close()` to properly track PTY slave/master
+// reference counts across dup/fork. Without this, closing any single FD
+// referencing a PTY slave marks the entire slave as closed, even if other
+// FDs (in the same or a child process) still reference it.
+#[allow(unused, reason = "NOTE(jayb): remove this lint before merging the PR")]
+#[doc(hidden)]
+pub struct DescriptorEntry<
+    Platform: crate::sync::RawSyncPrimitivesProvider
+        + crate::platform::StdioProvider
+        + crate::platform::TimeProvider,
+> {
+    entry: Device,
+    /// When this FD references a PTY master or slave, holds a reference to
+    /// the corresponding `PtyPair` so that `on_dup`/`on_close` can adjust
+    /// the reference count without needing access to the `PtyManager`.
+    pty_pair: Option<alloc::sync::Arc<PtyPair<Platform>>>,
 }
+impl<
+    Platform: crate::sync::RawSyncPrimitivesProvider
+        + crate::platform::StdioProvider
+        + crate::platform::TimeProvider,
+> crate::fd::FdEnabledSubsystem for FileSystem<Platform>
+{
+    type Entry = DescriptorEntry<Platform>;
+}
+impl<
+    Platform: crate::sync::RawSyncPrimitivesProvider
+        + crate::platform::StdioProvider
+        + crate::platform::TimeProvider,
+> crate::fd::FdEnabledSubsystemEntry for DescriptorEntry<Platform>
+{
+    fn on_dup(&self) {
+        if let Some(pair) = &self.pty_pair {
+            match self.entry {
+                Device::PtyMaster(_) => {
+                    pair.master_open_count
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+                Device::PtySlave(_) => {
+                    pair.slave_open_count
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn on_close(&self) {
+        if let Some(pair) = &self.pty_pair {
+            match self.entry {
+                Device::PtyMaster(_) => {
+                    let prev = pair
+                        .master_open_count
+                        .fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+                    if prev == 1 {
+                        pair.slave_pollee
+                            .notify_observers(crate::event::Events::HUP);
+                    }
+                }
+                Device::PtySlave(_) => {
+                    let prev = pair
+                        .slave_open_count
+                        .fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+                    if prev == 1 {
+                        pair.master_pollee
+                            .notify_observers(crate::event::Events::HUP);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+impl<
+    Platform: crate::sync::RawSyncPrimitivesProvider
+        + crate::platform::StdioProvider
+        + crate::platform::TimeProvider,
+> From<Device> for DescriptorEntry<Platform>
+{
+    fn from(entry: Device) -> Self {
+        Self {
+            entry,
+            pty_pair: None,
+        }
+    }
+}
+pub type FileFd<Platform> = crate::fd::TypedFd<FileSystem<Platform>>;

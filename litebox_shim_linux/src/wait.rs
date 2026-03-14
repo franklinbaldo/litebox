@@ -64,7 +64,7 @@ impl<FS: ShimFS> Task<FS> {
     /// sees `vfork_park=1`), but must NOT park — it is the only thread
     /// allowed to run during the vfork window. Identified by having a
     /// `fork_context`.
-    fn park_for_vfork_if_requested(&self) {
+    pub(crate) fn park_for_vfork_if_requested(&self) {
         use core::sync::atomic::Ordering;
         use litebox::platform::RawMutex as _;
 

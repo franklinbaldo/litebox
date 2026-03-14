@@ -112,7 +112,7 @@ impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
             && (info.error_code & 0x2) == 0x2
             && self
                 .task
-                .try_handle_cow_fault(info.cr2, ctx.rip, (info.error_code & 1) != 0)
+                .try_handle_cow_fault(info.cr2, ctx, (info.error_code & 1) != 0)
         {
             return ContinueOperation::Resume;
         }
@@ -131,7 +131,9 @@ impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
                 return ContinueOperation::Terminate;
             }
         }
-        self.enter_shim(false, ctx, |task, _ctx| task.handle_exception_request(info))
+        self.enter_shim(false, ctx, |task, ctx| {
+            task.handle_exception_request(info, ctx)
+        })
     }
 
     fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
@@ -323,6 +325,9 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
                 fork_context: RefCell::new(None),
+                bash_vfork_probe: RefCell::new(None),
+                last_shell_write: RefCell::new(None),
+                last_syscall: Cell::new(None),
                 deferred_vfork_park: Cell::new(false),
             },
         };
@@ -681,9 +686,10 @@ impl<FS: ShimFS> Task<FS> {
     fn try_handle_cow_fault(
         &self,
         fault_addr: usize,
-        fault_rip: usize,
+        ctx: &litebox_common_linux::PtRegs,
         page_present: bool,
     ) -> bool {
+        let fault_rip = ctx.rip;
         let ps = self.process_state.borrow();
         let cow_lock = ps.active_cow.lock();
         let Some(cow) = cow_lock.as_ref() else {
@@ -706,6 +712,8 @@ impl<FS: ShimFS> Task<FS> {
         let page_range = page_addr..page_addr + PAGE_SIZE;
 
         if is_child {
+            self.maybe_trace_bash_vfork_fault(fault_addr, fault_rip, ctx);
+
             // Child thread: snapshot the original content then re-enable write.
             let mut dirty = cow.dirty_pages.lock();
 
@@ -731,6 +739,16 @@ impl<FS: ShimFS> Task<FS> {
                 // Page not yet in page tables (demand-paged). Content is zeros.
                 vec![0u8; PAGE_SIZE]
             };
+
+            litebox::log_println!(
+                self.global.platform,
+                "[COW-FAULT] pid={} page={:#x} rip={:#x} dirty_count={}",
+                self.pid,
+                page_addr,
+                fault_rip,
+                dirty.len() + 1,
+            );
+
             dirty.push((page_addr, buf));
 
             // SAFETY: restoring the page's original (writable) permissions.
@@ -740,20 +758,39 @@ impl<FS: ShimFS> Task<FS> {
             // happen if the forking thread's shim code touches guest
             // memory while CoW is active. Other parent threads should be
             // parked and unable to reach here.
-            #[cfg(debug_assertions)]
-            litebox::log_println!(
-                self.global.platform,
-                "cow_fault: parent thread hit CoW page \
-                 addr={:#x} rip={:#x} tid={}",
-                fault_addr,
-                fault_rip,
-                self.tid,
-            );
-            let _ = fault_rip;
-            // Re-enable write without snapshotting — this is the forking
-            // thread's own access; the original data is already preserved
-            // in dirty_pages (eager) or will be snapshotted by the child
-            // (lazy).
+            //
+            // BUG RISK: In lazy CoW, if we just re-enable write here
+            // without snapshotting, the child can later write to this
+            // page without faulting (since it's already writable), meaning
+            // no snapshot is taken and CoW restore won't fix it.
+            // Snapshot this page as if the child faulted.
+            let mut dirty = cow.dirty_pages.lock();
+            if !dirty.iter().any(|(addr, _)| *addr == page_addr) {
+                litebox::log_println!(
+                    self.global.platform,
+                    "[COW-PARENT-FAULT] pid={} tid={} page={:#x} rip={:#x} — snapshotting for safety",
+                    self.pid,
+                    self.tid,
+                    page_addr,
+                    fault_rip
+                );
+                let buf = if page_present {
+                    let mut buf = vec![0u8; PAGE_SIZE];
+                    // SAFETY: page is present (mapped), safe to read.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            page_addr as *const u8,
+                            buf.as_mut_ptr(),
+                            PAGE_SIZE,
+                        );
+                    }
+                    buf
+                } else {
+                    vec![0u8; PAGE_SIZE]
+                };
+                dirty.push((page_addr, buf));
+            }
+            drop(dirty);
             // SAFETY: restoring the page's original (writable) permissions.
             unsafe { cow_update_permissions(self.global.platform, page_range, orig_perms) }
         }
@@ -931,6 +968,632 @@ impl<FS: ShimFS> Task<FS> {
     /// # Panics
     ///
     /// Unsupported syscalls or arguments would trigger a panic for development purposes.
+    fn task_comm_is(&self, name: &[u8]) -> bool {
+        let comm = self.comm.get();
+        name.len() < comm.len() && &comm[..name.len()] == name && comm[name.len()] == 0
+    }
+
+    fn task_comm_preview(&self) -> alloc::string::String {
+        let comm = self.comm.get();
+        let end = comm
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(comm.len());
+        let mut out = alloc::string::String::new();
+        for &byte in &comm[..end] {
+            match byte {
+                b' '..=b'~' => out.push(byte as char),
+                _ => out.push('.'),
+            }
+        }
+        out
+    }
+
+    fn shell_write_contains(buf: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty() && buf.windows(needle.len()).any(|window| window == needle)
+    }
+
+    fn should_trace_shell_write(buf: &[u8]) -> bool {
+        Self::shell_write_contains(buf, b"___BEGIN___COMMAND_")
+            || Self::shell_write_contains(buf, b"COMMAND_DONE_MARKER")
+            || Self::shell_write_contains(buf, b"PS1=\"\"")
+            || Self::shell_write_contains(buf, b"unset HISTFILE")
+            || Self::shell_write_contains(buf, b"git --no-pager")
+    }
+
+    fn shell_write_preview(buf: &[u8]) -> alloc::string::String {
+        let mut out = alloc::string::String::new();
+        for &byte in buf.iter().take(SHELL_WRITE_PREVIEW_LEN) {
+            match byte {
+                b'\n' => out.push_str("\\n"),
+                b'\r' => out.push_str("\\r"),
+                b'\t' => out.push_str("\\t"),
+                b' '..=b'~' => out.push(byte as char),
+                _ => out.push('.'),
+            }
+        }
+        if buf.len() > SHELL_WRITE_PREVIEW_LEN {
+            out.push_str("...");
+        }
+        out
+    }
+
+    fn shell_write_target_preview(&self, fd: i32) -> alloc::string::String {
+        let Ok(fd) = u32::try_from(fd) else {
+            return alloc::string::String::from("<bad-fd>");
+        };
+
+        let files = self.files.borrow();
+        let desc = {
+            let file_table = files.file_descriptors.read();
+            file_table.get_fd(fd).cloned()
+        };
+        let Some(desc) = desc else {
+            return alloc::string::String::from("<closed-fd>");
+        };
+
+        match desc {
+            Descriptor::LiteBoxRawFd(raw_fd) => files
+                .run_on_raw_fd(
+                    raw_fd,
+                    |file_fd| {
+                        let status = files.fs.fd_file_status(file_fd).ok();
+                        match status.and_then(|status| status.node_info.rdev.map(|rdev| rdev.get()))
+                        {
+                            Some(rdev) => alloc::format!(
+                                "raw={} fs rdev={}:{}",
+                                raw_fd,
+                                rdev >> 8,
+                                rdev & 0xff
+                            ),
+                            None => alloc::format!("raw={} fs", raw_fd),
+                        }
+                    },
+                    |_fd| alloc::format!("raw={} net", raw_fd),
+                    |_fd| alloc::format!("raw={} pipes", raw_fd),
+                )
+                .unwrap_or_else(|_| alloc::format!("raw={} invalid", raw_fd)),
+            Descriptor::Eventfd { .. } => alloc::string::String::from("eventfd"),
+            Descriptor::Epoll { .. } => alloc::string::String::from("epoll"),
+            Descriptor::Unix { .. } => alloc::string::String::from("unix"),
+        }
+    }
+
+    fn remember_traced_shell_write(
+        &self,
+        fd: i32,
+        via: &'static str,
+        total_len: usize,
+        target: alloc::string::String,
+        preview: alloc::string::String,
+        ctx: Option<&litebox_common_linux::PtRegs>,
+    ) {
+        let (syscall_rip, syscall_rsp) = match ctx {
+            Some(ctx) => (ctx.rip, ctx.rsp),
+            None => (0, 0),
+        };
+        self.last_shell_write.replace(Some(RecentShellWrite {
+            fd,
+            via,
+            total_len,
+            target,
+            preview,
+            syscall_rip,
+            syscall_rsp,
+        }));
+    }
+
+    fn maybe_trace_shell_write(
+        &self,
+        ctx: Option<&litebox_common_linux::PtRegs>,
+        fd: i32,
+        via: &'static str,
+        total_len: usize,
+        buf: &[u8],
+    ) {
+        if self.task_comm_is(b"bash") || !Self::should_trace_shell_write(buf) {
+            return;
+        }
+
+        let target = self.shell_write_target_preview(fd);
+        let preview = Self::shell_write_preview(buf);
+        self.remember_traced_shell_write(fd, via, total_len, target.clone(), preview.clone(), ctx);
+
+        litebox::log_println!(
+            self.global.platform,
+            "[SHELL-WRITE] pid={} tid={} comm={:?} fd={} target={} via={} len={} preview={:?}",
+            self.pid,
+            self.tid,
+            self.task_comm_preview(),
+            fd,
+            target,
+            via,
+            total_len,
+            preview,
+        );
+    }
+
+    fn maybe_trace_shell_writev(
+        &self,
+        ctx: Option<&litebox_common_linux::PtRegs>,
+        fd: i32,
+        iovs: &[litebox_common_linux::IoWriteVec<ConstPtr<u8>>],
+    ) {
+        if self.task_comm_is(b"bash") {
+            return;
+        }
+
+        let mut total_len = 0usize;
+        let mut sampled = alloc::vec::Vec::new();
+        for iov in iovs {
+            total_len = total_len.saturating_add(iov.iov_len);
+            if sampled.len() >= SHELL_WRITE_SCAN_LEN {
+                continue;
+            }
+
+            let to_copy = iov.iov_len.min(SHELL_WRITE_SCAN_LEN - sampled.len());
+            if to_copy == 0 {
+                continue;
+            }
+            let Some(slice) = iov.iov_base.to_owned_slice(to_copy) else {
+                return;
+            };
+            sampled.extend_from_slice(&slice);
+        }
+
+        self.maybe_trace_shell_write(ctx, fd, "writev", total_len, &sampled);
+    }
+
+    fn record_syscall_entry(&self, ctx: &litebox_common_linux::PtRegs, syscall_number: usize) {
+        self.last_syscall.set(Some(RecentSyscall {
+            number: syscall_number,
+            entry_rip: ctx.rip,
+            entry_rsp: ctx.rsp,
+            arg0: ctx.syscall_arg(0),
+            arg1: ctx.syscall_arg(1),
+            arg2: ctx.syscall_arg(2),
+        }));
+    }
+
+    fn log_fatal_signal_recent_activity(&self) {
+        if let Some(last_syscall) = self.last_syscall.get() {
+            litebox::log_println!(
+                self.global.platform,
+                "[FATAL-SIGNAL-LAST-SYSCALL] pid={} tid={} nr={} entry_rip={:#x} entry_rsp={:#x} arg0={:#x} arg1={:#x} arg2={:#x}",
+                self.pid,
+                self.tid,
+                last_syscall.number,
+                last_syscall.entry_rip,
+                last_syscall.entry_rsp,
+                last_syscall.arg0,
+                last_syscall.arg1,
+                last_syscall.arg2,
+            );
+        }
+
+        if let Some(last_write) = self.last_shell_write.borrow().as_ref() {
+            litebox::log_println!(
+                self.global.platform,
+                "[FATAL-SIGNAL-LAST-WRITE] pid={} tid={} fd={} target={} via={} len={} syscall_rip={:#x} syscall_rsp={:#x} preview={:?}",
+                self.pid,
+                self.tid,
+                last_write.fd,
+                last_write.target.as_str(),
+                last_write.via,
+                last_write.total_len,
+                last_write.syscall_rip,
+                last_write.syscall_rsp,
+                last_write.preview.as_str(),
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn log_fatal_signal_context(
+        &self,
+        signal: litebox_common_linux::signal::Signal,
+        ctx: &litebox_common_linux::PtRegs,
+    ) {
+        let last_exception = self.signals.last_exception();
+        litebox::log_println!(
+            self.global.platform,
+            "[FATAL-SIGNAL-CONTEXT] pid={} tid={} comm={:?} signal={:?} rip={:#x} rsp={:#x} rax={:#x} orig_rax={:#x} rdi={:#x} rsi={:#x} rdx={:#x} cr2={:#x} error_code={:#x}",
+            self.pid,
+            self.tid,
+            self.task_comm_preview(),
+            signal,
+            ctx.rip,
+            ctx.rsp,
+            ctx.rax,
+            ctx.orig_rax,
+            ctx.rdi,
+            ctx.rsi,
+            ctx.rdx,
+            last_exception.cr2,
+            last_exception.error_code,
+        );
+        self.log_fatal_signal_recent_activity();
+    }
+
+    #[cfg(target_arch = "x86")]
+    pub(crate) fn log_fatal_signal_context(
+        &self,
+        signal: litebox_common_linux::signal::Signal,
+        ctx: &litebox_common_linux::PtRegs,
+    ) {
+        let last_exception = self.signals.last_exception();
+        litebox::log_println!(
+            self.global.platform,
+            "[FATAL-SIGNAL-CONTEXT] pid={} tid={} comm={:?} signal={:?} eip={:#x} esp={:#x} eax={:#x} orig_eax={:#x} ebx={:#x} ecx={:#x} edx={:#x} cr2={:#x} error_code={:#x}",
+            self.pid,
+            self.tid,
+            self.task_comm_preview(),
+            signal,
+            ctx.eip,
+            ctx.esp,
+            ctx.eax,
+            ctx.orig_eax,
+            ctx.ebx,
+            ctx.ecx,
+            ctx.edx,
+            last_exception.cr2,
+            last_exception.error_code,
+        );
+        self.log_fatal_signal_recent_activity();
+    }
+
+    fn bash_probe_read_usize(&self, addr: usize) -> Option<usize> {
+        if addr == 0 {
+            return None;
+        }
+        crate::ConstPtr::<usize>::from_usize(addr).read_at_offset(0)
+    }
+
+    fn bash_probe_string_preview(&self, addr: usize) -> alloc::string::String {
+        let mut out = alloc::string::String::new();
+        if addr == 0 {
+            out.push_str("<null>");
+            return out;
+        }
+
+        let ptr = crate::ConstPtr::<u8>::from_usize(addr);
+        for i in 0..BASH_PROBE_PREVIEW_LEN {
+            match ptr.read_at_offset(i as isize) {
+                Some(0) => return out,
+                Some(byte @ b' '..=b'~') => out.push(byte as char),
+                Some(_) => out.push('.'),
+                None => {
+                    if out.is_empty() {
+                        out.push_str("<fault>");
+                    } else {
+                        out.push_str("<fault>");
+                    }
+                    return out;
+                }
+            }
+        }
+        out.push_str("...");
+        out
+    }
+
+    fn bash_probe_base(&self) -> usize {
+        self.process_state.borrow().pm.addr_min() + crate::loader::PIE_LOAD_OFFSET
+    }
+
+    fn bash_probe_phase(rip_off: Option<usize>) -> &'static str {
+        match rip_off {
+            Some(off) if (BASH_MAKE_CHILD_START_OFF..=BASH_MAKE_CHILD_END_OFF).contains(&off) => {
+                "make_child"
+            }
+            Some(off) if (BASH_EXEC_CHILD_START_OFF..=BASH_EXEC_CHILD_END_OFF).contains(&off) => {
+                "execute_disk_command"
+            }
+            Some(off)
+                if (BASH_SHELL_EXECVE_START_OFF..=BASH_SHELL_EXECVE_END_OFF).contains(&off) =>
+            {
+                "shell_execve"
+            }
+            Some(_) => "other",
+            None => "external",
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn capture_bash_parent_vfork_probe(
+        &self,
+        ctx: &litebox_common_linux::PtRegs,
+    ) -> Option<BashParentVforkProbe> {
+        if !self.task_comm_is(b"bash") {
+            return None;
+        }
+
+        let bash_base = self.bash_probe_base();
+        let return_off = ctx.rdi.checked_sub(bash_base)?;
+        if return_off != BASH_MAKE_CHILD_FORK_RETURN_OFF {
+            return None;
+        }
+
+        let command_addr = self.bash_probe_read_usize(ctx.rsp + BASH_MAKE_CHILD_SAVED_R12_OFF)?;
+        let words_addr = self.bash_probe_read_usize(ctx.rsp + BASH_MAKE_CHILD_SAVED_R13_OFF)?;
+        let pathname_addr = self.bash_probe_read_usize(ctx.rsp + BASH_MAKE_CHILD_SAVED_R14_OFF)?;
+        let word_desc_addr =
+            self.bash_probe_read_usize(words_addr + core::mem::size_of::<usize>())?;
+        let word_string_addr = self.bash_probe_read_usize(word_desc_addr)?;
+
+        Some(BashParentVforkProbe {
+            syscall_rip: ctx.rip,
+            syscall_rsp: ctx.rsp,
+            return_addr: ctx.rdi,
+            return_off,
+            command_addr,
+            pathname_addr,
+            words_addr,
+            word_desc_addr,
+            word_string_addr,
+            command: self.bash_probe_string_preview(command_addr),
+            pathname: self.bash_probe_string_preview(pathname_addr),
+            word: self.bash_probe_string_preview(word_string_addr),
+        })
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    pub(crate) fn capture_bash_parent_vfork_probe(
+        &self,
+        _ctx: &litebox_common_linux::PtRegs,
+    ) -> Option<BashParentVforkProbe> {
+        None
+    }
+
+    pub(crate) fn log_bash_parent_vfork_probe(&self, child_pid: i32, probe: &BashParentVforkProbe) {
+        litebox::log_println!(
+            self.global.platform,
+            "[BASH-PRE-VFORK] parent={} child={} rip={:#x} rsp={:#x} ret={:#x} ret_off={:#x} cmd_ptr={:#x} cmd={:?} path_ptr={:#x} path={:?} words_ptr={:#x} word_desc_ptr={:#x} word_ptr={:#x} word={:?}",
+            self.pid,
+            child_pid,
+            probe.syscall_rip,
+            probe.syscall_rsp,
+            probe.return_addr,
+            probe.return_off,
+            probe.command_addr,
+            probe.command,
+            probe.pathname_addr,
+            probe.pathname,
+            probe.words_addr,
+            probe.word_desc_addr,
+            probe.word_string_addr,
+            probe.word,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn maybe_capture_bash_vfork_probe(
+        &self,
+        fault_addr: usize,
+        fault_rip: usize,
+        ctx: &litebox_common_linux::PtRegs,
+    ) {
+        if self.fork_context.borrow().is_none() || !self.task_comm_is(b"bash") {
+            return;
+        }
+        if self.bash_vfork_probe.borrow().is_some() {
+            return;
+        }
+
+        let bash_base = self.bash_probe_base();
+        let Some(rip_off) = fault_rip.checked_sub(bash_base) else {
+            return;
+        };
+        let (command_addr, words_addr, pathname_addr, source) =
+            if rip_off == BASH_EXEC_CHILD_FAULT_OFF {
+                (ctx.r12, ctx.r13, ctx.r14, "execute-child")
+            } else if (BASH_MAKE_CHILD_START_OFF..=BASH_MAKE_CHILD_END_OFF).contains(&rip_off) {
+                let Some(command_addr) =
+                    self.bash_probe_read_usize(ctx.rsp + BASH_MAKE_CHILD_SAVED_R12_OFF)
+                else {
+                    return;
+                };
+                let Some(words_addr) =
+                    self.bash_probe_read_usize(ctx.rsp + BASH_MAKE_CHILD_SAVED_R13_OFF)
+                else {
+                    return;
+                };
+                let Some(pathname_addr) =
+                    self.bash_probe_read_usize(ctx.rsp + BASH_MAKE_CHILD_SAVED_R14_OFF)
+                else {
+                    return;
+                };
+                (command_addr, words_addr, pathname_addr, "make-child")
+            } else {
+                return;
+            };
+        let Some(word_desc_addr) =
+            self.bash_probe_read_usize(words_addr + core::mem::size_of::<usize>())
+        else {
+            litebox::log_println!(
+                self.global.platform,
+                "[BASH-VFORK-CAPTURE-FAIL] pid={} page={:#x} rip={:#x} words_ptr={:#x} reason=word_desc",
+                self.pid,
+                fault_addr,
+                fault_rip,
+                words_addr,
+            );
+            return;
+        };
+        let Some(word_string_addr) = self.bash_probe_read_usize(word_desc_addr) else {
+            litebox::log_println!(
+                self.global.platform,
+                "[BASH-VFORK-CAPTURE-FAIL] pid={} page={:#x} rip={:#x} word_desc_ptr={:#x} reason=word_string",
+                self.pid,
+                fault_addr,
+                fault_rip,
+                word_desc_addr,
+            );
+            return;
+        };
+
+        let baseline_command = self.bash_probe_string_preview(command_addr);
+        let baseline_pathname = self.bash_probe_string_preview(pathname_addr);
+        let baseline_word = self.bash_probe_string_preview(word_string_addr);
+
+        litebox::log_println!(
+            self.global.platform,
+            "[BASH-VFORK-CAPTURE] pid={} src={} page={:#x} rip={:#x} rip_off={:#x} rsp={:#x} cmd_ptr={:#x} cmd={:?} path_ptr={:#x} path={:?} words_ptr={:#x} word_desc_ptr={:#x} word_ptr={:#x} word={:?}",
+            self.pid,
+            source,
+            fault_addr,
+            fault_rip,
+            rip_off,
+            ctx.rsp,
+            command_addr,
+            baseline_command,
+            pathname_addr,
+            baseline_pathname,
+            words_addr,
+            word_desc_addr,
+            word_string_addr,
+            baseline_word,
+        );
+
+        *self.bash_vfork_probe.borrow_mut() = Some(BashVforkProbeState {
+            bash_base,
+            command_addr,
+            pathname_addr,
+            words_addr,
+            word_desc_addr,
+            word_string_addr,
+            baseline_command,
+            baseline_pathname,
+            baseline_word,
+        });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn maybe_trace_bash_vfork_fault(
+        &self,
+        fault_addr: usize,
+        fault_rip: usize,
+        ctx: &litebox_common_linux::PtRegs,
+    ) {
+        self.maybe_capture_bash_vfork_probe(fault_addr, fault_rip, ctx);
+
+        if self.fork_context.borrow().is_none() || !self.task_comm_is(b"bash") {
+            return;
+        }
+        let probe_borrow = self.bash_vfork_probe.borrow();
+        let Some(probe) = probe_borrow.as_ref() else {
+            return;
+        };
+
+        let rip_off = fault_rip.checked_sub(probe.bash_base);
+        let Some(rip_off_val) = rip_off else {
+            return;
+        };
+        let in_bash_window = (BASH_MAKE_CHILD_START_OFF..=BASH_MAKE_CHILD_END_OFF)
+            .contains(&rip_off_val)
+            || (BASH_EXEC_CHILD_START_OFF..=BASH_EXEC_CHILD_END_OFF).contains(&rip_off_val)
+            || (BASH_SHELL_EXECVE_START_OFF..=BASH_SHELL_EXECVE_END_OFF).contains(&rip_off_val);
+        if !in_bash_window {
+            return;
+        }
+
+        let current_word_desc_addr = self
+            .bash_probe_read_usize(probe.words_addr + core::mem::size_of::<usize>())
+            .unwrap_or(0);
+        let current_word_string_addr = self
+            .bash_probe_read_usize(current_word_desc_addr)
+            .unwrap_or(0);
+        let current_command = self.bash_probe_string_preview(probe.command_addr);
+        let current_pathname = self.bash_probe_string_preview(probe.pathname_addr);
+        let current_word = self.bash_probe_string_preview(current_word_string_addr);
+
+        litebox::log_println!(
+            self.global.platform,
+            "[BASH-VFORK-FAULT] pid={} page={:#x} rip={:#x} rip_off={:#x} phase={} live_r12={:#x} live_r13={:#x} live_r14={:#x} cmd_ptr={:#x} changed_cmd={} cmd={:?} path_ptr={:#x} changed_path={} path={:?} words_ptr={:#x} word_desc_ptr={:#x}->{:#x} word_ptr={:#x}->{:#x} changed_word={} word={:?}",
+            self.pid,
+            fault_addr,
+            fault_rip,
+            rip_off_val,
+            Self::bash_probe_phase(rip_off),
+            ctx.r12,
+            ctx.r13,
+            ctx.r14,
+            probe.command_addr,
+            current_command != probe.baseline_command,
+            current_command,
+            probe.pathname_addr,
+            current_pathname != probe.baseline_pathname,
+            current_pathname,
+            probe.words_addr,
+            probe.word_desc_addr,
+            current_word_desc_addr,
+            probe.word_string_addr,
+            current_word_string_addr,
+            current_word != probe.baseline_word,
+            current_word,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn maybe_trace_bash_vfork_syscall(&self, ctx: &litebox_common_linux::PtRegs) {
+        if self.fork_context.borrow().is_none() || !self.task_comm_is(b"bash") {
+            return;
+        }
+        let probe_borrow = self.bash_vfork_probe.borrow();
+        let Some(probe) = probe_borrow.as_ref() else {
+            return;
+        };
+
+        let rip_off = ctx.rip.checked_sub(probe.bash_base);
+        let current_word_desc_addr = self
+            .bash_probe_read_usize(probe.words_addr + core::mem::size_of::<usize>())
+            .unwrap_or(0);
+        let current_word_string_addr = self
+            .bash_probe_read_usize(current_word_desc_addr)
+            .unwrap_or(0);
+        let current_command = self.bash_probe_string_preview(probe.command_addr);
+        let current_pathname = self.bash_probe_string_preview(probe.pathname_addr);
+        let current_word = self.bash_probe_string_preview(current_word_string_addr);
+
+        litebox::log_println!(
+            self.global.platform,
+            "[BASH-VFORK-SYSCALL] pid={} nr={} rip={:#x} rip_off={:#x} phase={} rsp={:#x} live_r12={:#x} live_r13={:#x} live_r14={:#x} cmd_ptr={:#x} changed_cmd={} cmd={:?} path_ptr={:#x} changed_path={} path={:?} words_ptr={:#x} word_desc_ptr={:#x}->{:#x} word_ptr={:#x}->{:#x} changed_word={} word={:?}",
+            self.pid,
+            ctx.orig_rax,
+            ctx.rip,
+            rip_off.unwrap_or(usize::MAX),
+            Self::bash_probe_phase(rip_off),
+            ctx.rsp,
+            ctx.r12,
+            ctx.r13,
+            ctx.r14,
+            probe.command_addr,
+            current_command != probe.baseline_command,
+            current_command,
+            probe.pathname_addr,
+            current_pathname != probe.baseline_pathname,
+            current_pathname,
+            probe.words_addr,
+            probe.word_desc_addr,
+            current_word_desc_addr,
+            probe.word_string_addr,
+            current_word_string_addr,
+            current_word != probe.baseline_word,
+            current_word,
+        );
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn maybe_trace_bash_vfork_fault(
+        &self,
+        _fault_addr: usize,
+        _fault_rip: usize,
+        _ctx: &litebox_common_linux::PtRegs,
+    ) {
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn maybe_trace_bash_vfork_syscall(&self, _ctx: &litebox_common_linux::PtRegs) {}
+
     fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
         let return_value = match self.do_syscall(ctx) {
             Ok(v) => v,
@@ -971,12 +1634,24 @@ impl<FS: ShimFS> Task<FS> {
             }
         };
 
+        self.record_syscall_entry(ctx, syscall_number);
+        self.maybe_trace_bash_vfork_syscall(ctx);
+
         match request {
             SyscallRequest::Exit { status } => {
                 self.sys_exit(status);
                 Ok(0)
             }
             SyscallRequest::ExitGroup { status } => {
+                if status as i32 == 127 {
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[EXIT-127] pid={} tid={} is_vfork_child={}",
+                        self.pid,
+                        self.tid,
+                        self.fork_context.borrow().is_some(),
+                    );
+                }
                 self.sys_exit_group(status);
                 Ok(0)
             }
@@ -1010,40 +1685,84 @@ impl<FS: ShimFS> Task<FS> {
                             .ok_or(Errno::EFAULT)
                     })
                 } else {
-                    // If the read size is too large, we need to do some extra work to avoid OOMing.
-                    // We read data in chunks and update the file offset ourselves only if the read succeeds.
-                    self.sys_lseek(fd, 0, litebox::fs::SeekWhence::RelativeToCurrentOffset)
-                    .inspect_err(|e| {
-                        match *e {
-                            Errno::EBADF => (), // safe errors to return
-                            Errno::ESPIPE => {
-                                unimplemented!("read on non-seekable fds with large buffers");
-                            }
-                            Errno::EINVAL => {
-                                unreachable!("seekable file should not return EINVAL when getting current offset");
-                            }
-                            _ => {
-                                unimplemented!("unexpected error from lseek: {}", e);
-                            }
-                        }
-                    })
-                    .and_then(|cur_loc| {
-                        self.pread_with_user_buf(fd, buf, count, i64::try_from(cur_loc).unwrap())
+                    // Read is too large for a single kernel buffer. Try to get
+                    // the current file offset so we can use pread in chunks.
+                    match self.sys_lseek(fd, 0, litebox::fs::SeekWhence::RelativeToCurrentOffset) {
+                        Ok(cur_loc) => {
+                            // Seekable fd — use pread in chunks, then update offset.
+                            self.pread_with_user_buf(
+                                fd,
+                                buf,
+                                count,
+                                i64::try_from(cur_loc).unwrap(),
+                            )
                             .inspect(|read_total| {
-                                // Update the file offset to reflect the read we just did.
                                 self.sys_lseek(
                                     fd,
                                     (cur_loc + read_total).reinterpret_as_signed(),
                                     litebox::fs::SeekWhence::RelativeToBeginning,
                                 )
-                                // Given that previous lseek and pread succeeded, this lseek should also succeed.
                                 .expect("lseek failed");
                             })
-                    })
+                        }
+                        Err(Errno::ESPIPE) => {
+                            // Non-seekable fd (pipe, socket) — read in chunks
+                            // using sys_read directly.
+                            let mut kernel_buf = vec![0u8; MAX_KERNEL_BUF_SIZE];
+                            let mut read_total = 0;
+                            while read_total < count {
+                                let to_read = (count - read_total).min(kernel_buf.len());
+                                match self.sys_read(fd, &mut kernel_buf[..to_read], None) {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        if buf
+                                            .copy_from_slice(read_total, &kernel_buf[..n])
+                                            .is_none()
+                                        {
+                                            return Err(Errno::EFAULT);
+                                        }
+                                        read_total += n;
+                                        if n < to_read {
+                                            break; // short read
+                                        }
+                                    }
+                                    Err(e) if read_total > 0 => {
+                                        let _ = e;
+                                        break; // return partial read
+                                    }
+                                    Err(e) => return Err(e),
+                                }
+                            }
+                            self.park_if_deferred();
+                            Ok(read_total)
+                        }
+                        Err(e) => Err(e),
+                    }
                 }
             }
             SyscallRequest::Write { fd, buf, count } => match buf.to_owned_slice(count) {
-                Some(buf) => self.sys_write(fd, &buf, None),
+                Some(buf) => {
+                    let scan_len = buf.len().min(SHELL_WRITE_SCAN_LEN);
+                    self.maybe_trace_shell_write(
+                        Some(ctx),
+                        fd,
+                        "write",
+                        buf.len(),
+                        &buf[..scan_len],
+                    );
+                    // Log stderr writes from vfork children (captures "command not found" etc.)
+                    if fd == 2 && self.fork_context.borrow().is_some() {
+                        if let Ok(msg) = core::str::from_utf8(&buf) {
+                            litebox::log_println!(
+                                self.global.platform,
+                                "[VFORK-STDERR] pid={} {:?}",
+                                self.pid,
+                                msg.trim_end(),
+                            );
+                        }
+                    }
+                    self.sys_write(fd, &buf, None)
+                }
                 None => Err(Errno::EFAULT),
             },
             SyscallRequest::Close { fd } => {
@@ -1119,7 +1838,12 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Munmap { addr, length } => syscall!(sys_munmap(addr, length)),
             SyscallRequest::Brk { addr } => self.sys_brk(addr),
             SyscallRequest::Readv { fd, iovec, iovcnt } => self.sys_readv(fd, iovec, iovcnt),
-            SyscallRequest::Writev { fd, iovec, iovcnt } => self.sys_writev(fd, iovec, iovcnt),
+            SyscallRequest::Writev { fd, iovec, iovcnt } => {
+                if let Some(iovs) = iovec.to_owned_slice(iovcnt) {
+                    self.maybe_trace_shell_writev(Some(ctx), fd, &iovs);
+                }
+                self.sys_writev(fd, iovec, iovcnt)
+            }
             SyscallRequest::Access { pathname, mode } => pathname
                 .to_cstring()
                 .map_or(Err(Errno::EFAULT), |path| syscall!(sys_access(path, mode))),
@@ -1740,6 +2464,70 @@ struct ForkContext {
     vfork_done: Arc<VforkDone>,
 }
 
+const BASH_EXEC_CHILD_FAULT_OFF: usize = 0x5b485;
+const BASH_EXEC_CHILD_START_OFF: usize = 0x5b485;
+const BASH_EXEC_CHILD_END_OFF: usize = 0x5b8e9;
+const BASH_SHELL_EXECVE_START_OFF: usize = 0x54a10;
+const BASH_SHELL_EXECVE_END_OFF: usize = 0x55127;
+const BASH_MAKE_CHILD_START_OFF: usize = 0x66f3c;
+const BASH_MAKE_CHILD_END_OFF: usize = 0x67466;
+const BASH_MAKE_CHILD_FORK_RETURN_OFF: usize = 0x66f2f;
+const BASH_MAKE_CHILD_SAVED_R12_OFF: usize = 0x308;
+const BASH_MAKE_CHILD_SAVED_R13_OFF: usize = 0x310;
+const BASH_MAKE_CHILD_SAVED_R14_OFF: usize = 0x318;
+const BASH_PROBE_PREVIEW_LEN: usize = 48;
+const SHELL_WRITE_SCAN_LEN: usize = 1024;
+const SHELL_WRITE_PREVIEW_LEN: usize = 192;
+
+#[derive(Clone)]
+struct RecentShellWrite {
+    fd: i32,
+    via: &'static str,
+    total_len: usize,
+    target: alloc::string::String,
+    preview: alloc::string::String,
+    syscall_rip: usize,
+    syscall_rsp: usize,
+}
+
+#[derive(Clone, Copy)]
+struct RecentSyscall {
+    number: usize,
+    entry_rip: usize,
+    entry_rsp: usize,
+    arg0: usize,
+    arg1: usize,
+    arg2: usize,
+}
+
+struct BashParentVforkProbe {
+    syscall_rip: usize,
+    syscall_rsp: usize,
+    return_addr: usize,
+    return_off: usize,
+    command_addr: usize,
+    pathname_addr: usize,
+    words_addr: usize,
+    word_desc_addr: usize,
+    word_string_addr: usize,
+    command: alloc::string::String,
+    pathname: alloc::string::String,
+    word: alloc::string::String,
+}
+
+#[derive(Clone)]
+struct BashVforkProbeState {
+    bash_base: usize,
+    command_addr: usize,
+    pathname_addr: usize,
+    words_addr: usize,
+    word_desc_addr: usize,
+    word_string_addr: usize,
+    baseline_command: alloc::string::String,
+    baseline_pathname: alloc::string::String,
+    baseline_word: alloc::string::String,
+}
+
 struct Task<FS: ShimFS> {
     global: Arc<GlobalState<FS>>,
     /// Per-process state shared across threads in the same process.
@@ -1771,6 +2559,13 @@ struct Task<FS: ShimFS> {
     /// for threads. Set when `do_fork` creates a child process. `RefCell`
     /// because `sys_execve` consumes it via `take()` through `&self`.
     fork_context: RefCell<Option<ForkContext>>,
+    /// Narrow, temporary instrumentation to trace bash vfork children from
+    /// the execute-disk-command child branch through later syscalls/faults.
+    bash_vfork_probe: RefCell<Option<BashVforkProbeState>>,
+    /// Last traced shell write performed by this task, if any.
+    last_shell_write: RefCell<Option<RecentShellWrite>>,
+    /// Last syscall entry observed for this task.
+    last_syscall: Cell<Option<RecentSyscall>>,
     /// Set by `park_if_deferred()` when this task has claimed a deferred lie
     /// from the transport and is now blocking at a park checkpoint. Cleared
     /// when the task resumes after vfork completes. `Cell` because the task
@@ -1818,6 +2613,9 @@ mod test_utils {
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
                 fork_context: RefCell::new(None),
+                bash_vfork_probe: RefCell::new(None),
+                last_shell_write: RefCell::new(None),
+                last_syscall: Cell::new(None),
                 deferred_vfork_park: Cell::new(false),
                 process_state: self.process_state.into(),
                 global: self.global,
@@ -1847,6 +2645,9 @@ mod test_utils {
                 files: self.files.clone(),
                 signals: self.signals.clone_for_new_task(),
                 fork_context: RefCell::new(None),
+                bash_vfork_probe: RefCell::new(None),
+                last_shell_write: RefCell::new(None),
+                last_syscall: Cell::new(None),
                 deferred_vfork_park: Cell::new(false),
             };
             Some(task)

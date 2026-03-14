@@ -187,6 +187,76 @@ impl<FS: ShimFS> Task<FS> {
         self.fs.borrow().umask()
     }
 
+    fn pty_rdev_for_raw_fd(&self, files: &FilesState<FS>, raw_fd: usize) -> Option<usize> {
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |fd| {
+                    let status = files.fs.fd_file_status(fd).ok()?;
+                    let rdev = status.node_info.rdev?.get();
+                    ((rdev >> 8) == 136).then_some(rdev)
+                },
+                |_fd| None,
+                |_fd| None,
+            )
+            .ok()
+            .flatten()
+    }
+
+    fn pty_target_for_guest_fd(
+        &self,
+        files: &FilesState<FS>,
+        guest_fd: u32,
+    ) -> Option<(usize, usize)> {
+        let desc = {
+            let file_table = files.file_descriptors.read();
+            file_table.get_fd(guest_fd).cloned()
+        }?;
+        let Descriptor::LiteBoxRawFd(raw_fd) = desc else {
+            return None;
+        };
+        let rdev = self.pty_rdev_for_raw_fd(files, raw_fd)?;
+        Some((raw_fd, rdev))
+    }
+
+    fn trace_pty_open(&self, path: &str, guest_fd: u32, raw_fd: usize, rdev: Option<usize>) {
+        litebox::log_println!(
+            self.global.platform,
+            "[PTY-OPEN] pid={} guest_fd={} raw_fd={} path={:?} target={}",
+            self.pid,
+            guest_fd,
+            raw_fd,
+            path,
+            rdev.map_or_else(
+                || alloc::string::String::from("<non-pty>"),
+                |rdev| alloc::format!("{}:{}", rdev >> 8, rdev & 0xff),
+            ),
+        );
+    }
+
+    fn maybe_trace_pty_dup(&self, oldfd: u32, newfd: u32) {
+        let files = self.files.borrow();
+        let Some((old_raw_fd, old_rdev)) = self.pty_target_for_guest_fd(&files, oldfd) else {
+            return;
+        };
+        let Some((new_raw_fd, new_rdev)) = self.pty_target_for_guest_fd(&files, newfd) else {
+            return;
+        };
+        litebox::log_println!(
+            self.global.platform,
+            "[PTY-DUP] pid={} oldfd={} old_raw_fd={} old_target={}:{} newfd={} new_raw_fd={} new_target={}:{}",
+            self.pid,
+            oldfd,
+            old_raw_fd,
+            old_rdev >> 8,
+            old_rdev & 0xff,
+            newfd,
+            new_raw_fd,
+            new_rdev >> 8,
+            new_rdev & 0xff,
+        );
+    }
+
     /// Resolve a path against the current working directory.
     fn resolve_path(&self, path: impl path::Arg) -> Result<CString, Errno> {
         let path_str = path.as_rust_str().map_err(|_| Errno::EINVAL)?;
@@ -247,6 +317,10 @@ impl<FS: ShimFS> Task<FS> {
                 .fd_paths
                 .lock()
                 .insert(guest_fd.cast_signed(), alloc::string::String::from(s));
+            if s == "/dev/ptmx" || s.starts_with("/dev/pts/") {
+                let rdev = self.pty_rdev_for_raw_fd(&files, raw_fd);
+                self.trace_pty_open(s, guest_fd, raw_fd, rdev);
+            }
         }
 
         Ok(guest_fd)
@@ -1857,8 +1931,9 @@ impl<FS: ShimFS> Task<FS> {
                 // The argument contains O_RDWR|O_NOCTTY or similar open flags.
                 match desc {
                     Descriptor::LiteBoxRawFd(raw_fd) => {
+                        let source_raw_fd = *raw_fd;
                         let pty_idx = files.run_on_raw_fd(
-                            *raw_fd,
+                            source_raw_fd,
                             |file_fd| {
                                 // Check the fd is a PTY master (major 136).
                                 let status =
@@ -1880,7 +1955,20 @@ impl<FS: ShimFS> Task<FS> {
                         let slave_path = alloc::format!("/dev/pts/{pty_idx}");
                         let oflags =
                             OFlags::from_bits_truncate(u32::try_from(open_flags).unwrap_or(0));
-                        self.sys_open(slave_path.as_str(), oflags, Mode::empty())
+                        let opened = self.sys_open(slave_path.as_str(), oflags, Mode::empty());
+                        if let Ok(slave_fd) = opened {
+                            litebox::log_println!(
+                                self.global.platform,
+                                "[PTY-PEER] pid={} src_fd={} src_raw_fd={} src_target=136:{} slave_fd={} slave_path={:?}",
+                                self.pid,
+                                fd,
+                                source_raw_fd,
+                                pty_idx,
+                                slave_fd,
+                                slave_path,
+                            );
+                        }
+                        opened
                     }
                     _ => Err(Errno::ENOTTY),
                 }
@@ -2413,7 +2501,7 @@ impl<FS: ShimFS> Task<FS> {
             .get_fd(oldfd)
             .ok_or(Errno::EBADF)
             .map(|desc| self.do_dup(desc, flags.unwrap_or(OFlags::empty())))??;
-        if let Some(newfd_val) = newfd {
+        let result = if let Some(newfd_val) = newfd {
             let newfd = u32::try_from(newfd_val).unwrap(); // already validated above
             match files
                 .file_descriptors
@@ -2439,7 +2527,13 @@ impl<FS: ShimFS> Task<FS> {
                 .write()
                 .insert(self, new_file)
                 .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))
+        };
+
+        if let Ok(newfd) = result {
+            self.maybe_trace_pty_dup(oldfd, newfd);
         }
+
+        result
     }
 }
 
