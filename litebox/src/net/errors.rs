@@ -143,11 +143,11 @@ pub enum ReceiveError {
     OperationFinished,
 }
 
-/// Socket errors
+/// Asynchronous socket errors
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
-pub enum SocketError {
+pub enum SocketAsyncError {
     /// Connection was refused by the remote host (e.g., RST received during SYN).
     ConnectionRefused = 1,
     /// An established connection was reset by the remote host.
@@ -156,8 +156,8 @@ pub enum SocketError {
     TimedOut = 3,
 }
 
-impl SocketError {
-    /// Convert a raw `u32` value back to a `SocketError`, if valid.
+impl SocketAsyncError {
+    /// Convert a raw `u32` value back to a `SocketAsyncError`, if valid.
     pub fn from_u32(v: u32) -> Option<Self> {
         match v {
             1 => Some(Self::ConnectionRefused),

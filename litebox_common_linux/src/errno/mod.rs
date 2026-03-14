@@ -390,12 +390,12 @@ impl From<litebox::net::errors::ConnectError> for Errno {
     }
 }
 
-impl From<litebox::net::errors::SocketError> for Errno {
-    fn from(value: litebox::net::errors::SocketError) -> Self {
+impl From<litebox::net::errors::SocketAsyncError> for Errno {
+    fn from(value: litebox::net::errors::SocketAsyncError) -> Self {
         match value {
-            litebox::net::errors::SocketError::ConnectionRefused => Errno::ECONNREFUSED,
-            litebox::net::errors::SocketError::ConnectionReset => Errno::ECONNRESET,
-            litebox::net::errors::SocketError::TimedOut => Errno::ETIMEDOUT,
+            litebox::net::errors::SocketAsyncError::ConnectionRefused => Errno::ECONNREFUSED,
+            litebox::net::errors::SocketAsyncError::ConnectionReset => Errno::ECONNRESET,
+            litebox::net::errors::SocketAsyncError::TimedOut => Errno::ETIMEDOUT,
             _ => unimplemented!(),
         }
     }

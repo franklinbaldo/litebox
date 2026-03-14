@@ -604,7 +604,7 @@ where
 
                 if let tcp::State::Established = tcp_socket.state() {
                     proxy.set_state(socket_channel::SocketState::Connected);
-                    proxy.clear_socket_error();
+                    proxy.clear_async_error();
                 }
                 let tcp_specific = socket_handle.specific.tcp();
                 // Update socket state in the channel
@@ -616,16 +616,16 @@ where
                             // Socket closed while connecting. Distinguish RST from timeout.
                             let error = match tcp_specific.connect_initiated_at_us {
                                 Some(initiated_at) if now - initiated_at >= TCP_CONNECT_TIMEOUT => {
-                                    errors::SocketError::TimedOut
+                                    errors::SocketAsyncError::TimedOut
                                 }
-                                _ => errors::SocketError::ConnectionRefused,
+                                _ => errors::SocketAsyncError::ConnectionRefused,
                             };
-                            proxy.set_socket_error(error);
+                            proxy.set_async_error(error);
                             proxy.set_state(socket_channel::SocketState::Error);
                         }
                         socket_channel::SocketState::Connected => {
                             // Connection was reset by peer
-                            proxy.set_socket_error(errors::SocketError::ConnectionReset);
+                            proxy.set_async_error(errors::SocketAsyncError::ConnectionReset);
                             proxy.set_state(socket_channel::SocketState::Closed);
                         }
                         _ => {
@@ -1045,16 +1045,16 @@ where
                     proxy.set_state(socket_channel::SocketState::Connecting);
                 }
                 Err(ConnectError::Unaddressable) => {
-                    proxy.set_error(errors::SocketError::ConnectionRefused);
+                    proxy.set_async_error(errors::SocketAsyncError::ConnectionRefused);
                 }
                 Err(ConnectError::InvalidState) => {
                     // Distinguish timeout from RST using elapsed time
                     match socket_handle.tcp().connect_initiated_at_us {
                         Some(initiated_at) if now - initiated_at >= TCP_CONNECT_TIMEOUT => {
-                            proxy.set_error(errors::SocketError::TimedOut);
+                            proxy.set_async_error(errors::SocketAsyncError::TimedOut);
                             result = Err(ConnectError::TimedOut);
                         }
-                        _ => proxy.set_error(errors::SocketError::ConnectionRefused),
+                        _ => proxy.set_async_error(errors::SocketAsyncError::ConnectionRefused),
                     }
                 }
                 Err(_) => {}

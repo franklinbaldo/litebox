@@ -554,7 +554,7 @@ impl<FS: ShimFS> GlobalState<FS> {
                 SocketOption::ERROR => {
                     // SO_ERROR is self-clearing: atomically read and reset to 0.
                     let proxy = self.get_proxy(fd)?;
-                    match proxy.get_socket_error(true) {
+                    match proxy.get_async_error(true) {
                         Some(err) => {
                             let errno: Errno = err.into();
                             i32::from(errno).cast_unsigned()

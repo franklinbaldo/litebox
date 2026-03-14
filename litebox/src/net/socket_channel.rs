@@ -65,54 +65,54 @@ use crate::{
     platform::TimeProvider,
 };
 
-/// Generates common socket error accessor methods for channel types
-/// that contain an `inner` field with a `socket_error: SocketErrorState`.
-macro_rules! impl_socket_error_accessors {
+/// Generates common async socket error accessor methods for channel types
+/// that contain an `inner` field with a `socket_error: SocketAsyncErrorState`.
+macro_rules! impl_socket_async_error_accessors {
     () => {
-        /// Set the socket error.
-        pub(super) fn set_socket_error(&self, error: super::errors::SocketError) {
+        /// Set the async socket error.
+        pub(super) fn set_async_error(&self, error: super::errors::SocketAsyncError) {
             self.inner.socket_error.set(error);
         }
 
-        /// Clear the socket error.
+        /// Clear the async socket error.
         #[allow(dead_code)]
-        pub(super) fn clear_socket_error(&self) {
+        pub(super) fn clear_async_error(&self) {
             let _ = self.inner.socket_error.get(true);
         }
 
-        /// Read and clear (if specified) the socket error.
-        fn get_socket_error(&self, clear: bool) -> Option<super::errors::SocketError> {
+        /// Read and optionally clear the async socket error.
+        fn get_async_error(&self, clear: bool) -> Option<super::errors::SocketAsyncError> {
             self.inner.socket_error.get(clear)
         }
     };
 }
 
-/// Atomic storage for [`SocketError`]
+/// Atomic storage for [`SocketAsyncError`]
 ///
-/// [`SocketError`]: super::errors::SocketError
-struct SocketErrorState {
+/// [`SocketAsyncError`]: super::errors::SocketAsyncError
+struct SocketAsyncErrorState {
     /// Socket error stored as raw u32; 0 means no error.
     value: AtomicU32,
 }
 
-impl SocketErrorState {
+impl SocketAsyncErrorState {
     fn new() -> Self {
         Self {
             value: AtomicU32::new(0),
         }
     }
 
-    fn set(&self, error: super::errors::SocketError) {
+    fn set(&self, error: super::errors::SocketAsyncError) {
         self.value.store(error as u32, Ordering::Release);
     }
 
-    fn get(&self, clear: bool) -> Option<super::errors::SocketError> {
+    fn get(&self, clear: bool) -> Option<super::errors::SocketAsyncError> {
         let raw = if clear {
             self.value.swap(0, Ordering::AcqRel)
         } else {
             self.value.load(Ordering::Acquire)
         };
-        super::errors::SocketError::from_u32(raw)
+        super::errors::SocketAsyncError::from_u32(raw)
     }
 }
 
@@ -174,24 +174,24 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
         }
     }
 
-    /// Set the socket error.
-    pub(super) fn set_error(&self, error: super::errors::SocketError) {
+    /// Set the async socket error.
+    pub(super) fn set_async_error(&self, error: super::errors::SocketAsyncError) {
         match self {
             NetworkProxy::Stream(channel) => {
-                channel.set_socket_error(error);
+                channel.set_async_error(error);
             }
             NetworkProxy::Datagram(channel) => {
-                channel.set_socket_error(error);
+                channel.set_async_error(error);
             }
             NetworkProxy::Raw => {}
         }
     }
 
-    /// Read and clear (if specified) the socket error.
-    pub fn get_socket_error(&self, clear: bool) -> Option<super::errors::SocketError> {
+    /// Read and optionally clear the async socket error.
+    pub fn get_async_error(&self, clear: bool) -> Option<super::errors::SocketAsyncError> {
         match self {
-            NetworkProxy::Stream(channel) => channel.get_socket_error(clear),
-            NetworkProxy::Datagram(channel) => channel.get_socket_error(clear),
+            NetworkProxy::Stream(channel) => channel.get_async_error(clear),
+            NetworkProxy::Datagram(channel) => channel.get_async_error(clear),
             NetworkProxy::Raw => None,
         }
     }
@@ -310,7 +310,7 @@ struct StreamChannelInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     tx_available: AtomicUsize,
 
     /// Socket error.
-    socket_error: SocketErrorState,
+    socket_error: SocketAsyncErrorState,
 
     /// Event notification
     pollee: Pollee<Platform>,
@@ -337,7 +337,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamChannelInner<Plat
             rx_available: AtomicUsize::new(0),
             tx_available: AtomicUsize::new(tx_capacity),
 
-            socket_error: SocketErrorState::new(),
+            socket_error: SocketAsyncErrorState::new(),
 
             pollee: Pollee::new(),
         }
@@ -663,7 +663,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         self.inner.pollee.notify_observers(events);
     }
 
-    impl_socket_error_accessors!();
+    impl_socket_async_error_accessors!();
 }
 
 /// A datagram message for UDP-like sockets.
@@ -718,7 +718,7 @@ struct DatagramChannelInner<Platform: RawSyncPrimitivesProvider + TimeProvider> 
     is_connected: AtomicBool,
 
     /// Socket error.
-    socket_error: SocketErrorState,
+    socket_error: SocketAsyncErrorState,
 
     /// Event notification
     pollee: Pollee<Platform>,
@@ -748,7 +748,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramChannelInner<Pl
             local_port: AtomicU16::new(0),
             is_connected: AtomicBool::new(false),
 
-            socket_error: SocketErrorState::new(),
+            socket_error: SocketAsyncErrorState::new(),
 
             pollee: Pollee::new(),
         }
@@ -998,7 +998,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
         self.inner.is_connected.store(connected, Ordering::Release);
     }
 
-    impl_socket_error_accessors!();
+    impl_socket_async_error_accessors!();
 }
 
 #[cfg(test)]
