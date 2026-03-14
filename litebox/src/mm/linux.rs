@@ -564,19 +564,34 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         let _ = max_permissions;
         let can_grow_down = vma.flags.contains(VmFlags::VM_GROWSDOWN);
         let permissions_enum = MemoryRegionPermissions::from_bits(permissions).unwrap();
-        let ret = self
-            .platform
-            .allocate_pages(
-                suggested_range.into(),
-                permissions_enum,
-                can_grow_down,
-                populate_pages_immediately,
-                platform_fixed_address_behavior,
-            )
-            .map_err(|err| match err {
-                AllocationError::AddressInUse => AllocationError::AddressInUseByPlatform,
-                other => other,
-            })?;
+        let alloc_result = self.platform.allocate_pages(
+            suggested_range.into(),
+            permissions_enum,
+            can_grow_down,
+            populate_pages_immediately,
+            platform_fixed_address_behavior,
+        );
+        // On macOS, get_unmmaped_area may select an address near the top of
+        // the 48-bit VA space that our VMA tree considers free but the host
+        // kernel rejects (macOS restricts usable VA to a smaller range).
+        // When a hint-based allocation fails with ENOMEM, retry with hint=0
+        // so the host kernel picks an address it considers valid.
+        let alloc_result = match (&alloc_result, &platform_fixed_address_behavior) {
+            (Err(AllocationError::OutOfMemory), &FixedAddressBehavior::Hint) => self
+                .platform
+                .allocate_pages(
+                    0..suggested_range.len(),
+                    permissions_enum,
+                    can_grow_down,
+                    populate_pages_immediately,
+                    FixedAddressBehavior::Hint,
+                ),
+            _ => alloc_result,
+        };
+        let ret = alloc_result.map_err(|err| match err {
+            AllocationError::AddressInUse => AllocationError::AddressInUseByPlatform,
+            other => other,
+        })?;
         let mut new_start = ret.as_usize();
 
         // On platforms where the host kernel may ignore mmap hints (e.g. macOS),
