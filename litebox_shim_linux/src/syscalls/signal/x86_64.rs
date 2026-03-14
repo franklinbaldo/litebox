@@ -97,21 +97,26 @@ fn write_guest_fp_state(buf: &[u8; FXSAVE_SIZE]) {
     }
 }
 
-/// Reinitializes `guest_fp_state` in TLS by capturing the current (host) FP
-/// state. Call this after `execve` so the new process starts with a clean FP
-/// state (MXCSR=0x1F80) rather than the previous program's state.
+/// Constructs a canonical clean FXSAVE image matching Linux kernel's
+/// post-execve FP state.
+fn canonical_fxsave_image() -> [u8; FXSAVE_SIZE] {
+    let mut buf = [0u8; FXSAVE_SIZE];
+    // x87 control word: 0x037F (all exceptions masked, double precision, round-nearest)
+    buf[0..2].copy_from_slice(&0x037Fu16.to_le_bytes());
+    // x87 tag word: 0xFFFF (all registers empty)
+    buf[4..6].copy_from_slice(&0xFFFFu16.to_le_bytes());
+    // MXCSR: 0x1F80 (all SSE exceptions masked, round-nearest)
+    buf[24..28].copy_from_slice(&0x1F80u32.to_le_bytes());
+    // All other fields (x87 regs, XMM0-15, etc.) remain zero.
+    buf
+}
+
+/// Reinitializes `guest_fp_state` in TLS with a canonical clean FXSAVE image
+/// matching Linux kernel's post-execve FP state. All FP/XMM registers are
+/// zeroed, x87 CW=0x037F, MXCSR=0x1F80.
 #[cfg(feature = "platform_linux_userland")]
 pub(crate) fn reinit_guest_fp_state() {
-    let ptr = guest_fp_state_ptr();
-    // SAFETY: `ptr` points to a valid 512-byte, 64-byte-aligned TLS area.
-    // The current host FP state has a sane MXCSR (0x1F80) from the Rust runtime.
-    unsafe {
-        core::arch::asm!(
-            "fxsave64 [{ptr}]",
-            ptr = in(reg) ptr,
-            options(preserves_flags),
-        );
-    }
+    write_guest_fp_state(&canonical_fxsave_image());
 }
 
 /// Reads the `host_mxcsr_mask` TLS variable captured at thread startup from
@@ -567,5 +572,28 @@ mod tests {
 
         let mut ctx = PtRegs::default();
         assert_eq!(restore_sigcontext(&mut ctx, &sigctx), Ok(42));
+    }
+
+    // --- Canonical FXSAVE image test ---
+
+    #[test]
+    fn canonical_fxsave_image_matches_linux_init_state() {
+        let img = canonical_fxsave_image();
+
+        // x87 control word at offset 0: 0x037F
+        assert_eq!(u16::from_le_bytes(img[0..2].try_into().unwrap()), 0x037F);
+        // x87 status word at offset 2: 0 (no exceptions)
+        assert_eq!(u16::from_le_bytes(img[2..4].try_into().unwrap()), 0);
+        // x87 tag word at offset 4: 0xFFFF (all empty)
+        assert_eq!(u16::from_le_bytes(img[4..6].try_into().unwrap()), 0xFFFF);
+        // MXCSR at offset 24: 0x1F80
+        assert_eq!(u32::from_le_bytes(img[24..28].try_into().unwrap()), 0x1F80);
+        // XMM registers at offsets 160-415 should all be zero
+        assert!(
+            img[160..416].iter().all(|&b| b == 0),
+            "XMM registers not zeroed"
+        );
+        // x87 register space at offsets 32-159 should all be zero
+        assert!(img[32..160].iter().all(|&b| b == 0), "x87 regs not zeroed");
     }
 }
