@@ -1777,6 +1777,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                     )
                 };
                 if kr == KERN_SUCCESS {
+                    #[allow(clippy::cast_possible_truncation)] // aarch64-only: always 64-bit
                     let addr = address as usize;
                     // mach_vm_allocate gives RW pages.  Set the requested
                     // protection (often PROT_NONE for address space reservations).

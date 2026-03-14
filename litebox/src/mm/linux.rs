@@ -666,9 +666,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 #[cfg(target_os = "macos")]
                 mm_diag!("[insert_mapping] brk-zone safe_addr: {:?}",
                     safe_addr.map(|a| a as u64));
-                let safe_addr = match safe_addr {
-                    Some(a) => a,
-                    None => return Err(AllocationError::OutOfMemory),
+                let Some(safe_addr) = safe_addr else {
+                    return Err(AllocationError::OutOfMemory);
                 };
                 let safe_range = safe_addr..(safe_addr + size);
                 // Use Hint (not NoReplace/MAP_FIXED) for the retry: the VMA
@@ -816,7 +815,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         #[cfg(target_os = "macos")]
         {
             let ok = result.is_ok();
-            let addr = result.as_ref().map(|p| p.as_usize()).unwrap_or(0);
+            let addr = result.as_ref().map(Platform::RawMutPointer::as_usize).unwrap_or(0);
             mm_diag!("[create_mapping] insert_mapping → ok={} addr={:#x}", ok, addr);
         }
         result
