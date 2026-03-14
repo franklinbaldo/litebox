@@ -679,8 +679,8 @@ unsafe extern "C-unwind" fn run_thread_arch(
     // At entry:
     //   x18 = host TLS base (from trampoline's per-thread table lookup)
     //   x30 = guest return address (after the rewritten SVC)
-    //   Guest stack: [SP+0]=saved_x16, [SP+8]=saved_x17, [SP+16]=saved_x30, [SP+24]=guest_tpidr
-    //   SP was decremented by 32 by trampoline
+    //   Guest stack: [SP+0]=saved_x16, [SP+8]=saved_x17, [SP+16]=saved_x30, [SP+24]=guest_tpidr, [SP+32]=guest_x18
+    //   SP was decremented by 48 by trampoline
     //   x0-x15, x19-x29 = guest register values
     //   (x16, x17 were clobbered by trampoline; originals on guest stack)
     // ================================================================
@@ -728,9 +728,10 @@ _syscall_callback:
     // Store guest x16, x17 into PtRegs.regs[16..17].
     stp x0, x1, [x16, #128]      // regs[16], regs[17]
 
-    // x18 is host TLS; guest x18 was not saved by trampoline and was
-    // clobbered. Store 0 as placeholder (platform-reserved register).
-    str xzr, [x16, #144]         // regs[18] = 0
+    // x18 is host TLS (TCB pointer); guest x18 was saved to TCB.guest_x18
+    // by the shared SVC handler. Load it and store into PtRegs.regs[18].
+    ldr x17, [x18, #40]
+    str x17, [x16, #144]         // regs[18] = guest_x18
 
     // Save guest x19-x29.
     stp x19, x20, [x16, #152]    // regs[19], regs[20]
@@ -743,8 +744,8 @@ _syscall_callback:
     // Store guest x30 (link register, recovered from stack).
     str x2, [x16, #240]          // regs[30] = guest LR
 
-    // Compute original guest SP (trampoline decremented by 32).
-    add x0, sp, #32
+    // Compute original guest SP (trampoline decremented by 48).
+    add x0, sp, #48
     str x0, [x16, #248]          // PtRegs.sp
 
     // Store guest PC = x30 (return address from trampoline, in our x30).
