@@ -119,55 +119,111 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5,
   // The syscall_callback (syscall_entry) expects x18 = host TLS base.
   // The trampoline snippets normally do a TLS table lookup to set x18,
   // but do_syscall jumps directly to the callback. We must replicate
-  // the trampoline's TLS lookup here:
-  //   1. Save guest state (x16, x17, x30, guest TPIDR) on stack
-  //   2. Read current TPIDR_EL0 (= guest TLS)
-  //   3. Scan TLS table for matching guest_tpidr entry
-  //   4. Set x18 = host TLS from matched entry
-  //   5. Set x30 = return address, then BR to callback
+  // the trampoline's TLS lookup here.
   //
-  // The TLS table has 16-byte entries: [guest_tpidr(8), host_tls(8)].
-  // Sentinel entry has guest_tpidr = 0xFFFFFFFFFFFFFFFF.
+  // Platform-adaptive TLS table lookup:
   //
-  // Fallback: On macOS, the host kernel clobbers TPIDR_EL0 to the
-  // pthread value on preemptive context switches and signal delivery.
-  // When MRS reads a clobbered value, no TLS entry will match and the
-  // scan hits the sentinel. In that case, fall back to entry[0] —
-  // this matches the shared SVC handler's fallback behaviour in the
-  // rewritten trampoline code.
+  //   On macOS (running under litebox), TPIDR_EL0 is clobbered by XNU on
+  //   every kernel→userspace transition, so TLS table entries are keyed by
+  //   TPIDRRO_EL0 — the pthread TSD base (stable, read-only, never clobbered).
+  //   TPIDRRO_EL0 is always non-zero on macOS (valid userspace pointer).
+  //
+  //   On Linux, TPIDRRO_EL0 is typically zero (unused by the kernel), and
+  //   TLS table entries are keyed by guest_tpidr (TPIDR_EL0).
+  //
+  //   Detection: read TPIDRRO_EL0. If non-zero → use it as key (macOS path).
+  //   If zero → use TPIDR_EL0 as key (Linux path).
+  //
+  // The TLS table has 16-byte entries: [key(8), host_tls(8)].
+  //   macOS: key = TPIDRRO_EL0, Linux: key = guest_tpidr
+  // Sentinel entry has key = 0xFFFFFFFFFFFFFFFF.
+  //
+  // The stack frame must match syscall_callback's expectations:
+  //   macOS: 48 bytes ([SP+0..47], SP+48 = original guest SP)
+  //   Linux: 32 bytes ([SP+0..31], SP+32 = original guest SP)
+  // Since syscall_callback computes guest SP as SP+48 on macOS and SP+32
+  // on Linux, we use the appropriate frame size per platform.
+  //
+  //   [SP+0]  = saved x16
+  //   [SP+8]  = saved x17
+  //   [SP+16] = saved x30
+  //   [SP+24] = guest_tpidr
+  //   [SP+32] = guest_x18  (macOS only, not read by callback but needed for frame size)
+  //   [SP+40] = (padding)  (macOS only)
+  //
+  // Flow:
+  //   1. Read TPIDRRO_EL0; if non-zero → macOS path (48B frame, TPIDRRO key, TCB tpidr)
+  //      else → Linux path (32B frame, TPIDR_EL0 key on stack)
+  //   2. Scan TLS table for matching entry
+  //   3. Set x18 = host_tls (TCB ptr) from matched entry
+  //   4. Set x30 = return address, BR to callback
   uint64_t tls_table = tls_table_ptr;
   __asm__ volatile(
+    // Read TPIDRRO_EL0 to detect platform
+    "mrs  x18, tpidrro_el0\n"       // x18 = TPIDRRO_EL0
+    "cbnz x18, 10f\n"               // non-zero → macOS path
+
+    // ---- Linux path: 32-byte frame, TPIDR_EL0 keyed ----
     "sub  sp, sp, #32\n"
     "str  x16, [sp, #0]\n"
     "str  x17, [sp, #8]\n"
     "str  x30, [sp, #16]\n"
-    "mrs  x18, tpidr_el0\n"         // x18 = guest TPIDR (may be clobbered on macOS)
-    "str  x18, [sp, #24]\n"         // save guest TPIDR on stack
+    "mrs  x18, tpidr_el0\n"         // x18 = guest TPIDR (lookup key on Linux)
+    "str  x18, [sp, #24]\n"         // save guest_tpidr on stack
     "mov  x17, %[tls_table]\n"      // x17 = TLS table base
-    "cbz  x17, 2f\n"                // skip lookup if table ptr is NULL
-    "1:\n"                           // .Lloop
+    "cbz  x17, 2f\n"                // skip lookup if NULL
+    "1:\n"                           // .Lloop_linux
     "ldr  x16, [x17, #0]\n"         // x16 = entry.guest_tpidr
-    "cmn  x16, #1\n"                // sentinel (0xFFFFFFFFFFFFFFFF)?
+    "cmn  x16, #1\n"                // sentinel?
     "b.eq 5f\n"                      // -> fallback to entry[0]
-    "cmp  x16, x18\n"               // match current TPIDR?
+    "cmp  x16, x18\n"               // match?
     "b.eq 3f\n"                      // -> found
     "add  x17, x17, #16\n"          // next entry
     "b    1b\n"                      // -> loop
-    "3:\n"                           // .Lfound
-    "ldr  x18, [x17, #8]\n"         // x18 = host TLS base
+    "3:\n"                           // .Lfound_linux
+    "ldr  x18, [x17, #8]\n"         // x18 = host_tls
     "b    2f\n"                      // -> done
-    "5:\n"                           // .Lfallback
-    // No entry matched — TPIDR_EL0 was likely clobbered by the host.
+    "5:\n"                           // .Lfallback_linux
+    // No match — TPIDR_EL0 was clobbered by host context switch.
     // Fall back to entry[0] (correct for single-thread, best-effort for multi).
-    "mov  x17, %[tls_table]\n"      // x17 = TLS table base (reload, x17 was advanced)
-    "ldr  x16, [x17, #0]\n"         // x16 = entry[0].guest_tpidr
-    "str  x16, [sp, #24]\n"         // fix guest_tpidr on stack (replace clobbered value)
+    "mov  x17, %[tls_table]\n"      // reload table base
+    "ldr  x16, [x17, #0]\n"         // entry[0].guest_tpidr
+    "str  x16, [sp, #24]\n"         // fix guest_tpidr on stack
     "ldr  x18, [x17, #8]\n"         // x18 = entry[0].host_tls
-    "2:\n"                           // .Ldone
+    "2:\n"                           // .Ldone_linux
     "adr  x30, 4f\n"                // x30 = return address
     "mov  x16, %[entry]\n"
     "br   x16\n"                     // jump to syscall_callback
-    "4:\n"                           // return point
+
+    // ---- macOS path: 48-byte frame, TPIDRRO_EL0 keyed ----
+    "10:\n"                          // .Lmacos
+    "sub  sp, sp, #48\n"
+    "str  x16, [sp, #0]\n"
+    "str  x17, [sp, #8]\n"
+    "str  x30, [sp, #16]\n"
+    // x18 already = TPIDRRO_EL0 (read above)
+    "mov  x17, %[tls_table]\n"      // x17 = TLS table base
+    "cbz  x17, 12f\n"               // skip lookup if NULL
+    "11:\n"                          // .Lloop_macos
+    "ldr  x16, [x17, #0]\n"         // x16 = entry.tpidrro_el0
+    "cmn  x16, #1\n"                // sentinel?
+    "b.eq 16f\n"                     // -> trap (TPIDRRO is stable, no fallback needed)
+    "cmp  x16, x18\n"               // match TPIDRRO_EL0?
+    "b.eq 13f\n"                     // -> found
+    "add  x17, x17, #16\n"          // next entry
+    "b    11b\n"                     // -> loop
+    "13:\n"                          // .Lfound_macos
+    "ldr  x18, [x17, #8]\n"         // x18 = host_tls (TCB ptr)
+    "ldr  x16, [x18, #24]\n"        // x16 = TCB.guest_tpidr
+    "str  x16, [sp, #24]\n"         // frame.guest_tpidr = TCB.guest_tpidr
+    "12:\n"                          // .Ldone_macos
+    "adr  x30, 4f\n"                // x30 = return address
+    "mov  x16, %[entry]\n"
+    "br   x16\n"                     // jump to syscall_callback
+    "16:\n"                          // .Ltrap_macos
+    "brk  #1\n"                      // unreachable: unknown thread
+
+    "4:\n"                           // return point (shared by both paths)
     : "+r"(x0)
     : [entry] "r"(syscall_entry), [tls_table] "r"(tls_table),
       "r"(x1), "r"(x2), "r"(x3),
