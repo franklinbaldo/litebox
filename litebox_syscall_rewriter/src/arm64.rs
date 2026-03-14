@@ -102,7 +102,10 @@ const SHARED_MSR_HANDLER_INSN_COUNT: usize = 17;
 #[cfg(target_os = "macos")]
 const SHARED_MSR_HANDLER_SIZE: usize = SHARED_MSR_HANDLER_INSN_COUNT * 4; // 68
 
-/// Number of instructions in each per-site MSR gate (general case: 9 insns, 36 bytes).
+/// Number of instructions in each per-site MSR gate (general case).
+///
+/// Linux: 9 insns (36 bytes) — no NZCV save/restore needed.
+/// macOS: 13 insns (52 bytes) — includes NZCV save/restore around BL to shared handler.
 ///
 /// ```text
 /// [0] SUB  SP, SP, #48           ; 48-byte frame
@@ -116,14 +119,22 @@ const SHARED_MSR_HANDLER_SIZE: usize = SHARED_MSR_HANDLER_INSN_COUNT * 4; // 68
 /// [8] B    <return_addr>          ; branch back to site.vaddr + 4
 /// ```
 ///
-/// Special register cases (X16, X17, X30) use 10 instructions (40 bytes).
+/// Special register cases (X16, X17, X30) use 10 instructions (40 bytes) on Linux,
+/// 14 instructions (56 bytes) on macOS.
+#[cfg(target_os = "linux")]
 const MSR_GATE_INSN_COUNT: usize = 9;
-
-/// Size in bytes of each per-site MSR gate (general case).
+#[cfg(target_os = "linux")]
 const MSR_GATE_SIZE: usize = MSR_GATE_INSN_COUNT * 4; // 36
-
-/// Size in bytes of each per-site MSR gate for special registers (X16, X17, X30).
+#[cfg(target_os = "linux")]
 const MSR_GATE_SPECIAL_SIZE: usize = (MSR_GATE_INSN_COUNT + 1) * 4; // 40
+
+// ---- macOS MSR gate layout (with NZCV save/restore) ----
+#[cfg(target_os = "macos")]
+const MSR_GATE_INSN_COUNT: usize = 13;
+#[cfg(target_os = "macos")]
+const MSR_GATE_SIZE: usize = MSR_GATE_INSN_COUNT * 4; // 52
+#[cfg(target_os = "macos")]
+const MSR_GATE_SPECIAL_SIZE: usize = (MSR_GATE_INSN_COUNT + 1) * 4; // 56
 
 // ---- Linux MRS gate layout (5 insns, 20 bytes, inline TLS read) ----
 #[cfg(target_os = "linux")]
@@ -131,11 +142,11 @@ const MRS_GATE_INSN_COUNT: usize = 5;
 #[cfg(target_os = "linux")]
 const MRS_GATE_SIZE: usize = MRS_GATE_INSN_COUNT * 4; // 20
 
-// ---- macOS MRS gate layout (9 insns, 36 bytes, BL to shared MRS handler, 48-byte frame) ----
+// ---- macOS MRS gate layout (13 insns, 52 bytes, BL to shared MRS handler, 48-byte frame, NZCV save/restore) ----
 #[cfg(target_os = "macos")]
-const MRS_GATE_INSN_COUNT: usize = 9;
+const MRS_GATE_INSN_COUNT: usize = 13;
 #[cfg(target_os = "macos")]
-const MRS_GATE_SIZE: usize = MRS_GATE_INSN_COUNT * 4; // 36
+const MRS_GATE_SIZE: usize = MRS_GATE_INSN_COUNT * 4; // 52
 
 // ---- macOS shared MRS handler layout (TPIDRRO_EL0 → TCB → guest_tpidr → [SP+24]) ----
 #[cfg(target_os = "macos")]
@@ -155,13 +166,13 @@ const SHARED_X18_SAVE_HANDLER_INSN_COUNT: usize = 16;
 #[cfg(any(target_os = "macos", test))]
 const SHARED_X18_SAVE_HANDLER_SIZE: usize = SHARED_X18_SAVE_HANDLER_INSN_COUNT * 4; // 64
 
-// ---- macOS x18 gate layout ----
+// ---- macOS x18 gate layout (with NZCV save/restore) ----
 #[cfg(any(target_os = "macos", test))]
-const X18_GATE_READ_INSN_COUNT: usize = 10;
+const X18_GATE_READ_INSN_COUNT: usize = 14;
 #[cfg(any(target_os = "macos", test))]
-const X18_GATE_WRITE_INSN_COUNT: usize = 10;
+const X18_GATE_WRITE_INSN_COUNT: usize = 14;
 #[cfg(any(target_os = "macos", test))]
-const X18_GATE_READWRITE_INSN_COUNT: usize = 12;
+const X18_GATE_READWRITE_INSN_COUNT: usize = 16;
 
 /// ARM64 NOP instruction.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -442,6 +453,23 @@ fn encode_mrs_tpidrro_el0(rt: u8) -> u32 {
     // Same as TPIDR_EL0 except op2=3 instead of 2
     // = 0xD53BD060 | Rt
     0xD53B_D060 | u32::from(rt)
+}
+
+/// Encode `MRS Xt, NZCV` (read condition flags register).
+///
+/// NZCV: op0=3, op1=3, CRn=4, CRm=2, op2=0
+/// Encoding: `0xD53B4200 | Rt`
+#[cfg(target_os = "macos")]
+fn encode_mrs_nzcv(rt: u8) -> u32 {
+    0xD53B_4200 | u32::from(rt)
+}
+
+/// Encode `MSR NZCV, Xt` (write condition flags register).
+///
+/// Encoding: `0xD51B4200 | Rt`
+#[cfg(target_os = "macos")]
+fn encode_msr_nzcv(rt: u8) -> u32 {
+    0xD51B_4200 | u32::from(rt)
 }
 
 /// Encode `BRK #imm16` (breakpoint exception).
@@ -920,7 +948,7 @@ fn x18_gate_size(is_read: bool, is_write: bool) -> usize {
     if is_read && is_write {
         X18_GATE_READWRITE_INSN_COUNT * 4
     } else {
-        // Both read-only and write-only are 10 insns
+        // Both read-only and write-only are 14 insns (with NZCV save/restore)
         X18_GATE_READ_INSN_COUNT * 4
     }
 }
@@ -2797,50 +2825,66 @@ fn emit_shared_x18_save_handler(
 
 /// Emit a per-site x18 gate for instructions that reference x18 (macOS only).
 ///
+/// Saves/restores NZCV condition flags so that the shared handler's CMP/CMN
+/// instructions don't clobber guest condition flags (critical for correct
+/// conditional branch behavior after x18-referencing instructions).
+///
 /// Depending on whether x18 is read, written, or both, the gate layout varies:
 ///
-/// **x18-read-only** (10 insns / 40 bytes):
+/// **x18-read-only** (14 insns / 56 bytes):
 /// ```text
-/// [0] SUB  SP, SP, #48
-/// [1] STP  X16, X17, [SP]
-/// [2] STR  X30, [SP, #16]
-/// [3] BL   <shared_x18_load>      ; writes guest_x18 to [SP+24]
-/// [4] LDR  Xscratch, [SP, #24]    ; scratch = guest_x18
-/// [5] <rewritten instruction>
-/// [6] LDP  X16, X17, [SP]
-/// [7] LDR  X30, [SP, #16]
-/// [8] ADD  SP, SP, #48
-/// [9] B    <return_addr>
+///  [0] SUB  SP, SP, #48
+///  [1] STP  X16, X17, [SP]
+///  [2] STR  X30, [SP, #16]
+///  [3] MRS  X16, NZCV              ; save condition flags
+///  [4] STR  X16, [SP, #40]         ; store NZCV to frame
+///  [5] BL   <shared_x18_load>      ; writes guest_x18 to [SP+24]
+///  [6] LDR  Xscratch, [SP, #24]   ; scratch = guest_x18
+///  [7] <rewritten instruction>
+///  [8] LDR  X16, [SP, #40]         ; reload NZCV
+///  [9] MSR  NZCV, X16              ; restore condition flags
+/// [10] LDP  X16, X17, [SP]
+/// [11] LDR  X30, [SP, #16]
+/// [12] ADD  SP, SP, #48
+/// [13] B    <return_addr>
 /// ```
 ///
-/// **x18-write-only** (10 insns / 40 bytes):
+/// **x18-write-only** (14 insns / 56 bytes):
 /// ```text
-/// [0] SUB  SP, SP, #48
-/// [1] STP  X16, X17, [SP]
-/// [2] STR  X30, [SP, #16]
-/// [3] <rewritten instruction>
-/// [4] STR  Xscratch, [SP, #24]
-/// [5] BL   <shared_x18_save>
-/// [6] LDP  X16, X17, [SP]
-/// [7] LDR  X30, [SP, #16]
-/// [8] ADD  SP, SP, #48
-/// [9] B    <return_addr>
+///  [0] SUB  SP, SP, #48
+///  [1] STP  X16, X17, [SP]
+///  [2] STR  X30, [SP, #16]
+///  [3] MRS  X16, NZCV              ; save condition flags
+///  [4] STR  X16, [SP, #40]         ; store NZCV to frame
+///  [5] <rewritten instruction>
+///  [6] STR  Xscratch, [SP, #24]
+///  [7] BL   <shared_x18_save>
+///  [8] LDR  X16, [SP, #40]         ; reload NZCV
+///  [9] MSR  NZCV, X16              ; restore condition flags
+/// [10] LDP  X16, X17, [SP]
+/// [11] LDR  X30, [SP, #16]
+/// [12] ADD  SP, SP, #48
+/// [13] B    <return_addr>
 /// ```
 ///
-/// **x18-read-write** (12 insns / 48 bytes):
+/// **x18-read-write** (16 insns / 64 bytes):
 /// ```text
-/// [0]  SUB  SP, SP, #48
-/// [1]  STP  X16, X17, [SP]
-/// [2]  STR  X30, [SP, #16]
-/// [3]  BL   <shared_x18_load>
-/// [4]  LDR  Xscratch, [SP, #24]
-/// [5]  <rewritten instruction>
-/// [6]  STR  Xscratch, [SP, #24]
-/// [7]  BL   <shared_x18_save>
-/// [8]  LDP  X16, X17, [SP]
-/// [9]  LDR  X30, [SP, #16]
-/// [10] ADD  SP, SP, #48
-/// [11] B    <return_addr>
+///  [0]  SUB  SP, SP, #48
+///  [1]  STP  X16, X17, [SP]
+///  [2]  STR  X30, [SP, #16]
+///  [3]  MRS  X16, NZCV             ; save condition flags
+///  [4]  STR  X16, [SP, #40]        ; store NZCV to frame
+///  [5]  BL   <shared_x18_load>
+///  [6]  LDR  Xscratch, [SP, #24]
+///  [7]  <rewritten instruction>
+///  [8]  STR  Xscratch, [SP, #24]
+///  [9]  BL   <shared_x18_save>
+/// [10]  LDR  X16, [SP, #40]        ; reload NZCV
+/// [11]  MSR  NZCV, X16             ; restore condition flags
+/// [12]  LDP  X16, X17, [SP]
+/// [13]  LDR  X30, [SP, #16]
+/// [14]  ADD  SP, SP, #48
+/// [15]  B    <return_addr>
 /// ```
 #[cfg(target_os = "macos")]
 #[allow(clippy::cast_possible_wrap)]
@@ -2880,10 +2924,22 @@ fn emit_x18_gate(
     );
     insn_idx += 1;
 
+    // [3] MRS X16, NZCV — save condition flags before BL to shared handler
+    trampoline_data.extend_from_slice(&encode_mrs_nzcv(16).to_le_bytes());
+    insn_idx += 1;
+
+    // [4] STR X16, [SP, #40] — store NZCV value to unused frame slot
+    trampoline_data.extend_from_slice(
+        &encode_str_imm_unsigned(16, 31, 40)
+            .expect("offset 40 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
     if is_read && is_write {
         // Read-write path: load, execute, save
 
-        // [3] BL <shared_x18_load>
+        // [5] BL <shared_x18_load>
         let bl_vaddr = insn_vaddr(insn_idx);
         let load_handler_vaddr = trampoline_base_addr + SHARED_X18_LOAD_HANDLER_OFFSET as u64;
         let bl_offset = load_handler_vaddr.cast_signed() - bl_vaddr.cast_signed();
@@ -2896,13 +2952,67 @@ fn emit_x18_gate(
         trampoline_data.extend_from_slice(&bl_insn.to_le_bytes());
         insn_idx += 1;
 
-        // [4] LDR Xscratch, [SP, #24]
+        // [6] LDR Xscratch, [SP, #24]
         trampoline_data.extend_from_slice(
             &encode_ldr_imm_unsigned(scratch, 31, 24)
                 .expect("offset 24 valid")
                 .to_le_bytes(),
         );
         insn_idx += 1;
+
+        // [7] <rewritten instruction>
+        trampoline_data.extend_from_slice(&rewritten.to_le_bytes());
+        insn_idx += 1;
+
+        // [8] STR Xscratch, [SP, #24]
+        trampoline_data.extend_from_slice(
+            &encode_str_imm_unsigned(scratch, 31, 24)
+                .expect("offset 24 valid")
+                .to_le_bytes(),
+        );
+        insn_idx += 1;
+
+        // [9] BL <shared_x18_save>
+        let bl_vaddr = insn_vaddr(insn_idx);
+        let save_handler_vaddr = trampoline_base_addr + SHARED_X18_SAVE_HANDLER_OFFSET as u64;
+        let bl_offset = save_handler_vaddr.cast_signed() - bl_vaddr.cast_signed();
+        let bl_insn = encode_bl(bl_offset).ok_or_else(|| {
+            Error::DisassemblyFailure(format!(
+                "BL offset {bl_offset:#x} out of range for x18 gate -> shared x18 save handler at {:#x}",
+                site.vaddr
+            ))
+        })?;
+        trampoline_data.extend_from_slice(&bl_insn.to_le_bytes());
+        insn_idx += 1;
+    } else if is_read {
+        // Read-only path: load, execute
+
+        // [5] BL <shared_x18_load>
+        let bl_vaddr = insn_vaddr(insn_idx);
+        let load_handler_vaddr = trampoline_base_addr + SHARED_X18_LOAD_HANDLER_OFFSET as u64;
+        let bl_offset = load_handler_vaddr.cast_signed() - bl_vaddr.cast_signed();
+        let bl_insn = encode_bl(bl_offset).ok_or_else(|| {
+            Error::DisassemblyFailure(format!(
+                "BL offset {bl_offset:#x} out of range for x18 gate -> shared x18 load handler at {:#x}",
+                site.vaddr
+            ))
+        })?;
+        trampoline_data.extend_from_slice(&bl_insn.to_le_bytes());
+        insn_idx += 1;
+
+        // [6] LDR Xscratch, [SP, #24]
+        trampoline_data.extend_from_slice(
+            &encode_ldr_imm_unsigned(scratch, 31, 24)
+                .expect("offset 24 valid")
+                .to_le_bytes(),
+        );
+        insn_idx += 1;
+
+        // [7] <rewritten instruction>
+        trampoline_data.extend_from_slice(&rewritten.to_le_bytes());
+        insn_idx += 1;
+    } else {
+        // Write-only path: execute, save
 
         // [5] <rewritten instruction>
         trampoline_data.extend_from_slice(&rewritten.to_le_bytes());
@@ -2928,63 +3038,21 @@ fn emit_x18_gate(
         })?;
         trampoline_data.extend_from_slice(&bl_insn.to_le_bytes());
         insn_idx += 1;
-    } else if is_read {
-        // Read-only path: load, execute
-
-        // [3] BL <shared_x18_load>
-        let bl_vaddr = insn_vaddr(insn_idx);
-        let load_handler_vaddr = trampoline_base_addr + SHARED_X18_LOAD_HANDLER_OFFSET as u64;
-        let bl_offset = load_handler_vaddr.cast_signed() - bl_vaddr.cast_signed();
-        let bl_insn = encode_bl(bl_offset).ok_or_else(|| {
-            Error::DisassemblyFailure(format!(
-                "BL offset {bl_offset:#x} out of range for x18 gate -> shared x18 load handler at {:#x}",
-                site.vaddr
-            ))
-        })?;
-        trampoline_data.extend_from_slice(&bl_insn.to_le_bytes());
-        insn_idx += 1;
-
-        // [4] LDR Xscratch, [SP, #24]
-        trampoline_data.extend_from_slice(
-            &encode_ldr_imm_unsigned(scratch, 31, 24)
-                .expect("offset 24 valid")
-                .to_le_bytes(),
-        );
-        insn_idx += 1;
-
-        // [5] <rewritten instruction>
-        trampoline_data.extend_from_slice(&rewritten.to_le_bytes());
-        insn_idx += 1;
-    } else {
-        // Write-only path: execute, save
-
-        // [3] <rewritten instruction>
-        trampoline_data.extend_from_slice(&rewritten.to_le_bytes());
-        insn_idx += 1;
-
-        // [4] STR Xscratch, [SP, #24]
-        trampoline_data.extend_from_slice(
-            &encode_str_imm_unsigned(scratch, 31, 24)
-                .expect("offset 24 valid")
-                .to_le_bytes(),
-        );
-        insn_idx += 1;
-
-        // [5] BL <shared_x18_save>
-        let bl_vaddr = insn_vaddr(insn_idx);
-        let save_handler_vaddr = trampoline_base_addr + SHARED_X18_SAVE_HANDLER_OFFSET as u64;
-        let bl_offset = save_handler_vaddr.cast_signed() - bl_vaddr.cast_signed();
-        let bl_insn = encode_bl(bl_offset).ok_or_else(|| {
-            Error::DisassemblyFailure(format!(
-                "BL offset {bl_offset:#x} out of range for x18 gate -> shared x18 save handler at {:#x}",
-                site.vaddr
-            ))
-        })?;
-        trampoline_data.extend_from_slice(&bl_insn.to_le_bytes());
-        insn_idx += 1;
     }
 
     // Epilogue (common to all paths)
+
+    // LDR X16, [SP, #40] — reload saved NZCV value
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(16, 31, 40)
+            .expect("offset 40 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // MSR NZCV, X16 — restore condition flags
+    trampoline_data.extend_from_slice(&encode_msr_nzcv(16).to_le_bytes());
+    insn_idx += 1;
 
     // LDP X16, X17, [SP]
     trampoline_data.extend_from_slice(
@@ -3030,8 +3098,9 @@ fn emit_x18_gate(
 
 ///
 /// Special registers (X16, X17, X30) need an extra instruction to reload
-/// the saved value before storing to `[SP, #24]`, resulting in 40 bytes.
-/// All other registers (including XZR) use 36 bytes.
+/// the saved value before storing to `[SP, #24]`.
+/// Linux: general 36 bytes, special 40 bytes.
+/// macOS: general 52 bytes, special 56 bytes.
 fn msr_gate_size(rt: u8) -> usize {
     match rt {
         16 | 17 | 30 => MSR_GATE_SPECIAL_SIZE,
@@ -3039,12 +3108,30 @@ fn msr_gate_size(rt: u8) -> usize {
     }
 }
 
-/// Emit a per-site MSR gate (9-10 instructions, 36-40 bytes).
+/// Emit a per-site MSR gate.
+///
+/// On Linux: 9-10 instructions (36-40 bytes), no NZCV save/restore.
+/// On macOS: 13-14 instructions (52-56 bytes), with NZCV save/restore.
 ///
 /// This gate saves registers, stores the new TPIDR value, calls the shared
 /// MSR handler via BL, restores registers, and branches back to guest code.
-#[allow(clippy::cast_possible_wrap)]
 fn emit_msr_gate(
+    trampoline_data: &mut Vec<u8>,
+    gate_offset: usize,
+    trampoline_base_addr: u64,
+    site: &PatchSite,
+    rt: u8,
+) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    return emit_msr_gate_linux(trampoline_data, gate_offset, trampoline_base_addr, site, rt);
+    #[cfg(target_os = "macos")]
+    return emit_msr_gate_macos(trampoline_data, gate_offset, trampoline_base_addr, site, rt);
+}
+
+/// Linux MSR gate: 9-10 instructions, 36-40 bytes, no NZCV save/restore.
+#[cfg(target_os = "linux")]
+#[allow(clippy::cast_possible_wrap)]
+fn emit_msr_gate_linux(
     trampoline_data: &mut Vec<u8>,
     gate_offset: usize,
     trampoline_base_addr: u64,
@@ -3146,6 +3233,202 @@ fn emit_msr_gate(
         ))
     })?;
     trampoline_data.extend_from_slice(&bl_insn.to_le_bytes());
+    insn_idx += 1;
+
+    // [next] LDP X16, X17, [SP]
+    trampoline_data.extend_from_slice(
+        &encode_ldp_offset(16, 17, 31, 0)
+            .expect("offset 0 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [next] LDR X30, [SP, #16]
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(30, 31, 16)
+            .expect("offset 16 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [next] ADD SP, SP, #48
+    trampoline_data.extend_from_slice(&encode_add_sp_imm(48).expect("imm12=48 fits").to_le_bytes());
+    insn_idx += 1;
+
+    // [next] B <return_addr>
+    let ret_vaddr = insn_vaddr(insn_idx);
+    let ret_offset = (site.vaddr + 4).cast_signed() - ret_vaddr.cast_signed();
+    let ret_insn = encode_b(ret_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "B offset {ret_offset:#x} out of ±128MB range for return from MSR gate at {:#x}",
+            site.vaddr
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&ret_insn.to_le_bytes());
+    insn_idx += 1;
+
+    debug_assert_eq!(insn_idx, gate_insn_count);
+    debug_assert_eq!(
+        trampoline_data.len() - gate_offset,
+        gate_size,
+        "MSR gate size mismatch"
+    );
+
+    Ok(())
+}
+
+/// macOS MSR gate: 13-14 instructions (52-56 bytes), with NZCV save/restore.
+///
+/// Same structure as Linux MSR gate but with NZCV condition flags saved/restored
+/// around the BL to the shared handler, preventing flag clobbering from the
+/// handler's CMP/CMN instructions during TLS table lookup.
+///
+/// **General case (Xt ∉ {X16, X17, X30}):**
+/// ```text
+///  [0]  SUB  SP, SP, #48           ; 48-byte frame
+///  [1]  STP  X16, X17, [SP]        ; save X16, X17
+///  [2]  STR  X30, [SP, #16]        ; save guest LR
+///  [3]  MRS  X16, NZCV             ; save condition flags
+///  [4]  STR  X16, [SP, #40]        ; store NZCV to frame
+///  [5]  STR  Xt,  [SP, #24]        ; store new TPIDR value
+///  [6]  BL   shared_msr_handler    ; call shared handler
+///  [7]  LDR  X16, [SP, #40]        ; reload NZCV
+///  [8]  MSR  NZCV, X16             ; restore condition flags
+///  [9]  LDP  X16, X17, [SP]        ; restore X16, X17
+/// [10]  LDR  X30, [SP, #16]        ; restore guest LR
+/// [11]  ADD  SP, SP, #48           ; deallocate frame
+/// [12]  B    <return_addr>          ; branch back
+/// ```
+///
+/// Special register cases (X16, X17, X30) use 14 instructions (56 bytes).
+#[cfg(target_os = "macos")]
+#[allow(clippy::cast_possible_wrap)]
+fn emit_msr_gate_macos(
+    trampoline_data: &mut Vec<u8>,
+    gate_offset: usize,
+    trampoline_base_addr: u64,
+    site: &PatchSite,
+    rt: u8,
+) -> Result<()> {
+    let gate_vaddr = trampoline_base_addr + gate_offset as u64;
+    let gate_size = msr_gate_size(rt);
+    let gate_insn_count = gate_size / 4;
+    let mut insn_idx: usize = 0;
+    let insn_vaddr = |idx: usize| -> u64 { gate_vaddr + (idx as u64) * 4 };
+
+    // [0] SUB SP, SP, #48
+    trampoline_data.extend_from_slice(&encode_sub_sp_imm(48).expect("imm12=48 fits").to_le_bytes());
+    insn_idx += 1;
+
+    // [1] STP X16, X17, [SP]
+    trampoline_data.extend_from_slice(
+        &encode_stp_offset(16, 17, 31, 0)
+            .expect("offset 0 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [2] STR X30, [SP, #16]
+    trampoline_data.extend_from_slice(
+        &encode_str_imm_unsigned(30, 31, 16)
+            .expect("offset 16 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [3] MRS X16, NZCV — save condition flags
+    trampoline_data.extend_from_slice(&encode_mrs_nzcv(16).to_le_bytes());
+    insn_idx += 1;
+
+    // [4] STR X16, [SP, #40] — store NZCV value to frame
+    trampoline_data.extend_from_slice(
+        &encode_str_imm_unsigned(16, 31, 40)
+            .expect("offset 40 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [5] (or [5]-[6] for special regs) Store the new TPIDR value to [SP, #24]
+    match rt {
+        16 => {
+            // X16 already saved at [SP, #0]: reload into scratch, store to [SP, #24]
+            trampoline_data.extend_from_slice(
+                &encode_ldr_imm_unsigned(30, 31, 0)
+                    .expect("valid")
+                    .to_le_bytes(),
+            );
+            insn_idx += 1;
+            trampoline_data.extend_from_slice(
+                &encode_str_imm_unsigned(30, 31, 24)
+                    .expect("valid")
+                    .to_le_bytes(),
+            );
+            insn_idx += 1;
+        }
+        17 => {
+            // X17 already saved at [SP, #8]
+            trampoline_data.extend_from_slice(
+                &encode_ldr_imm_unsigned(30, 31, 8)
+                    .expect("valid")
+                    .to_le_bytes(),
+            );
+            insn_idx += 1;
+            trampoline_data.extend_from_slice(
+                &encode_str_imm_unsigned(30, 31, 24)
+                    .expect("valid")
+                    .to_le_bytes(),
+            );
+            insn_idx += 1;
+        }
+        30 => {
+            // X30 already saved at [SP, #16]: use X16 as scratch (already saved)
+            trampoline_data.extend_from_slice(
+                &encode_ldr_imm_unsigned(16, 31, 16)
+                    .expect("valid")
+                    .to_le_bytes(),
+            );
+            insn_idx += 1;
+            trampoline_data.extend_from_slice(
+                &encode_str_imm_unsigned(16, 31, 24)
+                    .expect("valid")
+                    .to_le_bytes(),
+            );
+            insn_idx += 1;
+        }
+        _ => {
+            // General case: STR Xt, [SP, #24] (reg 31 = XZR in STR context)
+            trampoline_data.extend_from_slice(
+                &encode_str_imm_unsigned(rt, 31, 24)
+                    .expect("valid")
+                    .to_le_bytes(),
+            );
+            insn_idx += 1;
+        }
+    }
+
+    // [next] BL shared_msr_handler
+    let bl_vaddr = insn_vaddr(insn_idx);
+    let handler_vaddr = trampoline_base_addr + SHARED_MSR_HANDLER_OFFSET as u64;
+    let bl_offset = handler_vaddr.cast_signed() - bl_vaddr.cast_signed();
+    let bl_insn = encode_bl(bl_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "BL offset {bl_offset:#x} out of range for MSR gate -> shared handler at {:#x}",
+            site.vaddr
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&bl_insn.to_le_bytes());
+    insn_idx += 1;
+
+    // [next] LDR X16, [SP, #40] — reload saved NZCV value
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(16, 31, 40)
+            .expect("offset 40 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [next] MSR NZCV, X16 — restore condition flags
+    trampoline_data.extend_from_slice(&encode_msr_nzcv(16).to_le_bytes());
     insn_idx += 1;
 
     // [next] LDP X16, X17, [SP]
@@ -3355,27 +3638,34 @@ fn emit_mrs_gate_linux(
     Ok(())
 }
 
-/// macOS MRS gate: BL to shared MRS handler, 9 instructions / 36 bytes, 48-byte frame.
+/// macOS MRS gate: BL to shared MRS handler, 13 instructions / 52 bytes, 48-byte frame.
+///
+/// Saves/restores NZCV condition flags so that the shared handler's CMP/CMN
+/// instructions don't clobber guest condition flags.
 ///
 /// The shared handler does TPIDRRO_EL0-keyed TLS table lookup, reads TCB.guest_tpidr,
 /// and stores the result to [SP+24]. The gate then loads [SP+24] into the destination register.
 ///
 /// **General case (Xd ∉ {X16, X17, X30}):**
 /// ```text
-/// [0] SUB  SP, SP, #48            ; 48-byte frame
-/// [1] STP  X16, X17, [SP]         ; save scratch
-/// [2] STR  X30, [SP, #16]         ; save LR
-/// [3] BL   <shared_mrs_handler>   ; writes guest_tpidr to [SP+24]
-/// [4] LDR  Xd,  [SP, #24]         ; Xd = guest_tpidr
-/// [5] LDP  X16, X17, [SP]         ; restore scratch
-/// [6] LDR  X30, [SP, #16]         ; restore LR
-/// [7] ADD  SP, SP, #48            ; deallocate
-/// [8] B    <return_addr>           ; back to guest
+///  [0] SUB  SP, SP, #48            ; 48-byte frame
+///  [1] STP  X16, X17, [SP]         ; save scratch
+///  [2] STR  X30, [SP, #16]         ; save LR
+///  [3] MRS  X16, NZCV              ; save condition flags
+///  [4] STR  X16, [SP, #40]         ; store NZCV to frame
+///  [5] BL   <shared_mrs_handler>   ; writes guest_tpidr to [SP+24]
+///  [6] LDR  X16, [SP, #40]         ; reload NZCV
+///  [7] MSR  NZCV, X16              ; restore condition flags
+///  [8] LDR  Xd,  [SP, #24]         ; Xd = guest_tpidr
+///  [9] LDP  X16, X17, [SP]         ; restore scratch
+/// [10] LDR  X30, [SP, #16]         ; restore LR
+/// [11] ADD  SP, SP, #48            ; deallocate
+/// [12] B    <return_addr>           ; back to guest
 /// ```
 ///
-/// **Xd = X16:** restore X17 and X30 individually, then load X16 from [SP+24]
-/// **Xd = X17:** restore X16 and X30 individually, then load X17 from [SP+24]
-/// **Xd = X30:** restore X16,X17, load X30 from [SP+24], NOP pad to 9 insns
+/// **Xd = X16:** NZCV restore first, then restore X17/X30 individually, load X16 from [SP+24] last
+/// **Xd = X17:** NZCV restore first, then restore X16/X30 individually, load X17 from [SP+24] last
+/// **Xd = X30:** NZCV restore first, then restore X16/X17, load X30 from [SP+24], NOP pad to 13
 #[cfg(target_os = "macos")]
 #[allow(clippy::cast_possible_wrap)]
 fn emit_mrs_gate_macos(
@@ -3409,7 +3699,19 @@ fn emit_mrs_gate_macos(
     );
     insn_idx += 1;
 
-    // [3] BL <shared_mrs_handler>
+    // [3] MRS X16, NZCV — save condition flags before BL to shared handler
+    trampoline_data.extend_from_slice(&encode_mrs_nzcv(16).to_le_bytes());
+    insn_idx += 1;
+
+    // [4] STR X16, [SP, #40] — store NZCV value to frame
+    trampoline_data.extend_from_slice(
+        &encode_str_imm_unsigned(16, 31, 40)
+            .expect("offset 40 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [5] BL <shared_mrs_handler>
     let bl_vaddr = insn_vaddr(insn_idx);
     let handler_vaddr = trampoline_base_addr + SHARED_MRS_HANDLER_OFFSET as u64;
     let bl_offset = handler_vaddr.cast_signed() - bl_vaddr.cast_signed();
@@ -3422,25 +3724,37 @@ fn emit_mrs_gate_macos(
     trampoline_data.extend_from_slice(&bl_insn.to_le_bytes());
     insn_idx += 1;
 
-    // [4]-[7] varies by destination register
+    // [6] LDR X16, [SP, #40] — reload saved NZCV value
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(16, 31, 40)
+            .expect("offset 40 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [7] MSR NZCV, X16 — restore condition flags
+    trampoline_data.extend_from_slice(&encode_msr_nzcv(16).to_le_bytes());
+    insn_idx += 1;
+
+    // [8]-[10] varies by destination register
     match rd {
         16 => {
-            // Xd = X16: restore X17 and X30 individually, then load X16 from [SP+24]
-            // [4] LDR X17, [SP, #8]
+            // Xd = X16: restore X17 and X30 individually, load X16 from [SP+24] last
+            // [8] LDR X17, [SP, #8]
             trampoline_data.extend_from_slice(
                 &encode_ldr_imm_unsigned(17, 31, 8)
                     .expect("offset 8 valid")
                     .to_le_bytes(),
             );
             insn_idx += 1;
-            // [5] LDR X30, [SP, #16]
+            // [9] LDR X30, [SP, #16]
             trampoline_data.extend_from_slice(
                 &encode_ldr_imm_unsigned(30, 31, 16)
                     .expect("offset 16 valid")
                     .to_le_bytes(),
             );
             insn_idx += 1;
-            // [6] LDR X16, [SP, #24] — X16 = guest_tpidr
+            // [10] LDR X16, [SP, #24] — X16 = guest_tpidr
             trampoline_data.extend_from_slice(
                 &encode_ldr_imm_unsigned(16, 31, 24)
                     .expect("offset 24 valid")
@@ -3449,22 +3763,22 @@ fn emit_mrs_gate_macos(
             insn_idx += 1;
         }
         17 => {
-            // Xd = X17: restore X16 and X30 individually, then load X17 from [SP+24]
-            // [4] LDR X16, [SP, #0]
+            // Xd = X17: restore X16 and X30 individually, load X17 from [SP+24] last
+            // [8] LDR X16, [SP, #0]
             trampoline_data.extend_from_slice(
                 &encode_ldr_imm_unsigned(16, 31, 0)
                     .expect("offset 0 valid")
                     .to_le_bytes(),
             );
             insn_idx += 1;
-            // [5] LDR X30, [SP, #16]
+            // [9] LDR X30, [SP, #16]
             trampoline_data.extend_from_slice(
                 &encode_ldr_imm_unsigned(30, 31, 16)
                     .expect("offset 16 valid")
                     .to_le_bytes(),
             );
             insn_idx += 1;
-            // [6] LDR X17, [SP, #24] — X17 = guest_tpidr
+            // [10] LDR X17, [SP, #24] — X17 = guest_tpidr
             trampoline_data.extend_from_slice(
                 &encode_ldr_imm_unsigned(17, 31, 24)
                     .expect("offset 24 valid")
@@ -3474,41 +3788,41 @@ fn emit_mrs_gate_macos(
         }
         30 => {
             // Xd = X30: restore X16,X17, load X30 from [SP+24], NOP pad
-            // [4] LDP X16, X17, [SP]
+            // [8] LDP X16, X17, [SP]
             trampoline_data.extend_from_slice(
                 &encode_ldp_offset(16, 17, 31, 0)
                     .expect("offset 0 valid")
                     .to_le_bytes(),
             );
             insn_idx += 1;
-            // [5] LDR X30, [SP, #24] — X30 = guest_tpidr
+            // [9] LDR X30, [SP, #24] — X30 = guest_tpidr
             trampoline_data.extend_from_slice(
                 &encode_ldr_imm_unsigned(30, 31, 24)
                     .expect("offset 24 valid")
                     .to_le_bytes(),
             );
             insn_idx += 1;
-            // [6] NOP — pad to 9 instructions for uniform gate size
+            // [10] NOP — pad to 13 instructions for uniform gate size
             trampoline_data.extend_from_slice(&NOP.to_le_bytes());
             insn_idx += 1;
         }
         _ => {
             // General case: Xd ∉ {X16, X17, X30}
-            // [4] LDR Xd, [SP, #24] — Xd = guest_tpidr
+            // [8] LDR Xd, [SP, #24] — Xd = guest_tpidr
             trampoline_data.extend_from_slice(
                 &encode_ldr_imm_unsigned(rd, 31, 24)
                     .expect("offset 24 valid")
                     .to_le_bytes(),
             );
             insn_idx += 1;
-            // [5] LDP X16, X17, [SP]
+            // [9] LDP X16, X17, [SP]
             trampoline_data.extend_from_slice(
                 &encode_ldp_offset(16, 17, 31, 0)
                     .expect("offset 0 valid")
                     .to_le_bytes(),
             );
             insn_idx += 1;
-            // [6] LDR X30, [SP, #16]
+            // [10] LDR X30, [SP, #16]
             trampoline_data.extend_from_slice(
                 &encode_ldr_imm_unsigned(30, 31, 16)
                     .expect("offset 16 valid")
@@ -3518,11 +3832,11 @@ fn emit_mrs_gate_macos(
         }
     }
 
-    // [7] ADD SP, SP, #48
+    // [11] ADD SP, SP, #48
     trampoline_data.extend_from_slice(&encode_add_sp_imm(48).expect("imm12=48 fits").to_le_bytes());
     insn_idx += 1;
 
-    // [8] B <return_addr>
+    // [12] B <return_addr>
     let ret_vaddr = insn_vaddr(insn_idx);
     let ret_offset = (site.vaddr + 4).cast_signed() - ret_vaddr.cast_signed();
     let ret_insn = encode_b(ret_offset).ok_or_else(|| {
