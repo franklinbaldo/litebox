@@ -1111,14 +1111,17 @@ unsafe extern "C" fn switch_to_guest(
         // `switch_to_guest_end` and will set `interrupt` and jump to
         // `interrupt_callback`.
         //
-        // x1 = TCB pointer (passed explicitly as 2nd argument).
-        // We do NOT read TPIDR_EL0 here because macOS does not guarantee
-        // its value — the kernel can clobber it on context switches at
-        // any time.
-        "mov x18, x1",
+        // IMPORTANT: We use x1 (the TCB argument) throughout the setup
+        // phase instead of x18. XNU zeros x18 on EVERY kernel→userspace
+        // transition — not just signal delivery, but also preemptive
+        // context switches (timeslice expiry). Using x18 as TCB pointer
+        // across multiple instructions creates a race where preemption
+        // between any two instructions leaves x18=0, crashing on the
+        // next TCB dereference. x1 is a normal callee-saved-by-kernel
+        // register that survives context switches.
         "mov w16, #1",
-        "strb w16, [x18, #32]",
-        "ldrb w17, [x18, #33]",
+        "strb w16, [x1, #32]",
+        "ldrb w17, [x1, #33]",
         "cbnz w17, 2f",
         // === Full register restore including x16, x17, x18 ===
         //
@@ -1143,10 +1146,11 @@ unsafe extern "C" fn switch_to_guest(
         // the kernel zeroes x18 on signal delivery).
 
         // Stash guest_tpidr, guest_x18, and guest_PC below guest SP.
-        "ldr x16, [x18, #24]",  // x16 = guest_tpidr (from TCB offset 24)
+        // x1 = TCB pointer (function arg, survives preemption).
+        "ldr x16, [x1, #24]",   // x16 = guest_tpidr (from TCB offset 24)
         "ldr x17, [x0, #248]",  // x17 = guest SP
         "str x16, [x17, #-24]", // guest_SP[-24] = guest_tpidr
-        "ldr x16, [x18, #40]",  // x16 = guest_x18 (from TCB offset 40)
+        "ldr x16, [x1, #40]",   // x16 = guest_x18 (from TCB offset 40)
         "str x16, [x17, #-16]", // guest_SP[-16] = guest x18
         "ldr x16, [x0, #256]",  // x16 = guest PC
         "str x16, [x17, #-8]",  // guest_SP[-8] = guest PC
@@ -1182,9 +1186,10 @@ unsafe extern "C" fn switch_to_guest(
         "br x16",              // jump to guest
         // Local trampoline for cbnz — macOS assembler rejects conditional
         // branches to non-assembler-local labels (only numbered labels qualify).
-        // Copy x18 (host_tls from TPIDR_EL0) to x9 because interrupt_callback
-        // expects host_tls in x9 (for consistency with signal-return path).
-        "2: mov x9, x18",
+        // Pass TCB (still in x1) to interrupt_callback via x9.
+        // We do NOT use x18 because XNU may have zeroed it via preemption
+        // between the cbnz check and this point.
+        "2: mov x9, x1",
         "b _interrupt_callback",
         ".globl _switch_to_guest_end",
         "_switch_to_guest_end:",
@@ -2939,7 +2944,19 @@ unsafe extern "C" fn exception_signal_handler(
                 // e.g. during ELF loading), just return directly — host code
                 // doesn't use TPIDR_EL0 for guest TLS.
                 if let Some((regs, host_tls)) = signal_handler_exit_guest(context, false) {
-                    copy_signal_context(unsafe { &mut *regs }, context);
+                    // If the fault happened during switch_to_guest (restoring
+                    // guest context), don't overwrite the saved PtRegs — they
+                    // already contain the correct guest state from before the
+                    // switch. Copying the ucontext here would save partially-
+                    // restored intermediate register values as "guest" state.
+                    // This mirrors the same check in interrupt_signal_handler.
+                    let ip = sigctx_edge.__ss.__pc as usize;
+                    let in_switch_to_guest = (switch_to_guest_start as *const () as usize
+                        ..switch_to_guest_end as *const () as usize)
+                        .contains(&ip);
+                    if !in_switch_to_guest {
+                        copy_signal_context(unsafe { &mut *regs }, context);
+                    }
 
                     // Ensure that `run_thread_arch` is linked in so that
                     // `interrupt_callback` is visible.
