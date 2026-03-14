@@ -24,14 +24,17 @@
 //! * All assembly entry points (`run_thread_arch`, `switch_to_guest`) receive
 //!   the TCB pointer as an explicit register argument instead of reading
 //!   `TPIDR_EL0`.
-//! * `write_tpidr_el0(tcb)` is still called so that `syscall_callback`'s
-//!   `msr tpidr_el0, x18` restores host TLS for Rust code, but no assembly
-//!   code **reads** `TPIDR_EL0` to recover the TCB pointer.
+//! * `TPIDR_EL0` is **never written** on host-side code paths.  macOS system
+//!   libraries (notably `libsystem_malloc`'s XZone allocator) use TPIDR_EL0
+//!   via `_os_cpu_number()` for per-CPU cache lookups.  Writing our TCB
+//!   address there corrupts the CPU-number derivation and crashes malloc.
+//! * The only `msr tpidr_el0` is in `switch_to_guest`, which sets the
+//!   *guest* TPIDR_EL0 value just before branching into guest code.
 //! * Signal handlers recover the host TLS pointer from the alt-stack layout
 //!   (SP-aligned base + magic cookie) rather than from `TPIDR_EL0`.
 //! * `set_signal_return` passes `host_tls` via `x9` in the signal ucontext
-//!   so the callback asm can restore `TPIDR_EL0` after `sigreturn` clobbers
-//!   it.  (`x18` cannot be used because Darwin sigreturn does not restore it.)
+//!   so the callback asm can use x9 as TCB pointer for host-stack recovery.
+//!   (`x18` cannot be used because Darwin sigreturn does not restore it.)
 //!
 //! ## Address space
 //!
@@ -822,29 +825,27 @@ fn run_thread_inner(
     let mut thread_ctx = ThreadContext { shim, ctx };
     let mut tcb = Box::new(ThreadControlBlock::default());
     ThreadHandle::run_with_handle(|| {
-        let original_tpidr = unsafe { litebox_common_linux::read_tpidr_el0() };
-        tcb.scratch = original_tpidr;
         let tcb_ptr = &raw mut *tcb;
         let tcb_addr = tcb_ptr as usize;
-        // Set the thread-local (for Rust code) now. TPIDR_EL0 is set inside
-        // the closure because macOS libc calls (mmap, sigaltstack, etc.) in
-        // with_signal_alt_stack reset TPIDR_EL0 to the pthread value.
+        // Set the thread-local (for Rust code) now.
         TCB_PTR.set(tcb_ptr);
         with_signal_alt_stack(tcb_addr, || unsafe {
-            // Set TPIDR_EL0 to tcb_addr so that the trampoline's SVC
-            // handler (which runs in guest context) and syscall_callback
-            // (which restores host TLS via `msr tpidr_el0, x18`) have a
-            // valid value.  However, we pass TCB explicitly as the 4th
-            // arg to run_thread_arch because macOS can clobber TPIDR_EL0
-            // on context switches / signal delivery at any time.
-            litebox_common_linux::write_tpidr_el0(tcb_addr);
+            // Do NOT write TPIDR_EL0 here.  macOS system libraries
+            // (libsystem_malloc's XZone allocator) use TPIDR_EL0 via
+            // _os_cpu_number() for per-CPU cache lookups.  Writing our
+            // TCB address there corrupts the CPU-number derivation and
+            // crashes malloc.  The trampoline's shared handlers use
+            // TPIDRRO_EL0 (not TPIDR_EL0) for TLS table lookup, and
+            // host Rust code uses TCB_PTR (thread-local).  The only
+            // place that writes TPIDR_EL0 is switch_to_guest, which
+            // sets the guest's virtual TPIDR_EL0 just before branching
+            // into guest code.
             run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter), tcb_ptr);
         });
         // Remove our entry from the TLS table before the TCB is freed.
         // This prevents stale entries from accumulating and exhausting
         // the 256-entry table in long-running programs with many threads.
         remove_host_tls_entries();
-        unsafe { litebox_common_linux::write_tpidr_el0(original_tpidr) };
         TCB_PTR.set(core::ptr::null_mut());
     });
 }
@@ -957,8 +958,10 @@ _syscall_callback:
     ldr x16, [sp, #24]           // x16 = guest_tpidr from trampoline
     str x16, [x17, #24]          // TCB.guest_tpidr = guest_tpidr
 
-    // Restore host TPIDR_EL0 from TCB.
-    msr tpidr_el0, x17
+    // Do NOT write TPIDR_EL0 here.  macOS system libraries use it for
+    // per-CPU data (_os_cpu_number); writing our TCB address corrupts
+    // malloc's XZone per-CPU cache lookup.  Host Rust code uses
+    // TCB_PTR (thread-local) to find the TCB, not TPIDR_EL0.
 
     // Load guest_context_top and compute PtRegs base address.
     ldr x16, [x17, #16]          // x16 = TCB.guest_context_top
@@ -1026,11 +1029,9 @@ _syscall_callback:
     .globl _exception_callback
 _exception_callback:
     .cfi_startproc
-    // Restore TPIDR_EL0 from x9 (passed via ucontext x[9] on signal return).
-    // macOS sigreturn clobbers TPIDR_EL0 AND does not restore x18
-    // (platform-reserved register on Darwin), so we use x9 instead.
-    msr tpidr_el0, x9
-    // Restore host stack.
+    // x9 = host_tls (TCB pointer), passed via ucontext x[9] by set_signal_return.
+    // Do NOT write TPIDR_EL0 — macOS system libraries use it for per-CPU data.
+    // Restore host stack from TCB.
     ldr x10, [x9, #8]
     mov sp, x10
 
@@ -1042,9 +1043,9 @@ _exception_callback:
     .globl _interrupt_callback
 _interrupt_callback:
     .cfi_startproc
-    // Restore TPIDR_EL0 from x9 (see exception_callback comment).
-    msr tpidr_el0, x9
-    // Restore host stack.
+    // x9 = host_tls (TCB pointer), passed via ucontext x[9] by set_signal_return.
+    // Do NOT write TPIDR_EL0 — macOS system libraries use it for per-CPU data.
+    // Restore host stack from TCB.
     ldr x10, [x9, #8]
     mov sp, x10
 
@@ -2459,24 +2460,14 @@ impl ThreadContext<'_> {
             ContinueOperation::Resume => {
                 update_host_tls_entry();
 
-                // Re-set TPIDR_EL0 and pass TCB explicitly to switch_to_guest.
-                // TPIDR_EL0 is still written for the benefit of
-                // syscall_callback's `msr tpidr_el0, x18` (which
-                // restores it for Rust code), but switch_to_guest
-                // itself uses the explicit TCB argument — it does NOT
-                // read TPIDR_EL0 because macOS can clobber it on
-                // context switches at any time.
-                //
-                // NOTE: The old TPIDR fixup block (which patched x18/x16 when
-                // a signal interrupted the SVC/MSR handler mid-execution) has
-                // been removed. With TPIDRRO_EL0-based handlers, there is no
-                // stale TPIDR_EL0 MRS result to fix up — the handlers read
-                // TPIDRRO_EL0 which the kernel never clobbers.
+                // Pass TCB explicitly to switch_to_guest.  Do NOT write
+                // TPIDR_EL0 here — macOS system libraries use it for
+                // per-CPU data and corrupting it crashes malloc.
+                // switch_to_guest sets the guest's virtual TPIDR_EL0
+                // from TCB.guest_tpidr just before branching into guest
+                // code.
                 let tcb = TCB_PTR.get();
-                unsafe {
-                    litebox_common_linux::write_tpidr_el0(tcb as usize);
-                    switch_to_guest(self.ctx, tcb)
-                }
+                unsafe { switch_to_guest(self.ctx, tcb) }
             }
             ContinueOperation::Terminate => {}
         }
@@ -2763,9 +2754,9 @@ fn signal_handler_exit_guest(
             return None;
         }
 
-        // Restore host TPIDR_EL0 so that subsequent Rust code and TLS accesses
-        // work correctly (though note any subsequent libc call will clobber it
-        // again on macOS).
+        // Do NOT write TPIDR_EL0 here.  macOS system libraries use it for
+        // per-CPU data (_os_cpu_number); writing our TCB address there
+        // corrupts malloc's XZone per-CPU cache lookup.
         //
         // On macOS, we do NOT read TPIDR_EL0 to save the guest TPIDR because
         // the kernel already clobbered it to the pthread value on signal
@@ -2774,7 +2765,6 @@ fn signal_handler_exit_guest(
         // `tcb.guest_tpidr`, set by the last `switch_to_guest` or
         // `syscall_callback`. Unlike Linux (where the kernel preserves
         // TPIDR_EL0 for signal handlers), macOS makes it unreliable here.
-        litebox_common_linux::write_tpidr_el0(host_tls);
 
         // Read and clear in_guest.
         let in_guest_ptr = (host_tls as *mut u8).byte_offset(tcb_offset_in_guest());
@@ -2851,9 +2841,9 @@ fn set_signal_return(
     sigctx.__ss.__x[1] = p1 as u64;
     sigctx.__ss.__x[2] = p2 as u64;
     sigctx.__ss.__x[3] = p3 as u64;
-    // Pass host_tls via x9 so callback asm can restore TPIDR_EL0.
-    // macOS sigreturn clobbers TPIDR_EL0 to the pthread value and does
-    // NOT restore x18 (platform-reserved register on Darwin ARM64).
+    // Pass host_tls via x9 so callback asm can use it as TCB pointer
+    // to recover the host stack.  macOS sigreturn does NOT restore x18
+    // (platform-reserved register on Darwin ARM64), so we use x9 instead.
     // x9 is a standard caller-saved temp register that IS properly restored.
     sigctx.__ss.__x[9] = host_tls as u64;
 }
@@ -2928,10 +2918,10 @@ unsafe extern "C" fn exception_signal_handler(
 
             if toggled {
                 // If we're in the guest, we can't just return: macOS sigreturn
-                // clobbers TPIDR_EL0 to the pthread value. Instead, route through
-                // the interrupt path which properly restores TPIDR_EL0 via the
-                // interrupt_callback asm trampoline and resumes the faulting
-                // instruction through switch_to_guest.
+                // clobbers TPIDR_EL0 to the per-CPU pthread value, not the
+                // guest's virtual TPIDR_EL0.  Route through the interrupt path
+                // which resumes via switch_to_guest (which sets the correct
+                // guest TPIDR_EL0 from TCB.guest_tpidr before entering guest).
                 //
                 // This matches the Windows platform's approach to FS base
                 // restoration after Windows clobbers it on context switches.
