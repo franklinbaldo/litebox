@@ -879,16 +879,16 @@ unsafe extern "C" fn switch_to_guest(
         // the guest SP (ARM64 red zone). Restore x0-x17, x19-x30 from
         // PtRegs. After setting SP, use x16 as scratch to set TPIDR,
         // then restore x18 from the stash, then load guest_PC into x16
-        // and branch. This sacrifices x16 (= IP0, intra-procedure-call
-        // scratch) for the final branch — a reasonable tradeoff since
-        // x16 is designated for linker veneers and compilers avoid
-        // relying on its value mid-function.
+        // and branch. guest_x18 is loaded from TCB offset 40 (the
+        // authoritative source maintained by the x18 virtualization
+        // gates) rather than PtRegs.regs[18] (which may be stale when
+        // the kernel zeroes x18 on signal delivery).
 
         // Stash guest_tpidr, guest_x18, and guest_PC below guest SP.
         "ldr x16, [x18, #24]",  // x16 = guest_tpidr (from TCB offset 24)
         "ldr x17, [x0, #248]",  // x17 = guest SP
         "str x16, [x17, #-24]", // guest_SP[-24] = guest_tpidr
-        "ldr x16, [x0, #144]",  // x16 = guest x18 (PtRegs.regs[18])
+        "ldr x16, [x18, #40]",  // x16 = guest_x18 (from TCB offset 40)
         "str x16, [x17, #-16]", // guest_SP[-16] = guest x18
         "ldr x16, [x0, #256]",  // x16 = guest PC
         "str x16, [x17, #-8]",  // guest_SP[-8] = guest PC
@@ -2002,116 +2002,35 @@ fn update_host_tls_entry() {
         return; // No TLS table allocated (not using rewriter-based trampoline)
     }
 
-    // On macOS, TPIDR_EL0 is clobbered by every syscall, so we cannot read
-    // it with `mrs`. Instead, derive host_tls from our thread-local TCB_PTR.
     let tcb = TCB_PTR.get();
     assert!(!tcb.is_null(), "update_host_tls_entry called without TCB");
     let host_tls = tcb as usize;
 
+    // TPIDRRO_EL0 is the lookup key — stable per-pthread, never clobbered.
+    // This replaces the old guest_tpidr-keyed approach which was fragile on
+    // macOS because TPIDR_EL0 gets clobbered on every kernel→userspace
+    // transition. With TPIDRRO_EL0 as key, phantom entry cleanup, reverse
+    // host_tls lookup, and guest_tpidr sync from table are all unnecessary.
+    // The MSR handler now writes guest_tpidr directly to TCB.
+    let tpidrro = unsafe { litebox_common_linux::read_tpidrro_el0() } as u64;
+
     let sentinel: u64 = 0xFFFFFFFFFFFFFFFF;
     let table = table_addr as *mut u64;
 
-    // Defensive cleanup: remove phantom entries with host_tls == 0.
-    //
-    // Before the MSR handler sentinel-branch fix, if TPIDR_EL0 was
-    // clobbered by macOS signal delivery, the sentinel path would
-    // unconditionally write the stale TPIDR into a new entry with
-    // host_tls=0 (from the zero-initialized page). These phantom entries
-    // cause the SVC handler to load host_tls=0 into x18, leading to
-    // SIGSEGV at far=0x20 when syscall_callback writes TCB.in_guest.
-    //
-    // Scan the table and compact out any entries with host_tls==0.
-    {
-        let mut write_idx: usize = 0;
-        let mut read_idx: usize = 0;
-        let mut removed = 0usize;
-        loop {
-            if read_idx >= TLS_TABLE_ENTRIES {
-                break;
-            }
-            let entry = unsafe { table.add(read_idx * 2) };
-            let gt = unsafe { entry.read_volatile() };
-            if gt == sentinel {
-                break;
-            }
-            let ht = unsafe { entry.add(1).read_volatile() };
-            if ht == 0 {
-                // Phantom entry — skip it
-                removed += 1;
-                read_idx += 1;
-                continue;
-            }
-            if write_idx != read_idx {
-                // Shift entry down
-                let dst = unsafe { table.add(write_idx * 2) };
-                unsafe {
-                    dst.write_volatile(gt);
-                    dst.add(1).write_volatile(ht);
-                }
-            }
-            write_idx += 1;
-            read_idx += 1;
-        }
-        if removed > 0 {
-            // Restore sentinel at new end
-            let sentinel_entry = unsafe { table.add(write_idx * 2) };
-            unsafe {
-                sentinel_entry.write_volatile(sentinel);
-            }
-        }
-    }
-    //
-    // On aarch64, the guest can change TPIDR_EL0 via rewritten MSR instructions.
-    // The MSR trampoline updates the TLS table entry's guest_tpidr in-place and
-    // returns directly to guest code without entering the host. This means
-    // tcb.guest_tpidr can be stale — the table has the authoritative value.
-    //
-    // On Linux, signal_handler_exit_guest reads the current TPIDR_EL0 from the
-    // register (which the kernel preserves), so the host always learns the
-    // correct value on any exception/interrupt. On macOS, TPIDR_EL0 is clobbered
-    // by the kernel on signal delivery, so we must read it back from the table.
-    //
-    // Do a reverse lookup: find the entry where host_tls matches, then read
-    // back the current guest_tpidr that the MSR trampoline wrote.
-
     for index in 0..TLS_TABLE_ENTRIES {
         let entry = unsafe { table.add(index * 2) };
-        let stored_guest_tpidr = unsafe { entry.read_volatile() };
-        if stored_guest_tpidr == sentinel {
-            break; // Past all occupied entries
-        }
-        let stored_host_tls = unsafe { entry.add(1).read_volatile() };
-        if stored_host_tls == host_tls as u64 {
-            // Found our entry. The MSR trampoline may have updated
-            // guest_tpidr in-place. Sync it back to the TCB.
-            let table_guest_tpidr = stored_guest_tpidr as usize;
-            let current_guest_tpidr = get_guest_tpidr();
-            if table_guest_tpidr != current_guest_tpidr {
-                set_guest_tpidr(table_guest_tpidr);
-            }
-            return;
-        }
-    }
+        let stored_key = unsafe { entry.read_volatile() };
 
-    // No existing entry for our host_tls. This is the first call for this
-    // thread (before any trampoline has run). Write a new entry with the
-    // current guest_tpidr.
-    let guest_tpidr = get_guest_tpidr();
-
-    for index in 0..TLS_TABLE_ENTRIES {
-        let entry = unsafe { table.add(index * 2) };
-        let stored_guest_tpidr = unsafe { entry.read_volatile() };
-
-        if stored_guest_tpidr == guest_tpidr as u64 {
-            // Found existing entry with same guest_tpidr - update host_tls
+        if stored_key == tpidrro {
+            // Found our entry — update host_tls in case it changed.
             unsafe { entry.add(1).write_volatile(host_tls as u64) };
             return;
         }
 
-        if stored_guest_tpidr == sentinel {
-            // Found free slot - claim it
+        if stored_key == sentinel {
+            // Free slot — write new [tpidrro_el0, host_tls] entry.
             unsafe {
-                entry.write_volatile(guest_tpidr as u64);
+                entry.write_volatile(tpidrro);
                 entry.add(1).write_volatile(host_tls as u64);
             }
             return;
@@ -2158,45 +2077,6 @@ impl ThreadContext<'_> {
             ContinueOperation::Resume => {
                 update_host_tls_entry();
 
-                // Fix stale TPIDR registers if resuming into the middle of
-                // a trampoline handler. macOS clobbers TPIDR_EL0 on signal
-                // delivery, so if a signal interrupted the guest while it
-                // was executing inside the shared SVC or MSR handler (after
-                // the MRS TPIDR_EL0 but before the handler completed), the
-                // register holding the MRS result (x18 for SVC, x16 for MSR)
-                // may contain a stale/clobbered value. Fix it up from
-                // tcb.guest_tpidr which update_host_tls_entry just synced.
-                //
-                // Trampoline layout from SIGRETURN_TRAMPOLINE_ADDR (offset 16):
-                //   base+48  .. base+120  = shared SVC handler (x18 = MRS result)
-                //   base+120 .. base+196  = shared MSR handler (x16 = MRS result)
-                //   base+196 ..           = per-site gates (SVC + MSR only)
-                // (Must match SHARED_SVC_HANDLER_OFFSET/SIZE and
-                //  SHARED_MSR_HANDLER_OFFSET/SIZE in litebox_syscall_rewriter.)
-                // NOTE: MRS TPIDR_EL0 is no longer rewritten; the platform
-                // signal handler uses fault-and-reinstall instead.
-                {
-                    let sigret_addr = litebox_common_linux::SIGRETURN_TRAMPOLINE_ADDR
-                        .load(core::sync::atomic::Ordering::Acquire);
-                    if sigret_addr != 0 {
-                        let trampoline_base = sigret_addr - 16;
-                        let svc_handler_start = trampoline_base + 48;
-                        let svc_handler_end = trampoline_base + 120;
-                        let msr_handler_start = trampoline_base + 120;
-                        let msr_handler_end = trampoline_base + 196;
-                        let pc = self.ctx.pc;
-                        let guest_tpidr = get_guest_tpidr();
-
-                        if pc >= svc_handler_start && pc < svc_handler_end {
-                            // SVC handler: x18 holds MRS TPIDR_EL0 result at [0]
-                            self.ctx.regs[18] = guest_tpidr;
-                        } else if pc >= msr_handler_start && pc < msr_handler_end {
-                            // MSR handler: x16 holds MRS TPIDR_EL0 result at [1]
-                            self.ctx.regs[16] = guest_tpidr;
-                        }
-                    }
-                }
-
                 // Re-set TPIDR_EL0 and pass TCB explicitly to switch_to_guest.
                 // TPIDR_EL0 is still written for the benefit of
                 // syscall_callback's `msr tpidr_el0, x18` (which
@@ -2204,6 +2084,12 @@ impl ThreadContext<'_> {
                 // itself uses the explicit TCB argument — it does NOT
                 // read TPIDR_EL0 because macOS can clobber it on
                 // context switches at any time.
+                //
+                // NOTE: The old TPIDR fixup block (which patched x18/x16 when
+                // a signal interrupted the SVC/MSR handler mid-execution) has
+                // been removed. With TPIDRRO_EL0-based handlers, there is no
+                // stale TPIDR_EL0 MRS result to fix up — the handlers read
+                // TPIDRRO_EL0 which the kernel never clobbers.
                 let tcb = TCB_PTR.get();
                 unsafe {
                     litebox_common_linux::write_tpidr_el0(tcb as usize);
@@ -2552,6 +2438,15 @@ fn copy_signal_context(regs: &mut litebox_common_linux::PtRegs, context: &libc::
     regs.sp = mctx.__ss.__sp as usize;
     regs.pc = mctx.__ss.__pc as usize;
     regs.pstate = mctx.__ss.__cpsr as usize;
+
+    // macOS zeroes x18 on every kernel→userspace transition (signal delivery,
+    // context switch). The mach context's x18 is therefore always 0. Override
+    // regs[18] with the authoritative guest_x18 from the TCB, which is kept
+    // up-to-date by the x18 virtualization gates in the rewriter trampoline.
+    let tcb = TCB_PTR.get();
+    if !tcb.is_null() {
+        regs.regs[18] = unsafe { (*tcb).guest_x18 };
+    }
 }
 
 /// Updates a Linux signal context to return to `f` with the given arguments (aarch64).
