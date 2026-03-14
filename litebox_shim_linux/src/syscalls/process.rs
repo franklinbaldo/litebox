@@ -269,31 +269,11 @@ impl<FS: ShimFS> Task<FS> {
         assert!(!inner.group_exit);
         inner.exit_status = status;
         inner.group_exit = true;
-        litebox::log_println!(
-            self.global.platform,
-            "[EXIT] pid={} tid={} status={:?}",
-            self.pid,
-            self.tid,
-            status,
-        );
         // Cancel blocking stdin reads so threads in host syscalls can exit.
         // Only do this for the init process; child processes should not cancel
         // stdin for the entire sandbox.
         let is_init = self.process_id == litebox::process::ProcessId::INIT;
         if is_init {
-            if cfg!(debug_assertions) {
-                litebox::log_println!(
-                    self.global.platform,
-                    "[EXIT] exit_group: tid={}, nr_threads={}, tids={:?}",
-                    self.tid,
-                    inner.threads.len(),
-                    inner
-                        .threads
-                        .keys()
-                        .copied()
-                        .collect::<alloc::vec::Vec<_>>(),
-                );
-            }
             self.global.platform.cancel_stdin();
         }
         for (&_tid, thread) in &inner.threads {
@@ -1682,13 +1662,6 @@ impl<FS: ShimFS> Task<FS> {
         if let Some(probe) = &bash_parent_vfork_probe {
             self.log_bash_parent_vfork_probe(child_pid, probe);
         }
-        litebox::log_println!(
-            self.global.platform,
-            "[FORK] parent={} child={} vfork={}",
-            self.pid,
-            child_pid,
-            is_shared,
-        );
         Ok(usize::try_from(child_pid).unwrap())
     }
 
@@ -2571,16 +2544,7 @@ impl<FS: ShimFS> Task<FS> {
             copy_vector(envp, "envp")?
         };
 
-        let loader = crate::loader::elf::ElfLoader::new(self, path).map_err(|e| {
-            litebox::log_println!(
-                self.global.platform,
-                "[EXEC-FAIL] pid={} path={:?} err={:?}",
-                self.pid,
-                path,
-                e,
-            );
-            Errno::from(e)
-        })?;
+        let loader = crate::loader::elf::ElfLoader::new(self, path).map_err(Errno::from)?;
 
         // Log successful exec with first few argv elements.
         {

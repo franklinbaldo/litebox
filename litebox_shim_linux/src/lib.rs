@@ -740,15 +740,6 @@ impl<FS: ShimFS> Task<FS> {
                 vec![0u8; PAGE_SIZE]
             };
 
-            litebox::log_println!(
-                self.global.platform,
-                "[COW-FAULT] pid={} page={:#x} rip={:#x} dirty_count={}",
-                self.pid,
-                page_addr,
-                fault_rip,
-                dirty.len() + 1,
-            );
-
             dirty.push((page_addr, buf));
 
             // SAFETY: restoring the page's original (writable) permissions.
@@ -1643,15 +1634,6 @@ impl<FS: ShimFS> Task<FS> {
                 Ok(0)
             }
             SyscallRequest::ExitGroup { status } => {
-                if status as i32 == 127 {
-                    litebox::log_println!(
-                        self.global.platform,
-                        "[EXIT-127] pid={} tid={} is_vfork_child={}",
-                        self.pid,
-                        self.tid,
-                        self.fork_context.borrow().is_some(),
-                    );
-                }
                 self.sys_exit_group(status);
                 Ok(0)
             }

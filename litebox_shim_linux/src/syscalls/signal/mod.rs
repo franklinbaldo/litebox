@@ -560,19 +560,6 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EFAULT);
         };
 
-        litebox::log_println!(
-            self.global.platform,
-            "[RT-SIGRETURN] pid={} tid={} comm={:?} uctx={:#x} restore_rip={:#x} restore_rsp={:#x} restore_rax={:#x} sigmask={:#x}",
-            self.pid,
-            self.tid,
-            self.task_comm_preview(),
-            uctx_addr,
-            uctx.mcontext.rip,
-            uctx.mcontext.rsp,
-            uctx.mcontext.rax,
-            uctx.sigmask.as_u64(),
-        );
-
         // Restore the alternate signal stack, ignoring errors.
         self.signals.set_sigaltstack(uctx.stack).ok();
 
@@ -624,28 +611,6 @@ impl<FS: ShimFS> Task<FS> {
             oldact_ptr
                 .write_at_offset(0, old_act)
                 .ok_or(Errno::EFAULT)?;
-        }
-
-        if matches!(
-            signal,
-            Signal::SIGSEGV | Signal::SIGBUS | Signal::SIGFPE | Signal::SIGILL | Signal::SIGTRAP
-        ) {
-            let new_act = act.unwrap_or(old_act);
-            litebox::log_println!(
-                self.global.platform,
-                "[RT-SIGACTION] pid={} tid={} comm={:?} signal={:?} set={} old_handler={:#x} old_flags={:#x} old_mask={:#x} new_handler={:#x} new_flags={:#x} new_mask={:#x}",
-                self.pid,
-                self.tid,
-                self.task_comm_preview(),
-                signal,
-                act.is_some(),
-                old_act.sigaction,
-                old_act.flags.bits(),
-                old_act.mask.as_u64(),
-                new_act.sigaction,
-                new_act.flags.bits(),
-                new_act.mask.as_u64(),
-            );
         }
 
         Ok(0)
@@ -793,19 +758,6 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 SIG_IGN => {}
                 _ => {
-                    litebox::log_println!(
-                        self.global.platform,
-                        "[SIGNAL-DELIVER] pid={} tid={} comm={:?} signal={:?} handler={:#x} restorer={:#x} flags={:#x} pre_rip={:#x} pre_rsp={:#x}",
-                        self.pid,
-                        self.tid,
-                        self.task_comm_preview(),
-                        signal,
-                        action.sigaction,
-                        action.restorer,
-                        action.flags.bits(),
-                        ctx.rip,
-                        ctx.rsp,
-                    );
                     if let Err(DeliverFault) = self
                         .signals
                         .deliver_signal(signal, &siginfo, &action, ctx, self)
