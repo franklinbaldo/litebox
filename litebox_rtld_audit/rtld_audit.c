@@ -689,6 +689,14 @@ unsigned int la_objopen(struct link_map *map,
     __builtin_memcpy((char *)mapped + 8, (const void *)&tls_table_ptr, 8);
   }
 #endif
+  // Flush data cache and invalidate instruction cache for the entire trampoline
+  // region. ARM64 has non-coherent I/D caches — without this, the CPU may
+  // execute stale icache contents (e.g., zeros from the initial mmap) instead of
+  // the trampoline code we wrote via read() + memcpy().
+  // Note: macOS mprotect(PROT_EXEC) likely does this internally, but the ARM
+  // architecture does not guarantee it, and this is free insurance.
+  __builtin___clear_cache((char *)mapped, (char *)mapped + tramp_size_raw);
+
   long mprot_ret = do_syscall(SYS_mprotect, (long)mapped, tramp_size, PROT_READ | PROT_EXEC, 0,
              0, 0);
   if (mprot_ret < 0) {
