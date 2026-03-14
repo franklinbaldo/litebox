@@ -183,6 +183,255 @@ static EDGE_PAGES: [std::sync::atomic::AtomicUsize; MAX_EDGE_PAGES] = {
 };
 static EDGE_PAGE_LOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+// ── Per-sub-page edge page permission tracking ──────────────────────────────
+//
+// Each 16KB host page that straddles a 4KB permission boundary needs
+// per-sub-page tracking so that `update_permissions` can compute the
+// correct W^X-compliant composite permission (RW or RX) for the whole
+// host page.  Without this, a `mprotect(PROT_NONE)` on one 4KB slice
+// can demote the entire 16KB page, stripping execute permission from
+// adjacent 4KB slices that still contain code.
+
+#[derive(Clone, Copy)]
+struct EdgePageState {
+    addr: usize,
+    subpage_perms: [u8; 4],
+}
+
+const EMPTY_EDGE_PAGE_STATE: EdgePageState = EdgePageState {
+    addr: 0,
+    subpage_perms: [0; 4],
+};
+
+static EDGE_PAGE_STATES: std::sync::Mutex<[EdgePageState; MAX_EDGE_PAGES]> =
+    std::sync::Mutex::new([EMPTY_EDGE_PAGE_STATE; MAX_EDGE_PAGES]);
+
+fn encode_perms(perms: MemoryRegionPermissions) -> u8 {
+    ((perms.contains(MemoryRegionPermissions::READ) as u8) << 0)
+        | ((perms.contains(MemoryRegionPermissions::WRITE) as u8) << 1)
+        | ((perms.contains(MemoryRegionPermissions::EXEC) as u8) << 2)
+}
+
+fn decode_perms(bits: u8) -> MemoryRegionPermissions {
+    let mut perms = MemoryRegionPermissions::empty();
+    if (bits & 0b001) != 0 {
+        perms |= MemoryRegionPermissions::READ;
+    }
+    if (bits & 0b010) != 0 {
+        perms |= MemoryRegionPermissions::WRITE;
+    }
+    if (bits & 0b100) != 0 {
+        perms |= MemoryRegionPermissions::EXEC;
+    }
+    perms
+}
+
+fn effective_edge_page_prot(subpage_perms: [u8; 4]) -> libc::c_int {
+    let mut any_read = false;
+    let mut any_write = false;
+    let mut any_exec = false;
+    for bits in subpage_perms {
+        let perms = decode_perms(bits);
+        any_read |= perms.contains(MemoryRegionPermissions::READ);
+        any_write |= perms.contains(MemoryRegionPermissions::WRITE);
+        any_exec |= perms.contains(MemoryRegionPermissions::EXEC);
+    }
+    let mut prot = 0;
+    if any_read || any_write || any_exec {
+        prot |= ProtFlags::PROT_READ.bits();
+    }
+    if any_exec {
+        prot |= ProtFlags::PROT_EXEC.bits();
+    } else if any_write {
+        prot |= ProtFlags::PROT_WRITE.bits();
+    }
+    prot
+}
+
+fn decode_host_protection(protection: i32) -> MemoryRegionPermissions {
+    let mut perms = MemoryRegionPermissions::empty();
+    perms.set(
+        MemoryRegionPermissions::READ,
+        protection & libc::VM_PROT_READ != 0,
+    );
+    perms.set(
+        MemoryRegionPermissions::WRITE,
+        protection & libc::VM_PROT_WRITE != 0,
+    );
+    perms.set(
+        MemoryRegionPermissions::EXEC,
+        protection & libc::VM_PROT_EXECUTE != 0,
+    );
+    perms
+}
+
+fn query_host_page_permissions(host_page_addr: usize) -> MemoryRegionPermissions {
+    let mut address: u64 = host_page_addr as u64;
+    let mut size: u64 = 0;
+    let mut depth: u32 = 0;
+    let mut info: vm_region_submap_info_64 = unsafe { core::mem::zeroed() };
+    let mut count = VM_REGION_SUBMAP_INFO_COUNT_64;
+
+    let kr = unsafe {
+        mach_vm_region_recurse(
+            mach_task_self(),
+            &raw mut address,
+            &raw mut size,
+            &raw mut depth,
+            &raw mut info,
+            &raw mut count,
+        )
+    };
+    if kr != KERN_SUCCESS || address as usize != host_page_addr {
+        return MemoryRegionPermissions::empty();
+    }
+
+    // `vm_region_submap_info_64` is modeled here as an opaque natural_t array to
+    // keep this file buildable off-macOS; the first field is `protection`.
+    decode_host_protection(info._data[0] as i32)
+}
+
+fn update_edge_page_state(
+    host_page_addr: usize,
+    range: core::ops::Range<usize>,
+    perms: MemoryRegionPermissions,
+) -> libc::c_int {
+    debug_assert_eq!(host_page_addr % HOST_PAGE_SIZE, 0);
+    let mut table = EDGE_PAGE_STATES.lock().unwrap();
+    let mut slot = None;
+    for entry in table.iter_mut() {
+        if entry.addr == host_page_addr {
+            slot = Some(entry);
+            break;
+        }
+        if entry.addr == 0 && slot.is_none() {
+            slot = Some(entry);
+        }
+    }
+    let Some(entry) = slot else {
+        panic!("edge page state table full: exceeded {MAX_EDGE_PAGES} entries");
+    };
+    if entry.addr == 0 {
+        entry.addr = host_page_addr;
+        entry.subpage_perms = [encode_perms(query_host_page_permissions(host_page_addr)); 4];
+    }
+    for (idx, bits) in entry.subpage_perms.iter_mut().enumerate() {
+        let sub_start = host_page_addr + idx * 4096;
+        let sub_end = sub_start + 4096;
+        if sub_start < range.end && sub_end > range.start {
+            *bits = encode_perms(perms);
+        }
+    }
+    effective_edge_page_prot(entry.subpage_perms)
+}
+
+fn clear_edge_page_state(host_page_addr: usize, range: core::ops::Range<usize>) -> bool {
+    debug_assert_eq!(host_page_addr % HOST_PAGE_SIZE, 0);
+    let mut table = EDGE_PAGE_STATES.lock().unwrap();
+    let Some(entry) = table.iter_mut().find(|entry| entry.addr == host_page_addr) else {
+        return false;
+    };
+    for (idx, bits) in entry.subpage_perms.iter_mut().enumerate() {
+        let sub_start = host_page_addr + idx * 4096;
+        let sub_end = sub_start + 4096;
+        if sub_start < range.end && sub_end > range.start {
+            *bits = 0;
+        }
+    }
+    let any_remaining = entry.subpage_perms.iter().any(|&bits| bits != 0);
+    if !any_remaining {
+        *entry = EMPTY_EDGE_PAGE_STATE;
+    }
+    any_remaining
+}
+
+fn unregister_edge_page(addr: usize) {
+    debug_assert_eq!(addr % HOST_PAGE_SIZE, 0, "edge page not 16KB-aligned");
+
+    while EDGE_PAGE_LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+
+    let mut write_idx = 0;
+    for read_idx in 0..MAX_EDGE_PAGES {
+        let value = EDGE_PAGES[read_idx].load(Ordering::Relaxed);
+        if value == 0 {
+            break;
+        }
+        if value == addr {
+            continue;
+        }
+        if write_idx != read_idx {
+            EDGE_PAGES[write_idx].store(value, Ordering::Relaxed);
+        }
+        write_idx += 1;
+    }
+    for entry in EDGE_PAGES.iter().skip(write_idx) {
+        entry.store(0, Ordering::Relaxed);
+    }
+
+    EDGE_PAGE_LOCK.store(false, Ordering::Release);
+}
+
+fn sync_edge_page_mapping(range: core::ops::Range<usize>, perms: MemoryRegionPermissions) {
+    let outer_start = host_page_align_down(range.start);
+    let outer_end = host_page_align_up(range.end);
+    let inner_start = host_page_align_up(range.start);
+    let inner_end = host_page_align_down(range.end);
+    let has_leading_edge = outer_start < inner_start;
+    let has_trailing_edge = inner_end < outer_end;
+    let leading_edge_addr = outer_start;
+    let trailing_edge_addr = host_page_align_down(range.end.saturating_sub(1));
+
+    if has_leading_edge {
+        update_edge_page_state(leading_edge_addr, range.clone(), perms);
+        register_edge_page(leading_edge_addr);
+    }
+
+    if has_trailing_edge && trailing_edge_addr != leading_edge_addr {
+        update_edge_page_state(trailing_edge_addr, range.clone(), perms);
+        register_edge_page(trailing_edge_addr);
+    }
+
+    if inner_start >= inner_end && !has_leading_edge && has_trailing_edge {
+        update_edge_page_state(outer_start, range, perms);
+        register_edge_page(outer_start);
+    }
+}
+
+fn clear_edge_page_mapping(range: core::ops::Range<usize>) {
+    let outer_start = host_page_align_down(range.start);
+    let outer_end = host_page_align_up(range.end);
+    let inner_start = host_page_align_up(range.start);
+    let inner_end = host_page_align_down(range.end);
+    let has_leading_edge = outer_start < inner_start;
+    let has_trailing_edge = inner_end < outer_end;
+    let leading_edge_addr = outer_start;
+    let trailing_edge_addr = host_page_align_down(range.end.saturating_sub(1));
+
+    if has_leading_edge && !clear_edge_page_state(leading_edge_addr, range.clone()) {
+        unregister_edge_page(leading_edge_addr);
+    }
+
+    if has_trailing_edge
+        && trailing_edge_addr != leading_edge_addr
+        && !clear_edge_page_state(trailing_edge_addr, range.clone())
+    {
+        unregister_edge_page(trailing_edge_addr);
+    }
+
+    if inner_start >= inner_end
+        && !has_leading_edge
+        && has_trailing_edge
+        && !clear_edge_page_state(outer_start, range)
+    {
+        unregister_edge_page(outer_start);
+    }
+}
+
 /// Register a 16KB host page as an edge page (has mixed RW/RX sub-pages).
 fn register_edge_page(addr: usize) {
     debug_assert_eq!(addr % HOST_PAGE_SIZE, 0, "edge page not 16KB-aligned");
@@ -1456,6 +1705,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 Ok(UserMutPtr::from_usize(r as usize))
             }
             FixedAddressBehavior::Replace | FixedAddressBehavior::NoReplace => {
+                if fixed_address_behavior == FixedAddressBehavior::Replace {
+                    clear_edge_page_mapping(suggested_range.clone());
+                }
+
                 let outer_start = host_page_align_down(suggested_range.start);
                 let outer_end = host_page_align_up(suggested_range.end);
                 let inner_start = host_page_align_up(suggested_range.start);
@@ -1532,6 +1785,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                     register_edge_page(outer_start);
                 }
 
+                sync_edge_page_mapping(suggested_range.clone(), initial_permissions);
+
                 // Zero the edge sub-pages that fall within our range but outside the
                 // interior mmap. The interior was freshly mmap'd as MAP_ANON (guaranteed
                 // zeroed), but edge sub-pages were only mprotect'd, preserving whatever
@@ -1572,6 +1827,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         &self,
         range: core::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
+        clear_edge_page_mapping(range.clone());
+
         // Round inward to HOST_PAGE_SIZE boundaries to avoid unmapping adjacent
         // 4KB sub-pages that belong to other VMAs within the same 16KB host page.
         // Sub-16KB edge portions are left mapped (as PROT_NONE from the original
@@ -1641,6 +1898,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
             register_edge_page(new_outer_start);
         }
 
+        sync_edge_page_mapping(
+            new_range.clone(),
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+        );
+
         // Zero edge sub-pages in the new range (anonymous memory must be zeroed).
         let leading_zero_end = new_inner_start.min(new_range.end);
         if new_range.start < leading_zero_end {
@@ -1701,6 +1963,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
 
         // Step 5: Deallocate old range using inward rounding (same as
         // deallocate_pages) to avoid destroying neighboring sub-pages.
+        clear_edge_page_mapping(old_range.clone());
         let old_aligned_start = host_page_align_up(old_range.start);
         let old_aligned_end = host_page_align_down(old_range.end);
         if old_aligned_start < old_aligned_end {
@@ -1730,22 +1993,17 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         //
         // Strategy (W^X compliant — no RWX):
         // - Interior host pages (fully enclosed): set to exactly the requested permissions.
-        // - Edge host pages (partially covered): set to RW or RX based on the
-        //   requested permissions. If EXEC is requested, use RX (the dominant need
-        //   is code execution). Otherwise use RW (data access). The fault-and-toggle
-        //   handler in exception_signal_handler will flip permissions on demand if
-        //   the other access type is needed later.
+        // - Edge host pages (partially covered): use per-sub-page tracking to
+        //   compute the correct W^X-compliant composite permission (RW or RX)
+        //   based on ALL sub-pages within the 16KB host page, not just the
+        //   requested permissions. This prevents a PROT_NONE request on one
+        //   4KB slice from stripping EXEC from adjacent slices that still
+        //   contain code.
         let outer_start = host_page_align_down(range.start);
         let outer_end = host_page_align_up(range.end);
         let inner_start = host_page_align_up(range.start);
         let inner_end = host_page_align_down(range.end);
         let prot = prot_flags(new_permissions).bits();
-        // Choose RX or RW for edge pages based on requested permissions.
-        let edge_prot = if new_permissions.contains(MemoryRegionPermissions::EXEC) {
-            (ProtFlags::PROT_READ | ProtFlags::PROT_EXEC).bits()
-        } else {
-            (ProtFlags::PROT_READ | ProtFlags::PROT_WRITE).bits()
-        };
 
         // Interior: exact permissions on fully-enclosed host pages.
         if inner_start < inner_end {
@@ -1759,19 +2017,24 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
             assert_eq!(r, 0, "mprotect failed: {}", std::io::Error::last_os_error());
         }
 
-        // Edge host pages: set to RW or RX (W^X compliant) and register for
-        // fault-and-toggle handling. Collect distinct edge page addresses.
+        // Edge host pages: update per-sub-page state and compute W^X composite
+        // permission from ALL sub-pages in the host page. Register for
+        // fault-and-toggle handling.
         let has_leading_edge = outer_start < inner_start;
         let has_trailing_edge = inner_end < outer_end;
         let leading_edge_addr = outer_start;
         let trailing_edge_addr = host_page_align_down(range.end.saturating_sub(1));
 
         if has_leading_edge {
+            let edge_prot =
+                update_edge_page_state(leading_edge_addr, range.clone(), new_permissions);
             ensure_edge_page(leading_edge_addr, edge_prot);
             register_edge_page(leading_edge_addr);
         }
 
         if has_trailing_edge && trailing_edge_addr != leading_edge_addr {
+            let edge_prot =
+                update_edge_page_state(trailing_edge_addr, range.clone(), new_permissions);
             ensure_edge_page(trailing_edge_addr, edge_prot);
             register_edge_page(trailing_edge_addr);
         }
@@ -1780,6 +2043,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         // and the interior is empty, no mprotect has fired yet. Handle by
         // ensuring the enclosing host page directly.
         if inner_start >= inner_end && !has_leading_edge && has_trailing_edge {
+            let edge_prot = update_edge_page_state(outer_start, range.clone(), new_permissions);
             ensure_edge_page(outer_start, edge_prot);
             register_edge_page(outer_start);
         }
@@ -1876,6 +2140,16 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         if result == libc::MAP_FAILED {
             Err(CowAllocationError::InternalFailure)
         } else {
+            let tracked_start = match fixed_address_behavior {
+                FixedAddressBehavior::Hint => result as usize,
+                FixedAddressBehavior::Replace | FixedAddressBehavior::NoReplace => suggested_start,
+            };
+            let tracked_range = tracked_start..(tracked_start + source_data.len());
+            if fixed_address_behavior == FixedAddressBehavior::Replace {
+                clear_edge_page_mapping(tracked_range.clone());
+            }
+            sync_edge_page_mapping(tracked_range, permissions);
+
             // Return the original suggested_start for fixed-address operations so
             // the VMem layer's 4KB bookkeeping is consistent, even though the
             // kernel mapped a wider 16KB-aligned region.
