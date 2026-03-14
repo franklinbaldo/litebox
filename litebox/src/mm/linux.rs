@@ -571,23 +571,9 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             populate_pages_immediately,
             platform_fixed_address_behavior,
         );
-        // On macOS, get_unmmaped_area may select an address near the top of
-        // the 48-bit VA space that our VMA tree considers free but the host
-        // kernel rejects (macOS restricts usable VA to a smaller range).
-        // When a hint-based allocation fails with ENOMEM, retry with hint=0
-        // so the host kernel picks an address it considers valid.
-        let alloc_result = match (&alloc_result, &platform_fixed_address_behavior) {
-            (Err(AllocationError::OutOfMemory), &FixedAddressBehavior::Hint) => self
-                .platform
-                .allocate_pages(
-                    0..suggested_range.len(),
-                    permissions_enum,
-                    can_grow_down,
-                    populate_pages_immediately,
-                    FixedAddressBehavior::Hint,
-                ),
-            _ => alloc_result,
-        };
+        // Note: The macOS platform layer retries internally (mmap with hint,
+        // mmap with NULL, mach_vm_allocate), so no additional retry is needed
+        // here.  On Linux, the hint is almost always accepted.
         let ret = alloc_result.map_err(|err| match err {
             AllocationError::AddressInUse => AllocationError::AddressInUseByPlatform,
             other => other,

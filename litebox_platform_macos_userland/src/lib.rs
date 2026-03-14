@@ -150,6 +150,8 @@ unsafe extern "C" {
         info: *mut vm_region_submap_info_64,
         info_count: *mut u32,
     ) -> i32;
+    fn mach_vm_allocate(target_task: u32, address: *mut u64, size: u64, flags: i32) -> i32;
+    fn mach_vm_deallocate(target_task: u32, address: u64, size: u64) -> i32;
     fn __ulock_wait(
         operation: u32,
         addr: *mut libc::c_void,
@@ -161,6 +163,9 @@ unsafe extern "C" {
 
 const UL_COMPARE_AND_WAIT: u32 = 1;
 const ULF_WAKE_ALL: u32 = 0x0000_0100;
+
+/// `VM_FLAGS_ANYWHERE`: Let the kernel choose any available address.
+const VM_FLAGS_ANYWHERE: i32 = 1;
 
 /// Maximum number of edge pages we track for fault-and-toggle W^X.
 ///
@@ -1716,6 +1721,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         // 16KB host page is preserved.
         match fixed_address_behavior {
             FixedAddressBehavior::Hint => {
+                let size = suggested_range.len();
+                let prot = prot_flags(initial_permissions).bits();
                 let linux_flags = MapFlags::MAP_PRIVATE
                     | MapFlags::MAP_ANONYMOUS
                     | if can_grow_down {
@@ -1726,26 +1733,74 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 // No MAP_JIT — we follow strict W^X. Edge pages use
                 // fault-and-toggle instead (see exception_signal_handler).
                 let native_flags = macos_mmap_flags(linux_flags);
+
+                // Attempt 1: mmap with the suggested hint address.
                 let r = unsafe {
                     libc::mmap(
                         suggested_range.start as *mut libc::c_void,
-                        suggested_range.len(),
-                        prot_flags(initial_permissions).bits(),
+                        size,
+                        prot,
                         native_flags,
                         -1,
                         0,
                     )
                 };
-                if r == libc::MAP_FAILED {
-                    let err = std::io::Error::last_os_error();
-                    return Err(match err.raw_os_error() {
-                        Some(libc::ENOMEM) => {
-                            litebox::platform::page_mgmt::AllocationError::OutOfMemory
-                        }
-                        _ => panic!("unhandled mmap error {err}"),
-                    });
+                if r != libc::MAP_FAILED {
+                    return Ok(UserMutPtr::from_usize(r as usize));
                 }
-                Ok(UserMutPtr::from_usize(r as usize))
+                let errno1 = std::io::Error::last_os_error();
+
+                // Attempt 2: mmap with NULL hint — let the kernel choose freely.
+                // On macOS, CONFIG_MAP_RANGES may confine anonymous mmap to a
+                // specific heap range.  A NULL hint lets the kernel search that
+                // range from its start.
+                let r =
+                    unsafe { libc::mmap(core::ptr::null_mut(), size, prot, native_flags, -1, 0) };
+                if r != libc::MAP_FAILED {
+                    return Ok(UserMutPtr::from_usize(r as usize));
+                }
+                let errno2 = std::io::Error::last_os_error();
+
+                // Attempt 3: mach_vm_allocate at the Mach VM layer.
+                // This bypasses the BSD mmap layer and its CONFIG_MAP_RANGES
+                // routing.  mach_vm_allocate with VM_FLAGS_ANYWHERE asks the
+                // kernel to place the allocation at any available address.
+                // The memory is created with VM_PROT_DEFAULT (RW).  We then
+                // mprotect to the desired permissions.
+                let mut address: u64 = 0;
+                let kr = unsafe {
+                    mach_vm_allocate(
+                        mach_task_self(),
+                        &raw mut address,
+                        size as u64,
+                        VM_FLAGS_ANYWHERE,
+                    )
+                };
+                if kr == KERN_SUCCESS {
+                    let addr = address as usize;
+                    // mach_vm_allocate gives RW pages.  Set the requested
+                    // protection (often PROT_NONE for address space reservations).
+                    if prot != (libc::PROT_READ | libc::PROT_WRITE) {
+                        let mprotect_ret =
+                            unsafe { libc::mprotect(addr as *mut libc::c_void, size, prot) };
+                        if mprotect_ret != 0 {
+                            // mprotect failed — clean up and fall through to error.
+                            unsafe {
+                                mach_vm_deallocate(mach_task_self(), address, size as u64);
+                            }
+                            return Err(litebox::platform::page_mgmt::AllocationError::OutOfMemory);
+                        }
+                    }
+                    return Ok(UserMutPtr::from_usize(addr));
+                }
+
+                // All attempts exhausted.  Log diagnostics for debugging.
+                eprintln!(
+                    "[allocate_pages] all 3 attempts failed for size={:#x} prot={}: \
+                     mmap(hint={:#x})={}, mmap(NULL)={}, mach_vm_allocate kr={}",
+                    size, prot, suggested_range.start, errno1, errno2, kr,
+                );
+                Err(litebox::platform::page_mgmt::AllocationError::OutOfMemory)
             }
             FixedAddressBehavior::Replace | FixedAddressBehavior::NoReplace => {
                 if fixed_address_behavior == FixedAddressBehavior::Replace {
