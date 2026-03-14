@@ -65,6 +65,57 @@ use crate::{
     platform::TimeProvider,
 };
 
+/// Generates common socket error accessor methods for channel types
+/// that contain an `inner` field with a `socket_error: SocketErrorState`.
+macro_rules! impl_socket_error_accessors {
+    () => {
+        /// Set the socket error.
+        pub(super) fn set_socket_error(&self, error: super::errors::SocketError) {
+            self.inner.socket_error.set(error);
+        }
+
+        /// Clear the socket error.
+        #[allow(dead_code)]
+        pub(super) fn clear_socket_error(&self) {
+            let _ = self.inner.socket_error.get(true);
+        }
+
+        /// Read and clear (if specified) the socket error.
+        fn get_socket_error(&self, clear: bool) -> Option<super::errors::SocketError> {
+            self.inner.socket_error.get(clear)
+        }
+    };
+}
+
+/// Atomic storage for [`SocketError`]
+///
+/// [`SocketError`]: super::errors::SocketError
+struct SocketErrorState {
+    /// Socket error stored as raw u32; 0 means no error.
+    value: AtomicU32,
+}
+
+impl SocketErrorState {
+    fn new() -> Self {
+        Self {
+            value: AtomicU32::new(0),
+        }
+    }
+
+    fn set(&self, error: super::errors::SocketError) {
+        self.value.store(error as u32, Ordering::Release);
+    }
+
+    fn get(&self, clear: bool) -> Option<super::errors::SocketError> {
+        let raw = if clear {
+            self.value.swap(0, Ordering::AcqRel)
+        } else {
+            self.value.load(Ordering::Acquire)
+        };
+        super::errors::SocketError::from_u32(raw)
+    }
+}
+
 /// Socket state flags stored atomically
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -129,7 +180,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
             NetworkProxy::Stream(channel) => {
                 channel.set_socket_error(error);
             }
-            NetworkProxy::Datagram(_) | NetworkProxy::Raw => {}
+            NetworkProxy::Datagram(channel) => {
+                channel.set_socket_error(error);
+            }
+            NetworkProxy::Raw => {}
         }
     }
 
@@ -137,7 +191,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
     pub fn get_socket_error(&self, clear: bool) -> Option<super::errors::SocketError> {
         match self {
             NetworkProxy::Stream(channel) => channel.get_socket_error(clear),
-            NetworkProxy::Datagram(_) | NetworkProxy::Raw => None,
+            NetworkProxy::Datagram(channel) => channel.get_socket_error(clear),
+            NetworkProxy::Raw => None,
         }
     }
 
@@ -254,8 +309,8 @@ struct StreamChannelInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     /// Space available in TX buffer (for quick poll checks)
     tx_available: AtomicUsize,
 
-    /// Socket error. 0 means no error.
-    socket_error: AtomicU32,
+    /// Socket error.
+    socket_error: SocketErrorState,
 
     /// Event notification
     pollee: Pollee<Platform>,
@@ -282,7 +337,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamChannelInner<Plat
             rx_available: AtomicUsize::new(0),
             tx_available: AtomicUsize::new(tx_capacity),
 
-            socket_error: AtomicU32::new(0),
+            socket_error: SocketErrorState::new(),
 
             pollee: Pollee::new(),
         }
@@ -608,27 +663,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         self.inner.pollee.notify_observers(events);
     }
 
-    /// Set the socket error.
-    pub(super) fn set_socket_error(&self, error: super::errors::SocketError) {
-        self.inner
-            .socket_error
-            .store(error as u32, Ordering::Release);
-    }
-
-    /// Clear the socket error
-    pub(super) fn clear_socket_error(&self) {
-        let _ = self.get_socket_error(true);
-    }
-
-    /// Read and clear (if specified) the socket error.
-    fn get_socket_error(&self, clear: bool) -> Option<super::errors::SocketError> {
-        let raw = if clear {
-            self.inner.socket_error.swap(0, Ordering::AcqRel)
-        } else {
-            self.inner.socket_error.load(Ordering::Acquire)
-        };
-        super::errors::SocketError::from_u32(raw)
-    }
+    impl_socket_error_accessors!();
 }
 
 /// A datagram message for UDP-like sockets.
@@ -682,6 +717,9 @@ struct DatagramChannelInner<Platform: RawSyncPrimitivesProvider + TimeProvider> 
     /// For UDP, this indicates that a default destination has been set via connect().
     is_connected: AtomicBool,
 
+    /// Socket error.
+    socket_error: SocketErrorState,
+
     /// Event notification
     pollee: Pollee<Platform>,
 }
@@ -709,6 +747,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramChannelInner<Pl
 
             local_port: AtomicU16::new(0),
             is_connected: AtomicBool::new(false),
+
+            socket_error: SocketErrorState::new(),
 
             pollee: Pollee::new(),
         }
@@ -957,6 +997,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
     fn set_connected(&self, connected: bool) {
         self.inner.is_connected.store(connected, Ordering::Release);
     }
+
+    impl_socket_error_accessors!();
 }
 
 #[cfg(test)]
