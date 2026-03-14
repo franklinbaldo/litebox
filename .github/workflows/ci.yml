@@ -233,6 +233,34 @@ jobs:
       - name: Build documentation (fail on warnings)
         run: cargo doc --locked --verbose --no-deps --all-features --document-private-items -p litebox_runner_linux_on_windows_userland
 
+  build_and_test_macos:
+    name: Build and Test macOS (Apple Silicon)
+    runs-on: macos-15
+    env:
+      RUSTFLAGS: -Dwarnings
+      RUSTDOCFLAGS: -Dwarnings
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v6
+      - name: Set up Rust
+        run: |
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy --target aarch64-apple-darwin
+      - name: Set up Nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@${{ env.NEXTEST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked --verbose --all-targets --all-features -p litebox_runner_linux_on_macos_userland
+      - run: cargo build --locked --verbose -p litebox_runner_linux_on_macos_userland
+      - run: cargo nextest run --locked --profile ci -p litebox_runner_linux_on_macos_userland
+      - run: |
+          cargo test --locked --verbose --doc -p litebox_runner_linux_on_macos_userland
+          # We need to run `cargo test --doc` separately because doc tests
+          # aren't included in nextest at the moment. See relevant discussion at
+          # https://github.com/nextest-rs/nextest/issues/16
+      - name: Build documentation (fail on warnings)
+        run: cargo doc --locked --verbose --no-deps --all-features --document-private-items -p litebox_runner_linux_on_macos_userland
+
   build_and_test_snp:
     name: Build and Test SNP
     runs-on: ubuntu-latest
@@ -296,6 +324,13 @@ jobs:
           # - `litebox_platform_windows_userland` is allowed to have `std` access,
           #   since it is a purely-userland implementation.
           #
+          # - `litebox_platform_macos_userland` is allowed to have `std` access,
+          #   since it is a purely-userland implementation.
+          #
+          # - `litebox_runner_linux_on_macos_userland` is allowed to have `std`
+          #   access since it needs to actually access the file-system, pull in
+          #   relevant files, and then actually trigger LiteBox itself.
+          #
           # - `litebox_platform_lvbs` has a custom target (`no_std`), so it does
           #   not work with the current no_std checker.
           #
@@ -342,7 +377,9 @@ jobs:
           find . -type f -name 'Cargo.toml' \
             -not -path './Cargo.toml' \
             -not -path './litebox_platform_linux_userland/Cargo.toml' \
+            -not -path './litebox_platform_macos_userland/Cargo.toml' \
             -not -path './litebox_platform_windows_userland/Cargo.toml' \
+            -not -path './litebox_runner_linux_on_macos_userland/Cargo.toml' \
             -not -path './litebox_runner_linux_on_windows_userland/Cargo.toml' \
             -not -path './litebox_platform_lvbs/Cargo.toml' \
             -not -path './litebox_platform_multiplex/Cargo.toml' \
