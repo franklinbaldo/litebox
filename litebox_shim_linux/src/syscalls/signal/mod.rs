@@ -655,7 +655,13 @@ impl<FS: ShimFS> Task<FS> {
 
         self.signals.set_signal_mask(uctx.sigmask);
 
-        Ok(arch::restore_sigcontext(ctx, &uctx.mcontext))
+        arch::restore_sigcontext(ctx, &uctx.mcontext).map_err(|()| {
+            // FP state validation failed (e.g., invalid MXCSR in
+            // guest-controlled signal frame). Force SIGSEGV matching
+            // Linux kernel behavior for malformed signal frames.
+            self.force_signal(Signal::SIGSEGV, false);
+            Errno::EFAULT
+        })
     }
 
     pub(crate) fn sys_rt_sigaction(

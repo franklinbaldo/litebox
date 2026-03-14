@@ -832,6 +832,15 @@ pending_host_signals:
 .globl wait_waker_addr
 wait_waker_addr:
     .quad 0
+    .align 64
+.globl guest_fp_state
+guest_fp_state:
+    .zero 512
+    .section .tdata
+    .align 4
+.globl default_mxcsr
+default_mxcsr:
+    .long 0x1F80
     "
 );
 
@@ -901,6 +910,11 @@ unsafe extern "C-unwind" fn run_thread_arch(
     rdfsbase r8
     wrgsbase r8
 
+    // Initialize guest_fp_state with current (host) FP state so the first
+    // fxrstor64 in switch_to_guest gets a sane MXCSR (0x1F80) rather than
+    // the all-zero default from .tbss.
+    fxsave64 [r8 + guest_fp_state@tpoff]
+
     // Call init_handler or reenter_handler based on reenter flag (in dl).
     test dl, dl
     jnz 1f
@@ -922,17 +936,23 @@ syscall_callback:
     // expectations of `interrupt_signal_handler`.
     mov      BYTE PTR gs:in_guest@tpoff, 0
 
-    // Restore host fs base.
+    // Save guest fsbase, then get host TLS base for FP save.
     rdfsbase r11
     mov      gs:guest_fsbase@tpoff, r11
     rdgsbase r11
+
+    // Save guest FP/SIMD state and sanitize MXCSR before any Rust code runs.
+    // fxsave64 does not clobber any GPRs, so guest registers are preserved.
+    fxsave64 [r11 + guest_fp_state@tpoff]
+    ldmxcsr  [r11 + default_mxcsr@tpoff]
+
+    // Restore host fs base.
     wrfsbase r11
 
     // Switch to the top of the guest context.
     mov     r11, rsp
     mov     rsp, fs:guest_context_top@tpoff
 
-    // TODO: save float and vector registers (xsave or fxsave)
     // Save caller-saved registers
     push    0x2b       // pt_regs->ss = __USER_DS
     push    r11        // pt_regs->sp
@@ -973,6 +993,13 @@ exception_callback:
     mov     rsp, fs:host_sp@tpoff
     mov     rbp, fs:host_bp@tpoff
 
+    // Save guest FP/SIMD state and sanitize MXCSR. The host kernel's sigreturn
+    // restored the CPU's FP state from the host signal frame before reaching
+    // here, so the CPU FP state is the guest's original FP state.
+    rdfsbase r11
+    fxsave64 [r11 + guest_fp_state@tpoff]
+    ldmxcsr  [r11 + default_mxcsr@tpoff]
+
     mov rdi, [rsp] // pass thread_ctx
     call {exception_handler}
     jmp .Ldone
@@ -981,6 +1008,12 @@ interrupt_callback:
     // Restore the stack and frame pointer.
     mov     rsp, fs:host_sp@tpoff
     mov     rbp, fs:host_bp@tpoff
+
+    // Save guest FP/SIMD state and sanitize MXCSR. Same rationale as
+    // exception_callback above.
+    rdfsbase r11
+    fxsave64 [r11 + guest_fp_state@tpoff]
+    ldmxcsr  [r11 + default_mxcsr@tpoff]
 
     mov rdi, [rsp] // pass thread_ctx
     call {interrupt_handler}
@@ -1180,6 +1213,11 @@ unsafe extern "fastcall-unwind" fn syscall_handler_fast(thread_ctx: &mut ThreadC
 #[unsafe(naked)]
 unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     core::arch::naked_asm!(
+        // Restore guest FP/SIMD state BEFORE setting in_guest=1.
+        // If an interrupt arrives here, handler sees in_guest=0 and IP outside
+        // [switch_to_guest_start, switch_to_guest_end) → host mode (Case 2).
+        "rdfsbase r11",
+        "fxrstor64 [r11 + guest_fp_state@tpoff]",
         "switch_to_guest_start:",
         // Set `in_guest` now, then check if there is a pending interrupt. If
         // so, jump to the interrupt handler.

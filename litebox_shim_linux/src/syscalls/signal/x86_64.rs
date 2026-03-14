@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+#[cfg(feature = "platform_linux_userland")]
+use crate::ConstPtr;
 use crate::MutPtr;
 use crate::syscalls::signal::{DeliverFault, SignalState};
 use core::mem::offset_of;
@@ -11,6 +13,13 @@ use litebox_common_linux::{
     signal::{SaFlags, SigAction, Siginfo, Ucontext, x86_64::Sigcontext},
 };
 use zerocopy::{FromBytes, IntoBytes};
+
+/// Size of the FXSAVE area in bytes.
+const FXSAVE_SIZE: usize = 512;
+/// FXSAVE area alignment (64-byte for future XSAVE compatibility).
+const FXSAVE_ALIGN: usize = 64;
+/// MXCSR bits that are valid (non-reserved). Bits 16-31 are reserved.
+const MXCSR_VALID_MASK: u32 = 0x0000_FFFF;
 
 #[repr(C)]
 #[derive(Clone, FromBytes, IntoBytes)]
@@ -85,6 +94,52 @@ pub(super) fn fpstate_diff_summary(
     (changed_bytes, first_diffs, first_diff_count)
 }
 
+/// Returns a pointer to the `guest_fp_state` TLS variable defined in the
+/// platform crate's `.tbss` section. This is only available on the
+/// linux_userland platform where the guest FP state is saved/restored via
+/// FXSAVE64/FXRSTOR64 in the platform asm.
+#[cfg(feature = "platform_linux_userland")]
+fn guest_fp_state_ptr() -> *mut u8 {
+    let ptr: *mut u8;
+    // SAFETY: `rdfsbase` reads the FS base which points to TLS. Adding
+    // `guest_fp_state@tpoff` gives the address of the TLS variable.
+    // The variable is 512 bytes, 64-byte aligned, defined in the
+    // platform crate's global_asm.
+    unsafe {
+        core::arch::asm!(
+            "rdfsbase {0}",
+            "add {0}, OFFSET guest_fp_state@tpoff",
+            out(reg) ptr,
+            options(nostack, preserves_flags),
+        );
+    }
+    ptr
+}
+
+/// Reads the guest FP state from TLS into a stack buffer.
+#[cfg(feature = "platform_linux_userland")]
+fn read_guest_fp_state() -> [u8; FXSAVE_SIZE] {
+    let ptr = guest_fp_state_ptr();
+    let mut buf = [0u8; FXSAVE_SIZE];
+    // SAFETY: `guest_fp_state` is a 512-byte TLS variable that is always valid
+    // when running on a shim thread.
+    unsafe {
+        core::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), FXSAVE_SIZE);
+    }
+    buf
+}
+
+/// Writes guest FP state from a buffer back to TLS, where `switch_to_guest`
+/// will restore it to the CPU via FXRSTOR64.
+#[cfg(feature = "platform_linux_userland")]
+fn write_guest_fp_state(buf: &[u8; FXSAVE_SIZE]) {
+    let ptr = guest_fp_state_ptr();
+    // SAFETY: Same as read_guest_fp_state.
+    unsafe {
+        core::ptr::copy_nonoverlapping(buf.as_ptr(), ptr, FXSAVE_SIZE);
+    }
+}
+
 pub(super) fn uctx_addr(ctx: &PtRegs) -> usize {
     ctx.rsp
 }
@@ -99,6 +154,10 @@ pub(super) fn get_signal_frame(sp: usize, _action: &SigAction) -> usize {
     // Skip the redzone.
     frame_addr = frame_addr.wrapping_sub(128);
 
+    // Reserve space for FpState (512 bytes, 64-byte aligned).
+    // Align down first, then subtract the FpState size.
+    frame_addr = (frame_addr.wrapping_sub(FXSAVE_SIZE)) & !(FXSAVE_ALIGN - 1);
+
     // Space for the signal frame.
     frame_addr = frame_addr.wrapping_sub(core::mem::size_of::<SignalFrame>());
 
@@ -107,6 +166,14 @@ pub(super) fn get_signal_frame(sp: usize, _action: &SigAction) -> usize {
     frame_addr = frame_addr.wrapping_sub(8);
 
     frame_addr
+}
+
+/// Computes the fpstate address on the guest stack given the signal frame
+/// address. The FpState lives above the SignalFrame, 64-byte aligned.
+fn fpstate_addr_from_frame(frame_addr: usize) -> usize {
+    let above_frame = frame_addr.wrapping_add(core::mem::size_of::<SignalFrame>());
+    // Align up to FXSAVE_ALIGN.
+    (above_frame + (FXSAVE_ALIGN - 1)) & !(FXSAVE_ALIGN - 1)
 }
 
 impl SignalState {
@@ -120,6 +187,23 @@ impl SignalState {
         if !action.flags.contains(SaFlags::RESTORER) {
             return Err(DeliverFault);
         }
+
+        // Compute fpstate address and write guest FP state to guest stack.
+        #[cfg(feature = "platform_linux_userland")]
+        let fpstate_guest_addr = {
+            const SW_RESERVED_OFFSET: usize = 464;
+            let addr = fpstate_addr_from_frame(frame_addr);
+            let mut fp = read_guest_fp_state();
+            // Zero sw_reserved (bytes 464-511). FXSAVE doesn't write these
+            // bytes; they may contain stale data. magic1=0 tells the guest
+            // this is legacy FXSAVE with no XSAVE extended state.
+            fp[SW_RESERVED_OFFSET..].fill(0);
+            let fp_ptr = MutPtr::<u8>::from_usize(addr);
+            fp_ptr.write_slice_at_offset(0, &fp).ok_or(DeliverFault)?;
+            addr as u64
+        };
+        #[cfg(not(feature = "platform_linux_userland"))]
+        let fpstate_guest_addr: u64 = 0;
 
         let last_exception = self.last_exception.get();
         let frame = SignalFrame {
@@ -155,7 +239,7 @@ impl SignalState {
                     trapno: last_exception.exception.0.into(),
                     oldmask: self.blocked.get().as_u64(),
                     cr2: last_exception.cr2 as u64,
-                    fpstate: 0, // TODO
+                    fpstate: fpstate_guest_addr,
                     reserved1: [0; 8],
                 },
                 sigmask: self.blocked.get(),
@@ -180,7 +264,7 @@ impl SignalState {
 pub(super) fn restore_sigcontext(
     ctx: &mut PtRegs,
     sigctx: &litebox_common_linux::signal::x86_64::Sigcontext,
-) -> usize {
+) -> Result<usize, ()> {
     let litebox_common_linux::signal::x86_64::Sigcontext {
         r8,
         r9,
@@ -208,7 +292,7 @@ pub(super) fn restore_sigcontext(
         trapno: _,
         oldmask: _,
         cr2: _,
-        fpstate: _,
+        fpstate,
         reserved1: _,
     } = *sigctx;
 
@@ -231,7 +315,33 @@ pub(super) fn restore_sigcontext(
     ctx.rip = rip.truncate();
     ctx.eflags = rflags.truncate();
 
-    // TODO: restore fpstate
+    // Restore FP state from the signal frame if present.
+    #[cfg(feature = "platform_linux_userland")]
+    if fpstate != 0 {
+        // This is x86_64-only code; fpstate is a u64 guest pointer.
+        #[allow(clippy::cast_possible_truncation)]
+        let fp_ptr = ConstPtr::<u8>::from_usize(fpstate as usize);
+        let Some(fp_bytes) = fp_ptr.to_owned_slice(FXSAVE_SIZE) else {
+            return Err(());
+        };
 
-    ctx.rax
+        let mut fp: [u8; FXSAVE_SIZE] = [0; FXSAVE_SIZE];
+        fp.copy_from_slice(&fp_bytes);
+
+        // Validate MXCSR from guest-controlled signal frame to prevent
+        // fxrstor #GP fault. Reserved bits (16-31) must be clear.
+        let mxcsr = u32::from_le_bytes(fp[24..28].try_into().unwrap());
+        if mxcsr & !MXCSR_VALID_MASK != 0 {
+            return Err(());
+        }
+        // Apply mxcsr_mask if non-zero (bits the CPU doesn't support must be 0).
+        let mxcsr_mask = u32::from_le_bytes(fp[28..32].try_into().unwrap());
+        if mxcsr_mask != 0 && mxcsr & !mxcsr_mask != 0 {
+            return Err(());
+        }
+
+        write_guest_fp_state(&fp);
+    }
+
+    Ok(ctx.rax)
 }
