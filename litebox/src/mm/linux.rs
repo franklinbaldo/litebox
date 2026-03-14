@@ -364,6 +364,38 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         self.vmas.insert(range.into(), vma);
     }
 
+    /// Evict pre-existing reserved-pages VMAs from the brk zone.
+    ///
+    /// `reserved_pages()` inserts host VM regions as VMAs with `VmFlags::empty()`
+    /// before the brk zone is established. If ASLR places the guest binary such
+    /// that its brk zone overlaps a host reservation, `brk()` will fail because
+    /// it finds an existing VMA.
+    ///
+    /// This method removes those stale tracking entries from
+    /// `[brk_start..brk_reserved_end)`. It does NOT call
+    /// `platform.deallocate_pages()` because these are host-owned regions, not
+    /// guest allocations. The `brk()` handler will later overwrite them with
+    /// `FIXED_ADDR | Replace` semantics.
+    pub(super) fn evict_reserved_from_brk_zone(&mut self) {
+        if self.brk_reserved_end == 0 {
+            return;
+        }
+        let brk_start = self.brk.next_multiple_of(ALIGN);
+        let brk_end = self.brk_reserved_end;
+
+        // Collect ranges to remove (can't mutate while iterating).
+        let to_remove: Vec<Range<usize>> = self
+            .vmas
+            .overlapping(brk_start..brk_end)
+            .filter(|(_, vma)| vma.flags() == VmFlags::empty() && !vma.is_file_backed())
+            .map(|(range, _)| range.clone())
+            .collect();
+
+        for range in to_remove {
+            self.vmas.remove(range);
+        }
+    }
+
     /// Gets an iterator over all the stored ranges that are
     /// either partially or completely overlapped by the given range.
     pub(super) fn overlapping(

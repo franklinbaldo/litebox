@@ -302,6 +302,11 @@ where
         // top-down hint-based allocator does not place anonymous mmaps there.
         let brk_aligned = brk.next_multiple_of(linux::PAGE_SIZE);
         vmem.brk_reserved_end = brk_aligned + Self::BRK_RESERVE_SIZE;
+        // Evict any pre-existing host reservation VMAs (from reserved_pages)
+        // that overlap the brk zone.  These were inserted at Vmem::new() time
+        // before the brk address was known and would cause brk() to fail with
+        // ENOMEM when it finds them via overlapping().
+        vmem.evict_reserved_from_brk_zone();
     }
 
     /// Find a free region of at least `size` bytes at or above `min_addr`.
