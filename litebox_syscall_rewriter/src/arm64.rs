@@ -781,6 +781,11 @@ enum PatchKind {
         is_read: bool,
         /// Whether x18 is written by this instruction.
         is_write: bool,
+        /// Whether the instruction is SP-relative memory access whose immediate offset
+        /// would overflow when adjusted by +48 (the gate's frame size). When true, the
+        /// gate uses ADD SP, SP, #48 / <original insn> / SUB SP, SP, #48 instead of
+        /// modifying the instruction's immediate field. This adds 2 instructions to the gate.
+        needs_sp_fixup: bool,
     },
 }
 
@@ -1117,14 +1122,78 @@ fn adjust_sp_relative_offset(insn: u32, frame_size: u16) -> Option<u32> {
     }
 }
 
-/// Compute the gate size for an x18-referencing instruction.
+/// Check if a rewritten instruction is an SP-relative memory access whose immediate
+/// offset would overflow when adjusted by the gate's frame size.
+///
+/// Returns `true` if the instruction uses SP as base (Rn=31), is a recognized
+/// memory opcode, and `adjust_sp_relative_offset` returns `None` (overflow or
+/// unsupported format). In this case, the gate must use the SP restore strategy
+/// (ADD SP, SP, #frame / <insn> / SUB SP, SP, #frame) instead of immediate adjustment.
 #[cfg(any(target_os = "macos", test))]
-fn x18_gate_size(is_read: bool, is_write: bool) -> usize {
+fn needs_sp_fixup(rewritten: u32, frame_size: u16) -> bool {
+    let rn = (rewritten >> 5) & 0x1F;
+    if rn != 31 {
+        return false; // Not SP-relative
+    }
+
+    // If adjust succeeds, no fixup needed
+    if adjust_sp_relative_offset(rewritten, frame_size).is_some() {
+        return false;
+    }
+
+    // Check if this is a memory operation (vs. ADD/SUB/CMP with SP)
+    use yaxpeax_arch::Decoder;
+    use yaxpeax_arm::armv8::a64::{InstDecoder, Opcode};
+    let decoder = InstDecoder::default();
+    let word = rewritten.to_le_bytes();
+    let mut reader = yaxpeax_arch::U8Reader::new(&word);
+    decoder.decode(&mut reader).map_or(false, |inst| {
+        matches!(
+            inst.opcode,
+            Opcode::STP
+                | Opcode::LDP
+                | Opcode::STNP
+                | Opcode::LDNP
+                | Opcode::STR
+                | Opcode::LDR
+                | Opcode::STUR
+                | Opcode::LDUR
+                | Opcode::STRB
+                | Opcode::LDRB
+                | Opcode::STURB
+                | Opcode::LDURB
+                | Opcode::STRH
+                | Opcode::LDRH
+                | Opcode::STURH
+                | Opcode::LDURH
+                | Opcode::STLR
+                | Opcode::STLRB
+                | Opcode::STLRH
+                | Opcode::LDAR
+                | Opcode::LDARB
+                | Opcode::LDARH
+                | Opcode::STXR
+                | Opcode::STXRB
+                | Opcode::STXRH
+                | Opcode::LDXR
+                | Opcode::LDXRB
+                | Opcode::LDXRH
+        )
+    })
+}
+
+/// Compute the gate size for an x18-referencing instruction.
+///
+/// When `sp_fixup` is true, the gate emits 2 extra instructions (ADD SP / SUB SP)
+/// around the rewritten instruction to restore the original SP for memory access.
+#[cfg(any(target_os = "macos", test))]
+fn x18_gate_size(is_read: bool, is_write: bool, sp_fixup: bool) -> usize {
+    let extra = if sp_fixup { 2 } else { 0 };
     if is_read && is_write {
-        X18_GATE_READWRITE_INSN_COUNT * 4
+        (X18_GATE_READWRITE_INSN_COUNT + extra) * 4
     } else {
         // Both read-only and write-only are 14 insns (with NZCV save/restore)
-        X18_GATE_READ_INSN_COUNT * 4
+        (X18_GATE_READ_INSN_COUNT + extra) * 4
     }
 }
 
@@ -1179,6 +1248,7 @@ fn find_patch_sites(sections: &[TextSectionInfo], buf: &[u8]) -> Result<Vec<Patc
                     && references_x18(insn)
                 {
                     let (rewritten, scratch, is_read, is_write) = rewrite_x18(insn);
+                    let sp_fixup = needs_sp_fixup(rewritten, 48);
                     sites.push(PatchSite {
                         file_offset: start + i,
                         vaddr: section.vaddr + i as u64,
@@ -1188,6 +1258,7 @@ fn find_patch_sites(sections: &[TextSectionInfo], buf: &[u8]) -> Result<Vec<Patc
                             scratch,
                             is_read,
                             is_write,
+                            needs_sp_fixup: sp_fixup,
                         },
                     });
                 }
@@ -1466,6 +1537,7 @@ pub(crate) fn hook_syscalls_aarch64(
                 scratch,
                 is_read,
                 is_write,
+                needs_sp_fixup: sp_fixup,
                 ..
             } => {
                 emit_x18_gate(
@@ -1477,6 +1549,7 @@ pub(crate) fn hook_syscalls_aarch64(
                     scratch,
                     is_read,
                     is_write,
+                    sp_fixup,
                 )?;
             }
         }
@@ -3072,9 +3145,10 @@ fn emit_x18_gate(
     scratch: u8,
     is_read: bool,
     is_write: bool,
+    sp_fixup: bool,
 ) -> Result<()> {
     let gate_vaddr = trampoline_base_addr + gate_offset as u64;
-    let gate_size = x18_gate_size(is_read, is_write);
+    let gate_size = x18_gate_size(is_read, is_write, sp_fixup);
     let gate_insn_count = gate_size / 4;
     let mut insn_idx: usize = 0;
     let insn_vaddr = |idx: usize| -> u64 { gate_vaddr + (idx as u64) * 4 };
@@ -3082,66 +3156,32 @@ fn emit_x18_gate(
     // Adjust SP-relative offset: the gate pushes a 48-byte frame, so any instruction
     // that uses SP as a base register for memory access needs its immediate offset
     // increased by 48 to access the original (caller's) stack location.
+    //
+    // There are two strategies:
+    // 1. Immediate adjustment: modify the instruction's offset field (+48). Used when
+    //    the adjusted value fits in the instruction's immediate encoding.
+    // 2. SP restore: when the adjusted offset overflows (sp_fixup=true), we instead
+    //    restore SP before the instruction and re-push after:
+    //      ADD SP, SP, #48   ; restore caller's SP
+    //      <original insn>   ; accesses correct stack location
+    //      SUB SP, SP, #48   ; re-push gate frame
+    //    This adds 2 instructions to the gate.
+    //
     // `adjust_sp_relative_offset` returns `None` for non-memory instructions (ADD, SUB,
     // CMP, etc.) even if they have Rn=SP, since it only matches load/store opcodes.
     let rn = (rewritten >> 5) & 0x1F;
-    let rewritten = if rn == 31 {
+    let rewritten = if rn == 31 && !sp_fixup {
+        // Try immediate adjustment (non-sp_fixup path)
         match adjust_sp_relative_offset(rewritten, 48) {
             Some(adjusted) => adjusted,
             None => {
-                // Check if this is actually a load/store that we failed to adjust.
-                // Non-memory instructions (ADD, CMP, MOV, etc.) with Rn=SP are fine
-                // without adjustment — they compute addresses, not access memory.
-                // We use the opcode check to distinguish.
-                use yaxpeax_arch::Decoder;
-                use yaxpeax_arm::armv8::a64::{InstDecoder, Opcode};
-                let decoder = InstDecoder::default();
-                let word = rewritten.to_le_bytes();
-                let mut reader = yaxpeax_arch::U8Reader::new(&word);
-                let is_memory_op = decoder.decode(&mut reader).map_or(false, |inst| {
-                    matches!(
-                        inst.opcode,
-                        Opcode::STP
-                            | Opcode::LDP
-                            | Opcode::STNP
-                            | Opcode::LDNP
-                            | Opcode::STR
-                            | Opcode::LDR
-                            | Opcode::STUR
-                            | Opcode::LDUR
-                            | Opcode::STRB
-                            | Opcode::LDRB
-                            | Opcode::STURB
-                            | Opcode::LDURB
-                            | Opcode::STRH
-                            | Opcode::LDRH
-                            | Opcode::STURH
-                            | Opcode::LDURH
-                            | Opcode::STLR
-                            | Opcode::STLRB
-                            | Opcode::STLRH
-                            | Opcode::LDAR
-                            | Opcode::LDARB
-                            | Opcode::LDARH
-                            | Opcode::STXR
-                            | Opcode::STXRB
-                            | Opcode::STXRH
-                            | Opcode::LDXR
-                            | Opcode::LDXRB
-                            | Opcode::LDXRH
-                    )
-                });
-                if is_memory_op {
-                    return Err(Error::DisassemblyFailure(format!(
-                        "cannot adjust SP-relative offset by +48 for x18 gate at {:#x} \
-                         (insn {:#010x}): memory instruction format not supported",
-                        site.vaddr, rewritten
-                    )));
-                }
+                // Not a memory op (ADD, CMP, etc. with Rn=SP) — use as-is
                 rewritten
             }
         }
     } else {
+        // Either not SP-relative, or sp_fixup mode (instruction used unchanged,
+        // SP is restored around it)
         rewritten
     };
 
@@ -3201,11 +3241,23 @@ fn emit_x18_gate(
         );
         insn_idx += 1;
 
-        // [7] <rewritten instruction>
+        // [7] <rewritten instruction> (possibly wrapped with SP restore/re-push)
+        if sp_fixup {
+            // ADD SP, SP, #48 — restore caller's SP
+            trampoline_data
+                .extend_from_slice(&encode_add_sp_imm(48).expect("imm12=48 fits").to_le_bytes());
+            insn_idx += 1;
+        }
         trampoline_data.extend_from_slice(&rewritten.to_le_bytes());
         insn_idx += 1;
+        if sp_fixup {
+            // SUB SP, SP, #48 — re-push gate frame
+            trampoline_data
+                .extend_from_slice(&encode_sub_sp_imm(48).expect("imm12=48 fits").to_le_bytes());
+            insn_idx += 1;
+        }
 
-        // [8] STR Xscratch, [SP, #24]
+        // [8/10] STR Xscratch, [SP, #24]
         trampoline_data.extend_from_slice(
             &encode_str_imm_unsigned(scratch, 31, 24)
                 .expect("offset 24 valid")
@@ -3249,15 +3301,35 @@ fn emit_x18_gate(
         );
         insn_idx += 1;
 
-        // [7] <rewritten instruction>
+        // [7] <rewritten instruction> (possibly wrapped with SP restore/re-push)
+        if sp_fixup {
+            trampoline_data
+                .extend_from_slice(&encode_add_sp_imm(48).expect("imm12=48 fits").to_le_bytes());
+            insn_idx += 1;
+        }
         trampoline_data.extend_from_slice(&rewritten.to_le_bytes());
         insn_idx += 1;
+        if sp_fixup {
+            trampoline_data
+                .extend_from_slice(&encode_sub_sp_imm(48).expect("imm12=48 fits").to_le_bytes());
+            insn_idx += 1;
+        }
     } else {
         // Write-only path: execute, save
 
-        // [5] <rewritten instruction>
+        // [5] <rewritten instruction> (possibly wrapped with SP restore/re-push)
+        if sp_fixup {
+            trampoline_data
+                .extend_from_slice(&encode_add_sp_imm(48).expect("imm12=48 fits").to_le_bytes());
+            insn_idx += 1;
+        }
         trampoline_data.extend_from_slice(&rewritten.to_le_bytes());
         insn_idx += 1;
+        if sp_fixup {
+            trampoline_data
+                .extend_from_slice(&encode_sub_sp_imm(48).expect("imm12=48 fits").to_le_bytes());
+            insn_idx += 1;
+        }
 
         // [6] STR Xscratch, [SP, #24]
         trampoline_data.extend_from_slice(
@@ -5772,17 +5844,26 @@ mod tests {
 
     #[test]
     fn test_x18_gate_size_read_only() {
-        assert_eq!(x18_gate_size(true, false), X18_GATE_READ_INSN_COUNT * 4);
+        assert_eq!(
+            x18_gate_size(true, false, false),
+            X18_GATE_READ_INSN_COUNT * 4
+        );
     }
 
     #[test]
     fn test_x18_gate_size_write_only() {
-        assert_eq!(x18_gate_size(false, true), X18_GATE_WRITE_INSN_COUNT * 4);
+        assert_eq!(
+            x18_gate_size(false, true, false),
+            X18_GATE_WRITE_INSN_COUNT * 4
+        );
     }
 
     #[test]
     fn test_x18_gate_size_readwrite() {
-        assert_eq!(x18_gate_size(true, true), X18_GATE_READWRITE_INSN_COUNT * 4);
+        assert_eq!(
+            x18_gate_size(true, true, false),
+            X18_GATE_READWRITE_INSN_COUNT * 4
+        );
     }
 
     #[test]
@@ -5951,5 +6032,105 @@ mod tests {
         // STP X17, X16, [SP, #0x70] — offset 0x70=112, new 0xa0=160
         let stp_70 = 0xA900_0000 | (14u32 << 15) | (16u32 << 10) | (31u32 << 5) | 17;
         assert!(adjust_sp_relative_offset(stp_70, frame_size).is_some());
+    }
+
+    // ============================================================
+    // Tests for needs_sp_fixup
+    // ============================================================
+
+    #[test]
+    fn test_needs_sp_fixup_ldp_w_overflow() {
+        // LDP W17, W8, [SP, #240] — the exact instruction from libc.so.6 at 0xa9f00
+        // opc=00 (32-bit), imm7=60 (240/4), Rt2=8, Rn=SP(31), Rt=17
+        // After +48: 288/4 = 72 > 63 (imm7 max), so needs SP fixup
+        let insn: u32 = 0x295e23f1; // LDP W17, W8, [SP, #240]
+                                    // After x18→x17 rewrite, x18 is not present in this encoding (it's W17, W8)
+                                    // but the instruction has Rn=SP and would overflow
+        assert!(
+            needs_sp_fixup(insn, 48),
+            "LDP W17, W8, [SP, #240] should need SP fixup (imm7 overflow)"
+        );
+    }
+
+    #[test]
+    fn test_needs_sp_fixup_stp_x_no_overflow() {
+        // STP X4, X17, [SP, #0xb8] — fits after +48 (imm7 goes from 23 to 29)
+        let insn = 0xA900_0000 | (23u32 << 15) | (17u32 << 10) | (31u32 << 5) | 4;
+        assert!(
+            !needs_sp_fixup(insn, 48),
+            "STP X4, X17, [SP, #0xb8] should NOT need SP fixup"
+        );
+    }
+
+    #[test]
+    fn test_needs_sp_fixup_stp_x_overflow() {
+        // STP X4, X17, [SP, #0x1F0]: imm7=62, after +48: 68 > 63
+        let insn = 0xA900_0000 | (62u32 << 15) | (17u32 << 10) | (31u32 << 5) | 4;
+        assert!(
+            needs_sp_fixup(insn, 48),
+            "STP X4, X17, [SP, #0x1F0] should need SP fixup (imm7 overflow)"
+        );
+    }
+
+    #[test]
+    fn test_needs_sp_fixup_add_sp_returns_false() {
+        // ADD X17, SP, #8 — not a memory op, doesn't need fixup
+        let insn: u32 = 0x910023F1;
+        assert!(
+            !needs_sp_fixup(insn, 48),
+            "ADD X17, SP should NOT need SP fixup (not memory op)"
+        );
+    }
+
+    #[test]
+    fn test_needs_sp_fixup_non_sp_returns_false() {
+        // LDR X17, [X0, #8] — not SP-relative
+        let insn = 0xF940_0000 | (1u32 << 10) | (0u32 << 5) | 17;
+        assert!(
+            !needs_sp_fixup(insn, 48),
+            "LDR X17, [X0, #8] should NOT need SP fixup (not SP-relative)"
+        );
+    }
+
+    #[test]
+    fn test_x18_gate_size_with_sp_fixup() {
+        // SP fixup adds 2 instructions (8 bytes) to each gate type
+        assert_eq!(
+            x18_gate_size(true, false, true),
+            (X18_GATE_READ_INSN_COUNT + 2) * 4,
+            "read-only gate with SP fixup"
+        );
+        assert_eq!(
+            x18_gate_size(false, true, true),
+            (X18_GATE_WRITE_INSN_COUNT + 2) * 4,
+            "write-only gate with SP fixup"
+        );
+        assert_eq!(
+            x18_gate_size(true, true, true),
+            (X18_GATE_READWRITE_INSN_COUNT + 2) * 4,
+            "read-write gate with SP fixup"
+        );
+    }
+
+    #[test]
+    fn test_needs_sp_fixup_ldp_w_near_max() {
+        // LDP W registers with imm7 = 63 (max), offset = 252
+        // After +48: 300/4 = 75 > 63, needs fixup
+        let insn: u32 = 0x2940_0000 | (63u32 << 15) | (8u32 << 10) | (31u32 << 5) | 17;
+        assert!(
+            needs_sp_fixup(insn, 48),
+            "LDP W at max imm7 should need SP fixup"
+        );
+    }
+
+    #[test]
+    fn test_needs_sp_fixup_ldp_w_just_fits() {
+        // LDP W registers with imm7 = 51, offset = 204
+        // After +48: 252/4 = 63, exactly at max — should fit
+        let insn: u32 = 0x2940_0000 | (51u32 << 15) | (8u32 << 10) | (31u32 << 5) | 17;
+        assert!(
+            !needs_sp_fixup(insn, 48),
+            "LDP W with imm7=51 should NOT need SP fixup (63 fits)"
+        );
     }
 }
