@@ -149,9 +149,9 @@ const MRS_GATE_INSN_COUNT: usize = 13;
 const MRS_GATE_SIZE: usize = MRS_GATE_INSN_COUNT * 4; // 52
 
 // ---- macOS shared MRS handler layout (TPIDRRO_EL0 → TCB → guest_tpidr → [SP+24]) ----
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 const SHARED_MRS_HANDLER_INSN_COUNT: usize = 16;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 const SHARED_MRS_HANDLER_SIZE: usize = SHARED_MRS_HANDLER_INSN_COUNT * 4; // 64
 
 // ---- macOS shared x18 load handler (TPIDRRO_EL0 → TCB → guest_x18 → [SP+24]) ----
@@ -201,17 +201,18 @@ const SHARED_MSR_HANDLER_OFFSET: usize = SHARED_SVC_HANDLER_OFFSET + SHARED_SVC_
 // Linux: 48 + 72 = 120, macOS: 52 + 68 = 120
 
 /// Offset where the shared MRS handler begins (macOS only; Linux has no shared MRS handler).
-#[cfg(target_os = "macos")]
+/// Under `test` on Linux, this computes from Linux MSR handler sizes (different value from macOS).
+#[cfg(any(target_os = "macos", test))]
 const SHARED_MRS_HANDLER_OFFSET: usize = SHARED_MSR_HANDLER_OFFSET + SHARED_MSR_HANDLER_SIZE;
 // macOS: 120 + 68 = 188
 
 /// Offset where the shared x18 load handler begins (macOS only).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 const SHARED_X18_LOAD_HANDLER_OFFSET: usize = SHARED_MRS_HANDLER_OFFSET + SHARED_MRS_HANDLER_SIZE;
 // macOS: 188 + 64 = 252
 
 /// Offset where the shared x18 save handler begins (macOS only).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 const SHARED_X18_SAVE_HANDLER_OFFSET: usize =
     SHARED_X18_LOAD_HANDLER_OFFSET + SHARED_X18_LOAD_HANDLER_SIZE;
 // macOS: 252 + 64 = 316
@@ -459,7 +460,7 @@ fn encode_mrs_tpidrro_el0(rt: u8) -> u32 {
 ///
 /// NZCV: op0=3, op1=3, CRn=4, CRm=2, op2=0
 /// Encoding: `0xD53B4200 | Rt`
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn encode_mrs_nzcv(rt: u8) -> u32 {
     0xD53B_4200 | u32::from(rt)
 }
@@ -467,7 +468,7 @@ fn encode_mrs_nzcv(rt: u8) -> u32 {
 /// Encode `MSR NZCV, Xt` (write condition flags register).
 ///
 /// Encoding: `0xD51B4200 | Rt`
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn encode_msr_nzcv(rt: u8) -> u32 {
     0xD51B_4200 | u32::from(rt)
 }
@@ -769,7 +770,7 @@ enum PatchKind {
     /// On macOS, x18 is zeroed by the kernel on every return to userspace, so every
     /// instruction that reads or writes x18 must be rewritten to load/store from the
     /// per-thread `guest_x18` cell in the TCB.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", test))]
     X18Use {
         /// The original 32-bit instruction word.
         insn: u32,
@@ -1531,7 +1532,7 @@ pub(crate) fn hook_syscalls_aarch64(
                     rd,
                 )?;
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", test))]
             PatchKind::X18Use {
                 rewritten,
                 scratch,
@@ -3086,11 +3087,11 @@ fn emit_shared_x18_save_handler(
 ///  [2] STR  X30, [SP, #16]
 ///  [3] MRS  X16, NZCV              ; save condition flags
 ///  [4] STR  X16, [SP, #40]         ; store NZCV to frame
-///  [5] BL   <shared_x18_load>      ; writes guest_x18 to [SP+24]
-///  [6] LDR  Xscratch, [SP, #24]   ; scratch = guest_x18
-///  [7] <rewritten instruction>
-///  [8] LDR  X16, [SP, #40]         ; reload NZCV
-///  [9] MSR  NZCV, X16              ; restore condition flags
+///  [5] BL   <shared_x18_load>      ; writes guest_x18 to [SP+24], clobbers NZCV
+///  [6] LDR  X16, [SP, #40]         ; reload saved NZCV
+///  [7] MSR  NZCV, X16              ; restore flags BEFORE guest instruction
+///  [8] LDR  Xscratch, [SP, #24]   ; scratch = guest_x18
+///  [9] <rewritten instruction>      ; flag output survives to caller
 /// [10] LDP  X16, X17, [SP]
 /// [11] LDR  X30, [SP, #16]
 /// [12] ADD  SP, SP, #48
@@ -3104,11 +3105,11 @@ fn emit_shared_x18_save_handler(
 ///  [2] STR  X30, [SP, #16]
 ///  [3] MRS  X16, NZCV              ; save condition flags
 ///  [4] STR  X16, [SP, #40]         ; store NZCV to frame
-///  [5] <rewritten instruction>
-///  [6] STR  Xscratch, [SP, #24]
-///  [7] BL   <shared_x18_save>
-///  [8] LDR  X16, [SP, #40]         ; reload NZCV
-///  [9] MSR  NZCV, X16              ; restore condition flags
+///  [5] LDR  X16, [SP, #40]         ; reload saved NZCV
+///  [6] MSR  NZCV, X16              ; restore flags BEFORE guest instruction
+///  [7] <rewritten instruction>      ; flag output survives
+///  [8] STR  Xscratch, [SP, #24]
+///  [9] BL   <shared_x18_save>
 /// [10] LDP  X16, X17, [SP]
 /// [11] LDR  X30, [SP, #16]
 /// [12] ADD  SP, SP, #48
@@ -3122,19 +3123,19 @@ fn emit_shared_x18_save_handler(
 ///  [2]  STR  X30, [SP, #16]
 ///  [3]  MRS  X16, NZCV             ; save condition flags
 ///  [4]  STR  X16, [SP, #40]        ; store NZCV to frame
-///  [5]  BL   <shared_x18_load>
-///  [6]  LDR  Xscratch, [SP, #24]
-///  [7]  <rewritten instruction>
-///  [8]  STR  Xscratch, [SP, #24]
-///  [9]  BL   <shared_x18_save>
-/// [10]  LDR  X16, [SP, #40]        ; reload NZCV
-/// [11]  MSR  NZCV, X16             ; restore condition flags
+///  [5]  BL   <shared_x18_load>     ; clobbers NZCV
+///  [6]  LDR  X16, [SP, #40]        ; reload saved NZCV
+///  [7]  MSR  NZCV, X16             ; restore flags BEFORE guest instruction
+///  [8]  LDR  Xscratch, [SP, #24]
+///  [9]  <rewritten instruction>     ; flag output survives
+/// [10]  STR  Xscratch, [SP, #24]
+/// [11]  BL   <shared_x18_save>
 /// [12]  LDP  X16, X17, [SP]
 /// [13]  LDR  X30, [SP, #16]
 /// [14]  ADD  SP, SP, #48
 /// [15]  B    <return_addr>
 /// ```
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 #[allow(clippy::cast_possible_wrap)]
 fn emit_x18_gate(
     trampoline_data: &mut Vec<u8>,
@@ -3218,7 +3219,7 @@ fn emit_x18_gate(
     insn_idx += 1;
 
     if is_read && is_write {
-        // Read-write path: load, execute, save
+        // Read-write path: load, restore NZCV, execute, save
 
         // [5] BL <shared_x18_load>
         let bl_vaddr = insn_vaddr(insn_idx);
@@ -3233,7 +3234,19 @@ fn emit_x18_gate(
         trampoline_data.extend_from_slice(&bl_insn.to_le_bytes());
         insn_idx += 1;
 
-        // [6] LDR Xscratch, [SP, #24]
+        // [6] LDR X16, [SP, #40] — reload saved NZCV (before guest instruction)
+        trampoline_data.extend_from_slice(
+            &encode_ldr_imm_unsigned(16, 31, 40)
+                .expect("offset 40 valid")
+                .to_le_bytes(),
+        );
+        insn_idx += 1;
+
+        // [7] MSR NZCV, X16 — restore condition flags (before guest instruction)
+        trampoline_data.extend_from_slice(&encode_msr_nzcv(16).to_le_bytes());
+        insn_idx += 1;
+
+        // [8] LDR Xscratch, [SP, #24]
         trampoline_data.extend_from_slice(
             &encode_ldr_imm_unsigned(scratch, 31, 24)
                 .expect("offset 24 valid")
@@ -3241,7 +3254,7 @@ fn emit_x18_gate(
         );
         insn_idx += 1;
 
-        // [7] <rewritten instruction> (possibly wrapped with SP restore/re-push)
+        // [9] <rewritten instruction> (possibly wrapped with SP restore/re-push)
         if sp_fixup {
             // ADD SP, SP, #48 — restore caller's SP
             trampoline_data
@@ -3257,7 +3270,7 @@ fn emit_x18_gate(
             insn_idx += 1;
         }
 
-        // [8/10] STR Xscratch, [SP, #24]
+        // [10/12] STR Xscratch, [SP, #24]
         trampoline_data.extend_from_slice(
             &encode_str_imm_unsigned(scratch, 31, 24)
                 .expect("offset 24 valid")
@@ -3265,7 +3278,7 @@ fn emit_x18_gate(
         );
         insn_idx += 1;
 
-        // [9] BL <shared_x18_save>
+        // [11/13] BL <shared_x18_save>
         let bl_vaddr = insn_vaddr(insn_idx);
         let save_handler_vaddr = trampoline_base_addr + SHARED_X18_SAVE_HANDLER_OFFSET as u64;
         let bl_offset = save_handler_vaddr.cast_signed() - bl_vaddr.cast_signed();
@@ -3278,7 +3291,7 @@ fn emit_x18_gate(
         trampoline_data.extend_from_slice(&bl_insn.to_le_bytes());
         insn_idx += 1;
     } else if is_read {
-        // Read-only path: load, execute
+        // Read-only path: load, restore NZCV, execute
 
         // [5] BL <shared_x18_load>
         let bl_vaddr = insn_vaddr(insn_idx);
@@ -3293,12 +3306,52 @@ fn emit_x18_gate(
         trampoline_data.extend_from_slice(&bl_insn.to_le_bytes());
         insn_idx += 1;
 
-        // [6] LDR Xscratch, [SP, #24]
+        // [6] LDR X16, [SP, #40] — reload saved NZCV (before guest instruction)
+        trampoline_data.extend_from_slice(
+            &encode_ldr_imm_unsigned(16, 31, 40)
+                .expect("offset 40 valid")
+                .to_le_bytes(),
+        );
+        insn_idx += 1;
+
+        // [7] MSR NZCV, X16 — restore condition flags (before guest instruction)
+        trampoline_data.extend_from_slice(&encode_msr_nzcv(16).to_le_bytes());
+        insn_idx += 1;
+
+        // [8] LDR Xscratch, [SP, #24]
         trampoline_data.extend_from_slice(
             &encode_ldr_imm_unsigned(scratch, 31, 24)
                 .expect("offset 24 valid")
                 .to_le_bytes(),
         );
+        insn_idx += 1;
+
+        // [9] <rewritten instruction> (possibly wrapped with SP restore/re-push)
+        if sp_fixup {
+            trampoline_data
+                .extend_from_slice(&encode_add_sp_imm(48).expect("imm12=48 fits").to_le_bytes());
+            insn_idx += 1;
+        }
+        trampoline_data.extend_from_slice(&rewritten.to_le_bytes());
+        insn_idx += 1;
+        if sp_fixup {
+            trampoline_data
+                .extend_from_slice(&encode_sub_sp_imm(48).expect("imm12=48 fits").to_le_bytes());
+            insn_idx += 1;
+        }
+    } else {
+        // Write-only path: restore NZCV, execute, save
+
+        // [5] LDR X16, [SP, #40] — reload saved NZCV (before guest instruction)
+        trampoline_data.extend_from_slice(
+            &encode_ldr_imm_unsigned(16, 31, 40)
+                .expect("offset 40 valid")
+                .to_le_bytes(),
+        );
+        insn_idx += 1;
+
+        // [6] MSR NZCV, X16 — restore condition flags (before guest instruction)
+        trampoline_data.extend_from_slice(&encode_msr_nzcv(16).to_le_bytes());
         insn_idx += 1;
 
         // [7] <rewritten instruction> (possibly wrapped with SP restore/re-push)
@@ -3314,24 +3367,8 @@ fn emit_x18_gate(
                 .extend_from_slice(&encode_sub_sp_imm(48).expect("imm12=48 fits").to_le_bytes());
             insn_idx += 1;
         }
-    } else {
-        // Write-only path: execute, save
 
-        // [5] <rewritten instruction> (possibly wrapped with SP restore/re-push)
-        if sp_fixup {
-            trampoline_data
-                .extend_from_slice(&encode_add_sp_imm(48).expect("imm12=48 fits").to_le_bytes());
-            insn_idx += 1;
-        }
-        trampoline_data.extend_from_slice(&rewritten.to_le_bytes());
-        insn_idx += 1;
-        if sp_fixup {
-            trampoline_data
-                .extend_from_slice(&encode_sub_sp_imm(48).expect("imm12=48 fits").to_le_bytes());
-            insn_idx += 1;
-        }
-
-        // [6] STR Xscratch, [SP, #24]
+        // [8/10] STR Xscratch, [SP, #24]
         trampoline_data.extend_from_slice(
             &encode_str_imm_unsigned(scratch, 31, 24)
                 .expect("offset 24 valid")
@@ -3339,7 +3376,7 @@ fn emit_x18_gate(
         );
         insn_idx += 1;
 
-        // [7] BL <shared_x18_save>
+        // [9/11] BL <shared_x18_save>
         let bl_vaddr = insn_vaddr(insn_idx);
         let save_handler_vaddr = trampoline_base_addr + SHARED_X18_SAVE_HANDLER_OFFSET as u64;
         let bl_offset = save_handler_vaddr.cast_signed() - bl_vaddr.cast_signed();
@@ -3353,19 +3390,7 @@ fn emit_x18_gate(
         insn_idx += 1;
     }
 
-    // Epilogue (common to all paths)
-
-    // LDR X16, [SP, #40] — reload saved NZCV value
-    trampoline_data.extend_from_slice(
-        &encode_ldr_imm_unsigned(16, 31, 40)
-            .expect("offset 40 valid")
-            .to_le_bytes(),
-    );
-    insn_idx += 1;
-
-    // MSR NZCV, X16 — restore condition flags
-    trampoline_data.extend_from_slice(&encode_msr_nzcv(16).to_le_bytes());
-    insn_idx += 1;
+    // Epilogue (common to all paths) — NZCV already restored before guest instruction
 
     // LDP X16, X17, [SP]
     trampoline_data.extend_from_slice(
@@ -6131,6 +6156,177 @@ mod tests {
         assert!(
             !needs_sp_fixup(insn, 48),
             "LDP W with imm7=51 should NOT need SP fixup (63 fits)"
+        );
+    }
+
+    // ============================================================
+    // Tests for x18 gate NZCV ordering
+    // ============================================================
+
+    /// Helper: emit an x18 gate and return the instruction words.
+    /// Creates a trampoline buffer with enough padding for the shared handler offsets,
+    /// then emits the gate at the correct offset.
+    fn emit_x18_gate_helper(
+        rewritten: u32,
+        scratch: u8,
+        is_read: bool,
+        is_write: bool,
+        sp_fixup: bool,
+    ) -> Vec<u32> {
+        let trampoline_base: u64 = 0x10000;
+        let gate_offset = SHARED_X18_SAVE_HANDLER_OFFSET + SHARED_X18_SAVE_HANDLER_SIZE;
+
+        let site = PatchSite {
+            file_offset: 0,
+            vaddr: 0x1000,
+            kind: PatchKind::X18Use {
+                insn: 0,
+                rewritten,
+                scratch,
+                is_read,
+                is_write,
+                needs_sp_fixup: sp_fixup,
+            },
+        };
+
+        // Pad the trampoline buffer to gate_offset
+        let mut td = vec![0u8; gate_offset];
+        emit_x18_gate(
+            &mut td,
+            gate_offset,
+            trampoline_base,
+            &site,
+            rewritten,
+            scratch,
+            is_read,
+            is_write,
+            sp_fixup,
+        )
+        .unwrap();
+
+        // Extract instructions from the gate
+        let gate_bytes = &td[gate_offset..];
+        gate_bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn test_x18_gate_nzcv_restore_before_instruction_read_only() {
+        // CMP X16, X4 — a flag-setting instruction (after x18→X16 rewrite).
+        // Encoding: SUBS XZR, X16, X4 → 0xEB04021F
+        let cmp_x16_x4: u32 = 0xEB04_021F;
+        let insns = emit_x18_gate_helper(cmp_x16_x4, 16, true, false, false);
+
+        let msr_nzcv_x16 = encode_msr_nzcv(16); // MSR NZCV, X16
+        let mrs_nzcv_x16 = encode_mrs_nzcv(16); // MRS X16, NZCV
+
+        // Find the position of the rewritten instruction (CMP)
+        let cmp_pos = insns
+            .iter()
+            .position(|&i| i == cmp_x16_x4)
+            .expect("CMP instruction not found in gate");
+
+        // Find the position of MSR NZCV, X16 (restore)
+        let msr_pos = insns
+            .iter()
+            .position(|&i| i == msr_nzcv_x16)
+            .expect("MSR NZCV, X16 not found in gate");
+
+        // Find MRS NZCV, X16 (save) — should be in prologue
+        let mrs_pos = insns
+            .iter()
+            .position(|&i| i == mrs_nzcv_x16)
+            .expect("MRS X16, NZCV not found in gate");
+
+        // The NZCV restore (MSR) must come BEFORE the rewritten instruction (CMP),
+        // NOT after. This ensures the CMP's flag output survives to the caller.
+        assert!(
+            msr_pos < cmp_pos,
+            "NZCV restore (MSR at idx {msr_pos}) must come BEFORE the rewritten \
+             instruction (CMP at idx {cmp_pos}). The gate must not destroy flag-setting results."
+        );
+
+        // The NZCV save (MRS) must come before the restore
+        assert!(mrs_pos < msr_pos, "NZCV save must come before restore");
+    }
+
+    #[test]
+    fn test_x18_gate_nzcv_restore_before_instruction_write_only() {
+        // LDR W16, [X5, #8] — a write-to-x18 instruction (after x18→X16 rewrite).
+        // Encoding: LDR W16, [X5, #8] → 0xB94008B0
+        let ldr_w16: u32 = 0xB940_08B0;
+        let insns = emit_x18_gate_helper(ldr_w16, 16, false, true, false);
+
+        let msr_nzcv_x16 = encode_msr_nzcv(16);
+
+        let ldr_pos = insns
+            .iter()
+            .position(|&i| i == ldr_w16)
+            .expect("LDR instruction not found in gate");
+
+        let msr_pos = insns
+            .iter()
+            .position(|&i| i == msr_nzcv_x16)
+            .expect("MSR NZCV, X16 not found in gate");
+
+        assert!(
+            msr_pos < ldr_pos,
+            "NZCV restore (MSR at idx {msr_pos}) must come BEFORE the rewritten \
+             instruction (LDR at idx {ldr_pos})."
+        );
+    }
+
+    #[test]
+    fn test_x18_gate_nzcv_restore_before_instruction_readwrite() {
+        // ADD X16, X16, X4 — a read-write instruction (after x18→X16 rewrite).
+        // Encoding: ADD X16, X16, X4 → 0x8B040210
+        let add_x16: u32 = 0x8B04_0210;
+        let insns = emit_x18_gate_helper(add_x16, 16, true, true, false);
+
+        let msr_nzcv_x16 = encode_msr_nzcv(16);
+
+        let add_pos = insns
+            .iter()
+            .position(|&i| i == add_x16)
+            .expect("ADD instruction not found in gate");
+
+        let msr_pos = insns
+            .iter()
+            .position(|&i| i == msr_nzcv_x16)
+            .expect("MSR NZCV, X16 not found in gate");
+
+        assert!(
+            msr_pos < add_pos,
+            "NZCV restore (MSR at idx {msr_pos}) must come BEFORE the rewritten \
+             instruction (ADD at idx {add_pos})."
+        );
+    }
+
+    #[test]
+    fn test_x18_gate_no_nzcv_restore_after_instruction_read_only() {
+        // Verify there is NO MSR NZCV after the rewritten instruction.
+        // This ensures the guest instruction's flag output survives.
+        let cmp_x16_x4: u32 = 0xEB04_021F;
+        let insns = emit_x18_gate_helper(cmp_x16_x4, 16, true, false, false);
+
+        let msr_nzcv_x16 = encode_msr_nzcv(16);
+
+        let cmp_pos = insns
+            .iter()
+            .position(|&i| i == cmp_x16_x4)
+            .expect("CMP instruction not found in gate");
+
+        let nzcv_restores_after = insns[cmp_pos + 1..]
+            .iter()
+            .filter(|&&i| i == msr_nzcv_x16)
+            .count();
+
+        assert_eq!(
+            nzcv_restores_after, 0,
+            "There must be NO NZCV restore (MSR NZCV, X16) after the rewritten instruction. \
+             Found {nzcv_restores_after} instance(s) that would destroy the instruction's flag output."
         );
     }
 }
