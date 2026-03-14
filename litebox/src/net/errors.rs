@@ -143,28 +143,17 @@ pub enum ReceiveError {
     OperationFinished,
 }
 
-/// Asynchronous socket errors
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum SocketAsyncError {
-    /// Connection was refused by the remote host (e.g., RST received during SYN).
-    ConnectionRefused = 1,
-    /// An established connection was reset by the remote host.
-    ConnectionReset = 2,
-    /// Connection timed out (e.g., SYN retransmission timeout expired without response).
-    TimedOut = 3,
-}
-
-impl SocketAsyncError {
-    /// Convert a raw `u32` value back to a `SocketAsyncError`, if valid.
-    pub fn from_u32(v: u32) -> Option<Self> {
-        match v {
-            1 => Some(Self::ConnectionRefused),
-            2 => Some(Self::ConnectionReset),
-            3 => Some(Self::TimedOut),
-            _ => None,
-        }
+crate::utilities::macros::repr_enum! {
+    /// Asynchronous socket errors
+    #[non_exhaustive]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SocketAsyncError: u32, from_u32 {
+        /// Connection was refused by the remote host (e.g., RST received during SYN).
+        ConnectionRefused = 1,
+        /// An established connection was reset by the remote host.
+        ConnectionReset = 2,
+        /// Connection timed out (e.g., SYN retransmission timeout expired without response).
+        TimedOut = 3,
     }
 }
 
