@@ -123,6 +123,24 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
         }
     }
 
+    /// Set the socket error.
+    pub(super) fn set_error(&self, error: super::errors::SocketError) {
+        match self {
+            NetworkProxy::Stream(channel) => {
+                channel.set_socket_error(error);
+            }
+            NetworkProxy::Datagram(_) | NetworkProxy::Raw => {}
+        }
+    }
+
+    /// Read and clear (if specified) the socket error.
+    pub fn get_socket_error(&self, clear: bool) -> Option<super::errors::SocketError> {
+        match self {
+            NetworkProxy::Stream(channel) => channel.get_socket_error(clear),
+            NetworkProxy::Datagram(_) | NetworkProxy::Raw => None,
+        }
+    }
+
     /// Attempt to read data from the socket into the provided buffer.
     ///
     /// Returns the number of bytes read, or an error if the operation would block
@@ -236,6 +254,9 @@ struct StreamChannelInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     /// Space available in TX buffer (for quick poll checks)
     tx_available: AtomicUsize,
 
+    /// Socket error. 0 means no error.
+    socket_error: AtomicU32,
+
     /// Event notification
     pollee: Pollee<Platform>,
 }
@@ -260,6 +281,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamChannelInner<Plat
             write_shutdown: AtomicBool::new(false),
             rx_available: AtomicUsize::new(0),
             tx_available: AtomicUsize::new(tx_capacity),
+
+            socket_error: AtomicU32::new(0),
 
             pollee: Pollee::new(),
         }
@@ -406,7 +429,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable
             SocketState::Closed => events |= Events::HUP | Events::OUT,
             SocketState::Error => events |= Events::ERR | Events::OUT,
             SocketState::Connected if self.is_writable() => events |= Events::OUT,
-            _ => {},
+            _ => {}
         }
 
         events
@@ -583,6 +606,28 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
     /// Notify observers of an I/O event.
     pub(super) fn notify_io_event(&self, events: Events) {
         self.inner.pollee.notify_observers(events);
+    }
+
+    /// Set the socket error.
+    pub(super) fn set_socket_error(&self, error: super::errors::SocketError) {
+        self.inner
+            .socket_error
+            .store(error as u32, Ordering::Release);
+    }
+
+    /// Clear the socket error
+    pub(super) fn clear_socket_error(&self) {
+        let _ = self.get_socket_error(true);
+    }
+
+    /// Read and clear (if specified) the socket error.
+    fn get_socket_error(&self, clear: bool) -> Option<super::errors::SocketError> {
+        let raw = if clear {
+            self.inner.socket_error.swap(0, Ordering::AcqRel)
+        } else {
+            self.inner.socket_error.load(Ordering::Acquire)
+        };
+        super::errors::SocketError::from_u32(raw)
     }
 }
 

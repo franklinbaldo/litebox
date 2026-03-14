@@ -613,8 +613,5 @@ fn test_tun_with_curl() {
     server_thread.join().expect("Server thread panicked");
 
     let output_str = String::from_utf8_lossy(&output);
-    assert!(
-        output_str.contains(RESPONSE_BODY),
-        "Unexpected curl output"
-    );
+    assert!(output_str.contains(RESPONSE_BODY), "Unexpected curl output");
 }

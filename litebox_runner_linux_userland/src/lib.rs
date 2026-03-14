@@ -369,8 +369,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                         }
                     }
                 };
-                litebox_platform_multiplex::platform()
-                    .wait_on_tun(Some(timeout.unwrap_or(DEFAULT_TIMEOUT).min(DEFAULT_TIMEOUT)));
+                litebox_platform_multiplex::platform().wait_on_tun(Some(
+                    timeout.unwrap_or(DEFAULT_TIMEOUT).min(DEFAULT_TIMEOUT),
+                ));
             }
             // Final flush
             // TODO: keep running until all sockets are closed?
