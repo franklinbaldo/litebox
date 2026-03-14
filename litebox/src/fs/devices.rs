@@ -517,16 +517,7 @@ impl<
             "/dev/urandom" => (Device::URandom, None),
             "/dev/tty" => (Device::Tty, None),
             "/dev/ptmx" => {
-                let before_len = self.pty_manager.pairs.lock().len();
                 let idx = self.pty_manager.alloc();
-                let msg = alloc::format!(
-                    "[PTY-ALLOC] fs={:p} mgr={:p} before_len={} idx={}\n",
-                    self,
-                    &self.pty_manager,
-                    before_len,
-                    idx,
-                );
-                self.litebox.x.platform.debug_log_print(&msg);
                 let pair = self.pty_manager.get(idx).unwrap();
                 (Device::PtyMaster(idx), Some(pair))
             }

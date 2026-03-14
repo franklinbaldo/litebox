@@ -1193,7 +1193,6 @@ impl<FS: ShimFS> Task<FS> {
                         files: self.files.clone(), // TODO: !CLONE_FILES support
                         signals: self.signals.clone_for_new_task(),
                         fork_context: core::cell::RefCell::new(None),
-                        bash_vfork_probe: core::cell::RefCell::new(None),
                         last_shell_write: core::cell::RefCell::new(None),
                         last_syscall: core::cell::Cell::new(None),
                         deferred_vfork_park: core::cell::Cell::new(false),
@@ -1239,8 +1238,6 @@ impl<FS: ShimFS> Task<FS> {
         _clone3: bool,
     ) -> Result<usize, Errno> {
         use litebox::platform::AddressSpaceProvider;
-
-        let bash_parent_vfork_probe = self.capture_bash_parent_vfork_probe(ctx);
 
         // Linux clone flag compatibility: CLONE_SIGHAND requires CLONE_VM,
         // and CLONE_THREAD requires CLONE_SIGHAND. Since the fork path has
@@ -1374,11 +1371,6 @@ impl<FS: ShimFS> Task<FS> {
             // unparked later, Ok(false) if no other threads exist, or
             // Err if another thread is already forking.
             let Ok(did_park) = self.park_other_threads() else {
-                litebox::log_println!(
-                    self.global.platform,
-                    "[FORK-EAGAIN] pid={} concurrent fork",
-                    self.pid,
-                );
                 return Err(Errno::EAGAIN);
             };
 
@@ -1560,7 +1552,6 @@ impl<FS: ShimFS> Task<FS> {
                         files: child_files,
                         signals: self.signals.clone_for_fork(),
                         fork_context: core::cell::RefCell::new(child_fork_context),
-                        bash_vfork_probe: core::cell::RefCell::new(None),
                         last_shell_write: core::cell::RefCell::new(None),
                         last_syscall: core::cell::Cell::new(None),
                         deferred_vfork_park: core::cell::Cell::new(false),
@@ -1659,9 +1650,6 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         // Parent returns child's PID.
-        if let Some(probe) = &bash_parent_vfork_probe {
-            self.log_bash_parent_vfork_probe(child_pid, probe);
-        }
         Ok(usize::try_from(child_pid).unwrap())
     }
 
@@ -2545,22 +2533,6 @@ impl<FS: ShimFS> Task<FS> {
         };
 
         let loader = crate::loader::elf::ElfLoader::new(self, path).map_err(Errno::from)?;
-
-        // Log successful exec with first few argv elements.
-        {
-            let argv_summary: alloc::vec::Vec<&str> = argv_vec
-                .iter()
-                .take(3)
-                .filter_map(|a| a.to_str().ok())
-                .collect();
-            litebox::log_println!(
-                self.global.platform,
-                "[EXEC] pid={} path={:?} argv={:?}",
-                self.pid,
-                path,
-                argv_summary,
-            );
-        }
 
         // After this point, the old program is torn down and failures must terminate the process.
 

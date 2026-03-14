@@ -203,7 +203,7 @@ impl<FS: ShimFS> Task<FS> {
             .flatten()
     }
 
-    fn pty_target_for_guest_fd(
+    fn _pty_target_for_guest_fd(
         &self,
         files: &FilesState<FS>,
         guest_fd: u32,
@@ -219,43 +219,9 @@ impl<FS: ShimFS> Task<FS> {
         Some((raw_fd, rdev))
     }
 
-    fn trace_pty_open(&self, path: &str, guest_fd: u32, raw_fd: usize, rdev: Option<usize>) {
-        litebox::log_println!(
-            self.global.platform,
-            "[PTY-OPEN] pid={} guest_fd={} raw_fd={} path={:?} target={}",
-            self.pid,
-            guest_fd,
-            raw_fd,
-            path,
-            rdev.map_or_else(
-                || alloc::string::String::from("<non-pty>"),
-                |rdev| alloc::format!("{}:{}", rdev >> 8, rdev & 0xff),
-            ),
-        );
-    }
+    fn trace_pty_open(&self, _path: &str, _guest_fd: u32, _raw_fd: usize, _rdev: Option<usize>) {}
 
-    fn maybe_trace_pty_dup(&self, oldfd: u32, newfd: u32) {
-        let files = self.files.borrow();
-        let Some((old_raw_fd, old_rdev)) = self.pty_target_for_guest_fd(&files, oldfd) else {
-            return;
-        };
-        let Some((new_raw_fd, new_rdev)) = self.pty_target_for_guest_fd(&files, newfd) else {
-            return;
-        };
-        litebox::log_println!(
-            self.global.platform,
-            "[PTY-DUP] pid={} oldfd={} old_raw_fd={} old_target={}:{} newfd={} new_raw_fd={} new_target={}:{}",
-            self.pid,
-            oldfd,
-            old_raw_fd,
-            old_rdev >> 8,
-            old_rdev & 0xff,
-            newfd,
-            new_raw_fd,
-            new_rdev >> 8,
-            new_rdev & 0xff,
-        );
-    }
+    fn maybe_trace_pty_dup(&self, _oldfd: u32, _newfd: u32) {}
 
     /// Resolve a path against the current working directory.
     fn resolve_path(&self, path: impl path::Arg) -> Result<CString, Errno> {
@@ -1956,18 +1922,6 @@ impl<FS: ShimFS> Task<FS> {
                         let oflags =
                             OFlags::from_bits_truncate(u32::try_from(open_flags).unwrap_or(0));
                         let opened = self.sys_open(slave_path.as_str(), oflags, Mode::empty());
-                        if let Ok(slave_fd) = opened {
-                            litebox::log_println!(
-                                self.global.platform,
-                                "[PTY-PEER] pid={} src_fd={} src_raw_fd={} src_target=136:{} slave_fd={} slave_path={:?}",
-                                self.pid,
-                                fd,
-                                source_raw_fd,
-                                pty_idx,
-                                slave_fd,
-                                slave_path,
-                            );
-                        }
                         opened
                     }
                     _ => Err(Errno::ENOTTY),
