@@ -1012,55 +1012,44 @@ impl<FS: ShimFS> Task<FS> {
                 .ok_or(Errno::EBADF)?
                 .set_file_descriptor_flags(&self.global, &files, flags)
                 .map(|()| 0),
-            FcntlArg::GETFL => match desc {
-                Descriptor::LiteBoxRawFd(raw_fd) => Ok(files
-                    .run_on_raw_fd(
-                        *raw_fd,
-                        |fd| {
-                            Ok(self
-                                .global
-                                .litebox
-                                .descriptor_table()
-                                .with_metadata(fd, |crate::StdioStatusFlags(flags)| {
-                                    *flags & OFlags::STATUS_FLAGS_MASK
-                                })
-                                .unwrap_or(OFlags::empty()))
-                        },
-                        |fd| {
-                            Ok(self
-                                .global
-                                .litebox
-                                .descriptor_table()
-                                .with_metadata(fd, |crate::syscalls::net::SocketOFlags(flags)| {
-                                    *flags & OFlags::STATUS_FLAGS_MASK
-                                })
-                                .unwrap_or(OFlags::empty()))
-                        },
-                        |fd| {
-                            let pipes = &self.global.pipes;
-                            let flags = OFlags::from(pipes.get_flags(fd).map_err(Errno::from)?);
-                            let dirn = match pipes.half_pipe_type(fd)? {
-                                litebox::pipes::HalfPipeType::SenderHalf => OFlags::WRONLY,
-                                litebox::pipes::HalfPipeType::ReceiverHalf => OFlags::RDONLY,
-                            };
-                            Ok(dirn | flags)
-                        },
-                    )
-                    .flatten()?
-                    .bits()),
-                Descriptor::Eventfd { file, .. } => Ok(file.get_status().bits()),
-                Descriptor::Epoll { file, .. } => Ok(file.get_status().bits()),
-                Descriptor::Unix { file, .. } => Ok(file.get_status().bits()),
-            },
+            FcntlArg::GETFL => {
+                macro_rules! getfl_from_metadata {
+                    ($fd:expr, $MetaType:path) => {
+                        Ok(self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .with_metadata($fd, |$MetaType(flags)| {
+                                *flags & OFlags::STATUS_FLAGS_MASK
+                            })
+                            .unwrap_or(OFlags::empty()))
+                    };
+                }
+                match desc {
+                    Descriptor::LiteBoxRawFd(raw_fd) => Ok(files
+                        .run_on_raw_fd(
+                            *raw_fd,
+                            |fd| getfl_from_metadata!(fd, crate::StdioStatusFlags),
+                            |fd| getfl_from_metadata!(fd, crate::syscalls::net::SocketOFlags),
+                            |fd| getfl_from_metadata!(fd, crate::PipeStatusFlags),
+                        )
+                        .flatten()?
+                        .bits()),
+                    Descriptor::Eventfd { file, .. } => Ok(file.get_status().bits()),
+                    Descriptor::Epoll { file, .. } => Ok(file.get_status().bits()),
+                    Descriptor::Unix { file, .. } => Ok(file.get_status().bits()),
+                }
+            }
             FcntlArg::SETFL(flags) => {
                 let setfl_mask = OFlags::APPEND
                     | OFlags::NONBLOCK
                     | OFlags::NDELAY
                     | OFlags::DIRECT
                     | OFlags::NOATIME;
+                let flags = flags & setfl_mask;
                 macro_rules! toggle_flags {
                     ($t:ident) => {
-                        let diff = $t.get_status() ^ flags;
+                        let diff = ($t.get_status() & setfl_mask) ^ flags;
                         if diff.intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME) {
                             todo!("unsupported flags");
                         }
@@ -1068,53 +1057,45 @@ impl<FS: ShimFS> Task<FS> {
                         $t.set_status(flags.complement() & setfl_mask, false);
                     };
                 }
+                macro_rules! setfl_in_metadata {
+                    ($fd:expr, $MetaType:path, $no_metadata_msg:expr) => {
+                        self.global
+                            .litebox
+                            .descriptor_table_mut()
+                            .with_metadata_mut($fd, |$MetaType(f)| {
+                                let diff = (*f & setfl_mask) ^ flags;
+                                if diff
+                                    .intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME)
+                                {
+                                    todo!("unsupported flags");
+                                }
+                                f.toggle(diff);
+                            })
+                            .map_err(|err| match err {
+                                MetadataError::ClosedFd => Errno::EBADF,
+                                MetadataError::NoSuchMetadata => $no_metadata_msg,
+                            })
+                    };
+                }
                 match desc {
                     Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
                         *raw_fd,
                         |fd| {
-                            self.global
-                                .litebox
-                                .descriptor_table_mut()
-                                .with_metadata_mut(fd, |crate::StdioStatusFlags(f)| {
-                                    let diff = *f ^ flags;
-                                    if diff.intersects(
-                                        OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME,
-                                    ) {
-                                        todo!("unsupported flags");
-                                    }
-                                    f.toggle(diff);
-                                })
-                                .map_err(|err| match err {
-                                    MetadataError::ClosedFd => Errno::EBADF,
-                                    MetadataError::NoSuchMetadata => {
-                                        unimplemented!("SETFL on non-stdio")
-                                    }
-                                })
+                            setfl_in_metadata!(
+                                fd,
+                                crate::StdioStatusFlags,
+                                unimplemented!("SETFL on non-stdio")
+                            )
                         },
                         |fd| {
-                            self.global
-                                .litebox
-                                .descriptor_table_mut()
-                                .with_metadata_mut(fd, |crate::syscalls::net::SocketOFlags(f)| {
-                                    let diff = *f ^ flags;
-                                    if diff.intersects(
-                                        OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME,
-                                    ) {
-                                        todo!("unsupported flags");
-                                    }
-                                    f.toggle(diff);
-                                })
-                                .map_err(|err| match err {
-                                    MetadataError::ClosedFd => Errno::EBADF,
-                                    MetadataError::NoSuchMetadata => {
-                                        unreachable!("all sockets have SocketOFlags when created")
-                                    }
-                                })
+                            setfl_in_metadata!(
+                                fd,
+                                crate::syscalls::net::SocketOFlags,
+                                unreachable!("all sockets have SocketOFlags when created")
+                            )
                         },
                         |fd| {
-                            if flags.intersects(OFlags::NONBLOCK.complement()) {
-                                todo!("unsupported flags for pipes")
-                            }
+                            // Update the actual pipe non-blocking behavior
                             self.global
                                 .pipes
                                 .update_flags(
@@ -1122,7 +1103,13 @@ impl<FS: ShimFS> Task<FS> {
                                     litebox::pipes::Flags::NON_BLOCKING,
                                     flags.intersects(OFlags::NONBLOCK),
                                 )
-                                .map_err(Errno::from)
+                                .map_err(Errno::from)?;
+                            // Record all status flags in metadata for F_GETFL
+                            setfl_in_metadata!(
+                                fd,
+                                crate::PipeStatusFlags,
+                                unreachable!("all pipes have PipeStatusFlags when created")
+                            )
                         },
                     )??,
                     Descriptor::Eventfd { file, .. } => {
@@ -1290,6 +1277,21 @@ impl<FS: ShimFS> Task<FS> {
             // See `man 7 pipe` for `PIPE_BUF`. On Linux, this is 4096.
             core::num::NonZero::new(4096),
         );
+
+        {
+            let initial_status = OFlags::from(pipe_flags);
+            let mut dt = self.global.litebox.descriptor_table_mut();
+            let old = dt.set_entry_metadata(
+                &writer,
+                crate::PipeStatusFlags(initial_status | OFlags::WRONLY),
+            );
+            assert!(old.is_none());
+            let old = dt.set_entry_metadata(
+                &reader,
+                crate::PipeStatusFlags(initial_status | OFlags::RDONLY),
+            );
+            assert!(old.is_none());
+        }
 
         if cloexec {
             let mut dt = self.global.litebox.descriptor_table_mut();
