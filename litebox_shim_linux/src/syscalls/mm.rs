@@ -5,13 +5,13 @@
 //! Most of these syscalls which are not backed by files are implemented in [`litebox_common_linux::mm`].
 
 use litebox::{
-    mm::linux::{MappingError, PageRange, PAGE_SIZE},
+    mm::linux::{MappingError, PAGE_SIZE, PageRange},
     platform::{
-        page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions},
         PageManagementProvider, RawConstPointer, RawMutPointer,
+        page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions},
     },
 };
-use litebox_common_linux::{errno::Errno, MRemapFlags, MapFlags, ProtFlags};
+use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
 
 use crate::MutPtr;
 use crate::ShimFS;
@@ -410,7 +410,7 @@ mod tests {
         fs::{Mode, OFlags},
         platform::{PageManagementProvider, RawConstPointer, RawMutPointer},
     };
-    use litebox_common_linux::{errno::Errno, MRemapFlags, MapFlags, ProtFlags};
+    use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
 
     use crate::syscalls::tests::init_platform;
 
@@ -809,18 +809,20 @@ mod tests {
         addr.write_slice_at_offset(0, &[0xff; 0x10]).unwrap();
 
         // Test MADV_NORMAL
-        assert!(task
-            .sys_madvise(addr, 0x2000, litebox_common_linux::MadviseBehavior::Normal)
-            .is_ok());
+        assert!(
+            task.sys_madvise(addr, 0x2000, litebox_common_linux::MadviseBehavior::Normal)
+                .is_ok()
+        );
 
         // Test MADV_DONTNEED
-        assert!(task
-            .sys_madvise(
+        assert!(
+            task.sys_madvise(
                 addr,
                 0x2000,
                 litebox_common_linux::MadviseBehavior::DontNeed
             )
-            .is_ok());
+            .is_ok()
+        );
 
         addr.to_owned_slice(0x10).unwrap().iter().for_each(|&x| {
             assert_eq!(x, 0); // Should be zeroed after MADV_DONTNEED

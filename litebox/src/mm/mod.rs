@@ -350,9 +350,7 @@ where
                     ) {
                         Ok(_) => {
                             // Track the reserved gap in the VMA tree.
-                            if let Some(pr) =
-                                linux::PageRange::new(gap_start, gap_end)
-                            {
+                            if let Some(pr) = linux::PageRange::new(gap_start, gap_end) {
                                 vmem.register_existing_mapping_overwrite(
                                     pr,
                                     linux::VmArea::new(linux::VmFlags::empty(), false),
@@ -450,8 +448,7 @@ where
                         // Fallback: munmap the region.
                         match unsafe {
                             vmem.remove_mapping(
-                                PageRange::new(new_brk, old_brk)
-                                    .ok_or(MappingError::UnAligned)?,
+                                PageRange::new(new_brk, old_brk).ok_or(MappingError::UnAligned)?,
                             )
                         } {
                             Ok(()) => {}
@@ -537,8 +534,7 @@ where
 
             if vmem.overlapping(old_brk..new_brk).next().is_some() {
                 // Diagnostic: dump the overlapping VMAs to help debug brk failures.
-                let mut msg =
-                    alloc::string::String::from("[diag] brk ENOMEM: overlapping VMAs:\n");
+                let mut msg = alloc::string::String::from("[diag] brk ENOMEM: overlapping VMAs:\n");
                 for (range, vma) in vmem.overlapping(old_brk..new_brk) {
                     use core::fmt::Write;
                     let _ = writeln!(
@@ -567,8 +563,7 @@ where
                     vmem.create_pages(
                         Some(suggested_address),
                         length,
-                        CreatePagesFlags::FIXED_ADDR
-                            | CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
+                        CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
                         perms,
                     )
                 }?;

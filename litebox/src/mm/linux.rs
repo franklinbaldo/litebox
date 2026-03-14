@@ -646,10 +646,13 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             platform_fixed_address_behavior,
         );
         #[cfg(target_os = "macos")]
-        mm_diag!("[insert_mapping] allocate_pages(range={:#x}..{:#x}, behavior={:?}) → ok={}",
-            suggested_range.start, suggested_range.end,
+        mm_diag!(
+            "[insert_mapping] allocate_pages(range={:#x}..{:#x}, behavior={:?}) → ok={}",
+            suggested_range.start,
+            suggested_range.end,
             platform_fixed_address_behavior,
-            alloc_result.is_ok());
+            alloc_result.is_ok()
+        );
         // Note: The macOS platform layer retries internally (mmap with hint,
         // mmap with NULL, mach_vm_allocate), so no additional retry is needed
         // here.  On Linux, the hint is almost always accepted.
@@ -672,8 +675,13 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             let new_end_tentative = new_start + suggested_range.len();
             if new_start < self.brk_reserved_end && new_end_tentative > brk_start {
                 #[cfg(target_os = "macos")]
-                mm_diag!("[insert_mapping] brk-zone conflict: addr={:#x}..{:#x} brk={:#x}..{:#x}",
-                    new_start, new_end_tentative, brk_start, self.brk_reserved_end);
+                mm_diag!(
+                    "[insert_mapping] brk-zone conflict: addr={:#x}..{:#x} brk={:#x}..{:#x}",
+                    new_start,
+                    new_end_tentative,
+                    brk_start,
+                    self.brk_reserved_end
+                );
                 // The platform placed the mapping inside the brk reservation.
                 // Deallocate it and retry at a safe address, even if the host
                 // returned the exact hint we asked for: the chosen hint itself
@@ -687,8 +695,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 let size = suggested_range.len();
                 let safe_addr = self.find_free_above(self.brk_reserved_end, size);
                 #[cfg(target_os = "macos")]
-                mm_diag!("[insert_mapping] brk-zone safe_addr: {:?}",
-                    safe_addr.map(|a| a as u64));
+                mm_diag!(
+                    "[insert_mapping] brk-zone safe_addr: {:?}",
+                    safe_addr.map(|a| a as u64)
+                );
                 let Some(safe_addr) = safe_addr else {
                     return Err(AllocationError::OutOfMemory);
                 };
@@ -713,7 +723,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     })?;
                 new_start = retry_ret.as_usize();
                 #[cfg(target_os = "macos")]
-                mm_diag!("[insert_mapping] brk-zone retry returned addr={:#x}", new_start);
+                mm_diag!(
+                    "[insert_mapping] brk-zone retry returned addr={:#x}",
+                    new_start
+                );
                 // Defensive: if the platform placed the retry ALSO inside the
                 // brk zone (shouldn't happen with a free Hint, but be safe),
                 // deallocate and fail rather than corrupt the brk region.
@@ -774,8 +787,12 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         flags: CreatePagesFlags,
     ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
         #[cfg(target_os = "macos")]
-        mm_diag!("[create_mapping] hint={:#x} len={:#x} flags={:#x}",
-            suggested_address.map_or(0, |a| a.0), length.as_usize(), flags.bits());
+        mm_diag!(
+            "[create_mapping] hint={:#x} len={:#x} flags={:#x}",
+            suggested_address.map_or(0, |a| a.0),
+            length.as_usize(),
+            flags.bits()
+        );
         let total_length = (length
             + if flags.contains(CreatePagesFlags::ENSURE_SPACE_AFTER) {
                 DEFAULT_RESERVED_SPACE_SIZE
@@ -799,8 +816,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             }
             None => {
                 #[cfg(target_os = "macos")]
-                mm_diag!("[create_mapping] get_unmmaped_area → None, fallback to TASK_ADDR_MIN={:#x}",
-                    Platform::TASK_ADDR_MIN);
+                mm_diag!(
+                    "[create_mapping] get_unmmaped_area → None, fallback to TASK_ADDR_MIN={:#x}",
+                    Platform::TASK_ADDR_MIN
+                );
                 // The VMA-tree-based search found no suitable gap.  On platforms
                 // like macOS, the host kernel aggressively ignores mmap hints and
                 // finds gaps between existing host mappings on its own.  Rather
@@ -817,8 +836,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // new_addr must be ALIGN aligned
         let new_range = PageRange::new(new_addr, new_addr + length.as_usize()).unwrap();
         #[cfg(target_os = "macos")]
-        mm_diag!("[create_mapping] calling insert_mapping range={:#x}..{:#x}",
-            new_range.start, new_range.end);
+        mm_diag!(
+            "[create_mapping] calling insert_mapping range={:#x}..{:#x}",
+            new_range.start,
+            new_range.end
+        );
         let result = unsafe {
             self.insert_mapping(
                 new_range,
@@ -838,8 +860,15 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         #[cfg(target_os = "macos")]
         {
             let ok = result.is_ok();
-            let addr = result.as_ref().map(Platform::RawMutPointer::as_usize).unwrap_or(0);
-            mm_diag!("[create_mapping] insert_mapping → ok={} addr={:#x}", ok, addr);
+            let addr = result
+                .as_ref()
+                .map(Platform::RawMutPointer::as_usize)
+                .unwrap_or(0);
+            mm_diag!(
+                "[create_mapping] insert_mapping → ok={} addr={:#x}",
+                ok,
+                addr
+            );
         }
         result
     }
@@ -1183,9 +1212,12 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     ) -> Option<usize> {
         let size = length.as_usize();
         #[cfg(target_os = "macos")]
-        mm_diag!("[get_unmmaped_area] size={:#x} fixed={} hint={:#x}",
-            size, fixed_addr,
-            suggested_address.map_or(0, |a| a.0));
+        mm_diag!(
+            "[get_unmmaped_area] size={:#x} fixed={} hint={:#x}",
+            size,
+            fixed_addr,
+            suggested_address.map_or(0, |a| a.0)
+        );
         if size > Platform::TASK_ADDR_MAX {
             #[cfg(target_os = "macos")]
             mm_diag!("[get_unmmaped_area] FAIL: size > TASK_ADDR_MAX");
@@ -1201,11 +1233,17 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 || !self.range_is_occupied(&(suggested_address.0..(suggested_address.0 + size)))
             {
                 #[cfg(target_os = "macos")]
-                mm_diag!("[get_unmmaped_area] OK: using hint {:#x}", suggested_address.0);
+                mm_diag!(
+                    "[get_unmmaped_area] OK: using hint {:#x}",
+                    suggested_address.0
+                );
                 return Some(suggested_address.0);
             }
             #[cfg(target_os = "macos")]
-            mm_diag!("[get_unmmaped_area] hint {:#x} occupied, trying top-down", suggested_address.0);
+            mm_diag!(
+                "[get_unmmaped_area] hint {:#x} occupied, trying top-down",
+                suggested_address.0
+            );
         } else if fixed_addr {
             // MAP_FIXED with addr=0: return 0 so insert_mapping rejects it
             // via the TASK_ADDR_MIN check (BelowMinAddress → EPERM).
@@ -1222,8 +1260,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         debug_assert!(Platform::TASK_ADDR_MAX % ALIGN == 0);
         let last_end = self.vmas.last_range_value().map_or(low_limit, |r| r.0.end);
         #[cfg(target_os = "macos")]
-        mm_diag!("[get_unmmaped_area] top-down step1: last_end={:#x} high_limit={:#x}",
-            last_end, high_limit);
+        mm_diag!(
+            "[get_unmmaped_area] top-down step1: last_end={:#x} high_limit={:#x}",
+            last_end,
+            high_limit
+        );
         if last_end <= high_limit && !self.range_is_occupied(&(high_limit..high_limit + size)) {
             #[cfg(target_os = "macos")]
             mm_diag!("[get_unmmaped_area] OK: top-down step1 → {:#x}", high_limit);
@@ -1232,11 +1273,18 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         #[cfg(target_os = "macos")]
         {
             let brk_s = self.brk.next_multiple_of(ALIGN);
-            mm_diag!("[get_unmmaped_area] step1 failed: brk={:#x} brk_reserved_end={:#x} brk_aligned={:#x}",
-                self.brk, self.brk_reserved_end, brk_s);
+            mm_diag!(
+                "[get_unmmaped_area] step1 failed: brk={:#x} brk_reserved_end={:#x} brk_aligned={:#x}",
+                self.brk,
+                self.brk_reserved_end,
+                brk_s
+            );
             let occ = self.vmas.overlaps(&(high_limit..high_limit + size));
-            mm_diag!("[get_unmmaped_area] step1: vma_overlaps={} range_is_occupied={}",
-                occ, self.range_is_occupied(&(high_limit..high_limit + size)));
+            mm_diag!(
+                "[get_unmmaped_area] step1: vma_overlaps={} range_is_occupied={}",
+                occ,
+                self.range_is_occupied(&(high_limit..high_limit + size))
+            );
         }
 
         // 2. check gaps between ranges (top-down heuristic)
@@ -1278,7 +1326,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         }
 
         #[cfg(target_os = "macos")]
-        mm_diag!("[get_unmmaped_area] top-down failed, trying bottom-up from {:#x}", low_limit);
+        mm_diag!(
+            "[get_unmmaped_area] top-down failed, trying bottom-up from {:#x}",
+            low_limit
+        );
 
         // 3. Bottom-up fallback: exhaustive gap search.
         //
@@ -1288,8 +1339,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // VMA tree from `low_limit` upward.
         let result = self.find_free_above(low_limit, size);
         #[cfg(target_os = "macos")]
-        mm_diag!("[get_unmmaped_area] bottom-up result: {:?}",
-            result.map(|a| a as u64));
+        mm_diag!(
+            "[get_unmmaped_area] bottom-up result: {:?}",
+            result.map(|a| a as u64)
+        );
         result
     }
 }

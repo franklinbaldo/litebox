@@ -4417,7 +4417,7 @@ mod tests {
         // Verify Rd=SP and Rn=SP
         assert_eq!(insn & 0x1F, 31); // Rd
         assert_eq!((insn >> 5) & 0x1F, 31); // Rn
-                                            // Verify imm12
+        // Verify imm12
         assert_eq!((insn >> 10) & 0xFFF, 32);
     }
 
@@ -4509,7 +4509,7 @@ mod tests {
         assert_eq!(insn & 0x1F, 31); // Rd = XZR
         assert_eq!((insn >> 5) & 0x1F, 16); // Rn
         assert_eq!((insn >> 16) & 0x1F, 18); // Rm
-                                             // Verify top bits: 111_01011_00_0
+        // Verify top bits: 111_01011_00_0
         assert_eq!(insn & 0xFFE0_FC00, 0xEB00_0000);
     }
 
@@ -4520,7 +4520,7 @@ mod tests {
         assert_eq!(insn & 0x1F, 31); // Rd = XZR
         assert_eq!((insn >> 5) & 0x1F, 16); // Rn
         assert_eq!((insn >> 10) & 0xFFF, 1); // imm12
-                                             // Verify opcode: 1_0_1_10001_00 = 0xB1000000
+        // Verify opcode: 1_0_1_10001_00 = 0xB1000000
         assert_eq!(insn & 0xFF00_0000, 0xB100_0000);
     }
 
@@ -6084,8 +6084,8 @@ mod tests {
         // opc=00 (32-bit), imm7=60 (240/4), Rt2=8, Rn=SP(31), Rt=17
         // After +48: 288/4 = 72 > 63 (imm7 max), so needs SP fixup
         let insn: u32 = 0x295e23f1; // LDP W17, W8, [SP, #240]
-                                    // After x18→x17 rewrite, x18 is not present in this encoding (it's W17, W8)
-                                    // but the instruction has Rn=SP and would overflow
+        // After x18→x17 rewrite, x18 is not present in this encoding (it's W17, W8)
+        // but the instruction has Rn=SP and would overflow
         assert!(
             needs_sp_fixup(insn, 48),
             "LDP W17, W8, [SP, #240] should need SP fixup (imm7 overflow)"
