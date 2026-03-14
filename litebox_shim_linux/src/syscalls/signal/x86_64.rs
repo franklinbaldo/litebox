@@ -21,6 +21,20 @@ const FXSAVE_ALIGN: usize = 64;
 /// MXCSR bits that are valid (non-reserved). Bits 16-31 are reserved.
 const MXCSR_VALID_MASK: u32 = 0x0000_FFFF;
 
+/// Validates an MXCSR value against the valid mask and an optional host CPU
+/// feature mask. Returns `true` if the value is safe for FXRSTOR.
+fn validate_mxcsr(mxcsr: u32, host_mxcsr_mask: u32) -> bool {
+    // Reserved bits (16-31) must always be clear.
+    if mxcsr & !MXCSR_VALID_MASK != 0 {
+        return false;
+    }
+    // If the host reports a feature mask, unsupported bits must be clear.
+    if host_mxcsr_mask != 0 && mxcsr & !host_mxcsr_mask != 0 {
+        return false;
+    }
+    true
+}
+
 #[repr(C)]
 #[derive(Clone, FromBytes, IntoBytes)]
 struct SignalFrame {
@@ -313,16 +327,8 @@ pub(super) fn restore_sigcontext(
         // Validate MXCSR from guest-controlled signal frame against the
         // trusted host CPU mask to prevent fxrstor #GP fault.
         let mxcsr = u32::from_le_bytes(fp[24..28].try_into().unwrap());
-
-        // Reserved bits (16-31) must always be clear.
-        if mxcsr & !MXCSR_VALID_MASK != 0 {
-            return Err(());
-        }
-        // Validate against the host CPU's actual feature mask (captured at
-        // thread startup), NOT the guest-provided mxcsr_mask in the frame.
-        // A malicious frame could set mxcsr_mask to bypass validation.
         let host_mask = read_host_mxcsr_mask();
-        if host_mask != 0 && mxcsr & !host_mask != 0 {
+        if !validate_mxcsr(mxcsr, host_mask) {
             return Err(());
         }
 
@@ -330,4 +336,236 @@ pub(super) fn restore_sigcontext(
     }
 
     Ok(ctx.rax)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use litebox_common_linux::signal::SigSet;
+
+    fn dummy_action() -> SigAction {
+        SigAction {
+            sigaction: 0x1000,
+            restorer: 0x2000,
+            flags: SaFlags::RESTORER,
+            mask: SigSet::empty(),
+            #[cfg(target_arch = "x86_64")]
+            __pad: 0,
+        }
+    }
+
+    // --- Signal frame layout tests ---
+
+    #[test]
+    fn signal_frame_is_return_address_aligned() {
+        // The frame address should satisfy the x86_64 ABI: 16-byte aligned
+        // minus 8 (so that after the call instruction pushes the return
+        // address, RSP is 16-byte aligned).
+        for &sp in &[
+            0x7fff_ffff_f000usize,
+            0x7fff_ffff_e008,
+            0x7fff_ffff_d100,
+            0x1000_0000_0000,
+        ] {
+            let frame_addr = get_signal_frame(sp, &dummy_action());
+            assert_eq!(
+                frame_addr % 16,
+                8,
+                "frame_addr {frame_addr:#x} for sp {sp:#x} should be 16-aligned minus 8"
+            );
+        }
+    }
+
+    #[test]
+    fn signal_frame_below_redzone() {
+        let sp = 0x7fff_ffff_f000usize;
+        let frame_addr = get_signal_frame(sp, &dummy_action());
+        // Frame must be at least 128 (redzone) + sizeof(SignalFrame) below sp.
+        assert!(
+            frame_addr + core::mem::size_of::<SignalFrame>() <= sp - 128,
+            "frame overlaps redzone"
+        );
+    }
+
+    #[test]
+    fn fpstate_area_is_64_byte_aligned() {
+        for &sp in &[
+            0x7fff_ffff_f000usize,
+            0x7fff_ffff_e008,
+            0x7fff_ffff_d123,
+            0x1000_0000_0000,
+        ] {
+            let frame_addr = get_signal_frame(sp, &dummy_action());
+            let fp_addr = fpstate_addr_from_frame(frame_addr);
+            assert_eq!(
+                fp_addr % FXSAVE_ALIGN,
+                0,
+                "fpstate {fp_addr:#x} for sp {sp:#x} not 64-byte aligned"
+            );
+        }
+    }
+
+    #[test]
+    fn fpstate_fits_between_frame_and_redzone() {
+        let sp = 0x7fff_ffff_f000usize;
+        let frame_addr = get_signal_frame(sp, &dummy_action());
+        let fp_addr = fpstate_addr_from_frame(frame_addr);
+
+        // fpstate must be above the signal frame.
+        assert!(
+            fp_addr >= frame_addr + core::mem::size_of::<SignalFrame>(),
+            "fpstate overlaps signal frame"
+        );
+        // fpstate + 512 must not exceed sp - 128 (redzone boundary).
+        assert!(
+            fp_addr + FXSAVE_SIZE <= sp - 128,
+            "fpstate extends into redzone"
+        );
+    }
+
+    #[test]
+    fn fpstate_layout_round_trip() {
+        // Verify that for various SP values, fpstate_addr_from_frame produces
+        // an address that is consistent with get_signal_frame's allocation.
+        for sp in (0x1000_0000..0x1000_0100).step_by(8) {
+            let frame_addr = get_signal_frame(sp, &dummy_action());
+            let fp_addr = fpstate_addr_from_frame(frame_addr);
+            assert_eq!(fp_addr % FXSAVE_ALIGN, 0);
+            assert!(fp_addr >= frame_addr + core::mem::size_of::<SignalFrame>());
+            assert!(fp_addr + FXSAVE_SIZE <= sp - 128);
+        }
+    }
+
+    // --- MXCSR validation tests ---
+
+    #[test]
+    fn mxcsr_default_is_valid() {
+        assert!(validate_mxcsr(0x1F80, 0));
+        assert!(validate_mxcsr(0x1F80, 0xFFFF));
+    }
+
+    #[test]
+    fn mxcsr_zero_is_valid() {
+        // All exceptions unmasked — unusual but architecturally valid.
+        assert!(validate_mxcsr(0x0000, 0));
+        assert!(validate_mxcsr(0x0000, 0xFFFF));
+    }
+
+    #[test]
+    fn mxcsr_reserved_bits_rejected() {
+        // Bit 16 is reserved.
+        assert!(!validate_mxcsr(0x0001_0000, 0));
+        // Bit 31 is reserved.
+        assert!(!validate_mxcsr(0x8000_0000, 0));
+        // All reserved bits set.
+        assert!(!validate_mxcsr(0xFFFF_0000, 0));
+    }
+
+    #[test]
+    fn mxcsr_host_mask_rejects_unsupported_bits() {
+        // Host mask says only bits 0-12 are valid (typical SSE-only CPU).
+        let host_mask = 0x0000_FFBF;
+        // Bit 6 (DAZ) is not in the mask — should fail.
+        assert!(!validate_mxcsr(0x0040, host_mask));
+        // Default 0x1F80 should pass (bits 7-12 = exception masks).
+        assert!(validate_mxcsr(0x1F80, host_mask));
+    }
+
+    #[test]
+    fn mxcsr_host_mask_zero_allows_all_low_bits() {
+        // host_mask=0 means CPU didn't report a mask, allow all valid bits.
+        assert!(validate_mxcsr(0xFFFF, 0));
+    }
+
+    #[test]
+    fn mxcsr_combined_reserved_and_host_mask() {
+        // Bit 16 is reserved AND unsupported — reserved check fires first.
+        assert!(!validate_mxcsr(0x0001_0040, 0xFFBF));
+    }
+
+    // --- GPR restore round-trip tests ---
+
+    #[test]
+    fn restore_sigcontext_restores_gprs() {
+        let sigctx = Sigcontext {
+            r8: 0x0808,
+            r9: 0x0909,
+            r10: 0x1010,
+            r11: 0x1111,
+            r12: 0x1212,
+            r13: 0x1313,
+            r14: 0x1414,
+            r15: 0x1515,
+            rdi: 0xD1,
+            rsi: 0x51,
+            rbp: 0xB9,
+            rbx: 0xBB,
+            rdx: 0xDD,
+            rax: 0xAA,
+            rcx: 0xCC,
+            rsp: 0x5959,
+            rip: 0x1919,
+            rflags: 0x0202,
+            cs: 0x33,
+            gs: 0,
+            fs: 0,
+            ss: 0x2B,
+            err: 0,
+            trapno: 0,
+            oldmask: 0,
+            cr2: 0,
+            fpstate: 0, // no FP state pointer → skip FP restore
+            reserved1: [0; 8],
+        };
+
+        let mut ctx = PtRegs::default();
+        let result = restore_sigcontext(&mut ctx, &sigctx);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0xAA); // rax
+        assert_eq!(ctx.r8, 0x0808);
+        assert_eq!(ctx.r15, 0x1515);
+        assert_eq!(ctx.rdi, 0xD1);
+        assert_eq!(ctx.rsp, 0x5959);
+        assert_eq!(ctx.rip, 0x1919);
+        assert_eq!(ctx.eflags, 0x0202);
+    }
+
+    #[test]
+    fn restore_sigcontext_with_zero_fpstate_succeeds() {
+        // fpstate=0 means no FP state in the signal frame (legacy).
+        // restore_sigcontext should succeed without touching TLS.
+        let sigctx = Sigcontext {
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            rdi: 0,
+            rsi: 0,
+            rbp: 0,
+            rbx: 0,
+            rdx: 0,
+            rax: 42,
+            rcx: 0,
+            rsp: 0x1000,
+            rip: 0x2000,
+            rflags: 0,
+            cs: 0x33,
+            gs: 0,
+            fs: 0,
+            ss: 0x2B,
+            err: 0,
+            trapno: 0,
+            oldmask: 0,
+            cr2: 0,
+            fpstate: 0,
+            reserved1: [0; 8],
+        };
+
+        let mut ctx = PtRegs::default();
+        assert_eq!(restore_sigcontext(&mut ctx, &sigctx), Ok(42));
+    }
 }
