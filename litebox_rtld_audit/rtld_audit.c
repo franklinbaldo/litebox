@@ -346,19 +346,17 @@ unsigned int la_version(unsigned int version __attribute__((unused))) {
   return LAV_CURRENT;
 }
 
-/// print value in hex
+/// print value in hex (always enabled — used for critical diagnostics)
 void print_hex(uint64_t data) {
-#ifdef DEBUG
   for (int i = 15; i >= 0; i--) {
     unsigned char byte = (data >> (i * 4)) & 0xF;
     if (byte < 10) {
-      syscall_print((&"0123456789"[byte]), 1);
+      do_syscall(SYS_write, 2, (long)(&"0123456789"[byte]), 1, 0, 0, 0);
     } else {
-      syscall_print((&"abcdef"[byte - 10]), 1);
+      do_syscall(SYS_write, 2, (long)(&"abcdef"[byte - 10]), 1, 0, 0, 0);
     }
   }
-  syscall_print("\n", 1);
-#endif
+  do_syscall(SYS_write, 2, (long)"\n", 1, 0, 0, 0);
 }
 
 /// @brief Parse object to find the syscall entry point and the interpreter
@@ -483,10 +481,16 @@ unsigned int la_objopen(struct link_map *map,
     return 0; // ld.so is patched by libOS
   }
 
-  // Other shared libraries
-  syscall_print("[audit] la_objopen: path=", 25);
-  syscall_print(path, 32);
-  syscall_print("\n", 1);
+  // Other shared libraries — always log the path for diagnostics
+  do_syscall(SYS_write, 2, (long)"[audit] la_objopen: path=", 25, 0, 0, 0);
+  // Print path character by character until null terminator (up to 256 chars)
+  {
+    const char *p = path;
+    int len = 0;
+    while (p[len] && len < 256) len++;
+    do_syscall(SYS_write, 2, (long)path, len, 0, 0, 0);
+  }
+  do_syscall(SYS_write, 2, (long)"\n", 1, 0, 0, 0);
 
   if (!syscall_entry) {
     return 0;
@@ -494,7 +498,14 @@ unsigned int la_objopen(struct link_map *map,
 
   int fd = do_syscall(SYS_openat, AT_FDCWD, (long)path, 0, 0, 0, 0);
   if (fd < 0) {
-    syscall_print("[audit] failed to open file\n", 28);
+    do_syscall(SYS_write, 2, (long)"[audit] failed to open file: ", 29, 0, 0, 0);
+    {
+      const char *p = path;
+      int len = 0;
+      while (p[len] && len < 256) len++;
+      do_syscall(SYS_write, 2, (long)path, len, 0, 0, 0);
+    }
+    do_syscall(SYS_write, 2, (long)"\n", 1, 0, 0, 0);
     return 0;
   }
 
@@ -556,7 +567,7 @@ unsigned int la_objopen(struct link_map *map,
   uint64_t tramp_size_raw = header->trampoline_size;
 
   do_syscall(SYS_munmap, (long)header_page, 0x1000, 0, 0, 0, 0);
-  syscall_print("[audit] found trampoline header at end of file\n", 47);
+  do_syscall(SYS_write, 2, (long)"[audit] found trampoline header at end of file\n", 47, 0, 0, 0);
 
   // Validate trampoline size
   if (tramp_size_raw == 0) {
@@ -596,17 +607,19 @@ unsigned int la_objopen(struct link_map *map,
     return 0;
   }
 
-  syscall_print("[audit] tramp base=", 19);
+  // Always log trampoline mapping details (not gated by DEBUG) so we can
+  // diagnose runtime crashes where gates branch to zeroed memory.
+  do_syscall(SYS_write, 2, (long)"[audit] tramp base=", 19, 0, 0, 0);
   print_hex(map->l_addr);
-  syscall_print("[audit] tramp vaddr=", 20);
+  do_syscall(SYS_write, 2, (long)"[audit] tramp vaddr=", 20, 0, 0, 0);
   print_hex(tramp_vaddr);
-  syscall_print("[audit] tramp_addr=", 19);
+  do_syscall(SYS_write, 2, (long)"[audit] tramp_addr=", 19, 0, 0, 0);
   print_hex(tramp_addr);
-  syscall_print("[audit] tramp_size_raw=", 23);
+  do_syscall(SYS_write, 2, (long)"[audit] tramp_size_raw=", 23, 0, 0, 0);
   print_hex(tramp_size_raw);
-  syscall_print("[audit] tramp_size_aligned=", 27);
+  do_syscall(SYS_write, 2, (long)"[audit] tramp_size_aligned=", 27, 0, 0, 0);
   print_hex(tramp_size);
-  syscall_print("[audit] file_offset=", 20);
+  do_syscall(SYS_write, 2, (long)"[audit] file_offset=", 20, 0, 0, 0);
   print_hex(tramp_file_offset);
 
   // Map the trampoline at the expected address using MAP_FIXED.
@@ -622,7 +635,7 @@ unsigned int la_objopen(struct link_map *map,
     do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
     return 0;
   }
-  syscall_print("[audit] mmap OK at ", 19);
+  do_syscall(SYS_write, 2, (long)"[audit] mmap OK at ", 19, 0, 0, 0);
   print_hex((uint64_t)(uintptr_t)mapped);
 
   // Seek to the trampoline data in the file and read it into the mapping.
@@ -647,8 +660,24 @@ unsigned int la_objopen(struct link_map *map,
     }
     total_read += n;
   }
-  syscall_print("[audit] read OK, total_read=", 28);
+  do_syscall(SYS_write, 2, (long)"[audit] read OK, total_read=", 28, 0, 0, 0);
   print_hex(total_read);
+
+  // Verify trampoline data integrity: check first instruction at shared handler
+  // start (offset 16 = after callback_ptr(8) + tls_table_ptr(8)).
+  // Real trampoline code has non-zero instructions here. If all zero, the read
+  // didn't actually write data (or wrote zeros).
+  {
+    uint64_t verify_word16 = read_u64((const char *)mapped + 16);
+    uint64_t verify_word24 = read_u64((const char *)mapped + 24);
+    do_syscall(SYS_write, 2, (long)"[audit] verify [+16]=", 21, 0, 0, 0);
+    print_hex(verify_word16);
+    do_syscall(SYS_write, 2, (long)"[audit] verify [+24]=", 21, 0, 0, 0);
+    print_hex(verify_word24);
+    if (verify_word16 == 0 && verify_word24 == 0) {
+      do_syscall(SYS_write, 2, (long)"[audit] WARNING: trampoline data appears to be all zeros!\n", 58, 0, 0, 0);
+    }
+  }
 
   // Write the syscall entry point at the start of the trampoline code
   __builtin_memcpy((char *)mapped, (const void *)&syscall_entry, 8);
@@ -660,9 +689,38 @@ unsigned int la_objopen(struct link_map *map,
     __builtin_memcpy((char *)mapped + 8, (const void *)&tls_table_ptr, 8);
   }
 #endif
-  do_syscall(SYS_mprotect, (long)mapped, tramp_size, PROT_READ | PROT_EXEC, 0,
+  long mprot_ret = do_syscall(SYS_mprotect, (long)mapped, tramp_size, PROT_READ | PROT_EXEC, 0,
              0, 0);
+  if (mprot_ret < 0) {
+    // CRITICAL: If mprotect fails, pages remain RW (not executable).
+    // Any branch into the trampoline will fault with EXC_BAD_ACCESS code=2.
+    // Always print this error, even in release builds.
+    do_syscall(SYS_write, 2, (long)"[audit] FATAL: mprotect RX failed, ret=", 40, 0, 0, 0);
+    print_hex((uint64_t)(long)mprot_ret);
+    do_syscall(SYS_write, 2, (long)"[audit]   mapped=", 17, 0, 0, 0);
+    print_hex((uint64_t)(uintptr_t)mapped);
+    do_syscall(SYS_write, 2, (long)"[audit]   tramp_size=", 21, 0, 0, 0);
+    print_hex(tramp_size);
+    // Don't return 0 silently — unmap and fail.
+    do_syscall(SYS_munmap, (long)mapped, tramp_size, 0, 0, 0, 0);
+    do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
+    return 0;
+  }
   syscall_print("[audit] trampoline patched and protected\n", 41);
+  do_syscall(SYS_write, 2, (long)"[audit] mprotect RX OK\n", 23, 0, 0, 0);
+
+  // Post-mprotect verification: read back the callback pointer to confirm
+  // the data survived the RW→RX transition (and wasn't replaced by the shim's
+  // page manager with fresh zero pages).
+  {
+    uint64_t readback_cb = read_u64((const char *)mapped);
+    if (readback_cb != (uint64_t)(uintptr_t)syscall_entry) {
+      do_syscall(SYS_write, 2, (long)"[audit] FATAL: post-mprotect callback mismatch! got=", 52, 0, 0, 0);
+      print_hex(readback_cb);
+      do_syscall(SYS_write, 2, (long)"[audit]   expected=", 19, 0, 0, 0);
+      print_hex((uint64_t)(uintptr_t)syscall_entry);
+    }
+  }
 
   do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
   return 0;
