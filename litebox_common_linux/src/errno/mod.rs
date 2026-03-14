@@ -343,10 +343,10 @@ impl From<litebox::fs::errors::FileStatusError> for Errno {
     }
 }
 
-impl From<litebox::net::errors::SocketError> for Errno {
-    fn from(value: litebox::net::errors::SocketError) -> Self {
+impl From<litebox::net::errors::CreateError> for Errno {
+    fn from(value: litebox::net::errors::CreateError) -> Self {
         match value {
-            litebox::net::errors::SocketError::UnsupportedProtocol(_) => Errno::EPROTONOSUPPORT,
+            litebox::net::errors::CreateError::UnsupportedProtocol(_) => Errno::EPROTONOSUPPORT,
             _ => unimplemented!(),
         }
     }
@@ -381,9 +381,21 @@ impl From<litebox::net::errors::ConnectError> for Errno {
             litebox::net::errors::ConnectError::InvalidFd => Errno::EBADF,
             litebox::net::errors::ConnectError::UnsupportedAddress(_) => Errno::EAFNOSUPPORT,
             litebox::net::errors::ConnectError::PortAllocationFailure(_) => Errno::EADDRINUSE,
-            litebox::net::errors::ConnectError::Unaddressable => Errno::EADDRNOTAVAIL,
+            litebox::net::errors::ConnectError::Unaddressable => Errno::ECONNREFUSED,
             litebox::net::errors::ConnectError::InProgress => Errno::EINPROGRESS,
             litebox::net::errors::ConnectError::InvalidState => Errno::ECONNREFUSED,
+            litebox::net::errors::ConnectError::TimedOut => Errno::ETIMEDOUT,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::net::errors::SocketAsyncError> for Errno {
+    fn from(value: litebox::net::errors::SocketAsyncError) -> Self {
+        match value {
+            litebox::net::errors::SocketAsyncError::ConnectionRefused => Errno::ECONNREFUSED,
+            litebox::net::errors::SocketAsyncError::ConnectionReset => Errno::ECONNRESET,
+            litebox::net::errors::SocketAsyncError::TimedOut => Errno::ETIMEDOUT,
             _ => unimplemented!(),
         }
     }
