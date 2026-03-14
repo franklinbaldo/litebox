@@ -521,3 +521,69 @@ Task 3 --+-- Tasks 4-7 (atomic) --+-- Tasks 8-9 --+-- Tasks 14-16
 | `litebox_platform_macos_userland/src/lib.rs` | macOS platform: TCB, signals, TLS |
 | `litebox_syscall_rewriter/Cargo.toml` | Add yaxpeax-arm dependency |
 | `litebox_common_linux/src/loader.rs` | ELF loader, TLS table allocation |
+
+## Implementation Status
+
+All 6 phases are **complete and committed** on `sanghle/macos_2`. Beyond the original
+plan, numerous runtime bugs were discovered and fixed during macOS integration testing.
+
+### Completed (34 commits)
+
+| Commit | Description |
+|--------|-------------|
+| `ef857eb8` | Design document (this file) |
+| `59e79dfd` | Phase 1: yaxpeax-arm dep, TCB guest_x18 field, PatchKind::X18Use |
+| `78702694` | Phase 2: macOS TPIDRRO_EL0-keyed SVC/MSR shared handlers |
+| `d128ff5c` | Phase 3: Shared MRS handler for macOS |
+| `5ebca66d` | Phase 4: Full x18 virtualization in rewriter |
+| `22ffab4f` | Phase 5: macOS platform integration |
+| `97377d38` | Fix: `syscall_callback` frame size 32→48 |
+| `fa79b561` | Fix: Save/restore NZCV condition flags in macOS gates |
+| `fdfef697` | Fix: `adjust_sp_relative_offset()` for 48-byte gate frame |
+| `ccf69a53` | Fix: SP-restore strategy for offset overflow |
+| `8f9abb75` | Fix: Per-sub-page edge page tracking (ported from old litebox) |
+| `0d974a91` | Fix: NZCV restore moved before guest instruction in all gate paths |
+| `3aef8f36` | Fix: rtld_audit platform-adaptive dual-path `do_syscall` |
+| `cac170a1` | Fix: Signal-delivery x18 race in `syscall_callback` |
+| `2766f639` | Fix: TLS table write race — AtomicU64 CAS for slot claiming |
+| `b38bba72` | Fix: `switch_to_guest` x18 preemption race |
+| `d82c8bb8` | Fix: SVC shared handler preemption — use x16 instead of x18 |
+| `2885f023` | Fix: Remove all 7 host-side TPIDR_EL0 writes |
+| `756bc33f` | Fix: `switch_to_guest` guest SP via x1 instead of x18 |
+| `abd300ec` | Fix: rtld_audit macOS x18 race in TLS lookup |
+| `69578730` | Fix: brk ENOMEM — remove bypass in `insert_mapping` |
+| `34c4f6ad` | Fix: Clippy warnings |
+| `29787b4e` | Fix: Remaining clippy warnings |
+| `8f438dd5` | Fix: brk ENOMEM — `evict_reserved_from_brk_zone()` |
+| `06b8898a` | Diag: rtld_audit mprotect integrity check |
+| `b3413bf1` | Fix: icache invalidation in rtld_audit |
+| `114beb26` | Fix: EACCES from mprotect on codesigned host pages |
+| `4b948427` | Fix: mmap ENOMEM fallback — bottom-up gap search |
+| `21abdcff` | Fix: diagnostic log borrow issue |
+| `091f8ef0` | Fix: hint=0 retry in insert_mapping (later superseded) |
+| `2f56688f` | Fix: mach_vm_allocate 3-level fallback in macOS allocate_pages |
+| `47ab6fc6` | Diag: `mm_diag!` macro + macOS-only tracing |
+| `9a2a9f93` | Fix: brk-zone retry uses Hint instead of NoReplace (root cause) |
+| `1a56f702` | Fix: clippy pedantic warnings |
+
+### Key Discoveries
+
+1. **XNU zeros x18** on ALL kernel→userspace transitions (preemptive context switches,
+   not just signals). No signal involved. x18 must NEVER be used as a temp register.
+2. **XNU overwrites TPIDR_EL0** with a per-CPU value on every return to userspace.
+   TPIDR_EL0 must never be written on host-side code paths (libsystem_malloc uses it).
+3. **NZCV condition flags** are clobbered by shared handler CMP/CMN instructions. Must
+   be restored BEFORE the rewritten guest instruction, not in the epilogue.
+4. **macOS ignores mmap hints** aggressively — CONFIG_MAP_RANGES forces anonymous mmaps
+   into a randomly-placed 1 TB heap range. The brk-zone retry must use Hint behavior
+   (not MAP_FIXED) because the VMA tree doesn't track invisible host mappings.
+5. **TPIDRRO_EL0** is stable per-pthread, read-only, unique, and never clobbered —
+   the correct key for per-thread TLS table lookup on macOS.
+
+### Current State
+
+- **rtld_audit.so now loads successfully** — the mmap ENOMEM root cause (brk-zone
+  retry using NoReplace on invisible host mappings) is fixed.
+- All 116 rewriter unit tests pass on Linux.
+- Clippy clean (zero warnings).
+- macOS platform crate compiles on Linux (`cargo check` passes).
