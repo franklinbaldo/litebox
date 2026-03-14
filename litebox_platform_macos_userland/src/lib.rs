@@ -495,7 +495,8 @@ fn is_edge_page(addr: usize) -> bool {
 ///
 /// Tries `mprotect` first to preserve existing content from adjacent
 /// sub-pages. If that fails with ENOMEM (page was unmapped by a prior
-/// `deallocate_pages` that rounded inward), falls back to `mmap MAP_FIXED`
+/// `deallocate_pages` that rounded inward) or EACCES (page has restricted
+/// `max_protection` from codesigning), falls back to `mmap MAP_FIXED`
 /// to recreate the page as fresh anonymous memory.
 fn ensure_edge_page(page_addr: usize, prot: libc::c_int) {
     debug_assert_eq!(page_addr % HOST_PAGE_SIZE, 0);
@@ -505,11 +506,17 @@ fn ensure_edge_page(page_addr: usize, prot: libc::c_int) {
         return; // mprotect succeeded — page existed, content preserved
     }
 
-    // mprotect failed — page was unmapped. Recreate with mmap MAP_FIXED.
+    // mprotect failed — page was unmapped or has restricted max_protection.
+    // ENOMEM: page was unmapped by a prior `deallocate_pages` that rounded inward.
+    // EACCES: page belongs to a codesigned Mach-O mapping (e.g., host binary
+    //   __DATA segment) whose max_protection doesn't allow the requested change.
+    //   This happens when the guest's brk heap grows into the host binary's
+    //   address range — `evict_reserved_from_brk_zone` removes the VMA tracker
+    //   entries but cannot unmap host-owned pages. mmap MAP_FIXED below will
+    //   forcibly replace the mapping with fresh anonymous memory.
     let errno = std::io::Error::last_os_error();
-    assert_eq!(
-        errno.raw_os_error(),
-        Some(libc::ENOMEM),
+    assert!(
+        errno.raw_os_error() == Some(libc::ENOMEM) || errno.raw_os_error() == Some(libc::EACCES),
         "mprotect edge page {page_addr:#x} failed with unexpected error: {errno}"
     );
     let r = unsafe {
