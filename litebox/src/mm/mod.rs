@@ -341,29 +341,29 @@ where
                     if gap_start >= gap_end {
                         continue;
                     }
-                    match vmem.platform.allocate_pages(
-                        gap_start..gap_end,
-                        MemoryRegionPermissions::empty(), // PROT_NONE
-                        false,                            // can_grow_down
-                        false,                            // populate_pages_immediately
-                        crate::platform::page_mgmt::FixedAddressBehavior::NoReplace,
-                    ) {
-                        Ok(_) => {
-                            // Track the reserved gap in the VMA tree.
-                            if let Some(pr) = linux::PageRange::new(gap_start, gap_end) {
-                                vmem.register_existing_mapping_overwrite(
-                                    pr,
-                                    linux::VmArea::new(linux::VmFlags::empty(), false),
-                                );
-                            }
-                            any_reserved = true;
+                    if vmem
+                        .platform
+                        .allocate_pages(
+                            gap_start..gap_end,
+                            MemoryRegionPermissions::empty(), // PROT_NONE
+                            false,                            // can_grow_down
+                            false,                            // populate_pages_immediately
+                            crate::platform::page_mgmt::FixedAddressBehavior::NoReplace,
+                        )
+                        .is_ok()
+                    {
+                        // Track the reserved gap in the VMA tree.
+                        if let Some(pr) = linux::PageRange::new(gap_start, gap_end) {
+                            vmem.register_existing_mapping_overwrite(
+                                pr,
+                                linux::VmArea::new(linux::VmFlags::empty(), false),
+                            );
                         }
-                        Err(_) => {
-                            // Gap reservation failed (host may have placed
-                            // something there between enumeration and mmap).
-                            // Continue with remaining gaps.
-                        }
+                        any_reserved = true;
                     }
+                    // If allocation failed, the host may have placed something
+                    // there between enumeration and mmap.  Continue with
+                    // remaining gaps.
                 }
                 vmem.brk_hard_reserved = any_reserved;
             }
