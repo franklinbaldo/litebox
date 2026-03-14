@@ -2693,6 +2693,13 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         self.init_thread_context(ctx);
+
+        // Reinitialize guest FP/SIMD state so the new process starts with a
+        // clean FP state (MXCSR=0x1F80, zeroed XMM) rather than inheriting
+        // the previous program's state.
+        #[cfg(all(target_arch = "x86_64", feature = "platform_linux_userland"))]
+        crate::syscalls::signal::reinit_guest_fp_state();
+
         if let Some(vd) = vfork_done.take() {
             vd.signal();
         }

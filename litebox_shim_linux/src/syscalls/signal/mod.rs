@@ -8,6 +8,13 @@ pub(crate) mod x86;
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 
+/// Reinitializes the guest FP/SIMD state in TLS for a fresh process image.
+/// Call after `execve` resets registers but before re-entering the guest.
+#[cfg(all(target_arch = "x86_64", feature = "platform_linux_userland"))]
+pub(crate) fn reinit_guest_fp_state() {
+    x86_64::reinit_guest_fp_state();
+}
+
 use litebox_common_linux::signal::SignalDisposition;
 #[cfg(target_arch = "x86")]
 use x86 as arch;
@@ -52,19 +59,6 @@ pub(crate) struct SignalState {
     /// pending signals. Used by `epoll_pwait` / `ppoll` to atomically
     /// unblock signals during the wait and re-block them afterwards.
     restore_mask: Cell<Option<SigSet>>,
-    /// Best-effort x86_64 FXSAVE snapshot captured just before a guest signal
-    /// handler runs, so `rt_sigreturn` can compare whether FP/SSE state
-    /// changed across the handler.
-    #[cfg(target_arch = "x86_64")]
-    debug_fp_state: RefCell<Option<DebugFpState>>,
-}
-
-#[cfg(target_arch = "x86_64")]
-struct DebugFpState {
-    signal: Signal,
-    delivered_pre_rip: usize,
-    delivered_pre_rsp: usize,
-    snapshot: arch::FpStateSnapshot,
 }
 
 impl SignalState {
@@ -88,8 +82,6 @@ impl SignalState {
                 kernel_mode: false,
             }),
             restore_mask: Cell::new(None),
-            #[cfg(target_arch = "x86_64")]
-            debug_fp_state: RefCell::new(None),
         }
     }
 
@@ -135,8 +127,6 @@ impl SignalState {
             // Preserve last exception
             last_exception: self.last_exception.clone(),
             restore_mask: Cell::new(None),
-            #[cfg(target_arch = "x86_64")]
-            debug_fp_state: RefCell::new(None),
         }
     }
 
@@ -163,8 +153,6 @@ impl SignalState {
             .into(),
             last_exception: self.last_exception.clone(),
             restore_mask: Cell::new(None),
-            #[cfg(target_arch = "x86_64")]
-            debug_fp_state: RefCell::new(None),
         }
     }
 
@@ -189,32 +177,6 @@ impl SignalState {
             };
         }
         self.clear_sigaltstack();
-        #[cfg(target_arch = "x86_64")]
-        self.debug_fp_state.borrow_mut().take();
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    fn capture_debug_fp_before_delivery(
-        &self,
-        signal: Signal,
-        delivered_pre_rip: usize,
-        delivered_pre_rsp: usize,
-    ) {
-        if signal != Signal::SIGCHLD {
-            return;
-        }
-
-        self.debug_fp_state.replace(Some(DebugFpState {
-            signal,
-            delivered_pre_rip,
-            delivered_pre_rsp,
-            snapshot: arch::capture_fp_state(),
-        }));
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    fn take_debug_fp_state(&self) -> Option<DebugFpState> {
-        self.debug_fp_state.borrow_mut().take()
     }
 }
 
@@ -484,11 +446,6 @@ impl SignalState {
             return Err(DeliverFault);
         }
 
-        #[cfg(target_arch = "x86_64")]
-        let delivered_pre_rip = ctx.rip;
-        #[cfg(target_arch = "x86_64")]
-        let delivered_pre_rsp = ctx.rsp;
-
         if self
             .write_signal_frame(frame_addr, siginfo, action, ctx)
             .is_err()
@@ -513,9 +470,6 @@ impl SignalState {
             );
             return Err(DeliverFault);
         }
-
-        #[cfg(target_arch = "x86_64")]
-        self.capture_debug_fp_before_delivery(signal, delivered_pre_rip, delivered_pre_rsp);
 
         let mut mask = self.blocked.get() | action.mask;
         if !action.flags.contains(SaFlags::NODEFER) {
@@ -605,37 +559,6 @@ impl<FS: ShimFS> Task<FS> {
             self.force_signal(Signal::SIGSEGV, false);
             return Err(Errno::EFAULT);
         };
-
-        #[cfg(target_arch = "x86_64")]
-        if let Some(debug_fp) = self.signals.take_debug_fp_state() {
-            let current_fp = arch::capture_fp_state();
-            let before_hash = arch::fpstate_hash(&debug_fp.snapshot);
-            let after_hash = arch::fpstate_hash(&current_fp);
-            let before_mxcsr = arch::fpstate_mxcsr(&debug_fp.snapshot);
-            let after_mxcsr = arch::fpstate_mxcsr(&current_fp);
-            let (changed_bytes, first_diffs, first_diff_count) =
-                arch::fpstate_diff_summary(&debug_fp.snapshot, &current_fp);
-            litebox::log_println!(
-                self.global.platform,
-                "[RT-SIGRETURN-FPSTATE] pid={} tid={} comm={:?} signal={:?} uctx={:#x} frame_fpstate={:#x} delivered_pre_rip={:#x} delivered_pre_rsp={:#x} restore_rip={:#x} restore_rsp={:#x} before_hash={:#x} after_hash={:#x} before_mxcsr={:#x} after_mxcsr={:#x} changed_bytes={} first_diffs={:?}",
-                self.pid,
-                self.tid,
-                self.task_comm_preview(),
-                debug_fp.signal,
-                uctx_addr,
-                uctx.mcontext.fpstate,
-                debug_fp.delivered_pre_rip,
-                debug_fp.delivered_pre_rsp,
-                uctx.mcontext.rip,
-                uctx.mcontext.rsp,
-                before_hash,
-                after_hash,
-                before_mxcsr,
-                after_mxcsr,
-                changed_bytes,
-                &first_diffs[..first_diff_count],
-            );
-        }
 
         litebox::log_println!(
             self.global.platform,

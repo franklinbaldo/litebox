@@ -836,6 +836,12 @@ wait_waker_addr:
 .globl guest_fp_state
 guest_fp_state:
     .zero 512
+    .align 4
+.globl host_mxcsr_mask
+host_mxcsr_mask:
+    .long 0
+
+    // NOTE: switching from .tbss to .tdata for initialized constants.
     .section .tdata
     .align 4
 .globl default_mxcsr
@@ -912,8 +918,12 @@ unsafe extern "C-unwind" fn run_thread_arch(
 
     // Initialize guest_fp_state with current (host) FP state so the first
     // fxrstor64 in switch_to_guest gets a sane MXCSR (0x1F80) rather than
-    // the all-zero default from .tbss.
+    // the all-zero default from .tbss. Also capture the CPU's mxcsr_mask
+    // (offset 28 in the FXSAVE area) for trusted MXCSR validation in
+    // restore_sigcontext.
     fxsave64 [r8 + guest_fp_state@tpoff]
+    mov      r9d, DWORD PTR [r8 + guest_fp_state@tpoff + 28]
+    mov      DWORD PTR [r8 + host_mxcsr_mask@tpoff], r9d
 
     // Call init_handler or reenter_handler based on reenter flag (in dl).
     test dl, dl

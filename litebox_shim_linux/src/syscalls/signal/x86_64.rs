@@ -29,69 +29,12 @@ struct SignalFrame {
     siginfo: Siginfo,
 }
 
-/// Best-effort snapshot of the live x87/SSE state via `fxsave64`.
-///
-/// This is for debugging signal-corruption hypotheses on x86_64. It captures
-/// the architectural FXSAVE area (512 bytes), which includes x87 state,
-/// MXCSR, and XMM registers, but not AVX upper halves.
-#[repr(C, align(16))]
-pub(super) struct FpStateSnapshot {
-    bytes: [u8; 512],
-}
-
-impl Default for FpStateSnapshot {
-    fn default() -> Self {
-        Self { bytes: [0; 512] }
-    }
-}
-
-pub(super) fn capture_fp_state() -> FpStateSnapshot {
-    let mut snapshot = FpStateSnapshot::default();
-    // SAFETY: `snapshot` is 16-byte aligned and points to writable memory of
-    // the required FXSAVE size.
-    unsafe {
-        core::arch::asm!(
-            "fxsave64 [{ptr}]",
-            ptr = in(reg) snapshot.bytes.as_mut_ptr(),
-            options(preserves_flags),
-        );
-    }
-    snapshot
-}
-
-pub(super) fn fpstate_hash(snapshot: &FpStateSnapshot) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for &byte in &snapshot.bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x1000_0000_01b3);
-    }
-    hash
-}
-
-pub(super) fn fpstate_mxcsr(snapshot: &FpStateSnapshot) -> u32 {
-    u32::from_le_bytes(snapshot.bytes[24..28].try_into().unwrap())
-}
-
-pub(super) fn fpstate_diff_summary(
-    before: &FpStateSnapshot,
-    after: &FpStateSnapshot,
-) -> (usize, [usize; 8], usize) {
-    let mut changed_bytes = 0;
-    let mut first_diffs = [0usize; 8];
-    let mut first_diff_count = 0;
-
-    for (idx, (&lhs, &rhs)) in before.bytes.iter().zip(after.bytes.iter()).enumerate() {
-        if lhs == rhs {
-            continue;
-        }
-        changed_bytes += 1;
-        if first_diff_count < first_diffs.len() {
-            first_diffs[first_diff_count] = idx;
-            first_diff_count += 1;
-        }
-    }
-
-    (changed_bytes, first_diffs, first_diff_count)
+/// 512-byte FP state buffer matching the FXSAVE layout, used for writing
+/// FP state to/from guest signal frames.
+#[repr(C, align(64))]
+#[derive(Clone, FromBytes, IntoBytes)]
+struct FpStateBuf {
+    bytes: [u8; FXSAVE_SIZE],
 }
 
 /// Returns a pointer to the `guest_fp_state` TLS variable defined in the
@@ -138,6 +81,43 @@ fn write_guest_fp_state(buf: &[u8; FXSAVE_SIZE]) {
     unsafe {
         core::ptr::copy_nonoverlapping(buf.as_ptr(), ptr, FXSAVE_SIZE);
     }
+}
+
+/// Reinitializes `guest_fp_state` in TLS by capturing the current (host) FP
+/// state. Call this after `execve` so the new process starts with a clean FP
+/// state (MXCSR=0x1F80) rather than the previous program's state.
+#[cfg(feature = "platform_linux_userland")]
+pub(crate) fn reinit_guest_fp_state() {
+    let ptr = guest_fp_state_ptr();
+    // SAFETY: `ptr` points to a valid 512-byte, 64-byte-aligned TLS area.
+    // The current host FP state has a sane MXCSR (0x1F80) from the Rust runtime.
+    unsafe {
+        core::arch::asm!(
+            "fxsave64 [{ptr}]",
+            ptr = in(reg) ptr,
+            options(preserves_flags),
+        );
+    }
+}
+
+/// Reads the `host_mxcsr_mask` TLS variable captured at thread startup from
+/// the CPU's FXSAVE output. Returns the CPU's actual MXCSR feature mask.
+/// If the CPU doesn't report a mask (older CPUs), returns 0.
+#[cfg(feature = "platform_linux_userland")]
+fn read_host_mxcsr_mask() -> u32 {
+    let mask: u32;
+    // SAFETY: `host_mxcsr_mask` is a u32 TLS variable populated at thread
+    // startup in `run_thread_arch`.
+    unsafe {
+        core::arch::asm!(
+            "rdfsbase {tmp}",
+            "mov {out:e}, DWORD PTR [{tmp} + host_mxcsr_mask@tpoff]",
+            tmp = out(reg) _,
+            out = out(reg) mask,
+            options(nostack, preserves_flags, readonly),
+        );
+    }
+    mask
 }
 
 pub(super) fn uctx_addr(ctx: &PtRegs) -> usize {
@@ -193,13 +173,15 @@ impl SignalState {
         let fpstate_guest_addr = {
             const SW_RESERVED_OFFSET: usize = 464;
             let addr = fpstate_addr_from_frame(frame_addr);
-            let mut fp = read_guest_fp_state();
+            let mut fp = FpStateBuf {
+                bytes: read_guest_fp_state(),
+            };
             // Zero sw_reserved (bytes 464-511). FXSAVE doesn't write these
             // bytes; they may contain stale data. magic1=0 tells the guest
             // this is legacy FXSAVE with no XSAVE extended state.
-            fp[SW_RESERVED_OFFSET..].fill(0);
-            let fp_ptr = MutPtr::<u8>::from_usize(addr);
-            fp_ptr.write_slice_at_offset(0, &fp).ok_or(DeliverFault)?;
+            fp.bytes[SW_RESERVED_OFFSET..].fill(0);
+            let fp_ptr = MutPtr::<FpStateBuf>::from_usize(addr);
+            fp_ptr.write_at_offset(0, fp).ok_or(DeliverFault)?;
             addr as u64
         };
         #[cfg(not(feature = "platform_linux_userland"))]
@@ -328,15 +310,19 @@ pub(super) fn restore_sigcontext(
         let mut fp: [u8; FXSAVE_SIZE] = [0; FXSAVE_SIZE];
         fp.copy_from_slice(&fp_bytes);
 
-        // Validate MXCSR from guest-controlled signal frame to prevent
-        // fxrstor #GP fault. Reserved bits (16-31) must be clear.
+        // Validate MXCSR from guest-controlled signal frame against the
+        // trusted host CPU mask to prevent fxrstor #GP fault.
         let mxcsr = u32::from_le_bytes(fp[24..28].try_into().unwrap());
+
+        // Reserved bits (16-31) must always be clear.
         if mxcsr & !MXCSR_VALID_MASK != 0 {
             return Err(());
         }
-        // Apply mxcsr_mask if non-zero (bits the CPU doesn't support must be 0).
-        let mxcsr_mask = u32::from_le_bytes(fp[28..32].try_into().unwrap());
-        if mxcsr_mask != 0 && mxcsr & !mxcsr_mask != 0 {
+        // Validate against the host CPU's actual feature mask (captured at
+        // thread startup), NOT the guest-provided mxcsr_mask in the frame.
+        // A malicious frame could set mxcsr_mask to bypass validation.
+        let host_mask = read_host_mxcsr_mask();
+        if host_mask != 0 && mxcsr & !host_mask != 0 {
             return Err(());
         }
 
