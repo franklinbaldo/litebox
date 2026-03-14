@@ -71,8 +71,9 @@ typedef long (*syscall_stub_t)(void);
 static syscall_stub_t syscall_entry = 0;
 #ifdef __aarch64__
 // TLS lookup table pointer from the trampoline (offset 8).
-// Used by do_syscall to look up the host TLS base before calling the callback,
-// since the callback (syscall_callback) expects x18 = host TLS.
+// Used by do_syscall to look up the host TLS base before calling the callback.
+// On Linux, syscall_callback expects x18 = host TLS.
+// On macOS, host_tls is passed via [SP+40] (x18 is unreliable on macOS).
 static uint64_t tls_table_ptr = 0;
 #endif
 static char interp[256] = {0}; // Buffer for interpreter path
@@ -116,8 +117,7 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5,
   register long x4 __asm__("x4") = a5;
   register long x5 __asm__("x5") = a6;
 
-  // The syscall_callback (syscall_entry) expects x18 = host TLS base.
-  // The trampoline snippets normally do a TLS table lookup to set x18,
+  // The trampoline snippets normally do a TLS table lookup to find host_tls,
   // but do_syscall jumps directly to the callback. We must replicate
   // the trampoline's TLS lookup here.
   //
@@ -160,9 +160,11 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5,
   //   4. Set x30 = return address, BR to callback
   uint64_t tls_table = tls_table_ptr;
   __asm__ volatile(
-    // Read TPIDRRO_EL0 to detect platform
-    "mrs  x18, tpidrro_el0\n"       // x18 = TPIDRRO_EL0
-    "cbnz x18, 10f\n"               // non-zero → macOS path
+    // Read TPIDRRO_EL0 to detect platform.
+    // We use x16 (not x18) because XNU zeros x18 on every
+    // kernel→userspace transition (preemptive context switches).
+    "mrs  x16, tpidrro_el0\n"       // x16 = TPIDRRO_EL0
+    "cbnz x16, 10f\n"               // non-zero → macOS path
 
     // ---- Linux path: 32-byte frame, TPIDR_EL0 keyed ----
     "sub  sp, sp, #32\n"
@@ -197,19 +199,24 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5,
     "br   x16\n"                     // jump to syscall_callback
 
     // ---- macOS path: 48-byte frame, TPIDRRO_EL0 keyed ----
+    // x18 is NOT used anywhere in this path — XNU may zero it at any time.
     "10:\n"                          // .Lmacos
     "sub  sp, sp, #48\n"
     "str  x16, [sp, #0]\n"
     "str  x17, [sp, #8]\n"
     "str  x30, [sp, #16]\n"
-    // x18 already = TPIDRRO_EL0 (read above)
+    // Store TPIDRRO_EL0 at [SP+32] (guest_x18 slot) so the loop can
+    // reload it without re-reading the system register each iteration.
+    // x16 still holds TPIDRRO_EL0 from the mrs above.
+    "str  x16, [sp, #32]\n"         // stash TPIDRRO_EL0 for loop
     "mov  x17, %[tls_table]\n"      // x17 = TLS table base
     "cbz  x17, 12f\n"               // skip lookup if NULL
     "11:\n"                          // .Lloop_macos
     "ldr  x16, [x17, #0]\n"         // x16 = entry.tpidrro_el0
     "cmn  x16, #1\n"                // sentinel?
     "b.eq 16f\n"                     // -> trap (TPIDRRO is stable, no fallback needed)
-    "cmp  x16, x18\n"               // match TPIDRRO_EL0?
+    "ldr  x30, [sp, #32]\n"         // x30 = our TPIDRRO_EL0 (stashed)
+    "cmp  x16, x30\n"               // match TPIDRRO_EL0?
     "b.eq 13f\n"                     // -> found
     "add  x17, x17, #16\n"          // next entry
     "b    11b\n"                     // -> loop
@@ -219,7 +226,7 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5,
     "str  x16, [sp, #24]\n"         // frame.guest_tpidr = TCB.guest_tpidr
     "str  x17, [sp, #40]\n"         // frame.host_tls for syscall_callback
     "12:\n"                          // .Ldone_macos
-    "adr  x30, 4f\n"                // x30 = return address
+    "adr  x30, 4f\n"                // x30 = return address (overwrites borrowed x30)
     "mov  x16, %[entry]\n"
     "br   x16\n"                     // jump to syscall_callback
     "16:\n"                          // .Ltrap_macos
