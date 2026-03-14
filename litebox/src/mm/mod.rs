@@ -310,49 +310,72 @@ where
         // top-down hint-based allocator does not place anonymous mmaps there.
         let brk_aligned = brk.next_multiple_of(linux::PAGE_SIZE);
         vmem.brk_reserved_end = brk_aligned + Self::BRK_RESERVE_SIZE;
+
+        // On macOS, hard-reserve the free gaps within the brk zone with the
+        // kernel via mmap(PROT_NONE, NoReplace).  This prevents the macOS
+        // kernel from placing future mappings inside the brk zone gaps.
+        //
+        // We must enumerate gaps BEFORE evicting host reservation VMAs,
+        // because those VMAs tell us where the host mappings are (and thus
+        // which regions are genuinely free).
+        //
+        // We do NOT use MAP_FIXED (Replace) because the brk zone may overlap
+        // live host mappings (dyld, system libraries, allocator regions).
+        // Clobbering them would hang or crash the process.
+        #[cfg(target_os = "macos")]
+        {
+            let brk_start = brk_aligned;
+            let brk_end = vmem.brk_reserved_end;
+            if brk_start < brk_end {
+                // Collect gaps (free regions) in the VMA tree within the brk zone.
+                // These are the regions not covered by host reservation VMAs.
+                let gaps: alloc::vec::Vec<core::ops::Range<usize>> =
+                    vmem.gaps_in_range(brk_start..brk_end);
+
+                let mut any_reserved = false;
+                for gap in gaps {
+                    // Align gap to page boundaries (should already be aligned,
+                    // but be defensive).
+                    let gap_start = gap.start.next_multiple_of(linux::PAGE_SIZE);
+                    let gap_end = gap.end & !(linux::PAGE_SIZE - 1);
+                    if gap_start >= gap_end {
+                        continue;
+                    }
+                    match vmem.platform.allocate_pages(
+                        gap_start..gap_end,
+                        MemoryRegionPermissions::empty(), // PROT_NONE
+                        false,                            // can_grow_down
+                        false,                            // populate_pages_immediately
+                        crate::platform::page_mgmt::FixedAddressBehavior::NoReplace,
+                    ) {
+                        Ok(_) => {
+                            // Track the reserved gap in the VMA tree.
+                            if let Some(pr) =
+                                linux::PageRange::new(gap_start, gap_end)
+                            {
+                                vmem.register_existing_mapping_overwrite(
+                                    pr,
+                                    linux::VmArea::new(linux::VmFlags::empty(), false),
+                                );
+                            }
+                            any_reserved = true;
+                        }
+                        Err(_) => {
+                            // Gap reservation failed (host may have placed
+                            // something there between enumeration and mmap).
+                            // Continue with remaining gaps.
+                        }
+                    }
+                }
+                vmem.brk_hard_reserved = any_reserved;
+            }
+        }
+
         // Evict any pre-existing host reservation VMAs (from reserved_pages)
         // that overlap the brk zone.  These were inserted at Vmem::new() time
         // before the brk address was known and would cause brk() to fail with
         // ENOMEM when it finds them via overlapping().
         vmem.evict_reserved_from_brk_zone();
-
-        // On macOS, hard-reserve the entire brk zone with the kernel via
-        // mmap(PROT_NONE, MAP_FIXED).  This prevents the macOS kernel from
-        // placing other mappings inside the brk zone (which it aggressively
-        // does since it ignores mmap hints).  The reservation costs no
-        // physical memory (PROT_NONE pages are never faulted in).  brk growth
-        // later promotes slices of this reservation to RW via mprotect.
-        #[cfg(target_os = "macos")]
-        {
-            let reserve_range = brk_aligned..vmem.brk_reserved_end;
-            if reserve_range.start < reserve_range.end {
-                match vmem.platform.allocate_pages(
-                    reserve_range.clone(),
-                    MemoryRegionPermissions::empty(), // PROT_NONE
-                    false,                            // can_grow_down
-                    false,                            // populate_pages_immediately
-                    crate::platform::page_mgmt::FixedAddressBehavior::Replace,
-                ) {
-                    Ok(_) => {
-                        // Insert a VMA entry so the VMA tree tracks the reservation.
-                        // Use VmFlags::empty() (= PROT_NONE, no access).
-                        vmem.register_existing_mapping_overwrite(
-                            linux::PageRange::new(reserve_range.start, reserve_range.end)
-                                .expect("brk reserve range must be page-aligned"),
-                            linux::VmArea::new(linux::VmFlags::empty(), false),
-                        );
-                        vmem.brk_hard_reserved = true;
-                    }
-                    Err(_e) => {
-                        // If the hard reservation fails, fall back to the soft
-                        // reservation (VMA-tree-only).  brk growth will still
-                        // use the create_pages path as on Linux.  This is not
-                        // fatal — the brk-zone retry in insert_mapping provides
-                        // a safety net.
-                    }
-                }
-            }
-        }
     }
 
     /// Find a free region of at least `size` bytes at or above `min_addr`.
@@ -405,26 +428,36 @@ where
             // demotes them back to PROT_NONE.  No mmap/munmap needed.
 
             if vmem.brk >= brk {
-                // Shrink: demote [new_brk..old_brk) back to PROT_NONE.
+                // Shrink: try to demote [new_brk..old_brk) back to PROT_NONE.
+                // If update_permissions fails (region may span a non-reserved
+                // host mapping), fall back to remove_mapping (munmap).
                 if new_brk < old_brk {
                     let range = new_brk..old_brk;
-                    match unsafe {
+                    let demoted = unsafe {
                         vmem.platform
                             .update_permissions(range.clone(), MemoryRegionPermissions::empty())
-                    } {
-                        Ok(()) => {
-                            // Update the VMA entry: replace the shrunk region with
-                            // PROT_NONE (it's still part of the hard reservation).
-                            if let Some(pr) = linux::PageRange::<ALIGN>::new(range.start, range.end)
-                            {
-                                vmem.register_existing_mapping_overwrite(
-                                    pr,
-                                    linux::VmArea::new(linux::VmFlags::empty(), false),
-                                );
-                            }
+                            .is_ok()
+                    };
+                    if demoted {
+                        // Update the VMA entry: mark as PROT_NONE (still reserved).
+                        if let Some(pr) = linux::PageRange::<ALIGN>::new(range.start, range.end) {
+                            vmem.register_existing_mapping_overwrite(
+                                pr,
+                                linux::VmArea::new(linux::VmFlags::empty(), false),
+                            );
                         }
-                        Err(_) => {
-                            return Ok(vmem.brk); // No change
+                    } else {
+                        // Fallback: munmap the region.
+                        match unsafe {
+                            vmem.remove_mapping(
+                                PageRange::new(new_brk, old_brk)
+                                    .ok_or(MappingError::UnAligned)?,
+                            )
+                        } {
+                            Ok(()) => {}
+                            Err(_) => {
+                                return Ok(vmem.brk); // No change
+                            }
                         }
                     }
                 }
@@ -433,6 +466,9 @@ where
             }
 
             // Grow: check hard cap, then promote [old_brk..new_brk) to RW.
+            // Try update_permissions first (for gap-reserved PROT_NONE pages).
+            // If it fails (the slice may span a host mapping that wasn't part
+            // of the gap-fill reservation), fall back to create_pages(MAP_FIXED).
             if new_brk > vmem.brk_reserved_end {
                 return Err(MappingError::MapError(
                     crate::platform::page_mgmt::AllocationError::OutOfMemory,
@@ -442,21 +478,35 @@ where
             if old_brk < new_brk {
                 let range = old_brk..new_brk;
                 let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
-                unsafe {
+                let promoted = unsafe {
                     vmem.platform
                         .update_permissions(range.clone(), perms)
-                        .map_err(|_| {
-                            MappingError::MapError(
-                                crate::platform::page_mgmt::AllocationError::OutOfMemory,
+                        .is_ok()
+                };
+                if promoted {
+                    // update_permissions succeeded — pages were part of our
+                    // gap-fill reservation.  Update VMA to RW.
+                    if let Some(pr) = linux::PageRange::<ALIGN>::new(range.start, range.end) {
+                        vmem.register_existing_mapping_overwrite(
+                            pr,
+                            linux::VmArea::new(linux::VmFlags::from(perms), false),
+                        );
+                    }
+                } else {
+                    // update_permissions failed — fall back to create_pages
+                    // (mmap MAP_FIXED) which can overwrite host mappings.
+                    if let Some(pr) = PageRange::<ALIGN>::new(old_brk, new_brk) {
+                        let (suggested_address, length) = pr.start_and_length();
+                        unsafe {
+                            vmem.create_pages(
+                                Some(suggested_address),
+                                length,
+                                CreatePagesFlags::FIXED_ADDR
+                                    | CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
+                                perms,
                             )
-                        })?;
-                }
-                // Update VMA: mark the promoted region as RW.
-                if let Some(pr) = linux::PageRange::<ALIGN>::new(range.start, range.end) {
-                    vmem.register_existing_mapping_overwrite(
-                        pr,
-                        linux::VmArea::new(linux::VmFlags::from(perms), false),
-                    );
+                        }?;
+                    }
                 }
             }
             vmem.brk = brk;

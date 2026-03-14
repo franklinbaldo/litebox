@@ -459,6 +459,17 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         }
     }
 
+    /// Collect the free gaps within `range` that are not covered by any VMA.
+    ///
+    /// Returns a `Vec` of non-overlapping, non-empty ranges that together
+    /// represent the unoccupied portions of `range`.  Used by the macOS
+    /// brk hard-reservation to find regions safe to `mmap(PROT_NONE)` without
+    /// clobbering live host mappings.
+    #[cfg(target_os = "macos")]
+    pub(super) fn gaps_in_range(&self, range: Range<usize>) -> Vec<Range<usize>> {
+        self.vmas.gaps(&range).collect()
+    }
+
     /// Gets an iterator over all the stored ranges that are
     /// either partially or completely overlapped by the given range.
     pub(super) fn overlapping(
