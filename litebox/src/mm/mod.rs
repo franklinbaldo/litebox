@@ -363,7 +363,28 @@ where
         }
 
         if vmem.overlapping(old_brk..new_brk).next().is_some() {
-            return Err(MappingError::OutOfMemory);
+            // Diagnostic: dump the overlapping VMAs to help debug brk failures.
+            let mut msg = alloc::string::String::from("[diag] brk ENOMEM: overlapping VMAs:\n");
+            for (range, vma) in vmem.overlapping(old_brk..new_brk) {
+                use core::fmt::Write;
+                let _ = writeln!(
+                    msg,
+                    "  VMA {:#x}..{:#x} flags={:?} file_backed={}",
+                    range.start,
+                    range.end,
+                    vma.flags(),
+                    vma.is_file_backed()
+                );
+            }
+            {
+                use core::fmt::Write;
+                let _ = write!(
+                    msg,
+                    "  old_brk={:#x} new_brk={:#x} vmem.brk={:#x} brk_reserved_end={:#x}",
+                    old_brk, new_brk, vmem.brk, vmem.brk_reserved_end
+                );
+            }
+            panic!("{msg}");
         }
         if let Some(range) = PageRange::<ALIGN>::new(old_brk, new_brk) {
             let (suggested_address, length) = range.start_and_length();

@@ -552,15 +552,15 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // chose.  If the returned address falls inside the brk reservation, future
         // brk() calls will fail with ENOMEM.  Detect this and retry with MAP_FIXED
         // at an address that is known-free in the VMA tree and outside the brk zone.
-        if matches!(fixed_address_behavior, FixedAddressBehavior::Hint)
-            && new_start != suggested_range.start
-            && self.brk_reserved_end > 0
+        if matches!(fixed_address_behavior, FixedAddressBehavior::Hint) && self.brk_reserved_end > 0
         {
             let brk_start = self.brk.next_multiple_of(ALIGN);
             let new_end_tentative = new_start + suggested_range.len();
             if new_start < self.brk_reserved_end && new_end_tentative > brk_start {
                 // The platform placed the mapping inside the brk reservation.
-                // Deallocate it and retry at a safe address.
+                // Deallocate it and retry at a safe address, even if the host
+                // returned the exact hint we asked for: the chosen hint itself
+                // may already be inside the reserved brk-growth window.
                 let bad_range = new_start..new_end_tentative;
                 unsafe {
                     // Ignore AlreadyUnallocated — platform may not have fully
