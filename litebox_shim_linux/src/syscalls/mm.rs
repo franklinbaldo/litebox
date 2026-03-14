@@ -314,12 +314,10 @@ impl<FS: ShimFS> Task<FS> {
             }
             litebox::log_println!(
                 self.global.platform,
-                "[mmap ENOMEM diag] addr={:#x} len={:#x} aligned_len={:#x} prot={:?} flags={:?}",
+                "[mmap ENOMEM diag] addr={:#x} len={:#x} aligned_len={:#x}",
                 addr,
                 len,
-                aligned_len,
-                prot,
-                flags
+                aligned_len
             );
             litebox::log_println!(
                 self.global.platform,
