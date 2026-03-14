@@ -942,6 +942,181 @@ fn rewrite_x18(insn: u32) -> (u32, u8, bool, bool) {
     (result, scratch, is_read, is_write)
 }
 
+/// Adjust the immediate offset of an SP-relative instruction to compensate for the
+/// x18 gate's stack frame.
+///
+/// When the x18 gate pushes its frame (`SUB SP, SP, #frame_size`), any guest instruction
+/// that uses SP-relative addressing will access the wrong memory location because SP has
+/// shifted. This function adds `frame_size` to the instruction's immediate offset to
+/// compensate.
+///
+/// Returns `Some(adjusted_insn)` if adjustment was needed and successful,
+/// `None` if the instruction is not SP-relative or the adjusted offset doesn't fit.
+///
+/// Supported formats:
+/// - STP/LDP signed offset (imm7, scaled by access size)
+/// - STR/LDR unsigned offset (imm12, scaled by access size)
+/// - STUR/LDUR unscaled offset (imm9, signed)
+#[cfg(any(target_os = "macos", test))]
+fn adjust_sp_relative_offset(insn: u32, frame_size: u16) -> Option<u32> {
+    // Check if Rn (bits 9:5) is SP (register 31)
+    let rn = (insn >> 5) & 0x1F;
+    if rn != 31 {
+        return None; // Not SP-relative, no adjustment needed
+    }
+
+    // Decode to identify instruction format
+    use yaxpeax_arch::Decoder;
+    use yaxpeax_arm::armv8::a64::{InstDecoder, Opcode};
+
+    let decoder = InstDecoder::default();
+    let word = insn.to_le_bytes();
+    let mut reader = yaxpeax_arch::U8Reader::new(&word);
+    let inst = match decoder.decode(&mut reader) {
+        Ok(inst) => inst,
+        Err(_) => return None,
+    };
+
+    match inst.opcode {
+        // STP/LDP/STNP/LDNP with signed offset: imm7 at bits 21:15, scaled by access size
+        Opcode::STP | Opcode::LDP | Opcode::STNP | Opcode::LDNP => {
+            // Determine scale from the opc field (bits 31:30)
+            // opc=00 → 32-bit (scale 4), opc=10 → 64-bit (scale 8), opc=01 → SIMD varies
+            let opc = (insn >> 30) & 0x3;
+            let scale: i16 = match opc {
+                0b00 => 4,        // 32-bit (W registers)
+                0b10 => 8,        // 64-bit (X registers)
+                _ => return None, // SIMD/FP or other — bail
+            };
+
+            // Check this is the signed-offset variant (not pre-index or post-index)
+            // Bits 25:23 encode the addressing mode for load/store pair:
+            //   010 = signed offset, 011 = pre-index, 001 = post-index
+            let addr_mode = (insn >> 23) & 0x7;
+            if addr_mode != 0b010 {
+                // Pre-index or post-index — these modify SP, can't just adjust offset
+                return None;
+            }
+
+            // Extract signed imm7 (bits 21:15)
+            let imm7_raw = ((insn >> 15) & 0x7F) as i16;
+            let imm7_signed = if imm7_raw >= 64 {
+                imm7_raw - 128
+            } else {
+                imm7_raw
+            };
+            let current_offset = imm7_signed * scale;
+            let new_offset = current_offset + frame_size as i16;
+            let new_imm7 = new_offset / scale;
+
+            // Validate: new offset must be aligned and fit in imm7 range [-64, 63]
+            if new_offset % scale != 0 || !(-64..=63).contains(&new_imm7) {
+                return None;
+            }
+
+            #[allow(clippy::cast_sign_loss)]
+            let new_imm7_u = (new_imm7 as u32) & 0x7F;
+            let adjusted = (insn & !(0x7F << 15)) | (new_imm7_u << 15);
+            Some(adjusted)
+        }
+
+        // STR/LDR with unsigned offset: imm12 at bits 21:10, scaled by access size
+        Opcode::STR | Opcode::LDR => {
+            // Determine scale from size field (bits 31:30)
+            let size = (insn >> 30) & 0x3;
+            let scale: u16 = 1 << size; // 0→1, 1→2, 2→4, 3→8
+
+            // Check this is the unsigned offset variant (bits 29:24 = 0b111001 for STR
+            // or 0b111001 for LDR, with bit 24=0 for unsigned offset form)
+            // The key distinguisher: bits 29:21 pattern. For unsigned offset:
+            // STR: 1x_111_0_01_00 (bits 31:22), LDR: 1x_111_0_01_01
+            // For unscaled (STUR/LDUR): 1x_111_0_00_0x
+            // Check bit 24 (part of the opc/type field): 1 = unsigned offset, 0 = other
+            let is_unsigned_offset = ((insn >> 24) & 0x1) == 1;
+            if !is_unsigned_offset {
+                // This is STUR/LDUR (unscaled) or other variant — handle separately
+                return None;
+            }
+
+            // Extract unsigned imm12 (bits 21:10)
+            let imm12 = ((insn >> 10) & 0xFFF) as u16;
+            let current_offset = imm12 * scale;
+            let new_offset = current_offset + frame_size;
+            let new_imm12 = new_offset / scale;
+
+            // Validate: new offset must be aligned and fit in 12 bits
+            if new_offset % scale != 0 || new_imm12 >= (1 << 12) {
+                return None;
+            }
+
+            let adjusted = (insn & !(0xFFF << 10)) | ((new_imm12 as u32) << 10);
+            Some(adjusted)
+        }
+
+        // STUR/LDUR with unscaled signed offset: imm9 at bits 20:12
+        Opcode::STUR
+        | Opcode::LDUR
+        | Opcode::STURB
+        | Opcode::LDURB
+        | Opcode::STURH
+        | Opcode::LDURH => {
+            let imm9_raw = ((insn >> 12) & 0x1FF) as i16;
+            let imm9_signed = if imm9_raw >= 256 {
+                imm9_raw - 512
+            } else {
+                imm9_raw
+            };
+            let new_offset = imm9_signed + frame_size as i16;
+
+            // Validate: fits in signed 9-bit range [-256, 255]
+            if !(-256..=255).contains(&new_offset) {
+                return None;
+            }
+
+            #[allow(clippy::cast_sign_loss)]
+            let new_imm9_u = (new_offset as u32) & 0x1FF;
+            let adjusted = (insn & !(0x1FF << 12)) | (new_imm9_u << 12);
+            Some(adjusted)
+        }
+
+        // STRB/LDRB/STRH/LDRH unsigned offset — same pattern as STR/LDR but different scale
+        Opcode::STRB | Opcode::LDRB => {
+            let is_unsigned_offset = ((insn >> 24) & 0x1) == 1;
+            if !is_unsigned_offset {
+                return None;
+            }
+            // Scale = 1 byte
+            let imm12 = ((insn >> 10) & 0xFFF) as u16;
+            let new_offset = imm12 + frame_size;
+            if new_offset >= (1 << 12) {
+                return None;
+            }
+            let adjusted = (insn & !(0xFFF << 10)) | ((new_offset as u32) << 10);
+            Some(adjusted)
+        }
+
+        Opcode::STRH | Opcode::LDRH => {
+            let is_unsigned_offset = ((insn >> 24) & 0x1) == 1;
+            if !is_unsigned_offset {
+                return None;
+            }
+            // Scale = 2 bytes
+            let imm12 = ((insn >> 10) & 0xFFF) as u16;
+            let current_offset = imm12 * 2;
+            let new_offset = current_offset + frame_size;
+            let new_imm12 = new_offset / 2;
+            if new_offset % 2 != 0 || new_imm12 >= (1 << 12) {
+                return None;
+            }
+            let adjusted = (insn & !(0xFFF << 10)) | ((new_imm12 as u32) << 10);
+            Some(adjusted)
+        }
+
+        // Any other instruction with SP as base that we don't know how to adjust
+        _ => None,
+    }
+}
+
 /// Compute the gate size for an x18-referencing instruction.
 #[cfg(any(target_os = "macos", test))]
 fn x18_gate_size(is_read: bool, is_write: bool) -> usize {
@@ -2903,6 +3078,72 @@ fn emit_x18_gate(
     let gate_insn_count = gate_size / 4;
     let mut insn_idx: usize = 0;
     let insn_vaddr = |idx: usize| -> u64 { gate_vaddr + (idx as u64) * 4 };
+
+    // Adjust SP-relative offset: the gate pushes a 48-byte frame, so any instruction
+    // that uses SP as a base register for memory access needs its immediate offset
+    // increased by 48 to access the original (caller's) stack location.
+    // `adjust_sp_relative_offset` returns `None` for non-memory instructions (ADD, SUB,
+    // CMP, etc.) even if they have Rn=SP, since it only matches load/store opcodes.
+    let rn = (rewritten >> 5) & 0x1F;
+    let rewritten = if rn == 31 {
+        match adjust_sp_relative_offset(rewritten, 48) {
+            Some(adjusted) => adjusted,
+            None => {
+                // Check if this is actually a load/store that we failed to adjust.
+                // Non-memory instructions (ADD, CMP, MOV, etc.) with Rn=SP are fine
+                // without adjustment — they compute addresses, not access memory.
+                // We use the opcode check to distinguish.
+                use yaxpeax_arch::Decoder;
+                use yaxpeax_arm::armv8::a64::{InstDecoder, Opcode};
+                let decoder = InstDecoder::default();
+                let word = rewritten.to_le_bytes();
+                let mut reader = yaxpeax_arch::U8Reader::new(&word);
+                let is_memory_op = decoder.decode(&mut reader).map_or(false, |inst| {
+                    matches!(
+                        inst.opcode,
+                        Opcode::STP
+                            | Opcode::LDP
+                            | Opcode::STNP
+                            | Opcode::LDNP
+                            | Opcode::STR
+                            | Opcode::LDR
+                            | Opcode::STUR
+                            | Opcode::LDUR
+                            | Opcode::STRB
+                            | Opcode::LDRB
+                            | Opcode::STURB
+                            | Opcode::LDURB
+                            | Opcode::STRH
+                            | Opcode::LDRH
+                            | Opcode::STURH
+                            | Opcode::LDURH
+                            | Opcode::STLR
+                            | Opcode::STLRB
+                            | Opcode::STLRH
+                            | Opcode::LDAR
+                            | Opcode::LDARB
+                            | Opcode::LDARH
+                            | Opcode::STXR
+                            | Opcode::STXRB
+                            | Opcode::STXRH
+                            | Opcode::LDXR
+                            | Opcode::LDXRB
+                            | Opcode::LDXRH
+                    )
+                });
+                if is_memory_op {
+                    return Err(Error::DisassemblyFailure(format!(
+                        "cannot adjust SP-relative offset by +48 for x18 gate at {:#x} \
+                         (insn {:#010x}): memory instruction format not supported",
+                        site.vaddr, rewritten
+                    )));
+                }
+                rewritten
+            }
+        }
+    } else {
+        rewritten
+    };
 
     // [0] SUB SP, SP, #48
     trampoline_data.extend_from_slice(&encode_sub_sp_imm(48).expect("imm12=48 fits").to_le_bytes());
@@ -5558,5 +5799,157 @@ mod tests {
         assert_eq!(SHARED_X18_SAVE_HANDLER_SIZE, 64);
         assert_eq!(SHARED_X18_LOAD_HANDLER_INSN_COUNT, 16);
         assert_eq!(SHARED_X18_SAVE_HANDLER_INSN_COUNT, 16);
+    }
+
+    // ============================================================
+    // Tests for adjust_sp_relative_offset
+    // ============================================================
+
+    #[test]
+    fn test_adjust_sp_offset_stp_x4_x18_sp_0xb8() {
+        // STP X4, X18, [SP, #0xb8] — the exact instruction from ld.so's do_lookup_x
+        // After x18→x17 rewrite, encode properly:
+        // STP X4, X17, [SP, #0xb8]: imm7 = 0xb8/8 = 23 = 0x17
+        // 0xA900_0000 | (0x17 << 15) | (17 << 10) | (31 << 5) | 4
+        let insn = 0xA900_0000 | (23u32 << 15) | (17u32 << 10) | (31u32 << 5) | 4;
+        let adjusted = adjust_sp_relative_offset(insn, 48).unwrap();
+        // New offset should be 0xb8 + 48 = 0xe8, imm7 = 0xe8/8 = 29 = 0x1D
+        let new_imm7 = (adjusted >> 15) & 0x7F;
+        assert_eq!(
+            new_imm7, 29,
+            "imm7 should be 29 (0xe8/8) after +48 adjustment"
+        );
+        // Other fields unchanged
+        assert_eq!(adjusted & 0x1F, 4, "Rt should still be 4");
+        assert_eq!((adjusted >> 5) & 0x1F, 31, "Rn should still be SP");
+        assert_eq!((adjusted >> 10) & 0x1F, 17, "Rt2 should still be 17");
+    }
+
+    #[test]
+    fn test_adjust_sp_offset_ldp_x4_x18_sp_0xb8() {
+        // LDP X4, X17, [SP, #0xb8] (after x18→x17 rewrite)
+        let insn = 0xA940_0000 | (23u32 << 15) | (17u32 << 10) | (31u32 << 5) | 4;
+        let adjusted = adjust_sp_relative_offset(insn, 48).unwrap();
+        let new_imm7 = (adjusted >> 15) & 0x7F;
+        assert_eq!(new_imm7, 29, "imm7 should be 29 after +48 adjustment");
+    }
+
+    #[test]
+    fn test_adjust_sp_offset_stp_sp_0xd0() {
+        // STP X4, X17, [SP, #0xd0]: imm7 = 0xd0/8 = 26
+        let insn = 0xA900_0000 | (26u32 << 15) | (17u32 << 10) | (31u32 << 5) | 4;
+        let adjusted = adjust_sp_relative_offset(insn, 48).unwrap();
+        // New offset = 0xd0 + 48 = 0x100, imm7 = 0x100/8 = 32
+        let new_imm7 = (adjusted >> 15) & 0x7F;
+        assert_eq!(
+            new_imm7, 32,
+            "imm7 should be 32 (0x100/8) after +48 adjustment"
+        );
+    }
+
+    #[test]
+    fn test_adjust_sp_offset_str_x18_sp_0xc8() {
+        // STR X17, [SP, #0xc8] (after x18→x17 rewrite)
+        // Encoding: 0xF900_0000 | (imm12 << 10) | (Rn << 5) | Rt
+        // imm12 = 0xc8/8 = 25
+        let insn = 0xF900_0000 | (25u32 << 10) | (31u32 << 5) | 17;
+        let adjusted = adjust_sp_relative_offset(insn, 48).unwrap();
+        // New offset = 0xc8 + 48 = 0xf8, imm12 = 0xf8/8 = 31
+        let new_imm12 = (adjusted >> 10) & 0xFFF;
+        assert_eq!(
+            new_imm12, 31,
+            "imm12 should be 31 (0xf8/8) after +48 adjustment"
+        );
+    }
+
+    #[test]
+    fn test_adjust_sp_offset_ldr_x18_sp_0xc8() {
+        // LDR X17, [SP, #0xc8] (after x18→x17 rewrite)
+        // imm12 = 0xc8/8 = 25
+        let insn = 0xF940_0000 | (25u32 << 10) | (31u32 << 5) | 17;
+        let adjusted = adjust_sp_relative_offset(insn, 48).unwrap();
+        let new_imm12 = (adjusted >> 10) & 0xFFF;
+        assert_eq!(new_imm12, 31, "imm12 should be 31 (0xf8/8)");
+    }
+
+    #[test]
+    fn test_adjust_sp_offset_stp_sp_0x70() {
+        // STP X17, X18→X16, [SP, #0x70]: imm7 = 0x70/8 = 14
+        let insn = 0xA900_0000 | (14u32 << 15) | (16u32 << 10) | (31u32 << 5) | 17;
+        let adjusted = adjust_sp_relative_offset(insn, 48).unwrap();
+        // New offset = 0x70 + 48 = 0xa0, imm7 = 0xa0/8 = 20
+        let new_imm7 = (adjusted >> 15) & 0x7F;
+        assert_eq!(
+            new_imm7, 20,
+            "imm7 should be 20 (0xa0/8) after +48 adjustment"
+        );
+    }
+
+    #[test]
+    fn test_adjust_sp_offset_not_sp_returns_none() {
+        // LDR X17, [X0, #8] — base is X0, not SP
+        let insn = 0xF940_0000 | (1u32 << 10) | (0u32 << 5) | 17;
+        assert!(
+            adjust_sp_relative_offset(insn, 48).is_none(),
+            "non-SP-relative should return None"
+        );
+    }
+
+    #[test]
+    fn test_adjust_sp_offset_add_sp_returns_none() {
+        // ADD X17, SP, #8 — SP is base but this is not a memory access
+        let insn: u32 = 0x910023F1; // ADD X17, SP, #8
+        assert!(
+            adjust_sp_relative_offset(insn, 48).is_none(),
+            "ADD with SP should return None (not a memory op)"
+        );
+    }
+
+    #[test]
+    fn test_adjust_sp_offset_stp_offset_overflow() {
+        // STP X4, X17, [SP, #0x1F0]: imm7 = 0x1F0/8 = 62
+        // After +48: 0x1F0 + 48 = 0x220, imm7 = 0x220/8 = 68 > 63 (max imm7)
+        let insn = 0xA900_0000 | (62u32 << 15) | (17u32 << 10) | (31u32 << 5) | 4;
+        assert!(
+            adjust_sp_relative_offset(insn, 48).is_none(),
+            "adjusted STP offset overflowing imm7 should return None"
+        );
+    }
+
+    #[test]
+    fn test_adjust_sp_offset_stp_zero_offset() {
+        // STP X4, X17, [SP, #0]: imm7 = 0
+        let insn = 0xA900_0000 | (0u32 << 15) | (17u32 << 10) | (31u32 << 5) | 4;
+        let adjusted = adjust_sp_relative_offset(insn, 48).unwrap();
+        // New offset = 0 + 48, imm7 = 48/8 = 6
+        let new_imm7 = (adjusted >> 15) & 0x7F;
+        assert_eq!(new_imm7, 6, "imm7 should be 6 (48/8)");
+    }
+
+    #[test]
+    fn test_adjust_sp_offset_roundtrip_all_ld_so_patterns() {
+        // Test all SP-relative x18 instruction patterns from ld-linux-aarch64.so.1
+        // Format: (original_offset, instruction_type, expected_new_offset)
+        let frame_size: u16 = 48;
+
+        // STP X4, X17, [SP, #0xb8] — offset 0xb8=184, new 0xe8=232
+        let stp_b8 = 0xA900_0000 | (23u32 << 15) | (17u32 << 10) | (31u32 << 5) | 4;
+        assert!(adjust_sp_relative_offset(stp_b8, frame_size).is_some());
+
+        // STP X4, X17, [SP, #0xd0] — offset 0xd0=208, new 0x100=256
+        let stp_d0 = 0xA900_0000 | (26u32 << 15) | (17u32 << 10) | (31u32 << 5) | 4;
+        assert!(adjust_sp_relative_offset(stp_d0, frame_size).is_some());
+
+        // STR X17, [SP, #0xc8] — offset 0xc8=200, new 0xf8=248
+        let str_c8 = 0xF900_0000 | (25u32 << 10) | (31u32 << 5) | 17;
+        assert!(adjust_sp_relative_offset(str_c8, frame_size).is_some());
+
+        // LDR X17, [SP, #0xc8] — offset 0xc8=200, new 0xf8=248
+        let ldr_c8 = 0xF940_0000 | (25u32 << 10) | (31u32 << 5) | 17;
+        assert!(adjust_sp_relative_offset(ldr_c8, frame_size).is_some());
+
+        // STP X17, X16, [SP, #0x70] — offset 0x70=112, new 0xa0=160
+        let stp_70 = 0xA900_0000 | (14u32 << 15) | (16u32 << 10) | (31u32 << 5) | 17;
+        assert!(adjust_sp_relative_offset(stp_70, frame_size).is_some());
     }
 }
