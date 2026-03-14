@@ -1234,6 +1234,29 @@ pub unsafe fn write_tpidr_el0(val: usize) {
     }
 }
 
+/// Read the TPIDRRO_EL0 register (read-only thread pointer, set by kernel).
+///
+/// On macOS, this is set to the pthread TSD base. It is stable per-thread,
+/// read-only to userspace, and never clobbered — making it a reliable key
+/// for TLS table lookups.
+///
+/// ## Safety
+///
+/// The caller must ensure that reading this register is appropriate for
+/// the current context.
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn read_tpidrro_el0() -> usize {
+    let ret: usize;
+    unsafe {
+        core::arch::asm!(
+            "mrs {}, tpidrro_el0",
+            out(reg) ret,
+            options(nostack, nomem, preserves_flags)
+        );
+    }
+    ret
+}
+
 /// Global address of the ARM64 TLS lookup table.
 /// Set by the loader when mapping the trampoline. Read by the platform
 /// to register per-thread host TLS entries before entering guest code.
@@ -3538,6 +3561,10 @@ impl<T: FromBytes, P: RawConstPointer<T>>
     ReinterpretUsizeAsPtr<core::marker::PhantomData<(bool, T)>> for Option<P>
 {
     fn reinterpret_usize_as_ptr(v: usize) -> Self {
-        if v == 0 { None } else { Some(P::from_usize(v)) }
+        if v == 0 {
+            None
+        } else {
+            Some(P::from_usize(v))
+        }
     }
 }
