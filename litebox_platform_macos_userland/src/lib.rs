@@ -938,29 +938,35 @@ unsafe extern "C-unwind" fn run_thread_arch(
     .globl _syscall_callback
 _syscall_callback:
     .cfi_startproc
-    // Clear in_guest flag. Must be first instruction to match the
-    // expectations of interrupt_signal_handler.
-    strb wzr, [x18, #32]
+    // Save TCB pointer (x18) to stack slot [SP+40] immediately.
+    // macOS zeroes x18 on signal delivery, so we must not rely on x18
+    // surviving across instructions. All subsequent TCB accesses reload
+    // from this stack slot instead.
+    str x18, [sp, #40]
+
+    // Clear in_guest flag. Use x17 as scratch loaded from the stack-saved
+    // TCB, NOT x18 directly, because a signal between the STR above and
+    // this instruction would zero x18.
+    ldr x17, [sp, #40]           // x17 = TCB (reload from stack)
+    strb wzr, [x17, #32]         // TCB.in_guest = 0
 
     // Save guest TPIDR (from trampoline stack slot) to guest_tpidr TLS var.
-    // This ensures switch_to_guest restores the correct TPIDR, even if
-    // the guest changed it via MSR TPIDR_EL0.
-    ldr x17, [sp, #24]
-    str x17, [x18, #24]
+    // Reload TCB from stack since x18 may have been clobbered by a signal
+    // between any two instructions.
+    ldr x17, [sp, #40]           // x17 = TCB (reload from stack)
+    ldr x16, [sp, #24]           // x16 = guest_tpidr from trampoline
+    str x16, [x17, #24]          // TCB.guest_tpidr = guest_tpidr
 
-    // Restore host TPIDR_EL0.
-    msr tpidr_el0, x18
+    // Restore host TPIDR_EL0 from TCB.
+    msr tpidr_el0, x17
 
     // Load guest_context_top and compute PtRegs base address.
-    // We'll build PtRegs ending at guest_context_top, starting at
-    // guest_context_top - GUEST_CONTEXT_SIZE.
-    ldr x16, [x18, #16]
+    ldr x16, [x17, #16]          // x16 = TCB.guest_context_top
     sub x16, x16, #{GUEST_CONTEXT_SIZE}
-    // x16 = base of PtRegs. We can now use x16 freely since the
-    // trampoline already saved the guest's x16.
+    // x16 = base of PtRegs.
 
     // Save guest x0-x15 into PtRegs.regs[0..15].
-    // x16 is our PtRegs base pointer. x17, x18 are scratch.
+    // x16 is our PtRegs base pointer.
     stp x0,  x1,  [x16, #0]      // regs[0], regs[1]
     stp x2,  x3,  [x16, #16]     // regs[2], regs[3]
     stp x4,  x5,  [x16, #32]     // regs[4], regs[5]
@@ -977,9 +983,10 @@ _syscall_callback:
     // Store guest x16, x17 into PtRegs.regs[16..17].
     stp x0, x1, [x16, #128]      // regs[16], regs[17]
 
-    // x18 is host TLS (TCB pointer); guest x18 was saved to TCB.guest_x18
-    // by the shared SVC handler. Load it and store into PtRegs.regs[18].
-    ldr x17, [x18, #40]
+    // Load guest_x18 from TCB and store into PtRegs.regs[18].
+    // Reload TCB from stack (x18 is unreliable).
+    ldr x17, [sp, #40]           // x17 = TCB (reload)
+    ldr x17, [x17, #40]          // x17 = TCB.guest_x18
     str x17, [x16, #144]         // regs[18] = guest_x18
 
     // Save guest x19-x29.
@@ -1004,12 +1011,9 @@ _syscall_callback:
     // userspace trampoline; the signal handler path fills it properly).
     str xzr, [x16, #264]         // PtRegs.pstate
 
-    // Switch to host stack.
-    // x18 already holds host_tls from the trampoline's TLS table lookup
-    // (set at syscall_callback entry), so no need to read TPIDR_EL0 here.
-    // Reading TPIDR_EL0 would be unreliable anyway since macOS can clobber
-    // it on context switches.
-    ldr x0, [x18, #8]
+    // Switch to host stack. Reload TCB from stack (x18 is unreliable).
+    ldr x17, [sp, #40]           // x17 = TCB (reload)
+    ldr x0, [x17, #8]            // x0 = TCB.host_sp
     mov sp, x0
 
     // Call syscall_handler. x0 = thread_ctx (on host stack).
@@ -2951,12 +2955,19 @@ unsafe fn interrupt_signal_handler(
     #[allow(clippy::cast_possible_truncation)]
     let ip = unsafe { (*context.uc_mcontext).__ss.__pc as usize };
 
-    // Case 1: at the beginning of the syscall handler.
+    // Case 1: in the syscall_callback prologue (before in_guest is cleared).
+    //
+    // syscall_callback's first instruction saves x18 to the stack, and the
+    // next two instructions reload TCB from the stack and clear in_guest.
+    // During these 3 instructions, in_guest is still 1. If the interrupt
+    // arrives here, just return — syscall_callback will clear in_guest and
+    // call into the shim which will check for interrupts.
     //
     // FUTURE: handle trampoline code, too. This is somewhat less important
     // because it's probably fine for the shim to observe a guest context that
     // is inside the trampoline.
-    if ip == syscall_callback as *const () as usize {
+    let syscall_callback_addr = syscall_callback as *const () as usize;
+    if (syscall_callback_addr..syscall_callback_addr + 12).contains(&ip) {
         // No need to clear `in_guest` or set interrupt; the syscall handler will
         // clear `in_guest` and call into the shim.
         return;
