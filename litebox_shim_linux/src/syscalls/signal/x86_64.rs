@@ -20,6 +20,9 @@ const FXSAVE_SIZE: usize = 512;
 const FXSAVE_ALIGN: usize = 64;
 /// MXCSR bits that are valid (non-reserved). Bits 16-31 are reserved.
 const MXCSR_VALID_MASK: u32 = 0x0000_FFFF;
+/// Default MXCSR feature mask for CPUs that don't report one (pre-SSE2).
+/// SSE1-only: no DAZ (bit 6), so bits 0-5 + 7-15 = 0xFFBF.
+const MXCSR_DEFAULT_FEATURE_MASK: u32 = 0x0000_FFBF;
 
 /// Validates an MXCSR value against the valid mask and an optional host CPU
 /// feature mask. Returns `true` if the value is safe for FXRSTOR.
@@ -28,8 +31,14 @@ fn validate_mxcsr(mxcsr: u32, host_mxcsr_mask: u32) -> bool {
     if mxcsr & !MXCSR_VALID_MASK != 0 {
         return false;
     }
-    // If the host reports a feature mask, unsupported bits must be clear.
-    if host_mxcsr_mask != 0 && mxcsr & !host_mxcsr_mask != 0 {
+    // Use the host-reported mask, or the conservative SSE1-only default
+    // if the CPU didn't report one (mxcsr_mask=0 on pre-SSE2 CPUs).
+    let effective_mask = if host_mxcsr_mask != 0 {
+        host_mxcsr_mask
+    } else {
+        MXCSR_DEFAULT_FEATURE_MASK
+    };
+    if mxcsr & !effective_mask != 0 {
         return false;
     }
     true
@@ -477,9 +486,12 @@ mod tests {
     }
 
     #[test]
-    fn mxcsr_host_mask_zero_allows_all_low_bits() {
-        // host_mask=0 means CPU didn't report a mask, allow all valid bits.
-        assert!(validate_mxcsr(0xFFFF, 0));
+    fn mxcsr_host_mask_zero_uses_conservative_default() {
+        // host_mask=0 means CPU didn't report a mask (pre-SSE2).
+        // Should use conservative default 0xFFBF (no DAZ bit 6).
+        assert!(validate_mxcsr(0x1F80, 0)); // standard default passes
+        assert!(!validate_mxcsr(0x0040, 0)); // DAZ bit rejected without host support
+        assert!(!validate_mxcsr(0xFFFF, 0)); // bits outside 0xFFBF rejected
     }
 
     #[test]
