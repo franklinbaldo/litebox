@@ -430,6 +430,7 @@ const COND_EQ: u8 = 0x0;
 ///
 /// TPIDR_EL0 system register: op0=3, op1=3, CRn=13, CRm=0, op2=2
 /// Encoding: `MRS Xt, <sysreg>` = `0xD53BD040 | Rt`
+#[allow(dead_code)]
 fn encode_mrs_tpidr_el0(rt: u8) -> u32 {
     // MRS: 1101_0101_0011_1_op0[1]_op1[2:0]_CRn[3:0]_CRm[3:0]_op2[2:0]_Rt[4:0]
     // TPIDR_EL0: op0=3(11), op1=3(011), CRn=13(1101), CRm=0(0000), op2=2(010)
@@ -842,12 +843,12 @@ fn references_x18(insn: u32) -> bool {
     let decoder = InstDecoder::default();
     let word = insn.to_le_bytes();
     let mut reader = yaxpeax_arch::U8Reader::new(&word);
-    let Ok(decoded) = decoder.decode(&mut reader) else {
+    let Ok(instruction) = decoder.decode(&mut reader) else {
         // Decoder failed — use conservative bit-field check
         return true;
     };
 
-    decoded.operands.iter().any(has_x18_in_operand)
+    instruction.operands.iter().any(has_x18_in_operand)
 }
 
 /// Check if an ARM64 instruction is a store (writes to memory).
@@ -863,12 +864,12 @@ fn is_store_instruction(insn: u32) -> bool {
     let decoder = InstDecoder::default();
     let word = insn.to_le_bytes();
     let mut reader = yaxpeax_arch::U8Reader::new(&word);
-    let Ok(decoded) = decoder.decode(&mut reader) else {
+    let Ok(instruction) = decoder.decode(&mut reader) else {
         return false;
     };
 
     matches!(
-        decoded.opcode,
+        instruction.opcode,
         Opcode::STP
             | Opcode::STR
             | Opcode::STUR
@@ -983,11 +984,11 @@ fn adjust_sp_relative_offset(insn: u32, frame_size: u16) -> Option<u32> {
     let decoder = InstDecoder::default();
     let word = insn.to_le_bytes();
     let mut reader = yaxpeax_arch::U8Reader::new(&word);
-    let Ok(decoded) = decoder.decode(&mut reader) else {
+    let Ok(instruction) = decoder.decode(&mut reader) else {
         return None;
     };
 
-    match decoded.opcode {
+    match instruction.opcode {
         // STP/LDP/STNP/LDNP with signed offset: imm7 at bits 21:15, scaled by access size
         Opcode::STP | Opcode::LDP | Opcode::STNP | Opcode::LDNP => {
             // Determine scale from the opc field (bits 31:30)

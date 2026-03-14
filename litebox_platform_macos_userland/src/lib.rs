@@ -2374,16 +2374,15 @@ fn update_host_tls_entry() {
             continue 'retry;
         }
 
-        match key_ptr.compare_exchange(current, tpidrro, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => {
-                // Claimed. Write host_tls value.
-                unsafe { val_ptr.write_volatile(host_tls as u64) };
-                return;
-            }
-            Err(_) => {
-                // CAS failed — another thread grabbed this slot. Rescan.
-            }
+        if key_ptr
+            .compare_exchange(current, tpidrro, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            // Claimed. Write host_tls value.
+            unsafe { val_ptr.write_volatile(host_tls as u64) };
+            return;
         }
+        // CAS failed — another thread grabbed this slot. Rescan.
     }
 }
 
