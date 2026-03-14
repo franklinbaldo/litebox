@@ -181,6 +181,7 @@ const MAX_EDGE_PAGES: usize = 256;
 /// Each entry is an AtomicUsize: 0 = empty, nonzero = 16KB-aligned address.
 static EDGE_PAGES: [std::sync::atomic::AtomicUsize; MAX_EDGE_PAGES] = {
     // const initializer for array of AtomicUsize
+    #[allow(clippy::declare_interior_mutable_const)]
     const ZERO: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     [ZERO; MAX_EDGE_PAGES]
 };
@@ -210,9 +211,9 @@ static EDGE_PAGE_STATES: std::sync::Mutex<[EdgePageState; MAX_EDGE_PAGES]> =
     std::sync::Mutex::new([EMPTY_EDGE_PAGE_STATE; MAX_EDGE_PAGES]);
 
 fn encode_perms(perms: MemoryRegionPermissions) -> u8 {
-    ((perms.contains(MemoryRegionPermissions::READ) as u8) << 0)
-        | ((perms.contains(MemoryRegionPermissions::WRITE) as u8) << 1)
-        | ((perms.contains(MemoryRegionPermissions::EXEC) as u8) << 2)
+    (u8::from(perms.contains(MemoryRegionPermissions::READ)))
+        | ((u8::from(perms.contains(MemoryRegionPermissions::WRITE))) << 1)
+        | ((u8::from(perms.contains(MemoryRegionPermissions::EXEC))) << 2)
 }
 
 fn decode_perms(bits: u8) -> MemoryRegionPermissions {
@@ -268,6 +269,11 @@ fn decode_host_protection(protection: i32) -> MemoryRegionPermissions {
     perms
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::used_underscore_binding
+)]
 fn query_host_page_permissions(host_page_addr: usize) -> MemoryRegionPermissions {
     let mut address: u64 = host_page_addr as u64;
     let mut size: u64 = 0;
@@ -348,6 +354,7 @@ fn clear_edge_page_state(host_page_addr: usize, range: core::ops::Range<usize>) 
     any_remaining
 }
 
+#[allow(clippy::needless_range_loop)]
 fn unregister_edge_page(addr: usize) {
     debug_assert_eq!(addr % HOST_PAGE_SIZE, 0, "edge page not 16KB-aligned");
 
@@ -503,9 +510,7 @@ fn ensure_edge_page(page_addr: usize, prot: libc::c_int) {
     assert_eq!(
         errno.raw_os_error(),
         Some(libc::ENOMEM),
-        "mprotect edge page {:#x} failed with unexpected error: {}",
-        page_addr,
-        errno
+        "mprotect edge page {page_addr:#x} failed with unexpected error: {errno}"
     );
     let r = unsafe {
         libc::mmap(
@@ -858,6 +863,7 @@ fn set_guest_tpidr(value: usize) {
     }
 }
 
+#[allow(dead_code)]
 fn get_guest_tpidr() -> usize {
     let tcb = TCB_PTR.get();
     assert!(!tcb.is_null(), "get_guest_tpidr called without TCB");
@@ -1610,6 +1616,7 @@ fn prot_flags(flags: MemoryRegionPermissions) -> ProtFlags {
 /// Currently unused — the VMA layer handles conflict detection, but this
 /// function is retained for diagnostic/debugging purposes.
 #[allow(dead_code)]
+#[allow(clippy::cast_possible_truncation)]
 fn is_range_unmapped(start: usize, len: usize) -> bool {
     let end = start + len;
     let mut address: u64 = start as u64;
@@ -2375,7 +2382,6 @@ fn update_host_tls_entry() {
             }
             Err(_) => {
                 // CAS failed — another thread grabbed this slot. Rescan.
-                continue 'retry;
             }
         }
     }
@@ -2885,6 +2891,7 @@ fn macos_signal_to_linux(signum: libc::c_int) -> libc::c_int {
 }
 
 /// Signal handler for hardware exceptions (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP).
+#[allow(clippy::cast_possible_truncation)]
 unsafe extern "C" fn exception_signal_handler(
     signum: libc::c_int,
     info: &mut libc::siginfo_t,
@@ -2902,7 +2909,7 @@ unsafe extern "C" fn exception_signal_handler(
     if signum == libc::SIGSEGV || signum == libc::SIGBUS {
         let sigctx_edge = unsafe { &*context.uc_mcontext };
         let far = sigctx_edge.__es.__far as usize;
-        let esr = sigctx_edge.__es.__esr as u32;
+        let esr = sigctx_edge.__es.__esr;
         let ec = (esr >> 26) & 0x3F;
 
         if is_edge_page(far) {

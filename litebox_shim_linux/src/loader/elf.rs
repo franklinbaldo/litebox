@@ -10,12 +10,12 @@ use litebox::{
     platform::{RawConstPointer as _, SystemInfoProvider as _},
     utils::{ReinterpretSignedExt, TruncateExt},
 };
-use litebox_common_linux::{MapFlags, errno::Errno, loader::ElfParsedFile};
+use litebox_common_linux::{errno::Errno, loader::ElfParsedFile, MapFlags};
 use thiserror::Error;
 
 use crate::{
-    MutPtr,
     loader::auxv::{AuxKey, AuxVec},
+    MutPtr,
 };
 
 use super::stack::UserStack;
@@ -240,11 +240,11 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
             {
                 use litebox::mm::PageManager;
                 type PM = PageManager<crate::Platform, { PAGE_SIZE }>;
+                // 4 MiB is generous for any interpreter (ld-linux is ~300 KiB).
+                const INTERP_SIZE_ESTIMATE: usize = 4 * 1024 * 1024;
 
                 let brk_aligned = info.brk.next_multiple_of(PAGE_SIZE);
                 let min_addr = brk_aligned + PM::BRK_RESERVE_SIZE;
-                // 4 MiB is generous for any interpreter (ld-linux is ~300 KiB).
-                const INTERP_SIZE_ESTIMATE: usize = 4 * 1024 * 1024;
                 if let Some(hint) = global
                     .pm
                     .find_free_hint_above(min_addr, INTERP_SIZE_ESTIMATE)

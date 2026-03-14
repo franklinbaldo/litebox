@@ -173,6 +173,7 @@ const SHARED_X18_SAVE_HANDLER_SIZE: usize = SHARED_X18_SAVE_HANDLER_INSN_COUNT *
 #[cfg(any(target_os = "macos", test))]
 const X18_GATE_READ_INSN_COUNT: usize = 14;
 #[cfg(any(target_os = "macos", test))]
+#[allow(dead_code)]
 const X18_GATE_WRITE_INSN_COUNT: usize = 14;
 #[cfg(any(target_os = "macos", test))]
 const X18_GATE_READWRITE_INSN_COUNT: usize = 16;
@@ -640,6 +641,7 @@ fn encode_ldp_offset(rt: u8, rt2: u8, rn: u8, imm_bytes: i16) -> Option<u32> {
 /// The offset must be a multiple of 8 and within [-512, 504].
 ///
 /// Encoding: opc=10, V=0, type=011 (pre-index), L=0 (store), imm7=offset/8, Rt2, Rn, Rt
+#[allow(dead_code)]
 fn encode_stp_pre_index(rt: u8, rt2: u8, rn: u8, imm_bytes: i16) -> Option<u32> {
     if imm_bytes % 8 != 0 {
         return None;
@@ -667,6 +669,7 @@ fn encode_stp_pre_index(rt: u8, rt2: u8, rn: u8, imm_bytes: i16) -> Option<u32> 
 /// The offset must be a multiple of 8 and within [-512, 504].
 ///
 /// Encoding: opc=10, V=0, type=001 (post-index), L=1 (load), imm7=offset/8, Rt2, Rn, Rt
+#[allow(dead_code)]
 fn encode_ldp_post_index(rt: u8, rt2: u8, rn: u8, imm_bytes: i16) -> Option<u32> {
     if imm_bytes % 8 != 0 {
         return None;
@@ -693,6 +696,7 @@ fn encode_ldp_post_index(rt: u8, rt2: u8, rn: u8, imm_bytes: i16) -> Option<u32>
 /// The offset must be within [-256, 255].
 ///
 /// Encoding: size=11, V=0, opc=00 (store), imm9, pre-index=11, Rn, Rt
+#[allow(dead_code)]
 fn encode_str_pre_index(rt: u8, rn: u8, imm_bytes: i16) -> Option<u32> {
     if !(-256..=255).contains(&imm_bytes) {
         return None;
@@ -708,6 +712,7 @@ fn encode_str_pre_index(rt: u8, rn: u8, imm_bytes: i16) -> Option<u32> {
 /// The offset must be within [-256, 255].
 ///
 /// Encoding: size=11, V=0, opc=01 (load), imm9, post-index=01, Rn, Rt
+#[allow(dead_code)]
 fn encode_ldr_post_index(rt: u8, rn: u8, imm_bytes: i16) -> Option<u32> {
     if !(-256..=255).contains(&imm_bytes) {
         return None;
@@ -806,29 +811,8 @@ enum PatchKind {
 /// including inside memory addressing modes (base register, index register, etc.).
 #[cfg(any(target_os = "macos", test))]
 fn references_x18(insn: u32) -> bool {
-    // Fast path: if no standard register bit field contains 18, skip
-    let rd = insn & 0x1F;
-    let rn = (insn >> 5) & 0x1F;
-    let rm = (insn >> 16) & 0x1F;
-    let rt2 = (insn >> 10) & 0x1F;
-    if rd != 18 && rn != 18 && rm != 18 && rt2 != 18 {
-        return false;
-    }
-
-    // Decode with yaxpeax-arm to confirm the bit field is actually a register operand
     use yaxpeax_arch::Decoder;
     use yaxpeax_arm::armv8::a64::{InstDecoder, Operand};
-
-    let decoder = InstDecoder::default();
-    let word = insn.to_le_bytes();
-    let mut reader = yaxpeax_arch::U8Reader::new(&word);
-    let inst = match decoder.decode(&mut reader) {
-        Ok(inst) => inst,
-        Err(_) => {
-            // Decoder failed — use conservative bit-field check
-            return true;
-        }
-    };
 
     // Helper: check if a register number is 18
     fn has_x18_in_operand(op: &Operand) -> bool {
@@ -845,7 +829,25 @@ fn references_x18(insn: u32) -> bool {
         }
     }
 
-    inst.operands.iter().any(has_x18_in_operand)
+    // Fast path: if no standard register bit field contains 18, skip
+    let rd = insn & 0x1F;
+    let rn = (insn >> 5) & 0x1F;
+    let rm = (insn >> 16) & 0x1F;
+    let rt2 = (insn >> 10) & 0x1F;
+    if rd != 18 && rn != 18 && rm != 18 && rt2 != 18 {
+        return false;
+    }
+
+    // Decode with yaxpeax-arm to confirm the bit field is actually a register operand
+    let decoder = InstDecoder::default();
+    let word = insn.to_le_bytes();
+    let mut reader = yaxpeax_arch::U8Reader::new(&word);
+    let Ok(decoded) = decoder.decode(&mut reader) else {
+        // Decoder failed — use conservative bit-field check
+        return true;
+    };
+
+    decoded.operands.iter().any(has_x18_in_operand)
 }
 
 /// Check if an ARM64 instruction is a store (writes to memory).
@@ -861,13 +863,12 @@ fn is_store_instruction(insn: u32) -> bool {
     let decoder = InstDecoder::default();
     let word = insn.to_le_bytes();
     let mut reader = yaxpeax_arch::U8Reader::new(&word);
-    let inst = match decoder.decode(&mut reader) {
-        Ok(inst) => inst,
-        Err(_) => return false,
+    let Ok(decoded) = decoder.decode(&mut reader) else {
+        return false;
     };
 
     matches!(
-        inst.opcode,
+        decoded.opcode,
         Opcode::STP
             | Opcode::STR
             | Opcode::STUR
@@ -918,7 +919,7 @@ fn rewrite_x18(insn: u32) -> (u32, u8, bool, bool) {
 
     // Rd (bits 4:0) — destination for most insns, but Rt (source) for stores
     if (result & 0x1F) == 18 {
-        result = (result & !0x1F) | (scratch as u32);
+        result = (result & !0x1F) | u32::from(scratch);
         if is_store {
             is_read = true;
         } else {
@@ -928,19 +929,19 @@ fn rewrite_x18(insn: u32) -> (u32, u8, bool, bool) {
 
     // Rn (bits 9:5) — first source/base register (read)
     if ((result >> 5) & 0x1F) == 18 {
-        result = (result & !(0x1F << 5)) | ((scratch as u32) << 5);
+        result = (result & !(0x1F << 5)) | (u32::from(scratch) << 5);
         is_read = true;
     }
 
     // Rm (bits 20:16) — second source register (read)
     if ((result >> 16) & 0x1F) == 18 {
-        result = (result & !(0x1F << 16)) | ((scratch as u32) << 16);
+        result = (result & !(0x1F << 16)) | (u32::from(scratch) << 16);
         is_read = true;
     }
 
     // Rt2 (bits 14:10) — second transfer register in LDP/STP
     if ((result >> 10) & 0x1F) == 18 {
-        result = (result & !(0x1F << 10)) | ((scratch as u32) << 10);
+        result = (result & !(0x1F << 10)) | (u32::from(scratch) << 10);
         if is_store {
             is_read = true;
         } else {
@@ -967,7 +968,11 @@ fn rewrite_x18(insn: u32) -> (u32, u8, bool, bool) {
 /// - STR/LDR unsigned offset (imm12, scaled by access size)
 /// - STUR/LDUR unscaled offset (imm9, signed)
 #[cfg(any(target_os = "macos", test))]
+#[allow(clippy::cast_possible_wrap, clippy::manual_is_multiple_of)]
 fn adjust_sp_relative_offset(insn: u32, frame_size: u16) -> Option<u32> {
+    use yaxpeax_arch::Decoder;
+    use yaxpeax_arm::armv8::a64::{InstDecoder, Opcode};
+
     // Check if Rn (bits 9:5) is SP (register 31)
     let rn = (insn >> 5) & 0x1F;
     if rn != 31 {
@@ -975,18 +980,14 @@ fn adjust_sp_relative_offset(insn: u32, frame_size: u16) -> Option<u32> {
     }
 
     // Decode to identify instruction format
-    use yaxpeax_arch::Decoder;
-    use yaxpeax_arm::armv8::a64::{InstDecoder, Opcode};
-
     let decoder = InstDecoder::default();
     let word = insn.to_le_bytes();
     let mut reader = yaxpeax_arch::U8Reader::new(&word);
-    let inst = match decoder.decode(&mut reader) {
-        Ok(inst) => inst,
-        Err(_) => return None,
+    let Ok(decoded) = decoder.decode(&mut reader) else {
+        return None;
     };
 
-    match inst.opcode {
+    match decoded.opcode {
         // STP/LDP/STNP/LDNP with signed offset: imm7 at bits 21:15, scaled by access size
         Opcode::STP | Opcode::LDP | Opcode::STNP | Opcode::LDNP => {
             // Determine scale from the opc field (bits 31:30)
@@ -1054,11 +1055,11 @@ fn adjust_sp_relative_offset(insn: u32, frame_size: u16) -> Option<u32> {
             let new_imm12 = new_offset / scale;
 
             // Validate: new offset must be aligned and fit in 12 bits
-            if new_offset % scale != 0 || new_imm12 >= (1 << 12) {
+            if !new_offset.is_multiple_of(scale) || new_imm12 >= (1 << 12) {
                 return None;
             }
 
-            let adjusted = (insn & !(0xFFF << 10)) | ((new_imm12 as u32) << 10);
+            let adjusted = (insn & !(0xFFF << 10)) | (u32::from(new_imm12) << 10);
             Some(adjusted)
         }
 
@@ -1100,7 +1101,7 @@ fn adjust_sp_relative_offset(insn: u32, frame_size: u16) -> Option<u32> {
             if new_offset >= (1 << 12) {
                 return None;
             }
-            let adjusted = (insn & !(0xFFF << 10)) | ((new_offset as u32) << 10);
+            let adjusted = (insn & !(0xFFF << 10)) | (u32::from(new_offset) << 10);
             Some(adjusted)
         }
 
@@ -1114,10 +1115,10 @@ fn adjust_sp_relative_offset(insn: u32, frame_size: u16) -> Option<u32> {
             let current_offset = imm12 * 2;
             let new_offset = current_offset + frame_size;
             let new_imm12 = new_offset / 2;
-            if new_offset % 2 != 0 || new_imm12 >= (1 << 12) {
+            if !new_offset.is_multiple_of(2) || new_imm12 >= (1 << 12) {
                 return None;
             }
-            let adjusted = (insn & !(0xFFF << 10)) | ((new_imm12 as u32) << 10);
+            let adjusted = (insn & !(0xFFF << 10)) | (u32::from(new_imm12) << 10);
             Some(adjusted)
         }
 
@@ -1135,6 +1136,9 @@ fn adjust_sp_relative_offset(insn: u32, frame_size: u16) -> Option<u32> {
 /// (ADD SP, SP, #frame / <insn> / SUB SP, SP, #frame) instead of immediate adjustment.
 #[cfg(any(target_os = "macos", test))]
 fn needs_sp_fixup(rewritten: u32, frame_size: u16) -> bool {
+    use yaxpeax_arch::Decoder;
+    use yaxpeax_arm::armv8::a64::{InstDecoder, Opcode};
+
     let rn = (rewritten >> 5) & 0x1F;
     if rn != 31 {
         return false; // Not SP-relative
@@ -1146,14 +1150,12 @@ fn needs_sp_fixup(rewritten: u32, frame_size: u16) -> bool {
     }
 
     // Check if this is a memory operation (vs. ADD/SUB/CMP with SP)
-    use yaxpeax_arch::Decoder;
-    use yaxpeax_arm::armv8::a64::{InstDecoder, Opcode};
     let decoder = InstDecoder::default();
     let word = rewritten.to_le_bytes();
     let mut reader = yaxpeax_arch::U8Reader::new(&word);
-    decoder.decode(&mut reader).map_or(false, |inst| {
+    decoder.decode(&mut reader).is_ok_and(|decoded| {
         matches!(
-            inst.opcode,
+            decoded.opcode,
             Opcode::STP
                 | Opcode::LDP
                 | Opcode::STNP
@@ -3148,7 +3150,7 @@ fn emit_shared_x18_save_handler(
 /// [15]  B    <return_addr>
 /// ```
 #[cfg(any(target_os = "macos", test))]
-#[allow(clippy::cast_possible_wrap)]
+#[allow(clippy::cast_possible_wrap, clippy::too_many_arguments)]
 fn emit_x18_gate(
     trampoline_data: &mut Vec<u8>,
     gate_offset: usize,
