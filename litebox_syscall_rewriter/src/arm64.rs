@@ -689,6 +689,24 @@ enum PatchKind {
     /// The `u8` is the destination register number (0-30 for X0-X30, 31 for XZR).
     /// Rewritten to read from TLS table entry[0] instead of the hardware register.
     MrsTpidr(u8),
+    /// An instruction that references X18 (macOS only).
+    ///
+    /// On macOS, x18 is zeroed by the kernel on every return to userspace, so every
+    /// instruction that reads or writes x18 must be rewritten to load/store from the
+    /// per-thread `guest_x18` cell in the TCB.
+    #[cfg(target_os = "macos")]
+    X18Use {
+        /// The original 32-bit instruction word.
+        insn: u32,
+        /// The rewritten instruction with x18 replaced by the scratch register.
+        rewritten: u32,
+        /// Which scratch register replaces x18 (typically 17, or 16 if insn uses X17).
+        scratch: u8,
+        /// Whether x18 is read by this instruction.
+        is_read: bool,
+        /// Whether x18 is written by this instruction.
+        is_write: bool,
+    },
 }
 
 /// Scan executable sections for `SVC #0`, `MSR TPIDR_EL0, Xt`, and
@@ -927,6 +945,12 @@ pub(crate) fn hook_syscalls_aarch64(
                     site,
                     rd,
                 )?;
+            }
+            #[cfg(target_os = "macos")]
+            PatchKind::X18Use { .. } => {
+                return Err(Error::DisassemblyFailure(
+                    "x18 gate emission not yet implemented".into(),
+                ));
             }
         }
 
@@ -1935,7 +1959,7 @@ mod tests {
         // Verify Rd=SP and Rn=SP
         assert_eq!(insn & 0x1F, 31); // Rd
         assert_eq!((insn >> 5) & 0x1F, 31); // Rn
-        // Verify imm12
+                                            // Verify imm12
         assert_eq!((insn >> 10) & 0xFFF, 32);
     }
 
@@ -2027,7 +2051,7 @@ mod tests {
         assert_eq!(insn & 0x1F, 31); // Rd = XZR
         assert_eq!((insn >> 5) & 0x1F, 16); // Rn
         assert_eq!((insn >> 16) & 0x1F, 18); // Rm
-        // Verify top bits: 111_01011_00_0
+                                             // Verify top bits: 111_01011_00_0
         assert_eq!(insn & 0xFFE0_FC00, 0xEB00_0000);
     }
 
@@ -2038,7 +2062,7 @@ mod tests {
         assert_eq!(insn & 0x1F, 31); // Rd = XZR
         assert_eq!((insn >> 5) & 0x1F, 16); // Rn
         assert_eq!((insn >> 10) & 0xFFF, 1); // imm12
-        // Verify opcode: 1_0_1_10001_00 = 0xB1000000
+                                             // Verify opcode: 1_0_1_10001_00 = 0xB1000000
         assert_eq!(insn & 0xFF00_0000, 0xB100_0000);
     }
 
