@@ -362,9 +362,20 @@ pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const 
     /// This prevents the common failure mode where anonymous mmaps fill the gap right above
     /// brk, blocking brk growth (which manifests as `malloc(): corrupted top size`).
     ///
-    /// This is a virtual reservation only — no platform allocation or VMA entry is created.
-    /// The `brk()` syscall handler ignores this field and grows brk normally.
+    /// On Linux this is a virtual reservation only — no platform allocation or VMA entry
+    /// is created.  The `brk()` syscall handler ignores this field and grows brk normally.
+    ///
+    /// On macOS, when `brk_hard_reserved` is `true`, the entire
+    /// `[brk_aligned..brk_reserved_end)` region has been hard-reserved with the kernel
+    /// via `mmap(PROT_NONE, MAP_FIXED)`.  brk growth promotes slices to RW via
+    /// `mprotect`, and brk shrink demotes them back to PROT_NONE.
     pub(super) brk_reserved_end: usize,
+    /// Whether the brk zone was hard-reserved with the kernel (macOS only).
+    ///
+    /// When `true`, brk growth uses `update_permissions(RW)` instead of `create_pages`,
+    /// and brk shrink uses `update_permissions(PROT_NONE)` instead of `remove_mapping`.
+    /// When `false` (Linux, or macOS fallback), the original create/remove path is used.
+    pub(super) brk_hard_reserved: bool,
     /// Virtual memory areas.
     vmas: RangeMap<usize, VmArea>,
 }
@@ -378,6 +389,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             vmas: RangeMap::new(),
             brk: 0,
             brk_reserved_end: 0,
+            brk_hard_reserved: false,
             platform,
         };
         for each in platform.reserved_pages() {

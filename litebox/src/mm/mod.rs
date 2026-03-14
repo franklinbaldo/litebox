@@ -41,11 +41,19 @@ where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
     /// Size of the region reserved above the initial brk for future brk growth.
-    /// The top-down allocator will avoid placing hint-based anonymous mmaps in
-    /// `[brk..brk + BRK_RESERVE_SIZE)`, preventing the common failure mode where
-    /// brk growth is blocked by nearby anonymous mappings.
     ///
-    /// 32 MiB is generous enough for typical programs while not wasting address space.
+    /// On Linux, this is a soft VMA-tree-only reservation: the top-down allocator
+    /// avoids placing hint-based anonymous mmaps in `[brk..brk + BRK_RESERVE_SIZE)`.
+    /// 32 MiB is generous enough for typical programs.
+    ///
+    /// On macOS, the entire brk zone is hard-reserved with the kernel via
+    /// `mmap(PROT_NONE, MAP_FIXED)` at `set_initial_brk` time.  256 MiB is used
+    /// because it is free (no physical memory committed for PROT_NONE pages) and
+    /// brk growth beyond this limit returns ENOMEM, forcing glibc to fall back to
+    /// mmap-based allocation.
+    #[cfg(target_os = "macos")]
+    pub const BRK_RESERVE_SIZE: usize = 256 << 20; // 256 MiB
+    #[cfg(not(target_os = "macos"))]
     pub const BRK_RESERVE_SIZE: usize = 32 << 20; // 32 MiB
 
     /// Create a new `PageManager` instance.
@@ -307,6 +315,44 @@ where
         // before the brk address was known and would cause brk() to fail with
         // ENOMEM when it finds them via overlapping().
         vmem.evict_reserved_from_brk_zone();
+
+        // On macOS, hard-reserve the entire brk zone with the kernel via
+        // mmap(PROT_NONE, MAP_FIXED).  This prevents the macOS kernel from
+        // placing other mappings inside the brk zone (which it aggressively
+        // does since it ignores mmap hints).  The reservation costs no
+        // physical memory (PROT_NONE pages are never faulted in).  brk growth
+        // later promotes slices of this reservation to RW via mprotect.
+        #[cfg(target_os = "macos")]
+        {
+            let reserve_range = brk_aligned..vmem.brk_reserved_end;
+            if reserve_range.start < reserve_range.end {
+                match vmem.platform.allocate_pages(
+                    reserve_range.clone(),
+                    MemoryRegionPermissions::empty(), // PROT_NONE
+                    false,                            // can_grow_down
+                    false,                            // populate_pages_immediately
+                    crate::platform::page_mgmt::FixedAddressBehavior::Replace,
+                ) {
+                    Ok(_) => {
+                        // Insert a VMA entry so the VMA tree tracks the reservation.
+                        // Use VmFlags::empty() (= PROT_NONE, no access).
+                        vmem.register_existing_mapping_overwrite(
+                            linux::PageRange::new(reserve_range.start, reserve_range.end)
+                                .expect("brk reserve range must be page-aligned"),
+                            linux::VmArea::new(linux::VmFlags::empty(), false),
+                        );
+                        vmem.brk_hard_reserved = true;
+                    }
+                    Err(_e) => {
+                        // If the hard reservation fails, fall back to the soft
+                        // reservation (VMA-tree-only).  brk growth will still
+                        // use the create_pages path as on Linux.  This is not
+                        // fatal — the brk-zone retry in insert_mapping provides
+                        // a safety net.
+                    }
+                }
+            }
+        }
     }
 
     /// Find a free region of at least `size` bytes at or above `min_addr`.
@@ -349,62 +395,137 @@ where
 
         let old_brk = vmem.brk.next_multiple_of(linux::PAGE_SIZE);
         let new_brk = brk.next_multiple_of(linux::PAGE_SIZE);
-        if vmem.brk >= brk {
-            // Shrink the memory region
-            let brk = match unsafe {
-                vmem.remove_mapping(
-                    PageRange::new(new_brk, old_brk).ok_or(MappingError::UnAligned)?,
-                )
-            } {
-                Ok(()) => {
-                    vmem.brk = brk;
-                    brk
-                }
-                Err(_) => {
-                    vmem.brk // No change, return the old brk
-                }
-            };
-            return Ok(brk);
-        }
 
-        if vmem.overlapping(old_brk..new_brk).next().is_some() {
-            // Diagnostic: dump the overlapping VMAs to help debug brk failures.
-            let mut msg = alloc::string::String::from("[diag] brk ENOMEM: overlapping VMAs:\n");
-            for (range, vma) in vmem.overlapping(old_brk..new_brk) {
-                use core::fmt::Write;
-                let _ = writeln!(
-                    msg,
-                    "  VMA {:#x}..{:#x} flags={:?} file_backed={}",
-                    range.start,
-                    range.end,
-                    vma.flags(),
-                    vma.is_file_backed()
-                );
+        if vmem.brk_hard_reserved {
+            // ── Hard-reserved brk zone (macOS) ──────────────────────────
+            //
+            // The entire brk zone `[brk_aligned..brk_reserved_end)` was
+            // hard-reserved with the kernel as PROT_NONE at set_initial_brk
+            // time.  Growth promotes slices to RW via mprotect; shrink
+            // demotes them back to PROT_NONE.  No mmap/munmap needed.
+
+            if vmem.brk >= brk {
+                // Shrink: demote [new_brk..old_brk) back to PROT_NONE.
+                if new_brk < old_brk {
+                    let range = new_brk..old_brk;
+                    match unsafe {
+                        vmem.platform
+                            .update_permissions(range.clone(), MemoryRegionPermissions::empty())
+                    } {
+                        Ok(()) => {
+                            // Update the VMA entry: replace the shrunk region with
+                            // PROT_NONE (it's still part of the hard reservation).
+                            if let Some(pr) = linux::PageRange::<ALIGN>::new(range.start, range.end)
+                            {
+                                vmem.register_existing_mapping_overwrite(
+                                    pr,
+                                    linux::VmArea::new(linux::VmFlags::empty(), false),
+                                );
+                            }
+                        }
+                        Err(_) => {
+                            return Ok(vmem.brk); // No change
+                        }
+                    }
+                }
+                vmem.brk = brk;
+                return Ok(brk);
             }
-            {
-                use core::fmt::Write;
-                let _ = write!(
-                    msg,
-                    "  old_brk={:#x} new_brk={:#x} vmem.brk={:#x} brk_reserved_end={:#x}",
-                    old_brk, new_brk, vmem.brk, vmem.brk_reserved_end
-                );
+
+            // Grow: check hard cap, then promote [old_brk..new_brk) to RW.
+            if new_brk > vmem.brk_reserved_end {
+                return Err(MappingError::MapError(
+                    crate::platform::page_mgmt::AllocationError::OutOfMemory,
+                ));
             }
-            panic!("{msg}");
+
+            if old_brk < new_brk {
+                let range = old_brk..new_brk;
+                let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
+                unsafe {
+                    vmem.platform
+                        .update_permissions(range.clone(), perms)
+                        .map_err(|_| {
+                            MappingError::MapError(
+                                crate::platform::page_mgmt::AllocationError::OutOfMemory,
+                            )
+                        })?;
+                }
+                // Update VMA: mark the promoted region as RW.
+                if let Some(pr) = linux::PageRange::<ALIGN>::new(range.start, range.end) {
+                    vmem.register_existing_mapping_overwrite(
+                        pr,
+                        linux::VmArea::new(linux::VmFlags::from(perms), false),
+                    );
+                }
+            }
+            vmem.brk = brk;
+            Ok(brk)
+        } else {
+            // ── Soft-reserved brk zone (Linux / macOS fallback) ─────────
+            //
+            // Original path: grow via create_pages (mmap MAP_FIXED),
+            // shrink via remove_mapping (munmap).
+
+            if vmem.brk >= brk {
+                // Shrink the memory region
+                let brk = match unsafe {
+                    vmem.remove_mapping(
+                        PageRange::new(new_brk, old_brk).ok_or(MappingError::UnAligned)?,
+                    )
+                } {
+                    Ok(()) => {
+                        vmem.brk = brk;
+                        brk
+                    }
+                    Err(_) => {
+                        vmem.brk // No change, return the old brk
+                    }
+                };
+                return Ok(brk);
+            }
+
+            if vmem.overlapping(old_brk..new_brk).next().is_some() {
+                // Diagnostic: dump the overlapping VMAs to help debug brk failures.
+                let mut msg =
+                    alloc::string::String::from("[diag] brk ENOMEM: overlapping VMAs:\n");
+                for (range, vma) in vmem.overlapping(old_brk..new_brk) {
+                    use core::fmt::Write;
+                    let _ = writeln!(
+                        msg,
+                        "  VMA {:#x}..{:#x} flags={:?} file_backed={}",
+                        range.start,
+                        range.end,
+                        vma.flags(),
+                        vma.is_file_backed()
+                    );
+                }
+                {
+                    use core::fmt::Write;
+                    let _ = write!(
+                        msg,
+                        "  old_brk={:#x} new_brk={:#x} vmem.brk={:#x} brk_reserved_end={:#x}",
+                        old_brk, new_brk, vmem.brk, vmem.brk_reserved_end
+                    );
+                }
+                panic!("{msg}");
+            }
+            if let Some(range) = PageRange::<ALIGN>::new(old_brk, new_brk) {
+                let (suggested_address, length) = range.start_and_length();
+                let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
+                unsafe {
+                    vmem.create_pages(
+                        Some(suggested_address),
+                        length,
+                        CreatePagesFlags::FIXED_ADDR
+                            | CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
+                        perms,
+                    )
+                }?;
+            }
+            vmem.brk = brk;
+            Ok(brk)
         }
-        if let Some(range) = PageRange::<ALIGN>::new(old_brk, new_brk) {
-            let (suggested_address, length) = range.start_and_length();
-            let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
-            unsafe {
-                vmem.create_pages(
-                    Some(suggested_address),
-                    length,
-                    CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
-                    perms,
-                )
-            }?;
-        }
-        vmem.brk = brk;
-        Ok(brk)
     }
 
     /// Release memory mappings that satisfy the given condition and reset the program break.
@@ -431,6 +552,7 @@ where
         let mut vmem = self.vmem.write();
         vmem.brk = 0;
         vmem.brk_reserved_end = 0;
+        vmem.brk_hard_reserved = false;
 
         Ok(())
     }
