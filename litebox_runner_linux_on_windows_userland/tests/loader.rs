@@ -1,7 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-#![cfg(all(target_os = "windows", target_arch = "x86_64"))]
+#![cfg(all(
+    target_os = "windows",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 
 mod common;
 
@@ -9,6 +12,7 @@ mod common;
     unused,
     reason = "This code snippet is just used to illustrate the source code of the `hello_exec_nolibc` test."
 )]
+#[cfg(target_arch = "x86_64")]
 const HELLO_WORLD_NOLIBC: &str = r#"
 // gcc tests/test.c -o test -static -nostdlib (-m32)
 #if defined(__x86_64__)
@@ -142,12 +146,19 @@ int main(void) {
 }
 "#;
 
+/// Directory name for architecture-specific test binaries.
+#[cfg(target_arch = "x86_64")]
+const TEST_BINS_DIR: &str = "tests/test-bins";
+#[cfg(target_arch = "aarch64")]
+const TEST_BINS_DIR: &str = "tests/test-bins-aarch64";
+
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn test_static_linked_prog_with_rewriter() {
     println!("Running statically linked binary + rewriter test...");
     // Use the already compiled executable from the tests folder (same dir as this file)
     let mut test_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    test_dir.push("tests/test-bins");
+    test_dir.push(TEST_BINS_DIR);
 
     let prog_name = "hello_world_static";
     let prog_name_hooked = format!("{prog_name}.hooked");
@@ -196,9 +207,8 @@ fn run_dynamic_linked_prog_with_rewriter(
     cmd_args: &[&str],
     install_files: fn(std::path::PathBuf),
 ) {
-    // Use the already compiled executable from the tests folder (same dir as this file)
     let mut test_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    test_dir.push("tests/test-bins");
+    test_dir.push(TEST_BINS_DIR);
 
     let prog_name = exec_name;
     let prog_name_hooked = format!("{prog_name}.hooked");
@@ -288,16 +298,16 @@ fn run_dynamic_linked_prog_with_rewriter(
     // Install the required files (e.g., scripts) to tar directory's /out
     install_files(tar_src_path.join("out"));
 
-    // tar
+    // tar — collect all subdirectories that exist under the tar source path
     let tar_target_file = std::path::Path::new(&out_path).join("rootfs_rewriter.tar");
+    let mut tar_args: Vec<&str> = vec!["-cvf", tar_target_file.to_str().unwrap()];
+    for dir in ["lib", "lib64", "lib32", "out"] {
+        if tar_src_path.join(dir).exists() {
+            tar_args.push(dir);
+        }
+    }
     let tar_data = std::process::Command::new("tar")
-        .args([
-            "-cvf",
-            tar_target_file.to_str().unwrap(),
-            "lib",
-            "lib64",
-            "out",
-        ])
+        .args(&tar_args)
         .current_dir(&tar_src_path)
         .output()
         .expect("Failed to create tar file");
@@ -314,6 +324,14 @@ fn run_dynamic_linked_prog_with_rewriter(
         });
 
     // Run litebox_runner_linux_on_windows_userland with the tar file and the compiled executable
+    // Determine where the rtld_audit library was placed
+    let audit_path = libs_without_rewrite
+        .iter()
+        .find(|(name, _)| *name == "litebox_rtld_audit.so")
+        .map(|(_, prefix)| format!("{prefix}/litebox_rtld_audit.so"))
+        .unwrap_or_else(|| "/lib64/litebox_rtld_audit.so".to_string());
+    let audit_env = format!("LD_AUDIT={audit_path}");
+
     let mut args = vec![
         "--unstable",
         // Tell ld where to find the libraries.
@@ -324,7 +342,7 @@ fn run_dynamic_linked_prog_with_rewriter(
         "--initial-files",
         tar_target_file.to_str().unwrap(),
         "--env",
-        "LD_AUDIT=/lib64/litebox_rtld_audit.so",
+        &audit_env,
     ];
     args.push(hooked_path.to_str().unwrap());
     args.extend_from_slice(cmd_args);
@@ -341,6 +359,7 @@ fn run_dynamic_linked_prog_with_rewriter(
     );
 }
 
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn test_testcase_dynamic_with_rewriter() {
     let exec_name = "hello_world_dyn";
@@ -351,6 +370,25 @@ fn test_testcase_dynamic_with_rewriter() {
     let libs_without_rewrite = [("litebox_rtld_audit.so", "/lib64")];
 
     // Run
+    run_dynamic_linked_prog_with_rewriter(
+        &libs_to_rewrite,
+        &libs_without_rewrite,
+        exec_name,
+        &[],
+        |_| {},
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn test_testcase_dynamic_with_rewriter() {
+    let exec_name = "hello_world_dyn";
+    let libs_to_rewrite = [
+        ("libc.so.6", "/lib/aarch64-linux-gnu"),
+        ("ld-linux-aarch64.so.1", "/lib"),
+    ];
+    let libs_without_rewrite = [("litebox_rtld_audit.so", "/lib")];
+
     run_dynamic_linked_prog_with_rewriter(
         &libs_to_rewrite,
         &libs_without_rewrite,
