@@ -3,9 +3,11 @@
 
 //! A [LiteBox platform](../litebox/platform/index.html) for running LiteBox on userland Windows.
 
-// Restrict this crate to only work on Windows. For now, we are restricting this to only x86-64
-// Windows, but we _may_ allow for more in the future, if we find it useful to do so.
-#![cfg(all(target_os = "windows", target_arch = "x86_64"))]
+// Restrict this crate to only work on Windows (x86-64 or ARM64).
+#![cfg(all(
+    target_os = "windows",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 
 use core::cell::Cell;
 use core::panic;
@@ -21,7 +23,9 @@ use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::{
     AllocationError, FixedAddressBehavior, MemoryRegionPermissions,
 };
-use litebox::shim::{ContinueOperation, Exception};
+use litebox::shim::ContinueOperation;
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+use litebox::shim::Exception;
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::PunchthroughSyscall;
 
@@ -43,9 +47,17 @@ use zerocopy::{FromBytes, IntoBytes};
 
 extern crate alloc;
 
-// Thread-local storage for FS base state
+// Thread-local storage for FS base state (x86_64) / guest TLS state (aarch64)
+#[cfg(target_arch = "x86_64")]
 thread_local! {
     static THREAD_FS_BASE: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(target_arch = "aarch64")]
+thread_local! {
+    /// On ARM64, we store the guest's virtual TPIDR_EL0 value here since the
+    /// real register is reserved by Windows.
+    static THREAD_TPIDR: Cell<usize> = const { Cell::new(0) };
 }
 
 /// The userland Windows platform.
@@ -70,29 +82,52 @@ impl core::fmt::Debug for WindowsUserland {
 unsafe impl Send for WindowsUserland {}
 unsafe impl Sync for WindowsUserland {}
 
-/// Helper functions for managing per-thread FS base
+/// Helper functions for managing per-thread FS base (x86_64) or TPIDR (aarch64).
 impl WindowsUserland {
-    /// Get the current thread's FS base state
+    /// Get the current thread's guest TLS base.
+    #[cfg(target_arch = "x86_64")]
     fn get_thread_fs_base() -> usize {
         THREAD_FS_BASE.get()
     }
 
-    /// Set the current thread's FS base
+    /// Set the current thread's FS base.
+    #[cfg(target_arch = "x86_64")]
     fn set_thread_fs_base(new_base: usize) {
         THREAD_FS_BASE.set(new_base);
         Self::restore_thread_fs_base();
     }
 
-    /// Restore the current thread's FS base from saved state
+    /// Restore the current thread's FS base from saved state.
+    #[cfg(target_arch = "x86_64")]
     fn restore_thread_fs_base() {
         unsafe {
             litebox_common_linux::wrfsbase(THREAD_FS_BASE.get());
         }
     }
 
-    /// Initialize FS base state for a new thread
+    /// Initialize FS base state for a new thread.
+    #[cfg(target_arch = "x86_64")]
     fn init_thread_fs_base() {
         Self::set_thread_fs_base(0);
+    }
+
+    /// Get the current thread's guest TPIDR value.
+    #[cfg(target_arch = "aarch64")]
+    #[allow(dead_code, reason = "will be used when GetTpidr punchthrough is added")]
+    fn get_thread_tpidr() -> usize {
+        THREAD_TPIDR.get()
+    }
+
+    /// Set the current thread's guest TPIDR value.
+    #[cfg(target_arch = "aarch64")]
+    fn set_thread_tpidr(new_tpidr: usize) {
+        THREAD_TPIDR.set(new_tpidr);
+    }
+
+    /// Initialize guest TLS state for a new thread (aarch64).
+    #[cfg(target_arch = "aarch64")]
+    fn init_thread_tls() {
+        Self::set_thread_tpidr(0);
     }
 }
 
@@ -114,12 +149,23 @@ unsafe extern "system" fn vectored_exception_handler(
     if !tls.is_in_guest.get() {
         // This might be a faulting guest memory access in LiteBox code. Try to
         // recover.
+        #[cfg(target_arch = "x86_64")]
+        let ip = context.Rip.truncate();
+        #[cfg(target_arch = "aarch64")]
+        let ip = context.Pc.truncate();
+
         if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
-            && let Some(recover) =
-                litebox::mm::exception_table::search_exception_tables(context.Rip.truncate())
+            && let Some(recover) = litebox::mm::exception_table::search_exception_tables(ip)
         {
             // Found a matching exception table entry.
-            context.Rip = recover as u64;
+            #[cfg(target_arch = "x86_64")]
+            {
+                context.Rip = recover as u64;
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                context.Pc = recover as u64;
+            }
             return EXCEPTION_CONTINUE_EXECUTION;
         } else {
             // Not one of our exceptions; let other handlers process it.
@@ -131,39 +177,69 @@ unsafe extern "system" fn vectored_exception_handler(
     let regs = unsafe { &mut *tls.guest_context_top.get().wrapping_sub(1) };
     save_guest_context(regs, context);
 
-    // If it looks like fs base was cleared, then go through the interrupt path
-    // instead of the exception path to restore the fs base and try again.
-    //
-    // This is done instead of just fixing up fsbase and returning here to avoid
-    // missing a real interrupt that arrives while resuming the guest. Go through
-    // the interrupt path to ensure that any pending interrupts are also handled.
-    if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
-        && unsafe { litebox_common_linux::rdfsbase() } == 0
-        && WindowsUserland::get_thread_fs_base() != 0
+    #[cfg(target_arch = "x86_64")]
     {
-        set_context_to_interrupt_callback(tls, context);
-    } else {
-        // Push the exception record onto the host stack.
-        let exception_record_ptr = tls.host_sp.get().cast::<EXCEPTION_RECORD>().wrapping_sub(1);
-        assert!(exception_record_ptr.is_aligned());
-        unsafe { exception_record_ptr.write(*exception_record) };
+        // If it looks like fs base was cleared, then go through the interrupt path
+        // instead of the exception path to restore the fs base and try again.
+        if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
+            && unsafe { litebox_common_linux::rdfsbase() } == 0
+            && WindowsUserland::get_thread_fs_base() != 0
+        {
+            set_context_to_interrupt_callback(tls, context);
+        } else {
+            set_context_to_exception_callback(tls, context, exception_record);
+        }
+    }
 
-        // Re-align the stack pointer.
-        let rsp = exception_record_ptr as usize & !15;
-
-        // Ensure that `run_thread_arch` is linked in so that `exception_callback` is visible.
-        let _ = run_thread_arch as *const () as usize;
-
-        // Update the thread context to jump to the exception handler.
-        context.Rip = exception_callback as *const () as usize as u64;
-        context.Rsp = rsp as u64;
-        context.Rbp = tls.host_bp.get() as u64;
-        context.Rdx = exception_record_ptr as u64;
+    #[cfg(target_arch = "aarch64")]
+    {
+        // On ARM64 there is no FS base to be cleared by Windows scheduling.
+        // Always go through the exception path.
+        set_context_to_exception_callback(tls, context, exception_record);
     }
 
     EXCEPTION_CONTINUE_EXECUTION
 }
 
+/// Sets the context to jump to the exception callback with the exception
+/// record pointer as the second argument.
+fn set_context_to_exception_callback(
+    tls: &TlsState,
+    context: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+    exception_record: &EXCEPTION_RECORD,
+) {
+    // Push the exception record onto the host stack.
+    let exception_record_ptr = tls.host_sp.get().cast::<EXCEPTION_RECORD>().wrapping_sub(1);
+    assert!(exception_record_ptr.is_aligned());
+    unsafe { exception_record_ptr.write(*exception_record) };
+
+    // Ensure that `run_thread_arch` is linked in so that `exception_callback` is visible.
+    let _ = run_thread_arch as *const () as usize;
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Re-align the stack pointer.
+        let rsp = exception_record_ptr as usize & !15;
+        context.Rip = exception_callback as *const () as usize as u64;
+        context.Rsp = rsp as u64;
+        context.Rbp = tls.host_bp.get() as u64;
+        context.Rdx = exception_record_ptr as u64;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Re-align the stack pointer.
+        let sp = exception_record_ptr as usize & !15;
+        context.Pc = exception_callback as *const () as usize as u64;
+        context.Sp = sp as u64;
+        // X29 = FP, X1 = exception_record_ptr (second argument per AAPCS64)
+        unsafe {
+            (*context.Anonymous.X.as_mut_ptr().add(29)) = tls.host_bp.get().addr() as u64;
+            (*context.Anonymous.X.as_mut_ptr().add(1)) = exception_record_ptr as u64;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 fn save_guest_context(
     guest_context: &mut litebox_common_linux::PtRegs,
     context: &windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
@@ -212,6 +288,21 @@ fn save_guest_context(
     *rsp = context.Rsp.truncate();
 }
 
+#[cfg(target_arch = "aarch64")]
+fn save_guest_context(
+    guest_context: &mut litebox_common_linux::PtRegs,
+    context: &windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+) {
+    // SAFETY: accessing the X register array from the CONTEXT union.
+    let x_regs = unsafe { &context.Anonymous.X };
+    for (i, x_reg) in x_regs.iter().enumerate().take(31) {
+        guest_context.regs[i] = x_reg.truncate();
+    }
+    guest_context.sp = context.Sp.truncate();
+    guest_context.pc = context.Pc.truncate();
+    guest_context.pstate = context.Cpsr as usize;
+}
+
 impl WindowsUserland {
     /// Create a new userland-Windows platform for use in `LiteBox`.
     ///
@@ -243,11 +334,15 @@ impl WindowsUserland {
             sys_info: std::sync::RwLock::new(sys_info),
         };
 
-        // Initialize it's own fs-base (for the main thread)
+        // Initialize it's own fs-base / tls (for the main thread)
+        #[cfg(target_arch = "x86_64")]
         WindowsUserland::init_thread_fs_base();
+        #[cfg(target_arch = "aarch64")]
+        WindowsUserland::init_thread_tls();
 
         // Windows sets FS_BASE to 0 regularly upon scheduling; we register an exception handler
         // to set FS_BASE back to a "stored" value whenever we notice that it has become 0.
+        // On ARM64, the VEH is still needed for guest exception handling.
         unsafe {
             let _ = AddVectoredExceptionHandler(0, Some(vectored_exception_handler));
         }
@@ -368,6 +463,8 @@ fn run_thread_inner(
         scratch: 0.into(),
         is_in_guest: false.into(),
         interrupt: false.into(),
+        #[cfg(target_arch = "aarch64")]
+        virt_x18: 0.into(),
         continue_context: Box::default(),
     };
     unsafe {
@@ -398,6 +495,9 @@ struct TlsState {
     scratch: Cell<usize>,
     is_in_guest: Cell<bool>,
     interrupt: Cell<bool>,
+    /// On ARM64, stores the guest's virtual X18 value (real X18 is reserved for TEB).
+    #[cfg(target_arch = "aarch64")]
+    virt_x18: Cell<usize>,
     continue_context:
         Box<std::cell::UnsafeCell<windows_sys::Win32::System::Diagnostics::Debug::CONTEXT>>,
 }
@@ -586,6 +686,170 @@ interrupt_callback:
     );
 }
 
+/// ARM64 version of `run_thread_arch`.
+///
+/// Saves callee-saved registers (X19-X28, FP/X29, LR/X30, D8-D15), then enters
+/// the guest via the shim. When the guest makes a syscall (via the rewritten
+/// trampoline), it branches to `syscall_callback`, which saves the guest
+/// context into PtRegs and returns to the host stack to call the syscall handler.
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+unsafe extern "C-unwind" fn run_thread_arch(thread_ctx: &mut ThreadContext, tls_state: &TlsState) {
+    core::arch::naked_asm!(
+    "
+    // Offset into the TEB (X18) where non-extended TLS slots are stored.
+    // On ARM64 Windows, TEB layout has TLS slots at offset 0x1480 (5248 decimal),
+    // same as x86_64.
+    .equ TEB_TLS_SLOTS_OFFSET, 5248
+
+    // Save callee-saved registers per Windows ARM64 ABI.
+    stp     x29, x30, [sp, #-16]!
+    mov     x29, sp
+    stp     x19, x20, [sp, #-16]!
+    stp     x21, x22, [sp, #-16]!
+    stp     x23, x24, [sp, #-16]!
+    stp     x25, x26, [sp, #-16]!
+    stp     x27, x28, [sp, #-16]!
+    // Save callee-saved NEON registers (D8-D15).
+    stp     d8, d9, [sp, #-16]!
+    stp     d10, d11, [sp, #-16]!
+    stp     d12, d13, [sp, #-16]!
+    stp     d14, d15, [sp, #-16]!
+
+    // x0 = thread_ctx, x1 = tls_state (per AAPCS64 calling convention)
+    // Save thread_ctx on stack for later recovery.
+    str     x0, [sp, #-16]!
+
+    // Save the host sp and fp (x29) into the TLS state.
+    mov     x9, sp
+    str     x9, [x1, #{HOST_SP}]
+    str     x29, [x1, #{HOST_BP}]
+
+    // Call init_handler(thread_ctx). x0 already contains thread_ctx.
+    bl      {init_handler}
+    b       .Ldone_arm64
+
+    // This entry point is called from the guest when it issues a syscall
+    // (via a rewritten SVC #0 that branches here through the trampoline).
+    //
+    // At entry, the guest register context is live. The trampoline has saved
+    // the guest's return address (PC after the SVC) and TPIDR in a stack frame.
+    // x16/x17 are available as scratch (intra-procedure-call scratch registers).
+    .globl  syscall_callback
+syscall_callback:
+    // Get the TLS state from the TLS slot and clear the in-guest flag.
+    ldr     w16, [{TLS_INDEX}]
+    // TEB is in X18; TLS slot address = X18 + TEB_TLS_SLOTS_OFFSET + index*8
+    add     x16, x18, x16, lsl #3
+    ldr     x16, [x16, #TEB_TLS_SLOTS_OFFSET]
+    strb    wzr, [x16, #{IS_IN_GUEST}]
+
+    // Save guest SP to scratch, then switch to guest context structure.
+    mov     x17, sp
+    str     x17, [x16, #{SCRATCH}]
+    ldr     x17, [x16, #{GUEST_CONTEXT_TOP}]
+
+    // Save all 31 general-purpose registers into PtRegs.regs[0..31].
+    // PtRegs layout (aarch64): regs[31] (248 bytes), sp (8), pc (8), pstate (8) = 272 bytes.
+    // We write from the top of PtRegs downward.
+    // Store pstate (use MRS to read NZCV as a proxy; real pstate is restored via NtContinue).
+    mrs     x9, NZCV
+    str     x9, [x17, #-8]!            // pstate
+    // Store pc (guest return address is in x30/LR from the trampoline gate).
+    str     x30, [x17, #-8]!           // pc
+    // Store sp.
+    ldr     x9, [x16, #{SCRATCH}]      // recover guest SP
+    str     x9, [x17, #-8]!            // sp
+    // Store x30 down to x0 (31 registers, 248 bytes).
+    // x30 is the guest's return address (already saved as pc above, but also save in regs[30]).
+    str     x30, [x17, #-8]!           // regs[30] = LR
+    str     x29, [x17, #-8]!           // regs[29] = FP
+    str     x28, [x17, #-8]!           // regs[28]
+    str     x27, [x17, #-8]!           // regs[27]
+    str     x26, [x17, #-8]!           // regs[26]
+    str     x25, [x17, #-8]!           // regs[25]
+    str     x24, [x17, #-8]!           // regs[24]
+    str     x23, [x17, #-8]!           // regs[23]
+    str     x22, [x17, #-8]!           // regs[22]
+    str     x21, [x17, #-8]!           // regs[21]
+    str     x20, [x17, #-8]!           // regs[20]
+    str     x19, [x17, #-8]!           // regs[19]
+    // x18 is TEB on Windows, save virtual X18 from the TEB slot instead.
+    ldr     x9, [x16, #{VIRT_X18}]
+    str     x9, [x17, #-8]!            // regs[18] = virtual x18
+    // x17 is being used as write pointer, save 0 as placeholder.
+    mov     x9, #0
+    str     x9, [x17, #-8]!            // regs[17] = 0 (clobbered by trampoline)
+    // x16 is being used as TLS pointer, save 0 as placeholder.
+    str     x9, [x17, #-8]!            // regs[16] = 0 (clobbered by trampoline)
+    str     x15, [x17, #-8]!           // regs[15]
+    str     x14, [x17, #-8]!           // regs[14]
+    str     x13, [x17, #-8]!           // regs[13]
+    str     x12, [x17, #-8]!           // regs[12]
+    str     x11, [x17, #-8]!           // regs[11]
+    str     x10, [x17, #-8]!           // regs[10]
+    str     x9, [x17, #-8]!            // regs[9] = 0 (x9 was clobbered)
+    str     x8, [x17, #-8]!            // regs[8] (syscall number)
+    str     x7, [x17, #-8]!            // regs[7]
+    str     x6, [x17, #-8]!            // regs[6]
+    str     x5, [x17, #-8]!            // regs[5]
+    str     x4, [x17, #-8]!            // regs[4]
+    str     x3, [x17, #-8]!            // regs[3]
+    str     x2, [x17, #-8]!            // regs[2]
+    str     x1, [x17, #-8]!            // regs[1]
+    str     x0, [x17, #-8]!            // regs[0]
+
+    // Reestablish the host stack and frame pointers.
+    ldr     x9, [x16, #{HOST_SP}]
+    mov     sp, x9
+    ldr     x29, [x16, #{HOST_BP}]
+
+    // Handle the syscall.
+    ldr     x0, [sp]                   // thread_ctx
+    bl      {syscall_handler}
+    b       .Ldone_arm64
+
+exception_callback:
+    // Handle the exception. The stack and frame pointers are already restored,
+    // and the guest context is up to date. x0 = thread_ctx, x1 = exception record ptr.
+    ldr     x0, [sp]                   // thread_ctx
+    bl      {exception_handler}
+    b       .Ldone_arm64
+
+interrupt_callback:
+    ldr     x0, [sp]                   // thread_ctx
+    bl      {interrupt_handler}
+    b       .Ldone_arm64
+
+.Ldone_arm64:
+    // Restore callee-saved registers and return.
+    add     sp, sp, #16                // pop thread_ctx slot
+    ldp     d14, d15, [sp], #16
+    ldp     d12, d13, [sp], #16
+    ldp     d10, d11, [sp], #16
+    ldp     d8, d9, [sp], #16
+    ldp     x27, x28, [sp], #16
+    ldp     x25, x26, [sp], #16
+    ldp     x23, x24, [sp], #16
+    ldp     x21, x22, [sp], #16
+    ldp     x19, x20, [sp], #16
+    ldp     x29, x30, [sp], #16
+    ret
+    ",
+    init_handler = sym init_handler,
+    syscall_handler = sym syscall_handler,
+    exception_handler = sym exception_handler,
+    interrupt_handler = sym interrupt_handler,
+    TLS_INDEX = sym TLS_INDEX,
+    HOST_SP = const core::mem::offset_of!(TlsState, host_sp),
+    HOST_BP = const core::mem::offset_of!(TlsState, host_bp),
+    GUEST_CONTEXT_TOP = const core::mem::offset_of!(TlsState, guest_context_top),
+    SCRATCH = const core::mem::offset_of!(TlsState, scratch),
+    IS_IN_GUEST = const core::mem::offset_of!(TlsState, is_in_guest),
+    VIRT_X18 = const core::mem::offset_of!(TlsState, virt_x18),
+    );
+}
+
 /// Switches to the provided guest context.
 ///
 /// # Safety
@@ -597,109 +861,169 @@ interrupt_callback:
 /// destructors.
 ///
 unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
-    #[unsafe(naked)]
-    extern "C" fn switch_to_guest_sysret(ctx: &litebox_common_linux::PtRegs) -> ! {
-        core::arch::naked_asm!(
-            // Load all registers from the guest context structure.
-            "switch_to_guest_start:",
-            "mov rsp, rcx",
-            "pop r15",
-            "pop r14",
-            "pop r13",
-            "pop r12",
-            "pop rbp",
-            "pop rbx",
-            "pop r11",
-            "pop r10",
-            "pop r9",
-            "pop r8",
-            "pop rax",
-            "pop rcx",
-            "pop rdx",
-            "pop rsi",
-            "pop rdi",
-            "pop rcx",    // skip orig_rax
-            "pop rcx",    // read rip into rcx
-            "add rsp, 8", // skip cs
-            "popfq",
-            "pop rsp",
-            "jmp rcx", // jump to the entry point of the thread
-            "switch_to_guest_end:",
-        );
-    }
-
-    fn switch_to_guest_ntcontinue(tls: &TlsState, ctx: &litebox_common_linux::PtRegs) -> ! {
-        use litebox::utils::ReinterpretSignedExt;
-        use windows_sys::Win32::System::Diagnostics::Debug::{
-            CONTEXT, CONTEXT_CONTROL_AMD64, CONTEXT_INTEGER_AMD64,
-        };
-        #[link(name = "ntdll")]
-        unsafe extern "system" {
-            fn NtContinue(
-                ctx: *const CONTEXT,
-                raise_alert: u8,
-            ) -> windows_sys::Win32::Foundation::NTSTATUS;
-        }
-        let win_ctx = tls.continue_context.get();
-        // SAFETY: no other code accesses `continue_context` while `is_in_guest` is false.
-        unsafe {
-            win_ctx.write(CONTEXT {
-                ContextFlags: CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64,
-                EFlags: ctx.eflags.truncate(),
-                Rax: ctx.rax as u64,
-                Rcx: ctx.rcx as u64,
-                Rdx: ctx.rdx as u64,
-                Rbx: ctx.rbx as u64,
-                Rsp: ctx.rsp as u64,
-                Rbp: ctx.rbp as u64,
-                Rsi: ctx.rsi as u64,
-                Rdi: ctx.rdi as u64,
-                R8: ctx.r8 as u64,
-                R9: ctx.r9 as u64,
-                R10: ctx.r10 as u64,
-                R11: ctx.r11 as u64,
-                R12: ctx.r12 as u64,
-                R13: ctx.r13 as u64,
-                R14: ctx.r14 as u64,
-                R15: ctx.r15 as u64,
-                Rip: ctx.rip as u64,
-                ..CONTEXT::default()
-            });
-        }
-        // Ensure the context is written before we set `is_in_guest` so that
-        // `ThreadHandle::interrupt` can see a consistent state.
-        std::sync::atomic::compiler_fence(Ordering::Release);
-        tls.is_in_guest.set(true);
-        unsafe {
-            let status = NtContinue(win_ctx, 0);
-            panic!(
-                "NtContinue failed: {}",
-                std::io::Error::from_raw_os_error(
-                    windows_sys::Win32::Foundation::RtlNtStatusToDosError(status)
-                        .reinterpret_as_signed(),
-                ),
+    #[cfg(target_arch = "x86_64")]
+    {
+        #[unsafe(naked)]
+        extern "C" fn switch_to_guest_sysret(ctx: &litebox_common_linux::PtRegs) -> ! {
+            core::arch::naked_asm!(
+                // Load all registers from the guest context structure.
+                "switch_to_guest_start:",
+                "mov rsp, rcx",
+                "pop r15",
+                "pop r14",
+                "pop r13",
+                "pop r12",
+                "pop rbp",
+                "pop rbx",
+                "pop r11",
+                "pop r10",
+                "pop r9",
+                "pop r8",
+                "pop rax",
+                "pop rcx",
+                "pop rdx",
+                "pop rsi",
+                "pop rdi",
+                "pop rcx",    // skip orig_rax
+                "pop rcx",    // read rip into rcx
+                "add rsp, 8", // skip cs
+                "popfq",
+                "pop rsp",
+                "jmp rcx", // jump to the entry point of the thread
+                "switch_to_guest_end:",
             );
         }
+
+        fn switch_to_guest_ntcontinue_x64(tls: &TlsState, ctx: &litebox_common_linux::PtRegs) -> ! {
+            use litebox::utils::ReinterpretSignedExt;
+            use windows_sys::Win32::System::Diagnostics::Debug::{
+                CONTEXT, CONTEXT_CONTROL_AMD64, CONTEXT_INTEGER_AMD64,
+            };
+            #[link(name = "ntdll")]
+            unsafe extern "system" {
+                fn NtContinue(
+                    ctx: *const CONTEXT,
+                    raise_alert: u8,
+                ) -> windows_sys::Win32::Foundation::NTSTATUS;
+            }
+            let win_ctx = tls.continue_context.get();
+            // SAFETY: no other code accesses `continue_context` while `is_in_guest` is false.
+            unsafe {
+                win_ctx.write(CONTEXT {
+                    ContextFlags: CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64,
+                    EFlags: ctx.eflags.truncate(),
+                    Rax: ctx.rax as u64,
+                    Rcx: ctx.rcx as u64,
+                    Rdx: ctx.rdx as u64,
+                    Rbx: ctx.rbx as u64,
+                    Rsp: ctx.rsp as u64,
+                    Rbp: ctx.rbp as u64,
+                    Rsi: ctx.rsi as u64,
+                    Rdi: ctx.rdi as u64,
+                    R8: ctx.r8 as u64,
+                    R9: ctx.r9 as u64,
+                    R10: ctx.r10 as u64,
+                    R11: ctx.r11 as u64,
+                    R12: ctx.r12 as u64,
+                    R13: ctx.r13 as u64,
+                    R14: ctx.r14 as u64,
+                    R15: ctx.r15 as u64,
+                    Rip: ctx.rip as u64,
+                    ..CONTEXT::default()
+                });
+            }
+            // Ensure the context is written before we set `is_in_guest` so that
+            // `ThreadHandle::interrupt` can see a consistent state.
+            std::sync::atomic::compiler_fence(Ordering::Release);
+            tls.is_in_guest.set(true);
+            unsafe {
+                let status = NtContinue(win_ctx, 0);
+                panic!(
+                    "NtContinue failed: {}",
+                    std::io::Error::from_raw_os_error(
+                        windows_sys::Win32::Foundation::RtlNtStatusToDosError(status)
+                            .reinterpret_as_signed(),
+                    ),
+                );
+            }
+        }
+
+        let tls = unsafe { &*get_tls_ptr().expect("TLS not initialized") };
+        assert!(!tls.is_in_guest.get());
+
+        // Restore fsbase for the guest.
+        WindowsUserland::restore_thread_fs_base();
+
+        // The fast path for switching to the guest relies on rcx == rip. This is
+        // the common case, because the syscall instruction sets rcx to rip at entry
+        // to the kernel. When this is not the case, we use NtContinue to jump to
+        // the guest with the full register state.
+        if ctx.rcx == ctx.rip {
+            tls.is_in_guest.set(true);
+            switch_to_guest_sysret(ctx)
+        } else {
+            switch_to_guest_ntcontinue_x64(tls, ctx)
+        }
     }
 
-    let tls = unsafe { &*get_tls_ptr().expect("TLS not initialized") };
-    assert!(!tls.is_in_guest.get());
+    #[cfg(target_arch = "aarch64")]
+    {
+        fn switch_to_guest_ntcontinue_arm64(
+            tls: &TlsState,
+            ctx: &litebox_common_linux::PtRegs,
+        ) -> ! {
+            use litebox::utils::ReinterpretSignedExt;
+            use windows_sys::Win32::System::Diagnostics::Debug::{
+                CONTEXT, CONTEXT_CONTROL_ARM64, CONTEXT_INTEGER_ARM64,
+            };
+            #[link(name = "ntdll")]
+            unsafe extern "system" {
+                fn NtContinue(
+                    ctx: *const CONTEXT,
+                    raise_alert: u8,
+                ) -> windows_sys::Win32::Foundation::NTSTATUS;
+            }
+            let win_ctx = tls.continue_context.get();
+            // SAFETY: no other code accesses `continue_context` while `is_in_guest` is false.
+            unsafe {
+                let mut new_ctx = CONTEXT {
+                    ContextFlags: CONTEXT_CONTROL_ARM64 | CONTEXT_INTEGER_ARM64,
+                    Cpsr: ctx.pstate.truncate(),
+                    Sp: ctx.sp as u64,
+                    Pc: ctx.pc as u64,
+                    ..CONTEXT::default()
+                };
+                // Set X0-X30 from PtRegs.
+                let x_regs = &mut new_ctx.Anonymous.X;
+                for (i, x_reg) in x_regs.iter_mut().enumerate().take(31) {
+                    *x_reg = ctx.regs[i] as u64;
+                }
+                // Virtualize X18: guest's X18 goes into TLS state, real X18 stays as TEB.
+                tls.virt_x18.set(ctx.regs[18]);
+                new_ctx.Anonymous.X[18] = 0; // Don't clobber TEB; NtContinue will set X18 to TEB.
+                win_ctx.write(new_ctx);
+            }
+            // Ensure the context is written before we set `is_in_guest`.
+            std::sync::atomic::compiler_fence(Ordering::Release);
+            tls.is_in_guest.set(true);
+            unsafe {
+                let status = NtContinue(win_ctx, 0);
+                panic!(
+                    "NtContinue failed: {}",
+                    std::io::Error::from_raw_os_error(
+                        windows_sys::Win32::Foundation::RtlNtStatusToDosError(status)
+                            .reinterpret_as_signed(),
+                    ),
+                );
+            }
+        }
 
-    // Restore fsbase for the guest.
-    WindowsUserland::restore_thread_fs_base();
+        let tls = unsafe { &*get_tls_ptr().expect("TLS not initialized") };
+        assert!(!tls.is_in_guest.get());
 
-    // The fast path for switching to the guest relies on rcx == rip. This is
-    // the common case, because the syscall instruction sets rcx to rip at entry
-    // to the kernel. When this is not the case, we use NtContinue to jump to
-    // the guest with the full register state.
-    //
-    // This is much slower, but it is only used for things like signal handlers,
-    // so it should not be on the critical path.
-    if ctx.rcx == ctx.rip {
-        tls.is_in_guest.set(true);
-        switch_to_guest_sysret(ctx)
-    } else {
-        switch_to_guest_ntcontinue(tls, ctx)
+        // On ARM64, always use NtContinue to restore the full register state.
+        // There is no fast-path equivalent of the x86_64 sysret trick.
+        switch_to_guest_ntcontinue_arm64(tls, ctx)
     }
 }
 
@@ -877,9 +1201,15 @@ impl ThreadHandle {
         // 4. In the guest. Save the guest context and jump to the interrupt callback.
 
         // Get the current register context.
+        #[cfg(target_arch = "x86_64")]
+        let context_flags = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64
+            | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_INTEGER_AMD64;
+        #[cfg(target_arch = "aarch64")]
+        let context_flags = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_ARM64
+            | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_INTEGER_ARM64;
+
         let mut context = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT {
-            ContextFlags: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64
-                | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_INTEGER_AMD64,
+            ContextFlags: context_flags,
             ..Default::default()
         };
         let r = unsafe {
@@ -895,14 +1225,25 @@ impl ThreadHandle {
             std::io::Error::last_os_error()
         );
 
-        let run_interrupt_callback = if (switch_to_guest_start as *const () as usize
+        #[cfg(target_arch = "x86_64")]
+        let ip: usize = context.Rip.truncate();
+        #[cfg(target_arch = "aarch64")]
+        let ip: usize = context.Pc.truncate();
+
+        // On x86_64, check if we're in the fast-path register-pop sequence.
+        // On ARM64, there is no fast path (always NtContinue), so this is always false.
+        #[cfg(target_arch = "x86_64")]
+        let in_fast_path = (switch_to_guest_start as *const () as usize
             ..switch_to_guest_end as *const () as usize)
-            .contains(&(context.Rip.truncate()))
-        {
+            .contains(&ip);
+        #[cfg(target_arch = "aarch64")]
+        let in_fast_path = false;
+
+        let run_interrupt_callback = if in_fast_path {
             // Case 1: jump to interrupt callback without saving the guest
             // context, since it's already saved.
             true
-        } else if is_in_ntdll_or_this(context.Rip.truncate()) {
+        } else if is_in_ntdll_or_this(ip) {
             // Case 2/3: we can't distinguish between them. For case 2 we don't
             // need to do anything, but for case 3 we need to update the
             // NtContinue context to point to the interrupt callback (the guest
@@ -939,12 +1280,27 @@ fn set_context_to_interrupt_callback(
     tls: &TlsState,
     context: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
 ) {
-    let required_flags = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64
-        | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_INTEGER_AMD64;
-    assert!(context.ContextFlags & required_flags == required_flags);
-    context.Rip = interrupt_callback as *const () as usize as u64;
-    context.Rsp = tls.host_sp.get().addr() as u64;
-    context.Rbp = tls.host_bp.get().addr() as u64;
+    #[cfg(target_arch = "x86_64")]
+    {
+        let required_flags = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64
+            | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_INTEGER_AMD64;
+        assert!(context.ContextFlags & required_flags == required_flags);
+        context.Rip = interrupt_callback as *const () as usize as u64;
+        context.Rsp = tls.host_sp.get().addr() as u64;
+        context.Rbp = tls.host_bp.get().addr() as u64;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let required_flags = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_ARM64
+            | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_INTEGER_ARM64;
+        assert!(context.ContextFlags & required_flags == required_flags);
+        context.Pc = interrupt_callback as *const () as usize as u64;
+        context.Sp = tls.host_sp.get().addr() as u64;
+        // X29 = FP
+        unsafe {
+            (*context.Anonymous.X.as_mut_ptr().add(29)) = tls.host_bp.get().addr() as u64;
+        }
+    }
 }
 
 /// Returns true if the given instruction pointer is in ntdll.dll or this module.
@@ -1212,15 +1568,19 @@ impl<'a> litebox::platform::PunchthroughToken for PunchthroughToken<'a> {
         >,
     > {
         match self.punchthrough {
+            #[cfg(target_arch = "x86_64")]
             PunchthroughSyscall::SetFsBase { addr } => {
-                // Use WindowsUserland's per-thread FS base management system
                 WindowsUserland::set_thread_fs_base(addr);
                 Ok(0)
             }
-            PunchthroughSyscall::GetFsBase => {
-                // Use the stored FS base value from our per-thread storage
-                Ok(WindowsUserland::get_thread_fs_base())
+            #[cfg(target_arch = "x86_64")]
+            PunchthroughSyscall::GetFsBase => Ok(WindowsUserland::get_thread_fs_base()),
+            #[cfg(target_arch = "aarch64")]
+            PunchthroughSyscall::SetTpidr { value } => {
+                WindowsUserland::set_thread_tpidr(value);
+                Ok(0)
             }
+            _ => unreachable!(),
         }
     }
 }
@@ -1364,6 +1724,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
     //
     // NOTE: make sure the values are PAGE_ALIGNED.
     const TASK_ADDR_MIN: usize = 0x1_0000;
+    // On x86_64 Windows, the max user address is 0x7FFF_FFFE_F000.
+    // On ARM64 Windows, the user VA space is also limited to 128TB by default.
+    // TODO: determine actual values from GetSystemInfo() instead of hardcoding.
+    #[cfg(target_arch = "x86_64")]
+    const TASK_ADDR_MAX: usize = 0x7FFF_FFFE_F000;
+    #[cfg(target_arch = "aarch64")]
     const TASK_ADDR_MAX: usize = 0x7FFF_FFFE_F000;
     fn allocate_pages(
         &self,
@@ -1674,7 +2040,9 @@ unsafe extern "C" {
     fn syscall_callback() -> isize;
     fn exception_callback() -> isize;
     fn interrupt_callback();
+    #[cfg(target_arch = "x86_64")]
     fn switch_to_guest_start();
+    #[cfg(target_arch = "x86_64")]
     fn switch_to_guest_end();
 }
 
@@ -1690,30 +2058,61 @@ unsafe extern "C-unwind" fn exception_handler(
     thread_ctx: &mut ThreadContext<'_>,
     exception_record: &EXCEPTION_RECORD,
 ) {
-    let (exception, error_code, cr2) = match exception_record.ExceptionCode {
-        Win32_Foundation::EXCEPTION_ACCESS_VIOLATION => {
-            let info = exception_record.ExceptionInformation;
-            let read_write_flag = info[0];
-            let faulting_address = info[1];
-            if read_write_flag == 0 && faulting_address == !0 {
-                // This is probably a #GP, not a #PF.
-                (Exception::GENERAL_PROTECTION_FAULT, 0, 0)
-            } else {
-                let error_code = 4 | if read_write_flag == 0 { 0 } else { 1 << 1 }; // PF error code: bit 1 = write
-                (Exception::PAGE_FAULT, error_code, faulting_address)
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    let info = {
+        let (exception, error_code, cr2) = match exception_record.ExceptionCode {
+            Win32_Foundation::EXCEPTION_ACCESS_VIOLATION => {
+                let info = exception_record.ExceptionInformation;
+                let read_write_flag = info[0];
+                let faulting_address = info[1];
+                if read_write_flag == 0 && faulting_address == !0 {
+                    // This is probably a #GP, not a #PF.
+                    (Exception::GENERAL_PROTECTION_FAULT, 0, 0)
+                } else {
+                    let error_code = 4 | if read_write_flag == 0 { 0 } else { 1 << 1 }; // PF error code: bit 1 = write
+                    (Exception::PAGE_FAULT, error_code, faulting_address)
+                }
             }
+            Win32_Foundation::EXCEPTION_ILLEGAL_INSTRUCTION => (Exception::INVALID_OPCODE, 0, 0),
+            Win32_Foundation::EXCEPTION_BREAKPOINT => (Exception::BREAKPOINT, 0, 0),
+            Win32_Foundation::EXCEPTION_INT_DIVIDE_BY_ZERO => (Exception::DIVIDE_ERROR, 0, 0),
+            code => panic!("Unhandled Win32 exception code: {:#x}", code),
+        };
+
+        litebox::shim::ExceptionInfo {
+            exception,
+            error_code,
+            cr2,
+            kernel_mode: false,
         }
-        Win32_Foundation::EXCEPTION_ILLEGAL_INSTRUCTION => (Exception::INVALID_OPCODE, 0, 0),
-        Win32_Foundation::EXCEPTION_BREAKPOINT => (Exception::BREAKPOINT, 0, 0),
-        Win32_Foundation::EXCEPTION_INT_DIVIDE_BY_ZERO => (Exception::DIVIDE_ERROR, 0, 0),
-        code => panic!("Unhandled Win32 exception code: {:#x}", code),
     };
 
-    let info = litebox::shim::ExceptionInfo {
-        exception,
-        error_code,
-        cr2,
-        kernel_mode: false,
+    #[cfg(target_arch = "aarch64")]
+    let info = {
+        let exception_info = exception_record.ExceptionInformation;
+        let (fault_address, esr) = match exception_record.ExceptionCode {
+            Win32_Foundation::EXCEPTION_ACCESS_VIOLATION => {
+                let faulting_address = exception_info[1];
+                let read_write_flag = exception_info[0];
+                // Synthesize a minimal ESR: EC=0x24 (data abort), ISS bit 6 = write.
+                let ec = 0x24u64; // Data abort from lower EL
+                let wnr = if read_write_flag != 0 { 1u64 << 6 } else { 0 };
+                let dfsc = 0x04u64; // Translation fault, level 0
+                let esr = (ec << 26) | wnr | dfsc;
+                (faulting_address, esr)
+            }
+            Win32_Foundation::EXCEPTION_ILLEGAL_INSTRUCTION => {
+                // EC=0x00 (unknown reason)
+                (0, 0u64)
+            }
+            Win32_Foundation::EXCEPTION_BREAKPOINT => {
+                // EC=0x3C (BRK instruction)
+                (0, 0x3Cu64 << 26)
+            }
+            code => panic!("Unhandled Win32 exception code: {:#x}", code),
+        };
+
+        litebox::shim::ExceptionInfo { fault_address, esr }
     };
 
     thread_ctx.call_shim(|shim, ctx, _interrupt| shim.exception(ctx, &info));
@@ -1786,7 +2185,10 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
     }
 
     fn clear_guest_thread_local_storage() {
+        #[cfg(target_arch = "x86_64")]
         Self::init_thread_fs_base();
+        #[cfg(target_arch = "aarch64")]
+        Self::init_thread_tls();
     }
 }
 

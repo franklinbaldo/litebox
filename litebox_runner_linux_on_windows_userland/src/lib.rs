@@ -1,9 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// Restrict this crate to only work on Windows. For now, we are restricting this to only x86-64
-// Windows, but we _may_ allow for more in the future, if we find it useful to do so.
-#![cfg(all(target_os = "windows", target_arch = "x86_64"))]
+// Restrict this crate to only work on Windows (x86-64 or ARM64).
+#![cfg(all(
+    target_os = "windows",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 
 use windows_sys::Win32::Storage::FileSystem;
 
