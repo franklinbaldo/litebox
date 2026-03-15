@@ -104,14 +104,14 @@ use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::time::Duration;
 
 use litebox::fs::OFlags;
-use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::{
     CowAllocationError, FixedAddressBehavior, MemoryRegionPermissions,
 };
+use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer as _};
 use litebox::shim::ContinueOperation;
 use litebox::utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt};
-use litebox_common_linux::{MapFlags, ProtFlags, PunchthroughSyscall, vmap::VmapManager};
+use litebox_common_linux::{vmap::VmapManager, MapFlags, ProtFlags, PunchthroughSyscall};
 
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -1147,22 +1147,21 @@ unsafe extern "C" fn switch_to_guest(
         //
         // The guest is a Linux ARM64 binary where x18 is a normal
         // caller-saved register (not platform-reserved like on macOS).
-        // We must restore x18 to its correct guest value, otherwise
-        // code interrupted mid-function by an edge-page fault may
-        // resume with a corrupt x18.
+        // However, x18 is fully virtualized by the rewriter: every
+        // guest instruction referencing x18 goes through gates that
+        // read/write TCB.guest_x18 in memory, never the physical
+        // register. Therefore we do NOT restore physical x18 here —
+        // it would be immediately zeroed by XNU on the next
+        // kernel→userspace transition anyway.
         //
-        // Strategy: stash guest_tpidr, guest_x18, and guest_PC below
-        // the guest SP (ARM64 red zone). Restore x0-x17, x19-x30 from
-        // PtRegs. After setting SP, use x16 as scratch to set TPIDR,
-        // then restore x18 from the stash, then load guest_PC into x16
-        // and branch. guest_x18 is loaded from TCB offset 40 (the
-        // authoritative source maintained by the x18 virtualization
-        // gates) rather than PtRegs.regs[18] (which may be stale when
-        // the kernel zeroes x18 on signal delivery).
+        // Strategy: stash guest_tpidr and guest_PC below the guest SP
+        // (ARM64 red zone). Restore x0-x17, x19-x30 from PtRegs.
+        // After setting SP, use x16 as scratch to set TPIDR, then
+        // load guest_PC into x16 and branch.
 
         // Stash guest values below guest SP (ARM64 red zone).
         //
-        // We stash guest_x0, guest_x1, guest_tpidr, guest_x18, and guest_PC
+        // We stash guest_x0, guest_x1, guest_tpidr, and guest_PC
         // below the guest SP so we can restore them AFTER setting SP.  This
         // avoids using x18 as a temp register — XNU zeros x18 on EVERY
         // kernel→userspace transition (preemptive context switches, not just
@@ -1171,20 +1170,17 @@ unsafe extern "C" fn switch_to_guest(
         //
         // x1 = TCB pointer (function arg, survives preemption).
         // Stash layout below guest SP:
-        //   [SP - 40] = guest_x0
-        //   [SP - 32] = guest_x1
-        //   [SP - 24] = guest_tpidr
-        //   [SP - 16] = guest_x18
+        //   [SP - 32] = guest_x0
+        //   [SP - 24] = guest_x1
+        //   [SP - 16] = guest_tpidr
         //   [SP - 8]  = guest_PC
         "ldr x17, [x0, #248]",  // x17 = guest SP
         "ldr x16, [x0, #0]",    // x16 = guest x0
-        "str x16, [x17, #-40]", // guest_SP[-40] = guest_x0
+        "str x16, [x17, #-32]", // guest_SP[-32] = guest_x0
         "ldr x16, [x0, #8]",    // x16 = guest x1
-        "str x16, [x17, #-32]", // guest_SP[-32] = guest_x1
+        "str x16, [x17, #-24]", // guest_SP[-24] = guest_x1
         "ldr x16, [x1, #24]",   // x16 = guest_tpidr (from TCB offset 24)
-        "str x16, [x17, #-24]", // guest_SP[-24] = guest_tpidr
-        "ldr x16, [x1, #40]",   // x16 = guest_x18 (from TCB offset 40)
-        "str x16, [x17, #-16]", // guest_SP[-16] = guest x18
+        "str x16, [x17, #-16]", // guest_SP[-16] = guest_tpidr
         "ldr x16, [x0, #256]",  // x16 = guest PC
         "str x16, [x17, #-8]",  // guest_SP[-8] = guest PC
         // Restore guest x2-x17 from PtRegs (x0 still holds ctx pointer).
@@ -1211,12 +1207,11 @@ unsafe extern "C" fn switch_to_guest(
         "mov sp, x1",         // SP = guest SP (safe: x1 survives preemption)
         // Final switch: recover stashed values from below guest SP.
         // Use x16 as scratch (it will hold guest_PC for the final BR).
-        "ldur x16, [sp, #-24]", // x16 = guest_tpidr
+        "ldur x16, [sp, #-16]", // x16 = guest_tpidr
         "msr tpidr_el0, x16",   // set guest TPIDR_EL0
-        "ldur x18, [sp, #-16]", // x18 = guest x18 (restored!)
         "ldur x16, [sp, #-8]",  // x16 = guest PC
-        "ldur x1,  [sp, #-32]", // x1 = guest x1 (from stash)
-        "ldur x0,  [sp, #-40]", // x0 = guest x0 (from stash)
+        "ldur x1,  [sp, #-24]", // x1 = guest x1 (from stash)
+        "ldur x0,  [sp, #-32]", // x0 = guest x0 (from stash)
         "br x16",               // jump to guest
         // Local trampoline for cbnz — macOS assembler rejects conditional
         // branches to non-assembler-local labels (only numbered labels qualify).
