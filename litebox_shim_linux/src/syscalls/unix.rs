@@ -1292,6 +1292,21 @@ impl<FS: ShimFS> UnixSocket<FS> {
             UnixSocketInner::Datagram(datagram) => datagram.get_local_addr(),
         }
     }
+
+    /// Shutdown the read side, write side, or both of a Unix socket.
+    pub(super) fn shutdown(&self, read: bool, write: bool) {
+        if let UnixSocketInner::Stream(stream) = &self.inner {
+            let state = stream.state.read();
+            if let Some(UnixStreamState::Connected(conn)) = &*state {
+                if read {
+                    conn.recv_channel.shutdown();
+                }
+                if write {
+                    conn.connected_send_channel.shutdown();
+                }
+            }
+        }
+    }
     pub(super) fn get_peer_addr(&self) -> Option<UnixSocketAddr> {
         match &self.inner {
             UnixSocketInner::Stream(stream) => stream.get_peer_addr(),

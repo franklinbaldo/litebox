@@ -2126,6 +2126,10 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         sockfd: i32,
         backlog: u16,
     },
+    Shutdown {
+        sockfd: i32,
+        how: i32,
+    },
     Setsockopt {
         sockfd: i32,
         level: u32,
@@ -2664,6 +2668,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::recvfrom => sys_req!(Recvfrom { sockfd, buf:*, len, flags, addr:*, addrlen:*, }),
             Sysno::bind => sys_req!(Bind { sockfd, sockaddr:*, addrlen }),
             Sysno::listen => sys_req!(Listen { sockfd, backlog }),
+            Sysno::shutdown => sys_req!(Shutdown { sockfd, how }),
             Sysno::setsockopt => sys_req!(Setsockopt {
                 sockfd,
                 level,

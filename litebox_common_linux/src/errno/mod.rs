@@ -465,6 +465,17 @@ impl From<litebox::net::errors::ListenError> for Errno {
     }
 }
 
+impl From<litebox::net::errors::ShutdownError> for Errno {
+    fn from(value: litebox::net::errors::ShutdownError) -> Self {
+        match value {
+            litebox::net::errors::ShutdownError::InvalidFd => Errno::EBADF,
+            litebox::net::errors::ShutdownError::NotConnected => Errno::ENOTCONN,
+
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl From<litebox::net::local_ports::LocalPortAllocationError> for Errno {
     fn from(value: litebox::net::local_ports::LocalPortAllocationError) -> Self {
         match value {

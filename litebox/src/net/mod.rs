@@ -821,6 +821,44 @@ where
         true
     }
 
+    /// Shutdown part of a full-duplex connection.
+    ///
+    /// `read` controls whether the read side is shut down, and `write` controls
+    /// the write side. At least one must be true.
+    pub fn shutdown(
+        &mut self,
+        fd: &SocketFd<Platform>,
+        read: bool,
+        write: bool,
+    ) -> Result<(), errors::ShutdownError> {
+        let table = self.litebox.descriptor_table();
+        let table_entry = table
+            .get_entry(fd)
+            .ok_or(errors::ShutdownError::InvalidFd)?;
+        let socket_handle = &table_entry.entry;
+        let proxy = socket_handle
+            .proxy
+            .as_ref()
+            .ok_or(errors::ShutdownError::NotConnected)?;
+
+        if read {
+            proxy.shutdown_read();
+        }
+        if write {
+            proxy.shutdown_write();
+            // For TCP, initiate a graceful close (FIN) on the smoltcp socket.
+            if let Protocol::Tcp = socket_handle.protocol() {
+                let tcp_socket: &mut tcp::Socket = self.socket_set.get_mut(socket_handle.handle);
+                tcp_socket.close();
+            }
+        }
+
+        drop(table_entry);
+        drop(table);
+        self.automated_platform_interaction(PollDirection::Both);
+        Ok(())
+    }
+
     /// Close the socket at `fd`
     pub fn close(
         &mut self,

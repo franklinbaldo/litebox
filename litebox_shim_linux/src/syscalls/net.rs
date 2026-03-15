@@ -757,6 +757,13 @@ impl<FS: ShimFS> GlobalState<FS> {
         self.net.lock().listen(fd, backlog).map_err(Errno::from)
     }
 
+    fn shutdown(&self, fd: &SocketFd, read: bool, write: bool) -> Result<(), Errno> {
+        self.net
+            .lock()
+            .shutdown(fd, read, write)
+            .map_err(Errno::from)
+    }
+
     /// Send data via socket channel (lock-free path).
     ///
     /// This uses the channel-based approach where the user writes to a TX ring buffer,
@@ -1405,6 +1412,31 @@ impl<FS: ShimFS> Task<FS> {
         )
     }
 
+    /// Handle syscall `shutdown`
+    pub(crate) fn sys_shutdown(&self, sockfd: i32, how: i32) -> Result<(), Errno> {
+        let Ok(sockfd) = u32::try_from(sockfd) else {
+            return Err(Errno::EBADF);
+        };
+        // SHUT_RD=0, SHUT_WR=1, SHUT_RDWR=2
+        let (read, write) = match how {
+            0 => (true, false),
+            1 => (false, true),
+            2 => (true, true),
+            _ => return Err(Errno::EINVAL),
+        };
+        self.do_shutdown(sockfd, read, write)
+    }
+    fn do_shutdown(&self, sockfd: u32, read: bool, write: bool) -> Result<(), Errno> {
+        self.files.borrow().with_socket(
+            sockfd,
+            |fd| self.global.shutdown(fd, read, write),
+            |file| {
+                file.shutdown(read, write);
+                Ok(())
+            },
+        )
+    }
+
     /// Handle syscall `sendto`
     pub(crate) fn sys_sendto(
         &self,
@@ -1851,6 +1883,12 @@ impl<FS: ShimFS> Task<FS> {
                 parse_socketcall_args!(2 => sys_listen {
                     sockfd: 0,
                     backlog: 1,
+                })
+            }
+            SocketcallType::Shutdown => {
+                parse_socketcall_args!(2 => sys_shutdown {
+                    sockfd: 0,
+                    how: 1,
                 })
             }
             SocketcallType::Accept => {

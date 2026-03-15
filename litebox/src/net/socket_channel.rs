@@ -237,6 +237,22 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
             NetworkProxy::Raw => unimplemented!(),
         }
     }
+
+    /// Shutdown the read side of the socket.
+    pub fn shutdown_read(&self) {
+        match self {
+            NetworkProxy::Stream(channel) => channel.shutdown_read(),
+            NetworkProxy::Datagram(_) | NetworkProxy::Raw => {}
+        }
+    }
+
+    /// Shutdown the write side of the socket.
+    pub fn shutdown_write(&self) {
+        match self {
+            NetworkProxy::Stream(channel) => channel.shutdown_write(),
+            NetworkProxy::Datagram(_) | NetworkProxy::Raw => {}
+        }
+    }
 }
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for NetworkProxy<Platform> {
     fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
