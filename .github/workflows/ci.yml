@@ -233,6 +233,24 @@ jobs:
       - name: Build documentation (fail on warnings)
         run: cargo doc --locked --verbose --no-deps --all-features --document-private-items -p litebox_runner_linux_on_windows_userland
 
+  cross_check_windows_arm64:
+    name: Cross-check Windows ARM64
+    runs-on: windows-latest
+    env:
+      RUSTFLAGS: -Dwarnings
+      RUSTDOCFLAGS: -Dwarnings
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v6
+      - name: Set up Rust
+        run: |
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component clippy --target aarch64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (cross-check ARM64)
+        run: cargo clippy --locked --verbose --target aarch64-pc-windows-msvc -p litebox_platform_windows_userland -p litebox_runner_linux_on_windows_userland -p litebox_syscall_rewriter
+      - name: Check (cross-check ARM64)
+        run: cargo check --locked --verbose --target aarch64-pc-windows-msvc -p litebox_platform_windows_userland -p litebox_runner_linux_on_windows_userland -p litebox_syscall_rewriter
+
   build_and_test_macos:
     name: Build and Test macOS (Apple Silicon)
     runs-on: macos-15
