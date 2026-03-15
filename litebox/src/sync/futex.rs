@@ -25,8 +25,13 @@ use thiserror::Error;
 
 /// A manager of all available futexes.
 ///
-/// Note: currently, this only supports "private" futexes, since it assumes only a single process.
-/// In the future, this may be expanded to support multi-process futexes.
+/// Supports both private and shared futexes. On userland platforms where all
+/// processes share a single flat virtual address space (with non-overlapping VA
+/// partitions), both private and shared futexes naturally work with
+/// `address_space_id = 0` because the same virtual address always refers to
+/// the same backing memory. On kernel platforms, the `address_space_id`
+/// discriminator prevents false aliasing between processes that might have
+/// overlapping virtual address ranges.
 pub struct FutexManager<Platform: RawSyncPrimitivesProvider> {
     /// Chaining hash table to map from futex address to waiter lists.
     table: alloc::boxed::Box<[LoanList<Platform, FutexEntry<Platform>>; HASH_TABLE_ENTRIES]>,

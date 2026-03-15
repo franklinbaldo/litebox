@@ -2463,19 +2463,12 @@ impl<FS: ShimFS> Task<FS> {
         &self,
         arg: litebox_common_linux::FutexArgs<litebox_platform_multiplex::Platform>,
     ) -> Result<usize, Errno> {
-        /// Note our mutex implementation assumes futexes are private as we don't support shared memory yet.
-        /// It should be fine to treat shared futexes as private for now.
-        macro_rules! warn_shared_futex {
-            ($flag:ident) => {
-                if !$flag.contains(litebox_common_linux::FutexFlags::PRIVATE) {
-                    log_unsupported!("shared futex");
-                }
-            };
-        }
-
         let res = match arg {
-            FutexArgs::Wake { addr, flags, count } => {
-                warn_shared_futex!(flags);
+            FutexArgs::Wake {
+                addr,
+                flags: _,
+                count,
+            } => {
                 let Some(count) = core::num::NonZeroU32::new(count) else {
                     return Ok(0);
                 };
@@ -2483,11 +2476,10 @@ impl<FS: ShimFS> Task<FS> {
             }
             FutexArgs::Wait {
                 addr,
-                flags,
+                flags: _,
                 val,
                 timeout,
             } => {
-                warn_shared_futex!(flags);
                 let timeout = timeout.read()?;
                 self.global.futex_manager.wait(
                     &self.wait_cx().with_timeout(timeout),
@@ -2505,7 +2497,6 @@ impl<FS: ShimFS> Task<FS> {
                 timeout,
                 bitmask,
             } => {
-                warn_shared_futex!(flags);
                 let deadline = if let Some(timeout) = timeout.read()? {
                     let clock_id =
                         if flags.contains(litebox_common_linux::FutexFlags::CLOCK_REALTIME) {
