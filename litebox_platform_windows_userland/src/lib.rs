@@ -738,7 +738,9 @@ unsafe extern "C-unwind" fn run_thread_arch(thread_ctx: &mut ThreadContext, tls_
     .globl  syscall_callback
 syscall_callback:
     // Get the TLS state from the TLS slot and clear the in-guest flag.
-    ldr     w16, [{TLS_INDEX}]
+    // ARM64 requires adrp+ldr pair for PC-relative symbol access.
+    adrp    x16, {TLS_INDEX}
+    ldr     w16, [x16, :lo12:{TLS_INDEX}]
     // TEB is in X18; TLS slot address = X18 + TEB_TLS_SLOTS_OFFSET + index*8
     add     x16, x18, x16, lsl #3
     ldr     x16, [x16, #TEB_TLS_SLOTS_OFFSET]

@@ -46,6 +46,7 @@ pub enum Error {
     #[error("provided trampoline address is too large for 32-bit executable")]
     TrampolineAddressTooLarge,
     #[error("unsupported target OS for this architecture: {0}")]
+    #[allow(dead_code, reason = "no longer emitted but kept for API compatibility")]
     UnsupportedTargetOs(&'static str),
 }
 

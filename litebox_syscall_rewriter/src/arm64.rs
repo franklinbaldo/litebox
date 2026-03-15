@@ -26,6 +26,19 @@ impl TargetOs {
         matches!(self, Self::MacOs)
     }
 
+    pub const fn is_windows(self) -> bool {
+        matches!(self, Self::Windows)
+    }
+
+    /// Whether the target OS requires X18 virtualization.
+    ///
+    /// On macOS, the kernel zeros X18 on every exception entry.
+    /// On Windows, X18 is reserved as the TEB pointer and must not be clobbered.
+    /// On Linux, X18 is a free GPR and needs no rewriting.
+    pub const fn needs_x18_rewriting(self) -> bool {
+        matches!(self, Self::MacOs | Self::Windows)
+    }
+
     // Shared SVC handler
     pub const fn shared_svc_handler_insn_count(self) -> usize {
         match self {
@@ -138,10 +151,8 @@ impl TargetOs {
 
     pub const fn gates_start_offset(self) -> usize {
         match self {
-            Self::Linux | Self::Windows => {
-                self.shared_msr_handler_offset() + self.shared_msr_handler_size()
-            }
-            Self::MacOs => {
+            Self::Linux => self.shared_msr_handler_offset() + self.shared_msr_handler_size(),
+            Self::Windows | Self::MacOs => {
                 self.shared_x18_save_handler_offset() + self.shared_x18_save_handler_size()
             }
         }
@@ -738,11 +749,14 @@ enum PatchKind {
     /// The `u8` is the destination register number (0-30 for X0-X30, 31 for XZR).
     /// Rewritten to read from TLS table entry[0] instead of the hardware register.
     MrsTpidr(u8),
-    /// An instruction that references X18 (macOS only).
+    /// An instruction that references X18 (macOS and Windows only).
     ///
     /// On macOS, x18 is zeroed by the kernel on every return to userspace, so every
     /// instruction that reads or writes x18 must be rewritten to load/store from the
     /// per-thread `guest_x18` cell in the TCB.
+    /// On Windows, x18 is reserved as the TEB pointer and must not be clobbered by
+    /// guest code. Instructions referencing x18 are rewritten to use a scratch register
+    /// that loads/stores from a TLS-backed virtual x18 slot.
     X18Use {
         /// The original 32-bit instruction word.
         insn: u32,
@@ -1206,8 +1220,8 @@ fn find_patch_sites(
                     kind: PatchKind::MrsTpidr(rd),
                 });
             }
-            // macOS: check for x18 references (after SVC/MSR/MRS checks to avoid double-patching)
-            if target_os.is_macos()
+            // macOS/Windows: check for x18 references (after SVC/MSR/MRS checks to avoid double-patching)
+            if target_os.needs_x18_rewriting()
                 && insn != SVC_0
                 && (insn & MSR_TPIDR_EL0_MASK) != MSR_TPIDR_EL0_BITS
                 && (insn & MRS_TPIDR_EL0_MASK) != MRS_TPIDR_EL0_BITS
@@ -1273,10 +1287,6 @@ pub(crate) fn hook_syscalls_aarch64(
     trampoline: u64,
     target_os: TargetOs,
 ) -> Result<(Vec<u8>, bool)> {
-    if matches!(target_os, TargetOs::Windows) {
-        return Err(Error::UnsupportedTargetOs("aarch64-windows"));
-    }
-
     // Find all SVC #0, MSR TPIDR_EL0, and MRS TPIDR_EL0 sites
     let sites = find_patch_sites(text_sections, buf, target_os)?;
 
@@ -1286,7 +1296,7 @@ pub(crate) fn hook_syscalls_aarch64(
         .iter()
         .any(|s| matches!(s.kind, PatchKind::MsrTpidr(_) | PatchKind::MrsTpidr(_)));
 
-    let has_x18_sites = if target_os.is_macos() {
+    let has_x18_sites = if target_os.needs_x18_rewriting() {
         sites
             .iter()
             .any(|s| matches!(s.kind, PatchKind::X18Use { .. }))
@@ -1350,8 +1360,8 @@ pub(crate) fn hook_syscalls_aarch64(
             target_os,
         )?;
 
-        // macOS: shared MRS handler, x18 load handler, x18 save handler
-        if target_os.is_macos() {
+        // macOS/Windows: shared MRS handler, x18 load handler, x18 save handler
+        if target_os.needs_x18_rewriting() {
             debug_assert_eq!(trampoline_data.len(), target_os.shared_mrs_handler_offset());
             emit_shared_mrs_handler(
                 &mut trampoline_data,
@@ -1441,8 +1451,8 @@ pub(crate) fn hook_syscalls_aarch64(
         target_os,
     )?;
 
-    // macOS: shared MRS handler, x18 load handler, x18 save handler
-    if target_os.is_macos() {
+    // macOS/Windows: shared MRS handler, x18 load handler, x18 save handler
+    if target_os.needs_x18_rewriting() {
         debug_assert_eq!(trampoline_data.len(), target_os.shared_mrs_handler_offset());
         emit_shared_mrs_handler(
             &mut trampoline_data,
@@ -2570,15 +2580,16 @@ fn emit_shared_msr_handler_macos(
 /// Emit the shared MRS handler (macOS only).
 ///
 /// On Linux there is no shared MRS handler — the MRS gate reads entry[0].guest_tpidr
-/// inline. On macOS the handler does a TPIDRRO_EL0-keyed TLS table lookup to find
-/// the correct TCB and loads guest_tpidr from it into [SP+24] for the gate.
+/// inline. On macOS/Windows the handler does a TLS table lookup (keyed by TPIDRRO_EL0
+/// on macOS, TPIDR_EL0 on Windows) to find the correct TCB and loads guest_tpidr from
+/// it into [SP+24] for the gate.
 fn emit_shared_mrs_handler(
     trampoline_data: &mut Vec<u8>,
     handler_offset: usize,
     trampoline_base_addr: u64,
     target_os: TargetOs,
 ) -> Result<()> {
-    emit_shared_mrs_handler_macos(
+    emit_shared_mrs_handler_tls_lookup(
         trampoline_data,
         handler_offset,
         trampoline_base_addr,
@@ -2586,9 +2597,9 @@ fn emit_shared_mrs_handler(
     )
 }
 
-/// macOS shared MRS handler: TPIDRRO_EL0-keyed lookup, reads guest_tpidr from TCB.
+/// Shared MRS handler with TLS table lookup.
 ///
-/// Uses TPIDRRO_EL0 (stable per-pthread, never clobbered) as the TLS table lookup key.
+/// Uses TPIDRRO_EL0 (macOS) or TPIDR_EL0 (Windows) as the TLS table lookup key.
 /// On match: loads host_tls (TCB ptr), reads TCB.guest_tpidr (offset 24), stores to
 /// [SP+24] for the gate to pick up. On sentinel: BRK (unknown thread = bug).
 ///
@@ -2617,7 +2628,7 @@ fn emit_shared_mrs_handler(
 /// [15]  BRK  #1                   ; .Ltrap: unreachable
 /// ```
 #[allow(clippy::cast_possible_wrap)]
-fn emit_shared_mrs_handler_macos(
+fn emit_shared_mrs_handler_tls_lookup(
     trampoline_data: &mut Vec<u8>,
     handler_offset: usize,
     trampoline_base_addr: u64,
@@ -2636,8 +2647,12 @@ fn emit_shared_mrs_handler_macos(
     );
     insn_idx += 1;
 
-    // [1] MRS X16, TPIDRRO_EL0 — stable lookup key
-    trampoline_data.extend_from_slice(&encode_mrs_tpidrro_el0(16).to_le_bytes());
+    // [1] MRS X16, TPIDRRO_EL0 (macOS) or MRS X16, TPIDR_EL0 (Windows) — lookup key
+    if target_os.is_macos() {
+        trampoline_data.extend_from_slice(&encode_mrs_tpidrro_el0(16).to_le_bytes());
+    } else {
+        trampoline_data.extend_from_slice(&encode_mrs_tpidr_el0(16).to_le_bytes());
+    }
     insn_idx += 1;
 
     // [2] LDR X17, [PC, #offset] — X17 = TLS table base
@@ -2645,7 +2660,7 @@ fn emit_shared_mrs_handler_macos(
     let ldr_tls_offset = tls_table_vaddr.cast_signed() - ldr_tls_vaddr.cast_signed();
     let ldr_tls_insn = encode_ldr_literal(17, ldr_tls_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
-            "LDR literal offset {ldr_tls_offset:#x} out of range for macOS shared MRS handler TLS load"
+            "LDR literal offset {ldr_tls_offset:#x} out of range for shared MRS handler TLS load"
         ))
     })?;
     trampoline_data.extend_from_slice(&ldr_tls_insn.to_le_bytes());
@@ -2807,8 +2822,12 @@ fn emit_shared_x18_load_handler(
     );
     insn_idx += 1;
 
-    // [1] MRS X16, TPIDRRO_EL0 — stable lookup key
-    trampoline_data.extend_from_slice(&encode_mrs_tpidrro_el0(16).to_le_bytes());
+    // [1] MRS X16, TPIDRRO_EL0 (macOS) or MRS X16, TPIDR_EL0 (Windows) — lookup key
+    if target_os.is_macos() {
+        trampoline_data.extend_from_slice(&encode_mrs_tpidrro_el0(16).to_le_bytes());
+    } else {
+        trampoline_data.extend_from_slice(&encode_mrs_tpidr_el0(16).to_le_bytes());
+    }
     insn_idx += 1;
 
     // [2] LDR X17, [PC, #offset] — X17 = TLS table base
@@ -2816,7 +2835,7 @@ fn emit_shared_x18_load_handler(
     let ldr_tls_offset = tls_table_vaddr.cast_signed() - ldr_tls_vaddr.cast_signed();
     let ldr_tls_insn = encode_ldr_literal(17, ldr_tls_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
-            "LDR literal offset {ldr_tls_offset:#x} out of range for macOS shared x18 load handler TLS load"
+            "LDR literal offset {ldr_tls_offset:#x} out of range for shared x18 load handler TLS load"
         ))
     })?;
     trampoline_data.extend_from_slice(&ldr_tls_insn.to_le_bytes());
@@ -2976,8 +2995,12 @@ fn emit_shared_x18_save_handler(
     );
     insn_idx += 1;
 
-    // [1] MRS X16, TPIDRRO_EL0 — stable lookup key
-    trampoline_data.extend_from_slice(&encode_mrs_tpidrro_el0(16).to_le_bytes());
+    // [1] MRS X16, TPIDRRO_EL0 (macOS) or MRS X16, TPIDR_EL0 (Windows) — lookup key
+    if target_os.is_macos() {
+        trampoline_data.extend_from_slice(&encode_mrs_tpidrro_el0(16).to_le_bytes());
+    } else {
+        trampoline_data.extend_from_slice(&encode_mrs_tpidr_el0(16).to_le_bytes());
+    }
     insn_idx += 1;
 
     // [2] LDR X17, [PC, #offset] — X17 = TLS table base
@@ -2985,7 +3008,7 @@ fn emit_shared_x18_save_handler(
     let ldr_tls_offset = tls_table_vaddr.cast_signed() - ldr_tls_vaddr.cast_signed();
     let ldr_tls_insn = encode_ldr_literal(17, ldr_tls_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
-            "LDR literal offset {ldr_tls_offset:#x} out of range for macOS shared x18 save handler TLS load"
+            "LDR literal offset {ldr_tls_offset:#x} out of range for shared x18 save handler TLS load"
         ))
     })?;
     trampoline_data.extend_from_slice(&ldr_tls_insn.to_le_bytes());
