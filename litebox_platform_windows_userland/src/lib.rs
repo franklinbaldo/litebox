@@ -481,8 +481,22 @@ fn run_thread_inner(
         ctx,
         tls: &tls_state,
     };
-    ThreadHandle::run_with_handle(&tls_state, || unsafe {
-        run_thread_arch(&mut thread_ctx, &tls_state);
+    ThreadHandle::run_with_handle(&tls_state, || {
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Register this thread in the TLS lookup table used by the
+            // rewriter's shared SVC/X18 handlers. The key is TPIDR_EL0 which
+            // we set to the TlsState address.
+            update_host_tls_entry(&tls_state);
+        }
+        unsafe {
+            run_thread_arch(&mut thread_ctx, &tls_state);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Remove our entry from the TLS table before TlsState is dropped.
+            remove_host_tls_entries(&tls_state);
+        }
     });
 }
 
@@ -1015,6 +1029,13 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
             // Ensure the context is written before we set `is_in_guest`.
             std::sync::atomic::compiler_fence(Ordering::Release);
             tls.is_in_guest.set(true);
+            // Set TPIDR_EL0 to our lookup key (TlsState address) so the
+            // rewriter's shared handlers can find our TLS entry. The kernel
+            // may wipe this on context switches; the shared handler's fallback
+            // to entry[0] handles that case.
+            unsafe {
+                litebox_common_linux::write_tpidr_el0(core::ptr::from_ref(tls) as usize);
+            }
             unsafe {
                 let status = NtContinue(win_ctx, 0);
                 panic!(
@@ -2145,6 +2166,118 @@ struct ThreadContext<'a> {
     tls: &'a TlsState,
 }
 
+// ============================================================
+// ARM64 TLS lookup table management
+// ============================================================
+//
+// The rewriter's shared SVC and X18 handlers use a TLS lookup table to find the
+// per-thread TlsState (host context). Each entry is 16 bytes:
+//   [+0] key:   TPIDR_EL0 value (set by us before guest entry)
+//   [+8] value: pointer to TlsState
+//
+// The table is allocated by the loader and its address is stored in the trampoline
+// header at offset 8 (HEADER_TLS_TABLE_OFFSET). The global address is also cached
+// in HOST_TLS_TABLE_ADDR for Rust code to use.
+//
+// On Windows ARM64, we use the TlsState address itself as the TPIDR_EL0 key
+// (written just before NtContinue). If the kernel wipes TPIDR_EL0, the shared
+// handler's fallback to entry[0] handles it.
+
+#[cfg(target_arch = "aarch64")]
+const TLS_TABLE_ENTRIES: usize = 256;
+#[cfg(target_arch = "aarch64")]
+const TLS_TABLE_SENTINEL: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+
+/// Register or update the current thread's entry in the TLS lookup table.
+///
+/// Uses the TlsState address as the TPIDR_EL0 key and stores a pointer to the
+/// TlsState as the value. Thread-safe via atomic CAS on the key slot.
+#[cfg(target_arch = "aarch64")]
+fn update_host_tls_entry(tls: &TlsState) {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    let table_addr = litebox_common_linux::HOST_TLS_TABLE_ADDR.load(Ordering::Acquire);
+    if table_addr == 0 {
+        return; // No TLS table (not using rewriter-based trampoline)
+    }
+
+    let tls_key = core::ptr::from_ref(tls) as u64;
+    let tls_value = core::ptr::from_ref(tls) as u64;
+
+    'retry: loop {
+        let mut first_free: Option<usize> = None;
+
+        for index in 0..TLS_TABLE_ENTRIES {
+            let key_ptr = unsafe { &*((table_addr + index * 16) as *const AtomicU64) };
+            let stored_key = key_ptr.load(Ordering::Acquire);
+
+            if stored_key == tls_key {
+                // Found our entry — update value.
+                let val_ptr = (table_addr + index * 16 + 8) as *mut u64;
+                unsafe { val_ptr.write_volatile(tls_value) };
+                return;
+            }
+
+            if stored_key == TLS_TABLE_SENTINEL {
+                if first_free.is_none() {
+                    first_free = Some(index);
+                }
+                break;
+            }
+
+            // Tombstone (key=0): candidate for reclamation.
+            if stored_key == 0 && first_free.is_none() {
+                first_free = Some(index);
+            }
+        }
+
+        let free_index = first_free.expect("TLS table full: exceeded 256 concurrent threads");
+        let key_ptr = unsafe { &*((table_addr + free_index * 16) as *const AtomicU64) };
+        let val_ptr = (table_addr + free_index * 16 + 8) as *mut u64;
+
+        let current = key_ptr.load(Ordering::Acquire);
+        if current != TLS_TABLE_SENTINEL && current != 0 {
+            continue 'retry;
+        }
+
+        if key_ptr
+            .compare_exchange(current, tls_key, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            unsafe { val_ptr.write_volatile(tls_value) };
+            return;
+        }
+        // CAS failed — rescan.
+    }
+}
+
+/// Remove the current thread's TLS table entry by writing a tombstone (key=0).
+#[cfg(target_arch = "aarch64")]
+fn remove_host_tls_entries(tls: &TlsState) {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    let table_addr = litebox_common_linux::HOST_TLS_TABLE_ADDR.load(Ordering::Acquire);
+    if table_addr == 0 {
+        return;
+    }
+
+    let tls_key = core::ptr::from_ref(tls) as u64;
+
+    for index in 0..TLS_TABLE_ENTRIES {
+        let key_ptr = unsafe { &*((table_addr + index * 16) as *const AtomicU64) };
+        let stored_key = key_ptr.load(Ordering::Acquire);
+
+        if stored_key == tls_key {
+            key_ptr.store(0, Ordering::Release);
+            return;
+        }
+
+        if stored_key == TLS_TABLE_SENTINEL {
+            return;
+        }
+    }
+}
+
 impl ThreadContext<'_> {
     /// Calls `f` in order to call into a shim entrypoint.
     fn call_shim(
@@ -2160,7 +2293,11 @@ impl ThreadContext<'_> {
         // before returning.
         let op = f(self.shim, self.ctx, self.tls.interrupt.replace(false));
         match op {
-            ContinueOperation::Resume => unsafe { switch_to_guest(self.ctx) },
+            ContinueOperation::Resume => {
+                #[cfg(target_arch = "aarch64")]
+                update_host_tls_entry(self.tls);
+                unsafe { switch_to_guest(self.ctx) }
+            }
             ContinueOperation::Terminate => {}
         }
     }
