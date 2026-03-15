@@ -325,18 +325,24 @@ fn run_dynamic_linked_prog_with_rewriter(
 
     // Run litebox_runner_linux_on_windows_userland with the tar file and the compiled executable
     // Determine where the rtld_audit library was placed
-    let audit_path = libs_without_rewrite
+    let audit_path = libs_to_rewrite
         .iter()
+        .chain(libs_without_rewrite.iter())
         .find(|(name, _)| *name == "litebox_rtld_audit.so")
         .map(|(_, prefix)| format!("{prefix}/litebox_rtld_audit.so"))
         .unwrap_or_else(|| "/lib64/litebox_rtld_audit.so".to_string());
     let audit_env = format!("LD_AUDIT={audit_path}");
 
-    // Build LD_LIBRARY_PATH from all library prefixes used.
-    let mut ld_paths: Vec<&str> = vec!["/lib64", "/lib32", "/lib"];
+    // Build LD_LIBRARY_PATH from all library prefixes used (test paths first).
+    let mut ld_paths: Vec<&str> = Vec::new();
     for (_, prefix) in libs_to_rewrite.iter().chain(libs_without_rewrite.iter()) {
         if !ld_paths.contains(prefix) {
             ld_paths.push(prefix);
+        }
+    }
+    for default in ["/lib64", "/lib32", "/lib"] {
+        if !ld_paths.contains(&default) {
+            ld_paths.push(default);
         }
     }
     let ld_library_path = format!("LD_LIBRARY_PATH={}", ld_paths.join(":"));
@@ -389,6 +395,25 @@ fn test_testcase_dynamic_with_rewriter() {
 #[test]
 fn test_testcase_dynamic_with_rewriter() {
     let exec_name = "hello_world_dyn";
+    let libs_to_rewrite = [
+        ("libc.so.6", "/lib/aarch64-linux-gnu"),
+        ("ld-linux-aarch64.so.1", "/lib"),
+    ];
+    let libs_without_rewrite = [("litebox_rtld_audit.so", "/lib")];
+
+    run_dynamic_linked_prog_with_rewriter(
+        &libs_to_rewrite,
+        &libs_without_rewrite,
+        exec_name,
+        &[],
+        |_| {},
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn test_testcase_thread_dynamic_with_rewriter() {
+    let exec_name = "hello_thread";
     let libs_to_rewrite = [
         ("libc.so.6", "/lib/aarch64-linux-gnu"),
         ("ld-linux-aarch64.so.1", "/lib"),

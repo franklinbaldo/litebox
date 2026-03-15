@@ -160,31 +160,39 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5,
   //   4. Set x30 = return address, BR to callback
   uint64_t tls_table = tls_table_ptr;
   __asm__ volatile(
-    // Read TPIDRRO_EL0 to detect platform.
-    // We use x16 (not x18) because XNU zeros x18 on every
-    // kernel→userspace transition (preemptive context switches).
+#if defined(TARGET_MACOS)
+    // Read TPIDRRO_EL0 to detect macOS.
     "mrs  x16, tpidrro_el0\n"       // x16 = TPIDRRO_EL0
     "cbnz x16, 10f\n"               // non-zero → macOS path
+#endif
 
     // ---- Linux path: 32-byte frame, TPIDR_EL0 keyed ----
+    // On Windows ARM64, X18 is the TEB pointer and must not be clobbered.
+    // Use X30 (saved at [SP+16]) instead of X18 for the TPIDR_EL0 lookup key
+    // and host_tls result. The caller (syscall_callback) reads host_tls from
+    // [SP+24] on Windows, not from X18.
     "sub  sp, sp, #32\n"
     "str  x16, [sp, #0]\n"
     "str  x17, [sp, #8]\n"
+    // Set x30 = return address BEFORE storing to [SP+16], so
+    // syscall_callback reads the correct return PC from [SP+16].
+    "adr  x30, 4f\n"                // x30 = return address after syscall
     "str  x30, [sp, #16]\n"
-    "mrs  x18, tpidr_el0\n"         // x18 = guest TPIDR (lookup key on Linux)
-    "str  x18, [sp, #24]\n"         // save guest_tpidr on stack
+    "mrs  x30, tpidr_el0\n"         // x30 = guest TPIDR (lookup key, avoids X18)
+    "str  x30, [sp, #24]\n"         // save guest_tpidr on stack
     "mov  x17, %[tls_table]\n"      // x17 = TLS table base
     "cbz  x17, 2f\n"                // skip lookup if NULL
     "1:\n"                           // .Lloop_linux
     "ldr  x16, [x17, #0]\n"         // x16 = entry.guest_tpidr
     "cmn  x16, #1\n"                // sentinel?
     "b.eq 5f\n"                      // -> fallback to entry[0]
-    "cmp  x16, x18\n"               // match?
+    "cmp  x16, x30\n"               // match? (x30 instead of x18)
     "b.eq 3f\n"                      // -> found
     "add  x17, x17, #16\n"          // next entry
     "b    1b\n"                      // -> loop
     "3:\n"                           // .Lfound_linux
-    "ldr  x18, [x17, #8]\n"         // x18 = host_tls
+    "ldr  x16, [x17, #8]\n"         // x16 = host_tls (NOT x18!)
+    "str  x16, [sp, #24]\n"         // store host_tls at [SP+24] for callback
     "b    2f\n"                      // -> done
     "5:\n"                           // .Lfallback_linux
     // No match — TPIDR_EL0 was clobbered by host context switch.
@@ -192,12 +200,13 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5,
     "mov  x17, %[tls_table]\n"      // reload table base
     "ldr  x16, [x17, #0]\n"         // entry[0].guest_tpidr
     "str  x16, [sp, #24]\n"         // fix guest_tpidr on stack
-    "ldr  x18, [x17, #8]\n"         // x18 = entry[0].host_tls
+    "ldr  x16, [x17, #8]\n"         // x16 = entry[0].host_tls (NOT x18!)
+    "str  x16, [sp, #24]\n"         // store host_tls at [SP+24]
     "2:\n"                           // .Ldone_linux
-    "adr  x30, 4f\n"                // x30 = return address
     "mov  x16, %[entry]\n"
     "br   x16\n"                     // jump to syscall_callback
 
+#if defined(TARGET_MACOS)
     // ---- macOS path: 48-byte frame, TPIDRRO_EL0 keyed ----
     // x18 is NOT used anywhere in this path — XNU may zero it at any time.
     "10:\n"                          // .Lmacos
@@ -231,6 +240,7 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5,
     "br   x16\n"                     // jump to syscall_callback
     "16:\n"                          // .Ltrap_macos
     "brk  #1\n"                      // unreachable: unknown thread
+#endif // TARGET_MACOS
 
     "4:\n"                           // return point (shared by both paths)
     : "+r"(x0)

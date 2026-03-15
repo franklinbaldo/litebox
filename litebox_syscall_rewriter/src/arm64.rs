@@ -42,7 +42,10 @@ impl TargetOs {
     // Shared SVC handler
     pub const fn shared_svc_handler_insn_count(self) -> usize {
         match self {
-            Self::Linux | Self::Windows | Self::MacOs => 18,
+            Self::Linux | Self::MacOs => 18,
+            // Windows: 2 extra instructions to store host_tls to stack frame
+            // (avoids X16 clobber by linker veneers on BR to callback).
+            Self::Windows => 20,
         }
     }
     pub const fn shared_svc_handler_size(self) -> usize {
@@ -1584,7 +1587,13 @@ fn emit_shared_svc_handler(
     target_os: TargetOs,
 ) -> Result<()> {
     match target_os {
-        TargetOs::Linux | TargetOs::Windows => emit_shared_svc_handler_linux(
+        TargetOs::Linux => emit_shared_svc_handler_linux(
+            trampoline_data,
+            handler_offset,
+            trampoline_base_addr,
+            target_os,
+        ),
+        TargetOs::Windows => emit_shared_svc_handler_windows(
             trampoline_data,
             handler_offset,
             trampoline_base_addr,
@@ -1782,7 +1791,211 @@ fn emit_shared_svc_handler_linux(
     Ok(())
 }
 
-/// macOS shared SVC handler: TPIDRRO_EL0-keyed lookup, x18 save, guest_tpidr from TCB.
+/// Windows shared SVC handler: same logic as Linux but avoids clobbering X18 (TEB).
+///
+/// On Windows ARM64, X18 is the TEB pointer and must not be modified. This handler
+/// uses X30 (saved in the SVC gate frame at [SP+16]) instead of X18 for the
+/// TPIDR_EL0 lookup key. The host_tls result goes into X16, and the callback
+/// address is loaded last via a PC-relative LDR.
+///
+/// Register allocation:
+///   X30: TPIDR_EL0 value (lookup key) — already saved at [SP+16] by SVC gate
+///   X17: TLS table pointer
+///   X16: entry fields, host_tls, callback address
+#[allow(clippy::cast_possible_wrap)]
+fn emit_shared_svc_handler_windows(
+    trampoline_data: &mut Vec<u8>,
+    handler_offset: usize,
+    trampoline_base_addr: u64,
+    target_os: TargetOs,
+) -> Result<()> {
+    let handler_vaddr = trampoline_base_addr + handler_offset as u64;
+    let mut insn_idx: usize = 0;
+    let insn_vaddr = |idx: usize| -> u64 { handler_vaddr + (idx as u64) * 4 };
+    let tls_table_vaddr = trampoline_base_addr + HEADER_TLS_TABLE_OFFSET as u64;
+
+    // [0] MRS X30, TPIDR_EL0 — use X30 (saved by SVC gate) instead of X18
+    trampoline_data.extend_from_slice(&encode_mrs_tpidr_el0(30).to_le_bytes());
+    insn_idx += 1;
+
+    // [1] STR X30, [SP, #24] — save guest TPIDR
+    trampoline_data.extend_from_slice(
+        &encode_str_imm_unsigned(30, 31, 24)
+            .expect("offset 24 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [2] LDR X17, [PC, #offset] — X17 = TLS table base
+    let ldr_tls_vaddr = insn_vaddr(insn_idx);
+    let ldr_tls_offset = tls_table_vaddr.cast_signed() - ldr_tls_vaddr.cast_signed();
+    let ldr_tls_insn = encode_ldr_literal(17, ldr_tls_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "LDR literal offset {ldr_tls_offset:#x} out of range for Windows shared SVC handler"
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&ldr_tls_insn.to_le_bytes());
+    insn_idx += 1;
+
+    // [3] .Lloop: LDR X16, [X17, #0] — X16 = entry.guest_tpidr
+    let loop_idx = insn_idx;
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(16, 17, 0)
+            .expect("offset 0 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [4] CMN X16, #1 — sentinel?
+    trampoline_data.extend_from_slice(&encode_cmn_imm(16, 1).expect("imm12=1 fits").to_le_bytes());
+    insn_idx += 1;
+
+    // [5] B.EQ .Lfallback -> [13]
+    let fallback_idx = 13usize;
+    let beq_fallback_offset = (fallback_idx as i64 - insn_idx as i64) * 4;
+    let beq_fallback = encode_b_cond(COND_EQ, beq_fallback_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "B.EQ offset {beq_fallback_offset:#x} out of range in Windows shared SVC handler"
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&beq_fallback.to_le_bytes());
+    insn_idx += 1;
+
+    // [6] CMP X16, X30 — match guest TPIDR? (X30 instead of X18)
+    trampoline_data.extend_from_slice(&encode_cmp_reg(16, 30).to_le_bytes());
+    insn_idx += 1;
+
+    // [7] B.EQ .Lfound -> [10]
+    let found_idx = 10usize;
+    let beq_found_offset = (found_idx as i64 - insn_idx as i64) * 4;
+    let beq_found = encode_b_cond(COND_EQ, beq_found_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "B.EQ offset {beq_found_offset:#x} out of range in Windows shared SVC handler"
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&beq_found.to_le_bytes());
+    insn_idx += 1;
+
+    // [8] ADD X17, X17, #16 — next entry
+    trampoline_data.extend_from_slice(
+        &encode_add_imm(17, 17, 16)
+            .expect("imm12=16 fits")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [9] B .Lloop -> [3]
+    let b_loop_offset = (loop_idx as i64 - insn_idx as i64) * 4;
+    let b_loop = encode_b(b_loop_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "B offset {b_loop_offset:#x} out of range in Windows shared SVC handler loop"
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&b_loop.to_le_bytes());
+    insn_idx += 1;
+
+    // [10] .Lfound: LDR X16, [X17, #8] — X16 = host_tls
+    debug_assert_eq!(insn_idx, found_idx);
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(16, 17, 8)
+            .expect("offset 8 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [11] STR X16, [SP, #24] — store host_tls to frame for syscall_callback
+    // (Overwrites guest_tpidr at [SP+24] which was saved at instruction [1].
+    // The callback reads host_tls from [SP+24] instead of X16, because the
+    // BR X17 to callback may go through a linker veneer that clobbers X16.)
+    trampoline_data.extend_from_slice(
+        &encode_str_imm_unsigned(16, 31, 24)
+            .expect("offset 24 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [12] B .Ldone -> [18]
+    let done_idx = 18usize;
+    let b_done_offset = (done_idx as i64 - insn_idx as i64) * 4;
+    let b_done = encode_b(b_done_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "B offset {b_done_offset:#x} out of range in Windows shared SVC handler done"
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&b_done.to_le_bytes());
+    insn_idx += 1;
+
+    // [12] .Lfallback: LDR X17, [PC, #offset] — reload TLS table base
+    debug_assert_eq!(insn_idx, fallback_idx);
+    let fallback_ldr_vaddr = insn_vaddr(insn_idx);
+    let fallback_ldr_offset = tls_table_vaddr.cast_signed() - fallback_ldr_vaddr.cast_signed();
+    let fallback_ldr_insn = encode_ldr_literal(17, fallback_ldr_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "LDR literal offset {fallback_ldr_offset:#x} out of range for Windows SVC handler fallback"
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&fallback_ldr_insn.to_le_bytes());
+    insn_idx += 1;
+
+    // [13] LDR X30, [X17, #0] — X30 = entry[0].guest_tpidr
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(30, 17, 0)
+            .expect("offset 0 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [14] STR X30, [SP, #24] — fix guest_tpidr on stack
+    trampoline_data.extend_from_slice(
+        &encode_str_imm_unsigned(30, 31, 24)
+            .expect("offset 24 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [16] LDR X16, [X17, #8] — X16 = entry[0].host_tls (fallback)
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(16, 17, 8)
+            .expect("offset 8 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [16b] STR X16, [SP, #24] — store host_tls to frame (fallback path)
+    trampoline_data.extend_from_slice(
+        &encode_str_imm_unsigned(16, 31, 24)
+            .expect("offset 24 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [17] .Ldone: LDR X17, [PC, #offset_to_callback]
+    // Use X17 for callback since X16 holds host_tls
+    debug_assert_eq!(insn_idx, done_idx);
+    let ldr_cb_vaddr = insn_vaddr(insn_idx);
+    let callback_vaddr = trampoline_base_addr + HEADER_CALLBACK_OFFSET as u64;
+    let ldr_cb_offset = callback_vaddr.cast_signed() - ldr_cb_vaddr.cast_signed();
+    let ldr_cb_insn = encode_ldr_literal(17, ldr_cb_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "LDR literal offset {ldr_cb_offset:#x} out of range for Windows shared SVC handler callback"
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&ldr_cb_insn.to_le_bytes());
+    insn_idx += 1;
+
+    // [17] BR X17 — jump to callback with X16 = host_tls
+    trampoline_data.extend_from_slice(&encode_br(17).to_le_bytes());
+    insn_idx += 1;
+
+    debug_assert_eq!(insn_idx, target_os.shared_svc_handler_insn_count());
+    debug_assert_eq!(
+        trampoline_data.len() - handler_offset,
+        target_os.shared_svc_handler_size(),
+        "Windows shared SVC handler size mismatch"
+    );
+
+    Ok(())
+}
 ///
 /// Uses TPIDRRO_EL0 (stable per-pthread, never clobbered) as the TLS table lookup key.
 /// On match: loads host_tls (TCB ptr), saves guest x18 to TCB, loads guest_tpidr to frame.

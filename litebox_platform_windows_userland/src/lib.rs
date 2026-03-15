@@ -134,6 +134,9 @@ impl WindowsUserland {
 unsafe extern "system" fn vectored_exception_handler(
     exception_info: *mut EXCEPTION_POINTERS,
 ) -> i32 {
+    #[cfg(target_arch = "aarch64")]
+    {}
+
     let Some(tls) = get_tls_ptr() else {
         // TLS slot not initialized yet; cannot be in guest
         return EXCEPTION_CONTINUE_SEARCH;
@@ -154,6 +157,9 @@ unsafe extern "system" fn vectored_exception_handler(
         #[cfg(target_arch = "aarch64")]
         let ip = context.Pc.truncate();
 
+        #[cfg(target_arch = "aarch64")]
+        {}
+
         if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
             && let Some(recover) = litebox::mm::exception_table::search_exception_tables(ip)
         {
@@ -173,6 +179,109 @@ unsafe extern "system" fn vectored_exception_handler(
         }
     }
     tls.is_in_guest.set(false);
+
+    // ARM64: Restore TEB stack limits FIRST — before any host code that might
+    // trigger __chkstk. The limits are still set to the guest stack range.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let teb: usize;
+        core::arch::asm!("mov {}, x18", out(reg) teb);
+        let orig_base = tls.orig_stack_base.get();
+        let orig_limit = tls.orig_stack_limit.get();
+        if orig_base != 0 {
+            ((teb + 0x8) as *mut usize).write_volatile(orig_base);
+            ((teb + 0x10) as *mut usize).write_volatile(orig_limit);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Try to handle access violations as demand-paging faults.
+        // On Windows, reserved-but-not-committed pages cause access violations
+        // that need explicit page commitment (unlike Linux which does this
+        // transparently in the kernel). Also handle PAGE_NOACCESS pages that
+        // were set by mprotect(..., PROT_NONE).
+        //
+        // NOTE: Do NOT call any Rust code that may trigger __chkstk here
+        // (no writeln!, no format!, no large stack allocations). The TEB
+        // stack limits still point to the guest stack range.
+        if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION {
+            let fault_addr = exception_record.ExceptionInformation[1] as usize;
+            let page_addr = fault_addr & !0xFFF;
+            let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+            let ok = unsafe {
+                Win32_Memory::VirtualQuery(
+                    page_addr as *const c_void,
+                    &raw mut mbi,
+                    core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+                ) != 0
+            };
+            if ok && mbi.State == Win32_Memory::MEM_RESERVE {
+                // Reserved but not committed — commit the page and retry.
+                let ptr = unsafe {
+                    Win32_Memory::VirtualAlloc2(
+                        Win32_Threading::GetCurrentProcess(),
+                        page_addr as *mut c_void,
+                        0x1000,
+                        Win32_Memory::MEM_COMMIT,
+                        Win32_Memory::PAGE_READWRITE,
+                        core::ptr::null_mut(),
+                        0,
+                    )
+                };
+                if !ptr.is_null() {
+                    tls.is_in_guest.set(true);
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+            // Committed but PAGE_NOACCESS — the guest used mprotect(PROT_NONE)
+            // to mark these pages. On Linux, re-accessing them triggers a kernel
+            // page fault that restores the mapping. On Windows, we need to
+            // change the protection back to allow access.
+            if ok
+                && mbi.State == Win32_Memory::MEM_COMMIT
+                && mbi.Protect == Win32_Memory::PAGE_NOACCESS
+            {
+                let rw = exception_record.ExceptionInformation[0];
+                // Determine appropriate protection based on access type.
+                // rw=0: read, rw=1: write, rw=8: execute
+                let new_prot = if rw == 8 {
+                    Win32_Memory::PAGE_EXECUTE_READ
+                } else {
+                    Win32_Memory::PAGE_READWRITE
+                };
+                let mut old_prot: u32 = 0;
+                let ok = unsafe {
+                    Win32_Memory::VirtualProtect(
+                        page_addr as *mut c_void,
+                        0x1000,
+                        new_prot,
+                        &raw mut old_prot,
+                    ) != 0
+                };
+                if ok {
+                    tls.is_in_guest.set(true);
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+        }
+        // Log unhandled guest exception — TEB stack limits already restored so
+        // eprintln is safe here.
+        use std::io::Write;
+        let pc: u64 = context.Pc;
+        let addr = if exception_record.NumberParameters > 1 {
+            exception_record.ExceptionInformation[1] as u64
+        } else {
+            0
+        };
+        let _ = writeln!(
+            std::io::stderr(),
+            "[winarm64] guest exc: code={:#x} pc={:#x} addr={:#x}",
+            exception_record.ExceptionCode,
+            pc,
+            addr,
+        );
+    }
 
     let regs = unsafe { &mut *tls.guest_context_top.get().wrapping_sub(1) };
     save_guest_context(regs, context);
@@ -227,11 +336,10 @@ fn set_context_to_exception_callback(
     }
     #[cfg(target_arch = "aarch64")]
     {
-        // Re-align the stack pointer.
-        let sp = exception_record_ptr as usize & !15;
+        // Set PC to exception callback, SP to host stack (where thread_ctx
+        // is at [SP]), and pass exception_record_ptr in X1 (second arg).
         context.Pc = exception_callback as *const () as usize as u64;
-        context.Sp = sp as u64;
-        // X29 = FP, X1 = exception_record_ptr (second argument per AAPCS64)
+        context.Sp = tls.host_sp.get().addr() as u64;
         unsafe {
             (*context.Anonymous.X.as_mut_ptr().add(29)) = tls.host_bp.get().addr() as u64;
             (*context.Anonymous.X.as_mut_ptr().add(1)) = exception_record_ptr as u64;
@@ -344,7 +452,72 @@ impl WindowsUserland {
         // to set FS_BASE back to a "stored" value whenever we notice that it has become 0.
         // On ARM64, the VEH is still needed for guest exception handling.
         unsafe {
-            let _ = AddVectoredExceptionHandler(0, Some(vectored_exception_handler));
+            let _ = AddVectoredExceptionHandler(1, Some(vectored_exception_handler));
+        }
+
+        // ARM64: Register exception/interrupt callback addresses as valid CFG
+        // targets. Without this, Windows ARM64 CFG (RtlGuardRestoreContext)
+        // rejects the VEH's modified context.Pc when returning with
+        // EXCEPTION_CONTINUE_EXECUTION.
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Ensure the asm symbols are linked in.
+            let _ = run_thread_arch as *const () as usize;
+
+            unsafe extern "C" {
+                safe static __ImageBase: c_void;
+            }
+            let module_base = &raw const __ImageBase as usize;
+
+            // Query the module size.
+            let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+            unsafe {
+                Win32_Memory::VirtualQuery(
+                    module_base as *const c_void,
+                    &raw mut mbi,
+                    core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+                );
+            }
+
+            // CFG_CALL_TARGET_VALID = 0x1, CFG_CALL_TARGET_INFO = { Offset, Flags }
+            #[repr(C)]
+            struct CfgCallTargetInfo {
+                offset: usize,
+                flags: usize,
+            }
+            const CFG_CALL_TARGET_VALID: usize = 0x1;
+
+            let targets = [
+                CfgCallTargetInfo {
+                    offset: exception_callback as usize - module_base,
+                    flags: CFG_CALL_TARGET_VALID,
+                },
+                CfgCallTargetInfo {
+                    offset: interrupt_callback as usize - module_base,
+                    flags: CFG_CALL_TARGET_VALID,
+                },
+            ];
+
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn SetProcessValidCallTargets(
+                    process: *mut c_void,
+                    base: *const c_void,
+                    size: usize,
+                    count: u32,
+                    targets: *mut CfgCallTargetInfo,
+                ) -> i32;
+            }
+
+            unsafe {
+                SetProcessValidCallTargets(
+                    windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                    module_base as *const c_void,
+                    mbi.RegionSize,
+                    targets.len() as u32,
+                    targets.as_ptr().cast_mut(),
+                );
+            }
         }
 
         Box::leak(Box::new(platform))
@@ -465,6 +638,10 @@ fn run_thread_inner(
         interrupt: false.into(),
         #[cfg(target_arch = "aarch64")]
         virt_x18: 0.into(),
+        #[cfg(target_arch = "aarch64")]
+        orig_stack_base: 0.into(),
+        #[cfg(target_arch = "aarch64")]
+        orig_stack_limit: 0.into(),
         continue_context: Box::default(),
     };
     unsafe {
@@ -502,6 +679,7 @@ fn run_thread_inner(
 
 static TLS_INDEX: AtomicU32 = AtomicU32::new(u32::MAX);
 
+#[repr(C)]
 struct TlsState {
     host_sp: Cell<*mut u128>,
     host_bp: Cell<*mut u128>,
@@ -513,6 +691,13 @@ struct TlsState {
     /// On ARM64, stores the guest's virtual X18 value (real X18 is reserved for TEB).
     #[cfg(target_arch = "aarch64")]
     virt_x18: Cell<usize>,
+    /// On ARM64, saves the original TEB StackBase so we can restore it
+    /// when returning from guest to host.
+    #[cfg(target_arch = "aarch64")]
+    orig_stack_base: Cell<usize>,
+    /// On ARM64, saves the original TEB StackLimit.
+    #[cfg(target_arch = "aarch64")]
+    orig_stack_limit: Cell<usize>,
     continue_context:
         Box<std::cell::UnsafeCell<windows_sys::Win32::System::Diagnostics::Debug::CONTEXT>>,
 }
@@ -522,9 +707,12 @@ fn get_tls_ptr() -> Option<*const TlsState> {
     if tls_index == u32::MAX {
         return None;
     }
-    Some(unsafe {
-        windows_sys::Win32::System::Threading::TlsGetValue(tls_index).cast::<TlsState>()
-    })
+    let ptr =
+        unsafe { windows_sys::Win32::System::Threading::TlsGetValue(tls_index).cast::<TlsState>() };
+    if ptr.is_null() {
+        return None;
+    }
+    Some(ptr)
 }
 
 /// Runs the guest thread until it terminates.
@@ -758,18 +946,16 @@ syscall_callback:
     //     [SP+8]  = saved guest X17
     //     [SP+16] = guest return address (X30, set by SVC gate)
     //     [SP+24] = guest TPIDR_EL0
+    //   X18 = host_tls (TlsState pointer, set by shared SVC handler)
     //   X30 = guest return address (also at [SP+16])
     //   X16, X17 = clobbered by shared handler
     //   All other registers = guest state
 
-    // Get the TLS state from the TLS slot and clear the in-guest flag.
-    // Use x9 as scratch (caller-saved, will be saved into PtRegs later).
-    // We need TLS state pointer; load it from TEB (X18) + TLS slot.
-    adrp    x9, {TLS_INDEX}
-    ldr     w9, [x9, :lo12:{TLS_INDEX}]
-    add     x9, x18, x9, lsl #3
-    ldr     x9, [x9, #TEB_TLS_SLOTS_OFFSET]
-    // x9 = TLS state pointer
+    // The Windows shared SVC handler stores host_tls (TlsState pointer) at
+    // [SP+24] in the SVC gate's stack frame. Read it from there — we can't
+    // use X16 because the BR from trampoline to callback may go through a
+    // linker veneer that clobbers X16/X17.
+    ldr     x9, [sp, #24]
     strb    wzr, [x9, #{IS_IN_GUEST}]
 
     // Get PtRegs base pointer. We write forwards from the base.
@@ -827,19 +1013,61 @@ syscall_callback:
     mov     sp, x0
     ldr     x29, [x9, #{HOST_BP}]
 
+    // Restore TEB stack limits to host range before calling Rust.
+    // Without this, __chkstk probes based on guest stack limits and crashes.
+    ldr     x0, [x9, #{ORIG_STACK_BASE}]
+    str     x0, [x18, #0x8]            // TEB.StackBase
+    ldr     x0, [x9, #{ORIG_STACK_LIMIT}]
+    str     x0, [x18, #0x10]           // TEB.StackLimit
+
     // Handle the syscall.
     ldr     x0, [sp]                   // thread_ctx
     bl      {syscall_handler}
     b       .Ldone_arm64
 
 exception_callback:
-    // Handle the exception. The stack and frame pointers are already restored,
-    // and the guest context is up to date. x0 = thread_ctx, x1 = exception record ptr.
+    // Handle the exception. The VEH set Pc=here, Sp=host_sp, X29=host_bp,
+    // X1=exception_record_ptr. But ALL OTHER registers have guest values
+    // from the captured CONTEXT. We must restore callee-saved registers
+    // from the host stack before calling any Rust code.
+    //
+    // Host stack layout (pushed by run_thread_arch prologue):
+    //   [sp]      = thread_ctx (str x0, [sp, #-16]!)
+    //   [sp+16]   = d14, d15
+    //   [sp+32]   = d12, d13
+    //   [sp+48]   = d10, d11
+    //   [sp+64]   = d8, d9
+    //   [sp+80]   = x27, x28
+    //   [sp+96]   = x25, x26
+    //   [sp+112]  = x23, x24
+    //   [sp+128]  = x21, x22
+    //   [sp+144]  = x19, x20
+    //   [sp+160]  = x29, x30 (stp x29, x30)
+    ldp     d14, d15, [sp, #16]
+    ldp     d12, d13, [sp, #32]
+    ldp     d10, d11, [sp, #48]
+    ldp     d8,  d9,  [sp, #64]
+    ldp     x27, x28, [sp, #80]
+    ldp     x25, x26, [sp, #96]
+    ldp     x23, x24, [sp, #112]
+    ldp     x21, x22, [sp, #128]
+    ldp     x19, x20, [sp, #144]
     ldr     x0, [sp]                   // thread_ctx
+    // x1 = exception_record_ptr (set by VEH in CONTEXT)
     bl      {exception_handler}
     b       .Ldone_arm64
 
 interrupt_callback:
+    // Same issue: restore callee-saved registers before calling Rust.
+    ldp     d14, d15, [sp, #16]
+    ldp     d12, d13, [sp, #32]
+    ldp     d10, d11, [sp, #48]
+    ldp     d8,  d9,  [sp, #64]
+    ldp     x27, x28, [sp, #80]
+    ldp     x25, x26, [sp, #96]
+    ldp     x23, x24, [sp, #112]
+    ldp     x21, x22, [sp, #128]
+    ldp     x19, x20, [sp, #144]
     ldr     x0, [sp]                   // thread_ctx
     bl      {interrupt_handler}
     b       .Ldone_arm64
@@ -863,12 +1091,13 @@ interrupt_callback:
     syscall_handler = sym syscall_handler,
     exception_handler = sym exception_handler,
     interrupt_handler = sym interrupt_handler,
-    TLS_INDEX = sym TLS_INDEX,
     HOST_SP = const core::mem::offset_of!(TlsState, host_sp),
     HOST_BP = const core::mem::offset_of!(TlsState, host_bp),
     GUEST_CONTEXT_TOP = const core::mem::offset_of!(TlsState, guest_context_top),
     IS_IN_GUEST = const core::mem::offset_of!(TlsState, is_in_guest),
     VIRT_X18 = const core::mem::offset_of!(TlsState, virt_x18),
+    ORIG_STACK_BASE = const core::mem::offset_of!(TlsState, orig_stack_base),
+    ORIG_STACK_LIMIT = const core::mem::offset_of!(TlsState, orig_stack_limit),
     );
 }
 
@@ -990,70 +1219,96 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
 
     #[cfg(target_arch = "aarch64")]
     {
-        fn switch_to_guest_ntcontinue_arm64(
-            tls: &TlsState,
-            ctx: &litebox_common_linux::PtRegs,
-        ) -> ! {
-            use litebox::utils::ReinterpretSignedExt;
-            use windows_sys::Win32::System::Diagnostics::Debug::{
-                CONTEXT, CONTEXT_CONTROL_ARM64, CONTEXT_INTEGER_ARM64,
-            };
-            #[link(name = "ntdll")]
-            unsafe extern "system" {
-                fn NtContinue(
-                    ctx: *const CONTEXT,
-                    raise_alert: u8,
-                ) -> windows_sys::Win32::Foundation::NTSTATUS;
-            }
-            let win_ctx = tls.continue_context.get();
-            // SAFETY: no other code accesses `continue_context` while `is_in_guest` is false.
-            unsafe {
-                let mut new_ctx = CONTEXT {
-                    ContextFlags: CONTEXT_CONTROL_ARM64 | CONTEXT_INTEGER_ARM64,
-                    Cpsr: ctx.pstate.truncate(),
-                    Sp: ctx.sp as u64,
-                    Pc: ctx.pc as u64,
-                    ..CONTEXT::default()
-                };
-                // Set X0-X30 from PtRegs.
-                let x_regs = &mut new_ctx.Anonymous.X;
-                for (i, x_reg) in x_regs.iter_mut().enumerate().take(31) {
-                    *x_reg = ctx.regs[i] as u64;
-                }
-                // Save guest's virtual X18 to TLS state. Don't write X18 into
-                // the CONTEXT — the kernel manages X18 as the TEB pointer and
-                // ignores whatever we put there. Leave it as default (0).
-                tls.virt_x18.set(ctx.regs[18]);
-                win_ctx.write(new_ctx);
-            }
-            // Ensure the context is written before we set `is_in_guest`.
-            std::sync::atomic::compiler_fence(Ordering::Release);
-            tls.is_in_guest.set(true);
-            // Set TPIDR_EL0 to our lookup key (TlsState address) so the
-            // rewriter's shared handlers can find our TLS entry. The kernel
-            // may wipe this on context switches; the shared handler's fallback
-            // to entry[0] handles that case.
-            unsafe {
-                litebox_common_linux::write_tpidr_el0(core::ptr::from_ref(tls) as usize);
-            }
-            unsafe {
-                let status = NtContinue(win_ctx, 0);
-                panic!(
-                    "NtContinue failed: {}",
-                    std::io::Error::from_raw_os_error(
-                        windows_sys::Win32::Foundation::RtlNtStatusToDosError(status)
-                            .reinterpret_as_signed(),
-                    ),
-                );
-            }
+        #[unsafe(naked)]
+        extern "C" fn switch_to_guest_asm(ctx: &litebox_common_linux::PtRegs) -> ! {
+            core::arch::naked_asm!(
+                "switch_to_guest_start:",
+                // x0 = PtRegs pointer
+                //
+                // Strategy: stash guest_x0, guest_x1, and guest_PC below the
+                // guest SP, then restore all other registers from PtRegs.
+                // X18 is NOT restored — it stays as TEB (Windows reserved).
+                // The Windows shared SVC handler does NOT clobber X18.
+
+                // Stash values below guest SP.
+                "ldr x17, [x0, #248]",  // x17 = guest SP
+                "ldr x16, [x0, #0]",    // x16 = guest x0
+                "str x16, [x17, #-32]", // guest_SP[-32] = guest_x0
+                "ldr x16, [x0, #8]",    // x16 = guest x1
+                "str x16, [x17, #-24]", // guest_SP[-24] = guest_x1
+                "ldr x16, [x0, #256]",  // x16 = guest PC
+                "str x16, [x17, #-16]", // guest_SP[-16] = guest_PC
+                // Restore guest x2-x17 from PtRegs.
+                "ldp x2,  x3,  [x0, #16]",
+                "ldp x4,  x5,  [x0, #32]",
+                "ldp x6,  x7,  [x0, #48]",
+                "ldp x8,  x9,  [x0, #64]",
+                "ldp x10, x11, [x0, #80]",
+                "ldp x12, x13, [x0, #96]",
+                "ldp x14, x15, [x0, #112]",
+                "ldp x16, x17, [x0, #128]",
+                // Restore x19-x30 (skip x18 — it's TEB).
+                "ldp x19, x20, [x0, #152]",
+                "ldp x21, x22, [x0, #168]",
+                "ldp x23, x24, [x0, #184]",
+                "ldp x25, x26, [x0, #200]",
+                "ldp x27, x28, [x0, #216]",
+                "ldr x29, [x0, #232]",
+                "ldr x30, [x0, #240]",
+                // Set guest SP.
+                "ldr x1, [x0, #248]",
+                "mov sp, x1",
+                // Recover stashed values and jump to guest.
+                "ldur x16, [sp, #-16]", // x16 = guest PC
+                "ldur x1,  [sp, #-24]", // x1 = guest x1
+                "ldur x0,  [sp, #-32]", // x0 = guest x0
+                "br x16",
+                "switch_to_guest_end:",
+            );
         }
 
         let tls = unsafe { &*get_tls_ptr().expect("TLS not initialized") };
         assert!(!tls.is_in_guest.get());
 
-        // On ARM64, always use NtContinue to restore the full register state.
-        // There is no fast-path equivalent of the x86_64 sysret trick.
-        switch_to_guest_ntcontinue_arm64(tls, ctx)
+        // Save guest's virtual X18 to TLS state.
+        tls.virt_x18.set(ctx.regs[18]);
+
+        // Update the TEB stack limits to cover the guest SP so Windows can
+        // dispatch VEH when the guest faults. Save the original limits so
+        // syscall_callback can restore them when returning to host code.
+        // TEB offsets: StackBase=0x8, StackLimit=0x10.
+        unsafe {
+            let teb: usize;
+            core::arch::asm!("mov {}, x18", out(reg) teb);
+            let stack_base_ptr = (teb + 0x8) as *mut usize;
+            let stack_limit_ptr = (teb + 0x10) as *mut usize;
+            // Save originals
+            tls.orig_stack_base.set(stack_base_ptr.read_volatile());
+            tls.orig_stack_limit.set(stack_limit_ptr.read_volatile());
+            // Set to cover guest SP
+            let guest_sp = ctx.sp;
+            let page_mask = !0xFFFusize;
+            stack_base_ptr.write_volatile((guest_sp + 0x10000) & page_mask);
+            stack_limit_ptr.write_volatile(guest_sp.wrapping_sub(0x100000) & page_mask);
+        }
+
+        // Flush instruction cache — ARM64 I-cache is not coherent with D-cache.
+        unsafe {
+            windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache(
+                GetCurrentProcess(),
+                core::ptr::null(),
+                0,
+            );
+        }
+
+        // Set TPIDR_EL0 to our lookup key (TlsState address) before entering
+        // guest. The shared SVC/X18 handlers use this to find the TlsState.
+        unsafe {
+            litebox_common_linux::write_tpidr_el0(core::ptr::from_ref(tls) as usize);
+        }
+
+        tls.is_in_guest.set(true);
+        switch_to_guest_asm(ctx)
     }
 }
 
@@ -1956,7 +2211,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         debug_assert_alignment!(range, ALIGN);
         let flags = prot_flags(new_permissions);
         process_memory_range_by_regions(
-            range,
+            range.clone(),
             |r, state| -> Result<bool, std::convert::Infallible> {
                 debug_assert_eq!(
                     state,
@@ -1972,6 +2227,22 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             },
         )
         .expect("update_permissions failed");
+
+        // On ARM64, flush the instruction cache after making pages executable.
+        // The ARM64 I-cache is not coherent with the D-cache; without this,
+        // the CPU may execute stale instructions after the rewriter has
+        // modified code in memory.
+        #[cfg(target_arch = "aarch64")]
+        if new_permissions.contains(MemoryRegionPermissions::EXEC) {
+            unsafe {
+                windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache(
+                    GetCurrentProcess(),
+                    range.start as *const c_void,
+                    range.len(),
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -2077,10 +2348,14 @@ unsafe extern "C" {
 }
 
 unsafe extern "C-unwind" fn init_handler(thread_ctx: &mut ThreadContext<'_>) {
+    #[cfg(target_arch = "aarch64")]
+    {}
     thread_ctx.call_shim(|shim, ctx, _interrupt| shim.init(ctx));
 }
 
 unsafe extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext<'_>) {
+    #[cfg(target_arch = "aarch64")]
+    {}
     thread_ctx.call_shim(|shim, ctx, _interrupt| shim.syscall(ctx));
 }
 
@@ -2295,7 +2570,9 @@ impl ThreadContext<'_> {
         match op {
             ContinueOperation::Resume => {
                 #[cfg(target_arch = "aarch64")]
-                update_host_tls_entry(self.tls);
+                {
+                    update_host_tls_entry(self.tls);
+                }
                 unsafe { switch_to_guest(self.ctx) }
             }
             ContinueOperation::Terminate => {}
