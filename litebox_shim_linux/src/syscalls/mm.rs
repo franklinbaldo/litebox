@@ -697,10 +697,25 @@ impl<FS: ShimFS> Task<FS> {
             && !flags.contains(MapFlags::MAP_ANONYMOUS)
         {
             #[cfg(debug_assertions)]
-            litebox::log_println!(
-                self.global.platform,
-                "WARN: MAP_SHARED|PROT_WRITE on file-backed mapping downgraded to MAP_PRIVATE"
-            );
+            {
+                let path = self
+                    .process_state
+                    .borrow()
+                    .fd_paths
+                    .lock()
+                    .get(&fd)
+                    .cloned()
+                    .unwrap_or_else(|| alloc::format!("fd={fd}"));
+                litebox::log_println!(
+                    self.global.platform,
+                    "WARN: MAP_SHARED|PROT_WRITE on file-backed mapping downgraded to MAP_PRIVATE \
+                     (file={}, len={:#x}, offset={:#x}, prot={:?})",
+                    path,
+                    len,
+                    offset,
+                    prot
+                );
+            }
         }
 
         if flags.intersects(
