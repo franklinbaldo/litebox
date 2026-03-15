@@ -55,7 +55,13 @@ impl<FS: crate::ShimFS> Task<FS> {
         );
         self.signals.set_signal_mask(mask);
 
-        Ok(restore_sigcontext(ctx, &lctx.sigcontext))
+        match restore_sigcontext(ctx, &lctx.sigcontext) {
+            Ok(rax) => Ok(rax),
+            Err(()) => {
+                self.signals.force_signal(Signal::SIGSEGV, false);
+                Err(Errno::EFAULT)
+            }
+        }
     }
 }
 
@@ -186,7 +192,7 @@ impl SignalState {
 pub(super) fn restore_sigcontext(
     ctx: &mut PtRegs,
     sigctx: &litebox_common_linux::signal::x86::Sigcontext,
-) -> usize {
+) -> Result<usize, ()> {
     let litebox_common_linux::signal::x86::Sigcontext {
         gs,
         fs,
@@ -229,7 +235,7 @@ pub(super) fn restore_sigcontext(
     ctx.eip = eip as usize;
     ctx.eflags = eflags as usize;
 
-    // TODO: restore fpstate
+    // TODO: restore fpstate for x86
 
-    ctx.eax
+    Ok(ctx.eax)
 }

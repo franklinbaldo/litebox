@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+#[cfg(feature = "platform_linux_userland")]
+use crate::ConstPtr;
 use crate::MutPtr;
 use crate::syscalls::signal::{DeliverFault, SignalState};
 use core::mem::offset_of;
@@ -12,12 +14,138 @@ use litebox_common_linux::{
 };
 use zerocopy::{FromBytes, IntoBytes};
 
+/// Size of the FXSAVE area in bytes.
+const FXSAVE_SIZE: usize = 512;
+/// FXSAVE area alignment (64-byte for future XSAVE compatibility).
+const FXSAVE_ALIGN: usize = 64;
+/// MXCSR bits that are valid (non-reserved). Bits 16-31 are reserved.
+const MXCSR_VALID_MASK: u32 = 0x0000_FFFF;
+/// Default MXCSR feature mask for CPUs that don't report one (pre-SSE2).
+/// SSE1-only: no DAZ (bit 6), so bits 0-5 + 7-15 = 0xFFBF.
+const MXCSR_DEFAULT_FEATURE_MASK: u32 = 0x0000_FFBF;
+
+/// Validates an MXCSR value against the valid mask and an optional host CPU
+/// feature mask. Returns `true` if the value is safe for FXRSTOR.
+fn validate_mxcsr(mxcsr: u32, host_mxcsr_mask: u32) -> bool {
+    // Reserved bits (16-31) must always be clear.
+    if mxcsr & !MXCSR_VALID_MASK != 0 {
+        return false;
+    }
+    // Use the host-reported mask, or the conservative SSE1-only default
+    // if the CPU didn't report one (mxcsr_mask=0 on pre-SSE2 CPUs).
+    let effective_mask = if host_mxcsr_mask != 0 {
+        host_mxcsr_mask
+    } else {
+        MXCSR_DEFAULT_FEATURE_MASK
+    };
+    if mxcsr & !effective_mask != 0 {
+        return false;
+    }
+    true
+}
+
 #[repr(C)]
 #[derive(Clone, FromBytes, IntoBytes)]
 struct SignalFrame {
     return_address: usize,
     ucontext: Ucontext,
     siginfo: Siginfo,
+}
+
+/// 512-byte FP state buffer matching the FXSAVE layout, used for writing
+/// FP state to/from guest signal frames.
+#[repr(C, align(64))]
+#[derive(Clone, FromBytes, IntoBytes)]
+struct FpStateBuf {
+    bytes: [u8; FXSAVE_SIZE],
+}
+
+/// Returns a pointer to the `guest_fp_state` TLS variable defined in the
+/// platform crate's `.tbss` section. This is only available on the
+/// linux_userland platform where the guest FP state is saved/restored via
+/// FXSAVE64/FXRSTOR64 in the platform asm.
+#[cfg(feature = "platform_linux_userland")]
+fn guest_fp_state_ptr() -> *mut u8 {
+    let ptr: *mut u8;
+    // SAFETY: `rdfsbase` reads the FS base which points to TLS. Adding
+    // `guest_fp_state@tpoff` gives the address of the TLS variable.
+    // The variable is 512 bytes, 64-byte aligned, defined in the
+    // platform crate's global_asm.
+    unsafe {
+        core::arch::asm!(
+            "rdfsbase {0}",
+            "add {0}, OFFSET guest_fp_state@tpoff",
+            out(reg) ptr,
+            options(nostack, preserves_flags),
+        );
+    }
+    ptr
+}
+
+/// Reads the guest FP state from TLS into a stack buffer.
+#[cfg(feature = "platform_linux_userland")]
+fn read_guest_fp_state() -> [u8; FXSAVE_SIZE] {
+    let ptr = guest_fp_state_ptr();
+    let mut buf = [0u8; FXSAVE_SIZE];
+    // SAFETY: `guest_fp_state` is a 512-byte TLS variable that is always valid
+    // when running on a shim thread.
+    unsafe {
+        core::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), FXSAVE_SIZE);
+    }
+    buf
+}
+
+/// Writes guest FP state from a buffer back to TLS, where `switch_to_guest`
+/// will restore it to the CPU via FXRSTOR64.
+#[cfg(feature = "platform_linux_userland")]
+fn write_guest_fp_state(buf: &[u8; FXSAVE_SIZE]) {
+    let ptr = guest_fp_state_ptr();
+    // SAFETY: Same as read_guest_fp_state.
+    unsafe {
+        core::ptr::copy_nonoverlapping(buf.as_ptr(), ptr, FXSAVE_SIZE);
+    }
+}
+
+/// Constructs a canonical clean FXSAVE image matching Linux kernel's
+/// post-execve FP state.
+fn canonical_fxsave_image() -> [u8; FXSAVE_SIZE] {
+    let mut buf = [0u8; FXSAVE_SIZE];
+    // x87 control word: 0x037F (all exceptions masked, double precision, round-nearest)
+    buf[0..2].copy_from_slice(&0x037Fu16.to_le_bytes());
+    // x87 tag word: 0xFFFF (all registers empty)
+    buf[4..6].copy_from_slice(&0xFFFFu16.to_le_bytes());
+    // MXCSR: 0x1F80 (all SSE exceptions masked, round-nearest)
+    buf[24..28].copy_from_slice(&0x1F80u32.to_le_bytes());
+    // All other fields (x87 regs, XMM0-15, etc.) remain zero.
+    buf
+}
+
+/// Reinitializes `guest_fp_state` in TLS with a canonical clean FXSAVE image
+/// matching Linux kernel's post-execve FP state. All FP/XMM registers are
+/// zeroed, x87 CW=0x037F, MXCSR=0x1F80.
+#[cfg(feature = "platform_linux_userland")]
+pub(crate) fn reinit_guest_fp_state() {
+    write_guest_fp_state(&canonical_fxsave_image());
+}
+
+/// Reads the `host_mxcsr_mask` TLS variable captured at thread startup from
+/// the CPU's FXSAVE output. Returns the CPU's actual MXCSR feature mask.
+/// If the CPU doesn't report a mask (older CPUs), returns 0.
+#[cfg(feature = "platform_linux_userland")]
+fn read_host_mxcsr_mask() -> u32 {
+    let mask: u32;
+    // SAFETY: `host_mxcsr_mask` is a u32 TLS variable populated at thread
+    // startup in `run_thread_arch`.
+    unsafe {
+        core::arch::asm!(
+            "rdfsbase {tmp}",
+            "mov {out:e}, DWORD PTR [{tmp} + host_mxcsr_mask@tpoff]",
+            tmp = out(reg) _,
+            out = out(reg) mask,
+            options(nostack, preserves_flags, readonly),
+        );
+    }
+    mask
 }
 
 pub(super) fn uctx_addr(ctx: &PtRegs) -> usize {
@@ -34,6 +162,10 @@ pub(super) fn get_signal_frame(sp: usize, _action: &SigAction) -> usize {
     // Skip the redzone.
     frame_addr = frame_addr.wrapping_sub(128);
 
+    // Reserve space for FpState (512 bytes, 64-byte aligned).
+    // Align down first, then subtract the FpState size.
+    frame_addr = (frame_addr.wrapping_sub(FXSAVE_SIZE)) & !(FXSAVE_ALIGN - 1);
+
     // Space for the signal frame.
     frame_addr = frame_addr.wrapping_sub(core::mem::size_of::<SignalFrame>());
 
@@ -42,6 +174,14 @@ pub(super) fn get_signal_frame(sp: usize, _action: &SigAction) -> usize {
     frame_addr = frame_addr.wrapping_sub(8);
 
     frame_addr
+}
+
+/// Computes the fpstate address on the guest stack given the signal frame
+/// address. The FpState lives above the SignalFrame, 64-byte aligned.
+fn fpstate_addr_from_frame(frame_addr: usize) -> usize {
+    let above_frame = frame_addr.wrapping_add(core::mem::size_of::<SignalFrame>());
+    // Align up to FXSAVE_ALIGN.
+    (above_frame + (FXSAVE_ALIGN - 1)) & !(FXSAVE_ALIGN - 1)
 }
 
 impl SignalState {
@@ -55,6 +195,25 @@ impl SignalState {
         if !action.flags.contains(SaFlags::RESTORER) {
             return Err(DeliverFault);
         }
+
+        // Compute fpstate address and write guest FP state to guest stack.
+        #[cfg(feature = "platform_linux_userland")]
+        let fpstate_guest_addr = {
+            const SW_RESERVED_OFFSET: usize = 464;
+            let addr = fpstate_addr_from_frame(frame_addr);
+            let mut fp = FpStateBuf {
+                bytes: read_guest_fp_state(),
+            };
+            // Zero sw_reserved (bytes 464-511). FXSAVE doesn't write these
+            // bytes; they may contain stale data. magic1=0 tells the guest
+            // this is legacy FXSAVE with no XSAVE extended state.
+            fp.bytes[SW_RESERVED_OFFSET..].fill(0);
+            let fp_ptr = MutPtr::<FpStateBuf>::from_usize(addr);
+            fp_ptr.write_at_offset(0, fp).ok_or(DeliverFault)?;
+            addr as u64
+        };
+        #[cfg(not(feature = "platform_linux_userland"))]
+        let fpstate_guest_addr: u64 = 0;
 
         let last_exception = self.last_exception.get();
         let frame = SignalFrame {
@@ -90,7 +249,7 @@ impl SignalState {
                     trapno: last_exception.exception.0.into(),
                     oldmask: self.blocked.get().as_u64(),
                     cr2: last_exception.cr2 as u64,
-                    fpstate: 0, // TODO
+                    fpstate: fpstate_guest_addr,
                     reserved1: [0; 8],
                 },
                 sigmask: self.blocked.get(),
@@ -115,7 +274,7 @@ impl SignalState {
 pub(super) fn restore_sigcontext(
     ctx: &mut PtRegs,
     sigctx: &litebox_common_linux::signal::x86_64::Sigcontext,
-) -> usize {
+) -> Result<usize, ()> {
     let litebox_common_linux::signal::x86_64::Sigcontext {
         r8,
         r9,
@@ -143,7 +302,7 @@ pub(super) fn restore_sigcontext(
         trapno: _,
         oldmask: _,
         cr2: _,
-        fpstate: _,
+        fpstate,
         reserved1: _,
     } = *sigctx;
 
@@ -166,7 +325,287 @@ pub(super) fn restore_sigcontext(
     ctx.rip = rip.truncate();
     ctx.eflags = rflags.truncate();
 
-    // TODO: restore fpstate
+    // Restore FP state from the signal frame if present.
+    #[cfg(feature = "platform_linux_userland")]
+    if fpstate != 0 {
+        // This is x86_64-only code; fpstate is a u64 guest pointer.
+        #[allow(clippy::cast_possible_truncation)]
+        let fp_ptr = ConstPtr::<u8>::from_usize(fpstate as usize);
+        let Some(fp_bytes) = fp_ptr.to_owned_slice(FXSAVE_SIZE) else {
+            return Err(());
+        };
 
-    ctx.rax
+        let mut fp: [u8; FXSAVE_SIZE] = [0; FXSAVE_SIZE];
+        fp.copy_from_slice(&fp_bytes);
+
+        // Validate MXCSR from guest-controlled signal frame against the
+        // trusted host CPU mask to prevent fxrstor #GP fault.
+        let mxcsr = u32::from_le_bytes(fp[24..28].try_into().unwrap());
+        let host_mask = read_host_mxcsr_mask();
+        if !validate_mxcsr(mxcsr, host_mask) {
+            return Err(());
+        }
+
+        write_guest_fp_state(&fp);
+    }
+
+    Ok(ctx.rax)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use litebox_common_linux::signal::SigSet;
+
+    fn dummy_action() -> SigAction {
+        SigAction {
+            sigaction: 0x1000,
+            restorer: 0x2000,
+            flags: SaFlags::RESTORER,
+            mask: SigSet::empty(),
+            #[cfg(target_arch = "x86_64")]
+            __pad: 0,
+        }
+    }
+
+    // --- Signal frame layout tests ---
+
+    #[test]
+    fn signal_frame_is_return_address_aligned() {
+        // The frame address should satisfy the x86_64 ABI: 16-byte aligned
+        // minus 8 (so that after the call instruction pushes the return
+        // address, RSP is 16-byte aligned).
+        for &sp in &[
+            0x7fff_ffff_f000usize,
+            0x7fff_ffff_e008,
+            0x7fff_ffff_d100,
+            0x1000_0000_0000,
+        ] {
+            let frame_addr = get_signal_frame(sp, &dummy_action());
+            assert_eq!(
+                frame_addr % 16,
+                8,
+                "frame_addr {frame_addr:#x} for sp {sp:#x} should be 16-aligned minus 8"
+            );
+        }
+    }
+
+    #[test]
+    fn signal_frame_below_redzone() {
+        let sp = 0x7fff_ffff_f000usize;
+        let frame_addr = get_signal_frame(sp, &dummy_action());
+        // Frame must be at least 128 (redzone) + sizeof(SignalFrame) below sp.
+        assert!(
+            frame_addr + core::mem::size_of::<SignalFrame>() <= sp - 128,
+            "frame overlaps redzone"
+        );
+    }
+
+    #[test]
+    fn fpstate_area_is_64_byte_aligned() {
+        for &sp in &[
+            0x7fff_ffff_f000usize,
+            0x7fff_ffff_e008,
+            0x7fff_ffff_d123,
+            0x1000_0000_0000,
+        ] {
+            let frame_addr = get_signal_frame(sp, &dummy_action());
+            let fp_addr = fpstate_addr_from_frame(frame_addr);
+            assert_eq!(
+                fp_addr % FXSAVE_ALIGN,
+                0,
+                "fpstate {fp_addr:#x} for sp {sp:#x} not 64-byte aligned"
+            );
+        }
+    }
+
+    #[test]
+    fn fpstate_fits_between_frame_and_redzone() {
+        let sp = 0x7fff_ffff_f000usize;
+        let frame_addr = get_signal_frame(sp, &dummy_action());
+        let fp_addr = fpstate_addr_from_frame(frame_addr);
+
+        // fpstate must be above the signal frame.
+        assert!(
+            fp_addr >= frame_addr + core::mem::size_of::<SignalFrame>(),
+            "fpstate overlaps signal frame"
+        );
+        // fpstate + 512 must not exceed sp - 128 (redzone boundary).
+        assert!(
+            fp_addr + FXSAVE_SIZE <= sp - 128,
+            "fpstate extends into redzone"
+        );
+    }
+
+    #[test]
+    fn fpstate_layout_round_trip() {
+        // Verify that for various SP values, fpstate_addr_from_frame produces
+        // an address that is consistent with get_signal_frame's allocation.
+        for sp in (0x1000_0000..0x1000_0100).step_by(8) {
+            let frame_addr = get_signal_frame(sp, &dummy_action());
+            let fp_addr = fpstate_addr_from_frame(frame_addr);
+            assert_eq!(fp_addr % FXSAVE_ALIGN, 0);
+            assert!(fp_addr >= frame_addr + core::mem::size_of::<SignalFrame>());
+            assert!(fp_addr + FXSAVE_SIZE <= sp - 128);
+        }
+    }
+
+    // --- MXCSR validation tests ---
+
+    #[test]
+    fn mxcsr_default_is_valid() {
+        assert!(validate_mxcsr(0x1F80, 0));
+        assert!(validate_mxcsr(0x1F80, 0xFFFF));
+    }
+
+    #[test]
+    fn mxcsr_zero_is_valid() {
+        // All exceptions unmasked — unusual but architecturally valid.
+        assert!(validate_mxcsr(0x0000, 0));
+        assert!(validate_mxcsr(0x0000, 0xFFFF));
+    }
+
+    #[test]
+    fn mxcsr_reserved_bits_rejected() {
+        // Bit 16 is reserved.
+        assert!(!validate_mxcsr(0x0001_0000, 0));
+        // Bit 31 is reserved.
+        assert!(!validate_mxcsr(0x8000_0000, 0));
+        // All reserved bits set.
+        assert!(!validate_mxcsr(0xFFFF_0000, 0));
+    }
+
+    #[test]
+    fn mxcsr_host_mask_rejects_unsupported_bits() {
+        // Host mask says only bits 0-12 are valid (typical SSE-only CPU).
+        let host_mask = 0x0000_FFBF;
+        // Bit 6 (DAZ) is not in the mask — should fail.
+        assert!(!validate_mxcsr(0x0040, host_mask));
+        // Default 0x1F80 should pass (bits 7-12 = exception masks).
+        assert!(validate_mxcsr(0x1F80, host_mask));
+    }
+
+    #[test]
+    fn mxcsr_host_mask_zero_uses_conservative_default() {
+        // host_mask=0 means CPU didn't report a mask (pre-SSE2).
+        // Should use conservative default 0xFFBF (no DAZ bit 6).
+        assert!(validate_mxcsr(0x1F80, 0)); // standard default passes
+        assert!(!validate_mxcsr(0x0040, 0)); // DAZ bit rejected without host support
+        assert!(!validate_mxcsr(0xFFFF, 0)); // bits outside 0xFFBF rejected
+    }
+
+    #[test]
+    fn mxcsr_combined_reserved_and_host_mask() {
+        // Bit 16 is reserved AND unsupported — reserved check fires first.
+        assert!(!validate_mxcsr(0x0001_0040, 0xFFBF));
+    }
+
+    // --- GPR restore round-trip tests ---
+
+    #[test]
+    fn restore_sigcontext_restores_gprs() {
+        let sigctx = Sigcontext {
+            r8: 0x0808,
+            r9: 0x0909,
+            r10: 0x1010,
+            r11: 0x1111,
+            r12: 0x1212,
+            r13: 0x1313,
+            r14: 0x1414,
+            r15: 0x1515,
+            rdi: 0xD1,
+            rsi: 0x51,
+            rbp: 0xB9,
+            rbx: 0xBB,
+            rdx: 0xDD,
+            rax: 0xAA,
+            rcx: 0xCC,
+            rsp: 0x5959,
+            rip: 0x1919,
+            rflags: 0x0202,
+            cs: 0x33,
+            gs: 0,
+            fs: 0,
+            ss: 0x2B,
+            err: 0,
+            trapno: 0,
+            oldmask: 0,
+            cr2: 0,
+            fpstate: 0, // no FP state pointer → skip FP restore
+            reserved1: [0; 8],
+        };
+
+        let mut ctx = PtRegs::default();
+        let result = restore_sigcontext(&mut ctx, &sigctx);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0xAA); // rax
+        assert_eq!(ctx.r8, 0x0808);
+        assert_eq!(ctx.r15, 0x1515);
+        assert_eq!(ctx.rdi, 0xD1);
+        assert_eq!(ctx.rsp, 0x5959);
+        assert_eq!(ctx.rip, 0x1919);
+        assert_eq!(ctx.eflags, 0x0202);
+    }
+
+    #[test]
+    fn restore_sigcontext_with_zero_fpstate_succeeds() {
+        // fpstate=0 means no FP state in the signal frame (legacy).
+        // restore_sigcontext should succeed without touching TLS.
+        let sigctx = Sigcontext {
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            rdi: 0,
+            rsi: 0,
+            rbp: 0,
+            rbx: 0,
+            rdx: 0,
+            rax: 42,
+            rcx: 0,
+            rsp: 0x1000,
+            rip: 0x2000,
+            rflags: 0,
+            cs: 0x33,
+            gs: 0,
+            fs: 0,
+            ss: 0x2B,
+            err: 0,
+            trapno: 0,
+            oldmask: 0,
+            cr2: 0,
+            fpstate: 0,
+            reserved1: [0; 8],
+        };
+
+        let mut ctx = PtRegs::default();
+        assert_eq!(restore_sigcontext(&mut ctx, &sigctx), Ok(42));
+    }
+
+    // --- Canonical FXSAVE image test ---
+
+    #[test]
+    fn canonical_fxsave_image_matches_linux_init_state() {
+        let img = canonical_fxsave_image();
+
+        // x87 control word at offset 0: 0x037F
+        assert_eq!(u16::from_le_bytes(img[0..2].try_into().unwrap()), 0x037F);
+        // x87 status word at offset 2: 0 (no exceptions)
+        assert_eq!(u16::from_le_bytes(img[2..4].try_into().unwrap()), 0);
+        // x87 tag word at offset 4: 0xFFFF (all empty)
+        assert_eq!(u16::from_le_bytes(img[4..6].try_into().unwrap()), 0xFFFF);
+        // MXCSR at offset 24: 0x1F80
+        assert_eq!(u32::from_le_bytes(img[24..28].try_into().unwrap()), 0x1F80);
+        // XMM registers at offsets 160-415 should all be zero
+        assert!(
+            img[160..416].iter().all(|&b| b == 0),
+            "XMM registers not zeroed"
+        );
+        // x87 register space at offsets 32-159 should all be zero
+        assert!(img[32..160].iter().all(|&b| b == 0), "x87 regs not zeroed");
+    }
 }

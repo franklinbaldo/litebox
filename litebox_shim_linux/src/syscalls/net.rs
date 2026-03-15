@@ -40,6 +40,11 @@ use crate::{
     syscalls::unix::{CSockUnixAddr, UnixSocket, UnixSocketAddr},
 };
 
+/// Linux default for `TCP_KEEPIDLE` (seconds before first keep-alive probe).
+const DEFAULT_TCP_KEEPIDLE_SECS: u32 = 7200;
+/// Linux default for `TCP_KEEPCNT` (number of unacknowledged probes before drop).
+const DEFAULT_TCP_KEEPCNT: u32 = 9;
+
 macro_rules! convert_flags {
     ($src:expr, $src_type:ty, $dst_type:ty, $($flag:ident),+ $(,)?) => {
         {
@@ -163,7 +168,7 @@ impl SocketAddress {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(super) struct SocketOptions {
     pub(super) reuse_address: bool,
     pub(super) keep_alive: bool,
@@ -179,7 +184,9 @@ pub(super) struct SocketOptions {
     pub(super) linger_timeout: Option<core::time::Duration>,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct SocketOFlags(pub OFlags);
+#[derive(Clone)]
 pub(crate) struct SocketProxy(pub Arc<NetworkProxy<Platform>>);
 
 pub(super) enum SocketOptionValue {
@@ -381,12 +388,19 @@ impl<FS: ShimFS> GlobalState<FS> {
             Ok(())
         }) {
             Err(Errno::ENOPROTOOPT) => {} // fallthrough to handle other options
-            other => return other,
+            other => {
+                return other;
+            }
         }
 
         match optname {
             SocketOptionName::IP(ip) => match ip {
                 litebox_common_linux::IpOption::TOS => return Err(Errno::EOPNOTSUPP),
+                // Silently accept IP_RECVERR, IP_MTU_DISCOVER, IP_PKTINFO
+                // (used by glibc's DNS resolver; not yet tracked).
+                litebox_common_linux::IpOption::RECVERR
+                | litebox_common_linux::IpOption::MTU_DISCOVER
+                | litebox_common_linux::IpOption::PKTINFO => return Ok(()),
             },
             SocketOptionName::Socket(so) => match so {
                 // handled by `setsockopt_common`
@@ -424,7 +438,32 @@ impl<FS: ShimFS> GlobalState<FS> {
                         },
                     )?;
                 }
-                TcpOption::KEEPCNT | TcpOption::KEEPIDLE | TcpOption::INFO => {
+                TcpOption::KEEPCNT => {
+                    // smoltcp doesn't support fine-grained keep-alive probe
+                    // counts. Accept and ignore the value so applications that
+                    // set it (e.g., curl) don't fail.
+                    let _val: u32 = super::read_from_user(optval, size_of::<u32>())?;
+                }
+                TcpOption::KEEPIDLE => {
+                    // smoltcp uses a single keep-alive interval (set via
+                    // TCP_KEEPINTVL / SO_KEEPALIVE). Accept KEEPIDLE and
+                    // forward it as the keep-alive interval so the setting
+                    // takes effect.
+                    let val: u32 = super::read_from_user(optval, size_of::<u32>())?;
+                    if val == 0 {
+                        return Err(Errno::EINVAL);
+                    }
+                    self.net
+                        .lock()
+                        .set_tcp_option(
+                            fd,
+                            litebox::net::TcpOptionData::KEEPALIVE(Some(
+                                core::time::Duration::from_secs(u64::from(val)),
+                            )),
+                        )
+                        .expect("set TCP_KEEPALIVE should succeed");
+                }
+                TcpOption::INFO => {
                     return Err(Errno::EOPNOTSUPP);
                 }
                 TcpOption::NODELAY | TcpOption::CORK => {
@@ -539,7 +578,10 @@ impl<FS: ShimFS> GlobalState<FS> {
 
         let val: u32 = match optname {
             SocketOptionName::IP(ipopt) => match ipopt {
-                litebox_common_linux::IpOption::TOS => return Err(Errno::EOPNOTSUPP),
+                litebox_common_linux::IpOption::TOS
+                | litebox_common_linux::IpOption::RECVERR
+                | litebox_common_linux::IpOption::MTU_DISCOVER
+                | litebox_common_linux::IpOption::PKTINFO => return Err(Errno::EOPNOTSUPP),
             },
             SocketOptionName::Socket(sopt) => match sopt {
                 // handled by `getsockopt_common`
@@ -590,7 +632,26 @@ impl<FS: ShimFS> GlobalState<FS> {
                             .ok_or(Errno::EFAULT)?;
                         return Ok(len);
                     }
-                    TcpOption::KEEPCNT | TcpOption::KEEPIDLE | TcpOption::INFO => {
+                    TcpOption::KEEPCNT => {
+                        // smoltcp doesn't track probe count; return Linux
+                        // default.
+                        DEFAULT_TCP_KEEPCNT
+                    }
+                    TcpOption::KEEPIDLE => {
+                        // Return the keep-alive interval as KEEPIDLE (smoltcp
+                        // doesn't distinguish idle vs interval).
+                        let TcpOptionData::KEEPALIVE(interval) = self
+                            .net
+                            .lock()
+                            .get_tcp_option(fd, litebox::net::TcpOptionName::KEEPALIVE)?
+                        else {
+                            unreachable!()
+                        };
+                        interval.map_or(DEFAULT_TCP_KEEPIDLE_SECS, |d| {
+                            d.as_secs().try_into().unwrap()
+                        })
+                    }
+                    TcpOption::INFO => {
                         return Err(Errno::EOPNOTSUPP);
                     }
                     TcpOption::KEEPINTVL => {
@@ -778,7 +839,10 @@ impl<FS: ShimFS> GlobalState<FS> {
         if let Err(Errno::EPIPE) = ret
             && !flags.contains(SendFlags::NOSIGNAL)
         {
-            unimplemented!("send signal SIGPIPE on EPIPE");
+            // SIGPIPE delivery: On real Linux, EPIPE without MSG_NOSIGNAL
+            // raises SIGPIPE. Most applications (including Node.js) ignore
+            // SIGPIPE via SIG_IGN, so just return EPIPE for now.
+            // TODO: actually deliver SIGPIPE to the calling process.
         }
         ret
     }
@@ -1451,6 +1515,54 @@ impl<FS: ShimFS> Task<FS> {
         )
     }
 
+    /// Handle syscall `sendmmsg` — send multiple messages on a socket.
+    pub(crate) fn sys_sendmmsg(
+        &self,
+        fd: i32,
+        msgvec: MutPtr<litebox_common_linux::UserMmsgHdr<Platform>>,
+        vlen: u32,
+        flags: SendFlags,
+    ) -> Result<usize, Errno> {
+        let Ok(sockfd) = u32::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+
+        let mut sent_count = 0u32;
+        for i in 0..vlen {
+            let mmsg_ptr = MutPtr::<litebox_common_linux::UserMmsgHdr<Platform>>::from_usize(
+                msgvec.as_usize().wrapping_add(
+                    i as usize
+                        * core::mem::size_of::<litebox_common_linux::UserMmsgHdr<Platform>>(),
+                ),
+            );
+            let mmsg = ConstPtr::<litebox_common_linux::UserMmsgHdr<Platform>>::from_usize(
+                mmsg_ptr.as_usize(),
+            )
+            .read_at_offset(0)
+            .ok_or(Errno::EFAULT)?;
+
+            match self.do_sendmsg(sockfd, &mmsg.msg_hdr, flags) {
+                Ok(bytes_sent) => {
+                    // Write back the number of bytes sent for this message.
+                    let msg_len_offset =
+                        core::mem::size_of::<litebox_common_linux::UserMsgHdr<Platform>>();
+                    let msg_len_ptr =
+                        MutPtr::<u32>::from_usize(mmsg_ptr.as_usize().wrapping_add(msg_len_offset));
+                    #[allow(clippy::cast_possible_truncation)]
+                    let _ = msg_len_ptr.write_at_offset(0, bytes_sent as u32);
+                    sent_count += 1;
+                }
+                Err(e) => {
+                    if sent_count == 0 {
+                        return Err(e);
+                    }
+                    break;
+                }
+            }
+        }
+        Ok(sent_count as usize)
+    }
+
     /// Handle syscall `recvfrom`
     pub(crate) fn sys_recvfrom(
         &self,
@@ -1585,7 +1697,7 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EBADF);
         };
         let optname = SocketOptionName::try_from(level, optname).ok_or_else(|| {
-            log_unsupported!("setsockopt(level = {level}, optname = {optname})");
+            log_unsupported!("getsockopt(level = {level}, optname = {optname})");
             Errno::EINVAL
         })?;
         let len = optlen.read_at_offset(0).ok_or(Errno::EFAULT)?;
@@ -2047,11 +2159,13 @@ mod tests {
                 let hdr = litebox_common_linux::UserMsgHdr {
                     msg_name: ConstPtr::from_usize(0),
                     msg_namelen: 0,
+                    padding1: 0,
                     msg_iov: ConstPtr::from_usize(iovec.as_ptr() as usize),
                     msg_iovlen: iovec.len(),
                     msg_control: ConstPtr::from_usize(0),
                     msg_controllen: 0,
                     msg_flags: SendFlags::empty(),
+                    padding2: 0,
                 };
                 assert_eq!(
                     task.do_sendmsg(client_fd, &hdr, SendFlags::empty())

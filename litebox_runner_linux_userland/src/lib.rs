@@ -77,6 +77,22 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub program_from_tar: bool,
+    /// Connect to a 9P file broker at the given address (e.g., 10.0.0.1:5640).
+    ///
+    /// Requires --tun-device-name. The broker must be a 9P2000.L server listening
+    /// on the TUN gateway. All file I/O flows through the shim's network stack,
+    /// making it suspension-aware for multi-process support.
+    #[arg(
+        long = "nine-p-broker",
+        requires_all = ["unstable", "tun_device_name"],
+        help_heading = "Unstable Options"
+    )]
+    pub nine_p_broker: Option<String>,
+
+    /// Set the initial working directory for the sandboxed process.
+    /// Defaults to "/".
+    #[arg(long = "cwd", requires = "unstable", help_heading = "Unstable Options")]
+    pub working_directory: Option<String>,
 }
 
 /// Backends supported for intercepting syscalls
@@ -88,9 +104,6 @@ pub enum InterceptionBackend {
     /// Depend purely on rewriten syscalls to intercept them
     Rewriter,
 }
-
-static REQUIRE_RTLD_AUDIT: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
 
 struct MmappedFile {
     data: &'static [u8],
@@ -128,17 +141,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         unimplemented!(
             "this should (hopefully soon) have a nicer interface to support loading in files"
         )
-    }
-
-    // --program-from-tar loads pre-rewritten binaries that depend on litebox_rtld_audit.so,
-    // which is only injected by the rewriter backend.
-    if cli_args.program_from_tar
-        && !matches!(cli_args.interception_backend, InterceptionBackend::Rewriter)
-    {
-        anyhow::bail!(
-            "--program-from-tar requires --interception-backend=rewriter \
-             (the packaged binary is pre-rewritten and needs the audit library)"
-        );
     }
 
     // When loading from tar, the program path is a guest-internal path and must
@@ -219,122 +221,125 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     }
 
     litebox_platform_multiplex::set_platform(platform);
-    let mut shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
+
+    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     let litebox = shim_builder.litebox();
-    let initial_file_system = {
-        let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
+    let (in_mem, tar_ro) = build_initial_fs(
+        litebox,
+        &cli_args,
+        &ancestor_modes_and_users,
+        prog_data,
+        tar_data,
+    )?;
+    let default_fs = shim_builder.default_fs(in_mem, tar_ro);
+    finish_run(shim_builder, default_fs, &cli_args)
+}
 
-        // When loading the program from the tar, we don't need to create ancestor
-        // directories or write the program binary into the in-memory FS -- the program
-        // is already in the tar layer.
-        if let Some(prog_data) = prog_data {
-            let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
-            let ancestors: Vec<_> = prog.ancestors().collect();
-            let mut prev_user = 0;
-            for (path, &mode_and_user) in ancestors
-                .into_iter()
-                .skip(1)
-                .rev()
-                .skip(1)
-                .zip(&ancestor_modes_and_users)
-            {
-                if prev_user == 0 {
-                    // require root user
-                    in_mem.with_root_privileges(|fs| {
-                        fs.mkdir(path.to_str().unwrap(), mode_and_user.0).unwrap();
-                        if mode_and_user.1 != 0 {
-                            // This file is owned by a non-root user, so we need to set the ownership to our default user
-                            fs.chown(path.to_str().unwrap(), Some(1000), Some(1000))
-                                .unwrap();
-                        }
-                    });
-                } else {
-                    in_mem
-                        .mkdir(path.to_str().unwrap(), mode_and_user.0)
-                        .unwrap();
-                }
-                prev_user = mode_and_user.1;
-            }
+/// Build the in-memory and tar read-only file systems, including program data and /tmp.
+///
+/// This is extracted so that both the default and 9P-broker-enabled code paths can share it.
+#[allow(clippy::type_complexity)]
+fn build_initial_fs(
+    litebox: &litebox::LiteBox<Platform>,
+    cli_args: &CliArgs,
+    ancestor_modes_and_users: &[(litebox::fs::Mode, u32)],
+    prog_data: Option<alloc::borrow::Cow<'static, [u8]>>,
+    tar_data: &'static [u8],
+) -> Result<(
+    litebox::fs::in_mem::FileSystem<Platform>,
+    litebox::fs::tar_ro::FileSystem<Platform>,
+)> {
+    let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
 
-            let open_file =
-                |fs: &mut litebox::fs::in_mem::FileSystem<litebox_platform_multiplex::Platform>,
-                 path,
-                 mode| {
-                    let fd = fs
-                        .open(
-                            path,
-                            litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
-                            mode,
-                        )
-                        .unwrap();
-                    fs.initialize_primarily_read_heavy_file(&fd, prog_data);
-                    fs.close(&fd).unwrap();
-                };
-            let last = ancestor_modes_and_users.last().ok_or_else(|| {
-                anyhow!("program path has no ancestor directories (is it the root path?)")
-            })?;
+    // When loading the program from the tar, we don't need to create ancestor
+    // directories or write the program binary into the in-memory FS -- the program
+    // is already in the tar layer.
+    if let Some(prog_data) = prog_data {
+        let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
+        let ancestors: Vec<_> = prog.ancestors().collect();
+        let mut prev_user = 0;
+        for (path, &mode_and_user) in ancestors
+            .into_iter()
+            .skip(1)
+            .rev()
+            .skip(1)
+            .zip(ancestor_modes_and_users)
+        {
             if prev_user == 0 {
                 in_mem.with_root_privileges(|fs| {
-                    open_file(fs, prog.to_str().unwrap(), last.0);
-                    if last.1 != 0 {
-                        // This file is owned by a non-root user, so we need to set the ownership to our default user
-                        fs.chown(prog.to_str().unwrap(), Some(1000), Some(1000))
+                    fs.mkdir(path.to_str().unwrap(), mode_and_user.0).unwrap();
+                    if mode_and_user.1 != 0 {
+                        fs.chown(path.to_str().unwrap(), Some(1000), Some(1000))
                             .unwrap();
                     }
                 });
             } else {
-                open_file(&mut in_mem, prog.to_str().unwrap(), last.0);
+                in_mem
+                    .mkdir(path.to_str().unwrap(), mode_and_user.0)
+                    .unwrap();
             }
+            prev_user = mode_and_user.1;
         }
-        in_mem.with_root_privileges(|fs| {
-            let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
-            if let Err(err) = fs.mkdir("/tmp", mode) {
-                match err {
-                    litebox::fs::errors::MkdirError::AlreadyExists => {
-                        fs.chmod("/tmp", mode).expect("Failed to call chmod");
-                    }
-                    _ => panic!(),
+
+        let open_file =
+            |fs: &mut litebox::fs::in_mem::FileSystem<litebox_platform_multiplex::Platform>,
+             path,
+             mode| {
+                let fd = fs
+                    .open(
+                        path,
+                        litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
+                        mode,
+                    )
+                    .unwrap();
+                fs.initialize_primarily_read_heavy_file(&fd, prog_data);
+                fs.close(&fd).unwrap();
+            };
+        let last = ancestor_modes_and_users.last().ok_or_else(|| {
+            anyhow!("program path has no ancestor directories (is it the root path?)")
+        })?;
+        if prev_user == 0 {
+            in_mem.with_root_privileges(|fs| {
+                open_file(fs, prog.to_str().unwrap(), last.0);
+                if last.1 != 0 {
+                    fs.chown(prog.to_str().unwrap(), Some(1000), Some(1000))
+                        .unwrap();
                 }
-            }
-        });
-
-        // When using the rewriter backend, automatically include litebox_rtld_audit.so
-        // in the filesystem so tests and users don't need to include it in tar files
-        match cli_args.interception_backend {
-            InterceptionBackend::Rewriter => {
-                #[cfg(not(target_arch = "x86_64"))]
-                eprintln!("WARN: litebox_rtld_audit not currently supported on non-x86_64 arch");
-                #[cfg(target_arch = "x86_64")]
-                in_mem.with_root_privileges(|fs| {
-                    let rwxr_xr_x = Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH;
-                    let _ = fs.mkdir("/lib", rwxr_xr_x);
-                    let fd = fs
-                        .open(
-                            "/lib/litebox_rtld_audit.so",
-                            litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
-                            rwxr_xr_x,
-                        )
-                        .expect("Failed to create /lib/litebox_rtld_audit.so");
-                    fs.initialize_primarily_read_heavy_file(
-                        &fd,
-                        include_bytes!(concat!(env!("OUT_DIR"), "/litebox_rtld_audit.so")).into(),
-                    );
-                    fs.close(&fd)
-                        .expect("Failed to close /lib/litebox_rtld_audit.so");
-                });
-            }
-            InterceptionBackend::Seccomp => {
-                // No need to include rtld_audit.so for seccomp backend
+            });
+        } else {
+            open_file(&mut in_mem, prog.to_str().unwrap(), last.0);
+        }
+    }
+    in_mem.with_root_privileges(|fs| {
+        let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
+        if let Err(err) = fs.mkdir("/tmp", mode) {
+            match err {
+                litebox::fs::errors::MkdirError::AlreadyExists => {
+                    fs.chmod("/tmp", mode).expect("Failed to call chmod");
+                }
+                _ => panic!(),
             }
         }
+    });
 
-        let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
-        shim_builder.default_fs(in_mem, tar_ro)
-    };
+    // When using the rewriter backend, the shim's mmap hook handles
+    // syscall patching at runtime — no audit library needed.
 
-    // We need to get the file path before enabling seccomp.
-    // For --program-from-tar the path is already validated as absolute above,
-    // so use it directly instead of resolving against the host CWD.
+    let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
+    Ok((in_mem, tar_ro))
+}
+
+/// Complete the run after the file system has been composed and the shim builder is ready.
+///
+/// This is generic over the file system type so it can handle both the default and
+/// broker-enabled FS compositions.
+fn finish_run<FS: litebox_shim_linux::ShimFS>(
+    mut shim_builder: litebox_shim_linux::LinuxShimBuilder,
+    fs: FS,
+    cli_args: &CliArgs,
+) -> Result<()> {
+    let platform = litebox_platform_multiplex::platform();
+
     let prog = if cli_args.program_from_tar {
         PathBuf::from(&cli_args.program_and_arguments[0])
     } else {
@@ -347,85 +352,123 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         )
     })?;
 
-    let initial_file_system = std::sync::Arc::new(initial_file_system);
-
     shim_builder.set_load_filter(fixup_env);
-    let shim = shim_builder.build();
-
-    let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
-    let net_worker = if cli_args.tun_device_name.is_some() {
-        let shim = shim.clone();
-        let shutdown_clone = shutdown.clone();
-        let child = litebox_platform_linux_userland::spawn_host_thread(move || {
-            const DEFAULT_TIMEOUT: core::time::Duration = core::time::Duration::from_micros(100);
-            const MAX_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(1);
-            pin_thread_to_cpu(0);
-
-            while !shutdown_clone.load(core::sync::atomic::Ordering::Relaxed) {
-                let timeout = loop {
-                    match shim.perform_network_interaction() {
-                        litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately => {}
-                        litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction{ timeout } => {
-                            break timeout;
-                        }
-                    }
-                };
-                // TODO: We only wait for ingress packets on the TUN device and thus may block processing egress packets for up to `timeout`.
-                // Set a maximum timeout to ensure we don't wait too long. Alternatively, shim could notify us when there are egress packets to process,
-                // but that would require more invasive changes.
-                litebox_platform_multiplex::platform()
-                    .wait_on_tun(Some(timeout.unwrap_or(DEFAULT_TIMEOUT).min(MAX_TIMEOUT)));
-            }
-            // Final flush
-            // TODO: keep running until all sockets are closed?
-            while shim.perform_network_interaction().call_again_immediately() {}
-        });
-        Some(child)
-    } else {
-        None
-    };
 
     match cli_args.interception_backend {
         InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),
-        InterceptionBackend::Rewriter => {
-            REQUIRE_RTLD_AUDIT.store(true, core::sync::atomic::Ordering::SeqCst);
-        }
+        InterceptionBackend::Rewriter => {}
     }
 
-    let argv = cli_args
-        .program_and_arguments
-        .iter()
-        .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
-        .collect();
-    let envp: Vec<_> = cli_args
-        .environment_variables
-        .iter()
-        .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
-        .collect();
-    let envp = if cli_args.forward_environment_variables {
-        envp.into_iter()
-            .chain(std::env::vars().map(|(k, v)| {
-                std::ffi::CString::new(
-                    k.bytes()
-                        .chain([b'='])
-                        .chain(v.bytes())
-                        .collect::<Vec<u8>>(),
-                )
-                .unwrap()
-            }))
-            .collect()
+    let argv = build_argv(cli_args);
+    let envp = build_envp(cli_args);
+
+    // If a 9P broker is requested, build shim → start network → connect 9P → layer FS.
+    // The FS type differs between branches, so each must build its own shim and run.
+    if cli_args.nine_p_broker.is_some() {
+        finish_run_with_nine_p(shim_builder, fs, cli_args, platform, prog_path, argv, envp)
     } else {
-        envp
+        let initial_file_system = std::sync::Arc::new(fs);
+        let shim = shim_builder.build();
+
+        let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let net_worker = start_network_worker(&shim, &shutdown, cli_args);
+
+        let program = shim.load_program(
+            initial_file_system,
+            platform.init_task(),
+            prog_path,
+            argv,
+            envp,
+            cli_args.working_directory.clone(),
+        )?;
+
+        run_program(program, shutdown, net_worker);
+    }
+}
+
+/// Finish running with a 9P broker providing the lower file system layer.
+///
+/// Builds the shim, starts the network worker, connects to the 9P broker,
+/// layers the resulting FS on top of the base FS, and runs the program.
+fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
+    shim_builder: litebox_shim_linux::LinuxShimBuilder,
+    base_fs: FS,
+    cli_args: &CliArgs,
+    platform: &litebox_platform_multiplex::Platform,
+    prog_path: &str,
+    argv: Vec<alloc::ffi::CString>,
+    envp: Vec<alloc::ffi::CString>,
+) -> Result<()> {
+    let broker_addr = cli_args.nine_p_broker.as_deref().unwrap();
+    let addr: core::net::SocketAddr = broker_addr
+        .parse()
+        .map_err(|e| anyhow!("Invalid 9P broker address '{broker_addr}': {e}"))?;
+
+    // Build shim — the FS type is determined by the combined layered FS below.
+    let shim = shim_builder.build();
+
+    let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let net_worker = start_network_worker(&shim, &shutdown, cli_args);
+
+    if cfg!(debug_assertions) {
+        eprintln!("Connecting to 9P broker at {broker_addr}...");
+    }
+
+    // Retry connection with backoff (broker might not be listening yet)
+    let transport = {
+        let mut attempts = 0;
+        loop {
+            match shim.tcp_connection(addr) {
+                Ok(t) => break t,
+                Err(e) => {
+                    attempts += 1;
+                    if attempts >= 50 {
+                        return Err(anyhow!(
+                            "Failed to connect to 9P broker at {broker_addr} after {attempts} attempts: {e:?}"
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        }
     };
 
+    let litebox = shim.litebox();
+    let nine_p_fs = litebox::fs::nine_p::FileSystem::new(litebox, transport, 65536, "root", "/")
+        .map_err(|e| anyhow!("9P attach failed: {e:?}"))?;
+
+    if cfg!(debug_assertions) {
+        eprintln!("9P broker connected.");
+    }
+
+    let combined = litebox::fs::layered::FileSystem::new(
+        litebox,
+        base_fs,
+        nine_p_fs,
+        litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
+    );
+    let combined_fs = std::sync::Arc::new(combined);
+
     let program = shim.load_program(
-        initial_file_system,
+        combined_fs,
         platform.init_task(),
         prog_path,
         argv,
         envp,
+        cli_args.working_directory.clone(),
     )?;
 
+    run_program(program, shutdown, net_worker);
+}
+
+/// Run the loaded program and exit with its return code.
+///
+/// This function never returns — it calls `std::process::exit()`.
+fn run_program<FS: litebox_shim_linux::ShimFS>(
+    program: litebox_shim_linux::LoadedProgram<FS>,
+    shutdown: std::sync::Arc<core::sync::atomic::AtomicBool>,
+    net_worker: Option<std::thread::JoinHandle<()>>,
+) -> ! {
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();
 
@@ -470,13 +513,73 @@ fn pin_thread_to_cpu(cpu: usize) {
     }
 }
 
-fn fixup_env(envp: &mut Vec<alloc::ffi::CString>) {
-    // Enable the audit library to load trampoline code for rewritten binaries.
-    if REQUIRE_RTLD_AUDIT.load(core::sync::atomic::Ordering::SeqCst) {
-        let p = c"LD_AUDIT=/lib/litebox_rtld_audit.so";
-        let has_ld_audit = envp.iter().any(|var| var.as_c_str() == p);
-        if !has_ld_audit {
-            envp.push(p.into());
+/// Start the network worker thread if a TUN device is configured.
+fn start_network_worker<FS: litebox_shim_linux::ShimFS>(
+    shim: &litebox_shim_linux::LinuxShim<FS>,
+    shutdown: &std::sync::Arc<core::sync::atomic::AtomicBool>,
+    cli_args: &CliArgs,
+) -> Option<std::thread::JoinHandle<()>> {
+    cli_args.tun_device_name.as_ref()?;
+    let shim = shim.clone();
+    let shutdown_clone = shutdown.clone();
+    let child = litebox_platform_linux_userland::spawn_host_thread(move || {
+        const DEFAULT_TIMEOUT: core::time::Duration = core::time::Duration::from_micros(100);
+        pin_thread_to_cpu(0);
+
+        while !shutdown_clone.load(core::sync::atomic::Ordering::Relaxed) {
+            let timeout = loop {
+                match shim.perform_network_interaction() {
+                    litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately => {}
+                    litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction { timeout } => {
+                        break timeout;
+                    }
+                }
+            };
+            let wait = match timeout {
+                Some(t) if t < DEFAULT_TIMEOUT => t,
+                _ => DEFAULT_TIMEOUT,
+            };
+            litebox_platform_multiplex::platform().wait_on_tun(Some(wait));
         }
+        while shim.perform_network_interaction().call_again_immediately() {}
+    });
+    Some(child)
+}
+
+/// Build argv from CLI args.
+fn build_argv(cli_args: &CliArgs) -> Vec<std::ffi::CString> {
+    cli_args
+        .program_and_arguments
+        .iter()
+        .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
+        .collect()
+}
+
+/// Build envp from CLI args, optionally forwarding host environment.
+fn build_envp(cli_args: &CliArgs) -> Vec<std::ffi::CString> {
+    let envp: Vec<_> = cli_args
+        .environment_variables
+        .iter()
+        .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
+        .collect();
+    if cli_args.forward_environment_variables {
+        envp.into_iter()
+            .chain(std::env::vars().map(|(k, v)| {
+                std::ffi::CString::new(
+                    k.bytes()
+                        .chain([b'='])
+                        .chain(v.bytes())
+                        .collect::<Vec<u8>>(),
+                )
+                .unwrap()
+            }))
+            .collect()
+    } else {
+        envp
     }
+}
+
+fn fixup_env(_envp: &mut Vec<alloc::ffi::CString>) {
+    // No environment fixups needed — the shim's mmap hook handles
+    // syscall patching at runtime without LD_AUDIT.
 }
