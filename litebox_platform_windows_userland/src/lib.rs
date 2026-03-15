@@ -492,6 +492,7 @@ struct TlsState {
     host_sp: Cell<*mut u128>,
     host_bp: Cell<*mut u128>,
     guest_context_top: Cell<*mut litebox_common_linux::PtRegs>,
+    #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
     scratch: Cell<usize>,
     is_in_guest: Cell<bool>,
     interrupt: Cell<bool>,
@@ -737,74 +738,80 @@ unsafe extern "C-unwind" fn run_thread_arch(thread_ctx: &mut ThreadContext, tls_
     // x16/x17 are available as scratch (intra-procedure-call scratch registers).
     .globl  syscall_callback
 syscall_callback:
+    // At entry from the shared SVC handler:
+    //   SP points to the SVC gate's 32-byte frame:
+    //     [SP+0]  = saved guest X16
+    //     [SP+8]  = saved guest X17
+    //     [SP+16] = guest return address (X30, set by SVC gate)
+    //     [SP+24] = guest TPIDR_EL0
+    //   X30 = guest return address (also at [SP+16])
+    //   X16, X17 = clobbered by shared handler
+    //   All other registers = guest state
+
     // Get the TLS state from the TLS slot and clear the in-guest flag.
-    // ARM64 requires adrp+ldr pair for PC-relative symbol access.
-    adrp    x16, {TLS_INDEX}
-    ldr     w16, [x16, :lo12:{TLS_INDEX}]
-    // TEB is in X18; TLS slot address = X18 + TEB_TLS_SLOTS_OFFSET + index*8
-    add     x16, x18, x16, lsl #3
-    ldr     x16, [x16, #TEB_TLS_SLOTS_OFFSET]
-    strb    wzr, [x16, #{IS_IN_GUEST}]
+    // Use x9 as scratch (caller-saved, will be saved into PtRegs later).
+    // We need TLS state pointer; load it from TEB (X18) + TLS slot.
+    adrp    x9, {TLS_INDEX}
+    ldr     w9, [x9, :lo12:{TLS_INDEX}]
+    add     x9, x18, x9, lsl #3
+    ldr     x9, [x9, #TEB_TLS_SLOTS_OFFSET]
+    // x9 = TLS state pointer
+    strb    wzr, [x9, #{IS_IN_GUEST}]
 
-    // Save guest SP to scratch, then switch to guest context structure.
-    mov     x17, sp
-    str     x17, [x16, #{SCRATCH}]
-    ldr     x17, [x16, #{GUEST_CONTEXT_TOP}]
+    // Get PtRegs base pointer. We write forwards from the base.
+    ldr     x16, [x9, #{GUEST_CONTEXT_TOP}]
+    sub     x16, x16, #272              // x16 = PtRegs base (272 = sizeof(PtRegs))
 
-    // Save all 31 general-purpose registers into PtRegs.regs[0..31].
-    // PtRegs layout (aarch64): regs[31] (248 bytes), sp (8), pc (8), pstate (8) = 272 bytes.
-    // We write from the top of PtRegs downward.
-    // Store pstate (use MRS to read NZCV as a proxy; real pstate is restored via NtContinue).
-    mrs     x9, NZCV
-    str     x9, [x17, #-8]!            // pstate
-    // Store pc (guest return address is in x30/LR from the trampoline gate).
-    str     x30, [x17, #-8]!           // pc
-    // Store sp.
-    ldr     x9, [x16, #{SCRATCH}]      // recover guest SP
-    str     x9, [x17, #-8]!            // sp
-    // Store x30 down to x0 (31 registers, 248 bytes).
-    // x30 is the guest's return address (already saved as pc above, but also save in regs[30]).
-    str     x30, [x17, #-8]!           // regs[30] = LR
-    str     x29, [x17, #-8]!           // regs[29] = FP
-    str     x28, [x17, #-8]!           // regs[28]
-    str     x27, [x17, #-8]!           // regs[27]
-    str     x26, [x17, #-8]!           // regs[26]
-    str     x25, [x17, #-8]!           // regs[25]
-    str     x24, [x17, #-8]!           // regs[24]
-    str     x23, [x17, #-8]!           // regs[23]
-    str     x22, [x17, #-8]!           // regs[22]
-    str     x21, [x17, #-8]!           // regs[21]
-    str     x20, [x17, #-8]!           // regs[20]
-    str     x19, [x17, #-8]!           // regs[19]
-    // x18 is TEB on Windows, save virtual X18 from the TEB slot instead.
-    ldr     x9, [x16, #{VIRT_X18}]
-    str     x9, [x17, #-8]!            // regs[18] = virtual x18
-    // x17 is being used as write pointer, save 0 as placeholder.
-    mov     x9, #0
-    str     x9, [x17, #-8]!            // regs[17] = 0 (clobbered by trampoline)
-    // x16 is being used as TLS pointer, save 0 as placeholder.
-    str     x9, [x17, #-8]!            // regs[16] = 0 (clobbered by trampoline)
-    str     x15, [x17, #-8]!           // regs[15]
-    str     x14, [x17, #-8]!           // regs[14]
-    str     x13, [x17, #-8]!           // regs[13]
-    str     x12, [x17, #-8]!           // regs[12]
-    str     x11, [x17, #-8]!           // regs[11]
-    str     x10, [x17, #-8]!           // regs[10]
-    str     x9, [x17, #-8]!            // regs[9] = 0 (x9 was clobbered)
-    str     x8, [x17, #-8]!            // regs[8] (syscall number)
-    str     x7, [x17, #-8]!            // regs[7]
-    str     x6, [x17, #-8]!            // regs[6]
-    str     x5, [x17, #-8]!            // regs[5]
-    str     x4, [x17, #-8]!            // regs[4]
-    str     x3, [x17, #-8]!            // regs[3]
-    str     x2, [x17, #-8]!            // regs[2]
-    str     x1, [x17, #-8]!            // regs[1]
-    str     x0, [x17, #-8]!            // regs[0]
+    // Save guest x0-x8 directly (they're still live).
+    stp     x0,  x1,  [x16, #0]        // regs[0], regs[1]
+    stp     x2,  x3,  [x16, #16]       // regs[2], regs[3]
+    stp     x4,  x5,  [x16, #32]       // regs[4], regs[5]
+    stp     x6,  x7,  [x16, #48]       // regs[6], regs[7]
+    str     x8,  [x16, #64]            // regs[8] (syscall number)
+
+    // x9 was clobbered (TLS pointer), save 0 as placeholder.
+    str     xzr, [x16, #72]            // regs[9] = 0
+
+    // Save guest x10-x15 directly (still live).
+    stp     x10, x11, [x16, #80]       // regs[10], regs[11]
+    stp     x12, x13, [x16, #96]       // regs[12], regs[13]
+    stp     x14, x15, [x16, #112]      // regs[14], regs[15]
+
+    // Recover guest x16, x17 from the SVC gate's stack frame.
+    ldp     x0, x1, [sp, #0]           // x0 = guest_x16, x1 = guest_x17
+    stp     x0, x1, [x16, #128]        // regs[16], regs[17]
+
+    // Save virtual x18 from TLS state.
+    ldr     x0, [x9, #{VIRT_X18}]
+    str     x0, [x16, #144]            // regs[18]
+
+    // Save guest x19-x29 directly (callee-saved, still live).
+    stp     x19, x20, [x16, #152]      // regs[19], regs[20]
+    stp     x21, x22, [x16, #168]      // regs[21], regs[22]
+    stp     x23, x24, [x16, #184]      // regs[23], regs[24]
+    stp     x25, x26, [x16, #200]      // regs[25], regs[26]
+    stp     x27, x28, [x16, #216]      // regs[27], regs[28]
+    str     x29, [x16, #232]           // regs[29] = FP
+
+    // Save guest x30 (return address from SVC gate frame).
+    ldr     x0, [sp, #16]
+    str     x0, [x16, #240]            // regs[30] = guest LR
+
+    // Compute original guest SP (before SVC gate's SUB SP, #32).
+    add     x0, sp, #32
+    str     x0, [x16, #248]            // PtRegs.sp
+
+    // Store guest PC = x30 (return address, same as regs[30]).
+    ldr     x0, [sp, #16]
+    str     x0, [x16, #256]            // PtRegs.pc
+
+    // Store pstate = 0 (will be set properly by NtContinue on resume).
+    str     xzr, [x16, #264]           // PtRegs.pstate
 
     // Reestablish the host stack and frame pointers.
-    ldr     x9, [x16, #{HOST_SP}]
-    mov     sp, x9
-    ldr     x29, [x16, #{HOST_BP}]
+    ldr     x0, [x9, #{HOST_SP}]
+    mov     sp, x0
+    ldr     x29, [x9, #{HOST_BP}]
 
     // Handle the syscall.
     ldr     x0, [sp]                   // thread_ctx
@@ -846,7 +853,6 @@ interrupt_callback:
     HOST_SP = const core::mem::offset_of!(TlsState, host_sp),
     HOST_BP = const core::mem::offset_of!(TlsState, host_bp),
     GUEST_CONTEXT_TOP = const core::mem::offset_of!(TlsState, guest_context_top),
-    SCRATCH = const core::mem::offset_of!(TlsState, scratch),
     IS_IN_GUEST = const core::mem::offset_of!(TlsState, is_in_guest),
     VIRT_X18 = const core::mem::offset_of!(TlsState, virt_x18),
     );
@@ -1000,9 +1006,10 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
                 for (i, x_reg) in x_regs.iter_mut().enumerate().take(31) {
                     *x_reg = ctx.regs[i] as u64;
                 }
-                // Virtualize X18: guest's X18 goes into TLS state, real X18 stays as TEB.
+                // Save guest's virtual X18 to TLS state. Don't write X18 into
+                // the CONTEXT — the kernel manages X18 as the TEB pointer and
+                // ignores whatever we put there. Leave it as default (0).
                 tls.virt_x18.set(ctx.regs[18]);
-                new_ctx.Anonymous.X[18] = 0; // Don't clobber TEB; NtContinue will set X18 to TEB.
                 win_ctx.write(new_ctx);
             }
             // Ensure the context is written before we set `is_in_guest`.

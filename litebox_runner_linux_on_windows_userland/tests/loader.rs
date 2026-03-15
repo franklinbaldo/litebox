@@ -332,13 +332,19 @@ fn run_dynamic_linked_prog_with_rewriter(
         .unwrap_or_else(|| "/lib64/litebox_rtld_audit.so".to_string());
     let audit_env = format!("LD_AUDIT={audit_path}");
 
+    // Build LD_LIBRARY_PATH from all library prefixes used.
+    let mut ld_paths: Vec<&str> = vec!["/lib64", "/lib32", "/lib"];
+    for (_, prefix) in libs_to_rewrite.iter().chain(libs_without_rewrite.iter()) {
+        if !ld_paths.contains(prefix) {
+            ld_paths.push(prefix);
+        }
+    }
+    let ld_library_path = format!("LD_LIBRARY_PATH={}", ld_paths.join(":"));
+
     let mut args = vec![
         "--unstable",
-        // Tell ld where to find the libraries.
-        // See https://man7.org/linux/man-pages/man8/ld.so.8.html for how ld works.
-        // Alternatively, we could add a `/etc/ld.so.cache` file to the rootfs.
         "--env",
-        "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
+        &ld_library_path,
         "--initial-files",
         tar_target_file.to_str().unwrap(),
         "--env",
