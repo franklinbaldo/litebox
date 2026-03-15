@@ -14,8 +14,9 @@
 //!
 //! This crate supports x86-64 (amd64), x86-32 (i386), and AArch64 (arm64) ELFs.
 
-#[cfg(target_arch = "aarch64")]
 mod arm64;
+
+pub use arm64::TargetOs;
 
 use std::collections::HashSet;
 
@@ -44,6 +45,8 @@ pub enum Error {
     InsufficientBytesBeforeOrAfter(u64),
     #[error("provided trampoline address is too large for 32-bit executable")]
     TrampolineAddressTooLarge,
+    #[error("unsupported target OS for this architecture: {0}")]
+    UnsupportedTargetOs(&'static str),
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -98,7 +101,16 @@ struct TextSectionInfo {
 /// - trampoline size (8 bytes for 64-bit, 4 bytes for 32-bit)
 ///
 /// This layout allows loaders to read just the last 32/20 bytes to get the metadata.
-pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Result<Vec<u8>> {
+///
+/// `target_os` selects the target OS for the rewritten binary. On AArch64, each OS has
+/// distinct rewriting behavior (TLS mechanism, x18 handling, trampoline layout). On x86,
+/// `target_os` is accepted but has no effect — all targets produce identical output.
+/// When `None`, defaults to the host OS.
+pub fn hook_syscalls_in_elf(
+    input_binary: &[u8],
+    trampoline: Option<u64>,
+    target_os: Option<arm64::TargetOs>,
+) -> Result<Vec<u8>> {
     // Make a single mutable, 8-byte-aligned copy of the input binary. This serves as both the
     // parse buffer (object::File::parse requires 8-byte alignment) and the output buffer for
     // in-place patching. We use a Vec<u64> to guarantee alignment, then view it as bytes.
@@ -156,16 +168,23 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
 
     let trampoline = trampoline.unwrap_or(0);
 
+    let target_os = target_os.unwrap_or(if cfg!(target_os = "macos") {
+        arm64::TargetOs::MacOs
+    } else if cfg!(target_os = "windows") {
+        arm64::TargetOs::Windows
+    } else {
+        arm64::TargetOs::Linux
+    });
+
     // Dispatch to arch-specific hooking logic
     let (trampoline_data, _syscall_insns_found) = if arch == Arch::Aarch64 {
-        #[cfg(target_arch = "aarch64")]
-        {
-            arm64::hook_syscalls_aarch64(buf, &text_sections, trampoline_base_addr, trampoline)?
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            unreachable!("AArch64 ELF cannot be loaded on non-aarch64 host")
-        }
+        arm64::hook_syscalls_aarch64(
+            buf,
+            &text_sections,
+            trampoline_base_addr,
+            trampoline,
+            target_os,
+        )?
     } else {
         // x86 path: build trampoline data and patch sections
         let mut trampoline_data = vec![];

@@ -29,7 +29,7 @@ const HELLO_INPUT_32: &[u8] = include_bytes!("hello-32");
 const HELLO_INPUT_AARCH64: &[u8] = include_bytes!("hello-aarch64");
 
 fn run_snapshot_test(input: &[u8], snapshot: &str) {
-    let output = litebox_syscall_rewriter::hook_syscalls_in_elf(input, None).unwrap();
+    let output = litebox_syscall_rewriter::hook_syscalls_in_elf(input, None, None).unwrap();
     let diff = similar::udiff::unified_diff(
         similar::Algorithm::Myers,
         &objdump(input),

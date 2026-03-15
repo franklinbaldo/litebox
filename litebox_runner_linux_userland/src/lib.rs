@@ -136,7 +136,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             .collect();
         let file = mmapped_file(&prog)?;
         let data = if cli_args.rewrite_syscalls {
-            litebox_syscall_rewriter::hook_syscalls_in_elf(file.data, None)
+            litebox_syscall_rewriter::hook_syscalls_in_elf(file.data, None, None)
                 .unwrap()
                 .into()
         } else {

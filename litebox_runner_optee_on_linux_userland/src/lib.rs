@@ -67,7 +67,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         let ldelf = PathBuf::from(&cli_args.ldelf);
         let data = std::fs::read(ldelf).unwrap();
         if cli_args.rewrite_syscalls {
-            litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None).unwrap()
+            litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None, None).unwrap()
         } else {
             data
         }
@@ -77,7 +77,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         let prog = PathBuf::from(&cli_args.program);
         let data = std::fs::read(prog).unwrap();
         if cli_args.rewrite_syscalls {
-            litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None).unwrap()
+            litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None, None).unwrap()
         } else {
             data
         }

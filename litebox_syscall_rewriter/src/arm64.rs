@@ -9,6 +9,152 @@
 
 use crate::{Error, Result, TextSectionInfo};
 
+/// Target operating system for the rewritten binary.
+///
+/// On x86, all targets produce identical output.
+/// On ARM64, each OS has distinct rewriting behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum TargetOs {
+    Linux,
+    #[value(name = "macos")]
+    MacOs,
+    Windows,
+}
+
+impl TargetOs {
+    pub const fn is_macos(self) -> bool {
+        matches!(self, Self::MacOs)
+    }
+
+    // Shared SVC handler
+    pub const fn shared_svc_handler_insn_count(self) -> usize {
+        match self {
+            Self::Linux | Self::Windows | Self::MacOs => 18,
+        }
+    }
+    pub const fn shared_svc_handler_size(self) -> usize {
+        self.shared_svc_handler_insn_count() * 4
+    }
+
+    // SVC gate
+    pub const fn svc_gate_insn_count(self) -> usize {
+        match self {
+            Self::Linux | Self::Windows => 6,
+            Self::MacOs => 7,
+        }
+    }
+    pub const fn svc_gate_size(self) -> usize {
+        self.svc_gate_insn_count() * 4
+    }
+
+    // Shared MSR handler
+    pub const fn shared_msr_handler_insn_count(self) -> usize {
+        match self {
+            Self::Linux | Self::Windows => 19,
+            Self::MacOs => 17,
+        }
+    }
+    pub const fn shared_msr_handler_size(self) -> usize {
+        self.shared_msr_handler_insn_count() * 4
+    }
+
+    // MSR gate
+    pub const fn msr_gate_insn_count(self) -> usize {
+        match self {
+            Self::Linux | Self::Windows => 9,
+            Self::MacOs => 13,
+        }
+    }
+    pub const fn msr_gate_size(self) -> usize {
+        self.msr_gate_insn_count() * 4
+    }
+    pub const fn msr_gate_special_size(self) -> usize {
+        (self.msr_gate_insn_count() + 1) * 4
+    }
+
+    // MRS gate
+    pub const fn mrs_gate_insn_count(self) -> usize {
+        match self {
+            Self::Linux | Self::Windows => 5,
+            Self::MacOs => 13,
+        }
+    }
+    pub const fn mrs_gate_size(self) -> usize {
+        self.mrs_gate_insn_count() * 4
+    }
+
+    // macOS-only shared handlers (values only meaningful when self == MacOs)
+    pub const fn shared_mrs_handler_insn_count(self) -> usize {
+        16
+    }
+    pub const fn shared_mrs_handler_size(self) -> usize {
+        self.shared_mrs_handler_insn_count() * 4
+    }
+    pub const fn shared_x18_load_handler_insn_count(self) -> usize {
+        16
+    }
+    pub const fn shared_x18_load_handler_size(self) -> usize {
+        self.shared_x18_load_handler_insn_count() * 4
+    }
+    pub const fn shared_x18_save_handler_insn_count(self) -> usize {
+        16
+    }
+    pub const fn shared_x18_save_handler_size(self) -> usize {
+        self.shared_x18_save_handler_insn_count() * 4
+    }
+
+    // x18 gate constants (only meaningful when self == MacOs)
+    pub const fn x18_gate_read_insn_count(self) -> usize {
+        14
+    }
+    #[allow(dead_code)]
+    pub const fn x18_gate_write_insn_count(self) -> usize {
+        14
+    }
+    pub const fn x18_gate_readwrite_insn_count(self) -> usize {
+        16
+    }
+
+    // Layout offsets
+    pub const fn shared_svc_handler_offset(self) -> usize {
+        SIGRETURN_GATE_OFFSET + self.svc_gate_size()
+    }
+
+    pub const fn shared_msr_handler_offset(self) -> usize {
+        self.shared_svc_handler_offset() + self.shared_svc_handler_size()
+    }
+
+    pub const fn shared_mrs_handler_offset(self) -> usize {
+        self.shared_msr_handler_offset() + self.shared_msr_handler_size()
+    }
+
+    pub const fn shared_x18_load_handler_offset(self) -> usize {
+        self.shared_mrs_handler_offset() + self.shared_mrs_handler_size()
+    }
+
+    pub const fn shared_x18_save_handler_offset(self) -> usize {
+        self.shared_x18_load_handler_offset() + self.shared_x18_load_handler_size()
+    }
+
+    pub const fn gates_start_offset(self) -> usize {
+        match self {
+            Self::Linux | Self::Windows => {
+                self.shared_msr_handler_offset() + self.shared_msr_handler_size()
+            }
+            Self::MacOs => {
+                self.shared_x18_save_handler_offset() + self.shared_x18_save_handler_size()
+            }
+        }
+    }
+
+    pub const fn msr_gate_size_for_rt(self, rt: u8) -> usize {
+        match rt {
+            16 | 17 | 30 => self.msr_gate_special_size(),
+            _ => self.msr_gate_size(),
+        }
+    }
+}
+
 /// ARM64 instruction: `SVC #0` (supervisor call)
 const SVC_0: u32 = 0xD4000001;
 
@@ -35,151 +181,7 @@ const MSR_TPIDR_EL0_BITS: u32 = 0xD51B_D040;
 const MRS_TPIDR_EL0_MASK: u32 = 0xFFFF_FFE0;
 const MRS_TPIDR_EL0_BITS: u32 = 0xD53B_D040;
 
-// ============================================================
-// Shared trampoline layout constants
-// ============================================================
-
-/// Number of instructions in the shared SVC handler (18 insns, 72 bytes).
-///
-/// Uses linear scan to find TLS entry matching guest TPIDR.
-/// On macOS, TPIDR_EL0 may be clobbered by the kernel on signal delivery,
-/// causing the scan to hit the sentinel without finding a match. The fallback
-/// path loads entry\[0\]'s host_tls and guest_tpidr as a best-effort recovery.
-///
-/// Linux layout (18 insns):
-/// ```text
-///  [0]  MRS  X18, TPIDR_EL0       ; get guest TPIDR (may be clobbered)
-///  [1]  STR  X18, [SP, #24]       ; save guest TPIDR
-///  [2]  LDR  X17, [PC, #off]      ; X17 = TLS table base
-///  [3]  LDR  X16, [X17, #0]       ; .Lloop: X16 = entry.guest_tpidr
-///  [4]  CMN  X16, #1              ; sentinel?
-///  [5]  B.EQ .Lfallback           ; -> [12]
-///  [6]  CMP  X16, X18             ; match guest TPIDR?
-///  [7]  B.EQ .Lfound              ; -> [10]
-///  [8]  ADD  X17, X17, #16        ; next entry
-///  [9]  B    .Lloop               ; -> [3]
-/// [10]  LDR  X18, [X17, #8]       ; .Lfound: X18 = host TLS
-/// [11]  B    .Ldone               ; -> [16]
-/// [12]  LDR  X17, [PC, #off]      ; .Lfallback: reload TLS table base
-/// [13]  LDR  X16, [X17, #0]       ; X16 = entry[0].guest_tpidr
-/// [14]  STR  X16, [SP, #24]       ; fix guest_tpidr on stack
-/// [15]  LDR  X18, [X17, #8]       ; X18 = entry[0].host_tls (fallback)
-/// [16]  LDR  X16, [PC, #off]      ; .Ldone: callback addr
-/// [17]  BR   X16                  ; jump to callback
-/// ```
-///
-/// macOS layout (18 insns): see `emit_shared_svc_handler_macos`
-// ---- Linux shared SVC handler layout ----
-#[cfg(target_os = "linux")]
-const SHARED_SVC_HANDLER_INSN_COUNT: usize = 18;
-#[cfg(target_os = "linux")]
-const SHARED_SVC_HANDLER_SIZE: usize = SHARED_SVC_HANDLER_INSN_COUNT * 4; // 72
-
-// ---- macOS shared SVC handler layout (TPIDRRO_EL0-keyed, x18 save, host_tls→frame) ----
-#[cfg(target_os = "macos")]
-const SHARED_SVC_HANDLER_INSN_COUNT: usize = 18;
-#[cfg(target_os = "macos")]
-const SHARED_SVC_HANDLER_SIZE: usize = SHARED_SVC_HANDLER_INSN_COUNT * 4; // 72
-
-// ---- Linux SVC gate layout (6 insns, 24 bytes, 32-byte frame) ----
-#[cfg(target_os = "linux")]
-const SVC_GATE_INSN_COUNT: usize = 6;
-#[cfg(target_os = "linux")]
-const SVC_GATE_SIZE: usize = SVC_GATE_INSN_COUNT * 4; // 24
-
-// ---- macOS SVC gate layout (7 insns, 28 bytes, 48-byte frame with x18 save) ----
-#[cfg(target_os = "macos")]
-const SVC_GATE_INSN_COUNT: usize = 7;
-#[cfg(target_os = "macos")]
-const SVC_GATE_SIZE: usize = SVC_GATE_INSN_COUNT * 4; // 28
-
-// ---- Linux shared MSR handler layout ----
-#[cfg(target_os = "linux")]
-const SHARED_MSR_HANDLER_INSN_COUNT: usize = 19;
-#[cfg(target_os = "linux")]
-const SHARED_MSR_HANDLER_SIZE: usize = SHARED_MSR_HANDLER_INSN_COUNT * 4; // 76
-
-// ---- macOS shared MSR handler layout (TPIDRRO_EL0-keyed, TCB write) ----
-#[cfg(target_os = "macos")]
-const SHARED_MSR_HANDLER_INSN_COUNT: usize = 17;
-#[cfg(target_os = "macos")]
-const SHARED_MSR_HANDLER_SIZE: usize = SHARED_MSR_HANDLER_INSN_COUNT * 4; // 68
-
-/// Number of instructions in each per-site MSR gate (general case).
-///
-/// Linux: 9 insns (36 bytes) — no NZCV save/restore needed.
-/// macOS: 13 insns (52 bytes) — includes NZCV save/restore around BL to shared handler.
-///
-/// ```text
-/// [0] SUB  SP, SP, #48           ; 48-byte frame
-/// [1] STP  X16, X17, [SP]        ; save X16, X17
-/// [2] STR  X30, [SP, #16]        ; save guest LR
-/// [3] STR  Xt,  [SP, #24]        ; store new TPIDR value (varies by Xt)
-/// [4] BL   shared_msr_handler    ; call shared handler
-/// [5] LDP  X16, X17, [SP]        ; restore X16, X17
-/// [6] LDR  X30, [SP, #16]        ; restore guest LR
-/// [7] ADD  SP, SP, #48           ; deallocate frame
-/// [8] B    <return_addr>          ; branch back to site.vaddr + 4
-/// ```
-///
-/// Special register cases (X16, X17, X30) use 10 instructions (40 bytes) on Linux,
-/// 14 instructions (56 bytes) on macOS.
-#[cfg(target_os = "linux")]
-const MSR_GATE_INSN_COUNT: usize = 9;
-#[cfg(target_os = "linux")]
-const MSR_GATE_SIZE: usize = MSR_GATE_INSN_COUNT * 4; // 36
-#[cfg(target_os = "linux")]
-const MSR_GATE_SPECIAL_SIZE: usize = (MSR_GATE_INSN_COUNT + 1) * 4; // 40
-
-// ---- macOS MSR gate layout (with NZCV save/restore) ----
-#[cfg(target_os = "macos")]
-const MSR_GATE_INSN_COUNT: usize = 13;
-#[cfg(target_os = "macos")]
-const MSR_GATE_SIZE: usize = MSR_GATE_INSN_COUNT * 4; // 52
-#[cfg(target_os = "macos")]
-const MSR_GATE_SPECIAL_SIZE: usize = (MSR_GATE_INSN_COUNT + 1) * 4; // 56
-
-// ---- Linux MRS gate layout (5 insns, 20 bytes, inline TLS read) ----
-#[cfg(target_os = "linux")]
-const MRS_GATE_INSN_COUNT: usize = 5;
-#[cfg(target_os = "linux")]
-const MRS_GATE_SIZE: usize = MRS_GATE_INSN_COUNT * 4; // 20
-
-// ---- macOS MRS gate layout (13 insns, 52 bytes, BL to shared MRS handler, 48-byte frame, NZCV save/restore) ----
-#[cfg(target_os = "macos")]
-const MRS_GATE_INSN_COUNT: usize = 13;
-#[cfg(target_os = "macos")]
-const MRS_GATE_SIZE: usize = MRS_GATE_INSN_COUNT * 4; // 52
-
-// ---- macOS shared MRS handler layout (TPIDRRO_EL0 → TCB → guest_tpidr → [SP+24]) ----
-#[cfg(any(target_os = "macos", test))]
-const SHARED_MRS_HANDLER_INSN_COUNT: usize = 16;
-#[cfg(any(target_os = "macos", test))]
-const SHARED_MRS_HANDLER_SIZE: usize = SHARED_MRS_HANDLER_INSN_COUNT * 4; // 64
-
-// ---- macOS shared x18 load handler (TPIDRRO_EL0 → TCB → guest_x18 → [SP+24]) ----
-#[cfg(any(target_os = "macos", test))]
-const SHARED_X18_LOAD_HANDLER_INSN_COUNT: usize = 16;
-#[cfg(any(target_os = "macos", test))]
-const SHARED_X18_LOAD_HANDLER_SIZE: usize = SHARED_X18_LOAD_HANDLER_INSN_COUNT * 4; // 64
-
-// ---- macOS shared x18 save handler (reads [SP+24] → TPIDRRO_EL0 → TCB → guest_x18) ----
-#[cfg(any(target_os = "macos", test))]
-const SHARED_X18_SAVE_HANDLER_INSN_COUNT: usize = 16;
-#[cfg(any(target_os = "macos", test))]
-const SHARED_X18_SAVE_HANDLER_SIZE: usize = SHARED_X18_SAVE_HANDLER_INSN_COUNT * 4; // 64
-
-// ---- macOS x18 gate layout (with NZCV save/restore) ----
-#[cfg(any(target_os = "macos", test))]
-const X18_GATE_READ_INSN_COUNT: usize = 14;
-#[cfg(any(target_os = "macos", test))]
-#[allow(dead_code)]
-const X18_GATE_WRITE_INSN_COUNT: usize = 14;
-#[cfg(any(target_os = "macos", test))]
-const X18_GATE_READWRITE_INSN_COUNT: usize = 16;
-
 /// ARM64 NOP instruction.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const NOP: u32 = 0xD503201F;
 
 /// Offset of the header region: callback address (8 bytes).
@@ -195,40 +197,6 @@ const HEADER_SIGRETURN_OFFSET: usize = 16;
 /// Offset where the sigreturn SVC gate begins.
 /// Called from the sigreturn preamble at offset 16 via `B .+8`.
 const SIGRETURN_GATE_OFFSET: usize = 24;
-
-/// Offset where the shared SVC handler begins.
-const SHARED_SVC_HANDLER_OFFSET: usize = SIGRETURN_GATE_OFFSET + SVC_GATE_SIZE;
-// Linux: 24 + 24 = 48, macOS: 24 + 28 = 52
-
-/// Offset where the shared MSR handler begins.
-const SHARED_MSR_HANDLER_OFFSET: usize = SHARED_SVC_HANDLER_OFFSET + SHARED_SVC_HANDLER_SIZE;
-// Linux: 48 + 72 = 120, macOS: 52 + 72 = 124
-
-/// Offset where the shared MRS handler begins (macOS only; Linux has no shared MRS handler).
-/// Under `test` on Linux, this computes from Linux MSR handler sizes (different value from macOS).
-#[cfg(any(target_os = "macos", test))]
-const SHARED_MRS_HANDLER_OFFSET: usize = SHARED_MSR_HANDLER_OFFSET + SHARED_MSR_HANDLER_SIZE;
-// macOS: 124 + 68 = 192
-
-/// Offset where the shared x18 load handler begins (macOS only).
-#[cfg(any(target_os = "macos", test))]
-const SHARED_X18_LOAD_HANDLER_OFFSET: usize = SHARED_MRS_HANDLER_OFFSET + SHARED_MRS_HANDLER_SIZE;
-// macOS: 192 + 64 = 256
-
-/// Offset where the shared x18 save handler begins (macOS only).
-#[cfg(any(target_os = "macos", test))]
-const SHARED_X18_SAVE_HANDLER_OFFSET: usize =
-    SHARED_X18_LOAD_HANDLER_OFFSET + SHARED_X18_LOAD_HANDLER_SIZE;
-// macOS: 256 + 64 = 320
-
-/// Offset where per-site gates begin (after all shared handlers).
-#[cfg(target_os = "linux")]
-const GATES_START_OFFSET: usize = SHARED_MSR_HANDLER_OFFSET + SHARED_MSR_HANDLER_SIZE;
-// Linux: 120 + 76 = 196
-
-#[cfg(target_os = "macos")]
-const GATES_START_OFFSET: usize = SHARED_X18_SAVE_HANDLER_OFFSET + SHARED_X18_SAVE_HANDLER_SIZE;
-// macOS: 320 + 64 = 384
 
 // ============================================================
 // Instruction encoders
@@ -453,7 +421,6 @@ fn encode_msr_tpidr_el0(rt: u8) -> u32 {
 /// On macOS, TPIDRRO_EL0 is set to the pthread TSD base. It is stable,
 /// per-thread, read-only to userspace, and never clobbered — making it
 /// a reliable lookup key for TLS table entries.
-#[cfg(target_os = "macos")]
 fn encode_mrs_tpidrro_el0(rt: u8) -> u32 {
     // TPIDRRO_EL0: op0=3(11), op1=3(011), CRn=13(1101), CRm=0(0000), op2=3(011)
     // Same as TPIDR_EL0 except op2=3 instead of 2
@@ -465,7 +432,6 @@ fn encode_mrs_tpidrro_el0(rt: u8) -> u32 {
 ///
 /// NZCV: op0=3, op1=3, CRn=4, CRm=2, op2=0
 /// Encoding: `0xD53B4200 | Rt`
-#[cfg(any(target_os = "macos", test))]
 fn encode_mrs_nzcv(rt: u8) -> u32 {
     0xD53B_4200 | u32::from(rt)
 }
@@ -473,7 +439,6 @@ fn encode_mrs_nzcv(rt: u8) -> u32 {
 /// Encode `MSR NZCV, Xt` (write condition flags register).
 ///
 /// Encoding: `0xD51B4200 | Rt`
-#[cfg(any(target_os = "macos", test))]
 fn encode_msr_nzcv(rt: u8) -> u32 {
     0xD51B_4200 | u32::from(rt)
 }
@@ -483,7 +448,6 @@ fn encode_msr_nzcv(rt: u8) -> u32 {
 /// Used as a trap instruction in unreachable code paths (e.g., unknown thread
 /// in TLS table lookup). Generates a synchronous debug exception.
 /// Encoding: `0xD4200000 | (imm16 << 5)`
-#[cfg(target_os = "macos")]
 fn encode_brk(imm16: u16) -> u32 {
     0xD420_0000 | (u32::from(imm16) << 5)
 }
@@ -779,7 +743,6 @@ enum PatchKind {
     /// On macOS, x18 is zeroed by the kernel on every return to userspace, so every
     /// instruction that reads or writes x18 must be rewritten to load/store from the
     /// per-thread `guest_x18` cell in the TCB.
-    #[cfg(any(target_os = "macos", test))]
     X18Use {
         /// The original 32-bit instruction word.
         insn: u32,
@@ -810,7 +773,6 @@ enum PatchKind {
 ///
 /// Returns `true` if any operand is a general-purpose register with number 18,
 /// including inside memory addressing modes (base register, index register, etc.).
-#[cfg(any(target_os = "macos", test))]
 fn references_x18(insn: u32) -> bool {
     use yaxpeax_arch::Decoder;
     use yaxpeax_arm::armv8::a64::{InstDecoder, Operand};
@@ -856,7 +818,6 @@ fn references_x18(insn: u32) -> bool {
 /// Uses the top byte of the instruction encoding to classify common store patterns.
 /// This is conservative — instructions not recognized as stores are treated as
 /// non-stores (loads or arithmetic), which is the safe default for read/write analysis.
-#[cfg(any(target_os = "macos", test))]
 fn is_store_instruction(insn: u32) -> bool {
     use yaxpeax_arch::Decoder;
     use yaxpeax_arm::armv8::a64::{InstDecoder, Opcode};
@@ -898,7 +859,6 @@ fn is_store_instruction(insn: u32) -> bool {
 ///
 /// Scratch register is X17 by default, or X16 if the instruction already uses X17
 /// in a non-x18 role.
-#[cfg(any(target_os = "macos", test))]
 fn rewrite_x18(insn: u32) -> (u32, u8, bool, bool) {
     // Determine if instruction uses X17 in a non-x18 field — if so, use X16 as scratch
     let rd = insn & 0x1F;
@@ -968,8 +928,6 @@ fn rewrite_x18(insn: u32) -> (u32, u8, bool, bool) {
 /// - STP/LDP signed offset (imm7, scaled by access size)
 /// - STR/LDR unsigned offset (imm12, scaled by access size)
 /// - STUR/LDUR unscaled offset (imm9, signed)
-#[cfg(any(target_os = "macos", test))]
-#[allow(clippy::cast_possible_wrap, clippy::manual_is_multiple_of)]
 fn adjust_sp_relative_offset(insn: u32, frame_size: u16) -> Option<u32> {
     use yaxpeax_arch::Decoder;
     use yaxpeax_arm::armv8::a64::{InstDecoder, Opcode};
@@ -1017,7 +975,7 @@ fn adjust_sp_relative_offset(insn: u32, frame_size: u16) -> Option<u32> {
                 imm7_raw
             };
             let current_offset = imm7_signed * scale;
-            let new_offset = current_offset + frame_size as i16;
+            let new_offset = current_offset + frame_size.cast_signed();
             let new_imm7 = new_offset / scale;
 
             // Validate: new offset must be aligned and fit in imm7 range [-64, 63]
@@ -1077,7 +1035,7 @@ fn adjust_sp_relative_offset(insn: u32, frame_size: u16) -> Option<u32> {
             } else {
                 imm9_raw
             };
-            let new_offset = imm9_signed + frame_size as i16;
+            let new_offset = imm9_signed + frame_size.cast_signed();
 
             // Validate: fits in signed 9-bit range [-256, 255]
             if !(-256..=255).contains(&new_offset) {
@@ -1135,7 +1093,6 @@ fn adjust_sp_relative_offset(insn: u32, frame_size: u16) -> Option<u32> {
 /// memory opcode, and `adjust_sp_relative_offset` returns `None` (overflow or
 /// unsupported format). In this case, the gate must use the SP restore strategy
 /// (ADD SP, SP, #frame / <insn> / SUB SP, SP, #frame) instead of immediate adjustment.
-#[cfg(any(target_os = "macos", test))]
 fn needs_sp_fixup(rewritten: u32, frame_size: u16) -> bool {
     use yaxpeax_arch::Decoder;
     use yaxpeax_arm::armv8::a64::{InstDecoder, Opcode};
@@ -1193,14 +1150,13 @@ fn needs_sp_fixup(rewritten: u32, frame_size: u16) -> bool {
 ///
 /// When `sp_fixup` is true, the gate emits 2 extra instructions (ADD SP / SUB SP)
 /// around the rewritten instruction to restore the original SP for memory access.
-#[cfg(any(target_os = "macos", test))]
-fn x18_gate_size(is_read: bool, is_write: bool, sp_fixup: bool) -> usize {
+fn x18_gate_size(target_os: TargetOs, is_read: bool, is_write: bool, sp_fixup: bool) -> usize {
     let extra = if sp_fixup { 2 } else { 0 };
     if is_read && is_write {
-        (X18_GATE_READWRITE_INSN_COUNT + extra) * 4
+        (target_os.x18_gate_readwrite_insn_count() + extra) * 4
     } else {
         // Both read-only and write-only are 14 insns (with NZCV save/restore)
-        (X18_GATE_READ_INSN_COUNT + extra) * 4
+        (target_os.x18_gate_read_insn_count() + extra) * 4
     }
 }
 
@@ -1210,7 +1166,11 @@ fn x18_gate_size(is_read: bool, is_write: bool, sp_fixup: bool) -> usize {
 /// ARM64 instructions are always 4-byte aligned, so we scan in 4-byte steps.
 /// Returns patch sites sorted by file offset.
 #[allow(clippy::cast_possible_truncation)]
-fn find_patch_sites(sections: &[TextSectionInfo], buf: &[u8]) -> Result<Vec<PatchSite>> {
+fn find_patch_sites(
+    sections: &[TextSectionInfo],
+    buf: &[u8],
+    target_os: TargetOs,
+) -> Result<Vec<PatchSite>> {
     let mut sites = Vec::new();
 
     for section in sections {
@@ -1247,28 +1207,26 @@ fn find_patch_sites(sections: &[TextSectionInfo], buf: &[u8]) -> Result<Vec<Patc
                 });
             }
             // macOS: check for x18 references (after SVC/MSR/MRS checks to avoid double-patching)
-            #[cfg(target_os = "macos")]
+            if target_os.is_macos()
+                && insn != SVC_0
+                && (insn & MSR_TPIDR_EL0_MASK) != MSR_TPIDR_EL0_BITS
+                && (insn & MRS_TPIDR_EL0_MASK) != MRS_TPIDR_EL0_BITS
+                && references_x18(insn)
             {
-                if insn != SVC_0
-                    && (insn & MSR_TPIDR_EL0_MASK) != MSR_TPIDR_EL0_BITS
-                    && (insn & MRS_TPIDR_EL0_MASK) != MRS_TPIDR_EL0_BITS
-                    && references_x18(insn)
-                {
-                    let (rewritten, scratch, is_read, is_write) = rewrite_x18(insn);
-                    let sp_fixup = needs_sp_fixup(rewritten, 48);
-                    sites.push(PatchSite {
-                        file_offset: start + i,
-                        vaddr: section.vaddr + i as u64,
-                        kind: PatchKind::X18Use {
-                            insn,
-                            rewritten,
-                            scratch,
-                            is_read,
-                            is_write,
-                            needs_sp_fixup: sp_fixup,
-                        },
-                    });
-                }
+                let (rewritten, scratch, is_read, is_write) = rewrite_x18(insn);
+                let sp_fixup = needs_sp_fixup(rewritten, 48);
+                sites.push(PatchSite {
+                    file_offset: start + i,
+                    vaddr: section.vaddr + i as u64,
+                    kind: PatchKind::X18Use {
+                        insn,
+                        rewritten,
+                        scratch,
+                        is_read,
+                        is_write,
+                        needs_sp_fixup: sp_fixup,
+                    },
+                });
             }
         }
     }
@@ -1313,9 +1271,14 @@ pub(crate) fn hook_syscalls_aarch64(
     text_sections: &[TextSectionInfo],
     trampoline_base_addr: u64,
     trampoline: u64,
+    target_os: TargetOs,
 ) -> Result<(Vec<u8>, bool)> {
+    if matches!(target_os, TargetOs::Windows) {
+        return Err(Error::UnsupportedTargetOs("aarch64-windows"));
+    }
+
     // Find all SVC #0, MSR TPIDR_EL0, and MRS TPIDR_EL0 sites
-    let sites = find_patch_sites(text_sections, buf)?;
+    let sites = find_patch_sites(text_sections, buf, target_os)?;
 
     // Check if there are any SVC instructions to patch
     let has_svc = sites.iter().any(|s| s.kind == PatchKind::Svc);
@@ -1323,12 +1286,13 @@ pub(crate) fn hook_syscalls_aarch64(
         .iter()
         .any(|s| matches!(s.kind, PatchKind::MsrTpidr(_) | PatchKind::MrsTpidr(_)));
 
-    #[cfg(target_os = "macos")]
-    let has_x18_sites = sites
-        .iter()
-        .any(|s| matches!(s.kind, PatchKind::X18Use { .. }));
-    #[cfg(not(target_os = "macos"))]
-    let has_x18_sites = false;
+    let has_x18_sites = if target_os.is_macos() {
+        sites
+            .iter()
+            .any(|s| matches!(s.kind, PatchKind::X18Use { .. }))
+    } else {
+        false
+    };
 
     if !has_svc && !has_tpidr_sites && !has_x18_sites {
         // No patch sites at all. Produce a minimal trampoline containing
@@ -1363,60 +1327,63 @@ pub(crate) fn hook_syscalls_aarch64(
             SIGRETURN_GATE_OFFSET,
             trampoline_base_addr,
             &sigret_dummy_site,
+            target_os,
         )?;
 
-        debug_assert_eq!(trampoline_data.len(), SHARED_SVC_HANDLER_OFFSET);
+        debug_assert_eq!(trampoline_data.len(), target_os.shared_svc_handler_offset());
 
         // Offset 48: shared SVC handler (72 bytes)
         emit_shared_svc_handler(
             &mut trampoline_data,
-            SHARED_SVC_HANDLER_OFFSET,
+            target_os.shared_svc_handler_offset(),
             trampoline_base_addr,
+            target_os,
         )?;
 
-        debug_assert_eq!(trampoline_data.len(), SHARED_MSR_HANDLER_OFFSET);
+        debug_assert_eq!(trampoline_data.len(), target_os.shared_msr_handler_offset());
 
         // Offset 120: shared MSR handler (76 bytes)
         emit_shared_msr_handler(
             &mut trampoline_data,
-            SHARED_MSR_HANDLER_OFFSET,
+            target_os.shared_msr_handler_offset(),
             trampoline_base_addr,
+            target_os,
         )?;
 
-        // macOS: shared MRS handler (64 bytes) between MSR handler and gates
-        #[cfg(target_os = "macos")]
-        {
-            debug_assert_eq!(trampoline_data.len(), SHARED_MRS_HANDLER_OFFSET);
+        // macOS: shared MRS handler, x18 load handler, x18 save handler
+        if target_os.is_macos() {
+            debug_assert_eq!(trampoline_data.len(), target_os.shared_mrs_handler_offset());
             emit_shared_mrs_handler(
                 &mut trampoline_data,
-                SHARED_MRS_HANDLER_OFFSET,
+                target_os.shared_mrs_handler_offset(),
                 trampoline_base_addr,
+                target_os,
             )?;
-        }
 
-        // macOS: shared x18 load handler (64 bytes)
-        #[cfg(target_os = "macos")]
-        {
-            debug_assert_eq!(trampoline_data.len(), SHARED_X18_LOAD_HANDLER_OFFSET);
+            debug_assert_eq!(
+                trampoline_data.len(),
+                target_os.shared_x18_load_handler_offset()
+            );
             emit_shared_x18_load_handler(
                 &mut trampoline_data,
-                SHARED_X18_LOAD_HANDLER_OFFSET,
+                target_os.shared_x18_load_handler_offset(),
                 trampoline_base_addr,
+                target_os,
             )?;
-        }
 
-        // macOS: shared x18 save handler (64 bytes)
-        #[cfg(target_os = "macos")]
-        {
-            debug_assert_eq!(trampoline_data.len(), SHARED_X18_SAVE_HANDLER_OFFSET);
+            debug_assert_eq!(
+                trampoline_data.len(),
+                target_os.shared_x18_save_handler_offset()
+            );
             emit_shared_x18_save_handler(
                 &mut trampoline_data,
-                SHARED_X18_SAVE_HANDLER_OFFSET,
+                target_os.shared_x18_save_handler_offset(),
                 trampoline_base_addr,
+                target_os,
             )?;
         }
 
-        debug_assert_eq!(trampoline_data.len(), GATES_START_OFFSET);
+        debug_assert_eq!(trampoline_data.len(), target_os.gates_start_offset());
 
         return Ok((trampoline_data, false));
     }
@@ -1451,60 +1418,63 @@ pub(crate) fn hook_syscalls_aarch64(
         SIGRETURN_GATE_OFFSET,
         trampoline_base_addr,
         &sigret_dummy_site,
+        target_os,
     )?;
 
-    debug_assert_eq!(trampoline_data.len(), SHARED_SVC_HANDLER_OFFSET);
+    debug_assert_eq!(trampoline_data.len(), target_os.shared_svc_handler_offset());
 
     // Offset 48: shared SVC handler (72 bytes)
     emit_shared_svc_handler(
         &mut trampoline_data,
-        SHARED_SVC_HANDLER_OFFSET,
+        target_os.shared_svc_handler_offset(),
         trampoline_base_addr,
+        target_os,
     )?;
 
-    debug_assert_eq!(trampoline_data.len(), SHARED_MSR_HANDLER_OFFSET);
+    debug_assert_eq!(trampoline_data.len(), target_os.shared_msr_handler_offset());
 
     // Offset 120: shared MSR handler (76 bytes)
     emit_shared_msr_handler(
         &mut trampoline_data,
-        SHARED_MSR_HANDLER_OFFSET,
+        target_os.shared_msr_handler_offset(),
         trampoline_base_addr,
+        target_os,
     )?;
 
-    // macOS: shared MRS handler (64 bytes) between MSR handler and gates
-    #[cfg(target_os = "macos")]
-    {
-        debug_assert_eq!(trampoline_data.len(), SHARED_MRS_HANDLER_OFFSET);
+    // macOS: shared MRS handler, x18 load handler, x18 save handler
+    if target_os.is_macos() {
+        debug_assert_eq!(trampoline_data.len(), target_os.shared_mrs_handler_offset());
         emit_shared_mrs_handler(
             &mut trampoline_data,
-            SHARED_MRS_HANDLER_OFFSET,
+            target_os.shared_mrs_handler_offset(),
             trampoline_base_addr,
+            target_os,
         )?;
-    }
 
-    // macOS: shared x18 load handler (64 bytes)
-    #[cfg(target_os = "macos")]
-    {
-        debug_assert_eq!(trampoline_data.len(), SHARED_X18_LOAD_HANDLER_OFFSET);
+        debug_assert_eq!(
+            trampoline_data.len(),
+            target_os.shared_x18_load_handler_offset()
+        );
         emit_shared_x18_load_handler(
             &mut trampoline_data,
-            SHARED_X18_LOAD_HANDLER_OFFSET,
+            target_os.shared_x18_load_handler_offset(),
             trampoline_base_addr,
+            target_os,
         )?;
-    }
 
-    // macOS: shared x18 save handler (64 bytes)
-    #[cfg(target_os = "macos")]
-    {
-        debug_assert_eq!(trampoline_data.len(), SHARED_X18_SAVE_HANDLER_OFFSET);
+        debug_assert_eq!(
+            trampoline_data.len(),
+            target_os.shared_x18_save_handler_offset()
+        );
         emit_shared_x18_save_handler(
             &mut trampoline_data,
-            SHARED_X18_SAVE_HANDLER_OFFSET,
+            target_os.shared_x18_save_handler_offset(),
             trampoline_base_addr,
+            target_os,
         )?;
     }
 
-    debug_assert_eq!(trampoline_data.len(), GATES_START_OFFSET);
+    debug_assert_eq!(trampoline_data.len(), target_os.gates_start_offset());
 
     // Generate per-site gates and patch original code
     for site in &sites {
@@ -1518,6 +1488,7 @@ pub(crate) fn hook_syscalls_aarch64(
                     gate_offset,
                     trampoline_base_addr,
                     site,
+                    target_os,
                 )?;
             }
             PatchKind::MsrTpidr(rt) => {
@@ -1527,6 +1498,7 @@ pub(crate) fn hook_syscalls_aarch64(
                     trampoline_base_addr,
                     site,
                     rt,
+                    target_os,
                 )?;
             }
             PatchKind::MrsTpidr(rd) => {
@@ -1536,9 +1508,9 @@ pub(crate) fn hook_syscalls_aarch64(
                     trampoline_base_addr,
                     site,
                     rd,
+                    target_os,
                 )?;
             }
-            #[cfg(any(target_os = "macos", test))]
             PatchKind::X18Use {
                 rewritten,
                 scratch,
@@ -1557,6 +1529,7 @@ pub(crate) fn hook_syscalls_aarch64(
                     is_read,
                     is_write,
                     sp_fixup,
+                    target_os,
                 )?;
             }
         }
@@ -1598,21 +1571,32 @@ fn emit_shared_svc_handler(
     trampoline_data: &mut Vec<u8>,
     handler_offset: usize,
     trampoline_base_addr: u64,
+    target_os: TargetOs,
 ) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    return emit_shared_svc_handler_linux(trampoline_data, handler_offset, trampoline_base_addr);
-    #[cfg(target_os = "macos")]
-    return emit_shared_svc_handler_macos(trampoline_data, handler_offset, trampoline_base_addr);
+    match target_os {
+        TargetOs::Linux | TargetOs::Windows => emit_shared_svc_handler_linux(
+            trampoline_data,
+            handler_offset,
+            trampoline_base_addr,
+            target_os,
+        ),
+        TargetOs::MacOs => emit_shared_svc_handler_macos(
+            trampoline_data,
+            handler_offset,
+            trampoline_base_addr,
+            target_os,
+        ),
+    }
 }
 
 /// Linux shared SVC handler: TPIDR_EL0-keyed lookup with fallback to entry[0].
 /// See constant docs for instruction layout.
-#[cfg(target_os = "linux")]
 #[allow(clippy::cast_possible_wrap)]
 fn emit_shared_svc_handler_linux(
     trampoline_data: &mut Vec<u8>,
     handler_offset: usize,
     trampoline_base_addr: u64,
+    target_os: TargetOs,
 ) -> Result<()> {
     let handler_vaddr = trampoline_base_addr + handler_offset as u64;
     let mut insn_idx: usize = 0;
@@ -1778,10 +1762,10 @@ fn emit_shared_svc_handler_linux(
     trampoline_data.extend_from_slice(&encode_br(16).to_le_bytes());
     insn_idx += 1;
 
-    debug_assert_eq!(insn_idx, SHARED_SVC_HANDLER_INSN_COUNT);
+    debug_assert_eq!(insn_idx, target_os.shared_svc_handler_insn_count());
     debug_assert_eq!(
         trampoline_data.len() - handler_offset,
-        SHARED_SVC_HANDLER_SIZE,
+        target_os.shared_svc_handler_size(),
         "Shared SVC handler size mismatch"
     );
 
@@ -1814,12 +1798,12 @@ fn emit_shared_svc_handler_linux(
 /// [16]  BR   X16                  ; jump to callback
 /// [17]  BRK  #1                   ; .Ltrap: unreachable (unknown thread)
 /// ```
-#[cfg(target_os = "macos")]
 #[allow(clippy::cast_possible_wrap)]
 fn emit_shared_svc_handler_macos(
     trampoline_data: &mut Vec<u8>,
     handler_offset: usize,
     trampoline_base_addr: u64,
+    target_os: TargetOs,
 ) -> Result<()> {
     let handler_vaddr = trampoline_base_addr + handler_offset as u64;
     let mut insn_idx: usize = 0;
@@ -1968,10 +1952,10 @@ fn emit_shared_svc_handler_macos(
     trampoline_data.extend_from_slice(&encode_brk(1).to_le_bytes());
     insn_idx += 1;
 
-    debug_assert_eq!(insn_idx, SHARED_SVC_HANDLER_INSN_COUNT);
+    debug_assert_eq!(insn_idx, target_os.shared_svc_handler_insn_count());
     debug_assert_eq!(
         trampoline_data.len() - handler_offset,
-        SHARED_SVC_HANDLER_SIZE,
+        target_os.shared_svc_handler_size(),
         "macOS shared SVC handler size mismatch"
     );
 
@@ -1990,21 +1974,34 @@ fn emit_svc_gate(
     gate_offset: usize,
     trampoline_base_addr: u64,
     site: &PatchSite,
+    target_os: TargetOs,
 ) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    return emit_svc_gate_linux(trampoline_data, gate_offset, trampoline_base_addr, site);
-    #[cfg(target_os = "macos")]
-    return emit_svc_gate_macos(trampoline_data, gate_offset, trampoline_base_addr, site);
+    match target_os {
+        TargetOs::Linux | TargetOs::Windows => emit_svc_gate_linux(
+            trampoline_data,
+            gate_offset,
+            trampoline_base_addr,
+            site,
+            target_os,
+        ),
+        TargetOs::MacOs => emit_svc_gate_macos(
+            trampoline_data,
+            gate_offset,
+            trampoline_base_addr,
+            site,
+            target_os,
+        ),
+    }
 }
 
 /// Linux SVC gate: 6 instructions, 24 bytes, 32-byte frame.
-#[cfg(target_os = "linux")]
 #[allow(clippy::cast_possible_wrap)]
 fn emit_svc_gate_linux(
     trampoline_data: &mut Vec<u8>,
     gate_offset: usize,
     trampoline_base_addr: u64,
     site: &PatchSite,
+    target_os: TargetOs,
 ) -> Result<()> {
     let gate_vaddr = trampoline_base_addr + gate_offset as u64;
     let mut insn_idx: usize = 0;
@@ -2056,7 +2053,7 @@ fn emit_svc_gate_linux(
 
     // [5] B <shared_svc_handler>
     let b_vaddr = insn_vaddr(insn_idx);
-    let handler_vaddr = trampoline_base_addr + SHARED_SVC_HANDLER_OFFSET as u64;
+    let handler_vaddr = trampoline_base_addr + target_os.shared_svc_handler_offset() as u64;
     let b_offset = handler_vaddr.cast_signed() - b_vaddr.cast_signed();
     let b_insn = encode_b(b_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
@@ -2067,10 +2064,10 @@ fn emit_svc_gate_linux(
     trampoline_data.extend_from_slice(&b_insn.to_le_bytes());
     insn_idx += 1;
 
-    debug_assert_eq!(insn_idx, SVC_GATE_INSN_COUNT);
+    debug_assert_eq!(insn_idx, target_os.svc_gate_insn_count());
     debug_assert_eq!(
         trampoline_data.len() - gate_offset,
-        SVC_GATE_SIZE,
+        target_os.svc_gate_size(),
         "SVC gate size mismatch"
     );
 
@@ -2088,13 +2085,13 @@ fn emit_svc_gate_linux(
 /// [5] ADD  X30, X30, #<pageoff>   ; return addr low 12 bits
 /// [6] B    <shared_svc_handler>   ; branch to shared handler
 /// ```
-#[cfg(target_os = "macos")]
 #[allow(clippy::cast_possible_wrap)]
 fn emit_svc_gate_macos(
     trampoline_data: &mut Vec<u8>,
     gate_offset: usize,
     trampoline_base_addr: u64,
     site: &PatchSite,
+    target_os: TargetOs,
 ) -> Result<()> {
     let gate_vaddr = trampoline_base_addr + gate_offset as u64;
     let mut insn_idx: usize = 0;
@@ -2154,7 +2151,7 @@ fn emit_svc_gate_macos(
 
     // [6] B <shared_svc_handler>
     let b_vaddr = insn_vaddr(insn_idx);
-    let handler_vaddr = trampoline_base_addr + SHARED_SVC_HANDLER_OFFSET as u64;
+    let handler_vaddr = trampoline_base_addr + target_os.shared_svc_handler_offset() as u64;
     let b_offset = handler_vaddr.cast_signed() - b_vaddr.cast_signed();
     let b_insn = encode_b(b_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
@@ -2165,10 +2162,10 @@ fn emit_svc_gate_macos(
     trampoline_data.extend_from_slice(&b_insn.to_le_bytes());
     insn_idx += 1;
 
-    debug_assert_eq!(insn_idx, SVC_GATE_INSN_COUNT);
+    debug_assert_eq!(insn_idx, target_os.svc_gate_insn_count());
     debug_assert_eq!(
         trampoline_data.len() - gate_offset,
-        SVC_GATE_SIZE,
+        target_os.svc_gate_size(),
         "macOS SVC gate size mismatch"
     );
 
@@ -2196,20 +2193,31 @@ fn emit_shared_msr_handler(
     trampoline_data: &mut Vec<u8>,
     handler_offset: usize,
     trampoline_base_addr: u64,
+    target_os: TargetOs,
 ) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    return emit_shared_msr_handler_linux(trampoline_data, handler_offset, trampoline_base_addr);
-    #[cfg(target_os = "macos")]
-    return emit_shared_msr_handler_macos(trampoline_data, handler_offset, trampoline_base_addr);
+    match target_os {
+        TargetOs::Linux | TargetOs::Windows => emit_shared_msr_handler_linux(
+            trampoline_data,
+            handler_offset,
+            trampoline_base_addr,
+            target_os,
+        ),
+        TargetOs::MacOs => emit_shared_msr_handler_macos(
+            trampoline_data,
+            handler_offset,
+            trampoline_base_addr,
+            target_os,
+        ),
+    }
 }
 
 /// Linux shared MSR handler: TPIDR_EL0-keyed lookup, updates entry in-place.
-#[cfg(target_os = "linux")]
 #[allow(clippy::cast_possible_wrap)]
 fn emit_shared_msr_handler_linux(
     trampoline_data: &mut Vec<u8>,
     handler_offset: usize,
     trampoline_base_addr: u64,
+    target_os: TargetOs,
 ) -> Result<()> {
     let handler_vaddr = trampoline_base_addr + handler_offset as u64;
     let mut insn_idx: usize = 0;
@@ -2375,10 +2383,10 @@ fn emit_shared_msr_handler_linux(
     trampoline_data.extend_from_slice(&encode_ret(30).to_le_bytes());
     insn_idx += 1;
 
-    debug_assert_eq!(insn_idx, SHARED_MSR_HANDLER_INSN_COUNT);
+    debug_assert_eq!(insn_idx, target_os.shared_msr_handler_insn_count());
     debug_assert_eq!(
         trampoline_data.len() - handler_offset,
-        SHARED_MSR_HANDLER_SIZE,
+        target_os.shared_msr_handler_size(),
         "Shared MSR handler size mismatch"
     );
 
@@ -2411,12 +2419,12 @@ fn emit_shared_msr_handler_linux(
 /// [15]  RET
 /// [16]  BRK  #1                   ; .Ltrap: unreachable
 /// ```
-#[cfg(target_os = "macos")]
 #[allow(clippy::cast_possible_wrap)]
 fn emit_shared_msr_handler_macos(
     trampoline_data: &mut Vec<u8>,
     handler_offset: usize,
     trampoline_base_addr: u64,
+    target_os: TargetOs,
 ) -> Result<()> {
     let handler_vaddr = trampoline_base_addr + handler_offset as u64;
     let mut insn_idx: usize = 0;
@@ -2549,10 +2557,10 @@ fn emit_shared_msr_handler_macos(
     trampoline_data.extend_from_slice(&encode_brk(1).to_le_bytes());
     insn_idx += 1;
 
-    debug_assert_eq!(insn_idx, SHARED_MSR_HANDLER_INSN_COUNT);
+    debug_assert_eq!(insn_idx, target_os.shared_msr_handler_insn_count());
     debug_assert_eq!(
         trampoline_data.len() - handler_offset,
-        SHARED_MSR_HANDLER_SIZE,
+        target_os.shared_msr_handler_size(),
         "macOS shared MSR handler size mismatch"
     );
 
@@ -2564,13 +2572,18 @@ fn emit_shared_msr_handler_macos(
 /// On Linux there is no shared MRS handler — the MRS gate reads entry[0].guest_tpidr
 /// inline. On macOS the handler does a TPIDRRO_EL0-keyed TLS table lookup to find
 /// the correct TCB and loads guest_tpidr from it into [SP+24] for the gate.
-#[cfg(target_os = "macos")]
 fn emit_shared_mrs_handler(
     trampoline_data: &mut Vec<u8>,
     handler_offset: usize,
     trampoline_base_addr: u64,
+    target_os: TargetOs,
 ) -> Result<()> {
-    emit_shared_mrs_handler_macos(trampoline_data, handler_offset, trampoline_base_addr)
+    emit_shared_mrs_handler_macos(
+        trampoline_data,
+        handler_offset,
+        trampoline_base_addr,
+        target_os,
+    )
 }
 
 /// macOS shared MRS handler: TPIDRRO_EL0-keyed lookup, reads guest_tpidr from TCB.
@@ -2603,12 +2616,12 @@ fn emit_shared_mrs_handler(
 /// [14]  RET
 /// [15]  BRK  #1                   ; .Ltrap: unreachable
 /// ```
-#[cfg(target_os = "macos")]
 #[allow(clippy::cast_possible_wrap)]
 fn emit_shared_mrs_handler_macos(
     trampoline_data: &mut Vec<u8>,
     handler_offset: usize,
     trampoline_base_addr: u64,
+    target_os: TargetOs,
 ) -> Result<()> {
     let handler_vaddr = trampoline_base_addr + handler_offset as u64;
     let mut insn_idx: usize = 0;
@@ -2737,10 +2750,10 @@ fn emit_shared_mrs_handler_macos(
     trampoline_data.extend_from_slice(&encode_brk(1).to_le_bytes());
     insn_idx += 1;
 
-    debug_assert_eq!(insn_idx, SHARED_MRS_HANDLER_INSN_COUNT);
+    debug_assert_eq!(insn_idx, target_os.shared_mrs_handler_insn_count());
     debug_assert_eq!(
         trampoline_data.len() - handler_offset,
-        SHARED_MRS_HANDLER_SIZE,
+        target_os.shared_mrs_handler_size(),
         "macOS shared MRS handler size mismatch"
     );
 
@@ -2774,12 +2787,12 @@ fn emit_shared_mrs_handler_macos(
 /// [14]  RET
 /// [15]  BRK  #1                     ; trap
 /// ```
-#[cfg(target_os = "macos")]
 #[allow(clippy::cast_possible_wrap)]
 fn emit_shared_x18_load_handler(
     trampoline_data: &mut Vec<u8>,
     handler_offset: usize,
     trampoline_base_addr: u64,
+    target_os: TargetOs,
 ) -> Result<()> {
     let handler_vaddr = trampoline_base_addr + handler_offset as u64;
     let mut insn_idx: usize = 0;
@@ -2908,10 +2921,10 @@ fn emit_shared_x18_load_handler(
     trampoline_data.extend_from_slice(&encode_brk(1).to_le_bytes());
     insn_idx += 1;
 
-    debug_assert_eq!(insn_idx, SHARED_X18_LOAD_HANDLER_INSN_COUNT);
+    debug_assert_eq!(insn_idx, target_os.shared_x18_load_handler_insn_count());
     debug_assert_eq!(
         trampoline_data.len() - handler_offset,
-        SHARED_X18_LOAD_HANDLER_SIZE,
+        target_os.shared_x18_load_handler_size(),
         "macOS shared x18 load handler size mismatch"
     );
 
@@ -2943,12 +2956,12 @@ fn emit_shared_x18_load_handler(
 /// [14]  RET
 /// [15]  BRK  #1                     ; trap
 /// ```
-#[cfg(target_os = "macos")]
 #[allow(clippy::cast_possible_wrap)]
 fn emit_shared_x18_save_handler(
     trampoline_data: &mut Vec<u8>,
     handler_offset: usize,
     trampoline_base_addr: u64,
+    target_os: TargetOs,
 ) -> Result<()> {
     let handler_vaddr = trampoline_base_addr + handler_offset as u64;
     let mut insn_idx: usize = 0;
@@ -3077,10 +3090,10 @@ fn emit_shared_x18_save_handler(
     trampoline_data.extend_from_slice(&encode_brk(1).to_le_bytes());
     insn_idx += 1;
 
-    debug_assert_eq!(insn_idx, SHARED_X18_SAVE_HANDLER_INSN_COUNT);
+    debug_assert_eq!(insn_idx, target_os.shared_x18_save_handler_insn_count());
     debug_assert_eq!(
         trampoline_data.len() - handler_offset,
-        SHARED_X18_SAVE_HANDLER_SIZE,
+        target_os.shared_x18_save_handler_size(),
         "macOS shared x18 save handler size mismatch"
     );
 
@@ -3150,7 +3163,6 @@ fn emit_shared_x18_save_handler(
 /// [14]  ADD  SP, SP, #48
 /// [15]  B    <return_addr>
 /// ```
-#[cfg(any(target_os = "macos", test))]
 #[allow(clippy::cast_possible_wrap, clippy::too_many_arguments)]
 fn emit_x18_gate(
     trampoline_data: &mut Vec<u8>,
@@ -3162,9 +3174,10 @@ fn emit_x18_gate(
     is_read: bool,
     is_write: bool,
     sp_fixup: bool,
+    target_os: TargetOs,
 ) -> Result<()> {
     let gate_vaddr = trampoline_base_addr + gate_offset as u64;
-    let gate_size = x18_gate_size(is_read, is_write, sp_fixup);
+    let gate_size = x18_gate_size(target_os, is_read, is_write, sp_fixup);
     let gate_insn_count = gate_size / 4;
     let mut insn_idx: usize = 0;
     let insn_vaddr = |idx: usize| -> u64 { gate_vaddr + (idx as u64) * 4 };
@@ -3238,7 +3251,8 @@ fn emit_x18_gate(
 
         // [5] BL <shared_x18_load>
         let bl_vaddr = insn_vaddr(insn_idx);
-        let load_handler_vaddr = trampoline_base_addr + SHARED_X18_LOAD_HANDLER_OFFSET as u64;
+        let load_handler_vaddr =
+            trampoline_base_addr + target_os.shared_x18_load_handler_offset() as u64;
         let bl_offset = load_handler_vaddr.cast_signed() - bl_vaddr.cast_signed();
         let bl_insn = encode_bl(bl_offset).ok_or_else(|| {
             Error::DisassemblyFailure(format!(
@@ -3295,7 +3309,8 @@ fn emit_x18_gate(
 
         // [11/13] BL <shared_x18_save>
         let bl_vaddr = insn_vaddr(insn_idx);
-        let save_handler_vaddr = trampoline_base_addr + SHARED_X18_SAVE_HANDLER_OFFSET as u64;
+        let save_handler_vaddr =
+            trampoline_base_addr + target_os.shared_x18_save_handler_offset() as u64;
         let bl_offset = save_handler_vaddr.cast_signed() - bl_vaddr.cast_signed();
         let bl_insn = encode_bl(bl_offset).ok_or_else(|| {
             Error::DisassemblyFailure(format!(
@@ -3310,7 +3325,8 @@ fn emit_x18_gate(
 
         // [5] BL <shared_x18_load>
         let bl_vaddr = insn_vaddr(insn_idx);
-        let load_handler_vaddr = trampoline_base_addr + SHARED_X18_LOAD_HANDLER_OFFSET as u64;
+        let load_handler_vaddr =
+            trampoline_base_addr + target_os.shared_x18_load_handler_offset() as u64;
         let bl_offset = load_handler_vaddr.cast_signed() - bl_vaddr.cast_signed();
         let bl_insn = encode_bl(bl_offset).ok_or_else(|| {
             Error::DisassemblyFailure(format!(
@@ -3393,7 +3409,8 @@ fn emit_x18_gate(
 
         // [9/11] BL <shared_x18_save>
         let bl_vaddr = insn_vaddr(insn_idx);
-        let save_handler_vaddr = trampoline_base_addr + SHARED_X18_SAVE_HANDLER_OFFSET as u64;
+        let save_handler_vaddr =
+            trampoline_base_addr + target_os.shared_x18_save_handler_offset() as u64;
         let bl_offset = save_handler_vaddr.cast_signed() - bl_vaddr.cast_signed();
         let bl_insn = encode_bl(bl_offset).ok_or_else(|| {
             Error::DisassemblyFailure(format!(
@@ -3454,11 +3471,8 @@ fn emit_x18_gate(
 /// the saved value before storing to `[SP, #24]`.
 /// Linux: general 36 bytes, special 40 bytes.
 /// macOS: general 52 bytes, special 56 bytes.
-fn msr_gate_size(rt: u8) -> usize {
-    match rt {
-        16 | 17 | 30 => MSR_GATE_SPECIAL_SIZE,
-        _ => MSR_GATE_SIZE,
-    }
+fn msr_gate_size(target_os: TargetOs, rt: u8) -> usize {
+    target_os.msr_gate_size_for_rt(rt)
 }
 
 /// Emit a per-site MSR gate.
@@ -3474,15 +3488,29 @@ fn emit_msr_gate(
     trampoline_base_addr: u64,
     site: &PatchSite,
     rt: u8,
+    target_os: TargetOs,
 ) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    return emit_msr_gate_linux(trampoline_data, gate_offset, trampoline_base_addr, site, rt);
-    #[cfg(target_os = "macos")]
-    return emit_msr_gate_macos(trampoline_data, gate_offset, trampoline_base_addr, site, rt);
+    match target_os {
+        TargetOs::Linux | TargetOs::Windows => emit_msr_gate_linux(
+            trampoline_data,
+            gate_offset,
+            trampoline_base_addr,
+            site,
+            rt,
+            target_os,
+        ),
+        TargetOs::MacOs => emit_msr_gate_macos(
+            trampoline_data,
+            gate_offset,
+            trampoline_base_addr,
+            site,
+            rt,
+            target_os,
+        ),
+    }
 }
 
 /// Linux MSR gate: 9-10 instructions, 36-40 bytes, no NZCV save/restore.
-#[cfg(target_os = "linux")]
 #[allow(clippy::cast_possible_wrap)]
 fn emit_msr_gate_linux(
     trampoline_data: &mut Vec<u8>,
@@ -3490,9 +3518,10 @@ fn emit_msr_gate_linux(
     trampoline_base_addr: u64,
     site: &PatchSite,
     rt: u8,
+    target_os: TargetOs,
 ) -> Result<()> {
     let gate_vaddr = trampoline_base_addr + gate_offset as u64;
-    let gate_size = msr_gate_size(rt);
+    let gate_size = msr_gate_size(target_os, rt);
     let gate_insn_count = gate_size / 4;
     let mut insn_idx: usize = 0;
     let insn_vaddr = |idx: usize| -> u64 { gate_vaddr + (idx as u64) * 4 };
@@ -3577,7 +3606,7 @@ fn emit_msr_gate_linux(
 
     // [next] BL shared_msr_handler
     let bl_vaddr = insn_vaddr(insn_idx);
-    let handler_vaddr = trampoline_base_addr + SHARED_MSR_HANDLER_OFFSET as u64;
+    let handler_vaddr = trampoline_base_addr + target_os.shared_msr_handler_offset() as u64;
     let bl_offset = handler_vaddr.cast_signed() - bl_vaddr.cast_signed();
     let bl_insn = encode_bl(bl_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
@@ -3654,7 +3683,6 @@ fn emit_msr_gate_linux(
 /// ```
 ///
 /// Special register cases (X16, X17, X30) use 14 instructions (56 bytes).
-#[cfg(target_os = "macos")]
 #[allow(clippy::cast_possible_wrap)]
 fn emit_msr_gate_macos(
     trampoline_data: &mut Vec<u8>,
@@ -3662,9 +3690,10 @@ fn emit_msr_gate_macos(
     trampoline_base_addr: u64,
     site: &PatchSite,
     rt: u8,
+    target_os: TargetOs,
 ) -> Result<()> {
     let gate_vaddr = trampoline_base_addr + gate_offset as u64;
-    let gate_size = msr_gate_size(rt);
+    let gate_size = msr_gate_size(target_os, rt);
     let gate_insn_count = gate_size / 4;
     let mut insn_idx: usize = 0;
     let insn_vaddr = |idx: usize| -> u64 { gate_vaddr + (idx as u64) * 4 };
@@ -3761,7 +3790,7 @@ fn emit_msr_gate_macos(
 
     // [next] BL shared_msr_handler
     let bl_vaddr = insn_vaddr(insn_idx);
-    let handler_vaddr = trampoline_base_addr + SHARED_MSR_HANDLER_OFFSET as u64;
+    let handler_vaddr = trampoline_base_addr + target_os.shared_msr_handler_offset() as u64;
     let bl_offset = handler_vaddr.cast_signed() - bl_vaddr.cast_signed();
     let bl_insn = encode_bl(bl_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
@@ -3836,11 +3865,26 @@ fn emit_mrs_gate(
     trampoline_base_addr: u64,
     site: &PatchSite,
     rd: u8,
+    target_os: TargetOs,
 ) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    return emit_mrs_gate_linux(trampoline_data, gate_offset, trampoline_base_addr, site, rd);
-    #[cfg(target_os = "macos")]
-    return emit_mrs_gate_macos(trampoline_data, gate_offset, trampoline_base_addr, site, rd);
+    match target_os {
+        TargetOs::Linux | TargetOs::Windows => emit_mrs_gate_linux(
+            trampoline_data,
+            gate_offset,
+            trampoline_base_addr,
+            site,
+            rd,
+            target_os,
+        ),
+        TargetOs::MacOs => emit_mrs_gate_macos(
+            trampoline_data,
+            gate_offset,
+            trampoline_base_addr,
+            site,
+            rd,
+            target_os,
+        ),
+    }
 }
 
 /// Linux MRS gate: inline TLS table read, 5 instructions / 20 bytes.
@@ -3859,7 +3903,6 @@ fn emit_mrs_gate(
 ///
 /// **Xd = X16:** use X17 as sole scratch
 /// **Xd = X17:** use X16 as sole scratch
-#[cfg(target_os = "linux")]
 #[allow(clippy::cast_possible_wrap)]
 fn emit_mrs_gate_linux(
     trampoline_data: &mut Vec<u8>,
@@ -3867,6 +3910,7 @@ fn emit_mrs_gate_linux(
     trampoline_base_addr: u64,
     site: &PatchSite,
     rd: u8,
+    target_os: TargetOs,
 ) -> Result<()> {
     let gate_vaddr = trampoline_base_addr + gate_offset as u64;
     let mut insn_idx: usize = 0;
@@ -3981,10 +4025,10 @@ fn emit_mrs_gate_linux(
     trampoline_data.extend_from_slice(&b_insn.to_le_bytes());
     insn_idx += 1;
 
-    debug_assert_eq!(insn_idx, MRS_GATE_INSN_COUNT);
+    debug_assert_eq!(insn_idx, target_os.mrs_gate_insn_count());
     debug_assert_eq!(
         trampoline_data.len() - gate_offset,
-        MRS_GATE_SIZE,
+        target_os.mrs_gate_size(),
         "MRS gate size mismatch"
     );
 
@@ -4019,7 +4063,6 @@ fn emit_mrs_gate_linux(
 /// **Xd = X16:** NZCV restore first, then restore X17/X30 individually, load X16 from [SP+24] last
 /// **Xd = X17:** NZCV restore first, then restore X16/X30 individually, load X17 from [SP+24] last
 /// **Xd = X30:** NZCV restore first, then restore X16/X17, load X30 from [SP+24], NOP pad to 13
-#[cfg(target_os = "macos")]
 #[allow(clippy::cast_possible_wrap)]
 fn emit_mrs_gate_macos(
     trampoline_data: &mut Vec<u8>,
@@ -4027,6 +4070,7 @@ fn emit_mrs_gate_macos(
     trampoline_base_addr: u64,
     site: &PatchSite,
     rd: u8,
+    target_os: TargetOs,
 ) -> Result<()> {
     let gate_vaddr = trampoline_base_addr + gate_offset as u64;
     let mut insn_idx: usize = 0;
@@ -4066,7 +4110,7 @@ fn emit_mrs_gate_macos(
 
     // [5] BL <shared_mrs_handler>
     let bl_vaddr = insn_vaddr(insn_idx);
-    let handler_vaddr = trampoline_base_addr + SHARED_MRS_HANDLER_OFFSET as u64;
+    let handler_vaddr = trampoline_base_addr + target_os.shared_mrs_handler_offset() as u64;
     let bl_offset = handler_vaddr.cast_signed() - bl_vaddr.cast_signed();
     let bl_insn = encode_bl(bl_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
@@ -4201,10 +4245,10 @@ fn emit_mrs_gate_macos(
     trampoline_data.extend_from_slice(&ret_insn.to_le_bytes());
     insn_idx += 1;
 
-    debug_assert_eq!(insn_idx, MRS_GATE_INSN_COUNT);
+    debug_assert_eq!(insn_idx, target_os.mrs_gate_insn_count());
     debug_assert_eq!(
         trampoline_data.len() - gate_offset,
-        MRS_GATE_SIZE,
+        target_os.mrs_gate_size(),
         "macOS MRS gate size mismatch"
     );
 
@@ -4588,7 +4632,7 @@ mod tests {
             size: 16,
         }];
 
-        let sites = find_patch_sites(&sections, &buf).unwrap();
+        let sites = find_patch_sites(&sections, &buf, TargetOs::Linux).unwrap();
         assert_eq!(sites.len(), 1);
         assert_eq!(sites[0].file_offset, 4);
         assert_eq!(sites[0].vaddr, 0x1004);
@@ -4609,7 +4653,7 @@ mod tests {
             size: 32,
         }];
 
-        let sites = find_patch_sites(&sections, &buf).unwrap();
+        let sites = find_patch_sites(&sections, &buf, TargetOs::Linux).unwrap();
         assert_eq!(sites.len(), 3);
         assert_eq!(sites[0].vaddr, 0x2000);
         assert_eq!(sites[1].vaddr, 0x200C);
@@ -4625,7 +4669,7 @@ mod tests {
             size: 16,
         }];
 
-        let sites = find_patch_sites(&sections, &buf).unwrap();
+        let sites = find_patch_sites(&sections, &buf, TargetOs::Linux).unwrap();
         assert!(sites.is_empty());
     }
 
@@ -4642,7 +4686,7 @@ mod tests {
             size: 16,
         }];
 
-        let sites = find_patch_sites(&sections, &buf).unwrap();
+        let sites = find_patch_sites(&sections, &buf, TargetOs::Linux).unwrap();
         assert!(sites.is_empty());
     }
 
@@ -4659,7 +4703,7 @@ mod tests {
             size: 16,
         }];
 
-        let sites = find_patch_sites(&sections, &buf).unwrap();
+        let sites = find_patch_sites(&sections, &buf, TargetOs::Linux).unwrap();
         assert_eq!(sites.len(), 1);
         assert_eq!(sites[0].file_offset, 4);
         assert_eq!(sites[0].vaddr, 0x1004);
@@ -4681,7 +4725,7 @@ mod tests {
             size: 24,
         }];
 
-        let sites = find_patch_sites(&sections, &buf).unwrap();
+        let sites = find_patch_sites(&sections, &buf, TargetOs::Linux).unwrap();
         assert_eq!(sites.len(), 3);
         assert_eq!(sites[0].kind, PatchKind::Svc);
         assert_eq!(sites[1].kind, PatchKind::MsrTpidr(0));
@@ -4695,22 +4739,22 @@ mod tests {
     #[test]
     fn test_snippet_size_constant() {
         // Shared SVC handler: 18 instructions, 72 bytes (linear scan + fallback)
-        assert_eq!(SHARED_SVC_HANDLER_SIZE, 72);
-        assert_eq!(SHARED_SVC_HANDLER_INSN_COUNT, 18);
+        assert_eq!(TargetOs::Linux.shared_svc_handler_size(), 72);
+        assert_eq!(TargetOs::Linux.shared_svc_handler_insn_count(), 18);
         // Per-site SVC gate: 6 instructions, 24 bytes
-        assert_eq!(SVC_GATE_SIZE, 24);
-        assert_eq!(SVC_GATE_INSN_COUNT, 6);
+        assert_eq!(TargetOs::Linux.svc_gate_size(), 24);
+        assert_eq!(TargetOs::Linux.svc_gate_insn_count(), 6);
         // Shared MSR handler: 19 instructions, 76 bytes (linear scan + sentinel entry[0] write)
-        assert_eq!(SHARED_MSR_HANDLER_SIZE, 76);
-        assert_eq!(SHARED_MSR_HANDLER_INSN_COUNT, 19);
+        assert_eq!(TargetOs::Linux.shared_msr_handler_size(), 76);
+        assert_eq!(TargetOs::Linux.shared_msr_handler_insn_count(), 19);
         // Per-site MSR gate: 9 instructions (general), 36 bytes
-        assert_eq!(MSR_GATE_SIZE, 36);
-        assert_eq!(MSR_GATE_INSN_COUNT, 9);
+        assert_eq!(TargetOs::Linux.msr_gate_size(), 36);
+        assert_eq!(TargetOs::Linux.msr_gate_insn_count(), 9);
         // Per-site MSR gate (special regs): 10 instructions, 40 bytes
-        assert_eq!(MSR_GATE_SPECIAL_SIZE, 40);
+        assert_eq!(TargetOs::Linux.msr_gate_special_size(), 40);
         // Per-site MRS gate: 5 instructions, 20 bytes
-        assert_eq!(MRS_GATE_SIZE, 20);
-        assert_eq!(MRS_GATE_INSN_COUNT, 5);
+        assert_eq!(TargetOs::Linux.mrs_gate_size(), 20);
+        assert_eq!(TargetOs::Linux.mrs_gate_insn_count(), 5);
     }
 
     #[test]
@@ -4733,11 +4777,17 @@ mod tests {
         let trampoline_base = 0x2000u64;
         let callback_addr = 0xDEAD_BEEF_CAFE_BABEu64;
 
-        let (td, _) =
-            hook_syscalls_aarch64(&mut buf, &sections, trampoline_base, callback_addr).unwrap();
+        let (td, _) = hook_syscalls_aarch64(
+            &mut buf,
+            &sections,
+            trampoline_base,
+            callback_addr,
+            TargetOs::Linux,
+        )
+        .unwrap();
 
-        // === Per-site SVC gate at GATES_START_OFFSET (6 instructions) ===
-        let gate_start = GATES_START_OFFSET;
+        // === Per-site SVC gate at TargetOs::Linux.gates_start_offset() (6 instructions) ===
+        let gate_start = TargetOs::Linux.gates_start_offset();
         let gate_vaddr = trampoline_base + gate_start as u64;
 
         let gate_insn_at = |idx: usize| -> u32 {
@@ -4772,13 +4822,13 @@ mod tests {
 
         // [5] B <shared_svc_handler>
         let b_vaddr = gate_vaddr + 5 * 4;
-        let handler_vaddr = trampoline_base + SHARED_SVC_HANDLER_OFFSET as u64;
+        let handler_vaddr = trampoline_base + TargetOs::Linux.shared_svc_handler_offset() as u64;
         let b_offset = handler_vaddr as i64 - b_vaddr as i64;
         assert_eq!(gate_insn_at(5), encode_b(b_offset).unwrap());
 
-        // === Shared SVC handler at SHARED_SVC_HANDLER_OFFSET (18 instructions) ===
+        // === Shared SVC handler at TargetOs::Linux.shared_svc_handler_offset() (18 instructions) ===
         // Linear scan TLS lookup with sentinel fallback
-        let handler_start = SHARED_SVC_HANDLER_OFFSET;
+        let handler_start = TargetOs::Linux.shared_svc_handler_offset();
         let handler_vaddr = trampoline_base + handler_start as u64;
 
         let handler_insn_at = |idx: usize| -> u32 {
@@ -4896,8 +4946,14 @@ mod tests {
         let trampoline_base = 0x2000u64;
         let callback_addr = 0xDEAD_BEEF_CAFE_BABEu64;
 
-        let (trampoline_data, found) =
-            hook_syscalls_aarch64(&mut buf, &sections, trampoline_base, callback_addr).unwrap();
+        let (trampoline_data, found) = hook_syscalls_aarch64(
+            &mut buf,
+            &sections,
+            trampoline_base,
+            callback_addr,
+            TargetOs::Linux,
+        )
+        .unwrap();
 
         assert!(found);
 
@@ -4920,13 +4976,16 @@ mod tests {
         let sigreturn_b = u32::from_le_bytes(trampoline_data[20..24].try_into().unwrap());
         assert_eq!(sigreturn_b, encode_b(4).unwrap());
 
-        // Total: GATES_START_OFFSET (184) + 1 SVC gate (24) = 208
-        assert_eq!(trampoline_data.len(), GATES_START_OFFSET + SVC_GATE_SIZE);
+        // Total: TargetOs::Linux.gates_start_offset() (184) + 1 SVC gate (24) = 208
+        assert_eq!(
+            trampoline_data.len(),
+            TargetOs::Linux.gates_start_offset() + TargetOs::Linux.svc_gate_size()
+        );
 
         // Verify the original SVC was patched with a B instruction
         let patched = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-        // B to per-site gate at 0x2000 + GATES_START_OFFSET
-        let gate_vaddr = trampoline_base + GATES_START_OFFSET as u64;
+        // B to per-site gate at 0x2000 + TargetOs::Linux.gates_start_offset()
+        let gate_vaddr = trampoline_base + TargetOs::Linux.gates_start_offset() as u64;
         let expected_b = encode_b(gate_vaddr as i64 - 0x1004i64).unwrap();
         assert_eq!(patched, expected_b);
 
@@ -4948,14 +5007,14 @@ mod tests {
             size: 8,
         }];
 
-        let result = hook_syscalls_aarch64(&mut buf, &sections, 0x2000, 0);
+        let result = hook_syscalls_aarch64(&mut buf, &sections, 0x2000, 0, TargetOs::Linux);
         let (trampoline_data, has_svc) = result.expect("should succeed with minimal trampoline");
         assert!(!has_svc, "should report no SVC found");
         // Minimal trampoline: header(16) + sigret preamble(8) + sigret gate(24) + shared SVC(72) + shared MSR(64) = 184
         assert_eq!(
             trampoline_data.len(),
-            GATES_START_OFFSET,
-            "minimal trampoline should be exactly GATES_START_OFFSET bytes"
+            TargetOs::Linux.gates_start_offset(),
+            "minimal trampoline should be exactly TargetOs::Linux.gates_start_offset() bytes"
         );
     }
 
@@ -4978,14 +5037,15 @@ mod tests {
 
         let trampoline_base = 0x2000u64;
         let (trampoline_data, found) =
-            hook_syscalls_aarch64(&mut buf, &sections, trampoline_base, 0).unwrap();
+            hook_syscalls_aarch64(&mut buf, &sections, trampoline_base, 0, TargetOs::Linux)
+                .unwrap();
 
         assert!(found);
 
-        // GATES_START_OFFSET (184) + 2 * SVC_GATE_SIZE (24) = 232
+        // TargetOs::Linux.gates_start_offset() (184) + 2 * TargetOs::Linux.svc_gate_size() (24) = 232
         assert_eq!(
             trampoline_data.len(),
-            GATES_START_OFFSET + 2 * SVC_GATE_SIZE
+            TargetOs::Linux.gates_start_offset() + 2 * TargetOs::Linux.svc_gate_size()
         );
 
         // Both SVCs should be patched
@@ -4999,9 +5059,11 @@ mod tests {
         // Verify they branch to different targets (different gates)
         assert_ne!(patched1, patched2);
 
-        // Verify gate 1 at GATES_START_OFFSET and gate 2 at GATES_START_OFFSET + SVC_GATE_SIZE
-        let gate1_vaddr = trampoline_base + GATES_START_OFFSET as u64;
-        let gate2_vaddr = trampoline_base + GATES_START_OFFSET as u64 + SVC_GATE_SIZE as u64;
+        // Verify gate 1 at TargetOs::Linux.gates_start_offset() and gate 2 at TargetOs::Linux.gates_start_offset() + TargetOs::Linux.svc_gate_size()
+        let gate1_vaddr = trampoline_base + TargetOs::Linux.gates_start_offset() as u64;
+        let gate2_vaddr = trampoline_base
+            + TargetOs::Linux.gates_start_offset() as u64
+            + TargetOs::Linux.svc_gate_size() as u64;
 
         let expected_b1 = encode_b(gate1_vaddr as i64 - 0x1004i64).unwrap();
         let expected_b2 = encode_b(gate2_vaddr as i64 - 0x1010i64).unwrap();
@@ -5020,7 +5082,8 @@ mod tests {
             size: 8,
         }];
 
-        let (trampoline_data, _) = hook_syscalls_aarch64(&mut buf, &sections, 0x2000, 0).unwrap();
+        let (trampoline_data, _) =
+            hook_syscalls_aarch64(&mut buf, &sections, 0x2000, 0, TargetOs::Linux).unwrap();
 
         // Offset 16: MOV X8, #139
         let sigreturn_mov = u32::from_le_bytes(trampoline_data[16..20].try_into().unwrap());
@@ -5059,7 +5122,8 @@ mod tests {
             size: 8,
         }];
 
-        let (trampoline_data, _) = hook_syscalls_aarch64(&mut buf, &sections, 0x2000, 0).unwrap();
+        let (trampoline_data, _) =
+            hook_syscalls_aarch64(&mut buf, &sections, 0x2000, 0, TargetOs::Linux).unwrap();
 
         let callback = u64::from_le_bytes(trampoline_data[0..8].try_into().unwrap());
         assert_eq!(callback, 0);
@@ -5076,7 +5140,8 @@ mod tests {
             size: 8,
         }];
 
-        let (trampoline_data, _) = hook_syscalls_aarch64(&mut buf, &sections, 0x2000, 0).unwrap();
+        let (trampoline_data, _) =
+            hook_syscalls_aarch64(&mut buf, &sections, 0x2000, 0, TargetOs::Linux).unwrap();
 
         let tls_ptr = u64::from_le_bytes(trampoline_data[8..16].try_into().unwrap());
         assert_eq!(tls_ptr, 0, "TLS table pointer should be 0 initially");
@@ -5095,7 +5160,9 @@ mod tests {
         }];
 
         let callback_addr = 0x1234_5678_9ABC_DEF0u64;
-        let (td, _) = hook_syscalls_aarch64(&mut buf, &sections, 0x2000, callback_addr).unwrap();
+        let (td, _) =
+            hook_syscalls_aarch64(&mut buf, &sections, 0x2000, callback_addr, TargetOs::Linux)
+                .unwrap();
 
         // Offset 0-7: callback address
         assert_eq!(
@@ -5141,8 +5208,11 @@ mod tests {
         // Offset 48: shared SVC handler (72 bytes)
         // Offset 120: shared MSR handler (64 bytes)
         // Offset 184: per-site gates start
-        // Total: GATES_START_OFFSET + SVC_GATE_SIZE = 208
-        assert_eq!(td.len(), GATES_START_OFFSET + SVC_GATE_SIZE);
+        // Total: TargetOs::Linux.gates_start_offset() + TargetOs::Linux.svc_gate_size() = 208
+        assert_eq!(
+            td.len(),
+            TargetOs::Linux.gates_start_offset() + TargetOs::Linux.svc_gate_size()
+        );
     }
 
     #[test]
@@ -5158,12 +5228,13 @@ mod tests {
             size: 8,
         }];
 
-        let (td, _) = hook_syscalls_aarch64(&mut buf, &sections, 0x2000, 0).unwrap();
+        let (td, _) =
+            hook_syscalls_aarch64(&mut buf, &sections, 0x2000, 0, TargetOs::Linux).unwrap();
 
-        // Read instructions from the shared SVC handler at SHARED_SVC_HANDLER_OFFSET
+        // Read instructions from the shared SVC handler at TargetOs::Linux.shared_svc_handler_offset()
         // Linear scan: loop at [3], found at [10], fallback at [12], done at [16]
         let insn_at = |idx: usize| -> u32 {
-            let off = SHARED_SVC_HANDLER_OFFSET + idx * 4;
+            let off = TargetOs::Linux.shared_svc_handler_offset() + idx * 4;
             u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
         };
 
@@ -5207,8 +5278,14 @@ mod tests {
         }];
 
         let trampoline_base = 0x2000u64;
-        let (td, found) =
-            hook_syscalls_aarch64(&mut buf, &sections, trampoline_base, 0xCAFE).unwrap();
+        let (td, found) = hook_syscalls_aarch64(
+            &mut buf,
+            &sections,
+            trampoline_base,
+            0xCAFE,
+            TargetOs::Linux,
+        )
+        .unwrap();
         assert!(found);
         (td, buf, trampoline_base)
     }
@@ -5216,8 +5293,13 @@ mod tests {
     #[test]
     fn test_hook_svc_and_msr_trampoline_sizes() {
         let (td, _, _) = hook_with_svc_and_msr(19);
-        // GATES_START_OFFSET (184) + SVC gate (24) + MSR gate for X19 (36) = 244
-        assert_eq!(td.len(), GATES_START_OFFSET + SVC_GATE_SIZE + MSR_GATE_SIZE);
+        // TargetOs::Linux.gates_start_offset() (184) + SVC gate (24) + MSR gate for X19 (36) = 244
+        assert_eq!(
+            td.len(),
+            TargetOs::Linux.gates_start_offset()
+                + TargetOs::Linux.svc_gate_size()
+                + TargetOs::Linux.msr_gate_size()
+        );
     }
 
     #[test]
@@ -5236,7 +5318,7 @@ mod tests {
     fn test_msr_gate_prologue() {
         let (td, _, _) = hook_with_svc_and_msr(19);
         // MSR gate starts after the SVC gate
-        let msr_start = GATES_START_OFFSET + SVC_GATE_SIZE;
+        let msr_start = TargetOs::Linux.gates_start_offset() + TargetOs::Linux.svc_gate_size();
         let insn_at = |idx: usize| -> u32 {
             let off = msr_start + idx * 4;
             u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
@@ -5254,7 +5336,7 @@ mod tests {
     fn test_msr_gate_store_new_tpidr_generic_reg() {
         // MSR TPIDR_EL0, X19 — generic register, should be STR X19, [SP, #24]
         let (td, _, _) = hook_with_svc_and_msr(19);
-        let msr_start = GATES_START_OFFSET + SVC_GATE_SIZE;
+        let msr_start = TargetOs::Linux.gates_start_offset() + TargetOs::Linux.svc_gate_size();
         let insn_at = |idx: usize| -> u32 {
             let off = msr_start + idx * 4;
             u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
@@ -5269,7 +5351,7 @@ mod tests {
         // MSR TPIDR_EL0, X16 — saved reg, must reload from [SP, #0]
         let (td, _, _) = hook_with_svc_and_msr(16);
         // X16 is a special register, so MSR gate is 40 bytes
-        let msr_start = GATES_START_OFFSET + SVC_GATE_SIZE;
+        let msr_start = TargetOs::Linux.gates_start_offset() + TargetOs::Linux.svc_gate_size();
         let insn_at = |idx: usize| -> u32 {
             let off = msr_start + idx * 4;
             u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
@@ -5286,7 +5368,7 @@ mod tests {
         // MSR TPIDR_EL0, X17 — saved reg, must reload from [SP, #8]
         let (td, _, _) = hook_with_svc_and_msr(17);
         // X17 is a special register, so MSR gate is 40 bytes
-        let msr_start = GATES_START_OFFSET + SVC_GATE_SIZE;
+        let msr_start = TargetOs::Linux.gates_start_offset() + TargetOs::Linux.svc_gate_size();
         let insn_at = |idx: usize| -> u32 {
             let off = msr_start + idx * 4;
             u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
@@ -5303,7 +5385,7 @@ mod tests {
         // MSR TPIDR_EL0, X30 — saved reg, must reload from [SP, #16]
         let (td, _, _) = hook_with_svc_and_msr(30);
         // X30 is a special register, so MSR gate is 40 bytes
-        let msr_start = GATES_START_OFFSET + SVC_GATE_SIZE;
+        let msr_start = TargetOs::Linux.gates_start_offset() + TargetOs::Linux.svc_gate_size();
         let insn_at = |idx: usize| -> u32 {
             let off = msr_start + idx * 4;
             u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
@@ -5319,7 +5401,7 @@ mod tests {
     fn test_msr_gate_store_new_tpidr_xzr() {
         // MSR TPIDR_EL0, XZR (reg 31) — store zero
         let (td, _, _) = hook_with_svc_and_msr(31);
-        let msr_start = GATES_START_OFFSET + SVC_GATE_SIZE;
+        let msr_start = TargetOs::Linux.gates_start_offset() + TargetOs::Linux.svc_gate_size();
         let insn_at = |idx: usize| -> u32 {
             let off = msr_start + idx * 4;
             u32::from_le_bytes(td[off..off + 4].try_into().unwrap())
@@ -5333,7 +5415,7 @@ mod tests {
     fn test_msr_gate_bl_and_epilogue() {
         // Verify the full MSR gate instruction layout: BL to shared handler + epilogue
         let (td, _, trampoline_base) = hook_with_svc_and_msr(19);
-        let msr_start = GATES_START_OFFSET + SVC_GATE_SIZE;
+        let msr_start = TargetOs::Linux.gates_start_offset() + TargetOs::Linux.svc_gate_size();
         let gate_vaddr = trampoline_base + msr_start as u64;
         let insn_at = |idx: usize| -> u32 {
             let off = msr_start + idx * 4;
@@ -5347,7 +5429,7 @@ mod tests {
 
         // [4] BL shared_msr_handler
         let bl_vaddr = gate_vaddr + 4 * 4;
-        let handler_vaddr = trampoline_base + SHARED_MSR_HANDLER_OFFSET as u64;
+        let handler_vaddr = trampoline_base + TargetOs::Linux.shared_msr_handler_offset() as u64;
         let bl_offset = handler_vaddr as i64 - bl_vaddr as i64;
         assert_eq!(insn_at(4), encode_bl(bl_offset).unwrap());
 
@@ -5372,7 +5454,7 @@ mod tests {
         // Verify the full shared MSR handler instruction layout (19 instructions)
         // Linear scan TLS lookup with sentinel entry[0] write
         let (td, _, trampoline_base) = hook_with_svc_and_msr(19);
-        let handler_start = SHARED_MSR_HANDLER_OFFSET;
+        let handler_start = TargetOs::Linux.shared_msr_handler_offset();
         let handler_vaddr = trampoline_base + handler_start as u64;
         let insn_at = |idx: usize| -> u32 {
             let off = handler_start + idx * 4;
@@ -5461,7 +5543,7 @@ mod tests {
             size: 8,
         }];
 
-        let result = hook_syscalls_aarch64(&mut buf, &sections, 0x2000, 0);
+        let result = hook_syscalls_aarch64(&mut buf, &sections, 0x2000, 0, TargetOs::Linux);
         let (trampoline_data, has_svc) = result.expect("should succeed");
         assert!(!has_svc, "should report no SVC found");
         // MSR instruction should be patched (replaced with a branch)
@@ -5470,10 +5552,10 @@ mod tests {
             msr_insn,
             "MSR instruction should be patched with a branch"
         );
-        // Trampoline should be larger than GATES_START_OFFSET (has an MSR gate)
+        // Trampoline should be larger than TargetOs::Linux.gates_start_offset() (has an MSR gate)
         assert_eq!(
             trampoline_data.len(),
-            GATES_START_OFFSET + MSR_GATE_SIZE,
+            TargetOs::Linux.gates_start_offset() + TargetOs::Linux.msr_gate_size(),
             "trampoline should contain shared layout + one MSR gate"
         );
     }
@@ -5504,7 +5586,7 @@ mod tests {
             size: 20,
         }];
 
-        let sites = find_patch_sites(&sections, &buf).unwrap();
+        let sites = find_patch_sites(&sections, &buf, TargetOs::Linux).unwrap();
         assert_eq!(sites.len(), 3, "should find SVC + MSR + MRS");
         assert_eq!(sites[0].kind, PatchKind::Svc);
         assert_eq!(sites[1].kind, PatchKind::MsrTpidr(5));
@@ -5528,7 +5610,7 @@ mod tests {
             size: 8,
         }];
 
-        let result = hook_syscalls_aarch64(&mut buf, &sections, 0x2000, 0);
+        let result = hook_syscalls_aarch64(&mut buf, &sections, 0x2000, 0, TargetOs::Linux);
         let (trampoline_data, has_svc) = result.expect("should succeed");
         assert!(!has_svc, "should report no SVC found");
         // MRS instruction should be patched (replaced with a branch)
@@ -5537,10 +5619,10 @@ mod tests {
             mrs_insn,
             "MRS instruction should be patched with a branch"
         );
-        // Trampoline should be larger than GATES_START_OFFSET (has an MRS gate)
+        // Trampoline should be larger than TargetOs::Linux.gates_start_offset() (has an MRS gate)
         assert_eq!(
             trampoline_data.len(),
-            GATES_START_OFFSET + MRS_GATE_SIZE,
+            TargetOs::Linux.gates_start_offset() + TargetOs::Linux.mrs_gate_size(),
             "trampoline should contain shared layout + one MRS gate"
         );
     }
@@ -5563,7 +5645,15 @@ mod tests {
             vaddr: 0x1000,
             kind: PatchKind::MrsTpidr(rd),
         };
-        emit_mrs_gate(&mut td, gate_offset, trampoline_base, &site, rd).unwrap();
+        emit_mrs_gate(
+            &mut td,
+            gate_offset,
+            trampoline_base,
+            &site,
+            rd,
+            TargetOs::Linux,
+        )
+        .unwrap();
         td
     }
 
@@ -5603,7 +5693,7 @@ mod tests {
         assert_eq!(b_insn & 0xFC00_0000, 0x14000000, "should be B instruction");
 
         // Total size = 5 instructions = 20 bytes
-        assert_eq!(td.len() - gate_start, MRS_GATE_SIZE);
+        assert_eq!(td.len() - gate_start, TargetOs::Linux.mrs_gate_size());
     }
 
     #[test]
@@ -5641,7 +5731,7 @@ mod tests {
         let b_insn = insn_at(4);
         assert_eq!(b_insn & 0xFC00_0000, 0x14000000, "should be B instruction");
 
-        assert_eq!(td.len() - gate_start, MRS_GATE_SIZE);
+        assert_eq!(td.len() - gate_start, TargetOs::Linux.mrs_gate_size());
     }
 
     #[test]
@@ -5679,7 +5769,7 @@ mod tests {
         let b_insn = insn_at(4);
         assert_eq!(b_insn & 0xFC00_0000, 0x14000000, "should be B instruction");
 
-        assert_eq!(td.len() - gate_start, MRS_GATE_SIZE);
+        assert_eq!(td.len() - gate_start, TargetOs::Linux.mrs_gate_size());
     }
 
     #[test]
@@ -5701,11 +5791,15 @@ mod tests {
             size: 20,
         }];
 
-        let (td, has_svc) = hook_syscalls_aarch64(&mut buf, &sections, 0x2000, 0).unwrap();
+        let (td, has_svc) =
+            hook_syscalls_aarch64(&mut buf, &sections, 0x2000, 0, TargetOs::Linux).unwrap();
         assert!(has_svc);
         assert_eq!(
             td.len(),
-            GATES_START_OFFSET + SVC_GATE_SIZE + MSR_GATE_SIZE + MRS_GATE_SIZE,
+            TargetOs::Linux.gates_start_offset()
+                + TargetOs::Linux.svc_gate_size()
+                + TargetOs::Linux.msr_gate_size()
+                + TargetOs::Linux.mrs_gate_size(),
             "trampoline should have shared layout + SVC + MSR + MRS gates"
         );
     }
@@ -5885,41 +5979,47 @@ mod tests {
     #[test]
     fn test_x18_gate_size_read_only() {
         assert_eq!(
-            x18_gate_size(true, false, false),
-            X18_GATE_READ_INSN_COUNT * 4
+            x18_gate_size(TargetOs::MacOs, true, false, false),
+            TargetOs::MacOs.x18_gate_read_insn_count() * 4
         );
     }
 
     #[test]
     fn test_x18_gate_size_write_only() {
         assert_eq!(
-            x18_gate_size(false, true, false),
-            X18_GATE_WRITE_INSN_COUNT * 4
+            x18_gate_size(TargetOs::MacOs, false, true, false),
+            TargetOs::MacOs.x18_gate_write_insn_count() * 4
         );
     }
 
     #[test]
     fn test_x18_gate_size_readwrite() {
         assert_eq!(
-            x18_gate_size(true, true, false),
-            X18_GATE_READWRITE_INSN_COUNT * 4
+            x18_gate_size(TargetOs::MacOs, true, true, false),
+            TargetOs::MacOs.x18_gate_readwrite_insn_count() * 4
         );
     }
 
     #[test]
     fn test_x18_gate_sizes_consistent() {
         // Read-only and write-only should be the same size
-        assert_eq!(X18_GATE_READ_INSN_COUNT, X18_GATE_WRITE_INSN_COUNT);
+        assert_eq!(
+            TargetOs::MacOs.x18_gate_read_insn_count(),
+            TargetOs::MacOs.x18_gate_write_insn_count()
+        );
         // Read-write should be larger
-        assert!(X18_GATE_READWRITE_INSN_COUNT > X18_GATE_READ_INSN_COUNT);
+        assert!(
+            TargetOs::MacOs.x18_gate_readwrite_insn_count()
+                > TargetOs::MacOs.x18_gate_read_insn_count()
+        );
     }
 
     #[test]
     fn test_shared_x18_handler_constants() {
-        assert_eq!(SHARED_X18_LOAD_HANDLER_SIZE, 64);
-        assert_eq!(SHARED_X18_SAVE_HANDLER_SIZE, 64);
-        assert_eq!(SHARED_X18_LOAD_HANDLER_INSN_COUNT, 16);
-        assert_eq!(SHARED_X18_SAVE_HANDLER_INSN_COUNT, 16);
+        assert_eq!(TargetOs::MacOs.shared_x18_load_handler_size(), 64);
+        assert_eq!(TargetOs::MacOs.shared_x18_save_handler_size(), 64);
+        assert_eq!(TargetOs::MacOs.shared_x18_load_handler_insn_count(), 16);
+        assert_eq!(TargetOs::MacOs.shared_x18_save_handler_insn_count(), 16);
     }
 
     // ============================================================
@@ -6136,18 +6236,18 @@ mod tests {
     fn test_x18_gate_size_with_sp_fixup() {
         // SP fixup adds 2 instructions (8 bytes) to each gate type
         assert_eq!(
-            x18_gate_size(true, false, true),
-            (X18_GATE_READ_INSN_COUNT + 2) * 4,
+            x18_gate_size(TargetOs::MacOs, true, false, true),
+            (TargetOs::MacOs.x18_gate_read_insn_count() + 2) * 4,
             "read-only gate with SP fixup"
         );
         assert_eq!(
-            x18_gate_size(false, true, true),
-            (X18_GATE_WRITE_INSN_COUNT + 2) * 4,
+            x18_gate_size(TargetOs::MacOs, false, true, true),
+            (TargetOs::MacOs.x18_gate_write_insn_count() + 2) * 4,
             "write-only gate with SP fixup"
         );
         assert_eq!(
-            x18_gate_size(true, true, true),
-            (X18_GATE_READWRITE_INSN_COUNT + 2) * 4,
+            x18_gate_size(TargetOs::MacOs, true, true, true),
+            (TargetOs::MacOs.x18_gate_readwrite_insn_count() + 2) * 4,
             "read-write gate with SP fixup"
         );
     }
@@ -6189,7 +6289,8 @@ mod tests {
         sp_fixup: bool,
     ) -> Vec<u32> {
         let trampoline_base: u64 = 0x10000;
-        let gate_offset = SHARED_X18_SAVE_HANDLER_OFFSET + SHARED_X18_SAVE_HANDLER_SIZE;
+        let gate_offset = TargetOs::MacOs.shared_x18_save_handler_offset()
+            + TargetOs::MacOs.shared_x18_save_handler_size();
 
         let site = PatchSite {
             file_offset: 0,
@@ -6216,6 +6317,7 @@ mod tests {
             is_read,
             is_write,
             sp_fixup,
+            TargetOs::MacOs,
         )
         .unwrap();
 

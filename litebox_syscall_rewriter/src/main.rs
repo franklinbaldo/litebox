@@ -4,6 +4,7 @@
 //! Runner for [`litebox_syscall_rewriter`]
 
 use clap::Parser;
+use litebox_syscall_rewriter::TargetOs;
 use std::io::Read as _;
 use std::io::Write as _;
 #[cfg(unix)]
@@ -21,6 +22,9 @@ struct CliArgs {
     /// Absolute address to set in the trampoline (default = 0)
     #[arg(long)]
     trampoline_addr: Option<u64>,
+    /// Target OS for the rewritten binary (default: host OS)
+    #[arg(long, value_enum)]
+    target_os: Option<TargetOs>,
 }
 
 fn copy_file_permissions(
@@ -50,6 +54,7 @@ fn main() -> anyhow::Result<()> {
     let output_binary = litebox_syscall_rewriter::hook_syscalls_in_elf(
         &input_binary_bytes,
         cli_args.trampoline_addr,
+        cli_args.target_os,
     )?;
     let output_path = cli_args.output_binary.unwrap_or_else(|| {
         cli_args.input_binary.with_file_name(

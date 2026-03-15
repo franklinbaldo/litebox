@@ -96,7 +96,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         let file = mmapped_file(&prog)?;
         let data = if cli_args.rewrite_syscalls {
             REQUIRE_RTLD_AUDIT.store(true, core::sync::atomic::Ordering::SeqCst);
-            litebox_syscall_rewriter::hook_syscalls_in_elf(file.data, None)
+            litebox_syscall_rewriter::hook_syscalls_in_elf(file.data, None, None)
                 .unwrap()
                 .into()
         } else {

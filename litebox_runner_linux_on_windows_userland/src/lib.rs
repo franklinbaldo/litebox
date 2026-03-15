@@ -129,7 +129,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             .collect();
         let data = std::fs::read(prog).unwrap();
         let data = if cli_args.rewrite_syscalls {
-            litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None).unwrap()
+            litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None, None).unwrap()
         } else {
             data
         };
