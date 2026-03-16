@@ -826,13 +826,25 @@ impl<FS: ShimFS> Task<FS> {
         res
     }
 
-    /// Handle syscall `access`
+    /// Handle syscall `access` / `faccessat` / `faccessat2`
     pub fn sys_access(
         &self,
+        dirfd: i32,
         pathname: impl path::Arg,
         mode: litebox_common_linux::AccessFlags,
+        flags: litebox_common_linux::AtFlags,
     ) -> Result<(), Errno> {
-        let pathname = self.resolve_path(pathname)?;
+        let _ = flags; // AT_EACCESS / AT_SYMLINK_NOFOLLOW not yet meaningful
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
+        let pathname = match fs_path {
+            FsPath::Absolute { path } => path,
+            FsPath::Cwd => CString::new(get_cwd()).map_err(|_| Errno::EINVAL)?,
+            FsPath::Fd(_) | FsPath::FdRelative { .. } => {
+                log_unsupported!("faccessat with FsPath::Fd/FdRelative");
+                return Err(Errno::EINVAL);
+            }
+        };
         let status = self.files.borrow().fs.file_status(&*pathname)?;
         if mode == litebox_common_linux::AccessFlags::F_OK {
             return Ok(());

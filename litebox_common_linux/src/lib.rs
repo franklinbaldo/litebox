@@ -2050,8 +2050,10 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         iovcnt: usize,
     },
     Access {
+        dirfd: i32,
         pathname: Platform::RawConstPointer<i8>,
         mode: AccessFlags,
+        flags: AtFlags,
     },
     Madvise {
         addr: Platform::RawMutPointer<u8>,
@@ -2421,6 +2423,10 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         infop: Option<Platform::RawMutPointer<u8>>,
         options: i32,
     },
+    RtSigsuspend {
+        mask: Option<Platform::RawConstPointer<signal::SigSet>>,
+        sigsetsize: usize,
+    },
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
@@ -2621,7 +2627,19 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             }),
             Sysno::readv => sys_req!(Readv { fd, iovec:*, iovcnt }),
             Sysno::writev => sys_req!(Writev { fd, iovec:*, iovcnt }),
-            Sysno::access => sys_req!(Access { pathname:*, mode }),
+            Sysno::access => SyscallRequest::Access {
+                dirfd: AT_FDCWD,
+                pathname: ctx.sys_req_ptr(0),
+                mode: ctx.sys_req_arg(1),
+                flags: AtFlags::empty(),
+            },
+            Sysno::faccessat => SyscallRequest::Access {
+                dirfd: ctx.sys_req_arg(0),
+                pathname: ctx.sys_req_ptr(1),
+                mode: ctx.sys_req_arg(2),
+                flags: AtFlags::empty(),
+            },
+            Sysno::faccessat2 => sys_req!(Access { dirfd, pathname:*, mode, flags }),
             Sysno::pipe => sys_req!(Pipe2 { pipefd:*, flags: { litebox::fs::OFlags::empty() } }),
             Sysno::pipe2 => sys_req!(Pipe2 { pipefd:* ,flags }),
             Sysno::madvise => sys_req!(Madvise { addr:*, length, behavior:? }),
@@ -3053,6 +3071,12 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::umask => sys_req!(Umask { mask }),
             Sysno::alarm => sys_req!(Alarm { seconds }),
             Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
+            Sysno::rt_sigsuspend => sys_req!(RtSigsuspend { mask:*, sigsetsize }),
+            #[cfg(target_arch = "x86_64")]
+            Sysno::pause => SyscallRequest::RtSigsuspend {
+                mask: None,
+                sigsetsize: 0,
+            },
             // utimensat: set file timestamps — no-op for in-memory FS.
             Sysno::utimensat => {
                 return Ok(SyscallRequest::Utimensat);
