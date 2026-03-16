@@ -1377,9 +1377,14 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 self.sys_writev(fd, iovec, iovcnt)
             }
-            SyscallRequest::Access { pathname, mode } => pathname
+            SyscallRequest::Access {
+                dirfd,
+                pathname,
+                mode,
+                flags,
+            } => pathname
                 .to_cstring()
-                .map_or(Err(Errno::EFAULT), |path| syscall!(sys_access(path, mode))),
+                .map_or(Err(Errno::EFAULT), |path| syscall!(sys_access(dirfd, path, mode, flags))),
             SyscallRequest::Madvise {
                 addr,
                 length,
@@ -1820,6 +1825,9 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Tgkill { tgid, tid, sig } => self.sys_tgkill(tgid, tid, sig),
             SyscallRequest::Sigaltstack { ss, old_ss } => self.sys_sigaltstack(ss, old_ss, ctx),
             SyscallRequest::Alarm { seconds } => syscall!(sys_alarm(seconds)),
+            SyscallRequest::RtSigsuspend { mask, sigsetsize } => {
+                self.sys_rt_sigsuspend(mask, sigsetsize)
+            }
             _ => {
                 log_unsupported!("{request:?}");
                 Err(Errno::ENOSYS)
