@@ -7,15 +7,81 @@
 use litebox::{
     mm::linux::{MappingError, PAGE_SIZE, PageRange},
     platform::{
-        PageManagementProvider, RawConstPointer, RawMutPointer,
+        PageManagementProvider, RawConstPointer, RawMutPointer, SystemInfoProvider,
         page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions},
     },
+    utils::TruncateExt as _,
 };
-use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
+use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno, loader::ElfParsedFile};
+use rangemap::RangeSet;
 
 use crate::MutPtr;
 use crate::ShimFS;
 use crate::Task;
+
+/// Adapter implementing [`litebox_common_linux::loader::MapMemory`] for loading
+/// trampolines via the shim's syscall layer.
+struct TrampolineMapper<'a, FS: ShimFS> {
+    task: &'a Task<FS>,
+    fd: i32,
+}
+
+impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for TrampolineMapper<'_, FS> {
+    type Error = Errno;
+
+    fn reserve(&mut self, _len: usize, _align: usize) -> Result<usize, Errno> {
+        unreachable!("reserve is not called during trampoline loading")
+    }
+
+    fn map_file(
+        &mut self,
+        address: usize,
+        len: usize,
+        offset: u64,
+        prot: &litebox_common_linux::loader::Protection,
+    ) -> Result<(), Errno> {
+        self.task.sys_mmap(
+            address,
+            len,
+            prot.flags(),
+            MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+            self.fd,
+            offset.truncate(),
+        )?;
+        Ok(())
+    }
+
+    fn map_zero(
+        &mut self,
+        address: usize,
+        len: usize,
+        prot: &litebox_common_linux::loader::Protection,
+    ) -> Result<(), Errno> {
+        self.task.sys_mmap(
+            address,
+            len,
+            prot.flags(),
+            MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+            -1,
+            0,
+        )?;
+        Ok(())
+    }
+
+    fn protect(
+        &mut self,
+        address: usize,
+        len: usize,
+        prot: &litebox_common_linux::loader::Protection,
+    ) -> Result<(), Errno> {
+        let addr = MutPtr::<u8>::from_usize(address);
+        self.task.sys_mprotect(addr, len, prot.flags())
+    }
+}
+
+/// Page-aligned virtual address ranges occupied by loaded trampolines.
+/// `sys_munmap` will refuse to unmap pages within these regions.
+pub(crate) type TrampolineRegions = RangeSet<usize>;
 
 #[inline]
 fn align_up(addr: usize, align: usize) -> usize {
@@ -64,7 +130,9 @@ impl<FS: ShimFS> Task<FS> {
         flags: MapFlags,
     ) -> Result<MutPtr<u8>, MappingError> {
         let op = |_| Ok(0);
-        self.do_mmap(suggested_addr, len, prot, flags, false, op)
+        let ret = self.do_mmap(suggested_addr, len, prot, flags, false, op);
+        log_unsupported!("do_mmap ret: {:?}", ret);
+        ret
     }
 
     fn do_mmap_file(
@@ -76,12 +144,129 @@ impl<FS: ShimFS> Task<FS> {
         fd: i32,
         offset: usize,
     ) -> Result<MutPtr<u8>, MappingError> {
-        if let Some(cow_result) =
-            self.try_cow_mmap_file(suggested_addr, len, &prot, &flags, fd, offset)
-        {
-            return cow_result;
+        let is_exec = prot.contains(ProtFlags::PROT_EXEC);
+
+        // Try to parse the ELF and detect a trampoline for initial mappings.
+        // When the file has a trampoline, skip the CoW fast path because CoW does not
+        // reserve the space immediately after the mapping that `ensure_space_after`
+        // (used in the memcpy path) provides.  The trampoline must be placed right
+        // after the mapped PT_LOAD segments, so we need that reservation.
+        let parsed_trampoline = if is_exec {
+            self.try_parse_trampoline_elf(fd)
+        } else {
+            None
+        };
+        log_unsupported!("parsed_trampoline: {:?}", parsed_trampoline);
+
+        let result = if let Some(cow_result) = self.try_cow_mmap_file(suggested_addr, len, &prot, &flags, fd, offset) {
+            cow_result?
+        } else {
+             self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, fd, offset)?
+        };
+
+        // let result = self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, fd, offset)?;
+        log_unsupported!("do_mmap file ret: {:?}", result);
+
+        // Load the trampoline immediately and record its region so that
+        // subsequent munmap calls (glibc trimming the reservation surplus)
+        // cannot destroy it.
+        if let Some(parsed) = &parsed_trampoline {
+            if let Some((start, end)) = self.load_trampoline_now(fd, result, offset, parsed) {
+                self.trampoline_regions.borrow_mut().insert(start..end);
+            }
         }
-        self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, fd, offset)
+
+        Ok(result)
+    }
+
+    /// Try to parse an ELF file with trampoline from a file descriptor's static
+    /// backing data.  Returns `Some(parsed)` only when a trampoline is present.
+    fn try_parse_trampoline_elf(&self, fd: i32) -> Option<ElfParsedFile> {
+        let Some(data) = self.get_file_static_backing_data(fd) else {
+            return None;
+        };
+        let mut reader: &[u8] = data;
+        let mut parsed = ElfParsedFile::parse(&mut reader).ok()?;
+        let syscall_entry = self.global.platform.get_syscall_entry_point();
+        parsed.parse_trampoline(&mut reader, syscall_entry).ok()?;
+        parsed.has_trampoline().then_some(parsed)
+    }
+
+    /// Load a parsed trampoline at the mapped address and return its region.
+    ///
+    /// This replaces the `LD_AUDIT`-based `litebox_rtld_audit.so` mechanism:
+    /// instead of relying on the dynamic linker's audit interface to detect and
+    /// map trampolines for each loaded shared library, the shim intercepts the
+    /// initial `mmap` of the file and maps the trampoline inline.
+    ///
+    /// Because glibc's anonymous reservation for a library only covers
+    /// the PT_LOAD segments (not the trampoline), the trampoline address
+    /// may be unreserved. We first reserve it with `MAP_FIXED_NOREPLACE`
+    /// to avoid overwriting other allocations (e.g. link_map structs).
+    ///
+    /// Returns `(start, end)` of the loaded trampoline region.
+    fn load_trampoline_now(
+        &self,
+        fd: i32,
+        mapped_addr: MutPtr<u8>,
+        offset: usize,
+        parsed: &ElfParsedFile,
+    ) -> Option<(usize, usize)> {
+        let vaddr = parsed.vaddr_for_file_offset(offset, true)?;
+        let base_addr = mapped_addr.as_usize().checked_sub(vaddr)?;
+        let info = parsed.trampoline_info()?;
+        let start = base_addr + info.vaddr;
+        let end = align_up(start + info.size, PAGE_SIZE);
+
+        // Reserve the trampoline area with NOREPLACE to ensure it doesn't
+        // collide with existing allocations. If the address is already in
+        // use (e.g., another library or heap allocation), skip loading.
+        if self
+            .sys_mmap(
+                start,
+                end - start,
+                ProtFlags::PROT_NONE,
+                MapFlags::MAP_ANONYMOUS
+                    | MapFlags::MAP_PRIVATE
+                    | MapFlags::MAP_FIXED_NOREPLACE,
+                -1,
+                0,
+            )
+            .is_err()
+        {
+            log_unsupported!(
+                "trampoline NOREPLACE failed: fd={fd}, range=[{start:#x}..{end:#x}), base={base_addr:#x}"
+            );
+            return None;
+        }
+
+        log_unsupported!(
+            "trampoline loaded: fd={fd}, range=[{start:#x}..{end:#x}), base={base_addr:#x}"
+        );
+
+        let mut mapper = TrampolineMapper { task: self, fd };
+        parsed
+            .load_trampoline_at_base(&mut mapper, &mut &*self.global.platform, base_addr)
+            .ok()?;
+        Some((start, end))
+    }
+
+    /// Get the static backing data for a file descriptor, if available.
+    fn get_file_static_backing_data(&self, fd: i32) -> Option<&'static [u8]> {
+        let fd = u32::try_from(fd).ok()?;
+        let files = self.files.borrow();
+        let raw_fd = match files.file_descriptors.read().get_fd(fd)? {
+            crate::Descriptor::LiteBoxRawFd(raw_fd) => *raw_fd,
+            _ => return None,
+        };
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |typed_fd| files.fs.get_static_backing_data(typed_fd),
+                |_| None,
+                |_| None,
+            )
+            .ok()?
     }
 
     /// Attempt to create a CoW mapping for a file with static backing data.
@@ -301,9 +486,44 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Handle syscall `munmap`
-    #[inline]
+    ///
+    /// Protects trampoline regions from being unmapped by splitting or
+    /// shrinking the requested range around any overlapping trampoline.
     pub(crate) fn sys_munmap(&self, addr: crate::MutPtr<u8>, len: usize) -> Result<(), Errno> {
-        litebox_common_linux::mm::sys_munmap(&self.global.pm, addr, len)
+        let req_start = addr.as_usize();
+        let Some(req_end) = req_start.checked_add(align_up(len, PAGE_SIZE)) else {
+            return Err(Errno::EINVAL);
+        };
+
+        let regions = self.trampoline_regions.borrow();
+
+        // Use RangeSet::overlapping to efficiently find trampoline regions
+        // that intersect the requested munmap range.
+        let mut cursor = req_start;
+        let mut has_overlap = false;
+        for protected in regions.overlapping(&(req_start..req_end)) {
+            has_overlap = true;
+            // Unmap the gap before this trampoline.
+            if cursor < protected.start {
+                let ptr = MutPtr::<u8>::from_usize(cursor);
+                litebox_common_linux::mm::sys_munmap(&self.global.pm, ptr, protected.start - cursor)?;
+            }
+            log_unsupported!("protected region: {protected:?}");
+            cursor = cursor.max(protected.end);
+        }
+        drop(regions);
+
+        // No trampoline overlapped — fast-path: unmap the original range.
+        if !has_overlap {
+            return litebox_common_linux::mm::sys_munmap(&self.global.pm, addr, len);
+        }
+
+        // Unmap the trailing gap after the last trampoline.
+        if cursor < req_end {
+            let ptr = MutPtr::<u8>::from_usize(cursor);
+            litebox_common_linux::mm::sys_munmap(&self.global.pm, ptr, req_end - cursor)?;
+        }
+        Ok(())
     }
 
     /// Handle syscall `mprotect`

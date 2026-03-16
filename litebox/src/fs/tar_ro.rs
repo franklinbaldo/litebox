@@ -603,6 +603,21 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             }
         }
     }
+
+    fn get_static_backing_data(&self, fd: &FileFd<Platform>) -> Option<&'static [u8]> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let entry = descriptor_table.get_entry(fd)?;
+        match &entry.entry {
+            Descriptor::File { idx, .. } => match &self.tar_index.tar_data {
+                alloc::borrow::Cow::Borrowed(data) => {
+                    let range = self.tar_index.files[*idx].data_range.clone();
+                    Some(&data[range])
+                }
+                alloc::borrow::Cow::Owned(_) => None,
+            },
+            Descriptor::Dir { .. } => None,
+        }
+    }
 }
 
 const DEFAULT_DIR_MODE: Mode =

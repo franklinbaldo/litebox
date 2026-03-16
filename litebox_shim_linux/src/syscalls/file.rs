@@ -1112,9 +1112,6 @@ impl<FS: ShimFS> Task<FS> {
                                 })
                         },
                         |fd| {
-                            if flags.intersects(OFlags::NONBLOCK.complement()) {
-                                todo!("unsupported flags for pipes")
-                            }
                             self.global
                                 .pipes
                                 .update_flags(

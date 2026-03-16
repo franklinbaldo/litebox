@@ -57,16 +57,16 @@ impl MappingInfo {
     }
 }
 
-#[derive(Debug)]
-struct TrampolineInfo {
+#[derive(Debug, Clone)]
+pub struct TrampolineInfo {
     /// The virtual memory of the trampoline code.
-    vaddr: usize,
+    pub vaddr: usize,
     /// The file offset of the trampoline code in the ELF file.
-    file_offset: u64,
+    pub file_offset: u64,
     /// Size of the trampoline code in the ELF file.
-    size: usize,
+    pub size: usize,
     /// The entry point to jump to in the trampoline.
-    syscall_entry_point: usize,
+    pub syscall_entry_point: usize,
 }
 
 /// The magic number used to identify the LiteBox trampoline.
@@ -528,6 +528,65 @@ impl ElfParsedFile {
         Ok(())
     }
 
+    /// Returns `true` if a trampoline section was found during parsing.
+    pub fn has_trampoline(&self) -> bool {
+        self.trampoline.is_some()
+    }
+
+    /// Given a page-aligned file offset and exec flag (as passed to `mmap`),
+    /// return the corresponding page-aligned virtual address by looking up
+    /// the matching PT_LOAD segment.
+    ///
+    /// Due to alignment, multiple PT_LOAD segments can share the same
+    /// `page_align_down(p_offset)`. For example, a R segment at
+    /// `(p_offset=0, p_vaddr=0)` and a R|X segment at
+    /// `(p_offset=0x628, p_vaddr=0x3628)` both have page-aligned offset 0.
+    /// The `exec` flag disambiguates by matching `PF_X`.
+    ///
+    /// This is needed to compute the ELF base address from a mapping:
+    /// `base_addr = mapped_addr - vaddr_for_file_offset(file_offset, exec)`.
+    pub fn vaddr_for_file_offset(&self, file_offset: usize, exec: bool) -> Option<usize> {
+        for ph in self.pt_loads() {
+            let is_exec = (ph.p_flags & elf::abi::PF_X) != 0;
+            if is_exec != exec {
+                continue;
+            }
+            let seg_offset: usize = ph.p_offset.truncate();
+            let seg_vaddr: usize = ph.p_vaddr.truncate();
+            if page_align_down(seg_offset) == file_offset {
+                return Some(page_align_down(seg_vaddr));
+            }
+        }
+        None
+    }
+
+    pub fn trampoline_info(&self) -> Option<TrampolineInfo> {
+        self.trampoline.clone()
+    }
+
+    /// Load the LiteBox trampoline at the given base address.
+    ///
+    /// Unlike [`Self::load_secondary_trampoline`], this takes the base address
+    /// directly rather than computing it from a loaded entry point.
+    pub fn load_trampoline_at_base<M: MapMemory>(
+        &self,
+        mapper: &mut M,
+        mem: &mut impl AccessMemory,
+        base_addr: usize,
+    ) -> Result<(), ElfLoadError<M::Error>> {
+        if self.trampoline.is_none() {
+            return Ok(());
+        }
+        let mut info = MappingInfo {
+            base_addr,
+            brk: 0,
+            entry_point: 0,
+            phdrs_addr: 0,
+            num_phdrs: 0,
+        };
+        self.load_trampoline(mapper, mem, &mut info)
+    }
+
     /// Load the secondary LiteBox trampoline into memory whose location is relative to
     /// the based address which is the difference of `loaded_entry_point` and `e_entry`
     /// in the ELF header.
@@ -565,6 +624,21 @@ pub trait ReadAt {
 
     /// Get the length of the ELF file.
     fn size(&mut self) -> Result<u64, Self::Error>;
+}
+
+impl ReadAt for &[u8] {
+    type Error = ();
+
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), ()> {
+        let start = usize::try_from(offset).map_err(|_| ())?;
+        let end = start.checked_add(buf.len()).ok_or(())?;
+        buf.copy_from_slice(self.get(start..end).ok_or(())?);
+        Ok(())
+    }
+
+    fn size(&mut self) -> Result<u64, ()> {
+        Ok(self.len() as u64)
+    }
 }
 
 pub trait MapMemory {

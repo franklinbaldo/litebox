@@ -14,8 +14,8 @@
 
 extern crate alloc;
 
-use alloc::vec;
 use alloc::vec::Vec;
+use alloc::{string::ToString, vec};
 
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
@@ -253,6 +253,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
+                trampoline_regions: RefCell::default(),
             },
         };
         entrypoints.task.load_program(
@@ -642,6 +643,9 @@ impl<FS: ShimFS> Task<FS> {
         let request =
             SyscallRequest::<Platform>::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
 
+        let req = format_args!("syscall request: {request:?}").to_string();
+        log_unsupported!("{req}");
+
         match request {
             SyscallRequest::Exit { status } => {
                 self.sys_exit(status);
@@ -973,6 +977,7 @@ impl<FS: ShimFS> Task<FS> {
                 flags,
                 mode,
             } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                log_unsupported!("open file {path:?}");
                 syscall!(sys_openat(dirfd, path, flags, mode))
             }),
             SyscallRequest::Ftruncate { fd, length } => syscall!(sys_ftruncate(fd, length)),
@@ -1197,6 +1202,8 @@ struct Task<FS: ShimFS> {
     files: RefCell<Arc<syscalls::file::FilesState<FS>>>,
     /// Signal state
     signals: syscalls::signal::SignalState,
+    /// Page-aligned regions occupied by loaded trampolines, protected from munmap.
+    trampoline_regions: RefCell<syscalls::mm::TrampolineRegions>,
 }
 
 impl<FS: ShimFS> Drop for Task<FS> {
@@ -1236,6 +1243,7 @@ mod test_utils {
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
+                trampoline_regions: RefCell::default(),
                 global: self,
             }
         }
@@ -1260,6 +1268,7 @@ mod test_utils {
                 fs: self.fs.clone(),
                 files: self.files.clone(),
                 signals: self.signals.clone_for_new_task(),
+                trampoline_regions: RefCell::default(),
             };
             Some(task)
         }

@@ -770,6 +770,7 @@ impl<FS: ShimFS> Task<FS> {
                         fs: fs.into(),
                         files: self.files.clone(), // TODO: !CLONE_FILES support
                         signals: self.signals.clone_for_new_task(),
+                        trampoline_regions: core::cell::RefCell::default(),
                     },
                 }),
             )
