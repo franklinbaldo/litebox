@@ -25,6 +25,7 @@ use litebox::platform::{
 };
 use litebox::platform::{RawMutPointer as _, TimerHandle, TimerProvider};
 use litebox::sync::Mutex;
+use litebox::utils::ReinterpretSignedExt as _;
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, FutexArgs, PrctlArg, TimeParam, errno::Errno,
@@ -400,6 +401,11 @@ enum ThreadInitState {
         stack: Option<usize>,
         tls: Option<ThreadLocalDescriptor>,
         set_child_tid: Option<MutPtr<i32>>,
+        /// True when this thread is the initial (main) thread of a newly
+        /// forked process. False for `clone(CLONE_THREAD)` worker threads.
+        /// Controls whether `process_thread_handles` is updated so
+        /// cross-process signals (e.g. SIGCHLD) can reach this process.
+        is_process_main_thread: bool,
     },
 }
 
@@ -1184,6 +1190,7 @@ impl<FS: ShimFS> Task<FS> {
             stack: sp,
             tls,
             set_child_tid,
+            is_process_main_thread: false,
         });
         thread.clear_child_tid.set(clear_child_tid);
 
@@ -1544,6 +1551,7 @@ impl<FS: ShimFS> Task<FS> {
             stack: None,     // vfork: parent's stack; independent: CoW copy
             tls: parent_tls, // inherit parent's guest TLS
             set_child_tid: None,
+            is_process_main_thread: true,
         });
 
         let r = unsafe {
@@ -2526,6 +2534,55 @@ impl<FS: ShimFS> Task<FS> {
 const MAX_VEC: usize = 4096; // limit count
 const MAX_TOTAL_BYTES: usize = 256 * 1024; // size cap
 
+/// Maximum number of shebang interpreter redirections before giving up.
+/// Linux uses 4 (include/linux/binfmts.h: BINPRM_MAX_RECURSION, which includes
+/// the initial binary, so effectively 4 shebang hops are allowed).
+const SHEBANG_MAX_RECURSION: usize = 4;
+
+/// Size of the buffer read from the start of a file to detect its type.
+/// Linux uses 256 (BINPRM_BUF_SIZE).
+const BINPRM_BUF_SIZE: usize = 256;
+
+/// Parse a shebang (`#!`) line from the first bytes of a file.
+///
+/// On success returns the interpreter path and an optional single argument,
+/// matching the Linux kernel's `load_script` behaviour:
+/// - Leading whitespace after `#!` is skipped.
+/// - The interpreter path ends at the first whitespace or newline.
+/// - An optional single argument (everything between the first whitespace
+///   after the interpreter and the newline) is returned with leading/trailing
+///   whitespace trimmed.
+/// - The line is terminated by `\n` or end-of-buffer.
+fn parse_shebang(buf: &[u8]) -> Option<(&str, Option<&str>)> {
+    // Must start with "#!"
+    if buf.len() < 2 || buf[0] != b'#' || buf[1] != b'!' {
+        return None;
+    }
+
+    // Find end of line (first newline or end of buffer).
+    let line_end = buf.iter().position(|&b| b == b'\n').unwrap_or(buf.len());
+    let line = &buf[2..line_end];
+
+    // The line must be valid UTF-8 (interpreter paths are ASCII in practice).
+    let line = core::str::from_utf8(line).ok()?;
+
+    // Skip leading whitespace.
+    let line = line.trim_start();
+    if line.is_empty() {
+        return None;
+    }
+
+    // Split into interpreter path and optional argument.
+    if let Some(space_pos) = line.find([' ', '\t']) {
+        let interp = &line[..space_pos];
+        let arg = line[space_pos..].trim();
+        let arg = if arg.is_empty() { None } else { Some(arg) };
+        Some((interp, arg))
+    } else {
+        Some((line, None))
+    }
+}
+
 impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `execve`.
     pub(crate) fn sys_execve(
@@ -2579,7 +2636,7 @@ impl<FS: ShimFS> Task<FS> {
         let path = path_cstr.to_str().map_err(|_| Errno::ENOENT)?;
 
         // Copy argv and envp vectors
-        let argv_vec = if argv.as_usize() == 0 {
+        let mut argv_vec = if argv.as_usize() == 0 {
             alloc::vec::Vec::new()
         } else {
             copy_vector(argv, "argv")?
@@ -2590,7 +2647,77 @@ impl<FS: ShimFS> Task<FS> {
             copy_vector(envp, "envp")?
         };
 
-        let loader = crate::loader::elf::ElfLoader::new(self, path).map_err(Errno::from)?;
+        // Resolve the binary to execute.  If the file starts with a shebang
+        // (`#!interpreter`), rewrite `exec_path` and `argv_vec` to invoke the
+        // interpreter with the script as an argument, following the same
+        // semantics as the Linux kernel's `load_script`.
+        //
+        // `exec_path_owned` keeps the resolved interpreter path alive so that
+        // `exec_path` (a `&str`) remains valid for `ElfLoader::new`.
+        let mut exec_path_owned = alloc::string::String::from(path);
+        let original_path = alloc::ffi::CString::new(path.as_bytes()).map_err(|_| Errno::EINVAL)?;
+
+        for depth in 0..SHEBANG_MAX_RECURSION {
+            // Read the first BINPRM_BUF_SIZE bytes to detect file type.
+            let mut header = [0u8; BINPRM_BUF_SIZE];
+            let fd = self.sys_open(
+                &*exec_path_owned,
+                litebox::fs::OFlags::RDONLY,
+                litebox::fs::Mode::empty(),
+            )?;
+            let n = self
+                .sys_read(fd.reinterpret_as_signed(), &mut header, Some(0))
+                .unwrap_or(0);
+            let _ = self.sys_close(fd.reinterpret_as_signed());
+
+            if n >= 4
+                && header[0] == 0x7f
+                && header[1] == b'E'
+                && header[2] == b'L'
+                && header[3] == b'F'
+            {
+                // ELF binary — proceed to load.
+                break;
+            }
+
+            if let Some((interp, opt_arg)) = parse_shebang(&header[..n]) {
+                // Build new argv: [interpreter, opt_arg?, script_path, original_argv[1:]]
+                let mut new_argv = alloc::vec::Vec::new();
+                new_argv
+                    .push(alloc::ffi::CString::new(interp.as_bytes()).map_err(|_| Errno::EINVAL)?);
+                if let Some(arg) = opt_arg {
+                    new_argv
+                        .push(alloc::ffi::CString::new(arg.as_bytes()).map_err(|_| Errno::EINVAL)?);
+                }
+                // On the first pass, insert the original script path.  On
+                // later passes (chained shebangs), the current exec_path is
+                // already in argv from the previous iteration — replace it.
+                if depth == 0 {
+                    new_argv.push(original_path.clone());
+                } else {
+                    new_argv.push(
+                        alloc::ffi::CString::new(exec_path_owned.as_bytes())
+                            .map_err(|_| Errno::EINVAL)?,
+                    );
+                }
+                // Append the rest of the original argv (skip argv[0]).
+                if argv_vec.len() > 1 {
+                    // On first pass, skip the original argv[0].
+                    // On later passes, skip the previously prepended elements.
+                    let skip = if depth == 0 { 1 } else { new_argv.len() - 1 };
+                    new_argv.extend_from_slice(&argv_vec[skip.min(argv_vec.len())..]);
+                }
+                argv_vec = new_argv;
+                exec_path_owned = alloc::string::String::from(interp);
+                continue;
+            }
+
+            // Neither ELF nor shebang — not an executable format.
+            return Err(Errno::ENOEXEC);
+        }
+
+        let exec_path: &str = &exec_path_owned;
+        let loader = crate::loader::elf::ElfLoader::new(self, exec_path).map_err(Errno::from)?;
 
         // After this point, the old program is torn down and failures must terminate the process.
 
@@ -2677,7 +2804,7 @@ impl<FS: ShimFS> Task<FS> {
                 litebox::log_println!(
                     self.global.platform,
                     "execve({:?}): load_program failed: {:?} — terminating child",
-                    path,
+                    exec_path,
                     e,
                 );
                 self.exit_group(ExitStatus::Exit(127_i32.truncate()));
@@ -2821,6 +2948,7 @@ impl<FS: ShimFS> Task<FS> {
                 tls,
                 stack,
                 set_child_tid,
+                is_process_main_thread,
             } => {
                 // Set the stack and the return value from clone().
                 #[cfg(target_arch = "x86_64")]
@@ -2858,7 +2986,7 @@ impl<FS: ShimFS> Task<FS> {
                     // Set the child TID if requested.
                     let _ = child_tid_ptr.write_at_offset(0, self.tid);
                 }
-                false
+                is_process_main_thread
             }
         }
     }
@@ -3243,5 +3371,71 @@ mod tests {
             // Clean up the timer.
             handle.delete_timer();
         });
+    }
+
+    #[test]
+    fn test_parse_shebang_basic() {
+        use super::parse_shebang;
+        let (interp, arg) = parse_shebang(b"#!/bin/sh\n").unwrap();
+        assert_eq!(interp, "/bin/sh");
+        assert_eq!(arg, None);
+    }
+
+    #[test]
+    fn test_parse_shebang_with_arg() {
+        use super::parse_shebang;
+        let (interp, arg) = parse_shebang(b"#!/usr/bin/env python3\n").unwrap();
+        assert_eq!(interp, "/usr/bin/env");
+        assert_eq!(arg, Some("python3"));
+    }
+
+    #[test]
+    fn test_parse_shebang_leading_space() {
+        use super::parse_shebang;
+        let (interp, arg) = parse_shebang(b"#!  /bin/bash\n").unwrap();
+        assert_eq!(interp, "/bin/bash");
+        assert_eq!(arg, None);
+    }
+
+    #[test]
+    fn test_parse_shebang_no_newline() {
+        use super::parse_shebang;
+        // No trailing newline — should still work (end of buffer).
+        let (interp, arg) = parse_shebang(b"#!/bin/sh").unwrap();
+        assert_eq!(interp, "/bin/sh");
+        assert_eq!(arg, None);
+    }
+
+    #[test]
+    fn test_parse_shebang_with_arg_trailing_space() {
+        use super::parse_shebang;
+        let (interp, arg) = parse_shebang(b"#!/bin/sh -e  \n").unwrap();
+        assert_eq!(interp, "/bin/sh");
+        assert_eq!(arg, Some("-e"));
+    }
+
+    #[test]
+    fn test_parse_shebang_not_shebang() {
+        use super::parse_shebang;
+        assert!(parse_shebang(b"\x7fELF...").is_none());
+        assert!(parse_shebang(b"").is_none());
+        assert!(parse_shebang(b"#").is_none());
+        assert!(parse_shebang(b"# comment\n").is_none());
+    }
+
+    #[test]
+    fn test_parse_shebang_empty_after_hash_bang() {
+        use super::parse_shebang;
+        // "#!\n" has no interpreter path.
+        assert!(parse_shebang(b"#!\n").is_none());
+        assert!(parse_shebang(b"#!  \n").is_none());
+    }
+
+    #[test]
+    fn test_parse_shebang_tab_separator() {
+        use super::parse_shebang;
+        let (interp, arg) = parse_shebang(b"#!/bin/sh\t-x\n").unwrap();
+        assert_eq!(interp, "/bin/sh");
+        assert_eq!(arg, Some("-x"));
     }
 }
