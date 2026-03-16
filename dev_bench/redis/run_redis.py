@@ -289,11 +289,14 @@ def run_native(
         # Shutdown server gracefully
         redis_cli = locate_command("redis-cli")
         if redis_cli:
-            subprocess.run(
-                [str(redis_cli), "-h", "127.0.0.1", "-p", str(REDIS_PORT), "SHUTDOWN", "NOSAVE"],
-                capture_output=True,
-                timeout=5,
-            )
+            try:
+                subprocess.run(
+                    [str(redis_cli), "-h", "127.0.0.1", "-p", str(REDIS_PORT), "SHUTDOWN", "NOSAVE"],
+                    capture_output=True,
+                    timeout=5,
+                )
+            except subprocess.TimeoutExpired:
+                pass  # server_proc.terminate() below will clean up
         server_proc.terminate()
         try:
             server_proc.wait(timeout=5)
@@ -480,12 +483,15 @@ def run_litebox(
         # Shutdown server
         redis_cli = locate_command("redis-cli")
         if redis_cli:
-            subprocess.run(
-                [str(redis_cli), "-h", GUEST_IP, "-p", str(REDIS_PORT),
-                 "SHUTDOWN", "NOSAVE"],
-                capture_output=True,
-                timeout=5,
-            )
+            try:
+                subprocess.run(
+                    [str(redis_cli), "-h", GUEST_IP, "-p", str(REDIS_PORT),
+                     "SHUTDOWN", "NOSAVE"],
+                    capture_output=True,
+                    timeout=5,
+                )
+            except subprocess.TimeoutExpired:
+                pass  # server_proc.terminate() below will clean up
         server_proc.terminate()
         try:
             server_proc.wait(timeout=10)
@@ -650,8 +656,8 @@ def main():
     parser.add_argument(
         "--clients",
         type=int,
-        default=50,
-        help="Number of parallel clients (default: 50)",
+        default=8,
+        help="Number of parallel clients (default: 8)",
     )
     parser.add_argument(
         "--tests",
