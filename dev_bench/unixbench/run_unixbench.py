@@ -315,6 +315,31 @@ def prepare_litebox_rootfs(
 
     cmd += [str(binary), "-o", str(tar_path)]
 
+    # Shell benchmarks (shell1/shell8) need a shell, coreutils, scripts,
+    # and the sort.src data file to be available inside the sandbox.
+    if bench.name in ("shell1", "shell8"):
+        # System utilities required by tst.sh
+        for util in ("sh", "sort", "od", "grep", "tee", "wc", "rm", "cat"):
+            util_path = shutil.which(util)
+            if util_path:
+                cmd.append(util_path)
+        # The shebang in tst.sh references /bin/sh; ensure it exists at
+        # that path (may differ from the resolved host path).
+        sh_path = shutil.which("sh")
+        if sh_path:
+            cmd += ["--rewrite-include", f"{sh_path}:/bin/sh"]
+        # Include the original shell scripts (faccessat/faccessat2 is now
+        # supported, so rm works inside the sandbox).
+        tst_sh = pgms_dir / "tst.sh"
+        cmd += ["--include", f"{tst_sh}:/pgms/tst.sh"]
+        multi_sh = pgms_dir / "multi.sh"
+        cmd += ["--include", f"{multi_sh}:/pgms/multi.sh"]
+        # Data file needed by tst.sh
+        testdir = pgms_dir.parent / "testdir"
+        sort_src = testdir / "sort.src"
+        if sort_src.exists():
+            cmd += ["--include", f"{sort_src}:/sort.src"]
+
     # Run packager
     result = subprocess.run(cmd, capture_output=True)
     if result.returncode != 0:
@@ -408,6 +433,12 @@ def run_litebox(
     if bench.name == "execl":
         cmd += ["--env", "UB_BINDIR=/pgms"]
 
+    # Shell benchmarks need UB_BINDIR (so multi.sh finds tst.sh) and
+    # PATH (so looper's execvp finds multi.sh and tst.sh finds coreutils).
+    if bench.name in ("shell1", "shell8"):
+        cmd += ["--env", "UB_BINDIR=/pgms"]
+        cmd += ["--env", "PATH=/usr/bin:/bin:/pgms"]
+
     cmd += ["--initial-files", str(tar_path)]
     cmd += [str(rewritten)]
 
@@ -458,6 +489,12 @@ def run_litebox_windows(
     # Special env for execl
     if bench.name == "execl":
         cmd += ["--env", "UB_BINDIR=/pgms"]
+
+    # Shell benchmarks need UB_BINDIR (so multi.sh finds tst.sh) and
+    # PATH (so looper's execvp finds multi.sh and tst.sh finds coreutils).
+    if bench.name in ("shell1", "shell8"):
+        cmd += ["--env", "UB_BINDIR=/pgms"]
+        cmd += ["--env", "PATH=/usr/bin:/bin:/pgms"]
 
     cmd += ["--initial-files", str(tar_path)]
     cmd += [tar_program_path]
