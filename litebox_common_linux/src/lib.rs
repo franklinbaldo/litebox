@@ -1771,8 +1771,8 @@ pub struct SigSetPack {
     pub size: usize,
 }
 
-#[derive(Debug, FromBytes, IntoBytes)]
-#[repr(C, packed)]
+#[derive(Debug, FromBytes)]
+#[repr(C)]
 pub struct UserMsgHdr<Platform: litebox::platform::RawPointerProvider> {
     /// ptr to socket address structure
     pub msg_name: Platform::RawConstPointer<u8>,
