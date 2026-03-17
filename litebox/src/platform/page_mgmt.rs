@@ -235,6 +235,8 @@ pub enum DeallocationError {
     Unaligned,
     #[error("provided range contains unallocated pages")]
     AlreadyUnallocated,
+    #[error("invalid frame address: {0:#x}")]
+    InvalidFrameAddress(u64),
 }
 
 /// Possible errors for [`PageManagementProvider::remap_pages`]
@@ -267,6 +269,10 @@ pub enum PermissionUpdateError {
     Unaligned,
     #[error("provided range contains unallocated pages")]
     Unallocated,
+    #[error("operation encountered a huge page")]
+    HugePage,
+    #[error("invalid frame address: {0:#x}")]
+    InvalidFrameAddress(u64),
 }
 
 /// Possible errors for [`PageManagementProvider::try_allocate_cow_pages`]

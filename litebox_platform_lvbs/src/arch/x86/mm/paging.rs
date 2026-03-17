@@ -186,7 +186,9 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     unreachable!("we do not support huge pages");
                 }
                 Err(X64UnmapError::InvalidFrameAddress(pa)) => {
-                    todo!("Invalid frame address: {:#x}", pa);
+                    return Err(page_mgmt::DeallocationError::InvalidFrameAddress(
+                        pa.as_u64(),
+                    ));
                 }
             }
         }
@@ -343,7 +345,10 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     offset: _,
                     flags,
                 } => {
-                    // If it is changed to writable, we leave it to page fault handler (COW)
+                    // If write access is requested on a read-only mapping, leave the PTE
+                    // read-only for now and let the write-fault path enable writes lazily.
+                    // Keep this split explicit so a future real COW implementation can hook
+                    // into the same fault path.
                     let change_to_write = new_flags.contains(PageTableFlags::WRITABLE)
                         && !flags.contains(PageTableFlags::WRITABLE);
                     let new_flags = if change_to_write {
@@ -351,7 +356,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     } else {
                         new_flags
                     };
-                    if flags != new_flags {
+                    if flags & Self::MPROTECT_PTE_MASK != new_flags {
                         match unsafe {
                             inner.update_flags(page, (flags & !Self::MPROTECT_PTE_MASK) | new_flags)
                         } {
@@ -359,7 +364,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                             Err(e) => match e {
                                 FlagUpdateError::PageNotMapped => unreachable!(),
                                 FlagUpdateError::ParentEntryHugePage => {
-                                    todo!("return Err(ProtectError::ProtectHugePage);")
+                                    return Err(page_mgmt::PermissionUpdateError::HugePage);
                                 }
                             },
                         }
@@ -367,7 +372,9 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                 }
                 TranslateResult::NotMapped => {}
                 TranslateResult::InvalidFrameAddress(pa) => {
-                    todo!("Invalid frame address: {:#x}", pa);
+                    return Err(page_mgmt::PermissionUpdateError::InvalidFrameAddress(
+                        pa.as_u64(),
+                    ));
                 }
             }
         }
@@ -431,25 +438,6 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             let page: Page<Size4KiB> =
                 Page::containing_address(pa_to_va(target_frame.start_address()));
 
-            match inner.translate(page.start_address()) {
-                TranslateResult::Mapped {
-                    frame,
-                    offset: _,
-                    flags: _,
-                } => {
-                    assert!(
-                        target_frame.start_address() == frame.start_address(),
-                        "{page:?} is already mapped to {frame:?} instead of {target_frame:?}"
-                    );
-
-                    continue;
-                }
-                TranslateResult::NotMapped => {}
-                TranslateResult::InvalidFrameAddress(pa) => {
-                    todo!("Invalid frame address: {:#x}", pa);
-                }
-            }
-
             // When exec_ranges are provided, determine per-page flags based
             // on whether the frame falls within an executable region.
             let page_flags = if let Some(ranges) = exec_ranges {
@@ -464,6 +452,45 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             } else {
                 flags
             };
+
+            match inner.translate(page.start_address()) {
+                TranslateResult::Mapped {
+                    frame,
+                    offset: _,
+                    flags: existing_flags,
+                } => {
+                    assert!(
+                        target_frame.start_address() == frame.start_address(),
+                        "{page:?} is already mapped to {frame:?} instead of {target_frame:?}"
+                    );
+
+                    // Update flags if the existing mapping has stale permissions.
+                    if existing_flags != page_flags {
+                        match unsafe { inner.update_flags(page, page_flags) } {
+                            Ok(_) => {
+                                // Permission changes on an existing mapping must invalidate
+                                // stale TLB entries on local and remote cores.
+                                flush_tlb_range(page, 1);
+                            }
+                            Err(FlagUpdateError::PageNotMapped) => unreachable!(),
+                            Err(FlagUpdateError::ParentEntryHugePage) => {
+                                unreachable!("we do not support huge pages");
+                            }
+                        }
+                    }
+
+                    continue;
+                }
+                TranslateResult::NotMapped => {}
+                TranslateResult::InvalidFrameAddress(pa) => {
+                    debug_assert!(
+                        false,
+                        "map_phys_frame_range: invalid frame address: {pa:#x}"
+                    );
+                    return Err(MapToError::FrameAllocationFailed);
+                }
+            }
+
             let table_flags = page_flags - PageTableFlags::NO_EXECUTE; // parent entries should not have NO_EXECUTE
 
             match unsafe {
@@ -724,8 +751,20 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
                         // probably set by other threads concurrently
                         return Ok(());
                     } else {
-                        // Copy-on-Write
-                        todo!("COW");
+                        // This is the deferred write-enable path used by mprotect today, not a
+                        // real COW implementation. Keep the write-fault handling separate so a
+                        // future COW path can replace this flag update.
+                        match unsafe { inner.update_flags(page, flags | PageTableFlags::WRITABLE) }
+                        {
+                            Ok(flush) => {
+                                flush.flush();
+                                return Ok(());
+                            }
+                            Err(FlagUpdateError::PageNotMapped) => unreachable!(),
+                            Err(FlagUpdateError::ParentEntryHugePage) => {
+                                return Err(PageFaultError::HugePage);
+                            }
+                        }
                     }
                 }
 
@@ -739,7 +778,8 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
             TranslateResult::NotMapped => {
                 let mut allocator = PageTableAllocator::<M>::new();
                 // TODO: if it is file-backed, we need to read the page from file
-                let frame = PageTableAllocator::<M>::allocate_frame(true).unwrap();
+                let frame = PageTableAllocator::<M>::allocate_frame(true)
+                    .ok_or(PageFaultError::AllocationFailed)?;
                 let table_flags = PageTableFlags::PRESENT
                     | PageTableFlags::WRITABLE
                     | PageTableFlags::USER_ACCESSIBLE;
@@ -770,7 +810,7 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
                 }
             }
             TranslateResult::InvalidFrameAddress(pa) => {
-                todo!("Invalid frame address: {:#x}", pa);
+                return Err(PageFaultError::InvalidFrameAddress(pa.as_u64()));
             }
         }
         Ok(())

@@ -1055,4 +1055,6 @@ pub enum PageFaultError {
     AllocationFailed,
     #[error("given page is part of an already mapped huge page")]
     HugePage,
+    #[error("invalid frame address: {0:#x}")]
+    InvalidFrameAddress(u64),
 }

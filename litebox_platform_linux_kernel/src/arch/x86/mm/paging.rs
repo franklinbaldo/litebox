@@ -253,7 +253,10 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     offset: _,
                     flags,
                 } => {
-                    // If it is changed to writable, we leave it to page fault handler (COW)
+                    // If write access is requested on a read-only mapping, leave the PTE
+                    // read-only for now and let the write-fault path enable writes lazily.
+                    // Keep this split explicit so a future real COW implementation can hook
+                    // into the same fault path.
                     let change_to_write = new_flags.contains(PageTableFlags::WRITABLE)
                         && !flags.contains(PageTableFlags::WRITABLE);
                     let new_flags = if change_to_write {
@@ -261,7 +264,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     } else {
                         new_flags
                     };
-                    if flags != new_flags {
+                    if flags & Self::MPROTECT_PTE_MASK != new_flags {
                         match unsafe {
                             inner.update_flags(page, (flags & !Self::MPROTECT_PTE_MASK) | new_flags)
                         } {
@@ -327,8 +330,22 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
                         // probably set by other threads concurrently
                         return Ok(());
                     } else {
-                        // Copy-on-Write
-                        todo!("COW");
+                        // This is the deferred write-enable path used by mprotect today, not a
+                        // real COW implementation. Keep the write-fault handling separate so a
+                        // future COW path can replace this flag update.
+                        match unsafe { inner.update_flags(page, flags | PageTableFlags::WRITABLE) }
+                        {
+                            Ok(flush) => {
+                                if FLUSH_TLB {
+                                    flush.flush();
+                                }
+                                return Ok(());
+                            }
+                            Err(FlagUpdateError::PageNotMapped) => unreachable!(),
+                            Err(FlagUpdateError::ParentEntryHugePage) => {
+                                return Err(PageFaultError::HugePage);
+                            }
+                        }
                     }
                 }
 
