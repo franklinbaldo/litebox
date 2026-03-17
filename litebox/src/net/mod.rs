@@ -907,6 +907,27 @@ where
 
     /// Close the `socket_handle`
     fn close_handle(&mut self, socket_handle: SocketHandle<Platform>) {
+        // Flush any pending proxy TX data into the smoltcp send buffer before
+        // closing, so the data makes it onto the wire before the FIN.
+        if socket_handle.proxy.is_some() {
+            let now = self.now();
+            // Drain in a loop to ensure all pending TX data is flushed
+            loop {
+                Self::drain_socket_channel_buffers(&mut self.socket_set, &socket_handle, now);
+                if !socket_handle
+                    .proxy
+                    .as_ref()
+                    .is_some_and(|p| p.has_pending_tx())
+                {
+                    break;
+                }
+                // If smoltcp can't accept more data right now, poll the interface
+                // to send buffered packets and make room.
+                self.interface
+                    .poll(now, &mut self.device, &mut self.socket_set);
+            }
+        }
+
         let SocketHandle {
             consider_closed: _,
             handle,
