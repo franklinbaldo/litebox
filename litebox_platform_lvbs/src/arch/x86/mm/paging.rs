@@ -258,34 +258,54 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     Ok((frame, _)) => {
                         match unsafe { inner.map_to(new_start, frame, flags, &mut allocator) } {
                             Ok(_) => {}
-                            Err(e) => match e {
-                                MapToError::PageAlreadyMapped(_) => {
-                                    return Err(page_mgmt::RemapError::AlreadyAllocated);
+                            Err(e) => {
+                                // Restore the original mapping so the frame is not leaked.
+                                // Safety: `start` was just unmapped so its PTE slot is free.
+                                // The returned flush is intentionally ignored: the batch
+                                // flush_tlb_range below covers this address.
+                                if unsafe { inner.map_to(start, frame, flags, &mut allocator) }
+                                    .is_err()
+                                {
+                                    // The frame is now orphaned — we cannot recover it.
+                                    debug_assert!(
+                                        false,
+                                        "remap_pages: failed to restore mapping, frame leaked"
+                                    );
+                                    return Err(page_mgmt::RemapError::RestoreFailed);
                                 }
-                                MapToError::ParentEntryHugePage => {
-                                    todo!("return Err(page_mgmt::RemapError::RemapToHugePage);")
-                                }
-                                MapToError::FrameAllocationFailed => {
-                                    return Err(page_mgmt::RemapError::OutOfMemory);
-                                }
-                            },
+
+                                // Flush TLB for pages already remapped in earlier iterations.
+                                let done = (start.start_address() - flush_start.start_address())
+                                    / Size4KiB::SIZE;
+                                flush_tlb_range(flush_start, done.truncate());
+
+                                return match e {
+                                    MapToError::PageAlreadyMapped(_) => {
+                                        Err(page_mgmt::RemapError::AlreadyAllocated)
+                                    }
+                                    MapToError::ParentEntryHugePage => {
+                                        Err(page_mgmt::RemapError::HugePage)
+                                    }
+                                    MapToError::FrameAllocationFailed => {
+                                        Err(page_mgmt::RemapError::OutOfMemory)
+                                    }
+                                };
+                            }
                         }
                     }
                     Err(X64UnmapError::PageNotMapped) => {
                         unreachable!()
                     }
                     Err(X64UnmapError::ParentEntryHugePage) => {
-                        todo!("return Err(page_mgmt::RemapError::RemapToHugePage);")
+                        return Err(page_mgmt::RemapError::HugePage);
                     }
                     Err(X64UnmapError::InvalidFrameAddress(pa)) => {
-                        // TODO: `panic!()` -> `todo!()` because user-driven interrupts or exceptions must not halt the kernel.
-                        // We should handle this exception carefully (i.e., clean up the context and data structures belonging to an errorneous process).
-                        todo!("Invalid frame address: {:#x}", pa);
+                        return Err(page_mgmt::RemapError::InvalidFrameAddress(pa.as_u64()));
                     }
                 },
                 TranslateResult::NotMapped => {}
                 TranslateResult::InvalidFrameAddress(pa) => {
-                    todo!("Invalid frame address: {:#x}", pa);
+                    return Err(page_mgmt::RemapError::InvalidFrameAddress(pa.as_u64()));
                 }
             }
             start += 1;

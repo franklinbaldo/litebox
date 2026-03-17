@@ -174,17 +174,36 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     Ok((frame, fl)) => {
                         match unsafe { inner.map_to(new_start, frame, flags, &mut allocator) } {
                             Ok(_) => {}
-                            Err(e) => match e {
-                                MapToError::PageAlreadyMapped(_) => {
-                                    return Err(page_mgmt::RemapError::AlreadyAllocated);
+                            Err(e) => {
+                                // Restore the original mapping so the frame is not leaked.
+                                // Safety: `start` was just unmapped so its PTE slot is free.
+                                if let Ok(restore_flush) =
+                                    unsafe { inner.map_to(start, frame, flags, &mut allocator) }
+                                {
+                                    if FLUSH_TLB {
+                                        restore_flush.flush();
+                                    }
+                                } else {
+                                    // The frame is now orphaned — we cannot recover it.
+                                    debug_assert!(
+                                        false,
+                                        "remap_pages: failed to restore mapping, frame leaked"
+                                    );
+                                    return Err(page_mgmt::RemapError::RestoreFailed);
                                 }
-                                MapToError::ParentEntryHugePage => {
-                                    todo!("return Err(page_mgmt::RemapError::RemapToHugePage);")
-                                }
-                                MapToError::FrameAllocationFailed => {
-                                    return Err(page_mgmt::RemapError::OutOfMemory);
-                                }
-                            },
+
+                                return match e {
+                                    MapToError::PageAlreadyMapped(_) => {
+                                        Err(page_mgmt::RemapError::AlreadyAllocated)
+                                    }
+                                    MapToError::ParentEntryHugePage => {
+                                        Err(page_mgmt::RemapError::HugePage)
+                                    }
+                                    MapToError::FrameAllocationFailed => {
+                                        Err(page_mgmt::RemapError::OutOfMemory)
+                                    }
+                                };
+                            }
                         }
                         if FLUSH_TLB {
                             fl.flush();
@@ -194,15 +213,15 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                         unreachable!()
                     }
                     Err(X64UnmapError::ParentEntryHugePage) => {
-                        todo!("return Err(page_mgmt::RemapError::RemapToHugePage);")
+                        return Err(page_mgmt::RemapError::HugePage);
                     }
                     Err(X64UnmapError::InvalidFrameAddress(pa)) => {
-                        panic!("Invalid frame address: {:#x}", pa);
+                        return Err(page_mgmt::RemapError::InvalidFrameAddress(pa.as_u64()));
                     }
                 },
                 TranslateResult::NotMapped => {}
                 TranslateResult::InvalidFrameAddress(pa) => {
-                    panic!("Invalid frame address: {:#x}", pa);
+                    return Err(page_mgmt::RemapError::InvalidFrameAddress(pa.as_u64()));
                 }
             }
             start += 1;

@@ -251,6 +251,12 @@ pub enum RemapError {
     AlreadyAllocated,
     #[error("out of memory")]
     OutOfMemory,
+    #[error("operation encountered a huge page")]
+    HugePage,
+    #[error("invalid frame address: {0:#x}")]
+    InvalidFrameAddress(u64),
+    #[error("failed to restore original mapping after remap failure (frame leaked)")]
+    RestoreFailed,
 }
 
 /// Possible errors for [`PageManagementProvider::update_permissions`]
