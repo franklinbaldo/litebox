@@ -42,6 +42,17 @@
 #endif
 #define AT_FDCWD -100
 
+#if defined(__aarch64__)
+// Provide __clear_cache for -nostdlib builds. On aarch64 this is a no-op
+// when running under litebox — the platform flushes the I-cache when
+// setting pages executable via mprotect. On bare metal, the kernel's
+// mprotect implementation also handles I-cache maintenance.
+void __clear_cache(void *beg __attribute__((unused)),
+                   void *end __attribute__((unused))) {
+    // Intentionally empty — I-cache coherence is handled by the platform.
+}
+#endif
+
 #ifdef __x86_64__
 // Maximum valid userspace address (47-bit address space)
 #define MAX_USERSPACE_ADDR 0x7FFFFFFFFFFFUL
