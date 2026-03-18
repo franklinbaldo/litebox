@@ -1660,6 +1660,14 @@ impl<FS: ShimFS> Task<FS> {
                 syscall!(sys_openat(dirfd, path, flags, mode))
             }),
             SyscallRequest::Ftruncate { fd, length } => syscall!(sys_ftruncate(fd, length)),
+            SyscallRequest::Mknodat {
+                dirfd,
+                pathname,
+                mode,
+                dev,
+            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                syscall!(sys_mknodat(dirfd, path, mode, dev))
+            }),
             SyscallRequest::Unlinkat {
                 dirfd,
                 pathname,

@@ -511,6 +511,38 @@ impl<FS: ShimFS> Task<FS> {
             .flatten()
     }
 
+    /// Handle syscall `mknodat` — create a filesystem node.
+    ///
+    /// Only `S_IFREG` (regular files) is supported: creates an empty file.
+    /// Device nodes (`S_IFBLK`, `S_IFCHR`) and FIFOs (`S_IFIFO`) return `EPERM`.
+    pub(crate) fn sys_mknodat(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        mode: u32,
+        _dev: u32,
+    ) -> Result<(), Errno> {
+        const S_IFMT: u32 = 0o170000;
+        const S_IFREG: u32 = 0o100000;
+
+        let file_type = mode & S_IFMT;
+        // mknodat with mode 0 (no file type) also creates a regular file on Linux.
+        if file_type != S_IFREG && file_type != 0 {
+            return Err(Errno::EPERM);
+        }
+
+        let perm_mode = Mode::from_bits_truncate(mode & !S_IFMT) & !self.get_umask();
+        // Create an empty regular file: O_CREAT | O_EXCL | O_WRONLY, then close.
+        let fd = self.sys_openat(
+            dirfd,
+            pathname,
+            OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+            perm_mode,
+        )?;
+        self.sys_close(fd.cast_signed())?;
+        Ok(())
+    }
+
     /// Handle syscall `unlinkat`
     pub(crate) fn sys_unlinkat(
         &self,
@@ -862,7 +894,23 @@ impl<FS: ShimFS> Task<FS> {
         files
             .run_on_raw_fd(
                 raw_fd,
-                |fd| files.fs.seek(fd, offset, whence).map_err(Errno::from),
+                |fd| {
+                    let is_dir_rewind =
+                        matches!(whence, SeekWhence::RelativeToBeginning) && offset == 0;
+                    match files.fs.seek(fd, offset, whence) {
+                        Ok(pos) => Ok(pos),
+                        Err(litebox::fs::errors::SeekError::NotAFile) if is_dir_rewind => {
+                            // lseek on a directory fd: reset the getdents64 read offset.
+                            let _old = self
+                                .global
+                                .litebox
+                                .descriptor_table_mut()
+                                .set_fd_metadata(fd, Diroff(0));
+                            Ok(0)
+                        }
+                        Err(e) => Err(Errno::from(e)),
+                    }
+                },
                 |_| Err(Errno::ESPIPE),
                 |_| Err(Errno::ESPIPE),
                 |_| Err(Errno::ESPIPE),
@@ -3860,7 +3908,13 @@ mod tests {
         task.sys_lstat("file.txt").unwrap();
 
         // ── sys_access: check relative file is accessible ──
-        task.sys_access("file.txt", AccessFlags::F_OK).unwrap();
+        task.sys_access(
+            litebox_common_linux::AT_FDCWD,
+            "file.txt",
+            AccessFlags::F_OK,
+            AtFlags::empty(),
+        )
+        .unwrap();
 
         // ── sys_mkdir: create a subdirectory via relative path ──
         task.sys_mkdir("subdir", 0o777).unwrap();
