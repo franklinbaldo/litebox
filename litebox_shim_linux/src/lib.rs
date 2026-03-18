@@ -307,6 +307,14 @@ impl<FS: ShimFS> LinuxShim<FS> {
         let files = Arc::new(files);
         files.initialize_stdio_in_shared_descriptors_table(&self.global);
 
+        // Ensure the global thread-ID counter is above the init task's PID
+        // so that child-thread TIDs never collide with the main thread's
+        // entry in the process threads map. On Linux userland the init PID
+        // is the host OS TID which can be much larger than 1.
+        self.global
+            .next_thread_id
+            .fetch_max(pid + 1, core::sync::atomic::Ordering::Relaxed);
+
         let entrypoints = crate::LinuxShimEntrypoints {
             _not_send: core::marker::PhantomData,
             task: Task {
