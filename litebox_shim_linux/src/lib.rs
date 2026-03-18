@@ -1382,9 +1382,9 @@ impl<FS: ShimFS> Task<FS> {
                 pathname,
                 mode,
                 flags,
-            } => pathname
-                .to_cstring()
-                .map_or(Err(Errno::EFAULT), |path| syscall!(sys_access(dirfd, path, mode, flags))),
+            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                syscall!(sys_access(dirfd, path, mode, flags))
+            }),
             SyscallRequest::Madvise {
                 addr,
                 length,
@@ -1444,6 +1444,7 @@ impl<FS: ShimFS> Task<FS> {
                 addr,
                 addrlen,
             } => self.sys_recvfrom(sockfd, buf, len, flags, addr, addrlen),
+            SyscallRequest::Recvmsg { sockfd, msg, flags } => self.sys_recvmsg(sockfd, msg, flags),
             SyscallRequest::Bind {
                 sockfd,
                 sockaddr,
