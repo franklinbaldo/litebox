@@ -578,6 +578,14 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             })?;
         let new_start = ret.as_usize();
         let new_end = new_start + suggested_range.len();
+        // When the platform returns a different address (hint mode), validate
+        // it still falls within the guest VA partition. If not, unmap and fail.
+        if new_start < self.addr_min || new_end > self.addr_max {
+            unsafe {
+                let _ = self.platform.deallocate_pages(new_start..new_end);
+            }
+            return Err(AllocationError::OutOfMemory);
+        }
         self.vmas.insert(new_start..new_end, vma);
         debug_assert!(new_start >= self.addr_min);
         debug_assert!(new_end <= self.addr_max);
@@ -636,22 +644,50 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .ok_or(AllocationError::OutOfMemory)?;
         // new_addr must be ALIGN aligned
         let new_range = PageRange::new(new_addr, new_addr + length.as_usize()).unwrap();
-        unsafe {
+        let fixed_address_behavior = if flags.contains(CreatePagesFlags::FIXED_ADDR) {
+            if flags.contains(CreatePagesFlags::NOREPLACE) {
+                FixedAddressBehavior::NoReplace
+            } else {
+                FixedAddressBehavior::Replace
+            }
+        } else {
+            FixedAddressBehavior::Hint
+        };
+        let result = unsafe {
             self.insert_mapping(
                 new_range,
                 vma,
                 flags.contains(CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY),
-                if flags.contains(CreatePagesFlags::FIXED_ADDR) {
-                    if flags.contains(CreatePagesFlags::NOREPLACE) {
-                        FixedAddressBehavior::NoReplace
-                    } else {
-                        FixedAddressBehavior::Replace
-                    }
-                } else {
-                    FixedAddressBehavior::Hint
-                },
+                fixed_address_behavior,
             )
+        };
+
+        // If a hint-based allocation landed outside the guest VA partition
+        // (e.g. the host kernel chose an address beyond addr_max), retry
+        // without the hint so the top-down search picks a valid address.
+        if matches!(
+            (&result, fixed_address_behavior),
+            (
+                Err(AllocationError::OutOfMemory),
+                FixedAddressBehavior::Hint
+            )
+        ) {
+            let fallback_addr = self
+                .get_unmmaped_area(None, total_length, false)
+                .ok_or(AllocationError::OutOfMemory)?;
+            let fallback_range =
+                PageRange::new(fallback_addr, fallback_addr + length.as_usize()).unwrap();
+            return unsafe {
+                self.insert_mapping(
+                    fallback_range,
+                    vma,
+                    flags.contains(CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY),
+                    FixedAddressBehavior::Hint,
+                )
+            };
         }
+
+        result
     }
 
     /// Resize a range in the virtual address space.
