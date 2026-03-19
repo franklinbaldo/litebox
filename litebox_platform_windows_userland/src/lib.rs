@@ -234,36 +234,12 @@ unsafe extern "system" fn vectored_exception_handler(
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
             }
-            // Committed but PAGE_NOACCESS — the guest used mprotect(PROT_NONE)
-            // to mark these pages. On Linux, re-accessing them triggers a kernel
-            // page fault that restores the mapping. On Windows, we need to
-            // change the protection back to allow access.
-            if ok
-                && mbi.State == Win32_Memory::MEM_COMMIT
-                && mbi.Protect == Win32_Memory::PAGE_NOACCESS
-            {
-                let rw = exception_record.ExceptionInformation[0];
-                // Determine appropriate protection based on access type.
-                // rw=0: read, rw=1: write, rw=8: execute
-                let new_prot = if rw == 8 {
-                    Win32_Memory::PAGE_EXECUTE_READ
-                } else {
-                    Win32_Memory::PAGE_READWRITE
-                };
-                let mut old_prot: u32 = 0;
-                let ok = unsafe {
-                    Win32_Memory::VirtualProtect(
-                        page_addr as *mut c_void,
-                        0x1000,
-                        new_prot,
-                        &raw mut old_prot,
-                    ) != 0
-                };
-                if ok {
-                    tls.is_in_guest.set(true);
-                    return EXCEPTION_CONTINUE_EXECUTION;
-                }
-            }
+            // PAGE_NOACCESS (PROT_NONE) pages are NOT auto-upgraded.
+            // On Linux, accessing PROT_NONE pages delivers SIGSEGV — the
+            // kernel does not restore the mapping. Fall through to deliver
+            // the fault to the guest as an exception (matching Linux behavior).
+            // glibc relies on PROT_NONE for arena guard pages; silently
+            // upgrading them would mask heap corruption.
         }
         // Log unhandled guest exception — TEB stack limits already restored so
         // eprintln is safe here.
@@ -1984,8 +1960,21 @@ where
     while !range.is_empty() {
         let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
         do_query_on_region(&mut mbi, range.start as *mut c_void);
-        debug_assert_eq!(range.start, mbi.BaseAddress as usize);
-        let len = mbi.RegionSize.min(range.len());
+        // VirtualQuery returns the base address and size of the *region*
+        // containing range.start.  When range.start falls mid-region,
+        // BaseAddress < range.start, so we must compute the available
+        // bytes from range.start to the region end rather than using
+        // RegionSize directly (which counts from BaseAddress).
+        let region_end = mbi.BaseAddress as usize + mbi.RegionSize;
+        let available = region_end.saturating_sub(range.start);
+        let len = available.min(range.len());
+        debug_assert!(
+            len > 0,
+            "VirtualQuery region {:#x}+{:#x} does not cover {:#x}",
+            mbi.BaseAddress as usize,
+            mbi.RegionSize,
+            range.start
+        );
         let success = operation(range.start..range.start + len, mbi.State)?;
         assert!(
             success,

@@ -213,7 +213,17 @@ pub fn sys_brk<
     pm: &litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
     addr: Platform::RawMutPointer<u8>,
 ) -> Result<usize, Errno> {
-    unsafe { pm.brk(addr.as_usize()) }.map_err(Errno::from)
+    // Linux brk(2) never returns a negative errno. On failure it returns
+    // the current (unchanged) program break. glibc always assigns the
+    // return value to __curbrk, so returning -errno would corrupt it
+    // (glibc would interpret 0xFFFF…FFF4 as a valid huge address).
+    match unsafe { pm.brk(addr.as_usize()) } {
+        Ok(new_brk) => Ok(new_brk),
+        Err(_) => {
+            // Return current break (brk(0) queries without modifying).
+            unsafe { pm.brk(0) }.map_err(Errno::from)
+        }
+    }
 }
 
 pub fn sys_madvise<
