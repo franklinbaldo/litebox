@@ -1,0 +1,180 @@
+# WINDOWS ARM64: TLS TABLE AND TCB STRUCTURE - VISUAL REFERENCE
+
+===============================================================================
+## TLS TABLE ENTRY FORMAT (16 bytes per entry, 256 entries total)
+===============================================================================
+
+Entry at table_base + (index * 16):
+
+Offset  Size  Field                Purpose
+------  ----  -----                -------
+  +0    8B    Key (u64)           TPIDRRO_EL0 (macOS) or guest_tpidr (Linux)
+  +8    8B    Value (u64)         TCB pointer or host TPIDR_EL0
+
+Example Memory Layout for 3 threads:
+┌─────────────────────────────────────┬─────────────────────────────────────┐
+│ Key: 0x0000700000fe1000 (thread A)  │ Value: 0x0000700000123000 (TCB A)   │  Entry 0
+├─────────────────────────────────────┼─────────────────────────────────────┤
+│ Key: 0x0000700000fe2000 (thread B)  │ Value: 0x0000700000124000 (TCB B)   │  Entry 1
+├─────────────────────────────────────┼─────────────────────────────────────┤
+│ Key: 0x0000700000fe3000 (thread C)  │ Value: 0x0000700000125000 (TCB C)   │  Entry 2
+├─────────────────────────────────────┼─────────────────────────────────────┤
+│ Key: 0xFFFFFFFFFFFFFFFF (sentinel)  │ Value: 0x0000000000000000 (unused)  │  Entry 3
+├─────────────────────────────────────┼─────────────────────────────────────┤
+│ Key: 0xFFFFFFFFFFFFFFFF (sentinel)  │ Value: 0x0000000000000000 (unused)  │  Entry 4
+└─────────────────────────────────────┴─────────────────────────────────────┘
+
+Sentinel 0xFFFFFFFFFFFFFFFF marks end of valid entries.
+Tombstone 0 marks freed slots (can be reclaimed).
+Linear scan: trampoline scans from index 0, stops at first sentinel.
+
+===============================================================================
+## THREAD CONTROL BLOCK (TCB) MEMORY LAYOUT
+===============================================================================
+
+All offsets measured in bytes from TCB base address.
+
+Offset  Size  Field                Purpose / Notes
+------  ----  -----                ---------------
+  0     8B    scratch              Temporary register save area (unused)
+  8     8B    host_sp              Host stack pointer (restored on callback)
+  16    8B    guest_context_top    Pointer to top of guest PtRegs (= PtRegs + size)
+  24    8B    guest_tpidr          ★ Guest TPIDR_EL0 value (written to TPIDR_EL0 on switch)
+  32    1B    in_guest             Boolean: 1 = currently executing guest code
+  33    1B    interrupt            Boolean: 1 = interrupt pending for guest
+  34-39 6B    _pad                 Padding for alignment
+  40    8B    guest_x18            ★ Guest x18 register (fully virtualized, never physical)
+
+Key Fields for Windows ARM64:
+  - guest_tpidr (offset 24): Must be loaded into TPIDR_EL0 before branching to guest
+  - guest_x18 (offset 40): Used by rewriter for x18 virtualization
+  - host_sp (offset 8): Restored from when returning to host code
+
+Memory Map of Single TCB:
+┌──────────────────────────┐
+│ scratch (offset 0)       │ 8 bytes
+├──────────────────────────┤
+│ host_sp (offset 8)       │ 8 bytes  ← Restored when returning to host
+├──────────────────────────┤
+│ guest_context_top (16)   │ 8 bytes  ← Points to PtRegs + sizeof(PtRegs)
+├──────────────────────────┤
+│ guest_tpidr (offset 24)  │ 8 bytes  ← ★ LOAD TO TPIDR_EL0 BEFORE GUEST ENTRY
+├──────────────────────────┤
+│ in_guest (offset 32)     │ 1 byte   ← Set to 1 before guest entry
+├──────────────────────────┤
+│ interrupt (offset 33)    │ 1 byte   ← If 1, jump to interrupt handler instead
+├──────────────────────────┤
+│ _pad (offset 34-39)      │ 6 bytes  ← Alignment padding
+├──────────────────────────┤
+│ guest_x18 (offset 40)    │ 8 bytes  ← ★ GUEST'S X18 VALUE
+└──────────────────────────┘
+
+===============================================================================
+## TLS TABLE REGISTRATION FLOW - BEFORE ENTERING GUEST
+===============================================================================
+
+Pseudocode for update_host_tls_entry():
+
+1. Load table address from HOST_TLS_TABLE_ADDR atomic
+   if table_addr == 0: return (no TLS table)
+
+2. Read key = TPIDRRO_EL0 (macOS stable per-thread TLS base)
+   or    key = guest_tpidr (Linux guest TLS value)
+
+3. Linear scan loop from index 0 to 255:
+   
+   for index in 0..256:
+       entry_addr = table_addr + (index * 16)
+       stored_key = read_u64_volatile(entry_addr + 0)
+       
+       if stored_key == key:
+           # Found existing entry for this thread
+           value_addr = entry_addr + 8
+           write_u64_volatile(value_addr, tcb_pointer)
+           return
+       
+       if stored_key == 0xFFFFFFFFFFFFFFFF:  # SENTINEL
+           # Found free slot at end of table
+           # Try to claim it via atomic CAS
+           if CAS(entry_addr, SENTINEL, key) == SUCCESS:
+               write_u64_volatile(entry_addr + 8, tcb_pointer)
+               return
+           else:
+               # Another thread claimed it, retry scan
+               goto loop_start
+       
+       if stored_key == 0:  # TOMBSTONE
+           # Previously freed slot, remember but keep scanning
+           if first_free == None:
+               first_free = index
+   
+   # After reaching end of table, claim first free tombstone (if found)
+   # or retry if filled by concurrent thread
+
+4. If table is full (all 256 entries used):
+   panic("TLS table full: exceeded 256 concurrent threads")
+
+===============================================================================
+## ASSEMBLY PSEUDOCODE: switch_to_guest (ARM64)
+===============================================================================
+
+ENTRY: x0 = PtRegs pointer, x1 = TCB pointer
+
+assembly switch_to_guest:
+    
+    # Set in_guest flag
+    mov w16, #1
+    strb w16, [x1, #32]              # TCB.in_guest = 1 (offset 32 = 1 byte)
+    
+    # Check interrupt flag
+    ldrb w17, [x1, #33]              # Load TCB.interrupt (offset 33)
+    cbnz w17, handle_interrupt       # If interrupt pending, branch
+    
+    # Restore guest general registers from PtRegs
+    # (x0 = PtRegs pointer, offsets into PtRegs)
+    ldp x2, x3,   [x0, #16]
+    ldp x4, x5,   [x0, #32]
+    ldp x6, x7,   [x0, #48]
+    ... (all regs except x0, x1, x30)
+    
+    # CRITICAL: Load and set guest TPIDR_EL0
+    ldr x16, [x1, #24]               # x16 = TCB.guest_tpidr (offset 24)
+    msr tpidr_el0, x16               # ★ SET GUEST TPIDR_EL0 ★
+    
+    # Load guest x18 from TCB (fully virtualized, never physical)
+    ldr x17, [x1, #40]               # x17 = TCB.guest_x18 (offset 40)
+    str x17, [x0, #144]              # Store to PtRegs.regs[18]
+    
+    # Restore guest SP
+    ldr x17, [x0, #248]              # x17 = PtRegs.sp
+    mov sp, x17
+    
+    # Restore guest x0, x1, x30 from red zone
+    ldr x0, [sp, #-24]
+    ldr x1, [sp, #-16]
+    ldr x30, [sp, #-8]
+    
+    # Branch to guest code
+    ldr x16, [x0, #256]              # x16 = PtRegs.pc
+    br x16                           # Jump to guest
+
+handle_interrupt:
+    # Branch to interrupt callback
+    mov x9, x1                       # Pass TCB via x9
+    b _interrupt_callback
+
+===============================================================================
+## SYSCALL/EXCEPTION RETURN: Restored Values
+===============================================================================
+
+When guest makes syscall and returns via exception_callback or interrupt_callback:
+
+Before returning to guest with switch_to_guest, update TCB:
+1. Call update_host_tls_entry() to register thread in TLS table
+2. Update TCB.guest_tpidr from shim if TPIDR_EL0 was modified
+3. Update TCB.guest_x18 from shim if x18 was modified
+4. Call switch_to_guest(PtRegs, TCB)
+
+The switch_to_guest will then restore everything including new guest_tpidr.
+
+===============================================================================

@@ -1301,10 +1301,13 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
             );
         }
 
-        // Set TPIDR_EL0 to our lookup key (TlsState address) before entering
-        // guest. The shared SVC/X18 handlers use this to find the TlsState.
+        // Set TPIDR_EL0 to the guest's virtual TPIDR value before entering guest.
+        // The shared SVC handler uses TPIDR_EL0 for TLS table lookup (the key
+        // in the table is also guest_tpidr). The MRS gate reads entry[0].key
+        // as the guest TPIDR value. Both return the same value, which is the
+        // guest's actual virtual TPIDR.
         unsafe {
-            litebox_common_linux::write_tpidr_el0(core::ptr::from_ref(tls) as usize);
+            litebox_common_linux::write_tpidr_el0(THREAD_TPIDR.get());
         }
 
         tls.is_in_guest.set(true);
@@ -2476,7 +2479,10 @@ fn update_host_tls_entry(tls: &TlsState) {
         return; // No TLS table (not using rewriter-based trampoline)
     }
 
-    let tls_key = core::ptr::from_ref(tls) as u64;
+    // Use the guest's virtual TPIDR value as the TLS table key.
+    // This matches what the MRS gate returns (entry[0].key = guest_tpidr).
+    // The SVC handler's TPIDR_EL0-keyed lookup also uses this value.
+    let tls_key = THREAD_TPIDR.get() as u64;
     let tls_value = core::ptr::from_ref(tls) as u64;
 
     'retry: loop {
@@ -2536,7 +2542,7 @@ fn remove_host_tls_entries(tls: &TlsState) {
         return;
     }
 
-    let tls_key = core::ptr::from_ref(tls) as u64;
+    let tls_key = THREAD_TPIDR.get() as u64;
 
     for index in 0..TLS_TABLE_ENTRIES {
         let key_ptr = unsafe { &*((table_addr + index * 16) as *const AtomicU64) };
@@ -2571,6 +2577,75 @@ impl ThreadContext<'_> {
             ContinueOperation::Resume => {
                 #[cfg(target_arch = "aarch64")]
                 {
+                    // Sync guest_tpidr from TLS table and always update entry[0].
+                    // The MRS gate reads entry[0].key as the guest TPIDR value.
+                    // The MSR handler may have updated a different entry, so we
+                    // must ensure entry[0] has the current guest TPIDR.
+                    let table_addr =
+                        litebox_common_linux::HOST_TLS_TABLE_ADDR.load(Ordering::Acquire);
+                    if table_addr != 0 {
+                        // Read guest TPIDR from the MSR handler's last update.
+                        // The MSR handler writes to the matching entry's key,
+                        // which might not be entry[0]. Scan for the non-sentinel,
+                        // non-zero key that has our host_tls value.
+                        let tls_value = core::ptr::from_ref(self.tls) as u64;
+                        let mut found_tpidr = THREAD_TPIDR.get() as u64;
+                        for index in 0..TLS_TABLE_ENTRIES {
+                            let key = unsafe {
+                                ((table_addr + index * 16) as *const u64).read_volatile()
+                            };
+                            if key == TLS_TABLE_SENTINEL {
+                                break;
+                            }
+                            let val = unsafe {
+                                ((table_addr + index * 16 + 8) as *const u64).read_volatile()
+                            };
+                            if val == tls_value && key != 0 {
+                                found_tpidr = key;
+                                break;
+                            }
+                        }
+                        THREAD_TPIDR.set(found_tpidr as usize);
+
+                        // Always write guest_tpidr to entry[0].key so the MRS
+                        // gate returns the correct value.
+                        unsafe {
+                            (table_addr as *mut u64).write_volatile(found_tpidr);
+                            ((table_addr + 8) as *mut u64).write_volatile(tls_value);
+                        }
+
+                        // DEBUG: verify entry[0]
+                        let e0_key = unsafe { (table_addr as *const u64).read_volatile() };
+                        let e0_val = unsafe { ((table_addr + 8) as *const u64).read_volatile() };
+                        if e0_key != found_tpidr || e0_val != tls_value {
+                            use std::io::Write;
+                            let _ = writeln!(
+                                std::io::stderr(),
+                                "[winarm64] BUG: entry[0] mismatch! key={:#x} expected={:#x}",
+                                e0_key,
+                                found_tpidr
+                            );
+                        }
+
+                        // DEBUG: also check trampoline header points to same table
+                        let sigret_addr =
+                            litebox_common_linux::SIGRETURN_TRAMPOLINE_ADDR.load(Ordering::Acquire);
+                        if sigret_addr != 0 {
+                            // trampoline header is at sigreturn_addr - 16
+                            // offset 8 in header = sigreturn_addr - 16 + 8 = sigreturn_addr - 8
+                            let header_tls_ptr =
+                                unsafe { ((sigret_addr - 8) as *const u64).read_volatile() };
+                            if header_tls_ptr != table_addr as u64 {
+                                use std::io::Write;
+                                let _ = writeln!(
+                                    std::io::stderr(),
+                                    "[winarm64] BUG: trampoline header TLS ptr={:#x} HOST_TLS={:#x}",
+                                    header_tls_ptr,
+                                    table_addr
+                                );
+                            }
+                        }
+                    }
                     update_host_tls_entry(self.tls);
                 }
                 unsafe { switch_to_guest(self.ctx) }

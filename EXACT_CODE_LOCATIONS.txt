@@ -1,0 +1,301 @@
+# EXACT CODE LOCATIONS - macOS and Linux ARM64 REFERENCE
+
+This file provides exact file paths and line numbers for every critical function
+you referenced in your exploration.
+
+================================================================================
+SECTION 1: macOS TLS IMPLEMENTATION
+================================================================================
+
+File: litebox_platform_macos_userland/src/lib.rs
+
+1. ThreadControlBlock Structure Definition
+   Location: Lines 582-593
+   Key Fields:
+   - guest_tpidr (u64) at offset 24 (line 588)
+   - guest_x18 (u64) at offset 40 (line 592)
+   
+   #[repr(C)]
+   #[derive(Default)]
+   struct ThreadControlBlock {
+       scratch: usize,              // offset 0
+       host_sp: usize,              // offset 8
+       guest_context_top: usize,    // offset 16
+       guest_tpidr: usize,          // offset 24
+       in_guest: u8,                // offset 32
+       interrupt: u8,               // offset 33
+       _pad: [u8; 6],               // offset 34-39
+       guest_x18: usize,            // offset 40
+   }
+
+2. TCB Offset Constants
+   Location: Lines 595-625
+   - tcb_offset_guest_tpidr() returns 24 (line 611)
+   - tcb_offset_guest_x18() returns 40 (line 624)
+
+3. Thread-Local TCB Pointer
+   Location: Lines 637-639
+   thread_local! {
+       static TCB_PTR: Cell<*mut ThreadControlBlock> = ...
+   }
+
+4. TLS Table Constants
+   Location: Lines 2374-2375
+   const TLS_TABLE_ENTRIES: usize = 256;
+   const TLS_TABLE_SENTINEL: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+
+5. TLS Table Registration Function
+   Name: update_host_tls_entry()
+   Location: Lines 2377-2446
+   
+   STRUCTURE:
+   - Lines 2380-2383: Load table address
+   - Lines 2385-2390: Get TCB pointer and TPIDRRO_EL0 key
+   - Lines 2392-2420: Main loop scanning table
+   - Lines 2422-2445: CAS logic for claiming free slots
+   
+   KEY CODE SNIPPETS:
+   Line 2380: let table_addr = HOST_TLS_TABLE_ADDR.load(Ordering::Acquire)
+   Line 2390: let tpidrro = unsafe { read_tpidrro_el0() } as u64
+   Line 2395: for index in 0..TLS_TABLE_ENTRIES
+   Line 2396: let key_ptr = unsafe { &*((table_addr + index * 16) as ...) }
+   Line 2400: if stored_key == tpidrro { ... }  // Found existing
+   Line 2407: if stored_key == TLS_TABLE_SENTINEL { ... }  // End marker
+   Line 2436-2438: CAS operation for thread-safe claiming
+
+6. Thread Cleanup Function
+   Name: remove_host_tls_entries()
+   Location: Lines 2461-2507
+   
+   STRUCTURE:
+   - Lines 2464-2467: Load table address
+   - Lines 2469-2476: Get TPIDRRO_EL0 key
+   - Lines 2471-2506: Linear scan to find and remove entry
+   
+   KEY CODE:
+   Line 2476: if stored_key == tpidrro { key_ptr.store(0, Ordering::Release) }
+   Line 2496: key_ptr.store(0, Ordering::Release); // Tombstone
+
+7. Called Before Guest Entry
+   Location: Lines 2544-2550
+   
+   ContinueOperation::Resume => {
+       update_host_tls_entry();  // LINE 2544
+       unsafe { switch_to_guest(self.ctx, tcb) }
+   }
+
+8. switch_to_guest Assembly Entry Point
+   Name: switch_to_guest() [naked function]
+   Location: Lines 1114-1221
+   
+   STRUCTURE:
+   - Lines 1114-1117: Function signature and prologue
+   - Lines 1118-1220: Naked asm! macro
+   - Line 1119: "_switch_to_guest_start:" label
+   - Lines 1137-1140: Set in_guest flag and check interrupt
+   - Lines 1162-1182: Stash values in red zone below SP
+   - Lines 1183-1199: Restore registers x2-x30 from PtRegs
+   - Lines 1200-1210: Final register restore and jump to guest
+   - Line 1216: "_switch_to_guest_end:" label
+   
+   KEY ASSEMBLY LINES:
+   Line 1138: strb w16, [x1, #32]  // Set TCB.in_guest
+   Line 1139: ldrb w17, [x1, #33]  // Check TCB.interrupt
+   
+   NOTE: The actual TPIDR_EL0 write would be in the assembly,
+         look for "msr tpidr_el0" instruction
+
+9. get_guest_tpidr / set_guest_tpidr (macOS uses TCB, not thread-local)
+   Location: Lines 870-883
+   
+   fn set_guest_tpidr(value: usize) {
+       let tcb = TCB_PTR.get();
+       unsafe { (*tcb).guest_tpidr = value; }  // Direct write to TCB
+   }
+   
+   fn get_guest_tpidr() -> usize {
+       let tcb = TCB_PTR.get();
+       unsafe { (*tcb).guest_tpidr }  // Direct read from TCB
+   }
+
+================================================================================
+SECTION 2: Linux TLS IMPLEMENTATION
+================================================================================
+
+File: litebox_platform_linux_userland/src/lib.rs
+
+1. TLS Table Constants
+   Location: Lines 2122-2123
+   const TLS_TABLE_ENTRIES: usize = 256;
+   // No SENTINEL define in Linux (uses direct sentinel write)
+
+2. TLS Table Registration Function
+   Name: update_host_tls_entry()
+   Location: Lines 2125-2168
+   
+   STRUCTURE:
+   - Lines 2128-2131: Load table address
+   - Lines 2134-2137: Read host TPIDR_EL0 via assembly
+   - Line 2140: Get guest_tpidr from thread-local
+   - Lines 2146-2165: Main loop scanning table
+   
+   KEY DIFFERENCES FROM MACOS:
+   - Line 2136: Assembly read of TPIDR_EL0 (kernel-preserved)
+   - Line 2140: get_guest_tpidr() reads from TPREL offset
+   - Line 2147: table.add(index * 2) [index * 8, not * 16!]
+   - No tombstone logic (just sentinel end marker)
+   - No CAS logic (kernel preserves TPIDR_EL0)
+
+3. Thread-Local guest_tpidr Access
+   Name: set_guest_tpidr()
+   Location: Lines 485-498
+   
+   Uses TPREL relocations to access variable at offset from TPIDR_EL0:
+   Line 489: "movz {tmp2}, #:tprel_g1:guest_tpidr"
+   Line 490: "movk {tmp2}, #:tprel_g0_nc:guest_tpidr"
+   Line 491: "str {val}, [{tmp}, {tmp2}]"
+   
+   Name: get_guest_tpidr()
+   Location: Lines 501-516
+   
+   Same TPREL pattern for reading
+
+4. interrupt_handler
+   Location: Lines 2170-2172
+   
+   extern "C-unwind" fn interrupt_handler(thread_ctx: &mut ThreadContext) {
+       thread_ctx.call_shim(|shim, ctx| shim.interrupt(ctx));
+   }
+
+================================================================================
+SECTION 3: LINUX COMMON - TLS TABLE INITIALIZATION
+================================================================================
+
+File: litebox_common_linux/src/loader.rs
+
+1. TLS Table Allocation and Initialization
+   Location: Lines 526-595
+   
+   STRUCTURE:
+   - Lines 526-533: Comments and constants definition
+   - Lines 535-539: Check for existing table
+   - Lines 540-589: Allocate new table (first trampoline only)
+   - Lines 591-592: Write table address to trampoline
+   
+   KEY CODE LINES:
+   
+   Line 528: // Comment: TLS lookup table layout explanation
+   Line 530: const TLS_ENTRY_SIZE: usize = 16;
+   Line 531: const TLS_TABLE_SIZE: usize = PAGE_SIZE;
+   Line 533: const TLS_TABLE_ENTRIES: usize = TLS_TABLE_SIZE / TLS_ENTRY_SIZE;
+   
+   Line 535: let existing = crate::HOST_TLS_TABLE_ADDR.load(...)
+   
+   Line 537: let tls_table_addr = if existing != 0 {
+   Line 538:     existing
+   Line 539: } else {
+   
+   Line 549: #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+   Line 550: const HOST_PAGE_SIZE: usize = 16384;
+   Line 551: #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+   Line 552: const HOST_PAGE_SIZE: usize = PAGE_SIZE;
+   
+   Line 554-557: Align table to HOST_PAGE_SIZE boundary
+   Line 559: let tls_table_end = page_align_up(addr + TLS_TABLE_SIZE);
+   
+   Line 561-571: Map memory with RW protection
+   
+   Line 573: let sentinel: u64 = 0xFFFFFFFFFFFFFFFF;
+   Line 574-577: Initialize all entries with sentinel
+       for i in 0..TLS_TABLE_ENTRIES {
+           let entry_addr = addr + i * TLS_ENTRY_SIZE;
+           mem.write(entry_addr, &sentinel.to_ne_bytes())?;
+       }
+   
+   Line 579: crate::HOST_TLS_TABLE_ADDR.store(addr, ...)
+   
+   Line 591-592: Write table address to trampoline
+       mem.write(trampoline_start + 8, &tls_table_addr.to_ne_bytes())?;
+
+2. Comment Block Explaining Design
+   Location: Lines 517-525
+   
+   Details about TLS table purpose and reuse across trampolines
+
+3. Sentinel Initialization
+   Location: Lines 573-577
+   
+   All 256 entries initialized with 0xFFFFFFFFFFFFFFFF
+
+================================================================================
+SECTION 4: SHARED CONSTANTS
+================================================================================
+
+File: litebox_common_linux/src/lib.rs (likely)
+
+HOST_TLS_TABLE_ADDR: AtomicUsize
+    - Global atomic to store TLS table base address
+    - Used by both macOS and Linux platforms
+    - Initialized by loader on first trampoline load
+    - Read by platforms before entering guest
+
+================================================================================
+SUMMARY OF KEY OFFSET CONSTANTS
+================================================================================
+
+ThreadControlBlock Offsets (MUST BE IDENTICAL):
+
+Field               Size    Offset  Used For
+-----               ----    ------  --------
+scratch             usize   0       (unused, scratch space)
+host_sp             usize   8       Saved host SP for recovery
+guest_context_top   usize   16      Points to PtRegs + sizeof(PtRegs)
+guest_tpidr         usize   24      ★ Guest TPIDR_EL0 value to load
+in_guest            u8      32      Flag: 1 = executing guest
+interrupt           u8      33      Flag: 1 = interrupt pending
+_pad                [u8;6]  34-39   Alignment padding
+guest_x18           usize   40      ★ Guest x18 register value
+
+TLS Table Entry Offsets:
+
+Offset  Size    Field           Purpose
+------  ----    -----           -------
+0       u64     key/guest_tpidr Key: TPIDRRO_EL0 (macOS) or guest_tpidr (Linux)
+8       u64     value/host_tls  Value: TCB pointer or host TPIDR_EL0
+
+================================================================================
+CRITICAL FUNCTIONS FOR WINDOWS ARM64
+================================================================================
+
+MUST IMPLEMENT:
+
+1. update_host_tls_entry()
+   - Called BEFORE every switch_to_guest()
+   - Uses TPIDRRO_EL0 as key
+   - Uses atomic CAS for thread safety
+   - Supports tombstone reclamation (like macOS)
+
+2. switch_to_guest()
+   - Loads guest_tpidr from TCB offset 24
+   - Writes to TPIDR_EL0
+   - Loads guest_x18 from TCB offset 40
+   - TCB pointer passed explicitly (not TPIDR_EL0)
+
+3. remove_host_tls_entries()
+   - Called when thread exits
+   - Writes tombstone (0) to free slot
+   - Enables slot reclamation by other threads
+
+MUST NOT DO:
+
+1. Don't rely on TPIDR_EL0 to find TCB
+   (Windows context switches may clobber it)
+
+2. Don't use different offsets for guest_tpidr/guest_x18
+   (Must match macOS: 24 and 40)
+
+3. Don't initialize TLS table entries with non-sentinel values
+   (All must start as 0xFFFFFFFFFFFFFFFF)
+
+4. Don't use host TPIDR_EL0 as table key
+   (Use TPIDRRO_EL0 like macOS does)

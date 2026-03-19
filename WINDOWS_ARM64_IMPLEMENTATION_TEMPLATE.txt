@@ -1,0 +1,306 @@
+# WINDOWS ARM64 IMPLEMENTATION TEMPLATE
+
+This document provides the exact code patterns you need to implement for Windows ARM64,
+based on the macOS and Linux implementations.
+
+## 1. TCB STRUCTURE (copy from macOS)
+
+File: litebox_platform_windows_userland/src/lib.rs
+
+#[repr(C)]
+#[derive(Default)]
+struct ThreadControlBlock {
+    scratch: usize,              // offset 0
+    host_sp: usize,              // offset 8
+    guest_context_top: usize,    // offset 16
+    guest_tpidr: usize,          // offset 24 ★ KEY FIELD
+    in_guest: u8,                // offset 32
+    interrupt: u8,               // offset 33
+    _pad: [u8; 6],               // offset 34-39
+    guest_x18: usize,            // offset 40 ★ KEY FIELD
+}
+
+// Offset constants
+const fn tcb_offset_host_sp() -> isize { 8 }
+const fn tcb_offset_guest_context_top() -> isize { 16 }
+const fn tcb_offset_guest_tpidr() -> isize { 24 }
+const fn tcb_offset_in_guest() -> isize { 32 }
+const fn tcb_offset_interrupt() -> isize { 33 }
+const fn tcb_offset_guest_x18() -> isize { 40 }
+
+---
+
+## 2. TLS TABLE CONSTANTS
+
+File: litebox_platform_windows_userland/src/lib.rs
+
+// Same as macOS (NOT Linux - Linux uses different key type)
+const TLS_TABLE_ENTRIES: usize = 256;
+const TLS_TABLE_SENTINEL: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+
+// Thread-local TCB pointer (like macOS)
+thread_local! {
+    static TCB_PTR: Cell<*mut ThreadControlBlock> = const { Cell::new(core::ptr::null_mut()) };
+}
+
+---
+
+## 3. REGISTER THREAD IN TLS TABLE
+
+Function name: update_host_tls_entry()
+Called BEFORE every switch_to_guest() call
+
+#[cfg(target_arch = "aarch64")]
+fn update_host_tls_entry() {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    let table_addr = litebox_common_linux::HOST_TLS_TABLE_ADDR.load(Ordering::Acquire);
+    if table_addr == 0 {
+        return; // No TLS table allocated
+    }
+
+    // Get TCB pointer (Windows uses thread-local like macOS)
+    let tcb = TCB_PTR.get();
+    assert!(!tcb.is_null(), "update_host_tls_entry called without TCB");
+    let host_tls = tcb as usize;
+
+    // KEY: Read TPIDRRO_EL0 as lookup key (like macOS)
+    // TPIDRRO_EL0 is stable per-thread on all ARM64 systems
+    let tpidrro = unsafe { litebox_common_linux::read_tpidrro_el0() } as u64;
+
+    'retry: loop {
+        let mut first_free: Option<usize> = None;
+
+        // Linear scan from index 0 (matches trampoline assembly)
+        for index in 0..TLS_TABLE_ENTRIES {
+            let key_ptr = unsafe { &*((table_addr + index * 16) as *const AtomicU64) };
+            let stored_key = key_ptr.load(Ordering::Acquire);
+
+            if stored_key == tpidrro {
+                // Found existing entry for this thread
+                let val_ptr = (table_addr + index * 16 + 8) as *mut u64;
+                unsafe { val_ptr.write_volatile(host_tls as u64) };
+                return;
+            }
+
+            if stored_key == TLS_TABLE_SENTINEL {
+                // End of valid entries
+                if first_free.is_none() {
+                    first_free = Some(index);
+                }
+                break;
+            }
+
+            // Tombstone (key=0): previously freed, remember as candidate
+            if stored_key == 0 && first_free.is_none() {
+                first_free = Some(index);
+            }
+        }
+
+        // Claim first available slot (sentinel or tombstone) via CAS
+        let free_index = first_free.expect("TLS table full: exceeded 256 concurrent threads");
+        let key_ptr = unsafe { &*((table_addr + free_index * 16) as *const AtomicU64) };
+        let val_ptr = (table_addr + free_index * 16 + 8) as *mut u64;
+
+        let current = key_ptr.load(Ordering::Acquire);
+
+        // Only CAS on sentinel or tombstone
+        if current != TLS_TABLE_SENTINEL && current != 0 {
+            continue 'retry; // Another thread beat us, rescan
+        }
+
+        // Atomic CAS: attempt to claim slot
+        if key_ptr
+            .compare_exchange(current, tpidrro, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            // Success: write host_tls value
+            unsafe { val_ptr.write_volatile(host_tls as u64) };
+            return;
+        }
+        // CAS failed, rescan from beginning
+    }
+}
+
+---
+
+## 4. REMOVE ENTRY ON THREAD EXIT
+
+Function name: remove_host_tls_entries()
+Called when thread exits run_thread_inner() before TCB is freed
+
+#[cfg(target_arch = "aarch64")]
+fn remove_host_tls_entries() {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    let table_addr = litebox_common_linux::HOST_TLS_TABLE_ADDR.load(Ordering::Acquire);
+    if table_addr == 0 {
+        return;
+    }
+
+    // Read this thread's key
+    let tpidrro = unsafe { litebox_common_linux::read_tpidrro_el0() } as u64;
+
+    for index in 0..TLS_TABLE_ENTRIES {
+        let key_ptr = unsafe { &*((table_addr + index * 16) as *const AtomicU64) };
+        let stored_key = key_ptr.load(Ordering::Acquire);
+
+        if stored_key == tpidrro {
+            // Found our entry - write tombstone (0)
+            // This frees the slot but allows higher entries to be found
+            // (scanner stops at sentinel 0xFFFF... not at tombstones)
+            key_ptr.store(0, Ordering::Release);
+            return;
+        }
+
+        if stored_key == TLS_TABLE_SENTINEL {
+            // Reached end without finding our entry
+            // (can happen if thread never entered guest)
+            return;
+        }
+    }
+}
+
+---
+
+## 5. ASSEMBLY: switch_to_guest
+
+Naked function with two arguments:
+  x0 = &PtRegs (guest context)
+  x1 = &mut ThreadControlBlock (TCB)
+
+IMPORTANT: Windows uses explicit TCB argument like macOS (not TPIDR_EL0 like Linux)
+
+unsafe extern "C" fn switch_to_guest(
+    ctx: &litebox_common_linux::PtRegs,
+    tcb: *mut ThreadControlBlock,
+) -> ! {
+    core::arch::naked_asm!(
+        ".globl _switch_to_guest_start",
+        "_switch_to_guest_start:",
+        
+        // Set in_guest flag (offset 32 in TCB)
+        "mov w16, #1",
+        "strb w16, [x1, #32]",  // TCB.in_guest = 1
+        
+        // Check interrupt flag (offset 33 in TCB)
+        "ldrb w17, [x1, #33]",
+        "cbnz w17, 2f",         // Jump if interrupt pending
+        
+        // === Restore all guest registers from PtRegs ===
+        // (This pattern matches macOS exactly)
+        
+        // Restore x0-x17 from PtRegs
+        "ldp x0,  x1,  [x0, #0]",   // regs[0], regs[1]
+        "ldp x2,  x3,  [x0, #16]",  // regs[2], regs[3]
+        "ldp x4,  x5,  [x0, #32]",  // regs[4], regs[5]
+        "ldp x6,  x7,  [x0, #48]",  // regs[6], regs[7]
+        "ldp x8,  x9,  [x0, #64]",  // regs[8], regs[9]
+        "ldp x10, x11, [x0, #80]",  // regs[10], regs[11]
+        "ldp x12, x13, [x0, #96]",  // regs[12], regs[13]
+        "ldp x14, x15, [x0, #112]", // regs[14], regs[15]
+        
+        // Load guest_tpidr and set TPIDR_EL0
+        "ldr x16, [x1, #24]",       // x16 = TCB.guest_tpidr (offset 24)
+        "msr tpidr_el0, x16",       // ★ SET GUEST TPIDR_EL0 ★
+        
+        // Load guest_x18 from TCB (fully virtualized)
+        "ldr x17, [x1, #40]",       // x17 = TCB.guest_x18 (offset 40)
+        // Store to PtRegs.regs[18] if needed (depends on your register layout)
+        
+        // Restore guest SP
+        "ldr x17, [x0, #248]",      // x17 = PtRegs.sp
+        "mov sp, x17",
+        
+        // Restore remaining registers
+        "ldp x16, x17, [x0, #128]", // regs[16], regs[17]
+        "ldp x19, x20, [x0, #152]",
+        "ldp x21, x22, [x0, #168]",
+        "ldp x23, x24, [x0, #184]",
+        "ldp x25, x26, [x0, #200]",
+        "ldp x27, x28, [x0, #216]",
+        "ldr x29, [x0, #232]",
+        "ldr x30, [x0, #240]",      // guest LR
+        
+        // Load guest PC and branch
+        "ldr x16, [x0, #256]",      // x16 = PtRegs.pc
+        "br x16",                   // Jump to guest
+        
+        // Interrupt path: pass TCB to interrupt callback
+        "2: mov x9, x1",            // x9 = TCB for callback
+        "b _interrupt_callback",
+        
+        ".globl _switch_to_guest_end",
+        "_switch_to_guest_end:",
+    );
+}
+
+---
+
+## 6. CALL SITE: Before entering guest
+
+In your equivalent of run_thread_arch() or after handling syscall:
+
+// When resuming guest execution
+match continue_op {
+    ContinueOperation::Resume => {
+        // Register thread in TLS table BEFORE guest entry
+        update_host_tls_entry();    // ★ CRITICAL CALL
+        
+        // Pass TCB explicitly (don't rely on TPIDR_EL0)
+        unsafe { switch_to_guest(ctx, tcb) }
+    }
+}
+
+---
+
+## 7. THREAD INITIALIZATION
+
+In run_thread_inner():
+
+let mut tcb = Box::new(ThreadControlBlock::default());
+let tcb_ptr = &raw mut *tcb;
+
+// Set thread-local TCB pointer
+TCB_PTR.set(tcb_ptr);
+
+with_signal_alt_stack(tcb_addr, || {
+    // Do NOT write TPIDR_EL0 here
+    // The only place TPIDR_EL0 is written is in switch_to_guest
+    run_thread_arch(..., tcb_ptr);
+});
+
+// Clean up TLS table entry before TCB is freed
+remove_host_tls_entries();
+TCB_PTR.set(core::ptr::null_mut());
+
+---
+
+## KEY DIFFERENCES FROM MACOS:
+
+1. Initialization: Same (TCB.guest_tpidr, guest_x18)
+2. TLS table: Same format (TPIDRRO_EL0 as key)
+3. Registration: Same pattern (update_host_tls_entry before switch)
+4. Assembly: Same offset constants
+5. Thread safety: Same CAS logic
+
+The implementations are so similar because both Windows and macOS:
+- Cannot rely on TPIDR_EL0 preservation across context switches
+- Must pass TCB via explicit register argument
+- Use TPIDRRO_EL0 as stable thread identifier
+- Both support 256 concurrent threads
+
+---
+
+## VALIDATION CHECKLIST FOR WINDOWS IMPLEMENTATION:
+
+[ ] TCB structure matches offsets (guest_tpidr at 24, guest_x18 at 40)
+[ ] TLS table allocator initializes sentinel values (0xFFFFFFFFFFFFFFFF)
+[ ] update_host_tls_entry() uses linear scan (index 0 to 255)
+[ ] update_host_tls_entry() uses atomic CAS for thread safety
+[ ] remove_host_tls_entries() uses tombstone (0) for freed slots
+[ ] switch_to_guest writes TPIDR_EL0 from TCB.guest_tpidr offset 24
+[ ] switch_to_guest loads guest_x18 from TCB offset 40
+[ ] update_host_tls_entry() called BEFORE every guest entry
+[ ] TCB pointer passed explicitly (not read from TPIDR_EL0)
+[ ] Assembly scanner stops at sentinel, continues past tombstones

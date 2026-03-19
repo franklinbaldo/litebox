@@ -1,0 +1,416 @@
+# macOS and Linux ARM64 TLS Table Registration - Complete Reference
+
+## 1. TLS TABLE INITIALIZATION (Linux Common)
+### File: litebox_common_linux/src/loader.rs (Lines 526-595)
+
+**TLS Table Layout:**
+- Size: 4 KB (PAGE_SIZE), supports up to 256 threads
+- Entry Size: 16 bytes per entry
+- Format: [guest_tpidr: u64, host_tls: u64]
+- Initialization Sentinel: 0xFFFFFFFFFFFFFFFF
+
+**Allocation Logic (Lines 527-595):**
+- First trampoline load: allocates new table
+- Subsequent loads: reuse existing table (CRITICAL for rtld_audit compatibility)
+- macOS special handling: align to 16KB (host page size) to avoid W^X issues
+- All entries initialized with sentinel value 0xFFFFFFFFFFFFFFFF
+
+KEY CODE (Lines 530-576):
+`ust
+const TLS_ENTRY_SIZE: usize = 16; // [guest_tpidr: u64, host_tls: u64]
+const TLS_TABLE_SIZE: usize = PAGE_SIZE;
+const TLS_TABLE_ENTRIES: usize = TLS_TABLE_SIZE / TLS_ENTRY_SIZE; // 256
+
+let existing = crate::HOST_TLS_TABLE_ADDR.load(Ordering::Acquire);
+let tls_table_addr = if existing != 0 {
+    existing
+} else {
+    // Allocate table at HOST_PAGE_SIZE-aligned boundary
+    let addr = info.brk.max(trampoline_end).next_multiple_of(HOST_PAGE_SIZE);
+    
+    // Map with RW protection
+    mapper.map_zero(addr, tls_table_end - addr, Protection { read: true, write: true, execute: false })?;
+    
+    // Initialize all entries with sentinel
+    let sentinel: u64 = 0xFFFFFFFFFFFFFFFF;
+    for i in 0..TLS_TABLE_ENTRIES {
+        let entry_addr = addr + i * TLS_ENTRY_SIZE;
+        mem.write(entry_addr, &sentinel.to_ne_bytes())?;
+    }
+    
+    crate::HOST_TLS_TABLE_ADDR.store(addr, Ordering::Release);
+    addr
+};
+
+// Write table address at trampoline offset 8
+mem.write(trampoline_start + 8, &tls_table_addr.to_ne_bytes())?;
+`
+
+---
+
+## 2. THREAD CONTROL BLOCK (TCB) STRUCTURE - macOS
+### File: litebox_platform_macos_userland/src/lib.rs (Lines 582-625)
+
+**TCB Memory Layout (repr(C), all offsets in bytes):**
+`ust
+#[repr(C)]
+#[derive(Default)]
+struct ThreadControlBlock {
+    scratch: usize,              // offset 0
+    host_sp: usize,              // offset 8
+    guest_context_top: usize,    // offset 16
+    guest_tpidr: usize,          // offset 24 ★ KEY FOR WINDOWS
+    in_guest: u8,                // offset 32
+    interrupt: u8,               // offset 33
+    _pad: [u8; 6],               // offset 34-39
+    guest_x18: usize,            // offset 40 ★ KEY FOR WINDOWS
+}
+`
+
+**Offset Constants (Lines 595-625):**
+`ust
+const fn tcb_offset_scratch() -> isize { 0 }
+const fn tcb_offset_host_sp() -> isize { 8 }
+const fn tcb_offset_guest_context_top() -> isize { 16 }
+const fn tcb_offset_guest_tpidr() -> isize { 24 }     // ★ LINE 611
+const fn tcb_offset_in_guest() -> isize { 32 }
+const fn tcb_offset_interrupt() -> isize { 33 }
+const fn tcb_offset_guest_x18() -> isize { 40 }      // ★ LINE 624
+`
+
+---
+
+## 3. TLS TABLE REGISTRATION - MACOS
+### File: litebox_platform_macos_userland/src/lib.rs
+
+**3A. TLS Table Constants (Lines 2360-2375):**
+`ust
+/// TLS lookup table entry format: [TPIDRRO_EL0: u64, host_tls_ptr: u64]
+/// Uses linear scan matching trampoline assembly.
+///
+/// Key is TPIDRRO_EL0 (stable per-pthread, never clobbered by XNU).
+/// Sentinel: 0xFFFF_FFFF_FFFF_FFFF (marks end of valid entries)
+/// Tombstone: 0 (marks freed slots, can be reclaimed)
+/// Thread-safe slot claiming: AtomicU64::compare_exchange
+
+const TLS_TABLE_ENTRIES: usize = 256;
+const TLS_TABLE_SENTINEL: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+`
+
+**3B. Register Thread in TLS Table - update_host_tls_entry() (Lines 2377-2446)**
+
+Called BEFORE entering guest code on every switch_to_guest.
+
+**Full Implementation:**
+`ust
+fn update_host_tls_entry() {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    let table_addr = litebox_common_linux::HOST_TLS_TABLE_ADDR.load(Ordering::Acquire);
+    if table_addr == 0 {
+        return; // No TLS table allocated
+    }
+
+    let tcb = TCB_PTR.get();
+    assert!(!tcb.is_null(), "update_host_tls_entry called without TCB");
+    let host_tls = tcb as usize;  // TCB pointer is the host_tls value
+
+    // TPIDRRO_EL0: lookup key (stable per-pthread, XNU never clobbers)
+    let tpidrro = unsafe { litebox_common_linux::read_tpidrro_el0() } as u64;
+
+    'retry: loop {
+        let mut first_free: Option<usize> = None;
+
+        // Linear scan to match trampoline assembly lookup
+        for index in 0..TLS_TABLE_ENTRIES {
+            // Entry at [index*16, index*16+8]: [key, value]
+            let key_ptr = unsafe { &*((table_addr + index * 16) as *const AtomicU64) };
+            let stored_key = key_ptr.load(Ordering::Acquire);
+
+            if stored_key == tpidrro {
+                // Found existing entry for this thread
+                let val_ptr = (table_addr + index * 16 + 8) as *mut u64;
+                unsafe { val_ptr.write_volatile(host_tls as u64) };
+                return;
+            }
+
+            if stored_key == TLS_TABLE_SENTINEL {
+                // End of valid entries
+                if first_free.is_none() {
+                    first_free = Some(index);
+                }
+                break;
+            }
+
+            // Tombstone (key=0): previously freed slot, remember as candidate
+            if stored_key == 0 && first_free.is_none() {
+                first_free = Some(index);
+            }
+        }
+
+        // Claim first available slot via CAS
+        let free_index = first_free.expect("TLS table full: exceeded 256 concurrent threads");
+        let key_ptr = unsafe { &*((table_addr + free_index * 16) as *const AtomicU64) };
+        let val_ptr = (table_addr + free_index * 16 + 8) as *mut u64;
+
+        let current = key_ptr.load(Ordering::Acquire);
+
+        // Only CAS on sentinel or tombstone slots
+        if current != TLS_TABLE_SENTINEL && current != 0 {
+            continue 'retry; // Another thread claimed it, rescan
+        }
+
+        // Atomic CAS: claim slot
+        if key_ptr
+            .compare_exchange(current, tpidrro, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            // Success: write host_tls value
+            unsafe { val_ptr.write_volatile(host_tls as u64) };
+            return;
+        }
+        // CAS failed, rescan
+    }
+}
+`
+
+**3C. Called Before Guest Entry (Lines 2544-2550):**
+`ust
+// In call_shim() method, after handling shim callbacks:
+ContinueOperation::Resume => {
+    update_host_tls_entry();  // ★ REGISTER THREAD IN TLS TABLE
+    
+    // Pass TCB explicitly to switch_to_guest
+    // Do NOT write TPIDR_EL0 here
+    unsafe { switch_to_guest(self.ctx, tcb) }
+}
+`
+
+---
+
+## 4. SWITCH TO GUEST - macOS
+### File: litebox_platform_macos_userland/src/lib.rs (Lines 1114-1221)
+
+**Assembly Entry Point (Lines 1114-1221):**
+- Takes 2 arguments: x0 = PtRegs, x1 = TCB pointer
+- Sets TPIDR_EL0 to guest_tpidr BEFORE branch to guest
+- Restores full register state including x18
+
+**Key Assembly Sequence (simplified):**
+`sm
+_switch_to_guest_start:
+    // Check for pending interrupts
+    mov w16, #1
+    strb w16, [x1, #32]           // Set TCB.in_guest = 1 (x1=TCB, offset 32)
+    ldrb w17, [x1, #33]           // Load TCB.interrupt
+    cbnz w17, interrupt_path       // Jump if interrupt pending
+    
+    // Restore guest registers from PtRegs (x0)
+    ldp x2,  x3,  [x0, #16]       // and so on...
+    
+    // Load guest_tpidr from TCB and set TPIDR_EL0
+    // (This would be at TCB offset 24 per the TCB struct)
+    ldr x16, [x1, #24]            // x16 = TCB.guest_tpidr
+    msr tpidr_el0, x16            // ★ SET GUEST TPIDR_EL0
+    
+    // Load guest_x18 from TCB (offset 40)
+    ldr x17, [x1, #40]            // x17 = TCB.guest_x18
+    str x17, [x0, #144]           // Store to PtRegs.regs[18]
+    
+    // Restore SP and branch to guest PC
+    mov sp, x17                   // Set guest SP
+    br x16                        // Jump to guest
+`
+
+**macOS Platform Differences:**
+- TCB passed explicitly in x1 (not read from TPIDR_EL0)
+- TPIDR_EL0 written ONLY here and only with guest value
+- Host code uses TPIDRRO_EL0 (not TPIDR_EL0) for TLS lookup
+- x18 fully virtualized; never restored to physical register
+
+---
+
+## 5. TLS TABLE LOOKUP - Linux Userland
+### File: litebox_platform_linux_userland/src/lib.rs (Lines 2125-2168)
+
+**Update TLS Entry (Lines 2125-2168):**
+`ust
+#[cfg(target_arch = "aarch64")]
+fn update_host_tls_entry() {
+    use core::sync::atomic::Ordering;
+
+    let table_addr = litebox_common_linux::HOST_TLS_TABLE_ADDR.load(Ordering::Acquire);
+    if table_addr == 0 {
+        return; // No TLS table allocated
+    }
+
+    // Read current host TPIDR_EL0 (= host TLS base)
+    let host_tls: usize;
+    unsafe {
+        core::arch::asm!("mrs {}, tpidr_el0", out(reg) host_tls, options(nostack, preserves_flags));
+    }
+
+    // Read guest_tpidr from thread-local
+    let guest_tpidr = get_guest_tpidr();
+
+    let sentinel: u64 = 0xFFFFFFFFFFFFFFFF;
+    let table = table_addr as *mut u64;
+
+    // Linear scan from index 0
+    for index in 0..TLS_TABLE_ENTRIES {
+        let entry = unsafe { table.add(index * 2) };
+        let stored_guest_tpidr = unsafe { entry.read_volatile() };
+
+        if stored_guest_tpidr == guest_tpidr as u64 {
+            // Found existing entry - update host_tls
+            unsafe { entry.add(1).write_volatile(host_tls as u64) };
+            return;
+        }
+
+        if stored_guest_tpidr == sentinel {
+            // Found free slot - claim it
+            unsafe {
+                entry.write_volatile(guest_tpidr as u64);
+                entry.add(1).write_volatile(host_tls as u64);
+            }
+            return;
+        }
+    }
+
+    panic!("TLS table full: exceeded {TLS_TABLE_ENTRIES} concurrent threads");
+}
+`
+
+**Key Differences from macOS:**
+- Linux has kernel TLS preservation; TPIDR_EL0 remains stable
+- Uses guest_tpidr as key (stored in thread-local via TPREL relocations)
+- Simpler CAS logic (no tombstones, just sentinel end-marker)
+- Called with same update_host_tls_entry() function
+
+---
+
+## 6. THREAD-LOCAL TLS ACCESS - Linux
+### File: litebox_platform_linux_userland/src/lib.rs (Lines 485-516)
+
+**Set Guest TPIDR (Lines 485-498):**
+`ust
+fn set_guest_tpidr(value: usize) {
+    unsafe {
+        core::arch::asm! {
+            "mrs {tmp}, tpidr_el0",                    // Read host TPIDR_EL0
+            "movz {tmp2}, #:tprel_g1:guest_tpidr",   // High bits of offset
+            "movk {tmp2}, #:tprel_g0_nc:guest_tpidr", // Low bits of offset
+            "str {val}, [{tmp}, {tmp2}]",              // Store to host_TPIDR + offset
+            val = in(reg) value,
+            tmp = out(reg) _,
+            tmp2 = out(reg) _,
+            options(nostack, preserves_flags)
+        }
+    }
+}
+`
+
+**Get Guest TPIDR (Lines 501-516):**
+`ust
+#[cfg(target_arch = "aarch64")]
+fn get_guest_tpidr() -> usize {
+    let value: usize;
+    unsafe {
+        core::arch::asm! {
+            "mrs {tmp}, tpidr_el0",                    // Read host TPIDR_EL0
+            "movz {tmp2}, #:tprel_g1:guest_tpidr",   // High bits of offset
+            "movk {tmp2}, #:tprel_g0_nc:guest_tpidr", // Low bits of offset
+            "ldr {val}, [{tmp}, {tmp2}]",              // Load from host_TPIDR + offset
+            val = out(reg) value,
+            tmp = out(reg) _,
+            tmp2 = out(reg) _,
+            options(nostack, preserves_flags)
+        }
+    }
+    value
+}
+`
+
+**Uses TPREL relocations** to access guest_tpidr relative to host TPIDR_EL0.
+
+---
+
+## 7. THREAD CLEANUP - macOS
+### File: litebox_platform_macos_userland/src/lib.rs (Lines 2461-2507)
+
+**Remove Entry When Thread Exits (Lines 2461-2507):**
+`ust
+fn remove_host_tls_entries() {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    let table_addr = litebox_common_linux::HOST_TLS_TABLE_ADDR.load(Ordering::Acquire);
+    if table_addr == 0 {
+        return;
+    }
+
+    let tpidrro = unsafe { litebox_common_linux::read_tpidrro_el0() } as u64;
+
+    for index in 0..TLS_TABLE_ENTRIES {
+        let key_ptr = unsafe { &*((table_addr + index * 16) as *const AtomicU64) };
+        let stored_key = key_ptr.load(Ordering::Acquire);
+
+        if stored_key == tpidrro {
+            // Found our entry — replace with tombstone (0)
+            // Tombstone allows entries beyond to remain discoverable
+            // (scanner only stops at sentinel, not tombstone)
+            key_ptr.store(0, Ordering::Release);
+            return;
+        }
+
+        if stored_key == TLS_TABLE_SENTINEL {
+            // End of table without finding entry
+            return;
+        }
+    }
+}
+`
+
+**Called at (Line 865):**
+`ust
+// In run_thread_inner, before TCB is freed:
+remove_host_tls_entries();  // ★ CLEANUP ON THREAD EXIT
+`
+
+---
+
+## 8. WINDOWS ARM64 IMPLEMENTATION GUIDANCE
+
+### Key Takeaways:
+
+1. **TLS Table Initialization**: Identical to Linux
+   - Allocate 4 KB table with 256 entries of 16 bytes each
+   - Initialize with sentinel 0xFFFFFFFFFFFFFFFF
+   - Store address in HOST_TLS_TABLE_ADDR atomic
+
+2. **TCB Structure for Windows**:
+   - MUST match macOS/Linux layout exactly
+   - guest_tpidr at offset 24
+   - guest_x18 at offset 40
+   - host_sp at offset 8 (for stack restoration)
+
+3. **Before Guest Entry (on every switch_to_guest)**:
+   - Call equivalent of update_host_tls_entry()
+   - Register current thread's TPIDRRO_EL0 → TCB mapping
+   - Use atomic CAS for concurrent threads (like macOS)
+   - Scan linearly like trampoline does
+
+4. **TCB as Key vs Value**:
+   - macOS: Uses TPIDRRO_EL0 as KEY, TCB pointer as VALUE
+   - Linux: Uses guest_tpidr as KEY, host TPIDR_EL0 as VALUE
+   - Windows: Should follow macOS model (TPIDRRO_EL0 is stable per-thread)
+
+5. **Assembly Entry Points**:
+   - Read guest_tpidr from TCB offset 24
+   - Write to TPIDR_EL0 (only place for guest TPIDR)
+   - Read guest_x18 from TCB offset 40
+   - Use TCB pointer explicitly (not TPIDR_EL0)
+
+6. **Thread Cleanup on Exit**:
+   - Remove TLS table entry when thread exits
+   - Use tombstone (0 key) to allow higher entries to be found
+   - Reclaim tombstone slots via CAS in update_host_tls_entry()
