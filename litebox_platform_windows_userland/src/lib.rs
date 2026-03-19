@@ -60,6 +60,12 @@ thread_local! {
     static THREAD_TPIDR: Cell<usize> = const { Cell::new(0) };
 }
 
+// Diagnostic: track main_arena address to monitor malloc initialization.
+// Set when we first detect libc's .data segment (from the mprotect RELRO pattern).
+#[cfg(target_arch = "aarch64")]
+static DIAG_MAIN_ARENA_ADDR: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// The userland Windows platform.
 ///
 /// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
@@ -234,12 +240,39 @@ unsafe extern "system" fn vectored_exception_handler(
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
             }
-            // PAGE_NOACCESS (PROT_NONE) pages are NOT auto-upgraded.
-            // On Linux, accessing PROT_NONE pages delivers SIGSEGV — the
-            // kernel does not restore the mapping. Fall through to deliver
-            // the fault to the guest as an exception (matching Linux behavior).
-            // glibc relies on PROT_NONE for arena guard pages; silently
-            // upgrading them would mask heap corruption.
+            // Committed but PAGE_NOACCESS — the guest accessed a page that
+            // was set to PROT_NONE via mprotect. Restore access so the guest
+            // can continue. On Linux, the kernel would deliver SIGSEGV, but
+            // the guest dynamic linker and libc may rely on accessing pages
+            // in the PROT_NONE gap between segments (e.g., during relocation).
+            //
+            // TODO: distinguish between intentional guard pages (should SIGSEGV)
+            // and decommit-remnant pages (should auto-commit). For now, always
+            // upgrade to avoid crashing during library loading.
+            if ok
+                && mbi.State == Win32_Memory::MEM_COMMIT
+                && mbi.Protect == Win32_Memory::PAGE_NOACCESS
+            {
+                let rw = exception_record.ExceptionInformation[0];
+                let new_prot = if rw == 8 {
+                    Win32_Memory::PAGE_EXECUTE_READ
+                } else {
+                    Win32_Memory::PAGE_READWRITE
+                };
+                let mut old_prot: u32 = 0;
+                let ok = unsafe {
+                    Win32_Memory::VirtualProtect(
+                        page_addr as *mut c_void,
+                        0x1000,
+                        new_prot,
+                        &raw mut old_prot,
+                    ) != 0
+                };
+                if ok {
+                    tls.is_in_guest.set(true);
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
         }
         // Log unhandled guest exception — TEB stack limits already restored so
         // eprintln is safe here.
@@ -250,13 +283,98 @@ unsafe extern "system" fn vectored_exception_handler(
         } else {
             0
         };
+        let x_regs = unsafe { &context.Anonymous.X };
         let _ = writeln!(
             std::io::stderr(),
-            "[winarm64] guest exc: code={:#x} pc={:#x} addr={:#x}",
+            "[winarm64] guest exc: code={:#x} pc={:#x} addr={:#x}\n\
+             [winarm64]   x0={:#x} x1={:#x} x2={:#x} x3={:#x}\n\
+             [winarm64]   x4={:#x} x5={:#x} x6={:#x} x7={:#x}\n\
+             [winarm64]   x19={:#x} x20={:#x} x25={:#x} x28={:#x}\n\
+             [winarm64]   sp={:#x} lr={:#x} tpidr_el0={:#x}",
             exception_record.ExceptionCode,
             pc,
             addr,
+            x_regs[0],
+            x_regs[1],
+            x_regs[2],
+            x_regs[3],
+            x_regs[4],
+            x_regs[5],
+            x_regs[6],
+            x_regs[7],
+            x_regs[19],
+            x_regs[20],
+            x_regs[25],
+            x_regs[28],
+            context.Sp,
+            x_regs[30],
+            THREAD_TPIDR.get(),
         );
+        // If this looks like a NULL-dereference (addr < 0x1000), dump arena
+        // memory around x25 (the arena/malloc_state pointer in _int_malloc).
+        if addr < 0x1000 {
+            let av = x_regs[25] as usize;
+            // Store arena address for per-syscall monitoring
+            DIAG_MAIN_ARENA_ADDR.store(av, std::sync::atomic::Ordering::Relaxed);
+            if av > 0x10000 {
+                // Probe arena memory — read bins[0..3] (offsets 112-144 from av)
+                // These are the unsorted bin fd/bk entries that should be non-zero
+                // after malloc_init_state.
+                let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+                let ok = unsafe {
+                    Win32_Memory::VirtualQuery(
+                        av as *const c_void,
+                        &raw mut mbi,
+                        core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+                    ) != 0
+                };
+                if ok && mbi.State == Win32_Memory::MEM_COMMIT {
+                    // Safe to read — dump key offsets
+                    let read_u64 = |off: usize| -> u64 {
+                        unsafe { ((av + off) as *const u64).read_volatile() }
+                    };
+                    // Write-test: verify the memory is truly writable
+                    let canary: u64 = 0xDEAD_BEEF_CAFE_F00D;
+                    let write_ok = if mbi.Protect == Win32_Memory::PAGE_READWRITE {
+                        unsafe {
+                            ((av + 120) as *mut u64).write_volatile(canary);
+                            ((av + 120) as *const u64).read_volatile() == canary
+                        }
+                    } else {
+                        false
+                    };
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "[winarm64] arena probe av={:#x} state={:#x} protect={:#x} write_ok={}\n\
+                         [winarm64]   [av+96]={:#x} [av+104]={:#x} [av+112]={:#x} [av+120]={:#x}\n\
+                         [winarm64]   [av+0]={:#x} [av+8]={:#x} [av+16]={:#x} [av+24]={:#x}\n\
+                         [winarm64]   alloc_base={:#x} alloc_prot={:#x} region_sz={:#x}",
+                        av,
+                        mbi.State,
+                        mbi.Protect,
+                        write_ok,
+                        read_u64(96),
+                        read_u64(104),
+                        read_u64(112),
+                        read_u64(120),
+                        read_u64(0),
+                        read_u64(8),
+                        read_u64(16),
+                        read_u64(24),
+                        mbi.AllocationBase as usize,
+                        mbi.AllocationProtect,
+                        mbi.RegionSize,
+                    );
+                } else {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "[winarm64] arena probe av={:#x}: not committed (state={:#x})",
+                        av,
+                        if ok { mbi.State } else { 0 }
+                    );
+                }
+            }
+        }
     }
 
     let regs = unsafe { &mut *tls.guest_context_top.get().wrapping_sub(1) };
@@ -1282,8 +1400,75 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         // in the table is also guest_tpidr). The MRS gate reads entry[0].key
         // as the guest TPIDR value. Both return the same value, which is the
         // guest's actual virtual TPIDR.
+        let tpidr_val = THREAD_TPIDR.get();
+        #[cfg(target_arch = "aarch64")]
+        if tpidr_val == 0 {
+            eprintln!(
+                "[switch_to_guest] WARNING: TPIDR_EL0=0 (uninitialized), guest pc={:#x}",
+                ctx.pc
+            );
+        }
+        // DIAG: arena watchpoint — detect when bins transition from nonzero to zero.
+        {
+            let arena_page = DIAG_MAIN_ARENA_ADDR.load(std::sync::atomic::Ordering::Relaxed);
+            if arena_page != 0 {
+                // main_arena is at arena_page + 0xa70 (glibc typical offset).
+                // bins[0] fd is at main_arena + 112, bins[0] bk at +120.
+                let av = arena_page + 0xa70;
+                let bins0_fd = unsafe { ((av + 112) as *const u64).read_volatile() };
+                let bins0_bk = unsafe { ((av + 120) as *const u64).read_volatile() };
+                let top = unsafe { ((av + 96) as *const u64).read_volatile() };
+                // Static tracking: detect init→zero transition
+                thread_local! {
+                    static PREV_BINS0: Cell<u64> = const { Cell::new(0) };
+                }
+                let prev = PREV_BINS0.get();
+                if prev != 0 && bins0_fd == 0 {
+                    eprintln!(
+                        "[arena-watch] BINS ZEROED! prev_fd={:#x} now_fd={:#x} top={:#x} pc={:#x}",
+                        prev, bins0_fd, top, ctx.pc
+                    );
+                }
+                if bins0_fd != 0 && prev == 0 {
+                    eprintln!(
+                        "[arena-watch] BINS INITIALIZED! fd={:#x} bk={:#x} top={:#x} pc={:#x}",
+                        bins0_fd, bins0_bk, top, ctx.pc
+                    );
+                }
+                PREV_BINS0.set(bins0_fd);
+            }
+        }
+        // DIAG: check __malloc_initialized and bins state.
+        // __malloc_initialized is at av + 0x5CC5 (delta from main_arena to __malloc_initialized).
+        // av = libc_base + 0x200a70, __malloc_initialized = libc_base + 0x206735.
+        {
+            let arena_page = DIAG_MAIN_ARENA_ADDR.load(std::sync::atomic::Ordering::Relaxed);
+            if arena_page != 0 {
+                let av = arena_page + 0xa70;
+                let malloc_init_addr = av + 0x5CC5;
+                let malloc_init_val = unsafe { (malloc_init_addr as *const u8).read_volatile() };
+                let bins_fd = unsafe { ((av + 112) as *const u64).read_volatile() };
+                if bins_fd == 0 || bins_fd == 0xCAFE_0001 {
+                    if bins_fd == 0 {
+                        unsafe {
+                            ((av + 112) as *mut u64).write_volatile(0xCAFE_0001);
+                            ((av + 120) as *mut u64).write_volatile(0xCAFE_0002);
+                        }
+                    }
+                    eprintln!(
+                        "[arena-canary] bins_fd={:#x} __malloc_initialized={} addr={:#x} pc={:#x}",
+                        bins_fd, malloc_init_val, malloc_init_addr, ctx.pc
+                    );
+                } else {
+                    eprintln!(
+                        "[arena-canary] bins SET! fd={:#x} init={} pc={:#x}",
+                        bins_fd, malloc_init_val, ctx.pc
+                    );
+                }
+            }
+        }
         unsafe {
-            litebox_common_linux::write_tpidr_el0(THREAD_TPIDR.get());
+            litebox_common_linux::write_tpidr_el0(tpidr_val);
         }
 
         tls.is_in_guest.set(true);
@@ -2092,6 +2277,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             {
                 return Err(AllocationError::AddressInUse);
             } else {
+                #[cfg(target_arch = "aarch64")]
+                let (range_start, range_end) = (suggested_range.start, suggested_range.end);
                 process_memory_range_by_regions(
                     suggested_range,
                     |r, state| -> Result<bool, std::convert::Infallible> {
@@ -2105,6 +2292,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                         fixed_address_behavior,
                                         FixedAddressBehavior::Replace,
                                         "raced with another memory allocator"
+                                    );
+                                    #[cfg(target_arch = "aarch64")]
+                                    eprintln!(
+                                        "[decommit] {:#x}..{:#x} (in alloc Replace)",
+                                        r.start, r.end
                                     );
                                     let decommit_ok = unsafe {
                                         VirtualFree(
@@ -2151,6 +2343,15 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     },
                 )
                 .unwrap();
+                #[cfg(target_arch = "aarch64")]
+                eprintln!(
+                    "[alloc] range={:#x}..{:#x} perm={:?} behavior={:?} result={:#x}",
+                    range_start,
+                    range_end,
+                    initial_permissions,
+                    fixed_address_behavior,
+                    base_addr as usize
+                );
                 return Ok(UserMutPtr::from_ptr(base_addr.cast()));
             }
         }
@@ -2168,6 +2369,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         if populate_pages_immediately {
             do_prefetch_on_range(ptr as usize, size);
         }
+        #[cfg(target_arch = "aarch64")]
+        eprintln!(
+            "[alloc] range={:#x}..{:#x} perm={:?} behavior=Hint result={:#x}",
+            suggested_range.start, suggested_range.end, initial_permissions, ptr as usize
+        );
         Ok(UserMutPtr::from_ptr(ptr.cast::<u8>()))
     }
 
@@ -2176,6 +2382,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         range: core::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
         debug_assert_alignment!(range, ALIGN);
+        #[cfg(target_arch = "aarch64")]
+        eprintln!("[dealloc] range={:#x}..{:#x}", range.start, range.end);
         process_memory_range_by_regions(
             range,
             |r, state| -> Result<bool, std::convert::Infallible> {
@@ -2201,6 +2409,25 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         new_permissions: MemoryRegionPermissions,
     ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
         debug_assert_alignment!(range, ALIGN);
+        #[cfg(target_arch = "aarch64")]
+        eprintln!(
+            "[perm] range={:#x}..{:#x} new={:?}",
+            range.start, range.end, new_permissions
+        );
+        // DIAG: detect main_arena page from RELRO mprotect.
+        // Always update — later RELRO mprotects override earlier ones.
+        // The libc RELRO range.end is the page containing main_arena.
+        #[cfg(target_arch = "aarch64")]
+        if new_permissions == MemoryRegionPermissions::READ
+            && range.end >= 0x7fffff400000
+            && range.end <= 0x7fffff600000
+        {
+            DIAG_MAIN_ARENA_ADDR.store(range.end, std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "[arena-diag] set arena page={:#x} (mprotect(R) {:#x}..{:#x})",
+                range.end, range.start, range.end
+            );
+        }
         let flags = prot_flags(new_permissions);
         process_memory_range_by_regions(
             range.clone(),
@@ -2632,6 +2859,38 @@ impl ThreadContext<'_> {
                                     header_tls_ptr,
                                     table_addr
                                 );
+                            }
+                        }
+
+                        // DIAG: monitor main_arena initialization.
+                        // Track the page detected after RELRO. main_arena
+                        // is at an offset within this page. Check if any
+                        // writes have happened to the bins area.
+                        let arena_page =
+                            DIAG_MAIN_ARENA_ADDR.load(std::sync::atomic::Ordering::Relaxed);
+                        if arena_page != 0 {
+                            // Scan for non-zero content in the expected arena region.
+                            // main_arena.bins starts at arena+112 or arena+0xa70+112.
+                            // Just dump the whole page's first sign of life.
+                            let mut any_nonzero = false;
+                            for off in (0..0x1000).step_by(8) {
+                                let v =
+                                    unsafe { ((arena_page + off) as *const u64).read_volatile() };
+                                if v != 0 {
+                                    if !any_nonzero {
+                                        use std::io::Write;
+                                        let _ = writeln!(
+                                            std::io::stderr(),
+                                            "[arena-diag] page {:#x} has data! first nonzero at +{:#x}={:#x} (syscall return pc={:#x})",
+                                            arena_page,
+                                            off,
+                                            v,
+                                            self.ctx.pc
+                                        );
+                                    }
+                                    any_nonzero = true;
+                                    break;
+                                }
                             }
                         }
                     }
