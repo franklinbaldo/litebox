@@ -794,6 +794,14 @@ impl<FS: ShimFS> Task<FS> {
     /// child exit promptly interrupts `epoll_pwait`/`futex` instead of
     /// sleeping until the timeout expires.
     pub(crate) fn drain_cross_process_signals(&self) {
+        // Fast path: skip the global lock when no cross-process signals exist.
+        if !self
+            .global
+            .has_cross_process_signals
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
         let my_id = self.process_id.0;
         let mut queue = self.global.cross_process_signals.lock();
         let mut i = 0;
@@ -808,6 +816,11 @@ impl<FS: ShimFS> Task<FS> {
             } else {
                 i += 1;
             }
+        }
+        if queue.is_empty() {
+            self.global
+                .has_cross_process_signals
+                .store(false, core::sync::atomic::Ordering::Release);
         }
     }
 

@@ -714,6 +714,9 @@ impl<FS: ShimFS> Task<FS> {
                                     siginfo,
                                 },
                             );
+                            self.global
+                                .has_cross_process_signals
+                                .store(true, core::sync::atomic::Ordering::Release);
 
                             // Interrupt the parent so it processes the signal.
                             let handles = self.global.process_thread_handles.read();
