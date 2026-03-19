@@ -605,11 +605,25 @@ impl RawDescriptorStorage {
         &mut self,
         fd: TypedFd<Subsystem>,
     ) -> usize {
+        self.fd_into_raw_integer_min(fd, 0)
+    }
+
+    /// Like [`Self::fd_into_raw_integer`] but starts searching from `min_fd`.
+    ///
+    /// This is used by `F_DUPFD` / `F_DUPFD_CLOEXEC` which require the new fd
+    /// to be >= a caller-specified minimum.
+    pub fn fd_into_raw_integer_min<Subsystem: FdEnabledSubsystem>(
+        &mut self,
+        fd: TypedFd<Subsystem>,
+        min_fd: usize,
+    ) -> usize {
         let ret = self
             .stored_fds
             .iter()
-            .position(Option::is_none)
-            .unwrap_or(self.stored_fds.len());
+            .enumerate()
+            .skip(min_fd)
+            .find_map(|(i, slot)| slot.is_none().then_some(i))
+            .unwrap_or(self.stored_fds.len().max(min_fd));
         let success = self.fd_into_specific_raw_integer(fd, ret);
         assert!(success);
         ret

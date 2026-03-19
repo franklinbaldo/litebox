@@ -1488,14 +1488,6 @@ impl<FS: ShimFS> Task<FS> {
                     .flatten()
             }
             FcntlArg::DUPFD { cloexec, min_fd } => {
-                let new_file = self.do_dup(
-                    desc,
-                    if cloexec {
-                        OFlags::CLOEXEC
-                    } else {
-                        OFlags::empty()
-                    },
-                )?;
                 let max_fd = self
                     .process()
                     .limits
@@ -1503,10 +1495,16 @@ impl<FS: ShimFS> Task<FS> {
                 if min_fd as usize >= max_fd {
                     return Err(Errno::EINVAL);
                 }
-                if new_file < min_fd as usize || new_file > max_fd {
-                    self.do_close(new_file)?;
-                    return Err(Errno::EMFILE);
-                }
+                let new_file = self.do_dup_inner(
+                    desc,
+                    if cloexec {
+                        OFlags::CLOEXEC
+                    } else {
+                        OFlags::empty()
+                    },
+                    None,
+                    min_fd as usize,
+                )?;
                 Ok(new_file.try_into().unwrap())
             }
             _ => unimplemented!(),
@@ -2672,7 +2670,7 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     fn do_dup(&self, file: usize, flags: OFlags) -> Result<usize, Errno> {
-        self.do_dup_inner(file, flags, None)
+        self.do_dup_inner(file, flags, None, 0)
     }
 
     fn do_dup_inner(
@@ -2680,6 +2678,7 @@ impl<FS: ShimFS> Task<FS> {
         file: usize,
         flags: OFlags,
         target: Option<usize>,
+        min_fd: usize,
     ) -> Result<usize, Errno> {
         fn dup<FS: ShimFS, S: FdEnabledSubsystem>(
             global: &GlobalState<FS>,
@@ -2687,6 +2686,7 @@ impl<FS: ShimFS> Task<FS> {
             fd: &TypedFd<S>,
             close_on_exec: bool,
             target: Option<usize>,
+            min_fd: usize,
         ) -> Result<usize, Errno> {
             let mut dt = global.litebox.descriptor_table_mut();
             let fd: TypedFd<_> = dt.duplicate(fd).ok_or(Errno::EBADF)?;
@@ -2701,19 +2701,19 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 Ok(target)
             } else {
-                Ok(rds.fd_into_raw_integer(fd))
+                Ok(rds.fd_into_raw_integer_min(fd, min_fd))
             }
         }
         let close_on_exec = flags.contains(OFlags::CLOEXEC);
         let files = self.files.borrow();
         let new_fd = files.run_on_raw_fd(
             file,
-            |fd| dup(&self.global, &files, fd, close_on_exec, target),
-            |fd| dup(&self.global, &files, fd, close_on_exec, target),
-            |fd| dup(&self.global, &files, fd, close_on_exec, target),
-            |fd| dup(&self.global, &files, fd, close_on_exec, target),
-            |fd| dup(&self.global, &files, fd, close_on_exec, target),
-            |fd| dup(&self.global, &files, fd, close_on_exec, target),
+            |fd| dup(&self.global, &files, fd, close_on_exec, target, min_fd),
+            |fd| dup(&self.global, &files, fd, close_on_exec, target, min_fd),
+            |fd| dup(&self.global, &files, fd, close_on_exec, target, min_fd),
+            |fd| dup(&self.global, &files, fd, close_on_exec, target, min_fd),
+            |fd| dup(&self.global, &files, fd, close_on_exec, target, min_fd),
+            |fd| dup(&self.global, &files, fd, close_on_exec, target, min_fd),
         )??;
         if target.is_none() {
             let max_fd = self
@@ -2826,6 +2826,7 @@ impl<FS: ShimFS> Task<FS> {
                 oldfd_usize,
                 flags.unwrap_or(OFlags::empty()),
                 Some(newfd_usize),
+                0,
             )?;
             self.maybe_trace_pty_dup(oldfd, newfd);
             Ok(newfd)
