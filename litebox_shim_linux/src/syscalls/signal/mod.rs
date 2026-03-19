@@ -805,9 +805,11 @@ impl<FS: ShimFS> Task<FS> {
         let my_id = self.process_id.0;
         let mut queue = self.global.cross_process_signals.lock();
         let mut i = 0;
+        let mut drained_any = false;
         while i < queue.len() {
             if queue[i].target_process_id == my_id {
                 let sig = queue.swap_remove(i);
+                drained_any = true;
                 self.signals.shared_pending.lock().push(
                     &self.process().limits,
                     sig.signal,
@@ -821,6 +823,15 @@ impl<FS: ShimFS> Task<FS> {
             self.global
                 .has_cross_process_signals
                 .store(false, core::sync::atomic::Ordering::Release);
+        }
+        // Update the shared_pending_hint so that has_pending_signals() can
+        // detect the newly-enqueued signals via the lock-free fast path.
+        if drained_any {
+            let shared = self.signals.shared_pending.lock();
+            self.signals.shared_pending_hint.store(
+                shared.pending.as_u64(),
+                core::sync::atomic::Ordering::Release,
+            );
         }
     }
 
