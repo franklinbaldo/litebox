@@ -71,8 +71,10 @@ struct TrampolineInfo {
     file_offset: u64,
     /// Size of the trampoline code in the ELF file.
     size: usize,
-    /// The entry point to jump to in the trampoline.
+    /// The entry point to jump to in the trampoline (normal, with FP save).
     syscall_entry_point: usize,
+    /// The nofp entry point (skip FP save/restore).
+    syscall_entry_point_nofp: usize,
 }
 
 /// The magic number used to identify the LiteBox trampoline.
@@ -235,6 +237,7 @@ impl ElfParsedFile {
     ///
     /// `syscall_entry_point` is the address of the syscall entry point to write
     /// into the trampoline at map time.
+    /// `syscall_entry_point_nofp` is the nofp fast-path entry point.
     #[expect(
         clippy::missing_panics_doc,
         reason = "cannot panic: array slices are always the correct size"
@@ -243,6 +246,7 @@ impl ElfParsedFile {
         &mut self,
         file: &mut F,
         syscall_entry_point: usize,
+        syscall_entry_point_nofp: usize,
     ) -> Result<(), ElfParseError<F::Error>> {
         if syscall_entry_point == 0 {
             // Platform running in kernel mode does not need trampoline
@@ -331,6 +335,7 @@ impl ElfParsedFile {
             size: trampoline_size,
             file_offset,
             syscall_entry_point,
+            syscall_entry_point_nofp,
         });
         Ok(())
     }
@@ -558,11 +563,19 @@ impl ElfParsedFile {
             )
             .map_err(ElfLoadError::Map)?;
 
-        // Write the trampoline entry point at the start of the trampoline code.
-        // The first 8 bytes (64-bit) or 4 bytes (32-bit) are reserved for the entry point.
+        // Write the trampoline entry points at the start of the trampoline code.
+        // On 64-bit: the first 16 bytes hold two 8-byte entry points:
+        //   offset 0: normal entry (with FP save/restore)
+        //   offset 8: nofp entry (skip FP save/restore)
+        // On 32-bit: the first 4 bytes hold a single entry point (no nofp).
         mem.write(
             trampoline_start,
             &trampoline.syscall_entry_point.to_ne_bytes(),
+        )?;
+        #[cfg(target_pointer_width = "64")]
+        mem.write(
+            trampoline_start + size_of::<usize>(),
+            &trampoline.syscall_entry_point_nofp.to_ne_bytes(),
         )?;
 
         // Now that the write is done, protect the trampoline code as

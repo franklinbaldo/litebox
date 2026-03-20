@@ -23,10 +23,14 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
+use iced_x86::InstructionInfoFactory;
 use object::read::elf::{ElfFile, ProgramHeader as _};
 use object::read::{Object as _, ObjectSection as _, ObjectSymbol as _};
 use thiserror::Error;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
+
+/// Size of a single entry-point slot (8 bytes on x86-64).
+const ENTRY_POINT_SLOT_SIZE_64: usize = 8;
 
 /// Possible errors during hooking of `syscall` instructions
 #[derive(Error, Debug)]
@@ -162,10 +166,15 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     };
 
     // Build the trampoline code (without header - header goes at the end)
-    // The code starts with the syscall entry point placeholder
+    // The code starts with the syscall entry point placeholder(s).
+    // On x86-64 we reserve two 8-byte slots: [normal entry][nofp entry].
+    // On x86-32 we reserve a single 4-byte slot (nofp optimization is x86-64 only).
     let mut trampoline_data = vec![];
     let trampoline = trampoline.unwrap_or(0);
     if arch == Arch::X86_64 {
+        // Slot 0: normal entry point (with FP save/restore)
+        trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
+        // Slot 1: nofp entry point (skip FP save/restore)
         trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
     } else {
         let trampoline = u32::try_from(trampoline).map_err(|_| Error::TrampolineAddressTooLarge)?;
@@ -174,6 +183,12 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
 
     // Patch syscalls in-place in buf
     let mut syscall_insns_found = false;
+    // On x86-64 the nofp entry is at slot 1 (offset 8); on x86-32 there is no nofp.
+    let syscall_entry_addr_nofp = if arch == Arch::X86_64 {
+        trampoline_base_addr + ENTRY_POINT_SLOT_SIZE_64 as u64
+    } else {
+        trampoline_base_addr // no nofp on 32-bit
+    };
     for s in &text_sections {
         let section_data = section_slice_mut(buf, s)?;
         match hook_syscalls_in_section(
@@ -183,6 +198,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
             section_data,
             trampoline_base_addr,
             trampoline_base_addr, // entry point is at offset 0 of trampoline
+            syscall_entry_addr_nofp,
             dl_sysinfo_int80,
             &mut trampoline_data,
         ) {
@@ -287,7 +303,10 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
 /// * `trampoline_write_vaddr` — virtual address where the returned stub bytes
 ///   will be placed by the caller.
 /// * `syscall_entry_addr` — address of the 8-byte entry-point value that
-///   each stub's indirect jump targets.
+///   each stub's indirect jump targets (normal path, with FP save/restore).
+/// * `syscall_entry_addr_nofp` — address of the 8-byte entry-point value for
+///   the fast path (skips FP save/restore). Used for syscall sites in functions
+///   that don't use FP/SIMD registers.
 ///
 /// # Returns
 ///
@@ -299,6 +318,7 @@ pub fn patch_code_segment(
     code_vaddr: u64,
     trampoline_write_vaddr: u64,
     syscall_entry_addr: u64,
+    syscall_entry_addr_nofp: u64,
 ) -> Result<Vec<u8>> {
     let arch = Arch::X86_64; // runtime patching is x86-64 only
 
@@ -320,6 +340,7 @@ pub fn patch_code_segment(
         code,
         trampoline_write_vaddr,
         syscall_entry_addr,
+        syscall_entry_addr_nofp,
         None, // dl_sysinfo_int80 — not applicable on x86-64
         &mut trampoline_data,
     ) {
@@ -415,11 +436,85 @@ enum Arch {
     X86_64,
 }
 
+/// Returns `true` if `reg` is a floating-point, SIMD, or mask register whose
+/// presence implies the function uses FP/SIMD state that must be
+/// preserved across a syscall.
+fn is_fp_simd_register(reg: iced_x86::Register) -> bool {
+    use iced_x86::Register;
+    // XMM0–XMM31, YMM0–YMM31, ZMM0–ZMM31
+    (reg >= Register::XMM0 && reg <= Register::XMM31)
+        || (reg >= Register::YMM0 && reg <= Register::YMM31)
+        || (reg >= Register::ZMM0 && reg <= Register::ZMM31)
+        // x87 (ST0–ST7) and MMX (MM0–MM7)
+        || (reg >= Register::ST0 && reg <= Register::ST7)
+        || (reg >= Register::MM0 && reg <= Register::MM7)
+        // AVX-512 opmask registers
+        || (reg >= Register::K0 && reg <= Register::K7)
+}
+
+/// Determines whether the "function" surrounding the syscall at `syscall_idx`
+/// uses any FP/SIMD registers.
+///
+/// We define function boundaries conservatively: scan backwards to the nearest
+/// `ret`/`int3`/`ud2`/unconditional-jump-to-elsewhere, and forwards to the
+/// nearest `ret`/`int3`/`ud2`. If any instruction in that range touches an
+/// FP/SIMD register, we return `true` (must use the slow FP-saving path).
+fn syscall_site_uses_fp(instructions: &[iced_x86::Instruction], syscall_idx: usize) -> bool {
+    // Find the start of the containing function: scan backwards from syscall_idx.
+    let func_start = {
+        let mut start = 0;
+        for j in (0..syscall_idx).rev() {
+            let flow = instructions[j].flow_control();
+            match flow {
+                iced_x86::FlowControl::Return | iced_x86::FlowControl::Exception => {
+                    // The instruction after this is the start of a new function.
+                    start = j + 1;
+                    break;
+                }
+                iced_x86::FlowControl::UnconditionalBranch => {
+                    // Unconditional jump often ends a basic block / function.
+                    start = j + 1;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        start
+    };
+
+    // Find the end of the containing function: scan forwards from syscall_idx.
+    let func_end = {
+        let mut end = instructions.len();
+        for j in (syscall_idx + 1)..instructions.len() {
+            let flow = instructions[j].flow_control();
+            if flow == iced_x86::FlowControl::Return {
+                end = j + 1; // include the ret
+                break;
+            }
+        }
+        end
+    };
+
+    // Scan all instructions in [func_start, func_end) for FP/SIMD register usage.
+    let mut info_factory = InstructionInfoFactory::new();
+    for inst in &instructions[func_start..func_end] {
+        let info = info_factory.info(inst);
+        for used_reg in info.used_registers() {
+            if is_fp_simd_register(used_reg.register()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// (private) Hook all syscalls in `section`, possibly extending `trampoline_data` to do so.
 ///
 /// `trampoline_base_addr` is the virtual address corresponding to `trampoline_data[0]`.
 /// `syscall_entry_addr` is the address of the 8-byte entry-point value that each trampoline
 /// stub jumps to (via `JMP [RIP+disp32]` on x86-64 or `CALL [EAX+disp32]` on x86-32).
+/// `syscall_entry_addr_nofp` is the nofp fast-path entry (x86-64 only; same as
+/// `syscall_entry_addr` on x86-32).
 #[allow(clippy::too_many_arguments)]
 fn hook_syscalls_in_section(
     arch: Arch,
@@ -428,6 +523,7 @@ fn hook_syscalls_in_section(
     section_data: &mut [u8],
     trampoline_base_addr: u64,
     syscall_entry_addr: u64,
+    syscall_entry_addr_nofp: u64,
     dl_sysinfo_int80: Option<u64>,
     trampoline_data: &mut Vec<u8>,
 ) -> Result<()> {
@@ -459,6 +555,14 @@ fn hook_syscalls_in_section(
         found_any = true;
         let replace_end = inst.next_ip();
 
+        // Select entry point: use the nofp fast path if the containing
+        // function doesn't reference any FP/SIMD registers.
+        let chosen_entry = if arch == Arch::X86_64 && !syscall_site_uses_fp(&instructions, i) {
+            syscall_entry_addr_nofp
+        } else {
+            syscall_entry_addr
+        };
+
         let mut replace_start = None;
         for inst_id in (0..=i).rev() {
             let prev_inst = &instructions[inst_id];
@@ -486,7 +590,7 @@ fn hook_syscalls_in_section(
                 section_base_addr,
                 section_data,
                 trampoline_base_addr,
-                syscall_entry_addr,
+                chosen_entry,
                 trampoline_data,
                 &instructions,
                 i,
@@ -529,9 +633,9 @@ fn hook_syscalls_in_section(
             // Add jmp [rip + offset_to_entry_point]
             trampoline_data.extend_from_slice(&[0xFF, 0x25]);
             // RIP after this instruction = trampoline_base_addr + trampoline_data.len() + 4
-            // We want: RIP + disp32 = syscall_entry_addr
+            // We want: RIP + disp32 = chosen_entry
             #[allow(clippy::cast_possible_wrap)]
-            let disp32 = i64::try_from(syscall_entry_addr).unwrap()
+            let disp32 = i64::try_from(chosen_entry).unwrap()
                 - i64::try_from(trampoline_base_addr).unwrap()
                 - trampoline_data.len() as i64
                 - 4;
@@ -543,9 +647,9 @@ fn hook_syscalls_in_section(
             trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
             trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
             // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
-            // We want: EAX + offset = syscall_entry_addr
+            // We want: EAX + offset = chosen_entry
             #[allow(clippy::cast_possible_wrap)]
-            let disp32 = i64::try_from(syscall_entry_addr).unwrap()
+            let disp32 = i64::try_from(chosen_entry).unwrap()
                 - i64::try_from(trampoline_base_addr).unwrap()
                 - trampoline_data.len() as i64
                 + 3;

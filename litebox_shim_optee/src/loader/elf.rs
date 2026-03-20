@@ -195,7 +195,11 @@ impl<'a> FileAndParsed<'a> {
         let file = ElfFileInMemory::new(task, elf_buf);
         let mut parsed = litebox_common_linux::loader::ElfParsedFile::parse(&mut &file)
             .map_err(ElfLoaderError::ParseError)?;
-        parsed.parse_trampoline(&mut &file, task.global.platform.get_syscall_entry_point())?;
+        parsed.parse_trampoline(
+            &mut &file,
+            task.global.platform.get_syscall_entry_point(),
+            task.global.platform.get_syscall_entry_point_nofp(),
+        )?;
         Ok(Self { file, parsed })
     }
 }

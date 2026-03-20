@@ -176,7 +176,11 @@ impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
         let file = ElfFile::new(task, path).map_err(ElfLoaderError::OpenError)?;
         let mut parsed = litebox_common_linux::loader::ElfParsedFile::parse(&mut &file)
             .map_err(ElfLoaderError::ParseError)?;
-        let _ = parsed.parse_trampoline(&mut &file, task.global.platform.get_syscall_entry_point());
+        let _ = parsed.parse_trampoline(
+            &mut &file,
+            task.global.platform.get_syscall_entry_point(),
+            task.global.platform.get_syscall_entry_point_nofp(),
+        );
         Ok(Self { file, parsed })
     }
 }

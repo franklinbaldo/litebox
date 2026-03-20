@@ -1341,6 +1341,11 @@ guest_xsave_mask_lo:
     .long 0
 guest_xsave_mask_hi:
     .long 0
+skip_fp_restore:
+    .byte 0
+    .align 4
+guest_mxcsr:
+    .long 0
 
     // NOTE: switching from .tbss to .tdata for initialized constants.
     .section .tdata
@@ -1460,6 +1465,9 @@ syscall_callback:
     // expectations of `interrupt_signal_handler`.
     mov      BYTE PTR gs:in_guest@tpoff, 0
 
+    // Mark this as a full FP save/restore path.
+    mov      BYTE PTR gs:skip_fp_restore@tpoff, 0
+
     // Save guest R11 (syscall call-site address from rewriter trampoline)
     // before it is clobbered by the fsbase/gsbase save sequence below.
     mov      gs:saved_r11@tpoff, r11
@@ -1491,6 +1499,35 @@ syscall_callback:
 
     // Restore host fs base.
     wrfsbase r11
+
+    jmp      .Lsyscall_save_regs
+
+    // Nofp fast-path entry: skip FP save, only save/restore MXCSR.
+    // Used for syscall sites in functions that don't use FP/SIMD registers.
+    .globl syscall_callback_nofp
+syscall_callback_nofp:
+    // Clear in_guest flag (must be first, see interrupt_signal_handler).
+    mov      BYTE PTR gs:in_guest@tpoff, 0
+
+    // Mark this as a nofp path.
+    mov      BYTE PTR gs:skip_fp_restore@tpoff, 1
+
+    // Save guest R11.
+    mov      gs:saved_r11@tpoff, r11
+
+    // Save guest fsbase, then get host TLS base.
+    rdfsbase r11
+    mov      gs:guest_fsbase@tpoff, r11
+    rdgsbase r11
+
+    // Skip xsave/fxsave. Just save guest MXCSR and load host default.
+    stmxcsr  gs:guest_mxcsr@tpoff
+    ldmxcsr  [r11 + default_mxcsr@tpoff]
+
+    // Restore host fs base.
+    wrfsbase r11
+
+.Lsyscall_save_regs:
 
     // Switch to the top of the guest context.
     mov     r11, rsp
@@ -1536,6 +1573,10 @@ exception_callback:
     mov     rsp, fs:host_sp@tpoff
     mov     rbp, fs:host_bp@tpoff
 
+    // Force full FP restore on next switch_to_guest (nofp path may have
+    // been active when the exception arrived).
+    mov      BYTE PTR fs:skip_fp_restore@tpoff, 0
+
     // Save guest FP/SIMD state into ctx.fp_regs and sanitize MXCSR. The host
     // kernel's sigreturn restored the CPU's FP state from the host signal frame
     // before reaching here, so the CPU FP state is the guest's original state.
@@ -1564,6 +1605,9 @@ interrupt_callback:
     // Restore the stack and frame pointer.
     mov     rsp, fs:host_sp@tpoff
     mov     rbp, fs:host_bp@tpoff
+
+    // Force full FP restore on next switch_to_guest.
+    mov      BYTE PTR fs:skip_fp_restore@tpoff, 0
 
     // Save guest FP/SIMD state into ctx.fp_regs and sanitize MXCSR.
     // Same rationale as exception_callback above.
@@ -1786,6 +1830,12 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::ExecutionContex
         // Restore guest FP/SIMD state from ctx.fp_regs BEFORE setting in_guest=1.
         // If an interrupt arrives here, handler sees in_guest=0 and IP outside
         // [switch_to_guest_start, switch_to_guest_end) → host mode (Case 2).
+        //
+        // Nofp fast-path: if skip_fp_restore is set, the syscall site didn't
+        // use FP registers, so we skip xrstor and just restore MXCSR.
+        "cmp BYTE PTR fs:skip_fp_restore@tpoff, 0",
+        "jne 4f",
+        // Full FP restore path.
         "cmp BYTE PTR fs:guest_xsave_enabled@tpoff, 0",
         "je 2f",
         "mov eax, DWORD PTR fs:guest_xsave_mask_lo@tpoff",
@@ -1794,6 +1844,11 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::ExecutionContex
         "jmp 3f",
         "2:",
         "fxrstor64 [rdi + {FP_REGS_OFFSET}]",
+        "jmp 3f",
+        // Nofp path: just restore guest MXCSR from TLS, clear the flag.
+        "4:",
+        "mov BYTE PTR fs:skip_fp_restore@tpoff, 0",
+        "ldmxcsr fs:guest_mxcsr@tpoff",
         "3:",
         "switch_to_guest_start:",
         // Set `in_guest` now, then check if there is a pending interrupt. If
@@ -3232,6 +3287,7 @@ impl litebox::platform::StdioProvider for LinuxUserland {
 unsafe extern "C" {
     // Defined in asm blocks above
     fn syscall_callback() -> isize;
+    fn syscall_callback_nofp() -> isize;
     fn exception_callback();
     fn interrupt_callback();
     fn switch_to_guest_start();
@@ -3313,6 +3369,17 @@ impl ThreadContext<'_> {
 impl litebox::platform::SystemInfoProvider for LinuxUserland {
     fn get_syscall_entry_point(&self) -> usize {
         syscall_callback as *const () as usize
+    }
+
+    fn get_syscall_entry_point_nofp(&self) -> usize {
+        #[cfg(target_arch = "x86_64")]
+        {
+            syscall_callback_nofp as *const () as usize
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            self.get_syscall_entry_point()
+        }
     }
 
     fn get_vdso_address(&self) -> Option<usize> {
@@ -3979,7 +4046,9 @@ unsafe fn interrupt_signal_handler(
     // FUTURE: handle trampoline code, too. This is somewhat less important
     // because it's probably fine for the shim to observe a guest context that
     // is inside the trampoline.
-    if ip == syscall_callback as *const () as usize {
+    if ip == syscall_callback as *const () as usize
+        || ip == syscall_callback_nofp as *const () as usize
+    {
         // No need to clear `in_guest` or set interrupt; the syscall handler will
         // clear `in_guest` and call into the shim.
         return;

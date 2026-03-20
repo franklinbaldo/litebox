@@ -871,6 +871,15 @@ pub trait SystemInfoProvider {
     /// execution context and transfer control to the syscall handler.
     fn get_syscall_entry_point(&self) -> usize;
 
+    /// Returns the address of the no-FP syscall entry point.
+    ///
+    /// This entry point skips FP/SIMD state save and restore, and is used for
+    /// syscall sites in functions that do not use FP/SIMD registers. Defaults
+    /// to the normal entry point if not overridden.
+    fn get_syscall_entry_point_nofp(&self) -> usize {
+        self.get_syscall_entry_point()
+    }
+
     /// Get the address of the VDSO (Virtual Dynamic Shared Object).
     ///
     /// Return `Some(address)` if the VDSO is available on the platform, or `None`

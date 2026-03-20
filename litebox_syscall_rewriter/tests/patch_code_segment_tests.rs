@@ -10,15 +10,18 @@ fn patch_single_syscall() {
     //                     nop   nop   nop   syscall  ret
     let mut code = vec![0x90, 0x90, 0x90, 0x0F, 0x05, 0xC3];
     let code_vaddr: u64 = 0x40_1000;
-    // Entry point at start of trampoline region, stubs follow after 8 bytes
+    // Entry point at start of trampoline region, stubs follow after 16 bytes
+    // (two 8-byte entry point slots: normal + nofp)
     let syscall_entry_addr: u64 = 0x40_2000;
-    let trampoline_write_vaddr: u64 = syscall_entry_addr + 8;
+    let syscall_entry_addr_nofp: u64 = syscall_entry_addr + 8;
+    let trampoline_write_vaddr: u64 = syscall_entry_addr + 16;
 
     let stubs = patch_code_segment(
         &mut code,
         code_vaddr,
         trampoline_write_vaddr,
         syscall_entry_addr,
+        syscall_entry_addr_nofp,
     )
     .unwrap();
 
@@ -34,7 +37,7 @@ fn patch_single_syscall() {
     // Stubs must be non-empty
     assert!(!stubs.is_empty(), "should have trampoline stubs");
 
-    // Stubs should contain a JMP [RIP+disp32] (FF 25) targeting syscall_entry_addr
+    // Stubs should contain a JMP [RIP+disp32] (FF 25) targeting one of the entry points
     let jmp_indirect_pos = stubs
         .windows(2)
         .position(|w| w == [0xFF, 0x25])
@@ -47,9 +50,9 @@ fn patch_single_syscall() {
     // RIP after = trampoline_write_vaddr + position_after_disp32
     let rip_after = trampoline_write_vaddr as i64 + jmp_indirect_pos as i64 + 6;
     let target = (rip_after + i64::from(disp32)) as u64;
-    assert_eq!(
-        target, syscall_entry_addr,
-        "indirect JMP should target entry point"
+    assert!(
+        target == syscall_entry_addr || target == syscall_entry_addr_nofp,
+        "indirect JMP should target one of the entry points, got {target:#x}",
     );
 }
 
@@ -60,7 +63,7 @@ fn no_syscalls_returns_empty() {
     let original = vec![0x90, 0x90, 0xC3];
     let mut code = original.clone();
 
-    let stubs = patch_code_segment(&mut code, 0x40_1000, 0x40_2008, 0x40_2000).unwrap();
+    let stubs = patch_code_segment(&mut code, 0x40_1000, 0x40_2010, 0x40_2000, 0x40_2008).unwrap();
 
     assert!(stubs.is_empty(), "no syscalls → no stubs");
     assert_eq!(code, original, "code should be unmodified");
@@ -88,9 +91,9 @@ fn matches_hook_syscalls_in_elf() {
     let trampoline_size =
         u64::from_le_bytes(output[hdr_start + 24..hdr_start + 32].try_into().unwrap()) as usize;
 
-    // The first 8 bytes of the trampoline code are the entry-point placeholder (zeros).
-    let trampoline_code_start = trampoline_file_offset as usize + 8;
-    let trampoline_stubs_from_elf = &output[trampoline_code_start..][..trampoline_size - 8];
+    // The first 16 bytes of the trampoline code are two entry-point placeholders (zeros).
+    let trampoline_code_start = trampoline_file_offset as usize + 16;
+    let trampoline_stubs_from_elf = &output[trampoline_code_start..][..trampoline_size - 16];
 
     // --- Run the per-segment API on each executable section ---
     // We need to reproduce the same setup: parse the ELF, find .text sections.
@@ -125,7 +128,8 @@ fn matches_hook_syscalls_in_elf() {
     // The entry-point address for stubs (same as trampoline_vaddr for the
     // whole-file API since offset 0 of the trampoline holds the entry).
     let entry_point_addr = trampoline_vaddr;
-    let stubs_base = trampoline_vaddr + 8; // stubs start after the 8-byte entry
+    let entry_point_addr_nofp = trampoline_vaddr + 8;
+    let stubs_base = trampoline_vaddr + 16; // stubs start after both 8-byte entries
 
     let mut all_stubs = Vec::new();
     for &(vaddr, file_offset, size) in &text_sections {
@@ -133,8 +137,14 @@ fn matches_hook_syscalls_in_elf() {
         let sz = size as usize;
         let mut section_data = buf[off..off + sz].to_vec();
         let write_vaddr = stubs_base + all_stubs.len() as u64;
-        let stubs = patch_code_segment(&mut section_data, vaddr, write_vaddr, entry_point_addr)
-            .expect("patch_code_segment");
+        let stubs = patch_code_segment(
+            &mut section_data,
+            vaddr,
+            write_vaddr,
+            entry_point_addr,
+            entry_point_addr_nofp,
+        )
+        .expect("patch_code_segment");
 
         // The patched section bytes should match those in the whole-file output.
         assert_eq!(
@@ -148,6 +158,6 @@ fn matches_hook_syscalls_in_elf() {
 
     assert_eq!(
         all_stubs, trampoline_stubs_from_elf,
-        "accumulated stubs should match hook_syscalls_in_elf trampoline (minus 8-byte header)"
+        "accumulated stubs should match hook_syscalls_in_elf trampoline (minus 16-byte header)"
     );
 }
