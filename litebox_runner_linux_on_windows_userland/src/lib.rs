@@ -79,7 +79,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         });
 
         let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
-        shim_builder.default_fs(in_mem, tar_ro)
+        let lbfs_ro = litebox::fs::lbfs_ro::FileSystem::new(
+            litebox,
+            litebox::fs::lbfs_ro::EMPTY_LBFS_FILE.into(),
+        );
+        shim_builder.default_fs(in_mem, lbfs_ro, tar_ro)
     };
     let initial_file_system = std::sync::Arc::new(initial_file_system);
 

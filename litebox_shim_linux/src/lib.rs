@@ -58,7 +58,11 @@ pub(crate) type LinuxFS = litebox::fs::layered::FileSystem<
     litebox::fs::layered::FileSystem<
         Platform,
         litebox::fs::devices::FileSystem<Platform>,
-        litebox::fs::tar_ro::FileSystem<Platform>,
+        litebox::fs::layered::FileSystem<
+            Platform,
+            litebox::fs::lbfs_ro::FileSystem<Platform>,
+            litebox::fs::tar_ro::FileSystem<Platform>,
+        >,
     >,
 >;
 
@@ -171,13 +175,14 @@ impl LinuxShimBuilder {
         &self.litebox
     }
 
-    /// Create a default layered file system with the given in-memory and tar read-only layers.
+    /// Create a default layered file system with the given in-memory, lbfs read-only, and tar read-only layers.
     pub fn default_fs(
         &self,
         in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
+        lbfs_ro_fs: litebox::fs::lbfs_ro::FileSystem<Platform>,
         tar_ro_fs: litebox::fs::tar_ro::FileSystem<Platform>,
     ) -> DefaultFS {
-        default_fs(&self.litebox, in_mem_fs, tar_ro_fs)
+        default_fs(&self.litebox, in_mem_fs, lbfs_ro_fs, tar_ro_fs)
     }
 
     /// Set the load filter, which can augment envp or auxv when starting a new program.
@@ -322,10 +327,11 @@ impl LinuxShimProcess {
     }
 }
 
-/// Create a default layered file system with the given in-memory and tar read-only layers.
+/// Create a default layered file system with the given in-memory, lbfs read-only, and tar read-only layers.
 fn default_fs(
     litebox: &LiteBox<Platform>,
     in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
+    lbfs_ro_fs: litebox::fs::lbfs_ro::FileSystem<Platform>,
     tar_ro_fs: litebox::fs::tar_ro::FileSystem<Platform>,
 ) -> LinuxFS {
     let dev_stdio = litebox::fs::devices::FileSystem::new(litebox);
@@ -335,7 +341,12 @@ fn default_fs(
         litebox::fs::layered::FileSystem::new(
             litebox,
             dev_stdio,
-            tar_ro_fs,
+            litebox::fs::layered::FileSystem::new(
+                litebox,
+                lbfs_ro_fs,
+                tar_ro_fs,
+                litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
+            ),
             litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
         ),
         litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,

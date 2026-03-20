@@ -38,7 +38,11 @@ impl TestLauncher {
                 tar_data.into()
             },
         );
-        let fs = shim_builder.default_fs(in_mem_fs, tar_ro_fs);
+        let lbfs_ro_fs = litebox::fs::lbfs_ro::FileSystem::new(
+            litebox,
+            litebox::fs::lbfs_ro::EMPTY_LBFS_FILE.into(),
+        );
+        let fs = shim_builder.default_fs(in_mem_fs, lbfs_ro_fs, tar_ro_fs);
         let mut this = Self {
             platform,
             shim_builder,

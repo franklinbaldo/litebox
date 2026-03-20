@@ -35,8 +35,10 @@ pub struct CliArgs {
     #[arg(long = "insert-file", value_hint = clap::ValueHint::FilePath,
           requires = "unstable", help_heading = "Unstable Options")]
     pub insert_files: Vec<PathBuf>,
-    /// Pre-fill the files in this tar file into the initial file system state
-    #[arg(long = "initial-files", value_name = "PATH_TO_TAR", value_hint = clap::ValueHint::FilePath,
+    /// Pre-fill the files in this archive into the initial file system state.
+    ///
+    /// Supports `.tar` and `.lbfs` files (detected by extension).
+    #[arg(long = "initial-files", value_name = "PATH_TO_ARCHIVE", value_hint = clap::ValueHint::FilePath,
           requires = "unstable", help_heading = "Unstable Options")]
     pub initial_files: Option<PathBuf>,
     /// Apply syscall-rewriter to the ELF file before running it
@@ -65,11 +67,11 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub tun_device_name: Option<String>,
-    /// Load the program binary from the tar file instead of from the host filesystem.
+    /// Load the program binary from the archive instead of from the host filesystem.
     ///
-    /// When set, the program path refers to a path inside the tar filesystem.
+    /// When set, the program path refers to a path inside the archive filesystem.
     /// The binary must already be rewritten (incompatible with --rewrite-syscalls).
-    /// This is used by `litebox-packager` to create fully self-contained tar bundles.
+    /// This is used by `litebox-packager` to create fully self-contained bundles.
     #[arg(
         long = "program-from-tar",
         requires_all = ["unstable", "initial_files"],
@@ -198,14 +200,24 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         };
         (modes, Some(data))
     };
-    let tar_data: &'static [u8] = if let Some(tar_file) = cli_args.initial_files.as_ref() {
-        if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
-            anyhow::bail!("Expected a .tar file, found {}", tar_file.display());
-        }
-        mmapped_file(tar_file)?.data
-    } else {
-        litebox::fs::tar_ro::EMPTY_TAR_FILE
-    };
+    let (tar_data, lbfs_data): (&'static [u8], &'static [u8]) =
+        if let Some(archive_file) = cli_args.initial_files.as_ref() {
+            match archive_file.extension().and_then(|x| x.to_str()) {
+                Some("tar") => (mmapped_file(archive_file)?.data, litebox::fs::lbfs_ro::EMPTY_LBFS_FILE),
+                Some("lbfs") => {
+                    let file = mmapped_file(archive_file)?;
+                    let data = file.data;
+                    cow_eligible_regions.push(file);
+                    (litebox::fs::tar_ro::EMPTY_TAR_FILE, data)
+                }
+                _ => anyhow::bail!(
+                    "Expected a .tar or .lbfs file, found {}",
+                    archive_file.display()
+                ),
+            }
+        } else {
+            (litebox::fs::tar_ro::EMPTY_TAR_FILE, litebox::fs::lbfs_ro::EMPTY_LBFS_FILE)
+        };
 
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
     //
@@ -329,7 +341,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         }
 
         let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
-        shim_builder.default_fs(in_mem, tar_ro)
+        let lbfs_ro = litebox::fs::lbfs_ro::FileSystem::new(litebox, lbfs_data.into());
+        shim_builder.default_fs(in_mem, lbfs_ro, tar_ro)
     };
 
     // We need to get the file path before enabling seccomp.
