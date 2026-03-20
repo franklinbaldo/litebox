@@ -291,20 +291,6 @@ unsafe extern "system" fn vectored_exception_handler(
         }
         // Log unhandled guest exception — TEB stack limits already restored so
         // eprintln is safe here.
-        use std::io::Write;
-        let pc: u64 = context.Pc;
-        let addr = if exception_record.NumberParameters > 1 {
-            exception_record.ExceptionInformation[1] as u64
-        } else {
-            0
-        };
-        let _ = writeln!(
-            std::io::stderr(),
-            "[winarm64] guest exc: code={:#x} pc={:#x} addr={:#x}",
-            exception_record.ExceptionCode,
-            pc,
-            addr,
-        );
     }
 
     let regs = unsafe { &mut *tls.guest_context_top.get().wrapping_sub(1) };
@@ -2493,14 +2479,8 @@ unsafe extern "C-unwind" fn exception_handler(
                 // EC=0x3C (BRK instruction)
                 (0, 0x3Cu64 << 26)
             }
-            code => {
+            _code => {
                 // Unknown exception — treat as data abort (SIGSEGV).
-                // Can occur from corrupted exception records during thread
-                // interrupt races or unusual ARM64 hardware exceptions.
-                eprintln!(
-                    "[winarm64] unknown exception code {:#x}, treating as data abort",
-                    code
-                );
                 let ec = 0x24u64; // Data abort from lower EL
                 let dfsc = 0x04u64; // Translation fault, level 0
                 (0, (ec << 26) | dfsc)

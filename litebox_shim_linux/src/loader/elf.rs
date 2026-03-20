@@ -249,20 +249,7 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
                     .pm
                     .find_free_hint_above(min_addr, INTERP_SIZE_ESTIMATE)
                 {
-                    litebox::log_println!(
-                        global.platform,
-                        "[diag] interp hint: brk={:#x} min_search={:#x} found_free={:#x}",
-                        info.brk,
-                        min_addr,
-                        hint
-                    );
                     interp.file.mmap_hint = hint;
-                } else {
-                    litebox::log_println!(
-                        global.platform,
-                        "[diag] interp hint: no free region above {:#x}, using default",
-                        min_addr
-                    );
                 }
             }
 
@@ -274,20 +261,6 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
         } else {
             None
         };
-
-        // Log the key addresses for brk/interpreter collision debugging
-        #[cfg(target_arch = "aarch64")]
-        if let Some(interp_info) = &interp {
-            litebox::log_println!(
-                global.platform,
-                "[diag] layout: main base={:#x} brk={:#x} | interp base={:#x} brk={:#x} | gap={:#x}",
-                info.base_addr,
-                info.brk,
-                interp_info.base_addr,
-                interp_info.brk,
-                interp_info.base_addr.saturating_sub(info.brk)
-            );
-        }
 
         global.pm.set_initial_brk(info.brk);
         aux.insert(AuxKey::AT_PAGESZ, PAGE_SIZE);

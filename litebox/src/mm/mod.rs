@@ -534,7 +534,7 @@ where
 
             if vmem.overlapping(old_brk..new_brk).next().is_some() {
                 // Diagnostic: dump the overlapping VMAs to help debug brk failures.
-                let mut msg = alloc::string::String::from("[diag] brk ENOMEM: overlapping VMAs:\n");
+                let mut msg = alloc::string::String::from("brk ENOMEM: overlapping VMAs:\n");
                 for (range, vma) in vmem.overlapping(old_brk..new_brk) {
                     use core::fmt::Write;
                     let _ = writeln!(

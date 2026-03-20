@@ -676,40 +676,6 @@ impl<FS: ShimFS> Task<FS> {
             }
         };
 
-        // Diagnostic: log ALL syscalls to trace the complete sequence during audit library loading
-        #[cfg(target_arch = "aarch64")]
-        {
-            let desc = match syscall_number {
-                56 => "openat",
-                57 => "close",
-                62 => "lseek",
-                63 => "read",
-                64 => "write",
-                35 => "unlinkat",
-                48 => "faccessat",
-                66 => "writev",
-                79 => "newfstatat",
-                80 => "fstat",
-                214 => "brk",
-                222 => "mmap",
-                226 => "mprotect",
-                215 => "munmap",
-                _ => "?",
-            };
-            litebox::log_println!(
-                self.global.platform,
-                "[syscall] nr={} ({}) x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x} x5={:#x}",
-                syscall_number,
-                desc,
-                ctx.regs[0],
-                ctx.regs[1],
-                ctx.regs[2],
-                ctx.regs[3],
-                ctx.regs[4],
-                ctx.regs[5]
-            );
-        }
-
         let result = match request {
             SyscallRequest::Exit { status } => {
                 self.sys_exit(status);
@@ -823,22 +789,9 @@ impl<FS: ShimFS> Task<FS> {
                 fd,
                 offset,
             } => {
-                #[cfg(target_arch = "aarch64")]
-                litebox::log_println!(
-                    self.global.platform,
-                    "[syscall] mmap detail: addr={:#x} len={:#x} prot={:?} flags={:?} fd={} off={:#x}",
-                    addr,
-                    length,
-                    prot,
-                    flags,
-                    fd,
-                    offset
-                );
                 let r = self
                     .sys_mmap(addr, length, prot, flags, fd, offset)
                     .map(|ptr| ptr.as_usize());
-                #[cfg(target_arch = "aarch64")]
-                litebox::log_println!(self.global.platform, "[syscall] mmap result: {:#x?}", r);
                 r
             }
             SyscallRequest::Mprotect { addr, length, prot } => {
@@ -1076,14 +1029,6 @@ impl<FS: ShimFS> Task<FS> {
                 pathname,
                 flags,
             } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
-                #[cfg(target_arch = "aarch64")]
-                litebox::log_println!(
-                    self.global.platform,
-                    "[syscall] unlinkat: dirfd={}, path={:?}, flags={:?}",
-                    dirfd,
-                    path.to_str(),
-                    flags
-                );
                 syscall!(sys_unlinkat(dirfd, path, flags))
             }),
             SyscallRequest::Stat { pathname, buf } => {
@@ -1104,15 +1049,11 @@ impl<FS: ShimFS> Task<FS> {
                     })
                 })
             }
-            SyscallRequest::Fstat { fd, buf } => {
-                #[cfg(target_arch = "aarch64")]
-                litebox::log_println!(self.global.platform, "[syscall] fstat: fd={}", fd);
-                self.sys_fstat(fd).and_then(|stat| {
-                    buf.write_at_offset(0, stat)
-                        .ok_or(Errno::EFAULT)
-                        .map(|()| 0)
-                })
-            }
+            SyscallRequest::Fstat { fd, buf } => self.sys_fstat(fd).and_then(|stat| {
+                buf.write_at_offset(0, stat)
+                    .ok_or(Errno::EFAULT)
+                    .map(|()| 0)
+            }),
             #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             SyscallRequest::Newfstatat {
                 dirfd,
@@ -1120,14 +1061,6 @@ impl<FS: ShimFS> Task<FS> {
                 buf,
                 flags,
             } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
-                #[cfg(target_arch = "aarch64")]
-                litebox::log_println!(
-                    self.global.platform,
-                    "[syscall] newfstatat: dirfd={}, path={:?}, flags={:?}",
-                    dirfd,
-                    path.to_str(),
-                    flags
-                );
                 self.sys_newfstatat(dirfd, path, flags).and_then(|stat| {
                     buf.write_at_offset(0, stat)
                         .ok_or(Errno::EFAULT)
@@ -1276,25 +1209,6 @@ impl<FS: ShimFS> Task<FS> {
                 Err(Errno::ENOSYS)
             }
         };
-
-        // Diagnostic: log ALL syscall results
-        #[cfg(target_arch = "aarch64")]
-        {
-            match &result {
-                Ok(val) => litebox::log_println!(
-                    self.global.platform,
-                    "[syscall] nr={} => Ok({:#x})",
-                    syscall_number,
-                    val
-                ),
-                Err(e) => litebox::log_println!(
-                    self.global.platform,
-                    "[syscall] nr={} => Err({})",
-                    syscall_number,
-                    e
-                ),
-            }
-        }
 
         result
     }
