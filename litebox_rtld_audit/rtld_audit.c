@@ -175,6 +175,7 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5,
   //      or set x18 = host_tls (Linux)
   //   4. Set x30 = return address, BR to callback
   uint64_t tls_table = tls_table_ptr;
+  uint64_t teb_offset = teb_tls_offset;
   __asm__ volatile(
 #if defined(TARGET_MACOS)
     // Read TPIDRRO_EL0 to detect macOS.
@@ -182,7 +183,7 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5,
     "cbnz x16, 10f\n"               // non-zero → macOS path
 #endif
 
-    // ---- Linux path: 48-byte frame, TPIDR_EL0 keyed ----
+    // ---- Linux/Windows path: 48-byte frame ----
     // Frame layout (must match syscall_callback expectations):
     //   [SP+0]  = saved X16
     //   [SP+8]  = saved X17
@@ -190,19 +191,39 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5,
     //   [SP+24] = host_tls (set after TLS lookup, initially guest TPIDR)
     //   [SP+32] = guest's original X30 (LR)
     //
-    // On Windows ARM64, X18 is the TEB pointer and must not be clobbered.
-    // Use X30 (saved at [SP+32]) instead of X18 for the TPIDR_EL0 lookup key
-    // and host_tls result. The caller (syscall_callback) reads host_tls from
-    // [SP+24] on Windows, not from X18.
+    // On Windows ARM64, X18 is the TEB pointer. We use it as a stable anchor
+    // to find TlsState directly via the TEB TLS slot, avoiding the unreliable
+    // TPIDR_EL0 register which Windows can wipe at any time.
+    // If teb_tls_offset is non-zero, we use the TEB path; otherwise we fall
+    // through to the TPIDR_EL0-based TLS table scan (Linux host).
     "sub  sp, sp, #48\n"
     "str  x16, [sp, #0]\n"
     "str  x17, [sp, #8]\n"
     "str  x30, [sp, #32]\n"         // save guest LR at [SP+32]
-    // Set x30 = return address BEFORE storing to [SP+16], so
-    // syscall_callback reads the correct return PC from [SP+16].
     "adr  x30, 4f\n"                // x30 = return address after syscall
     "str  x30, [sp, #16]\n"
-    "mrs  x30, tpidr_el0\n"         // x30 = guest TPIDR (lookup key, avoids X18)
+
+    // Check if we're on Windows (teb_tls_offset != 0)
+    "mov  x17, %[teb_offset]\n"     // x17 = teb_tls_offset
+    "cbz  x17, 6f\n"                // zero → Linux path (TPIDR_EL0 keyed)
+
+    // ---- Windows TEB path: O(1) direct TlsState lookup ----
+    "ldr  x16, [x18, x17]\n"        // x16 = TlsState* (from TEB TLS slot)
+    "cbz  x16, 7f\n"                // NULL → fallback to entry[0]
+    "str  x16, [sp, #24]\n"         // frame[24] = host_tls (TlsState*)
+    "mov  x16, %[entry]\n"
+    "br   x16\n"                     // jump to syscall_callback
+    "7:\n"                           // .Lfallback_windows
+    // TlsState not yet registered (early execution). Use entry[0].
+    "mov  x17, %[tls_table]\n"      // x17 = TLS table base
+    "ldr  x16, [x17, #8]\n"         // x16 = entry[0].host_tls
+    "str  x16, [sp, #24]\n"         // frame[24] = host_tls
+    "mov  x16, %[entry]\n"
+    "br   x16\n"                     // jump to syscall_callback
+
+    "6:\n"                           // .Llinux_path
+    // ---- Linux path: TPIDR_EL0 keyed TLS table scan ----
+    "mrs  x30, tpidr_el0\n"         // x30 = guest TPIDR (lookup key)
     "str  x30, [sp, #24]\n"         // save guest_tpidr on stack
     "mov  x17, %[tls_table]\n"      // x17 = TLS table base
     "cbz  x17, 2f\n"                // skip lookup if NULL
@@ -269,6 +290,7 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5,
     "4:\n"                           // return point (shared by both paths)
     : "+r"(x0)
     : [entry] "r"(syscall_entry), [tls_table] "r"(tls_table),
+      [teb_offset] "r"(teb_offset),
       "r"(x1), "r"(x2), "r"(x3),
       "r"(x4), "r"(x5), "r"(x8)
     : "x16", "x17", "x18", "x30", "memory"

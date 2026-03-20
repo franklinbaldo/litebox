@@ -1357,10 +1357,10 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
             );
         }
 
-        // Set TPIDR_EL0 to the guest's virtual TPIDR value before entering guest.
-        // The shared SVC handler uses TPIDR_EL0 for TLS table lookup (the key
-        // in the table is also guest_tpidr). The MRS gate now reads guest_tpidr
-        // from TlsState via TEB, but we still write TPIDR_EL0 for the SVC handler.
+        // Write TPIDR_EL0 and sync guest_tpidr to TlsState. The hardware
+        // TPIDR_EL0 write is best-effort on Windows (kernel may wipe it), but
+        // the TlsState.guest_tpidr is authoritative — the MRS gate, SVC handler,
+        // and X18/MSR handlers all read from TlsState via TEB (X18).
         let guest_tpidr = THREAD_TPIDR.get();
         unsafe {
             litebox_common_linux::write_tpidr_el0(guest_tpidr);
