@@ -1537,14 +1537,12 @@ impl ThreadHandle {
         #[cfg(target_arch = "aarch64")]
         let ip: usize = context.Pc.truncate();
 
-        // On x86_64, check if we're in the fast-path register-pop sequence.
-        // On ARM64, there is no fast path (always NtContinue), so this is always false.
-        #[cfg(target_arch = "x86_64")]
+        // Check if we're in the register-pop sequence (switch_to_guest_asm).
+        // On both x86_64 and ARM64, this is the naked asm block between
+        // switch_to_guest_start and switch_to_guest_end labels.
         let in_fast_path = (switch_to_guest_start as *const () as usize
             ..switch_to_guest_end as *const () as usize)
             .contains(&ip);
-        #[cfg(target_arch = "aarch64")]
-        let in_fast_path = false;
 
         let run_interrupt_callback = if in_fast_path {
             // Case 1: jump to interrupt callback without saving the guest
@@ -2380,6 +2378,10 @@ unsafe extern "C" {
     fn switch_to_guest_start();
     #[cfg(target_arch = "x86_64")]
     fn switch_to_guest_end();
+    #[cfg(target_arch = "aarch64")]
+    fn switch_to_guest_start();
+    #[cfg(target_arch = "aarch64")]
+    fn switch_to_guest_end();
 }
 
 unsafe extern "C-unwind" fn init_handler(thread_ctx: &mut ThreadContext<'_>) {
@@ -2449,7 +2451,18 @@ unsafe extern "C-unwind" fn exception_handler(
                 // EC=0x3C (BRK instruction)
                 (0, 0x3Cu64 << 26)
             }
-            code => panic!("Unhandled Win32 exception code: {:#x}", code),
+            code => {
+                // Unknown exception — treat as data abort (SIGSEGV).
+                // Can occur from corrupted exception records during thread
+                // interrupt races or unusual ARM64 hardware exceptions.
+                eprintln!(
+                    "[winarm64] unknown exception code {:#x}, treating as data abort",
+                    code
+                );
+                let ec = 0x24u64; // Data abort from lower EL
+                let dfsc = 0x04u64; // Translation fault, level 0
+                (0, (ec << 26) | dfsc)
+            }
         };
 
         litebox::shim::ExceptionInfo { fault_address, esr }
