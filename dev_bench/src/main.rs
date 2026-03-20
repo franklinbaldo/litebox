@@ -547,7 +547,7 @@ fn run_rewritten_node(ctx: BenchCtx<'_>) -> Result<()> {
         is_init,
         lock_tracing,
     } = ctx;
-    let tar_file = sh.current_dir().join("node_rootfs.tar");
+    let lbfs_file = sh.current_dir().join("node_rootfs.lbfs");
     let release_mode = true;
     if is_init {
         const HELLO_WORLD_JS: &str = r"
@@ -576,9 +576,9 @@ fn run_rewritten_node(ctx: BenchCtx<'_>) -> Result<()> {
             .run()?;
         }
 
-        sh.remove_path(&tar_file)?;
-        // ustar allows longer file names
-        cmd!(sh, "tar --format=ustar -C {tar_base_dir} -cvf {tar_file} .").run()?;
+        sh.remove_path(&lbfs_file)?;
+        cmd!(sh, "cargo build -p litebox_util_fs_archive --release").run()?;
+        cmd!(sh, "{project_root}/target/release/lbfs create -C {tar_base_dir} -o {lbfs_file}").run()?;
         let release = release_mode.then_some("--release");
         let features: &[&str] = if lock_tracing {
             &["--features", "lock_tracing"]
@@ -594,7 +594,7 @@ fn run_rewritten_node(ctx: BenchCtx<'_>) -> Result<()> {
         let mode = if release_mode { "release" } else { "debug" };
         cmd!(
             sh,
-            "{project_root}/target/{mode}/litebox_runner_linux_userland --unstable --interception-backend rewriter --env HOME=/ --initial-files {tar_file} node_rewritten hello_world.js"
+            "{project_root}/target/{mode}/litebox_runner_linux_userland --unstable --interception-backend rewriter --env HOME=/ --initial-files {lbfs_file} node_rewritten hello_world.js"
         ).run()?;
     }
     Ok(())
@@ -629,7 +629,7 @@ fn run_rewritten_iperf3(ctx: BenchCtx<'_>) -> Result<()> {
         is_init,
         lock_tracing,
     } = ctx;
-    let tar_file = sh.current_dir().join("iperf3_rootfs.tar");
+    let lbfs_file = sh.current_dir().join("iperf3_rootfs.lbfs");
     let release_mode = true;
     if is_init {
         rewriter_iperf3(ctx.with_init(true))?;
@@ -653,8 +653,9 @@ fn run_rewritten_iperf3(ctx: BenchCtx<'_>) -> Result<()> {
             .run()?;
         }
 
-        sh.remove_path(&tar_file)?;
-        cmd!(sh, "tar --format=ustar -C {tar_base_dir} -cvf {tar_file} .").run()?;
+        sh.remove_path(&lbfs_file)?;
+        cmd!(sh, "cargo build -p litebox_util_fs_archive --release").run()?;
+        cmd!(sh, "{project_root}/target/release/lbfs create -C {tar_base_dir} -o {lbfs_file}").run()?;
         let release = release_mode.then_some("--release");
         let features: &[&str] = if lock_tracing {
             &["--features", "lock_tracing"]
@@ -681,7 +682,7 @@ fn run_rewritten_iperf3(ctx: BenchCtx<'_>) -> Result<()> {
             let sh = xshell::Shell::new()?;
             cmd!(
                 sh,
-                "{runner} --unstable --interception-backend rewriter --env LD_LIBRARY_PATH=/lib64:/lib32:/lib --env HOME=/ --tun-device-name tun99 --initial-files {tar_file} {iperf3_rewritten} -s -1 -B 10.0.0.2"
+                "{runner} --unstable --interception-backend rewriter --env LD_LIBRARY_PATH=/lib64:/lib32:/lib --env HOME=/ --tun-device-name tun99 --initial-files {lbfs_file} {iperf3_rewritten} -s -1 -B 10.0.0.2"
             ).run()?;
             Ok(())
         });
