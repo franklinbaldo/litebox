@@ -3908,13 +3908,7 @@ mod tests {
         task.sys_lstat("file.txt").unwrap();
 
         // ── sys_access: check relative file is accessible ──
-        task.sys_access(
-            litebox_common_linux::AT_FDCWD,
-            "file.txt",
-            AccessFlags::F_OK,
-            AtFlags::empty(),
-        )
-        .unwrap();
+        task.sys_access("file.txt", AccessFlags::F_OK).unwrap();
 
         // ── sys_mkdir: create a subdirectory via relative path ──
         task.sys_mkdir("subdir", 0o777).unwrap();
