@@ -1245,6 +1245,7 @@ impl<FS: ShimFS> Task<FS> {
                         files: self.files.clone(), // TODO: !CLONE_FILES support
                         signals: self.signals.clone_for_new_task(),
                         fork_context: core::cell::RefCell::new(None),
+                        #[cfg(debug_assertions)]
                         last_shell_write: core::cell::RefCell::new(None),
                         last_syscall: core::cell::Cell::new(None),
                         syscall_restartable: core::cell::Cell::new(false),
@@ -1651,6 +1652,7 @@ impl<FS: ShimFS> Task<FS> {
                         files: child_files,
                         signals: self.signals.clone_for_fork(),
                         fork_context: core::cell::RefCell::new(child_fork_context),
+                        #[cfg(debug_assertions)]
                         last_shell_write: core::cell::RefCell::new(None),
                         last_syscall: core::cell::Cell::new(None),
                         syscall_restartable: core::cell::Cell::new(false),

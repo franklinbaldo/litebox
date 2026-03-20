@@ -38,6 +38,8 @@ pub(crate) struct ElfPatchState {
     pub trampoline_cursor: usize,
     /// Whether the trampoline region has been allocated.
     pub trampoline_mapped: bool,
+    /// Number of bytes actually mapped for the trampoline region (page-aligned).
+    pub trampoline_mapped_size: usize,
     /// File path of the ELF (from the fd→path table, if available).
     #[allow(dead_code)]
     pub file_path: Option<alloc::string::String>,
@@ -252,6 +254,7 @@ impl<FS: ShimFS> Task<FS> {
             trampoline_addr: trampoline_vaddr,
             trampoline_cursor: 0,
             trampoline_mapped: false,
+            trampoline_mapped_size: 0,
             file_path,
         });
     }
@@ -408,6 +411,7 @@ impl<FS: ShimFS> Task<FS> {
             let _ = entry_ptr.copy_from_slice(0, &syscall_entry.to_le_bytes());
             state.trampoline_cursor = 8; // stubs start after the 8-byte entry
             state.trampoline_mapped = true;
+            state.trampoline_mapped_size = PAGE_SIZE;
         }
 
         // Make the code segment writable for in-place patching.
@@ -448,29 +452,30 @@ impl<FS: ShimFS> Task<FS> {
                 // Write patched code back to the mapped region.
                 let _ = mapped_addr.copy_from_slice(0, &code_buf);
 
+                // Grow trampoline BEFORE writing stubs so all pages are mapped.
+                let new_cursor = state.trampoline_cursor + stubs.len();
+                let tramp_pages_needed = new_cursor.next_multiple_of(PAGE_SIZE);
+                if tramp_pages_needed > state.trampoline_mapped_size {
+                    let extra_start = state.trampoline_addr + state.trampoline_mapped_size;
+                    let extra_len = tramp_pages_needed - state.trampoline_mapped_size;
+                    if self
+                        .do_mmap_anonymous(
+                            Some(extra_start),
+                            extra_len,
+                            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                            MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+                        )
+                        .is_ok()
+                    {
+                        state.trampoline_mapped_size = tramp_pages_needed;
+                    }
+                }
+
                 // Write stubs to the trampoline region.
                 let tramp_write_ptr =
                     MutPtr::<u8>::from_usize(state.trampoline_addr + state.trampoline_cursor);
                 let _ = tramp_write_ptr.copy_from_slice(0, &stubs);
-                state.trampoline_cursor += stubs.len();
-
-                // Grow trampoline if needed (allocate more pages).
-                let tramp_pages_needed = state.trampoline_cursor.div_ceil(PAGE_SIZE) * PAGE_SIZE;
-                let tramp_pages_mapped = if state.trampoline_mapped {
-                    PAGE_SIZE
-                } else {
-                    0
-                };
-                if tramp_pages_needed > tramp_pages_mapped {
-                    let extra_start = state.trampoline_addr + tramp_pages_mapped;
-                    let extra_len = tramp_pages_needed - tramp_pages_mapped;
-                    let _ = self.do_mmap_anonymous(
-                        Some(extra_start),
-                        extra_len,
-                        ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                        MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
-                    );
-                }
+                state.trampoline_cursor = new_cursor;
             }
             _ => {
                 // No syscalls found or error — no patching needed.

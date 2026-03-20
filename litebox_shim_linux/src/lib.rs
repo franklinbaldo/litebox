@@ -343,6 +343,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
                 fork_context: RefCell::new(None),
+                #[cfg(debug_assertions)]
                 last_shell_write: RefCell::new(None),
                 last_syscall: Cell::new(None),
                 syscall_restartable: Cell::new(false),
@@ -768,6 +769,7 @@ impl<FS: ShimFS> Task<FS> {
     /// # Panics
     ///
     /// Unsupported syscalls or arguments would trigger a panic for development purposes.
+    #[cfg(debug_assertions)]
     fn task_comm_is(&self, name: &[u8]) -> bool {
         let comm = self.comm.get();
         name.len() < comm.len() && &comm[..name.len()] == name && comm[name.len()] == 0
@@ -887,10 +889,12 @@ impl<FS: ShimFS> Task<FS> {
         out
     }
 
+    #[cfg(debug_assertions)]
     fn shell_write_contains(buf: &[u8], needle: &[u8]) -> bool {
         !needle.is_empty() && buf.windows(needle.len()).any(|window| window == needle)
     }
 
+    #[cfg(debug_assertions)]
     fn should_trace_shell_write(buf: &[u8]) -> bool {
         Self::shell_write_contains(buf, b"___BEGIN___COMMAND_")
             || Self::shell_write_contains(buf, b"COMMAND_DONE_MARKER")
@@ -899,6 +903,7 @@ impl<FS: ShimFS> Task<FS> {
             || Self::shell_write_contains(buf, b"git --no-pager")
     }
 
+    #[cfg(debug_assertions)]
     fn shell_write_preview(buf: &[u8]) -> alloc::string::String {
         let mut out = alloc::string::String::new();
         for &byte in buf.iter().take(SHELL_WRITE_PREVIEW_LEN) {
@@ -916,6 +921,7 @@ impl<FS: ShimFS> Task<FS> {
         out
     }
 
+    #[cfg(debug_assertions)]
     fn shell_write_target_preview(&self, fd: i32) -> alloc::string::String {
         let Ok(raw_fd) = usize::try_from(fd) else {
             return alloc::string::String::from("<bad-fd>");
@@ -945,6 +951,7 @@ impl<FS: ShimFS> Task<FS> {
             .unwrap_or_else(|_| alloc::format!("raw={raw_fd} invalid"))
     }
 
+    #[cfg(debug_assertions)]
     #[allow(clippy::similar_names)] // rip/rsp are standard register names
     fn remember_traced_shell_write(
         &self,
@@ -970,6 +977,7 @@ impl<FS: ShimFS> Task<FS> {
         }));
     }
 
+    #[cfg(debug_assertions)]
     fn maybe_trace_shell_write(
         &self,
         ctx: Option<&litebox_common_linux::PtRegs>,
@@ -987,6 +995,7 @@ impl<FS: ShimFS> Task<FS> {
         self.remember_traced_shell_write(fd, via, total_len, target.clone(), preview.clone(), ctx);
     }
 
+    #[cfg(debug_assertions)]
     fn maybe_trace_shell_writev(
         &self,
         ctx: Option<&litebox_common_linux::PtRegs>,
@@ -1045,6 +1054,7 @@ impl<FS: ShimFS> Task<FS> {
             );
         }
 
+        #[cfg(debug_assertions)]
         if let Some(last_write) = self.last_shell_write.borrow().as_ref() {
             litebox::log_println!(
                 self.global.platform,
@@ -1328,14 +1338,17 @@ impl<FS: ShimFS> Task<FS> {
             }
             SyscallRequest::Write { fd, buf, count } => match buf.to_owned_slice(count) {
                 Some(buf) => {
-                    let scan_len = buf.len().min(SHELL_WRITE_SCAN_LEN);
-                    self.maybe_trace_shell_write(
-                        Some(ctx),
-                        fd,
-                        "write",
-                        buf.len(),
-                        &buf[..scan_len],
-                    );
+                    #[cfg(debug_assertions)]
+                    {
+                        let scan_len = buf.len().min(SHELL_WRITE_SCAN_LEN);
+                        self.maybe_trace_shell_write(
+                            Some(ctx),
+                            fd,
+                            "write",
+                            buf.len(),
+                            &buf[..scan_len],
+                        );
+                    }
                     self.sys_write(fd, &buf, None)
                 }
                 None => Err(Errno::EFAULT),
@@ -1422,6 +1435,7 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Brk { addr } => self.sys_brk(addr),
             SyscallRequest::Readv { fd, iovec, iovcnt } => self.sys_readv(fd, iovec, iovcnt),
             SyscallRequest::Writev { fd, iovec, iovcnt } => {
+                #[cfg(debug_assertions)]
                 if let Some(iovs) = iovec.to_owned_slice(iovcnt) {
                     self.maybe_trace_shell_writev(Some(ctx), fd, &iovs);
                 }
@@ -2243,9 +2257,12 @@ struct ForkContext {
     vfork_done: Arc<VforkDone>,
 }
 
+#[cfg(debug_assertions)]
 const SHELL_WRITE_SCAN_LEN: usize = 1024;
+#[cfg(debug_assertions)]
 const SHELL_WRITE_PREVIEW_LEN: usize = 192;
 
+#[cfg(debug_assertions)]
 #[derive(Clone)]
 struct RecentShellWrite {
     fd: i32,
@@ -2299,6 +2316,7 @@ struct Task<FS: ShimFS> {
     /// because `sys_execve` consumes it via `take()` through `&self`.
     fork_context: RefCell<Option<ForkContext>>,
     /// Last traced shell write performed by this task, if any.
+    #[cfg(debug_assertions)]
     last_shell_write: RefCell<Option<RecentShellWrite>>,
     /// Last syscall entry observed for this task.
     last_syscall: Cell<Option<RecentSyscall>>,
@@ -2359,6 +2377,7 @@ mod test_utils {
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
                 fork_context: RefCell::new(None),
+                #[cfg(debug_assertions)]
                 last_shell_write: RefCell::new(None),
                 last_syscall: Cell::new(None),
                 syscall_restartable: Cell::new(false),
@@ -2392,6 +2411,7 @@ mod test_utils {
                 files: self.files.clone(),
                 signals: self.signals.clone_for_new_task(),
                 fork_context: RefCell::new(None),
+                #[cfg(debug_assertions)]
                 last_shell_write: RefCell::new(None),
                 last_syscall: Cell::new(None),
                 syscall_restartable: Cell::new(false),
