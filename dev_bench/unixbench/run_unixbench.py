@@ -22,6 +22,9 @@ Examples:
     # Run only with LiteBox
     python3 run_unixbench.py --mode litebox
 
+    # Run only with gVisor
+    python3 run_unixbench.py --mode gvisor
+
     # Override duration and iterations for all benchmarks
     python3 run_unixbench.py --duration 5 --iterations 3
 
@@ -502,6 +505,234 @@ def run_litebox_windows(
     return _run_litebox_cmd(bench, duration, cmd)
 
 
+# ── gVisor Runner ───────────────────────────────────────────────────────────
+
+def _resolve_shared_libs(binary: Path) -> list[Path]:
+    """Resolve shared library dependencies of a binary via ldd."""
+    try:
+        result = subprocess.run(
+            ["ldd", str(binary)], capture_output=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return []
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return []
+    libs = []
+    for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+        # Match lines like: libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x...)
+        # or: /lib64/ld-linux-x86-64.so.2 (0x...)
+        m = re.search(r"=>\s+(/\S+)", line)
+        if m:
+            libs.append(Path(m.group(1)))
+        elif line.strip().startswith("/"):
+            m2 = re.match(r"\s*(/\S+)", line)
+            if m2:
+                libs.append(Path(m2.group(1)))
+    return libs
+
+
+def _prepare_gvisor_rootfs(
+    pgms_dir: Path,
+    bench: BenchmarkDef,
+    work_dir: Path,
+) -> Optional[Path]:
+    """
+    Prepare a minimal rootfs for running a benchmark under gVisor.
+
+    Copies the benchmark binary and its shared library dependencies into
+    an OCI-compatible rootfs directory.
+
+    Returns the rootfs directory path, or None on failure.
+    """
+    binary = pgms_dir / bench.binary
+    if not binary.exists():
+        print(f"  [SKIP] {bench.name}: binary not found at {binary}")
+        return None
+
+    rootfs = work_dir / f"gvisor_{bench.name}" / "rootfs"
+    if rootfs.exists():
+        shutil.rmtree(rootfs)
+    rootfs.mkdir(parents=True)
+    (rootfs / "tmp").mkdir()
+
+    # Copy the benchmark binary
+    dest_binary = rootfs / bench.binary
+    shutil.copy2(binary, dest_binary)
+
+    # Copy shared library dependencies
+    libs = _resolve_shared_libs(binary)
+    for lib in libs:
+        dest = rootfs / lib.relative_to("/")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if not dest.exists():
+            shutil.copy2(lib, dest)
+
+    # Shell benchmarks need additional binaries and scripts
+    if bench.name in ("shell1", "shell8"):
+        # System utilities required by tst.sh / multi.sh / looper
+        for util in ("sh", "sort", "od", "grep", "tee", "wc", "rm", "cat"):
+            util_path = shutil.which(util)
+            if util_path:
+                util_path = Path(util_path).resolve()
+                dest = rootfs / util_path.relative_to("/")
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                if not dest.exists():
+                    shutil.copy2(util_path, dest)
+                    # Also copy its shared libs
+                    for lib in _resolve_shared_libs(util_path):
+                        lib_dest = rootfs / lib.relative_to("/")
+                        lib_dest.parent.mkdir(parents=True, exist_ok=True)
+                        if not lib_dest.exists():
+                            shutil.copy2(lib, lib_dest)
+        # Ensure /bin/sh exists
+        bin_sh = rootfs / "bin" / "sh"
+        if not bin_sh.exists():
+            sh_path = shutil.which("sh")
+            if sh_path:
+                bin_sh.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(sh_path, bin_sh)
+        # Copy shell scripts
+        pgms_dest = rootfs / "pgms"
+        pgms_dest.mkdir(parents=True, exist_ok=True)
+        for script in ("tst.sh", "multi.sh"):
+            src = pgms_dir / script
+            if src.exists():
+                shutil.copy2(src, pgms_dest / script)
+        # Copy sort.src
+        testdir = pgms_dir.parent / "testdir"
+        sort_src = testdir / "sort.src"
+        if sort_src.exists():
+            shutil.copy2(sort_src, rootfs / "sort.src")
+
+    # execl needs itself available at /pgms/execl
+    if bench.name == "execl":
+        pgms_dest = rootfs / "pgms"
+        pgms_dest.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(binary, pgms_dest / "execl")
+
+    return rootfs.parent
+
+
+def _write_gvisor_config(
+    bundle_dir: Path,
+    bench: BenchmarkDef,
+    duration: int,
+) -> list[str]:
+    """
+    Write an OCI config.json for the benchmark and return the process args.
+    """
+    # For fstime variants, use /tmp in the container
+    tmpdir = "/tmp" if bench.binary == "fstime" else None
+    bench_args = bench.args(duration, tmpdir)
+    process_args = [f"/{bench.binary}"] + bench_args
+
+    env = ["PATH=/usr/bin:/bin:/pgms"]
+    if bench.name == "execl" or bench.name in ("shell1", "shell8"):
+        env.append("UB_BINDIR=/pgms")
+    env.append("HOME=/")
+
+    config = {
+        "ociVersion": "1.0.0",
+        "process": {
+            "terminal": False,
+            "user": {"uid": 0, "gid": 0},
+            "args": process_args,
+            "env": env,
+            "cwd": "/",
+        },
+        "root": {"path": "rootfs", "readonly": False},
+        "linux": {
+            "namespaces": [
+                {"type": "pid"},
+                {"type": "ipc"},
+                {"type": "uts"},
+                {"type": "mount"},
+            ]
+        },
+        "mounts": [
+            {"destination": "/tmp", "type": "tmpfs", "source": "tmpfs"},
+            {"destination": "/proc", "type": "proc", "source": "proc"},
+        ],
+    }
+
+    config_path = bundle_dir / "config.json"
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+
+    return process_args
+
+
+# Global counter for unique gVisor container IDs.
+_gvisor_container_seq = 0
+
+
+def run_gvisor(
+    pgms_dir: Path,
+    bench: BenchmarkDef,
+    duration: int,
+    work_dir: Path,
+) -> Optional[BenchmarkResult]:
+    """Run a benchmark under gVisor using an OCI bundle."""
+    global _gvisor_container_seq
+    _gvisor_container_seq += 1
+    container_id = f"litebox_bench_gv_{bench.name}_{_gvisor_container_seq}_{os.getpid()}"
+
+    bundle_dir = _prepare_gvisor_rootfs(pgms_dir, bench, work_dir)
+    if bundle_dir is None:
+        return None
+
+    process_args = _write_gvisor_config(bundle_dir, bench, duration)
+
+    cmd = [
+        "sudo", "runsc", "--network=none",
+        "run", "--bundle", str(bundle_dir), container_id,
+    ]
+
+    print(f"  Running: runsc run /{bench.binary} {' '.join(process_args[1:])}")
+    t0 = time.monotonic()
+    timeout = duration * 3 + 60
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"  [TIMEOUT] {bench.name}")
+        subprocess.run(
+            ["sudo", "runsc", "delete", "-force", container_id],
+            capture_output=True, timeout=10,
+        )
+        return None
+    finally:
+        # Clean up the container
+        subprocess.run(
+            ["sudo", "runsc", "delete", container_id],
+            capture_output=True, timeout=10,
+        )
+    elapsed = time.monotonic() - t0
+
+    # With terminal: false, the container's stderr is captured directly.
+    stderr = result.stderr.decode("utf-8", errors="replace")
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    # Check both stderr and stdout for the COUNT line
+    combined = stderr + "\n" + stdout
+
+    if result.returncode != 0:
+        print(f"  [FAIL] {bench.name} exited with {result.returncode}")
+        print(f"  stderr (last 300 chars): ...{stderr[-300:]}")
+        return None
+
+    parsed = parse_count_line(combined)
+    if parsed is None:
+        print(f"  [FAIL] {bench.name}: no COUNT line in output:\n{combined[:500]}")
+        return None
+
+    count, base, unit = parsed
+    return BenchmarkResult(
+        name=bench.name, count=count, base=base, unit=unit,
+        elapsed=elapsed, raw_stderr=stderr,
+    )
+
+
 # ── Comparison & Reporting ──────────────────────────────────────────────────
 
 @dataclass
@@ -510,6 +741,7 @@ class ComparisonRow:
     unit: str
     native_scores: list[float] = field(default_factory=list)
     litebox_scores: list[float] = field(default_factory=list)
+    gvisor_scores: list[float] = field(default_factory=list)
 
     @property
     def native_avg(self) -> Optional[float]:
@@ -518,6 +750,10 @@ class ComparisonRow:
     @property
     def litebox_avg(self) -> Optional[float]:
         return sum(self.litebox_scores) / len(self.litebox_scores) if self.litebox_scores else None
+
+    @property
+    def gvisor_avg(self) -> Optional[float]:
+        return sum(self.gvisor_scores) / len(self.gvisor_scores) if self.gvisor_scores else None
 
     @property
     def overhead_pct(self) -> Optional[float]:
@@ -535,32 +771,81 @@ class ComparisonRow:
             return l / n
         return None
 
+    @property
+    def gvisor_ratio(self) -> Optional[float]:
+        n = self.native_avg
+        g = self.gvisor_avg
+        if n and g and n > 0:
+            return g / n
+        return None
+
 
 def print_comparison_table(rows: list[ComparisonRow]):
     """Print a formatted comparison table."""
+    has_native = any(r.native_avg is not None for r in rows)
+    has_litebox = any(r.litebox_avg is not None for r in rows)
+    has_gvisor = any(r.gvisor_avg is not None for r in rows)
+
+    # Build header dynamically
+    header = f"{'Benchmark':<20} {'Unit':<8}"
+    if has_native:
+        header += f" {'Native':>12}"
+    if has_litebox:
+        header += f" {'LiteBox':>12}"
+    if has_gvisor:
+        header += f" {'gVisor':>12}"
+    if has_litebox and has_native:
+        header += f" {'LB Ratio':>10}"
+    if has_gvisor and has_native:
+        header += f" {'gV Ratio':>10}"
+
+    width = len(header) + 4
     print()
-    print("=" * 85)
-    print(f"{'Benchmark':<20} {'Unit':<8} {'Native':>12} {'LiteBox':>12} {'Ratio':>8} {'Overhead':>10}")
-    print("-" * 85)
+    print("=" * width)
+    print(header)
+    print("-" * width)
 
     for row in rows:
-        native_str = f"{row.native_avg:.1f}" if row.native_avg is not None else "N/A"
-        litebox_str = f"{row.litebox_avg:.1f}" if row.litebox_avg is not None else "N/A"
-        ratio_str = f"{row.ratio:.4f}" if row.ratio is not None else "N/A"
-        overhead_str = f"{row.overhead_pct:.2f}%" if row.overhead_pct is not None else "N/A"
-        print(f"{row.name:<20} {row.unit:<8} {native_str:>12} {litebox_str:>12} {ratio_str:>8} {overhead_str:>10}")
+        line = f"{row.name:<20} {row.unit:<8}"
+        if has_native:
+            s = f"{row.native_avg:.1f}" if row.native_avg is not None else "N/A"
+            line += f" {s:>12}"
+        if has_litebox:
+            s = f"{row.litebox_avg:.1f}" if row.litebox_avg is not None else "N/A"
+            line += f" {s:>12}"
+        if has_gvisor:
+            s = f"{row.gvisor_avg:.1f}" if row.gvisor_avg is not None else "N/A"
+            line += f" {s:>12}"
+        if has_litebox and has_native:
+            s = f"{row.ratio:.4f}" if row.ratio is not None else "N/A"
+            line += f" {s:>10}"
+        if has_gvisor and has_native:
+            s = f"{row.gvisor_ratio:.4f}" if row.gvisor_ratio is not None else "N/A"
+            line += f" {s:>10}"
+        print(line)
 
-    print("=" * 85)
+    print("=" * width)
 
     # Summary
-    ratios = [r.ratio for r in rows if r.ratio is not None]
-    if ratios:
-        geo_mean = 1.0
-        for r in ratios:
-            geo_mean *= r
-        geo_mean = geo_mean ** (1.0 / len(ratios))
-        print(f"\nGeometric mean ratio (LiteBox/Native): {geo_mean:.4f}")
-        print(f"Average overhead: {(1.0 - geo_mean) * 100:.2f}%")
+    if has_litebox and has_native:
+        ratios = [r.ratio for r in rows if r.ratio is not None]
+        if ratios:
+            geo_mean = 1.0
+            for r in ratios:
+                geo_mean *= r
+            geo_mean = geo_mean ** (1.0 / len(ratios))
+            print(f"\nGeometric mean ratio (LiteBox/Native): {geo_mean:.4f}")
+            print(f"Average overhead: {(1.0 - geo_mean) * 100:.2f}%")
+
+    if has_gvisor and has_native:
+        ratios = [r.gvisor_ratio for r in rows if r.gvisor_ratio is not None]
+        if ratios:
+            geo_mean = 1.0
+            for r in ratios:
+                geo_mean *= r
+            geo_mean = geo_mean ** (1.0 / len(ratios))
+            print(f"\nGeometric mean ratio (gVisor/Native):  {geo_mean:.4f}")
+            print(f"Average overhead: {(1.0 - geo_mean) * 100:.2f}%")
     print()
 
 
@@ -623,8 +908,8 @@ def main():
         help="Which benchmarks to run (default: all supported)",
     )
     parser.add_argument(
-        "--mode", choices=["both", "native", "litebox"], default="both",
-        help="Run mode: 'native', 'litebox', or 'both' (default: both)",
+        "--mode", choices=["both", "native", "litebox", "gvisor", "all"], default="both",
+        help="Run mode: 'native', 'litebox', 'gvisor', 'both' (native+litebox), or 'all' (default: both)",
     )
     parser.add_argument(
         "--duration", type=int, default=None,
@@ -709,7 +994,8 @@ def main():
         ensure_unixbench_built(unixbench_dir)
 
     # Resolve litebox binaries
-    run_litebox_mode = args.mode in ("both", "litebox")
+    run_litebox_mode = args.mode in ("both", "litebox", "all")
+    run_gvisor_mode = args.mode in ("gvisor", "all")
     runner_path = None
     packager_path = None
 
@@ -783,6 +1069,12 @@ def main():
         print(f"Runner:         {runner_path}")
         if not is_windows_mode:
             print(f"Packager:       {packager_path or 'cargo run'}")
+    if run_gvisor_mode:
+        runsc_path = shutil.which("runsc")
+        print(f"gVisor runsc:   {runsc_path or 'not found'}")
+        if runsc_path is None:
+            print("Error: runsc not found in PATH. Install gVisor first.")
+            sys.exit(1)
     print(f"Benchmarks:     {', '.join(args.benchmarks)}")
     if args.duration is not None:
         print(f"Duration:       {args.duration}s (override)")
@@ -808,7 +1100,7 @@ def main():
         iterations = args.iterations if args.iterations is not None else bench.default_iterations
 
         # Native runs
-        if args.mode in ("both", "native"):
+        if args.mode in ("both", "native", "all"):
             print(f"[Native] {bench_name} ({duration}s x {iterations} iterations)")
             for i in range(iterations):
                 print(f"  Iteration {i + 1}/{iterations}")
@@ -838,6 +1130,17 @@ def main():
                     row.unit = row.unit or result.unit
                     print(f"    Score: {result.score:.1f} {result.unit}")
 
+        # gVisor runs
+        if run_gvisor_mode:
+            print(f"[gVisor] {bench_name} ({duration}s x {iterations} iterations)")
+            for i in range(iterations):
+                print(f"  Iteration {i + 1}/{iterations}")
+                result = run_gvisor(pgms_dir, bench, duration, work_dir)
+                if result:
+                    row.gvisor_scores.append(result.score)
+                    row.unit = row.unit or result.unit
+                    print(f"    Score: {result.score:.1f} {result.unit}")
+
         all_results[bench_name] = row
 
     # ── Print results ───────────────────────────────────────────────────
@@ -862,9 +1165,12 @@ def main():
                 "unit": row.unit,
                 "native_scores": row.native_scores,
                 "litebox_scores": row.litebox_scores,
+                "gvisor_scores": row.gvisor_scores,
                 "native_avg": row.native_avg,
                 "litebox_avg": row.litebox_avg,
+                "gvisor_avg": row.gvisor_avg,
                 "ratio": row.ratio,
+                "gvisor_ratio": row.gvisor_ratio,
                 "overhead_pct": row.overhead_pct,
             }
         with open(args.output, "w") as f:
