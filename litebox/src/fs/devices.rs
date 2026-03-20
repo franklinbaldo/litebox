@@ -443,11 +443,9 @@ impl<
         let flags = flags - OFlags::NOCTTY - OFlags::NOFOLLOW - OFlags::APPEND;
         let truncate = flags.contains(OFlags::TRUNC);
         let flags = flags - OFlags::TRUNC;
-        if flags.contains(OFlags::CREAT | OFlags::EXCL) {
-            return Err(OpenError::AlreadyExists);
-        }
+        let exclusive = flags.contains(OFlags::EXCL);
         // Existing device nodes ignore create-only metadata and large-file mode bits.
-        let flags = flags - OFlags::CREAT - OFlags::LARGEFILE;
+        let flags = flags - OFlags::CREAT - OFlags::EXCL - OFlags::LARGEFILE;
         let _ = mode;
         let path = self.absolute_path(path)?;
         let (device, pty_pair) = match path.as_str() {
@@ -498,6 +496,9 @@ impl<
             }
             _ => return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory)),
         };
+        if exclusive {
+            return Err(OpenError::AlreadyExists);
+        }
         if open_directory {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
@@ -764,7 +765,7 @@ impl<
 
     #[expect(unused_variables, reason = "not supported by device filesystem")]
     fn mkdir(&self, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {
-        Err(MkdirError::Io)
+        Err(MkdirError::ReadOnlyFileSystem)
     }
 
     #[expect(unused_variables, reason = "unimplemented")]
