@@ -150,3 +150,223 @@ Running multiple test binaries in the same process (cargo test default) can
 cause TLS table contention — multiple test threads share the same global
 `HOST_TLS_TABLE_ADDR`. Using `cargo nextest` (process-per-test) avoids this.
 Not a production issue since litebox runs one guest per process.
+
+---
+
+## Future: Cross-Platform Guest×Host Matrix
+
+Currently litebox only runs **Linux guests**. Future work will add Windows
+and macOS shims, enabling Windows PE and macOS Mach-O guests. Each guest
+type has different expectations from the ARM64 TLS registers, and each host
+platform has different kernel behavior. The TLS virtualization strategy must
+handle all 9 combinations.
+
+### Guest OS Register Expectations
+
+| Register | Linux Guest | Windows Guest | macOS Guest |
+|---|---|---|---|
+| `TPIDR_EL0` | TLS pointer (glibc/musl) | Not used for guest TLS | pthread TLS pointer |
+| `X18` | General-purpose register | TEB pointer (must be valid) | Reserved (ABI, `-ffixed-x18`) |
+| `TPIDRRO_EL0` | Not used | Not used | pthread key (read-only, set by kernel) |
+
+### Host OS Register Guarantees
+
+| Register | Linux Host | macOS Host | Windows Host |
+|---|---|---|---|
+| `TPIDR_EL0` | ✅ Preserved | ❌ Clobbered | ❌ Not preserved |
+| `X18` | ✅ Free GPR | ❌ Zeroed on exception | ✅ TEB (stable) |
+| `TPIDRRO_EL0` | Always 0 | ✅ Stable per-pthread | Unused |
+| **Stable anchor** | `TPIDR_EL0` | `TPIDRRO_EL0` | `X18` (TEB) |
+
+### 3×3 Virtualization Matrix
+
+#### TPIDR_EL0 Virtualization
+
+| Guest↓ Host→ | Linux | macOS | Windows |
+|---|---|---|---|
+| **Linux** | Gate only¹ | Full virtualize | Full virtualize |
+| **Windows** | None² | None² | None² |
+| **macOS** | Gate only¹ | Full virtualize | Full virtualize |
+
+¹ MRS/MSR gates needed to separate host and guest TPIDR values, but hardware
+is reliable.
+
+² Windows guests don't use TPIDR_EL0 for TLS. However, if the guest binary
+contains MRS/MSR TPIDR_EL0 instructions (e.g., from linked Linux libraries
+or CRT), they should still be gated.
+
+#### X18 Virtualization
+
+| Guest↓ Host→ | Linux | macOS | Windows |
+|---|---|---|---|
+| **Linux** | None | Full virtualize | Full virtualize |
+| **Windows** | Provide fake TEB | Provide fake TEB | Native TEB ✅ |
+| **macOS** | None³ | None³ | Virtualize⁴ |
+
+³ macOS guest never references X18 (ABI reserves it, compiler uses
+`-ffixed-x18`). No rewriting needed.
+
+⁴ Windows reserves X18 for TEB, but macOS guest doesn't use it. However, the
+rewriter must still avoid generating code that uses X18 (scratch registers
+should be X16/X17 only).
+
+#### TPIDRRO_EL0 Handling
+
+| Guest↓ Host→ | Linux | macOS | Windows |
+|---|---|---|---|
+| **Linux** | N/A | N/A | N/A |
+| **Windows** | N/A | N/A | N/A |
+| **macOS** | Emulate⁵ | Native ✅ | Emulate⁵ |
+
+⁵ macOS guests read TPIDRRO_EL0 for pthread_self(). On non-macOS hosts, the
+shim must write a valid value via `MSR TPIDRRO_EL0` (requires EL1, so this
+likely needs a different approach — e.g., rewriting MRS TPIDRRO_EL0 to read
+from a memory location).
+
+### Key Challenge: Windows Guest X18 (Fake TEB)
+
+When running Windows PE guests on Linux or macOS hosts, the guest expects
+`X18 = TEB` at all times. Two approaches:
+
+**Option A: Set X18 = fake TEB, no rewriting**
+- Allocate a TEB-like structure, set X18 to its address before entering guest
+- Works on Linux (X18 preserved as GPR) — X18 stays valid naturally
+- Fails on macOS (XNU zeros X18 on exception entry) — would need
+  the rewriter to restore X18 after every signal/preemption, or use
+  VEH-equivalent to catch and fix
+
+**Option B: Full X18 virtualization (like Linux-on-macOS/Windows)**
+- Rewrite all X18 accesses to read/write from a memory-backed fake TEB pointer
+- More overhead but works on all hosts
+- Requires teaching the rewriter about PE binary X18 access patterns
+
+**Recommendation**: Option A for Linux host (simple), Option B for macOS host
+(X18 is unreliable). Windows host is free (native TEB).
+
+### Key Challenge: macOS Guest TPIDRRO_EL0
+
+macOS guests call `pthread_self()` which reads TPIDRRO_EL0. This is a
+**read-only** system register that can only be written from EL1 (kernel mode).
+On non-macOS hosts:
+
+- Cannot write TPIDRRO_EL0 from userspace
+- Must rewrite `MRS Xd, TPIDRRO_EL0` instructions to read from a
+  memory-backed emulated value (similar to TPIDR_EL0 virtualization)
+- The rewriter already has the infrastructure for this (PatchKind for MRS)
+
+### Abstraction: Rewriter Configuration
+
+The current code uses `TargetOs` to select behavior. For the 3×3 matrix, the
+rewriter needs to know:
+
+```
+struct RewriterConfig {
+    /// Stable register for TLS table/state lookup
+    anchor: Anchor,           // TPIDR_EL0 | TPIDRRO_EL0 | X18_TEB
+
+    /// Whether to intercept guest X18 accesses
+    virtualize_x18: bool,     // true when guest X18 semantics ≠ host X18
+
+    /// Whether to intercept guest TPIDR_EL0 accesses
+    virtualize_tpidr: bool,   // true when host clobbers TPIDR_EL0
+
+    /// Whether to intercept guest TPIDRRO_EL0 accesses
+    virtualize_tpidrro: bool, // true when guest reads it but host doesn't provide
+
+    /// Guest X18 mode
+    guest_x18: GuestX18,      // GPR | TEB | Reserved
+}
+```
+
+This decouples the rewriter from the `TargetOs` enum and allows clean
+expression of all 9 combinations. The current `TargetOs`-based dispatch
+maps to specific `RewriterConfig` values:
+
+```
+Linux-on-Linux:   { anchor: TPIDR,    virt_x18: false, virt_tpidr: false, virt_tpidrro: false }
+Linux-on-macOS:   { anchor: TPIDRRO,  virt_x18: true,  virt_tpidr: true,  virt_tpidrro: false }
+Linux-on-Windows: { anchor: X18_TEB,  virt_x18: true,  virt_tpidr: true,  virt_tpidrro: false }
+Win-on-Linux:     { anchor: TPIDR,    virt_x18: false, virt_tpidr: false, virt_tpidrro: false }
+Win-on-macOS:     { anchor: TPIDRRO,  virt_x18: true,  virt_tpidr: false, virt_tpidrro: false }
+Win-on-Windows:   { anchor: X18_TEB,  virt_x18: false, virt_tpidr: false, virt_tpidrro: false }
+macOS-on-Linux:   { anchor: TPIDR,    virt_x18: false, virt_tpidr: false, virt_tpidrro: true  }
+macOS-on-macOS:   { anchor: TPIDRRO,  virt_x18: false, virt_tpidr: false, virt_tpidrro: false }
+macOS-on-Windows: { anchor: X18_TEB,  virt_x18: false, virt_tpidr: true,  virt_tpidrro: true  }
+```
+
+### Multi-Shim Scenario: Dynamic TLS Handling
+
+A single litebox platform may host multiple guest types simultaneously
+(e.g., a Linux guest launching a Windows subprocess, or a mixed workload
+scheduler). This means the TLS virtualization strategy cannot be a
+compile-time constant — it must be **per-thread** at runtime.
+
+#### What works per-binary (no change needed)
+
+The **rewriter** already runs per-binary. Each rewritten ELF/PE/Mach-O gets
+its own trampoline with its own shared handlers, configured by
+`RewriterConfig`. A Linux ELF gets X18-virtualized handlers; a Windows PE
+on the same host gets non-virtualized X18 handlers. The trampoline is
+self-contained — no conflict.
+
+#### What needs to become dynamic
+
+The **platform-side code** (`syscall_callback`, `switch_to_guest`,
+`call_shim`) is compiled once per host platform. In a multi-shim scenario,
+`syscall_callback` must handle both a Linux guest (whose X18 is virtualized,
+whose TPIDR is in TlsState) and a Windows guest (whose X18 IS the TEB,
+whose TPIDR is unused) on successive calls.
+
+**Design: per-thread guest type tag in TlsState**
+
+```rust
+#[repr(u8)]
+enum GuestType { Linux, Windows, MacOs }
+
+struct TlsState {
+    // ... existing fields ...
+    guest_type: Cell<GuestType>,
+}
+```
+
+The tag is set when the thread enters `run_thread` and is readable from
+`syscall_callback` via the host_tls pointer. Each handler branches on it:
+
+```
+switch_to_guest:
+  match tls.guest_type {
+    Linux   → set virt_x18 in PtRegs, write TPIDR_EL0, skip restoring X18
+    Windows → set X18 = TEB (real), skip TPIDR_EL0
+    MacOs   → skip X18, write TPIDRRO emulation slot
+  }
+```
+
+#### What about the SVC handler (in the trampoline)?
+
+The SVC handler runs in rewriter-generated code, not in Rust. It's already
+per-binary (each binary's trampoline has its own SVC handler). So a Linux
+binary's SVC handler always does the Linux TLS dance, and a Windows binary's
+SVC handler always does the Windows TLS dance. No dynamic dispatch needed
+in the trampoline.
+
+#### What about mixed-shim threads?
+
+If a Linux guest's `clone()` creates a thread that `exec()`s a Windows PE:
+- The thread starts with `guest_type = Linux`
+- On `exec()`, the shim reloads the binary, switches to the Windows shim,
+  and updates `tls.guest_type = Windows`
+- The new binary's trampoline has Windows-configured handlers
+- `switch_to_guest` now uses the Windows path for this thread
+
+The key invariant: **`guest_type` and the trampoline handlers must agree**.
+The shim is responsible for keeping them in sync across `exec()` boundaries.
+
+#### Summary of what's static vs dynamic
+
+| Component | Scope | Static or Dynamic |
+|---|---|---|
+| Rewriter config | Per-binary | Static (set at rewrite time) |
+| Trampoline handlers | Per-binary | Static (emitted at rewrite time) |
+| TlsState.guest_type | Per-thread | Dynamic (set at run_thread, updated on exec) |
+| switch_to_guest path | Per-call | Dynamic (branches on guest_type) |
+| syscall_callback | Per-call | Dynamic (reads guest_type from host_tls) |
