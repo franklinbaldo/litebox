@@ -16,6 +16,7 @@ pub mod devices;
 pub mod errors;
 pub mod in_mem;
 pub mod layered;
+pub mod lbfs_ro;
 pub mod nine_p;
 pub mod tar_ro;
 

@@ -8,6 +8,7 @@ arrayvec = { version = "0.7.6", default-features = false, optional = true }
 bitflags = "2.6.0"
 either = { version = "1.13.0", default-features = false }
 hashbrown = "0.15.2"
+litebox_util_fs_archive = { path = "../litebox_util_fs_archive", default-features = false }
 smallvec = "1.13.2"
 smoltcp = { version = "0.12.0", default-features = false, features = ["log", "proto-ipv4", "medium-ip", "socket", "socket-tcp", "socket-udp", "socket-icmp", "socket-raw", "alloc"] }
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
