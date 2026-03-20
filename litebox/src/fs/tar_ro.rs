@@ -225,6 +225,16 @@ impl TarIndex {
         &self.tar_data[range]
     }
 
+    fn static_file_data(&self, file_idx: usize) -> Option<&'static [u8]> {
+        match &self.tar_data {
+            alloc::borrow::Cow::Borrowed(data) => {
+                let range = self.files[file_idx].data_range.clone();
+                Some(&data[range])
+            }
+            alloc::borrow::Cow::Owned(_) => None,
+        }
+    }
+
     fn file_by_path(&self, path: &str) -> Option<(usize, &IndexedFile)> {
         let file_idx = *self.files_by_path.get(path)?;
         Some((file_idx, &self.files[file_idx]))
@@ -557,6 +567,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             })
         } else {
             Err(PathError::NoSuchFileOrDirectory)?
+        }
+    }
+
+    fn get_static_backing_data(&self, fd: &FileFd<Platform>) -> Option<&'static [u8]> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let entry = descriptor_table.get_entry(fd)?;
+        match &entry.entry {
+            Descriptor::File { idx, .. } => self.tar_index.static_file_data(*idx),
+            Descriptor::Dir { .. } => None,
         }
     }
 

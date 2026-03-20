@@ -202,7 +202,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
             anyhow::bail!("Expected a .tar file, found {}", tar_file.display());
         }
-        mmapped_file(tar_file)?.data
+        let file = mmapped_file(tar_file)?;
+        let data = file.data;
+        cow_eligible_regions.push(file);
+        data
     } else {
         litebox::fs::tar_ro::EMPTY_TAR_FILE
     };
