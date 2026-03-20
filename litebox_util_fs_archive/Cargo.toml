@@ -1,0 +1,24 @@
+[package]
+name = "litebox_util_fs_archive"
+version = "0.1.0"
+edition = "2024"
+description = "LiteBox filesystem archive (.lbfs) format library and tool"
+
+[[bin]]
+name = "lbfs"
+path = "src/main.rs"
+required-features = ["std"]
+
+[features]
+default = ["std"]
+std = ["dep:clap", "dep:anyhow", "dep:walkdir"]
+
+[dependencies]
+thiserror = { version = "2.0.6", default-features = false }
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
+clap = { version = "4", features = ["derive"], optional = true }
+anyhow = { version = "1", optional = true }
+walkdir = { version = "2", optional = true }
+
+[lints]
+workspace = true

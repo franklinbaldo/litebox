@@ -1450,6 +1450,7 @@ dependencies = [
  "buddy_system_allocator",
  "either",
  "hashbrown",
+ "litebox_util_fs_archive",
  "rangemap",
  "ringbuf",
  "slabmalloc",
@@ -1728,6 +1729,17 @@ dependencies = [
  "similar",
  "tempfile",
  "thiserror",
+ "zerocopy",
+]
+
+[[package]]
+name = "litebox_util_fs_archive"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "thiserror",
+ "walkdir",
  "zerocopy",
 ]
 
