@@ -757,6 +757,14 @@ const _: () = assert!(
     "TlsState.guest_tpidr offset changed; update TLSSTATE_GUEST_TPIDR_OFFSET in litebox_syscall_rewriter/src/arm64.rs"
 );
 
+// The shared X18 load/save handlers and SVC handlers hardcode virt_x18 at
+// offset 40 (same as macOS TCB.guest_x18). Keep them in sync.
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(
+    core::mem::offset_of!(TlsState, virt_x18) == 40,
+    "TlsState.virt_x18 offset changed; update offset 40 in shared X18/SVC handlers in litebox_syscall_rewriter/src/arm64.rs"
+);
+
 fn get_tls_ptr() -> Option<*const TlsState> {
     let tls_index = TLS_INDEX.load(Ordering::Relaxed);
     if tls_index == u32::MAX {
