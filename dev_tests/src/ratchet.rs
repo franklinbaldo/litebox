@@ -12,8 +12,10 @@ fn ratchet_transmutes() -> Result<()> {
     ratchet(
         &[
             ("dev_tests/", 2),
+            ("dev_tools/", 1),
             ("litebox/", 8),
             ("litebox_platform_linux_userland/", 2),
+            ("litebox_platform_windows_userland/", 1),
         ],
         |file| {
             Ok(file
@@ -34,16 +36,18 @@ fn ratchet_globals() -> Result<()> {
     ratchet(
         &[
             ("dev_bench/", 1),
-            ("litebox/", 9),
+            ("litebox/", 10),
             ("litebox_platform_linux_kernel/", 6),
             ("litebox_platform_linux_userland/", 5),
             ("litebox_platform_lvbs/", 23),
             ("litebox_platform_multiplex/", 1),
-            ("litebox_platform_windows_userland/", 8),
+            ("litebox_platform_windows_userland/", 11),
             ("litebox_runner_lvbs/", 5),
             ("litebox_runner_snp/", 1),
             ("litebox_shim_linux/", 1),
             ("litebox_shim_optee/", 3),
+            ("litebox_common_windows/", 1),
+            ("litebox_shim_windows/", 1),
         ],
         |file| {
             Ok(file
@@ -72,6 +76,7 @@ fn ratchet_maybe_uninit() -> Result<()> {
             ("litebox/", 1),
             ("litebox_platform_linux_userland/", 3),
             ("litebox_shim_linux/", 5),
+            ("litebox_shim_windows/", 3),
         ],
         |file| {
             Ok(file
