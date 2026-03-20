@@ -591,6 +591,20 @@ impl ElfParsedFile {
             // Write the TLS table address at trampoline offset 8
             mem.write(trampoline_start + 8, &tls_table_addr.to_ne_bytes())?;
 
+            // On Windows ARM64, write the precomputed TEB TLS slot offset at
+            // trampoline offset 16. The MRS gate uses this to reach TlsState
+            // via X18 (TEB): LDR Xn, [X18, <this value>] → TlsState*.
+            #[cfg(target_os = "windows")]
+            {
+                let teb_offset =
+                    crate::TEB_TLS_SLOT_OFFSET.load(core::sync::atomic::Ordering::Acquire);
+                assert!(
+                    teb_offset != 0,
+                    "TEB_TLS_SLOT_OFFSET must be set before loading trampolines"
+                );
+                mem.write(trampoline_start + 16, &teb_offset.to_ne_bytes())?;
+            }
+
             info.tls_table_addr = tls_table_addr;
         }
 

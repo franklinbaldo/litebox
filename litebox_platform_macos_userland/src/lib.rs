@@ -104,14 +104,14 @@ use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::time::Duration;
 
 use litebox::fs::OFlags;
+use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::{
     CowAllocationError, FixedAddressBehavior, MemoryRegionPermissions,
 };
-use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer as _};
 use litebox::shim::ContinueOperation;
 use litebox::utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt};
-use litebox_common_linux::{vmap::VmapManager, MapFlags, ProtFlags, PunchthroughSyscall};
+use litebox_common_linux::{MapFlags, ProtFlags, PunchthroughSyscall, vmap::VmapManager};
 
 use zerocopy::{FromBytes, IntoBytes};
 

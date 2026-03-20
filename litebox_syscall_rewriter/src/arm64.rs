@@ -92,7 +92,7 @@ impl TargetOs {
     pub const fn mrs_gate_insn_count(self) -> usize {
         match self {
             Self::Linux => 5,
-            Self::Windows => 2,
+            Self::Windows => 11,
             Self::MacOs => 13,
         }
     }
@@ -206,8 +206,19 @@ const HEADER_CALLBACK_OFFSET: usize = 0;
 const HEADER_TLS_TABLE_OFFSET: usize = 8;
 
 /// Offset of the sigreturn preamble (8 bytes = 2 instructions: MOV X8, #139; B <sigreturn_snippet>).
+/// On Windows ARM64 this offset is repurposed for the TEB TLS slot offset
+/// (see `HEADER_TEB_TLS_OFFSET`).
 #[allow(dead_code)] // Documenting the layout; used by tests
 const HEADER_SIGRETURN_OFFSET: usize = 16;
+
+/// Offset of the precomputed TEB TLS slot offset (8 bytes, Windows ARM64 only).
+///
+/// Stores `TEB_TLS_SLOTS_OFFSET + TLS_INDEX * 8`, allowing the MRS gate to
+/// reach the TlsState pointer via `LDR Xn, [X18, <this value>]`.
+/// Reuses the same header offset as `HEADER_SIGRETURN_OFFSET` since sigreturn
+/// is not used on Windows.
+#[allow(dead_code)]
+const HEADER_TEB_TLS_OFFSET: usize = 16;
 
 /// Offset where the sigreturn SVC gate begins.
 /// Called from the sigreturn preamble at offset 16 via `B .+8`.
@@ -725,6 +736,31 @@ fn encode_bl(offset: i64) -> Option<u32> {
 /// Encoding: `0xD65F0000 | (Rn << 5)`
 fn encode_ret(rn: u8) -> u32 {
     0xD65F_0000 | (u32::from(rn) << 5)
+}
+
+/// Encode `CBZ Xt, #offset` (compare and branch on zero, 64-bit).
+///
+/// The offset must be a multiple of 4 and within ±1MB (signed 19-bit instruction count).
+/// Encoding: `[31] = 1 (sf=64-bit)`, `[30:25] = 011010`, `[24] = 0 (not-zero=0 → CBZ)`,
+/// `[23:5] = imm19`, `[4:0] = Rt`
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn encode_cbz(rt: u8, offset: i64) -> Option<u32> {
+    if offset % 4 != 0 {
+        return None;
+    }
+    let imm19 = offset / 4;
+    if !(-0x40000..0x40000).contains(&imm19) {
+        return None;
+    }
+    Some(0xB400_0000 | ((imm19 as u32 & 0x7FFFF) << 5) | u32::from(rt))
+}
+
+/// Encode `LDR Xt, [Xn, Xm]` (64-bit register offset load, no shift).
+///
+/// Loads from address `Xn + Xm` into `Xt`.
+/// Encoding: size=11, V=0, opc=01, Rm, option=011, S=0.
+fn encode_ldr_reg_offset(rt: u8, rn: u8, rm: u8) -> u32 {
+    0xF860_6800 | (u32::from(rm) << 16) | (u32::from(rn) << 5) | u32::from(rt)
 }
 
 // ============================================================
@@ -4145,19 +4181,42 @@ fn emit_mrs_gate(
     }
 }
 
-/// Windows MRS gate: just read the hardware TPIDR_EL0 register, 2 instructions / 8 bytes.
+/// Windows MRS gate: TEB-based TlsState lookup, 11 instructions / 44 bytes.
 ///
-/// On Windows ARM64, `TPIDR_EL0` is a per-thread register preserved across
-/// context switches. `switch_to_guest` sets it to the correct guest TPIDR
-/// value before entering guest code, and the MSR gate updates it when the
-/// guest writes a new value. So a direct hardware read is correct and
-/// avoids the TLS table entry[0] race condition that occurs with multiple
-/// threads sharing the same table.
+/// On Windows ARM64, the kernel does NOT preserve `TPIDR_EL0` across context
+/// switches, so reading the hardware register directly returns stale values.
+/// Instead, the gate reads `TlsState.guest_tpidr` via the TEB (X18), which
+/// Windows guarantees is always valid.
 ///
+/// Access path: `X18 (TEB) → [X18 + TEB_TLS_SLOT_OFFSET] → TlsState* → guest_tpidr`
+///
+/// The precomputed `TEB_TLS_SLOT_OFFSET` (= `TEB_TLS_SLOTS_OFFSET + TLS_INDEX*8`)
+/// is stored in the trampoline header at offset 16 (`HEADER_TEB_TLS_OFFSET`).
+///
+/// A NULL fallback reads `entry[0].guest_tpidr` from the TLS table (header+8)
+/// for early execution before TlsState is registered in the TEB slot (e.g.,
+/// during rtld_audit's `do_syscall` before `run_thread` runs).
+///
+/// **General case (Xd ∉ {X16, X17}):**
 /// ```text
-/// [0] MRS  Xd, TPIDR_EL0       ; read hardware register directly
-/// [1] B    <return_addr>
+/// [0]  STP  X16, X17, [SP, #-16]!    ; save scratch
+/// [1]  LDR  X16, [PC, #off_teb]      ; X16 = TEB_TLS_SLOT_OFFSET (from header+16)
+/// [2]  LDR  X16, [X18, X16]          ; X16 = TlsState* (from TEB TLS slot)
+/// [3]  CBZ  X16, .Lfallback          ; NULL → fallback to entry[0]
+/// [4]  LDR  Xd,  [X16, #64]          ; Xd = TlsState.guest_tpidr
+/// [5]  LDP  X16, X17, [SP], #16      ; restore scratch
+/// [6]  B    <return_addr>
+/// .Lfallback:
+/// [7]  LDR  X16, [PC, #off_tls]      ; X16 = TLS table address (from header+8)
+/// [8]  LDR  Xd,  [X16, #0]           ; Xd = entry[0].guest_tpidr
+/// [9]  LDP  X16, X17, [SP], #16      ; restore scratch
+/// [10] B    <return_addr>
 /// ```
+///
+/// The `guest_tpidr` field offset (64) must match
+/// `core::mem::offset_of!(TlsState, guest_tpidr)` in the platform crate.
+const TLSSTATE_GUEST_TPIDR_OFFSET: u16 = 64;
+
 #[allow(clippy::cast_possible_wrap)]
 fn emit_mrs_gate_windows(
     trampoline_data: &mut Vec<u8>,
@@ -4171,17 +4230,123 @@ fn emit_mrs_gate_windows(
     let mut insn_idx: usize = 0;
     let insn_vaddr = |idx: usize| -> u64 { gate_vaddr + (idx as u64) * 4 };
 
-    // [0] MRS Xd, TPIDR_EL0
-    trampoline_data.extend_from_slice(&encode_mrs_tpidr_el0(rd).to_le_bytes());
+    let teb_offset_vaddr = trampoline_base_addr + HEADER_TEB_TLS_OFFSET as u64;
+    let tls_table_vaddr = trampoline_base_addr + HEADER_TLS_TABLE_OFFSET as u64;
+
+    // Determine scratch register usage based on destination register.
+    // When Xd is X16 or X17, we use the other as the sole scratch.
+    let (save_scratch, restore_scratch, scratch) = match rd {
+        16 => (
+            // [0] STR X17, [SP, #-16]!
+            encode_str_pre_index(17, 31, -16).unwrap(),
+            // restore: LDR X17, [SP], #16
+            encode_ldr_post_index(17, 31, 16).unwrap(),
+            17u8,
+        ),
+        17 => (
+            // [0] STR X16, [SP, #-16]!
+            encode_str_pre_index(16, 31, -16).unwrap(),
+            // restore: LDR X16, [SP], #16
+            encode_ldr_post_index(16, 31, 16).unwrap(),
+            16u8,
+        ),
+        _ => (
+            // [0] STP X16, X17, [SP, #-16]!
+            encode_stp_pre_index(16, 17, 31, -16).unwrap(),
+            // restore: LDP X16, X17, [SP], #16
+            encode_ldp_post_index(16, 17, 31, 16).unwrap(),
+            16u8,
+        ),
+    };
+
+    // [0] Save scratch register(s)
+    trampoline_data.extend_from_slice(&save_scratch.to_le_bytes());
     insn_idx += 1;
 
-    // [1] B <return_addr>
+    // [1] LDR Xscratch, [PC, #off_teb] — load TEB TLS slot offset from header+16
+    let ldr_vaddr = insn_vaddr(insn_idx);
+    let ldr_offset = teb_offset_vaddr.cast_signed() - ldr_vaddr.cast_signed();
+    let ldr_insn = encode_ldr_literal(scratch, ldr_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "LDR literal offset {ldr_offset:#x} out of range for Windows MRS gate TEB load at {:#x}",
+            site.vaddr
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&ldr_insn.to_le_bytes());
+    insn_idx += 1;
+
+    // [2] LDR Xscratch, [X18, Xscratch] — load TlsState* from TEB TLS slot
+    trampoline_data.extend_from_slice(&encode_ldr_reg_offset(scratch, 18, scratch).to_le_bytes());
+    insn_idx += 1;
+
+    // [3] CBZ Xscratch, .Lfallback — NULL check (fallback is at instruction [7])
+    let cbz_offset: i64 = (7 - insn_idx as i64) * 4; // jump forward to [7]
+    let cbz_insn = encode_cbz(scratch, cbz_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "CBZ offset {cbz_offset:#x} out of range for Windows MRS gate at {:#x}",
+            site.vaddr
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&cbz_insn.to_le_bytes());
+    insn_idx += 1;
+
+    // [4] LDR Xd, [Xscratch, #TLSSTATE_GUEST_TPIDR_OFFSET] — read guest_tpidr
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(rd, scratch, TLSSTATE_GUEST_TPIDR_OFFSET)
+            .expect("offset 64 valid for LDR imm")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [5] Restore scratch register(s)
+    trampoline_data.extend_from_slice(&restore_scratch.to_le_bytes());
+    insn_idx += 1;
+
+    // [6] B <return_addr>
     let return_vaddr = site.vaddr + 4;
     let b_vaddr = insn_vaddr(insn_idx);
     let b_offset = return_vaddr.cast_signed() - b_vaddr.cast_signed();
     let b_insn = encode_b(b_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
             "B offset {b_offset:#x} out of range for Windows MRS gate return at {:#x}",
+            site.vaddr
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&b_insn.to_le_bytes());
+    insn_idx += 1;
+
+    // --- Fallback path: TlsState is NULL (early execution before run_thread) ---
+
+    // [7] LDR Xscratch, [PC, #off_tls] — load TLS table address from header+8
+    let ldr_vaddr = insn_vaddr(insn_idx);
+    let ldr_offset = tls_table_vaddr.cast_signed() - ldr_vaddr.cast_signed();
+    let ldr_insn = encode_ldr_literal(scratch, ldr_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "LDR literal offset {ldr_offset:#x} out of range for Windows MRS gate TLS fallback at {:#x}",
+            site.vaddr
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&ldr_insn.to_le_bytes());
+    insn_idx += 1;
+
+    // [8] LDR Xd, [Xscratch, #0] — entry[0].guest_tpidr
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(rd, scratch, 0)
+            .expect("offset 0 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [9] Restore scratch register(s)
+    trampoline_data.extend_from_slice(&restore_scratch.to_le_bytes());
+    insn_idx += 1;
+
+    // [10] B <return_addr>
+    let b_vaddr = insn_vaddr(insn_idx);
+    let b_offset = return_vaddr.cast_signed() - b_vaddr.cast_signed();
+    let b_insn = encode_b(b_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "B offset {b_offset:#x} out of range for Windows MRS gate fallback return at {:#x}",
             site.vaddr
         ))
     })?;

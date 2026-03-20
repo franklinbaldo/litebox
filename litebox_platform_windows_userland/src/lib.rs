@@ -122,6 +122,12 @@ impl WindowsUserland {
     #[cfg(target_arch = "aarch64")]
     fn set_thread_tpidr(new_tpidr: usize) {
         THREAD_TPIDR.set(new_tpidr);
+        // Also update TlsState.guest_tpidr so the MRS gate (which reads via
+        // TEB → TlsState) sees the new value immediately.
+        if let Some(tls) = get_tls_ptr() {
+            let tls = unsafe { &*tls };
+            tls.guest_tpidr.set(new_tpidr);
+        }
     }
 
     /// Initialize guest TLS state for a new thread (aarch64).
@@ -466,6 +472,36 @@ impl WindowsUserland {
         #[cfg(target_arch = "aarch64")]
         WindowsUserland::init_thread_tls();
 
+        // Allocate a Windows TLS slot for storing per-thread TlsState pointers.
+        // This must happen before the ELF loader runs, because load_trampoline
+        // writes the precomputed TEB offset into the trampoline header for the
+        // MRS gate to use.
+        //
+        // We use this instead of native TLS because accesses are easier from
+        // assembly. In particular, finding the module's TLS base requires extra
+        // registers and/or clobbering flags, whereas we can get the value of a
+        // TLS slot with only one register and no changes to flags.
+        {
+            static REGISTER_KEY: std::sync::Once = const { std::sync::Once::new() };
+            REGISTER_KEY.call_once(|| {
+                let index = unsafe { windows_sys::Win32::System::Threading::TlsAlloc() };
+                assert!(
+                    index < 64,
+                    "no non-extended TLS slots available: {index:#x}"
+                );
+                TLS_INDEX.store(index, Ordering::Relaxed);
+
+                // Store the precomputed TEB offset so load_trampoline can write
+                // it into the trampoline header for the MRS gate.
+                #[cfg(target_arch = "aarch64")]
+                {
+                    const TEB_TLS_SLOTS_OFFSET: usize = 5248;
+                    let offset = TEB_TLS_SLOTS_OFFSET + (index as usize) * 8;
+                    litebox_common_linux::TEB_TLS_SLOT_OFFSET.store(offset, Ordering::Release);
+                }
+            });
+        }
+
         // Windows sets FS_BASE to 0 regularly upon scheduling; we register an exception handler
         // to set FS_BASE back to a "stored" value whenever we notice that it has become 0.
         // On ARM64, the VEH is still needed for guest exception handling.
@@ -614,31 +650,16 @@ impl litebox::platform::Provider for WindowsUserland {}
 ///
 /// # Safety
 /// The context must be valid guest context.
-#[expect(
-    clippy::missing_panics_doc,
-    reason = "the caller cannot control whether this will panic"
-)]
 pub unsafe fn run_thread(
     shim: impl litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
     ctx: &mut litebox_common_linux::PtRegs,
 ) {
-    // Allocate a TLS slot for this module if not already done. This is used as
-    // a place to store data across calls to the guest, since all the registers
-    // are used by the guest and will be clobbered.
-    //
-    // We use this instead of native TLS because accesses are easier from
-    // assembly. In particular, finding the module's TLS base requires extra
-    // registers and/or clobbering flags, whereas we can get the value of a
-    // TLS slot with only one register and no changes to flags.
-    static REGISTER_KEY: std::sync::Once = const { std::sync::Once::new() };
-    REGISTER_KEY.call_once(|| {
-        let index = unsafe { windows_sys::Win32::System::Threading::TlsAlloc() };
-        assert!(
-            index < 64,
-            "no non-extended TLS slots available: {index:#x}"
-        );
-        TLS_INDEX.store(index, Ordering::Relaxed);
-    });
+    // TLS slot allocation has been moved to WindowsUserland::new() so the index
+    // is available before the ELF loader runs (needed for the MRS gate header).
+    debug_assert!(
+        TLS_INDEX.load(Ordering::Relaxed) != u32::MAX,
+        "TlsAlloc must be called before run_thread (in WindowsUserland::new)"
+    );
     run_thread_inner(&shim, ctx);
 }
 
@@ -660,6 +681,8 @@ fn run_thread_inner(
         orig_stack_base: 0.into(),
         #[cfg(target_arch = "aarch64")]
         orig_stack_limit: 0.into(),
+        #[cfg(target_arch = "aarch64")]
+        guest_tpidr: 0.into(),
         continue_context: Box::default(),
     };
     unsafe {
@@ -716,9 +739,23 @@ struct TlsState {
     /// On ARM64, saves the original TEB StackLimit.
     #[cfg(target_arch = "aarch64")]
     orig_stack_limit: Cell<usize>,
+    /// On ARM64, stores the guest's virtual TPIDR_EL0 value in a location
+    /// reachable from the MRS gate via TEB (X18). The MRS gate reads this
+    /// field instead of the hardware TPIDR_EL0 register, which Windows does
+    /// not preserve across context switches.
+    #[cfg(target_arch = "aarch64")]
+    guest_tpidr: Cell<usize>,
     continue_context:
         Box<std::cell::UnsafeCell<windows_sys::Win32::System::Diagnostics::Debug::CONTEXT>>,
 }
+
+// The MRS gate in litebox_syscall_rewriter hardcodes this offset as
+// TLSSTATE_GUEST_TPIDR_OFFSET. Keep them in sync.
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(
+    core::mem::offset_of!(TlsState, guest_tpidr) == 64,
+    "TlsState.guest_tpidr offset changed; update TLSSTATE_GUEST_TPIDR_OFFSET in litebox_syscall_rewriter/src/arm64.rs"
+);
 
 fn get_tls_ptr() -> Option<*const TlsState> {
     let tls_index = TLS_INDEX.load(Ordering::Relaxed);
@@ -1322,12 +1359,13 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
 
         // Set TPIDR_EL0 to the guest's virtual TPIDR value before entering guest.
         // The shared SVC handler uses TPIDR_EL0 for TLS table lookup (the key
-        // in the table is also guest_tpidr). The MRS gate reads entry[0].key
-        // as the guest TPIDR value. Both return the same value, which is the
-        // guest's actual virtual TPIDR.
+        // in the table is also guest_tpidr). The MRS gate now reads guest_tpidr
+        // from TlsState via TEB, but we still write TPIDR_EL0 for the SVC handler.
+        let guest_tpidr = THREAD_TPIDR.get();
         unsafe {
-            litebox_common_linux::write_tpidr_el0(THREAD_TPIDR.get());
+            litebox_common_linux::write_tpidr_el0(guest_tpidr);
         }
+        tls.guest_tpidr.set(guest_tpidr);
 
         tls.is_in_guest.set(true);
         switch_to_guest_asm(ctx)
@@ -2652,6 +2690,9 @@ impl ThreadContext<'_> {
                         }
                         THREAD_TPIDR.set(found_tpidr as usize);
                     }
+                    // Sync the updated guest_tpidr to TlsState so the MRS gate
+                    // (which reads via TEB → TlsState) sees the latest value.
+                    self.tls.guest_tpidr.set(THREAD_TPIDR.get());
                     update_host_tls_entry(self.tls);
                 }
                 unsafe { switch_to_guest(self.ctx) }

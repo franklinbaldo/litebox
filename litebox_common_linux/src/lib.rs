@@ -1272,6 +1272,16 @@ pub static HOST_TLS_TABLE_ADDR: core::sync::atomic::AtomicUsize =
 pub static SIGRETURN_TRAMPOLINE_ADDR: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
+/// Precomputed TEB TLS slot offset for the MRS gate on Windows ARM64.
+///
+/// Value = `TEB_TLS_SLOTS_OFFSET + TLS_INDEX * 8`, where `TEB_TLS_SLOTS_OFFSET`
+/// is 5248 (0x1480) and `TLS_INDEX` is the slot index returned by `TlsAlloc`.
+/// The MRS gate uses this to reach the `TlsState` pointer via `LDR Xn, [X18, <offset>]`.
+/// Set by the platform during initialization, before the ELF loader runs.
+#[cfg(all(target_arch = "aarch64", target_os = "windows"))]
+pub static TEB_TLS_SLOT_OFFSET: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
 /// Reads the current FS segment selector
 #[cfg(target_arch = "x86")]
 pub fn rdfss() -> u16 {

@@ -86,6 +86,11 @@ static syscall_stub_t syscall_entry = 0;
 // On Linux, syscall_callback expects x18 = host TLS.
 // On macOS, host_tls is passed via [SP+40] (x18 is unreliable on macOS).
 static uint64_t tls_table_ptr = 0;
+// TEB TLS slot offset from the trampoline (offset 16, Windows ARM64 only).
+// Stores TEB_TLS_SLOTS_OFFSET + TLS_INDEX*8, used by the MRS gate to reach
+// TlsState via X18 (TEB). Propagated from the main binary's trampoline to
+// the interpreter's trampoline.
+static uint64_t teb_tls_offset = 0;
 #endif
 static char interp[256] = {0}; // Buffer for interpreter path
 
@@ -463,6 +468,10 @@ int parse_object(const struct link_map *map) {
   // Read the TLS lookup table pointer at offset 8.
   // This is written by the litebox loader at trampoline_start + 8.
   tls_table_ptr = read_u64((const char *)trampoline_addr + 8);
+  // Read the TEB TLS slot offset at offset 16 (Windows ARM64 only).
+  // This is written by the litebox loader at trampoline_start + 16.
+  // On non-Windows hosts this will be 0 (sigreturn preamble), which is fine.
+  teb_tls_offset = read_u64((const char *)trampoline_addr + 16);
 #endif
   print_hex((uint64_t)syscall_entry);
   return 0;
@@ -716,6 +725,13 @@ unsigned int la_objopen(struct link_map *map,
   // This pointer was obtained from the main binary's trampoline in parse_object.
   if (tls_table_ptr != 0) {
     __builtin_memcpy((char *)mapped + 8, (const void *)&tls_table_ptr, 8);
+  }
+  // Write the TEB TLS slot offset at offset 16 (Windows ARM64 only).
+  // The MRS gate uses this to reach TlsState via X18 (TEB).
+  // On non-Windows hosts teb_tls_offset is 0, which is harmless (the MRS gate
+  // on Linux reads entry[0] from the TLS table instead).
+  if (teb_tls_offset != 0) {
+    __builtin_memcpy((char *)mapped + 16, (const void *)&teb_tls_offset, 8);
   }
 #endif
   // Flush data cache and invalidate instruction cache for the entire trampoline
