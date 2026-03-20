@@ -149,6 +149,20 @@ unsafe extern "system" fn vectored_exception_handler(
         context = &mut *info.ContextRecord;
     }
 
+    // Pass through host-side exceptions that are never guest faults:
+    // - 0xE06D7363: MSVC C++ exception (thread cleanup, CRT)
+    // - 0x40010006: DBG_PRINTEXCEPTION_C (CRT debug output)
+    // - 0x406D1388: SetThreadName exception (thread naming)
+    const EH_EXCEPTION_NUMBER: i32 = 0xE06D7363_u32 as i32;
+    const DBG_PRINTEXCEPTION_C: i32 = 0x40010006_u32 as i32;
+    const SET_THREAD_NAME: i32 = 0x406D1388_u32 as i32;
+    match exception_record.ExceptionCode {
+        EH_EXCEPTION_NUMBER | DBG_PRINTEXCEPTION_C | SET_THREAD_NAME => {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        _ => {}
+    }
+
     if !tls.is_in_guest.get() {
         // This might be a faulting guest memory access in LiteBox code. Try to
         // recover.
