@@ -2664,39 +2664,11 @@ impl ThreadContext<'_> {
             ContinueOperation::Resume => {
                 #[cfg(target_arch = "aarch64")]
                 {
-                    // Sync guest_tpidr from TLS table and always update entry[0].
-                    // The MRS gate reads entry[0].key as the guest TPIDR value.
-                    // The MSR handler may have updated a different entry, so we
-                    // must ensure entry[0] has the current guest TPIDR.
-                    let table_addr =
-                        litebox_common_linux::HOST_TLS_TABLE_ADDR.load(Ordering::Acquire);
-                    if table_addr != 0 {
-                        // Read guest TPIDR from the MSR handler's last update.
-                        // The MSR handler writes to the matching entry's key,
-                        // which might not be entry[0]. Scan for the non-sentinel,
-                        // non-zero key that has our host_tls value.
-                        let tls_value = core::ptr::from_ref(self.tls) as u64;
-                        let mut found_tpidr = THREAD_TPIDR.get() as u64;
-                        for index in 0..TLS_TABLE_ENTRIES {
-                            let key = unsafe {
-                                ((table_addr + index * 16) as *const u64).read_volatile()
-                            };
-                            if key == TLS_TABLE_SENTINEL {
-                                break;
-                            }
-                            let val = unsafe {
-                                ((table_addr + index * 16 + 8) as *const u64).read_volatile()
-                            };
-                            if val == tls_value && key != 0 {
-                                found_tpidr = key;
-                                break;
-                            }
-                        }
-                        THREAD_TPIDR.set(found_tpidr as usize);
-                    }
-                    // Sync the updated guest_tpidr to TlsState so the MRS gate
-                    // (which reads via TEB → TlsState) sees the latest value.
-                    self.tls.guest_tpidr.set(THREAD_TPIDR.get());
+                    // The MSR handler writes guest_tpidr directly to
+                    // TlsState.guest_tpidr (via TEB). Read it back as the
+                    // authoritative value — no TLS table scan needed.
+                    let guest_tpidr = self.tls.guest_tpidr.get();
+                    THREAD_TPIDR.set(guest_tpidr);
                     update_host_tls_entry(self.tls);
                 }
                 unsafe { switch_to_guest(self.ctx) }

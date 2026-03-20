@@ -106,18 +106,15 @@ Both `guest_tpidr` at offset 64 and `virt_x18` at offset 40 are validated by
 `const _: () = assert!(offset_of!(...) == N)` in the platform crate. Adding
 a field that shifts either offset will produce a compile error.
 
-### 2. Dual-copy TPIDR synchronization
+### 2. TPIDR source of truth
 
-On Windows, the guest's virtual TPIDR exists in two places:
-- `THREAD_TPIDR` — Rust thread-local `Cell<usize>`, source of truth
-- `TlsState.guest_tpidr` — published copy for the MRS gate
+On Windows, `TlsState.guest_tpidr` is the single authoritative copy. The MSR
+handler writes it directly via TEB, and `call_shim` reads it back from
+TlsState without scanning the TLS table. `THREAD_TPIDR` (Rust thread-local)
+is kept in sync as a convenience for Rust code but is not authoritative.
 
-Three sync points must keep them consistent:
-- `set_thread_tpidr()` → writes both
-- `switch_to_guest()` → copies `THREAD_TPIDR` → `TlsState.guest_tpidr`
-- `call_shim()` → reads from TLS table → updates both
-
-A missed sync point means the MRS gate returns a stale TPIDR value.
+On Linux/macOS, the TLS table entry key is the authoritative copy, and
+`call_shim` must scan the table to discover MSR handler updates.
 
 ### 3. TLS table entry[0] fallback is single-thread only
 
