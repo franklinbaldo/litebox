@@ -2651,45 +2651,6 @@ impl ThreadContext<'_> {
                             }
                         }
                         THREAD_TPIDR.set(found_tpidr as usize);
-
-                        // Always write guest_tpidr to entry[0].key so the MRS
-                        // gate returns the correct value.
-                        unsafe {
-                            (table_addr as *mut u64).write_volatile(found_tpidr);
-                            ((table_addr + 8) as *mut u64).write_volatile(tls_value);
-                        }
-
-                        // DEBUG: verify entry[0]
-                        let e0_key = unsafe { (table_addr as *const u64).read_volatile() };
-                        let e0_val = unsafe { ((table_addr + 8) as *const u64).read_volatile() };
-                        if e0_key != found_tpidr || e0_val != tls_value {
-                            use std::io::Write;
-                            let _ = writeln!(
-                                std::io::stderr(),
-                                "[winarm64] BUG: entry[0] mismatch! key={:#x} expected={:#x}",
-                                e0_key,
-                                found_tpidr
-                            );
-                        }
-
-                        // DEBUG: also check trampoline header points to same table
-                        let sigret_addr =
-                            litebox_common_linux::SIGRETURN_TRAMPOLINE_ADDR.load(Ordering::Acquire);
-                        if sigret_addr != 0 {
-                            // trampoline header is at sigreturn_addr - 16
-                            // offset 8 in header = sigreturn_addr - 16 + 8 = sigreturn_addr - 8
-                            let header_tls_ptr =
-                                unsafe { ((sigret_addr - 8) as *const u64).read_volatile() };
-                            if header_tls_ptr != table_addr as u64 {
-                                use std::io::Write;
-                                let _ = writeln!(
-                                    std::io::stderr(),
-                                    "[winarm64] BUG: trampoline header TLS ptr={:#x} HOST_TLS={:#x}",
-                                    header_tls_ptr,
-                                    table_addr
-                                );
-                            }
-                        }
                     }
                     update_host_tls_entry(self.tls);
                 }

@@ -91,7 +91,8 @@ impl TargetOs {
     // MRS gate
     pub const fn mrs_gate_insn_count(self) -> usize {
         match self {
-            Self::Linux | Self::Windows => 5,
+            Self::Linux => 5,
+            Self::Windows => 2,
             Self::MacOs => 13,
         }
     }
@@ -4117,7 +4118,15 @@ fn emit_mrs_gate(
     target_os: TargetOs,
 ) -> Result<()> {
     match target_os {
-        TargetOs::Linux | TargetOs::Windows => emit_mrs_gate_linux(
+        TargetOs::Linux => emit_mrs_gate_linux(
+            trampoline_data,
+            gate_offset,
+            trampoline_base_addr,
+            site,
+            rd,
+            target_os,
+        ),
+        TargetOs::Windows => emit_mrs_gate_windows(
             trampoline_data,
             gate_offset,
             trampoline_base_addr,
@@ -4134,6 +4143,59 @@ fn emit_mrs_gate(
             target_os,
         ),
     }
+}
+
+/// Windows MRS gate: just read the hardware TPIDR_EL0 register, 2 instructions / 8 bytes.
+///
+/// On Windows ARM64, `TPIDR_EL0` is a per-thread register preserved across
+/// context switches. `switch_to_guest` sets it to the correct guest TPIDR
+/// value before entering guest code, and the MSR gate updates it when the
+/// guest writes a new value. So a direct hardware read is correct and
+/// avoids the TLS table entry[0] race condition that occurs with multiple
+/// threads sharing the same table.
+///
+/// ```text
+/// [0] MRS  Xd, TPIDR_EL0       ; read hardware register directly
+/// [1] B    <return_addr>
+/// ```
+#[allow(clippy::cast_possible_wrap)]
+fn emit_mrs_gate_windows(
+    trampoline_data: &mut Vec<u8>,
+    gate_offset: usize,
+    trampoline_base_addr: u64,
+    site: &PatchSite,
+    rd: u8,
+    target_os: TargetOs,
+) -> Result<()> {
+    let gate_vaddr = trampoline_base_addr + gate_offset as u64;
+    let mut insn_idx: usize = 0;
+    let insn_vaddr = |idx: usize| -> u64 { gate_vaddr + (idx as u64) * 4 };
+
+    // [0] MRS Xd, TPIDR_EL0
+    trampoline_data.extend_from_slice(&encode_mrs_tpidr_el0(rd).to_le_bytes());
+    insn_idx += 1;
+
+    // [1] B <return_addr>
+    let return_vaddr = site.vaddr + 4;
+    let b_vaddr = insn_vaddr(insn_idx);
+    let b_offset = return_vaddr.cast_signed() - b_vaddr.cast_signed();
+    let b_insn = encode_b(b_offset).ok_or_else(|| {
+        Error::DisassemblyFailure(format!(
+            "B offset {b_offset:#x} out of range for Windows MRS gate return at {:#x}",
+            site.vaddr
+        ))
+    })?;
+    trampoline_data.extend_from_slice(&b_insn.to_le_bytes());
+    insn_idx += 1;
+
+    debug_assert_eq!(insn_idx, target_os.mrs_gate_insn_count());
+    debug_assert_eq!(
+        trampoline_data.len() - gate_offset,
+        target_os.mrs_gate_size(),
+        "Windows MRS gate size mismatch"
+    );
+
+    Ok(())
 }
 
 /// Linux MRS gate: inline TLS table read, 5 instructions / 20 bytes.
