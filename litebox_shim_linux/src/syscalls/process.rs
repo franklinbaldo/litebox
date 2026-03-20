@@ -25,6 +25,7 @@ use litebox::platform::{
 };
 use litebox::platform::{RawMutPointer as _, TimerHandle, TimerProvider};
 use litebox::sync::Mutex;
+use litebox::utils::ReinterpretSignedExt as _;
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, FutexArgs, PrctlArg, TimeParam, errno::Errno,
@@ -400,6 +401,11 @@ enum ThreadInitState {
         stack: Option<usize>,
         tls: Option<ThreadLocalDescriptor>,
         set_child_tid: Option<MutPtr<i32>>,
+        /// True when this thread is the initial (main) thread of a newly
+        /// forked process. False for `clone(CLONE_THREAD)` worker threads.
+        /// Controls whether `process_thread_handles` is updated so
+        /// cross-process signals (e.g. SIGCHLD) can reach this process.
+        is_process_main_thread: bool,
     },
 }
 
@@ -1207,6 +1213,7 @@ impl<FS: ShimFS> Task<FS> {
             stack: sp,
             tls,
             set_child_tid,
+            is_process_main_thread: false,
         });
         thread.clear_child_tid.set(clear_child_tid);
 
@@ -1612,6 +1619,7 @@ impl<FS: ShimFS> Task<FS> {
             stack: child_stack,
             tls: parent_tls, // inherit parent's guest TLS
             set_child_tid,
+            is_process_main_thread: true,
         });
         child_thread.clear_child_tid.set(clear_child_tid);
 
@@ -2698,7 +2706,7 @@ impl<FS: ShimFS> Task<FS> {
         let path = path_cstr.to_str().map_err(|_| Errno::ENOENT)?;
 
         // Copy argv and envp vectors
-        let argv_vec = if argv.as_usize() == 0 {
+        let mut argv_vec = if argv.as_usize() == 0 {
             alloc::vec::Vec::new()
         } else {
             copy_vector(argv, "argv")?
@@ -2856,7 +2864,7 @@ impl<FS: ShimFS> Task<FS> {
                 litebox::log_println!(
                     self.global.platform,
                     "execve({:?}): load_program failed: {:?} — terminating child",
-                    path,
+                    exec_path,
                     e,
                 );
                 self.exit_group(ExitStatus::Exit(127_i32.truncate()));
@@ -3000,6 +3008,7 @@ impl<FS: ShimFS> Task<FS> {
                 tls,
                 stack,
                 set_child_tid,
+                is_process_main_thread,
             } => {
                 // Set the stack and the return value from clone().
                 #[cfg(target_arch = "x86_64")]
@@ -3037,7 +3046,7 @@ impl<FS: ShimFS> Task<FS> {
                     // Set the child TID if requested.
                     let _ = child_tid_ptr.write_at_offset(0, self.tid);
                 }
-                false
+                is_process_main_thread
             }
         }
     }
