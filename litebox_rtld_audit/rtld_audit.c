@@ -178,7 +178,7 @@ void print_hex(uint64_t data) {
 /// The entry point is at offset 0 of the mapped trampoline. The litebox loader
 /// already validated the magic when parsing the file header.
 int parse_object(const struct link_map *map) {
-  unsigned long max_addr = 0;
+  unsigned long max_vaddr = 0;
   Elf64_Ehdr *eh = (Elf64_Ehdr *)map->l_addr;
   if (memcmp(eh->e_ident,
              "\x7f"
@@ -190,9 +190,12 @@ int parse_object(const struct link_map *map) {
   Elf64_Phdr *phdrs = (Elf64_Phdr *)((char *)map->l_addr + eh->e_phoff);
   for (int i = 0; i < eh->e_phnum; i++) {
     if (phdrs[i].p_type == PT_LOAD) {
-      unsigned long vaddr_end = (phdrs[i].p_vaddr + phdrs[i].p_memsz);
-      if (vaddr_end > max_addr) {
-        max_addr = vaddr_end;
+      // The trampoline PT_LOAD (repurposed from a sacrificial phdr by
+      // patch_phdr_to_pt_load() in litebox_syscall_rewriter/src/lib.rs) has
+      // the highest p_vaddr, since find_addr_for_trampoline_code() places it
+      // at ceil(max(p_vaddr + p_memsz), page_size) of the original segments.
+      if (phdrs[i].p_vaddr > max_vaddr) {
+        max_vaddr = phdrs[i].p_vaddr;
       }
     } else if (phdrs[i].p_type == PT_INTERP) {
       strncpy(interp, (char *)map->l_addr + phdrs[i].p_vaddr,
@@ -200,8 +203,7 @@ int parse_object(const struct link_map *map) {
       interp[sizeof(interp) - 1] = '\0'; // Ensure null termination
     }
   }
-  max_addr = align_up(max_addr, 0x1000);
-  void *trampoline_addr = (void *)map->l_addr + max_addr;
+  void *trampoline_addr = (void *)map->l_addr + max_vaddr;
   // The trampoline code has the syscall entry point at offset 0.
   syscall_entry = (syscall_stub_t)read_u64(trampoline_addr);
   if (syscall_entry == 0) {

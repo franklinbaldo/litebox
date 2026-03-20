@@ -41,6 +41,8 @@ pub enum Error {
     InsufficientBytesBeforeOrAfter(u64),
     #[error("provided trampoline address is too large for 32-bit executable")]
     TrampolineAddressTooLarge,
+    #[error("no dispensable program header (PT_GNU_PROPERTY or PT_NOTE) found to repurpose as PT_LOAD for the trampoline")]
+    NoSacrificialPhdr,
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -105,7 +107,14 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     let buf = &mut buf[..input_binary.len()];
 
     // Parse the ELF and extract all metadata we need, then drop the borrow so we can mutate buf.
-    let (arch, dl_sysinfo_int80, text_sections, control_transfer_targets, trampoline_base_addr) = {
+    let (
+        arch,
+        dl_sysinfo_int80,
+        text_sections,
+        control_transfer_targets,
+        trampoline_base_addr,
+        sacrificial_phdr_offset,
+    ) = {
         let file = object::File::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
 
         let arch = match file {
@@ -130,12 +139,15 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
 
         let trampoline_base_addr = find_addr_for_trampoline_code(&file);
 
+        let sacrificial_phdr_offset = find_sacrificial_phdr(&file, &*buf);
+
         (
             arch,
             dl_sysinfo_int80,
             text_sections,
             control_transfer_targets,
             trampoline_base_addr,
+            sacrificial_phdr_offset,
         )
     };
 
@@ -211,6 +223,24 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
         };
         out.extend_from_slice(header.as_bytes());
     }
+
+    // Repurpose a dispensable program header (PT_GNU_PROPERTY or PT_NOTE) as a PT_LOAD
+    // covering the trampoline region. Without this, ld.so doesn't reserve address space
+    // for the trampoline, and ASLR can place another library's mapping on top of it,
+    // causing the MAP_FIXED in rtld_audit to clobber that library's data.
+    let phdr_file_offset = sacrificial_phdr_offset.ok_or(Error::NoSacrificialPhdr)?;
+    // The trampoline's memsz is page-aligned so ld.so maps the full range
+    let trampoline_memsz = (trampoline_size as u64).next_multiple_of(0x1000);
+    patch_phdr_to_pt_load(
+        &mut out,
+        arch,
+        phdr_file_offset,
+        trampoline_file_offset,
+        trampoline_base_addr,
+        trampoline_size as u64,
+        trampoline_memsz,
+    )?;
+
     Ok(out)
 }
 
@@ -457,6 +487,12 @@ fn find_addr_for_trampoline_code(file: &object::File<'_>) -> u64 {
 }
 
 /// Returns the highest `p_vaddr + p_memsz` among all `PT_LOAD` segments.
+///
+/// This value is used to compute the trampoline's vaddr (rounded up to a page
+/// boundary). The rtld_audit side (parse_object() in
+/// litebox_rtld_audit/rtld_audit.c) finds the trampoline by taking max(p_vaddr)
+/// across all PT_LOAD segments at runtime, which yields the trampoline's vaddr
+/// directly (since it is placed above all original segments).
 fn max_load_segment_end<Elf: object::read::elf::FileHeader>(elf: &ElfFile<'_, Elf>) -> u64
 where
     Elf::Word: Into<u64>,
@@ -468,6 +504,130 @@ where
         .map(|ph| ph.p_vaddr(endian).into() + ph.p_memsz(endian).into())
         .max()
         .unwrap()
+}
+
+/// Find a dispensable program header entry that can be repurposed as PT_LOAD.
+/// Prefers PT_GNU_PROPERTY; then a PT_NOTE that does not contain the GNU
+/// build-id; finally falls back to any PT_NOTE. The build-id data remains
+/// accessible via the .note.gnu.build-id section header, so debug tools that
+/// use section headers (gdb, perf, debuginfod) are unaffected.
+/// Returns the byte offset within the file of that program header entry.
+fn find_sacrificial_phdr(file: &object::File<'_>, data: &[u8]) -> Option<usize> {
+    match file {
+        object::File::Elf64(elf) => find_sacrificial_phdr_impl(elf, data),
+        object::File::Elf32(elf) => find_sacrificial_phdr_impl(elf, data),
+        _ => None,
+    }
+}
+
+fn find_sacrificial_phdr_impl<Elf: object::read::elf::FileHeader>(
+    elf: &ElfFile<'_, Elf>,
+    data: &[u8],
+) -> Option<usize>
+where
+    Elf::Word: Into<u64>,
+{
+    use object::read::elf::ProgramHeader as _;
+
+    let endian = elf.endian();
+    let e_phoff: u64 = elf.elf_header().e_phoff(endian).into();
+    let e_phentsize = elf.elf_header().e_phentsize(endian) as u64;
+
+    let mut non_buildid_note_offset = None;
+    let mut any_note_offset = None;
+    for (i, ph) in elf.elf_program_headers().iter().enumerate() {
+        let pt = ph.p_type(endian);
+        let offset = e_phoff + i as u64 * e_phentsize;
+        if pt == object::elf::PT_GNU_PROPERTY {
+            return Some(offset as usize);
+        }
+        if pt == object::elf::PT_NOTE {
+            if any_note_offset.is_none() {
+                any_note_offset = Some(offset as usize);
+            }
+            if non_buildid_note_offset.is_none() {
+                let has_build_id = ph
+                    .notes(endian, data)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|mut notes| {
+                        notes.any(|note| {
+                            note.as_ref().is_ok_and(|n| {
+                                n.name() == object::elf::ELF_NOTE_GNU
+                                    && n.n_type(endian) == object::elf::NT_GNU_BUILD_ID
+                            })
+                        })
+                    });
+                if !has_build_id {
+                    non_buildid_note_offset = Some(offset as usize);
+                }
+            }
+        }
+    }
+    // Prefer a PT_NOTE without the build-id; fall back to any PT_NOTE.
+    non_buildid_note_offset.or(any_note_offset)
+}
+
+/// Overwrite a program header entry in-place to become a PT_LOAD for the trampoline.
+fn patch_phdr_to_pt_load(
+    out: &mut [u8],
+    arch: Arch,
+    phdr_offset: usize,
+    file_offset: u64,
+    vaddr: u64,
+    filesz: u64,
+    memsz: u64,
+) -> Result<()> {
+    let flags = object::elf::PF_R | object::elf::PF_X;
+    match arch {
+        Arch::X86_64 => {
+            // ProgramHeader64 layout (56 bytes):
+            // p_type(4), p_flags(4), p_offset(8), p_vaddr(8), p_paddr(8),
+            // p_filesz(8), p_memsz(8), p_align(8)
+            let p = phdr_offset;
+            assert!(
+                p + 56 <= out.len(),
+                "phdr_offset {p:#x} + 56 exceeds output buffer length {:#x}",
+                out.len()
+            );
+            out[p..p + 4].copy_from_slice(&object::elf::PT_LOAD.to_le_bytes());
+            out[p + 4..p + 8].copy_from_slice(&flags.to_le_bytes());
+            out[p + 8..p + 16].copy_from_slice(&file_offset.to_le_bytes());
+            out[p + 16..p + 24].copy_from_slice(&vaddr.to_le_bytes());
+            out[p + 24..p + 32].copy_from_slice(&vaddr.to_le_bytes()); // p_paddr
+            out[p + 32..p + 40].copy_from_slice(&filesz.to_le_bytes());
+            out[p + 40..p + 48].copy_from_slice(&memsz.to_le_bytes());
+            out[p + 48..p + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+        }
+        Arch::X86_32 => {
+            // ProgramHeader32 layout (32 bytes):
+            // p_type(4), p_offset(4), p_vaddr(4), p_paddr(4),
+            // p_filesz(4), p_memsz(4), p_flags(4), p_align(4)
+            let p = phdr_offset;
+            assert!(
+                p + 32 <= out.len(),
+                "phdr_offset {p:#x} + 32 exceeds output buffer length {:#x}",
+                out.len()
+            );
+            let file_offset_32 =
+                u32::try_from(file_offset).map_err(|_| Error::TrampolineAddressTooLarge)?;
+            let vaddr_32 =
+                u32::try_from(vaddr).map_err(|_| Error::TrampolineAddressTooLarge)?;
+            let filesz_32 =
+                u32::try_from(filesz).map_err(|_| Error::TrampolineAddressTooLarge)?;
+            let memsz_32 =
+                u32::try_from(memsz).map_err(|_| Error::TrampolineAddressTooLarge)?;
+            out[p..p + 4].copy_from_slice(&object::elf::PT_LOAD.to_le_bytes());
+            out[p + 4..p + 8].copy_from_slice(&file_offset_32.to_le_bytes());
+            out[p + 8..p + 12].copy_from_slice(&vaddr_32.to_le_bytes());
+            out[p + 12..p + 16].copy_from_slice(&vaddr_32.to_le_bytes()); // p_paddr
+            out[p + 16..p + 20].copy_from_slice(&filesz_32.to_le_bytes());
+            out[p + 20..p + 24].copy_from_slice(&memsz_32.to_le_bytes());
+            out[p + 24..p + 28].copy_from_slice(&flags.to_le_bytes());
+            out[p + 28..p + 32].copy_from_slice(&0x1000u32.to_le_bytes());
+        }
+    }
+    Ok(())
 }
 
 fn get_symbols(file: &object::File<'_>) -> Option<u64> {
