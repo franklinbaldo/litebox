@@ -527,6 +527,43 @@ impl SignalState {
 struct DeliverFault;
 
 impl<FS: ShimFS> Task<FS> {
+    /// Handle `rt_sigsuspend(mask, sigsetsize)` and `pause()`.
+    ///
+    /// Temporarily replaces the signal mask and suspends the thread until a
+    /// signal whose action is to invoke a handler is delivered. Always returns
+    /// `EINTR` (after restoring the original mask).
+    pub(crate) fn sys_rt_sigsuspend(
+        &self,
+        mask_ptr: Option<crate::ConstPtr<SigSet>>,
+        sigsetsize: usize,
+    ) -> Result<usize, Errno> {
+        // `pause()` is dispatched as RtSigsuspend with mask=None,sigsetsize=0.
+        let saved_mask = if let Some(mask_ptr) = mask_ptr {
+            if sigsetsize != core::mem::size_of::<SigSet>() {
+                return Err(Errno::EINVAL);
+            }
+            let new_mask: SigSet = mask_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            let old = self.signals.get_blocked();
+            self.signals.set_blocked(new_mask);
+            Some(old)
+        } else {
+            None
+        };
+
+        // Block until a signal is pending (check_for_interrupt will return
+        // true when a deliverable signal arrives or the thread is exiting).
+        let _ = self.wait_cx().wait_until(|| false);
+
+        // Defer mask restore to process_signals() so signals unblocked by
+        // the caller's mask are delivered before the original mask is
+        // reinstated.
+        if let Some(old) = saved_mask {
+            self.signals.set_restore_mask(old);
+        }
+
+        Err(Errno::EINTR)
+    }
+
     pub(crate) fn sys_rt_sigprocmask(
         &self,
         how: SigmaskHow,

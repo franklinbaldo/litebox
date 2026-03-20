@@ -2612,6 +2612,10 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         infop: Option<Platform::RawMutPointer<u8>>,
         options: i32,
     },
+    RtSigsuspend {
+        mask: Option<Platform::RawConstPointer<signal::SigSet>>,
+        sigsetsize: usize,
+    },
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
@@ -3264,6 +3268,11 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::umask => sys_req!(Umask { mask }),
             Sysno::alarm => sys_req!(Alarm { seconds }),
             Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
+            Sysno::rt_sigsuspend => sys_req!(RtSigsuspend { mask:*, sigsetsize }),
+            Sysno::pause => SyscallRequest::RtSigsuspend {
+                mask: None,
+                sigsetsize: 0,
+            },
             // utimensat: set file timestamps — no-op for in-memory FS.
             Sysno::utimensat => {
                 return Ok(SyscallRequest::Utimensat);

@@ -2022,6 +2022,9 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Tgkill { tgid, tid, sig } => self.sys_tgkill(tgid, tid, sig),
             SyscallRequest::Sigaltstack { ss, old_ss } => self.sys_sigaltstack(ss, old_ss, ctx),
             SyscallRequest::Alarm { seconds } => syscall!(sys_alarm(seconds)),
+            SyscallRequest::RtSigsuspend { mask, sigsetsize } => {
+                self.sys_rt_sigsuspend(mask, sigsetsize)
+            }
             _ => {
                 log_unsupported!("{request:?}");
                 Err(Errno::ENOSYS)

@@ -25,7 +25,6 @@ use litebox::platform::{
 };
 use litebox::platform::{RawMutPointer as _, TimerHandle, TimerProvider};
 use litebox::sync::Mutex;
-use litebox::utils::ReinterpretSignedExt as _;
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, FutexArgs, PrctlArg, TimeParam, errno::Errno,
@@ -2706,7 +2705,7 @@ impl<FS: ShimFS> Task<FS> {
         let path = path_cstr.to_str().map_err(|_| Errno::ENOENT)?;
 
         // Copy argv and envp vectors
-        let mut argv_vec = if argv.as_usize() == 0 {
+        let argv_vec = if argv.as_usize() == 0 {
             alloc::vec::Vec::new()
         } else {
             copy_vector(argv, "argv")?
@@ -2864,7 +2863,7 @@ impl<FS: ShimFS> Task<FS> {
                 litebox::log_println!(
                     self.global.platform,
                     "execve({:?}): load_program failed: {:?} — terminating child",
-                    exec_path,
+                    path,
                     e,
                 );
                 self.exit_group(ExitStatus::Exit(127_i32.truncate()));
