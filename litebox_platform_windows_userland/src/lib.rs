@@ -264,17 +264,6 @@ unsafe extern "system" fn vectored_exception_handler(
                     ) != 0
                 };
                 if vpok {
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        use std::io::Write;
-                        let _ = writeln!(
-                            std::io::stderr(),
-                            "[veh-upgrade] PAGE_NOACCESS→{:#x} at {:#x} (pc={:#x})",
-                            new_prot,
-                            page_addr,
-                            context.Pc
-                        );
-                    }
                     tls.is_in_guest.set(true);
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
@@ -289,7 +278,6 @@ unsafe extern "system" fn vectored_exception_handler(
         } else {
             0
         };
-        let x_regs = unsafe { &context.Anonymous.X };
         let _ = writeln!(
             std::io::stderr(),
             "[winarm64] guest exc: code={:#x} pc={:#x} addr={:#x}",
@@ -297,29 +285,6 @@ unsafe extern "system" fn vectored_exception_handler(
             pc,
             addr,
         );
-        // Probe main_arena and __malloc_initialized at crash time.
-        // x25 = av (arena pointer) from _int_malloc.
-        // __malloc_initialized = av + 0x5CC5.
-        // bins[0].fd = av + 112, bins[0].bk = av + 120.
-        if addr < 0x1000 {
-            let av = x_regs[25] as usize;
-            if av > 0x100000 {
-                let init_addr = av + 0x5CC5;
-                let init_val = unsafe { (init_addr as *const u8).read_volatile() };
-                let bins_fd = unsafe { ((av + 112) as *const u64).read_volatile() };
-                let bins_bk = unsafe { ((av + 120) as *const u64).read_volatile() };
-                let top = unsafe { ((av + 96) as *const u64).read_volatile() };
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "[winarm64] av={:#x} __malloc_initialized={} bins_fd={:#x} bins_bk={:#x} top={:#x}",
-                    av,
-                    init_val,
-                    bins_fd,
-                    bins_bk,
-                    top
-                );
-            }
-        }
     }
 
     let regs = unsafe { &mut *tls.guest_context_top.get().wrapping_sub(1) };
@@ -980,11 +945,12 @@ unsafe extern "C-unwind" fn run_thread_arch(thread_ctx: &mut ThreadContext, tls_
     .globl  syscall_callback
 syscall_callback:
     // At entry from the shared SVC handler:
-    //   SP points to the SVC gate's 32-byte frame:
+    //   SP points to the SVC gate's 48-byte frame:
     //     [SP+0]  = saved guest X16
     //     [SP+8]  = saved guest X17
-    //     [SP+16] = guest return address (X30, set by SVC gate)
-    //     [SP+24] = guest TPIDR_EL0
+    //     [SP+16] = return address (PC after SVC, set by SVC gate)
+    //     [SP+24] = host_tls (set by shared SVC handler, was TPIDR)
+    //     [SP+32] = guest's original X30 (LR, saved by SVC gate)
     //   X18 = host_tls (TlsState pointer, set by shared SVC handler)
     //   X30 = guest return address (also at [SP+16])
     //   X16, X17 = clobbered by shared handler
@@ -1032,17 +998,17 @@ syscall_callback:
     stp     x27, x28, [x16, #216]      // regs[27], regs[28]
     str     x29, [x16, #232]           // regs[29] = FP
 
-    // Save guest x30 (return address from SVC gate frame).
-    ldr     x0, [sp, #16]
-    str     x0, [x16, #240]            // regs[30] = guest LR
+    // Save guest x30 (original LR, saved to [SP+32] by SVC gate).
+    ldr     x0, [sp, #32]
+    str     x0, [x16, #240]            // regs[30] = guest's original LR
 
-    // Compute original guest SP (before SVC gate's SUB SP, #32).
-    add     x0, sp, #32
+    // Compute original guest SP (before SVC gate's SUB SP, #48).
+    add     x0, sp, #48
     str     x0, [x16, #248]            // PtRegs.sp
 
-    // Store guest PC = x30 (return address, same as regs[30]).
+    // Store guest PC = return address from [SP+16] (stored by SVC gate).
     ldr     x0, [sp, #16]
-    str     x0, [x16, #256]            // PtRegs.pc
+    str     x0, [x16, #256]            // PtRegs.pc = return address
 
     // Store pstate = 0 (will be set properly by NtContinue on resume).
     str     xzr, [x16, #264]           // PtRegs.pstate

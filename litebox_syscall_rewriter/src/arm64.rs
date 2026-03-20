@@ -55,7 +55,7 @@ impl TargetOs {
     // SVC gate
     pub const fn svc_gate_insn_count(self) -> usize {
         match self {
-            Self::Linux | Self::Windows => 6,
+            Self::Linux | Self::Windows => 7,
             Self::MacOs => 7,
         }
     }
@@ -2230,8 +2230,13 @@ fn emit_svc_gate_linux(
     let mut insn_idx: usize = 0;
     let insn_vaddr = |idx: usize| -> u64 { gate_vaddr + (idx as u64) * 4 };
 
-    // [0] SUB SP, SP, #32
-    trampoline_data.extend_from_slice(&encode_sub_sp_imm(32).expect("imm12=32 fits").to_le_bytes());
+    // [0] SUB SP, SP, #48  — 48-byte frame (was 32)
+    //   [SP+0]  = saved X16
+    //   [SP+8]  = saved X17
+    //   [SP+16] = return address (PC after original SVC)
+    //   [SP+24] = (used by shared SVC handler: first TPIDR, then host_tls)
+    //   [SP+32] = guest's original X30 (LR)
+    trampoline_data.extend_from_slice(&encode_sub_sp_imm(48).expect("imm12=48 fits").to_le_bytes());
     insn_idx += 1;
 
     // [1] STP X16, X17, [SP]
@@ -2242,15 +2247,15 @@ fn emit_svc_gate_linux(
     );
     insn_idx += 1;
 
-    // [2] STR X30, [SP, #16]
+    // [2] STR X30, [SP, #32]  — save guest's original LR BEFORE we clobber X30
     trampoline_data.extend_from_slice(
-        &encode_str_imm_unsigned(30, 31, 16)
-            .expect("offset 16 valid")
+        &encode_str_imm_unsigned(30, 31, 32)
+            .expect("offset 32 valid")
             .to_le_bytes(),
     );
     insn_idx += 1;
 
-    // [3] ADRP X30, <return_page>
+    // [3] ADRP X30, <return_page>  — compute return address
     let return_addr = site.vaddr + 4;
     let adrp_vaddr = insn_vaddr(insn_idx);
     let adrp_base = adrp_vaddr & !0xFFF;
@@ -2274,7 +2279,15 @@ fn emit_svc_gate_linux(
     );
     insn_idx += 1;
 
-    // [5] B <shared_svc_handler>
+    // [5] STR X30, [SP, #16]  — store return address
+    trampoline_data.extend_from_slice(
+        &encode_str_imm_unsigned(30, 31, 16)
+            .expect("offset 16 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [6] B <shared_svc_handler>
     let b_vaddr = insn_vaddr(insn_idx);
     let handler_vaddr = trampoline_base_addr + target_os.shared_svc_handler_offset() as u64;
     let b_offset = handler_vaddr.cast_signed() - b_vaddr.cast_signed();

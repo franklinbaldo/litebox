@@ -177,14 +177,22 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5,
     "cbnz x16, 10f\n"               // non-zero → macOS path
 #endif
 
-    // ---- Linux path: 32-byte frame, TPIDR_EL0 keyed ----
+    // ---- Linux path: 48-byte frame, TPIDR_EL0 keyed ----
+    // Frame layout (must match syscall_callback expectations):
+    //   [SP+0]  = saved X16
+    //   [SP+8]  = saved X17
+    //   [SP+16] = return address (PC after syscall)
+    //   [SP+24] = host_tls (set after TLS lookup, initially guest TPIDR)
+    //   [SP+32] = guest's original X30 (LR)
+    //
     // On Windows ARM64, X18 is the TEB pointer and must not be clobbered.
-    // Use X30 (saved at [SP+16]) instead of X18 for the TPIDR_EL0 lookup key
+    // Use X30 (saved at [SP+32]) instead of X18 for the TPIDR_EL0 lookup key
     // and host_tls result. The caller (syscall_callback) reads host_tls from
     // [SP+24] on Windows, not from X18.
-    "sub  sp, sp, #32\n"
+    "sub  sp, sp, #48\n"
     "str  x16, [sp, #0]\n"
     "str  x17, [sp, #8]\n"
+    "str  x30, [sp, #32]\n"         // save guest LR at [SP+32]
     // Set x30 = return address BEFORE storing to [SP+16], so
     // syscall_callback reads the correct return PC from [SP+16].
     "adr  x30, 4f\n"                // x30 = return address after syscall
