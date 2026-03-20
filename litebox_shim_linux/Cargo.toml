@@ -21,8 +21,10 @@ zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 [features]
 default = ["platform_linux_userland"]
 platform_linux_userland = ["litebox_platform_multiplex/platform_linux_userland_with_linux_syscall"]
-platform_windows_userland = ["litebox_platform_multiplex/platform_windows_userland"]
-platform_linux_snp = ["litebox_platform_multiplex/platform_linux_snp"]
+platform_windows_userland = ["litebox_platform_multiplex/platform_windows_userland", "alarm_fallback"]
+platform_linux_snp = ["litebox_platform_multiplex/platform_linux_snp", "alarm_fallback"]
+# Enable polling-based alarm deadline checking for platforms without timer support.
+alarm_fallback = []
 trace_syscalls = []
 
 [dev-dependencies]

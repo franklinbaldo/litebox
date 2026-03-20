@@ -131,6 +131,11 @@ pub(crate) struct Process {
     pub(crate) inner: Mutex<Platform, ProcessInner>,
     /// Resource limits for this process.
     pub(crate) limits: ResourceLimits,
+    /// Fast-path flag: set once a platform timer handle is created for the
+    /// alarm. Once true it never reverts to false, allowing
+    /// `check_alarm_deadline` to skip the mutex lock.
+    #[cfg(feature = "alarm_fallback")]
+    pub(crate) has_alarm_timer_handle: AtomicBool,
     /// Process-wide alarm timer.
     pub(crate) alarm_timer: Mutex<Platform, Alarm>,
 }
@@ -178,6 +183,8 @@ impl Process {
                 threads: BTreeMap::from_iter([(pid, remote)]),
             }),
             limits: ResourceLimits::default(),
+            #[cfg(feature = "alarm_fallback")]
+            has_alarm_timer_handle: AtomicBool::new(false),
             alarm_timer: Mutex::new(Alarm {
                 handle: None,
                 deadline: None,
@@ -706,6 +713,9 @@ impl<FS: ShimFS> Task<FS> {
                                     siginfo,
                                 },
                             );
+                            self.global
+                                .has_cross_process_signals
+                                .store(true, core::sync::atomic::Ordering::Release);
 
                             // Interrupt the parent so it processes the signal.
                             let handles = self.global.process_thread_handles.read();
@@ -2373,6 +2383,10 @@ impl<FS: ShimFS> Task<FS> {
             {
                 Ok(handle) => {
                     alarm.handle = Some(handle);
+                    #[cfg(feature = "alarm_fallback")]
+                    self.process()
+                        .has_alarm_timer_handle
+                        .store(true, Ordering::Release);
                 }
                 Err(litebox::platform::TimerCreationError::Unsupported) => {}
                 Err(_) => unimplemented!(),

@@ -257,6 +257,7 @@ impl LinuxShimBuilder {
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
             cross_process_signals: litebox::sync::Mutex::new(Vec::new()),
+            has_cross_process_signals: core::sync::atomic::AtomicBool::new(false),
             process_thread_handles: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
             transport_interrupt: alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false)),
         });
@@ -2074,6 +2075,10 @@ struct GlobalState<FS: ShimFS> {
     /// Cross-process signal queue for delivering signals (e.g. SIGCHLD) between
     /// processes. Entries are consumed by the target task during signal processing.
     cross_process_signals: litebox::sync::Mutex<Platform, Vec<CrossProcessSignal>>,
+    /// Fast-path hint: set to `true` when a cross-process signal is pushed,
+    /// checked before taking the mutex in `drain_cross_process_signals`. An
+    /// `Acquire` load of `false` lets the hot path skip the lock entirely.
+    has_cross_process_signals: core::sync::atomic::AtomicBool,
     /// Thread handles for each process's main thread, used to interrupt a
     /// process when delivering a cross-process signal.
     process_thread_handles: litebox::sync::RwLock<

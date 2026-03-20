@@ -68,6 +68,10 @@ pub(crate) struct SignalState {
     pending: RefCell<PendingSignals>,
     /// Pending process signals (shared across all threads).
     shared_pending: Arc<Mutex<Platform, PendingSignals>>,
+    /// Atomic snapshot of `shared_pending.pending` for lock-free fast-path
+    /// checks. May transiently lag behind the true value, but is always updated
+    /// under the shared_pending lock so it converges quickly.
+    shared_pending_hint: Arc<core::sync::atomic::AtomicU64>,
     /// Currently blocked signals.
     blocked: Cell<SigSet>,
     /// Signal handlers.
@@ -89,6 +93,7 @@ impl SignalState {
         Self {
             pending: RefCell::new(PendingSignals::new()),
             shared_pending: Arc::new(Mutex::new(PendingSignals::new())),
+            shared_pending_hint: Arc::new(core::sync::atomic::AtomicU64::new(0)),
             blocked: Cell::new(SigSet::empty()),
             handlers: RefCell::new(Arc::new(SignalHandlers::new())),
             altstack: Cell::new(SigAltStack {
@@ -134,6 +139,7 @@ impl SignalState {
             pending: RefCell::new(PendingSignals::new()),
             // Share process-wide pending signals
             shared_pending: self.shared_pending.clone(),
+            shared_pending_hint: self.shared_pending_hint.clone(),
             // Preserve blocked
             blocked: Cell::new(self.blocked.get()),
             // Share handlers across tasks
@@ -163,6 +169,7 @@ impl SignalState {
             pending: RefCell::new(PendingSignals::new()),
             blocked: Cell::new(self.blocked.get()),
             shared_pending: Arc::new(Mutex::new(PendingSignals::new())),
+            shared_pending_hint: Arc::new(core::sync::atomic::AtomicU64::new(0)),
             // Deep-copy handlers so the child's rt_sigaction doesn't affect
             // the parent (important for vfork where both run concurrently).
             handlers: RefCell::new(Arc::new((*self.handlers.borrow()).as_ref().clone())),
@@ -758,8 +765,12 @@ impl<FS: ShimFS> Task<FS> {
         if !thread_pending.is_empty() {
             return true;
         }
-        let shared_pending = self.signals.shared_pending.lock().pending & !blocked;
-        !shared_pending.is_empty()
+        // Fast path: check atomic hint before acquiring the lock.
+        let hint = self
+            .signals
+            .shared_pending_hint
+            .load(core::sync::atomic::Ordering::Acquire);
+        hint & !blocked.as_u64() != 0
     }
 
     /// Returns the set of all pending (deliverable) signals.
@@ -783,12 +794,22 @@ impl<FS: ShimFS> Task<FS> {
     /// child exit promptly interrupts `epoll_pwait`/`futex` instead of
     /// sleeping until the timeout expires.
     pub(crate) fn drain_cross_process_signals(&self) {
+        // Fast path: skip the global lock when no cross-process signals exist.
+        if !self
+            .global
+            .has_cross_process_signals
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
         let my_id = self.process_id.0;
         let mut queue = self.global.cross_process_signals.lock();
         let mut i = 0;
+        let mut drained_any = false;
         while i < queue.len() {
             if queue[i].target_process_id == my_id {
                 let sig = queue.swap_remove(i);
+                drained_any = true;
                 self.signals.shared_pending.lock().push(
                     &self.process().limits,
                     sig.signal,
@@ -797,6 +818,20 @@ impl<FS: ShimFS> Task<FS> {
             } else {
                 i += 1;
             }
+        }
+        if queue.is_empty() {
+            self.global
+                .has_cross_process_signals
+                .store(false, core::sync::atomic::Ordering::Release);
+        }
+        // Update the shared_pending_hint so that has_pending_signals() can
+        // detect the newly-enqueued signals via the lock-free fast path.
+        if drained_any {
+            let shared = self.signals.shared_pending.lock();
+            self.signals.shared_pending_hint.store(
+                shared.pending.as_u64(),
+                core::sync::atomic::Ordering::Release,
+            );
         }
     }
 
@@ -850,11 +885,35 @@ impl<FS: ShimFS> Task<FS> {
                 if let Some(signal) = pending.next(blocked) {
                     (signal, pending.remove(signal))
                 } else {
+                    // Fast path: check atomic hint before acquiring the
+                    // shared_pending lock.  The hint is a snapshot of the
+                    // shared pending mask that is always updated under the
+                    // lock, so a stale zero means "no signals were pending
+                    // at the last update."  A missed concurrent addition is
+                    // fine — it will be picked up on the next syscall
+                    // return.
+                    let hint = self
+                        .signals
+                        .shared_pending_hint
+                        .load(core::sync::atomic::Ordering::Acquire);
+                    if hint & !blocked.as_u64() == 0 {
+                        break;
+                    }
                     // Then try shared pending.
                     let mut shared = self.signals.shared_pending.lock();
                     if let Some(signal) = shared.next(blocked) {
-                        (signal, shared.remove(signal))
+                        let result = (signal, shared.remove(signal));
+                        self.signals.shared_pending_hint.store(
+                            shared.pending.as_u64(),
+                            core::sync::atomic::Ordering::Release,
+                        );
+                        result
                     } else {
+                        // Hint was stale; update it.
+                        self.signals.shared_pending_hint.store(
+                            shared.pending.as_u64(),
+                            core::sync::atomic::Ordering::Release,
+                        );
                         break;
                     }
                 }
@@ -954,9 +1013,26 @@ impl<FS: ShimFS> Task<FS> {
     /// Check whether the process-wide alarm deadline has passed and, if so,
     /// enqueue `SIGALRM`.
     ///
-    /// Note this is a fallback in case the platform does not support timers.
+    /// This is a polling fallback for platforms without timer support. On
+    /// platforms that support timers (e.g. Linux userland), the platform
+    /// delivers `SIGALRM` directly and this function is compiled out.
+    #[cfg(feature = "alarm_fallback")]
     pub(crate) fn check_alarm_deadline(&self) {
+        use core::sync::atomic::Ordering;
         use litebox::platform::TimeProvider as _;
+
+        // Fast path: if a platform timer handle has been created, the platform
+        // delivers SIGALRM via that timer and there is nothing to check here.
+        // The flag is set once and never cleared, so a Relaxed load is
+        // sufficient (the timer handle outlives the process).
+        if self
+            .process()
+            .has_alarm_timer_handle
+            .load(Ordering::Relaxed)
+        {
+            return;
+        }
+
         let mut alarm = self.process().alarm_timer.lock();
         if alarm.handle.is_some() {
             // If the platform supports timers, we rely on those to trigger SIGALRM, so we don't need
@@ -1023,10 +1099,12 @@ impl<FS: ShimFS> Task<FS> {
         if self.is_signal_ignored(signal) {
             return;
         }
-        self.signals
-            .shared_pending
-            .lock()
-            .push(&self.process().limits, signal, siginfo);
+        let mut shared = self.signals.shared_pending.lock();
+        shared.push(&self.process().limits, signal, siginfo);
+        self.signals.shared_pending_hint.store(
+            shared.pending.as_u64(),
+            core::sync::atomic::Ordering::Release,
+        );
     }
 
     /// Forces a signal to be delivered on next call to `check_for_signals`.
