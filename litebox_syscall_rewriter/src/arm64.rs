@@ -2628,30 +2628,27 @@ fn emit_shared_msr_handler_linux(
 /// On Windows ARM64, TPIDR_EL0 is NOT preserved across context switches.
 /// X18 is the TEB pointer (always valid). The trampoline header at offset 16
 /// stores a precomputed TEB TLS slot offset → TlsState*. This handler writes
-/// the new guest_tpidr to TlsState.guest_tpidr (offset 64), also updates
-/// entry[0].guest_tpidr in the TLS table (for backward compat), and writes
-/// MSR TPIDR_EL0 (for SVC handler compat). Falls back to TLS table entry[0]
-/// if TlsState is NULL (early execution before registration).
+/// the new guest_tpidr to TlsState.guest_tpidr (offset 64) and updates
+/// entry[0].guest_tpidr in the TLS table (for rtld_audit fallback).
+/// Hardware TPIDR_EL0 is NOT written — Windows doesn't preserve it.
+/// Falls back to TLS table entry[0] if TlsState is NULL (early execution).
 ///
 /// ```text
 ///  [0]  STR  X30, [SP, #32]       ; save BL return addr
 ///  [1]  LDR  X16, [PC, #off_teb]  ; TEB_TLS_SLOT_OFFSET
 ///  [2]  LDR  X17, [X18, X16]      ; TlsState*
-///  [3]  LDR  X16, [SP, #24]       ; new guest_tpidr (loaded early, needed by all paths)
+///  [3]  LDR  X16, [SP, #24]       ; new guest_tpidr
 ///  [4]  CBZ  X17, .Lnotls         ; -> [10]
 ///  [5]  STR  X16, [X17, #64]      ; TlsState.guest_tpidr = new value
 ///  [6]  LDR  X17, [PC, #off_tls]  ; TLS table base
 ///  [7]  STR  X16, [X17, #0]       ; entry[0].guest_tpidr = new value
-///  [8]  MSR  TPIDR_EL0, X16       ; hardware (for SVC handler compat)
+///  [8]  NOP
 ///  [9]  B    .Ldone               ; -> [15]
 /// [10]  LDR  X17, [PC, #off_tls]  ; .Lnotls: TLS table base
 /// [11]  STR  X16, [X17, #0]       ; entry[0].guest_tpidr
-/// [12]  MSR  TPIDR_EL0, X16       ; hardware
-/// [13]  NOP
-/// [14]  NOP
+/// [12]-[14] NOP
 /// [15]  LDR  X30, [SP, #32]       ; .Ldone: restore
-/// [16]  NOP
-/// [17]  NOP
+/// [16]-[17] NOP
 /// [18]  RET
 /// ```
 #[allow(clippy::cast_possible_wrap)]
@@ -2738,8 +2735,8 @@ fn emit_shared_msr_handler_windows(
     );
     insn_idx += 1;
 
-    // [8] MSR TPIDR_EL0, X16 — set hardware (for SVC handler compat)
-    trampoline_data.extend_from_slice(&encode_msr_tpidr_el0(16).to_le_bytes());
+    // [8] NOP — hardware TPIDR_EL0 is not used on Windows (kernel doesn't preserve it)
+    trampoline_data.extend_from_slice(&NOP.to_le_bytes());
     insn_idx += 1;
 
     // [9] B .Ldone -> [15]
@@ -2775,8 +2772,8 @@ fn emit_shared_msr_handler_windows(
     );
     insn_idx += 1;
 
-    // [12] MSR TPIDR_EL0, X16 — hardware
-    trampoline_data.extend_from_slice(&encode_msr_tpidr_el0(16).to_le_bytes());
+    // [12] NOP — hardware TPIDR_EL0 is not used on Windows
+    trampoline_data.extend_from_slice(&NOP.to_le_bytes());
     insn_idx += 1;
 
     // [13]-[14] NOP padding

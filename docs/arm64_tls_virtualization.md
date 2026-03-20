@@ -134,12 +134,11 @@ a stale or zero value pointer. The TEB-based path (Windows) is immune because
 it doesn't scan the TLS table, but the scan-based paths (Linux, macOS) could
 theoretically hit this window.
 
-### 5. Best-effort TPIDR_EL0 hardware write on Windows
+### 5. Hardware TPIDR_EL0 is never written on Windows
 
-The MSR handler on Windows still writes hardware `TPIDR_EL0` (for TLS table
-entry key consistency). This write may be silently undone by a context switch.
-Since the SVC handler now uses TEB (not hardware TPIDR_EL0), this is harmless
-but the TLS table entry key may drift from the actual hardware value.
+No handler writes hardware `TPIDR_EL0` on Windows — not `switch_to_guest`,
+not the MSR handler. All paths use TlsState via TEB. The TLS table
+`entry[0].guest_tpidr` is still maintained for the rtld_audit fallback path.
 
 ### 6. TEB slot cleanup on TlsState drop
 

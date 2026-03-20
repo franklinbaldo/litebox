@@ -1365,14 +1365,10 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
             );
         }
 
-        // Write TPIDR_EL0 and sync guest_tpidr to TlsState. The hardware
-        // TPIDR_EL0 write is best-effort on Windows (kernel may wipe it), but
-        // the TlsState.guest_tpidr is authoritative — the MRS gate, SVC handler,
-        // and X18/MSR handlers all read from TlsState via TEB (X18).
+        // Sync guest_tpidr to TlsState. All handlers (MRS gate, SVC, MSR,
+        // X18 load/save) read from TlsState via TEB — hardware TPIDR_EL0
+        // is not used on Windows (kernel doesn't preserve it).
         let guest_tpidr = THREAD_TPIDR.get();
-        unsafe {
-            litebox_common_linux::write_tpidr_el0(guest_tpidr);
-        }
         tls.guest_tpidr.set(guest_tpidr);
 
         tls.is_in_guest.set(true);
