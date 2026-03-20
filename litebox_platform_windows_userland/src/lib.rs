@@ -543,11 +543,11 @@ impl WindowsUserland {
 
             let targets = [
                 CfgCallTargetInfo {
-                    offset: exception_callback as usize - module_base,
+                    offset: exception_callback as *const () as usize - module_base,
                     flags: CFG_CALL_TARGET_VALID,
                 },
                 CfgCallTargetInfo {
-                    offset: interrupt_callback as usize - module_base,
+                    offset: interrupt_callback as *const () as usize - module_base,
                     flags: CFG_CALL_TARGET_VALID,
                 },
             ];
@@ -2617,7 +2617,7 @@ fn update_host_tls_entry(tls: &TlsState) {
 
 /// Remove the current thread's TLS table entry by writing a tombstone (key=0).
 #[cfg(target_arch = "aarch64")]
-fn remove_host_tls_entries(tls: &TlsState) {
+fn remove_host_tls_entries(_tls: &TlsState) {
     use core::sync::atomic::{AtomicU64, Ordering};
 
     let table_addr = litebox_common_linux::HOST_TLS_TABLE_ADDR.load(Ordering::Acquire);
