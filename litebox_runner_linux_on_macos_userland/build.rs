@@ -3,10 +3,11 @@
 
 use std::path::PathBuf;
 
-/// The git-tracked prebuilt aarch64-linux ELF shared object for rtld_audit.
-/// This is the authoritative copy — do NOT use the .gitignore'd build artifact
-/// in `../litebox_rtld_audit/` which may have the wrong architecture.
-const PREBUILT_RTLD_AUDIT_SO: &str = "tests/test-bins/litebox_rtld_audit.so";
+/// Centralized prebuilt directory for rtld_audit shared objects.
+/// The macOS runner executes Linux aarch64 binaries on macOS, so it needs
+/// the macOS-targeted variant (compiled with -DTARGET_MACOS).
+const PREBUILT_RTLD_AUDIT_SO: &str =
+    "../litebox_rtld_audit/prebuilt/litebox_rtld_audit_aarch64_macos.so";
 
 fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
@@ -18,7 +19,10 @@ fn main() {
     let src = PathBuf::from(PREBUILT_RTLD_AUDIT_SO);
     assert!(
         src.exists(),
-        "missing prebuilt rtld_audit.so at {}",
+        "missing prebuilt rtld_audit.so at {}.\n\
+         Rebuild on a Linux aarch64 host with:\n\
+         make -C litebox_rtld_audit ARCH=aarch64 TARGET_OS=macos \\\n\
+             OUTPUT=litebox_rtld_audit/prebuilt/litebox_rtld_audit_aarch64_macos.so",
         src.display()
     );
 

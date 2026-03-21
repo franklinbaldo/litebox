@@ -84,9 +84,16 @@ fn run_dynamic_linked_prog_with_rewriter(
     }
 
     // Copy libraries that don't need rewriting (litebox_rtld_audit.so)
-    // to the tar directory.
+    // to the tar directory. The rtld_audit prebuilt lives in the centralized
+    // prebuilt directory; other files come from test-bins.
+    let prebuilt_dir =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../litebox_rtld_audit/prebuilt");
     for (file, prefix) in libs_without_rewrite {
-        let src = test_dir.join(file);
+        let src = if *file == "litebox_rtld_audit.so" {
+            prebuilt_dir.join("litebox_rtld_audit_aarch64_macos.so")
+        } else {
+            test_dir.join(file)
+        };
         let dst_dir = tar_src_path.join(prefix.trim_start_matches('/'));
         let dst = dst_dir.join(file);
         std::fs::create_dir_all(&dst_dir).unwrap();

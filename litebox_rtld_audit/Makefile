@@ -7,8 +7,8 @@ OUTPUT = $(OUT_DIR)/litebox_rtld_audit.so
 CC ?= cc
 CFLAGS ?= -Wall -Werror -fPIC -shared -nostdlib -fno-stack-protector
 ARCH ?= $(shell uname -m)
-# TARGET_OS can be set to "macos" to enable the macOS-specific TPIDRRO_EL0 path.
-# Default: Linux/Windows path only (TPIDR_EL0 keyed, no X18 clobber).
+# TARGET_OS can be set to "macos" or "windows" to enable platform-specific paths.
+# Default: linux (TPIDR_EL0 keyed, no TEB offset, no X18 clobber).
 TARGET_OS ?= linux
 ifeq ($(ARCH),x86_64)
     CFLAGS += -m64
@@ -20,6 +20,8 @@ else ifeq ($(ARCH),aarch64)
     CFLAGS += -ffixed-x18
     ifeq ($(TARGET_OS),macos)
         CFLAGS += -DTARGET_MACOS
+    else ifeq ($(TARGET_OS),windows)
+        CFLAGS += -DTARGET_WINDOWS
     endif
 else
     $(error Unsupported target architecture: $(ARCH))

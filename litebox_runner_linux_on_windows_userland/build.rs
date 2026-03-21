@@ -3,8 +3,11 @@
 
 use std::path::PathBuf;
 
-/// Prebuilt aarch64-linux ELF shared object for rtld_audit (ARM64 target).
-const PREBUILT_RTLD_AUDIT_SO_AARCH64: &str = "tests/test-bins-aarch64/litebox_rtld_audit.so";
+/// Centralized prebuilt directory for rtld_audit shared objects.
+/// The Windows runner executes Linux binaries on Windows, so it needs
+/// the Windows-targeted variant (compiled with -DTARGET_WINDOWS).
+const PREBUILT_RTLD_AUDIT_SO_AARCH64: &str =
+    "../litebox_rtld_audit/prebuilt/litebox_rtld_audit_aarch64_windows.so";
 
 fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());

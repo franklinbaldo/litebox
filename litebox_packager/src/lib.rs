@@ -1,10 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// Restrict this crate to only work on Linux, as it relies on `ldd` for
-// dependency discovery and other Linux-specific functionality.
-#![cfg(target_os = "linux")]
-
 pub mod oci;
 
 use anyhow::{Context, bail};
@@ -358,6 +354,11 @@ fn finalize_tar(
     }
 
     // Include the rtld audit library so the rewriter backend can load it.
+    // On aarch64, different target OSes produce different rtld_audit code
+    // (e.g. TPIDRRO_EL0 for macOS, TEB path for Windows), so we embed all
+    // variants and select the correct one based on --target-os.
+    // On x86_64, there is only one variant (platform-specific code is
+    // aarch64-only in rtld_audit.c).
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
         const RTLD_AUDIT_TAR_PATH: &str = "lib/litebox_rtld_audit.so";
@@ -367,9 +368,10 @@ fn finalize_tar(
                  remove the conflicting entry or use --no-rewrite"
             );
         }
+        let rtld_audit_data = select_rtld_audit(args.target_os);
         tar_entries.push(TarEntry {
             tar_path: RTLD_AUDIT_TAR_PATH.to_string(),
-            data: include_bytes!(concat!(env!("OUT_DIR"), "/litebox_rtld_audit.so")).to_vec(),
+            data: rtld_audit_data.to_vec(),
             mode: 0o755,
         });
     }
@@ -615,6 +617,60 @@ fn rewrite_elf(
             Ok(data.to_vec())
         }
         Err(e) => Err(e).with_context(|| format!("failed to rewrite {}", path.display())),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// rtld_audit variant selection
+// ---------------------------------------------------------------------------
+
+/// Select the correct prebuilt rtld_audit.so for the given target OS.
+///
+/// On x86_64, the rtld_audit code has no platform-specific branches, so there
+/// is only one variant (built as "linux").  On aarch64, each target OS
+/// (linux / macos / windows) produces different code paths in rtld_audit.c.
+///
+/// When `target_os` is `None`, defaults to the host OS.
+///
+/// On Linux hosts, all three variants are built from source and available.
+/// On non-Linux hosts, only the host-OS variant is available (as a prebuilt).
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn select_rtld_audit(target_os: Option<TargetOs>) -> &'static [u8] {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // x86_64: platform-specific code is behind `#ifdef __aarch64__`,
+        // so all target OS variants compile identically.
+        let _ = target_os;
+        include_bytes!(concat!(env!("OUT_DIR"), "/litebox_rtld_audit_linux.so"))
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    {
+        // On Linux all three variants are built from source.
+        let effective_os = target_os.unwrap_or(TargetOs::Linux);
+        match effective_os {
+            TargetOs::Linux => {
+                include_bytes!(concat!(env!("OUT_DIR"), "/litebox_rtld_audit_linux.so"))
+            }
+            TargetOs::MacOs => {
+                include_bytes!(concat!(env!("OUT_DIR"), "/litebox_rtld_audit_macos.so"))
+            }
+            TargetOs::Windows => {
+                include_bytes!(concat!(env!("OUT_DIR"), "/litebox_rtld_audit_windows.so"))
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        let _ = target_os; // Only the macOS variant is available.
+        include_bytes!(concat!(env!("OUT_DIR"), "/litebox_rtld_audit_macos.so"))
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "windows"))]
+    {
+        let _ = target_os; // Only the Windows variant is available.
+        include_bytes!(concat!(env!("OUT_DIR"), "/litebox_rtld_audit_windows.so"))
     }
 }
 

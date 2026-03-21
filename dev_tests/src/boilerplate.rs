@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use fs::File;
 use fs_err as fs;
 use std::collections::HashMap;
@@ -134,6 +134,8 @@ const SKIP_FILES: &[&str] = &[
     "litebox/src/sync/mutex.rs",
     "litebox/src/sync/rwlock.rs",
     "litebox_rtld_audit/Makefile",
+    "litebox_rtld_audit/prebuilt/litebox_rtld_audit_aarch64_macos.so",
+    "litebox_rtld_audit/prebuilt/litebox_rtld_audit_aarch64_windows.so",
     "litebox_runner_linux_on_windows_userland/tests/test-bins/hello_exec_nolibc",
     "litebox_runner_linux_on_windows_userland/tests/test-bins/hello_thread",
     "litebox_runner_linux_on_windows_userland/tests/test-bins/hello_thread_static",
@@ -148,7 +150,6 @@ const SKIP_FILES: &[&str] = &[
     "litebox_runner_linux_on_macos_userland/tests/test-bins/hello_world_dyn",
     "litebox_runner_linux_on_macos_userland/tests/test-bins/ld-linux-aarch64.so.1",
     "litebox_runner_linux_on_macos_userland/tests/test-bins/libc.so.6",
-    "litebox_runner_linux_on_macos_userland/tests/test-bins/litebox_rtld_audit.so",
     "litebox_syscall_rewriter/tests/hello",
     "litebox_syscall_rewriter/tests/hello-32",
     "litebox_syscall_rewriter/tests/hello-aarch64",
