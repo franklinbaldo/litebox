@@ -195,6 +195,8 @@ dev_bench/unixbench/byte-unixbench-*/
 dev_bench/unixbench/*.zip
 dev_bench/sqlite/sqlite-src-*/
 dev_bench/sqlite/*.zip
+dev_bench/memcached/memcached-*/
+dev_bench/memcached/*.tar.gz
 dev_bench/memcached/memtier_benchmark/
 dev_bench/gvisor/*.tar
 dev_bench/gvisor/benchmark_results/

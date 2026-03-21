@@ -62,9 +62,14 @@ GUEST_IP = "10.0.0.2"
 REDIS_PORT = 6399  # non-default port to avoid conflict with host redis
 TUN_DEVICE = "tun99"
 
-# Tests to run with redis-benchmark (each produces ops/sec)
-BENCHMARK_TESTS = ["SET", "GET", "INCR", "LPUSH", "RPUSH", "LPOP", "RPOP",
-                   "SADD", "HSET", "MSET"]
+# Full default test suite of redis-benchmark (same order as redis-benchmark runs them).
+DEFAULT_TESTS = [
+    "PING_INLINE", "PING_MBULK", "SET", "GET", "INCR",
+    "LPUSH", "RPUSH", "LPOP", "RPOP", "SADD", "HSET",
+    "SPOP", "ZADD", "ZPOPMIN",
+    "LRANGE_100", "LRANGE_300", "LRANGE_500", "LRANGE_600",
+    "MSET",
+]
 
 
 # ── Workspace helpers ───────────────────────────────────────────────────────
@@ -157,7 +162,7 @@ def parse_redis_benchmark_output(output: str) -> list[TestResult]:
         ...
 
     Test names may include a parenthetical suffix (e.g. "MSET (10 keys)").
-    We strip the suffix so that names match the BENCHMARK_TESTS keys.
+    We strip the suffix to produce clean keys.
     """
     results = []
     for line in output.splitlines():
@@ -170,6 +175,58 @@ def parse_redis_benchmark_output(output: str) -> list[TestResult]:
             ops = float(m.group(2))
             results.append(TestResult(name=name, ops_per_sec=ops))
     return results
+
+
+def _run_benchmark_tests(
+    redis_benchmark: str,
+    host: str,
+    port: int,
+    requests: int,
+    clients: int,
+) -> Optional[BenchmarkResult]:
+    """Run redis-benchmark for each default test individually.
+
+    Running tests one-at-a-time isolates failures: if one test triggers a
+    protocol error (e.g. LRANGE with large payloads over smoltcp), the
+    remaining tests still produce results.
+    """
+    all_results: list[TestResult] = []
+    t0 = time.monotonic()
+    for test_name in DEFAULT_TESTS:
+        cmd = [
+            str(redis_benchmark),
+            "-h", host,
+            "-p", str(port),
+            "-n", str(requests),
+            "-c", str(clients),
+            "-t", test_name,
+            "--csv",
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            print(f"    [TIMEOUT] {test_name}")
+            continue
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="replace")
+            print(f"    [FAIL] {test_name}: {stderr[:200]}")
+            continue
+        stdout = result.stdout.decode("utf-8", errors="replace")
+        parsed = parse_redis_benchmark_output(stdout)
+        if not parsed:
+            print(f"    [FAIL] {test_name}: no results parsed")
+            continue
+        # For LRANGE tests, redis-benchmark emits a setup LPUSH line
+        # followed by the actual LRANGE result.  Pick the entry whose
+        # name matches the requested test; fall back to the last entry.
+        match = next((r for r in parsed if r.name == test_name), parsed[-1])
+        all_results.append(match)
+        print(f"    {match.name}: {match.ops_per_sec:,.0f} ops/sec")
+    elapsed = time.monotonic() - t0
+
+    if not all_results:
+        return None
+    return BenchmarkResult(tests=all_results, elapsed=elapsed)
 
 
 # ── Server Management ───────────────────────────────────────────────────────
@@ -223,7 +280,6 @@ def write_redis_config(config_path: Path, bind_addr: str, port: int) -> None:
 def run_native(
     requests: int,
     clients: int,
-    tests: list[str],
     work_dir: Path,
 ) -> Optional[BenchmarkResult]:
     """Run redis-server natively and benchmark it."""
@@ -252,42 +308,10 @@ def run_native(
             print("  [FAIL] redis-server did not start in time")
             return None
 
-        # Run benchmark
-        tests_arg = ",".join(tests)
-        cmd = [
-            str(redis_benchmark),
-            "-h", "127.0.0.1",
-            "-p", str(REDIS_PORT),
-            "-n", str(requests),
-            "-c", str(clients),
-            "-t", tests_arg,
-            "--csv",
-        ]
-        print(f"  Running: {' '.join(cmd)}")
-        t0 = time.monotonic()
-        try:
-            result = subprocess.run(cmd, capture_output=True, timeout=300)
-        except subprocess.TimeoutExpired:
-            print("  [TIMEOUT]")
-            return None
-        elapsed = time.monotonic() - t0
-
-        if result.returncode != 0:
-            stderr = result.stderr.decode("utf-8", errors="replace")
-            print(f"  [FAIL] redis-benchmark exit code {result.returncode}")
-            print(f"  stderr: {stderr[:500]}")
-            return None
-
-        stdout = result.stdout.decode("utf-8", errors="replace")
-        test_results = parse_redis_benchmark_output(stdout)
-        if not test_results:
-            print(f"  [FAIL] no results parsed from output:\n{stdout[:500]}")
-            return None
-
-        return BenchmarkResult(
-            tests=test_results,
-            elapsed=elapsed,
-            raw_output=stdout,
+        # Run each default test individually for isolation
+        print(f"  Running redis-benchmark (19 default tests) ...")
+        return _run_benchmark_tests(
+            redis_benchmark, "127.0.0.1", REDIS_PORT, requests, clients,
         )
     finally:
         # Shutdown server gracefully
@@ -309,231 +333,77 @@ def run_native(
             server_proc.wait()
 
 
-# ── gVisor Runner ───────────────────────────────────────────────────────────
+# ── gVisor Runner (via Docker) ───────────────────────────────────────────────
 
+GVISOR_REDIS_IMAGE = "redis:8.4.1"
 
 _gvisor_container_seq = 0
-
-
-def _resolve_shared_libs(binary: Path) -> list[Path]:
-    """Resolve shared library dependencies of a binary via ldd."""
-    try:
-        result = subprocess.run(
-            ["ldd", str(binary)], capture_output=True, timeout=10,
-        )
-        if result.returncode != 0:
-            return []
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return []
-    libs = []
-    for line in result.stdout.decode("utf-8", errors="replace").splitlines():
-        m = re.search(r"=>\s+(/\S+)", line)
-        if m:
-            libs.append(Path(m.group(1)))
-        elif line.strip().startswith("/"):
-            m2 = re.match(r"\s*(/\S+)", line)
-            if m2:
-                libs.append(Path(m2.group(1)))
-    return libs
-
-
-def _prepare_gvisor_redis_rootfs(
-    redis_server_path: Path,
-    redis_config_path: Path,
-    work_dir: Path,
-) -> Path:
-    """
-    Prepare a minimal rootfs for running redis-server under gVisor.
-
-    Copies the redis-server binary, config, and shared library dependencies
-    into an OCI-compatible rootfs directory.
-    """
-    bundle_dir = work_dir / "gvisor_redis"
-    rootfs = bundle_dir / "rootfs"
-    if rootfs.exists():
-        shutil.rmtree(rootfs)
-    rootfs.mkdir(parents=True)
-    (rootfs / "tmp").mkdir()
-
-    # Copy redis-server binary
-    shutil.copy2(redis_server_path, rootfs / "redis-server")
-
-    # Copy redis config
-    etc = rootfs / "etc"
-    etc.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(redis_config_path, etc / "redis.conf")
-
-    # Copy shared library dependencies
-    libs = _resolve_shared_libs(redis_server_path)
-    for lib in libs:
-        dest = rootfs / lib.relative_to("/")
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if not dest.exists():
-            shutil.copy2(lib, dest)
-
-    return bundle_dir
-
-
-def _write_gvisor_redis_config(
-    bundle_dir: Path,
-    port: int,
-) -> list[str]:
-    """
-    Write an OCI config.json for redis-server with host networking.
-    """
-    process_args = [
-        "/redis-server",
-        "/etc/redis.conf",
-    ]
-
-    config = {
-        "ociVersion": "1.0.0",
-        "process": {
-            "terminal": False,
-            "user": {"uid": 0, "gid": 0},
-            "args": process_args,
-            "env": ["PATH=/usr/bin:/bin", "HOME=/"],
-            "cwd": "/",
-        },
-        "root": {"path": "rootfs", "readonly": False},
-        "linux": {
-            "namespaces": [
-                {"type": "pid"},
-                {"type": "ipc"},
-                {"type": "uts"},
-                {"type": "mount"},
-                # No network namespace — uses host networking
-            ]
-        },
-        "mounts": [
-            {"destination": "/tmp", "type": "tmpfs", "source": "tmpfs"},
-            {"destination": "/proc", "type": "proc", "source": "proc"},
-        ],
-    }
-
-    config_path = bundle_dir / "config.json"
-    with open(config_path, "w") as f:
-        json.dump(config, f, indent=2)
-
-    return process_args
 
 
 def run_gvisor(
     requests: int,
     clients: int,
-    tests: list[str],
     work_dir: Path,
 ) -> Optional[BenchmarkResult]:
-    """Run redis-server under gVisor with host networking and benchmark from host."""
+    """Run redis-server under gVisor (via Docker --runtime=runsc) and benchmark from host.
+
+    Uses Docker with the runsc runtime so that gVisor's own netstack handles
+    networking (fair comparison with LiteBox's smoltcp/TUN).  Docker's -p flag
+    forwards a host port into the container through gVisor's network stack.
+    """
     global _gvisor_container_seq
     _gvisor_container_seq += 1
-    container_id = f"litebox_redis_gv_{_gvisor_container_seq}_{os.getpid()}"
+    container_name = f"litebox_redis_gv_{_gvisor_container_seq}_{os.getpid()}"
 
-    redis_server = locate_command("redis-server")
     redis_benchmark = locate_command("redis-benchmark")
-    if redis_server is None:
-        print("  [SKIP] redis-server not found on PATH")
-        return None
     if redis_benchmark is None:
         print("  [SKIP] redis-benchmark not found on PATH")
         return None
 
-    # Write config for gVisor (bind to 127.0.0.1 since host networking)
-    config_path = work_dir / "redis_gvisor.conf"
-    write_redis_config(config_path, "127.0.0.1", REDIS_PORT)
+    host_port = REDIS_PORT
 
-    bundle_dir = _prepare_gvisor_redis_rootfs(redis_server, config_path, work_dir)
-    process_args = _write_gvisor_redis_config(bundle_dir, REDIS_PORT)
-
-    cmd = [
-        "sudo", "runsc",
-        "--network=host",
-        "run", "--bundle", str(bundle_dir), container_id,
+    docker_cmd = [
+        "docker", "run", "--rm", "-d",
+        "--runtime=runsc",
+        "--name", container_name,
+        "-p", f"{host_port}:{REDIS_PORT}",
+        GVISOR_REDIS_IMAGE,
+        "redis-server",
+        "--bind", "0.0.0.0",
+        "--port", str(REDIS_PORT),
+        "--protected-mode", "no",
+        "--loglevel", "warning",
     ]
 
-    print(f"  Starting gVisor redis-server: runsc run {' '.join(process_args)}")
-    server_proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    print(f"  Starting gVisor redis-server (Docker): docker run --runtime=runsc ...")
+    result = subprocess.run(docker_cmd, capture_output=True, timeout=30)
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        print(f"  [FAIL] docker run failed: {stderr[:500]}")
+        return None
 
     try:
-        print(f"  Waiting for redis-server at 127.0.0.1:{REDIS_PORT}...")
-        if not wait_for_redis("127.0.0.1", REDIS_PORT, timeout=60.0):
-            stderr = ""
-            try:
-                _, stderr_bytes = server_proc.communicate(timeout=2)
-                stderr = stderr_bytes.decode("utf-8", errors="replace")
-            except subprocess.TimeoutExpired:
-                pass
-            rc = server_proc.poll()
-            if rc is not None:
-                print(f"  [FAIL] gVisor server exited early (code {rc})")
-            else:
-                print("  [FAIL] gVisor redis-server did not start in time")
-            if stderr:
-                print(f"  stderr (last 500): ...{stderr[-500:]}")
+        print(f"  Waiting for redis-server at 127.0.0.1:{host_port}...")
+        if not wait_for_redis("127.0.0.1", host_port, timeout=60.0):
+            logs = subprocess.run(
+                ["docker", "logs", container_name],
+                capture_output=True, timeout=5,
+            )
+            log_text = logs.stdout.decode("utf-8", errors="replace")
+            print("  [FAIL] gVisor redis-server did not start in time")
+            if log_text:
+                print(f"  container logs (last 500): ...{log_text[-500:]}")
             return None
 
-        # Run benchmark from host
-        tests_arg = ",".join(tests)
-        bench_cmd = [
-            str(redis_benchmark),
-            "-h", "127.0.0.1",
-            "-p", str(REDIS_PORT),
-            "-n", str(requests),
-            "-c", str(clients),
-            "-t", tests_arg,
-            "--csv",
-        ]
-        print(f"  Running: {' '.join(bench_cmd)}")
-        t0 = time.monotonic()
-        try:
-            result = subprocess.run(bench_cmd, capture_output=True, timeout=300)
-        except subprocess.TimeoutExpired:
-            print("  [TIMEOUT]")
-            return None
-        elapsed = time.monotonic() - t0
-
-        if result.returncode != 0:
-            stderr = result.stderr.decode("utf-8", errors="replace")
-            print(f"  [FAIL] redis-benchmark exit code {result.returncode}")
-            print(f"  stderr: {stderr[:500]}")
-            return None
-
-        stdout = result.stdout.decode("utf-8", errors="replace")
-        test_results = parse_redis_benchmark_output(stdout)
-        if not test_results:
-            print(f"  [FAIL] no results parsed from output:\n{stdout[:500]}")
-            return None
-
-        return BenchmarkResult(
-            tests=test_results,
-            elapsed=elapsed,
-            raw_output=stdout,
+        # Run each default test individually for isolation
+        print(f"  Running redis-benchmark (19 default tests) ...")
+        return _run_benchmark_tests(
+            redis_benchmark, "127.0.0.1", host_port, requests, clients,
         )
     finally:
-        # Shutdown redis-server and stop gVisor container
-        redis_cli = locate_command("redis-cli")
-        if redis_cli:
-            try:
-                subprocess.run(
-                    [str(redis_cli), "-h", "127.0.0.1", "-p", str(REDIS_PORT),
-                     "SHUTDOWN", "NOSAVE"],
-                    capture_output=True,
-                    timeout=5,
-                )
-            except subprocess.TimeoutExpired:
-                pass
-        server_proc.terminate()
-        try:
-            server_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            server_proc.kill()
-            server_proc.wait()
+        # Stop and remove the Docker container
         subprocess.run(
-            ["sudo", "runsc", "delete", "-force", container_id],
+            ["docker", "rm", "-f", container_name],
             capture_output=True, timeout=10,
         )
 
@@ -606,7 +476,6 @@ def prepare_litebox_rootfs(
 def run_litebox(
     requests: int,
     clients: int,
-    tests: list[str],
     runner_path: Path,
     work_dir: Path,
     packager_path: Optional[Path],
@@ -675,42 +544,10 @@ def run_litebox(
                 print(f"  stderr (last 500): ...{stderr[-500:]}")
             return None
 
-        # Run benchmark from host side
-        tests_arg = ",".join(tests)
-        cmd = [
-            str(redis_benchmark),
-            "-h", GUEST_IP,
-            "-p", str(REDIS_PORT),
-            "-n", str(requests),
-            "-c", str(clients),
-            "-t", tests_arg,
-            "--csv",
-        ]
-        print(f"  Running: {' '.join(cmd)}")
-        t0 = time.monotonic()
-        try:
-            result = subprocess.run(cmd, capture_output=True, timeout=300)
-        except subprocess.TimeoutExpired:
-            print("  [TIMEOUT]")
-            return None
-        elapsed = time.monotonic() - t0
-
-        if result.returncode != 0:
-            stderr = result.stderr.decode("utf-8", errors="replace")
-            print(f"  [FAIL] redis-benchmark exit code {result.returncode}")
-            print(f"  stderr: {stderr[:500]}")
-            return None
-
-        stdout = result.stdout.decode("utf-8", errors="replace")
-        test_results = parse_redis_benchmark_output(stdout)
-        if not test_results:
-            print(f"  [FAIL] no results parsed from output:\n{stdout[:500]}")
-            return None
-
-        return BenchmarkResult(
-            tests=test_results,
-            elapsed=elapsed,
-            raw_output=stdout,
+        # Run each default test individually for isolation
+        print(f"  Running redis-benchmark (19 default tests) ...")
+        return _run_benchmark_tests(
+            redis_benchmark, GUEST_IP, REDIS_PORT, requests, clients,
         )
     finally:
         # Shutdown server
@@ -956,12 +793,6 @@ def main():
         help="Number of parallel clients (default: 8)",
     )
     parser.add_argument(
-        "--tests",
-        nargs="+",
-        default=BENCHMARK_TESTS,
-        help="Redis tests to run (default: SET GET INCR LPUSH RPUSH LPOP RPOP SADD HSET MSET)",
-    )
-    parser.add_argument(
         "--iterations",
         type=int,
         default=3,
@@ -1069,9 +900,17 @@ def main():
             )
 
     if run_gvisor_mode:
-        if shutil.which("runsc") is None:
-            print("Error: runsc (gVisor) not found on PATH.")
-            print("Install gVisor: https://gvisor.dev/docs/user_guide/install/")
+        if shutil.which("docker") is None:
+            print("Error: docker not found on PATH (required for gVisor mode).")
+            sys.exit(1)
+        check = subprocess.run(
+            ["docker", "info", "--format", "{{.Runtimes}}"],
+            capture_output=True, timeout=10,
+        )
+        if "runsc" not in check.stdout.decode("utf-8", errors="replace"):
+            print("Error: Docker runtime 'runsc' not available.")
+            print("Install gVisor and register with Docker:")
+            print("  https://gvisor.dev/docs/user_guide/install/")
             sys.exit(1)
 
     # Working directory
@@ -1083,12 +922,11 @@ def main():
         work_dir = Path(tempfile.mkdtemp(prefix="litebox_redis_bench_"))
         cleanup_work_dir = True
 
-    tests_str = ", ".join(args.tests)
     print(f"Workspace root: {workspace_root}")
     print(f"Work dir:       {work_dir}")
     print(f"Requests:       {args.requests}")
     print(f"Clients:        {args.clients}")
-    print(f"Tests:          {tests_str}")
+    print(f"Tests:          default (all)")
     print(f"Iterations:     {args.iterations}")
     print(f"Mode:           {args.mode}")
     print(f"Port:           {REDIS_PORT}")
@@ -1097,13 +935,11 @@ def main():
         print(f"Runner:         {runner_path}")
         print(f"Packager:       {packager_path or 'cargo run'}")
     if run_gvisor_mode:
-        print(f"gVisor:         runsc")
+        print(f"gVisor:         docker --runtime=runsc (netstack)")
     print()
 
-    # Per-test comparison rows
-    all_rows: dict[str, ComparisonRow] = {
-        t: ComparisonRow(name=t) for t in args.tests
-    }
+    # Per-test comparison rows (populated dynamically from results)
+    all_rows: dict[str, ComparisonRow] = {}
 
     modes_run = []
 
@@ -1115,13 +951,13 @@ def main():
         for i in range(args.iterations):
             print(f"  Iteration {i + 1}/{args.iterations}")
             result = run_native(
-                args.requests, args.clients, args.tests, work_dir,
+                args.requests, args.clients, work_dir,
             )
             if result:
                 for t in result.tests:
-                    if t.name in all_rows:
-                        all_rows[t.name].native_ops.append(t.ops_per_sec)
-                        print(f"    {t.name}: {t.ops_per_sec:,.0f} ops/sec")
+                    if t.name not in all_rows:
+                        all_rows[t.name] = ComparisonRow(name=t.name)
+                    all_rows[t.name].native_ops.append(t.ops_per_sec)
 
     # ── LiteBox runs ────────────────────────────────────────────────────
 
@@ -1131,14 +967,14 @@ def main():
         for i in range(args.iterations):
             print(f"  Iteration {i + 1}/{args.iterations}")
             result = run_litebox(
-                args.requests, args.clients, args.tests,
+                args.requests, args.clients,
                 runner_path, work_dir, packager_path,
             )
             if result:
                 for t in result.tests:
-                    if t.name in all_rows:
-                        all_rows[t.name].litebox_ops.append(t.ops_per_sec)
-                        print(f"    {t.name}: {t.ops_per_sec:,.0f} ops/sec")
+                    if t.name not in all_rows:
+                        all_rows[t.name] = ComparisonRow(name=t.name)
+                    all_rows[t.name].litebox_ops.append(t.ops_per_sec)
 
     # ── gVisor runs ─────────────────────────────────────────────────────
 
@@ -1148,17 +984,17 @@ def main():
         for i in range(args.iterations):
             print(f"  Iteration {i + 1}/{args.iterations}")
             result = run_gvisor(
-                args.requests, args.clients, args.tests, work_dir,
+                args.requests, args.clients, work_dir,
             )
             if result:
                 for t in result.tests:
-                    if t.name in all_rows:
-                        all_rows[t.name].gvisor_ops.append(t.ops_per_sec)
-                        print(f"    {t.name}: {t.ops_per_sec:,.0f} ops/sec")
+                    if t.name not in all_rows:
+                        all_rows[t.name] = ComparisonRow(name=t.name)
+                    all_rows[t.name].gvisor_ops.append(t.ops_per_sec)
 
     # ── Results ─────────────────────────────────────────────────────────
 
-    rows = [all_rows[t] for t in args.tests if t in all_rows]
+    rows = list(all_rows.values())
     print_comparison_table(rows, modes_run)
 
     # ── Save to JSON ────────────────────────────────────────────────────
@@ -1168,7 +1004,7 @@ def main():
             "config": {
                 "requests": args.requests,
                 "clients": args.clients,
-                "tests": args.tests,
+                "tests": list(all_rows.keys()),
                 "iterations": args.iterations,
                 "mode": args.mode,
             },

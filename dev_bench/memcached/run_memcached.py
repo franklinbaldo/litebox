@@ -76,6 +76,15 @@ DEFAULT_KEY_MAX = 10000000
 # Operation types reported by memtier_benchmark
 OP_TYPES = ["Sets", "Gets", "Totals"]
 
+# ── Memcached source configuration ─────────────────────────────────────────
+
+MEMCACHED_VERSION = "1.6.41"
+MEMCACHED_SRC_URL = (
+    f"https://github.com/memcached/memcached/archive/refs/tags/"
+    f"{MEMCACHED_VERSION}.tar.gz"
+)
+MEMCACHED_SRC_DIR = f"memcached-{MEMCACHED_VERSION}"
+
 
 # ── Workspace helpers ───────────────────────────────────────────────────────
 
@@ -99,6 +108,71 @@ def locate_command(name: str) -> Optional[Path]:
     """Find a command on PATH."""
     result = shutil.which(name)
     return Path(result) if result else None
+
+
+# ── Memcached Download & Build ──────────────────────────────────────────────
+
+
+def _find_memcached_build_dir(workspace_root: Path) -> Path:
+    """Return the path to the memcached source directory under dev_bench/memcached/."""
+    return workspace_root / "dev_bench" / "memcached" / MEMCACHED_SRC_DIR
+
+
+def ensure_memcached_built(workspace_root: Path) -> Path:
+    """Download, build, and return the path to the memcached binary.
+
+    The source is downloaded once into dev_bench/memcached/<version>/ and
+    compiled with ``./autogen.sh && ./configure && make``.  Subsequent calls
+    reuse the existing binary.
+    """
+    build_dir = _find_memcached_build_dir(workspace_root)
+    memcached_bin = build_dir / "memcached"
+
+    if memcached_bin.exists():
+        return memcached_bin
+
+    script_dir = workspace_root / "dev_bench" / "memcached"
+    tarball = script_dir / f"memcached-{MEMCACHED_VERSION}.tar.gz"
+
+    # Download
+    if not tarball.exists():
+        import urllib.request
+
+        print(f"Downloading memcached {MEMCACHED_VERSION} from {MEMCACHED_SRC_URL}...")
+        urllib.request.urlretrieve(MEMCACHED_SRC_URL, str(tarball))
+        print("Download complete.")
+
+    # Extract
+    if not build_dir.exists():
+        print(f"Extracting memcached-{MEMCACHED_VERSION}.tar.gz...")
+        import tarfile as _tarfile
+
+        with _tarfile.open(tarball, "r:gz") as tf:
+            tf.extractall(script_dir)
+        print("Extraction complete.")
+
+    assert build_dir.exists(), f"Expected directory {build_dir} not found after extraction"
+
+    # Write version.m4 (GitHub tarballs lack git metadata for version detection)
+    version_m4 = build_dir / "version.m4"
+    version_m4.write_text(f"m4_define([VERSION_NUMBER], [{MEMCACHED_VERSION}])\n")
+
+    # Build
+    print(f"Building memcached {MEMCACHED_VERSION}...")
+    subprocess.run(["./autogen.sh"], cwd=str(build_dir), check=True,
+                    capture_output=True)
+    subprocess.run(["./configure"], cwd=str(build_dir), check=True,
+                    capture_output=True)
+    result = subprocess.run(["make", f"-j{os.cpu_count() or 1}"],
+                            cwd=str(build_dir), capture_output=True)
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        print(f"Error: memcached build failed:\n{stderr[-1000:]}")
+        sys.exit(1)
+
+    assert memcached_bin.exists(), f"memcached binary not found at {memcached_bin}"
+    print(f"Build complete: {memcached_bin}")
+    return memcached_bin
 
 
 # ── Result Parsing ──────────────────────────────────────────────────────────
@@ -315,12 +389,10 @@ def run_native(
     key_max: int,
     work_dir: Path,
     memtier_path: Path,
+    memcached_path: Path,
 ) -> Optional[BenchmarkResult]:
     """Run memcached natively and benchmark it."""
-    memcached = locate_command("memcached")
-    if memcached is None:
-        print("  [SKIP] memcached not found on PATH")
-        return None
+    memcached = memcached_path
 
     # Start memcached: single-threaded, bind to loopback, non-default port
     server_cmd = [
@@ -481,12 +553,10 @@ def run_litebox(
     work_dir: Path,
     packager_path: Optional[Path],
     memtier_path: Path,
+    memcached_path: Path,
 ) -> Optional[BenchmarkResult]:
-    """Run memcached natively and under LiteBox and benchmark from host."""
-    memcached = locate_command("memcached")
-    if memcached is None:
-        print("  [SKIP] memcached not found on PATH")
-        return None
+    """Run memcached under LiteBox and benchmark from host."""
+    memcached = memcached_path
 
     prepared = prepare_litebox_rootfs(memcached, work_dir, packager_path)
     if prepared is None:
@@ -599,118 +669,11 @@ def run_litebox(
             server_proc.wait()
 
 
-# ── gVisor Runner ───────────────────────────────────────────────────────────
+# ── gVisor Runner (via Docker) ──────────────────────────────────────────────
 
-
-def _resolve_shared_libs(binary: Path) -> list[Path]:
-    """Resolve shared library dependencies of a binary via ldd."""
-    try:
-        result = subprocess.run(
-            ["ldd", str(binary)], capture_output=True, timeout=10,
-        )
-        if result.returncode != 0:
-            return []
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return []
-    libs = []
-    for line in result.stdout.decode("utf-8", errors="replace").splitlines():
-        m = re.search(r"=>\s+(/\S+)", line)
-        if m:
-            libs.append(Path(m.group(1)))
-        elif line.strip().startswith("/"):
-            m2 = re.match(r"\s*(/\S+)", line)
-            if m2:
-                libs.append(Path(m2.group(1)))
-    return libs
-
+GVISOR_MEMCACHED_IMAGE = "memcached:1.6.41"
 
 _gvisor_container_seq = 0
-
-
-def _prepare_gvisor_memcached_rootfs(
-    memcached_path: Path,
-    work_dir: Path,
-) -> Path:
-    """
-    Prepare a minimal rootfs for running memcached under gVisor.
-
-    Copies the memcached binary and its shared library dependencies into
-    an OCI-compatible rootfs directory.
-    """
-    bundle_dir = work_dir / "gvisor_memcached"
-    rootfs = bundle_dir / "rootfs"
-    if rootfs.exists():
-        shutil.rmtree(rootfs)
-    rootfs.mkdir(parents=True)
-    (rootfs / "tmp").mkdir()
-
-    # Copy memcached binary
-    shutil.copy2(memcached_path, rootfs / "memcached")
-
-    # Copy shared library dependencies
-    libs = _resolve_shared_libs(memcached_path)
-    for lib in libs:
-        dest = rootfs / lib.relative_to("/")
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if not dest.exists():
-            shutil.copy2(lib, dest)
-
-    return bundle_dir
-
-
-def _write_gvisor_memcached_config(
-    bundle_dir: Path,
-    port: int,
-) -> list[str]:
-    """
-    Write an OCI config.json for memcached with host networking.
-    """
-    process_args = [
-        "/memcached",
-        "-l", "127.0.0.1",
-        "-p", str(port),
-        "-t", "1",
-        "-m", "256",
-        "-c", "1024",
-        "-u", "root",
-    ]
-
-    # /etc/passwd doesn't exist inside the minimal rootfs, so provide it
-    # so memcached's -u flag can look up the user.
-    etc = bundle_dir / "rootfs" / "etc"
-    etc.mkdir(parents=True, exist_ok=True)
-    (etc / "passwd").write_text("root:x:0:0:root:/root:/bin/sh\n")
-
-    config = {
-        "ociVersion": "1.0.0",
-        "process": {
-            "terminal": False,
-            "user": {"uid": 0, "gid": 0},
-            "args": process_args,
-            "env": ["PATH=/usr/bin:/bin", "HOME=/"],
-            "cwd": "/",
-        },
-        "root": {"path": "rootfs", "readonly": False},
-        "linux": {
-            "namespaces": [
-                {"type": "pid"},
-                {"type": "ipc"},
-                {"type": "uts"},
-                {"type": "mount"},
-                # No network namespace — uses host networking
-            ]
-        },
-        "mounts": [
-            {"destination": "/tmp", "type": "tmpfs", "source": "tmpfs"},
-            {"destination": "/proc", "type": "proc", "source": "proc"},
-        ],
-    }
-
-    config_path = bundle_dir / "config.json"
-    with open(config_path, "w") as f:
-        json.dump(config, f, indent=2)
-
-    return process_args
 
 
 def run_gvisor(
@@ -724,48 +687,53 @@ def run_gvisor(
     memtier_path: Path,
     port: int,
 ) -> Optional[BenchmarkResult]:
-    """Run memcached under gVisor with host networking and benchmark from host."""
+    """Run memcached under gVisor (via Docker --runtime=runsc) and benchmark from host.
+
+    Uses Docker with the runsc runtime so that gVisor's own netstack handles
+    networking (fair comparison with LiteBox's smoltcp/TUN).  Docker's -p flag
+    forwards a host port into the container through gVisor's network stack.
+    """
     global _gvisor_container_seq
     _gvisor_container_seq += 1
-    container_id = f"litebox_memcached_gv_{_gvisor_container_seq}_{os.getpid()}"
+    container_name = f"litebox_memcached_gv_{_gvisor_container_seq}_{os.getpid()}"
 
-    memcached = locate_command("memcached")
-    if memcached is None:
-        print("  [SKIP] memcached not found on PATH")
-        return None
+    # Pick a host-side port (use the same port by default)
+    host_port = port
 
-    bundle_dir = _prepare_gvisor_memcached_rootfs(memcached, work_dir)
-    process_args = _write_gvisor_memcached_config(bundle_dir, port)
-
-    cmd = [
-        "sudo", "runsc",
-        "--network=host",
-        "run", "--bundle", str(bundle_dir), container_id,
+    docker_cmd = [
+        "docker", "run", "--rm", "-d",
+        "--runtime=runsc",
+        "--name", container_name,
+        "-p", f"{host_port}:{port}",
+        GVISOR_MEMCACHED_IMAGE,
+        "memcached",
+        "-l", "0.0.0.0",
+        "-p", str(port),
+        "-t", "1",
+        "-m", "256",
+        "-c", "1024",
+        "-u", "memcache",
     ]
 
-    print(f"  Starting gVisor memcached: runsc run {' '.join(process_args)}")
-    server_proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    print(f"  Starting gVisor memcached (Docker): {' '.join(docker_cmd)}")
+    result = subprocess.run(docker_cmd, capture_output=True, timeout=30)
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        print(f"  [FAIL] docker run failed: {stderr[:500]}")
+        return None
 
     try:
-        print(f"  Waiting for memcached at 127.0.0.1:{port}...")
-        if not wait_for_memcached("127.0.0.1", port, timeout=60.0, proc=server_proc):
-            stderr = ""
-            try:
-                _, stderr_bytes = server_proc.communicate(timeout=2)
-                stderr = stderr_bytes.decode("utf-8", errors="replace")
-            except subprocess.TimeoutExpired:
-                pass
-            rc = server_proc.poll()
-            if rc is not None:
-                print(f"  [FAIL] gVisor server exited early (code {rc})")
-            else:
-                print("  [FAIL] gVisor memcached did not start in time")
-            if stderr:
-                print(f"  stderr (last 500): ...{stderr[-500:]}")
+        print(f"  Waiting for memcached at 127.0.0.1:{host_port}...")
+        if not wait_for_memcached("127.0.0.1", host_port, timeout=60.0):
+            # Try to get container logs for debugging
+            logs = subprocess.run(
+                ["docker", "logs", container_name],
+                capture_output=True, timeout=5,
+            )
+            log_text = logs.stdout.decode("utf-8", errors="replace")
+            print("  [FAIL] gVisor memcached did not start in time")
+            if log_text:
+                print(f"  container logs (last 500): ...{log_text[-500:]}")
             return None
 
         # Run memtier_benchmark from host
@@ -773,7 +741,7 @@ def run_gvisor(
         bench_cmd = [
             str(memtier_path),
             "-s", "127.0.0.1",
-            "-p", str(port),
+            "-p", str(host_port),
             "--protocol=memcache_text",
             "-n", str(requests_per_client),
             "-c", str(clients),
@@ -815,15 +783,9 @@ def run_gvisor(
             raw_output=stdout,
         )
     finally:
-        # Stop the gVisor container
-        server_proc.terminate()
-        try:
-            server_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            server_proc.kill()
-            server_proc.wait()
+        # Stop and remove the Docker container
         subprocess.run(
-            ["sudo", "runsc", "delete", "-force", container_id],
+            ["docker", "rm", "-f", container_name],
             capture_output=True, timeout=10,
         )
 
@@ -1145,11 +1107,10 @@ def main():
     TUN_DEVICE = args.tun_device
     MEMCACHED_PORT = args.port
 
-    # Check prerequisites
-    if locate_command("memcached") is None:
-        print("Error: memcached not found on PATH.")
-        print("Install it: sudo apt install memcached")
-        sys.exit(1)
+    workspace_root = find_workspace_root()
+
+    # Build memcached from source (downloads if needed)
+    memcached_path = ensure_memcached_built(workspace_root)
 
     # Resolve memtier_benchmark
     if args.memtier_path:
@@ -1169,13 +1130,26 @@ def main():
             print("  sudo make install  # or pass --memtier-path=./memtier_benchmark")
             sys.exit(1)
 
-    workspace_root = find_workspace_root()
-
     # Resolve litebox binaries
     run_litebox_mode = args.mode in ("both", "litebox", "all")
     run_gvisor_mode = args.mode in ("gvisor", "all")
     runner_path = None
     packager_path = None
+
+    if run_gvisor_mode:
+        if shutil.which("docker") is None:
+            print("Error: docker not found on PATH (required for gVisor mode).")
+            sys.exit(1)
+        # Verify runsc runtime is available in Docker
+        check = subprocess.run(
+            ["docker", "info", "--format", "{{.Runtimes}}"],
+            capture_output=True, timeout=10,
+        )
+        if "runsc" not in check.stdout.decode("utf-8", errors="replace"):
+            print("Error: Docker runtime 'runsc' not available.")
+            print("Install gVisor and register with Docker:")
+            print("  https://gvisor.dev/docs/user_guide/install/")
+            sys.exit(1)
 
     if run_litebox_mode:
         # Check TUN device
@@ -1227,13 +1201,14 @@ def main():
     print(f"Iterations:     {args.iterations}")
     print(f"Mode:           {args.mode}")
     print(f"Port:           {MEMCACHED_PORT}")
+    print(f"memcached:      {memcached_path} (v{MEMCACHED_VERSION})")
     print(f"memtier:        {memtier_path}")
     if run_litebox_mode:
         print(f"TUN device:     {TUN_DEVICE}")
         print(f"Runner:         {runner_path}")
         print(f"Packager:       {packager_path or 'cargo run'}")
     if run_gvisor_mode:
-        print(f"gVisor:         runsc --network=host (via sudo)")
+        print(f"gVisor:         docker --runtime=runsc (netstack)")
     print()
 
     # Per-operation comparison rows
@@ -1250,7 +1225,7 @@ def main():
             result = run_native(
                 args.requests, args.clients, args.threads,
                 args.ratio, args.data_size, args.key_maximum,
-                work_dir, memtier_path,
+                work_dir, memtier_path, memcached_path,
             )
             if result:
                 for op in result.ops:
@@ -1272,6 +1247,7 @@ def main():
                 args.requests, args.clients, args.threads,
                 args.ratio, args.data_size, args.key_maximum,
                 runner_path, work_dir, packager_path, memtier_path,
+                memcached_path,
             )
             if result:
                 for op in result.ops:
