@@ -43,6 +43,8 @@ macro_rules! log_unsupported {
 
 pub(crate) mod channel;
 pub mod loader;
+#[cfg(feature = "rr")]
+pub mod rr;
 pub(crate) mod stdio;
 pub mod syscalls;
 pub mod transport;
@@ -147,6 +149,10 @@ pub struct LinuxShimBuilder {
     platform: &'static Platform,
     litebox: LiteBox<Platform>,
     load_filter: Option<LoadFilter>,
+    #[cfg(feature = "rr")]
+    rr_mode: rr::RRMode,
+    #[cfg(feature = "rr")]
+    rr_trace_data: Option<Vec<u8>>,
 }
 
 impl Default for LinuxShimBuilder {
@@ -163,6 +169,10 @@ impl LinuxShimBuilder {
             platform,
             litebox: LiteBox::new(platform),
             load_filter: None,
+            #[cfg(feature = "rr")]
+            rr_mode: rr::RRMode::Off,
+            #[cfg(feature = "rr")]
+            rr_trace_data: None,
         }
     }
 
@@ -185,8 +195,28 @@ impl LinuxShimBuilder {
         self.load_filter = Some(callback);
     }
 
+    /// Enable record mode for record-and-replay.
+    #[cfg(feature = "rr")]
+    pub fn set_rr_record(&mut self) {
+        self.rr_mode = rr::RRMode::Record;
+    }
+
+    /// Enable replay mode for record-and-replay with the given trace data.
+    #[cfg(feature = "rr")]
+    pub fn set_rr_replay(&mut self, trace_data: Vec<u8>) {
+        self.rr_mode = rr::RRMode::Replay;
+        self.rr_trace_data = Some(trace_data);
+    }
+
     /// Build the shim.
-    pub fn build<FS: ShimFS>(self) -> LinuxShim<FS> {
+    ///
+    /// # Panics
+    ///
+    /// When the `rr` feature is enabled and replay mode is selected, this will
+    /// panic if no trace data was provided or if the trace data is invalid.
+    pub fn build<FS: ShimFS>(
+        #[cfg_attr(not(feature = "rr"), allow(unused_mut))] mut self,
+    ) -> LinuxShim<FS> {
         let mut net = Network::new(&self.litebox);
         net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
         let global = Arc::new(GlobalState {
@@ -200,6 +230,17 @@ impl LinuxShimBuilder {
             next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
+            #[cfg(feature = "rr")]
+            rr_state: match self.rr_mode {
+                rr::RRMode::Off => rr::RRState::new(rr::RRMode::Off),
+                rr::RRMode::Record => rr::RRState::new(rr::RRMode::Record),
+                rr::RRMode::Replay => rr::RRState::new_replay(
+                    self.rr_trace_data
+                        .take()
+                        .expect("replay requires trace data"),
+                )
+                .expect("invalid trace data"),
+            },
         });
         LinuxShim(global)
     }
@@ -213,6 +254,17 @@ impl<FS: ShimFS> Clone for LinuxShim<FS> {
 }
 
 impl<FS: ShimFS> LinuxShim<FS> {
+    /// Finish recording and return the trace bytes. Consumes the `LinuxShim`.
+    ///
+    /// Returns `None` if the shim was not in recording mode, or if there are
+    /// other outstanding references to the global state.
+    #[cfg(feature = "rr")]
+    pub fn finish_rr(self) -> Option<Vec<u8>> {
+        Arc::try_unwrap(self.0)
+            .ok()
+            .and_then(|global| global.rr_state.finish_recording())
+    }
+
     /// Loads the program at `path` as the shim's initial task, returning the
     /// initial register state.
     pub fn load_program(
@@ -498,6 +550,23 @@ impl<FS: ShimFS> Task<FS> {
     ///
     /// Unsupported syscalls or arguments would trigger a panic for development purposes.
     fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        #[cfg(feature = "rr")]
+        {
+            use crate::rr::RRMode;
+            match self.global.rr_state.mode() {
+                RRMode::Off => self.handle_syscall_request_normal(ctx),
+                RRMode::Record => self.handle_syscall_request_record(ctx),
+                RRMode::Replay => self.handle_syscall_request_replay(ctx),
+            }
+        }
+        #[cfg(not(feature = "rr"))]
+        {
+            self.handle_syscall_request_normal(ctx);
+        }
+    }
+
+    /// Normal (non-RR) syscall handling.
+    fn handle_syscall_request_normal(&self, ctx: &mut litebox_common_linux::PtRegs) {
         let return_value = match self.do_syscall(ctx) {
             Ok(v) => v,
             Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
@@ -509,6 +578,54 @@ impl<FS: ShimFS> Task<FS> {
         #[cfg(target_arch = "x86_64")]
         {
             ctx.rax = return_value;
+        }
+    }
+
+    /// Record mode: execute the syscall normally, then capture side-effects.
+    #[cfg(feature = "rr")]
+    fn handle_syscall_request_record(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let syscall_nr = rr::get_syscall_nr(ctx);
+
+        // Execute the syscall normally.
+        let return_value = match self.do_syscall(ctx) {
+            Ok(v) => v,
+            Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
+        };
+
+        // Write return value to guest context.
+        rr::set_return_value(ctx, return_value);
+
+        // Capture any side-effect data written to guest memory.
+        let data = rr::capture_side_effects(syscall_nr, ctx, return_value);
+
+        // Record the event. The return value as i64 preserves negative errno encoding.
+        #[allow(clippy::cast_possible_wrap)]
+        let result_i64 = return_value as isize as i64;
+        self.global
+            .rr_state
+            .record_event(syscall_nr, result_i64, data);
+    }
+
+    /// Replay mode: skip the real syscall, inject recorded return value and data.
+    #[cfg(feature = "rr")]
+    fn handle_syscall_request_replay(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let syscall_nr = rr::get_syscall_nr(ctx);
+
+        match self.global.rr_state.replay_event(syscall_nr) {
+            Ok(event) => {
+                // Inject side-effect data into guest memory.
+                if !event.data.is_empty() {
+                    rr::inject_side_effects(syscall_nr, ctx, &event.data);
+                }
+                // Inject return value. The i64 result encodes both success (positive)
+                // and error (negative errno) values.
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let return_value = event.result as usize;
+                rr::set_return_value(ctx, return_value);
+            }
+            Err(e) => {
+                panic!("replay error: {e:?}");
+            }
         }
     }
 
@@ -1059,6 +1176,9 @@ struct GlobalState<FS: ShimFS> {
     next_thread_id: core::sync::atomic::AtomicI32,
     /// UNIX domain socket address table
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<FS>>,
+    /// Record-and-replay state (only present when the `rr` feature is enabled).
+    #[cfg(feature = "rr")]
+    rr_state: rr::RRState,
 }
 
 struct Task<FS: ShimFS> {
