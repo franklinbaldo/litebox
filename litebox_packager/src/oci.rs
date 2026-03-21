@@ -15,8 +15,10 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use oci_client::client::{ClientConfig, ClientProtocol, ImageData};
 use oci_client::config::ConfigFile;
+use oci_client::manifest::ImageIndexEntry;
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
+use oci_spec::image::{Arch, Os};
 
 /// Parsed OCI image execution configuration (ENTRYPOINT, CMD, ENV, WORKDIR).
 #[derive(Debug, Default)]
@@ -96,6 +98,7 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
     let image_data = rt.block_on(async {
         let config = ClientConfig {
             protocol: ClientProtocol::Https,
+            platform_resolver: Some(Box::new(linux_host_arch_resolver)),
             ..Default::default()
         };
         let client = Client::new(config);
@@ -189,6 +192,34 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
         config,
         config_json,
     })
+}
+
+/// Custom OCI platform resolver that always selects Linux images matching the
+/// host architecture.
+///
+/// The packager packages Linux containers, so it must always pull `linux/{arch}`
+/// images regardless of the host OS. The default `current_platform_resolver`
+/// uses `std::env::consts::OS` which would select macOS or Windows images on
+/// those hosts.
+fn linux_host_arch_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
+    let target_arch = match std::env::consts::ARCH {
+        "x86_64" => Arch::Amd64,
+        "aarch64" => Arch::ARM64,
+        other => {
+            eprintln!("warning: unknown host architecture '{other}', falling back to amd64");
+            Arch::Amd64
+        }
+    };
+
+    manifests
+        .iter()
+        .find(|entry| {
+            entry
+                .platform
+                .as_ref()
+                .is_some_and(|p| p.os == Os::Linux && p.architecture == target_arch)
+        })
+        .map(|entry| entry.digest.clone())
 }
 
 /// Generate a `litebox/config_and_run.sh` shell script from the OCI image config.
