@@ -471,6 +471,7 @@ host_sp:
     .quad 0
 guest_context_top:
     .quad 0
+.globl guest_tpidr
 guest_tpidr:
     .quad 0
 in_guest:
@@ -902,8 +903,13 @@ unsafe extern "C-unwind" fn run_thread_arch(
     // At entry:
     //   x18 = host TLS base (from trampoline's per-thread table lookup)
     //   x30 = guest return address (after the rewritten SVC)
-    //   Guest stack: [SP+0]=saved_x16, [SP+8]=saved_x17, [SP+16]=saved_x30, [SP+24]=guest_tpidr
-    //   SP was decremented by 32 by trampoline
+    //   Guest stack (48-byte frame):
+    //     [SP+0]  = saved X16
+    //     [SP+8]  = saved X17
+    //     [SP+16] = return address (PC after original SVC, same as x30)
+    //     [SP+24] = guest TPIDR (written by shared handler)
+    //     [SP+32] = guest's original X30 (LR)
+    //   SP was decremented by 48 by trampoline
     //   x0-x15, x19-x29 = guest register values
     //   (x16, x17 were clobbered by trampoline; originals on guest stack)
     // ================================================================
@@ -915,10 +921,13 @@ syscall_callback:
     movk x16, #:tprel_g0_nc:in_guest
     strb wzr, [x18, x16]
 
-    // Save guest TPIDR (from trampoline stack slot) to guest_tpidr TLS var.
-    // This ensures switch_to_guest restores the correct TPIDR, even if
-    // the guest changed it via MSR TPIDR_EL0.
-    ldr x17, [sp, #24]
+    // Save guest TPIDR to guest_tpidr TLS var.
+    // Read directly from TPIDR_EL0 (which still holds the guest value at
+    // this point) rather than from [SP+24].  The trampoline's fallback
+    // path can clobber [SP+24] with a stale entry[0].guest_tpidr when the
+    // guest changed TPIDR_EL0 after the table was last registered —
+    // reading the hardware register is always correct.
+    mrs x17, tpidr_el0
     movz x16, #:tprel_g1:guest_tpidr
     movk x16, #:tprel_g0_nc:guest_tpidr
     str x17, [x18, x16]
@@ -947,9 +956,9 @@ syscall_callback:
     stp x12, x13, [x16, #96]     // regs[12], regs[13]
     stp x14, x15, [x16, #112]    // regs[14], regs[15]
 
-    // Recover guest x16, x17, x30 from guest stack frame.
+    // Recover guest x16, x17, x30 from guest stack frame (48-byte layout).
     ldp x0, x1, [sp]             // x0 = guest_x16, x1 = guest_x17
-    ldr x2, [sp, #16]            // x2 = guest_x30
+    ldr x2, [sp, #32]            // x2 = guest_x30 (LR, at [SP+32])
 
     // Store guest x16, x17 into PtRegs.regs[16..17].
     stp x0, x1, [x16, #128]      // regs[16], regs[17]
@@ -969,8 +978,8 @@ syscall_callback:
     // Store guest x30 (link register, recovered from stack).
     str x2, [x16, #240]          // regs[30] = guest LR
 
-    // Compute original guest SP (trampoline decremented by 32).
-    add x0, sp, #32
+    // Compute original guest SP (trampoline decremented by 48).
+    add x0, sp, #48
     str x0, [x16, #248]          // PtRegs.sp
 
     // Store guest PC = x30 (return address from trampoline, in our x30).
@@ -2114,12 +2123,19 @@ extern "C-unwind" fn exception_handler(
 
 /// Update the TLS lookup table with the current thread's (guest_tpidr, host_tls) entry.
 ///
-/// Called before entering guest code on aarch64. The trampoline's per-SVC
-/// snippets use this table to find the host TLS base on syscall entry.
+/// Called before entering guest code on aarch64. The trampoline's shared SVC
+/// and MSR handlers use hash-based open-addressing to find the host TLS
+/// base on syscall entry. This function places entries at hash-derived
+/// positions matching the assembly hash: `(guest_tpidr >> 4) & 0xFF`.
 ///
-/// Uses linear scan to match the trampoline's assembly lookup.
+/// If the guest's MSR handler updated the TPIDR key in-place (changing the
+/// key without moving the entry to the new hash bucket), this function
+/// detects the stale entry, tombstones it, and re-inserts at the correct
+/// hash position.
 #[cfg(target_arch = "aarch64")]
 const TLS_TABLE_ENTRIES: usize = 256;
+#[cfg(target_arch = "aarch64")]
+const TLS_MAX_PROBES: usize = 8;
 
 #[cfg(target_arch = "aarch64")]
 fn update_host_tls_entry() {
@@ -2137,34 +2153,128 @@ fn update_host_tls_entry() {
     }
 
     // Read guest_tpidr from our thread-local
-    let guest_tpidr = get_guest_tpidr();
+    let guest_tpidr = get_guest_tpidr() as u64;
 
-    let sentinel: u64 = 0xFFFFFFFFFFFFFFFF;
+    let sentinel: u64 = 0xFFFF_FFFF_FFFF_FFFF;
     let table = table_addr as *mut u64;
 
-    // Linear scan from index 0 (matches trampoline assembly lookup)
-    for index in 0..TLS_TABLE_ENTRIES {
+    // Hash function matches assembly: (guest_tpidr >> 4) & 0xFF
+    // Note: guest_tpidr == 0 would collide with tombstone semantics (key=0 means freed).
+    // In practice, TPIDR_EL0 is always non-zero on Linux (set by kernel to thread TLS area).
+    let hash_idx = ((guest_tpidr >> 4) & 0xFF) as usize;
+
+    // Probe from hash position (bounded; overflow entries are sentinel)
+    let mut first_free: Option<usize> = None;
+    for probe in 0..=TLS_MAX_PROBES {
+        let index = hash_idx + probe; // No wrap needed: 8 overflow sentinel entries allocated
         let entry = unsafe { table.add(index * 2) };
-        let stored_guest_tpidr = unsafe { entry.read_volatile() };
+        let stored = unsafe { entry.read_volatile() };
 
-        if stored_guest_tpidr == guest_tpidr as u64 {
-            // Found existing entry - update host_tls
+        if stored == guest_tpidr {
+            // Found our entry — update host_tls value
             unsafe { entry.add(1).write_volatile(host_tls as u64) };
+            // Maintain entry[0] as fallback for rtld_audit single-thread path
+            update_entry0_fallback(table, guest_tpidr, host_tls as u64);
             return;
         }
-
-        if stored_guest_tpidr == sentinel {
-            // Found free slot - claim it
-            unsafe {
-                entry.write_volatile(guest_tpidr as u64);
-                entry.add(1).write_volatile(host_tls as u64);
+        if stored == sentinel {
+            if first_free.is_none() {
+                first_free = Some(index);
             }
-            return;
+            // Sentinel = never occupied; our entry can't be further along the chain
+            break;
         }
-        // Slot occupied by different thread - continue scanning
+        if stored == 0 && first_free.is_none() {
+            // Tombstone (freed slot) — can be reclaimed
+            first_free = Some(index);
+        }
     }
 
-    panic!("TLS table full: exceeded {TLS_TABLE_ENTRIES} concurrent threads");
+    // Entry not found at hash position. Check if MSR handler left a stale
+    // entry at the old hash position (in-place key update). Scan for an
+    // entry with our host_tls value but wrong key.
+    for scan_idx in 0..TLS_TABLE_ENTRIES {
+        let entry = unsafe { table.add(scan_idx * 2) };
+        let stored_key = unsafe { entry.read_volatile() };
+        let stored_val = unsafe { entry.add(1).read_volatile() };
+
+        if stored_val == host_tls as u64 && stored_key != guest_tpidr && stored_key != sentinel {
+            // Stale entry from MSR rename: tombstone it
+            unsafe { entry.write_volatile(0u64) };
+            // If this was in our probe chain and before first_free, we might
+            // be able to use it. But it's simpler to just use first_free.
+            break;
+        }
+    }
+
+    // Insert at first available slot from hash position
+    if let Some(idx) = first_free {
+        let entry = unsafe { table.add(idx * 2) };
+        unsafe {
+            entry.write_volatile(guest_tpidr);
+            entry.add(1).write_volatile(host_tls as u64);
+        }
+        // Maintain entry[0] as fallback for rtld_audit single-thread path
+        update_entry0_fallback(table, guest_tpidr, host_tls as u64);
+        return;
+    }
+
+    panic!("TLS hash table: max probes exceeded for bucket {hash_idx}");
+}
+
+/// Remove the current thread's entry from the TLS hash table on thread exit.
+///
+/// Tombstones the entry (writes key=0) so the slot can be reclaimed by future
+/// threads. Without this, exited threads leave stale entries that accumulate
+/// and eventually overflow the probe chain.
+#[cfg(target_arch = "aarch64")]
+fn remove_host_tls_entry() {
+    use core::sync::atomic::Ordering;
+
+    let table_addr = litebox_common_linux::HOST_TLS_TABLE_ADDR.load(Ordering::Acquire);
+    if table_addr == 0 {
+        return;
+    }
+
+    let guest_tpidr = get_guest_tpidr() as u64;
+    if guest_tpidr == 0 {
+        return; // No guest TPIDR set for this thread
+    }
+
+    let sentinel: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+    let table = table_addr as *mut u64;
+    let hash_idx = ((guest_tpidr >> 4) & 0xFF) as usize;
+
+    for probe in 0..=TLS_MAX_PROBES {
+        let index = hash_idx + probe;
+        let entry = unsafe { table.add(index * 2) };
+        let stored = unsafe { entry.read_volatile() };
+
+        if stored == guest_tpidr {
+            // Tombstone: write key=0 so the slot can be reclaimed
+            unsafe { entry.write_volatile(0u64) };
+            return;
+        }
+        if stored == sentinel {
+            // Sentinel = never occupied; our entry can't be further along
+            return;
+        }
+    }
+}
+
+/// Write guest_tpidr + host_tls to entry[0] as a fallback for the SVC handler's
+/// sentinel path. During rtld_audit (single-thread bootstrap), the hash bucket
+/// may not be 0, so the fallback at entry[0] needs valid data.
+///
+/// In multi-thread mode this is best-effort (last writer wins) but the
+/// fallback path should never be reached on Linux (TPIDR_EL0 is preserved).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn update_entry0_fallback(table: *mut u64, guest_tpidr: u64, host_tls: u64) {
+    unsafe {
+        table.write_volatile(guest_tpidr);
+        table.add(1).write_volatile(host_tls);
+    }
 }
 
 extern "C-unwind" fn interrupt_handler(thread_ctx: &mut ThreadContext) {
@@ -2212,7 +2322,10 @@ impl ThreadContext<'_> {
                 update_host_tls_entry();
                 unsafe { switch_to_guest(self.ctx) }
             }
-            ContinueOperation::Terminate => {}
+            ContinueOperation::Terminate => {
+                #[cfg(target_arch = "aarch64")]
+                remove_host_tls_entry();
+            }
         }
     }
 }

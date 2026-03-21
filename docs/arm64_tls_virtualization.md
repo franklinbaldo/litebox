@@ -25,13 +25,17 @@ No register virtualization is needed. Host and guest share the same hardware
 - **MRS gate** (5 insns): Reads `entry[0].guest_tpidr` from the TLS lookup
   table. Avoids reading hardware directly because the host may have a different
   TPIDR value between syscalls.
-- **SVC handler** (18 insns): Reads hardware `TPIDR_EL0` as the TLS table
-  lookup key, scans for a matching entry, stores `host_tls` for
-  `syscall_callback`.
-- **MSR handler** (19 insns): Updates the TLS table entry with the new
-  guest TPIDR value and writes hardware `MSR TPIDR_EL0`.
+- **SVC handler** (21 insns): Reads hardware `TPIDR_EL0` as the TLS table
+  lookup key, hashes into the table (see below), stores `host_tls` for
+  `syscall_callback`. Falls back to `entry[0]` if no match (sentinel hit).
+- **MSR handler** (22 insns): Hashes the old `TPIDR_EL0` to find the
+  existing TLS table entry, updates it with the new guest TPIDR value in-place,
+  and writes hardware `MSR TPIDR_EL0`. Falls back to writing `entry[0]` on
+  sentinel (no match).
 - **X18**: Not virtualized — Linux treats X18 as a free GPR on both host
   and guest.
+- **Lookup cost**: **O(1) amortized** — hash-based open-addressing with
+  bounded linear probing (up to 8 probes).
 
 ### macOS ARM64
 
@@ -94,9 +98,81 @@ trampoline load, reused by subsequent loads.
 - **Entry size**: 16 bytes — `[key: u64, host_tls: u64]`
 - **Key**: Platform-dependent (TPIDR_EL0 on Linux, TPIDRRO_EL0 on macOS,
   guest_tpidr on Windows)
-- **Sentinel**: `0xFFFFFFFFFFFFFFFF` marks end of valid entries
-- **Tombstone**: `0` marks a freed slot (reclaimable by CAS)
-- **Capacity**: 256 entries (one page)
+- **Sentinel**: `0xFFFFFFFFFFFFFFFF` marks end of valid entries / empty slot
+- **Tombstone**: `0` marks a freed slot (reclaimable by CAS or insertion)
+- **Capacity**: 264 entries (256 usable + 8 overflow sentinels)
+
+### Hash-Based Lookup (Linux ARM64)
+
+On Linux ARM64, the SVC and MSR handlers use a hash-based open-addressing
+scheme instead of linear scan:
+
+- **Hash function**: `(guest_tpidr >> 4) & 0xFF` — computed in 3 instructions
+  (LSR, AND, ADD with LSL #4). The right-shift by 4 discards low alignment
+  bits; the 8-bit mask selects one of 256 buckets.
+- **Probe strategy**: Open-addressing with linear probing. Starting at the
+  hash bucket, the handler checks each entry sequentially: sentinel → fallback
+  to `entry[0]`; match → use entry; otherwise advance. The loop is unbounded
+  in the emitted assembly, but the 8 overflow sentinel entries at positions
+  256–263 guarantee termination within 8 probes of any bucket.
+- **Overflow sentinels**: The table allocates 264 entries (not 256). Positions
+  256–263 are permanently initialized to sentinel (`0xFFFFFFFFFFFFFFFF`). This
+  means a probe starting at bucket 255 will hit a sentinel by position 263 at
+  the latest, eliminating the need for wrap-around or explicit probe counting
+  in the assembly.
+- **Tombstone semantics**: When a thread exits, its TLS entry key is set to
+  `0` (tombstone). The Rust-side `update_host_tls_entry()` treats tombstones
+  as reclaimable during insertion. The assembly handlers skip tombstones
+  during probing (they only stop on sentinel or match).
+- **Rust-side insertion** (`update_host_tls_entry()`): Uses the same hash
+  function `(guest_tpidr >> 4) & 0xFF`. Probes up to `TLS_MAX_PROBES` (8)
+  entries from the hash position. If the entry already exists, updates
+  `host_tls` in-place. Otherwise inserts at the first free (tombstone or
+  sentinel) slot. Also detects stale entries left by MSR handler in-place
+  key updates (where `host_tls` matches but key doesn't) and tombstones them.
+- **`entry[0]` fallback**: Both SVC and MSR handlers maintain `entry[0]`
+  as a single-thread fallback for the rtld_audit bootstrap path (before
+  threads are created and before `update_host_tls_entry()` runs).
+
+### Linear Scan (macOS ARM64)
+
+On macOS, the handlers still use O(n) linear scan of the TLS table (up to
+256 entries), keyed by TPIDRRO_EL0.
+
+### Scaling Beyond 256 Threads
+
+The current 8-bit hash (`& 0xFF`) limits the table to 256 usable entries,
+supporting up to 256 concurrent guest threads per process. If this becomes
+insufficient, several approaches are available (in order of complexity):
+
+**Option 1: Widen the hash mask (recommended first step).**
+Change the mask from `& 0xFF` to `& 0x3FF` (10-bit, 1024 buckets) or
+`& 0xFFF` (12-bit, 4096 buckets). The assembly stays 3 instructions — only
+the `AND` immediate and table allocation change. A 1024-entry table is ~16KB;
+a 4096-entry table is ~64KB. The compile-time assert
+`TLS_TABLE_SIZE <= PAGE_SIZE * 2` will catch oversized tables. Both the
+assembly mask (`encode_and_bitmask`) and the Rust mask in
+`update_host_tls_entry()` must be updated together.
+
+**Option 2: Two-level lookup.**
+Use the hash to index a first-level table of pointers to per-bucket
+sub-tables allocated on demand. Removes the hard cap entirely but adds one
+extra `LDR` to the hot path and requires a bump allocator for sub-table
+allocation in the trampoline's address space. Significantly more assembly
+complexity.
+
+**Option 3: Kernel-assisted TPIDR assignment.**
+If litebox intercepts `clone`/`clone3`, it could assign TPIDR_EL0 values
+with guaranteed-unique low bits, eliminating hash collisions entirely.
+Does not work for threads created by the guest's own libc without
+interception.
+
+**Option 4: CPU-indexed table.**
+Index by CPU ID instead of TPIDR. Table size is bounded by CPU count
+(typically 64-256), not thread count. Requires re-validating entries on
+thread migration (a thread moving between CPUs must update the table).
+Reading CPU ID from userspace on ARM64 is non-trivial (MPIDR_EL1 is
+privileged; `sched_getcpu()` is a vDSO call).
 
 ## Known Pitfalls and Weaknesses
 
@@ -118,18 +194,18 @@ On Linux/macOS, the TLS table entry key is the authoritative copy, and
 
 ### 3. TLS table entry[0] fallback is single-thread only
 
-All NULL-check fallback paths (CBZ → read `entry[0]`) assume single-threaded
-execution. This is correct during early ELF loading (rtld_audit runs before
-threads are created), but would break if `ld-linux` ever spawns threads
-during initialization.
+All fallback paths (sentinel hit on Linux, CBZ on Windows/macOS → read
+`entry[0]`) assume single-threaded execution. This is correct during early
+ELF loading (rtld_audit runs before threads are created), but would break
+if `ld-linux` ever spawns threads during initialization.
 
 ### 4. TLS table key/value write is not atomic
 
 `update_host_tls_entry()` uses CAS on the key slot, then a separate volatile
 write on the value slot. A concurrent reader could observe a valid key with
 a stale or zero value pointer. The TEB-based path (Windows) is immune because
-it doesn't scan the TLS table, but the scan-based paths (Linux, macOS) could
-theoretically hit this window.
+it doesn't scan the TLS table, but the table-based paths (Linux hash probe,
+macOS linear scan) could theoretically hit this window.
 
 ### 5. Hardware TPIDR_EL0 is never written on Windows
 

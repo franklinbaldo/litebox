@@ -526,11 +526,15 @@ impl ElfParsedFile {
         #[cfg(target_arch = "aarch64")]
         {
             // TLS lookup table layout: array of [guest_tpidr: u64, host_tls: u64] entries.
-            // Uses linear scan from index 0; trampoline assembly must use the same approach.
+            // Uses hash-based open-addressing; trampoline assembly must use the same approach.
             const TLS_ENTRY_SIZE: usize = 16; // [guest_tpidr: u64, host_tls: u64]
-            const TLS_TABLE_SIZE: usize = PAGE_SIZE;
-            // Supports up to 256 concurrent threads. Panics if exceeded.
-            const TLS_TABLE_ENTRIES: usize = TLS_TABLE_SIZE / TLS_ENTRY_SIZE;
+            const TLS_TABLE_USABLE_ENTRIES: usize = 256;
+            const TLS_TABLE_OVERFLOW_ENTRIES: usize = 8; // Extra sentinel entries for hash probe overflow
+            const TLS_TABLE_TOTAL_ENTRIES: usize =
+                TLS_TABLE_USABLE_ENTRIES + TLS_TABLE_OVERFLOW_ENTRIES;
+            const TLS_TABLE_SIZE: usize = TLS_TABLE_TOTAL_ENTRIES * TLS_ENTRY_SIZE; // 4224 bytes
+            // Safety net: ensure table never exceeds 2 pages (reasonable memory bound)
+            const _: () = assert!(TLS_TABLE_SIZE <= PAGE_SIZE * 2);
 
             let existing = crate::HOST_TLS_TABLE_ADDR.load(core::sync::atomic::Ordering::Acquire);
 
@@ -571,7 +575,7 @@ impl ElfParsedFile {
                     .map_err(ElfLoadError::Map)?;
 
                 let sentinel: u64 = 0xFFFFFFFFFFFFFFFF;
-                for i in 0..TLS_TABLE_ENTRIES {
+                for i in 0..TLS_TABLE_TOTAL_ENTRIES {
                     let entry_addr = addr + i * TLS_ENTRY_SIZE;
                     mem.write(entry_addr, &sentinel.to_ne_bytes())?;
                 }

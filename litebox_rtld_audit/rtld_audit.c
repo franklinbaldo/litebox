@@ -188,8 +188,12 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5,
     //   [SP+0]  = saved X16
     //   [SP+8]  = saved X17
     //   [SP+16] = return address (PC after syscall)
-    //   [SP+24] = host_tls (set after TLS lookup, initially guest TPIDR)
+    //   [SP+24] = guest TPIDR (Linux) or host_tls/TlsState* (Windows)
     //   [SP+32] = guest's original X30 (LR)
+    //
+    // On Linux, syscall_callback expects x18 = host_tls and reads guest
+    // TPIDR directly from TPIDR_EL0 (which the handler leaves unchanged).
+    // On Windows, syscall_callback reads host_tls from [SP+24].
     //
     // On Windows ARM64, X18 is the TEB pointer. We use it as a stable anchor
     // to find TlsState directly via the TEB TLS slot, avoiding the unreliable
@@ -223,31 +227,34 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5,
 
     "6:\n"                           // .Llinux_path
     // ---- Linux path: TPIDR_EL0 keyed TLS table scan ----
+    // syscall_callback on Linux expects x18 = host_tls and TPIDR_EL0 still
+    // holding the guest value.  [SP+24] is unused by the callback (it reads
+    // guest TPIDR directly from TPIDR_EL0), but we leave it as-is.
+    // NOTE: we borrow x30 as a scratch register for the lookup key, then
+    // reload it from [SP+16] before jumping to the callback (syscall_callback
+    // uses x30 as the guest PC / return address).
     "mrs  x30, tpidr_el0\n"         // x30 = guest TPIDR (lookup key)
-    "str  x30, [sp, #24]\n"         // save guest_tpidr on stack
+    "str  x30, [sp, #24]\n"         // save guest_tpidr on stack (diagnostic)
     "mov  x17, %[tls_table]\n"      // x17 = TLS table base
     "cbz  x17, 2f\n"                // skip lookup if NULL
     "1:\n"                           // .Lloop_linux
     "ldr  x16, [x17, #0]\n"         // x16 = entry.guest_tpidr
     "cmn  x16, #1\n"                // sentinel?
     "b.eq 5f\n"                      // -> fallback to entry[0]
-    "cmp  x16, x30\n"               // match? (x30 instead of x18)
+    "cmp  x16, x30\n"               // match? (x30 = guest TPIDR key)
     "b.eq 3f\n"                      // -> found
     "add  x17, x17, #16\n"          // next entry
     "b    1b\n"                      // -> loop
     "3:\n"                           // .Lfound_linux
-    "ldr  x16, [x17, #8]\n"         // x16 = host_tls (NOT x18!)
-    "str  x16, [sp, #24]\n"         // store host_tls at [SP+24] for callback
+    "ldr  x18, [x17, #8]\n"         // x18 = host_tls (matching entry)
     "b    2f\n"                      // -> done
     "5:\n"                           // .Lfallback_linux
-    // No match — TPIDR_EL0 was clobbered by host context switch.
+    // No match — guest changed TPIDR_EL0 since last update_host_tls_entry.
     // Fall back to entry[0] (correct for single-thread, best-effort for multi).
     "mov  x17, %[tls_table]\n"      // reload table base
-    "ldr  x16, [x17, #0]\n"         // entry[0].guest_tpidr
-    "str  x16, [sp, #24]\n"         // fix guest_tpidr on stack
-    "ldr  x16, [x17, #8]\n"         // x16 = entry[0].host_tls (NOT x18!)
-    "str  x16, [sp, #24]\n"         // store host_tls at [SP+24]
+    "ldr  x18, [x17, #8]\n"         // x18 = entry[0].host_tls
     "2:\n"                           // .Ldone_linux
+    "ldr  x30, [sp, #16]\n"         // restore x30 = return address
     "mov  x16, %[entry]\n"
     "br   x16\n"                     // jump to syscall_callback
 
@@ -490,10 +497,15 @@ int parse_object(const struct link_map *map) {
   // Read the TLS lookup table pointer at offset 8.
   // This is written by the litebox loader at trampoline_start + 8.
   tls_table_ptr = read_u64((const char *)trampoline_addr + 8);
-  // Read the TEB TLS slot offset at offset 16 (Windows ARM64 only).
-  // This is written by the litebox loader at trampoline_start + 16.
-  // On non-Windows hosts this will be 0 (sigreturn preamble), which is fine.
+  // On Windows ARM64, offset 16 stores the TEB TLS slot offset
+  // (TEB_TLS_SLOTS_OFFSET + TLS_INDEX*8). On Linux/macOS, offset 16
+  // contains the sigreturn preamble (two ARM64 instructions), NOT a
+  // TEB offset. Reading it as teb_tls_offset would be non-zero and
+  // cause do_syscall to take the Windows TEB path erroneously.
+  // Only read it on Windows builds.
+#if defined(TARGET_WINDOWS)
   teb_tls_offset = read_u64((const char *)trampoline_addr + 16);
+#endif
 #endif
   print_hex((uint64_t)syscall_entry);
   return 0;
