@@ -99,6 +99,56 @@ void _start() {
 
 #[expect(
     unused,
+    reason = "This code snippet is just used to illustrate the source code of the `hello_exec_nolibc` test."
+)]
+#[cfg(target_arch = "aarch64")]
+const HELLO_WORLD_NOLIBC: &str = r#"
+// gcc tests/test.c -o test -static -nostdlib
+#if defined(__aarch64__)
+int write(int fd, const char *buf, int length)
+{
+    register long x0 asm("x0") = fd;
+    register const char *x1 asm("x1") = buf;
+    register long x2 asm("x2") = length;
+    register long x8 asm("x8") = 64; // SYS_write
+
+    asm volatile("svc #0"
+        : "+r"(x0)
+        : "r"(x1), "r"(x2), "r"(x8)
+        : "memory");
+
+    return x0;
+}
+
+_Noreturn void exit_group(int code)
+{
+    register long x0 asm("x0") = code;
+    register long x8 asm("x8") = 94; // SYS_exit_group
+
+    for (;;) {
+        asm volatile("svc #0"
+            :
+            : "r"(x0), "r"(x8)
+            : "memory");
+    }
+}
+#else
+#error "Unsupported architecture"
+#endif
+
+int main() {
+    // use write to print a string
+    write(1, "Hello, World!\n", 14);
+    return 0;
+}
+
+void _start() {
+    exit_group(main());
+}
+"#;
+
+#[expect(
+    unused,
     reason = "This code snippet is just used to illustrate the source code of the `hello_thread_static/dynamic` test."
 )]
 const HELLO_WORLD: &str = r#"
@@ -427,4 +477,90 @@ fn test_testcase_thread_dynamic_with_rewriter() {
         &[],
         |_| {},
     );
+}
+
+/// Run a statically linked binary through the syscall rewriter and execute it
+/// with the runner binary. Static binaries do not require shared libraries,
+/// so no tar of initial files or LD_AUDIT/LD_LIBRARY_PATH environment is needed.
+#[cfg(target_arch = "aarch64")]
+fn run_static_linked_prog_with_rewriter(exec_name: &str) {
+    println!("Running statically linked binary + rewriter test for {exec_name}...");
+
+    let mut test_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    test_dir.push(TEST_BINS_DIR);
+
+    let prog_name_hooked = format!("{exec_name}.hooked");
+
+    let path = test_dir.join(exec_name);
+    let hooked_path = test_dir.join(&prog_name_hooked);
+
+    // Rewrite the target ELF executable file
+    let _ = std::fs::remove_file(hooked_path.clone());
+    println!(
+        "Running `cargo run -p litebox_syscall_rewriter -- {} -o {}`",
+        path.to_str().unwrap(),
+        hooked_path.to_str().unwrap()
+    );
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let output = std::process::Command::new(cargo)
+        .args([
+            "run",
+            "-p",
+            "litebox_syscall_rewriter",
+            "--",
+            path.to_str().unwrap(),
+            "-o",
+            hooked_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to run syscall rewriter");
+    assert!(
+        output.status.success(),
+        "failed to run syscall rewriter {:?}",
+        std::str::from_utf8(output.stderr.as_slice()).unwrap()
+    );
+
+    let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_on_windows_userland")
+        .unwrap_or_else(|_| {
+            env!("CARGO_BIN_EXE_litebox_runner_linux_on_windows_userland").to_string()
+        });
+
+    // Run litebox_runner_linux_on_windows_userland with the rewritten static binary.
+    // No --initial-files, --env LD_AUDIT, or --env LD_LIBRARY_PATH needed for static binaries.
+    let args = vec!["--unstable", hooked_path.to_str().unwrap()];
+
+    let mut command = std::process::Command::new(&binary_path);
+    command.args(&args);
+    println!("Running `{command:?}`");
+    let status = command
+        .status()
+        .expect("Failed to run litebox_runner_linux_on_windows_userland");
+    assert!(
+        status.success(),
+        "failed to run litebox_runner_linux_on_windows_userland: {status}",
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn test_static_linked_prog_with_rewriter() {
+    run_static_linked_prog_with_rewriter("hello_world_static");
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn test_static_linked_nolibc_with_rewriter() {
+    run_static_linked_prog_with_rewriter("hello_exec_nolibc");
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn test_static_linked_thread_with_rewriter() {
+    run_static_linked_prog_with_rewriter("hello_thread_static");
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn test_static_linked_multithread_with_rewriter() {
+    run_static_linked_prog_with_rewriter("thread_static");
 }

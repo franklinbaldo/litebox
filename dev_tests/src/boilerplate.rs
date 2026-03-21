@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use fs::File;
 use fs_err as fs;
 use std::collections::HashMap;
@@ -140,6 +140,10 @@ const SKIP_FILES: &[&str] = &[
     "litebox_runner_linux_on_windows_userland/tests/test-bins/hello_world_dyn",
     "litebox_runner_linux_on_windows_userland/tests/test-bins/hello_world_static",
     "litebox_runner_linux_on_windows_userland/tests/test-bins/thread_static",
+    "litebox_runner_linux_on_windows_userland/tests/test-bins-aarch64/hello_exec_nolibc",
+    "litebox_runner_linux_on_windows_userland/tests/test-bins-aarch64/hello_thread_static",
+    "litebox_runner_linux_on_windows_userland/tests/test-bins-aarch64/hello_world_static",
+    "litebox_runner_linux_on_windows_userland/tests/test-bins-aarch64/thread_static",
     "litebox_runner_linux_on_macos_userland/tests/test-bins/hello_thread",
     "litebox_runner_linux_on_macos_userland/tests/test-bins/hello_world_dyn",
     "litebox_runner_linux_on_macos_userland/tests/test-bins/ld-linux-aarch64.so.1",
