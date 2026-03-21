@@ -11,10 +11,12 @@ use windows_sys::Win32::Storage::FileSystem;
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
-use litebox::fs::FileSystem as _;
+use litebox::fs::{FileSystem as _, Mode};
 use litebox_platform_multiplex::Platform;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
+
+extern crate alloc;
 
 /// Convert Windows file permissions and owner ID to LiteBox internal
 fn get_file_mode_and_uid(metadata: &std::fs::Metadata) -> (litebox::fs::Mode, u32) {
@@ -80,7 +82,22 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub rewrite_syscalls: bool,
+    /// Load the program binary from the tar file instead of from the host filesystem.
+    ///
+    /// When set, the program path refers to a path inside the tar filesystem.
+    /// The binary must already be rewritten (incompatible with --rewrite-syscalls).
+    /// This is used by `litebox-packager` to create fully self-contained tar bundles.
+    #[arg(
+        long = "program-from-tar",
+        requires_all = ["unstable", "initial_files"],
+        conflicts_with = "rewrite_syscalls",
+        help_heading = "Unstable Options"
+    )]
+    pub program_from_tar: bool,
 }
+
+static REQUIRE_RTLD_AUDIT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 fn windows_path_to_unix(path: &std::path::Path) -> String {
     let components: Vec<_> = path
@@ -117,26 +134,44 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         )
     }
 
-    let (ancestor_modes_and_users, prog_data): (Vec<(litebox::fs::Mode, u32)>, Vec<u8>) = {
-        let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0]))?;
-        let ancestors: Vec<_> = prog.ancestors().collect();
-        let modes: Vec<_> = ancestors
-            .into_iter()
-            .rev()
-            .skip(1)
-            .map(|path| {
-                let metadata = path.metadata().unwrap();
-                get_file_mode_and_uid(&metadata)
-            })
-            .collect();
-        let data = std::fs::read(prog).unwrap();
-        let data = if cli_args.rewrite_syscalls {
-            litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None, None).unwrap()
+    // When loading from tar, the program path is a guest-internal path and must
+    // be absolute — LiteBox does not resolve programs via PATH.
+    if cli_args.program_from_tar && !cli_args.program_and_arguments[0].starts_with('/') {
+        anyhow::bail!(
+            "--program-from-tar requires an absolute path (e.g., /usr/bin/ls), \
+             got: {}",
+            cli_args.program_and_arguments[0]
+        );
+    }
+
+    // When --program-from-tar is set, the program binary is already in the tar file,
+    // so we skip reading it from the host filesystem and skip extracting ancestor modes.
+    let (ancestor_modes_and_users, prog_data): (Vec<(litebox::fs::Mode, u32)>, Option<Vec<u8>>) =
+        if cli_args.program_from_tar {
+            // Pre-rewritten binary in tar needs the audit library.
+            REQUIRE_RTLD_AUDIT.store(true, core::sync::atomic::Ordering::SeqCst);
+            (Vec::new(), None)
         } else {
-            data
+            let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0]))?;
+            let ancestors: Vec<_> = prog.ancestors().collect();
+            let modes: Vec<_> = ancestors
+                .into_iter()
+                .rev()
+                .skip(1)
+                .map(|path| {
+                    let metadata = path.metadata().unwrap();
+                    get_file_mode_and_uid(&metadata)
+                })
+                .collect();
+            let data = std::fs::read(prog).unwrap();
+            let data = if cli_args.rewrite_syscalls {
+                REQUIRE_RTLD_AUDIT.store(true, core::sync::atomic::Ordering::SeqCst);
+                litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None, None).unwrap()
+            } else {
+                data
+            };
+            (modes, Some(data))
         };
-        (modes, data)
-    };
     let tar_data = if let Some(tar_file) = cli_args.initial_files.as_ref() {
         if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
             anyhow::bail!("Expected a .tar file, found {}", tar_file.display());
@@ -151,73 +186,114 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     litebox_platform_multiplex::set_platform(platform);
     let mut shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     let litebox = shim_builder.litebox();
-    let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0]))?;
-    let prog_unix_path = windows_path_to_unix(&prog);
+
+    // For --program-from-tar the path is already a guest-internal absolute path.
+    // Otherwise, resolve the host path and convert Windows path to Unix style.
+    let prog_unix_path = if cli_args.program_from_tar {
+        cli_args.program_and_arguments[0].clone()
+    } else {
+        let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0]))?;
+        windows_path_to_unix(&prog)
+    };
+
     let initial_file_system = {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
-        let ancestors: Vec<_> = prog.ancestors().collect();
-        let mut prev_user = 0;
-        for (path, &mode_and_user) in ancestors
-            .into_iter()
-            .skip(1)
-            .rev()
-            .skip(1)
-            .zip(&ancestor_modes_and_users)
-        {
-            // convert windows's path to unix-style and strip its root
-            let unix_path = windows_path_to_unix(path);
+
+        // When loading the program from the tar, we don't need to create ancestor
+        // directories or write the program binary into the in-memory FS -- the program
+        // is already in the tar layer.
+        if let Some(prog_data) = prog_data {
+            let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0]))?;
+            let ancestors: Vec<_> = prog.ancestors().collect();
+            let mut prev_user = 0;
+            for (path, &mode_and_user) in ancestors
+                .into_iter()
+                .skip(1)
+                .rev()
+                .skip(1)
+                .zip(&ancestor_modes_and_users)
+            {
+                // convert windows's path to unix-style and strip its root
+                let unix_path = windows_path_to_unix(path);
+                if prev_user == 0 {
+                    // require root user
+                    in_mem.with_root_privileges(|fs| {
+                        fs.mkdir(unix_path.as_str(), mode_and_user.0).unwrap();
+                        if mode_and_user.1 != 0 {
+                            // This file is owned by a non-root user, so we need to set the ownership to our default user
+                            fs.chown(unix_path.as_str(), Some(1000), Some(1000))
+                                .unwrap();
+                        }
+                    });
+                } else {
+                    in_mem.mkdir(unix_path, mode_and_user.0).unwrap();
+                }
+                prev_user = mode_and_user.1;
+            }
+
+            let open_file =
+                |fs: &mut litebox::fs::in_mem::FileSystem<litebox_platform_multiplex::Platform>,
+                 path,
+                 mode| {
+                    let fd = fs
+                        .open(
+                            path,
+                            litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
+                            mode,
+                        )
+                        .unwrap();
+                    let mut data = prog_data.as_slice();
+                    while !data.is_empty() {
+                        let len = fs.write(&fd, data, None).unwrap();
+                        data = &data[len..];
+                    }
+                    fs.close(&fd).unwrap();
+                };
+            let last = ancestor_modes_and_users.last().unwrap();
             if prev_user == 0 {
-                // require root user
                 in_mem.with_root_privileges(|fs| {
-                    fs.mkdir(unix_path.as_str(), mode_and_user.0).unwrap();
-                    if mode_and_user.1 != 0 {
+                    open_file(fs, prog_unix_path.as_str(), last.0);
+                    if last.1 != 0 {
                         // This file is owned by a non-root user, so we need to set the ownership to our default user
-                        fs.chown(unix_path.as_str(), Some(1000), Some(1000))
+                        fs.chown(prog_unix_path.as_str(), Some(1000), Some(1000))
                             .unwrap();
                     }
                 });
             } else {
-                in_mem.mkdir(unix_path, mode_and_user.0).unwrap();
+                open_file(&mut in_mem, prog_unix_path.as_str(), last.0);
             }
-            prev_user = mode_and_user.1;
         }
 
-        let open_file =
-            |fs: &mut litebox::fs::in_mem::FileSystem<litebox_platform_multiplex::Platform>,
-             path,
-             mode| {
+        // Inject rtld_audit.so for pre-rewritten binaries (--program-from-tar or --rewrite-syscalls).
+        if REQUIRE_RTLD_AUDIT.load(core::sync::atomic::Ordering::SeqCst) {
+            #[cfg(target_arch = "aarch64")]
+            in_mem.with_root_privileges(|fs| {
+                let rwxr_xr_x = Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH;
+                let _ = fs.mkdir("/lib", rwxr_xr_x);
                 let fd = fs
                     .open(
-                        path,
+                        "/lib/litebox_rtld_audit.so",
                         litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
-                        mode,
+                        rwxr_xr_x,
                     )
-                    .unwrap();
-                let mut data = prog_data.as_slice();
-                while !data.is_empty() {
-                    let len = fs.write(&fd, data, None).unwrap();
-                    data = &data[len..];
+                    .expect("Failed to create /lib/litebox_rtld_audit.so");
+                let data: &[u8] =
+                    include_bytes!(concat!(env!("OUT_DIR"), "/litebox_rtld_audit.so"));
+                let mut remaining = data;
+                while !remaining.is_empty() {
+                    let len = fs.write(&fd, remaining, None).unwrap();
+                    remaining = &remaining[len..];
                 }
-                fs.close(&fd).unwrap();
-            };
-        let last = ancestor_modes_and_users.last().unwrap();
-        if prev_user == 0 {
-            in_mem.with_root_privileges(|fs| {
-                open_file(fs, prog_unix_path.as_str(), last.0);
-                if last.1 != 0 {
-                    // This file is owned by a non-root user, so we need to set the ownership to our default user
-                    fs.chown(prog_unix_path.as_str(), Some(1000), Some(1000))
-                        .unwrap();
-                }
+                fs.close(&fd)
+                    .expect("Failed to close /lib/litebox_rtld_audit.so");
             });
-        } else {
-            open_file(&mut in_mem, prog_unix_path.as_str(), last.0);
         }
 
         let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
         shim_builder.default_fs(in_mem, tar_ro)
     };
     shim_builder.set_fs(initial_file_system);
+    shim_builder.set_load_filter(fixup_env);
     let shim = shim_builder.build();
     let argv = cli_args
         .program_and_arguments
@@ -262,4 +338,14 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         );
     }
     std::process::exit(program.process.wait())
+}
+
+fn fixup_env(envp: &mut Vec<alloc::ffi::CString>) {
+    if REQUIRE_RTLD_AUDIT.load(core::sync::atomic::Ordering::SeqCst) {
+        let p = c"LD_AUDIT=/lib/litebox_rtld_audit.so";
+        let has_ld_audit = envp.iter().any(|var| var.as_c_str() == p);
+        if !has_ld_audit {
+            envp.push(p.into());
+        }
+    }
 }
