@@ -17,23 +17,26 @@ Usage:
     python3 run_redis.py [options]
 
 Examples:
-    # Run both native and LiteBox (default: 100k requests, 50 clients)
-    python3 run_redis.py --release
+    # Run all modes (native, litebox, gvisor)
+    python3 run_redis.py
 
     # Run only native
     python3 run_redis.py --mode native
 
     # Run only LiteBox
-    python3 run_redis.py --mode litebox --release
+    python3 run_redis.py --mode litebox
+
+    # Run only gVisor
+    python3 run_redis.py --mode gvisor
 
     # Override request count and client count
-    python3 run_redis.py --requests 200000 --clients 20 --release
+    python3 run_redis.py --requests 200000 --clients 20
 
     # More iterations for stable results
-    python3 run_redis.py --iterations 5 --release
+    python3 run_redis.py --iterations 5
 
     # Save results to JSON
-    python3 run_redis.py --release --output results.json
+    python3 run_redis.py --output results.json
 """
 
 import argparse
@@ -204,15 +207,12 @@ def wait_for_redis(host: str, port: int, timeout: float = 30.0) -> bool:
 
 
 def write_redis_config(config_path: Path, bind_addr: str, port: int) -> None:
-    """Write a minimal redis.conf for benchmarking (no persistence, no fork)."""
+    """Write a minimal redis.conf for benchmarking."""
     config_path.write_text(
         f"bind {bind_addr}\n"
         f"port {port}\n"
         "protected-mode no\n"
         "daemonize no\n"
-        # Disable all persistence to avoid fork
-        'save ""\n'
-        "appendonly no\n"
         "loglevel warning\n"
     )
 
@@ -307,6 +307,235 @@ def run_native(
         except subprocess.TimeoutExpired:
             server_proc.kill()
             server_proc.wait()
+
+
+# ── gVisor Runner ───────────────────────────────────────────────────────────
+
+
+_gvisor_container_seq = 0
+
+
+def _resolve_shared_libs(binary: Path) -> list[Path]:
+    """Resolve shared library dependencies of a binary via ldd."""
+    try:
+        result = subprocess.run(
+            ["ldd", str(binary)], capture_output=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return []
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return []
+    libs = []
+    for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+        m = re.search(r"=>\s+(/\S+)", line)
+        if m:
+            libs.append(Path(m.group(1)))
+        elif line.strip().startswith("/"):
+            m2 = re.match(r"\s*(/\S+)", line)
+            if m2:
+                libs.append(Path(m2.group(1)))
+    return libs
+
+
+def _prepare_gvisor_redis_rootfs(
+    redis_server_path: Path,
+    redis_config_path: Path,
+    work_dir: Path,
+) -> Path:
+    """
+    Prepare a minimal rootfs for running redis-server under gVisor.
+
+    Copies the redis-server binary, config, and shared library dependencies
+    into an OCI-compatible rootfs directory.
+    """
+    bundle_dir = work_dir / "gvisor_redis"
+    rootfs = bundle_dir / "rootfs"
+    if rootfs.exists():
+        shutil.rmtree(rootfs)
+    rootfs.mkdir(parents=True)
+    (rootfs / "tmp").mkdir()
+
+    # Copy redis-server binary
+    shutil.copy2(redis_server_path, rootfs / "redis-server")
+
+    # Copy redis config
+    etc = rootfs / "etc"
+    etc.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(redis_config_path, etc / "redis.conf")
+
+    # Copy shared library dependencies
+    libs = _resolve_shared_libs(redis_server_path)
+    for lib in libs:
+        dest = rootfs / lib.relative_to("/")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if not dest.exists():
+            shutil.copy2(lib, dest)
+
+    return bundle_dir
+
+
+def _write_gvisor_redis_config(
+    bundle_dir: Path,
+    port: int,
+) -> list[str]:
+    """
+    Write an OCI config.json for redis-server with host networking.
+    """
+    process_args = [
+        "/redis-server",
+        "/etc/redis.conf",
+    ]
+
+    config = {
+        "ociVersion": "1.0.0",
+        "process": {
+            "terminal": False,
+            "user": {"uid": 0, "gid": 0},
+            "args": process_args,
+            "env": ["PATH=/usr/bin:/bin", "HOME=/"],
+            "cwd": "/",
+        },
+        "root": {"path": "rootfs", "readonly": False},
+        "linux": {
+            "namespaces": [
+                {"type": "pid"},
+                {"type": "ipc"},
+                {"type": "uts"},
+                {"type": "mount"},
+                # No network namespace — uses host networking
+            ]
+        },
+        "mounts": [
+            {"destination": "/tmp", "type": "tmpfs", "source": "tmpfs"},
+            {"destination": "/proc", "type": "proc", "source": "proc"},
+        ],
+    }
+
+    config_path = bundle_dir / "config.json"
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+
+    return process_args
+
+
+def run_gvisor(
+    requests: int,
+    clients: int,
+    tests: list[str],
+    work_dir: Path,
+) -> Optional[BenchmarkResult]:
+    """Run redis-server under gVisor with host networking and benchmark from host."""
+    global _gvisor_container_seq
+    _gvisor_container_seq += 1
+    container_id = f"litebox_redis_gv_{_gvisor_container_seq}_{os.getpid()}"
+
+    redis_server = locate_command("redis-server")
+    redis_benchmark = locate_command("redis-benchmark")
+    if redis_server is None:
+        print("  [SKIP] redis-server not found on PATH")
+        return None
+    if redis_benchmark is None:
+        print("  [SKIP] redis-benchmark not found on PATH")
+        return None
+
+    # Write config for gVisor (bind to 127.0.0.1 since host networking)
+    config_path = work_dir / "redis_gvisor.conf"
+    write_redis_config(config_path, "127.0.0.1", REDIS_PORT)
+
+    bundle_dir = _prepare_gvisor_redis_rootfs(redis_server, config_path, work_dir)
+    process_args = _write_gvisor_redis_config(bundle_dir, REDIS_PORT)
+
+    cmd = [
+        "sudo", "runsc",
+        "--network=host",
+        "run", "--bundle", str(bundle_dir), container_id,
+    ]
+
+    print(f"  Starting gVisor redis-server: runsc run {' '.join(process_args)}")
+    server_proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    try:
+        print(f"  Waiting for redis-server at 127.0.0.1:{REDIS_PORT}...")
+        if not wait_for_redis("127.0.0.1", REDIS_PORT, timeout=60.0):
+            stderr = ""
+            try:
+                _, stderr_bytes = server_proc.communicate(timeout=2)
+                stderr = stderr_bytes.decode("utf-8", errors="replace")
+            except subprocess.TimeoutExpired:
+                pass
+            rc = server_proc.poll()
+            if rc is not None:
+                print(f"  [FAIL] gVisor server exited early (code {rc})")
+            else:
+                print("  [FAIL] gVisor redis-server did not start in time")
+            if stderr:
+                print(f"  stderr (last 500): ...{stderr[-500:]}")
+            return None
+
+        # Run benchmark from host
+        tests_arg = ",".join(tests)
+        bench_cmd = [
+            str(redis_benchmark),
+            "-h", "127.0.0.1",
+            "-p", str(REDIS_PORT),
+            "-n", str(requests),
+            "-c", str(clients),
+            "-t", tests_arg,
+            "--csv",
+        ]
+        print(f"  Running: {' '.join(bench_cmd)}")
+        t0 = time.monotonic()
+        try:
+            result = subprocess.run(bench_cmd, capture_output=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            print("  [TIMEOUT]")
+            return None
+        elapsed = time.monotonic() - t0
+
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="replace")
+            print(f"  [FAIL] redis-benchmark exit code {result.returncode}")
+            print(f"  stderr: {stderr[:500]}")
+            return None
+
+        stdout = result.stdout.decode("utf-8", errors="replace")
+        test_results = parse_redis_benchmark_output(stdout)
+        if not test_results:
+            print(f"  [FAIL] no results parsed from output:\n{stdout[:500]}")
+            return None
+
+        return BenchmarkResult(
+            tests=test_results,
+            elapsed=elapsed,
+            raw_output=stdout,
+        )
+    finally:
+        # Shutdown redis-server and stop gVisor container
+        redis_cli = locate_command("redis-cli")
+        if redis_cli:
+            try:
+                subprocess.run(
+                    [str(redis_cli), "-h", "127.0.0.1", "-p", str(REDIS_PORT),
+                     "SHUTDOWN", "NOSAVE"],
+                    capture_output=True,
+                    timeout=5,
+                )
+            except subprocess.TimeoutExpired:
+                pass
+        server_proc.terminate()
+        try:
+            server_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            server_proc.kill()
+            server_proc.wait()
+        subprocess.run(
+            ["sudo", "runsc", "delete", "-force", container_id],
+            capture_output=True, timeout=10,
+        )
 
 
 # ── LiteBox Runner ──────────────────────────────────────────────────────────
@@ -512,6 +741,7 @@ class ComparisonRow:
     name: str
     native_ops: list[float] = field(default_factory=list)
     litebox_ops: list[float] = field(default_factory=list)
+    gvisor_ops: list[float] = field(default_factory=list)
 
     @property
     def native_avg(self) -> Optional[float]:
@@ -526,6 +756,14 @@ class ComparisonRow:
         return (
             sum(self.litebox_ops) / len(self.litebox_ops)
             if self.litebox_ops
+            else None
+        )
+
+    @property
+    def gvisor_avg(self) -> Optional[float]:
+        return (
+            sum(self.gvisor_ops) / len(self.gvisor_ops)
+            if self.gvisor_ops
             else None
         )
 
@@ -547,38 +785,92 @@ class ComparisonRow:
             return lb / n
         return None
 
+    @property
+    def gvisor_overhead_pct(self) -> Optional[float]:
+        """gVisor overhead %. Positive means slower."""
+        n = self.native_avg
+        gv = self.gvisor_avg
+        if n and gv and n > 0:
+            return ((n - gv) / n) * 100.0
+        return None
 
-def print_comparison_table(rows: list[ComparisonRow]):
+    @property
+    def gvisor_ratio(self) -> Optional[float]:
+        """Throughput ratio (gVisor / Native)."""
+        n = self.native_avg
+        gv = self.gvisor_avg
+        if n and gv and n > 0:
+            return gv / n
+        return None
+
+
+def print_comparison_table(rows: list[ComparisonRow], modes_run: list[str]):
     """Print formatted comparison table (higher ops/sec is better)."""
+    has_native = "native" in modes_run
+    has_litebox = "litebox" in modes_run
+    has_gvisor = "gvisor" in modes_run
+
+    # Build header dynamically
+    header = f"{'Test':<15}"
+    sep_len = 15
+    if has_native:
+        header += f" {'Native (ops/s)':>16}"
+        sep_len += 17
+    if has_litebox:
+        header += f" {'LiteBox (ops/s)':>16}"
+        sep_len += 17
+    if has_gvisor:
+        header += f" {'gVisor (ops/s)':>16}"
+        sep_len += 17
+    if has_native and has_litebox:
+        header += f" {'LB Ratio':>10} {'LB Ovhd':>10}"
+        sep_len += 22
+    if has_native and has_gvisor:
+        header += f" {'gV Ratio':>10} {'gV Ovhd':>10}"
+        sep_len += 22
+
     print()
-    print("=" * 85)
-    print(
-        f"{'Test':<15} {'Native (ops/s)':>16} {'LiteBox (ops/s)':>16}"
-        f" {'Ratio':>8} {'Overhead':>10}"
-    )
-    print("-" * 85)
+    print("=" * sep_len)
+    print(header)
+    print("-" * sep_len)
 
     for row in rows:
-        native_str = f"{row.native_avg:,.0f}" if row.native_avg is not None else "N/A"
-        litebox_str = (
-            f"{row.litebox_avg:,.0f}" if row.litebox_avg is not None else "N/A"
-        )
-        ratio_str = f"{row.ratio:.4f}" if row.ratio is not None else "N/A"
-        overhead_str = (
-            f"{row.overhead_pct:+.2f}%" if row.overhead_pct is not None else "N/A"
-        )
-        print(
-            f"{row.name:<15} {native_str:>16} {litebox_str:>16}"
-            f" {ratio_str:>8} {overhead_str:>10}"
-        )
+        line = f"{row.name:<15}"
+        if has_native:
+            s = f"{row.native_avg:,.0f}" if row.native_avg is not None else "N/A"
+            line += f" {s:>16}"
+        if has_litebox:
+            s = f"{row.litebox_avg:,.0f}" if row.litebox_avg is not None else "N/A"
+            line += f" {s:>16}"
+        if has_gvisor:
+            s = f"{row.gvisor_avg:,.0f}" if row.gvisor_avg is not None else "N/A"
+            line += f" {s:>16}"
+        if has_native and has_litebox:
+            r = f"{row.ratio:.4f}" if row.ratio is not None else "N/A"
+            o = f"{row.overhead_pct:+.2f}%" if row.overhead_pct is not None else "N/A"
+            line += f" {r:>10} {o:>10}"
+        if has_native and has_gvisor:
+            r = f"{row.gvisor_ratio:.4f}" if row.gvisor_ratio is not None else "N/A"
+            o = f"{row.gvisor_overhead_pct:+.2f}%" if row.gvisor_overhead_pct is not None else "N/A"
+            line += f" {r:>10} {o:>10}"
+        print(line)
 
-    print("=" * 85)
+    print("=" * sep_len)
 
-    ratios = [r.ratio for r in rows if r.ratio is not None]
-    if ratios:
-        geo_mean = math.prod(ratios) ** (1.0 / len(ratios))
-        print(f"\nGeometric mean throughput ratio (LiteBox/Native): {geo_mean:.4f}")
-        print(f"Overhead: {(1.0 - geo_mean) * 100:+.2f}%")
+    # Geo-mean for LiteBox
+    if has_native and has_litebox:
+        ratios = [r.ratio for r in rows if r.ratio is not None]
+        if ratios:
+            geo_mean = math.prod(ratios) ** (1.0 / len(ratios))
+            print(f"\nGeometric mean throughput ratio (LiteBox/Native): {geo_mean:.4f}")
+            print(f"LiteBox overhead: {(1.0 - geo_mean) * 100:+.2f}%")
+    # Geo-mean for gVisor
+    if has_native and has_gvisor:
+        ratios = [r.gvisor_ratio for r in rows if r.gvisor_ratio is not None]
+        if ratios:
+            geo_mean = math.prod(ratios) ** (1.0 / len(ratios))
+            print(f"\nGeometric mean throughput ratio (gVisor/Native):  {geo_mean:.4f}")
+            print(f"gVisor overhead:  {(1.0 - geo_mean) * 100:+.2f}%")
     print()
 
 
@@ -647,9 +939,9 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["both", "native", "litebox"],
-        default="both",
-        help="Run mode (default: both)",
+        choices=["all", "both", "native", "litebox", "gvisor"],
+        default="all",
+        help="Run mode (default: all)",
     )
     parser.add_argument(
         "--requests",
@@ -678,7 +970,8 @@ def main():
     parser.add_argument(
         "--release",
         action="store_true",
-        help="Use release build of litebox binaries",
+        default=True,
+        help="Use release build of litebox binaries (default: True)",
     )
     parser.add_argument(
         "--runner-path",
@@ -739,8 +1032,10 @@ def main():
 
     workspace_root = find_workspace_root()
 
-    # Resolve litebox binaries
-    run_litebox_mode = args.mode in ("both", "litebox")
+    # Resolve mode flags
+    run_native_mode = args.mode in ("all", "both", "native")
+    run_litebox_mode = args.mode in ("all", "both", "litebox")
+    run_gvisor_mode = args.mode in ("all", "gvisor")
     runner_path = None
     packager_path = None
 
@@ -773,6 +1068,12 @@ def main():
                 workspace_root, args.release,
             )
 
+    if run_gvisor_mode:
+        if shutil.which("runsc") is None:
+            print("Error: runsc (gVisor) not found on PATH.")
+            print("Install gVisor: https://gvisor.dev/docs/user_guide/install/")
+            sys.exit(1)
+
     # Working directory
     if args.work_dir:
         work_dir = Path(args.work_dir)
@@ -795,6 +1096,8 @@ def main():
         print(f"TUN device:     {TUN_DEVICE}")
         print(f"Runner:         {runner_path}")
         print(f"Packager:       {packager_path or 'cargo run'}")
+    if run_gvisor_mode:
+        print(f"gVisor:         runsc")
     print()
 
     # Per-test comparison rows
@@ -802,9 +1105,12 @@ def main():
         t: ComparisonRow(name=t) for t in args.tests
     }
 
+    modes_run = []
+
     # ── Native runs ─────────────────────────────────────────────────────
 
-    if args.mode in ("both", "native"):
+    if run_native_mode:
+        modes_run.append("native")
         print(f"[Native] Redis benchmark (x{args.iterations} iterations)")
         for i in range(args.iterations):
             print(f"  Iteration {i + 1}/{args.iterations}")
@@ -820,6 +1126,7 @@ def main():
     # ── LiteBox runs ────────────────────────────────────────────────────
 
     if run_litebox_mode:
+        modes_run.append("litebox")
         print(f"[LiteBox] Redis benchmark (x{args.iterations} iterations)")
         for i in range(args.iterations):
             print(f"  Iteration {i + 1}/{args.iterations}")
@@ -833,10 +1140,26 @@ def main():
                         all_rows[t.name].litebox_ops.append(t.ops_per_sec)
                         print(f"    {t.name}: {t.ops_per_sec:,.0f} ops/sec")
 
+    # ── gVisor runs ─────────────────────────────────────────────────────
+
+    if run_gvisor_mode:
+        modes_run.append("gvisor")
+        print(f"[gVisor] Redis benchmark (x{args.iterations} iterations)")
+        for i in range(args.iterations):
+            print(f"  Iteration {i + 1}/{args.iterations}")
+            result = run_gvisor(
+                args.requests, args.clients, args.tests, work_dir,
+            )
+            if result:
+                for t in result.tests:
+                    if t.name in all_rows:
+                        all_rows[t.name].gvisor_ops.append(t.ops_per_sec)
+                        print(f"    {t.name}: {t.ops_per_sec:,.0f} ops/sec")
+
     # ── Results ─────────────────────────────────────────────────────────
 
     rows = [all_rows[t] for t in args.tests if t in all_rows]
-    print_comparison_table(rows)
+    print_comparison_table(rows, modes_run)
 
     # ── Save to JSON ────────────────────────────────────────────────────
 
@@ -852,14 +1175,19 @@ def main():
             "results": {},
         }
         for name, row in all_rows.items():
-            output_data["results"][name] = {
+            entry = {
                 "native_ops": row.native_ops,
                 "litebox_ops": row.litebox_ops,
+                "gvisor_ops": row.gvisor_ops,
                 "native_avg": row.native_avg,
                 "litebox_avg": row.litebox_avg,
+                "gvisor_avg": row.gvisor_avg,
                 "ratio": row.ratio,
                 "overhead_pct": row.overhead_pct,
+                "gvisor_ratio": row.gvisor_ratio,
+                "gvisor_overhead_pct": row.gvisor_overhead_pct,
             }
+            output_data["results"][name] = entry
         with open(args.output, "w") as f:
             json.dump(output_data, f, indent=2)
         print(f"Results saved to {args.output}")

@@ -66,7 +66,7 @@ TUN_DEVICE = "tun99"
 # Default memtier_benchmark parameters:
 #   total requests = requests_per_client * clients * threads
 # With defaults: 2000 * 4 * 2 = 16,000
-DEFAULT_REQUESTS_PER_CLIENT = 2000
+DEFAULT_REQUESTS_PER_CLIENT = 10000
 DEFAULT_CLIENTS = 4
 DEFAULT_THREADS = 2
 DEFAULT_RATIO = "1:10"  # SET:GET ratio
@@ -482,7 +482,7 @@ def run_litebox(
     packager_path: Optional[Path],
     memtier_path: Path,
 ) -> Optional[BenchmarkResult]:
-    """Run memcached under LiteBox and benchmark from host."""
+    """Run memcached natively and under LiteBox and benchmark from host."""
     memcached = locate_command("memcached")
     if memcached is None:
         print("  [SKIP] memcached not found on PATH")
@@ -599,6 +599,235 @@ def run_litebox(
             server_proc.wait()
 
 
+# ── gVisor Runner ───────────────────────────────────────────────────────────
+
+
+def _resolve_shared_libs(binary: Path) -> list[Path]:
+    """Resolve shared library dependencies of a binary via ldd."""
+    try:
+        result = subprocess.run(
+            ["ldd", str(binary)], capture_output=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return []
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return []
+    libs = []
+    for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+        m = re.search(r"=>\s+(/\S+)", line)
+        if m:
+            libs.append(Path(m.group(1)))
+        elif line.strip().startswith("/"):
+            m2 = re.match(r"\s*(/\S+)", line)
+            if m2:
+                libs.append(Path(m2.group(1)))
+    return libs
+
+
+_gvisor_container_seq = 0
+
+
+def _prepare_gvisor_memcached_rootfs(
+    memcached_path: Path,
+    work_dir: Path,
+) -> Path:
+    """
+    Prepare a minimal rootfs for running memcached under gVisor.
+
+    Copies the memcached binary and its shared library dependencies into
+    an OCI-compatible rootfs directory.
+    """
+    bundle_dir = work_dir / "gvisor_memcached"
+    rootfs = bundle_dir / "rootfs"
+    if rootfs.exists():
+        shutil.rmtree(rootfs)
+    rootfs.mkdir(parents=True)
+    (rootfs / "tmp").mkdir()
+
+    # Copy memcached binary
+    shutil.copy2(memcached_path, rootfs / "memcached")
+
+    # Copy shared library dependencies
+    libs = _resolve_shared_libs(memcached_path)
+    for lib in libs:
+        dest = rootfs / lib.relative_to("/")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if not dest.exists():
+            shutil.copy2(lib, dest)
+
+    return bundle_dir
+
+
+def _write_gvisor_memcached_config(
+    bundle_dir: Path,
+    port: int,
+) -> list[str]:
+    """
+    Write an OCI config.json for memcached with host networking.
+    """
+    process_args = [
+        "/memcached",
+        "-l", "127.0.0.1",
+        "-p", str(port),
+        "-t", "1",
+        "-m", "256",
+        "-c", "1024",
+        "-u", "root",
+    ]
+
+    # /etc/passwd doesn't exist inside the minimal rootfs, so provide it
+    # so memcached's -u flag can look up the user.
+    etc = bundle_dir / "rootfs" / "etc"
+    etc.mkdir(parents=True, exist_ok=True)
+    (etc / "passwd").write_text("root:x:0:0:root:/root:/bin/sh\n")
+
+    config = {
+        "ociVersion": "1.0.0",
+        "process": {
+            "terminal": False,
+            "user": {"uid": 0, "gid": 0},
+            "args": process_args,
+            "env": ["PATH=/usr/bin:/bin", "HOME=/"],
+            "cwd": "/",
+        },
+        "root": {"path": "rootfs", "readonly": False},
+        "linux": {
+            "namespaces": [
+                {"type": "pid"},
+                {"type": "ipc"},
+                {"type": "uts"},
+                {"type": "mount"},
+                # No network namespace — uses host networking
+            ]
+        },
+        "mounts": [
+            {"destination": "/tmp", "type": "tmpfs", "source": "tmpfs"},
+            {"destination": "/proc", "type": "proc", "source": "proc"},
+        ],
+    }
+
+    config_path = bundle_dir / "config.json"
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+
+    return process_args
+
+
+def run_gvisor(
+    requests_per_client: int,
+    clients: int,
+    threads: int,
+    ratio: str,
+    data_size: int,
+    key_max: int,
+    work_dir: Path,
+    memtier_path: Path,
+    port: int,
+) -> Optional[BenchmarkResult]:
+    """Run memcached under gVisor with host networking and benchmark from host."""
+    global _gvisor_container_seq
+    _gvisor_container_seq += 1
+    container_id = f"litebox_memcached_gv_{_gvisor_container_seq}_{os.getpid()}"
+
+    memcached = locate_command("memcached")
+    if memcached is None:
+        print("  [SKIP] memcached not found on PATH")
+        return None
+
+    bundle_dir = _prepare_gvisor_memcached_rootfs(memcached, work_dir)
+    process_args = _write_gvisor_memcached_config(bundle_dir, port)
+
+    cmd = [
+        "sudo", "runsc",
+        "--network=host",
+        "run", "--bundle", str(bundle_dir), container_id,
+    ]
+
+    print(f"  Starting gVisor memcached: runsc run {' '.join(process_args)}")
+    server_proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    try:
+        print(f"  Waiting for memcached at 127.0.0.1:{port}...")
+        if not wait_for_memcached("127.0.0.1", port, timeout=60.0, proc=server_proc):
+            stderr = ""
+            try:
+                _, stderr_bytes = server_proc.communicate(timeout=2)
+                stderr = stderr_bytes.decode("utf-8", errors="replace")
+            except subprocess.TimeoutExpired:
+                pass
+            rc = server_proc.poll()
+            if rc is not None:
+                print(f"  [FAIL] gVisor server exited early (code {rc})")
+            else:
+                print("  [FAIL] gVisor memcached did not start in time")
+            if stderr:
+                print(f"  stderr (last 500): ...{stderr[-500:]}")
+            return None
+
+        # Run memtier_benchmark from host
+        json_out = work_dir / "memtier_gvisor.json"
+        bench_cmd = [
+            str(memtier_path),
+            "-s", "127.0.0.1",
+            "-p", str(port),
+            "--protocol=memcache_text",
+            "-n", str(requests_per_client),
+            "-c", str(clients),
+            "-t", str(threads),
+            f"--ratio={ratio}",
+            f"--data-size={data_size}",
+            "--key-minimum=1",
+            f"--key-maximum={key_max}",
+            f"--json-out-file={json_out}",
+        ]
+        print(f"  Running: {' '.join(bench_cmd)}")
+        t0 = time.monotonic()
+        try:
+            result = subprocess.run(bench_cmd, capture_output=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            print("  [TIMEOUT]")
+            return None
+        elapsed = time.monotonic() - t0
+
+        stdout = result.stdout.decode("utf-8", errors="replace")
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        if result.returncode != 0:
+            print(f"  [FAIL] memtier_benchmark exit code {result.returncode}")
+            print(f"  stderr: {stderr[:500]}")
+            return None
+
+        if json_out.exists():
+            op_results = parse_memtier_json(json_out)
+        else:
+            op_results = parse_memtier_text(stdout)
+
+        if not op_results:
+            print(f"  [FAIL] no results parsed from output:\n{stdout[:500]}")
+            return None
+
+        return BenchmarkResult(
+            ops=op_results,
+            elapsed=elapsed,
+            raw_output=stdout,
+        )
+    finally:
+        # Stop the gVisor container
+        server_proc.terminate()
+        try:
+            server_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            server_proc.kill()
+            server_proc.wait()
+        subprocess.run(
+            ["sudo", "runsc", "delete", "-force", container_id],
+            capture_output=True, timeout=10,
+        )
+
+
 # ── Comparison & Reporting ──────────────────────────────────────────────────
 
 
@@ -607,8 +836,10 @@ class ComparisonRow:
     name: str
     native_ops: list[float] = field(default_factory=list)
     litebox_ops: list[float] = field(default_factory=list)
+    gvisor_ops: list[float] = field(default_factory=list)
     native_lat: list[float] = field(default_factory=list)
     litebox_lat: list[float] = field(default_factory=list)
+    gvisor_lat: list[float] = field(default_factory=list)
 
     @property
     def native_avg_ops(self) -> Optional[float]:
@@ -619,12 +850,20 @@ class ComparisonRow:
         return sum(self.litebox_ops) / len(self.litebox_ops) if self.litebox_ops else None
 
     @property
+    def gvisor_avg_ops(self) -> Optional[float]:
+        return sum(self.gvisor_ops) / len(self.gvisor_ops) if self.gvisor_ops else None
+
+    @property
     def native_avg_lat(self) -> Optional[float]:
         return sum(self.native_lat) / len(self.native_lat) if self.native_lat else None
 
     @property
     def litebox_avg_lat(self) -> Optional[float]:
         return sum(self.litebox_lat) / len(self.litebox_lat) if self.litebox_lat else None
+
+    @property
+    def gvisor_avg_lat(self) -> Optional[float]:
+        return sum(self.gvisor_lat) / len(self.gvisor_lat) if self.gvisor_lat else None
 
     @property
     def overhead_pct(self) -> Optional[float]:
@@ -644,44 +883,94 @@ class ComparisonRow:
             return lb / n
         return None
 
+    @property
+    def gvisor_overhead_pct(self) -> Optional[float]:
+        """Overhead %. Positive means gVisor is slower (lower ops/sec)."""
+        n = self.native_avg_ops
+        g = self.gvisor_avg_ops
+        if n and g and n > 0:
+            return ((n - g) / n) * 100.0
+        return None
+
+    @property
+    def gvisor_ratio(self) -> Optional[float]:
+        """Throughput ratio (gVisor / Native). Values near 1.0 = no overhead."""
+        n = self.native_avg_ops
+        g = self.gvisor_avg_ops
+        if n and g and n > 0:
+            return g / n
+        return None
+
 
 def print_comparison_table(rows: list[ComparisonRow]):
     """Print formatted comparison table (higher ops/sec is better)."""
+    has_litebox = any(r.litebox_avg_ops is not None for r in rows)
+    has_gvisor = any(r.gvisor_avg_ops is not None for r in rows)
+
+    # Build dynamic header
+    header = f"{'Operation':<10} {'Native (ops/s)':>16}"
+    if has_litebox:
+        header += f" {'LiteBox (ops/s)':>16} {'LB Ratio':>10}"
+    if has_gvisor:
+        header += f" {'gVisor (ops/s)':>16} {'gV Ratio':>10}"
+    header += f" {'Native lat(ms)':>15}"
+    if has_litebox:
+        header += f" {'LB lat(ms)':>12}"
+    if has_gvisor:
+        header += f" {'gV lat(ms)':>12}"
+    width = len(header)
+
     print()
-    print("=" * 105)
-    print(
-        f"{'Operation':<10} {'Native (ops/s)':>16} {'LiteBox (ops/s)':>16}"
-        f" {'Ratio':>8} {'Overhead':>10}"
-        f" {'Native lat(ms)':>15} {'LiteBox lat(ms)':>16}"
-    )
-    print("-" * 105)
+    print("=" * width)
+    print(header)
+    print("-" * width)
 
     for row in rows:
         native_str = f"{row.native_avg_ops:,.0f}" if row.native_avg_ops is not None else "N/A"
-        litebox_str = f"{row.litebox_avg_ops:,.0f}" if row.litebox_avg_ops is not None else "N/A"
-        ratio_str = f"{row.ratio:.4f}" if row.ratio is not None else "N/A"
-        overhead_str = f"{row.overhead_pct:+.2f}%" if row.overhead_pct is not None else "N/A"
+        line = f"{row.name:<10} {native_str:>16}"
+
+        if has_litebox:
+            litebox_str = f"{row.litebox_avg_ops:,.0f}" if row.litebox_avg_ops is not None else "N/A"
+            ratio_str = f"{row.ratio:.4f}" if row.ratio is not None else "N/A"
+            line += f" {litebox_str:>16} {ratio_str:>10}"
+        if has_gvisor:
+            gvisor_str = f"{row.gvisor_avg_ops:,.0f}" if row.gvisor_avg_ops is not None else "N/A"
+            g_ratio_str = f"{row.gvisor_ratio:.4f}" if row.gvisor_ratio is not None else "N/A"
+            line += f" {gvisor_str:>16} {g_ratio_str:>10}"
+
         native_lat_str = f"{row.native_avg_lat:.3f}" if row.native_avg_lat is not None else "N/A"
-        litebox_lat_str = f"{row.litebox_avg_lat:.3f}" if row.litebox_avg_lat is not None else "N/A"
-        print(
-            f"{row.name:<10} {native_str:>16} {litebox_str:>16}"
-            f" {ratio_str:>8} {overhead_str:>10}"
-            f" {native_lat_str:>15} {litebox_lat_str:>16}"
-        )
+        line += f" {native_lat_str:>15}"
+        if has_litebox:
+            lb_lat_str = f"{row.litebox_avg_lat:.3f}" if row.litebox_avg_lat is not None else "N/A"
+            line += f" {lb_lat_str:>12}"
+        if has_gvisor:
+            gv_lat_str = f"{row.gvisor_avg_lat:.3f}" if row.gvisor_avg_lat is not None else "N/A"
+            line += f" {gv_lat_str:>12}"
 
-    print("=" * 105)
+        print(line)
 
-    # Compute geometric mean from Totals row only
+    print("=" * width)
+
+    # Compute summaries from Totals row
     totals = [r for r in rows if r.name == "Totals"]
-    if totals and totals[0].ratio is not None:
+    if has_litebox and totals and totals[0].ratio is not None:
         print(f"\nTotal throughput ratio (LiteBox/Native): {totals[0].ratio:.4f}")
-        print(f"Overhead: {totals[0].overhead_pct:+.2f}%")
-    else:
+        print(f"LiteBox overhead: {totals[0].overhead_pct:+.2f}%")
+    elif has_litebox:
         ratios = [r.ratio for r in rows if r.ratio is not None]
         if ratios:
             geo_mean = math.prod(ratios) ** (1.0 / len(ratios))
             print(f"\nGeometric mean throughput ratio (LiteBox/Native): {geo_mean:.4f}")
-            print(f"Overhead: {(1.0 - geo_mean) * 100:+.2f}%")
+            print(f"LiteBox overhead: {(1.0 - geo_mean) * 100:+.2f}%")
+    if has_gvisor and totals and totals[0].gvisor_ratio is not None:
+        print(f"\nTotal throughput ratio (gVisor/Native): {totals[0].gvisor_ratio:.4f}")
+        print(f"gVisor overhead: {totals[0].gvisor_overhead_pct:+.2f}%")
+    elif has_gvisor:
+        ratios = [r.gvisor_ratio for r in rows if r.gvisor_ratio is not None]
+        if ratios:
+            geo_mean = math.prod(ratios) ** (1.0 / len(ratios))
+            print(f"\nGeometric mean throughput ratio (gVisor/Native): {geo_mean:.4f}")
+            print(f"gVisor overhead: {(1.0 - geo_mean) * 100:+.2f}%")
     print()
 
 
@@ -750,9 +1039,9 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["both", "native", "litebox"],
-        default="both",
-        help="Run mode (default: both)",
+        choices=["both", "native", "litebox", "gvisor", "all"],
+        default="all",
+        help="Run mode (default: all). 'all' runs native + litebox + gvisor.",
     )
     parser.add_argument(
         "--requests",
@@ -800,7 +1089,8 @@ def main():
     parser.add_argument(
         "--release",
         action="store_true",
-        help="Use release build of litebox binaries",
+        default=True,
+        help="Use release build of litebox binaries (default: True)",
     )
     parser.add_argument(
         "--runner-path",
@@ -882,7 +1172,8 @@ def main():
     workspace_root = find_workspace_root()
 
     # Resolve litebox binaries
-    run_litebox_mode = args.mode in ("both", "litebox")
+    run_litebox_mode = args.mode in ("both", "litebox", "all")
+    run_gvisor_mode = args.mode in ("gvisor", "all")
     runner_path = None
     packager_path = None
 
@@ -941,6 +1232,8 @@ def main():
         print(f"TUN device:     {TUN_DEVICE}")
         print(f"Runner:         {runner_path}")
         print(f"Packager:       {packager_path or 'cargo run'}")
+    if run_gvisor_mode:
+        print(f"gVisor:         runsc --network=host (via sudo)")
     print()
 
     # Per-operation comparison rows
@@ -950,7 +1243,7 @@ def main():
 
     # ── Native runs ─────────────────────────────────────────────────────
 
-    if args.mode in ("both", "native"):
+    if args.mode in ("both", "native", "all"):
         print(f"[Native] Memcached benchmark (x{args.iterations} iterations)")
         for i in range(args.iterations):
             print(f"  Iteration {i + 1}/{args.iterations}")
@@ -990,6 +1283,27 @@ def main():
                             f"(avg lat {op.avg_latency_ms:.3f} ms)"
                         )
 
+    # ── gVisor runs ─────────────────────────────────────────────────────
+
+    if run_gvisor_mode:
+        print(f"[gVisor] Memcached benchmark (x{args.iterations} iterations)")
+        for i in range(args.iterations):
+            print(f"  Iteration {i + 1}/{args.iterations}")
+            result = run_gvisor(
+                args.requests, args.clients, args.threads,
+                args.ratio, args.data_size, args.key_maximum,
+                work_dir, memtier_path, MEMCACHED_PORT,
+            )
+            if result:
+                for op in result.ops:
+                    if op.name in all_rows:
+                        all_rows[op.name].gvisor_ops.append(op.ops_per_sec)
+                        all_rows[op.name].gvisor_lat.append(op.avg_latency_ms)
+                        print(
+                            f"    {op.name}: {op.ops_per_sec:,.0f} ops/sec "
+                            f"(avg lat {op.avg_latency_ms:.3f} ms)"
+                        )
+
     # ── Results ─────────────────────────────────────────────────────────
 
     rows = [all_rows[t] for t in OP_TYPES if t in all_rows]
@@ -1011,7 +1325,7 @@ def main():
             "results": {},
         }
         for name, row in all_rows.items():
-            output_data["results"][name] = {
+            entry: dict = {
                 "native_ops": row.native_ops,
                 "litebox_ops": row.litebox_ops,
                 "native_avg_ops": row.native_avg_ops,
@@ -1021,6 +1335,13 @@ def main():
                 "ratio": row.ratio,
                 "overhead_pct": row.overhead_pct,
             }
+            if row.gvisor_ops:
+                entry["gvisor_ops"] = row.gvisor_ops
+                entry["gvisor_avg_ops"] = row.gvisor_avg_ops
+                entry["gvisor_lat"] = row.gvisor_lat
+                entry["gvisor_ratio"] = row.gvisor_ratio
+                entry["gvisor_overhead_pct"] = row.gvisor_overhead_pct
+            output_data["results"][name] = entry
         with open(args.output, "w") as f:
             json.dump(output_data, f, indent=2)
         print(f"Results saved to {args.output}")

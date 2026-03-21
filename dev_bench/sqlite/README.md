@@ -1,6 +1,6 @@
 # SQLite Benchmark (speedtest1)
 
-Run SQLite's official [speedtest1](https://www.sqlite.org/src/file/test/speedtest1.c) benchmark natively and under LiteBox, then compare results.
+Run SQLite's official [speedtest1](https://www.sqlite.org/src/file/test/speedtest1.c) benchmark natively, under LiteBox, and/or under gVisor, then compare results.
 
 **Why:** Single-process, no networking needed, filesystem ops go to ramfs. Extremely common benchmark in OS/sandbox papers. Exercises mmap, file I/O, and compute together.
 
@@ -10,6 +10,7 @@ Run SQLite's official [speedtest1](https://www.sqlite.org/src/file/test/speedtes
 
 - `gcc`, `make` on the host (to build SQLite + speedtest1).
 - Pre-built LiteBox binaries (auto-built by the script unless `--no-build` is passed).
+- [gVisor](https://gvisor.dev/) (`runsc`) installed and available via `sudo` (for `--mode gvisor` or `--mode all`).
 
 Build LiteBox (from workspace root):
 ```bash
@@ -41,6 +42,12 @@ python3 dev_bench/sqlite/run_sqlite.py --no-memory --release
 
 # Save results to JSON
 python3 dev_bench/sqlite/run_sqlite.py --release --output results.json
+
+# Run with gVisor (requires runsc installed)
+python3 dev_bench/sqlite/run_sqlite.py --mode gvisor
+
+# Run all three: native + LiteBox + gVisor
+python3 dev_bench/sqlite/run_sqlite.py --mode all --release
 ```
 
 ## What It Runs
@@ -74,7 +81,7 @@ Overhead: -2.62%
 
 | Flag | Default | Description |
 |---|---|---|
-| `--mode {both,native,litebox}` | `both` | Which runs to perform |
+| `--mode {both,native,litebox,gvisor,all}` | `both` | Which runs to perform (`all` = native + litebox + gvisor) |
 | `--size N` | `100` | Size multiplier for speedtest1 workload |
 | `--no-memory` | (off) | Use file-backed DB instead of `:memory:` |
 | `--iterations N` | `3` | Number of iterations per mode |

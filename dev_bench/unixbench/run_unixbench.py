@@ -922,8 +922,8 @@ def main():
              "(default: use official per-benchmark iteration counts)",
     )
     parser.add_argument(
-        "--release", action="store_true",
-        help="Use release build of litebox binaries",
+        "--release", action="store_true", default=True,
+        help="Use release build of litebox binaries (default: True)",
     )
     parser.add_argument(
         "--runner-path", type=str, default=None,
