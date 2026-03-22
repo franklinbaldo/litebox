@@ -56,6 +56,17 @@ impl<FS: ShimFS> Task<FS> {
                 // of draining host signals. Loop to handle multiple
                 // consecutive signal events.
                 while self.global.rr_state.peek_is_signal() {
+                    // Verify the signal event's tid matches this thread.
+                    if let Some(event_tid) = self.global.rr_state.peek_event_tid() {
+                        assert_eq!(
+                            event_tid,
+                            self.rr_tid(),
+                            "signal event tid mismatch: trace has tid={event_tid}, \
+                             but current thread is tid={}",
+                            self.rr_tid(),
+                        );
+                    }
+
                     match self.global.rr_state.replay_signal() {
                         Ok((signal_nr, _siginfo_bytes)) => {
                             let signal = litebox_common_linux::signal::Signal::try_from(signal_nr)

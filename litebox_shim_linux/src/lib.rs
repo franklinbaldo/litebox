@@ -613,49 +613,186 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Record mode: execute the syscall normally, then capture side-effects
     /// and record every syscall to the trace.
+    ///
+    /// Potentially blocking syscalls produce two trace events (ENTRY + EXIT)
+    /// so that the run token can be released while the thread is blocked,
+    /// allowing other guest threads to proceed. Non-blocking syscalls produce
+    /// a single COMPLETE event.
     #[cfg(feature = "rr")]
     fn handle_syscall_request_record(&self, ctx: &mut litebox_common_linux::PtRegs) {
         let syscall_nr = rr::get_syscall_nr(ctx);
         let tid = self.rr_tid();
+        let tid_i32 = self.rr_tid_i32();
 
-        // Execute the syscall normally.
-        let return_value = match self.do_syscall(ctx) {
-            Ok(v) => v,
-            Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
-        };
+        if rr::is_potentially_blocking(syscall_nr) {
+            // --- Blocking path: ENTRY + execute + EXIT ---
 
-        // Write return value to guest context.
-        rr::set_return_value(ctx, return_value);
+            // 1. Record ENTRY event (result=0, no data).
+            self.global.rr_state.record_event(
+                syscall_nr,
+                0,
+                alloc::vec::Vec::new(),
+                tid,
+                litebox_rr::EventKind::Entry,
+            );
 
-        // Capture any side-effect data written to guest memory.
-        let data = rr::capture_side_effects(syscall_nr, ctx, return_value);
+            // 2. Release the run token so other threads can proceed while
+            //    this thread blocks.
+            if let Some(coord) = self.global.rr_state.coordinator() {
+                coord.enter_blocking(tid_i32);
+                // Grant the token to the next runnable thread (if any).
+                // For single-threaded programs no one is runnable, so this
+                // is a no-op and the token stays unheld until we wake up.
+                coord.try_grant_next_runnable();
+            }
 
-        // Record the event.
-        #[allow(clippy::cast_possible_wrap)]
-        let result_i64 = return_value as isize as i64;
-        self.global.rr_state.record_event(
-            syscall_nr,
-            result_i64,
-            data,
-            tid,
-            litebox_rr::EventKind::Complete,
-        );
+            // 3. Execute the syscall — this may block the host thread.
+            let return_value = match self.do_syscall(ctx) {
+                Ok(v) => v,
+                Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
+            };
 
-        // Release the run token so the coordinator can schedule the next thread.
-        if let Some(coord) = self.global.rr_state.coordinator() {
-            coord.release_token(self.rr_tid_i32());
-            coord.grant_next_runnable();
+            // 4. Thread woke up — exit blocking state and reacquire the
+            //    run token. try_grant_next_runnable handles the case where
+            //    no other thread is running (e.g., single-threaded) by
+            //    granting us the token immediately.
+            if let Some(coord) = self.global.rr_state.coordinator() {
+                coord.exit_blocking(tid_i32);
+                coord.try_grant_next_runnable();
+                if !coord.acquire_token(tid_i32) {
+                    // Coordinator shut down — exit this thread.
+                    return;
+                }
+            }
+
+            // 5. Write return value and capture side-effects.
+            rr::set_return_value(ctx, return_value);
+            let data = rr::capture_side_effects(syscall_nr, ctx, return_value);
+
+            // 6. Record EXIT event with result and side-effect data.
+            #[allow(clippy::cast_possible_wrap)]
+            let result_i64 = return_value as isize as i64;
+            self.global.rr_state.record_event(
+                syscall_nr,
+                result_i64,
+                data,
+                tid,
+                litebox_rr::EventKind::Exit,
+            );
+
+            // 7. Release token for the next thread.
+            if let Some(coord) = self.global.rr_state.coordinator() {
+                coord.release_token(tid_i32);
+                coord.grant_next_runnable();
+            }
+        } else {
+            // --- Non-blocking path: single COMPLETE event ---
+
+            // Execute the syscall normally.
+            let return_value = match self.do_syscall(ctx) {
+                Ok(v) => v,
+                Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
+            };
+
+            // Write return value to guest context.
+            rr::set_return_value(ctx, return_value);
+
+            // Capture any side-effect data written to guest memory.
+            let data = rr::capture_side_effects(syscall_nr, ctx, return_value);
+
+            // Record the event.
+            #[allow(clippy::cast_possible_wrap)]
+            let result_i64 = return_value as isize as i64;
+            self.global.rr_state.record_event(
+                syscall_nr,
+                result_i64,
+                data,
+                tid,
+                litebox_rr::EventKind::Complete,
+            );
+
+            // For exit/exit_group, flush observable side-effects
+            // (clear_child_tid + futex wake, robust-list wake) before
+            // releasing the run token. This ensures the joining thread
+            // observes the cleared tid immediately.
+            if syscall_nr == rr::nr_pub::EXIT || syscall_nr == rr::nr_pub::EXIT_GROUP {
+                self.flush_exit_side_effects();
+            }
+
+            // Release the run token so the coordinator can schedule the next thread.
+            if let Some(coord) = self.global.rr_state.coordinator() {
+                coord.release_token(tid_i32);
+                coord.grant_next_runnable();
+            }
         }
     }
 
     /// Replay mode: structural syscalls (memory management, process lifecycle,
     /// sigreturn) execute normally; all other syscalls are replayed from the
     /// trace by injecting the recorded return value and side-effect data.
+    ///
+    /// Blocking syscalls that produced ENTRY + EXIT event pairs during
+    /// recording are handled by consuming the ENTRY event, releasing the
+    /// token (so other threads can run), waiting for the token back, then
+    /// consuming the EXIT event to inject the recorded result.
     #[cfg(feature = "rr")]
     fn handle_syscall_request_replay(&self, ctx: &mut litebox_common_linux::PtRegs) {
         let syscall_nr = rr::get_syscall_nr(ctx);
 
-        if rr::is_structural(syscall_nr) {
+        // Check if the next trace event is an ENTRY event (blocking syscall).
+        let is_entry = self
+            .global
+            .rr_state
+            .peek_event_kind()
+            .is_some_and(|k| k == litebox_rr::EventKind::Entry);
+
+        if is_entry {
+            // --- Blocking syscall replay: ENTRY + EXIT ---
+
+            // 1. Consume the ENTRY event (validates syscall_nr).
+            match self.global.rr_state.replay_event(syscall_nr) {
+                Ok(_entry) => {}
+                Err(e) => {
+                    panic!(
+                        "replay error on ENTRY event: {e:?} (my_tid={}, syscall_nr={syscall_nr})",
+                        self.rr_tid()
+                    );
+                }
+            }
+
+            // 2. Release token and schedule the next thread from the trace.
+            //    Between ENTRY and EXIT, other threads may run.
+            if let Some(coord) = self.global.rr_state.coordinator() {
+                coord.release_token(self.rr_tid_i32());
+                if let Some(next_tid) = self.global.rr_state.peek_event_tid() {
+                    #[allow(clippy::cast_possible_wrap)]
+                    let next_tid_i32 = next_tid as i32;
+                    coord.grant_token(next_tid_i32);
+                } else {
+                    coord.grant_next_runnable();
+                }
+
+                // 3. Wait for the coordinator to schedule us back (when the
+                //    trace cursor reaches our EXIT event).
+                if !coord.acquire_token(self.rr_tid_i32()) {
+                    return; // Coordinator shut down.
+                }
+            }
+
+            // 4. Consume the EXIT event and inject the recorded result.
+            match self.global.rr_state.replay_event(syscall_nr) {
+                Ok(event) => {
+                    if !event.data.is_empty() {
+                        rr::inject_side_effects(syscall_nr, ctx, &event.data);
+                    }
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let return_value = event.result as usize;
+                    rr::set_return_value(ctx, return_value);
+                }
+                Err(e) => panic!("replay error on EXIT event: {e:?}"),
+            }
+        } else if rr::is_structural(syscall_nr) {
+            // --- Structural syscall: execute normally ---
             // For mmap, we need to force the recorded address so that the
             // mapping lands at exactly the same virtual address as during
             // recording. Peek at the trace to get the recorded return value
@@ -669,13 +806,24 @@ impl<FS: ShimFS> Task<FS> {
             // Structural syscall — execute normally, but still consume
             // the trace event to keep the replay cursor in sync.
             self.handle_syscall_request_normal(ctx);
+
+            // For exit/exit_group, flush observable side-effects (clear_child_tid
+            // write + futex wake, robust-list wake) NOW, while we still hold the
+            // run token. During recording these happen naturally (the real futex
+            // wake unblocks the joining thread), but during replay the joining
+            // thread's futex is replayed from trace and never blocks — so it needs
+            // to see the cleared tid in memory by the time it resumes.
+            if syscall_nr == rr::nr_pub::EXIT || syscall_nr == rr::nr_pub::EXIT_GROUP {
+                self.flush_exit_side_effects();
+            }
+
             // Consume and validate the trace event (ignore recorded data).
             match self.global.rr_state.replay_event(syscall_nr) {
                 Ok(_event) => {}
                 Err(e) => panic!("replay divergence on structural syscall: {e:?}"),
             }
         } else {
-            // Non-structural — replay from trace.
+            // --- Non-structural COMPLETE event: replay from trace ---
             match self.global.rr_state.replay_event(syscall_nr) {
                 Ok(event) => {
                     // Inject side-effect data into guest memory.

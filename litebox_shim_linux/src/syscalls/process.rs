@@ -546,6 +546,34 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
+    /// Flush the observable side-effects of thread exit — `clear_child_tid`
+    /// write + futex wake, and robust-list wake — so that other threads see
+    /// them immediately.
+    ///
+    /// This is safe to call with `&self` because `clear_child_tid` and
+    /// `robust_list` live in `Cell<Option<_>>`, so `take()` is idempotent.
+    /// If `prepare_for_exit` runs later (in `Drop`), the Cells will already
+    /// be `None` and these operations will be skipped.
+    ///
+    /// Called from the RR dispatch before releasing the run token so that
+    /// other threads (e.g., a thread blocked in `pthread_join` via futex)
+    /// observe the correct memory state during replay.
+    #[cfg(feature = "rr")]
+    pub(crate) fn flush_exit_side_effects(&self) {
+        if let Some(clear_child_tid) = self.thread.clear_child_tid.take() {
+            let _ = clear_child_tid.write_at_offset(0, 0);
+            let clear_child_tid = crate::MutPtr::from_usize(clear_child_tid.as_usize());
+            let _ = self.sys_futex(litebox_common_linux::FutexArgs::Wake {
+                addr: clear_child_tid,
+                flags: litebox_common_linux::FutexFlags::PRIVATE,
+                count: 1,
+            });
+        }
+        if let Some(robust_list) = self.thread.robust_list.take() {
+            let _ = wake_robust_list(robust_list);
+        }
+    }
+
     pub(crate) fn sys_exit(&self, status: i32) {
         // The `Task` will be dropped on the way out of the shim, which will
         // call `self.prepare_for_exit()`.

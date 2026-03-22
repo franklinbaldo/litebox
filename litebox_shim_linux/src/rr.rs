@@ -19,7 +19,7 @@ type Mutex<T> = litebox::sync::Mutex<Platform, T>;
 /// Public re-exports of syscall number constants needed by the dispatch logic
 /// in `lib.rs`.
 pub mod nr_pub {
-    pub use super::nr::MMAP;
+    pub use super::nr::{EXIT, EXIT_GROUP, MMAP};
 }
 
 /// The record-replay operating mode.
@@ -535,12 +535,25 @@ mod nr {
 
     // Network
     pub const RECVFROM: u32 = Sysno::recvfrom.id() as u32;
+    pub const RECVMSG: u32 = Sysno::recvmsg.id() as u32;
+    pub const SENDTO: u32 = Sysno::sendto.id() as u32;
+    pub const SENDMSG: u32 = Sysno::sendmsg.id() as u32;
+    pub const CONNECT: u32 = Sysno::connect.id() as u32;
     pub const ACCEPT: u32 = Sysno::accept.id() as u32;
     pub const ACCEPT4: u32 = Sysno::accept4.id() as u32;
     pub const GETSOCKOPT: u32 = Sysno::getsockopt.id() as u32;
     pub const GETSOCKNAME: u32 = Sysno::getsockname.id() as u32;
     pub const GETPEERNAME: u32 = Sysno::getpeername.id() as u32;
     pub const SOCKETPAIR: u32 = Sysno::socketpair.id() as u32;
+
+    // Blocking
+    pub const FUTEX: u32 = Sysno::futex.id() as u32;
+    pub const NANOSLEEP: u32 = Sysno::nanosleep.id() as u32;
+    pub const WRITE: u32 = Sysno::write.id() as u32;
+    pub const WRITEV: u32 = Sysno::writev.id() as u32;
+    pub const POLL: u32 = Sysno::poll.id() as u32;
+    pub const EPOLL_WAIT: u32 = Sysno::epoll_wait.id() as u32;
+    pub const RT_SIGTIMEDWAIT: u32 = Sysno::rt_sigtimedwait.id() as u32;
 
     // ioctl
     pub const IOCTL: u32 = Sysno::ioctl.id() as u32;
@@ -620,6 +633,38 @@ fn is_structural_arch(syscall_nr: u32) -> bool {
     // sigreturn: restores signal frame.
     // set_thread_area: modifies GDT entry for TLS via punchthrough.
     matches!(syscall_nr, nr::SIGRETURN | nr::SET_THREAD_AREA)
+}
+
+/// Returns `true` if this syscall may block the calling thread.
+///
+/// During recording, blocking syscalls produce an ENTRY event (token released)
+/// and an EXIT event (token reacquired, result captured). This allows other
+/// threads to run while one thread is blocked in a syscall like `futex_wait`
+/// or `nanosleep`.
+pub fn is_potentially_blocking(syscall_nr: u32) -> bool {
+    matches!(
+        syscall_nr,
+        nr::FUTEX
+            | nr::NANOSLEEP
+            | nr::CLOCK_NANOSLEEP
+            | nr::READ
+            | nr::READV
+            | nr::WRITE
+            | nr::WRITEV
+            | nr::RECVFROM
+            | nr::RECVMSG
+            | nr::SENDTO
+            | nr::SENDMSG
+            | nr::POLL
+            | nr::PPOLL
+            | nr::PSELECT6
+            | nr::EPOLL_WAIT
+            | nr::EPOLL_PWAIT
+            | nr::ACCEPT
+            | nr::ACCEPT4
+            | nr::CONNECT
+            | nr::RT_SIGTIMEDWAIT
+    )
 }
 
 /// Read `len` bytes from guest memory at the given address.
