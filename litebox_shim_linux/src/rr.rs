@@ -59,6 +59,11 @@ pub struct RRState {
 impl RRState {
     /// Create a new RR state in the given mode.
     ///
+    /// For `Record` mode, a [`RunCoordinator`] is created but no threads
+    /// are registered yet — call
+    /// [`RunCoordinator::register_initial_thread`] from the main thread
+    /// before dispatching any syscalls.
+    ///
     /// # Panics
     ///
     /// Panics if called with `RRMode::Replay`. Use [`RRState::new_replay`]
@@ -75,7 +80,7 @@ impl RRState {
                 mode,
                 recorder: Some(Mutex::new(Recorder::new(current_arch()))),
                 replayer: None,
-                coordinator: None,
+                coordinator: Some(RunCoordinator::new()),
             },
             RRMode::Replay => {
                 panic!("use RRState::new_replay() for replay mode");
@@ -90,7 +95,7 @@ impl RRState {
             mode: RRMode::Replay,
             recorder: None,
             replayer: Some(Mutex::new(replayer)),
-            coordinator: None,
+            coordinator: Some(RunCoordinator::new()),
         })
     }
 
@@ -99,23 +104,11 @@ impl RRState {
         self.mode
     }
 
-    /// Return a reference to the run coordinator, if present.
+    /// Return a reference to the run coordinator.
+    ///
+    /// Returns `None` when RR is disabled (`RRMode::Off`).
     pub fn coordinator(&self) -> Option<&RunCoordinator> {
         self.coordinator.as_ref()
-    }
-
-    /// Initialize the run coordinator with the given initial thread ID.
-    /// Must be called exactly once before any thread scheduling begins.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the coordinator is already initialized.
-    pub fn init_coordinator(&mut self, initial_tid: i32) {
-        assert!(
-            self.coordinator.is_none(),
-            "coordinator already initialized"
-        );
-        self.coordinator = Some(RunCoordinator::new(initial_tid));
     }
 
     /// Record a syscall event during recording mode.
@@ -257,20 +250,40 @@ struct CoordinatorInner {
     shutdown: bool,
 }
 
+impl Default for RunCoordinator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RunCoordinator {
-    /// Create a new coordinator. The initial thread is registered and
-    /// immediately granted the token.
-    pub fn new(initial_tid: i32) -> Self {
-        let mut runnable = BTreeSet::new();
-        runnable.insert(initial_tid);
+    /// Create a new empty coordinator. No threads are registered yet.
+    /// Call [`register_initial_thread`] to add and grant the first thread.
+    pub fn new() -> Self {
         Self {
             inner: Mutex::new(CoordinatorInner {
-                current_tid: initial_tid,
-                runnable,
+                current_tid: 0,
+                runnable: BTreeSet::new(),
                 blocked: BTreeSet::new(),
                 shutdown: false,
             }),
         }
+    }
+
+    /// Register and grant the token to the initial (main) thread.
+    /// Must be called exactly once before any other thread operations.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a thread already holds the token.
+    pub fn register_initial_thread(&self, tid: i32) {
+        let mut inner = self.inner.lock();
+        assert_eq!(
+            inner.current_tid, 0,
+            "register_initial_thread: token already held"
+        );
+        inner.runnable.insert(tid);
+        inner.current_tid = tid;
     }
 
     /// Register a new thread as runnable. It will not run until granted
@@ -343,6 +356,24 @@ impl RunCoordinator {
     pub fn grant_next_runnable(&self) -> i32 {
         let mut inner = self.inner.lock();
         assert_eq!(inner.current_tid, 0, "grant_next: token already held");
+        if let Some(&tid) = inner.runnable.iter().next() {
+            inner.current_tid = tid;
+            tid
+        } else {
+            0
+        }
+    }
+
+    /// Try to grant the token to the next runnable thread, but only if
+    /// no thread currently holds the token. This is a no-op if a thread
+    /// already has the token or no threads are runnable.
+    ///
+    /// Returns the tid that was granted, or 0 if nothing was done.
+    pub fn try_grant_next_runnable(&self) -> i32 {
+        let mut inner = self.inner.lock();
+        if inner.current_tid != 0 {
+            return 0;
+        }
         if let Some(&tid) = inner.runnable.iter().next() {
             inner.current_tid = tid;
             tid

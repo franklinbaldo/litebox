@@ -3,7 +3,7 @@
 
 //! Recorder — accumulates syscall events into an in-memory trace buffer.
 
-use crate::trace::{Event, EventKind, TraceArch, TraceHeader, TRACE_MAGIC, TRACE_VERSION};
+use crate::trace::{Event, EventKind, TRACE_MAGIC, TRACE_VERSION, TraceArch, TraceHeader};
 use alloc::vec::Vec;
 
 /// Records syscall events into an in-memory byte buffer.

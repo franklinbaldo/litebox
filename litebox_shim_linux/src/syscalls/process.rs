@@ -515,6 +515,18 @@ fn wake_robust_list(
 impl<FS: ShimFS> Task<FS> {
     /// Called when the task is exiting.
     pub(crate) fn prepare_for_exit(&mut self) {
+        // Deregister from the RR coordinator before cleaning up thread
+        // state. This releases the run token if we hold it and removes
+        // us from all coordinator sets, allowing other threads to
+        // proceed.
+        #[cfg(feature = "rr")]
+        if let Some(coord) = self.global.rr_state.coordinator() {
+            coord.remove_thread(self.rr_tid_i32());
+            // After removing ourselves, grant to the next runnable thread
+            // so the remaining threads don't spin forever.
+            coord.try_grant_next_runnable();
+        }
+
         self.thread.detach_from_process();
 
         if let Some(clear_child_tid) = self.thread.clear_child_tid.take() {
@@ -780,6 +792,14 @@ impl<FS: ShimFS> Task<FS> {
             // for conditions the user can control (such as "in-shim" rlimit
             // violations).
             return Err(Errno::ENOMEM);
+        }
+
+        // Register the new thread with the RR coordinator so it can be
+        // scheduled. This is done by the parent (which holds the run token)
+        // before the child's first syscall.
+        #[cfg(feature = "rr")]
+        if let Some(coord) = self.global.rr_state.coordinator() {
+            coord.register_thread(child_tid);
         }
 
         Ok(usize::try_from(child_tid).unwrap())
@@ -1472,6 +1492,18 @@ impl<FS: ShimFS> Task<FS> {
             .handle
             .set(Box::new(self.wait_state.thread_handle()))
             .ok();
+
+        // Register this thread with the RR coordinator. The main thread
+        // (tid == pid) is the initial thread and gets the token immediately.
+        // Child threads were already registered by the parent's do_clone();
+        // they do NOT get the token here — they will acquire it in
+        // prepare_to_run_guest().
+        #[cfg(feature = "rr")]
+        if self.tid == self.pid
+            && let Some(coord) = self.global.rr_state.coordinator()
+        {
+            coord.register_initial_thread(self.rr_tid_i32());
+        }
     }
 
     /// Initialize the thread context for a new process or thread, and perform any

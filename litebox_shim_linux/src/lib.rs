@@ -589,11 +589,34 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
+    /// Return the current task's tid as `u32` for use in RR trace events
+    /// and coordinator operations. The main thread (where `tid == pid`) is
+    /// normalized to 1 so that tids are deterministic across recording and
+    /// replay (the host `gettid()` differs between runs, but child thread
+    /// tids from `next_thread_id` are already deterministic starting at 2).
+    #[cfg(feature = "rr")]
+    #[allow(clippy::cast_sign_loss)]
+    fn rr_tid(&self) -> u32 {
+        if self.tid == self.pid {
+            1
+        } else {
+            self.tid as u32
+        }
+    }
+
+    /// Return the normalized RR tid as `i32` for coordinator operations.
+    #[cfg(feature = "rr")]
+    #[allow(clippy::cast_possible_wrap)]
+    fn rr_tid_i32(&self) -> i32 {
+        self.rr_tid() as i32
+    }
+
     /// Record mode: execute the syscall normally, then capture side-effects
     /// and record every syscall to the trace.
     #[cfg(feature = "rr")]
     fn handle_syscall_request_record(&self, ctx: &mut litebox_common_linux::PtRegs) {
         let syscall_nr = rr::get_syscall_nr(ctx);
+        let tid = self.rr_tid();
 
         // Execute the syscall normally.
         let return_value = match self.do_syscall(ctx) {
@@ -610,9 +633,19 @@ impl<FS: ShimFS> Task<FS> {
         // Record the event.
         #[allow(clippy::cast_possible_wrap)]
         let result_i64 = return_value as isize as i64;
-        self.global
-            .rr_state
-            .record_event(syscall_nr, result_i64, data, 0, litebox_rr::EventKind::Complete);
+        self.global.rr_state.record_event(
+            syscall_nr,
+            result_i64,
+            data,
+            tid,
+            litebox_rr::EventKind::Complete,
+        );
+
+        // Release the run token so the coordinator can schedule the next thread.
+        if let Some(coord) = self.global.rr_state.coordinator() {
+            coord.release_token(self.rr_tid_i32());
+            coord.grant_next_runnable();
+        }
     }
 
     /// Replay mode: structural syscalls (memory management, process lifecycle,
@@ -641,23 +674,37 @@ impl<FS: ShimFS> Task<FS> {
                 Ok(_event) => {}
                 Err(e) => panic!("replay divergence on structural syscall: {e:?}"),
             }
-            return;
+        } else {
+            // Non-structural — replay from trace.
+            match self.global.rr_state.replay_event(syscall_nr) {
+                Ok(event) => {
+                    // Inject side-effect data into guest memory.
+                    if !event.data.is_empty() {
+                        rr::inject_side_effects(syscall_nr, ctx, &event.data);
+                    }
+                    // Inject return value.
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let return_value = event.result as usize;
+                    rr::set_return_value(ctx, return_value);
+                }
+                Err(e) => {
+                    panic!("replay error: {e:?}");
+                }
+            }
         }
 
-        // Non-structural — replay from trace.
-        match self.global.rr_state.replay_event(syscall_nr) {
-            Ok(event) => {
-                // Inject side-effect data into guest memory.
-                if !event.data.is_empty() {
-                    rr::inject_side_effects(syscall_nr, ctx, &event.data);
-                }
-                // Inject return value.
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let return_value = event.result as usize;
-                rr::set_return_value(ctx, return_value);
-            }
-            Err(e) => {
-                panic!("replay error: {e:?}");
+        // Release the run token and schedule the next thread based on
+        // the trace. Peek at the next event's tid and grant it the token.
+        if let Some(coord) = self.global.rr_state.coordinator() {
+            coord.release_token(self.rr_tid_i32());
+            if let Some(next_tid) = self.global.rr_state.peek_event_tid() {
+                #[allow(clippy::cast_possible_wrap)]
+                let next_tid_i32 = next_tid as i32;
+                coord.grant_token(next_tid_i32);
+            } else {
+                // End of trace — grant to any runnable thread so it can
+                // observe the trace exhaustion and exit cleanly.
+                coord.grant_next_runnable();
             }
         }
     }

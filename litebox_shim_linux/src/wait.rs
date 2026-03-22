@@ -41,6 +41,17 @@ impl<FS: ShimFS> Task<FS> {
 
             #[cfg(feature = "rr")]
             if self.global.rr_state.mode() == crate::rr::RRMode::Replay {
+                // Ensure this thread holds the run token before returning
+                // to guest code. The token was released after the previous
+                // syscall and the coordinator scheduled us based on the
+                // trace.
+                if let Some(coord) = self.global.rr_state.coordinator()
+                    && !coord.acquire_token(self.rr_tid_i32())
+                {
+                    // Coordinator shut down — exit this thread.
+                    return false;
+                }
+
                 // During replay, inject async signals from the trace instead
                 // of draining host signals. Loop to handle multiple
                 // consecutive signal events.
@@ -70,6 +81,17 @@ impl<FS: ShimFS> Task<FS> {
                 return !self.is_exiting();
             }
 
+            #[cfg(feature = "rr")]
+            if self.global.rr_state.mode() == crate::rr::RRMode::Record {
+                // Ensure this thread holds the run token before returning
+                // to guest code.
+                if let Some(coord) = self.global.rr_state.coordinator()
+                    && !coord.acquire_token(self.rr_tid_i32())
+                {
+                    return false;
+                }
+            }
+
             self.global.platform.take_pending_signals(|signal| {
                 self.queue_signals(signal);
             });
@@ -84,11 +106,12 @@ impl<FS: ShimFS> Task<FS> {
             // blocking syscall (e.g., SIGALRM interrupting nanosleep).
             #[cfg(feature = "rr")]
             if self.global.rr_state.mode() == crate::rr::RRMode::Record {
+                let tid = self.rr_tid();
                 for signal in self.pending_signal_set() {
                     if !crate::rr::is_synchronous_signal(signal) {
                         self.global
                             .rr_state
-                            .record_signal(signal.as_i32(), alloc::vec![], 0);
+                            .record_signal(signal.as_i32(), alloc::vec![], tid);
                     }
                 }
             }
