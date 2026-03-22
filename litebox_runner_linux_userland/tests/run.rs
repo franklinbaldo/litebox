@@ -864,12 +864,11 @@ fn test_rr_replay_uses_trace_argv() {
     let trace_path = dir.join("trace_argv_rr.trace");
 
     // --- Record with a specific arg ---
-    let record_output =
-        Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_record"))
-            .runner_arg("--rr-record")
-            .runner_arg(&trace_path)
-            .arg("recorded_arg")
-            .output();
+    let record_output = Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_record"))
+        .runner_arg("--rr-record")
+        .runner_arg(&trace_path)
+        .arg("recorded_arg")
+        .output();
 
     assert!(
         trace_path.exists(),
@@ -884,13 +883,12 @@ fn test_rr_replay_uses_trace_argv() {
 
     // --- Replay with DIFFERENT CLI arg but --rr-replay-stdout ---
     // The CLI arg is ignored; trace metadata argv is used instead.
-    let replay_output =
-        Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_replay"))
-            .runner_arg("--rr-replay")
-            .runner_arg(&trace_path)
-            .runner_arg("--rr-replay-stdout")
-            .arg("WRONG_ARG_SHOULD_BE_IGNORED")
-            .output();
+    let replay_output = Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_replay"))
+        .runner_arg("--rr-replay")
+        .runner_arg(&trace_path)
+        .runner_arg("--rr-replay-stdout")
+        .arg("WRONG_ARG_SHOULD_BE_IGNORED")
+        .output();
 
     let replay_str = String::from_utf8_lossy(&replay_output);
 
