@@ -3,7 +3,7 @@
 
 //! Replayer — reads syscall events sequentially from a trace buffer.
 
-use crate::trace::{Event, EventKind, TraceArch, TraceError, TraceHeader};
+use crate::trace::{Event, EventKind, TraceArch, TraceError, TraceHeader, TraceMetadata};
 use alloc::vec::Vec;
 
 /// Error during replay.
@@ -45,6 +45,8 @@ pub struct Replayer {
     version: u32,
     /// Number of events consumed so far.
     events_consumed: u64,
+    /// Optional program metadata (v3+).
+    metadata: Option<TraceMetadata>,
 }
 
 impl Replayer {
@@ -57,6 +59,7 @@ impl Replayer {
             arch: header.arch,
             version: header.version,
             events_consumed: 0,
+            metadata: header.metadata,
         })
     }
 
@@ -68,6 +71,11 @@ impl Replayer {
     /// Return the trace format version.
     pub fn version(&self) -> u32 {
         self.version
+    }
+
+    /// Return a reference to the trace metadata, if present (v3+).
+    pub fn metadata(&self) -> Option<&TraceMetadata> {
+        self.metadata.as_ref()
     }
 
     /// Return the number of events consumed so far.
@@ -191,7 +199,7 @@ mod tests {
 
     #[test]
     fn test_replayer_roundtrip() {
-        let mut recorder = Recorder::new(TraceArch::X86_64);
+        let mut recorder = Recorder::new(TraceArch::X86_64, None);
         recorder.record(0, 5, alloc::vec![1, 2, 3, 4, 5], 0, EventKind::Complete);
         recorder.record(1, -1, alloc::vec![], 0, EventKind::Complete);
         recorder.record(60, 0, alloc::vec![0xAB], 0, EventKind::Complete);
@@ -229,7 +237,7 @@ mod tests {
 
     #[test]
     fn test_replayer_end_of_trace() {
-        let mut recorder = Recorder::new(TraceArch::X86_64);
+        let mut recorder = Recorder::new(TraceArch::X86_64, None);
         recorder.record(0, 0, alloc::vec![], 0, EventKind::Complete);
         let bytes = recorder.finish();
 
@@ -243,7 +251,7 @@ mod tests {
 
     #[test]
     fn test_replayer_divergence() {
-        let mut recorder = Recorder::new(TraceArch::X86_64);
+        let mut recorder = Recorder::new(TraceArch::X86_64, None);
         recorder.record(42, 0, alloc::vec![], 0, EventKind::Complete);
         let bytes = recorder.finish();
 
@@ -262,7 +270,7 @@ mod tests {
 
     #[test]
     fn test_replayer_peek_event_nr() {
-        let mut recorder = Recorder::new(TraceArch::X86_64);
+        let mut recorder = Recorder::new(TraceArch::X86_64, None);
         recorder.record(42, 0, alloc::vec![], 0, EventKind::Complete);
         recorder.record(
             crate::SIGNAL_DELIVERY_NR,
@@ -295,7 +303,7 @@ mod tests {
 
     #[test]
     fn test_replayer_peek_event_result() {
-        let mut recorder = Recorder::new(TraceArch::X86_64);
+        let mut recorder = Recorder::new(TraceArch::X86_64, None);
         recorder.record(9, 0x7f00_0000_0000, alloc::vec![], 0, EventKind::Complete); // mmap success
         recorder.record(9, -12, alloc::vec![], 0, EventKind::Complete); // mmap ENOMEM (-12)
         let bytes = recorder.finish();
@@ -327,7 +335,7 @@ mod tests {
 
     #[test]
     fn test_replayer_peek_event_tid() {
-        let mut recorder = Recorder::new(TraceArch::X86_64);
+        let mut recorder = Recorder::new(TraceArch::X86_64, None);
         recorder.record(0, 0, alloc::vec![], 1, EventKind::Complete);
         recorder.record(202, 0, alloc::vec![], 42, EventKind::Entry);
         recorder.record(202, 0, alloc::vec![], 42, EventKind::Exit);
@@ -350,7 +358,7 @@ mod tests {
 
     #[test]
     fn test_replayer_peek_event_kind() {
-        let mut recorder = Recorder::new(TraceArch::X86_64);
+        let mut recorder = Recorder::new(TraceArch::X86_64, None);
         recorder.record(0, 0, alloc::vec![], 0, EventKind::Complete);
         recorder.record(202, 0, alloc::vec![], 0, EventKind::Entry);
         recorder.record(202, 0, alloc::vec![], 0, EventKind::Exit);
@@ -382,9 +390,55 @@ mod tests {
 
     #[test]
     fn test_replayer_version() {
-        let recorder = Recorder::new(TraceArch::X86_64);
+        let recorder = Recorder::new(TraceArch::X86_64, None);
         let bytes = recorder.finish();
         let replayer = Replayer::from_bytes(bytes).unwrap();
-        assert_eq!(replayer.version(), 2);
+        assert_eq!(replayer.version(), 3);
+    }
+
+    #[test]
+    fn test_recorder_with_metadata() {
+        let meta = TraceMetadata {
+            program_path: alloc::string::String::from("/usr/bin/hello"),
+            argv: alloc::vec![
+                alloc::string::String::from("hello"),
+                alloc::string::String::from("--world"),
+            ],
+            envp: alloc::vec![
+                alloc::string::String::from("PATH=/usr/bin"),
+                alloc::string::String::from("HOME=/root"),
+            ],
+            initial_files_path: Some(alloc::string::String::from("/tmp/rootfs.tar")),
+            program_from_tar: true,
+        };
+
+        // Record with metadata
+        let mut recorder = Recorder::new(TraceArch::X86_64, Some(meta.clone()));
+        recorder.record(0, 42, alloc::vec![1, 2, 3], 0, EventKind::Complete);
+        let bytes = recorder.finish();
+
+        // Replay and verify metadata comes back
+        let mut replayer = Replayer::from_bytes(bytes).unwrap();
+        assert_eq!(replayer.version(), 3);
+        assert_eq!(replayer.arch(), TraceArch::X86_64);
+
+        let got_meta = replayer.metadata().expect("metadata should be present");
+        assert_eq!(*got_meta, meta);
+        assert_eq!(got_meta.program_path, "/usr/bin/hello");
+        assert_eq!(got_meta.argv.len(), 2);
+        assert_eq!(got_meta.envp.len(), 2);
+        assert!(got_meta.program_from_tar);
+        assert_eq!(
+            got_meta.initial_files_path.as_deref(),
+            Some("/tmp/rootfs.tar")
+        );
+
+        // Events should still be readable
+        let ev = replayer.next_event().unwrap();
+        assert_eq!(ev.event_id, 0);
+        assert_eq!(ev.syscall_nr, 0);
+        assert_eq!(ev.result, 42);
+        assert_eq!(ev.data, alloc::vec![1, 2, 3]);
+        assert!(replayer.is_exhausted());
     }
 }

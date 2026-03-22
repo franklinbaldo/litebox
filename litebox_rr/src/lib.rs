@@ -13,4 +13,6 @@ pub mod trace;
 
 pub use recorder::Recorder;
 pub use replayer::{ReplayError, Replayer};
-pub use trace::{Event, EventKind, SIGNAL_DELIVERY_NR, TraceArch, TraceError, TraceHeader};
+pub use trace::{
+    Event, EventKind, SIGNAL_DELIVERY_NR, TraceArch, TraceError, TraceHeader, TraceMetadata,
+};

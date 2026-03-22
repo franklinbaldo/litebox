@@ -3,13 +3,15 @@
 
 //! Recorder — accumulates syscall events into an in-memory trace buffer.
 
-use crate::trace::{Event, EventKind, TRACE_MAGIC, TRACE_VERSION, TraceArch, TraceHeader};
+use crate::trace::{
+    Event, EventKind, TRACE_MAGIC, TRACE_VERSION, TraceArch, TraceHeader, TraceMetadata,
+};
 use alloc::vec::Vec;
 
 /// Records syscall events into an in-memory byte buffer.
 ///
 /// Usage:
-/// 1. Create with `Recorder::new(arch)`
+/// 1. Create with `Recorder::new(arch, metadata)`
 /// 2. Call `record(syscall_nr, result, data)` for each syscall
 /// 3. Call `finish()` to get the complete trace bytes
 pub struct Recorder {
@@ -20,13 +22,24 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    /// Create a new recorder for the given architecture.
+    /// Create a new recorder for the given architecture and optional metadata.
     /// Immediately writes the trace header to the buffer.
-    pub fn new(arch: TraceArch) -> Self {
+    ///
+    /// If `metadata` is `None`, a default empty metadata block is used (v3
+    /// headers always include metadata).
+    pub fn new(arch: TraceArch, metadata: Option<TraceMetadata>) -> Self {
+        let metadata = metadata.unwrap_or_else(|| TraceMetadata {
+            program_path: alloc::string::String::new(),
+            argv: alloc::vec![],
+            envp: alloc::vec![],
+            initial_files_path: None,
+            program_from_tar: false,
+        });
         let header = TraceHeader {
             magic: TRACE_MAGIC,
             version: TRACE_VERSION,
             arch,
+            metadata: Some(metadata),
         };
         let buffer = header.to_bytes();
         Self {
@@ -83,10 +96,10 @@ mod tests {
 
     #[test]
     fn test_recorder_empty() {
-        let recorder = Recorder::new(TraceArch::X86_64);
+        let recorder = Recorder::new(TraceArch::X86_64, None);
         assert_eq!(recorder.event_count(), 0);
         let bytes = recorder.finish();
-        // Should contain only the header (9 bytes)
+        // Should contain only the header
         let (header, consumed) = TraceHeader::from_bytes(&bytes).unwrap();
         assert_eq!(consumed, bytes.len());
         assert_eq!(header.magic, TRACE_MAGIC);
@@ -96,7 +109,7 @@ mod tests {
 
     #[test]
     fn test_recorder_records_events() {
-        let mut recorder = Recorder::new(TraceArch::X86);
+        let mut recorder = Recorder::new(TraceArch::X86, None);
         recorder.record(0, 5, alloc::vec![1, 2, 3, 4, 5], 0, EventKind::Complete);
         recorder.record(1, -1, alloc::vec![], 0, EventKind::Complete);
         recorder.record(60, 0, alloc::vec![0xAB], 0, EventKind::Complete);
@@ -139,7 +152,7 @@ mod tests {
 
     #[test]
     fn test_recorder_event_count() {
-        let mut recorder = Recorder::new(TraceArch::X86_64);
+        let mut recorder = Recorder::new(TraceArch::X86_64, None);
         assert_eq!(recorder.event_count(), 0);
         recorder.record(0, 0, alloc::vec![], 0, EventKind::Complete);
         assert_eq!(recorder.event_count(), 1);

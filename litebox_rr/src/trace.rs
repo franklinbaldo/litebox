@@ -6,13 +6,14 @@
 //! The trace format uses a simple TLV (type-length-value) encoding with
 //! little-endian byte order for all multi-byte integers.
 
+use alloc::string::String;
 use alloc::vec::Vec;
 
 /// Magic bytes for the trace file header: "LBRR" in ASCII.
 pub const TRACE_MAGIC: [u8; 4] = *b"LBRR";
 
 /// Current trace format version.
-pub const TRACE_VERSION: u32 = 2;
+pub const TRACE_VERSION: u32 = 3;
 
 /// Sentinel syscall number used for signal delivery events in the trace.
 /// This is well outside the range of real Linux syscall numbers.
@@ -58,6 +59,8 @@ pub enum TraceError {
     InvalidArch(u8),
     /// Invalid event kind byte.
     InvalidEventKind(u8),
+    /// Invalid or corrupt metadata block.
+    InvalidMetadata,
 }
 
 /// Target architecture recorded in the trace header.
@@ -82,13 +85,219 @@ impl TraceArch {
     }
 }
 
+/// Metadata about the traced program, stored in the trace header (v3+).
+///
+/// This captures enough information to reproduce the original execution
+/// environment: the program binary, its arguments, environment variables,
+/// and optional initial filesystem snapshot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraceMetadata {
+    /// Path to the guest program binary.
+    pub program_path: String,
+    /// Command-line arguments (argv).
+    pub argv: Vec<String>,
+    /// Environment variables (envp).
+    pub envp: Vec<String>,
+    /// Optional path to the initial filesystem tar archive.
+    pub initial_files_path: Option<String>,
+    /// Whether the program binary was extracted from the tar archive.
+    pub program_from_tar: bool,
+}
+
+impl TraceMetadata {
+    /// Serialize this metadata to bytes.
+    ///
+    /// Wire format:
+    /// ```text
+    /// u32 LE  total_len        (byte count of everything after this u32)
+    /// u32 LE  program_path_len
+    /// [u8]    program_path     (UTF-8)
+    /// u32 LE  argc
+    /// for each arg:
+    ///   u32 LE  arg_len
+    ///   [u8]    arg
+    /// u32 LE  envc
+    /// for each env:
+    ///   u32 LE  env_len
+    ///   [u8]    env
+    /// u8      flags             (bit 0 = program_from_tar, bit 1 = has_initial_files)
+    /// if has_initial_files:
+    ///   u32 LE  initial_files_path_len
+    ///   [u8]    initial_files_path
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if any string length or the total payload size exceeds
+    /// [`u32::MAX`].
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        // Build the payload (everything after total_len).
+        let mut payload = Vec::new();
+
+        // program_path
+        let pp = self.program_path.as_bytes();
+        let pp_len: u32 = pp
+            .len()
+            .try_into()
+            .expect("program_path length exceeds u32::MAX");
+        payload.extend_from_slice(&pp_len.to_le_bytes());
+        payload.extend_from_slice(pp);
+
+        // argv
+        let argc: u32 = self.argv.len().try_into().expect("argc exceeds u32::MAX");
+        payload.extend_from_slice(&argc.to_le_bytes());
+        for arg in &self.argv {
+            let ab = arg.as_bytes();
+            let al: u32 = ab.len().try_into().expect("arg length exceeds u32::MAX");
+            payload.extend_from_slice(&al.to_le_bytes());
+            payload.extend_from_slice(ab);
+        }
+
+        // envp
+        let envc: u32 = self.envp.len().try_into().expect("envc exceeds u32::MAX");
+        payload.extend_from_slice(&envc.to_le_bytes());
+        for env in &self.envp {
+            let eb = env.as_bytes();
+            let el: u32 = eb.len().try_into().expect("env length exceeds u32::MAX");
+            payload.extend_from_slice(&el.to_le_bytes());
+            payload.extend_from_slice(eb);
+        }
+
+        // flags
+        let mut flags: u8 = 0;
+        if self.program_from_tar {
+            flags |= 0x01;
+        }
+        if self.initial_files_path.is_some() {
+            flags |= 0x02;
+        }
+        payload.push(flags);
+
+        // initial_files_path (if present)
+        if let Some(ref ifp) = self.initial_files_path {
+            let ib = ifp.as_bytes();
+            let il: u32 = ib
+                .len()
+                .try_into()
+                .expect("initial_files_path length exceeds u32::MAX");
+            payload.extend_from_slice(&il.to_le_bytes());
+            payload.extend_from_slice(ib);
+        }
+
+        // Prepend total_len
+        let total_len: u32 = payload
+            .len()
+            .try_into()
+            .expect("metadata payload size exceeds u32::MAX");
+        let mut buf = Vec::with_capacity(4 + payload.len());
+        buf.extend_from_slice(&total_len.to_le_bytes());
+        buf.extend_from_slice(&payload);
+        buf
+    }
+
+    /// Deserialize metadata from `data`, returning the metadata and the number
+    /// of bytes consumed.
+    ///
+    /// # Panics
+    ///
+    /// This method does not panic. All slice indexing is guarded by length
+    /// checks that return [`TraceError::InvalidMetadata`] or
+    /// [`TraceError::UnexpectedEof`] on invalid input.
+    #[allow(clippy::similar_names)] // argc/argv, envc/envp are natural names
+    pub fn from_bytes(data: &[u8]) -> Result<(Self, usize), TraceError> {
+        if data.len() < 4 {
+            return Err(TraceError::UnexpectedEof);
+        }
+        let total_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+        let total_consumed = 4 + total_len;
+        if data.len() < total_consumed {
+            return Err(TraceError::UnexpectedEof);
+        }
+
+        let payload = &data[4..total_consumed];
+        let mut pos = 0;
+
+        // Helper: read a u32 LE from payload
+        let read_u32 = |pos: &mut usize| -> Result<u32, TraceError> {
+            if *pos + 4 > payload.len() {
+                return Err(TraceError::InvalidMetadata);
+            }
+            let val = u32::from_le_bytes(payload[*pos..*pos + 4].try_into().unwrap());
+            *pos += 4;
+            Ok(val)
+        };
+
+        // Helper: read a UTF-8 string of known length from payload
+        let read_string = |pos: &mut usize, len: usize| -> Result<String, TraceError> {
+            if *pos + len > payload.len() {
+                return Err(TraceError::InvalidMetadata);
+            }
+            let s = core::str::from_utf8(&payload[*pos..*pos + len])
+                .map_err(|_| TraceError::InvalidMetadata)?;
+            *pos += len;
+            Ok(String::from(s))
+        };
+
+        // program_path
+        let pp_len = read_u32(&mut pos)? as usize;
+        let program_path = read_string(&mut pos, pp_len)?;
+
+        // argv
+        let argc = read_u32(&mut pos)? as usize;
+        let mut argv = Vec::with_capacity(argc);
+        for _ in 0..argc {
+            let al = read_u32(&mut pos)? as usize;
+            argv.push(read_string(&mut pos, al)?);
+        }
+
+        // envp
+        let envc = read_u32(&mut pos)? as usize;
+        let mut envp = Vec::with_capacity(envc);
+        for _ in 0..envc {
+            let el = read_u32(&mut pos)? as usize;
+            envp.push(read_string(&mut pos, el)?);
+        }
+
+        // flags
+        if pos >= payload.len() {
+            return Err(TraceError::InvalidMetadata);
+        }
+        let flags = payload[pos];
+        pos += 1;
+        let program_from_tar = flags & 0x01 != 0;
+        let has_initial_files = flags & 0x02 != 0;
+
+        // initial_files_path
+        let initial_files_path = if has_initial_files {
+            let il = read_u32(&mut pos)? as usize;
+            Some(read_string(&mut pos, il)?)
+        } else {
+            None
+        };
+
+        Ok((
+            Self {
+                program_path,
+                argv,
+                envp,
+                initial_files_path,
+                program_from_tar,
+            },
+            total_consumed,
+        ))
+    }
+}
+
 /// Header written at the start of every trace.
 ///
-/// Wire format (9 bytes):
+/// Wire format (v1/v2: 9 bytes, v3: 9 bytes + metadata block):
 /// ```text
 /// [0..4]  magic:   [u8; 4]
 /// [4..8]  version: u32 LE
 /// [8]     arch:    u8
+/// -- v3 only: --
+/// [9..]   metadata (see [`TraceMetadata::to_bytes`])
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraceHeader {
@@ -98,6 +307,8 @@ pub struct TraceHeader {
     pub version: u32,
     /// Target architecture.
     pub arch: TraceArch,
+    /// Optional program metadata (v3+).
+    pub metadata: Option<TraceMetadata>,
 }
 
 /// Size of a serialized [`TraceHeader`] in bytes.
@@ -106,20 +317,31 @@ const TRACE_HEADER_SIZE: usize = 9;
 impl TraceHeader {
     /// Serialize this header to bytes.
     ///
+    /// For v3 headers, metadata is always serialized after the fixed 9-byte
+    /// portion.
+    ///
     /// # Panics
     ///
-    /// This method does not panic.
+    /// Panics if `version >= 3` and `metadata` is `None`.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(TRACE_HEADER_SIZE);
         buf.extend_from_slice(&self.magic);
         buf.extend_from_slice(&self.version.to_le_bytes());
         buf.push(self.arch as u8);
+
+        if self.version >= 3 {
+            let meta = self.metadata.as_ref().expect("v3 header requires metadata");
+            buf.extend_from_slice(&meta.to_bytes());
+        }
+
         buf
     }
 
     /// Deserialize a header from `data`, returning the header and the number of
     /// bytes consumed.
+    ///
+    /// Accepts v1, v2 (no metadata), and v3 (metadata follows fixed header).
     ///
     /// # Panics
     ///
@@ -136,19 +358,29 @@ impl TraceHeader {
         }
 
         let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-        if version != 1 && version != 2 {
+        if version == 0 || version > TRACE_VERSION {
             return Err(TraceError::UnsupportedVersion(version));
         }
 
         let arch = TraceArch::from_byte(data[8])?;
+
+        let mut consumed = TRACE_HEADER_SIZE;
+        let metadata = if version >= 3 {
+            let (meta, meta_consumed) = TraceMetadata::from_bytes(&data[consumed..])?;
+            consumed += meta_consumed;
+            Some(meta)
+        } else {
+            None
+        };
 
         Ok((
             Self {
                 magic,
                 version,
                 arch,
+                metadata,
             },
-            TRACE_HEADER_SIZE,
+            consumed,
         ))
     }
 }
@@ -256,16 +488,35 @@ impl Event {
 mod tests {
     use super::*;
 
+    /// Helper to create a sample metadata for tests.
+    fn sample_metadata() -> TraceMetadata {
+        TraceMetadata {
+            program_path: String::from("/usr/bin/hello"),
+            argv: alloc::vec![String::from("hello"), String::from("--world")],
+            envp: alloc::vec![String::from("PATH=/usr/bin"), String::from("HOME=/root")],
+            initial_files_path: Some(String::from("/tmp/rootfs.tar")),
+            program_from_tar: true,
+        }
+    }
+
     #[test]
     fn test_header_roundtrip() {
+        // v3 requires metadata, so test with metadata present
         let header = TraceHeader {
             magic: TRACE_MAGIC,
             version: TRACE_VERSION,
             arch: TraceArch::X86_64,
+            metadata: Some(TraceMetadata {
+                program_path: String::from("/bin/test"),
+                argv: alloc::vec![],
+                envp: alloc::vec![],
+                initial_files_path: None,
+                program_from_tar: false,
+            }),
         };
         let bytes = header.to_bytes();
         let (decoded, consumed) = TraceHeader::from_bytes(&bytes).unwrap();
-        assert_eq!(consumed, TRACE_HEADER_SIZE);
+        assert_eq!(consumed, bytes.len());
         assert_eq!(decoded, header);
     }
 
@@ -307,6 +558,13 @@ mod tests {
             magic: TRACE_MAGIC,
             version: TRACE_VERSION,
             arch: TraceArch::X86_64,
+            metadata: Some(TraceMetadata {
+                program_path: String::from("/bin/x"),
+                argv: alloc::vec![],
+                envp: alloc::vec![],
+                initial_files_path: None,
+                program_from_tar: false,
+            }),
         }
         .to_bytes();
         // Corrupt the magic bytes.
@@ -352,5 +610,81 @@ mod tests {
         assert_eq!(decoded.tid, 42);
         assert_eq!(decoded.kind, EventKind::Entry);
         assert_eq!(decoded, event);
+    }
+
+    // -- TraceMetadata tests --
+
+    #[test]
+    fn test_metadata_roundtrip() {
+        let meta = sample_metadata();
+        let bytes = meta.to_bytes();
+        let (decoded, consumed) = TraceMetadata::from_bytes(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded, meta);
+    }
+
+    #[test]
+    fn test_metadata_empty_roundtrip() {
+        let meta = TraceMetadata {
+            program_path: String::new(),
+            argv: alloc::vec![],
+            envp: alloc::vec![],
+            initial_files_path: None,
+            program_from_tar: false,
+        };
+        let bytes = meta.to_bytes();
+        let (decoded, consumed) = TraceMetadata::from_bytes(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded, meta);
+    }
+
+    #[test]
+    fn test_metadata_program_from_tar() {
+        let meta = TraceMetadata {
+            program_path: String::from("/app/main"),
+            argv: alloc::vec![String::from("/app/main")],
+            envp: alloc::vec![],
+            initial_files_path: Some(String::from("/data/fs.tar")),
+            program_from_tar: true,
+        };
+        let bytes = meta.to_bytes();
+        let (decoded, consumed) = TraceMetadata::from_bytes(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded, meta);
+        assert!(decoded.program_from_tar);
+        assert_eq!(decoded.initial_files_path.as_deref(), Some("/data/fs.tar"));
+    }
+
+    // -- TraceHeader v3/v2 tests --
+
+    #[test]
+    fn test_header_v3_with_metadata_roundtrip() {
+        let meta = sample_metadata();
+        let header = TraceHeader {
+            magic: TRACE_MAGIC,
+            version: 3,
+            arch: TraceArch::X86_64,
+            metadata: Some(meta.clone()),
+        };
+        let bytes = header.to_bytes();
+        let (decoded, consumed) = TraceHeader::from_bytes(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded.version, 3);
+        assert_eq!(decoded.metadata, Some(meta));
+    }
+
+    #[test]
+    fn test_header_v2_no_metadata() {
+        // Manually build a v2 header (9 bytes, no metadata)
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&TRACE_MAGIC);
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.push(TraceArch::X86_64 as u8);
+
+        let (decoded, consumed) = TraceHeader::from_bytes(&bytes).unwrap();
+        assert_eq!(consumed, TRACE_HEADER_SIZE);
+        assert_eq!(decoded.version, 2);
+        assert_eq!(decoded.arch, TraceArch::X86_64);
+        assert_eq!(decoded.metadata, None);
     }
 }

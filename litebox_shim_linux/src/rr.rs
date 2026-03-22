@@ -82,7 +82,7 @@ impl RRState {
             },
             RRMode::Record => Self {
                 mode,
-                recorder: Some(Mutex::new(Recorder::new(current_arch()))),
+                recorder: Some(Mutex::new(Recorder::new(current_arch(), None))),
                 replayer: None,
                 coordinator: Some(RunCoordinator::new()),
                 replay_stdout: false,
@@ -163,7 +163,7 @@ impl RRState {
         // the Recorder without needing to lock.
         self.recorder
             .as_mut()
-            .map(|r| core::mem::replace(r.get_mut(), Recorder::new(current_arch())).finish())
+            .map(|r| core::mem::replace(r.get_mut(), Recorder::new(current_arch(), None)).finish())
     }
 
     /// Take the recorded trace data without consuming the RR state.
@@ -174,7 +174,7 @@ impl RRState {
     pub fn take_trace(&self) -> Option<Vec<u8>> {
         self.recorder.as_ref().map(|r| {
             let mut guard = r.lock();
-            core::mem::replace(&mut *guard, Recorder::new(current_arch())).finish()
+            core::mem::replace(&mut *guard, Recorder::new(current_arch(), None)).finish()
         })
     }
 
