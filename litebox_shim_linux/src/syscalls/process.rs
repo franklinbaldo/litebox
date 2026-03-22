@@ -1483,9 +1483,17 @@ impl<FS: ShimFS> Task<FS> {
             ctx.xgs.truncate(),
         );
 
-        let _load_info = self
+        let load_info = self
             .load_program(loader, argv_vec, envp_vec)
             .expect("TODO: terminate the process cleanly");
+
+        #[cfg(feature = "rr")]
+        self.global
+            .rr_state
+            .set_last_trampoline_start(load_info.trampoline_start);
+
+        // Suppress unused-variable warning when the `rr` feature is disabled.
+        let _ = &load_info;
 
         self.init_thread_context(ctx);
         Ok(0)

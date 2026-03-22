@@ -20,7 +20,7 @@ type Mutex<T> = litebox::sync::Mutex<Platform, T>;
 /// Public re-exports of syscall number constants needed by the dispatch logic
 /// in `lib.rs`.
 pub mod nr_pub {
-    pub use super::nr::{EXIT, EXIT_GROUP, MMAP};
+    pub use super::nr::{EXECVE, EXIT, EXIT_GROUP, MMAP};
 }
 
 /// The record-replay operating mode.
@@ -58,6 +58,9 @@ pub struct RRState {
     /// When true, write/writev to stdout/stderr are executed on the host
     /// during replay so that program output is visible.
     replay_stdout: bool,
+    /// Guest virtual address of the rewriter trampoline page from the most
+    /// recent `load_program()` call. Used to capture execve snapshots.
+    last_trampoline_start: core::sync::atomic::AtomicUsize,
 }
 
 impl RRState {
@@ -80,6 +83,7 @@ impl RRState {
                 replayer: None,
                 coordinator: None,
                 replay_stdout: false,
+                last_trampoline_start: core::sync::atomic::AtomicUsize::new(0),
             },
             RRMode::Record => Self {
                 mode,
@@ -87,6 +91,7 @@ impl RRState {
                 replayer: None,
                 coordinator: Some(RunCoordinator::new()),
                 replay_stdout: false,
+                last_trampoline_start: core::sync::atomic::AtomicUsize::new(0),
             },
             RRMode::Replay => {
                 panic!("use RRState::new_replay() for replay mode");
@@ -103,6 +108,7 @@ impl RRState {
             replayer: Some(Mutex::new(replayer)),
             coordinator: Some(RunCoordinator::new()),
             replay_stdout: false,
+            last_trampoline_start: core::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -119,6 +125,18 @@ impl RRState {
     /// Returns `true` if stdout/stderr writes should be executed during replay.
     pub fn replay_stdout(&self) -> bool {
         self.replay_stdout
+    }
+
+    /// Store the trampoline start address from the most recent `load_program()`.
+    pub fn set_last_trampoline_start(&self, addr: usize) {
+        self.last_trampoline_start
+            .store(addr, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Retrieve the trampoline start address from the most recent `load_program()`.
+    pub fn last_trampoline_start(&self) -> usize {
+        self.last_trampoline_start
+            .load(core::sync::atomic::Ordering::Relaxed)
     }
 
     /// Return a reference to the run coordinator.

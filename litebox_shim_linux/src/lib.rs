@@ -957,6 +957,30 @@ impl<FS: ShimFS> Task<FS> {
                 litebox_rr::EventKind::Complete,
             );
 
+            // After a successful execve, capture a memory snapshot. The
+            // snapshot is emitted as a separate event following the execve
+            // Complete event so that replay can restore the post-exec
+            // address space.
+            if syscall_nr == rr::nr_pub::EXECVE && result_i64 >= 0 {
+                let mappings = self.global.pm.mappings();
+                let brk = self.global.pm.current_brk();
+                // After execve, init_thread_context() has set the registers:
+                // rip/eip = entry_point, rsp/esp = stack_top.
+                #[cfg(target_arch = "x86_64")]
+                let (entry_point, stack_top) = (ctx.rip, ctx.rsp);
+                #[cfg(target_arch = "x86")]
+                let (entry_point, stack_top) = (ctx.eip, ctx.esp);
+                let trampoline_start = self.global.rr_state.last_trampoline_start();
+                let snapshot_data = rr::capture_memory_snapshot(
+                    &mappings,
+                    brk,
+                    entry_point,
+                    stack_top,
+                    trampoline_start,
+                );
+                self.global.rr_state.record_snapshot(snapshot_data, tid);
+            }
+
             // For exit/exit_group, flush observable side-effects
             // (clear_child_tid + futex wake, robust-list wake) before
             // releasing the run token. This ensures the joining thread
