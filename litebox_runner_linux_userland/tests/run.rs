@@ -903,3 +903,52 @@ fn test_rr_replay_uses_trace_argv() {
         "replay output must not contain the CLI arg 'WRONG_ARG_SHOULD_BE_IGNORED':\n{replay_str}"
     );
 }
+
+/// Replay a trace with NO program path on the CLI — only the trace file.
+/// The program path, argv, envp, and initial-files all come from the trace
+/// metadata, so the user doesn't need to supply them.
+#[cfg(feature = "rr")]
+#[test]
+fn test_rr_replay_minimal_cli() {
+    let unique_name = "minimal_cli_rr";
+    let target = common::compile("./tests/hello.c", unique_name, true, false);
+    let dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    let trace_path = dir.join("minimal_cli_rr.trace");
+
+    // --- Record (using the full Runner helper) ---
+    let record_output = Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_record"))
+        .runner_arg("--rr-record")
+        .runner_arg(&trace_path)
+        .output();
+
+    assert!(trace_path.exists(), "trace file was not created");
+    let record_str = String::from_utf8_lossy(&record_output);
+    assert!(!record_str.is_empty(), "record produced no output");
+
+    // --- Replay with MINIMAL CLI: only the trace path, no program, no --initial-files ---
+    let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_userland")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_litebox_runner_linux_userland").to_string());
+
+    let output = std::process::Command::new(binary_path)
+        .args([
+            "--unstable",
+            "--rr-replay",
+            trace_path.to_str().unwrap(),
+            "--rr-replay-stdout",
+        ])
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .expect("failed to run litebox_runner_linux_userland");
+
+    assert!(
+        output.status.success(),
+        "replay with minimal CLI failed: {}",
+        output.status
+    );
+
+    let replay_str = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        record_output, output.stdout,
+        "minimal-CLI replay should match recording\n--- record ---\n{record_str}\n--- replay ---\n{replay_str}"
+    );
+}

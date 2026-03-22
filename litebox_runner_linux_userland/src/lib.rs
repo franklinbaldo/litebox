@@ -19,7 +19,10 @@ pub struct CliArgs {
     ///
     /// By default this is a path on the host filesystem. When --program-from-tar
     /// is set, it refers to a path inside the tar archive instead.
-    #[arg(required = true, trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
+    ///
+    /// Not required when `--rr-replay` is used with a v3 trace that contains
+    /// metadata — the program path and arguments are read from the trace.
+    #[arg(trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
     pub program_and_arguments: Vec<String>,
     /// Environment variables passed to the program (`K=V` pairs; can be invoked multiple times)
     #[arg(long = "env")]
@@ -166,28 +169,7 @@ pub fn run(mut cli_args: CliArgs) -> Result<()> {
         )
     }
 
-    // --program-from-tar loads pre-rewritten binaries that depend on litebox_rtld_audit.so,
-    // which is only injected by the rewriter backend.
-    if cli_args.program_from_tar
-        && !matches!(cli_args.interception_backend, InterceptionBackend::Rewriter)
-    {
-        anyhow::bail!(
-            "--program-from-tar requires --interception-backend=rewriter \
-             (the packaged binary is pre-rewritten and needs the audit library)"
-        );
-    }
-
-    // When loading from tar, the program path is a guest-internal path and must
-    // be absolute — LiteBox does not resolve programs via PATH.
-    if cli_args.program_from_tar && !cli_args.program_and_arguments[0].starts_with('/') {
-        anyhow::bail!(
-            "--program-from-tar requires an absolute path (e.g., /usr/bin/ls), \
-             got: {}",
-            cli_args.program_and_arguments[0]
-        );
-    }
-
-    // --- Replay metadata override ---
+    // --- Replay metadata override (must run BEFORE validation) ---
     // When replaying, read the trace header early to extract metadata and
     // override CLI args with the recorded values.  We keep the raw trace data
     // so that it can be handed to `set_rr_replay()` later without a second read.
@@ -218,6 +200,35 @@ pub fn run(mut cli_args: CliArgs) -> Result<()> {
         } else {
             (None, None)
         };
+
+    // After potential metadata override, program_and_arguments must be non-empty.
+    if cli_args.program_and_arguments.is_empty() {
+        anyhow::bail!(
+            "no program specified. Pass a program path on the command line, \
+             or use --rr-replay with a v3 trace that contains metadata."
+        );
+    }
+
+    // --program-from-tar loads pre-rewritten binaries that depend on litebox_rtld_audit.so,
+    // which is only injected by the rewriter backend.
+    if cli_args.program_from_tar
+        && !matches!(cli_args.interception_backend, InterceptionBackend::Rewriter)
+    {
+        anyhow::bail!(
+            "--program-from-tar requires --interception-backend=rewriter \
+             (the packaged binary is pre-rewritten and needs the audit library)"
+        );
+    }
+
+    // When loading from tar, the program path is a guest-internal path and must
+    // be absolute — LiteBox does not resolve programs via PATH.
+    if cli_args.program_from_tar && !cli_args.program_and_arguments[0].starts_with('/') {
+        anyhow::bail!(
+            "--program-from-tar requires an absolute path (e.g., /usr/bin/ls), \
+             got: {}",
+            cli_args.program_and_arguments[0]
+        );
+    }
 
     let mut cow_eligible_regions: Vec<MmappedFile> = Vec::new();
 
