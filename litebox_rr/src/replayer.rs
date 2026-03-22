@@ -3,7 +3,7 @@
 
 //! Replayer — reads syscall events sequentially from a trace buffer.
 
-use crate::trace::{Event, TraceArch, TraceError, TraceHeader};
+use crate::trace::{Event, EventKind, TraceArch, TraceError, TraceHeader};
 use alloc::vec::Vec;
 
 /// Error during replay.
@@ -41,6 +41,8 @@ pub struct Replayer {
     offset: usize,
     /// Architecture from the trace header.
     arch: TraceArch,
+    /// Trace format version from the header.
+    version: u32,
     /// Number of events consumed so far.
     events_consumed: u64,
 }
@@ -53,6 +55,7 @@ impl Replayer {
             data,
             offset: consumed,
             arch: header.arch,
+            version: header.version,
             events_consumed: 0,
         })
     }
@@ -60,6 +63,11 @@ impl Replayer {
     /// Return the architecture from the trace header.
     pub fn arch(&self) -> TraceArch {
         self.arch
+    }
+
+    /// Return the trace format version.
+    pub fn version(&self) -> u32 {
+        self.version
     }
 
     /// Return the number of events consumed so far.
@@ -138,19 +146,55 @@ impl Replayer {
             self.data[start..start + 8].try_into().unwrap(),
         ))
     }
+
+    /// Peek at the `tid` field of the next event without consuming it.
+    /// Returns `None` if the trace is exhausted.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying slice conversion fails (should not happen when
+    /// the bounds check above succeeds).
+    pub fn peek_event_tid(&self) -> Option<u32> {
+        if self.offset >= self.data.len() {
+            return None;
+        }
+        // tid is at bytes [24..28] within the v2 event.
+        let start = self.offset + 24;
+        if start + 4 > self.data.len() {
+            return None;
+        }
+        Some(u32::from_le_bytes(
+            self.data[start..start + 4].try_into().unwrap(),
+        ))
+    }
+
+    /// Peek at the `kind` field of the next event without consuming it.
+    /// Returns `None` if the trace is exhausted.
+    pub fn peek_event_kind(&self) -> Option<EventKind> {
+        if self.offset >= self.data.len() {
+            return None;
+        }
+        // kind is at byte [28] within the v2 event.
+        let start = self.offset + 28;
+        if start >= self.data.len() {
+            return None;
+        }
+        EventKind::from_byte(self.data[start])
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::recorder::Recorder;
+    use crate::trace::EventKind;
 
     #[test]
     fn test_replayer_roundtrip() {
         let mut recorder = Recorder::new(TraceArch::X86_64);
-        recorder.record(0, 5, alloc::vec![1, 2, 3, 4, 5]);
-        recorder.record(1, -1, alloc::vec![]);
-        recorder.record(60, 0, alloc::vec![0xAB]);
+        recorder.record(0, 5, alloc::vec![1, 2, 3, 4, 5], 0, EventKind::Complete);
+        recorder.record(1, -1, alloc::vec![], 0, EventKind::Complete);
+        recorder.record(60, 0, alloc::vec![0xAB], 0, EventKind::Complete);
         let bytes = recorder.finish();
 
         let mut replayer = Replayer::from_bytes(bytes).unwrap();
@@ -162,6 +206,8 @@ mod tests {
         assert_eq!(ev0.syscall_nr, 0);
         assert_eq!(ev0.result, 5);
         assert_eq!(ev0.data, alloc::vec![1, 2, 3, 4, 5]);
+        assert_eq!(ev0.tid, 0);
+        assert_eq!(ev0.kind, EventKind::Complete);
         assert_eq!(replayer.events_consumed(), 1);
 
         let ev1 = replayer.next_event().unwrap();
@@ -184,7 +230,7 @@ mod tests {
     #[test]
     fn test_replayer_end_of_trace() {
         let mut recorder = Recorder::new(TraceArch::X86_64);
-        recorder.record(0, 0, alloc::vec![]);
+        recorder.record(0, 0, alloc::vec![], 0, EventKind::Complete);
         let bytes = recorder.finish();
 
         let mut replayer = Replayer::from_bytes(bytes).unwrap();
@@ -198,7 +244,7 @@ mod tests {
     #[test]
     fn test_replayer_divergence() {
         let mut recorder = Recorder::new(TraceArch::X86_64);
-        recorder.record(42, 0, alloc::vec![]);
+        recorder.record(42, 0, alloc::vec![], 0, EventKind::Complete);
         let bytes = recorder.finish();
 
         let mut replayer = Replayer::from_bytes(bytes).unwrap();
@@ -217,9 +263,15 @@ mod tests {
     #[test]
     fn test_replayer_peek_event_nr() {
         let mut recorder = Recorder::new(TraceArch::X86_64);
-        recorder.record(42, 0, alloc::vec![]);
-        recorder.record(crate::SIGNAL_DELIVERY_NR, 14, alloc::vec![0xAA; 128]);
-        recorder.record(99, 1, alloc::vec![]);
+        recorder.record(42, 0, alloc::vec![], 0, EventKind::Complete);
+        recorder.record(
+            crate::SIGNAL_DELIVERY_NR,
+            14,
+            alloc::vec![0xAA; 128],
+            0,
+            EventKind::Signal,
+        );
+        recorder.record(99, 1, alloc::vec![], 0, EventKind::Complete);
         let bytes = recorder.finish();
 
         let mut replayer = Replayer::from_bytes(bytes).unwrap();
@@ -244,8 +296,8 @@ mod tests {
     #[test]
     fn test_replayer_peek_event_result() {
         let mut recorder = Recorder::new(TraceArch::X86_64);
-        recorder.record(9, 0x7f00_0000_0000, alloc::vec![]); // mmap success
-        recorder.record(9, -12, alloc::vec![]); // mmap ENOMEM (-12)
+        recorder.record(9, 0x7f00_0000_0000, alloc::vec![], 0, EventKind::Complete); // mmap success
+        recorder.record(9, -12, alloc::vec![], 0, EventKind::Complete); // mmap ENOMEM (-12)
         let bytes = recorder.finish();
 
         let mut replayer = Replayer::from_bytes(bytes).unwrap();
@@ -271,5 +323,68 @@ mod tests {
             ReplayError::Trace(_) => {} // Expected: some TraceError variant
             other => panic!("expected Trace error, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_replayer_peek_event_tid() {
+        let mut recorder = Recorder::new(TraceArch::X86_64);
+        recorder.record(0, 0, alloc::vec![], 1, EventKind::Complete);
+        recorder.record(202, 0, alloc::vec![], 42, EventKind::Entry);
+        recorder.record(202, 0, alloc::vec![], 42, EventKind::Exit);
+        let bytes = recorder.finish();
+
+        let mut replayer = Replayer::from_bytes(bytes).unwrap();
+
+        assert_eq!(replayer.peek_event_tid(), Some(1));
+        assert_eq!(replayer.peek_event_tid(), Some(1)); // idempotent
+        let _ = replayer.next_event().unwrap();
+
+        assert_eq!(replayer.peek_event_tid(), Some(42));
+        let _ = replayer.next_event().unwrap();
+
+        assert_eq!(replayer.peek_event_tid(), Some(42));
+        let _ = replayer.next_event().unwrap();
+
+        assert_eq!(replayer.peek_event_tid(), None);
+    }
+
+    #[test]
+    fn test_replayer_peek_event_kind() {
+        let mut recorder = Recorder::new(TraceArch::X86_64);
+        recorder.record(0, 0, alloc::vec![], 0, EventKind::Complete);
+        recorder.record(202, 0, alloc::vec![], 0, EventKind::Entry);
+        recorder.record(202, 0, alloc::vec![], 0, EventKind::Exit);
+        recorder.record(
+            crate::SIGNAL_DELIVERY_NR,
+            14,
+            alloc::vec![],
+            0,
+            EventKind::Signal,
+        );
+        let bytes = recorder.finish();
+
+        let mut replayer = Replayer::from_bytes(bytes).unwrap();
+
+        assert_eq!(replayer.peek_event_kind(), Some(EventKind::Complete));
+        let _ = replayer.next_event().unwrap();
+
+        assert_eq!(replayer.peek_event_kind(), Some(EventKind::Entry));
+        let _ = replayer.next_event().unwrap();
+
+        assert_eq!(replayer.peek_event_kind(), Some(EventKind::Exit));
+        let _ = replayer.next_event().unwrap();
+
+        assert_eq!(replayer.peek_event_kind(), Some(EventKind::Signal));
+        let _ = replayer.next_event().unwrap();
+
+        assert_eq!(replayer.peek_event_kind(), None);
+    }
+
+    #[test]
+    fn test_replayer_version() {
+        let recorder = Recorder::new(TraceArch::X86_64);
+        let bytes = recorder.finish();
+        let replayer = Replayer::from_bytes(bytes).unwrap();
+        assert_eq!(replayer.version(), 2);
     }
 }

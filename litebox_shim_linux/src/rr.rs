@@ -6,8 +6,9 @@
 //! When enabled via the `rr` feature, syscall execution can be recorded to a
 //! trace buffer or replayed from a previously recorded trace.
 
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
-use litebox_rr::{Event, Recorder, ReplayError, Replayer, TraceArch};
+use litebox_rr::{Event, EventKind, Recorder, ReplayError, Replayer, TraceArch};
 
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 
@@ -51,6 +52,8 @@ pub struct RRState {
     recorder: Option<Mutex<Recorder>>,
     /// Only present in Replay mode.
     replayer: Option<Mutex<Replayer>>,
+    /// Serializes thread execution. Present in Record and Replay modes.
+    coordinator: Option<RunCoordinator>,
 }
 
 impl RRState {
@@ -66,11 +69,13 @@ impl RRState {
                 mode,
                 recorder: None,
                 replayer: None,
+                coordinator: None,
             },
             RRMode::Record => Self {
                 mode,
                 recorder: Some(Mutex::new(Recorder::new(current_arch()))),
                 replayer: None,
+                coordinator: None,
             },
             RRMode::Replay => {
                 panic!("use RRState::new_replay() for replay mode");
@@ -85,6 +90,7 @@ impl RRState {
             mode: RRMode::Replay,
             recorder: None,
             replayer: Some(Mutex::new(replayer)),
+            coordinator: None,
         })
     }
 
@@ -93,14 +99,43 @@ impl RRState {
         self.mode
     }
 
+    /// Return a reference to the run coordinator, if present.
+    pub fn coordinator(&self) -> Option<&RunCoordinator> {
+        self.coordinator.as_ref()
+    }
+
+    /// Initialize the run coordinator with the given initial thread ID.
+    /// Must be called exactly once before any thread scheduling begins.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the coordinator is already initialized.
+    pub fn init_coordinator(&mut self, initial_tid: i32) {
+        assert!(
+            self.coordinator.is_none(),
+            "coordinator already initialized"
+        );
+        self.coordinator = Some(RunCoordinator::new(initial_tid));
+    }
+
     /// Record a syscall event during recording mode.
     ///
     /// `syscall_nr` is the raw Linux syscall number.
     /// `result` is the return value (positive = success, negative = -errno).
     /// `data` is the side-effect data (bytes written to guest buffers).
-    pub fn record_event(&self, syscall_nr: u32, result: i64, data: Vec<u8>) {
+    /// `tid` identifies the thread that produced this event.
+    /// `kind` indicates whether the event is a complete syscall, blocking
+    /// entry/exit, or signal delivery.
+    pub fn record_event(
+        &self,
+        syscall_nr: u32,
+        result: i64,
+        data: Vec<u8>,
+        tid: u32,
+        kind: EventKind,
+    ) {
         if let Some(ref recorder) = self.recorder {
-            recorder.lock().record(syscall_nr, result, data);
+            recorder.lock().record(syscall_nr, result, data, tid, kind);
         }
     }
 
@@ -138,12 +173,15 @@ impl RRState {
     ///
     /// `signal_nr` is the signal number (e.g., 14 for SIGALRM).
     /// `siginfo_bytes` is the raw `Siginfo` struct serialized as bytes.
-    pub fn record_signal(&self, signal_nr: i32, siginfo_bytes: Vec<u8>) {
+    /// `tid` identifies the thread that received the signal.
+    pub fn record_signal(&self, signal_nr: i32, siginfo_bytes: Vec<u8>, tid: u32) {
         if let Some(ref recorder) = self.recorder {
             recorder.lock().record(
                 litebox_rr::SIGNAL_DELIVERY_NR,
                 i64::from(signal_nr),
                 siginfo_bytes,
+                tid,
+                EventKind::Signal,
             );
         }
     }
@@ -163,6 +201,22 @@ impl RRState {
             .and_then(|r| r.lock().peek_event_result())
     }
 
+    /// During replay, peek at the `tid` field of the next trace event
+    /// without consuming it. Returns `None` if the trace is exhausted.
+    pub fn peek_event_tid(&self) -> Option<u32> {
+        self.replayer
+            .as_ref()
+            .and_then(|r| r.lock().peek_event_tid())
+    }
+
+    /// During replay, peek at the `kind` field of the next trace event
+    /// without consuming it. Returns `None` if the trace is exhausted.
+    pub fn peek_event_kind(&self) -> Option<EventKind> {
+        self.replayer
+            .as_ref()
+            .and_then(|r| r.lock().peek_event_kind())
+    }
+
     /// During replay, consume the next signal event from the trace.
     /// Returns `(signal_nr, siginfo_bytes)`.
     pub fn replay_signal(&self) -> Result<(i32, Vec<u8>), litebox_rr::ReplayError> {
@@ -176,6 +230,156 @@ impl RRState {
         } else {
             Err(litebox_rr::ReplayError::EndOfTrace)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Run coordinator — serializes guest thread execution
+// ---------------------------------------------------------------------------
+
+/// Serializes guest thread execution so only one thread runs at a time.
+///
+/// During recording, any runnable thread may be granted the token.
+/// During replay, only the thread matching the next trace event's tid
+/// is granted the token.
+pub struct RunCoordinator {
+    inner: Mutex<CoordinatorInner>,
+}
+
+struct CoordinatorInner {
+    /// TID of the thread currently holding the run token, or 0 if idle.
+    current_tid: i32,
+    /// Threads that are runnable (waiting for the token).
+    runnable: BTreeSet<i32>,
+    /// Threads that are blocked inside a syscall (released the token).
+    blocked: BTreeSet<i32>,
+    /// When true, all threads should exit.
+    shutdown: bool,
+}
+
+impl RunCoordinator {
+    /// Create a new coordinator. The initial thread is registered and
+    /// immediately granted the token.
+    pub fn new(initial_tid: i32) -> Self {
+        let mut runnable = BTreeSet::new();
+        runnable.insert(initial_tid);
+        Self {
+            inner: Mutex::new(CoordinatorInner {
+                current_tid: initial_tid,
+                runnable,
+                blocked: BTreeSet::new(),
+                shutdown: false,
+            }),
+        }
+    }
+
+    /// Register a new thread as runnable. It will not run until granted
+    /// the token.
+    pub fn register_thread(&self, tid: i32) {
+        let mut inner = self.inner.lock();
+        inner.runnable.insert(tid);
+    }
+
+    /// Remove a thread from all sets (on exit).
+    pub fn remove_thread(&self, tid: i32) {
+        let mut inner = self.inner.lock();
+        inner.runnable.remove(&tid);
+        inner.blocked.remove(&tid);
+        if inner.current_tid == tid {
+            inner.current_tid = 0;
+        }
+    }
+
+    /// Release the run token after a syscall completes. The caller must
+    /// hold the token (current_tid == tid).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `tid` does not match the current token holder.
+    pub fn release_token(&self, tid: i32) {
+        let mut inner = self.inner.lock();
+        assert_eq!(inner.current_tid, tid, "release_token: tid mismatch");
+        inner.current_tid = 0;
+    }
+
+    /// Wait until this thread is granted the run token.
+    /// Returns false if the coordinator has been shut down.
+    pub fn acquire_token(&self, tid: i32) -> bool {
+        loop {
+            {
+                let inner = self.inner.lock();
+                if inner.shutdown {
+                    return false;
+                }
+                if inner.current_tid == tid {
+                    return true;
+                }
+            }
+            // Spin-wait: hint the CPU that we're in a busy loop.
+            // In the litebox no_std context there is no condvar available,
+            // so spin_loop is the best we can do.
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Grant the token to a specific thread (used by replay coordinator).
+    ///
+    /// # Panics
+    ///
+    /// Panics if another thread already holds the token.
+    pub fn grant_token(&self, tid: i32) {
+        let mut inner = self.inner.lock();
+        assert_eq!(inner.current_tid, 0, "grant_token: token already held");
+        inner.current_tid = tid;
+    }
+
+    /// Pick the next runnable thread and grant it the token.
+    /// Used during recording (any runnable thread is fine).
+    /// Returns the tid that was granted, or 0 if no threads are runnable.
+    ///
+    /// # Panics
+    ///
+    /// Panics if another thread already holds the token.
+    pub fn grant_next_runnable(&self) -> i32 {
+        let mut inner = self.inner.lock();
+        assert_eq!(inner.current_tid, 0, "grant_next: token already held");
+        if let Some(&tid) = inner.runnable.iter().next() {
+            inner.current_tid = tid;
+            tid
+        } else {
+            0
+        }
+    }
+
+    /// Move a thread from runnable to blocked (entering a blocking syscall).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `tid` does not match the current token holder.
+    pub fn enter_blocking(&self, tid: i32) {
+        let mut inner = self.inner.lock();
+        assert_eq!(inner.current_tid, tid, "enter_blocking: not token holder");
+        inner.runnable.remove(&tid);
+        inner.blocked.insert(tid);
+        inner.current_tid = 0;
+    }
+
+    /// Move a thread from blocked to runnable (woke up from blocking syscall).
+    pub fn exit_blocking(&self, tid: i32) {
+        let mut inner = self.inner.lock();
+        inner.blocked.remove(&tid);
+        inner.runnable.insert(tid);
+    }
+
+    /// Signal all threads to shut down.
+    pub fn shutdown(&self) {
+        let mut inner = self.inner.lock();
+        inner.shutdown = true;
+    }
+
+    /// Check if shutdown has been requested.
+    pub fn is_shutdown(&self) -> bool {
+        self.inner.lock().shutdown
     }
 }
 

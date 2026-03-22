@@ -612,7 +612,7 @@ impl<FS: ShimFS> Task<FS> {
         let result_i64 = return_value as isize as i64;
         self.global
             .rr_state
-            .record_event(syscall_nr, result_i64, data);
+            .record_event(syscall_nr, result_i64, data, 0, litebox_rr::EventKind::Complete);
     }
 
     /// Replay mode: structural syscalls (memory management, process lifecycle,

@@ -88,7 +88,7 @@ impl<FS: ShimFS> Task<FS> {
                     if !crate::rr::is_synchronous_signal(signal) {
                         self.global
                             .rr_state
-                            .record_signal(signal.as_i32(), alloc::vec![]);
+                            .record_signal(signal.as_i32(), alloc::vec![], 0);
                     }
                 }
             }

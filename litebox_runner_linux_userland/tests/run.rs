@@ -782,3 +782,34 @@ fn test_rr_record_replay_mmap() {
         .runner_arg(&trace_path)
         .run();
 }
+
+/// Record a multithreaded test program (spawns 2 threads, shared atomic
+/// counter, join), replay it, and verify successful completion.
+#[cfg(feature = "rr")]
+#[test]
+fn test_rr_record_replay_threads() {
+    let unique_name = "threads_rr";
+    let target = common::compile_with_extra_args(
+        "./tests/threads_rr.c",
+        unique_name,
+        true,
+        false,
+        &["-lpthread"],
+    );
+    let dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    let trace_path = dir.join("threads_rr.trace");
+
+    // --- Record ---
+    Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_record"))
+        .runner_arg("--rr-record")
+        .runner_arg(&trace_path)
+        .run();
+
+    assert!(trace_path.exists(), "trace file was not created");
+
+    // --- Replay ---
+    Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_replay"))
+        .runner_arg("--rr-replay")
+        .runner_arg(&trace_path)
+        .run();
+}

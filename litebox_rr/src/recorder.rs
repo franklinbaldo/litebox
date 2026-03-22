@@ -3,7 +3,7 @@
 
 //! Recorder — accumulates syscall events into an in-memory trace buffer.
 
-use crate::trace::{Event, TRACE_MAGIC, TRACE_VERSION, TraceArch, TraceHeader};
+use crate::trace::{Event, EventKind, TraceArch, TraceHeader, TRACE_MAGIC, TRACE_VERSION};
 use alloc::vec::Vec;
 
 /// Records syscall events into an in-memory byte buffer.
@@ -35,16 +35,35 @@ impl Recorder {
         }
     }
 
-    /// Record a syscall event. `data` is the side-effect bytes (empty if none).
-    pub fn record(&mut self, syscall_nr: u32, result: i64, data: Vec<u8>) {
+    /// Record a syscall event.
+    ///
+    /// `data` is the side-effect bytes (empty if none). `tid` identifies the
+    /// thread that produced this event. `kind` indicates whether the event is a
+    /// complete syscall, a blocking entry/exit pair, or a signal delivery.
+    pub fn record(
+        &mut self,
+        syscall_nr: u32,
+        result: i64,
+        data: Vec<u8>,
+        tid: u32,
+        kind: EventKind,
+    ) {
         let event = Event {
             event_id: self.next_event_id,
             syscall_nr,
             result,
             data,
+            tid,
+            kind,
         };
         self.buffer.extend_from_slice(&event.to_bytes());
         self.next_event_id += 1;
+    }
+
+    /// Record a syscall event with default `tid=0` and `kind=Complete`.
+    /// Convenience for single-threaded recording.
+    pub fn record_simple(&mut self, syscall_nr: u32, result: i64, data: Vec<u8>) {
+        self.record(syscall_nr, result, data, 0, EventKind::Complete);
     }
 
     /// Return the number of events recorded so far.
@@ -78,9 +97,9 @@ mod tests {
     #[test]
     fn test_recorder_records_events() {
         let mut recorder = Recorder::new(TraceArch::X86);
-        recorder.record(0, 5, alloc::vec![1, 2, 3, 4, 5]);
-        recorder.record(1, -1, alloc::vec![]);
-        recorder.record(60, 0, alloc::vec![0xAB]);
+        recorder.record(0, 5, alloc::vec![1, 2, 3, 4, 5], 0, EventKind::Complete);
+        recorder.record(1, -1, alloc::vec![], 0, EventKind::Complete);
+        recorder.record(60, 0, alloc::vec![0xAB], 0, EventKind::Complete);
 
         let bytes = recorder.finish();
 
@@ -95,6 +114,8 @@ mod tests {
         assert_eq!(ev0.syscall_nr, 0);
         assert_eq!(ev0.result, 5);
         assert_eq!(ev0.data, alloc::vec![1, 2, 3, 4, 5]);
+        assert_eq!(ev0.tid, 0);
+        assert_eq!(ev0.kind, EventKind::Complete);
 
         // Parse event 1
         let (ev1, consumed) = Event::from_bytes(&bytes[offset..]).unwrap();
@@ -120,11 +141,11 @@ mod tests {
     fn test_recorder_event_count() {
         let mut recorder = Recorder::new(TraceArch::X86_64);
         assert_eq!(recorder.event_count(), 0);
-        recorder.record(0, 0, alloc::vec![]);
+        recorder.record(0, 0, alloc::vec![], 0, EventKind::Complete);
         assert_eq!(recorder.event_count(), 1);
-        recorder.record(1, 0, alloc::vec![]);
+        recorder.record(1, 0, alloc::vec![], 0, EventKind::Complete);
         assert_eq!(recorder.event_count(), 2);
-        recorder.record(2, 0, alloc::vec![]);
+        recorder.record(2, 0, alloc::vec![], 0, EventKind::Complete);
         assert_eq!(recorder.event_count(), 3);
     }
 }

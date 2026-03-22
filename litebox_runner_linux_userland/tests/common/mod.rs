@@ -131,6 +131,68 @@ pub fn compile(src_path: &str, unique_name: &str, exec_or_lib: bool, nolibc: boo
     path
 }
 
+/// Compile a C source file with additional GCC arguments (e.g., `-lpthread`).
+pub fn compile_with_extra_args(
+    src_path: &str,
+    unique_name: &str,
+    exec_or_lib: bool,
+    nolibc: bool,
+    extra_args: &[&str],
+) -> PathBuf {
+    let dir_path = std::env::var("OUT_DIR").unwrap();
+    let path = std::path::Path::new(dir_path.as_str()).join(unique_name);
+    let output = path.to_str().unwrap();
+
+    let mut args = vec!["-o", output, src_path];
+    if exec_or_lib {
+        args.push("-static");
+    }
+    if nolibc {
+        args.push("-nostdlib");
+    }
+    args.push(match std::env::consts::ARCH {
+        "x86_64" => "-m64",
+        "x86" => "-m32",
+        _ => unimplemented!(),
+    });
+    for arg in extra_args {
+        args.push(arg);
+    }
+
+    // Create command string for caching
+    let mut command_parts = vec!["gcc"];
+    command_parts.extend_from_slice(&args);
+    let command = command_parts.join(" ");
+
+    // Check cache first
+    let src_path_buf = Path::new(src_path);
+    let input_paths = vec![src_path_buf];
+
+    if let Ok(true) = crate::cache::is_cached_and_valid(&input_paths, &path, &command) {
+        println!("Using cached compilation result for: {unique_name}");
+        return path;
+    }
+
+    println!("Compiling: {src_path} -> {unique_name}");
+
+    let output = std::process::Command::new("gcc")
+        .args(args)
+        .output()
+        .expect("Failed to compile");
+    assert!(
+        output.status.success(),
+        "failed to compile: {:?}",
+        std::str::from_utf8(output.stderr.as_slice()).unwrap()
+    );
+
+    // Create cache entry after successful compilation
+    if let Err(e) = crate::cache::create_cache_entry(&input_paths, &path, &command) {
+        eprintln!("Warning: Failed to create cache entry for {unique_name}: {e}");
+    }
+
+    path
+}
+
 /// Run syscall rewriter with caching
 pub fn rewrite_with_cache(input_path: &Path, output_path: &Path, extra_args: &[&str]) -> bool {
     // Include both the input file and all rewriter source files in the cache key

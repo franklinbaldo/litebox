@@ -12,11 +12,38 @@ use alloc::vec::Vec;
 pub const TRACE_MAGIC: [u8; 4] = *b"LBRR";
 
 /// Current trace format version.
-pub const TRACE_VERSION: u32 = 1;
+pub const TRACE_VERSION: u32 = 2;
 
 /// Sentinel syscall number used for signal delivery events in the trace.
 /// This is well outside the range of real Linux syscall numbers.
 pub const SIGNAL_DELIVERY_NR: u32 = 0xFFFF_FFFE;
+
+/// The kind of a trace event.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(u8)]
+pub enum EventKind {
+    /// Non-blocking syscall completed in a single event.
+    Complete = 0,
+    /// Blocking syscall entered; run token released. `result` field is unused.
+    Entry = 1,
+    /// Blocking syscall resumed; run token reacquired. `result` + side-effects captured.
+    Exit = 2,
+    /// Async signal delivery event.
+    Signal = 3,
+}
+
+impl EventKind {
+    /// Convert a raw byte to an [`EventKind`].
+    pub fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(Self::Complete),
+            1 => Some(Self::Entry),
+            2 => Some(Self::Exit),
+            3 => Some(Self::Signal),
+            _ => None,
+        }
+    }
+}
 
 /// Errors that can occur when decoding trace data.
 #[derive(Debug, Clone, PartialEq)]
@@ -29,6 +56,8 @@ pub enum TraceError {
     UnsupportedVersion(u32),
     /// Invalid architecture byte.
     InvalidArch(u8),
+    /// Invalid event kind byte.
+    InvalidEventKind(u8),
 }
 
 /// Target architecture recorded in the trace header.
@@ -107,7 +136,7 @@ impl TraceHeader {
         }
 
         let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-        if version != TRACE_VERSION {
+        if version != 1 && version != 2 {
             return Err(TraceError::UnsupportedVersion(version));
         }
 
@@ -126,13 +155,16 @@ impl TraceHeader {
 
 /// A single recorded syscall event.
 ///
-/// Wire format (24 + `data_len` bytes):
+/// Wire format (32 + `data_len` bytes):
 /// ```text
 /// [0..8]              event_id:   u64 LE
 /// [8..12]             syscall_nr: u32 LE
 /// [12..20]            result:     i64 LE
 /// [20..24]            data_len:   u32 LE
-/// [24..24+data_len]   data:       [u8]
+/// [24..28]            tid:        u32 LE
+/// [28]                kind:       u8
+/// [29..32]            pad:        [u8; 3] (zero)
+/// [32..32+data_len]   data:       [u8]
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct Event {
@@ -145,10 +177,14 @@ pub struct Event {
     /// Side-effect data written to guest memory by this syscall (e.g., bytes
     /// from `read()`). Empty for syscalls that don't produce output data.
     pub data: Vec<u8>,
+    /// Thread ID of the thread that produced this event.
+    pub tid: u32,
+    /// Kind of event (complete, entry, exit, signal).
+    pub kind: EventKind,
 }
 
 /// Size of the fixed portion of a serialized [`Event`] (excluding variable-length data).
-const EVENT_FIXED_SIZE: usize = 24;
+const EVENT_FIXED_SIZE: usize = 32;
 
 impl Event {
     /// Serialize this event to bytes.
@@ -168,6 +204,9 @@ impl Event {
         buf.extend_from_slice(&self.syscall_nr.to_le_bytes());
         buf.extend_from_slice(&self.result.to_le_bytes());
         buf.extend_from_slice(&data_len.to_le_bytes());
+        buf.extend_from_slice(&self.tid.to_le_bytes());
+        buf.push(self.kind as u8);
+        buf.extend_from_slice(&[0u8; 3]); // padding
         buf.extend_from_slice(&self.data);
         buf
     }
@@ -188,6 +227,9 @@ impl Event {
         let syscall_nr = u32::from_le_bytes(data[8..12].try_into().unwrap());
         let result = i64::from_le_bytes(data[12..20].try_into().unwrap());
         let data_len = u32::from_le_bytes(data[20..24].try_into().unwrap()) as usize;
+        let tid = u32::from_le_bytes(data[24..28].try_into().unwrap());
+        let kind = EventKind::from_byte(data[28]).ok_or(TraceError::InvalidEventKind(data[28]))?;
+        // bytes [29..32] are padding, skip them
 
         let total = EVENT_FIXED_SIZE + data_len;
         if data.len() < total {
@@ -202,6 +244,8 @@ impl Event {
                 syscall_nr,
                 result,
                 data: payload,
+                tid,
+                kind,
             },
             total,
         ))
@@ -232,6 +276,8 @@ mod tests {
             syscall_nr: 0,
             result: 5,
             data: alloc::vec![1, 2, 3, 4, 5],
+            tid: 0,
+            kind: EventKind::Complete,
         };
         let bytes = event.to_bytes();
         let (decoded, consumed) = Event::from_bytes(&bytes).unwrap();
@@ -246,6 +292,8 @@ mod tests {
             syscall_nr: 60,
             result: 0,
             data: alloc::vec![],
+            tid: 0,
+            kind: EventKind::Complete,
         };
         let bytes = event.to_bytes();
         let (decoded, consumed) = Event::from_bytes(&bytes).unwrap();
@@ -272,5 +320,37 @@ mod tests {
         let bytes = [0u8; 4]; // Too short for a header.
         let err = TraceHeader::from_bytes(&bytes).unwrap_err();
         assert_eq!(err, TraceError::UnexpectedEof);
+    }
+
+    #[test]
+    fn test_event_kind_roundtrip() {
+        for (byte, expected) in [
+            (0u8, EventKind::Complete),
+            (1, EventKind::Entry),
+            (2, EventKind::Exit),
+            (3, EventKind::Signal),
+        ] {
+            assert_eq!(EventKind::from_byte(byte), Some(expected));
+        }
+        assert_eq!(EventKind::from_byte(4), None);
+        assert_eq!(EventKind::from_byte(255), None);
+    }
+
+    #[test]
+    fn test_event_with_tid_and_kind() {
+        let event = Event {
+            event_id: 10,
+            syscall_nr: 202, // futex
+            result: 0,
+            data: alloc::vec![],
+            tid: 42,
+            kind: EventKind::Entry,
+        };
+        let bytes = event.to_bytes();
+        let (decoded, consumed) = Event::from_bytes(&bytes).unwrap();
+        assert_eq!(consumed, EVENT_FIXED_SIZE);
+        assert_eq!(decoded.tid, 42);
+        assert_eq!(decoded.kind, EventKind::Entry);
+        assert_eq!(decoded, event);
     }
 }
