@@ -112,6 +112,54 @@ impl RRState {
             .as_mut()
             .map(|r| core::mem::replace(r.get_mut(), Recorder::new(current_arch())).finish())
     }
+
+    /// Take the recorded trace data without consuming the RR state.
+    ///
+    /// Returns `None` if not in recording mode. After this call the
+    /// recorder is replaced with a fresh one (so subsequent syscalls
+    /// would start a new, empty trace).
+    pub fn take_trace(&self) -> Option<Vec<u8>> {
+        self.recorder.as_ref().map(|r| {
+            let mut guard = r.lock();
+            core::mem::replace(&mut *guard, Recorder::new(current_arch())).finish()
+        })
+    }
+
+    /// Record a signal delivery event during recording mode.
+    ///
+    /// `signal_nr` is the signal number (e.g., 14 for SIGALRM).
+    /// `siginfo_bytes` is the raw `Siginfo` struct serialized as bytes.
+    pub fn record_signal(&self, signal_nr: i32, siginfo_bytes: Vec<u8>) {
+        if let Some(ref recorder) = self.recorder {
+            recorder.lock().record(
+                litebox_rr::SIGNAL_DELIVERY_NR,
+                i64::from(signal_nr),
+                siginfo_bytes,
+            );
+        }
+    }
+
+    /// During replay, check if the next trace event is a signal delivery.
+    pub fn peek_is_signal(&self) -> bool {
+        self.replayer
+            .as_ref()
+            .is_some_and(|r| r.lock().peek_event_nr() == Some(litebox_rr::SIGNAL_DELIVERY_NR))
+    }
+
+    /// During replay, consume the next signal event from the trace.
+    /// Returns `(signal_nr, siginfo_bytes)`.
+    pub fn replay_signal(&self) -> Result<(i32, Vec<u8>), litebox_rr::ReplayError> {
+        if let Some(ref replayer) = self.replayer {
+            let event = replayer
+                .lock()
+                .expect_event(litebox_rr::SIGNAL_DELIVERY_NR)?;
+            #[allow(clippy::cast_possible_truncation)]
+            let signal_nr = event.result as i32;
+            Ok((signal_nr, event.data))
+        } else {
+            Err(litebox_rr::ReplayError::EndOfTrace)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +227,55 @@ mod nr {
     #[cfg(target_arch = "x86")]
     pub const FSTATAT64: u32 = Sysno::fstatat64.id() as u32;
     pub const TIME: u32 = Sysno::time.id() as u32;
+}
+
+/// Returns `true` if the signal is synchronous (caused deterministically by
+/// an instruction) and does not need recording. These signals will re-trigger
+/// naturally during replay from the same faulting instruction.
+pub fn is_synchronous_signal(signal: litebox_common_linux::signal::Signal) -> bool {
+    use litebox_common_linux::signal::Signal;
+    matches!(
+        signal,
+        Signal::SIGSEGV | Signal::SIGBUS | Signal::SIGFPE | Signal::SIGILL | Signal::SIGTRAP
+    )
+}
+
+/// Returns `true` if this syscall is nondeterministic and should be
+/// recorded / replayed from the trace rather than re-executed.
+///
+/// Deterministic or structural syscalls (memory management, I/O output,
+/// process lifecycle, etc.) are always executed normally even during replay.
+pub fn is_nondeterministic(syscall_nr: u32) -> bool {
+    matches!(
+        syscall_nr,
+        nr::READ
+            | nr::PREAD64
+            | nr::READV
+            | nr::GETRANDOM
+            | nr::CLOCK_GETTIME
+            | nr::GETTIMEOFDAY
+            | nr::TIME
+            | nr::FSTAT
+            | nr::GETCWD
+            | nr::UNAME
+            | nr::PIPE2
+            | nr::SYSINFO
+            | nr::GETDENTS64
+            | nr::READLINKAT
+    ) || is_nondeterministic_arch(syscall_nr)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn is_nondeterministic_arch(syscall_nr: u32) -> bool {
+    matches!(
+        syscall_nr,
+        nr::STAT | nr::LSTAT | nr::READLINK | nr::NEWFSTATAT
+    )
+}
+
+#[cfg(target_arch = "x86")]
+fn is_nondeterministic_arch(syscall_nr: u32) -> bool {
+    matches!(syscall_nr, nr::FSTATAT64)
 }
 
 /// Read `len` bytes from guest memory at the given address.

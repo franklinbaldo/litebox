@@ -77,6 +77,30 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub program_from_tar: bool,
+    /// Record a trace of all syscalls to the given file path.
+    /// On exit, the trace is written to this file.
+    #[cfg(feature = "rr")]
+    #[arg(
+        long = "rr-record",
+        value_name = "TRACE_PATH",
+        value_hint = clap::ValueHint::FilePath,
+        conflicts_with = "rr_replay",
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
+    pub rr_record: Option<PathBuf>,
+    /// Replay execution from a previously recorded trace file.
+    /// The program runs but all syscall results come from the trace.
+    #[cfg(feature = "rr")]
+    #[arg(
+        long = "rr-replay",
+        value_name = "TRACE_PATH",
+        value_hint = clap::ValueHint::FilePath,
+        conflicts_with = "rr_record",
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
+    pub rr_replay: Option<PathBuf>,
 }
 
 /// Backends supported for intercepting syscalls
@@ -350,6 +374,16 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let initial_file_system = std::sync::Arc::new(initial_file_system);
 
     shim_builder.set_load_filter(fixup_env);
+    #[cfg(feature = "rr")]
+    {
+        if cli_args.rr_record.is_some() {
+            shim_builder.set_rr_record();
+        } else if let Some(ref trace_path) = cli_args.rr_replay {
+            let trace_data =
+                std::fs::read(trace_path).map_err(|e| anyhow!("failed to read trace file: {e}"))?;
+            shim_builder.set_rr_replay(trace_data);
+        }
+    }
     let shim = shim_builder.build();
 
     let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
@@ -453,6 +487,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     if let Some(net_worker) = net_worker {
         shutdown.store(true, core::sync::atomic::Ordering::Relaxed);
         net_worker.join().unwrap();
+    }
+    #[cfg(feature = "rr")]
+    if let Some(ref trace_path) = cli_args.rr_record
+        && let Some(trace_data) = shim.take_rr_trace()
+    {
+        std::fs::write(trace_path, &trace_data)
+            .unwrap_or_else(|e| eprintln!("failed to write trace: {e}"));
     }
     std::process::exit(program.process.wait())
 }

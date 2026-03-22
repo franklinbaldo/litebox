@@ -265,6 +265,14 @@ impl<FS: ShimFS> LinuxShim<FS> {
             .and_then(|global| global.rr_state.finish_recording())
     }
 
+    /// Take the recorded trace data without consuming the `LinuxShim`.
+    ///
+    /// Returns `None` if the shim was not in recording mode.
+    #[cfg(feature = "rr")]
+    pub fn take_rr_trace(&self) -> Option<Vec<u8>> {
+        self.0.rr_state.take_trace()
+    }
+
     /// Loads the program at `path` as the shim's initial task, returning the
     /// initial register state.
     pub fn load_program(
@@ -581,7 +589,8 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
-    /// Record mode: execute the syscall normally, then capture side-effects.
+    /// Record mode: execute the syscall normally, then capture side-effects
+    /// for nondeterministic syscalls.
     #[cfg(feature = "rr")]
     fn handle_syscall_request_record(&self, ctx: &mut litebox_common_linux::PtRegs) {
         let syscall_nr = rr::get_syscall_nr(ctx);
@@ -595,21 +604,32 @@ impl<FS: ShimFS> Task<FS> {
         // Write return value to guest context.
         rr::set_return_value(ctx, return_value);
 
-        // Capture any side-effect data written to guest memory.
-        let data = rr::capture_side_effects(syscall_nr, ctx, return_value);
+        // Only record nondeterministic syscalls.
+        if rr::is_nondeterministic(syscall_nr) {
+            // Capture any side-effect data written to guest memory.
+            let data = rr::capture_side_effects(syscall_nr, ctx, return_value);
 
-        // Record the event. The return value as i64 preserves negative errno encoding.
-        #[allow(clippy::cast_possible_wrap)]
-        let result_i64 = return_value as isize as i64;
-        self.global
-            .rr_state
-            .record_event(syscall_nr, result_i64, data);
+            // Record the event. The return value as i64 preserves negative errno encoding.
+            #[allow(clippy::cast_possible_wrap)]
+            let result_i64 = return_value as isize as i64;
+            self.global
+                .rr_state
+                .record_event(syscall_nr, result_i64, data);
+        }
     }
 
-    /// Replay mode: skip the real syscall, inject recorded return value and data.
+    /// Replay mode: for nondeterministic syscalls, inject recorded return value
+    /// and data instead of executing the real syscall. All other syscalls
+    /// (memory management, output, process lifecycle, etc.) execute normally.
     #[cfg(feature = "rr")]
     fn handle_syscall_request_replay(&self, ctx: &mut litebox_common_linux::PtRegs) {
         let syscall_nr = rr::get_syscall_nr(ctx);
+
+        if !rr::is_nondeterministic(syscall_nr) {
+            // Deterministic / structural syscall — execute normally.
+            self.handle_syscall_request_normal(ctx);
+            return;
+        }
 
         match self.global.rr_state.replay_event(syscall_nr) {
             Ok(event) => {

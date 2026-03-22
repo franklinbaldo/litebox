@@ -11,6 +11,7 @@ litebox = { version = "0.1.0", path = "../litebox" }
 litebox_common_linux = { version = "0.1.0", path = "../litebox_common_linux" }
 litebox_platform_linux_userland = { version = "0.1.0", path = "../litebox_platform_linux_userland" }
 litebox_platform_multiplex = { version = "0.1.0", path = "../litebox_platform_multiplex", default-features = false, features = ["platform_linux_userland", "systrap_backend"] }
+litebox_rr = { path = "../litebox_rr/", version = "0.1.0", optional = true }
 litebox_shim_linux = { version = "0.1.0", path = "../litebox_shim_linux" }
 litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewriter" }
 memmap2 = "0.9.8"
@@ -22,6 +23,7 @@ glob = "0.3"
 
 [features]
 lock_tracing = ["litebox/lock_tracing"]
+rr = ["dep:litebox_rr", "litebox_shim_linux/rr"]
 
 [lints]
 workspace = true

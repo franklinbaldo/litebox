@@ -134,6 +134,13 @@ impl Runner {
         self
     }
 
+    /// Add a raw argument to the runner command (before the program path).
+    #[cfg_attr(not(feature = "rr"), expect(dead_code))]
+    fn runner_arg(&mut self, arg: impl AsRef<std::ffi::OsStr>) -> &mut Self {
+        self.command.arg(arg);
+        self
+    }
+
     fn tun_device_name(&mut self, tun_name: &str) -> &mut Self {
         self.command.arg("--tun-device-name").arg(tun_name);
         self
@@ -631,4 +638,114 @@ fn test_tun_with_curl() {
 
     let output_str = String::from_utf8_lossy(&output);
     assert!(output_str.contains(RESPONSE_BODY), "Unexpected curl output");
+}
+
+// ---------- Record-and-Replay integration tests ----------
+
+/// Record a statically-linked hello program, then replay it and assert that
+/// both runs produce identical stdout output.
+#[cfg(feature = "rr")]
+#[test]
+fn test_rr_record_replay_hello() {
+    let unique_name = "hello_rr";
+    let target = common::compile("./tests/hello.c", unique_name, true, false);
+    let dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    let trace_path = dir.join("hello_rr.trace");
+
+    // --- Record ---
+    let record_output = Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_record"))
+        .runner_arg("--rr-record")
+        .runner_arg(&trace_path)
+        .output();
+
+    assert!(
+        trace_path.exists(),
+        "trace file was not created at {}",
+        trace_path.display()
+    );
+    let trace_len = std::fs::metadata(&trace_path).unwrap().len();
+    assert!(trace_len > 0, "trace file is empty ({trace_len} bytes)");
+
+    // --- Replay ---
+    let replay_output = Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_replay"))
+        .runner_arg("--rr-replay")
+        .runner_arg(&trace_path)
+        .output();
+
+    // --- Compare ---
+    let record_str = String::from_utf8_lossy(&record_output);
+    let replay_str = String::from_utf8_lossy(&replay_output);
+    assert_eq!(
+        record_str, replay_str,
+        "Record and replay stdout differ.\n--- Record ---\n{record_str}\n--- Replay ---\n{replay_str}"
+    );
+}
+
+/// Record the signal test program (exercises SIGSEGV handler + recovery),
+/// replay it, and verify identical stdout output. SIGSEGV is synchronous so
+/// it re-triggers deterministically — this validates that signal handling
+/// doesn't break under RR mode.
+#[cfg(feature = "rr")]
+#[test]
+fn test_rr_record_replay_signal() {
+    let unique_name = "signal_rr";
+    let target = common::compile("./tests/signal.c", unique_name, true, false);
+    let dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    let trace_path = dir.join("signal_rr.trace");
+
+    // --- Record ---
+    let record_output = Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_record"))
+        .runner_arg("--rr-record")
+        .runner_arg(&trace_path)
+        .output();
+
+    assert!(trace_path.exists(), "trace file was not created");
+
+    // --- Replay ---
+    let replay_output = Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_replay"))
+        .runner_arg("--rr-replay")
+        .runner_arg(&trace_path)
+        .output();
+
+    // --- Compare ---
+    let record_str = String::from_utf8_lossy(&record_output);
+    let replay_str = String::from_utf8_lossy(&replay_output);
+    assert_eq!(
+        record_str, replay_str,
+        "Record and replay stdout differ.\n--- Record ---\n{record_str}\n--- Replay ---\n{replay_str}"
+    );
+}
+
+/// Record the sigint test program (exercises self-directed SIGINT via
+/// raise/kill, blocking/unblocking, and signal coalescing), replay it,
+/// and verify identical stdout output.
+#[cfg(feature = "rr")]
+#[test]
+fn test_rr_record_replay_sigint() {
+    let unique_name = "sigint_rr";
+    let target = common::compile("./tests/sigint.c", unique_name, true, false);
+    let dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    let trace_path = dir.join("sigint_rr.trace");
+
+    // --- Record ---
+    let record_output = Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_record"))
+        .runner_arg("--rr-record")
+        .runner_arg(&trace_path)
+        .output();
+
+    assert!(trace_path.exists(), "trace file was not created");
+
+    // --- Replay ---
+    let replay_output = Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_replay"))
+        .runner_arg("--rr-replay")
+        .runner_arg(&trace_path)
+        .output();
+
+    // --- Compare ---
+    let record_str = String::from_utf8_lossy(&record_output);
+    let replay_str = String::from_utf8_lossy(&replay_output);
+    assert_eq!(
+        record_str, replay_str,
+        "Record and replay stdout differ.\n--- Record ---\n{record_str}\n--- Replay ---\n{replay_str}"
+    );
 }

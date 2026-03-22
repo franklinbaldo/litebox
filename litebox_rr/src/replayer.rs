@@ -96,6 +96,27 @@ impl Replayer {
     pub fn is_exhausted(&self) -> bool {
         self.offset >= self.data.len()
     }
+
+    /// Peek at the `syscall_nr` of the next event without consuming it.
+    /// Returns `None` if the trace is exhausted.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying slice conversion fails (should not happen when
+    /// the bounds check above succeeds).
+    pub fn peek_event_nr(&self) -> Option<u32> {
+        if self.offset >= self.data.len() {
+            return None;
+        }
+        // syscall_nr is at bytes [8..12] within the event (after event_id).
+        let start = self.offset + 8;
+        if start + 4 > self.data.len() {
+            return None;
+        }
+        Some(u32::from_le_bytes(
+            self.data[start..start + 4].try_into().unwrap(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -170,6 +191,33 @@ mod tests {
                 actual_syscall_nr: 99,
             }
         );
+    }
+
+    #[test]
+    fn test_replayer_peek_event_nr() {
+        let mut recorder = Recorder::new(TraceArch::X86_64);
+        recorder.record(42, 0, alloc::vec![]);
+        recorder.record(crate::SIGNAL_DELIVERY_NR, 14, alloc::vec![0xAA; 128]);
+        recorder.record(99, 1, alloc::vec![]);
+        let bytes = recorder.finish();
+
+        let mut replayer = Replayer::from_bytes(bytes).unwrap();
+
+        // Peek should show 42 without consuming
+        assert_eq!(replayer.peek_event_nr(), Some(42));
+        assert_eq!(replayer.peek_event_nr(), Some(42)); // idempotent
+        let _ = replayer.next_event().unwrap(); // consume
+
+        // Peek should show signal sentinel
+        assert_eq!(replayer.peek_event_nr(), Some(crate::SIGNAL_DELIVERY_NR));
+        let _ = replayer.next_event().unwrap(); // consume
+
+        // Peek should show 99
+        assert_eq!(replayer.peek_event_nr(), Some(99));
+        let _ = replayer.next_event().unwrap(); // consume
+
+        // Exhausted
+        assert_eq!(replayer.peek_event_nr(), None);
     }
 
     #[test]

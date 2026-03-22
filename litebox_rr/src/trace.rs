@@ -14,6 +14,10 @@ pub const TRACE_MAGIC: [u8; 4] = *b"LBRR";
 /// Current trace format version.
 pub const TRACE_VERSION: u32 = 1;
 
+/// Sentinel syscall number used for signal delivery events in the trace.
+/// This is well outside the range of real Linux syscall numbers.
+pub const SIGNAL_DELIVERY_NR: u32 = 0xFFFF_FFFE;
+
 /// Errors that can occur when decoding trace data.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TraceError {
