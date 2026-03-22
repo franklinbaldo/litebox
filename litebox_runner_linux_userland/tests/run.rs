@@ -755,3 +755,30 @@ fn test_rr_record_replay_alarm() {
         .runner_arg(&trace_path)
         .run();
 }
+
+/// Record the mmap test program (exercises mmap address determinism with
+/// cross-mapping pointer dereferences and linked lists through mappings),
+/// replay it, and verify successful completion. During replay, mmap uses
+/// MAP_FIXED to force the recorded addresses, so pointer chains remain valid.
+#[cfg(feature = "rr")]
+#[test]
+fn test_rr_record_replay_mmap() {
+    let unique_name = "mmap_rr";
+    let target = common::compile("./tests/mmap_rr.c", unique_name, true, false);
+    let dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    let trace_path = dir.join("mmap_rr.trace");
+
+    // --- Record ---
+    Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_record"))
+        .runner_arg("--rr-record")
+        .runner_arg(&trace_path)
+        .run();
+
+    assert!(trace_path.exists(), "trace file was not created");
+
+    // --- Replay (write is skipped, so no stdout — just verify exit code) ---
+    Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_replay"))
+        .runner_arg("--rr-replay")
+        .runner_arg(&trace_path)
+        .run();
+}

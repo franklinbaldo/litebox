@@ -623,6 +623,16 @@ impl<FS: ShimFS> Task<FS> {
         let syscall_nr = rr::get_syscall_nr(ctx);
 
         if rr::is_structural(syscall_nr) {
+            // For mmap, we need to force the recorded address so that the
+            // mapping lands at exactly the same virtual address as during
+            // recording. Peek at the trace to get the recorded return value
+            // and patch the registers to use MAP_FIXED at that address.
+            if syscall_nr == rr::nr_pub::MMAP
+                && let Some(recorded_result) = self.global.rr_state.peek_event_result()
+            {
+                rr::patch_mmap_for_replay(ctx, recorded_result);
+            }
+
             // Structural syscall — execute normally, but still consume
             // the trace event to keep the replay cursor in sync.
             self.handle_syscall_request_normal(ctx);

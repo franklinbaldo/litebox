@@ -15,6 +15,12 @@ use crate::{MutPtr, Platform};
 
 type Mutex<T> = litebox::sync::Mutex<Platform, T>;
 
+/// Public re-exports of syscall number constants needed by the dispatch logic
+/// in `lib.rs`.
+pub mod nr_pub {
+    pub use super::nr::MMAP;
+}
+
 /// The record-replay operating mode.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RRMode {
@@ -147,6 +153,14 @@ impl RRState {
         self.replayer
             .as_ref()
             .is_some_and(|r| r.lock().peek_event_nr() == Some(litebox_rr::SIGNAL_DELIVERY_NR))
+    }
+
+    /// During replay, peek at the result field of the next trace event
+    /// without consuming it. Returns `None` if the trace is exhausted.
+    pub fn peek_event_result(&self) -> Option<i64> {
+        self.replayer
+            .as_ref()
+            .and_then(|r| r.lock().peek_event_result())
     }
 
     /// During replay, consume the next signal event from the trace.
@@ -1433,4 +1447,52 @@ fn inject_sockaddr_from_tail(addr_addr: usize, addrlen_addr: usize, data: &[u8],
     write_guest_bytes(buf_addr, buf_bytes);
     write_guest_bytes(addr_addr, addr_bytes);
     write_guest_bytes(addrlen_addr, addrlen_bytes);
+}
+
+// ---------------------------------------------------------------------------
+// Replay address determinism for mmap
+// ---------------------------------------------------------------------------
+
+/// During replay, patch the register context for an `mmap` syscall so that the
+/// mapping lands at the same address as during recording. If the recorded
+/// result is a valid address (non-negative), we set `addr = recorded_address`
+/// and add `MAP_FIXED` to the flags.
+///
+/// Returns `true` if the context was patched, `false` if it was left unchanged
+/// (e.g., the recorded call returned an error).
+pub fn patch_mmap_for_replay(ctx: &mut litebox_common_linux::PtRegs, recorded_result: i64) -> bool {
+    // Negative result means the mmap failed during recording; don't force
+    // an address.
+    if recorded_result < 0 {
+        return false;
+    }
+
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let recorded_addr = recorded_result as usize;
+    if recorded_addr == 0 {
+        return false;
+    }
+
+    // Patch addr (arg0) to the recorded address.
+    #[cfg(target_arch = "x86_64")]
+    {
+        ctx.rdi = recorded_addr;
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        ctx.ebx = recorded_addr;
+    }
+
+    // Patch flags (arg3) to include MAP_FIXED and remove MAP_FIXED_NOREPLACE.
+    // MAP_FIXED = 0x10, MAP_FIXED_NOREPLACE = 0x100000
+    #[cfg(target_arch = "x86_64")]
+    {
+        ctx.r10 = (ctx.r10 | 0x10) & !0x10_0000;
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        ctx.esi = (ctx.esi | 0x10) & !0x10_0000;
+    }
+
+    true
 }

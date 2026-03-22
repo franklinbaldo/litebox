@@ -117,6 +117,27 @@ impl Replayer {
             self.data[start..start + 4].try_into().unwrap(),
         ))
     }
+
+    /// Peek at the `result` field of the next event without consuming it.
+    /// Returns `None` if the trace is exhausted.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying slice conversion fails (should not happen when
+    /// the bounds check above succeeds).
+    pub fn peek_event_result(&self) -> Option<i64> {
+        if self.offset >= self.data.len() {
+            return None;
+        }
+        // result is at bytes [12..20] within the event (after event_id + syscall_nr).
+        let start = self.offset + 12;
+        if start + 8 > self.data.len() {
+            return None;
+        }
+        Some(i64::from_le_bytes(
+            self.data[start..start + 8].try_into().unwrap(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -218,6 +239,28 @@ mod tests {
 
         // Exhausted
         assert_eq!(replayer.peek_event_nr(), None);
+    }
+
+    #[test]
+    fn test_replayer_peek_event_result() {
+        let mut recorder = Recorder::new(TraceArch::X86_64);
+        recorder.record(9, 0x7f00_0000_0000, alloc::vec![]); // mmap success
+        recorder.record(9, -12, alloc::vec![]); // mmap ENOMEM (-12)
+        let bytes = recorder.finish();
+
+        let mut replayer = Replayer::from_bytes(bytes).unwrap();
+
+        // Peek result of first event: 0x7f00_0000_0000
+        assert_eq!(replayer.peek_event_result(), Some(0x7f00_0000_0000));
+        assert_eq!(replayer.peek_event_result(), Some(0x7f00_0000_0000)); // idempotent
+        let _ = replayer.next_event().unwrap(); // consume
+
+        // Peek result of second event: -12
+        assert_eq!(replayer.peek_event_result(), Some(-12));
+        let _ = replayer.next_event().unwrap(); // consume
+
+        // Exhausted
+        assert_eq!(replayer.peek_event_result(), None);
     }
 
     #[test]
