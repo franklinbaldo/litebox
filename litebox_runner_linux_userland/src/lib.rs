@@ -158,7 +158,8 @@ fn mmapped_file(path: impl AsRef<Path>) -> Result<MmappedFile> {
 /// Can panic if any particulars of the environment are not set up as expected. Ideally, would not
 /// panic. If it does actually panic, then ping the authors of LiteBox, and likely a better error
 /// message could be thrown instead.
-pub fn run(cli_args: CliArgs) -> Result<()> {
+#[allow(unused_mut)] // `cli_args` is only mutated when the `rr` feature is active
+pub fn run(mut cli_args: CliArgs) -> Result<()> {
     if !cli_args.insert_files.is_empty() {
         unimplemented!(
             "this should (hopefully soon) have a nicer interface to support loading in files"
@@ -185,6 +186,38 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             cli_args.program_and_arguments[0]
         );
     }
+
+    // --- Replay metadata override ---
+    // When replaying, read the trace header early to extract metadata and
+    // override CLI args with the recorded values.  We keep the raw trace data
+    // so that it can be handed to `set_rr_replay()` later without a second read.
+    #[cfg(feature = "rr")]
+    let (rr_trace_data, replay_prog_path): (Option<Vec<u8>>, Option<String>) =
+        if let Some(ref trace_path) = cli_args.rr_replay {
+            let data =
+                std::fs::read(trace_path).map_err(|e| anyhow!("failed to read trace file: {e}"))?;
+            let (header, _) = litebox_rr::TraceHeader::from_bytes(&data)
+                .map_err(|e| anyhow!("invalid trace file: {e:?}"))?;
+            if let Some(meta) = header.metadata {
+                let prog_path_override = meta.program_path.clone();
+                cli_args.program_and_arguments = meta.argv;
+                cli_args.initial_files = meta.initial_files_path.map(PathBuf::from);
+                cli_args.program_from_tar = meta.program_from_tar;
+                // envp from metadata already includes forwarded vars that were
+                // present at record time, so disable forwarding.
+                cli_args.environment_variables = meta.envp;
+                cli_args.forward_environment_variables = false;
+                (Some(data), Some(prog_path_override))
+            } else {
+                eprintln!(
+                    "warning: trace file has no metadata (v2 format); \
+                     using CLI arguments for replay. Results may diverge."
+                );
+                (Some(data), None)
+            }
+        } else {
+            (None, None)
+        };
 
     let mut cow_eligible_regions: Vec<MmappedFile> = Vec::new();
 
@@ -382,6 +415,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         )
     })?;
 
+    // During replay with metadata, use the exact program_path that was recorded
+    // instead of re-resolving from argv[0].
+    #[cfg(feature = "rr")]
+    let prog_path = replay_prog_path.as_deref().unwrap_or(prog_path);
+
     let initial_file_system = std::sync::Arc::new(initial_file_system);
 
     shim_builder.set_load_filter(fixup_env);
@@ -413,9 +451,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                     .map(|p| p.display().to_string()),
                 program_from_tar: cli_args.program_from_tar,
             });
-        } else if let Some(ref trace_path) = cli_args.rr_replay {
+        } else if cli_args.rr_replay.is_some() {
+            // Trace data was already read and parsed during the early metadata
+            // override phase above; hand it to the shim without a second read.
             let trace_data =
-                std::fs::read(trace_path).map_err(|e| anyhow!("failed to read trace file: {e}"))?;
+                rr_trace_data.expect("rr_trace_data must be Some when rr_replay is set");
             shim_builder.set_rr_replay(trace_data);
             if cli_args.rr_replay_stdout {
                 shim_builder.set_rr_replay_stdout();

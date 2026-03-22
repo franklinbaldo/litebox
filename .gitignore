@@ -193,3 +193,5 @@ venv/
 dev_bench/unixbench/prepared/
 dev_bench/unixbench/byte-unixbench-*/
 dev_bench/unixbench/*.zip
+*.tar
+*.trace
