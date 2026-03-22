@@ -1095,6 +1095,17 @@ impl<FS: ShimFS> Task<FS> {
                 Ok(_event) => {}
                 Err(e) => panic!("replay divergence on structural syscall: {e:?}"),
             }
+
+            // If this was an execve, consume the snapshot event that follows
+            // it in the trace. For now we discard it — execve still runs the
+            // ELF loader structurally. The snapshot exists for forward compat.
+            if syscall_nr == rr::nr_pub::EXECVE && self.global.rr_state.peek_is_snapshot() {
+                let _snapshot = self
+                    .global
+                    .rr_state
+                    .replay_event(litebox_rr::EXECVE_SNAPSHOT_NR)
+                    .expect("failed to consume execve snapshot event");
+            }
         } else {
             // --- Non-structural COMPLETE event: replay from trace ---
             //    If replay-stdout is enabled, execute writes to stdout/stderr
