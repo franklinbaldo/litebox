@@ -666,23 +666,18 @@ fn test_rr_record_replay_hello() {
     let trace_len = std::fs::metadata(&trace_path).unwrap().len();
     assert!(trace_len > 0, "trace file is empty ({trace_len} bytes)");
 
-    // --- Replay ---
-    let replay_output = Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_replay"))
+    let record_str = String::from_utf8_lossy(&record_output);
+    assert!(!record_str.is_empty(), "record produced no output");
+
+    // --- Replay (write is skipped, so no stdout — just verify exit code) ---
+    Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_replay"))
         .runner_arg("--rr-replay")
         .runner_arg(&trace_path)
-        .output();
-
-    // --- Compare ---
-    let record_str = String::from_utf8_lossy(&record_output);
-    let replay_str = String::from_utf8_lossy(&replay_output);
-    assert_eq!(
-        record_str, replay_str,
-        "Record and replay stdout differ.\n--- Record ---\n{record_str}\n--- Replay ---\n{replay_str}"
-    );
+        .run();
 }
 
 /// Record the signal test program (exercises SIGSEGV handler + recovery),
-/// replay it, and verify identical stdout output. SIGSEGV is synchronous so
+/// replay it, and verify successful completion. SIGSEGV is synchronous so
 /// it re-triggers deterministically — this validates that signal handling
 /// doesn't break under RR mode.
 #[cfg(feature = "rr")]
@@ -694,31 +689,23 @@ fn test_rr_record_replay_signal() {
     let trace_path = dir.join("signal_rr.trace");
 
     // --- Record ---
-    let record_output = Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_record"))
+    Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_record"))
         .runner_arg("--rr-record")
         .runner_arg(&trace_path)
-        .output();
+        .run();
 
     assert!(trace_path.exists(), "trace file was not created");
 
-    // --- Replay ---
-    let replay_output = Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_replay"))
+    // --- Replay (write is skipped, so no stdout — just verify exit code) ---
+    Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_replay"))
         .runner_arg("--rr-replay")
         .runner_arg(&trace_path)
-        .output();
-
-    // --- Compare ---
-    let record_str = String::from_utf8_lossy(&record_output);
-    let replay_str = String::from_utf8_lossy(&replay_output);
-    assert_eq!(
-        record_str, replay_str,
-        "Record and replay stdout differ.\n--- Record ---\n{record_str}\n--- Replay ---\n{replay_str}"
-    );
+        .run();
 }
 
 /// Record the sigint test program (exercises self-directed SIGINT via
 /// raise/kill, blocking/unblocking, and signal coalescing), replay it,
-/// and verify identical stdout output.
+/// and verify successful completion.
 #[cfg(feature = "rr")]
 #[test]
 fn test_rr_record_replay_sigint() {
@@ -728,24 +715,43 @@ fn test_rr_record_replay_sigint() {
     let trace_path = dir.join("sigint_rr.trace");
 
     // --- Record ---
-    let record_output = Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_record"))
+    Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_record"))
         .runner_arg("--rr-record")
         .runner_arg(&trace_path)
-        .output();
+        .run();
 
     assert!(trace_path.exists(), "trace file was not created");
 
-    // --- Replay ---
-    let replay_output = Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_replay"))
+    // --- Replay (write is skipped, so no stdout — just verify exit code) ---
+    Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_replay"))
         .runner_arg("--rr-replay")
         .runner_arg(&trace_path)
-        .output();
+        .run();
+}
 
-    // --- Compare ---
-    let record_str = String::from_utf8_lossy(&record_output);
-    let replay_str = String::from_utf8_lossy(&replay_output);
-    assert_eq!(
-        record_str, replay_str,
-        "Record and replay stdout differ.\n--- Record ---\n{record_str}\n--- Replay ---\n{replay_str}"
-    );
+/// Record the alarm test program (exercises alarm(), SIGALRM delivery via
+/// sleep interruption and poll interruption), replay it, and verify
+/// successful completion. Blocking syscalls (nanosleep, poll) return
+/// immediately from trace during replay; SIGALRM is injected from the trace.
+#[cfg(feature = "rr")]
+#[test]
+fn test_rr_record_replay_alarm() {
+    let unique_name = "alarm_rr";
+    let target = common::compile("./tests/alarm_rr.c", unique_name, true, false);
+    let dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    let trace_path = dir.join("alarm_rr.trace");
+
+    // --- Record ---
+    Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_record"))
+        .runner_arg("--rr-record")
+        .runner_arg(&trace_path)
+        .run();
+
+    assert!(trace_path.exists(), "trace file was not created");
+
+    // --- Replay (write is skipped, so no stdout — just verify exit code) ---
+    Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_replay"))
+        .runner_arg("--rr-replay")
+        .runner_arg(&trace_path)
+        .run();
 }

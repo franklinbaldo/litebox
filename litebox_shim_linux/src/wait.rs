@@ -47,11 +47,19 @@ impl<FS: ShimFS> Task<FS> {
                 while self.global.rr_state.peek_is_signal() {
                     match self.global.rr_state.replay_signal() {
                         Ok((signal_nr, _siginfo_bytes)) => {
-                            // Reconstruct the signal and queue it (same as
-                            // what take_pending_signals + queue_signals does).
                             let signal = litebox_common_linux::signal::Signal::try_from(signal_nr)
                                 .expect("invalid signal number in trace");
-                            self.queue_signals(signal);
+                            // Only inject if the signal is not already in a
+                            // pending set. Structural syscalls like
+                            // kill/tgkill/tkill queue signals directly via
+                            // send_signal (thread-level pending), while
+                            // queue_signals uses send_shared_signal
+                            // (process-level shared_pending). Without this
+                            // check, both copies would be delivered — once from
+                            // each queue — causing spurious double delivery.
+                            if !self.pending_signal_set().contains(signal) {
+                                self.queue_signals(signal);
+                            }
                         }
                         Err(e) => panic!("replay signal error: {e:?}"),
                     }
@@ -63,18 +71,28 @@ impl<FS: ShimFS> Task<FS> {
             }
 
             self.global.platform.take_pending_signals(|signal| {
-                // During recording, record each host-originated signal.
-                #[cfg(feature = "rr")]
-                if self.global.rr_state.mode() == crate::rr::RRMode::Record
-                    && !crate::rr::is_synchronous_signal(signal)
-                {
-                    self.global
-                        .rr_state
-                        .record_signal(signal.as_i32(), alloc::vec![]);
-                }
                 self.queue_signals(signal);
             });
             self.check_alarm_deadline();
+
+            // During recording, record all pending async signals as delivery
+            // events. This is done AFTER take_pending_signals and
+            // check_alarm_deadline (so all signal sources are captured) and
+            // BEFORE process_signals (so events appear in the trace before the
+            // rt_sigreturn that the handler will issue). This also captures
+            // signals that were queued during check_for_interrupt inside a
+            // blocking syscall (e.g., SIGALRM interrupting nanosleep).
+            #[cfg(feature = "rr")]
+            if self.global.rr_state.mode() == crate::rr::RRMode::Record {
+                for signal in self.pending_signal_set() {
+                    if !crate::rr::is_synchronous_signal(signal) {
+                        self.global
+                            .rr_state
+                            .record_signal(signal.as_i32(), alloc::vec![]);
+                    }
+                }
+            }
+
             self.process_signals(ctx);
             !self.is_exiting()
         })

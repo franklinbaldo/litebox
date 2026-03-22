@@ -542,7 +542,7 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Returns the set of all pending (deliverable) signals.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "rr"))]
     pub(crate) fn pending_signal_set(&self) -> SigSet {
         let blocked = self.signals.blocked.get();
         let thread = self.signals.pending.borrow().pending & !blocked;

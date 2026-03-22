@@ -590,7 +590,7 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Record mode: execute the syscall normally, then capture side-effects
-    /// for nondeterministic syscalls.
+    /// and record every syscall to the trace.
     #[cfg(feature = "rr")]
     fn handle_syscall_request_record(&self, ctx: &mut litebox_common_linux::PtRegs) {
         let syscall_nr = rr::get_syscall_nr(ctx);
@@ -604,41 +604,44 @@ impl<FS: ShimFS> Task<FS> {
         // Write return value to guest context.
         rr::set_return_value(ctx, return_value);
 
-        // Only record nondeterministic syscalls.
-        if rr::is_nondeterministic(syscall_nr) {
-            // Capture any side-effect data written to guest memory.
-            let data = rr::capture_side_effects(syscall_nr, ctx, return_value);
+        // Capture any side-effect data written to guest memory.
+        let data = rr::capture_side_effects(syscall_nr, ctx, return_value);
 
-            // Record the event. The return value as i64 preserves negative errno encoding.
-            #[allow(clippy::cast_possible_wrap)]
-            let result_i64 = return_value as isize as i64;
-            self.global
-                .rr_state
-                .record_event(syscall_nr, result_i64, data);
-        }
+        // Record the event.
+        #[allow(clippy::cast_possible_wrap)]
+        let result_i64 = return_value as isize as i64;
+        self.global
+            .rr_state
+            .record_event(syscall_nr, result_i64, data);
     }
 
-    /// Replay mode: for nondeterministic syscalls, inject recorded return value
-    /// and data instead of executing the real syscall. All other syscalls
-    /// (memory management, output, process lifecycle, etc.) execute normally.
+    /// Replay mode: structural syscalls (memory management, process lifecycle,
+    /// sigreturn) execute normally; all other syscalls are replayed from the
+    /// trace by injecting the recorded return value and side-effect data.
     #[cfg(feature = "rr")]
     fn handle_syscall_request_replay(&self, ctx: &mut litebox_common_linux::PtRegs) {
         let syscall_nr = rr::get_syscall_nr(ctx);
 
-        if !rr::is_nondeterministic(syscall_nr) {
-            // Deterministic / structural syscall — execute normally.
+        if rr::is_structural(syscall_nr) {
+            // Structural syscall — execute normally, but still consume
+            // the trace event to keep the replay cursor in sync.
             self.handle_syscall_request_normal(ctx);
+            // Consume and validate the trace event (ignore recorded data).
+            match self.global.rr_state.replay_event(syscall_nr) {
+                Ok(_event) => {}
+                Err(e) => panic!("replay divergence on structural syscall: {e:?}"),
+            }
             return;
         }
 
+        // Non-structural — replay from trace.
         match self.global.rr_state.replay_event(syscall_nr) {
             Ok(event) => {
                 // Inject side-effect data into guest memory.
                 if !event.data.is_empty() {
                     rr::inject_side_effects(syscall_nr, ctx, &event.data);
                 }
-                // Inject return value. The i64 result encodes both success (positive)
-                // and error (negative errno) values.
+                // Inject return value.
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let return_value = event.result as usize;
                 rr::set_return_value(ctx, return_value);
