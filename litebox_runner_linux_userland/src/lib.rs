@@ -385,10 +385,34 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let initial_file_system = std::sync::Arc::new(initial_file_system);
 
     shim_builder.set_load_filter(fixup_env);
+
+    // Compute envp as strings first, so we can capture them in trace metadata
+    // before converting to CStrings for load_program.
+    let envp_strings: Vec<String> = if cli_args.forward_environment_variables {
+        cli_args
+            .environment_variables
+            .iter()
+            .cloned()
+            .chain(std::env::vars().map(|(k, v)| format!("{k}={v}")))
+            .collect()
+    } else {
+        cli_args.environment_variables.clone()
+    };
+
     #[cfg(feature = "rr")]
     {
         if cli_args.rr_record.is_some() {
             shim_builder.set_rr_record();
+            shim_builder.set_rr_metadata(litebox_rr::TraceMetadata {
+                program_path: prog_path.to_owned(),
+                argv: cli_args.program_and_arguments.clone(),
+                envp: envp_strings.clone(),
+                initial_files_path: cli_args
+                    .initial_files
+                    .as_ref()
+                    .map(|p| p.display().to_string()),
+                program_from_tar: cli_args.program_from_tar,
+            });
         } else if let Some(ref trace_path) = cli_args.rr_replay {
             let trace_data =
                 std::fs::read(trace_path).map_err(|e| anyhow!("failed to read trace file: {e}"))?;
@@ -445,26 +469,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         .iter()
         .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
         .collect();
-    let envp: Vec<_> = cli_args
-        .environment_variables
+    let envp: Vec<std::ffi::CString> = envp_strings
         .iter()
         .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
         .collect();
-    let envp = if cli_args.forward_environment_variables {
-        envp.into_iter()
-            .chain(std::env::vars().map(|(k, v)| {
-                std::ffi::CString::new(
-                    k.bytes()
-                        .chain([b'='])
-                        .chain(v.bytes())
-                        .collect::<Vec<u8>>(),
-                )
-                .unwrap()
-            }))
-            .collect()
-    } else {
-        envp
-    };
 
     let program = shim.load_program(
         initial_file_system,

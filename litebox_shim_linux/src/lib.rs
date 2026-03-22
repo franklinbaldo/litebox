@@ -155,6 +155,8 @@ pub struct LinuxShimBuilder {
     rr_trace_data: Option<Vec<u8>>,
     #[cfg(feature = "rr")]
     rr_replay_stdout: bool,
+    #[cfg(feature = "rr")]
+    rr_metadata: Option<litebox_rr::TraceMetadata>,
 }
 
 impl Default for LinuxShimBuilder {
@@ -177,6 +179,8 @@ impl LinuxShimBuilder {
             rr_trace_data: None,
             #[cfg(feature = "rr")]
             rr_replay_stdout: false,
+            #[cfg(feature = "rr")]
+            rr_metadata: None,
         }
     }
 
@@ -222,6 +226,15 @@ impl LinuxShimBuilder {
         self.rr_replay_stdout = true;
     }
 
+    /// Set the trace metadata for recording.
+    ///
+    /// The metadata captures the program path, argv, envp, and filesystem
+    /// flags so that replay can reproduce the original execution environment.
+    #[cfg(feature = "rr")]
+    pub fn set_rr_metadata(&mut self, metadata: litebox_rr::TraceMetadata) {
+        self.rr_metadata = Some(metadata);
+    }
+
     /// Build the shim.
     ///
     /// # Panics
@@ -246,8 +259,8 @@ impl LinuxShimBuilder {
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
             #[cfg(feature = "rr")]
             rr_state: match self.rr_mode {
-                rr::RRMode::Off => rr::RRState::new(rr::RRMode::Off),
-                rr::RRMode::Record => rr::RRState::new(rr::RRMode::Record),
+                rr::RRMode::Off => rr::RRState::new(rr::RRMode::Off, None),
+                rr::RRMode::Record => rr::RRState::new(rr::RRMode::Record, self.rr_metadata.take()),
                 rr::RRMode::Replay => {
                     let mut state = rr::RRState::new_replay(
                         self.rr_trace_data

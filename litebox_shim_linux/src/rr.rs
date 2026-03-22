@@ -8,7 +8,7 @@
 
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
-use litebox_rr::{Event, EventKind, Recorder, ReplayError, Replayer, TraceArch};
+use litebox_rr::{Event, EventKind, Recorder, ReplayError, Replayer, TraceArch, TraceMetadata};
 
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 
@@ -71,7 +71,7 @@ impl RRState {
     ///
     /// Panics if called with `RRMode::Replay`. Use [`RRState::new_replay`]
     /// instead.
-    pub fn new(mode: RRMode) -> Self {
+    pub fn new(mode: RRMode, metadata: Option<TraceMetadata>) -> Self {
         match mode {
             RRMode::Off => Self {
                 mode,
@@ -82,7 +82,7 @@ impl RRState {
             },
             RRMode::Record => Self {
                 mode,
-                recorder: Some(Mutex::new(Recorder::new(current_arch(), None))),
+                recorder: Some(Mutex::new(Recorder::new(current_arch(), metadata))),
                 replayer: None,
                 coordinator: Some(RunCoordinator::new()),
                 replay_stdout: false,
