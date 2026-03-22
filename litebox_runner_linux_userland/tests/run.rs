@@ -813,3 +813,40 @@ fn test_rr_record_replay_threads() {
         .runner_arg(&trace_path)
         .run();
 }
+
+/// Record hello, then replay with `--rr-replay-stdout` and verify that the
+/// replayed stdout output matches the recorded output byte-for-byte.
+#[cfg(feature = "rr")]
+#[test]
+fn test_rr_replay_stdout() {
+    let unique_name = "replay_stdout_rr";
+    let target = common::compile("./tests/hello.c", unique_name, true, false);
+    let dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    let trace_path = dir.join("replay_stdout_rr.trace");
+
+    // --- Record (capture stdout) ---
+    let record_output = Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_record"))
+        .runner_arg("--rr-record")
+        .runner_arg(&trace_path)
+        .output();
+
+    let record_str = String::from_utf8_lossy(&record_output);
+    assert!(!record_str.is_empty(), "record produced no output");
+
+    // --- Replay with --rr-replay-stdout (capture stdout) ---
+    let replay_output = Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_replay"))
+        .runner_arg("--rr-replay")
+        .runner_arg(&trace_path)
+        .runner_arg("--rr-replay-stdout")
+        .output();
+
+    let replay_str = String::from_utf8_lossy(&replay_output);
+    assert!(
+        !replay_str.is_empty(),
+        "replay with --rr-replay-stdout produced no output"
+    );
+    assert_eq!(
+        record_output, replay_output,
+        "replay stdout does not match recorded stdout\n--- record ---\n{record_str}\n--- replay ---\n{replay_str}"
+    );
+}

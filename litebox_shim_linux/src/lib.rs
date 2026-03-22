@@ -153,6 +153,8 @@ pub struct LinuxShimBuilder {
     rr_mode: rr::RRMode,
     #[cfg(feature = "rr")]
     rr_trace_data: Option<Vec<u8>>,
+    #[cfg(feature = "rr")]
+    rr_replay_stdout: bool,
 }
 
 impl Default for LinuxShimBuilder {
@@ -173,6 +175,8 @@ impl LinuxShimBuilder {
             rr_mode: rr::RRMode::Off,
             #[cfg(feature = "rr")]
             rr_trace_data: None,
+            #[cfg(feature = "rr")]
+            rr_replay_stdout: false,
         }
     }
 
@@ -208,6 +212,16 @@ impl LinuxShimBuilder {
         self.rr_trace_data = Some(trace_data);
     }
 
+    /// Enable stdout/stderr output during replay.
+    ///
+    /// When set, `write`/`writev` to fd 1 (stdout) and fd 2 (stderr) are
+    /// executed on the host during replay so that program output is visible.
+    /// The return value still comes from the trace.
+    #[cfg(feature = "rr")]
+    pub fn set_rr_replay_stdout(&mut self) {
+        self.rr_replay_stdout = true;
+    }
+
     /// Build the shim.
     ///
     /// # Panics
@@ -234,12 +248,18 @@ impl LinuxShimBuilder {
             rr_state: match self.rr_mode {
                 rr::RRMode::Off => rr::RRState::new(rr::RRMode::Off),
                 rr::RRMode::Record => rr::RRState::new(rr::RRMode::Record),
-                rr::RRMode::Replay => rr::RRState::new_replay(
-                    self.rr_trace_data
-                        .take()
-                        .expect("replay requires trace data"),
-                )
-                .expect("invalid trace data"),
+                rr::RRMode::Replay => {
+                    let mut state = rr::RRState::new_replay(
+                        self.rr_trace_data
+                            .take()
+                            .expect("replay requires trace data"),
+                    )
+                    .expect("invalid trace data");
+                    if self.rr_replay_stdout {
+                        state.set_replay_stdout(true);
+                    }
+                    state
+                }
             },
         });
         LinuxShim(global)
@@ -780,6 +800,9 @@ impl<FS: ShimFS> Task<FS> {
             }
 
             // 4. Consume the EXIT event and inject the recorded result.
+            //    If replay-stdout is enabled, execute writes to stdout/stderr
+            //    on the host before injecting the trace return value.
+            rr::maybe_replay_stdio_write(syscall_nr, ctx, self.global.rr_state.replay_stdout());
             match self.global.rr_state.replay_event(syscall_nr) {
                 Ok(event) => {
                     if !event.data.is_empty() {
@@ -824,6 +847,9 @@ impl<FS: ShimFS> Task<FS> {
             }
         } else {
             // --- Non-structural COMPLETE event: replay from trace ---
+            //    If replay-stdout is enabled, execute writes to stdout/stderr
+            //    on the host before injecting the trace return value.
+            rr::maybe_replay_stdio_write(syscall_nr, ctx, self.global.rr_state.replay_stdout());
             match self.global.rr_state.replay_event(syscall_nr) {
                 Ok(event) => {
                     // Inject side-effect data into guest memory.

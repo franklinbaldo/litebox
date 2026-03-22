@@ -54,6 +54,9 @@ pub struct RRState {
     replayer: Option<Mutex<Replayer>>,
     /// Serializes thread execution. Present in Record and Replay modes.
     coordinator: Option<RunCoordinator>,
+    /// When true, write/writev to stdout/stderr are executed on the host
+    /// during replay so that program output is visible.
+    replay_stdout: bool,
 }
 
 impl RRState {
@@ -75,12 +78,14 @@ impl RRState {
                 recorder: None,
                 replayer: None,
                 coordinator: None,
+                replay_stdout: false,
             },
             RRMode::Record => Self {
                 mode,
                 recorder: Some(Mutex::new(Recorder::new(current_arch()))),
                 replayer: None,
                 coordinator: Some(RunCoordinator::new()),
+                replay_stdout: false,
             },
             RRMode::Replay => {
                 panic!("use RRState::new_replay() for replay mode");
@@ -96,12 +101,23 @@ impl RRState {
             recorder: None,
             replayer: Some(Mutex::new(replayer)),
             coordinator: Some(RunCoordinator::new()),
+            replay_stdout: false,
         })
     }
 
     /// Return the current mode.
     pub fn mode(&self) -> RRMode {
         self.mode
+    }
+
+    /// Enable or disable stdout/stderr replay output.
+    pub fn set_replay_stdout(&mut self, enabled: bool) {
+        self.replay_stdout = enabled;
+    }
+
+    /// Returns `true` if stdout/stderr writes should be executed during replay.
+    pub fn replay_stdout(&self) -> bool {
+        self.replay_stdout
     }
 
     /// Return a reference to the run coordinator.
@@ -686,6 +702,91 @@ fn write_guest_bytes(addr: usize, data: &[u8]) {
     }
     let ptr: MutPtr<u8> = MutPtr::from_usize(addr);
     let _ = ptr.copy_from_slice(0, data);
+}
+
+/// During replay with `--rr-replay-stdout`, execute `write`/`writev` on the
+/// host for stdout (fd 1) and stderr (fd 2) so that program output is visible.
+///
+/// The return value still comes from the trace — this only performs the I/O
+/// side effect.
+///
+/// # Panics
+///
+/// Does not panic.
+pub fn maybe_replay_stdio_write(
+    syscall_nr: u32,
+    ctx: &litebox_common_linux::PtRegs,
+    replay_stdout: bool,
+) {
+    if !replay_stdout {
+        return;
+    }
+
+    let fd = ctx.syscall_arg(0);
+    // Only replay writes to stdout (1) or stderr (2).
+    if fd != 1 && fd != 2 {
+        return;
+    }
+
+    match syscall_nr {
+        nr::WRITE => {
+            let buf_addr = ctx.syscall_arg(1);
+            let count = ctx.syscall_arg(2);
+            let buf = read_guest_bytes(buf_addr, count);
+            if !buf.is_empty() {
+                // SAFETY: buf points to a valid slice from read_guest_bytes,
+                // fd is 1 or 2 (stdout/stderr), which are valid host fds.
+                unsafe {
+                    syscalls::raw::syscall3(
+                        syscalls::Sysno::write,
+                        fd,
+                        buf.as_ptr() as usize,
+                        buf.len(),
+                    );
+                }
+            }
+        }
+        nr::WRITEV => {
+            let iov_addr = ctx.syscall_arg(1);
+            let iovcnt = ctx.syscall_arg(2);
+            // Each iovec is { base: *const u8, len: usize } = 2 * size_of::<usize>() bytes.
+            let iovec_size = 2 * core::mem::size_of::<usize>();
+            let iov_bytes = read_guest_bytes(iov_addr, iovcnt * iovec_size);
+            if iov_bytes.is_empty() {
+                return;
+            }
+            for i in 0..iovcnt {
+                let offset = i * iovec_size;
+                if offset + iovec_size > iov_bytes.len() {
+                    break;
+                }
+                let base = usize::from_ne_bytes(
+                    iov_bytes[offset..offset + core::mem::size_of::<usize>()]
+                        .try_into()
+                        .unwrap_or([0; core::mem::size_of::<usize>()]),
+                );
+                let len = usize::from_ne_bytes(
+                    iov_bytes[offset + core::mem::size_of::<usize>()..offset + iovec_size]
+                        .try_into()
+                        .unwrap_or([0; core::mem::size_of::<usize>()]),
+                );
+                let buf = read_guest_bytes(base, len);
+                if !buf.is_empty() {
+                    // SAFETY: buf points to a valid slice from read_guest_bytes,
+                    // fd is 1 or 2 (stdout/stderr), which are valid host fds.
+                    unsafe {
+                        syscalls::raw::syscall3(
+                            syscalls::Sysno::write,
+                            fd,
+                            buf.as_ptr() as usize,
+                            buf.len(),
+                        );
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// After a syscall completes successfully during recording, capture any

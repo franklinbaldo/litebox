@@ -101,6 +101,17 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub rr_replay: Option<PathBuf>,
+    /// During replay, also write stdout/stderr output to the host.
+    /// Normally, write/writev are skipped during replay; this flag causes
+    /// writes to fd 1 (stdout) and fd 2 (stderr) to be executed so that
+    /// the program's output is visible.
+    #[cfg(feature = "rr")]
+    #[arg(
+        long = "rr-replay-stdout",
+        requires = "rr_replay",
+        help_heading = "Unstable Options"
+    )]
+    pub rr_replay_stdout: bool,
 }
 
 /// Backends supported for intercepting syscalls
@@ -382,6 +393,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             let trace_data =
                 std::fs::read(trace_path).map_err(|e| anyhow!("failed to read trace file: {e}"))?;
             shim_builder.set_rr_replay(trace_data);
+            if cli_args.rr_replay_stdout {
+                shim_builder.set_rr_replay_stdout();
+            }
         }
     }
     let shim = shim_builder.build();
