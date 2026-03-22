@@ -850,3 +850,58 @@ fn test_rr_replay_stdout() {
         "replay stdout does not match recorded stdout\n--- record ---\n{record_str}\n--- replay ---\n{replay_str}"
     );
 }
+
+/// Record hello.c with a specific argument, replay with a DIFFERENT argument
+/// on the CLI plus --rr-replay-stdout. The replay should use the trace's
+/// stored argv (from recording), not the CLI args, so the output must match
+/// the recording and must NOT contain the wrong argument.
+#[cfg(feature = "rr")]
+#[test]
+fn test_rr_replay_uses_trace_argv() {
+    let unique_name = "trace_argv_rr";
+    let target = common::compile("./tests/hello.c", unique_name, true, false);
+    let dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    let trace_path = dir.join("trace_argv_rr.trace");
+
+    // --- Record with a specific arg ---
+    let record_output =
+        Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_record"))
+            .runner_arg("--rr-record")
+            .runner_arg(&trace_path)
+            .arg("recorded_arg")
+            .output();
+
+    assert!(
+        trace_path.exists(),
+        "trace file was not created at {}",
+        trace_path.display()
+    );
+    let record_str = String::from_utf8_lossy(&record_output);
+    assert!(
+        record_str.contains("recorded_arg"),
+        "recording should contain 'recorded_arg' in output:\n{record_str}"
+    );
+
+    // --- Replay with DIFFERENT CLI arg but --rr-replay-stdout ---
+    // The CLI arg is ignored; trace metadata argv is used instead.
+    let replay_output =
+        Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_replay"))
+            .runner_arg("--rr-replay")
+            .runner_arg(&trace_path)
+            .runner_arg("--rr-replay-stdout")
+            .arg("WRONG_ARG_SHOULD_BE_IGNORED")
+            .output();
+
+    let replay_str = String::from_utf8_lossy(&replay_output);
+
+    // Replay output should match recording exactly (trace argv is used).
+    assert_eq!(
+        record_output, replay_output,
+        "replay should use trace argv, not CLI argv\n--- record ---\n{record_str}\n--- replay ---\n{replay_str}"
+    );
+    // Double-check: the wrong arg must NOT appear in replay output.
+    assert!(
+        !replay_str.contains("WRONG_ARG_SHOULD_BE_IGNORED"),
+        "replay output must not contain the CLI arg 'WRONG_ARG_SHOULD_BE_IGNORED':\n{replay_str}"
+    );
+}
