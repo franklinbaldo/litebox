@@ -13,11 +13,15 @@ use alloc::vec::Vec;
 pub const TRACE_MAGIC: [u8; 4] = *b"LBRR";
 
 /// Current trace format version.
-pub const TRACE_VERSION: u32 = 3;
+pub const TRACE_VERSION: u32 = 4;
 
 /// Sentinel syscall number used for signal delivery events in the trace.
 /// This is well outside the range of real Linux syscall numbers.
 pub const SIGNAL_DELIVERY_NR: u32 = 0xFFFF_FFFE;
+
+/// Sentinel syscall number used for execve snapshot events in the trace.
+/// This is well outside the range of real Linux syscall numbers.
+pub const EXECVE_SNAPSHOT_NR: u32 = 0xFFFF_FFFD;
 
 /// The kind of a trace event.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -31,6 +35,8 @@ pub enum EventKind {
     Exit = 2,
     /// Async signal delivery event.
     Signal = 3,
+    /// Memory snapshot event (used after execve or initial program load).
+    Snapshot = 4,
 }
 
 impl EventKind {
@@ -41,6 +47,7 @@ impl EventKind {
             1 => Some(Self::Entry),
             2 => Some(Self::Exit),
             3 => Some(Self::Signal),
+            4 => Some(Self::Snapshot),
             _ => None,
         }
     }
@@ -590,7 +597,8 @@ mod tests {
         ] {
             assert_eq!(EventKind::from_byte(byte), Some(expected));
         }
-        assert_eq!(EventKind::from_byte(4), None);
+        assert_eq!(EventKind::from_byte(4), Some(EventKind::Snapshot));
+        assert_eq!(EventKind::from_byte(5), None);
         assert_eq!(EventKind::from_byte(255), None);
     }
 
@@ -686,5 +694,27 @@ mod tests {
         assert_eq!(decoded.version, 2);
         assert_eq!(decoded.arch, TraceArch::X86_64);
         assert_eq!(decoded.metadata, None);
+    }
+
+    #[test]
+    fn test_snapshot_event_kind_roundtrip() {
+        assert_eq!(EventKind::from_byte(4), Some(EventKind::Snapshot));
+    }
+
+    #[test]
+    fn test_snapshot_event_roundtrip() {
+        let snapshot_data = alloc::vec![1, 2, 3, 4, 5];
+        let event = Event {
+            event_id: 42,
+            syscall_nr: EXECVE_SNAPSHOT_NR,
+            result: 0,
+            data: snapshot_data.clone(),
+            tid: 1,
+            kind: EventKind::Snapshot,
+        };
+        let bytes = event.to_bytes();
+        let (decoded, consumed) = Event::from_bytes(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded, event);
     }
 }

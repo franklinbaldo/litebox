@@ -189,6 +189,11 @@ impl Replayer {
         }
         EventKind::from_byte(self.data[start])
     }
+
+    /// Returns `true` if the next event is a memory snapshot event.
+    pub fn peek_is_snapshot(&self) -> bool {
+        self.peek_event_nr() == Some(crate::trace::EXECVE_SNAPSHOT_NR)
+    }
 }
 
 #[cfg(test)]
@@ -393,7 +398,7 @@ mod tests {
         let recorder = Recorder::new(TraceArch::X86_64, None);
         let bytes = recorder.finish();
         let replayer = Replayer::from_bytes(bytes).unwrap();
-        assert_eq!(replayer.version(), 3);
+        assert_eq!(replayer.version(), 4);
     }
 
     #[test]
@@ -419,7 +424,7 @@ mod tests {
 
         // Replay and verify metadata comes back
         let mut replayer = Replayer::from_bytes(bytes).unwrap();
-        assert_eq!(replayer.version(), 3);
+        assert_eq!(replayer.version(), 4);
         assert_eq!(replayer.arch(), TraceArch::X86_64);
 
         let got_meta = replayer.metadata().expect("metadata should be present");
@@ -440,5 +445,22 @@ mod tests {
         assert_eq!(ev.result, 42);
         assert_eq!(ev.data, alloc::vec![1, 2, 3]);
         assert!(replayer.is_exhausted());
+    }
+
+    #[test]
+    fn test_peek_is_snapshot() {
+        use crate::Recorder;
+
+        let mut rec = Recorder::new(TraceArch::X86_64, None);
+        rec.record_simple(1, 0, alloc::vec![]);
+        rec.record_snapshot(alloc::vec![1, 2, 3], 1);
+        let trace = rec.finish();
+
+        let mut rep = Replayer::from_bytes(trace).unwrap();
+        assert!(!rep.peek_is_snapshot());
+        let _ = rep.next_event().unwrap();
+        assert!(rep.peek_is_snapshot());
+        let snap = rep.next_event().unwrap();
+        assert_eq!(snap.kind, EventKind::Snapshot);
     }
 }

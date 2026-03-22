@@ -79,6 +79,20 @@ impl Recorder {
         self.record(syscall_nr, result, data, 0, EventKind::Complete);
     }
 
+    /// Records a memory snapshot event (used after execve or initial program load).
+    ///
+    /// `snapshot_data` contains the serialized memory snapshot (VMAs + contents + registers).
+    /// `tid` is the thread that performed the execve.
+    pub fn record_snapshot(&mut self, snapshot_data: Vec<u8>, tid: u32) {
+        self.record(
+            crate::trace::EXECVE_SNAPSHOT_NR,
+            0,
+            snapshot_data,
+            tid,
+            EventKind::Snapshot,
+        );
+    }
+
     /// Return the number of events recorded so far.
     pub fn event_count(&self) -> u64 {
         self.next_event_id
@@ -160,5 +174,22 @@ mod tests {
         assert_eq!(recorder.event_count(), 2);
         recorder.record(2, 0, alloc::vec![], 0, EventKind::Complete);
         assert_eq!(recorder.event_count(), 3);
+    }
+
+    #[test]
+    fn test_record_snapshot() {
+        use crate::Replayer;
+        use crate::trace::EXECVE_SNAPSHOT_NR;
+
+        let mut rec = Recorder::new(TraceArch::X86_64, None);
+        rec.record_snapshot(alloc::vec![10, 20, 30], 1);
+        let trace = rec.finish();
+        let mut rep = Replayer::from_bytes(trace).unwrap();
+        let event = rep.next_event().unwrap();
+        assert_eq!(event.syscall_nr, EXECVE_SNAPSHOT_NR);
+        assert_eq!(event.kind, EventKind::Snapshot);
+        assert_eq!(event.data, alloc::vec![10, 20, 30]);
+        assert_eq!(event.tid, 1);
+        assert_eq!(event.result, 0);
     }
 }
