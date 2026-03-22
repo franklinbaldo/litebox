@@ -45,6 +45,10 @@ pub struct MappingInfo {
     pub phdrs_addr: usize,
     /// The number of program headers.
     pub num_phdrs: usize,
+    /// The guest virtual address of the rewriter trampoline page, or 0 if
+    /// none. Used by snapshot capture/restore to re-patch the trampoline with
+    /// the current host's syscall entry point.
+    pub trampoline_start: usize,
 }
 
 impl MappingInfo {
@@ -471,6 +475,7 @@ impl ElfParsedFile {
             entry_point: base_addr.wrapping_add(self.header.e_entry.truncate()),
             phdrs_addr,
             num_phdrs: self.header.e_phnum.into(),
+            trampoline_start: 0,
         };
 
         if self.trampoline.is_some() {
@@ -525,6 +530,7 @@ impl ElfParsedFile {
             .map_err(ElfLoadError::Map)?;
 
         info.brk = info.brk.max(trampoline_end);
+        info.trampoline_start = trampoline_start;
         Ok(())
     }
 
@@ -550,6 +556,7 @@ impl ElfParsedFile {
             entry_point: 0,
             phdrs_addr: 0,
             num_phdrs: 0,
+            trampoline_start: 0,
         };
         self.load_trampoline(mapper, mem, &mut info)
     }

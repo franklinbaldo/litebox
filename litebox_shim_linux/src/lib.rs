@@ -352,7 +352,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 signals: syscalls::signal::SignalState::new_process(),
             },
         };
-        entrypoints.task.load_program(
+        let load_info = entrypoints.task.load_program(
             loader::elf::ElfLoader::new(&entrypoints.task, path)?,
             argv,
             envp,
@@ -361,6 +361,9 @@ impl<FS: ShimFS> LinuxShim<FS> {
         Ok(LoadedProgram {
             entrypoints,
             process,
+            entry_point: load_info.entry_point,
+            stack_top: load_info.user_stack_top,
+            trampoline_start: load_info.trampoline_start,
         })
     }
 
@@ -392,11 +395,221 @@ impl<FS: ShimFS> LinuxShim<FS> {
     pub fn litebox(&self) -> &LiteBox<Platform> {
         &self.0.litebox
     }
+
+    /// Captures a memory snapshot of the currently loaded program and records
+    /// it to the trace. Should be called right after `load_program()`.
+    #[cfg(feature = "rr")]
+    pub fn capture_initial_snapshot(
+        &self,
+        entry_point: usize,
+        stack_top: usize,
+        trampoline_start: usize,
+    ) {
+        if self.0.rr_state.mode() != crate::rr::RRMode::Record {
+            return;
+        }
+        let mappings = self.0.pm.mappings();
+        let brk = self.0.pm.current_brk();
+        let snapshot_data = crate::rr::capture_memory_snapshot(
+            &mappings,
+            brk,
+            entry_point,
+            stack_top,
+            trampoline_start,
+        );
+        // Use tid=1 for the initial thread (before any thread registration)
+        self.0.rr_state.record_snapshot(snapshot_data, 1);
+    }
+
+    /// Returns the current RR mode.
+    #[cfg(feature = "rr")]
+    pub fn rr_mode(&self) -> crate::rr::RRMode {
+        self.0.rr_state.mode()
+    }
+
+    /// Checks whether the next replay event is a memory snapshot.
+    #[cfg(feature = "rr")]
+    pub fn rr_peek_is_snapshot(&self) -> bool {
+        self.0.rr_state.peek_is_snapshot()
+    }
+
+    /// Like `load_program`, but restores memory state from a snapshot instead
+    /// of loading an ELF binary. Used during replay when the trace contains
+    /// an initial memory snapshot.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any snapshot VMA has a zero or unaligned start address or
+    /// length, or if page creation fails.
+    #[cfg(feature = "rr")]
+    pub fn load_program_from_snapshot(
+        &self,
+        fs: alloc::sync::Arc<FS>,
+        task: litebox_common_linux::TaskParams,
+    ) -> Result<LoadedProgram<FS>, litebox_rr::ReplayError> {
+        use litebox::mm::linux::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize, VmFlags};
+        use litebox::platform::{RawMutPointer as _, SystemInfoProvider as _};
+
+        // Consume the snapshot event
+        let event = self
+            .0
+            .rr_state
+            .replay_event(litebox_rr::EXECVE_SNAPSHOT_NR)?;
+        let snapshot = crate::rr::parse_memory_snapshot(&event.data);
+
+        let litebox_common_linux::TaskParams {
+            pid,
+            ppid,
+            uid,
+            euid,
+            gid,
+            egid,
+        } = task;
+
+        // Create Task infrastructure (same as load_program minus ELF loading)
+        let files = syscalls::file::FilesState::new(fs);
+        files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR - 1);
+        let files = Arc::new(files);
+        files.initialize_stdio_in_shared_descriptors_table(&self.0);
+
+        let entrypoints = crate::LinuxShimEntrypoints {
+            _not_send: core::marker::PhantomData,
+            task: Task {
+                global: self.0.clone(),
+                thread: syscalls::process::ThreadState::new_process(pid),
+                wait_state: wait::WaitState::new(self.0.platform),
+                pid,
+                ppid,
+                tid: pid,
+                credentials: syscalls::process::Credentials {
+                    uid,
+                    euid,
+                    gid,
+                    egid,
+                }
+                .into(),
+                comm: [0; litebox_common_linux::TASK_COMM_LEN].into(),
+                fs: Arc::new(syscalls::file::FsState::new()).into(),
+                files: files.into(),
+                signals: syscalls::signal::SignalState::new_process(),
+            },
+        };
+
+        // The current host syscall entry point — needed to re-patch the
+        // rewriter trampoline page which was captured with stale host addresses.
+        let syscall_ep = self.0.platform.get_syscall_entry_point();
+        let trampoline_vaddr = snapshot.trampoline_start;
+
+        // Restore memory from snapshot
+        for vma in &snapshot.vmas {
+            let len = vma.end - vma.start;
+            if len == 0 {
+                continue;
+            }
+
+            let addr = NonZeroAddress::new(vma.start).expect("snapshot VMA has zero start address");
+            let aligned_len = (len + (PAGE_SIZE - 1)) & !(PAGE_SIZE - 1);
+            let page_len = NonZeroPageSize::new(aligned_len).expect("snapshot VMA has zero length");
+            let create_flags =
+                CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY;
+
+            let is_exec = vma.flags.contains(VmFlags::VM_EXEC);
+            let is_write = vma.flags.contains(VmFlags::VM_WRITE);
+            let is_trampoline = trampoline_vaddr != 0 && vma.start == trampoline_vaddr;
+
+            let vma_data = &vma.data;
+            let write_data =
+                |ptr: <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<u8>|
+                 -> Result<usize, litebox::mm::linux::MappingError> {
+                    if !vma_data.is_empty() {
+                        let _ = ptr.copy_from_slice(0, vma_data);
+                    }
+                    // Re-patch the trampoline: overwrite the first pointer-sized
+                    // bytes with the current host's syscall entry point.
+                    if is_trampoline {
+                        let _ = ptr.copy_from_slice(0, &syscall_ep.to_ne_bytes());
+                    }
+                    Ok(vma_data.len())
+                };
+
+            if is_exec && !is_write {
+                // R-X: use create_executable_pages (creates as RW, writes, then sets RX)
+                unsafe {
+                    self.0.pm.create_executable_pages(
+                        Some(addr),
+                        page_len,
+                        create_flags,
+                        write_data,
+                    )
+                }
+                .expect("failed to create exec VMA from snapshot");
+            } else {
+                // RW- or anything else: create as writable, then adjust permissions
+                let ptr = unsafe {
+                    self.0
+                        .pm
+                        .create_writable_pages(Some(addr), page_len, create_flags, write_data)
+                }
+                .expect("failed to create writable VMA from snapshot");
+
+                // Adjust permissions if the final state is not RW
+                if !is_write {
+                    let is_read = vma.flags.contains(VmFlags::VM_READ);
+                    if is_read && is_exec {
+                        // RWX — shouldn't reach here since is_exec && !is_write is handled above
+                        unsafe { self.0.pm.make_pages_rwx(ptr, len) }
+                            .expect("failed to mprotect VMA to rwx");
+                    } else if is_read {
+                        // R-- (read-only)
+                        unsafe { self.0.pm.make_pages_readable(ptr, len) }
+                            .expect("failed to mprotect VMA to read-only");
+                    } else {
+                        // PROT_NONE
+                        unsafe { self.0.pm.make_pages_inaccessible(ptr, len) }
+                            .expect("failed to mprotect VMA to inaccessible");
+                    }
+                }
+            }
+        }
+
+        // Set brk
+        if snapshot.brk != 0 {
+            self.0.pm.set_initial_brk(snapshot.brk);
+        }
+
+        // Set the init state so handle_init_request can set up registers
+        entrypoints
+            .task
+            .thread
+            .init_state
+            .set(syscalls::process::ThreadInitState::NewProcess(
+                loader::elf::ElfLoadInfo {
+                    entry_point: snapshot.entry_point,
+                    user_stack_top: snapshot.stack_top,
+                    trampoline_start: snapshot.trampoline_start,
+                },
+            ));
+
+        let process = LinuxShimProcess(entrypoints.task.process().clone());
+        Ok(LoadedProgram {
+            entrypoints,
+            process,
+            entry_point: snapshot.entry_point,
+            stack_top: snapshot.stack_top,
+            trampoline_start: snapshot.trampoline_start,
+        })
+    }
 }
 
 pub struct LoadedProgram<FS: ShimFS> {
     pub entrypoints: LinuxShimEntrypoints<FS>,
     pub process: LinuxShimProcess,
+    /// ELF entry point address (used for RR snapshots).
+    pub entry_point: usize,
+    /// Initial stack pointer (used for RR snapshots).
+    pub stack_top: usize,
+    /// Guest virtual address of the rewriter trampoline page, or 0 if none.
+    pub trampoline_start: usize,
 }
 
 /// A handle to a process loaded via [`LinuxShim::load_program`].

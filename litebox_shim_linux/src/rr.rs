@@ -1900,11 +1900,14 @@ pub fn patch_mmap_for_replay(ctx: &mut litebox_common_linux::PtRegs, recorded_re
 // Memory snapshot capture and restore
 // ---------------------------------------------------------------------------
 
-/// Captures a memory snapshot: all VMAs + contents + brk + entry/stack.
+/// Captures a memory snapshot: all VMAs + contents + brk + entry/stack +
+/// trampoline address.
 ///
 /// `mappings` is the list of `(range, flags)` from `PageManager::mappings()`.
 /// `brk` is the current program break.
 /// `entry_point` and `stack_top` come from `ElfLoadInfo`.
+/// `trampoline_start` is the guest virtual address where the rewriter
+/// trampoline page begins (0 if none).
 ///
 /// Returns serialized snapshot bytes.
 #[allow(clippy::cast_possible_truncation)]
@@ -1913,6 +1916,7 @@ pub fn capture_memory_snapshot(
     brk: usize,
     entry_point: usize,
     stack_top: usize,
+    trampoline_start: usize,
 ) -> Vec<u8> {
     let mut buf = Vec::new();
     let num_vmas = mappings.len() as u32;
@@ -1935,6 +1939,7 @@ pub fn capture_memory_snapshot(
     buf.extend_from_slice(&(brk as u64).to_le_bytes());
     buf.extend_from_slice(&(entry_point as u64).to_le_bytes());
     buf.extend_from_slice(&(stack_top as u64).to_le_bytes());
+    buf.extend_from_slice(&(trampoline_start as u64).to_le_bytes());
     buf
 }
 
@@ -1952,6 +1957,8 @@ pub struct ParsedSnapshot {
     pub brk: usize,
     pub entry_point: usize,
     pub stack_top: usize,
+    /// Guest virtual address of the rewriter trampoline page (0 if none).
+    pub trampoline_start: usize,
 }
 
 /// Deserializes a memory snapshot from bytes.
@@ -1993,11 +2000,18 @@ pub fn parse_memory_snapshot(data: &[u8]) -> ParsedSnapshot {
     let entry_point = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
     offset += 8;
     let stack_top = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
+    offset += 8;
+    let trampoline_start = if offset + 8 <= data.len() {
+        u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize
+    } else {
+        0
+    };
 
     ParsedSnapshot {
         vmas,
         brk,
         entry_point,
         stack_top,
+        trampoline_start,
     }
 }

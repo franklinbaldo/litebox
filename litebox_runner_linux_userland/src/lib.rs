@@ -525,13 +525,42 @@ pub fn run(mut cli_args: CliArgs) -> Result<()> {
         .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
         .collect();
 
-    let program = shim.load_program(
-        initial_file_system,
-        platform.init_task(),
-        prog_path,
-        argv,
-        envp,
-    )?;
+    let program = {
+        #[cfg(feature = "rr")]
+        {
+            if cli_args.rr_replay.is_some() && shim.rr_peek_is_snapshot() {
+                // Replay with snapshot — skip ELF loading
+                shim.load_program_from_snapshot(initial_file_system, platform.init_task())
+                    .map_err(|e| anyhow!("failed to restore snapshot: {e:?}"))?
+            } else {
+                // Normal load (also handles recording)
+                let prog = shim.load_program(
+                    initial_file_system,
+                    platform.init_task(),
+                    prog_path,
+                    argv,
+                    envp,
+                )?;
+                // During recording, capture snapshot after load
+                shim.capture_initial_snapshot(
+                    prog.entry_point,
+                    prog.stack_top,
+                    prog.trampoline_start,
+                );
+                prog
+            }
+        }
+        #[cfg(not(feature = "rr"))]
+        {
+            shim.load_program(
+                initial_file_system,
+                platform.init_task(),
+                prog_path,
+                argv,
+                envp,
+            )?
+        }
+    };
 
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();

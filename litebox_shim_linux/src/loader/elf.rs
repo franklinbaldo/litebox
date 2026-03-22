@@ -150,9 +150,12 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for ElfFile<'_, FS> {
 
 /// Struct to hold the information needed to start the program
 /// (entry point and user stack top).
+#[derive(Clone, Copy)]
 pub struct ElfLoadInfo {
     pub entry_point: usize,
     pub user_stack_top: usize,
+    /// Guest virtual address of the rewriter trampoline page, or 0 if none.
+    pub trampoline_start: usize,
 }
 
 /// Loader for ELF files
@@ -250,6 +253,7 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
         Ok(ElfLoadInfo {
             entry_point: entry,
             user_stack_top: stack.get_cur_stack_top(),
+            trampoline_start: info.trampoline_start,
         })
     }
 

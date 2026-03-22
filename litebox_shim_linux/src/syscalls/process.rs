@@ -31,7 +31,7 @@ use litebox_platform_multiplex::Platform;
 
 /// Process-management-related state on [`Task`].
 pub(crate) struct ThreadState {
-    init_state: Cell<ThreadInitState>,
+    pub(crate) init_state: Cell<ThreadInitState>,
     process: Arc<Process>,
     /// Thread state that can be accessed from a remote thread.
     remote: Arc<ThreadRemote>,
@@ -313,7 +313,7 @@ impl<FS: ShimFS> Task<FS> {
 }
 
 #[derive(Default)]
-enum ThreadInitState {
+pub(crate) enum ThreadInitState {
     #[default]
     None,
     NewProcess(crate::loader::elf::ElfLoadInfo),
@@ -1483,7 +1483,8 @@ impl<FS: ShimFS> Task<FS> {
             ctx.xgs.truncate(),
         );
 
-        self.load_program(loader, argv_vec, envp_vec)
+        let _load_info = self
+            .load_program(loader, argv_vec, envp_vec)
             .expect("TODO: terminate the process cleanly");
 
         self.init_thread_context(ctx);
@@ -1497,7 +1498,7 @@ impl<FS: ShimFS> Task<FS> {
         mut loader: crate::loader::elf::ElfLoader<'_, FS>,
         argv: Vec<alloc::ffi::CString>,
         mut envp: Vec<alloc::ffi::CString>,
-    ) -> Result<(), crate::loader::elf::ElfLoaderError> {
+    ) -> Result<crate::loader::elf::ElfLoadInfo, crate::loader::elf::ElfLoaderError> {
         if let Some(filter) = self.global.load_filter {
             filter(&mut envp);
         }
@@ -1506,10 +1507,9 @@ impl<FS: ShimFS> Task<FS> {
 
         self.set_task_comm(loader.comm());
 
-        self.thread
-            .init_state
-            .set(ThreadInitState::NewProcess(load_info));
-        Ok(())
+        let ret = load_info;
+        self.thread.init_state.set(ThreadInitState::NewProcess(ret));
+        Ok(ret)
     }
 
     pub(crate) fn handle_init_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
