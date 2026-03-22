@@ -904,6 +904,53 @@ fn test_rr_replay_uses_trace_argv() {
     );
 }
 
+/// Verify that recorded traces contain at least one memory snapshot event
+/// (the initial snapshot emitted after load_program).
+#[cfg(feature = "rr")]
+#[test]
+fn test_rr_trace_contains_snapshot() {
+    let unique_name = "snapshot_check_rr";
+    let target = common::compile("./tests/hello.c", unique_name, true, false);
+    let dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    let trace_path = dir.join("snapshot_check_rr.trace");
+
+    // Record
+    let _record_output = Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_record"))
+        .runner_arg("--rr-record")
+        .runner_arg(&trace_path)
+        .output();
+
+    assert!(trace_path.exists(), "trace file was not created");
+
+    // Parse the trace and look for a Snapshot event.
+    let trace_bytes = std::fs::read(&trace_path).expect("failed to read trace");
+    let mut replayer =
+        litebox_rr::Replayer::from_bytes(trace_bytes).expect("failed to parse trace");
+
+    let mut snapshot_count = 0;
+    while let Ok(event) = replayer.next_event() {
+        if event.kind == litebox_rr::EventKind::Snapshot {
+            snapshot_count += 1;
+            // The snapshot should have non-empty data (serialized VMAs).
+            assert!(
+                !event.data.is_empty(),
+                "snapshot event should contain non-empty data"
+            );
+            // Sentinel syscall number
+            assert_eq!(
+                event.syscall_nr,
+                litebox_rr::EXECVE_SNAPSHOT_NR,
+                "snapshot event should use EXECVE_SNAPSHOT_NR sentinel"
+            );
+        }
+    }
+
+    assert!(
+        snapshot_count >= 1,
+        "trace should contain at least one snapshot event, found {snapshot_count}"
+    );
+}
+
 /// Replay a trace with NO program path on the CLI — only the trace file.
 /// The program path, argv, envp, and initial-files all come from the trace
 /// metadata, so the user doesn't need to supply them.
