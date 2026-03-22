@@ -292,6 +292,11 @@ where
         vmem.brk = brk;
     }
 
+    /// Returns the current program break address.
+    pub fn current_brk(&self) -> usize {
+        self.vmem.read().brk
+    }
+
     /// Set the program break to the given address.
     ///
     /// Increasing the program break has the effect of allocating memory to the process;

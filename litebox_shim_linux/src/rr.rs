@@ -10,6 +10,7 @@ use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 use litebox_rr::{Event, EventKind, Recorder, ReplayError, Replayer, TraceArch, TraceMetadata};
 
+use litebox::mm::linux::VmFlags;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 
 use crate::{MutPtr, Platform};
@@ -224,6 +225,23 @@ impl RRState {
         self.replayer
             .as_ref()
             .and_then(|r| r.lock().peek_event_kind())
+    }
+
+    /// Records a memory snapshot event during recording.
+    ///
+    /// `snapshot_data` is the serialized memory snapshot.
+    /// `tid` is the RR-normalized thread id.
+    pub fn record_snapshot(&self, snapshot_data: Vec<u8>, tid: u32) {
+        if let Some(ref recorder) = self.recorder {
+            recorder.lock().record_snapshot(snapshot_data, tid);
+        }
+    }
+
+    /// Returns `true` if the next replay event is a memory snapshot.
+    pub fn peek_is_snapshot(&self) -> bool {
+        self.replayer
+            .as_ref()
+            .is_some_and(|r| r.lock().peek_is_snapshot())
     }
 
     /// During replay, consume the next signal event from the trace.
@@ -1876,4 +1894,110 @@ pub fn patch_mmap_for_replay(ctx: &mut litebox_common_linux::PtRegs, recorded_re
     }
 
     true
+}
+
+// ---------------------------------------------------------------------------
+// Memory snapshot capture and restore
+// ---------------------------------------------------------------------------
+
+/// Captures a memory snapshot: all VMAs + contents + brk + entry/stack.
+///
+/// `mappings` is the list of `(range, flags)` from `PageManager::mappings()`.
+/// `brk` is the current program break.
+/// `entry_point` and `stack_top` come from `ElfLoadInfo`.
+///
+/// Returns serialized snapshot bytes.
+#[allow(clippy::cast_possible_truncation)]
+pub fn capture_memory_snapshot(
+    mappings: &[(core::ops::Range<usize>, VmFlags)],
+    brk: usize,
+    entry_point: usize,
+    stack_top: usize,
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let num_vmas = mappings.len() as u32;
+    buf.extend_from_slice(&num_vmas.to_le_bytes());
+
+    for (range, flags) in mappings {
+        let start = range.start as u64;
+        let end = range.end as u64;
+        let len = range.end.saturating_sub(range.start);
+        buf.extend_from_slice(&start.to_le_bytes());
+        buf.extend_from_slice(&end.to_le_bytes());
+        buf.extend_from_slice(&flags.bits().to_le_bytes());
+
+        let data = read_guest_bytes(range.start, len);
+        let data_len = data.len() as u64;
+        buf.extend_from_slice(&data_len.to_le_bytes());
+        buf.extend_from_slice(&data);
+    }
+
+    buf.extend_from_slice(&(brk as u64).to_le_bytes());
+    buf.extend_from_slice(&(entry_point as u64).to_le_bytes());
+    buf.extend_from_slice(&(stack_top as u64).to_le_bytes());
+    buf
+}
+
+/// Parsed VMA from a memory snapshot.
+pub struct SnapshotVma {
+    pub start: usize,
+    pub end: usize,
+    pub flags: VmFlags,
+    pub data: Vec<u8>,
+}
+
+/// Result of deserializing a memory snapshot.
+pub struct ParsedSnapshot {
+    pub vmas: Vec<SnapshotVma>,
+    pub brk: usize,
+    pub entry_point: usize,
+    pub stack_top: usize,
+}
+
+/// Deserializes a memory snapshot from bytes.
+///
+/// # Panics
+///
+/// Panics if the data is malformed (truncated or inconsistent).
+#[allow(clippy::cast_possible_truncation)]
+pub fn parse_memory_snapshot(data: &[u8]) -> ParsedSnapshot {
+    let mut offset = 0;
+
+    let num_vmas = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+    offset += 4;
+
+    let mut vmas = Vec::with_capacity(num_vmas);
+    for _ in 0..num_vmas {
+        let start = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
+        offset += 8;
+        let end = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
+        offset += 8;
+        let flags_bits = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+        offset += 4;
+        let data_len = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
+        offset += 8;
+        let vma_data = data[offset..offset + data_len].to_vec();
+        offset += data_len;
+
+        let flags = VmFlags::from_bits_truncate(flags_bits);
+        vmas.push(SnapshotVma {
+            start,
+            end,
+            flags,
+            data: vma_data,
+        });
+    }
+
+    let brk = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
+    offset += 8;
+    let entry_point = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
+    offset += 8;
+    let stack_top = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
+
+    ParsedSnapshot {
+        vmas,
+        brk,
+        entry_point,
+        stack_top,
+    }
 }
