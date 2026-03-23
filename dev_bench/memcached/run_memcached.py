@@ -399,7 +399,6 @@ def run_native(
         str(memcached),
         "-l", "127.0.0.1",
         "-p", str(MEMCACHED_PORT),
-        "-c", "8",         # limit connections
     ]
     # -u is required when running as root
     if os.getuid() == 0:
@@ -576,7 +575,6 @@ def run_litebox(
         str(rewritten),
         "-l", GUEST_IP,
         "-p", str(MEMCACHED_PORT),
-        "-c", "8",
     ]
 
     print(f"  Starting LiteBox memcached:\n    {' '.join(server_cmd)}")
@@ -714,7 +712,6 @@ def run_gvisor(
         "memcached",
         "-l", "0.0.0.0",
         "-p", str(port),
-        "-c", "8",
         "-u", "memcache",
     ]
 
