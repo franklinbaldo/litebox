@@ -500,6 +500,28 @@ impl<FS: ShimFS> LinuxShim<FS> {
         let syscall_ep = self.0.platform.get_syscall_entry_point();
         let trampoline_vaddr = snapshot.trampoline_start;
 
+        // Extract the OLD (stale) host entry point from the known trampoline's
+        // snapshot data. We need this to identify ALL trampoline pages — the
+        // main binary and the dynamic linker each get their own trampoline page,
+        // but `trampoline_start` only records the main one.
+        let old_syscall_ep: Option<[u8; core::mem::size_of::<usize>()]> = if trampoline_vaddr != 0 {
+            snapshot
+                .vmas
+                .iter()
+                .find(|v| v.start == trampoline_vaddr)
+                .and_then(|v| {
+                    if v.data.len() >= core::mem::size_of::<usize>() {
+                        let mut buf = [0u8; core::mem::size_of::<usize>()];
+                        buf.copy_from_slice(&v.data[..core::mem::size_of::<usize>()]);
+                        Some(buf)
+                    } else {
+                        None
+                    }
+                })
+        } else {
+            None
+        };
+
         // Restore memory from snapshot
         for vma in &snapshot.vmas {
             let len = vma.end - vma.start;
@@ -515,7 +537,16 @@ impl<FS: ShimFS> LinuxShim<FS> {
 
             let is_exec = vma.flags.contains(VmFlags::VM_EXEC);
             let is_write = vma.flags.contains(VmFlags::VM_WRITE);
-            let is_trampoline = trampoline_vaddr != 0 && vma.start == trampoline_vaddr;
+
+            // Detect trampoline pages: any R-X VMA whose first pointer-sized
+            // bytes match the old (stale) host syscall entry point is a
+            // trampoline that needs re-patching. This catches both the main
+            // binary's trampoline and the dynamic linker's trampoline.
+            let is_trampoline = is_exec
+                && !is_write
+                && old_syscall_ep.is_some_and(|old_ep| {
+                    vma.data.len() >= old_ep.len() && vma.data[..old_ep.len()] == old_ep
+                });
 
             let vma_data = &vma.data;
             let write_data =
