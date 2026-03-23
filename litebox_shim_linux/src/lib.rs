@@ -1155,10 +1155,9 @@ impl<FS: ShimFS> Task<FS> {
                         let mapped_addr = event.result as usize;
                         let mapped_len = event.data.len();
                         rr::inject_mmap_file_data(mapped_addr, &event.data);
-                        // If the original mapping was not writable, restore
-                        // the original protection after injecting data.
-                        // PROT_WRITE = 0x2
-                        if mmap_original_prot & 0x2 == 0 {
+                        // We mapped with PROT_READ|PROT_WRITE (0x3).
+                        // Restore original protection if it differs.
+                        if mmap_original_prot != 0x3 {
                             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                             let prot = litebox_common_linux::ProtFlags::from_bits_truncate(
                                 mmap_original_prot as i32,

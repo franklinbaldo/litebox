@@ -2523,18 +2523,19 @@ pub fn patch_mmap_for_replay(ctx: &mut litebox_common_linux::PtRegs, recorded_re
 /// executes.
 ///
 /// Patches:
-/// - prot (arg2): adds `PROT_WRITE` (0x2) so we can inject data after mapping
+/// - prot (arg2): sets to `PROT_READ | PROT_WRITE` (0x3) so we can inject
+///   data after mapping without creating unsupported RWX pages
 /// - flags (arg3): adds `MAP_ANONYMOUS` (0x20)
 /// - fd (arg4): sets to `-1` (ignored for anonymous mappings)
 /// - offset (arg5): sets to `0`
 ///
 /// Returns the original prot value so the caller can mprotect back.
 pub fn patch_mmap_to_anonymous(ctx: &mut litebox_common_linux::PtRegs) -> usize {
-    // PROT_WRITE = 0x2, MAP_ANONYMOUS = 0x20
+    // PROT_READ | PROT_WRITE = 0x3, MAP_ANONYMOUS = 0x20
     #[cfg(target_arch = "x86_64")]
     {
         let original_prot = ctx.rdx;
-        ctx.rdx |= 0x2; // add PROT_WRITE
+        ctx.rdx = 0x3; // PROT_READ | PROT_WRITE (not OR — avoids RWX)
         ctx.r10 |= 0x20;
         ctx.r8 = usize::MAX; // fd = -1
         ctx.r9 = 0; // offset = 0
@@ -2543,7 +2544,7 @@ pub fn patch_mmap_to_anonymous(ctx: &mut litebox_common_linux::PtRegs) -> usize 
     #[cfg(target_arch = "x86")]
     {
         let original_prot = ctx.edx;
-        ctx.edx |= 0x2; // add PROT_WRITE
+        ctx.edx = 0x3; // PROT_READ | PROT_WRITE (not OR — avoids RWX)
         ctx.esi |= 0x20;
         ctx.edi = usize::MAX; // fd = -1
         ctx.ebp = 0; // offset = 0
