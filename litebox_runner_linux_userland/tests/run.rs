@@ -207,6 +207,16 @@ fn find_c_test_files(dir: &str) -> Vec<PathBuf> {
             continue;
         }
         if let Some("c") = path.extension().and_then(|e| e.to_str()) {
+            // Skip *_rr.c files — those are RR-specific tests that need
+            // special setup (trace recording, test data files, etc.) and
+            // are run by dedicated test functions.
+            if path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|stem| stem.ends_with("_rr"))
+            {
+                continue;
+            }
             files.push(path);
         }
     }
