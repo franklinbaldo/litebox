@@ -783,6 +783,45 @@ fn test_rr_record_replay_mmap() {
         .run();
 }
 
+/// Record a program that does file-backed mmap (MAP_PRIVATE on a real file),
+/// replay it, and verify the mapped file contents are correctly restored from
+/// the trace even though the fd is a phantom during replay.
+#[cfg(feature = "rr")]
+#[test]
+fn test_rr_record_replay_mmap_file() {
+    let unique_name = "mmap_file_rr";
+    let target = common::compile("./tests/mmap_file_rr.c", unique_name, true, false);
+    let dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    let trace_path = dir.join("mmap_file_rr.trace");
+
+    // --- Record ---
+    // The test program reads /out/testdata.bin, so we must create that file
+    // inside the tar filesystem. The file contains bytes 0x00..0xFF repeated
+    // 16 times (4096 bytes total).
+    let mut runner = Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_record"));
+    runner
+        .runner_arg("--rr-record")
+        .runner_arg(&trace_path)
+        .with_fs_path(|tar_dir| {
+            let mut data = vec![0u8; 4096];
+            #[allow(clippy::cast_possible_truncation)]
+            for (i, byte) in data.iter_mut().enumerate() {
+                *byte = (i % 256) as u8;
+            }
+            std::fs::write(tar_dir.join("out/testdata.bin"), &data).unwrap();
+        });
+    runner.run();
+
+    assert!(trace_path.exists(), "trace file was not created");
+
+    // --- Replay (fd from open is a phantom — file-backed mmap must be
+    // replayed from captured trace data) ---
+    Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_replay"))
+        .runner_arg("--rr-replay")
+        .runner_arg(&trace_path)
+        .run();
+}
+
 /// Record a multithreaded test program (spawns 2 threads, shared atomic
 /// counter, join), replay it, and verify successful completion.
 #[cfg(feature = "rr")]

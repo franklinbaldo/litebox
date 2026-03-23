@@ -1104,11 +1104,29 @@ impl<FS: ShimFS> Task<FS> {
             // mapping lands at exactly the same virtual address as during
             // recording. Peek at the trace to get the recorded return value
             // and patch the registers to use MAP_FIXED at that address.
-            if syscall_nr == rr::nr_pub::MMAP
-                && let Some(recorded_result) = self.global.rr_state.peek_event_result()
-            {
-                rr::patch_mmap_for_replay(ctx, recorded_result);
-            }
+            //
+            // For file-backed mmaps (trace event has non-empty data), we also
+            // convert the mmap to MAP_ANONYMOUS because the fd may be a
+            // phantom (the corresponding open was non-structural and never
+            // actually executed). The captured file contents are injected
+            // into the mapping after it is created.
+            let (mmap_has_file_data, mmap_original_prot) = if syscall_nr == rr::nr_pub::MMAP {
+                let has_data = self
+                    .global
+                    .rr_state
+                    .peek_event_data_len()
+                    .is_some_and(|len| len > 0);
+                let mut original_prot = 0;
+                if let Some(recorded_result) = self.global.rr_state.peek_event_result() {
+                    rr::patch_mmap_for_replay(ctx, recorded_result);
+                    if has_data {
+                        original_prot = rr::patch_mmap_to_anonymous(ctx);
+                    }
+                }
+                (has_data, original_prot)
+            } else {
+                (false, 0)
+            };
 
             // Structural syscall — execute normally, but still consume
             // the trace event to keep the replay cursor in sync.
@@ -1124,13 +1142,32 @@ impl<FS: ShimFS> Task<FS> {
                 self.flush_exit_side_effects();
             }
 
-            // Consume and validate the trace event (ignore recorded data).
+            // Consume and validate the trace event. For file-backed mmaps,
+            // inject the captured file contents into the (now anonymous) mapping.
             match self
                 .global
                 .rr_state
                 .replay_event_checked(syscall_nr, self.rr_tid(), ctx)
             {
-                Ok(_event) => {}
+                Ok(event) => {
+                    if mmap_has_file_data && !event.data.is_empty() {
+                        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                        let mapped_addr = event.result as usize;
+                        let mapped_len = event.data.len();
+                        rr::inject_mmap_file_data(mapped_addr, &event.data);
+                        // If the original mapping was not writable, restore
+                        // the original protection after injecting data.
+                        // PROT_WRITE = 0x2
+                        if mmap_original_prot & 0x2 == 0 {
+                            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                            let prot = litebox_common_linux::ProtFlags::from_bits_truncate(
+                                mmap_original_prot as i32,
+                            );
+                            let addr = crate::MutPtr::<u8>::from_usize(mapped_addr);
+                            let _ = self.sys_mprotect(addr, mapped_len, prot);
+                        }
+                    }
+                }
                 Err(msg) => panic!("{msg}"),
             }
 

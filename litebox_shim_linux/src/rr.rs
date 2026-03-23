@@ -261,6 +261,14 @@ impl RRState {
             .and_then(|r| r.lock().peek_event_kind())
     }
 
+    /// During replay, peek at the `data_len` field of the next trace event
+    /// without consuming it. Returns `None` if the trace is exhausted.
+    pub fn peek_event_data_len(&self) -> Option<u32> {
+        self.replayer
+            .as_ref()
+            .and_then(|r| r.lock().peek_event_data_len())
+    }
+
     /// Records a memory snapshot event during recording.
     ///
     /// `snapshot_data` is the serialized memory snapshot.
@@ -1503,6 +1511,24 @@ pub fn capture_side_effects(
             read_guest_bytes(data_addr, cap_data_size * data_count)
         }
 
+        // mmap(addr, len, prot, flags, fd, offset) -> mapped_addr
+        // For file-backed mmaps (MAP_ANONYMOUS not set), capture the mapped
+        // memory contents so the trace is self-contained. During replay, the
+        // fd may be a phantom (the corresponding open was non-structural and
+        // never actually executed), so we convert the mmap to anonymous and
+        // inject the captured data.
+        nr::MMAP => {
+            let flags = ctx.syscall_arg(3);
+            // MAP_ANONYMOUS = 0x20
+            let is_anonymous = flags & 0x20 != 0;
+            if !is_anonymous && return_value != 0 {
+                let len = ctx.syscall_arg(1);
+                read_guest_bytes(return_value, len)
+            } else {
+                Vec::new()
+            }
+        }
+
         // No side-effect data for other syscalls.
         _ => Vec::new(),
     }
@@ -2489,6 +2515,47 @@ pub fn patch_mmap_for_replay(ctx: &mut litebox_common_linux::PtRegs, recorded_re
     }
 
     true
+}
+
+/// During replay of a file-backed mmap, convert it to an anonymous mapping.
+/// This is called when the trace event has non-empty data (captured file
+/// contents). The caller must inject the captured data after the mmap
+/// executes.
+///
+/// Patches:
+/// - prot (arg2): adds `PROT_WRITE` (0x2) so we can inject data after mapping
+/// - flags (arg3): adds `MAP_ANONYMOUS` (0x20)
+/// - fd (arg4): sets to `-1` (ignored for anonymous mappings)
+/// - offset (arg5): sets to `0`
+///
+/// Returns the original prot value so the caller can mprotect back.
+pub fn patch_mmap_to_anonymous(ctx: &mut litebox_common_linux::PtRegs) -> usize {
+    // PROT_WRITE = 0x2, MAP_ANONYMOUS = 0x20
+    #[cfg(target_arch = "x86_64")]
+    {
+        let original_prot = ctx.rdx;
+        ctx.rdx |= 0x2; // add PROT_WRITE
+        ctx.r10 |= 0x20;
+        ctx.r8 = usize::MAX; // fd = -1
+        ctx.r9 = 0; // offset = 0
+        original_prot
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        let original_prot = ctx.edx;
+        ctx.edx |= 0x2; // add PROT_WRITE
+        ctx.esi |= 0x20;
+        ctx.edi = usize::MAX; // fd = -1
+        ctx.ebp = 0; // offset = 0
+        original_prot
+    }
+}
+
+/// During replay, inject captured file contents into a file-backed mmap that
+/// was converted to anonymous. Writes `data` into guest memory at
+/// `mapped_addr`.
+pub fn inject_mmap_file_data(mapped_addr: usize, data: &[u8]) {
+    write_guest_bytes(mapped_addr, data);
 }
 
 // ---------------------------------------------------------------------------

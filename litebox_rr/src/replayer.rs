@@ -194,6 +194,27 @@ impl Replayer {
     pub fn peek_is_snapshot(&self) -> bool {
         self.peek_event_nr() == Some(crate::trace::EXECVE_SNAPSHOT_NR)
     }
+
+    /// Peek at the `data_len` field of the next event without consuming it.
+    /// Returns `None` if the trace is exhausted.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying slice conversion fails (should not happen when
+    /// the bounds check above succeeds).
+    pub fn peek_event_data_len(&self) -> Option<u32> {
+        if self.offset >= self.data.len() {
+            return None;
+        }
+        // data_len is at bytes [20..24] within the event.
+        let start = self.offset + 20;
+        if start + 4 > self.data.len() {
+            return None;
+        }
+        Some(u32::from_le_bytes(
+            self.data[start..start + 4].try_into().unwrap(),
+        ))
+    }
 }
 
 #[cfg(test)]
