@@ -1220,6 +1220,17 @@ pub fn capture_side_effects(
             }
         }
 
+        // rt_sigtimedwait(set, info, timeout, sigsetsize) -> signal_nr
+        // info = arg1, sizeof(siginfo_t) = 128
+        nr::RT_SIGTIMEDWAIT => {
+            let info_addr = ctx.syscall_arg(1);
+            if info_addr != 0 {
+                read_guest_bytes(info_addr, 128) // sizeof(siginfo_t)
+            } else {
+                Vec::new()
+            }
+        }
+
         // -----------------------------------------------------------
         // Process info syscalls
         // -----------------------------------------------------------
@@ -1324,6 +1335,17 @@ pub fn capture_side_effects(
             )
         }
 
+        // poll(fds, nfds, timeout) -> ready_count
+        // Same as ppoll: capture entire pollfd array with updated revents.
+        nr::POLL => {
+            let fds_addr = ctx.syscall_arg(0);
+            let nfds = ctx.syscall_arg(1);
+            read_guest_bytes(
+                fds_addr,
+                nfds * core::mem::size_of::<litebox_common_linux::Pollfd>(),
+            )
+        }
+
         // pselect6(nfds, readfds, writefds, exceptfds, timeout, sigsetpack) -> ready_count
         // Each fd_set is ceil(nfds / bits_per_usize) * sizeof(usize) bytes.
         // Concatenate: [readfds] + [writefds] + [exceptfds] (skip null ones).
@@ -1344,6 +1366,16 @@ pub fn capture_side_effects(
         // epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize) -> ready_count
         // events = arg1, sizeof(EpollEvent) = 12 (packed)
         nr::EPOLL_PWAIT => {
+            let events_addr = ctx.syscall_arg(1);
+            read_guest_bytes(
+                events_addr,
+                return_value * core::mem::size_of::<litebox_common_linux::EpollEvent>(),
+            )
+        }
+
+        // epoll_wait(epfd, events, maxevents, timeout) -> ready_count
+        // Same as epoll_pwait: capture ready_count epoll_event structs.
+        nr::EPOLL_WAIT => {
             let events_addr = ctx.syscall_arg(1);
             read_guest_bytes(
                 events_addr,
@@ -1564,6 +1596,16 @@ fn capture_side_effects_on_error(
             }
         }
 
+        // nanosleep(req, rem) — rem = arg1, written on EINTR
+        nr::NANOSLEEP if result_signed == Errno::EINTR.as_neg() as isize => {
+            let remain_addr = ctx.syscall_arg(1);
+            if remain_addr != 0 {
+                read_guest_bytes(remain_addr, 16) // sizeof(struct timespec)
+            } else {
+                Vec::new()
+            }
+        }
+
         // sigaltstack: writes old_ss even when returning EPERM.
         nr::SIGALTSTACK if result_signed == Errno::EPERM.as_neg() as isize => {
             let old_ss_addr = ctx.syscall_arg(1);
@@ -1750,6 +1792,14 @@ pub fn inject_side_effects(syscall_nr: u32, ctx: &litebox_common_linux::PtRegs, 
             }
         }
 
+        // rt_sigtimedwait: info = arg1
+        nr::RT_SIGTIMEDWAIT => {
+            let info_addr = ctx.syscall_arg(1);
+            if info_addr != 0 {
+                write_guest_bytes(info_addr, data);
+            }
+        }
+
         // -----------------------------------------------------------
         // Process info syscalls
         // -----------------------------------------------------------
@@ -1808,6 +1858,14 @@ pub fn inject_side_effects(syscall_nr: u32, ctx: &litebox_common_linux::PtRegs, 
             }
         }
 
+        // nanosleep: remain = arg1 (on EINTR)
+        nr::NANOSLEEP => {
+            let remain_addr = ctx.syscall_arg(1);
+            if remain_addr != 0 {
+                write_guest_bytes(remain_addr, data);
+            }
+        }
+
         // get_robust_list: data = [head_ptr bytes] + [len bytes]
         nr::GET_ROBUST_LIST => {
             let ptr_size = core::mem::size_of::<usize>();
@@ -1829,6 +1887,12 @@ pub fn inject_side_effects(syscall_nr: u32, ctx: &litebox_common_linux::PtRegs, 
             write_guest_bytes(fds_addr, data);
         }
 
+        // poll: write entire pollfd array back to arg0 (same as ppoll)
+        nr::POLL => {
+            let fds_addr = ctx.syscall_arg(0);
+            write_guest_bytes(fds_addr, data);
+        }
+
         // pselect6: data = [readfds] + [writefds] + [exceptfds] (concatenated)
         nr::PSELECT6 => {
             let nfds = ctx.syscall_arg(0);
@@ -1846,6 +1910,12 @@ pub fn inject_side_effects(syscall_nr: u32, ctx: &litebox_common_linux::PtRegs, 
 
         // epoll_pwait: events = arg1
         nr::EPOLL_PWAIT => {
+            let events_addr = ctx.syscall_arg(1);
+            write_guest_bytes(events_addr, data);
+        }
+
+        // epoll_wait: events = arg1 (same as epoll_pwait)
+        nr::EPOLL_WAIT => {
             let events_addr = ctx.syscall_arg(1);
             write_guest_bytes(events_addr, data);
         }
