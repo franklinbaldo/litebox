@@ -863,6 +863,136 @@ fn test_rr_record_replay_threads() {
         .run();
 }
 
+/// Record the efault test (write with invalid pointer → EFAULT), replay it,
+/// and verify successful completion.
+#[cfg(feature = "rr")]
+#[test]
+fn test_rr_record_replay_efault() {
+    let unique_name = "efault_rr";
+    let target = common::compile("./tests/efault.c", unique_name, true, false);
+    let dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    let trace_path = dir.join("efault_rr.trace");
+
+    // --- Record ---
+    Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_record"))
+        .runner_arg("--rr-record")
+        .runner_arg(&trace_path)
+        .run();
+
+    assert!(trace_path.exists(), "trace file was not created");
+
+    // --- Replay ---
+    Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_replay"))
+        .runner_arg("--rr-replay")
+        .runner_arg(&trace_path)
+        .run();
+}
+
+/// Record the execve test (exercises execve with fd close-on-exec semantics
+/// and thread teardown), replay it, and verify successful completion.
+///
+/// NOTE: Currently disabled — recording hangs because the RR coordinator
+/// deadlocks when execve tears down threads that are waiting for the run
+/// token. This requires changes to how execve interacts with the
+/// `RunCoordinator`.
+#[cfg(feature = "rr")]
+#[test]
+#[ignore = "RR record hangs: execve + multithreaded teardown deadlocks coordinator"]
+fn test_rr_record_replay_execve() {
+    let unique_name = "execve_rr";
+    let target = common::compile_with_extra_args(
+        "./tests/execve.c",
+        unique_name,
+        true,
+        false,
+        &["-lpthread"],
+    );
+    let dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    let trace_path = dir.join("execve_rr.trace");
+
+    // --- Record ---
+    Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_record"))
+        .runner_arg("--rr-record")
+        .runner_arg(&trace_path)
+        .run();
+
+    assert!(trace_path.exists(), "trace file was not created");
+
+    // --- Replay ---
+    Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_replay"))
+        .runner_arg("--rr-replay")
+        .runner_arg(&trace_path)
+        .run();
+}
+
+/// Record the thread_exit test (non-main thread calls exit while other threads
+/// are blocked in diverse syscalls), replay it, and verify successful
+/// completion.
+///
+/// NOTE: Currently disabled — recording hangs because the RR coordinator
+/// deadlocks when exit is called from a non-main thread while other threads
+/// are blocked in syscalls waiting for the run token.
+#[cfg(feature = "rr")]
+#[test]
+#[ignore = "RR record hangs: non-main-thread exit deadlocks coordinator"]
+fn test_rr_record_replay_thread_exit() {
+    let unique_name = "thread_exit_rr";
+    let target = common::compile_with_extra_args(
+        "./tests/thread_exit.c",
+        unique_name,
+        true,
+        false,
+        &["-lpthread"],
+    );
+    let dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    let trace_path = dir.join("thread_exit_rr.trace");
+
+    // --- Record ---
+    Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_record"))
+        .runner_arg("--rr-record")
+        .runner_arg(&trace_path)
+        .run();
+
+    assert!(trace_path.exists(), "trace file was not created");
+
+    // --- Replay ---
+    Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_replay"))
+        .runner_arg("--rr-replay")
+        .runner_arg(&trace_path)
+        .run();
+}
+
+/// Record the unix socket test (socketpair + filesystem-bound AF_UNIX with
+/// threaded client/server), replay it, and verify successful completion.
+#[cfg(feature = "rr")]
+#[test]
+fn test_rr_record_replay_unix() {
+    let unique_name = "unix_rr";
+    let target = common::compile_with_extra_args(
+        "./tests/unix.c",
+        unique_name,
+        true,
+        false,
+        &["-lpthread"],
+    );
+    let dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    let trace_path = dir.join("unix_rr.trace");
+
+    // --- Record ---
+    Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_record"))
+        .runner_arg("--rr-record")
+        .runner_arg(&trace_path)
+        .run();
+
+    assert!(trace_path.exists(), "trace file was not created");
+
+    // --- Replay ---
+    Runner::new(Backend::Rewriter, &target, &format!("{unique_name}_replay"))
+        .runner_arg("--rr-replay")
+        .runner_arg(&trace_path)
+        .run();
+}
+
 /// Record hello, then replay with `--rr-replay-stdout` and verify that the
 /// replayed stdout output matches the recorded output byte-for-byte.
 #[cfg(feature = "rr")]
