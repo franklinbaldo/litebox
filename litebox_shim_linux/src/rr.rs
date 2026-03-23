@@ -293,6 +293,48 @@ impl RRState {
         }
     }
 
+    /// Wrapper around [`replay_event()`] that also pushes the consumed event
+    /// into the history ring buffer and, on divergence, formats a rich error
+    /// message including syscall names, register arguments, and recent history.
+    pub fn replay_event_checked(
+        &self,
+        actual_syscall_nr: u32,
+        actual_tid: u32,
+        ctx: &litebox_common_linux::PtRegs,
+    ) -> Result<Event, alloc::string::String> {
+        match self.replay_event(actual_syscall_nr) {
+            Ok(event) => {
+                self.push_event_history(&event);
+                Ok(event)
+            }
+            Err(ReplayError::Divergence {
+                event_id,
+                expected_syscall_nr,
+                actual_syscall_nr,
+            }) => Err(alloc::format!(
+                "RR DIVERGENCE at event #{event_id}:\n\
+                 \x20 Expected: syscall {} (nr={expected_syscall_nr})\n\
+                 \x20 Actual:   syscall {} (nr={actual_syscall_nr}) tid={actual_tid}\n\
+                 \x20 Syscall args: [{}]\n\
+                 \x20 Event history (last 10):\n{}",
+                syscall_name(expected_syscall_nr),
+                syscall_name(actual_syscall_nr),
+                format_syscall_args(ctx),
+                self.format_event_history(),
+            )),
+            Err(ReplayError::EndOfTrace) => Err(alloc::format!(
+                "RR unexpected end of trace:\n\
+                 \x20 Actual: syscall {} (nr={actual_syscall_nr}) tid={actual_tid}\n\
+                 \x20 Syscall args: [{}]\n\
+                 \x20 Event history (last 10):\n{}",
+                syscall_name(actual_syscall_nr),
+                format_syscall_args(ctx),
+                self.format_event_history(),
+            )),
+            Err(e) => Err(alloc::format!("RR replay error: {e:?}")),
+        }
+    }
+
     /// Record a consumed event in the history ring buffer (max 10 entries).
     fn push_event_history(&self, event: &litebox_rr::Event) {
         let mut history = self.event_history.lock();

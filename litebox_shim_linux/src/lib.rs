@@ -1020,14 +1020,13 @@ impl<FS: ShimFS> Task<FS> {
             // --- Blocking syscall replay: ENTRY + EXIT ---
 
             // 1. Consume the ENTRY event (validates syscall_nr).
-            match self.global.rr_state.replay_event(syscall_nr) {
+            match self
+                .global
+                .rr_state
+                .replay_event_checked(syscall_nr, self.rr_tid(), ctx)
+            {
                 Ok(_entry) => {}
-                Err(e) => {
-                    panic!(
-                        "replay error on ENTRY event: {e:?} (my_tid={}, syscall_nr={syscall_nr})",
-                        self.rr_tid()
-                    );
-                }
+                Err(msg) => panic!("{msg}"),
             }
 
             // 2. Release token and schedule the next thread from the trace.
@@ -1053,7 +1052,11 @@ impl<FS: ShimFS> Task<FS> {
             //    If replay-stdout is enabled, execute writes to stdout/stderr
             //    on the host before injecting the trace return value.
             rr::maybe_replay_stdio_write(syscall_nr, ctx, self.global.rr_state.replay_stdout());
-            match self.global.rr_state.replay_event(syscall_nr) {
+            match self
+                .global
+                .rr_state
+                .replay_event_checked(syscall_nr, self.rr_tid(), ctx)
+            {
                 Ok(event) => {
                     if !event.data.is_empty() {
                         rr::inject_side_effects(syscall_nr, ctx, &event.data);
@@ -1062,7 +1065,7 @@ impl<FS: ShimFS> Task<FS> {
                     let return_value = event.result as usize;
                     rr::set_return_value(ctx, return_value);
                 }
-                Err(e) => panic!("replay error on EXIT event: {e:?}"),
+                Err(msg) => panic!("{msg}"),
             }
         } else if rr::is_structural(syscall_nr) {
             // --- Structural syscall: execute normally ---
@@ -1091,9 +1094,13 @@ impl<FS: ShimFS> Task<FS> {
             }
 
             // Consume and validate the trace event (ignore recorded data).
-            match self.global.rr_state.replay_event(syscall_nr) {
+            match self
+                .global
+                .rr_state
+                .replay_event_checked(syscall_nr, self.rr_tid(), ctx)
+            {
                 Ok(_event) => {}
-                Err(e) => panic!("replay divergence on structural syscall: {e:?}"),
+                Err(msg) => panic!("{msg}"),
             }
 
             // If this was an execve, consume the snapshot event that follows
@@ -1111,7 +1118,11 @@ impl<FS: ShimFS> Task<FS> {
             //    If replay-stdout is enabled, execute writes to stdout/stderr
             //    on the host before injecting the trace return value.
             rr::maybe_replay_stdio_write(syscall_nr, ctx, self.global.rr_state.replay_stdout());
-            match self.global.rr_state.replay_event(syscall_nr) {
+            match self
+                .global
+                .rr_state
+                .replay_event_checked(syscall_nr, self.rr_tid(), ctx)
+            {
                 Ok(event) => {
                     // Inject side-effect data into guest memory.
                     if !event.data.is_empty() {
@@ -1122,9 +1133,7 @@ impl<FS: ShimFS> Task<FS> {
                     let return_value = event.result as usize;
                     rr::set_return_value(ctx, return_value);
                 }
-                Err(e) => {
-                    panic!("replay error: {e:?}");
-                }
+                Err(msg) => panic!("{msg}"),
             }
         }
 
