@@ -399,9 +399,7 @@ def run_native(
         str(memcached),
         "-l", "127.0.0.1",
         "-p", str(MEMCACHED_PORT),
-        "-t", "1",         # single thread for fair comparison
-        "-m", "256",       # 256 MB memory limit
-        "-c", "1024",      # max connections
+        "-c", "8",         # limit connections
     ]
     # -u is required when running as root
     if os.getuid() == 0:
@@ -578,9 +576,7 @@ def run_litebox(
         str(rewritten),
         "-l", GUEST_IP,
         "-p", str(MEMCACHED_PORT),
-        "-t", "1",
-        "-m", "256",
-        "-c", "1024",
+        "-c", "8",
     ]
 
     print(f"  Starting LiteBox memcached:\n    {' '.join(server_cmd)}")
@@ -676,6 +672,15 @@ GVISOR_MEMCACHED_IMAGE = "memcached:1.6.41"
 _gvisor_container_seq = 0
 
 
+# /etc/docker/deamon.json
+# {
+#     "runtimes": {
+#         "runsc": {
+#             "path": "/usr/local/bin/runsc",
+#             "runtimeArgs": ["--gso=false"]
+#         }
+#     }
+# }
 def run_gvisor(
     requests_per_client: int,
     clients: int,
@@ -709,9 +714,7 @@ def run_gvisor(
         "memcached",
         "-l", "0.0.0.0",
         "-p", str(port),
-        "-t", "1",
-        "-m", "256",
-        "-c", "1024",
+        "-c", "8",
         "-u", "memcache",
     ]
 
