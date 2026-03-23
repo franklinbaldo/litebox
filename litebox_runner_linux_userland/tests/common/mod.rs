@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+#![allow(dead_code)]
+
 use glob::glob;
 use std::path::{Path, PathBuf};
 
