@@ -1436,6 +1436,9 @@ pub fn capture_side_effects(
             data
         }
 
+        // recvmsg(sockfd, msg, flags) -> bytes_received
+        nr::RECVMSG => capture_recvmsg_data(ctx, return_value),
+
         // socketpair(domain, type, protocol, sv) -> 0
         // sv = arg3, 8 bytes (two i32s)
         nr::SOCKETPAIR => {
@@ -1565,6 +1568,165 @@ fn capture_readv_data(ctx: &litebox_common_linux::PtRegs, total_bytes_read: usiz
         let chunk = read_guest_bytes(base, to_read);
         result.extend_from_slice(&chunk);
         remaining = remaining.saturating_sub(chunk.len());
+    }
+
+    result
+}
+
+/// Capture `recvmsg` output: scatter-gather iovec data + updated msghdr fields.
+///
+/// Serialized format:
+/// - `msg_namelen` (4 bytes LE) — updated name length
+/// - `msg_name` data (`msg_namelen` bytes)
+/// - `msg_controllen` (8 bytes LE) — updated control length
+/// - `msg_control` data (`msg_controllen` bytes)
+/// - `msg_flags` (4 bytes LE)
+/// - iovec scatter data (concatenated, total = `return_value` bytes)
+fn capture_recvmsg_data(ctx: &litebox_common_linux::PtRegs, total_bytes_read: usize) -> Vec<u8> {
+    #[cfg(target_arch = "x86_64")]
+    const IOVEC_SIZE: usize = 16;
+    #[cfg(target_arch = "x86")]
+    const IOVEC_SIZE: usize = 8;
+    const PTR_SIZE: usize = core::mem::size_of::<usize>();
+    // msghdr is 56 bytes on x86_64, 28 on x86
+    #[cfg(target_arch = "x86_64")]
+    const MSGHDR_SIZE: usize = 56;
+    #[cfg(target_arch = "x86")]
+    const MSGHDR_SIZE: usize = 28;
+
+    let msghdr_addr = ctx.syscall_arg(1);
+    if msghdr_addr == 0 {
+        return Vec::new();
+    }
+
+    let msghdr_bytes = read_guest_bytes(msghdr_addr, MSGHDR_SIZE);
+    if msghdr_bytes.len() < MSGHDR_SIZE {
+        return Vec::new();
+    }
+
+    let mut result = Vec::new();
+
+    // Parse msghdr fields (native endian — same machine capture)
+    let mut off = 0;
+
+    // msg_name: ptr at offset 0
+    let msg_name_ptr = usize::from_ne_bytes(
+        msghdr_bytes[off..off + PTR_SIZE]
+            .try_into()
+            .unwrap_or([0u8; PTR_SIZE]),
+    );
+    off += PTR_SIZE;
+
+    // msg_namelen: u32 at offset PTR_SIZE
+    let msg_namelen = u32::from_ne_bytes(msghdr_bytes[off..off + 4].try_into().unwrap_or([0u8; 4]));
+    off += 4;
+
+    // padding on x86_64
+    #[cfg(target_arch = "x86_64")]
+    {
+        off += 4;
+    }
+
+    // msg_iov: ptr
+    let msg_iov_ptr = usize::from_ne_bytes(
+        msghdr_bytes[off..off + PTR_SIZE]
+            .try_into()
+            .unwrap_or([0u8; PTR_SIZE]),
+    );
+    off += PTR_SIZE;
+
+    // msg_iovlen: usize
+    let msg_iovlen = usize::from_ne_bytes(
+        msghdr_bytes[off..off + PTR_SIZE]
+            .try_into()
+            .unwrap_or([0u8; PTR_SIZE]),
+    );
+    off += PTR_SIZE;
+
+    // msg_control: ptr
+    let msg_control_ptr = usize::from_ne_bytes(
+        msghdr_bytes[off..off + PTR_SIZE]
+            .try_into()
+            .unwrap_or([0u8; PTR_SIZE]),
+    );
+    off += PTR_SIZE;
+
+    // msg_controllen: usize
+    let msg_controllen = usize::from_ne_bytes(
+        msghdr_bytes[off..off + PTR_SIZE]
+            .try_into()
+            .unwrap_or([0u8; PTR_SIZE]),
+    );
+    off += PTR_SIZE;
+
+    // msg_flags: i32 (4 bytes)
+    let msg_flags = u32::from_ne_bytes(msghdr_bytes[off..off + 4].try_into().unwrap_or([0u8; 4]));
+
+    // 1. Serialize msg_name
+    result.extend_from_slice(&msg_namelen.to_le_bytes());
+    if msg_name_ptr != 0 && msg_namelen > 0 {
+        result.extend_from_slice(&read_guest_bytes(msg_name_ptr, msg_namelen as usize));
+    }
+
+    // 2. Serialize msg_control
+    #[allow(clippy::cast_possible_truncation)]
+    let controllen_u64 = msg_controllen as u64;
+    result.extend_from_slice(&controllen_u64.to_le_bytes());
+    if msg_control_ptr != 0 && msg_controllen > 0 {
+        result.extend_from_slice(&read_guest_bytes(msg_control_ptr, msg_controllen));
+    }
+
+    // 3. Serialize msg_flags
+    result.extend_from_slice(&msg_flags.to_le_bytes());
+
+    // 4. Serialize iovec scatter data (same approach as capture_readv_data)
+    if msg_iov_ptr != 0 && msg_iovlen > 0 && total_bytes_read > 0 {
+        let iov_bytes = read_guest_bytes(msg_iov_ptr, msg_iovlen * IOVEC_SIZE);
+        let mut remaining = total_bytes_read;
+        for i in 0..msg_iovlen {
+            if remaining == 0 {
+                break;
+            }
+            let iov_off = i * IOVEC_SIZE;
+            if iov_off + IOVEC_SIZE > iov_bytes.len() {
+                break;
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            let (base, len) = {
+                let base = usize::from_ne_bytes(
+                    iov_bytes[iov_off..iov_off + 8]
+                        .try_into()
+                        .unwrap_or([0u8; 8]),
+                );
+                let len = usize::from_ne_bytes(
+                    iov_bytes[iov_off + 8..iov_off + 16]
+                        .try_into()
+                        .unwrap_or([0u8; 8]),
+                );
+                (base, len)
+            };
+
+            #[cfg(target_arch = "x86")]
+            let (base, len) = {
+                let base = u32::from_ne_bytes(
+                    iov_bytes[iov_off..iov_off + 4]
+                        .try_into()
+                        .unwrap_or([0u8; 4]),
+                ) as usize;
+                let len = u32::from_ne_bytes(
+                    iov_bytes[iov_off + 4..iov_off + 8]
+                        .try_into()
+                        .unwrap_or([0u8; 4]),
+                ) as usize;
+                (base, len)
+            };
+
+            let to_read = len.min(remaining);
+            let chunk = read_guest_bytes(base, to_read);
+            result.extend_from_slice(&chunk);
+            remaining = remaining.saturating_sub(chunk.len());
+        }
     }
 
     result
@@ -1981,6 +2143,9 @@ pub fn inject_side_effects(syscall_nr: u32, ctx: &litebox_common_linux::PtRegs, 
             write_guest_bytes(sv_addr, data);
         }
 
+        // recvmsg: complex msghdr injection
+        nr::RECVMSG => inject_recvmsg_data(ctx, data),
+
         // -----------------------------------------------------------
         // ioctl sub-commands
         // -----------------------------------------------------------
@@ -2068,6 +2233,176 @@ fn inject_readv_data(ctx: &litebox_common_linux::PtRegs, data: &[u8]) {
         let to_write = len.min(data.len() - written);
         write_guest_bytes(base, &data[written..written + to_write]);
         written += to_write;
+    }
+}
+
+/// Inject `recvmsg` data back into the guest's msghdr structure.
+///
+/// Parses the format written by `capture_recvmsg_data()`.
+fn inject_recvmsg_data(ctx: &litebox_common_linux::PtRegs, data: &[u8]) {
+    #[cfg(target_arch = "x86_64")]
+    const IOVEC_SIZE: usize = 16;
+    #[cfg(target_arch = "x86")]
+    const IOVEC_SIZE: usize = 8;
+    const PTR_SIZE: usize = core::mem::size_of::<usize>();
+    #[cfg(target_arch = "x86_64")]
+    const MSGHDR_SIZE: usize = 56;
+    #[cfg(target_arch = "x86")]
+    const MSGHDR_SIZE: usize = 28;
+
+    let msghdr_addr = ctx.syscall_arg(1);
+    if msghdr_addr == 0 || data.is_empty() {
+        return;
+    }
+
+    // Read the original msghdr to get pointers
+    let msghdr_bytes = read_guest_bytes(msghdr_addr, MSGHDR_SIZE);
+    if msghdr_bytes.len() < MSGHDR_SIZE {
+        return;
+    }
+
+    // Parse pointers from msghdr
+    let msg_name_ptr = usize::from_ne_bytes(
+        msghdr_bytes[..PTR_SIZE]
+            .try_into()
+            .unwrap_or([0u8; PTR_SIZE]),
+    );
+
+    let mut hdr_off = PTR_SIZE + 4; // skip name ptr + namelen
+    #[cfg(target_arch = "x86_64")]
+    {
+        hdr_off += 4;
+    } // padding
+
+    let msg_iov_ptr = usize::from_ne_bytes(
+        msghdr_bytes[hdr_off..hdr_off + PTR_SIZE]
+            .try_into()
+            .unwrap_or([0u8; PTR_SIZE]),
+    );
+    hdr_off += PTR_SIZE;
+
+    let msg_iovlen = usize::from_ne_bytes(
+        msghdr_bytes[hdr_off..hdr_off + PTR_SIZE]
+            .try_into()
+            .unwrap_or([0u8; PTR_SIZE]),
+    );
+    hdr_off += PTR_SIZE;
+
+    let msg_control_ptr = usize::from_ne_bytes(
+        msghdr_bytes[hdr_off..hdr_off + PTR_SIZE]
+            .try_into()
+            .unwrap_or([0u8; PTR_SIZE]),
+    );
+
+    // Now parse the serialized data blob
+    let mut off = 0;
+
+    // 1. msg_namelen + msg_name data
+    if off + 4 > data.len() {
+        return;
+    }
+    let msg_namelen = u32::from_le_bytes(data[off..off + 4].try_into().unwrap_or([0u8; 4]));
+    off += 4;
+
+    // Write updated msg_namelen into msghdr (at offset PTR_SIZE in the struct)
+    write_guest_bytes(msghdr_addr + PTR_SIZE, &msg_namelen.to_ne_bytes());
+
+    if msg_name_ptr != 0 && msg_namelen > 0 {
+        let name_end = off + msg_namelen as usize;
+        if name_end <= data.len() {
+            write_guest_bytes(msg_name_ptr, &data[off..name_end]);
+        }
+        off = name_end;
+    }
+
+    // 2. msg_controllen + msg_control data
+    if off + 8 > data.len() {
+        return;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let msg_controllen =
+        u64::from_le_bytes(data[off..off + 8].try_into().unwrap_or([0u8; 8])) as usize;
+    off += 8;
+
+    // Write updated msg_controllen into msghdr
+    // controllen is at: PTR_SIZE(name) + 4(namelen) + pad + PTR_SIZE(iov) + PTR_SIZE(iovlen) + PTR_SIZE(control)
+    let controllen_offset =
+        PTR_SIZE + 4 + if PTR_SIZE == 8 { 4 } else { 0 } + PTR_SIZE + PTR_SIZE + PTR_SIZE;
+    write_guest_bytes(
+        msghdr_addr + controllen_offset,
+        &msg_controllen.to_ne_bytes(),
+    );
+
+    if msg_control_ptr != 0 && msg_controllen > 0 {
+        let ctrl_end = off + msg_controllen;
+        if ctrl_end <= data.len() {
+            write_guest_bytes(msg_control_ptr, &data[off..ctrl_end]);
+        }
+        off = ctrl_end;
+    }
+
+    // 3. msg_flags
+    if off + 4 > data.len() {
+        return;
+    }
+    let msg_flags_bytes = &data[off..off + 4];
+    off += 4;
+
+    // Write msg_flags into msghdr
+    // flags is at: controllen_offset + PTR_SIZE(controllen)
+    let flags_offset = controllen_offset + PTR_SIZE;
+    write_guest_bytes(msghdr_addr + flags_offset, msg_flags_bytes);
+
+    // 4. iovec scatter data
+    let iov_data = &data[off..];
+    if iov_data.is_empty() || msg_iov_ptr == 0 || msg_iovlen == 0 {
+        return;
+    }
+
+    let iov_bytes = read_guest_bytes(msg_iov_ptr, msg_iovlen * IOVEC_SIZE);
+    let mut data_off = 0;
+    for i in 0..msg_iovlen {
+        if data_off >= iov_data.len() {
+            break;
+        }
+        let iov_off = i * IOVEC_SIZE;
+        if iov_off + IOVEC_SIZE > iov_bytes.len() {
+            break;
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        let (base, len) = {
+            let base = usize::from_ne_bytes(
+                iov_bytes[iov_off..iov_off + 8]
+                    .try_into()
+                    .unwrap_or([0u8; 8]),
+            );
+            let len = usize::from_ne_bytes(
+                iov_bytes[iov_off + 8..iov_off + 16]
+                    .try_into()
+                    .unwrap_or([0u8; 8]),
+            );
+            (base, len)
+        };
+
+        #[cfg(target_arch = "x86")]
+        let (base, len) = {
+            let base = u32::from_ne_bytes(
+                iov_bytes[iov_off..iov_off + 4]
+                    .try_into()
+                    .unwrap_or([0u8; 4]),
+            ) as usize;
+            let len = u32::from_ne_bytes(
+                iov_bytes[iov_off + 4..iov_off + 8]
+                    .try_into()
+                    .unwrap_or([0u8; 4]),
+            ) as usize;
+            (base, len)
+        };
+
+        let to_write = len.min(iov_data.len() - data_off);
+        write_guest_bytes(base, &iov_data[data_off..data_off + to_write]);
+        data_off += to_write;
     }
 }
 
