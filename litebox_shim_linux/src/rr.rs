@@ -7,6 +7,7 @@
 //! trace buffer or replayed from a previously recorded trace.
 
 use alloc::collections::BTreeSet;
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use litebox_rr::{Event, EventKind, Recorder, ReplayError, Replayer, TraceArch, TraceMetadata};
 
@@ -46,6 +47,16 @@ fn current_arch() -> TraceArch {
     }
 }
 
+/// Summary of a consumed trace event, stored in the event history ring buffer
+/// for divergence diagnostics.
+struct EventSummary {
+    event_index: u64,
+    syscall_nr: u32,
+    tid: u32,
+    kind: litebox_rr::EventKind,
+    result: i64,
+}
+
 /// Record-replay state attached to a `GlobalState`.
 pub struct RRState {
     mode: RRMode,
@@ -61,6 +72,8 @@ pub struct RRState {
     /// Guest virtual address of the rewriter trampoline page from the most
     /// recent `load_program()` call. Used to capture execve snapshots.
     last_trampoline_start: core::sync::atomic::AtomicUsize,
+    /// Ring buffer of recently consumed trace events for divergence diagnostics.
+    event_history: Mutex<VecDeque<EventSummary>>,
 }
 
 impl RRState {
@@ -84,6 +97,7 @@ impl RRState {
                 coordinator: None,
                 replay_stdout: false,
                 last_trampoline_start: core::sync::atomic::AtomicUsize::new(0),
+                event_history: Mutex::new(VecDeque::with_capacity(16)),
             },
             RRMode::Record => Self {
                 mode,
@@ -92,6 +106,7 @@ impl RRState {
                 coordinator: Some(RunCoordinator::new()),
                 replay_stdout: false,
                 last_trampoline_start: core::sync::atomic::AtomicUsize::new(0),
+                event_history: Mutex::new(VecDeque::with_capacity(16)),
             },
             RRMode::Replay => {
                 panic!("use RRState::new_replay() for replay mode");
@@ -109,6 +124,7 @@ impl RRState {
             coordinator: Some(RunCoordinator::new()),
             replay_stdout: false,
             last_trampoline_start: core::sync::atomic::AtomicUsize::new(0),
+            event_history: Mutex::new(VecDeque::with_capacity(16)),
         })
     }
 
@@ -275,6 +291,44 @@ impl RRState {
         } else {
             Err(litebox_rr::ReplayError::EndOfTrace)
         }
+    }
+
+    /// Record a consumed event in the history ring buffer (max 10 entries).
+    fn push_event_history(&self, event: &litebox_rr::Event) {
+        let mut history = self.event_history.lock();
+        if history.len() >= 10 {
+            history.pop_front();
+        }
+        history.push_back(EventSummary {
+            event_index: event.event_id,
+            syscall_nr: event.syscall_nr,
+            tid: event.tid,
+            kind: event.kind,
+            result: event.result,
+        });
+    }
+
+    /// Format the event history for divergence diagnostics.
+    fn format_event_history(&self) -> alloc::string::String {
+        use alloc::fmt::Write;
+        let history = self.event_history.lock();
+        let mut out = alloc::string::String::new();
+        for entry in history.iter() {
+            let name = syscall_name(entry.syscall_nr);
+            let kind_str = match entry.kind {
+                litebox_rr::EventKind::Complete => "",
+                litebox_rr::EventKind::Entry => " [ENTRY]",
+                litebox_rr::EventKind::Exit => " [EXIT]",
+                litebox_rr::EventKind::Signal => " [SIGNAL]",
+                litebox_rr::EventKind::Snapshot => " [SNAPSHOT]",
+            };
+            let _ = writeln!(
+                out,
+                "    #{}: tid={} {} (nr={}){} -> {}",
+                entry.event_index, entry.tid, name, entry.syscall_nr, kind_str, entry.result
+            );
+        }
+        out
     }
 }
 
@@ -622,6 +676,82 @@ pub fn is_synchronous_signal(signal: litebox_common_linux::signal::Signal) -> bo
     matches!(
         signal,
         Signal::SIGSEGV | Signal::SIGBUS | Signal::SIGFPE | Signal::SIGILL | Signal::SIGTRAP
+    )
+}
+
+/// Human-readable name for common syscall numbers, used in divergence diagnostics.
+pub fn syscall_name(nr: u32) -> &'static str {
+    match nr {
+        nr::MMAP => "mmap",
+        nr::MREMAP => "mremap",
+        nr::MUNMAP => "munmap",
+        nr::MPROTECT => "mprotect",
+        nr::BRK => "brk",
+        nr::READ => "read",
+        nr::PREAD64 => "pread64",
+        nr::READV => "readv",
+        nr::WRITE => "write",
+        nr::WRITEV => "writev",
+        nr::GETRANDOM => "getrandom",
+        nr::CLOCK_GETTIME => "clock_gettime",
+        nr::GETTIMEOFDAY => "gettimeofday",
+        nr::TIME => "time",
+        nr::FSTAT => "fstat",
+        nr::GETCWD => "getcwd",
+        nr::UNAME => "uname",
+        nr::PIPE2 => "pipe2",
+        nr::GETDENTS64 => "getdents64",
+        nr::FUTEX => "futex",
+        nr::NANOSLEEP => "nanosleep",
+        nr::CLOCK_NANOSLEEP => "clock_nanosleep",
+        nr::PPOLL => "ppoll",
+        nr::POLL => "poll",
+        nr::PSELECT6 => "pselect6",
+        nr::EPOLL_PWAIT => "epoll_pwait",
+        nr::EPOLL_WAIT => "epoll_wait",
+        nr::RECVFROM => "recvfrom",
+        nr::RECVMSG => "recvmsg",
+        nr::SENDTO => "sendto",
+        nr::SENDMSG => "sendmsg",
+        nr::CONNECT => "connect",
+        nr::ACCEPT => "accept",
+        nr::ACCEPT4 => "accept4",
+        nr::CLONE => "clone",
+        nr::CLONE3 => "clone3",
+        nr::EXECVE => "execve",
+        nr::EXIT => "exit",
+        nr::EXIT_GROUP => "exit_group",
+        nr::RT_SIGACTION => "rt_sigaction",
+        nr::RT_SIGPROCMASK => "rt_sigprocmask",
+        nr::SIGALTSTACK => "sigaltstack",
+        nr::RT_SIGRETURN => "rt_sigreturn",
+        nr::RT_SIGTIMEDWAIT => "rt_sigtimedwait",
+        nr::KILL => "kill",
+        nr::TKILL => "tkill",
+        nr::TGKILL => "tgkill",
+        nr::GETPID => "getpid",
+        nr::GETTID => "gettid",
+        nr::IOCTL => "ioctl",
+        nr::MADVISE => "madvise",
+        nr::SYSINFO => "sysinfo",
+        nr::SOCKETPAIR => "socketpair",
+        nr::GETSOCKOPT => "getsockopt",
+        nr::GETSOCKNAME => "getsockname",
+        nr::GETPEERNAME => "getpeername",
+        nr::CAPGET => "capget",
+        _ => "unknown",
+    }
+}
+
+fn format_syscall_args(ctx: &litebox_common_linux::PtRegs) -> alloc::string::String {
+    alloc::format!(
+        "{:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}",
+        ctx.syscall_arg(0),
+        ctx.syscall_arg(1),
+        ctx.syscall_arg(2),
+        ctx.syscall_arg(3),
+        ctx.syscall_arg(4),
+        ctx.syscall_arg(5),
     )
 }
 
