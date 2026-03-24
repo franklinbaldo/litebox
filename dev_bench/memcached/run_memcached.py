@@ -67,11 +67,9 @@ TUN_DEVICE = "tun99"
 #   total requests = requests_per_client * clients * threads
 # With defaults: 2000 * 4 * 2 = 16,000
 DEFAULT_REQUESTS_PER_CLIENT = 10000
-DEFAULT_CLIENTS = 4
-DEFAULT_THREADS = 2
+DEFAULT_CLIENTS = 2
+DEFAULT_THREADS = 4
 DEFAULT_RATIO = "1:10"  # SET:GET ratio
-DEFAULT_DATA_SIZE = 32  # value size in bytes
-DEFAULT_KEY_MAX = 10000000
 
 # Operation types reported by memtier_benchmark
 OP_TYPES = ["Sets", "Gets", "Totals"]
@@ -385,8 +383,6 @@ def run_native(
     clients: int,
     threads: int,
     ratio: str,
-    data_size: int,
-    key_max: int,
     work_dir: Path,
     memtier_path: Path,
     memcached_path: Path,
@@ -430,9 +426,6 @@ def run_native(
             "-c", str(clients),
             "-t", str(threads),
             f"--ratio={ratio}",
-            f"--data-size={data_size}",
-            "--key-minimum=1",
-            f"--key-maximum={key_max}",
             f"--json-out-file={json_out}",
         ]
         print(f"  Running: {' '.join(cmd)}")
@@ -544,8 +537,6 @@ def run_litebox(
     clients: int,
     threads: int,
     ratio: str,
-    data_size: int,
-    key_max: int,
     runner_path: Path,
     work_dir: Path,
     packager_path: Optional[Path],
@@ -617,9 +608,6 @@ def run_litebox(
             "-c", str(clients),
             "-t", str(threads),
             f"--ratio={ratio}",
-            f"--data-size={data_size}",
-            "--key-minimum=1",
-            f"--key-maximum={key_max}",
             f"--json-out-file={json_out}",
         ]
         print(f"  Running: {' '.join(cmd)}")
@@ -684,8 +672,6 @@ def run_gvisor(
     clients: int,
     threads: int,
     ratio: str,
-    data_size: int,
-    key_max: int,
     work_dir: Path,
     memtier_path: Path,
     port: int,
@@ -747,9 +733,6 @@ def run_gvisor(
             "-c", str(clients),
             "-t", str(threads),
             f"--ratio={ratio}",
-            f"--data-size={data_size}",
-            "--key-minimum=1",
-            f"--key-maximum={key_max}",
             f"--json-out-file={json_out}",
         ]
         print(f"  Running: {' '.join(bench_cmd)}")
@@ -1031,18 +1014,6 @@ def main():
         help=f"SET:GET ratio (default: {DEFAULT_RATIO})",
     )
     parser.add_argument(
-        "--data-size",
-        type=int,
-        default=DEFAULT_DATA_SIZE,
-        help=f"Value size in bytes (default: {DEFAULT_DATA_SIZE})",
-    )
-    parser.add_argument(
-        "--key-maximum",
-        type=int,
-        default=DEFAULT_KEY_MAX,
-        help=f"Max key range (default: {DEFAULT_KEY_MAX})",
-    )
-    parser.add_argument(
         "--iterations",
         type=int,
         default=3,
@@ -1197,7 +1168,6 @@ def main():
     print(f"Threads:        {args.threads}")
     print(f"Total requests: {total_reqs:,}")
     print(f"Ratio (S:G):    {args.ratio}")
-    print(f"Data size:      {args.data_size} bytes")
     print(f"Iterations:     {args.iterations}")
     print(f"Mode:           {args.mode}")
     print(f"Port:           {MEMCACHED_PORT}")
@@ -1224,7 +1194,7 @@ def main():
             print(f"  Iteration {i + 1}/{args.iterations}")
             result = run_native(
                 args.requests, args.clients, args.threads,
-                args.ratio, args.data_size, args.key_maximum,
+                args.ratio,
                 work_dir, memtier_path, memcached_path,
             )
             if result:
@@ -1245,7 +1215,7 @@ def main():
             print(f"  Iteration {i + 1}/{args.iterations}")
             result = run_litebox(
                 args.requests, args.clients, args.threads,
-                args.ratio, args.data_size, args.key_maximum,
+                args.ratio,
                 runner_path, work_dir, packager_path, memtier_path,
                 memcached_path,
             )
@@ -1267,7 +1237,7 @@ def main():
             print(f"  Iteration {i + 1}/{args.iterations}")
             result = run_gvisor(
                 args.requests, args.clients, args.threads,
-                args.ratio, args.data_size, args.key_maximum,
+                args.ratio,
                 work_dir, memtier_path, MEMCACHED_PORT,
             )
             if result:
@@ -1294,7 +1264,6 @@ def main():
                 "clients": args.clients,
                 "threads": args.threads,
                 "ratio": args.ratio,
-                "data_size": args.data_size,
                 "iterations": args.iterations,
                 "mode": args.mode,
             },
