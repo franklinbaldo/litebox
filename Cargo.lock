@@ -1663,6 +1663,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_runner_optee_on_windows_userland"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrayvec",
+ "base64",
+ "clap",
+ "litebox",
+ "litebox_common_linux",
+ "litebox_common_optee",
+ "litebox_platform_multiplex",
+ "litebox_platform_windows_userland",
+ "litebox_shim_optee",
+ "litebox_syscall_rewriter",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "litebox_runner_snp"
 version = "0.1.0"
 dependencies = [

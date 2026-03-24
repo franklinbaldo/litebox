@@ -24,6 +24,7 @@ use litebox::platform::page_mgmt::{
 use litebox::shim::{ContinueOperation, Exception};
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::PunchthroughSyscall;
+use litebox_common_linux::vmap::VmapManager;
 
 use windows_sys::Win32::Foundation::{self as Win32_Foundation, FILETIME};
 use windows_sys::Win32::{
@@ -385,12 +386,43 @@ pub unsafe fn run_thread(
     ctx: &mut litebox_common_linux::PtRegs,
 ) {
     ensure_tls_index();
-    run_thread_inner(&shim, ctx);
+    run_thread_inner(&shim, ctx, false);
+}
+
+/// Run a guest thread using a reference to the shim.
+///
+/// Unlike [`run_thread`], this version takes a reference instead of ownership,
+/// avoiding struct moves that could invalidate internal state.
+///
+/// # Safety
+/// The context must be valid guest context.
+pub unsafe fn run_thread_ref<T>(shim: &T, ctx: &mut litebox_common_linux::PtRegs)
+where
+    T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+{
+    ensure_tls_index();
+    run_thread_inner(shim, ctx, false);
+}
+
+/// Re-enter a guest thread using a reference to the shim.
+///
+/// This version takes a reference instead of ownership, avoiding struct moves
+/// that could invalidate internal state.
+///
+/// # Safety
+/// The context must be valid guest context.
+pub unsafe fn reenter_thread<T>(shim: &T, ctx: &mut litebox_common_linux::PtRegs)
+where
+    T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+{
+    ensure_tls_index();
+    run_thread_inner(shim, ctx, true);
 }
 
 fn run_thread_inner(
     shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
     ctx: &mut litebox_common_linux::PtRegs,
+    reenter: bool,
 ) {
     let tls_state = TlsState::new();
     tls_state
@@ -403,7 +435,7 @@ fn run_thread_inner(
         tls: &tls_state,
     };
     ThreadHandle::run_with_handle(&tls_state, || unsafe {
-        run_thread_arch(&mut thread_ctx, &tls_state);
+        run_thread_arch(&mut thread_ctx, &tls_state, u8::from(reenter));
     });
 }
 
@@ -488,7 +520,11 @@ fn get_tls_ptr() -> Option<*const TlsState> {
 /// non-volatile register state.
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
-unsafe extern "C-unwind" fn run_thread_arch(thread_ctx: &mut ThreadContext, tls_state: &TlsState) {
+unsafe extern "C-unwind" fn run_thread_arch(
+    thread_ctx: &mut ThreadContext,
+    tls_state: &TlsState,
+    reenter: u8,
+) {
     core::arch::naked_asm!(
     "
     .seh_proc run_thread
@@ -545,7 +581,13 @@ unsafe extern "C-unwind" fn run_thread_arch(thread_ctx: &mut ThreadContext, tls_
     mov     QWORD PTR [rdx + {HOST_SP}], rsp
     mov     QWORD PTR [rdx + {HOST_BP}], rbp
 
+    // Call init_handler or reenter_handler based on reenter flag (in r8b).
+    test r8b, r8b
+    jnz 1f
     call {init_handler}
+    jmp .Ldone
+1:
+    call {reenter_handler}
     jmp .Ldone
 
     // This entry point is called from the guest when it issues a syscall
@@ -638,6 +680,7 @@ interrupt_callback:
     .seh_endproc
     ",
     init_handler = sym init_handler,
+    reenter_handler = sym reenter_handler,
     syscall_handler = sym syscall_handler,
     exception_handler = sym exception_handler,
     interrupt_handler = sym interrupt_handler,
@@ -776,7 +819,7 @@ fn thread_start(
     // Allow caller to run some code before we return to the new thread.
     let shim = init_thread.init();
 
-    run_thread_inner(shim.as_ref(), &mut ctx);
+    run_thread_inner(shim.as_ref(), &mut ctx, false);
 }
 
 impl litebox::platform::ThreadProvider for WindowsUserland {
@@ -1958,6 +2001,10 @@ unsafe extern "C-unwind" fn init_handler(thread_ctx: &mut ThreadContext<'_>) {
     thread_ctx.call_shim(|shim, ctx, _interrupt| shim.init(ctx));
 }
 
+unsafe extern "C-unwind" fn reenter_handler(thread_ctx: &mut ThreadContext<'_>) {
+    thread_ctx.call_shim(|shim, ctx, _interrupt| shim.reenter(ctx));
+}
+
 unsafe extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext<'_>) {
     thread_ctx.call_shim(|shim, ctx, _interrupt| shim.syscall(ctx));
 }
@@ -2072,6 +2119,13 @@ impl litebox::platform::CrngProvider for WindowsUserland {
         getrandom::fill(buf).expect("getrandom failed");
     }
 }
+
+/// Dummy `VmapManager`.
+///
+/// In general, userland platforms do not support `vmap` and `vunmap` (which are kernel functions).
+/// We might need to emulate these functions' behaviors using virtual addresses for development or
+/// testing, or use a kernel module to provide this functionality (if needed).
+impl<const ALIGN: usize> VmapManager<ALIGN> for WindowsUserland {}
 
 /// Dummy `VmemPageFaultHandler`.
 ///
