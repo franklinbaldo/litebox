@@ -521,7 +521,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             return Err(AllocationError::AboveMaxAddress);
         }
         let platform_fixed_address_behavior = match fixed_address_behavior {
-            FixedAddressBehavior::Hint => FixedAddressBehavior::Hint,
+            FixedAddressBehavior::Hint => FixedAddressBehavior::NoReplace,
             FixedAddressBehavior::NoReplace => {
                 // Ensure there are no mappings managed by us.
                 if self.vmas.overlaps(&(start..end)) {
@@ -563,25 +563,44 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // The `max_permissions` is tracked by `VMem::protect_mapping` and thus doesn't need to be
         // passed to `allocate_pages`.
         let _ = max_permissions;
-        let ret = self
-            .platform
-            .allocate_pages(
+        let mut suggested_range = suggested_range;
+        let len = suggested_range.len();
+        loop {
+            let ret = match self.platform.allocate_pages(
                 suggested_range.into(),
                 MemoryRegionPermissions::from_bits(permissions).unwrap(),
                 vma.flags.contains(VmFlags::VM_GROWSDOWN),
                 populate_pages_immediately,
                 platform_fixed_address_behavior,
-            )
-            .map_err(|err| match err {
-                AllocationError::AddressInUse => AllocationError::AddressInUseByPlatform,
-                other => other,
-            })?;
-        let new_start = ret.as_usize();
-        let new_end = new_start + suggested_range.len();
-        self.vmas.insert(new_start..new_end, vma);
-        debug_assert!(new_start >= self.addr_min);
-        debug_assert!(new_end <= self.addr_max);
-        Ok(ret)
+            ) {
+                Ok(addr) => addr,
+                Err(AllocationError::AddressInUse)
+                    if matches!(fixed_address_behavior, FixedAddressBehavior::Hint) =>
+                {
+                    // If the allocation fails due to address in use and we are treating the suggested address as a hint, then we can retry with a new hint address.
+                    // Record the overlapping mapping so that we won't try to allocate in this range again
+                    self.vmas.insert(
+                        suggested_range.start..suggested_range.end,
+                        VmArea {
+                            flags: VmFlags::empty(),
+                            is_file_backed: false,
+                        },
+                    );
+                    let new_addr = self
+                        .get_unmmaped_area(None, NonZeroPageSize::new(len).unwrap(), false)
+                        .ok_or(AllocationError::OutOfMemory)?;
+                    suggested_range = PageRange::new(new_addr, new_addr + len).unwrap();
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            let new_start = ret.as_usize();
+            let new_end = new_start + len;
+            self.vmas.insert(new_start..new_end, vma);
+            debug_assert!(new_start >= self.addr_min);
+            debug_assert!(new_end <= self.addr_max);
+            return Ok(ret);
+        }
     }
 
     /// Create a new mapping in the virtual address space.
