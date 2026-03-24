@@ -121,7 +121,23 @@ impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
     }
 
     fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        self.enter_shim(false, ctx, |_, _| {})
+        self.enter_shim(false, ctx, |task, _| {
+            // During RR recording, if this thread holds the run token it was
+            // interrupted while running guest code (preemption). Yield the
+            // token here so that other runnable threads get a chance to
+            // execute. The subsequent `prepare_to_run_guest` will reacquire
+            // the token via `acquire_token_preemptive`.
+            #[cfg(feature = "rr")]
+            if task.global.rr_state.mode() == crate::rr::RRMode::Record
+                && let Some(coord) = task.global.rr_state.coordinator()
+            {
+                let tid = task.rr_tid_i32();
+                if coord.holds_token(tid) {
+                    coord.yield_token(tid);
+                }
+            }
+            let _ = task;
+        })
     }
 }
 
@@ -888,6 +904,29 @@ impl<FS: ShimFS> Task<FS> {
         self.rr_tid() as i32
     }
 
+    /// Acquire the RR run token, interrupting the current holder if it is
+    /// running guest code without making syscalls. Returns `false` if the
+    /// coordinator has been shut down.
+    #[cfg(feature = "rr")]
+    fn rr_acquire_token_preemptive(&self) -> bool {
+        let Some(coord) = self.global.rr_state.coordinator() else {
+            return true;
+        };
+        let tid = self.rr_tid_i32();
+        let pid = self.pid;
+        coord.acquire_token_preemptive(tid, |holder_rr_tid| {
+            // Map the RR TID back to the host TID. The main thread has
+            // RR TID 1 but host TID == pid; child threads have equal
+            // RR and host TIDs.
+            let host_tid = if holder_rr_tid == 1 {
+                pid
+            } else {
+                holder_rr_tid
+            };
+            self.thread.try_interrupt_thread_by_host_tid(host_tid)
+        })
+    }
+
     /// Record mode: execute the syscall normally, then capture side-effects
     /// and record every syscall to the trace.
     ///
@@ -902,8 +941,6 @@ impl<FS: ShimFS> Task<FS> {
         let tid_i32 = self.rr_tid_i32();
 
         if rr::is_potentially_blocking(syscall_nr) {
-            // --- Blocking path: ENTRY + execute + EXIT ---
-
             // 1. Record ENTRY event (result=0, no data).
             self.global.rr_state.record_event(
                 syscall_nr,
@@ -936,7 +973,7 @@ impl<FS: ShimFS> Task<FS> {
             if let Some(coord) = self.global.rr_state.coordinator() {
                 coord.exit_blocking(tid_i32);
                 coord.try_grant_next_runnable();
-                if !coord.acquire_token(tid_i32) {
+                if !self.rr_acquire_token_preemptive() {
                     // Coordinator shut down — exit this thread.
                     return;
                 }
@@ -1023,7 +1060,16 @@ impl<FS: ShimFS> Task<FS> {
             // Release the run token so the coordinator can schedule the next thread.
             if let Some(coord) = self.global.rr_state.coordinator() {
                 coord.release_token(tid_i32);
-                coord.grant_next_runnable();
+                // For exit/exit_group the coordinator is shut down and other
+                // threads may be racing through their own teardown (which
+                // calls try_grant_next_runnable from prepare_for_exit).
+                // Use try_grant to avoid asserting that current_tid == 0
+                // in a shutdown race.
+                if syscall_nr == rr::nr_pub::EXIT || syscall_nr == rr::nr_pub::EXIT_GROUP {
+                    coord.try_grant_next_runnable();
+                } else {
+                    coord.grant_next_runnable();
+                }
             }
         }
     }

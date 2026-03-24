@@ -889,15 +889,10 @@ fn test_rr_record_replay_efault() {
 }
 
 /// Record the execve test (exercises execve with fd close-on-exec semantics
-/// and thread teardown), replay it, and verify successful completion.
-///
-/// NOTE: Currently disabled — recording hangs because the RR coordinator
-/// deadlocks when execve tears down threads that are waiting for the run
-/// token. This requires changes to how execve interacts with the
-/// `RunCoordinator`.
+/// and thread teardown), replay it, and verify that both phases complete
+/// successfully.
 #[cfg(feature = "rr")]
 #[test]
-#[ignore = "RR record hangs: execve + multithreaded teardown deadlocks coordinator"]
 fn test_rr_record_replay_execve() {
     let unique_name = "execve_rr";
     let target = common::compile_with_extra_args(
@@ -928,13 +923,8 @@ fn test_rr_record_replay_execve() {
 /// Record the thread_exit test (non-main thread calls exit while other threads
 /// are blocked in diverse syscalls), replay it, and verify successful
 /// completion.
-///
-/// NOTE: Currently disabled — recording hangs because the RR coordinator
-/// deadlocks when exit is called from a non-main thread while other threads
-/// are blocked in syscalls waiting for the run token.
 #[cfg(feature = "rr")]
 #[test]
-#[ignore = "RR record hangs: non-main-thread exit deadlocks coordinator"]
 fn test_rr_record_replay_thread_exit() {
     let unique_name = "thread_exit_rr";
     let target = common::compile_with_extra_args(
@@ -968,13 +958,8 @@ fn test_rr_record_replay_thread_exit() {
 #[test]
 fn test_rr_record_replay_unix() {
     let unique_name = "unix_rr";
-    let target = common::compile_with_extra_args(
-        "./tests/unix.c",
-        unique_name,
-        true,
-        false,
-        &["-lpthread"],
-    );
+    let target =
+        common::compile_with_extra_args("./tests/unix.c", unique_name, true, false, &["-lpthread"]);
     let dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
     let trace_path = dir.join("unix_rr.trace");
 

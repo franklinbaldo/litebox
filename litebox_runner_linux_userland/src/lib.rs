@@ -590,6 +590,7 @@ pub fn run(mut cli_args: CliArgs) -> Result<()> {
         shutdown.store(true, core::sync::atomic::Ordering::Relaxed);
         net_worker.join().unwrap();
     }
+    let exit_code = program.process.wait();
     #[cfg(feature = "rr")]
     if let Some(ref trace_path) = cli_args.rr_record
         && let Some(trace_data) = shim.take_rr_trace()
@@ -597,7 +598,7 @@ pub fn run(mut cli_args: CliArgs) -> Result<()> {
         std::fs::write(trace_path, &trace_data)
             .unwrap_or_else(|e| eprintln!("failed to write trace: {e}"));
     }
-    std::process::exit(program.process.wait())
+    std::process::exit(exit_code)
 }
 
 /// Pin the current thread to a specific CPU core

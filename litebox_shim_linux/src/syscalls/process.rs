@@ -84,6 +84,23 @@ impl ThreadState {
             self.process.detach_thread(tid);
         }
     }
+
+    /// Interrupt a thread by its host TID. This is used by the RR
+    /// coordinator's preemption mechanism to bring a guest-executing thread
+    /// back to the shim so it can yield the run token.
+    ///
+    /// Returns `true` if the interrupt was actually delivered (the thread
+    /// was in `RUNNING_IN_GUEST` or `WAITING` state), `false` if the
+    /// thread was in a state where the interrupt had no effect.
+    #[cfg(feature = "rr")]
+    pub(crate) fn try_interrupt_thread_by_host_tid(&self, host_tid: i32) -> bool {
+        let inner = self.process.inner.lock();
+        if let Some(remote) = inner.threads.get(&host_tid) {
+            remote.try_interrupt()
+        } else {
+            false
+        }
+    }
 }
 
 impl Drop for ThreadState {
@@ -112,6 +129,15 @@ impl ThreadRemote {
     fn interrupt(&self) {
         if let Some(handle) = self.handle.get() {
             handle.interrupt();
+        }
+    }
+
+    #[cfg(feature = "rr")]
+    fn try_interrupt(&self) -> bool {
+        if let Some(handle) = self.handle.get() {
+            handle.try_interrupt()
+        } else {
+            false
         }
     }
 }
@@ -255,16 +281,27 @@ impl<FS: ShimFS> Task<FS> {
     /// Updates the process exit status for a group exit and signals all threads
     /// to exit.
     pub(crate) fn exit_group(&self, status: ExitStatus) {
-        let mut inner = self.thread.process.inner.lock();
-        if self.is_exiting() {
-            return;
+        {
+            let mut inner = self.thread.process.inner.lock();
+            if self.is_exiting() {
+                return;
+            }
+            assert!(!inner.group_exit);
+            inner.exit_status = status;
+            inner.group_exit = true;
+            for thread in inner.threads.values() {
+                thread.is_exiting.store(true, Ordering::Relaxed);
+                thread.interrupt();
+            }
         }
-        assert!(!inner.group_exit);
-        inner.exit_status = status;
-        inner.group_exit = true;
-        for thread in inner.threads.values() {
-            thread.is_exiting.store(true, Ordering::Relaxed);
-            thread.interrupt();
+        // During RR recording/replay, shut down the coordinator so that
+        // threads spin-waiting in `acquire_token()` will observe the
+        // shutdown and exit instead of deadlocking. This must happen
+        // after releasing the process `inner` lock because exiting
+        // threads will acquire it during teardown.
+        #[cfg(feature = "rr")]
+        if let Some(coord) = self.global.rr_state.coordinator() {
+            coord.shutdown();
         }
     }
 
@@ -288,6 +325,13 @@ impl<FS: ShimFS> Task<FS> {
             assert!(!inner.is_killing_other_threads);
             inner.is_killing_other_threads = true;
         }
+        // During RR recording/replay, shut down the coordinator so that
+        // threads spin-waiting in `acquire_token()` will observe the
+        // shutdown and exit instead of deadlocking.
+        #[cfg(feature = "rr")]
+        if let Some(coord) = self.global.rr_state.coordinator() {
+            coord.shutdown();
+        }
         // Wait for other threads to exit.
         loop {
             let n = self
@@ -302,6 +346,13 @@ impl<FS: ShimFS> Task<FS> {
             let _ = self.thread.process.nr_threads.block(n);
         }
         self.thread.process.inner.lock().is_killing_other_threads = false;
+        // Reset the coordinator now that all other threads have exited.
+        // The surviving thread (this one) needs to continue executing
+        // the execve, so clear the shutdown flag and re-register.
+        #[cfg(feature = "rr")]
+        if let Some(coord) = self.global.rr_state.coordinator() {
+            coord.reset_after_kill(self.rr_tid_i32());
+        }
         true
     }
 

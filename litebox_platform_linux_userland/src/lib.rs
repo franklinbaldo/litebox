@@ -707,6 +707,12 @@ exception_callback:
     jmp .Ldone
 
 interrupt_callback:
+    // Clear in_guest — we may arrive here from switch_to_guest, which
+    // sets in_guest=1 before checking the interrupt flag. Without this,
+    // a second interrupt signal during the host-side interrupt handler
+    // would be misidentified as Case 4 (in guest), corrupting the guest
+    // context with host register values.
+    mov     BYTE PTR gs:in_guest@tpoff, 0
     // Restore the stack and frame pointer.
     mov     rsp, fs:host_sp@tpoff
     mov     rbp, fs:host_bp@tpoff
@@ -861,6 +867,12 @@ exception_callback:
     jmp .Ldone
 
 interrupt_callback:
+    // Clear in_guest — we may arrive here from switch_to_guest, which
+    // sets in_guest=1 before checking the interrupt flag. Without this,
+    // a second interrupt signal during the host-side interrupt handler
+    // would be misidentified as Case 4 (in guest), corrupting the guest
+    // context with host register values.
+    mov     BYTE PTR fs:in_guest@ntpoff, 0
     // Restore esp and ebp
     mov esp, gs:host_sp@ntpoff
     mov ebp, gs:host_bp@ntpoff
@@ -2039,7 +2051,31 @@ impl ThreadContext<'_> {
         }
         let op = f(self.shim, self.ctx);
         match op {
-            ContinueOperation::Resume => unsafe { switch_to_guest(self.ctx) },
+            ContinueOperation::Resume => {
+                // Clear the interrupt flag. The shim may have received
+                // interrupt signals during prepare_to_run_guest (or
+                // earlier) that left the `interrupt` TLS flag set.
+                // Without this clear, `switch_to_guest` would see the
+                // stale flag and redirect to `interrupt_callback`.
+                //
+                // The matching WaitState cleanup (resetting
+                // INTERRUPTED_GUEST → RUNNING_IN_GUEST) is handled by
+                // a compare_exchange in WaitState::prepare_to_run_guest.
+                // Together these ensure the thread enters switch_to_guest
+                // with interrupt=0 and WaitState=RUNNING_IN_GUEST.
+                //
+                // If a new interrupt arrives after this clear but before
+                // switch_to_guest sets in_guest=1, the signal handler
+                // will set interrupt=1 again and the normal interrupt
+                // path will handle it correctly.
+                unsafe {
+                    core::arch::asm!(
+                        concat!("mov BYTE PTR ", tls!("interrupt"), ", 0"),
+                        options(nostack, preserves_flags)
+                    );
+                }
+                unsafe { switch_to_guest(self.ctx) }
+            }
             ContinueOperation::Terminate => {}
         }
     }

@@ -133,7 +133,25 @@ impl<Platform: RawSyncPrimitivesProvider> WaitState<Platform> {
             .0
             .set_state(ThreadState::RUNNING_IN_GUEST, Ordering::SeqCst);
         let ready_to_run_guest = f();
-        if !ready_to_run_guest {
+        if ready_to_run_guest {
+            // The closure may have taken a long time (e.g., spinning in the RR
+            // run-coordinator waiting for a token). During that time, the state
+            // was `RUNNING_IN_GUEST`, so a `ThreadHandle::interrupt()` call
+            // could have transitioned it to `INTERRUPTED_GUEST`. The signal
+            // handler would have run but found `in_guest=0` (we're in the
+            // shim), set the `interrupt` TLS flag, and returned.
+            //
+            // Reset `INTERRUPTED_GUEST` back to `RUNNING_IN_GUEST` so that
+            // future calls to `ThreadHandle::interrupt()` can succeed. The
+            // `interrupt` TLS flag will be cleared by the caller before
+            // entering `switch_to_guest`.
+            let _ = self.waker.0.condvar.underlying_atomic().compare_exchange(
+                ThreadState::INTERRUPTED_GUEST.0,
+                ThreadState::RUNNING_IN_GUEST.0,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            );
+        } else {
             self.waker
                 .0
                 .set_state(ThreadState::RUNNING_IN_HOST, Ordering::Relaxed);
@@ -211,31 +229,49 @@ impl<Platform: RawSyncPrimitivesProvider + ThreadProvider> ThreadHandle<Platform
     /// condition and interrupt condition. If it is running guest code, the
     /// platform will interrupt the thread and re-enter the shim.
     pub fn interrupt(&self) {
+        self.try_interrupt();
+    }
+
+    /// Like [`interrupt`](Self::interrupt), but returns `true` if the platform
+    /// interrupt was sent (i.e., the thread was `RUNNING_IN_GUEST`,
+    /// `INTERRUPTED_GUEST`, or `WAITING`). Returns `false` if the thread was
+    /// in a state where the interrupt had no effect (`RUNNING_IN_HOST` or
+    /// `WOKEN`).
+    pub fn try_interrupt(&self) -> bool {
         let condvar = &self.waker.0.condvar;
         let v = condvar.underlying_atomic().fetch_update(
             Ordering::Release,
             Ordering::Relaxed,
             |state| match ThreadState(state) {
-                ThreadState::RUNNING_IN_HOST
-                | ThreadState::WOKEN
-                | ThreadState::INTERRUPTED_GUEST => None,
+                ThreadState::RUNNING_IN_HOST | ThreadState::WOKEN => None,
                 ThreadState::WAITING => Some(ThreadState::WOKEN.0),
-                ThreadState::RUNNING_IN_GUEST => Some(ThreadState::INTERRUPTED_GUEST.0),
+                // Re-interrupt: the thread may have entered guest code while
+                // still in the INTERRUPTED_GUEST state (due to a race between
+                // prepare_to_run_guest's CAS and a concurrent try_interrupt).
+                // Resend the platform interrupt so that the signal handler can
+                // redirect execution back to interrupt_callback if the thread
+                // is now truly running guest code (in_guest=1).
+                ThreadState::RUNNING_IN_GUEST | ThreadState::INTERRUPTED_GUEST => {
+                    Some(ThreadState::INTERRUPTED_GUEST.0)
+                }
                 state => unreachable!("{state:?}"),
             },
         );
         match v.map(ThreadState) {
             Ok(ThreadState::WAITING) => {
                 condvar.wake_one();
+                true
             }
-            Ok(ThreadState::RUNNING_IN_GUEST) => {
+            Ok(ThreadState::RUNNING_IN_GUEST | ThreadState::INTERRUPTED_GUEST) => {
                 self.waker.0.platform.interrupt_thread(&self.thread);
+                true
             }
             Ok(state) => unreachable!("{state:?}"),
             Err(_) => {
                 // Provide a consistent release fence even if we didn't wake up
                 // the thread.
                 core::sync::atomic::fence(Ordering::Release);
+                false
             }
         }
     }

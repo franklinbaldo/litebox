@@ -92,15 +92,17 @@ impl<FS: ShimFS> Task<FS> {
                 return !self.is_exiting();
             }
 
+            // During RR recording, acquire the run token inside this closure
+            // (where WaitState is already RUNNING_IN_GUEST). The try_interrupt
+            // mechanism ensures failed interrupts (when target is not yet in
+            // RUNNING_IN_GUEST) are retried, and the CAS in
+            // prepare_to_run_guest() resets INTERRUPTED_GUEST back to
+            // RUNNING_IN_GUEST after we return.
             #[cfg(feature = "rr")]
-            if self.global.rr_state.mode() == crate::rr::RRMode::Record {
-                // Ensure this thread holds the run token before returning
-                // to guest code.
-                if let Some(coord) = self.global.rr_state.coordinator()
-                    && !coord.acquire_token(self.rr_tid_i32())
-                {
-                    return false;
-                }
+            if self.global.rr_state.mode() == crate::rr::RRMode::Record
+                && !self.rr_acquire_token_preemptive()
+            {
+                return false;
             }
 
             self.global.platform.take_pending_signals(|signal| {

@@ -9,6 +9,7 @@
 use alloc::collections::BTreeSet;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use litebox_rr::{Event, EventKind, Recorder, ReplayError, Replayer, TraceArch, TraceMetadata};
 
 use litebox::mm::linux::VmFlags;
@@ -393,17 +394,31 @@ impl RRState {
 /// is granted the token.
 pub struct RunCoordinator {
     inner: Mutex<CoordinatorInner>,
+    /// TID of the thread currently holding the run token, or 0 if idle.
+    /// Exposed as an atomic so that spinning threads in
+    /// `acquire_token`/`acquire_token_preemptive` can check it without
+    /// locking the Mutex — this eliminates the Mutex convoy effect that
+    /// was throttling throughput to ~27 syscalls/sec with 10 threads.
+    current_tid: AtomicI32,
+    /// When true, all threads should exit. Atomic for lock-free reads in
+    /// spin loops.
+    shutdown: AtomicBool,
+    /// Set to `true` when any waiter sends an interrupt to the current token
+    /// holder. Cleared when the token is granted to a new thread. This
+    /// ensures at most one interrupt signal is sent per scheduling cycle,
+    /// preventing an interrupt storm when many threads are waiting.
+    interrupt_sent: AtomicBool,
 }
 
 struct CoordinatorInner {
-    /// TID of the thread currently holding the run token, or 0 if idle.
-    current_tid: i32,
+    /// TID of the last thread that held the token. Used for round-robin
+    /// scheduling: `grant_next_runnable` picks the next thread after this
+    /// one in the runnable set.
+    last_holder: i32,
     /// Threads that are runnable (waiting for the token).
     runnable: BTreeSet<i32>,
     /// Threads that are blocked inside a syscall (released the token).
     blocked: BTreeSet<i32>,
-    /// When true, all threads should exit.
-    shutdown: bool,
 }
 
 impl Default for RunCoordinator {
@@ -418,11 +433,13 @@ impl RunCoordinator {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(CoordinatorInner {
-                current_tid: 0,
+                last_holder: 0,
                 runnable: BTreeSet::new(),
                 blocked: BTreeSet::new(),
-                shutdown: false,
             }),
+            current_tid: AtomicI32::new(0),
+            shutdown: AtomicBool::new(false),
+            interrupt_sent: AtomicBool::new(false),
         }
     }
 
@@ -435,11 +452,12 @@ impl RunCoordinator {
     pub fn register_initial_thread(&self, tid: i32) {
         let mut inner = self.inner.lock();
         assert_eq!(
-            inner.current_tid, 0,
+            self.current_tid.load(Ordering::Acquire),
+            0,
             "register_initial_thread: token already held"
         );
         inner.runnable.insert(tid);
-        inner.current_tid = tid;
+        self.current_tid.store(tid, Ordering::Release);
     }
 
     /// Register a new thread as runnable. It will not run until granted
@@ -454,9 +472,9 @@ impl RunCoordinator {
         let mut inner = self.inner.lock();
         inner.runnable.remove(&tid);
         inner.blocked.remove(&tid);
-        if inner.current_tid == tid {
-            inner.current_tid = 0;
-        }
+        let _ = self
+            .current_tid
+            .compare_exchange(tid, 0, Ordering::AcqRel, Ordering::Relaxed);
     }
 
     /// Release the run token after a syscall completes. The caller must
@@ -467,27 +485,163 @@ impl RunCoordinator {
     /// Panics if `tid` does not match the current token holder.
     pub fn release_token(&self, tid: i32) {
         let mut inner = self.inner.lock();
-        assert_eq!(inner.current_tid, tid, "release_token: tid mismatch");
-        inner.current_tid = 0;
+        assert_eq!(
+            self.current_tid.load(Ordering::Acquire),
+            tid,
+            "release_token: tid mismatch"
+        );
+        inner.last_holder = tid;
+        self.current_tid.store(0, Ordering::Release);
     }
 
     /// Wait until this thread is granted the run token.
     /// Returns false if the coordinator has been shut down.
     pub fn acquire_token(&self, tid: i32) -> bool {
         loop {
-            {
-                let inner = self.inner.lock();
-                if inner.shutdown {
-                    return false;
-                }
-                if inner.current_tid == tid {
-                    return true;
-                }
+            if self.shutdown.load(Ordering::Acquire) {
+                return false;
+            }
+            if self.current_tid.load(Ordering::Acquire) == tid {
+                return true;
             }
             // Spin-wait: hint the CPU that we're in a busy loop.
             // In the litebox no_std context there is no condvar available,
             // so spin_loop is the best we can do.
             core::hint::spin_loop();
+        }
+    }
+
+    /// Wait until this thread is granted the run token, interrupting the
+    /// current holder if it is running guest code without making syscalls.
+    ///
+    /// `interrupt_holder` is called with the RR TID of the current token
+    /// holder so that the caller can send it an interrupt signal, forcing
+    /// it back into the shim where it will yield the token.
+    ///
+    /// At most one interrupt signal is sent per scheduling cycle (between
+    /// token grants). This prevents an interrupt storm when many threads
+    /// are waiting: the first waiter sends the signal and subsequent
+    /// waiters see `interrupt_sent` and skip sending.
+    ///
+    /// Returns false if the coordinator has been shut down.
+    pub fn acquire_token_preemptive(
+        &self,
+        tid: i32,
+        interrupt_holder: impl Fn(i32) -> bool,
+    ) -> bool {
+        // Number of spin iterations before sending an interrupt. This gives
+        // the newly-granted token holder time to enter guest code (and
+        // potentially make a syscall that releases the token naturally)
+        // before we force a preemption via signal.
+        const INTERRUPT_DELAY_SPINS: u32 = 1_000;
+        const INTERRUPT_RETRY_SPINS: u32 = INTERRUPT_DELAY_SPINS * 10;
+        let mut spins: u32 = 0;
+        let mut last_observed_holder: i32 = 0;
+        loop {
+            // Read current_tid and shutdown atomically (no Mutex needed).
+            if self.shutdown.load(Ordering::Acquire) {
+                return false;
+            }
+            let holder = self.current_tid.load(Ordering::Acquire);
+            if holder == tid {
+                return true;
+            }
+            // Detect a new scheduling cycle: the holder changed since our
+            // last observation. Reset the spin counter so the new holder
+            // gets the full grace period before any waiter sends an
+            // interrupt.
+            if holder != last_observed_holder {
+                last_observed_holder = holder;
+                spins = 0;
+            }
+            // After spinning for a while without getting the token, send
+            // exactly one interrupt to the current holder (if nobody else
+            // has sent one this cycle yet).
+            //
+            // NOTE: We periodically retry interrupts because a "successful"
+            // try_interrupt (CAS RUNNING_IN_GUEST → INTERRUPTED_GUEST) does
+            // not guarantee the thread actually entered the interrupt handler.
+            // If the thread was in the shim (e.g., spinning in the
+            // prepare_to_run_guest closure) when the signal arrived,
+            // in_guest=0 so the signal handler just sets interrupt TLS and
+            // returns. The thread later absorbs this via the CAS in
+            // prepare_to_run_guest without yielding. To handle this, we
+            // clear interrupt_sent every INTERRUPT_RETRY_SPINS to allow
+            // retrying — the next attempt may catch the thread actually
+            // running guest code.
+            if holder != 0
+                && spins >= INTERRUPT_DELAY_SPINS
+                && spins.is_multiple_of(INTERRUPT_RETRY_SPINS)
+            {
+                // Reset interrupt_sent to allow a fresh attempt.
+                self.interrupt_sent.store(false, Ordering::Release);
+            }
+            if holder != 0
+                && spins >= INTERRUPT_DELAY_SPINS
+                && !self.interrupt_sent.load(Ordering::Acquire)
+            {
+                // Try to interrupt the current holder. Only mark
+                // interrupt_sent if the interrupt was actually delivered
+                // (thread was RUNNING_IN_GUEST or WAITING). If it wasn't
+                // delivered (thread was RUNNING_IN_HOST, WOKEN, or
+                // INTERRUPTED_GUEST), we leave interrupt_sent false so the
+                // next spin iteration can retry.
+                if interrupt_holder(holder) {
+                    self.interrupt_sent.store(true, Ordering::Release);
+                }
+            }
+            spins = spins.saturating_add(1);
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Check whether the given thread currently holds the run token.
+    pub fn holds_token(&self, tid: i32) -> bool {
+        self.current_tid.load(Ordering::Acquire) == tid
+    }
+
+    /// Return the RR TID of the thread currently holding the run token,
+    /// or 0 if no thread holds it.
+    pub fn current_holder(&self) -> i32 {
+        self.current_tid.load(Ordering::Acquire)
+    }
+
+    /// Yield the token to the next runnable thread.
+    ///
+    /// This is used for preemption during recording: a thread that has
+    /// been interrupted while running guest code yields its turn so that
+    /// other threads get a chance to run. The caller must reacquire the
+    /// token (e.g., via [`acquire_token_preemptive`]) before returning
+    /// to guest code.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `tid` does not match the current token holder.
+    pub fn yield_token(&self, tid: i32) {
+        let mut inner = self.inner.lock();
+        if self.shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        assert_eq!(
+            self.current_tid.load(Ordering::Acquire),
+            tid,
+            "yield_token: tid mismatch"
+        );
+        inner.last_holder = tid;
+        // Grant to the next runnable thread using round-robin (which may
+        // be us if no other threads are runnable).
+        let next = inner
+            .runnable
+            .range((tid + 1)..)
+            .next()
+            .or_else(|| inner.runnable.iter().next())
+            .copied()
+            .unwrap_or(tid);
+        if next != tid {
+            self.current_tid.store(next, Ordering::Release);
+            // New holder — clear interrupt_sent so waiters can send a
+            // fresh interrupt if this new holder also needs preemption.
+            self.interrupt_sent.store(false, Ordering::Release);
         }
     }
 
@@ -497,45 +651,77 @@ impl RunCoordinator {
     ///
     /// Panics if another thread already holds the token.
     pub fn grant_token(&self, tid: i32) {
-        let mut inner = self.inner.lock();
-        assert_eq!(inner.current_tid, 0, "grant_token: token already held");
-        inner.current_tid = tid;
+        let _inner = self.inner.lock();
+        assert_eq!(
+            self.current_tid.load(Ordering::Acquire),
+            0,
+            "grant_token: token already held"
+        );
+        self.current_tid.store(tid, Ordering::Release);
+        self.interrupt_sent.store(false, Ordering::Release);
     }
 
-    /// Pick the next runnable thread and grant it the token.
-    /// Used during recording (any runnable thread is fine).
+    /// Pick the next runnable thread and grant it the token using
+    /// round-robin scheduling. Starts from the thread after `last_holder`
+    /// (wrapping around) so that all runnable threads get a fair share.
     /// Returns the tid that was granted, or 0 if no threads are runnable.
     ///
     /// # Panics
     ///
     /// Panics if another thread already holds the token.
     pub fn grant_next_runnable(&self) -> i32 {
-        let mut inner = self.inner.lock();
-        assert_eq!(inner.current_tid, 0, "grant_next: token already held");
-        if let Some(&tid) = inner.runnable.iter().next() {
-            inner.current_tid = tid;
-            tid
-        } else {
-            0
+        let inner = self.inner.lock();
+        assert_eq!(
+            self.current_tid.load(Ordering::Acquire),
+            0,
+            "grant_next: token already held"
+        );
+        if inner.runnable.is_empty() {
+            return 0;
         }
+        // Round-robin: pick the first runnable tid strictly greater than
+        // last_holder; if none, wrap around to the smallest runnable tid.
+        let tid = inner
+            .runnable
+            .range((inner.last_holder + 1)..)
+            .next()
+            .or_else(|| inner.runnable.iter().next())
+            .copied()
+            .unwrap();
+        self.current_tid.store(tid, Ordering::Release);
+        self.interrupt_sent.store(false, Ordering::Release);
+        tid
     }
 
     /// Try to grant the token to the next runnable thread, but only if
-    /// no thread currently holds the token. This is a no-op if a thread
-    /// already has the token or no threads are runnable.
+    /// no thread currently holds the token. Uses round-robin scheduling.
+    /// This is a no-op if a thread already has the token or no threads
+    /// are runnable.
     ///
     /// Returns the tid that was granted, or 0 if nothing was done.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the runnable set is non-empty but iteration yields no
+    /// elements (should be unreachable).
     pub fn try_grant_next_runnable(&self) -> i32 {
-        let mut inner = self.inner.lock();
-        if inner.current_tid != 0 {
+        let inner = self.inner.lock();
+        if self.current_tid.load(Ordering::Acquire) != 0 {
             return 0;
         }
-        if let Some(&tid) = inner.runnable.iter().next() {
-            inner.current_tid = tid;
-            tid
-        } else {
-            0
+        if inner.runnable.is_empty() {
+            return 0;
         }
+        let tid = inner
+            .runnable
+            .range((inner.last_holder + 1)..)
+            .next()
+            .or_else(|| inner.runnable.iter().next())
+            .copied()
+            .unwrap();
+        self.current_tid.store(tid, Ordering::Release);
+        self.interrupt_sent.store(false, Ordering::Release);
+        tid
     }
 
     /// Move a thread from runnable to blocked (entering a blocking syscall).
@@ -545,10 +731,14 @@ impl RunCoordinator {
     /// Panics if `tid` does not match the current token holder.
     pub fn enter_blocking(&self, tid: i32) {
         let mut inner = self.inner.lock();
-        assert_eq!(inner.current_tid, tid, "enter_blocking: not token holder");
+        assert_eq!(
+            self.current_tid.load(Ordering::Acquire),
+            tid,
+            "enter_blocking: not token holder"
+        );
         inner.runnable.remove(&tid);
         inner.blocked.insert(tid);
-        inner.current_tid = 0;
+        self.current_tid.store(0, Ordering::Release);
     }
 
     /// Move a thread from blocked to runnable (woke up from blocking syscall).
@@ -560,13 +750,39 @@ impl RunCoordinator {
 
     /// Signal all threads to shut down.
     pub fn shutdown(&self) {
-        let mut inner = self.inner.lock();
-        inner.shutdown = true;
+        self.shutdown.store(true, Ordering::Release);
     }
 
     /// Check if shutdown has been requested.
     pub fn is_shutdown(&self) -> bool {
-        self.inner.lock().shutdown
+        self.shutdown.load(Ordering::Acquire)
+    }
+
+    /// Reset the coordinator after `kill_other_threads()` (execve).
+    ///
+    /// Clears the shutdown flag and re-registers the surviving thread
+    /// as the sole runnable thread holding the token. All other threads
+    /// must have already exited and been removed before calling this.
+    pub fn reset_after_kill(&self, survivor_tid: i32) {
+        let mut inner = self.inner.lock();
+        debug_assert!(
+            inner.runnable.is_empty()
+                || (inner.runnable.len() == 1 && inner.runnable.contains(&survivor_tid)),
+            "reset_after_kill: unexpected runnable threads: {:?}",
+            inner.runnable
+        );
+        debug_assert!(
+            inner.blocked.is_empty(),
+            "reset_after_kill: unexpected blocked threads: {:?}",
+            inner.blocked
+        );
+        self.shutdown.store(false, Ordering::Release);
+        inner.runnable.clear();
+        inner.runnable.insert(survivor_tid);
+        inner.blocked.clear();
+        self.current_tid.store(survivor_tid, Ordering::Release);
+        inner.last_holder = 0;
+        self.interrupt_sent.store(false, Ordering::Release);
     }
 }
 
