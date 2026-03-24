@@ -18,11 +18,17 @@ Usage:
     python3 run_node_http.py [options]
 
 Examples:
-    # Run both native and LiteBox
+    # Run all: native + LiteBox + gVisor
     python3 run_node_http.py --release
+
+    # Run only native
+    python3 run_node_http.py --mode native
 
     # Run only LiteBox
     python3 run_node_http.py --mode litebox --release
+
+    # Run only gVisor (requires Docker + runsc)
+    python3 run_node_http.py --mode gvisor
 
     # Override duration, threads, connections
     python3 run_node_http.py --duration 15 --threads 2 --connections 50 --release
@@ -37,6 +43,7 @@ import math
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tarfile
@@ -186,8 +193,6 @@ def parse_wrk_output(output: str) -> Optional[BenchmarkResult]:
 
 def wait_for_http(host: str, port: int, timeout: float = 30.0) -> bool:
     """Wait until the HTTP server is accepting connections."""
-    import socket
-
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -459,6 +464,114 @@ def run_litebox(
             server_proc.wait()
 
 
+# ── gVisor Runner (via Docker) ──────────────────────────────────────────────
+
+GVISOR_NODE_IMAGE = "node:24.14.0-slim"
+
+_gvisor_container_seq = 0
+
+
+def run_gvisor(
+    duration: int,
+    threads: int,
+    connections: int,
+    response_size: int,
+    work_dir: Path,
+    port: int,
+) -> Optional[BenchmarkResult]:
+    """Run Node.js HTTP server under gVisor (via Docker --runtime=runsc) and benchmark from host.
+
+    Uses Docker with the runsc runtime so that gVisor's own netstack handles
+    networking (fair comparison with LiteBox's smoltcp/TUN).
+    """
+    global _gvisor_container_seq
+    _gvisor_container_seq += 1
+    container_name = f"litebox_node_gv_{_gvisor_container_seq}_{os.getpid()}"
+
+    wrk_path = locate_command("wrk")
+    if wrk_path is None:
+        print("  [SKIP] wrk not found on PATH")
+        return None
+
+    # Write server script to work_dir so Docker can copy it in
+    server_js = work_dir / "server.js"
+    server_js.write_text(HTTP_SERVER_JS)
+
+    host_port = port
+
+    docker_cmd = [
+        "docker", "run", "--rm", "-d",
+        "--runtime=runsc",
+        "--name", container_name,
+        "-p", f"{host_port}:{port}",
+        "-v", f"{server_js}:/app/server.js:ro",
+        "-e", f"BIND_ADDR=0.0.0.0",
+        "-e", f"PORT={port}",
+        "-e", f"RESPONSE_SIZE={response_size}",
+        GVISOR_NODE_IMAGE,
+        "node", "/app/server.js",
+    ]
+
+    print(f"  Starting gVisor Node.js (Docker): docker run --runtime=runsc ...")
+    result = subprocess.run(docker_cmd, capture_output=True, timeout=30)
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        print(f"  [FAIL] docker run failed: {stderr[:500]}")
+        return None
+
+    try:
+        print(f"  Waiting for Node.js at 127.0.0.1:{host_port}...")
+        if not wait_for_http("127.0.0.1", host_port, timeout=60.0):
+            logs = subprocess.run(
+                ["docker", "logs", container_name],
+                capture_output=True, timeout=5,
+            )
+            log_text = logs.stderr.decode("utf-8", errors="replace")
+            print("  [FAIL] gVisor Node.js did not start in time")
+            if log_text:
+                print(f"  container logs (last 500): ...{log_text[-500:]}")
+            return None
+
+        # Run wrk from host
+        url = f"http://127.0.0.1:{host_port}/"
+        cmd = [
+            str(wrk_path),
+            "-t", str(threads),
+            "-c", str(connections),
+            "-d", f"{duration}s",
+            url,
+        ]
+        print(f"  Running: {' '.join(cmd)}")
+        t0 = time.monotonic()
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=duration * 3 + 30)
+        except subprocess.TimeoutExpired:
+            print("  [TIMEOUT]")
+            return None
+        elapsed = time.monotonic() - t0
+
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="replace")
+            print(f"  [FAIL] wrk exit code {result.returncode}")
+            print(f"  stderr: {stderr[:500]}")
+            return None
+
+        stdout = result.stdout.decode("utf-8", errors="replace")
+        parsed = parse_wrk_output(stdout)
+        if parsed is None:
+            print(f"  [FAIL] no results parsed from wrk output:\n{stdout[:500]}")
+            return None
+
+        parsed.elapsed = elapsed
+        return parsed
+
+    finally:
+        subprocess.run(
+            ["docker", "rm", "-f", container_name],
+            capture_output=True, timeout=10,
+        )
+
+
 # ── Comparison & Reporting ──────────────────────────────────────────────────
 
 
@@ -467,8 +580,10 @@ class ComparisonRow:
     name: str
     native_rps: list[float] = field(default_factory=list)
     litebox_rps: list[float] = field(default_factory=list)
+    gvisor_rps: list[float] = field(default_factory=list)
     native_lat: list[float] = field(default_factory=list)
     litebox_lat: list[float] = field(default_factory=list)
+    gvisor_lat: list[float] = field(default_factory=list)
 
     @property
     def native_avg_rps(self) -> Optional[float]:
@@ -479,12 +594,20 @@ class ComparisonRow:
         return sum(self.litebox_rps) / len(self.litebox_rps) if self.litebox_rps else None
 
     @property
+    def gvisor_avg_rps(self) -> Optional[float]:
+        return sum(self.gvisor_rps) / len(self.gvisor_rps) if self.gvisor_rps else None
+
+    @property
     def native_avg_lat(self) -> Optional[float]:
         return sum(self.native_lat) / len(self.native_lat) if self.native_lat else None
 
     @property
     def litebox_avg_lat(self) -> Optional[float]:
         return sum(self.litebox_lat) / len(self.litebox_lat) if self.litebox_lat else None
+
+    @property
+    def gvisor_avg_lat(self) -> Optional[float]:
+        return sum(self.gvisor_lat) / len(self.gvisor_lat) if self.gvisor_lat else None
 
     @property
     def rps_ratio(self) -> Optional[float]:
@@ -502,40 +625,83 @@ class ComparisonRow:
             return ((n - lb) / n) * 100.0
         return None
 
+    @property
+    def gvisor_rps_ratio(self) -> Optional[float]:
+        n = self.native_avg_rps
+        g = self.gvisor_avg_rps
+        if n and g and n > 0:
+            return g / n
+        return None
+
+    @property
+    def gvisor_overhead_pct(self) -> Optional[float]:
+        n = self.native_avg_rps
+        g = self.gvisor_avg_rps
+        if n and g and n > 0:
+            return ((n - g) / n) * 100.0
+        return None
+
 
 def print_comparison_table(row: ComparisonRow):
     """Print formatted comparison table."""
+    has_litebox = row.litebox_avg_rps is not None
+    has_gvisor = row.gvisor_avg_rps is not None
+
+    # Build dynamic header
+    header = f"{'Metric':<25} {'Native':>16}"
+    if has_litebox:
+        header += f" {'LiteBox':>16} {'LB Ratio':>10} {'LB Ovhd':>10}"
+    if has_gvisor:
+        header += f" {'gVisor':>16} {'gV Ratio':>10} {'gV Ovhd':>10}"
+    width = len(header)
+
     print()
-    print("=" * 90)
-    print(
-        f"{'Metric':<25} {'Native':>16} {'LiteBox':>16}"
-        f" {'Ratio':>8} {'Overhead':>10}"
-    )
-    print("-" * 90)
+    print("=" * width)
+    print(header)
+    print("-" * width)
 
     # Requests/sec
     native_rps = f"{row.native_avg_rps:,.0f}" if row.native_avg_rps is not None else "N/A"
-    litebox_rps = f"{row.litebox_avg_rps:,.0f}" if row.litebox_avg_rps is not None else "N/A"
-    ratio_str = f"{row.rps_ratio:.4f}" if row.rps_ratio is not None else "N/A"
-    overhead_str = f"{row.overhead_pct:+.2f}%" if row.overhead_pct is not None else "N/A"
-    print(
-        f"{'Requests/sec':<25} {native_rps:>16} {litebox_rps:>16}"
-        f" {ratio_str:>8} {overhead_str:>10}"
-    )
+    line = f"{'Requests/sec':<25} {native_rps:>16}"
+    if has_litebox:
+        litebox_rps = f"{row.litebox_avg_rps:,.0f}" if row.litebox_avg_rps is not None else "N/A"
+        ratio_str = f"{row.rps_ratio:.4f}" if row.rps_ratio is not None else "N/A"
+        overhead_str = f"{row.overhead_pct:+.2f}%" if row.overhead_pct is not None else "N/A"
+        line += f" {litebox_rps:>16} {ratio_str:>10} {overhead_str:>10}"
+    if has_gvisor:
+        gvisor_rps = f"{row.gvisor_avg_rps:,.0f}" if row.gvisor_avg_rps is not None else "N/A"
+        g_ratio_str = f"{row.gvisor_rps_ratio:.4f}" if row.gvisor_rps_ratio is not None else "N/A"
+        g_overhead_str = f"{row.gvisor_overhead_pct:+.2f}%" if row.gvisor_overhead_pct is not None else "N/A"
+        line += f" {gvisor_rps:>16} {g_ratio_str:>10} {g_overhead_str:>10}"
+    print(line)
 
     # Avg latency
     native_lat = f"{row.native_avg_lat:.2f}ms" if row.native_avg_lat is not None else "N/A"
-    litebox_lat = f"{row.litebox_avg_lat:.2f}ms" if row.litebox_avg_lat is not None else "N/A"
-    if row.native_avg_lat and row.litebox_avg_lat and row.native_avg_lat > 0:
-        lat_ratio = f"{row.litebox_avg_lat / row.native_avg_lat:.4f}"
-    else:
-        lat_ratio = "N/A"
-    print(
-        f"{'Avg Latency':<25} {native_lat:>16} {litebox_lat:>16}"
-        f" {lat_ratio:>8} {'':>10}"
-    )
+    line = f"{'Avg Latency':<25} {native_lat:>16}"
+    if has_litebox:
+        litebox_lat = f"{row.litebox_avg_lat:.2f}ms" if row.litebox_avg_lat is not None else "N/A"
+        if row.native_avg_lat and row.litebox_avg_lat and row.native_avg_lat > 0:
+            lat_ratio = f"{row.litebox_avg_lat / row.native_avg_lat:.4f}"
+        else:
+            lat_ratio = "N/A"
+        line += f" {litebox_lat:>16} {lat_ratio:>10} {'':>10}"
+    if has_gvisor:
+        gvisor_lat = f"{row.gvisor_avg_lat:.2f}ms" if row.gvisor_avg_lat is not None else "N/A"
+        if row.native_avg_lat and row.gvisor_avg_lat and row.native_avg_lat > 0:
+            g_lat_ratio = f"{row.gvisor_avg_lat / row.native_avg_lat:.4f}"
+        else:
+            g_lat_ratio = "N/A"
+        line += f" {gvisor_lat:>16} {g_lat_ratio:>10} {'':>10}"
+    print(line)
 
-    print("=" * 90)
+    print("=" * width)
+
+    if has_litebox and row.rps_ratio is not None:
+        print(f"\nThroughput ratio (LiteBox/Native): {row.rps_ratio:.4f}")
+        print(f"LiteBox overhead: {row.overhead_pct:+.2f}%")
+    if has_gvisor and row.gvisor_rps_ratio is not None:
+        print(f"\nThroughput ratio (gVisor/Native): {row.gvisor_rps_ratio:.4f}")
+        print(f"gVisor overhead: {row.gvisor_overhead_pct:+.2f}%")
     print()
 
 
@@ -604,9 +770,9 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["both", "native", "litebox"],
-        default="both",
-        help="Run mode (default: both)",
+        choices=["both", "native", "litebox", "gvisor", "all"],
+        default="all",
+        help="Run mode (default: all). 'all' runs native + litebox + gvisor.",
     )
     parser.add_argument(
         "--duration",
@@ -635,7 +801,13 @@ def main():
     parser.add_argument(
         "--release",
         action="store_true",
-        help="Use release build of litebox binaries",
+        default=True,
+        help="Use release build of litebox binaries (default: True)",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Use debug build of litebox binaries",
     )
     parser.add_argument(
         "--runner-path",
@@ -675,9 +847,10 @@ def main():
     parser.add_argument(
         "--response-size",
         type=int,
-        default=14,
-        help="Response body size in bytes (default: 14). Larger values stress "
-             "the network data path; smaller values stress syscall overhead.",
+        nargs="+",
+        default=[2048, 4096, 8192, 16384, 32768, 65536],
+        help="Response body size(s) in bytes (default: 4096 8192 16384 32768 65536). "
+             "Multiple sizes run sequentially with a table per size.",
     )
     parser.add_argument(
         "--port",
@@ -687,6 +860,8 @@ def main():
     )
 
     args = parser.parse_args()
+    if args.debug:
+        args.release = False
 
     TUN_DEVICE = args.tun_device
     NODE_PORT = args.port
@@ -704,9 +879,24 @@ def main():
     workspace_root = find_workspace_root()
 
     # Resolve litebox binaries
-    run_litebox_mode = args.mode in ("both", "litebox")
+    run_litebox_mode = args.mode in ("both", "litebox", "all")
+    run_gvisor_mode = args.mode in ("gvisor", "all")
     runner_path = None
     packager_path = None
+
+    if run_gvisor_mode:
+        if shutil.which("docker") is None:
+            print("Error: docker not found on PATH (required for gVisor mode).")
+            sys.exit(1)
+        check = subprocess.run(
+            ["docker", "info", "--format", "{{.Runtimes}}"],
+            capture_output=True, timeout=10,
+        )
+        if "runsc" not in check.stdout.decode("utf-8", errors="replace"):
+            print("Error: Docker runtime 'runsc' not available.")
+            print("Install gVisor and register with Docker:")
+            print("  https://gvisor.dev/docs/user_guide/install/")
+            sys.exit(1)
 
     if run_litebox_mode:
         # Check TUN device
@@ -746,12 +936,15 @@ def main():
         work_dir = Path(tempfile.mkdtemp(prefix="litebox_node_bench_"))
         cleanup_work_dir = True
 
+    response_sizes = args.response_size
+    size_labels = [f"{s // 1024}k" if s >= 1024 else str(s) for s in response_sizes]
+
     print(f"Workspace root: {workspace_root}")
     print(f"Work dir:       {work_dir}")
     print(f"Duration:       {args.duration}s per run")
     print(f"Threads:        {args.threads}")
     print(f"Connections:    {args.connections}")
-    print(f"Response size:  {args.response_size} bytes")
+    print(f"Response sizes: {', '.join(size_labels)}")
     print(f"Iterations:     {args.iterations}")
     print(f"Mode:           {args.mode}")
     print(f"Port:           {NODE_PORT}")
@@ -759,49 +952,77 @@ def main():
         print(f"TUN device:     {TUN_DEVICE}")
         print(f"Runner:         {runner_path}")
         print(f"Packager:       {packager_path or 'cargo run'}")
+    if run_gvisor_mode:
+        print(f"gVisor:         docker --runtime=runsc")
     print()
 
-    row = ComparisonRow(name="node-http")
+    all_rows: list[ComparisonRow] = []
 
-    # ── Native runs ─────────────────────────────────────────────────────
+    for resp_size, size_label in zip(response_sizes, size_labels):
+        print(f"\n{'─' * 60}")
+        print(f"Response size: {resp_size} bytes ({size_label})")
+        print(f"{'─' * 60}")
 
-    if args.mode in ("both", "native"):
-        print(f"[Native] Node.js HTTP (x{args.iterations} iterations)")
-        for i in range(args.iterations):
-            print(f"  Iteration {i + 1}/{args.iterations}")
-            result = run_native(
-                args.duration, args.threads, args.connections,
-                args.response_size, work_dir,
-            )
-            if result:
-                row.native_rps.append(result.requests_per_sec)
-                row.native_lat.append(result.avg_latency_ms)
-                print(
-                    f"    {result.requests_per_sec:,.0f} req/s, "
-                    f"avg latency {result.avg_latency_ms:.2f}ms"
+        row = ComparisonRow(name=f"node-http-{size_label}")
+
+        # ── Native runs ─────────────────────────────────────────────
+
+        if args.mode in ("both", "native", "all"):
+            print(f"[Native] Node.js HTTP (x{args.iterations} iterations)")
+            for i in range(args.iterations):
+                print(f"  Iteration {i + 1}/{args.iterations}")
+                result = run_native(
+                    args.duration, args.threads, args.connections,
+                    resp_size, work_dir,
                 )
+                if result:
+                    row.native_rps.append(result.requests_per_sec)
+                    row.native_lat.append(result.avg_latency_ms)
+                    print(
+                        f"    {result.requests_per_sec:,.0f} req/s, "
+                        f"avg latency {result.avg_latency_ms:.2f}ms"
+                    )
 
-    # ── LiteBox runs ────────────────────────────────────────────────────
+        # ── LiteBox runs ────────────────────────────────────────────
 
-    if run_litebox_mode:
-        print(f"[LiteBox] Node.js HTTP (x{args.iterations} iterations)")
-        for i in range(args.iterations):
-            print(f"  Iteration {i + 1}/{args.iterations}")
-            result = run_litebox(
-                args.duration, args.threads, args.connections,
-                args.response_size, runner_path, work_dir, packager_path,
-            )
-            if result:
-                row.litebox_rps.append(result.requests_per_sec)
-                row.litebox_lat.append(result.avg_latency_ms)
-                print(
-                    f"    {result.requests_per_sec:,.0f} req/s, "
-                    f"avg latency {result.avg_latency_ms:.2f}ms"
+        if run_litebox_mode:
+            print(f"[LiteBox] Node.js HTTP (x{args.iterations} iterations)")
+            for i in range(args.iterations):
+                print(f"  Iteration {i + 1}/{args.iterations}")
+                result = run_litebox(
+                    args.duration, args.threads, args.connections,
+                    resp_size, runner_path, work_dir, packager_path,
                 )
+                if result:
+                    row.litebox_rps.append(result.requests_per_sec)
+                    row.litebox_lat.append(result.avg_latency_ms)
+                    print(
+                        f"    {result.requests_per_sec:,.0f} req/s, "
+                        f"avg latency {result.avg_latency_ms:.2f}ms"
+                    )
 
-    # ── Results ─────────────────────────────────────────────────────────
+        # ── gVisor runs ─────────────────────────────────────────────
 
-    print_comparison_table(row)
+        if run_gvisor_mode:
+            print(f"[gVisor] Node.js HTTP (x{args.iterations} iterations)")
+            for i in range(args.iterations):
+                print(f"  Iteration {i + 1}/{args.iterations}")
+                result = run_gvisor(
+                    args.duration, args.threads, args.connections,
+                    resp_size, work_dir, NODE_PORT,
+                )
+                if result:
+                    row.gvisor_rps.append(result.requests_per_sec)
+                    row.gvisor_lat.append(result.avg_latency_ms)
+                    print(
+                        f"    {result.requests_per_sec:,.0f} req/s, "
+                        f"avg latency {result.avg_latency_ms:.2f}ms"
+                    )
+
+        # ── Per-size results ────────────────────────────────────────
+
+        print_comparison_table(row)
+        all_rows.append(row)
 
     # ── Save to JSON ────────────────────────────────────────────────────
 
@@ -811,22 +1032,32 @@ def main():
                 "duration": args.duration,
                 "threads": args.threads,
                 "connections": args.connections,
-                "response_size": args.response_size,
+                "response_sizes": response_sizes,
                 "iterations": args.iterations,
                 "mode": args.mode,
             },
-            "results": {
-                "native_rps": row.native_rps,
-                "litebox_rps": row.litebox_rps,
-                "native_lat": row.native_lat,
-                "litebox_lat": row.litebox_lat,
-                "native_avg_rps": row.native_avg_rps,
-                "litebox_avg_rps": row.litebox_avg_rps,
-                "native_avg_lat": row.native_avg_lat,
-                "litebox_avg_lat": row.litebox_avg_lat,
-                "rps_ratio": row.rps_ratio,
-                "overhead_pct": row.overhead_pct,
-            },
+            "results": [
+                {
+                    "response_size": resp_size,
+                    "native_rps": row.native_rps,
+                    "litebox_rps": row.litebox_rps,
+                    "native_lat": row.native_lat,
+                    "litebox_lat": row.litebox_lat,
+                    "native_avg_rps": row.native_avg_rps,
+                    "litebox_avg_rps": row.litebox_avg_rps,
+                    "native_avg_lat": row.native_avg_lat,
+                    "litebox_avg_lat": row.litebox_avg_lat,
+                    "rps_ratio": row.rps_ratio,
+                    "overhead_pct": row.overhead_pct,
+                    "gvisor_rps": row.gvisor_rps,
+                    "gvisor_lat": row.gvisor_lat,
+                    "gvisor_avg_rps": row.gvisor_avg_rps,
+                    "gvisor_avg_lat": row.gvisor_avg_lat,
+                    "gvisor_rps_ratio": row.gvisor_rps_ratio,
+                    "gvisor_overhead_pct": row.gvisor_overhead_pct,
+                }
+                for resp_size, row in zip(response_sizes, all_rows)
+            ],
         }
         with open(args.output, "w") as f:
             json.dump(output_data, f, indent=2)
