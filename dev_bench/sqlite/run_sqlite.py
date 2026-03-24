@@ -453,72 +453,53 @@ def run_litebox(
 
 # ── gVisor Runner ───────────────────────────────────────────────────────────
 
-# Global counter for unique gVisor container IDs.
+# Global counter for unique gVisor container names.
 _gvisor_container_seq = 0
 
-
-def _prepare_gvisor_rootfs(
-    speedtest1_path: Path,
-    work_dir: Path,
-) -> Path:
-    """
-    Prepare a minimal rootfs for running speedtest1 under gVisor.
-
-    Since speedtest1 is statically compiled, we only need to copy the
-    binary — no shared library resolution needed.
-    """
-    bundle_dir = work_dir / "gvisor_sqlite"
-    rootfs = bundle_dir / "rootfs"
-    if rootfs.exists():
-        shutil.rmtree(rootfs)
-    rootfs.mkdir(parents=True)
-    (rootfs / "tmp").mkdir()
-
-    shutil.copy2(speedtest1_path, rootfs / "speedtest1")
-    return bundle_dir
+# Docker image used for gVisor runs.  We build a tiny image from scratch
+# containing only the statically-linked speedtest1 binary.
+GVISOR_SQLITE_IMAGE = "litebox_sqlite_gvisor"
 
 
-def _write_gvisor_config(
-    bundle_dir: Path,
-    size: int,
-    use_memory: bool,
-) -> list[str]:
-    """
-    Write an OCI config.json for speedtest1 and return the process args.
-    """
-    process_args = ["/speedtest1", "--size", str(size)]
-    if use_memory:
-        process_args.append("--memdb")
+def _ensure_gvisor_image(speedtest1_path: Path, work_dir: Path) -> bool:
+    """Build a minimal Docker image containing speedtest1 for gVisor."""
+    # Check if image already exists.
+    check = subprocess.run(
+        ["docker", "image", "inspect", GVISOR_SQLITE_IMAGE],
+        capture_output=True,
+    )
+    if check.returncode == 0:
+        return True
 
-    config = {
-        "ociVersion": "1.0.0",
-        "process": {
-            "terminal": False,
-            "user": {"uid": 0, "gid": 0},
-            "args": process_args,
-            "env": ["PATH=/usr/bin:/bin", "HOME=/"],
-            "cwd": "/",
-        },
-        "root": {"path": "rootfs", "readonly": False},
-        "linux": {
-            "namespaces": [
-                {"type": "pid"},
-                {"type": "ipc"},
-                {"type": "uts"},
-                {"type": "mount"},
-            ]
-        },
-        "mounts": [
-            {"destination": "/tmp", "type": "tmpfs", "source": "tmpfs"},
-            {"destination": "/proc", "type": "proc", "source": "proc"},
+    dockerfile = work_dir / "Dockerfile.gvisor_sqlite"
+    dockerfile.write_text(
+        "FROM scratch\n"
+        "COPY speedtest1 /speedtest1\n"
+        'ENTRYPOINT ["/speedtest1"]\n'
+    )
+
+    # Stage speedtest1 next to the Dockerfile for the build context.
+    staged = work_dir / "speedtest1"
+    if not staged.exists():
+        shutil.copy2(speedtest1_path, staged)
+
+    print(f"  Building Docker image '{GVISOR_SQLITE_IMAGE}'...")
+    result = subprocess.run(
+        [
+            "docker", "build",
+            "-t", GVISOR_SQLITE_IMAGE,
+            "-f", str(dockerfile),
+            str(work_dir),
         ],
-    }
+        capture_output=True,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        print(f"  [FAIL] docker build failed: {stderr[:500]}")
+        return False
 
-    config_path = bundle_dir / "config.json"
-    with open(config_path, "w") as f:
-        json.dump(config, f, indent=2)
-
-    return process_args
+    return True
 
 
 def run_gvisor(
@@ -527,37 +508,40 @@ def run_gvisor(
     use_memory: bool,
     work_dir: Path,
 ) -> Optional[BenchmarkResult]:
-    """Run speedtest1 under gVisor using an OCI bundle."""
+    """Run speedtest1 under gVisor via Docker --runtime=runsc."""
     global _gvisor_container_seq
     _gvisor_container_seq += 1
-    container_id = (
+    container_name = (
         f"litebox_sqlite_gv_{_gvisor_container_seq}_{os.getpid()}"
     )
 
-    bundle_dir = _prepare_gvisor_rootfs(speedtest1_path, work_dir)
-    process_args = _write_gvisor_config(bundle_dir, size, use_memory)
+    if not _ensure_gvisor_image(speedtest1_path, work_dir):
+        return None
+
+    process_args = ["--size", str(size)]
+    if use_memory:
+        process_args.append("--memdb")
 
     cmd = [
-        "sudo", "runsc", "--network=none",
-        "run", "--bundle", str(bundle_dir), container_id,
-    ]
+        "docker", "run", "--rm",
+        "--runtime=runsc",
+        "--network=none",
+        "--name", container_name,
+        GVISOR_SQLITE_IMAGE,
+    ] + process_args
 
-    print(f"  Running: runsc run {' '.join(process_args)}")
+    print(f"  Running: docker run --runtime=runsc {GVISOR_SQLITE_IMAGE}"
+          f" {' '.join(process_args)}")
     t0 = time.monotonic()
     try:
         result = subprocess.run(cmd, capture_output=True, timeout=600)
     except subprocess.TimeoutExpired:
         print("  [TIMEOUT]")
         subprocess.run(
-            ["sudo", "runsc", "delete", "-force", container_id],
+            ["docker", "rm", "-f", container_name],
             capture_output=True, timeout=10,
         )
         return None
-    finally:
-        subprocess.run(
-            ["sudo", "runsc", "delete", container_id],
-            capture_output=True, timeout=10,
-        )
     elapsed = time.monotonic() - t0
 
     stdout = result.stdout.decode("utf-8", errors="replace")
@@ -986,7 +970,7 @@ def main():
         print(f"Runner:         {runner_path}")
         print(f"Packager:       {packager_path or 'cargo run'}")
     if run_gvisor_mode:
-        print(f"gVisor:         runsc (via sudo)")
+        print(f"gVisor:         docker --runtime=runsc")
     print()
 
     row = ComparisonRow(name=bench_name)
