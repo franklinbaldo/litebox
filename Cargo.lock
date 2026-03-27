@@ -1491,6 +1491,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_ipc"
+version = "0.1.0"
+dependencies = [
+ "zerocopy",
+]
+
+[[package]]
 name = "litebox_packager"
 version = "0.1.0"
 dependencies = [
