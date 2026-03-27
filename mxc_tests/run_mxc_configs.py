@@ -10,7 +10,7 @@ import tempfile
 import time
 from pathlib import Path
 
-PYTHON_SCRIPT_RE = re.compile(r'^python -c "(?P<code>.*)"$', re.DOTALL)
+PYTHON_SCRIPT_RE = re.compile(r'^(?:python|python3)(?:\.exe)? -c "(?P<code>.*)"$', re.DOTALL)
 IMPORT_SYS_RE = re.compile(r"(^|\n)\s*(import sys\b|from sys import\b)")
 WINDOWS_PATH_RE = re.compile(r"[A-Za-z]:\\[^\"'\n]+")
 DEFAULT_BROKER_ROOT = Path("C:\\")
@@ -93,6 +93,61 @@ def parse_args() -> argparse.Namespace:
         help="Path to the JSON summary written by the harness",
     )
     return parser.parse_args()
+
+
+def process_config(data: dict) -> dict:
+    process = data.get("process")
+    if process is None:
+        return {}
+    if not isinstance(process, dict):
+        raise TypeError("process must be an object")
+    return process
+
+
+def command_line_for_config(data: dict) -> str:
+    process = process_config(data)
+    command_line = process.get("commandLine")
+    if command_line is None:
+        legacy_script = data.get("script")
+        if isinstance(legacy_script, str):
+            return legacy_script.strip()
+        raise KeyError("missing process.commandLine")
+    if not isinstance(command_line, str):
+        raise TypeError("process.commandLine must be a string")
+    return command_line.strip()
+
+
+def timeout_seconds_for_config(data: dict) -> float:
+    process = process_config(data)
+    timeout_ms = process.get("timeout", data.get("timeout", 15_000))
+    if not isinstance(timeout_ms, (int, float)):
+        raise TypeError("process.timeout must be a number")
+    if timeout_ms < 0:
+        raise ValueError("process.timeout must be non-negative")
+    return (timeout_ms / 1000.0) + 5.0
+
+
+def working_directory_for_config(data: dict) -> str | None:
+    process = process_config(data)
+    cwd = process.get("cwd")
+    if cwd is None:
+        return None
+    if not isinstance(cwd, str):
+        raise TypeError("process.cwd must be a string")
+    cwd = cwd.strip()
+    return cwd or None
+
+
+def environment_for_config(data: dict) -> list[str]:
+    process = process_config(data)
+    env = process.get("env")
+    if env is None:
+        return []
+    if not isinstance(env, list):
+        raise TypeError("process.env must be an array of KEY=VALUE strings")
+    if not all(isinstance(item, str) for item in env):
+        raise TypeError("process.env must contain only strings")
+    return env
 
 
 def normalize_code(name: str, code: str) -> tuple[str, list[str]]:
@@ -281,13 +336,29 @@ def run_config(
     python_tar: Path,
 ) -> dict:
     data = json.loads(path.read_text(encoding="utf-8"))
-    script = data.get("script", "").strip()
-    match = PYTHON_SCRIPT_RE.fullmatch(script)
+    try:
+        command_line = command_line_for_config(data)
+        timeout_s = timeout_seconds_for_config(data)
+        working_directory = working_directory_for_config(data)
+        environment_variables = environment_for_config(data)
+    except (KeyError, TypeError, ValueError) as exc:
+        return {
+            "name": path.name,
+            "status": "failed",
+            "reason": f"invalid config: {exc}",
+            "notes": [],
+            "returncode": None,
+            "stdout": "",
+            "stderr": "",
+            "semantic_warning": False,
+        }
+
+    match = PYTHON_SCRIPT_RE.fullmatch(command_line)
     if not match:
         return {
             "name": path.name,
             "status": "skipped",
-            "reason": "non-python script",
+            "reason": "non-python command line",
             "notes": [],
             "returncode": None,
             "stdout": "",
@@ -300,7 +371,6 @@ def run_config(
     code, path_notes = rewrite_windows_paths(code)
     notes.extend(path_notes)
     writable_paths = writable_paths_for_config(data)
-    timeout_s = (data.get("timeout", 15_000) / 1000.0) + 5.0
 
     broker_proc = None
     broker_log = None
@@ -320,12 +390,20 @@ def run_config(
             broker_endpoint,
             "--nine-p-broker",
             broker_endpoint,
-            "--initial-files",
-            str(python_tar),
-            "/usr/local/bin/python3",
-            "-c",
-            code,
         ]
+        if working_directory is not None:
+            cmd.extend(["--cwd", working_directory])
+        for env_var in environment_variables:
+            cmd.extend(["--env", env_var])
+        cmd.extend(
+            [
+                "--initial-files",
+                str(python_tar),
+                "/usr/local/bin/python3",
+                "-c",
+                code,
+            ]
+        )
         completed = subprocess.run(
             cmd,
             capture_output=True,

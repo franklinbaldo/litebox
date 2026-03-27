@@ -16,9 +16,11 @@ The harness:
 - writes a JSON results file plus a broker log
 - prints each test result as soon as that config finishes, followed by a final
   summary
+- understands both the newer MXC `process.commandLine` / `process.timeout`
+  schema and the older top-level `script` / `timeout` fields
 
-Configs whose `script` field is not a `python -c "..."` one-liner are reported
-as `skipped`.
+Configs whose `process.commandLine` (or legacy top-level `script`) is not a
+`python -c "..."` one-liner are reported as `skipped`.
 
 ## Prerequisites
 
@@ -139,8 +141,8 @@ The status values mean:
 
 - `ok`: LiteBox returned exit code `0` for that config.
 - `failed`: LiteBox returned a non-zero exit code or the config timed out.
-- `skipped`: the config was not a `python -c "..."` case, so this harness did
-  not try to run it.
+- `skipped`: the config's `process.commandLine` (or legacy top-level `script`)
+  was not a `python -c "..."` case, so this harness did not try to run it.
 
 The summary line at the end looks like this:
 
