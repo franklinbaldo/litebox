@@ -23,6 +23,7 @@ use litebox_ipc::ring::{CqEntry, RingHeader, SharedRingLayout, SqEntry, RING_SIZ
 /// `SharedRegion` owns both the file descriptor and the mapping. It is `Send`
 /// but deliberately not `Sync` — a single owner should manage the region and
 /// share the fd with exactly one guest process.
+#[allow(dead_code)] // fd/as_ptr/data_region will be used by the launcher in Phase B
 pub struct SharedRegion {
     /// The anonymous shared memory file descriptor.
     fd: OwnedFd,
@@ -37,6 +38,7 @@ pub struct SharedRegion {
 // safe. We intentionally do NOT implement `Sync`.
 unsafe impl Send for SharedRegion {}
 
+#[allow(dead_code)] // fd/as_ptr/data_region will be used by the launcher
 impl SharedRegion {
     /// Create a new shared memory region with the default layout.
     ///

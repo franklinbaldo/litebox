@@ -27,7 +27,7 @@ use litebox_platform_multiplex::Platform;
 /// `orig_rax` is set from `entry.syscall_nr`.
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::cast_possible_truncation)] // x86_64: usize == u64, no truncation
-fn sq_entry_to_ptregs(entry: &SqEntry) -> PtRegs {
+pub(crate) fn sq_entry_to_ptregs(entry: &SqEntry) -> PtRegs {
     PtRegs {
         rdi: entry.args[0] as usize,
         rsi: entry.args[1] as usize,

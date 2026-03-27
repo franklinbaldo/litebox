@@ -9,6 +9,7 @@
 use std::ptr::null;
 use std::sync::atomic::Ordering::Relaxed;
 
+use litebox::fs::in_mem::FileSystem as InMemFs;
 use litebox_ipc::cq::{cq_notify_thread, cq_push};
 use litebox_ipc::messages::{
     self, MSG_CHILD_READY, MSG_FORK_RESULT, MSG_LOCAL_RESULT, MSG_THREAD_DEREGISTER,
@@ -17,19 +18,24 @@ use litebox_ipc::messages::{
 use litebox_ipc::ring::{CqEntry, SqEntry, RING_MASK};
 use litebox_ipc::sq::{sq_advance_head, sq_head_index, sq_try_consume};
 use litebox_ipc::wait::spin_then_wait;
+use litebox_platform_multiplex::Platform;
 
 use crate::shmem::SharedRegion;
 
 /// The central server that processes SQ entries and produces CQ completions.
 pub struct ProcessServer {
     region: SharedRegion,
+    task: litebox_shim_linux::LinuxShimTask<InMemFs<Platform>>,
 }
 
 impl ProcessServer {
     /// Create a new `ProcessServer` backed by the given shared memory region.
     #[must_use]
-    pub fn new(region: SharedRegion) -> Self {
-        Self { region }
+    pub fn new(
+        region: SharedRegion,
+        task: litebox_shim_linux::LinuxShimTask<InMemFs<Platform>>,
+    ) -> Self {
+        Self { region, task }
     }
 
     /// Run the server loop.
@@ -127,23 +133,12 @@ impl ProcessServer {
 
     /// Dispatch a regular syscall from an SQ entry.
     ///
-    /// Parses the entry into a typed `SyscallRequest` and returns the result.
-    /// Currently returns `-ENOSYS` for all valid requests (dispatch through
-    /// `Task::do_syscall` is not yet implemented).
-    // TODO(micro-litebox): Wire up Task::do_syscall dispatch.
-    // Currently returns -ENOSYS for all syscalls. Full dispatch requires
-    // exposing a public entrypoint in litebox_shim_linux for creating a
-    // headless Task (one that processes syscall requests without loading
-    // an ELF binary). See docs/plans/2026-03-27-micro-litebox-07-central-refactoring.md.
-    #[allow(clippy::unused_self)] // will use self once Task::do_syscall is wired up
+    /// Builds a synthetic [`PtRegs`](litebox_common_linux::PtRegs) from the
+    /// SQ entry's arguments and routes it through the shim's
+    /// [`LinuxShimTask::dispatch_syscall`].
     fn handle_syscall(&self, entry: &SqEntry) -> i64 {
-        match crate::dispatch::parse_sq_entry(entry) {
-            Ok(_request) => {
-                // TODO: dispatch through Task::do_syscall
-                -i64::from(libc::ENOSYS)
-            }
-            Err(errno) => i64::from(errno.as_neg()),
-        }
+        let mut regs = crate::dispatch::sq_entry_to_ptregs(entry);
+        self.task.dispatch_syscall(&mut regs)
     }
 
     /// Dispatch a control message from an SQ entry.

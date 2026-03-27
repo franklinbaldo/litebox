@@ -322,6 +322,67 @@ impl LinuxShimProcess {
     }
 }
 
+/// A headless task handle for dispatching syscalls without loading an ELF
+/// binary. Used by `litebox_central` to process syscall requests received
+/// over IPC.
+pub struct LinuxShimTask<FS: ShimFS> {
+    task: Task<FS>,
+}
+
+impl<FS: ShimFS> LinuxShimTask<FS> {
+    /// Dispatch a single syscall described by the given register context.
+    ///
+    /// Returns the raw syscall result: non-negative on success, negative
+    /// `-errno` on failure.
+    #[allow(clippy::cast_possible_wrap)] // syscall return values fit in i64
+    pub fn dispatch_syscall(&self, ctx: &mut litebox_common_linux::PtRegs) -> i64 {
+        match self.task.do_syscall(ctx) {
+            Ok(v) => v as i64,
+            Err(e) => i64::from(e.as_neg()),
+        }
+    }
+}
+
+impl<FS: ShimFS> LinuxShim<FS> {
+    /// Create a headless task that can process syscalls without loading a
+    /// guest ELF binary.
+    ///
+    /// This is the entry point for `litebox_central`: it creates a [`Task`]
+    /// backed by the shim's [`GlobalState`] and the given filesystem, ready
+    /// to receive [`dispatch_syscall`](LinuxShimTask::dispatch_syscall) calls.
+    pub fn create_task(
+        &self,
+        fs: alloc::sync::Arc<FS>,
+        params: litebox_common_linux::TaskParams,
+    ) -> LinuxShimTask<FS> {
+        let files = Arc::new(syscalls::file::FilesState::new(fs));
+        files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR - 1);
+        files.initialize_stdio_in_shared_descriptors_table(&self.0);
+
+        LinuxShimTask {
+            task: Task {
+                global: self.0.clone(),
+                thread: syscalls::process::ThreadState::new_process(params.pid),
+                wait_state: wait::WaitState::new(self.0.platform),
+                pid: params.pid,
+                ppid: params.ppid,
+                tid: params.pid,
+                credentials: syscalls::process::Credentials {
+                    uid: params.uid,
+                    euid: params.euid,
+                    gid: params.gid,
+                    egid: params.egid,
+                }
+                .into(),
+                comm: Cell::new([0; litebox_common_linux::TASK_COMM_LEN]),
+                fs: Arc::new(syscalls::file::FsState::new()).into(),
+                files: files.into(),
+                signals: syscalls::signal::SignalState::new_process(),
+            },
+        }
+    }
+}
+
 /// Create a default layered file system with the given in-memory and tar read-only layers.
 fn default_fs(
     litebox: &LiteBox<Platform>,
