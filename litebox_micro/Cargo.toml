@@ -1,0 +1,11 @@
+[package]
+name = "litebox_micro"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+litebox_ipc = { path = "../litebox_ipc" }
+libc = "0.2"
+
+[lints]
+workspace = true
