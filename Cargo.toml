@@ -10,6 +10,7 @@ members = [
     "litebox_platform_windows_userland",
     "litebox_platform_lvbs",
     "litebox_platform_central",
+    "litebox_central",
     "litebox_platform_multiplex",
     "litebox_runner_linux_userland",
     "litebox_runner_linux_on_windows_userland",
@@ -50,6 +51,9 @@ default-members = [
 ]
 # We exclude `litebox_runner_lvbs` from `default-members` because it requires
 # a custom target and `-Z build-std`, which requires a nightly toolchain.
+# We exclude `litebox_central` from `default-members` because it uses
+# `platform_central` which conflicts with the default `platform_linux_userland`
+# feature in `litebox_platform_multiplex` due to Cargo feature unification.
 
 # Introduce all the pedantic clippy lints and remove ones I (jayb) think are
 # pushing it too far; this way we get something even further than default clippy

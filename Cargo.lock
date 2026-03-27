@@ -1464,6 +1464,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_central"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "litebox",
+ "litebox_common_linux",
+ "litebox_ipc",
+ "litebox_platform_central",
+ "litebox_platform_multiplex",
+ "litebox_shim_linux",
+]
+
+[[package]]
 name = "litebox_common_linux"
 version = "0.1.0"
 dependencies = [
