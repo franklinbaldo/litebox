@@ -252,6 +252,21 @@ impl SharedRegion {
             std::slice::from_raw_parts(base, self.layout.data_region_size)
         }
     }
+
+    /// Returns the data region as a mutable byte slice.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure no other references to the data region exist
+    /// simultaneously. In practice, the server is single-threaded and only
+    /// accesses the data region during syscall handling (between CQ writes).
+    #[allow(clippy::mut_from_ref)] // shared-memory region with single-threaded access
+    pub fn data_region_mut(&self) -> &mut [u8] {
+        unsafe {
+            let base = self.ptr.as_ptr().add(self.layout.data_region_offset);
+            std::slice::from_raw_parts_mut(base, self.layout.data_region_size)
+        }
+    }
 }
 
 impl Drop for SharedRegion {
@@ -290,5 +305,14 @@ mod tests {
         assert_eq!(header.sq_tail.load(Ordering::Relaxed), 0);
         assert_eq!(header.cq_head.load(Ordering::Relaxed), 0);
         assert_eq!(header.cq_tail.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn data_region_mut_is_writable() {
+        let region = SharedRegion::new().expect("failed to create shared region");
+        let data = region.data_region_mut();
+        assert!(!data.is_empty());
+        data[0] = 0xAB;
+        assert_eq!(region.data_region()[0], 0xAB);
     }
 }
