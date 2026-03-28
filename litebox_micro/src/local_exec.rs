@@ -64,6 +64,28 @@ pub unsafe fn execute_locally(syscall_nr: u32, args: &[u64; 6], _cq: &CqEntry) -
         nr if nr == libc::SYS_arch_prctl as u32 => unsafe {
             libc::syscall(libc::SYS_arch_prctl, args[0] as i32, args[1] as usize)
         },
+        nr if nr == libc::SYS_write as u32 => unsafe {
+            libc::syscall(
+                libc::SYS_write,
+                args[0] as i32,
+                args[1] as usize,
+                args[2] as usize,
+            )
+        },
+        nr if nr == libc::SYS_read as u32 => unsafe {
+            libc::syscall(
+                libc::SYS_read,
+                args[0] as i32,
+                args[1] as usize,
+                args[2] as usize,
+            )
+        },
+        nr if nr == libc::SYS_exit_group as u32 => unsafe {
+            libc::syscall(libc::SYS_exit_group, args[0] as i32)
+        },
+        nr if nr == libc::SYS_exit as u32 => unsafe {
+            libc::syscall(libc::SYS_exit, args[0] as i32)
+        },
         _ => -i64::from(libc::ENOSYS),
     }
 }

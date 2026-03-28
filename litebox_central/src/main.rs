@@ -12,10 +12,17 @@ mod shmem;
 use std::os::fd::OwnedFd;
 
 use clap::Parser;
-use litebox::fs::in_mem::FileSystem as InMemFs;
 use litebox_ipc::ring::SharedRingLayout;
 use litebox_platform_central::CentralPlatform;
 use litebox_platform_multiplex::Platform;
+
+/// Filesystem type for central: device nodes (/dev/stdin, /dev/stdout, /dev/stderr)
+/// layered on top of an in-memory FS.
+type CentralFs = litebox::fs::layered::FileSystem<
+    Platform,
+    litebox::fs::devices::FileSystem<Platform>,
+    litebox::fs::in_mem::FileSystem<Platform>,
+>;
 
 #[derive(Parser)]
 struct Args {
@@ -29,13 +36,23 @@ fn main() -> anyhow::Result<()> {
     // Initialize the platform — must happen before any other litebox usage.
     let platform: &'static Platform = Box::leak(Box::new(CentralPlatform));
     litebox_platform_multiplex::set_platform(platform);
-    eprintln!("litebox_central: platform initialized");
 
-    // Build the LiteBox shim with an in-memory filesystem.
+    // Build the LiteBox shim with a layered filesystem (device nodes + in-mem).
+    // The devices layer (upper) provides /dev/stdin, /dev/stdout, /dev/stderr
+    // which are required for stdio initialization during task creation.
+    // Devices must be the UPPER layer so that open() receives the original flags
+    // (the layered FS rewrites lower-layer flags to RDONLY with LowerLayerReadOnly).
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
-    let fs = std::sync::Arc::new(InMemFs::new(shim_builder.litebox()));
-    let shim = shim_builder.build::<InMemFs<Platform>>();
-    eprintln!("litebox_central: shim initialized");
+    let lb = shim_builder.litebox();
+    let devices = litebox::fs::devices::FileSystem::new(lb);
+    let in_mem = litebox::fs::in_mem::FileSystem::new(lb);
+    let fs = std::sync::Arc::new(litebox::fs::layered::FileSystem::new(
+        lb,
+        devices,
+        in_mem,
+        litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
+    ));
+    let shim = shim_builder.build::<CentralFs>();
 
     // Create a headless task for syscall dispatch.
     // TODO: receive real TaskParams from the launcher via the ring buffer
@@ -49,11 +66,9 @@ fn main() -> anyhow::Result<()> {
         egid: 0,
     };
     let task = shim.create_task(fs, params);
-    eprintln!("litebox_central: task created (pid=1)");
 
     let args = Args::parse();
 
-    eprintln!("litebox_central: creating shared memory region");
     let region = if let Some(fd) = args.shmem_fd {
         use std::os::unix::io::FromRawFd;
         let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
@@ -62,12 +77,7 @@ fn main() -> anyhow::Result<()> {
     } else {
         shmem::SharedRegion::new()?
     };
-    eprintln!(
-        "litebox_central: shared region created, {} bytes",
-        region.layout().total_size
-    );
 
     let server = server::ProcessServer::new(region, task);
-    eprintln!("litebox_central: starting server loop");
     server.run()
 }

@@ -21,10 +21,16 @@ core::arch::global_asm!(
     ".balign 16",
     "micro_syscall_entry:",
     "mov gs:[0x20], rcx", // save return addr
+    // Skip the 128-byte red zone mandated by the x86_64 ABI. Leaf functions
+    // (and inline-asm `syscall` sites) are allowed to use 128 bytes below RSP
+    // without adjusting it. We must not clobber that region.
+    //
     // Stack alignment: the binary rewriter's trampoline stub uses
     // `LEA RCX, [RIP+disp]` + `JMP [RIP+disp]`, so on entry here RSP ≡ 8
-    // (mod 16) — same as after a CALL. Subtracting 56 (≡ 8 mod 16) gives
+    // (mod 16) — same as after a CALL. Subtracting 128 (≡ 0 mod 16) keeps
+    // the same alignment class. Then subtracting 56 (≡ 8 mod 16) gives
     // RSP ≡ 0 (mod 16) before the CALL below, satisfying the x86_64 ABI.
+    "sub rsp, 128",        // skip red zone
     "sub rsp, 56",         // allocate SyscallArgs
     "mov [rsp+0x00], rax", // nr
     "mov [rsp+0x08], rdi", // arg0
@@ -35,7 +41,8 @@ core::arch::global_asm!(
     "mov [rsp+0x30], r9",  // arg5
     "mov rdi, rsp",        // C arg0 = &SyscallArgs
     "call micro_handle_syscall",
-    "add rsp, 56",        // clean up
+    "add rsp, 56",        // deallocate SyscallArgs
+    "add rsp, 128",       // restore red zone
     "mov rcx, gs:[0x20]", // restore return addr
     "jmp rcx",
     ".size micro_syscall_entry, . - micro_syscall_entry",

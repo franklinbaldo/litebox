@@ -68,23 +68,28 @@ pub(crate) unsafe fn submit_and_wait(
     let seq = unsafe { (*tls).seq_counter };
     unsafe { (*tls).seq_counter += 1 };
 
+    // Capture the CQ tail BEFORE publishing the SQ entry so that we
+    // don't miss a fast completion that arrives before we start scanning.
+    let thread_slot = unsafe { (*tls).thread_slot as u16 };
+    let notify_slot = &header.cq_notify_slots[thread_slot as usize];
+    let search_start = cq_tail(header);
+
     let slot_idx = unsafe { sq_acquire_slot(header) };
     let entry = unsafe { &mut *sq_entries.add(slot_idx as usize) };
 
     entry.seq = seq;
     entry.syscall_nr = syscall_nr;
-    entry.thread_slot = unsafe { (*tls).thread_slot as u16 };
+    entry.thread_slot = thread_slot;
     entry.flags = flags;
     entry.args = *args;
     entry.data_offset = 0;
     entry.data_len = 0;
 
     sq_publish(entry);
+    header
+        .sq_notify
+        .fetch_add(1, core::sync::atomic::Ordering::Release);
     futex_wake(&header.sq_notify);
-
-    let thread_slot = unsafe { (*tls).thread_slot as u16 };
-    let notify_slot = &header.cq_notify_slots[thread_slot as usize];
-    let mut search_start = cq_tail(header);
 
     loop {
         if let Some(cq) = unsafe { cq_find_by_seq(header, cq_entries, search_start, seq) } {
@@ -95,7 +100,6 @@ pub(crate) unsafe fn submit_and_wait(
             return cq;
         }
         spin_then_wait(notify_slot, current, futex_wait);
-        search_start = cq_tail(header);
     }
 }
 

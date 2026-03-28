@@ -1,0 +1,3 @@
+# Compiled test binaries (generated during integration tests)
+hello_nolibc
+hello_nolibc.hooked

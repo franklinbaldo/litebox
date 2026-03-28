@@ -26,12 +26,12 @@ fn find_central_binary() -> String {
         return path;
     }
     // Check same directory as current executable
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join("litebox_central");
-            if candidate.exists() {
-                return candidate.to_string_lossy().into_owned();
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let candidate = dir.join("litebox_central");
+        if candidate.exists() {
+            return candidate.to_string_lossy().into_owned();
         }
     }
     // Fall back to PATH lookup
@@ -58,7 +58,25 @@ impl CentralProcess {
         match pid {
             -1 => anyhow::bail!("fork failed: {}", std::io::Error::last_os_error()),
             0 => {
-                // Child: exec litebox_central with the shmem fd as an argument.
+                // Child: redirect stdout/stderr to /dev/null so that central
+                // does not hold the parent's pipe handles open (which would
+                // prevent Command::output() from returning in tests).
+                // Skip if shmem_fd is 1 or 2 to avoid clobbering it.
+                if shmem_fd != 1 && shmem_fd != 2 {
+                    let devnull = unsafe {
+                        libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC)
+                    };
+                    if devnull >= 0 {
+                        unsafe {
+                            libc::dup2(devnull, 1);
+                            // Keep stderr for now — central may need diagnostics.
+                            // In production, redirect stderr to a log file.
+                            libc::close(devnull);
+                        }
+                    }
+                }
+
+                // Exec litebox_central with the shmem fd as an argument.
                 let fd_arg = format!("--shmem-fd={shmem_fd}");
                 let central_path = find_central_binary();
                 let c_path = CString::new(central_path).unwrap();

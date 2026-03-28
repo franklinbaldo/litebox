@@ -60,15 +60,16 @@ fn test_hello_nolibc_end_to_end() {
         .expect("launcher should run");
 
     // Step 6: Check output
-    // Central's StdioProvider writes guest stdout to host stderr
+    // With EXEC_LOCAL, micro executes write(1, ...) locally, so the
+    // guest message appears on stdout (fd 1) of the launcher process.
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     eprintln!("=== launcher stdout ===\n{stdout}");
     eprintln!("=== launcher stderr ===\n{stderr}");
 
     assert!(
-        stderr.contains("Hello from micro-LiteBox!"),
-        "Expected guest output in stderr, got:\nstdout: {stdout}\nstderr: {stderr}"
+        stdout.contains("Hello from micro-LiteBox!"),
+        "Expected guest output in stdout, got:\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert!(
         output.status.success(),

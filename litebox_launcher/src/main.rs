@@ -16,14 +16,9 @@ fn main() -> anyhow::Result<()> {
 
     // 1. Create shared memory region for IPC ring buffer.
     let shmem = shmem::LauncherSharedRegion::new()?;
-    eprintln!(
-        "litebox_launcher: shared memory created (fd={})",
-        shmem.fd_raw()
-    );
 
     // 2. Spawn central process (child inherits the shmem fd).
-    let central = central::CentralProcess::spawn(shmem.fd_raw())?;
-    eprintln!("litebox_launcher: central spawned (pid={})", central.pid());
+    let _central = central::CentralProcess::spawn(shmem.fd_raw())?;
 
     // Give central time to initialize (platform, shim, server loop).
     // TODO: Replace with proper readiness signaling via ring header.
@@ -53,10 +48,6 @@ fn main() -> anyhow::Result<()> {
     let guest_argv: Vec<&str> = args[1..].iter().map(String::as_str).collect();
     let guest_envp: Vec<&str> = Vec::new(); // empty environment for now
     let loaded = load_elf::load_elf(elf_path, &guest_argv, &guest_envp, syscall_entry)?;
-    eprintln!(
-        "litebox_launcher: ELF loaded (entry={:#x}, sp={:#x})",
-        loaded.entry_point, loaded.stack_pointer
-    );
 
     // 5. Jump to guest entry point — this never returns.
     // SAFETY: `entry_point` was produced by `load_elf` from a valid ELF, and

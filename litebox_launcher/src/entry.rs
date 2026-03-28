@@ -23,14 +23,16 @@ pub unsafe fn jump_to_guest(entry_point: usize, stack_pointer: usize) -> ! {
     // address and `stack_pointer` is a properly aligned and initialised
     // user stack.  The inline assembly zeros all GPRs, sets RSP, and
     // jumps to the entry — matching the kernel's ELF-exec ABI contract.
+    //
+    // We bind `entry_point` to RDX and `stack_pointer` to RCX via
+    // explicit register constraints, and zero those two registers last
+    // (after the `mov rsp` / `jmp` that consume them).
     unsafe {
         core::arch::asm!(
-            // Zero every general-purpose register to match the kernel's
-            // ELF-exec ABI (all GPRs = 0, flags cleared).
+            // Zero all GPRs except RCX (stack) and RDX (entry) which we
+            // need for the final mov+jmp.
             "xor rax, rax",
             "xor rbx, rbx",
-            "xor rcx, rcx",
-            "xor rdx, rdx",
             "xor rsi, rsi",
             "xor rdi, rdi",
             "xor rbp, rbp",
@@ -42,11 +44,15 @@ pub unsafe fn jump_to_guest(entry_point: usize, stack_pointer: usize) -> ! {
             "xor r13, r13",
             "xor r14, r14",
             "xor r15, r15",
-            // Set the stack pointer and jump to the entry point.
-            "mov rsp, {stack}",
-            "jmp {entry}",
-            stack = in(reg) stack_pointer,
-            entry = in(reg) entry_point,
+            // Switch stack and jump.  RCX and RDX are consumed here.
+            "mov rsp, rcx",
+            "xor rcx, rcx",  // zero rcx now that it's consumed
+            // RDX still holds entry_point; jump consumes it.
+            "push rdx",
+            "xor rdx, rdx",  // zero rdx
+            "ret",            // pop entry_point into RIP
+            in("rcx") stack_pointer,
+            in("rdx") entry_point,
             options(noreturn),
         );
     }
