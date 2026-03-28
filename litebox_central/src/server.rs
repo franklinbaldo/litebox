@@ -45,8 +45,8 @@ impl ProcessServer {
     ///
     /// # Errors
     ///
-    /// Currently never returns `Ok(())` — the loop is infinite. Returns
-    /// `Err` only if an unrecoverable error occurs.
+    /// Returns `Ok(())` when the guest exits cleanly.
+    #[allow(clippy::unnecessary_wraps)] // Result kept for future error paths
     pub fn run(&self) -> anyhow::Result<()> {
         let header = self.region.header();
         let sq_entries = self.region.sq_entries();
