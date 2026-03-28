@@ -1468,6 +1468,7 @@ name = "litebox_central"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
  "libc",
  "litebox",
  "litebox_common_linux",

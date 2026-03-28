@@ -9,9 +9,21 @@ mod dispatch;
 mod server;
 mod shmem;
 
+use std::os::fd::OwnedFd;
+
+use clap::Parser;
 use litebox::fs::in_mem::FileSystem as InMemFs;
+use litebox_ipc::ring::SharedRingLayout;
 use litebox_platform_central::CentralPlatform;
 use litebox_platform_multiplex::Platform;
+
+#[derive(Parser)]
+struct Args {
+    /// Shared memory file descriptor (inherited from launcher).
+    /// If not provided, central creates its own shmem.
+    #[arg(long)]
+    shmem_fd: Option<i32>,
+}
 
 fn main() -> anyhow::Result<()> {
     // Initialize the platform — must happen before any other litebox usage.
@@ -39,8 +51,17 @@ fn main() -> anyhow::Result<()> {
     let task = shim.create_task(fs, params);
     eprintln!("litebox_central: task created (pid=1)");
 
+    let args = Args::parse();
+
     eprintln!("litebox_central: creating shared memory region");
-    let region = shmem::SharedRegion::new()?;
+    let region = if let Some(fd) = args.shmem_fd {
+        use std::os::unix::io::FromRawFd;
+        let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let layout = SharedRingLayout::default_layout();
+        shmem::SharedRegion::from_fd(owned_fd, layout)?
+    } else {
+        shmem::SharedRegion::new()?
+    };
     eprintln!(
         "litebox_central: shared region created, {} bytes",
         region.layout().total_size
