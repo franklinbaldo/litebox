@@ -19,7 +19,7 @@ fn futex_wait(addr: &core::sync::atomic::AtomicU32, expected: u32) {
         libc::syscall(
             libc::SYS_futex,
             core::ptr::from_ref(addr) as usize,
-            libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
+            libc::FUTEX_WAIT,
             expected,
             core::ptr::null::<libc::timespec>(),
         );
@@ -31,7 +31,7 @@ fn futex_wake(addr: &core::sync::atomic::AtomicU32) {
         libc::syscall(
             libc::SYS_futex,
             core::ptr::from_ref(addr) as usize,
-            libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
+            libc::FUTEX_WAKE,
             1i32,
         );
     }
