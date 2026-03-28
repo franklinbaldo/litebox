@@ -1512,6 +1512,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_launcher"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "litebox_common_linux",
+ "litebox_ipc",
+ "litebox_micro",
+]
+
+[[package]]
 name = "litebox_micro"
 version = "0.1.0"
 dependencies = [
