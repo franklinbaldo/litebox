@@ -244,16 +244,23 @@ impl<T: FromBytes> RawConstPointer<T> for GuestConstPtr<T> {
         }
     }
 
-    fn read_at_offset(self, _count: isize) -> Option<T> {
-        unimplemented!(
-            "CentralPlatform: guest pointers cannot be dereferenced from the host process"
-        )
+    fn read_at_offset(self, count: isize) -> Option<T> {
+        if self.addr == 0 {
+            return None;
+        }
+        unsafe { Some((self.addr as *const T).offset(count).read_unaligned()) }
     }
 
-    fn to_owned_slice(self, _len: usize) -> Option<alloc::boxed::Box<[T]>> {
-        unimplemented!(
-            "CentralPlatform: guest pointers cannot be dereferenced from the host process"
-        )
+    fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
+        if self.addr == 0 {
+            return None;
+        }
+        let src = self.addr as *const T;
+        let mut vec = alloc::vec::Vec::with_capacity(len);
+        for i in 0..len {
+            vec.push(unsafe { src.add(i).read_unaligned() });
+        }
+        Some(vec.into_boxed_slice())
     }
 }
 
@@ -293,32 +300,57 @@ impl<T: FromBytes> RawConstPointer<T> for GuestMutPtr<T> {
         }
     }
 
-    fn read_at_offset(self, _count: isize) -> Option<T> {
-        unimplemented!(
-            "CentralPlatform: guest pointers cannot be dereferenced from the host process"
-        )
+    fn read_at_offset(self, count: isize) -> Option<T> {
+        if self.addr == 0 {
+            return None;
+        }
+        unsafe { Some((self.addr as *const T).offset(count).read_unaligned()) }
     }
 
-    fn to_owned_slice(self, _len: usize) -> Option<alloc::boxed::Box<[T]>> {
-        unimplemented!(
-            "CentralPlatform: guest pointers cannot be dereferenced from the host process"
-        )
+    fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
+        if self.addr == 0 {
+            return None;
+        }
+        let src = self.addr as *const T;
+        let mut vec = alloc::vec::Vec::with_capacity(len);
+        for i in 0..len {
+            vec.push(unsafe { src.add(i).read_unaligned() });
+        }
+        Some(vec.into_boxed_slice())
     }
 }
 
 impl<T: FromBytes + IntoBytes> RawMutPointer<T> for GuestMutPtr<T> {
-    fn write_at_offset(self, _count: isize, _value: T) -> Option<()> {
-        unimplemented!("CentralPlatform: guest pointers cannot be written from the host process")
+    fn write_at_offset(self, count: isize, value: T) -> Option<()> {
+        if self.addr == 0 {
+            return None;
+        }
+        unsafe { (self.addr as *mut T).offset(count).write_unaligned(value) };
+        Some(())
     }
 
     fn mutate_subslice_with<R>(
         self,
-        _range: impl RangeBounds<isize>,
-        _f: impl FnOnce(&mut [T]) -> R,
+        range: impl RangeBounds<isize>,
+        f: impl FnOnce(&mut [T]) -> R,
     ) -> Option<R> {
-        unimplemented!(
-            "CentralPlatform: guest pointer slices cannot be accessed from the host process"
-        )
+        if self.addr == 0 {
+            return None;
+        }
+        let start = match range.start_bound() {
+            core::ops::Bound::Included(&s) => s,
+            core::ops::Bound::Excluded(&s) => s.checked_add(1)?,
+            core::ops::Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            core::ops::Bound::Included(&e) => e.checked_add(1)?,
+            core::ops::Bound::Excluded(&e) => e,
+            core::ops::Bound::Unbounded => return None,
+        };
+        let len = (end - start).cast_unsigned();
+        let slice =
+            unsafe { core::slice::from_raw_parts_mut((self.addr as *mut T).offset(start), len) };
+        Some(f(slice))
     }
 }
 
@@ -681,5 +713,80 @@ impl litebox::mm::linux::VmemPageFaultHandler for CentralPlatform {
 
     fn access_error(_error_code: u64, _flags: litebox::mm::linux::VmFlags) -> bool {
         unreachable!("host kernel handles page faults for central platform")
+    }
+}
+
+#[cfg(test)]
+mod guest_ptr_tests {
+    use super::*;
+    use litebox::platform::{RawConstPointer, RawMutPointer};
+
+    #[test]
+    fn guest_const_ptr_read_at_offset() {
+        let values: [u64; 3] = [42, 99, 7];
+        let ptr = GuestConstPtr::<u64>::from_usize(values.as_ptr() as usize);
+        assert_eq!(ptr.read_at_offset(0), Some(42));
+        assert_eq!(ptr.read_at_offset(1), Some(99));
+        assert_eq!(ptr.read_at_offset(2), Some(7));
+    }
+
+    #[test]
+    fn guest_const_ptr_to_owned_slice() {
+        let values: [u32; 4] = [1, 2, 3, 4];
+        let ptr = GuestConstPtr::<u32>::from_usize(values.as_ptr() as usize);
+        let slice = ptr.to_owned_slice(4).unwrap();
+        assert_eq!(&*slice, &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn guest_const_ptr_null_returns_none() {
+        let ptr = GuestConstPtr::<u64>::from_usize(0);
+        assert_eq!(ptr.read_at_offset(0), None);
+        assert!(ptr.to_owned_slice(1).is_none());
+    }
+
+    #[test]
+    fn guest_mut_ptr_read_at_offset() {
+        let mut values: [u64; 2] = [10, 20];
+        let ptr = GuestMutPtr::<u64>::from_usize(values.as_mut_ptr() as usize);
+        assert_eq!(RawConstPointer::read_at_offset(ptr, 0), Some(10));
+        assert_eq!(RawConstPointer::read_at_offset(ptr, 1), Some(20));
+    }
+
+    #[test]
+    fn guest_mut_ptr_to_owned_slice() {
+        let mut values: [u8; 3] = [0xAA, 0xBB, 0xCC];
+        let ptr = GuestMutPtr::<u8>::from_usize(values.as_mut_ptr() as usize);
+        let slice = RawConstPointer::to_owned_slice(ptr, 3).unwrap();
+        assert_eq!(&*slice, &[0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn guest_mut_ptr_write_at_offset() {
+        let mut values: [u64; 2] = [0, 0];
+        let ptr = GuestMutPtr::<u64>::from_usize(values.as_mut_ptr() as usize);
+        assert_eq!(ptr.write_at_offset(0, 42), Some(()));
+        assert_eq!(ptr.write_at_offset(1, 99), Some(()));
+        assert_eq!(values, [42, 99]);
+    }
+
+    #[test]
+    fn guest_mut_ptr_mutate_subslice_with() {
+        let mut values: [u8; 4] = [0; 4];
+        let ptr = GuestMutPtr::<u8>::from_usize(values.as_mut_ptr() as usize);
+        let result = ptr.mutate_subslice_with(1..3, |slice| {
+            slice[0] = 0xAA;
+            slice[1] = 0xBB;
+            42
+        });
+        assert_eq!(result, Some(42));
+        assert_eq!(values, [0, 0xAA, 0xBB, 0]);
+    }
+
+    #[test]
+    fn guest_mut_ptr_null_returns_none() {
+        let ptr = GuestMutPtr::<u64>::from_usize(0);
+        assert_eq!(ptr.write_at_offset(0, 42), None);
+        assert_eq!(ptr.mutate_subslice_with(0..1, |_| 0), None);
     }
 }
