@@ -1521,6 +1521,7 @@ dependencies = [
  "litebox_common_linux",
  "litebox_ipc",
  "litebox_micro",
+ "litebox_syscall_rewriter",
 ]
 
 [[package]]
