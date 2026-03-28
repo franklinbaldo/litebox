@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 mod central;
+mod entry;
 mod load_elf;
 mod loader;
 mod shmem;
