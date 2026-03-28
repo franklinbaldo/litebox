@@ -128,7 +128,15 @@ impl ProcessServer {
             }
 
             sq_advance_head(header, entry);
+
+            // Check if the guest process is exiting.
+            if self.task.is_exiting() {
+                eprintln!("litebox_central: guest exiting");
+                break;
+            }
         }
+
+        Ok(())
     }
 
     /// Dispatch a regular syscall from an SQ entry.
