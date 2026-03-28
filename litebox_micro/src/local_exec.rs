@@ -162,6 +162,104 @@ pub unsafe fn execute_locally(
                 unsafe { crate::fork::handle_fork(cq) }
             }
         }
+        nr if nr == libc::SYS_fstat as u32 => unsafe {
+            libc::syscall(libc::SYS_fstat, args[0] as i32, args[1] as usize)
+        },
+        nr if nr == libc::SYS_newfstatat as u32 => unsafe {
+            libc::syscall(
+                libc::SYS_newfstatat,
+                args[0] as i32,
+                args[1] as usize,
+                args[2] as usize,
+                args[3] as i32,
+            )
+        },
+        nr if nr == libc::SYS_set_tid_address as u32 => unsafe {
+            libc::syscall(libc::SYS_set_tid_address, args[0] as usize)
+        },
+        nr if nr == libc::SYS_set_robust_list as u32 => unsafe {
+            libc::syscall(
+                libc::SYS_set_robust_list,
+                args[0] as usize,
+                args[1] as usize,
+            )
+        },
+        nr if nr == libc::SYS_rseq as u32 => unsafe {
+            libc::syscall(
+                libc::SYS_rseq,
+                args[0] as usize,
+                args[1] as u32,
+                args[2] as i32,
+                args[3] as u32,
+            )
+        },
+        nr if nr == libc::SYS_prlimit64 as u32 => unsafe {
+            libc::syscall(
+                libc::SYS_prlimit64,
+                args[0] as i32,
+                args[1] as i32,
+                args[2] as usize,
+                args[3] as usize,
+            )
+        },
+        nr if nr == libc::SYS_getrandom as u32 => unsafe {
+            libc::syscall(
+                libc::SYS_getrandom,
+                args[0] as usize,
+                args[1] as usize,
+                args[2] as u32,
+            )
+        },
+        nr if nr == libc::SYS_rt_sigaction as u32 => unsafe {
+            libc::syscall(
+                libc::SYS_rt_sigaction,
+                args[0] as i32,
+                args[1] as usize,
+                args[2] as usize,
+                args[3] as usize,
+            )
+        },
+        nr if nr == libc::SYS_rt_sigprocmask as u32 => unsafe {
+            libc::syscall(
+                libc::SYS_rt_sigprocmask,
+                args[0] as i32,
+                args[1] as usize,
+                args[2] as usize,
+                args[3] as usize,
+            )
+        },
+        nr if nr == libc::SYS_sched_getaffinity as u32 => unsafe {
+            libc::syscall(
+                libc::SYS_sched_getaffinity,
+                args[0] as i32,
+                args[1] as usize,
+                args[2] as usize,
+            )
+        },
+        nr if nr == libc::SYS_clock_gettime as u32 => unsafe {
+            libc::syscall(libc::SYS_clock_gettime, args[0] as i32, args[1] as usize)
+        },
+        nr if nr == libc::SYS_gettimeofday as u32 => unsafe {
+            libc::syscall(libc::SYS_gettimeofday, args[0] as usize, args[1] as usize)
+        },
+        nr if nr == libc::SYS_pread64 as u32 => unsafe {
+            libc::syscall(
+                libc::SYS_pread64,
+                args[0] as i32,
+                args[1] as usize,
+                args[2] as usize,
+                args[3] as i64,
+            )
+        },
+        nr if nr == libc::SYS_pwrite64 as u32 => unsafe {
+            libc::syscall(
+                libc::SYS_pwrite64,
+                args[0] as i32,
+                args[1] as usize,
+                args[2] as usize,
+                args[3] as i64,
+            )
+        },
         _ => -i64::from(libc::ENOSYS),
     }
 }

@@ -374,6 +374,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
     fn needs_local_exec(nr: u32) -> bool {
         matches!(
             i64::from(nr),
+            // I/O syscalls: dereference guest buffers
             libc::SYS_read
                 | libc::SYS_write
                 | libc::SYS_readv
@@ -388,6 +389,26 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 | libc::SYS_sendto
                 | libc::SYS_recvmsg
                 | libc::SYS_sendmsg
+                // Stat syscalls: write to guest stat buffer
+                | libc::SYS_fstat
+                | libc::SYS_newfstatat
+                // Arch/thread syscalls: must execute in guest context
+                | libc::SYS_arch_prctl
+                | libc::SYS_set_tid_address
+                | libc::SYS_set_robust_list
+                | libc::SYS_rseq
+                // Resource limit: dereference guest rlimit struct
+                | libc::SYS_prlimit64
+                // Random: writes to guest buffer
+                | libc::SYS_getrandom
+                // Signal: dereference guest sigaction/sigset structs
+                | libc::SYS_rt_sigaction
+                | libc::SYS_rt_sigprocmask
+                // Sched: dereference guest cpu_set buffer
+                | libc::SYS_sched_getaffinity
+                // Time: writes to guest timespec/timeval
+                | libc::SYS_clock_gettime
+                | libc::SYS_gettimeofday
         )
     }
 
