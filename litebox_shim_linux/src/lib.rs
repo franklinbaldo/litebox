@@ -341,6 +341,12 @@ impl<FS: ShimFS> LinuxShimTask<FS> {
             Err(e) => i64::from(e.as_neg()),
         }
     }
+
+    /// Returns true if the task's process has started exiting
+    /// (e.g. after exit_group was called).
+    pub fn is_exiting(&self) -> bool {
+        self.task.is_exiting()
+    }
 }
 
 impl<FS: ShimFS> LinuxShim<FS> {
