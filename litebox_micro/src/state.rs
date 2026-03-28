@@ -12,6 +12,8 @@ pub struct MicroState {
     pub ring_fd: i32,
     pub pid: u32,
     pub ppid: u32,
+    /// PID of the central process, used to open child ring fds via `/proc/<pid>/fd/<N>`.
+    pub central_pid: u32,
     pub layout: SharedRingLayout,
 }
 
@@ -24,6 +26,7 @@ static mut MICRO_STATE: MicroState = MicroState {
     ring_fd: -1,
     pid: 0,
     ppid: 0,
+    central_pid: 0,
     layout: SharedRingLayout::new(0),
 };
 
@@ -39,6 +42,7 @@ pub unsafe fn micro_init(
     ring_size: usize,
     pid: u32,
     parent_pid: u32,
+    central_pid: u32,
 ) {
     unsafe {
         MICRO_STATE.ring_base = ring_base;
@@ -46,6 +50,7 @@ pub unsafe fn micro_init(
         MICRO_STATE.ring_fd = ring_fd;
         MICRO_STATE.pid = pid;
         MICRO_STATE.ppid = parent_pid;
+        MICRO_STATE.central_pid = central_pid;
         // Compute the layout from the ring_size. The data_region_size is the
         // remaining space after header + SQ + CQ entries.
         let base_layout = SharedRingLayout::new(0);
@@ -85,6 +90,7 @@ impl MicroState {
             ring_fd: -1,
             pid: 0,
             ppid: 0,
+            central_pid: 0,
             layout: SharedRingLayout::new(0),
         }
     }

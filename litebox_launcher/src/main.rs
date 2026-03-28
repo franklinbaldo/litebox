@@ -18,7 +18,7 @@ fn main() -> anyhow::Result<()> {
     let shmem = shmem::LauncherSharedRegion::new()?;
 
     // 2. Spawn central process (child inherits the shmem fd).
-    let _central = central::CentralProcess::spawn(shmem.fd_raw())?;
+    let central = central::CentralProcess::spawn(shmem.fd_raw())?;
 
     // Give central time to initialize (platform, shim, server loop).
     // TODO: Replace with proper readiness signaling via ring header.
@@ -32,8 +32,9 @@ fn main() -> anyhow::Result<()> {
             shmem.fd_raw(),
             shmem.base_ptr(),
             shmem.layout().total_size,
-            1, // pid — the guest is process 1
-            0, // ppid — no parent
+            1,                              // pid — the guest is process 1
+            0,                              // ppid — no parent
+            central.pid().cast_unsigned(),   // central_pid — for /proc fd passing
         );
     }
 

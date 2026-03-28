@@ -75,6 +75,37 @@ impl SharedRegion {
         Self::from_fd(fd, layout)
     }
 
+    /// Create a new shared memory region for a child process after fork.
+    ///
+    /// The memfd is created **without** `MFD_CLOEXEC` so that the fd remains
+    /// accessible via `/proc/<pid>/fd/<N>` from the micro process.
+    ///
+    /// Returns `(region, raw_fd)` where `raw_fd` is the fd number in this
+    /// process's fd table that micro will use to construct the `/proc` path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `memfd_create`, `ftruncate`, or `mmap` fails.
+    pub fn create_child_ring() -> anyhow::Result<(Self, i32)> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::io::FromRawFd;
+
+        let name = c"litebox-child-ring";
+        // Note: NO MFD_CLOEXEC — fd must be accessible from micro via /proc.
+        let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), 0) };
+        if raw_fd < 0 {
+            return Err(anyhow::anyhow!(
+                "memfd_create failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let layout = SharedRingLayout::default_layout();
+        let region = Self::from_fd(fd, layout)?;
+        let result_fd = region.fd().as_raw_fd();
+        Ok((region, result_fd))
+    }
+
     /// Initialize a shared memory region from an existing file descriptor.
     ///
     /// Sets the fd to the required size, maps it, and zero-initializes the

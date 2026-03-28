@@ -153,7 +153,18 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
         }
 
         let result = unsafe { execute_locally(args.nr as u32, &args.args, &cq) };
-        unsafe { report_local_result(tls, cq.seq, result) };
+
+        // After a fork, the child has remapped to a new ring and already sent
+        // MSG_CHILD_READY.  Sending report_local_result on the child's ring
+        // would confuse central, so skip it.
+        #[allow(clippy::cast_possible_truncation)]
+        let is_fork_child = args.nr as u32 == libc::SYS_clone as u32
+            && args.args[0] & 0x100 == 0 // no CLONE_VM → fork
+            && result == 0; // child returns 0
+        if !is_fork_child {
+            unsafe { report_local_result(tls, cq.seq, result) };
+        }
+
         result
     } else {
         cq.result

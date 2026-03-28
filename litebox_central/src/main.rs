@@ -54,6 +54,9 @@ fn main() -> anyhow::Result<()> {
     ));
     let shim = shim_builder.build::<CentralFs>();
 
+    // Wrap the shim in an Arc so it can be shared with child ProcessServers.
+    let shim = std::sync::Arc::new(shim);
+
     // Create a headless task for syscall dispatch.
     // TODO: receive real TaskParams from the launcher via the ring buffer
     // or command-line arguments.
@@ -65,7 +68,7 @@ fn main() -> anyhow::Result<()> {
         gid: 0,
         egid: 0,
     };
-    let task = shim.create_task(fs, params);
+    let task = shim.create_task(fs.clone(), params);
 
     let args = Args::parse();
 
@@ -78,6 +81,6 @@ fn main() -> anyhow::Result<()> {
         shmem::SharedRegion::new()?
     };
 
-    let server = server::ProcessServer::new(region, task);
+    let server = server::ProcessServer::new(region, task, shim, fs);
     server.run()
 }

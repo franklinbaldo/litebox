@@ -86,7 +86,15 @@ pub unsafe fn execute_locally(syscall_nr: u32, args: &[u64; 6], cq: &CqEntry) ->
         nr if nr == libc::SYS_exit as u32 => unsafe {
             libc::syscall(libc::SYS_exit, args[0] as i32)
         },
-        nr if nr == libc::SYS_clone as u32 => unsafe { crate::thread::handle_clone(args, cq) },
+        nr if nr == libc::SYS_clone as u32 => {
+            let flags = args[0];
+            // CLONE_VM = 0x100: present → thread clone; absent → fork.
+            if flags & 0x100 != 0 {
+                unsafe { crate::thread::handle_clone(args, cq) }
+            } else {
+                unsafe { crate::fork::handle_fork(cq) }
+            }
+        }
         _ => -i64::from(libc::ENOSYS),
     }
 }
