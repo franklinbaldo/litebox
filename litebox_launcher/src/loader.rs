@@ -10,10 +10,7 @@
 
 use litebox_common_linux::loader::{AccessMemory, Fault, MapMemory, Protection, ReadAt};
 
-// Used by loader orchestration in later phases; suppress dead-code warnings
-// until the caller code lands.
-#[allow(dead_code)]
-const PAGE_SIZE: usize = 4096;
+pub(crate) const PAGE_SIZE: usize = 4096;
 
 // ---------------------------------------------------------------------------
 // ReadAt: RealFile
@@ -26,6 +23,11 @@ pub struct RealFile {
 }
 
 impl RealFile {
+    /// Return the underlying file descriptor.
+    pub fn fd(&self) -> i32 {
+        self.fd
+    }
+
     /// Open `path` as read-only with `O_CLOEXEC`.
     ///
     /// # Errors
@@ -107,21 +109,18 @@ impl ReadAt for &RealFile {
 // ---------------------------------------------------------------------------
 
 /// Maps ELF segments into the current process via real `mmap`/`mprotect` calls.
-#[allow(dead_code)]
 pub struct RealMapper {
     fd: i32,
 }
 
 impl RealMapper {
     /// Create a new mapper that will use `fd` for file-backed mappings.
-    #[allow(dead_code)]
     pub fn new(fd: i32) -> Self {
         Self { fd }
     }
 }
 
 /// Convert [`Protection`] flags to the `libc` `PROT_*` bitmask.
-#[allow(dead_code)]
 fn prot_to_libc(prot: Protection) -> i32 {
     prot.flags().bits()
 }
@@ -239,7 +238,6 @@ impl MapMemory for RealMapper {
 // ---------------------------------------------------------------------------
 
 /// Direct in-process memory access (the launcher IS the guest process).
-#[allow(dead_code)]
 pub struct RealMemory;
 
 impl AccessMemory for RealMemory {
