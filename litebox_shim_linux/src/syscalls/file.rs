@@ -167,7 +167,7 @@ impl FsState {
         }
     }
 
-    fn umask(&self) -> Mode {
+    pub(crate) fn umask(&self) -> Mode {
         Mode::from_bits_retain(self.umask.load(Ordering::Relaxed))
     }
 
