@@ -145,6 +145,9 @@ impl ProcessServer {
     /// SQ entry's arguments and routes it through the shim's
     /// [`LinuxShimTask::dispatch_syscall`].
     fn handle_syscall(&self, entry: &SqEntry) -> i64 {
+        // TODO: set_initial_brk in PageManager before serving brk() syscalls.
+        // Currently, the headless task has brk=0 which will panic on brk().
+        // This is OK for nolibc test binaries that don't call brk.
         let mut regs = crate::dispatch::sq_entry_to_ptregs(entry);
         self.task.dispatch_syscall(&mut regs)
     }
