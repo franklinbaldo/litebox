@@ -25,6 +25,10 @@ fn main() -> anyhow::Result<()> {
     let central = central::CentralProcess::spawn(shmem.fd_raw())?;
     eprintln!("litebox_launcher: central spawned (pid={})", central.pid());
 
+    // Give central time to initialize (platform, shim, server loop).
+    // TODO: Replace with proper readiness signaling via ring header.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
     // 3. Initialize micro-LiteBox global state and thread-local storage.
     // SAFETY: Called exactly once, before any guest code runs, while the
     // process is still single-threaded (central was forked, not a thread).
