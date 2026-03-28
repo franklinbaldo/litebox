@@ -152,7 +152,16 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
             }
         }
 
-        let result = unsafe { execute_locally(args.nr as u32, &args.args, &cq) };
+        let micro = unsafe { &*(*tls).micro };
+        let result = unsafe {
+            execute_locally(
+                args.nr as u32,
+                &args.args,
+                &cq,
+                micro.ring_base,
+                &micro.layout,
+            )
+        };
 
         // After a fork, the child has remapped to a new ring and already sent
         // MSG_CHILD_READY.  Sending report_local_result on the child's ring
