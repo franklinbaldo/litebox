@@ -138,6 +138,20 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
     };
 
     if cq.flags & cq_flags::EXEC_LOCAL != 0 {
+        // For SYS_exit: deregister thread before it dies
+        #[allow(clippy::cast_possible_truncation)]
+        if args.nr as u32 == libc::SYS_exit as u32 {
+            let dereg_args = [unsafe { (*tls).thread_slot }, 0, 0, 0, 0, 0];
+            unsafe {
+                submit_and_wait(
+                    tls,
+                    litebox_ipc::messages::MSG_THREAD_DEREGISTER,
+                    &dereg_args,
+                    0,
+                );
+            }
+        }
+
         let result = unsafe { execute_locally(args.nr as u32, &args.args, &cq) };
         unsafe { report_local_result(tls, cq.seq, result) };
         result
