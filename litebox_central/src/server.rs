@@ -24,14 +24,6 @@ use litebox_shim_linux::ShimFS;
 
 use crate::shmem::SharedRegion;
 
-/// Pending fork that has been prepared but the child hasn't connected yet.
-#[allow(dead_code, clippy::struct_field_names)] // child_ prefix is natural here
-struct PendingFork<FS: ShimFS> {
-    child_region: SharedRegion,
-    child_pid: i32,
-    child_task: litebox_shim_linux::LinuxShimTask<FS>,
-}
-
 /// The central server that processes SQ entries and produces CQ completions.
 ///
 /// Manages one primary task (the main thread at slot 0) plus additional
@@ -52,8 +44,6 @@ pub struct ProcessServer<FS: ShimFS> {
     pending_tasks: RefCell<Vec<litebox_shim_linux::LinuxShimTask<FS>>>,
     /// Next available thread slot (starts at 1; slot 0 is the primary task).
     next_thread_slot: Cell<u16>,
-    /// Pending forks awaiting MSG_CHILD_READY from the child.
-    pending_forks: RefCell<Vec<PendingFork<FS>>>,
     /// Next child PID to assign (starts at 2 since the main process is 1).
     next_child_pid: Cell<i32>,
     /// Reference to the shim for creating child tasks.
@@ -77,7 +67,6 @@ impl<FS: ShimFS> ProcessServer<FS> {
             thread_tasks: RefCell::new(HashMap::new()),
             pending_tasks: RefCell::new(Vec::new()),
             next_thread_slot: Cell::new(1),
-            pending_forks: RefCell::new(Vec::new()),
             next_child_pid: Cell::new(2),
             shim,
             fs,
@@ -252,9 +241,46 @@ impl<FS: ShimFS> ProcessServer<FS> {
             return cq;
         }
 
-        // TODO: set_initial_brk in PageManager before serving brk() syscalls.
-        // Currently, the headless task has brk=0 which will panic on brk().
-        // This is OK for nolibc test binaries that don't call brk.
+        // Memory management: dispatch through shim (PageManager state) AND
+        // return EXEC_LOCAL so micro creates the real mapping.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        if Self::is_mm_syscall(nr) {
+            let mut regs = crate::dispatch::sq_entry_to_ptregs(entry);
+            cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+            if cq.result < 0 {
+                // Shim returned an error — pass it through without EXEC_LOCAL.
+                return cq;
+            }
+            cq.flags = cq_flags::EXEC_LOCAL;
+
+            // For file-backed mmap: copy the populated data into the data region.
+            if nr == libc::SYS_mmap as u32 {
+                let flags = entry.args[3] as i32;
+                if flags & libc::MAP_ANONYMOUS == 0 {
+                    // File-backed mmap: shim populated memory at cq.result.
+                    let addr = cq.result as usize;
+                    let len = entry.args[1] as usize;
+                    let data_region = self.region.data_region_mut();
+                    let copy_len = len.min(data_region.len());
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            addr as *const u8,
+                            data_region.as_mut_ptr(),
+                            copy_len,
+                        );
+                    }
+                    cq.flags |= cq_flags::HAS_DATA;
+                    cq.data_offset = 0;
+                    cq.data_len = copy_len as u32;
+                }
+            }
+            return cq;
+        }
+
+        // Syscalls that dereference pathname pointers (openat, access, stat,
+        // etc.) work for paths in ELF-mapped memory (which is also mapped in
+        // central's address space). Guest stack pointers will segfault — a
+        // full solution requires data transfer via the SQ data region.
         let mut regs = crate::dispatch::sq_entry_to_ptregs(entry);
         cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
         cq
@@ -296,12 +322,24 @@ impl<FS: ShimFS> ProcessServer<FS> {
         };
         let child_task = self.shim.create_task(self.fs.clone(), params);
 
-        // 4. Store pending fork (consumed when child server is spawned).
-        self.pending_forks.borrow_mut().push(PendingFork {
-            child_region,
-            child_pid,
-            child_task,
-        });
+        // 4. Spawn the child server immediately.
+        //
+        // The child process will send MSG_CHILD_READY on the *child's* ring
+        // after post-fork initialization.  The child server must already be
+        // running its event loop so it can consume that message (and all
+        // subsequent syscalls from the child).
+        {
+            let shim = self.shim.clone();
+            let fs = self.fs.clone();
+            let child_server = ProcessServer::new(child_region, child_task, shim, fs);
+            child_server.next_child_pid.set(self.next_child_pid.get());
+
+            std::thread::spawn(move || {
+                if let Err(e) = child_server.run() {
+                    eprintln!("litebox_central: child server error: {e}");
+                }
+            });
+        }
 
         // 5. Return info to micro.
         let central_pid = std::process::id();
@@ -353,6 +391,21 @@ impl<FS: ShimFS> ProcessServer<FS> {
         )
     }
 
+    /// Returns `true` for memory management syscalls that need dual-dispatch:
+    /// dispatch through the shim for PageManager tracking, then EXEC_LOCAL
+    /// for micro to create the real mapping.
+    fn is_mm_syscall(nr: u32) -> bool {
+        matches!(
+            i64::from(nr),
+            libc::SYS_mmap
+                | libc::SYS_munmap
+                | libc::SYS_mprotect
+                | libc::SYS_mremap
+                | libc::SYS_madvise
+                | libc::SYS_brk
+        )
+    }
+
     /// Dispatch a control message from an SQ entry.
     ///
     /// Handles thread lifecycle messages (`MSG_THREAD_REGISTER`,
@@ -391,10 +444,9 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 0
             }
             MSG_CHILD_READY => {
-                // A child process has finished post-fork initialization and is
-                // ready to receive syscalls on its new ring.  Spawn a server
-                // thread for it.
-                self.spawn_child_server();
+                // The child process has finished post-fork initialization.
+                // The child server was already spawned in handle_fork(), so
+                // this is just an acknowledgement — no action needed.
                 0
             }
             // MSG_FORK_RESULT is a no-op acknowledgement.
@@ -403,30 +455,5 @@ impl<FS: ShimFS> ProcessServer<FS> {
         };
         cq.result = result;
         cq
-    }
-
-    /// Spawn a new server thread for a pending forked child.
-    ///
-    /// Takes the most recent `PendingFork`, moves it to a new `ProcessServer`,
-    /// and spawns a thread to run the child's server loop.
-    fn spawn_child_server(&self) {
-        let pending = self.pending_forks.borrow_mut().pop();
-        if let Some(fork_info) = pending {
-            let shim = self.shim.clone();
-            let fs = self.fs.clone();
-
-            let child_server =
-                ProcessServer::new(fork_info.child_region, fork_info.child_task, shim, fs);
-            // Inherit the next_child_pid counter so child-of-child PIDs
-            // don't collide.  In a production system this would be a shared
-            // atomic, but for now each server keeps its own counter.
-            child_server.next_child_pid.set(self.next_child_pid.get());
-
-            std::thread::spawn(move || {
-                if let Err(e) = child_server.run() {
-                    eprintln!("litebox_central: child server error: {e}");
-                }
-            });
-        }
     }
 }
