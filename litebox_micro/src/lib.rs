@@ -9,6 +9,7 @@ pub mod fork;
 pub mod handler;
 pub mod local_exec;
 pub mod state;
+pub mod thread;
 pub mod tls;
 pub mod trampoline;
 

@@ -16,7 +16,7 @@ use litebox_ipc::ring::CqEntry;
 /// The caller must ensure `syscall_nr` and `args` describe a valid syscall
 /// that central has authorized for local execution.
 #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-pub unsafe fn execute_locally(syscall_nr: u32, args: &[u64; 6], _cq: &CqEntry) -> i64 {
+pub unsafe fn execute_locally(syscall_nr: u32, args: &[u64; 6], cq: &CqEntry) -> i64 {
     match syscall_nr {
         nr if nr == libc::SYS_mmap as u32 => unsafe {
             libc::syscall(
@@ -86,6 +86,7 @@ pub unsafe fn execute_locally(syscall_nr: u32, args: &[u64; 6], _cq: &CqEntry) -
         nr if nr == libc::SYS_exit as u32 => unsafe {
             libc::syscall(libc::SYS_exit, args[0] as i32)
         },
+        nr if nr == libc::SYS_clone as u32 => unsafe { crate::thread::handle_clone(args, cq) },
         _ => -i64::from(libc::ENOSYS),
     }
 }
