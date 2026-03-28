@@ -90,9 +90,13 @@ extern "C" fn clone_child_entry(arg: *mut libc::c_void) -> libc::c_int {
 
     unsafe {
         core::arch::asm!(
-            "xor eax, eax",    // RAX = 0 (clone returns 0 in child)
             "jmp {ret_addr}",
             ret_addr = in(reg) return_addr,
+            // RAX = 0: clone returns 0 in the child. Using an explicit
+            // register input for RAX (instead of `xor eax, eax` in the asm
+            // template) prevents the compiler from allocating `ret_addr` to
+            // RAX, which would be clobbered by the zeroing.
+            in("rax") 0u64,
             options(noreturn),
         );
     }
