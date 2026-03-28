@@ -1950,6 +1950,7 @@ impl<FS: ShimFS> Task<FS> {
                         syscall_restartable: core::cell::Cell::new(false),
                         in_syscall: core::cell::Cell::new(false),
                         deferred_vfork_park: core::cell::Cell::new(false),
+                        delayed_fork_pending: core::cell::Cell::new(false),
                     },
                 }),
             )
@@ -2475,6 +2476,7 @@ impl<FS: ShimFS> Task<FS> {
                         syscall_restartable: core::cell::Cell::new(false),
                         in_syscall: core::cell::Cell::new(false),
                         deferred_vfork_park: core::cell::Cell::new(false),
+                        delayed_fork_pending: core::cell::Cell::new(false),
                     },
                 }),
             )
