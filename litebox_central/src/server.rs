@@ -160,6 +160,24 @@ impl<FS: ShimFS> ProcessServer<FS> {
             return (result, cq_flags::EXEC_LOCAL);
         }
 
+        // Thread creation: when micro sends clone with CLONE_VM | CLONE_THREAD
+        // we perform the shim bookkeeping (allocate TID, create ThreadState)
+        // and return EXEC_LOCAL so micro executes the real clone(2).
+        #[allow(clippy::cast_possible_truncation)]
+        if nr == libc::SYS_clone as u32 {
+            let flags = entry.args[0];
+            // CLONE_VM = 0x100, CLONE_THREAD = 0x10000
+            if flags & 0x100 != 0 && flags & 0x1_0000 != 0 {
+                match self.task.create_thread_task() {
+                    Ok((child_tid, _child_task)) => {
+                        // TODO: store child_task for per-thread dispatch (Task 3)
+                        return (i64::from(child_tid), cq_flags::EXEC_LOCAL);
+                    }
+                    Err(e) => return (i64::from(e.as_neg()), 0),
+                }
+            }
+        }
+
         if Self::needs_local_exec(nr) {
             return (0, cq_flags::EXEC_LOCAL);
         }

@@ -347,6 +347,44 @@ impl<FS: ShimFS> LinuxShimTask<FS> {
     pub fn is_exiting(&self) -> bool {
         self.task.is_exiting()
     }
+
+    /// Create a new task handle for a child thread.
+    ///
+    /// Performs the same bookkeeping as `do_clone` (allocate TID, create
+    /// `ThreadState`, attach to `Process`) but does **not** spawn a platform
+    /// thread.  Returns `(child_tid, child_task)` on success.
+    pub fn create_thread_task(
+        &self,
+    ) -> Result<(i32, Self), litebox_common_linux::errno::Errno> {
+        let child_tid = self
+            .task
+            .global
+            .next_thread_id
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let thread = self
+            .task
+            .thread
+            .new_thread(child_tid)
+            .ok_or(litebox_common_linux::errno::Errno::EBUSY)?;
+
+        let child_task = LinuxShimTask {
+            task: Task {
+                global: self.task.global.clone(),
+                wait_state: crate::wait::WaitState::new(self.task.global.platform),
+                thread,
+                pid: self.task.pid,
+                ppid: self.task.ppid,
+                tid: child_tid,
+                credentials: self.task.credentials.clone(),
+                comm: self.task.comm.clone(),
+                fs: self.task.fs.clone(),
+                files: self.task.files.clone(),
+                signals: self.task.signals.clone_for_new_task(),
+            },
+        };
+
+        Ok((child_tid, child_task))
+    }
 }
 
 impl<FS: ShimFS> LinuxShim<FS> {
