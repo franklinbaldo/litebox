@@ -83,7 +83,7 @@ impl SharedRegion {
     /// # Errors
     ///
     /// Returns an error if `ftruncate` or `mmap` fails.
-    fn from_fd(fd: OwnedFd, layout: SharedRingLayout) -> anyhow::Result<Self> {
+    pub fn from_fd(fd: OwnedFd, layout: SharedRingLayout) -> anyhow::Result<Self> {
         use std::os::unix::io::AsRawFd;
 
         let total_size = layout.total_size;
