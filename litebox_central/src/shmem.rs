@@ -154,12 +154,11 @@ impl SharedRegion {
             ));
         }
 
-        // SAFETY: `mmap` succeeded, so `ptr` is non-null and points to
-        // `total_size` bytes of mapped memory. We zero-initialize the entire
-        // region to ensure all atomic fields start at zero.
-        unsafe {
-            std::ptr::write_bytes(ptr.cast::<u8>(), 0, total_size);
-        }
+        // Note: No explicit zero-initialization needed. The memfd was just
+        // created (empty) and ftruncated to `total_size`, so the kernel
+        // guarantees that all mapped pages are zero-filled. This avoids
+        // touching every page eagerly, which would cause ~2048 page faults
+        // and has been observed to hang under heavy fork workloads.
 
         let non_null = NonNull::new(ptr.cast::<u8>()).expect("mmap succeeded but returned null");
 

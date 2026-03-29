@@ -58,21 +58,22 @@ impl CentralProcess {
         match pid {
             -1 => anyhow::bail!("fork failed: {}", std::io::Error::last_os_error()),
             0 => {
-                // Child: redirect stdout/stderr to /dev/null so that central
-                // does not hold the parent's pipe handles open (which would
-                // prevent Command::output() from returning in tests).
+                // Child: redirect stdout and stderr to /dev/null so that
+                // central does not hold the parent's pipe handles open (which
+                // would prevent Command::output() from returning in tests)
+                // and does not pollute the guest's stderr.
                 // Skip if shmem_fd is 1 or 2 to avoid clobbering it.
-                if shmem_fd != 1 && shmem_fd != 2 {
-                    let devnull = unsafe {
-                        libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC)
-                    };
-                    if devnull >= 0 {
-                        unsafe {
-                            libc::dup2(devnull, 1);
-                            libc::dup2(devnull, 2);
-                            libc::close(devnull);
-                        }
+                let devnull = unsafe {
+                    libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC)
+                };
+                if devnull >= 0 {
+                    if shmem_fd != 1 {
+                        unsafe { libc::dup2(devnull, 1); }
                     }
+                    if shmem_fd != 2 {
+                        unsafe { libc::dup2(devnull, 2); }
+                    }
+                    unsafe { libc::close(devnull); }
                 }
 
                 // Exec litebox_central with the shmem fd and initial brk as arguments.

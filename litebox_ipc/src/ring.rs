@@ -21,8 +21,11 @@ pub const RING_MASK: usize = 255;
 /// Maximum number of guest threads that can be multiplexed.
 pub const MAX_THREADS: usize = 64;
 
-/// Default size of the shared data region (4 MiB).
-pub const DEFAULT_DATA_REGION_SIZE: usize = 4 * 1024 * 1024;
+/// Default size of the shared data region (8 MiB).
+///
+/// Must be large enough to hold the biggest mmap segment from an ELF
+/// binary plus the trampoline descriptor and code that follow it.
+pub const DEFAULT_DATA_REGION_SIZE: usize = 8 * 1024 * 1024;
 
 /// Flags for submission queue entries.
 pub mod sq_flags {
