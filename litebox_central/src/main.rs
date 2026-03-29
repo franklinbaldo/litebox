@@ -16,12 +16,19 @@ use litebox_ipc::ring::SharedRingLayout;
 use litebox_platform_central::CentralPlatform;
 use litebox_platform_multiplex::Platform;
 
-/// Filesystem type for central: device nodes (/dev/stdin, /dev/stdout, /dev/stderr)
-/// layered on top of an in-memory FS.
+/// Filesystem type for central: in-memory over (devices over tar_ro).
+///
+/// The tar_ro layer provides shared libraries from a rootfs tar.
+/// The devices layer provides /dev/stdin, /dev/stdout, /dev/stderr.
+/// The in-memory layer is the writable top layer.
 type CentralFs = litebox::fs::layered::FileSystem<
     Platform,
-    litebox::fs::devices::FileSystem<Platform>,
     litebox::fs::in_mem::FileSystem<Platform>,
+    litebox::fs::layered::FileSystem<
+        Platform,
+        litebox::fs::devices::FileSystem<Platform>,
+        litebox::fs::tar_ro::FileSystem<Platform>,
+    >,
 >;
 
 #[derive(Parser)]
@@ -34,6 +41,10 @@ struct Args {
     /// Initial program break address from the ELF loader.
     #[arg(long, default_value = "0")]
     initial_brk: usize,
+
+    /// Path to a .tar file containing the root filesystem (shared libraries, etc.).
+    #[arg(long)]
+    rootfs_tar: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -41,19 +52,39 @@ fn main() -> anyhow::Result<()> {
     let platform: &'static Platform = Box::leak(Box::new(CentralPlatform));
     litebox_platform_multiplex::set_platform(platform);
 
-    // Build the LiteBox shim with a layered filesystem (device nodes + in-mem).
-    // The devices layer (upper) provides /dev/stdin, /dev/stdout, /dev/stderr
-    // which are required for stdio initialization during task creation.
-    // Devices must be the UPPER layer so that open() receives the original flags
-    // (the layered FS rewrites lower-layer flags to RDONLY with LowerLayerReadOnly).
+    // Parse CLI args early — we need rootfs_tar for FS construction.
+    let args = Args::parse();
+
+    // Build the LiteBox shim with a 3-layer filesystem:
+    //   in_mem (writable top) over (devices over tar_ro)
+    //
+    // - tar_ro provides shared libraries from the rootfs tar
+    // - devices provides /dev/stdin, /dev/stdout, /dev/stderr
+    // - in_mem is the writable top layer for runtime state
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     let lb = shim_builder.litebox();
+
+    let tar_data: std::borrow::Cow<'static, [u8]> = if let Some(ref tar_path) = args.rootfs_tar {
+        let data = std::fs::read(tar_path)
+            .map_err(|e| anyhow::anyhow!("failed to read rootfs tar {tar_path}: {e}"))?;
+        std::borrow::Cow::Owned(data)
+    } else {
+        std::borrow::Cow::Borrowed(litebox::fs::tar_ro::EMPTY_TAR_FILE)
+    };
+
     let devices = litebox::fs::devices::FileSystem::new(lb);
     let in_mem = litebox::fs::in_mem::FileSystem::new(lb);
-    let fs = std::sync::Arc::new(litebox::fs::layered::FileSystem::new(
+    let tar_ro = litebox::fs::tar_ro::FileSystem::new(lb, tar_data);
+    let inner = litebox::fs::layered::FileSystem::new(
         lb,
         devices,
+        tar_ro,
+        litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
+    );
+    let fs = std::sync::Arc::new(litebox::fs::layered::FileSystem::new(
+        lb,
         in_mem,
+        inner,
         litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
     ));
     let shim = shim_builder.build::<CentralFs>();
@@ -73,8 +104,6 @@ fn main() -> anyhow::Result<()> {
         egid: 0,
     };
     let task = shim.create_task(fs.clone(), params);
-
-    let args = Args::parse();
 
     if args.initial_brk != 0 {
         task.set_initial_brk(args.initial_brk);

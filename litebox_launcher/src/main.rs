@@ -9,22 +9,36 @@ mod shmem;
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        anyhow::bail!("Usage: litebox_launcher <elf-path> [args...]");
+
+    // Extract --rootfs-tar=<path> before processing guest args.
+    let rootfs_tar = args
+        .iter()
+        .find(|a| a.starts_with("--rootfs-tar="))
+        .map(|a| a.strip_prefix("--rootfs-tar=").unwrap().to_string());
+
+    // Filter out launcher-only flags from guest argv.
+    let guest_argv: Vec<&str> = args[1..]
+        .iter()
+        .filter(|a| !a.starts_with("--rootfs-tar="))
+        .map(String::as_str)
+        .collect();
+
+    if guest_argv.is_empty() {
+        anyhow::bail!("Usage: litebox_launcher [--rootfs-tar=<path>] <elf-path> [args...]");
     }
-    let elf_path = &args[1];
+    let elf_path = guest_argv[0];
 
     // 1. Create shared memory region for IPC ring buffer.
     let shmem = shmem::LauncherSharedRegion::new()?;
 
     // 2. Load the guest ELF binary (need brk for central initialization).
     let syscall_entry = litebox_micro::get_syscall_entry_point();
-    let guest_argv: Vec<&str> = args[1..].iter().map(String::as_str).collect();
     let guest_envp: Vec<&str> = Vec::new(); // empty environment for now
     let loaded = load_elf::load_elf(elf_path, &guest_argv, &guest_envp, syscall_entry)?;
 
-    // 3. Spawn central process (child inherits the shmem fd + initial brk).
-    let central = central::CentralProcess::spawn(shmem.fd_raw(), loaded.brk)?;
+    // 3. Spawn central process (child inherits the shmem fd + initial brk + rootfs tar).
+    let central =
+        central::CentralProcess::spawn(shmem.fd_raw(), loaded.brk, rootfs_tar.as_deref())?;
 
     // Give central time to initialize (platform, shim, server loop).
     // TODO: Replace with proper readiness signaling via ring header.

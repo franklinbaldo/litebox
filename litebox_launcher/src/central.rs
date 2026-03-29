@@ -50,7 +50,7 @@ impl CentralProcess {
     /// This function calls `libc::fork()`. The caller must ensure that forking
     /// is safe in the current process state (e.g. no other threads holding
     /// locks that the child would inherit in a locked state).
-    pub fn spawn(shmem_fd: i32, initial_brk: usize) -> anyhow::Result<Self> {
+    pub fn spawn(shmem_fd: i32, initial_brk: usize, rootfs_tar: Option<&str>) -> anyhow::Result<Self> {
         // SAFETY: We call `fork()` which is safe here because the launcher is
         // single-threaded at the point of spawning. The child either execs
         // `litebox_central` or exits on failure.
@@ -81,14 +81,25 @@ impl CentralProcess {
                 let brk_arg = format!("--initial-brk={initial_brk}");
                 let central_path = find_central_binary();
                 let c_path = CString::new(central_path).unwrap();
-                let c_arg0 = CString::new("litebox_central").unwrap();
-                let c_arg1 = CString::new(fd_arg).unwrap();
-                let c_arg2 = CString::new(brk_arg).unwrap();
-                let args = [c_arg0.as_ptr(), c_arg1.as_ptr(), c_arg2.as_ptr(), std::ptr::null()];
-                // SAFETY: `c_path` and `args` are valid C strings / null-
-                // terminated array that remain live for the duration of the
-                // `execvp` call. On success `execvp` never returns.
-                unsafe { libc::execvp(c_path.as_ptr(), args.as_ptr()) };
+                let c_name = CString::new("litebox_central").unwrap();
+                let c_fd = CString::new(fd_arg).unwrap();
+                let c_brk = CString::new(brk_arg).unwrap();
+
+                let mut c_args = vec![c_name, c_fd, c_brk];
+
+                if let Some(tar_path) = rootfs_tar {
+                    c_args.push(CString::new(format!("--rootfs-tar={tar_path}")).unwrap());
+                }
+
+                let mut arg_ptrs: Vec<*const libc::c_char> =
+                    c_args.iter().map(|a| a.as_ptr()).collect();
+                arg_ptrs.push(std::ptr::null());
+
+                // SAFETY: `c_path` and `arg_ptrs` are valid C strings / null-
+                // terminated array. The `c_args` Vec keeps the CStrings alive
+                // for the duration of the `execvp` call. On success `execvp`
+                // never returns.
+                unsafe { libc::execvp(c_path.as_ptr(), arg_ptrs.as_ptr()) };
                 // If exec fails:
                 eprintln!(
                     "litebox_launcher: exec litebox_central failed: {}",
@@ -115,7 +126,7 @@ mod tests {
 
     #[test]
     fn spawn_and_wait() {
-        let proc = CentralProcess::spawn(0, 0).expect("spawn should succeed");
+        let proc = CentralProcess::spawn(0, 0, None).expect("spawn should succeed");
         assert!(proc.pid() > 0);
         let mut status: i32 = 0;
         // SAFETY: `proc.pid()` is a valid child PID returned by `fork()`.
