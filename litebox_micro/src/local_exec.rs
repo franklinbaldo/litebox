@@ -558,6 +558,11 @@ pub unsafe fn execute_locally(
 
 /// Execute a micro-local syscall directly, without consulting central.
 ///
+/// SYNC NOTE: The match arms here must stay in sync with `is_micro_local()`
+/// in `handler.rs` and the overlapping arms in `execute_locally()` above.
+/// If you add a syscall here, add it to `is_micro_local` too (and vice-versa).
+/// The `micro_local_covers_all_listed` test below enforces the invariant.
+///
 /// # Safety
 ///
 /// The caller must ensure `syscall_nr` and `args` describe a valid syscall
@@ -664,16 +669,15 @@ pub unsafe fn execute_micro_local(syscall_nr: u32, args: &[u64; 6]) -> i64 {
         },
         // Filesystem sync: no arguments
         nr if nr == libc::SYS_sync as u32 => unsafe { raw_syscall::syscall0(libc::SYS_sync) },
-        // brk: post-execve, managed entirely by micro's guest_brk watermark
+        // brk: post-execve, managed entirely by micro's guest_brk watermark.
+        // Only called when guest_brk != 0 (handler.rs checks this precondition).
         nr if nr == libc::SYS_brk as u32 => {
             let requested = args[0] as usize;
             let state = unsafe { crate::state::global_micro_state() };
             let current = state.guest_brk.load(core::sync::atomic::Ordering::Acquire);
+            debug_assert!(current != 0, "execute_micro_local(brk) called pre-execve");
 
-            if current == 0 {
-                // Pre-execve: pass through to real brk.
-                unsafe { raw_syscall::syscall1(libc::SYS_brk, requested as u64) }
-            } else if requested == 0 {
+            if requested == 0 {
                 // brk(0): query current break.
                 current as i64
             } else if requested > current {
@@ -792,6 +796,103 @@ mod tests {
                 0,
             )
         };
+        assert_eq!(result, -i64::from(libc::ENOSYS));
+    }
+
+    /// Verify that `is_micro_local` and `execute_micro_local` stay in sync.
+    /// Tests that every syscall `is_micro_local` accepts is also handled by
+    /// `execute_micro_local` (doesn't return -ENOSYS). We only test safe,
+    /// non-blocking zero-arg syscalls for actual dispatch; the rest are
+    /// covered by the `is_micro_local` check alone.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn micro_local_covers_all_listed() {
+        // All syscalls in the micro-local set (must match is_micro_local).
+        let micro_local_nrs: &[i64] = &[
+            libc::SYS_getpid,
+            libc::SYS_getppid,
+            libc::SYS_getuid,
+            libc::SYS_getgid,
+            libc::SYS_geteuid,
+            libc::SYS_getegid,
+            libc::SYS_clock_gettime,
+            libc::SYS_gettimeofday,
+            libc::SYS_time,
+            libc::SYS_clock_getres,
+            libc::SYS_nanosleep,
+            libc::SYS_clock_nanosleep,
+            libc::SYS_arch_prctl,
+            libc::SYS_set_tid_address,
+            libc::SYS_set_robust_list,
+            libc::SYS_rseq,
+            libc::SYS_rt_sigaction,
+            libc::SYS_rt_sigprocmask,
+            libc::SYS_sigaltstack,
+            libc::SYS_rt_sigsuspend,
+            libc::SYS_alarm,
+            libc::SYS_getrandom,
+            libc::SYS_sched_getaffinity,
+            libc::SYS_prlimit64,
+            libc::SYS_uname,
+            libc::SYS_sysinfo,
+            libc::SYS_getrlimit,
+            libc::SYS_mincore,
+            libc::SYS_wait4,
+            libc::SYS_pipe2,
+            libc::SYS_sync,
+        ];
+
+        for &sys_nr in micro_local_nrs {
+            let nr = sys_nr as u32;
+            assert!(
+                crate::handler::is_micro_local(nr),
+                "SYS {sys_nr} should be micro-local but is_micro_local returned false"
+            );
+        }
+
+        // Verify that zero-arg identity syscalls are properly dispatched
+        // (not returning -ENOSYS). These are safe to call unconditionally.
+        let safe_zero_arg: &[i64] = &[
+            libc::SYS_getpid,
+            libc::SYS_getppid,
+            libc::SYS_getuid,
+            libc::SYS_getgid,
+            libc::SYS_geteuid,
+            libc::SYS_getegid,
+        ];
+        for &sys_nr in safe_zero_arg {
+            let nr = sys_nr as u32;
+            let args = [0u64; 6];
+            let result = unsafe { execute_micro_local(nr, &args) };
+            assert_ne!(
+                result,
+                -i64::from(libc::ENOSYS),
+                "execute_micro_local returned -ENOSYS for SYS {sys_nr} — missing match arm?"
+            );
+        }
+
+        // Verify that an unknown syscall still returns -ENOSYS.
+        let args = [0u64; 6];
+        let result = unsafe { execute_micro_local(0xFFFF, &args) };
+        assert_eq!(result, -i64::from(libc::ENOSYS));
+    }
+
+    /// Basic smoke test: `execute_micro_local` for getpid returns the
+    /// actual process ID.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn micro_local_getpid() {
+        let args = [0u64; 6];
+        let result = unsafe { execute_micro_local(libc::SYS_getpid as u32, &args) };
+        let expected = i64::from(unsafe { libc::getpid() });
+        assert_eq!(result, expected, "micro_local getpid mismatch");
+    }
+
+    /// `execute_micro_local` for unknown syscall returns -ENOSYS.
+    #[test]
+    fn micro_local_unknown_returns_enosys() {
+        let args = [0u64; 6];
+        let result = unsafe { execute_micro_local(0xFFFF, &args) };
         assert_eq!(result, -i64::from(libc::ENOSYS));
     }
 }

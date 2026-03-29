@@ -293,8 +293,7 @@ unsafe fn report_local_result(tls: *mut MicroTls, original_seq: u64, result: i64
 /// without consulting central. These are syscalls where central provably
 /// does zero work — it always returns `EXEC_LOCAL` with no shim dispatch,
 /// no state update, and no side effects.
-#[allow(clippy::cast_possible_truncation)]
-fn is_micro_local(nr: u32) -> bool {
+pub(crate) fn is_micro_local(nr: u32) -> bool {
     matches!(
         i64::from(nr),
         // Process/user identity: return kernel constants
@@ -347,21 +346,20 @@ fn is_micro_local(nr: u32) -> bool {
 /// - `args` must point to a valid `SyscallArgs` struct on the stack.
 /// - GS-based TLS must have been initialized for the current thread.
 #[unsafe(no_mangle)]
-#[allow(clippy::cast_possible_truncation)] // nr is a syscall number, always fits in u32
+#[allow(clippy::cast_possible_truncation)] // syscall number constants always fit in u32
 pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
     let args = unsafe { &*args };
     let tls = unsafe { crate::tls::current_tls() };
 
+    let nr = args.nr as u32;
+
     // Execve: special handling — serialize args and manage the exec protocol.
-    #[allow(clippy::cast_possible_truncation)]
-    if args.nr as u32 == libc::SYS_execve as u32 {
+    if nr == libc::SYS_execve as u32 {
         return unsafe { crate::execve::handle_execve(tls, args) };
     }
 
     // Micro-local fast-path: syscalls that central always stamps EXEC_LOCAL
     // with zero work. Execute directly without any ring-buffer round-trip.
-    #[allow(clippy::cast_possible_truncation)]
-    let nr = args.nr as u32;
     if is_micro_local(nr) {
         return unsafe { crate::local_exec::execute_micro_local(nr, &args.args) };
     }
@@ -377,19 +375,12 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
         // Pre-execve: fall through to central round-trip.
     }
 
-    let cq = unsafe {
-        submit_and_wait(
-            tls,
-            args.nr as u32,
-            &args.args,
-            litebox_ipc::ring::sq_flags::NEED_AUTH,
-        )
-    };
+    let cq =
+        unsafe { submit_and_wait(tls, nr, &args.args, litebox_ipc::ring::sq_flags::NEED_AUTH) };
 
     if cq.flags & cq_flags::EXEC_LOCAL != 0 {
         // For SYS_exit: deregister thread before it dies
-        #[allow(clippy::cast_possible_truncation)]
-        if args.nr as u32 == libc::SYS_exit as u32 {
+        if nr == libc::SYS_exit as u32 {
             let dereg_args = [unsafe { (*tls).thread_slot }, 0, 0, 0, 0, 0];
             unsafe {
                 submit_and_wait(
@@ -404,7 +395,7 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
         let micro = unsafe { &*(*tls).micro };
         let result = unsafe {
             execute_locally(
-                args.nr as u32,
+                nr,
                 &args.args,
                 &cq,
                 micro.ring_base,
@@ -416,11 +407,10 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
         // After a fork, the child has remapped to a new ring and already sent
         // MSG_CHILD_READY.  Sending report_local_result on the child's ring
         // would confuse central, so skip it.
-        #[allow(clippy::cast_possible_truncation)]
         let is_fork_child = result == 0
-            && (args.nr as u32 == libc::SYS_fork as u32
-                || args.nr as u32 == libc::SYS_vfork as u32
-                || (args.nr as u32 == libc::SYS_clone as u32 && args.args[0] & 0x100 == 0)); // no CLONE_VM → fork
+            && (nr == libc::SYS_fork as u32
+                || nr == libc::SYS_vfork as u32
+                || (nr == libc::SYS_clone as u32 && args.args[0] & 0x100 == 0)); // no CLONE_VM → fork
         if !is_fork_child {
             unsafe { report_local_result(tls, cq.seq, result) };
         }

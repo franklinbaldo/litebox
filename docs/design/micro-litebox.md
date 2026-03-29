@@ -361,6 +361,77 @@ after central authorizes the syscall, micro executes it locally and then
 sends a `MSG_LOCAL_RESULT` back to central — adding a third round-trip
 for state synchronization.
 
+### Micro-Local Fast-Path Optimization
+
+The overhead breakdown above reveals that for many `EXEC_LOCAL` syscalls,
+central does **zero work**: it receives the request, immediately returns
+`EXEC_LOCAL` with no shim dispatch, no state update, and no side effects.
+The guest then executes the syscall, reports back via `MSG_LOCAL_RESULT`,
+and central discards the result. The entire central round-trip is wasted.
+
+The **micro-local fast-path** eliminates this overhead for ~30 stateless
+syscalls. When micro recognizes a syscall in the micro-local set (via a
+compile-time `matches!` check), it executes the syscall directly without
+any ring-buffer communication. Central is never consulted.
+
+**Micro-local syscall categories:**
+
+- **Process/user identity** (getpid, getppid, getuid, getgid, geteuid,
+  getegid): Simple kernel queries, return constants.
+- **Time** (clock_gettime, gettimeofday, time, clock_getres): Read-only
+  kernel state, write to guest buffer.
+- **Sleep** (nanosleep, clock_nanosleep): Blocking, no shared state.
+- **Thread setup** (arch_prctl, set_tid_address, set_robust_list, rseq):
+  Thread-local operations only.
+- **Signals** (rt_sigaction, rt_sigprocmask, sigaltstack, rt_sigsuspend,
+  alarm): Process-local signal state.
+- **Random/info** (getrandom, sched_getaffinity, prlimit64, uname,
+  sysinfo, getrlimit, mincore): Write to guest buffer, no shared state.
+- **Process wait** (wait4): Must run in micro's PID namespace.
+- **Pipe creation** (pipe2): Real OS pipes, no shim state involvement.
+- **Filesystem sync** (sync): No arguments, globally visible operation.
+- **brk** (post-execve only): Managed by micro's `guest_brk` watermark
+  via mmap/munmap.
+
+**Design principles:**
+- **Stateless only**: Every micro-local syscall was verified against
+  central's `handle_syscall` — central does zero shim dispatch, zero
+  state updates, and the `MSG_LOCAL_RESULT` handler is a no-op.
+- **No fd-aware syscalls**: Syscalls that interact with file descriptors
+  (other than pipe2) are excluded to preserve the virtual fd abstraction.
+- **No mm syscalls**: mmap, munmap, mprotect, madvise remain centrally
+  managed via the PageManager.
+
+#### Post-Fast-Path Results
+
+| Benchmark | Unit | Native | Micro (before) | Micro (after) | Improvement |
+|---|---|---:|---:|---:|---|
+| dhry2reg | lps | 348,543,199 | 338,742,160 | 344,684,715 | ~same |
+| whetstone-double | MWIPS | 7,364 | 7,142 | 7,414 | ~same |
+| pipe | lps | 5,453,790 | 290,827 | 321,205 | 1.1x |
+| syscall | lps | 3,357,451 | 190,423 | 900,513 | **4.7x** |
+| spawn | lps | 10,191 | 3,336 | 3,427 | ~same |
+| execl | lps | 13,574 | 1,171 | 1,252 | ~same |
+| context1 | lps | 935,063 | 47,516 | 64,211 | 1.4x |
+| fstime | KBps | 634,676 | 92,530 | 132,581 | 1.4x |
+| shell1 | lpm | 558 | 65 | 69 | ~same |
+| shell8 | lpm | 302 | 29 | 30 | ~same |
+
+The `syscall` benchmark (a tight `getpid()` loop) improved **4.7x**
+because getpid is now micro-local — zero ring-buffer round-trips. The
+remaining gap to native (0.27x) is the cost of the binary rewriting
+trampoline (JMP to stub + register save/restore + match check + JMP back)
+versus a bare `syscall` instruction.
+
+`context1` and `fstime` improved ~1.4x because their inner loops include
+micro-local syscalls (pipe read/write still goes through central, but
+clock_gettime and close are fast-pathed or were already local).
+
+The other benchmarks show negligible change because their bottleneck is
+not in micro-local syscalls — `pipe` is dominated by read/write
+round-trips, `spawn`/`execl` by fork/exec overhead, and `shell1`/`shell8`
+by the combination of all costs.
+
 ### Functional Coverage
 
 Micro-LiteBox runs all 10 UnixBench benchmarks without modifying the
@@ -444,9 +515,10 @@ returns an `EXEC_LOCAL` flag in the CQ entry. Micro then performs the real
 syscall in the guest's address space and reports the result back to central
 via `MSG_LOCAL_RESULT`. The overhead is a shared-memory round-trip
 (~microseconds, dominated by two futex wake/sleep pairs), but the actual
-syscall executes without any ptrace interposition. For high-frequency local
-syscalls like `clock_gettime` or `getpid`, this avoids the ptrace tax
-entirely.
+syscall executes without any ptrace interposition. Additionally, the
+**micro-local fast-path** allows ~30 stateless syscalls to execute without
+any central round-trip at all — the trampoline recognizes them and issues
+the raw syscall directly.
 
 ### IPC Performance Model
 
