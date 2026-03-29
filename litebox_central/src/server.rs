@@ -193,6 +193,12 @@ impl<FS: ShimFS> ProcessServer<FS> {
         let nr = entry.syscall_nr;
         let mut cq = Self::base_cq(entry);
 
+        // Execve: custom handler that parses ELF and sends segment data to micro.
+        #[allow(clippy::cast_possible_truncation)]
+        if nr == libc::SYS_execve as u32 {
+            return self.handle_execve(entry);
+        }
+
         // Exit syscalls: dispatch through the shim (to set the exiting flag)
         // AND tell micro to execute locally (to actually terminate the guest).
         #[allow(clippy::cast_possible_truncation)]
@@ -236,13 +242,21 @@ impl<FS: ShimFS> ProcessServer<FS> {
             return self.handle_fork(entry);
         }
 
-        // Close: dual-dispatch. Try shim first for fd table cleanup, then
-        // always EXEC_LOCAL so micro closes the real fd.
+        // Close: dual-dispatch. Try shim first for fd table cleanup.
+        // If shim recognized the fd (returned success), the fd is virtual
+        // (tar_ro filesystem) — return 0 directly without local exec.
+        // If shim returned EBADF, the fd is a real OS fd (pipe, etc.) —
+        // tell micro to close it locally.
         #[allow(clippy::cast_possible_truncation)]
         if nr == libc::SYS_close as u32 {
             let mut regs = crate::dispatch::sq_entry_to_ptregs(entry);
-            let _shim_result = self.dispatch_to_task(entry.thread_slot, &mut regs);
-            // Ignore EBADF from shim (fd may be a real OS fd not in shim's table).
+            let shim_result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+            if shim_result >= 0 {
+                // Shim recognized and closed the fd — return success directly.
+                cq.result = 0;
+                return cq;
+            }
+            // EBADF from shim: fd is a real OS fd, let micro close it.
             cq.flags = cq_flags::EXEC_LOCAL;
             return cq;
         }
@@ -348,7 +362,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     libc::SYS_openat
                     | libc::SYS_newfstatat
                     | libc::SYS_faccessat
-                    | libc::SYS_faccessat2 => {
+                    | libc::SYS_faccessat2
+                    | libc::SYS_readlinkat => {
                         regs.rsi = buf_ptr; // arg1
                     }
                     libc::SYS_access
@@ -609,6 +624,14 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 // alarm sets a process timer.
                 | libc::SYS_pipe2
                 | libc::SYS_alarm
+                // Syscalls that write results to guest memory pointers.
+                // Must execute locally because central cannot dereference
+                // addresses in the guest's (launcher's) address space.
+                | libc::SYS_time
+                | libc::SYS_uname
+                | libc::SYS_sysinfo
+                | libc::SYS_getrlimit
+                | libc::SYS_clock_getres
         )
     }
 
@@ -643,6 +666,12 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 | libc::SYS_preadv2
                 | libc::SYS_fstat
                 | libc::SYS_newfstatat
+                | libc::SYS_stat
+                | libc::SYS_lstat
+                | libc::SYS_readlink
+                | libc::SYS_readlinkat
+                | libc::SYS_getdents64
+                | libc::SYS_getcwd
         )
     }
 
@@ -739,6 +768,97 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     cq.data_len = 144; // struct stat
                 }
             }
+            libc::SYS_stat => {
+                // stat(pathname, statbuf) — rewrite pathname (rdi) if we have
+                // it, statbuf (rsi) to data region.
+                if !pathname_buf.is_empty() {
+                    regs.rdi = pathname_buf.as_ptr() as usize;
+                }
+                regs.rsi = data_ptr;
+                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                if cq.result >= 0 {
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.data_offset = 0;
+                    cq.data_len = 144; // struct stat
+                }
+            }
+            libc::SYS_lstat => {
+                // lstat(pathname, statbuf) — same layout as stat.
+                if !pathname_buf.is_empty() {
+                    regs.rdi = pathname_buf.as_ptr() as usize;
+                }
+                regs.rsi = data_ptr;
+                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                if cq.result >= 0 {
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.data_offset = 0;
+                    cq.data_len = 144; // struct stat
+                }
+            }
+            libc::SYS_readlink => {
+                // readlink(pathname, buf, bufsiz) — rewrite pathname (rdi) if
+                // we have it, buf (rsi) to data region.
+                if !pathname_buf.is_empty() {
+                    regs.rdi = pathname_buf.as_ptr() as usize;
+                }
+                let bufsiz = entry.args[2] as usize;
+                let capped = bufsiz.min(data_region.len());
+                regs.rsi = data_ptr;
+                regs.rdx = capped;
+                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                if cq.result > 0 {
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.data_offset = 0;
+                    cq.data_len = cq.result as u32;
+                }
+            }
+            libc::SYS_readlinkat => {
+                // readlinkat(dirfd, pathname, buf, bufsiz) — rewrite pathname
+                // (rsi) if we have it, buf (rdx) to data region.
+                if !pathname_buf.is_empty() {
+                    regs.rsi = pathname_buf.as_ptr() as usize;
+                }
+                let bufsiz = entry.args[3] as usize;
+                let capped = bufsiz.min(data_region.len());
+                regs.rdx = data_ptr;
+                regs.r10 = capped;
+                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                if cq.result > 0 {
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.data_offset = 0;
+                    cq.data_len = cq.result as u32;
+                }
+            }
+            libc::SYS_getdents64 => {
+                // getdents64(fd, dirp, count) — rewrite dirp (rsi) to data
+                // region.
+                let count = entry.args[2] as usize;
+                let capped = count.min(data_region.len());
+                regs.rsi = data_ptr;
+                regs.rdx = capped;
+                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                if cq.result > 0 {
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.data_offset = 0;
+                    cq.data_len = cq.result as u32;
+                } else if cq.result == 0 {
+                    // End of directory.
+                    cq.flags = cq_flags::EXEC_LOCAL;
+                }
+            }
+            libc::SYS_getcwd => {
+                // getcwd(buf, size) — rewrite buf (rdi) to data region.
+                let size = entry.args[1] as usize;
+                let capped = size.min(data_region.len());
+                regs.rdi = data_ptr;
+                regs.rsi = capped;
+                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                if cq.result > 0 {
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.data_offset = 0;
+                    cq.data_len = cq.result as u32;
+                }
+            }
             _ => {
                 // For readv/preadv/preadv2 — not yet implemented, fall back
                 // to EXEC_LOCAL (micro will attempt local execution).
@@ -747,6 +867,545 @@ impl<FS: ShimFS> ProcessServer<FS> {
         }
 
         cq
+    }
+
+    /// Handle an execve syscall by parsing the ELF and preparing segment data
+    /// for micro to map and jump to.
+    ///
+    /// The data region from micro contains serialized path/argv/envp.
+    /// Central reads the ELF file, parses it, and packs all segment data into
+    /// the data region for micro to consume.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::too_many_lines,
+        clippy::field_reassign_with_default
+    )]
+    fn handle_execve(&self, entry: &SqEntry) -> CqEntry {
+        let mut cq = Self::base_cq(entry);
+        let thread_slot = entry.thread_slot;
+
+        // Read serialized path/argv/envp from the data region.
+        let data = self.region.data_region();
+        let data_len = entry.data_len as usize;
+        if data_len == 0 || data_len > data.len() {
+            cq.result = -i64::from(libc::EFAULT);
+            return cq;
+        }
+        let serialized = &data[..data_len];
+
+        let Some((path_bytes, after_path)) = deserialize_execve_path(serialized) else {
+            cq.result = -i64::from(libc::EINVAL);
+            return cq;
+        };
+
+        let Some((argv_strs, after_argv)) = deserialize_string_vector(serialized, after_path)
+        else {
+            cq.result = -i64::from(libc::EINVAL);
+            return cq;
+        };
+
+        let Some((envp_strs, _after_envp)) = deserialize_string_vector(serialized, after_argv)
+        else {
+            cq.result = -i64::from(libc::EINVAL);
+            return cq;
+        };
+
+        // Open the file via shim dispatch (SYS_openat with AT_FDCWD).
+        // Build a null-terminated path in a local buffer.
+        let mut path_cstr = vec![0u8; path_bytes.len() + 1];
+        path_cstr[..path_bytes.len()].copy_from_slice(path_bytes);
+        // Ensure null terminated — path_bytes may already include NUL.
+        if path_bytes.last() == Some(&0) {
+            path_cstr.truncate(path_bytes.len());
+        } else {
+            path_cstr[path_bytes.len()] = 0;
+        }
+
+        let fd = {
+            let mut regs = litebox_common_linux::PtRegs::default();
+            regs.orig_rax = libc::SYS_openat as usize;
+            regs.rdi = libc::AT_FDCWD as usize;
+            regs.rsi = path_cstr.as_ptr() as usize;
+            regs.rdx = libc::O_RDONLY as usize;
+            self.dispatch_to_task(thread_slot, &mut regs)
+        };
+        if fd < 0 {
+            cq.result = fd;
+            return cq;
+        }
+        let fd = fd as i32;
+
+        // Get file size via fstat.
+        let file_size = {
+            let mut stat_buf = [0u8; 144];
+            let mut regs = litebox_common_linux::PtRegs::default();
+            regs.orig_rax = libc::SYS_fstat as usize;
+            regs.rdi = fd as usize;
+            regs.rsi = stat_buf.as_mut_ptr() as usize;
+            let result = self.dispatch_to_task(thread_slot, &mut regs);
+            if result < 0 {
+                self.close_fd(thread_slot, fd);
+                cq.result = result;
+                return cq;
+            }
+            i64::from_le_bytes(stat_buf[48..56].try_into().unwrap()) as usize
+        };
+
+        // Read the entire file.
+        let mut file_data = vec![0u8; file_size];
+        {
+            let mut offset = 0usize;
+            while offset < file_size {
+                let chunk = (file_size - offset).min(1024 * 1024); // 1 MiB chunks
+                let mut regs = litebox_common_linux::PtRegs::default();
+                regs.orig_rax = libc::SYS_pread64 as usize;
+                regs.rdi = fd as usize;
+                regs.rsi = file_data[offset..].as_mut_ptr() as usize;
+                regs.rdx = chunk;
+                regs.r10 = offset;
+                let result = self.dispatch_to_task(thread_slot, &mut regs);
+                if result <= 0 {
+                    self.close_fd(thread_slot, fd);
+                    cq.result = if result == 0 {
+                        -i64::from(libc::EIO)
+                    } else {
+                        result
+                    };
+                    return cq;
+                }
+                offset += result as usize;
+            }
+        }
+        self.close_fd(thread_slot, fd);
+
+        // Parse the ELF.
+        let mut reader = MemReader(&file_data);
+        let Ok(mut parsed) = litebox_common_linux::loader::ElfParsedFile::parse(&mut reader) else {
+            cq.result = -i64::from(libc::ENOEXEC);
+            return cq;
+        };
+
+        // Get the syscall entry point (central returns 0, but micro needs
+        // the real value — we'll get it from the existing trampoline handling).
+        // For central, the platform returns 0 for syscall_entry_point. But
+        // micro needs the real entry point. We'll use the same value that the
+        // launcher would use — this is set by micro's trampoline assembly.
+        // Since we don't have it here, we pass a non-zero sentinel (1) to
+        // enable trampoline parsing. Micro will patch the actual value.
+        let syscall_entry_point = 1usize; // sentinel — micro patches the real value
+
+        // Parse trampoline for the main binary.
+        let _ = parsed.parse_trampoline(&mut reader, syscall_entry_point);
+
+        // Check for interpreter.
+        let interp_name = parsed.interp(&mut reader).ok().flatten();
+        let interp_data: Option<(Vec<u8>, litebox_common_linux::loader::ElfParsedFile)> =
+            if let Some(ref name) = interp_name {
+                let interp_path_bytes = name.to_bytes_with_nul();
+                let mut interp_cstr = vec![0u8; interp_path_bytes.len()];
+                interp_cstr.copy_from_slice(interp_path_bytes);
+
+                let interp_fd = {
+                    let mut regs = litebox_common_linux::PtRegs::default();
+                    regs.orig_rax = libc::SYS_openat as usize;
+                    regs.rdi = libc::AT_FDCWD as usize;
+                    regs.rsi = interp_cstr.as_ptr() as usize;
+                    regs.rdx = libc::O_RDONLY as usize;
+                    self.dispatch_to_task(thread_slot, &mut regs)
+                };
+                if interp_fd < 0 {
+                    cq.result = interp_fd;
+                    return cq;
+                }
+                let interp_fd = interp_fd as i32;
+
+                let interp_size = {
+                    let mut stat_buf = [0u8; 144];
+                    let mut regs = litebox_common_linux::PtRegs::default();
+                    regs.orig_rax = libc::SYS_fstat as usize;
+                    regs.rdi = interp_fd as usize;
+                    regs.rsi = stat_buf.as_mut_ptr() as usize;
+                    let result = self.dispatch_to_task(thread_slot, &mut regs);
+                    if result < 0 {
+                        self.close_fd(thread_slot, interp_fd);
+                        cq.result = result;
+                        return cq;
+                    }
+                    i64::from_le_bytes(stat_buf[48..56].try_into().unwrap()) as usize
+                };
+
+                let mut interp_file_data = vec![0u8; interp_size];
+                {
+                    let mut offset = 0usize;
+                    while offset < interp_size {
+                        let chunk = (interp_size - offset).min(1024 * 1024);
+                        let mut regs = litebox_common_linux::PtRegs::default();
+                        regs.orig_rax = libc::SYS_pread64 as usize;
+                        regs.rdi = interp_fd as usize;
+                        regs.rsi = interp_file_data[offset..].as_mut_ptr() as usize;
+                        regs.rdx = chunk;
+                        regs.r10 = offset;
+                        let result = self.dispatch_to_task(thread_slot, &mut regs);
+                        if result <= 0 {
+                            self.close_fd(thread_slot, interp_fd);
+                            cq.result = if result == 0 {
+                                -i64::from(libc::EIO)
+                            } else {
+                                result
+                            };
+                            return cq;
+                        }
+                        offset += result as usize;
+                    }
+                }
+                self.close_fd(thread_slot, interp_fd);
+
+                let mut ireader = MemReader(&interp_file_data);
+                let Ok(mut iparsed) =
+                    litebox_common_linux::loader::ElfParsedFile::parse(&mut ireader)
+                else {
+                    cq.result = -i64::from(libc::ENOEXEC);
+                    return cq;
+                };
+                let _ = iparsed.parse_trampoline(&mut ireader, syscall_entry_point);
+                Some((interp_file_data, iparsed))
+            } else {
+                None
+            };
+
+        // Build segment list by simulating the load.
+        // We use SimpleMapper to capture the segments without actually mapping.
+        let mut main_mapper = SimpleMapper::new();
+        let mut main_mem = SimpleMem::new();
+        let Ok(main_info) = parsed.load(&mut main_mapper, &mut main_mem) else {
+            cq.result = -i64::from(libc::ENOEXEC);
+            return cq;
+        };
+
+        let interp_info = if let Some((ref _idata, ref iparsed)) = interp_data {
+            // Start the interpreter after the main binary's segments so they
+            // don't overlap.  Align up to page boundary.
+            let interp_start = (main_mapper.next_addr + 0xFFF) & !0xFFF;
+            let mut imapper = SimpleMapper::new_at(interp_start);
+            let mut imem = SimpleMem::new();
+            if let Ok(info) = iparsed.load(&mut imapper, &mut imem) {
+                Some((info, imapper, imem))
+            } else {
+                cq.result = -i64::from(libc::ENOEXEC);
+                return cq;
+            }
+        } else {
+            None
+        };
+
+        // Now pack everything into the data region for micro.
+        let data_region = self.region.data_region_mut();
+        let data_region_size = data_region.len();
+
+        // Collect segments from main + interp.
+        let mut segments: Vec<SegmentInfo> = Vec::new();
+
+        // Main ELF segments.
+        for seg in &main_mapper.segments {
+            segments.push(SegmentInfo {
+                vaddr: seg.address as u64,
+                map_len: seg.len as u64,
+                data_len: seg.file_len as u64,
+                prot: seg.prot_flags() as u32,
+                file_data_offset: seg.file_offset,
+                file_data_source: FileSource::Main,
+                has_trampoline: seg.is_trampoline,
+                trampoline_base: if seg.is_trampoline {
+                    main_mapper.base_addr
+                } else {
+                    0
+                },
+            });
+        }
+
+        // Interp segments.
+        if let Some((ref _iinfo, ref imapper, _)) = interp_info {
+            for seg in &imapper.segments {
+                segments.push(SegmentInfo {
+                    vaddr: seg.address as u64,
+                    map_len: seg.len as u64,
+                    data_len: seg.file_len as u64,
+                    prot: seg.prot_flags() as u32,
+                    file_data_offset: seg.file_offset,
+                    file_data_source: FileSource::Interp,
+                    has_trampoline: seg.is_trampoline,
+                    trampoline_base: if seg.is_trampoline {
+                        imapper.base_addr
+                    } else {
+                        0
+                    },
+                });
+            }
+        }
+
+        let num_segments = segments.len();
+
+        // Compute layout.
+        let header_size = size_of::<ExecveHeaderCentral>();
+        let segments_size = num_segments * size_of::<ExecveSegmentCentral>();
+        let after_segments = header_size + segments_size;
+
+        // Serialize argv strings (NUL-separated).
+        let mut argv_bytes: Vec<u8> = Vec::new();
+        for s in &argv_strs {
+            argv_bytes.extend_from_slice(s);
+            // Ensure NUL termination.
+            if s.last() != Some(&0) {
+                argv_bytes.push(0);
+            }
+        }
+
+        // Serialize envp strings (NUL-separated).
+        let mut envp_bytes: Vec<u8> = Vec::new();
+        for s in &envp_strs {
+            envp_bytes.extend_from_slice(s);
+            if s.last() != Some(&0) {
+                envp_bytes.push(0);
+            }
+        }
+
+        let argv_offset = after_segments;
+        let envp_offset = argv_offset + argv_bytes.len();
+        let mut data_cursor = envp_offset + envp_bytes.len();
+
+        // Compute data offsets for each segment's file data and trampoline data.
+        let mut seg_layouts: Vec<SegLayout> = Vec::with_capacity(num_segments);
+
+        for seg in &segments {
+            let seg_data_offset = data_cursor;
+            data_cursor += seg.data_len as usize;
+
+            let tramp_desc_len = if seg.has_trampoline {
+                // We need to compute the trampoline descriptor size.
+                // The trampoline data is embedded in the file data of the source ELF.
+                // Actually, we use the parse_trampoline info from the parsed ELF.
+                // For simplicity in this first implementation, compute from file data.
+                let source_data = match seg.file_data_source {
+                    FileSource::Main => &file_data,
+                    FileSource::Interp => {
+                        if let Some((ref idata, _)) = interp_data {
+                            idata.as_slice()
+                        } else {
+                            &[]
+                        }
+                    }
+                };
+                // Read trampoline header from end of file.
+                let tramp_info = read_trampoline_header(source_data);
+                if let Some((_, tramp_size)) = tramp_info {
+                    8 + tramp_size // descriptor (8 bytes) + code
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            data_cursor += tramp_desc_len;
+            seg_layouts.push(SegLayout {
+                data_offset: seg_data_offset,
+                tramp_desc_len,
+            });
+        }
+
+        let total_data_len = data_cursor;
+
+        if total_data_len > data_region_size {
+            cq.result = -i64::from(libc::E2BIG);
+            return cq;
+        }
+
+        // Determine entry points.
+        let main_entry = main_info.entry_point as u64;
+        let jump_entry = interp_info
+            .as_ref()
+            .map_or(main_entry, |(iinfo, _, _)| iinfo.entry_point as u64);
+
+        let interp_base = interp_info
+            .as_ref()
+            .map_or(0u64, |(iinfo, _, _)| iinfo.base_addr as u64);
+
+        // The brk must be past ALL mapped segments (main binary + interpreter).
+        // Using only main_info.brk would place it inside the interpreter's
+        // address range since the interpreter is loaded right after the main
+        // binary.  When the new ld-linux calls brk(0), the kernel returns the
+        // current brk — if it falls inside the interpreter, the allocator
+        // corrupts interpreter data and crashes.
+        let brk = interp_info
+            .as_ref()
+            .map_or(main_info.brk, |(iinfo, _, _)| main_info.brk.max(iinfo.brk));
+
+        // Write ExecveHeader.
+        let hdr = ExecveHeaderCentral {
+            num_segments: num_segments as u32,
+            _pad0: 0,
+            entry_point: jump_entry,
+            at_entry: main_entry,
+            brk: brk as u64,
+            phdr_addr: main_info.phdrs_addr as u64,
+            phnum: main_info.num_phdrs as u32,
+            phent: main_info.phent_size() as u32,
+            interp_base,
+            argc: argv_strs.len() as u32,
+            envc: envp_strs.len() as u32,
+            argv_offset: argv_offset as u32,
+            argv_len: argv_bytes.len() as u32,
+            envp_offset: envp_offset as u32,
+            envp_len: envp_bytes.len() as u32,
+            syscall_entry_point: 0, // micro will patch this from its own trampoline
+        };
+
+        // Copy header bytes.
+        let hdr_bytes: &[u8] = unsafe {
+            core::slice::from_raw_parts(
+                (&raw const hdr).cast::<u8>(),
+                size_of::<ExecveHeaderCentral>(),
+            )
+        };
+        data_region[..header_size].copy_from_slice(hdr_bytes);
+
+        // Write ExecveSegment entries.
+        for (i, seg) in segments.iter().enumerate() {
+            let layout = &seg_layouts[i];
+            let seg_entry = ExecveSegmentCentral {
+                vaddr: seg.vaddr,
+                map_len: seg.map_len,
+                data_len: seg.data_len,
+                prot: seg.prot,
+                has_trampoline: u32::from(seg.has_trampoline && layout.tramp_desc_len > 0),
+                data_offset: layout.data_offset as u64,
+            };
+            let seg_bytes: &[u8] = unsafe {
+                core::slice::from_raw_parts(
+                    (&raw const seg_entry).cast::<u8>(),
+                    size_of::<ExecveSegmentCentral>(),
+                )
+            };
+            let offset = header_size + i * size_of::<ExecveSegmentCentral>();
+            data_region[offset..offset + size_of::<ExecveSegmentCentral>()]
+                .copy_from_slice(seg_bytes);
+        }
+
+        // Write argv strings.
+        data_region[argv_offset..argv_offset + argv_bytes.len()].copy_from_slice(&argv_bytes);
+
+        // Write envp strings.
+        data_region[envp_offset..envp_offset + envp_bytes.len()].copy_from_slice(&envp_bytes);
+
+        // Write segment file data + trampoline data.
+        for (i, seg) in segments.iter().enumerate() {
+            let layout = &seg_layouts[i];
+            let source_data = match seg.file_data_source {
+                FileSource::Main => &file_data,
+                FileSource::Interp => {
+                    if let Some((ref idata, _)) = interp_data {
+                        idata.as_slice()
+                    } else {
+                        &[]
+                    }
+                }
+            };
+
+            // Copy file-backed data for this segment.
+            let file_offset = seg.file_data_offset as usize;
+            let copy_len = seg.data_len as usize;
+            if copy_len > 0 && file_offset + copy_len <= source_data.len() {
+                data_region[layout.data_offset..layout.data_offset + copy_len]
+                    .copy_from_slice(&source_data[file_offset..file_offset + copy_len]);
+            } else if copy_len > 0 {
+                // File data shorter than expected — zero-fill.
+                let available = source_data.len().saturating_sub(file_offset);
+                if available > 0 {
+                    data_region[layout.data_offset..layout.data_offset + available]
+                        .copy_from_slice(&source_data[file_offset..file_offset + available]);
+                }
+                // Rest is already zeroed (or will be by mmap on micro side).
+            }
+
+            // Copy trampoline data if present.
+            if seg.has_trampoline && layout.tramp_desc_len > 0 {
+                let tramp_info = read_trampoline_header(source_data);
+                if let Some((tramp_file_offset, tramp_size)) = tramp_info {
+                    let desc_start = layout.data_offset + copy_len;
+                    // Read vaddr from trampoline header.
+                    let tramp_hdr_offset = source_data.len() - 32;
+                    let tramp_vaddr = u64::from_le_bytes(
+                        source_data[tramp_hdr_offset + 16..tramp_hdr_offset + 24]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    // Write descriptor: [u32 LE: absolute trampoline address] [u32 LE: size]
+                    let tramp_absolute = seg.trampoline_base as u64 + tramp_vaddr;
+                    data_region[desc_start..desc_start + 4]
+                        .copy_from_slice(&(tramp_absolute as u32).to_le_bytes());
+                    data_region[desc_start + 4..desc_start + 8]
+                        .copy_from_slice(&(tramp_size as u32).to_le_bytes());
+
+                    // Copy trampoline code from the file.
+                    let tramp_src_start = tramp_file_offset as usize;
+                    if tramp_src_start + tramp_size <= source_data.len() {
+                        data_region[desc_start + 8..desc_start + 8 + tramp_size].copy_from_slice(
+                            &source_data[tramp_src_start..tramp_src_start + tramp_size],
+                        );
+                    }
+                }
+            }
+        }
+
+        // Zero BSS regions in the packed data.
+        //
+        // The ELF loader records BSS (zero-fill) ranges via SimpleMem::zero().
+        // These correspond to the gap between p_filesz and p_memsz within
+        // file-backed pages. Without zeroing, those bytes contain whatever
+        // happens to follow in the ELF file (section headers, string tables,
+        // trampoline data), which corrupts BSS variables like ld-linux's
+        // internal allocator state.
+        let all_bss: Vec<(usize, usize)> = {
+            let mut ranges = main_mem.bss_ranges;
+            if let Some((_, _, ref imem)) = interp_info {
+                ranges.extend_from_slice(&imem.bss_ranges);
+            }
+            ranges
+        };
+        for (bss_addr, bss_len) in &all_bss {
+            // Find which segment contains this BSS address and zero it
+            // in the packed data region.
+            for (i, seg) in segments.iter().enumerate() {
+                let seg_start = seg.vaddr as usize;
+                let seg_end = seg_start + seg.data_len as usize;
+                if *bss_addr >= seg_start && *bss_addr < seg_end {
+                    let offset_in_seg = *bss_addr - seg_start;
+                    let zero_end = (offset_in_seg + bss_len).min(seg.data_len as usize);
+                    let data_start = seg_layouts[i].data_offset + offset_in_seg;
+                    let data_end = seg_layouts[i].data_offset + zero_end;
+                    data_region[data_start..data_end].fill(0);
+                    break;
+                }
+            }
+        }
+
+        cq.result = 0;
+        cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+        cq.data_offset = 0;
+        cq.data_len = total_data_len as u32;
+        cq
+    }
+
+    /// Close a file descriptor via the shim.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn close_fd(&self, thread_slot: u16, fd: i32) {
+        let mut regs = litebox_common_linux::PtRegs {
+            orig_rax: libc::SYS_close as usize,
+            rdi: fd as usize,
+            ..litebox_common_linux::PtRegs::default()
+        };
+        let _ = self.dispatch_to_task(thread_slot, &mut regs);
     }
 
     /// Dispatch a control message from an SQ entry.
@@ -799,4 +1458,363 @@ impl<FS: ShimFS> ProcessServer<FS> {
         cq.result = result;
         cq
     }
+}
+
+// ── Execve helper types ─────────────────────────────────────────────────────
+
+/// Mirror of `ExecveHeader` from `litebox_micro::execve` (central cannot import micro).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct ExecveHeaderCentral {
+    num_segments: u32,
+    _pad0: u32,
+    entry_point: u64,
+    at_entry: u64,
+    brk: u64,
+    phdr_addr: u64,
+    phnum: u32,
+    phent: u32,
+    interp_base: u64,
+    argc: u32,
+    envc: u32,
+    argv_offset: u32,
+    argv_len: u32,
+    envp_offset: u32,
+    envp_len: u32,
+    syscall_entry_point: u64,
+}
+
+/// Mirror of `ExecveSegment` from `litebox_micro::execve`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct ExecveSegmentCentral {
+    vaddr: u64,
+    map_len: u64,
+    data_len: u64,
+    prot: u32,
+    has_trampoline: u32,
+    data_offset: u64,
+}
+
+/// Which source file a segment's data comes from.
+#[derive(Clone, Copy)]
+enum FileSource {
+    Main,
+    Interp,
+}
+
+/// Layout of a segment's data in the data region.
+struct SegLayout {
+    data_offset: usize,
+    tramp_desc_len: usize, // 0 if no trampoline, else 8 + trampoline_code_size
+}
+
+/// Collected segment info before packing into the data region.
+struct SegmentInfo {
+    vaddr: u64,
+    map_len: u64,
+    data_len: u64,
+    prot: u32,
+    file_data_offset: u64,
+    file_data_source: FileSource,
+    has_trampoline: bool,
+    trampoline_base: usize,
+}
+
+/// A `ReadAt` implementation that reads from an in-memory byte slice.
+struct MemReader<'a>(&'a [u8]);
+
+impl litebox_common_linux::loader::ReadAt for MemReader<'_> {
+    type Error = litebox_common_linux::errno::Errno;
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
+        let start = offset as usize;
+        let end = start
+            .checked_add(buf.len())
+            .ok_or(litebox_common_linux::errno::Errno::EINVAL)?;
+        if end > self.0.len() {
+            return Err(litebox_common_linux::errno::Errno::EIO);
+        }
+        buf.copy_from_slice(&self.0[start..end]);
+        Ok(())
+    }
+
+    fn size(&mut self) -> Result<u64, Self::Error> {
+        Ok(self.0.len() as u64)
+    }
+}
+
+/// `ReadAt` for `&MemReader` (the ELF parser takes `&mut F` where `F: ReadAt`).
+impl litebox_common_linux::loader::ReadAt for &MemReader<'_> {
+    type Error = litebox_common_linux::errno::Errno;
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
+        let start = offset as usize;
+        let end = start
+            .checked_add(buf.len())
+            .ok_or(litebox_common_linux::errno::Errno::EINVAL)?;
+        if end > self.0.len() {
+            return Err(litebox_common_linux::errno::Errno::EIO);
+        }
+        buf.copy_from_slice(&self.0[start..end]);
+        Ok(())
+    }
+
+    fn size(&mut self) -> Result<u64, Self::Error> {
+        Ok(self.0.len() as u64)
+    }
+}
+
+// ── Simple mapper for simulating ELF load ───────────────────────────────────
+
+/// A recorded segment from the simple mapper.
+struct RecordedSegment {
+    address: usize,
+    len: usize,
+    file_len: usize,
+    file_offset: u64,
+    prot: litebox_common_linux::loader::Protection,
+    is_trampoline: bool,
+}
+
+impl RecordedSegment {
+    fn prot_flags(&self) -> i32 {
+        let mut flags = 0i32;
+        if self.prot.read {
+            flags |= libc::PROT_READ;
+        }
+        if self.prot.write {
+            flags |= libc::PROT_WRITE;
+        }
+        if self.prot.execute {
+            flags |= libc::PROT_EXEC;
+        }
+        flags
+    }
+}
+
+/// A mapper that records segment information without actually mapping memory.
+///
+/// This is used by central to figure out what segments the ELF loader would
+/// create, so we can pack the data into the data region for micro.
+struct SimpleMapper {
+    segments: Vec<RecordedSegment>,
+    base_addr: usize,
+    next_addr: usize,
+}
+
+impl SimpleMapper {
+    fn new() -> Self {
+        // Start at a high address that won't conflict.
+        // This is for ET_DYN binaries that need a base address.
+        Self {
+            segments: Vec::new(),
+            base_addr: 0,
+            next_addr: 0x0040_0000, // 4 MiB — typical PIE base
+        }
+    }
+
+    /// Create a mapper that starts allocating at `addr`.
+    ///
+    /// Used for the interpreter so its segments don't overlap the main binary.
+    fn new_at(addr: usize) -> Self {
+        Self {
+            segments: Vec::new(),
+            base_addr: 0,
+            next_addr: addr,
+        }
+    }
+}
+
+impl litebox_common_linux::loader::MapMemory for SimpleMapper {
+    type Error = litebox_common_linux::errno::Errno;
+
+    fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error> {
+        // Align up the next address.
+        let aligned = (self.next_addr + align - 1) & !(align - 1);
+        self.next_addr = aligned + len;
+        self.base_addr = aligned;
+        Ok(aligned)
+    }
+
+    fn map_file(
+        &mut self,
+        address: usize,
+        len: usize,
+        offset: u64,
+        prot: &litebox_common_linux::loader::Protection,
+    ) -> Result<(), Self::Error> {
+        self.segments.push(RecordedSegment {
+            address,
+            len,
+            file_len: len,
+            file_offset: offset,
+            prot: *prot,
+            is_trampoline: false,
+        });
+        Ok(())
+    }
+
+    fn map_zero(
+        &mut self,
+        address: usize,
+        len: usize,
+        prot: &litebox_common_linux::loader::Protection,
+    ) -> Result<(), Self::Error> {
+        self.segments.push(RecordedSegment {
+            address,
+            len,
+            file_len: 0,
+            file_offset: 0,
+            prot: *prot,
+            is_trampoline: false,
+        });
+        Ok(())
+    }
+
+    fn protect(
+        &mut self,
+        _address: usize,
+        _len: usize,
+        prot: &litebox_common_linux::loader::Protection,
+    ) -> Result<(), Self::Error> {
+        // Track protection changes — mark the last segment as trampoline
+        // since `load_trampoline` calls `map_file` then `protect`.
+        // `protect` is only called from `load_trampoline`, so the last
+        // segment recorded by `map_file` is always the trampoline.
+        if let Some(last) = self.segments.last_mut() {
+            last.prot = *prot;
+            last.is_trampoline = true;
+        }
+        Ok(())
+    }
+}
+
+/// A no-op memory accessor for the simple mapper.
+/// Records BSS (zero-fill) ranges emitted by the ELF loader.
+///
+/// The loader calls `mem.zero(address, len)` to zero BSS within file-backed
+/// pages. We record these so that the packed segment data can have those
+/// regions zeroed before sending to micro.
+struct SimpleMem {
+    /// (address, len) pairs of BSS ranges.
+    bss_ranges: Vec<(usize, usize)>,
+}
+
+impl SimpleMem {
+    fn new() -> Self {
+        Self {
+            bss_ranges: Vec::new(),
+        }
+    }
+}
+
+impl litebox_common_linux::loader::AccessMemory for SimpleMem {
+    fn read(
+        &mut self,
+        _address: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, litebox_common_linux::loader::Fault> {
+        // Return zeroes — we don't actually read memory.
+        buf.fill(0);
+        Ok(buf.len())
+    }
+
+    fn write(
+        &mut self,
+        _address: usize,
+        _data: &[u8],
+    ) -> Result<(), litebox_common_linux::loader::Fault> {
+        // No-op — trampoline patching writes the entry point here,
+        // but we don't need to record it (micro patches it).
+        Ok(())
+    }
+
+    fn zero(
+        &mut self,
+        address: usize,
+        len: usize,
+    ) -> Result<(), litebox_common_linux::loader::Fault> {
+        self.bss_ranges.push((address, len));
+        Ok(())
+    }
+}
+
+// ── Deserialization helpers ─────────────────────────────────────────────────
+
+/// Deserialize the pathname from the serialized execve args.
+///
+/// Returns `(path_bytes, bytes_consumed)`.
+fn deserialize_execve_path(data: &[u8]) -> Option<(&[u8], usize)> {
+    if data.len() < 4 {
+        return None;
+    }
+    let path_len = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
+    if 4 + path_len > data.len() {
+        return None;
+    }
+    Some((&data[4..4 + path_len], 4 + path_len))
+}
+
+/// Deserialize a string vector (argv or envp) from the serialized execve args.
+///
+/// Returns `(Vec<byte_slices>, new_position)`.
+fn deserialize_string_vector(data: &[u8], mut pos: usize) -> Option<(Vec<&[u8]>, usize)> {
+    if pos + 4 > data.len() {
+        return None;
+    }
+    let count = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+    pos += 4;
+    let mut result = Vec::with_capacity(count);
+    for _ in 0..count {
+        if pos + 4 > data.len() {
+            return None;
+        }
+        let len = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+        pos += 4;
+        if pos + len > data.len() {
+            return None;
+        }
+        result.push(&data[pos..pos + len]);
+        pos += len;
+    }
+    Some((result, pos))
+}
+
+/// Read the trampoline header from the end of an ELF file's data.
+///
+/// Returns `Some((file_offset, trampoline_size))` if valid, `None` otherwise.
+#[allow(clippy::cast_possible_truncation)]
+fn read_trampoline_header(file_data: &[u8]) -> Option<(u64, usize)> {
+    const LITEBOX0_MAGIC: u64 = u64::from_le_bytes(*b"LITEBOX0");
+    const HEADER_SIZE: usize = 32;
+
+    if file_data.len() < HEADER_SIZE {
+        return None;
+    }
+    let header_offset = file_data.len() - HEADER_SIZE;
+    let magic = u64::from_le_bytes(
+        file_data[header_offset..header_offset + 8]
+            .try_into()
+            .ok()?,
+    );
+    if magic != LITEBOX0_MAGIC {
+        return None;
+    }
+    let file_offset = u64::from_le_bytes(
+        file_data[header_offset + 8..header_offset + 16]
+            .try_into()
+            .ok()?,
+    );
+    let tramp_size = u64::from_le_bytes(
+        file_data[header_offset + 24..header_offset + 32]
+            .try_into()
+            .ok()?,
+    ) as usize;
+    if tramp_size == 0 {
+        return None;
+    }
+    Some((file_offset, tramp_size))
 }

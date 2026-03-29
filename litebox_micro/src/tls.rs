@@ -50,8 +50,8 @@ pub unsafe fn micro_init_thread_inner(
     thread_slot: u16,
 ) -> *mut MicroTls {
     let ptr = unsafe {
-        libc::mmap(
-            core::ptr::null_mut(),
+        crate::raw_syscall::mmap(
+            0,
             TLS_ALLOC_SIZE,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
@@ -59,9 +59,12 @@ pub unsafe fn micro_init_thread_inner(
             0,
         )
     };
-    assert_ne!(ptr, libc::MAP_FAILED, "mmap for MicroTls failed");
+    assert!(
+        !crate::raw_syscall::is_error(ptr),
+        "mmap for MicroTls failed"
+    );
 
-    let tls = ptr.cast::<MicroTls>();
+    let tls = ptr as *mut MicroTls;
     unsafe {
         (*tls).self_ptr = tls;
         (*tls).micro = micro_state;
@@ -71,7 +74,7 @@ pub unsafe fn micro_init_thread_inner(
     }
 
     // ARCH_SET_GS = 0x1001
-    let ret = unsafe { libc::syscall(libc::SYS_arch_prctl, 0x1001i32, tls as usize) };
+    let ret = unsafe { crate::raw_syscall::arch_prctl(0x1001, tls as usize) };
     assert_eq!(ret, 0, "arch_prctl(ARCH_SET_GS) failed: {ret}");
 
     tls
@@ -143,6 +146,6 @@ mod tests {
         assert_eq!(read_tls, tls);
 
         // Clean up.
-        unsafe { libc::munmap(tls.cast(), TLS_ALLOC_SIZE) };
+        unsafe { crate::raw_syscall::munmap(tls as usize, TLS_ALLOC_SIZE) };
     }
 }

@@ -1,0 +1,886 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+//! Execve handling: serialize args, receive ELF data from central, map
+//! segments, and jump to the new entry point.
+
+use litebox_ipc::ring::{cq_flags, CqEntry};
+
+use crate::state::MicroState;
+use crate::tls::MicroTls;
+use crate::trampoline::SyscallArgs;
+
+// ── Data structures ──────────────────────────────────────────────────────
+
+/// Header sent by central in the execve CQ response data region.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ExecveHeader {
+    /// Number of segments to map (main ELF + interpreter).
+    pub num_segments: u32,
+    /// Padding for alignment.
+    pub pad0: u32,
+    /// Entry point address (interpreter entry if dynamic, else main entry).
+    /// This is where we actually jump to.
+    pub entry_point: u64,
+    /// The main binary's entry point (for AT_ENTRY auxv).
+    pub at_entry: u64,
+    /// Program break address.
+    pub brk: u64,
+    /// Address of program headers in memory (for AT_PHDR).
+    pub phdr_addr: u64,
+    /// Number of program headers.
+    pub phnum: u32,
+    /// Size of each program header entry.
+    pub phent: u32,
+    /// Interpreter base address (0 if static binary).
+    pub interp_base: u64,
+    /// Number of argv entries.
+    pub argc: u32,
+    /// Number of envp entries.
+    pub envc: u32,
+    /// Offset in data region (relative to header start) where argv strings start.
+    pub argv_offset: u32,
+    /// Total byte length of serialized argv strings (NUL-separated).
+    pub argv_len: u32,
+    /// Offset in data region where envp strings start.
+    pub envp_offset: u32,
+    /// Total byte length of serialized envp strings (NUL-separated).
+    pub envp_len: u32,
+    /// Syscall entry point address (for trampoline patching).
+    pub syscall_entry_point: u64,
+}
+
+/// Describes a loaded ELF segment that micro must map.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ExecveSegment {
+    /// Virtual address where this segment should be mapped (already base-adjusted for ET_DYN).
+    pub vaddr: u64,
+    /// Length of the mapping (page-aligned).
+    pub map_len: u64,
+    /// Length of file-backed data within the mapping.
+    pub data_len: u64,
+    /// Protection flags (PROT_READ | PROT_WRITE | PROT_EXEC bitmask).
+    pub prot: u32,
+    /// Non-zero if this segment carries trampoline data that follows immediately
+    /// after the file-backed data. The trampoline data has format:
+    /// [u32 LE: vaddr_offset from base_addr] [u32 LE: trampoline_code_size] [trampoline_code bytes]
+    pub has_trampoline: u32,
+    /// Offset in data region where this segment's file data starts (relative to header start).
+    pub data_offset: u64,
+}
+
+// ── Serialization (micro → central) ─────────────────────────────────────
+
+/// Serialize pathname, argv, and envp into a data buffer for transfer to central.
+///
+/// Format: `[u32 path_len][path bytes with NUL][u32 argc][u32 arg0_len][arg0+NUL]...[u32 envc][u32 env0_len][env0+NUL]...`
+///
+/// Returns the number of bytes written, or `None` if the buffer is too small.
+///
+/// # Safety
+///
+/// `argv_ptr` and `envp_ptr` must be null-terminated arrays of null-terminated C string pointers.
+#[allow(clippy::cast_possible_truncation)]
+pub unsafe fn serialize_execve_args(
+    buf: &mut [u8],
+    pathname: &core::ffi::CStr,
+    argv_ptr: *const *const i8,
+    envp_ptr: *const *const i8,
+) -> Option<usize> {
+    let mut pos = 0usize;
+
+    // Write pathname.
+    let path_bytes = pathname.to_bytes_with_nul();
+    let path_len = path_bytes.len() as u32;
+    if pos + 4 + path_bytes.len() > buf.len() {
+        return None;
+    }
+    buf[pos..pos + 4].copy_from_slice(&path_len.to_le_bytes());
+    pos += 4;
+    buf[pos..pos + path_bytes.len()].copy_from_slice(path_bytes);
+    pos += path_bytes.len();
+
+    // Count and write argv.
+    let mut argc: u32 = 0;
+    if !argv_ptr.is_null() {
+        let mut p = argv_ptr;
+        while !unsafe { *p }.is_null() {
+            argc += 1;
+            p = unsafe { p.add(1) };
+        }
+    }
+    if pos + 4 > buf.len() {
+        return None;
+    }
+    buf[pos..pos + 4].copy_from_slice(&argc.to_le_bytes());
+    pos += 4;
+
+    if !argv_ptr.is_null() {
+        let mut p = argv_ptr;
+        for _ in 0..argc {
+            let cstr = unsafe { core::ffi::CStr::from_ptr(*p) };
+            let bytes = cstr.to_bytes_with_nul();
+            let arg_len = bytes.len() as u32;
+            if pos + 4 + bytes.len() > buf.len() {
+                return None;
+            }
+            buf[pos..pos + 4].copy_from_slice(&arg_len.to_le_bytes());
+            pos += 4;
+            buf[pos..pos + bytes.len()].copy_from_slice(bytes);
+            pos += bytes.len();
+            p = unsafe { p.add(1) };
+        }
+    }
+
+    // Count and write envp.
+    let mut envc: u32 = 0;
+    if !envp_ptr.is_null() {
+        let mut p = envp_ptr;
+        while !unsafe { *p }.is_null() {
+            envc += 1;
+            p = unsafe { p.add(1) };
+        }
+    }
+    if pos + 4 > buf.len() {
+        return None;
+    }
+    buf[pos..pos + 4].copy_from_slice(&envc.to_le_bytes());
+    pos += 4;
+
+    if !envp_ptr.is_null() {
+        let mut p = envp_ptr;
+        for _ in 0..envc {
+            let cstr = unsafe { core::ffi::CStr::from_ptr(*p) };
+            let bytes = cstr.to_bytes_with_nul();
+            let env_len = bytes.len() as u32;
+            if pos + 4 + bytes.len() > buf.len() {
+                return None;
+            }
+            buf[pos..pos + 4].copy_from_slice(&env_len.to_le_bytes());
+            pos += 4;
+            buf[pos..pos + bytes.len()].copy_from_slice(bytes);
+            pos += bytes.len();
+            p = unsafe { p.add(1) };
+        }
+    }
+
+    Some(pos)
+}
+
+// ── Stack building ──────────────────────────────────────────────────────
+
+/// 8 MiB — matches the default Linux `RLIMIT_STACK`.
+const STACK_SIZE: usize = 8 * 1024 * 1024;
+
+/// Auxiliary vector key constants (mirrors Linux `AT_*`).
+#[allow(non_upper_case_globals)]
+mod at {
+    pub const AT_NULL: usize = 0;
+    pub const AT_PHDR: usize = 3;
+    pub const AT_PHENT: usize = 4;
+    pub const AT_PHNUM: usize = 5;
+    pub const AT_PAGESZ: usize = 6;
+    pub const AT_BASE: usize = 7;
+    pub const AT_ENTRY: usize = 9;
+    pub const AT_UID: usize = 11;
+    pub const AT_EUID: usize = 12;
+    pub const AT_GID: usize = 13;
+    pub const AT_EGID: usize = 14;
+    pub const AT_CLKTCK: usize = 17;
+    pub const AT_RANDOM: usize = 25;
+}
+
+/// Build an ELF initial stack: argc, argv ptrs, NULL, envp ptrs, NULL, auxv, random, strings.
+///
+/// Returns the stack pointer (pointing at argc, 16-byte aligned).
+#[allow(clippy::cast_possible_truncation)]
+fn build_exec_stack(
+    stack_base: usize,
+    stack_size: usize,
+    argv_strings: &[&[u8]], // NUL-terminated strings
+    envp_strings: &[&[u8]], // NUL-terminated strings
+    header: &ExecveHeader,
+) -> usize {
+    let mut pos = stack_size;
+
+    // Helper: write bytes at current pos (growing downward).
+    let write_bytes = |pos: &mut usize, data: &[u8], base: usize| {
+        *pos -= data.len();
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr(), (base + *pos) as *mut u8, data.len());
+        }
+    };
+
+    let write_usize = |pos: &mut usize, val: usize, base: usize| {
+        *pos -= core::mem::size_of::<usize>();
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                val.to_ne_bytes().as_ptr(),
+                (base + *pos) as *mut u8,
+                core::mem::size_of::<usize>(),
+            );
+        }
+    };
+
+    // ── end marker (NULL) ──────────────────────────────────────────
+    write_usize(&mut pos, 0, stack_base);
+
+    // ── environment strings (ASCIIZ) ───────────────────────────────
+    let mut env_addrs = [0usize; 1024]; // max 1024 envp entries
+    let env_count = envp_strings.len().min(1024);
+    for i in (0..env_count).rev() {
+        write_bytes(&mut pos, envp_strings[i], stack_base);
+        env_addrs[i] = stack_base + pos;
+    }
+
+    // ── argument strings (ASCIIZ) ──────────────────────────────────
+    let mut arg_addrs = [0usize; 1024]; // max 1024 argv entries
+    let arg_count = argv_strings.len().min(1024);
+    for i in (0..arg_count).rev() {
+        write_bytes(&mut pos, argv_strings[i], stack_base);
+        arg_addrs[i] = stack_base + pos;
+    }
+
+    // ── AT_RANDOM: 16 pseudo-random bytes ──────────────────────────
+    let random_bytes: [u8; 16] = [
+        0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD,
+        0xBE, 0xEF,
+    ];
+    write_bytes(&mut pos, &random_bytes, stack_base);
+    let at_random_addr = stack_base + pos;
+
+    // ── alignment padding ──────────────────────────────────────────
+    // Align pos to usize boundary first.
+    pos &= !(core::mem::size_of::<usize>() - 1);
+
+    // Build auxv list to count entries.
+    // Fixed entries: PAGESZ, PHDR, PHENT, PHNUM, ENTRY, UID, EUID, GID, EGID, CLKTCK, RANDOM = 11
+    // Optional: BASE (if interp_base != 0) = +1
+    // Plus AT_NULL terminator = +1
+    let auxv_count = 11 + usize::from(header.interp_base != 0) + 1;
+
+    let remaining_entries =
+        // auxv: entries * 2 words each
+        auxv_count * 2
+        // envp pointers + NULL terminator
+        + env_count + 1
+        // argv pointers + NULL terminator
+        + arg_count + 1
+        // argc
+        + 1;
+    let bytes_needed = remaining_entries * core::mem::size_of::<usize>();
+    let final_pos = pos - bytes_needed;
+    let aligned_final = final_pos & !15; // align down to 16 bytes
+    pos -= final_pos - aligned_final;
+
+    // ── auxv entries (push from top down) ──────────────────────────
+    // AT_NULL terminator.
+    write_usize(&mut pos, 0, stack_base);
+    write_usize(&mut pos, at::AT_NULL, stack_base);
+
+    // Push entries in reverse order so they appear ascending in memory.
+    // We use a fixed order.
+    write_usize(&mut pos, at_random_addr, stack_base);
+    write_usize(&mut pos, at::AT_RANDOM, stack_base);
+
+    write_usize(&mut pos, 100, stack_base);
+    write_usize(&mut pos, at::AT_CLKTCK, stack_base);
+
+    write_usize(&mut pos, 0, stack_base);
+    write_usize(&mut pos, at::AT_EGID, stack_base);
+
+    write_usize(&mut pos, 0, stack_base);
+    write_usize(&mut pos, at::AT_GID, stack_base);
+
+    write_usize(&mut pos, 0, stack_base);
+    write_usize(&mut pos, at::AT_EUID, stack_base);
+
+    write_usize(&mut pos, 0, stack_base);
+    write_usize(&mut pos, at::AT_UID, stack_base);
+
+    write_usize(&mut pos, header.at_entry as usize, stack_base);
+    write_usize(&mut pos, at::AT_ENTRY, stack_base);
+
+    if header.interp_base != 0 {
+        write_usize(&mut pos, header.interp_base as usize, stack_base);
+        write_usize(&mut pos, at::AT_BASE, stack_base);
+    }
+
+    write_usize(&mut pos, 4096, stack_base);
+    write_usize(&mut pos, at::AT_PAGESZ, stack_base);
+
+    write_usize(&mut pos, header.phnum as usize, stack_base);
+    write_usize(&mut pos, at::AT_PHNUM, stack_base);
+
+    write_usize(&mut pos, header.phent as usize, stack_base);
+    write_usize(&mut pos, at::AT_PHENT, stack_base);
+
+    write_usize(&mut pos, header.phdr_addr as usize, stack_base);
+    write_usize(&mut pos, at::AT_PHDR, stack_base);
+
+    // ── envp pointers ──────────────────────────────────────────────
+    write_usize(&mut pos, 0, stack_base); // NULL terminator
+    for i in (0..env_count).rev() {
+        write_usize(&mut pos, env_addrs[i], stack_base);
+    }
+
+    // ── argv pointers ──────────────────────────────────────────────
+    write_usize(&mut pos, 0, stack_base); // NULL terminator
+    for i in (0..arg_count).rev() {
+        write_usize(&mut pos, arg_addrs[i], stack_base);
+    }
+
+    // ── argc ───────────────────────────────────────────────────────
+    write_usize(&mut pos, arg_count, stack_base);
+
+    stack_base + pos
+}
+
+// ── Main entry point ────────────────────────────────────────────────────
+
+/// Handle an execve syscall from the guest.
+///
+/// Serializes path/argv/envp into the data region, submits to central,
+/// and on success, tears down old memory, maps new segments, and jumps
+/// to the new entry point.
+///
+/// On error (before point-of-no-return), returns the negative errno.
+/// On success, does NOT return — jumps to new entry point.
+///
+/// # Safety
+///
+/// - `tls` must point to valid initialized `MicroTls`.
+/// - `args` must contain valid execve arguments.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+pub unsafe fn handle_execve(tls: *mut MicroTls, args: &SyscallArgs) -> i64 {
+    let micro = unsafe { &*(*tls).micro };
+
+    // Extract execve arguments.
+    let pathname_ptr = args.args[0] as *const i8;
+    let argv_ptr = args.args[1] as *const *const i8;
+    let envp_ptr = args.args[2] as *const *const i8;
+
+    if pathname_ptr.is_null() {
+        return -i64::from(libc::EFAULT);
+    }
+
+    let pathname = unsafe { core::ffi::CStr::from_ptr(pathname_ptr) };
+
+    // Serialize path/argv/envp into the data region.
+    let data_region_ptr =
+        unsafe { micro.ring_base.add(micro.layout.data_region_offset) };
+    let data_region =
+        unsafe { core::slice::from_raw_parts_mut(data_region_ptr, micro.layout.data_region_size) };
+
+    let Some(data_len) =
+        (unsafe { serialize_execve_args(data_region, pathname, argv_ptr, envp_ptr) })
+    else {
+        return -i64::from(libc::E2BIG);
+    };
+
+    // Submit SYS_execve to central with the serialized data.
+    // We build a custom SQ entry with data_offset=0, data_len=serialized length.
+    // The submit_and_wait function handles the normal pathname copy, but for execve
+    // we already wrote the data ourselves. We need to submit with the right flags.
+    let sq_args = args.args;
+    // Override the args so central knows where the data is.
+    // We'll use a special submission that sets data fields.
+    let cq = unsafe {
+        submit_execve_sq(tls, args.nr as u32, &sq_args, data_len as u32)
+    };
+
+    if cq.result < 0 {
+        return cq.result;
+    }
+
+    // Central returned success with EXEC_LOCAL | HAS_DATA.
+    if cq.flags & cq_flags::EXEC_LOCAL == 0 || cq.flags & cq_flags::HAS_DATA == 0 {
+        return -i64::from(libc::ENOEXEC);
+    }
+
+    // Point of no return — execute the new binary.
+    unsafe { execute_execve(tls, &cq, micro) }
+}
+
+/// Submit an execve SQ entry with pre-populated data region.
+///
+/// Similar to `submit_and_wait` but sets `data_offset` and `data_len` directly
+/// instead of copying a pathname.
+///
+/// # Safety
+///
+/// - `tls` must point to valid initialized `MicroTls`.
+#[allow(clippy::cast_possible_truncation, clippy::cast_ptr_alignment)]
+unsafe fn submit_execve_sq(
+    tls: *mut MicroTls,
+    syscall_nr: u32,
+    args: &[u64; 6],
+    data_len: u32,
+) -> CqEntry {
+    use core::sync::atomic::Ordering::Acquire;
+    use litebox_ipc::cq::{cq_find_by_seq, cq_tail};
+    use litebox_ipc::ring::{RingHeader, SqEntry, sq_flags};
+    use litebox_ipc::sq::{sq_acquire_slot, sq_publish};
+    use litebox_ipc::wait::spin_then_wait;
+
+    let micro = unsafe { &*(*tls).micro };
+    let header = unsafe { &*(micro.ring_base.cast::<RingHeader>()) };
+    let sq_entries = unsafe {
+        micro
+            .ring_base
+            .add(micro.layout.sq_entries_offset)
+            .cast::<SqEntry>()
+    };
+    let cq_entries = unsafe {
+        micro
+            .ring_base
+            .add(micro.layout.cq_entries_offset)
+            .cast::<litebox_ipc::ring::CqEntry>()
+    };
+
+    let seq = unsafe { (*tls).seq_counter };
+    unsafe { (*tls).seq_counter += 1 };
+
+    let thread_slot = unsafe { (*tls).thread_slot as u16 };
+    let notify_slot = &header.cq_notify_slots[thread_slot as usize];
+    let search_start = cq_tail(header);
+
+    let slot_idx = unsafe { sq_acquire_slot(header) };
+    let entry = unsafe { &mut *sq_entries.add(slot_idx as usize) };
+
+    entry.seq = seq;
+    entry.syscall_nr = syscall_nr;
+    entry.thread_slot = thread_slot;
+    entry.flags = sq_flags::NEED_AUTH;
+    entry.args = *args;
+    entry.data_offset = 0;
+    entry.data_len = data_len;
+
+    sq_publish(entry);
+    header
+        .sq_notify
+        .fetch_add(1, core::sync::atomic::Ordering::Release);
+    // Wake central.
+    unsafe {
+        crate::raw_syscall::futex4(
+            core::ptr::from_ref(&header.sq_notify) as usize,
+            libc::FUTEX_WAKE,
+            1,
+            0,
+        );
+    }
+
+    loop {
+        if let Some(cq) = unsafe { cq_find_by_seq(header, cq_entries, search_start, seq) } {
+            return cq;
+        }
+        let current = notify_slot.load(Acquire);
+        if let Some(cq) = unsafe { cq_find_by_seq(header, cq_entries, search_start, seq) } {
+            return cq;
+        }
+        spin_then_wait(notify_slot, current, |addr, exp| {
+            unsafe {
+                crate::raw_syscall::futex4(
+                    core::ptr::from_ref(addr) as usize,
+                    libc::FUTEX_WAIT,
+                    exp,
+                    0,
+                );
+            }
+        });
+    }
+}
+
+// ── Execute execve ──────────────────────────────────────────────────────
+
+/// Execute an execve prepared by central. Does NOT return.
+///
+/// # Safety
+/// - Data region must contain valid `ExecveHeader` + `ExecveSegment` array + segment data.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_ptr_alignment,
+    clippy::too_many_lines
+)]
+unsafe fn execute_execve(
+    _tls: *mut MicroTls,
+    cq: &CqEntry,
+    micro: &MicroState,
+) -> ! {
+    let data_region_ptr = unsafe { micro.ring_base.add(micro.layout.data_region_offset) };
+    let data_base = unsafe { data_region_ptr.add(cq.data_offset as usize) };
+
+    // Read the header.
+    let header = unsafe { &*(data_base.cast::<ExecveHeader>()) };
+
+    // Read the segments array (immediately after the header).
+    let segments_ptr = unsafe { data_base.add(core::mem::size_of::<ExecveHeader>()) };
+    let num_segments = header.num_segments as usize;
+
+    // ── Parse argv/envp and build stack BEFORE mapping segments ─────────
+    //
+    // CRITICAL: All heap allocations and complex data manipulation must
+    // happen before the segment mapping loop. The segment mapping uses
+    // MAP_FIXED which can overwrite parts of the old binary's data segments,
+    // corrupting glibc's malloc arena locks (accessed via FS-based TLS).
+    // Any heap allocation after segment mapping would call glibc malloc,
+    // which would find its internal locks in a corrupt state and block
+    // forever on a futex wait.
+    //
+    // The data region is in shared memory (at a high address), so it's
+    // safe to read from before or after mapping. We use stack-allocated
+    // fixed-size arrays to avoid any heap allocation.
+
+    let argv_data = unsafe {
+        core::slice::from_raw_parts(
+            data_base.add(header.argv_offset as usize),
+            header.argv_len as usize,
+        )
+    };
+    let envp_data = unsafe {
+        core::slice::from_raw_parts(
+            data_base.add(header.envp_offset as usize),
+            header.envp_len as usize,
+        )
+    };
+
+    // Split NUL-separated strings into stack-allocated fixed-size arrays.
+    let empty: &[u8] = &[];
+    let mut argv_strings = [empty; MAX_STRINGS];
+    let argc = split_nul_strings_into(argv_data, header.argc as usize, &mut argv_strings);
+    let mut envp_strings = [empty; MAX_STRINGS];
+    let envc = split_nul_strings_into(envp_data, header.envc as usize, &mut envp_strings);
+
+    let argv_refs: &[&[u8]] = &argv_strings[..argc];
+    let envp_refs: &[&[u8]] = &envp_strings[..envc];
+
+    // Allocate a new stack (must happen before segment mapping too).
+    let stack_ret = unsafe {
+        crate::raw_syscall::mmap(
+            0,
+            STACK_SIZE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_ANONYMOUS | libc::MAP_PRIVATE | libc::MAP_STACK | libc::MAP_GROWSDOWN,
+            -1,
+            0,
+        )
+    };
+    let stack_base = stack_ret as usize;
+    if crate::raw_syscall::is_error(stack_ret) {
+        unsafe { crate::raw_syscall::syscall1(libc::SYS_exit_group, 127) };
+        unreachable!();
+    }
+
+    let stack_pointer = build_exec_stack(stack_base, STACK_SIZE, argv_refs, envp_refs, header);
+
+    let entry_point = header.entry_point as usize;
+
+    // Set the emulated guest brk to the end of the new binary's segments.
+    // The kernel's real brk cannot be moved to the new binary's address range
+    // (it stays at the host process's original brk), so micro emulates brk
+    // by tracking this value and using mmap/munmap for the guest.
+    micro
+        .guest_brk
+        .store(header.brk as usize, core::sync::atomic::Ordering::Release);
+
+    // ── Map segments (point of no return) ──────────────────────────────
+    //
+    // After this loop, no heap allocations or glibc calls are safe.
+    // Only raw syscalls via libc::syscall() are allowed.
+
+    for i in 0..num_segments {
+        let seg = unsafe {
+            &*(segments_ptr
+                .add(i * core::mem::size_of::<ExecveSegment>())
+                .cast::<ExecveSegment>())
+        };
+
+        let vaddr = seg.vaddr as usize;
+        let map_len = seg.map_len as usize;
+        let data_len = seg.data_len as usize;
+        let final_prot = seg.prot as i32;
+
+        if map_len == 0 {
+            continue;
+        }
+
+        // 1. Create anonymous writable mapping at the target address.
+        let ptr_ret = unsafe {
+            crate::raw_syscall::mmap(
+                vaddr,
+                map_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if crate::raw_syscall::is_error(ptr_ret) {
+            // Cannot recover — abort.
+            unsafe { crate::raw_syscall::syscall1(libc::SYS_exit_group, 127) };
+            unreachable!();
+        }
+
+        // 2. Copy file data from data region.
+        if data_len > 0 {
+            let src = unsafe { data_base.add(seg.data_offset as usize) };
+            unsafe {
+                core::ptr::copy_nonoverlapping(src, ptr_ret as *mut u8, data_len);
+            }
+        }
+
+        // 3. Set final permissions.
+        if final_prot != (libc::PROT_READ | libc::PROT_WRITE) {
+            unsafe { crate::raw_syscall::mprotect(ptr_ret as usize, map_len, final_prot) };
+        }
+
+        // 4. Handle trampoline data if present.
+        if seg.has_trampoline != 0 {
+            let tramp_desc_ptr = unsafe { data_base.add(seg.data_offset as usize + data_len) };
+            let tramp_vaddr_offset = unsafe {
+                u32::from_le_bytes(
+                    core::slice::from_raw_parts(tramp_desc_ptr, 4)
+                        .try_into()
+                        .unwrap(),
+                ) as usize
+            };
+            let tramp_size = unsafe {
+                u32::from_le_bytes(
+                    core::slice::from_raw_parts(tramp_desc_ptr.add(4), 4)
+                        .try_into()
+                        .unwrap(),
+                ) as usize
+            };
+
+            if tramp_size > 0 {
+                let tramp_data_src = unsafe { tramp_desc_ptr.add(8) };
+                let tramp_addr = tramp_vaddr_offset;
+                let tramp_page_size = (tramp_size + 0xFFF) & !0xFFF;
+
+                let tramp_ret = unsafe {
+                    crate::raw_syscall::mmap(
+                        tramp_addr,
+                        tramp_page_size,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                if !crate::raw_syscall::is_error(tramp_ret) {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            tramp_data_src,
+                            tramp_ret as *mut u8,
+                            tramp_size,
+                        );
+                    }
+
+                    // Patch the syscall entry point at offset 0 with micro's
+                    // own trampoline entry (central sends 0 as a placeholder).
+                    let entry_addr = crate::trampoline::get_syscall_entry_point() as u64;
+                    unsafe {
+                        *(tramp_ret as *mut u64) = entry_addr;
+                    }
+
+                    unsafe {
+                        crate::raw_syscall::mprotect(
+                            tramp_ret as usize,
+                            tramp_page_size,
+                            libc::PROT_READ | libc::PROT_EXEC,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Jump to the new entry point. This never returns.
+    //
+    // CRITICAL: The arch_prctl(ARCH_SET_FS, 0) to reset the FS base MUST
+    // happen inside the inline asm block, not via a Rust libc::syscall()
+    // call. After FS is zeroed, ANY Rust-generated code that accesses
+    // %fs:0x28 (stack canary) will SIGSEGV. By doing it in asm, we
+    // guarantee no compiler-generated TLS accesses occur between the
+    // reset and the jump to the new entry point.
+    //
+    // Note: The program break is NOT reset here via a raw brk() syscall
+    // because the kernel's mm->start_brk is fixed at process creation
+    // time and cannot be lowered to the new binary's address range.
+    // Instead, brk is emulated in micro's local_exec handler using the
+    // guest_brk field in MicroState.
+    //
+    // Register strategy: we use r12/r13 to hold stack_pointer/entry_point
+    // across the arch_prctl syscall (syscall clobbers rax, rcx, r11).
+    // r12/r13 are callee-saved and not touched by `syscall`.
+    unsafe {
+        core::arch::asm!(
+            // Save values in callee-saved registers across the syscall.
+            "mov r12, rcx",     // r12 = stack_pointer
+            "mov r13, rdx",     // r13 = entry_point
+            // Reset FS base to 0 via arch_prctl(ARCH_SET_FS, 0).
+            // This lets the new ld-linux set up fresh glibc TLS.
+            // GS base is left intact — it points to micro's own TLS.
+            "mov rax, 158",     // SYS_arch_prctl
+            "mov rdi, 0x1002",  // ARCH_SET_FS
+            "xor rsi, rsi",     // addr = 0
+            "syscall",
+            // Set up new stack and jump.
+            "mov rsp, r12",
+            // Use an absolute jump instead of push+ret to avoid
+            // any potential stack issues.
+            "jmp r13",
+            in("rcx") stack_pointer,
+            in("rdx") entry_point,
+            options(noreturn),
+        );
+    }
+}
+
+/// Maximum number of argv/envp entries supported in execve.
+const MAX_STRINGS: usize = 1024;
+
+/// Split NUL-separated byte data into individual NUL-terminated string slices,
+/// storing results in a caller-provided fixed-size array.
+///
+/// Each returned slice includes its trailing NUL byte.
+/// Returns the number of entries actually written to `out`.
+fn split_nul_strings_into<'a>(
+    data: &'a [u8],
+    count: usize,
+    out: &mut [&'a [u8]; MAX_STRINGS],
+) -> usize {
+    let n = count.min(MAX_STRINGS);
+    let mut pos = 0;
+    let mut written = 0;
+    for _ in 0..n {
+        if pos >= data.len() {
+            break;
+        }
+        // Find the NUL terminator.
+        let end = data[pos..]
+            .iter()
+            .position(|&b| b == 0)
+            .map_or(data.len(), |p| pos + p + 1);
+        out[written] = &data[pos..end];
+        written += 1;
+        pos = end;
+    }
+    written
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn execve_header_size() {
+        // Verify the struct is a reasonable size (no unexpected padding).
+        let size = core::mem::size_of::<ExecveHeader>();
+        assert!(size > 0);
+        // ExecveHeader has: 2*u32 + 4*u64 + 2*u32 + u64 + 2*u32 + 4*u32 + u64
+        // = 8 + 32 + 8 + 8 + 8 + 16 + 8 = 88 bytes
+        assert_eq!(size, 88);
+    }
+
+    #[test]
+    fn execve_segment_size() {
+        let size = core::mem::size_of::<ExecveSegment>();
+        // ExecveSegment: 3*u64 + 2*u32 + u64 = 24 + 8 + 8 = 40 bytes
+        assert_eq!(size, 40);
+    }
+
+    #[test]
+    fn serialize_execve_args_basic() {
+        let mut buf = [0u8; 1024];
+        let path = c"/bin/hello";
+        let arg0 = c"/bin/hello";
+        let arg1 = c"world";
+        let argv: [*const i8; 3] = [arg0.as_ptr(), arg1.as_ptr(), core::ptr::null()];
+        let env0 = c"HOME=/root";
+        let envp: [*const i8; 2] = [env0.as_ptr(), core::ptr::null()];
+
+        let len = unsafe {
+            serialize_execve_args(&mut buf, path, argv.as_ptr(), envp.as_ptr())
+        };
+        assert!(len.is_some());
+        let len = len.unwrap();
+        assert!(len > 0);
+
+        // Verify path length.
+        let path_len = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+        assert_eq!(path_len, 11); // "/bin/hello\0"
+    }
+
+    #[test]
+    fn split_nul_strings_basic() {
+        let data = b"hello\0world\0";
+        let empty: &[u8] = &[];
+        let mut out = [empty; MAX_STRINGS];
+        let count = split_nul_strings_into(data, 2, &mut out);
+        assert_eq!(count, 2);
+        assert_eq!(out[0], b"hello\0");
+        assert_eq!(out[1], b"world\0");
+    }
+
+    #[test]
+    fn build_exec_stack_basic() {
+        // Allocate a test stack.
+        let stack_size: usize = 64 * 1024;
+        let base_ret = unsafe {
+            crate::raw_syscall::mmap(
+                0,
+                stack_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        assert!(!crate::raw_syscall::is_error(base_ret));
+        let base = base_ret as usize;
+
+        let argv: [&[u8]; 2] = [b"./hello\0", b"world\0"];
+        let envp: [&[u8]; 1] = [b"HOME=/root\0"];
+        let header = ExecveHeader {
+            num_segments: 0,
+            pad0: 0,
+            entry_point: 0x400000,
+            at_entry: 0x400000,
+            brk: 0x600000,
+            phdr_addr: 0x400040,
+            phnum: 4,
+            phent: 56,
+            interp_base: 0,
+            argc: 2,
+            envc: 1,
+            argv_offset: 0,
+            argv_len: 0,
+            envp_offset: 0,
+            envp_len: 0,
+            syscall_entry_point: 0,
+        };
+
+        let sp = build_exec_stack(base, stack_size, &argv, &envp, &header);
+
+        // SP must be 16-byte aligned.
+        assert_eq!(sp % 16, 0, "SP is not 16-byte aligned");
+        assert!(sp >= base);
+        assert!(sp < base + stack_size);
+
+        // Read argc.
+        let argc = unsafe { *(sp as *const usize) };
+        assert_eq!(argc, 2);
+
+        // Clean up.
+        unsafe { crate::raw_syscall::munmap(base, stack_size) };
+    }
+}

@@ -5,9 +5,12 @@
 //! guest syscalls and proxies them to central LiteBox via shared-memory ring
 //! buffer IPC.
 
+pub mod execve;
 pub mod fork;
 pub mod handler;
 pub mod local_exec;
+#[allow(clippy::missing_safety_doc, clippy::cast_sign_loss)]
+pub mod raw_syscall;
 pub mod state;
 pub mod thread;
 pub mod tls;

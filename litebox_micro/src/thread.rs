@@ -66,9 +66,8 @@ extern "C" fn clone_child_entry(arg: *mut libc::c_void) -> libc::c_int {
     // 3. Handle CLONE_SETTLS: set FS base for guest's glibc TLS.
     if bootstrap.original_flags & (libc::CLONE_SETTLS as u64) != 0 && bootstrap.guest_tls != 0 {
         unsafe {
-            libc::syscall(
-                libc::SYS_arch_prctl,
-                0x1002i32, // ARCH_SET_FS
+            crate::raw_syscall::arch_prctl(
+                0x1002, // ARCH_SET_FS
                 bootstrap.guest_tls as usize,
             );
         }

@@ -3,6 +3,7 @@
 
 //! Local execution of syscalls authorized by central.
 
+use crate::raw_syscall;
 use litebox_ipc::ring::{cq_flags, CqEntry};
 
 /// Execute a locally-authorized syscall.
@@ -40,9 +41,9 @@ pub unsafe fn execute_locally(
                 let data_len = cq.data_len as usize;
 
                 // 1. Create anonymous mapping at the address central chose.
-                let ptr = unsafe {
-                    libc::mmap(
-                        map_addr as *mut libc::c_void,
+                let ptr_ret = unsafe {
+                    raw_syscall::mmap(
+                        map_addr,
                         map_len,
                         libc::PROT_READ | libc::PROT_WRITE,
                         libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
@@ -50,7 +51,7 @@ pub unsafe fn execute_locally(
                         0,
                     )
                 };
-                if ptr == libc::MAP_FAILED {
+                if raw_syscall::is_error(ptr_ret) {
                     return -i64::from(libc::ENOMEM);
                 }
 
@@ -60,13 +61,13 @@ pub unsafe fn execute_locally(
                         let data_src = ring_base
                             .add(layout.data_region_offset)
                             .add(cq.data_offset as usize);
-                        core::ptr::copy_nonoverlapping(data_src, ptr.cast::<u8>(), data_len);
+                        core::ptr::copy_nonoverlapping(data_src, ptr_ret as *mut u8, data_len);
                     }
                 }
 
                 // 3. Set final permissions (skip if already RW).
                 if final_prot != (libc::PROT_READ | libc::PROT_WRITE) {
-                    unsafe { libc::mprotect(ptr, map_len, final_prot) };
+                    unsafe { raw_syscall::mprotect(ptr_ret as usize, map_len, final_prot) };
                 }
 
                 // 4. If TRAMPOLINE flag is set, map the trampoline page for
@@ -97,9 +98,9 @@ pub unsafe fn execute_locally(
                         let tramp_page_size = (tramp_size + 0xFFF) & !0xFFF;
 
                         // Map anonymous writable page at the trampoline address.
-                        let tramp_ptr = unsafe {
-                            libc::mmap(
-                                tramp_addr as *mut libc::c_void,
+                        let tramp_ret = unsafe {
+                            raw_syscall::mmap(
+                                tramp_addr,
                                 tramp_page_size,
                                 libc::PROT_READ | libc::PROT_WRITE,
                                 libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
@@ -107,12 +108,12 @@ pub unsafe fn execute_locally(
                                 0,
                             )
                         };
-                        if tramp_ptr != libc::MAP_FAILED {
+                        if !raw_syscall::is_error(tramp_ret) {
                             // Copy trampoline code from the data region.
                             unsafe {
                                 core::ptr::copy_nonoverlapping(
                                     tramp_data_src,
-                                    tramp_ptr.cast::<u8>(),
+                                    tramp_ret as *mut u8,
                                     tramp_size,
                                 );
                             }
@@ -121,13 +122,13 @@ pub unsafe fn execute_locally(
                             // 8 bytes of the trampoline, used by the rewritten
                             // `JMP [RIP+disp]` instructions).
                             unsafe {
-                                *(tramp_ptr.cast::<u64>()) = syscall_entry_point as u64;
+                                *(tramp_ret as *mut u64) = syscall_entry_point as u64;
                             }
 
                             // Protect as read + execute.
                             unsafe {
-                                libc::mprotect(
-                                    tramp_ptr,
+                                raw_syscall::mprotect(
+                                    tramp_ret as usize,
                                     tramp_page_size,
                                     libc::PROT_READ | libc::PROT_EXEC,
                                 );
@@ -141,8 +142,7 @@ pub unsafe fn execute_locally(
                 // Anonymous mmap: central chose the address via PageManager.
                 // Use MAP_FIXED at central's chosen address.
                 unsafe {
-                    libc::syscall(
-                        libc::SYS_mmap,
+                    raw_syscall::mmap(
                         cq.result as usize,
                         args[1] as usize,
                         args[2] as i32,
@@ -154,8 +154,7 @@ pub unsafe fn execute_locally(
             } else {
                 // cq.result == 0: execute with original args (fallback).
                 unsafe {
-                    libc::syscall(
-                        libc::SYS_mmap,
+                    raw_syscall::mmap(
                         args[0] as usize,
                         args[1] as usize,
                         args[2] as i32,
@@ -167,47 +166,82 @@ pub unsafe fn execute_locally(
             }
         }
         nr if nr == libc::SYS_munmap as u32 => unsafe {
-            libc::syscall(libc::SYS_munmap, args[0] as usize, args[1] as usize)
+            raw_syscall::munmap(args[0] as usize, args[1] as usize)
         },
         nr if nr == libc::SYS_mprotect as u32 => unsafe {
-            libc::syscall(
-                libc::SYS_mprotect,
-                args[0] as usize,
-                args[1] as usize,
-                args[2] as i32,
-            )
+            raw_syscall::mprotect(args[0] as usize, args[1] as usize, args[2] as i32)
         },
         nr if nr == libc::SYS_mremap as u32 => unsafe {
-            libc::syscall(
+            raw_syscall::syscall5(
                 libc::SYS_mremap,
-                args[0] as usize,
-                args[1] as usize,
-                args[2] as usize,
-                args[3] as i32,
-                args[4] as usize,
+                args[0],
+                args[1],
+                args[2],
+                args[3],
+                args[4],
             )
         },
         nr if nr == libc::SYS_madvise as u32 => unsafe {
-            libc::syscall(
-                libc::SYS_madvise,
-                args[0] as usize,
-                args[1] as usize,
-                args[2] as i32,
-            )
+            raw_syscall::syscall3(libc::SYS_madvise, args[0], args[1], args[2])
         },
-        nr if nr == libc::SYS_brk as u32 => unsafe {
-            libc::syscall(libc::SYS_brk, args[0] as usize)
-        },
+        nr if nr == libc::SYS_brk as u32 => {
+            let requested = args[0] as usize;
+            let state = unsafe { crate::state::global_micro_state() };
+            let current = state.guest_brk.load(core::sync::atomic::Ordering::Acquire);
+
+            if current == 0 {
+                // Pre-execve: pass through to real brk.
+                unsafe { raw_syscall::syscall1(libc::SYS_brk, requested as u64) }
+            } else if requested == 0 {
+                // brk(0): query current break.
+                current as i64
+            } else if requested > current {
+                // Grow: map anonymous pages from current to requested.
+                let page_current = (current + 0xFFF) & !0xFFF;
+                let page_requested = (requested + 0xFFF) & !0xFFF;
+                if page_requested > page_current {
+                    let ret = unsafe {
+                        raw_syscall::mmap(
+                            page_current,
+                            page_requested - page_current,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                            libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                            -1,
+                            0,
+                        )
+                    };
+                    if raw_syscall::is_error(ret) {
+                        // Return current brk (failure).
+                        return current as i64;
+                    }
+                }
+                state
+                    .guest_brk
+                    .store(requested, core::sync::atomic::Ordering::Release);
+                requested as i64
+            } else if requested < current {
+                // Shrink: unmap pages from requested to current.
+                let page_requested = (requested + 0xFFF) & !0xFFF;
+                let page_current = (current + 0xFFF) & !0xFFF;
+                if page_current > page_requested {
+                    unsafe {
+                        raw_syscall::munmap(page_requested, page_current - page_requested);
+                    }
+                }
+                state
+                    .guest_brk
+                    .store(requested, core::sync::atomic::Ordering::Release);
+                requested as i64
+            } else {
+                // No change.
+                current as i64
+            }
+        }
         nr if nr == libc::SYS_arch_prctl as u32 => unsafe {
-            libc::syscall(libc::SYS_arch_prctl, args[0] as i32, args[1] as usize)
+            raw_syscall::arch_prctl(args[0] as i32, args[1] as usize)
         },
         nr if nr == libc::SYS_write as u32 => unsafe {
-            libc::syscall(
-                libc::SYS_write,
-                args[0] as i32,
-                args[1] as usize,
-                args[2] as usize,
-            )
+            raw_syscall::write(args[0] as i32, args[1] as *const u8, args[2] as usize)
         },
         nr if nr == libc::SYS_read as u32 => {
             if cq.flags & litebox_ipc::ring::cq_flags::HAS_DATA != 0 {
@@ -227,24 +261,17 @@ pub unsafe fn execute_locally(
             } else if cq.result == -i64::from(libc::EBADF) {
                 // EBADF fallback: central's shim doesn't know this fd (e.g. pipe).
                 // Execute read locally — the fd is a real OS fd.
-                unsafe {
-                    libc::syscall(
-                        libc::SYS_read,
-                        args[0] as i32,
-                        args[1] as usize,
-                        args[2] as usize,
-                    )
-                }
+                unsafe { raw_syscall::read(args[0] as i32, args[1] as *mut u8, args[2] as usize) }
             } else {
                 // EOF or other error: return the result directly.
                 cq.result
             }
         }
         nr if nr == libc::SYS_exit_group as u32 => unsafe {
-            libc::syscall(libc::SYS_exit_group, args[0] as i32)
+            raw_syscall::syscall1(libc::SYS_exit_group, args[0])
         },
         nr if nr == libc::SYS_exit as u32 => unsafe {
-            libc::syscall(libc::SYS_exit, args[0] as i32)
+            raw_syscall::syscall1(libc::SYS_exit, args[0])
         },
         nr if nr == libc::SYS_clone as u32 => {
             let flags = args[0];
@@ -291,73 +318,142 @@ pub unsafe fn execute_locally(
                 cq.result
             }
         }
+        nr if nr == libc::SYS_stat as u32 => {
+            if cq.flags & litebox_ipc::ring::cq_flags::HAS_DATA != 0 {
+                // Central stat'd the path and put struct stat in the data region.
+                let guest_buf = args[1] as *mut u8; // arg1 = statbuf for stat
+                let data_len = cq.data_len as usize;
+                if !ring_base.is_null() && data_len > 0 {
+                    unsafe {
+                        let data_src = ring_base
+                            .add(layout.data_region_offset)
+                            .add(cq.data_offset as usize);
+                        core::ptr::copy_nonoverlapping(data_src, guest_buf, data_len);
+                    }
+                }
+                cq.result
+            } else {
+                cq.result
+            }
+        }
+        nr if nr == libc::SYS_lstat as u32 => {
+            if cq.flags & litebox_ipc::ring::cq_flags::HAS_DATA != 0 {
+                // Central lstat'd the path and put struct stat in the data region.
+                let guest_buf = args[1] as *mut u8; // arg1 = statbuf for lstat
+                let data_len = cq.data_len as usize;
+                if !ring_base.is_null() && data_len > 0 {
+                    unsafe {
+                        let data_src = ring_base
+                            .add(layout.data_region_offset)
+                            .add(cq.data_offset as usize);
+                        core::ptr::copy_nonoverlapping(data_src, guest_buf, data_len);
+                    }
+                }
+                cq.result
+            } else {
+                cq.result
+            }
+        }
+        nr if nr == libc::SYS_readlink as u32 => {
+            if cq.flags & litebox_ipc::ring::cq_flags::HAS_DATA != 0 {
+                let guest_buf = args[1] as *mut u8; // arg1 = buf
+                let data_len = cq.data_len as usize;
+                if !ring_base.is_null() && data_len > 0 {
+                    unsafe {
+                        let data_src = ring_base
+                            .add(layout.data_region_offset)
+                            .add(cq.data_offset as usize);
+                        core::ptr::copy_nonoverlapping(data_src, guest_buf, data_len);
+                    }
+                }
+                cq.result
+            } else {
+                cq.result
+            }
+        }
+        nr if nr == libc::SYS_readlinkat as u32 => {
+            if cq.flags & litebox_ipc::ring::cq_flags::HAS_DATA != 0 {
+                let guest_buf = args[2] as *mut u8; // arg2 = buf for readlinkat
+                let data_len = cq.data_len as usize;
+                if !ring_base.is_null() && data_len > 0 {
+                    unsafe {
+                        let data_src = ring_base
+                            .add(layout.data_region_offset)
+                            .add(cq.data_offset as usize);
+                        core::ptr::copy_nonoverlapping(data_src, guest_buf, data_len);
+                    }
+                }
+                cq.result
+            } else {
+                cq.result
+            }
+        }
+        nr if nr == libc::SYS_getdents64 as u32 => {
+            if cq.flags & litebox_ipc::ring::cq_flags::HAS_DATA != 0 {
+                let guest_buf = args[1] as *mut u8; // arg1 = dirp
+                let data_len = cq.data_len as usize;
+                if !ring_base.is_null() && data_len > 0 {
+                    unsafe {
+                        let data_src = ring_base
+                            .add(layout.data_region_offset)
+                            .add(cq.data_offset as usize);
+                        core::ptr::copy_nonoverlapping(data_src, guest_buf, data_len);
+                    }
+                }
+                cq.result
+            } else if cq.result == 0 {
+                // End of directory.
+                0
+            } else {
+                cq.result
+            }
+        }
+        nr if nr == libc::SYS_getcwd as u32 => {
+            if cq.flags & litebox_ipc::ring::cq_flags::HAS_DATA != 0 {
+                let guest_buf = args[0] as *mut u8; // arg0 = buf
+                let data_len = cq.data_len as usize;
+                if !ring_base.is_null() && data_len > 0 {
+                    unsafe {
+                        let data_src = ring_base
+                            .add(layout.data_region_offset)
+                            .add(cq.data_offset as usize);
+                        core::ptr::copy_nonoverlapping(data_src, guest_buf, data_len);
+                    }
+                }
+                cq.result
+            } else {
+                cq.result
+            }
+        }
         nr if nr == libc::SYS_set_tid_address as u32 => unsafe {
-            libc::syscall(libc::SYS_set_tid_address, args[0] as usize)
+            raw_syscall::syscall1(libc::SYS_set_tid_address, args[0])
         },
         nr if nr == libc::SYS_set_robust_list as u32 => unsafe {
-            libc::syscall(
-                libc::SYS_set_robust_list,
-                args[0] as usize,
-                args[1] as usize,
-            )
+            raw_syscall::syscall2(libc::SYS_set_robust_list, args[0], args[1])
         },
         nr if nr == libc::SYS_rseq as u32 => unsafe {
-            libc::syscall(
-                libc::SYS_rseq,
-                args[0] as usize,
-                args[1] as u32,
-                args[2] as i32,
-                args[3] as u32,
-            )
+            raw_syscall::syscall4(libc::SYS_rseq, args[0], args[1], args[2], args[3])
         },
         nr if nr == libc::SYS_prlimit64 as u32 => unsafe {
-            libc::syscall(
-                libc::SYS_prlimit64,
-                args[0] as i32,
-                args[1] as i32,
-                args[2] as usize,
-                args[3] as usize,
-            )
+            raw_syscall::syscall4(libc::SYS_prlimit64, args[0], args[1], args[2], args[3])
         },
         nr if nr == libc::SYS_getrandom as u32 => unsafe {
-            libc::syscall(
-                libc::SYS_getrandom,
-                args[0] as usize,
-                args[1] as usize,
-                args[2] as u32,
-            )
+            raw_syscall::syscall3(libc::SYS_getrandom, args[0], args[1], args[2])
         },
         nr if nr == libc::SYS_rt_sigaction as u32 => unsafe {
-            libc::syscall(
-                libc::SYS_rt_sigaction,
-                args[0] as i32,
-                args[1] as usize,
-                args[2] as usize,
-                args[3] as usize,
-            )
+            raw_syscall::syscall4(libc::SYS_rt_sigaction, args[0], args[1], args[2], args[3])
         },
         nr if nr == libc::SYS_rt_sigprocmask as u32 => unsafe {
-            libc::syscall(
-                libc::SYS_rt_sigprocmask,
-                args[0] as i32,
-                args[1] as usize,
-                args[2] as usize,
-                args[3] as usize,
-            )
+            raw_syscall::syscall4(libc::SYS_rt_sigprocmask, args[0], args[1], args[2], args[3])
         },
         nr if nr == libc::SYS_sched_getaffinity as u32 => unsafe {
-            libc::syscall(
-                libc::SYS_sched_getaffinity,
-                args[0] as i32,
-                args[1] as usize,
-                args[2] as usize,
-            )
+            raw_syscall::syscall3(libc::SYS_sched_getaffinity, args[0], args[1], args[2])
         },
         nr if nr == libc::SYS_clock_gettime as u32 => unsafe {
-            libc::syscall(libc::SYS_clock_gettime, args[0] as i32, args[1] as usize)
+            raw_syscall::syscall2(libc::SYS_clock_gettime, args[0], args[1])
         },
         nr if nr == libc::SYS_gettimeofday as u32 => unsafe {
-            libc::syscall(libc::SYS_gettimeofday, args[0] as usize, args[1] as usize)
+            raw_syscall::syscall2(libc::SYS_gettimeofday, args[0], args[1])
         },
         nr if nr == libc::SYS_pread64 as u32 => {
             if cq.flags & litebox_ipc::ring::cq_flags::HAS_DATA != 0 {
@@ -378,44 +474,36 @@ pub unsafe fn execute_locally(
             }
         }
         nr if nr == libc::SYS_pwrite64 as u32 => unsafe {
-            libc::syscall(
-                libc::SYS_pwrite64,
-                args[0] as i32,
-                args[1] as usize,
-                args[2] as usize,
-                args[3] as i64,
-            )
+            raw_syscall::syscall4(libc::SYS_pwrite64, args[0], args[1], args[2], args[3])
         },
         nr if nr == libc::SYS_wait4 as u32 => unsafe {
-            libc::syscall(
-                libc::SYS_wait4,
-                args[0] as i32,   // pid
-                args[1] as usize, // wstatus
-                args[2] as i32,   // options
-                args[3] as usize, // rusage
-            )
+            raw_syscall::syscall4(libc::SYS_wait4, args[0], args[1], args[2], args[3])
         },
         nr if nr == libc::SYS_pipe2 as u32 => unsafe {
-            libc::syscall(
-                libc::SYS_pipe2,
-                args[0] as usize, // pipefd[2] pointer
-                args[1] as i32,   // flags
-            )
+            raw_syscall::syscall2(libc::SYS_pipe2, args[0], args[1])
         },
         nr if nr == libc::SYS_alarm as u32 => unsafe {
-            libc::syscall(libc::SYS_alarm, args[0] as u32)
+            raw_syscall::syscall1(libc::SYS_alarm, args[0])
+        },
+        nr if nr == libc::SYS_time as u32 => unsafe {
+            raw_syscall::syscall1(libc::SYS_time, args[0])
+        },
+        nr if nr == libc::SYS_uname as u32 => unsafe {
+            raw_syscall::syscall1(libc::SYS_uname, args[0])
+        },
+        nr if nr == libc::SYS_sysinfo as u32 => unsafe {
+            raw_syscall::syscall1(libc::SYS_sysinfo, args[0])
+        },
+        nr if nr == libc::SYS_getrlimit as u32 => unsafe {
+            raw_syscall::syscall2(libc::SYS_getrlimit, args[0], args[1])
+        },
+        nr if nr == libc::SYS_clock_getres as u32 => unsafe {
+            raw_syscall::syscall2(libc::SYS_clock_getres, args[0], args[1])
         },
         nr if nr == libc::SYS_writev as u32 => unsafe {
-            libc::syscall(
-                libc::SYS_writev,
-                args[0] as i32,
-                args[1] as usize,
-                args[2] as i32,
-            )
+            raw_syscall::syscall3(libc::SYS_writev, args[0], args[1], args[2])
         },
-        nr if nr == libc::SYS_close as u32 => unsafe {
-            libc::syscall(libc::SYS_close, args[0] as i32)
-        },
+        nr if nr == libc::SYS_close as u32 => unsafe { raw_syscall::close(args[0] as i32) },
         _ => -i64::from(libc::ENOSYS),
     }
 }

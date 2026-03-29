@@ -41,7 +41,16 @@ fn main() -> anyhow::Result<()> {
 
     // 2. Load the guest ELF binary (need brk for central initialization).
     let syscall_entry = litebox_micro::get_syscall_entry_point();
-    let guest_envp: Vec<&str> = Vec::new(); // empty environment for now
+    // Pass the host environment through to the guest.  Benchmarks such as
+    // `execl` rely on `UB_BINDIR` and other environment variables.
+    let host_env: Vec<String> = std::env::vars()
+        .filter(|(k, _)| {
+            // Filter out launcher-internal vars that should not leak.
+            k != "LITEBOX_CENTRAL_PATH"
+        })
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    let guest_envp: Vec<&str> = host_env.iter().map(String::as_str).collect();
     let loaded = load_elf::load_elf(
         elf_path,
         &guest_argv,

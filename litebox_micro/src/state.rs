@@ -3,6 +3,7 @@
 
 //! Global per-process micro-LiteBox state.
 
+use core::sync::atomic::AtomicUsize;
 use litebox_ipc::ring::SharedRingLayout;
 
 #[repr(C)]
@@ -20,6 +21,11 @@ pub struct MicroState {
     /// 8 bytes of each trampoline page so the rewritten `JMP [RIP+disp]`
     /// reaches the handler.
     pub syscall_entry_point: usize,
+    /// Emulated program break for the guest. After execve, the kernel's real
+    /// brk cannot be moved to the new binary's address range (it stays at the
+    /// host's original brk). This field tracks a virtual brk that starts at
+    /// the end of the new binary's segments and grows via mmap.
+    pub guest_brk: AtomicUsize,
 }
 
 unsafe impl Send for MicroState {}
@@ -34,6 +40,7 @@ static mut MICRO_STATE: MicroState = MicroState {
     central_pid: 0,
     layout: SharedRingLayout::new(0),
     syscall_entry_point: 0,
+    guest_brk: AtomicUsize::new(0),
 };
 
 /// Initialize the global micro-LiteBox state.
@@ -101,6 +108,7 @@ impl MicroState {
             central_pid: 0,
             layout: SharedRingLayout::new(0),
             syscall_entry_point: 0,
+            guest_brk: AtomicUsize::new(0),
         }
     }
 }

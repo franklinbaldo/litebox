@@ -63,6 +63,15 @@ pub const MSG_CHILD_READY: u32 = MSG_BASE + 3;
 /// - `result`: 0 on acknowledgement (central recorded the result).
 pub const MSG_LOCAL_RESULT: u32 = MSG_BASE + 4;
 
+/// Micro signals readiness for the next execve data chunk.
+///
+/// **SQ args:**
+/// - `args[0]`: chunk index being requested.
+///
+/// **CQ result:**
+/// - Contains chunk data in the data region (HAS_DATA flag set).
+pub const MSG_EXECVE_READY: u32 = MSG_BASE + 5;
+
 /// Returns `true` if `syscall_nr` is a control message (>= [`MSG_BASE`])
 /// rather than a real Linux syscall number.
 pub const fn is_control_message(syscall_nr: u32) -> bool {

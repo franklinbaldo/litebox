@@ -16,24 +16,18 @@ use crate::trampoline::SyscallArgs;
 
 fn futex_wait(addr: &core::sync::atomic::AtomicU32, expected: u32) {
     unsafe {
-        libc::syscall(
-            libc::SYS_futex,
+        crate::raw_syscall::futex4(
             core::ptr::from_ref(addr) as usize,
             libc::FUTEX_WAIT,
             expected,
-            core::ptr::null::<libc::timespec>(),
+            0,
         );
     }
 }
 
 fn futex_wake(addr: &core::sync::atomic::AtomicU32) {
     unsafe {
-        libc::syscall(
-            libc::SYS_futex,
-            core::ptr::from_ref(addr) as usize,
-            libc::FUTEX_WAKE,
-            1i32,
-        );
+        crate::raw_syscall::futex4(core::ptr::from_ref(addr) as usize, libc::FUTEX_WAKE, 1, 0);
     }
 }
 
@@ -217,6 +211,12 @@ unsafe fn report_local_result(tls: *mut MicroTls, original_seq: u64, result: i64
 pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
     let args = unsafe { &*args };
     let tls = unsafe { crate::tls::current_tls() };
+
+    // Execve: special handling — serialize args and manage the exec protocol.
+    #[allow(clippy::cast_possible_truncation)]
+    if args.nr as u32 == libc::SYS_execve as u32 {
+        return unsafe { crate::execve::handle_execve(tls, args) };
+    }
 
     let cq = unsafe {
         submit_and_wait(

@@ -14,3 +14,9 @@ fork_dynamic_rootfs/
 context1
 context1.tar
 context1_rootfs/
+pipe_nolibc
+pipe_nolibc.hooked
+pipe_fork_nolibc
+pipe_fork_nolibc.hooked
+signal_alarm
+signal_alarm.hooked

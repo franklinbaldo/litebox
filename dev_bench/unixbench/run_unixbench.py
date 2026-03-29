@@ -572,6 +572,11 @@ def run_micro(
     timeout = duration * 3 + 30 if bench.uses_alarm else duration * 10 + 60
     env = os.environ.copy()
     env["LITEBOX_CENTRAL_PATH"] = str(central_path)
+
+    # The launcher passes its environment to the guest.  Set variables that
+    # benchmarks need (paths are relative to the virtual rootfs, not the host).
+    if bench.name == "execl":
+        env["UB_BINDIR"] = "/pgms"
     try:
         result = subprocess.run(
             cmd, capture_output=True, timeout=timeout, env=env,

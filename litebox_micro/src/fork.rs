@@ -44,27 +44,27 @@ pub unsafe fn handle_fork(cq: &CqEntry) -> i64 {
     // Central created the memfd WITHOUT MFD_CLOEXEC so it is accessible here.
     let mut path_buf = [0u8; 64];
     format_proc_fd_path(&mut path_buf, central_pid, child_ring_fd_in_central);
-    let local_fd = unsafe { libc::open(path_buf.as_ptr().cast(), libc::O_RDWR) };
-    if local_fd < 0 {
-        return -i64::from(unsafe { *libc::__errno_location() });
+    let local_fd = unsafe { crate::raw_syscall::open(path_buf.as_ptr(), libc::O_RDWR) };
+    if crate::raw_syscall::is_error(local_fd) {
+        return local_fd;
     }
 
     // dup2 to reserved fd so both parent and child have a well-known fd number.
-    let dup_ret = unsafe { libc::dup2(local_fd, RESERVED_CHILD_FD) };
+    let dup_ret = unsafe { libc::dup2(local_fd as i32, RESERVED_CHILD_FD) };
     if dup_ret < 0 {
         let e = -i64::from(unsafe { *libc::__errno_location() });
-        unsafe { libc::close(local_fd) };
+        unsafe { crate::raw_syscall::close(local_fd as i32) };
         return e;
     }
-    if local_fd != RESERVED_CHILD_FD {
-        unsafe { libc::close(local_fd) };
+    if local_fd as i32 != RESERVED_CHILD_FD {
+        unsafe { crate::raw_syscall::close(local_fd as i32) };
     }
 
     let pid = unsafe { libc::fork() };
 
     if pid < 0 {
         let errno = unsafe { *libc::__errno_location() };
-        unsafe { libc::close(RESERVED_CHILD_FD) };
+        unsafe { crate::raw_syscall::close(RESERVED_CHILD_FD) };
         return -i64::from(errno);
     }
 
@@ -74,7 +74,7 @@ pub unsafe fn handle_fork(cq: &CqEntry) -> i64 {
         0
     } else {
         // PARENT
-        unsafe { libc::close(RESERVED_CHILD_FD) };
+        unsafe { crate::raw_syscall::close(RESERVED_CHILD_FD) };
         // Return the real OS child PID so the guest can waitpid() on it.
         // Central's assigned PID is used only for internal bookkeeping.
         i64::from(pid)
@@ -131,14 +131,14 @@ unsafe fn post_fork_child(child_ring_fd: i32, child_pid: u32) {
 
     // 1. Unmap parent's ring buffer.
     if !micro.ring_base.is_null() && micro.ring_size > 0 {
-        unsafe { libc::munmap(micro.ring_base.cast(), micro.ring_size) };
+        unsafe { crate::raw_syscall::munmap(micro.ring_base as usize, micro.ring_size) };
     }
 
     // 2. Map child's new ring buffer.
     let layout = SharedRingLayout::default_layout();
     let new_base = unsafe {
-        libc::mmap(
-            core::ptr::null_mut(),
+        crate::raw_syscall::mmap(
+            0,
             layout.total_size,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_SHARED,
@@ -146,10 +146,13 @@ unsafe fn post_fork_child(child_ring_fd: i32, child_pid: u32) {
             0,
         )
     };
-    assert_ne!(new_base, libc::MAP_FAILED, "child: mmap of new ring failed");
+    assert!(
+        !crate::raw_syscall::is_error(new_base),
+        "child: mmap of new ring failed"
+    );
 
     // 3. Update global micro state.
-    micro.ring_base = new_base.cast();
+    micro.ring_base = new_base as *mut u8;
     micro.ring_size = layout.total_size;
     micro.ring_fd = child_ring_fd;
     micro.pid = child_pid;
@@ -172,7 +175,7 @@ unsafe fn post_fork_child(child_ring_fd: i32, child_pid: u32) {
     }
 
     // 6. Close the reserved fd — the ring is now mapped, fd no longer needed.
-    unsafe { libc::close(child_ring_fd) };
+    unsafe { crate::raw_syscall::close(child_ring_fd) };
 }
 
 #[cfg(test)]
