@@ -289,6 +289,57 @@ unsafe fn report_local_result(tls: *mut MicroTls, original_seq: u64, result: i64
     }
 }
 
+/// Returns `true` if this syscall can be executed entirely within micro
+/// without consulting central. These are syscalls where central provably
+/// does zero work — it always returns `EXEC_LOCAL` with no shim dispatch,
+/// no state update, and no side effects.
+#[allow(clippy::cast_possible_truncation)]
+fn is_micro_local(nr: u32) -> bool {
+    matches!(
+        i64::from(nr),
+        // Process/user identity: return kernel constants
+        libc::SYS_getpid
+            | libc::SYS_getppid
+            | libc::SYS_getuid
+            | libc::SYS_getgid
+            | libc::SYS_geteuid
+            | libc::SYS_getegid
+            // Time: read-only kernel state, writes to guest buffer
+            | libc::SYS_clock_gettime
+            | libc::SYS_gettimeofday
+            | libc::SYS_time
+            | libc::SYS_clock_getres
+            // Sleep: blocking, no shared state
+            | libc::SYS_nanosleep
+            | libc::SYS_clock_nanosleep
+            // Thread setup: thread-local only
+            | libc::SYS_arch_prctl
+            | libc::SYS_set_tid_address
+            | libc::SYS_set_robust_list
+            | libc::SYS_rseq
+            // Signals: process-local signal state
+            | libc::SYS_rt_sigaction
+            | libc::SYS_rt_sigprocmask
+            | libc::SYS_sigaltstack
+            | libc::SYS_rt_sigsuspend
+            | libc::SYS_alarm
+            // Random/info: write to guest buffer, no shared state
+            | libc::SYS_getrandom
+            | libc::SYS_sched_getaffinity
+            | libc::SYS_prlimit64
+            | libc::SYS_uname
+            | libc::SYS_sysinfo
+            | libc::SYS_getrlimit
+            | libc::SYS_mincore
+            // Process wait: must run in micro's PID namespace
+            | libc::SYS_wait4
+            // Pipe creation: real OS pipes, no shim state
+            | libc::SYS_pipe2
+            // Filesystem sync: no arguments
+            | libc::SYS_sync
+    )
+}
+
 /// Main syscall handler called from the assembly trampoline.
 ///
 /// # Safety
@@ -305,6 +356,25 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
     #[allow(clippy::cast_possible_truncation)]
     if args.nr as u32 == libc::SYS_execve as u32 {
         return unsafe { crate::execve::handle_execve(tls, args) };
+    }
+
+    // Micro-local fast-path: syscalls that central always stamps EXEC_LOCAL
+    // with zero work. Execute directly without any ring-buffer round-trip.
+    #[allow(clippy::cast_possible_truncation)]
+    let nr = args.nr as u32;
+    if is_micro_local(nr) {
+        return unsafe { crate::local_exec::execute_micro_local(nr, &args.args) };
+    }
+
+    // brk fast-path: post-execve, brk is entirely managed by micro's
+    // guest_brk watermark. Central does zero work for brk.
+    if nr == libc::SYS_brk as u32 {
+        let state = unsafe { crate::state::global_micro_state() };
+        let current = state.guest_brk.load(core::sync::atomic::Ordering::Acquire);
+        if current != 0 {
+            return unsafe { crate::local_exec::execute_micro_local(nr, &args.args) };
+        }
+        // Pre-execve: fall through to central round-trip.
     }
 
     let cq = unsafe {

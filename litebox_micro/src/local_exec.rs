@@ -556,6 +556,172 @@ pub unsafe fn execute_locally(
     }
 }
 
+/// Execute a micro-local syscall directly, without consulting central.
+///
+/// # Safety
+///
+/// The caller must ensure `syscall_nr` and `args` describe a valid syscall
+/// that is in the micro-local set (or brk post-execve).
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::too_many_lines
+)]
+pub unsafe fn execute_micro_local(syscall_nr: u32, args: &[u64; 6]) -> i64 {
+    match syscall_nr {
+        // Process/user identity: simple queries, no pointers
+        nr if nr == libc::SYS_getpid as u32 => unsafe { raw_syscall::syscall0(libc::SYS_getpid) },
+        nr if nr == libc::SYS_getppid as u32 => unsafe { raw_syscall::syscall0(libc::SYS_getppid) },
+        nr if nr == libc::SYS_getuid as u32 => unsafe { raw_syscall::syscall0(libc::SYS_getuid) },
+        nr if nr == libc::SYS_getgid as u32 => unsafe { raw_syscall::syscall0(libc::SYS_getgid) },
+        nr if nr == libc::SYS_geteuid as u32 => unsafe { raw_syscall::syscall0(libc::SYS_geteuid) },
+        nr if nr == libc::SYS_getegid as u32 => unsafe { raw_syscall::syscall0(libc::SYS_getegid) },
+        // Time: read-only kernel state, writes to guest buffer
+        nr if nr == libc::SYS_clock_gettime as u32 => unsafe {
+            raw_syscall::syscall2(libc::SYS_clock_gettime, args[0], args[1])
+        },
+        nr if nr == libc::SYS_gettimeofday as u32 => unsafe {
+            raw_syscall::syscall2(libc::SYS_gettimeofday, args[0], args[1])
+        },
+        nr if nr == libc::SYS_time as u32 => unsafe {
+            raw_syscall::syscall1(libc::SYS_time, args[0])
+        },
+        nr if nr == libc::SYS_clock_getres as u32 => unsafe {
+            raw_syscall::syscall2(libc::SYS_clock_getres, args[0], args[1])
+        },
+        // Sleep: blocking, no shared state
+        nr if nr == libc::SYS_nanosleep as u32 => unsafe {
+            raw_syscall::syscall2(libc::SYS_nanosleep, args[0], args[1])
+        },
+        nr if nr == libc::SYS_clock_nanosleep as u32 => unsafe {
+            raw_syscall::syscall4(
+                libc::SYS_clock_nanosleep,
+                args[0],
+                args[1],
+                args[2],
+                args[3],
+            )
+        },
+        // Thread setup: thread-local only
+        nr if nr == libc::SYS_arch_prctl as u32 => unsafe {
+            raw_syscall::arch_prctl(args[0] as i32, args[1] as usize)
+        },
+        nr if nr == libc::SYS_set_tid_address as u32 => unsafe {
+            raw_syscall::syscall1(libc::SYS_set_tid_address, args[0])
+        },
+        nr if nr == libc::SYS_set_robust_list as u32 => unsafe {
+            raw_syscall::syscall2(libc::SYS_set_robust_list, args[0], args[1])
+        },
+        nr if nr == libc::SYS_rseq as u32 => unsafe {
+            raw_syscall::syscall4(libc::SYS_rseq, args[0], args[1], args[2], args[3])
+        },
+        // Signals: process-local signal state
+        nr if nr == libc::SYS_rt_sigaction as u32 => unsafe {
+            raw_syscall::syscall4(libc::SYS_rt_sigaction, args[0], args[1], args[2], args[3])
+        },
+        nr if nr == libc::SYS_rt_sigprocmask as u32 => unsafe {
+            raw_syscall::syscall4(libc::SYS_rt_sigprocmask, args[0], args[1], args[2], args[3])
+        },
+        nr if nr == libc::SYS_sigaltstack as u32 => unsafe {
+            raw_syscall::syscall2(libc::SYS_sigaltstack, args[0], args[1])
+        },
+        nr if nr == libc::SYS_rt_sigsuspend as u32 => unsafe {
+            raw_syscall::syscall2(libc::SYS_rt_sigsuspend, args[0], args[1])
+        },
+        nr if nr == libc::SYS_alarm as u32 => unsafe {
+            raw_syscall::syscall1(libc::SYS_alarm, args[0])
+        },
+        // Random/info: write to guest buffer, no shared state
+        nr if nr == libc::SYS_getrandom as u32 => unsafe {
+            raw_syscall::syscall3(libc::SYS_getrandom, args[0], args[1], args[2])
+        },
+        nr if nr == libc::SYS_sched_getaffinity as u32 => unsafe {
+            raw_syscall::syscall3(libc::SYS_sched_getaffinity, args[0], args[1], args[2])
+        },
+        nr if nr == libc::SYS_prlimit64 as u32 => unsafe {
+            raw_syscall::syscall4(libc::SYS_prlimit64, args[0], args[1], args[2], args[3])
+        },
+        nr if nr == libc::SYS_uname as u32 => unsafe {
+            raw_syscall::syscall1(libc::SYS_uname, args[0])
+        },
+        nr if nr == libc::SYS_sysinfo as u32 => unsafe {
+            raw_syscall::syscall1(libc::SYS_sysinfo, args[0])
+        },
+        nr if nr == libc::SYS_getrlimit as u32 => unsafe {
+            raw_syscall::syscall2(libc::SYS_getrlimit, args[0], args[1])
+        },
+        nr if nr == libc::SYS_mincore as u32 => unsafe {
+            raw_syscall::syscall3(libc::SYS_mincore, args[0], args[1], args[2])
+        },
+        // Process wait: must run in micro's PID namespace
+        nr if nr == libc::SYS_wait4 as u32 => unsafe {
+            raw_syscall::syscall4(libc::SYS_wait4, args[0], args[1], args[2], args[3])
+        },
+        // Pipe creation: real OS pipes, no shim state
+        nr if nr == libc::SYS_pipe2 as u32 => unsafe {
+            raw_syscall::syscall2(libc::SYS_pipe2, args[0], args[1])
+        },
+        // Filesystem sync: no arguments
+        nr if nr == libc::SYS_sync as u32 => unsafe { raw_syscall::syscall0(libc::SYS_sync) },
+        // brk: post-execve, managed entirely by micro's guest_brk watermark
+        nr if nr == libc::SYS_brk as u32 => {
+            let requested = args[0] as usize;
+            let state = unsafe { crate::state::global_micro_state() };
+            let current = state.guest_brk.load(core::sync::atomic::Ordering::Acquire);
+
+            if current == 0 {
+                // Pre-execve: pass through to real brk.
+                unsafe { raw_syscall::syscall1(libc::SYS_brk, requested as u64) }
+            } else if requested == 0 {
+                // brk(0): query current break.
+                current as i64
+            } else if requested > current {
+                // Grow: map anonymous pages from current to requested.
+                let page_current = (current + 0xFFF) & !0xFFF;
+                let page_requested = (requested + 0xFFF) & !0xFFF;
+                if page_requested > page_current {
+                    let ret = unsafe {
+                        raw_syscall::mmap(
+                            page_current,
+                            page_requested - page_current,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                            libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                            -1,
+                            0,
+                        )
+                    };
+                    if raw_syscall::is_error(ret) {
+                        // Return current brk (failure).
+                        return current as i64;
+                    }
+                }
+                state
+                    .guest_brk
+                    .store(requested, core::sync::atomic::Ordering::Release);
+                requested as i64
+            } else if requested < current {
+                // Shrink: unmap pages from requested to current.
+                let page_requested = (requested + 0xFFF) & !0xFFF;
+                let page_current = (current + 0xFFF) & !0xFFF;
+                if page_current > page_requested {
+                    unsafe {
+                        raw_syscall::munmap(page_requested, page_current - page_requested);
+                    }
+                }
+                state
+                    .guest_brk
+                    .store(requested, core::sync::atomic::Ordering::Release);
+                requested as i64
+            } else {
+                // No change.
+                current as i64
+            }
+        }
+        _ => -i64::from(libc::ENOSYS),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
