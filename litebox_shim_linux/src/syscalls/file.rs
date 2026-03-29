@@ -9,7 +9,7 @@ use alloc::{
     vec,
 };
 use litebox::{
-    event::{Events, wait::WaitError},
+    event::{wait::WaitError, Events},
     fd::{FdEnabledSubsystem, MetadataError, TypedFd},
     fs::{Mode, OFlags, SeekWhence},
     path,
@@ -17,8 +17,8 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
-    AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, IoReadVec,
-    IoWriteVec, IoctlArg, TimeParam, errno::Errno,
+    errno::Errno, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
+    IoReadVec, IoWriteVec, IoctlArg, TimeParam,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -63,6 +63,9 @@ pub(crate) struct FilesState<FS: ShimFS> {
     pub(crate) raw_descriptor_store:
         litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>,
     max_fd: AtomicUsize,
+    /// Minimum fd for new allocations. For fork children whose stdio fds are
+    /// real OS pipes, this is set to 3 so the shim doesn't allocate fd 0/1/2.
+    min_alloc_fd: AtomicUsize,
 }
 
 impl<FS: ShimFS> FilesState<FS> {
@@ -73,11 +76,19 @@ impl<FS: ShimFS> FilesState<FS> {
                 litebox::fd::RawDescriptorStorage::new(),
             ),
             max_fd: AtomicUsize::new(usize::MAX),
+            min_alloc_fd: AtomicUsize::new(0),
         }
     }
 
     pub(crate) fn set_max_fd(&self, max_fd: usize) {
         self.max_fd.store(max_fd, Ordering::Relaxed);
+    }
+
+    /// Set the minimum fd for new allocations. Used for fork children whose
+    /// stdio fds (0/1/2) are real OS pipes — the shim must not allocate those
+    /// slots so they remain unknown (EBADF) and fall back to EXEC_LOCAL.
+    pub(crate) fn set_min_alloc_fd(&self, min_fd: usize) {
+        self.min_alloc_fd.store(min_fd, Ordering::Relaxed);
     }
 
     // Returns Ok(raw_fd) if it fits within the max limits already set up; otherwise returns the
@@ -89,7 +100,8 @@ impl<FS: ShimFS> FilesState<FS> {
         // XXX(jb): should we try to somehow enforce that it is set at the smallest
         // available/unassigned FD number?
         let mut rds = self.raw_descriptor_store.write();
-        let raw_fd = rds.fd_into_raw_integer(typed_fd);
+        let min_fd = self.min_alloc_fd.load(Ordering::Relaxed);
+        let raw_fd = rds.fd_into_raw_integer_min(typed_fd, min_fd);
         let max_fd = self.max_fd.load(Ordering::Relaxed);
         if raw_fd > max_fd {
             let orig = rds.fd_consume_raw_integer::<Subsystem>(raw_fd).unwrap();
@@ -1192,14 +1204,6 @@ impl<FS: ShimFS> Task<FS> {
                     .flatten()
             }
             FcntlArg::DUPFD { cloexec, min_fd } => {
-                let new_file = self.do_dup(
-                    desc,
-                    if cloexec {
-                        OFlags::CLOEXEC
-                    } else {
-                        OFlags::empty()
-                    },
-                )?;
                 let max_fd = self
                     .process()
                     .limits
@@ -1207,10 +1211,16 @@ impl<FS: ShimFS> Task<FS> {
                 if min_fd as usize >= max_fd {
                     return Err(Errno::EINVAL);
                 }
-                if new_file < min_fd as usize || new_file > max_fd {
-                    self.do_close(new_file)?;
-                    return Err(Errno::EMFILE);
-                }
+                let new_file = self.do_dup_inner(
+                    desc,
+                    if cloexec {
+                        OFlags::CLOEXEC
+                    } else {
+                        OFlags::empty()
+                    },
+                    None,
+                    min_fd as usize,
+                )?;
                 Ok(new_file.try_into().unwrap())
             }
             _ => unimplemented!(),
@@ -1235,8 +1245,8 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle syscall `chdir`
     pub fn sys_chdir(&self, pathname: impl path::Arg) -> Result<(), Errno> {
-        use litebox::fs::FileType;
         use litebox::fs::errors::{FileStatusError, PathError};
+        use litebox::fs::FileType;
         use litebox::path::Arg as _;
 
         // Resolve relative paths against CWD, then normalize (handle `.` / `..`).
@@ -1916,7 +1926,7 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     fn do_dup(&self, file: usize, flags: OFlags) -> Result<usize, Errno> {
-        self.do_dup_inner(file, flags, None)
+        self.do_dup_inner(file, flags, None, 0)
     }
 
     fn do_dup_inner(
@@ -1924,6 +1934,7 @@ impl<FS: ShimFS> Task<FS> {
         file: usize,
         flags: OFlags,
         target: Option<usize>,
+        min_fd: usize,
     ) -> Result<usize, Errno> {
         fn dup<FS: ShimFS, S: FdEnabledSubsystem>(
             global: &GlobalState<FS>,
@@ -1931,6 +1942,7 @@ impl<FS: ShimFS> Task<FS> {
             fd: &TypedFd<S>,
             close_on_exec: bool,
             target: Option<usize>,
+            min_fd: usize,
         ) -> Result<usize, Errno> {
             let mut dt = global.litebox.descriptor_table_mut();
             let fd: TypedFd<_> = dt.duplicate(fd).ok_or(Errno::EBADF)?;
@@ -1945,19 +1957,19 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 Ok(target)
             } else {
-                Ok(rds.fd_into_raw_integer(fd))
+                Ok(rds.fd_into_raw_integer_min(fd, min_fd))
             }
         }
         let close_on_exec = flags.contains(OFlags::CLOEXEC);
         let files = self.files.borrow();
         let new_fd = files.run_on_raw_fd(
             file,
-            |fd| dup(&self.global, &files, fd, close_on_exec, target),
-            |fd| dup(&self.global, &files, fd, close_on_exec, target),
-            |fd| dup(&self.global, &files, fd, close_on_exec, target),
-            |fd| dup(&self.global, &files, fd, close_on_exec, target),
-            |fd| dup(&self.global, &files, fd, close_on_exec, target),
-            |fd| dup(&self.global, &files, fd, close_on_exec, target),
+            |fd| dup(&self.global, &files, fd, close_on_exec, target, min_fd),
+            |fd| dup(&self.global, &files, fd, close_on_exec, target, min_fd),
+            |fd| dup(&self.global, &files, fd, close_on_exec, target, min_fd),
+            |fd| dup(&self.global, &files, fd, close_on_exec, target, min_fd),
+            |fd| dup(&self.global, &files, fd, close_on_exec, target, min_fd),
+            |fd| dup(&self.global, &files, fd, close_on_exec, target, min_fd),
         )??;
         if target.is_none() {
             let max_fd = self
@@ -2019,6 +2031,7 @@ impl<FS: ShimFS> Task<FS> {
                 oldfd_usize,
                 flags.unwrap_or(OFlags::empty()),
                 Some(newfd_usize),
+                0,
             )?;
             Ok(newfd)
         } else {

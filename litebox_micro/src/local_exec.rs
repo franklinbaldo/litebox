@@ -282,6 +282,9 @@ pub unsafe fn execute_locally(
                 unsafe { crate::fork::handle_fork(cq) }
             }
         }
+        nr if nr == libc::SYS_fork as u32 || nr == libc::SYS_vfork as u32 => unsafe {
+            crate::fork::handle_fork(cq)
+        },
         nr if nr == libc::SYS_fstat as u32 => {
             if cq.flags & litebox_ipc::ring::cq_flags::HAS_DATA != 0 {
                 // Central stat'd the fd and put struct stat in the data region.
@@ -446,6 +449,9 @@ pub unsafe fn execute_locally(
         nr if nr == libc::SYS_rt_sigprocmask as u32 => unsafe {
             raw_syscall::syscall4(libc::SYS_rt_sigprocmask, args[0], args[1], args[2], args[3])
         },
+        nr if nr == libc::SYS_sigaltstack as u32 => unsafe {
+            raw_syscall::syscall2(libc::SYS_sigaltstack, args[0], args[1])
+        },
         nr if nr == libc::SYS_sched_getaffinity as u32 => unsafe {
             raw_syscall::syscall3(libc::SYS_sched_getaffinity, args[0], args[1], args[2])
         },
@@ -454,6 +460,19 @@ pub unsafe fn execute_locally(
         },
         nr if nr == libc::SYS_gettimeofday as u32 => unsafe {
             raw_syscall::syscall2(libc::SYS_gettimeofday, args[0], args[1])
+        },
+        // Sleep: dereference guest timespec struct for duration
+        nr if nr == libc::SYS_nanosleep as u32 => unsafe {
+            raw_syscall::syscall2(libc::SYS_nanosleep, args[0], args[1])
+        },
+        nr if nr == libc::SYS_clock_nanosleep as u32 => unsafe {
+            raw_syscall::syscall4(
+                libc::SYS_clock_nanosleep,
+                args[0],
+                args[1],
+                args[2],
+                args[3],
+            )
         },
         nr if nr == libc::SYS_pread64 as u32 => {
             if cq.flags & litebox_ipc::ring::cq_flags::HAS_DATA != 0 {
@@ -485,6 +504,9 @@ pub unsafe fn execute_locally(
         nr if nr == libc::SYS_alarm as u32 => unsafe {
             raw_syscall::syscall1(libc::SYS_alarm, args[0])
         },
+        nr if nr == libc::SYS_rt_sigsuspend as u32 => unsafe {
+            raw_syscall::syscall2(libc::SYS_rt_sigsuspend, args[0], args[1])
+        },
         nr if nr == libc::SYS_time as u32 => unsafe {
             raw_syscall::syscall1(libc::SYS_time, args[0])
         },
@@ -504,6 +526,32 @@ pub unsafe fn execute_locally(
             raw_syscall::syscall3(libc::SYS_writev, args[0], args[1], args[2])
         },
         nr if nr == libc::SYS_close as u32 => unsafe { raw_syscall::close(args[0] as i32) },
+        // FD manipulation: operates on real OS fds (pipes from pipe2, etc.)
+        nr if nr == libc::SYS_dup as u32 => unsafe {
+            raw_syscall::syscall1(libc::SYS_dup, args[0])
+        },
+        nr if nr == libc::SYS_dup2 as u32 => unsafe {
+            raw_syscall::syscall2(libc::SYS_dup2, args[0], args[1])
+        },
+        nr if nr == libc::SYS_dup3 as u32 => unsafe {
+            raw_syscall::syscall3(libc::SYS_dup3, args[0], args[1], args[2])
+        },
+        nr if nr == libc::SYS_fcntl as u32 => unsafe {
+            raw_syscall::syscall3(libc::SYS_fcntl, args[0], args[1], args[2])
+        },
+        // Process/user identity: simple queries, no pointers
+        nr if nr == libc::SYS_getpid as u32 => unsafe { raw_syscall::syscall0(libc::SYS_getpid) },
+        nr if nr == libc::SYS_getppid as u32 => unsafe { raw_syscall::syscall0(libc::SYS_getppid) },
+        nr if nr == libc::SYS_getuid as u32 => unsafe { raw_syscall::syscall0(libc::SYS_getuid) },
+        nr if nr == libc::SYS_getgid as u32 => unsafe { raw_syscall::syscall0(libc::SYS_getgid) },
+        nr if nr == libc::SYS_geteuid as u32 => unsafe { raw_syscall::syscall0(libc::SYS_geteuid) },
+        nr if nr == libc::SYS_getegid as u32 => unsafe { raw_syscall::syscall0(libc::SYS_getegid) },
+        // Memory query: mincore checks page residency
+        nr if nr == libc::SYS_mincore as u32 => unsafe {
+            raw_syscall::syscall3(libc::SYS_mincore, args[0], args[1], args[2])
+        },
+        // Filesystem sync: no arguments, must run locally
+        nr if nr == libc::SYS_sync as u32 => unsafe { raw_syscall::syscall0(libc::SYS_sync) },
         _ => -i64::from(libc::ENOSYS),
     }
 }

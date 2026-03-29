@@ -347,9 +347,10 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
         // MSG_CHILD_READY.  Sending report_local_result on the child's ring
         // would confuse central, so skip it.
         #[allow(clippy::cast_possible_truncation)]
-        let is_fork_child = args.nr as u32 == libc::SYS_clone as u32
-            && args.args[0] & 0x100 == 0 // no CLONE_VM → fork
-            && result == 0; // child returns 0
+        let is_fork_child = result == 0
+            && (args.nr as u32 == libc::SYS_fork as u32
+                || args.nr as u32 == libc::SYS_vfork as u32
+                || (args.nr as u32 == libc::SYS_clone as u32 && args.args[0] & 0x100 == 0)); // no CLONE_VM → fork
         if !is_fork_child {
             unsafe { report_local_result(tls, cq.seq, result) };
         }

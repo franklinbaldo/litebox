@@ -402,14 +402,29 @@ impl<FS: ShimFS> LinuxShim<FS> {
     /// This is the entry point for `litebox_central`: it creates a [`Task`]
     /// backed by the shim's [`GlobalState`] and the given filesystem, ready
     /// to receive [`dispatch_syscall`](LinuxShimTask::dispatch_syscall) calls.
+    ///
+    /// When `init_stdio` is `true`, fd 0/1/2 are mapped to `/dev/stdin`,
+    /// `/dev/stdout`, `/dev/stderr` in the shared descriptor table. Set this
+    /// to `false` for fork children whose stdio fds are real OS pipes — the
+    /// shim will return EBADF for unknown fds, and central will fall back to
+    /// `EXEC_LOCAL` so micro reads/writes the pipe directly.
     pub fn create_task(
         &self,
         fs: alloc::sync::Arc<FS>,
         params: litebox_common_linux::TaskParams,
+        init_stdio: bool,
     ) -> LinuxShimTask<FS> {
         let files = Arc::new(syscalls::file::FilesState::new(fs));
         files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR - 1);
-        files.initialize_stdio_in_shared_descriptors_table(&self.0);
+        if init_stdio {
+            files.initialize_stdio_in_shared_descriptors_table(&self.0);
+        } else {
+            // For fork children, reserve fd 0/1/2 so the shim allocates new
+            // descriptors starting at fd 3. Reads/writes on 0/1/2 will return
+            // EBADF (not in shim's table), triggering EXEC_LOCAL fallback in
+            // central so micro handles the real OS pipes.
+            files.set_min_alloc_fd(3);
+        }
 
         LinuxShimTask {
             task: Task {
@@ -428,6 +443,50 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 .into(),
                 comm: Cell::new([0; litebox_common_linux::TASK_COMM_LEN]),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
+                files: files.into(),
+                signals: syscalls::signal::SignalState::new_process(),
+            },
+        }
+    }
+
+    /// Create a child task for a fork, inheriting the parent's file
+    /// descriptors and current working directory.
+    ///
+    /// Unlike [`Self::create_task`], this duplicates every open fd from
+    /// `parent_task` into the child's descriptor table, so that the child
+    /// sees the same virtual fd numbers (including redirected stdin/stdout).
+    pub fn fork_task(
+        &self,
+        _fs: alloc::sync::Arc<FS>,
+        params: litebox_common_linux::TaskParams,
+        parent_task: &LinuxShimTask<FS>,
+    ) -> LinuxShimTask<FS> {
+        let parent_files = parent_task.task.files.borrow();
+        let files = parent_files.fork_files_state(&self.0);
+        files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR - 1);
+
+        // Inherit the parent's current working directory and umask.
+        let parent_fs = parent_task.task.fs.borrow();
+        let child_fs_state: Arc<syscalls::file::FsState> =
+            Arc::new((*parent_fs).as_ref().clone());
+
+        LinuxShimTask {
+            task: Task {
+                global: self.0.clone(),
+                thread: syscalls::process::ThreadState::new_process(params.pid),
+                wait_state: wait::WaitState::new(self.0.platform),
+                pid: params.pid,
+                ppid: params.ppid,
+                tid: params.pid,
+                credentials: syscalls::process::Credentials {
+                    uid: params.uid,
+                    euid: params.euid,
+                    gid: params.gid,
+                    egid: params.egid,
+                }
+                .into(),
+                comm: Cell::new([0; litebox_common_linux::TASK_COMM_LEN]),
+                fs: child_fs_state.into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
             },
@@ -545,6 +604,69 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
             return Ok(unix(&fd));
         }
         Err(Errno::EBADF)
+    }
+
+    /// Create a new `FilesState` for a fork child, inheriting all open file
+    /// descriptors from this (parent) state.
+    ///
+    /// Each fd is duplicated in the descriptor table (sharing the underlying
+    /// entry/offset) and placed at the same raw fd number in the child's
+    /// `RawDescriptorStorage`. Per-fd metadata (e.g., `FD_CLOEXEC`) is also
+    /// copied.
+    pub(crate) fn fork_files_state(
+        &self,
+        global: &GlobalState<FS>,
+    ) -> Arc<syscalls::file::FilesState<FS>> {
+        use litebox::fd::FdEnabledSubsystem;
+        use litebox_common_linux::FileDescriptorFlags;
+
+        // Helper: duplicate one fd from parent to child, preserving metadata.
+        fn dup_one<FS2: ShimFS, S: FdEnabledSubsystem>(
+            global: &GlobalState<FS2>,
+            child: &syscalls::file::FilesState<FS2>,
+            parent_fd: &TypedFd<S>,
+            raw_fd: usize,
+        ) {
+            let mut dt = global.litebox.descriptor_table_mut();
+            let Some(new_fd) = dt.duplicate(parent_fd) else {
+                return; // fd was closed concurrently
+            };
+            // Copy FD_CLOEXEC if set on the parent fd.
+            let cloexec = dt
+                .with_metadata(parent_fd, |flags: &FileDescriptorFlags| *flags)
+                .unwrap_or(FileDescriptorFlags::empty());
+            if cloexec.contains(FileDescriptorFlags::FD_CLOEXEC) {
+                let _old = dt.set_fd_metadata(&new_fd, FileDescriptorFlags::FD_CLOEXEC);
+            }
+            drop(dt);
+
+            let mut rds = child.raw_descriptor_store.write();
+            let success = rds.fd_into_specific_raw_integer(new_fd, raw_fd);
+            assert!(success, "child raw fd {raw_fd} already occupied");
+        }
+
+        let child = Arc::new(syscalls::file::FilesState::new(Arc::clone(&self.fs)));
+
+        // Collect alive fds while holding the parent's RDS lock briefly.
+        let alive_fds: Vec<usize> = self.raw_descriptor_store.read().iter_alive().collect();
+
+        for raw_fd in alive_fds {
+            // Use run_on_raw_fd to dispatch by subsystem type.
+            let _ = self.run_on_raw_fd(
+                raw_fd,
+                |fd| dup_one(global, &child, fd, raw_fd),
+                |fd| dup_one(global, &child, fd, raw_fd),
+                |fd| dup_one(global, &child, fd, raw_fd),
+                |fd| dup_one(global, &child, fd, raw_fd),
+                |fd| dup_one(global, &child, fd, raw_fd),
+                |fd| dup_one(global, &child, fd, raw_fd),
+            );
+        }
+
+        // Don't set min_alloc_fd to 3 — the child inherits real virtual fds
+        // at 0/1/2 from the parent. New allocations should start above the
+        // highest inherited fd.
+        child
     }
 }
 

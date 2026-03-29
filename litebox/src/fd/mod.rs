@@ -582,19 +582,32 @@ impl RawDescriptorStorage {
     /// Get the corresponding integer value of the provided `fd`.
     ///
     /// This explicitly consumes the `fd`.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "panics are only within assertions"
-    )]
     pub fn fd_into_raw_integer<Subsystem: FdEnabledSubsystem>(
         &mut self,
         fd: TypedFd<Subsystem>,
     ) -> usize {
+        self.fd_into_raw_integer_min(fd, 0)
+    }
+
+    /// Like [`Self::fd_into_raw_integer`] but the allocated raw FD will be `>= min_fd`.
+    ///
+    /// This is needed for `fcntl(F_DUPFD)` / `fcntl(F_DUPFD_CLOEXEC)` which
+    /// require the new descriptor to be at least `min_fd`.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "panics are only within assertions"
+    )]
+    pub fn fd_into_raw_integer_min<Subsystem: FdEnabledSubsystem>(
+        &mut self,
+        fd: TypedFd<Subsystem>,
+        min_fd: usize,
+    ) -> usize {
         let ret = self
             .stored_fds
             .iter()
+            .skip(min_fd)
             .position(Option::is_none)
-            .unwrap_or(self.stored_fds.len());
+            .map_or(self.stored_fds.len().max(min_fd), |pos| pos + min_fd);
         let success = self.fd_into_specific_raw_integer(fd, ret);
         assert!(success);
         ret

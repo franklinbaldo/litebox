@@ -257,6 +257,12 @@ impl<FS: ShimFS> ProcessServer<FS> {
             return self.handle_fork(entry);
         }
 
+        // fork/vfork: treat as fork (same as clone without CLONE_VM).
+        #[allow(clippy::cast_possible_truncation)]
+        if nr == libc::SYS_fork as u32 || nr == libc::SYS_vfork as u32 {
+            return self.handle_fork(entry);
+        }
+
         // Close: dual-dispatch. Try shim first for fd table cleanup.
         // If shim recognized the fd (returned success), the fd is virtual
         // (tar_ro filesystem) — return 0 directly without local exec.
@@ -273,6 +279,40 @@ impl<FS: ShimFS> ProcessServer<FS> {
             }
             // EBADF from shim: fd is a real OS fd, let micro close it.
             cq.flags = cq_flags::EXEC_LOCAL;
+            return cq;
+        }
+
+        // FD manipulation (dup/dup2/dup3/fcntl): dual-dispatch like close.
+        // The source fd may be a virtual fd in the shim (tar_ro file) or a
+        // real OS fd (pipe from pipe2). Try the shim first; if it returns
+        // EBADF (fd not in shim's table), fall back to local exec so micro
+        // performs the operation on the real OS fd.
+        #[allow(clippy::cast_possible_truncation)]
+        if matches!(
+            i64::from(nr),
+            libc::SYS_dup | libc::SYS_dup2 | libc::SYS_dup3 | libc::SYS_fcntl
+        ) {
+            let mut regs = crate::dispatch::sq_entry_to_ptregs(entry);
+            let shim_result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+            if shim_result >= 0 {
+                // Shim handled it (virtual fd) — return result directly.
+                cq.result = shim_result;
+                return cq;
+            }
+            if shim_result == -i64::from(libc::EBADF) {
+                // Real OS fd — let micro execute locally.
+                cq.flags = cq_flags::EXEC_LOCAL;
+                return cq;
+            }
+            // Other error from shim — pass through.
+            cq.result = shim_result;
+            return cq;
+        }
+
+        // fadvise64: pure hint, always succeeds.  Cannot be dispatched
+        // locally because the fd may be a virtual shim fd.
+        if i64::from(nr) == libc::SYS_fadvise64 {
+            cq.result = 0;
             return cq;
         }
 
@@ -434,7 +474,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
         let child_pid = self.next_child_pid.get();
         self.next_child_pid.set(child_pid + 1);
 
-        // 3. Create child task via the shim.
+        // 3. Create child task via the shim, inheriting parent's fds and cwd.
         let params = litebox_common_linux::TaskParams {
             pid: child_pid,
             ppid: 1, // parent is the main process
@@ -443,7 +483,19 @@ impl<FS: ShimFS> ProcessServer<FS> {
             gid: 0,
             egid: 0,
         };
-        let child_task = self.shim.create_task(self.fs.clone(), params);
+        let child_task = if entry.thread_slot == 0 {
+            self.shim
+                .fork_task(self.fs.clone(), params, &self.primary_task)
+        } else {
+            let tasks = self.thread_tasks.borrow();
+            if let Some(parent) = tasks.get(&entry.thread_slot) {
+                self.shim.fork_task(self.fs.clone(), params, parent)
+            } else {
+                // Shouldn't happen — the forking thread must exist.
+                cq.result = -i64::from(libc::ESRCH);
+                return cq;
+            }
+        };
 
         // 4. Spawn the child server immediately.
         //
@@ -638,6 +690,11 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 // Signal: dereference guest sigaction/sigset structs
                 | libc::SYS_rt_sigaction
                 | libc::SYS_rt_sigprocmask
+                // Signal suspend: must execute locally where real signals
+                // (SIGCHLD from fork children) are delivered.
+                | libc::SYS_rt_sigsuspend
+                // Signal stack: dereference guest stack_t pointers
+                | libc::SYS_sigaltstack
                 // Sched: dereference guest cpu_set buffer
                 | libc::SYS_sched_getaffinity
                 // Time: writes to guest timespec/timeval
@@ -663,6 +720,18 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 | libc::SYS_sysinfo
                 | libc::SYS_getrlimit
                 | libc::SYS_clock_getres
+                // Process/user identity: simple queries with no pointer args.
+                // Must execute locally so the guest sees real UID/GID/PID
+                // values from the OS rather than ENOSYS from the shim.
+                | libc::SYS_getpid
+                | libc::SYS_getppid
+                | libc::SYS_getuid
+                | libc::SYS_getgid
+                | libc::SYS_geteuid
+                | libc::SYS_getegid
+                // Memory query: mincore checks page residency on real OS
+                // pages in the guest's address space.
+                | libc::SYS_mincore
         )
     }
 

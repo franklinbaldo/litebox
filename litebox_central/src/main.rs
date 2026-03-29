@@ -79,8 +79,15 @@ fn main() -> anyhow::Result<()> {
     // Create /tmp on the in-memory layer so guest programs can write
     // temporary files (e.g. fstime benchmark's creat("/tmp/dummy0-...")).
     // This mirrors what litebox_runner_linux_userland does.
+    //
+    // Also make the root directory world-writable so that guest processes
+    // (which run as uid 1000 in the in-mem FS) can create files in the
+    // current working directory (which starts at /).
     in_mem.with_root_privileges(|fs| {
         let mode = litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO;
+        if let Err(err) = fs.chmod("/", mode) {
+            eprintln!("litebox_central: failed to chmod /: {err:?}");
+        }
         if let Err(err) = fs.mkdir("/tmp", mode)
             && !matches!(err, litebox::fs::errors::MkdirError::AlreadyExists)
         {
@@ -117,7 +124,7 @@ fn main() -> anyhow::Result<()> {
         gid: 0,
         egid: 0,
     };
-    let task = shim.create_task(fs.clone(), params);
+    let task = shim.create_task(fs.clone(), params, true);
 
     if args.initial_brk != 0 {
         task.set_initial_brk(args.initial_brk);
