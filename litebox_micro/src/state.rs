@@ -15,6 +15,11 @@ pub struct MicroState {
     /// PID of the central process, used to open child ring fds via `/proc/<pid>/fd/<N>`.
     pub central_pid: u32,
     pub layout: SharedRingLayout,
+    /// Address of `micro_syscall_entry` — the assembly trampoline that
+    /// intercepts rewritten `syscall` instructions. Written into the first
+    /// 8 bytes of each trampoline page so the rewritten `JMP [RIP+disp]`
+    /// reaches the handler.
+    pub syscall_entry_point: usize,
 }
 
 unsafe impl Send for MicroState {}
@@ -28,6 +33,7 @@ static mut MICRO_STATE: MicroState = MicroState {
     ppid: 0,
     central_pid: 0,
     layout: SharedRingLayout::new(0),
+    syscall_entry_point: 0,
 };
 
 /// Initialize the global micro-LiteBox state.
@@ -43,6 +49,7 @@ pub unsafe fn micro_init(
     pid: u32,
     parent_pid: u32,
     central_pid: u32,
+    syscall_entry_point: usize,
 ) {
     unsafe {
         MICRO_STATE.ring_base = ring_base;
@@ -51,6 +58,7 @@ pub unsafe fn micro_init(
         MICRO_STATE.pid = pid;
         MICRO_STATE.ppid = parent_pid;
         MICRO_STATE.central_pid = central_pid;
+        MICRO_STATE.syscall_entry_point = syscall_entry_point;
         // Compute the layout from the ring_size. The data_region_size is the
         // remaining space after header + SQ + CQ entries.
         let base_layout = SharedRingLayout::new(0);
@@ -92,6 +100,7 @@ impl MicroState {
             ppid: 0,
             central_pid: 0,
             layout: SharedRingLayout::new(0),
+            syscall_entry_point: 0,
         }
     }
 }

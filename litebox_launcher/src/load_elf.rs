@@ -135,6 +135,7 @@ pub fn load_elf(
     argv: &[&str],
     envp: &[&str],
     syscall_entry_point: usize,
+    rootfs_prefix: Option<&str>,
 ) -> anyhow::Result<LoadedElf> {
     // ── 1. Open & parse main ELF ───────────────────────────────────────
     let file = RealFile::open(path).map_err(|e| anyhow::anyhow!("open({path}): errno {e}"))?;
@@ -150,7 +151,16 @@ pub fn load_elf(
         .map_err(|e| anyhow::anyhow!("interp({path}): {e}"))?;
 
     let interp_data: Option<(RealFile, ElfParsedFile)> = if let Some(ref name) = interp_cstring {
-        let interp_path = name.to_str().context("interpreter path is not UTF-8")?;
+        let raw_interp_path = name.to_str().context("interpreter path is not UTF-8")?;
+        // When --rootfs-prefix is given, resolve the interpreter relative to
+        // that directory (e.g. /tmp/rootfs + /lib64/ld-linux-x86-64.so.2).
+        let resolved_interp;
+        let interp_path = if let Some(prefix) = rootfs_prefix {
+            resolved_interp = format!("{prefix}{raw_interp_path}");
+            &resolved_interp
+        } else {
+            raw_interp_path
+        };
         let ifile = RealFile::open(interp_path)
             .map_err(|e| anyhow::anyhow!("open({interp_path}): errno {e}"))?;
         let mut iparsed = ElfParsedFile::parse(&mut &ifile)

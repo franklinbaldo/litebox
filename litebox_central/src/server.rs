@@ -17,7 +17,7 @@ use litebox_ipc::messages::{
     self, MSG_CHILD_READY, MSG_FORK_RESULT, MSG_LOCAL_RESULT, MSG_THREAD_DEREGISTER,
     MSG_THREAD_REGISTER,
 };
-use litebox_ipc::ring::{cq_flags, CqEntry, SqEntry, RING_MASK};
+use litebox_ipc::ring::{cq_flags, CqEntry, SqEntry, TrampolineDescriptor, RING_MASK};
 use litebox_ipc::sq::{sq_advance_head, sq_head_index, sq_try_consume};
 use litebox_ipc::wait::spin_then_wait;
 use litebox_shim_linux::ShimFS;
@@ -241,6 +241,14 @@ impl<FS: ShimFS> ProcessServer<FS> {
             return cq;
         }
 
+        // File I/O that produces data: dispatch through shim with a buffer
+        // in the shmem data region, then return EXEC_LOCAL | HAS_DATA so
+        // micro copies the data into the guest's buffer.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        if Self::is_data_producing_io(nr) {
+            return self.handle_data_producing_io(entry);
+        }
+
         // Memory management: dispatch through shim (PageManager state) AND
         // return EXEC_LOCAL so micro creates the real mapping.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -248,12 +256,26 @@ impl<FS: ShimFS> ProcessServer<FS> {
             let mut regs = crate::dispatch::sq_entry_to_ptregs(entry);
             cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
             if cq.result < 0 {
+                // For mprotect/madvise/munmap: the shim's PageManager may not
+                // know about addresses from the launcher's initial ELF loading.
+                // Fall through to EXEC_LOCAL so micro can execute it directly.
+                #[allow(clippy::cast_possible_truncation)]
+                if matches!(
+                    i64::from(nr),
+                    libc::SYS_mprotect | libc::SYS_madvise | libc::SYS_munmap
+                ) {
+                    cq.result = 0; // Clear error; let micro decide.
+                    cq.flags = cq_flags::EXEC_LOCAL;
+                    return cq;
+                }
                 // Shim returned an error — pass it through without EXEC_LOCAL.
                 return cq;
             }
             cq.flags = cq_flags::EXEC_LOCAL;
 
             // For file-backed mmap: copy the populated data into the data region.
+            // Also detect rewritten ELF trampolines and include trampoline data
+            // so micro can map the trampoline page in the guest address space.
             if nr == libc::SYS_mmap as u32 {
                 let flags = entry.args[3] as i32;
                 if flags & libc::MAP_ANONYMOUS == 0 {
@@ -272,16 +294,54 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     cq.flags |= cq_flags::HAS_DATA;
                     cq.data_offset = 0;
                     cq.data_len = copy_len as u32;
+
+                    // For the initial reservation mmap (no MAP_FIXED), check if
+                    // the file is a rewritten ELF with a trampoline section.
+                    #[allow(clippy::cast_possible_truncation)]
+                    if flags & libc::MAP_FIXED == 0 {
+                        let fd = entry.args[4] as i32;
+                        self.try_append_trampoline(entry.thread_slot, fd, copy_len, &mut cq);
+                    }
                 }
             }
             return cq;
         }
 
-        // Syscalls that dereference pathname pointers (openat, access, stat,
-        // etc.) work for paths in ELF-mapped memory (which is also mapped in
-        // central's address space). Guest stack pointers will segfault — a
-        // full solution requires data transfer via the SQ data region.
+        // For pathname syscalls, micro copies the pathname string into the
+        // shared data region (micro's address space holds the guest's memory;
+        // central cannot dereference guest pointers directly). If data_len > 0,
+        // copy the pathname into a local buffer and rewrite the PtRegs argument
+        // to point to it before dispatching to the shim.
+        let mut pathname_buf: Vec<u8> = Vec::new();
         let mut regs = crate::dispatch::sq_entry_to_ptregs(entry);
+
+        if entry.data_len > 0 {
+            let data = self.region.data_region();
+            let offset = entry.data_offset as usize;
+            let len = entry.data_len as usize;
+            if offset + len <= data.len() {
+                pathname_buf.extend_from_slice(&data[offset..offset + len]);
+                let buf_ptr = pathname_buf.as_ptr() as usize;
+                // Determine which register holds the pathname pointer.
+                match i64::from(nr) {
+                    libc::SYS_openat
+                    | libc::SYS_newfstatat
+                    | libc::SYS_faccessat
+                    | libc::SYS_faccessat2 => {
+                        regs.rsi = buf_ptr; // arg1
+                    }
+                    libc::SYS_access
+                    | libc::SYS_stat
+                    | libc::SYS_lstat
+                    | libc::SYS_readlink
+                    | libc::SYS_unlink => {
+                        regs.rdi = buf_ptr; // arg0
+                    }
+                    _ => {} // Unknown — dispatch as-is.
+                }
+            }
+        }
+
         cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
         cq
     }
@@ -367,31 +427,143 @@ impl<FS: ShimFS> ProcessServer<FS> {
         }
     }
 
-    /// Returns `true` for syscalls that involve guest memory pointers.
+    /// Check if the file behind `fd` is a rewritten ELF with a trampoline.
+    /// If so, read the trampoline code and append a `TrampolineDescriptor`
+    /// followed by the trampoline code bytes to the data region (after the
+    /// mmap data that starts at offset 0).
+    ///
+    /// On success, sets `cq_flags::TRAMPOLINE` on the CQ entry.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::field_reassign_with_default
+    )]
+    fn try_append_trampoline(
+        &self,
+        thread_slot: u16,
+        fd: i32,
+        mmap_data_len: usize,
+        cq: &mut CqEntry,
+    ) {
+        /// Trampoline magic: `b"LITEBOX0"` as a little-endian u64.
+        const LITEBOX0_MAGIC: u64 = u64::from_le_bytes(*b"LITEBOX0");
+        /// 64-bit trampoline header size (magic + file_offset + vaddr + size).
+        const HEADER_SIZE: usize = 32;
+
+        // Get file size via fstat (syscall 5).
+        // fstat(fd, statbuf): rdi=fd, rsi=statbuf.
+        // We allocate a local buffer and dispatch through the task.
+        let mut stat_buf = [0u8; 144]; // struct stat is 144 bytes on x86_64
+        {
+            let mut regs = litebox_common_linux::PtRegs::default();
+            regs.orig_rax = libc::SYS_fstat as usize;
+            regs.rdi = fd as usize;
+            regs.rsi = stat_buf.as_mut_ptr() as usize;
+            let result = self.dispatch_to_task(thread_slot, &mut regs);
+            if result < 0 {
+                return;
+            }
+        }
+        // st_size is at offset 48 in struct stat on x86_64 (i64).
+        let file_size = i64::from_le_bytes(stat_buf[48..56].try_into().unwrap());
+        if (file_size as usize) < HEADER_SIZE {
+            return;
+        }
+
+        // Read the trampoline header from the end of the file via pread64.
+        let mut header_buf = [0u8; HEADER_SIZE];
+        let header_offset = file_size - HEADER_SIZE as i64;
+        {
+            let mut regs = litebox_common_linux::PtRegs::default();
+            regs.orig_rax = libc::SYS_pread64 as usize;
+            regs.rdi = fd as usize;
+            regs.rsi = header_buf.as_mut_ptr() as usize;
+            regs.rdx = HEADER_SIZE;
+            regs.r10 = header_offset as usize;
+            let result = self.dispatch_to_task(thread_slot, &mut regs);
+            if result < HEADER_SIZE as i64 {
+                return;
+            }
+        }
+
+        // Check magic.
+        let magic = u64::from_le_bytes(header_buf[0..8].try_into().unwrap());
+        if magic != LITEBOX0_MAGIC {
+            return;
+        }
+
+        // Parse header fields (64-bit): file_offset, vaddr, trampoline_size.
+        let tramp_file_offset = u64::from_le_bytes(header_buf[8..16].try_into().unwrap());
+        let tramp_vaddr = u64::from_le_bytes(header_buf[16..24].try_into().unwrap()) as u32;
+        let tramp_size = u64::from_le_bytes(header_buf[24..32].try_into().unwrap()) as usize;
+
+        if tramp_size == 0 {
+            return;
+        }
+
+        // Check that the data region has enough space for the trampoline
+        // descriptor + code after the mmap data.
+        let desc_size = size_of::<TrampolineDescriptor>();
+        let needed = mmap_data_len + desc_size + tramp_size;
+        let data_region = self.region.data_region_mut();
+        if needed > data_region.len() {
+            eprintln!(
+                "[central] trampoline: data region too small ({needed} > {})",
+                data_region.len()
+            );
+            return;
+        }
+
+        // Write the TrampolineDescriptor (2 × u32 LE) manually to avoid
+        // depending on zerocopy in this crate.
+        data_region[mmap_data_len..mmap_data_len + 4].copy_from_slice(&tramp_vaddr.to_le_bytes());
+        data_region[mmap_data_len + 4..mmap_data_len + desc_size]
+            .copy_from_slice(&(tramp_size as u32).to_le_bytes());
+
+        // Read trampoline code from the file into the data region via pread64.
+        let tramp_dest_ptr = data_region[mmap_data_len + desc_size..].as_mut_ptr();
+        {
+            let mut regs = litebox_common_linux::PtRegs::default();
+            regs.orig_rax = libc::SYS_pread64 as usize;
+            regs.rdi = fd as usize;
+            regs.rsi = tramp_dest_ptr as usize;
+            regs.rdx = tramp_size;
+            regs.r10 = tramp_file_offset as usize;
+            let result = self.dispatch_to_task(thread_slot, &mut regs);
+            if result < tramp_size as i64 {
+                eprintln!("[central] trampoline: pread64 returned {result}, expected {tramp_size}");
+                return;
+            }
+        }
+
+        cq.flags |= cq_flags::TRAMPOLINE;
+    }
+
+    /// Returns `true` for syscalls that involve guest memory pointers
+    /// but do NOT need data transfer through the shmem data region.
     ///
     /// Central cannot dereference guest pointers (separate address space),
     /// so these must be executed locally by micro-LiteBox.
+    ///
+    /// Note: `read`, `pread64`, `fstat`, `newfstatat` are NOT here — they go
+    /// through `is_data_producing_io` instead, which dispatches through the
+    /// shim and transfers data via the shmem data region.
     fn needs_local_exec(nr: u32) -> bool {
         matches!(
             i64::from(nr),
-            // I/O syscalls: dereference guest buffers
-            libc::SYS_read
-                | libc::SYS_write
-                | libc::SYS_readv
+            // I/O syscalls that micro handles locally (writes go directly
+            // to inherited fds like stdout/stderr; scatter/gather I/O is
+            // passed through)
+            libc::SYS_write
                 | libc::SYS_writev
-                | libc::SYS_pread64
                 | libc::SYS_pwrite64
-                | libc::SYS_preadv
                 | libc::SYS_pwritev
-                | libc::SYS_preadv2
                 | libc::SYS_pwritev2
                 | libc::SYS_recvfrom
                 | libc::SYS_sendto
                 | libc::SYS_recvmsg
                 | libc::SYS_sendmsg
-                // Stat syscalls: write to guest stat buffer
-                | libc::SYS_fstat
-                | libc::SYS_newfstatat
                 // Arch/thread syscalls: must execute in guest context
                 | libc::SYS_arch_prctl
                 | libc::SYS_set_tid_address
@@ -425,6 +597,123 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 | libc::SYS_madvise
                 | libc::SYS_brk
         )
+    }
+
+    /// Returns `true` for syscalls where central reads/produces data that must
+    /// be transferred to micro via the shmem data region.
+    ///
+    /// These syscalls are dispatched through the shim (to use central's fd
+    /// table and filesystem), but the output buffer is redirected to the shmem
+    /// data region so micro can copy the result into the guest's memory.
+    fn is_data_producing_io(nr: u32) -> bool {
+        matches!(
+            i64::from(nr),
+            libc::SYS_read
+                | libc::SYS_pread64
+                | libc::SYS_readv
+                | libc::SYS_preadv
+                | libc::SYS_preadv2
+                | libc::SYS_fstat
+                | libc::SYS_newfstatat
+        )
+    }
+
+    /// Handle a data-producing I/O syscall by dispatching through the shim
+    /// with the output buffer pointing into the shmem data region.
+    ///
+    /// Central dispatches the syscall normally (using the shim's fd table),
+    /// but rewrites the guest buffer pointer to point into the data region.
+    /// The shim writes the output there, and central returns `EXEC_LOCAL |
+    /// HAS_DATA` so micro copies the data into the guest's actual buffer.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn handle_data_producing_io(&self, entry: &SqEntry) -> CqEntry {
+        let nr = entry.syscall_nr;
+        let mut cq = Self::base_cq(entry);
+
+        // Get a pointer to the data region for output.
+        let data_region = self.region.data_region_mut();
+        let data_ptr = data_region.as_mut_ptr() as usize;
+
+        let mut regs = crate::dispatch::sq_entry_to_ptregs(entry);
+
+        // For pathname syscalls (newfstatat), also handle pathname transfer.
+        let mut pathname_buf: Vec<u8> = Vec::new();
+        if entry.data_len > 0 {
+            let data = self.region.data_region();
+            let offset = entry.data_offset as usize;
+            let len = entry.data_len as usize;
+            if offset + len <= data.len() {
+                pathname_buf.extend_from_slice(&data[offset..offset + len]);
+            }
+        }
+
+        match i64::from(nr) {
+            libc::SYS_read => {
+                // read(fd, buf, count) — rewrite buf (rsi) to data region.
+                let count = entry.args[2] as usize;
+                let capped = count.min(data_region.len());
+                regs.rsi = data_ptr;
+                regs.rdx = capped;
+                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                if cq.result > 0 {
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.data_offset = 0;
+                    cq.data_len = cq.result as u32;
+                } else if cq.result == 0 {
+                    // EOF — still tell micro, result=0.
+                    cq.flags = cq_flags::EXEC_LOCAL;
+                }
+                // Negative: error, pass through directly.
+            }
+            libc::SYS_pread64 => {
+                // pread64(fd, buf, count, offset) — rewrite buf (rsi).
+                let count = entry.args[2] as usize;
+                let capped = count.min(data_region.len());
+                regs.rsi = data_ptr;
+                regs.rdx = capped;
+                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                if cq.result > 0 {
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.data_offset = 0;
+                    cq.data_len = cq.result as u32;
+                } else if cq.result == 0 {
+                    cq.flags = cq_flags::EXEC_LOCAL;
+                }
+            }
+            libc::SYS_fstat => {
+                // fstat(fd, statbuf) — rewrite statbuf (rsi) to data region.
+                // struct stat is ~144 bytes on x86_64.
+                regs.rsi = data_ptr;
+                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                if cq.result >= 0 {
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.data_offset = 0;
+                    // struct stat is 144 bytes on x86_64 Linux.
+                    cq.data_len = 144;
+                }
+            }
+            libc::SYS_newfstatat => {
+                // newfstatat(dirfd, pathname, statbuf, flags).
+                // Rewrite pathname (rsi) if we have it, statbuf (rdx) to data region.
+                if !pathname_buf.is_empty() {
+                    regs.rsi = pathname_buf.as_ptr() as usize;
+                }
+                regs.rdx = data_ptr;
+                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                if cq.result >= 0 {
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.data_offset = 0;
+                    cq.data_len = 144; // struct stat
+                }
+            }
+            _ => {
+                // For readv/preadv/preadv2 — not yet implemented, fall back
+                // to EXEC_LOCAL (micro will attempt local execution).
+                cq.flags = cq_flags::EXEC_LOCAL;
+            }
+        }
+
+        cq
     }
 
     /// Dispatch a control message from an SQ entry.

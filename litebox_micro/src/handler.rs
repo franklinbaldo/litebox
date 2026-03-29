@@ -49,6 +49,91 @@ unsafe fn ring_ptrs(
     (header, sq_entries, cq_entries)
 }
 
+/// Per-thread region size in the data region for pathname transfer.
+const PATHNAME_REGION_SIZE: usize = 4096;
+
+/// Returns the argument index that contains a pathname pointer for the given
+/// syscall, or `None` if the syscall doesn't carry a pathname argument that
+/// central needs to dereference.
+#[allow(clippy::cast_possible_truncation)]
+fn pathname_arg_index(nr: u32) -> Option<usize> {
+    #[allow(clippy::match_same_arms)] // arms kept separate for per-syscall documentation
+    match i64::from(nr) {
+        libc::SYS_openat => Some(1),   // openat(dirfd, pathname, flags, mode)
+        libc::SYS_access => Some(0),   // access(pathname, mode)
+        libc::SYS_stat => Some(0),     // stat(pathname, statbuf)
+        libc::SYS_lstat => Some(0),    // lstat(pathname, statbuf)
+        libc::SYS_readlink => Some(0), // readlink(pathname, buf, bufsiz)
+        libc::SYS_unlink => Some(0),   // unlink(pathname)
+        libc::SYS_newfstatat
+            if {
+                // newfstatat(dirfd, pathname, statbuf, flags)
+                // Only if pathname != empty string (AT_EMPTY_PATH uses fd only)
+                true
+            } =>
+        {
+            Some(1)
+        }
+        libc::SYS_faccessat => Some(1), // faccessat(dirfd, pathname, mode)
+        libc::SYS_faccessat2 => Some(1), // faccessat2(dirfd, pathname, mode, flags)
+        _ => None,
+    }
+}
+
+/// Copy the pathname string from the guest's memory into the shared data
+/// region. Updates the SQ entry's `data_offset` and `data_len` fields.
+///
+/// Each thread uses a 4 KiB region at `thread_slot * 4096` within the data
+/// region, avoiding conflicts between concurrent threads.
+///
+/// # Safety
+///
+/// The pathname pointer (from `args`) must be a valid C string in the guest's
+/// address space.
+fn copy_pathname_to_data_region(
+    entry: &mut SqEntry,
+    args: &[u64; 6],
+    syscall_nr: u32,
+    ring_base: *mut u8,
+    layout: &SharedRingLayout,
+) {
+    let Some(arg_idx) = pathname_arg_index(syscall_nr) else {
+        return;
+    };
+
+    let pathname_ptr = args[arg_idx] as *const u8;
+    if pathname_ptr.is_null() {
+        return;
+    }
+
+    // Read the pathname as a C string (NUL-terminated) from guest memory.
+    // SAFETY: The guest passed this pointer as a syscall argument, so it
+    // should point to a valid NUL-terminated string in guest memory.
+    let cstr = unsafe { core::ffi::CStr::from_ptr(pathname_ptr.cast()) };
+    let bytes = cstr.to_bytes_with_nul();
+
+    // Compute per-thread offset in the data region.
+    let thread_offset = entry.thread_slot as usize * PATHNAME_REGION_SIZE;
+    let max_len = PATHNAME_REGION_SIZE.min(bytes.len());
+    if thread_offset + max_len > layout.data_region_size {
+        // Data region too small — skip the copy. Central will segfault,
+        // but this shouldn't happen with the default 4 MiB region.
+        return;
+    }
+
+    // Copy into the data region.
+    unsafe {
+        let dst = ring_base.add(layout.data_region_offset + thread_offset);
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, max_len);
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        entry.data_offset = thread_offset as u32;
+        entry.data_len = max_len as u32;
+    }
+}
+
 /// Submit an `SqEntry` and wait for the corresponding `CqEntry`.
 ///
 /// # Safety
@@ -84,6 +169,11 @@ pub(crate) unsafe fn submit_and_wait(
     entry.args = *args;
     entry.data_offset = 0;
     entry.data_len = 0;
+
+    // For pathname syscalls, copy the pathname string from the guest's address
+    // space into the shared data region so central can read it (central is a
+    // separate process and cannot dereference guest pointers directly).
+    copy_pathname_to_data_region(entry, args, syscall_nr, micro.ring_base, &micro.layout);
 
     sq_publish(entry);
     header
@@ -160,6 +250,7 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
                 &cq,
                 micro.ring_base,
                 &micro.layout,
+                micro.syscall_entry_point,
             )
         };
 

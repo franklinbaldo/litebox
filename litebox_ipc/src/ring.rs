@@ -40,6 +40,24 @@ pub mod cq_flags {
     pub const EXEC_LOCAL: u16 = 1 << 0;
     /// The completion carries associated data in the data region.
     pub const HAS_DATA: u16 = 1 << 1;
+    /// The completion includes trampoline data for a dynamically-loaded
+    /// rewritten ELF.  Set alongside `HAS_DATA` on file-backed mmap
+    /// responses.  The data region layout is:
+    ///   `[mmap_data (data_len bytes)][TrampolineDescriptor][trampoline code]`
+    pub const TRAMPOLINE: u16 = 1 << 2;
+}
+
+/// Descriptor appended to the data region when `cq_flags::TRAMPOLINE` is set.
+///
+/// Immediately follows the mmap data (at `data_offset + data_len`).
+/// The trampoline code bytes follow this descriptor.
+#[derive(Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct TrampolineDescriptor {
+    /// Virtual address offset of the trampoline relative to the mmap base.
+    pub vaddr_offset: u32,
+    /// Size of the trampoline code in bytes (follows this descriptor).
+    pub size: u32,
 }
 
 /// A submission queue entry describing a syscall request from guest to host.

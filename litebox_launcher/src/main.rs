@@ -16,15 +16,23 @@ fn main() -> anyhow::Result<()> {
         .find(|a| a.starts_with("--rootfs-tar="))
         .map(|a| a.strip_prefix("--rootfs-tar=").unwrap().to_string());
 
+    // Extract --rootfs-prefix=<dir> for interpreter resolution.
+    let rootfs_prefix = args
+        .iter()
+        .find(|a| a.starts_with("--rootfs-prefix="))
+        .map(|a| a.strip_prefix("--rootfs-prefix=").unwrap().to_string());
+
     // Filter out launcher-only flags from guest argv.
     let guest_argv: Vec<&str> = args[1..]
         .iter()
-        .filter(|a| !a.starts_with("--rootfs-tar="))
+        .filter(|a| !a.starts_with("--rootfs-tar=") && !a.starts_with("--rootfs-prefix="))
         .map(String::as_str)
         .collect();
 
     if guest_argv.is_empty() {
-        anyhow::bail!("Usage: litebox_launcher [--rootfs-tar=<path>] <elf-path> [args...]");
+        anyhow::bail!(
+            "Usage: litebox_launcher [--rootfs-tar=<path>] [--rootfs-prefix=<dir>] <elf-path> [args...]"
+        );
     }
     let elf_path = guest_argv[0];
 
@@ -34,7 +42,13 @@ fn main() -> anyhow::Result<()> {
     // 2. Load the guest ELF binary (need brk for central initialization).
     let syscall_entry = litebox_micro::get_syscall_entry_point();
     let guest_envp: Vec<&str> = Vec::new(); // empty environment for now
-    let loaded = load_elf::load_elf(elf_path, &guest_argv, &guest_envp, syscall_entry)?;
+    let loaded = load_elf::load_elf(
+        elf_path,
+        &guest_argv,
+        &guest_envp,
+        syscall_entry,
+        rootfs_prefix.as_deref(),
+    )?;
 
     // 3. Spawn central process (child inherits the shmem fd + initial brk + rootfs tar).
     let central =
@@ -55,6 +69,7 @@ fn main() -> anyhow::Result<()> {
             1,                              // pid — the guest is process 1
             0,                              // ppid — no parent
             central.pid().cast_unsigned(),   // central_pid — for /proc fd passing
+            syscall_entry,                   // syscall_entry_point
         );
     }
 

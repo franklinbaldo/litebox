@@ -5,3 +5,6 @@ thread_nolibc
 thread_nolibc.hooked
 fork_nolibc
 fork_nolibc.hooked
+hello_dynamic
+hello_dynamic.tar
+hello_dynamic_rootfs/
