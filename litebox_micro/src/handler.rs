@@ -54,11 +54,16 @@ fn pathname_arg_index(nr: u32) -> Option<usize> {
     #[allow(clippy::match_same_arms)] // arms kept separate for per-syscall documentation
     match i64::from(nr) {
         libc::SYS_openat => Some(1),   // openat(dirfd, pathname, flags, mode)
+        libc::SYS_open => Some(0),     // open(pathname, flags, mode)
+        libc::SYS_creat => Some(0),    // creat(pathname, mode)
         libc::SYS_access => Some(0),   // access(pathname, mode)
         libc::SYS_stat => Some(0),     // stat(pathname, statbuf)
         libc::SYS_lstat => Some(0),    // lstat(pathname, statbuf)
         libc::SYS_readlink => Some(0), // readlink(pathname, buf, bufsiz)
         libc::SYS_unlink => Some(0),   // unlink(pathname)
+        libc::SYS_chdir => Some(0),    // chdir(pathname)
+        libc::SYS_mkdir => Some(0),    // mkdir(pathname, mode)
+        libc::SYS_unlinkat => Some(1), // unlinkat(dirfd, pathname, flags)
         libc::SYS_newfstatat
             if {
                 // newfstatat(dirfd, pathname, statbuf, flags)

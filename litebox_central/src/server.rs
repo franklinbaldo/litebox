@@ -385,14 +385,19 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     | libc::SYS_newfstatat
                     | libc::SYS_faccessat
                     | libc::SYS_faccessat2
-                    | libc::SYS_readlinkat => {
+                    | libc::SYS_readlinkat
+                    | libc::SYS_unlinkat => {
                         regs.rsi = buf_ptr; // arg1
                     }
                     libc::SYS_access
                     | libc::SYS_stat
                     | libc::SYS_lstat
                     | libc::SYS_readlink
-                    | libc::SYS_unlink => {
+                    | libc::SYS_unlink
+                    | libc::SYS_chdir
+                    | libc::SYS_mkdir
+                    | libc::SYS_open
+                    | libc::SYS_creat => {
                         regs.rdi = buf_ptr; // arg0
                     }
                     _ => {} // Unknown — dispatch as-is.
@@ -910,6 +915,9 @@ impl<FS: ShimFS> ProcessServer<FS> {
     /// Central reads it from there, rewrites the buffer pointer in `PtRegs`
     /// to point to the local copy, and dispatches through the shim.
     ///
+    /// - If the fd is a standard I/O fd (0, 1, 2): skip shim dispatch and
+    ///   go directly to `EXEC_LOCAL` — the shim maps these to virtual
+    ///   `/dev/std{in,out,err}` devices, but the guest needs the real OS fds.
     /// - If the shim succeeds (result >= 0): return the result directly.
     /// - If the shim returns -EBADF: the fd is a real OS fd — set `EXEC_LOCAL`
     ///   so micro performs the write locally.
@@ -918,6 +926,16 @@ impl<FS: ShimFS> ProcessServer<FS> {
     fn handle_data_consuming_io(&self, entry: &SqEntry) -> CqEntry {
         let nr = entry.syscall_nr;
         let mut cq = Self::base_cq(entry);
+
+        // Standard I/O fds (0=stdin, 1=stdout, 2=stderr) must always be
+        // handled locally by micro. The shim maps these to virtual /dev/std*
+        // devices in the in-memory filesystem, but the guest process needs
+        // writes to reach its real OS stdout/stderr (pipes, terminals, etc.).
+        let fd = entry.args[0] as i32;
+        if (0..=2).contains(&fd) {
+            cq.flags = cq_flags::EXEC_LOCAL;
+            return cq;
+        }
 
         // Read the write data that micro placed in the data region.
         let data = self.region.data_region();
