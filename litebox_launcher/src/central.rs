@@ -69,8 +69,7 @@ impl CentralProcess {
                     if devnull >= 0 {
                         unsafe {
                             libc::dup2(devnull, 1);
-                            // Keep stderr for now — central may need diagnostics.
-                            // In production, redirect stderr to a log file.
+                            libc::dup2(devnull, 2);
                             libc::close(devnull);
                         }
                     }

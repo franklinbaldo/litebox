@@ -547,8 +547,8 @@ fn test_pipe_fork_nolibc_end_to_end() {
 }
 
 #[test]
-#[ignore] // Run with: cargo nextest run -p litebox_launcher --run-ignored=only -E 'test(test_context1)'
-fn test_context1_benchmark() {
+#[ignore] // Run with: cargo nextest run -p litebox_launcher --run-ignored=only -E 'test(test_signal_alarm)'
+fn test_signal_alarm() {
     let test_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -556,8 +556,8 @@ fn test_context1_benchmark() {
     let target_dir = workspace_root.join("target").join("debug");
 
     // Step 1: Compile a dynamically-linked C program.
-    let c_src = test_dir.join("context1.c");
-    let compiled = test_dir.join("context1");
+    let c_src = test_dir.join("signal_alarm.c");
+    let compiled = test_dir.join("signal_alarm");
     let status = Command::new("gcc")
         .args(["-o"])
         .arg(&compiled)
@@ -582,7 +582,7 @@ fn test_context1_benchmark() {
     assert!(status.success(), "cargo build failed");
 
     // Step 3: Run litebox_packager to produce a tar with rewritten ELFs.
-    let tar_path = test_dir.join("context1.tar");
+    let tar_path = test_dir.join("signal_alarm.tar");
     let packager_bin = target_dir.join("litebox_packager");
     assert!(
         packager_bin.exists(),
@@ -603,9 +603,8 @@ fn test_context1_benchmark() {
         "litebox_packager failed: {packager_stderr}"
     );
 
-    // Step 4: Extract the tar to a temp directory so the launcher can find
-    // the rewritten main binary and the rewritten interpreter.
-    let extract_dir = test_dir.join("context1_rootfs");
+    // Step 4: Extract the tar to a temp directory.
+    let extract_dir = test_dir.join("signal_alarm_rootfs");
     if extract_dir.exists() {
         std::fs::remove_dir_all(&extract_dir).expect("clean up old extraction dir");
     }
@@ -634,7 +633,6 @@ fn test_context1_benchmark() {
         extracted_binary.display()
     );
 
-    // Make it executable.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -643,7 +641,6 @@ fn test_context1_benchmark() {
     }
 
     // Step 6: Run the launcher with the rewritten binary.
-    // Pass "1" as a guest argument for a 1-second benchmark duration.
     let launcher_bin = target_dir.join("litebox_launcher");
     assert!(
         launcher_bin.exists(),
@@ -658,7 +655,6 @@ fn test_context1_benchmark() {
         .arg(&extracted_binary)
         .arg(&rootfs_tar_arg)
         .arg(&rootfs_prefix_arg)
-        .arg("1") // guest arg: benchmark duration in seconds
         .env("LITEBOX_CENTRAL_PATH", target_dir.join("litebox_central"))
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -670,15 +666,14 @@ fn test_context1_benchmark() {
         .expect("launcher should produce output");
 
     // Step 7: Check output.
-    // context1 reports to stderr in the format: COUNT|<iterations>|1|lps
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     eprintln!("=== launcher stdout ===\n{stdout}");
     eprintln!("=== launcher stderr ===\n{stderr}");
 
     assert!(
-        stderr.contains("COUNT|"),
-        "Expected 'COUNT|' in stderr (benchmark output), got:\nstdout: {stdout}\nstderr: {stderr}"
+        stderr.contains("ALARM fired"),
+        "Expected 'ALARM fired' in stderr, got:\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert!(
         output.status.success(),
@@ -690,3 +685,5 @@ fn test_context1_benchmark() {
     let _ = std::fs::remove_dir_all(&extract_dir);
     let _ = std::fs::remove_file(&tar_path);
 }
+// test_context1_benchmark removed — context1.c is GPL-licensed.
+// Use the Python scripts in dev_bench/unixbench/ to run UnixBench benchmarks.

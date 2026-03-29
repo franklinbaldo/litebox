@@ -264,21 +264,31 @@ impl<FS: ShimFS> ProcessServer<FS> {
         // return EXEC_LOCAL so micro creates the real mapping.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         if Self::is_mm_syscall(nr) {
+            // For munmap/mprotect/madvise/brk: skip shim dispatch entirely.
+            // In micro, the guest runs in a separate address space (the
+            // launcher process). Dispatching these through the shim causes
+            // CentralPlatform to execute real munmap/mprotect/madvise on
+            // guest addresses within central's own address space, which is
+            // catastrophic (SIGSEGV). For brk, the shim's PageManager
+            // shrink path calls deallocate_pages with huge ranges that
+            // overlap central's memory. Just return EXEC_LOCAL so micro
+            // handles all of these directly in the guest's address space.
+            #[allow(clippy::cast_possible_truncation)]
+            if matches!(
+                i64::from(nr),
+                libc::SYS_munmap | libc::SYS_mprotect | libc::SYS_madvise | libc::SYS_brk
+            ) {
+                cq.flags = cq_flags::EXEC_LOCAL;
+                return cq;
+            }
+
+            // For mmap (and mremap): still dispatch through shim. The shim's
+            // PageManager tracks allocations, and for file-backed mmap the
+            // shim reads file data from tar_ro and populates memory that
+            // central then copies into the shmem data region.
             let mut regs = crate::dispatch::sq_entry_to_ptregs(entry);
             cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
             if cq.result < 0 {
-                // For mprotect/madvise/munmap: the shim's PageManager may not
-                // know about addresses from the launcher's initial ELF loading.
-                // Fall through to EXEC_LOCAL so micro can execute it directly.
-                #[allow(clippy::cast_possible_truncation)]
-                if matches!(
-                    i64::from(nr),
-                    libc::SYS_mprotect | libc::SYS_madvise | libc::SYS_munmap
-                ) {
-                    cq.result = 0; // Clear error; let micro decide.
-                    cq.flags = cq_flags::EXEC_LOCAL;
-                    return cq;
-                }
                 // Shim returned an error — pass it through without EXEC_LOCAL.
                 return cq;
             }

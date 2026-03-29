@@ -19,8 +19,11 @@ Examples:
     # Run only native (no LiteBox)
     python3 run_unixbench.py --mode native
 
-    # Run only with LiteBox
+    # Run only with LiteBox (monolithic runner)
     python3 run_unixbench.py --mode litebox
+
+    # Run only with micro-LiteBox (launcher + central)
+    python3 run_unixbench.py --mode micro
 
     # Override duration and iterations for all benchmarks
     python3 run_unixbench.py --duration 5 --iterations 3
@@ -465,6 +468,147 @@ def run_litebox_windows(
     return _run_litebox_cmd(bench, duration, cmd)
 
 
+# ── Micro-LiteBox Runner ───────────────────────────────────────────────────
+
+def prepare_micro_rootfs(
+    pgms_dir: Path,
+    bench: BenchmarkDef,
+    work_dir: Path,
+    packager_path: Optional[Path],
+) -> Optional[tuple[Path, Path, Path]]:
+    """
+    Prepare the rootfs for a micro-LiteBox benchmark run.
+
+    Uses litebox_packager to create a tar, then extracts it to a directory so
+    the launcher can resolve the interpreter and shared libraries on the host
+    filesystem.
+
+    Returns (tar_path, extract_dir, rewritten_binary_path) or None on failure.
+    """
+    binary = pgms_dir / bench.binary
+    if not binary.exists():
+        print(f"  [SKIP] {bench.name}: binary not found at {binary}")
+        return None
+
+    tar_path = work_dir / f"rootfs_{bench.name}.tar"
+
+    # Build packager command
+    if packager_path:
+        cmd = [str(packager_path)]
+    else:
+        cmd = ["cargo", "run", "-p", "litebox_packager", "--"]
+
+    cmd += [str(binary), "-o", str(tar_path)]
+
+    # Run packager
+    result = subprocess.run(cmd, capture_output=True)
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        print(f"  Error: packager failed for {bench.name}: {stderr[:500]}")
+        return None
+
+    # Extract the tar to a rootfs directory
+    extract_dir = work_dir / f"rootfs_{bench.name}"
+    extract_dir.mkdir(parents=True, exist_ok=True)
+
+    import tarfile as _tarfile
+    with _tarfile.open(tar_path) as tf:
+        tf.extractall(str(extract_dir))
+
+    # Find the rewritten main binary inside the extracted rootfs.
+    # The packager stores files without leading '/', e.g. for
+    # /path/to/pgms/dhry2reg -> path/to/pgms/dhry2reg
+    binary_abs = binary.resolve()
+    rel_path = str(binary_abs).lstrip("/")
+    extracted_binary = extract_dir / rel_path
+    if not extracted_binary.exists():
+        print(f"  Error: rewritten binary not found at {extracted_binary}")
+        return None
+
+    # Ensure it's executable
+    extracted_binary.chmod(0o755)
+
+    # For execl: add the rewritten binary at /pgms/execl in the tar
+    if bench.name == "execl":
+        add_execl_to_tar(tar_path, extracted_binary)
+        # Also re-extract (the tar changed)
+        with _tarfile.open(tar_path) as tf:
+            tf.extractall(str(extract_dir))
+
+    return tar_path, extract_dir, extracted_binary
+
+
+def run_micro(
+    pgms_dir: Path,
+    bench: BenchmarkDef,
+    duration: int,
+    launcher_path: Path,
+    central_path: Path,
+    work_dir: Path,
+    packager_path: Optional[Path],
+) -> Optional[BenchmarkResult]:
+    """Run a benchmark under micro-LiteBox (launcher + central)."""
+    prepared = prepare_micro_rootfs(
+        pgms_dir, bench, work_dir, packager_path,
+    )
+    if prepared is None:
+        return None
+
+    tar_path, extract_dir, extracted_binary = prepared
+
+    cmd = [
+        str(launcher_path),
+        str(extracted_binary),
+        f"--rootfs-tar={tar_path}",
+        f"--rootfs-prefix={extract_dir}",
+    ]
+
+    # For fstime variants, use /tmp in the sandbox as the tmpdir.
+    litebox_tmpdir = "/tmp" if bench.binary == "fstime" else None
+    cmd += bench.args(duration, litebox_tmpdir)
+
+    print(f"  Running: {' '.join(cmd)}")
+    t0 = time.monotonic()
+    timeout = duration * 3 + 30 if bench.uses_alarm else duration * 10 + 60
+    env = os.environ.copy()
+    env["LITEBOX_CENTRAL_PATH"] = str(central_path)
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, timeout=timeout, env=env,
+        )
+    except subprocess.TimeoutExpired:
+        hint = " (this benchmark uses alarm/SIGALRM)" if bench.uses_alarm else ""
+        print(f"  [TIMEOUT] {bench.name}{hint}")
+        return None
+    elapsed = time.monotonic() - t0
+
+    stderr = result.stderr.decode("utf-8", errors="replace")
+    stdout = result.stdout.decode("utf-8", errors="replace")
+
+    if result.returncode != 0:
+        print(f"  [FAIL] {bench.name} exited with {result.returncode}")
+        print(f"  stderr (last 500 chars): ...{stderr[-500:]}")
+        print(f"  stdout (last 200 chars): ...{stdout[-200:]}")
+        return None
+
+    # The benchmark writes COUNT| to stderr.
+    parsed = parse_count_line(stderr)
+    if parsed is None:
+        # Also check stdout in case the benchmark writes there.
+        parsed = parse_count_line(stdout)
+    if parsed is None:
+        print(f"  [FAIL] {bench.name}: no COUNT line in output")
+        print(f"  stderr: {stderr[:500]}")
+        print(f"  stdout: {stdout[:500]}")
+        return None
+
+    count, base, unit = parsed
+    return BenchmarkResult(
+        name=bench.name, count=count, base=base, unit=unit,
+        elapsed=elapsed, raw_stderr=stderr,
+    )
+
+
 # ── Comparison & Reporting ──────────────────────────────────────────────────
 
 @dataclass
@@ -561,6 +705,40 @@ def build_litebox_binaries(
     return runner, packager
 
 
+def build_micro_binaries(
+    workspace_root: Path, release: bool,
+) -> tuple[Path, Path, Path]:
+    """
+    Build litebox_launcher, litebox_central, and litebox_packager via cargo.
+
+    Returns (launcher_path, central_path, packager_path).
+    """
+    build_type = "release" if release else "debug"
+    cmd = [
+        "cargo", "build",
+        "-p", "litebox_launcher",
+        "-p", "litebox_central",
+        "-p", "litebox_packager",
+    ]
+    if release:
+        cmd.append("--release")
+
+    print(f"Building micro-LiteBox binaries ({build_type})...")
+    result = subprocess.run(cmd, cwd=str(workspace_root))
+    if result.returncode != 0:
+        print(f"Error: cargo build failed (exit {result.returncode})")
+        sys.exit(1)
+    print("Build complete.")
+
+    launcher = workspace_root / "target" / build_type / "litebox_launcher"
+    central = workspace_root / "target" / build_type / "litebox_central"
+    packager = workspace_root / "target" / build_type / "litebox_packager"
+    assert launcher.exists(), f"Launcher not found at {launcher}"
+    assert central.exists(), f"Central not found at {central}"
+    assert packager.exists(), f"Packager not found at {packager}"
+    return launcher, central, packager
+
+
 def find_litebox_binaries(
     workspace_root: Path, release: bool,
 ) -> tuple[Optional[Path], Optional[Path]]:
@@ -570,6 +748,21 @@ def find_litebox_binaries(
     packager = workspace_root / "target" / build_type / "litebox_packager"
     return (
         runner if runner.exists() else None,
+        packager if packager.exists() else None,
+    )
+
+
+def find_micro_binaries(
+    workspace_root: Path, release: bool,
+) -> tuple[Optional[Path], Optional[Path], Optional[Path]]:
+    """Find pre-built micro-LiteBox binaries without building."""
+    build_type = "release" if release else "debug"
+    launcher = workspace_root / "target" / build_type / "litebox_launcher"
+    central = workspace_root / "target" / build_type / "litebox_central"
+    packager = workspace_root / "target" / build_type / "litebox_packager"
+    return (
+        launcher if launcher.exists() else None,
+        central if central.exists() else None,
         packager if packager.exists() else None,
     )
 
@@ -586,8 +779,9 @@ def main():
         help="Which benchmarks to run (default: all supported)",
     )
     parser.add_argument(
-        "--mode", choices=["both", "native", "litebox"], default="both",
-        help="Run mode: 'native', 'litebox', or 'both' (default: both)",
+        "--mode", choices=["both", "native", "litebox", "micro"], default="both",
+        help="Run mode: 'native', 'litebox', 'micro', or 'both' (default: both). "
+             "'micro' uses the micro-LiteBox architecture (launcher + central).",
     )
     parser.add_argument(
         "--duration", type=int, default=None,
@@ -673,10 +867,31 @@ def main():
 
     # Resolve litebox binaries
     run_litebox_mode = args.mode in ("both", "litebox")
+    run_micro_mode = args.mode == "micro"
     runner_path = None
     packager_path = None
+    launcher_path = None
+    central_path = None
 
-    if run_litebox_mode:
+    if run_micro_mode:
+        if args.no_build:
+            launcher_path, central_path, packager_path = find_micro_binaries(
+                workspace_root, args.release,
+            )
+            if launcher_path is None:
+                print("Error: litebox_launcher not found.")
+                print("Run without --no-build, or build manually:")
+                print("  cargo build -p litebox_launcher -p litebox_central -p litebox_packager"
+                      + (" --release" if args.release else ""))
+                sys.exit(1)
+        else:
+            launcher_path, central_path, packager_path = build_micro_binaries(
+                workspace_root, args.release,
+            )
+        if args.packager_path:
+            packager_path = Path(args.packager_path)
+
+    elif run_litebox_mode:
         if args.runner_path:
             runner_path = Path(args.runner_path)
             if args.packager_path:
@@ -742,7 +957,11 @@ def main():
     if is_windows_mode:
         print(f"Platform:       Windows (litebox_runner_linux_on_windows)")
         print(f"Prepared dir:   {prepared_dir}")
-    if run_litebox_mode:
+    if run_micro_mode:
+        print(f"Launcher:       {launcher_path}")
+        print(f"Central:        {central_path}")
+        print(f"Packager:       {packager_path or 'cargo run'}")
+    elif run_litebox_mode:
         print(f"Runner:         {runner_path}")
         if not is_windows_mode:
             print(f"Packager:       {packager_path or 'cargo run'}")
@@ -796,6 +1015,21 @@ def main():
                         pgms_dir, bench, duration,
                         runner_path, work_dir, packager_path,
                     )
+                if result:
+                    row.litebox_scores.append(result.score)
+                    row.unit = row.unit or result.unit
+                    print(f"    Score: {result.score:.1f} {result.unit}")
+
+        # Micro-LiteBox runs
+        if run_micro_mode:
+            print(f"[Micro] {bench_name} ({duration}s x {iterations} iterations)")
+            for i in range(iterations):
+                print(f"  Iteration {i + 1}/{iterations}")
+                result = run_micro(
+                    pgms_dir, bench, duration,
+                    launcher_path, central_path,
+                    work_dir, packager_path,
+                )
                 if result:
                     row.litebox_scores.append(result.score)
                     row.unit = row.unit or result.unit

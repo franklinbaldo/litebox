@@ -405,6 +405,14 @@ pub unsafe fn execute_locally(
         nr if nr == libc::SYS_alarm as u32 => unsafe {
             libc::syscall(libc::SYS_alarm, args[0] as u32)
         },
+        nr if nr == libc::SYS_writev as u32 => unsafe {
+            libc::syscall(
+                libc::SYS_writev,
+                args[0] as i32,
+                args[1] as usize,
+                args[2] as i32,
+            )
+        },
         nr if nr == libc::SYS_close as u32 => unsafe {
             libc::syscall(libc::SYS_close, args[0] as i32)
         },
