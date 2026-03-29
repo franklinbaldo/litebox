@@ -17,14 +17,20 @@ fn main() -> anyhow::Result<()> {
     // 1. Create shared memory region for IPC ring buffer.
     let shmem = shmem::LauncherSharedRegion::new()?;
 
-    // 2. Spawn central process (child inherits the shmem fd).
-    let central = central::CentralProcess::spawn(shmem.fd_raw())?;
+    // 2. Load the guest ELF binary (need brk for central initialization).
+    let syscall_entry = litebox_micro::get_syscall_entry_point();
+    let guest_argv: Vec<&str> = args[1..].iter().map(String::as_str).collect();
+    let guest_envp: Vec<&str> = Vec::new(); // empty environment for now
+    let loaded = load_elf::load_elf(elf_path, &guest_argv, &guest_envp, syscall_entry)?;
+
+    // 3. Spawn central process (child inherits the shmem fd + initial brk).
+    let central = central::CentralProcess::spawn(shmem.fd_raw(), loaded.brk)?;
 
     // Give central time to initialize (platform, shim, server loop).
     // TODO: Replace with proper readiness signaling via ring header.
     std::thread::sleep(std::time::Duration::from_millis(200));
 
-    // 3. Initialize micro-LiteBox global state and thread-local storage.
+    // 4. Initialize micro-LiteBox global state and thread-local storage.
     // SAFETY: Called exactly once, before any guest code runs, while the
     // process is still single-threaded (central was forked, not a thread).
     unsafe {
@@ -43,12 +49,6 @@ fn main() -> anyhow::Result<()> {
     unsafe {
         litebox_micro::micro_init_thread(0);
     }
-
-    // 4. Load the guest ELF binary.
-    let syscall_entry = litebox_micro::get_syscall_entry_point();
-    let guest_argv: Vec<&str> = args[1..].iter().map(String::as_str).collect();
-    let guest_envp: Vec<&str> = Vec::new(); // empty environment for now
-    let loaded = load_elf::load_elf(elf_path, &guest_argv, &guest_envp, syscall_entry)?;
 
     // 5. Jump to guest entry point — this never returns.
     // SAFETY: `entry_point` was produced by `load_elf` from a valid ELF, and

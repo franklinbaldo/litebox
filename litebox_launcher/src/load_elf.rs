@@ -50,6 +50,8 @@ pub struct LoadedElf {
     pub entry_point: usize,
     /// Stack pointer to pass to the new program (points at `argc`).
     pub stack_pointer: usize,
+    /// Program break address (end of mapped segments).
+    pub brk: usize,
 }
 
 // ── Stack size ─────────────────────────────────────────────────────────────
@@ -207,6 +209,7 @@ pub fn load_elf(
     Ok(LoadedElf {
         entry_point,
         stack_pointer,
+        brk: main_info.brk,
     })
 }
 

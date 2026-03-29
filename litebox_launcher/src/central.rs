@@ -50,7 +50,7 @@ impl CentralProcess {
     /// This function calls `libc::fork()`. The caller must ensure that forking
     /// is safe in the current process state (e.g. no other threads holding
     /// locks that the child would inherit in a locked state).
-    pub fn spawn(shmem_fd: i32) -> anyhow::Result<Self> {
+    pub fn spawn(shmem_fd: i32, initial_brk: usize) -> anyhow::Result<Self> {
         // SAFETY: We call `fork()` which is safe here because the launcher is
         // single-threaded at the point of spawning. The child either execs
         // `litebox_central` or exits on failure.
@@ -76,13 +76,15 @@ impl CentralProcess {
                     }
                 }
 
-                // Exec litebox_central with the shmem fd as an argument.
+                // Exec litebox_central with the shmem fd and initial brk as arguments.
                 let fd_arg = format!("--shmem-fd={shmem_fd}");
+                let brk_arg = format!("--initial-brk={initial_brk}");
                 let central_path = find_central_binary();
                 let c_path = CString::new(central_path).unwrap();
                 let c_arg0 = CString::new("litebox_central").unwrap();
                 let c_arg1 = CString::new(fd_arg).unwrap();
-                let args = [c_arg0.as_ptr(), c_arg1.as_ptr(), std::ptr::null()];
+                let c_arg2 = CString::new(brk_arg).unwrap();
+                let args = [c_arg0.as_ptr(), c_arg1.as_ptr(), c_arg2.as_ptr(), std::ptr::null()];
                 // SAFETY: `c_path` and `args` are valid C strings / null-
                 // terminated array that remain live for the duration of the
                 // `execvp` call. On success `execvp` never returns.
@@ -113,7 +115,7 @@ mod tests {
 
     #[test]
     fn spawn_and_wait() {
-        let proc = CentralProcess::spawn(0).expect("spawn should succeed");
+        let proc = CentralProcess::spawn(0, 0).expect("spawn should succeed");
         assert!(proc.pid() > 0);
         let mut status: i32 = 0;
         // SAFETY: `proc.pid()` is a valid child PID returned by `fork()`.

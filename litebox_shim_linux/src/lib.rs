@@ -385,6 +385,14 @@ impl<FS: ShimFS> LinuxShimTask<FS> {
 
         Ok((child_tid, child_task))
     }
+
+    /// Set the initial program break address in the PageManager.
+    ///
+    /// Must be called once before the first `brk()` syscall. Panics if
+    /// called after brk is already initialized.
+    pub fn set_initial_brk(&self, brk: usize) {
+        self.task.global.pm.set_initial_brk(brk);
+    }
 }
 
 impl<FS: ShimFS> LinuxShim<FS> {

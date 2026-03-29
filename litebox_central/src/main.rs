@@ -30,6 +30,10 @@ struct Args {
     /// If not provided, central creates its own shmem.
     #[arg(long)]
     shmem_fd: Option<i32>,
+
+    /// Initial program break address from the ELF loader.
+    #[arg(long, default_value = "0")]
+    initial_brk: usize,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -71,6 +75,10 @@ fn main() -> anyhow::Result<()> {
     let task = shim.create_task(fs.clone(), params);
 
     let args = Args::parse();
+
+    if args.initial_brk != 0 {
+        task.set_initial_brk(args.initial_brk);
+    }
 
     let region = if let Some(fd) = args.shmem_fd {
         use std::os::unix::io::FromRawFd;
