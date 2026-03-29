@@ -156,3 +156,119 @@ def add_execl_to_tar(tar_path: Path, rewritten: Path) -> None:
                 out_tf.addfile(member, in_tf.extractfile(member))
         out_tf.add(str(rewritten), arcname="pgms/execl")
     rebuilt_path.rename(tar_path)
+
+
+# System utilities required by shell benchmarks (multi.sh, tst.sh).
+SHELL_UTILITIES = ["sort", "od", "grep", "tee", "wc", "rm", "cat"]
+
+
+def add_shell_support_to_tar(
+    tar_path: Path,
+    pgms_dir: Path,
+    unixbench_dir: Path,
+    packager_path: Optional[Path],
+    work_dir: Path,
+) -> bool:
+    """
+    Add /bin/sh, system utilities, shell scripts, and data files to the
+    rootfs tar for shell benchmarks (shell1/shell8).
+
+    The packager rewrites each system binary (and its shared libraries)
+    into its own tar.  This function merges all of those into the main
+    benchmark rootfs tar, deduplicating shared library entries.
+
+    Returns True on success, False on failure.
+    """
+    import io
+    import shutil as _shutil
+
+    # 1. Find /bin/sh (resolve symlink to actual binary, e.g. dash/bash)
+    sh_path = _shutil.which("sh")
+    if sh_path is None:
+        print("  Error: /bin/sh not found")
+        return False
+    sh_real = Path(sh_path).resolve()
+
+    # 2. Collect all binaries to rewrite
+    bins_to_rewrite: list[Path] = [sh_real]
+    for util in SHELL_UTILITIES:
+        util_path = _shutil.which(util)
+        if util_path is None:
+            print(f"  Error: {util} not found in PATH")
+            return False
+        bins_to_rewrite.append(Path(util_path).resolve())
+
+    # Deduplicate (e.g. if sh and bash are the same binary)
+    bins_to_rewrite = list(dict.fromkeys(bins_to_rewrite))
+
+    # 3. Rewrite each binary with the packager and collect the tar outputs
+    rewritten_tars: list[Path] = []
+    for binary in bins_to_rewrite:
+        bin_tar = work_dir / f"rootfs_{binary.name}.tar"
+        if packager_path:
+            cmd = [str(packager_path)]
+        else:
+            cmd = ["cargo", "run", "-p", "litebox_packager", "--"]
+        cmd += [str(binary), "-o", str(bin_tar)]
+        result = subprocess.run(cmd, capture_output=True)
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="replace")
+            print(f"  Error: packager failed for {binary.name}: {stderr[:500]}")
+            return False
+        rewritten_tars.append(bin_tar)
+
+    # 4. Merge all rewritten binaries into the main tar.
+    rebuilt_path = tar_path.with_suffix(".shell.tar")
+    with tarfile.open(rebuilt_path, "w", format=tarfile.GNU_FORMAT) as out_tf:
+        # Copy existing entries from the main tar
+        seen: set[str] = set()
+        with tarfile.open(tar_path) as in_tf:
+            for member in in_tf.getmembers():
+                seen.add(member.name)
+                out_tf.addfile(member, in_tf.extractfile(member))
+
+        # Merge entries from each utility's tar (deduplicate shared libs)
+        for util_tar in rewritten_tars:
+            with tarfile.open(util_tar) as in_tf:
+                for member in in_tf.getmembers():
+                    if member.name not in seen:
+                        seen.add(member.name)
+                        fileobj = in_tf.extractfile(member)
+                        out_tf.addfile(member, fileobj)
+
+        # 5. Add /bin/sh as a copy of the rewritten shell binary.
+        # The packager stores the rewritten shell at its real path
+        # (e.g. usr/bin/dash).  We need bin/sh for #! /bin/sh resolution.
+        sh_in_tar = str(sh_real).lstrip("/")
+        sh_data = None
+        for util_tar in rewritten_tars[:1]:  # first tar is always the shell
+            with tarfile.open(util_tar) as in_tf:
+                for member in in_tf.getmembers():
+                    if member.name == sh_in_tar:
+                        sh_data = in_tf.extractfile(member).read()
+                        break
+            if sh_data is not None:
+                break
+
+        if sh_data is not None and "bin/sh" not in seen:
+            sh_member = tarfile.TarInfo(name="bin/sh")
+            sh_member.size = len(sh_data)
+            sh_member.mode = 0o755
+            out_tf.addfile(sh_member, io.BytesIO(sh_data))
+            seen.add("bin/sh")
+
+        # 6. Add shell scripts from pgms/
+        for script in ("multi.sh", "tst.sh"):
+            script_path = pgms_dir / script
+            if script_path.exists() and f"pgms/{script}" not in seen:
+                out_tf.add(str(script_path), arcname=f"pgms/{script}")
+                seen.add(f"pgms/{script}")
+
+        # 7. Add sort.src data file at the root (CWD is / in the sandbox).
+        sort_src = unixbench_dir / "testdir" / "sort.src"
+        if sort_src.exists() and "sort.src" not in seen:
+            out_tf.add(str(sort_src), arcname="sort.src")
+            seen.add("sort.src")
+
+    rebuilt_path.rename(tar_path)
+    return True

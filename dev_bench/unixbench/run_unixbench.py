@@ -46,6 +46,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -53,6 +54,7 @@ from typing import Optional
 
 from unixbench_common import (
     add_execl_to_tar,
+    add_shell_support_to_tar,
     ensure_unixbench_built,
     ensure_unixbench_downloaded,
     extract_rewritten_binary,
@@ -475,6 +477,7 @@ def prepare_micro_rootfs(
     bench: BenchmarkDef,
     work_dir: Path,
     packager_path: Optional[Path],
+    unixbench_dir: Optional[Path] = None,
 ) -> Optional[tuple[Path, Path, Path]]:
     """
     Prepare the rootfs for a micro-LiteBox benchmark run.
@@ -535,6 +538,16 @@ def prepare_micro_rootfs(
         with _tarfile.open(tar_path) as tf:
             tf.extractall(str(extract_dir))
 
+    # For shell benchmarks: add /bin/sh, system utilities, scripts, and data
+    if bench.name in ("shell1", "shell8") and unixbench_dir is not None:
+        if not add_shell_support_to_tar(
+            tar_path, pgms_dir, unixbench_dir, packager_path, work_dir,
+        ):
+            return None
+        # Re-extract (the tar changed)
+        with _tarfile.open(tar_path) as tf:
+            tf.extractall(str(extract_dir))
+
     return tar_path, extract_dir, extracted_binary
 
 
@@ -546,10 +559,11 @@ def run_micro(
     central_path: Path,
     work_dir: Path,
     packager_path: Optional[Path],
+    unixbench_dir: Optional[Path] = None,
 ) -> Optional[BenchmarkResult]:
     """Run a benchmark under micro-LiteBox (launcher + central)."""
     prepared = prepare_micro_rootfs(
-        pgms_dir, bench, work_dir, packager_path,
+        pgms_dir, bench, work_dir, packager_path, unixbench_dir,
     )
     if prepared is None:
         return None
@@ -575,36 +589,98 @@ def run_micro(
 
     # The launcher passes its environment to the guest.  Set variables that
     # benchmarks need (paths are relative to the virtual rootfs, not the host).
-    if bench.name == "execl":
+    if bench.name in ("execl", "shell1", "shell8"):
         env["UB_BINDIR"] = "/pgms"
+    if bench.name in ("shell1", "shell8"):
+        # Shell utilities and scripts are at /usr/bin and /pgms in the rootfs.
+        # The shell (dash) uses PATH from the environment for command lookup.
+        env["PATH"] = "/pgms:/usr/bin:/bin"
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, timeout=timeout, env=env,
+        # Use Popen with start_new_session=True so that the launcher and
+        # all its child processes (central, fork children) are in their
+        # own process group.  This lets us kill the entire group if the
+        # benchmark times out or if orphaned children keep pipes open
+        # after the main process exits.
+        #
+        # With start_new_session=True the process group ID equals the
+        # launcher PID, so we can use it even after the main process has
+        # been reaped.
+        #
+        # Stdout is discarded: benchmarks like shell8 produce megabytes
+        # of stdout from child processes (sort, od, grep, etc.).  If
+        # stdout went to a pipe the 64 KB pipe buffer would fill up,
+        # blocking children and preventing any benchmark iterations from
+        # completing.  The result we care about (the COUNT line) is
+        # always on stderr.
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            env=env, start_new_session=True,
         )
-    except subprocess.TimeoutExpired:
-        hint = " (this benchmark uses alarm/SIGALRM)" if bench.uses_alarm else ""
-        print(f"  [TIMEOUT] {bench.name}{hint}")
+
+        import signal as _signal
+        pgid = proc.pid  # start_new_session=True ⇒ pgid == pid
+
+        # Drain stderr in a background thread so that the pipe buffer
+        # never fills up (which would block the guest process).
+        # We can't simply call proc.wait() then proc.stderr.read()
+        # because orphaned fork children may keep the pipe write end
+        # open, so we drain into a list and kill orphans after wait.
+        stderr_chunks: list[bytes] = []
+
+        def _drain_stderr():
+            assert proc.stderr is not None
+            while True:
+                chunk = proc.stderr.read(65536)
+                if not chunk:
+                    break
+                stderr_chunks.append(chunk)
+
+        drain_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        drain_thread.start()
+
+        # Wait for the top-level process to exit (or timeout).
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # Kill the entire process group.
+            try:
+                os.killpg(pgid, _signal.SIGKILL)
+            except OSError:
+                proc.kill()
+            proc.wait()
+            drain_thread.join(timeout=5)
+            hint = " (this benchmark uses alarm/SIGALRM)" if bench.uses_alarm else ""
+            print(f"  [TIMEOUT] {bench.name}{hint}")
+            return None
+
+        # Main process exited.  Kill any orphaned children in the
+        # process group so their pipe write ends close, then drain.
+        try:
+            os.killpg(pgid, _signal.SIGKILL)
+        except OSError:
+            pass  # process group already gone
+
+        drain_thread.join(timeout=5)
+        result_stderr = b"".join(stderr_chunks)
+        proc.stderr.close()
+        result_returncode = proc.returncode
+    except Exception as e:
+        print(f"  [ERROR] {bench.name}: {e}")
         return None
     elapsed = time.monotonic() - t0
 
-    stderr = result.stderr.decode("utf-8", errors="replace")
-    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result_stderr.decode("utf-8", errors="replace")
 
-    if result.returncode != 0:
-        print(f"  [FAIL] {bench.name} exited with {result.returncode}")
+    if result_returncode != 0:
+        print(f"  [FAIL] {bench.name} exited with {result_returncode}")
         print(f"  stderr (last 500 chars): ...{stderr[-500:]}")
-        print(f"  stdout (last 200 chars): ...{stdout[-200:]}")
         return None
 
     # The benchmark writes COUNT| to stderr.
     parsed = parse_count_line(stderr)
     if parsed is None:
-        # Also check stdout in case the benchmark writes there.
-        parsed = parse_count_line(stdout)
-    if parsed is None:
         print(f"  [FAIL] {bench.name}: no COUNT line in output")
         print(f"  stderr: {stderr[:500]}")
-        print(f"  stdout: {stdout[:500]}")
         return None
 
     count, base, unit = parsed
@@ -1033,7 +1109,7 @@ def main():
                 result = run_micro(
                     pgms_dir, bench, duration,
                     launcher_path, central_path,
-                    work_dir, packager_path,
+                    work_dir, packager_path, unixbench_dir,
                 )
                 if result:
                     row.litebox_scores.append(result.score)
