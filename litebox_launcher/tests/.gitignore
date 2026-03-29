@@ -11,3 +11,6 @@ hello_dynamic_rootfs/
 fork_dynamic
 fork_dynamic.tar
 fork_dynamic_rootfs/
+context1
+context1.tar
+context1_rootfs/
