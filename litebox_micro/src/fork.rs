@@ -75,7 +75,9 @@ pub unsafe fn handle_fork(cq: &CqEntry) -> i64 {
     } else {
         // PARENT
         unsafe { libc::close(RESERVED_CHILD_FD) };
-        i64::from(child_pid_from_central.cast_signed()) // Return assigned PID to guest
+        // Return the real OS child PID so the guest can waitpid() on it.
+        // Central's assigned PID is used only for internal bookkeeping.
+        i64::from(pid)
     }
 }
 

@@ -375,6 +375,15 @@ pub unsafe fn execute_locally(
                 args[3] as i64,
             )
         },
+        nr if nr == libc::SYS_wait4 as u32 => unsafe {
+            libc::syscall(
+                libc::SYS_wait4,
+                args[0] as i32,   // pid
+                args[1] as usize, // wstatus
+                args[2] as i32,   // options
+                args[3] as usize, // rusage
+            )
+        },
         _ => -i64::from(libc::ENOSYS),
     }
 }

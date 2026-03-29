@@ -581,6 +581,9 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 // Time: writes to guest timespec/timeval
                 | libc::SYS_clock_gettime
                 | libc::SYS_gettimeofday
+                // Process wait: must run in micro's PID namespace where
+                // the real child process lives (central has no children).
+                | libc::SYS_wait4
         )
     }
 

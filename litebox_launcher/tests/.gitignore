@@ -8,3 +8,6 @@ fork_nolibc.hooked
 hello_dynamic
 hello_dynamic.tar
 hello_dynamic_rootfs/
+fork_dynamic
+fork_dynamic.tar
+fork_dynamic_rootfs/
