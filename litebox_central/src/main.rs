@@ -12,6 +12,7 @@ mod shmem;
 use std::os::fd::OwnedFd;
 
 use clap::Parser;
+use litebox::fs::FileSystem as _;
 use litebox_ipc::ring::SharedRingLayout;
 use litebox_platform_central::CentralPlatform;
 use litebox_platform_multiplex::Platform;
@@ -73,7 +74,20 @@ fn main() -> anyhow::Result<()> {
     };
 
     let devices = litebox::fs::devices::FileSystem::new(lb);
-    let in_mem = litebox::fs::in_mem::FileSystem::new(lb);
+    let mut in_mem = litebox::fs::in_mem::FileSystem::new(lb);
+
+    // Create /tmp on the in-memory layer so guest programs can write
+    // temporary files (e.g. fstime benchmark's creat("/tmp/dummy0-...")).
+    // This mirrors what litebox_runner_linux_userland does.
+    in_mem.with_root_privileges(|fs| {
+        let mode = litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO;
+        if let Err(err) = fs.mkdir("/tmp", mode)
+            && !matches!(err, litebox::fs::errors::MkdirError::AlreadyExists)
+        {
+            eprintln!("litebox_central: failed to create /tmp: {err:?}");
+        }
+    });
+
     let tar_ro = litebox::fs::tar_ro::FileSystem::new(lb, tar_data);
     let inner = litebox::fs::layered::FileSystem::new(
         lb,
