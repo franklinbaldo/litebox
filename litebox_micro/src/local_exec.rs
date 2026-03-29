@@ -224,8 +224,19 @@ pub unsafe fn execute_locally(
                     }
                 }
                 cq.result
+            } else if cq.result == -i64::from(libc::EBADF) {
+                // EBADF fallback: central's shim doesn't know this fd (e.g. pipe).
+                // Execute read locally — the fd is a real OS fd.
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_read,
+                        args[0] as i32,
+                        args[1] as usize,
+                        args[2] as usize,
+                    )
+                }
             } else {
-                // EOF or error: return the result directly.
+                // EOF or other error: return the result directly.
                 cq.result
             }
         }
@@ -383,6 +394,19 @@ pub unsafe fn execute_locally(
                 args[2] as i32,   // options
                 args[3] as usize, // rusage
             )
+        },
+        nr if nr == libc::SYS_pipe2 as u32 => unsafe {
+            libc::syscall(
+                libc::SYS_pipe2,
+                args[0] as usize, // pipefd[2] pointer
+                args[1] as i32,   // flags
+            )
+        },
+        nr if nr == libc::SYS_alarm as u32 => unsafe {
+            libc::syscall(libc::SYS_alarm, args[0] as u32)
+        },
+        nr if nr == libc::SYS_close as u32 => unsafe {
+            libc::syscall(libc::SYS_close, args[0] as i32)
         },
         _ => -i64::from(libc::ENOSYS),
     }

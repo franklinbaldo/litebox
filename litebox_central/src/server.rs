@@ -236,6 +236,17 @@ impl<FS: ShimFS> ProcessServer<FS> {
             return self.handle_fork(entry);
         }
 
+        // Close: dual-dispatch. Try shim first for fd table cleanup, then
+        // always EXEC_LOCAL so micro closes the real fd.
+        #[allow(clippy::cast_possible_truncation)]
+        if nr == libc::SYS_close as u32 {
+            let mut regs = crate::dispatch::sq_entry_to_ptregs(entry);
+            let _shim_result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+            // Ignore EBADF from shim (fd may be a real OS fd not in shim's table).
+            cq.flags = cq_flags::EXEC_LOCAL;
+            return cq;
+        }
+
         if Self::needs_local_exec(nr) {
             cq.flags = cq_flags::EXEC_LOCAL;
             return cq;
@@ -584,6 +595,10 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 // Process wait: must run in micro's PID namespace where
                 // the real child process lives (central has no children).
                 | libc::SYS_wait4
+                // Pipe/timer: pipe2 creates real OS pipes in micro's process;
+                // alarm sets a process timer.
+                | libc::SYS_pipe2
+                | libc::SYS_alarm
         )
     }
 
@@ -665,8 +680,13 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 } else if cq.result == 0 {
                     // EOF — still tell micro, result=0.
                     cq.flags = cq_flags::EXEC_LOCAL;
+                } else if cq.result == -i64::from(libc::EBADF) {
+                    // Fd not in shim's table — it's a real OS fd (e.g. pipe).
+                    // Let micro execute the read locally. Keep result as -EBADF
+                    // so micro can distinguish from EOF.
+                    cq.flags = cq_flags::EXEC_LOCAL;
                 }
-                // Negative: error, pass through directly.
+                // Other negative: error, pass through directly.
             }
             libc::SYS_pread64 => {
                 // pread64(fd, buf, count, offset) — rewrite buf (rsi).
