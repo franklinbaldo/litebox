@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::ptr::null;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
+use std::thread::JoinHandle;
 
 use litebox_ipc::cq::{cq_notify_thread, cq_push};
 use litebox_ipc::messages::{
@@ -50,6 +51,10 @@ pub struct ProcessServer<FS: ShimFS> {
     shim: Arc<litebox_shim_linux::LinuxShim<FS>>,
     /// Filesystem for creating child tasks.
     fs: Arc<FS>,
+    /// Join handles for child server threads spawned by `handle_fork`.
+    /// Joined when this server's `run()` loop exits, preventing premature
+    /// central process termination while children are still running.
+    child_handles: RefCell<Vec<JoinHandle<()>>>,
 }
 
 impl<FS: ShimFS> ProcessServer<FS> {
@@ -70,6 +75,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
             next_child_pid: Cell::new(2),
             shim,
             fs,
+            child_handles: RefCell::new(Vec::new()),
         }
     }
 
@@ -165,6 +171,15 @@ impl<FS: ShimFS> ProcessServer<FS> {
             if self.primary_task.is_exiting() {
                 break;
             }
+        }
+
+        // Wait for all child server threads to finish before returning.
+        // This prevents the central process from exiting while children
+        // are still processing syscalls (the OS would kill child threads,
+        // leaving child guest processes hanging on dead rings).
+        let handles: Vec<_> = self.child_handles.borrow_mut().drain(..).collect();
+        for handle in handles {
+            let _ = handle.join();
         }
 
         Ok(())
@@ -430,11 +445,12 @@ impl<FS: ShimFS> ProcessServer<FS> {
             let child_server = ProcessServer::new(child_region, child_task, shim, fs);
             child_server.next_child_pid.set(self.next_child_pid.get());
 
-            std::thread::spawn(move || {
+            let handle = std::thread::spawn(move || {
                 if let Err(e) = child_server.run() {
                     eprintln!("litebox_central: child server error: {e}");
                 }
             });
+            self.child_handles.borrow_mut().push(handle);
         }
 
         // 5. Return info to micro.
