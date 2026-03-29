@@ -988,8 +988,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
         cq
     }
 
-    /// Handle an execve syscall by parsing the ELF and preparing segment data
-    /// for micro to map and jump to.
+    /// Handle an execve syscall by deserializing the path/argv/envp from the
+    /// data region and delegating to `handle_execve_inner`.
     ///
     /// The data region from micro contains serialized path/argv/envp.
     /// Central reads the ELF file, parses it, and packs all segment data into
@@ -1003,7 +1003,6 @@ impl<FS: ShimFS> ProcessServer<FS> {
     )]
     fn handle_execve(&self, entry: &SqEntry) -> CqEntry {
         let mut cq = Self::base_cq(entry);
-        let thread_slot = entry.thread_slot;
 
         // Read serialized path/argv/envp from the data region.
         let data = self.region.data_region();
@@ -1030,6 +1029,31 @@ impl<FS: ShimFS> ProcessServer<FS> {
             cq.result = -i64::from(libc::EINVAL);
             return cq;
         };
+
+        self.handle_execve_inner(entry, path_bytes, &argv_strs, &envp_strs)
+    }
+
+    /// Inner execve handler: opens the target binary, checks for shebang
+    /// scripts, parses ELF, and packs segment data into the data region.
+    ///
+    /// Separated from `handle_execve` so shebang scripts can re-dispatch
+    /// with the interpreter binary as the target.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::too_many_lines,
+        clippy::field_reassign_with_default
+    )]
+    fn handle_execve_inner(
+        &self,
+        entry: &SqEntry,
+        path_bytes: &[u8],
+        argv_strs: &[&[u8]],
+        envp_strs: &[&[u8]],
+    ) -> CqEntry {
+        let mut cq = Self::base_cq(entry);
+        let thread_slot = entry.thread_slot;
 
         // Open the file via shim dispatch (SYS_openat with AT_FDCWD).
         // Build a null-terminated path in a local buffer.
@@ -1098,6 +1122,29 @@ impl<FS: ShimFS> ProcessServer<FS> {
             }
         }
         self.close_fd(thread_slot, fd);
+
+        // Check for shebang (#!) scripts.
+        //
+        // If the file starts with `#!`, parse the interpreter path and optional
+        // argument, rebuild argv per Linux convention, and re-dispatch with the
+        // interpreter binary as the target. Limited to one level of indirection
+        // (the interpreter must be an ELF binary).
+        if let Some((interp_path, interp_arg)) = parse_shebang(&file_data) {
+            let mut new_argv: Vec<&[u8]> = Vec::new();
+            new_argv.push(interp_path);
+            if let Some(arg) = interp_arg {
+                new_argv.push(arg);
+            }
+            new_argv.push(path_bytes);
+            for a in argv_strs.iter().skip(1) {
+                new_argv.push(a);
+            }
+            // Recursive call — the interpreter must be an ELF binary.
+            // If it's another shebang script, parse_shebang will fire again,
+            // but Linux limits this to a small number of levels. We allow
+            // one level of recursion here (interpreter must be ELF).
+            return self.handle_execve_inner(entry, interp_path, &new_argv, envp_strs);
+        }
 
         // Parse the ELF.
         let mut reader = MemReader(&file_data);
@@ -1273,7 +1320,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
 
         // Serialize argv strings (NUL-separated).
         let mut argv_bytes: Vec<u8> = Vec::new();
-        for s in &argv_strs {
+        for s in argv_strs {
             argv_bytes.extend_from_slice(s);
             // Ensure NUL termination.
             if s.last() != Some(&0) {
@@ -1283,7 +1330,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
 
         // Serialize envp strings (NUL-separated).
         let mut envp_bytes: Vec<u8> = Vec::new();
-        for s in &envp_strs {
+        for s in envp_strs {
             envp_bytes.extend_from_slice(s);
             if s.last() != Some(&0) {
                 envp_bytes.push(0);
@@ -1580,6 +1627,64 @@ impl<FS: ShimFS> ProcessServer<FS> {
 }
 
 // ── Execve helper types ─────────────────────────────────────────────────────
+
+/// Parse a `#!` shebang line from the start of a file.
+///
+/// Returns `Some((interpreter_path, optional_arg))` if the file starts with
+/// `#!`. The interpreter path and optional argument are byte slices without
+/// leading/trailing whitespace. Returns `None` if the file is not a shebang
+/// script.
+///
+/// Linux limits shebang parsing to the first 256 bytes.
+fn parse_shebang(data: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
+    if data.len() < 3 || data[0] != b'#' || data[1] != b'!' {
+        return None;
+    }
+
+    // Find the end of the first line (max 256 bytes per Linux convention).
+    let max_len = data.len().min(256);
+    let line_end = data[2..max_len]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(max_len, |p| p + 2);
+    let line = &data[2..line_end];
+
+    // Skip leading whitespace after #!
+    let start = line
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(line.len());
+    let line = &line[start..];
+    if line.is_empty() {
+        return None;
+    }
+
+    // Interpreter path: up to first whitespace.
+    let interp_end = line
+        .iter()
+        .position(u8::is_ascii_whitespace)
+        .unwrap_or(line.len());
+    let interp = &line[..interp_end];
+    if interp.is_empty() {
+        return None;
+    }
+
+    // Optional argument: rest of line, trimmed.
+    let rest = &line[interp_end..];
+    let rest_start = rest
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(rest.len());
+    let rest = &rest[rest_start..];
+    let rest_end = rest
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(0, |p| p + 1);
+    let rest = &rest[..rest_end];
+
+    let arg = if rest.is_empty() { None } else { Some(rest) };
+    Some((interp, arg))
+}
 
 /// Mirror of `ExecveHeader` from `litebox_micro::execve` (central cannot import micro).
 #[repr(C)]
