@@ -276,6 +276,13 @@ impl<FS: ShimFS> ProcessServer<FS> {
             return cq;
         }
 
+        // Data-consuming I/O (write to virtual fds): micro copies write buffer
+        // into shmem, central reads it and dispatches through shim.
+        // If shim returns EBADF (real OS fd), fall back to local exec.
+        if Self::is_data_consuming_io(nr) {
+            return self.handle_data_consuming_io(entry);
+        }
+
         if Self::needs_local_exec(nr) {
             cq.flags = cq_flags::EXEC_LOCAL;
             return cq;
@@ -604,12 +611,10 @@ impl<FS: ShimFS> ProcessServer<FS> {
     fn needs_local_exec(nr: u32) -> bool {
         matches!(
             i64::from(nr),
-            // I/O syscalls that micro handles locally (writes go directly
-            // to inherited fds like stdout/stderr; scatter/gather I/O is
-            // passed through)
-            libc::SYS_write
-                | libc::SYS_writev
-                | libc::SYS_pwrite64
+            // I/O syscalls that micro handles locally (scatter/gather
+            // writes are passed through; simple writes go via
+            // data-consuming I/O dispatch instead)
+            libc::SYS_writev
                 | libc::SYS_pwritev
                 | libc::SYS_pwritev2
                 | libc::SYS_recvfrom
@@ -886,6 +891,81 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 cq.flags = cq_flags::EXEC_LOCAL;
             }
         }
+
+        cq
+    }
+
+    /// Returns `true` for syscalls where micro sends write data to central
+    /// via the shmem data region, and central dispatches through the shim.
+    ///
+    /// If the shim returns EBADF (fd not in shim's table), central falls back
+    /// to `EXEC_LOCAL` so micro writes to the real OS fd.
+    fn is_data_consuming_io(nr: u32) -> bool {
+        matches!(i64::from(nr), libc::SYS_write | libc::SYS_pwrite64)
+    }
+
+    /// Handle a data-consuming I/O syscall (write family).
+    ///
+    /// Micro has already copied the write buffer into the shmem data region.
+    /// Central reads it from there, rewrites the buffer pointer in `PtRegs`
+    /// to point to the local copy, and dispatches through the shim.
+    ///
+    /// - If the shim succeeds (result >= 0): return the result directly.
+    /// - If the shim returns -EBADF: the fd is a real OS fd — set `EXEC_LOCAL`
+    ///   so micro performs the write locally.
+    /// - Other errors: pass through directly.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn handle_data_consuming_io(&self, entry: &SqEntry) -> CqEntry {
+        let nr = entry.syscall_nr;
+        let mut cq = Self::base_cq(entry);
+
+        // Read the write data that micro placed in the data region.
+        let data = self.region.data_region();
+        let offset = entry.data_offset as usize;
+        let len = entry.data_len as usize;
+
+        // Validate data region bounds.
+        if len == 0 || offset + len > data.len() {
+            // No data or invalid bounds — fall back to local exec.
+            cq.flags = cq_flags::EXEC_LOCAL;
+            return cq;
+        }
+
+        // Make a local copy of the write data so we have a stable pointer
+        // for the shim dispatch (the data region is shared memory).
+        let write_buf: Vec<u8> = data[offset..offset + len].to_vec();
+        let buf_ptr = write_buf.as_ptr() as usize;
+
+        let mut regs = crate::dispatch::sq_entry_to_ptregs(entry);
+
+        match i64::from(nr) {
+            libc::SYS_write => {
+                // write(fd, buf, count) — rewrite buf (rsi) to local copy.
+                regs.rsi = buf_ptr;
+                regs.rdx = len;
+            }
+            libc::SYS_pwrite64 => {
+                // pwrite64(fd, buf, count, offset) — rewrite buf (rsi) to local copy.
+                regs.rsi = buf_ptr;
+                regs.rdx = len;
+            }
+            _ => {
+                // Unexpected syscall — fall back to local exec.
+                cq.flags = cq_flags::EXEC_LOCAL;
+                return cq;
+            }
+        }
+
+        cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+
+        if cq.result >= 0 {
+            // Shim handled the write to a virtual fd — return result directly.
+        } else if cq.result == -i64::from(libc::EBADF) {
+            // Fd not in shim's table — it's a real OS fd (e.g. stdout, pipe).
+            // Tell micro to execute the write locally.
+            cq.flags = cq_flags::EXEC_LOCAL;
+        }
+        // Other negative: error from shim, pass through directly.
 
         cq
     }

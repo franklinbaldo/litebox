@@ -128,6 +128,85 @@ fn copy_pathname_to_data_region(
     }
 }
 
+/// Base offset in the data region where write data starts.
+///
+/// Pathname slots use `thread_slot * PATHNAME_REGION_SIZE` (up to
+/// `MAX_PATHNAME_SLOTS * 4096 = 256 * 4096 = 1 MiB`).  Write data is placed
+/// past all pathname slots to avoid conflicts with concurrent pathname
+/// transfers from other threads.
+const WRITE_DATA_BASE_OFFSET: usize = 256 * PATHNAME_REGION_SIZE; // 1 MiB
+
+/// Per-thread region size for write data in the data region (64 KiB).
+///
+/// Each thread can write up to this many bytes per syscall. Writes larger
+/// than this are capped (the kernel will return a short write).
+const WRITE_DATA_REGION_SIZE: usize = 65536;
+
+/// Returns `(buf_arg_index, count_arg_index)` for write-family syscalls,
+/// or `None` if this is not a write syscall.
+#[allow(clippy::cast_possible_truncation)]
+fn write_data_arg_info(nr: u32) -> Option<(usize, usize)> {
+    #[allow(clippy::match_same_arms)] // arms kept separate for per-syscall documentation
+    match i64::from(nr) {
+        libc::SYS_write => Some((1, 2)),    // write(fd, buf, count)
+        libc::SYS_pwrite64 => Some((1, 2)), // pwrite64(fd, buf, count, offset)
+        _ => None,
+    }
+}
+
+/// Copy write data from the guest's memory into the shared data region.
+///
+/// Updates the SQ entry's `data_offset` and `data_len` fields so central
+/// knows where to find the data.
+///
+/// Each thread uses a separate region in the data region past the pathname
+/// slots: `WRITE_DATA_BASE_OFFSET + thread_slot * WRITE_DATA_REGION_SIZE`.
+///
+/// # Safety
+///
+/// The buffer pointer (from `args`) must point to valid readable memory of
+/// at least `count` bytes in the guest's address space.
+#[allow(clippy::cast_possible_truncation)]
+fn copy_write_data_to_data_region(
+    entry: &mut SqEntry,
+    args: &[u64; 6],
+    syscall_nr: u32,
+    ring_base: *mut u8,
+    layout: &SharedRingLayout,
+) {
+    let Some((buf_idx, count_idx)) = write_data_arg_info(syscall_nr) else {
+        return;
+    };
+
+    let buf_ptr = args[buf_idx] as *const u8;
+    let count = args[count_idx] as usize;
+
+    if buf_ptr.is_null() || count == 0 {
+        return;
+    }
+
+    // Compute per-thread offset in the write data zone.
+    let thread_offset =
+        WRITE_DATA_BASE_OFFSET + entry.thread_slot as usize * WRITE_DATA_REGION_SIZE;
+    let max_len = count.min(WRITE_DATA_REGION_SIZE);
+    if thread_offset + max_len > layout.data_region_size {
+        // Data region too small — skip the copy.
+        return;
+    }
+
+    // Copy from guest memory into the data region.
+    unsafe {
+        let dst = ring_base.add(layout.data_region_offset + thread_offset);
+        core::ptr::copy_nonoverlapping(buf_ptr, dst, max_len);
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        entry.data_offset = thread_offset as u32;
+        entry.data_len = max_len as u32;
+    }
+}
+
 /// Submit an `SqEntry` and wait for the corresponding `CqEntry`.
 ///
 /// # Safety
@@ -168,6 +247,11 @@ pub(crate) unsafe fn submit_and_wait(
     // space into the shared data region so central can read it (central is a
     // separate process and cannot dereference guest pointers directly).
     copy_pathname_to_data_region(entry, args, syscall_nr, micro.ring_base, &micro.layout);
+
+    // For write-family syscalls, copy the write buffer from the guest's
+    // address space into the data region so central can dispatch through
+    // the shim (which may handle virtual fds).
+    copy_write_data_to_data_region(entry, args, syscall_nr, micro.ring_base, &micro.layout);
 
     sq_publish(entry);
     header
