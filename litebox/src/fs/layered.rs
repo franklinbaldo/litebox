@@ -9,10 +9,10 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use hashbrown::{HashMap, HashSet};
 
-use crate::LiteBox;
 use crate::fd::{InternalFd, TypedFd};
 use crate::path::Arg;
 use crate::sync;
+use crate::LiteBox;
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
@@ -70,8 +70,11 @@ pub struct FileSystem<
     node_info_lookup: sync::RwLock<Platform, HashMap<NodeInfo, usize>>,
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower: super::FileSystem>
-    FileSystem<Platform, Upper, Lower>
+impl<
+        Platform: sync::RawSyncPrimitivesProvider,
+        Upper: super::FileSystem,
+        Lower: super::FileSystem,
+    > FileSystem<Platform, Upper, Lower>
 {
     /// Construct a new `FileSystem` instance
     #[must_use]
@@ -341,10 +344,31 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             let upper_entry = Arc::new(EntryX::Upper { fd: upper_fd });
             // Then we check up on replacing entries
             match Arc::strong_count(&entry) {
-                0..=2 => {
-                    // We are holding one, and also there must be an entry in `root` and the file
-                    // descriptor table.
+                0..=1 => {
+                    // We are holding one, and also there must be at least the
+                    // descriptor table entry.
                     unreachable!()
+                }
+                2 => {
+                    // Only two references: our local clone + descriptor table.
+                    // This fd is independently opened (not sharing the root
+                    // Arc), so we can replace and close directly.
+                    let old_entry = self
+                        .litebox
+                        .descriptor_table()
+                        .with_entry_mut_via_internal_fd::<Self, _, _>(internal_fd, |entry| {
+                            core::mem::replace(&mut entry.entry.entry, upper_entry)
+                        })
+                        .expect("nothing should have changed the existing entry");
+                    assert!(Arc::ptr_eq(&old_entry, &entry));
+                    drop(entry);
+                    let entry = Arc::into_inner(old_entry).unwrap();
+                    match entry {
+                        EntryX::Upper { .. } | EntryX::Tombstone => unreachable!(),
+                        EntryX::Lower { fd } => {
+                            self.lower.close(&fd).unwrap();
+                        }
+                    }
                 }
                 3 => {
                     // Perfect amount to trigger a `close` on the lower level, and remove
@@ -432,16 +456,19 @@ pub enum MigrationError {
     PathError(#[from] PathError),
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower: super::FileSystem>
-    super::private::Sealed for FileSystem<Platform, Upper, Lower>
+impl<
+        Platform: sync::RawSyncPrimitivesProvider,
+        Upper: super::FileSystem,
+        Lower: super::FileSystem,
+    > super::private::Sealed for FileSystem<Platform, Upper, Lower>
 {
 }
 
 impl<
-    Platform: sync::RawSyncPrimitivesProvider,
-    Upper: super::FileSystem + 'static,
-    Lower: super::FileSystem + 'static,
-> super::FileSystem for FileSystem<Platform, Upper, Lower>
+        Platform: sync::RawSyncPrimitivesProvider,
+        Upper: super::FileSystem + 'static,
+        Lower: super::FileSystem + 'static,
+    > super::FileSystem for FileSystem<Platform, Upper, Lower>
 {
     fn open(
         &self,
@@ -497,14 +524,29 @@ impl<
                 }
                 EntryX::Upper { .. } => unreachable!(),
                 EntryX::Lower { .. } => {
-                    // As an optimization, since a lower-level file entry is always opened with the
-                    // same flags, and since it indicates that there is no such file at the upper
-                    // level, we can just return that directly (with the "real" flags being wrapped
-                    // up in the layered descriptor).
+                    // The file exists in the lower layer and has no upper-level
+                    // override (not tombstoned). Open a fresh lower fd so this
+                    // descriptor gets its own file position — sharing the
+                    // existing fd would cause concurrent openers to interfere
+                    // with each other's read positions.
+                    let mut lower_flags = flags;
+                    lower_flags.remove(OFlags::CREAT);
+                    lower_flags.remove(OFlags::TRUNC);
+                    match self.layering_semantics {
+                        LayeringSemantics::LowerLayerReadOnly => {
+                            lower_flags.remove(OFlags::RDWR);
+                            lower_flags.remove(OFlags::WRONLY);
+                            lower_flags.insert(OFlags::RDONLY);
+                        }
+                        LayeringSemantics::LowerLayerWritableFiles => {}
+                    }
+                    let new_entry = Arc::new(EntryX::Lower {
+                        fd: self.lower.open(path.as_str(), lower_flags, mode)?,
+                    });
                     return Ok(self.litebox.descriptor_table_mut().insert(Descriptor {
                         path,
                         flags,
-                        entry: Arc::clone(entry),
+                        entry: new_entry,
                         position: 0.into(),
                     }));
                 }
@@ -599,12 +641,15 @@ impl<
         let entry = Arc::new(EntryX::Lower {
             fd: self.lower.open(path.as_str(), flags, mode)?,
         });
-        let old = self
-            .root
+        // Insert the entry for this path.  Another thread may have already
+        // inserted an entry for the same lower-layer path concurrently (e.g.
+        // two forked children both opening `/bin/dash`).  This is benign —
+        // both entries refer to the same underlying lower-layer file — so we
+        // simply allow the overwrite.
+        self.root
             .write()
             .entries
             .insert(path.clone(), Arc::clone(&entry));
-        assert!(old.is_none());
         let fd = self.litebox.descriptor_table_mut().insert(Descriptor {
             path,
             flags: original_flags,
@@ -676,9 +721,26 @@ impl<
             EntryX::Lower { .. } => {
                 // Lower level FDs almost always have a corresponding entry in the root. Thus, we
                 // might need to possibly clean things up from the root.
-                //
-                // First, we can attempt a fast-path clean-up by quickly check if there are other
-                // FDs referring to the same file
+
+                // Check whether this fd's Arc is shared with the root entry.
+                // If Arc::strong_count is 1, this fd was independently opened
+                // (not sharing the root Arc), so we can close the underlying
+                // lower fd directly without touching root.
+                if Arc::strong_count(&entry) == 1 {
+                    let root_entry = root_entries.get(&path);
+                    let is_root_shared = root_entry.is_some_and(|re| Arc::ptr_eq(&entry, re));
+                    if !is_root_shared {
+                        // This is an independently-opened lower fd.  Close it
+                        // directly; the root entry (if any) is unaffected.
+                        let EntryX::Lower { fd, .. } = Arc::into_inner(entry).unwrap() else {
+                            unreachable!()
+                        };
+                        return self.lower.close(&fd);
+                    }
+                }
+
+                // Fast-path: if there are other FDs referring to the same
+                // shared entry, leave the root alone.
                 if Arc::strong_count(&entry) > 2 {
                     // There are _definitely_ other FDs pointing at this file, leave it alone
                     return Ok(());
@@ -756,13 +818,17 @@ impl<
             EntryX::Lower { fd } => self.lower.read(fd, buf, offset)?,
             EntryX::Tombstone => unreachable!(),
         };
-        self.litebox
-            .descriptor_table()
-            .get_entry(fd)
-            .ok_or(ReadError::ClosedFd)?
-            .entry
-            .position
-            .fetch_add(num_bytes, SeqCst);
+        // Only advance position for regular reads (offset == None).
+        // pread64 (offset == Some) should NOT modify the file position.
+        if offset.is_none() {
+            self.litebox
+                .descriptor_table()
+                .get_entry(fd)
+                .ok_or(ReadError::ClosedFd)?
+                .entry
+                .position
+                .fetch_add(num_bytes, SeqCst);
+        }
         Ok(num_bytes)
     }
 
@@ -795,13 +861,15 @@ impl<
         match entry.as_ref() {
             EntryX::Upper { fd: upper_fd } => {
                 let num_bytes = self.upper.write(upper_fd, buf, offset)?;
-                self.litebox
-                    .descriptor_table()
-                    .get_entry(fd)
-                    .unwrap()
-                    .entry
-                    .position
-                    .fetch_add(num_bytes, SeqCst);
+                if offset.is_none() {
+                    self.litebox
+                        .descriptor_table()
+                        .get_entry(fd)
+                        .unwrap()
+                        .entry
+                        .position
+                        .fetch_add(num_bytes, SeqCst);
+                }
                 return Ok(num_bytes);
             }
             EntryX::Lower { fd: lower_fd } => {
@@ -812,7 +880,9 @@ impl<
                     LayeringSemantics::LowerLayerWritableFiles => {
                         // Allow direct write to lower layer
                         let num_bytes = self.lower.write(lower_fd, buf, offset)?;
-                        if let Some(e) = self.litebox.descriptor_table().get_entry(fd) {
+                        if offset.is_none()
+                            && let Some(e) = self.litebox.descriptor_table().get_entry(fd)
+                        {
                             e.entry.position.fetch_add(num_bytes, SeqCst);
                         }
                         return Ok(num_bytes);
