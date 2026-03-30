@@ -15,8 +15,9 @@ use std::thread::JoinHandle;
 
 use litebox_ipc::cq::{cq_notify_thread, cq_push};
 use litebox_ipc::messages::{
-    self, MSG_CHILD_READY, MSG_FORK_RESULT, MSG_LOCAL_RESULT, MSG_THREAD_DEREGISTER,
-    MSG_THREAD_REGISTER,
+    self, MSG_CHILD_READY, MSG_FORK_RESULT, MSG_LOCAL_RESULT, MSG_NOTIFY_ALARM, MSG_NOTIFY_PIPE2,
+    MSG_NOTIFY_SIGACTION, MSG_NOTIFY_SIGALTSTACK, MSG_NOTIFY_SIGPROCMASK, MSG_NOTIFY_WAIT4,
+    MSG_THREAD_DEREGISTER, MSG_THREAD_REGISTER,
 };
 use litebox_ipc::ring::{cq_flags, sq_flags, CqEntry, SqEntry, TrampolineDescriptor, RING_MASK};
 use litebox_ipc::sq::{sq_advance_head, sq_head_index, sq_try_consume};
@@ -55,6 +56,8 @@ pub struct ProcessServer<FS: ShimFS> {
     /// Joined when this server's `run()` loop exits, preventing premature
     /// central process termination while children are still running.
     child_handles: RefCell<Vec<JoinHandle<()>>>,
+    /// Per-process state from Tier 2 fire-and-forget notifications.
+    notification_state: RefCell<crate::notification_state::ProcessNotificationState>,
 }
 
 impl<FS: ShimFS> ProcessServer<FS> {
@@ -76,6 +79,9 @@ impl<FS: ShimFS> ProcessServer<FS> {
             shim,
             fs,
             child_handles: RefCell::new(Vec::new()),
+            notification_state: RefCell::new(
+                crate::notification_state::ProcessNotificationState::default(),
+            ),
         }
     }
 
@@ -1895,6 +1901,85 @@ impl<FS: ShimFS> ProcessServer<FS> {
             }
             // MSG_FORK_RESULT is a no-op acknowledgement.
             MSG_FORK_RESULT => 0,
+            MSG_NOTIFY_SIGACTION => {
+                #[allow(clippy::cast_possible_truncation)]
+                let signum = entry.args[0] as usize;
+                #[allow(clippy::cast_possible_wrap)]
+                let result = entry.args[4].cast_signed();
+                if result == 0 && signum < 64 {
+                    let mut state = self.notification_state.borrow_mut();
+                    state.signal_actions[signum] = Some(crate::notification_state::SignalAction {
+                        handler: entry.args[1],
+                        flags: entry.args[2],
+                        mask: entry.args[3],
+                    });
+                }
+                0
+            }
+            MSG_NOTIFY_SIGPROCMASK => {
+                #[allow(clippy::cast_possible_truncation)]
+                let how = entry.args[0] as i32;
+                let new_mask = entry.args[1];
+                let result = entry.args[2].cast_signed();
+                if result == 0 {
+                    let slot = entry.thread_slot as usize;
+                    let mut state = self.notification_state.borrow_mut();
+                    match how {
+                        libc::SIG_BLOCK => state.signal_masks[slot] |= new_mask,
+                        libc::SIG_UNBLOCK => state.signal_masks[slot] &= !new_mask,
+                        libc::SIG_SETMASK => state.signal_masks[slot] = new_mask,
+                        _ => {}
+                    }
+                }
+                0
+            }
+            MSG_NOTIFY_SIGALTSTACK => {
+                let result = entry.args[3].cast_signed();
+                if result == 0 {
+                    let slot = entry.thread_slot as usize;
+                    let mut state = self.notification_state.borrow_mut();
+                    state.alt_stacks[slot] = Some(crate::notification_state::AltStack {
+                        sp: entry.args[0],
+                        size: entry.args[1],
+                        flags: entry.args[2],
+                    });
+                }
+                0
+            }
+            MSG_NOTIFY_ALARM => {
+                let mut state = self.notification_state.borrow_mut();
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    state.alarm_seconds = entry.args[0] as u32;
+                }
+                0
+            }
+            MSG_NOTIFY_PIPE2 => {
+                let result = entry.args[3].cast_signed();
+                if result == 0 {
+                    let mut state = self.notification_state.borrow_mut();
+                    #[allow(clippy::cast_possible_truncation)]
+                    state
+                        .micro_pipes
+                        .push(crate::notification_state::MicroPipe {
+                            read_fd: entry.args[0] as i32,
+                            write_fd: entry.args[1] as i32,
+                            flags: entry.args[2] as i32,
+                        });
+                }
+                0
+            }
+            MSG_NOTIFY_WAIT4 => {
+                #[allow(clippy::cast_possible_truncation)]
+                let returned_pid = entry.args[1] as i32;
+                #[allow(clippy::cast_possible_truncation)]
+                let status = entry.args[2] as i32;
+                if returned_pid > 0 {
+                    let mut state = self.notification_state.borrow_mut();
+                    state.reaped_children.push((returned_pid, status));
+                }
+                0
+            }
             _ => -i64::from(libc::ENOSYS),
         };
         cq.result = result;

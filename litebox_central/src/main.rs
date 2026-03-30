@@ -6,6 +6,7 @@
 
 #[allow(dead_code)]
 mod dispatch;
+mod notification_state;
 mod server;
 mod shmem;
 
