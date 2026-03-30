@@ -437,30 +437,82 @@ pub unsafe fn execute_locally(
         nr if nr == libc::SYS_rseq as u32 => unsafe {
             raw_syscall::syscall4(libc::SYS_rseq, args[0], args[1], args[2], args[3])
         },
-        nr if nr == libc::SYS_prlimit64 as u32 => unsafe {
-            raw_syscall::syscall4(libc::SYS_prlimit64, args[0], args[1], args[2], args[3])
-        },
-        nr if nr == libc::SYS_getrandom as u32 => unsafe {
-            raw_syscall::syscall3(libc::SYS_getrandom, args[0], args[1], args[2])
-        },
-        nr if nr == libc::SYS_rt_sigaction as u32 => unsafe {
-            raw_syscall::syscall4(libc::SYS_rt_sigaction, args[0], args[1], args[2], args[3])
-        },
-        nr if nr == libc::SYS_rt_sigprocmask as u32 => unsafe {
-            raw_syscall::syscall4(libc::SYS_rt_sigprocmask, args[0], args[1], args[2], args[3])
-        },
-        nr if nr == libc::SYS_sigaltstack as u32 => unsafe {
-            raw_syscall::syscall2(libc::SYS_sigaltstack, args[0], args[1])
-        },
-        nr if nr == libc::SYS_sched_getaffinity as u32 => unsafe {
-            raw_syscall::syscall3(libc::SYS_sched_getaffinity, args[0], args[1], args[2])
-        },
-        nr if nr == libc::SYS_clock_gettime as u32 => unsafe {
-            raw_syscall::syscall2(libc::SYS_clock_gettime, args[0], args[1])
-        },
-        nr if nr == libc::SYS_gettimeofday as u32 => unsafe {
-            raw_syscall::syscall2(libc::SYS_gettimeofday, args[0], args[1])
-        },
+        nr if nr == libc::SYS_prlimit64 as u32 => {
+            // Bidirectional: old_limit output comes back via HAS_DATA.
+            if cq.flags & cq_flags::HAS_DATA != 0 {
+                let guest_buf = args[3] as *mut u8; // old_limit (r10)
+                let data_len = cq.data_len as usize;
+                if !ring_base.is_null() && data_len > 0 {
+                    unsafe {
+                        let data_src = ring_base
+                            .add(layout.data_region_offset)
+                            .add(cq.data_offset as usize);
+                        core::ptr::copy_nonoverlapping(data_src, guest_buf, data_len);
+                    }
+                }
+            }
+            cq.result
+        }
+        nr if nr == libc::SYS_getrandom as u32 => {
+            if cq.flags & cq_flags::HAS_DATA != 0 {
+                let guest_buf = args[0] as *mut u8; // buf (rdi)
+                let data_len = cq.data_len as usize;
+                if !ring_base.is_null() && data_len > 0 {
+                    unsafe {
+                        let data_src = ring_base
+                            .add(layout.data_region_offset)
+                            .add(cq.data_offset as usize);
+                        core::ptr::copy_nonoverlapping(data_src, guest_buf, data_len);
+                    }
+                }
+            }
+            cq.result
+        }
+        nr if nr == libc::SYS_sched_getaffinity as u32 => {
+            if cq.flags & cq_flags::HAS_DATA != 0 {
+                let guest_buf = args[2] as *mut u8; // mask (rdx)
+                let data_len = cq.data_len as usize;
+                if !ring_base.is_null() && data_len > 0 {
+                    unsafe {
+                        let data_src = ring_base
+                            .add(layout.data_region_offset)
+                            .add(cq.data_offset as usize);
+                        core::ptr::copy_nonoverlapping(data_src, guest_buf, data_len);
+                    }
+                }
+            }
+            cq.result
+        }
+        nr if nr == libc::SYS_clock_gettime as u32 => {
+            if cq.flags & cq_flags::HAS_DATA != 0 {
+                let guest_buf = args[1] as *mut u8; // tp (rsi)
+                let data_len = cq.data_len as usize;
+                if !ring_base.is_null() && data_len > 0 {
+                    unsafe {
+                        let data_src = ring_base
+                            .add(layout.data_region_offset)
+                            .add(cq.data_offset as usize);
+                        core::ptr::copy_nonoverlapping(data_src, guest_buf, data_len);
+                    }
+                }
+            }
+            cq.result
+        }
+        nr if nr == libc::SYS_gettimeofday as u32 => {
+            if cq.flags & cq_flags::HAS_DATA != 0 {
+                let guest_buf = args[0] as *mut u8; // tv (rdi)
+                let data_len = cq.data_len as usize;
+                if !ring_base.is_null() && data_len > 0 {
+                    unsafe {
+                        let data_src = ring_base
+                            .add(layout.data_region_offset)
+                            .add(cq.data_offset as usize);
+                        core::ptr::copy_nonoverlapping(data_src, guest_buf, data_len);
+                    }
+                }
+            }
+            cq.result
+        }
         // Sleep: dereference guest timespec struct for duration
         nr if nr == libc::SYS_nanosleep as u32 => unsafe {
             raw_syscall::syscall2(libc::SYS_nanosleep, args[0], args[1])
@@ -501,27 +553,98 @@ pub unsafe fn execute_locally(
         nr if nr == libc::SYS_pipe2 as u32 => unsafe {
             raw_syscall::syscall2(libc::SYS_pipe2, args[0], args[1])
         },
+        // Signal syscalls: executed locally via raw kernel syscalls (micro-local
+        // fast-path normally handles these, but these arms serve as fallback).
         nr if nr == libc::SYS_alarm as u32 => unsafe {
             raw_syscall::syscall1(libc::SYS_alarm, args[0])
         },
         nr if nr == libc::SYS_rt_sigsuspend as u32 => unsafe {
             raw_syscall::syscall2(libc::SYS_rt_sigsuspend, args[0], args[1])
         },
-        nr if nr == libc::SYS_time as u32 => unsafe {
-            raw_syscall::syscall1(libc::SYS_time, args[0])
+        nr if nr == libc::SYS_rt_sigaction as u32 => unsafe {
+            raw_syscall::syscall4(libc::SYS_rt_sigaction, args[0], args[1], args[2], args[3])
         },
-        nr if nr == libc::SYS_uname as u32 => unsafe {
-            raw_syscall::syscall1(libc::SYS_uname, args[0])
+        nr if nr == libc::SYS_rt_sigprocmask as u32 => unsafe {
+            raw_syscall::syscall4(libc::SYS_rt_sigprocmask, args[0], args[1], args[2], args[3])
         },
-        nr if nr == libc::SYS_sysinfo as u32 => unsafe {
-            raw_syscall::syscall1(libc::SYS_sysinfo, args[0])
+        nr if nr == libc::SYS_sigaltstack as u32 => unsafe {
+            raw_syscall::syscall2(libc::SYS_sigaltstack, args[0], args[1])
         },
-        nr if nr == libc::SYS_getrlimit as u32 => unsafe {
-            raw_syscall::syscall2(libc::SYS_getrlimit, args[0], args[1])
-        },
-        nr if nr == libc::SYS_clock_getres as u32 => unsafe {
-            raw_syscall::syscall2(libc::SYS_clock_getres, args[0], args[1])
-        },
+        nr if nr == libc::SYS_time as u32 => {
+            if cq.flags & cq_flags::HAS_DATA != 0 {
+                let guest_buf = args[0] as *mut u8; // tloc (rdi)
+                let data_len = cq.data_len as usize;
+                if !ring_base.is_null() && data_len > 0 {
+                    unsafe {
+                        let data_src = ring_base
+                            .add(layout.data_region_offset)
+                            .add(cq.data_offset as usize);
+                        core::ptr::copy_nonoverlapping(data_src, guest_buf, data_len);
+                    }
+                }
+            }
+            cq.result
+        }
+        nr if nr == libc::SYS_uname as u32 => {
+            if cq.flags & cq_flags::HAS_DATA != 0 {
+                let guest_buf = args[0] as *mut u8; // buf (rdi)
+                let data_len = cq.data_len as usize;
+                if !ring_base.is_null() && data_len > 0 {
+                    unsafe {
+                        let data_src = ring_base
+                            .add(layout.data_region_offset)
+                            .add(cq.data_offset as usize);
+                        core::ptr::copy_nonoverlapping(data_src, guest_buf, data_len);
+                    }
+                }
+            }
+            cq.result
+        }
+        nr if nr == libc::SYS_sysinfo as u32 => {
+            if cq.flags & cq_flags::HAS_DATA != 0 {
+                let guest_buf = args[0] as *mut u8; // info (rdi)
+                let data_len = cq.data_len as usize;
+                if !ring_base.is_null() && data_len > 0 {
+                    unsafe {
+                        let data_src = ring_base
+                            .add(layout.data_region_offset)
+                            .add(cq.data_offset as usize);
+                        core::ptr::copy_nonoverlapping(data_src, guest_buf, data_len);
+                    }
+                }
+            }
+            cq.result
+        }
+        nr if nr == libc::SYS_getrlimit as u32 => {
+            if cq.flags & cq_flags::HAS_DATA != 0 {
+                let guest_buf = args[1] as *mut u8; // rlim (rsi)
+                let data_len = cq.data_len as usize;
+                if !ring_base.is_null() && data_len > 0 {
+                    unsafe {
+                        let data_src = ring_base
+                            .add(layout.data_region_offset)
+                            .add(cq.data_offset as usize);
+                        core::ptr::copy_nonoverlapping(data_src, guest_buf, data_len);
+                    }
+                }
+            }
+            cq.result
+        }
+        nr if nr == libc::SYS_clock_getres as u32 => {
+            if cq.flags & cq_flags::HAS_DATA != 0 {
+                let guest_buf = args[1] as *mut u8; // res (rsi)
+                let data_len = cq.data_len as usize;
+                if !ring_base.is_null() && data_len > 0 {
+                    unsafe {
+                        let data_src = ring_base
+                            .add(layout.data_region_offset)
+                            .add(cq.data_offset as usize);
+                        core::ptr::copy_nonoverlapping(data_src, guest_buf, data_len);
+                    }
+                }
+            }
+            cq.result
+        }
         nr if nr == libc::SYS_writev as u32 => unsafe {
             raw_syscall::syscall3(libc::SYS_writev, args[0], args[1], args[2])
         },
@@ -598,19 +721,6 @@ pub unsafe fn execute_micro_local(syscall_nr: u32, args: &[u64; 6]) -> i64 {
         nr if nr == libc::SYS_getgid as u32 => 0,
         nr if nr == libc::SYS_geteuid as u32 => 0,
         nr if nr == libc::SYS_getegid as u32 => 0,
-        // Time: read-only kernel state, writes to guest buffer
-        nr if nr == libc::SYS_clock_gettime as u32 => unsafe {
-            raw_syscall::syscall2(libc::SYS_clock_gettime, args[0], args[1])
-        },
-        nr if nr == libc::SYS_gettimeofday as u32 => unsafe {
-            raw_syscall::syscall2(libc::SYS_gettimeofday, args[0], args[1])
-        },
-        nr if nr == libc::SYS_time as u32 => unsafe {
-            raw_syscall::syscall1(libc::SYS_time, args[0])
-        },
-        nr if nr == libc::SYS_clock_getres as u32 => unsafe {
-            raw_syscall::syscall2(libc::SYS_clock_getres, args[0], args[1])
-        },
         // Sleep: blocking, no shared state
         nr if nr == libc::SYS_nanosleep as u32 => unsafe {
             raw_syscall::syscall2(libc::SYS_nanosleep, args[0], args[1])
@@ -637,7 +747,12 @@ pub unsafe fn execute_micro_local(syscall_nr: u32, args: &[u64; 6]) -> i64 {
         nr if nr == libc::SYS_rseq as u32 => unsafe {
             raw_syscall::syscall4(libc::SYS_rseq, args[0], args[1], args[2], args[3])
         },
-        // Signals: process-local signal state
+        // Signal suspend: must block in micro where real signals are delivered.
+        nr if nr == libc::SYS_rt_sigsuspend as u32 => unsafe {
+            raw_syscall::syscall2(libc::SYS_rt_sigsuspend, args[0], args[1])
+        },
+        // Signal management: must execute locally because micro is the process
+        // that receives real kernel signals (alarm timers, SIGCHLD, etc.).
         nr if nr == libc::SYS_rt_sigaction as u32 => unsafe {
             raw_syscall::syscall4(libc::SYS_rt_sigaction, args[0], args[1], args[2], args[3])
         },
@@ -647,31 +762,10 @@ pub unsafe fn execute_micro_local(syscall_nr: u32, args: &[u64; 6]) -> i64 {
         nr if nr == libc::SYS_sigaltstack as u32 => unsafe {
             raw_syscall::syscall2(libc::SYS_sigaltstack, args[0], args[1])
         },
-        nr if nr == libc::SYS_rt_sigsuspend as u32 => unsafe {
-            raw_syscall::syscall2(libc::SYS_rt_sigsuspend, args[0], args[1])
-        },
         nr if nr == libc::SYS_alarm as u32 => unsafe {
             raw_syscall::syscall1(libc::SYS_alarm, args[0])
         },
-        // Random/info: write to guest buffer, no shared state
-        nr if nr == libc::SYS_getrandom as u32 => unsafe {
-            raw_syscall::syscall3(libc::SYS_getrandom, args[0], args[1], args[2])
-        },
-        nr if nr == libc::SYS_sched_getaffinity as u32 => unsafe {
-            raw_syscall::syscall3(libc::SYS_sched_getaffinity, args[0], args[1], args[2])
-        },
-        nr if nr == libc::SYS_prlimit64 as u32 => unsafe {
-            raw_syscall::syscall4(libc::SYS_prlimit64, args[0], args[1], args[2], args[3])
-        },
-        nr if nr == libc::SYS_uname as u32 => unsafe {
-            raw_syscall::syscall1(libc::SYS_uname, args[0])
-        },
-        nr if nr == libc::SYS_sysinfo as u32 => unsafe {
-            raw_syscall::syscall1(libc::SYS_sysinfo, args[0])
-        },
-        nr if nr == libc::SYS_getrlimit as u32 => unsafe {
-            raw_syscall::syscall2(libc::SYS_getrlimit, args[0], args[1])
-        },
+        // Memory query: checks pages in micro's address space
         nr if nr == libc::SYS_mincore as u32 => unsafe {
             raw_syscall::syscall3(libc::SYS_mincore, args[0], args[1], args[2])
         },
@@ -820,41 +914,45 @@ mod tests {
     /// `execute_micro_local` (doesn't return -ENOSYS). We only test safe,
     /// non-blocking zero-arg syscalls for actual dispatch; the rest are
     /// covered by the `is_micro_local` check alone.
+    ///
+    /// Note: Group 1 syscalls (uname, sysinfo, getrlimit, prlimit64,
+    /// sched_getaffinity, getrandom, clock_gettime, gettimeofday, time,
+    /// clock_getres, rt_sigaction, rt_sigprocmask, sigaltstack, alarm)
+    /// are now routed through central's shim via HAS_DATA, not micro-local.
     #[test]
     #[allow(clippy::cast_possible_truncation)]
     fn micro_local_covers_all_listed() {
         // All syscalls in the micro-local set (must match is_micro_local).
+        // Only includes syscalls that MUST run in micro's process.
         let micro_local_nrs: &[i64] = &[
+            // Identity — return virtual values from MicroState.
             libc::SYS_getpid,
             libc::SYS_getppid,
             libc::SYS_getuid,
             libc::SYS_getgid,
             libc::SYS_geteuid,
             libc::SYS_getegid,
-            libc::SYS_clock_gettime,
-            libc::SYS_gettimeofday,
-            libc::SYS_time,
-            libc::SYS_clock_getres,
+            // Sleep — must block in micro's thread.
             libc::SYS_nanosleep,
             libc::SYS_clock_nanosleep,
+            // Thread setup — thread-local kernel state.
             libc::SYS_arch_prctl,
             libc::SYS_set_tid_address,
             libc::SYS_set_robust_list,
             libc::SYS_rseq,
+            // Signals — must execute locally for real kernel signal delivery.
             libc::SYS_rt_sigaction,
             libc::SYS_rt_sigprocmask,
             libc::SYS_sigaltstack,
             libc::SYS_rt_sigsuspend,
             libc::SYS_alarm,
-            libc::SYS_getrandom,
-            libc::SYS_sched_getaffinity,
-            libc::SYS_prlimit64,
-            libc::SYS_uname,
-            libc::SYS_sysinfo,
-            libc::SYS_getrlimit,
+            // Memory — checks pages in micro's address space.
             libc::SYS_mincore,
+            // Process — micro's PID namespace.
             libc::SYS_wait4,
+            // Pipes — creates real OS pipes in micro.
             libc::SYS_pipe2,
+            // FS sync — kernel FS sync.
             libc::SYS_sync,
         ];
 

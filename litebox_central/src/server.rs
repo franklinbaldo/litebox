@@ -323,6 +323,29 @@ impl<FS: ShimFS> ProcessServer<FS> {
             return self.handle_data_consuming_io(entry);
         }
 
+        // Process/user identity: return virtual values directly.
+        // Micro's fast-path also handles these, but if they reach central
+        // (e.g., from execute_locally path), return the virtual values.
+        #[allow(clippy::cast_possible_truncation)]
+        match i64::from(nr) {
+            libc::SYS_getpid => {
+                // Guest is always PID 1.
+                cq.result = 1;
+                return cq;
+            }
+            libc::SYS_getppid => {
+                // Guest's parent is PID 0 (no parent).
+                cq.result = 0;
+                return cq;
+            }
+            libc::SYS_getuid | libc::SYS_getgid | libc::SYS_geteuid | libc::SYS_getegid => {
+                // Virtual root identity (uid=0, gid=0).
+                cq.result = 0;
+                return cq;
+            }
+            _ => {}
+        }
+
         if Self::needs_local_exec(nr) {
             cq.flags = cq_flags::EXEC_LOCAL;
             return cq;
@@ -679,58 +702,32 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 | libc::SYS_recvmsg
                 | libc::SYS_sendmsg
                 // Arch/thread syscalls: must execute in guest context
+                // (set kernel thread-local state in micro's threads).
                 | libc::SYS_arch_prctl
                 | libc::SYS_set_tid_address
                 | libc::SYS_set_robust_list
                 | libc::SYS_rseq
-                // Resource limit: dereference guest rlimit struct
-                | libc::SYS_prlimit64
-                // Random: writes to guest buffer
-                | libc::SYS_getrandom
-                // Signal: dereference guest sigaction/sigset structs
-                | libc::SYS_rt_sigaction
-                | libc::SYS_rt_sigprocmask
-                // Signal suspend: must execute locally where real signals
-                // (SIGCHLD from fork children) are delivered.
-                | libc::SYS_rt_sigsuspend
-                // Signal stack: dereference guest stack_t pointers
-                | libc::SYS_sigaltstack
-                // Sched: dereference guest cpu_set buffer
-                | libc::SYS_sched_getaffinity
-                // Time: writes to guest timespec/timeval
-                | libc::SYS_clock_gettime
-                | libc::SYS_gettimeofday
-                // Sleep: dereference guest timespec struct for duration
+                // Sleep: must block in micro's thread.
                 | libc::SYS_nanosleep
                 | libc::SYS_clock_nanosleep
-                // Filesystem sync: no arguments, must execute locally
+                // Signal syscalls: must execute locally in micro's process
+                // where real kernel signal delivery happens. The guest
+                // relies on real alarm() timers and real sigaction handlers.
+                | libc::SYS_rt_sigaction
+                | libc::SYS_rt_sigprocmask
+                | libc::SYS_sigaltstack
+                | libc::SYS_rt_sigsuspend
+                | libc::SYS_alarm
+                // Filesystem sync: no arguments, must execute locally.
                 | libc::SYS_sync
                 // Process wait: must run in micro's PID namespace where
                 // the real child process lives (central has no children).
                 | libc::SYS_wait4
-                // Pipe/timer: pipe2 creates real OS pipes in micro's process;
-                // alarm sets a process timer.
+                // Pipe creation: creates real OS pipes in micro's process.
                 | libc::SYS_pipe2
-                | libc::SYS_alarm
-                // Syscalls that write results to guest memory pointers.
-                // Must execute locally because central cannot dereference
-                // addresses in the guest's (launcher's) address space.
-                | libc::SYS_time
-                | libc::SYS_uname
-                | libc::SYS_sysinfo
-                | libc::SYS_getrlimit
-                | libc::SYS_clock_getres
-                // Process/user identity: simple queries with no pointer args.
-                // Must execute locally so the guest sees real UID/GID/PID
-                // values from the OS rather than ENOSYS from the shim.
-                | libc::SYS_getpid
-                | libc::SYS_getppid
-                | libc::SYS_getuid
-                | libc::SYS_getgid
-                | libc::SYS_geteuid
-                | libc::SYS_getegid
                 // Memory query: mincore checks page residency on real OS
-                // pages in the guest's address space.
+                // pages in the guest's address space — cannot be done from
+                // central's address space.
                 | libc::SYS_mincore
         )
     }
@@ -772,6 +769,19 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 | libc::SYS_readlinkat
                 | libc::SYS_getdents64
                 | libc::SYS_getcwd
+                // Info queries: shim implements these with virtual values;
+                // results are written to the shmem data region and copied
+                // to the guest buffer by micro.
+                | libc::SYS_uname
+                | libc::SYS_sysinfo
+                | libc::SYS_getrlimit
+                | libc::SYS_prlimit64
+                | libc::SYS_sched_getaffinity
+                | libc::SYS_getrandom
+                | libc::SYS_clock_gettime
+                | libc::SYS_gettimeofday
+                | libc::SYS_time
+                | libc::SYS_clock_getres
         )
     }
 
@@ -793,9 +803,20 @@ impl<FS: ShimFS> ProcessServer<FS> {
 
         let mut regs = crate::dispatch::sq_entry_to_ptregs(entry);
 
-        // For pathname syscalls (newfstatat), also handle pathname transfer.
+        // For pathname syscalls (newfstatat, stat, lstat, readlink,
+        // readlinkat), micro copies the pathname into the data region.
+        // Only read it for those syscalls — bidirectional syscalls also use
+        // data_len for input struct data, which is a different format.
         let mut pathname_buf: Vec<u8> = Vec::new();
-        if entry.data_len > 0 {
+        let is_pathname_syscall = matches!(
+            i64::from(nr),
+            libc::SYS_newfstatat
+                | libc::SYS_stat
+                | libc::SYS_lstat
+                | libc::SYS_readlink
+                | libc::SYS_readlinkat
+        );
+        if is_pathname_syscall && entry.data_len > 0 {
             let data = self.region.data_region();
             let offset = entry.data_offset as usize;
             let len = entry.data_len as usize;
@@ -957,6 +978,181 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
                     cq.data_offset = 0;
                     cq.data_len = cq.result as u32;
+                }
+            }
+            // ── Info queries ────────────────────────────────────────────
+            // The shim implements these with virtual values; output is
+            // written into the shmem data region and copied to the guest
+            // buffer by micro.
+            libc::SYS_uname => {
+                // uname(buf) — rewrite buf (rdi) to data region.
+                // struct utsname = 6 × 65 = 390 bytes.
+                const UTSNAME_SIZE: u32 = 390;
+                regs.rdi = data_ptr;
+                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                if cq.result >= 0 {
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.data_offset = 0;
+                    cq.data_len = UTSNAME_SIZE;
+                }
+            }
+            libc::SYS_sysinfo => {
+                // sysinfo(info) — rewrite info (rdi) to data region.
+                // struct sysinfo = 112 bytes on x86_64.
+                const SYSINFO_SIZE: u32 =
+                    core::mem::size_of::<litebox_common_linux::Sysinfo>() as u32;
+                regs.rdi = data_ptr;
+                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                if cq.result >= 0 {
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.data_offset = 0;
+                    cq.data_len = SYSINFO_SIZE;
+                }
+            }
+            libc::SYS_getrlimit => {
+                // getrlimit(resource, rlim) — rewrite rlim (rsi) to data region.
+                // struct rlimit = 16 bytes on x86_64.
+                const RLIMIT_SIZE: u32 =
+                    core::mem::size_of::<litebox_common_linux::Rlimit>() as u32;
+                regs.rsi = data_ptr;
+                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                if cq.result >= 0 {
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.data_offset = 0;
+                    cq.data_len = RLIMIT_SIZE;
+                }
+            }
+            libc::SYS_prlimit64 => {
+                // prlimit64(pid, resource, new_limit, old_limit)
+                // Bidirectional: new_limit is input (ConstPtr, arg2/rdx),
+                // old_limit is output (MutPtr, arg3/r10).
+                // struct rlimit64 = 16 bytes.
+                const RLIMIT64_SIZE: usize = core::mem::size_of::<litebox_common_linux::Rlimit64>();
+                // If micro sent input data (new_limit != NULL), read from the
+                // correct data region offset into a local copy (micro writes
+                // at WRITE_DATA_BASE_OFFSET + thread_slot * 65536, not at 0).
+                let mut input_buf: Vec<u8> = Vec::new();
+                if entry.data_len > 0 {
+                    let data = self.region.data_region();
+                    let offset = entry.data_offset as usize;
+                    let len = entry.data_len as usize;
+                    if offset + len <= data.len() {
+                        input_buf.extend_from_slice(&data[offset..offset + len]);
+                    }
+                }
+                if !input_buf.is_empty() {
+                    // Point new_limit (rdx) at the local copy.
+                    regs.rdx = input_buf.as_ptr() as usize;
+                }
+                // Point old_limit (r10) at offset 0 of the data region for output.
+                let old_limit_arg = entry.args[3]; // original r10 from guest
+                if old_limit_arg != 0 {
+                    regs.r10 = data_ptr;
+                }
+                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                if cq.result >= 0 && old_limit_arg != 0 {
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.data_offset = 0;
+                    cq.data_len = RLIMIT64_SIZE as u32;
+                } else if cq.result >= 0 {
+                    // No output requested (old_limit was NULL), just success.
+                    cq.flags = cq_flags::EXEC_LOCAL;
+                }
+            }
+            libc::SYS_sched_getaffinity => {
+                // sched_getaffinity(pid, cpusetsize, mask) — rewrite
+                // mask (rdx) to data region.
+                let cpusetsize = entry.args[1] as usize;
+                let capped = cpusetsize.min(data_region.len());
+                regs.rdx = data_ptr;
+                regs.rsi = capped;
+                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                if cq.result > 0 {
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.data_offset = 0;
+                    cq.data_len = cq.result as u32;
+                }
+            }
+            libc::SYS_getrandom => {
+                // getrandom(buf, buflen, flags) — rewrite buf (rdi) to
+                // data region.
+                let buflen = entry.args[1] as usize;
+                let capped = buflen.min(data_region.len());
+                regs.rdi = data_ptr;
+                regs.rsi = capped;
+                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                if cq.result > 0 {
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.data_offset = 0;
+                    cq.data_len = cq.result as u32;
+                }
+            }
+            // ── Time queries ────────────────────────────────────────────
+            libc::SYS_clock_gettime => {
+                // clock_gettime(clockid, tp) — rewrite tp (rsi) to data
+                // region. struct timespec = 16 bytes on x86_64.
+                const TIMESPEC_SIZE: u32 = 16;
+                regs.rsi = data_ptr;
+                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                if cq.result >= 0 {
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.data_offset = 0;
+                    cq.data_len = TIMESPEC_SIZE;
+                }
+            }
+            libc::SYS_clock_getres => {
+                // clock_getres(clockid, res) — rewrite res (rsi) to data
+                // region. struct timespec = 16 bytes on x86_64.
+                const TIMESPEC_SIZE: u32 = 16;
+                let res_arg = entry.args[1]; // original rsi from guest
+                if res_arg != 0 {
+                    regs.rsi = data_ptr;
+                }
+                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                if cq.result >= 0 && res_arg != 0 {
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.data_offset = 0;
+                    cq.data_len = TIMESPEC_SIZE;
+                } else if cq.result >= 0 {
+                    cq.flags = cq_flags::EXEC_LOCAL;
+                }
+            }
+            libc::SYS_gettimeofday => {
+                // gettimeofday(tv, tz) — rewrite tv (rdi) to data region.
+                // struct timeval = 16 bytes on x86_64.
+                // tz is obsolete and usually NULL; we don't rewrite it.
+                const TIMEVAL_SIZE: u32 =
+                    core::mem::size_of::<litebox_common_linux::TimeVal>() as u32;
+                let tv_arg = entry.args[0]; // original rdi from guest
+                if tv_arg != 0 {
+                    regs.rdi = data_ptr;
+                }
+                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                if cq.result >= 0 && tv_arg != 0 {
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.data_offset = 0;
+                    cq.data_len = TIMEVAL_SIZE;
+                } else if cq.result >= 0 {
+                    cq.flags = cq_flags::EXEC_LOCAL;
+                }
+            }
+            libc::SYS_time => {
+                // time(tloc) — rewrite tloc (rdi) to data region.
+                // time_t = 8 bytes on x86_64. Return value is also the time.
+                const TIME_T_SIZE: u32 =
+                    core::mem::size_of::<litebox_common_linux::time_t>() as u32;
+                let tloc_arg = entry.args[0]; // original rdi from guest
+                if tloc_arg != 0 {
+                    regs.rdi = data_ptr;
+                }
+                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                if cq.result >= 0 && tloc_arg != 0 {
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.data_offset = 0;
+                    cq.data_len = TIME_T_SIZE;
+                } else if cq.result >= 0 {
+                    // tloc was NULL; result is the time value directly.
+                    cq.flags = cq_flags::EXEC_LOCAL;
                 }
             }
             _ => {

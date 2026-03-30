@@ -212,6 +212,74 @@ fn copy_write_data_to_data_region(
     }
 }
 
+/// Returns `(input_arg_index, input_size)` for bidirectional syscalls where
+/// central needs input data from the guest's memory. Returns `None` if the
+/// syscall has no input pointer, or the pointer is NULL.
+///
+/// Currently only `prlimit64` is bidirectional through central.
+/// Signal syscalls (rt_sigaction, rt_sigprocmask, sigaltstack) are handled
+/// as micro-local because they must execute real kernel signal operations
+/// in the guest's process.
+#[allow(clippy::cast_possible_truncation)]
+fn bidirectional_input_info(nr: u32, args: &[u64; 6]) -> Option<(usize, usize)> {
+    match i64::from(nr) {
+        libc::SYS_prlimit64 => {
+            // prlimit64(pid, resource, new_limit, old_limit): input=arg2 (new_limit)
+            // Rlimit64 = 16 bytes (2 × u64)
+            if args[2] != 0 {
+                Some((2, 16))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Copy input data for bidirectional syscalls from the guest's memory into
+/// the shared data region, so central can pass it to the shim.
+///
+/// Uses the same write-data zone as `copy_write_data_to_data_region`:
+/// `WRITE_DATA_BASE_OFFSET + thread_slot * WRITE_DATA_REGION_SIZE`.
+///
+/// # Safety
+///
+/// The input pointer (from `args`) must point to valid readable memory of
+/// at least `size` bytes in the guest's address space.
+#[allow(clippy::cast_possible_truncation)]
+fn copy_bidirectional_input_to_data_region(
+    entry: &mut SqEntry,
+    args: &[u64; 6],
+    syscall_nr: u32,
+    ring_base: *mut u8,
+    layout: &SharedRingLayout,
+) {
+    let Some((input_idx, input_size)) = bidirectional_input_info(syscall_nr, args) else {
+        return;
+    };
+
+    let input_ptr = args[input_idx] as *const u8;
+    if input_ptr.is_null() || input_size == 0 {
+        return;
+    }
+
+    // Use the write data zone (same offset scheme as write data).
+    let thread_offset =
+        WRITE_DATA_BASE_OFFSET + entry.thread_slot as usize * WRITE_DATA_REGION_SIZE;
+    if thread_offset + input_size > layout.data_region_size {
+        return;
+    }
+
+    // Copy input data from guest memory into the data region.
+    unsafe {
+        let dst = ring_base.add(layout.data_region_offset + thread_offset);
+        core::ptr::copy_nonoverlapping(input_ptr, dst, input_size);
+    }
+
+    entry.data_offset = thread_offset as u32;
+    entry.data_len = input_size as u32;
+}
+
 /// Submit an `SqEntry` and wait for the corresponding `CqEntry`.
 ///
 /// # Safety
@@ -258,6 +326,17 @@ pub(crate) unsafe fn submit_and_wait(
     // the shim (which may handle virtual fds).
     copy_write_data_to_data_region(entry, args, syscall_nr, micro.ring_base, &micro.layout);
 
+    // For bidirectional syscalls (prlimit64, rt_sigaction, rt_sigprocmask,
+    // sigaltstack), copy the input struct from the guest's memory so
+    // central can pass it to the shim.
+    copy_bidirectional_input_to_data_region(
+        entry,
+        args,
+        syscall_nr,
+        micro.ring_base,
+        &micro.layout,
+    );
+
     sq_publish(entry);
     header
         .sq_notify
@@ -296,39 +375,30 @@ unsafe fn report_local_result(tls: *mut MicroTls, original_seq: u64, result: i64
 pub(crate) fn is_micro_local(nr: u32) -> bool {
     matches!(
         i64::from(nr),
-        // Process/user identity: return kernel constants
+        // Process/user identity: return virtual values from MicroState
         libc::SYS_getpid
             | libc::SYS_getppid
             | libc::SYS_getuid
             | libc::SYS_getgid
             | libc::SYS_geteuid
             | libc::SYS_getegid
-            // Time: read-only kernel state, writes to guest buffer
-            | libc::SYS_clock_gettime
-            | libc::SYS_gettimeofday
-            | libc::SYS_time
-            | libc::SYS_clock_getres
             // Sleep: blocking, no shared state
             | libc::SYS_nanosleep
             | libc::SYS_clock_nanosleep
-            // Thread setup: thread-local only
+            // Thread setup: thread-local only, must execute in guest context
             | libc::SYS_arch_prctl
             | libc::SYS_set_tid_address
             | libc::SYS_set_robust_list
             | libc::SYS_rseq
-            // Signals: process-local signal state
+            // Signal syscalls: must execute locally in micro's process
+            // where real kernel signal delivery happens. The guest relies
+            // on real alarm() timers and real sigaction handlers.
             | libc::SYS_rt_sigaction
             | libc::SYS_rt_sigprocmask
             | libc::SYS_sigaltstack
             | libc::SYS_rt_sigsuspend
             | libc::SYS_alarm
-            // Random/info: write to guest buffer, no shared state
-            | libc::SYS_getrandom
-            | libc::SYS_sched_getaffinity
-            | libc::SYS_prlimit64
-            | libc::SYS_uname
-            | libc::SYS_sysinfo
-            | libc::SYS_getrlimit
+            // Memory query: checks pages in micro's address space
             | libc::SYS_mincore
             // Process wait: must run in micro's PID namespace
             | libc::SYS_wait4
