@@ -35,6 +35,9 @@ pub mod sq_flags {
     pub const NEED_AUTH: u16 = 1 << 1;
     /// Report the result of this syscall back to the guest.
     pub const REPORT_RESULT: u16 = 1 << 2;
+    /// This entry is a one-way notification — central should process it
+    /// but NOT write a CQ entry or wake the sender.
+    pub const NOTIFY_ONLY: u16 = 1 << 3;
 }
 
 /// Flags for completion queue entries.

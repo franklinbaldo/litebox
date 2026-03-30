@@ -72,6 +72,34 @@ pub const MSG_LOCAL_RESULT: u32 = MSG_BASE + 4;
 /// - Contains chunk data in the data region (HAS_DATA flag set).
 pub const MSG_EXECVE_READY: u32 = MSG_BASE + 5;
 
+/// Notification: micro executed rt_sigaction locally.
+/// args[0] = signum, args[1] = handler address, args[2] = sa_flags,
+/// args[3] = sa_mask, args[4] = result (0 or -errno).
+pub const MSG_NOTIFY_SIGACTION: u32 = MSG_BASE + 6;
+
+/// Notification: micro executed rt_sigprocmask locally.
+/// args[0] = how (SIG_BLOCK/UNBLOCK/SETMASK), args[1] = new mask bits,
+/// args[2] = result.
+pub const MSG_NOTIFY_SIGPROCMASK: u32 = MSG_BASE + 7;
+
+/// Notification: micro executed sigaltstack locally.
+/// args[0] = ss_sp, args[1] = ss_size, args[2] = ss_flags, args[3] = result.
+pub const MSG_NOTIFY_SIGALTSTACK: u32 = MSG_BASE + 8;
+
+/// Notification: micro executed alarm locally.
+/// args[0] = seconds requested, args[1] = return value (remaining seconds).
+pub const MSG_NOTIFY_ALARM: u32 = MSG_BASE + 9;
+
+/// Notification: micro executed pipe2 locally.
+/// args[0] = fd[0] (read end), args[1] = fd[1] (write end),
+/// args[2] = flags, args[3] = result (0 or -errno).
+pub const MSG_NOTIFY_PIPE2: u32 = MSG_BASE + 10;
+
+/// Notification: micro executed wait4 locally.
+/// args[0] = pid arg, args[1] = returned pid, args[2] = status,
+/// args[3] = options, args[4] = result.
+pub const MSG_NOTIFY_WAIT4: u32 = MSG_BASE + 11;
+
 /// Returns `true` if `syscall_nr` is a control message (>= [`MSG_BASE`])
 /// rather than a real Linux syscall number.
 pub const fn is_control_message(syscall_nr: u32) -> bool {

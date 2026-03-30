@@ -18,7 +18,7 @@ use litebox_ipc::messages::{
     self, MSG_CHILD_READY, MSG_FORK_RESULT, MSG_LOCAL_RESULT, MSG_THREAD_DEREGISTER,
     MSG_THREAD_REGISTER,
 };
-use litebox_ipc::ring::{cq_flags, CqEntry, SqEntry, TrampolineDescriptor, RING_MASK};
+use litebox_ipc::ring::{cq_flags, sq_flags, CqEntry, SqEntry, TrampolineDescriptor, RING_MASK};
 use litebox_ipc::sq::{sq_advance_head, sq_head_index, sq_try_consume};
 use litebox_ipc::wait::spin_then_wait;
 use litebox_shim_linux::ShimFS;
@@ -136,6 +136,17 @@ impl<FS: ShimFS> ProcessServer<FS> {
             } else {
                 self.handle_syscall(entry)
             };
+
+            // Notification-only: central processed it, skip CQ response.
+            let is_notify_only = entry.flags & sq_flags::NOTIFY_ONLY != 0;
+
+            if is_notify_only {
+                sq_advance_head(header, entry);
+                if self.primary_task.is_exiting() {
+                    break;
+                }
+                continue;
+            }
 
             // SAFETY: `cq_entries` points to a valid array of RING_SIZE CqEntry
             // values in the shared memory region. We are the sole CQ producer

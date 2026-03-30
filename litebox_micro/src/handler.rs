@@ -368,6 +368,45 @@ unsafe fn report_local_result(tls: *mut MicroTls, original_seq: u64, result: i64
     }
 }
 
+/// Send a fire-and-forget notification to central.
+///
+/// Publishes an SQ entry with the `NOTIFY_ONLY` flag. Central will process
+/// the notification (update state tracking) but will NOT write a CQ response.
+/// Micro returns immediately without waiting.
+///
+/// # Safety
+///
+/// - `tls` must point to a valid, initialized `MicroTls`.
+/// - The ring buffer referenced by the TLS must be valid and properly mapped.
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) unsafe fn notify_central(tls: *mut MicroTls, syscall_nr: u32, args: &[u64; 6]) {
+    let micro = unsafe { &*(*tls).micro };
+    let (header, sq_entries, _cq_entries) = unsafe { ring_ptrs(micro.ring_base, &micro.layout) };
+
+    let seq = unsafe { (*tls).seq_counter };
+    unsafe { (*tls).seq_counter += 1 };
+
+    let thread_slot = unsafe { (*tls).thread_slot as u16 };
+
+    let slot_idx = unsafe { sq_acquire_slot(header) };
+    let entry = unsafe { &mut *sq_entries.add(slot_idx as usize) };
+
+    entry.seq = seq;
+    entry.syscall_nr = syscall_nr;
+    entry.thread_slot = thread_slot;
+    entry.flags = litebox_ipc::ring::sq_flags::NOTIFY_ONLY;
+    entry.args = *args;
+    entry.data_offset = 0;
+    entry.data_len = 0;
+
+    sq_publish(entry);
+    header
+        .sq_notify
+        .fetch_add(1, core::sync::atomic::Ordering::Release);
+    futex_wake(&header.sq_notify);
+    // No CQ wait — fire and forget.
+}
+
 /// Returns `true` if this syscall can be executed entirely within micro
 /// without consulting central. These are syscalls where central provably
 /// does zero work — it always returns `EXEC_LOCAL` with no shim dispatch,
