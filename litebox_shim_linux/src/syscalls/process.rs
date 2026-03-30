@@ -821,20 +821,28 @@ pub(crate) struct ResourceLimits {
 
 impl ResourceLimits {
     const fn default() -> Self {
+        const INFINITY: usize = litebox_common_linux::rlim_t::MAX;
         seq_macro::seq!(N in 0..16 {
             let mut limits = [
                 #(
-                    AtomicRlimit::new(0, 0),
+                    AtomicRlimit::new(INFINITY, INFINITY),
                 )*
             ];
         });
+        // NOFILE: default 1M open files (not infinity)
         limits[litebox_common_linux::RlimitResource::NOFILE as usize] = AtomicRlimit {
             cur: core::sync::atomic::AtomicUsize::new(RLIMIT_NOFILE_CUR),
             max: core::sync::atomic::AtomicUsize::new(RLIMIT_NOFILE_MAX),
         };
+        // STACK: default stack size with unlimited hard limit
         limits[litebox_common_linux::RlimitResource::STACK as usize] = AtomicRlimit {
             cur: core::sync::atomic::AtomicUsize::new(crate::loader::DEFAULT_STACK_SIZE),
-            max: core::sync::atomic::AtomicUsize::new(litebox_common_linux::rlim_t::MAX),
+            max: core::sync::atomic::AtomicUsize::new(INFINITY),
+        };
+        // CORE: no core dumps by default
+        limits[litebox_common_linux::RlimitResource::CORE as usize] = AtomicRlimit {
+            cur: core::sync::atomic::AtomicUsize::new(0),
+            max: core::sync::atomic::AtomicUsize::new(INFINITY),
         };
         Self { limits }
     }
@@ -873,13 +881,7 @@ impl<FS: ShimFS> Task<FS> {
         resource: litebox_common_linux::RlimitResource,
         new_limit: Option<litebox_common_linux::Rlimit>,
     ) -> Result<litebox_common_linux::Rlimit, Errno> {
-        let old_rlimit = match resource {
-            litebox_common_linux::RlimitResource::NOFILE
-            | litebox_common_linux::RlimitResource::STACK => {
-                self.thread.process.limits.get_rlimit(resource)
-            }
-            _ => unimplemented!("Unsupported resource for get_rlimit: {:?}", resource),
-        };
+        let old_rlimit = self.thread.process.limits.get_rlimit(resource);
         if let Some(new_limit) = new_limit {
             if new_limit.rlim_cur > new_limit.rlim_max {
                 return Err(Errno::EINVAL);
@@ -900,7 +902,10 @@ impl<FS: ShimFS> Task<FS> {
                     self.thread.process.limits.set_rlimit(resource, new_limit);
                     self.files.borrow().set_max_fd(new_max_fd);
                 }
-                _ => unimplemented!("Unsupported resource for set_rlimit: {:?}", resource),
+                _ => {
+                    // For all other resources: store the new limit.
+                    self.thread.process.limits.set_rlimit(resource, new_limit);
+                }
             }
         }
         Ok(old_rlimit)
