@@ -561,6 +561,8 @@ pub unsafe fn execute_locally(
         nr if nr == libc::SYS_rt_sigsuspend as u32 => unsafe {
             raw_syscall::syscall2(libc::SYS_rt_sigsuspend, args[0], args[1])
         },
+        // Signal syscalls: now Tier 2 (notify-after-execute), so these arms are only
+        // reachable if central explicitly sends them via EXEC_LOCAL (fallback path).
         nr if nr == libc::SYS_rt_sigaction as u32 => unsafe {
             raw_syscall::syscall4(libc::SYS_rt_sigaction, args[0], args[1], args[2], args[3])
         },
@@ -691,6 +693,9 @@ pub unsafe fn execute_locally(
 #[allow(clippy::cast_possible_truncation)]
 pub(crate) fn tier2_notify_message(nr: u32) -> u32 {
     match i64::from(nr) {
+        libc::SYS_rt_sigaction => litebox_ipc::messages::MSG_NOTIFY_SIGACTION,
+        libc::SYS_rt_sigprocmask => litebox_ipc::messages::MSG_NOTIFY_SIGPROCMASK,
+        libc::SYS_sigaltstack => litebox_ipc::messages::MSG_NOTIFY_SIGALTSTACK,
         libc::SYS_alarm => litebox_ipc::messages::MSG_NOTIFY_ALARM,
         libc::SYS_pipe2 => litebox_ipc::messages::MSG_NOTIFY_PIPE2,
         libc::SYS_wait4 => litebox_ipc::messages::MSG_NOTIFY_WAIT4,
@@ -705,6 +710,10 @@ pub(crate) fn tier2_notify_message(nr: u32) -> u32 {
 ///
 /// # Safety
 ///
+/// For `rt_sigaction`: if `args[1]` is non-null, reads 4 u64 values from the
+/// `kernel_sigaction` struct.
+/// For `rt_sigprocmask`: if `args[1]` is non-null, reads a u64 from the `sigset_t`.
+/// For `sigaltstack`: if `args[0]` is non-null, reads fields from the `stack_t` struct.
 /// For `pipe2`: if `result == 0`, reads the two i32 fd values from the
 /// pointer in `args[0]` (which the kernel just wrote to).
 /// For `wait4`: if `result > 0` and `args[1]` is non-null, reads the
@@ -712,6 +721,51 @@ pub(crate) fn tier2_notify_message(nr: u32) -> u32 {
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) unsafe fn tier2_notify_args(nr: u32, args: &[u64; 6], result: i64) -> [u64; 6] {
     match i64::from(nr) {
+        libc::SYS_rt_sigaction => {
+            // Extract fields from the kernel_sigaction struct at args[1] (the act pointer).
+            // Kernel layout (x86-64): sa_handler(8) + sa_flags(8) + sa_restorer(8) + sa_mask(8).
+            let (handler, flags, mask) = if args[1] != 0 {
+                let p = args[1] as *const u64;
+                unsafe {
+                    (
+                        core::ptr::read_unaligned(p),        // sa_handler at offset 0
+                        core::ptr::read_unaligned(p.add(1)), // sa_flags at offset 8
+                        core::ptr::read_unaligned(p.add(3)), // sa_mask at offset 24
+                    )
+                }
+            } else {
+                (0, 0, 0)
+            };
+            // Protocol: signum, handler, flags, mask, result
+            [args[0], handler, flags, mask, result.cast_unsigned(), 0]
+        }
+        libc::SYS_rt_sigprocmask => {
+            // Read the sigset_t (single u64 on x86-64) from the set pointer at args[1].
+            let mask = if args[1] != 0 {
+                unsafe { core::ptr::read_unaligned(args[1] as *const u64) }
+            } else {
+                0
+            };
+            // Protocol: how, mask, result
+            [args[0], mask, result.cast_unsigned(), 0, 0, 0]
+        }
+        libc::SYS_sigaltstack => {
+            // Read stack_t fields from args[0] (the ss pointer).
+            // Layout (x86-64): ss_sp(8) + ss_flags(u32 at offset 8) + padding + ss_size(8 at offset 16).
+            let (sp, flags_val, size) = if args[0] != 0 {
+                let base = args[0] as *const u8;
+                unsafe {
+                    let sp = core::ptr::read_unaligned(base.cast::<u64>());
+                    let flags_val = u64::from(core::ptr::read_unaligned(base.add(8).cast::<u32>()));
+                    let size = core::ptr::read_unaligned(base.add(16).cast::<u64>());
+                    (sp, flags_val, size)
+                }
+            } else {
+                (0, 0, 0)
+            };
+            // Protocol: sp, size, flags, result
+            [sp, size, flags_val, result.cast_unsigned(), 0, 0]
+        }
         libc::SYS_alarm => {
             // args[0] = seconds requested, result = remaining seconds
             [args[0], result.cast_unsigned(), 0, 0, 0, 0]
@@ -996,9 +1050,6 @@ mod tests {
             libc::SYS_set_tid_address,
             libc::SYS_set_robust_list,
             libc::SYS_rseq,
-            libc::SYS_rt_sigaction,
-            libc::SYS_rt_sigprocmask,
-            libc::SYS_sigaltstack,
             libc::SYS_rt_sigsuspend,
             libc::SYS_mincore,
             libc::SYS_sync,
@@ -1017,7 +1068,14 @@ mod tests {
         }
 
         // Tier 2: notify-after-execute.
-        let tier2_nrs: &[i64] = &[libc::SYS_alarm, libc::SYS_pipe2, libc::SYS_wait4];
+        let tier2_nrs: &[i64] = &[
+            libc::SYS_rt_sigaction,
+            libc::SYS_rt_sigprocmask,
+            libc::SYS_sigaltstack,
+            libc::SYS_alarm,
+            libc::SYS_pipe2,
+            libc::SYS_wait4,
+        ];
 
         for &sys_nr in tier2_nrs {
             let nr = sys_nr as u32;
@@ -1061,6 +1119,18 @@ mod tests {
     #[test]
     #[allow(clippy::cast_possible_truncation)]
     fn tier2_notify_message_maps_correctly() {
+        assert_eq!(
+            tier2_notify_message(libc::SYS_rt_sigaction as u32),
+            litebox_ipc::messages::MSG_NOTIFY_SIGACTION
+        );
+        assert_eq!(
+            tier2_notify_message(libc::SYS_rt_sigprocmask as u32),
+            litebox_ipc::messages::MSG_NOTIFY_SIGPROCMASK
+        );
+        assert_eq!(
+            tier2_notify_message(libc::SYS_sigaltstack as u32),
+            litebox_ipc::messages::MSG_NOTIFY_SIGALTSTACK
+        );
         assert_eq!(
             tier2_notify_message(libc::SYS_alarm as u32),
             litebox_ipc::messages::MSG_NOTIFY_ALARM
@@ -1112,5 +1182,143 @@ mod tests {
         let args = [0u64; 6];
         let result = unsafe { execute_micro_local(0xFFFF, &args) };
         assert_eq!(result, -i64::from(libc::ENOSYS));
+    }
+
+    /// Verify `tier2_notify_args` correctly extracts fields from a
+    /// `kernel_sigaction` struct for `rt_sigaction`.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn tier2_notify_args_sigaction() {
+        // Simulate kernel_sigaction layout: handler(8) + flags(8) + restorer(8) + mask(8)
+        let kernel_sigaction: [u64; 4] = [
+            0xDEAD_BEEF_0000_0001, // sa_handler
+            0x0000_0000_0400_0000, // sa_flags (SA_RESTORER)
+            0x7FFF_FFFF_FFFF_FFF0, // sa_restorer (skipped by extraction)
+            0x0000_0000_0000_FFFF, // sa_mask
+        ];
+        let act_ptr = kernel_sigaction.as_ptr() as u64;
+        let signum: u64 = 14; // SIGALRM
+        let args = [
+            signum, act_ptr, 0, /* oldact */
+            8, /* sigsetsize */
+            0, 0,
+        ];
+        let result = unsafe { tier2_notify_args(libc::SYS_rt_sigaction as u32, &args, 0) };
+        assert_eq!(result[0], signum, "args[0] = signum");
+        assert_eq!(result[1], 0xDEAD_BEEF_0000_0001, "args[1] = handler");
+        assert_eq!(result[2], 0x0000_0000_0400_0000, "args[2] = flags");
+        assert_eq!(result[3], 0x0000_0000_0000_FFFF, "args[3] = mask");
+        assert_eq!(result[4], 0, "args[4] = result (success)");
+        assert_eq!(result[5], 0, "args[5] = padding");
+    }
+
+    /// Verify `tier2_notify_args` handles null act pointer for `rt_sigaction`.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn tier2_notify_args_sigaction_null_act() {
+        let signum: u64 = 14;
+        let args = [signum, 0 /* null act */, 0, 8, 0, 0];
+        let result = unsafe { tier2_notify_args(libc::SYS_rt_sigaction as u32, &args, 0) };
+        assert_eq!(result[0], signum, "signum preserved");
+        assert_eq!(result[1], 0, "handler = 0 for null act");
+        assert_eq!(result[2], 0, "flags = 0 for null act");
+        assert_eq!(result[3], 0, "mask = 0 for null act");
+    }
+
+    /// Verify `tier2_notify_args` correctly reads sigset_t for `rt_sigprocmask`.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn tier2_notify_args_sigprocmask() {
+        let mask_value: u64 = 0x0000_0000_0000_7FFE; // block signals 2-14
+        let set_ptr = &mask_value as *const u64 as u64;
+        let how = 0u64; // SIG_BLOCK
+        let args = [
+            how, set_ptr, 0, /* oldset */
+            8, /* sigsetsize */
+            0, 0,
+        ];
+        let result = unsafe { tier2_notify_args(libc::SYS_rt_sigprocmask as u32, &args, 0) };
+        assert_eq!(result[0], how, "args[0] = how");
+        assert_eq!(result[1], 0x0000_0000_0000_7FFE, "args[1] = mask");
+        assert_eq!(result[2], 0, "args[2] = result (success)");
+    }
+
+    /// Verify `tier2_notify_args` handles null set pointer for `rt_sigprocmask`.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn tier2_notify_args_sigprocmask_null_set() {
+        let args = [1 /* SIG_UNBLOCK */, 0 /* null set */, 0, 8, 0, 0];
+        let result = unsafe { tier2_notify_args(libc::SYS_rt_sigprocmask as u32, &args, 0) };
+        assert_eq!(result[0], 1, "how preserved");
+        assert_eq!(result[1], 0, "mask = 0 for null set");
+    }
+
+    /// Verify `tier2_notify_args` correctly reads stack_t for `sigaltstack`.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn tier2_notify_args_sigaltstack() {
+        // Simulate stack_t layout: ss_sp(8) + ss_flags(u32 at offset 8) + pad(4) + ss_size(8 at offset 16)
+        #[repr(C)]
+        struct StackT {
+            ss_sp: u64,
+            ss_flags: u32,
+            _pad: u32,
+            ss_size: u64,
+        }
+        let stack = StackT {
+            ss_sp: 0x7FFF_0000_0000,
+            ss_flags: 0x8000_0001, // SS_DISABLE | SS_AUTODISARM
+            _pad: 0xDEAD,          // should be ignored
+            ss_size: 0x2000,
+        };
+        let ss_ptr = &stack as *const StackT as u64;
+        let args = [ss_ptr, 0 /* old_ss */, 0, 0, 0, 0];
+        let result = unsafe { tier2_notify_args(libc::SYS_sigaltstack as u32, &args, 0) };
+        assert_eq!(result[0], 0x7FFF_0000_0000, "args[0] = sp");
+        assert_eq!(result[1], 0x2000, "args[1] = size");
+        // Zero-extended u32 → u64, no sign extension
+        assert_eq!(result[2], 0x8000_0001, "args[2] = flags (zero-extended)");
+        assert_eq!(result[3], 0, "args[3] = result (success)");
+    }
+
+    /// Verify `tier2_notify_args` handles null ss pointer for `sigaltstack`.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn tier2_notify_args_sigaltstack_null_ss() {
+        let args = [0u64 /* null ss */, 0, 0, 0, 0, 0];
+        let result = unsafe { tier2_notify_args(libc::SYS_sigaltstack as u32, &args, 0) };
+        assert_eq!(result[0], 0, "sp = 0 for null ss");
+        assert_eq!(result[1], 0, "size = 0 for null ss");
+        assert_eq!(result[2], 0, "flags = 0 for null ss");
+    }
+
+    /// Verify error results are placed in the correct position for signal syscalls.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn tier2_notify_args_signal_error_result() {
+        let args = [14u64 /* signum */, 0 /* null act */, 0, 8, 0, 0];
+        let errno = -i64::from(libc::EINVAL);
+        let result = unsafe { tier2_notify_args(libc::SYS_rt_sigaction as u32, &args, errno) };
+        assert_eq!(
+            result[4],
+            errno.cast_unsigned(),
+            "sigaction error in args[4]"
+        );
+
+        let args = [0u64, 0, 0, 8, 0, 0];
+        let result = unsafe { tier2_notify_args(libc::SYS_rt_sigprocmask as u32, &args, errno) };
+        assert_eq!(
+            result[2],
+            errno.cast_unsigned(),
+            "sigprocmask error in args[2]"
+        );
+
+        let args = [0u64; 6];
+        let result = unsafe { tier2_notify_args(libc::SYS_sigaltstack as u32, &args, errno) };
+        assert_eq!(
+            result[3],
+            errno.cast_unsigned(),
+            "sigaltstack error in args[3]"
+        );
     }
 }

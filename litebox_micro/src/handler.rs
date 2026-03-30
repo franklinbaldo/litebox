@@ -323,9 +323,10 @@ pub(crate) unsafe fn submit_and_wait(
     // the shim (which may handle virtual fds).
     copy_write_data_to_data_region(entry, args, syscall_nr, micro.ring_base, &micro.layout);
 
-    // For bidirectional syscalls (prlimit64, rt_sigaction, rt_sigprocmask,
-    // sigaltstack), copy the input struct from the guest's memory so
-    // central can pass it to the shim.
+    // For bidirectional syscalls (prlimit64), copy the input struct from
+    // the guest's memory so central can pass it to the shim.
+    // Note: rt_sigaction, rt_sigprocmask, sigaltstack are now Tier 2
+    // (notify-after-execute) and no longer go through this path.
     copy_bidirectional_input_to_data_region(
         entry,
         args,
@@ -425,13 +426,6 @@ pub(crate) fn is_tier1_micro_local(nr: u32) -> bool {
             | libc::SYS_set_tid_address
             | libc::SYS_set_robust_list
             | libc::SYS_rseq
-            // Signal syscalls: must execute locally. These ARE stateful but
-            // fork preserves them correctly (kernel copies signal handlers,
-            // masks, alt stack). Phase 2 will add shmem serialization to
-            // notify central of the exact state for reconstruction.
-            | libc::SYS_rt_sigaction
-            | libc::SYS_rt_sigprocmask
-            | libc::SYS_sigaltstack
             | libc::SYS_rt_sigsuspend
             // Memory query: read-only on micro's address space
             | libc::SYS_mincore
@@ -446,8 +440,12 @@ pub(crate) fn is_tier1_micro_local(nr: u32) -> bool {
 pub(crate) fn is_tier2_notify(nr: u32) -> bool {
     matches!(
         i64::from(nr),
+        // Signal state: micro executes locally, notifies central for fork reconstruction.
+        libc::SYS_rt_sigaction
+        | libc::SYS_rt_sigprocmask
+        | libc::SYS_sigaltstack
         // Alarm: creates kernel timer that fork does NOT inherit.
-        libc::SYS_alarm
+        | libc::SYS_alarm
         // Pipe: creates fds that central's fdtable doesn't know about.
         | libc::SYS_pipe2
         // Wait: reaps children, consumes SIGCHLD — destructive.
