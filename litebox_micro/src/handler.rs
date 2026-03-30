@@ -630,7 +630,7 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
             && (nr == libc::SYS_fork as u32
                 || nr == libc::SYS_vfork as u32
                 || (nr == libc::SYS_clone as u32 && args.args[0] & 0x100 == 0)); // no CLONE_VM → fork
-        if !is_fork_child {
+        if !is_fork_child && (cq.flags & cq_flags::NO_REPORT == 0) {
             unsafe { report_local_result(tls, cq.seq, result) };
         }
 

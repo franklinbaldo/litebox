@@ -51,6 +51,9 @@ pub mod cq_flags {
     /// responses.  The data region layout is:
     ///   `[mmap_data (data_len bytes)][TrampolineDescriptor][trampoline code]`
     pub const TRAMPOLINE: u16 = 1 << 2;
+    /// Central does not need a result report for this EXEC_LOCAL entry.
+    /// Micro should skip `report_local_result()` after local execution.
+    pub const NO_REPORT: u16 = 1 << 4;
 }
 
 /// Descriptor appended to the data region when `cq_flags::TRAMPOLINE` is set.

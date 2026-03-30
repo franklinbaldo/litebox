@@ -238,7 +238,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
         if nr == libc::SYS_exit_group as u32 || nr == libc::SYS_exit as u32 {
             let mut regs = crate::dispatch::sq_entry_to_ptregs(entry);
             cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
-            cq.flags = cq_flags::EXEC_LOCAL;
+            cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
             return cq;
         }
 
@@ -262,7 +262,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     Ok((child_tid, child_task)) => {
                         self.pending_tasks.borrow_mut().push(child_task);
                         cq.result = i64::from(child_tid);
-                        cq.flags = cq_flags::EXEC_LOCAL;
+                        cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
                     }
                     Err(e) => {
                         cq.result = i64::from(e.as_neg());
@@ -296,7 +296,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 return cq;
             }
             // EBADF from shim: fd is a real OS fd, let micro close it.
-            cq.flags = cq_flags::EXEC_LOCAL;
+            cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
             return cq;
         }
 
@@ -319,7 +319,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
             }
             if shim_result == -i64::from(libc::EBADF) {
                 // Real OS fd — let micro execute locally.
-                cq.flags = cq_flags::EXEC_LOCAL;
+                cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
                 return cq;
             }
             // Other error from shim — pass through.
@@ -365,7 +365,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
         }
 
         if Self::needs_local_exec(nr) {
-            cq.flags = cq_flags::EXEC_LOCAL;
+            cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
             return cq;
         }
 
@@ -393,7 +393,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
             // (notify-after-execute) and no longer reach central.
             #[allow(clippy::cast_possible_truncation)]
             if nr == libc::SYS_brk as u32 {
-                cq.flags = cq_flags::EXEC_LOCAL;
+                cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
                 return cq;
             }
 
@@ -407,7 +407,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 // Shim returned an error — pass it through without EXEC_LOCAL.
                 return cq;
             }
-            cq.flags = cq_flags::EXEC_LOCAL;
+            cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
 
             // For file-backed mmap: copy the populated data into the data region.
             // Also detect rewritten ELF trampolines and include trampoline data
@@ -559,7 +559,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
         // 5. Return info to micro.
         let central_pid = std::process::id();
         cq.result = i64::from(central_pid);
-        cq.flags = cq_flags::EXEC_LOCAL;
+        cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
         cq.data_offset = child_pid as u32;
         cq.data_len = child_ring_fd as u32;
         cq
@@ -844,17 +844,17 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 regs.rdx = capped;
                 cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
                 if cq.result > 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
                     cq.data_offset = 0;
                     cq.data_len = cq.result as u32;
                 } else if cq.result == 0 {
                     // EOF — still tell micro, result=0.
-                    cq.flags = cq_flags::EXEC_LOCAL;
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
                 } else if cq.result == -i64::from(libc::EBADF) {
                     // Fd not in shim's table — it's a real OS fd (e.g. pipe).
                     // Let micro execute the read locally. Keep result as -EBADF
                     // so micro can distinguish from EOF.
-                    cq.flags = cq_flags::EXEC_LOCAL;
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
                 }
                 // Other negative: error, pass through directly.
             }
@@ -866,11 +866,11 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 regs.rdx = capped;
                 cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
                 if cq.result > 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
                     cq.data_offset = 0;
                     cq.data_len = cq.result as u32;
                 } else if cq.result == 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL;
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
                 }
             }
             libc::SYS_fstat => {
@@ -879,7 +879,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 regs.rsi = data_ptr;
                 cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
                 if cq.result >= 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
                     cq.data_offset = 0;
                     // struct stat is 144 bytes on x86_64 Linux.
                     cq.data_len = 144;
@@ -894,7 +894,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 regs.rdx = data_ptr;
                 cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
                 if cq.result >= 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
                     cq.data_offset = 0;
                     cq.data_len = 144; // struct stat
                 }
@@ -908,7 +908,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 regs.rsi = data_ptr;
                 cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
                 if cq.result >= 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
                     cq.data_offset = 0;
                     cq.data_len = 144; // struct stat
                 }
@@ -921,7 +921,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 regs.rsi = data_ptr;
                 cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
                 if cq.result >= 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
                     cq.data_offset = 0;
                     cq.data_len = 144; // struct stat
                 }
@@ -938,7 +938,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 regs.rdx = capped;
                 cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
                 if cq.result > 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
                     cq.data_offset = 0;
                     cq.data_len = cq.result as u32;
                 }
@@ -955,7 +955,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 regs.r10 = capped;
                 cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
                 if cq.result > 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
                     cq.data_offset = 0;
                     cq.data_len = cq.result as u32;
                 }
@@ -969,12 +969,12 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 regs.rdx = capped;
                 cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
                 if cq.result > 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
                     cq.data_offset = 0;
                     cq.data_len = cq.result as u32;
                 } else if cq.result == 0 {
                     // End of directory.
-                    cq.flags = cq_flags::EXEC_LOCAL;
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
                 }
             }
             libc::SYS_getcwd => {
@@ -985,7 +985,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 regs.rsi = capped;
                 cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
                 if cq.result > 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
                     cq.data_offset = 0;
                     cq.data_len = cq.result as u32;
                 }
@@ -1001,7 +1001,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 regs.rdi = data_ptr;
                 cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
                 if cq.result >= 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
                     cq.data_offset = 0;
                     cq.data_len = UTSNAME_SIZE;
                 }
@@ -1014,7 +1014,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 regs.rdi = data_ptr;
                 cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
                 if cq.result >= 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
                     cq.data_offset = 0;
                     cq.data_len = SYSINFO_SIZE;
                 }
@@ -1027,7 +1027,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 regs.rsi = data_ptr;
                 cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
                 if cq.result >= 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
                     cq.data_offset = 0;
                     cq.data_len = RLIMIT_SIZE;
                 }
@@ -1061,12 +1061,12 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 }
                 cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
                 if cq.result >= 0 && old_limit_arg != 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
                     cq.data_offset = 0;
                     cq.data_len = RLIMIT64_SIZE as u32;
                 } else if cq.result >= 0 {
                     // No output requested (old_limit was NULL), just success.
-                    cq.flags = cq_flags::EXEC_LOCAL;
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
                 }
             }
             libc::SYS_sched_getaffinity => {
@@ -1078,7 +1078,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 regs.rsi = capped;
                 cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
                 if cq.result > 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
                     cq.data_offset = 0;
                     cq.data_len = cq.result as u32;
                 }
@@ -1092,7 +1092,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 regs.rsi = capped;
                 cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
                 if cq.result > 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
                     cq.data_offset = 0;
                     cq.data_len = cq.result as u32;
                 }
@@ -1105,7 +1105,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 regs.rsi = data_ptr;
                 cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
                 if cq.result >= 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
                     cq.data_offset = 0;
                     cq.data_len = TIMESPEC_SIZE;
                 }
@@ -1120,11 +1120,11 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 }
                 cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
                 if cq.result >= 0 && res_arg != 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
                     cq.data_offset = 0;
                     cq.data_len = TIMESPEC_SIZE;
                 } else if cq.result >= 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL;
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
                 }
             }
             libc::SYS_gettimeofday => {
@@ -1139,11 +1139,11 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 }
                 cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
                 if cq.result >= 0 && tv_arg != 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
                     cq.data_offset = 0;
                     cq.data_len = TIMEVAL_SIZE;
                 } else if cq.result >= 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL;
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
                 }
             }
             libc::SYS_time => {
@@ -1157,18 +1157,18 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 }
                 cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
                 if cq.result >= 0 && tloc_arg != 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
                     cq.data_offset = 0;
                     cq.data_len = TIME_T_SIZE;
                 } else if cq.result >= 0 {
                     // tloc was NULL; result is the time value directly.
-                    cq.flags = cq_flags::EXEC_LOCAL;
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
                 }
             }
             _ => {
                 // For readv/preadv/preadv2 — not yet implemented, fall back
                 // to EXEC_LOCAL (micro will attempt local execution).
-                cq.flags = cq_flags::EXEC_LOCAL;
+                cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
             }
         }
 
@@ -1215,7 +1215,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
         // writes to reach its real OS stdout/stderr (pipes, terminals, etc.).
         let fd = entry.args[0] as i32;
         if (0..=2).contains(&fd) {
-            cq.flags = cq_flags::EXEC_LOCAL;
+            cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
             return cq;
         }
 
@@ -1227,7 +1227,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
         // Validate data region bounds.
         if len == 0 || offset + len > data.len() {
             // No data or invalid bounds — fall back to local exec.
-            cq.flags = cq_flags::EXEC_LOCAL;
+            cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
             return cq;
         }
 
@@ -1277,7 +1277,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
             }
             _ => {
                 // Unexpected syscall — fall back to local exec.
-                cq.flags = cq_flags::EXEC_LOCAL;
+                cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
                 return cq;
             }
         }
@@ -1289,7 +1289,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
         } else if cq.result == -i64::from(libc::EBADF) {
             // Fd not in shim's table — it's a real OS fd (e.g. stdout, pipe).
             // Tell micro to execute the write locally.
-            cq.flags = cq_flags::EXEC_LOCAL;
+            cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
         }
         // Other negative: error from shim, pass through directly.
 
@@ -1865,7 +1865,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
         }
 
         cq.result = 0;
-        cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA;
+        cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
         cq.data_offset = 0;
         cq.data_len = total_data_len as u32;
         cq
