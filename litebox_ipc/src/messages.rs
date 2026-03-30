@@ -100,6 +100,18 @@ pub const MSG_NOTIFY_PIPE2: u32 = MSG_BASE + 10;
 /// args[2] = status, args[3] = options.
 pub const MSG_NOTIFY_WAIT4: u32 = MSG_BASE + 11;
 
+/// Notification: micro executed munmap locally.
+/// args[0] = addr, args[1] = len, args[2] = result (0 or -errno).
+pub const MSG_NOTIFY_MUNMAP: u32 = MSG_BASE + 12;
+
+/// Notification: micro executed mprotect locally.
+/// args[0] = addr, args[1] = len, args[2] = prot, args[3] = result (0 or -errno).
+pub const MSG_NOTIFY_MPROTECT: u32 = MSG_BASE + 13;
+
+/// Notification: micro executed madvise locally.
+/// args[0] = addr, args[1] = len, args[2] = advice, args[3] = result (0 or -errno).
+pub const MSG_NOTIFY_MADVISE: u32 = MSG_BASE + 14;
+
 /// Returns `true` if `syscall_nr` is a control message (>= [`MSG_BASE`])
 /// rather than a real Linux syscall number.
 pub const fn is_control_message(syscall_nr: u32) -> bool {

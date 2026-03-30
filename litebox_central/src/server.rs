@@ -15,9 +15,10 @@ use std::thread::JoinHandle;
 
 use litebox_ipc::cq::{cq_notify_thread, cq_push};
 use litebox_ipc::messages::{
-    self, MSG_CHILD_READY, MSG_FORK_RESULT, MSG_LOCAL_RESULT, MSG_NOTIFY_ALARM, MSG_NOTIFY_PIPE2,
-    MSG_NOTIFY_SIGACTION, MSG_NOTIFY_SIGALTSTACK, MSG_NOTIFY_SIGPROCMASK, MSG_NOTIFY_WAIT4,
-    MSG_THREAD_DEREGISTER, MSG_THREAD_REGISTER,
+    self, MSG_CHILD_READY, MSG_FORK_RESULT, MSG_LOCAL_RESULT, MSG_NOTIFY_ALARM, MSG_NOTIFY_MADVISE,
+    MSG_NOTIFY_MPROTECT, MSG_NOTIFY_MUNMAP, MSG_NOTIFY_PIPE2, MSG_NOTIFY_SIGACTION,
+    MSG_NOTIFY_SIGALTSTACK, MSG_NOTIFY_SIGPROCMASK, MSG_NOTIFY_WAIT4, MSG_THREAD_DEREGISTER,
+    MSG_THREAD_REGISTER,
 };
 use litebox_ipc::ring::{cq_flags, sq_flags, CqEntry, SqEntry, TrampolineDescriptor, RING_MASK};
 use litebox_ipc::sq::{sq_advance_head, sq_head_index, sq_try_consume};
@@ -376,24 +377,22 @@ impl<FS: ShimFS> ProcessServer<FS> {
             return self.handle_data_producing_io(entry);
         }
 
-        // Memory management: dispatch through shim (PageManager state) AND
-        // return EXEC_LOCAL so micro creates the real mapping.
+        // Memory management: mmap/mremap dispatch through shim (PageManager
+        // state) then EXEC_LOCAL so micro creates the real mapping. brk
+        // returns EXEC_LOCAL immediately (micro manages guest_brk).
+        // Note: munmap/mprotect/madvise are now Tier 2 in micro.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         if Self::is_mm_syscall(nr) {
-            // For munmap/mprotect/madvise/brk: skip shim dispatch entirely.
-            // In micro, the guest runs in a separate address space (the
-            // launcher process). Dispatching these through the shim causes
-            // CentralPlatform to execute real munmap/mprotect/madvise on
-            // guest addresses within central's own address space, which is
-            // catastrophic (SIGSEGV). For brk, the shim's PageManager
-            // shrink path calls deallocate_pages with huge ranges that
-            // overlap central's memory. Just return EXEC_LOCAL so micro
-            // handles all of these directly in the guest's address space.
+            // For brk: skip shim dispatch entirely. In micro, the guest
+            // runs in a separate address space (the launcher process).
+            // For brk, the shim's PageManager shrink path calls
+            // deallocate_pages with huge ranges that overlap central's
+            // memory. Just return EXEC_LOCAL so micro handles brk
+            // directly in the guest's address space.
+            // Note: munmap/mprotect/madvise are now Tier 2 in micro
+            // (notify-after-execute) and no longer reach central.
             #[allow(clippy::cast_possible_truncation)]
-            if matches!(
-                i64::from(nr),
-                libc::SYS_munmap | libc::SYS_mprotect | libc::SYS_madvise | libc::SYS_brk
-            ) {
+            if nr == libc::SYS_brk as u32 {
                 cq.flags = cq_flags::EXEC_LOCAL;
                 return cq;
             }
@@ -745,18 +744,16 @@ impl<FS: ShimFS> ProcessServer<FS> {
         )
     }
 
-    /// Returns `true` for memory management syscalls that need dual-dispatch:
-    /// dispatch through the shim for PageManager tracking, then EXEC_LOCAL
-    /// for micro to create the real mapping.
+    /// Returns `true` for memory management syscalls that central still handles:
+    /// mmap/mremap need dual-dispatch (shim for PageManager + EXEC_LOCAL for
+    /// micro), brk returns EXEC_LOCAL immediately.
+    ///
+    /// Note: munmap/mprotect/madvise are now Tier 2 in micro
+    /// (notify-after-execute) and no longer reach central.
     fn is_mm_syscall(nr: u32) -> bool {
         matches!(
             i64::from(nr),
-            libc::SYS_mmap
-                | libc::SYS_munmap
-                | libc::SYS_mprotect
-                | libc::SYS_mremap
-                | libc::SYS_madvise
-                | libc::SYS_brk
+            libc::SYS_mmap | libc::SYS_mremap | libc::SYS_brk
         )
     }
 
@@ -2006,6 +2003,52 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 if returned_pid > 0 {
                     let mut state = self.notification_state.borrow_mut();
                     state.reaped_children.push((returned_pid, status));
+                }
+                0
+            }
+            MSG_NOTIFY_MUNMAP => {
+                #[allow(clippy::cast_possible_wrap)]
+                let result = entry.args[2].cast_signed();
+                if result == 0 {
+                    let mut state = self.notification_state.borrow_mut();
+                    state
+                        .vma_events
+                        .push(crate::notification_state::VmaEvent::Munmap {
+                            addr: entry.args[0],
+                            len: entry.args[1],
+                        });
+                }
+                0
+            }
+            MSG_NOTIFY_MPROTECT => {
+                #[allow(clippy::cast_possible_wrap)]
+                let result = entry.args[3].cast_signed();
+                if result == 0 {
+                    let mut state = self.notification_state.borrow_mut();
+                    #[allow(clippy::cast_possible_truncation)]
+                    state
+                        .vma_events
+                        .push(crate::notification_state::VmaEvent::Mprotect {
+                            addr: entry.args[0],
+                            len: entry.args[1],
+                            prot: entry.args[2] as u32,
+                        });
+                }
+                0
+            }
+            MSG_NOTIFY_MADVISE => {
+                #[allow(clippy::cast_possible_wrap)]
+                let result = entry.args[3].cast_signed();
+                if result == 0 {
+                    let mut state = self.notification_state.borrow_mut();
+                    #[allow(clippy::cast_possible_truncation)]
+                    state
+                        .vma_events
+                        .push(crate::notification_state::VmaEvent::Madvise {
+                            addr: entry.args[0],
+                            len: entry.args[1],
+                            advice: entry.args[2] as u32,
+                        });
                 }
                 0
             }

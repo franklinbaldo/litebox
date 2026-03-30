@@ -712,6 +712,9 @@ pub(crate) fn tier2_notify_message(nr: u32) -> u32 {
         libc::SYS_alarm => litebox_ipc::messages::MSG_NOTIFY_ALARM,
         libc::SYS_pipe2 => litebox_ipc::messages::MSG_NOTIFY_PIPE2,
         libc::SYS_wait4 => litebox_ipc::messages::MSG_NOTIFY_WAIT4,
+        libc::SYS_munmap => litebox_ipc::messages::MSG_NOTIFY_MUNMAP,
+        libc::SYS_mprotect => litebox_ipc::messages::MSG_NOTIFY_MPROTECT,
+        libc::SYS_madvise => litebox_ipc::messages::MSG_NOTIFY_MADVISE,
         _ => unreachable!("tier2_notify_message called for non-Tier-2 syscall {nr}"),
     }
 }
@@ -808,6 +811,18 @@ pub(crate) unsafe fn tier2_notify_args(nr: u32, args: &[u64; 6], result: i64) ->
             };
             // pid_arg, returned_pid (result), status, options, 0, 0
             [args[0], result.cast_unsigned(), status, args[2], 0, 0]
+        }
+        libc::SYS_munmap => {
+            // addr, len, result
+            [args[0], args[1], result.cast_unsigned(), 0, 0, 0]
+        }
+        libc::SYS_mprotect => {
+            // addr, len, prot, result
+            [args[0], args[1], args[2], result.cast_unsigned(), 0, 0]
+        }
+        libc::SYS_madvise => {
+            // addr, len, advice, result
+            [args[0], args[1], args[2], result.cast_unsigned(), 0, 0]
         }
         _ => unreachable!("tier2_notify_args called for non-Tier-2 syscall {nr}"),
     }
@@ -906,6 +921,16 @@ pub unsafe fn execute_micro_local(syscall_nr: u32, args: &[u64; 6]) -> i64 {
         },
         // Filesystem sync: no arguments
         nr if nr == libc::SYS_sync as u32 => unsafe { raw_syscall::syscall0(libc::SYS_sync) },
+        // VMA operations: execute in micro's address space.
+        nr if nr == libc::SYS_munmap as u32 => unsafe {
+            raw_syscall::munmap(args[0] as usize, args[1] as usize)
+        },
+        nr if nr == libc::SYS_mprotect as u32 => unsafe {
+            raw_syscall::mprotect(args[0] as usize, args[1] as usize, args[2] as i32)
+        },
+        nr if nr == libc::SYS_madvise as u32 => unsafe {
+            raw_syscall::syscall3(libc::SYS_madvise, args[0], args[1], args[2])
+        },
         // brk: post-execve, managed entirely by micro's guest_brk watermark.
         // Only called when guest_brk != 0 (handler.rs checks this precondition).
         nr if nr == libc::SYS_brk as u32 => {
@@ -1088,6 +1113,9 @@ mod tests {
             libc::SYS_alarm,
             libc::SYS_pipe2,
             libc::SYS_wait4,
+            libc::SYS_munmap,
+            libc::SYS_mprotect,
+            libc::SYS_madvise,
         ];
 
         for &sys_nr in tier2_nrs {
@@ -1155,6 +1183,18 @@ mod tests {
         assert_eq!(
             tier2_notify_message(libc::SYS_wait4 as u32),
             litebox_ipc::messages::MSG_NOTIFY_WAIT4
+        );
+        assert_eq!(
+            tier2_notify_message(libc::SYS_munmap as u32),
+            litebox_ipc::messages::MSG_NOTIFY_MUNMAP
+        );
+        assert_eq!(
+            tier2_notify_message(libc::SYS_mprotect as u32),
+            litebox_ipc::messages::MSG_NOTIFY_MPROTECT
+        );
+        assert_eq!(
+            tier2_notify_message(libc::SYS_madvise as u32),
+            litebox_ipc::messages::MSG_NOTIFY_MADVISE
         );
     }
 
@@ -1333,5 +1373,85 @@ mod tests {
             errno.cast_unsigned(),
             "sigaltstack error in args[3]"
         );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn tier2_notify_args_munmap() {
+        let addr = 0x7FFF_0000_0000u64;
+        let len = 0x1000u64;
+        let args = [addr, len, 0, 0, 0, 0];
+        let result = unsafe { tier2_notify_args(libc::SYS_munmap as u32, &args, 0) };
+        assert_eq!(result[0], addr, "args[0] = addr");
+        assert_eq!(result[1], len, "args[1] = len");
+        assert_eq!(result[2], 0, "args[2] = result (success)");
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn tier2_notify_args_mprotect() {
+        let addr = 0x7FFF_0000_0000u64;
+        let len = 0x2000u64;
+        let prot = (libc::PROT_READ | libc::PROT_WRITE) as u64;
+        let args = [addr, len, prot, 0, 0, 0];
+        let result = unsafe { tier2_notify_args(libc::SYS_mprotect as u32, &args, 0) };
+        assert_eq!(result[0], addr, "args[0] = addr");
+        assert_eq!(result[1], len, "args[1] = len");
+        assert_eq!(result[2], prot, "args[2] = prot");
+        assert_eq!(result[3], 0, "args[3] = result (success)");
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn tier2_notify_args_madvise() {
+        let addr = 0x7FFF_0000_0000u64;
+        let len = 0x4000u64;
+        let advice = libc::MADV_DONTNEED as u64;
+        let args = [addr, len, advice, 0, 0, 0];
+        let result = unsafe { tier2_notify_args(libc::SYS_madvise as u32, &args, 0) };
+        assert_eq!(result[0], addr, "args[0] = addr");
+        assert_eq!(result[1], len, "args[1] = len");
+        assert_eq!(result[2], advice, "args[2] = advice");
+        assert_eq!(result[3], 0, "args[3] = result (success)");
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn tier2_notify_args_vma_error_result() {
+        let args = [0x7FFF_0000_0000u64, 0x1000, 0, 0, 0, 0];
+        let errno = -i64::from(libc::EINVAL);
+        let result = unsafe { tier2_notify_args(libc::SYS_munmap as u32, &args, errno) };
+        assert_eq!(result[2], errno.cast_unsigned(), "munmap error in args[2]");
+
+        let result = unsafe { tier2_notify_args(libc::SYS_mprotect as u32, &args, errno) };
+        assert_eq!(
+            result[3],
+            errno.cast_unsigned(),
+            "mprotect error in args[3]"
+        );
+
+        let result = unsafe { tier2_notify_args(libc::SYS_madvise as u32, &args, errno) };
+        assert_eq!(result[3], errno.cast_unsigned(), "madvise error in args[3]");
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn micro_local_munmap() {
+        // First mmap a page, then munmap it via execute_micro_local
+        let mmap_result = unsafe {
+            raw_syscall::mmap(
+                0,
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert!(!raw_syscall::is_error(mmap_result), "mmap failed");
+
+        let args = [mmap_result.cast_unsigned(), 4096, 0, 0, 0, 0];
+        let result = unsafe { execute_micro_local(libc::SYS_munmap as u32, &args) };
+        assert_eq!(result, 0, "munmap via execute_micro_local should succeed");
     }
 }

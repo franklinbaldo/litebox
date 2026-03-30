@@ -8,6 +8,16 @@
 
 use litebox_ipc::ring::MAX_THREADS;
 
+/// A VMA change event recorded from a Tier 2 notification.
+/// Used as an event log for fork/CoW reconstruction.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // Fields read during fork reconstruction (future task).
+pub(crate) enum VmaEvent {
+    Munmap { addr: u64, len: u64 },
+    Mprotect { addr: u64, len: u64, prot: u32 },
+    Madvise { addr: u64, len: u64, advice: u32 },
+}
+
 /// Signal action as reported by micro via MSG_NOTIFY_SIGACTION.
 #[derive(Clone, Copy, Default)]
 #[allow(dead_code)] // Fields read during fork reconstruction (future task).
@@ -57,6 +67,9 @@ pub(crate) struct ProcessNotificationState {
 
     /// Children reaped by micro via wait4: (pid, exit_status).
     pub reaped_children: Vec<(i32, i32)>,
+
+    /// VMA change events (munmap, mprotect, madvise) from Tier 2 notifications.
+    pub vma_events: Vec<VmaEvent>,
 }
 
 impl Default for ProcessNotificationState {
@@ -68,6 +81,7 @@ impl Default for ProcessNotificationState {
             alarm_seconds: 0,
             micro_pipes: Vec::new(),
             reaped_children: Vec::new(),
+            vma_events: Vec::new(),
         }
     }
 }

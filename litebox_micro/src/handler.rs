@@ -543,6 +543,10 @@ pub(crate) fn is_tier2_notify(nr: u32) -> bool {
         | libc::SYS_pipe2
         // Wait: reaps children, consumes SIGCHLD — destructive.
         | libc::SYS_wait4
+        // VMA operations: must execute in micro's address space, notify central for VMA tracking.
+        | libc::SYS_munmap
+        | libc::SYS_mprotect
+        | libc::SYS_madvise
     )
 }
 
