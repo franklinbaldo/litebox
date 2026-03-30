@@ -708,13 +708,9 @@ impl<FS: ShimFS> ProcessServer<FS> {
     fn needs_local_exec(nr: u32) -> bool {
         matches!(
             i64::from(nr),
-            // I/O syscalls that micro handles locally (scatter/gather
-            // writes are passed through; simple writes go via
-            // data-consuming I/O dispatch instead)
-            libc::SYS_writev
-                | libc::SYS_pwritev
-                | libc::SYS_pwritev2
-                | libc::SYS_recvfrom
+            // Socket I/O: micro handles locally (central can't
+            // dereference guest sockaddr/msghdr pointers).
+            libc::SYS_recvfrom
                 | libc::SYS_sendto
                 | libc::SYS_recvmsg
                 | libc::SYS_sendmsg
@@ -1188,7 +1184,14 @@ impl<FS: ShimFS> ProcessServer<FS> {
     /// If the shim returns EBADF (fd not in shim's table), central falls back
     /// to `EXEC_LOCAL` so micro writes to the real OS fd.
     fn is_data_consuming_io(nr: u32) -> bool {
-        matches!(i64::from(nr), libc::SYS_write | libc::SYS_pwrite64)
+        matches!(
+            i64::from(nr),
+            libc::SYS_write
+                | libc::SYS_pwrite64
+                | libc::SYS_writev
+                | libc::SYS_pwritev
+                | libc::SYS_pwritev2
+        )
     }
 
     /// Handle a data-consuming I/O syscall (write family).
@@ -1246,6 +1249,32 @@ impl<FS: ShimFS> ProcessServer<FS> {
             }
             libc::SYS_pwrite64 => {
                 // pwrite64(fd, buf, count, offset) — rewrite buf (rsi) to local copy.
+                regs.rsi = buf_ptr;
+                regs.rdx = len;
+            }
+            libc::SYS_writev => {
+                // writev(fd, iov, iovcnt) — micro gathered iov data into flat buffer.
+                // Dispatch as write(fd, buf, count) through shim.
+                regs.orig_rax = libc::SYS_write as usize;
+                regs.rsi = buf_ptr;
+                regs.rdx = len;
+            }
+            libc::SYS_pwritev => {
+                // pwritev(fd, iov, iovcnt, offset) — dispatch as pwrite64(fd, buf, count, offset).
+                regs.orig_rax = libc::SYS_pwrite64 as usize;
+                regs.rsi = buf_ptr;
+                regs.rdx = len;
+                // r10 = offset (args[3]), already set from sq_entry_to_ptregs.
+            }
+            libc::SYS_pwritev2 => {
+                // pwritev2(fd, iov, iovcnt, offset, flags).
+                // If offset == -1, acts like writev (current file position).
+                let offset = entry.args[3].cast_signed();
+                if offset == -1 {
+                    regs.orig_rax = libc::SYS_write as usize;
+                } else {
+                    regs.orig_rax = libc::SYS_pwrite64 as usize;
+                }
                 regs.rsi = buf_ptr;
                 regs.rdx = len;
             }

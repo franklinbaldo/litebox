@@ -650,6 +650,19 @@ pub unsafe fn execute_locally(
         nr if nr == libc::SYS_writev as u32 => unsafe {
             raw_syscall::syscall3(libc::SYS_writev, args[0], args[1], args[2])
         },
+        nr if nr == libc::SYS_pwritev as u32 => unsafe {
+            raw_syscall::syscall4(libc::SYS_pwritev, args[0], args[1], args[2], args[3])
+        },
+        nr if nr == libc::SYS_pwritev2 as u32 => unsafe {
+            raw_syscall::syscall5(
+                libc::SYS_pwritev2,
+                args[0],
+                args[1],
+                args[2],
+                args[3],
+                args[4],
+            )
+        },
         nr if nr == libc::SYS_close as u32 => unsafe { raw_syscall::close(args[0] as i32) },
         // FD manipulation: operates on real OS fds (pipes from pipe2, etc.)
         nr if nr == libc::SYS_dup as u32 => unsafe {

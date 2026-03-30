@@ -147,6 +147,9 @@ const WRITE_DATA_BASE_OFFSET: usize = 256 * PATHNAME_REGION_SIZE; // 1 MiB
 /// than this are capped (the kernel will return a short write).
 const WRITE_DATA_REGION_SIZE: usize = 65536;
 
+/// Size of a single `iovec` struct on x86-64 (16 bytes: `iov_base` + `iov_len`).
+const IOVEC_SIZE: usize = 16;
+
 /// Returns `(buf_arg_index, count_arg_index)` for write-family syscalls,
 /// or `None` if this is not a write syscall.
 #[allow(clippy::cast_possible_truncation)]
@@ -209,6 +212,92 @@ fn copy_write_data_to_data_region(
     {
         entry.data_offset = thread_offset as u32;
         entry.data_len = max_len as u32;
+    }
+}
+
+/// Returns `true` for scatter/gather write-family syscalls (writev, pwritev,
+/// pwritev2).
+#[allow(clippy::cast_possible_truncation)]
+fn is_writev_family(nr: u32) -> bool {
+    matches!(
+        i64::from(nr),
+        libc::SYS_writev | libc::SYS_pwritev | libc::SYS_pwritev2
+    )
+}
+
+/// Gather iovec data from the guest's memory into the shared data region.
+///
+/// For writev-family syscalls, micro reads the iovec array from the guest,
+/// concatenates all buffers into a single contiguous region in the shmem
+/// data zone (the same per-thread slot used by `copy_write_data_to_data_region`),
+/// and sets `entry.data_offset` / `entry.data_len` so central can dispatch
+/// the gathered data as a flat write through the shim.
+///
+/// # Safety
+///
+/// The iov pointer (from `args[1]`) must point to a valid array of `iovcnt`
+/// `iovec` structs in the guest's address space, and each `iov_base` must
+/// point to valid readable memory of `iov_len` bytes.
+#[allow(clippy::cast_possible_truncation)]
+fn copy_writev_data_to_data_region(
+    entry: &mut SqEntry,
+    args: &[u64; 6],
+    syscall_nr: u32,
+    ring_base: *mut u8,
+    layout: &SharedRingLayout,
+) {
+    if !is_writev_family(syscall_nr) {
+        return;
+    }
+
+    let iov_ptr = args[1] as *const u8;
+    let iovcnt = args[2] as usize;
+
+    if iov_ptr.is_null() || iovcnt == 0 {
+        return;
+    }
+
+    // Compute per-thread offset in the write data zone.
+    let thread_offset =
+        WRITE_DATA_BASE_OFFSET + entry.thread_slot as usize * WRITE_DATA_REGION_SIZE;
+
+    // Each iovec is 16 bytes on x86-64: { iov_base: *const u8, iov_len: usize }.
+    let mut total_copied: usize = 0;
+
+    for i in 0..iovcnt {
+        // Read iov_base and iov_len from the guest's iovec array.
+        let iov_entry_ptr = unsafe { iov_ptr.add(i * IOVEC_SIZE) };
+        let iov_base =
+            unsafe { core::ptr::read_unaligned(iov_entry_ptr.cast::<u64>()) } as *const u8;
+        let iov_len =
+            unsafe { core::ptr::read_unaligned(iov_entry_ptr.add(8).cast::<u64>()) } as usize;
+
+        if iov_base.is_null() || iov_len == 0 {
+            continue;
+        }
+
+        let remaining = WRITE_DATA_REGION_SIZE.saturating_sub(total_copied);
+        if remaining == 0 {
+            break;
+        }
+        let copy_len = iov_len.min(remaining);
+
+        if thread_offset + total_copied + copy_len > layout.data_region_size {
+            // Data region too small — stop copying.
+            break;
+        }
+
+        unsafe {
+            let dst = ring_base.add(layout.data_region_offset + thread_offset + total_copied);
+            core::ptr::copy_nonoverlapping(iov_base, dst, copy_len);
+        }
+
+        total_copied += copy_len;
+    }
+
+    if total_copied > 0 {
+        entry.data_offset = thread_offset as u32;
+        entry.data_len = total_copied as u32;
     }
 }
 
@@ -322,6 +411,10 @@ pub(crate) unsafe fn submit_and_wait(
     // address space into the data region so central can dispatch through
     // the shim (which may handle virtual fds).
     copy_write_data_to_data_region(entry, args, syscall_nr, micro.ring_base, &micro.layout);
+
+    // For scatter/gather write syscalls (writev, pwritev, pwritev2), gather
+    // the iovec buffers into a contiguous flat buffer in the data region.
+    copy_writev_data_to_data_region(entry, args, syscall_nr, micro.ring_base, &micro.layout);
 
     // For bidirectional syscalls (prlimit64), copy the input struct from
     // the guest's memory so central can pass it to the shim.
