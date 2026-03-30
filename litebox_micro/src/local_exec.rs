@@ -687,12 +687,72 @@ pub unsafe fn execute_locally(
     }
 }
 
+/// Map a Tier 2 syscall number to its `MSG_NOTIFY_*` control message number.
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn tier2_notify_message(nr: u32) -> u32 {
+    match i64::from(nr) {
+        libc::SYS_alarm => litebox_ipc::messages::MSG_NOTIFY_ALARM,
+        libc::SYS_pipe2 => litebox_ipc::messages::MSG_NOTIFY_PIPE2,
+        libc::SYS_wait4 => litebox_ipc::messages::MSG_NOTIFY_WAIT4,
+        _ => unreachable!("tier2_notify_message called for non-Tier-2 syscall {nr}"),
+    }
+}
+
+/// Build the notification args for a Tier 2 syscall.
+///
+/// Packs the relevant arguments and result into a 6-element array
+/// matching the `MSG_NOTIFY_*` protocol defined in `litebox_ipc::messages`.
+///
+/// # Safety
+///
+/// For `pipe2`: if `result == 0`, reads the two i32 fd values from the
+/// pointer in `args[0]` (which the kernel just wrote to).
+/// For `wait4`: if `result > 0` and `args[1]` is non-null, reads the
+/// i32 status value from that pointer.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub(crate) unsafe fn tier2_notify_args(nr: u32, args: &[u64; 6], result: i64) -> [u64; 6] {
+    match i64::from(nr) {
+        libc::SYS_alarm => {
+            // args[0] = seconds requested, result = remaining seconds
+            [args[0], result.cast_unsigned(), 0, 0, 0, 0]
+        }
+        libc::SYS_pipe2 => {
+            // Read fd values from the int[2] output buffer after successful syscall
+            let (fd0, fd1) = if result == 0 {
+                let fds_ptr = args[0] as *const i32;
+                unsafe { ((*fds_ptr) as u64, (*fds_ptr.add(1)) as u64) }
+            } else {
+                (0, 0)
+            };
+            // fd[0], fd[1], flags, result, 0, 0
+            [fd0, fd1, args[1], result.cast_unsigned(), 0, 0]
+        }
+        libc::SYS_wait4 => {
+            // Read status from output pointer after successful wait
+            let status = if result > 0 {
+                let status_ptr = args[1] as *const i32;
+                if status_ptr.is_null() {
+                    0
+                } else {
+                    unsafe { (*status_ptr) as u64 }
+                }
+            } else {
+                0
+            };
+            // pid_arg, returned_pid (result), status, options, 0, 0
+            [args[0], result.cast_unsigned(), status, args[2], 0, 0]
+        }
+        _ => unreachable!("tier2_notify_args called for non-Tier-2 syscall {nr}"),
+    }
+}
+
 /// Execute a micro-local syscall directly, without consulting central.
 ///
-/// SYNC NOTE: The match arms here must stay in sync with `is_micro_local()`
-/// in `handler.rs` and the overlapping arms in `execute_locally()` above.
-/// If you add a syscall here, add it to `is_micro_local` too (and vice-versa).
-/// The `micro_local_covers_all_listed` test below enforces the invariant.
+/// SYNC NOTE: The match arms here must stay in sync with `is_tier1_micro_local()`
+/// and `is_tier2_notify()` in `handler.rs` and the overlapping arms in
+/// `execute_locally()` above. Both Tier 1 and Tier 2 syscalls are handled here;
+/// the difference is only whether `notify_central` is called afterward.
+/// The `tier_classification_covers_all` test below enforces the invariant.
 ///
 /// # Safety
 ///
@@ -909,58 +969,65 @@ mod tests {
         assert_eq!(result, -i64::from(libc::ENOSYS));
     }
 
-    /// Verify that `is_micro_local` and `execute_micro_local` stay in sync.
-    /// Tests that every syscall `is_micro_local` accepts is also handled by
-    /// `execute_micro_local` (doesn't return -ENOSYS). We only test safe,
-    /// non-blocking zero-arg syscalls for actual dispatch; the rest are
-    /// covered by the `is_micro_local` check alone.
+    /// Verify that `is_tier1_micro_local`, `is_tier2_notify`, and
+    /// `execute_micro_local` stay in sync. Tests that every syscall in
+    /// each tier is accepted by the corresponding classifier and handled
+    /// by `execute_micro_local` (doesn't return -ENOSYS for safe zero-arg
+    /// calls). Also verifies Tier 1 and Tier 2 don't overlap.
     ///
     /// Note: Group 1 syscalls (uname, sysinfo, getrlimit, prlimit64,
     /// sched_getaffinity, getrandom, clock_gettime, gettimeofday, time,
-    /// clock_getres, rt_sigaction, rt_sigprocmask, sigaltstack, alarm)
-    /// are now routed through central's shim via HAS_DATA, not micro-local.
+    /// clock_getres) are routed through central's shim via HAS_DATA,
+    /// not micro-local.
     #[test]
     #[allow(clippy::cast_possible_truncation)]
-    fn micro_local_covers_all_listed() {
-        // All syscalls in the micro-local set (must match is_micro_local).
-        // Only includes syscalls that MUST run in micro's process.
-        let micro_local_nrs: &[i64] = &[
-            // Identity — return virtual values from MicroState.
+    fn tier_classification_covers_all() {
+        // Tier 1: silent micro-local (no notification needed).
+        let tier1_nrs: &[i64] = &[
             libc::SYS_getpid,
             libc::SYS_getppid,
             libc::SYS_getuid,
             libc::SYS_getgid,
             libc::SYS_geteuid,
             libc::SYS_getegid,
-            // Sleep — must block in micro's thread.
             libc::SYS_nanosleep,
             libc::SYS_clock_nanosleep,
-            // Thread setup — thread-local kernel state.
             libc::SYS_arch_prctl,
             libc::SYS_set_tid_address,
             libc::SYS_set_robust_list,
             libc::SYS_rseq,
-            // Signals — must execute locally for real kernel signal delivery.
             libc::SYS_rt_sigaction,
             libc::SYS_rt_sigprocmask,
             libc::SYS_sigaltstack,
             libc::SYS_rt_sigsuspend,
-            libc::SYS_alarm,
-            // Memory — checks pages in micro's address space.
             libc::SYS_mincore,
-            // Process — micro's PID namespace.
-            libc::SYS_wait4,
-            // Pipes — creates real OS pipes in micro.
-            libc::SYS_pipe2,
-            // FS sync — kernel FS sync.
             libc::SYS_sync,
         ];
 
-        for &sys_nr in micro_local_nrs {
+        for &sys_nr in tier1_nrs {
             let nr = sys_nr as u32;
             assert!(
-                crate::handler::is_micro_local(nr),
-                "SYS {sys_nr} should be micro-local but is_micro_local returned false"
+                crate::handler::is_tier1_micro_local(nr),
+                "SYS {sys_nr} should be Tier 1 but is_tier1_micro_local returned false"
+            );
+            assert!(
+                !crate::handler::is_tier2_notify(nr),
+                "SYS {sys_nr} is in both Tier 1 and Tier 2"
+            );
+        }
+
+        // Tier 2: notify-after-execute.
+        let tier2_nrs: &[i64] = &[libc::SYS_alarm, libc::SYS_pipe2, libc::SYS_wait4];
+
+        for &sys_nr in tier2_nrs {
+            let nr = sys_nr as u32;
+            assert!(
+                crate::handler::is_tier2_notify(nr),
+                "SYS {sys_nr} should be Tier 2 but is_tier2_notify returned false"
+            );
+            assert!(
+                !crate::handler::is_tier1_micro_local(nr),
+                "SYS {sys_nr} is in both Tier 1 and Tier 2"
             );
         }
 
@@ -981,14 +1048,31 @@ mod tests {
             assert_ne!(
                 result,
                 -i64::from(libc::ENOSYS),
-                "execute_micro_local returned -ENOSYS for SYS {sys_nr} — missing match arm?"
+                "execute_micro_local returned -ENOSYS for SYS {sys_nr}"
             );
         }
 
-        // Verify that an unknown syscall still returns -ENOSYS.
+        // Unknown syscall still returns -ENOSYS.
         let args = [0u64; 6];
         let result = unsafe { execute_micro_local(0xFFFF, &args) };
         assert_eq!(result, -i64::from(libc::ENOSYS));
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn tier2_notify_message_maps_correctly() {
+        assert_eq!(
+            tier2_notify_message(libc::SYS_alarm as u32),
+            litebox_ipc::messages::MSG_NOTIFY_ALARM
+        );
+        assert_eq!(
+            tier2_notify_message(libc::SYS_pipe2 as u32),
+            litebox_ipc::messages::MSG_NOTIFY_PIPE2
+        );
+        assert_eq!(
+            tier2_notify_message(libc::SYS_wait4 as u32),
+            litebox_ipc::messages::MSG_NOTIFY_WAIT4
+        );
     }
 
     /// Basic smoke test: `execute_micro_local` for getpid returns the

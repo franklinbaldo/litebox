@@ -96,8 +96,8 @@ pub const MSG_NOTIFY_ALARM: u32 = MSG_BASE + 9;
 pub const MSG_NOTIFY_PIPE2: u32 = MSG_BASE + 10;
 
 /// Notification: micro executed wait4 locally.
-/// args[0] = pid arg, args[1] = returned pid, args[2] = status,
-/// args[3] = options, args[4] = result.
+/// args[0] = pid arg, args[1] = returned pid (or -errno),
+/// args[2] = status, args[3] = options.
 pub const MSG_NOTIFY_WAIT4: u32 = MSG_BASE + 11;
 
 /// Returns `true` if `syscall_nr` is a control message (>= [`MSG_BASE`])

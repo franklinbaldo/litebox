@@ -217,9 +217,6 @@ fn copy_write_data_to_data_region(
 /// syscall has no input pointer, or the pointer is NULL.
 ///
 /// Currently only `prlimit64` is bidirectional through central.
-/// Signal syscalls (rt_sigaction, rt_sigprocmask, sigaltstack) are handled
-/// as micro-local because they must execute real kernel signal operations
-/// in the guest's process.
 #[allow(clippy::cast_possible_truncation)]
 fn bidirectional_input_info(nr: u32, args: &[u64; 6]) -> Option<(usize, usize)> {
     match i64::from(nr) {
@@ -407,11 +404,10 @@ pub(crate) unsafe fn notify_central(tls: *mut MicroTls, syscall_nr: u32, args: &
     // No CQ wait — fire and forget.
 }
 
-/// Returns `true` if this syscall can be executed entirely within micro
-/// without consulting central. These are syscalls where central provably
-/// does zero work — it always returns `EXEC_LOCAL` with no shim dispatch,
-/// no state update, and no side effects.
-pub(crate) fn is_micro_local(nr: u32) -> bool {
+/// Tier 1: Syscalls that execute locally with NO notification to central.
+/// These create no state, or only state that lives in micro's memory
+/// (fork-copies correctly without central needing to know).
+pub(crate) fn is_tier1_micro_local(nr: u32) -> bool {
     matches!(
         i64::from(nr),
         // Process/user identity: return virtual values from MicroState
@@ -421,30 +417,41 @@ pub(crate) fn is_micro_local(nr: u32) -> bool {
             | libc::SYS_getgid
             | libc::SYS_geteuid
             | libc::SYS_getegid
-            // Sleep: blocking, no shared state
+            // Sleep: blocking, no state change
             | libc::SYS_nanosleep
             | libc::SYS_clock_nanosleep
-            // Thread setup: thread-local only, must execute in guest context
+            // Thread setup: thread-local only, correct after fork by definition
             | libc::SYS_arch_prctl
             | libc::SYS_set_tid_address
             | libc::SYS_set_robust_list
             | libc::SYS_rseq
-            // Signal syscalls: must execute locally in micro's process
-            // where real kernel signal delivery happens. The guest relies
-            // on real alarm() timers and real sigaction handlers.
+            // Signal syscalls: must execute locally. These ARE stateful but
+            // fork preserves them correctly (kernel copies signal handlers,
+            // masks, alt stack). Phase 2 will add shmem serialization to
+            // notify central of the exact state for reconstruction.
             | libc::SYS_rt_sigaction
             | libc::SYS_rt_sigprocmask
             | libc::SYS_sigaltstack
             | libc::SYS_rt_sigsuspend
-            | libc::SYS_alarm
-            // Memory query: checks pages in micro's address space
+            // Memory query: read-only on micro's address space
             | libc::SYS_mincore
-            // Process wait: must run in micro's PID namespace
-            | libc::SYS_wait4
-            // Pipe creation: real OS pipes, no shim state
-            | libc::SYS_pipe2
-            // Filesystem sync: no arguments
+            // Filesystem sync: no arguments, no state
             | libc::SYS_sync
+    )
+}
+
+/// Tier 2: Syscalls that execute locally but MUST notify central of the
+/// state change for fork reconstruction. Micro executes first, then sends
+/// a fire-and-forget notification.
+pub(crate) fn is_tier2_notify(nr: u32) -> bool {
+    matches!(
+        i64::from(nr),
+        // Alarm: creates kernel timer that fork does NOT inherit.
+        libc::SYS_alarm
+        // Pipe: creates fds that central's fdtable doesn't know about.
+        | libc::SYS_pipe2
+        // Wait: reaps children, consumes SIGCHLD — destructive.
+        | libc::SYS_wait4
     )
 }
 
@@ -467,10 +474,18 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
         return unsafe { crate::execve::handle_execve(tls, args) };
     }
 
-    // Micro-local fast-path: syscalls that central always stamps EXEC_LOCAL
-    // with zero work. Execute directly without any ring-buffer round-trip.
-    if is_micro_local(nr) {
+    // Tier 1: silent micro-local — no notification to central.
+    if is_tier1_micro_local(nr) {
         return unsafe { crate::local_exec::execute_micro_local(nr, &args.args) };
+    }
+
+    // Tier 2: execute locally, then notify central for state tracking.
+    if is_tier2_notify(nr) {
+        let result = unsafe { crate::local_exec::execute_micro_local(nr, &args.args) };
+        let notify_nr = crate::local_exec::tier2_notify_message(nr);
+        let notify_args = unsafe { crate::local_exec::tier2_notify_args(nr, &args.args, result) };
+        unsafe { notify_central(tls, notify_nr, &notify_args) };
+        return result;
     }
 
     // brk fast-path: post-execve, brk is entirely managed by micro's
