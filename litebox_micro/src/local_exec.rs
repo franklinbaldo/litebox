@@ -539,13 +539,21 @@ pub unsafe fn execute_locally(
         nr if nr == libc::SYS_fcntl as u32 => unsafe {
             raw_syscall::syscall3(libc::SYS_fcntl, args[0], args[1], args[2])
         },
-        // Process/user identity: simple queries, no pointers
-        nr if nr == libc::SYS_getpid as u32 => unsafe { raw_syscall::syscall0(libc::SYS_getpid) },
-        nr if nr == libc::SYS_getppid as u32 => unsafe { raw_syscall::syscall0(libc::SYS_getppid) },
-        nr if nr == libc::SYS_getuid as u32 => unsafe { raw_syscall::syscall0(libc::SYS_getuid) },
-        nr if nr == libc::SYS_getgid as u32 => unsafe { raw_syscall::syscall0(libc::SYS_getgid) },
-        nr if nr == libc::SYS_geteuid as u32 => unsafe { raw_syscall::syscall0(libc::SYS_geteuid) },
-        nr if nr == libc::SYS_getegid as u32 => unsafe { raw_syscall::syscall0(libc::SYS_getegid) },
+        // Process/user identity: libOS-emulated from MicroState / virtual values.
+        // These MUST NOT do raw kernel syscalls — LiteBox is a libOS.
+        nr if nr == libc::SYS_getpid as u32 => {
+            let state = unsafe { crate::state::global_micro_state() };
+            i64::from(state.pid)
+        }
+        nr if nr == libc::SYS_getppid as u32 => {
+            let state = unsafe { crate::state::global_micro_state() };
+            i64::from(state.ppid)
+        }
+        // Virtual root identity (uid=0, gid=0) — container-like behavior.
+        nr if nr == libc::SYS_getuid as u32 => 0,
+        nr if nr == libc::SYS_getgid as u32 => 0,
+        nr if nr == libc::SYS_geteuid as u32 => 0,
+        nr if nr == libc::SYS_getegid as u32 => 0,
         // Memory query: mincore checks page residency
         nr if nr == libc::SYS_mincore as u32 => unsafe {
             raw_syscall::syscall3(libc::SYS_mincore, args[0], args[1], args[2])
@@ -575,13 +583,21 @@ pub unsafe fn execute_locally(
 )]
 pub unsafe fn execute_micro_local(syscall_nr: u32, args: &[u64; 6]) -> i64 {
     match syscall_nr {
-        // Process/user identity: simple queries, no pointers
-        nr if nr == libc::SYS_getpid as u32 => unsafe { raw_syscall::syscall0(libc::SYS_getpid) },
-        nr if nr == libc::SYS_getppid as u32 => unsafe { raw_syscall::syscall0(libc::SYS_getppid) },
-        nr if nr == libc::SYS_getuid as u32 => unsafe { raw_syscall::syscall0(libc::SYS_getuid) },
-        nr if nr == libc::SYS_getgid as u32 => unsafe { raw_syscall::syscall0(libc::SYS_getgid) },
-        nr if nr == libc::SYS_geteuid as u32 => unsafe { raw_syscall::syscall0(libc::SYS_geteuid) },
-        nr if nr == libc::SYS_getegid as u32 => unsafe { raw_syscall::syscall0(libc::SYS_getegid) },
+        // Process/user identity: libOS-emulated from MicroState / virtual values.
+        // These MUST NOT do raw kernel syscalls — LiteBox is a libOS.
+        nr if nr == libc::SYS_getpid as u32 => {
+            let state = unsafe { crate::state::global_micro_state() };
+            i64::from(state.pid)
+        }
+        nr if nr == libc::SYS_getppid as u32 => {
+            let state = unsafe { crate::state::global_micro_state() };
+            i64::from(state.ppid)
+        }
+        // Virtual root identity (uid=0, gid=0) — container-like behavior.
+        nr if nr == libc::SYS_getuid as u32 => 0,
+        nr if nr == libc::SYS_getgid as u32 => 0,
+        nr if nr == libc::SYS_geteuid as u32 => 0,
+        nr if nr == libc::SYS_getegid as u32 => 0,
         // Time: read-only kernel state, writes to guest buffer
         nr if nr == libc::SYS_clock_gettime as u32 => unsafe {
             raw_syscall::syscall2(libc::SYS_clock_gettime, args[0], args[1])
@@ -878,14 +894,34 @@ mod tests {
     }
 
     /// Basic smoke test: `execute_micro_local` for getpid returns the
-    /// actual process ID.
+    /// virtual PID from `MicroState`, not the host kernel PID.
     #[test]
     #[allow(clippy::cast_possible_truncation)]
     fn micro_local_getpid() {
+        // MicroState.pid defaults to 0 in the static initializer.
         let args = [0u64; 6];
         let result = unsafe { execute_micro_local(libc::SYS_getpid as u32, &args) };
-        let expected = i64::from(unsafe { libc::getpid() });
-        assert_eq!(result, expected, "micro_local getpid mismatch");
+        let state = unsafe { crate::state::global_micro_state() };
+        assert_eq!(
+            result,
+            i64::from(state.pid),
+            "micro_local getpid should return virtual PID from MicroState"
+        );
+    }
+
+    /// Identity syscalls return virtual root (uid=0, gid=0) — libOS emulation.
+    #[test]
+    fn micro_local_identity_returns_virtual_root() {
+        let args = [0u64; 6];
+        for &(nr, name) in &[
+            (libc::SYS_getuid, "getuid"),
+            (libc::SYS_getgid, "getgid"),
+            (libc::SYS_geteuid, "geteuid"),
+            (libc::SYS_getegid, "getegid"),
+        ] {
+            let result = unsafe { execute_micro_local(nr as u32, &args) };
+            assert_eq!(result, 0, "{name} should return 0 (virtual root)");
+        }
     }
 
     /// `execute_micro_local` for unknown syscall returns -ENOSYS.
