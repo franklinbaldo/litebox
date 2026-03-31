@@ -8,8 +8,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::ptr::null;
-use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -25,7 +23,7 @@ use litebox_ipc::ring::{
     PIPE_ZONE_BASE_OFFSET, RING_MASK,
 };
 use litebox_ipc::sq::{sq_advance_head, sq_head_index, sq_try_consume};
-use litebox_ipc::wait::spin_then_wait;
+use litebox_ipc::wait::spin_u8_then_wait_u32;
 use litebox_shim_linux::ShimFS;
 
 use crate::shmem::{RingPool, SharedRegion};
@@ -119,32 +117,26 @@ impl<FS: ShimFS> ProcessServer<FS> {
             let entry = &sq_entries[slot];
 
             if !sq_try_consume(entry) {
-                // Entry not ready — wait for the producer to publish it.
-                let expected = header.sq_notify.load(Relaxed);
-                // Re-check after reading the notify counter. If the producer
-                // published the entry AND incremented sq_notify between our
-                // initial `sq_try_consume` and the `load` above, we would
-                // otherwise wait forever on an already-stale expected value.
-                if sq_try_consume(entry) {
-                    // Entry became ready — fall through to process it.
-                } else {
-                    spin_then_wait(&header.sq_notify, expected, |addr, exp| {
-                        // SAFETY: We pass a valid pointer to an AtomicU32 in the
-                        // shared memory region. The futex syscall reads the u32 at
-                        // that address and blocks the thread if it still equals
-                        // `exp`. The timeout is null (infinite wait).
-                        unsafe {
-                            libc::syscall(
-                                libc::SYS_futex,
-                                addr.as_ptr(),
-                                libc::FUTEX_WAIT,
-                                exp.cast_signed(),
-                                null::<libc::timespec>(),
-                            );
-                        }
-                    });
-                    continue;
-                }
+                // Entry not ready — spin on the ready flag (fast), with futex
+                // fallback on sq_notify for multi-process fairness.
+                // 10,000 spins ≈ 100 µs catches most fast syscalls; after that
+                // we sleep to avoid starving other processes in shell8/spawn.
+                spin_u8_then_wait_u32(&entry.ready, 0, &header.sq_notify, |addr, exp| {
+                    // Re-check ready flag before blocking.
+                    if sq_try_consume(entry) {
+                        return;
+                    }
+                    // SAFETY: valid pointer to AtomicU32 in shared memory.
+                    unsafe {
+                        libc::syscall(
+                            libc::SYS_futex,
+                            addr.as_ptr(),
+                            libc::FUTEX_WAIT,
+                            exp.cast_signed(),
+                            std::ptr::null::<libc::timespec>(),
+                        );
+                    }
+                });
             }
 
             // Entry is ready — extract fields and dispatch.
@@ -182,9 +174,9 @@ impl<FS: ShimFS> ProcessServer<FS> {
             // Notify the guest thread that a completion is available.
             let notify_slot = cq_notify_thread(header, cq_entry.thread_slot);
 
+            // Wake micro in case it fell through to futex_wait.
             // SAFETY: `notify_slot` points to a valid AtomicU32 in the shared
-            // memory region's `cq_notify_slots` array. The futex syscall wakes
-            // at most one waiter blocked on that address.
+            // memory region's `cq_notify_slots` array.
             unsafe {
                 libc::syscall(
                     libc::SYS_futex,
@@ -1620,7 +1612,6 @@ impl<FS: ShimFS> ProcessServer<FS> {
         }
         self.close_fd(thread_slot, fd);
 
-        // Check for shebang (#!) scripts.
         //
         // If the file starts with `#!`, parse the interpreter path and optional
         // argument, rebuild argv per Linux convention, and re-dispatch with the
@@ -1737,8 +1728,6 @@ impl<FS: ShimFS> ProcessServer<FS> {
             } else {
                 None
             };
-
-        // Build segment list by simulating the load.
         // We use SimpleMapper to capture the segments without actually mapping.
         let mut main_mapper = SimpleMapper::new();
         let mut main_mem = SimpleMem::new();

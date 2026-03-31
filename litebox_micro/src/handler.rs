@@ -14,6 +14,12 @@ use crate::local_exec::execute_locally;
 use crate::tls::MicroTls;
 use crate::trampoline::SyscallArgs;
 
+fn futex_wake(addr: &core::sync::atomic::AtomicU32) {
+    unsafe {
+        crate::raw_syscall::futex4(core::ptr::from_ref(addr) as usize, libc::FUTEX_WAKE, 1, 0);
+    }
+}
+
 fn futex_wait(addr: &core::sync::atomic::AtomicU32, expected: u32) {
     unsafe {
         crate::raw_syscall::futex4(
@@ -22,12 +28,6 @@ fn futex_wait(addr: &core::sync::atomic::AtomicU32, expected: u32) {
             expected,
             0,
         );
-    }
-}
-
-fn futex_wake(addr: &core::sync::atomic::AtomicU32) {
-    unsafe {
-        crate::raw_syscall::futex4(core::ptr::from_ref(addr) as usize, libc::FUTEX_WAKE, 1, 0);
     }
 }
 
@@ -433,6 +433,7 @@ pub(crate) unsafe fn submit_and_wait(
     header
         .sq_notify
         .fetch_add(1, core::sync::atomic::Ordering::Release);
+    // Wake central in case it fell through to futex_wait.
     futex_wake(&header.sq_notify);
 
     loop {
@@ -443,6 +444,8 @@ pub(crate) unsafe fn submit_and_wait(
         if let Some(cq) = unsafe { cq_find_by_seq(header, cq_entries, search_start, seq) } {
             return cq;
         }
+        // Spin aggressively (10,000 iters ≈ 100 µs), then futex fallback
+        // for multi-process fairness.
         spin_then_wait(notify_slot, current, futex_wait);
     }
 }
@@ -495,6 +498,7 @@ pub(crate) unsafe fn notify_central(tls: *mut MicroTls, syscall_nr: u32, args: &
     header
         .sq_notify
         .fetch_add(1, core::sync::atomic::Ordering::Release);
+    // Wake central in case it fell through to futex_wait.
     futex_wake(&header.sq_notify);
     // No CQ wait — fire and forget.
 }

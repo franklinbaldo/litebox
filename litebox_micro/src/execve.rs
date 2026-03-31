@@ -466,7 +466,7 @@ unsafe fn submit_execve_sq(
     header
         .sq_notify
         .fetch_add(1, core::sync::atomic::Ordering::Release);
-    // Wake central.
+    // Wake central in case it fell through to futex_wait.
     unsafe {
         crate::raw_syscall::futex4(
             core::ptr::from_ref(&header.sq_notify) as usize,
@@ -484,6 +484,7 @@ unsafe fn submit_execve_sq(
         if let Some(cq) = unsafe { cq_find_by_seq(header, cq_entries, search_start, seq) } {
             return cq;
         }
+        // Spin aggressively (10,000 iters ≈ 100 µs), then futex fallback.
         spin_then_wait(notify_slot, current, |addr, exp| {
             unsafe {
                 crate::raw_syscall::futex4(
