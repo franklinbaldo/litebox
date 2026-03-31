@@ -27,6 +27,22 @@ pub const MAX_THREADS: usize = 64;
 /// binary plus the trampoline descriptor and code that follow it.
 pub const DEFAULT_DATA_REGION_SIZE: usize = 8 * 1024 * 1024;
 
+/// Base offset within the data region where pipe ring buffers start.
+///
+/// Layout: [pathnames: 1 MiB][write data: 4 MiB][pipe zone: 3 MiB]
+pub const PIPE_ZONE_BASE_OFFSET: usize = 5 * 1024 * 1024; // 0x500000
+
+/// Size of each pipe slot (header + data buffer).
+/// Header: 64 bytes (cache-line aligned). Data: 64 KiB (power-of-2).
+pub const PIPE_SLOT_SIZE: usize = 64 + 65536;
+
+/// Capacity of the pipe data buffer (must be power-of-2).
+pub const PIPE_DATA_CAPACITY: usize = 65536;
+
+/// Maximum number of concurrent pipe slots.
+/// floor((8 MiB - 5 MiB) / PIPE_SLOT_SIZE) = floor(3145728 / 65600) = 47
+pub const MAX_PIPE_SLOTS: usize = 47;
+
 /// Flags for submission queue entries.
 pub mod sq_flags {
     /// Batch this entry with the next one.
@@ -124,6 +140,46 @@ pub struct CqEntry {
 }
 
 const _: () = assert!(size_of::<CqEntry>() == 32);
+
+/// Header for a shmem-backed pipe ring buffer.
+///
+/// Lives at the start of each pipe slot in the pipe zone. Both micro and
+/// central access this through the shared memory mapping. The ring buffer
+/// data immediately follows this header.
+///
+/// Invariants:
+/// - `tail - head` = bytes available to read (always non-negative)
+/// - `capacity - (tail - head)` = bytes available to write
+/// - Data index: `cursor & (capacity - 1)` (power-of-2 masking)
+#[repr(C, align(64))]
+pub struct ShmemPipeHeader {
+    /// Consumer (reader) position — byte offset of next read.
+    pub head: AtomicU64,
+    /// Producer (writer) position — byte offset of next write.
+    pub tail: AtomicU64,
+    /// Usable buffer capacity in bytes (always power-of-2).
+    pub capacity: u64,
+    /// Pipe status flags (bitwise OR of `pipe_flags::*`).
+    pub flags: AtomicU32,
+    /// The read-end fd number (for identification).
+    pub read_fd: i32,
+    /// The write-end fd number (for identification).
+    pub write_fd: i32,
+    /// Padding to fill to 64 bytes (one cache line).
+    pub _pad: [u8; 24],
+}
+
+const _: () = assert!(size_of::<ShmemPipeHeader>() == 64);
+
+/// Flags for `ShmemPipeHeader::flags`.
+pub mod pipe_flags {
+    /// The read end has been closed. Writers should get EPIPE/SIGPIPE.
+    pub const READER_CLOSED: u32 = 1 << 0;
+    /// The write end has been closed. Readers should get EOF (0) when buffer empty.
+    pub const WRITER_CLOSED: u32 = 1 << 1;
+    /// The pipe is non-blocking (O_NONBLOCK was set).
+    pub const NONBLOCK: u32 = 1 << 2;
+}
 
 /// Header at the start of the shared memory region containing ring metadata.
 ///
@@ -301,5 +357,32 @@ mod tests {
         let eight_mib = 8 * 1024 * 1024;
         let layout = SharedRingLayout::new(eight_mib);
         assert_eq!(layout.data_region_size, eight_mib);
+    }
+
+    #[test]
+    fn pipe_zone_fits_in_default_data_region() {
+        let end = PIPE_ZONE_BASE_OFFSET + MAX_PIPE_SLOTS * PIPE_SLOT_SIZE;
+        assert!(
+            end <= DEFAULT_DATA_REGION_SIZE,
+            "pipe zone end ({end}) exceeds data region size ({DEFAULT_DATA_REGION_SIZE})"
+        );
+    }
+
+    #[test]
+    fn pipe_data_capacity_is_power_of_two() {
+        assert!(PIPE_DATA_CAPACITY.is_power_of_two());
+    }
+
+    #[test]
+    fn shmem_pipe_header_size() {
+        assert_eq!(size_of::<ShmemPipeHeader>(), 64);
+    }
+
+    #[test]
+    fn pipe_slot_size_matches_header_plus_data() {
+        assert_eq!(
+            PIPE_SLOT_SIZE,
+            size_of::<ShmemPipeHeader>() + PIPE_DATA_CAPACITY
+        );
     }
 }
