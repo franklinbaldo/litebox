@@ -282,9 +282,8 @@ pub unsafe fn execute_locally(
                 unsafe { crate::fork::handle_fork(cq) }
             }
         }
-        nr if nr == libc::SYS_fork as u32 || nr == libc::SYS_vfork as u32 => unsafe {
-            crate::fork::handle_fork(cq)
-        },
+        nr if nr == libc::SYS_fork as u32 => unsafe { crate::fork::handle_fork(cq) },
+        nr if nr == libc::SYS_vfork as u32 => unsafe { crate::fork::handle_vfork(cq) },
         nr if nr == libc::SYS_fstat as u32 => {
             if cq.flags & litebox_ipc::ring::cq_flags::HAS_DATA != 0 {
                 // Central stat'd the fd and put struct stat in the data region.
