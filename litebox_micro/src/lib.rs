@@ -11,6 +11,7 @@ pub mod handler;
 pub mod local_exec;
 #[allow(clippy::missing_safety_doc, clippy::cast_sign_loss)]
 pub mod raw_syscall;
+pub mod stack_pool;
 pub mod state;
 pub mod thread;
 pub mod tls;
