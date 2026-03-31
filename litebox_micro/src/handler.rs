@@ -53,17 +53,18 @@ const PATHNAME_REGION_SIZE: usize = 4096;
 fn pathname_arg_index(nr: u32) -> Option<usize> {
     #[allow(clippy::match_same_arms)] // arms kept separate for per-syscall documentation
     match i64::from(nr) {
-        libc::SYS_openat => Some(1),   // openat(dirfd, pathname, flags, mode)
-        libc::SYS_open => Some(0),     // open(pathname, flags, mode)
-        libc::SYS_creat => Some(0),    // creat(pathname, mode)
-        libc::SYS_access => Some(0),   // access(pathname, mode)
-        libc::SYS_stat => Some(0),     // stat(pathname, statbuf)
-        libc::SYS_lstat => Some(0),    // lstat(pathname, statbuf)
-        libc::SYS_readlink => Some(0), // readlink(pathname, buf, bufsiz)
-        libc::SYS_unlink => Some(0),   // unlink(pathname)
-        libc::SYS_chdir => Some(0),    // chdir(pathname)
-        libc::SYS_mkdir => Some(0),    // mkdir(pathname, mode)
-        libc::SYS_unlinkat => Some(1), // unlinkat(dirfd, pathname, flags)
+        libc::SYS_openat => Some(1),     // openat(dirfd, pathname, flags, mode)
+        libc::SYS_open => Some(0),       // open(pathname, flags, mode)
+        libc::SYS_creat => Some(0),      // creat(pathname, mode)
+        libc::SYS_access => Some(0),     // access(pathname, mode)
+        libc::SYS_stat => Some(0),       // stat(pathname, statbuf)
+        libc::SYS_lstat => Some(0),      // lstat(pathname, statbuf)
+        libc::SYS_readlink => Some(0),   // readlink(pathname, buf, bufsiz)
+        libc::SYS_readlinkat => Some(1), // readlinkat(dirfd, pathname, buf, bufsiz)
+        libc::SYS_unlink => Some(0),     // unlink(pathname)
+        libc::SYS_chdir => Some(0),      // chdir(pathname)
+        libc::SYS_mkdir => Some(0),      // mkdir(pathname, mode)
+        libc::SYS_unlinkat => Some(1),   // unlinkat(dirfd, pathname, flags)
         libc::SYS_newfstatat
             if {
                 // newfstatat(dirfd, pathname, statbuf, flags)
@@ -618,6 +619,25 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
                 _ => {} // dup, fcntl, etc. — fall through to central
             }
         }
+    }
+
+    // exit_group: notify central (fire-and-forget) then die immediately.
+    //
+    // exit_group terminates the entire process. We must NOT use submit_and_wait
+    // — the child server thread sees `is_exiting()` after dispatching
+    // exit_group, breaks out of its run loop, and may release/reset the
+    // shared ring before we read the CQ response, causing a deadlock.
+    // Instead, notify central so it can update its exiting state, then
+    // execute the raw syscall which kills the process.
+    //
+    // Note: SYS_exit (thread exit) still uses the normal submit_and_wait
+    // path because it doesn't trigger is_exiting on the primary task and
+    // needs the thread deregistration round-trip.
+    #[allow(clippy::cast_possible_truncation)]
+    if nr == libc::SYS_exit_group as u32 {
+        unsafe { notify_central(tls, nr, &args.args) };
+        unsafe { crate::raw_syscall::syscall1(libc::SYS_exit_group, args.args[0]) };
+        // unreachable — process is dead
     }
 
     let cq =
