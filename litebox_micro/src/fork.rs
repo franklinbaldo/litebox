@@ -16,6 +16,11 @@ use litebox_ipc::ring::{CqEntry, SharedRingLayout};
 /// across `fork()`.
 const RESERVED_CHILD_FD: i32 = 200;
 
+/// Clone flags for vfork fast-path.
+const CLONE_VM: u64 = 0x100;
+const CLONE_VFORK: u64 = 0x4000;
+const SIGCHLD: u64 = 17;
+
 /// Execute a fork authorized by central.
 ///
 /// The CqEntry carries:
@@ -119,6 +124,183 @@ fn write_u32(buf: &mut [u8], start: usize, mut val: u32) -> usize {
     }
     buf[begin..pos].reverse();
     pos
+}
+
+/// Execute a vfork authorized by central — fast-path using
+/// `clone(CLONE_VM|CLONE_VFORK|SIGCHLD)` with a pooled stack.
+///
+/// The CqEntry carries the same fields as [`handle_fork`].
+///
+/// Returns: child OS PID in parent, 0 in child, or negative errno on failure.
+///
+/// # Safety
+///
+/// - The global [`MicroState`] must be initialized.
+/// - TLS must be initialized for the calling thread.
+/// - `cq` must contain valid fork parameters from central.
+/// - The global stack pool must be initialized.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::similar_names
+)]
+pub unsafe fn handle_vfork(cq: &CqEntry) -> i64 {
+    let central_pid = cq.result as u32;
+    let child_pid_from_central = cq.data_offset;
+    let child_ring_fd_in_central = cq.data_len.cast_signed();
+
+    // Open the child ring fd via /proc/<central_pid>/fd/<N>.
+    let mut path_buf = [0u8; 64];
+    format_proc_fd_path(&mut path_buf, central_pid, child_ring_fd_in_central);
+    let local_fd = unsafe { crate::raw_syscall::open(path_buf.as_ptr(), libc::O_RDWR) };
+    if crate::raw_syscall::is_error(local_fd) {
+        return local_fd;
+    }
+
+    // dup2 to reserved fd so both parent and child have a well-known fd number.
+    let dup_ret = unsafe { libc::dup2(local_fd as i32, RESERVED_CHILD_FD) };
+    if dup_ret < 0 {
+        let e = -i64::from(unsafe { *libc::__errno_location() });
+        unsafe { crate::raw_syscall::close(local_fd as i32) };
+        return e;
+    }
+    if local_fd as i32 != RESERVED_CHILD_FD {
+        unsafe { crate::raw_syscall::close(local_fd as i32) };
+    }
+
+    // Acquire a pooled stack for the child.
+    let Some(child_stack) = crate::state::global_stack_pool().acquire() else {
+        unsafe { crate::raw_syscall::close(RESERVED_CHILD_FD) };
+        return -i64::from(libc::ENOMEM);
+    };
+
+    // Save parent's MicroState + TLS fields before clone.
+    // The child will mutate the shared global state (same address space).
+    let micro = unsafe { crate::state::global_micro_state_mut() };
+    let saved_ring_base = micro.ring_base;
+    let saved_ring_size = micro.ring_size;
+    let saved_ring_fd = micro.ring_fd;
+    let saved_pid = micro.pid;
+    let saved_ppid = micro.ppid;
+    let saved_layout = micro.layout;
+    let saved_pipe_fds = micro.pipe_fds;
+    let saved_guest_brk = micro.guest_brk.load(core::sync::atomic::Ordering::Acquire);
+
+    let tls = unsafe { crate::tls::current_tls() };
+    let saved_thread_slot = unsafe { (*tls).thread_slot };
+    let saved_seq_counter = unsafe { (*tls).seq_counter };
+
+    // clone(CLONE_VM | CLONE_VFORK | SIGCHLD, child_stack_top)
+    let flags = CLONE_VM | CLONE_VFORK | SIGCHLD;
+
+    let ret =
+        unsafe { crate::raw_syscall::syscall2(libc::SYS_clone, flags, child_stack.top() as u64) };
+
+    if crate::raw_syscall::is_error(ret) {
+        // Error: release stack and close fd.
+        crate::state::global_stack_pool().release(child_stack);
+        unsafe { crate::raw_syscall::close(RESERVED_CHILD_FD) };
+        return ret;
+    }
+
+    if ret == 0 {
+        // CHILD — running on the pooled stack, sharing parent's address space.
+        unsafe {
+            post_fork_child_vfork(RESERVED_CHILD_FD, child_pid_from_central);
+        }
+        0
+    } else {
+        // PARENT — resumed after child called execve or _exit.
+        // Restore all saved MicroState + TLS fields.
+        let micro = unsafe { crate::state::global_micro_state_mut() };
+        micro.ring_base = saved_ring_base;
+        micro.ring_size = saved_ring_size;
+        micro.ring_fd = saved_ring_fd;
+        micro.pid = saved_pid;
+        micro.ppid = saved_ppid;
+        micro.layout = saved_layout;
+        micro.pipe_fds = saved_pipe_fds;
+        micro
+            .guest_brk
+            .store(saved_guest_brk, core::sync::atomic::Ordering::Release);
+
+        let tls = unsafe { crate::tls::current_tls() };
+        unsafe {
+            (*tls).thread_slot = saved_thread_slot;
+            (*tls).seq_counter = saved_seq_counter;
+        }
+
+        // Release stack back to pool.
+        crate::state::global_stack_pool().release(child_stack);
+
+        // Close the reserved fd — child has its own ring mapped.
+        unsafe { crate::raw_syscall::close(RESERVED_CHILD_FD) };
+
+        // Return child's OS PID.
+        ret
+    }
+}
+
+/// Post-fork child initialization for vfork (CLONE_VM path).
+///
+/// Unlike [`post_fork_child`], this does **not** munmap the parent's ring
+/// because `CLONE_VM` shares the address space — unmapping would corrupt the
+/// parent's mappings.
+///
+/// # Safety
+///
+/// Must be called in the child immediately after `clone(CLONE_VM|CLONE_VFORK)`
+/// returns 0.
+#[allow(clippy::cast_sign_loss)]
+unsafe fn post_fork_child_vfork(child_ring_fd: i32, child_pid: u32) {
+    let micro = unsafe { crate::state::global_micro_state_mut() };
+
+    // 1. Map child's new ring buffer at a NEW address (let kernel choose).
+    //    Do NOT munmap the parent ring — we share address space.
+    let layout = SharedRingLayout::default_layout();
+    let new_base = unsafe {
+        crate::raw_syscall::mmap(
+            0,
+            layout.total_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            child_ring_fd,
+            0,
+        )
+    };
+    assert!(
+        !crate::raw_syscall::is_error(new_base),
+        "vfork child: mmap of new ring failed"
+    );
+
+    // 2. Update global micro state to point at child ring.
+    micro.ring_base = new_base as *mut u8;
+    micro.ring_size = layout.total_size;
+    micro.ring_fd = child_ring_fd;
+    micro.pid = child_pid;
+    micro.ppid = unsafe { libc::getppid().cast_unsigned() };
+    micro.layout = layout;
+
+    // 3. Clear pipe fd tracking table.
+    micro.pipe_fds = [None; litebox_ipc::ring::MAX_PIPE_SLOTS];
+
+    // 4. Reset TLS.
+    let tls = unsafe { crate::tls::current_tls() };
+    unsafe {
+        (*tls).micro = crate::state::global_micro_state_ptr();
+        (*tls).thread_slot = 0;
+        (*tls).seq_counter = 0;
+    }
+
+    // 5. Send MSG_CHILD_READY to central via new ring.
+    let args = [u64::from(child_pid), 0, 0, 0, 0, 0];
+    unsafe {
+        crate::handler::submit_and_wait(tls, MSG_CHILD_READY, &args, 0);
+    }
+
+    // 6. Close the reserved fd — the ring is now mapped, fd no longer needed.
+    unsafe { crate::raw_syscall::close(child_ring_fd) };
 }
 
 /// Post-fork child initialization.
