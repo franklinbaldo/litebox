@@ -36,15 +36,6 @@ pub(crate) struct AltStack {
     pub flags: u64,
 }
 
-/// Pipe created by micro via MSG_NOTIFY_PIPE2.
-#[derive(Clone, Copy)]
-#[allow(dead_code)] // Fields read during fork reconstruction (future task).
-pub(crate) struct MicroPipe {
-    pub read_fd: i32,
-    pub write_fd: i32,
-    pub flags: i32,
-}
-
 /// A shmem-backed pipe tracked by central.
 #[derive(Clone, Copy)]
 pub(crate) struct ShmemPipe {
@@ -73,9 +64,6 @@ pub(crate) struct ProcessNotificationState {
     /// Pending alarm in seconds, or 0 if none.
     pub alarm_seconds: u32,
 
-    /// Pipes created by micro (not tracked in shim's fdtable).
-    pub micro_pipes: Vec<MicroPipe>,
-
     /// Children reaped by micro via wait4: (pid, exit_status).
     pub reaped_children: Vec<(i32, i32)>,
 
@@ -96,7 +84,6 @@ impl Default for ProcessNotificationState {
             signal_masks: [0; MAX_THREADS],
             alt_stacks: [None; MAX_THREADS],
             alarm_seconds: 0,
-            micro_pipes: Vec::new(),
             reaped_children: Vec::new(),
             vma_events: Vec::new(),
             pipe_slot_bitset: 0,

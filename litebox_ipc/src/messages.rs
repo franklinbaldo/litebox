@@ -90,9 +90,9 @@ pub const MSG_NOTIFY_SIGALTSTACK: u32 = MSG_BASE + 8;
 /// args[0] = seconds requested, args[1] = return value (remaining seconds).
 pub const MSG_NOTIFY_ALARM: u32 = MSG_BASE + 9;
 
-/// Notification: micro executed pipe2 locally.
-/// args[0] = fd[0] (read end), args[1] = fd[1] (write end),
-/// args[2] = flags, args[3] = result (0 or -errno).
+/// Notification: pipe2 (DEPRECATED — pipe2 is now Tier 3, handled via
+/// shmem-backed pipes. This constant is retained to avoid shifting other
+/// constant values.)
 pub const MSG_NOTIFY_PIPE2: u32 = MSG_BASE + 10;
 
 /// Notification: micro executed wait4 locally.

@@ -16,9 +16,8 @@ use std::thread::JoinHandle;
 use litebox_ipc::cq::{cq_notify_thread, cq_push};
 use litebox_ipc::messages::{
     self, MSG_CHILD_READY, MSG_FORK_RESULT, MSG_LOCAL_RESULT, MSG_NOTIFY_ALARM, MSG_NOTIFY_MADVISE,
-    MSG_NOTIFY_MPROTECT, MSG_NOTIFY_MUNMAP, MSG_NOTIFY_PIPE2, MSG_NOTIFY_SIGACTION,
-    MSG_NOTIFY_SIGALTSTACK, MSG_NOTIFY_SIGPROCMASK, MSG_NOTIFY_WAIT4, MSG_THREAD_DEREGISTER,
-    MSG_THREAD_REGISTER,
+    MSG_NOTIFY_MPROTECT, MSG_NOTIFY_MUNMAP, MSG_NOTIFY_SIGACTION, MSG_NOTIFY_SIGALTSTACK,
+    MSG_NOTIFY_SIGPROCMASK, MSG_NOTIFY_WAIT4, MSG_THREAD_DEREGISTER, MSG_THREAD_REGISTER,
 };
 use litebox_ipc::ring::{
     cq_flags, pipe_flags, sq_flags, CqEntry, SqEntry, TrampolineDescriptor, PIPE_SLOT_SIZE,
@@ -2151,21 +2150,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 }
                 0
             }
-            MSG_NOTIFY_PIPE2 => {
-                let result = entry.args[3].cast_signed();
-                if result == 0 {
-                    let mut state = self.notification_state.borrow_mut();
-                    #[allow(clippy::cast_possible_truncation)]
-                    state
-                        .micro_pipes
-                        .push(crate::notification_state::MicroPipe {
-                            read_fd: entry.args[0] as i32,
-                            write_fd: entry.args[1] as i32,
-                            flags: entry.args[2] as i32,
-                        });
-                }
-                0
-            }
+            // MSG_NOTIFY_PIPE2 removed: pipe2 is now Tier 3 (full round-trip),
+            // handled via shmem-backed pipes. No Tier 2 notification path.
             MSG_NOTIFY_WAIT4 => {
                 #[allow(clippy::cast_possible_truncation)]
                 let returned_pid = entry.args[1] as i32;
