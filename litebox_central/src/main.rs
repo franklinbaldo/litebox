@@ -11,6 +11,7 @@ mod server;
 mod shmem;
 
 use std::os::fd::OwnedFd;
+use std::sync::Arc;
 
 use clap::Parser;
 use litebox::fs::FileSystem as _;
@@ -140,6 +141,8 @@ fn main() -> anyhow::Result<()> {
         shmem::SharedRegion::new()?
     };
 
-    let server = server::ProcessServer::new(region, task, shim, fs);
+    let ring_pool = Arc::new(shmem::RingPool::new(8));
+
+    let server = server::ProcessServer::new(region, task, shim, fs, ring_pool, -1);
     server.run()
 }
