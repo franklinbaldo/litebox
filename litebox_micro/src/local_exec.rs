@@ -550,9 +550,6 @@ pub unsafe fn execute_locally(
         nr if nr == libc::SYS_wait4 as u32 => unsafe {
             raw_syscall::syscall4(libc::SYS_wait4, args[0], args[1], args[2], args[3])
         },
-        nr if nr == libc::SYS_pipe2 as u32 => unsafe {
-            raw_syscall::syscall2(libc::SYS_pipe2, args[0], args[1])
-        },
         // Signal syscalls: executed locally via raw kernel syscalls (micro-local
         // fast-path normally handles these, but these arms serve as fallback).
         nr if nr == libc::SYS_alarm as u32 => unsafe {
@@ -710,7 +707,6 @@ pub(crate) fn tier2_notify_message(nr: u32) -> u32 {
         libc::SYS_rt_sigprocmask => litebox_ipc::messages::MSG_NOTIFY_SIGPROCMASK,
         libc::SYS_sigaltstack => litebox_ipc::messages::MSG_NOTIFY_SIGALTSTACK,
         libc::SYS_alarm => litebox_ipc::messages::MSG_NOTIFY_ALARM,
-        libc::SYS_pipe2 => litebox_ipc::messages::MSG_NOTIFY_PIPE2,
         libc::SYS_wait4 => litebox_ipc::messages::MSG_NOTIFY_WAIT4,
         libc::SYS_munmap => litebox_ipc::messages::MSG_NOTIFY_MUNMAP,
         libc::SYS_mprotect => litebox_ipc::messages::MSG_NOTIFY_MPROTECT,
@@ -730,8 +726,6 @@ pub(crate) fn tier2_notify_message(nr: u32) -> u32 {
 /// `kernel_sigaction` struct.
 /// For `rt_sigprocmask`: if `args[1]` is non-null, reads a u64 from the `sigset_t`.
 /// For `sigaltstack`: if `args[0]` is non-null, reads fields from the `stack_t` struct.
-/// For `pipe2`: if `result == 0`, reads the two i32 fd values from the
-/// pointer in `args[0]` (which the kernel just wrote to).
 /// For `wait4`: if `result > 0` and `args[1]` is non-null, reads the
 /// i32 status value from that pointer.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -785,17 +779,6 @@ pub(crate) unsafe fn tier2_notify_args(nr: u32, args: &[u64; 6], result: i64) ->
         libc::SYS_alarm => {
             // args[0] = seconds requested, result = remaining seconds
             [args[0], result.cast_unsigned(), 0, 0, 0, 0]
-        }
-        libc::SYS_pipe2 => {
-            // Read fd values from the int[2] output buffer after successful syscall
-            let (fd0, fd1) = if result == 0 {
-                let fds_ptr = args[0] as *const i32;
-                unsafe { ((*fds_ptr) as u64, (*fds_ptr.add(1)) as u64) }
-            } else {
-                (0, 0)
-            };
-            // fd[0], fd[1], flags, result, 0, 0
-            [fd0, fd1, args[1], result.cast_unsigned(), 0, 0]
         }
         libc::SYS_wait4 => {
             // Read status from output pointer after successful wait
@@ -914,10 +897,6 @@ pub unsafe fn execute_micro_local(syscall_nr: u32, args: &[u64; 6]) -> i64 {
         // Process wait: must run in micro's PID namespace
         nr if nr == libc::SYS_wait4 as u32 => unsafe {
             raw_syscall::syscall4(libc::SYS_wait4, args[0], args[1], args[2], args[3])
-        },
-        // Pipe creation: real OS pipes, no shim state
-        nr if nr == libc::SYS_pipe2 as u32 => unsafe {
-            raw_syscall::syscall2(libc::SYS_pipe2, args[0], args[1])
         },
         // Filesystem sync: no arguments
         nr if nr == libc::SYS_sync as u32 => unsafe { raw_syscall::syscall0(libc::SYS_sync) },
@@ -1111,7 +1090,6 @@ mod tests {
             libc::SYS_rt_sigprocmask,
             libc::SYS_sigaltstack,
             libc::SYS_alarm,
-            libc::SYS_pipe2,
             libc::SYS_wait4,
             libc::SYS_munmap,
             libc::SYS_mprotect,
@@ -1175,10 +1153,6 @@ mod tests {
         assert_eq!(
             tier2_notify_message(libc::SYS_alarm as u32),
             litebox_ipc::messages::MSG_NOTIFY_ALARM
-        );
-        assert_eq!(
-            tier2_notify_message(libc::SYS_pipe2 as u32),
-            litebox_ipc::messages::MSG_NOTIFY_PIPE2
         );
         assert_eq!(
             tier2_notify_message(libc::SYS_wait4 as u32),

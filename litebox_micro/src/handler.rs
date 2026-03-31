@@ -539,8 +539,6 @@ pub(crate) fn is_tier2_notify(nr: u32) -> bool {
         | libc::SYS_sigaltstack
         // Alarm: creates kernel timer that fork does NOT inherit.
         | libc::SYS_alarm
-        // Pipe: creates fds that central's fdtable doesn't know about.
-        | libc::SYS_pipe2
         // Wait: reaps children, consumes SIGCHLD — destructive.
         | libc::SYS_wait4
         // VMA operations: must execute in micro's address space, notify central for VMA tracking.
@@ -594,6 +592,34 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
         // Pre-execve: fall through to central round-trip.
     }
 
+    // Shmem pipe fast-path: read/write on pipe fds bypass central entirely.
+    {
+        let micro = unsafe { &*(*tls).micro };
+        let fd = args.args[0] as i32;
+        if let Some((shmem_offset, is_write_end)) = micro.find_pipe_fd(fd) {
+            match i64::from(nr) {
+                libc::SYS_write if is_write_end => {
+                    let buf = args.args[1] as *const u8;
+                    let count = args.args[2] as usize;
+                    return unsafe { shmem_pipe_write(micro, shmem_offset, buf, count) };
+                }
+                libc::SYS_read if !is_write_end => {
+                    let buf = args.args[1] as *mut u8;
+                    let count = args.args[2] as usize;
+                    return unsafe { shmem_pipe_read(micro, shmem_offset, buf, count) };
+                }
+                libc::SYS_close => {
+                    // Unregister the pipe fd locally, then let close fall through
+                    // to central (which handles shim fd closure and shmem flags).
+                    let micro_mut = unsafe { &mut *(*tls).micro };
+                    micro_mut.unregister_pipe_fd(fd);
+                    // Fall through to submit_and_wait for central to handle close
+                }
+                _ => {} // dup, fcntl, etc. — fall through to central
+            }
+        }
+    }
+
     let cq =
         unsafe { submit_and_wait(tls, nr, &args.args, litebox_ipc::ring::sq_flags::NEED_AUTH) };
 
@@ -609,6 +635,28 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
                     0,
                 );
             }
+        }
+
+        // pipe2: central created shmem pipe, extract response from data region.
+        #[allow(clippy::cast_ptr_alignment)] // data region is properly aligned for Pipe2Response
+        if nr == libc::SYS_pipe2 as u32 && cq.flags & cq_flags::HAS_DATA != 0 {
+            let micro = unsafe { &mut *(*tls).micro };
+            let data_base = unsafe { micro.ring_base.add(micro.layout.data_region_offset) };
+            let resp = unsafe {
+                &*(data_base
+                    .add(cq.data_offset as usize)
+                    .cast::<litebox_ipc::messages::Pipe2Response>())
+            };
+            // Register both pipe fds for fast-path read/write.
+            micro.register_pipe_fd(resp.read_fd, resp.pipe_slot_offset, false);
+            micro.register_pipe_fd(resp.write_fd, resp.pipe_slot_offset, true);
+            // Write fd pair to guest's output pointer.
+            let fds_ptr = args.args[0] as *mut i32;
+            unsafe {
+                core::ptr::write(fds_ptr, resp.read_fd);
+                core::ptr::write(fds_ptr.add(1), resp.write_fd);
+            }
+            return 0; // success
         }
 
         let micro = unsafe { &*(*tls).micro };
@@ -637,5 +685,168 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
         result
     } else {
         cq.result
+    }
+}
+
+/// Write to a shmem pipe ring buffer with blocking support.
+///
+/// # Safety
+///
+/// `buf_ptr` must point to valid readable memory of at least `count` bytes.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_ptr_alignment,
+    clippy::ptr_as_ptr
+)]
+unsafe fn shmem_pipe_write(
+    micro: &crate::state::MicroState,
+    shmem_offset: u32,
+    buf_ptr: *const u8,
+    count: usize,
+) -> i64 {
+    if count == 0 {
+        return 0;
+    }
+    let header = unsafe {
+        micro
+            .ring_base
+            .add(micro.layout.data_region_offset)
+            .add(shmem_offset as usize)
+            .cast::<litebox_ipc::ring::ShmemPipeHeader>()
+    };
+    let buf = unsafe { core::slice::from_raw_parts(buf_ptr, count) };
+    let mut total_written = 0usize;
+
+    loop {
+        let result = unsafe { litebox_ipc::pipe::pipe_try_write(header, &buf[total_written..]) };
+        if result == -i64::from(libc::EPIPE) {
+            if total_written > 0 {
+                return total_written as i64;
+            }
+            // TODO: send SIGPIPE to current thread
+            return -i64::from(libc::EPIPE);
+        }
+        if result > 0 {
+            total_written += result as usize;
+            if total_written >= count {
+                // Wake reader (may be blocked on empty buffer)
+                let head_ptr = unsafe { &(*header).head };
+                unsafe {
+                    crate::raw_syscall::futex4(
+                        core::ptr::from_ref(head_ptr).cast::<u8>() as usize,
+                        libc::FUTEX_WAKE,
+                        1,
+                        0,
+                    );
+                }
+                return total_written as i64;
+            }
+            // Partial write — continue for blocking pipes
+            continue;
+        }
+        // result == -EAGAIN: buffer full
+        let flags = unsafe { (*header).flags.load(core::sync::atomic::Ordering::Relaxed) };
+        if flags & litebox_ipc::ring::pipe_flags::NONBLOCK != 0 {
+            if total_written > 0 {
+                return total_written as i64;
+            }
+            return -i64::from(libc::EAGAIN);
+        }
+        // Blocking: spin briefly then futex-wait on head (reader will advance it)
+        let head_ptr = unsafe { &(*header).head };
+        let current_head = head_ptr.load(core::sync::atomic::Ordering::Relaxed);
+        for _ in 0..100 {
+            core::hint::spin_loop();
+            if head_ptr.load(core::sync::atomic::Ordering::Relaxed) != current_head {
+                break;
+            }
+        }
+        if head_ptr.load(core::sync::atomic::Ordering::Relaxed) == current_head {
+            // Still no progress — futex wait on head
+            unsafe {
+                crate::raw_syscall::futex4(
+                    core::ptr::from_ref(head_ptr).cast::<u8>() as usize,
+                    libc::FUTEX_WAIT,
+                    current_head as u32, // compare low 32 bits
+                    0,
+                );
+            }
+        }
+    }
+}
+
+/// Read from a shmem pipe ring buffer with blocking support.
+///
+/// # Safety
+///
+/// `buf_ptr` must point to valid writable memory of at least `count` bytes.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_ptr_alignment,
+    clippy::ptr_as_ptr
+)]
+unsafe fn shmem_pipe_read(
+    micro: &crate::state::MicroState,
+    shmem_offset: u32,
+    buf_ptr: *mut u8,
+    count: usize,
+) -> i64 {
+    if count == 0 {
+        return 0;
+    }
+    let header = unsafe {
+        micro
+            .ring_base
+            .add(micro.layout.data_region_offset)
+            .add(shmem_offset as usize)
+            .cast::<litebox_ipc::ring::ShmemPipeHeader>()
+    };
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, count) };
+
+    loop {
+        let result = unsafe { litebox_ipc::pipe::pipe_try_read(header, buf) };
+        if result > 0 {
+            // Wake writer (may be blocked on full buffer)
+            let tail_ptr = unsafe { &(*header).tail };
+            unsafe {
+                crate::raw_syscall::futex4(
+                    core::ptr::from_ref(tail_ptr).cast::<u8>() as usize,
+                    libc::FUTEX_WAKE,
+                    1,
+                    0,
+                );
+            }
+            return result;
+        }
+        if result == 0 {
+            // EOF — writer closed and buffer empty
+            return 0;
+        }
+        // result == -EAGAIN: buffer empty
+        let flags = unsafe { (*header).flags.load(core::sync::atomic::Ordering::Relaxed) };
+        if flags & litebox_ipc::ring::pipe_flags::NONBLOCK != 0 {
+            return -i64::from(libc::EAGAIN);
+        }
+        // Blocking: spin briefly then futex-wait on tail (writer will advance it)
+        let tail_ptr = unsafe { &(*header).tail };
+        let current_tail = tail_ptr.load(core::sync::atomic::Ordering::Relaxed);
+        for _ in 0..100 {
+            core::hint::spin_loop();
+            if tail_ptr.load(core::sync::atomic::Ordering::Relaxed) != current_tail {
+                break;
+            }
+        }
+        if tail_ptr.load(core::sync::atomic::Ordering::Relaxed) == current_tail {
+            unsafe {
+                crate::raw_syscall::futex4(
+                    core::ptr::from_ref(tail_ptr).cast::<u8>() as usize,
+                    libc::FUTEX_WAIT,
+                    current_tail as u32,
+                    0,
+                );
+            }
+        }
     }
 }
