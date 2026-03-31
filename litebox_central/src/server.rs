@@ -364,6 +364,13 @@ impl<FS: ShimFS> ProcessServer<FS> {
             _ => {}
         }
 
+        // pipe2: create virtual pipes in shim's fd table, allocate shmem
+        // ring buffer slot, return fd pair + slot offset to micro.
+        #[allow(clippy::cast_possible_truncation)]
+        if nr == libc::SYS_pipe2 as u32 {
+            return self.handle_pipe2(entry);
+        }
+
         if Self::needs_local_exec(nr) {
             cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
             return cq;
@@ -735,8 +742,6 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 // Process wait: must run in micro's PID namespace where
                 // the real child process lives (central has no children).
                 | libc::SYS_wait4
-                // Pipe creation: creates real OS pipes in micro's process.
-                | libc::SYS_pipe2
                 // Memory query: mincore checks page residency on real OS
                 // pages in the guest's address space — cannot be done from
                 // central's address space.
@@ -1293,6 +1298,100 @@ impl<FS: ShimFS> ProcessServer<FS> {
         }
         // Other negative: error from shim, pass through directly.
 
+        cq
+    }
+
+    /// Handle a `pipe2` syscall by creating virtual pipe fds in the shim's
+    /// fd table, allocating a shmem ring buffer slot, and returning the fd
+    /// pair + slot offset to micro via the data region.
+    ///
+    /// The guest's `pipefd` pointer (arg0/rdi) is in micro's address space
+    /// and cannot be dereferenced by central. We redirect it to a local
+    /// `[u32; 2]` buffer so the shim writes fd values into central's memory,
+    /// then package them in a `Pipe2Response` for micro.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
+    fn handle_pipe2(&self, entry: &SqEntry) -> CqEntry {
+        let mut cq = Self::base_cq(entry);
+        let flags = entry.args[1] as i32;
+
+        // Create a local buffer for the shim to write the fd pair into.
+        // This avoids the guest pointer problem — the shim writes to
+        // central's memory instead of micro's address space.
+        let mut fd_buf: [u32; 2] = [0; 2];
+        let mut regs = crate::dispatch::sq_entry_to_ptregs(entry);
+        regs.rdi = fd_buf.as_mut_ptr() as usize; // redirect pipefd pointer
+
+        let shim_result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+        if shim_result < 0 {
+            cq.result = shim_result;
+            return cq;
+        }
+
+        // Extract fd pair from our local buffer.
+        let read_fd = fd_buf[0] as i32;
+        let write_fd = fd_buf[1] as i32;
+
+        // Allocate a shmem pipe slot for the ring buffer.
+        let mut ns = self.notification_state.borrow_mut();
+        let Some((slot_index, slot_offset)) = ns.alloc_pipe_slot() else {
+            // No free pipe slots — return EMFILE.
+            cq.result = -i64::from(libc::EMFILE);
+            return cq;
+        };
+
+        // Initialize the ring buffer header in shmem.
+        let nonblock = flags & libc::O_NONBLOCK != 0;
+        {
+            let data_region = self.region.data_region_mut();
+            #[allow(clippy::cast_ptr_alignment)] // slot offsets are 64-byte aligned by design
+            let header_ptr = unsafe {
+                data_region
+                    .as_mut_ptr()
+                    .add(slot_offset as usize)
+                    .cast::<litebox_ipc::ring::ShmemPipeHeader>()
+            };
+            unsafe {
+                litebox_ipc::pipe::pipe_init(header_ptr, read_fd, write_fd, nonblock);
+            }
+        }
+
+        // Track the pipe in notification state.
+        ns.shmem_pipes.push(crate::notification_state::ShmemPipe {
+            read_fd,
+            write_fd,
+            slot_index,
+            open_ends: 2,
+        });
+
+        // Write a Pipe2Response to the data region at offset 0 for micro.
+        let response = litebox_ipc::messages::Pipe2Response {
+            read_fd,
+            write_fd,
+            pipe_slot_offset: slot_offset,
+            _pad: 0,
+        };
+        {
+            let data_region = self.region.data_region_mut();
+            let resp_bytes: &[u8] = unsafe {
+                core::slice::from_raw_parts(
+                    (&raw const response).cast::<u8>(),
+                    core::mem::size_of::<litebox_ipc::messages::Pipe2Response>(),
+                )
+            };
+            data_region[..resp_bytes.len()].copy_from_slice(resp_bytes);
+        }
+
+        // Return CQ with EXEC_LOCAL | HAS_DATA | NO_REPORT.
+        // EXEC_LOCAL tells micro to enter its local-exec block where it
+        // detects HAS_DATA for pipe2 and reads the Pipe2Response.
+        cq.result = 0;
+        cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
+        cq.data_offset = 0;
+        cq.data_len = core::mem::size_of::<litebox_ipc::messages::Pipe2Response>() as u32;
         cq
     }
 
