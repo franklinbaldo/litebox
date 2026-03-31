@@ -1998,7 +1998,13 @@ impl<FS: ShimFS> Task<FS> {
                 | Sysno::setrlimit | Sysno::prlimit64
                 // No-ops (read-only queries).
                 | Sysno::getpid | Sysno::getppid | Sysno::gettid
-                | Sysno::getuid | Sysno::getgid,
+                | Sysno::getuid | Sysno::getgid | Sysno::getsid | Sysno::getpgid
+                // Stat queries — bash calls fstat between fork and exec
+                // to check terminal type and fd validity.
+                | Sysno::fstat | Sysno::stat | Sysno::newfstatat
+                // ioctl — bash calls ioctl(TIOCGPGRP) for job control
+                // between fork and exec.
+                | Sysno::ioctl,
             ) => true,
             // Argument-aware: fcntl — only allow fd flag / dup / status-flag operations.
             // F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4, F_DUPFD_CLOEXEC=1030
@@ -3579,6 +3585,12 @@ mod tests {
         assert_allowed(Sysno::gettid);
         assert_allowed(Sysno::getuid);
         assert_allowed(Sysno::getgid);
+        assert_allowed(Sysno::getsid);
+        assert_allowed(Sysno::getpgid);
+        assert_allowed(Sysno::fstat);
+        assert_allowed(Sysno::stat);
+        assert_allowed(Sysno::newfstatat);
+        assert_allowed(Sysno::ioctl);
     }
 
     #[test]
@@ -3589,7 +3601,6 @@ mod tests {
         assert_rejected(Sysno::mmap);
         assert_rejected(Sysno::brk);
         assert_rejected(Sysno::clone);
-        assert_rejected(Sysno::ioctl);
         assert_rejected(Sysno::poll);
         assert_rejected(Sysno::socket);
         assert_rejected(Sysno::connect);

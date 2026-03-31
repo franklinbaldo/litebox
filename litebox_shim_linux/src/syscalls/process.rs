@@ -2572,6 +2572,15 @@ impl<FS: ShimFS> Task<FS> {
             if !replacements.is_empty() {
                 let files = self.files.borrow();
                 for repl in replacements {
+                    #[cfg(feature = "trace_syscalls")]
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[PIPE-REPLACE] pid={}: replacing guest_fd={} with HostPipeFd(host_fd={}, dir={:?})",
+                        self.pid,
+                        repl.guest_fd,
+                        repl.host_fd,
+                        repl.direction,
+                    );
                     let entry = super::host_pipe::HostPipeFd::new(repl.host_fd, repl.direction);
                     let mut dt = self.global.litebox.descriptor_table_mut();
                     let typed_fd: litebox::fd::TypedFd<super::host_pipe::HostPipeSubsystem> =
@@ -2787,6 +2796,40 @@ impl<FS: ShimFS> Task<FS> {
             drop(files);
 
             let mut parent_replacements: Vec<crate::PipeReplacement> = Vec::new();
+
+            // Also gather existing HostPipeFd entries — these are pipe bridge
+            // fds inherited from a prior delayed fork.  They already wrap a
+            // host OS fd, so we pass them directly to the worker without
+            // creating a new OS pipe pair.
+            {
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                for raw_fd in rds.iter_alive() {
+                    if let Ok(typed) =
+                        rds.fd_from_raw_integer::<super::host_pipe::HostPipeSubsystem>(raw_fd)
+                    {
+                        let dt = self.global.litebox.descriptor_table();
+                        let result =
+                            dt.with_entry(&typed, |entry: &super::host_pipe::HostPipeFd| {
+                                (entry.raw_fd(), entry.direction)
+                            });
+                        if let Some((host_fd, dir)) = result {
+                            if host_fd >= 0 {
+                                #[cfg(feature = "trace_syscalls")]
+                                litebox::log_println!(
+                                    self.global.platform,
+                                    "[DELAYED-FORK] pid={}: chaining HostPipeFd guest_fd={} host_fd={} dir={:?}",
+                                    self.pid,
+                                    raw_fd,
+                                    host_fd,
+                                    dir,
+                                );
+                                child_pipe_bridges.push((raw_fd, host_fd, dir));
+                            }
+                        }
+                    }
+                }
+            }
 
             for &(child_fd, child_dir, child_pair_id) in &child_pipes {
                 // Create a real OS pipe pair.
@@ -3508,6 +3551,11 @@ impl<FS: ShimFS> Task<FS> {
                 rds.fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd)
             {
                 (FdClass::UnixSocket, Some(fd.object_id()))
+            } else if let Ok(fd) =
+                rds.fd_from_raw_integer::<super::host_pipe::HostPipeSubsystem>(raw_fd)
+            {
+                // HostPipe is a pipe bridge from delayed fork — treat as Pipe.
+                (FdClass::Pipe, Some(fd.object_id()))
             } else {
                 (FdClass::Other, None)
             };
@@ -3568,7 +3616,7 @@ impl<FS: ShimFS> Task<FS> {
     /// proceed or abort).
     fn snapshot_memory(
         &self,
-        reject: &mut super::fork_snapshot::ForkRejectReasons,
+        _reject: &mut super::fork_snapshot::ForkRejectReasons,
     ) -> super::fork_snapshot::MemorySnapshot {
         let ps = self.process_state.borrow();
         let mappings = ps.pm.mappings();
@@ -3577,14 +3625,12 @@ impl<FS: ShimFS> Task<FS> {
         for (range, flags) in &mappings {
             let is_shared = flags.contains(VmFlags::VM_SHARED);
 
-            // v1: reject shared mappings since we cannot preserve cross-host
-            // shared-memory semantics.
-            if is_shared {
-                reject.push(super::fork_snapshot::ForkRejectReason::SharedMapping {
-                    addr: range.start,
-                    len: range.end - range.start,
-                });
-            }
+            // The sandbox demotes all MAP_SHARED mappings to MAP_PRIVATE at
+            // the kernel level (see mm.rs mmap handling), so VM_SHARED is
+            // metadata-only.  There is no actual cross-process shared memory
+            // to worry about.  File-backed shared mappings are just locale
+            // archives, gconv modules, etc.; anonymous shared mappings are
+            // process-local shmem.  Both are safe to snapshot.
 
             let len = range.end - range.start;
             let readable = flags.contains(VmFlags::VM_READ);
@@ -5843,6 +5889,14 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
         return false;
     }
     drop(rds);
+
+    // HostPipeFd: these are pipe bridge fds from a prior delayed fork.
+    // They already wrap a host OS fd, so the worker can inherit them
+    // directly — they are always supported.
+    if files.try_host_pipe_fd(raw_fd).is_some() {
+        return false;
+    }
+
     log_worker_exec_stdio_unsupported(global, raw_fd, "unknown descriptor subsystem");
     true
 }
@@ -5905,6 +5959,13 @@ fn worker_exec_input_binding<FS: ShimFS>(
 ) -> WorkerExecInputBinding<FS, Platform> {
     if !worker_exec_fd_survives_exec(raw_fd, global, files) {
         return WorkerExecInputBinding::Close;
+    }
+
+    // HostPipeFd: the worker will receive this fd via the pipe bridge
+    // mechanism (--pipe-bridge CLI arg) and install_host_pipe_fd will set
+    // it up.  The stdio binding should not try to wire it up separately.
+    if files.try_host_pipe_fd(raw_fd).is_some() {
+        return WorkerExecInputBinding::Inherit;
     }
 
     let rds = files.raw_descriptor_store.read();
@@ -6014,6 +6075,11 @@ fn worker_exec_output_binding<FS: ShimFS>(
 ) -> WorkerExecOutputBinding<FS, Platform> {
     if !worker_exec_fd_survives_exec(raw_fd, global, files) {
         return WorkerExecOutputBinding::Close;
+    }
+
+    // HostPipeFd: handled by the pipe bridge mechanism.
+    if files.try_host_pipe_fd(raw_fd).is_some() {
+        return WorkerExecOutputBinding::Inherit;
     }
 
     let rds = files.raw_descriptor_store.read();
