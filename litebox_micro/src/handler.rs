@@ -523,7 +523,7 @@ pub(crate) fn is_tier1_micro_local(nr: u32) -> bool {
             | libc::SYS_rt_sigsuspend
             // Memory query: read-only on micro's address space
             | libc::SYS_mincore
-            // Filesystem sync: no arguments, no state
+            // Filesystem sync: no-op (central owns the filesystem)
             | libc::SYS_sync
     )
 }

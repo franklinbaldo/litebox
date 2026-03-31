@@ -692,8 +692,8 @@ pub unsafe fn execute_locally(
         nr if nr == libc::SYS_mincore as u32 => unsafe {
             raw_syscall::syscall3(libc::SYS_mincore, args[0], args[1], args[2])
         },
-        // Filesystem sync: no arguments, must run locally
-        nr if nr == libc::SYS_sync as u32 => unsafe { raw_syscall::syscall0(libc::SYS_sync) },
+        // Filesystem sync: no-op — central owns the filesystem.
+        nr if nr == libc::SYS_sync as u32 => 0,
         _ => -i64::from(libc::ENOSYS),
     }
 }
@@ -902,8 +902,8 @@ pub unsafe fn execute_micro_local(syscall_nr: u32, args: &[u64; 6]) -> i64 {
         nr if nr == libc::SYS_wait4 as u32 => unsafe {
             raw_syscall::syscall4(libc::SYS_wait4, args[0], args[1], args[2], args[3])
         },
-        // Filesystem sync: no arguments
-        nr if nr == libc::SYS_sync as u32 => unsafe { raw_syscall::syscall0(libc::SYS_sync) },
+        // Filesystem sync: no-op — central owns the filesystem.
+        nr if nr == libc::SYS_sync as u32 => 0,
         // VMA operations: execute in micro's address space.
         nr if nr == libc::SYS_munmap as u32 => unsafe {
             raw_syscall::munmap(args[0] as usize, args[1] as usize)
