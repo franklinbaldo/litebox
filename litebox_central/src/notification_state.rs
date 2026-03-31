@@ -47,7 +47,6 @@ pub(crate) struct MicroPipe {
 
 /// A shmem-backed pipe tracked by central.
 #[derive(Clone, Copy)]
-#[allow(dead_code)]
 pub(crate) struct ShmemPipe {
     pub read_fd: i32,
     pub write_fd: i32,
@@ -87,7 +86,6 @@ pub(crate) struct ProcessNotificationState {
     pub pipe_slot_bitset: u64,
 
     /// Active shmem-backed pipes.
-    #[allow(dead_code)] // Used when pipe2 handler is wired up (future task).
     pub shmem_pipes: Vec<ShmemPipe>,
 }
 
@@ -128,7 +126,7 @@ impl ProcessNotificationState {
     }
 
     /// Find a shmem pipe by fd (either read or write end).
-    #[allow(dead_code)] // Used when pipe2 handler is wired up (future task).
+    #[allow(dead_code)] // Used when pipe read/write handlers are wired up (future task).
     pub fn find_shmem_pipe(&self, fd: i32) -> Option<&ShmemPipe> {
         self.shmem_pipes
             .iter()
@@ -136,7 +134,6 @@ impl ProcessNotificationState {
     }
 
     /// Find a mutable shmem pipe by fd.
-    #[allow(dead_code)] // Used when pipe2 handler is wired up (future task).
     pub fn find_shmem_pipe_mut(&mut self, fd: i32) -> Option<&mut ShmemPipe> {
         self.shmem_pipes
             .iter_mut()

@@ -20,7 +20,10 @@ use litebox_ipc::messages::{
     MSG_NOTIFY_SIGALTSTACK, MSG_NOTIFY_SIGPROCMASK, MSG_NOTIFY_WAIT4, MSG_THREAD_DEREGISTER,
     MSG_THREAD_REGISTER,
 };
-use litebox_ipc::ring::{cq_flags, sq_flags, CqEntry, SqEntry, TrampolineDescriptor, RING_MASK};
+use litebox_ipc::ring::{
+    cq_flags, pipe_flags, sq_flags, CqEntry, SqEntry, TrampolineDescriptor, PIPE_SLOT_SIZE,
+    PIPE_ZONE_BASE_OFFSET, RING_MASK,
+};
 use litebox_ipc::sq::{sq_advance_head, sq_head_index, sq_try_consume};
 use litebox_ipc::wait::spin_then_wait;
 use litebox_shim_linux::ShimFS;
@@ -288,10 +291,13 @@ impl<FS: ShimFS> ProcessServer<FS> {
         // tell micro to close it locally.
         #[allow(clippy::cast_possible_truncation)]
         if nr == libc::SYS_close as u32 {
+            let fd = entry.args[0] as i32;
             let mut regs = crate::dispatch::sq_entry_to_ptregs(entry);
             let shim_result = self.dispatch_to_task(entry.thread_slot, &mut regs);
             if shim_result >= 0 {
                 // Shim recognized and closed the fd — return success directly.
+                // If this fd was a shmem pipe end, update flags and free slot.
+                self.maybe_close_shmem_pipe_end(fd);
                 cq.result = 0;
                 return cq;
             }
@@ -1393,6 +1399,72 @@ impl<FS: ShimFS> ProcessServer<FS> {
         cq.data_offset = 0;
         cq.data_len = core::mem::size_of::<litebox_ipc::messages::Pipe2Response>() as u32;
         cq
+    }
+
+    /// If `fd` is one end of a shmem pipe, set the appropriate closed flag,
+    /// futex-wake blocked readers/writers, and decrement `open_ends`. When
+    /// both ends are closed, free the pipe slot.
+    fn maybe_close_shmem_pipe_end(&self, fd: i32) {
+        let mut ns = self.notification_state.borrow_mut();
+        let Some(pipe) = ns.find_shmem_pipe_mut(fd) else {
+            return;
+        };
+
+        // Determine which flag to set based on which end is being closed.
+        let flag = if fd == pipe.read_fd {
+            pipe_flags::READER_CLOSED
+        } else {
+            pipe_flags::WRITER_CLOSED
+        };
+
+        let slot_offset = PIPE_ZONE_BASE_OFFSET + pipe.slot_index as usize * PIPE_SLOT_SIZE;
+
+        // Set the closed flag in the shmem pipe header.
+        let data_region = self.region.data_region_mut();
+        #[allow(clippy::cast_ptr_alignment)] // slot offsets are 64-byte aligned by design
+        let header_ptr = unsafe {
+            data_region
+                .as_mut_ptr()
+                .add(slot_offset)
+                .cast::<litebox_ipc::ring::ShmemPipeHeader>()
+        };
+        unsafe {
+            litebox_ipc::pipe::pipe_set_flag(header_ptr, flag);
+        }
+
+        // Futex-wake any blocked readers/writers on both head and tail.
+        unsafe {
+            let head_ptr = &raw const (*header_ptr).head;
+            let tail_ptr = &raw const (*header_ptr).tail;
+            libc::syscall(
+                libc::SYS_futex,
+                head_ptr,
+                libc::FUTEX_WAKE,
+                i32::MAX,
+                std::ptr::null::<libc::timespec>(),
+            );
+            libc::syscall(
+                libc::SYS_futex,
+                tail_ptr,
+                libc::FUTEX_WAKE,
+                i32::MAX,
+                std::ptr::null::<libc::timespec>(),
+            );
+        }
+
+        // Decrement open_ends; free slot when both ends are closed.
+        pipe.open_ends -= 1;
+        if pipe.open_ends == 0 {
+            let slot_index = pipe.slot_index;
+            // Remove the pipe entry from the vec.
+            let idx = ns
+                .shmem_pipes
+                .iter()
+                .position(|p| p.slot_index == slot_index)
+                .expect("pipe must exist");
+            ns.shmem_pipes.swap_remove(idx);
+            ns.free_pipe_slot(slot_index);
+        }
     }
 
     /// Handle an execve syscall by deserializing the path/argv/envp from the
