@@ -3,7 +3,7 @@
 
 //! Global per-process micro-LiteBox state.
 
-use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicU32, AtomicUsize};
 use litebox_ipc::ring::{SharedRingLayout, MAX_PIPE_SLOTS};
 
 use crate::stack_pool::StackPool;
@@ -41,6 +41,10 @@ pub struct MicroState {
     /// host's original brk). This field tracks a virtual brk that starts at
     /// the end of the new binary's segments and grows via mmap.
     pub guest_brk: AtomicUsize,
+    /// Emulated umask for the guest. Micro doesn't use the OS filesystem
+    /// (central does), so we track the umask purely in libOS state. Default
+    /// is 0o022 (matching central's shim default).
+    pub umask: AtomicU32,
     /// Pipe fd tracking table. Each entry maps a guest fd to a shmem pipe
     /// ring buffer. Linear scan is fine — at most MAX_PIPE_SLOTS entries.
     pub pipe_fds: [Option<PipeFdEntry>; MAX_PIPE_SLOTS],
@@ -59,6 +63,7 @@ static mut MICRO_STATE: MicroState = MicroState {
     layout: SharedRingLayout::new(0),
     syscall_entry_point: 0,
     guest_brk: AtomicUsize::new(0),
+    umask: AtomicU32::new(0o022),
     pipe_fds: [None; MAX_PIPE_SLOTS],
 };
 
@@ -193,6 +198,7 @@ impl MicroState {
             layout: SharedRingLayout::new(0),
             syscall_entry_point: 0,
             guest_brk: AtomicUsize::new(0),
+            umask: AtomicU32::new(0o022),
             pipe_fds: [None; MAX_PIPE_SLOTS],
         }
     }

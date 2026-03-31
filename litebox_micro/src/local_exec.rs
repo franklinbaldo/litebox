@@ -914,11 +914,18 @@ pub unsafe fn execute_micro_local(syscall_nr: u32, args: &[u64; 6]) -> i64 {
         nr if nr == libc::SYS_madvise as u32 => unsafe {
             raw_syscall::syscall3(libc::SYS_madvise, args[0], args[1], args[2])
         },
-        // umask: process-local, kernel returns old mask. Central needs to know
-        // the current value for open/creat/mkdir permission calculations.
-        nr if nr == libc::SYS_umask as u32 => unsafe {
-            raw_syscall::syscall1(libc::SYS_umask, args[0])
-        },
+        // umask: pure libOS emulation. Micro doesn't use the OS filesystem —
+        // central does — so we track the umask in MicroState. The Tier 2
+        // notification keeps central's shim in sync for open/creat/mkdir.
+        nr if nr == libc::SYS_umask as u32 => {
+            let state = unsafe { crate::state::global_micro_state() };
+            #[allow(clippy::cast_possible_truncation)]
+            let new_mask = (args[0] as u32) & 0o777;
+            let old_mask = state
+                .umask
+                .swap(new_mask, core::sync::atomic::Ordering::Relaxed);
+            i64::from(old_mask)
+        }
         // brk: post-execve, managed entirely by micro's guest_brk watermark.
         // Only called when guest_brk != 0 (handler.rs checks this precondition).
         nr if nr == libc::SYS_brk as u32 => {
