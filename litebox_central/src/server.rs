@@ -27,7 +27,7 @@ use litebox_ipc::sq::{sq_advance_head, sq_head_index, sq_try_consume};
 use litebox_ipc::wait::spin_then_wait;
 use litebox_shim_linux::ShimFS;
 
-use crate::shmem::SharedRegion;
+use crate::shmem::{RingPool, SharedRegion};
 
 /// The central server that processes SQ entries and produces CQ completions.
 ///
@@ -39,6 +39,11 @@ use crate::shmem::SharedRegion;
 /// and `Cell` rather than `Mutex`.
 pub struct ProcessServer<FS: ShimFS> {
     region: SharedRegion,
+    /// Pre-allocated ring pool shared across all `ProcessServer` instances.
+    ring_pool: Arc<RingPool>,
+    /// Raw fd of this process's ring memfd (`-1` for the root process whose
+    /// ring did not come from the pool).
+    ring_fd: i32,
     /// Primary task (main thread, slot 0). Always present.
     primary_task: litebox_shim_linux::LinuxShimTask<FS>,
     /// Active thread tasks keyed by thread_slot. Does not include slot 0.
@@ -71,9 +76,13 @@ impl<FS: ShimFS> ProcessServer<FS> {
         task: litebox_shim_linux::LinuxShimTask<FS>,
         shim: Arc<litebox_shim_linux::LinuxShim<FS>>,
         fs: Arc<FS>,
+        ring_pool: Arc<RingPool>,
+        ring_fd: i32,
     ) -> Self {
         Self {
             region,
+            ring_pool,
+            ring_fd,
             primary_task: task,
             thread_tasks: RefCell::new(HashMap::new()),
             pending_tasks: RefCell::new(Vec::new()),
@@ -97,7 +106,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
     ///
     /// Returns `Ok(())` when the guest exits cleanly.
     #[allow(clippy::unnecessary_wraps)] // Result kept for future error paths
-    pub fn run(&self) -> anyhow::Result<()> {
+    pub fn run(self) -> anyhow::Result<()> {
         let header = self.region.header();
         let sq_entries = self.region.sq_entries();
 
@@ -197,9 +206,16 @@ impl<FS: ShimFS> ProcessServer<FS> {
         // This prevents the central process from exiting while children
         // are still processing syscalls (the OS would kill child threads,
         // leaving child guest processes hanging on dead rings).
-        let handles: Vec<_> = self.child_handles.borrow_mut().drain(..).collect();
+        let handles: Vec<_> = self.child_handles.into_inner().drain(..).collect();
         for handle in handles {
             let _ = handle.join();
+        }
+
+        // Return this process's ring to the pool so it can be reused by a
+        // future fork.  The root server (ring_fd == -1) did not get its ring
+        // from the pool, so it skips the release.
+        if self.ring_fd >= 0 {
+            self.ring_pool.release(self.region, self.ring_fd);
         }
 
         Ok(())
@@ -515,8 +531,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
     fn handle_fork(&self, entry: &SqEntry) -> CqEntry {
         let mut cq = Self::base_cq(entry);
 
-        // 1. Create new shmem for child.
-        let Ok((child_region, child_ring_fd)) = SharedRegion::create_child_ring() else {
+        // 1. Acquire a ring for the child from the pool.
+        let Ok((child_region, child_ring_fd)) = self.ring_pool.acquire() else {
             cq.result = -i64::from(libc::ENOMEM);
             return cq;
         };
@@ -557,7 +573,9 @@ impl<FS: ShimFS> ProcessServer<FS> {
         {
             let shim = self.shim.clone();
             let fs = self.fs.clone();
-            let child_server = ProcessServer::new(child_region, child_task, shim, fs);
+            let pool = Arc::clone(&self.ring_pool);
+            let child_server =
+                ProcessServer::new(child_region, child_task, shim, fs, pool, child_ring_fd);
             child_server.next_child_pid.set(self.next_child_pid.get());
 
             let handle = std::thread::spawn(move || {
