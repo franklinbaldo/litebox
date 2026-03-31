@@ -17,7 +17,8 @@ use litebox_ipc::cq::{cq_notify_thread, cq_push};
 use litebox_ipc::messages::{
     self, MSG_CHILD_READY, MSG_FORK_RESULT, MSG_LOCAL_RESULT, MSG_NOTIFY_ALARM, MSG_NOTIFY_MADVISE,
     MSG_NOTIFY_MPROTECT, MSG_NOTIFY_MUNMAP, MSG_NOTIFY_SIGACTION, MSG_NOTIFY_SIGALTSTACK,
-    MSG_NOTIFY_SIGPROCMASK, MSG_NOTIFY_WAIT4, MSG_THREAD_DEREGISTER, MSG_THREAD_REGISTER,
+    MSG_NOTIFY_SIGPROCMASK, MSG_NOTIFY_UMASK, MSG_NOTIFY_WAIT4, MSG_THREAD_DEREGISTER,
+    MSG_THREAD_REGISTER,
 };
 use litebox_ipc::ring::{
     cq_flags, pipe_flags, sq_flags, CqEntry, SqEntry, TrampolineDescriptor, PIPE_SLOT_SIZE,
@@ -2225,6 +2226,21 @@ impl<FS: ShimFS> ProcessServer<FS> {
                             advice: entry.args[2] as u32,
                         });
                 }
+                0
+            }
+            MSG_NOTIFY_UMASK => {
+                // Micro executed umask locally. Update the shim's stored umask
+                // so that subsequent open/creat/mkdir on central apply the
+                // correct permission mask.
+                #[allow(clippy::cast_possible_truncation)]
+                let new_mask = entry.args[0] as u32;
+                #[allow(clippy::cast_possible_truncation)]
+                let mut regs = litebox_common_linux::PtRegs {
+                    orig_rax: libc::SYS_umask as usize,
+                    rdi: new_mask as usize,
+                    ..litebox_common_linux::PtRegs::default()
+                };
+                let _ = self.dispatch_to_task(entry.thread_slot, &mut regs);
                 0
             }
             _ => -i64::from(libc::ENOSYS),

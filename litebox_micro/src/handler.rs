@@ -546,6 +546,8 @@ pub(crate) fn is_tier2_notify(nr: u32) -> bool {
         | libc::SYS_munmap
         | libc::SYS_mprotect
         | libc::SYS_madvise
+        // umask: process-local, but central's shim uses get_umask() for open/creat/mkdir.
+        | libc::SYS_umask
     )
 }
 

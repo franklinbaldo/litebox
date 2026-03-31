@@ -710,6 +710,7 @@ pub(crate) fn tier2_notify_message(nr: u32) -> u32 {
         libc::SYS_munmap => litebox_ipc::messages::MSG_NOTIFY_MUNMAP,
         libc::SYS_mprotect => litebox_ipc::messages::MSG_NOTIFY_MPROTECT,
         libc::SYS_madvise => litebox_ipc::messages::MSG_NOTIFY_MADVISE,
+        libc::SYS_umask => litebox_ipc::messages::MSG_NOTIFY_UMASK,
         _ => unreachable!("tier2_notify_message called for non-Tier-2 syscall {nr}"),
     }
 }
@@ -805,6 +806,10 @@ pub(crate) unsafe fn tier2_notify_args(nr: u32, args: &[u64; 6], result: i64) ->
         libc::SYS_madvise => {
             // addr, len, advice, result
             [args[0], args[1], args[2], result.cast_unsigned(), 0, 0]
+        }
+        libc::SYS_umask => {
+            // new_mask, result (old mask)
+            [args[0], result.cast_unsigned(), 0, 0, 0, 0]
         }
         _ => unreachable!("tier2_notify_args called for non-Tier-2 syscall {nr}"),
     }
@@ -908,6 +913,11 @@ pub unsafe fn execute_micro_local(syscall_nr: u32, args: &[u64; 6]) -> i64 {
         },
         nr if nr == libc::SYS_madvise as u32 => unsafe {
             raw_syscall::syscall3(libc::SYS_madvise, args[0], args[1], args[2])
+        },
+        // umask: process-local, kernel returns old mask. Central needs to know
+        // the current value for open/creat/mkdir permission calculations.
+        nr if nr == libc::SYS_umask as u32 => unsafe {
+            raw_syscall::syscall1(libc::SYS_umask, args[0])
         },
         // brk: post-execve, managed entirely by micro's guest_brk watermark.
         // Only called when guest_brk != 0 (handler.rs checks this precondition).
@@ -1093,6 +1103,7 @@ mod tests {
             libc::SYS_munmap,
             libc::SYS_mprotect,
             libc::SYS_madvise,
+            libc::SYS_umask,
         ];
 
         for &sys_nr in tier2_nrs {

@@ -112,6 +112,10 @@ pub const MSG_NOTIFY_MPROTECT: u32 = MSG_BASE + 13;
 /// args[0] = addr, args[1] = len, args[2] = advice, args[3] = result (0 or -errno).
 pub const MSG_NOTIFY_MADVISE: u32 = MSG_BASE + 14;
 
+/// Notification: micro executed umask locally.
+/// args[0] = new_mask (argument passed to umask), args[1] = result (old mask).
+pub const MSG_NOTIFY_UMASK: u32 = MSG_BASE + 15;
+
 /// Returns `true` if `syscall_nr` is a control message (>= [`MSG_BASE`])
 /// rather than a real Linux syscall number.
 pub const fn is_control_message(syscall_nr: u32) -> bool {
