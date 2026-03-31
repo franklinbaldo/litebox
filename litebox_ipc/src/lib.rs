@@ -10,6 +10,7 @@ extern crate alloc;
 
 pub mod cq;
 pub mod messages;
+pub mod pipe;
 pub mod ring;
 pub mod sq;
 pub mod wait;
