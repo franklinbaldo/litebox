@@ -674,10 +674,22 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
         // After a fork, the child has remapped to a new ring and already sent
         // MSG_CHILD_READY.  Sending report_local_result on the child's ring
         // would confuse central, so skip it.
-        let is_fork_child = result == 0
-            && (nr == libc::SYS_fork as u32
-                || nr == libc::SYS_vfork as u32
-                || (nr == libc::SYS_clone as u32 && args.args[0] & 0x100 == 0)); // no CLONE_VM → fork
+        let is_fork = nr == libc::SYS_fork as u32
+            || nr == libc::SYS_vfork as u32
+            || (nr == libc::SYS_clone as u32 && args.args[0] & 0x100 == 0); // no CLONE_VM → fork
+        let is_fork_child = result == 0 && is_fork;
+
+        // After fork, clear the *parent's* pipe fd table.  The child will
+        // use its own shim task's virtual pipes (HeapRb).  The parent must
+        // also fall back to the shim so both processes share the same pipe
+        // data buffer.  Without this, parent writes to shmem but child
+        // reads from HeapRb → deadlock.  (Phase B will add cross-process
+        // shmem pipes; until then, post-fork pipe I/O goes through central.)
+        if is_fork && result > 0 {
+            let micro_mut = unsafe { &mut *(*tls).micro };
+            micro_mut.pipe_fds = [None; litebox_ipc::ring::MAX_PIPE_SLOTS];
+        }
+
         if !is_fork_child && (cq.flags & cq_flags::NO_REPORT == 0) {
             unsafe { report_local_result(tls, cq.seq, result) };
         }

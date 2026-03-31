@@ -160,6 +160,13 @@ unsafe fn post_fork_child(child_ring_fd: i32, child_pid: u32) {
     // central_pid stays the same — same central process serves the child.
     micro.layout = layout;
 
+    // 3b. Clear the pipe fd tracking table. The parent's shmem pipe ring
+    // buffers live in the parent's data region, which is now unmapped.
+    // The child's pipe operations will fall through to central (which
+    // still tracks the virtual pipe fds in the shim). Cross-process
+    // shmem pipes are a future optimization (Phase B).
+    micro.pipe_fds = [None; litebox_ipc::ring::MAX_PIPE_SLOTS];
+
     // 4. Reset TLS.
     let tls = unsafe { crate::tls::current_tls() };
     unsafe {
