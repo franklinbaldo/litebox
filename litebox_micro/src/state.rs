@@ -6,6 +6,8 @@
 use core::sync::atomic::AtomicUsize;
 use litebox_ipc::ring::{SharedRingLayout, MAX_PIPE_SLOTS};
 
+use crate::stack_pool::StackPool;
+
 /// Entry in micro's local pipe fd tracking table.
 ///
 /// Maps a file descriptor to the shmem offset of its pipe ring buffer.
@@ -88,6 +90,32 @@ pub unsafe fn micro_init(
         let base_layout = SharedRingLayout::new(0);
         let data_size = ring_size.saturating_sub(base_layout.total_size);
         MICRO_STATE.layout = SharedRingLayout::new(data_size);
+    }
+}
+
+// ── Stack pool for vfork children ──────────────────────────────────────
+
+static mut STACK_POOL: Option<StackPool> = None;
+
+/// Initialize the global stack pool.
+///
+/// Must be called once, after `micro_init`, before any vfork/clone calls.
+pub fn init_stack_pool() {
+    unsafe {
+        let ptr = &raw mut STACK_POOL;
+        (*ptr) = Some(StackPool::new());
+    }
+}
+
+/// Returns a mutable reference to the global stack pool.
+///
+/// # Panics
+///
+/// Panics if `init_stack_pool` has not been called.
+pub fn global_stack_pool() -> &'static mut StackPool {
+    unsafe {
+        let ptr = &raw mut STACK_POOL;
+        (*ptr).as_mut().expect("stack pool not initialized")
     }
 }
 

@@ -82,6 +82,9 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Initialize the stack pool for vfork children, after micro_init.
+    litebox_micro::state::init_stack_pool();
+
     // SAFETY: Called exactly once on the main thread, after `micro_init`,
     // before any guest code runs.
     unsafe {

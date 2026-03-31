@@ -43,6 +43,12 @@ pub struct StackPool {
     stacks: Vec<PooledStack>,
 }
 
+impl Default for StackPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StackPool {
     pub fn new() -> Self {
         let mut stacks = Vec::with_capacity(INITIAL_POOL_SIZE);
