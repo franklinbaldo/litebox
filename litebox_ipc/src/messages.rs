@@ -117,3 +117,26 @@ pub const MSG_NOTIFY_MADVISE: u32 = MSG_BASE + 14;
 pub const fn is_control_message(syscall_nr: u32) -> bool {
     syscall_nr >= MSG_BASE
 }
+
+/// Response data written to the shmem data region by central after creating
+/// a pipe via `pipe2`. Micro reads this when it receives a CQ with `HAS_DATA`
+/// for a `SYS_pipe2` request.
+///
+/// Central writes this at offset 0 of the data region (same location used
+/// for other data-producing responses).
+#[derive(Clone, Copy)]
+#[repr(C)]
+#[allow(clippy::pub_underscore_fields)]
+pub struct Pipe2Response {
+    /// Read-end file descriptor number.
+    pub read_fd: i32,
+    /// Write-end file descriptor number.
+    pub write_fd: i32,
+    /// Offset within the data region to the pipe's `ShmemPipeHeader`.
+    /// The ring buffer data starts at `pipe_slot_offset + 64`.
+    pub pipe_slot_offset: u32,
+    /// Reserved padding.
+    pub _pad: u32,
+}
+
+const _: () = assert!(size_of::<Pipe2Response>() == 16);
