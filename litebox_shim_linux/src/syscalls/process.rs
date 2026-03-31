@@ -768,6 +768,11 @@ impl<FS: ShimFS> Task<FS> {
         if is_last_thread {
             // Last thread — remove the entry entirely.
             self.global.process_thread_handles.write().remove(&proc_key);
+            // Clean up per-process shadow termios.
+            self.global
+                .host_tty_shadow_termios
+                .lock()
+                .remove(&self.process_id);
         } else {
             // Process still alive. If WE were the registered thread, hand
             // the handle to another live thread so cross-process signals
@@ -2139,6 +2144,23 @@ impl<FS: ShimFS> Task<FS> {
             // unparked later, Ok(false) if no other threads exist, or
             // Err if another thread is already forking.
             let Ok(did_park) = self.park_other_threads() else {
+                // Rollback: remove the child process and address space
+                // allocated above since the fork cannot proceed.
+                self.global
+                    .litebox
+                    .process_registry()
+                    .remove_process(child_process_id);
+                let _destroy_result = self.global.platform.destroy_address_space(child_as_id);
+                #[cfg(feature = "trace_syscalls")]
+                if let Err(e) = _destroy_result {
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[FORK] pid={}: park failed, destroy_address_space({}) failed: {:?}",
+                        self.pid,
+                        child_as_id,
+                        e,
+                    );
+                }
                 return Err(Errno::EAGAIN);
             };
 
@@ -2458,6 +2480,21 @@ impl<FS: ShimFS> Task<FS> {
             // Unpark other threads now that CoW is fully restored.
             if did_park_threads {
                 self.unpark_other_threads();
+            }
+        }
+
+        // Inherit parent's shadow termios (if any) so the child sees the
+        // same emulated terminal state the parent configured. Done after all
+        // fallible setup so failed forks don't leak orphaned entries.
+        {
+            let shadow = self.global.host_tty_shadow_termios.lock();
+            if let Some(parent_attrs) = shadow.get(&self.process_id) {
+                let child_attrs = parent_attrs.clone();
+                drop(shadow);
+                self.global
+                    .host_tty_shadow_termios
+                    .lock()
+                    .insert(child_process_id, child_attrs);
             }
         }
 
@@ -4145,7 +4182,7 @@ impl<FS: ShimFS> Task<FS> {
             }
         }
 
-        self.init_thread_context(ctx);
+        self.handle_init_request(ctx);
 
         // Reinitialize guest FP/SIMD state so the new process starts with a
         // clean FP state (MXCSR=0x1F80, zeroed XMM) rather than inheriting

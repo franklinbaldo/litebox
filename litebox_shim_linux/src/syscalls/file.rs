@@ -688,6 +688,17 @@ impl<FS: ShimFS> Task<FS> {
             .open(&*path, flags - OFlags::CLOEXEC, mode)
             .map_err(Errno::from)?;
         let status = flags & OFlags::STATUS_FLAGS_MASK;
+        // Query file status before acquiring the descriptor table write lock
+        // to avoid deadlock (fd_file_status takes a read lock on the same
+        // descriptor table internally).
+        let file_rdev_major = self
+            .files
+            .borrow()
+            .fs
+            .fd_file_status(&file)
+            .ok()
+            .and_then(|s| s.node_info.rdev)
+            .map(|rdev| rdev.get() >> 8);
         {
             let mut dt = self.global.litebox.descriptor_table_mut();
             if flags.contains(OFlags::CLOEXEC) {
@@ -714,22 +725,13 @@ impl<FS: ShimFS> Task<FS> {
             // Tag fds opened via the host PTY device path (e.g., /dev/pts/156)
             // so that fstat returns the host PTY identity, not the default
             // Device::Tty identity (rdev=0x500). Skip if the fd resolved to a
-            // sandbox PTY (major 136) rather than the host tty alias.
+            // sandbox PTY (major >= 136) rather than the host tty alias.
             if let Ok(path_str) = path.to_str()
                 && is_host_pty_device_path(path_str, self.global.platform)
+                && file_rdev_major.is_none_or(|m| m < 136)
             {
-                let is_sandbox_pty = self
-                    .files
-                    .borrow()
-                    .fs
-                    .fd_file_status(&file)
-                    .ok()
-                    .and_then(|s| s.node_info.rdev)
-                    .is_some_and(|rdev| (rdev.get() >> 8) >= 136);
-                if !is_sandbox_pty {
-                    let old = dt.set_entry_metadata(&file, HostPtyDeviceFd);
-                    assert!(old.is_none());
-                }
+                let old = dt.set_entry_metadata(&file, HostPtyDeviceFd);
+                assert!(old.is_none());
             }
         }
         self.files
@@ -809,6 +811,14 @@ impl<FS: ShimFS> Task<FS> {
                     |_| Err(Errno::ENOTDIR),
                 )?;
                 let file = file?;
+                // Query file status before acquiring descriptor table write
+                // lock to avoid deadlock (fd_file_status needs a read lock).
+                let file_rdev_major = files
+                    .fs
+                    .fd_file_status(&file)
+                    .ok()
+                    .and_then(|s| s.node_info.rdev)
+                    .map(|rdev| rdev.get() >> 8);
                 {
                     let mut dt = self.global.litebox.descriptor_table_mut();
                     if flags.contains(OFlags::CLOEXEC) {
@@ -833,17 +843,10 @@ impl<FS: ShimFS> Task<FS> {
                     if abs_path
                         .as_deref()
                         .is_some_and(|p| is_host_pty_device_path(p, self.global.platform))
+                        && file_rdev_major.is_none_or(|m| m < 136)
                     {
-                        let is_sandbox_pty = files
-                            .fs
-                            .fd_file_status(&file)
-                            .ok()
-                            .and_then(|s| s.node_info.rdev)
-                            .is_some_and(|rdev| (rdev.get() >> 8) >= 136);
-                        if !is_sandbox_pty {
-                            let old = dt.set_entry_metadata(&file, HostPtyDeviceFd);
-                            assert!(old.is_none());
-                        }
+                        let old = dt.set_entry_metadata(&file, HostPtyDeviceFd);
+                        assert!(old.is_none());
                     }
                 }
                 files
@@ -3983,20 +3986,27 @@ impl<FS: ShimFS> Task<FS> {
 
         match arg {
             IoctlArg::TCGETS(termios_ptr) => {
-                // Non-init processes may have a shadow termios from a
-                // silently-accepted TCSETS. Return the shadow if present
-                // so TCGETS reflects what the caller set.
-                let shadow = self.global.host_tty_shadow_termios.lock().clone();
-                let attrs = if self.process_id != litebox::process::ProcessId::INIT
-                    && let Some(ref shadow_attrs) = shadow
-                {
-                    shadow_attrs.clone()
+                // Non-init processes may have a per-process shadow termios
+                // from a silently-accepted TCSETS. Return it so TCGETS
+                // reflects what the caller set.
+                let attrs = if self.process_id == litebox::process::ProcessId::INIT {
+                    None
                 } else {
                     self.global
-                        .platform
-                        .get_terminal_attributes(stream)
-                        .map_err(ioctl_err_to_errno)?
+                        .host_tty_shadow_termios
+                        .lock()
+                        .get(&self.process_id)
+                        .cloned()
                 };
+                let attrs = attrs.map_or_else(
+                    || {
+                        self.global
+                            .platform
+                            .get_terminal_attributes(stream)
+                            .map_err(ioctl_err_to_errno)
+                    },
+                    Ok,
+                )?;
                 termios_ptr
                     .write_at_offset(
                         0,
@@ -4027,7 +4037,10 @@ impl<FS: ShimFS> Task<FS> {
                 // attributes. Child processes update a shadow so TCGETS
                 // reflects the change, but the real terminal is untouched.
                 if self.process_id != litebox::process::ProcessId::INIT {
-                    *self.global.host_tty_shadow_termios.lock() = Some(attrs);
+                    self.global
+                        .host_tty_shadow_termios
+                        .lock()
+                        .insert(self.process_id, attrs);
                     return Ok(0);
                 }
                 self.global
@@ -4035,7 +4048,7 @@ impl<FS: ShimFS> Task<FS> {
                     .set_terminal_attributes(stream, &attrs, SetTermiosWhen::Now)
                     .map_err(ioctl_err_to_errno)?;
                 // Clear stale shadow so non-init TCGETS sees the new real state.
-                *self.global.host_tty_shadow_termios.lock() = None;
+                self.global.host_tty_shadow_termios.lock().clear();
                 Ok(0)
             }
             IoctlArg::TCSETSW(termios_ptr) => {
@@ -4050,14 +4063,17 @@ impl<FS: ShimFS> Task<FS> {
                     c_cc: t.c_cc,
                 };
                 if self.process_id != litebox::process::ProcessId::INIT {
-                    *self.global.host_tty_shadow_termios.lock() = Some(attrs);
+                    self.global
+                        .host_tty_shadow_termios
+                        .lock()
+                        .insert(self.process_id, attrs);
                     return Ok(0);
                 }
                 self.global
                     .platform
                     .set_terminal_attributes(stream, &attrs, SetTermiosWhen::AfterDrain)
                     .map_err(ioctl_err_to_errno)?;
-                *self.global.host_tty_shadow_termios.lock() = None;
+                self.global.host_tty_shadow_termios.lock().clear();
                 Ok(0)
             }
             IoctlArg::TCSETSF(termios_ptr) => {
@@ -4072,14 +4088,17 @@ impl<FS: ShimFS> Task<FS> {
                     c_cc: t.c_cc,
                 };
                 if self.process_id != litebox::process::ProcessId::INIT {
-                    *self.global.host_tty_shadow_termios.lock() = Some(attrs);
+                    self.global
+                        .host_tty_shadow_termios
+                        .lock()
+                        .insert(self.process_id, attrs);
                     return Ok(0);
                 }
                 self.global
                     .platform
                     .set_terminal_attributes(stream, &attrs, SetTermiosWhen::AfterDrainFlushInput)
                     .map_err(ioctl_err_to_errno)?;
-                *self.global.host_tty_shadow_termios.lock() = None;
+                self.global.host_tty_shadow_termios.lock().clear();
                 Ok(0)
             }
             IoctlArg::TIOCGWINSZ(ws_ptr) => {
@@ -4538,17 +4557,39 @@ impl<FS: ShimFS> Task<FS> {
             IoctlArg::TIOCGPTPEER(open_flags) => {
                 // TIOCGPTPEER: open the slave side of a PTY master, returning a new fd.
                 // The argument contains O_RDWR|O_NOCTTY or similar open flags.
-                let pty_idx = files.run_on_raw_fd(
+                //
+                // We must open the slave through the device FS directly rather
+                // than via sys_open("/dev/pts/N"), because the layered FS might
+                // route /dev/pts/N to the 9P broker (host filesystem) instead of
+                // the sandbox's PTY manager — especially when the host's terminal
+                // happens to be /dev/pts/N.
+                let slave_fd = files.run_on_raw_fd(
                     desc,
                     |file_fd| {
-                        // Check the fd is a PTY master (major 136).
                         let status = files.fs.fd_file_status(file_fd).map_err(|_| Errno::EBADF)?;
                         let rdev = status.node_info.rdev.ok_or(Errno::ENOTTY)?;
                         let major = rdev.get() >> 8;
-                        if major != 136 {
+                        if major < 136 {
                             return Err(Errno::ENOTTY);
                         }
-                        Ok(rdev.get() & 0xFF)
+                        // Recover the full PTY index: major 136 holds indices
+                        // 0-255, major 137 holds 256-511, etc.
+                        let idx = u32::try_from((major - 136) * 256 + (rdev.get() & 0xFF))
+                            .map_err(|_| Errno::ENOTTY)?;
+                        let oflags =
+                            OFlags::from_bits_truncate(u32::try_from(open_flags).unwrap_or(0));
+                        let slave_path = alloc::format!("/dev/pts/{idx}");
+                        // Strip O_CLOEXEC before passing to the FS layer — the
+                        // layered FS does not support it (panics). CLOEXEC is
+                        // handled as fd-level metadata after insert.
+                        files
+                            .fs
+                            .open(
+                                slave_path.as_str(),
+                                oflags - OFlags::CLOEXEC,
+                                litebox::fs::Mode::empty(),
+                            )
+                            .map_err(|_| Errno::EIO)
                     },
                     |_| Err(Errno::ENOTTY),
                     |_| Err(Errno::ENOTTY),
@@ -4556,12 +4597,30 @@ impl<FS: ShimFS> Task<FS> {
                     |_| Err(Errno::ENOTTY),
                     |_| Err(Errno::ENOTTY),
                 )??;
-                // Drop borrows before opening (which needs write access).
                 drop(files);
-                // Open the slave via the normal open path.
-                let slave_path = alloc::format!("/dev/pts/{pty_idx}");
+                let files = self.files.borrow();
                 let oflags = OFlags::from_bits_truncate(u32::try_from(open_flags).unwrap_or(0));
-                self.sys_open(slave_path.as_str(), oflags, Mode::empty())
+                {
+                    let mut dt = self.global.litebox.descriptor_table_mut();
+                    let None = dt.set_entry_metadata(&slave_fd, crate::StdioStatusFlags(oflags))
+                    else {
+                        unreachable!()
+                    };
+                    // Propagate O_CLOEXEC to fd-level metadata so close_on_exec
+                    // sees it (the device FS only stores status flags, not
+                    // descriptor flags).
+                    if oflags.contains(OFlags::CLOEXEC) {
+                        dt.set_fd_metadata(
+                            &slave_fd,
+                            litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC,
+                        );
+                    }
+                }
+                let raw_fd = files.insert_raw_fd(slave_fd).map_err(|fd| {
+                    let _ = files.fs.close(&fd);
+                    Errno::EMFILE
+                })?;
+                Ok(u32::try_from(raw_fd).unwrap_or(u32::MAX))
             }
             IoctlArg::TCGETS(..)
             | IoctlArg::TCSETS(..)
