@@ -10,6 +10,7 @@
 use std::mem::align_of;
 use std::os::unix::io::OwnedFd;
 use std::ptr::NonNull;
+use std::sync::Mutex;
 
 use litebox_ipc::ring::{CqEntry, RingHeader, SharedRingLayout, SqEntry, RING_SIZE};
 
@@ -265,6 +266,65 @@ impl SharedRegion {
             let base = self.ptr.as_ptr().add(self.layout.data_region_offset);
             std::slice::from_raw_parts_mut(base, self.layout.data_region_size)
         }
+    }
+}
+
+/// Pre-allocated pool of shared memory rings for child processes.
+///
+/// Rings are created eagerly at startup and recycled when child servers exit.
+/// If the pool is empty, `acquire()` falls back to fresh allocation.
+/// Thread-safe: the main server thread acquires, child server threads release.
+pub struct RingPool {
+    rings: Mutex<Vec<(SharedRegion, i32)>>,
+}
+
+impl RingPool {
+    /// Create a new pool, eagerly pre-allocating `initial_count` rings.
+    pub fn new(initial_count: usize) -> Self {
+        let mut rings = Vec::with_capacity(initial_count);
+        for _ in 0..initial_count {
+            match SharedRegion::create_child_ring() {
+                Ok(entry) => rings.push(entry),
+                Err(e) => {
+                    eprintln!("ring pool: failed to pre-allocate ring: {e}");
+                    break;
+                }
+            }
+        }
+        Self {
+            rings: Mutex::new(rings),
+        }
+    }
+
+    /// Take a ring from the pool, or allocate a fresh one if empty.
+    pub fn acquire(&self) -> anyhow::Result<(SharedRegion, i32)> {
+        if let Some(entry) = self.rings.lock().unwrap().pop() {
+            Ok(entry)
+        } else {
+            SharedRegion::create_child_ring()
+        }
+    }
+
+    /// Return a ring to the pool after resetting its header and SQ flags.
+    pub fn release(&self, region: SharedRegion, fd: i32) {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        // Reset ring header to initial state
+        let header = region.header();
+        header.sq_head.store(0, Relaxed);
+        header.sq_tail.store(0, Relaxed);
+        header.sq_notify.store(0, Relaxed);
+        header.cq_head.store(0, Relaxed);
+        header.cq_tail.store(0, Relaxed);
+        for slot in &header.cq_notify_slots {
+            slot.store(0, Relaxed);
+        }
+        // Reset all SQ entry ready flags
+        let sq = region.sq_entries();
+        for entry in sq {
+            entry.ready.store(0, Relaxed);
+        }
+        self.rings.lock().unwrap().push((region, fd));
     }
 }
 
