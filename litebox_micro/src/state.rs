@@ -4,7 +4,20 @@
 //! Global per-process micro-LiteBox state.
 
 use core::sync::atomic::AtomicUsize;
-use litebox_ipc::ring::SharedRingLayout;
+use litebox_ipc::ring::{SharedRingLayout, MAX_PIPE_SLOTS};
+
+/// Entry in micro's local pipe fd tracking table.
+///
+/// Maps a file descriptor to the shmem offset of its pipe ring buffer.
+#[derive(Clone, Copy)]
+pub struct PipeFdEntry {
+    /// The file descriptor number.
+    pub fd: i32,
+    /// Offset within the data region to the pipe's `ShmemPipeHeader`.
+    pub shmem_offset: u32,
+    /// `true` if this fd is the write end, `false` if read end.
+    pub is_write_end: bool,
+}
 
 #[repr(C)]
 pub struct MicroState {
@@ -26,6 +39,9 @@ pub struct MicroState {
     /// host's original brk). This field tracks a virtual brk that starts at
     /// the end of the new binary's segments and grows via mmap.
     pub guest_brk: AtomicUsize,
+    /// Pipe fd tracking table. Each entry maps a guest fd to a shmem pipe
+    /// ring buffer. Linear scan is fine — at most MAX_PIPE_SLOTS entries.
+    pub pipe_fds: [Option<PipeFdEntry>; MAX_PIPE_SLOTS],
 }
 
 unsafe impl Send for MicroState {}
@@ -41,6 +57,7 @@ static mut MICRO_STATE: MicroState = MicroState {
     layout: SharedRingLayout::new(0),
     syscall_entry_point: 0,
     guest_brk: AtomicUsize::new(0),
+    pipe_fds: [None; MAX_PIPE_SLOTS],
 };
 
 /// Initialize the global micro-LiteBox state.
@@ -97,6 +114,45 @@ pub unsafe fn global_micro_state_mut() -> &'static mut MicroState {
 }
 
 impl MicroState {
+    /// Look up a pipe fd in the tracking table.
+    /// Returns `(shmem_offset, is_write_end)` if found.
+    pub fn find_pipe_fd(&self, fd: i32) -> Option<(u32, bool)> {
+        for e in self.pipe_fds.iter().flatten() {
+            if e.fd == fd {
+                return Some((e.shmem_offset, e.is_write_end));
+            }
+        }
+        None
+    }
+
+    /// Register a pipe fd in the tracking table. Returns `true` on success.
+    pub fn register_pipe_fd(&mut self, fd: i32, shmem_offset: u32, is_write_end: bool) -> bool {
+        for slot in &mut self.pipe_fds {
+            if slot.is_none() {
+                *slot = Some(PipeFdEntry {
+                    fd,
+                    shmem_offset,
+                    is_write_end,
+                });
+                return true;
+            }
+        }
+        false // table full
+    }
+
+    /// Remove a pipe fd from the tracking table. Returns `true` if found.
+    pub fn unregister_pipe_fd(&mut self, fd: i32) -> bool {
+        for slot in &mut self.pipe_fds {
+            if let Some(e) = slot
+                && e.fd == fd
+            {
+                *slot = None;
+                return true;
+            }
+        }
+        false
+    }
+
     #[cfg(test)]
     pub fn zeroed() -> Self {
         Self {
@@ -109,6 +165,7 @@ impl MicroState {
             layout: SharedRingLayout::new(0),
             syscall_entry_point: 0,
             guest_brk: AtomicUsize::new(0),
+            pipe_fds: [None; MAX_PIPE_SLOTS],
         }
     }
 }
@@ -130,5 +187,36 @@ mod tests {
         let p1 = global_micro_state_ptr();
         let p2 = global_micro_state_ptr();
         assert_eq!(p1, p2);
+    }
+
+    #[test]
+    fn pipe_fd_register_and_find() {
+        let mut state = MicroState::zeroed();
+        assert!(state.find_pipe_fd(5).is_none());
+        assert!(state.register_pipe_fd(5, 0x500000, false));
+        let (offset, is_write) = state.find_pipe_fd(5).unwrap();
+        assert_eq!(offset, 0x500000);
+        assert!(!is_write);
+    }
+
+    #[test]
+    fn pipe_fd_unregister() {
+        let mut state = MicroState::zeroed();
+        state.register_pipe_fd(5, 0x500000, false);
+        assert!(state.unregister_pipe_fd(5));
+        assert!(state.find_pipe_fd(5).is_none());
+        assert!(!state.unregister_pipe_fd(5)); // already removed
+    }
+
+    #[test]
+    fn pipe_fd_register_both_ends() {
+        let mut state = MicroState::zeroed();
+        assert!(state.register_pipe_fd(3, 0x500000, false)); // read end
+        assert!(state.register_pipe_fd(4, 0x500000, true)); // write end
+        let (off_r, wr_r) = state.find_pipe_fd(3).unwrap();
+        let (off_w, wr_w) = state.find_pipe_fd(4).unwrap();
+        assert_eq!(off_r, off_w); // same pipe slot
+        assert!(!wr_r);
+        assert!(wr_w);
     }
 }
