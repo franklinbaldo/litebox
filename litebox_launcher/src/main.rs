@@ -22,16 +22,22 @@ fn main() -> anyhow::Result<()> {
         .find(|a| a.starts_with("--rootfs-prefix="))
         .map(|a| a.strip_prefix("--rootfs-prefix=").unwrap().to_string());
 
+    // Extract --tun-device=<name> for TUN networking.
+    let tun_device = args
+        .iter()
+        .find(|a| a.starts_with("--tun-device="))
+        .map(|a| a.strip_prefix("--tun-device=").unwrap().to_string());
+
     // Filter out launcher-only flags from guest argv.
     let guest_argv: Vec<&str> = args[1..]
         .iter()
-        .filter(|a| !a.starts_with("--rootfs-tar=") && !a.starts_with("--rootfs-prefix="))
+        .filter(|a| !a.starts_with("--rootfs-tar=") && !a.starts_with("--rootfs-prefix=") && !a.starts_with("--tun-device="))
         .map(String::as_str)
         .collect();
 
     if guest_argv.is_empty() {
         anyhow::bail!(
-            "Usage: litebox_launcher [--rootfs-tar=<path>] [--rootfs-prefix=<dir>] <elf-path> [args...]"
+            "Usage: litebox_launcher [--rootfs-tar=<path>] [--rootfs-prefix=<dir>] [--tun-device=<name>] <elf-path> [args...]"
         );
     }
     let elf_path = guest_argv[0];
@@ -59,9 +65,9 @@ fn main() -> anyhow::Result<()> {
         rootfs_prefix.as_deref(),
     )?;
 
-    // 3. Spawn central process (child inherits the shmem fd + initial brk + rootfs tar).
+    // 3. Spawn central process (child inherits the shmem fd + initial brk + rootfs tar + tun device).
     let central =
-        central::CentralProcess::spawn(shmem.fd_raw(), loaded.brk, rootfs_tar.as_deref())?;
+        central::CentralProcess::spawn(shmem.fd_raw(), loaded.brk, rootfs_tar.as_deref(), tun_device.as_deref())?;
 
     // Give central time to initialize (platform, shim, server loop).
     // TODO: Replace with proper readiness signaling via ring header.

@@ -481,6 +481,10 @@ impl<FS: ShimFS> ProcessServer<FS> {
         // central cannot dereference guest pointers directly). If data_len > 0,
         // copy the pathname into a local buffer and rewrite the PtRegs argument
         // to point to it before dispatching to the shim.
+        //
+        // For socket input syscalls (connect, bind, setsockopt), micro copies
+        // the sockaddr/optval into the data region. If data_len > 0, copy it
+        // into a local buffer and rewrite the PtRegs pointer argument.
         let mut pathname_buf: Vec<u8> = Vec::new();
         let mut regs = crate::dispatch::sq_entry_to_ptregs(entry);
 
@@ -491,7 +495,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
             if offset + len <= data.len() {
                 pathname_buf.extend_from_slice(&data[offset..offset + len]);
                 let buf_ptr = pathname_buf.as_ptr() as usize;
-                // Determine which register holds the pathname pointer.
+                // Determine which register holds the pointer argument.
                 match i64::from(nr) {
                     libc::SYS_openat
                     | libc::SYS_newfstatat
@@ -511,6 +515,14 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     | libc::SYS_open
                     | libc::SYS_creat => {
                         regs.rdi = buf_ptr; // arg0
+                    }
+                    // Socket input: connect/bind sockaddr at arg1 (rsi)
+                    libc::SYS_connect | libc::SYS_bind => {
+                        regs.rsi = buf_ptr; // arg1 = sockaddr*
+                    }
+                    // Socket input: setsockopt optval at arg3 (r10)
+                    libc::SYS_setsockopt => {
+                        regs.r10 = buf_ptr; // arg3 = optval*
                     }
                     _ => {} // Unknown — dispatch as-is.
                 }
@@ -813,6 +825,14 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 | libc::SYS_readlinkat
                 | libc::SYS_getdents64
                 | libc::SYS_getcwd
+                // Socket output syscalls: central dispatches through shim,
+                // writes output (sockaddr, addrlen, optval, optlen) into the
+                // shmem data region for micro to copy back to guest buffers.
+                | libc::SYS_accept
+                | libc::SYS_accept4
+                | libc::SYS_getsockname
+                | libc::SYS_getpeername
+                | libc::SYS_getsockopt
                 // Info queries: shim implements these with virtual values;
                 // results are written to the shmem data region and copied
                 // to the guest buffer by micro.
@@ -1240,6 +1260,60 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 } else if cq.result >= 0 {
                     // tloc was NULL; result is the time value directly.
                     cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
+                }
+            }
+            // ── Socket output syscalls ──────────────────────────────────
+            // accept/accept4: redirect addr (rsi) and addrlen (rdx) to shmem.
+            // Layout: [0..128): sockaddr buffer, [128..132): addrlen as u32.
+            libc::SYS_accept | libc::SYS_accept4 => {
+                let has_addr = entry.args[1] != 0;
+                if has_addr {
+                    regs.rsi = data_ptr;
+                    regs.rdx = data_ptr + 128;
+                    // Initialize addrlen to 128 (max sockaddr size).
+                    data_region[128..132].copy_from_slice(&128u32.to_ne_bytes());
+                } else {
+                    regs.rsi = 0; // NULL addr
+                    regs.rdx = 0; // NULL addrlen
+                }
+                // For accept4: r10 = flags, already set from sq_entry_to_ptregs.
+                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                if cq.result >= 0 && has_addr {
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
+                    cq.data_offset = 0;
+                    cq.data_len = 132; // sockaddr (128) + addrlen (4)
+                } else if cq.result >= 0 {
+                    // No addr requested — just return the new fd.
+                    // Don't set EXEC_LOCAL: result is the fd, micro uses it directly.
+                }
+                // Negative result: error, pass through directly.
+            }
+            // getsockname/getpeername: same output layout as accept.
+            // Layout: [0..128): sockaddr, [128..132): addrlen as u32.
+            libc::SYS_getsockname | libc::SYS_getpeername => {
+                regs.rsi = data_ptr;
+                regs.rdx = data_ptr + 128;
+                // Initialize addrlen to 128.
+                data_region[128..132].copy_from_slice(&128u32.to_ne_bytes());
+                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                if cq.result >= 0 {
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
+                    cq.data_offset = 0;
+                    cq.data_len = 132;
+                }
+            }
+            // getsockopt: redirect optval (r10) and optlen (r8) to shmem.
+            // Layout: [0..256): optval buffer, [256..260): optlen as u32.
+            libc::SYS_getsockopt => {
+                regs.r10 = data_ptr;
+                regs.r8 = data_ptr + 256;
+                // Initialize optlen to 256 (generous max).
+                data_region[256..260].copy_from_slice(&256u32.to_ne_bytes());
+                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                if cq.result >= 0 {
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
+                    cq.data_offset = 0;
+                    cq.data_len = 260; // optval (256) + optlen (4)
                 }
             }
             _ => {

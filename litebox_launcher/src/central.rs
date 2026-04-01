@@ -50,7 +50,7 @@ impl CentralProcess {
     /// This function calls `libc::fork()`. The caller must ensure that forking
     /// is safe in the current process state (e.g. no other threads holding
     /// locks that the child would inherit in a locked state).
-    pub fn spawn(shmem_fd: i32, initial_brk: usize, rootfs_tar: Option<&str>) -> anyhow::Result<Self> {
+    pub fn spawn(shmem_fd: i32, initial_brk: usize, rootfs_tar: Option<&str>, tun_device: Option<&str>) -> anyhow::Result<Self> {
         // SAFETY: We call `fork()` which is safe here because the launcher is
         // single-threaded at the point of spawning. The child either execs
         // `litebox_central` or exits on failure.
@@ -91,6 +91,10 @@ impl CentralProcess {
                     c_args.push(CString::new(format!("--rootfs-tar={tar_path}")).unwrap());
                 }
 
+                if let Some(name) = tun_device {
+                    c_args.push(CString::new(format!("--tun-device={name}")).unwrap());
+                }
+
                 let mut arg_ptrs: Vec<*const libc::c_char> =
                     c_args.iter().map(|a| a.as_ptr()).collect();
                 arg_ptrs.push(std::ptr::null());
@@ -126,7 +130,7 @@ mod tests {
 
     #[test]
     fn spawn_and_wait() {
-        let proc = CentralProcess::spawn(0, 0, None).expect("spawn should succeed");
+        let proc = CentralProcess::spawn(0, 0, None, None).expect("spawn should succeed");
         assert!(proc.pid() > 0);
         let mut status: i32 = 0;
         // SAFETY: `proc.pid()` is a valid child PID returned by `fork()`.

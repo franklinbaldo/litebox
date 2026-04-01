@@ -351,6 +351,63 @@ fn copy_writev_data_to_data_region(
     }
 }
 
+/// Copy socket input data (sockaddr for connect/bind, optval for setsockopt)
+/// from the guest's memory into the shared data region.
+///
+/// These syscalls carry pointer arguments that central cannot dereference
+/// (separate address space). Micro copies the data into the per-thread
+/// pathname zone (`thread_slot * 4096`) and sets `entry.data_offset` /
+/// `entry.data_len` so central can read it.
+///
+/// SAFETY: connect/bind/setsockopt are NOT pathname syscalls and NOT
+/// write-data syscalls, so the existing copy functions won't touch
+/// `entry.data_offset`/`entry.data_len` for these syscalls.
+///
+/// # Safety
+///
+/// The pointer argument (sockaddr or optval) must point to valid readable
+/// memory of at least the specified size in the guest's address space.
+#[allow(clippy::cast_possible_truncation)]
+fn copy_socket_input_to_data_region(
+    entry: &mut SqEntry,
+    args: &[u64; 6],
+    syscall_nr: u32,
+    ring_base: *mut u8,
+    layout: &SharedRingLayout,
+) {
+    // Determine pointer arg index and size arg index for socket input syscalls.
+    let (ptr_idx, size_idx) = match i64::from(syscall_nr) {
+        // connect/bind(fd, sockaddr*, addrlen) — sockaddr at arg1, size at arg2
+        libc::SYS_connect | libc::SYS_bind => (1, 2),
+        // setsockopt(fd, level, optname, optval*, optlen) — optval at arg3, size at arg4
+        libc::SYS_setsockopt => (3, 4),
+        _ => return,
+    };
+
+    let data_ptr = args[ptr_idx] as *const u8;
+    let data_size = args[size_idx] as usize;
+
+    if data_ptr.is_null() || data_size == 0 {
+        return;
+    }
+
+    // Compute per-thread offset in the pathname zone of the data region.
+    let thread_offset = entry.thread_slot as usize * PATHNAME_REGION_SIZE;
+    let max_len = data_size.min(PATHNAME_REGION_SIZE);
+    if thread_offset + max_len > layout.data_region_size {
+        return;
+    }
+
+    // Copy from guest memory into the data region.
+    unsafe {
+        let dst = ring_base.add(layout.data_region_offset + thread_offset);
+        core::ptr::copy_nonoverlapping(data_ptr, dst, max_len);
+    }
+
+    entry.data_offset = thread_offset as u32;
+    entry.data_len = max_len as u32;
+}
+
 /// Returns `(input_arg_index, input_size)` for bidirectional syscalls where
 /// central needs input data from the guest's memory. Returns `None` if the
 /// syscall has no input pointer, or the pointer is NULL.
@@ -481,6 +538,10 @@ pub(crate) unsafe fn submit_and_wait(
         micro.ring_base,
         &micro.layout,
     );
+
+    // For socket input syscalls (connect, bind, setsockopt), copy the
+    // sockaddr/optval from guest memory into the shmem pathname zone.
+    copy_socket_input_to_data_region(entry, args, syscall_nr, micro.ring_base, &micro.layout);
 
     sq_publish(entry);
     header

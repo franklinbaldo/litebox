@@ -752,6 +752,114 @@ pub unsafe fn execute_locally(
         },
         // Filesystem sync: no-op — central owns the filesystem.
         nr if nr == libc::SYS_sync as u32 => 0,
+        // ── Socket output syscalls ──────────────────────────────────
+        // Central dispatched the syscall through the shim and placed
+        // output (sockaddr + addrlen, or optval + optlen) in the shmem
+        // data region at offset 0. Copy back to guest buffers.
+        nr if nr == libc::SYS_accept as u32 || nr == libc::SYS_accept4 as u32 => {
+            // accept/accept4: result is the new fd (or negative error).
+            // Layout: [0..128): sockaddr, [128..132): addrlen as u32.
+            if cq.flags & cq_flags::HAS_DATA != 0 && !ring_base.is_null() {
+                let data_region_base = unsafe {
+                    ring_base
+                        .add(layout.data_region_offset)
+                        .add(cq.data_offset as usize)
+                };
+                let guest_addr = args[1] as *mut u8;
+                let guest_addrlen = args[2] as *mut u32;
+                if !guest_addr.is_null() {
+                    let addrlen_src = unsafe { data_region_base.add(128) };
+                    let addrlen = u32::from_ne_bytes(
+                        unsafe { core::slice::from_raw_parts(addrlen_src, 4) }
+                            .try_into()
+                            .unwrap(),
+                    );
+                    if addrlen > 0 && addrlen <= 128 {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                data_region_base,
+                                guest_addr,
+                                addrlen as usize,
+                            );
+                        }
+                    }
+                    if !guest_addrlen.is_null() {
+                        unsafe {
+                            guest_addrlen.write(addrlen);
+                        }
+                    }
+                }
+            }
+            cq.result
+        }
+        nr if nr == libc::SYS_getsockname as u32 || nr == libc::SYS_getpeername as u32 => {
+            // getsockname/getpeername: same layout as accept addr output.
+            // Layout: [0..128): sockaddr, [128..132): addrlen as u32.
+            if cq.flags & cq_flags::HAS_DATA != 0 && !ring_base.is_null() {
+                let data_region_base = unsafe {
+                    ring_base
+                        .add(layout.data_region_offset)
+                        .add(cq.data_offset as usize)
+                };
+                let guest_addr = args[1] as *mut u8;
+                let guest_addrlen = args[2] as *mut u32;
+                let addrlen_src = unsafe { data_region_base.add(128) };
+                let addrlen = u32::from_ne_bytes(
+                    unsafe { core::slice::from_raw_parts(addrlen_src, 4) }
+                        .try_into()
+                        .unwrap(),
+                );
+                if !guest_addr.is_null() && addrlen > 0 && addrlen <= 128 {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            data_region_base,
+                            guest_addr,
+                            addrlen as usize,
+                        );
+                    }
+                }
+                if !guest_addrlen.is_null() {
+                    unsafe {
+                        guest_addrlen.write(addrlen);
+                    }
+                }
+            }
+            cq.result
+        }
+        nr if nr == libc::SYS_getsockopt as u32 => {
+            // getsockopt: central placed optval + optlen in shmem.
+            // Layout: [0..256): optval, [256..260): optlen as u32.
+            if cq.flags & cq_flags::HAS_DATA != 0 && !ring_base.is_null() {
+                let data_region_base = unsafe {
+                    ring_base
+                        .add(layout.data_region_offset)
+                        .add(cq.data_offset as usize)
+                };
+                let guest_optval = args[3] as *mut u8;
+                let guest_optlen = args[4] as *mut u32;
+                let optlen_src = unsafe { data_region_base.add(256) };
+                let optlen = u32::from_ne_bytes(
+                    unsafe { core::slice::from_raw_parts(optlen_src, 4) }
+                        .try_into()
+                        .unwrap(),
+                );
+                if !guest_optval.is_null() && optlen > 0 && optlen <= 256 {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            data_region_base,
+                            guest_optval,
+                            optlen as usize,
+                        );
+                    }
+                }
+                if !guest_optlen.is_null() {
+                    unsafe {
+                        guest_optlen.write(optlen);
+                    }
+                }
+            }
+            cq.result
+        }
         _ => -i64::from(libc::ENOSYS),
     }
 }

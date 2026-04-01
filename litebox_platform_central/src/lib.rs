@@ -88,6 +88,46 @@ impl CentralPlatform {
                 std::io::Error::last_os_error()
             );
 
+            // Host-side network configuration for the TUN device
+            eprintln!("configuring TUN device {name}...");
+
+            eprintln!("  ip addr add 10.0.0.1/24 dev {name}");
+            let status = std::process::Command::new("ip")
+                .args(["addr", "add", "10.0.0.1/24", "dev", name])
+                .status()
+                .expect("failed to run `ip addr add`");
+            assert!(status.success(), "`ip addr add` failed: {status}");
+
+            eprintln!("  ip link set {name} up");
+            let status = std::process::Command::new("ip")
+                .args(["link", "set", name, "up"])
+                .status()
+                .expect("failed to run `ip link set`");
+            assert!(status.success(), "`ip link set` failed: {status}");
+
+            eprintln!("  enabling ip_forward");
+            std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")
+                .expect("failed to enable ip_forward");
+
+            eprintln!("  iptables MASQUERADE for 10.0.0.0/24");
+            let check = std::process::Command::new("iptables")
+                .args([
+                    "-t", "nat", "-C", "POSTROUTING", "-s", "10.0.0.0/24", "-j", "MASQUERADE",
+                ])
+                .output()
+                .expect("failed to run `iptables -C`");
+            if !check.status.success() {
+                let status = std::process::Command::new("iptables")
+                    .args([
+                        "-t", "nat", "-A", "POSTROUTING", "-s", "10.0.0.0/24", "-j", "MASQUERADE",
+                    ])
+                    .status()
+                    .expect("failed to run `iptables -A`");
+                assert!(status.success(), "`iptables -A` failed: {status}");
+            }
+
+            eprintln!("TUN device {name} configured");
+
             unsafe { OwnedFd::from_raw_fd(fd) }
         });
 
