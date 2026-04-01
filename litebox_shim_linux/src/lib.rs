@@ -387,6 +387,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 syscall_restartable: Cell::new(false),
                 in_syscall: Cell::new(false),
                 deferred_vfork_park: Cell::new(false),
+                suppress_elf_runtime_patch: Cell::new(false),
             },
         };
         let exec_filename = alloc::ffi::CString::new(exec_filename).ok();
@@ -2677,6 +2678,12 @@ struct Task<FS: ShimFS> {
     /// when the task resumes after vfork completes. `Cell` because the task
     /// owns this flag exclusively (no cross-thread sharing).
     deferred_vfork_park: Cell<bool>,
+    /// Suppresses runtime ELF patching in `do_mmap_file` while the ELF loader
+    /// is actively loading a binary. The loader handles trampoline mapping
+    /// itself via `load_trampoline()`; running `maybe_patch_exec_segment` for
+    /// the same fd would double-map the trampoline (the second MAP_FIXED
+    /// destroys the first mapping and re-reads from the file).
+    suppress_elf_runtime_patch: Cell<bool>,
 }
 
 impl<FS: ShimFS> Drop for Task<FS> {
@@ -2724,6 +2731,7 @@ mod test_utils {
                 syscall_restartable: Cell::new(false),
                 in_syscall: Cell::new(false),
                 deferred_vfork_park: Cell::new(false),
+                suppress_elf_runtime_patch: Cell::new(false),
                 process_state: self.process_state.into(),
                 global: self.global,
             }
@@ -2757,6 +2765,7 @@ mod test_utils {
                 syscall_restartable: Cell::new(false),
                 in_syscall: Cell::new(false),
                 deferred_vfork_park: Cell::new(false),
+                suppress_elf_runtime_patch: Cell::new(false),
             };
             Some(task)
         }

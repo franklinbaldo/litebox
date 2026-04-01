@@ -1129,15 +1129,32 @@ impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
             #[cfg(not(target_arch = "x86_64"))]
             return Err(ElfLoaderError::OutOfRange);
         }
-        if let Some(ref data) = self.patched_data {
+
+        // Suppress runtime ELF patching (maybe_patch_exec_segment) when the
+        // loader will map the trampoline itself via load_trampoline(). Without
+        // this, both paths would map the same region — the second MAP_FIXED
+        // destroys the first mapping.
+        //
+        // Only suppress when using the ElfFile mapper (which routes through
+        // do_mmap_file → maybe_patch_exec_segment) AND the loader actually
+        // has a trampoline to map. When patched_data is None and there's no
+        // trampoline (e.g. the rewriter declined the binary), the runtime
+        // fallback must remain enabled.
+        let has_loader_trampoline = self.patched_data.is_some() || self.parsed.has_trampoline();
+        let suppress = has_loader_trampoline && self.patched_data.is_none();
+        self.file.task.suppress_elf_runtime_patch.set(suppress);
+        let result = if let Some(ref data) = self.patched_data {
             let mut mapper = PatchedMapper {
                 inner: &mut self.file,
                 data,
             };
-            Ok(self.parsed.load(&mut mapper, &mut &*platform)?)
+            self.parsed.load(&mut mapper, &mut &*platform)
         } else {
-            Ok(self.parsed.load(&mut self.file, &mut &*platform)?)
-        }
+            self.parsed.load(&mut self.file, &mut &*platform)
+        };
+        self.file.task.suppress_elf_runtime_patch.set(false);
+
+        Ok(result?)
     }
 }
 

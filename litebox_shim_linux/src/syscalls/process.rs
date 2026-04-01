@@ -1910,6 +1910,7 @@ impl<FS: ShimFS> Task<FS> {
                         syscall_restartable: core::cell::Cell::new(false),
                         in_syscall: core::cell::Cell::new(false),
                         deferred_vfork_park: core::cell::Cell::new(false),
+                        suppress_elf_runtime_patch: core::cell::Cell::new(false),
                     },
                 }),
             )
@@ -2436,11 +2437,11 @@ impl<FS: ShimFS> Task<FS> {
                         syscall_restartable: core::cell::Cell::new(false),
                         in_syscall: core::cell::Cell::new(false),
                         deferred_vfork_park: core::cell::Cell::new(false),
+                        suppress_elf_runtime_patch: core::cell::Cell::new(false),
                     },
                 }),
             )
         };
-
         if let Err(err) = r {
             litebox::log_println!(self.global.platform, "failed to spawn fork child: {}", err);
             let _ = self.global.platform.destroy_address_space(child_as_id);

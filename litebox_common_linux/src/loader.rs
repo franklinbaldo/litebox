@@ -227,6 +227,11 @@ impl ElfParsedFile {
         })
     }
 
+    /// Returns `true` if a trampoline was parsed and will be mapped by `load()`.
+    pub fn has_trampoline(&self) -> bool {
+        self.trampoline.is_some()
+    }
+
     /// Parse the LiteBox trampoline data, if any.
     ///
     /// The trampoline header is located at the end of the file (last 32/20 bytes).

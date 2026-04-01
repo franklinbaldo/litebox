@@ -329,14 +329,27 @@ impl<FS: ShimFS> Task<FS> {
         };
 
         // Runtime syscall rewriting: patch PROT_EXEC segments in-place.
-        if is_exec {
-            let syscall_entry = self.global.platform.get_syscall_entry_point();
-            if syscall_entry != 0 {
-                self.maybe_patch_exec_segment(result, len, fd, offset, syscall_entry);
+        // Suppressed during ELF loader's load() sequence because the loader
+        // maps the trampoline itself via load_trampoline(). Running both
+        // paths would double-map the trampoline, with the second MAP_FIXED
+        // destroying the first mapping.
+        if !self.suppress_elf_runtime_patch.get() {
+            if is_exec {
+                let syscall_entry = self.global.platform.get_syscall_entry_point();
+                if syscall_entry != 0
+                    && !self.maybe_patch_exec_segment(result, len, fd, offset, syscall_entry)
+                {
+                    // Trampoline setup failed for a pre-patched binary whose
+                    // .text already contains JMPs to the trampoline address.
+                    // Continuing would guarantee a SIGSEGV on the first
+                    // rewritten syscall, so fail the mmap instead.
+                    let _ = self.sys_munmap(result, len);
+                    return Err(MappingError::OutOfMemory);
+                }
+            } else if offset == 0 {
+                // First mmap at offset 0: record the base address for later patching.
+                self.init_elf_patch_state(fd, result.as_usize());
             }
-        } else if offset == 0 {
-            // First mmap at offset 0: record the base address for later patching.
-            self.init_elf_patch_state(fd, result.as_usize());
         }
 
         Ok(result)
@@ -494,6 +507,11 @@ impl<FS: ShimFS> Task<FS> {
     /// the syscall entry point.
     /// For unpatched binaries: calls `patch_code_segment()` to rewrite syscall
     /// instructions and places the generated stubs in the trampoline region.
+    ///
+    /// Returns `true` on success or non-fatal skip. Returns `false` when a
+    /// pre-patched binary's trampoline could not be set up — the caller must
+    /// fail the mapping because the code already contains JMPs to the
+    /// trampoline address.
     #[allow(clippy::cast_possible_truncation)]
     fn maybe_patch_exec_segment(
         &self,
@@ -502,7 +520,7 @@ impl<FS: ShimFS> Task<FS> {
         fd: i32,
         offset: usize,
         syscall_entry: usize,
-    ) {
+    ) -> bool {
         // Initialize patch state if this is the first mmap for this fd.
         // This handles the case where the first mmap IS the PROT_EXEC one
         // (e.g., MAP_FIXED from the ElfLoader at offset 0).
@@ -513,7 +531,7 @@ impl<FS: ShimFS> Task<FS> {
         let ps = self.process_state.borrow();
         let mut cache = ps.elf_patch_cache.lock();
         let Some(state) = cache.get_mut(&fd) else {
-            return; // No patch state — not an ELF we're tracking
+            return true; // No patch state — not an ELF we're tracking
         };
         #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
@@ -554,13 +572,29 @@ impl<FS: ShimFS> Task<FS> {
                             MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
                         )
                     });
-                let actual_addr = match alloc_result {
-                    Ok(ptr) => ptr.as_usize(),
-                    Err(_) => return,
+                let Ok(alloc_ptr) = alloc_result else {
+                    litebox::log_println!(
+                        self.global.platform,
+                        "warning: trampoline alloc failed for fd={} path={:?} addr={:#x} len={:#x}",
+                        fd,
+                        state.file_path,
+                        tramp_addr,
+                        tramp_len,
+                    );
+                    return false;
                 };
+                let actual_addr = alloc_ptr.as_usize();
                 if actual_addr != tramp_addr {
+                    litebox::log_println!(
+                        self.global.platform,
+                        "warning: trampoline addr mismatch fd={} path={:?} wanted={:#x} got={:#x}",
+                        fd,
+                        state.file_path,
+                        tramp_addr,
+                        actual_addr,
+                    );
                     let _ = self.sys_munmap(MutPtr::<u8>::from_usize(actual_addr), tramp_len);
-                    return;
+                    return false;
                 }
 
                 // Read trampoline data from the file.
@@ -570,8 +604,16 @@ impl<FS: ShimFS> Task<FS> {
                 match self.sys_read(fd, &mut tramp_data, Some(file_off)) {
                     Ok(n) if n == tramp_data.len() => {}
                     _ => {
+                        litebox::log_println!(
+                            self.global.platform,
+                            "warning: trampoline read failed for fd={} path={:?} offset={:#x} size={:#x}",
+                            fd,
+                            state.file_path,
+                            file_off,
+                            state.trampoline_file_size,
+                        );
                         let _ = self.sys_munmap(tramp_ptr, tramp_len);
-                        return;
+                        return false;
                     }
                 }
 
@@ -583,7 +625,7 @@ impl<FS: ShimFS> Task<FS> {
                 // Write to the mapped region.
                 if tramp_ptr.copy_from_slice(0, &tramp_data).is_none() {
                     let _ = self.sys_munmap(tramp_ptr, tramp_len);
-                    return;
+                    return false;
                 }
 
                 // Protect as RX immediately.
@@ -596,13 +638,13 @@ impl<FS: ShimFS> Task<FS> {
                     .is_err()
                 {
                     let _ = self.sys_munmap(tramp_ptr, tramp_len);
-                    return;
+                    return false;
                 }
 
                 state.trampoline_mapped = true;
                 state.trampoline_mapped_len = tramp_len;
             }
-            return;
+            return true;
         }
 
         // Allocate the trampoline region if not yet done.
@@ -631,7 +673,7 @@ impl<FS: ShimFS> Task<FS> {
                 });
             let actual_addr = match actual_addr {
                 Ok(ptr) => ptr.as_usize(),
-                Err(_) => return,
+                Err(_) => return true,
             };
 
             // Verify the trampoline is within JMP rel32 range (±2GB) of the code.
@@ -639,7 +681,7 @@ impl<FS: ShimFS> Task<FS> {
             if distance > 0x7FFF_0000 {
                 // Too far — unmap and bail.
                 let _ = self.sys_munmap(MutPtr::<u8>::from_usize(actual_addr), PAGE_SIZE);
-                return;
+                return true;
             }
 
             state.trampoline_addr = actual_addr;
@@ -651,7 +693,7 @@ impl<FS: ShimFS> Task<FS> {
                 .is_none()
             {
                 let _ = self.sys_munmap(MutPtr::<u8>::from_usize(actual_addr), PAGE_SIZE);
-                return;
+                return true;
             }
             state.trampoline_cursor = 8; // stubs start after the 8-byte entry
             state.trampoline_mapped = true;
@@ -677,7 +719,7 @@ impl<FS: ShimFS> Task<FS> {
                 )
                 .is_err()
         {
-            return;
+            return true;
         }
 
         // Make the code segment writable for in-place patching.
@@ -689,7 +731,7 @@ impl<FS: ShimFS> Task<FS> {
             )
             .is_err()
         {
-            return;
+            return true;
         }
 
         // Read the mapped code into a buffer, patch it, write back.
@@ -701,7 +743,7 @@ impl<FS: ShimFS> Task<FS> {
                 ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
             );
             restore_trampoline_rx(self, state);
-            return;
+            return true;
         };
         let mut code_buf = code_owned.into_vec();
         let original_code = code_buf.clone();
@@ -736,7 +778,7 @@ impl<FS: ShimFS> Task<FS> {
                         ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
                     );
                     restore_trampoline_rx(self, state);
-                    return;
+                    return true;
                 };
                 let tramp_pages_needed = align_up(new_cursor, PAGE_SIZE);
                 if tramp_pages_needed > state.trampoline_mapped_len {
@@ -757,7 +799,7 @@ impl<FS: ShimFS> Task<FS> {
                             ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
                         );
                         restore_trampoline_rx(self, state);
-                        return;
+                        return true;
                     }
                     state.trampoline_mapped_len = tramp_pages_needed;
                 }
@@ -773,7 +815,7 @@ impl<FS: ShimFS> Task<FS> {
                         ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
                     );
                     restore_trampoline_rx(self, state);
-                    return;
+                    return true;
                 }
 
                 // Write patched code back to the mapped region.
@@ -785,7 +827,7 @@ impl<FS: ShimFS> Task<FS> {
                         ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
                     );
                     restore_trampoline_rx(self, state);
-                    return;
+                    return true;
                 }
                 state.trampoline_cursor = new_cursor;
                 state.runtime_patches_committed = true;
@@ -822,7 +864,7 @@ impl<FS: ShimFS> Task<FS> {
                     ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
                 );
                 restore_trampoline_rx(self, state);
-                return;
+                return true;
             }
         }
 
@@ -833,6 +875,7 @@ impl<FS: ShimFS> Task<FS> {
             ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
         );
         restore_trampoline_rx(self, state);
+        true
     }
 
     /// Finalize the ELF patching state for `fd`.
