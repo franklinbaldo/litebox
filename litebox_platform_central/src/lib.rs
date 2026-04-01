@@ -11,6 +11,8 @@
 use core::ops::RangeBounds;
 use core::sync::atomic::AtomicU32;
 use core::time::Duration;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::RwLock;
 
 use litebox::platform::{
     ImmediatelyWokenUp, Punchthrough, PunchthroughProvider, PunchthroughToken, RawConstPointer,
@@ -22,10 +24,99 @@ extern crate alloc;
 
 /// The central server platform.
 ///
-/// This is a zero-sized type that implements [`litebox::platform::Provider`] for
-/// use in a server (host-side) process that communicates with a guest over IPC.
+/// Implements [`litebox::platform::Provider`] for use in a server (host-side)
+/// process that communicates with a guest over IPC. Optionally holds a TUN
+/// device file descriptor for raw IP networking.
 #[derive(Debug)]
-pub struct CentralPlatform;
+pub struct CentralPlatform {
+    tun_fd: RwLock<Option<OwnedFd>>,
+}
+
+impl CentralPlatform {
+    /// Create a new `CentralPlatform`, optionally opening a TUN device.
+    ///
+    /// If `tun_device_name` is `Some`, the named TUN device is opened via
+    /// `/dev/net/tun` and configured with `TUNSETIFF`. If `None`, no TUN
+    /// device is created and IP networking calls will panic.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the TUN device cannot be opened or configured (e.g.,
+    /// `/dev/net/tun` does not exist, or the `TUNSETIFF` ioctl fails).
+    /// Also panics if the device name is 16 bytes or longer.
+    pub fn new(tun_device_name: Option<&str>) -> Self {
+        const IFF_TUN: libc::c_short = 0x0001;
+        const IFF_NO_PI: libc::c_short = 0x1000;
+
+        #[repr(C)]
+        struct Ifreq {
+            ifr_name: [libc::c_char; 16],
+            ifr_flags: libc::c_short,
+            _pad: [u8; 22],
+        }
+
+        let tun_fd = tun_device_name.map(|name| {
+            // Open /dev/net/tun
+            let fd = unsafe {
+                libc::open(
+                    c"/dev/net/tun".as_ptr(),
+                    libc::O_RDWR | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                )
+            };
+            assert!(
+                fd >= 0,
+                "failed to open /dev/net/tun: {}",
+                std::io::Error::last_os_error()
+            );
+
+            // TUNSETIFF ioctl
+            let mut ifreq = Ifreq {
+                ifr_name: [0; 16],
+                ifr_flags: IFF_TUN | IFF_NO_PI,
+                _pad: [0; 22],
+            };
+            assert!(name.len() < 16, "TUN device name too long");
+            for (i, b) in name.bytes().enumerate() {
+                ifreq.ifr_name[i] = b.cast_signed();
+            }
+
+            // TUNSETIFF = _IOW('T', 202, int) = 0x400454CA
+            let ret = unsafe { libc::ioctl(fd, 0x400454CA, &raw const ifreq) };
+            assert!(
+                ret >= 0,
+                "TUNSETIFF failed: {}",
+                std::io::Error::last_os_error()
+            );
+
+            unsafe { OwnedFd::from_raw_fd(fd) }
+        });
+
+        Self {
+            tun_fd: RwLock::new(tun_fd),
+        }
+    }
+
+    /// Block until the TUN device has data to read, or the timeout expires.
+    ///
+    /// Returns immediately if no TUN device is configured.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    pub fn wait_on_tun(&self, timeout: Option<Duration>) {
+        let guard = self.tun_fd.read().unwrap();
+        let Some(fd) = guard.as_ref() else { return };
+        let mut pfd = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let timeout_ms = timeout.map_or(-1, |t| {
+            i32::try_from(t.as_millis()).unwrap_or(i32::MAX)
+        });
+        unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Task 2: DebugLogProvider and IPInterfaceProvider
@@ -38,18 +129,39 @@ impl litebox::platform::DebugLogProvider for CentralPlatform {
 }
 
 impl litebox::platform::IPInterfaceProvider for CentralPlatform {
-    fn send_ip_packet(&self, _packet: &[u8]) -> Result<(), litebox::platform::SendError> {
-        // Central platform does not handle raw IP traffic; packets travel over
-        // IPC, not through a TUN device.
-        unimplemented!("CentralPlatform does not support raw IP networking")
+    fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
+        let guard = self.tun_fd.read().unwrap();
+        let fd = guard
+            .as_ref()
+            .expect("networking not enabled (no TUN device)");
+        let ret =
+            unsafe { libc::write(fd.as_raw_fd(), packet.as_ptr().cast(), packet.len()) };
+        assert!(
+            ret >= 0,
+            "TUN write failed: {}",
+            std::io::Error::last_os_error()
+        );
+        Ok(())
     }
 
     fn receive_ip_packet(
         &self,
-        _packet: &mut [u8],
+        packet: &mut [u8],
     ) -> Result<usize, litebox::platform::ReceiveError> {
-        // Central platform does not handle raw IP traffic.
-        unimplemented!("CentralPlatform does not support raw IP networking")
+        let guard = self.tun_fd.read().unwrap();
+        let fd = guard
+            .as_ref()
+            .expect("networking not enabled (no TUN device)");
+        let ret =
+            unsafe { libc::read(fd.as_raw_fd(), packet.as_mut_ptr().cast(), packet.len()) };
+        if ret < 0 {
+            let errno = unsafe { *libc::__errno_location() };
+            if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+                return Err(litebox::platform::ReceiveError::WouldBlock);
+            }
+            panic!("TUN read failed: {}", std::io::Error::last_os_error());
+        }
+        Ok(ret.cast_unsigned())
     }
 }
 

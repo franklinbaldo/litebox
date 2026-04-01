@@ -48,15 +48,21 @@ struct Args {
     /// Path to a .tar file containing the root filesystem (shared libraries, etc.).
     #[arg(long)]
     rootfs_tar: Option<String>,
+
+    /// Name of the TUN device to open for raw IP networking (e.g. "tun0").
+    /// If not provided, IP networking is disabled.
+    #[arg(long)]
+    tun_device: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
-    // Initialize the platform — must happen before any other litebox usage.
-    let platform: &'static Platform = Box::leak(Box::new(CentralPlatform));
-    litebox_platform_multiplex::set_platform(platform);
-
-    // Parse CLI args early — we need rootfs_tar for FS construction.
+    // Parse CLI args early — we need them for platform and FS construction.
     let args = Args::parse();
+
+    // Initialize the platform — must happen before any other litebox usage.
+    let platform: &'static Platform =
+        Box::leak(Box::new(CentralPlatform::new(args.tun_device.as_deref())));
+    litebox_platform_multiplex::set_platform(platform);
 
     // Build the LiteBox shim with a 3-layer filesystem:
     //   in_mem (writable top) over (devices over tar_ro)
@@ -115,6 +121,45 @@ fn main() -> anyhow::Result<()> {
     // Wrap the shim in an Arc so it can be shared with child ProcessServers.
     let shim = std::sync::Arc::new(shim);
 
+    // Spawn a network worker thread to drive smoltcp ↔ TUN packet flow.
+    let net_shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let net_worker = if args.tun_device.is_some() {
+        let shim = shim.clone();
+        let shutdown = net_shutdown.clone();
+        Some(
+            std::thread::Builder::new()
+                .name("net-worker".into())
+                .spawn(move || {
+                    const DEFAULT_TIMEOUT: core::time::Duration =
+                        core::time::Duration::from_micros(100);
+                    const MAX_TIMEOUT: core::time::Duration =
+                        core::time::Duration::from_millis(1);
+
+                    while !shutdown.load(core::sync::atomic::Ordering::Relaxed) {
+                        let timeout = loop {
+                            match shim.perform_network_interaction() {
+                                litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately => {}
+                                litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction { timeout } => {
+                                    break timeout;
+                                }
+                            }
+                        };
+                        platform.wait_on_tun(
+                            Some(timeout.unwrap_or(DEFAULT_TIMEOUT).min(MAX_TIMEOUT)),
+                        );
+                    }
+                    // Final flush
+                    while shim
+                        .perform_network_interaction()
+                        .call_again_immediately()
+                    {}
+                })
+                .expect("failed to spawn network worker thread"),
+        )
+    } else {
+        None
+    };
+
     // Create a headless task for syscall dispatch.
     // TODO: receive real TaskParams from the launcher via the ring buffer
     // or command-line arguments.
@@ -144,5 +189,10 @@ fn main() -> anyhow::Result<()> {
     let ring_pool = Arc::new(shmem::RingPool::new(8));
 
     let server = server::ProcessServer::new(region, task, shim, fs, ring_pool, -1);
-    server.run()
+    let result = server.run();
+    net_shutdown.store(true, core::sync::atomic::Ordering::Relaxed);
+    if let Some(handle) = net_worker {
+        let _ = handle.join();
+    }
+    result
 }
