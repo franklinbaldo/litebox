@@ -13,6 +13,7 @@ use litebox_ipc::ring::{MAX_PIPE_SLOTS, MAX_THREADS, PIPE_SLOT_SIZE, PIPE_ZONE_B
 #[derive(Clone, Copy, Debug)]
 #[allow(dead_code)] // Fields read during fork reconstruction (future task).
 pub(crate) enum VmaEvent {
+    Mmap { addr: u64, len: u64, prot: u32 },
     Munmap { addr: u64, len: u64 },
     Mprotect { addr: u64, len: u64, prot: u32 },
     Madvise { addr: u64, len: u64, advice: u32 },

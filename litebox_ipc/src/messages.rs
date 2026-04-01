@@ -116,6 +116,11 @@ pub const MSG_NOTIFY_MADVISE: u32 = MSG_BASE + 14;
 /// args[0] = new_mask (argument passed to umask), args[1] = result (old mask).
 pub const MSG_NOTIFY_UMASK: u32 = MSG_BASE + 15;
 
+/// Notification: micro executed anonymous mmap locally via the bump allocator.
+/// args[0] = addr (chosen by bump allocator), args[1] = len, args[2] = prot,
+/// args[3] = flags (original flags, without MAP_FIXED), args[4] = result (addr or -errno).
+pub const MSG_NOTIFY_MMAP: u32 = MSG_BASE + 16;
+
 /// Returns `true` if `syscall_nr` is a control message (>= [`MSG_BASE`])
 /// rather than a real Linux syscall number.
 pub const fn is_control_message(syscall_nr: u32) -> bool {

@@ -14,9 +14,9 @@ use std::thread::JoinHandle;
 use litebox_ipc::cq::{cq_notify_thread, cq_push};
 use litebox_ipc::messages::{
     self, MSG_CHILD_READY, MSG_FORK_RESULT, MSG_LOCAL_RESULT, MSG_NOTIFY_ALARM, MSG_NOTIFY_MADVISE,
-    MSG_NOTIFY_MPROTECT, MSG_NOTIFY_MUNMAP, MSG_NOTIFY_SIGACTION, MSG_NOTIFY_SIGALTSTACK,
-    MSG_NOTIFY_SIGPROCMASK, MSG_NOTIFY_UMASK, MSG_NOTIFY_WAIT4, MSG_THREAD_DEREGISTER,
-    MSG_THREAD_REGISTER,
+    MSG_NOTIFY_MMAP, MSG_NOTIFY_MPROTECT, MSG_NOTIFY_MUNMAP, MSG_NOTIFY_SIGACTION,
+    MSG_NOTIFY_SIGALTSTACK, MSG_NOTIFY_SIGPROCMASK, MSG_NOTIFY_UMASK, MSG_NOTIFY_WAIT4,
+    MSG_THREAD_DEREGISTER, MSG_THREAD_REGISTER,
 };
 use litebox_ipc::ring::{
     cq_flags, pipe_flags, sq_flags, CqEntry, SqEntry, TrampolineDescriptor, PIPE_SLOT_SIZE,
@@ -27,6 +27,18 @@ use litebox_ipc::wait::spin_u8_then_wait_u32;
 use litebox_shim_linux::ShimFS;
 
 use crate::shmem::{RingPool, SharedRegion};
+
+/// Start of the reserved address range for micro's anonymous mmap bump
+/// allocator.  This range is communicated to micro via `ExecveHeader` and
+/// reserved in central's `PageManager` so `get_unmmaped_area` never returns
+/// addresses within it.
+///
+/// 0x1000_0000_0000 = 16 TiB, well above typical ELF load addresses
+/// (< 0x1_0000_0000) and below the kernel boundary.
+const MMAP_BUMP_START: u64 = 0x1000_0000_0000;
+
+/// End (exclusive) of the bump allocator range. 1 TiB of space.
+const MMAP_BUMP_END: u64 = 0x1100_0000_0000;
 
 /// The central server that processes SQ entries and produces CQ completions.
 ///
@@ -1911,6 +1923,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
             envp_offset: envp_offset as u32,
             envp_len: envp_bytes.len() as u32,
             syscall_entry_point: 0, // micro will patch this from its own trampoline
+            mmap_bump_start: MMAP_BUMP_START,
+            mmap_bump_end: MMAP_BUMP_END,
         };
 
         // Copy header bytes.
@@ -2042,6 +2056,29 @@ impl<FS: ShimFS> ProcessServer<FS> {
             }
         }
 
+        // Reserve the bump allocator range in the PageManager so that
+        // `get_unmmaped_area` (top-down allocation) never returns addresses
+        // within MMAP_BUMP_START..MMAP_BUMP_END.  This prevents collisions
+        // between central-allocated mappings and micro's local bump allocator.
+        {
+            let pm = self.shim.page_manager();
+            let range = litebox::mm::linux::PageRange {
+                start: MMAP_BUMP_START as usize,
+                end: MMAP_BUMP_END as usize,
+            };
+            // SAFETY: the range is not yet mapped — we are just reserving it
+            // in the VMA tracker so the address allocator skips it.
+            unsafe {
+                let _ = pm.register_existing_mapping(
+                    range,
+                    litebox::platform::page_mgmt::MemoryRegionPermissions::empty(),
+                    false,
+                    true, // replace any existing entries in this range
+                    false,
+                );
+            }
+        }
+
         cq.result = 0;
         cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
         cq.data_offset = 0;
@@ -2168,6 +2205,41 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 if returned_pid > 0 {
                     let mut state = self.notification_state.borrow_mut();
                     state.reaped_children.push((returned_pid, status));
+                }
+                0
+            }
+            MSG_NOTIFY_MMAP => {
+                // Micro executed an anonymous mmap locally via the bump allocator.
+                // Record the VMA event so fork reconstruction can replay it.
+                // Also register the mapping in the PageManager so
+                // `get_unmmaped_area` never hands out overlapping addresses.
+                let addr = entry.args[0];
+                let len = entry.args[1];
+                #[allow(clippy::cast_possible_truncation)]
+                let prot = entry.args[2] as u32;
+
+                let mut state = self.notification_state.borrow_mut();
+                state
+                    .vma_events
+                    .push(crate::notification_state::VmaEvent::Mmap { addr, len, prot });
+
+                // Register in PageManager so central's address allocator
+                // knows this range is occupied (prevents future collisions).
+                let pm = self.shim.page_manager();
+                #[allow(clippy::cast_possible_truncation)] // 64-bit only
+                let range = litebox::mm::linux::PageRange {
+                    start: addr as usize,
+                    end: (addr + len) as usize,
+                };
+                // SAFETY: micro has already mapped this range; we are just
+                // recording it in the VMA tracker.
+                #[allow(clippy::cast_possible_truncation)]
+                let perms =
+                    litebox::platform::page_mgmt::MemoryRegionPermissions::from_bits_truncate(
+                        prot as u8,
+                    );
+                unsafe {
+                    let _ = pm.register_existing_mapping(range, perms, false, true, false);
                 }
                 0
             }
@@ -2319,6 +2391,8 @@ struct ExecveHeaderCentral {
     envp_offset: u32,
     envp_len: u32,
     syscall_entry_point: u64,
+    mmap_bump_start: u64,
+    mmap_bump_end: u64,
 }
 
 /// Mirror of `ExecveSegment` from `litebox_micro::execve`.

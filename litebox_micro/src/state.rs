@@ -45,6 +45,14 @@ pub struct MicroState {
     /// (central does), so we track the umask purely in libOS state. Default
     /// is 0o022 (matching central's shim default).
     pub umask: AtomicU32,
+    /// Bump allocator for anonymous `mmap(NULL, ...)` fast-path.
+    /// Next address to hand out (grows upward). 0 means bump allocator is
+    /// not yet initialized (pre-execve).
+    pub mmap_bump_next: AtomicUsize,
+    /// Upper bound (exclusive) of the bump allocator range. When
+    /// `mmap_bump_next >= mmap_bump_end`, the bump allocator is exhausted
+    /// and mmap falls through to the normal central round-trip.
+    pub mmap_bump_end: usize,
     /// Pipe fd tracking table. Each entry maps a guest fd to a shmem pipe
     /// ring buffer. Linear scan is fine — at most MAX_PIPE_SLOTS entries.
     pub pipe_fds: [Option<PipeFdEntry>; MAX_PIPE_SLOTS],
@@ -64,6 +72,8 @@ static mut MICRO_STATE: MicroState = MicroState {
     syscall_entry_point: 0,
     guest_brk: AtomicUsize::new(0),
     umask: AtomicU32::new(0o022),
+    mmap_bump_next: AtomicUsize::new(0),
+    mmap_bump_end: 0,
     pipe_fds: [None; MAX_PIPE_SLOTS],
 };
 
@@ -199,6 +209,8 @@ impl MicroState {
             syscall_entry_point: 0,
             guest_brk: AtomicUsize::new(0),
             umask: AtomicU32::new(0o022),
+            mmap_bump_next: AtomicUsize::new(0),
+            mmap_bump_end: 0,
             pipe_fds: [None; MAX_PIPE_SLOTS],
         }
     }

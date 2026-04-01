@@ -49,6 +49,11 @@ pub struct ExecveHeader {
     pub envp_len: u32,
     /// Syscall entry point address (for trampoline patching).
     pub syscall_entry_point: u64,
+    /// Start of the reserved bump-allocator range for anonymous mmap(NULL).
+    /// 0 means no bump allocator is available.
+    pub mmap_bump_start: u64,
+    /// End (exclusive) of the bump-allocator range.
+    pub mmap_bump_end: u64,
 }
 
 /// Describes a loaded ELF segment that micro must map.
@@ -512,7 +517,7 @@ unsafe fn submit_execve_sq(
     clippy::too_many_lines
 )]
 unsafe fn execute_execve(
-    _tls: *mut MicroTls,
+    tls: *mut MicroTls,
     cq: &CqEntry,
     micro: &MicroState,
 ) -> ! {
@@ -591,6 +596,20 @@ unsafe fn execute_execve(
     micro
         .guest_brk
         .store(header.brk as usize, core::sync::atomic::Ordering::Release);
+
+    // Initialize the anonymous mmap bump allocator from the range central
+    // reserved for us.  After this, anonymous mmap(NULL, ...) calls can be
+    // handled locally without a ring round-trip.
+    if header.mmap_bump_start != 0 {
+        micro
+            .mmap_bump_next
+            .store(header.mmap_bump_start as usize, core::sync::atomic::Ordering::Release);
+        // mmap_bump_end is not atomic — safe to write here because we are
+        // single-threaded at this point (post-execve, pre-entry).  We go
+        // through the raw MicroState pointer to avoid UB from &T → &mut T.
+        let micro_ptr = unsafe { (*tls).micro };
+        unsafe { (*micro_ptr).mmap_bump_end = header.mmap_bump_end as usize };
+    }
 
     // ── Map segments (point of no return) ──────────────────────────────
     //
@@ -787,9 +806,9 @@ mod tests {
         // Verify the struct is a reasonable size (no unexpected padding).
         let size = core::mem::size_of::<ExecveHeader>();
         assert!(size > 0);
-        // ExecveHeader has: 2*u32 + 4*u64 + 2*u32 + u64 + 2*u32 + 4*u32 + u64
-        // = 8 + 32 + 8 + 8 + 8 + 16 + 8 = 88 bytes
-        assert_eq!(size, 88);
+        // ExecveHeader has: 2*u32 + 4*u64 + 2*u32 + u64 + 2*u32 + 4*u32 + u64 + 2*u64
+        // = 8 + 32 + 8 + 8 + 8 + 16 + 8 + 16 = 104 bytes
+        assert_eq!(size, 104);
     }
 
     #[test]
@@ -868,6 +887,8 @@ mod tests {
             envp_offset: 0,
             envp_len: 0,
             syscall_entry_point: 0,
+            mmap_bump_start: 0,
+            mmap_bump_end: 0,
         };
 
         let sp = build_exec_stack(base, stack_size, &argv, &envp, &header);

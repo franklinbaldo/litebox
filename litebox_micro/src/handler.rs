@@ -8,6 +8,7 @@ use core::sync::atomic::Ordering::Acquire;
 use litebox_ipc::cq::{cq_find_by_seq, cq_tail};
 use litebox_ipc::ring::{cq_flags, CqEntry, RingHeader, SharedRingLayout, SqEntry};
 use litebox_ipc::sq::{sq_acquire_slot, sq_publish};
+
 use litebox_ipc::wait::spin_then_wait;
 
 use crate::local_exec::execute_locally;
@@ -649,6 +650,86 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
             return handle_prlimit64_readonly(args.args[1] as u32, old_limit as *mut u8);
         }
         // Write case or pid != 0: fall through to central round-trip.
+    }
+
+    // Anonymous mmap(NULL) fast-path: use the bump allocator to avoid a
+    // ring round-trip.  ld-linux issues ~1 anonymous mmap(NULL) call per
+    // exec; handling it locally saves ~144 µs per exec.
+    //
+    // Conditions: addr == NULL, MAP_ANONYMOUS set, MAP_FIXED not set, fd == -1.
+    // The bump allocator hands out addresses from a pre-reserved range
+    // (MMAP_BUMP_START..MMAP_BUMP_END) and sends a Tier 2 fire-and-forget
+    // notification so central can track the VMA for fork reconstruction.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    if nr == libc::SYS_mmap as u32 {
+        let addr = args.args[0];
+        let len = args.args[1] as usize;
+        let prot = args.args[2] as i32;
+        let flags = args.args[3] as i32;
+        let fd = args.args[4] as i32;
+
+        let is_anon = flags & libc::MAP_ANONYMOUS != 0;
+        let is_fixed = flags & libc::MAP_FIXED != 0;
+
+        if addr == 0 && is_anon && !is_fixed && fd == -1 && len > 0 {
+            let state = unsafe { crate::state::global_micro_state() };
+            let bump_end = state.mmap_bump_end;
+
+            if bump_end != 0 {
+                // Page-align the requested length.
+                let aligned_len = (len + 0xFFF) & !0xFFF;
+                let next = state
+                    .mmap_bump_next
+                    .fetch_add(aligned_len, core::sync::atomic::Ordering::Relaxed);
+
+                if next + aligned_len <= bump_end {
+                    // Execute the mmap locally with MAP_FIXED at the bump address.
+                    let result = unsafe {
+                        crate::raw_syscall::mmap(
+                            next,
+                            aligned_len,
+                            prot,
+                            (flags | libc::MAP_FIXED) & !libc::MAP_GROWSDOWN,
+                            -1,
+                            0,
+                        )
+                    };
+
+                    if crate::raw_syscall::is_error(result) {
+                        // Roll back the bump pointer on failure.
+                        state
+                            .mmap_bump_next
+                            .fetch_sub(aligned_len, core::sync::atomic::Ordering::Relaxed);
+                        return result;
+                    }
+
+                    // Tier 2 notification: tell central about the new mapping.
+                    // Protocol: addr, len, prot, flags, 0, 0
+                    let notify_args = [
+                        next as u64,
+                        aligned_len as u64,
+                        #[allow(clippy::cast_sign_loss)]
+                        {
+                            prot as u64
+                        },
+                        u64::from(flags.cast_unsigned()),
+                        0,
+                        0,
+                    ];
+                    unsafe {
+                        notify_central(tls, litebox_ipc::messages::MSG_NOTIFY_MMAP, &notify_args);
+                    }
+
+                    return result;
+                }
+                // Bump allocator exhausted — roll back and fall through to central.
+                state
+                    .mmap_bump_next
+                    .fetch_sub(aligned_len, core::sync::atomic::Ordering::Relaxed);
+            }
+            // bump_end == 0 means pre-execve or not initialized; fall through.
+        }
+        // Non-anonymous, MAP_FIXED, or explicit addr: fall through to central.
     }
 
     // Shmem pipe fast-path: read/write on pipe fds bypass central entirely.
