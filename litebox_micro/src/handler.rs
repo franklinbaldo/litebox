@@ -160,6 +160,7 @@ fn write_data_arg_info(nr: u32) -> Option<(usize, usize)> {
     match i64::from(nr) {
         libc::SYS_write => Some((1, 2)),    // write(fd, buf, count)
         libc::SYS_pwrite64 => Some((1, 2)), // pwrite64(fd, buf, count, offset)
+        libc::SYS_sendto => Some((1, 2)),   // sendto(fd, buf, len, flags, dest_addr, addrlen)
         _ => None,
     }
 }
@@ -215,6 +216,53 @@ fn copy_write_data_to_data_region(
         entry.data_offset = thread_offset as u32;
         entry.data_len = max_len as u32;
     }
+}
+
+/// Copy the destination sockaddr for `sendto` into the shmem write-data zone,
+/// appended immediately after the send buffer data.
+///
+/// `copy_write_data_to_data_region` has already placed the send buffer at
+/// `[data_offset..data_offset + send_len)`. This function appends the
+/// sockaddr at `[data_offset + send_len..data_offset + send_len + addrlen)`
+/// and updates `entry.data_len` to include both.
+///
+/// # Safety
+///
+/// The dest_addr pointer (from `args[4]`) must point to valid readable memory
+/// of at least `addrlen` (args[5]) bytes in the guest's address space.
+#[allow(clippy::cast_possible_truncation)]
+fn copy_sendto_sockaddr_to_data_region(
+    entry: &mut SqEntry,
+    args: &[u64; 6],
+    syscall_nr: u32,
+    ring_base: *mut u8,
+    layout: &SharedRingLayout,
+) {
+    if i64::from(syscall_nr) != libc::SYS_sendto {
+        return;
+    }
+
+    let dest_addr = args[4] as *const u8;
+    let addrlen = args[5] as usize;
+
+    if dest_addr.is_null() || addrlen == 0 {
+        return;
+    }
+
+    // The send buffer was already placed at entry.data_offset with length
+    // entry.data_len by copy_write_data_to_data_region. Append sockaddr after it.
+    let send_data_end = entry.data_offset as usize + entry.data_len as usize;
+    if send_data_end + addrlen > layout.data_region_size {
+        // Not enough room — skip sockaddr copy (sendto will proceed without it).
+        return;
+    }
+
+    unsafe {
+        let dst = ring_base.add(layout.data_region_offset + send_data_end);
+        core::ptr::copy_nonoverlapping(dest_addr, dst, addrlen);
+    }
+
+    entry.data_len += addrlen as u32;
 }
 
 /// Returns `true` for scatter/gather write-family syscalls (writev, pwritev,
@@ -413,6 +461,10 @@ pub(crate) unsafe fn submit_and_wait(
     // address space into the data region so central can dispatch through
     // the shim (which may handle virtual fds).
     copy_write_data_to_data_region(entry, args, syscall_nr, micro.ring_base, &micro.layout);
+
+    // For sendto, append the destination sockaddr after the send buffer
+    // in the shmem write-data zone so central can pass it to the shim.
+    copy_sendto_sockaddr_to_data_region(entry, args, syscall_nr, micro.ring_base, &micro.layout);
 
     // For scatter/gather write syscalls (writev, pwritev, pwritev2), gather
     // the iovec buffers into a contiguous flat buffer in the data region.

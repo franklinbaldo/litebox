@@ -267,6 +267,64 @@ pub unsafe fn execute_locally(
                 cq.result
             }
         }
+        nr if nr == libc::SYS_recvfrom as u32 => {
+            if cq.flags & cq_flags::HAS_DATA != 0 {
+                // Central dispatched recvfrom through the shim and placed
+                // results in the shmem data region.
+                //
+                // Layout (when src_addr was requested, data_len > recv_len):
+                //   [0..recv_len):          received data
+                //   [capped..capped+128):   sockaddr
+                //   [capped+128..capped+132): addrlen as u32
+                // where capped = data_len - 132.
+                //
+                // Layout (no src_addr): data_len == recv_len, just data bytes.
+                let recv_len = cq.result as usize;
+                let data_len = cq.data_len as usize;
+                let data_region_base = unsafe {
+                    ring_base
+                        .add(layout.data_region_offset)
+                        .add(cq.data_offset as usize)
+                };
+
+                // Copy received data to guest buffer.
+                let guest_buf = args[1] as *mut u8;
+                if !ring_base.is_null() && recv_len > 0 {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(data_region_base, guest_buf, recv_len);
+                    }
+                }
+
+                // Copy sockaddr if present (data_len > recv_len means sockaddr area included).
+                let guest_addr = args[4] as *mut u8;
+                let guest_addrlen = args[5] as *mut u32;
+                if !guest_addr.is_null() && data_len > recv_len && !ring_base.is_null() {
+                    // capped_len = data_len - 132
+                    let capped = data_len - 132;
+                    let addr_src = unsafe { data_region_base.add(capped) };
+                    let addrlen_src = unsafe { data_region_base.add(capped + 128) };
+                    let addrlen = u32::from_ne_bytes(
+                        unsafe { core::slice::from_raw_parts(addrlen_src, 4) }
+                            .try_into()
+                            .unwrap(),
+                    );
+                    if addrlen > 0 && addrlen <= 128 {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(addr_src, guest_addr, addrlen as usize);
+                        }
+                    }
+                    if !guest_addrlen.is_null() {
+                        unsafe {
+                            guest_addrlen.write(addrlen);
+                        }
+                    }
+                }
+
+                cq.result
+            } else {
+                cq.result
+            }
+        }
         nr if nr == libc::SYS_exit_group as u32 => unsafe {
             raw_syscall::syscall1(libc::SYS_exit_group, args[0])
         },

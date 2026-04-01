@@ -742,11 +742,11 @@ impl<FS: ShimFS> ProcessServer<FS> {
     fn needs_local_exec(nr: u32) -> bool {
         matches!(
             i64::from(nr),
-            // Socket I/O: micro handles locally (central can't
-            // dereference guest sockaddr/msghdr pointers).
-            libc::SYS_recvfrom
-                | libc::SYS_sendto
-                | libc::SYS_recvmsg
+            // Socket I/O: recvmsg/sendmsg still run locally (central
+            // can't dereference guest msghdr pointers).
+            // recvfrom/sendto are now routed through central's shim
+            // with shmem buffer marshaling.
+            libc::SYS_recvmsg
                 | libc::SYS_sendmsg
                 // Arch/thread syscalls: must execute in guest context
                 // (set kernel thread-local state in micro's threads).
@@ -804,6 +804,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 | libc::SYS_readv
                 | libc::SYS_preadv
                 | libc::SYS_preadv2
+                | libc::SYS_recvfrom
                 | libc::SYS_fstat
                 | libc::SYS_newfstatat
                 | libc::SYS_stat
@@ -905,6 +906,49 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 } else if cq.result == 0 {
                     cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
                 }
+            }
+            libc::SYS_recvfrom => {
+                // recvfrom(fd, buf, len, flags, src_addr, addrlen)
+                // regs: rdi=fd, rsi=buf, rdx=len, r10=flags, r8=src_addr, r9=addrlen
+                //
+                // Rewrite buf to shmem data region. If src_addr is requested,
+                // place sockaddr and addrlen in shmem after the receive buffer.
+                //
+                // Shmem layout:
+                //   [0..capped):              receive buffer
+                //   [capped..capped+128):     sockaddr (if requested)
+                //   [capped+128..capped+132): addrlen as u32 (if requested)
+                let len = entry.args[2] as usize;
+                // Reserve 256 bytes for sockaddr(128) + addrlen(4) + padding.
+                let capped = len.min(data_region.len().saturating_sub(256));
+
+                regs.rsi = data_ptr;
+                regs.rdx = capped;
+
+                let has_addr = entry.args[4] != 0;
+                if has_addr {
+                    // Redirect src_addr and addrlen pointers into shmem.
+                    regs.r8 = data_ptr + capped;
+                    regs.r9 = data_ptr + capped + 128;
+                    // Initialize addrlen to 128 (max sockaddr size).
+                    let addrlen_slot = &mut data_region[capped + 128..capped + 132];
+                    addrlen_slot.copy_from_slice(&128u32.to_ne_bytes());
+                } else {
+                    regs.r8 = 0;
+                    regs.r9 = 0;
+                }
+
+                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                if cq.result >= 0 {
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
+                    cq.data_offset = 0;
+                    cq.data_len = if has_addr {
+                        (capped + 132) as u32
+                    } else {
+                        cq.result as u32
+                    };
+                }
+                // Negative result: error, pass through directly.
             }
             libc::SYS_fstat => {
                 // fstat(fd, statbuf) — rewrite statbuf (rsi) to data region.
@@ -1221,6 +1265,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 | libc::SYS_writev
                 | libc::SYS_pwritev
                 | libc::SYS_pwritev2
+                | libc::SYS_sendto
         )
     }
 
@@ -1243,11 +1288,13 @@ impl<FS: ShimFS> ProcessServer<FS> {
         let mut cq = Self::base_cq(entry);
 
         // Standard I/O fds (0=stdin, 1=stdout, 2=stderr) must always be
-        // handled locally by micro. The shim maps these to virtual /dev/std*
-        // devices in the in-memory filesystem, but the guest process needs
-        // writes to reach its real OS stdout/stderr (pipes, terminals, etc.).
+        // handled locally by micro for write-family syscalls. The shim maps
+        // these to virtual /dev/std* devices in the in-memory filesystem,
+        // but the guest process needs writes to reach its real OS
+        // stdout/stderr (pipes, terminals, etc.).
+        // sendto is excluded: socket fds are never 0-2.
         let fd = entry.args[0] as i32;
-        if (0..=2).contains(&fd) {
+        if i64::from(nr) != libc::SYS_sendto && (0..=2).contains(&fd) {
             cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
             return cq;
         }
@@ -1307,6 +1354,27 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 }
                 regs.rsi = buf_ptr;
                 regs.rdx = len;
+            }
+            libc::SYS_sendto => {
+                // sendto(fd, buf, len, flags, dest_addr, addrlen)
+                // regs: rdi=fd, rsi=buf, rdx=len, r10=flags, r8=dest_addr, r9=addrlen
+                //
+                // Micro packed the shmem write-data zone as:
+                //   [0..send_len):           send buffer data
+                //   [send_len..send_len+N):  sockaddr (if dest_addr != 0)
+                // where send_len = args[2] (capped) and N = args[5] (addrlen).
+                let send_len = entry.args[2] as usize;
+                let addrlen = entry.args[5] as usize;
+                let actual_send_len = send_len.min(len.saturating_sub(addrlen));
+
+                regs.rsi = buf_ptr;
+                regs.rdx = actual_send_len;
+
+                if entry.args[4] != 0 && addrlen > 0 && actual_send_len + addrlen <= len {
+                    // Rewrite dest_addr to point at sockaddr in local copy.
+                    regs.r8 = buf_ptr + actual_send_len;
+                    // r9 (addrlen) is a value, not a pointer — already correct.
+                }
             }
             _ => {
                 // Unexpected syscall — fall back to local exec.
