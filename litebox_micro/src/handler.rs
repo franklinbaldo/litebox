@@ -503,6 +503,43 @@ pub(crate) unsafe fn notify_central(tls: *mut MicroTls, syscall_nr: u32, args: &
     // No CQ wait — fire and forget.
 }
 
+/// Handle a read-only `prlimit64(0, resource, NULL, old_limit)` entirely in
+/// micro without a ring round-trip.
+///
+/// Returns the same hardcoded virtual rlimit values that central's shim uses.
+/// The `Rlimit64` struct is `{ rlim_cur: u64, rlim_max: u64 }` = 16 bytes.
+fn handle_prlimit64_readonly(resource: u32, old_limit_ptr: *mut u8) -> i64 {
+    // Resource constants from <linux/resource.h>:
+    const RLIMIT_STACK: u32 = 3;
+    const RLIMIT_CORE: u32 = 4;
+    const RLIMIT_NOFILE: u32 = 7;
+    const NUM_RESOURCES: u32 = 16;
+
+    if resource >= NUM_RESOURCES {
+        return -i64::from(libc::EINVAL);
+    }
+
+    // Virtual rlimit values (matching litebox_shim_linux::ResourceLimits::default):
+    // - STACK:  cur = 8 MiB, max = INFINITY
+    // - CORE:   cur = 0,     max = INFINITY
+    // - NOFILE: cur = 1M,    max = 1M
+    // - All others: cur = INFINITY, max = INFINITY
+    let (cur, max): (u64, u64) = match resource {
+        RLIMIT_STACK => (8_388_608, u64::MAX),
+        RLIMIT_CORE => (0, u64::MAX),
+        RLIMIT_NOFILE => (1_048_576, 1_048_576),
+        _ => (u64::MAX, u64::MAX),
+    };
+
+    // Write the Rlimit64 struct to the guest's output buffer.
+    // SAFETY: the guest provided a valid pointer for the old_limit output.
+    unsafe {
+        core::ptr::write_unaligned(old_limit_ptr.cast::<u64>(), cur);
+        core::ptr::write_unaligned(old_limit_ptr.add(8).cast::<u64>(), max);
+    }
+    0 // success
+}
+
 /// Tier 1: Syscalls that execute locally with NO notification to central.
 /// These create no state, or only state that lives in micro's memory
 /// (fork-copies correctly without central needing to know).
@@ -597,6 +634,21 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
             return unsafe { crate::local_exec::execute_micro_local(nr, &args.args) };
         }
         // Pre-execve: fall through to central round-trip.
+    }
+
+    // prlimit64 fast-path: read-only queries (pid == 0 or self, new_limit == NULL)
+    // are handled entirely in micro using the same hardcoded virtual rlimit
+    // values that central's shim returns.  This eliminates one ring round-trip
+    // per exec (ld-linux queries RLIMIT_STACK on every startup).
+    #[allow(clippy::cast_possible_truncation)]
+    if nr == libc::SYS_prlimit64 as u32 {
+        let pid = args.args[0];
+        let new_limit = args.args[2];
+        let old_limit = args.args[3];
+        if (pid == 0) && new_limit == 0 && old_limit != 0 {
+            return handle_prlimit64_readonly(args.args[1] as u32, old_limit as *mut u8);
+        }
+        // Write case or pid != 0: fall through to central round-trip.
     }
 
     // Shmem pipe fast-path: read/write on pipe fds bypass central entirely.
