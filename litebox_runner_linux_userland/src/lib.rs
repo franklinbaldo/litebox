@@ -973,6 +973,10 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
     };
     litebox_platform_multiplex::set_platform(platform);
 
+    // Forward runner CLI flags so nested worker-exec spawns (e.g. gcc-13
+    // invoking collect2, both non-PIE) have 9P/network access.
+    register_worker_spawn_flags(platform, &cli_args);
+
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     let litebox = shim_builder.litebox();
     let transferred_exec_image = if let Some(fd) = cli_args.worker_exec_fd {
