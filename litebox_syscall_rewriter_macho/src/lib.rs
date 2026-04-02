@@ -96,20 +96,146 @@ fn parse_text_sections(data: &[u8]) -> Result<Vec<arm64::TextSectionInfo>> {
     Ok(sections)
 }
 
+/// Find the highest virtual address + size across all segments.
+#[allow(clippy::cast_possible_truncation)]
+fn find_max_segment_end(data: &[u8]) -> Result<u64> {
+    let header = macho::MachHeader64::<Endianness>::parse(data, 0)
+        .map_err(|e| Error::ParseError(format!("{e}")))?;
+    let endian = header
+        .endian()
+        .map_err(|e| Error::ParseError(format!("{e}")))?;
+    let mut max_end: u64 = 0;
+    let mut commands = header
+        .load_commands(endian, data, 0)
+        .map_err(|e| Error::ParseError(format!("{e}")))?;
+    while let Some(cmd) = commands
+        .next()
+        .map_err(|e| Error::ParseError(format!("{e}")))?
+    {
+        if let Some((seg, _)) = cmd
+            .segment_64()
+            .map_err(|e| Error::ParseError(format!("{e}")))?
+        {
+            let end = seg.vmaddr(endian) + seg.vmsize(endian);
+            if end > max_end {
+                max_end = end;
+            }
+        }
+    }
+    Ok(max_end)
+}
+
+/// Size of a segment_command_64 structure.
+const SEGMENT_COMMAND_64_SIZE: usize = 72;
+
+#[allow(clippy::cast_possible_truncation)]
+fn insert_load_command_and_trampoline(
+    buf: &mut Vec<u8>,
+    trampoline_data: &[u8],
+    trampoline_vaddr: u64,
+) -> Result<()> {
+    let header = macho::MachHeader64::<Endianness>::parse(buf.as_slice(), 0)
+        .map_err(|e| Error::ParseError(format!("{e}")))?;
+    let endian = header
+        .endian()
+        .map_err(|e| Error::ParseError(format!("{e}")))?;
+
+    let header_size = core::mem::size_of::<macho::MachHeader64<Endianness>>();
+    let existing_cmds_size = header.sizeofcmds(endian) as usize;
+    let cmds_end = header_size + existing_cmds_size;
+
+    // Find earliest section/segment file offset to know how much header space is free
+    let mut earliest_data_offset = buf.len();
+    let mut commands = header
+        .load_commands(endian, buf.as_slice(), 0)
+        .map_err(|e| Error::ParseError(format!("{e}")))?;
+    while let Some(cmd) = commands
+        .next()
+        .map_err(|e| Error::ParseError(format!("{e}")))?
+    {
+        if let Some((seg, _)) = cmd
+            .segment_64()
+            .map_err(|e| Error::ParseError(format!("{e}")))?
+        {
+            let off = seg.fileoff(endian) as usize;
+            let sz = seg.filesize(endian) as usize;
+            if sz > 0 && off < earliest_data_offset {
+                earliest_data_offset = off;
+            }
+        }
+    }
+
+    let available = earliest_data_offset.saturating_sub(cmds_end);
+    if available < SEGMENT_COMMAND_64_SIZE {
+        return Err(Error::InsufficientHeaderSpace);
+    }
+
+    // Append trampoline data at end of file, page-aligned
+    let trampoline_file_offset = (buf.len() + 0xFFF) & !0xFFF;
+    buf.resize(trampoline_file_offset, 0); // pad to page boundary
+    buf.extend_from_slice(trampoline_data);
+    let trampoline_file_size = trampoline_data.len();
+    // Round vm size up to 16KB page
+    let trampoline_vm_size = (trampoline_file_size + 0x3FFF) & !0x3FFF;
+
+    // Build LC_SEGMENT_64 command bytes
+    let mut seg_cmd = [0u8; SEGMENT_COMMAND_64_SIZE];
+    // cmd = LC_SEGMENT_64
+    seg_cmd[0..4].copy_from_slice(&macho::LC_SEGMENT_64.to_le_bytes());
+    // cmdsize
+    seg_cmd[4..8].copy_from_slice(&(SEGMENT_COMMAND_64_SIZE as u32).to_le_bytes());
+    // segname = "__LITEBOX\0..."
+    seg_cmd[8..24].copy_from_slice(b"__LITEBOX\0\0\0\0\0\0\0");
+    // vmaddr
+    seg_cmd[24..32].copy_from_slice(&trampoline_vaddr.to_le_bytes());
+    // vmsize
+    seg_cmd[32..40].copy_from_slice(&(trampoline_vm_size as u64).to_le_bytes());
+    // fileoff
+    seg_cmd[40..48].copy_from_slice(&(trampoline_file_offset as u64).to_le_bytes());
+    // filesize
+    seg_cmd[48..56].copy_from_slice(&(trampoline_file_size as u64).to_le_bytes());
+    // maxprot = VM_PROT_READ | VM_PROT_EXECUTE (5)
+    seg_cmd[56..60].copy_from_slice(&5u32.to_le_bytes());
+    // initprot = VM_PROT_READ | VM_PROT_EXECUTE (5)
+    seg_cmd[60..64].copy_from_slice(&5u32.to_le_bytes());
+    // nsects = 0
+    seg_cmd[64..68].copy_from_slice(&0u32.to_le_bytes());
+    // flags = 0
+    seg_cmd[68..72].copy_from_slice(&0u32.to_le_bytes());
+
+    // Insert the load command at cmds_end
+    buf[cmds_end..cmds_end + SEGMENT_COMMAND_64_SIZE].copy_from_slice(&seg_cmd);
+
+    // Update header: ncmds += 1, sizeofcmds += 72
+    let ncmds_offset = 16; // offset of ncmds in MachHeader64
+    let sizeofcmds_offset = 20;
+    let old_ncmds = u32::from_le_bytes(buf[ncmds_offset..ncmds_offset + 4].try_into().unwrap());
+    let old_sizeofcmds = u32::from_le_bytes(
+        buf[sizeofcmds_offset..sizeofcmds_offset + 4]
+            .try_into()
+            .unwrap(),
+    );
+    buf[ncmds_offset..ncmds_offset + 4].copy_from_slice(&(old_ncmds + 1).to_le_bytes());
+    buf[sizeofcmds_offset..sizeofcmds_offset + 4]
+        .copy_from_slice(&(old_sizeofcmds + SEGMENT_COMMAND_64_SIZE as u32).to_le_bytes());
+
+    Ok(())
+}
+
 /// Rewrite a Mach-O binary to hook `svc #0x80` instructions.
 ///
 /// Returns the rewritten binary bytes.
 pub fn hook_syscalls_in_macho(input_binary: &[u8]) -> Result<Vec<u8>> {
     let text_sections = parse_text_sections(input_binary)?;
-    let buf = input_binary.to_vec();
-    let sites = arm64::find_patch_sites(&text_sections, &buf)?;
+    let mut buf = input_binary.to_vec();
 
-    if sites.is_empty() {
-        return Err(Error::NoSvcInstructionsFound);
-    }
+    // Compute trampoline vaddr: page-aligned address past all segments
+    let max_vaddr = find_max_segment_end(input_binary)?;
+    let trampoline_vaddr = (max_vaddr + 0x3FFF) & !0x3FFF; // 16KB page align
 
-    // TODO: Task 5 will add trampoline emission and patching here.
-    let _ = sites;
+    let trampoline_data = arm64::hook_syscalls_aarch64(&mut buf, &text_sections, trampoline_vaddr)?;
 
-    todo!("trampoline emission not yet implemented")
+    insert_load_command_and_trampoline(&mut buf, &trampoline_data, trampoline_vaddr)?;
+
+    Ok(buf)
 }
