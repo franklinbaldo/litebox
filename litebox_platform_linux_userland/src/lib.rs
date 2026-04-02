@@ -537,6 +537,8 @@ core::arch::global_asm!(
     "
     .section .tbss
     .align 8
+saved_r11:
+    .quad 0
 scratch:
     .quad 0
 host_sp:
@@ -651,6 +653,10 @@ syscall_callback:
     // expectations of `interrupt_signal_handler`.
     mov      BYTE PTR gs:in_guest@tpoff, 0
 
+    // Save guest R11 (syscall call-site address from rewriter trampoline)
+    // before it is clobbered by the fsbase/gsbase save sequence below.
+    mov      gs:saved_r11@tpoff, r11
+
     // Restore host fs base.
     rdfsbase r11
     mov      gs:guest_fsbase@tpoff, r11
@@ -660,6 +666,25 @@ syscall_callback:
     // Switch to the top of the guest context.
     mov     r11, rsp
     mov     rsp, fs:guest_context_top@tpoff
+    jmp .Lsyscall_save_regs
+
+    .globl syscall_callback_redzone
+syscall_callback_redzone:
+    // Same as syscall_callback, but the trampoline has already reserved
+    // 128 bytes below RSP to protect the SysV red zone.
+    mov      BYTE PTR gs:in_guest@tpoff, 0
+    mov      gs:saved_r11@tpoff, r11
+    rdfsbase r11
+    mov      gs:guest_fsbase@tpoff, r11
+    rdgsbase r11
+    wrfsbase r11
+
+    // The trampoline lowered RSP by 128 bytes with LEA, so recover the
+    // architectural guest stack pointer before saving pt_regs.
+    lea     r11, [rsp + 128]
+    mov     rsp, fs:guest_context_top@tpoff
+
+.Lsyscall_save_regs:
 
     // TODO: save float and vector registers (xsave or fxsave)
     // Save caller-saved registers
@@ -678,7 +703,7 @@ syscall_callback:
     push    r8          // pt_regs->r8
     push    r9          // pt_regs->r9
     push    r10         // pt_regs->r10
-    push    [rsp + 88]  // pt_regs->r11 = rflags
+    push    QWORD PTR gs:saved_r11@tpoff // pt_regs->r11 (syscall call-site from rewriter)
     push    rbx         // pt_regs->bx
     push    rbp         // pt_regs->bp
     push    r12         // pt_regs->r12
@@ -1967,6 +1992,7 @@ impl litebox::platform::StdioProvider for LinuxUserland {
 unsafe extern "C" {
     // Defined in asm blocks above
     fn syscall_callback() -> isize;
+    fn syscall_callback_redzone() -> isize;
     fn exception_callback();
     fn interrupt_callback();
     fn switch_to_guest_start();
@@ -2047,7 +2073,7 @@ impl ThreadContext<'_> {
 
 impl litebox::platform::SystemInfoProvider for LinuxUserland {
     fn get_syscall_entry_point(&self) -> usize {
-        syscall_callback as *const () as usize
+        syscall_callback_redzone as *const () as usize
     }
 
     fn get_vdso_address(&self) -> Option<usize> {
@@ -2714,7 +2740,9 @@ unsafe fn interrupt_signal_handler(
     // FUTURE: handle trampoline code, too. This is somewhat less important
     // because it's probably fine for the shim to observe a guest context that
     // is inside the trampoline.
-    if ip == syscall_callback as *const () as usize {
+    if ip == syscall_callback as *const () as usize
+        || ip == syscall_callback_redzone as *const () as usize
+    {
         // No need to clear `in_guest` or set interrupt; the syscall handler will
         // clear `in_guest` and call into the shim.
         return;
