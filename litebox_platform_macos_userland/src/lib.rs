@@ -1283,6 +1283,7 @@ unsafe extern "C" fn switch_to_guest(
         //
         // x1 = TCB pointer (function arg, survives preemption).
         // Stash layout below guest SP:
+        //   [SP - 32] = guest_pstate
         //   [SP - 24] = guest_x0
         //   [SP - 16] = guest_x1
         //   [SP - 8]  = guest_PC
@@ -1293,6 +1294,8 @@ unsafe extern "C" fn switch_to_guest(
         "str x16, [x17, #-16]", // guest_SP[-16] = guest_x1
         "ldr x16, [x0, #256]",  // x16 = guest PC
         "str x16, [x17, #-8]",  // guest_SP[-8] = guest PC
+        "ldr x16, [x0, #264]",  // x16 = guest pstate
+        "str x16, [x17, #-32]", // guest_SP[-32] = guest pstate
         // Restore guest x2-x17 from PtRegs (x0 still holds ctx pointer).
         "ldp x2,  x3,  [x0, #16]",
         "ldp x4,  x5,  [x0, #32]",
@@ -1319,6 +1322,8 @@ unsafe extern "C" fn switch_to_guest(
         // Use x16 as scratch (it will hold guest_PC for the final BR).
         "ldur x16, [sp, #-8]",  // x16 = guest PC
         "ldur x1,  [sp, #-16]", // x1 = guest x1 (from stash)
+        "ldur x0,  [sp, #-32]", // x0 = guest pstate (temp)
+        "msr NZCV, x0",         // restore condition flags
         "ldur x0,  [sp, #-24]", // x0 = guest x0 (from stash)
         "br x16",               // jump to guest
         // Local trampoline for cbnz — macOS assembler rejects conditional
