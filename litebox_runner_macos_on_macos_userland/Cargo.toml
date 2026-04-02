@@ -1,0 +1,20 @@
+[package]
+name = "litebox_runner_macos_on_macos_userland"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.97"
+clap = { version = "4.5.33", features = ["derive"] }
+libc = { version = "0.2.169", default-features = false }
+litebox = { version = "0.1.0", path = "../litebox" }
+litebox_common_macos = { version = "0.1.0", path = "../litebox_common_macos" }
+litebox_common_linux = { version = "0.1.0", path = "../litebox_common_linux" }
+litebox_platform_macos_userland = { version = "0.1.0", path = "../litebox_platform_macos_userland" }
+litebox_platform_multiplex = { version = "0.1.0", path = "../litebox_platform_multiplex", default-features = false, features = ["platform_macos_userland"] }
+litebox_shim_macos = { version = "0.1.0", path = "../litebox_shim_macos" }
+litebox_syscall_rewriter_macho = { version = "0.1.0", path = "../litebox_syscall_rewriter_macho" }
+memmap2 = "0.9.8"
+
+[lints]
+workspace = true

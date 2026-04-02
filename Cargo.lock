@@ -1567,6 +1567,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_common_macos"
+version = "0.1.0"
+dependencies = [
+ "litebox",
+ "litebox_common_linux",
+]
+
+[[package]]
 name = "litebox_common_optee"
 version = "0.1.0"
 dependencies = [
@@ -1762,6 +1770,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_runner_macos_on_macos_userland"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "litebox",
+ "litebox_common_linux",
+ "litebox_common_macos",
+ "litebox_platform_macos_userland",
+ "litebox_platform_multiplex",
+ "litebox_shim_macos",
+ "litebox_syscall_rewriter_macho",
+ "memmap2",
+]
+
+[[package]]
 name = "litebox_runner_optee_on_linux_userland"
 version = "0.1.0"
 dependencies = [
@@ -1814,6 +1839,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_shim_macos"
+version = "0.1.0"
+dependencies = [
+ "litebox",
+ "litebox_common_linux",
+ "litebox_common_macos",
+ "litebox_platform_multiplex",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "litebox_shim_optee"
 version = "0.1.0"
 dependencies = [
@@ -1848,6 +1884,16 @@ dependencies = [
  "thiserror 2.0.17",
  "yaxpeax-arch",
  "yaxpeax-arm",
+ "zerocopy",
+]
+
+[[package]]
+name = "litebox_syscall_rewriter_macho"
+version = "0.1.0"
+dependencies = [
+ "object",
+ "tempfile",
+ "thiserror 2.0.17",
  "zerocopy",
 ]
 
