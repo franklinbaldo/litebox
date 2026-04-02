@@ -159,14 +159,11 @@ impl<FS: ShimFS> Clone for MacosShim<FS> {
 impl<FS: ShimFS> MacosShim<FS> {
     /// Loads a program as the shim's initial task, returning the initial
     /// register state and process handle.
-    ///
-    /// # Stub
-    /// Task 7 will fill in the actual loader. For now this is a placeholder.
     pub fn load_program(
         &self,
-        _program_bytes: &[u8],
-        _argv: Vec<alloc::ffi::CString>,
-        _envp: Vec<alloc::ffi::CString>,
+        program_bytes: &[u8],
+        argv: Vec<alloc::ffi::CString>,
+        envp: Vec<alloc::ffi::CString>,
     ) -> Result<LoadedProgram<FS>, loader::MachoLoaderError> {
         let exit_code = Arc::new(AtomicI32::new(0));
 
@@ -181,7 +178,31 @@ impl<FS: ShimFS> MacosShim<FS> {
             _not_send: core::marker::PhantomData,
         };
 
-        let initial_ctx = PtRegs::default();
+        let arg_count = argv.len();
+        let env_count = envp.len();
+        let load_info = loader::load_macho(&entrypoints.task, program_bytes, argv, envp)?;
+
+        let mut initial_ctx = PtRegs {
+            pc: load_info.entry_point,
+            sp: load_info.user_stack_top,
+            ..PtRegs::default()
+        };
+
+        if load_info.is_lc_main {
+            // LC_MAIN: entry is called as a C function:
+            //   main(argc, argv, envp, apple)
+            // The stack has: [argc, argv[0..n], NULL, envp[0..m], NULL, apple[0..], NULL]
+            // We pass argc in x0, argv pointer in x1, envp pointer in x2, apple in x3.
+            let sp = load_info.user_stack_top;
+            initial_ctx.regs[0] = arg_count; // x0 = argc
+            initial_ctx.regs[1] = sp + size_of::<usize>(); // x1 = &argv[0]
+                                                           // x2 = envp: skip past argc + argv pointers + NULL terminator
+            let envp_offset = size_of::<usize>() + (arg_count + 1) * size_of::<usize>();
+            initial_ctx.regs[2] = sp + envp_offset; // x2 = &envp[0]
+                                                    // x3 = apple: skip past envp pointers + NULL terminator
+            let apple_offset = envp_offset + (env_count + 1) * size_of::<usize>();
+            initial_ctx.regs[3] = sp + apple_offset; // x3 = &apple[0]
+        }
 
         Ok(LoadedProgram {
             entrypoints,
@@ -314,8 +335,8 @@ impl<FS: ShimFS> MacosShimEntrypoints<FS> {
 
 /// Global shim state, shared across all tasks.
 struct GlobalState<FS: ShimFS> {
-    /// The platform instance (used by the loader and diagnostics).
-    #[expect(dead_code, reason = "will be used by the Mach-O loader in Task 7")]
+    /// The platform instance (used for diagnostics and time queries).
+    #[expect(dead_code, reason = "will be used for clock_gettime and diagnostics")]
     platform: &'static Platform,
     /// The LiteBox instance.
     litebox: LiteBox<Platform>,

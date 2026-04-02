@@ -1846,6 +1846,7 @@ dependencies = [
  "litebox_common_linux",
  "litebox_common_macos",
  "litebox_platform_multiplex",
+ "object",
  "thiserror 2.0.17",
 ]
 
