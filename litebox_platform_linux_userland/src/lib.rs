@@ -2220,10 +2220,10 @@ unsafe fn interrupt_signal_handler(
     // FUTURE: handle trampoline code, too. This is somewhat less important
     // because it's probably fine for the shim to observe a guest context that
     // is inside the trampoline.
+    #[cfg(target_arch = "x86")]
     let is_at_syscall_callback = ip == syscall_callback as *const () as usize;
     #[cfg(target_arch = "x86_64")]
-    let is_at_syscall_callback =
-        is_at_syscall_callback || ip == syscall_callback_redzone as *const () as usize;
+    let is_at_syscall_callback = ip == syscall_callback_redzone as *const () as usize;
     if is_at_syscall_callback {
         // No need to clear `in_guest` or set interrupt; the syscall handler will
         // clear `in_guest` and call into the shim.
