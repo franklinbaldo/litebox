@@ -1390,11 +1390,15 @@ impl<FS: ShimFS> Task<FS> {
             }
             IoctlArg::TCSETS(_) => Ok(0), // TODO: implement
             IoctlArg::TIOCGWINSZ(ws) => {
+                // Return a standard terminal size. A real implementation would
+                // query the host terminal dimensions via the platform, but
+                // 80x24 is the safe default that matches the traditional VT100
+                // size and prevents line-wrapping issues with small values.
                 ws.write_at_offset(
                     0,
                     litebox_common_linux::Winsize {
-                        row: 20,
-                        col: 20,
+                        row: 24,
+                        col: 80,
                         xpixel: 0,
                         ypixel: 0,
                     },
