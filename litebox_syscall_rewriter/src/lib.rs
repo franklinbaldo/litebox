@@ -199,6 +199,7 @@ pub fn hook_syscalls_in_elf(
     }
     // Patch syscalls in-place in buf
     let mut skipped_addrs = Vec::new();
+    let mut syscall_insns_found = false;
     for s in &text_sections {
         let section_data = section_slice_mut(buf, s)?;
         match hook_syscalls_in_section(
@@ -211,9 +212,59 @@ pub fn hook_syscalls_in_elf(
             dl_sysinfo_int80,
             &mut trampoline_data,
         ) {
-            Ok(addrs) => skipped_addrs.extend(addrs),
+            Ok(addrs) => {
+                skipped_addrs.extend(addrs);
+                syscall_insns_found = true;
+            }
             Err(Error::NoSyscallInstructionsFound) => {}
             Err(e) => return Err(e),
+        }
+    }
+
+    if !syscall_insns_found {
+        // No syscall instructions found. Append a header-only marker so the
+        // loader can distinguish "checked by rewriter, nothing to patch" from
+        // "never processed." The trampoline_size=0 sentinel tells the loader
+        // to skip trampoline mapping entirely.
+        // Use the original input (not `buf`) to avoid emitting the phdr
+        // alignment fixup that was only needed for the `object` crate parser.
+        let mut out = input_binary.to_vec();
+        if arch == Arch::X86_64 {
+            let header = TrampolineHeader64 {
+                magic: *TRAMPOLINE_MAGIC,
+                file_offset: 0,
+                vaddr: 0,
+                trampoline_size: 0,
+            };
+            out.extend_from_slice(header.as_bytes());
+        } else {
+            let header = TrampolineHeader32 {
+                magic: *TRAMPOLINE_MAGIC,
+                file_offset: 0,
+                vaddr: 0,
+                trampoline_size: 0,
+            };
+            out.extend_from_slice(header.as_bytes());
+        }
+        return Ok(out);
+    }
+
+    // Patch fork → vfork: overwrite the first bytes of __libc_fork with a
+    // JMP to __libc_vfork. This prevents glibc's fork wrapper from running
+    // post-fork handlers that corrupt shared state under vfork semantics.
+    if let Some((fork_file_offset, fork_patch_end, rel32)) = fork_to_vfork_patch {
+        #[allow(clippy::cast_possible_truncation)]
+        let off = fork_file_offset as usize;
+        #[allow(clippy::cast_possible_truncation)]
+        let patch_end = fork_patch_end as usize;
+        if off + 5 <= buf.len() && patch_end <= buf.len() && off + 5 <= patch_end {
+            buf[off] = 0xE9; // JMP rel32
+            buf[off + 1..off + 5].copy_from_slice(&rel32.to_le_bytes());
+        } else {
+            return Err(Error::ParseError(format!(
+                "fork→vfork patch range {off:#x}..{patch_end:#x} is invalid for buffer length {}",
+                buf.len(),
+            )));
         }
     }
 
@@ -434,22 +485,94 @@ fn hook_syscalls_in_section(
         let replace_start = replace_start.unwrap();
         let replace_len = usize::try_from(replace_end - replace_start).unwrap();
 
+        let copied_presyscall_insts_have_ip_rel_mem = arch == Arch::X86_64
+            && instruction_slice_has_ip_rel_memory_operand(
+                instructions
+                    .iter()
+                    .take(i)
+                    .skip_while(|prev_inst| prev_inst.ip() < replace_start),
+            );
+
         let target_addr = checked_add_u64(
             trampoline_base_addr,
             trampoline_data.len() as u64,
             "syscall trampoline target",
         )?;
 
-        // Copy the original instructions to the trampoline
+        // Copy the pre-syscall instructions to the trampoline.
+        // When any instruction has a RIP-relative memory operand, we
+        // re-encode them so the displacement targets the same absolute
+        // address from the new trampoline location.
         if replace_start < inst.ip() {
-            trampoline_data.extend_from_slice(
-                &section_data[usize::try_from(replace_start - section_base_addr).unwrap()
-                    ..usize::try_from(inst.ip() - section_base_addr).unwrap()],
-            );
+            if copied_presyscall_insts_have_ip_rel_mem {
+                let mut reencoded = Vec::new();
+                let mut ok = true;
+                let mut encoder = iced_x86::Encoder::new(64);
+                for pre_inst in instructions
+                    .iter()
+                    .take(i)
+                    .skip_while(|p| p.ip() < replace_start)
+                {
+                    let tramp_ip = target_addr + reencoded.len() as u64;
+                    if encoder.encode(pre_inst, tramp_ip).is_err() {
+                        ok = false;
+                        break;
+                    }
+                    let bytes = encoder.take_buffer();
+                    if bytes.len() != pre_inst.len() {
+                        ok = false;
+                        break;
+                    }
+                    reencoded.extend_from_slice(&bytes);
+                }
+                if !ok {
+                    match hook_syscall_and_after(
+                        arch,
+                        control_transfer_targets,
+                        section_base_addr,
+                        section_data,
+                        trampoline_base_addr,
+                        syscall_entry_addr,
+                        trampoline_data,
+                        &instructions,
+                        i,
+                    ) {
+                        Ok(()) => {}
+                        Err(Error::InsufficientBytesBeforeOrAfter(_)) => {
+                            replace_with_ud2(section_data, section_base_addr, inst);
+                            skipped_addrs.push(inst.ip());
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    continue;
+                }
+                trampoline_data.extend_from_slice(&reencoded);
+            } else {
+                trampoline_data.extend_from_slice(
+                    &section_data[usize::try_from(replace_start - section_base_addr).unwrap()
+                        ..usize::try_from(inst.ip() - section_base_addr).unwrap()],
+                );
+            }
         }
 
         let return_addr = inst.next_ip();
         if arch == Arch::X86_64 {
+            // Reserve the SysV red zone before entering the shim so async
+            // guest signal delivery / interrupt handling cannot clobber
+            // stack locals parked below the architectural RSP.
+            // LEA RSP, [RSP - 0x80] = 48 8D 64 24 80
+            trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x64, 0x24, 0x80]);
+
+            // Put the address of the original JMP (call-site) into R11 so
+            // that SA_RESTART can rewind ctx.rip to re-enter the trampoline.
+            // The real `syscall` instruction clobbers R11 with RFLAGS, so
+            // this register is free from the guest's perspective.
+            // LEA R11, [RIP + disp32] = 4C 8D 1D <disp32>
+            let r11_disp = i64::try_from(replace_start).unwrap()
+                - i64::try_from(trampoline_base_addr + trampoline_data.len() as u64 + 7).unwrap();
+            trampoline_data.extend_from_slice(&[0x4C, 0x8D, 0x1D]); // LEA R11, [RIP + disp32]
+            trampoline_data.extend_from_slice(&(i32::try_from(r11_disp).unwrap().to_le_bytes()));
+
             // Put jump back location into rcx.
             let jmp_back_base = checked_add_u64(
                 trampoline_base_addr,
@@ -483,8 +606,8 @@ fn hook_syscalls_in_section(
             trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
             trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
             trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-            // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
-            // We want: EAX + offset = syscall_entry_addr
+                                                              // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
+                                                              // We want: EAX + offset = syscall_entry_addr
             let call_base = checked_add_u64(
                 trampoline_base_addr,
                 trampoline_data.len() as u64 - 3,
@@ -591,8 +714,8 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
         return;
     };
 
-    if old_end > buf.len() || new_end > buf.len() {
-        return; // corrupt phdr table or not enough room
+    if new_end > buf.len() {
+        return; // not enough room
     }
 
     // Only relocate when the overwritten bytes are padding. Otherwise this would corrupt the file
@@ -636,6 +759,94 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
             // The PHDR segment size should match the phdr table; no change needed.
         }
     }
+}
+
+/// Find fork and vfork symbols in the ELF and compute the patch needed to
+/// redirect fork -> vfork. Returns `Some((fork_file_offset, jmp_rel32))` if
+/// both symbols are found, or `None` if this binary doesn't export fork.
+fn find_fork_vfork_patch(
+    file: &object::File<'_>,
+    text_sections: &[TextSectionInfo],
+) -> Option<(u64, u64, i32)> {
+    use object::ObjectSymbol as _;
+
+    let mut fork_vaddr = None;
+    let mut vfork_vaddr = None;
+
+    // Restrict this rewrite to libc-specific symbols. Plain `fork`/`vfork` names may belong to
+    // arbitrary DSOs or user code, and retargeting them would silently change unrelated behavior.
+    for sym in file.dynamic_symbols() {
+        if sym.kind() != object::SymbolKind::Text {
+            continue;
+        }
+        let Ok(name) = sym.name() else { continue };
+        match name {
+            "__libc_fork" if fork_vaddr.is_none() => {
+                fork_vaddr = Some(sym.address());
+            }
+            "__libc_vfork" | "__vfork" if vfork_vaddr.is_none() => {
+                vfork_vaddr = Some(sym.address());
+            }
+            _ => {}
+        }
+    }
+
+    for sym in file.symbols() {
+        if sym.kind() != object::SymbolKind::Text {
+            continue;
+        }
+        let Ok(name) = sym.name() else { continue };
+        match name {
+            "__libc_fork" if fork_vaddr.is_none() => {
+                fork_vaddr = Some(sym.address());
+            }
+            "__libc_vfork" | "__vfork" if vfork_vaddr.is_none() => {
+                vfork_vaddr = Some(sym.address());
+            }
+            _ => {}
+        }
+    }
+
+    let fork_vaddr = fork_vaddr?;
+    let vfork_vaddr = vfork_vaddr?;
+    if fork_vaddr == 0 || vfork_vaddr == 0 {
+        return None;
+    }
+
+    // Convert fork's vaddr to a file offset using the text sections.
+    let (fork_file_offset, fork_patch_end) = text_sections.iter().find_map(|s| {
+        let section_end = s.vaddr + s.size;
+        if fork_vaddr >= s.vaddr
+            && fork_vaddr < section_end
+            && fork_vaddr
+                .checked_add(5)
+                .is_some_and(|end| end <= section_end)
+        {
+            let file_offset = s.file_offset + (fork_vaddr - s.vaddr);
+            let file_end = s.file_offset + s.size;
+            Some((file_offset, file_end))
+        } else {
+            None
+        }
+    })?;
+
+    // Compute the relative offset for a JMP rel32 instruction.
+    // JMP rel32 encodes: target = rip_after_jmp + rel32
+    // rip_after_jmp = fork_vaddr + 5 (size of JMP rel32 instruction)
+    let rel32 = i64::try_from(vfork_vaddr)
+        .ok()?
+        .checked_sub(i64::try_from(fork_vaddr).ok()? + 5)?;
+    let rel32 = i32::try_from(rel32).ok()?;
+
+    Some((fork_file_offset, fork_patch_end, rel32))
+}
+
+/// Check if the input binary has the Bun footer marker near the end.
+fn has_bun_footer_marker(input_binary: &[u8]) -> bool {
+    let window_len = input_binary.len().min(256);
+    input_binary[input_binary.len().saturating_sub(window_len)..]
+        .windows(BUN_FOOTER_MARKER.len())
+        .any(|window| window == BUN_FOOTER_MARKER)
 }
 
 /// Replace an unpatchable syscall instruction with `ICEBP; HLT` (`F1 F4`) so
@@ -939,6 +1150,26 @@ fn hook_syscall_and_after(
     }
 
     let replace_end = replace_end.unwrap();
+    let copied_postsyscall_insts_have_ip_rel_mem = arch == Arch::X86_64
+        && instruction_slice_has_ip_rel_memory_operand(
+            instructions
+                .iter()
+                .skip(inst_index + 1)
+                .take_while(|next_inst| next_inst.ip() < replace_end),
+        );
+    if copied_postsyscall_insts_have_ip_rel_mem {
+        return hook_syscall_before_and_after(
+            arch,
+            control_transfer_targets,
+            section_base_addr,
+            section_data,
+            trampoline_base_addr,
+            syscall_entry_addr,
+            trampoline_data,
+            instructions,
+            inst_index,
+        );
+    }
 
     let target_addr = checked_add_u64(
         trampoline_base_addr,
@@ -947,6 +1178,20 @@ fn hook_syscall_and_after(
     )?;
 
     if arch == Arch::X86_64 {
+        // Reserve the SysV red zone before entering the shim so async guest
+        // signal delivery / interrupt handling cannot clobber stack locals
+        // parked below the architectural RSP.
+        // LEA RSP, [RSP - 0x80] = 48 8D 64 24 80
+        trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x64, 0x24, 0x80]);
+
+        // Put the address of the original JMP (call-site) into R11 so
+        // that SA_RESTART can rewind ctx.rip to re-enter the trampoline.
+        // LEA R11, [RIP + disp32] = 4C 8D 1D <disp32>
+        let r11_disp = i64::try_from(replace_start).unwrap()
+            - i64::try_from(trampoline_base_addr + trampoline_data.len() as u64 + 7).unwrap();
+        trampoline_data.extend_from_slice(&[0x4C, 0x8D, 0x1D]); // LEA R11, [RIP + disp32]
+        trampoline_data.extend_from_slice(&(i32::try_from(r11_disp).unwrap().to_le_bytes()));
+
         // Put jump back location into rcx, via lea rcx, [next instruction]
         trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D]); // LEA RCX, [RIP + disp32]
         trampoline_data.extend_from_slice(&6u32.to_le_bytes());
@@ -970,8 +1215,8 @@ fn hook_syscall_and_after(
         trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
         trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
         trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-        // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
-        // We want: EAX + offset = syscall_entry_addr
+                                                          // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
+                                                          // We want: EAX + offset = syscall_entry_addr
         let call_base = checked_add_u64(
             trampoline_base_addr,
             trampoline_data.len() as u64,
@@ -1026,6 +1271,14 @@ fn hook_syscall_and_after(
     }
 
     Ok(())
+}
+
+fn instruction_slice_has_ip_rel_memory_operand<'a>(
+    instructions: impl IntoIterator<Item = &'a iced_x86::Instruction>,
+) -> bool {
+    instructions
+        .into_iter()
+        .any(iced_x86::Instruction::is_ip_rel_memory_operand)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1114,8 +1367,8 @@ fn hook_syscall_before_and_after(
     trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
     trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
     trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-    // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
-    // We want: EAX + offset = syscall_entry_addr
+                                                      // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
+                                                      // We want: EAX + offset = syscall_entry_addr
     let call_base = checked_add_u64(
         trampoline_base_addr,
         trampoline_data.len() as u64,
@@ -1168,4 +1421,95 @@ fn hook_syscall_before_and_after(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{has_bun_footer_marker, patch_code_segment, BUN_FOOTER_MARKER};
+
+    #[test]
+    fn detects_bun_footer_marker_near_end() {
+        let mut bytes = vec![0u8; 512];
+        let offset = bytes.len() - BUN_FOOTER_MARKER.len() - 8;
+        bytes[offset..offset + BUN_FOOTER_MARKER.len()].copy_from_slice(BUN_FOOTER_MARKER);
+        assert!(has_bun_footer_marker(&bytes));
+    }
+
+    #[test]
+    fn ignores_missing_bun_footer_marker() {
+        let bytes = vec![0u8; 512];
+        assert!(!has_bun_footer_marker(&bytes));
+    }
+
+    #[test]
+    fn patch_code_segment_relocates_rip_relative_presyscall_to_trampoline() {
+        let mut code = vec![
+            0x48, 0x8D, 0x35, 0x10, 0x00, 0x00, 0x00, // lea rsi, [rip + 0x10] @ 0x1000
+            0x0F, 0x05, // syscall @ 0x1007
+            0x31, 0xC0, // xor eax, eax
+            0xBA, 0x01, 0x00, 0x00, 0x00, // mov edx, 1
+        ];
+
+        let trampoline = patch_code_segment(&mut code, 0x1000, 0x8000, 0x9000, &mut Vec::new())
+            .expect("patch_code_segment should succeed");
+
+        assert!(!trampoline.is_empty());
+        // The lea + syscall region (9 bytes starting at 0x1000) should now be a
+        // JMP to the trampoline followed by NOPs.
+        assert_eq!(code[0], 0xE9, "replace region should start with JMP rel32");
+        // The trampoline should contain the re-encoded lea with an adjusted
+        // RIP-relative displacement targeting the same absolute address.
+        // Original: lea targets 0x1007 + 0x10 = 0x1017.
+        // Re-encoded at 0x8000: displacement = 0x1017 - (0x8000 + 7) = -0x6FF0 = 0xFFFF9010
+        #[allow(clippy::cast_possible_truncation)]
+        let expected_disp: i32 = 0x1017_i64.wrapping_sub(0x8000 + 7) as i32;
+        assert_eq!(
+            &trampoline[3..7],
+            &expected_disp.to_le_bytes(),
+            "re-encoded lea displacement should target the original address"
+        );
+    }
+
+    #[test]
+    fn patch_code_segment_handles_rip_relative_on_both_sides_of_syscall() {
+        let mut code = vec![
+            0x48, 0x8D, 0x35, 0x10, 0x00, 0x00, 0x00, // lea rsi, [rip + 0x10] @ 0x1000
+            0x0F, 0x05, // syscall @ 0x1007
+            0x48, 0x8D, 0x3D, 0x10, 0x00, 0x00, 0x00, // lea rdi, [rip + 0x10]
+        ];
+
+        let mut skipped = Vec::new();
+        let stubs = patch_code_segment(&mut code, 0x1000, 0x8000, 0x9000, &mut skipped)
+            .expect("patch_code_segment should succeed");
+        // The pre-syscall lea is re-encoded in the trampoline; the
+        // post-syscall lea stays in place (not overwritten).
+        assert!(!stubs.is_empty(), "should be patched via re-encoding");
+        assert_eq!(code[0], 0xE9, "replace region should start with JMP");
+        assert!(skipped.is_empty(), "nothing should be skipped");
+    }
+
+    #[test]
+    fn patch_code_segment_patches_all_syscalls_including_rip_relative() {
+        let mut code = vec![
+            // First syscall: patchable (3 nops before = 5 bytes total with syscall)
+            0x90, 0x90, 0x90, // nop; nop; nop
+            0x0F, 0x05, // syscall @ offset 3
+            0xC3, // ret
+            // Second syscall: RIP-relative before, now patchable via re-encoding
+            0x48, 0x8D, 0x35, 0x10, 0x00, 0x00, 0x00, // lea rsi, [rip+0x10]
+            0x0F, 0x05, // syscall @ offset 13
+            0x48, 0x8D, 0x3D, 0x10, 0x00, 0x00, 0x00, // lea rdi, [rip+0x10]
+        ];
+
+        let mut skipped = Vec::new();
+        let stubs = patch_code_segment(&mut code, 0x1000, 0x8000, 0x9000, &mut skipped).unwrap();
+
+        assert!(!stubs.is_empty(), "both syscalls should be patched");
+        assert_eq!(code[0], 0xE9, "first syscall site should be a JMP");
+        assert_eq!(
+            code[6], 0xE9,
+            "second syscall site (lea start) should be a JMP"
+        );
+        assert!(skipped.is_empty(), "nothing should be skipped");
+    }
 }
