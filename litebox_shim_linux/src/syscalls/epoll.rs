@@ -130,8 +130,11 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
             }
             EpollDescriptor::Epoll(_file) => unimplemented!(),
             EpollDescriptor::File(_file) => {
-                // TODO: probably polling on stdio files, return dummy events for now
-                Some(Events::OUT & mask)
+                // Stdio files (stdin/stdout/stderr) and regular files are
+                // always considered both readable and writable for polling
+                // purposes. This is the same behaviour as the Linux kernel
+                // for regular files and terminals.
+                Some((Events::IN | Events::OUT) & mask)
             }
             EpollDescriptor::Socket(fd) => {
                 let proxy = match global.get_proxy(fd) {
