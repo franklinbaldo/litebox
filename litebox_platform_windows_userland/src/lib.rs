@@ -562,6 +562,22 @@ syscall_callback:
     mov     BYTE PTR [r11 + {IS_IN_GUEST}], 0
     // Set rsp to the top of the guest context.
     mov     QWORD PTR [r11 + {SCRATCH}], rsp
+    jmp     .Lsyscall_callback_common
+
+    .globl  syscall_callback_redzone
+syscall_callback_redzone:
+    // Same as syscall_callback, but the trampoline has already reserved
+    // 128 bytes below RSP to protect the SysV red zone. Recover the
+    // architectural guest stack pointer.
+    mov     r11d, DWORD PTR [rip + {TLS_INDEX}]
+    mov     r11, QWORD PTR gs:[r11 * 8 + TEB_TLS_SLOTS_OFFSET]
+    mov     BYTE PTR [r11 + {IS_IN_GUEST}], 0
+    // Save RSP + 128 to SCRATCH without clobbering any guest registers.
+    // Use SCRATCH as a temporary: store rsp, then add 128 in-place.
+    mov     QWORD PTR [r11 + {SCRATCH}], rsp
+    add     QWORD PTR [r11 + {SCRATCH}], 128
+
+.Lsyscall_callback_common:
     mov     rsp, QWORD PTR [r11 + {GUEST_CONTEXT_TOP}]
 
     // TODO: save float and vector registers (xsave or fxsave)
@@ -1939,6 +1955,7 @@ impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
 unsafe extern "C" {
     // Defined in asm blocks above
     fn syscall_callback() -> isize;
+    fn syscall_callback_redzone() -> isize;
     fn exception_callback() -> isize;
     fn interrupt_callback();
     fn switch_to_guest_start();
@@ -2028,7 +2045,7 @@ impl ThreadContext<'_> {
 
 impl litebox::platform::SystemInfoProvider for WindowsUserland {
     fn get_syscall_entry_point(&self) -> usize {
-        syscall_callback as *const () as usize
+        syscall_callback_redzone as *const () as usize
     }
 
     fn get_vdso_address(&self) -> Option<usize> {
