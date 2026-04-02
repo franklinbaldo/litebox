@@ -14,6 +14,7 @@ extern crate alloc;
 
 /// Run Linux programs with LiteBox on macOS Apple Silicon
 #[derive(Parser, Debug)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct CliArgs {
     /// The program and arguments passed to it (e.g., `python3 --version`)
     #[arg(required = true, trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
@@ -54,6 +55,13 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub program_from_tar: bool,
+    /// Connect to a utun device with this name (e.g., `utun5`)
+    #[arg(
+        long = "tun-device-name",
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
+    pub tun_device_name: Option<String>,
 }
 
 static REQUIRE_RTLD_AUDIT: core::sync::atomic::AtomicBool =
@@ -144,7 +152,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         litebox::fs::tar_ro::EMPTY_TAR_FILE
     };
 
-    let platform = Platform::new(None);
+    let platform = Platform::new(cli_args.tun_device_name.as_deref());
 
     for file in cow_eligible_regions {
         platform.register_cow_region(file.data, file.abs_path);
@@ -265,6 +273,33 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     shim_builder.set_load_filter(fixup_env);
     let shim = shim_builder.build();
 
+    let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let net_worker = if cli_args.tun_device_name.is_some() {
+        let shim = shim.clone();
+        let shutdown_clone = shutdown.clone();
+        let child = std::thread::spawn(move || {
+            const DEFAULT_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(5);
+
+            while !shutdown_clone.load(core::sync::atomic::Ordering::Relaxed) {
+                let timeout = loop {
+                    match shim.perform_network_interaction() {
+                        litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately => {}
+                        litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction{ timeout } => {
+                            break timeout;
+                        }
+                    }
+                };
+                litebox_platform_multiplex::platform()
+                    .wait_on_tun(Some(timeout.unwrap_or(DEFAULT_TIMEOUT)));
+            }
+            // Final flush
+            while shim.perform_network_interaction().call_again_immediately() {}
+        });
+        Some(child)
+    } else {
+        None
+    };
+
     let argv = cli_args
         .program_and_arguments
         .iter()
@@ -300,6 +335,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         );
     }
 
+    if let Some(net_worker) = net_worker {
+        shutdown.store(true, core::sync::atomic::Ordering::Relaxed);
+        net_worker.join().unwrap();
+    }
     std::process::exit(program.process.wait())
 }
 

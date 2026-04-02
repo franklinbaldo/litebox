@@ -104,14 +104,14 @@ use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::time::Duration;
 
 use litebox::fs::OFlags;
-use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::{
     CowAllocationError, FixedAddressBehavior, MemoryRegionPermissions,
 };
+use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer as _};
 use litebox::shim::ContinueOperation;
 use litebox::utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt};
-use litebox_common_linux::{MapFlags, ProtFlags, PunchthroughSyscall, vmap::VmapManager};
+use litebox_common_linux::{vmap::VmapManager, MapFlags, ProtFlags, PunchthroughSyscall};
 
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -650,10 +650,7 @@ impl MacosUserland {
     pub fn new(tun_device_name: Option<&str>) -> &'static Self {
         register_exception_handlers();
 
-        let tun_socket_fd = std::sync::RwLock::new(None);
-        if tun_device_name.is_some() {
-            unimplemented!("macOS TUN (utun) networking not yet implemented");
-        }
+        let tun_socket_fd = std::sync::RwLock::new(tun_device_name.map(Self::open_utun));
 
         let reserved_pages = Self::read_maps();
         let platform = Self {
@@ -663,6 +660,122 @@ impl MacosUserland {
             cow_regions: std::sync::RwLock::new(std::collections::BTreeMap::new()),
         };
         Box::leak(Box::new(platform))
+    }
+
+    /// Open a macOS utun device by name (e.g., `"utun5"`).
+    ///
+    /// Returns an `OwnedFd` for the utun socket, configured in non-blocking mode.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the device name is invalid, the socket cannot be created, or
+    /// the control info / connect calls fail.
+    fn open_utun(name: &str) -> std::os::fd::OwnedFd {
+        use std::os::fd::FromRawFd as _;
+
+        // Constants from <sys/kern_control.h> and <net/if_utun.h>
+        const PF_SYSTEM: i32 = libc::AF_SYSTEM;
+        const SYSPROTO_CONTROL: i32 = 2;
+        const AF_SYS_CONTROL: u16 = 2;
+        const MAX_KCTL_NAME: usize = 96;
+        const UTUN_CONTROL_NAME: &[u8] = b"com.apple.net.utun_control";
+
+        // struct ctl_info { u32 ctl_id; char ctl_name[MAX_KCTL_NAME]; }
+        #[repr(C)]
+        struct CtlInfo {
+            ctl_id: u32,
+            ctl_name: [u8; MAX_KCTL_NAME],
+        }
+
+        // struct sockaddr_ctl
+        #[repr(C)]
+        struct SockaddrCtl {
+            sc_len: u8,
+            sc_family: u8,
+            ss_sysaddr: u16,
+            sc_id: u32,
+            sc_unit: u32,
+            sc_reserved: [u32; 5],
+        }
+
+        // CTLIOCGINFO ioctl number: _IOWR('N', 3, struct ctl_info) using BSD ioctl encoding
+        // BSD: _IOC(IOC_INOUT, 'N', 3, sizeof(ctl_info))
+        //    = 0xC0000000 | ((size & 0x1FFF) << 16) | ('N' << 8) | 3
+        const CTLIOCGINFO: libc::c_ulong = 0xC0000000
+            | ((core::mem::size_of::<CtlInfo>() as libc::c_ulong & 0x1FFF) << 16)
+            | ((b'N' as libc::c_ulong) << 8)
+            | 3;
+
+        // Parse unit number from device name: "utunN" → N
+        let unit_str = name
+            .strip_prefix("utun")
+            .unwrap_or_else(|| panic!("utun device name must start with 'utun', got: {name:?}"));
+        let unit: u32 = unit_str
+            .parse()
+            .unwrap_or_else(|e| panic!("failed to parse utun unit number from {name:?}: {e}"));
+        // macOS uses sc_unit = N + 1 for utunN
+        let sc_unit = unit + 1;
+
+        // Create PF_SYSTEM / SOCK_DGRAM / SYSPROTO_CONTROL socket
+        let fd = unsafe { libc::socket(PF_SYSTEM, libc::SOCK_DGRAM, SYSPROTO_CONTROL) };
+        assert!(
+            fd >= 0,
+            "failed to create PF_SYSTEM socket: {}",
+            std::io::Error::last_os_error()
+        );
+
+        // Look up the control ID for com.apple.net.utun_control
+        let mut info = CtlInfo {
+            ctl_id: 0,
+            ctl_name: [0u8; MAX_KCTL_NAME],
+        };
+        info.ctl_name[..UTUN_CONTROL_NAME.len()].copy_from_slice(UTUN_CONTROL_NAME);
+
+        let ret = unsafe { libc::ioctl(fd, CTLIOCGINFO, &raw mut info) };
+        assert!(
+            ret == 0,
+            "CTLIOCGINFO ioctl failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        // Connect to the utun control with the desired unit number
+        let addr = SockaddrCtl {
+            sc_len: u8::try_from(core::mem::size_of::<SockaddrCtl>()).unwrap(),
+            sc_family: u8::try_from(libc::AF_SYSTEM).unwrap(),
+            ss_sysaddr: AF_SYS_CONTROL,
+            sc_id: info.ctl_id,
+            sc_unit,
+            sc_reserved: [0; 5],
+        };
+        let ret = unsafe {
+            libc::connect(
+                fd,
+                (&raw const addr).cast(),
+                u32::try_from(core::mem::size_of::<SockaddrCtl>()).unwrap(),
+            )
+        };
+        assert!(
+            ret == 0,
+            "failed to connect utun socket: {}",
+            std::io::Error::last_os_error()
+        );
+
+        // Set non-blocking
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(
+            flags >= 0,
+            "fcntl F_GETFL failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let ret = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        assert!(
+            ret == 0,
+            "fcntl F_SETFL O_NONBLOCK failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        // Take ownership of the fd
+        unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
     }
 
     /// Register a CoW-eligible memory region backed by a file.
@@ -1415,20 +1528,50 @@ impl litebox::platform::IPInterfaceProvider for MacosUserland {
         let Some(tun_socket_fd) = tun_fd.as_ref() else {
             unimplemented!("networking without tun is unimplemented")
         };
-        let n = unsafe {
-            libc::write(
-                tun_socket_fd.as_raw_fd(),
-                packet.as_ptr().cast(),
-                packet.len(),
-            )
+        // macOS utun requires a 4-byte address family header before the IP packet.
+        // Detect IP version from the first nibble of the packet.
+        let af: u32 = if !packet.is_empty() && (packet[0] >> 4) == 6 {
+            libc::AF_INET6 as u32
+        } else {
+            libc::AF_INET as u32
         };
+        let header = af.to_be_bytes();
+        let iov = [
+            libc::iovec {
+                iov_base: header.as_ptr() as *mut libc::c_void,
+                iov_len: header.len(),
+            },
+            libc::iovec {
+                iov_base: packet.as_ptr() as *mut libc::c_void,
+                iov_len: packet.len(),
+            },
+        ];
+        let msg = libc::msghdr {
+            msg_name: core::ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: iov.as_ptr().cast_mut(),
+            msg_iovlen: i32::try_from(iov.len()).unwrap(),
+            msg_control: core::ptr::null_mut(),
+            msg_controllen: 0,
+            msg_flags: 0,
+        };
+        let n = unsafe { libc::sendmsg(tun_socket_fd.as_raw_fd(), &raw const msg, 0) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
-            unimplemented!("unexpected error {err}")
+            match err.raw_os_error() {
+                // ENOBUFS / EAGAIN / EWOULDBLOCK: the utun socket's send buffer is full.
+                // Drop the packet — smoltcp will handle retransmission via TCP.
+                #[allow(unreachable_patterns, reason = "EAGAIN == EWOULDBLOCK")]
+                Some(libc::ENOBUFS | libc::EAGAIN | libc::EWOULDBLOCK) => {
+                    return Ok(());
+                }
+                _ => unimplemented!("unexpected error {err}"),
+            }
         }
         let n = usize::try_from(n).unwrap();
-        if n != packet.len() {
-            unimplemented!("unexpected size {n}")
+        let expected = 4 + packet.len();
+        if n != expected {
+            unimplemented!("unexpected size {n}, expected {expected}")
         }
         Ok(())
     }
@@ -1441,13 +1584,22 @@ impl litebox::platform::IPInterfaceProvider for MacosUserland {
         let Some(tun_socket_fd) = tun_fd.as_ref() else {
             unimplemented!("networking without tun is unimplemented")
         };
-        let n = unsafe {
-            libc::read(
-                tun_socket_fd.as_raw_fd(),
-                packet.as_mut_ptr().cast(),
-                packet.len(),
-            )
-        };
+        // Read into a buffer with space for the 4-byte utun address family header.
+        let mut header = [0u8; 4];
+        let mut iov = [
+            libc::iovec {
+                iov_base: header.as_mut_ptr().cast(),
+                iov_len: header.len(),
+            },
+            libc::iovec {
+                iov_base: packet.as_mut_ptr().cast(),
+                iov_len: packet.len(),
+            },
+        ];
+        let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
+        msg.msg_iov = iov.as_mut_ptr();
+        msg.msg_iovlen = i32::try_from(iov.len()).unwrap();
+        let n = unsafe { libc::recvmsg(tun_socket_fd.as_raw_fd(), &raw mut msg, 0) };
         if n < 0 {
             return Err(match std::io::Error::last_os_error().raw_os_error() {
                 #[allow(unreachable_patterns, reason = "EAGAIN == EWOULDBLOCK")]
@@ -1457,7 +1609,13 @@ impl litebox::platform::IPInterfaceProvider for MacosUserland {
                 _ => unimplemented!("unexpected error {}", std::io::Error::last_os_error()),
             });
         }
-        Ok(usize::try_from(n).unwrap())
+        let n = usize::try_from(n).unwrap();
+        // Strip the 4-byte header; return only the IP packet length.
+        if n < 4 {
+            unimplemented!("utun read returned only {n} bytes, expected at least 4")
+        }
+        let ip_len = n - 4;
+        Ok(ip_len)
     }
 }
 
