@@ -1963,6 +1963,7 @@ impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
 
 unsafe extern "C" {
     // Defined in asm blocks above
+    #[allow(dead_code)] // Referenced from inline asm, not directly from Rust
     fn syscall_callback() -> isize;
     fn syscall_callback_redzone() -> isize;
     fn exception_callback() -> isize;
