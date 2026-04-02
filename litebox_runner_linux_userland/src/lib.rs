@@ -89,9 +89,6 @@ pub enum InterceptionBackend {
     Rewriter,
 }
 
-static REQUIRE_RTLD_AUDIT: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
 struct MmappedFile {
     data: &'static [u8],
     abs_path: PathBuf,
@@ -130,14 +127,14 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         )
     }
 
-    // --program-from-tar loads pre-rewritten binaries that depend on litebox_rtld_audit.so,
-    // which is only injected by the rewriter backend.
+    // --program-from-tar loads pre-rewritten binaries that require the rewriter
+    // backend's runtime trampoline setup.
     if cli_args.program_from_tar
         && !matches!(cli_args.interception_backend, InterceptionBackend::Rewriter)
     {
         anyhow::bail!(
             "--program-from-tar requires --interception-backend=rewriter \
-             (the packaged binary is pre-rewritten and needs the audit library)"
+             (the packaged binary is pre-rewritten and needs the rewriter runtime)"
         );
     }
 
@@ -307,34 +304,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             }
         });
 
-        // When using the rewriter backend, automatically include litebox_rtld_audit.so
-        // in the filesystem so tests and users don't need to include it in tar files
+        // When using the rewriter backend, the shim's mmap hook handles
+        // syscall patching at runtime — no audit library needed.
         match cli_args.interception_backend {
-            InterceptionBackend::Rewriter => {
-                #[cfg(not(target_arch = "x86_64"))]
-                eprintln!("WARN: litebox_rtld_audit not currently supported on non-x86_64 arch");
-                #[cfg(target_arch = "x86_64")]
-                in_mem.with_root_privileges(|fs| {
-                    let rwxr_xr_x = Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH;
-                    let _ = fs.mkdir("/lib", rwxr_xr_x);
-                    let fd = fs
-                        .open(
-                            "/lib/litebox_rtld_audit.so",
-                            litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
-                            rwxr_xr_x,
-                        )
-                        .expect("Failed to create /lib/litebox_rtld_audit.so");
-                    fs.initialize_primarily_read_heavy_file(
-                        &fd,
-                        include_bytes!(concat!(env!("OUT_DIR"), "/litebox_rtld_audit.so")).into(),
-                    );
-                    fs.close(&fd)
-                        .expect("Failed to close /lib/litebox_rtld_audit.so");
-                });
-            }
-            InterceptionBackend::Seccomp => {
-                // No need to include rtld_audit.so for seccomp backend
-            }
+            InterceptionBackend::Rewriter | InterceptionBackend::Seccomp => {}
         }
 
         let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
@@ -397,7 +370,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     match cli_args.interception_backend {
         InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),
         InterceptionBackend::Rewriter => {
-            REQUIRE_RTLD_AUDIT.store(true, core::sync::atomic::Ordering::SeqCst);
+            // Runtime patching is handled by the shim's mmap hook — nothing to do here.
         }
     }
 
@@ -479,13 +452,6 @@ fn pin_thread_to_cpu(cpu: usize) {
     }
 }
 
-fn fixup_env(envp: &mut Vec<alloc::ffi::CString>) {
-    // Enable the audit library to load trampoline code for rewritten binaries.
-    if REQUIRE_RTLD_AUDIT.load(core::sync::atomic::Ordering::SeqCst) {
-        let p = c"LD_AUDIT=/lib/litebox_rtld_audit.so";
-        let has_ld_audit = envp.iter().any(|var| var.as_c_str() == p);
-        if !has_ld_audit {
-            envp.push(p.into());
-        }
-    }
+fn fixup_env(_envp: &mut Vec<alloc::ffi::CString>) {
+    // No-op: rtld_audit has been removed; runtime patching is handled by the shim.
 }
