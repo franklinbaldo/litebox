@@ -10,12 +10,12 @@ use litebox::{
     platform::{RawConstPointer as _, SystemInfoProvider as _},
     utils::{ReinterpretSignedExt, TruncateExt},
 };
-use litebox_common_linux::{MapFlags, errno::Errno, loader::ElfParsedFile};
+use litebox_common_linux::{errno::Errno, loader::ElfParsedFile, MapFlags};
 use thiserror::Error;
 
 use crate::{
-    MutPtr,
     loader::auxv::{AuxKey, AuxVec},
+    MutPtr,
 };
 
 use super::stack::UserStack;
@@ -172,7 +172,10 @@ impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
         let file = ElfFile::new(task, path).map_err(ElfLoaderError::OpenError)?;
         let mut parsed = litebox_common_linux::loader::ElfParsedFile::parse(&mut &file)
             .map_err(ElfLoaderError::ParseError)?;
-        parsed.parse_trampoline(&mut &file, task.global.platform.get_syscall_entry_point())?;
+        match parsed.parse_trampoline(&mut &file, task.global.platform.get_syscall_entry_point()) {
+            Ok(()) | Err(litebox_common_linux::loader::ElfParseError::UnpatchedBinary) => {}
+            Err(err) => return Err(ElfLoaderError::ParseError(err)),
+        }
         Ok(Self { file, parsed })
     }
 }
