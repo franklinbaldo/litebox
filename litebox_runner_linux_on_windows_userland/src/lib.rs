@@ -140,11 +140,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 }
 
 fn fixup_env(envp: &mut Vec<alloc::ffi::CString>) {
-    // Always inject LD_AUDIT so the dynamic linker loads the audit library
-    // that sets up trampolines for rewritten binaries.
-    let p = c"LD_AUDIT=/lib/litebox_rtld_audit.so";
-    let has_ld_audit = envp.iter().any(|var| var.as_c_str() == p);
-    if !has_ld_audit {
-        envp.push(p.into());
-    }
+    let _ = envp;
+    // No environment fixups needed — the shim's mmap hook handles
+    // syscall patching at runtime without LD_AUDIT.
 }
