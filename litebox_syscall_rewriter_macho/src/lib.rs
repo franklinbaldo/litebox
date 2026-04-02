@@ -5,7 +5,7 @@
 //!
 //! This crate supports AArch64 Mach-O executables (MH_EXECUTE).
 
-pub mod arm64;
+mod arm64;
 
 use object::macho;
 use object::read::macho::{MachHeader, Segment};
@@ -97,7 +97,6 @@ fn parse_text_sections(data: &[u8]) -> Result<Vec<arm64::TextSectionInfo>> {
 }
 
 /// Find the highest virtual address + size across all segments.
-#[allow(clippy::cast_possible_truncation)]
 fn find_max_segment_end(data: &[u8]) -> Result<u64> {
     let header = macho::MachHeader64::<Endianness>::parse(data, 0)
         .map_err(|e| Error::ParseError(format!("{e}")))?;
@@ -170,8 +169,8 @@ fn insert_load_command_and_trampoline(
         return Err(Error::InsufficientHeaderSpace);
     }
 
-    // Append trampoline data at end of file, page-aligned
-    let trampoline_file_offset = (buf.len() + 0xFFF) & !0xFFF;
+    // Append trampoline data at end of file, 16KB page-aligned
+    let trampoline_file_offset = (buf.len() + 0x3FFF) & !0x3FFF;
     buf.resize(trampoline_file_offset, 0); // pad to page boundary
     buf.extend_from_slice(trampoline_data);
     let trampoline_file_size = trampoline_data.len();
@@ -202,6 +201,14 @@ fn insert_load_command_and_trampoline(
     seg_cmd[64..68].copy_from_slice(&0u32.to_le_bytes());
     // flags = 0
     seg_cmd[68..72].copy_from_slice(&0u32.to_le_bytes());
+
+    // Verify the header space we're about to overwrite is all zeros (unused padding)
+    if buf[cmds_end..cmds_end + SEGMENT_COMMAND_64_SIZE]
+        .iter()
+        .any(|&b| b != 0)
+    {
+        return Err(Error::InsufficientHeaderSpace);
+    }
 
     // Insert the load command at cmds_end
     buf[cmds_end..cmds_end + SEGMENT_COMMAND_64_SIZE].copy_from_slice(&seg_cmd);

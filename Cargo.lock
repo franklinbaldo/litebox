@@ -1894,7 +1894,6 @@ dependencies = [
  "object",
  "tempfile",
  "thiserror 2.0.17",
- "zerocopy",
 ]
 
 [[package]]
