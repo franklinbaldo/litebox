@@ -361,7 +361,7 @@ fn test_testcase_dynamic_with_rewriter() {
         ("libc.so.6", "/lib/x86_64-linux-gnu"),
         ("ld-linux-x86-64.so.2", "/lib64"),
     ];
-    let libs_without_rewrite = [("litebox_rtld_audit.so", "/lib")];
+    let libs_without_rewrite: [(&str, &str); 0] = [];
 
     // Run
     run_dynamic_linked_prog_with_rewriter(
