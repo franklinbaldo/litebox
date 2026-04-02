@@ -646,3 +646,90 @@ crate::fd::enable_fds_for_subsystem! {
     Descriptor;
     -> FileFd<Platform>;
 }
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+    use super::*;
+
+    #[test]
+    fn test_tar_index_finds_usr_lib_files() {
+        let tar_path = std::path::Path::new("/workspace/litebox-mu/nginx_alpine_fixed_patched.tar");
+        if !tar_path.exists() {
+            std::eprintln!("Skipping test: nginx tar not found at {tar_path:?}");
+            return;
+        }
+        let tar_data = std::fs::read(tar_path).expect("read tar");
+
+        // First, count how many entries the raw tar_no_std iterator returns
+        let archive = tar_no_std::TarArchiveRef::new(&tar_data).expect("invalid tar");
+        let mut count = 0;
+        let mut last_name = std::string::String::new();
+        for entry in archive.entries() {
+            let filename = entry.filename();
+            let name_str = filename.as_str().unwrap_or("<invalid>");
+            last_name = String::from(name_str);
+            count += 1;
+        }
+        std::eprintln!(
+            "tar_no_std iterator returned {} entries, last: {}",
+            count,
+            last_name
+        );
+
+        let index = TarIndex::new(alloc::borrow::Cow::Owned(tar_data));
+
+        std::eprintln!("Total files indexed: {}", index.files_by_path.len());
+        std::eprintln!("Total dirs indexed: {}", index.dirs_by_path.len());
+
+        // Check key library files
+        let libs = [
+            "usr/lib/libpcre2-8.so.0",
+            "usr/lib/libssl.so.3",
+            "usr/lib/libcrypto.so.3",
+            "usr/lib/libz.so.1",
+        ];
+        for lib in &libs {
+            match index.file_by_path(lib) {
+                Some((idx, file)) => {
+                    std::eprintln!(
+                        "FOUND: {} (idx={}, size={})",
+                        lib,
+                        idx,
+                        file.data_range.len()
+                    );
+                }
+                None => {
+                    std::eprintln!("MISSING: {}", lib);
+                }
+            }
+        }
+
+        // Also check directories
+        let dirs = ["usr", "usr/lib", "lib", "bin", "etc"];
+        for dir in &dirs {
+            match index.dir_by_path(dir) {
+                Some((idx, d)) => {
+                    std::eprintln!("DIR: {} (idx={}, children={})", dir, idx, d.children.len());
+                }
+                None => {
+                    std::eprintln!("DIR MISSING: {}", dir);
+                }
+            }
+        }
+
+        // Assert the critical ones exist
+        assert!(
+            index.file_by_path("usr/lib/libpcre2-8.so.0").is_some(),
+            "libpcre2-8.so.0 should be in tar index"
+        );
+        assert!(
+            index.file_by_path("usr/lib/libssl.so.3").is_some(),
+            "libssl.so.3 should be in tar index"
+        );
+        assert!(
+            index.dir_by_path("usr/lib").is_some(),
+            "usr/lib directory should exist"
+        );
+    }
+}

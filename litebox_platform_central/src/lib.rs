@@ -112,14 +112,28 @@ impl CentralPlatform {
             eprintln!("  iptables MASQUERADE for 10.0.0.0/24");
             let check = std::process::Command::new("iptables")
                 .args([
-                    "-t", "nat", "-C", "POSTROUTING", "-s", "10.0.0.0/24", "-j", "MASQUERADE",
+                    "-t",
+                    "nat",
+                    "-C",
+                    "POSTROUTING",
+                    "-s",
+                    "10.0.0.0/24",
+                    "-j",
+                    "MASQUERADE",
                 ])
                 .output()
                 .expect("failed to run `iptables -C`");
             if !check.status.success() {
                 let status = std::process::Command::new("iptables")
                     .args([
-                        "-t", "nat", "-A", "POSTROUTING", "-s", "10.0.0.0/24", "-j", "MASQUERADE",
+                        "-t",
+                        "nat",
+                        "-A",
+                        "POSTROUTING",
+                        "-s",
+                        "10.0.0.0/24",
+                        "-j",
+                        "MASQUERADE",
                     ])
                     .status()
                     .expect("failed to run `iptables -A`");
@@ -151,9 +165,7 @@ impl CentralPlatform {
             events: libc::POLLIN,
             revents: 0,
         };
-        let timeout_ms = timeout.map_or(-1, |t| {
-            i32::try_from(t.as_millis()).unwrap_or(i32::MAX)
-        });
+        let timeout_ms = timeout.map_or(-1, |t| i32::try_from(t.as_millis()).unwrap_or(i32::MAX));
         unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
     }
 }
@@ -174,8 +186,7 @@ impl litebox::platform::IPInterfaceProvider for CentralPlatform {
         let fd = guard
             .as_ref()
             .expect("networking not enabled (no TUN device)");
-        let ret =
-            unsafe { libc::write(fd.as_raw_fd(), packet.as_ptr().cast(), packet.len()) };
+        let ret = unsafe { libc::write(fd.as_raw_fd(), packet.as_ptr().cast(), packet.len()) };
         assert!(
             ret >= 0,
             "TUN write failed: {}",
@@ -192,8 +203,7 @@ impl litebox::platform::IPInterfaceProvider for CentralPlatform {
         let fd = guard
             .as_ref()
             .expect("networking not enabled (no TUN device)");
-        let ret =
-            unsafe { libc::read(fd.as_raw_fd(), packet.as_mut_ptr().cast(), packet.len()) };
+        let ret = unsafe { libc::read(fd.as_raw_fd(), packet.as_mut_ptr().cast(), packet.len()) };
         if ret < 0 {
             let errno = unsafe { *libc::__errno_location() };
             if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {

@@ -153,8 +153,7 @@ mod tests {
 
     #[test]
     fn create_launcher_shared_region() {
-        let region =
-            LauncherSharedRegion::new().expect("failed to create launcher shared region");
+        let region = LauncherSharedRegion::new().expect("failed to create launcher shared region");
 
         assert!(!region.base_ptr().is_null());
         assert!(region.layout().total_size > 0);
@@ -163,8 +162,7 @@ mod tests {
 
     #[test]
     fn header_is_zeroed() {
-        let region =
-            LauncherSharedRegion::new().expect("failed to create launcher shared region");
+        let region = LauncherSharedRegion::new().expect("failed to create launcher shared region");
 
         // SAFETY: Region was just created and we have exclusive access. The
         // header lives at offset 0, and the mapping is page-aligned which
@@ -179,8 +177,7 @@ mod tests {
 
     #[test]
     fn fd_is_valid_and_inheritable() {
-        let region =
-            LauncherSharedRegion::new().expect("failed to create launcher shared region");
+        let region = LauncherSharedRegion::new().expect("failed to create launcher shared region");
 
         let raw_fd = region.fd_raw();
 

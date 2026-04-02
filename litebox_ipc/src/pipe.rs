@@ -9,7 +9,7 @@
 
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
-use crate::ring::{pipe_flags, ShmemPipeHeader, PIPE_DATA_CAPACITY};
+use crate::ring::{PIPE_DATA_CAPACITY, ShmemPipeHeader, pipe_flags};
 
 /// Initialize a `ShmemPipeHeader` at the given pointer.
 ///

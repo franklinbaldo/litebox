@@ -11,9 +11,9 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 
-use crate::loader::{RealFile, RealMapper, RealMemory, PAGE_SIZE};
+use crate::loader::{PAGE_SIZE, RealFile, RealMapper, RealMemory};
 use litebox_common_linux::loader::ElfParsedFile;
 
 // ── Auxiliary vector key constants ──────────────────────────────────────────
@@ -306,8 +306,8 @@ fn init_stack(
     // Terminator first.
     sb.push_usize(0); // AT_NULL value
     sb.push_usize(AuxKey::AT_NULL as usize); // AT_NULL key
-                                             // Remaining entries in reverse order (BTreeMap iterates in key order,
-                                             // but we push from top-down so reverse to get ascending in memory).
+    // Remaining entries in reverse order (BTreeMap iterates in key order,
+    // but we push from top-down so reverse to get ascending in memory).
     for (&key, &val) in auxv.iter().rev() {
         sb.push_usize(val);
         sb.push_usize(key as usize);
@@ -349,7 +349,7 @@ mod tests {
     #[test]
     fn stack_layout_is_correct() {
         let stack_size: usize = 64 * 1024; // 64 KiB is plenty for a test
-                                           // SAFETY: test-only anonymous mapping.
+        // SAFETY: test-only anonymous mapping.
         let base = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),

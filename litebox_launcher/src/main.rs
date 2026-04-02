@@ -31,7 +31,11 @@ fn main() -> anyhow::Result<()> {
     // Filter out launcher-only flags from guest argv.
     let guest_argv: Vec<&str> = args[1..]
         .iter()
-        .filter(|a| !a.starts_with("--rootfs-tar=") && !a.starts_with("--rootfs-prefix=") && !a.starts_with("--tun-device="))
+        .filter(|a| {
+            !a.starts_with("--rootfs-tar=")
+                && !a.starts_with("--rootfs-prefix=")
+                && !a.starts_with("--tun-device=")
+        })
         .map(String::as_str)
         .collect();
 
@@ -66,8 +70,12 @@ fn main() -> anyhow::Result<()> {
     )?;
 
     // 3. Spawn central process (child inherits the shmem fd + initial brk + rootfs tar + tun device).
-    let central =
-        central::CentralProcess::spawn(shmem.fd_raw(), loaded.brk, rootfs_tar.as_deref(), tun_device.as_deref())?;
+    let central = central::CentralProcess::spawn(
+        shmem.fd_raw(),
+        loaded.brk,
+        rootfs_tar.as_deref(),
+        tun_device.as_deref(),
+    )?;
 
     // Give central time to initialize (platform, shim, server loop).
     // TODO: Replace with proper readiness signaling via ring header.
@@ -81,10 +89,10 @@ fn main() -> anyhow::Result<()> {
             shmem.fd_raw(),
             shmem.base_ptr(),
             shmem.layout().total_size,
-            1,                              // pid — the guest is process 1
-            0,                              // ppid — no parent
-            central.pid().cast_unsigned(),   // central_pid — for /proc fd passing
-            syscall_entry,                   // syscall_entry_point
+            1,                             // pid — the guest is process 1
+            0,                             // ppid — no parent
+            central.pid().cast_unsigned(), // central_pid — for /proc fd passing
+            syscall_entry,                 // syscall_entry_point
         );
     }
 

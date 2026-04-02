@@ -476,6 +476,10 @@ pub enum FcntlArg<Platform: litebox::platform::RawPointerProvider> {
     SETLKW(Platform::RawConstPointer<Flock>),
     /// Duplicate file descriptor
     DUPFD { cloexec: bool, min_fd: u32 },
+    /// Set the process ID that will receive SIGIO/SIGURG signals
+    SETOWN(i32),
+    /// Get the process ID that receives SIGIO/SIGURG signals
+    GETOWN,
 }
 
 #[repr(i16)]
@@ -519,6 +523,8 @@ const F_SETFL: i32 = 4;
 const F_GETLK: i32 = 5;
 const F_SETLK: i32 = 6;
 const F_SETLKW: i32 = 7;
+const F_SETOWN: i32 = 8;
+const F_GETOWN: i32 = 9;
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy)]
@@ -548,6 +554,8 @@ impl<Platform: litebox::platform::RawPointerProvider> FcntlArg<Platform> {
                 cloexec: true,
                 min_fd: arg.truncate(),
             },
+            F_SETOWN => Self::SETOWN(arg as i32),
+            F_GETOWN => Self::GETOWN,
             _ => return None,
         })
     }
@@ -590,6 +598,7 @@ pub const TCGETS: u32 = 0x5401;
 pub const TCSETS: u32 = 0x5402;
 pub const TIOCGWINSZ: u32 = 0x5413;
 pub const FIONBIO: u32 = 0x5421;
+pub const FIOASYNC: u32 = 0x5452;
 pub const FIOCLEX: u32 = 0x5451;
 pub const TIOCGPTN: u32 = 0x80045430;
 
@@ -608,6 +617,8 @@ pub enum IoctlArg<Platform: litebox::platform::RawPointerProvider> {
     TIOCGPTN(Platform::RawMutPointer<u32>),
     /// Enables or disables non-blocking mode
     FIONBIO(Platform::RawConstPointer<i32>),
+    /// Enables or disables async I/O notification (O_ASYNC / SIGIO)
+    FIOASYNC(Platform::RawConstPointer<i32>),
     /// Set close on exec
     FIOCLEX,
     Raw {
@@ -2266,6 +2277,42 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Umask {
         mask: u32,
     },
+    Chmod {
+        pathname: Platform::RawConstPointer<i8>,
+        mode: u32,
+    },
+    Fchmod {
+        fd: i32,
+        mode: u32,
+    },
+    Fchmodat {
+        dirfd: i32,
+        pathname: Platform::RawConstPointer<i8>,
+        mode: u32,
+        flags: i32,
+    },
+    Chown {
+        pathname: Platform::RawConstPointer<i8>,
+        owner: u32,
+        group: u32,
+    },
+    Fchown {
+        fd: i32,
+        owner: u32,
+        group: u32,
+    },
+    Lchown {
+        pathname: Platform::RawConstPointer<i8>,
+        owner: u32,
+        group: u32,
+    },
+    Fchownat {
+        dirfd: i32,
+        pathname: Platform::RawConstPointer<i8>,
+        owner: u32,
+        group: u32,
+        flags: i32,
+    },
     Prctl {
         args: PrctlArg<Platform>,
     },
@@ -2428,6 +2475,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                         TIOCGWINSZ => IoctlArg::TIOCGWINSZ(ctx.sys_req_ptr(2)),
                         TIOCGPTN => IoctlArg::TIOCGPTN(ctx.sys_req_ptr(2)),
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),
+                        FIOASYNC => IoctlArg::FIOASYNC(ctx.sys_req_ptr(2)),
                         FIOCLEX => IoctlArg::FIOCLEX,
                         _ => IoctlArg::Raw {
                             cmd,
@@ -2815,6 +2863,13 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             }
             Sysno::execve => sys_req!(Execve { pathname:*, argv:*, envp:* }),
             Sysno::umask => sys_req!(Umask { mask }),
+            Sysno::chmod => sys_req!(Chmod { pathname:*, mode }),
+            Sysno::fchmod => sys_req!(Fchmod { fd, mode }),
+            Sysno::fchmodat => sys_req!(Fchmodat { dirfd, pathname:*, mode, flags }),
+            Sysno::chown => sys_req!(Chown { pathname:*, owner, group }),
+            Sysno::fchown => sys_req!(Fchown { fd, owner, group }),
+            Sysno::lchown => sys_req!(Lchown { pathname:*, owner, group }),
+            Sysno::fchownat => sys_req!(Fchownat { dirfd, pathname:*, owner, group, flags }),
             Sysno::alarm => sys_req!(Alarm { seconds }),
             Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
             // Noisy unsupported syscalls.

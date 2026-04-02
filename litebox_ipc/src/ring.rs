@@ -8,7 +8,7 @@
 // construction and zerocopy compatibility.
 #![allow(clippy::pub_underscore_fields)]
 
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64};
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 

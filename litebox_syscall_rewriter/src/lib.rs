@@ -376,12 +376,25 @@ fn hook_syscalls_in_section(
 
         let target_addr = trampoline_base_addr + trampoline_data.len() as u64;
 
-        // Copy the original instructions to the trampoline
+        // Copy the original pre-syscall instructions to the trampoline,
+        // re-encoding to fix up RIP-relative displacements for the new location.
         if replace_start < inst.ip() {
-            trampoline_data.extend_from_slice(
-                &section_data[usize::try_from(replace_start - section_base_addr).unwrap()
-                    ..usize::try_from(inst.ip() - section_base_addr).unwrap()],
-            );
+            let pre_insts: Vec<_> = instructions[..i]
+                .iter()
+                .filter(|p| p.ip() >= replace_start && p.next_ip() <= inst.ip())
+                .copied()
+                .collect();
+            if arch == Arch::X86_64 && !pre_insts.is_empty() {
+                let new_ip = trampoline_base_addr + trampoline_data.len() as u64;
+                let encoded = reencode_instructions_at(64, &pre_insts, new_ip)
+                    .map_err(Error::DisassemblyFailure)?;
+                trampoline_data.extend_from_slice(&encoded);
+            } else {
+                trampoline_data.extend_from_slice(
+                    &section_data[usize::try_from(replace_start - section_base_addr).unwrap()
+                        ..usize::try_from(inst.ip() - section_base_addr).unwrap()],
+                );
+            }
         }
 
         let return_addr = inst.next_ip();
@@ -502,6 +515,24 @@ fn get_control_transfer_targets(
 const MAX_X86_INSTRUCTION_LEN: usize = 15;
 const CHUNK_OVERLAP_LEN: usize = MAX_X86_INSTRUCTION_LEN - 1;
 const TARGET_DECODE_CHUNK_LEN: usize = 8 * 1024 * 1024;
+
+/// Re-encode instructions at a new address, fixing up RIP-relative displacements.
+///
+/// Given decoded instructions that were originally at their `inst.ip()` addresses,
+/// this function re-encodes them as if they were at `new_ip`, which corrects any
+/// RIP-relative addressing (e.g., `lea rsi, [rip+0x411fc]`) to reference the same
+/// absolute target from the new location.
+fn reencode_instructions_at(
+    bitness: u32,
+    instructions: &[iced_x86::Instruction],
+    new_ip: u64,
+) -> std::result::Result<Vec<u8>, String> {
+    let block = iced_x86::InstructionBlock::new(instructions, new_ip);
+    let result =
+        iced_x86::BlockEncoder::encode(bitness, block, iced_x86::BlockEncoderOptions::NONE)
+            .map_err(|e| format!("BlockEncoder failed: {e}"))?;
+    Ok(result.code_buffer)
+}
 
 fn bytes_until_next_4g_boundary(ptr: *const u8) -> usize {
     let low = (ptr as u64) & 0xFFFF_FFFF;
@@ -680,13 +711,27 @@ fn hook_syscall_and_after(
         // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
     }
 
-    // Copy the original instructions to the trampoline
+    // Copy the original post-syscall instructions to the trampoline,
+    // re-encoding to fix up RIP-relative displacements for the new location.
     let syscall_inst_end = syscall_inst.next_ip();
     if syscall_inst_end < replace_end {
-        trampoline_data.extend_from_slice(
-            &section_data[usize::try_from(syscall_inst_end - section_base_addr).unwrap()
-                ..usize::try_from(replace_end - section_base_addr).unwrap()],
-        );
+        let post_insts: Vec<_> = instructions
+            .iter()
+            .skip(inst_index + 1)
+            .filter(|p| p.ip() >= syscall_inst_end && p.next_ip() <= replace_end)
+            .copied()
+            .collect();
+        if arch == Arch::X86_64 && !post_insts.is_empty() {
+            let new_ip = trampoline_base_addr + trampoline_data.len() as u64;
+            let encoded = reencode_instructions_at(64, &post_insts, new_ip)
+                .map_err(Error::DisassemblyFailure)?;
+            trampoline_data.extend_from_slice(&encoded);
+        } else {
+            trampoline_data.extend_from_slice(
+                &section_data[usize::try_from(syscall_inst_end - section_base_addr).unwrap()
+                    ..usize::try_from(replace_end - section_base_addr).unwrap()],
+            );
+        }
     }
 
     // Add jmp back to original after syscall
@@ -832,4 +877,107 @@ fn hook_syscall_before_and_after(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Decode a single x86-64 instruction from bytes at the given IP.
+    fn decode_one(bytes: &[u8], ip: u64) -> iced_x86::Instruction {
+        let mut decoder = iced_x86::Decoder::new(64, bytes, iced_x86::DecoderOptions::NONE);
+        decoder.set_ip(ip);
+        decoder.decode()
+    }
+
+    /// Compute the absolute address targeted by a RIP-relative instruction.
+    fn rip_relative_target(inst: &iced_x86::Instruction) -> Option<u64> {
+        if inst.is_ip_rel_memory_operand() {
+            Some(inst.ip_rel_memory_address())
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn reencode_fixes_rip_relative_lea() {
+        // `lea rsi, [rip+0x411fc]` — 7-byte instruction
+        // Original bytes: 48 8D 35 FC 11 04 00
+        let original_bytes = [0x48, 0x8D, 0x35, 0xFC, 0x11, 0x04, 0x00];
+        let original_ip = 0x5e5fe;
+        let inst = decode_one(&original_bytes, original_ip);
+
+        // The absolute target should be next_ip + 0x411fc
+        let abs_target = rip_relative_target(&inst).expect("should be RIP-relative");
+        assert_eq!(abs_target, original_ip + 7 + 0x411fc); // 0x5e605 + 0x411fc = 0x9f801
+
+        // Re-encode at a completely different address (trampoline)
+        let new_ip = 0xa8068;
+        let encoded = reencode_instructions_at(64, &[inst], new_ip).unwrap();
+
+        // Re-decode the result and verify the absolute target is preserved
+        let new_inst = decode_one(&encoded, new_ip);
+        let new_target = rip_relative_target(&new_inst).expect("should still be RIP-relative");
+        assert_eq!(
+            new_target, abs_target,
+            "absolute target must be preserved: original {abs_target:#x}, got {new_target:#x}"
+        );
+
+        // The encoded displacement should be different from the original
+        assert_ne!(
+            &encoded[..],
+            &original_bytes[..],
+            "raw bytes should differ because displacement was adjusted"
+        );
+    }
+
+    #[test]
+    fn reencode_preserves_non_rip_relative() {
+        // `xor edi, edi` — 2-byte instruction: 31 FF
+        let bytes = [0x31, 0xFF];
+        let original_ip = 0x5e605;
+        let inst = decode_one(&bytes, original_ip);
+
+        assert!(rip_relative_target(&inst).is_none());
+
+        let new_ip = 0xa806f;
+        let encoded = reencode_instructions_at(64, &[inst], new_ip).unwrap();
+        assert_eq!(
+            &encoded[..],
+            &bytes[..],
+            "non-RIP-relative instructions should be identical"
+        );
+    }
+
+    #[test]
+    fn reencode_multi_instruction_sequence() {
+        // Sequence: `lea rsi, [rip+0x411fc]` + `xor edi, edi`
+        // This is exactly the musl __block_all_sigs pattern before the syscall
+        let lea_bytes = [0x48, 0x8D, 0x35, 0xFC, 0x11, 0x04, 0x00]; // 7 bytes
+        let xor_bytes = [0x31, 0xFF]; // 2 bytes
+
+        let original_ip = 0x5e5fe;
+        let lea_inst = decode_one(&lea_bytes, original_ip);
+        let xor_inst = decode_one(&xor_bytes, original_ip + 7);
+
+        let abs_target = rip_relative_target(&lea_inst).expect("lea should be RIP-relative");
+
+        // Re-encode both at trampoline address
+        let new_ip = 0xa8068;
+        let encoded = reencode_instructions_at(64, &[lea_inst, xor_inst], new_ip).unwrap();
+
+        // Should be 9 bytes total (7 + 2)
+        assert_eq!(encoded.len(), 9);
+
+        // Re-decode and verify
+        let new_lea = decode_one(&encoded, new_ip);
+        let new_xor = decode_one(&encoded[new_lea.len()..], new_ip + new_lea.len() as u64);
+
+        assert_eq!(
+            rip_relative_target(&new_lea).unwrap(),
+            abs_target,
+            "lea target must be preserved"
+        );
+        assert_eq!(new_xor.code(), iced_x86::Code::Xor_rm32_r32);
+    }
 }

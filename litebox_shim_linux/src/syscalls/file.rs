@@ -9,7 +9,7 @@ use alloc::{
     vec,
 };
 use litebox::{
-    event::{wait::WaitError, Events},
+    event::{Events, wait::WaitError},
     fd::{FdEnabledSubsystem, MetadataError, TypedFd},
     fs::{Mode, OFlags, SeekWhence},
     path,
@@ -17,8 +17,8 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
-    errno::Errno, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
-    IoReadVec, IoWriteVec, IoctlArg, TimeParam,
+    AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, IoReadVec,
+    IoWriteVec, IoctlArg, TimeParam, errno::Errno,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -1223,6 +1223,16 @@ impl<FS: ShimFS> Task<FS> {
                 )?;
                 Ok(new_file.try_into().unwrap())
             }
+            FcntlArg::SETOWN(_pid) => {
+                // F_SETOWN sets the process/group that receives SIGIO/SIGURG.
+                // The libOS does not deliver SIGIO, so this is a no-op success.
+                Ok(0)
+            }
+            FcntlArg::GETOWN => {
+                // F_GETOWN returns the process that would receive SIGIO.
+                // Since we never set one, return 0 (no owner).
+                Ok(0)
+            }
             _ => unimplemented!(),
         }
     }
@@ -1245,8 +1255,8 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle syscall `chdir`
     pub fn sys_chdir(&self, pathname: impl path::Arg) -> Result<(), Errno> {
-        use litebox::fs::errors::{FileStatusError, PathError};
         use litebox::fs::FileType;
+        use litebox::fs::errors::{FileStatusError, PathError};
         use litebox::path::Arg as _;
 
         // Resolve relative paths against CWD, then normalize (handle `.` / `..`).
@@ -1522,6 +1532,13 @@ impl<FS: ShimFS> Task<FS> {
                     .flatten()?;
                 Ok(0)
             }
+            IoctlArg::FIOASYNC(_arg) => {
+                // FIOASYNC enables/disables O_ASYNC (SIGIO on I/O readiness).
+                // The libOS does not deliver SIGIO, so this is a no-op success.
+                // Nginx uses this on the master-worker socketpair channel but
+                // does not depend on SIGIO delivery for correctness.
+                Ok(0)
+            }
             IoctlArg::FIOCLEX => files.run_on_raw_fd(
                 desc,
                 |fd| {
@@ -1580,7 +1597,10 @@ impl<FS: ShimFS> Task<FS> {
             _ => {
                 #[cfg(debug_assertions)]
                 litebox::log_println!(self.global.platform, "\n\n\n{:?}\n\n\n", arg);
-                todo!()
+                // Unknown ioctl — return ENOTTY. The libOS does not expose
+                // real device files, so terminal/device-specific ioctls
+                // (e.g. TIOCSCTTY, TIOCSPGRP) are not supported.
+                Err(Errno::ENOTTY)
             }
         }
     }

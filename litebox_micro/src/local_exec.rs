@@ -4,7 +4,7 @@
 //! Local execution of syscalls authorized by central.
 
 use crate::raw_syscall;
-use litebox_ipc::ring::{cq_flags, CqEntry};
+use litebox_ipc::ring::{CqEntry, cq_flags};
 
 /// Execute a locally-authorized syscall.
 ///
@@ -746,6 +746,35 @@ pub unsafe fn execute_locally(
         nr if nr == libc::SYS_getgid as u32 => 0,
         nr if nr == libc::SYS_geteuid as u32 => 0,
         nr if nr == libc::SYS_getegid as u32 => 0,
+        // set* identity: no-op success — guest is always virtual root.
+        nr if nr == libc::SYS_setuid as u32
+            || nr == libc::SYS_setgid as u32
+            || nr == libc::SYS_setreuid as u32
+            || nr == libc::SYS_setregid as u32
+            || nr == libc::SYS_setresuid as u32
+            || nr == libc::SYS_setresgid as u32
+            || nr == libc::SYS_setgroups as u32 =>
+        {
+            0
+        }
+        // getresuid/getresgid: write 0 to all three output pointers.
+        nr if nr == libc::SYS_getresuid as u32 || nr == libc::SYS_getresgid as u32 => {
+            let p0 = args[0] as *mut u32;
+            let p1 = args[1] as *mut u32;
+            let p2 = args[2] as *mut u32;
+            if !p0.is_null() {
+                unsafe { core::ptr::write(p0, 0) };
+            }
+            if !p1.is_null() {
+                unsafe { core::ptr::write(p1, 0) };
+            }
+            if !p2.is_null() {
+                unsafe { core::ptr::write(p2, 0) };
+            }
+            0
+        }
+        // getgroups: return 0 (no supplementary groups).
+        nr if nr == libc::SYS_getgroups as u32 => 0,
         // Memory query: mincore checks page residency
         nr if nr == libc::SYS_mincore as u32 => unsafe {
             raw_syscall::syscall3(libc::SYS_mincore, args[0], args[1], args[2])
@@ -855,6 +884,55 @@ pub unsafe fn execute_locally(
                 if !guest_optlen.is_null() {
                     unsafe {
                         guest_optlen.write(optlen);
+                    }
+                }
+            }
+            cq.result
+        }
+        nr if nr == libc::SYS_socketpair as u32 => {
+            // socketpair: central placed two fd u32s in shmem.
+            // Layout: [0..4): fd[0], [4..8): fd[1].
+            if cq.flags & cq_flags::HAS_DATA != 0 && !ring_base.is_null() {
+                let data_region_base = unsafe {
+                    ring_base
+                        .add(layout.data_region_offset)
+                        .add(cq.data_offset as usize)
+                };
+                let guest_sockvec = args[3] as *mut u32;
+                if !guest_sockvec.is_null() {
+                    let fd0 = u32::from_ne_bytes(
+                        unsafe { core::slice::from_raw_parts(data_region_base, 4) }
+                            .try_into()
+                            .unwrap(),
+                    );
+                    let fd1 = u32::from_ne_bytes(
+                        unsafe { core::slice::from_raw_parts(data_region_base.add(4), 4) }
+                            .try_into()
+                            .unwrap(),
+                    );
+                    unsafe {
+                        guest_sockvec.write(fd0);
+                        guest_sockvec.add(1).write(fd1);
+                    }
+                }
+            }
+            cq.result
+        }
+        nr if nr == libc::SYS_epoll_pwait as u32 || nr == libc::SYS_epoll_wait as u32 => {
+            // epoll_pwait/epoll_wait: central placed epoll_event array in shmem.
+            // Layout: [0..data_len): array of struct epoll_event (12 bytes each).
+            // Copy into the guest's events buffer (arg1 = rsi).
+            if cq.flags & cq_flags::HAS_DATA != 0 && !ring_base.is_null() {
+                let data_len = cq.data_len as usize;
+                let guest_events = args[1] as *mut u8;
+                if !guest_events.is_null() && data_len > 0 {
+                    let data_src = unsafe {
+                        ring_base
+                            .add(layout.data_region_offset)
+                            .add(cq.data_offset as usize)
+                    };
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(data_src, guest_events, data_len);
                     }
                 }
             }
@@ -1016,6 +1094,35 @@ pub unsafe fn execute_micro_local(syscall_nr: u32, args: &[u64; 6]) -> i64 {
         nr if nr == libc::SYS_getgid as u32 => 0,
         nr if nr == libc::SYS_geteuid as u32 => 0,
         nr if nr == libc::SYS_getegid as u32 => 0,
+        // set* identity: no-op success — guest is always virtual root.
+        nr if nr == libc::SYS_setuid as u32
+            || nr == libc::SYS_setgid as u32
+            || nr == libc::SYS_setreuid as u32
+            || nr == libc::SYS_setregid as u32
+            || nr == libc::SYS_setresuid as u32
+            || nr == libc::SYS_setresgid as u32
+            || nr == libc::SYS_setgroups as u32 =>
+        {
+            0
+        }
+        // getresuid/getresgid: write 0 to all three output pointers.
+        nr if nr == libc::SYS_getresuid as u32 || nr == libc::SYS_getresgid as u32 => {
+            let p0 = args[0] as *mut u32;
+            let p1 = args[1] as *mut u32;
+            let p2 = args[2] as *mut u32;
+            if !p0.is_null() {
+                unsafe { core::ptr::write(p0, 0) };
+            }
+            if !p1.is_null() {
+                unsafe { core::ptr::write(p1, 0) };
+            }
+            if !p2.is_null() {
+                unsafe { core::ptr::write(p2, 0) };
+            }
+            0
+        }
+        // getgroups: return 0 (no supplementary groups).
+        nr if nr == libc::SYS_getgroups as u32 => 0,
         // Sleep: blocking, no shared state
         nr if nr == libc::SYS_nanosleep as u32 => unsafe {
             raw_syscall::syscall2(libc::SYS_nanosleep, args[0], args[1])
@@ -1243,6 +1350,16 @@ mod tests {
             libc::SYS_getgid,
             libc::SYS_geteuid,
             libc::SYS_getegid,
+            libc::SYS_setuid,
+            libc::SYS_setgid,
+            libc::SYS_setreuid,
+            libc::SYS_setregid,
+            libc::SYS_setresuid,
+            libc::SYS_setresgid,
+            libc::SYS_getresuid,
+            libc::SYS_getresgid,
+            libc::SYS_getgroups,
+            libc::SYS_setgroups,
             libc::SYS_nanosleep,
             libc::SYS_clock_nanosleep,
             libc::SYS_arch_prctl,
@@ -1380,6 +1497,14 @@ mod tests {
             (libc::SYS_getgid, "getgid"),
             (libc::SYS_geteuid, "geteuid"),
             (libc::SYS_getegid, "getegid"),
+            (libc::SYS_setuid, "setuid"),
+            (libc::SYS_setgid, "setgid"),
+            (libc::SYS_setreuid, "setreuid"),
+            (libc::SYS_setregid, "setregid"),
+            (libc::SYS_setresuid, "setresuid"),
+            (libc::SYS_setresgid, "setresgid"),
+            (libc::SYS_setgroups, "setgroups"),
+            (libc::SYS_getgroups, "getgroups"),
         ] {
             let result = unsafe { execute_micro_local(nr as u32, &args) };
             assert_eq!(result, 0, "{name} should return 0 (virtual root)");

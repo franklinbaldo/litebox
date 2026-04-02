@@ -55,26 +55,35 @@ pub unsafe fn handle_fork(cq: &CqEntry) -> i64 {
     }
 
     // dup2 to reserved fd so both parent and child have a well-known fd number.
-    let dup_ret = unsafe { libc::dup2(local_fd as i32, RESERVED_CHILD_FD) };
-    if dup_ret < 0 {
-        let e = -i64::from(unsafe { *libc::__errno_location() });
+    // Use raw dup3 syscall to avoid glibc wrappers (which access TLS for errno).
+    let dup_ret = unsafe {
+        crate::raw_syscall::syscall3(
+            libc::SYS_dup3,
+            local_fd as u64,
+            RESERVED_CHILD_FD as u64,
+            0, // no flags
+        )
+    };
+    if crate::raw_syscall::is_error(dup_ret) {
         unsafe { crate::raw_syscall::close(local_fd as i32) };
-        return e;
+        return dup_ret;
     }
     if local_fd as i32 != RESERVED_CHILD_FD {
         unsafe { crate::raw_syscall::close(local_fd as i32) };
     }
 
-    let pid = unsafe { libc::fork() };
+    // Use raw SYS_clone instead of libc::fork() to avoid glibc's atfork
+    // handlers, which access internal state that is invalid in the guest
+    // context (causes SIGSEGV at address 0x8 in the child).
+    let pid = unsafe { crate::raw_syscall::syscall2(libc::SYS_clone, SIGCHLD, 0) };
 
-    if pid < 0 {
-        let errno = unsafe { *libc::__errno_location() };
+    if crate::raw_syscall::is_error(pid) {
         unsafe { crate::raw_syscall::close(RESERVED_CHILD_FD) };
-        return -i64::from(errno);
+        return pid;
     }
 
     if pid == 0 {
-        // CHILD
+        // CHILD — use raw syscalls only from here.
         unsafe { post_fork_child(RESERVED_CHILD_FD, child_pid_from_central) };
         0
     } else {
@@ -82,7 +91,7 @@ pub unsafe fn handle_fork(cq: &CqEntry) -> i64 {
         unsafe { crate::raw_syscall::close(RESERVED_CHILD_FD) };
         // Return the real OS child PID so the guest can waitpid() on it.
         // Central's assigned PID is used only for internal bookkeeping.
-        i64::from(pid)
+        pid
     }
 }
 
@@ -159,11 +168,13 @@ pub unsafe fn handle_vfork(cq: &CqEntry) -> i64 {
     }
 
     // dup2 to reserved fd so both parent and child have a well-known fd number.
-    let dup_ret = unsafe { libc::dup2(local_fd as i32, RESERVED_CHILD_FD) };
-    if dup_ret < 0 {
-        let e = -i64::from(unsafe { *libc::__errno_location() });
+    // Use raw dup3 syscall to avoid glibc wrappers.
+    let dup_ret = unsafe {
+        crate::raw_syscall::syscall3(libc::SYS_dup3, local_fd as u64, RESERVED_CHILD_FD as u64, 0)
+    };
+    if crate::raw_syscall::is_error(dup_ret) {
         unsafe { crate::raw_syscall::close(local_fd as i32) };
-        return e;
+        return dup_ret;
     }
     if local_fd as i32 != RESERVED_CHILD_FD {
         unsafe { crate::raw_syscall::close(local_fd as i32) };
@@ -328,25 +339,23 @@ unsafe fn post_fork_child(child_ring_fd: i32, child_pid: u32) {
             0,
         )
     };
-    assert!(
-        !crate::raw_syscall::is_error(new_base),
-        "child: mmap of new ring failed"
-    );
+    if crate::raw_syscall::is_error(new_base) {
+        unsafe { crate::raw_syscall::syscall1(libc::SYS_exit_group, 99) };
+        unreachable!();
+    }
 
     // 3. Update global micro state.
     micro.ring_base = new_base as *mut u8;
     micro.ring_size = layout.total_size;
     micro.ring_fd = child_ring_fd;
     micro.pid = child_pid;
-    micro.ppid = unsafe { libc::getppid().cast_unsigned() };
+    // Use raw syscall for getppid to avoid glibc TLS issues
+    let ppid = unsafe { crate::raw_syscall::syscall0(libc::SYS_getppid) };
+    micro.ppid = ppid as u32;
     // central_pid stays the same — same central process serves the child.
     micro.layout = layout;
 
-    // 3b. Clear the pipe fd tracking table. The parent's shmem pipe ring
-    // buffers live in the parent's data region, which is now unmapped.
-    // The child's pipe operations will fall through to central (which
-    // still tracks the virtual pipe fds in the shim). Cross-process
-    // shmem pipes are a future optimization (Phase B).
+    // 3b. Clear the pipe fd tracking table.
     micro.pipe_fds = [None; litebox_ipc::ring::MAX_PIPE_SLOTS];
 
     // 4. Reset TLS.

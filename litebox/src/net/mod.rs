@@ -1273,9 +1273,10 @@ where
                     return Err(ListenError::InvalidAddress);
                 }
                 if server_socket.backlog.is_some() || !server_socket.socket_set_handles.is_empty() {
-                    // Need to change the amount of backlog; growing will just work, but truncating
-                    // might need some effort to pick which ones to keep/drop
-                    unimplemented!()
+                    // Re-listen: update the backlog. If growing, we'll refill
+                    // below. If shrinking, excess pending connections will
+                    // remain until accepted — matching Linux behavior.
+                    server_socket.backlog = Some(backlog);
                 } else {
                     server_socket.backlog = Some(backlog);
                     server_socket.socket_set_handles = Vec::with_capacity(backlog.into());

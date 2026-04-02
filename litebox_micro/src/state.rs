@@ -4,7 +4,7 @@
 //! Global per-process micro-LiteBox state.
 
 use core::sync::atomic::{AtomicU32, AtomicUsize};
-use litebox_ipc::ring::{SharedRingLayout, MAX_PIPE_SLOTS};
+use litebox_ipc::ring::{MAX_PIPE_SLOTS, SharedRingLayout};
 
 use crate::stack_pool::StackPool;
 

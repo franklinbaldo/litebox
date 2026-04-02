@@ -19,8 +19,8 @@ use litebox_ipc::messages::{
     MSG_THREAD_DEREGISTER, MSG_THREAD_REGISTER,
 };
 use litebox_ipc::ring::{
-    cq_flags, pipe_flags, sq_flags, CqEntry, SqEntry, TrampolineDescriptor, PIPE_SLOT_SIZE,
-    PIPE_ZONE_BASE_OFFSET, RING_MASK,
+    CqEntry, PIPE_SLOT_SIZE, PIPE_ZONE_BASE_OFFSET, RING_MASK, SqEntry, TrampolineDescriptor,
+    cq_flags, pipe_flags, sq_flags,
 };
 use litebox_ipc::sq::{sq_advance_head, sq_head_index, sq_try_consume};
 use litebox_ipc::wait::spin_u8_then_wait_u32;
@@ -524,12 +524,21 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     libc::SYS_setsockopt => {
                         regs.r10 = buf_ptr; // arg3 = optval*
                     }
+                    // ioctl: for FIONBIO (0x5421), the int* arg is at arg2 (rdx)
+                    libc::SYS_ioctl if regs.rsi == 0x5421 => {
+                        regs.rdx = buf_ptr; // arg2 = int*
+                    }
+                    // epoll_ctl: event* is at arg3 (r10)
+                    libc::SYS_epoll_ctl => {
+                        regs.r10 = buf_ptr; // arg3 = epoll_event*
+                    }
                     _ => {} // Unknown — dispatch as-is.
                 }
             }
         }
 
         cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+
         cq
     }
 
@@ -833,6 +842,11 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 | libc::SYS_getsockname
                 | libc::SYS_getpeername
                 | libc::SYS_getsockopt
+                | libc::SYS_socketpair
+                // epoll_pwait/epoll_wait: events output buffer is a guest
+                // pointer; redirect to shmem so the shim writes there.
+                | libc::SYS_epoll_pwait
+                | libc::SYS_epoll_wait
                 // Info queries: shim implements these with virtual values;
                 // results are written to the shmem data region and copied
                 // to the guest buffer by micro.
@@ -1315,6 +1329,45 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     cq.data_offset = 0;
                     cq.data_len = 260; // optval (256) + optlen (4)
                 }
+            }
+            // socketpair: redirect sockvec (r10) to shmem.
+            // Layout: [0..4): fd[0] as u32, [4..8): fd[1] as u32.
+            libc::SYS_socketpair => {
+                regs.r10 = data_ptr;
+                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                if cq.result >= 0 {
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
+                    cq.data_offset = 0;
+                    cq.data_len = 8; // two u32 fds
+                }
+            }
+            // epoll_pwait/epoll_wait: redirect events buffer (rsi) to shmem.
+            // epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize)
+            // epoll_wait(epfd, events, maxevents, timeout)
+            // regs: rdi=epfd, rsi=events, rdx=maxevents, r10=timeout, r8=sigmask, r9=sigsetsize
+            // Layout: [0..n*12): array of struct epoll_event (12 bytes each, packed).
+            libc::SYS_epoll_pwait | libc::SYS_epoll_wait => {
+                const EPOLL_EVENT_SIZE: usize = 12; // sizeof(struct epoll_event), packed
+                let maxevents = entry.args[2] as usize;
+                let max_bytes = maxevents * EPOLL_EVENT_SIZE;
+                let capped_events = if max_bytes > data_region.len() {
+                    data_region.len() / EPOLL_EVENT_SIZE
+                } else {
+                    maxevents
+                };
+                regs.rsi = data_ptr;
+                regs.rdx = capped_events;
+                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                if cq.result > 0 {
+                    let n_events = cq.result as usize;
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
+                    cq.data_offset = 0;
+                    cq.data_len = (n_events * EPOLL_EVENT_SIZE) as u32;
+                } else if cq.result == 0 {
+                    // Timeout or no events — no data to transfer.
+                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
+                }
+                // Negative result: error, pass through directly.
             }
             _ => {
                 // For readv/preadv/preadv2 — not yet implemented, fall back

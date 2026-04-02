@@ -4,7 +4,7 @@
 //! Execve handling: serialize args, receive ELF data from central, map
 //! segments, and jump to the new entry point.
 
-use litebox_ipc::ring::{cq_flags, CqEntry};
+use litebox_ipc::ring::{CqEntry, cq_flags};
 
 use crate::state::MicroState;
 use crate::tls::MicroTls;
@@ -250,8 +250,8 @@ fn build_exec_stack(
 
     // ── AT_RANDOM: 16 pseudo-random bytes ──────────────────────────
     let random_bytes: [u8; 16] = [
-        0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD,
-        0xBE, 0xEF,
+        0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE,
+        0xEF,
     ];
     write_bytes(&mut pos, &random_bytes, stack_base);
     let at_random_addr = stack_base + pos;
@@ -378,8 +378,7 @@ pub unsafe fn handle_execve(tls: *mut MicroTls, args: &SyscallArgs) -> i64 {
     let pathname = unsafe { core::ffi::CStr::from_ptr(pathname_ptr) };
 
     // Serialize path/argv/envp into the data region.
-    let data_region_ptr =
-        unsafe { micro.ring_base.add(micro.layout.data_region_offset) };
+    let data_region_ptr = unsafe { micro.ring_base.add(micro.layout.data_region_offset) };
     let data_region =
         unsafe { core::slice::from_raw_parts_mut(data_region_ptr, micro.layout.data_region_size) };
 
@@ -396,9 +395,7 @@ pub unsafe fn handle_execve(tls: *mut MicroTls, args: &SyscallArgs) -> i64 {
     let sq_args = args.args;
     // Override the args so central knows where the data is.
     // We'll use a special submission that sets data fields.
-    let cq = unsafe {
-        submit_execve_sq(tls, args.nr as u32, &sq_args, data_len as u32)
-    };
+    let cq = unsafe { submit_execve_sq(tls, args.nr as u32, &sq_args, data_len as u32) };
 
     if cq.result < 0 {
         return cq.result;
@@ -490,15 +487,13 @@ unsafe fn submit_execve_sq(
             return cq;
         }
         // Spin aggressively (10,000 iters ≈ 100 µs), then futex fallback.
-        spin_then_wait(notify_slot, current, |addr, exp| {
-            unsafe {
-                crate::raw_syscall::futex4(
-                    core::ptr::from_ref(addr) as usize,
-                    libc::FUTEX_WAIT,
-                    exp,
-                    0,
-                );
-            }
+        spin_then_wait(notify_slot, current, |addr, exp| unsafe {
+            crate::raw_syscall::futex4(
+                core::ptr::from_ref(addr) as usize,
+                libc::FUTEX_WAIT,
+                exp,
+                0,
+            );
         });
     }
 }
@@ -516,11 +511,7 @@ unsafe fn submit_execve_sq(
     clippy::cast_ptr_alignment,
     clippy::too_many_lines
 )]
-unsafe fn execute_execve(
-    tls: *mut MicroTls,
-    cq: &CqEntry,
-    micro: &MicroState,
-) -> ! {
+unsafe fn execute_execve(tls: *mut MicroTls, cq: &CqEntry, micro: &MicroState) -> ! {
     let data_region_ptr = unsafe { micro.ring_base.add(micro.layout.data_region_offset) };
     let data_base = unsafe { data_region_ptr.add(cq.data_offset as usize) };
 
@@ -601,9 +592,10 @@ unsafe fn execute_execve(
     // reserved for us.  After this, anonymous mmap(NULL, ...) calls can be
     // handled locally without a ring round-trip.
     if header.mmap_bump_start != 0 {
-        micro
-            .mmap_bump_next
-            .store(header.mmap_bump_start as usize, core::sync::atomic::Ordering::Release);
+        micro.mmap_bump_next.store(
+            header.mmap_bump_start as usize,
+            core::sync::atomic::Ordering::Release,
+        );
         // mmap_bump_end is not atomic — safe to write here because we are
         // single-threaded at this point (post-execve, pre-entry).  We go
         // through the raw MicroState pointer to avoid UB from &T → &mut T.
@@ -828,9 +820,7 @@ mod tests {
         let env0 = c"HOME=/root";
         let envp: [*const i8; 2] = [env0.as_ptr(), core::ptr::null()];
 
-        let len = unsafe {
-            serialize_execve_args(&mut buf, path, argv.as_ptr(), envp.as_ptr())
-        };
+        let len = unsafe { serialize_execve_args(&mut buf, path, argv.as_ptr(), envp.as_ptr()) };
         assert!(len.is_some());
         let len = len.unwrap();
         assert!(len > 0);

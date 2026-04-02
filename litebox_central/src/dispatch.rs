@@ -7,7 +7,7 @@
 //! This module builds a synthetic [`PtRegs`] from the arguments stored in an
 //! [`SqEntry`] and delegates to [`SyscallRequest::try_from_raw`] for parsing.
 
-use litebox_common_linux::{errno::Errno, PtRegs, SyscallRequest};
+use litebox_common_linux::{PtRegs, SyscallRequest, errno::Errno};
 use litebox_ipc::ring::SqEntry;
 use litebox_platform_multiplex::Platform;
 

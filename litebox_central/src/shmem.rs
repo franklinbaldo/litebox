@@ -12,7 +12,7 @@ use std::os::unix::io::OwnedFd;
 use std::ptr::NonNull;
 use std::sync::Mutex;
 
-use litebox_ipc::ring::{CqEntry, RingHeader, SharedRingLayout, SqEntry, RING_SIZE};
+use litebox_ipc::ring::{CqEntry, RING_SIZE, RingHeader, SharedRingLayout, SqEntry};
 
 /// An owned, memory-mapped shared memory region laid out for ring buffer IPC.
 ///

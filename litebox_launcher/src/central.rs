@@ -50,7 +50,12 @@ impl CentralProcess {
     /// This function calls `libc::fork()`. The caller must ensure that forking
     /// is safe in the current process state (e.g. no other threads holding
     /// locks that the child would inherit in a locked state).
-    pub fn spawn(shmem_fd: i32, initial_brk: usize, rootfs_tar: Option<&str>, tun_device: Option<&str>) -> anyhow::Result<Self> {
+    pub fn spawn(
+        shmem_fd: i32,
+        initial_brk: usize,
+        rootfs_tar: Option<&str>,
+        tun_device: Option<&str>,
+    ) -> anyhow::Result<Self> {
         // SAFETY: We call `fork()` which is safe here because the launcher is
         // single-threaded at the point of spawning. The child either execs
         // `litebox_central` or exits on failure.
@@ -63,17 +68,22 @@ impl CentralProcess {
                 // would prevent Command::output() from returning in tests)
                 // and does not pollute the guest's stderr.
                 // Skip if shmem_fd is 1 or 2 to avoid clobbering it.
-                let devnull = unsafe {
-                    libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC)
-                };
+                let devnull =
+                    unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
                 if devnull >= 0 {
                     if shmem_fd != 1 {
-                        unsafe { libc::dup2(devnull, 1); }
+                        unsafe {
+                            libc::dup2(devnull, 1);
+                        }
                     }
                     if shmem_fd != 2 {
-                        unsafe { libc::dup2(devnull, 2); }
+                        unsafe {
+                            libc::dup2(devnull, 2);
+                        }
                     }
-                    unsafe { libc::close(devnull); }
+                    unsafe {
+                        libc::close(devnull);
+                    }
                 }
 
                 // Exec litebox_central with the shmem fd and initial brk as arguments.

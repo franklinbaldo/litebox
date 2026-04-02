@@ -9,7 +9,7 @@
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering::{Acquire, Release};
 
-use crate::ring::{CqEntry, RingHeader, RING_MASK};
+use crate::ring::{CqEntry, RING_MASK, RingHeader};
 
 /// Push a completion entry onto the CQ.
 ///

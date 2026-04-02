@@ -9,7 +9,7 @@
 use core::hint::spin_loop;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
-use crate::ring::{RingHeader, SqEntry, RING_MASK, RING_SIZE};
+use crate::ring::{RING_MASK, RING_SIZE, RingHeader, SqEntry};
 
 /// Acquire an SQ slot by advancing `sq_tail` with a CAS loop.
 ///

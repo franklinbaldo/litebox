@@ -629,7 +629,23 @@ fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("failed to create output file {}", output.display()))?;
     let mut builder = Builder::new(file);
 
+    let mut skipped = 0usize;
     for entry in entries {
+        // Skip entries whose paths contain non-ASCII characters. The Rust `tar`
+        // crate emits PAX extension headers for such paths, but `tar_no_std`
+        // (which the litebox runtime uses to read the tar) does not handle PAX
+        // headers and will silently stop iterating when it encounters one. This
+        // drops a handful of files (typically non-ASCII certificate names) that
+        // are unneeded at runtime.
+        if !entry.tar_path.is_ascii() {
+            skipped += 1;
+            eprintln!(
+                "  warning: skipping non-ASCII tar path (would produce PAX header): {}",
+                entry.tar_path
+            );
+            continue;
+        }
+
         let mut header = Header::new_gnu();
         header.set_size(entry.data.len() as u64);
         // Mask to permission bits only (rwxrwxrwx). The full st_mode from
@@ -643,6 +659,10 @@ fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
         builder
             .append_data(&mut header, &entry.tar_path, entry.data.as_slice())
             .with_context(|| format!("failed to add {} to tar", entry.tar_path))?;
+    }
+
+    if skipped > 0 {
+        eprintln!("  Skipped {skipped} entries with non-ASCII paths");
     }
 
     builder.finish().context("failed to finalize tar archive")?;

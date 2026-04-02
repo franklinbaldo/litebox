@@ -353,9 +353,7 @@ impl<FS: ShimFS> LinuxShimTask<FS> {
     /// Performs the same bookkeeping as `do_clone` (allocate TID, create
     /// `ThreadState`, attach to `Process`) but does **not** spawn a platform
     /// thread.  Returns `(child_tid, child_task)` on success.
-    pub fn create_thread_task(
-        &self,
-    ) -> Result<(i32, Self), litebox_common_linux::errno::Errno> {
+    pub fn create_thread_task(&self) -> Result<(i32, Self), litebox_common_linux::errno::Errno> {
         let child_tid = self
             .task
             .global
@@ -467,8 +465,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
 
         // Inherit the parent's current working directory and umask.
         let parent_fs = parent_task.task.fs.borrow();
-        let child_fs_state: Arc<syscalls::file::FsState> =
-            Arc::new((*parent_fs).as_ref().clone());
+        let child_fs_state: Arc<syscalls::file::FsState> = Arc::new((*parent_fs).as_ref().clone());
 
         LinuxShimTask {
             task: Task {
@@ -1258,6 +1255,14 @@ impl<FS: ShimFS> Task<FS> {
                 let old_mask = self.sys_umask(mask);
                 Ok(old_mask.bits() as usize)
             }
+            // chmod/chown family: virtual root identity, always succeed as no-ops.
+            SyscallRequest::Chmod { .. }
+            | SyscallRequest::Fchmod { .. }
+            | SyscallRequest::Fchmodat { .. }
+            | SyscallRequest::Chown { .. }
+            | SyscallRequest::Fchown { .. }
+            | SyscallRequest::Lchown { .. }
+            | SyscallRequest::Fchownat { .. } => Ok(0),
             SyscallRequest::Kill { pid, sig } => self.sys_kill(pid, sig),
             SyscallRequest::Tkill { tid, sig } => self.sys_tkill(tid, sig),
             SyscallRequest::Tgkill { tgid, tid, sig } => self.sys_tgkill(tgid, tid, sig),

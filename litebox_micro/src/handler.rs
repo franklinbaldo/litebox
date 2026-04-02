@@ -6,7 +6,7 @@
 use core::sync::atomic::Ordering::Acquire;
 
 use litebox_ipc::cq::{cq_find_by_seq, cq_tail};
-use litebox_ipc::ring::{cq_flags, CqEntry, RingHeader, SharedRingLayout, SqEntry};
+use litebox_ipc::ring::{CqEntry, RingHeader, SharedRingLayout, SqEntry, cq_flags};
 use litebox_ipc::sq::{sq_acquire_slot, sq_publish};
 
 use litebox_ipc::wait::spin_then_wait;
@@ -375,17 +375,22 @@ fn copy_socket_input_to_data_region(
     ring_base: *mut u8,
     layout: &SharedRingLayout,
 ) {
-    // Determine pointer arg index and size arg index for socket input syscalls.
-    let (ptr_idx, size_idx) = match i64::from(syscall_nr) {
+    // Determine pointer arg index and data size for syscalls where central
+    // needs input data from the guest's memory.
+    let (ptr_idx, data_size) = match i64::from(syscall_nr) {
         // connect/bind(fd, sockaddr*, addrlen) — sockaddr at arg1, size at arg2
-        libc::SYS_connect | libc::SYS_bind => (1, 2),
+        libc::SYS_connect | libc::SYS_bind => (1usize, args[2] as usize),
         // setsockopt(fd, level, optname, optval*, optlen) — optval at arg3, size at arg4
-        libc::SYS_setsockopt => (3, 4),
+        libc::SYS_setsockopt => (3, args[4] as usize),
+        // ioctl(fd, request, arg) — for FIONBIO (0x5421) and FIOASYNC (0x5452), arg at index 2 is int*
+        libc::SYS_ioctl if args[1] == 0x5421 || args[1] == 0x5452 => (2, 4),
+        // epoll_ctl(epfd, op, fd, event*) — event at arg3, 12 bytes (packed epoll_event)
+        // For EPOLL_CTL_DEL (op=2), event is ignored/NULL.
+        libc::SYS_epoll_ctl if args[1] != 2 && args[3] != 0 => (3, 12),
         _ => return,
     };
 
     let data_ptr = args[ptr_idx] as *const u8;
-    let data_size = args[size_idx] as usize;
 
     if data_ptr.is_null() || data_size == 0 {
         return;
@@ -419,11 +424,7 @@ fn bidirectional_input_info(nr: u32, args: &[u64; 6]) -> Option<(usize, usize)> 
         libc::SYS_prlimit64 => {
             // prlimit64(pid, resource, new_limit, old_limit): input=arg2 (new_limit)
             // Rlimit64 = 16 bytes (2 × u64)
-            if args[2] != 0 {
-                Some((2, 16))
-            } else {
-                None
-            }
+            if args[2] != 0 { Some((2, 16)) } else { None }
         }
         _ => None,
     }
@@ -660,13 +661,24 @@ fn handle_prlimit64_readonly(resource: u32, old_limit_ptr: *mut u8) -> i64 {
 pub(crate) fn is_tier1_micro_local(nr: u32) -> bool {
     matches!(
         i64::from(nr),
-        // Process/user identity: return virtual values from MicroState
+        // Process/user identity: return virtual values from MicroState.
+        // set* variants are no-ops (guest is always virtual root).
         libc::SYS_getpid
             | libc::SYS_getppid
             | libc::SYS_getuid
             | libc::SYS_getgid
             | libc::SYS_geteuid
             | libc::SYS_getegid
+            | libc::SYS_setuid
+            | libc::SYS_setgid
+            | libc::SYS_setreuid
+            | libc::SYS_setregid
+            | libc::SYS_setresuid
+            | libc::SYS_setresgid
+            | libc::SYS_getresuid
+            | libc::SYS_getresgid
+            | libc::SYS_getgroups
+            | libc::SYS_setgroups
             // Sleep: blocking, no state change
             | libc::SYS_nanosleep
             | libc::SYS_clock_nanosleep
@@ -720,6 +732,8 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
 
     let nr = args.nr as u32;
 
+    // TRAMP-CHECK removed — was causing segfault that killed process before fork.
+
     // Execve: special handling — serialize args and manage the exec protocol.
     if nr == libc::SYS_execve as u32 {
         return unsafe { crate::execve::handle_execve(tls, args) };
@@ -748,6 +762,29 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
             return unsafe { crate::local_exec::execute_micro_local(nr, &args.args) };
         }
         // Pre-execve: fall through to central round-trip.
+    }
+
+    // Linux AIO stubs: nginx (Alpine, compiled with --with-file-aio) probes
+    // AIO support via io_setup() during event module init and treats ENOSYS
+    // as fatal. Stub io_setup to return success with a dummy context so
+    // nginx can start. With `aio off;` in nginx.conf, no actual AIO
+    // operations are submitted.
+    #[allow(clippy::cast_possible_truncation)]
+    if nr == libc::SYS_io_setup as u32 {
+        // io_setup(unsigned nr_events, aio_context_t *ctx_idp)
+        // Write a dummy non-zero context ID to *ctx_idp and return 0.
+        let ctx_ptr = args.args[1] as *mut u64;
+        if !ctx_ptr.is_null() {
+            unsafe { core::ptr::write(ctx_ptr, 0xdead_a100_u64) };
+        }
+        return 0;
+    }
+    if matches!(
+        i64::from(nr),
+        libc::SYS_io_destroy | libc::SYS_io_getevents | libc::SYS_io_submit | libc::SYS_io_cancel
+    ) {
+        // Stub: return 0 (no events, no submissions).
+        return 0;
     }
 
     // prlimit64 fast-path: read-only queries (pid == 0 or self, new_limit == NULL)

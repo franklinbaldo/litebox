@@ -7,8 +7,8 @@
 //! equivalent) is supplied by the caller as a callback.
 
 use core::hint::spin_loop;
-use core::sync::atomic::AtomicU32;
 use core::sync::atomic::AtomicU8;
+use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering::Acquire;
 
 /// Number of busy-spin iterations before falling to futex.
