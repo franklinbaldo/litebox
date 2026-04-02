@@ -1685,6 +1685,7 @@ dependencies = [
  "litebox",
  "litebox_common_linux",
  "litebox_platform_multiplex",
+ "litebox_syscall_rewriter",
  "once_cell",
  "ringbuf",
  "seq-macro",
