@@ -260,6 +260,11 @@ pub fn hook_syscalls_in_elf(
         if off + 5 <= buf.len() {
             buf[off] = 0xE9; // JMP rel32
             buf[off + 1..off + 5].copy_from_slice(&rel32.to_le_bytes());
+        } else {
+            return Err(Error::ParseError(format!(
+                "fork→vfork patch offset {off:#x} + 5 exceeds buffer length {}",
+                buf.len()
+            )));
         }
     }
 
@@ -587,8 +592,8 @@ fn hook_syscalls_in_section(
             trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
             trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
             trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-            // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
-            // We want: EAX + offset = syscall_entry_addr
+                                                              // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
+                                                              // We want: EAX + offset = syscall_entry_addr
             #[allow(clippy::cast_possible_wrap)]
             let disp32 = i64::try_from(syscall_entry_addr).unwrap()
                 - i64::try_from(trampoline_base_addr).unwrap()
@@ -1104,8 +1109,8 @@ fn hook_syscall_and_after(
         trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
         trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
         trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-        // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
-        // We want: EAX + offset = syscall_entry_addr
+                                                          // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
+                                                          // We want: EAX + offset = syscall_entry_addr
         #[allow(clippy::cast_possible_wrap)]
         let disp32 = i64::try_from(syscall_entry_addr).unwrap()
             - i64::try_from(trampoline_base_addr).unwrap()
@@ -1238,8 +1243,8 @@ fn hook_syscall_before_and_after(
     trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
     trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
     trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-    // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
-    // We want: EAX + offset = syscall_entry_addr
+                                                      // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
+                                                      // We want: EAX + offset = syscall_entry_addr
     #[allow(clippy::cast_possible_wrap)]
     let disp32 = i64::try_from(syscall_entry_addr).unwrap()
         - i64::try_from(trampoline_base_addr).unwrap()
@@ -1282,7 +1287,7 @@ fn hook_syscall_before_and_after(
 
 #[cfg(test)]
 mod tests {
-    use super::{BUN_FOOTER_MARKER, has_bun_footer_marker, patch_code_segment};
+    use super::{has_bun_footer_marker, patch_code_segment, BUN_FOOTER_MARKER};
 
     #[test]
     fn detects_bun_footer_marker_near_end() {
