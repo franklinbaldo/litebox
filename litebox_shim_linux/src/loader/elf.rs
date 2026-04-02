@@ -11,15 +11,15 @@ use litebox::{
     utils::{ReinterpretSignedExt, TruncateExt},
 };
 use litebox_common_linux::{
-    MapFlags,
     errno::Errno,
     loader::{ElfParsedFile, ReadAt as _},
+    MapFlags,
 };
 use thiserror::Error;
 
 use crate::{
-    MutPtr,
     loader::auxv::{AuxKey, AuxVec},
+    MutPtr,
 };
 
 use super::stack::UserStack;
@@ -259,7 +259,15 @@ impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
         // If the rewriter backend is active (syscall_entry_point != 0) and the
         // binary lacks a trampoline, patch it on the fly so that both the main
         // program and the dynamic linker are covered.
-        let patched_data = if syscall_entry_point != 0 && trampoline_result.is_err() {
+        //
+        // Only attempt runtime patching for UnpatchedBinary — other errors
+        // (BadTrampolineVersion, BadTrampoline, Io) indicate a corrupt or
+        // incompatible pre-patched binary that should not be re-patched.
+        let patched_data = if syscall_entry_point != 0
+            && matches!(
+                trampoline_result,
+                Err(litebox_common_linux::loader::ElfParseError::UnpatchedBinary)
+            ) {
             let size: usize = (&mut &file)
                 .size()
                 .map_err(ElfLoaderError::OpenError)?
@@ -289,12 +297,39 @@ impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
                         .map_err(ElfLoaderError::ParseError)?;
                     Some(patched)
                 }
-                Err(_) => {
-                    // Patching failed (e.g. ET_REL, no .text). Proceed without
-                    // a trampoline — the binary may simply have no syscalls.
+                Err(
+                    litebox_syscall_rewriter::Error::UnsupportedBunExecutable
+                    | litebox_syscall_rewriter::Error::UnsupportedObjectFile
+                    | litebox_syscall_rewriter::Error::NoTextSectionFound
+                    | litebox_syscall_rewriter::Error::NoSyscallInstructionsFound
+                    | litebox_syscall_rewriter::Error::AlreadyHooked,
+                ) => {
+                    // These are expected non-fatal cases:
+                    // - BUN: can't be statically patched but the runtime mmap
+                    //   hook will patch code segments as they are mapped.
+                    // - Object files / no .text / no syscalls / already hooked:
+                    //   nothing to patch.
+                    None
+                }
+                Err(e) => {
+                    // Unexpected rewriter failure (parse error, disassembly
+                    // failure, etc.). Proceed without a trampoline — the
+                    // runtime mmap hook may still patch individual segments.
+                    litebox::log_println!(
+                        task.global.platform,
+                        "warning: syscall rewriter failed: {}; \
+                         falling back to runtime patching",
+                        e
+                    );
                     None
                 }
             }
+        } else if syscall_entry_point != 0 {
+            // Rewriter is active but trampoline_result is an error other than
+            // UnpatchedBinary (e.g. BadTrampolineVersion, BadTrampoline, Io).
+            // Propagate the error rather than silently proceeding.
+            trampoline_result.map_err(ElfLoaderError::ParseError)?;
+            None
         } else {
             None
         };
@@ -317,14 +352,13 @@ impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
         // this, both paths would map the same region — the second MAP_FIXED
         // destroys the first mapping.
         //
-        // Only suppress when using the ElfFile mapper (which routes through
-        // do_mmap_file → maybe_patch_exec_segment) AND the loader actually
-        // has a trampoline to map. When patched_data is None and there's no
-        // trampoline (e.g. the rewriter declined the binary), the runtime
-        // fallback must remain enabled.
-        let has_loader_trampoline = self.patched_data.is_some() || self.parsed.has_trampoline();
-        let suppress = has_loader_trampoline && self.patched_data.is_none();
-        self.file.task.suppress_elf_runtime_patch.set(suppress);
+        // When patched_data is Some the PatchedMapper path doesn't go through
+        // do_mmap_file so the flag is a no-op, but setting it is harmless and
+        // keeps the logic simple.
+        self.file
+            .task
+            .suppress_elf_runtime_patch
+            .set(self.patched_data.is_some() || self.parsed.has_trampoline());
         let result = if let Some(ref data) = self.patched_data {
             let mut mapper = PatchedMapper {
                 inner: &mut self.file,

@@ -206,7 +206,7 @@ fn find_c_test_files(dir: &str) -> Vec<PathBuf> {
     files
 }
 
-// our rtld_audit does not support x86 yet
+// Syscall rewriting does not support x86 yet
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn test_dynamic_lib_with_rewriter() {

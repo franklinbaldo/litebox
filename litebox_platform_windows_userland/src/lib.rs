@@ -568,9 +568,11 @@ syscall_callback_redzone:
     mov     r11d, DWORD PTR [rip + {TLS_INDEX}]
     mov     r11, QWORD PTR gs:[r11 * 8 + TEB_TLS_SLOTS_OFFSET]
     mov     BYTE PTR [r11 + {IS_IN_GUEST}], 0
-    // Recover the architectural guest stack pointer (RSP + 128) into SCRATCH.
+    // Recover the architectural guest stack pointer (undo the 128-byte
+    // red zone reservation) and store it in SCRATCH.  LEA is used instead
+    // of ADD to avoid clobbering RFLAGS before pushfq.
+    lea     rsp, [rsp + 128]
     mov     QWORD PTR [r11 + {SCRATCH}], rsp
-    add     QWORD PTR [r11 + {SCRATCH}], 128
 
 .Lsyscall_callback_common:
     mov     rsp, QWORD PTR [r11 + {GUEST_CONTEXT_TOP}]

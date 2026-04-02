@@ -224,7 +224,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     }
 
     litebox_platform_multiplex::set_platform(platform);
-    let mut shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
+    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     let litebox = shim_builder.litebox();
     let initial_file_system = {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
@@ -330,7 +330,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     let initial_file_system = std::sync::Arc::new(initial_file_system);
 
-    shim_builder.set_load_filter(fixup_env);
     let shim = shim_builder.build();
 
     let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
@@ -449,8 +448,4 @@ fn pin_thread_to_cpu(cpu: usize) {
             eprintln!("Warning: Failed to pin thread to CPU core {cpu}");
         }
     }
-}
-
-fn fixup_env(_envp: &mut Vec<alloc::ffi::CString>) {
-    // No-op: rtld_audit has been removed; runtime patching is handled by the shim.
 }
