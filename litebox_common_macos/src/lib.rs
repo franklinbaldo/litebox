@@ -7,5 +7,8 @@
 
 extern crate alloc;
 
+pub mod errno;
+pub mod syscall;
+
 // Re-export PtRegs from litebox_common_linux (same aarch64 register layout).
 pub use litebox_common_linux::PtRegs;
