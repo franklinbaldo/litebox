@@ -549,31 +549,26 @@ unsafe extern "C-unwind" fn run_thread_arch(thread_ctx: &mut ThreadContext, tls_
     jmp .Ldone
 
     // This entry point is called from the guest when it issues a syscall
-    // instruction.
+    // instruction.  The rewriter trampoline has already:
+    //   1. Reserved 128 bytes below RSP to protect the SysV red zone
+    //   2. Loaded the call-site restart address into R11 (for SA_RESTART)
+    //   3. Loaded the return address into RCX
     //
-    // At entry, the register context is the guest context with the
-    // return address in rcx. r11 is an available scratch register (it would
-    // contain rflags if the syscall instruction had actually been issued).
-    .globl  syscall_callback
-syscall_callback:
+    // All other registers hold guest state.
+    .globl  syscall_callback_redzone
+syscall_callback_redzone:
+    // Save guest R11 (restart address from rewriter trampoline) into
+    // TEB.ArbitraryUserPointer (gs:[0x28]) before the TLS index lookup
+    // clobbers R11.  This slot is per-thread and the window is very
+    // narrow: only ~20 instructions of inline asm with no API calls,
+    // no Rust code, and no DLL activity, so the ntdll loader (which
+    // also uses this slot for debugger communication) cannot interfere.
+    mov     gs:[0x28], r11
     // Get the TLS state from the TLS slot and clear the in-guest flag.
     mov     r11d, DWORD PTR [rip + {TLS_INDEX}]
     mov     r11, QWORD PTR gs:[r11 * 8 + TEB_TLS_SLOTS_OFFSET]
     mov     BYTE PTR [r11 + {IS_IN_GUEST}], 0
-    // Set rsp to the top of the guest context.
-    mov     QWORD PTR [r11 + {SCRATCH}], rsp
-    jmp     .Lsyscall_callback_common
-
-    .globl  syscall_callback_redzone
-syscall_callback_redzone:
-    // Same as syscall_callback, but the trampoline has already reserved
-    // 128 bytes below RSP to protect the SysV red zone. Recover the
-    // architectural guest stack pointer.
-    mov     r11d, DWORD PTR [rip + {TLS_INDEX}]
-    mov     r11, QWORD PTR gs:[r11 * 8 + TEB_TLS_SLOTS_OFFSET]
-    mov     BYTE PTR [r11 + {IS_IN_GUEST}], 0
-    // Save RSP + 128 to SCRATCH without clobbering any guest registers.
-    // Use SCRATCH as a temporary: store rsp, then add 128 in-place.
+    // Recover the architectural guest stack pointer (RSP + 128) into SCRATCH.
     mov     QWORD PTR [r11 + {SCRATCH}], rsp
     add     QWORD PTR [r11 + {SCRATCH}], 128
 
@@ -597,7 +592,8 @@ syscall_callback_redzone:
     push    r8          // pt_regs->r8
     push    r9          // pt_regs->r9
     push    r10         // pt_regs->r10
-    push    [rsp + 88]  // pt_regs->r11 = rflags
+    mov     r10, gs:[0x28]          // recover guest R11 saved at entry
+    push    r10         // pt_regs->r11 = guest R11 (restart addr from rewriter)
     push    rbx         // pt_regs->bx
     push    rbp         // pt_regs->bp
     push    r12
@@ -1963,8 +1959,6 @@ impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
 
 unsafe extern "C" {
     // Defined in asm blocks above
-    #[allow(dead_code)] // Referenced from inline asm, not directly from Rust
-    fn syscall_callback() -> isize;
     fn syscall_callback_redzone() -> isize;
     fn exception_callback() -> isize;
     fn interrupt_callback();
