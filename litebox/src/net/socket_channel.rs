@@ -397,6 +397,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
 
         match self.inner.state() {
             SocketState::Connected => {}
+            SocketState::Closed => {
+                if !self.is_readable() {
+                    return Err(ReceiveError::OperationFinished);
+                }
+            }
             _ => return Err(ReceiveError::SocketInInvalidState),
         }
 
@@ -1127,6 +1132,17 @@ mod tests {
         // Should fail to write
         let result = channel.try_write(b"data");
         assert!(matches!(result, Err(SendError::SocketInInvalidState)));
+    }
+
+    #[test]
+    fn stream_channel_read_after_orderly_close_reports_finished() {
+        let channel: StreamSocketChannel<TestPlatform> = StreamSocketChannel::new();
+        channel.set_state(SocketState::Connected);
+        channel.set_state(SocketState::Closed);
+
+        let mut buf = [0u8; 32];
+        let result = channel.try_read(&mut buf, super::super::ReceiveFlags::empty(), None);
+        assert!(matches!(result, Err(ReceiveError::OperationFinished)));
     }
 
     #[test]

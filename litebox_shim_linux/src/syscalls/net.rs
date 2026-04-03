@@ -1867,12 +1867,13 @@ impl<FS: ShimFS> Task<FS> {
 mod tests {
     use core::net::SocketAddr;
 
-    use alloc::string::ToString as _;
+    use alloc::{string::ToString as _, vec::Vec};
+    use litebox::event::Events;
     use litebox::platform::RawConstPointer as _;
     use litebox::utils::TruncateExt as _;
     use litebox_common_linux::{
         AddressFamily, ReceiveFlags, SendFlags, SockFlags, SockType, SocketOption,
-        SocketOptionName, TcpOption, errno::Errno,
+        SocketOptionName, TcpOption, TimeParam, errno::Errno,
     };
 
     use super::SocketAddress;
@@ -1943,6 +1944,27 @@ mod tests {
         let events_ptr = crate::MutPtr::from_usize(events.as_mut_ptr() as usize);
         task.sys_epoll_pwait(epfd, events_ptr, events.len().truncate(), -1, None, 0)
             .expect("epoll_wait failed")
+    }
+
+    fn ppoll(task: &crate::Task<crate::DefaultFS>, fd: u32, events: Events) {
+        let fd = i32::try_from(fd).unwrap();
+        let mut pollfd = [litebox_common_linux::Pollfd {
+            fd,
+            events: i16::try_from(events.bits()).unwrap(),
+            revents: 0,
+        }];
+
+        let n = task
+            .sys_ppoll(
+                MutPtr::from_usize(pollfd.as_mut_ptr() as usize),
+                1,
+                TimeParam::None,
+                None,
+                0,
+            )
+            .expect("ppoll");
+        assert!(n != 0);
+        assert!(pollfd[0].revents != 0);
     }
 
     fn test_tcp_socket_as_server(
@@ -2266,6 +2288,120 @@ mod tests {
             .expect("Failed to wait for client");
         let stdout = alloc::string::String::from_utf8_lossy(&output.stdout);
         assert_eq!(stdout, buf);
+    }
+
+    fn test_multiple_tun_tcp_stream_connections(is_nonblocking: bool) {
+        let task = init_platform(Some(TUN_DEVICE_NAME));
+        let port = SERVER_PORT + if is_nonblocking { 2 } else { 1 };
+        let server_fd = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Stream,
+                if is_nonblocking {
+                    SockFlags::NONBLOCK
+                } else {
+                    SockFlags::empty()
+                },
+                0,
+            )
+            .expect("failed to create server socket");
+        let server_addr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
+            core::net::Ipv4Addr::from(TUN_IP_ADDR),
+            port,
+        )));
+        task.do_bind(server_fd, server_addr.clone())
+            .expect("failed to bind server socket");
+        task.do_listen(server_fd, 10)
+            .expect("failed to listen on server socket");
+
+        let connect_addr = server_addr.clone();
+        task.spawn_clone_for_test(move |task| {
+            let mut client_fds = Vec::new();
+            for _ in 0..10 {
+                let client_fd = task
+                    .do_socket(
+                        AddressFamily::INET,
+                        SockType::Stream,
+                        if is_nonblocking {
+                            SockFlags::NONBLOCK
+                        } else {
+                            SockFlags::empty()
+                        },
+                        0,
+                    )
+                    .expect("failed to create client socket");
+                if is_nonblocking {
+                    match task.do_connect(client_fd, connect_addr.clone()) {
+                        Ok(()) => {}
+                        Err(Errno::EINPROGRESS) => ppoll(&task, client_fd, Events::OUT),
+                        Err(err) => panic!("connect failed: {err}"),
+                    }
+                } else {
+                    task.do_connect(client_fd, connect_addr.clone())
+                        .expect("connect failed");
+                }
+                client_fds.push(client_fd);
+            }
+
+            for (i, client_fd) in client_fds.iter().enumerate() {
+                let msg = alloc::format!("message from connection {i}");
+                let n = task
+                    .do_sendto(*client_fd, msg.as_bytes(), SendFlags::empty(), None)
+                    .expect("sendto failed");
+                assert_eq!(n, msg.len());
+            }
+
+            for client_fd in client_fds {
+                close_socket(&task, client_fd);
+            }
+        });
+
+        let mut server_conn_fds = Vec::new();
+        for _ in 0..10 {
+            if is_nonblocking {
+                ppoll(&task, server_fd, Events::IN);
+            }
+            let server_conn = task
+                .do_accept(
+                    server_fd,
+                    None,
+                    if is_nonblocking {
+                        SockFlags::NONBLOCK
+                    } else {
+                        SockFlags::empty()
+                    },
+                )
+                .expect("accept failed");
+            server_conn_fds.push(server_conn);
+        }
+
+        for (i, server_conn_fd) in server_conn_fds.iter().enumerate() {
+            let msg = alloc::format!("message from connection {i}");
+            let mut buf = [0u8; 64];
+            if is_nonblocking {
+                ppoll(&task, *server_conn_fd, Events::IN);
+            }
+            let n = task
+                .do_recvfrom(*server_conn_fd, &mut buf, ReceiveFlags::empty(), None)
+                .expect("recvfrom failed");
+            assert_eq!(n, msg.len());
+            assert_eq!(&buf[..n], msg.as_bytes());
+        }
+
+        for server_conn_fd in server_conn_fds {
+            close_socket(&task, server_conn_fd);
+        }
+        close_socket(&task, server_fd);
+    }
+
+    #[test]
+    fn test_multiple_blocking_tun_tcp_stream_connections() {
+        test_multiple_tun_tcp_stream_connections(false);
+    }
+
+    #[test]
+    fn test_multiple_nonblocking_tun_tcp_stream_connections() {
+        test_multiple_tun_tcp_stream_connections(true);
     }
 
     fn blocking_udp_server_socket(test_trunc: bool, is_nonblocking: bool) {

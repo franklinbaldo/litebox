@@ -8,6 +8,9 @@ use super::*;
 use core::net::SocketAddrV4;
 use core::str::FromStr;
 
+use crate::event::IOPollable;
+use crate::net::socket_channel::{NetworkProxy, StreamSocketChannel};
+
 extern crate std;
 
 fn bidi_tcp_comms(mut network: Network<MockPlatform>, comms: fn(&mut Network<MockPlatform>)) {
@@ -109,4 +112,66 @@ fn test_bidirectional_tcp_communication_automatic() {
     let mut network = Network::new(&litebox);
     network.set_platform_interaction(PlatformInteraction::Automatic);
     bidi_tcp_comms(network, |_| {});
+}
+
+#[test]
+fn test_accept_keeps_listener_readable_when_more_connections_are_ready() {
+    let litebox = LiteBox::new(MockPlatform::new());
+    let mut network = Network::new(&litebox);
+    network.set_platform_interaction(PlatformInteraction::Manual);
+
+    let listener_fd = network.socket(Protocol::Tcp).unwrap();
+    let listener_proxy = alloc::sync::Arc::new(NetworkProxy::Stream(StreamSocketChannel::new()));
+    assert!(network.set_socket_proxy(&listener_fd, listener_proxy.clone()));
+    let listen_addr = SocketAddr::V4(SocketAddrV4::from_str("10.0.0.2:8080").unwrap());
+    network.bind(&listener_fd, &listen_addr).unwrap();
+    network.listen(&listener_fd, 2).unwrap();
+
+    let client1_fd = network.socket(Protocol::Tcp).unwrap();
+    let client2_fd = network.socket(Protocol::Tcp).unwrap();
+    assert!(matches!(
+        network.connect(&client1_fd, &listen_addr, false),
+        Err(ConnectError::InProgress)
+    ));
+    assert!(matches!(
+        network.connect(&client2_fd, &listen_addr, false),
+        Err(ConnectError::InProgress)
+    ));
+
+    for _ in 0..32 {
+        while network
+            .perform_platform_interaction()
+            .call_again_immediately()
+        {}
+    }
+
+    assert!(
+        listener_proxy
+            .check_io_events()
+            .contains(crate::event::Events::IN)
+    );
+
+    let server1_fd = network.accept(&listener_fd, None).unwrap();
+    let _ = server1_fd;
+
+    assert!(
+        listener_proxy
+            .check_io_events()
+            .contains(crate::event::Events::IN)
+    );
+
+    let server2_fd = network.accept(&listener_fd, None).unwrap();
+
+    network
+        .close(&client1_fd, CloseBehavior::Immediate)
+        .unwrap();
+    network
+        .close(&client2_fd, CloseBehavior::Immediate)
+        .unwrap();
+    network
+        .close(&server2_fd, CloseBehavior::Immediate)
+        .unwrap();
+    network
+        .close(&listener_fd, CloseBehavior::Immediate)
+        .unwrap();
 }

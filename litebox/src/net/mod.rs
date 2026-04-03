@@ -1423,6 +1423,14 @@ where
                 }
                 // Pull that position out of the listening handles
                 let ready_handle = server_socket.socket_set_handles.swap_remove(position);
+                if let Some(proxy) = &socket_handle.proxy
+                    && server_socket.socket_set_handles.iter().any(|&h| {
+                        let socket: &tcp::Socket = self.socket_set.get(h);
+                        socket.state() == tcp::State::Established
+                    })
+                {
+                    proxy.set_readable(true);
+                }
                 // Refill to the backlog, so that we can have more listening sockets again if needed
                 server_socket.refill_to_backlog(&mut self.socket_set);
                 // Grab the local port again, so we can put it into the new `TcpSpecific`
