@@ -32,7 +32,7 @@ impl Runner {
             Backend::Rewriter => "rewriter",
             Backend::Seccomp => "seccomp",
         };
-        let dir_path = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+        let dir_path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
         let path = match backend {
             Backend::Seccomp => target.to_path_buf(),
             Backend::Rewriter => {
