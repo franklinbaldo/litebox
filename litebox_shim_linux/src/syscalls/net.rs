@@ -1342,8 +1342,23 @@ impl<FS: ShimFS> Task<FS> {
         let sockaddr = addr
             .map(|addr| read_sockaddr_from_user(addr, addrlen as usize))
             .transpose()?;
-        let buf = buf.to_owned_slice(len).ok_or(Errno::EFAULT)?;
-        self.do_sendto(fd, &buf, flags, sockaddr)
+        #[cfg(feature = "platform_central")]
+        {
+            let buf_addr = buf.as_usize();
+            if buf_addr == 0 {
+                return Err(Errno::EFAULT);
+            }
+            // SAFETY: In central mode, buf points to valid, stable host memory
+            // for the duration of this synchronous dispatch.
+            let buf_slice =
+                unsafe { core::slice::from_raw_parts(buf_addr as *const u8, len) };
+            self.do_sendto(fd, buf_slice, flags, sockaddr)
+        }
+        #[cfg(not(feature = "platform_central"))]
+        {
+            let buf_slice = buf.to_owned_slice(len).ok_or(Errno::EFAULT)?;
+            self.do_sendto(fd, &buf_slice, flags, sockaddr)
+        }
     }
     fn do_sendto(
         &self,
@@ -1424,13 +1439,29 @@ impl<FS: ShimFS> Task<FS> {
                     if iov.iov_len == 0 {
                         continue;
                     }
-                    let buf = iov
-                        .iov_base
-                        .to_owned_slice(iov.iov_len)
-                        .ok_or(Errno::EFAULT)?;
-                    total_sent +=
+                    let base = iov.iov_base;
+                    let len = iov.iov_len;
+                    #[cfg(feature = "platform_central")]
+                    let sent = {
+                        let buf_addr = base.as_usize();
+                        if buf_addr == 0 {
+                            return Err(Errno::EFAULT);
+                        }
+                        // SAFETY: In central mode, iov_base points to valid,
+                        // stable host memory for this dispatch.
+                        let buf = unsafe {
+                            core::slice::from_raw_parts(buf_addr as *const u8, len)
+                        };
                         self.global
-                            .sendto(&self.wait_cx(), fd, &buf, flags, sock_addr)?;
+                            .sendto(&self.wait_cx(), fd, buf, flags, sock_addr)?
+                    };
+                    #[cfg(not(feature = "platform_central"))]
+                    let sent = {
+                        let buf = base.to_owned_slice(len).ok_or(Errno::EFAULT)?;
+                        self.global
+                            .sendto(&self.wait_cx(), fd, &buf, flags, sock_addr)?
+                    };
+                    total_sent += sent;
                 }
                 Ok(total_sent)
             },

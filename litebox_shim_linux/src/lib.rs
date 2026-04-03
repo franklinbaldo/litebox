@@ -816,10 +816,28 @@ impl<FS: ShimFS> Task<FS> {
                     })
                 }
             }
-            SyscallRequest::Write { fd, buf, count } => match buf.to_owned_slice(count) {
-                Some(buf) => self.sys_write(fd, &buf, None),
-                None => Err(Errno::EFAULT),
-            },
+            SyscallRequest::Write { fd, buf, count } => {
+                #[cfg(feature = "platform_central")]
+                {
+                    let addr = buf.as_usize();
+                    if addr == 0 {
+                        Err(Errno::EFAULT)
+                    } else {
+                        // SAFETY: In central mode, buf points to valid, stable
+                        // host memory (shmem or central's own heap) for the
+                        // duration of this synchronous dispatch.
+                        let slice = unsafe {
+                            core::slice::from_raw_parts(addr as *const u8, count)
+                        };
+                        self.sys_write(fd, slice, None)
+                    }
+                }
+                #[cfg(not(feature = "platform_central"))]
+                match buf.to_owned_slice(count) {
+                    Some(buf) => self.sys_write(fd, &buf, None),
+                    None => Err(Errno::EFAULT),
+                }
+            }
             SyscallRequest::Close { fd } => syscall!(sys_close(fd)),
             SyscallRequest::Lseek { fd, offset, whence } => {
                 use litebox::utils::TruncateExt as _;
@@ -860,10 +878,26 @@ impl<FS: ShimFS> Task<FS> {
                 buf,
                 count,
                 offset,
-            } => match buf.to_owned_slice(count) {
-                Some(buf) => self.sys_pwrite64(fd, &buf, offset),
-                None => Err(Errno::EFAULT),
-            },
+            } => {
+                #[cfg(feature = "platform_central")]
+                {
+                    let addr = buf.as_usize();
+                    if addr == 0 {
+                        Err(Errno::EFAULT)
+                    } else {
+                        // SAFETY: same reasoning as SyscallRequest::Write above.
+                        let slice = unsafe {
+                            core::slice::from_raw_parts(addr as *const u8, count)
+                        };
+                        self.sys_pwrite64(fd, slice, offset)
+                    }
+                }
+                #[cfg(not(feature = "platform_central"))]
+                match buf.to_owned_slice(count) {
+                    Some(buf) => self.sys_pwrite64(fd, &buf, offset),
+                    None => Err(Errno::EFAULT),
+                }
+            }
             SyscallRequest::Mmap {
                 addr,
                 length,

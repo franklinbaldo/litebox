@@ -10,7 +10,7 @@ use alloc::{
 };
 use core::sync::atomic::{AtomicUsize, Ordering};
 use litebox::{
-    event::{Events, wait::WaitError},
+    event::{wait::WaitError, Events},
     fd::{FdEnabledSubsystem, MetadataError, TypedFd},
     fs::{Mode, OFlags, SeekWhence},
     path,
@@ -18,8 +18,8 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
-    AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, IoReadVec,
-    IoWriteVec, IoctlArg, TimeParam, errno::Errno,
+    errno::Errno, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
+    IoReadVec, IoWriteVec, IoctlArg, TimeParam,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -623,13 +623,26 @@ where
         if iov.iov_len == 0 {
             continue;
         }
-        let slice = iov
-            .iov_base
-            .to_owned_slice(iov.iov_len)
-            .ok_or(Errno::EFAULT)?;
-        let size = write_fn(&slice)?;
+        let base = iov.iov_base;
+        let len = iov.iov_len;
+        #[cfg(feature = "platform_central")]
+        let size = {
+            let addr = base.as_usize();
+            if addr == 0 {
+                return Err(Errno::EFAULT);
+            }
+            // SAFETY: In central mode, iov_base points to valid, stable
+            // host memory for the duration of this synchronous dispatch.
+            let slice = unsafe { core::slice::from_raw_parts(addr as *const u8, len) };
+            write_fn(slice)?
+        };
+        #[cfg(not(feature = "platform_central"))]
+        let size = {
+            let slice = base.to_owned_slice(len).ok_or(Errno::EFAULT)?;
+            write_fn(&slice)?
+        };
         total_written += size;
-        if size < iov.iov_len {
+        if size < len {
             // Okay to transfer fewer bytes than requested
             break;
         }
@@ -1255,8 +1268,8 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle syscall `chdir`
     pub fn sys_chdir(&self, pathname: impl path::Arg) -> Result<(), Errno> {
-        use litebox::fs::FileType;
         use litebox::fs::errors::{FileStatusError, PathError};
+        use litebox::fs::FileType;
         use litebox::path::Arg as _;
 
         // Resolve relative paths against CWD, then normalize (handle `.` / `..`).
