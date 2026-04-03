@@ -41,12 +41,13 @@ fn parse_text_sections(data: &[u8]) -> Result<Vec<arm64::TextSectionInfo>> {
         .endian()
         .map_err(|e| Error::ParseError(format!("unsupported endianness: {e}")))?;
 
-    // Validate: must be MH_EXECUTE, CPU_TYPE_ARM64
+    // Validate: must be MH_EXECUTE or MH_DYLINKER, CPU_TYPE_ARM64
     if header.cputype(endian) != macho::CPU_TYPE_ARM64 {
         return Err(Error::UnsupportedObjectFile);
     }
     let filetype = header.filetype(endian);
-    if filetype != macho::MH_EXECUTE {
+    // MH_DYLINKER = 7 (the dynamic linker, e.g. /usr/lib/dyld)
+    if filetype != macho::MH_EXECUTE && filetype != 7 {
         return Err(Error::UnsupportedObjectFile);
     }
 

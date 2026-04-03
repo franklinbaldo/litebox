@@ -157,7 +157,7 @@ pub fn run_macho_binary(binary_data: &[u8], argv: &[&str]) -> (i32, Vec<u8>) {
     let envp = vec![std::ffi::CString::new("PATH=/bin").unwrap()];
 
     let program = shim
-        .load_program(binary_data, argv_cstrings, envp)
+        .load_program(binary_data, argv_cstrings, envp, None)
         .expect("load_program failed");
 
     let litebox_shim_macos::LoadedProgram {

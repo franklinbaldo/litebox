@@ -19,7 +19,7 @@ use object::read::macho::MachHeader;
 use object::Endianness;
 
 use super::stack::UserStack;
-use super::{MachoLoadInfo, MachoLoaderError, DEFAULT_LOW_ADDR, DEFAULT_STACK_SIZE};
+use super::{DyldLoadInfo, MachoLoadInfo, MachoLoaderError, DEFAULT_LOW_ADDR, DEFAULT_STACK_SIZE};
 use crate::{MutPtr, ShimFS, Task};
 
 struct SegmentInfo {
@@ -36,6 +36,7 @@ pub(crate) fn load<FS: ShimFS>(
     data: &[u8],
     argv: Vec<CString>,
     envp: Vec<CString>,
+    dyld_bytes: Option<&[u8]>,
 ) -> Result<MachoLoadInfo, MachoLoaderError> {
     // Parse header
     let header = macho::MachHeader64::<Endianness>::parse(data, 0)
@@ -57,6 +58,7 @@ pub(crate) fn load<FS: ShimFS>(
     let mut entry_offset: Option<u64> = None;
     let mut is_lc_main = false;
     let mut text_vmaddr: Option<u64> = None;
+    let mut has_dylinker = false;
 
     let mut commands = header
         .load_commands(endian, data, 0)
@@ -112,6 +114,11 @@ pub(crate) fn load<FS: ShimFS>(
                 entry_offset = Some(pc);
                 is_lc_main = false;
             }
+        }
+
+        // Check for LC_LOAD_DYLINKER
+        if cmd.cmd() == macho::LC_LOAD_DYLINKER {
+            has_dylinker = true;
         }
     }
 
@@ -383,6 +390,29 @@ pub(crate) fn load<FS: ShimFS>(
     // Set the initial brk now that all segments and TLS table are mapped.
     task.global.pm.set_initial_brk(brk);
 
+    // --- Load dyld if the binary has LC_LOAD_DYLINKER ---
+    //
+    // When the binary is dynamically linked, we load /usr/lib/dyld alongside
+    // the main binary. dyld takes over as the entry point and is responsible
+    // for loading shared libraries at runtime (via mmap, which our mmap-hook
+    // intercepts for code patching).
+    let mut dyld_entry: Option<usize> = None;
+    if has_dylinker {
+        if let Some(dyld_data) = dyld_bytes {
+            let dyld_info = load_dyld(task, dyld_data)?;
+            dyld_entry = Some(dyld_info.entry_point);
+        }
+    }
+
+    // Use dyld's entry point if loaded, otherwise use the main binary's.
+    let final_entry = dyld_entry.unwrap_or(entry_point);
+    // When dyld is loaded, it uses LC_UNIXTHREAD-style entry (stack-based args).
+    let final_is_lc_main = if dyld_entry.is_some() {
+        false
+    } else {
+        is_lc_main
+    };
+
     // Allocate stack
     let sp = unsafe {
         let length = litebox::mm::linux::NonZeroPageSize::new(DEFAULT_STACK_SIZE)
@@ -396,15 +426,315 @@ pub(crate) fn load<FS: ShimFS>(
     };
     let mut stack =
         UserStack::new(sp, DEFAULT_STACK_SIZE).ok_or(MachoLoaderError::InvalidStackAddr)?;
-    stack
-        .init(argv, envp)
-        .ok_or(MachoLoaderError::InvalidStackAddr)?;
+
+    if dyld_entry.is_some() {
+        // Build apple entries for dyld
+        let executable_path = argv
+            .first()
+            .map(|a| a.to_str().unwrap_or("./a.out"))
+            .unwrap_or("./a.out");
+        let apple = alloc::vec![
+            CString::new(alloc::format!("executable_path={executable_path}"))
+                .map_err(|_| MachoLoaderError::InvalidStackAddr)?,
+        ];
+        stack
+            .init_with_apple(argv, envp, apple)
+            .ok_or(MachoLoaderError::InvalidStackAddr)?;
+    } else {
+        stack
+            .init(argv, envp)
+            .ok_or(MachoLoaderError::InvalidStackAddr)?;
+    }
 
     Ok(MachoLoadInfo {
-        entry_point,
+        entry_point: final_entry,
         user_stack_top: stack.get_cur_stack_top(),
-        is_lc_main,
+        is_lc_main: final_is_lc_main,
+        has_dylinker,
     })
+}
+
+/// Extract the arm64/arm64e slice from a universal (fat) Mach-O binary.
+///
+/// Returns the byte range (offset, size) of the arm64 slice within the input.
+/// If the input is not a fat binary, returns None.
+pub(crate) fn extract_arm64_slice(data: &[u8]) -> Option<(usize, usize)> {
+    if data.len() < 8 {
+        return None;
+    }
+    let magic = u32::from_be_bytes(data[0..4].try_into().ok()?);
+    if magic != 0xCAFE_BABE && magic != 0xBEBA_FECA {
+        return None; // Not a fat binary
+    }
+    let nfat_arch = u32::from_be_bytes(data[4..8].try_into().ok()?);
+
+    // Each fat_arch entry is 20 bytes: cputype(4), cpusubtype(4), offset(4), size(4), align(4)
+    for i in 0..nfat_arch as usize {
+        let entry_offset = 8 + i * 20;
+        if entry_offset + 20 > data.len() {
+            return None;
+        }
+        let cputype = u32::from_be_bytes(data[entry_offset..entry_offset + 4].try_into().ok()?);
+        // CPU_TYPE_ARM64 = 0x0100000C (16777228)
+        if cputype == 0x0100_000C {
+            let offset =
+                u32::from_be_bytes(data[entry_offset + 8..entry_offset + 12].try_into().ok()?)
+                    as usize;
+            let size =
+                u32::from_be_bytes(data[entry_offset + 12..entry_offset + 16].try_into().ok()?)
+                    as usize;
+            return Some((offset, size));
+        }
+    }
+    None
+}
+
+/// Load dyld from a (possibly fat) binary, rewriting syscalls and mapping segments.
+///
+/// Returns `DyldLoadInfo` with dyld's entry point and slide.
+fn load_dyld<FS: ShimFS>(
+    task: &Task<FS>,
+    dyld_bytes: &[u8],
+) -> Result<DyldLoadInfo, MachoLoaderError> {
+    // Extract arm64 slice if this is a universal binary
+    let slice_data: &[u8] = if let Some((offset, size)) = extract_arm64_slice(dyld_bytes) {
+        if offset + size > dyld_bytes.len() {
+            return Err(MachoLoaderError::ParseError(
+                "arm64 slice extends beyond file".into(),
+            ));
+        }
+        &dyld_bytes[offset..offset + size]
+    } else {
+        dyld_bytes
+    };
+
+    // Rewrite SVC #0x80 instructions in dyld
+    let rewritten = litebox_syscall_rewriter_macho::hook_syscalls_in_macho(slice_data)
+        .map_err(|e| MachoLoaderError::ParseError(alloc::format!("dyld rewrite failed: {e}")))?;
+    let data: &[u8] = &rewritten;
+
+    // Parse dyld Mach-O header
+    let header = macho::MachHeader64::<Endianness>::parse(data, 0)
+        .map_err(|e| MachoLoaderError::ParseError(alloc::format!("dyld invalid header: {e}")))?;
+    let endian = header
+        .endian()
+        .map_err(|e| MachoLoaderError::ParseError(alloc::format!("dyld endianness: {e}")))?;
+
+    // Validate: must be ARM64, MH_DYLINKER (filetype 7)
+    if header.cputype(endian) != macho::CPU_TYPE_ARM64 {
+        return Err(MachoLoaderError::UnsupportedFormat);
+    }
+    if header.filetype(endian) != 7 {
+        return Err(MachoLoaderError::UnsupportedFormat);
+    }
+
+    // Collect segments and find entry point (LC_UNIXTHREAD)
+    let mut segments = Vec::new();
+    let mut entry_pc: Option<u64> = None;
+
+    let mut commands = header
+        .load_commands(endian, data, 0)
+        .map_err(|e| MachoLoaderError::ParseError(alloc::format!("dyld load commands: {e}")))?;
+
+    while let Some(cmd) = commands
+        .next()
+        .map_err(|e| MachoLoaderError::ParseError(alloc::format!("dyld iterate commands: {e}")))?
+    {
+        if let Some((seg, _sections)) = cmd
+            .segment_64()
+            .map_err(|e| MachoLoaderError::ParseError(alloc::format!("dyld segment: {e}")))?
+        {
+            let name = &seg.segname;
+            if *name == *b"__PAGEZERO\0\0\0\0\0\0" {
+                continue;
+            }
+            segments.push(SegmentInfo {
+                vmaddr: seg.vmaddr.get(endian),
+                vmsize: seg.vmsize.get(endian),
+                fileoff: seg.fileoff.get(endian),
+                filesize: seg.filesize.get(endian),
+                initprot: seg.initprot.get(endian),
+                segname: *name,
+            });
+            continue;
+        }
+
+        // LC_UNIXTHREAD for dyld entry point
+        if cmd.cmd() == macho::LC_UNIXTHREAD {
+            let cmd_data = cmd.raw_data();
+            let pc_offset = 16 + 32 * 8;
+            if cmd_data.len() >= pc_offset + 8 {
+                let pc = u64::from_le_bytes(cmd_data[pc_offset..pc_offset + 8].try_into().unwrap());
+                entry_pc = Some(pc);
+            }
+        }
+    }
+
+    if segments.is_empty() {
+        return Err(MachoLoaderError::NoTextSegment);
+    }
+
+    // Reserve-then-map strategy, same as for main binary but with hint offset
+    // 256MB above DEFAULT_LOW_ADDR to avoid the main binary.
+    const DYLD_HINT_OFFSET: usize = 256 * 1024 * 1024; // 256 MB
+
+    let min_vmaddr = segments
+        .iter()
+        .filter(|s| s.vmsize > 0)
+        .map(|s| s.vmaddr as usize)
+        .min()
+        .unwrap_or(DEFAULT_LOW_ADDR);
+    let max_vmend = segments
+        .iter()
+        .filter(|s| s.vmsize > 0)
+        .map(|s| (s.vmaddr + s.vmsize) as usize)
+        .max()
+        .unwrap_or(DEFAULT_LOW_ADDR);
+
+    let page_aligned_min = min_vmaddr & !(PAGE_SIZE - 1);
+    let page_aligned_max = max_vmend.next_multiple_of(PAGE_SIZE);
+    let total_span = page_aligned_max - page_aligned_min;
+
+    let reserve_flags =
+        litebox_common_linux::MapFlags::MAP_ANONYMOUS | litebox_common_linux::MapFlags::MAP_PRIVATE;
+    let reserved_base = litebox_common_linux::mm::do_mmap(
+        &task.global.pm,
+        Some(DEFAULT_LOW_ADDR + DYLD_HINT_OFFSET),
+        total_span,
+        litebox_common_linux::ProtFlags::PROT_NONE,
+        reserve_flags,
+        false,
+        |_| Ok(0),
+    )
+    .map_err(|e| {
+        MachoLoaderError::MappingError(alloc::format!("dyld reserve {total_span:#x} bytes: {e:?}"))
+    })?
+    .as_usize();
+
+    let slide = reserved_base.wrapping_sub(page_aligned_min);
+
+    // Map each segment
+    for seg in &segments {
+        if seg.vmsize == 0 {
+            continue;
+        }
+
+        let vm_addr = (seg.vmaddr as usize).wrapping_add(slide);
+        let vm_size = (seg.vmsize as usize).next_multiple_of(PAGE_SIZE);
+        let final_prot = prot_from_macho(seg.initprot);
+        let initial_prot = litebox_common_linux::ProtFlags::PROT_READ_WRITE;
+        let flags = litebox_common_linux::MapFlags::MAP_ANONYMOUS
+            | litebox_common_linux::MapFlags::MAP_PRIVATE
+            | litebox_common_linux::MapFlags::MAP_FIXED;
+
+        litebox_common_linux::mm::do_mmap(
+            &task.global.pm,
+            Some(vm_addr),
+            vm_size,
+            initial_prot,
+            flags,
+            false,
+            |_| Ok(0),
+        )
+        .map_err(|e| {
+            MachoLoaderError::MappingError(alloc::format!(
+                "dyld mmap segment {:?} at {vm_addr:#x} size {vm_size:#x}: {e:?}",
+                core::str::from_utf8(&seg.segname).unwrap_or("<invalid>")
+            ))
+        })?;
+
+        let file_size = seg.filesize as usize;
+        if file_size > 0 {
+            let file_off = seg.fileoff as usize;
+            if file_off + file_size > data.len() {
+                return Err(MachoLoaderError::ParseError(alloc::format!(
+                    "dyld segment data at offset {file_off:#x} size {file_size:#x} exceeds file"
+                )));
+            }
+            let dest: MutPtr<u8> = MutPtr::from_usize(vm_addr);
+            dest.copy_from_slice(0, &data[file_off..file_off + file_size])
+                .ok_or(MachoLoaderError::MemoryError(
+                    "failed to copy dyld segment data".into(),
+                ))?;
+        }
+
+        if final_prot != litebox_common_linux::ProtFlags::PROT_READ_WRITE {
+            litebox_common_linux::mm::sys_mprotect(
+                &task.global.pm,
+                MutPtr::from_usize(vm_addr),
+                vm_size,
+                final_prot,
+            )
+            .map_err(|e| {
+                MachoLoaderError::MappingError(alloc::format!(
+                    "dyld mprotect segment at {vm_addr:#x}: {e:?}"
+                ))
+            })?;
+        }
+    }
+
+    // Compute dyld entry point (LC_UNIXTHREAD gives absolute PC, apply slide)
+    let entry_point =
+        (entry_pc.ok_or(MachoLoaderError::NoEntryPoint)? as usize).wrapping_add(slide);
+
+    // --- Initialize dyld's __LITEBOX trampoline ---
+    //
+    // dyld has its own __LITEBOX segment from the rewriter. We need to:
+    // 1. Write the syscall callback address at offset 0 (same as main binary)
+    // 2. Write the SAME TLS table address at offset 8 (reuse the one from main binary)
+    // 3. Do NOT allocate a new TLS table
+    // 4. Do NOT update HOST_TLS_TABLE_ADDR
+    if let Some(litebox_seg) = segments
+        .iter()
+        .find(|s| s.segname.starts_with(b"__LITEBOX"))
+    {
+        let trampoline_start = (litebox_seg.vmaddr as usize).wrapping_add(slide);
+        let trampoline_size = (litebox_seg.vmsize as usize).next_multiple_of(PAGE_SIZE);
+
+        // Make writable
+        litebox_common_linux::mm::sys_mprotect(
+            &task.global.pm,
+            MutPtr::from_usize(trampoline_start),
+            trampoline_size,
+            litebox_common_linux::ProtFlags::PROT_READ_WRITE,
+        )
+        .map_err(|e| {
+            MachoLoaderError::MappingError(alloc::format!(
+                "dyld mprotect __LITEBOX RW for init: {e:?}"
+            ))
+        })?;
+
+        // Write syscall callback address at offset 0
+        let callback_addr = litebox_platform_multiplex::platform().get_syscall_entry_point();
+        let dest: MutPtr<u8> = MutPtr::from_usize(trampoline_start);
+        dest.copy_from_slice(0, &callback_addr.to_ne_bytes())
+            .ok_or(MachoLoaderError::MemoryError(
+                "failed to write dyld trampoline callback address".into(),
+            ))?;
+
+        // Reuse the TLS table from the main binary (already allocated and stored)
+        let tls_table_addr =
+            litebox_common_linux::HOST_TLS_TABLE_ADDR.load(core::sync::atomic::Ordering::Acquire);
+        dest.copy_from_slice(8, &tls_table_addr.to_ne_bytes())
+            .ok_or(MachoLoaderError::MemoryError(
+                "failed to write TLS table address in dyld trampoline".into(),
+            ))?;
+
+        // Re-protect as R-X
+        litebox_common_linux::mm::sys_mprotect(
+            &task.global.pm,
+            MutPtr::from_usize(trampoline_start),
+            trampoline_size,
+            litebox_common_linux::ProtFlags::PROT_READ_EXEC,
+        )
+        .map_err(|e| {
+            MachoLoaderError::MappingError(alloc::format!(
+                "dyld mprotect __LITEBOX R-X after init: {e:?}"
+            ))
+        })?;
+    }
+
+    Ok(DyldLoadInfo { entry_point, slide })
 }
 
 /// Convert macOS VM_PROT_* flags to litebox ProtFlags.

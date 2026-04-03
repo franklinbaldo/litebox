@@ -177,6 +177,7 @@ impl<FS: ShimFS> MacosShim<FS> {
         program_bytes: &[u8],
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
+        dyld_bytes: Option<&[u8]>,
     ) -> Result<LoadedProgram<FS>, loader::MachoLoaderError> {
         let exit_code = Arc::new(AtomicI32::new(0));
 
@@ -194,7 +195,8 @@ impl<FS: ShimFS> MacosShim<FS> {
 
         let arg_count = argv.len();
         let env_count = envp.len();
-        let load_info = loader::load_macho(&entrypoints.task, program_bytes, argv, envp)?;
+        let load_info =
+            loader::load_macho(&entrypoints.task, program_bytes, argv, envp, dyld_bytes)?;
 
         let mut initial_ctx = PtRegs {
             pc: load_info.entry_point,

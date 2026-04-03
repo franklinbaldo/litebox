@@ -3,7 +3,7 @@
 
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use clap::Parser;
 use litebox::fs::{FileSystem as _, Mode};
 use litebox_platform_multiplex::Platform;
@@ -81,7 +81,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         .collect();
 
     let program = shim
-        .load_program(binary_data, argv, envp)
+        .load_program(binary_data, argv, envp, None)
         .map_err(|e| anyhow!("Failed to load Mach-O: {e}"))?;
 
     let litebox_shim_macos::LoadedProgram {

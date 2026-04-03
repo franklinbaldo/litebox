@@ -101,15 +101,26 @@ impl UserStack {
 
     /// Initialize the macOS-style stack.
     pub(super) fn init(&mut self, argv: Vec<CString>, env: Vec<CString>) -> Option<()> {
+        self.init_with_apple(argv, env, Vec::new())
+    }
+
+    /// Initialize the macOS-style stack with apple entries.
+    ///
+    /// The apple array contains key-value strings (e.g. `executable_path=/path`)
+    /// that dyld uses during initialization.
+    pub(super) fn init_with_apple(
+        &mut self,
+        argv: Vec<CString>,
+        env: Vec<CString>,
+        apple: Vec<CString>,
+    ) -> Option<()> {
         // End marker at bottom of stack (8 zero bytes)
         self.push_usize(0)?;
 
         // Push string data (stack grows downward)
+        let apple_offsets = self.push_cstrings(&apple)?;
         let envp_offsets = self.push_cstrings(&env)?;
         let argvp_offsets = self.push_cstrings(&argv)?;
-
-        // apple[] is empty for phase 1
-        let apple_offsets: Vec<usize> = Vec::new();
 
         // Ensure alignment
         let align_down = |pos: usize, alignment: usize| -> usize { pos & !(alignment - 1) };
