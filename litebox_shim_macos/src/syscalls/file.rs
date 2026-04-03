@@ -112,6 +112,22 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle `close(fd)`.
     pub(crate) fn sys_close(&self, fd: i32) -> Result<(), Errno> {
+        // Finalize any mmap-hook trampoline for this fd
+        if let Some(state) = self.patch_cache.borrow_mut().remove(&fd) {
+            if state.trampoline_cursor > 0 {
+                // mprotect trampoline from RW to RX
+                if let Err(e) = litebox_common_linux::mm::sys_mprotect(
+                    &self.global.pm,
+                    crate::MutPtr::from_usize(state.trampoline_addr),
+                    crate::MMAP_HOOK_TRAMPOLINE_SIZE,
+                    litebox_common_linux::ProtFlags::PROT_READ_EXEC,
+                ) {
+                    log_unsupported!("mprotect trampoline RW->RX failed: {e:?}");
+                }
+            }
+        }
+
+        // Existing close logic
         let raw_fd = fd_to_usize(fd)?;
         let typed_fd = {
             let mut rds = self.global.raw_descriptors.write();

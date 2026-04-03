@@ -12,6 +12,7 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -186,6 +187,7 @@ impl<FS: ShimFS> MacosShim<FS> {
                 global: self.0.clone(),
                 terminated: Cell::new(false),
                 exit_code: exit_code.clone(),
+                patch_cache: core::cell::RefCell::new(BTreeMap::new()),
             },
             _not_send: core::marker::PhantomData,
         };
@@ -374,6 +376,17 @@ struct GlobalState<FS: ShimFS> {
     sysroot: Option<alloc::string::String>,
 }
 
+/// Per-fd state for tracking mmap-hook code patching.
+pub(crate) struct MachoPatchState {
+    /// VA of the allocated trampoline region.
+    pub(crate) trampoline_addr: usize,
+    /// Next write offset in the trampoline buffer.
+    pub(crate) trampoline_cursor: usize,
+}
+
+/// Size of the per-fd trampoline region allocated by the mmap-hook (16 KB).
+pub(crate) const MMAP_HOOK_TRAMPOLINE_SIZE: usize = 16 * 1024;
+
 /// A single task (single-threaded for macOS phase 1).
 struct Task<FS: ShimFS> {
     global: Arc<GlobalState<FS>>,
@@ -381,6 +394,9 @@ struct Task<FS: ShimFS> {
     terminated: Cell<bool>,
     /// The exit code, shared with `MacosShimProcess`.
     exit_code: Arc<AtomicI32>,
+    /// Per-fd patch state for the mmap-hook. Tracks trampoline allocation
+    /// and cursor for each fd that has had executable segments mapped.
+    patch_cache: core::cell::RefCell<BTreeMap<i32, MachoPatchState>>,
 }
 
 impl<FS: ShimFS> Task<FS> {

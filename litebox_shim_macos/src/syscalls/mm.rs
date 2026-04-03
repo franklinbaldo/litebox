@@ -6,7 +6,7 @@
 //! macOS uses different flag values from Linux for mmap, so we translate them
 //! to `litebox_common_linux` types which the shared `PageManager` understands.
 
-use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+use litebox::platform::{RawConstPointer as _, RawMutPointer as _, SystemInfoProvider as _};
 use litebox_common_linux::{MapFlags, ProtFlags};
 use litebox_common_macos::errno::Errno;
 
@@ -102,6 +102,8 @@ impl<FS: ShimFS> Task<FS> {
 
         let suggested_addr = if addr == 0 { None } else { Some(addr) };
 
+        let has_exec = (prot & MACOS_PROT_EXEC) != 0;
+
         if linux_flags.contains(MapFlags::MAP_ANONYMOUS) {
             // Anonymous mapping: no file involved.
             let op = |_| Ok(0);
@@ -116,6 +118,9 @@ impl<FS: ShimFS> Task<FS> {
             )
             .map(|ptr: MutPtr<u8>| ptr.as_usize())
             .map_err(mapping_error_to_errno)
+        } else if has_exec && fd >= 0 {
+            // File-backed PROT_EXEC mapping: intercept for code patching.
+            self.sys_mmap_exec_hook(addr, length, prot, flags, fd, offset)
         } else {
             // File-backed mapping: look up the fd and read data into the mapping.
             let typed_fd = {
@@ -157,6 +162,132 @@ impl<FS: ShimFS> Task<FS> {
             .map(|ptr: MutPtr<u8>| ptr.as_usize())
             .map_err(mapping_error_to_errno)
         }
+    }
+
+    /// mmap-hook: intercept file-backed PROT_EXEC mappings and patch SVC sites.
+    ///
+    /// The hook always produces R-X mappings regardless of the requested
+    /// protection bits, since code segments should never be writable at runtime.
+    fn sys_mmap_exec_hook(
+        &self,
+        addr: usize,
+        length: usize,
+        _prot: i32,
+        flags: i32,
+        fd: i32,
+        offset: i64,
+    ) -> Result<usize, Errno> {
+        use litebox::mm::linux::PAGE_SIZE;
+
+        let aligned_length = align_up(length, PAGE_SIZE);
+
+        let is_fixed = (flags & MACOS_MAP_FIXED) != 0;
+
+        // Allocate anonymous RW pages
+        let rw_flags = MapFlags::MAP_ANONYMOUS
+            | MapFlags::MAP_PRIVATE
+            | if is_fixed {
+                MapFlags::MAP_FIXED
+            } else {
+                MapFlags::empty()
+            };
+        let suggested = if addr != 0 { Some(addr) } else { None };
+        let mapped_addr = litebox_common_linux::mm::do_mmap(
+            &self.global.pm,
+            suggested,
+            aligned_length,
+            ProtFlags::PROT_READ_WRITE,
+            rw_flags,
+            false,
+            |_| Ok(0),
+        )
+        .map_err(mapping_error_to_errno)?
+        .as_usize();
+
+        // Read file content into a zero-initialized buffer. Bytes beyond what
+        // the file provides remain zero, which is correct for BSS-like tails.
+        #[allow(clippy::cast_sign_loss)] // fd >= 0 is guaranteed by the caller
+        let typed_fd = {
+            let rds = self.global.raw_descriptors.read();
+            rds.fd_from_raw_integer::<FS>(fd as usize)
+                .map_err(|_| Errno::EBADF)?
+        };
+
+        let mut code_buf = alloc::vec![0u8; length];
+        let offset_usize = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
+        let bytes_read = self
+            .global
+            .fs
+            .read(&typed_fd, &mut code_buf, Some(offset_usize))
+            .map_err(|_| Errno::EIO)?;
+        let _ = bytes_read; // buffer is zero-initialized; unread tail is valid zeros
+
+        // Look up or allocate trampoline for this fd
+        let syscall_entry = litebox_platform_multiplex::platform().get_syscall_entry_point();
+        let mut cache = self.patch_cache.borrow_mut();
+        let state = match cache.entry(fd) {
+            alloc::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            alloc::collections::btree_map::Entry::Vacant(entry) => {
+                let trampoline_hint = mapped_addr.wrapping_add(aligned_length);
+                let trampoline_flags = MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE;
+                let trampoline_addr = litebox_common_linux::mm::do_mmap(
+                    &self.global.pm,
+                    Some(trampoline_hint),
+                    crate::MMAP_HOOK_TRAMPOLINE_SIZE,
+                    ProtFlags::PROT_READ_WRITE,
+                    trampoline_flags,
+                    false,
+                    |_| Ok(0),
+                )
+                .map_err(mapping_error_to_errno)?
+                .as_usize();
+
+                entry.insert(crate::MachoPatchState {
+                    trampoline_addr,
+                    trampoline_cursor: 0,
+                })
+            }
+        };
+
+        // Patch the code buffer
+        // SAFETY: `state.trampoline_addr` points to a valid RW mapping of
+        // MMAP_HOOK_TRAMPOLINE_SIZE bytes that we allocated above.
+        let trampoline_slice = unsafe {
+            core::slice::from_raw_parts_mut(
+                state.trampoline_addr as *mut u8,
+                crate::MMAP_HOOK_TRAMPOLINE_SIZE,
+            )
+        };
+
+        let new_cursor = litebox_syscall_rewriter_macho::patch_code_segment(
+            &mut code_buf,
+            mapped_addr as u64,
+            trampoline_slice,
+            state.trampoline_addr as u64,
+            state.trampoline_cursor,
+            syscall_entry as u64,
+        )
+        .map_err(|e| {
+            log_unsupported!("patch_code_segment failed for fd {fd}: {e}");
+            Errno::EINVAL
+        })?;
+
+        state.trampoline_cursor = new_cursor;
+
+        // Copy patched code into the mapped pages
+        let dest: MutPtr<u8> = MutPtr::from_usize(mapped_addr);
+        dest.copy_from_slice(0, &code_buf).ok_or(Errno::EFAULT)?;
+
+        // Set final protection to R-X
+        litebox_common_linux::mm::sys_mprotect(
+            &self.global.pm,
+            MutPtr::from_usize(mapped_addr),
+            aligned_length,
+            ProtFlags::PROT_READ_EXEC,
+        )
+        .map_err(linux_errno_to_macos)?;
+
+        Ok(mapped_addr)
     }
 
     /// Handle `munmap(addr, length)`.

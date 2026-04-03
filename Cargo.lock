@@ -1845,6 +1845,7 @@ dependencies = [
  "litebox_common_linux",
  "litebox_common_macos",
  "litebox_platform_multiplex",
+ "litebox_syscall_rewriter_macho",
  "object",
  "thiserror 2.0.17",
 ]
