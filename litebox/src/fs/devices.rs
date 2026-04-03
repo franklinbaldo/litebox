@@ -27,6 +27,13 @@ const NULL_BLOCK_SIZE: usize = 0x1000;
 /// Block size for /dev/urandom
 const URANDOM_BLOCK_SIZE: usize = 0x1000;
 
+/// Stored terminal attributes for a PTY pair.
+///
+/// This is a re-export of [`crate::platform::TerminalAttributes`] — the same
+/// type used by the platform abstraction for host stdio terminals. Using a
+/// single type avoids duplication and simplifies conversions.
+pub type PtyTermios = crate::platform::TerminalAttributes;
+
 /// Constant node information for all 3 stdio devices:
 /// ```console
 /// $ stat -L --format 'name=%-11n dev=%d ino=%i rdev=%r' /dev/stdin /dev/stdout /dev/stderr

@@ -3,7 +3,8 @@
 
 //! File-system related functionality
 
-use crate::fd::{FdEnabledSubsystem, TypedFd};
+use crate::event::IOPollable;
+use crate::fd::{FdEnabledSubsystem, MetadataError, TypedFd};
 use crate::path;
 
 use alloc::vec::Vec;
@@ -24,7 +25,7 @@ mod tests;
 
 use errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, ReadDirError,
-    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ReadError, RenameError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
 };
 
 /// A private module, to help support writing sealed traits. This module should _itself_ never be
@@ -44,6 +45,15 @@ mod private {
 /// However, users of any of these file systems might find benefit in having most of their code
 /// depend on this trait, rather than on any individual file system.
 pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
+    /// Whether the FS backend automatically follows symlinks during walk.
+    ///
+    /// When `true`, callers should skip client-side `realpath`-like
+    /// canonicalization because the backend already resolves symlinks.
+    /// Defaults to `false` (conservative).
+    fn walks_follow_symlinks(&self) -> bool {
+        false
+    }
+
     /// Opens a file
     ///
     /// The `mode` is only significant when creating a file
@@ -53,6 +63,20 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         flags: OFlags,
         mode: Mode,
     ) -> Result<TypedFd<Self>, OpenError>;
+
+    /// Create an anonymous regular file that has no namespace entry.
+    ///
+    /// This is used for Linux `memfd_create`-style descriptors: the file
+    /// behaves like an ordinary seekable regular file, but only the returned
+    /// file descriptor keeps it alive.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn create_anonymous_file(
+        &self,
+        name: &str,
+        mode: Mode,
+    ) -> Result<TypedFd<Self>, errors::CreateAnonymousFileError> {
+        Err(errors::CreateAnonymousFileError::NotSupported)
+    }
 
     /// Close the file at `fd`.
     ///
@@ -120,6 +144,15 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// Unlink a file
     fn unlink(&self, path: impl path::Arg) -> Result<(), UnlinkError>;
 
+    /// Rename (move) a file or directory
+    fn rename(
+        &self,
+        _old_path: impl path::Arg,
+        _new_path: impl path::Arg,
+    ) -> Result<(), RenameError> {
+        Err(RenameError::Io)
+    }
+
     /// Create a new directory
     fn mkdir(&self, path: impl path::Arg, mode: Mode) -> Result<(), MkdirError>;
 
@@ -145,6 +178,201 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// Returns `None` if indicating no static backing data is available/supported.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
     fn get_static_backing_data(&self, fd: &TypedFd<Self>) -> Option<&'static [u8]> {
+        None
+    }
+
+    /// Check whether the given fd was opened with write access (`O_WRONLY` or
+    /// `O_RDWR`).
+    ///
+    /// This is a pure metadata query with no I/O side effects. The default
+    /// implementation conservatively returns `true`.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn is_writable(&self, fd: &TypedFd<Self>) -> bool {
+        true
+    }
+
+    /// Synchronize per-open status flags to the backing file description.
+    ///
+    /// Most filesystem backends can ignore this because status flags are only
+    /// tracked by higher layers for `F_GETFL`. Device-style backends that
+    /// implement per-open blocking behavior should override it so `O_NONBLOCK`
+    /// and similar flags remain visible on the real backing fd.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn set_open_status_flags(
+        &self,
+        fd: &TypedFd<Self>,
+        flags: OFlags,
+    ) -> Result<(), MetadataError> {
+        Ok(())
+    }
+
+    /// Get an `IOPollable` for a file descriptor, if the underlying device supports polling.
+    ///
+    /// Returns `Some(pollable)` for device types with async event support (e.g., PTY master),
+    /// or `None` for regular files that don't support async I/O notifications.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn get_io_pollable(&self, fd: &TypedFd<Self>) -> Option<alloc::boxed::Box<dyn IOPollable>> {
+        None
+    }
+
+    /// Get stored PTY termios for a file descriptor.
+    ///
+    /// Returns `Some(termios)` if the fd refers to a PTY device, `None` otherwise.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn get_pty_termios(&self, fd: &TypedFd<Self>) -> Option<devices::PtyTermios> {
+        None
+    }
+
+    /// Set stored PTY termios for a file descriptor.
+    ///
+    /// Returns `true` if the fd refers to a PTY device and the termios was updated,
+    /// `false` otherwise.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn set_pty_termios(&self, fd: &TypedFd<Self>, termios: devices::PtyTermios) -> bool {
+        false
+    }
+
+    /// Get the foreground process group for a PTY file descriptor.
+    ///
+    /// Returns `Some(pgrp)` if the fd refers to a PTY device, `None` otherwise.
+    /// A value of `0` means no foreground pgrp has been set yet.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn get_pty_foreground_pgrp(&self, fd: &TypedFd<Self>) -> Option<i32> {
+        None
+    }
+
+    /// Set the foreground process group for a PTY file descriptor.
+    ///
+    /// Returns `true` if the fd refers to a PTY device and the pgrp was updated,
+    /// `false` otherwise.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn set_pty_foreground_pgrp(&self, fd: &TypedFd<Self>, pgrp: i32) -> bool {
+        false
+    }
+
+    /// Read the target of a symbolic link.
+    ///
+    /// Returns the link target as a string. The default implementation returns
+    /// [`ReadLinkError::NotSupported`](errors::ReadLinkError::NotSupported),
+    /// since most in-memory filesystems don't have symlinks.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn read_link(
+        &self,
+        path: impl path::Arg,
+    ) -> Result<alloc::string::String, errors::ReadLinkError> {
+        Err(errors::ReadLinkError::NotSupported)
+    }
+
+    /// Create a symbolic link.
+    ///
+    /// Creates a symlink at `linkpath` pointing to `target`. The default
+    /// implementation returns
+    /// [`SymlinkError::NotSupported`](errors::SymlinkError::NotSupported),
+    /// since most in-memory filesystems don't support symlinks.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn symlink(
+        &self,
+        target: impl path::Arg,
+        linkpath: impl path::Arg,
+    ) -> Result<(), errors::SymlinkError> {
+        Err(errors::SymlinkError::NotSupported)
+    }
+
+    /// Create a hard link.
+    ///
+    /// Creates a new directory entry `newpath` that refers to the same inode
+    /// as `oldpath`. The default implementation returns
+    /// [`LinkError::NotSupported`](errors::LinkError::NotSupported).
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn link(
+        &self,
+        oldpath: impl path::Arg,
+        newpath: impl path::Arg,
+    ) -> Result<(), errors::LinkError> {
+        Err(errors::LinkError::NotSupported)
+    }
+
+    // -- fd-relative (`*_at`) methods --
+    //
+    // These resolve a relative path starting from a directory file descriptor.
+    // The path is stored in each FS Descriptor at open time; implementations
+    // join it with the relative component and delegate to path-based methods.
+    //
+    // Default implementations return `NotSupported` / `NotFound`-style errors
+    // so that the trait expansion can land before concrete implementations.
+
+    /// Open a file relative to a directory fd.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn open_at(
+        &self,
+        dirfd: &TypedFd<Self>,
+        rel_path: impl path::Arg,
+        flags: OFlags,
+        mode: Mode,
+    ) -> Result<TypedFd<Self>, OpenError> {
+        Err(OpenError::Io)
+    }
+
+    /// Obtain the status of a file relative to a directory fd.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn stat_at(
+        &self,
+        dirfd: &TypedFd<Self>,
+        rel_path: impl path::Arg,
+        follow_symlinks: bool,
+    ) -> Result<FileStatus, FileStatusError> {
+        Err(FileStatusError::Io)
+    }
+
+    /// Unlink a file relative to a directory fd.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn unlink_at(
+        &self,
+        dirfd: &TypedFd<Self>,
+        rel_path: impl path::Arg,
+    ) -> Result<(), UnlinkError> {
+        Err(UnlinkError::Io)
+    }
+
+    /// Read a symbolic link relative to a directory fd.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn readlink_at(
+        &self,
+        dirfd: &TypedFd<Self>,
+        rel_path: impl path::Arg,
+    ) -> Result<alloc::string::String, errors::ReadLinkError> {
+        Err(errors::ReadLinkError::NotSupported)
+    }
+
+    /// Rename a file, with source and destination relative to directory fds.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn rename_at(
+        &self,
+        old_dirfd: &TypedFd<Self>,
+        old_rel: impl path::Arg,
+        new_dirfd: &TypedFd<Self>,
+        new_rel: impl path::Arg,
+    ) -> Result<(), RenameError> {
+        Err(RenameError::NotSupported)
+    }
+
+    /// Create a directory relative to a directory fd.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn mkdir_at(
+        &self,
+        dirfd: &TypedFd<Self>,
+        rel_path: impl path::Arg,
+        mode: Mode,
+    ) -> Result<(), MkdirError> {
+        Err(MkdirError::Io)
+    }
+
+    /// Get the path associated with an open file descriptor, if available.
+    ///
+    /// Returns the path that was used to open the file. Used by the ELF
+    /// patch cache and diagnostics.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn fd_path(&self, fd: &TypedFd<Self>) -> Option<alloc::string::String> {
         None
     }
 }
@@ -198,6 +426,7 @@ pub enum FileType {
     RegularFile,
     Directory,
     CharacterDevice,
+    Symlink,
 }
 
 bitflags! {
@@ -287,6 +516,7 @@ pub enum SeekWhence {
 /// elements might be added to this struct, allowing file systems to provide richer information
 /// about the status of files. However, users of LiteBox must not depend on the completeness or even
 /// layout of this particular type.
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct FileStatus {
     /// File type

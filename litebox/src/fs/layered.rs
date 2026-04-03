@@ -145,11 +145,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         },
                     }
                 }
-                Ok(FileType::RegularFile | FileType::CharacterDevice)
+                Ok(FileType::RegularFile | FileType::CharacterDevice | FileType::Symlink)
                 | Err(
                     FileStatusError::PathError(PathError::MissingComponent)
                     | FileStatusError::ClosedFd,
                 ) => unreachable!(),
+                Err(FileStatusError::NotADirectory) => {
+                    unimplemented!()
+                }
+                Err(FileStatusError::SymlinkLoop) => {
+                    unimplemented!()
+                }
                 Err(FileStatusError::PathError(PathError::ComponentNotADirectory)) => {
                     unimplemented!()
                 }
@@ -208,6 +214,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                 OpenError::NoWritePerms
                 | OpenError::ReadOnlyFileSystem
                 | OpenError::AlreadyExists
+                | OpenError::Interrupted
+                | OpenError::ClosedFd
+                | OpenError::NotADirectory
                 | OpenError::TruncateError(_) => unreachable!(),
                 OpenError::PathError(path_error) => return Err(path_error)?,
             },
@@ -260,7 +269,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         // In which case we quit early
                         return Err(MigrationError::NotAFile);
                     }
-                    ReadError::ClosedFd | ReadError::NotForReading => unreachable!(),
+                    ReadError::ClosedFd
+                    | ReadError::NotForReading
+                    | ReadError::WouldBlock
+                    | ReadError::Interrupted => unreachable!(),
                     ReadError::Io => return Err(MigrationError::Io),
                 },
             }
@@ -538,6 +550,9 @@ impl<
                 | OpenError::NoWritePerms
                 | OpenError::ReadOnlyFileSystem
                 | OpenError::AlreadyExists
+                | OpenError::Interrupted
+                | OpenError::ClosedFd
+                | OpenError::NotADirectory
                 | OpenError::TruncateError(
                     TruncateError::IsDirectory
                     | TruncateError::NotForWriting
@@ -958,6 +973,8 @@ impl<
             Err(FileStatusError::Io) => return Err(ChmodError::Io),
             Err(FileStatusError::PathError(e)) => return Err(ChmodError::PathError(e)),
             Err(FileStatusError::ClosedFd) => unreachable!(),
+            Err(FileStatusError::NotADirectory) => unimplemented!(),
+            Err(FileStatusError::SymlinkLoop) => unimplemented!(),
         }
         match self.migrate_file_up(&path, true) {
             Ok(()) => {}
@@ -1003,6 +1020,8 @@ impl<
             Err(FileStatusError::Io) => return Err(ChownError::Io),
             Err(FileStatusError::PathError(e)) => return Err(ChownError::PathError(e)),
             Err(FileStatusError::ClosedFd) => unreachable!(),
+            Err(FileStatusError::NotADirectory) => unimplemented!(),
+            Err(FileStatusError::SymlinkLoop) => unimplemented!(),
         }
         match self.migrate_file_up(&path, true) {
             Ok(()) => {}
@@ -1035,6 +1054,8 @@ impl<
                 | UnlinkError::Io
                 | UnlinkError::IsADirectory
                 | UnlinkError::ReadOnlyFileSystem
+                | UnlinkError::ClosedFd
+                | UnlinkError::NotADirectory
                 | UnlinkError::PathError(
                     PathError::ComponentNotADirectory
                     | PathError::InvalidPathname
@@ -1048,9 +1069,10 @@ impl<
                     // We must now check if the lower level contains the file; if it does not, we
                     // must exit with failure. Otherwise, we fallthrough to place the tombstone.
                     match self.ensure_lower_contains(&path).map_err(|e| match e {
-                        FileStatusError::Io => UnlinkError::Io,
+                        FileStatusError::Io | FileStatusError::SymlinkLoop => UnlinkError::Io,
                         FileStatusError::PathError(p) => UnlinkError::PathError(p),
                         FileStatusError::ClosedFd => unreachable!(),
+                        FileStatusError::NotADirectory => UnlinkError::NotADirectory,
                     })? {
                         FileType::RegularFile => {
                             // fallthrough
@@ -1058,7 +1080,7 @@ impl<
                         FileType::Directory => {
                             return Err(UnlinkError::IsADirectory);
                         }
-                        FileType::CharacterDevice => unimplemented!(),
+                        FileType::CharacterDevice | FileType::Symlink => unimplemented!(),
                     }
                 }
             },
@@ -1138,6 +1160,9 @@ impl<
                 }
                 OpenError::NoWritePerms
                 | OpenError::AlreadyExists
+                | OpenError::Interrupted
+                | OpenError::ClosedFd
+                | OpenError::NotADirectory
                 | OpenError::TruncateError(_) => {
                     unreachable!()
                 }
@@ -1315,7 +1340,9 @@ impl<
                     // None of these can be handled by lower level, just quit out early
                     return Err(e);
                 }
-                FileStatusError::Io => return Err(e),
+                FileStatusError::Io
+                | FileStatusError::NotADirectory
+                | FileStatusError::SymlinkLoop => return Err(e),
                 FileStatusError::PathError(
                     PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
                 ) => {
