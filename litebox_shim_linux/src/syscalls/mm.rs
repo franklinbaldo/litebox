@@ -424,6 +424,8 @@ impl<FS: ShimFS> Task<FS> {
     /// Reads the ELF header to determine the trampoline address (page-aligned
     /// end of the highest PT_LOAD segment) and checks the file tail for the
     /// trampoline magic to determine if it's pre-patched.
+    ///
+    /// x86_64 only: assumes 64-bit ELF layout and program header offsets.
     #[allow(clippy::cast_possible_truncation)]
     fn init_elf_patch_state(&self, fd: i32, base_addr: usize) {
         // Quick check: skip if already initialized.
