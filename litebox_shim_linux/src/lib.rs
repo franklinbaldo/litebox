@@ -702,26 +702,53 @@ impl<FS: ShimFS> Task<FS> {
         count: usize,
         offset: i64,
     ) -> Result<usize, Errno> {
-        let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
-        let mut read_total = 0;
-        while read_total < count {
-            let to_read = (count - read_total).min(kernel_buf.len());
-            match self.sys_pread64(
-                fd,
-                &mut kernel_buf[..to_read],
-                offset + (read_total.reinterpret_as_signed() as i64),
-            ) {
-                Ok(0) => break, // EOF
-                Ok(size) => {
-                    buf.copy_from_slice(read_total, &kernel_buf[..size])
-                        .ok_or(Errno::EFAULT)?;
-                    read_total += size;
-                }
-                Err(e) => return Err(e),
+        #[cfg(feature = "platform_central")]
+        {
+            let addr = buf.as_usize();
+            if addr == 0 {
+                return Err(Errno::EFAULT);
             }
+            // SAFETY: In central mode, buf points to the shmem data region
+            // (central rewrites the pointer). The memory is valid and writable
+            // for `count` bytes.
+            let slice = unsafe {
+                core::slice::from_raw_parts_mut(addr as *mut u8, count)
+            };
+            let mut read_total = 0;
+            while read_total < count {
+                let cur_offset = offset + (read_total.reinterpret_as_signed() as i64);
+                match self.sys_pread64(fd, &mut slice[read_total..], cur_offset) {
+                    Ok(0) => break, // EOF
+                    Ok(size) => read_total += size,
+                    Err(e) => return Err(e),
+                }
+            }
+            assert!(read_total <= count);
+            Ok(read_total)
         }
-        assert!(read_total <= count);
-        Ok(read_total)
+        #[cfg(not(feature = "platform_central"))]
+        {
+            let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
+            let mut read_total = 0;
+            while read_total < count {
+                let to_read = (count - read_total).min(kernel_buf.len());
+                match self.sys_pread64(
+                    fd,
+                    &mut kernel_buf[..to_read],
+                    offset + (read_total.reinterpret_as_signed() as i64),
+                ) {
+                    Ok(0) => break, // EOF
+                    Ok(size) => {
+                        buf.copy_from_slice(read_total, &kernel_buf[..size])
+                            .ok_or(Errno::EFAULT)?;
+                        read_total += size;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            assert!(read_total <= count);
+            Ok(read_total)
+        }
     }
 
     /// Handle Linux syscalls and dispatch them to LiteBox implementations.
@@ -777,12 +804,30 @@ impl<FS: ShimFS> Task<FS> {
                 // Note some applications (e.g., `node`) seem to assume that getting fewer bytes than
                 // requested indicates EOF.
                 if count <= MAX_KERNEL_BUF_SIZE {
-                    let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
-                    self.sys_read(fd, &mut kernel_buf, None).and_then(|size| {
-                        buf.copy_from_slice(0, &kernel_buf[..size])
-                            .map(|()| size)
-                            .ok_or(Errno::EFAULT)
-                    })
+                    #[cfg(feature = "platform_central")]
+                    {
+                        let addr = buf.as_usize();
+                        if addr == 0 {
+                            Err(Errno::EFAULT)
+                        } else {
+                            // SAFETY: In central mode, buf points to the shmem
+                            // data region (central rewrites rsi). The memory is
+                            // valid and writable for `count` bytes.
+                            let slice = unsafe {
+                                core::slice::from_raw_parts_mut(addr as *mut u8, count)
+                            };
+                            self.sys_read(fd, slice, None)
+                        }
+                    }
+                    #[cfg(not(feature = "platform_central"))]
+                    {
+                        let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
+                        self.sys_read(fd, &mut kernel_buf, None).and_then(|size| {
+                            buf.copy_from_slice(0, &kernel_buf[..size])
+                                .map(|()| size)
+                                .ok_or(Errno::EFAULT)
+                        })
+                    }
                 } else {
                     // If the read size is too large, we need to do some extra work to avoid OOMing.
                     // We read data in chunks and update the file offset ourselves only if the read succeeds.

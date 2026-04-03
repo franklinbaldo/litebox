@@ -1484,20 +1484,50 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EBADF);
         };
         let mut source_addr = None;
-        let mut buffer = [0u8; MAX_LEN];
-        let recv_buf = &mut buffer[..MAX_LEN.min(len)];
-        let size = self.do_recvfrom(
-            sockfd,
-            recv_buf,
-            flags,
-            if addr.is_some() {
-                Some(&mut source_addr)
-            } else {
-                None
-            },
-        )?;
-        buf.copy_from_slice(0, &recv_buf[..size.min(recv_buf.len())])
-            .ok_or(Errno::EFAULT)?;
+
+        #[cfg(feature = "platform_central")]
+        let size = {
+            let buf_addr = buf.as_usize();
+            if buf_addr == 0 {
+                return Err(Errno::EFAULT);
+            }
+            // SAFETY: In central mode, buf points to the shmem data region
+            // (central rewrites the pointer). The memory is valid and writable
+            // for `len` bytes (capped at MAX_LEN).
+            let recv_buf = unsafe {
+                core::slice::from_raw_parts_mut(buf_addr as *mut u8, MAX_LEN.min(len))
+            };
+            self.do_recvfrom(
+                sockfd,
+                recv_buf,
+                flags,
+                if addr.is_some() {
+                    Some(&mut source_addr)
+                } else {
+                    None
+                },
+            )?
+        };
+
+        #[cfg(not(feature = "platform_central"))]
+        let size = {
+            let mut buffer = [0u8; MAX_LEN];
+            let recv_buf = &mut buffer[..MAX_LEN.min(len)];
+            let size = self.do_recvfrom(
+                sockfd,
+                recv_buf,
+                flags,
+                if addr.is_some() {
+                    Some(&mut source_addr)
+                } else {
+                    None
+                },
+            )?;
+            buf.copy_from_slice(0, &recv_buf[..size.min(recv_buf.len())])
+                .ok_or(Errno::EFAULT)?;
+            size
+        };
+
         if let Some(src_addr) = source_addr
             && let Some(sock_ptr) = addr
         {

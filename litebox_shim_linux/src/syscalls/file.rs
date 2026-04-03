@@ -567,6 +567,8 @@ impl<FS: ShimFS> Task<FS> {
         let iovs: &[IoReadVec<MutPtr<u8>>] = &iovec.to_owned_slice(iovcnt).ok_or(Errno::EFAULT)?;
         let files = self.files.borrow();
         let mut total_read = 0;
+
+        #[cfg(not(feature = "platform_central"))]
         let mut kernel_buffer = vec![
             0u8;
             iovs.iter()
@@ -575,6 +577,7 @@ impl<FS: ShimFS> Task<FS> {
                 .unwrap_or_default()
                 .min(super::super::MAX_KERNEL_BUF_SIZE)
         ];
+
         for iov in iovs {
             if iov.iov_len == 0 {
                 continue;
@@ -585,25 +588,56 @@ impl<FS: ShimFS> Task<FS> {
             // TODO: The data transfers performed by readv() and writev() are atomic: the data
             // written by writev() is written as a single block that is not intermingled with
             // output from writes in other processes
-            let size = files
-                .run_on_raw_fd(
-                    raw_fd,
-                    |fd| {
-                        files
-                            .fs
-                            .read(fd, &mut kernel_buffer, None)
-                            .map_err(Errno::from)
-                    },
-                    |_fd| todo!("net"),
-                    |_fd| todo!("pipes"),
-                    |_fd| todo!("eventfd"),
-                    |_fd| Err(Errno::EINVAL),
-                    |_fd| todo!("unix"),
-                )
-                .flatten()?;
-            iov.iov_base
-                .copy_from_slice(0, &kernel_buffer[..size])
-                .ok_or(Errno::EFAULT)?;
+
+            #[cfg(feature = "platform_central")]
+            let size = {
+                let iov_base = iov.iov_base;
+                let iov_len = iov.iov_len;
+                let addr = iov_base.as_usize();
+                if addr == 0 {
+                    return Err(Errno::EFAULT);
+                }
+                // SAFETY: In central mode, iov_base points to valid, stable
+                // host memory (shmem) for the duration of this synchronous
+                // dispatch.
+                let slice = unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, iov_len) };
+                files
+                    .run_on_raw_fd(
+                        raw_fd,
+                        |fd| files.fs.read(fd, slice, None).map_err(Errno::from),
+                        |_fd| todo!("net"),
+                        |_fd| todo!("pipes"),
+                        |_fd| todo!("eventfd"),
+                        |_fd| Err(Errno::EINVAL),
+                        |_fd| todo!("unix"),
+                    )
+                    .flatten()?
+            };
+
+            #[cfg(not(feature = "platform_central"))]
+            let size = {
+                let size = files
+                    .run_on_raw_fd(
+                        raw_fd,
+                        |fd| {
+                            files
+                                .fs
+                                .read(fd, &mut kernel_buffer, None)
+                                .map_err(Errno::from)
+                        },
+                        |_fd| todo!("net"),
+                        |_fd| todo!("pipes"),
+                        |_fd| todo!("eventfd"),
+                        |_fd| Err(Errno::EINVAL),
+                        |_fd| todo!("unix"),
+                    )
+                    .flatten()?;
+                iov.iov_base
+                    .copy_from_slice(0, &kernel_buffer[..size])
+                    .ok_or(Errno::EFAULT)?;
+                size
+            };
+
             total_read += size;
             if size < iov.iov_len {
                 // Okay to transfer fewer bytes than requested
