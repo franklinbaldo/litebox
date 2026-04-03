@@ -254,6 +254,7 @@ impl<
             .read_from_stdin(buf)
             .map_err(|e| match e {
                 StdioReadError::Closed => unimplemented!(),
+                StdioReadError::WouldBlock => unimplemented!(),
             })
     }
 

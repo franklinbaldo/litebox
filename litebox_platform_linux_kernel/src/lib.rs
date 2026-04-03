@@ -85,6 +85,12 @@ impl<'a, Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<'a, H
 
 impl<Host: HostInterface> Provider for LinuxKernel<Host> {}
 
+impl<Host: HostInterface> litebox::platform::RawMessageProvider for LinuxKernel<Host> {}
+
+impl<Host: HostInterface> litebox::platform::AddressSpaceProvider for LinuxKernel<Host> {
+    type AddressSpaceId = u32;
+}
+
 // TODO: implement pointer validation to ensure the pointers are in user space.
 type UserConstPtr<T> = litebox::platform::common_providers::userspace_pointers::UserConstPtr<
     litebox::platform::common_providers::userspace_pointers::NoValidation,
@@ -424,6 +430,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         initial_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
         can_grow_down: bool,
         populate_pages_immediately: bool,
+        _noreserve: bool,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
         let range = PageRange::new(suggested_range.start, suggested_range.end)

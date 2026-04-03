@@ -59,6 +59,14 @@ impl MockPlatform {
 
 impl Provider for MockPlatform {}
 
+impl RawMessageProvider for MockPlatform {}
+
+impl AddressSpaceProvider for MockPlatform {
+    // All methods default to `Err(NotSupported)`, which is correct for the
+    // mock platform (single-process only).
+    type AddressSpaceId = u32;
+}
+
 pub(crate) struct MockRawMutex {
     inner: AtomicU32,
     internal_state: std::sync::RwLock<MockRawMutexInternalState>,
@@ -210,7 +218,7 @@ impl IPInterfaceProvider for MockPlatform {
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct MockInstant {
-    time: u64,
+    pub(crate) time: u64,
 }
 
 impl Instant for MockInstant {
@@ -230,7 +238,7 @@ impl Instant for MockInstant {
 }
 
 pub(crate) struct MockSystemTime {
-    time: u64,
+    pub(crate) time: u64,
 }
 
 impl SystemTime for MockSystemTime {
@@ -290,6 +298,9 @@ impl RawPointerProvider for MockPlatform {
 
 impl StdioProvider for MockPlatform {
     fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, StdioReadError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let Some(front) = self.stdin_queue.write().unwrap().pop_front() else {
             return Err(StdioReadError::Closed);
         };
@@ -318,6 +329,26 @@ impl StdioProvider for MockPlatform {
     fn is_a_tty(&self, _stream: StdioStream) -> bool {
         false
     }
+
+    fn get_terminal_input_bytes(&self, stream: StdioStream) -> Result<u32, StdioIoctlError> {
+        match stream {
+            StdioStream::Stdin => {
+                let len = self
+                    .stdin_queue
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .map(std::vec::Vec::len)
+                    .sum::<usize>();
+                Ok(u32::try_from(len).unwrap_or(u32::MAX))
+            }
+            StdioStream::Stdout | StdioStream::Stderr => Err(StdioIoctlError::NotATerminal),
+        }
+    }
+
+    fn poll_stdin_readable(&self) -> bool {
+        self.stdin_queue.read().unwrap().front().is_some()
+    }
 }
 
 impl CrngProvider for MockPlatform {
@@ -330,6 +361,29 @@ impl CrngProvider for MockPlatform {
             buf[off..off + max].copy_from_slice(&bytes.to_ne_bytes()[..max]);
             off += max;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MockPlatform, StdioProvider};
+
+    #[test]
+    fn nonblocking_stdin_reads_queued_input() {
+        let platform = MockPlatform::new();
+        platform
+            .stdin_queue
+            .write()
+            .unwrap()
+            .push_back(b"ready".to_vec());
+
+        let mut buf = [0u8; 8];
+        let read = platform
+            .read_from_stdin_nonblocking(&mut buf)
+            .expect("queued stdin should not block");
+
+        assert_eq!(read, 5);
+        assert_eq!(&buf[..read], b"ready");
     }
 }
 

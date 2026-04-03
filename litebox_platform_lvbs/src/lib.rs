@@ -1228,6 +1228,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         initial_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
         can_grow_down: bool,
         populate_pages_immediately: bool,
+        _noreserve: bool,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
         let range = PageRange::new(suggested_range.start, suggested_range.end)
@@ -1349,6 +1350,14 @@ impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<
     fn get_vdso_address(&self) -> Option<usize> {
         unimplemented!()
     }
+}
+
+impl<Host: HostInterface> litebox::platform::RawMessageProvider for LinuxKernel<Host> {}
+
+impl<Host: HostInterface> litebox::platform::AddressSpaceProvider for LinuxKernel<Host> {
+    // All methods default to `Err(NotSupported)` — real implementation comes
+    // when LVBS multi-process (separate page tables) is added.
+    type AddressSpaceId = u32;
 }
 
 #[cfg(feature = "optee_syscall")]
