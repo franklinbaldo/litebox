@@ -12,12 +12,49 @@ mod shmem;
 
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use clap::Parser;
 use litebox::fs::FileSystem as _;
 use litebox_ipc::ring::SharedRingLayout;
 use litebox_platform_central::CentralPlatform;
 use litebox_platform_multiplex::Platform;
+
+/// Newtype wrapper so we can store raw ring-header pointers in a `Mutex`
+/// across threads (required for `static` items to implement `Sync`).
+struct RingPtr(*const litebox_ipc::ring::RingHeader);
+
+// SAFETY: Ring header pointers come from mmap'd shared memory that outlives
+// the process. The Mutex serialises all access.
+unsafe impl Send for RingPtr {}
+
+/// Global registry of active ring header pointers so that the panic hook
+/// (and normal exit path) can set `is_exiting` on ALL rings, ensuring every
+/// micro process detects central's death.
+static ACTIVE_RINGS: Mutex<Vec<RingPtr>> = Mutex::new(Vec::new());
+
+/// Register a ring header pointer so it will be signalled on exit/panic.
+fn register_active_ring(header: &litebox_ipc::ring::RingHeader) {
+    let ptr: *const litebox_ipc::ring::RingHeader = header;
+    if let Ok(mut rings) = ACTIVE_RINGS.lock() {
+        rings.push(RingPtr(ptr));
+    }
+}
+
+/// Signal all active rings that central is exiting.
+fn signal_all_rings_exiting() {
+    if let Ok(rings) = ACTIVE_RINGS.lock() {
+        for ring in &*rings {
+            // SAFETY: The ring header lives in mmap'd shared memory that
+            // remains valid for the lifetime of the process.
+            unsafe {
+                (*ring.0)
+                    .is_exiting
+                    .store(1, core::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+}
 
 /// Filesystem type for central: in-memory over (devices over tar_ro).
 ///
@@ -56,6 +93,13 @@ struct Args {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Install a panic hook that signals all micro processes before aborting.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        signal_all_rings_exiting();
+        default_hook(info);
+    }));
+
     // Parse CLI args early — we need them for platform and FS construction.
     let args = Args::parse();
 
@@ -136,9 +180,23 @@ fn main() -> anyhow::Result<()> {
                         core::time::Duration::from_millis(1);
 
                     while !shutdown.load(core::sync::atomic::Ordering::Relaxed) {
+                        // Limit consecutive immediate re-polls to prevent the
+                        // net-worker from starving server threads when smoltcp
+                        // continuously reports SocketStateChanged (e.g. many
+                        // sockets in half-closed / TIME_WAIT states).
+                        const MAX_IMMEDIATE_POLLS: u32 = 64;
+                        let mut polls = 0u32;
                         let timeout = loop {
                             match shim.perform_network_interaction() {
-                                litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately => {}
+                                litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately => {
+                                    polls += 1;
+                                    if polls >= MAX_IMMEDIATE_POLLS {
+                                        // Yield to let server threads acquire
+                                        // the network lock, then try again
+                                        // with a real blocking wait.
+                                        break Some(MAX_TIMEOUT);
+                                    }
+                                }
                                 litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction { timeout } => {
                                     break timeout;
                                 }
@@ -188,8 +246,15 @@ fn main() -> anyhow::Result<()> {
 
     let ring_pool = Arc::new(shmem::RingPool::new(8));
 
+    // Register the initial ring so it gets signalled on exit/panic.
+    register_active_ring(region.header());
+
     let server = server::ProcessServer::new(region, task, shim, fs, ring_pool, -1);
     let result = server.run();
+
+    // Signal all micro processes that central is shutting down.
+    signal_all_rings_exiting();
+
     net_shutdown.store(true, core::sync::atomic::Ordering::Relaxed);
     if let Some(handle) = net_worker {
         let _ = handle.join();

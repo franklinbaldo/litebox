@@ -1658,6 +1658,35 @@ impl<FS: ShimFS> Task<FS> {
             },
         )
     }
+
+    /// Handle syscall `shutdown`
+    pub(crate) fn sys_shutdown(&self, sockfd: i32, how: i32) -> Result<(), Errno> {
+        let Ok(sockfd) = u32::try_from(sockfd) else {
+            return Err(Errno::EBADF);
+        };
+        let (shut_rd, shut_wr) = match how {
+            0 => (true, false), // SHUT_RD
+            1 => (false, true), // SHUT_WR
+            2 => (true, true),  // SHUT_RDWR
+            _ => return Err(Errno::EINVAL),
+        };
+        self.files.borrow().with_socket(
+            &self.global,
+            sockfd,
+            |fd| {
+                self.global
+                    .net
+                    .lock()
+                    .shutdown(fd, shut_rd, shut_wr)
+                    .map_err(Errno::from)
+            },
+            |_file| {
+                // Unix socket shutdown — not yet implemented; return success
+                // to avoid breaking callers that call shutdown on all sockets.
+                Ok(())
+            },
+        )
+    }
 }
 
 #[cfg(target_arch = "x86")]

@@ -194,8 +194,12 @@ pub struct RingHeader {
     pub sq_tail: AtomicU64,
     /// Notification futex for waking the host when new SQ entries arrive.
     pub sq_notify: AtomicU32,
+    /// Set to 1 by central when it is shutting down (normal exit, panic, or
+    /// signal). Micro checks this after futex timeouts to detect central death
+    /// and exit gracefully instead of hanging forever.
+    pub is_exiting: AtomicU32,
     /// Padding to fill the first cache line.
-    pub _pad_sq: [u8; 44],
+    pub _pad_sq: [u8; 40],
 
     // --- Second cache line: completion queue metadata ---
     /// CQ consumer position (read by producer to check for space).

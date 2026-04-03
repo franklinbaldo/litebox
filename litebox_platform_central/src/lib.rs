@@ -165,7 +165,13 @@ impl CentralPlatform {
             events: libc::POLLIN,
             revents: 0,
         };
-        let timeout_ms = timeout.map_or(-1, |t| i32::try_from(t.as_millis()).unwrap_or(i32::MAX));
+        // Round sub-millisecond non-zero timeouts UP to 1 ms so that poll()
+        // actually blocks instead of returning immediately.
+        let timeout_ms = timeout.map_or(-1, |t| {
+            let ms = t.as_millis();
+            let ms = if ms == 0 && !t.is_zero() { 1 } else { ms };
+            i32::try_from(ms).unwrap_or(i32::MAX)
+        });
         unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
     }
 }

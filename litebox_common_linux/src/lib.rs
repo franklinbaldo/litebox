@@ -554,6 +554,7 @@ impl<Platform: litebox::platform::RawPointerProvider> FcntlArg<Platform> {
                 cloexec: true,
                 min_fd: arg.truncate(),
             },
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             F_SETOWN => Self::SETOWN(arg as i32),
             F_GETOWN => Self::GETOWN,
             _ => return None,
@@ -2079,6 +2080,10 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         addr: Platform::RawMutPointer<u8>,
         addrlen: Platform::RawMutPointer<u32>,
     },
+    Shutdown {
+        sockfd: i32,
+        how: i32,
+    },
     Uname {
         buf: Platform::RawMutPointer<Utsname>,
     },
@@ -2576,6 +2581,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             }),
             Sysno::getsockname => sys_req!(Getsockname { sockfd, addr:*, addrlen:* }),
             Sysno::getpeername => sys_req!(Getpeername { sockfd, addr:*, addrlen:* }),
+            Sysno::shutdown => sys_req!(Shutdown { sockfd, how }),
             Sysno::exit => sys_req!(Exit { status }),
             Sysno::exit_group => sys_req!(ExitGroup { status }),
             Sysno::uname => sys_req!(Uname { buf:* }),

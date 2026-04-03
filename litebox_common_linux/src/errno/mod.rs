@@ -183,6 +183,16 @@ impl From<litebox::net::errors::CloseError> for Errno {
     }
 }
 
+impl From<litebox::net::errors::ShutdownError> for Errno {
+    fn from(value: litebox::net::errors::ShutdownError) -> Self {
+        match value {
+            litebox::net::errors::ShutdownError::InvalidFd => Errno::EBADF,
+            litebox::net::errors::ShutdownError::NotConnected => Errno::ENOTCONN,
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl From<litebox::fs::errors::ReadError> for Errno {
     fn from(value: litebox::fs::errors::ReadError) -> Self {
         match value {

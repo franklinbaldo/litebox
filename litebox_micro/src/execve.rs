@@ -486,14 +486,28 @@ unsafe fn submit_execve_sq(
         if let Some(cq) = unsafe { cq_find_by_seq(header, cq_entries, search_start, seq) } {
             return cq;
         }
-        // Spin aggressively (10,000 iters ≈ 100 µs), then futex fallback.
-        spin_then_wait(notify_slot, current, |addr, exp| unsafe {
-            crate::raw_syscall::futex4(
-                core::ptr::from_ref(addr) as usize,
-                libc::FUTEX_WAIT,
-                exp,
-                0,
-            );
+        // Spin aggressively (10,000 iters ≈ 100 µs), then timed futex
+        // fallback that periodically checks whether central is still alive.
+        spin_then_wait(notify_slot, current, |addr, exp| {
+            // Use a timed futex wait (100 ms) so we can check liveness.
+            #[repr(C)]
+            struct Timespec {
+                tv_sec: i64,
+                tv_nsec: i64,
+            }
+            let ts = Timespec {
+                tv_sec: 0,
+                tv_nsec: 100_000_000,
+            };
+            unsafe {
+                crate::raw_syscall::futex4(
+                    core::ptr::from_ref(addr) as usize,
+                    libc::FUTEX_WAIT,
+                    exp,
+                    core::ptr::from_ref(&ts) as usize,
+                );
+            }
+            crate::handler::check_central_alive(header, micro.central_pid);
         });
     }
 }

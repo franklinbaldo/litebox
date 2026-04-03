@@ -976,6 +976,7 @@ impl<FS: ShimFS> Task<FS> {
                 addr,
                 addrlen,
             } => syscall!(sys_getpeername(sockfd, addr, addrlen)),
+            SyscallRequest::Shutdown { sockfd, how } => syscall!(sys_shutdown(sockfd, how)),
             SyscallRequest::Uname { buf } => syscall!(sys_uname(buf)),
             SyscallRequest::Fcntl { fd, arg } => syscall!(sys_fcntl(fd, arg)),
             SyscallRequest::Getcwd { buf, size: count } => {

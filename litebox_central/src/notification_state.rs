@@ -105,6 +105,7 @@ impl ProcessNotificationState {
         }
         self.pipe_slot_bitset |= 1u64 << free_bit;
         let offset = PIPE_ZONE_BASE_OFFSET + (free_bit as usize) * PIPE_SLOT_SIZE;
+        #[allow(clippy::cast_possible_truncation)]
         Some((free_bit as u8, offset as u32))
     }
 

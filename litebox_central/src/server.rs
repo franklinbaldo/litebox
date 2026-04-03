@@ -563,6 +563,9 @@ impl<FS: ShimFS> ProcessServer<FS> {
             return cq;
         };
 
+        // Register the child ring so it gets signalled on central exit/panic.
+        crate::register_active_ring(child_region.header());
+
         // 2. Assign child PID.
         let child_pid = self.next_child_pid.get();
         self.next_child_pid.set(child_pid + 1);

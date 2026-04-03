@@ -314,6 +314,7 @@ impl RingPool {
         header.sq_head.store(0, Relaxed);
         header.sq_tail.store(0, Relaxed);
         header.sq_notify.store(0, Relaxed);
+        header.is_exiting.store(0, Relaxed);
         header.cq_head.store(0, Relaxed);
         header.cq_tail.store(0, Relaxed);
         for slot in &header.cq_notify_slots {

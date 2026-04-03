@@ -951,6 +951,81 @@ where
         self.automated_platform_interaction(PollDirection::Both);
     }
 
+    /// Shut down part of a full-duplex connection.
+    ///
+    /// `shut_rd` / `shut_wr` correspond to SHUT_RD / SHUT_WR / SHUT_RDWR.
+    ///
+    /// For `SHUT_WR` / `SHUT_RDWR` on TCP sockets this calls
+    /// `tcp_socket.close()` in smoltcp to initiate a FIN handshake and marks
+    /// the proxy's write side as shut down.
+    ///
+    /// For `SHUT_RD` this marks the proxy's read side as shut down without
+    /// touching the underlying smoltcp socket (matching Linux behaviour).
+    pub fn shutdown(
+        &mut self,
+        fd: &SocketFd<Platform>,
+        shut_rd: bool,
+        shut_wr: bool,
+    ) -> Result<(), errors::ShutdownError> {
+        // First pass: update the proxy (channel-level shutdown + events).
+        {
+            let dt = self.litebox.descriptor_table();
+            let handle = dt
+                .entry_handle(fd)
+                .ok_or(errors::ShutdownError::InvalidFd)?;
+            handle.with_entry(|entry| {
+                let socket_handle = &entry.entry;
+                let proxy = socket_handle
+                    .proxy
+                    .as_ref()
+                    .ok_or(errors::ShutdownError::NotConnected)?;
+                match proxy.as_ref() {
+                    NetworkProxy::Stream(channel) => {
+                        if shut_rd {
+                            channel.shutdown_read();
+                            channel.notify_io_event(Events::IN | Events::HUP);
+                        }
+                        if shut_wr {
+                            channel.shutdown_write();
+                            channel.notify_io_event(Events::OUT | Events::HUP);
+                        }
+                    }
+                    NetworkProxy::Datagram(_) | NetworkProxy::Raw => {
+                        // UDP/raw shutdown is a no-op in Linux (just marks the channel)
+                    }
+                }
+                Ok(())
+            })?;
+        }
+
+        // Second pass: for SHUT_WR on TCP, close the smoltcp socket to send FIN.
+        if shut_wr {
+            let smoltcp_handle = {
+                let dt = self.litebox.descriptor_table();
+                let handle = dt
+                    .entry_handle(fd)
+                    .ok_or(errors::ShutdownError::InvalidFd)?;
+                handle.with_entry(|entry| {
+                    let socket_handle = &entry.entry;
+                    if let Protocol::Tcp = socket_handle.protocol() {
+                        Some(socket_handle.handle)
+                    } else {
+                        None
+                    }
+                })
+            };
+            if let Some(smoltcp_handle) = smoltcp_handle {
+                let tcp_socket: &mut tcp::Socket = self.socket_set.get_mut(smoltcp_handle);
+                if tcp_socket.may_send() {
+                    tcp_socket.close();
+                }
+            }
+        }
+
+        self.automated_platform_interaction(PollDirection::Both);
+        Ok(())
+    }
+
     /// Initiate a connection to an IP address
     ///
     /// When `check_progress` is false, this function attempts to initiate a connection.

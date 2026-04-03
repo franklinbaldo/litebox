@@ -351,7 +351,10 @@ unsafe fn post_fork_child(child_ring_fd: i32, child_pid: u32) {
     micro.pid = child_pid;
     // Use raw syscall for getppid to avoid glibc TLS issues
     let ppid = unsafe { crate::raw_syscall::syscall0(libc::SYS_getppid) };
-    micro.ppid = ppid as u32;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        micro.ppid = ppid as u32;
+    }
     // central_pid stays the same — same central process serves the child.
     micro.layout = layout;
 

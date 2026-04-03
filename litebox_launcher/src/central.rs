@@ -63,10 +63,9 @@ impl CentralProcess {
         match pid {
             -1 => anyhow::bail!("fork failed: {}", std::io::Error::last_os_error()),
             0 => {
-                // Child: redirect stdout and stderr to /dev/null so that
-                // central does not hold the parent's pipe handles open (which
-                // would prevent Command::output() from returning in tests)
-                // and does not pollute the guest's stderr.
+                // Child: redirect stdout to /dev/null so that central does
+                // not hold the parent's pipe handles open. Stderr goes to a
+                // log file for crash diagnostics.
                 // Skip if shmem_fd is 1 or 2 to avoid clobbering it.
                 let devnull =
                     unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
@@ -76,13 +75,22 @@ impl CentralProcess {
                             libc::dup2(devnull, 1);
                         }
                     }
-                    if shmem_fd != 2 {
-                        unsafe {
-                            libc::dup2(devnull, 2);
-                        }
-                    }
                     unsafe {
                         libc::close(devnull);
+                    }
+                }
+                // Redirect stderr to a log file so we can see panics/crashes.
+                let logfd = unsafe {
+                    libc::open(
+                        c"/tmp/central_stderr.log".as_ptr(),
+                        libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC,
+                        0o644,
+                    )
+                };
+                if logfd >= 0 && shmem_fd != 2 {
+                    unsafe {
+                        libc::dup2(logfd, 2);
+                        libc::close(logfd);
                     }
                 }
 

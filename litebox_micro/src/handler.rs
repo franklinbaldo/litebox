@@ -3,7 +3,7 @@
 
 //! Core syscall handler called from the assembly trampoline.
 
-use core::sync::atomic::Ordering::Acquire;
+use core::sync::atomic::Ordering::{Acquire, Relaxed};
 
 use litebox_ipc::cq::{cq_find_by_seq, cq_tail};
 use litebox_ipc::ring::{CqEntry, RingHeader, SharedRingLayout, SqEntry, cq_flags};
@@ -21,6 +21,9 @@ fn futex_wake(addr: &core::sync::atomic::AtomicU32) {
     }
 }
 
+/// Untimed futex wait. Used by paths that don't need liveness checking
+/// (e.g. central's own wait loops or short-lived waits).
+#[allow(dead_code)]
 fn futex_wait(addr: &core::sync::atomic::AtomicU32, expected: u32) {
     unsafe {
         crate::raw_syscall::futex4(
@@ -30,6 +33,130 @@ fn futex_wait(addr: &core::sync::atomic::AtomicU32, expected: u32) {
             0,
         );
     }
+}
+
+/// Like [`futex_wait`] but with a 100 ms timeout so micro can periodically
+/// check whether central is still alive.
+fn futex_wait_timed(addr: &core::sync::atomic::AtomicU32, expected: u32) {
+    #[repr(C)]
+    struct Timespec {
+        tv_sec: i64,
+        tv_nsec: i64,
+    }
+    let ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 100_000_000, // 100 ms
+    };
+    unsafe {
+        crate::raw_syscall::futex4(
+            core::ptr::from_ref(addr) as usize,
+            libc::FUTEX_WAIT,
+            expected,
+            core::ptr::from_ref(&ts) as usize,
+        );
+    }
+}
+
+/// Check whether central is still alive.  If not, terminate micro immediately.
+///
+/// Two-tier detection:
+/// 1. Fast path — `header.is_exiting` is set cooperatively by central on
+///    normal exit or panic.
+/// 2. Slow path — open `/proc/<pid>/status` and check for zombie state or
+///    non-existence.  Unlike `kill(pid, 0)`, this correctly detects zombies
+///    (which `kill` reports as alive since the PID still exists).
+pub(crate) fn check_central_alive(header: &RingHeader, central_pid: u32) {
+    // Fast: cooperative flag.
+    if header.is_exiting.load(Relaxed) != 0 {
+        unsafe { crate::raw_syscall::syscall1(libc::SYS_exit_group, 1) };
+    }
+    // Slow: probe whether central is alive and not a zombie.
+    if central_pid != 0 && !is_process_alive(central_pid) {
+        unsafe { crate::raw_syscall::syscall1(libc::SYS_exit_group, 1) };
+    }
+}
+
+/// Check if a process is alive (exists and is not a zombie) by reading
+/// `/proc/<pid>/status`.  Returns `false` if the process does not exist
+/// or is in zombie state.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn is_process_alive(pid: u32) -> bool {
+    // Build "/proc/<pid>/status\0" on the stack.  Max PID is ~4 million
+    // (7 digits), so 32 bytes is plenty.  Use MaybeUninit to avoid SSE-
+    // aligned zeroing (movaps) which faults when the stack is only 8-byte
+    // aligned in the micro syscall context.
+    let mut buf: core::mem::MaybeUninit<[u8; 32]> = core::mem::MaybeUninit::uninit();
+    let buf_ptr = buf.as_mut_ptr().cast::<u8>();
+    let prefix = b"/proc/";
+    unsafe { core::ptr::copy_nonoverlapping(prefix.as_ptr(), buf_ptr, prefix.len()) };
+    let mut pos = prefix.len();
+
+    // Write PID digits.
+    let mut digits = [0u8; 10];
+    let mut n = pid;
+    let mut dlen = 0;
+    if n == 0 {
+        digits[0] = b'0';
+        dlen = 1;
+    } else {
+        while n > 0 {
+            digits[dlen] = b'0' + (n % 10) as u8;
+            n /= 10;
+            dlen += 1;
+        }
+        // Reverse digits.
+        let mut i = 0;
+        let mut j = dlen - 1;
+        while i < j {
+            digits.swap(i, j);
+            i += 1;
+            j -= 1;
+        }
+    }
+    unsafe { core::ptr::copy_nonoverlapping(digits.as_ptr(), buf_ptr.add(pos), dlen) };
+    pos += dlen;
+
+    let suffix = b"/status\0";
+    unsafe { core::ptr::copy_nonoverlapping(suffix.as_ptr(), buf_ptr.add(pos), suffix.len()) };
+
+    // Open the file.
+    let fd = unsafe { crate::raw_syscall::open(buf_ptr, libc::O_RDONLY) };
+    if fd < 0 {
+        // ENOENT / ESRCH — process is gone.
+        return false;
+    }
+
+    // Read enough to find the "State:" line.  The first ~200 bytes of
+    // /proc/<pid>/status contain Name:, Umask:, State:, etc.
+    // Use MaybeUninit to avoid aligned zeroing on the stack.
+    let mut rbuf: core::mem::MaybeUninit<[u8; 256]> = core::mem::MaybeUninit::uninit();
+    let rbuf_ptr = rbuf.as_mut_ptr().cast::<u8>();
+    let nread = unsafe { crate::raw_syscall::read(fd as i32, rbuf_ptr, 256) };
+    unsafe { crate::raw_syscall::close(fd as i32) };
+
+    if nread <= 0 {
+        return false;
+    }
+
+    // Search for "State:\tZ" in the buffer.
+    let len = nread as usize;
+    let pattern = b"State:\tZ";
+    if len >= pattern.len() {
+        let mut i = 0;
+        while i + pattern.len() <= len {
+            let matches = unsafe {
+                let slice = core::slice::from_raw_parts(rbuf_ptr.add(i), pattern.len());
+                slice == pattern.as_slice()
+            };
+            if matches {
+                // Zombie detected.
+                return false;
+            }
+            i += 1;
+        }
+    }
+
+    true
 }
 
 #[inline]
@@ -559,9 +686,14 @@ pub(crate) unsafe fn submit_and_wait(
         if let Some(cq) = unsafe { cq_find_by_seq(header, cq_entries, search_start, seq) } {
             return cq;
         }
-        // Spin aggressively (10,000 iters ≈ 100 µs), then futex fallback
-        // for multi-process fairness.
-        spin_then_wait(notify_slot, current, futex_wait);
+        // Spin aggressively (10,000 iters ≈ 100 µs), then timed futex
+        // fallback that periodically checks whether central is still alive.
+        spin_then_wait(notify_slot, current, |addr, exp| {
+            futex_wait_timed(addr, exp);
+            // After the futex times out (or spurious wake), check whether
+            // central has signalled that it is shutting down.
+            check_central_alive(header, micro.central_pid);
+        });
     }
 }
 
