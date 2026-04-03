@@ -815,7 +815,8 @@ impl<FS: ShimFS> GlobalState<FS> {
         }
 
         let proxy = self.get_proxy(fd)?;
-        cx.with_timeout(timeout)
+        let ret = cx
+            .with_timeout(timeout)
             .wait_on_events(
                 is_nonblock,
                 Events::IN,
@@ -829,7 +830,12 @@ impl<FS: ShimFS> GlobalState<FS> {
                     Err(e) => Err(TryOpError::Other(Errno::from(e))),
                 },
             )
-            .map_err(Errno::from)
+            .map_err(Errno::from);
+
+        match ret {
+            Err(Errno::ESHUTDOWN) => Ok(0),
+            other => other,
+        }
     }
 
     fn get_socket_type(&self, fd: &SocketFd) -> Result<SockType, Errno> {
@@ -1215,6 +1221,7 @@ impl<FS: ShimFS> Task<FS> {
                     .global
                     .initialize_socket(&accepted_file, sock_type, flags);
                 proxy.set_state(SocketState::Connected);
+                let _ = self.global.net.lock().perform_platform_interaction();
                 let Ok(raw_fd) = files.insert_raw_fd(accepted_file) else {
                     unimplemented!()
                 };
@@ -2290,6 +2297,89 @@ mod tests {
         assert_eq!(stdout, buf);
     }
 
+    #[test]
+    fn test_tun_tcp_recv_returns_zero_after_peer_shutdown_write() {
+        let task = init_platform(Some(TUN_DEVICE_NAME));
+
+        let server_fd = task
+            .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
+            .unwrap();
+        let server_addr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
+            core::net::Ipv4Addr::from(TUN_IP_ADDR),
+            SERVER_PORT + 3,
+        )));
+        task.do_bind(server_fd, server_addr.clone()).unwrap();
+        task.do_listen(server_fd, 1).unwrap();
+
+        let client_fd = task
+            .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
+            .unwrap();
+        task.do_connect(client_fd, server_addr).unwrap();
+
+        let server_conn = task.do_accept(server_fd, None, SockFlags::empty()).unwrap();
+
+        task.sys_shutdown(i32::try_from(client_fd).unwrap(), libc::SHUT_WR)
+            .unwrap();
+
+        let mut buf = [0u8; 16];
+        let n = task
+            .do_recvfrom(server_conn, &mut buf, ReceiveFlags::empty(), None)
+            .unwrap();
+        assert_eq!(n, 0);
+
+        close_socket(&task, client_fd);
+        close_socket(&task, server_conn);
+        close_socket(&task, server_fd);
+    }
+
+    #[test]
+    fn test_tun_accept_then_recv_request_payload() {
+        let task = init_platform(Some(TUN_DEVICE_NAME));
+
+        let server_fd = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Stream,
+                SockFlags::NONBLOCK,
+                0,
+            )
+            .unwrap();
+        let server_addr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
+            core::net::Ipv4Addr::from(TUN_IP_ADDR),
+            SERVER_PORT + 4,
+        )));
+        task.do_bind(server_fd, server_addr.clone()).unwrap();
+        task.do_listen(server_fd, 1).unwrap();
+
+        task.spawn_clone_for_test(move |task| {
+            let client_fd = task
+                .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
+                .unwrap();
+            task.do_connect(client_fd, server_addr).unwrap();
+            let payload = b"GET / HTTP/1.0\r\n\r\n";
+            let n = task
+                .do_sendto(client_fd, payload, SendFlags::empty(), None)
+                .unwrap();
+            assert_eq!(n, payload.len());
+            close_socket(&task, client_fd);
+        });
+
+        ppoll(&task, server_fd, Events::IN);
+        let server_conn = task
+            .do_accept(server_fd, None, SockFlags::NONBLOCK)
+            .unwrap();
+
+        ppoll(&task, server_conn, Events::IN);
+        let mut buf = [0u8; 64];
+        let n = task
+            .do_recvfrom(server_conn, &mut buf, ReceiveFlags::empty(), None)
+            .unwrap();
+        assert_eq!(&buf[..n], b"GET / HTTP/1.0\r\n\r\n");
+
+        close_socket(&task, server_conn);
+        close_socket(&task, server_fd);
+    }
+
     fn test_multiple_tun_tcp_stream_connections(is_nonblocking: bool) {
         let task = init_platform(Some(TUN_DEVICE_NAME));
         let port = SERVER_PORT + if is_nonblocking { 2 } else { 1 };
@@ -3206,6 +3296,24 @@ mod unix_tests {
     fn test_unix_socket_recv_timeout() {
         unix_socket_recv_timeout(SockType::Stream);
         unix_socket_recv_timeout(SockType::Datagram);
+    }
+
+    #[test]
+    fn test_unix_stream_socketpair_recv_returns_zero_after_peer_close() {
+        let task = init_platform(None);
+        let (sock1, sock2) = task
+            .do_socketpair(AddressFamily::UNIX, SockType::Stream, SockFlags::empty(), 0)
+            .expect("socketpair failed");
+
+        close_socket(&task, sock2);
+
+        let mut buf = [0u8; 16];
+        let n = task
+            .do_recvfrom(sock1, &mut buf, ReceiveFlags::empty(), None)
+            .expect("recvfrom failed");
+        assert_eq!(n, 0);
+
+        close_socket(&task, sock1);
     }
 
     #[test]

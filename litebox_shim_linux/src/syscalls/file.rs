@@ -8,6 +8,7 @@ use alloc::{
     string::{String, ToString as _},
     vec,
 };
+use core::sync::atomic::{AtomicUsize, Ordering};
 use litebox::{
     event::{Events, wait::WaitError},
     fd::{FdEnabledSubsystem, MetadataError, TypedFd},
@@ -23,7 +24,6 @@ use litebox_common_linux::{
 use litebox_platform_multiplex::Platform;
 
 use crate::{ConstPtr, GlobalState, MutPtr, ShimFS, Task};
-use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Task state shared by `CLONE_FS`.
 pub(crate) struct FsState {

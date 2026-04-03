@@ -617,10 +617,11 @@ mod test {
     use alloc::sync::Arc;
     use litebox::event::Events;
     use litebox::event::wait::WaitState;
+    use litebox::platform::common_providers::userspace_pointers::UserMutPtr;
     use litebox_common_linux::{EfdFlags, EpollEvent};
     use litebox_platform_multiplex::platform;
 
-    use super::EpollFile;
+    use super::{EpollFile, EpollSubsystem};
     use crate::syscalls::file::FilesState;
 
     extern crate std;
@@ -723,6 +724,33 @@ mod test {
             .read(&WaitState::new(platform()).context(), &consumer, &mut buf)
             .unwrap();
         assert_eq!(buf, [1, 2]);
+    }
+
+    #[test]
+    fn test_sys_epoll_pwait_timeout_returns_zero() {
+        let (task, epoll) = setup_epoll();
+        let typed = task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<EpollSubsystem<crate::DefaultFS>>(epoll);
+        let Ok(raw_fd) = task.files.borrow().insert_raw_fd(typed) else {
+            panic!("insert epoll fd failed");
+        };
+        let epfd = i32::try_from(raw_fd).unwrap();
+
+        let mut events = [EpollEvent { events: 0, data: 0 }];
+        let ret = task
+            .sys_epoll_pwait(
+                epfd,
+                UserMutPtr::from_ptr(events.as_mut_ptr()),
+                events.len().try_into().unwrap(),
+                10,
+                None,
+                0,
+            )
+            .expect("epoll_pwait should return 0 on timeout");
+        assert_eq!(ret, 0);
     }
 
     #[test]

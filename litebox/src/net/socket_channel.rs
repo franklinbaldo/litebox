@@ -309,6 +309,10 @@ struct StreamChannelInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     /// Space available in TX buffer (for quick poll checks)
     tx_available: AtomicUsize,
 
+    /// Whether the channel has ever been in the `Connected` state.
+    /// Used to distinguish "initial Closed" from "post-connection Closed" (EOF).
+    was_connected: AtomicBool,
+
     /// Socket error.
     socket_error: SocketAsyncErrorState,
 
@@ -336,6 +340,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamChannelInner<Plat
             write_shutdown: AtomicBool::new(false),
             rx_available: AtomicUsize::new(0),
             tx_available: AtomicUsize::new(tx_capacity),
+
+            was_connected: AtomicBool::new(false),
 
             socket_error: SocketAsyncErrorState::new(),
 
@@ -398,8 +404,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         match self.inner.state() {
             SocketState::Connected => {}
             SocketState::Closed => {
-                if !self.is_readable() {
+                // Only report EOF if the channel was previously connected.
+                // A newly created channel starts in Closed state but has never
+                // been connected — that's an invalid-state error, not EOF.
+                if self.inner.was_connected.load(Ordering::Acquire) && !self.is_readable() {
                     return Err(ReceiveError::OperationFinished);
+                }
+                if !self.inner.was_connected.load(Ordering::Acquire) {
+                    return Err(ReceiveError::SocketInInvalidState);
                 }
             }
             _ => return Err(ReceiveError::SocketInInvalidState),
@@ -646,6 +658,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         // Notify user of state changes
         match state {
             SocketState::Connected => {
+                self.inner.was_connected.store(true, Ordering::Release);
                 self.inner.pollee.notify_observers(Events::OUT);
             }
             SocketState::Closed => {
@@ -1082,6 +1095,26 @@ mod tests {
 
         // No more pending TX
         assert!(!channel.has_pending_tx());
+    }
+
+    #[test]
+    fn stream_channel_out_rearms_after_tx_space_is_freed() {
+        let channel: StreamSocketChannel<TestPlatform> =
+            StreamSocketChannel::new_with_capacity(64, 8);
+        channel.set_state(SocketState::Connected);
+
+        assert!(channel.check_io_events().contains(Events::OUT));
+
+        assert_eq!(channel.try_write(b"12345678").unwrap(), 8);
+        assert!(!channel.check_io_events().contains(Events::OUT));
+        assert!(matches!(
+            channel.try_write(b"x"),
+            Err(SendError::BufferFull)
+        ));
+
+        let mut buf = [0u8; 4];
+        assert_eq!(channel.pop_tx_data(&mut buf), 4);
+        assert!(channel.check_io_events().contains(Events::OUT));
     }
 
     #[test]

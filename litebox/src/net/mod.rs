@@ -936,6 +936,23 @@ where
                 if let Some(local_port) = tcp_specific.local_port.take() {
                     self.local_port_allocator.deallocate(local_port);
                 }
+                // Drain any pending TX data from the socket channel into
+                // smoltcp before closing.  `close()` transitions out of
+                // ESTABLISHED, after which `can_send()` returns false and
+                // the net-worker would never drain the remaining TX ring.
+                if let Some(proxy) = proxy.as_ref()
+                    && let NetworkProxy::Stream(channel) = proxy.as_ref()
+                {
+                    let tcp_socket: &mut tcp::Socket = self.socket_set.get_mut(handle);
+                    while tcp_socket.can_send() {
+                        let sent = channel.pop_tx_data_with(|data| {
+                            tcp_socket.send_slice(data).unwrap_or_default()
+                        });
+                        if sent == 0 {
+                            break;
+                        }
+                    }
+                }
                 let tcp_socket: &mut tcp::Socket = self.socket_set.get_mut(handle);
                 if tcp_specific.immediate_close.load(Ordering::Relaxed) {
                     tcp_socket.abort();
@@ -998,9 +1015,13 @@ where
             })?;
         }
 
-        // Second pass: for SHUT_WR on TCP, close the smoltcp socket to send FIN.
+        // Second pass: for SHUT_WR on TCP, drain any pending TX data from
+        // the socket channel into smoltcp and then close the smoltcp socket
+        // to send FIN.  Draining first is critical because `close()` moves
+        // the socket out of ESTABLISHED, after which `can_send()` returns
+        // false and the net-worker will never drain the remaining TX ring.
         if shut_wr {
-            let smoltcp_handle = {
+            let smoltcp_handle_and_proxy = {
                 let dt = self.litebox.descriptor_table();
                 let handle = dt
                     .entry_handle(fd)
@@ -1008,13 +1029,28 @@ where
                 handle.with_entry(|entry| {
                     let socket_handle = &entry.entry;
                     if let Protocol::Tcp = socket_handle.protocol() {
-                        Some(socket_handle.handle)
+                        let proxy = socket_handle.proxy.clone();
+                        Some((socket_handle.handle, proxy))
                     } else {
                         None
                     }
                 })
             };
-            if let Some(smoltcp_handle) = smoltcp_handle {
+            if let Some((smoltcp_handle, proxy)) = smoltcp_handle_and_proxy {
+                // Drain the TX ring into smoltcp before closing.
+                if let Some(proxy) = proxy.as_ref()
+                    && let NetworkProxy::Stream(channel) = proxy.as_ref()
+                {
+                    let tcp_socket: &mut tcp::Socket = self.socket_set.get_mut(smoltcp_handle);
+                    while tcp_socket.can_send() {
+                        let sent = channel.pop_tx_data_with(|data| {
+                            tcp_socket.send_slice(data).unwrap_or_default()
+                        });
+                        if sent == 0 {
+                            break;
+                        }
+                    }
+                }
                 let tcp_socket: &mut tcp::Socket = self.socket_set.get_mut(smoltcp_handle);
                 if tcp_socket.may_send() {
                     tcp_socket.close();
@@ -1309,7 +1345,7 @@ where
         // packet to the socket it belongs to, so having a large backlog can cause performance issues
         // (see https://github.com/smoltcp-rs/smoltcp/issues/973). Restricting the backlog to a smaller
         // value for now until we have a better solution.
-        let backlog = backlog.min(8);
+        let backlog = backlog.min(64);
 
         match &mut socket_handle.specific {
             ProtocolSpecific::Tcp(handle) => {

@@ -175,3 +175,109 @@ fn test_accept_keeps_listener_readable_when_more_connections_are_ready() {
         .close(&listener_fd, CloseBehavior::Immediate)
         .unwrap();
 }
+
+#[test]
+fn test_receive_reports_finished_after_peer_shutdown_write() {
+    let litebox = LiteBox::new(MockPlatform::new());
+    let mut network = Network::new(&litebox);
+    network.set_platform_interaction(PlatformInteraction::Manual);
+
+    let listener_fd = network.socket(Protocol::Tcp).unwrap();
+    let listen_addr = SocketAddr::V4(SocketAddrV4::from_str("10.0.0.2:8081").unwrap());
+    network.bind(&listener_fd, &listen_addr).unwrap();
+    network.listen(&listener_fd, 1).unwrap();
+
+    let client_fd = network.socket(Protocol::Tcp).unwrap();
+    assert!(matches!(
+        network.connect(&client_fd, &listen_addr, false),
+        Err(ConnectError::InProgress)
+    ));
+
+    for _ in 0..32 {
+        while network
+            .perform_platform_interaction()
+            .call_again_immediately()
+        {}
+    }
+
+    let server_fd = network.accept(&listener_fd, None).unwrap();
+
+    network.close(&client_fd, CloseBehavior::Graceful).unwrap();
+
+    for _ in 0..32 {
+        while network
+            .perform_platform_interaction()
+            .call_again_immediately()
+        {}
+    }
+
+    let mut buf = [0u8; 16];
+    let result = network.receive(&server_fd, &mut buf, ReceiveFlags::empty(), None);
+    assert!(matches!(result, Err(ReceiveError::OperationFinished)));
+
+    // client_fd was already gracefully closed above, so no need to close again
+    network.close(&server_fd, CloseBehavior::Immediate).unwrap();
+    network
+        .close(&listener_fd, CloseBehavior::Immediate)
+        .unwrap();
+}
+
+#[test]
+fn test_accept_does_not_hand_out_socket_before_request_data_is_ready() {
+    let litebox = LiteBox::new(MockPlatform::new());
+    let mut network = Network::new(&litebox);
+    network.set_platform_interaction(PlatformInteraction::Manual);
+
+    let listener_fd = network.socket(Protocol::Tcp).unwrap();
+    let listener_proxy = alloc::sync::Arc::new(NetworkProxy::Stream(StreamSocketChannel::new()));
+    assert!(network.set_socket_proxy(&listener_fd, listener_proxy.clone()));
+    let listen_addr = SocketAddr::V4(SocketAddrV4::from_str("10.0.0.2:8082").unwrap());
+    network.bind(&listener_fd, &listen_addr).unwrap();
+    network.listen(&listener_fd, 1).unwrap();
+
+    let client_fd = network.socket(Protocol::Tcp).unwrap();
+    assert!(matches!(
+        network.connect(&client_fd, &listen_addr, false),
+        Err(ConnectError::InProgress)
+    ));
+
+    for _ in 0..32 {
+        while network
+            .perform_platform_interaction()
+            .call_again_immediately()
+        {}
+    }
+
+    let payload = b"GET / HTTP/1.0\r\n\r\n";
+    assert_eq!(
+        network
+            .send(&client_fd, payload, SendFlags::empty(), None)
+            .unwrap(),
+        payload.len()
+    );
+
+    let accepted_fd = network.accept(&listener_fd, None).unwrap();
+    let accepted_proxy = alloc::sync::Arc::new(NetworkProxy::Stream(StreamSocketChannel::new()));
+    assert!(network.set_socket_proxy(&accepted_fd, accepted_proxy.clone()));
+
+    for _ in 0..4 {
+        while network
+            .perform_platform_interaction()
+            .call_again_immediately()
+        {}
+    }
+
+    let mut buf = [0u8; 64];
+    let n = accepted_proxy
+        .try_read(&mut buf, ReceiveFlags::empty(), None)
+        .unwrap();
+    assert_eq!(&buf[..n], payload);
+
+    network.close(&client_fd, CloseBehavior::Immediate).unwrap();
+    network
+        .close(&accepted_fd, CloseBehavior::Immediate)
+        .unwrap();
+    network
+        .close(&listener_fd, CloseBehavior::Immediate)
+        .unwrap();
+}
