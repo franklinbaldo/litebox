@@ -8,12 +8,11 @@
     reason = "still under development, remove before merging PR"
 )]
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::sync::atomic::AtomicBool;
-use hashbrown::HashMap;
 use thiserror::Error;
 
 use crate::sync::{RawSyncPrimitivesProvider, RwLock};
@@ -66,6 +65,41 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         }
     }
 
+    /// Duplicate an entry given only its raw index, returning a new [`OwnedFd`]
+    /// that independently tracks its closed state.
+    ///
+    /// This is used by [`RawDescriptorStorage::clone_for_fork`] so that parent
+    /// and child processes get independent `OwnedFd` instances that share the
+    /// underlying file description (via `Arc`).
+    ///
+    /// Per-fd metadata (e.g. `FD_CLOEXEC`) is cloned from the source entry,
+    /// matching POSIX fork semantics where the child inherits the parent's
+    /// per-fd flags.
+    ///
+    /// Returns `None` if the fd is already closed.
+    pub(crate) fn duplicate_raw_fd(&mut self, raw: &OwnedFd) -> Option<OwnedFd> {
+        let idx = self
+            .entries
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or_else(|| {
+                self.entries.push(None);
+                self.entries.len() - 1
+            });
+        let (shared_entry, metadata) = {
+            let src = self.entries[raw.as_usize()?].as_ref().unwrap();
+            src.x.read().entry.on_dup();
+            (Arc::clone(&src.x), src.metadata.clone())
+        };
+        let new_ind_entry = IndividualEntry {
+            x: shared_entry,
+            metadata,
+        };
+        let old = self.entries[idx].replace(new_ind_entry);
+        assert!(old.is_none());
+        Some(OwnedFd::new(idx))
+    }
+
     /// Create a duplicate of the provided `fd`.
     ///
     /// This newly-created FD shares all behavior with the existing FD, including (for example)
@@ -92,9 +126,12 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 self.entries.push(None);
                 self.entries.len() - 1
             });
-        let new_ind_entry = IndividualEntry::new(Arc::clone(
-            &self.entries[fd.x.as_usize()?].as_ref().unwrap().x,
-        ));
+        let shared_entry = {
+            let src = self.entries[fd.x.as_usize()?].as_ref().unwrap();
+            src.x.read().entry.on_dup();
+            Arc::clone(&src.x)
+        };
+        let new_ind_entry = IndividualEntry::new(shared_entry);
         let old = self.entries[idx].replace(new_ind_entry);
         assert!(old.is_none());
         Some(TypedFd {
@@ -116,19 +153,42 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         let Some(old) = self.entries[fd.x.as_usize()?].take() else {
             unreachable!();
         };
+        old.x.read().entry.on_close();
         fd.x.mark_as_closed();
         Arc::into_inner(old.x)
             .map(RwLock::into_inner)
             .map(DescriptorEntry::into_subsystem_entry::<Subsystem>)
     }
 
-    /// Close the provided `fd`, and remove the corresponding entry if it is unique.
-    /// If not unique, duplicate the `fd` for future closure.
+    /// Close the provided `fd`, removing the entry from the descriptor table.
     ///
-    /// This method takes a closure `can_close_immediately` that is called with the entry to determine
-    /// whether the file descriptor can be closed immediately. This allows the caller to implement
-    /// custom logic (e.g., checking for pending data) before allowing the close to proceed.
-    pub(crate) fn close_and_duplicate_if_shared<
+    /// # Design
+    ///
+    /// This method **always frees the descriptor table slot** for `fd`, regardless of whether
+    /// other references (from `dup` or `fork`) exist. Resource lifetime is managed by `Arc`:
+    /// when the last `Arc` reference is dropped, the underlying resource is torn down.
+    ///
+    /// This avoids the need for polling-based deferred cleanup. Callers do not need to track
+    /// "queued for closure" fds or retry close on each event loop tick — slot removal is
+    /// immediate, and `Arc` drop semantics handle the rest.
+    ///
+    /// # Results
+    ///
+    /// - `Closed(entry)`: This was the last reference. The caller receives ownership of the
+    ///   entry and is responsible for tearing down the underlying resource (e.g., removing a
+    ///   socket from the socket set).
+    /// - `Released`: The slot was freed, but other `Arc` references still hold the entry.
+    ///   No teardown is needed — the last closer will get `Closed`.
+    /// - `Deferred`: This is the last reference, but `can_close_immediately` returned false
+    ///   (e.g., pending data to flush). The entry stays in the slot for the caller's polling
+    ///   loop (e.g., `close_pending_sockets`) to retry later.
+    ///
+    /// # Parameters
+    ///
+    /// `can_close_immediately` is only consulted when this is the **last** reference. If other
+    /// references exist, the slot is always released without checking — those other holders
+    /// will service any pending work.
+    pub(crate) fn close_and_remove<
         Subsystem: FdEnabledSubsystem,
         F: FnOnce(&Subsystem::Entry) -> bool,
     >(
@@ -137,99 +197,33 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         can_close_immediately: F,
     ) -> Option<CloseResult<Subsystem>> {
         let idx = fd.x.as_usize()?;
-        let Some(old) = self.entries[idx].take() else {
-            unreachable!();
-        };
-        if Arc::strong_count(&old.x) == 1 {
-            // Unique, so we can just return it if allowed.
-            if can_close_immediately(old.x.read().as_subsystem::<Subsystem>()) {
-                fd.x.mark_as_closed();
-                let entry = Arc::into_inner(old.x)
-                    .map(RwLock::into_inner)
-                    .map(DescriptorEntry::into_subsystem_entry::<Subsystem>)
-                    .unwrap();
-                Some(CloseResult::Closed(entry))
-            } else {
-                // Put it back
-                let old = self.entries[idx].replace(old);
-                assert!(old.is_none());
-                Some(CloseResult::Deferred)
-            }
-        } else {
-            fd.x.mark_as_closed();
-            // Shared, so we need to duplicate it.
-            let old = self.entries[idx].replace(old);
-            assert!(old.is_none());
-            Some(CloseResult::Duplicated(TypedFd {
-                _phantom: PhantomData,
-                x: OwnedFd::new(idx),
-            }))
-        }
-    }
+        let entry = self.entries[idx].as_ref().unwrap();
 
-    /// Drain all entries that are fully accounted for by the `fds`, removing those FDs from `fd`s,
-    /// and returning their corresponding entries.
-    ///
-    /// This is similar to [`Self::remove`] except it allows draining a whole collection of FDs,
-    /// which is helpful if there are duplicated FDs in the mix. This is particularly useful if one
-    /// is unsure if there are ongoing operations on some entries in the FD, and thus wants to delay
-    /// some sort of `close` operation.
-    ///
-    /// No ordering guarantees are provided by this function; the resulting entries can be
-    /// arbitrarily ordered.
-    ///
-    /// If an FD remains in `fds` after this function finishes running, then it is guaranteed to
-    /// have at least one other duplicate floating around and still accessing an entry somewhere
-    /// outside of `fds`; if an entry is returned, then all possible FDs to it have been removed
-    /// removed from `fds` (and no other operation was concurrently accessing an entry).
-    pub(crate) fn drain_entries_full_covered_by<Subsystem: FdEnabledSubsystem>(
-        &mut self,
-        fds: &mut Vec<TypedFd<Subsystem>>,
-    ) -> Vec<Subsystem::Entry> {
-        // Each FD corresponds to an `IndividualEntry`, which has an Arc to a `DescriptorEntry`. If
-        // we have the same number of FDs as matching to the strong-count of a descriptor entry,
-        // then it must be the case that we have everything needed to close the entries out.
-        let removable_entries: Vec<*const RwLock<_, _>> = {
-            let mut strong_count_and_count = HashMap::<*const _, (usize, usize)>::new();
-            for fd in fds.iter() {
-                let entry = &self.entries[fd.x.as_usize().unwrap()];
-                // It would not be "incorrect" to see a closed out entry, but as it currently stands, I
-                // believe that we'll only see alive entries, so this `unwrap` is confirming that; if we
-                // need to expand it out, we'd simply have a `continue` here.
-                let entry = entry.as_ref().unwrap();
-                strong_count_and_count
-                    .entry(Arc::as_ptr(&entry.x))
-                    .or_insert((Arc::strong_count(&entry.x), 0))
-                    .1 += 1;
+        // Only check pending data when we're the last reference.
+        // If other refs exist (dup or fork), they'll service the socket after we release our slot.
+        if Arc::strong_count(&entry.x) == 1
+            && !can_close_immediately(entry.x.read().as_subsystem::<Subsystem>())
+        {
+            // Last ref, pending data — keep entry in slot for close_pending_sockets to poll.
+            return Some(CloseResult::Deferred);
+        }
+
+        // Always remove the slot.
+        let old = self.entries[idx].take().unwrap();
+        old.x.read().entry.on_close();
+        fd.x.mark_as_closed();
+
+        match Arc::into_inner(old.x) {
+            Some(rwlock) => {
+                // Last reference — extract entry for teardown.
+                let entry = RwLock::into_inner(rwlock).into_subsystem_entry::<Subsystem>();
+                Some(CloseResult::Closed(entry))
             }
-            strong_count_and_count
-                .into_iter()
-                .filter(|(_ptr, (sc, c))| sc == c)
-                .map(|(ptr, _)| ptr)
-                .collect()
-        };
-        // Now we can actually go and remove every single such FD.
-        let entries: Vec<Subsystem::Entry> = {
-            let mut entries = vec![];
-            fds.retain(|fd: &TypedFd<Subsystem>| {
-                let entry = &self.entries[fd.x.as_usize().unwrap()];
-                let entry = entry.as_ref().unwrap();
-                let entry_ptr = Arc::as_ptr(&entry.x);
-                if !removable_entries.contains(&entry_ptr) {
-                    return true;
-                }
-                // This FD is removable
-                let entry = self.remove(fd);
-                if let Some(entry) = entry {
-                    // This is the last of the individual entries that were holding a ref to this.
-                    entries.push(entry);
-                }
-                false
-            });
-            entries
-        };
-        debug_assert_eq!(entries.len(), removable_entries.len());
-        entries
+            None => {
+                // Other references exist (dup or fork). Slot freed, done.
+                Some(CloseResult::Released)
+            }
+        }
     }
 
     /// An iterator of descriptors and entries for a subsystem
@@ -336,7 +330,28 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         // the first place, none of this should panic---if it does, someone has done a bad cast
         // somewhere.
         let entry = self.entries[fd.x.as_usize()?].as_ref()?;
-        Some(EntryHandle(Arc::clone(&entry.x), PhantomData))
+        Some(EntryHandle {
+            entry: Arc::clone(&entry.x),
+            _phantom: PhantomData,
+        })
+    }
+
+    /// Handles to all currently alive entries in a subsystem.
+    pub fn entry_handles<Subsystem: FdEnabledSubsystem>(
+        &self,
+    ) -> impl Iterator<Item = EntryHandle<Platform, Subsystem>> + '_ {
+        self.entries.iter().filter_map(|entry| {
+            let entry = entry.as_ref()?;
+            let guard = entry.read();
+            if !guard.matches_subsystem::<Subsystem>() {
+                return None;
+            }
+            drop(guard);
+            Some(EntryHandle {
+                entry: entry.x.clone(),
+                _phantom: PhantomData,
+            })
+        })
     }
 
     /// Use the entry at `internal_fd` as mutably.
@@ -518,28 +533,78 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
 
 /// A handle to a descriptor entry (via [`Descriptors::entry_handle`]) that can be used without
 /// maintaining access to the descriptor table itself.
-pub struct EntryHandle<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>(
-    Arc<RwLock<Platform, DescriptorEntry>>,
-    PhantomData<Subsystem>,
-);
+pub struct EntryHandle<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem> {
+    entry: Arc<RwLock<Platform, DescriptorEntry>>,
+    _phantom: PhantomData<Subsystem>,
+}
+impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem> Clone
+    for EntryHandle<Platform, Subsystem>
+{
+    fn clone(&self) -> Self {
+        Self {
+            entry: Arc::clone(&self.entry),
+            _phantom: PhantomData,
+        }
+    }
+}
 impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>
     EntryHandle<Platform, Subsystem>
 {
+    pub fn identity_addr(&self) -> usize {
+        Arc::as_ptr(&self.entry).addr()
+    }
+
     pub fn with_entry<R>(&self, f: impl FnOnce(&Subsystem::Entry) -> R) -> R {
-        f(self.0.read().as_subsystem::<Subsystem>())
+        f(self.entry.read().as_subsystem::<Subsystem>())
     }
 
     pub fn with_entry_mut<R>(&self, f: impl FnOnce(&mut Subsystem::Entry) -> R) -> R {
-        f(self.0.write().as_subsystem_mut::<Subsystem>())
+        f(self.entry.write().as_subsystem_mut::<Subsystem>())
+    }
+
+    pub fn downgrade(&self) -> WeakEntryHandle<Platform, Subsystem> {
+        WeakEntryHandle {
+            entry: Arc::downgrade(&self.entry),
+            _phantom: PhantomData,
+        }
     }
 }
 
-/// Result of a [`Descriptors::close_and_duplicate_if_shared`] operation
+pub struct WeakEntryHandle<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem> {
+    entry: Weak<RwLock<Platform, DescriptorEntry>>,
+    _phantom: PhantomData<Subsystem>,
+}
+impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem> Clone
+    for WeakEntryHandle<Platform, Subsystem>
+{
+    fn clone(&self) -> Self {
+        Self {
+            entry: self.entry.clone(),
+            _phantom: PhantomData,
+        }
+    }
+}
+impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>
+    WeakEntryHandle<Platform, Subsystem>
+{
+    pub fn identity_addr(&self) -> usize {
+        self.entry.as_ptr().addr()
+    }
+
+    pub fn upgrade(&self) -> Option<EntryHandle<Platform, Subsystem>> {
+        Some(EntryHandle {
+            entry: self.entry.upgrade()?,
+            _phantom: PhantomData,
+        })
+    }
+}
+
+/// Result of a [`Descriptors::close_and_remove`] operation
 pub(crate) enum CloseResult<Subsystem: FdEnabledSubsystem> {
-    /// The FD was the last reference and has been closed, returning the entry
+    /// The FD was the last reference and has been closed, returning the entry for teardown
     Closed(Subsystem::Entry),
-    /// There are other references, so a new duplicate was created for queued closure
-    Duplicated(TypedFd<Subsystem>),
+    /// The slot was freed, but other references (dup or fork) still exist — no teardown needed
+    Released,
     /// The FD was unique but couldn't be closed immediately (e.g., due to pending data)
     Deferred,
 }
@@ -555,9 +620,27 @@ pub struct RawDescriptorStorage {
     stored_fds: Vec<Option<StoredFd>>,
 }
 
+/// An opaque token representing an fd duplicated for inter-process delivery
+/// (e.g. via `SCM_RIGHTS`). Create one with
+/// [`RawDescriptorStorage::duplicate_for_passing`] and install it on the
+/// receiving side with [`RawDescriptorStorage::insert_passed_fd`].
+pub struct PassedFd {
+    owned: OwnedFd,
+    type_id: core::any::TypeId,
+}
+
 struct StoredFd {
     x: Arc<OwnedFd>,
     subsystem_entry_type_id: core::any::TypeId,
+}
+
+impl Clone for StoredFd {
+    fn clone(&self) -> Self {
+        Self {
+            x: Arc::clone(&self.x),
+            subsystem_entry_type_id: self.subsystem_entry_type_id,
+        }
+    }
 }
 impl StoredFd {
     fn new<Subsystem: FdEnabledSubsystem>(fd: TypedFd<Subsystem>) -> Self {
@@ -577,6 +660,89 @@ impl RawDescriptorStorage {
     /// Create a new raw descriptor store.
     pub fn new() -> Self {
         Self { stored_fds: vec![] }
+    }
+
+    /// Clone the descriptor storage for `fork()`.
+    ///
+    /// Each stored fd is duplicated in the global `Descriptors` table so that
+    /// the child gets an independent `OwnedFd` (with its own `closed` flag).
+    /// The underlying file descriptions are shared via `Arc`, matching POSIX
+    /// shared-file-description semantics after fork.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any stored fd has already been closed in `global_dt`.
+    #[must_use]
+    pub fn clone_for_fork<Platform: RawSyncPrimitivesProvider>(
+        &self,
+        global_dt: &mut Descriptors<Platform>,
+    ) -> Self {
+        Self {
+            stored_fds: self
+                .stored_fds
+                .iter()
+                .map(|slot| {
+                    slot.as_ref().map(|stored| {
+                        let new_owned = global_dt
+                            .duplicate_raw_fd(&stored.x)
+                            .expect("fd should not be closed during fork");
+                        StoredFd {
+                            x: Arc::new(new_owned),
+                            subsystem_entry_type_id: stored.subsystem_entry_type_id,
+                        }
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    /// Duplicate a stored fd for inter-process passing (e.g. `SCM_RIGHTS`).
+    ///
+    /// Creates a new entry in the global descriptor table that shares the same
+    /// underlying file description as the fd at `raw_fd`. Returns a
+    /// [`PassedFd`] token that can be installed in another process's raw
+    /// descriptor store via [`Self::insert_passed_fd`].
+    ///
+    /// Returns `None` if `raw_fd` is not occupied or the underlying owned fd
+    /// has already been closed.
+    pub fn duplicate_for_passing<Platform: RawSyncPrimitivesProvider>(
+        &self,
+        raw_fd: usize,
+        global_dt: &mut Descriptors<Platform>,
+    ) -> Option<PassedFd> {
+        let stored = self.stored_fds.get(raw_fd)?.as_ref()?;
+        let new_owned = global_dt.duplicate_raw_fd(&stored.x)?;
+        Some(PassedFd {
+            owned: new_owned,
+            type_id: stored.subsystem_entry_type_id,
+        })
+    }
+
+    /// Install an fd received via inter-process passing (e.g. `SCM_RIGHTS`).
+    ///
+    /// The caller supplies a [`PassedFd`] token (obtained from
+    /// [`Self::duplicate_for_passing`]). The fd is placed in the first
+    /// available slot and its raw integer is returned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the selected slot is unexpectedly occupied.
+    pub fn insert_passed_fd(&mut self, passed: PassedFd) -> usize {
+        let raw_fd = self
+            .stored_fds
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or_else(|| {
+                self.stored_fds.push(None);
+                self.stored_fds.len() - 1
+            });
+        let stored = StoredFd {
+            x: Arc::new(passed.owned),
+            subsystem_entry_type_id: passed.type_id,
+        };
+        let old = self.stored_fds[raw_fd].replace(stored);
+        assert!(old.is_none());
+        raw_fd
     }
 
     /// Get the corresponding integer value of the provided `fd`.
@@ -620,13 +786,6 @@ impl RawDescriptorStorage {
     ) -> bool {
         // TODO(jayb): Should we be storing things via a HashMap to make sure this operation cannot
         // be too expensive if someone tries to store into a large raw FD?
-        //
-        // If this assertion failure is hit in practice, we might need to be more defensive via the
-        // HashMap, rather than just silently allow big growth
-        assert!(
-            raw_fd < self.stored_fds.len() + 100,
-            "explicit upper bound restriction for now; see implementation details"
-        );
         if self.stored_fds.get(raw_fd).is_some_and(Option::is_some) {
             // There's already something at this slot.
             return false;
@@ -762,7 +921,17 @@ pub trait FdEnabledSubsystem: Sized {
 }
 
 /// A per-FD entry stored in the descriptor table for a specific [`FdEnabledSubsystem`]
-pub trait FdEnabledSubsystemEntry: Send + Sync + core::any::Any {}
+pub trait FdEnabledSubsystemEntry: Send + Sync + core::any::Any {
+    /// Called when this entry is duplicated (e.g. via `dup`/`dup2`/`fork`).
+    /// Subsystems that maintain reference counts (PTY open counts, pipe sender
+    /// counts) should increment them here.
+    fn on_dup(&self) {}
+
+    /// Called when a file descriptor referencing this entry is closed.
+    /// Subsystems that maintain reference counts should decrement them here
+    /// and fire any resulting notifications (e.g. HUP on last PTY close).
+    fn on_close(&self) {}
+}
 
 /// Possible errors from [`RawDescriptorStorage::fd_from_raw_integer`] and
 /// [`RawDescriptorStorage::fd_consume_raw_integer`].
@@ -878,7 +1047,7 @@ pub(crate) struct InternalFd {
 ///
 /// Note: this indicates ownership over the descriptor itself, but not necessarily the underlying
 /// entry, since there might be duplicates to the underlying entry.
-struct OwnedFd {
+pub(crate) struct OwnedFd {
     raw: u32,
     closed: AtomicBool,
 }

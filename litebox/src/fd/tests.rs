@@ -117,6 +117,31 @@ fn test_with_entry() {
 }
 
 #[test]
+fn test_duplicate_shares_identity() {
+    let litebox = litebox();
+    let mut descriptors = litebox.descriptor_table_mut();
+
+    let entry = MockEntry {
+        data: "test".to_string(),
+    };
+    let typed_fd: TypedFd<MockSubsystem> = descriptors.insert(entry);
+    let dup_fd = descriptors
+        .duplicate(&typed_fd)
+        .expect("duplicate should succeed");
+
+    let handle_orig = descriptors
+        .entry_handle(&typed_fd)
+        .expect("entry handle should exist");
+    let handle_dup = descriptors
+        .entry_handle(&dup_fd)
+        .expect("dup entry handle should exist");
+    assert_eq!(handle_orig.identity_addr(), handle_dup.identity_addr());
+
+    let weak = handle_orig.downgrade();
+    assert_eq!(weak.identity_addr(), handle_orig.identity_addr());
+}
+
+#[test]
 fn test_fd_raw_integer() {
     let litebox = litebox();
     let mut descriptors = litebox.descriptor_table_mut();
@@ -146,4 +171,31 @@ fn test_fd_raw_integer() {
         .with_entry(&consumed_fd, |e| e.data.clone())
         .unwrap();
     assert_eq!(data, "test");
+}
+
+#[test]
+fn test_clone_for_fork_shares_identity() {
+    let litebox = litebox();
+    let mut descriptors = litebox.descriptor_table_mut();
+    let mut parent_rds = super::RawDescriptorStorage::new();
+
+    let entry = MockEntry {
+        data: "test".to_string(),
+    };
+    let typed_fd: TypedFd<MockSubsystem> = descriptors.insert(entry);
+    let raw_fd = parent_rds.fd_into_raw_integer(typed_fd);
+
+    let child_rds = parent_rds.clone_for_fork(&mut descriptors);
+
+    let parent_fd = parent_rds
+        .fd_from_raw_integer::<MockSubsystem>(raw_fd)
+        .expect("parent fd should still exist");
+    let child_fd = child_rds
+        .fd_from_raw_integer::<MockSubsystem>(raw_fd)
+        .expect("child fd should be cloned");
+
+    // Parent and child fds should share the same underlying entry (same Arc)
+    let parent_handle = descriptors.entry_handle(&parent_fd).unwrap();
+    let child_handle = descriptors.entry_handle(&child_fd).unwrap();
+    assert_eq!(parent_handle.identity_addr(), child_handle.identity_addr());
 }
