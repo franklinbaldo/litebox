@@ -4,7 +4,7 @@
 //! Local execution of syscalls authorized by central.
 
 use crate::raw_syscall;
-use litebox_ipc::ring::{CqEntry, cq_flags};
+use litebox_ipc::ring::{cq_flags, CqEntry};
 
 /// Execute a locally-authorized syscall.
 ///
@@ -540,36 +540,6 @@ pub unsafe fn execute_locally(
             }
             cq.result
         }
-        nr if nr == libc::SYS_clock_gettime as u32 => {
-            if cq.flags & cq_flags::HAS_DATA != 0 {
-                let guest_buf = args[1] as *mut u8; // tp (rsi)
-                let data_len = cq.data_len as usize;
-                if !ring_base.is_null() && data_len > 0 {
-                    unsafe {
-                        let data_src = ring_base
-                            .add(layout.data_region_offset)
-                            .add(cq.data_offset as usize);
-                        core::ptr::copy_nonoverlapping(data_src, guest_buf, data_len);
-                    }
-                }
-            }
-            cq.result
-        }
-        nr if nr == libc::SYS_gettimeofday as u32 => {
-            if cq.flags & cq_flags::HAS_DATA != 0 {
-                let guest_buf = args[0] as *mut u8; // tv (rdi)
-                let data_len = cq.data_len as usize;
-                if !ring_base.is_null() && data_len > 0 {
-                    unsafe {
-                        let data_src = ring_base
-                            .add(layout.data_region_offset)
-                            .add(cq.data_offset as usize);
-                        core::ptr::copy_nonoverlapping(data_src, guest_buf, data_len);
-                    }
-                }
-            }
-            cq.result
-        }
         // Sleep: dereference guest timespec struct for duration
         nr if nr == libc::SYS_nanosleep as u32 => unsafe {
             raw_syscall::syscall2(libc::SYS_nanosleep, args[0], args[1])
@@ -626,21 +596,6 @@ pub unsafe fn execute_locally(
         nr if nr == libc::SYS_sigaltstack as u32 => unsafe {
             raw_syscall::syscall2(libc::SYS_sigaltstack, args[0], args[1])
         },
-        nr if nr == libc::SYS_time as u32 => {
-            if cq.flags & cq_flags::HAS_DATA != 0 {
-                let guest_buf = args[0] as *mut u8; // tloc (rdi)
-                let data_len = cq.data_len as usize;
-                if !ring_base.is_null() && data_len > 0 {
-                    unsafe {
-                        let data_src = ring_base
-                            .add(layout.data_region_offset)
-                            .add(cq.data_offset as usize);
-                        core::ptr::copy_nonoverlapping(data_src, guest_buf, data_len);
-                    }
-                }
-            }
-            cq.result
-        }
         nr if nr == libc::SYS_uname as u32 => {
             if cq.flags & cq_flags::HAS_DATA != 0 {
                 let guest_buf = args[0] as *mut u8; // buf (rdi)
@@ -674,21 +629,6 @@ pub unsafe fn execute_locally(
         nr if nr == libc::SYS_getrlimit as u32 => {
             if cq.flags & cq_flags::HAS_DATA != 0 {
                 let guest_buf = args[1] as *mut u8; // rlim (rsi)
-                let data_len = cq.data_len as usize;
-                if !ring_base.is_null() && data_len > 0 {
-                    unsafe {
-                        let data_src = ring_base
-                            .add(layout.data_region_offset)
-                            .add(cq.data_offset as usize);
-                        core::ptr::copy_nonoverlapping(data_src, guest_buf, data_len);
-                    }
-                }
-            }
-            cq.result
-        }
-        nr if nr == libc::SYS_clock_getres as u32 => {
-            if cq.flags & cq_flags::HAS_DATA != 0 {
-                let guest_buf = args[1] as *mut u8; // res (rsi)
                 let data_len = cq.data_len as usize;
                 if !ring_base.is_null() && data_len > 0 {
                     unsafe {
@@ -1136,6 +1076,17 @@ pub unsafe fn execute_micro_local(syscall_nr: u32, args: &[u64; 6]) -> i64 {
                 args[3],
             )
         },
+        // Time queries: read-only, no state in central.
+        // Raw host syscall gives correct wall-clock / monotonic time.
+        nr if nr == libc::SYS_clock_gettime as u32 || nr == libc::SYS_clock_getres as u32 => unsafe {
+            raw_syscall::syscall2(i64::from(nr), args[0], args[1])
+        },
+        nr if nr == libc::SYS_gettimeofday as u32 => unsafe {
+            raw_syscall::syscall2(libc::SYS_gettimeofday, args[0], args[1])
+        },
+        nr if nr == libc::SYS_time as u32 => unsafe {
+            raw_syscall::syscall1(libc::SYS_time, args[0])
+        },
         // Thread setup: thread-local only
         nr if nr == libc::SYS_arch_prctl as u32 => unsafe {
             raw_syscall::arch_prctl(args[0] as i32, args[1] as usize)
@@ -1336,9 +1287,8 @@ mod tests {
     /// calls). Also verifies Tier 1 and Tier 2 don't overlap.
     ///
     /// Note: Group 1 syscalls (uname, sysinfo, getrlimit, prlimit64,
-    /// sched_getaffinity, getrandom, clock_gettime, gettimeofday, time,
-    /// clock_getres) are routed through central's shim via HAS_DATA,
-    /// not micro-local.
+    /// sched_getaffinity, getrandom) are routed through central's shim via
+    /// HAS_DATA, not micro-local.
     #[test]
     #[allow(clippy::cast_possible_truncation)]
     fn tier_classification_covers_all() {
@@ -1362,6 +1312,10 @@ mod tests {
             libc::SYS_setgroups,
             libc::SYS_nanosleep,
             libc::SYS_clock_nanosleep,
+            libc::SYS_clock_gettime,
+            libc::SYS_clock_getres,
+            libc::SYS_gettimeofday,
+            libc::SYS_time,
             libc::SYS_arch_prctl,
             libc::SYS_set_tid_address,
             libc::SYS_set_robust_list,

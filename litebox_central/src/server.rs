@@ -19,8 +19,8 @@ use litebox_ipc::messages::{
     MSG_THREAD_DEREGISTER, MSG_THREAD_REGISTER,
 };
 use litebox_ipc::ring::{
-    CqEntry, PIPE_SLOT_SIZE, PIPE_ZONE_BASE_OFFSET, RING_MASK, SqEntry, TrampolineDescriptor,
-    cq_flags, pipe_flags, sq_flags,
+    cq_flags, pipe_flags, sq_flags, CqEntry, SqEntry, TrampolineDescriptor, PIPE_SLOT_SIZE,
+    PIPE_ZONE_BASE_OFFSET, RING_MASK,
 };
 use litebox_ipc::sq::{sq_advance_head, sq_head_index, sq_try_consume};
 use litebox_ipc::wait::spin_u8_then_wait_u32;
@@ -860,10 +860,6 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 | libc::SYS_prlimit64
                 | libc::SYS_sched_getaffinity
                 | libc::SYS_getrandom
-                | libc::SYS_clock_gettime
-                | libc::SYS_gettimeofday
-                | libc::SYS_time
-                | libc::SYS_clock_getres
         )
     }
 
@@ -1210,74 +1206,6 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
                     cq.data_offset = 0;
                     cq.data_len = cq.result as u32;
-                }
-            }
-            // ── Time queries ────────────────────────────────────────────
-            libc::SYS_clock_gettime => {
-                // clock_gettime(clockid, tp) — rewrite tp (rsi) to data
-                // region. struct timespec = 16 bytes on x86_64.
-                const TIMESPEC_SIZE: u32 = 16;
-                regs.rsi = data_ptr;
-                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
-                if cq.result >= 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
-                    cq.data_offset = 0;
-                    cq.data_len = TIMESPEC_SIZE;
-                }
-            }
-            libc::SYS_clock_getres => {
-                // clock_getres(clockid, res) — rewrite res (rsi) to data
-                // region. struct timespec = 16 bytes on x86_64.
-                const TIMESPEC_SIZE: u32 = 16;
-                let res_arg = entry.args[1]; // original rsi from guest
-                if res_arg != 0 {
-                    regs.rsi = data_ptr;
-                }
-                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
-                if cq.result >= 0 && res_arg != 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
-                    cq.data_offset = 0;
-                    cq.data_len = TIMESPEC_SIZE;
-                } else if cq.result >= 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
-                }
-            }
-            libc::SYS_gettimeofday => {
-                // gettimeofday(tv, tz) — rewrite tv (rdi) to data region.
-                // struct timeval = 16 bytes on x86_64.
-                // tz is obsolete and usually NULL; we don't rewrite it.
-                const TIMEVAL_SIZE: u32 =
-                    core::mem::size_of::<litebox_common_linux::TimeVal>() as u32;
-                let tv_arg = entry.args[0]; // original rdi from guest
-                if tv_arg != 0 {
-                    regs.rdi = data_ptr;
-                }
-                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
-                if cq.result >= 0 && tv_arg != 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
-                    cq.data_offset = 0;
-                    cq.data_len = TIMEVAL_SIZE;
-                } else if cq.result >= 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
-                }
-            }
-            libc::SYS_time => {
-                // time(tloc) — rewrite tloc (rdi) to data region.
-                // time_t = 8 bytes on x86_64. Return value is also the time.
-                const TIME_T_SIZE: u32 =
-                    core::mem::size_of::<litebox_common_linux::time_t>() as u32;
-                let tloc_arg = entry.args[0]; // original rdi from guest
-                if tloc_arg != 0 {
-                    regs.rdi = data_ptr;
-                }
-                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
-                if cq.result >= 0 && tloc_arg != 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
-                    cq.data_offset = 0;
-                    cq.data_len = TIME_T_SIZE;
-                } else if cq.result >= 0 {
-                    // tloc was NULL; result is the time value directly.
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
                 }
             }
             // ── Socket output syscalls ──────────────────────────────────
