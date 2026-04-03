@@ -108,42 +108,4 @@ impl<FS: ShimFS> Task<FS> {
             }
         }
     }
-
-    // === Temporary stubs — proper implementations in Task 3 (file.rs) ===
-
-    /// Handle `open()` — temporary stub.
-    pub(crate) fn sys_open(
-        &self,
-        _path_addr: usize,
-        _flags: i32,
-        _mode: u32,
-    ) -> Result<usize, Errno> {
-        Err(Errno::ENOSYS)
-    }
-
-    /// Handle `lseek()` — temporary stub.
-    pub(crate) fn sys_lseek(&self, _fd: i32, _offset: i64, _whence: i32) -> Result<usize, Errno> {
-        Err(Errno::ENOSYS)
-    }
-
-    /// Handle `pread()` — temporary stub.
-    pub(crate) fn sys_pread(
-        &self,
-        _fd: i32,
-        _buf: usize,
-        _count: usize,
-        _offset: i64,
-    ) -> Result<usize, Errno> {
-        Err(Errno::ENOSYS)
-    }
-
-    /// Handle `fstat64()` — temporary stub.
-    pub(crate) fn sys_fstat64(&self, _fd: i32, _buf: usize) -> Result<usize, Errno> {
-        Err(Errno::ENOSYS)
-    }
-
-    /// Handle `fcntl()` — temporary stub.
-    pub(crate) fn sys_fcntl(&self, _fd: i32, _cmd: i32, _arg: usize) -> Result<usize, Errno> {
-        Err(Errno::ENOSYS)
-    }
 }

@@ -12,19 +12,20 @@
 
 extern crate alloc;
 
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::Cell;
 use core::sync::atomic::{AtomicI32, Ordering};
 use litebox::{
-    LiteBox,
     fd::RawDescriptorStorage,
-    mm::{PageManager, linux::PAGE_SIZE},
+    mm::{linux::PAGE_SIZE, PageManager},
     net::Network,
     pipes::Pipes,
     platform::TimeProvider,
     shim::ContinueOperation,
     sync::futex::FutexManager,
+    LiteBox,
 };
 use litebox_common_macos::PtRegs;
 use litebox_platform_multiplex::Platform;
@@ -73,6 +74,7 @@ pub struct MacosShimBuilder<FS: ShimFS> {
     platform: &'static Platform,
     litebox: LiteBox<Platform>,
     fs: Option<FS>,
+    sysroot: Option<String>,
 }
 
 impl<FS: ShimFS> Default for MacosShimBuilder<FS> {
@@ -89,7 +91,16 @@ impl<FS: ShimFS> MacosShimBuilder<FS> {
             platform,
             litebox: LiteBox::new(platform),
             fs: None,
+            sysroot: None,
         }
+    }
+
+    /// Set the sysroot path for file system path rewriting.
+    ///
+    /// When set, paths starting with `/usr/lib/` or `/System/Library/` will
+    /// be redirected under this sysroot prefix in `sys_open`.
+    pub fn set_sysroot(&mut self, path: String) {
+        self.sysroot = Some(path);
     }
 
     /// Returns the litebox object for the shim.
@@ -142,6 +153,7 @@ impl<FS: ShimFS> MacosShimBuilder<FS> {
             boot_time: self.platform.now(),
             litebox: self.litebox,
             raw_descriptors: litebox::sync::RwLock::new(RawDescriptorStorage::new()),
+            sysroot: self.sysroot,
         });
         MacosShim(global)
     }
@@ -196,10 +208,10 @@ impl<FS: ShimFS> MacosShim<FS> {
             let sp = load_info.user_stack_top;
             initial_ctx.regs[0] = arg_count; // x0 = argc
             initial_ctx.regs[1] = sp + size_of::<usize>(); // x1 = &argv[0]
-            // x2 = envp: skip past argc + argv pointers + NULL terminator
+                                                           // x2 = envp: skip past argc + argv pointers + NULL terminator
             let envp_offset = size_of::<usize>() + (arg_count + 1) * size_of::<usize>();
             initial_ctx.regs[2] = sp + envp_offset; // x2 = &envp[0]
-            // x3 = apple: skip past envp pointers + NULL terminator
+                                                    // x3 = apple: skip past envp pointers + NULL terminator
             let apple_offset = envp_offset + (env_count + 1) * size_of::<usize>();
             initial_ctx.regs[3] = sp + apple_offset; // x3 = &apple[0]
         }
@@ -358,6 +370,8 @@ struct GlobalState<FS: ShimFS> {
     boot_time: <Platform as TimeProvider>::Instant,
     /// Raw file descriptor mapping (integer fd -> TypedFd).
     raw_descriptors: litebox::sync::RwLock<Platform, RawDescriptorStorage>,
+    /// Optional sysroot prefix for path rewriting in sys_open.
+    sysroot: Option<alloc::string::String>,
 }
 
 /// A single task (single-threaded for macOS phase 1).

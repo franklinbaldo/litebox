@@ -14,12 +14,12 @@ use alloc::ffi::CString;
 use alloc::vec::Vec;
 use litebox::mm::linux::{CreatePagesFlags, PAGE_SIZE};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, SystemInfoProvider as _};
-use object::Endianness;
 use object::macho;
 use object::read::macho::MachHeader;
+use object::Endianness;
 
 use super::stack::UserStack;
-use super::{DEFAULT_LOW_ADDR, DEFAULT_STACK_SIZE, MachoLoadInfo, MachoLoaderError};
+use super::{MachoLoadInfo, MachoLoaderError, DEFAULT_LOW_ADDR, DEFAULT_STACK_SIZE};
 use crate::{MutPtr, ShimFS, Task};
 
 struct SegmentInfo {
