@@ -46,8 +46,8 @@ fn parse_text_sections(data: &[u8]) -> Result<Vec<arm64::TextSectionInfo>> {
         return Err(Error::UnsupportedObjectFile);
     }
     let filetype = header.filetype(endian);
-    // MH_DYLINKER = 7 (the dynamic linker, e.g. /usr/lib/dyld)
-    if filetype != macho::MH_EXECUTE && filetype != 7 {
+    // MH_DYLINKER (the dynamic linker, e.g. /usr/lib/dyld)
+    if filetype != macho::MH_EXECUTE && filetype != macho::MH_DYLINKER {
         return Err(Error::UnsupportedObjectFile);
     }
 

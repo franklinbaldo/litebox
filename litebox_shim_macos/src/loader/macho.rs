@@ -22,6 +22,13 @@ use super::stack::UserStack;
 use super::{DyldLoadInfo, MachoLoadInfo, MachoLoaderError, DEFAULT_LOW_ADDR, DEFAULT_STACK_SIZE};
 use crate::{MutPtr, ShimFS, Task};
 
+/// Byte offset of the PC register within an LC_UNIXTHREAD ARM64 thread state command.
+///
+/// Layout: cmd(4) + cmdsize(4) + flavor(4) + count(4) = 16 bytes header,
+/// then 32 general-purpose registers (x0-x30, sp) at 8 bytes each = 256 bytes.
+/// PC is at register index 32 (after the 32 GPRs).
+const ARM64_THREAD_STATE_PC_OFFSET: usize = 16 + 32 * 8;
+
 struct SegmentInfo {
     vmaddr: u64,
     vmsize: u64,
@@ -104,13 +111,12 @@ pub(crate) fn load<FS: ShimFS>(
         // Check for LC_UNIXTHREAD
         if cmd.cmd() == macho::LC_UNIXTHREAD {
             let cmd_data = cmd.raw_data();
-            // ARM64 thread state layout:
-            // cmd(4) + cmdsize(4) + flavor(4) + count(4) = 16 bytes header
-            // Then 32 general-purpose registers (x0-x30, sp) at 8 bytes each = 256 bytes
-            // PC is at register index 32 (after the 32 GPRs)
-            let pc_offset = 16 + 32 * 8;
-            if cmd_data.len() >= pc_offset + 8 {
-                let pc = u64::from_le_bytes(cmd_data[pc_offset..pc_offset + 8].try_into().unwrap());
+            if cmd_data.len() >= ARM64_THREAD_STATE_PC_OFFSET + 8 {
+                let pc = u64::from_le_bytes(
+                    cmd_data[ARM64_THREAD_STATE_PC_OFFSET..ARM64_THREAD_STATE_PC_OFFSET + 8]
+                        .try_into()
+                        .unwrap(),
+                );
                 entry_offset = Some(pc);
                 is_lc_main = false;
             }
@@ -398,20 +404,19 @@ pub(crate) fn load<FS: ShimFS>(
     // intercepts for code patching).
     let mut dyld_entry: Option<usize> = None;
     if has_dylinker {
-        if let Some(dyld_data) = dyld_bytes {
-            let dyld_info = load_dyld(task, dyld_data)?;
-            dyld_entry = Some(dyld_info.entry_point);
-        }
+        let dyld_data = dyld_bytes.ok_or_else(|| {
+            MachoLoaderError::ParseError(
+                "binary requires dyld (LC_LOAD_DYLINKER) but no dyld_bytes provided".into(),
+            )
+        })?;
+        let dyld_info = load_dyld(task, dyld_data)?;
+        dyld_entry = Some(dyld_info.entry_point);
     }
 
     // Use dyld's entry point if loaded, otherwise use the main binary's.
     let final_entry = dyld_entry.unwrap_or(entry_point);
     // When dyld is loaded, it uses LC_UNIXTHREAD-style entry (stack-based args).
-    let final_is_lc_main = if dyld_entry.is_some() {
-        false
-    } else {
-        is_lc_main
-    };
+    let final_is_lc_main = dyld_entry.is_none() && is_lc_main;
 
     // Allocate stack
     let sp = unsafe {
@@ -463,8 +468,11 @@ pub(crate) fn extract_arm64_slice(data: &[u8]) -> Option<(usize, usize)> {
         return None;
     }
     let magic = u32::from_be_bytes(data[0..4].try_into().ok()?);
-    if magic != 0xCAFE_BABE && magic != 0xBEBA_FECA {
-        return None; // Not a fat binary
+    // FAT_MAGIC is always big-endian (0xCAFEBABE). Since we read with from_be_bytes,
+    // we only need to check for this value. FAT_MAGIC_64 (0xCAFEBABF) uses
+    // fat_arch_64 entries with different layout and is not supported.
+    if magic != 0xCAFE_BABE {
+        return None; // Not a fat binary (or unsupported FAT_MAGIC_64)
     }
     let nfat_arch = u32::from_be_bytes(data[4..8].try_into().ok()?);
 
@@ -524,7 +532,7 @@ fn load_dyld<FS: ShimFS>(
     if header.cputype(endian) != macho::CPU_TYPE_ARM64 {
         return Err(MachoLoaderError::UnsupportedFormat);
     }
-    if header.filetype(endian) != 7 {
+    if header.filetype(endian) != macho::MH_DYLINKER {
         return Err(MachoLoaderError::UnsupportedFormat);
     }
 
@@ -562,9 +570,12 @@ fn load_dyld<FS: ShimFS>(
         // LC_UNIXTHREAD for dyld entry point
         if cmd.cmd() == macho::LC_UNIXTHREAD {
             let cmd_data = cmd.raw_data();
-            let pc_offset = 16 + 32 * 8;
-            if cmd_data.len() >= pc_offset + 8 {
-                let pc = u64::from_le_bytes(cmd_data[pc_offset..pc_offset + 8].try_into().unwrap());
+            if cmd_data.len() >= ARM64_THREAD_STATE_PC_OFFSET + 8 {
+                let pc = u64::from_le_bytes(
+                    cmd_data[ARM64_THREAD_STATE_PC_OFFSET..ARM64_THREAD_STATE_PC_OFFSET + 8]
+                        .try_into()
+                        .unwrap(),
+                );
                 entry_pc = Some(pc);
             }
         }
@@ -574,8 +585,9 @@ fn load_dyld<FS: ShimFS>(
         return Err(MachoLoaderError::NoTextSegment);
     }
 
-    // Reserve-then-map strategy, same as for main binary but with hint offset
-    // 256MB above DEFAULT_LOW_ADDR to avoid the main binary.
+    // Reserve-then-map strategy, same as for main binary but with a hint address
+    // 256MB above DEFAULT_LOW_ADDR to avoid the main binary. This is only a hint —
+    // if the region is occupied, the kernel will choose a different address.
     const DYLD_HINT_OFFSET: usize = 256 * 1024 * 1024; // 256 MB
 
     let min_vmaddr = segments
