@@ -157,24 +157,6 @@ fn run_host_mode(args: CliArgs) -> anyhow::Result<()> {
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    let includes: Vec<IncludeEntry> = args
-        .include
-        .iter()
-        .map(|s| parse_include(s))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-
-    let rewrite_includes: Vec<IncludeEntry> = args
-        .rewrite_include
-        .iter()
-        .map(|s| parse_include(s))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-
-    for inc in includes.iter().chain(&rewrite_includes) {
-        if !inc.host_path.exists() {
-            bail!("included file does not exist: {}", inc.host_path.display());
-        }
-    }
-
     let no_rewrite: BTreeSet<PathBuf> = args
         .no_rewrite
         .iter()
@@ -268,7 +250,12 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
 
     // --- Phase 2: Scan rootfs for files ---
     eprintln!("Scanning rootfs...");
-    let file_map = oci::scan_rootfs(&extracted.rootfs_path, &extracted.symlinks, args.verbose)?;
+    let file_map = oci::scan_rootfs(
+        &extracted.rootfs_path,
+        &extracted.symlink_map,
+        &extracted.permissions,
+        args.verbose,
+    )?;
 
     let no_rewrite: BTreeSet<PathBuf> = args
         .no_rewrite
@@ -426,6 +413,12 @@ fn finalize_tar(
         .collect::<anyhow::Result<Vec<_>>>()?;
 
     for inc in &rewrite_includes {
+        if !inc.host_path.exists() {
+            bail!(
+                "rewrite-included file does not exist: {}",
+                inc.host_path.display()
+            );
+        }
         if !added_tar_paths.insert(inc.tar_path.clone()) {
             bail!(
                 "duplicate tar path from --rewrite-include: '{}' (already present)",
@@ -750,13 +743,10 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn rewrite_elf_rejects_bun_packaged_executables() {
-        let mut bun_binary = b"\x7fELF".to_vec();
-        bun_binary.extend_from_slice(b"\n---- Bun! ----\n");
-
-        let error = rewrite_elf(&bun_binary, Path::new("/tmp/claude"), false)
-            .expect_err("bun-packaged executable should not be packaged as-is");
-
-        assert!(error.to_string().contains("Bun-packaged executable"));
+    fn rewrite_elf_skips_non_elf_files() {
+        // Non-ELF data should be returned unmodified.
+        let data = b"#!/bin/sh\necho hello\n";
+        let result = rewrite_elf(data, Path::new("/tmp/script.sh"), false).unwrap();
+        assert_eq!(result, data);
     }
 }
