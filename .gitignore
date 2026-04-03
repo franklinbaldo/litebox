@@ -169,4 +169,7 @@ $RECYCLE.BIN/
 # Windows shortcuts
 *.lnk
 
+# Extracted macOS sysroot for dynamic linking tests
+test-sysroot/
+
 # End of https://www.toptal.com/developers/gitignore/api/rust,linux,windows,macos,emacs,vim,visualstudiocode
