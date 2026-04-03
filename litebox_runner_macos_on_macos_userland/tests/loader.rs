@@ -103,3 +103,50 @@ fn test_exit_code_42() {
     let (exit_code, _) = common::run_macho_binary(&rewritten, &["exit_42"]);
     assert_eq!(exit_code, 42, "expected exit code 42, got {exit_code}");
 }
+
+/// Dynamically linked hello world using libc's printf.
+/// This is the target program for Phase 2 — it requires dyld, libSystem, and
+/// the mmap-hook code patching pipeline.
+const HELLO_DYNAMIC_C: &str = r#"
+#include <stdio.h>
+
+int main(int argc, char *argv[]) {
+    for (int i = 0; i < argc; i++) {
+        printf("argv[%d] = %s\n", i, argv[i]);
+    }
+    return 0;
+}
+"#;
+
+#[test]
+#[ignore = "requires sysroot extraction: run extract_sysroot.sh first"]
+fn test_hello_dynamic() {
+    let sysroot = std::env::var("LITEBOX_MACOS_SYSROOT").unwrap_or_else(|_| {
+        // Default sysroot location next to the test binary
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        format!("{manifest_dir}/test-sysroot")
+    });
+
+    // Check if sysroot exists
+    if !std::path::Path::new(&sysroot)
+        .join("usr/lib/libSystem.B.dylib")
+        .exists()
+    {
+        panic!(
+            "Sysroot not found at {sysroot}/usr/lib/libSystem.B.dylib. \
+             Run extract_sysroot.sh first:\n  \
+             ./litebox_runner_macos_on_macos_userland/extract_sysroot.sh {sysroot}"
+        );
+    }
+
+    let bin_path = common::compile_macho_dynamic(HELLO_DYNAMIC_C, "hello_dynamic");
+    let binary_data = std::fs::read(&bin_path).expect("read binary");
+
+    // Rewrite the main binary's SVC sites
+    let rewritten = litebox_syscall_rewriter_macho::hook_syscalls_in_macho(&binary_data)
+        .expect("rewrite failed");
+
+    let (exit_code, _stdout) =
+        common::run_macho_dynamic(&rewritten, &["hello_dynamic", "arg1", "arg2"], &sysroot);
+    assert_eq!(exit_code, 0, "process exited with non-zero code");
+}

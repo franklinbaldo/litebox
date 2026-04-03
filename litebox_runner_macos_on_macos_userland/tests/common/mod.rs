@@ -114,6 +114,37 @@ pub fn compile_macho_nolibc(c_source: &str, name: &str) -> PathBuf {
     bin_path
 }
 
+/// Compile a C file to a dynamically linked Mach-O binary using clang.
+pub fn compile_macho_dynamic(c_source: &str, name: &str) -> PathBuf {
+    let dir = std::env::var("OUT_DIR")
+        .unwrap_or_else(|_| std::env::temp_dir().to_str().unwrap().to_string());
+    let dir = Path::new(&dir);
+
+    let src_path = dir.join(format!("{name}.c"));
+    let bin_path = dir.join(name);
+
+    std::fs::write(&src_path, c_source).expect("write C source");
+
+    let output = std::process::Command::new("clang")
+        .args([
+            "-arch",
+            "arm64",
+            "-Wl,-headerpad,0x1000",
+            "-o",
+            bin_path.to_str().unwrap(),
+            src_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run clang");
+    assert!(
+        output.status.success(),
+        "clang failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    bin_path
+}
+
 /// Rewrite a Mach-O binary using the Mach-O syscall rewriter.
 pub fn rewrite_macho(input: &Path) -> Vec<u8> {
     let data = std::fs::read(input).expect("read binary");
@@ -174,5 +205,60 @@ pub fn run_macho_binary(binary_data: &[u8], argv: &[&str]) -> (i32, Vec<u8>) {
     // Phase 1: stdout is written to the host's fd 1 via the /dev/stdout
     // device. We can't easily capture it. Return empty for now.
     // The test verifies exit code; stdout capture is a future enhancement.
+    (exit_code, Vec::new())
+}
+
+/// Run a dynamically linked Mach-O binary through litebox with dyld support.
+///
+/// Unlike [`run_macho_binary`], this:
+/// - Sets a sysroot on the shim builder so dyld can find dylibs
+/// - Reads `/usr/lib/dyld` from the host and passes it to `load_program`
+pub fn run_macho_dynamic(binary_data: &[u8], argv: &[&str], sysroot: &str) -> (i32, Vec<u8>) {
+    use litebox::fs::{FileSystem as _, Mode};
+
+    let _guard = TEST_LOCK.lock().unwrap();
+    ensure_platform();
+    litebox_common_linux::HOST_TLS_TABLE_ADDR.store(0, std::sync::atomic::Ordering::Release);
+
+    let mut shim_builder =
+        litebox_shim_macos::MacosShimBuilder::<litebox_shim_macos::DefaultFS>::new();
+    shim_builder.set_sysroot(sysroot.to_string());
+
+    let litebox = shim_builder.litebox();
+    let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
+    in_mem_fs.with_root_privileges(|fs| {
+        let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
+        let _ = fs.mkdir("/tmp", mode);
+    });
+    let tar_ro_fs =
+        litebox::fs::tar_ro::FileSystem::new(litebox, litebox::fs::tar_ro::EMPTY_TAR_FILE.into());
+    let fs = shim_builder.default_fs(in_mem_fs, tar_ro_fs);
+    shim_builder.set_fs(fs);
+    let shim = shim_builder.build();
+
+    let argv_cstrings: Vec<std::ffi::CString> = argv
+        .iter()
+        .map(|s| std::ffi::CString::new(*s).unwrap())
+        .collect();
+    let envp = vec![std::ffi::CString::new("PATH=/bin").unwrap()];
+
+    // Read dyld from the host filesystem
+    let dyld_data = std::fs::read("/usr/lib/dyld").expect("failed to read /usr/lib/dyld");
+
+    let program = shim
+        .load_program(binary_data, argv_cstrings, envp, Some(&dyld_data))
+        .expect("load_program failed");
+
+    let litebox_shim_macos::LoadedProgram {
+        entrypoints,
+        process,
+        mut initial_ctx,
+    } = program;
+
+    unsafe {
+        litebox_platform_macos_userland::run_thread(entrypoints, &mut initial_ctx);
+    }
+
+    let exit_code = process.wait();
     (exit_code, Vec::new())
 }
