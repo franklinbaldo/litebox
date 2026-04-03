@@ -8,7 +8,7 @@
 // construction and zerocopy compatibility.
 #![allow(clippy::pub_underscore_fields)]
 
-use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8};
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -198,16 +198,23 @@ pub struct RingHeader {
     /// signal). Micro checks this after futex timeouts to detect central death
     /// and exit gracefully instead of hanging forever.
     pub is_exiting: AtomicU32,
+    /// Set to 1 by central when it enters futex sleep waiting for SQ entries.
+    /// Cleared by central when it wakes up. Micro checks this before issuing
+    /// FUTEX_WAKE on sq_notify — if central is still spinning, the wake is skipped.
+    pub sq_consumer_sleeping: AtomicU32,
     /// Padding to fill the first cache line.
-    pub _pad_sq: [u8; 40],
+    pub _pad_sq: [u8; 36],
 
     // --- Second cache line: completion queue metadata ---
     /// CQ consumer position (read by producer to check for space).
     pub cq_head: AtomicU64,
     /// CQ producer position (read by consumer to find new entries).
     pub cq_tail: AtomicU64,
+    /// Bitmask: bit N is set when thread N has entered futex sleep on its
+    /// `cq_notify_slots[N]`. Central checks this before issuing FUTEX_WAKE.
+    pub cq_consumers_sleeping: AtomicU64,
     /// Padding to fill the second cache line.
-    pub _pad_cq: [u8; 48],
+    pub _pad_cq: [u8; 40],
 
     // --- Per-thread wake slots ---
     /// Per-thread notification futexes for waking individual guest threads.

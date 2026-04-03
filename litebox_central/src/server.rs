@@ -138,6 +138,17 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     if sq_try_consume(entry) {
                         return;
                     }
+                    // Signal that we're about to sleep — micro can skip FUTEX_WAKE.
+                    header
+                        .sq_consumer_sleeping
+                        .store(1, std::sync::atomic::Ordering::Release);
+                    // Re-check after setting flag to avoid lost wake.
+                    if sq_try_consume(entry) {
+                        header
+                            .sq_consumer_sleeping
+                            .store(0, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
                     // SAFETY: valid pointer to AtomicU32 in shared memory.
                     unsafe {
                         libc::syscall(
@@ -148,6 +159,9 @@ impl<FS: ShimFS> ProcessServer<FS> {
                             std::ptr::null::<libc::timespec>(),
                         );
                     }
+                    header
+                        .sq_consumer_sleeping
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
                 });
             }
 
@@ -186,16 +200,22 @@ impl<FS: ShimFS> ProcessServer<FS> {
             // Notify the guest thread that a completion is available.
             let notify_slot = cq_notify_thread(header, cq_entry.thread_slot);
 
-            // Wake micro in case it fell through to futex_wait.
-            // SAFETY: `notify_slot` points to a valid AtomicU32 in the shared
-            // memory region's `cq_notify_slots` array.
-            unsafe {
-                libc::syscall(
-                    libc::SYS_futex,
-                    notify_slot.as_ptr(),
-                    libc::FUTEX_WAKE,
-                    1i32,
-                );
+            // Only issue FUTEX_WAKE if this thread has entered futex sleep.
+            let sleeping_bits = header
+                .cq_consumers_sleeping
+                .load(std::sync::atomic::Ordering::Acquire);
+            if sleeping_bits & (1u64 << cq_entry.thread_slot) != 0 {
+                // Wake micro in case it fell through to futex_wait.
+                // SAFETY: `notify_slot` points to a valid AtomicU32 in the shared
+                // memory region's `cq_notify_slots` array.
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_futex,
+                        notify_slot.as_ptr(),
+                        libc::FUTEX_WAKE,
+                        1i32,
+                    );
+                }
             }
 
             sq_advance_head(header, entry);

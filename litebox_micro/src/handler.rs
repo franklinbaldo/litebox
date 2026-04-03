@@ -913,8 +913,14 @@ pub(crate) unsafe fn submit_and_wait(
     header
         .sq_notify
         .fetch_add(1, core::sync::atomic::Ordering::Release);
-    // Wake central in case it fell through to futex_wait.
-    futex_wake(&header.sq_notify);
+    // Only issue FUTEX_WAKE if central has entered futex sleep.
+    if header
+        .sq_consumer_sleeping
+        .load(core::sync::atomic::Ordering::Acquire)
+        != 0
+    {
+        futex_wake(&header.sq_notify);
+    }
 
     loop {
         if let Some(cq) = unsafe { cq_find_by_seq(header, cq_entries, search_start, seq) } {
@@ -927,7 +933,22 @@ pub(crate) unsafe fn submit_and_wait(
         // Spin aggressively (10,000 iters ≈ 100 µs), then timed futex
         // fallback that periodically checks whether central is still alive.
         spin_then_wait(notify_slot, current, |addr, exp| {
+            // Set our sleeping bit so central can skip FUTEX_WAKE.
+            let bit = 1u64 << unsafe { (*tls).thread_slot };
+            header
+                .cq_consumers_sleeping
+                .fetch_or(bit, core::sync::atomic::Ordering::Release);
+            // Re-check before sleeping to avoid lost wake.
+            if addr.load(core::sync::atomic::Ordering::Acquire) != exp {
+                header
+                    .cq_consumers_sleeping
+                    .fetch_and(!bit, core::sync::atomic::Ordering::Relaxed);
+                return;
+            }
             futex_wait_timed(addr, exp);
+            header
+                .cq_consumers_sleeping
+                .fetch_and(!bit, core::sync::atomic::Ordering::Relaxed);
             // After the futex times out (or spurious wake), check whether
             // central has signalled that it is shutting down.
             check_central_alive(header, micro.central_pid);
@@ -983,8 +1004,14 @@ pub(crate) unsafe fn notify_central(tls: *mut MicroTls, syscall_nr: u32, args: &
     header
         .sq_notify
         .fetch_add(1, core::sync::atomic::Ordering::Release);
-    // Wake central in case it fell through to futex_wait.
-    futex_wake(&header.sq_notify);
+    // Only issue FUTEX_WAKE if central has entered futex sleep.
+    if header
+        .sq_consumer_sleeping
+        .load(core::sync::atomic::Ordering::Acquire)
+        != 0
+    {
+        futex_wake(&header.sq_notify);
+    }
     // No CQ wait — fire and forget.
 }
 
