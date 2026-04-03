@@ -11,15 +11,15 @@ use litebox::{
     utils::{ReinterpretSignedExt, TruncateExt},
 };
 use litebox_common_linux::{
+    MapFlags,
     errno::Errno,
     loader::{ElfParsedFile, ReadAt as _},
-    MapFlags,
 };
 use thiserror::Error;
 
 use crate::{
-    loader::auxv::{AuxKey, AuxVec},
     MutPtr,
+    loader::auxv::{AuxKey, AuxVec},
 };
 
 use super::stack::UserStack;
