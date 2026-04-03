@@ -23,15 +23,11 @@ use crate::Task;
 /// Tracks base address and trampoline write cursor for each ELF file that
 /// has executable segments mapped via `do_mmap_file()`.
 pub(crate) struct ElfPatchState {
-    /// Base virtual address of the ELF (recorded from first mmap at offset 0).
-    pub _base_addr: usize,
     /// Whether this file is already pre-patched (trampoline magic found at file tail).
     pub pre_patched: bool,
     /// For pre-patched binaries: file offset and size of the trampoline data.
     pub trampoline_file_offset: u64,
     pub trampoline_file_size: usize,
-    /// For pre-patched binaries: virtual address offset of the trampoline in the ELF.
-    pub _trampoline_vaddr: usize,
     /// Start address of the trampoline region (runtime).
     pub trampoline_addr: usize,
     /// Current write position within the trampoline (byte offset from `trampoline_addr`).
@@ -43,9 +39,6 @@ pub(crate) struct ElfPatchState {
     /// Whether any runtime-generated stubs were successfully linked from code
     /// in this fd to the trampoline.
     pub runtime_patches_committed: bool,
-    /// File path of the ELF (from the fd path table, if available).
-    #[allow(dead_code)]
-    pub file_path: Option<alloc::string::String>,
 }
 
 /// Per-process collection of ELF patching state, keyed by fd number.
@@ -435,8 +428,9 @@ impl<FS: ShimFS> Task<FS> {
 
         // Read the ELF header (first 64 bytes covers both 32-bit and 64-bit).
         let mut ehdr_buf = [0u8; 64];
-        if self.sys_read(fd, &mut ehdr_buf, Some(0)).is_err() {
-            return; // Not readable, skip
+        match self.sys_read(fd, &mut ehdr_buf, Some(0)) {
+            Ok(n) if n == ehdr_buf.len() => {}
+            _ => return, // Not readable or short read, skip
         }
 
         // Verify ELF magic
@@ -456,8 +450,9 @@ impl<FS: ShimFS> Task<FS> {
             return; // Sanity check
         }
         let mut phdrs_buf = alloc::vec![0u8; phdrs_size];
-        if self.sys_read(fd, &mut phdrs_buf, Some(e_phoff)).is_err() {
-            return;
+        match self.sys_read(fd, &mut phdrs_buf, Some(e_phoff)) {
+            Ok(n) if n == phdrs_buf.len() => {}
+            _ => return,
         }
 
         // Find highest PT_LOAD end (p_vaddr + p_memsz)
@@ -509,17 +504,14 @@ impl<FS: ShimFS> Task<FS> {
         // Insert under lock (re-check for races).
         let mut cache = self.global.elf_patch_cache.lock();
         cache.entry(fd).or_insert(ElfPatchState {
-            _base_addr: base_addr,
             pre_patched,
             trampoline_file_offset: tramp_file_offset,
             trampoline_file_size: tramp_file_size as usize,
-            _trampoline_vaddr: tramp_vaddr as usize,
             trampoline_addr: trampoline_vaddr,
             trampoline_cursor: 0,
             trampoline_mapped: false,
             trampoline_mapped_len: 0,
             runtime_patches_committed: false,
-            file_path: None,
         });
     }
 
@@ -534,8 +526,9 @@ impl<FS: ShimFS> Task<FS> {
             return (false, 0, 0, 0);
         }
         let mut tail = [0u8; 32];
-        if self.sys_read(fd, &mut tail, Some(file_size - 32)).is_err() {
-            return (false, 0, 0, 0);
+        match self.sys_read(fd, &mut tail, Some(file_size - 32)) {
+            Ok(n) if n == tail.len() => {}
+            _ => return (false, 0, 0, 0),
         }
         if &tail[0..8] != litebox_syscall_rewriter::TRAMPOLINE_MAGIC {
             return (false, 0, 0, 0);
