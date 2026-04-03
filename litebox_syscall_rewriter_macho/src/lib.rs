@@ -5,11 +5,13 @@
 //!
 //! This crate supports AArch64 Mach-O executables (MH_EXECUTE).
 
-mod arm64;
+pub mod arm64;
 
-use object::Endianness;
+pub use arm64::patch_code_segment;
+
 use object::macho;
 use object::read::macho::{MachHeader, Segment};
+use object::Endianness;
 use thiserror::Error;
 
 #[derive(Error, Debug)]

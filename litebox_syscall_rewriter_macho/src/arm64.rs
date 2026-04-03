@@ -76,7 +76,7 @@ pub fn find_patch_sites(text_sections: &[TextSectionInfo], buf: &[u8]) -> Result
 /// The offset must be a multiple of 4 and within ±128MB (signed 26-bit instruction count).
 /// Encoding: `[31:26] = 0b000101`, `[25:0] = signed offset / 4`
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn encode_b(offset: i64) -> Option<u32> {
+pub fn encode_b(offset: i64) -> Option<u32> {
     if offset % 4 != 0 {
         return None;
     }
@@ -94,7 +94,7 @@ fn encode_b(offset: i64) -> Option<u32> {
 /// Range: ±4GB.
 /// The encoding splits the immediate: `immlo` in bits [30:29], `immhi` in bits [23:5].
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn encode_adrp(rd: u8, page_offset: i64) -> Option<u32> {
+pub fn encode_adrp(rd: u8, page_offset: i64) -> Option<u32> {
     if !(-(1 << 20)..(1 << 20)).contains(&page_offset) {
         return None;
     }
@@ -129,7 +129,7 @@ fn encode_br(rn: u8) -> u32 {
 ///
 /// Subtracts an unsigned 12-bit immediate from SP and writes back to SP.
 /// Encoding: sf=1, op=1 (SUB), S=0, shift=00, imm12, Rn=SP(31), Rd=SP(31)
-fn encode_sub_sp_imm(imm12: u16) -> Option<u32> {
+pub fn encode_sub_sp_imm(imm12: u16) -> Option<u32> {
     if imm12 >= (1 << 12) {
         return None;
     }
@@ -143,7 +143,7 @@ fn encode_sub_sp_imm(imm12: u16) -> Option<u32> {
 /// scaling (i.e., `imm_bytes` must be in `[0, 32760]` and divisible by 8).
 ///
 /// Encoding: size=11, V=0, opc=00 (STR), imm12=imm_bytes/8, Rn, Rt
-fn encode_str_imm_unsigned(rt: u8, rn: u8, imm_bytes: u16) -> Option<u32> {
+pub fn encode_str_imm_unsigned(rt: u8, rn: u8, imm_bytes: u16) -> Option<u32> {
     if !imm_bytes.is_multiple_of(8) {
         return None;
     }
@@ -176,7 +176,7 @@ fn encode_ldr_imm_unsigned(rt: u8, rn: u8, imm_bytes: u16) -> Option<u32> {
 ///
 /// Adds an unsigned 12-bit immediate to a 64-bit source register.
 /// Encoding: sf=1, op=0 (ADD), S=0, shift=00, imm12, Rn, Rd
-fn encode_add_imm(rd: u8, rn: u8, imm12: u16) -> Option<u32> {
+pub fn encode_add_imm(rd: u8, rn: u8, imm12: u16) -> Option<u32> {
     if imm12 >= (1 << 12) {
         return None;
     }
@@ -236,7 +236,7 @@ fn encode_brk(imm16: u16) -> u32 {
 /// Encode `STP Xt1, Xt2, [Xn, #imm]` (store pair, 64-bit, signed offset).
 ///
 /// The offset must be a multiple of 8 and within [-512, 504].
-fn encode_stp_offset(rt: u8, rt2: u8, rn: u8, imm_bytes: i16) -> Option<u32> {
+pub fn encode_stp_offset(rt: u8, rt2: u8, rn: u8, imm_bytes: i16) -> Option<u32> {
     if imm_bytes % 8 != 0 {
         return None;
     }
@@ -269,16 +269,16 @@ pub const HEADER_TLS_TABLE_OFFSET: usize = 8;
 const SHARED_SVC_HANDLER_INSN_COUNT: usize = 18;
 
 /// Size of the shared SVC handler in bytes.
-const SHARED_SVC_HANDLER_SIZE: usize = SHARED_SVC_HANDLER_INSN_COUNT * 4;
+pub const SHARED_SVC_HANDLER_SIZE: usize = SHARED_SVC_HANDLER_INSN_COUNT * 4;
 
 /// Offset where the shared SVC handler begins in the trampoline.
-const SHARED_SVC_HANDLER_OFFSET: usize = 16; // After 8-byte callback + 8-byte TLS ptr
+pub const SHARED_SVC_HANDLER_OFFSET: usize = 16; // After 8-byte callback + 8-byte TLS ptr
 
 /// Number of instructions in each SVC gate.
 const SVC_GATE_INSN_COUNT: usize = 7;
 
 /// Size of each SVC gate in bytes.
-const SVC_GATE_SIZE: usize = SVC_GATE_INSN_COUNT * 4;
+pub const SVC_GATE_SIZE: usize = SVC_GATE_INSN_COUNT * 4;
 
 // ============================================================
 // Trampoline emission
@@ -311,7 +311,7 @@ const SVC_GATE_SIZE: usize = SVC_GATE_INSN_COUNT * 4;
 /// [17] .Ltrap: BRK #1             ; unreachable
 /// ```
 #[allow(clippy::cast_possible_wrap)]
-fn emit_shared_svc_handler_macos(
+pub fn emit_shared_svc_handler_macos(
     trampoline_data: &mut Vec<u8>,
     handler_offset: usize,
     trampoline_base_addr: u64,
@@ -487,7 +487,7 @@ fn emit_shared_svc_handler_macos(
 /// [6] B    <shared_svc_handler>   ; branch to shared handler
 /// ```
 #[allow(clippy::cast_possible_wrap)]
-fn emit_svc_gate_macos(
+pub fn emit_svc_gate_macos(
     trampoline_data: &mut Vec<u8>,
     gate_offset: usize,
     trampoline_base_addr: u64,
@@ -629,4 +629,167 @@ pub fn hook_syscalls_aarch64(
     }
 
     Ok(trampoline_data)
+}
+
+/// Patch SVC #0x80 sites in a code buffer, emitting stubs into a trampoline slice.
+///
+/// This is used by the mmap-hook at runtime to patch dylib code segments as
+/// they are mapped by dyld. Unlike `hook_syscalls_aarch64` which works on a
+/// complete Mach-O file, this works on raw code bytes at a known VA.
+///
+/// # Arguments
+/// - `code`: Mutable code segment bytes. SVC instructions are replaced in-place.
+/// - `code_vaddr`: Virtual address where this code segment is mapped.
+/// - `trampoline`: Mutable pre-allocated buffer for trampoline stubs.
+/// - `trampoline_vaddr`: Virtual address of the trampoline buffer.
+/// - `cursor`: Current write offset in the trampoline buffer.
+/// - `syscall_entry`: Address of the shim's syscall entry point.
+///
+/// # Returns
+/// The new trampoline cursor (byte offset past last written data).
+///
+/// # Invariant
+/// `cursor == 0` signals that the trampoline header and shared SVC handler
+/// have not been emitted yet. Callers must pass the cursor returned from the
+/// previous call (or 0 for the first call) and must not reset it to 0.
+#[allow(clippy::cast_possible_wrap)]
+pub fn patch_code_segment(
+    code: &mut [u8],
+    code_vaddr: u64,
+    trampoline: &mut [u8],
+    trampoline_vaddr: u64,
+    mut cursor: usize,
+    syscall_entry: u64,
+) -> crate::Result<usize> {
+    // Scan for SVC #0x80
+    let mut sites = Vec::new();
+    {
+        let mut off = 0usize;
+        while off + 4 <= code.len() {
+            let insn = u32::from_le_bytes(code[off..off + 4].try_into().unwrap());
+            if insn == SVC_0X80 {
+                sites.push(PatchSite {
+                    file_offset: off,
+                    vaddr: code_vaddr + off as u64,
+                    kind: PatchKind::Svc,
+                });
+            }
+            off += 4;
+        }
+    }
+
+    if sites.is_empty() {
+        return Ok(cursor);
+    }
+
+    // If header not yet written (cursor == 0), write header + shared handler.
+    if cursor == 0 {
+        if trampoline.len() < SHARED_SVC_HANDLER_OFFSET + SHARED_SVC_HANDLER_SIZE {
+            return Err(crate::Error::ParseError(
+                "trampoline too small for header + shared handler".into(),
+            ));
+        }
+        // Write syscall entry callback address at offset 0
+        trampoline[0..8].copy_from_slice(&syscall_entry.to_le_bytes());
+        // TLS table ptr at offset 8 — left as zero, caller fills it in.
+
+        // Emit shared handler into a temp vec, then copy.
+        // The handler emitter uses handler_offset to compute PC-relative
+        // addresses, and also uses trampoline_base_addr for the header
+        // data pointers (callback + TLS table). We pass the real
+        // trampoline_vaddr as base and SHARED_SVC_HANDLER_OFFSET as the
+        // handler_offset, but we must pre-pad handler_vec so that the
+        // debug_assert (len - handler_offset == SHARED_SVC_HANDLER_SIZE)
+        // holds.
+        let mut handler_vec = vec![0u8; SHARED_SVC_HANDLER_OFFSET];
+        emit_shared_svc_handler_macos(
+            &mut handler_vec,
+            SHARED_SVC_HANDLER_OFFSET,
+            trampoline_vaddr,
+        )?;
+        // Copy only the handler portion (skip the padding)
+        trampoline[SHARED_SVC_HANDLER_OFFSET..SHARED_SVC_HANDLER_OFFSET + SHARED_SVC_HANDLER_SIZE]
+            .copy_from_slice(&handler_vec[SHARED_SVC_HANDLER_OFFSET..]);
+        cursor = SHARED_SVC_HANDLER_OFFSET + SHARED_SVC_HANDLER_SIZE;
+    }
+
+    // Emit per-site SVC gates
+    for site in &sites {
+        let gate_vaddr = trampoline_vaddr + cursor as u64;
+        let return_addr = site.vaddr + 4;
+
+        // Build the 7-instruction gate directly into a fixed buffer
+        let mut gate = [0u8; SVC_GATE_SIZE];
+
+        // [0] SUB SP, SP, #48
+        gate[0..4].copy_from_slice(&encode_sub_sp_imm(48).expect("imm12=48 fits").to_le_bytes());
+        // [1] STP X16, X17, [SP]
+        gate[4..8].copy_from_slice(
+            &encode_stp_offset(16, 17, 31, 0)
+                .expect("offset 0 valid")
+                .to_le_bytes(),
+        );
+        // [2] STR X30, [SP, #16]
+        gate[8..12].copy_from_slice(
+            &encode_str_imm_unsigned(30, 31, 16)
+                .expect("offset 16 valid")
+                .to_le_bytes(),
+        );
+        // [3] STR X18, [SP, #32]
+        gate[12..16].copy_from_slice(
+            &encode_str_imm_unsigned(18, 31, 32)
+                .expect("offset 32 valid")
+                .to_le_bytes(),
+        );
+        // [4] ADRP X30, <return_page>
+        let adrp_vaddr_val = gate_vaddr + 4 * 4;
+        let adrp_base = adrp_vaddr_val & !0xFFF;
+        let return_page = return_addr & !0xFFF;
+        let page_offset = (return_page as i64 - adrp_base as i64) >> 12;
+        let adrp_insn = encode_adrp(30, page_offset).ok_or_else(|| {
+            crate::Error::DisassemblyFailure(format!(
+                "ADRP out of range for SVC at {:#x}",
+                site.vaddr
+            ))
+        })?;
+        gate[16..20].copy_from_slice(&adrp_insn.to_le_bytes());
+        // [5] ADD X30, X30, #pageoff
+        let pageoff = (return_addr & 0xFFF) as u16;
+        gate[20..24].copy_from_slice(
+            &encode_add_imm(30, 30, pageoff)
+                .expect("page offset fits imm12")
+                .to_le_bytes(),
+        );
+        // [6] B <shared_svc_handler>
+        let handler_vaddr = trampoline_vaddr + SHARED_SVC_HANDLER_OFFSET as u64;
+        let b_to_handler = handler_vaddr as i64 - (gate_vaddr + 6 * 4) as i64;
+        let b_insn = encode_b(b_to_handler).ok_or_else(|| {
+            crate::Error::DisassemblyFailure(format!(
+                "B to handler out of range for gate at {gate_vaddr:#x}"
+            ))
+        })?;
+        gate[24..28].copy_from_slice(&b_insn.to_le_bytes());
+
+        // Copy gate into trampoline
+        if cursor + SVC_GATE_SIZE > trampoline.len() {
+            return Err(crate::Error::ParseError(
+                "trampoline buffer too small for gate".into(),
+            ));
+        }
+        trampoline[cursor..cursor + SVC_GATE_SIZE].copy_from_slice(&gate);
+
+        // Patch original SVC → B <gate>
+        let b_offset = gate_vaddr as i64 - site.vaddr as i64;
+        let b_to_gate = encode_b(b_offset).ok_or_else(|| {
+            crate::Error::DisassemblyFailure(format!(
+                "B offset {b_offset:#x} out of ±128MB for SVC at {:#x}",
+                site.vaddr
+            ))
+        })?;
+        code[site.file_offset..site.file_offset + 4].copy_from_slice(&b_to_gate.to_le_bytes());
+
+        cursor += SVC_GATE_SIZE;
+    }
+
+    Ok(cursor)
 }
