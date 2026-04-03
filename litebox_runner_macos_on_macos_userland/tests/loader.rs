@@ -37,3 +37,69 @@ fn test_hello_nolibc_asm() {
     let (exit_code, _stdout) = common::run_macho_binary(&rewritten, &["hello_nolibc_asm"]);
     assert_eq!(exit_code, 0, "process exited with non-zero code");
 }
+
+/// Nolibc C program with raw BSD syscall wrappers.
+const HELLO_NOLIBC_C: &str = r#"
+// Compile: clang -arch arm64 -static -nostdlib -e __start -o hello hello.c
+
+static int bsd_write(int fd, const void *buf, unsigned long count)
+{
+    register long x0 __asm__("x0") = fd;
+    register const void *x1 __asm__("x1") = buf;
+    register unsigned long x2 __asm__("x2") = count;
+    register long x16 __asm__("x16") = 4; // SYS_write
+
+    __asm__ volatile("svc #0x80"
+        : "+r"(x0)
+        : "r"(x1), "r"(x2), "r"(x16)
+        : "memory", "cc");
+
+    return (int)x0;
+}
+
+_Noreturn static void bsd_exit(int status)
+{
+    register long x0 __asm__("x0") = status;
+    register long x16 __asm__("x16") = 1; // SYS_exit
+
+    for (;;) {
+        __asm__ volatile("svc #0x80"
+            :
+            : "r"(x0), "r"(x16)
+            : "memory", "cc");
+    }
+}
+
+void _start(void)
+{
+    bsd_write(1, "Hello from C!\n", 14);
+    bsd_exit(0);
+}
+"#;
+
+#[test]
+fn test_hello_nolibc_c() {
+    let bin_path = common::compile_macho_nolibc(HELLO_NOLIBC_C, "hello_nolibc_c");
+    let rewritten = common::rewrite_macho(&bin_path);
+    let (exit_code, _stdout) = common::run_macho_binary(&rewritten, &["hello_nolibc_c"]);
+    assert_eq!(exit_code, 0, "process exited with non-zero code");
+}
+
+/// Assembly that exits with code 42.
+const EXIT_42_ASM: &str = r"
+.global _start
+.align 4
+
+_start:
+    mov x0, #42         // status = 42
+    mov x16, #1         // SYS_exit = 1
+    svc #0x80
+";
+
+#[test]
+fn test_exit_code_42() {
+    let bin_path = common::assemble_macho(EXIT_42_ASM, "exit_42_asm");
+    let rewritten = common::rewrite_macho(&bin_path);
+    let (exit_code, _) = common::run_macho_binary(&rewritten, &["exit_42"]);
+    assert_eq!(exit_code, 42, "expected exit code 42, got {exit_code}");
+}

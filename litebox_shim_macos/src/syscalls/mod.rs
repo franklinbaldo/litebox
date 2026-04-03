@@ -7,7 +7,7 @@ pub(crate) mod file;
 pub(crate) mod mm;
 pub(crate) mod process;
 
-use litebox_common_macos::{errno::Errno, syscall::MacosSyscallRequest, PtRegs};
+use litebox_common_macos::{PtRegs, errno::Errno, syscall::MacosSyscallRequest};
 
 use crate::{ShimFS, Task};
 

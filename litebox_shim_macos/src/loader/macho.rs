@@ -13,13 +13,13 @@
 use alloc::ffi::CString;
 use alloc::vec::Vec;
 use litebox::mm::linux::{CreatePagesFlags, PAGE_SIZE};
-use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+use litebox::platform::{RawConstPointer as _, RawMutPointer as _, SystemInfoProvider as _};
+use object::Endianness;
 use object::macho;
 use object::read::macho::MachHeader;
-use object::Endianness;
 
 use super::stack::UserStack;
-use super::{MachoLoadInfo, MachoLoaderError, DEFAULT_LOW_ADDR, DEFAULT_STACK_SIZE};
+use super::{DEFAULT_LOW_ADDR, DEFAULT_STACK_SIZE, MachoLoadInfo, MachoLoaderError};
 use crate::{MutPtr, ShimFS, Task};
 
 struct SegmentInfo {
@@ -119,14 +119,74 @@ pub(crate) fn load<FS: ShimFS>(
         return Err(MachoLoaderError::NoTextSegment);
     }
 
-    // Map segments using do_mmap (same as sys_mmap uses internally).
+    // --- Reserve-then-map strategy ---
+    //
+    // Static Mach-O binaries have absolute load addresses (typically __TEXT at
+    // 0x100000000). We cannot use MAP_FIXED at these addresses because the
+    // host process itself may occupy that region (e.g., the cargo test runner
+    // on macOS is also loaded at 0x100000000).
+    //
+    // Instead, we follow the same approach as the ELF loader for PIE binaries:
+    // 1. Compute the total VA span of all loadable segments.
+    // 2. Reserve that span with a hint-based mmap (no MAP_FIXED) — let the
+    //    kernel pick a free region.
+    // 3. Compute a "slide" (relocation offset) = reserved_base - min_vmaddr.
+    // 4. Map individual segments with MAP_FIXED *within* the reserved region.
+    //
+    // Since we only support static binaries without relocations, the guest code
+    // uses absolute addresses. The syscall rewriter's trampoline uses
+    // PC-relative addressing (ADRP+ADD), so it works at any address. The guest
+    // assembly itself must also use PC-relative addressing for this to work.
+    // Our test binaries are written with this constraint in mind.
+
+    // Step 1: Compute the VA span of all loadable segments.
+    let min_vmaddr = segments
+        .iter()
+        .filter(|s| s.vmsize > 0)
+        .map(|s| s.vmaddr as usize)
+        .min()
+        .unwrap_or(DEFAULT_LOW_ADDR);
+    let max_vmend = segments
+        .iter()
+        .filter(|s| s.vmsize > 0)
+        .map(|s| (s.vmaddr + s.vmsize) as usize)
+        .max()
+        .unwrap_or(DEFAULT_LOW_ADDR);
+
+    let page_aligned_min = min_vmaddr & !(PAGE_SIZE - 1);
+    let page_aligned_max = max_vmend.next_multiple_of(PAGE_SIZE);
+    let total_span = page_aligned_max - page_aligned_min;
+
+    // Step 2: Reserve the full span with a hint (no MAP_FIXED).
+    let reserve_flags =
+        litebox_common_linux::MapFlags::MAP_ANONYMOUS | litebox_common_linux::MapFlags::MAP_PRIVATE;
+    let reserved_base = litebox_common_linux::mm::do_mmap(
+        &task.global.pm,
+        Some(DEFAULT_LOW_ADDR),
+        total_span,
+        litebox_common_linux::ProtFlags::PROT_NONE,
+        reserve_flags,
+        false,
+        |_| Ok(0),
+    )
+    .map_err(|e| {
+        MachoLoaderError::MappingError(alloc::format!(
+            "reserve {total_span:#x} bytes for segments: {e:?}"
+        ))
+    })?
+    .as_usize();
+
+    // Step 3: Compute the slide (relocation offset).
+    let slide = reserved_base.wrapping_sub(page_aligned_min);
+
+    // Step 4: Map each segment with MAP_FIXED within the reserved region.
     // Map as RW first to copy data, then mprotect to final permissions.
     for seg in &segments {
         if seg.vmsize == 0 {
             continue;
         }
 
-        let vm_addr = seg.vmaddr as usize;
+        let vm_addr = (seg.vmaddr as usize).wrapping_add(slide);
         let vm_size = (seg.vmsize as usize).next_multiple_of(PAGE_SIZE);
 
         // Determine the final protection from the Mach-O initprot
@@ -186,22 +246,141 @@ pub(crate) fn load<FS: ShimFS>(
         }
     }
 
-    // Compute entry point
+    // Compute entry point (apply slide)
     let entry_point = if is_lc_main {
         let text_base = text_vmaddr.ok_or(MachoLoaderError::NoTextSegment)?;
         let offset = entry_offset.ok_or(MachoLoaderError::NoEntryPoint)?;
-        (text_base + offset) as usize
+        ((text_base + offset) as usize).wrapping_add(slide)
     } else {
-        entry_offset.ok_or(MachoLoaderError::NoEntryPoint)? as usize
+        (entry_offset.ok_or(MachoLoaderError::NoEntryPoint)? as usize).wrapping_add(slide)
     };
 
-    // Set brk after highest mapped segment
+    // Set brk after highest mapped segment (with slide applied).
+    // NOTE: Do NOT call set_initial_brk yet — the trampoline initialization
+    // below may extend brk past the TLS table.
     let max_end = segments
         .iter()
-        .map(|s| (s.vmaddr + s.vmsize) as usize)
+        .map(|s| ((s.vmaddr + s.vmsize) as usize).wrapping_add(slide))
         .max()
         .unwrap_or(DEFAULT_LOW_ADDR);
-    let brk = max_end.next_multiple_of(PAGE_SIZE);
+    let mut brk = max_end.next_multiple_of(PAGE_SIZE);
+
+    // --- Initialize trampoline callback address and TLS table ---
+    //
+    // The __LITEBOX segment contains the trampoline code emitted by the
+    // Mach-O syscall rewriter. The first 8 bytes are reserved for the
+    // platform's syscall callback address, and bytes 8..16 are reserved
+    // for the TLS lookup table pointer. The rewriter initializes both to
+    // zero; we must fill them in now that the segment is mapped.
+    //
+    // This mirrors what the ELF loader does in load_trampoline().
+    #[allow(clippy::items_after_statements)]
+    if let Some(litebox_seg) = segments
+        .iter()
+        .find(|s| s.segname.starts_with(b"__LITEBOX"))
+    {
+        let trampoline_start = (litebox_seg.vmaddr as usize).wrapping_add(slide);
+        let trampoline_size = (litebox_seg.vmsize as usize).next_multiple_of(PAGE_SIZE);
+
+        // Make the trampoline writable so we can fill in the callback and TLS
+        // table pointer. It was already mprotected to R-X during segment mapping.
+        litebox_common_linux::mm::sys_mprotect(
+            &task.global.pm,
+            MutPtr::from_usize(trampoline_start),
+            trampoline_size,
+            litebox_common_linux::ProtFlags::PROT_READ_WRITE,
+        )
+        .map_err(|e| {
+            MachoLoaderError::MappingError(alloc::format!("mprotect __LITEBOX RW for init: {e:?}"))
+        })?;
+
+        // Write the syscall callback address at offset 0.
+        let callback_addr = litebox_platform_multiplex::platform().get_syscall_entry_point();
+        let dest: MutPtr<u8> = MutPtr::from_usize(trampoline_start);
+        dest.copy_from_slice(0, &callback_addr.to_ne_bytes())
+            .ok_or(MachoLoaderError::MemoryError(
+                "failed to write trampoline callback address".into(),
+            ))?;
+
+        // Allocate TLS lookup table.
+        //
+        // Layout: array of [guest_tpidr: u64, host_tls: u64] entries.
+        // 256 usable entries + 8 overflow sentinel entries for hash probe.
+        const TLS_ENTRY_SIZE: usize = 16;
+        const TLS_TABLE_USABLE_ENTRIES: usize = 256;
+        const TLS_TABLE_OVERFLOW_ENTRIES: usize = 8;
+        const TLS_TABLE_TOTAL_ENTRIES: usize =
+            TLS_TABLE_USABLE_ENTRIES + TLS_TABLE_OVERFLOW_ENTRIES;
+        const TLS_TABLE_SIZE: usize = TLS_TABLE_TOTAL_ENTRIES * TLS_ENTRY_SIZE; // 4224 bytes
+
+        // On macOS aarch64, the host page size is 16KB. Align the TLS table
+        // to 16KB to ensure it gets its own host page and doesn't share a
+        // page with the trampoline (which will be mprotected to R-X).
+        const HOST_PAGE_SIZE: usize = 16384;
+        let tls_table_addr = brk
+            .max(trampoline_start + trampoline_size)
+            .next_multiple_of(HOST_PAGE_SIZE);
+        let tls_table_end = (tls_table_addr + TLS_TABLE_SIZE).next_multiple_of(PAGE_SIZE);
+
+        let tls_flags = litebox_common_linux::MapFlags::MAP_ANONYMOUS
+            | litebox_common_linux::MapFlags::MAP_PRIVATE
+            | litebox_common_linux::MapFlags::MAP_FIXED;
+        litebox_common_linux::mm::do_mmap(
+            &task.global.pm,
+            Some(tls_table_addr),
+            tls_table_end - tls_table_addr,
+            litebox_common_linux::ProtFlags::PROT_READ_WRITE,
+            tls_flags,
+            false,
+            |_| Ok(0),
+        )
+        .map_err(|e| {
+            MachoLoaderError::MappingError(alloc::format!(
+                "mmap TLS table at {tls_table_addr:#x}: {e:?}"
+            ))
+        })?;
+
+        // Initialize all guest_tpidr fields with sentinel 0xFFFFFFFFFFFFFFFF.
+        let sentinel: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+        let tls_dest: MutPtr<u8> = MutPtr::from_usize(tls_table_addr);
+        for i in 0..TLS_TABLE_TOTAL_ENTRIES {
+            let entry_offset = i * TLS_ENTRY_SIZE;
+            tls_dest
+                .copy_from_slice(entry_offset, &sentinel.to_ne_bytes())
+                .ok_or(MachoLoaderError::MemoryError(
+                    "failed to initialize TLS table entry".into(),
+                ))?;
+        }
+
+        // Write the TLS table address at trampoline offset 8.
+        dest.copy_from_slice(8, &tls_table_addr.to_ne_bytes())
+            .ok_or(MachoLoaderError::MemoryError(
+                "failed to write TLS table address in trampoline".into(),
+            ))?;
+
+        // Store TLS table address in the global atomic so the platform's
+        // update_host_tls_entry() can find and write to it.
+        litebox_common_linux::HOST_TLS_TABLE_ADDR
+            .store(tls_table_addr, core::sync::atomic::Ordering::Release);
+
+        // Re-protect the trampoline as R-X (executable code).
+        litebox_common_linux::mm::sys_mprotect(
+            &task.global.pm,
+            MutPtr::from_usize(trampoline_start),
+            trampoline_size,
+            litebox_common_linux::ProtFlags::PROT_READ_EXEC,
+        )
+        .map_err(|e| {
+            MachoLoaderError::MappingError(alloc::format!(
+                "mprotect __LITEBOX R-X after init: {e:?}"
+            ))
+        })?;
+
+        // Update brk past the TLS table.
+        brk = brk.max(tls_table_end);
+    }
+
+    // Set the initial brk now that all segments and TLS table are mapped.
     task.global.pm.set_initial_brk(brk);
 
     // Allocate stack

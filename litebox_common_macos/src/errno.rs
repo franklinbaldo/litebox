@@ -48,6 +48,7 @@ pub enum Errno {
 
 impl Errno {
     /// Return the raw errno value as a positive integer (for the macOS ABI).
+    #[allow(clippy::cast_sign_loss)] // All errno variants are small positive values.
     pub const fn raw(self) -> usize {
         self as i32 as usize
     }

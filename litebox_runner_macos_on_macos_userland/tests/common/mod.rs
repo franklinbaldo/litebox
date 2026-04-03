@@ -2,6 +2,23 @@
 // Licensed under the MIT license.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, Once};
+
+/// Serialize test execution. Each test creates its own `MacosShimBuilder`
+/// and `PageManager`, but the platform and global `HOST_TLS_TABLE_ADDR`
+/// are process-wide singletons. Running tests concurrently causes the
+/// second test's `update_host_tls_entry()` to access stale TLS table
+/// memory from the first test's (now-dropped) `PageManager`.
+static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Ensure the litebox platform is initialized exactly once per test binary.
+fn ensure_platform() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let platform = litebox_platform_macos_userland::MacosUserland::new(None);
+        litebox_platform_multiplex::set_platform(platform);
+    });
+}
 
 /// Assemble and link an aarch64 Mach-O binary from assembly source.
 ///
@@ -79,6 +96,7 @@ pub fn compile_macho_nolibc(c_source: &str, name: &str) -> PathBuf {
             "arm64",
             "-static",
             "-nostdlib",
+            "-Wl,-headerpad,0x1000",
             "-e",
             "__start",
             "-o",
@@ -106,8 +124,15 @@ pub fn rewrite_macho(input: &Path) -> Vec<u8> {
 pub fn run_macho_binary(binary_data: &[u8], argv: &[&str]) -> (i32, Vec<u8>) {
     use litebox::fs::{FileSystem as _, Mode};
 
-    let platform = litebox_platform_macos_userland::MacosUserland::new(None);
-    litebox_platform_multiplex::set_platform(platform);
+    // Serialize: only one test can use the platform + TLS table at a time.
+    let _guard = TEST_LOCK.lock().unwrap();
+
+    ensure_platform();
+
+    // Reset the global TLS table address so the new shim's loader can
+    // allocate a fresh one. The old table (if any) belonged to a previous
+    // test's PageManager which has since been dropped.
+    litebox_common_linux::HOST_TLS_TABLE_ADDR.store(0, std::sync::atomic::Ordering::Release);
 
     let mut shim_builder =
         litebox_shim_macos::MacosShimBuilder::<litebox_shim_macos::DefaultFS>::new();

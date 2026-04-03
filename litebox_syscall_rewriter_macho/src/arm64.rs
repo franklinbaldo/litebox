@@ -26,7 +26,8 @@ pub struct PatchSite {
     pub file_offset: usize,
     /// Virtual address of the instruction.
     pub vaddr: u64,
-    /// Kind of patch.
+    /// Kind of patch (used for diagnostics / future expansion).
+    #[allow(dead_code)]
     pub kind: PatchKind,
 }
 

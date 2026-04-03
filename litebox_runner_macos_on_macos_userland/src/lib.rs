@@ -3,7 +3,7 @@
 
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use clap::Parser;
 use litebox::fs::{FileSystem as _, Mode};
 use litebox_platform_multiplex::Platform;
@@ -25,6 +25,10 @@ pub struct CliArgs {
 }
 
 /// Run macOS Mach-O programs with LiteBox on Apple Silicon.
+///
+/// # Panics
+///
+/// Panics if any program argument or environment variable contains a null byte.
 pub fn run(cli_args: CliArgs) -> Result<()> {
     let prog_path = Path::new(&cli_args.program_and_arguments[0]);
     let file = std::fs::File::open(prog_path)?;

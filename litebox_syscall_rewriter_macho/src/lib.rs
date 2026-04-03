@@ -7,9 +7,9 @@
 
 mod arm64;
 
+use object::Endianness;
 use object::macho;
 use object::read::macho::{MachHeader, Segment};
-use object::Endianness;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -79,6 +79,7 @@ fn parse_text_sections(data: &[u8]) -> Result<Vec<arm64::TextSectionInfo>> {
                     if attrs & macho::S_ATTR_SOME_INSTRUCTIONS != 0
                         || attrs & macho::S_ATTR_PURE_INSTRUCTIONS != 0
                     {
+                        #[allow(clippy::cast_possible_truncation)] // aarch64-only: u64 fits usize.
                         sections.push(arm64::TextSectionInfo {
                             vaddr: section.addr.get(endian),
                             file_offset: section.offset.get(endian) as usize,
@@ -143,7 +144,12 @@ fn insert_load_command_and_trampoline(
     let existing_cmds_size = header.sizeofcmds(endian) as usize;
     let cmds_end = header_size + existing_cmds_size;
 
-    // Find earliest section/segment file offset to know how much header space is free
+    // Find earliest section/segment data offset to know how much header space is free.
+    //
+    // The __TEXT segment typically starts at fileoff=0, which includes the Mach-O header
+    // and load commands. We need to find the first *section* offset within such segments,
+    // or the fileoff of non-zero-offset segments, to determine where actual content begins
+    // after the header area.
     let mut earliest_data_offset = buf.len();
     let mut commands = header
         .load_commands(endian, buf.as_slice(), 0)
@@ -152,13 +158,28 @@ fn insert_load_command_and_trampoline(
         .next()
         .map_err(|e| Error::ParseError(format!("{e}")))?
     {
-        if let Some((seg, _)) = cmd
+        if let Some((seg, section_data)) = cmd
             .segment_64()
             .map_err(|e| Error::ParseError(format!("{e}")))?
         {
             let off = seg.fileoff(endian) as usize;
             let sz = seg.filesize(endian) as usize;
-            if sz > 0 && off < earliest_data_offset {
+            if sz == 0 {
+                continue;
+            }
+            if off == 0 {
+                // Segment at fileoff 0 contains the header. Look at individual
+                // section offsets to find where actual content starts.
+                let sections: &[macho::Section64<Endianness>] = seg
+                    .sections(endian, section_data)
+                    .map_err(|e| Error::ParseError(format!("{e}")))?;
+                for section in sections {
+                    let sec_off = section.offset.get(endian) as usize;
+                    if sec_off > 0 && sec_off < earliest_data_offset {
+                        earliest_data_offset = sec_off;
+                    }
+                }
+            } else if off < earliest_data_offset {
                 earliest_data_offset = off;
             }
         }

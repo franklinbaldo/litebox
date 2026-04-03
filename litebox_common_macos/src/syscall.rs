@@ -84,6 +84,7 @@ impl MacosSyscallRequest {
     /// Decode a syscall request from the register state.
     ///
     /// macOS aarch64: syscall number in x16, args in x0-x5.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)] // Intentional: register values (usize/u64) → syscall arg types (i32, i64).
     pub fn try_from_raw(ctx: &PtRegs) -> Self {
         let nr = ctx.regs[16];
         let a0 = ctx.regs[0];

@@ -17,14 +17,14 @@ use alloc::vec::Vec;
 use core::cell::Cell;
 use core::sync::atomic::{AtomicI32, Ordering};
 use litebox::{
+    LiteBox,
     fd::RawDescriptorStorage,
-    mm::{linux::PAGE_SIZE, PageManager},
+    mm::{PageManager, linux::PAGE_SIZE},
     net::Network,
     pipes::Pipes,
     platform::TimeProvider,
     shim::ContinueOperation,
     sync::futex::FutexManager,
-    LiteBox,
 };
 use litebox_common_macos::PtRegs;
 use litebox_platform_multiplex::Platform;
@@ -196,10 +196,10 @@ impl<FS: ShimFS> MacosShim<FS> {
             let sp = load_info.user_stack_top;
             initial_ctx.regs[0] = arg_count; // x0 = argc
             initial_ctx.regs[1] = sp + size_of::<usize>(); // x1 = &argv[0]
-                                                           // x2 = envp: skip past argc + argv pointers + NULL terminator
+            // x2 = envp: skip past argc + argv pointers + NULL terminator
             let envp_offset = size_of::<usize>() + (arg_count + 1) * size_of::<usize>();
             initial_ctx.regs[2] = sp + envp_offset; // x2 = &envp[0]
-                                                    // x3 = apple: skip past envp pointers + NULL terminator
+            // x3 = apple: skip past envp pointers + NULL terminator
             let apple_offset = envp_offset + (env_count + 1) * size_of::<usize>();
             initial_ctx.regs[3] = sp + apple_offset; // x3 = &apple[0]
         }
