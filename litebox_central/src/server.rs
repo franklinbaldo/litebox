@@ -1351,8 +1351,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
     /// Handle a data-consuming I/O syscall (write family).
     ///
     /// Micro has already copied the write buffer into the shmem data region.
-    /// Central reads it from there, rewrites the buffer pointer in `PtRegs`
-    /// to point to the local copy, and dispatches through the shim.
+    /// Central rewrites the buffer pointer in `PtRegs` to point directly
+    /// into the shmem data region, and dispatches through the shim.
     ///
     /// - If the fd is a standard I/O fd (0, 1, 2): skip shim dispatch and
     ///   go directly to `EXEC_LOCAL` — the shim maps these to virtual
@@ -1390,21 +1390,20 @@ impl<FS: ShimFS> ProcessServer<FS> {
             return cq;
         }
 
-        // Make a local copy of the write data so we have a stable pointer
-        // for the shim dispatch (the data region is shared memory).
-        let write_buf: Vec<u8> = data[offset..offset + len].to_vec();
-        let buf_ptr = write_buf.as_ptr() as usize;
+        // The data is stable: micro is blocked in submit_and_wait, and each
+        // thread writes to its own slot in the data region. No copy needed.
+        let buf_ptr = data[offset..].as_ptr() as usize;
 
         let mut regs = crate::dispatch::sq_entry_to_ptregs(entry);
 
         match i64::from(nr) {
             libc::SYS_write => {
-                // write(fd, buf, count) — rewrite buf (rsi) to local copy.
+                // write(fd, buf, count) — rewrite buf (rsi) to shmem pointer.
                 regs.rsi = buf_ptr;
                 regs.rdx = len;
             }
             libc::SYS_pwrite64 => {
-                // pwrite64(fd, buf, count, offset) — rewrite buf (rsi) to local copy.
+                // pwrite64(fd, buf, count, offset) — rewrite buf (rsi) to shmem pointer.
                 regs.rsi = buf_ptr;
                 regs.rdx = len;
             }
@@ -1450,7 +1449,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 regs.rdx = actual_send_len;
 
                 if entry.args[4] != 0 && addrlen > 0 && actual_send_len + addrlen <= len {
-                    // Rewrite dest_addr to point at sockaddr in local copy.
+                    // Rewrite dest_addr to point at sockaddr in shmem buffer.
                     regs.r8 = buf_ptr + actual_send_len;
                     // r9 (addrlen) is a value, not a pointer — already correct.
                 }
