@@ -35,6 +35,240 @@ fn futex_wait(addr: &core::sync::atomic::AtomicU32, expected: u32) {
     }
 }
 
+/// Handle `sendmsg(fd, msg, flags)` by gathering the iovec data from the
+/// guest's `msghdr` and sending it as a regular `SYS_write` to central.
+///
+/// This allows socketpair fds (virtual, managed by central's shim) to work
+/// without full msghdr marshaling. Ancillary data (e.g. `SCM_RIGHTS`) is
+/// silently dropped — nginx's basic master→worker channel commands work
+/// without it.
+///
+/// # Safety
+///
+/// - `tls` must point to a valid, initialized `MicroTls`.
+/// - `args` must point to a valid `SyscallArgs` with `sendmsg` arguments.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+unsafe fn handle_sendmsg_as_write(tls: *mut MicroTls, args: &SyscallArgs) -> i64 {
+    let fd = args.args[0];
+    let msg_ptr = args.args[1] as *const u8;
+    // flags = args.args[2]; // ignored for the write conversion
+
+    if msg_ptr.is_null() {
+        return -i64::from(libc::EFAULT);
+    }
+
+    // Read msghdr fields from guest memory.
+    // struct msghdr layout on x86-64:
+    //   msg_name:       *mut void    (8 bytes, offset 0)
+    //   msg_namelen:    socklen_t    (4 bytes, offset 8)
+    //   _pad:           4 bytes      (offset 12, for alignment)
+    //   msg_iov:        *mut iovec   (8 bytes, offset 16)
+    //   msg_iovlen:     size_t       (8 bytes, offset 24)
+    //   msg_control:    *mut void    (8 bytes, offset 32)
+    //   msg_controllen: size_t       (8 bytes, offset 40)
+    //   msg_flags:      int          (4 bytes, offset 48)
+    let iov_ptr =
+        unsafe { core::ptr::read_unaligned(msg_ptr.add(16).cast::<usize>()) } as *const u8;
+    let iov_len = unsafe { core::ptr::read_unaligned(msg_ptr.add(24).cast::<usize>()) };
+
+    if iov_ptr.is_null() || iov_len == 0 {
+        return 0; // nothing to send
+    }
+
+    // Gather iovec data into a stack buffer.
+    // nginx channel messages are small (≤32 bytes), so 4096 is plenty.
+    let mut buf = core::mem::MaybeUninit::<[u8; 4096]>::uninit();
+    let buf_ptr = buf.as_mut_ptr().cast::<u8>();
+    let mut total = 0usize;
+
+    for i in 0..iov_len {
+        let iov_entry = unsafe { iov_ptr.add(i * IOVEC_SIZE) };
+        let base = unsafe { core::ptr::read_unaligned(iov_entry.cast::<usize>()) } as *const u8;
+        let len = unsafe { core::ptr::read_unaligned(iov_entry.add(8).cast::<usize>()) };
+
+        if base.is_null() || len == 0 {
+            continue;
+        }
+
+        let remaining = 4096 - total;
+        let copy_len = len.min(remaining);
+        if copy_len == 0 {
+            break;
+        }
+
+        unsafe { core::ptr::copy_nonoverlapping(base, buf_ptr.add(total), copy_len) };
+        total += copy_len;
+    }
+
+    if total == 0 {
+        return 0;
+    }
+
+    // Rewrite as SYS_write(fd, buf, total).
+    let write_args = [fd, buf_ptr as u64, total as u64, 0, 0, 0];
+    let cq = unsafe {
+        submit_and_wait(
+            tls,
+            libc::SYS_write as u32,
+            &write_args,
+            litebox_ipc::ring::sq_flags::NEED_AUTH,
+        )
+    };
+
+    if cq.flags & cq_flags::EXEC_LOCAL != 0 {
+        // Central says exec locally — this shouldn't happen for write,
+        // but handle it gracefully.
+        return cq.result;
+    }
+
+    cq.result
+}
+
+/// Handle `recvmsg(fd, msg, flags)` by reading data from central via
+/// `SYS_read` and scattering it into the guest's iovec.
+///
+/// Ancillary data is not supported — `msg_controllen` is set to 0.
+///
+/// # Safety
+///
+/// - `tls` must point to a valid, initialized `MicroTls`.
+/// - `args` must point to a valid `SyscallArgs` with `recvmsg` arguments.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::ptr_cast_constness
+)]
+unsafe fn handle_recvmsg_as_read(tls: *mut MicroTls, args: &SyscallArgs) -> i64 {
+    let fd = args.args[0];
+    let msg_ptr = args.args[1] as *mut u8;
+    // flags = args.args[2]; // ignored for the read conversion
+
+    if msg_ptr.is_null() {
+        return -i64::from(libc::EFAULT);
+    }
+
+    // Read msg_control and msg_controllen BEFORE processing, so we can zero
+    // the control buffer after the read to prevent the caller from parsing
+    // stale cmsg data.
+    let msg_control =
+        unsafe { core::ptr::read_unaligned(msg_ptr.add(32).cast::<usize>()) } as *mut u8;
+    let msg_controllen = unsafe { core::ptr::read_unaligned(msg_ptr.add(40).cast::<usize>()) };
+
+    // Read iovec info from msghdr.
+    let iov_ptr = unsafe { core::ptr::read_unaligned(msg_ptr.add(16).cast::<usize>()) } as *mut u8;
+    let iov_len = unsafe { core::ptr::read_unaligned(msg_ptr.add(24).cast::<usize>()) };
+
+    if iov_ptr.is_null() || iov_len == 0 {
+        return 0;
+    }
+
+    // Calculate total iovec capacity.
+    let mut total_capacity = 0usize;
+    for i in 0..iov_len {
+        let iov_entry = unsafe { iov_ptr.add(i * IOVEC_SIZE) };
+        let len = unsafe { core::ptr::read_unaligned(iov_entry.add(8).cast::<usize>()) };
+        total_capacity += len;
+    }
+
+    let read_len = total_capacity.min(4096);
+    if read_len == 0 {
+        return 0;
+    }
+
+    // Read into a stack buffer.
+    let mut buf = core::mem::MaybeUninit::<[u8; 4096]>::uninit();
+    let buf_ptr = buf.as_mut_ptr().cast::<u8>();
+
+    let read_args = [fd, buf_ptr as u64, read_len as u64, 0, 0, 0];
+    let cq = unsafe {
+        submit_and_wait(
+            tls,
+            libc::SYS_read as u32,
+            &read_args,
+            litebox_ipc::ring::sq_flags::NEED_AUTH,
+        )
+    };
+
+    let bytes_read = if cq.flags & cq_flags::EXEC_LOCAL != 0 {
+        // Central returned data via shmem data region.
+        if cq.result < 0 {
+            return cq.result;
+        }
+        let n = cq.result as usize;
+        if cq.flags & cq_flags::HAS_DATA != 0 && n > 0 {
+            let micro = unsafe { &*(*tls).micro };
+            let data_src = unsafe {
+                micro
+                    .ring_base
+                    .add(micro.layout.data_region_offset)
+                    .add(cq.data_offset as usize)
+            };
+            let copy_len = n.min(4096);
+            unsafe { core::ptr::copy_nonoverlapping(data_src, buf_ptr, copy_len) };
+            copy_len
+        } else {
+            n
+        }
+    } else {
+        if cq.result < 0 {
+            return cq.result;
+        }
+        cq.result as usize
+    };
+
+    // Scatter into iovec.
+    let mut offset = 0usize;
+    for i in 0..iov_len {
+        if offset >= bytes_read {
+            break;
+        }
+        let iov_entry = unsafe { (iov_ptr as *const u8).add(i * IOVEC_SIZE) };
+        let base = unsafe { core::ptr::read_unaligned(iov_entry.cast::<usize>()) } as *mut u8;
+        let len = unsafe { core::ptr::read_unaligned(iov_entry.add(8).cast::<usize>()) };
+
+        if base.is_null() || len == 0 {
+            continue;
+        }
+
+        let copy_len = len.min(bytes_read - offset);
+        unsafe { core::ptr::copy_nonoverlapping(buf_ptr.add(offset), base, copy_len) };
+        offset += copy_len;
+    }
+
+    // Fake ancillary data: construct a valid SCM_RIGHTS cmsghdr with fd=-1
+    // so callers like nginx's ngx_read_channel() that unconditionally parse
+    // ancillary data for OPEN_CHANNEL commands won't error out.
+    // cmsghdr layout on x86-64:
+    //   cmsg_len:   size_t (8 bytes, offset 0)  = CMSG_LEN(sizeof(int)) = 20
+    //   cmsg_level: int    (4 bytes, offset 8)   = SOL_SOCKET = 1
+    //   cmsg_type:  int    (4 bytes, offset 12)  = SCM_RIGHTS = 1
+    //   data:       int    (4 bytes, offset 16)  = fd = -1
+    // Total: 20 bytes (CMSG_LEN), padded to 24 (CMSG_SPACE).
+    if !msg_control.is_null() && msg_controllen >= 24 {
+        // Zero the buffer first to clear any stale data.
+        let zero_len = msg_controllen.min(256);
+        unsafe { core::ptr::write_bytes(msg_control, 0, zero_len) };
+        // Write fake cmsghdr.
+        unsafe { core::ptr::write_unaligned(msg_control.cast::<u64>(), 20) }; // cmsg_len = 20
+        unsafe { core::ptr::write_unaligned(msg_control.add(8).cast::<i32>(), 1) }; // cmsg_level = SOL_SOCKET
+        unsafe { core::ptr::write_unaligned(msg_control.add(12).cast::<i32>(), 1) }; // cmsg_type = SCM_RIGHTS
+        unsafe { core::ptr::write_unaligned(msg_control.add(16).cast::<i32>(), -1) }; // fd = -1
+        // Set msg_controllen to CMSG_SPACE(sizeof(int)) = 24.
+        unsafe { core::ptr::write_unaligned(msg_ptr.add(40).cast::<usize>(), 24) };
+    } else if !msg_control.is_null() && msg_controllen > 0 {
+        // Buffer too small for a fake cmsghdr — just zero everything.
+        let zero_len = msg_controllen.min(256);
+        unsafe { core::ptr::write_bytes(msg_control, 0, zero_len) };
+        unsafe { core::ptr::write_unaligned(msg_ptr.add(40).cast::<usize>(), 0) };
+    } else {
+        unsafe { core::ptr::write_unaligned(msg_ptr.add(40).cast::<usize>(), 0) };
+    }
+    unsafe { core::ptr::write_unaligned(msg_ptr.add(48).cast::<i32>(), 0) }; // msg_flags = 0
+
+    offset as i64
+}
+
 /// Like [`futex_wait`] but with a 100 ms timeout so micro can periodically
 /// check whether central is still alive.
 fn futex_wait_timed(addr: &core::sync::atomic::AtomicU32, expected: u32) {
@@ -1059,6 +1293,23 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
         unsafe { notify_central(tls, nr, &args.args) };
         unsafe { crate::raw_syscall::syscall1(libc::SYS_exit_group, args.args[0]) };
         // unreachable — process is dead
+    }
+
+    // sendmsg → write conversion: extract iovec data from guest's msghdr
+    // and rewrite as SYS_write. This allows socketpair fds (virtual, managed
+    // by central's shim) to work without implementing full msghdr marshaling.
+    // Ancillary data (SCM_RIGHTS) is silently dropped — nginx can function
+    // without it for basic master→worker channel commands.
+    #[allow(clippy::cast_possible_truncation)]
+    if nr == libc::SYS_sendmsg as u32 {
+        return unsafe { handle_sendmsg_as_write(tls, args) };
+    }
+
+    // recvmsg → read conversion: similar to sendmsg, read data from central
+    // and scatter into the guest's iovec.
+    #[allow(clippy::cast_possible_truncation)]
+    if nr == libc::SYS_recvmsg as u32 {
+        return unsafe { handle_recvmsg_as_read(tls, args) };
     }
 
     let cq =

@@ -384,6 +384,14 @@ impl<FS: ShimFS> Task<FS> {
                 // Note we don't support capabilities in LiteBox, so we always return 0.
                 Ok(0)
             }
+            PrctlArg::SetDumpable(_) => {
+                // Silently accept — dumpable flag is not meaningful in a libOS sandbox.
+                Ok(0)
+            }
+            PrctlArg::GetDumpable => {
+                // Always report as dumpable (1).
+                Ok(1)
+            }
             _ => unimplemented!(),
         }
     }

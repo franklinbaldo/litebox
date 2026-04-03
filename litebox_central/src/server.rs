@@ -559,6 +559,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
 
         // 1. Acquire a ring for the child from the pool.
         let Ok((child_region, child_ring_fd)) = self.ring_pool.acquire() else {
+            eprintln!("[CENTRAL] handle_fork: FAILED to acquire ring (ENOMEM)");
             cq.result = -i64::from(libc::ENOMEM);
             return cq;
         };

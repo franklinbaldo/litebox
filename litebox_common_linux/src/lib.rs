@@ -1708,6 +1708,8 @@ pub enum PrctlArg<Platform: litebox::platform::RawPointerProvider> {
     SetName(Platform::RawConstPointer<u8>),
     GetName(Platform::RawMutPointer<u8>),
     CapBSetRead(usize),
+    SetDumpable(usize),
+    GetDumpable,
 }
 
 #[repr(i32)]
@@ -2740,6 +2742,12 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                         },
                         PrctlOption::CapBSetRead => SyscallRequest::Prctl {
                             args: PrctlArg::CapBSetRead(ctx.sys_req_arg(1)),
+                        },
+                        PrctlOption::SetDumpable => SyscallRequest::Prctl {
+                            args: PrctlArg::SetDumpable(ctx.sys_req_arg(1)),
+                        },
+                        PrctlOption::GetDumpable => SyscallRequest::Prctl {
+                            args: PrctlArg::GetDumpable,
                         },
                         _ => {
                             return Err(unsupported_einval(format_args!("prctl({op:?})")));
