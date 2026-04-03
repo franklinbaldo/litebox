@@ -9,6 +9,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[derive(Clone, Copy)]
+enum Backend {
+    Rewriter,
+    Seccomp,
+}
+
 #[must_use]
 struct Runner {
     command: std::process::Command,
@@ -21,17 +27,24 @@ struct Runner {
 }
 
 impl Runner {
-    fn new(target: &Path, unique_name: &str) -> Self {
-        let dir_path = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
-        let path = {
-            // new path in out_dir with .hooked suffix
-            let out_path = dir_path.join(format!(
-                "{}.hooked",
-                target.file_name().unwrap().to_str().unwrap()
-            ));
-            let success = common::rewrite_with_cache(target, &out_path, &[]);
-            assert!(success, "failed to run litebox_syscall_rewriter");
-            out_path
+    fn new(backend: Backend, target: &Path, unique_name: &str) -> Self {
+        let backend_str = match backend {
+            Backend::Rewriter => "rewriter",
+            Backend::Seccomp => "seccomp",
+        };
+        let dir_path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+        let path = match backend {
+            Backend::Seccomp => target.to_path_buf(),
+            Backend::Rewriter => {
+                // new path in out_dir with .hooked suffix
+                let out_path = dir_path.join(format!(
+                    "{}.hooked",
+                    target.file_name().unwrap().to_str().unwrap()
+                ));
+                let success = common::rewrite_with_cache(target, &out_path, &[]);
+                assert!(success, "failed to run litebox_syscall_rewriter");
+                out_path
+            }
         };
 
         // create tar file containing all dependencies
@@ -61,6 +74,8 @@ impl Runner {
         let mut command = std::process::Command::new(binary_path);
         command.args([
             "--unstable",
+            "--interception-backend",
+            backend_str,
             // Tell ld where to find the libraries.
             // See https://man7.org/linux/man-pages/man8/ld.so.8.html for how ld works.
             // Alternatively, we could add a `/etc/ld.so.cache` file to the rootfs.
