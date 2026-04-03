@@ -383,17 +383,25 @@ fn extract_tar<R: Read>(
                             }
                         }
                     }
+                    // Also prune in-memory symlinks under this directory so
+                    // they are not resurrected by materialize_symlinks.
+                    symlinks.retain(|s| !s.rel_path.starts_with(parent));
                 }
                 continue;
             }
             if let Some(target_name) = file_name.strip_prefix(".wh.") {
                 // Regular whiteout: delete the specific file/directory
                 if let Some(parent) = path.parent() {
-                    let target = rootfs.join(parent).join(target_name);
+                    let whiteout_rel = parent.join(target_name);
+                    let target = rootfs.join(&whiteout_rel);
                     if target.is_dir() {
                         let _ = std::fs::remove_dir_all(&target);
+                        // Prune symlinks under the removed directory.
+                        symlinks.retain(|s| !s.rel_path.starts_with(&whiteout_rel));
                     } else {
                         let _ = std::fs::remove_file(&target);
+                        // Prune the exact symlink entry if present.
+                        symlinks.retain(|s| s.rel_path != whiteout_rel);
                     }
                 }
                 continue;
@@ -501,6 +509,12 @@ fn resolve_symlink_in_rootfs(
     max_depth: u32,
 ) -> Option<PathBuf> {
     if max_depth == 0 {
+        return None;
+    }
+
+    // Empty rel_path would resolve to the rootfs directory itself — treat
+    // as unresolvable to avoid accidentally matching the entire rootfs.
+    if rel_path.as_os_str().is_empty() {
         return None;
     }
 
