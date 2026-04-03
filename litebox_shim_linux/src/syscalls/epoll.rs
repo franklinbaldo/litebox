@@ -200,10 +200,7 @@ impl<FS: ShimFS> EpollFile<FS> {
     ) -> Result<(), Errno> {
         match op {
             EpollOp::EpollCtlAdd => self.add_interest(global, fd, file, event.unwrap()),
-            EpollOp::EpollCtlMod => {
-                log_unsupported!("epoll_ctl mod");
-                Err(Errno::EINVAL)
-            }
+            EpollOp::EpollCtlMod => self.mod_interest(global, fd, file, event.unwrap()),
             EpollOp::EpollCtlDel => {
                 let mut interests = self.interests.lock();
                 let _ = interests
@@ -250,7 +247,6 @@ impl<FS: ShimFS> EpollFile<FS> {
         Ok(())
     }
 
-    #[expect(dead_code, reason = "currently unused, but might want to use soon")]
     fn mod_interest(
         &self,
         global: &GlobalState<FS>,
