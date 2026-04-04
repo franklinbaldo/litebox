@@ -70,6 +70,7 @@ fn ratchet_maybe_uninit() -> Result<()> {
         &[
             ("dev_tests/", 1),
             ("litebox/", 1),
+            ("litebox_common_linux/", 1),
             ("litebox_platform_linux_userland/", 3),
             ("litebox_shim_linux/", 5),
         ],

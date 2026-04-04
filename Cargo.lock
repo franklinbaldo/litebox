@@ -1472,6 +1472,7 @@ dependencies = [
  "cfg-if",
  "elf",
  "int-enum",
+ "libc",
  "litebox",
  "syscalls",
  "thiserror",
