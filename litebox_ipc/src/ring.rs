@@ -8,7 +8,7 @@
 // construction and zerocopy compatibility.
 #![allow(clippy::pub_underscore_fields)]
 
-use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8};
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -42,6 +42,32 @@ pub const PIPE_DATA_CAPACITY: usize = 65536;
 /// Maximum number of concurrent pipe slots.
 /// floor((8 MiB - 5 MiB) / PIPE_SLOT_SIZE) = floor(3145728 / 65600) = 47
 pub const MAX_PIPE_SLOTS: usize = 47;
+
+/// Size of socket ring data buffer per direction (must be power-of-2).
+/// 256 KiB matches the current HeapRb socket channel size.
+pub const SOCKET_RING_CAPACITY: usize = 256 * 1024;
+
+/// Size of the socket ring header (cache-line aligned).
+/// Contains RX header, TX header, and control flags.
+pub const SOCKET_RING_HEADER_SIZE: usize = 192; // 3 cache lines
+
+/// Size of each socket slot: header + RX data + TX data.
+pub const SOCKET_SLOT_SIZE: usize = SOCKET_RING_HEADER_SIZE + 2 * SOCKET_RING_CAPACITY;
+
+/// Base offset within the data region where socket ring buffers start.
+/// Placed after the pipe zone. The data region must be enlarged to accommodate.
+/// Pipe zone ends at: 5 MiB + 47 * 65600 = 5 MiB + 3083200 ≈ 7.94 MiB
+/// Round up to 8 MiB boundary.
+pub const SOCKET_ZONE_BASE_OFFSET: usize = 8 * 1024 * 1024;
+
+/// Maximum number of concurrent socket slots.
+/// Each slot is ~512 KiB. With 32 MiB socket zone: 32 MiB / 512 KiB = 64 slots.
+pub const MAX_SOCKET_SLOTS: usize = 64;
+
+/// Total data region size including socket zone.
+/// 8 MiB (existing) + 32 MiB (socket zone) = 40 MiB.
+pub const SOCKET_DATA_REGION_SIZE: usize =
+    SOCKET_ZONE_BASE_OFFSET + MAX_SOCKET_SLOTS * SOCKET_SLOT_SIZE;
 
 /// Flags for submission queue entries.
 pub mod sq_flags {

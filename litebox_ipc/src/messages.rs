@@ -149,3 +149,23 @@ pub struct Pipe2Response {
 }
 
 const _: () = assert!(size_of::<Pipe2Response>() == 16);
+
+/// Response payload for `SYS_accept4` when a shmem socket slot is allocated.
+///
+/// Central writes this to the data region. Micro reads it to learn the
+/// shmem offset for the new socket's ring buffers.
+#[repr(C)]
+#[allow(clippy::pub_underscore_fields)]
+pub struct AcceptResponse {
+    /// The new fd number returned by accept.
+    pub fd: i32,
+    /// Offset within the data region to the `ShmemSocketHeader`.
+    pub socket_slot_offset: u32,
+    /// Peer address (raw `sockaddr_in` bytes, network byte order).
+    pub peer_addr: [u8; 16],
+    /// Length of valid peer address data in `peer_addr`.
+    pub peer_addr_len: u32,
+    pub _pad: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<AcceptResponse>() == 32);
