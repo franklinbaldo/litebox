@@ -104,6 +104,7 @@ impl TryFrom<i32> for Signal {
 }
 
 /// The default disposition of a signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignalDisposition {
     /// Terminate the process.
     Terminate,
@@ -316,6 +317,9 @@ pub const SI_SIGIO: i32 = -5;
 pub const SI_TKILL: i32 = -6;
 pub const SI_DETHREAD: i32 = -7;
 pub const SI_ASYNCNL: i32 = -60;
+
+pub const SEGV_MAPERR: i32 = 1;
+pub const SEGV_ACCERR: i32 = 2;
 
 #[repr(C)]
 #[derive(Clone, FromBytes, IntoBytes)]

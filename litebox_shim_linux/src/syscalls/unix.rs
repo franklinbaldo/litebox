@@ -1367,6 +1367,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
         match optname {
             SocketOptionName::IP(ip) => match ip {
                 IpOption::TOS => Err(Errno::EOPNOTSUPP),
+                _ => Err(Errno::ENOPROTOOPT),
             },
             SocketOptionName::Socket(so) => match so {
                 // handled by `setsockopt_common`
@@ -1417,6 +1418,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
         let val: u32 = match optname {
             SocketOptionName::IP(ip) => match ip {
                 IpOption::TOS => return Err(Errno::EOPNOTSUPP),
+                _ => return Err(Errno::ENOPROTOOPT),
             },
             SocketOptionName::Socket(so) => match so {
                 // handled by `getsockopt_common`

@@ -1652,7 +1652,7 @@ impl<FS: ShimFS> Task<FS> {
         epfd: i32,
         events: MutPtr<litebox_common_linux::EpollEvent>,
         maxevents: u32,
-        timeout: i32,
+        timeout: litebox_common_linux::TimeParam<litebox_platform_multiplex::Platform>,
         sigmask: Option<ConstPtr<litebox_common_linux::signal::SigSet>>,
         _sigsetsize: usize,
     ) -> Result<usize, Errno> {
@@ -1668,11 +1668,26 @@ impl<FS: ShimFS> Task<FS> {
         {
             return Err(Errno::EINVAL);
         }
-        let timeout = if timeout >= 0 {
-            #[allow(clippy::cast_sign_loss, reason = "timeout is a positive integer")]
-            Some(core::time::Duration::from_millis(timeout as u64))
-        } else {
-            None
+        let timeout = match timeout {
+            litebox_common_linux::TimeParam::Milliseconds(ms) if ms >= 0 =>
+            {
+                #[allow(clippy::cast_sign_loss, reason = "ms is a positive integer")]
+                Some(core::time::Duration::from_millis(ms as u64))
+            }
+            litebox_common_linux::TimeParam::Timespec64(ptr) => {
+                let ts: litebox_common_linux::Timespec =
+                    litebox::platform::RawConstPointer::read_at_offset(ptr, 0)
+                        .ok_or(Errno::EFAULT)?;
+                if ts.tv_sec < 0 || ts.tv_nsec >= 1_000_000_000 {
+                    return Err(Errno::EINVAL);
+                }
+                #[allow(clippy::cast_sign_loss)]
+                Some(core::time::Duration::new(
+                    ts.tv_sec as u64,
+                    ts.tv_nsec.min(999_999_999) as u32,
+                ))
+            }
+            _ => None,
         };
         let handle = {
             let files = self.files.borrow();

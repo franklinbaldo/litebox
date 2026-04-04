@@ -381,6 +381,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         match optname {
             SocketOptionName::IP(ip) => match ip {
                 litebox_common_linux::IpOption::TOS => return Err(Errno::EOPNOTSUPP),
+                _ => return Err(Errno::ENOPROTOOPT),
             },
             SocketOptionName::Socket(so) => match so {
                 // handled by `setsockopt_common`
@@ -534,6 +535,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         let val: u32 = match optname {
             SocketOptionName::IP(ipopt) => match ipopt {
                 litebox_common_linux::IpOption::TOS => return Err(Errno::EOPNOTSUPP),
+                _ => return Err(Errno::ENOPROTOOPT),
             },
             SocketOptionName::Socket(sopt) => match sopt {
                 // handled by `getsockopt_common`
@@ -1914,8 +1916,15 @@ mod tests {
         events: &mut [litebox_common_linux::EpollEvent],
     ) -> usize {
         let events_ptr = crate::MutPtr::from_usize(events.as_mut_ptr() as usize);
-        task.sys_epoll_pwait(epfd, events_ptr, events.len().truncate(), -1, None, 0)
-            .expect("epoll_wait failed")
+        task.sys_epoll_pwait(
+            epfd,
+            events_ptr,
+            events.len().truncate(),
+            litebox_common_linux::TimeParam::Milliseconds(-1),
+            None,
+            0,
+        )
+        .expect("epoll_wait failed")
     }
 
     fn test_tcp_socket_as_server(
