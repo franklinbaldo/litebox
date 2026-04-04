@@ -39,6 +39,7 @@ enum EventFileInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
         counter: u64,
         semaphore: bool,
     },
+    #[allow(dead_code)]
     Pidfd {
         exited: Arc<AtomicBool>,
         subject: Arc<Subject<Events, Events, Platform>>,
@@ -100,6 +101,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn new_pidfd(
         exited: Arc<AtomicBool>,
         subject: Arc<Subject<Events, Events, Platform>>,
@@ -118,6 +120,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         matches!(*self.inner.lock(), EventFileInner::Timerfd(_))
     }
 
+    #[allow(dead_code)]
     #[cfg(feature = "trace_syscalls")]
     pub(crate) fn kind_name(&self) -> &'static str {
         match &*self.inner.lock() {
