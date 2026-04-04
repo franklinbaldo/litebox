@@ -9,14 +9,18 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use hashbrown::{HashMap, HashSet};
 
+#[cfg(feature = "trace_fs")]
+use crate::log_println;
+
 use crate::LiteBox;
-use crate::fd::{InternalFd, TypedFd};
+use crate::fd::{InternalFd, MetadataError, TypedFd};
 use crate::path::Arg;
 use crate::sync;
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ReadDirError, ReadError, RenameError, RmdirError, SeekError, TruncateError, UnlinkError,
+    WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence};
 
@@ -34,9 +38,10 @@ pub enum LayeringSemantics {
     LowerLayerReadOnly,
     /// Lower layer's files are writable.
     ///
-    /// No new files can be made at the lower layer, but any existing files in the lower layer can
-    /// still be written to. If an upper level file exists with the same name as a lower layer file,
-    /// then it is shadowed, and only the upper layer file would be visible.
+    /// New files created with `O_CREAT` are placed directly on the lower layer so they persist
+    /// on the backing store (e.g., the host filesystem via 9P). Existing lower-layer files can
+    /// be written to directly. If an upper level file exists with the same name as a lower layer
+    /// file, then it is shadowed, and only the upper layer file would be visible.
     LowerLayerWritableFiles,
 }
 
@@ -100,6 +105,57 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         self.lower.file_status(path).map(|stat| stat.file_type)
     }
 
+    /// Whether this path is hidden because it or one of its ancestors is tombstoned.
+    fn is_hidden_by_tombstone(&self, path: &str) -> Result<bool, PathError> {
+        let root = self.root.read();
+        Ok(path.increasing_ancestors()?.any(|ancestor| {
+            root.entries
+                .get(ancestor)
+                .is_some_and(|e| matches!(e.as_ref(), EntryX::Tombstone))
+        }))
+    }
+
+    /// Whether one of this path's strict ancestors is tombstoned.
+    fn has_tombstoned_ancestor(&self, path: &str) -> Result<bool, PathError> {
+        let root = self.root.read();
+        Ok(path.increasing_ancestors()?.any(|ancestor| {
+            ancestor != path
+                && root
+                    .entries
+                    .get(ancestor)
+                    .is_some_and(|e| matches!(e.as_ref(), EntryX::Tombstone))
+        }))
+    }
+
+    /// Invalidate `root.entries` cache for a path and all its descendants.
+    /// Required after rename to prevent stale cached fds and tombstones
+    /// from shadowing the post-rename namespace.
+    fn invalidate_cache_tree(root: &mut RootDir<Upper, Lower>, path: &str) {
+        root.entries.remove(path);
+        let prefix = alloc::format!("{path}/");
+        let descendants: Vec<String> = root
+            .entries
+            .keys()
+            .filter(|k| k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for k in descendants {
+            root.entries.remove(&k);
+        }
+    }
+
+    /// Returns whether a lower-layer fd is safe to share across multiple layered opens.
+    ///
+    /// Regular files and directories can reuse a shared lower fd because layered descriptors track
+    /// their own offsets. Character devices often have per-open state or side effects, so each
+    /// layered open must keep its own lower fd.
+    fn lower_fd_is_shareable(&self, fd: &TypedFd<Lower>) -> Result<bool, FileStatusError> {
+        Ok(!matches!(
+            self.lower.fd_file_status(fd)?.file_type,
+            FileType::CharacterDevice
+        ))
+    }
+
     /// (private-only) Create all parent/ancestor directories for a `path`, making sure that each of
     /// these exist in the lower layer. It does _not_ set up `path` itself on the upper layer
     /// though; this is left to the callee to handle.
@@ -112,21 +168,44 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             if dir == path {
                 return Ok(());
             }
+            if self.is_hidden_by_tombstone(dir)? {
+                return Err(PathError::NoSuchFileOrDirectory)?;
+            }
+            // Check if the ancestor already exists on the upper layer.
+            // This handles dirs created on upper in a prior layered mkdir
+            // (e.g., a parent that only exists in the in-mem FS because the
+            // lower layer couldn't create it).
+            match self.upper.file_status(dir) {
+                Ok(FileStatus {
+                    file_type: FileType::Directory,
+                    ..
+                }) => continue,
+                Ok(_) => return Err(MkdirError::PathError(PathError::ComponentNotADirectory)),
+                Err(FileStatusError::PathError(
+                    PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                )) => {
+                    // Not on upper; check lower and migrate if found.
+                }
+                Err(FileStatusError::PathError(e @ PathError::NoSearchPerms { .. })) => {
+                    return Err(e)?;
+                }
+                Err(FileStatusError::PathError(PathError::ComponentNotADirectory)) => {
+                    return Err(MkdirError::PathError(PathError::ComponentNotADirectory));
+                }
+                Err(FileStatusError::PathError(PathError::InvalidPathname)) => {
+                    unreachable!("we just confirmed valid path")
+                }
+                Err(_) => return Err(MkdirError::Io),
+            }
             match self.ensure_lower_contains(dir) {
                 Ok(FileType::Directory) => {
-                    // The dir does in fact exist; we just need to confirm that the upper layer also
-                    // has it.
+                    // The dir exists on lower; mirror it on upper.
                     match self
                         .upper
                         .mkdir(dir, self.lower.file_status(dir).unwrap().mode)
                     {
-                        Ok(()) => {
-                            // fallthrough to next increasing ancestor
-                        }
+                        Ok(()) | Err(MkdirError::AlreadyExists) => {}
                         Err(e) => match e {
-                            MkdirError::AlreadyExists => {
-                                // perfectly fine, just fallthrough to next place in the loop
-                            }
                             MkdirError::ReadOnlyFileSystem
                             | MkdirError::Io
                             | MkdirError::NoWritePerms
@@ -142,20 +221,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                             ) => {
                                 unreachable!()
                             }
+                            _ => return Err(MkdirError::Io),
                         },
                     }
                 }
                 Ok(FileType::RegularFile | FileType::CharacterDevice | FileType::Symlink)
                 | Err(
                     FileStatusError::PathError(PathError::MissingComponent)
-                    | FileStatusError::ClosedFd,
+                    | FileStatusError::ClosedFd
+                    | FileStatusError::NotADirectory,
                 ) => unreachable!(),
-                Err(FileStatusError::NotADirectory) => {
-                    unimplemented!()
-                }
-                Err(FileStatusError::SymlinkLoop) => {
-                    unimplemented!()
-                }
                 Err(FileStatusError::PathError(PathError::ComponentNotADirectory)) => {
                     unimplemented!()
                 }
@@ -169,7 +244,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     assert_ne!(dir, path);
                     return Err(PathError::MissingComponent)?;
                 }
-                Err(FileStatusError::Io) => return Err(MkdirError::Io),
+                Err(FileStatusError::Io | FileStatusError::SymlinkLoop) => {
+                    return Err(MkdirError::Io);
+                }
             }
         }
         // The loop above should return at one of its return points
@@ -210,11 +287,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             Ok(fd) => fd,
             Err(e) => match e {
                 OpenError::AccessNotAllowed => return Err(MigrationError::NoReadPerms),
-                OpenError::Io => return Err(MigrationError::Io),
+                OpenError::Io | OpenError::Interrupted => return Err(MigrationError::Io),
                 OpenError::NoWritePerms
                 | OpenError::ReadOnlyFileSystem
                 | OpenError::AlreadyExists
-                | OpenError::Interrupted
                 | OpenError::ClosedFd
                 | OpenError::NotADirectory
                 | OpenError::TruncateError(_) => unreachable!(),
@@ -239,7 +315,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         // First, we make sure we've set up the ancestor directories.
                         match self.mkdir_migrating_ancestor_dirs(path) {
                             Ok(()) => {}
-                            Err(e) => unimplemented!("{e} when setting up ancestor dirs"),
+                            Err(_) => return Err(MigrationError::Io),
                         }
                         // Now we can actually open the file.
                         upper_fd = Some(
@@ -269,11 +345,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         // In which case we quit early
                         return Err(MigrationError::NotAFile);
                     }
-                    ReadError::ClosedFd
-                    | ReadError::NotForReading
-                    | ReadError::WouldBlock
-                    | ReadError::Interrupted => unreachable!(),
-                    ReadError::Io => return Err(MigrationError::Io),
+                    ReadError::ClosedFd | ReadError::NotForReading => unreachable!(),
+                    ReadError::Io | ReadError::WouldBlock | ReadError::Interrupted => {
+                        return Err(MigrationError::Io);
+                    }
                 },
             }
         }
@@ -416,6 +491,134 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         }
     }
 
+    /// Get the stored path from any fd's Descriptor.
+    fn descriptor_path(&self, dirfd: &FileFd<Platform, Upper, Lower>) -> Option<String> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let entry = descriptor_table.get_entry(dirfd)?;
+        Some(entry.entry.path.clone())
+    }
+
+    /// Get the stored path from a directory fd's Descriptor.
+    fn dir_fd_path(
+        &self,
+        dirfd: &FileFd<Platform, Upper, Lower>,
+    ) -> Result<String, super::DirFdError> {
+        // Clone the path and underlying entry in a single borrow scope so the
+        // descriptor_table borrow is released before we query the backend.
+        let (path, entry) = {
+            let descriptor_table = self.litebox.descriptor_table();
+            let desc = descriptor_table
+                .get_entry(dirfd)
+                .ok_or(super::DirFdError::ClosedFd)?;
+            (desc.entry.path.clone(), Arc::clone(&desc.entry.entry))
+        };
+        // Check the actual file type from the underlying backend rather than
+        // relying on OFlags::DIRECTORY, which the caller may not have set.
+        let file_type = match entry.as_ref() {
+            EntryX::Upper { fd } => self.upper.fd_file_status(fd),
+            EntryX::Lower { fd } => self.lower.fd_file_status(fd),
+            EntryX::Tombstone => return Err(super::DirFdError::ClosedFd),
+        }
+        .map_err(|e| match e {
+            FileStatusError::ClosedFd => super::DirFdError::ClosedFd,
+            _ => super::DirFdError::Io,
+        })?
+        .file_type;
+        if matches!(file_type, super::FileType::Directory) {
+            Ok(path)
+        } else {
+            Err(super::DirFdError::NotADirectory)
+        }
+    }
+
+    /// Resolve a relative path against a base directory path.
+    fn resolve_relative(base: &str, rel: &str) -> Result<String, PathError> {
+        if rel.is_empty() || rel == "." {
+            return Ok(base.into());
+        }
+        if rel.starts_with('/') {
+            return Ok(rel.normalized()?);
+        }
+        let combined = if base.ends_with('/') {
+            alloc::format!("{base}{rel}")
+        } else {
+            alloc::format!("{base}/{rel}")
+        };
+        Ok(combined.normalized()?)
+    }
+
+    /// Resolve symlinks in every component of `path` (like `realpath`).
+    ///
+    /// Walks each component, checking for symlinks at each prefix. When a
+    /// symlink is found, its target's components are spliced into the work
+    /// queue so nested symlinks within the target are also resolved.
+    /// Returns `SymlinkLoop` if more than `max_hops` symlinks are followed.
+    fn resolve_follow_symlinks(
+        &self,
+        path: String,
+        max_hops: usize,
+    ) -> Result<String, super::FileStatusError> {
+        let mut resolved = alloc::string::String::from("/");
+        let mut hops_remaining = max_hops;
+
+        let mut remaining: alloc::vec::Vec<alloc::string::String> = path
+            .split('/')
+            .filter(|c| !c.is_empty())
+            .map(alloc::string::String::from)
+            .collect();
+        let mut idx = 0;
+
+        while idx < remaining.len() {
+            let component = remaining[idx].clone();
+            idx += 1;
+
+            match component.as_str() {
+                "" | "." => continue,
+                ".." => {
+                    if let Some(pos) = resolved[..resolved.len().saturating_sub(1)].rfind('/') {
+                        resolved.truncate(pos + 1);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+
+            if !resolved.ends_with('/') {
+                resolved.push('/');
+            }
+            resolved.push_str(&component);
+
+            if let Ok(t) = <Self as super::FileSystem>::read_link(self, &*resolved) {
+                if hops_remaining == 0 {
+                    return Err(super::FileStatusError::SymlinkLoop);
+                }
+                hops_remaining -= 1;
+
+                if t.starts_with('/') {
+                    resolved = alloc::string::String::from("/");
+                } else {
+                    let parent_end = resolved.rfind('/').unwrap_or(0).max(1);
+                    resolved.truncate(parent_end);
+                }
+
+                let tail: alloc::vec::Vec<alloc::string::String> = remaining.drain(idx..).collect();
+                remaining.truncate(0);
+                remaining.extend(
+                    t.split('/')
+                        .filter(|c| !c.is_empty())
+                        .map(alloc::string::String::from),
+                );
+                remaining.extend(tail);
+                idx = 0;
+            }
+        }
+
+        if resolved.len() > 1 && resolved.ends_with('/') {
+            resolved.pop();
+        }
+        Ok(resolved)
+    }
+
     // Converts a `NodeInfo` from any of the layers into a layered `NodeInfo`
     fn get_layered_nodeinfo(&self, node_info: NodeInfo) -> NodeInfo {
         let mut node_info_lookup = self.node_info_lookup.write();
@@ -455,12 +658,37 @@ impl<
     Lower: super::FileSystem + 'static,
 > super::FileSystem for FileSystem<Platform, Upper, Lower>
 {
+    fn walks_follow_symlinks(&self) -> bool {
+        // Returns true if either layer follows symlinks during walks.
+        // The upper layer (in_mem/tar) has no symlinks, so it returns
+        // false (the default). The lower layer (9P) follows symlinks
+        // via server-side canonicalization. Using OR is correct because
+        // the upper layer never has symlinks that would need client-side
+        // resolution, and the lower layer resolves them server-side.
+        self.upper.walks_follow_symlinks() || self.lower.walks_follow_symlinks()
+    }
+
+    fn create_anonymous_file(
+        &self,
+        name: &str,
+        mode: super::Mode,
+    ) -> Result<FileFd<Platform, Upper, Lower>, super::errors::CreateAnonymousFileError> {
+        let upper_fd = self.upper.create_anonymous_file(name, mode)?;
+        Ok(self.litebox.descriptor_table_mut().insert(Descriptor {
+            path: super::memfd_display_path(name),
+            flags: OFlags::RDWR | OFlags::LARGEFILE,
+            entry: Arc::new(EntryX::Upper { fd: upper_fd }),
+            position: 0.into(),
+        }))
+    }
+
     fn open(
         &self,
         path: impl crate::path::Arg,
         flags: OFlags,
         mode: Mode,
     ) -> Result<FileFd<Platform, Upper, Lower>, OpenError> {
+        let flags = flags - OFlags::PATH;
         let currently_supported_oflags: OFlags = OFlags::CREAT
             | OFlags::RDONLY
             | OFlags::WRONLY
@@ -472,11 +700,15 @@ impl<
             | OFlags::NONBLOCK
             | OFlags::LARGEFILE
             | OFlags::NOFOLLOW
-            | OFlags::APPEND;
+            | OFlags::APPEND
+            | OFlags::PATH;
         if flags.intersects(currently_supported_oflags.complement()) {
             unimplemented!("{flags:?}")
         }
         let path = self.absolute_path(path)?;
+        if self.has_tombstoned_ancestor(&path)? {
+            return Err(PathError::NoSuchFileOrDirectory)?;
+        }
         if flags.contains(OFlags::CREAT) {
             if flags.contains(OFlags::EXCL) {
                 // O_EXCL with O_CREAT: fail if file already exists anywhere (upper or lower layer)
@@ -484,8 +716,8 @@ impl<
                     return Err(OpenError::AlreadyExists);
                 }
             } else {
-                // We must first attempt to open the file _without_ creating it, and only if that fails,
-                // do we fall-through and end up creating it (which will happen on the upper layer).
+                // We must first attempt to open the file _without_ creating it, and only if that
+                // fails, do we fall-through and end up creating it.
                 if let Ok(fd) = self.open(path.as_str(), flags - OFlags::CREAT, mode) {
                     return Ok(fd);
                 }
@@ -494,7 +726,20 @@ impl<
         let mut tombstone_removal = false;
         // If we already have an entry saying it is a tombstone, then we need to quit out early;
         // otherwise, we'll check the levels.
-        if let Some(entry) = self.root.read().entries.get(&path) {
+        if let Some(entry) = self.root.read().entries.get(&path).cloned() {
+            #[cfg(feature = "trace_fs")]
+            if matches!(
+                self.layering_semantics,
+                LayeringSemantics::LowerLayerWritableFiles
+            ) {
+                log_println!(
+                    self.litebox.x.platform,
+                    "[LAYERED-TRACE] cache hit path={:?} entry={:?} flags={:?}",
+                    path,
+                    entry,
+                    flags,
+                );
+            }
             match entry.as_ref() {
                 EntryX::Tombstone => {
                     // The file has been cleared out; it used to exist on the lower level, but we
@@ -508,17 +753,23 @@ impl<
                     }
                 }
                 EntryX::Upper { .. } => unreachable!(),
-                EntryX::Lower { .. } => {
+                EntryX::Lower { fd } => {
                     // As an optimization, since a lower-level file entry is always opened with the
                     // same flags, and since it indicates that there is no such file at the upper
                     // level, we can just return that directly (with the "real" flags being wrapped
                     // up in the layered descriptor).
-                    return Ok(self.litebox.descriptor_table_mut().insert(Descriptor {
-                        path,
-                        flags,
-                        entry: Arc::clone(entry),
-                        position: 0.into(),
-                    }));
+                    match self.lower_fd_is_shareable(fd) {
+                        Ok(true) => {
+                            return Ok(self.litebox.descriptor_table_mut().insert(Descriptor {
+                                path,
+                                flags,
+                                entry,
+                                position: 0.into(),
+                            }));
+                        }
+                        Ok(false) => {}
+                        Err(_) => return Err(OpenError::Io),
+                    }
                 }
             }
         }
@@ -533,6 +784,101 @@ impl<
                 // removed it for us. We don't need to remove it, and can proceed as normal.
             }
         }
+        // When LowerLayerWritableFiles and O_CREAT for a new file, try the
+        // lower layer first so the file persists on the host filesystem.
+        // Fall back to upper if lower can't create (e.g., parent dir only
+        // exists on upper).  Skip if we just removed a tombstone — the file
+        // still exists on lower and reopening it would resurrect a hidden entry.
+        // Also skip if the file already exists visibly — the non-O_CREAT open
+        // above (line 629) failed for a non-missing reason (e.g., not writable,
+        // wrong type), and creating on lower would shadow the upper entry.
+        if flags.contains(OFlags::CREAT)
+            && !tombstone_removal
+            && matches!(
+                self.layering_semantics,
+                LayeringSemantics::LowerLayerWritableFiles
+            )
+            && self.file_status(path.as_str()).is_err()
+        {
+            // Validate path through upper first. Only soft not-found errors
+            // (the path or an ancestor simply doesn't exist on upper) allow
+            // creation on lower. All other errors — ancestor is a non-dir,
+            // no search perms, I/O failures — must propagate.
+            match self.upper.file_status(path.as_str()) {
+                Ok(_)
+                | Err(FileStatusError::PathError(
+                    PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                )) => {}
+                Err(FileStatusError::PathError(p)) => return Err(OpenError::PathError(p)),
+                Err(_) => return Err(OpenError::Io),
+            }
+            match self.lower.open(path.as_str(), flags, mode) {
+                Ok(lower_fd) => {
+                    // Mirror the shared-cache logic used by the normal lower
+                    // open path so that subsequent opens of the same
+                    // shareable file reuse this entry instead of creating a
+                    // conflicting standalone Arc.
+                    let Ok(shareable) = self.lower_fd_is_shareable(&lower_fd) else {
+                        let _ = self.lower.close(&lower_fd);
+                        return Err(OpenError::Io);
+                    };
+                    let entry = if shareable {
+                        let mut root = self.root.write();
+                        if let Some(existing) = root.entries.get(&path) {
+                            match existing.as_ref() {
+                                EntryX::Lower { fd } => {
+                                    let Ok(existing_shareable) = self.lower_fd_is_shareable(fd)
+                                    else {
+                                        drop(root);
+                                        let _ = self.lower.close(&lower_fd);
+                                        return Err(OpenError::Io);
+                                    };
+                                    if existing_shareable {
+                                        let shared = Arc::clone(existing);
+                                        drop(root);
+                                        let _ = self.lower.close(&lower_fd);
+                                        shared
+                                    } else {
+                                        drop(root);
+                                        let _ = self.lower.close(&lower_fd);
+                                        return Err(PathError::NoSuchFileOrDirectory.into());
+                                    }
+                                }
+                                EntryX::Upper { .. } | EntryX::Tombstone => {
+                                    drop(root);
+                                    let _ = self.lower.close(&lower_fd);
+                                    return Err(PathError::NoSuchFileOrDirectory.into());
+                                }
+                            }
+                        } else {
+                            let entry = Arc::new(EntryX::Lower { fd: lower_fd });
+                            root.entries.insert(path.clone(), Arc::clone(&entry));
+                            entry
+                        }
+                    } else {
+                        Arc::new(EntryX::Lower { fd: lower_fd })
+                    };
+                    return Ok(self.litebox.descriptor_table_mut().insert(Descriptor {
+                        path,
+                        flags,
+                        entry,
+                        position: 0.into(),
+                    }));
+                }
+                Err(
+                    OpenError::PathError(
+                        PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                    )
+                    | OpenError::ReadOnlyFileSystem
+                    | OpenError::Io,
+                ) => {
+                    // Parent dir doesn't exist on lower, lower is read-only
+                    // for this path, or transport error — fall through to
+                    // upper-layer creation.
+                }
+                Err(e) => return Err(e),
+            }
+        }
         // Otherwise, we first check the upper level, creating an entry if needed
         match self.upper.open(&*path, flags, mode) {
             Ok(fd) => {
@@ -544,58 +890,73 @@ impl<
                     position: 0.into(),
                 }));
             }
-            Err(e) => match &e {
-                OpenError::AccessNotAllowed
-                | OpenError::Io
-                | OpenError::NoWritePerms
-                | OpenError::ReadOnlyFileSystem
-                | OpenError::AlreadyExists
-                | OpenError::Interrupted
-                | OpenError::ClosedFd
-                | OpenError::NotADirectory
-                | OpenError::TruncateError(
-                    TruncateError::IsDirectory
-                    | TruncateError::NotForWriting
-                    | TruncateError::IsTerminalDevice
-                    | TruncateError::ClosedFd
-                    | TruncateError::Io,
-                )
-                | OpenError::PathError(
-                    PathError::ComponentNotADirectory
-                    | PathError::InvalidPathname
-                    | PathError::NoSearchPerms { .. },
-                ) => {
-                    // None of these can be handled by lower level, just quit out early
-                    return Err(e);
+            Err(e) => {
+                #[cfg(feature = "trace_fs")]
+                if matches!(
+                    self.layering_semantics,
+                    LayeringSemantics::LowerLayerWritableFiles
+                ) {
+                    log_println!(
+                        self.litebox.x.platform,
+                        "[LAYERED-TRACE] upper.open FAILED path={:?} flags={:?} err={:?}",
+                        path,
+                        flags,
+                        e,
+                    );
                 }
-                OpenError::PathError(PathError::MissingComponent)
-                    if flags.contains(OFlags::CREAT) =>
-                {
-                    // We must check if the lower layer contains all the directories; if it does, we
-                    // can create the same directories and then re-trigger the open.
-                    let dirname = path.rsplit_once('/').unwrap().0;
-                    if let Ok(FileType::Directory) = self.ensure_lower_contains(dirname) {
-                        // We must migrate the directories above, and then re-trigger the open
-                        self.mkdir_migrating_ancestor_dirs(&path).unwrap();
-                        return self.open(path, flags, mode);
+                match &e {
+                    OpenError::AccessNotAllowed
+                    | OpenError::Io
+                    | OpenError::Interrupted
+                    | OpenError::NoWritePerms
+                    | OpenError::ReadOnlyFileSystem
+                    | OpenError::AlreadyExists
+                    | OpenError::ClosedFd
+                    | OpenError::NotADirectory
+                    | OpenError::TruncateError(
+                        TruncateError::IsDirectory
+                        | TruncateError::NotForWriting
+                        | TruncateError::IsTerminalDevice
+                        | TruncateError::ClosedFd
+                        | TruncateError::Io,
+                    )
+                    | OpenError::PathError(
+                        PathError::ComponentNotADirectory
+                        | PathError::InvalidPathname
+                        | PathError::NoSearchPerms { .. },
+                    ) => {
+                        // None of these can be handled by lower level, just quit out early
+                        return Err(e);
                     }
-                    // Otherwise, handle-able by a lower level, fallthrough
+                    OpenError::PathError(PathError::MissingComponent)
+                        if flags.contains(OFlags::CREAT) =>
+                    {
+                        // We must check if the lower layer contains all the directories; if it does, we
+                        // can create the same directories and then re-trigger the open.
+                        let dirname = path.rsplit_once('/').unwrap().0;
+                        if let Ok(FileType::Directory) = self.ensure_lower_contains(dirname) {
+                            // We must migrate the directories above, and then re-trigger the open
+                            self.mkdir_migrating_ancestor_dirs(&path).unwrap();
+                            return self.open(path, flags, mode);
+                        }
+                        // Otherwise, handle-able by a lower level, fallthrough
+                    }
+                    OpenError::PathError(
+                        PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                    ) => {
+                        // Handle-able by a lower level, fallthrough
+                    }
                 }
-                OpenError::PathError(
-                    PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
-                ) => {
-                    // Handle-able by a lower level, fallthrough
-                }
-            },
+            }
         }
         // We must check the lower level, creating an entry if needed
         let original_flags = flags;
         let mut flags = flags;
-        // Prevent creation or truncation of files at lower level
-        flags.remove(OFlags::CREAT);
-        flags.remove(OFlags::TRUNC);
         match self.layering_semantics {
             LayeringSemantics::LowerLayerReadOnly => {
+                // Prevent creation or truncation of files at lower level
+                flags.remove(OFlags::CREAT);
+                flags.remove(OFlags::TRUNC);
                 // Switch the lower level to read-only; the other calls will take care of
                 // copying into the upper level if/when necessary.
                 flags.remove(OFlags::RDWR);
@@ -603,23 +964,88 @@ impl<
                 flags.insert(OFlags::RDONLY);
             }
             LayeringSemantics::LowerLayerWritableFiles => {
-                // Do nothing more to the flags, because we might be writing things to lower level.
-                // We just make sure that there is no creation happening, that's all :)
-                assert!(!flags.contains(OFlags::CREAT));
-                assert!(!flags.contains(OFlags::TRUNC));
+                // Preserve O_CREAT so the lower layer can create new files.
+                // O_TRUNC is also preserved — the lower layer handles it directly.
             }
         }
         // Any errors from lower level now _must_ propagate up, so we can just invoke
         // the lower level and set up the relevant descriptor upon success.
-        let entry = Arc::new(EntryX::Lower {
-            fd: self.lower.open(path.as_str(), flags, mode)?,
-        });
-        let old = self
-            .root
-            .write()
-            .entries
-            .insert(path.clone(), Arc::clone(&entry));
-        assert!(old.is_none());
+        #[cfg(feature = "trace_fs")]
+        if matches!(
+            self.layering_semantics,
+            LayeringSemantics::LowerLayerWritableFiles
+        ) {
+            log_println!(
+                self.litebox.x.platform,
+                "[LAYERED-TRACE] trying lower.open path={:?} flags={:?}",
+                path,
+                flags,
+            );
+        }
+        let lower_fd = match self.lower.open(path.as_str(), flags, mode) {
+            Ok(fd) => fd,
+            Err(e) => {
+                #[cfg(feature = "trace_fs")]
+                if matches!(
+                    self.layering_semantics,
+                    LayeringSemantics::LowerLayerWritableFiles
+                ) {
+                    log_println!(
+                        self.litebox.x.platform,
+                        "[LAYERED-TRACE] lower.open FAILED path={:?} flags={:?} err={:?}",
+                        path,
+                        flags,
+                        e,
+                    );
+                }
+                return Err(e);
+            }
+        };
+        let Ok(shareable) = self.lower_fd_is_shareable(&lower_fd) else {
+            let _ = self.lower.close(&lower_fd);
+            return Err(OpenError::Io);
+        };
+        let entry = if shareable {
+            // Insert into root entries, handling the race where another thread may have
+            // already inserted an entry for the same path between our earlier read-lock
+            // check and this write-lock acquisition.
+            let mut root = self.root.write();
+            if let Some(existing) = root.entries.get(&path) {
+                match existing.as_ref() {
+                    EntryX::Lower { fd } => {
+                        let Ok(existing_shareable) = self.lower_fd_is_shareable(fd) else {
+                            drop(root);
+                            let _ = self.lower.close(&lower_fd);
+                            return Err(OpenError::Io);
+                        };
+                        if existing_shareable {
+                            // Another thread won the race — reuse its entry and close ours.
+                            let shared = Arc::clone(existing);
+                            drop(root);
+                            let _ = self.lower.close(&lower_fd);
+                            shared
+                        } else {
+                            drop(root);
+                            let _ = self.lower.close(&lower_fd);
+                            return Err(PathError::NoSuchFileOrDirectory.into());
+                        }
+                    }
+                    EntryX::Upper { .. } | EntryX::Tombstone => {
+                        // Tombstone or Upper inserted concurrently — shouldn't happen in
+                        // normal operation, but close the FD we opened and bail out.
+                        drop(root);
+                        let _ = self.lower.close(&lower_fd);
+                        return Err(PathError::NoSuchFileOrDirectory.into());
+                    }
+                }
+            } else {
+                let entry = Arc::new(EntryX::Lower { fd: lower_fd });
+                root.entries.insert(path.clone(), Arc::clone(&entry));
+                entry
+            }
+        } else {
+            Arc::new(EntryX::Lower { fd: lower_fd })
+        };
         let fd = self.litebox.descriptor_table_mut().insert(Descriptor {
             path,
             flags: original_flags,
@@ -689,8 +1115,19 @@ impl<
                 self.upper.close(&fd)
             }
             EntryX::Lower { .. } => {
-                // Lower level FDs almost always have a corresponding entry in the root. Thus, we
-                // might need to possibly clean things up from the root.
+                // Lower-level descriptors without a root entry are either standalone
+                // (e.g., character devices) or had their cache evicted (e.g., by rename).
+                // Close the fd if we are the sole remaining holder; otherwise another
+                // descriptor will handle it.
+                if !root_entries.contains_key(&path) {
+                    match Arc::into_inner(entry) {
+                        Some(EntryX::Lower { fd }) => return self.lower.close(&fd),
+                        Some(_) => unreachable!(),
+                        None => return Ok(()),
+                    }
+                }
+                // Shared lower-level FDs have a corresponding entry in the root. Thus, we might
+                // need to possibly clean things up from the root.
                 //
                 // First, we can attempt a fast-path clean-up by quickly check if there are other
                 // FDs referring to the same file
@@ -724,10 +1161,18 @@ impl<
                         }
                     }
                 }
-                // Pull out the root entry, and perform a quick sanity check, and drop it out
-                // entirely, which should lead us to become the sole owner.
+                // Pull out the root entry. If it is a different Arc (e.g., the
+                // cache was evicted by rename and a new open re-populated it),
+                // put it back and treat this fd as evicted.
                 let root_entry = root_entries.remove(&path).unwrap();
-                assert!(Arc::ptr_eq(&entry, &root_entry));
+                if !Arc::ptr_eq(&entry, &root_entry) {
+                    root_entries.insert(path, root_entry);
+                    match Arc::into_inner(entry) {
+                        Some(EntryX::Lower { fd }) => return self.lower.close(&fd),
+                        Some(_) => unreachable!(),
+                        None => return Ok(()),
+                    }
+                }
                 assert!(matches!(*root_entry, EntryX::Lower { .. }));
                 drop(root_entry);
                 // We are now assured that we can close out the underlying file; we are the only
@@ -755,9 +1200,10 @@ impl<
             .litebox
             .descriptor_table()
             .with_entry(fd, |descriptor| {
-                if !descriptor.entry.flags.contains(OFlags::RDONLY)
-                    && !descriptor.entry.flags.contains(OFlags::RDWR)
-                {
+                // O_RDONLY is 0, so `contains(RDONLY)` is always true.
+                // Check the access-mode bits explicitly: deny if WRONLY.
+                let access = descriptor.entry.flags & (OFlags::WRONLY | OFlags::RDWR);
+                if access == OFlags::WRONLY {
                     Err(ReadError::NotForReading)
                 } else {
                     Ok(Arc::clone(&descriptor.entry.entry))
@@ -767,17 +1213,31 @@ impl<
             .flatten()?;
         // Perform the actual operation
         let num_bytes = match entry.as_ref() {
-            EntryX::Upper { fd } => self.upper.read(fd, buf, offset)?,
-            EntryX::Lower { fd } => self.lower.read(fd, buf, offset)?,
+            EntryX::Upper { fd: upper_fd } => self.upper.read(upper_fd, buf, offset)?,
+            EntryX::Lower { fd: lower_fd } => {
+                // Lower-layer file descriptors are shared across all opens of the same
+                // path (see the `EntryX::Lower` fast-path in `open`). We must always
+                // provide an explicit offset to the lower layer so concurrent readers
+                // don't corrupt each other's positions.
+                let lower_offset = offset.unwrap_or_else(|| {
+                    self.litebox
+                        .descriptor_table()
+                        .get_entry(fd)
+                        .map_or(0, |e| e.entry.position.load(SeqCst))
+                });
+                self.lower.read(lower_fd, buf, Some(lower_offset))?
+            }
             EntryX::Tombstone => unreachable!(),
         };
-        self.litebox
-            .descriptor_table()
-            .get_entry(fd)
-            .ok_or(ReadError::ClosedFd)?
-            .entry
-            .position
-            .fetch_add(num_bytes, SeqCst);
+        if offset.is_none() {
+            self.litebox
+                .descriptor_table()
+                .get_entry(fd)
+                .ok_or(ReadError::ClosedFd)?
+                .entry
+                .position
+                .fetch_add(num_bytes, SeqCst);
+        }
         Ok(num_bytes)
     }
 
@@ -794,9 +1254,10 @@ impl<
             .litebox
             .descriptor_table()
             .with_entry(fd, |descriptor| {
-                if !descriptor.entry.flags.contains(OFlags::WRONLY)
-                    && !descriptor.entry.flags.contains(OFlags::RDWR)
-                {
+                // O_RDONLY is 0, so `contains(RDONLY)` would always be true.
+                // Check the access-mode bits explicitly: deny if RDONLY.
+                let access = descriptor.entry.flags & (OFlags::WRONLY | OFlags::RDWR);
+                if access.is_empty() {
                     Err(WriteError::NotForWriting)
                 } else {
                     Ok((
@@ -810,13 +1271,15 @@ impl<
         match entry.as_ref() {
             EntryX::Upper { fd: upper_fd } => {
                 let num_bytes = self.upper.write(upper_fd, buf, offset)?;
-                self.litebox
-                    .descriptor_table()
-                    .get_entry(fd)
-                    .unwrap()
-                    .entry
-                    .position
-                    .fetch_add(num_bytes, SeqCst);
+                if offset.is_none() {
+                    self.litebox
+                        .descriptor_table()
+                        .get_entry(fd)
+                        .unwrap()
+                        .entry
+                        .position
+                        .fetch_add(num_bytes, SeqCst);
+                }
                 return Ok(num_bytes);
             }
             EntryX::Lower { fd: lower_fd } => {
@@ -827,7 +1290,9 @@ impl<
                     LayeringSemantics::LowerLayerWritableFiles => {
                         // Allow direct write to lower layer
                         let num_bytes = self.lower.write(lower_fd, buf, offset)?;
-                        if let Some(e) = self.litebox.descriptor_table().get_entry(fd) {
+                        if offset.is_none()
+                            && let Some(e) = self.litebox.descriptor_table().get_entry(fd)
+                        {
                             e.entry.position.fetch_add(num_bytes, SeqCst);
                         }
                         return Ok(num_bytes);
@@ -874,8 +1339,32 @@ impl<
             .ok_or(SeekError::ClosedFd)?;
         // Perform the seek, and update the position info
         let position = match entry.as_ref() {
-            EntryX::Upper { fd } => self.upper.seek(fd, offset, whence)?,
-            EntryX::Lower { fd } => self.lower.seek(fd, offset, whence)?,
+            EntryX::Upper { fd: upper_fd } => self.upper.seek(upper_fd, offset, whence)?,
+            EntryX::Lower { fd: lower_fd } => {
+                // For lower-layer files the underlying fd is shared across all opens
+                // of the same path. Translate SEEK_CUR into SEEK_SET using our own
+                // tracked position so concurrent seekers don't interfere.
+                match whence {
+                    SeekWhence::RelativeToCurrentOffset => {
+                        let cur = self
+                            .litebox
+                            .descriptor_table()
+                            .get_entry(fd)
+                            .map_or(0, |e| e.entry.position.load(SeqCst));
+                        let effective_offset = isize::try_from(cur)
+                            .ok()
+                            .and_then(|c| c.checked_add(offset));
+                        match effective_offset {
+                            Some(o) => {
+                                self.lower
+                                    .seek(lower_fd, o, SeekWhence::RelativeToBeginning)?
+                            }
+                            None => return Err(SeekError::InvalidOffset),
+                        }
+                    }
+                    _ => self.lower.seek(lower_fd, offset, whence)?,
+                }
+            }
             EntryX::Tombstone => unreachable!(),
         };
         if let Some(e) = self.litebox.descriptor_table().get_entry(fd) {
@@ -927,10 +1416,10 @@ impl<
                                             descriptor.entry.path.clone()
                                         })
                                         .ok_or(TruncateError::ClosedFd)?;
-                                    self.migrate_file_up(&path, false)
-                                        .expect("this migration should always succeed");
-
-                                    Ok(())
+                                    match self.migrate_file_up(&path, false) {
+                                        Ok(()) => Ok(()),
+                                        Err(MigrationError::Io | _) => Err(TruncateError::Io),
+                                    }
                                 }
                                 Err(TruncateError::Io) => Err(TruncateError::Io),
                             }
@@ -964,17 +1453,32 @@ impl<
                 ChmodError::PathError(
                     PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
                 ) => {
-                    // fallthrough
+                    // fallthrough to lower
                 }
             },
         }
+        // A tombstoned path is visibly absent in the layered namespace even
+        // though the hidden lower entry still physically exists.
+        if self
+            .root
+            .read()
+            .entries
+            .get(&*path)
+            .is_some_and(|e| matches!(e.as_ref(), EntryX::Tombstone))
+        {
+            return Err(ChmodError::PathError(PathError::NoSuchFileOrDirectory));
+        }
         match self.ensure_lower_contains(&path) {
             Ok(_) => {}
-            Err(FileStatusError::Io) => return Err(ChmodError::Io),
+            Err(FileStatusError::Io | FileStatusError::SymlinkLoop) => return Err(ChmodError::Io),
             Err(FileStatusError::PathError(e)) => return Err(ChmodError::PathError(e)),
-            Err(FileStatusError::ClosedFd) => unreachable!(),
-            Err(FileStatusError::NotADirectory) => unimplemented!(),
-            Err(FileStatusError::SymlinkLoop) => unimplemented!(),
+            Err(FileStatusError::ClosedFd | FileStatusError::NotADirectory) => unreachable!(),
+        }
+        if matches!(
+            self.layering_semantics,
+            LayeringSemantics::LowerLayerWritableFiles
+        ) {
+            return self.lower.chmod(path.as_str(), mode);
         }
         match self.migrate_file_up(&path, true) {
             Ok(()) => {}
@@ -1011,17 +1515,32 @@ impl<
                 ChownError::PathError(
                     PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
                 ) => {
-                    // fallthrough
+                    // fallthrough to lower
                 }
             },
         }
+        // A tombstoned path is visibly absent in the layered namespace even
+        // though the hidden lower entry still physically exists.
+        if self
+            .root
+            .read()
+            .entries
+            .get(&*path)
+            .is_some_and(|e| matches!(e.as_ref(), EntryX::Tombstone))
+        {
+            return Err(ChownError::PathError(PathError::NoSuchFileOrDirectory));
+        }
         match self.ensure_lower_contains(&path) {
             Ok(_) => {}
-            Err(FileStatusError::Io) => return Err(ChownError::Io),
+            Err(FileStatusError::Io | FileStatusError::SymlinkLoop) => return Err(ChownError::Io),
             Err(FileStatusError::PathError(e)) => return Err(ChownError::PathError(e)),
-            Err(FileStatusError::ClosedFd) => unreachable!(),
-            Err(FileStatusError::NotADirectory) => unimplemented!(),
-            Err(FileStatusError::SymlinkLoop) => unimplemented!(),
+            Err(FileStatusError::ClosedFd | FileStatusError::NotADirectory) => unreachable!(),
+        }
+        if matches!(
+            self.layering_semantics,
+            LayeringSemantics::LowerLayerWritableFiles
+        ) {
+            return self.lower.chown(path.as_str(), user, group);
         }
         match self.migrate_file_up(&path, true) {
             Ok(()) => {}
@@ -1071,16 +1590,17 @@ impl<
                     match self.ensure_lower_contains(&path).map_err(|e| match e {
                         FileStatusError::Io | FileStatusError::SymlinkLoop => UnlinkError::Io,
                         FileStatusError::PathError(p) => UnlinkError::PathError(p),
-                        FileStatusError::ClosedFd => unreachable!(),
-                        FileStatusError::NotADirectory => UnlinkError::NotADirectory,
+                        FileStatusError::ClosedFd | FileStatusError::NotADirectory => {
+                            unreachable!()
+                        }
                     })? {
-                        FileType::RegularFile => {
+                        FileType::RegularFile | FileType::Symlink => {
                             // fallthrough
                         }
                         FileType::Directory => {
                             return Err(UnlinkError::IsADirectory);
                         }
-                        FileType::CharacterDevice | FileType::Symlink => unimplemented!(),
+                        FileType::CharacterDevice => unimplemented!(),
                     }
                 }
             },
@@ -1094,8 +1614,223 @@ impl<
         Ok(())
     }
 
+    fn rename(
+        &self,
+        old_path: impl crate::path::Arg,
+        new_path: impl crate::path::Arg,
+    ) -> Result<(), RenameError> {
+        let old = self.absolute_path(old_path)?;
+        let new = self.absolute_path(new_path)?;
+
+        if old == new {
+            return Ok(());
+        }
+
+        // Block rename if the source is tombstoned (deleted from view).
+        // Also check if the destination is tombstoned — a tombstoned path
+        // is visibly absent in the layered namespace even though the lower
+        // entry still physically exists. This affects cross-layer EXDEV
+        // decisions: a tombstoned lower destination is not a live cross-
+        // layer target.
+        let new_is_tombstoned;
+        {
+            let root = self.root.read();
+            if let Some(entry) = root.entries.get(&old)
+                && matches!(entry.as_ref(), EntryX::Tombstone)
+            {
+                return Err(RenameError::PathError(PathError::NoSuchFileOrDirectory));
+            }
+            new_is_tombstoned = root
+                .entries
+                .get(&new)
+                .is_some_and(|e| matches!(e.as_ref(), EntryX::Tombstone));
+        }
+
+        // When LowerLayerWritableFiles, try the lower layer first so renames
+        // of host-persisted files stay on the lower layer.
+        if matches!(
+            self.layering_semantics,
+            LayeringSemantics::LowerLayerWritableFiles
+        ) {
+            // Check upper status for both paths, propagating hard ancestor
+            // errors (ComponentNotADirectory, NoSearchPerms, etc.) that
+            // visible lookup would also reject.
+            let old_on_upper = match self.upper.file_status(&*old) {
+                Ok(_) => true,
+                Err(FileStatusError::PathError(
+                    PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                )) => false,
+                Err(FileStatusError::PathError(p)) => return Err(RenameError::PathError(p)),
+                Err(_) => return Err(RenameError::Io),
+            };
+            let new_on_upper = match self.upper.file_status(&*new) {
+                Ok(_) => true,
+                Err(FileStatusError::PathError(
+                    PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                )) => false,
+                Err(FileStatusError::PathError(p)) => return Err(RenameError::PathError(p)),
+                Err(_) => return Err(RenameError::Io),
+            };
+
+            if !old_on_upper {
+                // Source is not on upper — must be on lower.
+                // Verify source exists on lower, propagating hard errors.
+                match self.lower.file_status(&*old) {
+                    Ok(_) => {}
+                    Err(FileStatusError::PathError(
+                        PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                    )) => {
+                        // Source not on lower either — upper.rename will
+                        // produce the appropriate ENOENT.
+                        return self.upper.rename(old.as_str(), new.as_str());
+                    }
+                    Err(FileStatusError::PathError(p)) => return Err(RenameError::PathError(p)),
+                    Err(_) => return Err(RenameError::Io),
+                }
+
+                if new_on_upper {
+                    // Cross-layer rename: source on lower, destination on
+                    // upper. Return EXDEV so callers fall back to
+                    // copy + delete (which every POSIX program already
+                    // handles for cross-mount renames).
+                    //
+                    // Why not attempt the rename directly?
+                    //
+                    // The lower backend (in-mem or 9P) can destroy a hidden
+                    // lower destination as part of rename, and there is no
+                    // way to atomically clean up the upper shadow in the
+                    // same operation. Any multi-step approach (park upper
+                    // dest, lower rename, cleanup parked entry) has failure
+                    // modes where rollback cannot fully restore hidden
+                    // state. See docs/litebox/design/layered-rename-codex.md
+                    // for a detailed analysis.
+                    //
+                    // TODO: Implement OverrideEntry::RedirectLower in the
+                    // layered namespace so cross-layer rename can be
+                    // expressed as a metadata transaction without immediate
+                    // lower mutation. Until then, EXDEV is the safe choice.
+                    return Err(RenameError::CrossDevice);
+                }
+
+                // No upper shadow on destination — pure lower rename.
+                // If the destination is tombstoned, the lower backend still
+                // has the hidden entry. Park it at a temp path so
+                // lower.rename doesn't validate type/emptiness against an
+                // invisible entry. If the rename fails, restore the hidden
+                // entry from temp so no hidden state is lost.
+                let tombstone_saved = if new_is_tombstoned && self.lower.file_status(&*new).is_ok()
+                {
+                    static TOMB_COUNTER: AtomicUsize = AtomicUsize::new(0);
+                    let parent_dir = {
+                        let p = new.rsplit_once('/').map_or("/", |(p, _)| p);
+                        if p.is_empty() { "/" } else { p }
+                    };
+                    let tmp = loop {
+                        let n = TOMB_COUNTER.fetch_add(1, SeqCst);
+                        let c = alloc::format!("{parent_dir}/.litebox_ts_{n:x}");
+                        if self.lower.file_status(&c).is_err() {
+                            break c;
+                        }
+                    };
+                    self.lower.rename(new.as_str(), &tmp).ok().map(|()| tmp)
+                } else {
+                    None
+                };
+
+                match self.lower.rename(old.as_str(), new.as_str()) {
+                    Ok(()) => {
+                        // Clean up the saved hidden entry (best-effort).
+                        if let Some(ref ts) = tombstone_saved
+                            && self.lower.unlink(ts.as_str()).is_err()
+                        {
+                            let _ = self.lower.rmdir(ts.as_str());
+                        }
+                        let mut root = self.root.write();
+                        Self::invalidate_cache_tree(&mut root, &old);
+                        Self::invalidate_cache_tree(&mut root, &new);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        // Restore the hidden lower entry on failure.
+                        if let Some(ref ts) = tombstone_saved {
+                            let _ = self.lower.rename(ts.as_str(), new.as_str());
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            // old_on_upper: visible source is on upper.
+            // Check if destination exists only on lower — that's also
+            // cross-layer and needs EXDEV for the same reasons. But skip
+            // the check if the destination is tombstoned (visibly absent).
+            if !new_on_upper && !new_is_tombstoned {
+                let new_on_lower = match self.lower.file_status(&*new) {
+                    Ok(_) => true,
+                    Err(FileStatusError::PathError(
+                        PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                    )) => false,
+                    Err(FileStatusError::PathError(p)) => return Err(RenameError::PathError(p)),
+                    Err(_) => return Err(RenameError::Io),
+                };
+                if new_on_lower {
+                    // Cross-layer rename: source on upper, destination on
+                    // lower. The upper rename can't see or validate the
+                    // visible lower destination (type compatibility,
+                    // emptiness), and would leave stale lower cache entries.
+                    // Same rationale as the lower→upper EXDEV above.
+                    return Err(RenameError::CrossDevice);
+                }
+            }
+            // Both on upper (or new doesn't exist anywhere) — safe to
+            // delegate to upper.rename().
+        }
+
+        self.upper.rename(old.as_str(), new.as_str())?;
+        // Clear any tombstone or stale cache at the destination so the
+        // renamed entry is visible through layered lookup.
+        let mut root = self.root.write();
+        Self::invalidate_cache_tree(&mut root, &old);
+        Self::invalidate_cache_tree(&mut root, &new);
+        Ok(())
+    }
+
     fn mkdir(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), MkdirError> {
         let path = self.absolute_path(path)?;
+        if self.has_tombstoned_ancestor(&path)? {
+            return Err(PathError::NoSuchFileOrDirectory)?;
+        }
+        // When LowerLayerWritableFiles, try lower layer first so directories
+        // persist on the host. Fall back to upper if lower can't create.
+        // But first, check upper for conflicts: if the path already exists,
+        // reject with AlreadyExists; if an ancestor is invalid (non-dir,
+        // no search perms), propagate that error instead of creating on lower.
+        if matches!(
+            self.layering_semantics,
+            LayeringSemantics::LowerLayerWritableFiles
+        ) {
+            match self.upper.file_status(path.as_str()) {
+                Ok(_) => return Err(MkdirError::AlreadyExists),
+                Err(FileStatusError::PathError(
+                    PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                )) => {}
+                Err(FileStatusError::PathError(p)) => return Err(MkdirError::PathError(p)),
+                Err(_) => return Err(MkdirError::Io),
+            }
+            match self.lower.mkdir(path.as_str(), mode) {
+                Ok(()) => return Ok(()),
+                Err(
+                    MkdirError::PathError(
+                        PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                    )
+                    | MkdirError::ReadOnlyFileSystem
+                    | MkdirError::Io,
+                ) => {
+                    // Parent doesn't exist on lower, or lower had a
+                    // transport error — fall through to upper.
+                }
+                Err(e) => return Err(e),
+            }
+        }
         match self.upper.mkdir(path.as_str(), mode) {
             Ok(()) => {
                 // If we could successfully make the directory, we know that things are "sane" at
@@ -1108,7 +1843,6 @@ impl<
             }
             Err(e) => match e {
                 MkdirError::NoWritePerms
-                | MkdirError::Io
                 | MkdirError::AlreadyExists
                 | MkdirError::ReadOnlyFileSystem
                 | MkdirError::PathError(
@@ -1121,8 +1855,11 @@ impl<
                 MkdirError::PathError(PathError::NoSuchFileOrDirectory) => {
                     unreachable!()
                 }
-                MkdirError::PathError(PathError::MissingComponent) => {
-                    // fallthrough
+                MkdirError::PathError(PathError::MissingComponent) | MkdirError::Io => {
+                    // MissingComponent: ancestor only exists on lower,
+                    // needs migration. Io: nested layered FS couldn't
+                    // resolve the path. Both cases fall through to
+                    // ancestor migration.
                 }
             },
         }
@@ -1160,9 +1897,9 @@ impl<
                 }
                 OpenError::NoWritePerms
                 | OpenError::AlreadyExists
-                | OpenError::Interrupted
                 | OpenError::ClosedFd
                 | OpenError::NotADirectory
+                | OpenError::Interrupted
                 | OpenError::TruncateError(_) => {
                     unreachable!()
                 }
@@ -1173,7 +1910,7 @@ impl<
             Err(ReadDirError::ClosedFd | ReadDirError::NotADirectory) => unreachable!(),
             Err(ReadDirError::Io) => return Err(RmdirError::Io),
         };
-        self.close(&dir_fd).expect("close dir fd failed");
+        self.close(&dir_fd).map_err(|_| RmdirError::Io)?;
         // "." and ".." are always present; anything more => not empty.
         if entries.len() > 2 {
             return Err(RmdirError::NotEmpty);
@@ -1212,18 +1949,12 @@ impl<
                     RmdirError::PathError(
                         PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
                     ) => {
-                        // fallthrough
+                        // Dir doesn't exist on lower — fine, it only existed on upper.
                     }
-                    RmdirError::NotEmpty
-                    | RmdirError::NotADirectory
-                    | RmdirError::ReadOnlyFileSystem
-                    | RmdirError::PathError(
-                        PathError::ComponentNotADirectory | PathError::InvalidPathname,
-                    ) => unreachable!(),
-                    RmdirError::Busy
-                    | RmdirError::NoWritePerms
-                    | RmdirError::Io
-                    | RmdirError::PathError(PathError::NoSearchPerms { .. }) => return Err(e),
+                    // The lower rmdir can legitimately fail: the directory
+                    // may not be empty on lower (lower-only children), or
+                    // the lower path may not be a directory.
+                    _ => return Err(e),
                 }
             }
         }
@@ -1257,10 +1988,25 @@ impl<
                         let upper_names: HashSet<String> =
                             upper_entries.iter().map(|e| e.name.clone()).collect();
 
+                        let root = self.root.read();
                         for lower_entry in lower_entries {
-                            if !upper_names.contains(&lower_entry.name) {
-                                upper_entries.push(lower_entry);
+                            if upper_names.contains(&lower_entry.name) {
+                                continue;
                             }
+                            // Skip tombstoned entries — they are visibly deleted.
+                            let child_path = if path == "/" {
+                                alloc::format!("/{}", lower_entry.name)
+                            } else {
+                                alloc::format!("{}/{}", path, lower_entry.name)
+                            };
+                            if root
+                                .entries
+                                .get(&child_path)
+                                .is_some_and(|e| matches!(e.as_ref(), EntryX::Tombstone))
+                            {
+                                continue;
+                            }
+                            upper_entries.push(lower_entry);
                         }
                     }
                     let _ = self.lower.close(&lower_fd);
@@ -1269,8 +2015,21 @@ impl<
                 upper_entries
             }
             EntryX::Lower { fd } => {
-                // This is the easy case, nothing to deal with upper entries.
-                self.lower.read_dir(fd)?
+                // Lower-only directory: still need to filter tombstoned children.
+                let mut lower_entries = self.lower.read_dir(fd)?;
+                let root = self.root.read();
+                lower_entries.retain(|e| {
+                    let child_path = if path == "/" {
+                        alloc::format!("/{}", e.name)
+                    } else {
+                        alloc::format!("{}/{}", path, e.name)
+                    };
+                    !root
+                        .entries
+                        .get(&child_path)
+                        .is_some_and(|e| matches!(e.as_ref(), EntryX::Tombstone))
+                });
+                lower_entries
             }
             EntryX::Tombstone => unreachable!(),
         };
@@ -1288,6 +2047,9 @@ impl<
         // essentially to ask the compiler to remind us we need to update this when we support
         // inodes and such.
         let path = self.absolute_path(path)?;
+        if self.is_hidden_by_tombstone(&path)? {
+            return Err(PathError::NoSuchFileOrDirectory)?;
+        }
         if let Some(entry) = self.root.read().entries.get(&path) {
             let FileStatus {
                 file_type,
@@ -1340,15 +2102,13 @@ impl<
                     // None of these can be handled by lower level, just quit out early
                     return Err(e);
                 }
-                FileStatusError::Io
-                | FileStatusError::NotADirectory
-                | FileStatusError::SymlinkLoop => return Err(e),
+                FileStatusError::Io | FileStatusError::SymlinkLoop => return Err(e),
                 FileStatusError::PathError(
                     PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
                 ) => {
                     // Handle-able by a lower level, fallthrough
                 }
-                FileStatusError::ClosedFd => unreachable!(),
+                FileStatusError::ClosedFd | FileStatusError::NotADirectory => unreachable!(),
             },
         }
         let FileStatus {
@@ -1416,6 +2176,287 @@ impl<
             EntryX::Tombstone => unreachable!(),
         }
     }
+
+    fn is_writable(&self, fd: &FileFd<Platform, Upper, Lower>) -> bool {
+        self.litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| {
+                descriptor
+                    .entry
+                    .flags
+                    .intersects(OFlags::WRONLY | OFlags::RDWR)
+            })
+            .unwrap_or(false)
+    }
+
+    fn set_open_status_flags(
+        &self,
+        fd: &FileFd<Platform, Upper, Lower>,
+        flags: OFlags,
+    ) -> Result<(), MetadataError> {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry))
+            .ok_or(MetadataError::ClosedFd)?;
+        match entry.as_ref() {
+            EntryX::Upper { fd } => self.upper.set_open_status_flags(fd, flags),
+            EntryX::Lower { fd } => self.lower.set_open_status_flags(fd, flags),
+            EntryX::Tombstone => unreachable!(),
+        }
+    }
+
+    fn get_io_pollable(
+        &self,
+        fd: &FileFd<Platform, Upper, Lower>,
+    ) -> Option<alloc::boxed::Box<dyn crate::event::IOPollable>> {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry))?;
+        match entry.as_ref() {
+            EntryX::Upper { fd } => self.upper.get_io_pollable(fd),
+            EntryX::Lower { fd } => self.lower.get_io_pollable(fd),
+            EntryX::Tombstone => None,
+        }
+    }
+
+    fn get_pty_termios(
+        &self,
+        fd: &FileFd<Platform, Upper, Lower>,
+    ) -> Option<super::devices::PtyTermios> {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry))?;
+        match entry.as_ref() {
+            EntryX::Upper { fd } => self.upper.get_pty_termios(fd),
+            EntryX::Lower { fd } => self.lower.get_pty_termios(fd),
+            EntryX::Tombstone => None,
+        }
+    }
+
+    fn set_pty_termios(
+        &self,
+        fd: &FileFd<Platform, Upper, Lower>,
+        termios: super::devices::PtyTermios,
+    ) -> bool {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry));
+        match entry.as_deref() {
+            Some(EntryX::Upper { fd }) => self.upper.set_pty_termios(fd, termios),
+            Some(EntryX::Lower { fd }) => self.lower.set_pty_termios(fd, termios),
+            _ => false,
+        }
+    }
+
+    fn get_pty_foreground_pgrp(&self, fd: &FileFd<Platform, Upper, Lower>) -> Option<i32> {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry))?;
+        match entry.as_ref() {
+            EntryX::Upper { fd } => self.upper.get_pty_foreground_pgrp(fd),
+            EntryX::Lower { fd } => self.lower.get_pty_foreground_pgrp(fd),
+            EntryX::Tombstone => None,
+        }
+    }
+
+    fn set_pty_foreground_pgrp(&self, fd: &FileFd<Platform, Upper, Lower>, pgrp: i32) -> bool {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry));
+        match entry.as_deref() {
+            Some(EntryX::Upper { fd }) => self.upper.set_pty_foreground_pgrp(fd, pgrp),
+            Some(EntryX::Lower { fd }) => self.lower.set_pty_foreground_pgrp(fd, pgrp),
+            _ => false,
+        }
+    }
+
+    fn read_link(
+        &self,
+        path: impl crate::path::Arg,
+    ) -> Result<alloc::string::String, super::errors::ReadLinkError> {
+        let path = self
+            .absolute_path(path)
+            .map_err(|_| super::errors::ReadLinkError::Io)?;
+        if self
+            .is_hidden_by_tombstone(&path)
+            .map_err(super::errors::ReadLinkError::PathError)?
+        {
+            return Err(super::errors::ReadLinkError::PathError(
+                super::errors::PathError::NoSuchFileOrDirectory,
+            ));
+        }
+
+        match self.upper.file_status(&*path) {
+            Ok(_) => {
+                return match self.upper.read_link(&*path) {
+                    Ok(target) => Ok(target),
+                    Err(super::errors::ReadLinkError::NotSupported) => {
+                        Err(super::errors::ReadLinkError::NotASymlink)
+                    }
+                    Err(e) => Err(e),
+                };
+            }
+            Err(super::errors::FileStatusError::PathError(
+                super::errors::PathError::NoSuchFileOrDirectory
+                | super::errors::PathError::MissingComponent,
+            )) => {
+                // fall through to lower
+            }
+            Err(super::errors::FileStatusError::PathError(e)) => {
+                return Err(super::errors::ReadLinkError::PathError(e));
+            }
+            Err(
+                super::errors::FileStatusError::Io | super::errors::FileStatusError::SymlinkLoop,
+            ) => {
+                return Err(super::errors::ReadLinkError::Io);
+            }
+            Err(
+                super::errors::FileStatusError::ClosedFd
+                | super::errors::FileStatusError::NotADirectory,
+            ) => {
+                unreachable!()
+            }
+        }
+
+        self.lower.read_link(path)
+    }
+
+    fn open_at(
+        &self,
+        dirfd: &FileFd<Platform, Upper, Lower>,
+        rel_path: impl crate::path::Arg,
+        flags: super::OFlags,
+        mode: super::Mode,
+    ) -> Result<FileFd<Platform, Upper, Lower>, OpenError> {
+        let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
+            super::DirFdError::ClosedFd => OpenError::ClosedFd,
+            super::DirFdError::NotADirectory => OpenError::NotADirectory,
+            super::DirFdError::Io => OpenError::Io,
+        })?;
+        let rel = rel_path
+            .as_rust_str()
+            .map_err(|e| OpenError::PathError(e.into()))?;
+        let abs = Self::resolve_relative(&dir, rel).map_err(OpenError::PathError)?;
+        self.open(abs, flags, mode)
+    }
+
+    fn stat_at(
+        &self,
+        dirfd: &FileFd<Platform, Upper, Lower>,
+        rel_path: impl crate::path::Arg,
+        follow_symlinks: bool,
+    ) -> Result<super::FileStatus, super::FileStatusError> {
+        let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
+            super::DirFdError::ClosedFd => super::FileStatusError::ClosedFd,
+            super::DirFdError::NotADirectory => super::FileStatusError::NotADirectory,
+            super::DirFdError::Io => super::FileStatusError::Io,
+        })?;
+        let rel = rel_path
+            .as_rust_str()
+            .map_err(|e| super::FileStatusError::PathError(e.into()))?;
+        let abs = Self::resolve_relative(&dir, rel).map_err(super::FileStatusError::PathError)?;
+        // When following symlinks, resolve the full chain (up to 40 hops).
+        // Relative targets are resolved against the symlink's parent
+        // directory, not the process CWD.
+        let resolved = if follow_symlinks {
+            self.resolve_follow_symlinks(abs, 40)?
+        } else {
+            abs
+        };
+        self.file_status(resolved)
+    }
+
+    fn unlink_at(
+        &self,
+        dirfd: &FileFd<Platform, Upper, Lower>,
+        rel_path: impl crate::path::Arg,
+    ) -> Result<(), UnlinkError> {
+        let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
+            super::DirFdError::ClosedFd => UnlinkError::ClosedFd,
+            super::DirFdError::NotADirectory => UnlinkError::NotADirectory,
+            super::DirFdError::Io => UnlinkError::Io,
+        })?;
+        let rel = rel_path
+            .as_rust_str()
+            .map_err(|e| UnlinkError::PathError(e.into()))?;
+        let abs = Self::resolve_relative(&dir, rel).map_err(UnlinkError::PathError)?;
+        self.unlink(abs)
+    }
+
+    fn readlink_at(
+        &self,
+        dirfd: &FileFd<Platform, Upper, Lower>,
+        rel_path: impl crate::path::Arg,
+    ) -> Result<alloc::string::String, super::errors::ReadLinkError> {
+        let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
+            super::DirFdError::ClosedFd => super::errors::ReadLinkError::ClosedFd,
+            super::DirFdError::NotADirectory => super::errors::ReadLinkError::NotADirectory,
+            super::DirFdError::Io => super::errors::ReadLinkError::Io,
+        })?;
+        let rel = rel_path
+            .as_rust_str()
+            .map_err(|e| super::errors::ReadLinkError::PathError(e.into()))?;
+        let abs =
+            Self::resolve_relative(&dir, rel).map_err(super::errors::ReadLinkError::PathError)?;
+        self.read_link(abs)
+    }
+
+    fn rename_at(
+        &self,
+        old_dirfd: &FileFd<Platform, Upper, Lower>,
+        old_rel: impl crate::path::Arg,
+        new_dirfd: &FileFd<Platform, Upper, Lower>,
+        new_rel: impl crate::path::Arg,
+    ) -> Result<(), RenameError> {
+        let old_dir = self.dir_fd_path(old_dirfd).map_err(|e| match e {
+            super::DirFdError::ClosedFd => RenameError::ClosedFd,
+            super::DirFdError::NotADirectory => RenameError::NotADirectory,
+            super::DirFdError::Io => RenameError::Io,
+        })?;
+        let old_r = old_rel
+            .as_rust_str()
+            .map_err(|e| RenameError::PathError(e.into()))?;
+        let old_abs = Self::resolve_relative(&old_dir, old_r).map_err(RenameError::PathError)?;
+        let new_dir = self.dir_fd_path(new_dirfd).map_err(|e| match e {
+            super::DirFdError::ClosedFd => RenameError::ClosedFd,
+            super::DirFdError::NotADirectory => RenameError::NotADirectory,
+            super::DirFdError::Io => RenameError::Io,
+        })?;
+        let new_r = new_rel
+            .as_rust_str()
+            .map_err(|e| RenameError::PathError(e.into()))?;
+        let new_abs = Self::resolve_relative(&new_dir, new_r).map_err(RenameError::PathError)?;
+        self.rename(old_abs, new_abs)
+    }
+
+    fn fd_path(&self, fd: &FileFd<Platform, Upper, Lower>) -> Option<alloc::string::String> {
+        self.descriptor_path(fd)
+    }
+
+    fn mkdir_at(
+        &self,
+        dirfd: &FileFd<Platform, Upper, Lower>,
+        rel_path: impl crate::path::Arg,
+        mode: super::Mode,
+    ) -> Result<(), MkdirError> {
+        let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
+            super::DirFdError::NotADirectory => {
+                MkdirError::PathError(PathError::ComponentNotADirectory)
+            }
+            super::DirFdError::ClosedFd | super::DirFdError::Io => MkdirError::Io,
+        })?;
+        let rel = rel_path
+            .as_rust_str()
+            .map_err(|e| MkdirError::PathError(e.into()))?;
+        let abs = Self::resolve_relative(&dir, rel).map_err(MkdirError::PathError)?;
+        self.mkdir(abs, mode)
+    }
 }
 
 struct Descriptor<Upper: super::FileSystem + 'static, Lower: super::FileSystem + 'static> {
@@ -1429,7 +2470,8 @@ struct RootDir<Upper: super::FileSystem + 'static, Lower: super::FileSystem + 's
     // keys are normalized paths; directories do not have the final `/` (thus the root would be at
     // the empty-string key "")
     //
-    // Invariant: this only stores lower+tombstone entries, no upper entries will show up here.
+    // Invariant: this only stores shareable lower+tombstone entries, no upper entries will show up
+    // here.
     entries: HashMap<String, Entry<Upper, Lower>>,
 }
 
