@@ -18,10 +18,10 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 use crate::utils::id_pool::IdPool;
 
-use super::Error;
 use super::fcall::{self, Fcall, FcallStr, GetattrMask, TaggedFcall};
 use super::pending_table::PendingTable;
 use super::transport::{self, Read, Write};
+use super::Error;
 
 /// Fid generator with thread-safe access
 struct FidGenerator {
@@ -768,7 +768,6 @@ impl<Platform: RawSyncPrimitivesProvider, W: Write> Client<Platform, W> {
     }
 
     /// Rename a file
-    #[allow(dead_code)] // Used in later step (caching layer)
     pub(super) fn rename(
         &self,
         fid: fcall::Fid,
@@ -893,7 +892,6 @@ impl<Platform: RawSyncPrimitivesProvider, W: Write> Client<Platform, W> {
     }
 
     /// Read the target of a symlink identified by `fid`.
-    #[allow(dead_code)] // Used in later step (*_at methods)
     pub(super) fn readlink(&self, fid: fcall::Fid) -> Result<alloc::vec::Vec<u8>, Error> {
         self.fcall(
             Fcall::Treadlink(fcall::Treadlink { fid }),

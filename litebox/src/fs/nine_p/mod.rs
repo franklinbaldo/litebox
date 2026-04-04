@@ -139,6 +139,36 @@ impl From<Error> for MkdirError {
     }
 }
 
+impl From<Error> for super::errors::ReadLinkError {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::InvalidPathname => {
+                super::errors::ReadLinkError::PathError(PathError::InvalidPathname)
+            }
+            Error::Remote(errno) => match errno {
+                ENOENT => super::errors::ReadLinkError::PathError(PathError::NoSuchFileOrDirectory),
+                ENOTDIR => {
+                    super::errors::ReadLinkError::PathError(PathError::ComponentNotADirectory)
+                }
+                ENAMETOOLONG => super::errors::ReadLinkError::PathError(PathError::InvalidPathname),
+                EINVAL => super::errors::ReadLinkError::NotASymlink,
+                EPERM | EACCES => {
+                    super::errors::ReadLinkError::PathError(PathError::NoSearchPerms {
+                        #[cfg(debug_assertions)]
+                        dir: String::new(),
+                        #[cfg(debug_assertions)]
+                        perms: super::Mode::empty(),
+                    })
+                }
+                _ => super::errors::ReadLinkError::Io,
+            },
+            Error::Io | Error::InvalidResponse | Error::Interrupted => {
+                super::errors::ReadLinkError::Io
+            }
+        }
+    }
+}
+
 impl From<Error> for ReadDirError {
     fn from(e: Error) -> Self {
         match e {
@@ -362,7 +392,7 @@ pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider, W: transport::W
     /// Readlink result cache. Keyed by absolute symlink path, stores
     /// the target string returned by `readlink`. Avoids repeated
     /// readlinkpath RPCs for symlinks that are read many times during
-    /// a build (e.g. `/usr/lib/libfoo.so` -> `libfoo.so.1`).
+    /// a build (e.g. `/usr/lib/libfoo.so` → `libfoo.so.1`).
     /// Invalidated on unlink, rename, and create (which can replace a
     /// symlink).
     readlink_cache: sync::Mutex<Platform, BTreeMap<String, String>>,
@@ -755,6 +785,45 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> FileSystem<
         }
     }
 
+    /// Get the stored path from any fd's Descriptor.
+    fn descriptor_path(&self, dirfd: &FileFd<Platform, W>) -> Option<alloc::string::String> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let entry = descriptor_table.get_entry(dirfd)?;
+        Some(entry.entry.path.clone())
+    }
+
+    /// Get the stored path from a directory fd's Descriptor.
+    fn dir_fd_path(
+        &self,
+        dirfd: &FileFd<Platform, W>,
+    ) -> Result<alloc::string::String, super::DirFdError> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let entry = descriptor_table
+            .get_entry(dirfd)
+            .ok_or(super::DirFdError::ClosedFd)?;
+        if entry.entry.qid.typ.contains(fcall::QidType::DIR) {
+            Ok(entry.entry.path.clone())
+        } else {
+            Err(super::DirFdError::NotADirectory)
+        }
+    }
+
+    /// Resolve a relative path against a base directory path.
+    fn resolve_relative(base: &str, rel: &str) -> Result<alloc::string::String, PathError> {
+        if rel.is_empty() || rel == "." {
+            return Ok(base.into());
+        }
+        if rel.starts_with('/') {
+            return Ok(rel.normalized()?);
+        }
+        let combined = if base.ends_with('/') {
+            alloc::format!("{base}{rel}")
+        } else {
+            alloc::format!("{base}/{rel}")
+        };
+        Ok(combined.normalized()?)
+    }
+
     /// Walk to a path and return the fid
     fn walk_to(&self, path: &str) -> Result<fcall::Fid, Error> {
         self.walk_to_with_qid(path).map(|(fid, _)| fid)
@@ -784,7 +853,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> FileSystem<
             return Some((cloned, best_prefix_len));
         }
         // No cache hit, or clone failed (fid already clunked by racing
-        // invalidation) -- fall back to root.
+        // invalidation) — fall back to root.
         None
     }
 
@@ -809,7 +878,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> FileSystem<
 
         let remaining = &components[best_prefix_len..];
         if remaining.is_empty() {
-            // Full path was cached as a directory -- the cloned fid IS our result.
+            // Full path was cached as a directory — the cloned fid IS our result.
             if cloned_cache_fid {
                 let cache = self.dir_fid_cache.lock();
                 let prefix: String = components.iter().fold(String::new(), |mut a, c| {
@@ -857,7 +926,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> FileSystem<
                 let mut cache = self.dir_fid_cache.lock();
                 if !cache.contains_key(&parent_path) {
                     drop(cache);
-                    // Walk the full parent path from root -- the cached prefix
+                    // Walk the full parent path from root — the cached prefix
                     // fid was already clunked above.
                     let parent_components = &components[..components.len() - 1];
                     if let Ok((_, parent_fid)) = self.client.walk(self.root.1, parent_components) {
@@ -865,7 +934,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> FileSystem<
                         // threads race to populate the same cache entry.
                         cache = self.dir_fid_cache.lock();
                         if let Some(&(existing_fid, _)) = cache.get(&parent_path) {
-                            // Another thread won the race -- clunk ours.
+                            // Another thread won the race — clunk ours.
                             drop(cache);
                             self.client.clunk_async(parent_fid);
                             let _ = existing_fid; // keep the winner
@@ -1085,6 +1154,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::priv
 impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::FileSystem
     for FileSystem<Platform, W>
 {
+    fn walks_follow_symlinks(&self) -> bool {
+        // The 9P broker walk canonicalizes every component via
+        // fs::canonicalize(), so symlinks are always resolved server-side.
+        true
+    }
+
     #[allow(clippy::similar_names)]
     fn open(
         &self,
@@ -1134,7 +1209,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
                     self.client.clunk_async(existing_fid);
                     return Err(OpenError::AlreadyExists);
                 }
-                // File exists -- strip O_TRUNC and open normally, then
+                // File exists — strip O_TRUNC and open normally, then
                 // flush buffers and apply truncation manually.
                 let has_trunc = lflags.contains(fcall::LOpenFlags::O_TRUNC);
                 let open_flags = lflags & !fcall::LOpenFlags::O_TRUNC & !fcall::LOpenFlags::O_CREAT;
@@ -1166,7 +1241,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
                     }
                 }
             } else {
-                // File does not exist -- create it. No flush needed since
+                // File does not exist — create it. No flush needed since
                 // there can be no pending writes to a nonexistent file.
                 let (_, dfid) = self
                     .client
@@ -1253,7 +1328,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
                     self.client.clunk_async(opened_fid);
                     return Err(e.into());
                 }
-                // Truncation changes file content -- invalidate all
+                // Truncation changes file content — invalidate all
                 // read-ahead buffers for sibling fids on this file.
                 self.invalidate_read_buffers_for_file(qid.path);
             }
@@ -1295,7 +1370,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
             // Propagate flush errors so callers know about data loss.
             let flush_result = self.flush_write_buffer(entry.entry.fid);
             // On flush failure, do_flush_write_buffer re-inserts the
-            // unwritten remainder. Remove it unconditionally -- the fid is
+            // unwritten remainder. Remove it unconditionally — the fid is
             // about to be clunked, so the remainder can never be flushed.
             self.write_buffers.lock().remove(&entry.entry.fid);
             self.read_buffers.lock().remove(&entry.entry.fid);
@@ -1360,7 +1435,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
                 if rb.eof_seen && read_offset >= buf_end {
                     return Ok(0);
                 }
-                // Read not in buffer range -- discard stale buffer.
+                // Read not in buffer range — discard stale buffer.
                 buffers.remove(&fid);
             }
         }
@@ -1369,7 +1444,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         // so that subsequent sequential reads can be served from the cache
         // without extra RPCs. Cap at READ_AHEAD_SIZE to avoid huge allocations.
         let readahead_size = if buf.len() >= READ_AHEAD_SIZE {
-            // Caller already wants a large read -- no extra readahead needed.
+            // Caller already wants a large read — no extra readahead needed.
             buf.len()
         } else {
             READ_AHEAD_SIZE
@@ -1462,11 +1537,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         // buffer (which we may still coalesce into).
         self.flush_sibling_write_buffers(qid_path, fid)?;
 
-        // Invalidate any read-ahead buffers for this file -- the write
+        // Invalidate any read-ahead buffers for this file — the write
         // makes cached read data potentially stale.
         self.invalidate_read_buffers_for_file(qid_path);
 
-        // Invalidate stat cache -- file size/mtime will change.
+        // Invalidate stat cache — file size/mtime will change.
         self.invalidate_stat_cache_by_qid(qid_path);
 
         let write_offset = match offset {
@@ -1504,7 +1579,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         if let Some(wb) = buffers.get_mut(&fid) {
             let expected_offset = wb.file_offset + wb.data.len();
             if write_offset == expected_offset && wb.data.len() + total <= buf_cap {
-                // Sequential and fits -- append without any RPC.
+                // Sequential and fits — append without any RPC.
                 wb.data.extend_from_slice(buf);
                 drop(buffers);
                 if offset.is_none() {
@@ -1514,7 +1589,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
                 }
                 return Ok(total);
             }
-            // Non-sequential or buffer full -- flush the old buffer first.
+            // Non-sequential or buffer full — flush the old buffer first.
             let old_wb = buffers.remove(&fid).unwrap();
             drop(buffers);
             self.do_flush_write_buffer(fid, old_wb)?;
@@ -1540,7 +1615,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
             return Ok(total);
         }
 
-        // Large write -- send directly in a loop (no point buffering).
+        // Large write — send directly in a loop (no point buffering).
         let mut written = 0;
         while written < total {
             let n = self
@@ -1618,14 +1693,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
             .ok_or(super::errors::TruncateError::ClosedFd)?;
 
         // Flush all pending writes for this file (across all fids) before
-        // truncating -- buffered data from sibling fids past the new size
+        // truncating — buffered data from sibling fids past the new size
         // would otherwise be lost or re-applied after the truncate.
         self.flush_write_buffers_for_file(qid.path)?;
 
-        // Invalidate read-ahead buffers -- truncation changes file content.
+        // Invalidate read-ahead buffers — truncation changes file content.
         self.invalidate_read_buffers_for_file(qid.path);
 
-        // Invalidate stat cache -- file size will change.
+        // Invalidate stat cache — file size will change.
         self.invalidate_stat_cache_by_qid(qid.path);
 
         if qid.typ.contains(fcall::QidType::DIR) {
@@ -1733,7 +1808,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
             }
             if let Some(ref p) = abs_path {
                 self.invalidate_parent_stat_cache(p);
-                // Unlink may remove a symlink -- invalidate readlink cache.
+                // Unlink may remove a symlink — invalidate readlink cache.
                 self.invalidate_readlink_cache(&[p]);
             }
         }
@@ -1766,7 +1841,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
 
         // Flush any pending write-behind data for the source file so that
         // the server has the latest contents before the rename. Propagate
-        // flush errors -- a silent drop would lose acknowledged writes.
+        // flush errors — a silent drop would lose acknowledged writes.
         if self.flush_write_buffers_for_file(source_qid.path).is_err() {
             self.client.clunk_async(src_fid);
             return Err(super::errors::RenameError::Io);
@@ -1822,7 +1897,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
             }
             self.invalidate_stat_cache_tree(&old_path);
             self.invalidate_stat_cache_tree(&new_path);
-            // Invalidate parent directories -- rename changes their mtime.
+            // Invalidate parent directories — rename changes their mtime.
             self.invalidate_parent_stat_cache(&old_path);
             self.invalidate_parent_stat_cache(&new_path);
             // Invalidate dir fid cache for renamed directories.
@@ -1947,7 +2022,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         // RPC so we can detect namespace mutations racing with this lookup.
         let gen_before = self.cache_generation.load(Ordering::SeqCst);
 
-        // Check the negative stat cache -- if we previously got ENOENT
+        // Check the negative stat cache — if we previously got ENOENT
         // for this path and no namespace mutations have invalidated it,
         // we can return the error without any RPCs.
         {
@@ -2055,11 +2130,213 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         let status = Self::rgetattr_to_file_status(&attr)?;
 
         // Do NOT populate stat_cache here. The descriptor's path may be
-        // stale if the file was unlinked and recreated -- fstat() on the
+        // stale if the file was unlinked and recreated — fstat() on the
         // open fd returns metadata for the deleted inode, which would
         // poison the path-keyed cache for the new file.
 
         Ok(status)
+    }
+
+    fn read_link(
+        &self,
+        path: impl crate::path::Arg,
+    ) -> Result<alloc::string::String, super::errors::ReadLinkError> {
+        let abs = self
+            .absolute_path(path)
+            .map_err(super::errors::ReadLinkError::PathError)?;
+
+        // Snapshot generation before consulting the cache or issuing any
+        // RPC so we don't populate the cache with a target raced by a
+        // concurrent namespace mutation.
+        let gen_before = self.cache_generation.load(Ordering::SeqCst);
+
+        // Check the readlink cache first to avoid any RPCs.
+        {
+            let cache = self.readlink_cache.lock();
+            if let Some(cached) = cache.get(&abs) {
+                return Ok(cached.clone());
+            }
+        }
+
+        // Use standard walk + readlink + clunk sequence with
+        // dir_fid_cache prefix lookup.
+        let components: Vec<&str> = abs
+            .normalized_components()
+            .map_err(|_| super::errors::ReadLinkError::PathError(PathError::InvalidPathname))?
+            .collect();
+        let (start_fid, prefix_len, cloned_cache_fid) =
+            if let Some((cloned, plen)) = self.find_cached_prefix(&components) {
+                (cloned, plen, true)
+            } else {
+                (self.root.1, 0, false)
+            };
+        let remaining = &components[prefix_len..];
+
+        let target = {
+            let (_, walked_fid) = match self.client.walk(start_fid, remaining) {
+                Ok(r) => r,
+                Err(e) => {
+                    if cloned_cache_fid {
+                        self.client.clunk_async(start_fid);
+                    }
+                    return Err(e.into());
+                }
+            };
+            if cloned_cache_fid {
+                self.client.clunk_async(start_fid);
+            }
+            let result = self.client.readlink(walked_fid);
+            self.client.clunk_async(walked_fid);
+            result.map_err(super::errors::ReadLinkError::from)?
+        };
+        let target_str = alloc::string::String::from_utf8(target)
+            .map_err(|_| super::errors::ReadLinkError::Io)?;
+
+        // Cache the readlink result. Symlink targets are immutable unless
+        // the symlink is replaced (unlink + symlink), which is handled by
+        // cache invalidation in unlink/rename/create.
+        if self.cache_generation.load(Ordering::SeqCst) == gen_before {
+            self.readlink_cache.lock().insert(abs, target_str.clone());
+        }
+
+        Ok(target_str)
+    }
+
+    fn open_at(
+        &self,
+        dirfd: &FileFd<Platform, W>,
+        rel_path: impl crate::path::Arg,
+        flags: super::OFlags,
+        mode: super::Mode,
+    ) -> Result<FileFd<Platform, W>, super::errors::OpenError> {
+        let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
+            super::DirFdError::ClosedFd => super::errors::OpenError::ClosedFd,
+            super::DirFdError::NotADirectory => super::errors::OpenError::NotADirectory,
+            super::DirFdError::Io => super::errors::OpenError::Io,
+        })?;
+        let rel = rel_path
+            .as_rust_str()
+            .map_err(|e| super::errors::OpenError::PathError(e.into()))?;
+        let abs = Self::resolve_relative(&dir, rel).map_err(super::errors::OpenError::PathError)?;
+        self.open(abs, flags, mode)
+    }
+
+    /// Note: `_follow_symlinks` is currently ignored because
+    /// `walks_follow_symlinks()` returns `true` for 9P, meaning the
+    /// shim already handles follow/nofollow at the syscall layer by
+    /// choosing `stat_at` vs `lstat`. The 9P walk will follow
+    /// symlinks regardless, so both stat and lstat end up resolving
+    /// the same target. This is acceptable since the broker resolves
+    /// all symlinks during walk anyway.
+    fn stat_at(
+        &self,
+        dirfd: &FileFd<Platform, W>,
+        rel_path: impl crate::path::Arg,
+        _follow_symlinks: bool,
+    ) -> Result<super::FileStatus, super::FileStatusError> {
+        let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
+            super::DirFdError::ClosedFd => super::FileStatusError::ClosedFd,
+            super::DirFdError::NotADirectory => super::FileStatusError::NotADirectory,
+            super::DirFdError::Io => super::FileStatusError::Io,
+        })?;
+        let rel = rel_path
+            .as_rust_str()
+            .map_err(|e| super::FileStatusError::PathError(e.into()))?;
+        let abs = Self::resolve_relative(&dir, rel).map_err(super::FileStatusError::PathError)?;
+        // The 9P broker walk already follows symlinks (via
+        // `fs::canonicalize` per component), so we can skip the
+        // client-side symlink resolution chain. Just pass the path
+        // directly — walk_to + getattr will see the target.
+        self.file_status(abs)
+    }
+
+    fn unlink_at(
+        &self,
+        dirfd: &FileFd<Platform, W>,
+        rel_path: impl crate::path::Arg,
+    ) -> Result<(), super::errors::UnlinkError> {
+        let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
+            super::DirFdError::ClosedFd => super::errors::UnlinkError::ClosedFd,
+            super::DirFdError::NotADirectory => super::errors::UnlinkError::NotADirectory,
+            super::DirFdError::Io => super::errors::UnlinkError::Io,
+        })?;
+        let rel = rel_path
+            .as_rust_str()
+            .map_err(|e| super::errors::UnlinkError::PathError(e.into()))?;
+        let abs =
+            Self::resolve_relative(&dir, rel).map_err(super::errors::UnlinkError::PathError)?;
+        self.unlink(abs)
+    }
+
+    fn readlink_at(
+        &self,
+        dirfd: &FileFd<Platform, W>,
+        rel_path: impl crate::path::Arg,
+    ) -> Result<alloc::string::String, super::errors::ReadLinkError> {
+        let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
+            super::DirFdError::ClosedFd => super::errors::ReadLinkError::ClosedFd,
+            super::DirFdError::NotADirectory => super::errors::ReadLinkError::NotADirectory,
+            super::DirFdError::Io => super::errors::ReadLinkError::Io,
+        })?;
+        let rel = rel_path
+            .as_rust_str()
+            .map_err(|e| super::errors::ReadLinkError::PathError(e.into()))?;
+        let abs =
+            Self::resolve_relative(&dir, rel).map_err(super::errors::ReadLinkError::PathError)?;
+        self.read_link(abs)
+    }
+
+    fn rename_at(
+        &self,
+        old_dirfd: &FileFd<Platform, W>,
+        old_rel: impl crate::path::Arg,
+        new_dirfd: &FileFd<Platform, W>,
+        new_rel: impl crate::path::Arg,
+    ) -> Result<(), super::errors::RenameError> {
+        let old_dir = self.dir_fd_path(old_dirfd).map_err(|e| match e {
+            super::DirFdError::ClosedFd => super::errors::RenameError::ClosedFd,
+            super::DirFdError::NotADirectory => super::errors::RenameError::NotADirectory,
+            super::DirFdError::Io => super::errors::RenameError::Io,
+        })?;
+        let old_r = old_rel
+            .as_rust_str()
+            .map_err(|e| super::errors::RenameError::PathError(e.into()))?;
+        let old_abs = Self::resolve_relative(&old_dir, old_r)
+            .map_err(super::errors::RenameError::PathError)?;
+        let new_dir = self.dir_fd_path(new_dirfd).map_err(|e| match e {
+            super::DirFdError::ClosedFd => super::errors::RenameError::ClosedFd,
+            super::DirFdError::NotADirectory => super::errors::RenameError::NotADirectory,
+            super::DirFdError::Io => super::errors::RenameError::Io,
+        })?;
+        let new_r = new_rel
+            .as_rust_str()
+            .map_err(|e| super::errors::RenameError::PathError(e.into()))?;
+        let new_abs = Self::resolve_relative(&new_dir, new_r)
+            .map_err(super::errors::RenameError::PathError)?;
+        self.rename(old_abs, new_abs)
+    }
+
+    fn fd_path(&self, fd: &FileFd<Platform, W>) -> Option<alloc::string::String> {
+        self.descriptor_path(fd)
+    }
+
+    fn mkdir_at(
+        &self,
+        dirfd: &FileFd<Platform, W>,
+        rel_path: impl crate::path::Arg,
+        mode: super::Mode,
+    ) -> Result<(), MkdirError> {
+        let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
+            super::DirFdError::NotADirectory => {
+                MkdirError::PathError(PathError::ComponentNotADirectory)
+            }
+            super::DirFdError::ClosedFd | super::DirFdError::Io => MkdirError::Io,
+        })?;
+        let rel = rel_path
+            .as_rust_str()
+            .map_err(|e| MkdirError::PathError(e.into()))?;
+        let abs = Self::resolve_relative(&dir, rel).map_err(MkdirError::PathError)?;
+        self.mkdir(abs, mode)
     }
 }
 
