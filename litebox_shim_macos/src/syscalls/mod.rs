@@ -179,6 +179,19 @@ impl<FS: ShimFS> Task<FS> {
             MacosSyscallRequest::Sigreturn { .. } => {
                 unreachable!("Sigreturn is handled in handle_syscall_request before do_syscall")
             }
+            // Stubbed syscalls for future pipe/fs tasks:
+            MacosSyscallRequest::Unlink { .. }
+            | MacosSyscallRequest::Access { .. }
+            | MacosSyscallRequest::Pipe
+            | MacosSyscallRequest::Fchmod { .. }
+            | MacosSyscallRequest::Mkdir { .. }
+            | MacosSyscallRequest::Rmdir { .. }
+            | MacosSyscallRequest::Ftruncate { .. }
+            | MacosSyscallRequest::SemwaitSignal { .. }
+            | MacosSyscallRequest::Getdirentries64 { .. } => {
+                log_unsupported!("unimplemented syscall");
+                Err(Errno::ENOSYS)
+            }
         }
     }
 }

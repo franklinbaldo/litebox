@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use litebox::{
     LiteBox,
-    fd::RawDescriptorStorage,
+    fd::{RawDescriptorStorage, TypedFd},
     mm::{PageManager, linux::PAGE_SIZE},
     net::Network,
     pipes::Pipes,
@@ -27,6 +27,7 @@ use litebox::{
     shim::ContinueOperation,
     sync::futex::FutexManager,
 };
+use litebox_common_macos::errno::Errno;
 use litebox_common_macos::PtRegs;
 use litebox_platform_multiplex::Platform;
 
@@ -795,7 +796,6 @@ struct GlobalState<FS: ShimFS> {
     #[expect(dead_code, reason = "will be used when futex syscalls are added")]
     futex_manager: FutexManager<Platform>,
     /// The anonymous pipe implementation.
-    #[expect(dead_code, reason = "will be used when pipe syscalls are added")]
     pipes: Pipes<Platform>,
     /// The network subsystem.
     #[expect(dead_code, reason = "will be used when network syscalls are added")]
@@ -827,6 +827,27 @@ pub(crate) struct MachoPatchState {
 
 /// Size of the per-fd trampoline region allocated by the mmap-hook (16 KB).
 pub(crate) const MMAP_HOOK_TRAMPOLINE_SIZE: usize = 16 * 1024;
+
+/// A strongly-typed FD that can represent any subsystem's file descriptor.
+///
+/// Used by read/write/close to dispatch to the correct subsystem.
+enum StrongFd<FS: ShimFS> {
+    FileSystem(Arc<TypedFd<FS>>),
+    Pipes(Arc<TypedFd<Pipes<Platform>>>),
+}
+
+impl<FS: ShimFS> StrongFd<FS> {
+    /// Resolve a raw integer FD to a strongly-typed FD, trying each subsystem.
+    fn from_raw(rds: &RawDescriptorStorage, fd: usize) -> Result<Self, Errno> {
+        if let Ok(fd) = rds.fd_from_raw_integer::<FS>(fd) {
+            return Ok(StrongFd::FileSystem(fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer::<Pipes<Platform>>(fd) {
+            return Ok(StrongFd::Pipes(fd));
+        }
+        Err(Errno::EBADF)
+    }
+}
 
 /// Per-thread task state.
 struct Task<FS: ShimFS> {

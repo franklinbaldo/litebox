@@ -6,10 +6,11 @@
 use alloc::string::String;
 use alloc::vec;
 use litebox::fs::{OFlags, SeekWhence};
+use litebox::pipes::Pipes;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox_common_macos::errno::Errno;
 
-use crate::{ConstPtr, MutPtr, ShimFS, Task};
+use crate::{ConstPtr, MutPtr, Platform, ShimFS, Task};
 
 /// Maximum kernel-side buffer size, to prevent OOM from huge read/write requests.
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
@@ -33,6 +34,12 @@ pub(crate) fn read_cstring_from_guest(ptr: ConstPtr<u8>, max_len: usize) -> Opti
         buf.push(byte);
     }
     None // no NUL terminator found within max_len
+}
+
+/// Owned duplicated FD, used by sys_dup2 to hold the result of descriptor_table.duplicate().
+enum DuplicatedFd<FS: ShimFS> {
+    FileSystem(litebox::fd::TypedFd<FS>),
+    Pipes(litebox::fd::TypedFd<Pipes<Platform>>),
 }
 
 /// Translate macOS open(2) flags to litebox OFlags.
@@ -69,23 +76,31 @@ fn translate_open_flags(macos_flags: i32) -> OFlags {
 impl<FS: ShimFS> Task<FS> {
     /// Handle `read(fd, buf, count)`.
     ///
-    /// Reads data from the file descriptor into a kernel buffer, then copies
-    /// it to the user buffer address.
+    /// Dispatches to filesystem or pipe subsystem based on FD type.
     pub(crate) fn sys_read(&self, fd: i32, buf_addr: usize, count: usize) -> Result<usize, Errno> {
         let raw_fd = fd_to_usize(fd)?;
-        let typed_fd = {
+        let strong_fd = {
             let rds = self.global.raw_descriptors.read();
-            rds.fd_from_raw_integer::<FS>(raw_fd)
-                .map_err(|_| Errno::EBADF)?
+            crate::StrongFd::from_raw(&rds, raw_fd)?
         };
 
         let read_len = count.min(MAX_KERNEL_BUF_SIZE);
         let mut kernel_buf = vec![0u8; read_len];
-        let size = self
-            .global
-            .fs
-            .read(&typed_fd, &mut kernel_buf, None)
-            .map_err(Self::read_error_to_errno)?;
+
+        let size = match strong_fd {
+            crate::StrongFd::FileSystem(ref typed_fd) => self
+                .global
+                .fs
+                .read(typed_fd, &mut kernel_buf, None)
+                .map_err(Self::read_error_to_errno)?,
+            crate::StrongFd::Pipes(ref typed_fd) => {
+                let cx = self.wait_cx();
+                self.global
+                    .pipes
+                    .read(&cx, typed_fd, &mut kernel_buf)
+                    .map_err(Self::pipe_read_error_to_errno)?
+            }
+        };
 
         let user_buf: MutPtr<u8> = MutPtr::from_usize(buf_addr);
         user_buf
@@ -97,7 +112,7 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle `write(fd, buf, count)`.
     ///
-    /// Copies data from the user buffer, then writes it to the file descriptor.
+    /// Dispatches to filesystem or pipe subsystem based on FD type.
     pub(crate) fn sys_write(&self, fd: i32, buf_addr: usize, count: usize) -> Result<usize, Errno> {
         // Debug: log write calls to see dyld error messages (written to fd -1, 1, or 2)
         if fd == -1 || fd == 1 || fd == 2 {
@@ -112,26 +127,36 @@ impl<FS: ShimFS> Task<FS> {
         // fd -1 is invalid — return EBADF (but we've already logged the diagnostic above).
         let raw_fd = fd_to_usize(fd)?;
 
-        let typed_fd = {
+        let strong_fd = {
             let rds = self.global.raw_descriptors.read();
-            rds.fd_from_raw_integer::<FS>(raw_fd)
-                .map_err(|_| Errno::EBADF)?
+            crate::StrongFd::from_raw(&rds, raw_fd)?
         };
 
         let user_buf: ConstPtr<u8> = ConstPtr::from_usize(buf_addr);
         let write_len = count.min(MAX_KERNEL_BUF_SIZE);
         let data = user_buf.to_owned_slice(write_len).ok_or(Errno::EFAULT)?;
 
-        let size = self
-            .global
-            .fs
-            .write(&typed_fd, &data, None)
-            .map_err(Self::write_error_to_errno)?;
+        let size = match strong_fd {
+            crate::StrongFd::FileSystem(ref typed_fd) => self
+                .global
+                .fs
+                .write(typed_fd, &data, None)
+                .map_err(Self::write_error_to_errno)?,
+            crate::StrongFd::Pipes(ref typed_fd) => {
+                let cx = self.wait_cx();
+                self.global
+                    .pipes
+                    .write(&cx, typed_fd, &data)
+                    .map_err(Self::pipe_write_error_to_errno)?
+            }
+        };
 
         Ok(size)
     }
 
     /// Handle `close(fd)`.
+    ///
+    /// Dispatches to filesystem or pipe subsystem based on FD type.
     pub(crate) fn sys_close(&self, fd: i32) -> Result<(), Errno> {
         // Finalize any mmap-hook trampoline for this fd
         if let Some(state) = self.patch_cache.lock().remove(&fd)
@@ -148,7 +173,6 @@ impl<FS: ShimFS> Task<FS> {
             }
         }
 
-        // Existing close logic
         let raw_fd = fd_to_usize(fd)?;
 
         // Remove the path entry for F_GETPATH tracking.
@@ -157,13 +181,18 @@ impl<FS: ShimFS> Task<FS> {
             paths.remove(&raw_fd);
         }
 
-        let typed_fd = {
+        // Try filesystem first, then pipes.
+        {
             let mut rds = self.global.raw_descriptors.write();
-            rds.fd_consume_raw_integer::<FS>(raw_fd)
-                .map_err(|_| Errno::EBADF)?
-        };
+            if let Ok(typed_fd) = rds.fd_consume_raw_integer::<FS>(raw_fd) {
+                return self.global.fs.close(&typed_fd).map_err(|_| Errno::EIO);
+            }
+            if let Ok(typed_fd) = rds.fd_consume_raw_integer::<Pipes<Platform>>(raw_fd) {
+                return self.global.pipes.close(&typed_fd).map_err(|_| Errno::EIO);
+            }
+        }
 
-        self.global.fs.close(&typed_fd).map_err(|_| Errno::EIO)
+        Err(Errno::EBADF)
     }
 
     /// Convert a filesystem `ReadError` to a macOS errno.
@@ -182,6 +211,27 @@ impl<FS: ShimFS> Task<FS> {
             litebox::fs::errors::WriteError::ClosedFd
             | litebox::fs::errors::WriteError::NotAFile
             | litebox::fs::errors::WriteError::NotForWriting => Errno::EBADF,
+            _ => Errno::EIO,
+        }
+    }
+
+    /// Convert a pipe `ReadError` to a macOS errno.
+    fn pipe_read_error_to_errno(e: litebox::pipes::errors::ReadError) -> Errno {
+        match e {
+            litebox::pipes::errors::ReadError::ClosedFd => Errno::EBADF,
+            litebox::pipes::errors::ReadError::NotForReading => Errno::EBADF,
+            litebox::pipes::errors::ReadError::WouldBlock => Errno::EAGAIN,
+            _ => Errno::EIO,
+        }
+    }
+
+    /// Convert a pipe `WriteError` to a macOS errno.
+    fn pipe_write_error_to_errno(e: litebox::pipes::errors::WriteError) -> Errno {
+        match e {
+            litebox::pipes::errors::WriteError::ClosedFd => Errno::EBADF,
+            litebox::pipes::errors::WriteError::ReadEndClosed => Errno::EPIPE,
+            litebox::pipes::errors::WriteError::NotForWriting => Errno::EBADF,
+            litebox::pipes::errors::WriteError::WouldBlock => Errno::EAGAIN,
             _ => Errno::EIO,
         }
     }
@@ -412,11 +462,10 @@ impl<FS: ShimFS> Task<FS> {
         let raw_oldfd = fd_to_usize(oldfd)?;
         let raw_newfd = fd_to_usize(newfd)?;
 
-        // Validate that oldfd exists.
-        let old_typed_fd = {
+        // Resolve the old fd to validate it exists.
+        let strong_fd: crate::StrongFd<FS> = {
             let rds = self.global.raw_descriptors.read();
-            rds.fd_from_raw_integer::<FS>(raw_oldfd)
-                .map_err(|_| Errno::EBADF)?
+            crate::StrongFd::from_raw(&rds, raw_oldfd)?
         };
 
         // If oldfd == newfd, dup2 is a no-op (just validates oldfd).
@@ -424,27 +473,48 @@ impl<FS: ShimFS> Task<FS> {
             return Ok(raw_newfd);
         }
 
-        // Create a new TypedFd that shares the same underlying descriptor.
-        let new_typed_fd = self
-            .global
-            .litebox
-            .descriptor_table_mut()
-            .duplicate(&old_typed_fd)
-            .ok_or(Errno::EBADF)?;
+        // Duplicate the underlying descriptor.
+        // duplicate() returns Option<TypedFd<T>> (owned, no Arc).
+        let duplicated = match &strong_fd {
+            crate::StrongFd::FileSystem(typed_fd) => self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .duplicate(typed_fd)
+                .ok_or(Errno::EBADF)
+                .map(DuplicatedFd::FileSystem),
+            crate::StrongFd::Pipes(typed_fd) => self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .duplicate(typed_fd)
+                .ok_or(Errno::EBADF)
+                .map(DuplicatedFd::Pipes),
+        }?;
 
-        // If newfd is already open, close it first.
+        // If newfd is already open, close it first (try all subsystems).
         {
             let mut rds = self.global.raw_descriptors.write();
             if let Ok(existing_fd) = rds.fd_consume_raw_integer::<FS>(raw_newfd) {
-                // Best-effort close; ignore errors (matches POSIX dup2 semantics).
                 let _ = self.global.fs.close(&existing_fd);
+            } else if let Ok(existing_fd) =
+                rds.fd_consume_raw_integer::<Pipes<Platform>>(raw_newfd)
+            {
+                let _ = self.global.pipes.close(&existing_fd);
             }
         }
 
         // Insert the duplicated fd at the specific newfd slot.
         {
             let mut rds = self.global.raw_descriptors.write();
-            let success = rds.fd_into_specific_raw_integer(new_typed_fd, raw_newfd);
+            let success = match duplicated {
+                DuplicatedFd::FileSystem(typed_fd) => {
+                    rds.fd_into_specific_raw_integer(typed_fd, raw_newfd)
+                }
+                DuplicatedFd::Pipes(typed_fd) => {
+                    rds.fd_into_specific_raw_integer(typed_fd, raw_newfd)
+                }
+            };
             if !success {
                 return Err(Errno::EBADF);
             }
