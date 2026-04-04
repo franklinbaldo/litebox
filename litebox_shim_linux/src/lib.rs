@@ -86,14 +86,14 @@ pub struct LinuxShimEntrypoints<FS: ShimFS> {
 }
 
 impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
-    type ExecutionContext = litebox_common_linux::PtRegs;
+    type ExecutionContext = litebox_common_linux::ExecutionContext;
 
     fn init(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        self.enter_shim(true, ctx, Task::handle_init_request)
+        self.enter_shim(true, &mut ctx.regs, Task::handle_init_request)
     }
 
     fn syscall(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        self.enter_shim(false, ctx, Task::handle_syscall_request)
+        self.enter_shim(false, &mut ctx.regs, Task::handle_syscall_request)
     }
 
     fn exception(
@@ -115,11 +115,13 @@ impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
                 return ContinueOperation::Terminate;
             }
         }
-        self.enter_shim(false, ctx, |task, _ctx| task.handle_exception_request(info))
+        self.enter_shim(false, &mut ctx.regs, |task, _ctx| {
+            task.handle_exception_request(info);
+        })
     }
 
     fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        self.enter_shim(false, ctx, |_, _| {})
+        self.enter_shim(false, &mut ctx.regs, |_, _| {})
     }
 }
 

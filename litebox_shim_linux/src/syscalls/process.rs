@@ -566,7 +566,7 @@ struct NewThreadArgs<FS: ShimFS> {
 }
 
 impl<FS: ShimFS> litebox::shim::InitThread for NewThreadArgs<FS> {
-    type ExecutionContext = litebox_common_linux::PtRegs;
+    type ExecutionContext = litebox_common_linux::ExecutionContext;
 
     fn init(
         self: alloc::boxed::Box<Self>,
@@ -755,8 +755,12 @@ impl<FS: ShimFS> Task<FS> {
         thread.clear_child_tid.set(clear_child_tid);
 
         let r = unsafe {
+            let exec_ctx = litebox_common_linux::ExecutionContext {
+                regs: ctx.clone(),
+                fp_regs: litebox_common_linux::FpRegs::default(),
+            };
             self.global.platform.spawn_thread(
-                ctx,
+                &exec_ctx,
                 Box::new(NewThreadArgs {
                     task: Task {
                         global: self.global.clone(),
