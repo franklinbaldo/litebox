@@ -5,7 +5,7 @@
 //!
 //! This module provides a high-level client for the 9P2000.L protocol.
 //! Multiple guest threads can issue requests concurrently — each request
-//! acquires a tag from the [`PendingTable`](super::pending_table::PendingTable),
+//! acquires a tag from the [`PendingTable`],
 //! sends its message under the write lock, then spin-waits for the dedicated
 //! worker thread to deliver the matching response.
 
