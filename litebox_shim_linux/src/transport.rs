@@ -24,14 +24,14 @@ trait DropGuard: Send + Sync {
 
 /// Concrete, generic implementation of [`DropGuard`].
 struct SocketDropGuard<FS: ShimFS> {
-    global: Arc<GlobalState<FS>>,
+    _fs: core::marker::PhantomData<FS>,
+    net: Arc<litebox::sync::Mutex<crate::Platform, litebox::net::Network<crate::Platform>>>,
     sockfd: SocketFd,
 }
 
 impl<FS: ShimFS> DropGuard for SocketDropGuard<FS> {
     fn close(&mut self) {
         let _ = self
-            .global
             .net
             .lock()
             .close(&self.sockfd, litebox::net::CloseBehavior::Immediate);
@@ -64,22 +64,22 @@ impl ShimTransport {
     /// spin-polling when the operation cannot complete immediately.
     pub(crate) fn connect<FS: ShimFS>(
         global: Arc<GlobalState<FS>>,
+        net: Arc<litebox::sync::Mutex<crate::Platform, litebox::net::Network<crate::Platform>>>,
         addr: core::net::SocketAddr,
     ) -> Result<Self, Errno> {
         // 1. Create the raw socket.
-        let sockfd = global
-            .net
+        let sockfd = net
             .lock()
             .socket(litebox::net::Protocol::Tcp)
             .map_err(Errno::from)?;
 
         // 2. Initialise metadata / proxy in the litebox descriptor table.
-        let proxy = global.initialize_socket(&sockfd, SockType::Stream, SockFlags::empty());
+        let proxy = global.initialize_socket(&net, &sockfd, SockType::Stream, SockFlags::empty());
 
         // 3. Initiate the TCP connection.
         let mut check_progress = false;
         loop {
-            match global.net.lock().connect(&sockfd, &addr, check_progress) {
+            match net.lock().connect(&sockfd, &addr, check_progress) {
                 Ok(()) => break,
                 Err(litebox::net::errors::ConnectError::InProgress) => {
                     core::hint::spin_loop();
@@ -89,7 +89,11 @@ impl ShimTransport {
             }
         }
 
-        let drop_guard = Box::new(SocketDropGuard { global, sockfd });
+        let drop_guard: Box<SocketDropGuard<FS>> = Box::new(SocketDropGuard {
+            _fs: core::marker::PhantomData,
+            net,
+            sockfd,
+        });
 
         Ok(Self { drop_guard, proxy })
     }
@@ -262,7 +266,7 @@ mod tests {
         server: &DiodServer,
     ) -> nine_p::FileSystem<crate::Platform, ShimTransport> {
         let addr = socket_addr([10, 0, 0, 1], server.port);
-        let transport = ShimTransport::connect(task.global.clone(), addr)
+        let transport = ShimTransport::connect(task.global.clone(), task.net.clone(), addr)
             .expect("failed to connect to 9P server via shim network");
 
         let aname = server.export_path().to_str().unwrap();

@@ -189,26 +189,34 @@ impl LinuxShimBuilder {
     pub fn build<FS: ShimFS>(self) -> LinuxShim<FS> {
         let mut net = Network::new(&self.litebox);
         net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
+        let root_net = Arc::new(litebox::sync::Mutex::new(net));
         let global = Arc::new(GlobalState {
             platform: self.platform,
             pm: PageManager::new(&self.litebox),
             futex_manager: FutexManager::new(),
             pipes: Pipes::new(&self.litebox),
-            net: litebox::sync::Mutex::new(net),
             boot_time: self.platform.now(),
             load_filter: self.load_filter,
             next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
         });
-        LinuxShim(global)
+        LinuxShim { global, root_net }
     }
 }
 
-pub struct LinuxShim<FS: ShimFS>(Arc<GlobalState<FS>>);
+pub struct LinuxShim<FS: ShimFS> {
+    global: Arc<GlobalState<FS>>,
+    /// The root process's Network. The single net-worker in main.rs drives
+    /// this via [`Self::perform_network_interaction`].
+    root_net: Arc<litebox::sync::Mutex<Platform, Network<Platform>>>,
+}
 impl<FS: ShimFS> Clone for LinuxShim<FS> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self {
+            global: self.global.clone(),
+            root_net: self.root_net.clone(),
+        }
     }
 }
 
@@ -235,14 +243,15 @@ impl<FS: ShimFS> LinuxShim<FS> {
         let files = syscalls::file::FilesState::new(fs);
         files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR - 1);
         let files = Arc::new(files);
-        files.initialize_stdio_in_shared_descriptors_table(&self.0);
+        files.initialize_stdio_in_shared_descriptors_table(&self.global);
 
         let entrypoints = crate::LinuxShimEntrypoints {
             _not_send: core::marker::PhantomData,
             task: Task {
-                global: self.0.clone(),
+                global: self.global.clone(),
+                net: self.root_net.clone(),
                 thread: syscalls::process::ThreadState::new_process(pid),
-                wait_state: wait::WaitState::new(self.0.platform),
+                wait_state: wait::WaitState::new(self.global.platform),
                 pid,
                 ppid,
                 tid: pid,
@@ -273,16 +282,17 @@ impl<FS: ShimFS> LinuxShim<FS> {
 
     /// Get the global page manager
     pub fn page_manager(&self) -> &PageManager<Platform, PAGE_SIZE> {
-        &self.0.pm
+        &self.global.pm
     }
 
     /// Perform queued network interactions with the outside world.
     ///
-    /// This function should be invoked in a loop, based on the returned advice.
+    /// Drives the root process's Network. This function should be invoked in
+    /// a loop, based on the returned advice.
     pub fn perform_network_interaction(
         &self,
     ) -> litebox::net::PlatformInteractionReinvocationAdvice {
-        self.0.net.lock().perform_platform_interaction()
+        self.root_net.lock().perform_platform_interaction()
     }
 
     /// Establish a TCP connection to the given address.
@@ -293,11 +303,11 @@ impl<FS: ShimFS> LinuxShim<FS> {
         &self,
         addr: core::net::SocketAddr,
     ) -> Result<transport::ShimTransport, Errno> {
-        transport::ShimTransport::connect(self.0.clone(), addr)
+        transport::ShimTransport::connect(self.global.clone(), self.root_net.clone(), addr)
     }
 
     pub fn litebox(&self) -> &LiteBox<Platform> {
-        &self.0.litebox
+        &self.global.litebox
     }
 }
 
@@ -368,6 +378,7 @@ impl<FS: ShimFS> LinuxShimTask<FS> {
         let child_task = LinuxShimTask {
             task: Task {
                 global: self.task.global.clone(),
+                net: self.task.net.clone(),
                 wait_state: crate::wait::WaitState::new(self.task.global.platform),
                 thread,
                 pid: self.task.pid,
@@ -390,6 +401,15 @@ impl<FS: ShimFS> LinuxShimTask<FS> {
     /// called after brk is already initialized.
     pub fn set_initial_brk(&self, brk: usize) {
         self.task.global.pm.set_initial_brk(brk);
+    }
+
+    /// Perform queued network interactions for this task's process Network.
+    ///
+    /// This function should be invoked in a loop, based on the returned advice.
+    pub fn perform_network_interaction(
+        &self,
+    ) -> litebox::net::PlatformInteractionReinvocationAdvice {
+        self.task.net.lock().perform_platform_interaction()
     }
 }
 
@@ -415,7 +435,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
         let files = Arc::new(syscalls::file::FilesState::new(fs));
         files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR - 1);
         if init_stdio {
-            files.initialize_stdio_in_shared_descriptors_table(&self.0);
+            files.initialize_stdio_in_shared_descriptors_table(&self.global);
         } else {
             // For fork children, reserve fd 0/1/2 so the shim allocates new
             // descriptors starting at fd 3. Reads/writes on 0/1/2 will return
@@ -426,9 +446,10 @@ impl<FS: ShimFS> LinuxShim<FS> {
 
         LinuxShimTask {
             task: Task {
-                global: self.0.clone(),
+                global: self.global.clone(),
+                net: self.root_net.clone(),
                 thread: syscalls::process::ThreadState::new_process(params.pid),
-                wait_state: wait::WaitState::new(self.0.platform),
+                wait_state: wait::WaitState::new(self.global.platform),
                 pid: params.pid,
                 ppid: params.ppid,
                 tid: params.pid,
@@ -460,18 +481,24 @@ impl<FS: ShimFS> LinuxShim<FS> {
         parent_task: &LinuxShimTask<FS>,
     ) -> LinuxShimTask<FS> {
         let parent_files = parent_task.task.files.borrow();
-        let files = parent_files.fork_files_state(&self.0);
+        let files = parent_files.fork_files_state(&self.global);
         files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR - 1);
 
         // Inherit the parent's current working directory and umask.
         let parent_fs = parent_task.task.fs.borrow();
         let child_fs_state: Arc<syscalls::file::FsState> = Arc::new((*parent_fs).as_ref().clone());
 
+        // Each forked process gets its own fresh Network instance.
+        let mut child_net = Network::new(&self.global.litebox);
+        child_net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
+        let child_net = Arc::new(litebox::sync::Mutex::new(child_net));
+
         LinuxShimTask {
             task: Task {
-                global: self.0.clone(),
+                global: self.global.clone(),
+                net: child_net,
                 thread: syscalls::process::ThreadState::new_process(params.pid),
-                wait_state: wait::WaitState::new(self.0.platform),
+                wait_state: wait::WaitState::new(self.global.platform),
                 pid: params.pid,
                 ppid: params.ppid,
                 tid: params.pid,
@@ -711,9 +738,7 @@ impl<FS: ShimFS> Task<FS> {
             // SAFETY: In central mode, buf points to the shmem data region
             // (central rewrites the pointer). The memory is valid and writable
             // for `count` bytes.
-            let slice = unsafe {
-                core::slice::from_raw_parts_mut(addr as *mut u8, count)
-            };
+            let slice = unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, count) };
             let mut read_total = 0;
             while read_total < count {
                 let cur_offset = offset + (read_total.reinterpret_as_signed() as i64);
@@ -813,9 +838,8 @@ impl<FS: ShimFS> Task<FS> {
                             // SAFETY: In central mode, buf points to the shmem
                             // data region (central rewrites rsi). The memory is
                             // valid and writable for `count` bytes.
-                            let slice = unsafe {
-                                core::slice::from_raw_parts_mut(addr as *mut u8, count)
-                            };
+                            let slice =
+                                unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, count) };
                             self.sys_read(fd, slice, None)
                         }
                     }
@@ -871,9 +895,8 @@ impl<FS: ShimFS> Task<FS> {
                         // SAFETY: In central mode, buf points to valid, stable
                         // host memory (shmem or central's own heap) for the
                         // duration of this synchronous dispatch.
-                        let slice = unsafe {
-                            core::slice::from_raw_parts(addr as *const u8, count)
-                        };
+                        let slice =
+                            unsafe { core::slice::from_raw_parts(addr as *const u8, count) };
                         self.sys_write(fd, slice, None)
                     }
                 }
@@ -931,9 +954,8 @@ impl<FS: ShimFS> Task<FS> {
                         Err(Errno::EFAULT)
                     } else {
                         // SAFETY: same reasoning as SyscallRequest::Write above.
-                        let slice = unsafe {
-                            core::slice::from_raw_parts(addr as *const u8, count)
-                        };
+                        let slice =
+                            unsafe { core::slice::from_raw_parts(addr as *const u8, count) };
                         self.sys_pwrite64(fd, slice, offset)
                     }
                 }
@@ -1368,8 +1390,6 @@ struct GlobalState<FS: ShimFS> {
     futex_manager: FutexManager<Platform>,
     /// The anonymous pipe implementation.
     pipes: Pipes<Platform>,
-    /// The network subsystem.
-    net: litebox::sync::Mutex<Platform, Network<Platform>>,
     /// The time when the shim was started.
     boot_time: <Platform as TimeProvider>::Instant,
     /// Optional load filter function to modify environment variables during program loading.
@@ -1383,6 +1403,9 @@ struct GlobalState<FS: ShimFS> {
 
 struct Task<FS: ShimFS> {
     global: Arc<GlobalState<FS>>,
+    /// Per-process network state. Shared among threads in the same process
+    /// via Arc, but each forked process gets its own instance.
+    net: Arc<litebox::sync::Mutex<Platform, Network<Platform>>>,
     wait_state: wait::WaitState,
     thread: syscalls::process::ThreadState,
     /// Process ID
@@ -1425,8 +1448,11 @@ mod test_utils {
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let files = Arc::new(syscalls::file::FilesState::new(fs));
             files.initialize_stdio_in_shared_descriptors_table(&self);
+            let mut net = Network::new(&self.litebox);
+            net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
             Task {
                 wait_state: wait::WaitState::new(self.platform),
+                net: Arc::new(litebox::sync::Mutex::new(net)),
                 thread: syscalls::process::ThreadState::new_process(pid),
                 pid,
                 ppid: 0,
@@ -1456,6 +1482,7 @@ mod test_utils {
             let task = Task {
                 wait_state: wait::WaitState::new(self.global.platform),
                 global: self.global.clone(),
+                net: self.net.clone(),
                 thread: self.thread.new_thread(tid)?,
                 pid: self.pid,
                 ppid: self.ppid,

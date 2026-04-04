@@ -768,6 +768,7 @@ impl<FS: ShimFS> Task<FS> {
                 Box::new(NewThreadArgs {
                     task: Task {
                         global: self.global.clone(),
+                        net: self.net.clone(),
                         wait_state: crate::wait::WaitState::new(self.global.platform),
                         thread,
                         pid: self.pid,

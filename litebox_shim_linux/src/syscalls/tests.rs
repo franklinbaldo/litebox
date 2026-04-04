@@ -3,8 +3,8 @@
 
 use litebox::fs::{FileSystem as _, Mode, OFlags};
 use litebox::platform::RawConstPointer as _;
-use litebox_common_linux::{AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, errno::Errno};
-use litebox_platform_multiplex::{Platform, set_platform};
+use litebox_common_linux::{errno::Errno, AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags};
+use litebox_platform_multiplex::{set_platform, Platform};
 
 use crate::MutPtr;
 
@@ -34,22 +34,19 @@ pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task<crate:
     });
     let tar_ro_fs = litebox::fs::tar_ro::FileSystem::new(litebox, TEST_TAR_FILE.into());
     let fs = alloc::sync::Arc::new(shim_builder.default_fs(in_mem_fs, tar_ro_fs));
-    let task = shim_builder.build().0.new_test_task(fs);
+    let task = shim_builder.build().global.new_test_task(fs);
 
     if tun_device_name.is_some() {
-        let global = task.global.clone();
+        let net = task.net.clone();
         // Start a background thread to perform network interaction
         // Naive implementation for testing purpose only
-        std::thread::spawn(move || {
-            loop {
-                while global
-                    .net
-                    .lock()
-                    .perform_platform_interaction()
-                    .call_again_immediately()
-                {}
-                core::hint::spin_loop();
-            }
+        std::thread::spawn(move || loop {
+            while net
+                .lock()
+                .perform_platform_interaction()
+                .call_again_immediately()
+            {}
+            core::hint::spin_loop();
         });
     }
     task
@@ -463,7 +460,7 @@ fn test_umask_behavior() {
 
 #[test]
 fn test_rlimit_nofile() {
-    use litebox_common_linux::{Rlimit, RlimitResource, errno::Errno};
+    use litebox_common_linux::{errno::Errno, Rlimit, RlimitResource};
 
     let task = crate::syscalls::tests::init_platform(None);
 

@@ -10,7 +10,7 @@ use alloc::{
 };
 use core::sync::atomic::{AtomicUsize, Ordering};
 use litebox::{
-    event::{wait::WaitError, Events},
+    event::{Events, wait::WaitError},
     fd::{FdEnabledSubsystem, MetadataError, TypedFd},
     fs::{Mode, OFlags, SeekWhence},
     path,
@@ -18,8 +18,8 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
-    errno::Errno, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
-    IoReadVec, IoWriteVec, IoctlArg, TimeParam,
+    AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, IoReadVec,
+    IoWriteVec, IoctlArg, TimeParam, errno::Errno,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -385,6 +385,7 @@ impl<FS: ShimFS> Task<FS> {
                 |fd| files.fs.write(fd, buf, offset).map_err(Errno::from),
                 |fd| {
                     self.global.sendto(
+                        &self.net,
                         &self.wait_cx(),
                         fd,
                         buf,
@@ -508,7 +509,7 @@ impl<FS: ShimFS> Task<FS> {
         }
         if let Ok(fd) = rds.fd_consume_raw_integer(raw_fd) {
             drop(rds);
-            return self.global.close_socket(&self.wait_cx(), fd);
+            return self.global.close_socket(&self.net, &self.wait_cx(), fd);
         }
         if let Ok(fd) = rds.fd_consume_raw_integer(raw_fd) {
             drop(rds);
@@ -712,6 +713,7 @@ impl<FS: ShimFS> Task<FS> {
                 |fd| {
                     write_to_iovec(iovs, |buf| {
                         self.global.sendto(
+                            &self.net,
                             &self.wait_cx(),
                             fd,
                             buf,
@@ -1302,8 +1304,8 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle syscall `chdir`
     pub fn sys_chdir(&self, pathname: impl path::Arg) -> Result<(), Errno> {
-        use litebox::fs::errors::{FileStatusError, PathError};
         use litebox::fs::FileType;
+        use litebox::fs::errors::{FileStatusError, PathError};
         use litebox::path::Arg as _;
 
         // Resolve relative paths against CWD, then normalize (handle `.` / `..`).

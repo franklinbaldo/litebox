@@ -55,6 +55,9 @@ macro_rules! convert_flags {
 
 pub(crate) type SocketFd = litebox::net::SocketFd<Platform>;
 
+/// Shorthand for the per-process network mutex type.
+type NetMutex = litebox::sync::Mutex<Platform, litebox::net::Network<Platform>>;
+
 impl<FS: ShimFS> super::file::FilesState<FS> {
     /// Helper to dispatch socket operations based on socket type (INET vs Unix).
     ///
@@ -186,6 +189,7 @@ pub(super) enum SocketOptionValue {
 impl<FS: ShimFS> GlobalState<FS> {
     pub(crate) fn initialize_socket(
         &self,
+        net: &NetMutex,
         fd: &SocketFd,
         sock_type: SockType,
         flags: SockFlags,
@@ -225,7 +229,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         assert!(old.is_none());
         drop(dt);
 
-        if !self.net.lock().set_socket_proxy(fd, proxy.clone()) {
+        if !net.lock().set_socket_proxy(fd, proxy.clone()) {
             unreachable!("failed to set socket proxy for a newly-created socket");
         }
         proxy
@@ -309,6 +313,7 @@ impl<FS: ShimFS> GlobalState<FS> {
     }
     fn setsockopt(
         &self,
+        net: &NetMutex,
         fd: &SocketFd,
         optname: SocketOptionName,
         optval: ConstPtr<u8>,
@@ -358,7 +363,7 @@ impl<FS: ShimFS> GlobalState<FS> {
             })?;
             // Apply deferred TCP option after releasing the descriptor table write lock.
             if let Some(tcp_data) = deferred_tcp_option
-                && let Err(err) = self.net.lock().set_tcp_option(fd, tcp_data)
+                && let Err(err) = net.lock().set_tcp_option(fd, tcp_data)
             {
                 match err {
                     litebox::net::errors::SetTcpOptionError::InvalidFd => {
@@ -402,7 +407,7 @@ impl<FS: ShimFS> GlobalState<FS> {
                         .to_owned_slice(TCP_CONGESTION_NAME_MAX.min(optlen))
                         .ok_or(Errno::EFAULT)?;
                     let name = core::str::from_utf8(&data).map_err(|_| Errno::EINVAL)?;
-                    self.net.lock().set_tcp_option(
+                    net.lock().set_tcp_option(
                         fd,
                         match name {
                             "reno" | "cubic" => {
@@ -431,8 +436,7 @@ impl<FS: ShimFS> GlobalState<FS> {
                         // CORK is the opposite of NODELAY
                         val == 0
                     };
-                    self.net
-                        .lock()
+                    net.lock()
                         .set_tcp_option(fd, litebox::net::TcpOptionData::NODELAY(on))?;
                 }
                 TcpOption::KEEPINTVL => {
@@ -441,8 +445,7 @@ impl<FS: ShimFS> GlobalState<FS> {
                     if !(1..=MAX_TCP_KEEPINTVL).contains(&val) {
                         return Err(Errno::EINVAL);
                     }
-                    self.net
-                        .lock()
+                    net.lock()
                         .set_tcp_option(
                             fd,
                             litebox::net::TcpOptionData::KEEPALIVE(Some(
@@ -509,6 +512,7 @@ impl<FS: ShimFS> GlobalState<FS> {
     }
     fn getsockopt(
         &self,
+        net: &NetMutex,
         fd: &SocketFd,
         optname: SocketOptionName,
         optval: MutPtr<u8>,
@@ -563,8 +567,7 @@ impl<FS: ShimFS> GlobalState<FS> {
             SocketOptionName::TCP(tcpopt) => {
                 match tcpopt {
                     TcpOption::CONGESTION => {
-                        let TcpOptionData::CONGESTION(congestion) = self
-                            .net
+                        let TcpOptionData::CONGESTION(congestion) = net
                             .lock()
                             .get_tcp_option(fd, litebox::net::TcpOptionName::CONGESTION)?
                         else {
@@ -586,8 +589,7 @@ impl<FS: ShimFS> GlobalState<FS> {
                         return Err(Errno::EOPNOTSUPP);
                     }
                     TcpOption::KEEPINTVL => {
-                        let TcpOptionData::KEEPALIVE(interval) = self
-                            .net
+                        let TcpOptionData::KEEPALIVE(interval) = net
                             .lock()
                             .get_tcp_option(fd, litebox::net::TcpOptionName::KEEPALIVE)?
                         else {
@@ -596,8 +598,7 @@ impl<FS: ShimFS> GlobalState<FS> {
                         interval.map_or(0, |d| d.as_secs().try_into().unwrap())
                     }
                     TcpOption::NODELAY | TcpOption::CORK => {
-                        let TcpOptionData::NODELAY(nodelay) = self
-                            .net
+                        let TcpOptionData::NODELAY(nodelay) = net
                             .lock()
                             .get_tcp_option(fd, litebox::net::TcpOptionName::NODELAY)?
                         else {
@@ -618,10 +619,11 @@ impl<FS: ShimFS> GlobalState<FS> {
 
     fn try_accept(
         &self,
+        net: &NetMutex,
         fd: &SocketFd,
         peer: Option<&mut SocketAddr>,
     ) -> Result<SocketFd, TryOpError<Errno>> {
-        self.net.lock().accept(fd, peer).map_err(|e| match e {
+        net.lock().accept(fd, peer).map_err(|e| match e {
             AcceptError::NoConnectionsReady => TryOpError::TryAgain,
             AcceptError::InvalidFd | AcceptError::NotListening => TryOpError::Other(e.into()),
             _ => unimplemented!(),
@@ -630,6 +632,7 @@ impl<FS: ShimFS> GlobalState<FS> {
 
     fn accept(
         &self,
+        net: &NetMutex,
         cx: &WaitContext<'_, Platform>,
         fd: &SocketFd,
         mut peer: Option<&mut SocketAddr>,
@@ -642,17 +645,18 @@ impl<FS: ShimFS> GlobalState<FS> {
                 proxy.register_observer(observer, filter);
                 Ok(())
             },
-            || self.try_accept(fd, peer.as_deref_mut()),
+            || self.try_accept(net, fd, peer.as_deref_mut()),
         )
         .map_err(Errno::from)
     }
 
-    fn bind(&self, fd: &SocketFd, sockaddr: SocketAddr) -> Result<(), Errno> {
-        self.net.lock().bind(fd, &sockaddr).map_err(Errno::from)
+    fn bind(&self, net: &NetMutex, fd: &SocketFd, sockaddr: SocketAddr) -> Result<(), Errno> {
+        net.lock().bind(fd, &sockaddr).map_err(Errno::from)
     }
 
     fn connect(
         &self,
+        net: &NetMutex,
         cx: &WaitContext<'_, Platform>,
         fd: &SocketFd,
         sockaddr: SocketAddr,
@@ -669,7 +673,7 @@ impl<FS: ShimFS> GlobalState<FS> {
                 proxy.register_observer(observer, filter);
                 Ok(())
             },
-            || match self.net.lock().connect(fd, &sockaddr, check_progress) {
+            || match net.lock().connect(fd, &sockaddr, check_progress) {
                 Ok(()) => Ok(()),
                 Err(litebox::net::errors::ConnectError::InProgress) => {
                     check_progress = true;
@@ -684,8 +688,8 @@ impl<FS: ShimFS> GlobalState<FS> {
         })
     }
 
-    fn listen(&self, fd: &SocketFd, backlog: u16) -> Result<(), Errno> {
-        self.net.lock().listen(fd, backlog).map_err(Errno::from)
+    fn listen(&self, net: &NetMutex, fd: &SocketFd, backlog: u16) -> Result<(), Errno> {
+        net.lock().listen(fd, backlog).map_err(Errno::from)
     }
 
     /// Send data via socket channel (lock-free path).
@@ -694,6 +698,7 @@ impl<FS: ShimFS> GlobalState<FS> {
     /// and the network worker later drains it.
     pub(crate) fn sendto(
         &self,
+        net: &NetMutex,
         cx: &WaitContext<'_, Platform>,
         fd: &SocketFd,
         buf: &[u8],
@@ -709,9 +714,9 @@ impl<FS: ShimFS> GlobalState<FS> {
             && proxy.local_port() == 0
         {
             // UDP socket is unbound - bind to an ephemeral port
-            let mut net = self.net.lock();
+            let mut net_guard = net.lock();
             // Bind with port 0 to get an ephemeral port
-            if let Err(err) = net.bind(
+            if let Err(err) = net_guard.bind(
                 fd,
                 &SocketAddr::V4(core::net::SocketAddrV4::new(
                     core::net::Ipv4Addr::UNSPECIFIED,
@@ -729,7 +734,7 @@ impl<FS: ShimFS> GlobalState<FS> {
                 }
             }
             // Get the assigned port
-            let local_addr = net.get_local_addr(fd).map_err(Errno::from)?;
+            let local_addr = net_guard.get_local_addr(fd).map_err(Errno::from)?;
             // If another thread already set a port, that's fine - we'll use theirs
             let _ = proxy.set_local_port(local_addr.port());
         }
@@ -868,6 +873,7 @@ impl<FS: ShimFS> GlobalState<FS> {
 
     pub(crate) fn close_socket(
         &self,
+        net: &NetMutex,
         cx: &WaitContext<'_, Platform>,
         fd: Arc<SocketFd>,
     ) -> Result<(), Errno> {
@@ -885,7 +891,7 @@ impl<FS: ShimFS> GlobalState<FS> {
                 proxy.register_observer(observer, filter);
                 Ok(())
             },
-            || match self.net.lock().close(&fd, behavior) {
+            || match net.lock().close(&fd, behavior) {
                 Ok(()) => Ok(()),
                 Err(litebox::net::errors::CloseError::DataPending) => Err(TryOpError::TryAgain),
                 Err(litebox::net::errors::CloseError::InvalidFd) => {
@@ -895,8 +901,7 @@ impl<FS: ShimFS> GlobalState<FS> {
             },
         ) {
             Ok(()) => Ok(()),
-            Err(TryOpError::WaitError(WaitError::TimedOut)) => self
-                .net
+            Err(TryOpError::WaitError(WaitError::TimedOut)) => net
                 .lock()
                 .close(&fd, CloseBehavior::Immediate)
                 .map_err(Errno::from),
@@ -961,8 +966,8 @@ impl<FS: ShimFS> Task<FS> {
                     SockType::Raw => todo!(),
                     _ => unimplemented!(),
                 };
-                let socket = self.global.net.lock().socket(protocol)?;
-                let _ = self.global.initialize_socket(&socket, ty, flags);
+                let socket = self.net.lock().socket(protocol)?;
+                let _ = self.global.initialize_socket(&self.net, &socket, ty, flags);
                 let Ok(raw_fd) = files.insert_raw_fd(socket) else {
                     unimplemented!()
                 };
@@ -1214,14 +1219,14 @@ impl<FS: ShimFS> Task<FS> {
                     want_peer.then(|| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
                 let accepted_file =
                     self.global
-                        .accept(&self.wait_cx(), fd, socket_addr.as_mut())?;
+                        .accept(&self.net, &self.wait_cx(), fd, socket_addr.as_mut())?;
                 let peer_addr = socket_addr.map(SocketAddress::Inet);
 
-                let proxy = self
-                    .global
-                    .initialize_socket(&accepted_file, sock_type, flags);
+                let proxy =
+                    self.global
+                        .initialize_socket(&self.net, &accepted_file, sock_type, flags);
                 proxy.set_state(SocketState::Connected);
-                let _ = self.global.net.lock().perform_platform_interaction();
+                let _ = self.net.lock().perform_platform_interaction();
                 let Ok(raw_fd) = files.insert_raw_fd(accepted_file) else {
                     unimplemented!()
                 };
@@ -1273,7 +1278,7 @@ impl<FS: ShimFS> Task<FS> {
             sockfd,
             |fd| {
                 let addr = sockaddr.clone().inet().ok_or(Errno::EAFNOSUPPORT)?;
-                self.global.connect(&self.wait_cx(), fd, addr)
+                self.global.connect(&self.net, &self.wait_cx(), fd, addr)
             },
             |file| {
                 let addr = sockaddr.clone().unix().ok_or(Errno::EAFNOSUPPORT)?;
@@ -1301,7 +1306,7 @@ impl<FS: ShimFS> Task<FS> {
             sockfd,
             |fd| {
                 let addr = sockaddr.clone().inet().ok_or(Errno::EAFNOSUPPORT)?;
-                self.global.bind(fd, addr)
+                self.global.bind(&self.net, fd, addr)
             },
             |file| {
                 let addr = sockaddr.clone().unix().ok_or(Errno::EAFNOSUPPORT)?;
@@ -1321,7 +1326,7 @@ impl<FS: ShimFS> Task<FS> {
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
-            |fd| self.global.listen(fd, backlog),
+            |fd| self.global.listen(&self.net, fd, backlog),
             |file| file.listen(backlog, &self.global),
         )
     }
@@ -1350,8 +1355,7 @@ impl<FS: ShimFS> Task<FS> {
             }
             // SAFETY: In central mode, buf points to valid, stable host memory
             // for the duration of this synchronous dispatch.
-            let buf_slice =
-                unsafe { core::slice::from_raw_parts(buf_addr as *const u8, len) };
+            let buf_slice = unsafe { core::slice::from_raw_parts(buf_addr as *const u8, len) };
             self.do_sendto(fd, buf_slice, flags, sockaddr)
         }
         #[cfg(not(feature = "platform_central"))]
@@ -1376,7 +1380,7 @@ impl<FS: ShimFS> Task<FS> {
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
                 self.global
-                    .sendto(&self.wait_cx(), fd, buf, flags, sockaddr)
+                    .sendto(&self.net, &self.wait_cx(), fd, buf, flags, sockaddr)
             },
             |file| {
                 let addr = sockaddr
@@ -1449,17 +1453,22 @@ impl<FS: ShimFS> Task<FS> {
                         }
                         // SAFETY: In central mode, iov_base points to valid,
                         // stable host memory for this dispatch.
-                        let buf = unsafe {
-                            core::slice::from_raw_parts(buf_addr as *const u8, len)
-                        };
+                        let buf =
+                            unsafe { core::slice::from_raw_parts(buf_addr as *const u8, len) };
                         self.global
-                            .sendto(&self.wait_cx(), fd, buf, flags, sock_addr)?
+                            .sendto(&self.net, &self.wait_cx(), fd, buf, flags, sock_addr)?
                     };
                     #[cfg(not(feature = "platform_central"))]
                     let sent = {
                         let buf = base.to_owned_slice(len).ok_or(Errno::EFAULT)?;
-                        self.global
-                            .sendto(&self.wait_cx(), fd, &buf, flags, sock_addr)?
+                        self.global.sendto(
+                            &self.net,
+                            &self.wait_cx(),
+                            fd,
+                            &buf,
+                            flags,
+                            sock_addr,
+                        )?
                     };
                     total_sent += sent;
                 }
@@ -1494,9 +1503,8 @@ impl<FS: ShimFS> Task<FS> {
             // SAFETY: In central mode, buf points to the shmem data region
             // (central rewrites the pointer). The memory is valid and writable
             // for `len` bytes (capped at MAX_LEN).
-            let recv_buf = unsafe {
-                core::slice::from_raw_parts_mut(buf_addr as *mut u8, MAX_LEN.min(len))
-            };
+            let recv_buf =
+                unsafe { core::slice::from_raw_parts_mut(buf_addr as *mut u8, MAX_LEN.min(len)) };
             self.do_recvfrom(
                 sockfd,
                 recv_buf,
@@ -1616,7 +1624,10 @@ impl<FS: ShimFS> Task<FS> {
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
-            |fd| self.global.setsockopt(fd, optname, optval, optlen),
+            |fd| {
+                self.global
+                    .setsockopt(&self.net, fd, optname, optval, optlen)
+            },
             |file| file.setsockopt(&self.global, optname, optval, optlen),
         )
     }
@@ -1660,7 +1671,7 @@ impl<FS: ShimFS> Task<FS> {
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
-            |fd| self.global.getsockopt(fd, optname, optval, len),
+            |fd| self.global.getsockopt(&self.net, fd, optname, optval, len),
             |file| file.getsockopt(&self.global, optname, optval, len),
         )
     }
@@ -1683,8 +1694,7 @@ impl<FS: ShimFS> Task<FS> {
             &self.global,
             sockfd,
             |fd| {
-                self.global
-                    .net
+                self.net
                     .lock()
                     .get_local_addr(fd)
                     .map(SocketAddress::Inet)
@@ -1712,8 +1722,7 @@ impl<FS: ShimFS> Task<FS> {
             &self.global,
             sockfd,
             |fd| {
-                self.global
-                    .net
+                self.net
                     .lock()
                     .get_remote_addr(fd)
                     .map(SocketAddress::Inet)
@@ -1742,8 +1751,7 @@ impl<FS: ShimFS> Task<FS> {
             &self.global,
             sockfd,
             |fd| {
-                self.global
-                    .net
+                self.net
                     .lock()
                     .shutdown(fd, shut_rd, shut_wr)
                     .map_err(Errno::from)
