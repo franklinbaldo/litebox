@@ -11,7 +11,7 @@ use alloc::{
     vec,
 };
 use litebox::{
-    event::{Events, wait::WaitError},
+    event::{wait::WaitError, Events},
     fd::{FdEnabledSubsystem, MetadataError, TypedFd},
     fs::{Mode, OFlags, SeekWhence},
     path,
@@ -19,9 +19,9 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
-    AtFlags, ClockId, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
-    IoReadVec, IoWriteVec, IoctlArg, ItimerSpec, STATX_BASIC_STATS, StatfsBuf, StatxBuf,
-    StatxTimestamp, TMPFS_MAGIC, TimeParam, TimerfdFlags, TimerfdTimerFlags, errno::Errno,
+    errno::Errno, AtFlags, ClockId, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags,
+    FileStat, IoReadVec, IoWriteVec, IoctlArg, ItimerSpec, StatfsBuf, StatxBuf, StatxTimestamp,
+    TimeParam, TimerfdFlags, TimerfdTimerFlags, STATX_BASIC_STATS, TMPFS_MAGIC,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -2022,8 +2022,8 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle syscall `chdir`
     pub fn sys_chdir(&self, pathname: impl path::Arg) -> Result<(), Errno> {
-        use litebox::fs::FileType;
         use litebox::fs::errors::{FileStatusError, PathError};
+        use litebox::fs::FileType;
         use litebox::path::Arg as _;
 
         // Resolve relative paths against CWD, then normalize (handle `.` / `..`).
@@ -2960,6 +2960,7 @@ impl<FS: ShimFS> Task<FS> {
         clippy::cast_sign_loss,
         clippy::unnecessary_cast
     )]
+    #[allow(clippy::useless_conversion)]
     pub fn sys_statx(
         &self,
         dirfd: i32,
@@ -2974,27 +2975,27 @@ impl<FS: ShimFS> Task<FS> {
             stx_blksize: stat.st_blksize as u32,
             stx_attributes: 0,
             stx_nlink: stat.st_nlink as u32,
-            stx_uid: stat.st_uid,
-            stx_gid: stat.st_gid,
+            stx_uid: stat.st_uid.into(),
+            stx_gid: stat.st_gid.into(),
             stx_mode: stat.st_mode as u16,
             __spare0: [0],
-            stx_ino: stat.st_ino,
+            stx_ino: stat.st_ino.into(),
             stx_size: stat.st_size as u64,
             stx_blocks: stat.st_blocks as u64,
             stx_attributes_mask: 0,
             stx_atime: StatxTimestamp {
-                tv_sec: stat.st_atime,
+                tv_sec: stat.st_atime.into(),
                 tv_nsec: stat.st_atime_nsec as u32,
                 __reserved: 0,
             },
             stx_btime: StatxTimestamp::default(),
             stx_ctime: StatxTimestamp {
-                tv_sec: stat.st_ctime,
+                tv_sec: stat.st_ctime.into(),
                 tv_nsec: stat.st_ctime_nsec as u32,
                 __reserved: 0,
             },
             stx_mtime: StatxTimestamp {
-                tv_sec: stat.st_mtime,
+                tv_sec: stat.st_mtime.into(),
                 tv_nsec: stat.st_mtime_nsec as u32,
                 __reserved: 0,
             },
