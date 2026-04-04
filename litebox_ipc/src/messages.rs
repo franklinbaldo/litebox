@@ -154,6 +154,7 @@ const _: () = assert!(size_of::<Pipe2Response>() == 16);
 ///
 /// Central writes this to the data region. Micro reads it to learn the
 /// shmem offset for the new socket's ring buffers.
+#[derive(Clone, Copy)]
 #[repr(C)]
 #[allow(clippy::pub_underscore_fields)]
 pub struct AcceptResponse {

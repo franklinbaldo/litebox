@@ -154,7 +154,7 @@ pub unsafe fn socket_try_read(header: *mut ShmemSocketHeader, buf: &mut [u8]) ->
     // Check for errors first.
     let flags = h.flags.load(Ordering::Acquire);
     if flags & socket_flags::CLOSED != 0 {
-        return -104; // ECONNRESET
+        return -i64::from(libc::ECONNRESET);
     }
     if flags & socket_flags::ERROR != 0 {
         let err = h.error.load(Ordering::Relaxed);
@@ -174,7 +174,7 @@ pub unsafe fn socket_try_read(header: *mut ShmemSocketHeader, buf: &mut [u8]) ->
         if flags & socket_flags::RX_SHUTDOWN != 0 {
             return 0; // EOF
         }
-        return -11; // EAGAIN
+        return -i64::from(libc::EAGAIN);
     }
 
     let to_read = buf.len().min(available);
@@ -212,9 +212,9 @@ pub unsafe fn socket_try_read(header: *mut ShmemSocketHeader, buf: &mut [u8]) ->
 pub unsafe fn socket_try_write(header: *mut ShmemSocketHeader, buf: &[u8]) -> i64 {
     let h = unsafe { &*header };
 
-    let flags = h.flags.load(Ordering::Relaxed);
+    let flags = h.flags.load(Ordering::Acquire);
     if flags & (socket_flags::TX_SHUTDOWN | socket_flags::CLOSED) != 0 {
-        return -32; // EPIPE
+        return -i64::from(libc::EPIPE);
     }
 
     let capacity = h.capacity as usize;
@@ -226,7 +226,7 @@ pub unsafe fn socket_try_write(header: *mut ShmemSocketHeader, buf: &[u8]) -> i6
 
     let available = capacity - (tail.wrapping_sub(head)) as usize;
     if available == 0 {
-        return -11; // EAGAIN
+        return -i64::from(libc::EAGAIN);
     }
 
     let to_write = buf.len().min(available);
@@ -276,7 +276,7 @@ pub unsafe fn socket_tx_drain(header: *mut ShmemSocketHeader, buf: &mut [u8]) ->
         if flags & socket_flags::TX_SHUTDOWN != 0 {
             return 0; // EOF
         }
-        return -11; // EAGAIN
+        return -i64::from(libc::EAGAIN);
     }
 
     let to_read = buf.len().min(available);
@@ -321,7 +321,7 @@ pub unsafe fn socket_rx_fill(header: *mut ShmemSocketHeader, buf: &[u8]) -> i64 
 
     let available = capacity - (tail.wrapping_sub(head)) as usize;
     if available == 0 {
-        return -11; // EAGAIN
+        return -i64::from(libc::EAGAIN);
     }
 
     let to_write = buf.len().min(available);
