@@ -121,7 +121,7 @@ struct TextSectionInfo {
 /// - trampoline size (8 bytes for 64-bit, 4 bytes for 32-bit)
 ///
 /// This layout allows loaders to read just the last 32/20 bytes to get the metadata. Even when
-/// there is no syscall instruction in the binary, the rewriter still appends the header and the initial
+/// no syscall instructions are patched, the rewriter still appends the header and the initial
 /// syscall-entry placeholder so the loader/audit path can tell the binary was processed.
 ///
 /// Returns the rewritten binary. Binaries that cannot or do not need to be
@@ -195,6 +195,8 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
 
         let trampoline_base_addr = find_addr_for_trampoline_code(&file)?;
 
+        let fork_to_vfork_patch = find_fork_vfork_patch(&file, &text_sections);
+
         (
             arch,
             dl_sysinfo_int80,
@@ -232,6 +234,27 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
             Err(InternalError::NoSyscallInstructionsFound) => {}
             Err(InternalError::Public(e)) => return Err(e),
             Err(e) => unreachable!("unexpected internal error: {e:?}"),
+        }
+    }
+
+    // Patch fork → vfork: overwrite the first bytes of __libc_fork with a
+    // JMP to __libc_vfork. This prevents glibc's fork wrapper from running
+    // post-fork handlers that corrupt shared state under vfork semantics.
+    if let Some((fork_file_offset, fork_patch_end, rel32)) = fork_to_vfork_patch {
+        #[allow(clippy::cast_possible_truncation)]
+        let off = fork_file_offset as usize;
+        #[allow(clippy::cast_possible_truncation)]
+        let patch_end = fork_patch_end as usize;
+        if off + 5 <= buf.len() && patch_end <= buf.len() && off + 5 <= patch_end {
+            buf[off] = 0xE9; // JMP rel32
+            buf[off + 1..off + 5].copy_from_slice(&rel32.to_le_bytes());
+        } else {
+            return Err(Error::ParseError(format!(
+                "fork→vfork patch range {off:#x}..{patch_end:#x} is invalid for buffer length {}",
+                buf.len(),
+            )));
+        }
+    }
         }
     }
 
@@ -478,9 +501,11 @@ fn hook_syscalls_in_section(
             // Put jump back location into rcx.
             let jmp_back_base = checked_add_u64(
                 trampoline_base_addr,
-                trampoline_data.len() as u64 + 7,
+                trampoline_data.len() as u64,
                 "x86_64 trampoline jump-back base",
             )?;
+            let jmp_back_base =
+                checked_add_u64(jmp_back_base, 7, "x86_64 trampoline jump-back base")?;
             trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D]); // LEA RCX, [RIP + disp32]
             trampoline_data.extend_from_slice(&rel32_bytes(
                 return_addr,
@@ -494,9 +519,10 @@ fn hook_syscalls_in_section(
             // We want: RIP + disp32 = syscall_entry_addr
             let entry_base = checked_add_u64(
                 trampoline_base_addr,
-                trampoline_data.len() as u64 + 4,
+                trampoline_data.len() as u64,
                 "x86_64 trampoline entry base",
             )?;
+            let entry_base = checked_add_u64(entry_base, 4, "x86_64 trampoline entry base")?;
             trampoline_data.extend_from_slice(&rel32_bytes(
                 syscall_entry_addr,
                 entry_base,
@@ -512,9 +538,10 @@ fn hook_syscalls_in_section(
             // We want: EAX + offset = syscall_entry_addr
             let call_base = checked_add_u64(
                 trampoline_base_addr,
-                trampoline_data.len() as u64 - 3,
+                trampoline_data.len() as u64,
                 "x86 trampoline entry base",
             )?;
+            let call_base = checked_sub_u64(call_base, 3, "x86 trampoline entry base")?;
             trampoline_data.extend_from_slice(&rel32_bytes(
                 syscall_entry_addr,
                 call_base,
@@ -526,9 +553,10 @@ fn hook_syscalls_in_section(
             // Add jmp back to original after syscall
             let jmp_back_base = checked_add_u64(
                 trampoline_base_addr,
-                trampoline_data.len() as u64 + 5,
+                trampoline_data.len() as u64,
                 "x86 trampoline jump-back base",
             )?;
+            let jmp_back_base = checked_add_u64(jmp_back_base, 5, "x86 trampoline jump-back base")?;
             trampoline_data.push(0xE9);
             trampoline_data.extend_from_slice(&rel32_bytes(
                 return_addr,
@@ -684,6 +712,86 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
 /// `ICEBP` alone does not trap on Linux in userspace, but `HLT` does
 /// (SIGSEGV in ring 3), and the `F1` prefix makes it easy for a signal
 /// handler to identify an intentionally poisoned syscall.
+
+/// Find fork and vfork symbols in the ELF and compute the patch needed to
+/// redirect fork -> vfork. Returns `Some((fork_file_offset, fork_patch_end, jmp_rel32))` if
+/// both symbols are found, or `None` if this binary doesn't export fork.
+fn find_fork_vfork_patch(
+    file: &object::File<'_>,
+    text_sections: &[TextSectionInfo],
+) -> Option<(u64, u64, i32)> {
+    use object::ObjectSymbol as _;
+
+    let mut fork_vaddr = None;
+    let mut vfork_vaddr = None;
+
+    // Restrict this rewrite to libc-specific symbols. Plain `fork`/`vfork` names may belong to
+    // arbitrary DSOs or user code, and retargeting them would silently change unrelated behavior.
+    for sym in file.dynamic_symbols() {
+        if sym.kind() != object::SymbolKind::Text {
+            continue;
+        }
+        let Ok(name) = sym.name() else { continue };
+        match name {
+            "__libc_fork" if fork_vaddr.is_none() => {
+                fork_vaddr = Some(sym.address());
+            }
+            "__libc_vfork" | "__vfork" if vfork_vaddr.is_none() => {
+                vfork_vaddr = Some(sym.address());
+            }
+            _ => {}
+        }
+    }
+
+    for sym in file.symbols() {
+        if sym.kind() != object::SymbolKind::Text {
+            continue;
+        }
+        let Ok(name) = sym.name() else { continue };
+        match name {
+            "__libc_fork" if fork_vaddr.is_none() => {
+                fork_vaddr = Some(sym.address());
+            }
+            "__libc_vfork" | "__vfork" if vfork_vaddr.is_none() => {
+                vfork_vaddr = Some(sym.address());
+            }
+            _ => {}
+        }
+    }
+
+    let fork_vaddr = fork_vaddr?;
+    let vfork_vaddr = vfork_vaddr?;
+    if fork_vaddr == 0 || vfork_vaddr == 0 {
+        return None;
+    }
+
+    // Convert fork's vaddr to a file offset using the text sections.
+    let (fork_file_offset, fork_patch_end) = text_sections.iter().find_map(|s| {
+        let section_end = s.vaddr + s.size;
+        if fork_vaddr >= s.vaddr
+            && fork_vaddr < section_end
+            && fork_vaddr
+                .checked_add(5)
+                .is_some_and(|end| end <= section_end)
+        {
+            let file_offset = s.file_offset + (fork_vaddr - s.vaddr);
+            let file_end = s.file_offset + s.size;
+            Some((file_offset, file_end))
+        } else {
+            None
+        }
+    })?;
+
+    // Compute the relative offset for a JMP rel32 instruction.
+    // JMP rel32 encodes: target = rip_after_jmp + rel32
+    // rip_after_jmp = fork_vaddr + 5 (size of JMP rel32 instruction)
+    let rel32 = i64::try_from(vfork_vaddr)
+        .ok()?
+        .checked_sub(i64::try_from(fork_vaddr).ok()? + 5)?;
+    let rel32 = i32::try_from(rel32).ok()?;
+
+    Some((fork_file_offset, fork_patch_end, rel32))
+}
 ///
 /// `syscall` (0F 05) and `int 0x80` (CD 80) are both 2 bytes — same size as
 /// `ICEBP; HLT`.  For `call DWORD PTR gs:0x10` (7 bytes), the remaining 5
@@ -722,6 +830,71 @@ fn rel32_bytes(target: u64, base: u64, context: &'static str) -> Result<[u8; 4]>
         ))
     })?;
     Ok(disp.to_le_bytes())
+}
+
+/// Patch a single mapped code segment in-place, returning trampoline stubs.
+///
+/// This is the runtime counterpart to [`hook_syscalls_in_elf`]. Instead of
+/// processing a whole ELF file, it operates on a single already-mapped code
+/// region — the caller is responsible for making the region writable before
+/// calling and restoring permissions afterwards.
+///
+/// # Arguments
+///
+/// * `code` — mutable slice of the mapped code segment.
+/// * `code_vaddr` — virtual address of `code[0]` in guest memory.
+/// * `trampoline_write_vaddr` — virtual address where the returned stub bytes
+///   will be placed by the caller.
+/// * `syscall_entry_addr` — address of the 8-byte entry-point value that
+///   each stub's indirect jump targets.
+///
+/// # Returns
+///
+/// The trampoline stub bytes. The caller must copy them to
+/// `trampoline_write_vaddr`. Returns an empty `Vec` if no syscall
+/// instructions are found in `code`.
+///
+/// `skipped_addrs` receives the virtual addresses of any `syscall`
+/// instructions that could not be patched (replaced with `ICEBP; HLT` so they
+/// trap instead of escaping to the host kernel).
+pub fn patch_code_segment(
+    code: &mut [u8],
+    code_vaddr: u64,
+    trampoline_write_vaddr: u64,
+    syscall_entry_addr: u64,
+    skipped_addrs: &mut Vec<u64>,
+) -> Result<Vec<u8>> {
+    let arch = Arch::X86_64; // runtime patching is x86-64 only
+
+    // Build control-transfer targets for this segment.
+    let instructions = decode_section_instructions(arch, code, code_vaddr)?;
+    let mut control_transfer_targets = BTreeSet::new();
+    for inst in &instructions {
+        let target = inst.near_branch_target();
+        if target != 0 {
+            control_transfer_targets.insert(target);
+        }
+    }
+
+    let mut trampoline_data = Vec::new();
+    match hook_syscalls_in_section(
+        arch,
+        &control_transfer_targets,
+        code_vaddr,
+        code,
+        trampoline_write_vaddr,
+        syscall_entry_addr,
+        None, // dl_sysinfo_int80 — not applicable on x86-64
+        &mut trampoline_data,
+    ) {
+        Ok(addrs) => {
+            skipped_addrs.extend(addrs);
+            Ok(trampoline_data)
+        }
+        Err(InternalError::NoSyscallInstructionsFound) => Ok(Vec::new()),
+        Err(InternalError::Public(e)) => Err(e),
+        Err(e) => unreachable!("unexpected internal error: {e:?}"),
+    }
 }
 
 fn find_addr_for_trampoline_code(file: &object::File<'_>) -> Result<u64> {
@@ -948,9 +1121,10 @@ fn hook_syscall_and_after(
         // We want: RIP + disp32 = syscall_entry_addr
         let entry_base = checked_add_u64(
             trampoline_base_addr,
-            trampoline_data.len() as u64 + 4,
+            trampoline_data.len() as u64,
             "x86_64 trampoline entry base",
         )?;
+        let entry_base = checked_add_u64(entry_base, 4, "x86_64 trampoline entry base")?;
         trampoline_data.extend_from_slice(&rel32_bytes(
             syscall_entry_addr,
             entry_base,
@@ -991,9 +1165,10 @@ fn hook_syscall_and_after(
     // Add jmp back to original after syscall
     let jmp_back_base = checked_add_u64(
         trampoline_base_addr,
-        trampoline_data.len() as u64 + 5,
+        trampoline_data.len() as u64,
         "trampoline jump-back base",
     )?;
+    let jmp_back_base = checked_add_u64(jmp_back_base, 5, "trampoline jump-back base")?;
     trampoline_data.push(0xE9);
     trampoline_data.extend_from_slice(&rel32_bytes(
         replace_end,
@@ -1133,9 +1308,10 @@ fn hook_syscall_before_and_after(
         let return_addr = next_inst.next_ip();
         let jmp_back_base = checked_add_u64(
             trampoline_base_addr,
-            trampoline_data.len() as u64 + 5,
+            trampoline_data.len() as u64,
             "x86 trampoline jump-back base",
         )?;
+        let jmp_back_base = checked_add_u64(jmp_back_base, 5, "x86 trampoline jump-back base")?;
         trampoline_data.push(0xE9);
         trampoline_data.extend_from_slice(&rel32_bytes(
             return_addr,
