@@ -426,7 +426,7 @@ pub(super) fn restore_sigcontext(
     Ok(ctx.rax)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "platform_linux_userland"))]
 mod tests {
     use super::*;
     use litebox_common_linux::signal::SigSet;
