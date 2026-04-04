@@ -238,6 +238,7 @@ impl<FS: ShimFS> Task<FS> {
                         true,
                         fixed_behavior == FixedAddressBehavior::Replace,
                         flags.contains(MapFlags::MAP_SHARED),
+                        false,
                     )
                 }
                 .unwrap();

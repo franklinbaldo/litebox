@@ -191,7 +191,11 @@ impl LinuxShimBuilder {
         net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
         let global = Arc::new(GlobalState {
             platform: self.platform,
-            pm: PageManager::new(&self.litebox),
+            pm: PageManager::new(
+                &self.litebox,
+                <Platform as litebox::platform::PageManagementProvider<{ PAGE_SIZE }>>::TASK_ADDR_MIN
+                    ..<Platform as litebox::platform::PageManagementProvider<{ PAGE_SIZE }>>::TASK_ADDR_MAX,
+            ),
             futex_manager: FutexManager::new(),
             pipes: Pipes::new(&self.litebox),
             net: litebox::sync::Mutex::new(net),
