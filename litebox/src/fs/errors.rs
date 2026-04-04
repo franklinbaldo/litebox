@@ -11,6 +11,16 @@ use super::FileSystem;
 
 use thiserror::Error;
 
+/// Possible errors from [`FileSystem::create_anonymous_file`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum CreateAnonymousFileError {
+    #[error("I/O error")]
+    Io,
+    #[error("operation not supported")]
+    NotSupported,
+}
+
 /// Possible errors from [`FileSystem::open`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
@@ -27,11 +37,11 @@ pub enum OpenError {
     TruncateError(#[from] TruncateError),
     #[error("I/O error")]
     Io,
-    #[error("operation interrupted")]
+    #[error("operation was interrupted")]
     Interrupted,
     #[error("fd has been closed already")]
     ClosedFd,
-    #[error("a component used as a directory in pathname is not, in fact, a directory")]
+    #[error("dirfd does not refer to a directory")]
     NotADirectory,
     #[error(transparent)]
     PathError(#[from] PathError),
@@ -41,7 +51,8 @@ pub enum OpenError {
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum CloseError {
-    #[error("I/O error")]
+    /// An I/O error occurred while flushing buffered writes.
+    #[error("I/O error during close flush")]
     Io,
 }
 
@@ -57,9 +68,9 @@ pub enum ReadError {
     NotForReading,
     #[error("I/O error")]
     Io,
-    #[error("read would block")]
+    #[error("operation would block")]
     WouldBlock,
-    #[error("operation interrupted")]
+    #[error("operation was interrupted")]
     Interrupted,
 }
 
@@ -75,7 +86,7 @@ pub enum WriteError {
     NotForWriting,
     #[error("I/O error")]
     Io,
-    #[error("operation interrupted")]
+    #[error("operation was interrupted")]
     Interrupted,
 }
 
@@ -158,7 +169,7 @@ pub enum UnlinkError {
     Io,
     #[error("fd has been closed already")]
     ClosedFd,
-    #[error("a component used as a directory in pathname is not, in fact, a directory")]
+    #[error("dirfd does not refer to a directory")]
     NotADirectory,
     #[error(transparent)]
     PathError(#[from] PathError),
@@ -202,6 +213,34 @@ pub enum RmdirError {
     PathError(#[from] PathError),
 }
 
+/// Possible errors from [`FileSystem::rename`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum RenameError {
+    #[error("a directory component in either path does not allow write permission")]
+    NoWritePerms,
+    #[error("new path is an existing directory but old path is not a directory")]
+    IsADirectory,
+    #[error("old path is a directory but new path is not a directory")]
+    NotADirectory,
+    #[error("new path is a non-empty directory")]
+    NotEmpty,
+    #[error("new path contains a prefix that names old path")]
+    InvalidArgument,
+    #[error("the filesystem does not support renaming")]
+    ReadOnlyFileSystem,
+    #[error("old and new are on different filesystems")]
+    CrossDevice,
+    #[error("old and new are the same file")]
+    SameFile,
+    #[error("I/O error")]
+    Io,
+    #[error("fd has been closed already")]
+    ClosedFd,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
 /// Possible errors from [`FileSystem::read_dir`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
@@ -220,12 +259,70 @@ pub enum ReadDirError {
 pub enum FileStatusError {
     #[error("fd has been closed already")]
     ClosedFd,
+    #[error("dirfd does not refer to a directory")]
+    NotADirectory,
     #[error("I/O error")]
     Io,
-    #[error("a component used as a directory in pathname is not, in fact, a directory")]
-    NotADirectory,
     #[error("too many levels of symbolic links")]
     SymlinkLoop,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
+/// Possible errors from [`FileSystem::read_link`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum ReadLinkError {
+    #[error("not a symbolic link")]
+    NotASymlink,
+    #[error("I/O error")]
+    Io,
+    #[error("operation not supported")]
+    NotSupported,
+    #[error("fd has been closed already")]
+    ClosedFd,
+    #[error("dirfd does not refer to a directory")]
+    NotADirectory,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
+/// Possible errors from [`FileSystem::symlink`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum SymlinkError {
+    #[error("pathname already exists")]
+    AlreadyExists,
+    #[error("the named file resides on a read-only filesystem")]
+    ReadOnlyFileSystem,
+    #[error("the parent directory does not allow write permission")]
+    NoWritePerms,
+    #[error("I/O error")]
+    Io,
+    #[error("operation not supported")]
+    NotSupported,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
+/// Possible errors from [`FileSystem::link`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum LinkError {
+    #[error("pathname already exists")]
+    AlreadyExists,
+    #[error("the named file resides on a read-only filesystem")]
+    ReadOnlyFileSystem,
+    #[error("the parent directory does not allow write permission")]
+    NoWritePerms,
+    #[error("cross-device link not permitted")]
+    CrossDevice,
+    #[error("oldpath is a directory")]
+    IsDirectory,
+    #[error("I/O error")]
+    Io,
+    #[error("operation not supported")]
+    NotSupported,
     #[error(transparent)]
     PathError(#[from] PathError),
 }
@@ -254,70 +351,4 @@ impl From<crate::path::ConversionError> for PathError {
     fn from(_value: crate::path::ConversionError) -> Self {
         Self::InvalidPathname
     }
-}
-
-/// Possible errors from [`FileSystem::create_anonymous_file`]
-#[non_exhaustive]
-#[derive(Error, Debug)]
-pub enum CreateAnonymousFileError {
-    #[error("the filesystem does not support anonymous files")]
-    NotSupported,
-    #[error("I/O error")]
-    Io,
-}
-
-/// Possible errors from [`FileSystem::rename`]
-#[non_exhaustive]
-#[derive(Error, Debug)]
-pub enum RenameError {
-    #[error("the parent directory does not allow write permission")]
-    NoWritePerms,
-    #[error("the named file resides on a read-only filesystem")]
-    ReadOnlyFileSystem,
-    #[error("I/O error")]
-    Io,
-    #[error("operation not supported")]
-    NotSupported,
-    #[error(transparent)]
-    PathError(#[from] PathError),
-}
-
-/// Possible errors from [`FileSystem::read_link`]
-#[non_exhaustive]
-#[derive(Error, Debug)]
-pub enum ReadLinkError {
-    #[error("the filesystem does not support symlinks")]
-    NotSupported,
-    #[error("I/O error")]
-    Io,
-    #[error(transparent)]
-    PathError(#[from] PathError),
-}
-
-/// Possible errors from [`FileSystem::symlink`]
-#[non_exhaustive]
-#[derive(Error, Debug)]
-pub enum SymlinkError {
-    #[error("the filesystem does not support symlinks")]
-    NotSupported,
-    #[error("path already exists")]
-    AlreadyExists,
-    #[error("I/O error")]
-    Io,
-    #[error(transparent)]
-    PathError(#[from] PathError),
-}
-
-/// Possible errors from [`FileSystem::link`]
-#[non_exhaustive]
-#[derive(Error, Debug)]
-pub enum LinkError {
-    #[error("the filesystem does not support hard links")]
-    NotSupported,
-    #[error("path already exists")]
-    AlreadyExists,
-    #[error("I/O error")]
-    Io,
-    #[error(transparent)]
-    PathError(#[from] PathError),
 }

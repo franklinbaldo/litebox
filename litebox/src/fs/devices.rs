@@ -1075,7 +1075,7 @@ impl<
         _new_dirfd: &FileFd<Platform>,
         _new_rel: impl crate::path::Arg,
     ) -> Result<(), super::errors::RenameError> {
-        Err(super::errors::RenameError::NotSupported)
+        Err(super::errors::RenameError::Io)
     }
 
     fn fd_path(&self, _fd: &FileFd<Platform>) -> Option<alloc::string::String> {

@@ -28,6 +28,22 @@ use errors::{
     ReadError, RenameError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
 };
 
+/// Error from resolving a directory file descriptor's path.
+///
+/// Used internally by `*_at` method implementations to distinguish a missing
+/// fd (the table has no entry) from a valid fd that doesn't point to a
+/// directory.
+#[derive(Debug)]
+pub(crate) enum DirFdError {
+    /// The fd is not present in the descriptor table.
+    ClosedFd,
+    /// The fd exists but refers to a non-directory (regular file, device, etc.).
+    NotADirectory,
+    /// An I/O error occurred while querying the underlying backend.
+    #[allow(dead_code)]
+    Io,
+}
+
 /// A private module, to help support writing sealed traits. This module should _itself_ never be
 /// made public.
 mod private {
@@ -262,9 +278,6 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     // These resolve a relative path starting from a directory file descriptor.
     // The path is stored in each FS Descriptor at open time; implementations
     // join it with the relative component and delegate to path-based methods.
-    //
-    // Default implementations return `NotSupported` / `NotFound`-style errors
-    // so that the trait expansion can land before concrete implementations.
 
     /// Open a file relative to a directory fd.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
@@ -318,7 +331,7 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         new_dirfd: &TypedFd<Self>,
         new_rel: impl path::Arg,
     ) -> Result<(), RenameError> {
-        Err(RenameError::NotSupported)
+        Err(RenameError::Io)
     }
 
     /// Create a directory relative to a directory fd.
@@ -340,6 +353,10 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     fn fd_path(&self, fd: &TypedFd<Self>) -> Option<alloc::string::String> {
         None
     }
+}
+
+pub(crate) fn memfd_display_path(name: &str) -> alloc::string::String {
+    alloc::format!("/memfd:{name} (deleted)")
 }
 
 bitflags! {
