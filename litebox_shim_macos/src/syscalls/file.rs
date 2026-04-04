@@ -20,10 +20,19 @@ fn fd_to_usize(fd: i32) -> Result<usize, Errno> {
 }
 
 /// Read a NUL-terminated C string from guest memory (up to max_len bytes).
-fn read_cstring_from_guest(ptr: ConstPtr<u8>, max_len: usize) -> Option<String> {
-    let bytes = ptr.to_owned_slice(max_len)?;
-    let nul_pos = bytes.iter().position(|&b| b == 0)?;
-    String::from_utf8(bytes[..nul_pos].to_vec()).ok()
+///
+/// Reads byte-by-byte to avoid faulting past the end of a mapped region.
+/// This matches the approach used by the Linux shim's `to_cstring()`.
+pub(crate) fn read_cstring_from_guest(ptr: ConstPtr<u8>, max_len: usize) -> Option<String> {
+    let mut buf = alloc::vec::Vec::with_capacity(256);
+    for i in 0..max_len {
+        let byte: u8 = ptr.read_at_offset(i as isize)?;
+        if byte == 0 {
+            return String::from_utf8(buf).ok();
+        }
+        buf.push(byte);
+    }
+    None // no NUL terminator found within max_len
 }
 
 /// Translate macOS open(2) flags to litebox OFlags.
@@ -90,7 +99,19 @@ impl<FS: ShimFS> Task<FS> {
     ///
     /// Copies data from the user buffer, then writes it to the file descriptor.
     pub(crate) fn sys_write(&self, fd: i32, buf_addr: usize, count: usize) -> Result<usize, Errno> {
+        // Debug: log write calls to see dyld error messages (written to fd -1, 1, or 2)
+        if fd == -1 || fd == 1 || fd == 2 {
+            let user_buf_dbg: ConstPtr<u8> = ConstPtr::from_usize(buf_addr);
+            if let Some(data) = user_buf_dbg.to_owned_slice(count.min(256)) {
+                if let Ok(s) = core::str::from_utf8(&data) {
+                    log_unsupported!("write(fd={fd}, count={count}): {s:?}");
+                }
+            }
+        }
+
+        // fd -1 is invalid — return EBADF (but we've already logged the diagnostic above).
         let raw_fd = fd_to_usize(fd)?;
+
         let typed_fd = {
             let rds = self.global.raw_descriptors.read();
             rds.fd_from_raw_integer::<FS>(raw_fd)
@@ -129,6 +150,13 @@ impl<FS: ShimFS> Task<FS> {
 
         // Existing close logic
         let raw_fd = fd_to_usize(fd)?;
+
+        // Remove the path entry for F_GETPATH tracking.
+        {
+            let mut paths = self.global.fd_paths.write();
+            paths.remove(&raw_fd);
+        }
+
         let typed_fd = {
             let mut rds = self.global.raw_descriptors.write();
             rds.fd_consume_raw_integer::<FS>(raw_fd)
@@ -158,7 +186,10 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
-    /// Handle `open(path, flags, mode)` with sysroot path rewriting.
+    /// Handle `open(path, flags, mode)`.
+    ///
+    /// Dylib files are expected to already be populated in the in-mem FS at
+    /// their original guest paths (e.g., `/usr/lib/libSystem.B.dylib`).
     pub(crate) fn sys_open(
         &self,
         path_addr: usize,
@@ -168,33 +199,36 @@ impl<FS: ShimFS> Task<FS> {
         let path_ptr: ConstPtr<u8> = ConstPtr::from_usize(path_addr);
         let path = read_cstring_from_guest(path_ptr, 4096).ok_or(Errno::EFAULT)?;
 
-        // Apply sysroot rewriting if configured
-        let actual_path = if let Some(ref sysroot) = self.global.sysroot {
-            if path.starts_with("/usr/lib/") || path.starts_with("/System/Library/") {
-                let mut redirected = String::from(sysroot.as_str());
-                redirected.push_str(&path);
-                redirected
-            } else {
-                path
-            }
-        } else {
-            path
-        };
+        log_unsupported!("sys_open({path:?}, flags={flags:#x})");
 
         let oflags = translate_open_flags(flags);
-        let cpath = alloc::ffi::CString::new(actual_path.as_bytes()).map_err(|_| Errno::EINVAL)?;
+        let cpath = alloc::ffi::CString::new(path.as_bytes()).map_err(|_| Errno::EINVAL)?;
 
-        let typed_fd = self
+        let typed_fd = match self
             .global
             .fs
             .open(&cpath, oflags, litebox::fs::Mode::empty())
-            .map_err(Self::open_error_to_errno)?;
+        {
+            Ok(fd) => fd,
+            Err(e) => {
+                let errno = Self::open_error_to_errno(e);
+                log_unsupported!("sys_open({path:?}) FAILED: {errno:?}");
+                return Err(errno);
+            }
+        };
 
         let raw_fd = {
             let mut rds = self.global.raw_descriptors.write();
             rds.fd_into_raw_integer(typed_fd)
         };
 
+        // Record the path for F_GETPATH support.
+        {
+            let mut paths = self.global.fd_paths.write();
+            paths.insert(raw_fd, path.clone());
+        }
+
+        log_unsupported!("sys_open({path:?}) → fd={raw_fd}");
         Ok(raw_fd)
     }
 
@@ -292,8 +326,22 @@ impl<FS: ShimFS> Task<FS> {
             .map_err(|_| Errno::EBADF)?;
 
         // Build macOS stat64 struct (144 bytes on aarch64).
+        //
+        // Layout (from <sys/stat.h> on aarch64 macOS):
+        //   offset  0: st_dev     (i32)
+        //   offset  4: st_mode    (u16)
+        //   offset  6: st_nlink   (u16)
+        //   offset  8: st_ino     (u64)
+        //   offset 16: st_uid     (u32)
+        //   offset 20: st_gid     (u32)
+        //   offset 24: st_rdev    (i32)
+        //   offset 96: st_size    (i64)
+        //   offset 104: st_blocks (i64)
+        //   offset 112: st_blksize (i32)
         let mut stat_buf = [0u8; 144];
 
+        // st_dev at offset 0 (i32)
+        stat_buf[0..4].copy_from_slice(&(status.node_info.dev as i32).to_le_bytes());
         // st_mode at offset 4 (u16)
         let mode: u16 = match status.file_type {
             litebox::fs::FileType::RegularFile => 0o100644,
@@ -304,6 +352,15 @@ impl<FS: ShimFS> Task<FS> {
         stat_buf[4..6].copy_from_slice(&mode.to_le_bytes());
         // st_nlink at offset 6 (u16)
         stat_buf[6..8].copy_from_slice(&1u16.to_le_bytes());
+        // st_ino at offset 8 (u64)
+        stat_buf[8..16].copy_from_slice(&(status.node_info.ino as u64).to_le_bytes());
+        // st_uid at offset 16 (u32)
+        stat_buf[16..20].copy_from_slice(&(u32::from(status.owner.user)).to_le_bytes());
+        // st_gid at offset 20 (u32)
+        stat_buf[20..24].copy_from_slice(&(u32::from(status.owner.group)).to_le_bytes());
+        // st_rdev at offset 24 (i32)
+        let rdev = status.node_info.rdev.map(|r| r.get() as i32).unwrap_or(0);
+        stat_buf[24..28].copy_from_slice(&rdev.to_le_bytes());
         // st_size at offset 96 (i64)
         stat_buf[96..104].copy_from_slice(&(status.size as i64).to_le_bytes());
         // st_blksize at offset 112 (i32)
@@ -321,13 +378,170 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Handle `fcntl(fd, cmd, arg)` — minimal support.
-    pub(crate) fn sys_fcntl(&self, fd: i32, cmd: i32, _arg: usize) -> Result<usize, Errno> {
-        let _raw_fd = fd_to_usize(fd)?;
+    pub(crate) fn sys_fcntl(&self, fd: i32, cmd: i32, arg: usize) -> Result<usize, Errno> {
+        let raw_fd = fd_to_usize(fd)?;
         match cmd {
-            3 => Ok(0),              // F_GETFL: return O_RDONLY
-            4 => Ok(0),              // F_SETFL: pretend success
-            50 => Err(Errno::EBADF), // F_GETPATH: not supported
+            3 => Ok(0), // F_GETFL: return O_RDONLY
+            4 => Ok(0), // F_SETFL: pretend success
+            50 => {
+                // F_GETPATH: write the file's path (NUL-terminated) to the
+                // user buffer at `arg`. Maximum MAXPATHLEN = 1024 bytes.
+                let paths = self.global.fd_paths.read();
+                let path = paths.get(&raw_fd).ok_or(Errno::EBADF)?;
+                let path_bytes = path.as_bytes();
+                // MAXPATHLEN on macOS is 1024
+                if path_bytes.len() + 1 > 1024 {
+                    return Err(Errno::ERANGE);
+                }
+                let dest: MutPtr<u8> = MutPtr::from_usize(arg);
+                dest.copy_from_slice(0, path_bytes).ok_or(Errno::EFAULT)?;
+                // Write NUL terminator
+                dest.write_at_offset(path_bytes.len() as isize, 0u8)
+                    .ok_or(Errno::EFAULT)?;
+                log_unsupported!("fcntl(fd={fd}, F_GETPATH) → {path:?}");
+                Ok(0)
+            }
             _ => Err(Errno::EINVAL),
         }
+    }
+
+    /// Handle `dup2(oldfd, newfd)`.
+    ///
+    /// Duplicates `oldfd` onto `newfd`. If `newfd` is already open, it is
+    /// silently closed first. If `oldfd == newfd`, just validates oldfd and
+    /// returns it.
+    pub(crate) fn sys_dup2(&self, oldfd: i32, newfd: i32) -> Result<usize, Errno> {
+        let raw_oldfd = fd_to_usize(oldfd)?;
+        let raw_newfd = fd_to_usize(newfd)?;
+
+        // Validate that oldfd exists.
+        let old_typed_fd = {
+            let rds = self.global.raw_descriptors.read();
+            rds.fd_from_raw_integer::<FS>(raw_oldfd)
+                .map_err(|_| Errno::EBADF)?
+        };
+
+        // If oldfd == newfd, dup2 is a no-op (just validates oldfd).
+        if raw_oldfd == raw_newfd {
+            return Ok(raw_newfd);
+        }
+
+        // Create a new TypedFd that shares the same underlying descriptor.
+        let new_typed_fd = self
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .duplicate(&old_typed_fd)
+            .ok_or(Errno::EBADF)?;
+
+        // If newfd is already open, close it first.
+        {
+            let mut rds = self.global.raw_descriptors.write();
+            if let Ok(existing_fd) = rds.fd_consume_raw_integer::<FS>(raw_newfd) {
+                // Best-effort close; ignore errors (matches POSIX dup2 semantics).
+                let _ = self.global.fs.close(&existing_fd);
+            }
+        }
+
+        // Insert the duplicated fd at the specific newfd slot.
+        {
+            let mut rds = self.global.raw_descriptors.write();
+            let success = rds.fd_into_specific_raw_integer(new_typed_fd, raw_newfd);
+            if !success {
+                return Err(Errno::EBADF);
+            }
+        }
+
+        // Copy the path entry from oldfd to newfd for F_GETPATH support.
+        {
+            let mut paths = self.global.fd_paths.write();
+            if let Some(path) = paths.get(&raw_oldfd).cloned() {
+                paths.insert(raw_newfd, path);
+            }
+        }
+
+        log_unsupported!("dup2({oldfd}, {newfd}) → {raw_newfd}");
+        Ok(raw_newfd)
+    }
+
+    /// Handle `stat64(path, buf)` — stat a file by path.
+    ///
+    /// Opens the file, calls fstat64, then closes it. This is a simple
+    /// implementation that works for regular files and directories.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    pub(crate) fn sys_stat64(&self, path_addr: usize, buf_addr: usize) -> Result<usize, Errno> {
+        let path_ptr: ConstPtr<u8> = ConstPtr::from_usize(path_addr);
+        let path = read_cstring_from_guest(path_ptr, 4096).ok_or(Errno::EFAULT)?;
+        log_unsupported!("stat64({path:?})");
+
+        // Try to open the path read-only
+        let cpath = alloc::ffi::CString::new(path.as_bytes()).map_err(|_| Errno::EINVAL)?;
+        let typed_fd = self
+            .global
+            .fs
+            .open(&cpath, OFlags::RDONLY, litebox::fs::Mode::empty())
+            .map_err(Self::open_error_to_errno)?;
+
+        // Get the raw fd number so we can call sys_fstat64
+        let raw_fd = {
+            let mut rds = self.global.raw_descriptors.write();
+            rds.fd_into_raw_integer(typed_fd)
+        };
+
+        let result = self.sys_fstat64(raw_fd as i32, buf_addr);
+
+        // Close the temporary fd
+        let _ = self.sys_close(raw_fd as i32);
+
+        result
+    }
+
+    /// Handle `openat(dirfd, path, flags, mode)`.
+    ///
+    /// When `dirfd` is AT_FDCWD (-2 on macOS), this behaves like `open()`.
+    /// Other dirfd values are not yet supported.
+    pub(crate) fn sys_openat(
+        &self,
+        dirfd: i32,
+        path_addr: usize,
+        flags: i32,
+        mode: u32,
+    ) -> Result<usize, Errno> {
+        let path_ptr: ConstPtr<u8> = ConstPtr::from_usize(path_addr);
+        let path = read_cstring_from_guest(path_ptr, 4096).ok_or(Errno::EFAULT)?;
+        log_unsupported!("openat(dirfd={dirfd}, {path:?}, flags={flags:#x})");
+
+        // AT_FDCWD on macOS is -2
+        if dirfd == -2 || path.starts_with('/') {
+            // Absolute path or relative to cwd — treat like open()
+            return self.sys_open(path_addr, flags, mode);
+        }
+
+        // Non-AT_FDCWD relative paths are not yet supported
+        log_unsupported!("openat: unsupported dirfd={dirfd}");
+        Err(Errno::ENOSYS)
+    }
+
+    /// Handle `fstatat64(dirfd, path, buf, flag)`.
+    ///
+    /// When `dirfd` is AT_FDCWD (-2 on macOS), this behaves like `stat64()`.
+    pub(crate) fn sys_fstatat64(
+        &self,
+        dirfd: i32,
+        path_addr: usize,
+        buf_addr: usize,
+        _flag: i32,
+    ) -> Result<usize, Errno> {
+        let path_ptr: ConstPtr<u8> = ConstPtr::from_usize(path_addr);
+        let path = read_cstring_from_guest(path_ptr, 4096).ok_or(Errno::EFAULT)?;
+        log_unsupported!("fstatat64(dirfd={dirfd}, {path:?})");
+
+        // AT_FDCWD on macOS is -2
+        if dirfd == -2 || path.starts_with('/') {
+            return self.sys_stat64(path_addr, buf_addr);
+        }
+
+        log_unsupported!("fstatat64: unsupported dirfd={dirfd}");
+        Err(Errno::ENOSYS)
     }
 }

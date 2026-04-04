@@ -17,7 +17,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::Cell;
-use core::sync::atomic::{AtomicI32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use litebox::{
     fd::RawDescriptorStorage,
     mm::{linux::PAGE_SIZE, PageManager},
@@ -154,6 +154,8 @@ impl<FS: ShimFS> MacosShimBuilder<FS> {
             boot_time: self.platform.now(),
             litebox: self.litebox,
             raw_descriptors: litebox::sync::RwLock::new(RawDescriptorStorage::new()),
+            fd_paths: litebox::sync::RwLock::new(BTreeMap::new()),
+            shared_cache_base: AtomicU64::new(0),
             sysroot: self.sysroot,
         });
         MacosShim(global)
@@ -230,6 +232,115 @@ impl<FS: ShimFS> MacosShim<FS> {
     /// Get the global page manager.
     pub fn page_manager(&self) -> &PageManager<Platform, PAGE_SIZE> {
         &self.0.pm
+    }
+
+    /// Install shared cache regions into the guest address space.
+    ///
+    /// Each region is mapped at `guest_addr` with the given data and protection.
+    /// RX (executable) regions are patched for SVC rewriting before being made
+    /// executable. The cache base address is recorded for `shared_region_check_np`.
+    ///
+    /// `cache_base` is typically `0x180000000`.
+    /// `regions` is a slice of `(guest_addr, data, is_executable)` tuples.
+    pub fn install_shared_cache(&self, cache_base: u64, regions: &[(u64, &[u8], bool)]) {
+        use litebox::mm::linux::PAGE_SIZE;
+        use litebox::platform::{
+            RawConstPointer as _, RawMutPointer as _, SystemInfoProvider as _,
+        };
+        use litebox_common_linux::MapFlags;
+        use litebox_common_linux::ProtFlags;
+
+        let syscall_entry = litebox_platform_multiplex::platform().get_syscall_entry_point();
+
+        for &(guest_addr, data, is_executable) in regions {
+            let aligned_start = guest_addr & !(PAGE_SIZE as u64 - 1);
+            let aligned_end =
+                (guest_addr + data.len() as u64 + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
+            let aligned_len = (aligned_end - aligned_start) as usize;
+            let offset_in_page = (guest_addr - aligned_start) as usize;
+
+            // Allocate anonymous RW pages at the aligned address with MAP_FIXED.
+            let rw_flags = MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED;
+            let mapped_ptr: MutPtr<u8> = litebox_common_linux::mm::do_mmap(
+                &self.0.pm,
+                Some(aligned_start as usize),
+                aligned_len,
+                ProtFlags::PROT_READ_WRITE,
+                rw_flags,
+                false,
+                |_| Ok(0),
+            )
+            .expect("install_shared_cache: do_mmap failed");
+
+            // Write data into the mapping at the correct offset within the page.
+            mapped_ptr
+                .copy_from_slice(offset_in_page, data)
+                .expect("install_shared_cache: copy_from_slice failed");
+
+            if is_executable {
+                // Allocate a trampoline region for SVC rewriting.
+                let tramp_size = ((data.len() / (1024 * 1024)) + 1) * 4 * PAGE_SIZE;
+                let tramp_flags = MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE;
+                let tramp_ptr: MutPtr<u8> = litebox_common_linux::mm::do_mmap(
+                    &self.0.pm,
+                    None,
+                    tramp_size,
+                    ProtFlags::PROT_READ_WRITE,
+                    tramp_flags,
+                    false,
+                    |_| Ok(0),
+                )
+                .expect("install_shared_cache: trampoline do_mmap failed");
+                let tramp_addr = tramp_ptr.as_usize();
+
+                // Get mutable slices for patching.
+                // SAFETY: We just allocated these RW regions and no other code is
+                // accessing them yet (called during setup before guest runs).
+                let code_slice = unsafe {
+                    core::slice::from_raw_parts_mut(mapped_ptr.as_usize() as *mut u8, aligned_len)
+                };
+                // Patch only the data portion (offset within the page-aligned region).
+                let code_to_patch = &mut code_slice[offset_in_page..offset_in_page + data.len()];
+
+                let tramp_slice =
+                    unsafe { core::slice::from_raw_parts_mut(tramp_addr as *mut u8, tramp_size) };
+
+                let mut tramp_cursor = 0usize;
+                tramp_cursor = litebox_syscall_rewriter_macho::patch_code_segment(
+                    code_to_patch,
+                    guest_addr,
+                    tramp_slice,
+                    tramp_addr as u64,
+                    tramp_cursor,
+                    syscall_entry as u64,
+                )
+                .expect("install_shared_cache: patch_code_segment failed");
+                let _ = tramp_cursor;
+
+                // mprotect trampoline to R-X.
+                litebox_common_linux::mm::sys_mprotect(
+                    &self.0.pm,
+                    MutPtr::from_usize(tramp_addr),
+                    tramp_size,
+                    ProtFlags::PROT_READ_EXEC,
+                )
+                .expect("install_shared_cache: trampoline mprotect failed");
+
+                // mprotect code region to R-X.
+                litebox_common_linux::mm::sys_mprotect(
+                    &self.0.pm,
+                    MutPtr::from_usize(aligned_start as usize),
+                    aligned_len,
+                    ProtFlags::PROT_READ_EXEC,
+                )
+                .expect("install_shared_cache: code mprotect failed");
+            }
+        }
+
+        // Record the cache base address.
+        self.0
+            .shared_cache_base
+            .store(cache_base, Ordering::Release);
     }
 
     /// Initialize stdio file descriptors (0=stdin, 1=stdout, 2=stderr).
@@ -321,10 +432,25 @@ impl<FS: ShimFS> litebox::shim::EnterShim for MacosShimEntrypoints<FS> {
 
     fn exception(
         &self,
-        _ctx: &mut Self::ExecutionContext,
-        _info: &litebox::shim::ExceptionInfo,
+        ctx: &mut Self::ExecutionContext,
+        info: &litebox::shim::ExceptionInfo,
     ) -> ContinueOperation {
-        // Phase 1: no exception handling, just terminate.
+        // Log the exception to understand what went wrong.
+        log_unsupported!(
+            "EXCEPTION at pc={:#x} sp={:#x} info={:?}",
+            ctx.pc,
+            ctx.sp,
+            info
+        );
+        // Also log x0-x3 and x16 for context
+        log_unsupported!(
+            "  x0={:#x} x1={:#x} x2={:#x} x3={:#x} x16={:#x}",
+            ctx.regs[0],
+            ctx.regs[1],
+            ctx.regs[2],
+            ctx.regs[3],
+            ctx.regs[16]
+        );
         ContinueOperation::Terminate
     }
 
@@ -374,6 +500,10 @@ struct GlobalState<FS: ShimFS> {
     boot_time: <Platform as TimeProvider>::Instant,
     /// Raw file descriptor mapping (integer fd -> TypedFd).
     raw_descriptors: litebox::sync::RwLock<Platform, RawDescriptorStorage>,
+    /// Maps raw fd numbers to their open paths (for `F_GETPATH` support).
+    fd_paths: litebox::sync::RwLock<Platform, BTreeMap<usize, String>>,
+    /// Base address of the installed shared cache (0 if not installed).
+    pub(crate) shared_cache_base: AtomicU64,
     /// Optional sysroot prefix for path rewriting in sys_open.
     sysroot: Option<alloc::string::String>,
 }
@@ -414,6 +544,30 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle a macOS syscall and write the result back to the register context.
     fn handle_syscall_request(&self, ctx: &mut PtRegs) {
+        // Debug: trace all syscall numbers
+        if cfg!(debug_assertions) {
+            let nr = ctx.regs[16];
+            if (nr as i64) < 0 {
+                let trap = (-(nr as i64)) as usize;
+                log_unsupported!(
+                    "TRACE: mach_trap({trap}) x0={:#x} x1={:#x} x2={:#x} x3={:#x}",
+                    ctx.regs[0],
+                    ctx.regs[1],
+                    ctx.regs[2],
+                    ctx.regs[3]
+                );
+            } else {
+                log_unsupported!(
+                    "TRACE: syscall({nr}) x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x} x5={:#x}",
+                    ctx.regs[0],
+                    ctx.regs[1],
+                    ctx.regs[2],
+                    ctx.regs[3],
+                    ctx.regs[4],
+                    ctx.regs[5]
+                );
+            }
+        }
         let request = litebox_common_macos::syscall::MacosSyscallRequest::try_from_raw(ctx);
         let result = self.do_syscall(request, ctx);
         litebox_common_macos::syscall::set_syscall_return(ctx, result);

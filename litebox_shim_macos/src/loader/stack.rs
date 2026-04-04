@@ -11,7 +11,7 @@ use crate::MutPtr;
 
 /// The stack for the macOS guest process.
 ///
-/// Layout (stack grows downward, i.e. toward lower addresses):
+/// For static binaries (no dyld), the layout matches a standard macOS stack:
 /// ```text
 /// position            content                     size (bytes)
 /// ------------------------------------------------------------------------
@@ -28,6 +28,28 @@ use crate::MutPtr;
 ///                   [ argument ASCIIZ strings ]   >= 0
 ///                   [ environment ASCIIZ str. ]   >= 0
 ///                   [ apple ASCIIZ strings ]      >= 0
+///                   [ end marker ]                8   (= NULL)
+///                   < bottom of stack >           0   (virtual)
+/// ```
+///
+/// When dyld is loaded, the kernel passes a `KernelArgs` struct on the
+/// stack. dyld's `__dyld_start` does `mov x0, sp` and calls
+/// `start(KernelArgs*, ...)`. The `KernelArgs` layout is:
+/// ```text
+/// position            content                     size (bytes)
+/// ------------------------------------------------------------------------
+/// stack pointer ->  [ mainExecutable (mh ptr) ]   8   (mach_header_64*)
+///                   [ argc = number of args ]     8
+///                   [ argv[0] (pointer) ]         8
+///                   [ argv[..] (pointer) ]        8 * x
+///                   [ argv[n] (pointer) ]         8   (= NULL)
+///                   [ envp[0] (pointer) ]         8
+///                   [ envp[..] (pointer) ]        8 * y
+///                   [ envp[term] (pointer) ]      8   (= NULL)
+///                   [ apple[0] (pointer) ]        8
+///                   [ apple[term] (pointer) ]     8   (= NULL)
+///                   [ padding ]                   0 - 16
+///                   [ string data ... ]           variable
 ///                   [ end marker ]                8   (= NULL)
 ///                   < bottom of stack >           0   (virtual)
 /// ```
@@ -114,6 +136,34 @@ impl UserStack {
         env: Vec<CString>,
         apple: Vec<CString>,
     ) -> Option<()> {
+        self.init_internal(argv, env, apple, None)
+    }
+
+    /// Initialize the stack as a `KernelArgs` struct for dyld.
+    ///
+    /// When dyld is loaded, the kernel prepends the main executable's
+    /// `mach_header_64*` before `argc` on the stack. dyld's `__dyld_start`
+    /// passes `SP` to `start(KernelArgs*, ...)` where `KernelArgs` has
+    /// `mainExecutable` as its first field, followed by `argc` and the
+    /// argv/envp/apple arrays.
+    pub(super) fn init_for_dyld(
+        &mut self,
+        argv: Vec<CString>,
+        env: Vec<CString>,
+        apple: Vec<CString>,
+        main_executable_mh: usize,
+    ) -> Option<()> {
+        self.init_internal(argv, env, apple, Some(main_executable_mh))
+    }
+
+    /// Internal implementation shared by `init_with_apple` and `init_for_dyld`.
+    fn init_internal(
+        &mut self,
+        argv: Vec<CString>,
+        env: Vec<CString>,
+        apple: Vec<CString>,
+        main_executable_mh: Option<usize>,
+    ) -> Option<()> {
         // End marker at bottom of stack (8 zero bytes)
         self.push_usize(0)?;
 
@@ -127,8 +177,11 @@ impl UserStack {
         self.pos = align_down(self.pos, size_of::<usize>());
 
         // Calculate total items and ensure final alignment
-        let len =
+        let mut len =
             (apple_offsets.len() + 1) + (envp_offsets.len() + 1) + (argvp_offsets.len() + 1) + 1; // argc
+        if main_executable_mh.is_some() {
+            len += 1; // mainExecutable pointer
+        }
         let size = len * size_of::<usize>();
         let final_pos = self.pos.checked_sub(size)?;
         self.pos -= final_pos - align_down(final_pos, Self::STACK_ALIGNMENT);
@@ -141,6 +194,10 @@ impl UserStack {
         self.push_pointers(argvp_offsets)?;
         // Push argc
         self.push_usize(argv.len())?;
+        // Push mainExecutable mach_header pointer (for dyld's KernelArgs)
+        if let Some(mh) = main_executable_mh {
+            self.push_usize(mh)?;
+        }
 
         assert_eq!(self.pos, align_down(self.pos, Self::STACK_ALIGNMENT));
         Some(())

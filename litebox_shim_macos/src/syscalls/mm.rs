@@ -9,8 +9,9 @@
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, SystemInfoProvider as _};
 use litebox_common_linux::{MapFlags, ProtFlags};
 use litebox_common_macos::errno::Errno;
+use litebox_common_macos::PtRegs;
 
-use crate::{MutPtr, ShimFS, Task};
+use crate::{ConstPtr, MutPtr, ShimFS, Task};
 
 // macOS mmap protection flags (same values as Linux).
 const MACOS_PROT_READ: i32 = 1;
@@ -288,6 +289,160 @@ impl<FS: ShimFS> Task<FS> {
         .map_err(linux_errno_to_macos)?;
 
         Ok(mapped_addr)
+    }
+
+    /// Handle Mach trap 10 (`_kernelrpc_mach_vm_allocate_trap`).
+    ///
+    /// Arguments (from registers):
+    ///   x0 = target port (ignored — always self)
+    ///   x1 = address pointer (IN/OUT — pointer to mach_vm_address_t)
+    ///   x2 = size
+    ///   x3 = flags (VM_FLAGS_ANYWHERE=0x1)
+    ///
+    /// Allocates anonymous RW memory. The address parameter is a pointer to the
+    /// desired/result address, similar to `mach_vm_map`.
+    pub(crate) fn sys_mach_vm_allocate(&self, ctx: &mut PtRegs) -> Result<usize, Errno> {
+        let addr_ptr_usize = ctx.regs[1];
+        let size = ctx.regs[2];
+        let flags = ctx.regs[3];
+
+        // Read desired address from pointer.
+        let addr_ptr: ConstPtr<usize> = ConstPtr::from_usize(addr_ptr_usize);
+        let desired_addr = addr_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+
+        const VM_FLAGS_ANYWHERE: usize = 0x1;
+        let is_anywhere = (flags & VM_FLAGS_ANYWHERE) != 0;
+
+        // Build anonymous RW mmap.
+        let mut macos_flags: i32 = MACOS_MAP_ANON | MACOS_MAP_PRIVATE;
+        if !is_anywhere && desired_addr != 0 {
+            macos_flags |= MACOS_MAP_FIXED;
+        }
+
+        let result_addr = self.sys_mmap(
+            if is_anywhere { 0 } else { desired_addr },
+            size,
+            MACOS_PROT_READ | MACOS_PROT_WRITE,
+            macos_flags,
+            -1, // anonymous
+            0,  // no offset
+        )?;
+
+        log_unsupported!(
+            "mach_vm_allocate(desired={desired_addr:#x}, size={size:#x}, flags={flags:#x}) → {result_addr:#x}"
+        );
+
+        // Write result address back to pointer.
+        let out_ptr: MutPtr<usize> = MutPtr::from_usize(addr_ptr_usize);
+        out_ptr
+            .write_at_offset(0, result_addr)
+            .ok_or(Errno::EFAULT)?;
+
+        Ok(0) // KERN_SUCCESS
+    }
+
+    /// Handle Mach trap 12 (`_kernelrpc_mach_vm_deallocate_trap`).
+    ///
+    /// Arguments (from registers):
+    ///   x0 = target port (ignored — always self)
+    ///   x1 = address
+    ///   x2 = size
+    ///
+    /// This is essentially munmap.
+    pub(crate) fn sys_mach_vm_deallocate(&self, ctx: &PtRegs) -> Result<usize, Errno> {
+        use litebox::mm::linux::PAGE_SIZE;
+
+        let addr = ctx.regs[1];
+        let size = ctx.regs[2];
+        let aligned_size = align_up(size, PAGE_SIZE);
+        self.sys_munmap(addr, aligned_size).map(|()| 0)
+    }
+
+    /// Handle Mach trap 14 (`_kernelrpc_mach_vm_protect_trap`).
+    ///
+    /// Arguments (from registers):
+    ///   x0 = target port (ignored — always self)
+    ///   x1 = address
+    ///   x2 = size
+    ///   x3 = set_maximum (ignored)
+    ///   x4 = new_protection (VM_PROT_* flags: READ=1, WRITE=2, EXECUTE=4)
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)] // Intentional: register value (usize/u64) → prot (i32).
+    pub(crate) fn sys_mach_vm_protect(&self, ctx: &PtRegs) -> Result<usize, Errno> {
+        use litebox::mm::linux::PAGE_SIZE;
+
+        let addr = ctx.regs[1];
+        let size = ctx.regs[2];
+        let new_prot = ctx.regs[4] as i32;
+
+        // Mach VM operations use byte-precise sizes but the underlying page
+        // manager operates in whole pages. Round up to page boundary.
+        let aligned_size = align_up(size, PAGE_SIZE);
+
+        log_unsupported!(
+            "mach_vm_protect(addr={addr:#x}, size={size:#x}→{aligned_size:#x}, prot={new_prot})"
+        );
+        let result = self.sys_mprotect(addr, aligned_size, new_prot);
+        if let Err(ref e) = result {
+            log_unsupported!("mach_vm_protect FAILED: {e:?}");
+        }
+        result.map(|()| 0)
+    }
+
+    /// Handle Mach trap 15 (`_kernelrpc_mach_vm_map_trap`).
+    ///
+    /// Arguments (from registers):
+    ///   x0 = target port (ignored — always self)
+    ///   x1 = address pointer (IN/OUT — pointer to mach_vm_address_t)
+    ///   x2 = size
+    ///   x3 = mask (alignment mask, ignored)
+    ///   x4 = flags (VM_FLAGS_ANYWHERE=0x1, VM_FLAGS_FIXED=0x0)
+    ///   x5 = cur_protection (VM_PROT_* flags)
+    ///
+    /// This is essentially an anonymous mmap. The address parameter is a pointer
+    /// to the desired/result address (not the address itself).
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)] // Intentional: register value (usize/u64) → prot (i32).
+    #[allow(clippy::items_after_statements)] // VM_FLAGS_ANYWHERE const is placed near its use for readability.
+    pub(crate) fn sys_mach_vm_map(&self, ctx: &mut PtRegs) -> Result<usize, Errno> {
+        let addr_ptr_usize = ctx.regs[1];
+        let size = ctx.regs[2];
+        // x3 = mask (ignored)
+        let vm_flags = ctx.regs[4];
+        let cur_prot = ctx.regs[5] as i32;
+
+        // Read desired address from pointer
+        let addr_ptr: ConstPtr<usize> = ConstPtr::from_usize(addr_ptr_usize);
+        let desired_addr = addr_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+
+        // VM_FLAGS_ANYWHERE = 0x1 means kernel picks address
+        const VM_FLAGS_ANYWHERE: usize = 0x1;
+        let is_anywhere = (vm_flags & VM_FLAGS_ANYWHERE) != 0;
+
+        // Build equivalent mmap flags
+        let mut macos_flags: i32 = 0x1000 | 0x0002; // MAP_ANON | MAP_PRIVATE
+        if !is_anywhere && desired_addr != 0 {
+            macos_flags |= 0x0010; // MAP_FIXED
+        }
+
+        let result_addr = self.sys_mmap(
+            if is_anywhere { 0 } else { desired_addr },
+            size,
+            cur_prot,
+            macos_flags,
+            -1, // anonymous
+            0,  // no offset
+        )?;
+
+        log_unsupported!(
+            "mach_vm_map(desired={desired_addr:#x}, size={size:#x}, flags={vm_flags:#x}, prot={cur_prot}) → {result_addr:#x}"
+        );
+
+        // Write result address back to pointer
+        let out_ptr: MutPtr<usize> = MutPtr::from_usize(addr_ptr_usize);
+        out_ptr
+            .write_at_offset(0, result_addr)
+            .ok_or(Errno::EFAULT)?;
+
+        Ok(0) // KERN_SUCCESS
     }
 
     /// Handle `munmap(addr, length)`.

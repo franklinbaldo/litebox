@@ -33,12 +33,35 @@ pub mod nr {
     pub const SHARED_REGION_CHECK_NP: usize = 294;
     pub const ISSETUGID: usize = 327;
     pub const FSTAT64: usize = 339;
+    pub const THREAD_SELFID: usize = 372;
+    pub const CSRCTL: usize = 483;
+    /// `mach_msg2_trap` — modern Mach message passing (macOS 12+).
+    /// This uses x16 = 0x80000000 (NOT sign-extended, so it's a positive BSD-style number).
+    pub const MACH_MSG2_TRAP: usize = 0x8000_0000;
     pub const GETENTROPY: usize = 500;
+    pub const CROSSARCH_TRAP: usize = 38;
+    pub const DUP2: usize = 90;
+    pub const FSCTL: usize = 242;
+    pub const MAC_SYSCALL: usize = 381;
+    pub const SHARED_REGION_MAP_AND_SLIDE_2_NP: usize = 536;
+    pub const KDEBUG_TRACE_STRING: usize = 178;
+    pub const REBOOT: usize = 55;
+    pub const STATFS64: usize = 345;
+    pub const TERMINATE_WITH_PAYLOAD: usize = 520;
+    pub const ABORT_WITH_PAYLOAD: usize = 521;
+    pub const STAT64: usize = 338;
+    pub const OPENAT: usize = 463;
+    pub const FSTATAT64: usize = 470;
 }
 
 /// Mach trap numbers (negative x16 values, stored as positive constants).
 /// The actual x16 value is the negation of these.
 pub mod mach_trap {
+    pub const KERNELRPC_MACH_VM_ALLOCATE_TRAP: usize = 10;
+    pub const KERNELRPC_MACH_VM_DEALLOCATE_TRAP: usize = 12;
+    pub const KERNELRPC_MACH_VM_PROTECT_TRAP: usize = 14;
+    pub const KERNELRPC_MACH_VM_MAP_TRAP: usize = 15;
+    pub const MACH_PORT_CONSTRUCT_TRAP: usize = 24;
     pub const MACH_REPLY_PORT: usize = 26;
     pub const THREAD_SELF_TRAP: usize = 27;
     pub const TASK_SELF_TRAP: usize = 28;
@@ -157,9 +180,56 @@ pub enum MacosSyscallRequest {
         buf: usize,
         count: usize,
     },
+    ThreadSelfid,
+    /// `mach_msg2_trap` — modern Mach message passing.
+    MachMsg2Trap {
+        data: usize,
+        options: usize,
+        msgh_bits: u32,
+    },
     /// A Mach trap (negative x16 value).
     MachTrap {
         number: usize,
+    },
+    CrossarchTrap,
+    Csrctl,
+    Dup2 {
+        oldfd: i32,
+        newfd: i32,
+    },
+    MacSyscall,
+    Fsctl,
+    SharedRegionMapAndSlide2Np,
+    KdebugTraceString,
+    Statfs64 {
+        path: usize,
+        buf: usize,
+    },
+    /// `terminate_with_payload(pid, namespace, code, payload, payload_size)`
+    TerminateWithPayload {
+        namespace: usize,
+        code: usize,
+    },
+    /// `abort_with_payload(namespace, code, payload, payload_size, reason, flags)`
+    AbortWithPayload {
+        namespace: usize,
+        code: usize,
+    },
+    Stat64 {
+        path: usize,
+        buf: usize,
+    },
+    Openat {
+        dirfd: i32,
+        path: usize,
+        flags: i32,
+        mode: u32,
+    },
+    Fstatat64 {
+        dirfd: i32,
+        path: usize,
+        buf: usize,
+        flag: i32,
     },
     Unknown {
         number: usize,
@@ -285,6 +355,45 @@ impl MacosSyscallRequest {
                 buf: a1,
             },
             nr::GETENTROPY => MacosSyscallRequest::Getentropy { buf: a0, count: a1 },
+            nr::THREAD_SELFID => MacosSyscallRequest::ThreadSelfid,
+            nr::MACH_MSG2_TRAP => MacosSyscallRequest::MachMsg2Trap {
+                data: a0,
+                options: a1,
+                msgh_bits: a2 as u32,
+            },
+            nr::CROSSARCH_TRAP => MacosSyscallRequest::CrossarchTrap,
+            nr::CSRCTL => MacosSyscallRequest::Csrctl,
+            nr::DUP2 => MacosSyscallRequest::Dup2 {
+                oldfd: a0 as i32,
+                newfd: a1 as i32,
+            },
+            nr::MAC_SYSCALL => MacosSyscallRequest::MacSyscall,
+            nr::FSCTL => MacosSyscallRequest::Fsctl,
+            nr::SHARED_REGION_MAP_AND_SLIDE_2_NP => MacosSyscallRequest::SharedRegionMapAndSlide2Np,
+            nr::KDEBUG_TRACE_STRING => MacosSyscallRequest::KdebugTraceString,
+            nr::STATFS64 => MacosSyscallRequest::Statfs64 { path: a0, buf: a1 },
+            nr::REBOOT => MacosSyscallRequest::Unknown { number: nr_raw }, // treated as unknown
+            nr::TERMINATE_WITH_PAYLOAD => MacosSyscallRequest::TerminateWithPayload {
+                namespace: a1,
+                code: a2,
+            },
+            nr::ABORT_WITH_PAYLOAD => MacosSyscallRequest::AbortWithPayload {
+                namespace: a0,
+                code: a1,
+            },
+            nr::STAT64 => MacosSyscallRequest::Stat64 { path: a0, buf: a1 },
+            nr::OPENAT => MacosSyscallRequest::Openat {
+                dirfd: a0 as i32,
+                path: a1,
+                flags: a2 as i32,
+                mode: a3 as u32,
+            },
+            nr::FSTATAT64 => MacosSyscallRequest::Fstatat64 {
+                dirfd: a0 as i32,
+                path: a1,
+                buf: a2,
+                flag: a3 as i32,
+            },
             _ => MacosSyscallRequest::Unknown { number: nr_raw },
         }
     }

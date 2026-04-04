@@ -21,7 +21,7 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn do_syscall(
         &self,
         request: MacosSyscallRequest,
-        _ctx: &mut PtRegs,
+        ctx: &mut PtRegs,
     ) -> Result<usize, Errno> {
         match request {
             MacosSyscallRequest::Exit { status } => {
@@ -99,7 +99,47 @@ impl<FS: ShimFS> Task<FS> {
             }
             MacosSyscallRequest::Fstat64 { fd, buf } => self.sys_fstat64(fd, buf),
             MacosSyscallRequest::Getentropy { buf, count } => self.sys_getentropy(buf, count),
-            MacosSyscallRequest::MachTrap { number } => self.do_mach_trap(number),
+            MacosSyscallRequest::ThreadSelfid => self.sys_thread_selfid(),
+            MacosSyscallRequest::MachMsg2Trap { .. } => self.sys_mach_msg2_trap(),
+            MacosSyscallRequest::MachTrap { number } => self.do_mach_trap(number, ctx),
+            MacosSyscallRequest::CrossarchTrap => Ok(0),
+            MacosSyscallRequest::Csrctl => Err(Errno::EPERM),
+            MacosSyscallRequest::Dup2 { oldfd, newfd } => self.sys_dup2(oldfd, newfd),
+            MacosSyscallRequest::MacSyscall => Err(Errno::ENOSYS),
+            MacosSyscallRequest::Fsctl => Err(Errno::ENOTTY),
+            MacosSyscallRequest::SharedRegionMapAndSlide2Np => {
+                log_unsupported!("shared_region_map_and_slide_2_np: no-op (cache pre-mapped)");
+                Ok(0)
+            }
+            MacosSyscallRequest::KdebugTraceString => Ok(0),
+            MacosSyscallRequest::Statfs64 { path, buf } => self.sys_statfs64(path, buf),
+            MacosSyscallRequest::Stat64 { path, buf } => self.sys_stat64(path, buf),
+            MacosSyscallRequest::Openat {
+                dirfd,
+                path,
+                flags,
+                mode,
+            } => self.sys_openat(dirfd, path, flags, mode),
+            MacosSyscallRequest::Fstatat64 {
+                dirfd,
+                path,
+                buf,
+                flag,
+            } => self.sys_fstatat64(dirfd, path, buf, flag),
+            MacosSyscallRequest::TerminateWithPayload { namespace, code } => {
+                log_unsupported!(
+                    "terminate_with_payload(namespace={namespace:#x}, code={code:#x}) → exit(1)"
+                );
+                self.sys_exit(1);
+                Ok(0)
+            }
+            MacosSyscallRequest::AbortWithPayload { namespace, code } => {
+                log_unsupported!(
+                    "abort_with_payload(namespace={namespace:#x}, code={code:#x}) → exit(1)"
+                );
+                self.sys_exit(1);
+                Ok(0)
+            }
             MacosSyscallRequest::Unknown { number } => {
                 log_unsupported!("macOS syscall {number}");
                 Err(Errno::ENOSYS)

@@ -278,7 +278,73 @@ pub(crate) fn load<FS: ShimFS>(
         .unwrap_or(DEFAULT_LOW_ADDR);
     let mut brk = max_end.next_multiple_of(PAGE_SIZE);
 
-    // --- Initialize trampoline callback address and TLS table ---
+    // --- Allocate TLS lookup table ---
+    //
+    // The TLS table is needed whenever syscall interception is active —
+    // either from a __LITEBOX trampoline in the main binary (static case)
+    // or from the mmap-hook rewriting code loaded via dyld (dynamic case).
+    // We allocate it unconditionally so that load_dyld() can reference it.
+    //
+    // Layout: array of [guest_tpidr: u64, host_tls: u64] entries.
+    // 256 usable entries + 8 overflow sentinel entries for hash probe.
+    #[allow(clippy::items_after_statements)]
+    const TLS_ENTRY_SIZE: usize = 16;
+    #[allow(clippy::items_after_statements)]
+    const TLS_TABLE_USABLE_ENTRIES: usize = 256;
+    #[allow(clippy::items_after_statements)]
+    const TLS_TABLE_OVERFLOW_ENTRIES: usize = 8;
+    #[allow(clippy::items_after_statements)]
+    const TLS_TABLE_TOTAL_ENTRIES: usize = TLS_TABLE_USABLE_ENTRIES + TLS_TABLE_OVERFLOW_ENTRIES;
+    #[allow(clippy::items_after_statements)]
+    const TLS_TABLE_SIZE: usize = TLS_TABLE_TOTAL_ENTRIES * TLS_ENTRY_SIZE; // 4224 bytes
+                                                                            // On macOS aarch64, the host page size is 16KB. Align the TLS table
+                                                                            // to 16KB to ensure it gets its own host page and doesn't share a
+                                                                            // page with any trampoline (which may be mprotected to R-X).
+    #[allow(clippy::items_after_statements)]
+    const HOST_PAGE_SIZE: usize = 16384;
+
+    let tls_table_addr = brk.next_multiple_of(HOST_PAGE_SIZE);
+    let tls_table_end = (tls_table_addr + TLS_TABLE_SIZE).next_multiple_of(PAGE_SIZE);
+
+    let tls_flags = litebox_common_linux::MapFlags::MAP_ANONYMOUS
+        | litebox_common_linux::MapFlags::MAP_PRIVATE
+        | litebox_common_linux::MapFlags::MAP_FIXED;
+    litebox_common_linux::mm::do_mmap(
+        &task.global.pm,
+        Some(tls_table_addr),
+        tls_table_end - tls_table_addr,
+        litebox_common_linux::ProtFlags::PROT_READ_WRITE,
+        tls_flags,
+        false,
+        |_| Ok(0),
+    )
+    .map_err(|e| {
+        MachoLoaderError::MappingError(alloc::format!(
+            "mmap TLS table at {tls_table_addr:#x}: {e:?}"
+        ))
+    })?;
+
+    // Initialize all guest_tpidr fields with sentinel 0xFFFFFFFFFFFFFFFF.
+    let sentinel: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+    let tls_dest: MutPtr<u8> = MutPtr::from_usize(tls_table_addr);
+    for i in 0..TLS_TABLE_TOTAL_ENTRIES {
+        let entry_offset = i * TLS_ENTRY_SIZE;
+        tls_dest
+            .copy_from_slice(entry_offset, &sentinel.to_ne_bytes())
+            .ok_or(MachoLoaderError::MemoryError(
+                "failed to initialize TLS table entry".into(),
+            ))?;
+    }
+
+    // Store TLS table address in the global atomic so the platform's
+    // update_host_tls_entry() can find and write to it.
+    litebox_common_linux::HOST_TLS_TABLE_ADDR
+        .store(tls_table_addr, core::sync::atomic::Ordering::Release);
+
+    // Update brk past the TLS table.
+    brk = brk.max(tls_table_end);
+
+    // --- Initialize trampoline callback address (if __LITEBOX segment exists) ---
     //
     // The __LITEBOX segment contains the trampoline code emitted by the
     // Mach-O syscall rewriter. The first 8 bytes are reserved for the
@@ -286,8 +352,9 @@ pub(crate) fn load<FS: ShimFS>(
     // for the TLS lookup table pointer. The rewriter initializes both to
     // zero; we must fill them in now that the segment is mapped.
     //
-    // This mirrors what the ELF loader does in load_trampoline().
-    #[allow(clippy::items_after_statements)]
+    // For dynamically linked binaries that weren't rewritten, there is no
+    // __LITEBOX segment — the TLS table was already allocated above and
+    // dyld's trampoline will be initialized in load_dyld().
     if let Some(litebox_seg) = segments
         .iter()
         .find(|s| s.segname.starts_with(b"__LITEBOX"))
@@ -315,66 +382,11 @@ pub(crate) fn load<FS: ShimFS>(
                 "failed to write trampoline callback address".into(),
             ))?;
 
-        // Allocate TLS lookup table.
-        //
-        // Layout: array of [guest_tpidr: u64, host_tls: u64] entries.
-        // 256 usable entries + 8 overflow sentinel entries for hash probe.
-        const TLS_ENTRY_SIZE: usize = 16;
-        const TLS_TABLE_USABLE_ENTRIES: usize = 256;
-        const TLS_TABLE_OVERFLOW_ENTRIES: usize = 8;
-        const TLS_TABLE_TOTAL_ENTRIES: usize =
-            TLS_TABLE_USABLE_ENTRIES + TLS_TABLE_OVERFLOW_ENTRIES;
-        const TLS_TABLE_SIZE: usize = TLS_TABLE_TOTAL_ENTRIES * TLS_ENTRY_SIZE; // 4224 bytes
-
-        // On macOS aarch64, the host page size is 16KB. Align the TLS table
-        // to 16KB to ensure it gets its own host page and doesn't share a
-        // page with the trampoline (which will be mprotected to R-X).
-        const HOST_PAGE_SIZE: usize = 16384;
-        let tls_table_addr = brk
-            .max(trampoline_start + trampoline_size)
-            .next_multiple_of(HOST_PAGE_SIZE);
-        let tls_table_end = (tls_table_addr + TLS_TABLE_SIZE).next_multiple_of(PAGE_SIZE);
-
-        let tls_flags = litebox_common_linux::MapFlags::MAP_ANONYMOUS
-            | litebox_common_linux::MapFlags::MAP_PRIVATE
-            | litebox_common_linux::MapFlags::MAP_FIXED;
-        litebox_common_linux::mm::do_mmap(
-            &task.global.pm,
-            Some(tls_table_addr),
-            tls_table_end - tls_table_addr,
-            litebox_common_linux::ProtFlags::PROT_READ_WRITE,
-            tls_flags,
-            false,
-            |_| Ok(0),
-        )
-        .map_err(|e| {
-            MachoLoaderError::MappingError(alloc::format!(
-                "mmap TLS table at {tls_table_addr:#x}: {e:?}"
-            ))
-        })?;
-
-        // Initialize all guest_tpidr fields with sentinel 0xFFFFFFFFFFFFFFFF.
-        let sentinel: u64 = 0xFFFF_FFFF_FFFF_FFFF;
-        let tls_dest: MutPtr<u8> = MutPtr::from_usize(tls_table_addr);
-        for i in 0..TLS_TABLE_TOTAL_ENTRIES {
-            let entry_offset = i * TLS_ENTRY_SIZE;
-            tls_dest
-                .copy_from_slice(entry_offset, &sentinel.to_ne_bytes())
-                .ok_or(MachoLoaderError::MemoryError(
-                    "failed to initialize TLS table entry".into(),
-                ))?;
-        }
-
         // Write the TLS table address at trampoline offset 8.
         dest.copy_from_slice(8, &tls_table_addr.to_ne_bytes())
             .ok_or(MachoLoaderError::MemoryError(
                 "failed to write TLS table address in trampoline".into(),
             ))?;
-
-        // Store TLS table address in the global atomic so the platform's
-        // update_host_tls_entry() can find and write to it.
-        litebox_common_linux::HOST_TLS_TABLE_ADDR
-            .store(tls_table_addr, core::sync::atomic::Ordering::Release);
 
         // Re-protect the trampoline as R-X (executable code).
         litebox_common_linux::mm::sys_mprotect(
@@ -388,9 +400,6 @@ pub(crate) fn load<FS: ShimFS>(
                 "mprotect __LITEBOX R-X after init: {e:?}"
             ))
         })?;
-
-        // Update brk past the TLS table.
-        brk = brk.max(tls_table_end);
     }
 
     // Set the initial brk now that all segments and TLS table are mapped.
@@ -429,21 +438,41 @@ pub(crate) fn load<FS: ShimFS>(
                 MachoLoaderError::MappingError(alloc::format!("stack allocation: {e:?}"))
             })?
     };
+    log_unsupported!(
+        "stack allocated: sp={:#x}, size={DEFAULT_STACK_SIZE:#x}, range=[{:#x}..{:#x}]",
+        sp.as_usize(),
+        sp.as_usize() - DEFAULT_STACK_SIZE,
+        sp.as_usize(),
+    );
     let mut stack =
         UserStack::new(sp, DEFAULT_STACK_SIZE).ok_or(MachoLoaderError::InvalidStackAddr)?;
 
     if dyld_entry.is_some() {
-        // Build apple entries for dyld
+        // Build apple entries for dyld.
+        //
+        // dyld reads KernelArgs from the stack. Critical apple entries:
+        // - executable_mh=<hex>: the mapped address of the main binary's
+        //   mach_header_64. dyld uses this to find LC_LOAD_DYLIB commands.
+        // - executable_path=<path>: the executable's file path.
+        //
+        // The Mach-O header is at the start of the __TEXT segment, which
+        // is the first mapped segment (at reserved_base after slide).
+        let executable_mh = reserved_base;
         let executable_path = argv
             .first()
             .map(|a| a.to_str().unwrap_or("./a.out"))
             .unwrap_or("./a.out");
         let apple = alloc::vec![
+            CString::new(alloc::format!("executable_mh=0x{executable_mh:x}"))
+                .map_err(|_| MachoLoaderError::InvalidStackAddr)?,
             CString::new(alloc::format!("executable_path={executable_path}"))
                 .map_err(|_| MachoLoaderError::InvalidStackAddr)?,
         ];
+        // Use init_for_dyld to produce the KernelArgs layout that dyld
+        // expects: [mainExecutable mach_header*, argc, argv..., NULL,
+        // envp..., NULL, apple..., NULL].
         stack
-            .init_with_apple(argv, envp, apple)
+            .init_for_dyld(argv, envp, apple, executable_mh)
             .ok_or(MachoLoaderError::InvalidStackAddr)?;
     } else {
         stack
@@ -688,6 +717,11 @@ fn load_dyld<FS: ShimFS>(
     // Compute dyld entry point (LC_UNIXTHREAD gives absolute PC, apply slide)
     let entry_point =
         (entry_pc.ok_or(MachoLoaderError::NoEntryPoint)? as usize).wrapping_add(slide);
+
+    // Debug: log dyld load info
+    if cfg!(debug_assertions) {
+        log_unsupported!("dyld loaded: slide={slide:#x} entry={entry_point:#x} reserved_base={reserved_base:#x} min_vmaddr={min_vmaddr:#x}");
+    }
 
     // --- Initialize dyld's __LITEBOX trampoline ---
     //
