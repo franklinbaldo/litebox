@@ -22,8 +22,8 @@ use litebox_ipc::messages::{
 };
 use litebox_ipc::ring::{
     cq_flags, pipe_flags, sq_flags, CqEntry, SqEntry, TrampolineDescriptor, FILE_SLOT_SIZE,
-    FILE_ZONE_BASE_OFFSET, PIPE_SLOT_SIZE, PIPE_ZONE_BASE_OFFSET, RING_MASK, SOCKET_SLOT_SIZE,
-    SOCKET_ZONE_BASE_OFFSET,
+    FILE_ZONE_BASE_OFFSET, PIPE_SLOT_SIZE, PIPE_ZONE_BASE_OFFSET, RING_MASK, SOCKET_RING_CAPACITY,
+    SOCKET_SLOT_SIZE, SOCKET_ZONE_BASE_OFFSET,
 };
 use litebox_ipc::sq::{sq_advance_head, sq_head_index, sq_try_consume};
 use litebox_ipc::wait::spin_u8_then_wait_u32;
@@ -1161,39 +1161,70 @@ impl<FS: ShimFS> ProcessServer<FS> {
         match i64::from(nr) {
             libc::SYS_read => {
                 // read(fd, buf, count) — rewrite buf (rsi) to data region.
+                let fd = entry.args[0] as i32;
                 let count = entry.args[2] as usize;
-                let capped = count.min(data_region.len());
-                regs.rsi = data_ptr;
-                regs.rdx = capped;
-                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
-                if cq.result > 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
-                    cq.data_offset = 0;
-                    cq.data_len = cq.result as u32;
-                } else if cq.result == 0 {
-                    // EOF — still tell micro, result=0.
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
-                } else if cq.result == -i64::from(libc::EBADF) {
-                    // Fd not in shim's table — it's a real OS fd (e.g. pipe).
-                    // Let micro execute the read locally. Keep result as -EBADF
-                    // so micro can distinguish from EOF.
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
+
+                if let Some(header_ptr) = self.find_file_shmem_header(fd) {
+                    self.dispatch_shmem_read(
+                        entry.thread_slot,
+                        &mut regs,
+                        &mut cq,
+                        header_ptr,
+                        count,
+                    );
+                    // For shmem-backed fds, EBADF shouldn't occur since we know
+                    // the fd is tracked, but handle it the same as EOF for safety.
+                    if cq.result == -i64::from(libc::EBADF) {
+                        cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
+                    }
+                } else {
+                    // Original path: read into data_region.
+                    let capped = count.min(data_region.len());
+                    regs.rsi = data_ptr;
+                    regs.rdx = capped;
+                    cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                    if cq.result > 0 {
+                        cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
+                        cq.data_offset = 0;
+                        cq.data_len = cq.result as u32;
+                    } else if cq.result == 0 {
+                        // EOF — still tell micro, result=0.
+                        cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
+                    } else if cq.result == -i64::from(libc::EBADF) {
+                        // Fd not in shim's table — it's a real OS fd (e.g. pipe).
+                        // Let micro execute the read locally. Keep result as
+                        // -EBADF so micro can distinguish from EOF.
+                        cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
+                    }
                 }
                 // Other negative: error, pass through directly.
             }
             libc::SYS_pread64 => {
                 // pread64(fd, buf, count, offset) — rewrite buf (rsi).
+                let fd = entry.args[0] as i32;
                 let count = entry.args[2] as usize;
-                let capped = count.min(data_region.len());
-                regs.rsi = data_ptr;
-                regs.rdx = capped;
-                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
-                if cq.result > 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
-                    cq.data_offset = 0;
-                    cq.data_len = cq.result as u32;
-                } else if cq.result == 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
+
+                if let Some(header_ptr) = self.find_file_shmem_header(fd) {
+                    self.dispatch_shmem_read(
+                        entry.thread_slot,
+                        &mut regs,
+                        &mut cq,
+                        header_ptr,
+                        count,
+                    );
+                } else {
+                    // Original path: read into data_region.
+                    let capped = count.min(data_region.len());
+                    regs.rsi = data_ptr;
+                    regs.rdx = capped;
+                    cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                    if cq.result > 0 {
+                        cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
+                        cq.data_offset = 0;
+                        cq.data_len = cq.result as u32;
+                    } else if cq.result == 0 {
+                        cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
+                    }
                 }
             }
             libc::SYS_recvfrom => {
@@ -1329,18 +1360,31 @@ impl<FS: ShimFS> ProcessServer<FS> {
             libc::SYS_getdents64 => {
                 // getdents64(fd, dirp, count) — rewrite dirp (rsi) to data
                 // region.
+                let fd = entry.args[0] as i32;
                 let count = entry.args[2] as usize;
-                let capped = count.min(data_region.len());
-                regs.rsi = data_ptr;
-                regs.rdx = capped;
-                cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
-                if cq.result > 0 {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
-                    cq.data_offset = 0;
-                    cq.data_len = cq.result as u32;
-                } else if cq.result == 0 {
-                    // End of directory.
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
+
+                if let Some(header_ptr) = self.find_file_shmem_header(fd) {
+                    self.dispatch_shmem_read(
+                        entry.thread_slot,
+                        &mut regs,
+                        &mut cq,
+                        header_ptr,
+                        count,
+                    );
+                } else {
+                    // Original path: read into data_region.
+                    let capped = count.min(data_region.len());
+                    regs.rsi = data_ptr;
+                    regs.rdx = capped;
+                    cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                    if cq.result > 0 {
+                        cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
+                        cq.data_offset = 0;
+                        cq.data_len = cq.result as u32;
+                    } else if cq.result == 0 {
+                        // End of directory.
+                        cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
+                    }
                 }
             }
             libc::SYS_getcwd => {
@@ -2008,6 +2052,62 @@ impl<FS: ShimFS> ProcessServer<FS> {
         // Remove from tracking and free the slot.
         ns.shmem_sockets.swap_remove(idx);
         ns.free_socket_slot(slot_index);
+    }
+
+    /// Find the shmem header pointer for a file fd, if it has a shmem slot.
+    fn find_file_shmem_header(
+        &self,
+        fd: i32,
+    ) -> Option<*mut litebox_ipc::socket_ring::ShmemSocketHeader> {
+        let ns = self.notification_state.borrow();
+        for file in &ns.shmem_files {
+            if file.fd == fd {
+                let slot_offset =
+                    FILE_ZONE_BASE_OFFSET + (file.slot_index as usize) * FILE_SLOT_SIZE;
+                let data_region = self.region.data_region_mut();
+                #[allow(clippy::cast_ptr_alignment)]
+                let header_ptr = unsafe {
+                    data_region
+                        .as_mut_ptr()
+                        .add(slot_offset)
+                        .cast::<litebox_ipc::socket_ring::ShmemSocketHeader>()
+                };
+                return Some(header_ptr);
+            }
+        }
+        None
+    }
+
+    /// Dispatch a data-producing syscall through the shmem file ring.
+    ///
+    /// Reads data through the shim into a heap buffer, then fills the per-fd
+    /// shmem RX ring so micro can read it out.  Sets `FILE_SHMEM_DATA` on the
+    /// CQ when data was produced, or `EXEC_LOCAL | NO_REPORT` on EOF (result 0).
+    fn dispatch_shmem_read(
+        &self,
+        thread_slot: u16,
+        regs: &mut litebox_common_linux::PtRegs,
+        cq: &mut CqEntry,
+        header_ptr: *mut litebox_ipc::socket_ring::ShmemSocketHeader,
+        count: usize,
+    ) {
+        let capped = count.min(SOCKET_RING_CAPACITY);
+        let mut buf = vec![0u8; capped];
+        regs.rsi = buf.as_mut_ptr() as usize;
+        regs.rdx = capped;
+        cq.result = self.dispatch_to_task(thread_slot, regs);
+        if cq.result > 0 {
+            let n = cq.result as usize;
+            let filled = unsafe { litebox_ipc::socket_ring::socket_rx_fill(header_ptr, &buf[..n]) };
+            debug_assert!(
+                filled as usize == n,
+                "socket_rx_fill: expected {n}, got {filled} — ring should be empty before fill"
+            );
+            cq.flags = cq_flags::EXEC_LOCAL | cq_flags::FILE_SHMEM_DATA | cq_flags::NO_REPORT;
+        } else if cq.result == 0 {
+            cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
+        }
+        // Other negative results: error, pass through directly (no flags set).
     }
 
     /// If `fd` is a shmem-backed file, set the CLOSED flag, wake blocked

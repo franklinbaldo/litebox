@@ -119,6 +119,9 @@ pub mod cq_flags {
     /// responses.  The data region layout is:
     ///   `[mmap_data (data_len bytes)][TrampolineDescriptor][trampoline code]`
     pub const TRAMPOLINE: u16 = 1 << 2;
+    /// Data is in the fd's shmem ring buffer (RX ring for reads).
+    /// Micro should read from the fd's per-fd ring instead of the shared data_region.
+    pub const FILE_SHMEM_DATA: u16 = 1 << 3;
     /// Central does not need a result report for this EXEC_LOCAL entry.
     /// Micro should skip `report_local_result()` after local execution.
     pub const NO_REPORT: u16 = 1 << 4;
