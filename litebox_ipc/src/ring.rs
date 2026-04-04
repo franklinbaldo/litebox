@@ -106,6 +106,9 @@ pub mod sq_flags {
     /// This entry is a one-way notification — central should process it
     /// but NOT write a CQ entry or wake the sender.
     pub const NOTIFY_ONLY: u16 = 1 << 3;
+    /// Data for this syscall is in the fd's shmem file ring buffer (TX ring),
+    /// not the shared data_region.
+    pub const FILE_SHMEM: u16 = 1 << 4;
 }
 
 /// Flags for completion queue entries.

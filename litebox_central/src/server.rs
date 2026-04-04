@@ -1745,6 +1745,58 @@ impl<FS: ShimFS> ProcessServer<FS> {
             return cq;
         }
 
+        // Check if micro placed write data in the shmem file ring.
+        if entry.flags & sq_flags::FILE_SHMEM != 0
+            && let Some(header_ptr) = self.find_file_shmem_header(fd)
+        {
+            let mut buf = vec![0u8; SOCKET_RING_CAPACITY];
+            let drained =
+                unsafe { litebox_ipc::socket_ring::socket_tx_drain(header_ptr, &mut buf) };
+            if drained > 0 {
+                let n = drained as usize;
+                let mut regs = crate::dispatch::sq_entry_to_ptregs(entry);
+                // Convert writev/pwritev/pwritev2 to write/pwrite64.
+                match i64::from(nr) {
+                    libc::SYS_write | libc::SYS_pwrite64 => {
+                        regs.rsi = buf.as_ptr() as usize;
+                        regs.rdx = n;
+                    }
+                    libc::SYS_writev => {
+                        regs.orig_rax = libc::SYS_write as usize;
+                        regs.rsi = buf.as_ptr() as usize;
+                        regs.rdx = n;
+                    }
+                    libc::SYS_pwritev | libc::SYS_pwritev2 => {
+                        let offset_arg = entry.args[3].cast_signed();
+                        if offset_arg == -1 {
+                            regs.orig_rax = libc::SYS_write as usize;
+                        } else {
+                            regs.orig_rax = libc::SYS_pwrite64 as usize;
+                        }
+                        regs.rsi = buf.as_ptr() as usize;
+                        regs.rdx = n;
+                    }
+                    _ => {
+                        // sendto with FILE_SHMEM makes no sense — fall through to
+                        // normal path.
+                    }
+                }
+                if !matches!(i64::from(nr), libc::SYS_sendto) {
+                    cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                    if cq.result == -i64::from(libc::EBADF) {
+                        cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
+                    }
+                    return cq;
+                }
+            } else {
+                // No data in ring — shouldn't happen but return 0 gracefully.
+                cq.result = 0;
+                return cq;
+            }
+            // If no shmem header found (shouldn't happen if flag is set), fall
+            // through to normal data_region path.
+        }
+
         // Read the write data that micro placed in the data region.
         let data = self.region.data_region();
         let offset = entry.data_offset as usize;
