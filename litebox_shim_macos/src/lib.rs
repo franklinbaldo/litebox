@@ -252,6 +252,25 @@ impl<FS: ShimFS> MacosShim<FS> {
 
         let syscall_entry = litebox_platform_multiplex::platform().get_syscall_entry_point();
 
+        // Build a sorted list of all region page-aligned extents so we can find
+        // gaps for trampoline placement.  Each entry is (aligned_start, aligned_end).
+        let mut all_extents: Vec<(u64, u64)> = regions
+            .iter()
+            .map(|&(guest_addr, data, _)| {
+                let aligned_start = guest_addr & !(PAGE_SIZE as u64 - 1);
+                let aligned_end = (guest_addr + data.len() as u64 + PAGE_SIZE as u64 - 1)
+                    & !(PAGE_SIZE as u64 - 1);
+                (aligned_start, aligned_end)
+            })
+            .collect();
+        all_extents.sort_unstable();
+
+        // Pass 1: map ALL regions as RW at their fixed addresses.
+        // For non-executable regions on macOS-on-macOS, the host process may
+        // already have these regions mapped from its own shared cache (e.g.,
+        // __LINKEDIT, __OBJC_RO).  Mapping failures for non-executable regions
+        // are silently ignored — the host data is the same as what we would
+        // write.  Executable region failures are still fatal.
         for &(guest_addr, data, is_executable) in regions {
             let aligned_start = guest_addr & !(PAGE_SIZE as u64 - 1);
             let aligned_end =
@@ -259,9 +278,8 @@ impl<FS: ShimFS> MacosShim<FS> {
             let aligned_len = (aligned_end - aligned_start) as usize;
             let offset_in_page = (guest_addr - aligned_start) as usize;
 
-            // Allocate anonymous RW pages at the aligned address with MAP_FIXED.
             let rw_flags = MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED;
-            let mapped_ptr: MutPtr<u8> = litebox_common_linux::mm::do_mmap(
+            let map_result: Result<MutPtr<u8>, _> = litebox_common_linux::mm::do_mmap(
                 &self.0.pm,
                 Some(aligned_start as usize),
                 aligned_len,
@@ -269,78 +287,199 @@ impl<FS: ShimFS> MacosShim<FS> {
                 rw_flags,
                 false,
                 |_| Ok(0),
-            )
-            .expect("install_shared_cache: do_mmap failed");
+            );
 
-            // Write data into the mapping at the correct offset within the page.
-            mapped_ptr
-                .copy_from_slice(offset_in_page, data)
-                .expect("install_shared_cache: copy_from_slice failed");
-
-            if is_executable {
-                // Allocate a trampoline region for SVC rewriting.
-                let tramp_size = ((data.len() / (1024 * 1024)) + 1) * 4 * PAGE_SIZE;
-                let tramp_flags = MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE;
-                let tramp_ptr: MutPtr<u8> = litebox_common_linux::mm::do_mmap(
-                    &self.0.pm,
-                    None,
-                    tramp_size,
-                    ProtFlags::PROT_READ_WRITE,
-                    tramp_flags,
-                    false,
-                    |_| Ok(0),
-                )
-                .expect("install_shared_cache: trampoline do_mmap failed");
-                let tramp_addr = tramp_ptr.as_usize();
-
-                // Get mutable slices for patching.
-                // SAFETY: We just allocated these RW regions and no other code is
-                // accessing them yet (called during setup before guest runs).
-                let code_slice = unsafe {
-                    core::slice::from_raw_parts_mut(mapped_ptr.as_usize() as *mut u8, aligned_len)
-                };
-                // Patch only the data portion (offset within the page-aligned region).
-                let code_to_patch = &mut code_slice[offset_in_page..offset_in_page + data.len()];
-
-                let tramp_slice =
-                    unsafe { core::slice::from_raw_parts_mut(tramp_addr as *mut u8, tramp_size) };
-
-                let mut tramp_cursor = 0usize;
-                tramp_cursor = litebox_syscall_rewriter_macho::patch_code_segment(
-                    code_to_patch,
-                    guest_addr,
-                    tramp_slice,
-                    tramp_addr as u64,
-                    tramp_cursor,
-                    syscall_entry as u64,
-                )
-                .expect("install_shared_cache: patch_code_segment failed");
-                let _ = tramp_cursor;
-
-                // mprotect trampoline to R-X.
-                litebox_common_linux::mm::sys_mprotect(
-                    &self.0.pm,
-                    MutPtr::from_usize(tramp_addr),
-                    tramp_size,
-                    ProtFlags::PROT_READ_EXEC,
-                )
-                .expect("install_shared_cache: trampoline mprotect failed");
-
-                // mprotect code region to R-X.
-                litebox_common_linux::mm::sys_mprotect(
-                    &self.0.pm,
-                    MutPtr::from_usize(aligned_start as usize),
-                    aligned_len,
-                    ProtFlags::PROT_READ_EXEC,
-                )
-                .expect("install_shared_cache: code mprotect failed");
+            match map_result {
+                Ok(mapped_ptr) => {
+                    mapped_ptr
+                        .copy_from_slice(offset_in_page, data)
+                        .expect("install_shared_cache: copy_from_slice failed");
+                }
+                Err(_) if !is_executable => {
+                    // Non-executable region mapping failed — the host likely
+                    // already has this data mapped from the shared cache.
+                    log_unsupported!(
+                        "install_shared_cache: skipping non-exec region at {:#x} (len {:#x}): \
+                         host already maps this address",
+                        aligned_start,
+                        aligned_len
+                    );
+                }
+                Err(e) => {
+                    panic!(
+                        "install_shared_cache: do_mmap failed for exec region at {:#x}: {e:?}",
+                        aligned_start
+                    );
+                }
             }
+        }
+
+        // Pass 2: for each executable region, find a nearby gap for the
+        // trampoline, patch SVC sites, and set R-X permissions.
+        for &(guest_addr, data, is_executable) in regions {
+            if !is_executable {
+                continue;
+            }
+
+            let aligned_start = guest_addr & !(PAGE_SIZE as u64 - 1);
+            let aligned_end =
+                (guest_addr + data.len() as u64 + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
+            let aligned_len = (aligned_end - aligned_start) as usize;
+            let offset_in_page = (guest_addr - aligned_start) as usize;
+
+            let tramp_size = ((data.len() / (1024 * 1024)) + 1) * 4 * PAGE_SIZE;
+
+            // Find the best gap for the trampoline: scan the sorted extents
+            // for a gap within ±128MB of the code region's midpoint.
+            let code_mid = aligned_start + aligned_len as u64 / 2;
+            let branch_range: u64 = 128 * 1024 * 1024; // ±128MB
+            let tramp_addr = Self::find_trampoline_gap(
+                &all_extents,
+                code_mid,
+                branch_range,
+                tramp_size as u64,
+                PAGE_SIZE as u64,
+            )
+            .unwrap_or_else(|| {
+                panic!(
+                    "install_shared_cache: no gap for trampoline near code at {:#x} (size {:#x})",
+                    aligned_start, aligned_len
+                )
+            });
+
+            // Record the trampoline extent so future gap searches don't overlap.
+            let tramp_extent = (tramp_addr, tramp_addr + tramp_size as u64);
+            let insert_pos = all_extents
+                .binary_search_by_key(&tramp_addr, |e| e.0)
+                .unwrap_or_else(|i| i);
+            all_extents.insert(insert_pos, tramp_extent);
+
+            // Allocate the trampoline with MAP_FIXED at the computed address.
+            let tramp_flags = MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED;
+            let tramp_ptr: MutPtr<u8> = litebox_common_linux::mm::do_mmap(
+                &self.0.pm,
+                Some(tramp_addr as usize),
+                tramp_size,
+                ProtFlags::PROT_READ_WRITE,
+                tramp_flags,
+                false,
+                |_| Ok(0),
+            )
+            .expect("install_shared_cache: trampoline do_mmap failed");
+            let tramp_addr_usize = tramp_ptr.as_usize();
+
+            // Get mutable slices for patching.
+            // SAFETY: We just allocated these RW regions and no other code is
+            // accessing them yet (called during setup before guest runs).
+            let code_slice = unsafe {
+                core::slice::from_raw_parts_mut(aligned_start as usize as *mut u8, aligned_len)
+            };
+            let code_to_patch = &mut code_slice[offset_in_page..offset_in_page + data.len()];
+
+            let tramp_slice =
+                unsafe { core::slice::from_raw_parts_mut(tramp_addr_usize as *mut u8, tramp_size) };
+
+            let mut tramp_cursor = 0usize;
+            tramp_cursor = litebox_syscall_rewriter_macho::patch_code_segment(
+                code_to_patch,
+                guest_addr,
+                tramp_slice,
+                tramp_addr,
+                tramp_cursor,
+                syscall_entry as u64,
+            )
+            .expect("install_shared_cache: patch_code_segment failed");
+            let _ = tramp_cursor;
+
+            // mprotect trampoline to R-X.
+            litebox_common_linux::mm::sys_mprotect(
+                &self.0.pm,
+                MutPtr::from_usize(tramp_addr_usize),
+                tramp_size,
+                ProtFlags::PROT_READ_EXEC,
+            )
+            .expect("install_shared_cache: trampoline mprotect failed");
+
+            // mprotect code region to R-X.
+            litebox_common_linux::mm::sys_mprotect(
+                &self.0.pm,
+                MutPtr::from_usize(aligned_start as usize),
+                aligned_len,
+                ProtFlags::PROT_READ_EXEC,
+            )
+            .expect("install_shared_cache: code mprotect failed");
         }
 
         // Record the cache base address.
         self.0
             .shared_cache_base
             .store(cache_base, Ordering::Release);
+    }
+
+    /// Find a page-aligned gap within `±branch_range` of `code_mid` that can
+    /// hold `tramp_size` bytes without overlapping any extent in `extents`.
+    ///
+    /// `extents` must be sorted by start address.  Returns the gap start
+    /// address, or `None` if no suitable gap exists.
+    fn find_trampoline_gap(
+        extents: &[(u64, u64)],
+        code_mid: u64,
+        branch_range: u64,
+        tramp_size: u64,
+        page_size: u64,
+    ) -> Option<u64> {
+        let range_lo = code_mid.saturating_sub(branch_range);
+        let range_hi = code_mid.saturating_add(branch_range);
+
+        // Candidate gaps: before the first extent, between consecutive extents,
+        // and after the last extent — all clipped to [range_lo, range_hi].
+        // Pick the gap whose midpoint is closest to `code_mid`.
+        let mut best: Option<(u64, u64)> = None; // (distance_to_code, gap_start)
+
+        // Helper to consider a candidate gap [gap_lo, gap_hi) clipped to the
+        // branch range.
+        let mut consider = |gap_lo: u64, gap_hi: u64| {
+            let lo = gap_lo.max(range_lo);
+            let hi = gap_hi.min(range_hi);
+            if hi <= lo || hi - lo < tramp_size {
+                return;
+            }
+            // Page-align the candidate.
+            let aligned_lo = (lo + page_size - 1) & !(page_size - 1);
+            if aligned_lo + tramp_size > hi {
+                return;
+            }
+            // Pick the page-aligned start closest to code_mid.
+            let candidate = if code_mid >= aligned_lo && code_mid <= hi - tramp_size {
+                code_mid & !(page_size - 1)
+            } else if code_mid < aligned_lo {
+                aligned_lo
+            } else {
+                ((hi - tramp_size) & !(page_size - 1)).max(aligned_lo)
+            };
+            if candidate + tramp_size > hi {
+                return;
+            }
+            let dist = code_mid.abs_diff(candidate + tramp_size / 2);
+            if best.map_or(true, |(d, _)| dist < d) {
+                best = Some((dist, candidate));
+            }
+        };
+
+        // Gap before the first extent.
+        if let Some(&(first_start, _)) = extents.first() {
+            consider(0, first_start);
+        }
+        // Gaps between consecutive extents.
+        for w in extents.windows(2) {
+            consider(w[0].1, w[1].0);
+        }
+        // Gap after the last extent.
+        if let Some(&(_, last_end)) = extents.last() {
+            consider(last_end, u64::MAX - page_size);
+        }
+
+        best.map(|(_, addr)| addr)
     }
 
     /// Initialize stdio file descriptors (0=stdin, 1=stdout, 2=stderr).

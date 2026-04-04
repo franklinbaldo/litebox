@@ -104,14 +104,14 @@ use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::time::Duration;
 
 use litebox::fs::OFlags;
-use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::{
     CowAllocationError, FixedAddressBehavior, MemoryRegionPermissions,
 };
+use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer as _};
 use litebox::shim::ContinueOperation;
 use litebox::utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt};
-use litebox_common_linux::{MapFlags, ProtFlags, PunchthroughSyscall, vmap::VmapManager};
+use litebox_common_linux::{vmap::VmapManager, MapFlags, ProtFlags, PunchthroughSyscall};
 
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -1993,6 +1993,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                         return Err(match err.raw_os_error() {
                             Some(libc::ENOMEM) => {
                                 litebox::platform::page_mgmt::AllocationError::OutOfMemory
+                            }
+                            Some(libc::EACCES) | Some(libc::EPERM) => {
+                                // MAP_FIXED on a region owned by the platform
+                                // (e.g. the host shared cache) returns EACCES.
+                                litebox::platform::page_mgmt::AllocationError::AddressInUseByPlatform
                             }
                             _ => panic!("unhandled mmap error {err}"),
                         });
