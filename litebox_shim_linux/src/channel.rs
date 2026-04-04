@@ -20,13 +20,12 @@ macro_rules! common_functions_for_channel {
         }
 
         /// Shut this channel down.
-        #[expect(dead_code)]
-        fn shutdown(&self) {
+        pub(crate) fn shutdown(&self) {
             self.endpoint.shutdown();
         }
 
         /// Has the peer (i.e., other end) been shut down?
-        fn is_peer_shutdown(&self) -> bool {
+        pub(crate) fn is_peer_shutdown(&self) -> bool {
             if let Some(peer) = self.peer.upgrade() {
                 peer.is_shutdown()
             } else {
@@ -113,10 +112,19 @@ impl<T> ReadEnd<T> {
     common_functions_for_channel!();
 }
 
-#[derive(Clone)]
 pub(crate) struct WriteEnd<T> {
     endpoint: alloc::sync::Arc<EndPointer<crate::Platform, ringbuf::HeapProd<T>>>,
     peer: alloc::sync::Weak<EndPointer<crate::Platform, ringbuf::HeapCons<T>>>,
+}
+
+// Manual Clone impl: Arc/Weak are always Clone regardless of T.
+impl<T> Clone for WriteEnd<T> {
+    fn clone(&self) -> Self {
+        Self {
+            endpoint: self.endpoint.clone(),
+            peer: self.peer.clone(),
+        }
+    }
 }
 
 impl<T> WriteEnd<T> {

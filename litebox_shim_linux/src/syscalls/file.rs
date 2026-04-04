@@ -9,6 +9,7 @@ use alloc::{
     string::{String, ToString as _},
     sync::Arc,
     vec,
+    vec::Vec,
 };
 use litebox::{
     event::{Events, wait::WaitError},
@@ -611,6 +612,7 @@ impl<FS: ShimFS> Task<FS> {
                             &mut buf.borrow_mut(),
                             litebox_common_linux::ReceiveFlags::empty(),
                             None,
+                            &mut Vec::new(),
                         )
                     })
                 },
@@ -671,7 +673,13 @@ impl<FS: ShimFS> Task<FS> {
                         .entry_handle(fd)
                         .ok_or(Errno::EBADF)?;
                     handle.with_entry(|file| {
-                        file.sendto(self, buf, litebox_common_linux::SendFlags::empty(), None)
+                        file.sendto(
+                            self,
+                            buf,
+                            litebox_common_linux::SendFlags::empty(),
+                            None,
+                            Vec::new(),
+                        )
                     })
                 },
             )
@@ -1221,6 +1229,7 @@ impl<FS: ShimFS> Task<FS> {
                                 buf,
                                 litebox_common_linux::ReceiveFlags::empty(),
                                 None,
+                                &mut Vec::new(),
                             )
                         })
                     })
@@ -1505,7 +1514,13 @@ impl<FS: ShimFS> Task<FS> {
                         .ok_or(Errno::EBADF)?;
                     handle.with_entry(|file| {
                         write_once_from_iovecs(iovs, |buf| {
-                            file.sendto(self, buf, litebox_common_linux::SendFlags::empty(), None)
+                            file.sendto(
+                                self,
+                                buf,
+                                litebox_common_linux::SendFlags::empty(),
+                                None,
+                                Vec::new(),
+                            )
                         })
                     })
                 },

@@ -405,6 +405,15 @@ impl<FS: ShimFS> Task<FS> {
             }
         }
     }
+
+    /// Returns the current effective credentials as a `Ucred`.
+    pub(crate) fn current_ucred(&self) -> litebox_common_linux::Ucred {
+        litebox_common_linux::Ucred {
+            pid: self.pid.cast_unsigned(),
+            uid: self.credentials.euid,
+            gid: self.credentials.egid,
+        }
+    }
 }
 
 impl<FS: ShimFS> syscalls::file::FilesState<FS> {

@@ -1,0 +1,96 @@
+# Session Log (append-only)
+# Started: 2026-04-04
+
+## Entry 1 — Resuming session, assessing state
+- Branch: wdcui/stacked/pr15-litebox-infra (ac9c9a6b)
+- Working tree: clean
+- All branches pr16–pr24 intact with expected commit hashes
+- Commit chain: ac9c9a6b → 03408d0a → d2a85ca7 → 40df4142 → 5a284bf9 → 527ed14b → b9cf8348 → 4c373a54 → f278ddd4 → b7bf795a
+- TASK: Amend PR 15 to remove DescriptorObjectId, then rebase PRs 16-24
+- NOTE: PRs 23-24 were never pushed (SSH broken). PRs 1-22 were pushed.
+
+## Entry 2 — Starting PR 15 amendment
+- Need to: remove DescriptorObjectId from fd/mod.rs and fd/tests.rs
+- Keep identity_addr() intact
+- Then amend commit, rebase chain, fix conflicts in PR 18/19
+
+## Entry 3 — PR 15 amendment complete
+- Removed DescriptorObjectId struct, impl, all field/param/method references from fd/mod.rs
+- Reverted tests to use identity_addr() comparisons
+- cargo fmt applied (import reorder in tests.rs, pipes.rs)
+- Build, clippy, fmt all clean at PR 15
+- Amended commit: ac9c9a6b → 8d22ecaf
+- New message: "WorkerExec bindings, MM/net/pipe improvements"
+
+## Entry 4 — Rebase PRs 16-24
+- First rebase (onto new PR 15) completed cleanly — no textual conflicts
+- BUT PR 19 has compile error: `DescriptorObjectId` no longer exists
+- Checked out rebased PR 19 (90f73531), fixed WorkerExecOutputGroupKey:
+  - Fs(DescriptorObjectId) → Fs(usize), using Arc::as_ptr(fd).addr()
+  - Pipe(DescriptorObjectId) → Pipe(usize), using Arc::as_ptr(fd).addr()
+  - Stream(u64) unchanged (writer.object_id() still exists on trait)
+- Amended PR 19: 90f73531 → 1435d7d6
+- Rebased PRs 20-24 onto fixed PR 19 — clean, no conflicts
+
+## Entry 5 — Branches re-pointed and verified
+- All branch refs updated to new commit hashes
+- Full chain: 8d22ecaf → ee22e7e2 → f272546e → d9449b04 → 1435d7d6 → 21b505d4 → a281fab5 → bb3c79b8 → 13fbf92f → 979ad959
+
+## Entry 6 — Verification
+- cargo build -p litebox_broker: PASS
+- cargo fmt --all -- --check: PASS
+- cargo clippy --all-targets --all-features: PASS (0 warnings)
+- cargo nextest run (excluding nine_p, tun, exit_callback): 310 passed, 63 skipped, 0 failed
+
+## Entry 7 — All branches pushed
+- SSH is working again
+- PRs 15-22: force-pushed (rebased commits)
+- PRs 23-24: new branches (first time pushed)
+- All 10 branches (pr15-pr24) now on remote
+
+## STATUS: PR 15 DescriptorObjectId removal COMPLETE
+- Next: shim work (Steps 25-39), BUT user said "Do NOT work on the shim without checking with me"
+- Waiting for user direction
+
+## Entry 8 — Shim + Runner analysis complete
+- User asked to analyze before starting work
+- Ran 3 subagent analyses: shim diff structure, runner diff structure, shim internal dependencies
+- Key findings documented in conversation (see proposed step breakdown below)
+- Total remaining: ~23,910 added lines (shim ~21,700 + runner ~2,200)
+- Independent subsystems: multihost.rs, epoll.rs, eventfd.rs
+- Cross-cutting subsystem: vfork/CoW touches nearly every file
+- Runner depends on 2 new shim APIs: load_program_with_exec_filename(), default_fs() standalone
+- Recommended approach: Option A (small shim API stub → runner → bulk shim)
+
+## Entry 9 — PR 27 complete (loader improvements + file syscalls part 1)
+- Branch: wdcui/stacked/pr27-loader-file-syscalls-1 (bb03e84d)
+- Parent: wdcui/stacked/pr26-epoll-eventfd-enhancements (d8f393c5)
+- 8 files changed, 898 insertions(+), 157 deletions(-)
+- Changes:
+  - Loader: stack.rs/auxv.rs/mod.rs replaced with target, elf.rs edits (exec_filename, at_random, suppress fix)
+  - common_loader: bss_start/bss_end, PIE base_addr fix, fixed_load_range()
+  - file.rs: vectored I/O helpers (total_readv_len, total_writev_len, alloc_zeroed_kernel_buf, scatter_bytes_to_iovecs, read_once_to_iovecs, gather_iovecs, write_once_from_iovecs)
+  - file.rs: expanded sys_readv/sys_writev to all 6 fd subsystems
+  - file.rs: set_close_on_exec, sys_close_range, sys_mkdirat, resolve_dirfd_path, resolve_fs_path_to_string, sys_symlinkat, sys_linkat, sys_renameat2
+  - file.rs: fcntl helpers (fcntl_status_flags, validate_fcntl_lock_fd, emulate_fcntl_getlk, emulate_fcntl_setlk), updated sys_fcntl GETFL/GETLK/SETLK arms
+  - lib.rs: close_range dispatch before try_from_raw, Mkdirat/Renameat2/Symlinkat/Linkat arms
+  - process.rs: updated loader.load() call for new exec_filename param
+- Build: pass, fmt: pass, clippy: pass, 339 tests pass
+- Pushed to remote
+- Next: PR 28 (file syscalls part 2)
+
+## Entry 10 — PR 28 complete (file syscalls part 2)
+- Branch: wdcui/stacked/pr28-file-syscalls-2 (81de5c9f)
+- Parent: wdcui/stacked/pr27-loader-file-syscalls-1 (bb03e84d)
+- 2 files changed, 981 insertions(+), 20 deletions(-)
+- Changes:
+  - file.rs: InotifyInstanceState, FsState (exe_path, cwd, with_cwd), FilesState inotify tracking
+  - file.rs: FsPath refactor (new rejects empty, new_inner, new_empty_ok), canonicalize_path
+  - file.rs: validation helpers (validate_fd, validate_path, validate_path_nofollow/follow)
+  - file.rs: faccessat, statx, statfs/fstatfs, fchmodat, fchdir, memfd_create
+  - file.rs: inotify_init1/add_watch/rm_watch, timerfd_create/settime/gettime
+  - lib.rs: dispatch for all new syscalls + no-op stubs (fchmod, fchown, fsync, xattr, etc.)
+  - Bug fixes: do_close inotify cleanup, do_dup_inner inotify duplicate, dup2(fd,fd) CLOEXEC clear, getdents64 ENOTDIR
+- Build: pass, fmt: pass, clippy: pass, 339 tests pass
+- Pushed to remote
+- Next: PR 29 (net + unix enhancements)

@@ -9,8 +9,8 @@ use core::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
 };
 
-use alloc::string::ToString;
 use alloc::sync::Arc;
+use alloc::{string::ToString, vec::Vec};
 use litebox::{
     event::{
         Events, IOPollable,
@@ -38,6 +38,11 @@ use crate::{
     Platform,
     syscalls::unix::{CSockUnixAddr, UnixSocket, UnixSocketAddr},
 };
+
+/// Linux default for `TCP_KEEPIDLE` (seconds before first keep-alive probe).
+const DEFAULT_TCP_KEEPIDLE_SECS: u32 = 7200;
+/// Linux default for `TCP_KEEPCNT` (number of unacknowledged probes before drop).
+const DEFAULT_TCP_KEEPCNT: u32 = 9;
 
 macro_rules! convert_flags {
     ($src:expr, $src_type:ty, $dst_type:ty, $($flag:ident),+ $(,)?) => {
@@ -171,7 +176,7 @@ pub(super) struct SocketOptions {
     pub(super) linger_timeout: Option<core::time::Duration>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub(crate) struct SocketOFlags(pub OFlags);
 #[derive(Clone)]
 pub(crate) struct SocketProxy(pub Arc<NetworkProxy<Platform>>);
@@ -375,13 +380,19 @@ impl<FS: ShimFS> GlobalState<FS> {
             Ok(())
         }) {
             Err(Errno::ENOPROTOOPT) => {} // fallthrough to handle other options
-            other => return other,
+            other => {
+                return other;
+            }
         }
 
         match optname {
             SocketOptionName::IP(ip) => match ip {
                 litebox_common_linux::IpOption::TOS => return Err(Errno::EOPNOTSUPP),
-                _ => return Err(Errno::ENOPROTOOPT),
+                // Silently accept IP_RECVERR, IP_MTU_DISCOVER, IP_PKTINFO
+                // (used by glibc's DNS resolver; not yet tracked).
+                litebox_common_linux::IpOption::RECVERR
+                | litebox_common_linux::IpOption::MTU_DISCOVER
+                | litebox_common_linux::IpOption::PKTINFO => return Ok(()),
             },
             SocketOptionName::Socket(so) => match so {
                 // handled by `setsockopt_common`
@@ -419,7 +430,32 @@ impl<FS: ShimFS> GlobalState<FS> {
                         },
                     )?;
                 }
-                TcpOption::KEEPCNT | TcpOption::KEEPIDLE | TcpOption::INFO => {
+                TcpOption::KEEPCNT => {
+                    // smoltcp doesn't support fine-grained keep-alive probe
+                    // counts. Accept and ignore the value so applications that
+                    // set it (e.g., curl) don't fail.
+                    let _val: u32 = super::read_from_user(optval, size_of::<u32>())?;
+                }
+                TcpOption::KEEPIDLE => {
+                    // smoltcp uses a single keep-alive interval (set via
+                    // TCP_KEEPINTVL / SO_KEEPALIVE). Accept KEEPIDLE and
+                    // forward it as the keep-alive interval so the setting
+                    // takes effect.
+                    let val: u32 = super::read_from_user(optval, size_of::<u32>())?;
+                    if val == 0 {
+                        return Err(Errno::EINVAL);
+                    }
+                    self.net
+                        .lock()
+                        .set_tcp_option(
+                            fd,
+                            litebox::net::TcpOptionData::KEEPALIVE(Some(
+                                core::time::Duration::from_secs(u64::from(val)),
+                            )),
+                        )
+                        .expect("set TCP_KEEPALIVE should succeed");
+                }
+                TcpOption::INFO => {
                     return Err(Errno::EOPNOTSUPP);
                 }
                 TcpOption::NODELAY | TcpOption::CORK => {
@@ -534,8 +570,10 @@ impl<FS: ShimFS> GlobalState<FS> {
 
         let val: u32 = match optname {
             SocketOptionName::IP(ipopt) => match ipopt {
-                litebox_common_linux::IpOption::TOS => return Err(Errno::EOPNOTSUPP),
-                _ => return Err(Errno::ENOPROTOOPT),
+                litebox_common_linux::IpOption::TOS
+                | litebox_common_linux::IpOption::RECVERR
+                | litebox_common_linux::IpOption::MTU_DISCOVER
+                | litebox_common_linux::IpOption::PKTINFO => return Err(Errno::EOPNOTSUPP),
             },
             SocketOptionName::Socket(sopt) => match sopt {
                 // handled by `getsockopt_common`
@@ -550,7 +588,8 @@ impl<FS: ShimFS> GlobalState<FS> {
                 SocketOption::ERROR => {
                     // SO_ERROR is self-clearing: atomically read and reset to 0.
                     let proxy = self.get_proxy(fd)?;
-                    match proxy.get_async_error(true) {
+                    let async_error = proxy.get_async_error(true);
+                    match async_error {
                         Some(err) => {
                             let errno: Errno = err.into();
                             i32::from(errno).cast_unsigned()
@@ -586,7 +625,26 @@ impl<FS: ShimFS> GlobalState<FS> {
                             .ok_or(Errno::EFAULT)?;
                         return Ok(len);
                     }
-                    TcpOption::KEEPCNT | TcpOption::KEEPIDLE | TcpOption::INFO => {
+                    TcpOption::KEEPCNT => {
+                        // smoltcp doesn't track probe count; return Linux
+                        // default.
+                        DEFAULT_TCP_KEEPCNT
+                    }
+                    TcpOption::KEEPIDLE => {
+                        // Return the keep-alive interval as KEEPIDLE (smoltcp
+                        // doesn't distinguish idle vs interval).
+                        let TcpOptionData::KEEPALIVE(interval) = self
+                            .net
+                            .lock()
+                            .get_tcp_option(fd, litebox::net::TcpOptionName::KEEPALIVE)?
+                        else {
+                            unreachable!()
+                        };
+                        interval.map_or(DEFAULT_TCP_KEEPIDLE_SECS, |d| {
+                            d.as_secs().try_into().unwrap()
+                        })
+                    }
+                    TcpOption::INFO => {
                         return Err(Errno::EOPNOTSUPP);
                     }
                     TcpOption::KEEPINTVL => {
@@ -692,6 +750,13 @@ impl<FS: ShimFS> GlobalState<FS> {
         self.net.lock().listen(fd, backlog).map_err(Errno::from)
     }
 
+    fn shutdown(&self, fd: &SocketFd, read: bool, write: bool) -> Result<(), Errno> {
+        self.net
+            .lock()
+            .shutdown(fd, read, write)
+            .map_err(Errno::from)
+    }
+
     /// Send data via socket channel (lock-free path).
     ///
     /// This uses the channel-based approach where the user writes to a TX ring buffer,
@@ -755,8 +820,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         let is_nonblock =
             self.get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT);
 
-        let ret = cx
-            .with_timeout(timeout)
+        cx.with_timeout(timeout)
             .wait_on_events(
                 is_nonblock,
                 Events::OUT,
@@ -765,18 +829,13 @@ impl<FS: ShimFS> GlobalState<FS> {
                     Ok(())
                 },
                 || match proxy.try_write(buf, new_flags, sockaddr) {
+                    Ok(0) if buf.is_empty() => Ok(0),
                     Ok(0) => Err(TryOpError::TryAgain),
                     Ok(n) => Ok(n),
                     Err(e) => Err(TryOpError::Other(Errno::from(e))),
                 },
             )
-            .map_err(Errno::from);
-        if let Err(Errno::EPIPE) = ret
-            && !flags.contains(SendFlags::NOSIGNAL)
-        {
-            unimplemented!("send signal SIGPIPE on EPIPE");
-        }
-        ret
+            .map_err(Errno::from)
     }
 
     /// Receive data via socket channel (lock-free path).
@@ -1022,7 +1081,8 @@ impl<FS: ShimFS> Task<FS> {
             AddressFamily::UNIX => {
                 let _ = UnixProtocol::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?;
                 let (sock1, sock2) =
-                    UnixSocket::new_connected_pair(ty, flags).ok_or(Errno::ESOCKTNOSUPPORT)?;
+                    UnixSocket::new_connected_pair(ty, flags, self.current_ucred())
+                        .ok_or(Errno::ESOCKTNOSUPPORT)?;
                 let files = self.files.borrow();
                 let mut dt = self.global.litebox.descriptor_table_mut();
                 let typed1 = dt.insert::<crate::syscalls::unix::UnixSocketSubsystem<FS>>(sock1);
@@ -1164,7 +1224,9 @@ pub(crate) fn write_sockaddr_to_user(
                 }
             }
         }
-        SocketAddress::Inet(SocketAddr::V6(_)) => todo!("copy_sockaddr_to_user for IPv6"),
+        SocketAddress::Inet(SocketAddr::V6(_)) => {
+            return Err(Errno::EAFNOSUPPORT);
+        }
     }
     .truncate();
     addrlen.write_at_offset(0, len).ok_or(Errno::EFAULT)
@@ -1319,7 +1381,30 @@ impl<FS: ShimFS> Task<FS> {
             &self.global,
             sockfd,
             |fd| self.global.listen(fd, backlog),
-            |file| file.listen(backlog, &self.global),
+            |file| file.listen(self, backlog, &self.global),
+        )
+    }
+
+    /// Handle syscall `shutdown`
+    pub(crate) fn sys_shutdown(&self, sockfd: i32, how: i32) -> Result<(), Errno> {
+        let Ok(sockfd) = u32::try_from(sockfd) else {
+            return Err(Errno::EBADF);
+        };
+        // SHUT_RD=0, SHUT_WR=1, SHUT_RDWR=2
+        let (read, write) = match how {
+            0 => (true, false),
+            1 => (false, true),
+            2 => (true, true),
+            _ => return Err(Errno::EINVAL),
+        };
+        self.do_shutdown(sockfd, read, write)
+    }
+    fn do_shutdown(&self, sockfd: u32, read: bool, write: bool) -> Result<(), Errno> {
+        self.files.borrow().with_socket(
+            &self.global,
+            sockfd,
+            |fd| self.global.shutdown(fd, read, write),
+            |file| file.shutdown(read, write),
         )
     }
 
@@ -1349,7 +1434,7 @@ impl<FS: ShimFS> Task<FS> {
         flags: SendFlags,
         sockaddr: Option<SocketAddress>,
     ) -> Result<usize, Errno> {
-        self.files.borrow().with_socket(
+        let ret = self.files.borrow().with_socket(
             &self.global,
             sockfd,
             |fd| {
@@ -1365,9 +1450,18 @@ impl<FS: ShimFS> Task<FS> {
                     .clone()
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
-                file.sendto(self, buf, flags, addr)
+                file.sendto(self, buf, flags, addr, Vec::new())
             },
-        )
+        );
+        if let Err(Errno::EPIPE) = ret
+            && !flags.contains(SendFlags::NOSIGNAL)
+        {
+            self.send_signal(
+                litebox_common_linux::signal::Signal::SIGPIPE,
+                super::signal::siginfo_kernel(litebox_common_linux::signal::Signal::SIGPIPE),
+            );
+        }
+        ret
     }
 
     /// Handle syscall `sendmsg`
@@ -1383,6 +1477,223 @@ impl<FS: ShimFS> Task<FS> {
         let msg = msg.read_at_offset(0).ok_or(Errno::EFAULT)?;
         self.do_sendmsg(fd, &msg, flags)
     }
+
+    fn copy_sendmsg_iovs(
+        iovs: &[litebox_common_linux::IoVec<MutPtr<u8>>],
+    ) -> Result<Vec<u8>, Errno> {
+        let total_len = iovs
+            .iter()
+            .try_fold(0usize, |acc, iov| acc.checked_add(iov.iov_len))
+            .ok_or(Errno::EINVAL)?;
+        let mut buf = Vec::with_capacity(total_len);
+        for iov in iovs {
+            let iov_base = iov.iov_base;
+            let iov_len = iov.iov_len;
+            let start = buf.len();
+            buf.resize(start + iov_len, 0);
+            let ptr = ConstPtr::<u8>::from_usize(iov_base.as_usize());
+            for (offset, byte) in buf[start..].iter_mut().enumerate() {
+                *byte = ptr
+                    .read_at_offset(isize::try_from(offset).unwrap())
+                    .ok_or(Errno::EFAULT)?;
+            }
+        }
+        Ok(buf)
+    }
+
+    fn sendmsg_stream_iovs(
+        iovs: &[litebox_common_linux::IoVec<MutPtr<u8>>],
+        mut send_chunk: impl FnMut(&[u8]) -> Result<usize, Errno>,
+    ) -> Result<usize, Errno> {
+        let mut total_sent = 0usize;
+        for iov in iovs {
+            let iov_base = iov.iov_base;
+            let iov_len = iov.iov_len;
+            let mut offset = 0usize;
+            while offset < iov_len {
+                let ptr = ConstPtr::<u8>::from_usize(iov_base.as_usize().wrapping_add(offset));
+                let chunk = ptr.to_owned_slice(iov_len - offset).ok_or(Errno::EFAULT)?;
+                let sent = match send_chunk(&chunk) {
+                    Ok(sent) => sent,
+                    Err(_err) if total_sent > 0 => return Ok(total_sent),
+                    Err(err) => return Err(err),
+                };
+                total_sent = total_sent.checked_add(sent).ok_or(Errno::EINVAL)?;
+                if sent == 0 || sent < chunk.len() {
+                    return Ok(total_sent);
+                }
+                offset += sent;
+            }
+        }
+        Ok(total_sent)
+    }
+
+    /// Parse `SCM_RIGHTS` control messages from a `sendmsg` header.
+    ///
+    /// Iterates over the control-message buffer, validates each `cmsghdr`,
+    /// and duplicates the referenced file descriptors for inter-process
+    /// passing. Only `SOL_SOCKET` / `SCM_RIGHTS` is supported; any other
+    /// cmsg level/type is rejected with `EOPNOTSUPP`.
+    fn parse_sendmsg_cmsg(
+        &self,
+        msg: &litebox_common_linux::UserMsgHdr<Platform>,
+    ) -> Result<Vec<litebox::fd::PassedFd>, Errno> {
+        use litebox::platform::RawConstPointer as _;
+        use litebox_common_linux::{CmsgHdr, SCM_RIGHTS, cmsg_align, cmsg_len};
+
+        let controllen = msg.msg_controllen;
+        if controllen == 0 {
+            return Ok(Vec::new());
+        }
+
+        let msg_control = { msg.msg_control };
+        let control_ptr = msg_control.as_usize();
+        if control_ptr == 0 {
+            return Err(Errno::EFAULT);
+        }
+
+        let hdr_size = core::mem::size_of::<CmsgHdr>();
+        let mut passed_fds = Vec::new();
+        let mut offset = 0usize;
+
+        while offset + hdr_size <= controllen {
+            let cmsg_ptr = ConstPtr::<CmsgHdr>::from_usize(control_ptr + offset);
+            let cmsg: CmsgHdr = cmsg_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+
+            if cmsg.cmsg_len < cmsg_len(0) {
+                return Err(Errno::EINVAL);
+            }
+
+            // Validate that the full cmsg fits within the control buffer.
+            if cmsg.cmsg_len > controllen - offset {
+                return Err(Errno::EINVAL);
+            }
+
+            // SOL_SOCKET = 1 (SocketOptionLevel::SOCKET)
+            if cmsg.cmsg_level != 1 || cmsg.cmsg_type != SCM_RIGHTS {
+                return Err(Errno::EOPNOTSUPP);
+            }
+
+            let data_offset = cmsg_align(hdr_size);
+            let data_len = cmsg.cmsg_len - data_offset;
+            if !data_len.is_multiple_of(core::mem::size_of::<i32>()) {
+                return Err(Errno::EINVAL);
+            }
+            let fd_count = data_len / core::mem::size_of::<i32>();
+            if fd_count == 0 {
+                // Advance past this cmsg.
+                offset += cmsg_align(cmsg.cmsg_len);
+                continue;
+            }
+
+            let fds_ptr = ConstPtr::<i32>::from_usize(control_ptr + offset + data_offset);
+            let fd_array = fds_ptr.to_owned_slice(fd_count).ok_or(Errno::EFAULT)?;
+
+            // Duplicate each fd for passing. We take the descriptor_table_mut
+            // lock first (matching the established dt -> rds lock order), then
+            // briefly read from raw_descriptor_store for each fd.
+            let mut dt = self.global.litebox.descriptor_table_mut();
+            for &guest_fd in &fd_array {
+                let raw_fd = usize::try_from(guest_fd).map_err(|_| Errno::EBADF)?;
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                let passed = rds
+                    .duplicate_for_passing(raw_fd, &mut dt)
+                    .ok_or(Errno::EBADF)?;
+                drop(rds);
+                drop(files);
+                passed_fds.push(passed);
+            }
+
+            offset += cmsg_align(cmsg.cmsg_len);
+        }
+
+        Ok(passed_fds)
+    }
+
+    /// Write an `SCM_RIGHTS` control message into the user's `msg_control`
+    /// buffer. Updates `msg_controllen` with the actual bytes written, and
+    /// sets `MSG_CTRUNC` in `msg_flags` if the buffer was too small.
+    ///
+    /// Returns the number of fds that were actually written to the control
+    /// buffer. The caller must close any excess fds (matching Linux semantics
+    /// where truncated SCM_RIGHTS fds are closed by the kernel).
+    fn write_recvmsg_cmsg(
+        &self,
+        hdr: &mut litebox_common_linux::UserMsgHdr<Platform>,
+        fds: &[i32],
+        msg_flags: &mut ReceiveFlags,
+    ) -> usize {
+        use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+        use litebox_common_linux::{CmsgHdr, SCM_RIGHTS, cmsg_align, cmsg_len, cmsg_space};
+
+        if fds.is_empty() {
+            hdr.msg_controllen = 0;
+            return 0;
+        }
+
+        let fd_data_len = core::mem::size_of_val(fds);
+        let needed = cmsg_space(fd_data_len);
+        let control_buf_len = hdr.msg_controllen;
+        let msg_control = { hdr.msg_control };
+        let control_ptr = msg_control.as_usize();
+
+        if control_ptr == 0 || control_buf_len == 0 {
+            *msg_flags |= ReceiveFlags::CTRUNC;
+            hdr.msg_controllen = 0;
+            return 0;
+        }
+
+        let hdr_size = core::mem::size_of::<CmsgHdr>();
+        let data_offset = cmsg_align(hdr_size);
+
+        // Check if we have room for at least the header + one fd.
+        if control_buf_len < data_offset + core::mem::size_of::<i32>() {
+            *msg_flags |= ReceiveFlags::CTRUNC;
+            hdr.msg_controllen = 0;
+            return 0;
+        }
+
+        // Determine how many fds fit in the available buffer.
+        let available_data = control_buf_len.saturating_sub(data_offset);
+        let fds_that_fit = available_data / core::mem::size_of::<i32>();
+        let fds_to_write = fds.len().min(fds_that_fit);
+
+        if fds_to_write < fds.len() {
+            *msg_flags |= ReceiveFlags::CTRUNC;
+        }
+
+        // Write the cmsghdr with the *actual* payload length.
+        let written_data_len = fds_to_write * core::mem::size_of::<i32>();
+        let cmsg_hdr = CmsgHdr {
+            cmsg_len: cmsg_len(written_data_len),
+            cmsg_level: 1, // SOL_SOCKET
+            cmsg_type: SCM_RIGHTS,
+        };
+        let cmsg_ptr = MutPtr::<CmsgHdr>::from_usize(control_ptr);
+        if cmsg_ptr.write_at_offset(0, cmsg_hdr).is_none() {
+            *msg_flags |= ReceiveFlags::CTRUNC;
+            hdr.msg_controllen = 0;
+            return 0;
+        }
+
+        // Write the fd array.
+        if fds_to_write > 0 {
+            let fd_ptr = MutPtr::<u8>::from_usize(control_ptr + data_offset);
+            let fd_bytes: &[u8] = zerocopy::IntoBytes::as_bytes(&fds[..fds_to_write]);
+            let _ = fd_ptr.copy_from_slice(0, fd_bytes);
+        }
+
+        // Cap msg_controllen to the buffer actually available.
+        let reported = if fds_to_write == fds.len() {
+            needed
+        } else {
+            cmsg_space(written_data_len)
+        };
+        hdr.msg_controllen = reported.min(control_buf_len);
+        fds_to_write
+    }
+
     fn do_sendmsg(
         &self,
         sockfd: u32,
@@ -1398,41 +1709,131 @@ impl<FS: ShimFS> Task<FS> {
         } else {
             None
         };
-        if msg.msg_controllen != 0 {
-            unimplemented!("ancillary data is not supported");
-        }
-        if msg.msg_iovlen == 0 || msg.msg_iovlen > 1024 {
+        if msg.msg_iovlen > 1024 {
             return Err(Errno::EINVAL);
         }
         let iovs = msg
             .msg_iov
             .to_owned_slice(msg.msg_iovlen)
             .ok_or(Errno::EFAULT)?;
-        self.files.borrow().with_socket(
+        let total_len = iovs
+            .iter()
+            .try_fold(0usize, |acc, iov| acc.checked_add(iov.iov_len))
+            .ok_or(Errno::EINVAL)?;
+        let ret = self.files.borrow().with_socket(
             &self.global,
             sockfd,
             |fd| {
+                // Inet sockets do not support ancillary data.
+                if msg.msg_controllen != 0 {
+                    return Err(Errno::EOPNOTSUPP);
+                }
                 let sock_addr = sock_addr
                     .clone()
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
-                let mut total_sent = 0;
-                for iov in &iovs {
-                    if iov.iov_len == 0 {
-                        continue;
+                if self.global.get_socket_type(fd)? == SockType::Stream {
+                    if total_len == 0 {
+                        return self
+                            .global
+                            .sendto(&self.wait_cx(), fd, &[], flags, sock_addr);
                     }
-                    let buf = iov
-                        .iov_base
-                        .to_owned_slice(iov.iov_len)
-                        .ok_or(Errno::EFAULT)?;
-                    total_sent +=
+                    Self::sendmsg_stream_iovs(&iovs, |chunk| {
                         self.global
-                            .sendto(&self.wait_cx(), fd, &buf, flags, sock_addr)?;
+                            .sendto(&self.wait_cx(), fd, chunk, flags, sock_addr)
+                    })
+                } else {
+                    let buf = Self::copy_sendmsg_iovs(&iovs)?;
+                    self.global
+                        .sendto(&self.wait_cx(), fd, &buf, flags, sock_addr)
                 }
-                Ok(total_sent)
             },
-            |_file| Err(Errno::ENOTSOCK),
-        )
+            |file| {
+                // Parse SCM_RIGHTS ancillary data for unix sockets.
+                let passed_fds = self.parse_sendmsg_cmsg(msg)?;
+                let sock_addr = sock_addr
+                    .clone()
+                    .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
+                    .transpose()?;
+                if file.sock_type() == SockType::Stream {
+                    if total_len == 0 {
+                        return file.sendto(self, &[], flags, sock_addr.clone(), passed_fds);
+                    }
+                    // For stream sockets with ancillary data, attach fds to
+                    // the first chunk only (matching Linux semantics).
+                    let mut fds = Some(passed_fds);
+                    Self::sendmsg_stream_iovs(&iovs, |chunk| {
+                        file.sendto(
+                            self,
+                            chunk,
+                            flags,
+                            sock_addr.clone(),
+                            fds.take().unwrap_or_default(),
+                        )
+                    })
+                } else {
+                    let buf = Self::copy_sendmsg_iovs(&iovs)?;
+                    file.sendto(self, &buf, flags, sock_addr, passed_fds)
+                }
+            },
+        );
+        if let Err(Errno::EPIPE) = ret
+            && !flags.contains(SendFlags::NOSIGNAL)
+        {
+            self.send_signal(
+                litebox_common_linux::signal::Signal::SIGPIPE,
+                super::signal::siginfo_kernel(litebox_common_linux::signal::Signal::SIGPIPE),
+            );
+        }
+        ret
+    }
+
+    /// Handle syscall `sendmmsg` — send multiple messages on a socket.
+    pub(crate) fn sys_sendmmsg(
+        &self,
+        fd: i32,
+        msgvec: MutPtr<litebox_common_linux::UserMmsgHdr<Platform>>,
+        vlen: u32,
+        flags: SendFlags,
+    ) -> Result<usize, Errno> {
+        let Ok(sockfd) = u32::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+
+        let mut sent_count = 0u32;
+        for i in 0..vlen {
+            let mmsg_ptr = MutPtr::<litebox_common_linux::UserMmsgHdr<Platform>>::from_usize(
+                msgvec.as_usize().wrapping_add(
+                    i as usize
+                        * core::mem::size_of::<litebox_common_linux::UserMmsgHdr<Platform>>(),
+                ),
+            );
+            let mmsg = ConstPtr::<litebox_common_linux::UserMmsgHdr<Platform>>::from_usize(
+                mmsg_ptr.as_usize(),
+            )
+            .read_at_offset(0)
+            .ok_or(Errno::EFAULT)?;
+
+            match self.do_sendmsg(sockfd, &mmsg.msg_hdr, flags) {
+                Ok(bytes_sent) => {
+                    // Write back the number of bytes sent for this message.
+                    let msg_len_offset =
+                        core::mem::size_of::<litebox_common_linux::UserMsgHdr<Platform>>();
+                    let msg_len_ptr =
+                        MutPtr::<u32>::from_usize(mmsg_ptr.as_usize().wrapping_add(msg_len_offset));
+                    #[allow(clippy::cast_possible_truncation)]
+                    let _ = msg_len_ptr.write_at_offset(0, bytes_sent as u32);
+                    sent_count += 1;
+                }
+                Err(e) => {
+                    if sent_count == 0 {
+                        return Err(e);
+                    }
+                    break;
+                }
+            }
+        }
+        Ok(sent_count as usize)
     }
 
     /// Handle syscall `recvfrom`
@@ -1471,12 +1872,129 @@ impl<FS: ShimFS> Task<FS> {
         }
         Ok(size)
     }
+
+    /// Handle syscall `recvmsg`
+    pub(crate) fn sys_recvmsg(
+        &self,
+        fd: i32,
+        msg: MutPtr<litebox_common_linux::UserMsgHdr<Platform>>,
+        flags: ReceiveFlags,
+    ) -> Result<usize, Errno> {
+        let Ok(sockfd) = u32::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+        let mut hdr =
+            ConstPtr::<litebox_common_linux::UserMsgHdr<Platform>>::from_usize(msg.as_usize())
+                .read_at_offset(0)
+                .ok_or(Errno::EFAULT)?;
+        if hdr.msg_iovlen == 0 || hdr.msg_iovlen > 1024 {
+            return Err(Errno::EINVAL);
+        }
+
+        let iovs = hdr
+            .msg_iov
+            .to_owned_slice(hdr.msg_iovlen)
+            .ok_or(Errno::EFAULT)?;
+        let total_len = iovs
+            .iter()
+            .try_fold(0usize, |acc, iov| acc.checked_add(iov.iov_len))
+            .ok_or(Errno::EINVAL)?;
+        let mut recv_buf = alloc::vec![0; total_len.min(0x80_000)];
+
+        let msg_name = hdr.msg_name;
+        let want_source = msg_name.as_usize() != 0;
+        let mut source_addr = None;
+        let mut received_fds = Vec::new();
+        let size = self.do_recvfrom_with_fds(
+            sockfd,
+            &mut recv_buf,
+            flags,
+            if want_source {
+                Some(&mut source_addr)
+            } else {
+                None
+            },
+            &mut received_fds,
+        )?;
+
+        let copied_len = size.min(recv_buf.len());
+        let mut copied = 0usize;
+        for iov in &iovs {
+            if copied >= copied_len {
+                break;
+            }
+            let len = iov.iov_len.min(copied_len - copied);
+            iov.iov_base
+                .copy_from_slice(0, &recv_buf[copied..copied + len])
+                .ok_or(Errno::EFAULT)?;
+            copied += len;
+        }
+
+        if let Some(src_addr) = source_addr {
+            let name_ptr = MutPtr::<u8>::from_usize(msg_name.as_usize());
+            let mut name_len = hdr.msg_namelen;
+            write_sockaddr_to_user(
+                src_addr,
+                name_ptr,
+                MutPtr::from_usize((&raw mut name_len).cast::<u32>() as usize),
+            )?;
+            hdr.msg_namelen = name_len;
+        } else {
+            hdr.msg_namelen = 0;
+        }
+
+        let mut msg_flags = ReceiveFlags::empty();
+        if size > copied_len {
+            msg_flags |= ReceiveFlags::TRUNC;
+        }
+
+        // Install received fds and format SCM_RIGHTS control message.
+        if received_fds.is_empty() {
+            hdr.msg_controllen = 0;
+        } else {
+            let mut installed_fds = Vec::with_capacity(received_fds.len());
+            {
+                let files = self.files.borrow();
+                let mut rds = files.raw_descriptor_store.write();
+                for passed_fd in received_fds {
+                    let raw_fd = rds.insert_passed_fd(passed_fd);
+                    installed_fds.push(i32::try_from(raw_fd).unwrap_or(i32::MAX));
+                }
+            }
+
+            // Format the SCM_RIGHTS control message into the user buffer.
+            let fds_written = self.write_recvmsg_cmsg(&mut hdr, &installed_fds, &mut msg_flags);
+
+            // Close any excess fds that didn't fit in the control buffer
+            // (matching Linux semantics where truncated SCM_RIGHTS fds are
+            // closed by the kernel).
+            for &excess_fd in &installed_fds[fds_written..] {
+                let _ = self.sys_close(excess_fd);
+            }
+        }
+
+        hdr.msg_flags = msg_flags;
+        msg.write_at_offset(0, hdr).ok_or(Errno::EFAULT)?;
+        Ok(size)
+    }
+
     fn do_recvfrom(
         &self,
         sockfd: u32,
         buf: &mut [u8],
         flags: ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddress>>,
+    ) -> Result<usize, Errno> {
+        self.do_recvfrom_with_fds(sockfd, buf, flags, source_addr, &mut Vec::new())
+    }
+
+    fn do_recvfrom_with_fds(
+        &self,
+        sockfd: u32,
+        buf: &mut [u8],
+        flags: ReceiveFlags,
+        source_addr: Option<&mut Option<SocketAddress>>,
+        received_fds: &mut Vec<litebox::fd::PassedFd>,
     ) -> Result<usize, Errno> {
         let want_source = source_addr.is_some();
         let files = self.files.borrow();
@@ -1507,6 +2025,7 @@ impl<FS: ShimFS> Task<FS> {
                         &mut buf.borrow_mut(),
                         flags,
                         if want_source { Some(&mut addr) } else { None },
+                        received_fds,
                     )?;
                     let src_addr = addr.map(SocketAddress::Unix);
                     Ok((size, src_addr))
@@ -1570,7 +2089,7 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EBADF);
         };
         let optname = SocketOptionName::try_from(level, optname).ok_or_else(|| {
-            log_unsupported!("setsockopt(level = {level}, optname = {optname})");
+            log_unsupported!("getsockopt(level = {level}, optname = {optname})");
             Errno::EINVAL
         })?;
         let len = optlen.read_at_offset(0).ok_or(Errno::EFAULT)?;
@@ -1729,6 +2248,12 @@ impl<FS: ShimFS> Task<FS> {
                     backlog: 1,
                 })
             }
+            SocketcallType::Shutdown => {
+                parse_socketcall_args!(2 => sys_shutdown {
+                    sockfd: 0,
+                    how: 1,
+                })
+            }
             SocketcallType::Accept => {
                 let flags = SockFlags::empty();
                 parse_socketcall_args!(3 => sys_accept {
@@ -1829,6 +2354,13 @@ impl<FS: ShimFS> Task<FS> {
                     flags: 2,
                 })
             }
+            SocketcallType::Recvmsg => {
+                parse_socketcall_args!(3 => sys_recvmsg {
+                    fd: 0,
+                    msg: [ 1 ],
+                    flags: 2,
+                })
+            }
             _ => {
                 log_unsupported!("socketcall type {socketcall_type:?} is not supported");
                 Err(Errno::EINVAL)
@@ -1889,6 +2421,44 @@ mod tests {
         optval
     }
 
+    pub(super) fn get_so_peercred(
+        task: &crate::Task<crate::DefaultFS>,
+        sockfd: u32,
+    ) -> litebox_common_linux::Ucred {
+        let mut peercred = litebox_common_linux::Ucred {
+            pid: u32::MAX,
+            uid: 0,
+            gid: 0,
+        };
+        let len = task
+            .do_getsockopt(
+                sockfd,
+                SocketOptionName::Socket(SocketOption::PEERCRED),
+                MutPtr::from_usize((&raw mut peercred).cast::<u8>() as usize),
+                core::mem::size_of::<litebox_common_linux::Ucred>().truncate(),
+            )
+            .expect("getsockopt SO_PEERCRED failed");
+        assert_eq!(len, core::mem::size_of::<litebox_common_linux::Ucred>());
+        peercred
+    }
+
+    pub(super) fn assert_ucred_eq(
+        actual: litebox_common_linux::Ucred,
+        expected: litebox_common_linux::Ucred,
+    ) {
+        assert_eq!(actual.pid, expected.pid);
+        assert_eq!(actual.uid, expected.uid);
+        assert_eq!(actual.gid, expected.gid);
+    }
+
+    pub(super) fn unconnected_peercred() -> litebox_common_linux::Ucred {
+        litebox_common_linux::Ucred {
+            pid: 0,
+            uid: u32::MAX,
+            gid: u32::MAX,
+        }
+    }
+
     fn epoll_add(
         task: &crate::Task<crate::DefaultFS>,
         epfd: i32,
@@ -1925,6 +2495,24 @@ mod tests {
             0,
         )
         .expect("epoll_wait failed")
+    }
+
+    fn epoll_wait_timeout(
+        task: &crate::Task<crate::DefaultFS>,
+        epfd: i32,
+        events: &mut [litebox_common_linux::EpollEvent],
+        timeout_ms: i32,
+    ) -> usize {
+        let events_ptr = crate::MutPtr::from_usize(events.as_mut_ptr() as usize);
+        task.sys_epoll_pwait(
+            epfd,
+            events_ptr,
+            events.len().truncate(),
+            litebox_common_linux::TimeParam::Milliseconds(timeout_ms),
+            None,
+            0,
+        )
+        .expect("epoll_wait with timeout failed")
     }
 
     fn test_tcp_socket_as_server(
@@ -1976,7 +2564,7 @@ mod tests {
                     ])
                     .stdout(std::process::Stdio::piped())
                     .output(),
-                "recvfrom" => std::process::Command::new("sh")
+                "recvfrom" | "recvmsg" => std::process::Command::new("sh")
                     .args([
                         "-c",
                         &alloc::format!(
@@ -2094,6 +2682,53 @@ mod tests {
                     assert_eq!(recv_buf[..n], buf.as_bytes()[..n]);
                 }
                 assert_eq!(n, buf.len()); // even with truncation, it returns the actual length
+                let _ = child_handle.join().expect("Failed to wait for client");
+            }
+            "recvmsg" => {
+                if is_nonblocking {
+                    epoll_add(task, epfd, client_fd, litebox::event::Events::IN);
+                    let mut events = [litebox_common_linux::EpollEvent { events: 0, data: 0 }; 2];
+                    let n = epoll_wait(task, epfd, &mut events);
+                    for ev in &events[..n] {
+                        assert!(ev.events & litebox::event::Events::IN.bits() != 0);
+                        let fd = u32::try_from(ev.data).unwrap();
+                        assert_eq!(fd, client_fd);
+                    }
+                }
+
+                let mut buf1 = [0u8; 5];
+                let mut buf2 = [0u8; 16];
+                let iovec = [
+                    litebox_common_linux::IoVec {
+                        iov_base: MutPtr::from_usize(buf1.as_mut_ptr() as usize),
+                        iov_len: buf1.len(),
+                    },
+                    litebox_common_linux::IoVec {
+                        iov_base: MutPtr::from_usize(buf2.as_mut_ptr() as usize),
+                        iov_len: buf2.len(),
+                    },
+                ];
+                let mut hdr = {
+                    use zerocopy::FromZeros as _;
+                    let mut h = litebox_common_linux::UserMsgHdr::<crate::Platform>::new_zeroed();
+                    h.msg_iov = ConstPtr::from_usize(iovec.as_ptr() as usize);
+                    h.msg_iovlen = iovec.len();
+                    h
+                };
+                let n = task
+                    .sys_recvmsg(
+                        i32::try_from(client_fd).unwrap(),
+                        MutPtr::from_usize((&raw mut hdr) as usize),
+                        ReceiveFlags::empty(),
+                    )
+                    .expect("Failed to recvmsg");
+                assert_eq!(n, buf.len());
+                let combined = alloc::format!(
+                    "{}{}",
+                    alloc::string::String::from_utf8_lossy(&buf1),
+                    alloc::string::String::from_utf8_lossy(&buf2[..buf.len() - buf1.len()])
+                );
+                assert_eq!(combined, buf);
                 let _ = child_handle.join().expect("Failed to wait for client");
             }
             _ => panic!("Unknown option"),
@@ -2248,6 +2883,107 @@ mod tests {
             .expect("Failed to wait for client");
         let stdout = alloc::string::String::from_utf8_lossy(&output.stdout);
         assert_eq!(stdout, buf);
+    }
+
+    fn test_nonblocking_tcp_connect_epoll_then_send(epoll_add_delay: core::time::Duration) {
+        const NONBLOCK_CONNECT_PORT: u16 = 8082;
+
+        let task = init_platform(Some(TUN_DEVICE_NAME));
+        let buf = "Hello, world!";
+
+        let child_handle = std::thread::spawn(|| {
+            std::process::Command::new("nc")
+                .args([
+                    "-w",
+                    "2",
+                    "-l",
+                    "10.0.0.1",
+                    NONBLOCK_CONNECT_PORT.to_string().as_str(),
+                ])
+                .output()
+        });
+        std::thread::sleep(core::time::Duration::from_millis(1000));
+
+        let client_fd = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Stream,
+                SockFlags::NONBLOCK,
+                0,
+            )
+            .expect("failed to create nonblocking client socket");
+        let server_addr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
+            core::net::Ipv4Addr::from([10, 0, 0, 1]),
+            NONBLOCK_CONNECT_PORT,
+        )));
+        let err = task
+            .do_connect(client_fd, server_addr)
+            .expect_err("nonblocking connect should report EINPROGRESS");
+        assert_eq!(err, Errno::EINPROGRESS);
+
+        if !epoll_add_delay.is_zero() {
+            std::thread::sleep(epoll_add_delay);
+        }
+
+        let epfd = task
+            .sys_epoll_create(litebox_common_linux::EpollCreateFlags::empty())
+            .expect("failed to create epoll");
+        let epfd = i32::try_from(epfd).unwrap();
+        epoll_add(
+            &task,
+            epfd,
+            client_fd,
+            litebox::event::Events::OUT | litebox::event::Events::ERR,
+        );
+
+        let mut events = [litebox_common_linux::EpollEvent { events: 0, data: 0 }; 2];
+        let n = epoll_wait_timeout(&task, epfd, &mut events, 5_000);
+        assert_ne!(n, 0, "timed out waiting for nonblocking connect readiness");
+        assert_eq!(n, 1, "expected a single epoll event, got {n}");
+        let event = &events[0];
+        let event_data = event.data;
+        let event_bits = event.events;
+        assert_eq!(
+            event_data,
+            u64::from(client_fd),
+            "epoll returned readiness for the wrong fd"
+        );
+        assert_ne!(
+            event_bits & litebox::event::Events::OUT.bits(),
+            0,
+            "expected EPOLLOUT after connect completion, got events={event_bits:#x}",
+        );
+
+        let so_error = get_so_error(&task, client_fd);
+        assert_eq!(
+            so_error, 0,
+            "SO_ERROR should be 0 after successful nonblocking connect, got {so_error}"
+        );
+
+        let n = task
+            .do_sendto(client_fd, buf.as_bytes(), SendFlags::empty(), None)
+            .expect("first send after nonblocking connect failed");
+        assert_eq!(n, buf.len());
+
+        close_socket(&task, client_fd);
+        task.sys_close(epfd).expect("failed to close epoll fd");
+
+        let output = child_handle
+            .join()
+            .unwrap()
+            .expect("failed to wait for listener");
+        let stdout = alloc::string::String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout, buf);
+    }
+
+    #[test]
+    fn test_tun_nonblocking_tcp_connect_epoll_writable_then_send() {
+        test_nonblocking_tcp_connect_epoll_then_send(core::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn test_tun_nonblocking_tcp_connect_epoll_add_after_connected() {
+        test_nonblocking_tcp_connect_epoll_then_send(core::time::Duration::from_millis(200));
     }
 
     fn blocking_udp_server_socket(test_trunc: bool, is_nonblocking: bool) {
@@ -2539,13 +3275,14 @@ mod tests {
 mod unix_tests {
     use core::time::Duration;
 
-    use alloc::{string::ToString, vec::Vec};
+    use alloc::{string::ToString, vec, vec::Vec};
     use litebox::{event::Events, platform::RawConstPointer};
     use litebox_common_linux::{
         AddressFamily, AtFlags, ReceiveFlags, SendFlags, SockFlags, SockType, SocketOption,
         SocketOptionName, TimeParam, errno::Errno,
     };
 
+    use super::tests::{assert_ucred_eq, get_so_peercred, unconnected_peercred};
     use crate::{
         ConstPtr, MutPtr, Task,
         syscalls::{net::SocketAddress, tests::init_platform, unix::UnixSocketAddr},
@@ -3052,6 +3789,436 @@ mod unix_tests {
     fn test_unix_socket_recv_timeout() {
         unix_socket_recv_timeout(SockType::Stream);
         unix_socket_recv_timeout(SockType::Datagram);
+    }
+
+    fn unix_socketpair_peercred(ty: SockType) {
+        let task = init_platform(None);
+        let (sock1, sock2) = task
+            .do_socketpair(AddressFamily::UNIX, ty, SockFlags::empty(), 0)
+            .expect("socketpair failed");
+        let expected = task.current_ucred();
+
+        assert_ucred_eq(get_so_peercred(&task, sock1), expected);
+        assert_ucred_eq(get_so_peercred(&task, sock2), expected);
+
+        close_socket(&task, sock1);
+        close_socket(&task, sock2);
+    }
+
+    #[test]
+    fn test_unix_socketpair_peercred() {
+        unix_socketpair_peercred(SockType::Stream);
+        unix_socketpair_peercred(SockType::SeqPacket);
+        unix_socketpair_peercred(SockType::Datagram);
+    }
+
+    #[test]
+    fn test_unix_stream_connect_accept_peercred() {
+        let task = init_platform(None);
+        let addr = "/unix_stream_peercred.sock";
+        let server_fd = create_unix_server_socket(&task, addr, SockFlags::empty()).unwrap();
+        let client_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
+        let expected = task.current_ucred();
+
+        assert_ucred_eq(get_so_peercred(&task, server_fd), unconnected_peercred());
+
+        task.do_connect(
+            client_fd,
+            SocketAddress::Unix(UnixSocketAddr::Path(addr.to_string())),
+        )
+        .expect("connect failed");
+        let server_conn = task
+            .do_accept(server_fd, None, SockFlags::empty())
+            .expect("accept failed");
+
+        assert_ucred_eq(get_so_peercred(&task, client_fd), expected);
+        assert_ucred_eq(get_so_peercred(&task, server_conn), expected);
+
+        close_socket(&task, client_fd);
+        close_socket(&task, server_conn);
+        close_socket(&task, server_fd);
+        task.sys_unlinkat(-1, addr, AtFlags::empty()).unwrap();
+    }
+
+    #[test]
+    fn test_unix_connected_datagram_peercred() {
+        let task = init_platform(None);
+        let server_path = "/unix_dgram_peercred_server.sock";
+        let server_fd = create_unix_socket(&task, SockType::Datagram, SockFlags::empty());
+        let client_fd = create_unix_socket(&task, SockType::Datagram, SockFlags::empty());
+
+        task.do_bind(
+            server_fd,
+            SocketAddress::Unix(UnixSocketAddr::Path(server_path.to_string())),
+        )
+        .expect("bind failed");
+        assert_ucred_eq(get_so_peercred(&task, server_fd), unconnected_peercred());
+
+        task.do_connect(
+            client_fd,
+            SocketAddress::Unix(UnixSocketAddr::Path(server_path.to_string())),
+        )
+        .expect("connect failed");
+
+        assert_ucred_eq(get_so_peercred(&task, client_fd), unconnected_peercred());
+        assert_ucred_eq(get_so_peercred(&task, server_fd), unconnected_peercred());
+
+        close_socket(&task, client_fd);
+        close_socket(&task, server_fd);
+        task.sys_unlinkat(-1, server_path, AtFlags::empty())
+            .unwrap();
+    }
+
+    #[test]
+    fn test_unix_socketpair_peercred_uses_effective_ids() {
+        let mut task = init_platform(None);
+        task.credentials = alloc::sync::Arc::new(crate::syscalls::process::Credentials {
+            uid: 1000,
+            euid: 2000,
+            gid: 3000,
+            egid: 4000,
+        });
+
+        let (sock1, sock2) = task
+            .do_socketpair(AddressFamily::UNIX, SockType::Stream, SockFlags::empty(), 0)
+            .expect("socketpair failed");
+        let expected = task.current_ucred();
+
+        assert_ucred_eq(get_so_peercred(&task, sock1), expected);
+        assert_ucred_eq(get_so_peercred(&task, sock2), expected);
+
+        close_socket(&task, sock1);
+        close_socket(&task, sock2);
+    }
+
+    fn unix_socketpair_recvmsg(ty: SockType) {
+        let task = init_platform(None);
+        let (sock1, sock2) = task
+            .do_socketpair(AddressFamily::UNIX, ty, SockFlags::empty(), 0)
+            .expect("socketpair failed");
+
+        let msg = b"recvmsg over socketpair";
+        task.do_sendto(sock1, msg, SendFlags::empty(), None)
+            .expect("sendto failed");
+
+        let mut buf1 = [0u8; 7];
+        let mut buf2 = [0u8; 32];
+        let iovec = [
+            litebox_common_linux::IoVec {
+                iov_base: MutPtr::from_usize(buf1.as_mut_ptr() as usize),
+                iov_len: buf1.len(),
+            },
+            litebox_common_linux::IoVec {
+                iov_base: MutPtr::from_usize(buf2.as_mut_ptr() as usize),
+                iov_len: buf2.len(),
+            },
+        ];
+        let mut hdr = {
+            use zerocopy::FromZeros as _;
+            let mut h = litebox_common_linux::UserMsgHdr::<crate::Platform>::new_zeroed();
+            h.msg_iov = ConstPtr::from_usize(iovec.as_ptr() as usize);
+            h.msg_iovlen = iovec.len();
+            h
+        };
+        let n = task
+            .sys_recvmsg(
+                i32::try_from(sock2).unwrap(),
+                MutPtr::from_usize((&raw mut hdr) as usize),
+                ReceiveFlags::empty(),
+            )
+            .expect("recvmsg failed");
+        assert_eq!(n, msg.len());
+        let msg_flags = hdr.msg_flags;
+        let msg_namelen = hdr.msg_namelen;
+        let msg_controllen = hdr.msg_controllen;
+        assert!(msg_flags.is_empty());
+        assert_eq!(msg_namelen, 0);
+        assert_eq!(msg_controllen, 0);
+
+        let mut combined = alloc::vec::Vec::new();
+        combined.extend_from_slice(&buf1);
+        combined.extend_from_slice(&buf2[..msg.len() - buf1.len()]);
+        assert_eq!(combined.as_slice(), msg);
+
+        close_socket(&task, sock1);
+        close_socket(&task, sock2);
+    }
+
+    #[test]
+    fn test_unix_socketpair_recvmsg() {
+        unix_socketpair_recvmsg(SockType::Stream);
+        unix_socketpair_recvmsg(SockType::Datagram);
+    }
+
+    fn unix_socketpair_sendmsg(ty: SockType) {
+        let task = init_platform(None);
+        let (sock1, sock2) = task
+            .do_socketpair(AddressFamily::UNIX, ty, SockFlags::empty(), 0)
+            .expect("socketpair failed");
+
+        let buf1 = b"sendmsg ";
+        let buf2 = b"over unix socketpair";
+        let iovec = [
+            litebox_common_linux::IoVec {
+                iov_base: MutPtr::from_usize(buf1.as_ptr() as usize),
+                iov_len: buf1.len(),
+            },
+            litebox_common_linux::IoVec {
+                iov_base: MutPtr::from_usize(buf2.as_ptr() as usize),
+                iov_len: buf2.len(),
+            },
+        ];
+        let hdr = {
+            use zerocopy::FromZeros as _;
+            let mut h = litebox_common_linux::UserMsgHdr::<crate::Platform>::new_zeroed();
+            h.msg_iov = ConstPtr::from_usize(iovec.as_ptr() as usize);
+            h.msg_iovlen = iovec.len();
+            h
+        };
+        let sent = task
+            .do_sendmsg(sock1, &hdr, SendFlags::empty())
+            .expect("sendmsg failed");
+        assert_eq!(sent, buf1.len() + buf2.len());
+
+        let mut recv = [0u8; 64];
+        let received = task
+            .do_recvfrom(sock2, &mut recv, ReceiveFlags::empty(), None)
+            .expect("recvfrom failed");
+        assert_eq!(received, sent);
+        assert_eq!(
+            &recv[..received],
+            &[buf1.as_slice(), buf2.as_slice()].concat()
+        );
+
+        close_socket(&task, sock1);
+        close_socket(&task, sock2);
+    }
+
+    #[test]
+    fn test_unix_socketpair_sendmsg() {
+        unix_socketpair_sendmsg(SockType::Stream);
+        unix_socketpair_sendmsg(SockType::Datagram);
+    }
+
+    #[test]
+    fn test_sendmsg_allows_zero_iovecs_for_unix_datagram() {
+        let task = init_platform(None);
+        let (sock1, sock2) = task
+            .do_socketpair(
+                AddressFamily::UNIX,
+                SockType::Datagram,
+                SockFlags::NONBLOCK,
+                0,
+            )
+            .expect("socketpair failed");
+
+        let hdr = {
+            use zerocopy::FromZeros as _;
+            litebox_common_linux::UserMsgHdr::<crate::Platform>::new_zeroed()
+        };
+        let sent = task
+            .do_sendmsg(sock1, &hdr, SendFlags::empty())
+            .expect("zero-iovec sendmsg failed");
+        assert_eq!(sent, 0);
+
+        let mut recv = [0u8; 1];
+        let received = task
+            .do_recvfrom(sock2, &mut recv, ReceiveFlags::DONTWAIT, None)
+            .expect("recvfrom failed");
+        assert_eq!(received, 0);
+
+        close_socket(&task, sock1);
+        close_socket(&task, sock2);
+    }
+
+    #[test]
+    fn test_sendmsg_zero_iovecs_is_noop_for_unix_stream() {
+        let task = init_platform(None);
+        let (sock1, sock2) = task
+            .do_socketpair(
+                AddressFamily::UNIX,
+                SockType::Stream,
+                SockFlags::NONBLOCK,
+                0,
+            )
+            .expect("socketpair failed");
+
+        let hdr = {
+            use zerocopy::FromZeros as _;
+            litebox_common_linux::UserMsgHdr::<crate::Platform>::new_zeroed()
+        };
+        let sent = task
+            .do_sendmsg(sock1, &hdr, SendFlags::empty())
+            .expect("zero-iovec sendmsg failed");
+        assert_eq!(sent, 0);
+
+        let mut recv = [0u8; 1];
+        let err = task
+            .do_recvfrom(sock2, &mut recv, ReceiveFlags::DONTWAIT, None)
+            .expect_err("zero-length stream send should not enqueue data");
+        assert_eq!(err, Errno::EAGAIN);
+
+        close_socket(&task, sock1);
+        close_socket(&task, sock2);
+    }
+
+    #[test]
+    fn test_sendmsg_zero_iovecs_unconnected_unix_stream_returns_enotconn() {
+        let task = init_platform(None);
+        let sock = create_unix_socket(&task, SockType::Stream, SockFlags::NONBLOCK);
+
+        let hdr = {
+            use zerocopy::FromZeros as _;
+            litebox_common_linux::UserMsgHdr::<crate::Platform>::new_zeroed()
+        };
+        let err = task
+            .do_sendmsg(sock, &hdr, SendFlags::empty())
+            .expect_err("unconnected stream sendmsg should fail");
+        assert_eq!(err, Errno::ENOTCONN);
+
+        close_socket(&task, sock);
+    }
+
+    #[test]
+    fn test_sendmsg_zero_iovecs_delivers_empty_unix_seqpacket_record() {
+        let task = init_platform(None);
+        let (sock1, sock2) = task
+            .do_socketpair(
+                AddressFamily::UNIX,
+                SockType::SeqPacket,
+                SockFlags::NONBLOCK,
+                0,
+            )
+            .expect("socketpair failed");
+
+        let hdr = {
+            use zerocopy::FromZeros as _;
+            litebox_common_linux::UserMsgHdr::<crate::Platform>::new_zeroed()
+        };
+        let sent = task
+            .do_sendmsg(sock1, &hdr, SendFlags::empty())
+            .expect("zero-iovec sendmsg failed");
+        assert_eq!(sent, 0);
+
+        let mut recv = [0u8; 1];
+        let received = task
+            .do_recvfrom(sock2, &mut recv, ReceiveFlags::DONTWAIT, None)
+            .expect("zero-length seqpacket record should be delivered");
+        assert_eq!(received, 0);
+
+        close_socket(&task, sock1);
+        close_socket(&task, sock2);
+    }
+
+    #[test]
+    fn test_sendmsg_rejects_ancillary_data_on_inet_socket() {
+        // Ancillary data on inet sockets should still be rejected.
+        let task = init_platform(None);
+        let (sock1, sock2) = task
+            .do_socketpair(AddressFamily::UNIX, SockType::Stream, SockFlags::empty(), 0)
+            .expect("socketpair failed");
+
+        // Build a valid SCM_RIGHTS cmsg with the fd of sock2.
+        let fd_to_pass = i32::try_from(sock2).unwrap();
+        let hdr_size = core::mem::size_of::<litebox_common_linux::CmsgHdr>();
+        let aligned_hdr = litebox_common_linux::cmsg_align(hdr_size);
+        let cmsg_hdr = litebox_common_linux::CmsgHdr {
+            cmsg_len: litebox_common_linux::cmsg_len(core::mem::size_of::<i32>()),
+            cmsg_level: 1, // SOL_SOCKET
+            cmsg_type: litebox_common_linux::SCM_RIGHTS,
+        };
+        let mut control_buf =
+            vec![0u8; litebox_common_linux::cmsg_space(core::mem::size_of::<i32>())];
+        // Write the cmsghdr.
+        control_buf[..hdr_size].copy_from_slice(zerocopy::IntoBytes::as_bytes(&cmsg_hdr));
+        // Write the fd.
+        control_buf[aligned_hdr..aligned_hdr + core::mem::size_of::<i32>()]
+            .copy_from_slice(&fd_to_pass.to_ne_bytes());
+
+        let byte = b"x";
+        let iovec = [litebox_common_linux::IoVec {
+            iov_base: MutPtr::from_usize(byte.as_ptr() as usize),
+            iov_len: 1,
+        }];
+        let send_hdr = {
+            use zerocopy::FromZeros as _;
+            let mut h = litebox_common_linux::UserMsgHdr::<crate::Platform>::new_zeroed();
+            h.msg_iov = ConstPtr::from_usize(iovec.as_ptr() as usize);
+            h.msg_iovlen = iovec.len();
+            h.msg_control = ConstPtr::from_usize(control_buf.as_ptr() as usize);
+            h.msg_controllen = control_buf.len();
+            h
+        };
+
+        // Send with SCM_RIGHTS on a unix socket should succeed.
+        let sent = task
+            .do_sendmsg(sock1, &send_hdr, SendFlags::empty())
+            .expect("sendmsg with SCM_RIGHTS should succeed");
+        assert_eq!(sent, 1);
+
+        // Receive via recvmsg — should get the fd back.
+        let mut recv_data = [0u8; 1];
+        let recv_iovec = [litebox_common_linux::IoVec {
+            iov_base: MutPtr::from_usize(recv_data.as_mut_ptr() as usize),
+            iov_len: recv_data.len(),
+        }];
+        let mut recv_control =
+            vec![0u8; litebox_common_linux::cmsg_space(core::mem::size_of::<i32>())];
+        let mut recv_hdr = {
+            use zerocopy::FromZeros as _;
+            let mut h = litebox_common_linux::UserMsgHdr::<crate::Platform>::new_zeroed();
+            h.msg_iov = ConstPtr::from_usize(recv_iovec.as_ptr() as usize);
+            h.msg_iovlen = recv_iovec.len();
+            h.msg_control = ConstPtr::from_usize(recv_control.as_mut_ptr() as usize);
+            h.msg_controllen = recv_control.len();
+            h
+        };
+        let recv_hdr_ptr = MutPtr::from_usize((&raw mut recv_hdr) as usize);
+        let received = task
+            .sys_recvmsg(
+                i32::try_from(sock2).unwrap(),
+                recv_hdr_ptr,
+                ReceiveFlags::empty(),
+            )
+            .expect("recvmsg should succeed");
+        assert_eq!(received, 1);
+        assert_eq!(recv_data[0], b'x');
+
+        // Verify we got a control message back.
+        let recv_controllen = { recv_hdr.msg_controllen };
+        assert!(
+            recv_controllen >= litebox_common_linux::cmsg_len(core::mem::size_of::<i32>()),
+            "expected control data, got controllen={recv_controllen}"
+        );
+
+        // Parse the received cmsghdr.
+        let recv_cmsg: litebox_common_linux::CmsgHdr =
+            zerocopy::FromBytes::read_from_bytes(&recv_control[..hdr_size]).unwrap();
+        assert_eq!(recv_cmsg.cmsg_level, 1); // SOL_SOCKET
+        assert_eq!(recv_cmsg.cmsg_type, litebox_common_linux::SCM_RIGHTS);
+
+        // Extract the received fd number.
+        let mut fd_bytes = [0u8; 4];
+        fd_bytes.copy_from_slice(&recv_control[aligned_hdr..aligned_hdr + 4]);
+        let received_fd = i32::from_ne_bytes(fd_bytes);
+
+        // The received fd should be a new fd (different from the one we sent).
+        assert_ne!(received_fd, fd_to_pass);
+
+        // Verify the received fd is alive.
+        assert!(
+            task.files
+                .borrow()
+                .raw_descriptor_store
+                .read()
+                .is_alive(usize::try_from(received_fd).unwrap()),
+            "received fd should be alive"
+        );
+
+        #[allow(clippy::cast_sign_loss)]
+        close_socket(&task, received_fd as u32);
+        close_socket(&task, sock1);
+        close_socket(&task, sock2);
     }
 
     #[test]
