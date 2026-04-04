@@ -119,34 +119,40 @@ int main(int argc, char *argv[]) {
 "#;
 
 #[test]
-#[ignore = "requires sysroot extraction: run extract_sysroot.sh first"]
+#[ignore = "requires access to /System/Cryptexes/OS/System/Library/dyld/"]
 fn test_hello_dynamic() {
-    let sysroot = std::env::var("LITEBOX_MACOS_SYSROOT").unwrap_or_else(|_| {
-        // Default sysroot location next to the test binary
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        format!("{manifest_dir}/test-sysroot")
-    });
-
-    // Check if sysroot exists
-    if !std::path::Path::new(&sysroot)
-        .join("usr/lib/libSystem.B.dylib")
-        .exists()
-    {
+    let cache_dir = std::path::Path::new("/System/Cryptexes/OS/System/Library/dyld");
+    if !cache_dir.exists() {
         panic!(
-            "Sysroot not found at {sysroot}/usr/lib/libSystem.B.dylib. \
-             Run extract_sysroot.sh first:\n  \
-             ./litebox_runner_macos_on_macos_userland/extract_sysroot.sh {sysroot}"
+            "Shared cache not found at {}. This test requires macOS with dyld shared cache.",
+            cache_dir.display()
         );
     }
+
+    // Parse cache map and collect regions for system dylibs
+    let map_path = cache_dir.join("dyld_shared_cache_arm64e.map");
+    let map_text = std::fs::read_to_string(&map_path).unwrap();
+    let cache_map = common::shared_cache::CacheMap::parse(&map_text);
+    let system_dylibs = cache_map.system_dylib_paths();
+    let dylib_refs: Vec<&str> = system_dylibs.iter().map(|s| s.as_str()).collect();
+    let cache_regions = common::shared_cache::collect_regions(cache_dir, &dylib_refs);
+
+    eprintln!(
+        "Loaded {} cache regions ({:.1} MB total)",
+        cache_regions.len(),
+        cache_regions.iter().map(|r| r.data.len()).sum::<usize>() as f64 / (1024.0 * 1024.0),
+    );
 
     let bin_path = common::compile_macho_dynamic(HELLO_DYNAMIC_C, "hello_dynamic");
     let binary_data = std::fs::read(&bin_path).expect("read binary");
 
-    // Rewrite the main binary's SVC sites
-    let rewritten = litebox_syscall_rewriter_macho::hook_syscalls_in_macho(&binary_data)
-        .expect("rewrite failed");
-
-    let (exit_code, _stdout) =
-        common::run_macho_dynamic(&rewritten, &["hello_dynamic", "arg1", "arg2"], &sysroot);
+    // NOTE: We do NOT rewrite the main binary — dynamically linked binaries have
+    // no SVC #0x80 instructions. All syscalls go through dyld/libSystem, which get
+    // rewritten via install_shared_cache (dylibs) and the mmap-hook (dyld itself).
+    let (exit_code, _stdout) = common::run_macho_dynamic(
+        &binary_data,
+        &["/usr/bin/hello_dynamic", "arg1", "arg2"],
+        &cache_regions,
+    );
     assert_eq!(exit_code, 0, "process exited with non-zero code");
 }

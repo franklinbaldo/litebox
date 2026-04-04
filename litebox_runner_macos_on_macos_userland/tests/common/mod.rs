@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, Once};
 
 pub mod shared_cache;
-mod trie_rebuilder;
 
 /// Serialize test execution. Each test creates its own `MacosShimBuilder`
 /// and `PageManager`, but the platform and global `HOST_TLS_TABLE_ADDR`
@@ -211,12 +210,16 @@ pub fn run_macho_binary(binary_data: &[u8], argv: &[&str]) -> (i32, Vec<u8>) {
     (exit_code, Vec::new())
 }
 
-/// Run a dynamically linked Mach-O binary through litebox with dyld support.
+/// Run a dynamically linked Mach-O binary through litebox with shared cache passthrough.
 ///
 /// Unlike [`run_macho_binary`], this:
-/// - Sets a sysroot on the shim builder so dyld can find dylibs
+/// - Installs shared cache regions into guest address space
 /// - Reads `/usr/lib/dyld` from the host and passes it to `load_program`
-pub fn run_macho_dynamic(binary_data: &[u8], argv: &[&str], sysroot: &str) -> (i32, Vec<u8>) {
+pub fn run_macho_dynamic(
+    binary_data: &[u8],
+    argv: &[&str],
+    cache_regions: &[shared_cache::SharedCacheRegion],
+) -> (i32, Vec<u8>) {
     use litebox::fs::{FileSystem as _, Mode, OFlags};
 
     let _guard = TEST_LOCK.lock().unwrap();
@@ -225,17 +228,14 @@ pub fn run_macho_dynamic(binary_data: &[u8], argv: &[&str], sysroot: &str) -> (i
 
     let mut shim_builder =
         litebox_shim_macos::MacosShimBuilder::<litebox_shim_macos::DefaultFS>::new();
-    // No sysroot rewriting — we populate the in-mem FS with dylibs at their
-    // original guest paths instead.
-
     let litebox = shim_builder.litebox();
     let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
     in_mem_fs.with_root_privileges(|fs| {
         let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
         let _ = fs.mkdir("/tmp", mode);
-        // Create /usr/bin so we can install the executable at an absolute path.
         let _ = fs.mkdir("/usr", mode);
         let _ = fs.mkdir("/usr/bin", mode);
+
         // Write the main binary into the in-mem FS so dyld can open it.
         let fd = fs
             .open(
@@ -247,17 +247,22 @@ pub fn run_macho_dynamic(binary_data: &[u8], argv: &[&str], sysroot: &str) -> (i
         fs.write(&fd, binary_data, None)
             .expect("write executable data");
         fs.close(&fd).expect("close executable fd");
-
-        // Populate the in-mem FS with dylibs from the host sysroot at their
-        // original guest paths.  dyld opens e.g. `/usr/lib/libSystem.B.dylib`
-        // and we need it to exist in our FS.
-        populate_inmem_from_sysroot(fs, sysroot, mode);
     });
     let tar_ro_fs =
         litebox::fs::tar_ro::FileSystem::new(litebox, litebox::fs::tar_ro::EMPTY_TAR_FILE.into());
     let fs = shim_builder.default_fs(in_mem_fs, tar_ro_fs);
     shim_builder.set_fs(fs);
     let shim = shim_builder.build();
+
+    // Install shared cache regions into guest address space.
+    let regions_for_shim: Vec<(u64, &[u8], bool)> = cache_regions
+        .iter()
+        .map(|r| {
+            let is_exec = matches!(r.prot, shared_cache::Protection::ReadExecute);
+            (r.guest_addr, r.data.as_slice(), is_exec)
+        })
+        .collect();
+    shim.install_shared_cache(0x180000000, &regions_for_shim);
 
     // Use absolute path for argv[0] so dyld can resolve executable_path.
     let mut argv_cstrings: Vec<std::ffi::CString> = Vec::with_capacity(argv.len());
@@ -286,79 +291,4 @@ pub fn run_macho_dynamic(binary_data: &[u8], argv: &[&str], sysroot: &str) -> (i
 
     let exit_code = process.wait();
     (exit_code, Vec::new())
-}
-
-/// Populate an in-memory filesystem with dylibs from a host sysroot directory.
-///
-/// Only loads the dylibs needed for a simple C hello world program:
-/// - `/usr/lib/libSystem.B.dylib` (the umbrella framework)
-/// - `/usr/lib/system/*.dylib` (all system sub-dylibs re-exported by libSystem)
-///
-/// This avoids loading the entire sysroot (~200MB+) into memory.
-fn populate_inmem_from_sysroot(
-    fs: &mut litebox::fs::in_mem::FileSystem<litebox_platform_macos_userland::MacosUserland>,
-    sysroot: &str,
-    mode: litebox::fs::Mode,
-) {
-    use litebox::fs::{FileSystem as _, OFlags};
-
-    let sysroot = Path::new(sysroot);
-    let usr_lib = sysroot.join("usr/lib");
-
-    // Create /usr/lib directory (may already exist from binary install).
-    let _ = fs.mkdir("/usr/lib", mode);
-
-    // Helper to install a single file from host disk into in-mem FS.
-    // For dylibs extracted from the shared cache, this also rebuilds the
-    // exports trie (which the Apple extractor strips).
-    let install_file = |fs: &mut litebox::fs::in_mem::FileSystem<
-        litebox_platform_macos_userland::MacosUserland,
-    >,
-                        host_path: &Path,
-                        guest_path: &str| {
-        if let Ok(data) = std::fs::read(host_path) {
-            // For dylibs extracted from the shared cache:
-            // 1. Rebuild exports trie if stripped by the extractor.
-            // 2. Fix segment flags (e.g., add SG_READ_ONLY to __DATA_CONST).
-            let mut data = if guest_path.ends_with(".dylib") {
-                trie_rebuilder::rebuild_exports_trie(&data).unwrap_or(data)
-            } else {
-                data
-            };
-            if guest_path.ends_with(".dylib") {
-                trie_rebuilder::fix_segment_flags(&mut data);
-            }
-            let fd = fs
-                .open(guest_path, OFlags::CREAT | OFlags::WRONLY, mode)
-                .unwrap_or_else(|e| panic!("create {guest_path} in in-mem FS: {e:?}"));
-            fs.write(&fd, &data, None)
-                .unwrap_or_else(|e| panic!("write {guest_path}: {e:?}"));
-            fs.close(&fd)
-                .unwrap_or_else(|e| panic!("close {guest_path}: {e:?}"));
-        }
-    };
-
-    // Install libSystem.B.dylib (the main umbrella library for C programs).
-    install_file(
-        fs,
-        &usr_lib.join("libSystem.B.dylib"),
-        "/usr/lib/libSystem.B.dylib",
-    );
-
-    // Install all /usr/lib/system/*.dylib (re-exported sub-dylibs).
-    let system_dir = usr_lib.join("system");
-    if system_dir.is_dir() {
-        let _ = fs.mkdir("/usr/lib/system", mode);
-        if let Ok(entries) = std::fs::read_dir(&system_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                if name_str.ends_with(".dylib") && entry.file_type().map_or(false, |t| t.is_file())
-                {
-                    let guest_path = format!("/usr/lib/system/{name_str}");
-                    install_file(fs, &entry.path(), &guest_path);
-                }
-            }
-        }
-    }
 }
