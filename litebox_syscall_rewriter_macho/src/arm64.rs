@@ -38,6 +38,11 @@ pub enum PatchKind {
 }
 
 /// Find all patch sites in the given executable sections.
+///
+/// # Panics
+///
+/// Panics if a 4-byte slice cannot be converted to `[u8; 4]`, which cannot
+/// happen because the loop only reads when at least 4 bytes remain.
 pub fn find_patch_sites(text_sections: &[TextSectionInfo], buf: &[u8]) -> Result<Vec<PatchSite>> {
     let mut sites = Vec::new();
     for section in text_sections {
@@ -310,6 +315,10 @@ pub const SVC_GATE_SIZE: usize = SVC_GATE_INSN_COUNT * 4;
 /// [16] BR   X16                   ; jump to callback
 /// [17] .Ltrap: BRK #1             ; unreachable
 /// ```
+/// # Panics
+///
+/// Panics if encoding helpers (`encode_ldr_imm_unsigned`, `encode_cmn_imm`,
+/// etc.) fail on hardcoded constants that are always valid.
 #[allow(clippy::cast_possible_wrap)]
 pub fn emit_shared_svc_handler_macos(
     trampoline_data: &mut Vec<u8>,
@@ -486,6 +495,10 @@ pub fn emit_shared_svc_handler_macos(
 /// [5] ADD  X30, X30, #<pageoff>   ; return addr low 12 bits
 /// [6] B    <shared_svc_handler>   ; branch to shared handler
 /// ```
+/// # Panics
+///
+/// Panics if encoding helpers (`encode_sub_sp_imm`, `encode_stp_offset`)
+/// fail on hardcoded constants that are always valid.
 #[allow(clippy::cast_possible_wrap)]
 pub fn emit_svc_gate_macos(
     trampoline_data: &mut Vec<u8>,
@@ -652,6 +665,10 @@ pub fn hook_syscalls_aarch64(
 /// `cursor == 0` signals that the trampoline header and shared SVC handler
 /// have not been emitted yet. Callers must pass the cursor returned from the
 /// previous call (or 0 for the first call) and must not reset it to 0.
+/// # Panics
+///
+/// Panics if a 4-byte slice cannot be converted to `[u8; 4]`, which cannot
+/// happen because the loop only reads when at least 4 bytes remain.
 #[allow(clippy::cast_possible_wrap)]
 pub fn patch_code_segment(
     code: &mut [u8],

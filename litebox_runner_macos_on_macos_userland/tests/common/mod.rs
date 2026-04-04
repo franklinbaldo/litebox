@@ -22,27 +22,24 @@ fn ensure_platform() {
     });
 }
 
-/// Assemble and link an aarch64 Mach-O binary from assembly source.
+/// Assemble and link an aarch64 Mach-O binary from an assembly source file.
 ///
 /// Uses Xcode `as` and `ld` to produce a static MH_EXECUTE with LC_UNIXTHREAD
 /// (no dyld, no libc).
-pub fn assemble_macho(asm_source: &str, name: &str) -> PathBuf {
+pub fn assemble_macho(src_path: &str, name: &str) -> PathBuf {
     let dir = std::env::var("OUT_DIR")
         .unwrap_or_else(|_| std::env::temp_dir().to_str().unwrap().to_string());
     let dir = Path::new(&dir);
 
-    let asm_path = dir.join(format!("{name}.s"));
     let obj_path = dir.join(format!("{name}.o"));
     let bin_path = dir.join(name);
-
-    std::fs::write(&asm_path, asm_source).expect("write asm source");
 
     // Assemble
     let output = std::process::Command::new("as")
         .args([
             "-arch",
             "arm64",
-            asm_path.to_str().unwrap(),
+            src_path,
             "-o",
             obj_path.to_str().unwrap(),
         ])
@@ -81,16 +78,13 @@ pub fn assemble_macho(asm_source: &str, name: &str) -> PathBuf {
     bin_path
 }
 
-/// Compile a C file to a static Mach-O binary using clang (no libc).
-pub fn compile_macho_nolibc(c_source: &str, name: &str) -> PathBuf {
+/// Compile a C source file to a static Mach-O binary using clang (no libc).
+pub fn compile_macho_nolibc(src_path: &str, name: &str) -> PathBuf {
     let dir = std::env::var("OUT_DIR")
         .unwrap_or_else(|_| std::env::temp_dir().to_str().unwrap().to_string());
     let dir = Path::new(&dir);
 
-    let src_path = dir.join(format!("{name}.c"));
     let bin_path = dir.join(name);
-
-    std::fs::write(&src_path, c_source).expect("write C source");
 
     let output = std::process::Command::new("clang")
         .args([
@@ -103,7 +97,7 @@ pub fn compile_macho_nolibc(c_source: &str, name: &str) -> PathBuf {
             "__start",
             "-o",
             bin_path.to_str().unwrap(),
-            src_path.to_str().unwrap(),
+            src_path,
         ])
         .output()
         .expect("failed to run clang");
@@ -116,16 +110,13 @@ pub fn compile_macho_nolibc(c_source: &str, name: &str) -> PathBuf {
     bin_path
 }
 
-/// Compile a C file to a dynamically linked Mach-O binary using clang.
-pub fn compile_macho_dynamic(c_source: &str, name: &str) -> PathBuf {
+/// Compile a C source file to a dynamically linked Mach-O binary using clang.
+pub fn compile_macho_dynamic(src_path: &str, name: &str) -> PathBuf {
     let dir = std::env::var("OUT_DIR")
         .unwrap_or_else(|_| std::env::temp_dir().to_str().unwrap().to_string());
     let dir = Path::new(&dir);
 
-    let src_path = dir.join(format!("{name}.c"));
     let bin_path = dir.join(name);
-
-    std::fs::write(&src_path, c_source).expect("write C source");
 
     let output = std::process::Command::new("clang")
         .args([
@@ -134,7 +125,7 @@ pub fn compile_macho_dynamic(c_source: &str, name: &str) -> PathBuf {
             "-Wl,-headerpad,0x1000",
             "-o",
             bin_path.to_str().unwrap(),
-            src_path.to_str().unwrap(),
+            src_path,
         ])
         .output()
         .expect("failed to run clang");
