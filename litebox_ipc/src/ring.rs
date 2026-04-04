@@ -21,11 +21,12 @@ pub const RING_MASK: usize = 255;
 /// Maximum number of guest threads that can be multiplexed.
 pub const MAX_THREADS: usize = 64;
 
-/// Default size of the shared data region (8 MiB).
+/// Default size of the shared data region (~40 MiB).
 ///
 /// Must be large enough to hold the biggest mmap segment from an ELF
-/// binary plus the trampoline descriptor and code that follow it.
-pub const DEFAULT_DATA_REGION_SIZE: usize = 8 * 1024 * 1024;
+/// binary plus the trampoline descriptor and code that follow it,
+/// as well as the pipe zone and socket zone.
+pub const DEFAULT_DATA_REGION_SIZE: usize = SOCKET_DATA_REGION_SIZE;
 
 /// Base offset within the data region where pipe ring buffers start.
 ///
@@ -402,6 +403,15 @@ mod tests {
         assert!(
             end <= DEFAULT_DATA_REGION_SIZE,
             "pipe zone end ({end}) exceeds data region size ({DEFAULT_DATA_REGION_SIZE})"
+        );
+    }
+
+    #[test]
+    fn socket_zone_fits_in_default_data_region() {
+        let end = SOCKET_ZONE_BASE_OFFSET + MAX_SOCKET_SLOTS * SOCKET_SLOT_SIZE;
+        assert!(
+            end <= DEFAULT_DATA_REGION_SIZE,
+            "socket zone end ({end}) exceeds data region size ({DEFAULT_DATA_REGION_SIZE})"
         );
     }
 

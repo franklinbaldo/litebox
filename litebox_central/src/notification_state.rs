@@ -6,7 +6,10 @@
 //! Central records these so it can reconstruct guest-visible state when
 //! forking micro.
 
-use litebox_ipc::ring::{MAX_PIPE_SLOTS, MAX_THREADS, PIPE_SLOT_SIZE, PIPE_ZONE_BASE_OFFSET};
+use litebox_ipc::ring::{
+    MAX_PIPE_SLOTS, MAX_SOCKET_SLOTS, MAX_THREADS, PIPE_SLOT_SIZE, PIPE_ZONE_BASE_OFFSET,
+    SOCKET_SLOT_SIZE, SOCKET_ZONE_BASE_OFFSET,
+};
 
 /// A VMA change event recorded from a Tier 2 notification.
 /// Used as an event log for fork/CoW reconstruction.
@@ -48,6 +51,16 @@ pub(crate) struct ShmemPipe {
     pub open_ends: u8,
 }
 
+/// Tracking info for a shmem-backed socket.
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // Fields read when socket handlers are wired up (future task).
+pub(crate) struct ShmemSocket {
+    /// Guest fd number.
+    pub fd: i32,
+    /// Slot index in the socket zone (0..MAX_SOCKET_SLOTS).
+    pub slot_index: u8,
+}
+
 /// Per-process notification state.
 ///
 /// Updated by central's notification handler when it receives Tier 2
@@ -76,6 +89,14 @@ pub(crate) struct ProcessNotificationState {
 
     /// Active shmem-backed pipes.
     pub shmem_pipes: Vec<ShmemPipe>,
+
+    /// Shmem socket slot allocation bitset. Bit N = 1 means slot N is in use.
+    #[allow(dead_code)] // Used when socket handlers are wired up (future task).
+    pub socket_slot_bitset: u64,
+
+    /// Active shmem-backed sockets.
+    #[allow(dead_code)] // Used when socket handlers are wired up (future task).
+    pub shmem_sockets: Vec<ShmemSocket>,
 }
 
 impl Default for ProcessNotificationState {
@@ -89,6 +110,8 @@ impl Default for ProcessNotificationState {
             vma_events: Vec::new(),
             pipe_slot_bitset: 0,
             shmem_pipes: Vec::new(),
+            socket_slot_bitset: 0,
+            shmem_sockets: Vec::new(),
         }
     }
 }
@@ -128,6 +151,28 @@ impl ProcessNotificationState {
             .iter_mut()
             .find(|p| p.read_fd == fd || p.write_fd == fd)
     }
+
+    /// Allocate a free socket slot. Returns the slot index and data-region offset.
+    #[allow(dead_code)] // Used when socket handlers are wired up (future task).
+    pub fn alloc_socket_slot(&mut self) -> Option<(u8, u32)> {
+        if self.socket_slot_bitset == u64::MAX {
+            return None;
+        }
+        let free_bit = self.socket_slot_bitset.trailing_ones();
+        if free_bit as usize >= MAX_SOCKET_SLOTS {
+            return None;
+        }
+        self.socket_slot_bitset |= 1u64 << free_bit;
+        let offset = SOCKET_ZONE_BASE_OFFSET + (free_bit as usize) * SOCKET_SLOT_SIZE;
+        #[allow(clippy::cast_possible_truncation)]
+        Some((free_bit as u8, offset as u32))
+    }
+
+    /// Free a socket slot.
+    #[allow(dead_code)] // Used when socket handlers are wired up (future task).
+    pub fn free_socket_slot(&mut self, slot_index: u8) {
+        self.socket_slot_bitset &= !(1u64 << slot_index);
+    }
 }
 
 #[cfg(test)]
@@ -161,5 +206,34 @@ mod tests {
             assert!(state.alloc_pipe_slot().is_some());
         }
         assert!(state.alloc_pipe_slot().is_none()); // full
+    }
+
+    #[test]
+    fn alloc_socket_slot_returns_sequential_indices() {
+        let mut state = ProcessNotificationState::default();
+        let (idx0, off0) = state.alloc_socket_slot().unwrap();
+        let (idx1, off1) = state.alloc_socket_slot().unwrap();
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        assert_eq!(off0 as usize, SOCKET_ZONE_BASE_OFFSET);
+        assert_eq!(off1 as usize, SOCKET_ZONE_BASE_OFFSET + SOCKET_SLOT_SIZE);
+    }
+
+    #[test]
+    fn free_socket_slot_allows_reuse() {
+        let mut state = ProcessNotificationState::default();
+        let (idx, _) = state.alloc_socket_slot().unwrap();
+        state.free_socket_slot(idx);
+        let (idx2, _) = state.alloc_socket_slot().unwrap();
+        assert_eq!(idx, idx2); // reused
+    }
+
+    #[test]
+    fn alloc_socket_slot_exhaustion() {
+        let mut state = ProcessNotificationState::default();
+        for _ in 0..MAX_SOCKET_SLOTS {
+            assert!(state.alloc_socket_slot().is_some());
+        }
+        assert!(state.alloc_socket_slot().is_none()); // full
     }
 }
