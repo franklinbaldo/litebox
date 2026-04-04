@@ -15,28 +15,6 @@ use litebox_common_macos::PtRegs;
 use crate::{MutPtr, ShimFS, Task};
 
 impl<FS: ShimFS> Task<FS> {
-    /// Handle `sigaction()` — stub: record but don't deliver signals.
-    #[allow(clippy::unnecessary_wraps)]
-    pub(crate) fn sys_sigaction(
-        &self,
-        _signum: i32,
-        _new_act: usize,
-        _old_act: usize,
-    ) -> Result<usize, Errno> {
-        Ok(0)
-    }
-
-    /// Handle `sigprocmask()` — stub: return success.
-    #[allow(clippy::unnecessary_wraps)]
-    pub(crate) fn sys_sigprocmask(
-        &self,
-        _how: i32,
-        _set: usize,
-        _oldset: usize,
-    ) -> Result<usize, Errno> {
-        Ok(0)
-    }
-
     /// Handle `madvise()` — stub: return success.
     #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn sys_madvise(
