@@ -697,11 +697,18 @@ fn test_nine_p_broken_write() {
     let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
 
-    // 4 writes: version + attach + walk + lopen. Then write will fail.
-    let handle = BrokenNinePHandle::new(&litebox, &server, 4);
+    // With caching: version + attach + walk(existence-check, fails) +
+    // walk(parent=clone-root) + create + clone-root(invalidate_parent) +
+    // clunk(invalidation fid). Then write will fail.
+    // O_SYNC bypasses the write-behind buffer so the write RPC fires immediately.
+    let handle = BrokenNinePHandle::new(&litebox, &server, 7);
     let fs = handle.fs();
     let fd = fs
-        .open("/write_me.txt", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+        .open(
+            "/write_me.txt",
+            OFlags::CREAT | OFlags::WRONLY | OFlags::SYNC,
+            Mode::RWXU,
+        )
         .expect("create should succeed before break");
 
     let result = fs.write(&fd, b"data", None);
