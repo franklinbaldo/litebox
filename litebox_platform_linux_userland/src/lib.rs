@@ -797,7 +797,7 @@ impl LinuxUserland {
             path,
             rdev: stat_buf.st_rdev,
             dev: stat_buf.st_dev,
-            ino: stat_buf.st_ino,
+            ino: stat_buf.st_ino as u64,
         })
     }
 
@@ -1065,7 +1065,8 @@ impl LinuxUserland {
         let ts = timeout.map(|t| libc::timespec {
             #[allow(clippy::cast_possible_wrap)]
             tv_sec: t.as_secs() as libc::time_t,
-            tv_nsec: libc::c_long::from(t.subsec_nanos()),
+            #[allow(clippy::cast_possible_wrap, clippy::cast_lossless)]
+            tv_nsec: t.subsec_nanos() as libc::c_long,
         });
         let _ = unsafe {
             libc::ppoll(

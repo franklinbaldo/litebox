@@ -587,7 +587,7 @@ fn open_session_single_instance(
         .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
 
     // Run the TA's OpenSession entry point using reference-based reenter
-    let mut ctx = litebox_common_linux::PtRegs::default();
+    let mut ctx = litebox_common_linux::ExecutionContext::default();
     unsafe {
         litebox_platform_lvbs::reenter_thread_ref(
             instance.loaded_program.entrypoints.as_ref().unwrap(),
@@ -763,7 +763,7 @@ fn open_session_new_instance(
     );
 
     // Run ldelf to load the TA using reference-based run to avoid moving the shim
-    let mut ldelf_ctx = litebox_common_linux::PtRegs::default();
+    let mut ldelf_ctx = litebox_common_linux::ExecutionContext::default();
     unsafe {
         litebox_platform_lvbs::run_thread_ref(
             loaded_program.entrypoints.as_ref().unwrap(),
@@ -822,7 +822,7 @@ fn open_session_new_instance(
         })?;
 
     // Run the TA entry function using reference-based reenter to avoid moving the shim
-    let mut ctx = litebox_common_linux::PtRegs::default();
+    let mut ctx = litebox_common_linux::ExecutionContext::default();
     unsafe {
         litebox_platform_lvbs::reenter_thread_ref(
             loaded_program.entrypoints.as_ref().unwrap(),
@@ -964,7 +964,7 @@ fn handle_invoke_command(
         .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
 
     // Run the TA entry function using reference-based reenter to avoid moving the shim
-    let mut ctx = litebox_common_linux::PtRegs::default();
+    let mut ctx = litebox_common_linux::ExecutionContext::default();
     unsafe {
         litebox_platform_lvbs::reenter_thread_ref(
             instance.loaded_program.entrypoints.as_ref().unwrap(),
@@ -1103,7 +1103,7 @@ fn handle_close_session(
         .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
 
     // Run the TA entry function (TA_CloseSessionEntryPoint)
-    let mut ctx = litebox_common_linux::PtRegs::default();
+    let mut ctx = litebox_common_linux::ExecutionContext::default();
     unsafe {
         litebox_platform_lvbs::reenter_thread_ref(
             instance.loaded_program.entrypoints.as_ref().unwrap(),

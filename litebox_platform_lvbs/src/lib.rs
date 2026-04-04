@@ -1579,9 +1579,9 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
 ///
 /// # Safety
 /// The context must be valid user context.
-pub unsafe fn run_thread<T>(shim: T, ctx: &mut litebox_common_linux::PtRegs)
+pub unsafe fn run_thread<T>(shim: T, ctx: &mut litebox_common_linux::ExecutionContext)
 where
-    T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::ExecutionContext>,
 {
     // Currently, `litebox_platform_lvbs` uses `swapgs` to efficiently switch between
     // kernel and user GS base values during kernel-user mode transitions.
@@ -1598,9 +1598,9 @@ where
 ///
 /// # Safety
 /// The context must be valid user context.
-pub unsafe fn run_thread_ref<T>(shim: &T, ctx: &mut litebox_common_linux::PtRegs)
+pub unsafe fn run_thread_ref<T>(shim: &T, ctx: &mut litebox_common_linux::ExecutionContext)
 where
-    T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::ExecutionContext>,
 {
     crate::arch::write_kernel_gsbase_msr(VirtAddr::zero());
     run_thread_inner(shim, ctx, false);
@@ -1613,25 +1613,25 @@ where
 ///
 /// # Safety
 /// The context must be valid user context.
-pub unsafe fn reenter_thread_ref<T>(shim: &T, ctx: &mut litebox_common_linux::PtRegs)
+pub unsafe fn reenter_thread_ref<T>(shim: &T, ctx: &mut litebox_common_linux::ExecutionContext)
 where
-    T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::ExecutionContext>,
 {
     crate::arch::write_kernel_gsbase_msr(VirtAddr::zero());
     run_thread_inner(shim, ctx, true);
 }
 
 struct ThreadContext<'a> {
-    shim: &'a dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
-    ctx: &'a mut litebox_common_linux::PtRegs,
+    shim: &'a dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::ExecutionContext>,
+    ctx: &'a mut litebox_common_linux::ExecutionContext,
 }
 
 fn run_thread_inner(
-    shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
-    ctx: &mut litebox_common_linux::PtRegs,
+    shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::ExecutionContext>,
+    ctx: &mut litebox_common_linux::ExecutionContext,
     reenter: bool,
 ) {
-    let ctx_ptr = core::ptr::from_mut(ctx);
+    let ctx_ptr = core::ptr::from_mut(&mut ctx.regs);
     let mut thread_ctx = ThreadContext { shim, ctx };
     // `thread_ctx` will be passed to `syscall_handler` later.
     // `ctx_ptr` is to let `run_thread_arch` easily access `ctx` (i.e., not to deal with
@@ -2057,21 +2057,21 @@ unsafe extern "C" {
 
 unsafe extern "C" fn init_handler(thread_ctx: &mut ThreadContext) {
     match thread_ctx.call_shim(|shim, ctx| shim.init(ctx)) {
-        ContinueOperation::Resume => unsafe { switch_to_user(thread_ctx.ctx) },
+        ContinueOperation::Resume => unsafe { switch_to_user(&thread_ctx.ctx.regs) },
         ContinueOperation::Terminate => {}
     }
 }
 
 unsafe extern "C" fn reenter_handler(thread_ctx: &mut ThreadContext) {
     match thread_ctx.call_shim(|shim, ctx| shim.reenter(ctx)) {
-        ContinueOperation::Resume => unsafe { switch_to_user(thread_ctx.ctx) },
+        ContinueOperation::Resume => unsafe { switch_to_user(&thread_ctx.ctx.regs) },
         ContinueOperation::Terminate => {}
     }
 }
 
 unsafe extern "C" fn syscall_handler(thread_ctx: &mut ThreadContext) {
     match thread_ctx.call_shim(|shim, ctx| shim.syscall(ctx)) {
-        ContinueOperation::Resume => unsafe { switch_to_user(thread_ctx.ctx) },
+        ContinueOperation::Resume => unsafe { switch_to_user(&thread_ctx.ctx.regs) },
         ContinueOperation::Terminate => {}
     }
 }
@@ -2143,7 +2143,7 @@ unsafe extern "C" fn exception_handler(
                 0
             } else {
                 // User-mode exception handled; resume user execution.
-                unsafe { switch_to_user(thread_ctx.ctx) }
+                unsafe { switch_to_user(&thread_ctx.ctx.regs) }
             }
         }
         ContinueOperation::Terminate => {
@@ -2174,8 +2174,8 @@ impl ThreadContext<'_> {
     fn call_shim(
         &mut self,
         f: impl FnOnce(
-            &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
-            &mut litebox_common_linux::PtRegs,
+            &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::ExecutionContext>,
+            &mut litebox_common_linux::ExecutionContext,
         ) -> ContinueOperation,
     ) -> ContinueOperation {
         f(self.shim, self.ctx)
