@@ -1401,6 +1401,90 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
         return unsafe { handle_recvmsg_as_read(tls, args) };
     }
 
+    // File shmem write pre-copy: for write-family syscalls on fds with a shmem
+    // file slot, copy data into the per-fd TX ring and submit with FILE_SHMEM
+    // flag. Central reads from the ring instead of the data_region.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_ptr_alignment
+    )]
+    if matches!(
+        i64::from(nr),
+        libc::SYS_write
+            | libc::SYS_pwrite64
+            | libc::SYS_writev
+            | libc::SYS_pwritev
+            | libc::SYS_pwritev2
+    ) {
+        let fd = args.args[0] as i32;
+        let micro = unsafe { &*(*tls).micro };
+        if let Some(shmem_offset) = micro.find_file_fd(fd) {
+            let header = unsafe {
+                micro
+                    .ring_base
+                    .add(micro.layout.data_region_offset)
+                    .add(shmem_offset as usize)
+                    .cast::<litebox_ipc::socket_ring::ShmemSocketHeader>()
+            };
+
+            match i64::from(nr) {
+                libc::SYS_write | libc::SYS_pwrite64 => {
+                    // Flat write: copy buffer into TX ring
+                    let buf_ptr = args.args[1] as *const u8;
+                    let count = args.args[2] as usize;
+                    if count > 0 && !buf_ptr.is_null() {
+                        let buf = unsafe { core::slice::from_raw_parts(buf_ptr, count) };
+                        let written =
+                            unsafe { litebox_ipc::socket_ring::socket_try_write(header, buf) };
+                        if written < 0 {
+                            return written;
+                        }
+                    }
+                }
+                libc::SYS_writev | libc::SYS_pwritev | libc::SYS_pwritev2 => {
+                    // Scatter-gather write: flatten iovec into TX ring
+                    let iov_ptr = args.args[1] as *const u8;
+                    let iovcnt = args.args[2] as usize;
+                    if !iov_ptr.is_null() && iovcnt > 0 {
+                        for i in 0..iovcnt {
+                            let iov_entry = unsafe { iov_ptr.add(i * IOVEC_SIZE) };
+                            let iov_base =
+                                unsafe { core::ptr::read_unaligned(iov_entry.cast::<u64>()) }
+                                    as *const u8;
+                            let iov_len = unsafe {
+                                core::ptr::read_unaligned(iov_entry.add(8).cast::<u64>())
+                            } as usize;
+
+                            if iov_base.is_null() || iov_len == 0 {
+                                continue;
+                            }
+
+                            let buf = unsafe { core::slice::from_raw_parts(iov_base, iov_len) };
+                            let written =
+                                unsafe { litebox_ipc::socket_ring::socket_try_write(header, buf) };
+                            if written < 0 {
+                                return written;
+                            }
+                        }
+                    }
+                }
+                _ => {} // unreachable due to outer match
+            }
+
+            let cq = unsafe {
+                submit_and_wait(
+                    tls,
+                    nr,
+                    &args.args,
+                    litebox_ipc::ring::sq_flags::NEED_AUTH
+                        | litebox_ipc::ring::sq_flags::FILE_SHMEM,
+                )
+            };
+            return cq.result;
+        }
+    }
+
     let cq =
         unsafe { submit_and_wait(tls, nr, &args.args, litebox_ipc::ring::sq_flags::NEED_AUTH) };
 
@@ -1488,6 +1572,33 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
                 micro.register_file_fd(resp.fd, resp.file_slot_offset);
             }
             return cq.result; // return the fd
+        }
+
+        // File shmem read post-copy: central placed data into the per-fd RX
+        // ring. Copy it into the guest buffer and return the result directly.
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_ptr_alignment
+        )]
+        if cq.flags & cq_flags::FILE_SHMEM_DATA != 0 && cq.result > 0 {
+            let fd = args.args[0] as i32;
+            let micro = unsafe { &*(*tls).micro };
+            if let Some(shmem_offset) = micro.find_file_fd(fd) {
+                let header = unsafe {
+                    micro
+                        .ring_base
+                        .add(micro.layout.data_region_offset)
+                        .add(shmem_offset as usize)
+                        .cast::<litebox_ipc::socket_ring::ShmemSocketHeader>()
+                };
+                let buf_ptr = args.args[1] as *mut u8;
+                let count = cq.result as usize;
+                let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, count) };
+                unsafe { litebox_ipc::socket_ring::socket_try_read(header, buf) };
+            }
+            // NO_REPORT is set — skip report_local_result
+            return cq.result;
         }
 
         let micro = unsafe { &*(*tls).micro };
