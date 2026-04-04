@@ -268,4 +268,64 @@ impl<FS: ShimFS> Task<FS> {
             }
         }
     }
+
+    /// Handle `bsdthread_register` — one-time pthread library registration.
+    ///
+    /// Stores the `_thread_start` trampoline address and pthread struct size
+    /// in the shared `Process` so that future `bsdthread_create` calls know
+    /// where to set new threads' PC and how to find TSD.
+    ///
+    /// # Arguments
+    /// - `threadstart`: address of `_thread_start` asm trampoline
+    /// - `wqthread`: address of `_start_wqthread` asm trampoline
+    /// - `pthsize`: `sizeof(struct pthread_s)`
+    /// - `pthread_init_data`: pointer to `_pthread_registration_data` struct
+    /// - `pthread_init_data_size`: size of the registration data struct
+    pub(crate) fn sys_bsdthread_register(
+        &self,
+        threadstart: usize,
+        wqthread: usize,
+        pthsize: u32,
+        pthread_init_data: usize,
+        pthread_init_data_size: usize,
+    ) -> Result<i32, Errno> {
+        use core::sync::atomic::Ordering;
+
+        log_unsupported!(
+            "bsdthread_register(threadstart={threadstart:#x}, wqthread={wqthread:#x}, \
+             pthsize={pthsize}, init_data={pthread_init_data:#x}, init_data_size={pthread_init_data_size})"
+        );
+
+        self.process
+            .threadstart
+            .store(threadstart as u64, Ordering::Release);
+        self.process
+            .wqthread
+            .store(wqthread as u64, Ordering::Release);
+        self.process.pthsize.store(pthsize, Ordering::Release);
+
+        // Parse the _pthread_registration_data struct to extract tsd_offset.
+        if pthread_init_data != 0 && pthread_init_data_size >= 24 {
+            // Read tsd_offset at offset 16 (8 bytes)
+            let ptr: crate::ConstPtr<u8> = crate::ConstPtr::from_usize(pthread_init_data + 16);
+            let mut tsd_offset_bytes = [0u8; 8];
+            for i in 0..8 {
+                tsd_offset_bytes[i] = ptr.read_at_offset(i as isize).ok_or(Errno::EFAULT)?;
+            }
+            let tsd_offset = u64::from_le_bytes(tsd_offset_bytes) as u32;
+            self.process.tsd_offset.store(tsd_offset, Ordering::Release);
+            log_unsupported!("bsdthread_register: tsd_offset={tsd_offset:#x}");
+
+            // Write back the reply data (version/size acknowledgment).
+            let version_bytes = (pthread_init_data_size as u64).to_le_bytes();
+            let dest: MutPtr<u8> = MutPtr::from_usize(pthread_init_data);
+            for i in 0..8isize {
+                dest.write_at_offset(i, version_bytes[i as usize])
+                    .ok_or(Errno::EFAULT)?;
+            }
+        }
+
+        // Return 0 for minimal pthread feature support.
+        Ok(0)
+    }
 }
