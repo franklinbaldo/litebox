@@ -188,9 +188,14 @@ impl<FS: ShimFS> Task<FS> {
             MacosSyscallRequest::Mkdir { path, mode } => self.sys_mkdir(path, mode),
             MacosSyscallRequest::Rmdir { path } => self.sys_rmdir(path),
             MacosSyscallRequest::Ftruncate { fd, length } => self.sys_ftruncate(fd, length),
+            MacosSyscallRequest::Getdirentries64 {
+                fd,
+                buf,
+                bufsize,
+                basep,
+            } => self.sys_getdirentries64(fd, buf, bufsize, basep),
             // Stubbed syscalls for future tasks:
-            MacosSyscallRequest::SemwaitSignal { .. }
-            | MacosSyscallRequest::Getdirentries64 { .. } => {
+            MacosSyscallRequest::SemwaitSignal { .. } => {
                 log_unsupported!("unimplemented syscall");
                 Err(Errno::ENOSYS)
             }

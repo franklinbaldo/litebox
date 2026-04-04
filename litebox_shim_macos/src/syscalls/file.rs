@@ -751,4 +751,108 @@ impl<FS: ShimFS> Task<FS> {
             })?;
         Ok(0)
     }
+
+    /// Handle `getdirentries64(fd, buf, bufsize, basep)`.
+    ///
+    /// Reads directory entries from the directory FD and serializes them as
+    /// macOS `struct dirent` records into the user buffer. Returns the number
+    /// of bytes written.
+    ///
+    /// macOS `struct dirent` layout (aarch64):
+    /// - offset 0: d_ino (u64, 8 bytes)
+    /// - offset 8: d_seekoff (u64, 8 bytes)
+    /// - offset 16: d_reclen (u16, 2 bytes) — total record length including padding
+    /// - offset 18: d_namlen (u16, 2 bytes) — length of d_name (excluding NUL)
+    /// - offset 20: d_type (u8, 1 byte) — DT_REG=8, DT_DIR=4, DT_CHR=2
+    /// - offset 21: d_name (variable) — NUL-terminated name
+    /// - padding to 8-byte alignment
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn sys_getdirentries64(
+        &self,
+        fd: i32,
+        buf_addr: usize,
+        bufsize: usize,
+        basep: usize,
+    ) -> Result<usize, Errno> {
+        let raw_fd = fd_to_usize(fd)?;
+        let typed_fd = {
+            let rds = self.global.raw_descriptors.read();
+            rds.fd_from_raw_integer::<FS>(raw_fd)
+                .map_err(|_| Errno::EBADF)?
+        };
+
+        let entries = self
+            .global
+            .fs
+            .read_dir(&typed_fd)
+            .map_err(|e| match e {
+                litebox::fs::errors::ReadDirError::ClosedFd => Errno::EBADF,
+                litebox::fs::errors::ReadDirError::NotADirectory => Errno::ENOTDIR,
+                litebox::fs::errors::ReadDirError::Io => Errno::EIO,
+                _ => Errno::EIO,
+            })?;
+
+        // Serialize entries into macOS dirent format.
+        let mut output = alloc::vec::Vec::with_capacity(bufsize.min(MAX_KERNEL_BUF_SIZE));
+        let mut seek_offset: u64 = 1;
+
+        for entry in &entries {
+            let name_bytes = entry.name.as_bytes();
+            let namlen = name_bytes.len();
+            // d_reclen = header (21 bytes) + name + NUL, rounded up to 8-byte alignment
+            let reclen = (21 + namlen + 1 + 7) & !7;
+            if output.len() + reclen > bufsize {
+                break; // buffer full
+            }
+
+            let ino: u64 = entry
+                .ino_info
+                .as_ref()
+                .map_or(seek_offset, |info| info.ino as u64);
+            let d_type: u8 = match entry.file_type {
+                litebox::fs::FileType::RegularFile => 8,        // DT_REG
+                litebox::fs::FileType::Directory => 4,           // DT_DIR
+                litebox::fs::FileType::CharacterDevice => 2,     // DT_CHR
+                _ => 0,                                          // DT_UNKNOWN
+            };
+
+            // d_ino (8 bytes)
+            output.extend_from_slice(&ino.to_le_bytes());
+            // d_seekoff (8 bytes)
+            output.extend_from_slice(&seek_offset.to_le_bytes());
+            // d_reclen (2 bytes)
+            output.extend_from_slice(&(reclen as u16).to_le_bytes());
+            // d_namlen (2 bytes)
+            output.extend_from_slice(&(namlen as u16).to_le_bytes());
+            // d_type (1 byte)
+            output.push(d_type);
+            // d_name (NUL-terminated)
+            output.extend_from_slice(name_bytes);
+            output.push(0); // NUL terminator
+            // Pad to 8-byte alignment
+            while output.len() % 8 != 0 {
+                output.push(0);
+            }
+
+            seek_offset += 1;
+        }
+
+        // Write output to user buffer
+        if !output.is_empty() {
+            let user_buf: MutPtr<u8> = MutPtr::from_usize(buf_addr);
+            user_buf
+                .copy_from_slice(0, &output)
+                .ok_or(Errno::EFAULT)?;
+        }
+
+        // Write basep (position) if non-null
+        if basep != 0 {
+            let basep_ptr: MutPtr<u64> = MutPtr::from_usize(basep);
+            basep_ptr
+                .write_at_offset(0, seek_offset)
+                .ok_or(Errno::EFAULT)?;
+        }
+
+        Ok(output.len())
+    }
 }
