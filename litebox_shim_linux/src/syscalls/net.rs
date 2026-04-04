@@ -159,7 +159,7 @@ impl SocketAddress {
 }
 
 #[derive(Default)]
-pub(super) struct SocketOptions {
+pub(crate) struct SocketOptions {
     pub(super) reuse_address: bool,
     pub(super) keep_alive: bool,
     pub(super) broadcast: bool,

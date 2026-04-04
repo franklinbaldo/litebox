@@ -8,8 +8,8 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -21,8 +21,8 @@ use litebox_ipc::messages::{
     MSG_THREAD_DEREGISTER, MSG_THREAD_REGISTER,
 };
 use litebox_ipc::ring::{
-    cq_flags, pipe_flags, sq_flags, CqEntry, SqEntry, TrampolineDescriptor, PIPE_SLOT_SIZE,
-    PIPE_ZONE_BASE_OFFSET, RING_MASK,
+    CqEntry, PIPE_SLOT_SIZE, PIPE_ZONE_BASE_OFFSET, RING_MASK, SqEntry, TrampolineDescriptor,
+    cq_flags, pipe_flags, sq_flags,
 };
 use litebox_ipc::sq::{sq_advance_head, sq_head_index, sq_try_consume};
 use litebox_ipc::wait::spin_u8_then_wait_u32;

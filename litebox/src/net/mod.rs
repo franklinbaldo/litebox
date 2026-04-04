@@ -1842,6 +1842,108 @@ pub enum CloseBehavior {
     GracefulIfNoPendingData,
 }
 
+/// Information about a listening TCP socket, used for transferring listening
+/// state across a fork boundary.
+pub struct ListeningSocketInfo {
+    /// The port the socket is listening on.
+    pub port: u16,
+    /// The backlog (maximum number of pending connections).
+    pub backlog: u16,
+    /// The IP listen endpoint (address + port).
+    pub ip_listen_endpoint: smoltcp::wire::IpListenEndpoint,
+}
+
+impl<Platform> Network<Platform>
+where
+    Platform:
+        platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider,
+{
+    /// Export the state of all listening TCP sockets.
+    ///
+    /// Returns a [`ListeningSocketInfo`] for each TCP socket that has an active
+    /// server socket with a set backlog (i.e., `listen()` has been called).
+    ///
+    /// This is used during fork to discover which listening sockets need to be
+    /// re-created in the child's fresh [`Network`] instance.
+    pub fn listening_tcp_sockets(&self) -> Vec<ListeningSocketInfo> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let mut listeners = Vec::new();
+        for (_internal_fd, entry) in descriptor_table.iter::<Network<Platform>>() {
+            if let ProtocolSpecific::Tcp(tcp) = &entry.entry.specific
+                && let Some(server) = &tcp.server_socket
+                && let Some(backlog) = server.backlog
+            {
+                listeners.push(ListeningSocketInfo {
+                    port: server.ip_listen_endpoint.port,
+                    backlog,
+                    ip_listen_endpoint: server.ip_listen_endpoint,
+                });
+            }
+        }
+        listeners
+    }
+
+    /// Create listening sockets from previously exported state.
+    ///
+    /// For each entry in `listeners`, this creates a new TCP socket, binds it
+    /// to the specified port, and starts listening with the given backlog.
+    ///
+    /// Returns `(port, SocketFd)` pairs so the caller can remap file descriptors
+    /// from the old (parent) Network entries to the new (child) ones.
+    /// # Panics
+    ///
+    /// Panics if socket creation, binding, or listening fails for any of the
+    /// provided listener entries (these are internal errors that indicate a
+    /// bug in the fork logic).
+    pub fn import_listening_sockets(
+        &mut self,
+        listeners: &[ListeningSocketInfo],
+    ) -> Vec<(u16, SocketFd<Platform>)> {
+        let mut result = Vec::with_capacity(listeners.len());
+        for info in listeners {
+            // Create a fresh TCP socket in this Network's socket_set.
+            let fd = self
+                .socket(Protocol::Tcp)
+                .expect("failed to create TCP socket for listener import");
+
+            // Bind to the listening port. Use UNSPECIFIED as the IP address
+            // since the original listener may have been bound to 0.0.0.0.
+            let bind_ip: Ipv4Addr = match info.ip_listen_endpoint.addr {
+                Some(smoltcp::wire::IpAddress::Ipv4(ipv4)) => ipv4,
+                None => smoltcp::wire::Ipv4Address::UNSPECIFIED,
+            };
+            let addr = SocketAddr::V4(SocketAddrV4::new(bind_ip, info.port));
+            self.bind(&fd, &addr)
+                .expect("failed to bind imported listener");
+
+            // Start listening with the same backlog.
+            self.listen(&fd, info.backlog)
+                .expect("failed to listen on imported socket");
+
+            result.push((info.port, fd));
+        }
+        result
+    }
+
+    /// Check if a socket fd is a listening TCP socket and return its port if so.
+    ///
+    /// Returns `Some(port)` if the fd is a TCP socket with an active server
+    /// socket and a set backlog (i.e., `listen()` has been called on it).
+    /// Returns `None` otherwise.
+    pub fn listening_port(&self, fd: &SocketFd<Platform>) -> Option<u16> {
+        let descriptor_table = self.litebox.descriptor_table();
+        descriptor_table.with_entry(fd, |entry| {
+            if let ProtocolSpecific::Tcp(tcp) = &entry.entry.specific
+                && let Some(server) = &tcp.server_socket
+                && server.backlog.is_some()
+            {
+                return Some(server.ip_listen_endpoint.port);
+            }
+            None
+        })?
+    }
+}
+
 crate::fd::enable_fds_for_subsystem! {
     @Platform: { platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider };
     Network<Platform>;

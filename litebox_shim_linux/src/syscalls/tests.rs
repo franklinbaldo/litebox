@@ -3,8 +3,8 @@
 
 use litebox::fs::{FileSystem as _, Mode, OFlags};
 use litebox::platform::RawConstPointer as _;
-use litebox_common_linux::{errno::Errno, AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags};
-use litebox_platform_multiplex::{set_platform, Platform};
+use litebox_common_linux::{AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, errno::Errno};
+use litebox_platform_multiplex::{Platform, set_platform};
 
 use crate::MutPtr;
 
@@ -40,13 +40,15 @@ pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task<crate:
         let net = task.net.clone();
         // Start a background thread to perform network interaction
         // Naive implementation for testing purpose only
-        std::thread::spawn(move || loop {
-            while net
-                .lock()
-                .perform_platform_interaction()
-                .call_again_immediately()
-            {}
-            core::hint::spin_loop();
+        std::thread::spawn(move || {
+            loop {
+                while net
+                    .lock()
+                    .perform_platform_interaction()
+                    .call_again_immediately()
+                {}
+                core::hint::spin_loop();
+            }
         });
     }
     task
@@ -460,7 +462,7 @@ fn test_umask_behavior() {
 
 #[test]
 fn test_rlimit_nofile() {
-    use litebox_common_linux::{errno::Errno, Rlimit, RlimitResource};
+    use litebox_common_linux::{Rlimit, RlimitResource, errno::Errno};
 
     let task = crate::syscalls::tests::init_platform(None);
 

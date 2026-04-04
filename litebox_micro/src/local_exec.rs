@@ -4,7 +4,7 @@
 //! Local execution of syscalls authorized by central.
 
 use crate::raw_syscall;
-use litebox_ipc::ring::{cq_flags, CqEntry};
+use litebox_ipc::ring::{CqEntry, cq_flags};
 
 /// Execute a locally-authorized syscall.
 ///

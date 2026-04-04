@@ -487,6 +487,11 @@ impl<FS: ShimFS> LinuxShim<FS> {
     /// Unlike [`Self::create_task`], this duplicates every open fd from
     /// `parent_task` into the child's descriptor table, so that the child
     /// sees the same virtual fd numbers (including redirected stdin/stdout).
+    ///
+    /// # Panics
+    ///
+    /// Panics if listening socket re-creation or fd remapping fails during
+    /// fork (these indicate internal bugs in the fork logic).
     pub fn fork_task(
         &self,
         _fs: alloc::sync::Arc<FS>,
@@ -504,6 +509,133 @@ impl<FS: ShimFS> LinuxShim<FS> {
         // Each forked process gets its own fresh Network instance.
         let mut child_net = Network::new(&self.global.litebox);
         child_net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
+
+        // Re-create listening sockets from the parent's Network into the child's
+        // fresh Network, so that inherited listening fds actually work.
+        {
+            // Step 1: Export listening socket state from the parent.
+            let parent_net_guard = parent_task.task.net.lock();
+            let listeners = parent_net_guard.listening_tcp_sockets();
+
+            if listeners.is_empty() {
+                drop(parent_net_guard);
+            } else {
+                // Step 2: Walk the child's raw fd table to find network fds that
+                // correspond to listening sockets. We use the parent's Network
+                // to check since both share the same descriptor table entries.
+                let alive_fds: Vec<usize> =
+                    files.raw_descriptor_store.read().iter_alive().collect();
+
+                // Collect (raw_fd, port) pairs for listening sockets.
+                let mut listening_raw_fds: Vec<(usize, u16)> = Vec::new();
+                for raw_fd in &alive_fds {
+                    let rds = files.raw_descriptor_store.read();
+                    let Ok(net_fd) = rds.fd_from_raw_integer::<Network<Platform>>(*raw_fd) else {
+                        continue;
+                    };
+                    if let Some(port) = parent_net_guard.listening_port(&net_fd) {
+                        listening_raw_fds.push((*raw_fd, port));
+                    }
+                }
+
+                // Release the parent lock before mutating the child.
+                drop(parent_net_guard);
+
+                // Step 3: Import listeners into the child's Network (creates new
+                // smoltcp sockets, binds, and listens).
+                let imported = child_net.import_listening_sockets(&listeners);
+
+                // Step 4: Remap each listening raw fd to point to the new
+                // child-owned descriptor table entry.
+                for (raw_fd, port) in &listening_raw_fds {
+                    // Find the matching imported fd by port.
+                    let Some((_port, new_fd)) = imported.iter().find(|(p, _)| p == port) else {
+                        continue;
+                    };
+
+                    // Set up metadata on the new fd.
+                    {
+                        let mut dt = self.global.litebox.descriptor_table_mut();
+                        let _old =
+                            dt.set_entry_metadata(new_fd, syscalls::net::SocketOptions::default());
+                        let _old =
+                            dt.set_entry_metadata(new_fd, litebox_common_linux::SockType::Stream);
+                        let _old = dt.set_entry_metadata(
+                            new_fd,
+                            syscalls::net::SocketOFlags(litebox::fs::OFlags::RDWR),
+                        );
+                    }
+
+                    // Copy FD_CLOEXEC from old fd if present.
+                    {
+                        let rds = files.raw_descriptor_store.read();
+                        let old_net_fd = rds
+                            .fd_from_raw_integer::<Network<Platform>>(*raw_fd)
+                            .expect("raw fd should still be alive");
+                        let dt = self.global.litebox.descriptor_table();
+                        let cloexec = dt
+                            .with_metadata(
+                                old_net_fd.as_ref(),
+                                |flags: &litebox_common_linux::FileDescriptorFlags| *flags,
+                            )
+                            .unwrap_or(litebox_common_linux::FileDescriptorFlags::empty());
+                        drop(dt);
+                        drop(rds);
+                        if cloexec.contains(litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC) {
+                            let mut dt = self.global.litebox.descriptor_table_mut();
+                            let _old = dt.set_fd_metadata(
+                                new_fd,
+                                litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC,
+                            );
+                        }
+                    }
+
+                    // Create and set a new proxy for the child's socket.
+                    let proxy = Arc::new(litebox::net::socket_channel::NetworkProxy::Stream(
+                        litebox::net::socket_channel::StreamSocketChannel::new(),
+                    ));
+                    {
+                        let mut dt = self.global.litebox.descriptor_table_mut();
+                        let _old = dt
+                            .set_entry_metadata(new_fd, syscalls::net::SocketProxy(proxy.clone()));
+                    }
+                    let proxy_set = child_net.set_socket_proxy(new_fd, proxy);
+                    assert!(proxy_set, "failed to set proxy on imported socket");
+
+                    // Replace the child's raw fd entry: consume the old
+                    // (parent-shared) fd and insert the new (child-owned) one.
+                    // Duplicate first (needs descriptor_table_mut), then swap
+                    // in the raw descriptor store.
+                    let dup_fd = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .duplicate(new_fd)
+                        .expect("new fd should be valid");
+                    let mut rds = files.raw_descriptor_store.write();
+                    let _old_fd = rds
+                        .fd_consume_raw_integer::<Network<Platform>>(*raw_fd)
+                        .expect("raw fd should still be alive");
+                    let success = rds.fd_into_specific_raw_integer(dup_fd, *raw_fd);
+                    assert!(
+                        success,
+                        "child raw fd {raw_fd} should be free after consume"
+                    );
+                    drop(rds);
+                }
+
+                // Step 5: Clean up the original fds from import_listening_sockets().
+                // They have been duplicated into the raw fd table, so we remove them
+                // from the descriptor table to avoid leaking OwnedFds.
+                {
+                    let mut dt = self.global.litebox.descriptor_table_mut();
+                    for (_port, fd) in &imported {
+                        let _ = dt.remove::<Network<Platform>>(fd);
+                    }
+                }
+            }
+        }
+
         let child_net = Arc::new(litebox::sync::Mutex::new(child_net));
 
         LinuxShimTask {
