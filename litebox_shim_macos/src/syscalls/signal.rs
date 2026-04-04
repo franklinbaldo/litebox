@@ -366,4 +366,57 @@ impl<FS: ShimFS> Task<FS> {
         }
         ctx.sp = new_sp; // sp = bottom of frame
     }
+
+    /// Handle `sigreturn()` (BSD syscall 184).
+    ///
+    /// Reads the saved `ucontext_t` and `mcontext64_t` from the guest stack,
+    /// restores all general registers, pstate/cpsr, and the signal mask.
+    ///
+    /// This modifies `ctx` directly and must NOT be followed by `set_syscall_return`.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    pub(crate) fn sys_sigreturn(&self, ctx: &mut PtRegs, uctx_addr: usize) {
+        // 1. Read uc_sigmask (4 bytes at offset 4 in ucontext_t).
+        let sigmask_ptr: ConstPtr<u32> = ConstPtr::from_usize(uctx_addr + UCTX_SIGMASK);
+        let sigmask = sigmask_ptr
+            .read_at_offset(0)
+            .expect("sigreturn: read uc_sigmask");
+        self.blocked_signals
+            .store(sigmask & !UNCATCHABLE_MASK, Ordering::Relaxed);
+
+        // 2. Read uc_mcontext pointer (8 bytes at offset 48 in ucontext_t).
+        let mctx_ptr_ptr: ConstPtr<u64> = ConstPtr::from_usize(uctx_addr + UCTX_MCONTEXT);
+        let mcontext_addr = mctx_ptr_ptr
+            .read_at_offset(0)
+            .expect("sigreturn: read uc_mcontext") as usize;
+
+        // 3. Restore registers from mcontext.__ss (272 bytes at offset 16).
+        let ss_addr = mcontext_addr + MCTX_SS_BASE;
+        let ss_u64: ConstPtr<u64> = ConstPtr::from_usize(ss_addr);
+
+        // x0-x28
+        for i in 0..29 {
+            ctx.regs[i] = ss_u64
+                .read_at_offset(((SS_X_BASE / 8) + i) as isize)
+                .expect("sigreturn: read x reg") as usize;
+        }
+        // fp (x29)
+        ctx.regs[29] = ss_u64
+            .read_at_offset((SS_FP / 8) as isize)
+            .expect("sigreturn: read fp") as usize;
+        // lr (x30)
+        ctx.regs[30] = ss_u64
+            .read_at_offset((SS_LR / 8) as isize)
+            .expect("sigreturn: read lr") as usize;
+        // sp
+        ctx.sp = ss_u64
+            .read_at_offset((SS_SP / 8) as isize)
+            .expect("sigreturn: read sp") as usize;
+        // pc
+        ctx.pc = ss_u64
+            .read_at_offset((SS_PC / 8) as isize)
+            .expect("sigreturn: read pc") as usize;
+        // cpsr → pstate
+        let cpsr_ptr: ConstPtr<u32> = ConstPtr::from_usize(ss_addr + SS_CPSR);
+        ctx.pstate = cpsr_ptr.read_at_offset(0).expect("sigreturn: read cpsr") as usize;
+    }
 }

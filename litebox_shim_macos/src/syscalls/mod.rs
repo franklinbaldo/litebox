@@ -177,8 +177,7 @@ impl<FS: ShimFS> Task<FS> {
                 arg3,
             } => self.sys_bsdthread_ctl(cmd, arg1, arg2, arg3),
             MacosSyscallRequest::Sigreturn { .. } => {
-                log_unsupported!("sigreturn not yet implemented");
-                Err(Errno::ENOSYS)
+                unreachable!("Sigreturn is handled in handle_syscall_request before do_syscall")
             }
         }
     }

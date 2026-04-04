@@ -929,6 +929,16 @@ impl<FS: ShimFS> Task<FS> {
             }
         }
         let request = litebox_common_macos::syscall::MacosSyscallRequest::try_from_raw(ctx);
+
+        // Sigreturn restores the full register set (including pstate) and must
+        // NOT be followed by set_syscall_return, which would overwrite x0 and
+        // the carry flag.
+        if let litebox_common_macos::syscall::MacosSyscallRequest::Sigreturn { uctx, .. } = &request
+        {
+            self.sys_sigreturn(ctx, *uctx);
+            return;
+        }
+
         let result = self.do_syscall(request, ctx);
         litebox_common_macos::syscall::set_syscall_return(ctx, result);
     }
