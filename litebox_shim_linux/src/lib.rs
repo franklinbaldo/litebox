@@ -209,6 +209,7 @@ impl LinuxShimBuilder {
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
             elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+            epoll_graph_lock: litebox::sync::Mutex::new(()),
         });
         LinuxShim(global)
     }
@@ -1073,6 +1074,9 @@ struct GlobalState<FS: ShimFS> {
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<FS>>,
     /// Per-process collection of ELF patching state for runtime syscall rewriting.
     elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
+    /// Serializes epoll graph mutations (add/remove nested epoll entries) to prevent
+    /// TOCTOU races in cycle detection and parent tracking.
+    epoll_graph_lock: litebox::sync::Mutex<Platform, ()>,
 }
 
 struct Task<FS: ShimFS> {

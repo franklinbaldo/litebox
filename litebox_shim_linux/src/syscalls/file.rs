@@ -1630,7 +1630,8 @@ impl<FS: ShimFS> Task<FS> {
             .read()
             .fd_from_raw_integer::<super::epoll::EpollSubsystem<FS>>(epfd as usize)
             .map_err(|_| Errno::EBADF)?;
-        let file_descriptor = super::epoll::EpollDescriptor::try_from(&files, fd as usize)?;
+        let file_descriptor =
+            super::epoll::EpollDescriptor::try_from(&self.global, &files, fd as usize)?;
 
         let event = if op == litebox_common_linux::EpollOp::EpollCtlDel {
             None
@@ -1643,7 +1644,9 @@ impl<FS: ShimFS> Task<FS> {
             .descriptor_table()
             .entry_handle(&epoll_fd)
             .ok_or(Errno::EBADF)?;
-        handle.with_entry(|entry| entry.epoll_ctl(&self.global, op, fd, &file_descriptor, event))
+        handle.with_entry(|entry| {
+            entry.epoll_ctl(&self.global, &files.fs, op, fd, &file_descriptor, event)
+        })
     }
 
     /// Handle syscall `epoll_pwait`
@@ -1711,6 +1714,7 @@ impl<FS: ShimFS> Task<FS> {
         handle.with_entry(|epoll_file| {
             match epoll_file.wait(
                 &self.global,
+                &self.files.borrow().fs,
                 &self.wait_cx().with_timeout(timeout),
                 maxevents,
             ) {

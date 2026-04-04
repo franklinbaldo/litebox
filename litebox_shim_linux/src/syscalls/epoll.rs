@@ -15,7 +15,8 @@ use litebox::{
         polling::{Pollee, TryOpError},
         wait::{WaitContext, WaitError, Waker},
     },
-    fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
+    fd::{EntryHandle, FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd, WeakEntryHandle},
+    fs::OFlags,
     utils::ReinterpretUnsignedExt,
 };
 use litebox_common_linux::{EpollEvent, EpollOp, errno::Errno};
@@ -41,9 +42,11 @@ bitflags::bitflags! {
     }
 }
 
+const MAX_NESTED_EPOLL_DEPTH: usize = 5;
+
 pub(crate) enum EpollDescriptor<FS: ShimFS> {
     Eventfd(Arc<TypedFd<super::eventfd::EventfdSubsystem>>),
-    Epoll(Arc<TypedFd<super::epoll::EpollSubsystem<FS>>>),
+    Epoll(EntryHandle<Platform, super::epoll::EpollSubsystem<FS>>),
     File(Arc<crate::FileFd<FS>>),
     Socket(Arc<super::net::SocketFd>),
     Pipe(Arc<litebox::pipes::PipeFd<Platform>>),
@@ -51,33 +54,66 @@ pub(crate) enum EpollDescriptor<FS: ShimFS> {
 }
 
 impl<FS: ShimFS> EpollDescriptor<FS> {
-    pub fn try_from(files: &FilesState<FS>, raw_fd: usize) -> Result<Self, Errno> {
-        let rds = files.raw_descriptor_store.read();
-        if let Ok(fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
-            return Ok(EpollDescriptor::File(fd));
+    pub fn try_from(
+        global: &GlobalState<FS>,
+        files: &FilesState<FS>,
+        raw_fd: usize,
+    ) -> Result<Self, Errno> {
+        enum ResolvedFd<FS: ShimFS> {
+            File(Arc<crate::FileFd<FS>>),
+            Socket(Arc<super::net::SocketFd>),
+            Pipe(Arc<litebox::pipes::PipeFd<Platform>>),
+            Eventfd(Arc<TypedFd<super::eventfd::EventfdSubsystem>>),
+            Epoll(Arc<TypedFd<EpollSubsystem<FS>>>),
+            Unix(Arc<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<FS>>>),
         }
-        if let Ok(fd) = rds.fd_from_raw_integer::<crate::Network<Platform>>(raw_fd) {
-            return Ok(EpollDescriptor::Socket(fd));
-        }
-        if let Ok(fd) = rds.fd_from_raw_integer::<litebox::pipes::Pipes<Platform>>(raw_fd) {
-            return Ok(EpollDescriptor::Pipe(fd));
-        }
-        if let Ok(fd) = rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd) {
-            return Ok(EpollDescriptor::Eventfd(fd));
-        }
-        if let Ok(fd) = rds.fd_from_raw_integer::<EpollSubsystem<FS>>(raw_fd) {
-            return Ok(EpollDescriptor::Epoll(fd));
-        }
-        if let Ok(fd) = rds.fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd) {
-            return Ok(EpollDescriptor::Unix(fd));
-        }
-        Err(Errno::EBADF)
+
+        let resolved = {
+            let rds = files.raw_descriptor_store.read();
+            if let Ok(fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
+                ResolvedFd::File(fd)
+            } else if let Ok(fd) = rds.fd_from_raw_integer::<crate::Network<Platform>>(raw_fd) {
+                ResolvedFd::Socket(fd)
+            } else if let Ok(fd) =
+                rds.fd_from_raw_integer::<litebox::pipes::Pipes<Platform>>(raw_fd)
+            {
+                ResolvedFd::Pipe(fd)
+            } else if let Ok(fd) =
+                rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
+            {
+                ResolvedFd::Eventfd(fd)
+            } else if let Ok(fd) = rds.fd_from_raw_integer::<EpollSubsystem<FS>>(raw_fd) {
+                ResolvedFd::Epoll(fd)
+            } else if let Ok(fd) =
+                rds.fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd)
+            {
+                ResolvedFd::Unix(fd)
+            } else {
+                return Err(Errno::EBADF);
+            }
+        };
+
+        Ok(match resolved {
+            ResolvedFd::File(fd) => EpollDescriptor::File(fd),
+            ResolvedFd::Socket(fd) => EpollDescriptor::Socket(fd),
+            ResolvedFd::Pipe(fd) => EpollDescriptor::Pipe(fd),
+            ResolvedFd::Eventfd(fd) => EpollDescriptor::Eventfd(fd),
+            ResolvedFd::Epoll(fd) => {
+                let handle = global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(&fd)
+                    .ok_or(Errno::EBADF)?;
+                EpollDescriptor::Epoll(handle)
+            }
+            ResolvedFd::Unix(fd) => EpollDescriptor::Unix(fd),
+        })
     }
 }
 
 enum DescriptorRef<FS: ShimFS> {
     Eventfd(Weak<TypedFd<super::eventfd::EventfdSubsystem>>),
-    Epoll(Weak<TypedFd<super::epoll::EpollSubsystem<FS>>>),
+    Epoll(WeakEntryHandle<Platform, super::epoll::EpollSubsystem<FS>>),
     File(Weak<crate::FileFd<FS>>),
     Socket(Weak<super::net::SocketFd>),
     Pipe(Weak<litebox::pipes::PipeFd<Platform>>),
@@ -88,7 +124,7 @@ impl<FS: ShimFS> DescriptorRef<FS> {
     fn from(value: &EpollDescriptor<FS>) -> Self {
         match value {
             EpollDescriptor::Eventfd(file) => Self::Eventfd(Arc::downgrade(file)),
-            EpollDescriptor::Epoll(file) => Self::Epoll(Arc::downgrade(file)),
+            EpollDescriptor::Epoll(file) => Self::Epoll(file.downgrade()),
             EpollDescriptor::File(file) => Self::File(Arc::downgrade(file)),
             EpollDescriptor::Socket(socket) => Self::Socket(Arc::downgrade(socket)),
             EpollDescriptor::Pipe(pipe) => Self::Pipe(Arc::downgrade(pipe)),
@@ -114,11 +150,12 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
     fn poll(
         &self,
         global: &GlobalState<FS>,
+        fs: &FS,
         mask: Events,
         observer: Option<Weak<dyn Observer<Events>>>,
     ) -> Option<Events> {
         let poll = |iop: &dyn IOPollable| {
-            if let Some(observer) = observer {
+            if let Some(observer) = observer.clone() {
                 iop.register_observer(observer, mask);
             }
             iop.check_io_events() & (mask | Events::ALWAYS_POLLED)
@@ -128,9 +165,20 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
                 Some(handle.with_entry(|entry| poll(entry)))
             }
-            EpollDescriptor::Epoll(_file) => unimplemented!(),
-            EpollDescriptor::File(_file) => {
-                // TODO: probably polling on stdio files, return dummy events for now
+            EpollDescriptor::Epoll(handle) => Some(handle.with_entry(|entry| {
+                if let Some(observer) = observer {
+                    entry.register_observer(observer, mask);
+                }
+                entry.rescan_interests(global, fs);
+                entry.check_io_events() & (mask | Events::ALWAYS_POLLED)
+            })),
+            EpollDescriptor::File(file) => {
+                // Check if the file supports async I/O polling (e.g., PTY master).
+                if let Some(io_poll) = fs.get_io_pollable(file) {
+                    let events = poll(&*io_poll);
+                    return Some(events);
+                }
+                // Regular files: return dummy OUT events.
                 Some(Events::OUT & mask)
             }
             EpollDescriptor::Socket(fd) => {
@@ -150,6 +198,27 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
             }
         }
     }
+
+    /// Returns `true` if this descriptor requires periodic host polling
+    /// rather than observer-based notifications.
+    fn needs_host_poll(&self, global: &GlobalState<FS>, fs: &FS) -> bool {
+        match self {
+            EpollDescriptor::Eventfd(fd) => global
+                .litebox
+                .descriptor_table()
+                .entry_handle(fd)
+                .is_some_and(|handle| {
+                    handle.with_entry(super::eventfd::EventFile::needs_host_poll)
+                }),
+            EpollDescriptor::Epoll(handle) => {
+                handle.with_entry(|entry| entry.compute_needs_host_poll(global, fs))
+            }
+            EpollDescriptor::File(file) => fs
+                .get_io_pollable(file)
+                .is_some_and(|p| p.needs_host_poll()),
+            _ => false,
+        }
+    }
 }
 
 pub(crate) struct EpollFile<FS: ShimFS> {
@@ -157,58 +226,297 @@ pub(crate) struct EpollFile<FS: ShimFS> {
         litebox_platform_multiplex::Platform,
         BTreeMap<EpollEntryKey, alloc::sync::Arc<EpollEntry<FS>>>,
     >,
+    parents: litebox::sync::Mutex<
+        litebox_platform_multiplex::Platform,
+        Vec<WeakEntryHandle<Platform, super::epoll::EpollSubsystem<FS>>>,
+    >,
     ready: Arc<ReadySet<FS>>,
     status: core::sync::atomic::AtomicU32,
+    /// Set when the interest set contains descriptors that cannot register
+    /// observers (e.g. host stdin). When true, `wait()` uses a capped timeout
+    /// so it periodically re-polls these descriptors.
+    needs_host_poll: core::sync::atomic::AtomicBool,
 }
 
 impl<FS: ShimFS> EpollFile<FS> {
     pub(crate) fn new() -> Self {
         EpollFile {
             interests: litebox::sync::Mutex::new(BTreeMap::new()),
+            parents: litebox::sync::Mutex::new(Vec::new()),
             ready: Arc::new(ReadySet::new()),
-            status: core::sync::atomic::AtomicU32::new(0),
+            status: core::sync::atomic::AtomicU32::new(OFlags::RDWR.bits()),
+            needs_host_poll: core::sync::atomic::AtomicBool::new(false),
         }
     }
 
     pub(crate) fn wait(
         &self,
         global: &GlobalState<FS>,
+        fs: &FS,
         cx: &WaitContext<'_, Platform>,
         maxevents: usize,
     ) -> Result<Vec<EpollEvent>, WaitError> {
+        enum WaitOutcome {
+            Ready,
+            RecheckMode,
+        }
+
         let mut events = Vec::new();
-        match self.ready.pollee.wait(cx, false, Events::IN, || {
-            self.ready.pop_multiple(global, maxevents, &mut events);
-            if events.is_empty() {
-                return Err(TryOpError::<Infallible>::TryAgain);
+        loop {
+            if self.compute_needs_host_poll(global, fs) {
+                // At least one descriptor requires periodic host polling (e.g.
+                // stdin). Re-scan all interests with a short timeout to detect
+                // host-side readiness changes, but also wait on the ready set so
+                // observer-driven wakeups (e.g. eventfd) are not delayed until the
+                // next poll tick.
+                const POLL_INTERVAL: core::time::Duration = core::time::Duration::from_millis(50);
+                loop {
+                    // Re-poll every interest — this calls check_io_events()
+                    // which queries the host for poll-only descriptors.
+                    self.rescan_interests(global, fs);
+
+                    self.ready.pop_multiple(global, fs, maxevents, &mut events);
+                    if !events.is_empty() {
+                        return Ok(events);
+                    }
+
+                    // Check if the caller's deadline has already passed.
+                    if let Some(remaining) = cx.remaining_timeout() {
+                        if remaining.is_zero() {
+                            return Err(WaitError::TimedOut);
+                        }
+                    } else if cx.deadline().is_some() {
+                        // Deadline was set but remaining_timeout() returned None →
+                        // deadline has passed.
+                        return Err(WaitError::TimedOut);
+                    }
+
+                    // Sleep up to POLL_INTERVAL or until an observer fires or
+                    // the caller's deadline arrives, whichever is sooner.
+                    let poll_cx = cx.with_timeout(Some(POLL_INTERVAL));
+                    match self.ready.pollee.wait(&poll_cx, false, Events::IN, || {
+                        self.ready.pop_multiple(global, fs, maxevents, &mut events);
+                        if events.is_empty() {
+                            return Err(TryOpError::<Infallible>::TryAgain);
+                        }
+                        Ok(())
+                    }) {
+                        Ok(()) => return Ok(events),
+                        Err(TryOpError::TryAgain) => unreachable!(),
+                        Err(TryOpError::WaitError(WaitError::TimedOut)) => {
+                            // If the caller's deadline has passed, propagate.
+                            if cx
+                                .deadline()
+                                .is_some_and(|_| cx.remaining_timeout().is_none())
+                            {
+                                return Err(WaitError::TimedOut);
+                            }
+                            // Otherwise it was just our poll interval — continue.
+                        }
+                        Err(TryOpError::WaitError(WaitError::Interrupted)) => {
+                            return Err(WaitError::Interrupted);
+                        }
+                        Err(TryOpError::Other(infallible)) => match infallible {},
+                    }
+                }
+            } else {
+                match self.ready.pollee.wait(cx, false, Events::IN, || {
+                    self.ready.pop_multiple(global, fs, maxevents, &mut events);
+                    if !events.is_empty() {
+                        return Ok(WaitOutcome::Ready);
+                    }
+                    if self.compute_needs_host_poll(global, fs) {
+                        return Ok(WaitOutcome::RecheckMode);
+                    }
+                    Err(TryOpError::<Infallible>::TryAgain)
+                }) {
+                    Ok(WaitOutcome::Ready) => return Ok(events),
+                    Ok(WaitOutcome::RecheckMode) => {}
+                    Err(TryOpError::TryAgain) => unreachable!(),
+                    Err(TryOpError::WaitError(e)) => return Err(e),
+                    Err(TryOpError::Other(infallible)) => match infallible {},
+                }
             }
-            Ok(())
-        }) {
-            Ok(()) => Ok(events),
-            Err(TryOpError::TryAgain) => unreachable!(),
-            Err(TryOpError::WaitError(e)) => Err(e),
+        }
+    }
+
+    /// Re-scan all interests and push any that are ready to the ready set.
+    fn rescan_interests(&self, global: &GlobalState<FS>, fs: &FS) {
+        let entries = {
+            let interests = self.interests.lock();
+            interests.values().cloned().collect::<Vec<_>>()
+        };
+        for entry in entries {
+            if entry.is_ready.load(core::sync::atomic::Ordering::Relaxed) {
+                continue; // already in the ready set
+            }
+            if let Some((Some(_event), _)) = entry.poll(global, fs, false) {
+                self.ready.push(&entry);
+            }
+        }
+    }
+
+    fn register_observer(&self, observer: Weak<dyn Observer<Events>>, mask: Events) {
+        self.ready.pollee.register_observer(observer, mask);
+    }
+
+    fn check_io_events(&self) -> Events {
+        if self.ready.has_ready_entries() {
+            Events::IN
+        } else {
+            Events::empty()
+        }
+    }
+
+    fn compute_needs_host_poll(&self, global: &GlobalState<FS>, fs: &FS) -> bool {
+        if self.requires_host_poll() {
+            return true;
+        }
+        let interests = self.interests.lock();
+        interests.values().any(|entry| {
+            entry
+                .desc
+                .upgrade()
+                .is_some_and(|file| file.needs_host_poll(global, fs))
+        })
+    }
+
+    fn requires_host_poll(&self) -> bool {
+        self.needs_host_poll
+            .load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn directly_contains_epoll(&self, _global: &GlobalState<FS>, target: *const Self) -> bool {
+        let interests = self.interests.lock();
+        interests.values().any(|entry| {
+            let Some(EpollDescriptor::Epoll(epoll)) = entry.desc.upgrade() else {
+                return false;
+            };
+            epoll.with_entry(|nested| core::ptr::eq(nested, target))
+        })
+    }
+
+    #[allow(clippy::only_used_in_recursion)]
+    fn contains_epoll(&self, global: &GlobalState<FS>, target: *const Self) -> bool {
+        if core::ptr::eq(self, target) {
+            return true;
+        }
+        let interests = self.interests.lock();
+        for entry in interests.values() {
+            let Some(EpollDescriptor::Epoll(epoll)) = entry.desc.upgrade() else {
+                continue;
+            };
+            if epoll.with_entry(|nested| nested.contains_epoll(global, target)) {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[allow(clippy::only_used_in_recursion)]
+    fn max_descendant_epoll_depth(&self, global: &GlobalState<FS>) -> usize {
+        let interests = self.interests.lock();
+        let mut max_depth = 1;
+        for entry in interests.values() {
+            let Some(EpollDescriptor::Epoll(epoll)) = entry.desc.upgrade() else {
+                continue;
+            };
+            let depth = epoll.with_entry(|nested| nested.max_descendant_epoll_depth(global));
+            max_depth = max_depth.max(1 + depth);
+        }
+        max_depth
+    }
+
+    fn max_ancestor_epoll_depth(&self, global: &GlobalState<FS>) -> usize {
+        let parents = self.parents.lock().clone();
+        let self_ptr: *const _ = self;
+        let mut max_depth = 1;
+        for handle in parents {
+            let Some(handle) = handle.upgrade() else {
+                continue;
+            };
+            let depth = handle.with_entry(|candidate| {
+                if core::ptr::eq(candidate, self)
+                    || !candidate.directly_contains_epoll(global, self_ptr)
+                {
+                    return 0;
+                }
+                candidate.max_ancestor_epoll_depth(global) + 1
+            });
+            max_depth = max_depth.max(depth);
+        }
+        max_depth
+    }
+
+    fn find_entry_handle(
+        &self,
+        global: &GlobalState<FS>,
+    ) -> Option<EntryHandle<Platform, super::epoll::EpollSubsystem<FS>>> {
+        global
+            .litebox
+            .descriptor_table()
+            .entry_handles::<super::epoll::EpollSubsystem<FS>>()
+            .find(|handle| handle.with_entry(|candidate| core::ptr::eq(candidate, self)))
+    }
+
+    fn add_parent(&self, parent: &EntryHandle<Platform, super::epoll::EpollSubsystem<FS>>) {
+        self.parents.lock().push(parent.downgrade());
+    }
+
+    fn remove_parent_by_id(&self, parent_id: usize) {
+        let mut parents = self.parents.lock();
+        if let Some(idx) = parents
+            .iter()
+            .position(|weak| weak.identity_addr() == parent_id)
+        {
+            parents.remove(idx);
+        }
+    }
+
+    #[allow(dead_code)] // called by close() logic added in a later PR
+    pub(crate) fn detach_nested_children_by_parent_id(&self, parent_id: usize) {
+        let entries = {
+            let interests = self.interests.lock();
+            interests.values().cloned().collect::<Vec<_>>()
+        };
+        for entry in entries {
+            let Some(EpollDescriptor::Epoll(child)) = entry.desc.upgrade() else {
+                continue;
+            };
+            child.with_entry(|nested| nested.remove_parent_by_id(parent_id));
         }
     }
 
     pub(crate) fn epoll_ctl(
         &self,
         global: &GlobalState<FS>,
+        fs: &FS,
         op: EpollOp,
         fd: u32,
         file: &EpollDescriptor<FS>,
         event: Option<EpollEvent>,
     ) -> Result<(), Errno> {
         match op {
-            EpollOp::EpollCtlAdd => self.add_interest(global, fd, file, event.unwrap()),
-            EpollOp::EpollCtlMod => {
-                log_unsupported!("epoll_ctl mod");
-                Err(Errno::EINVAL)
-            }
+            EpollOp::EpollCtlAdd => self.add_interest(global, fs, fd, file, event.unwrap()),
+            EpollOp::EpollCtlMod => self.mod_interest(global, fs, fd, file, event.unwrap()),
             EpollOp::EpollCtlDel => {
+                let _epoll_graph_guard = matches!(file, EpollDescriptor::Epoll(_))
+                    .then(|| global.epoll_graph_lock.lock());
+                let parent_handle = matches!(file, EpollDescriptor::Epoll(_))
+                    .then(|| self.find_entry_handle(global))
+                    .flatten();
                 let mut interests = self.interests.lock();
-                let _ = interests
+                let removed = interests
                     .remove(&EpollEntryKey::new(fd, file))
                     .ok_or(Errno::ENOENT)?;
+                drop(interests);
+                if let (Some(parent_handle), Some(EpollDescriptor::Epoll(child))) =
+                    (parent_handle.as_ref(), removed.desc.upgrade())
+                {
+                    child.with_entry(|entry| {
+                        entry.remove_parent_by_id(parent_handle.identity_addr());
+                    });
+                }
                 Ok(())
             }
         }
@@ -217,10 +525,37 @@ impl<FS: ShimFS> EpollFile<FS> {
     fn add_interest(
         &self,
         global: &GlobalState<FS>,
+        fs: &FS,
         fd: u32,
         file: &EpollDescriptor<FS>,
         event: EpollEvent,
     ) -> Result<(), Errno> {
+        let _epoll_graph_guard =
+            matches!(file, EpollDescriptor::Epoll(_)).then(|| global.epoll_graph_lock.lock());
+        let parent_handle = matches!(file, EpollDescriptor::Epoll(_))
+            .then(|| self.find_entry_handle(global))
+            .flatten();
+        let flags = EpollFlags::from_bits_truncate(event.events);
+        if let EpollDescriptor::Epoll(epoll) = file {
+            if flags.contains(EpollFlags::EXCLUSIVE) {
+                return Err(Errno::EINVAL);
+            }
+            epoll.with_entry(|entry| {
+                if core::ptr::eq(entry, self) {
+                    return Err(Errno::EINVAL);
+                }
+                if entry.contains_epoll(global, core::ptr::from_ref(self)) {
+                    return Err(Errno::ELOOP);
+                }
+                let new_depth = self.max_ancestor_epoll_depth(global)
+                    + entry.max_descendant_epoll_depth(global);
+                if new_depth > MAX_NESTED_EPOLL_DEPTH {
+                    return Err(Errno::ELOOP);
+                }
+                Ok(())
+            })?;
+        }
+
         let mut interests = self.interests.lock();
         let key = EpollEntryKey::new(fd, file);
         if let Some(entry) = interests.get(&key)
@@ -235,25 +570,37 @@ impl<FS: ShimFS> EpollFile<FS> {
         let entry = EpollEntry::new(
             DescriptorRef::from(file),
             mask,
-            EpollFlags::from_bits_truncate(event.events),
+            flags,
             event.data,
             self.ready.clone(),
         );
         let events = file
-            .poll(global, mask, Some(entry.weak_self.clone() as _))
+            .poll(global, fs, mask, Some(entry.weak_self.clone() as _))
             .ok_or(Errno::EBADF)?;
         // Add the new entry to the ready list if the file is ready
         if !events.is_empty() {
             self.ready.push(&entry);
         }
+        if file.needs_host_poll(global, fs)
+            && !self
+                .needs_host_poll
+                .swap(true, core::sync::atomic::Ordering::Relaxed)
+        {
+            self.ready.pollee.notify_observers(Events::IN);
+        }
         interests.insert(key, entry);
+        drop(interests);
+        if let (Some(parent_handle), EpollDescriptor::Epoll(child)) = (parent_handle.as_ref(), file)
+        {
+            child.with_entry(|entry| entry.add_parent(parent_handle));
+        }
         Ok(())
     }
 
-    #[expect(dead_code, reason = "currently unused, but might want to use soon")]
     fn mod_interest(
         &self,
         global: &GlobalState<FS>,
+        fs: &FS,
         fd: u32,
         file: &EpollDescriptor<FS>,
         event: EpollEvent,
@@ -292,7 +639,7 @@ impl<FS: ShimFS> EpollFile<FS> {
         drop(inner);
 
         // re-register the observer with the new mask
-        if let Some(events) = file.poll(global, mask, Some(observer as _)) {
+        if let Some(events) = file.poll(global, fs, mask, Some(observer as _)) {
             if !events.is_empty() {
                 // Add the updated entry to the ready list if the file is ready
                 self.ready.push(entry);
@@ -313,15 +660,15 @@ impl<FS: ShimFS> EpollFile<FS> {
 struct EpollEntryKey(u32, usize);
 impl EpollEntryKey {
     fn new<FS: ShimFS>(fd: u32, desc: &EpollDescriptor<FS>) -> Self {
-        let ptr = match desc {
+        let identity = match desc {
             EpollDescriptor::Eventfd(file) => Arc::as_ptr(file).addr(),
-            EpollDescriptor::Epoll(file) => Arc::as_ptr(file).addr(),
+            EpollDescriptor::Epoll(file) => file.identity_addr(),
             EpollDescriptor::File(file) => Arc::as_ptr(file).addr(),
             EpollDescriptor::Socket(socket_fd) => Arc::as_ptr(socket_fd).addr(),
             EpollDescriptor::Pipe(pipe_fd) => Arc::as_ptr(pipe_fd).addr(),
             EpollDescriptor::Unix(unix) => Arc::as_ptr(unix).addr(),
         };
-        Self(fd, ptr)
+        Self(fd, identity)
     }
 }
 
@@ -358,7 +705,25 @@ impl<FS: ShimFS> EpollEntry<FS> {
         })
     }
 
-    fn poll(&self, global: &GlobalState<FS>) -> Option<(Option<EpollEvent>, bool)> {
+    /// Poll the entry for events.
+    ///
+    /// When `disable_oneshot` is true (used by `pop_multiple()` during event
+    /// delivery), ONESHOT entries are disabled atomically under the `inner` lock
+    /// before returning. This prevents both:
+    /// - Double-delivery: another `pop_multiple()` thread cannot see the entry
+    ///   as enabled between poll and disable.
+    /// - MOD clobber: `mod_interest()` also operates under `inner`, so a
+    ///   concurrent re-arm either completes before poll (and the disable
+    ///   correctly fires for this delivery) or after (re-enabling the entry).
+    ///
+    /// When `disable_oneshot` is false (used by `rescan_interests()`), ONESHOT
+    /// entries remain enabled so `push()` can add them to the ready set.
+    fn poll(
+        &self,
+        global: &GlobalState<FS>,
+        fs: &FS,
+        disable_oneshot: bool,
+    ) -> Option<(Option<EpollEvent>, bool)> {
         let file = self.desc.upgrade()?;
         let inner = self.inner.lock();
 
@@ -367,7 +732,7 @@ impl<FS: ShimFS> EpollEntry<FS> {
             return None;
         }
 
-        let events = file.poll(global, inner.mask, None)?;
+        let events = file.poll(global, fs, inner.mask, None)?;
         if events.is_empty() {
             Some((None, false))
         } else {
@@ -382,8 +747,11 @@ impl<FS: ShimFS> EpollEntry<FS> {
                     .flags
                     .intersects(EpollFlags::EDGE_TRIGGER | EpollFlags::ONE_SHOT);
 
-            // disable the entry if it is one-shot
-            if inner.flags.contains(EpollFlags::ONE_SHOT) {
+            // Disable ONESHOT entries atomically under the inner lock when
+            // delivering events (pop_multiple path). This is NOT done in the
+            // rescan_interests path — disabling here would cause push() to
+            // reject the entry, silently dropping the event.
+            if disable_oneshot && inner.flags.contains(EpollFlags::ONE_SHOT) {
                 self.is_enabled
                     .store(false, core::sync::atomic::Ordering::Relaxed);
             }
@@ -432,9 +800,19 @@ impl<FS: ShimFS> ReadySet<FS> {
         self.pollee.notify_observers(Events::IN);
     }
 
+    fn has_ready_entries(&self) -> bool {
+        self.entries.lock().iter().any(|weak_entry| {
+            weak_entry.upgrade().is_some_and(|entry| {
+                entry.is_enabled.load(core::sync::atomic::Ordering::Relaxed)
+                    && entry.is_ready.load(core::sync::atomic::Ordering::Relaxed)
+            })
+        })
+    }
+
     fn pop_multiple(
         &self,
         global: &GlobalState<FS>,
+        fs: &FS,
         maxevents: usize,
         events: &mut Vec<EpollEvent>,
     ) {
@@ -461,13 +839,16 @@ impl<FS: ShimFS> ReadySet<FS> {
                 .is_ready
                 .store(false, core::sync::atomic::Ordering::Relaxed);
 
-            let Some((event, is_still_ready)) = entry.poll(global) else {
+            let Some((event, is_still_ready)) = entry.poll(global, fs, true) else {
                 // the entry is disabled or the associated file is closed
                 continue;
             };
 
             if let Some(event) = event {
                 events.push(event);
+                // ONESHOT disable already happened atomically inside poll()
+                // under the inner lock, preventing both MOD-clobber races and
+                // double-delivery by concurrent pop_multiple() threads.
             }
 
             if is_still_ready {
@@ -530,9 +911,11 @@ impl PollSet {
         for entry in &mut self.entries {
             entry.revents = if entry.fd < 0 {
                 continue;
-            } else if let Ok(poll_descriptor) =
-                EpollDescriptor::try_from(files, entry.fd.reinterpret_as_unsigned() as usize)
-            {
+            } else if let Ok(poll_descriptor) = EpollDescriptor::try_from(
+                global,
+                files,
+                entry.fd.reinterpret_as_unsigned() as usize,
+            ) {
                 let observer = if !is_ready && let Some(waker) = waker {
                     // TODO: a separate allocation is necessary here
                     // because registering an observer twice with two
@@ -552,7 +935,7 @@ impl PollSet {
                 };
                 // TODO: add machinery to unregister the observer to avoid leaks.
                 poll_descriptor
-                    .poll(global, entry.mask, observer)
+                    .poll(global, &*files.fs, entry.mask, observer)
                     .unwrap_or(Events::NVAL)
             } else {
                 Events::NVAL
@@ -580,15 +963,59 @@ impl PollSet {
             return Ok(());
         }
 
-        let mut register = true;
-        cx.wait_until(|| {
-            if self.scan_once(global, files, register.then_some(cx.waker())) {
+        // Check if any entry needs host polling (e.g. stdin).
+        let needs_host_poll = self.has_host_poll_fds(global, files);
+
+        if needs_host_poll {
+            const POLL_INTERVAL: core::time::Duration = core::time::Duration::from_millis(50);
+            loop {
+                if self.scan_once(global, files, None) {
+                    return Ok(());
+                }
+                let poll_cx = cx.with_timeout(Some(POLL_INTERVAL));
+                match poll_cx.sleep() {
+                    WaitError::TimedOut => {
+                        if cx
+                            .deadline()
+                            .is_some_and(|_| cx.remaining_timeout().is_none())
+                        {
+                            return Err(WaitError::TimedOut);
+                        }
+                    }
+                    WaitError::Interrupted => return Err(WaitError::Interrupted),
+                }
+            }
+        } else {
+            let mut register = true;
+            cx.wait_until(|| {
+                if self.scan_once(global, files, register.then_some(cx.waker())) {
+                    return true;
+                }
+                // Don't register observers again in the next iteration.
+                register = false;
+                false
+            })
+        }
+    }
+
+    /// Returns true if any entry in the poll set requires host polling.
+    fn has_host_poll_fds<FS: ShimFS>(
+        &self,
+        global: &GlobalState<FS>,
+        files: &FilesState<FS>,
+    ) -> bool {
+        for entry in &self.entries {
+            if entry.fd < 0 {
+                continue;
+            }
+            let raw_fd = entry.fd.reinterpret_as_unsigned() as usize;
+            if let Ok(poll_descriptor) = EpollDescriptor::try_from(global, files, raw_fd)
+                && poll_descriptor.needs_host_poll(global, &*files.fs)
+            {
                 return true;
             }
-            // Don't register observers again in the next iteration.
-            register = false;
-            false
-        })
+        }
+        false
     }
 
     /// Returns the accumulated `revents` for each entry in the poll set.
@@ -614,10 +1041,16 @@ impl Observer<Events> for PollEntryObserver {
 
 #[cfg(test)]
 mod test {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::time::Duration;
+
     use alloc::sync::Arc;
     use litebox::event::Events;
     use litebox::event::wait::WaitState;
-    use litebox_common_linux::{EfdFlags, EpollEvent};
+    use litebox::platform::TimeProvider as _;
+    use litebox_common_linux::{
+        ClockId, EfdFlags, EpollEvent, ItimerSpec, TimerfdFlags, TimerfdTimerFlags,
+    };
     use litebox_platform_multiplex::platform;
 
     use super::EpollFile;
@@ -625,16 +1058,20 @@ mod test {
 
     extern crate std;
 
-    fn setup_epoll() -> (crate::Task<crate::DefaultFS>, EpollFile<crate::DefaultFS>) {
+    fn setup_epoll() -> (
+        crate::Task<crate::DefaultFS>,
+        EpollFile<crate::DefaultFS>,
+        alloc::sync::Arc<crate::DefaultFS>,
+    ) {
         let task = crate::syscalls::tests::init_platform(None);
-
+        let fs = task.files.borrow().fs.clone();
         let epoll = EpollFile::new();
-        (task, epoll)
+        (task, epoll, fs)
     }
 
     #[test]
     fn test_epoll_with_eventfd() {
-        let (task, epoll) = setup_epoll();
+        let (task, epoll, fs) = setup_epoll();
         let eventfd = crate::syscalls::eventfd::EventFile::new(0, EfdFlags::CLOEXEC);
         let typed = task
             .global
@@ -645,10 +1082,11 @@ mod test {
         let Ok(raw_fd) = files.insert_raw_fd(typed) else {
             unreachable!()
         };
-        let descriptor = super::EpollDescriptor::try_from(&files, raw_fd).unwrap();
+        let descriptor = super::EpollDescriptor::try_from(&task.global, &files, raw_fd).unwrap();
         epoll
             .add_interest(
                 &task.global,
+                &*fs,
                 10,
                 &descriptor,
                 EpollEvent {
@@ -677,13 +1115,459 @@ mod test {
             });
         }
         epoll
-            .wait(&task.global, &WaitState::new(platform()).context(), 1024)
+            .wait(
+                &task.global,
+                &*fs,
+                &WaitState::new(platform()).context(),
+                1024,
+            )
             .unwrap();
     }
 
     #[test]
+    fn test_epoll_with_timerfd() {
+        let (task, epoll, fs) = setup_epoll();
+        let timerfd = crate::syscalls::eventfd::EventFile::new_timer(
+            platform(),
+            platform().now(),
+            ClockId::Monotonic,
+            TimerfdFlags::empty(),
+        );
+        let typed = task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<crate::syscalls::eventfd::EventfdSubsystem>(timerfd);
+        let files = Arc::new(FilesState::new(task.files.borrow().fs.clone()));
+        let Ok(raw_fd) = files.insert_raw_fd(typed) else {
+            unreachable!()
+        };
+        let descriptor = super::EpollDescriptor::try_from(&task.global, &files, raw_fd).unwrap();
+        epoll
+            .add_interest(
+                &task.global,
+                &*fs,
+                11,
+                &descriptor,
+                EpollEvent {
+                    events: Events::IN.bits(),
+                    data: 0,
+                },
+            )
+            .unwrap();
+        task.global
+            .litebox
+            .descriptor_table()
+            .with_entry(
+                &files
+                    .raw_descriptor_store
+                    .read()
+                    .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem>(raw_fd)
+                    .unwrap(),
+                |entry| {
+                    entry.set_timer(
+                        TimerfdTimerFlags::empty(),
+                        ItimerSpec {
+                            interval: Duration::ZERO.into(),
+                            value: Duration::from_millis(1).into(),
+                        },
+                    )
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        let events = epoll
+            .wait(
+                &task.global,
+                &*fs,
+                &WaitState::new(platform()).context(),
+                1024,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn test_nested_epoll_wait_switches_to_host_poll_after_child_update() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let fs = task.files.borrow().fs.clone();
+
+        let outer = super::EpollFile::new();
+        let outer_typed = task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<super::EpollSubsystem<crate::DefaultFS>>(outer);
+        let outer_handle = task
+            .global
+            .litebox
+            .descriptor_table()
+            .entry_handle(&outer_typed)
+            .unwrap();
+
+        let middle = super::EpollFile::new();
+        let middle_typed = task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<super::EpollSubsystem<crate::DefaultFS>>(middle);
+        let middle_handle = task
+            .global
+            .litebox
+            .descriptor_table()
+            .entry_handle(&middle_typed)
+            .unwrap();
+
+        let inner = super::EpollFile::new();
+        let inner_typed = task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<super::EpollSubsystem<crate::DefaultFS>>(inner);
+        let inner_handle = task
+            .global
+            .litebox
+            .descriptor_table()
+            .entry_handle(&inner_typed)
+            .unwrap();
+
+        let files = Arc::new(FilesState::new(task.files.borrow().fs.clone()));
+        let Ok(outer_raw) = files.insert_raw_fd(outer_typed) else {
+            unreachable!()
+        };
+        let Ok(middle_raw) = files.insert_raw_fd(middle_typed) else {
+            unreachable!()
+        };
+        let Ok(inner_raw) = files.insert_raw_fd(inner_typed) else {
+            unreachable!()
+        };
+
+        let middle_desc =
+            super::EpollDescriptor::try_from(&task.global, &files, middle_raw).unwrap();
+        outer_handle
+            .with_entry(|entry| {
+                entry.add_interest(
+                    &task.global,
+                    &*fs,
+                    1,
+                    &middle_desc,
+                    EpollEvent {
+                        events: Events::IN.bits(),
+                        data: 0x1111,
+                    },
+                )
+            })
+            .unwrap();
+
+        let inner_desc = super::EpollDescriptor::try_from(&task.global, &files, inner_raw).unwrap();
+        middle_handle
+            .with_entry(|entry| {
+                entry.add_interest(
+                    &task.global,
+                    &*fs,
+                    2,
+                    &inner_desc,
+                    EpollEvent {
+                        events: Events::IN.bits(),
+                        data: 0x2222,
+                    },
+                )
+            })
+            .unwrap();
+
+        {
+            let global = task.global.clone();
+            let files = Arc::clone(&files);
+            let fs = fs.clone();
+            let inner_handle = inner_handle.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                let timerfd = crate::syscalls::eventfd::EventFile::new_timer(
+                    platform(),
+                    platform().now(),
+                    ClockId::Monotonic,
+                    TimerfdFlags::empty(),
+                );
+                let typed = global
+                    .litebox
+                    .descriptor_table_mut()
+                    .insert::<crate::syscalls::eventfd::EventfdSubsystem>(timerfd);
+                let timer_handle = global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(&typed)
+                    .unwrap();
+                let Ok(timer_raw) = files.insert_raw_fd(typed) else {
+                    unreachable!()
+                };
+                let timer_desc =
+                    super::EpollDescriptor::try_from(&global, &files, timer_raw).unwrap();
+                inner_handle
+                    .with_entry(|entry| {
+                        entry.add_interest(
+                            &global,
+                            &*fs,
+                            3,
+                            &timer_desc,
+                            EpollEvent {
+                                events: Events::IN.bits(),
+                                data: 0x3333,
+                            },
+                        )
+                    })
+                    .unwrap();
+                timer_handle
+                    .with_entry(|entry| {
+                        entry.set_timer(
+                            TimerfdTimerFlags::empty(),
+                            ItimerSpec {
+                                interval: Duration::ZERO.into(),
+                                value: Duration::from_millis(1).into(),
+                            },
+                        )
+                    })
+                    .unwrap();
+            });
+        }
+
+        let wait_state = WaitState::new(platform());
+        let wait_cx = wait_state
+            .context()
+            .with_timeout(Some(Duration::from_secs(1)));
+        let events = outer_handle
+            .with_entry(|entry| entry.wait(&task.global, &*fs, &wait_cx, 4))
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let data = events[0].data;
+        let bits = events[0].events;
+        assert_eq!(data, 0x1111);
+        assert_ne!(bits & Events::IN.bits(), 0);
+
+        let _ = outer_raw;
+    }
+
+    #[test]
+    fn test_epoll_with_eventfd_and_timerfd() {
+        let (task, epoll, fs) = setup_epoll();
+
+        let eventfd = crate::syscalls::eventfd::EventFile::new(0, EfdFlags::CLOEXEC);
+        let eventfd = task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<crate::syscalls::eventfd::EventfdSubsystem>(eventfd);
+
+        let timerfd = crate::syscalls::eventfd::EventFile::new_timer(
+            platform(),
+            platform().now(),
+            ClockId::Monotonic,
+            TimerfdFlags::empty(),
+        );
+        let timerfd = task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<crate::syscalls::eventfd::EventfdSubsystem>(timerfd);
+
+        let files = Arc::new(FilesState::new(task.files.borrow().fs.clone()));
+        let Ok(eventfd_raw) = files.insert_raw_fd(eventfd) else {
+            unreachable!()
+        };
+        let Ok(timerfd_raw) = files.insert_raw_fd(timerfd) else {
+            unreachable!()
+        };
+
+        let eventfd_desc =
+            super::EpollDescriptor::try_from(&task.global, &files, eventfd_raw).unwrap();
+        epoll
+            .add_interest(
+                &task.global,
+                &*fs,
+                12,
+                &eventfd_desc,
+                EpollEvent {
+                    events: Events::IN.bits(),
+                    data: 12,
+                },
+            )
+            .unwrap();
+
+        let timerfd_desc =
+            super::EpollDescriptor::try_from(&task.global, &files, timerfd_raw).unwrap();
+        epoll
+            .add_interest(
+                &task.global,
+                &*fs,
+                13,
+                &timerfd_desc,
+                EpollEvent {
+                    events: Events::IN.bits(),
+                    data: 13,
+                },
+            )
+            .unwrap();
+
+        {
+            let global = task.global.clone();
+            let files = Arc::clone(&files);
+            std::thread::spawn(move || {
+                std::thread::sleep(core::time::Duration::from_millis(10));
+                let typed = files
+                    .raw_descriptor_store
+                    .read()
+                    .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem>(eventfd_raw)
+                    .unwrap();
+                let _ = global
+                    .litebox
+                    .descriptor_table()
+                    .with_entry(&typed, |entry| {
+                        entry.write(&WaitState::new(platform()).context(), 1)
+                    });
+            });
+        }
+
+        let events = epoll
+            .wait(
+                &task.global,
+                &*fs,
+                &WaitState::new(platform())
+                    .context()
+                    .with_timeout(core::time::Duration::from_secs(1)),
+                1024,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        let data = event.data;
+        let events_bits = event.events;
+        assert_eq!(data, 12);
+        assert_eq!(events_bits, Events::IN.bits());
+    }
+
+    #[test]
+    fn test_epoll_with_host_poll_and_spurious_wakes() {
+        let (task, epoll, fs) = setup_epoll();
+
+        let eventfd = crate::syscalls::eventfd::EventFile::new(0, EfdFlags::CLOEXEC);
+        let eventfd = task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<crate::syscalls::eventfd::EventfdSubsystem>(eventfd);
+
+        let timerfd = crate::syscalls::eventfd::EventFile::new_timer(
+            platform(),
+            platform().now(),
+            ClockId::Monotonic,
+            TimerfdFlags::empty(),
+        );
+        let timerfd = task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<crate::syscalls::eventfd::EventfdSubsystem>(timerfd);
+
+        let files = Arc::new(FilesState::new(task.files.borrow().fs.clone()));
+        let Ok(eventfd_raw) = files.insert_raw_fd(eventfd) else {
+            unreachable!()
+        };
+        let Ok(timerfd_raw) = files.insert_raw_fd(timerfd) else {
+            unreachable!()
+        };
+
+        let eventfd_desc =
+            super::EpollDescriptor::try_from(&task.global, &files, eventfd_raw).unwrap();
+        epoll
+            .add_interest(
+                &task.global,
+                &*fs,
+                12,
+                &eventfd_desc,
+                EpollEvent {
+                    events: Events::IN.bits(),
+                    data: 12,
+                },
+            )
+            .unwrap();
+
+        let timerfd_desc =
+            super::EpollDescriptor::try_from(&task.global, &files, timerfd_raw).unwrap();
+        epoll
+            .add_interest(
+                &task.global,
+                &*fs,
+                13,
+                &timerfd_desc,
+                EpollEvent {
+                    events: Events::IN.bits(),
+                    data: 13,
+                },
+            )
+            .unwrap();
+
+        let wait_state = WaitState::new(platform());
+        let waiter_waker = wait_state.context().waker().clone();
+        let stop_spurious_wakes = Arc::new(AtomicBool::new(false));
+
+        let spurious_waker = {
+            let stop_spurious_wakes = Arc::clone(&stop_spurious_wakes);
+            std::thread::spawn(move || {
+                while !stop_spurious_wakes.load(Ordering::Relaxed) {
+                    waiter_waker.wake();
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+        };
+
+        let writer = {
+            let global = task.global.clone();
+            let files = Arc::clone(&files);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(10));
+                let typed = files
+                    .raw_descriptor_store
+                    .read()
+                    .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem>(eventfd_raw)
+                    .unwrap();
+                let _ = global
+                    .litebox
+                    .descriptor_table()
+                    .with_entry(&typed, |entry| {
+                        entry.write(&WaitState::new(platform()).context(), 1)
+                    });
+            })
+        };
+
+        let events = epoll
+            .wait(
+                &task.global,
+                &*fs,
+                &wait_state
+                    .context()
+                    .with_timeout(Duration::from_millis(200)),
+                1024,
+            )
+            .unwrap();
+
+        stop_spurious_wakes.store(true, Ordering::Relaxed);
+        spurious_waker.join().unwrap();
+        writer.join().unwrap();
+
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        let data = event.data;
+        let events_bits = event.events;
+        assert_eq!(data, 12);
+        assert_eq!(events_bits, Events::IN.bits());
+    }
+
+    // NOTE: test_sys_epoll_pwait_with_eventfd_and_timerfd is deferred to the PR
+    // that introduces sys_timerfd_create.
+
+    #[test]
     fn test_epoll_with_pipe() {
-        let (task, epoll) = setup_epoll();
+        let (task, epoll, fs) = setup_epoll();
         let (producer, consumer) =
             task.global
                 .pipes
@@ -693,6 +1577,7 @@ mod test {
         epoll
             .add_interest(
                 &task.global,
+                &*fs,
                 10,
                 &reader,
                 EpollEvent {
@@ -715,7 +1600,12 @@ mod test {
             );
         });
         epoll
-            .wait(&task.global, &WaitState::new(platform()).context(), 1024)
+            .wait(
+                &task.global,
+                &*fs,
+                &WaitState::new(platform()).context(),
+                1024,
+            )
             .unwrap();
         let mut buf = [0; 2];
         task.global
