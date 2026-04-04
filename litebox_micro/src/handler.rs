@@ -1313,15 +1313,52 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
         }
     }
 
-    // Shmem socket close: unregister locally, then fall through to central.
+    // Shmem socket fast-path: read/write/recvfrom/sendto bypass central entirely.
+    // Close falls through to central for shmem cleanup.
     #[allow(clippy::cast_possible_truncation)]
-    if i64::from(nr) == libc::SYS_close {
-        let fd = args.args[0] as i32;
+    {
         let micro = unsafe { &*(*tls).micro };
-        if micro.find_socket_fd(fd).is_some() {
-            let micro_mut = unsafe { &mut *(*tls).micro };
-            micro_mut.unregister_socket_fd(fd);
-            // Fall through to submit_and_wait for central to handle close + shmem cleanup
+        let fd = args.args[0] as i32;
+        if let Some(shmem_offset) = micro.find_socket_fd(fd) {
+            match i64::from(nr) {
+                libc::SYS_read => {
+                    let buf = args.args[1] as *mut u8;
+                    let count = args.args[2] as usize;
+                    return unsafe { shmem_socket_read(micro, shmem_offset, buf, count) };
+                }
+                libc::SYS_recvfrom => {
+                    let flags = args.args[3] as i32;
+                    let src_addr = args.args[4];
+                    // Fast-path only when no address requested and simple flags
+                    if src_addr == 0 && (flags == 0 || flags == libc::MSG_NOSIGNAL) {
+                        let buf = args.args[1] as *mut u8;
+                        let count = args.args[2] as usize;
+                        return unsafe { shmem_socket_read(micro, shmem_offset, buf, count) };
+                    }
+                    // Otherwise fall through to central
+                }
+                libc::SYS_write => {
+                    let buf = args.args[1] as *const u8;
+                    let count = args.args[2] as usize;
+                    return unsafe { shmem_socket_write(micro, shmem_offset, buf, count) };
+                }
+                libc::SYS_sendto => {
+                    let flags = args.args[3] as i32;
+                    let dest_addr = args.args[4];
+                    if dest_addr == 0 && (flags == 0 || flags == libc::MSG_NOSIGNAL) {
+                        let buf = args.args[1] as *const u8;
+                        let count = args.args[2] as usize;
+                        return unsafe { shmem_socket_write(micro, shmem_offset, buf, count) };
+                    }
+                    // Otherwise fall through to central
+                }
+                libc::SYS_close => {
+                    let micro_mut = unsafe { &mut *(*tls).micro };
+                    micro_mut.unregister_socket_fd(fd);
+                    // Fall through to submit_and_wait for central to handle close + shmem cleanup
+                }
+                _ => {} // setsockopt, getsockopt, shutdown, etc. — fall through to central
+            }
         }
     }
 
@@ -1627,6 +1664,169 @@ unsafe fn shmem_pipe_read(
                     core::ptr::from_ref(tail_ptr).cast::<u8>() as usize,
                     libc::FUTEX_WAIT,
                     current_tail as u32,
+                    0,
+                );
+            }
+        }
+    }
+}
+
+/// Read from a shmem socket RX ring buffer with blocking support.
+///
+/// # Safety
+///
+/// `buf_ptr` must point to valid writable memory of at least `count` bytes.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_ptr_alignment,
+    clippy::ptr_as_ptr
+)]
+unsafe fn shmem_socket_read(
+    micro: &crate::state::MicroState,
+    shmem_offset: u32,
+    buf_ptr: *mut u8,
+    count: usize,
+) -> i64 {
+    if count == 0 {
+        return 0;
+    }
+    let header = unsafe {
+        micro
+            .ring_base
+            .add(micro.layout.data_region_offset)
+            .add(shmem_offset as usize)
+            .cast::<litebox_ipc::socket_ring::ShmemSocketHeader>()
+    };
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, count) };
+
+    loop {
+        let result = unsafe { litebox_ipc::socket_ring::socket_try_read(header, buf) };
+        if result > 0 {
+            // Wake net-worker (may need to fill more RX data from smoltcp)
+            let rx_head_ptr = unsafe { &(*header).rx_head };
+            unsafe {
+                crate::raw_syscall::futex4(
+                    core::ptr::from_ref(rx_head_ptr).cast::<u8>() as usize,
+                    libc::FUTEX_WAKE,
+                    1,
+                    0,
+                );
+            }
+            return result;
+        }
+        if result == 0 {
+            return 0; // EOF (RX_SHUTDOWN + empty)
+        }
+        if result != -11 {
+            return result; // error (ECONNRESET, etc.)
+        }
+        // -EAGAIN: buffer empty
+        let flags = unsafe { (*header).flags.load(core::sync::atomic::Ordering::Relaxed) };
+        if flags & litebox_ipc::socket_ring::socket_flags::NONBLOCK != 0 {
+            return -i64::from(libc::EAGAIN);
+        }
+        // Blocking: spin briefly then futex-wait on rx_tail
+        let rx_tail_ptr = unsafe { &(*header).rx_tail };
+        let current_tail = rx_tail_ptr.load(core::sync::atomic::Ordering::Relaxed);
+        for _ in 0..100 {
+            core::hint::spin_loop();
+            if rx_tail_ptr.load(core::sync::atomic::Ordering::Relaxed) != current_tail {
+                break;
+            }
+        }
+        if rx_tail_ptr.load(core::sync::atomic::Ordering::Relaxed) == current_tail {
+            unsafe {
+                crate::raw_syscall::futex4(
+                    core::ptr::from_ref(rx_tail_ptr).cast::<u8>() as usize,
+                    libc::FUTEX_WAIT,
+                    current_tail as u32,
+                    0,
+                );
+            }
+        }
+    }
+}
+
+/// Write to a shmem socket TX ring buffer with blocking support.
+///
+/// # Safety
+///
+/// `buf_ptr` must point to valid readable memory of at least `count` bytes.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_ptr_alignment,
+    clippy::ptr_as_ptr
+)]
+unsafe fn shmem_socket_write(
+    micro: &crate::state::MicroState,
+    shmem_offset: u32,
+    buf_ptr: *const u8,
+    count: usize,
+) -> i64 {
+    if count == 0 {
+        return 0;
+    }
+    let header = unsafe {
+        micro
+            .ring_base
+            .add(micro.layout.data_region_offset)
+            .add(shmem_offset as usize)
+            .cast::<litebox_ipc::socket_ring::ShmemSocketHeader>()
+    };
+    let buf = unsafe { core::slice::from_raw_parts(buf_ptr, count) };
+    let mut total_written = 0usize;
+
+    loop {
+        let result =
+            unsafe { litebox_ipc::socket_ring::socket_try_write(header, &buf[total_written..]) };
+        if result == -i64::from(libc::EPIPE) {
+            if total_written > 0 {
+                return total_written as i64;
+            }
+            return -i64::from(libc::EPIPE);
+        }
+        if result > 0 {
+            total_written += result as usize;
+            // Wake net-worker after each chunk so it drains TX ring
+            let tx_tail_ptr = unsafe { &(*header).tx_tail };
+            unsafe {
+                crate::raw_syscall::futex4(
+                    core::ptr::from_ref(tx_tail_ptr).cast::<u8>() as usize,
+                    libc::FUTEX_WAKE,
+                    1,
+                    0,
+                );
+            }
+            if total_written >= count {
+                return total_written as i64;
+            }
+            continue;
+        }
+        // result == -EAGAIN: buffer full
+        let flags = unsafe { (*header).flags.load(core::sync::atomic::Ordering::Relaxed) };
+        if flags & litebox_ipc::socket_ring::socket_flags::NONBLOCK != 0 {
+            if total_written > 0 {
+                return total_written as i64;
+            }
+            return -i64::from(libc::EAGAIN);
+        }
+        // Blocking: spin briefly then futex-wait on tx_head
+        let tx_head_ptr = unsafe { &(*header).tx_head };
+        let current_head = tx_head_ptr.load(core::sync::atomic::Ordering::Relaxed);
+        for _ in 0..100 {
+            core::hint::spin_loop();
+            if tx_head_ptr.load(core::sync::atomic::Ordering::Relaxed) != current_head {
+                break;
+            }
+        }
+        if tx_head_ptr.load(core::sync::atomic::Ordering::Relaxed) == current_head {
+            unsafe {
+                crate::raw_syscall::futex4(
+                    core::ptr::from_ref(tx_head_ptr).cast::<u8>() as usize,
+                    libc::FUTEX_WAIT,
+                    current_head as u32,
                     0,
                 );
             }
