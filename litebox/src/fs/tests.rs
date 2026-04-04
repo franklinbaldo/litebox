@@ -1083,6 +1083,35 @@ mod layered {
         fs.close(&fd).expect("Failed to close dir");
     }
 
+    #[test]
+    fn read_link_falls_back_when_upper_reports_missing_component() {
+        use crate::fs::errors::ReadLinkError;
+
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut lower = in_mem::FileSystem::new(&litebox);
+        lower.with_root_privileges(|fs| {
+            fs.mkdir("/workspace", Mode::from_bits(0o755).unwrap())
+                .unwrap();
+            fs.mkdir("/workspace/repo", Mode::from_bits(0o755).unwrap())
+                .unwrap();
+        });
+        let fs = layered::FileSystem::new(
+            &litebox,
+            in_mem::FileSystem::new(&litebox),
+            lower,
+            layered::LayeringSemantics::LowerLayerWritableFiles,
+        );
+
+        assert_eq!(
+            fs.file_status("/workspace/repo").unwrap().file_type,
+            FileType::Directory
+        );
+        assert!(matches!(
+            fs.read_link("/workspace/repo"),
+            Err(ReadLinkError::NotASymlink)
+        ));
+    }
+
     /// Check that for the same file, even though it started as a lower-level file, writing to it
     /// successfully migrated it to an upper-level file, and converted the internal descriptors
     /// over, such that the expected semantics of being able to see the updated file are held.
@@ -1882,6 +1911,287 @@ mod layered {
             Err(RmdirError::NotADirectory)
         ));
     }
+
+    /// Regression test: closing a stale fd after rename must not remove or
+    /// assert-fail on a fresh cache entry at the same path.
+    #[test]
+    fn close_stale_fd_after_rename_no_panic() {
+        use crate::fs::errors::RenameError;
+        use crate::fs::layered::LayeringSemantics;
+
+        let all_rw = Mode::RWXU | Mode::RWXG | Mode::RWXO;
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut lower = in_mem::FileSystem::new(&litebox);
+        lower.with_root_privileges(|fs| {
+            fs.chmod("/", all_rw).expect("chmod /");
+            let fd = fs
+                .open("/a.txt", OFlags::CREAT | OFlags::WRONLY, all_rw)
+                .expect("create /a.txt");
+            fs.write(&fd, b"original", None).expect("write");
+            fs.close(&fd).expect("close");
+        });
+
+        let mut upper = in_mem::FileSystem::new(&litebox);
+        upper.with_root_privileges(|fs| {
+            fs.chmod("/", all_rw).expect("chmod /");
+            // Pre-populate an upper-only file for cross-layer EXDEV test.
+            let fd = fs
+                .open("/upper.txt", OFlags::CREAT | OFlags::WRONLY, all_rw)
+                .expect("create /upper.txt");
+            fs.write(&fd, b"upper", None).expect("write");
+            fs.close(&fd).expect("close");
+        });
+
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            LayeringSemantics::LowerLayerWritableFiles,
+        );
+
+        // Open /a.txt — this caches a Lower entry in root.entries.
+        let fd_stale = fs
+            .open("/a.txt", OFlags::RDONLY, Mode::empty())
+            .expect("open /a.txt");
+
+        // Rename /a.txt → /b.txt on lower. This evicts the cache.
+        fs.rename("/a.txt", "/b.txt").expect("rename a→b");
+
+        // Create a new /a.txt. This inserts a fresh cache entry.
+        let fd_new = fs
+            .open("/a.txt", OFlags::CREAT | OFlags::WRONLY, all_rw)
+            .expect("recreate /a.txt");
+        fs.write(&fd_new, b"replacement", None).expect("write");
+
+        // Close the stale fd. Must not panic or corrupt the new cache entry.
+        fs.close(&fd_stale).expect("close stale fd");
+
+        // The new fd and its cache entry must still work.
+        fs.close(&fd_new).expect("close new fd");
+
+        // Cross-layer rename (lower src → upper dest) returns EXDEV.
+        assert!(matches!(
+            fs.rename("/b.txt", "/upper.txt"),
+            Err(RenameError::CrossDevice)
+        ));
+
+        // Cross-layer rename (upper src → lower dest) also returns EXDEV.
+        assert!(matches!(
+            fs.rename("/upper.txt", "/b.txt"),
+            Err(RenameError::CrossDevice)
+        ));
+    }
+
+    /// Renaming into a tombstoned destination must not return EXDEV.
+    /// The tombstone hides the lower entry, so the dest is visibly absent.
+    #[test]
+    fn rename_into_tombstoned_dest_not_exdev() {
+        use crate::fs::layered::LayeringSemantics;
+
+        let all_rw = Mode::RWXU | Mode::RWXG | Mode::RWXO;
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut lower = in_mem::FileSystem::new(&litebox);
+        lower.with_root_privileges(|fs| {
+            fs.chmod("/", all_rw).expect("chmod /");
+            let fd = fs
+                .open("/dst.txt", OFlags::CREAT | OFlags::WRONLY, all_rw)
+                .expect("create /dst.txt");
+            fs.close(&fd).expect("close");
+        });
+
+        let mut upper = in_mem::FileSystem::new(&litebox);
+        upper.with_root_privileges(|fs| {
+            fs.chmod("/", all_rw).expect("chmod /");
+            let fd = fs
+                .open("/src.txt", OFlags::CREAT | OFlags::WRONLY, all_rw)
+                .expect("create /src.txt");
+            fs.write(&fd, b"hello", None).expect("write");
+            fs.close(&fd).expect("close");
+        });
+
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            LayeringSemantics::LowerLayerWritableFiles,
+        );
+
+        // /dst.txt exists on lower. Delete it — installs tombstone.
+        fs.unlink("/dst.txt").expect("unlink tombstones /dst.txt");
+
+        // Rename upper /src.txt → /dst.txt. The dest is tombstoned
+        // (visibly absent), so this is NOT cross-layer and must succeed.
+        fs.rename("/src.txt", "/dst.txt")
+            .expect("rename into tombstoned dest must not be EXDEV");
+
+        // /dst.txt must be visible after the rename — tombstone must be cleared.
+        let stat = fs
+            .file_status("/dst.txt")
+            .expect("/dst.txt must be visible after rename");
+        assert_eq!(stat.file_type, FileType::RegularFile);
+
+        // The content from the original upper /src.txt must be readable.
+        let fd = fs
+            .open("/dst.txt", OFlags::RDONLY, Mode::empty())
+            .expect("open /dst.txt");
+        let mut buf = vec![0u8; 64];
+        let n = fs.read(&fd, &mut buf, None).expect("read");
+        assert_eq!(&buf[..n], b"hello");
+        fs.close(&fd).expect("close");
+
+        // /src.txt must no longer exist.
+        assert!(fs.file_status("/src.txt").is_err());
+    }
+
+    /// Lower-source rename into a tombstoned lower destination must not
+    /// fail with type-mismatch errors from the hidden lower entry.
+    #[test]
+    fn rename_lower_source_into_tombstoned_lower_dest() {
+        use crate::fs::layered::LayeringSemantics;
+
+        let all_rw = Mode::RWXU | Mode::RWXG | Mode::RWXO;
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut lower = in_mem::FileSystem::new(&litebox);
+        lower.with_root_privileges(|fs| {
+            fs.chmod("/", all_rw).expect("chmod /");
+            // Create a file at /dst.txt on lower.
+            let fd = fs
+                .open("/dst.txt", OFlags::CREAT | OFlags::WRONLY, all_rw)
+                .expect("create /dst.txt");
+            fs.close(&fd).expect("close");
+            // Create a directory at /srcdir on lower.
+            fs.mkdir("/srcdir", all_rw).expect("mkdir /srcdir");
+        });
+
+        let mut upper = in_mem::FileSystem::new(&litebox);
+        upper.with_root_privileges(|fs| {
+            fs.chmod("/", all_rw).expect("chmod /");
+        });
+
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            LayeringSemantics::LowerLayerWritableFiles,
+        );
+
+        // Delete /dst.txt — installs tombstone. Lower still has the file.
+        fs.unlink("/dst.txt").expect("unlink /dst.txt");
+
+        // Rename lower dir /srcdir → /dst.txt. Without the tombstone fix,
+        // the lower backend would see the hidden file at /dst.txt and
+        // return NotADirectory. With the fix, the hidden entry is cleared
+        // first, so the rename succeeds.
+        fs.rename("/srcdir", "/dst.txt")
+            .expect("rename dir over tombstoned file must succeed");
+
+        // /dst.txt is now a directory.
+        let stat = fs.file_status("/dst.txt").expect("/dst.txt visible");
+        assert_eq!(stat.file_type, FileType::Directory);
+
+        // /srcdir is gone.
+        assert!(fs.file_status("/srcdir").is_err());
+    }
+
+    /// Tombstoned entries must not appear in read_dir() listings.
+    #[test]
+    fn read_dir_hides_tombstoned_entries() {
+        use crate::fs::layered::LayeringSemantics;
+
+        let all_rw = Mode::RWXU | Mode::RWXG | Mode::RWXO;
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut lower = in_mem::FileSystem::new(&litebox);
+        lower.with_root_privileges(|fs| {
+            fs.chmod("/", all_rw).expect("chmod /");
+            let fd = fs
+                .open("/visible.txt", OFlags::CREAT | OFlags::WRONLY, all_rw)
+                .expect("create /visible.txt");
+            fs.close(&fd).expect("close");
+            let fd = fs
+                .open("/deleted.txt", OFlags::CREAT | OFlags::WRONLY, all_rw)
+                .expect("create /deleted.txt");
+            fs.close(&fd).expect("close");
+        });
+
+        let mut upper = in_mem::FileSystem::new(&litebox);
+        upper.with_root_privileges(|fs| {
+            fs.chmod("/", all_rw).expect("chmod /");
+        });
+
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            LayeringSemantics::LowerLayerWritableFiles,
+        );
+
+        // Unlink /deleted.txt — installs tombstone.
+        fs.unlink("/deleted.txt").expect("unlink");
+
+        // read_dir on root must show /visible.txt but NOT /deleted.txt.
+        let root_fd = fs
+            .open("/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+            .expect("open /");
+        let entries = fs.read_dir(&root_fd).expect("read_dir /");
+        fs.close(&root_fd).expect("close");
+
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"visible.txt"),
+            "visible.txt must appear: {names:?}"
+        );
+        assert!(
+            !names.contains(&"deleted.txt"),
+            "deleted.txt must be hidden: {names:?}"
+        );
+    }
+
+    /// chmod/chown on a tombstoned path must return ENOENT, not mutate the
+    /// hidden lower inode.
+    #[test]
+    fn chmod_chown_tombstoned_path_returns_enoent() {
+        use crate::fs::layered::LayeringSemantics;
+
+        let all_rw = Mode::RWXU | Mode::RWXG | Mode::RWXO;
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut lower = in_mem::FileSystem::new(&litebox);
+        lower.with_root_privileges(|fs| {
+            fs.chmod("/", all_rw).expect("chmod /");
+            let fd = fs
+                .open("/target.txt", OFlags::CREAT | OFlags::WRONLY, all_rw)
+                .expect("create /target.txt");
+            fs.close(&fd).expect("close");
+        });
+
+        let mut upper = in_mem::FileSystem::new(&litebox);
+        upper.with_root_privileges(|fs| {
+            fs.chmod("/", all_rw).expect("chmod /");
+        });
+
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            LayeringSemantics::LowerLayerWritableFiles,
+        );
+
+        // Unlink installs a tombstone.
+        fs.unlink("/target.txt").expect("unlink");
+
+        // chmod on the tombstoned path must fail.
+        let chmod_result = fs.chmod("/target.txt", all_rw);
+        assert!(
+            chmod_result.is_err(),
+            "chmod on tombstoned path must fail: {chmod_result:?}"
+        );
+
+        // chown on the tombstoned path must fail.
+        let chown_result = fs.chown("/target.txt", Some(0), Some(0));
+        assert!(
+            chown_result.is_err(),
+            "chown on tombstoned path must fail: {chown_result:?}"
+        );
+    }
 }
 
 mod stdio {
@@ -1955,6 +2265,7 @@ mod stdio {
 
 mod layered_stdio {
     use crate::LiteBox;
+    use crate::fs::errors::ReadError;
     use crate::fs::layered::LayeringSemantics;
     use crate::fs::{FileSystem as _, Mode, OFlags};
     use crate::fs::{devices, in_mem, layered};
@@ -2051,5 +2362,373 @@ mod layered_stdio {
             fs.open(path, OFlags::RDONLY, Mode::RWXU).is_err(),
             "File should not exist"
         );
+    }
+
+    #[test]
+    fn layered_ptmx_opens_are_distinct() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let layered_fs = layered::FileSystem::new(
+            &litebox,
+            in_mem::FileSystem::new(&litebox),
+            devices::FileSystem::new(&litebox),
+            LayeringSemantics::LowerLayerWritableFiles,
+        );
+
+        let first = layered_fs
+            .open("/dev/ptmx", OFlags::RDWR, Mode::empty())
+            .expect("Failed to open first /dev/ptmx");
+        let second = layered_fs
+            .open("/dev/ptmx", OFlags::RDWR, Mode::empty())
+            .expect("Failed to open second /dev/ptmx");
+
+        let first_status = layered_fs
+            .fd_file_status(&first)
+            .expect("Failed to stat first /dev/ptmx");
+        let second_status = layered_fs
+            .fd_file_status(&second)
+            .expect("Failed to stat second /dev/ptmx");
+
+        assert_ne!(
+            first_status.node_info.rdev, second_status.node_info.rdev,
+            "each /dev/ptmx open should allocate a fresh PTY master"
+        );
+
+        layered_fs
+            .close(&first)
+            .expect("Failed to close first /dev/ptmx");
+        layered_fs
+            .close(&second)
+            .expect("Failed to close second /dev/ptmx");
+    }
+
+    #[test]
+    fn layered_tty_status_flags_sync_to_device_reads() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let layered_fs = layered::FileSystem::new(
+            &litebox,
+            in_mem::FileSystem::new(&litebox),
+            devices::FileSystem::new(&litebox),
+            LayeringSemantics::LowerLayerWritableFiles,
+        );
+
+        let fd = layered_fs
+            .open("/dev/tty", OFlags::RDWR, Mode::empty())
+            .expect("Failed to open /dev/tty");
+
+        layered_fs
+            .set_open_status_flags(&fd, OFlags::RDWR | OFlags::NONBLOCK)
+            .expect("Failed to set nonblocking status on /dev/tty");
+
+        let mut buffer = vec![0; 16];
+        let err = layered_fs
+            .read(&fd, &mut buffer, None)
+            .expect_err("empty nonblocking /dev/tty read should not block");
+        assert!(matches!(err, ReadError::WouldBlock));
+
+        layered_fs.close(&fd).expect("Failed to close /dev/tty");
+    }
+
+    #[test]
+    fn layered_stderr_open_ignores_create_mode_bits() {
+        let platform = MockPlatform::new();
+        let litebox = LiteBox::new(platform);
+        let layered_fs = layered::FileSystem::new(
+            &litebox,
+            in_mem::FileSystem::new(&litebox),
+            devices::FileSystem::new(&litebox),
+            LayeringSemantics::LowerLayerWritableFiles,
+        );
+
+        let fd = layered_fs
+            .open(
+                "/dev/stderr",
+                OFlags::WRONLY | OFlags::CREAT | OFlags::TRUNC | OFlags::LARGEFILE,
+                Mode::RWXU | Mode::RWXG | Mode::RWXO,
+            )
+            .expect("Failed to open /dev/stderr with shell-style redirection flags");
+
+        let data = b"stderr redirection still writes";
+        layered_fs
+            .write(&fd, data, None)
+            .expect("Failed to write redirected stderr");
+        layered_fs
+            .close(&fd)
+            .expect("Failed to close redirected stderr");
+
+        assert_eq!(litebox.x.platform.stderr_queue.read().unwrap().len(), 1);
+        assert_eq!(litebox.x.platform.stderr_queue.read().unwrap()[0], data);
+    }
+}
+
+mod in_mem_at {
+    use crate::LiteBox;
+    use crate::fs::in_mem;
+    use crate::fs::{FileSystem as _, Mode, OFlags};
+    use crate::platform::mock::MockPlatform;
+    extern crate std;
+
+    /// Helper: set up a filesystem with /dir/ containing a file.
+    fn setup_with_dir_and_file() -> in_mem::FileSystem<MockPlatform> {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut fs = in_mem::FileSystem::new(&litebox);
+        fs.with_root_privileges(|fs| {
+            fs.mkdir("/dir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("mkdir /dir");
+            let fd = fs
+                .open("/dir/hello.txt", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+                .expect("create hello.txt");
+            fs.write(&fd, b"hello", None).expect("write");
+            fs.close(&fd).expect("close");
+        });
+        fs
+    }
+
+    #[test]
+    fn open_at_creates_file_relative_to_dirfd() {
+        let mut fs = setup_with_dir_and_file();
+        fs.with_root_privileges(|fs| {
+            let dirfd = fs
+                .open("/dir", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+                .expect("open dirfd");
+
+            let fd = fs
+                .open_at(
+                    &dirfd,
+                    "new.txt",
+                    OFlags::CREAT | OFlags::WRONLY,
+                    Mode::RWXU,
+                )
+                .expect("open_at create");
+            fs.write(&fd, b"world", None).expect("write");
+            fs.close(&fd).expect("close");
+            fs.close(&dirfd).expect("close dirfd");
+
+            // Verify via absolute path.
+            let fd = fs
+                .open("/dir/new.txt", OFlags::RDONLY, Mode::empty())
+                .expect("open absolute");
+            let mut buf = [0u8; 5];
+            let n = fs.read(&fd, &mut buf, None).expect("read");
+            assert_eq!(n, 5);
+            assert_eq!(&buf, b"world");
+            fs.close(&fd).expect("close");
+        });
+    }
+
+    #[test]
+    fn open_at_reads_existing_file() {
+        let mut fs = setup_with_dir_and_file();
+        fs.with_root_privileges(|fs| {
+            let dirfd = fs
+                .open("/dir", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+                .expect("open dirfd");
+
+            let fd = fs
+                .open_at(&dirfd, "hello.txt", OFlags::RDONLY, Mode::empty())
+                .expect("open_at read");
+            let mut buf = [0u8; 5];
+            let n = fs.read(&fd, &mut buf, None).expect("read");
+            assert_eq!(n, 5);
+            assert_eq!(&buf, b"hello");
+            fs.close(&fd).expect("close");
+            fs.close(&dirfd).expect("close dirfd");
+        });
+    }
+
+    #[test]
+    fn stat_at_returns_correct_metadata() {
+        let mut fs = setup_with_dir_and_file();
+        fs.with_root_privileges(|fs| {
+            let dirfd = fs
+                .open("/dir", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+                .expect("open dirfd");
+
+            let st = fs.stat_at(&dirfd, "hello.txt", true).expect("stat_at");
+            assert_eq!(st.size, 5);
+            assert_eq!(st.file_type, crate::fs::FileType::RegularFile);
+
+            // stat_at on the directory itself with "."
+            let st = fs.stat_at(&dirfd, ".", true).expect("stat_at dot");
+            assert_eq!(st.file_type, crate::fs::FileType::Directory);
+
+            fs.close(&dirfd).expect("close dirfd");
+        });
+    }
+
+    #[test]
+    fn stat_at_nonexistent_returns_error() {
+        let mut fs = setup_with_dir_and_file();
+        fs.with_root_privileges(|fs| {
+            let dirfd = fs
+                .open("/dir", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+                .expect("open dirfd");
+
+            let err = fs.stat_at(&dirfd, "does_not_exist", true);
+            assert!(err.is_err());
+            fs.close(&dirfd).expect("close dirfd");
+        });
+    }
+
+    #[test]
+    fn unlink_at_removes_file() {
+        let mut fs = setup_with_dir_and_file();
+        fs.with_root_privileges(|fs| {
+            let dirfd = fs
+                .open("/dir", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+                .expect("open dirfd");
+
+            fs.unlink_at(&dirfd, "hello.txt").expect("unlink_at");
+            fs.close(&dirfd).expect("close dirfd");
+
+            // Verify deleted via absolute path.
+            assert!(
+                fs.open("/dir/hello.txt", OFlags::RDONLY, Mode::empty())
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn rename_at_moves_file() {
+        let mut fs = setup_with_dir_and_file();
+        fs.with_root_privileges(|fs| {
+            fs.mkdir("/dir2", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("mkdir /dir2");
+
+            let src_dirfd = fs
+                .open("/dir", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+                .expect("open src dirfd");
+            let dst_dirfd = fs
+                .open("/dir2", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+                .expect("open dst dirfd");
+
+            fs.rename_at(&src_dirfd, "hello.txt", &dst_dirfd, "moved.txt")
+                .expect("rename_at");
+
+            fs.close(&src_dirfd).expect("close");
+            fs.close(&dst_dirfd).expect("close");
+
+            // Old path gone, new path exists.
+            assert!(
+                fs.open("/dir/hello.txt", OFlags::RDONLY, Mode::empty())
+                    .is_err()
+            );
+            let fd = fs
+                .open("/dir2/moved.txt", OFlags::RDONLY, Mode::empty())
+                .expect("open moved");
+            let mut buf = [0u8; 5];
+            let n = fs.read(&fd, &mut buf, None).expect("read");
+            assert_eq!(n, 5);
+            assert_eq!(&buf, b"hello");
+            fs.close(&fd).expect("close");
+        });
+    }
+
+    #[test]
+    fn fd_path_returns_open_path() {
+        let mut fs = setup_with_dir_and_file();
+        fs.with_root_privileges(|fs| {
+            let dirfd = fs
+                .open("/dir", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+                .expect("open dirfd");
+            assert_eq!(fs.fd_path(&dirfd).as_deref(), Some("/dir"));
+
+            let fd = fs
+                .open("/dir/hello.txt", OFlags::RDONLY, Mode::empty())
+                .expect("open file");
+            assert_eq!(fs.fd_path(&fd).as_deref(), Some("/dir/hello.txt"));
+
+            fs.close(&fd).expect("close");
+            fs.close(&dirfd).expect("close dirfd");
+        });
+    }
+
+    #[test]
+    fn open_at_with_absolute_path_ignores_dirfd() {
+        let mut fs = setup_with_dir_and_file();
+        fs.with_root_privileges(|fs| {
+            let dirfd = fs
+                .open("/dir", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+                .expect("open dirfd");
+
+            // Absolute path overrides the dirfd entirely.
+            let fd = fs
+                .open_at(&dirfd, "/dir/hello.txt", OFlags::RDONLY, Mode::empty())
+                .expect("open_at absolute");
+            let mut buf = [0u8; 5];
+            let n = fs.read(&fd, &mut buf, None).expect("read");
+            assert_eq!(n, 5);
+            assert_eq!(&buf, b"hello");
+            fs.close(&fd).expect("close");
+            fs.close(&dirfd).expect("close dirfd");
+        });
+    }
+
+    #[test]
+    fn open_at_with_dotdot_resolves_parent() {
+        let mut fs = setup_with_dir_and_file();
+        fs.with_root_privileges(|fs| {
+            fs.mkdir("/dir/sub", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("mkdir sub");
+            let fd = fs
+                .open(
+                    "/dir/sub/in_sub.txt",
+                    OFlags::CREAT | OFlags::WRONLY,
+                    Mode::RWXU,
+                )
+                .expect("create in_sub");
+            fs.close(&fd).expect("close");
+
+            let sub_dirfd = fs
+                .open(
+                    "/dir/sub",
+                    OFlags::RDONLY | OFlags::DIRECTORY,
+                    Mode::empty(),
+                )
+                .expect("open sub dirfd");
+
+            // "../hello.txt" from /dir/sub should resolve to /dir/hello.txt
+            let fd = fs
+                .open_at(&sub_dirfd, "../hello.txt", OFlags::RDONLY, Mode::empty())
+                .expect("open_at dotdot");
+            let mut buf = [0u8; 5];
+            let n = fs.read(&fd, &mut buf, None).expect("read");
+            assert_eq!(n, 5);
+            assert_eq!(&buf, b"hello");
+            fs.close(&fd).expect("close");
+            fs.close(&sub_dirfd).expect("close dirfd");
+        });
+    }
+
+    /// Non-directory fds must be rejected as dirfd with NotADirectory.
+    #[test]
+    fn non_directory_dirfd_returns_enotdir() {
+        let mut fs = setup_with_dir_and_file();
+        fs.with_root_privileges(|fs| {
+            // Open a regular file (not a directory).
+            let filefd = fs
+                .open("/dir/hello.txt", OFlags::RDONLY, Mode::empty())
+                .expect("open file");
+
+            // stat_at with a file fd must fail with NotADirectory.
+            assert!(matches!(
+                fs.stat_at(&filefd, ".", true),
+                Err(crate::fs::errors::FileStatusError::NotADirectory)
+            ));
+
+            // open_at with a file fd must fail with NotADirectory.
+            assert!(matches!(
+                fs.open_at(&filefd, "other.txt", OFlags::RDONLY, Mode::empty()),
+                Err(crate::fs::errors::OpenError::NotADirectory)
+            ));
+
+            // unlink_at with a file fd must fail with NotADirectory.
+            assert!(matches!(
+                fs.unlink_at(&filefd, "anything"),
+                Err(crate::fs::errors::UnlinkError::NotADirectory)
+            ));
+
+            fs.close(&filefd).expect("close filefd");
+        });
     }
 }

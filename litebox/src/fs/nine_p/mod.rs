@@ -2339,7 +2339,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         self.mkdir(abs, mode)
     }
 }
-
 #[derive(Debug)]
 struct Descriptor {
     /// The 9P fid for this file

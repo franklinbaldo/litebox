@@ -160,13 +160,8 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     fn unlink(&self, path: impl path::Arg) -> Result<(), UnlinkError>;
 
     /// Rename (move) a file or directory
-    fn rename(
-        &self,
-        _old_path: impl path::Arg,
-        _new_path: impl path::Arg,
-    ) -> Result<(), RenameError> {
-        Err(RenameError::Io)
-    }
+    fn rename(&self, old_path: impl path::Arg, new_path: impl path::Arg)
+    -> Result<(), RenameError>;
 
     /// Create a new directory
     fn mkdir(&self, path: impl path::Arg, mode: Mode) -> Result<(), MkdirError>;
@@ -314,79 +309,55 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     // join it with the relative component and delegate to path-based methods.
 
     /// Open a file relative to a directory fd.
-    #[expect(unused_variables, reason = "default body, non-underscored param names")]
     fn open_at(
         &self,
         dirfd: &TypedFd<Self>,
         rel_path: impl path::Arg,
         flags: OFlags,
         mode: Mode,
-    ) -> Result<TypedFd<Self>, OpenError> {
-        Err(OpenError::Io)
-    }
+    ) -> Result<TypedFd<Self>, OpenError>;
 
     /// Obtain the status of a file relative to a directory fd.
-    #[expect(unused_variables, reason = "default body, non-underscored param names")]
     fn stat_at(
         &self,
         dirfd: &TypedFd<Self>,
         rel_path: impl path::Arg,
         follow_symlinks: bool,
-    ) -> Result<FileStatus, FileStatusError> {
-        Err(FileStatusError::Io)
-    }
+    ) -> Result<FileStatus, FileStatusError>;
 
     /// Unlink a file relative to a directory fd.
-    #[expect(unused_variables, reason = "default body, non-underscored param names")]
-    fn unlink_at(
-        &self,
-        dirfd: &TypedFd<Self>,
-        rel_path: impl path::Arg,
-    ) -> Result<(), UnlinkError> {
-        Err(UnlinkError::Io)
-    }
+    fn unlink_at(&self, dirfd: &TypedFd<Self>, rel_path: impl path::Arg)
+    -> Result<(), UnlinkError>;
 
     /// Read a symbolic link relative to a directory fd.
-    #[expect(unused_variables, reason = "default body, non-underscored param names")]
     fn readlink_at(
         &self,
         dirfd: &TypedFd<Self>,
         rel_path: impl path::Arg,
-    ) -> Result<alloc::string::String, errors::ReadLinkError> {
-        Err(errors::ReadLinkError::NotSupported)
-    }
+    ) -> Result<alloc::string::String, errors::ReadLinkError>;
 
     /// Rename a file, with source and destination relative to directory fds.
-    #[expect(unused_variables, reason = "default body, non-underscored param names")]
     fn rename_at(
         &self,
         old_dirfd: &TypedFd<Self>,
         old_rel: impl path::Arg,
         new_dirfd: &TypedFd<Self>,
         new_rel: impl path::Arg,
-    ) -> Result<(), RenameError> {
-        Err(RenameError::NotSupported)
-    }
+    ) -> Result<(), RenameError>;
 
     /// Create a directory relative to a directory fd.
-    #[expect(unused_variables, reason = "default body, non-underscored param names")]
     fn mkdir_at(
         &self,
         dirfd: &TypedFd<Self>,
         rel_path: impl path::Arg,
         mode: Mode,
-    ) -> Result<(), MkdirError> {
-        Err(MkdirError::Io)
-    }
+    ) -> Result<(), MkdirError>;
 
     /// Get the path associated with an open file descriptor, if available.
     ///
     /// Returns the path that was used to open the file. Used by the ELF
     /// patch cache and diagnostics.
-    #[expect(unused_variables, reason = "default body, non-underscored param names")]
-    fn fd_path(&self, fd: &TypedFd<Self>) -> Option<alloc::string::String> {
-        None
-    }
+    fn fd_path(&self, fd: &TypedFd<Self>) -> Option<alloc::string::String>;
 }
 
 pub(crate) fn memfd_display_path(name: &str) -> alloc::string::String {

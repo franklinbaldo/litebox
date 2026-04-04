@@ -1200,10 +1200,9 @@ impl<
             .litebox
             .descriptor_table()
             .with_entry(fd, |descriptor| {
-                // O_RDONLY is 0, so `contains(RDONLY)` is always true.
-                // Check the access-mode bits explicitly: deny if WRONLY.
-                let access = descriptor.entry.flags & (OFlags::WRONLY | OFlags::RDWR);
-                if access == OFlags::WRONLY {
+                if !descriptor.entry.flags.contains(OFlags::RDONLY)
+                    && !descriptor.entry.flags.contains(OFlags::RDWR)
+                {
                     Err(ReadError::NotForReading)
                 } else {
                     Ok(Arc::clone(&descriptor.entry.entry))
@@ -1254,10 +1253,9 @@ impl<
             .litebox
             .descriptor_table()
             .with_entry(fd, |descriptor| {
-                // O_RDONLY is 0, so `contains(RDONLY)` would always be true.
-                // Check the access-mode bits explicitly: deny if RDONLY.
-                let access = descriptor.entry.flags & (OFlags::WRONLY | OFlags::RDWR);
-                if access.is_empty() {
+                if !descriptor.entry.flags.contains(OFlags::WRONLY)
+                    && !descriptor.entry.flags.contains(OFlags::RDWR)
+                {
                     Err(WriteError::NotForWriting)
                 } else {
                     Ok((
@@ -1271,15 +1269,13 @@ impl<
         match entry.as_ref() {
             EntryX::Upper { fd: upper_fd } => {
                 let num_bytes = self.upper.write(upper_fd, buf, offset)?;
-                if offset.is_none() {
-                    self.litebox
-                        .descriptor_table()
-                        .get_entry(fd)
-                        .unwrap()
-                        .entry
-                        .position
-                        .fetch_add(num_bytes, SeqCst);
-                }
+                self.litebox
+                    .descriptor_table()
+                    .get_entry(fd)
+                    .unwrap()
+                    .entry
+                    .position
+                    .fetch_add(num_bytes, SeqCst);
                 return Ok(num_bytes);
             }
             EntryX::Lower { fd: lower_fd } => {
@@ -1290,9 +1286,7 @@ impl<
                     LayeringSemantics::LowerLayerWritableFiles => {
                         // Allow direct write to lower layer
                         let num_bytes = self.lower.write(lower_fd, buf, offset)?;
-                        if offset.is_none()
-                            && let Some(e) = self.litebox.descriptor_table().get_entry(fd)
-                        {
+                        if let Some(e) = self.litebox.descriptor_table().get_entry(fd) {
                             e.entry.position.fetch_add(num_bytes, SeqCst);
                         }
                         return Ok(num_bytes);

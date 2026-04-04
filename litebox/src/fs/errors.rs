@@ -219,14 +219,12 @@ pub enum RmdirError {
 pub enum RenameError {
     #[error("a directory component in either path does not allow write permission")]
     NoWritePerms,
-    #[error("new path is an existing directory but old path is not a directory")]
+    #[error("old path is a directory but new path is not")]
     IsADirectory,
-    #[error("old path is a directory but new path is not a directory")]
+    #[error("new path is a directory but old path is not")]
     NotADirectory,
     #[error("new path is a non-empty directory")]
     NotEmpty,
-    #[error("new path contains a prefix that names old path")]
-    InvalidArgument,
     #[error("the filesystem does not support renaming")]
     ReadOnlyFileSystem,
     #[error("old and new are on different filesystems")]
@@ -235,8 +233,6 @@ pub enum RenameError {
     SameFile,
     #[error("I/O error")]
     Io,
-    #[error("operation not supported")]
-    NotSupported,
     #[error("fd has been closed already")]
     ClosedFd,
     #[error(transparent)]

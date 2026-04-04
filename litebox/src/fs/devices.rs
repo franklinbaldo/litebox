@@ -338,56 +338,6 @@ impl<
             _ => None,
         }
     }
-
-    /// Returns the PTY pair index if the given FD is a PTY master, or `None` otherwise.
-    pub fn get_pty_master_index(&self, fd: &FileFd<Platform>) -> Option<u32> {
-        let table = self.litebox.descriptor_table();
-        match table.get_entry(fd)?.entry {
-            Device::PtyMaster(idx) => Some(idx),
-            _ => None,
-        }
-    }
-
-    /// Returns a reference to the PTY manager for performing PTY operations.
-    pub fn pty_manager(&self) -> &PtyManager<Platform> {
-        &self.pty_manager
-    }
-
-    /// Get the stored terminal attributes for a PTY device FD.
-    pub fn get_pty_termios(&self, fd: &FileFd<Platform>) -> Option<PtyTermios> {
-        let (pair, _, _) = self.get_pty_info(fd)?;
-        Some(pair.termios.lock().clone())
-    }
-
-    /// Set the terminal attributes for a PTY device FD.
-    pub fn set_pty_termios(&self, fd: &FileFd<Platform>, termios: PtyTermios) -> bool {
-        if let Some((pair, _, _)) = self.get_pty_info(fd) {
-            *pair.termios.lock() = termios;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Get the foreground process group for a PTY device FD.
-    pub fn get_pty_foreground_pgrp(&self, fd: &FileFd<Platform>) -> Option<i32> {
-        let (pair, _, _) = self.get_pty_info(fd)?;
-        Some(
-            pair.foreground_pgrp
-                .load(core::sync::atomic::Ordering::Relaxed),
-        )
-    }
-
-    /// Set the foreground process group for a PTY device FD.
-    pub fn set_pty_foreground_pgrp(&self, fd: &FileFd<Platform>, pgrp: i32) -> bool {
-        if let Some((pair, _, _)) = self.get_pty_info(fd) {
-            pair.foreground_pgrp
-                .store(pgrp, core::sync::atomic::Ordering::Relaxed);
-            true
-        } else {
-            false
-        }
-    }
 }
 
 impl<
@@ -585,7 +535,7 @@ impl<
                         return Err(OpenError::AccessNotAllowed);
                     }
                     pair.slave_open_count
-                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        .fetch_add(1, core::sync::atomic::Ordering::Release);
                     (Device::PtySlave(idx), Some(pair))
                 } else if self
                     .litebox
@@ -654,9 +604,6 @@ impl<
                     return Ok(buf.len());
                 }
                 &Device::PtyMaster(idx) => {
-                    if buf.is_empty() {
-                        return Ok(0);
-                    }
                     // Master reads what the slave has written
                     let pair = self.pty_manager.get(idx).ok_or(ReadError::ClosedFd)?;
                     let mut ring = pair.slave_to_master.lock();
@@ -677,9 +624,6 @@ impl<
                     return Ok(n);
                 }
                 &Device::PtySlave(idx) => {
-                    if buf.is_empty() {
-                        return Ok(0);
-                    }
                     // Slave reads what the master has written.
                     // Returns WouldBlock (EAGAIN) when no data is available;
                     // the shim layer handles blocking retry with interruptibility.
@@ -751,9 +695,6 @@ impl<
                 // Master writes feed the slave's input buffer.
                 // Line discipline: ICRNL translates \r → \n (if enabled).
                 // ECHO reflects input back to master's read buffer.
-                //
-                // Lock ordering: master_to_slave before slave_to_master when
-                // echo is enabled. No other code path takes both locks.
                 let pair = self.pty_manager.get(idx).ok_or(WriteError::ClosedFd)?;
                 let termios = pair.termios.lock();
                 let icrnl = termios.icrnl_enabled();
@@ -779,11 +720,9 @@ impl<
                         }
                     }
                 }
-                if !buf.is_empty() {
-                    pair.slave_pollee.notify_observers(Events::IN);
-                    if echo {
-                        pair.master_pollee.notify_observers(Events::IN);
-                    }
+                pair.slave_pollee.notify_observers(Events::IN);
+                if echo {
+                    pair.master_pollee.notify_observers(Events::IN);
                 }
                 return Ok(buf.len());
             }
@@ -808,9 +747,7 @@ impl<
                     }
                 }
                 // Wake epoll watchers on the master side.
-                if !buf.is_empty() {
-                    pair.master_pollee.notify_observers(Events::IN);
-                }
+                pair.master_pollee.notify_observers(Events::IN);
                 return Ok(buf.len());
             }
         };
@@ -880,7 +817,7 @@ impl<
     }
 
     fn rename(&self, _old: impl Arg, _new: impl Arg) -> Result<(), RenameError> {
-        Err(RenameError::NotSupported)
+        unimplemented!()
     }
 
     #[expect(unused_variables, reason = "not supported by device filesystem")]
@@ -1032,6 +969,38 @@ impl<
         }
     }
 
+    fn get_pty_termios(&self, fd: &FileFd<Platform>) -> Option<PtyTermios> {
+        let (pair, _, _) = self.get_pty_info(fd)?;
+        Some(pair.termios.lock().clone())
+    }
+
+    fn set_pty_termios(&self, fd: &FileFd<Platform>, termios: PtyTermios) -> bool {
+        if let Some((pair, _, _)) = self.get_pty_info(fd) {
+            *pair.termios.lock() = termios;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn get_pty_foreground_pgrp(&self, fd: &FileFd<Platform>) -> Option<i32> {
+        let (pair, _, _) = self.get_pty_info(fd)?;
+        Some(
+            pair.foreground_pgrp
+                .load(core::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    fn set_pty_foreground_pgrp(&self, fd: &FileFd<Platform>, pgrp: i32) -> bool {
+        if let Some((pair, _, _)) = self.get_pty_info(fd) {
+            pair.foreground_pgrp
+                .store(pgrp, core::sync::atomic::Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
     fn open_at(
         &self,
         _dirfd: &FileFd<Platform>,
@@ -1065,7 +1034,7 @@ impl<
         _dirfd: &FileFd<Platform>,
         _rel_path: impl crate::path::Arg,
     ) -> Result<alloc::string::String, super::errors::ReadLinkError> {
-        Err(super::errors::ReadLinkError::NotSupported)
+        Err(super::errors::ReadLinkError::NotADirectory)
     }
 
     fn rename_at(
@@ -1075,7 +1044,7 @@ impl<
         _new_dirfd: &FileFd<Platform>,
         _new_rel: impl crate::path::Arg,
     ) -> Result<(), super::errors::RenameError> {
-        Err(super::errors::RenameError::NotSupported)
+        Err(super::errors::RenameError::NotADirectory)
     }
 
     fn fd_path(&self, _fd: &FileFd<Platform>) -> Option<alloc::string::String> {
@@ -1093,12 +1062,32 @@ impl<
     }
 }
 
+impl<
+    Platform: crate::platform::StdioProvider + crate::sync::RawSyncPrimitivesProvider + TimeProvider,
+> FileSystem<Platform>
+{
+    /// Returns the PTY pair index if the given FD is a PTY master, or `None` otherwise.
+    pub fn get_pty_master_index(&self, fd: &FileFd<Platform>) -> Option<u32> {
+        let table = self.litebox.descriptor_table();
+        match table.get_entry(fd)?.entry {
+            Device::PtyMaster(idx) => Some(idx),
+            _ => None,
+        }
+    }
+
+    /// Returns a reference to the PTY manager for performing PTY operations.
+    pub fn pty_manager(&self) -> &PtyManager<Platform> {
+        &self.pty_manager
+    }
+}
+
 // Manual implementation of FD subsystem integration for devices.
 // We can't use the `enable_fds_for_subsystem!` macro here because we need
 // to override `on_dup()` and `on_close()` to properly track PTY slave/master
 // reference counts across dup/fork. Without this, closing any single FD
 // referencing a PTY slave marks the entire slave as closed, even if other
 // FDs (in the same or a child process) still reference it.
+#[allow(unused, reason = "NOTE(jayb): remove this lint before merging the PR")]
 #[doc(hidden)]
 pub struct DescriptorEntry<
     Platform: crate::sync::RawSyncPrimitivesProvider

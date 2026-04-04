@@ -683,16 +683,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         };
         let old_is_dir = matches!(old_entry, Entry::Dir(_));
 
-        // POSIX: "The new pathname shall not contain a path prefix that names old."
-        // i.e., cannot rename a directory into its own descendant.
-        if old_is_dir {
-            let mut prefix = old_path.clone();
-            prefix.push('/');
-            if new_path.starts_with(&prefix) {
-                return Err(RenameError::InvalidArgument);
-            }
-        }
-
         // Check write permission on old parent
         if !self.current_user.can_write(&old_parent_dir.read().perms) {
             return Err(RenameError::NoWritePerms);
