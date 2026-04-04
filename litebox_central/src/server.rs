@@ -141,6 +141,13 @@ impl<FS: ShimFS> ProcessServer<FS> {
     /// Returns `Ok(())` when the guest exits cleanly.
     #[allow(clippy::unnecessary_wraps)] // Result kept for future error paths
     pub fn run(self) -> anyhow::Result<()> {
+        // Route IPInterfaceProvider calls on this thread to the process's TUN
+        // queue.  Syscall handlers (e.g. accept/connect) may lock the
+        // per-process Network and invoke the platform device on this thread.
+        if let Some(queue) = self.tun_queue {
+            litebox_platform_central::CentralPlatform::set_current_queue(queue);
+        }
+
         // Spawn a per-process net-worker thread if networking is enabled.
         // The guard ensures the thread is joined even if run() panics.
         let net_worker_guard = if let Some(queue) = self.tun_queue {
@@ -159,6 +166,9 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 .spawn(move || {
                     const DEFAULT_TIMEOUT: Duration = Duration::from_micros(100);
                     const MAX_TIMEOUT: Duration = Duration::from_millis(1);
+
+                    // Route IPInterfaceProvider calls to this process's TUN queue.
+                    litebox_platform_central::CentralPlatform::set_current_queue(queue);
 
                     while !shutdown_clone.load(Ordering::Relaxed) {
                         const MAX_IMMEDIATE_POLLS: u32 = 64;

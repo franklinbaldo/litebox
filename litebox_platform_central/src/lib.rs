@@ -311,6 +311,26 @@ impl CentralPlatform {
 }
 
 // ---------------------------------------------------------------------------
+// Task 5: Thread-local TUN queue routing
+// ---------------------------------------------------------------------------
+
+std::thread_local! {
+    /// The TUN queue index that the current thread should use for
+    /// [`IPInterfaceProvider`] send/receive operations.
+    static CURRENT_TUN_QUEUE: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+impl CentralPlatform {
+    /// Set the TUN queue index for the current thread.
+    ///
+    /// All subsequent [`IPInterfaceProvider`] calls on this thread will route
+    /// through the specified queue.
+    pub fn set_current_queue(queue: usize) {
+        CURRENT_TUN_QUEUE.set(queue);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Task 2: DebugLogProvider and IPInterfaceProvider
 // ---------------------------------------------------------------------------
 
@@ -322,7 +342,7 @@ impl litebox::platform::DebugLogProvider for CentralPlatform {
 
 impl litebox::platform::IPInterfaceProvider for CentralPlatform {
     fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
-        self.send_ip_packet_on_queue(0, packet);
+        self.send_ip_packet_on_queue(CURRENT_TUN_QUEUE.get(), packet);
         Ok(())
     }
 
@@ -330,7 +350,7 @@ impl litebox::platform::IPInterfaceProvider for CentralPlatform {
         &self,
         packet: &mut [u8],
     ) -> Result<usize, litebox::platform::ReceiveError> {
-        self.receive_ip_packet_on_queue(0, packet)
+        self.receive_ip_packet_on_queue(CURRENT_TUN_QUEUE.get(), packet)
     }
 }
 
