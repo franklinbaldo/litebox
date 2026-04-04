@@ -129,18 +129,26 @@ fn test_hello_dynamic() {
         );
     }
 
-    // Parse cache map and collect regions for system dylibs
+    // Parse cache map and collect regions for system dylibs.
+    // All addresses from the .map file are UNSLID (the kernel applies an ASLR
+    // slide at boot). We map our own copy of the cache at the unslid base
+    // (0x180000000) so we don't interfere with the host's slid cache.
     let map_path = cache_dir.join("dyld_shared_cache_arm64e.map");
     let map_text = std::fs::read_to_string(&map_path).unwrap();
     let cache_map = common::shared_cache::CacheMap::parse(&map_text);
     let system_dylibs = cache_map.system_dylib_paths();
     let dylib_refs: Vec<&str> = system_dylibs.iter().map(|s| s.as_str()).collect();
-    let cache_regions = common::shared_cache::collect_regions(cache_dir, &dylib_refs);
+    let cache_result = common::shared_cache::collect_regions(cache_dir, &cache_map, &dylib_refs);
 
     eprintln!(
         "Loaded {} cache regions ({:.1} MB total)",
-        cache_regions.len(),
-        cache_regions.iter().map(|r| r.data.len()).sum::<usize>() as f64 / (1024.0 * 1024.0),
+        cache_result.regions.len(),
+        cache_result
+            .regions
+            .iter()
+            .map(|r| r.data.len())
+            .sum::<usize>() as f64
+            / (1024.0 * 1024.0),
     );
 
     let bin_path = common::compile_macho_dynamic(HELLO_DYNAMIC_C, "hello_dynamic");
@@ -152,7 +160,7 @@ fn test_hello_dynamic() {
     let (exit_code, _stdout) = common::run_macho_dynamic(
         &binary_data,
         &["/usr/bin/hello_dynamic", "arg1", "arg2"],
-        &cache_regions,
+        &cache_result,
     );
     assert_eq!(exit_code, 0, "process exited with non-zero code");
 }

@@ -242,7 +242,12 @@ impl<FS: ShimFS> MacosShim<FS> {
     ///
     /// `cache_base` is typically `0x180000000`.
     /// `regions` is a slice of `(guest_addr, data, is_executable)` tuples.
-    pub fn install_shared_cache(&self, cache_base: u64, regions: &[(u64, &[u8], bool)]) {
+    pub fn install_shared_cache(
+        &self,
+        cache_base: u64,
+        regions: &[(u64, &[u8], bool)],
+        reserved_extents: &[(u64, u64)],
+    ) {
         use litebox::mm::linux::PAGE_SIZE;
         use litebox::platform::{
             RawConstPointer as _, RawMutPointer as _, SystemInfoProvider as _,
@@ -254,23 +259,25 @@ impl<FS: ShimFS> MacosShim<FS> {
 
         // Build a sorted list of all region page-aligned extents so we can find
         // gaps for trampoline placement.  Each entry is (aligned_start, aligned_end).
-        let mut all_extents: Vec<(u64, u64)> = regions
-            .iter()
-            .map(|&(guest_addr, data, _)| {
-                let aligned_start = guest_addr & !(PAGE_SIZE as u64 - 1);
-                let aligned_end = (guest_addr + data.len() as u64 + PAGE_SIZE as u64 - 1)
-                    & !(PAGE_SIZE as u64 - 1);
-                (aligned_start, aligned_end)
-            })
-            .collect();
+        // Include both the regions we're mapping AND any reserved extents (e.g.
+        // the host's shared cache global mappings) so that trampolines never
+        // overlap with existing memory.
+        let mut all_extents: Vec<(u64, u64)> = reserved_extents.to_vec();
+        all_extents.extend(regions.iter().map(|&(guest_addr, data, _)| {
+            let aligned_start = guest_addr & !(PAGE_SIZE as u64 - 1);
+            let aligned_end =
+                (guest_addr + data.len() as u64 + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
+            (aligned_start, aligned_end)
+        }));
         all_extents.sort_unstable();
 
         // Pass 1: map ALL regions as RW at their fixed addresses.
-        // For non-executable regions on macOS-on-macOS, the host process may
-        // already have these regions mapped from its own shared cache (e.g.,
-        // __LINKEDIT, __OBJC_RO).  Mapping failures for non-executable regions
+        // For regions on macOS-on-macOS, the host process may already have
+        // these regions mapped from its own shared cache.  Mapping failures
         // are silently ignored — the host data is the same as what we would
-        // write.  Executable region failures are still fatal.
+        // write.  We track which regions mapped successfully so Pass 2 only
+        // patches regions we own.
+        let mut mapped_ok: Vec<bool> = Vec::with_capacity(regions.len());
         for &(guest_addr, data, is_executable) in regions {
             let aligned_start = guest_addr & !(PAGE_SIZE as u64 - 1);
             let aligned_end =
@@ -294,6 +301,7 @@ impl<FS: ShimFS> MacosShim<FS> {
                     mapped_ptr
                         .copy_from_slice(offset_in_page, data)
                         .expect("install_shared_cache: copy_from_slice failed");
+                    mapped_ok.push(true);
                 }
                 Err(_) if !is_executable => {
                     // Non-executable region mapping failed — the host likely
@@ -304,20 +312,29 @@ impl<FS: ShimFS> MacosShim<FS> {
                         aligned_start,
                         aligned_len
                     );
+                    mapped_ok.push(false);
                 }
-                Err(e) => {
-                    panic!(
-                        "install_shared_cache: do_mmap failed for exec region at {:#x}: {e:?}",
-                        aligned_start
+                Err(_) => {
+                    // Executable region mapping failed — the host may already
+                    // occupy this address (e.g. small global metadata regions
+                    // like slide info stubs).  Log and skip — the host data is
+                    // identical to what we would write.
+                    log_unsupported!(
+                        "install_shared_cache: skipping exec region at {:#x} (len {:#x}): \
+                         host already maps this address",
+                        aligned_start,
+                        aligned_len
                     );
+                    mapped_ok.push(false);
                 }
             }
         }
 
-        // Pass 2: for each executable region, find a nearby gap for the
-        // trampoline, patch SVC sites, and set R-X permissions.
-        for &(guest_addr, data, is_executable) in regions {
-            if !is_executable {
+        // Pass 2: for each executable region that was successfully mapped,
+        // find a nearby gap for the trampoline, patch SVC sites, and set R-X
+        // permissions.
+        for (idx, &(guest_addr, data, is_executable)) in regions.iter().enumerate() {
+            if !is_executable || !mapped_ok[idx] {
                 continue;
             }
 

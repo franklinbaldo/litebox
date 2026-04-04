@@ -300,21 +300,123 @@ fn segment_protection(seg_name: &str, vm_start: u64, mappings: &[CacheMapping]) 
     }
 }
 
+/// Result of collecting shared cache regions.
+pub struct CollectedCache {
+    /// Regions to be mapped via `install_shared_cache`.
+    pub regions: Vec<SharedCacheRegion>,
+}
+
 /// Collect shared-cache regions for the given set of dylibs.
 ///
-/// Reads the `.map` file from `cache_dir`, discovers sub-cache files, and reads
-/// the VM regions that correspond to the segments of the requested dylibs.
-pub fn collect_regions(cache_dir: &Path, needed_dylibs: &[&str]) -> Vec<SharedCacheRegion> {
-    let map_path = cache_dir.join("dyld_shared_cache_arm64e.map");
-    let map_text = fs::read_to_string(&map_path)
-        .unwrap_or_else(|e| panic!("failed to read map file {}: {e}", map_path.display()));
-    let cache_map = CacheMap::parse(&map_text);
-
+/// Maps a complete, independent copy of the cache at UNSLID addresses.
+/// The host's shared cache is at SLID addresses (ASLR), so mapping at
+/// unslid addresses does not interfere with the host process.
+///
+/// Includes:
+/// - The cache header (first global mapping, typically 544KB)
+/// - All segments (__TEXT, __DATA_CONST, __DATA, __AUTH, etc.) of needed dylibs
+/// - Deduplicated __LINKEDIT ranges
+///
+/// The dynamic config data region is returned separately in `CollectedCache`
+/// because it may overlap with the host's slid cache and needs special handling.
+pub fn collect_regions(
+    cache_dir: &Path,
+    cache_map: &CacheMap,
+    needed_dylibs: &[&str],
+) -> CollectedCache {
     let subcaches = discover_subcache_files(cache_dir);
 
     // Deduplicate regions by (vm_start, vm_end).
     let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
     let mut regions: Vec<SharedCacheRegion> = Vec::new();
+
+    // Map the cache header — dyld reads magic, dynamicDataOffset, slide info,
+    // and other metadata from the first global mapping.
+    if let Some(first_mapping) = cache_map.mappings.first() {
+        let header_start = first_mapping.vm_start;
+        let header_end = first_mapping.vm_end;
+        if let Some(sc) = subcaches.iter().find(|s| s.contains_vmaddr(header_start)) {
+            if let Some(mut data) = sc.read_region(header_start, header_end) {
+                seen.insert((header_start, header_end));
+
+                // Parse dynamicDataOffset and dynamicDataMaxSize from the cache
+                // header. The original offset points to an address that overlaps
+                // with the host's slid shared cache (kernel-protected), so we
+                // relocate the dynamic config data to the end of the first
+                // mapping (which is the header itself) and patch our copy.
+                // dyld validates that dynamicDataOffset falls within one of the
+                // cache's global mapping ranges, so we must place it INSIDE
+                // an existing mapping — not adjacent to one.
+                if data.len() >= 0x200 {
+                    let orig_off = u64::from_le_bytes(data[0x1F0..0x1F8].try_into().unwrap());
+                    let max_size = u64::from_le_bytes(data[0x1F8..0x200].try_into().unwrap());
+                    if orig_off != 0 && max_size != 0 {
+                        let size = max_size as usize;
+                        let header_size = data.len();
+
+                        // Place the dynamic config data at the end of the
+                        // header mapping. The mapping covers `header_start..
+                        // header_end` and we own all the data, so we can write
+                        // the synthesized struct at the tail.
+                        let new_offset = (header_size - size) as u64;
+                        // Ensure page alignment (16KB pages).
+                        let new_offset = new_offset & !0x3FFF;
+                        let dyn_guest_addr = header_start + new_offset;
+
+                        eprintln!(
+                            "Relocating dyld dynamic config data: orig VM {:#X} → new VM {:#X} \
+                             (offset {:#X} → {:#X}, size {:#X})",
+                            header_start + orig_off,
+                            dyn_guest_addr,
+                            orig_off,
+                            new_offset,
+                            max_size
+                        );
+
+                        // Patch dynamicDataOffset in our copy of the header.
+                        data[0x1F0..0x1F8].copy_from_slice(&new_offset.to_le_bytes());
+
+                        // Write the synthesized dynamic config data struct
+                        // into our header data buffer.
+                        //
+                        // DynamicRegion layout (from dyld open source):
+                        //   char     _magic[16]             — "dyld_data    v3\0"
+                        //   fsid_t   _dyldCache.fsid        — { int32_t val[2] } = 8 bytes
+                        //   fsobj_id _dyldCache.fsobjid     — { u32 fid_objno; u32 fid_generation } = 8 bytes
+                        //   uint32_t _osCryptexPathOffset   — 4 bytes (v1)
+                        //   uint32_t _cachePathOffset       — 4 bytes (v2)
+                        //   ...more v3 fields...
+                        let write_start = new_offset as usize;
+                        let magic = b"dyld_data    v3\0";
+                        // Zero-fill the region first.
+                        data[write_start..write_start + size].fill(0);
+                        data[write_start..write_start + 16].copy_from_slice(magic);
+                        // FileIdTuple at bytes 16..32: must be non-zero so
+                        // FileIdTuple::operator bool() returns true and dyld
+                        // doesn't halt.  Write fake but non-zero values.
+                        // fsid.val[0] (i32 LE) at offset 16
+                        data[write_start + 16..write_start + 20]
+                            .copy_from_slice(&1_i32.to_le_bytes());
+                        // fsid.val[1] (i32 LE) at offset 20
+                        data[write_start + 20..write_start + 24]
+                            .copy_from_slice(&0_i32.to_le_bytes());
+                        // fsobjid.fid_objno (u32 LE) at offset 24
+                        data[write_start + 24..write_start + 28]
+                            .copy_from_slice(&1_u32.to_le_bytes());
+                        // fsobjid.fid_generation (u32 LE) at offset 28
+                        data[write_start + 28..write_start + 32]
+                            .copy_from_slice(&0_u32.to_le_bytes());
+                    }
+                }
+
+                regions.push(SharedCacheRegion {
+                    guest_addr: header_start,
+                    data,
+                    prot: first_mapping.prot,
+                });
+            }
+        }
+    }
 
     // Collect LINKEDIT ranges separately so we can deduplicate them across dylibs.
     let mut linkedit_ranges: Vec<(u64, u64)> = Vec::new();
@@ -375,7 +477,7 @@ pub fn collect_regions(cache_dir: &Path, needed_dylibs: &[&str]) -> Vec<SharedCa
         }
     }
 
-    regions
+    CollectedCache { regions }
 }
 
 #[cfg(test)]
@@ -470,14 +572,15 @@ mapping  RO  120MB 0x1F73F0000 -> 0x1FEC78000
         let needed: Vec<&str> = sys_paths.iter().map(|s| s.as_str()).collect();
 
         eprintln!("Collecting regions for {} dylibs...", needed.len());
-        let regions = collect_regions(cache_dir, &needed);
+        let result = collect_regions(cache_dir, &cache_map, &needed);
 
         assert!(
-            !regions.is_empty(),
+            !result.regions.is_empty(),
             "expected at least one region from system dylibs"
         );
 
-        let total_rx: usize = regions
+        let total_rx: usize = result
+            .regions
             .iter()
             .filter(|r| r.prot == Protection::ReadExecute)
             .map(|r| r.data.len())
@@ -485,7 +588,7 @@ mapping  RO  120MB 0x1F73F0000 -> 0x1FEC78000
 
         eprintln!(
             "Collected {} regions, total RX = {:.2} MB",
-            regions.len(),
+            result.regions.len(),
             total_rx as f64 / (1024.0 * 1024.0)
         );
 
