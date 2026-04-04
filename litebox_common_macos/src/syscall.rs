@@ -52,6 +52,10 @@ pub mod nr {
     pub const STAT64: usize = 338;
     pub const OPENAT: usize = 463;
     pub const FSTATAT64: usize = 470;
+    pub const BSDTHREAD_CREATE: usize = 360;
+    pub const BSDTHREAD_TERMINATE: usize = 361;
+    pub const BSDTHREAD_REGISTER: usize = 366;
+    pub const BSDTHREAD_CTL: usize = 478;
 }
 
 /// Mach trap numbers (negative x16 values, stored as positive constants).
@@ -231,6 +235,36 @@ pub enum MacosSyscallRequest {
         buf: usize,
         flag: i32,
     },
+    /// `bsdthread_register(threadstart, wqthread, pthsize, pthread_init_data, pthread_init_data_size, dispatchqueue_offset, tsd_offset)`
+    BsdthreadRegister {
+        threadstart: usize,
+        wqthread: usize,
+        pthsize: u32,
+        pthread_init_data: usize,
+        pthread_init_data_size: usize,
+    },
+    /// `bsdthread_create(func, func_arg, stack, pthread, flags)`
+    BsdthreadCreate {
+        func: usize,
+        func_arg: usize,
+        stack: usize,
+        pthread: usize,
+        flags: u32,
+    },
+    /// `bsdthread_terminate(stackaddr, freesize, port, sema_or_ulock)`
+    BsdthreadTerminate {
+        stackaddr: usize,
+        freesize: usize,
+        port: u32,
+        sema_or_ulock: usize,
+    },
+    /// `bsdthread_ctl(cmd, arg1, arg2, arg3)`
+    BsdthreadCtl {
+        cmd: usize,
+        arg1: usize,
+        arg2: usize,
+        arg3: usize,
+    },
     Unknown {
         number: usize,
     },
@@ -393,6 +427,32 @@ impl MacosSyscallRequest {
                 path: a1,
                 buf: a2,
                 flag: a3 as i32,
+            },
+            nr::BSDTHREAD_REGISTER => Self::BsdthreadRegister {
+                threadstart: a0,
+                wqthread: a1,
+                pthsize: a2 as u32,
+                pthread_init_data: a3,
+                pthread_init_data_size: a4,
+            },
+            nr::BSDTHREAD_CREATE => Self::BsdthreadCreate {
+                func: a0,
+                func_arg: a1,
+                stack: a2,
+                pthread: a3,
+                flags: a4 as u32,
+            },
+            nr::BSDTHREAD_TERMINATE => Self::BsdthreadTerminate {
+                stackaddr: a0,
+                freesize: a1,
+                port: a2 as u32,
+                sema_or_ulock: a3,
+            },
+            nr::BSDTHREAD_CTL => Self::BsdthreadCtl {
+                cmd: a0,
+                arg1: a1,
+                arg2: a2,
+                arg3: a3,
             },
             _ => MacosSyscallRequest::Unknown { number: nr_raw },
         }
