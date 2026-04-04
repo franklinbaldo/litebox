@@ -805,6 +805,7 @@ impl<FS: ShimFS> Task<FS> {
 // TODO: enforce the following limits:
 pub(crate) const RLIMIT_NOFILE_CUR: usize = 1024 * 1024;
 const RLIMIT_NOFILE_MAX: usize = 1024 * 1024;
+const RLIMIT_SIGPENDING: usize = 128;
 
 struct AtomicRlimit {
     cur: core::sync::atomic::AtomicUsize,
@@ -840,6 +841,13 @@ impl ResourceLimits {
         limits[litebox_common_linux::RlimitResource::STACK as usize] = AtomicRlimit {
             cur: core::sync::atomic::AtomicUsize::new(crate::loader::DEFAULT_STACK_SIZE),
             max: core::sync::atomic::AtomicUsize::new(litebox_common_linux::rlim_t::MAX),
+        };
+        // Linux defaults SIGPENDING to ~30000 (based on available memory).
+        // Use a reasonable fixed value so that exception-generated signals
+        // (e.g., SIGSEGV with code SEGV_MAPERR) are not silently dropped.
+        limits[litebox_common_linux::RlimitResource::SIGPENDING as usize] = AtomicRlimit {
+            cur: core::sync::atomic::AtomicUsize::new(RLIMIT_SIGPENDING),
+            max: core::sync::atomic::AtomicUsize::new(RLIMIT_SIGPENDING),
         };
         Self { limits }
     }
