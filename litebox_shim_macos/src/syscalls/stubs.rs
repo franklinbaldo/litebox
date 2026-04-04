@@ -7,14 +7,15 @@
 //! bootstrap and hello.c execution.
 
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+use litebox_common_macos::PtRegs;
 use litebox_common_macos::errno::Errno;
 use litebox_common_macos::syscall::mach_trap;
-use litebox_common_macos::PtRegs;
 
 use crate::{MutPtr, ShimFS, Task};
 
 impl<FS: ShimFS> Task<FS> {
     /// Handle `sigaction()` — stub: record but don't deliver signals.
+    #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn sys_sigaction(
         &self,
         _signum: i32,
@@ -25,6 +26,7 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Handle `sigprocmask()` — stub: return success.
+    #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn sys_sigprocmask(
         &self,
         _how: i32,
@@ -35,6 +37,7 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Handle `madvise()` — stub: return success.
+    #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn sys_madvise(
         &self,
         _addr: usize,
@@ -45,6 +48,7 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Handle `csops()` — stub: return success (not code-signed).
+    #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn sys_csops(
         &self,
         _pid: i32,
@@ -78,7 +82,11 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EIO);
         }
         let data: alloc::vec::Vec<u8> = (0..count)
-            .map(|i| (i as u8).wrapping_mul(7).wrapping_add(13))
+            .map(|i| {
+                #[allow(clippy::cast_possible_truncation)]
+                let b = (i as u8).wrapping_mul(7).wrapping_add(13);
+                b
+            })
             .collect();
         let dest: MutPtr<u8> = MutPtr::from_usize(buf_addr);
         dest.copy_from_slice(0, &data).ok_or(Errno::EFAULT)?;
@@ -99,6 +107,7 @@ impl<FS: ShimFS> Task<FS> {
         let name_ptr: crate::ConstPtr<i32> = crate::ConstPtr::from_usize(name);
         let mut name_ints = alloc::vec::Vec::new();
         for i in 0..namelen.min(6) {
+            #[allow(clippy::cast_possible_wrap)]
             if let Some(val) = name_ptr.read_at_offset(i as isize) {
                 name_ints.push(val);
             }
@@ -207,6 +216,7 @@ impl<FS: ShimFS> Task<FS> {
     ///
     /// This is used by dyld during bootstrap. The exact value doesn't matter
     /// as long as it's nonzero and consistent within the process.
+    #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn sys_thread_selfid(&self) -> Result<usize, Errno> {
         Ok(1)
     }
@@ -216,6 +226,7 @@ impl<FS: ShimFS> Task<FS> {
     /// Returns `MACH_SEND_INVALID_DEST` (0x10000003) to indicate the message
     /// could not be delivered. dyld uses this for task port communication but
     /// handles failure gracefully.
+    #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn sys_mach_msg2_trap(&self) -> Result<usize, Errno> {
         Ok(0x1000_0003) // MACH_SEND_INVALID_DEST
     }
@@ -235,7 +246,10 @@ impl<FS: ShimFS> Task<FS> {
                 // gracefully when the port is never actually used.
                 log_unsupported!(
                     "mach_port_construct_trap(target={:#x}, options={:#x}, context={:#x}, name_out={:#x}) → KERN_SUCCESS",
-                    ctx.regs[0], ctx.regs[1], ctx.regs[2], ctx.regs[3]
+                    ctx.regs[0],
+                    ctx.regs[1],
+                    ctx.regs[2],
+                    ctx.regs[3]
                 );
                 Ok(0) // KERN_SUCCESS
             }

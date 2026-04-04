@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 /// Memory protection for a shared cache mapping or region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub enum Protection {
     ReadExecute,
     ReadWrite,
@@ -110,18 +111,17 @@ impl CacheMap {
                 }
                 let parts: Vec<&str> = trimmed.split_whitespace().collect();
                 // parts: ["__TEXT", "0x190312000", "->", "0x190313CE4"]
-                if parts.len() >= 4 && parts[2] == "->" {
-                    if let (Some(vm_start), Some(vm_end)) =
+                if parts.len() >= 4
+                    && parts[2] == "->"
+                    && let (Some(vm_start), Some(vm_end)) =
                         (parse_hex(parts[1]), parse_hex(parts[3]))
-                    {
-                        if let Some(ref mut entry) = current_dylib {
-                            entry.segments.push(DylibSegment {
-                                name: parts[0].to_string(),
-                                vm_start,
-                                vm_end,
-                            });
-                        }
-                    }
+                    && let Some(ref mut entry) = current_dylib
+                {
+                    entry.segments.push(DylibSegment {
+                        name: parts[0].to_string(),
+                        vm_start,
+                        vm_end,
+                    });
                 }
             }
             // Empty lines are ignored.
@@ -167,6 +167,7 @@ struct SubCacheFile {
 impl SubCacheFile {
     /// Parse a sub-cache file by reading its header (~4KB).
     /// Returns `None` if the file cannot be read or lacks the `dyld_v1` magic.
+    #[allow(clippy::used_underscore_binding)]
     fn parse(path: &Path) -> Option<SubCacheFile> {
         let mut f = fs::File::open(path).ok()?;
         let mut header = vec![0u8; 4096];
@@ -234,6 +235,7 @@ impl SubCacheFile {
     ///
     /// Finds the mapping that contains `vm_start`, computes the file offset,
     /// and reads the bytes.  The read length is clamped to the mapping boundary.
+    #[allow(clippy::cast_possible_truncation)]
     fn read_region(&self, vm_start: u64, vm_end: u64) -> Option<Vec<u8>> {
         let mapping = self
             .mappings
@@ -260,9 +262,8 @@ impl SubCacheFile {
 /// excluding `.map` and `.atlas` files.
 fn discover_subcache_files(cache_dir: &Path) -> Vec<SubCacheFile> {
     let mut files = Vec::new();
-    let entries = match fs::read_dir(cache_dir) {
-        Ok(e) => e,
-        Err(_) => return files,
+    let Ok(entries) = fs::read_dir(cache_dir) else {
+        return files;
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -294,8 +295,7 @@ fn segment_protection(seg_name: &str, vm_start: u64, mappings: &[CacheMapping]) 
             mappings
                 .iter()
                 .find(|m| vm_start >= m.vm_start && vm_start < m.vm_end)
-                .map(|m| m.prot)
-                .unwrap_or(Protection::ReadOnly)
+                .map_or(Protection::ReadOnly, |m| m.prot)
         }
     }
 }
@@ -319,6 +319,7 @@ pub struct CollectedCache {
 ///
 /// The dynamic config data region is returned separately in `CollectedCache`
 /// because it may overlap with the host's slid cache and needs special handling.
+#[allow(clippy::cast_possible_truncation)]
 pub fn collect_regions(
     cache_dir: &Path,
     cache_map: &CacheMap,
@@ -335,86 +336,82 @@ pub fn collect_regions(
     if let Some(first_mapping) = cache_map.mappings.first() {
         let header_start = first_mapping.vm_start;
         let header_end = first_mapping.vm_end;
-        if let Some(sc) = subcaches.iter().find(|s| s.contains_vmaddr(header_start)) {
-            if let Some(mut data) = sc.read_region(header_start, header_end) {
-                seen.insert((header_start, header_end));
+        if let Some(sc) = subcaches.iter().find(|s| s.contains_vmaddr(header_start))
+            && let Some(mut data) = sc.read_region(header_start, header_end)
+        {
+            seen.insert((header_start, header_end));
 
-                // Parse dynamicDataOffset and dynamicDataMaxSize from the cache
-                // header. The original offset points to an address that overlaps
-                // with the host's slid shared cache (kernel-protected), so we
-                // relocate the dynamic config data to the end of the first
-                // mapping (which is the header itself) and patch our copy.
-                // dyld validates that dynamicDataOffset falls within one of the
-                // cache's global mapping ranges, so we must place it INSIDE
-                // an existing mapping — not adjacent to one.
-                if data.len() >= 0x200 {
-                    let orig_off = u64::from_le_bytes(data[0x1F0..0x1F8].try_into().unwrap());
-                    let max_size = u64::from_le_bytes(data[0x1F8..0x200].try_into().unwrap());
-                    if orig_off != 0 && max_size != 0 {
-                        let size = max_size as usize;
-                        let header_size = data.len();
+            // Parse dynamicDataOffset and dynamicDataMaxSize from the cache
+            // header. The original offset points to an address that overlaps
+            // with the host's slid shared cache (kernel-protected), so we
+            // relocate the dynamic config data to the end of the first
+            // mapping (which is the header itself) and patch our copy.
+            // dyld validates that dynamicDataOffset falls within one of the
+            // cache's global mapping ranges, so we must place it INSIDE
+            // an existing mapping — not adjacent to one.
+            if data.len() >= 0x200 {
+                let orig_off = u64::from_le_bytes(data[0x1F0..0x1F8].try_into().unwrap());
+                let max_size = u64::from_le_bytes(data[0x1F8..0x200].try_into().unwrap());
+                if orig_off != 0 && max_size != 0 {
+                    let size = max_size as usize;
+                    let header_size = data.len();
 
-                        // Place the dynamic config data at the end of the
-                        // header mapping. The mapping covers `header_start..
-                        // header_end` and we own all the data, so we can write
-                        // the synthesized struct at the tail.
-                        let new_offset = (header_size - size) as u64;
-                        // Ensure page alignment (16KB pages).
-                        let new_offset = new_offset & !0x3FFF;
-                        let dyn_guest_addr = header_start + new_offset;
+                    // Place the dynamic config data at the end of the
+                    // header mapping. The mapping covers `header_start..
+                    // header_end` and we own all the data, so we can write
+                    // the synthesized struct at the tail.
+                    let new_offset = (header_size - size) as u64;
+                    // Ensure page alignment (16KB pages).
+                    let new_offset = new_offset & !0x3FFF;
+                    let dyn_guest_addr = header_start + new_offset;
 
-                        eprintln!(
-                            "Relocating dyld dynamic config data: orig VM {:#X} → new VM {:#X} \
-                             (offset {:#X} → {:#X}, size {:#X})",
-                            header_start + orig_off,
-                            dyn_guest_addr,
-                            orig_off,
-                            new_offset,
-                            max_size
-                        );
+                    eprintln!(
+                        "Relocating dyld dynamic config data: orig VM {:#X} → new VM {:#X} \
+                         (offset {:#X} → {:#X}, size {:#X})",
+                        header_start + orig_off,
+                        dyn_guest_addr,
+                        orig_off,
+                        new_offset,
+                        max_size
+                    );
 
-                        // Patch dynamicDataOffset in our copy of the header.
-                        data[0x1F0..0x1F8].copy_from_slice(&new_offset.to_le_bytes());
+                    // Patch dynamicDataOffset in our copy of the header.
+                    data[0x1F0..0x1F8].copy_from_slice(&new_offset.to_le_bytes());
 
-                        // Write the synthesized dynamic config data struct
-                        // into our header data buffer.
-                        //
-                        // DynamicRegion layout (from dyld open source):
-                        //   char     _magic[16]             — "dyld_data    v3\0"
-                        //   fsid_t   _dyldCache.fsid        — { int32_t val[2] } = 8 bytes
-                        //   fsobj_id _dyldCache.fsobjid     — { u32 fid_objno; u32 fid_generation } = 8 bytes
-                        //   uint32_t _osCryptexPathOffset   — 4 bytes (v1)
-                        //   uint32_t _cachePathOffset       — 4 bytes (v2)
-                        //   ...more v3 fields...
-                        let write_start = new_offset as usize;
-                        let magic = b"dyld_data    v3\0";
-                        // Zero-fill the region first.
-                        data[write_start..write_start + size].fill(0);
-                        data[write_start..write_start + 16].copy_from_slice(magic);
-                        // FileIdTuple at bytes 16..32: must be non-zero so
-                        // FileIdTuple::operator bool() returns true and dyld
-                        // doesn't halt.  Write fake but non-zero values.
-                        // fsid.val[0] (i32 LE) at offset 16
-                        data[write_start + 16..write_start + 20]
-                            .copy_from_slice(&1_i32.to_le_bytes());
-                        // fsid.val[1] (i32 LE) at offset 20
-                        data[write_start + 20..write_start + 24]
-                            .copy_from_slice(&0_i32.to_le_bytes());
-                        // fsobjid.fid_objno (u32 LE) at offset 24
-                        data[write_start + 24..write_start + 28]
-                            .copy_from_slice(&1_u32.to_le_bytes());
-                        // fsobjid.fid_generation (u32 LE) at offset 28
-                        data[write_start + 28..write_start + 32]
-                            .copy_from_slice(&0_u32.to_le_bytes());
-                    }
+                    // Write the synthesized dynamic config data struct
+                    // into our header data buffer.
+                    //
+                    // DynamicRegion layout (from dyld open source):
+                    //   char     _magic[16]             — "dyld_data    v3\0"
+                    //   fsid_t   _dyldCache.fsid        — { int32_t val[2] } = 8 bytes
+                    //   fsobj_id _dyldCache.fsobjid     — { u32 fid_objno; u32 fid_generation } = 8 bytes
+                    //   uint32_t _osCryptexPathOffset   — 4 bytes (v1)
+                    //   uint32_t _cachePathOffset       — 4 bytes (v2)
+                    //   ...more v3 fields...
+                    let write_start = new_offset as usize;
+                    let magic = b"dyld_data    v3\0";
+                    // Zero-fill the region first.
+                    data[write_start..write_start + size].fill(0);
+                    data[write_start..write_start + 16].copy_from_slice(magic);
+                    // FileIdTuple at bytes 16..32: must be non-zero so
+                    // FileIdTuple::operator bool() returns true and dyld
+                    // doesn't halt.  Write fake but non-zero values.
+                    // fsid.val[0] (i32 LE) at offset 16
+                    data[write_start + 16..write_start + 20].copy_from_slice(&1_i32.to_le_bytes());
+                    // fsid.val[1] (i32 LE) at offset 20
+                    data[write_start + 20..write_start + 24].copy_from_slice(&0_i32.to_le_bytes());
+                    // fsobjid.fid_objno (u32 LE) at offset 24
+                    data[write_start + 24..write_start + 28].copy_from_slice(&1_u32.to_le_bytes());
+                    // fsobjid.fid_generation (u32 LE) at offset 28
+                    data[write_start + 28..write_start + 32].copy_from_slice(&0_u32.to_le_bytes());
                 }
-
-                regions.push(SharedCacheRegion {
-                    guest_addr: header_start,
-                    data,
-                    prot: first_mapping.prot,
-                });
             }
+
+            regions.push(SharedCacheRegion {
+                guest_addr: header_start,
+                data,
+                prot: first_mapping.prot,
+            });
         }
     }
 
@@ -422,9 +419,8 @@ pub fn collect_regions(
     let mut linkedit_ranges: Vec<(u64, u64)> = Vec::new();
 
     for &dylib_path in needed_dylibs {
-        let entry = match cache_map.dylibs.get(dylib_path) {
-            Some(e) => e,
-            None => continue,
+        let Some(entry) = cache_map.dylibs.get(dylib_path) else {
+            continue;
         };
 
         for seg in &entry.segments {
@@ -441,9 +437,8 @@ pub fn collect_regions(
             let prot = segment_protection(&seg.name, seg.vm_start, &cache_map.mappings);
 
             // Find the sub-cache file that contains this VM address.
-            let sc = match subcaches.iter().find(|s| s.contains_vmaddr(seg.vm_start)) {
-                Some(s) => s,
-                None => continue,
+            let Some(sc) = subcaches.iter().find(|s| s.contains_vmaddr(seg.vm_start)) else {
+                continue;
             };
 
             if let Some(data) = sc.read_region(seg.vm_start, seg.vm_end) {
@@ -457,16 +452,15 @@ pub fn collect_regions(
     }
 
     // Deduplicate and read LINKEDIT ranges.
-    linkedit_ranges.sort();
+    linkedit_ranges.sort_unstable();
     linkedit_ranges.dedup();
     for (vm_start, vm_end) in &linkedit_ranges {
         let key = (*vm_start, *vm_end);
         if !seen.insert(key) {
             continue;
         }
-        let sc = match subcaches.iter().find(|s| s.contains_vmaddr(*vm_start)) {
-            Some(s) => s,
-            None => continue,
+        let Some(sc) = subcaches.iter().find(|s| s.contains_vmaddr(*vm_start)) else {
+            continue;
         };
         if let Some(data) = sc.read_region(*vm_start, *vm_end) {
             regions.push(SharedCacheRegion {
@@ -558,6 +552,7 @@ mapping  RO  120MB 0x1F73F0000 -> 0x1FEC78000
 
     #[test]
     #[ignore = "requires access to /System/Cryptexes/OS/System/Library/dyld/"]
+    #[allow(clippy::cast_precision_loss)]
     fn test_read_real_cache_regions() {
         let cache_dir = std::path::Path::new("/System/Cryptexes/OS/System/Library/dyld/");
         if !cache_dir.exists() {
@@ -569,7 +564,7 @@ mapping  RO  120MB 0x1F73F0000 -> 0x1FEC78000
         let map_text = std::fs::read_to_string(&map_path).expect("failed to read map file");
         let cache_map = CacheMap::parse(&map_text);
         let sys_paths = cache_map.system_dylib_paths();
-        let needed: Vec<&str> = sys_paths.iter().map(|s| s.as_str()).collect();
+        let needed: Vec<&str> = sys_paths.iter().map(std::string::String::as_str).collect();
 
         eprintln!("Collecting regions for {} dylibs...", needed.len());
         let result = collect_regions(cache_dir, &cache_map, &needed);

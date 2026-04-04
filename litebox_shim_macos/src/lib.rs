@@ -19,14 +19,14 @@ use alloc::vec::Vec;
 use core::cell::Cell;
 use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use litebox::{
+    LiteBox,
     fd::RawDescriptorStorage,
-    mm::{linux::PAGE_SIZE, PageManager},
+    mm::{PageManager, linux::PAGE_SIZE},
     net::Network,
     pipes::Pipes,
     platform::TimeProvider,
     shim::ContinueOperation,
     sync::futex::FutexManager,
-    LiteBox,
 };
 use litebox_common_macos::PtRegs;
 use litebox_platform_multiplex::Platform;
@@ -214,10 +214,10 @@ impl<FS: ShimFS> MacosShim<FS> {
             let sp = load_info.user_stack_top;
             initial_ctx.regs[0] = arg_count; // x0 = argc
             initial_ctx.regs[1] = sp + size_of::<usize>(); // x1 = &argv[0]
-                                                           // x2 = envp: skip past argc + argv pointers + NULL terminator
+            // x2 = envp: skip past argc + argv pointers + NULL terminator
             let envp_offset = size_of::<usize>() + (arg_count + 1) * size_of::<usize>();
             initial_ctx.regs[2] = sp + envp_offset; // x2 = &envp[0]
-                                                    // x3 = apple: skip past envp pointers + NULL terminator
+            // x3 = apple: skip past envp pointers + NULL terminator
             let apple_offset = envp_offset + (env_count + 1) * size_of::<usize>();
             initial_ctx.regs[3] = sp + apple_offset; // x3 = &apple[0]
         }
@@ -242,6 +242,7 @@ impl<FS: ShimFS> MacosShim<FS> {
     ///
     /// `cache_base` is typically `0x180000000`.
     /// `regions` is a slice of `(guest_addr, data, is_executable)` tuples.
+    #[allow(clippy::missing_panics_doc, clippy::cast_possible_truncation)]
     pub fn install_shared_cache(
         &self,
         cache_base: u64,
@@ -478,7 +479,7 @@ impl<FS: ShimFS> MacosShim<FS> {
                 return;
             }
             let dist = code_mid.abs_diff(candidate + tramp_size / 2);
-            if best.map_or(true, |(d, _)| dist < d) {
+            if best.is_none_or(|(d, _)| dist < d) {
                 best = Some((dist, candidate));
             }
         };
@@ -703,6 +704,11 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Handle a macOS syscall and write the result back to the register context.
+    #[allow(
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation
+    )]
     fn handle_syscall_request(&self, ctx: &mut PtRegs) {
         // Debug: trace all syscall numbers
         if cfg!(debug_assertions) {

@@ -8,8 +8,8 @@
 
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, SystemInfoProvider as _};
 use litebox_common_linux::{MapFlags, ProtFlags};
-use litebox_common_macos::errno::Errno;
 use litebox_common_macos::PtRegs;
+use litebox_common_macos::errno::Errno;
 
 use crate::{ConstPtr, MutPtr, ShimFS, Task};
 
@@ -302,6 +302,8 @@ impl<FS: ShimFS> Task<FS> {
     /// Allocates anonymous RW memory. The address parameter is a pointer to the
     /// desired/result address, similar to `mach_vm_map`.
     pub(crate) fn sys_mach_vm_allocate(&self, ctx: &mut PtRegs) -> Result<usize, Errno> {
+        const VM_FLAGS_ANYWHERE: usize = 0x1;
+
         let addr_ptr_usize = ctx.regs[1];
         let size = ctx.regs[2];
         let flags = ctx.regs[3];
@@ -310,7 +312,6 @@ impl<FS: ShimFS> Task<FS> {
         let addr_ptr: ConstPtr<usize> = ConstPtr::from_usize(addr_ptr_usize);
         let desired_addr = addr_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
 
-        const VM_FLAGS_ANYWHERE: usize = 0x1;
         let is_anywhere = (flags & VM_FLAGS_ANYWHERE) != 0;
 
         // Build anonymous RW mmap.

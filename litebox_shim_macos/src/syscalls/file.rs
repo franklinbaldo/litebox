@@ -26,7 +26,7 @@ fn fd_to_usize(fd: i32) -> Result<usize, Errno> {
 pub(crate) fn read_cstring_from_guest(ptr: ConstPtr<u8>, max_len: usize) -> Option<String> {
     let mut buf = alloc::vec::Vec::with_capacity(256);
     for i in 0..max_len {
-        let byte: u8 = ptr.read_at_offset(i as isize)?;
+        let byte: u8 = ptr.read_at_offset(i.cast_signed())?;
         if byte == 0 {
             return String::from_utf8(buf).ok();
         }
@@ -102,10 +102,10 @@ impl<FS: ShimFS> Task<FS> {
         // Debug: log write calls to see dyld error messages (written to fd -1, 1, or 2)
         if fd == -1 || fd == 1 || fd == 2 {
             let user_buf_dbg: ConstPtr<u8> = ConstPtr::from_usize(buf_addr);
-            if let Some(data) = user_buf_dbg.to_owned_slice(count.min(256)) {
-                if let Ok(s) = core::str::from_utf8(&data) {
-                    log_unsupported!("write(fd={fd}, count={count}): {s:?}");
-                }
+            if let Some(data) = user_buf_dbg.to_owned_slice(count.min(256))
+                && let Ok(s) = core::str::from_utf8(&data)
+            {
+                log_unsupported!("write(fd={fd}, count={count}): {s:?}");
             }
         }
 
@@ -134,17 +134,17 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle `close(fd)`.
     pub(crate) fn sys_close(&self, fd: i32) -> Result<(), Errno> {
         // Finalize any mmap-hook trampoline for this fd
-        if let Some(state) = self.patch_cache.borrow_mut().remove(&fd) {
-            if state.trampoline_cursor > 0 {
-                // mprotect trampoline from RW to RX
-                if let Err(e) = litebox_common_linux::mm::sys_mprotect(
-                    &self.global.pm,
-                    crate::MutPtr::from_usize(state.trampoline_addr),
-                    crate::MMAP_HOOK_TRAMPOLINE_SIZE,
-                    litebox_common_linux::ProtFlags::PROT_READ_EXEC,
-                ) {
-                    log_unsupported!("mprotect trampoline RW->RX failed: {e:?}");
-                }
+        if let Some(state) = self.patch_cache.borrow_mut().remove(&fd)
+            && state.trampoline_cursor > 0
+        {
+            // mprotect trampoline from RW to RX
+            if let Err(e) = litebox_common_linux::mm::sys_mprotect(
+                &self.global.pm,
+                crate::MutPtr::from_usize(state.trampoline_addr),
+                crate::MMAP_HOOK_TRAMPOLINE_SIZE,
+                litebox_common_linux::ProtFlags::PROT_READ_EXEC,
+            ) {
+                log_unsupported!("mprotect trampoline RW->RX failed: {e:?}");
             }
         }
 
@@ -344,7 +344,6 @@ impl<FS: ShimFS> Task<FS> {
         stat_buf[0..4].copy_from_slice(&(status.node_info.dev as i32).to_le_bytes());
         // st_mode at offset 4 (u16)
         let mode: u16 = match status.file_type {
-            litebox::fs::FileType::RegularFile => 0o100644,
             litebox::fs::FileType::Directory => 0o040755,
             litebox::fs::FileType::CharacterDevice => 0o020666,
             _ => 0o100644, // default to regular file for unknown types
@@ -359,7 +358,7 @@ impl<FS: ShimFS> Task<FS> {
         // st_gid at offset 20 (u32)
         stat_buf[20..24].copy_from_slice(&(u32::from(status.owner.group)).to_le_bytes());
         // st_rdev at offset 24 (i32)
-        let rdev = status.node_info.rdev.map(|r| r.get() as i32).unwrap_or(0);
+        let rdev = status.node_info.rdev.map_or(0, |r| r.get() as i32);
         stat_buf[24..28].copy_from_slice(&rdev.to_le_bytes());
         // st_size at offset 96 (i64)
         stat_buf[96..104].copy_from_slice(&(status.size as i64).to_le_bytes());
@@ -381,8 +380,7 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_fcntl(&self, fd: i32, cmd: i32, arg: usize) -> Result<usize, Errno> {
         let raw_fd = fd_to_usize(fd)?;
         match cmd {
-            3 => Ok(0), // F_GETFL: return O_RDONLY
-            4 => Ok(0), // F_SETFL: pretend success
+            3 | 4 => Ok(0), // F_GETFL / F_SETFL
             50 => {
                 // F_GETPATH: write the file's path (NUL-terminated) to the
                 // user buffer at `arg`. Maximum MAXPATHLEN = 1024 bytes.
@@ -396,7 +394,7 @@ impl<FS: ShimFS> Task<FS> {
                 let dest: MutPtr<u8> = MutPtr::from_usize(arg);
                 dest.copy_from_slice(0, path_bytes).ok_or(Errno::EFAULT)?;
                 // Write NUL terminator
-                dest.write_at_offset(path_bytes.len() as isize, 0u8)
+                dest.write_at_offset(path_bytes.len().cast_signed(), 0u8)
                     .ok_or(Errno::EFAULT)?;
                 log_unsupported!("fcntl(fd={fd}, F_GETPATH) → {path:?}");
                 Ok(0)

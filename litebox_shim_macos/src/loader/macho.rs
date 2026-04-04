@@ -14,12 +14,12 @@ use alloc::ffi::CString;
 use alloc::vec::Vec;
 use litebox::mm::linux::{CreatePagesFlags, PAGE_SIZE};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, SystemInfoProvider as _};
+use object::Endianness;
 use object::macho;
 use object::read::macho::MachHeader;
-use object::Endianness;
 
 use super::stack::UserStack;
-use super::{DyldLoadInfo, MachoLoadInfo, MachoLoaderError, DEFAULT_LOW_ADDR, DEFAULT_STACK_SIZE};
+use super::{DEFAULT_LOW_ADDR, DEFAULT_STACK_SIZE, DyldLoadInfo, MachoLoadInfo, MachoLoaderError};
 use crate::{MutPtr, ShimFS, Task};
 
 /// Byte offset of the PC register within an LC_UNIXTHREAD ARM64 thread state command.
@@ -297,9 +297,9 @@ pub(crate) fn load<FS: ShimFS>(
     const TLS_TABLE_TOTAL_ENTRIES: usize = TLS_TABLE_USABLE_ENTRIES + TLS_TABLE_OVERFLOW_ENTRIES;
     #[allow(clippy::items_after_statements)]
     const TLS_TABLE_SIZE: usize = TLS_TABLE_TOTAL_ENTRIES * TLS_ENTRY_SIZE; // 4224 bytes
-                                                                            // On macOS aarch64, the host page size is 16KB. Align the TLS table
-                                                                            // to 16KB to ensure it gets its own host page and doesn't share a
-                                                                            // page with any trampoline (which may be mprotected to R-X).
+    // On macOS aarch64, the host page size is 16KB. Align the TLS table
+    // to 16KB to ensure it gets its own host page and doesn't share a
+    // page with any trampoline (which may be mprotected to R-X).
     #[allow(clippy::items_after_statements)]
     const HOST_PAGE_SIZE: usize = 16384;
 
@@ -460,8 +460,7 @@ pub(crate) fn load<FS: ShimFS>(
         let executable_mh = reserved_base;
         let executable_path = argv
             .first()
-            .map(|a| a.to_str().unwrap_or("./a.out"))
-            .unwrap_or("./a.out");
+            .map_or("./a.out", |a| a.to_str().unwrap_or("./a.out"));
         let apple = alloc::vec![
             CString::new(alloc::format!("executable_mh=0x{executable_mh:x}"))
                 .map_err(|_| MachoLoaderError::InvalidStackAddr)?,
@@ -533,6 +532,8 @@ fn load_dyld<FS: ShimFS>(
     task: &Task<FS>,
     dyld_bytes: &[u8],
 ) -> Result<DyldLoadInfo, MachoLoaderError> {
+    const DYLD_HINT_OFFSET: usize = 256 * 1024 * 1024; // 256 MB
+
     // Extract arm64 slice if this is a universal binary
     let slice_data: &[u8] = if let Some((offset, size)) = extract_arm64_slice(dyld_bytes) {
         if offset + size > dyld_bytes.len() {
@@ -617,8 +618,6 @@ fn load_dyld<FS: ShimFS>(
     // Reserve-then-map strategy, same as for main binary but with a hint address
     // 256MB above DEFAULT_LOW_ADDR to avoid the main binary. This is only a hint —
     // if the region is occupied, the kernel will choose a different address.
-    const DYLD_HINT_OFFSET: usize = 256 * 1024 * 1024; // 256 MB
-
     let min_vmaddr = segments
         .iter()
         .filter(|s| s.vmsize > 0)
@@ -720,7 +719,9 @@ fn load_dyld<FS: ShimFS>(
 
     // Debug: log dyld load info
     if cfg!(debug_assertions) {
-        log_unsupported!("dyld loaded: slide={slide:#x} entry={entry_point:#x} reserved_base={reserved_base:#x} min_vmaddr={min_vmaddr:#x}");
+        log_unsupported!(
+            "dyld loaded: slide={slide:#x} entry={entry_point:#x} reserved_base={reserved_base:#x} min_vmaddr={min_vmaddr:#x}"
+        );
     }
 
     // --- Initialize dyld's __LITEBOX trampoline ---

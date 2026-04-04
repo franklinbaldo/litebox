@@ -8,7 +8,7 @@ pub(crate) mod mm;
 pub(crate) mod process;
 pub(crate) mod stubs;
 
-use litebox_common_macos::{errno::Errno, syscall::MacosSyscallRequest, PtRegs};
+use litebox_common_macos::{PtRegs, errno::Errno, syscall::MacosSyscallRequest};
 
 use crate::{ShimFS, Task};
 
@@ -102,7 +102,7 @@ impl<FS: ShimFS> Task<FS> {
             MacosSyscallRequest::ThreadSelfid => self.sys_thread_selfid(),
             MacosSyscallRequest::MachMsg2Trap { .. } => self.sys_mach_msg2_trap(),
             MacosSyscallRequest::MachTrap { number } => self.do_mach_trap(number, ctx),
-            MacosSyscallRequest::CrossarchTrap => Ok(0),
+            MacosSyscallRequest::CrossarchTrap | MacosSyscallRequest::KdebugTraceString => Ok(0),
             MacosSyscallRequest::Csrctl => Err(Errno::EPERM),
             MacosSyscallRequest::Dup2 { oldfd, newfd } => self.sys_dup2(oldfd, newfd),
             MacosSyscallRequest::MacSyscall => Err(Errno::ENOSYS),
@@ -111,7 +111,6 @@ impl<FS: ShimFS> Task<FS> {
                 log_unsupported!("shared_region_map_and_slide_2_np: no-op (cache pre-mapped)");
                 Ok(0)
             }
-            MacosSyscallRequest::KdebugTraceString => Ok(0),
             MacosSyscallRequest::Statfs64 { path, buf } => self.sys_statfs64(path, buf),
             MacosSyscallRequest::Stat64 { path, buf } => self.sys_stat64(path, buf),
             MacosSyscallRequest::Openat {
