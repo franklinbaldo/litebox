@@ -7,9 +7,9 @@
 //! bootstrap and hello.c execution.
 
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
-use litebox_common_macos::PtRegs;
 use litebox_common_macos::errno::Errno;
 use litebox_common_macos::syscall::mach_trap;
+use litebox_common_macos::PtRegs;
 
 use crate::{MutPtr, ShimFS, Task};
 
@@ -212,13 +212,13 @@ impl<FS: ShimFS> Task<FS> {
         Ok(0)
     }
 
-    /// Handle `thread_selfid()` — return a fake thread ID.
+    /// Handle `thread_selfid()` — return the thread ID for this task.
     ///
     /// This is used by dyld during bootstrap. The exact value doesn't matter
     /// as long as it's nonzero and consistent within the process.
     #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn sys_thread_selfid(&self) -> Result<usize, Errno> {
-        Ok(1)
+        Ok(self.tid as usize)
     }
 
     /// Handle `mach_msg2_trap()` — modern Mach IPC (macOS 12+).

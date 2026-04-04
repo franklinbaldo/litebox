@@ -8,8 +8,8 @@
 
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, SystemInfoProvider as _};
 use litebox_common_linux::{MapFlags, ProtFlags};
-use litebox_common_macos::PtRegs;
 use litebox_common_macos::errno::Errno;
+use litebox_common_macos::PtRegs;
 
 use crate::{ConstPtr, MutPtr, ShimFS, Task};
 
@@ -225,7 +225,7 @@ impl<FS: ShimFS> Task<FS> {
 
         // Look up or allocate trampoline for this fd
         let syscall_entry = litebox_platform_multiplex::platform().get_syscall_entry_point();
-        let mut cache = self.patch_cache.borrow_mut();
+        let mut cache = self.patch_cache.lock();
         let state = match cache.entry(fd) {
             alloc::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
             alloc::collections::btree_map::Entry::Vacant(entry) => {

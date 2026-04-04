@@ -16,15 +16,14 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::cell::Cell;
-use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use litebox::{
     LiteBox,
     fd::RawDescriptorStorage,
     mm::{PageManager, linux::PAGE_SIZE},
     net::Network,
     pipes::Pipes,
-    platform::TimeProvider,
+    platform::{PunchthroughProvider as _, PunchthroughToken as _, TimeProvider},
     shim::ContinueOperation,
     sync::futex::FutexManager,
 };
@@ -49,6 +48,68 @@ pub(crate) fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {
     if cfg!(debug_assertions) {
         let msg = alloc::format!("WARNING: unsupported: {args}\n");
         litebox_platform_multiplex::platform().debug_log_print(&msg);
+    }
+}
+
+/// Per-thread initialization state, set before the thread is resumed.
+#[derive(Default)]
+#[allow(dead_code, reason = "BsdThread variant used by bsdthread_create in a future task")]
+enum ThreadInitState {
+    #[default]
+    None,
+    /// A new thread created via `bsdthread_create`.
+    BsdThread {
+        /// Address of the `_thread_start` trampoline (from bsdthread_register).
+        threadstart: usize,
+        /// User's start function pointer.
+        func: usize,
+        /// User's function argument.
+        func_arg: usize,
+        /// Stack top (SP will be set to this).
+        stack: usize,
+        /// Address of the pthread_t struct.
+        pthread: usize,
+        /// Combined flags|policy|importance.
+        flags: u32,
+        /// Mach thread port for this thread.
+        mach_port: u32,
+        /// Offset from pthread_t base to TSD array.
+        tsd_offset: u32,
+    },
+}
+
+/// Shared process state, accessible from all threads via `Arc`.
+#[allow(dead_code, reason = "fields used by bsdthread syscalls in future tasks")]
+struct Process {
+    /// Number of live threads. When this reaches 0, the process has exited.
+    nr_threads: AtomicI32,
+    /// Process exit code.
+    exit_code: AtomicI32,
+    /// Whether a group exit has been initiated (exit() as opposed to
+    /// bsdthread_terminate for a single thread).
+    group_exit: AtomicBool,
+    /// Address of the `_thread_start` asm trampoline, registered once by
+    /// libpthread via `bsdthread_register`. Zero if not yet registered.
+    threadstart: AtomicU64,
+    /// Address of the `_start_wqthread` asm trampoline.
+    wqthread: AtomicU64,
+    /// Size of the pthread struct (`pthsize`).
+    pthsize: AtomicU32,
+    /// Offset from pthread_t to TSD base (set by bsdthread_register).
+    tsd_offset: AtomicU32,
+}
+
+impl Process {
+    fn new() -> Self {
+        Self {
+            nr_threads: AtomicI32::new(1),
+            exit_code: AtomicI32::new(0),
+            group_exit: AtomicBool::new(false),
+            threadstart: AtomicU64::new(0),
+            wqthread: AtomicU64::new(0),
+            pthsize: AtomicU32::new(0),
+            tsd_offset: AtomicU32::new(0),
+        }
     }
 }
 
@@ -181,18 +242,19 @@ impl<FS: ShimFS> MacosShim<FS> {
         envp: Vec<alloc::ffi::CString>,
         dyld_bytes: Option<&[u8]>,
     ) -> Result<LoadedProgram<FS>, loader::MachoLoaderError> {
-        let exit_code = Arc::new(AtomicI32::new(0));
+        let process = Arc::new(Process::new());
 
         self.initialize_stdio();
 
         let entrypoints = MacosShimEntrypoints {
             task: Task {
                 global: self.0.clone(),
-                terminated: Cell::new(false),
-                exit_code: exit_code.clone(),
-                patch_cache: core::cell::RefCell::new(BTreeMap::new()),
+                process: process.clone(),
+                tid: 1,
+                terminated: AtomicBool::new(false),
+                patch_cache: litebox::sync::Mutex::new(BTreeMap::new()),
+                init_state: litebox::sync::Mutex::new(ThreadInitState::None),
             },
-            _not_send: core::marker::PhantomData,
         };
 
         let arg_count = argv.len();
@@ -224,7 +286,7 @@ impl<FS: ShimFS> MacosShim<FS> {
 
         Ok(LoadedProgram {
             entrypoints,
-            process: MacosShimProcess(exit_code),
+            process: MacosShimProcess(process),
             initial_ctx,
         })
     }
@@ -553,27 +615,33 @@ pub struct LoadedProgram<FS: ShimFS> {
 /// A handle to a process loaded via [`MacosShim::load_program`].
 ///
 /// Can be used to retrieve the exit code after the process terminates.
-pub struct MacosShimProcess(Arc<AtomicI32>);
+pub struct MacosShimProcess(Arc<Process>);
 
 impl MacosShimProcess {
     /// Returns the exit code set by the process.
     pub fn exit_code(&self) -> i32 {
-        self.0.load(Ordering::Acquire)
+        self.0.exit_code.load(Ordering::Acquire)
     }
 
     /// Wait for the process to exit, returning its exit code.
     ///
-    /// In phase 1 (single-threaded), this is a simple synchronous read since
-    /// `run_thread` has already returned by the time the runner calls this.
+    /// Spins until `group_exit` is set or `nr_threads` reaches 0.
     pub fn wait(&self) -> i32 {
-        self.0.load(Ordering::Acquire)
+        loop {
+            if self.0.group_exit.load(Ordering::Acquire) {
+                return self.0.exit_code.load(Ordering::Acquire);
+            }
+            if self.0.nr_threads.load(Ordering::Acquire) <= 0 {
+                return self.0.exit_code.load(Ordering::Acquire);
+            }
+            core::hint::spin_loop();
+        }
     }
 }
 
 /// The shim entrypoints, implementing `EnterShim` for the macOS platform.
 pub struct MacosShimEntrypoints<FS: ShimFS> {
     task: Task<FS>,
-    _not_send: core::marker::PhantomData<*const ()>,
 }
 
 impl<FS: ShimFS> litebox::shim::EnterShim for MacosShimEntrypoints<FS> {
@@ -608,6 +676,9 @@ impl<FS: ShimFS> litebox::shim::EnterShim for MacosShimEntrypoints<FS> {
             ctx.regs[3],
             ctx.regs[16]
         );
+        // Signal process termination so wait() won't spin forever.
+        self.task.process.group_exit.store(true, Ordering::Release);
+        self.task.terminated.store(true, Ordering::Release);
         ContinueOperation::Terminate
     }
 
@@ -634,8 +705,7 @@ impl<FS: ShimFS> MacosShimEntrypoints<FS> {
 
 /// Global shim state, shared across all tasks.
 struct GlobalState<FS: ShimFS> {
-    /// The platform instance (used for diagnostics and time queries).
-    #[expect(dead_code, reason = "will be used for clock_gettime and diagnostics")]
+    /// The platform instance (used for diagnostics, time queries, and punchthrough).
     platform: &'static Platform,
     /// The LiteBox instance.
     litebox: LiteBox<Platform>,
@@ -680,27 +750,73 @@ pub(crate) struct MachoPatchState {
 /// Size of the per-fd trampoline region allocated by the mmap-hook (16 KB).
 pub(crate) const MMAP_HOOK_TRAMPOLINE_SIZE: usize = 16 * 1024;
 
-/// A single task (single-threaded for macOS phase 1).
+/// Per-thread task state.
 struct Task<FS: ShimFS> {
     global: Arc<GlobalState<FS>>,
-    /// Whether this task has been terminated (e.g., via sys_exit).
-    terminated: Cell<bool>,
-    /// The exit code, shared with `MacosShimProcess`.
-    exit_code: Arc<AtomicI32>,
+    /// Shared process state.
+    process: Arc<Process>,
+    /// Thread ID for this thread.
+    tid: i32,
+    /// Whether this thread has been terminated.
+    terminated: AtomicBool,
     /// Per-fd patch state for the mmap-hook. Tracks trampoline allocation
     /// and cursor for each fd that has had executable segments mapped.
-    patch_cache: core::cell::RefCell<BTreeMap<i32, MachoPatchState>>,
+    patch_cache: litebox::sync::Mutex<Platform, BTreeMap<i32, MachoPatchState>>,
+    /// Initialization state for this thread (set before first entry).
+    init_state: litebox::sync::Mutex<Platform, ThreadInitState>,
 }
 
 impl<FS: ShimFS> Task<FS> {
     /// Returns whether this task should terminate.
     fn should_terminate(&self) -> bool {
-        self.terminated.get()
+        self.terminated.load(Ordering::Acquire) || self.process.group_exit.load(Ordering::Acquire)
     }
 
-    /// Handle the init request — nothing to do in phase 1.
+    /// Handle the init request — set up registers for new threads.
     fn handle_init_request(&self, ctx: &mut PtRegs) {
-        let _ = ctx;
+        let state = {
+            let mut guard = self.init_state.lock();
+            core::mem::take(&mut *guard)
+        };
+        match state {
+            ThreadInitState::None => {}
+            ThreadInitState::BsdThread {
+                threadstart,
+                func,
+                func_arg,
+                stack,
+                pthread,
+                flags,
+                mach_port,
+                tsd_offset,
+            } => {
+                // Set up registers per the macOS bsdthread ABI:
+                // PC = _thread_start, SP = stack
+                // x0 = pthread_t, x1 = mach_port, x2 = func, x3 = arg,
+                // x4 = stack, x5 = flags
+                ctx.pc = threadstart;
+                ctx.sp = stack;
+                ctx.regs[0] = pthread;
+                ctx.regs[1] = mach_port as usize;
+                ctx.regs[2] = func;
+                ctx.regs[3] = func_arg;
+                ctx.regs[4] = stack;
+                ctx.regs[5] = flags as usize;
+
+                // Set TSD base if tsd_offset is known.
+                if tsd_offset > 0 {
+                    let tsd_base = pthread + tsd_offset as usize;
+                    let punchthrough =
+                        litebox_common_linux::PunchthroughSyscall::SetTpidr { value: tsd_base };
+                    let token = self
+                        .global
+                        .platform
+                        .get_punchthrough_token_for(punchthrough)
+                        .expect("Failed to get punchthrough token for SetTpidr");
+                    token.execute().map(|_| ()).unwrap();
+                }
+            }
+        }
     }
 
     /// Handle a macOS syscall and write the result back to the register context.

@@ -10,8 +10,9 @@ use crate::{ShimFS, Task};
 impl<FS: ShimFS> Task<FS> {
     /// Handle `exit(status)` — mark the task as terminated and record the exit code.
     pub(crate) fn sys_exit(&self, status: i32) {
-        self.exit_code.store(status, Ordering::Release);
-        self.terminated.set(true);
+        self.process.exit_code.store(status, Ordering::Release);
+        self.process.group_exit.store(true, Ordering::Release);
+        self.terminated.store(true, Ordering::Release);
     }
 
     /// Handle `getpid()` — return a fixed PID (single-process phase 1).

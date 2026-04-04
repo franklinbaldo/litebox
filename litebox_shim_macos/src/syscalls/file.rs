@@ -134,7 +134,7 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle `close(fd)`.
     pub(crate) fn sys_close(&self, fd: i32) -> Result<(), Errno> {
         // Finalize any mmap-hook trampoline for this fd
-        if let Some(state) = self.patch_cache.borrow_mut().remove(&fd)
+        if let Some(state) = self.patch_cache.lock().remove(&fd)
             && state.trampoline_cursor > 0
         {
             // mprotect trampoline from RW to RX
