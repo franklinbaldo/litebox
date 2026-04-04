@@ -158,8 +158,14 @@ impl<FS: ShimFS> Task<FS> {
                     pthread_init_data_size,
                 )
                 .map(|v| v as usize),
-            MacosSyscallRequest::BsdthreadCreate { .. }
-            | MacosSyscallRequest::BsdthreadTerminate { .. }
+            MacosSyscallRequest::BsdthreadCreate {
+                func,
+                func_arg,
+                stack,
+                pthread,
+                flags,
+            } => self.sys_bsdthread_create(func, func_arg, stack, pthread, flags, ctx),
+            MacosSyscallRequest::BsdthreadTerminate { .. }
             | MacosSyscallRequest::BsdthreadCtl { .. } => {
                 log_unsupported!("bsdthread syscall not yet implemented");
                 Err(Errno::ENOSYS)

@@ -6,7 +6,8 @@
 //! These handlers provide minimal implementations sufficient for dyld
 //! bootstrap and hello.c execution.
 
-use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+use alloc::boxed::Box;
+use litebox::platform::{RawConstPointer as _, RawMutPointer as _, ThreadProvider as _};
 use litebox_common_macos::errno::Errno;
 use litebox_common_macos::syscall::mach_trap;
 use litebox_common_macos::PtRegs;
@@ -254,7 +255,13 @@ impl<FS: ShimFS> Task<FS> {
                 Ok(0) // KERN_SUCCESS
             }
             mach_trap::MACH_REPLY_PORT => Ok(0x0703),
-            mach_trap::THREAD_SELF_TRAP => Ok(0x0303),
+            mach_trap::THREAD_SELF_TRAP => {
+                if self.tid == 1 {
+                    Ok(0x0303)
+                } else {
+                    Ok(((self.tid as usize) + 2) << 8 | 0x03)
+                }
+            }
             mach_trap::TASK_SELF_TRAP => Ok(0x0103),
             mach_trap::HOST_SELF_TRAP => Ok(0x0503),
             mach_trap::MACH_MSG_TRAP => {
@@ -327,5 +334,80 @@ impl<FS: ShimFS> Task<FS> {
 
         // Return 0 for minimal pthread feature support.
         Ok(0)
+    }
+
+    /// Handle `bsdthread_create` — create a new thread.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `bsdthread_register` has not been called (threadstart == 0).
+    pub(crate) fn sys_bsdthread_create(
+        &self,
+        func: usize,
+        func_arg: usize,
+        stack: usize,
+        pthread: usize,
+        flags: u32,
+        ctx: &PtRegs,
+    ) -> Result<usize, Errno> {
+        use core::sync::atomic::Ordering;
+
+        let threadstart = self.process.threadstart.load(Ordering::Acquire) as usize;
+        if threadstart == 0 {
+            log_unsupported!("bsdthread_create called before bsdthread_register");
+            return Err(Errno::EINVAL);
+        }
+
+        let tid = self.process.next_tid.fetch_add(1, Ordering::Relaxed);
+        let mach_port = self
+            .process
+            .next_mach_port
+            .fetch_add(0x100, Ordering::Relaxed);
+        let tsd_offset = self.process.tsd_offset.load(Ordering::Acquire);
+
+        log_unsupported!(
+            "bsdthread_create(func={func:#x}, arg={func_arg:#x}, stack={stack:#x}, \
+             pthread={pthread:#x}, flags={flags:#x}) → tid={tid}, port={mach_port:#x}"
+        );
+
+        // Increment thread count before spawning.
+        self.process.nr_threads.fetch_add(1, Ordering::Release);
+
+        // Set PTHREAD_START_TSD_BASE_SET (0x10000000) in flags to tell
+        // libpthread that we pre-configured the TSD base.
+        let flags_with_tsd = flags | 0x1000_0000;
+
+        let child_task = crate::Task {
+            global: self.global.clone(),
+            process: self.process.clone(),
+            tid,
+            terminated: core::sync::atomic::AtomicBool::new(false),
+            patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+            init_state: litebox::sync::Mutex::new(crate::ThreadInitState::BsdThread {
+                threadstart,
+                func,
+                func_arg,
+                stack,
+                pthread,
+                flags: flags_with_tsd,
+                mach_port,
+                tsd_offset,
+            }),
+        };
+
+        let r = unsafe {
+            self.global
+                .platform
+                .spawn_thread(ctx, Box::new(crate::NewThreadArgs { task: child_task }))
+        };
+
+        if let Err(err) = r {
+            self.process.nr_threads.fetch_sub(1, Ordering::Release);
+            log_unsupported!("bsdthread_create: spawn_thread failed: {err}");
+            return Err(Errno::EAGAIN);
+        }
+
+        // Return the pthread address (what the kernel returns on success).
+        Ok(pthread)
     }
 }
