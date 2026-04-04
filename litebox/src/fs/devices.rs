@@ -880,7 +880,7 @@ impl<
     }
 
     fn rename(&self, _old: impl Arg, _new: impl Arg) -> Result<(), RenameError> {
-        unimplemented!()
+        Err(RenameError::NotSupported)
     }
 
     #[expect(unused_variables, reason = "not supported by device filesystem")]
@@ -1075,7 +1075,7 @@ impl<
         _new_dirfd: &FileFd<Platform>,
         _new_rel: impl crate::path::Arg,
     ) -> Result<(), super::errors::RenameError> {
-        Err(super::errors::RenameError::Io)
+        Err(super::errors::RenameError::NotSupported)
     }
 
     fn fd_path(&self, _fd: &FileFd<Platform>) -> Option<alloc::string::String> {

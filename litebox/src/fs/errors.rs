@@ -235,6 +235,8 @@ pub enum RenameError {
     SameFile,
     #[error("I/O error")]
     Io,
+    #[error("operation not supported")]
+    NotSupported,
     #[error("fd has been closed already")]
     ClosedFd,
     #[error(transparent)]

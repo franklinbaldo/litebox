@@ -331,7 +331,7 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         new_dirfd: &TypedFd<Self>,
         new_rel: impl path::Arg,
     ) -> Result<(), RenameError> {
-        Err(RenameError::Io)
+        Err(RenameError::NotSupported)
     }
 
     /// Create a directory relative to a directory fd.
