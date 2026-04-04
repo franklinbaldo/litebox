@@ -43,6 +43,8 @@ macro_rules! log_unsupported {
 
 pub(crate) mod channel;
 pub mod loader;
+#[allow(dead_code)] // callers land in later PRs (fork/exec/wait)
+pub(crate) mod multihost;
 pub(crate) mod stdio;
 pub mod syscalls;
 pub mod transport;
