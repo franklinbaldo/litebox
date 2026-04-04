@@ -1488,6 +1488,7 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
             let micro_mut = unsafe { &mut *(*tls).micro };
             micro_mut.pipe_fds = [None; litebox_ipc::ring::MAX_PIPE_SLOTS];
             micro_mut.socket_fds = [None; litebox_ipc::ring::MAX_SOCKET_SLOTS];
+            micro_mut.file_fds = [None; litebox_ipc::ring::MAX_FILE_SLOTS];
         }
 
         if !is_fork_child && (cq.flags & cq_flags::NO_REPORT == 0) {

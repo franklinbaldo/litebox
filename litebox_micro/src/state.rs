@@ -4,7 +4,7 @@
 //! Global per-process micro-LiteBox state.
 
 use core::sync::atomic::{AtomicU32, AtomicUsize};
-use litebox_ipc::ring::{MAX_PIPE_SLOTS, MAX_SOCKET_SLOTS, SharedRingLayout};
+use litebox_ipc::ring::{MAX_FILE_SLOTS, MAX_PIPE_SLOTS, MAX_SOCKET_SLOTS, SharedRingLayout};
 
 use crate::stack_pool::StackPool;
 
@@ -16,6 +16,14 @@ pub struct SocketFdEntry {
     /// The file descriptor number.
     pub fd: i32,
     /// Offset within the data region to the socket's `ShmemSocketHeader`.
+    pub shmem_offset: u32,
+}
+
+/// Tracks a file fd that has a shmem ring buffer slot for data transport.
+#[derive(Clone, Copy)]
+pub struct FileFdEntry {
+    pub fd: i32,
+    /// Offset within the data region to the file slot header (reuses ShmemSocketHeader layout).
     pub shmem_offset: u32,
 }
 
@@ -70,6 +78,9 @@ pub struct MicroState {
     /// Socket fd tracking table. Each entry maps a guest fd to a shmem socket
     /// ring buffer. Linear scan is fine — at most MAX_SOCKET_SLOTS entries.
     pub socket_fds: [Option<SocketFdEntry>; MAX_SOCKET_SLOTS],
+    /// File fd tracking table. Each entry maps a guest fd to a shmem file
+    /// ring buffer slot. Linear scan is fine — at most MAX_FILE_SLOTS entries.
+    pub file_fds: [Option<FileFdEntry>; MAX_FILE_SLOTS],
 }
 
 unsafe impl Send for MicroState {}
@@ -90,6 +101,7 @@ static mut MICRO_STATE: MicroState = MicroState {
     mmap_bump_end: 0,
     pipe_fds: [None; MAX_PIPE_SLOTS],
     socket_fds: [None; MAX_SOCKET_SLOTS],
+    file_fds: [None; MAX_FILE_SLOTS],
 };
 
 /// Initialize the global micro-LiteBox state.
@@ -246,6 +258,40 @@ impl MicroState {
         false
     }
 
+    /// Find a file fd's shmem offset.
+    pub fn find_file_fd(&self, fd: i32) -> Option<u32> {
+        for e in self.file_fds.iter().flatten() {
+            if e.fd == fd {
+                return Some(e.shmem_offset);
+            }
+        }
+        None
+    }
+
+    /// Register a file fd with its shmem slot offset.
+    pub fn register_file_fd(&mut self, fd: i32, shmem_offset: u32) -> bool {
+        for slot in &mut self.file_fds {
+            if slot.is_none() {
+                *slot = Some(FileFdEntry { fd, shmem_offset });
+                return true;
+            }
+        }
+        false // table full
+    }
+
+    /// Unregister a file fd. Returns true if found and removed.
+    pub fn unregister_file_fd(&mut self, fd: i32) -> bool {
+        for slot in &mut self.file_fds {
+            if let Some(e) = slot
+                && e.fd == fd
+            {
+                *slot = None;
+                return true;
+            }
+        }
+        false
+    }
+
     #[cfg(test)]
     pub fn zeroed() -> Self {
         Self {
@@ -263,6 +309,7 @@ impl MicroState {
             mmap_bump_end: 0,
             pipe_fds: [None; MAX_PIPE_SLOTS],
             socket_fds: [None; MAX_SOCKET_SLOTS],
+            file_fds: [None; MAX_FILE_SLOTS],
         }
     }
 }
