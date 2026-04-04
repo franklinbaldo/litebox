@@ -639,6 +639,7 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Chdir { pathname } => pathname
                 .to_cstring()
                 .map_or(Err(Errno::EINVAL), |path| syscall!(sys_chdir(path))),
+            SyscallRequest::Fchdir { fd } => syscall!(sys_fchdir(fd)),
             SyscallRequest::RtSigprocmask {
                 how,
                 set,
@@ -699,6 +700,26 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Access { pathname, mode } => pathname
                 .to_cstring()
                 .map_or(Err(Errno::EFAULT), |path| syscall!(sys_access(path, mode))),
+            SyscallRequest::Faccessat {
+                dirfd,
+                pathname,
+                mode,
+            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                syscall!(sys_faccessat(
+                    dirfd,
+                    path,
+                    mode,
+                    litebox_common_linux::AtFlags::empty()
+                ))
+            }),
+            SyscallRequest::Faccessat2 {
+                dirfd,
+                pathname,
+                mode,
+                flags,
+            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                syscall!(sys_faccessat(dirfd, path, mode, flags))
+            }),
             SyscallRequest::Madvise {
                 addr,
                 length,
@@ -1097,6 +1118,170 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Tgkill { tgid, tid, sig } => self.sys_tgkill(tgid, tid, sig),
             SyscallRequest::Sigaltstack { ss, old_ss } => self.sys_sigaltstack(ss, old_ss, ctx),
             SyscallRequest::Alarm { seconds } => syscall!(sys_alarm(seconds)),
+            SyscallRequest::Fchmod { fd: _, mode: _ }
+            | SyscallRequest::Fchown
+            | SyscallRequest::Fchownat => {
+                // Silently succeed; sandbox runs as a single user.
+                Ok(0)
+            }
+            SyscallRequest::Fsync { fd: _ }
+            | SyscallRequest::Fdatasync { fd: _ }
+            | SyscallRequest::Utimensat => {
+                // No-op for in-memory FS; data is always "persisted" and timestamps are ignored.
+                Ok(0)
+            }
+            SyscallRequest::Fadvise64 { fd, .. } => {
+                // No-op: file access advice is optional and safe to ignore.
+                self.validate_fd(fd)?;
+                Ok(0)
+            }
+            SyscallRequest::Flock { fd, .. } => {
+                // No-op: single-process sandbox has no contention.
+                self.validate_fd(fd)?;
+                Ok(0)
+            }
+            SyscallRequest::Fallocate { fd, .. } => {
+                // No-op: in-memory FS doesn't need preallocation.
+                self.validate_fd(fd)?;
+                Ok(0)
+            }
+            SyscallRequest::XattrGetPath {
+                pathname,
+                name,
+                follow_symlinks,
+            } => {
+                let path = pathname.to_cstring().ok_or(Errno::EFAULT)?;
+                self.validate_path_follow(path, follow_symlinks)?;
+                name.to_cstring().ok_or(Errno::EFAULT)?;
+                Err(Errno::ENODATA)
+            }
+            SyscallRequest::XattrSetPath {
+                pathname,
+                name,
+                value,
+                size,
+                flags,
+                follow_symlinks,
+            } => {
+                // XATTR_CREATE=1, XATTR_REPLACE=2; any other bits → EINVAL.
+                if flags & !0x3 != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                let path = pathname.to_cstring().ok_or(Errno::EFAULT)?;
+                self.validate_path_follow(path, follow_symlinks)?;
+                name.to_cstring().ok_or(Errno::EFAULT)?;
+                if size > 0 {
+                    value.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                }
+                Err(Errno::EOPNOTSUPP)
+            }
+            SyscallRequest::XattrListPath {
+                pathname,
+                follow_symlinks,
+            } => {
+                let path = pathname.to_cstring().ok_or(Errno::EFAULT)?;
+                self.validate_path_follow(path, follow_symlinks)?;
+                Ok(0)
+            }
+            SyscallRequest::XattrGetFd { fd, name } => {
+                self.validate_fd(fd)?;
+                name.to_cstring().ok_or(Errno::EFAULT)?;
+                Err(Errno::ENODATA)
+            }
+            SyscallRequest::XattrSetFd {
+                fd,
+                name,
+                value,
+                size,
+                flags,
+            } => {
+                if flags & !0x3 != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                self.validate_fd(fd)?;
+                name.to_cstring().ok_or(Errno::EFAULT)?;
+                if size > 0 {
+                    value.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                }
+                Err(Errno::EOPNOTSUPP)
+            }
+            SyscallRequest::XattrListFd { fd } => {
+                self.validate_fd(fd)?;
+                Ok(0)
+            }
+            SyscallRequest::Fchmodat {
+                dirfd,
+                pathname,
+                mode,
+            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                syscall!(sys_fchmodat(dirfd, path, mode))
+            }),
+            SyscallRequest::Statx {
+                dirfd,
+                pathname,
+                flags,
+                mask,
+                buf,
+            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                self.sys_statx(dirfd, path, flags, mask).and_then(|statx| {
+                    buf.write_at_offset(0, statx)
+                        .ok_or(Errno::EFAULT)
+                        .map(|()| 0)
+                })
+            }),
+            SyscallRequest::Statfs { pathname, buf } => {
+                pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                    self.sys_statfs(path)
+                        .and_then(|s| buf.write_at_offset(0, s).ok_or(Errno::EFAULT).map(|()| 0))
+                })
+            }
+            SyscallRequest::Fstatfs { fd, buf } => self
+                .sys_fstatfs(fd)
+                .and_then(|s| buf.write_at_offset(0, s).ok_or(Errno::EFAULT).map(|()| 0)),
+            SyscallRequest::MemfdCreate { name, flags } => {
+                name.to_cstring().map_or(Err(Errno::EFAULT), |name| {
+                    syscall!(sys_memfd_create(name, flags))
+                })
+            }
+            SyscallRequest::InotifyInit1 { flags } => syscall!(sys_inotify_init1(flags)),
+            SyscallRequest::InotifyAddWatch { fd, pathname, mask } => {
+                pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                    syscall!(sys_inotify_add_watch(fd, path, mask))
+                })
+            }
+            SyscallRequest::InotifyRmWatch { fd, wd } => syscall!(sys_inotify_rm_watch(fd, wd)),
+            SyscallRequest::TimerfdCreate { clockid, flags } => {
+                litebox_common_linux::ClockId::try_from(clockid)
+                    .map_err(|_| Errno::EINVAL)
+                    .and_then(|clockid| syscall!(sys_timerfd_create(clockid, flags)))
+            }
+            SyscallRequest::TimerfdSettime {
+                fd,
+                flags,
+                new_value,
+                old_value,
+            } => new_value
+                .read_at_offset(0)
+                .ok_or(Errno::EFAULT)
+                .and_then(|new_value| self.sys_timerfd_settime(fd, flags, new_value, old_value))
+                .map(|()| 0),
+            SyscallRequest::TimerfdGettime { fd, curr_value } => {
+                self.sys_timerfd_gettime(fd).and_then(|curr_value_value| {
+                    curr_value
+                        .write_at_offset(0, curr_value_value)
+                        .ok_or(Errno::EFAULT)
+                        .map(|()| 0)
+                })
+            }
+            SyscallRequest::SchedGetparam { pid: _, param } => {
+                // Write sched_priority = 0 (SCHED_OTHER default).
+                param.write_at_offset(0, 0i32).ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            SyscallRequest::SchedGetscheduler { pid: _ } => {
+                // Return SCHED_OTHER (0) — the default Linux scheduler policy.
+                Ok(0)
+            }
             _ => {
                 log_unsupported!("{request:?}");
                 Err(Errno::ENOSYS)

@@ -4,8 +4,10 @@
 //! Implementation of file related syscalls, e.g., `open`, `read`, `write`, etc.
 
 use alloc::{
+    collections::BTreeMap,
     ffi::CString,
     string::{String, ToString as _},
+    sync::Arc,
     vec,
 };
 use litebox::{
@@ -17,13 +19,45 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
-    AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, IoReadVec,
-    IoWriteVec, IoctlArg, TimeParam, errno::Errno,
+    AtFlags, ClockId, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
+    IoReadVec, IoWriteVec, IoctlArg, ItimerSpec, STATX_BASIC_STATS, StatfsBuf, StatxBuf,
+    StatxTimestamp, TMPFS_MAGIC, TimeParam, TimerfdFlags, TimerfdTimerFlags, errno::Errno,
 };
 use litebox_platform_multiplex::Platform;
 
 use crate::{ConstPtr, GlobalState, MutPtr, ShimFS, Task};
 use core::sync::atomic::{AtomicUsize, Ordering};
+
+struct InotifyInstanceState {
+    next_watch_descriptor: i32,
+    watches: BTreeMap<i32, String>,
+}
+
+impl InotifyInstanceState {
+    fn new() -> Self {
+        Self {
+            next_watch_descriptor: 1,
+            watches: BTreeMap::new(),
+        }
+    }
+
+    fn add_watch(&mut self, path: String) -> Result<i32, Errno> {
+        let wd = self.next_watch_descriptor;
+        self.next_watch_descriptor = self
+            .next_watch_descriptor
+            .checked_add(1)
+            .ok_or(Errno::ENOMEM)?;
+        self.watches.insert(wd, path);
+        Ok(wd)
+    }
+
+    fn remove_watch(&mut self, wd: i32) -> Result<(), Errno> {
+        if wd <= 0 {
+            return Err(Errno::EINVAL);
+        }
+        self.watches.remove(&wd).map(|_| ()).ok_or(Errno::EINVAL)
+    }
+}
 
 /// Task state shared by `CLONE_FS`.
 pub(crate) struct FsState {
@@ -32,6 +66,8 @@ pub(crate) struct FsState {
     ///
     /// Must end with a '/'.
     cwd: litebox::sync::RwLock<Platform, String>,
+    /// The path of the current executable (for `/proc/self/exe`).
+    pub(crate) exe_path: litebox::sync::RwLock<Platform, String>,
 }
 
 impl Clone for FsState {
@@ -39,6 +75,7 @@ impl Clone for FsState {
         Self {
             umask: self.umask.load(Ordering::Relaxed).into(),
             cwd: litebox::sync::RwLock::new(self.cwd.read().clone()),
+            exe_path: litebox::sync::RwLock::new(self.exe_path.read().clone()),
         }
     }
 }
@@ -48,11 +85,34 @@ impl FsState {
         Self {
             umask: (Mode::WGRP | Mode::WOTH).bits().into(),
             cwd: litebox::sync::RwLock::new(String::from("/")),
+            exe_path: litebox::sync::RwLock::new(String::new()),
+        }
+    }
+
+    /// Create a new `FsState` with a custom initial working directory.
+    ///
+    /// The `cwd` must be an absolute path. A trailing '/' is appended if missing.
+    #[allow(dead_code)]
+    pub fn with_cwd(mut cwd: String) -> Self {
+        assert!(cwd.starts_with('/'), "initial CWD must be absolute");
+        if !cwd.ends_with('/') {
+            cwd.push('/');
+        }
+        Self {
+            umask: (Mode::WGRP | Mode::WOTH).bits().into(),
+            cwd: litebox::sync::RwLock::new(cwd),
+            exe_path: litebox::sync::RwLock::new(String::new()),
         }
     }
 
     fn umask(&self) -> Mode {
         Mode::from_bits_retain(self.umask.load(Ordering::Relaxed))
+    }
+
+    /// Returns the current working directory path.
+    #[allow(dead_code)]
+    pub(crate) fn current_working_directory(&self) -> String {
+        self.cwd.read().clone()
     }
 }
 
@@ -62,6 +122,10 @@ pub(crate) struct FilesState<FS: ShimFS> {
     pub(crate) fs: alloc::sync::Arc<FS>,
     pub(crate) raw_descriptor_store:
         litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>,
+    inotify_instances: litebox::sync::Mutex<
+        Platform,
+        BTreeMap<usize, Arc<litebox::sync::Mutex<Platform, InotifyInstanceState>>>,
+    >,
     max_fd: AtomicUsize,
 }
 
@@ -72,6 +136,7 @@ impl<FS: ShimFS> FilesState<FS> {
             raw_descriptor_store: litebox::sync::RwLock::new(
                 litebox::fd::RawDescriptorStorage::new(),
             ),
+            inotify_instances: litebox::sync::Mutex::new(BTreeMap::new()),
             max_fd: AtomicUsize::new(usize::MAX),
         }
     }
@@ -97,6 +162,39 @@ impl<FS: ShimFS> FilesState<FS> {
         }
         Ok(raw_fd)
     }
+
+    fn register_inotify_fd(&self, raw_fd: usize) {
+        self.inotify_instances.lock().insert(
+            raw_fd,
+            Arc::new(litebox::sync::Mutex::new(InotifyInstanceState::new())),
+        );
+    }
+
+    fn duplicate_inotify_fd(&self, old_fd: usize, new_fd: usize) {
+        let state = self.inotify_instances.lock().get(&old_fd).cloned();
+        if let Some(state) = state {
+            self.inotify_instances.lock().insert(new_fd, state);
+        }
+    }
+
+    fn remove_inotify_fd(&self, raw_fd: usize) {
+        self.inotify_instances.lock().remove(&raw_fd);
+    }
+
+    fn with_inotify_fd<R>(
+        &self,
+        raw_fd: usize,
+        f: impl FnOnce(&mut InotifyInstanceState) -> Result<R, Errno>,
+    ) -> Result<R, Errno> {
+        let state = self
+            .inotify_instances
+            .lock()
+            .get(&raw_fd)
+            .cloned()
+            .ok_or(Errno::EBADF)?;
+        let mut state = state.lock();
+        f(&mut state)
+    }
 }
 
 /// Path in the file system
@@ -119,10 +217,33 @@ impl FsPath {
     /// Create a new `FsPath` from a dirfd and path.
     ///
     /// CWD-relative paths are resolved immediately to absolute paths.
+    /// Empty paths return `ENOENT` unless `allow_empty` is true (for
+    /// syscalls that support `AT_EMPTY_PATH`).
     fn new(
         dirfd: i32,
         path: impl path::Arg,
         get_cwd: impl FnOnce() -> String,
+    ) -> Result<Self, Errno> {
+        Self::new_inner(dirfd, path, get_cwd, false)
+    }
+
+    /// Like [`new`](Self::new) but permits empty paths, producing
+    /// `FsPath::Fd` or `FsPath::Cwd`. Callers must only use this when
+    /// `AT_EMPTY_PATH` is set.
+    #[cfg(test)]
+    fn new_empty_ok(
+        dirfd: i32,
+        path: impl path::Arg,
+        get_cwd: impl FnOnce() -> String,
+    ) -> Result<Self, Errno> {
+        Self::new_inner(dirfd, path, get_cwd, true)
+    }
+
+    fn new_inner(
+        dirfd: i32,
+        path: impl path::Arg,
+        get_cwd: impl FnOnce() -> String,
+        allow_empty: bool,
     ) -> Result<Self, Errno> {
         let path_str = path.as_rust_str()?;
         if path_str.len() > PATH_MAX {
@@ -134,6 +255,9 @@ impl FsPath {
         } else if dirfd >= 0 {
             let dirfd = u32::try_from(dirfd).expect("dirfd >= 0");
             if path_str.is_empty() {
+                if !allow_empty {
+                    return Err(Errno::ENOENT);
+                }
                 FsPath::Fd(dirfd)
             } else {
                 let cpath = path.to_c_str()?.into_owned();
@@ -144,6 +268,9 @@ impl FsPath {
             }
         } else if dirfd == litebox_common_linux::AT_FDCWD {
             if path_str.is_empty() {
+                if !allow_empty {
+                    return Err(Errno::ENOENT);
+                }
                 FsPath::Cwd
             } else {
                 // Resolve CWD-relative path to absolute.
@@ -160,6 +287,19 @@ impl FsPath {
 }
 
 impl<FS: ShimFS> Task<FS> {
+    #[allow(dead_code)]
+    fn validate_removedir_path_str(path: &str) -> Result<(), Errno> {
+        if path.is_empty() {
+            return Err(Errno::ENOENT);
+        }
+        match path.rsplit('/').find(|component| !component.is_empty()) {
+            Some(".") => return Err(Errno::EINVAL),
+            Some("..") => return Err(Errno::ENOTEMPTY),
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn get_umask(&self) -> Mode {
         self.fs.borrow().umask()
     }
@@ -173,6 +313,127 @@ impl<FS: ShimFS> Task<FS> {
             let mut cwd = self.fs.borrow().cwd.read().clone();
             cwd.push_str(path_str);
             CString::new(cwd).map_err(|_| Errno::EINVAL)
+        }
+    }
+
+    /// Resolve symlinks in a path to produce a canonicalized absolute path.
+    fn canonicalize_path(&self, path: &str) -> Result<String, Errno> {
+        let mut resolved = String::from("/");
+        let mut hops_remaining: usize = 40;
+
+        // Work queue of components still to process. Symlink expansions
+        // splice their target components to the front.
+        let mut remaining: alloc::vec::Vec<String> = path
+            .split('/')
+            .filter(|c| !c.is_empty())
+            .map(str::to_string)
+            .collect();
+        let mut idx = 0;
+
+        while idx < remaining.len() {
+            let component = remaining[idx].clone();
+            idx += 1;
+
+            match component.as_str() {
+                "" | "." => continue,
+                ".." => {
+                    if let Some(pos) = resolved[..resolved.len().saturating_sub(1)].rfind('/') {
+                        resolved.truncate(pos + 1);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+
+            if !resolved.ends_with('/') {
+                resolved.push('/');
+            }
+            resolved.push_str(&component);
+
+            // If this prefix is a symlink, expand it: splice the target's
+            // components into the front of `remaining` and restart the
+            // outer loop so each new component is individually walked.
+            if let Ok(target) = self.do_readlink(&resolved) {
+                if hops_remaining == 0 {
+                    return Err(Errno::ELOOP);
+                }
+                hops_remaining -= 1;
+
+                if target.starts_with('/') {
+                    resolved = String::from("/");
+                } else {
+                    let parent_end = resolved.rfind('/').unwrap_or(0).max(1);
+                    resolved.truncate(parent_end);
+                }
+
+                let tail: alloc::vec::Vec<String> = remaining.drain(idx..).collect();
+                remaining.truncate(0);
+                remaining.extend(
+                    target
+                        .split('/')
+                        .filter(|c| !c.is_empty())
+                        .map(str::to_string),
+                );
+                remaining.extend(tail);
+                idx = 0;
+            }
+        }
+
+        if resolved.len() > 1 && resolved.ends_with('/') {
+            resolved.pop();
+        }
+        Ok(resolved)
+    }
+
+    /// Validate that a file descriptor is open and valid.
+    pub fn validate_fd(&self, fd: i32) -> Result<(), Errno> {
+        let Ok(raw_fd) = usize::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+        let files = self.files.borrow();
+        files.run_on_raw_fd(raw_fd, |_| (), |_| (), |_| (), |_| (), |_| (), |_| ())?;
+        Ok(())
+    }
+
+    /// Validate that a path resolves to an existing file (follows symlinks).
+    pub fn validate_path(&self, pathname: impl path::Arg) -> Result<(), Errno> {
+        let path = self.resolve_path(pathname)?;
+        self.files
+            .borrow()
+            .fs
+            .file_status(path)
+            .map_err(Errno::from)?;
+        Ok(())
+    }
+
+    /// Validate that a path entry itself exists (does not follow symlinks).
+    /// A dangling symlink is considered valid.
+    pub fn validate_path_nofollow(&self, pathname: impl path::Arg) -> Result<(), Errno> {
+        let path = self.resolve_path(pathname)?;
+        let files = self.files.borrow();
+        // If the path resolves via follow (normal stat), it exists.
+        if files.fs.file_status(&path).is_ok() {
+            return Ok(());
+        }
+        // The follow-stat failed. Check if it's a symlink (possibly dangling).
+        if files.fs.read_link(&path).is_ok() {
+            return Ok(());
+        }
+        // Neither a resolvable path nor a symlink — report the original error.
+        files.fs.file_status(path).map_err(Errno::from)?;
+        Ok(())
+    }
+
+    /// Validate a path with symlink-follow control.
+    pub fn validate_path_follow(
+        &self,
+        pathname: impl path::Arg,
+        follow: bool,
+    ) -> Result<(), Errno> {
+        if follow {
+            self.validate_path(pathname)
+        } else {
+            self.validate_path_nofollow(pathname)
         }
     }
 
@@ -480,6 +741,8 @@ impl<FS: ShimFS> Task<FS> {
 
     pub(crate) fn do_close(&self, raw_fd: usize) -> Result<(), Errno> {
         let files = self.files.borrow();
+        // Clean up inotify tracking for this fd (no-op if not an inotify fd).
+        files.remove_inotify_fd(raw_fd);
         let mut rds = files.raw_descriptor_store.write();
         match rds.fd_consume_raw_integer(raw_fd) {
             Ok(fd) => {
@@ -1335,6 +1598,25 @@ impl<FS: ShimFS> Task<FS> {
         let min_len = core::cmp::min(buf.len(), bytes.len());
         buf[..min_len].copy_from_slice(&bytes[..min_len]);
         Ok(min_len)
+    }
+}
+
+#[allow(dead_code)]
+fn synthetic_symlink_stat(target_len: usize) -> FileStat {
+    FileStat {
+        st_dev: 0,
+        st_ino: 0,
+        st_nlink: 1,
+        st_mode: ((litebox_common_linux::InodeType::SymLink as u32)
+            | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits())
+        .truncate(),
+        st_uid: 0,
+        st_gid: 0,
+        st_rdev: 0,
+        st_size: target_len,
+        st_blksize: 4096,
+        st_blocks: 0,
+        ..Default::default()
     }
 }
 
@@ -2483,6 +2765,8 @@ impl<FS: ShimFS> Task<FS> {
             |fd| dup(&self.global, &files, fd, close_on_exec, target),
             |fd| dup(&self.global, &files, fd, close_on_exec, target),
         )??;
+        // If the source fd is an inotify instance, track the duplicate.
+        files.duplicate_inotify_fd(file, new_fd);
         if target.is_none() {
             let max_fd = self
                 .process()
@@ -2526,15 +2810,24 @@ impl<FS: ShimFS> Task<FS> {
                 return Err(Errno::EBADF);
             };
             if oldfd == newfd {
-                // Different from dup3, if oldfd is a valid file descriptor, and newfd has the same value
-                // as oldfd, then dup2() does nothing.
-                return if flags.is_some() {
-                    // dup3
-                    Err(Errno::EINVAL)
-                } else {
-                    // dup2
-                    Ok(oldfd)
-                };
+                if flags.is_some() {
+                    // dup3(fd, fd) always returns EINVAL per POSIX.
+                    return Err(Errno::EINVAL);
+                }
+                // dup2(fd, fd): verify fd is valid, then clear CLOEXEC.
+                //
+                // POSIX says dup2(fd, fd) "does nothing", but libuv relies on
+                // inherited stdio fds surviving exec even though the parent
+                // sets CLOEXEC. Clearing CLOEXEC here matches the intent of
+                // the dup2 caller (set up this fd for the child) and prevents
+                // close-on-exec from closing stdio fds after exec.
+                set_file_descriptor_flags(
+                    oldfd_usize,
+                    &self.global,
+                    &self.files.borrow(),
+                    FileDescriptorFlags::empty(),
+                )?;
+                return Ok(oldfd);
             }
             // Close whatever is at newfd before duping into it
             let newfd_usize = usize::try_from(newfd).or(Err(Errno::EBADF))?;
@@ -2550,6 +2843,479 @@ impl<FS: ShimFS> Task<FS> {
             let new_file = self.do_dup(oldfd_usize, flags.unwrap_or(OFlags::empty()))?;
             Ok(u32::try_from(new_file).unwrap())
         }
+    }
+
+    /// Handle `faccessat` — check file accessibility.
+    pub fn sys_faccessat(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        mode: litebox_common_linux::AccessFlags,
+        flags: litebox_common_linux::AtFlags,
+    ) -> Result<(), Errno> {
+        use litebox_common_linux::AtFlags;
+        let supported = AtFlags::AT_EACCESS | AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH;
+        if flags.intersects(!supported) {
+            return Err(Errno::EINVAL);
+        }
+
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let allow_empty = flags.contains(AtFlags::AT_EMPTY_PATH);
+        let fs_path = FsPath::new_inner(dirfd, pathname, get_cwd, allow_empty)?;
+
+        let follow_symlinks = !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW);
+
+        let files = self.files.borrow();
+        let status = match fs_path {
+            FsPath::Absolute { path } => {
+                // Skip client-side symlink resolution when the FS follows
+                // symlinks during walk (e.g., 9P with canonicalizing broker).
+                if follow_symlinks && !files.fs.walks_follow_symlinks() {
+                    let path_str = path.to_str().map_err(|_| Errno::EINVAL)?;
+                    let resolved = self.canonicalize_path(path_str)?;
+                    files.fs.file_status(&*resolved)?
+                } else {
+                    files.fs.file_status(&*path)?
+                }
+            }
+            FsPath::Cwd => files.fs.file_status(&*get_cwd())?,
+            FsPath::Fd(raw) => {
+                // AT_EMPTY_PATH: check the fd itself. For non-FS fds
+                // (network, pipes, etc.), the fd is valid so F_OK succeeds
+                // and we don't model fine-grained permissions.
+                let raw = usize::try_from(raw).map_err(|_| Errno::EBADF)?;
+                return files.run_on_raw_fd(
+                    raw,
+                    |fd| {
+                        let s = files.fs.fd_file_status(fd).map_err(Errno::from)?;
+                        Self::check_access_mode(&s, mode)
+                    },
+                    |_| Ok(()),
+                    |_| Ok(()),
+                    |_| Ok(()),
+                    |_| Ok(()),
+                    |_| Ok(()),
+                )?;
+            }
+            FsPath::FdRelative { fd, path } => {
+                // Use stat_at which handles follow_symlinks properly.
+                let raw = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
+                return files.run_on_raw_fd(
+                    raw,
+                    |dirfd| {
+                        let s = files
+                            .fs
+                            .stat_at(dirfd, path, follow_symlinks)
+                            .map_err(Errno::from)?;
+                        Self::check_access_mode(&s, mode)
+                    },
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                )?;
+            }
+        };
+
+        // AT_EACCESS: use effective IDs instead of real IDs.
+        // We don't distinguish real vs effective, so this is a no-op.
+        Self::check_access_mode(&status, mode)
+    }
+
+    /// Check file access permissions against the given mode flags.
+    fn check_access_mode(
+        status: &litebox::fs::FileStatus,
+        mode: litebox_common_linux::AccessFlags,
+    ) -> Result<(), Errno> {
+        if mode == litebox_common_linux::AccessFlags::F_OK {
+            return Ok(());
+        }
+        // TODO: the check is done using the calling process's real UID and GID.
+        // Here we assume the caller owns the file.
+        if mode.contains(litebox_common_linux::AccessFlags::R_OK)
+            && !status.mode.contains(litebox::fs::Mode::RUSR)
+        {
+            return Err(Errno::EACCES);
+        }
+        if mode.contains(litebox_common_linux::AccessFlags::W_OK)
+            && !status.mode.contains(litebox::fs::Mode::WUSR)
+        {
+            return Err(Errno::EACCES);
+        }
+        if mode.contains(litebox_common_linux::AccessFlags::X_OK)
+            && !status.mode.contains(litebox::fs::Mode::XUSR)
+        {
+            return Err(Errno::EACCES);
+        }
+        Ok(())
+    }
+
+    /// Handle `statx` — modern replacement for `stat`/`fstatat`.
+    ///
+    /// Delegates to the same resolution logic as `newfstatat`, then
+    /// converts `FileStat` into the `statx` buffer layout.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::unnecessary_cast
+    )]
+    pub fn sys_statx(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        flags: AtFlags,
+        _mask: u32,
+    ) -> Result<StatxBuf, Errno> {
+        // statx shares the same AT_* flags as newfstatat.
+        let stat = self.sys_newfstatat(dirfd, pathname, flags)?;
+        Ok(StatxBuf {
+            stx_mask: STATX_BASIC_STATS,
+            stx_blksize: stat.st_blksize as u32,
+            stx_attributes: 0,
+            stx_nlink: stat.st_nlink as u32,
+            stx_uid: stat.st_uid,
+            stx_gid: stat.st_gid,
+            stx_mode: stat.st_mode as u16,
+            __spare0: [0],
+            stx_ino: stat.st_ino,
+            stx_size: stat.st_size as u64,
+            stx_blocks: stat.st_blocks as u64,
+            stx_attributes_mask: 0,
+            stx_atime: StatxTimestamp {
+                tv_sec: stat.st_atime,
+                tv_nsec: stat.st_atime_nsec as u32,
+                __reserved: 0,
+            },
+            stx_btime: StatxTimestamp::default(),
+            stx_ctime: StatxTimestamp {
+                tv_sec: stat.st_ctime,
+                tv_nsec: stat.st_ctime_nsec as u32,
+                __reserved: 0,
+            },
+            stx_mtime: StatxTimestamp {
+                tv_sec: stat.st_mtime,
+                tv_nsec: stat.st_mtime_nsec as u32,
+                __reserved: 0,
+            },
+            stx_rdev_major: (stat.st_rdev >> 8) as u32,
+            stx_rdev_minor: (stat.st_rdev & 0xff) as u32,
+            stx_dev_major: (stat.st_dev >> 8) as u32,
+            stx_dev_minor: (stat.st_dev & 0xff) as u32,
+            stx_mnt_id: 0,
+            stx_dio_mem_align: 0,
+            stx_dio_opt_align: 0,
+            __spare3: [0; 12],
+        })
+    }
+
+    /// Handle `statfs` — return synthetic tmpfs-like filesystem stats.
+    pub fn sys_statfs(&self, pathname: impl path::Arg) -> Result<StatfsBuf, Errno> {
+        // Verify the path exists.
+        let path = self.resolve_path(pathname)?;
+        self.files
+            .borrow()
+            .fs
+            .file_status(path)
+            .map_err(Errno::from)?;
+        Ok(Self::synthetic_statfs())
+    }
+
+    /// Handle `fstatfs` — return synthetic tmpfs-like filesystem stats.
+    pub fn sys_fstatfs(&self, fd: i32) -> Result<StatfsBuf, Errno> {
+        let Ok(raw_fd) = usize::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+        // Verify the fd is valid by attempting to stat it.
+        descriptor_stat(raw_fd, self)?;
+        Ok(Self::synthetic_statfs())
+    }
+
+    fn synthetic_statfs() -> StatfsBuf {
+        StatfsBuf {
+            f_type: TMPFS_MAGIC,
+            f_bsize: 4096,
+            f_blocks: 1024 * 1024,
+            f_bfree: 1024 * 1024,
+            f_bavail: 1024 * 1024,
+            f_files: 1024 * 1024,
+            f_ffree: 1024 * 1024,
+            f_fsid: [0, 0],
+            f_namelen: 255,
+            f_frsize: 4096,
+            f_flags: 0,
+            __spare: [0; 4],
+        }
+    }
+
+    /// Handle `fchmodat` — change file mode relative to directory fd.
+    pub fn sys_fchmodat(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        mode: u32,
+    ) -> Result<(), Errno> {
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
+        let mode = litebox::fs::Mode::from_bits_truncate(mode);
+        match fs_path {
+            FsPath::Absolute { path } => self
+                .files
+                .borrow()
+                .fs
+                .chmod(path, mode)
+                .map_err(Errno::from),
+            FsPath::Cwd => self
+                .files
+                .borrow()
+                .fs
+                .chmod(get_cwd(), mode)
+                .map_err(Errno::from),
+            FsPath::Fd(_fd) => Err(Errno::EINVAL),
+            FsPath::FdRelative { fd, path } => {
+                let abs = self.resolve_dirfd_path(fd, &path)?;
+                self.files.borrow().fs.chmod(abs, mode).map_err(Errno::from)
+            }
+        }
+    }
+
+    /// Handle `fchdir` — change working directory via file descriptor.
+    pub fn sys_fchdir(&self, fd: i32) -> Result<(), Errno> {
+        use litebox::fs::FileType;
+
+        let raw = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
+        let files = self.files.borrow();
+
+        // Get the path and verify it's a directory.
+        let dir_path = files.run_on_raw_fd(
+            raw,
+            |typed_fd| {
+                let status = files.fs.fd_file_status(typed_fd).map_err(Errno::from)?;
+                if status.file_type != FileType::Directory {
+                    return Err(Errno::ENOTDIR);
+                }
+                files.fs.fd_path(typed_fd).ok_or(Errno::EBADF)
+            },
+            |_| Err(Errno::ENOTDIR),
+            |_| Err(Errno::ENOTDIR),
+            |_| Err(Errno::ENOTDIR),
+            |_| Err(Errno::ENOTDIR),
+            |_| Err(Errno::ENOTDIR),
+        )??;
+
+        let mut new_cwd = dir_path;
+        if !new_cwd.ends_with('/') {
+            new_cwd.push('/');
+        }
+
+        drop(files);
+        *self.fs.borrow().cwd.write() = new_cwd;
+        Ok(())
+    }
+
+    /// Handle `memfd_create` — create an anonymous file in memory.
+    pub fn sys_memfd_create(
+        &self,
+        name: alloc::ffi::CString,
+        flags: litebox_common_linux::MemfdFlags,
+    ) -> Result<u32, Errno> {
+        use litebox::fs::errors::CreateAnonymousFileError;
+        use litebox_common_linux::MemfdFlags;
+
+        let known = MemfdFlags::CLOEXEC
+            | MemfdFlags::ALLOW_SEALING
+            | MemfdFlags::HUGETLB
+            | MemfdFlags::NOEXEC_SEAL
+            | MemfdFlags::EXEC;
+        if flags.intersects(known.complement()) {
+            return Err(Errno::EINVAL);
+        }
+        if flags.contains(MemfdFlags::HUGETLB) {
+            return Err(Errno::ENOSYS);
+        }
+        // MFD_EXEC and MFD_NOEXEC_SEAL are mutually exclusive.
+        if flags.contains(MemfdFlags::EXEC) && flags.contains(MemfdFlags::NOEXEC_SEAL) {
+            return Err(Errno::EINVAL);
+        }
+
+        let name_str = name.to_string_lossy();
+        // Strip execute bits when MFD_NOEXEC_SEAL is set, matching Linux.
+        let mode = if flags.contains(MemfdFlags::NOEXEC_SEAL) {
+            litebox::fs::Mode::from_bits_truncate(0o666)
+        } else {
+            litebox::fs::Mode::from_bits_truncate(0o777)
+        };
+        let files = self.files.borrow();
+        let file = files
+            .fs
+            .create_anonymous_file(&name_str, mode)
+            .map_err(|e| match e {
+                CreateAnonymousFileError::NotSupported => Errno::ENOSYS,
+                CreateAnonymousFileError::Io | _ => Errno::EIO,
+            })?;
+        {
+            let mut dt = self.global.litebox.descriptor_table_mut();
+            if flags.contains(MemfdFlags::CLOEXEC) {
+                let old = dt.set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC);
+                assert!(old.is_none());
+            }
+            let status = OFlags::RDWR | OFlags::LARGEFILE;
+            let old = dt.set_entry_metadata(&file, crate::StdioStatusFlags(status));
+            assert!(old.is_none());
+        }
+        let raw_fd = files.insert_raw_fd(file).map_err(|file| {
+            files.fs.close(&file).unwrap();
+            Errno::EMFILE
+        })?;
+        Ok(raw_fd.try_into().unwrap())
+    }
+
+    /// Handle `inotify_init1` — create an inotify instance.
+    ///
+    /// Backed by an eventfd; no real filesystem events are delivered.
+    pub fn sys_inotify_init1(&self, flags: OFlags) -> Result<u32, Errno> {
+        if flags.intersects((OFlags::CLOEXEC | OFlags::NONBLOCK).complement()) {
+            return Err(Errno::EINVAL);
+        }
+
+        let mut eventfd_flags = EfdFlags::empty();
+        if flags.contains(OFlags::CLOEXEC) {
+            eventfd_flags |= EfdFlags::CLOEXEC;
+        }
+        if flags.contains(OFlags::NONBLOCK) {
+            eventfd_flags |= EfdFlags::NONBLOCK;
+        }
+
+        let raw_fd = self.sys_eventfd2(0, eventfd_flags)?;
+        self.files
+            .borrow()
+            .register_inotify_fd(usize::try_from(raw_fd).unwrap());
+        Ok(raw_fd)
+    }
+
+    /// Handle `inotify_add_watch` — register a watch on a path.
+    pub fn sys_inotify_add_watch(
+        &self,
+        fd: i32,
+        pathname: impl path::Arg,
+        _mask: u32,
+    ) -> Result<u32, Errno> {
+        let raw_fd = u32::try_from(fd)
+            .map_err(|_| Errno::EBADF)
+            .and_then(|fd| usize::try_from(fd).map_err(|_| Errno::EBADF))?;
+        let resolved = self.resolve_path(pathname)?;
+        self.do_stat(resolved.clone(), true)?;
+        let resolved = resolved.into_string().map_err(|_| Errno::EINVAL)?;
+        self.files.borrow().with_inotify_fd(raw_fd, |state| {
+            state
+                .add_watch(resolved.clone())
+                .and_then(|wd| u32::try_from(wd).map_err(|_| Errno::EINVAL))
+        })
+    }
+
+    /// Handle `inotify_rm_watch` — remove a previously registered watch.
+    pub fn sys_inotify_rm_watch(&self, fd: i32, wd: i32) -> Result<(), Errno> {
+        let raw_fd = u32::try_from(fd)
+            .map_err(|_| Errno::EBADF)
+            .and_then(|fd| usize::try_from(fd).map_err(|_| Errno::EBADF))?;
+        self.files
+            .borrow()
+            .with_inotify_fd(raw_fd, |state| state.remove_watch(wd))
+    }
+
+    /// Handle `timerfd_create` — create a timer file descriptor.
+    pub fn sys_timerfd_create(&self, clockid: ClockId, flags: TimerfdFlags) -> Result<u32, Errno> {
+        if flags.intersects((TimerfdFlags::CLOEXEC | TimerfdFlags::NONBLOCK).complement()) {
+            return Err(Errno::EINVAL);
+        }
+        match clockid {
+            ClockId::RealTime
+            | ClockId::RealtimeCoarse
+            | ClockId::Monotonic
+            | ClockId::MonotonicCoarse
+            | ClockId::MonotonicRaw
+            | ClockId::Boottime => {}
+            _ => return Err(Errno::EINVAL),
+        }
+
+        let timerfd = super::eventfd::EventFile::new_timer(
+            self.global.platform,
+            self.global.boot_time,
+            clockid,
+            flags,
+        );
+        let mut dt = self.global.litebox.descriptor_table_mut();
+        let typed = dt.insert::<super::eventfd::EventfdSubsystem>(timerfd);
+        if flags.contains(TimerfdFlags::CLOEXEC) {
+            let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
+            assert!(old.is_none());
+        }
+        drop(dt);
+        let files = self.files.borrow();
+        let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
+            self.global
+                .litebox
+                .descriptor_table_mut()
+                .remove(&typed)
+                .unwrap();
+            Errno::EMFILE
+        })?;
+        Ok(raw_fd.try_into().unwrap())
+    }
+
+    /// Handle `timerfd_settime` — arm or disarm a timer fd.
+    pub fn sys_timerfd_settime(
+        &self,
+        fd: i32,
+        flags: TimerfdTimerFlags,
+        new_value: ItimerSpec,
+        old_value: Option<MutPtr<ItimerSpec>>,
+    ) -> Result<(), Errno> {
+        if flags.intersects(
+            (TimerfdTimerFlags::ABSTIME | TimerfdTimerFlags::CANCEL_ON_SET).complement(),
+        ) {
+            return Err(Errno::EINVAL);
+        }
+        let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
+            return Err(Errno::EBADF);
+        };
+        let files = self.files.borrow();
+        let handle = {
+            let rds = files.raw_descriptor_store.read();
+            let typed = rds
+                .fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
+                .map_err(|_| Errno::EBADF)?;
+            self.global
+                .litebox
+                .descriptor_table()
+                .entry_handle(&typed)
+                .ok_or(Errno::EBADF)?
+        };
+        let old = handle.with_entry(|file| file.set_timer(flags, new_value))?;
+        if let Some(old_value) = old_value {
+            old_value.write_at_offset(0, old).ok_or(Errno::EFAULT)?;
+        }
+        Ok(())
+    }
+
+    /// Handle `timerfd_gettime` — return the current timer value.
+    pub fn sys_timerfd_gettime(&self, fd: i32) -> Result<ItimerSpec, Errno> {
+        let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
+            return Err(Errno::EBADF);
+        };
+        let files = self.files.borrow();
+        let handle = {
+            let rds = files.raw_descriptor_store.read();
+            let typed = rds
+                .fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
+                .map_err(|_| Errno::EBADF)?;
+            self.global
+                .litebox
+                .descriptor_table()
+                .entry_handle(&typed)
+                .ok_or(Errno::EBADF)?
+        };
+        handle.with_entry(super::eventfd::EventFile::get_timer)
     }
 }
 
@@ -2627,11 +3393,11 @@ impl<FS: ShimFS> Task<FS> {
                     .set_fd_metadata(file, Diroff(dir_off));
                 Ok(nbytes)
             },
-            |_fd| todo!("net"),
-            |_fd| todo!("pipes"),
-            |_fd| Err(Errno::EBADF),
-            |_fd| Err(Errno::EBADF),
-            |_fd| Err(Errno::EBADF),
+            |_fd| Err(Errno::ENOTDIR),
+            |_fd| Err(Errno::ENOTDIR),
+            |_fd| Err(Errno::ENOTDIR),
+            |_fd| Err(Errno::ENOTDIR),
+            |_fd| Err(Errno::ENOTDIR),
         )?
     }
 }
@@ -2662,15 +3428,25 @@ mod tests {
             matches!(fp, FsPath::Absolute { path } if path.to_str().unwrap() == "/home/foo/bar")
         );
 
-        // Empty path at AT_FDCWD → Cwd variant.
-        let fp = FsPath::new(litebox_common_linux::AT_FDCWD, "", || {
+        // Empty path at AT_FDCWD → ENOENT (new() rejects empty paths).
+        let err = FsPath::new(litebox_common_linux::AT_FDCWD, "", || {
+            panic!("get_cwd should not be called for empty path")
+        })
+        .unwrap_err();
+        assert_eq!(err, Errno::ENOENT);
+
+        // Positive fd + empty path → ENOENT with new().
+        let err = FsPath::new(5, "", || panic!("should not be called")).unwrap_err();
+        assert_eq!(err, Errno::ENOENT);
+
+        // new_empty_ok allows empty paths (AT_EMPTY_PATH semantics).
+        let fp = FsPath::new_empty_ok(litebox_common_linux::AT_FDCWD, "", || {
             panic!("get_cwd should not be called for empty Cwd path")
         })
         .unwrap();
         assert!(matches!(fp, FsPath::Cwd));
 
-        // Positive fd + empty path → Fd variant.
-        let fp = FsPath::new(5, "", || panic!("should not be called")).unwrap();
+        let fp = FsPath::new_empty_ok(5, "", || panic!("should not be called")).unwrap();
         assert!(matches!(fp, FsPath::Fd(5)));
 
         // Invalid dirfd → EBADF.
