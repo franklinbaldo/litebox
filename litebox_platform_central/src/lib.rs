@@ -22,6 +22,24 @@ use zerocopy::{FromBytes, IntoBytes};
 
 extern crate alloc;
 
+// ---------------------------------------------------------------------------
+// TUN constants and helpers
+// ---------------------------------------------------------------------------
+
+const IFF_TUN: libc::c_short = 0x0001;
+const IFF_NO_PI: libc::c_short = 0x1000;
+const IFF_MULTI_QUEUE: libc::c_short = 0x0100;
+
+/// `TUNSETIFF` ioctl number: `_IOW('T', 202, int)` = `0x400454CA`.
+const TUNSETIFF: libc::c_ulong = 0x400454CA;
+
+#[repr(C)]
+struct Ifreq {
+    ifr_name: [libc::c_char; 16],
+    ifr_flags: libc::c_short,
+    _pad: [u8; 22],
+}
+
 /// The central server platform.
 ///
 /// Implements [`litebox::platform::Provider`] for use in a server (host-side)
@@ -49,17 +67,6 @@ impl CentralPlatform {
     /// `/dev/net/tun` does not exist, or the `TUNSETIFF` ioctl fails).
     /// Also panics if the device name is 16 bytes or longer.
     pub fn new(tun_device_name: Option<&str>) -> Self {
-        const IFF_TUN: libc::c_short = 0x0001;
-        const IFF_NO_PI: libc::c_short = 0x1000;
-        const IFF_MULTI_QUEUE: libc::c_short = 0x0100;
-
-        #[repr(C)]
-        struct Ifreq {
-            ifr_name: [libc::c_char; 16],
-            ifr_flags: libc::c_short,
-            _pad: [u8; 22],
-        }
-
         let tun_fd = tun_device_name.map(|name| {
             // Open /dev/net/tun
             let fd = unsafe {
@@ -85,8 +92,7 @@ impl CentralPlatform {
                 ifreq.ifr_name[i] = b.cast_signed();
             }
 
-            // TUNSETIFF = _IOW('T', 202, int) = 0x400454CA
-            let ret = unsafe { libc::ioctl(fd, 0x400454CA, &raw const ifreq) };
+            let ret = unsafe { libc::ioctl(fd, TUNSETIFF, &raw const ifreq) };
             assert!(
                 ret >= 0,
                 "TUNSETIFF failed: {}",
@@ -169,17 +175,6 @@ impl CentralPlatform {
     /// Panics if no TUN device was configured at startup, if `/dev/net/tun`
     /// cannot be opened, or if the `TUNSETIFF` ioctl fails.
     pub fn open_new_queue(&self) -> usize {
-        const IFF_TUN: libc::c_short = 0x0001;
-        const IFF_NO_PI: libc::c_short = 0x1000;
-        const IFF_MULTI_QUEUE: libc::c_short = 0x0100;
-
-        #[repr(C)]
-        struct Ifreq {
-            ifr_name: [libc::c_char; 16],
-            ifr_flags: libc::c_short,
-            _pad: [u8; 22],
-        }
-
         let name = self
             .tun_device_name
             .as_deref()
@@ -207,7 +202,7 @@ impl CentralPlatform {
             ifreq.ifr_name[i] = b.cast_signed();
         }
 
-        let ret = unsafe { libc::ioctl(fd, 0x400454CA, &raw const ifreq) };
+        let ret = unsafe { libc::ioctl(fd, TUNSETIFF, &raw const ifreq) };
         assert!(
             ret >= 0,
             "TUNSETIFF failed for new queue: {}",
@@ -227,9 +222,11 @@ impl CentralPlatform {
     ///
     /// Panics if the queue index is out of bounds or the write fails.
     pub fn send_ip_packet_on_queue(&self, queue: usize, packet: &[u8]) {
-        let guard = self.tun_queues.read().unwrap();
-        let fd = &guard[queue];
-        let ret = unsafe { libc::write(fd.as_raw_fd(), packet.as_ptr().cast(), packet.len()) };
+        let raw_fd = {
+            let guard = self.tun_queues.read().unwrap();
+            guard[queue].as_raw_fd()
+        };
+        let ret = unsafe { libc::write(raw_fd, packet.as_ptr().cast(), packet.len()) };
         assert!(
             ret >= 0,
             "TUN queue {queue} write failed: {}",
@@ -253,9 +250,11 @@ impl CentralPlatform {
         queue: usize,
         packet: &mut [u8],
     ) -> Result<usize, litebox::platform::ReceiveError> {
-        let guard = self.tun_queues.read().unwrap();
-        let fd = &guard[queue];
-        let ret = unsafe { libc::read(fd.as_raw_fd(), packet.as_mut_ptr().cast(), packet.len()) };
+        let raw_fd = {
+            let guard = self.tun_queues.read().unwrap();
+            guard[queue].as_raw_fd()
+        };
+        let ret = unsafe { libc::read(raw_fd, packet.as_mut_ptr().cast(), packet.len()) };
         if ret < 0 {
             let errno = unsafe { *libc::__errno_location() };
             if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
@@ -278,13 +277,15 @@ impl CentralPlatform {
     ///
     /// Panics if the internal `RwLock` is poisoned.
     pub fn wait_on_tun_queue(&self, queue: usize, timeout: Option<Duration>) {
-        let guard = self.tun_queues.read().unwrap();
-        if queue >= guard.len() {
-            return;
-        }
-        let fd = &guard[queue];
+        let raw_fd = {
+            let guard = self.tun_queues.read().unwrap();
+            if queue >= guard.len() {
+                return;
+            }
+            guard[queue].as_raw_fd()
+        };
         let mut pfd = libc::pollfd {
-            fd: fd.as_raw_fd(),
+            fd: raw_fd,
             events: libc::POLLIN,
             revents: 0,
         };
@@ -305,11 +306,6 @@ impl CentralPlatform {
     ///
     /// Panics if the internal `RwLock` is poisoned.
     pub fn wait_on_tun(&self, timeout: Option<Duration>) {
-        let guard = self.tun_queues.read().unwrap();
-        if guard.is_empty() {
-            return;
-        }
-        drop(guard);
         self.wait_on_tun_queue(0, timeout);
     }
 }
