@@ -797,6 +797,7 @@ impl LinuxUserland {
             path,
             rdev: stat_buf.st_rdev,
             dev: stat_buf.st_dev,
+            #[allow(clippy::useless_conversion)]
             ino: u64::from(stat_buf.st_ino),
         })
     }
@@ -3510,11 +3511,15 @@ impl litebox::platform::StdioProvider for LinuxUserland {
 unsafe extern "C" {
     // Defined in asm blocks above
     fn syscall_callback() -> isize;
-    fn syscall_callback_redzone() -> isize;
     fn exception_callback();
     fn interrupt_callback();
     fn switch_to_guest_start();
     fn switch_to_guest_end();
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" {
+    fn syscall_callback_redzone() -> isize;
 }
 
 unsafe extern "C-unwind" fn init_handler(thread_ctx: &mut ThreadContext) {
@@ -3592,7 +3597,14 @@ impl ThreadContext<'_> {
 
 impl litebox::platform::SystemInfoProvider for LinuxUserland {
     fn get_syscall_entry_point(&self) -> usize {
-        syscall_callback_redzone as *const () as usize
+        #[cfg(target_arch = "x86_64")]
+        {
+            syscall_callback_redzone as *const () as usize
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            syscall_callback as *const () as usize
+        }
     }
 
     fn get_vdso_address(&self) -> Option<usize> {
@@ -4293,9 +4305,12 @@ unsafe fn interrupt_signal_handler(
     // FUTURE: handle trampoline code, too. This is somewhat less important
     // because it's probably fine for the shim to observe a guest context that
     // is inside the trampoline.
-    if ip == syscall_callback as *const () as usize
-        || ip == syscall_callback_redzone as *const () as usize
-    {
+    #[cfg(target_arch = "x86_64")]
+    let at_syscall_callback = ip == syscall_callback as *const () as usize
+        || ip == syscall_callback_redzone as *const () as usize;
+    #[cfg(target_arch = "x86")]
+    let at_syscall_callback = ip == syscall_callback as *const () as usize;
+    if at_syscall_callback {
         // No need to clear `in_guest` or set interrupt; the syscall handler will
         // clear `in_guest` and call into the shim.
         return;
