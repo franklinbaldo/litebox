@@ -98,11 +98,20 @@ pub struct ProcessServer<FS: ShimFS> {
     notification_state: RefCell<crate::notification_state::ProcessNotificationState>,
     /// TUN queue index for this process's net-worker.
     tun_queue: Option<usize>,
+    /// Whether TUN networking is available (independent of this process having
+    /// a queue — the master has `tun_queue = None` but `tun_enabled = true`).
+    tun_enabled: bool,
+    /// Initial TUN queue index to hand to the first forked child.  `Some(0)`
+    /// for the master (queue 0 was created at startup), `None` once it has
+    /// been given away or for non-master processes (which always call
+    /// `open_new_queue()` for their children).
+    initial_child_queue: Cell<Option<usize>>,
 }
 
 impl<FS: ShimFS> ProcessServer<FS> {
     /// Create a new `ProcessServer` backed by the given shared memory region.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         region: SharedRegion,
         task: litebox_shim_linux::LinuxShimTask<FS>,
@@ -111,7 +120,16 @@ impl<FS: ShimFS> ProcessServer<FS> {
         ring_pool: Arc<RingPool>,
         ring_fd: i32,
         tun_queue: Option<usize>,
+        tun_enabled: bool,
     ) -> Self {
+        // If this process has no TUN queue but TUN is enabled, it's the master.
+        // Queue 0 (created by CentralPlatform::new) should be given to the
+        // first forked child.
+        let initial_child_queue = if tun_queue.is_none() && tun_enabled {
+            Cell::new(Some(0))
+        } else {
+            Cell::new(None)
+        };
         Self {
             region,
             ring_pool,
@@ -128,6 +146,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 crate::notification_state::ProcessNotificationState::default(),
             ),
             tun_queue,
+            tun_enabled,
+            initial_child_queue,
         }
     }
 
@@ -753,12 +773,21 @@ impl<FS: ShimFS> ProcessServer<FS> {
             let shim = self.shim.clone();
             let fs = self.fs.clone();
             let pool = Arc::clone(&self.ring_pool);
-            let tun_queue = if self.tun_queue.is_some() {
-                let platform = litebox_platform_multiplex::platform();
-                Some(platform.open_new_queue())
+            let tun_queue = if self.tun_enabled {
+                // Use the pre-existing queue 0 for the first child (avoids
+                // wasting the queue created at startup), otherwise open a new
+                // one.
+                if let Some(q) = self.initial_child_queue.get() {
+                    self.initial_child_queue.set(None);
+                    Some(q)
+                } else {
+                    let platform = litebox_platform_multiplex::platform();
+                    Some(platform.open_new_queue())
+                }
             } else {
                 None
             };
+            let tun_enabled = self.tun_enabled;
             let child_server = ProcessServer::new(
                 child_region,
                 child_task,
@@ -767,6 +796,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 pool,
                 child_ring_fd,
                 tun_queue,
+                tun_enabled,
             );
             child_server.next_child_pid.set(self.next_child_pid.get());
 
@@ -1436,10 +1466,16 @@ impl<FS: ShimFS> ProcessServer<FS> {
 
                         // Tell the net-worker to drain/fill this socket's shmem
                         // rings directly instead of using the HeapRb channel.
-                        self.primary_task
-                            .net_mutex()
-                            .lock()
-                            .set_shmem_header_on_last_accepted(header_ptr);
+                        // Also drains any HeapRb data accumulated during accept
+                        // into the shmem RX ring.
+                        // SAFETY: header_ptr was just initialized via socket_init
+                        // and points to valid shmem within the data region.
+                        unsafe {
+                            self.primary_task
+                                .net_mutex()
+                                .lock()
+                                .set_shmem_header_on_last_accepted(header_ptr);
+                        }
 
                         // Build AcceptResponse and write to data region at offset 0.
                         let response = litebox_ipc::messages::AcceptResponse {

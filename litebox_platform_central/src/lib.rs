@@ -33,6 +33,14 @@ const IFF_MULTI_QUEUE: libc::c_short = 0x0100;
 /// `TUNSETIFF` ioctl number: `_IOW('T', 202, int)` = `0x400454CA`.
 const TUNSETIFF: libc::c_ulong = 0x400454CA;
 
+/// `TUNSETQUEUE` ioctl number: `_IOW('T', 217, int)` = `0x400454D9`.
+/// Used with `IFF_DETACH_QUEUE` / `IFF_ATTACH_QUEUE` to control which queues
+/// actively receive packets from the kernel.
+const TUNSETQUEUE: libc::c_ulong = 0x400454D9;
+
+/// Flag for `TUNSETQUEUE`: detach a queue so it stops receiving packets.
+const IFF_DETACH_QUEUE: libc::c_short = 0x0400;
+
 #[repr(C)]
 struct Ifreq {
     ifr_name: [libc::c_char; 16],
@@ -166,6 +174,11 @@ impl CentralPlatform {
         }
     }
 
+    /// Returns `true` if a TUN device was configured at startup.
+    pub fn has_tun(&self) -> bool {
+        self.tun_device_name.is_some()
+    }
+
     /// Open an additional file descriptor to the same TUN device.
     ///
     /// Called when a worker is forked. Returns the queue index.
@@ -214,6 +227,46 @@ impl CentralPlatform {
         let idx = queues.len();
         queues.push(owned);
         idx
+    }
+
+    /// Detach a TUN queue so the kernel stops routing packets to it.
+    ///
+    /// After detaching, the queue fd remains open (other state may reference
+    /// its index) but `read()` will never return data because the kernel no
+    /// longer delivers packets to it. This is used to remove the master
+    /// process's queue after forking workers, so that all incoming traffic is
+    /// directed exclusively to worker queues.
+    ///
+    /// Returns `true` if the queue was detached, `false` if it was already
+    /// detached (the ioctl returned `EINVAL`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the queue index is out of bounds or the ioctl fails with an
+    /// error other than `EINVAL`.
+    pub fn try_detach_queue(&self, queue: usize) -> bool {
+        let raw_fd = {
+            let guard = self.tun_queues.read().unwrap();
+            guard[queue].as_raw_fd()
+        };
+        let ifreq = Ifreq {
+            ifr_name: [0; 16],
+            ifr_flags: IFF_DETACH_QUEUE,
+            _pad: [0; 22],
+        };
+        let ret = unsafe { libc::ioctl(raw_fd, TUNSETQUEUE, &raw const ifreq) };
+        if ret < 0 {
+            let errno = unsafe { *libc::__errno_location() };
+            if errno == libc::EINVAL {
+                // Already detached — this is expected on subsequent forks.
+                return false;
+            }
+            panic!(
+                "TUNSETQUEUE(DETACH) failed for queue {queue}: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        true
     }
 
     /// Send an IP packet via a specific TUN queue.
@@ -265,7 +318,8 @@ impl CentralPlatform {
                 std::io::Error::last_os_error()
             );
         }
-        Ok(ret.cast_unsigned())
+        let size = ret.cast_unsigned();
+        Ok(size)
     }
 
     /// Block until a specific TUN queue has data to read, or the timeout

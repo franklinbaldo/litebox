@@ -654,8 +654,42 @@ where
                 }
             }
 
-            // State tracking via proxy (if present) still applies.
+            // Shmem readability/writability → proxy notifications for epoll.
+            //
+            // The shmem ring bypasses the HeapRb that normally manages the
+            // proxy's rx_available/tx_available counters. We must update the
+            // proxy so that epoll_wait (which checks check_io_events) can
+            // report EPOLLIN/EPOLLOUT to the guest.
             if let Some(proxy) = &socket_handle.proxy {
+                let h = unsafe { &*header };
+                // RX: shmem ring has data → proxy readable
+                let rx_head = h.rx_head.load(core::sync::atomic::Ordering::Acquire);
+                let rx_tail = h.rx_tail.load(core::sync::atomic::Ordering::Relaxed);
+                let rx_has_data = rx_tail.wrapping_sub(rx_head) > 0;
+
+                // TX: shmem ring has free space → proxy writable
+                let tx_head = h.tx_head.load(core::sync::atomic::Ordering::Relaxed);
+                let tx_tail = h.tx_tail.load(core::sync::atomic::Ordering::Acquire);
+                let capacity = h.capacity;
+                let tx_has_space = capacity - tx_tail.wrapping_sub(tx_head) > 0;
+
+                if let NetworkProxy::Stream(stream_proxy) = proxy.as_ref() {
+                    stream_proxy.set_readable(rx_has_data);
+                    stream_proxy.set_writable(tx_has_space);
+                }
+
+                // Fire events so epoll observers get notified.
+                let mut events = Events::empty();
+                if rx_has_data {
+                    events |= Events::IN;
+                }
+                if tx_has_space {
+                    events |= Events::OUT;
+                }
+                if !events.is_empty() {
+                    proxy.notify_io_event(events);
+                }
+
                 let tcp_socket = socket_set.get::<tcp::Socket>(socket_handle.handle);
                 Self::update_tcp_socket_state(
                     tcp_socket,
@@ -934,6 +968,7 @@ where
                 });
         }
     }
+
 }
 
 impl<Platform> Network<Platform>
@@ -1047,9 +1082,17 @@ where
     /// allocated. The net-worker will then drain/fill the shmem rings directly
     /// instead of using the HeapRb socket channel.
     ///
+    /// Any data already in the HeapRb RX buffer (from the initial
+    /// `perform_platform_interaction()` during accept) is drained into the
+    /// shmem RX ring before switching to shmem mode.
+    ///
     /// Returns `true` if the header was set, `false` if there is no pending
     /// accepted socket (should not happen in normal operation).
-    pub fn set_shmem_header_on_last_accepted(
+    ///
+    /// # Safety
+    /// `header` must point to a valid, initialized `ShmemSocketHeader` with
+    /// sufficient backing data buffers that outlive this socket.
+    pub unsafe fn set_shmem_header_on_last_accepted(
         &mut self,
         header: *mut litebox_ipc::socket_ring::ShmemSocketHeader,
     ) -> bool {
@@ -1061,6 +1104,20 @@ where
             if entry.entry.network_id == self.id
                 && entry.entry.handle == smoltcp_handle
             {
+                // Drain any data that the HeapRb path accumulated before the
+                // shmem header was set. This can happen when
+                // `perform_platform_interaction()` runs during `do_accept()`
+                // and pushes received data (e.g. the HTTP request that arrived
+                // in the same packet burst as the SYN/ACK) into the HeapRb RX
+                // ring. Without this drain, the data would be stranded: micro
+                // reads from the shmem ring (empty) while the HeapRb has it.
+                if let Some(proxy) = &entry.entry.proxy
+                    && let NetworkProxy::Stream(stream_proxy) = proxy.as_ref()
+                {
+                    // SAFETY: `header` was just initialized by `socket_init`
+                    // and the caller guarantees it points to valid shmem.
+                    unsafe { stream_proxy.drain_rx_to_shmem(header) };
+                }
                 entry.entry.shmem_header = Some(header);
                 return true;
             }
@@ -2170,6 +2227,40 @@ where
     Platform:
         platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider,
 {
+    /// Remove all smoltcp listening sub-sockets from this Network's `socket_set`.
+    ///
+    /// After a fork, the parent process typically does not accept new connections
+    /// (e.g., nginx master). However, its smoltcp instance still has listening
+    /// sub-sockets (created by `refill_to_backlog`) that will respond to incoming
+    /// SYN packets routed to the parent's TUN queue. Since the parent never calls
+    /// `accept()`, those connections are black-holed: the TCP handshake completes
+    /// but the connection is never consumed.
+    ///
+    /// This method closes and removes those sub-sockets so the parent's smoltcp
+    /// stops responding to SYNs. The descriptor table entries (including
+    /// `TcpServerSpecific` metadata) are preserved, allowing `listening_tcp_sockets()`
+    /// to still discover them for future forks.
+    pub fn close_listening_smoltcp_sockets(&mut self) {
+        let my_id = self.id;
+        let table = self.litebox.descriptor_table();
+        for (_, mut handle) in table.iter_mut::<Network<Platform>>() {
+            if handle.entry.network_id != my_id {
+                continue;
+            }
+            if let ProtocolSpecific::Tcp(tcp) = &mut handle.entry.specific
+                && let Some(server) = &mut tcp.server_socket
+            {
+                // Close and remove all listening sub-sockets from the socket set.
+                for &sub_handle in &server.socket_set_handles {
+                    let tcp_socket = self.socket_set.get_mut::<tcp::Socket>(sub_handle);
+                    tcp_socket.abort();
+                    self.socket_set.remove(sub_handle);
+                }
+                server.socket_set_handles.clear();
+            }
+        }
+    }
+
     /// Export the state of all listening TCP sockets owned by this Network.
     ///
     /// Returns a [`ListeningSocketInfo`] for each unique listening port that has

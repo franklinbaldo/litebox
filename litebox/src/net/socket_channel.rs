@@ -276,6 +276,18 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
             NetworkProxy::Raw => false,
         }
     }
+
+    /// Notify epoll observers of I/O events.
+    ///
+    /// Used by the shmem path to fire `EPOLLIN`/`EPOLLOUT` notifications
+    /// when data flows through the shmem rings.
+    pub(super) fn notify_io_event(&self, events: Events) {
+        match self {
+            NetworkProxy::Stream(channel) => channel.notify_io_event(events),
+            NetworkProxy::Datagram(channel) => channel.notify_io_event(events),
+            NetworkProxy::Raw => {}
+        }
+    }
 }
 
 /// A channel for stream (TCP) socket communication.
@@ -618,7 +630,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
 
     /// Manually set the readable state.
     ///
-    /// This is used for server sockets to indicate that a connection is ready to accept.
+    /// This is used for server sockets to indicate that a connection is ready to accept,
+    /// and for shmem-backed sockets to reflect the shmem RX ring state.
     pub(super) fn set_readable(&self, readable: bool) {
         if readable {
             self.inner.rx_available.store(1, Ordering::Release);
@@ -627,10 +640,78 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         }
     }
 
+    /// Manually set the writable state.
+    ///
+    /// Used for shmem-backed sockets to reflect the shmem TX ring space
+    /// in the proxy, so that `check_io_events()` reports `OUT` correctly.
+    pub(super) fn set_writable(&self, writable: bool) {
+        if writable {
+            self.inner.tx_available.store(1, Ordering::Release);
+        } else {
+            self.inner.tx_available.store(0, Ordering::Release);
+        }
+    }
+
     /// Check if there is data in the TX buffer waiting to be sent.
     pub(super) fn has_pending_tx(&self) -> bool {
         let tx_cons = self.inner.tx_cons.lock();
         !tx_cons.is_empty()
+    }
+
+    /// Drain any data from the HeapRb RX buffer into a shmem RX ring.
+    ///
+    /// Called when transitioning an accepted socket from HeapRb mode to shmem
+    /// mode. Any data that was pushed into the HeapRb RX ring (e.g. during
+    /// `perform_platform_interaction()` in the accept handler) is moved into
+    /// the shmem RX ring so that micro can read it via `shmem_socket_read()`.
+    ///
+    /// Returns the number of bytes drained.
+    ///
+    /// # Safety
+    /// `header` must point to a valid, initialized `ShmemSocketHeader` with
+    /// sufficient backing RX data buffer space.
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    pub(super) unsafe fn drain_rx_to_shmem(
+        &self,
+        header: *mut litebox_ipc::socket_ring::ShmemSocketHeader,
+    ) -> usize {
+        let rx_cons = self.inner.rx_cons.lock();
+        let mut total = 0usize;
+
+        // Read contiguous slices from the HeapRb and write them into the
+        // shmem RX ring (advancing rx_tail).
+        let slices = rx_cons.as_slices();
+        let (first, second) = slices;
+        if !first.is_empty() {
+            // Write first slice to shmem RX ring
+            let written = unsafe {
+                litebox_ipc::socket_ring::socket_rx_fill(header, first)
+            };
+            if written > 0 {
+                total += written as usize;
+            }
+
+            // Write second slice if first was fully consumed
+            if written >= 0
+                && (written as usize) == first.len()
+                && !second.is_empty()
+            {
+                let written2 = unsafe {
+                    litebox_ipc::socket_ring::socket_rx_fill(header, second)
+                };
+                if written2 > 0 {
+                    total += written2 as usize;
+                }
+            }
+        }
+
+        // Advance the HeapRb consumer and update rx_available
+        if total > 0 {
+            unsafe { rx_cons.advance_read_index(total) };
+            self.inner.rx_available.fetch_sub(total, Ordering::Release);
+        }
+
+        total
     }
 
     /// Get the available space in the RX buffer.
@@ -1009,6 +1090,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
         } else {
             self.inner.rx_count.store(0, Ordering::Release);
         }
+    }
+
+    /// Notify observers of an I/O event.
+    pub(super) fn notify_io_event(&self, events: Events) {
+        self.inner.pollee.notify_observers(events);
     }
 
     /// Set the connected state of the datagram socket.

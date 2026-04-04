@@ -21,20 +21,6 @@ fn futex_wake(addr: &core::sync::atomic::AtomicU32) {
     }
 }
 
-/// Untimed futex wait. Used by paths that don't need liveness checking
-/// (e.g. central's own wait loops or short-lived waits).
-#[allow(dead_code)]
-fn futex_wait(addr: &core::sync::atomic::AtomicU32, expected: u32) {
-    unsafe {
-        crate::raw_syscall::futex4(
-            core::ptr::from_ref(addr) as usize,
-            libc::FUTEX_WAIT,
-            expected,
-            0,
-        );
-    }
-}
-
 /// Handle `sendmsg(fd, msg, flags)` by gathering the iovec data from the
 /// guest's `msghdr` and sending it as a regular `SYS_write` to central.
 ///
@@ -1352,6 +1338,12 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
                     }
                     // Otherwise fall through to central
                 }
+                libc::SYS_writev => {
+                    // writev(fd, iov, iovcnt) — flatten iov and write to shmem TX ring.
+                    let iov_ptr = args.args[1] as *const u8;
+                    let iovcnt = args.args[2] as usize;
+                    return unsafe { shmem_socket_writev(micro, shmem_offset, iov_ptr, iovcnt) };
+                }
                 libc::SYS_close => {
                     let micro_mut = unsafe { &mut *(*tls).micro };
                     micro_mut.unregister_socket_fd(fd);
@@ -1832,4 +1824,59 @@ unsafe fn shmem_socket_write(
             }
         }
     }
+}
+
+/// Write gathered iov data to a shmem socket TX ring buffer.
+///
+/// Iterates the iovec array, writing each buffer's data to the shmem TX
+/// ring. Returns the total number of bytes written, or a negative errno.
+///
+/// # Safety
+///
+/// `iov_ptr` must point to a valid array of `iovcnt` iovec structs in the
+/// guest's address space. Each iov_base must be valid readable memory.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_ptr_alignment,
+    clippy::ptr_as_ptr,
+    clippy::items_after_statements
+)]
+unsafe fn shmem_socket_writev(
+    micro: &crate::state::MicroState,
+    shmem_offset: u32,
+    iov_ptr: *const u8,
+    iovcnt: usize,
+) -> i64 {
+    if iov_ptr.is_null() || iovcnt == 0 {
+        return 0;
+    }
+
+    const IOVEC_SIZE: usize = 16; // sizeof(struct iovec) on x86-64
+    let mut total_written = 0i64;
+
+    for i in 0..iovcnt {
+        let iov_entry = unsafe { iov_ptr.add(i * IOVEC_SIZE) };
+        let iov_base = unsafe { core::ptr::read_unaligned(iov_entry.cast::<u64>()) } as *const u8;
+        let iov_len = unsafe { core::ptr::read_unaligned(iov_entry.add(8).cast::<u64>()) } as usize;
+
+        if iov_base.is_null() || iov_len == 0 {
+            continue;
+        }
+
+        let buf = unsafe { core::slice::from_raw_parts(iov_base, iov_len) };
+        let result = unsafe { shmem_socket_write(micro, shmem_offset, buf.as_ptr(), buf.len()) };
+        if result > 0 {
+            total_written += result;
+        } else if result < 0 {
+            // Error or EAGAIN — return what we've written so far, or the error
+            if total_written > 0 {
+                return total_written;
+            }
+            return result;
+        }
+    }
+
+    total_written
 }

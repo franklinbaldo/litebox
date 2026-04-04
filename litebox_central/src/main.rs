@@ -196,12 +196,13 @@ fn main() -> anyhow::Result<()> {
     // Register the initial ring so it gets signalled on exit/panic.
     register_active_ring(region.header());
 
-    let tun_queue = if args.tun_device.is_some() {
-        Some(0)
-    } else {
-        None
-    };
-    let server = server::ProcessServer::new(region, task, shim, fs, ring_pool, -1, tun_queue);
+    // Master process does NOT get a TUN queue — only worker children do.
+    // This prevents master's smoltcp from black-holing incoming TCP connections
+    // (master never calls accept, so connections completed on its Network are
+    // lost).  Queue 0 (created by CentralPlatform::new) is handed to the first
+    // forked worker; subsequent workers get new queues via open_new_queue().
+    let tun_enabled = args.tun_device.is_some();
+    let server = server::ProcessServer::new(region, task, shim, fs, ring_pool, -1, None, tun_enabled);
     let result = server.run();
 
     // Signal all micro processes that central is shutting down.
