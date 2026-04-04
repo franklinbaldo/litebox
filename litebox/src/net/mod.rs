@@ -1845,8 +1845,6 @@ pub enum CloseBehavior {
 /// Information about a listening TCP socket, used for transferring listening
 /// state across a fork boundary.
 pub struct ListeningSocketInfo {
-    /// The port the socket is listening on.
-    pub port: u16,
     /// The backlog (maximum number of pending connections).
     pub backlog: u16,
     /// The IP listen endpoint (address + port).
@@ -1874,7 +1872,6 @@ where
                 && let Some(backlog) = server.backlog
             {
                 listeners.push(ListeningSocketInfo {
-                    port: server.ip_listen_endpoint.port,
                     backlog,
                     ip_listen_endpoint: server.ip_listen_endpoint,
                 });
@@ -1912,7 +1909,8 @@ where
                 Some(smoltcp::wire::IpAddress::Ipv4(ipv4)) => ipv4,
                 None => smoltcp::wire::Ipv4Address::UNSPECIFIED,
             };
-            let addr = SocketAddr::V4(SocketAddrV4::new(bind_ip, info.port));
+            let port = info.ip_listen_endpoint.port;
+            let addr = SocketAddr::V4(SocketAddrV4::new(bind_ip, port));
             self.bind(&fd, &addr)
                 .expect("failed to bind imported listener");
 
@@ -1920,7 +1918,7 @@ where
             self.listen(&fd, info.backlog)
                 .expect("failed to listen on imported socket");
 
-            result.push((info.port, fd));
+            result.push((port, fd));
         }
         result
     }

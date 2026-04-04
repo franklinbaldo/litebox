@@ -517,9 +517,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
             let parent_net_guard = parent_task.task.net.lock();
             let listeners = parent_net_guard.listening_tcp_sockets();
 
-            if listeners.is_empty() {
-                drop(parent_net_guard);
-            } else {
+            if !listeners.is_empty() {
                 // Step 2: Walk the child's raw fd table to find network fds that
                 // correspond to listening sockets. We use the parent's Network
                 // to check since both share the same descriptor table entries.
@@ -528,13 +526,16 @@ impl<FS: ShimFS> LinuxShim<FS> {
 
                 // Collect (raw_fd, port) pairs for listening sockets.
                 let mut listening_raw_fds: Vec<(usize, u16)> = Vec::new();
-                for raw_fd in &alive_fds {
+                {
                     let rds = files.raw_descriptor_store.read();
-                    let Ok(net_fd) = rds.fd_from_raw_integer::<Network<Platform>>(*raw_fd) else {
-                        continue;
-                    };
-                    if let Some(port) = parent_net_guard.listening_port(&net_fd) {
-                        listening_raw_fds.push((*raw_fd, port));
+                    for raw_fd in &alive_fds {
+                        let Ok(net_fd) = rds.fd_from_raw_integer::<Network<Platform>>(*raw_fd)
+                        else {
+                            continue;
+                        };
+                        if let Some(port) = parent_net_guard.listening_port(&net_fd) {
+                            listening_raw_fds.push((*raw_fd, port));
+                        }
                     }
                 }
 
@@ -554,17 +555,24 @@ impl<FS: ShimFS> LinuxShim<FS> {
                     };
 
                     // Read parent's metadata from the old fd BEFORE consuming it.
-                    let (parent_sock_opts, parent_oflags, parent_cloexec) = {
+                    let (parent_sock_opts, parent_sock_type, parent_oflags, parent_cloexec) = {
                         let rds = files.raw_descriptor_store.read();
                         let old_net_fd = rds
                             .fd_from_raw_integer::<Network<Platform>>(*raw_fd)
                             .expect("raw fd should still be alive");
                         let dt = self.global.litebox.descriptor_table();
                         let sock_opts = dt
-                            .with_metadata(old_net_fd.as_ref(), |o: &syscalls::net::SocketOptions| {
-                                o.clone()
-                            })
+                            .with_metadata(
+                                old_net_fd.as_ref(),
+                                |o: &syscalls::net::SocketOptions| o.clone(),
+                            )
                             .unwrap_or_default();
+                        let sock_type = dt
+                            .with_metadata(
+                                old_net_fd.as_ref(),
+                                |t: &litebox_common_linux::SockType| *t,
+                            )
+                            .unwrap_or(litebox_common_linux::SockType::Stream);
                         let oflags = dt
                             .with_metadata(
                                 old_net_fd.as_ref(),
@@ -577,15 +585,14 @@ impl<FS: ShimFS> LinuxShim<FS> {
                                 |flags: &litebox_common_linux::FileDescriptorFlags| *flags,
                             )
                             .unwrap_or(litebox_common_linux::FileDescriptorFlags::empty());
-                        (sock_opts, oflags, cloexec)
+                        (sock_opts, sock_type, oflags, cloexec)
                     };
 
                     // Set up metadata on the new fd (using parent's values).
                     {
                         let mut dt = self.global.litebox.descriptor_table_mut();
                         let _old = dt.set_entry_metadata(new_fd, parent_sock_opts);
-                        let _old =
-                            dt.set_entry_metadata(new_fd, litebox_common_linux::SockType::Stream);
+                        let _old = dt.set_entry_metadata(new_fd, parent_sock_type);
                         let _old = dt.set_entry_metadata(new_fd, parent_oflags);
                     }
 
