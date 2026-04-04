@@ -5,7 +5,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use alloc::sync::{Arc, Weak};
 use litebox::{
-    event::{observer::Observer, polling::Pollee, Events},
+    event::{Events, observer::Observer, polling::Pollee},
     platform::TimeProvider,
     sync::{Mutex, RawSyncPrimitivesProvider},
 };
