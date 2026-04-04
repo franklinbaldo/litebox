@@ -18,10 +18,10 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 use crate::utils::id_pool::IdPool;
 
+use super::Error;
 use super::fcall::{self, Fcall, FcallStr, GetattrMask, TaggedFcall};
 use super::pending_table::PendingTable;
 use super::transport::{self, Read, Write};
-use super::Error;
 
 /// Fid generator with thread-safe access
 struct FidGenerator {
