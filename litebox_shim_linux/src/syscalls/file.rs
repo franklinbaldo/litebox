@@ -446,6 +446,7 @@ impl<FS: ShimFS> Task<FS> {
     /// relative paths are made absolute against CWD, `..`/`.` segments are
     /// normalized, and symlinks in every component are followed (like
     /// `realpath`).
+    #[allow(dead_code)]
     pub(crate) fn resolve_exe_path(&self, path: &str) -> String {
         let abs = if path.starts_with('/') {
             path.to_string()
@@ -550,6 +551,7 @@ impl<FS: ShimFS> Task<FS> {
 
     fn trace_pty_open(&self, _path: &str, _guest_fd: u32, _raw_fd: usize, _rdev: Option<usize>) {}
 
+    #[allow(dead_code)]
     fn maybe_trace_pty_dup(&self, _oldfd: u32, _newfd: u32) {}
 
     /// Validate that a file descriptor is open and valid.
@@ -750,6 +752,7 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn sys_rmdir(&self, pathname: impl path::Arg) -> Result<(), Errno> {
         self.sys_unlinkat(
             litebox_common_linux::AT_FDCWD,
@@ -2636,6 +2639,7 @@ impl<FS: ShimFS> Task<FS> {
         // STDOUT_NODE_INFO (ino=10), STDERR_NODE_INFO (ino=11), and
         // TTY_NODE_INFO (ino=12) in litebox/src/fs/devices.rs.
         let status = fs.fd_file_status(fd).map_err(|_| Errno::EBADF)?;
+        #[allow(clippy::match_same_arms)]
         let preferred = match status.node_info.ino {
             9 => StdioStream::Stdin,
             10 => StdioStream::Stdout,
