@@ -160,6 +160,7 @@ impl<FS: ShimFS> litebox::shim::InitThread for NewThreadArgs<FS> {
 
 pub mod loader;
 pub mod syscalls;
+mod wait;
 
 pub type DefaultFS = MacosFS;
 pub(crate) type MacosFS = litebox::fs::layered::FileSystem<
@@ -300,6 +301,7 @@ impl<FS: ShimFS> MacosShim<FS> {
                 patch_cache: litebox::sync::Mutex::new(BTreeMap::new()),
                 init_state: litebox::sync::Mutex::new(ThreadInitState::None),
                 blocked_signals: AtomicU32::new(0),
+                wait_state: wait::WaitState::new(self.0.platform),
             },
         };
 
@@ -842,6 +844,8 @@ struct Task<FS: ShimFS> {
     init_state: litebox::sync::Mutex<Platform, ThreadInitState>,
     /// Per-thread blocked signal mask (macOS 32-bit sigset_t).
     blocked_signals: AtomicU32,
+    /// Per-thread wait state for interruptible waits (pipes, futexes, etc.).
+    wait_state: wait::WaitState,
 }
 
 impl<FS: ShimFS> Task<FS> {
