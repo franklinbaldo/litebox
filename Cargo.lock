@@ -1450,6 +1450,7 @@ dependencies = [
  "buddy_system_allocator",
  "either",
  "hashbrown",
+ "litebox_ipc",
  "rangemap",
  "ringbuf",
  "slabmalloc",

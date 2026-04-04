@@ -174,7 +174,39 @@ impl<FS: ShimFS> ProcessServer<FS> {
                         const MAX_IMMEDIATE_POLLS: u32 = 64;
                         let mut polls = 0u32;
                         let timeout = loop {
-                            match net.lock().perform_platform_interaction() {
+                            let mut guard = net.lock();
+                            let advice = guard.perform_platform_interaction();
+                            // Collect shmem headers while still holding the lock.
+                            let headers = guard.active_shmem_headers();
+                            drop(guard);
+
+                            // Futex-wake blocked readers/writers on shmem sockets.
+                            // This is cheap (no-op if no waiters) and ensures
+                            // the guest is woken promptly after data moves.
+                            for header in &headers {
+                                // SAFETY: header points to valid shmem in the
+                                // shared region that outlives this thread.
+                                unsafe {
+                                    let rx_tail_ptr = &raw const (**header).rx_tail;
+                                    let tx_head_ptr = &raw const (**header).tx_head;
+                                    libc::syscall(
+                                        libc::SYS_futex,
+                                        rx_tail_ptr,
+                                        libc::FUTEX_WAKE,
+                                        1i32,
+                                        std::ptr::null::<libc::timespec>(),
+                                    );
+                                    libc::syscall(
+                                        libc::SYS_futex,
+                                        tx_head_ptr,
+                                        libc::FUTEX_WAKE,
+                                        1i32,
+                                        std::ptr::null::<libc::timespec>(),
+                                    );
+                                }
+                            }
+
+                            match advice {
                                 CallAgainImmediately => {
                                     polls += 1;
                                     if polls >= MAX_IMMEDIATE_POLLS {
@@ -1401,6 +1433,13 @@ impl<FS: ShimFS> ProcessServer<FS> {
                                 slot_index,
                             });
                         drop(ns);
+
+                        // Tell the net-worker to drain/fill this socket's shmem
+                        // rings directly instead of using the HeapRb channel.
+                        self.primary_task
+                            .net_mutex()
+                            .lock()
+                            .set_shmem_header_on_last_accepted(header_ptr);
 
                         // Build AcceptResponse and write to data region at offset 0.
                         let response = litebox_ipc::messages::AcceptResponse {

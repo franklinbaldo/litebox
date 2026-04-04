@@ -91,6 +91,9 @@ where
     queued_for_closure: Vec<SocketFd<Platform>>,
     /// Sockets that are closing in the background
     closing_in_background: Vec<smoltcp::iface::SocketHandle>,
+    /// The smoltcp handle of the most recently accepted socket.
+    /// Used by central to set the shmem header after accept completes.
+    last_accepted_smoltcp_handle: Option<smoltcp::iface::SocketHandle>,
 }
 
 impl<Platform> Network<Platform>
@@ -135,6 +138,7 @@ where
             platform_interaction: PlatformInteraction::Automatic,
             queued_for_closure: vec![],
             closing_in_background: vec![],
+            last_accepted_smoltcp_handle: None,
         }
     }
 }
@@ -155,7 +159,19 @@ pub(crate) struct SocketHandle<Platform: RawSyncPrimitivesProvider + TimeProvide
     /// The proxy associated with this socket to enable lock-free data transfer
     /// and event notification
     proxy: Option<alloc::sync::Arc<NetworkProxy<Platform>>>,
+    /// Pointer to the shmem socket ring header, if this socket has a shmem slot.
+    /// When `Some`, the net-worker drains/fills the shmem rings directly instead
+    /// of using the HeapRb socket channel, eliminating 2 data copies per direction.
+    shmem_header: Option<*mut litebox_ipc::socket_ring::ShmemSocketHeader>,
 }
+
+// SAFETY: `shmem_header` points to process-shared memory that outlives the
+// `SocketHandle`. Access is synchronized: net-worker is the only
+// producer/consumer on the central side, protected by the Network mutex.
+unsafe impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Send for SocketHandle<Platform> {}
+// SAFETY: The `shmem_header` raw pointer is only accessed while holding the
+// Network mutex, providing mutual exclusion.
+unsafe impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Sync for SocketHandle<Platform> {}
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SocketHandle<Platform> {
     /// Convenience function to perform an operation depending on the socket type
@@ -541,8 +557,20 @@ where
             }
             let socket_handle = &mut handle.entry;
             if socket_handle.consider_closed {
-                // check if there is pending data to be sent
-                if let Some(proxy) = &socket_handle.proxy
+                // Check if there is pending data to be sent.
+                // For shmem sockets, check the shmem TX ring.
+                if let Some(header) = socket_handle.shmem_header {
+                    // SAFETY: header points to valid shmem, we hold the net mutex.
+                    let has_pending = unsafe {
+                        let h = &*header;
+                        let head = h.tx_head.load(core::sync::atomic::Ordering::Relaxed);
+                        let tail = h.tx_tail.load(core::sync::atomic::Ordering::Acquire);
+                        tail.wrapping_sub(head) > 0
+                    };
+                    if has_pending {
+                        continue;
+                    }
+                } else if let Some(proxy) = &socket_handle.proxy
                     && proxy.has_pending_tx()
                 {
                     continue;
@@ -590,85 +618,94 @@ where
     /// This transfers data from the TX ring buffer (user writes) to the smoltcp socket,
     /// and from the smoltcp socket to the RX ring buffer (user reads).
     ///
+    /// When a shmem header is present, data is transferred directly between
+    /// the shmem rings and smoltcp, bypassing the HeapRb proxy channel.
+    ///
     /// Should be called periodically by the network worker to keep data flowing.
+    #[allow(clippy::too_many_lines)]
     fn drain_socket_channel_buffers(
         socket_set: &mut smoltcp::iface::SocketSet<'static>,
         socket_handle: &SocketHandle<Platform>,
         now: smoltcp::time::Instant,
     ) {
-        let proxy = match &socket_handle.proxy {
-            Some(proxy) => proxy.as_ref(),
-            None => return,
-        };
-        match (socket_handle.protocol(), proxy) {
-            (Protocol::Tcp, NetworkProxy::Stream(proxy)) => {
+        // Shmem-backed TCP sockets: drain/fill shmem rings directly.
+        if let Some(header) = socket_handle.shmem_header {
+            if !matches!(socket_handle.protocol(), Protocol::Tcp) {
+                // Only TCP sockets support shmem rings currently.
+                return;
+            }
+
+            // TX drain + RX fill in a scoped mutable borrow so we can
+            // immutably re-borrow `socket_set` for state tracking below.
+            {
                 let tcp_socket = socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
 
-                // Drain TX buffer: from ring buffer directly to smoltcp
-                while tcp_socket.can_send() {
-                    let sent = proxy
-                        .pop_tx_data_with(|data| tcp_socket.send_slice(data).unwrap_or_default());
-                    if sent == 0 {
-                        break;
-                    }
+                // TX drain: shmem TX ring → smoltcp (zero-copy peek + consume)
+                // SAFETY: `header` points to a valid, initialized `ShmemSocketHeader`
+                // in process-shared memory. The net-worker is the sole consumer of
+                // tx_head, and the sole producer of rx_tail.
+                unsafe {
+                    Self::drain_shmem_tx(header, tcp_socket);
                 }
 
-                // Drain RX buffer: from smoltcp directly to ring buffer
-                while tcp_socket.can_recv() {
-                    let received = proxy
-                        .push_rx_data_with(|buf| tcp_socket.recv_slice(buf).unwrap_or_default());
-                    if received == 0 {
-                        break;
-                    }
+                // RX fill: smoltcp → shmem RX ring (zero-copy)
+                unsafe {
+                    Self::fill_shmem_rx(header, tcp_socket);
                 }
+            }
 
-                if let tcp::State::Established = tcp_socket.state() {
-                    proxy.set_state(socket_channel::SocketState::Connected);
-                    proxy.clear_async_error();
-                }
-                let tcp_specific = socket_handle.specific.tcp();
-                // Update socket state in the channel
-                // server socket that is listening also has closed state
-                if !tcp_socket.is_open() && tcp_specific.server_socket.is_none() {
-                    // Determine error based on previous socket state
-                    match proxy.state() {
-                        socket_channel::SocketState::Connecting => {
-                            // Socket closed while connecting. Distinguish RST from timeout.
-                            let error = match tcp_specific.connect_initiated_at_us {
-                                Some(initiated_at) if now - initiated_at >= TCP_CONNECT_TIMEOUT => {
-                                    errors::SocketAsyncError::TimedOut
-                                }
-                                _ => errors::SocketAsyncError::ConnectionRefused,
-                            };
-                            proxy.set_async_error(error);
-                            proxy.set_state(socket_channel::SocketState::Error);
-                        }
-                        socket_channel::SocketState::Connected => {
-                            // Connection was reset by peer
-                            proxy.set_async_error(errors::SocketAsyncError::ConnectionReset);
-                            proxy.set_state(socket_channel::SocketState::Closed);
-                        }
-                        _ => {
-                            proxy.set_state(socket_channel::SocketState::Closed);
-                        }
-                    }
-                }
+            // State tracking via proxy (if present) still applies.
+            if let Some(proxy) = &socket_handle.proxy {
+                let tcp_socket = socket_set.get::<tcp::Socket>(socket_handle.handle);
+                Self::update_tcp_socket_state(
+                    tcp_socket,
+                    proxy.as_ref(),
+                    socket_handle,
+                    socket_set,
+                    now,
+                );
+            }
+            return;
+        }
 
-                if let Some(server_socket) = tcp_specific.server_socket.as_ref()
-                    && !proxy.is_readable()
+        // HeapRb proxy path (legacy, non-shmem sockets).
+        let Some(proxy) = &socket_handle.proxy else {
+            return;
+        };
+        match (socket_handle.protocol(), proxy.as_ref()) {
+            (Protocol::Tcp, NetworkProxy::Stream(stream_proxy)) => {
                 {
-                    server_socket
-                        .socket_set_handles
-                        .iter()
-                        .any(|&h| {
-                            let socket: &tcp::Socket = socket_set.get(h);
-                            socket.state() == tcp::State::Established
-                        })
-                        .then(|| {
-                            proxy.set_readable(true);
-                            proxy.notify_io_event(Events::IN);
+                    let tcp_socket = socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
+
+                    // Drain TX buffer: from ring buffer directly to smoltcp
+                    while tcp_socket.can_send() {
+                        let sent = stream_proxy.pop_tx_data_with(|data| {
+                            tcp_socket.send_slice(data).unwrap_or_default()
                         });
+                        if sent == 0 {
+                            break;
+                        }
+                    }
+
+                    // Drain RX buffer: from smoltcp directly to ring buffer
+                    while tcp_socket.can_recv() {
+                        let received = stream_proxy.push_rx_data_with(|buf| {
+                            tcp_socket.recv_slice(buf).unwrap_or_default()
+                        });
+                        if received == 0 {
+                            break;
+                        }
+                    }
                 }
+
+                let tcp_socket = socket_set.get::<tcp::Socket>(socket_handle.handle);
+                Self::update_tcp_socket_state(
+                    tcp_socket,
+                    proxy.as_ref(),
+                    socket_handle,
+                    socket_set,
+                    now,
+                );
             }
             (Protocol::Udp, NetworkProxy::Datagram(udp_proxy)) => {
                 let udp_socket = socket_set.get_mut::<udp::Socket>(socket_handle.handle);
@@ -717,6 +754,184 @@ where
                 unimplemented!()
             }
             _ => panic!("Mismatched protocol and proxy type"),
+        }
+    }
+
+    /// Drain the shmem TX ring into a smoltcp TCP socket.
+    ///
+    /// Uses a zero-copy peek-and-consume pattern: reads directly from the ring
+    /// buffer memory, sends the contiguous chunk to smoltcp, then advances
+    /// `tx_head` by only the amount smoltcp accepted.
+    ///
+    /// # Safety
+    /// `header` must point to a valid, initialized `ShmemSocketHeader` with
+    /// backing data buffers.
+    #[allow(clippy::cast_possible_truncation)]
+    unsafe fn drain_shmem_tx(
+        header: *mut litebox_ipc::socket_ring::ShmemSocketHeader,
+        tcp_socket: &mut tcp::Socket<'_>,
+    ) {
+        let h = unsafe { &*header };
+        let capacity = h.capacity as usize;
+        let mask = capacity - 1;
+
+        while tcp_socket.can_send() {
+            let mut head = h.tx_head.load(core::sync::atomic::Ordering::Relaxed);
+            let tail = h.tx_tail.load(core::sync::atomic::Ordering::Acquire);
+            let available = tail.wrapping_sub(head) as usize;
+            if available == 0 {
+                break;
+            }
+
+            let tx_data = unsafe { litebox_ipc::socket_ring::tx_data_ptr(header) };
+            let start = (head as usize) & mask;
+            let contiguous = available.min(capacity - start);
+
+            // Send the contiguous chunk to smoltcp.
+            let first_slice = unsafe { core::slice::from_raw_parts(tx_data.add(start), contiguous) };
+            let sent = tcp_socket.send_slice(first_slice).unwrap_or(0);
+            if sent > 0 {
+                head = head.wrapping_add(sent as u64);
+                h.tx_head.store(head, core::sync::atomic::Ordering::Release);
+            }
+            if sent < contiguous {
+                break; // smoltcp full or partial send
+            }
+
+            // If there's a wraparound portion and smoltcp can still accept more
+            if available > contiguous && tcp_socket.can_send() {
+                let wrap_len = available - contiguous;
+                let wrap_slice = unsafe { core::slice::from_raw_parts(tx_data, wrap_len) };
+                let sent2 = tcp_socket.send_slice(wrap_slice).unwrap_or(0);
+                if sent2 > 0 {
+                    head = head.wrapping_add(sent2 as u64);
+                    h.tx_head.store(head, core::sync::atomic::Ordering::Release);
+                }
+                if sent2 < wrap_len {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Fill the shmem RX ring from a smoltcp TCP socket.
+    ///
+    /// Receives data from smoltcp directly into the ring buffer memory,
+    /// then advances `rx_tail` by the amount received.
+    ///
+    /// # Safety
+    /// `header` must point to a valid, initialized `ShmemSocketHeader` with
+    /// backing data buffers.
+    #[allow(clippy::cast_possible_truncation)]
+    unsafe fn fill_shmem_rx(
+        header: *mut litebox_ipc::socket_ring::ShmemSocketHeader,
+        tcp_socket: &mut tcp::Socket<'_>,
+    ) {
+        let h = unsafe { &*header };
+        let capacity = h.capacity as usize;
+        let mask = capacity - 1;
+
+        while tcp_socket.can_recv() {
+            let mut tail = h.rx_tail.load(core::sync::atomic::Ordering::Relaxed);
+            let head = h.rx_head.load(core::sync::atomic::Ordering::Acquire);
+            let space = capacity - (tail.wrapping_sub(head)) as usize;
+            if space == 0 {
+                break;
+            }
+
+            let rx_data = unsafe { litebox_ipc::socket_ring::rx_data_ptr(header) };
+            let start = (tail as usize) & mask;
+            let contiguous = space.min(capacity - start);
+
+            // Recv from smoltcp directly into the shmem ring.
+            let recv_buf =
+                unsafe { core::slice::from_raw_parts_mut(rx_data.add(start), contiguous) };
+            let received = tcp_socket.recv_slice(recv_buf).unwrap_or(0);
+            if received > 0 {
+                tail = tail.wrapping_add(received as u64);
+                h.rx_tail.store(tail, core::sync::atomic::Ordering::Release);
+            }
+            if received < contiguous {
+                break; // smoltcp empty or partial recv
+            }
+
+            // Wraparound
+            if space > contiguous && tcp_socket.can_recv() {
+                let wrap_len = space - contiguous;
+                let wrap_buf = unsafe { core::slice::from_raw_parts_mut(rx_data, wrap_len) };
+                let received2 = tcp_socket.recv_slice(wrap_buf).unwrap_or(0);
+                if received2 > 0 {
+                    tail = tail.wrapping_add(received2 as u64);
+                    h.rx_tail.store(tail, core::sync::atomic::Ordering::Release);
+                }
+                if received2 < wrap_len {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Update TCP socket state tracking via the proxy.
+    ///
+    /// This handles state transitions (Connected, Error, Closed) and server
+    /// socket readability notifications. Shared by both shmem and HeapRb paths.
+    fn update_tcp_socket_state(
+        tcp_socket: &tcp::Socket<'_>,
+        proxy: &NetworkProxy<Platform>,
+        socket_handle: &SocketHandle<Platform>,
+        socket_set: &smoltcp::iface::SocketSet<'static>,
+        now: smoltcp::time::Instant,
+    ) {
+        let NetworkProxy::Stream(stream_proxy) = proxy else {
+            return;
+        };
+
+        if let tcp::State::Established = tcp_socket.state() {
+            stream_proxy.set_state(socket_channel::SocketState::Connected);
+            stream_proxy.clear_async_error();
+        }
+        let tcp_specific = socket_handle.specific.tcp();
+        // Update socket state in the channel
+        // server socket that is listening also has closed state
+        if !tcp_socket.is_open() && tcp_specific.server_socket.is_none() {
+            // Determine error based on previous socket state
+            match stream_proxy.state() {
+                socket_channel::SocketState::Connecting => {
+                    // Socket closed while connecting. Distinguish RST from timeout.
+                    let error = match tcp_specific.connect_initiated_at_us {
+                        Some(initiated_at) if now - initiated_at >= TCP_CONNECT_TIMEOUT => {
+                            errors::SocketAsyncError::TimedOut
+                        }
+                        _ => errors::SocketAsyncError::ConnectionRefused,
+                    };
+                    stream_proxy.set_async_error(error);
+                    stream_proxy.set_state(socket_channel::SocketState::Error);
+                }
+                socket_channel::SocketState::Connected => {
+                    // Connection was reset by peer
+                    stream_proxy.set_async_error(errors::SocketAsyncError::ConnectionReset);
+                    stream_proxy.set_state(socket_channel::SocketState::Closed);
+                }
+                _ => {
+                    stream_proxy.set_state(socket_channel::SocketState::Closed);
+                }
+            }
+        }
+
+        if let Some(server_socket) = tcp_specific.server_socket.as_ref()
+            && !stream_proxy.is_readable()
+        {
+            server_socket
+                .socket_set_handles
+                .iter()
+                .any(|&h| {
+                    let socket: &tcp::Socket = socket_set.get(h);
+                    socket.state() == tcp::State::Established
+                })
+                .then(|| {
+                    stream_proxy.set_readable(true);
+                    stream_proxy.notify_io_event(Events::IN);
+                });
         }
     }
 }
@@ -817,12 +1032,61 @@ where
                 Protocol::Raw { protocol: _ } => unimplemented!(),
             },
             proxy: None,
+            shmem_header: None,
         }))
     }
 
     /// Creates a new [`SocketFd`] for a newly-created [`SocketHandle`].
     fn new_socket_fd_for(&mut self, socket_handle: SocketHandle<Platform>) -> SocketFd<Platform> {
         self.litebox.descriptor_table_mut().insert(socket_handle)
+    }
+
+    /// Set the shmem header pointer on the most recently accepted socket.
+    ///
+    /// Called by central after `accept()` returns and a shmem slot has been
+    /// allocated. The net-worker will then drain/fill the shmem rings directly
+    /// instead of using the HeapRb socket channel.
+    ///
+    /// Returns `true` if the header was set, `false` if there is no pending
+    /// accepted socket (should not happen in normal operation).
+    pub fn set_shmem_header_on_last_accepted(
+        &mut self,
+        header: *mut litebox_ipc::socket_ring::ShmemSocketHeader,
+    ) -> bool {
+        let Some(smoltcp_handle) = self.last_accepted_smoltcp_handle.take() else {
+            return false;
+        };
+        let table = self.litebox.descriptor_table();
+        for (_, mut entry) in table.iter_mut::<Network<Platform>>() {
+            if entry.entry.network_id == self.id
+                && entry.entry.handle == smoltcp_handle
+            {
+                entry.entry.shmem_header = Some(header);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns shmem socket header pointers for all active shmem-backed
+    /// sockets owned by this Network instance.
+    ///
+    /// The caller (net-worker) uses these to futex-wake blocked
+    /// readers/writers in the guest after each poll cycle.
+    pub fn active_shmem_headers(
+        &self,
+    ) -> Vec<*mut litebox_ipc::socket_ring::ShmemSocketHeader> {
+        let table = self.litebox.descriptor_table();
+        let mut headers = Vec::new();
+        for (_, entry) in table.iter::<Network<Platform>>() {
+            if entry.entry.network_id != self.id {
+                continue;
+            }
+            if let Some(h) = entry.entry.shmem_header {
+                headers.push(h);
+            }
+        }
+        headers
     }
 
     /// Set the network proxy for the socket at `fd`
@@ -875,7 +1139,18 @@ where
                 }
                 // check if there is pending data to be sent
                 let socket_handle = &entry.entry;
-                if let Some(proxy) = &socket_handle.proxy
+                if let Some(header) = socket_handle.shmem_header {
+                    // SAFETY: header points to valid shmem.
+                    let has_pending = unsafe {
+                        let h = &*header;
+                        let head = h.tx_head.load(core::sync::atomic::Ordering::Relaxed);
+                        let tail = h.tx_tail.load(core::sync::atomic::Ordering::Acquire);
+                        tail.wrapping_sub(head) > 0
+                    };
+                    if has_pending {
+                        return false;
+                    }
+                } else if let Some(proxy) = &socket_handle.proxy
                     && proxy.has_pending_tx()
                 {
                     return false;
@@ -937,6 +1212,7 @@ where
             handle,
             mut specific,
             proxy,
+            shmem_header,
         } = socket_handle;
         match specific.protocol() {
             Protocol::Raw { .. } | Protocol::Icmp => {
@@ -961,11 +1237,17 @@ where
                 if let Some(local_port) = tcp_specific.local_port.take() {
                     self.local_port_allocator.deallocate(local_port);
                 }
-                // Drain any pending TX data from the socket channel into
-                // smoltcp before closing.  `close()` transitions out of
-                // ESTABLISHED, after which `can_send()` returns false and
+                // Drain any pending TX data before closing. `close()` transitions
+                // out of ESTABLISHED, after which `can_send()` returns false and
                 // the net-worker would never drain the remaining TX ring.
-                if let Some(proxy) = proxy.as_ref()
+                if let Some(header) = shmem_header {
+                    // Shmem path: drain TX ring directly.
+                    let tcp_socket: &mut tcp::Socket = self.socket_set.get_mut(handle);
+                    // SAFETY: header points to valid shmem, we hold the net mutex.
+                    unsafe {
+                        Self::drain_shmem_tx(header, tcp_socket);
+                    }
+                } else if let Some(proxy) = proxy.as_ref()
                     && let NetworkProxy::Stream(channel) = proxy.as_ref()
                 {
                     let tcp_socket: &mut tcp::Socket = self.socket_set.get_mut(handle);
@@ -1046,7 +1328,7 @@ where
         // the socket out of ESTABLISHED, after which `can_send()` returns
         // false and the net-worker will never drain the remaining TX ring.
         if shut_wr {
-            let smoltcp_handle_and_proxy = {
+            let smoltcp_handle_and_info = {
                 let dt = self.litebox.descriptor_table();
                 let handle = dt
                     .entry_handle(fd)
@@ -1055,18 +1337,22 @@ where
                     let socket_handle = &entry.entry;
                     if let Protocol::Tcp = socket_handle.protocol() {
                         let proxy = socket_handle.proxy.clone();
-                        Some((socket_handle.handle, proxy))
+                        Some((socket_handle.handle, proxy, socket_handle.shmem_header))
                     } else {
                         None
                     }
                 })
             };
-            if let Some((smoltcp_handle, proxy)) = smoltcp_handle_and_proxy {
-                // Drain the TX ring into smoltcp before closing.
-                if let Some(proxy) = proxy.as_ref()
+            if let Some((smoltcp_handle, proxy, shmem_header)) = smoltcp_handle_and_info {
+                let tcp_socket: &mut tcp::Socket = self.socket_set.get_mut(smoltcp_handle);
+                // Drain pending TX data into smoltcp before closing.
+                if let Some(header) = shmem_header {
+                    // Shmem path: drain TX ring directly (drain_shmem_tx loops internally).
+                    unsafe { Self::drain_shmem_tx(header, tcp_socket) };
+                } else if let Some(proxy) = proxy.as_ref()
                     && let NetworkProxy::Stream(channel) = proxy.as_ref()
                 {
-                    let tcp_socket: &mut tcp::Socket = self.socket_set.get_mut(smoltcp_handle);
+                    // HeapRb fallback path.
                     while tcp_socket.can_send() {
                         let sent = channel.pop_tx_data_with(|data| {
                             tcp_socket.send_slice(data).unwrap_or_default()
@@ -1514,7 +1800,9 @@ where
                         connect_initiated_at_us: None,
                     }),
                     proxy: None,
+                    shmem_header: None,
                 };
+                self.last_accepted_smoltcp_handle = Some(ready_handle);
                 if let Some(peer) = peer {
                     let Ok(remote_addr) = self.get_remote_addr_for_handle(&handle) else {
                         unreachable!("a connected TCP socket must have a remote address")
