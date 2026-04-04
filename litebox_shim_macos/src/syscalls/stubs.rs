@@ -8,9 +8,9 @@
 
 use alloc::boxed::Box;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, ThreadProvider as _};
-use litebox_common_macos::PtRegs;
 use litebox_common_macos::errno::Errno;
 use litebox_common_macos::syscall::mach_trap;
+use litebox_common_macos::PtRegs;
 
 use crate::{MutPtr, ShimFS, Task};
 
@@ -397,6 +397,7 @@ impl<FS: ShimFS> Task<FS> {
                 mach_port,
                 tsd_offset,
             }),
+            blocked_signals: core::sync::atomic::AtomicU32::new(0),
         };
 
         let r = unsafe {

@@ -81,6 +81,31 @@ enum ThreadInitState {
     },
 }
 
+/// Per-signal handler registration (matches macOS kernel-facing struct __sigaction layout).
+#[derive(Clone, Copy)]
+#[allow(dead_code, reason = "fields used by sigaction/sigreturn syscalls in future tasks")]
+struct SignalHandler {
+    /// Signal handler address, or SIG_DFL(0)/SIG_IGN(1).
+    handler: u64,
+    /// Address of `_sigtramp` from libsystem_platform (passed via sa_tramp).
+    tramp: u64,
+    /// Signal mask to apply during handler execution (macOS 32-bit sigset_t).
+    mask: u32,
+    /// SA_* flags (SA_SIGINFO, SA_NODEFER, etc.).
+    flags: u32,
+}
+
+impl Default for SignalHandler {
+    fn default() -> Self {
+        Self {
+            handler: 0, // SIG_DFL
+            tramp: 0,
+            mask: 0,
+            flags: 0,
+        }
+    }
+}
+
 /// Shared process state, accessible from all threads via `Arc`.
 #[allow(
     dead_code,
@@ -107,6 +132,8 @@ struct Process {
     next_tid: AtomicI32,
     /// Next Mach thread port to allocate.
     next_mach_port: AtomicU32,
+    /// Per-signal handler table. Indexed by signal number (1-31; index 0 unused).
+    signal_handlers: litebox::sync::Mutex<Platform, [SignalHandler; 32]>,
 }
 
 impl Process {
@@ -121,6 +148,7 @@ impl Process {
             tsd_offset: AtomicU32::new(0),
             next_tid: AtomicI32::new(2),
             next_mach_port: AtomicU32::new(0x0403),
+            signal_handlers: litebox::sync::Mutex::new([SignalHandler::default(); 32]),
         }
     }
 }
@@ -283,6 +311,7 @@ impl<FS: ShimFS> MacosShim<FS> {
                 terminated: AtomicBool::new(false),
                 patch_cache: litebox::sync::Mutex::new(BTreeMap::new()),
                 init_state: litebox::sync::Mutex::new(ThreadInitState::None),
+                blocked_signals: AtomicU32::new(0),
             },
         };
 
@@ -793,6 +822,9 @@ struct Task<FS: ShimFS> {
     patch_cache: litebox::sync::Mutex<Platform, BTreeMap<i32, MachoPatchState>>,
     /// Initialization state for this thread (set before first entry).
     init_state: litebox::sync::Mutex<Platform, ThreadInitState>,
+    /// Per-thread blocked signal mask (macOS 32-bit sigset_t).
+    #[allow(dead_code, reason = "used by sigprocmask/signal delivery in future tasks")]
+    blocked_signals: AtomicU32,
 }
 
 impl<FS: ShimFS> Task<FS> {
