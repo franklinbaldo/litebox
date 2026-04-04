@@ -149,15 +149,13 @@ impl<FS: ShimFS> Task<FS> {
                 pthsize,
                 pthread_init_data,
                 pthread_init_data_size,
-            } => self
-                .sys_bsdthread_register(
-                    threadstart,
-                    wqthread,
-                    pthsize,
-                    pthread_init_data,
-                    pthread_init_data_size,
-                )
-                .map(|v| v as usize),
+            } => self.sys_bsdthread_register(
+                threadstart,
+                wqthread,
+                pthsize,
+                pthread_init_data,
+                pthread_init_data_size,
+            ),
             MacosSyscallRequest::BsdthreadCreate {
                 func,
                 func_arg,

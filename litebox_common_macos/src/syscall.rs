@@ -286,6 +286,8 @@ impl MacosSyscallRequest {
 
         // Mach traps use negative x16 values.
         if (nr_raw as i64) < 0 {
+            #[allow(clippy::cast_sign_loss)]
+            // Mach trap numbers are always small positive after negation
             let number = (-(nr_raw as i64)) as usize;
             return MacosSyscallRequest::MachTrap { number };
         }
@@ -406,7 +408,7 @@ impl MacosSyscallRequest {
             nr::SHARED_REGION_MAP_AND_SLIDE_2_NP => MacosSyscallRequest::SharedRegionMapAndSlide2Np,
             nr::KDEBUG_TRACE_STRING => MacosSyscallRequest::KdebugTraceString,
             nr::STATFS64 => MacosSyscallRequest::Statfs64 { path: a0, buf: a1 },
-            nr::REBOOT => MacosSyscallRequest::Unknown { number: nr_raw }, // treated as unknown
+            // nr::REBOOT is intentionally not decoded — falls through to the wildcard arm.
             nr::TERMINATE_WITH_PAYLOAD => MacosSyscallRequest::TerminateWithPayload {
                 namespace: a1,
                 code: a2,

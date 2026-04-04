@@ -53,7 +53,10 @@ pub(crate) fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {
 
 /// Per-thread initialization state, set before the thread is resumed.
 #[derive(Default)]
-#[allow(dead_code, reason = "BsdThread variant used by bsdthread_create in a future task")]
+#[allow(
+    dead_code,
+    reason = "BsdThread variant used by bsdthread_create in a future task"
+)]
 enum ThreadInitState {
     #[default]
     None,
@@ -79,7 +82,10 @@ enum ThreadInitState {
 }
 
 /// Shared process state, accessible from all threads via `Arc`.
-#[allow(dead_code, reason = "fields used by bsdthread syscalls in future tasks")]
+#[allow(
+    dead_code,
+    reason = "fields used by bsdthread syscalls in future tasks"
+)]
 struct Process {
     /// Number of live threads. When this reaches 0, the process has exited.
     nr_threads: AtomicI32,

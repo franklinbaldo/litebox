@@ -8,9 +8,9 @@
 
 use alloc::boxed::Box;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, ThreadProvider as _};
+use litebox_common_macos::PtRegs;
 use litebox_common_macos::errno::Errno;
 use litebox_common_macos::syscall::mach_trap;
-use litebox_common_macos::PtRegs;
 
 use crate::{MutPtr, ShimFS, Task};
 
@@ -217,7 +217,7 @@ impl<FS: ShimFS> Task<FS> {
     ///
     /// This is used by dyld during bootstrap. The exact value doesn't matter
     /// as long as it's nonzero and consistent within the process.
-    #[allow(clippy::unnecessary_wraps)]
+    #[allow(clippy::unnecessary_wraps, clippy::cast_sign_loss)]
     pub(crate) fn sys_thread_selfid(&self) -> Result<usize, Errno> {
         Ok(self.tid as usize)
     }
@@ -259,7 +259,9 @@ impl<FS: ShimFS> Task<FS> {
                 if self.tid == 1 {
                     Ok(0x0303)
                 } else {
-                    Ok(((self.tid as usize) + 2) << 8 | 0x03)
+                    #[allow(clippy::cast_sign_loss)] // tid is always positive
+                    let port = ((self.tid as usize) + 2) << 8 | 0x03;
+                    Ok(port)
                 }
             }
             mach_trap::TASK_SELF_TRAP => Ok(0x0103),
@@ -295,7 +297,7 @@ impl<FS: ShimFS> Task<FS> {
         pthsize: u32,
         pthread_init_data: usize,
         pthread_init_data_size: usize,
-    ) -> Result<i32, Errno> {
+    ) -> Result<usize, Errno> {
         use core::sync::atomic::Ordering;
 
         log_unsupported!(
@@ -316,9 +318,10 @@ impl<FS: ShimFS> Task<FS> {
             // Read tsd_offset at offset 16 (8 bytes)
             let ptr: crate::ConstPtr<u8> = crate::ConstPtr::from_usize(pthread_init_data + 16);
             let mut tsd_offset_bytes = [0u8; 8];
-            for i in 0..8 {
-                tsd_offset_bytes[i] = ptr.read_at_offset(i as isize).ok_or(Errno::EFAULT)?;
+            for (i, byte) in tsd_offset_bytes.iter_mut().enumerate() {
+                *byte = ptr.read_at_offset(i.cast_signed()).ok_or(Errno::EFAULT)?;
             }
+            #[allow(clippy::cast_possible_truncation)] // TSD offset fits in u32 on aarch64
             let tsd_offset = u64::from_le_bytes(tsd_offset_bytes) as u32;
             self.process.tsd_offset.store(tsd_offset, Ordering::Release);
             log_unsupported!("bsdthread_register: tsd_offset={tsd_offset:#x}");
@@ -327,7 +330,7 @@ impl<FS: ShimFS> Task<FS> {
             let version_bytes = (pthread_init_data_size as u64).to_le_bytes();
             let dest: MutPtr<u8> = MutPtr::from_usize(pthread_init_data);
             for i in 0..8isize {
-                dest.write_at_offset(i, version_bytes[i as usize])
+                dest.write_at_offset(i, version_bytes[i.cast_unsigned()])
                     .ok_or(Errno::EFAULT)?;
             }
         }
@@ -352,6 +355,7 @@ impl<FS: ShimFS> Task<FS> {
     ) -> Result<usize, Errno> {
         use core::sync::atomic::Ordering;
 
+        #[allow(clippy::cast_possible_truncation)] // aarch64: usize == u64
         let threadstart = self.process.threadstart.load(Ordering::Acquire) as usize;
         if threadstart == 0 {
             log_unsupported!("bsdthread_create called before bsdthread_register");
@@ -416,6 +420,7 @@ impl<FS: ShimFS> Task<FS> {
     /// On real macOS, the kernel frees the thread's stack, deallocates its
     /// Mach port, and signals a semaphore/ulock. We skip stack freeing
     /// (the host thread owns its stack) and just mark the thread terminated.
+    #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn sys_bsdthread_terminate(
         &self,
         _stackaddr: usize,
@@ -459,9 +464,8 @@ impl<FS: ShimFS> Task<FS> {
         const BSDTHREAD_CTL_QOS_MAX_PARALLELISM: usize = 0x800;
 
         match cmd {
-            BSDTHREAD_CTL_SET_SELF => Ok(0),
             BSDTHREAD_CTL_QOS_MAX_PARALLELISM => Ok(1),
-            BSDTHREAD_CTL_SET_QOS | BSDTHREAD_CTL_GET_QOS => Ok(0),
+            BSDTHREAD_CTL_SET_SELF | BSDTHREAD_CTL_SET_QOS | BSDTHREAD_CTL_GET_QOS => Ok(0),
             _ => {
                 log_unsupported!("bsdthread_ctl(cmd={cmd:#x}): unsupported");
                 Ok(0)

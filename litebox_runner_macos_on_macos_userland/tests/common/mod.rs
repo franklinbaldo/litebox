@@ -36,13 +36,7 @@ pub fn assemble_macho(src_path: &str, name: &str) -> PathBuf {
 
     // Assemble
     let output = std::process::Command::new("as")
-        .args([
-            "-arch",
-            "arm64",
-            src_path,
-            "-o",
-            obj_path.to_str().unwrap(),
-        ])
+        .args(["-arch", "arm64", src_path, "-o", obj_path.to_str().unwrap()])
         .output()
         .expect("failed to run assembler");
     assert!(
@@ -231,11 +225,7 @@ pub fn run_macho_dynamic(
         // Write the main binary into the in-mem FS so dyld can open it.
         let exe_path = format!("/usr/bin/{exe_name}");
         let fd = fs
-            .open(
-                &exe_path,
-                OFlags::CREAT | OFlags::WRONLY,
-                mode,
-            )
+            .open(&exe_path, OFlags::CREAT | OFlags::WRONLY, mode)
             .expect("create executable in in-mem FS");
         fs.write(&fd, binary_data, None)
             .expect("write executable data");
