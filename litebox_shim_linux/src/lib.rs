@@ -513,35 +513,34 @@ impl<FS: ShimFS> LinuxShim<FS> {
         // Re-create listening sockets from the parent's Network into the child's
         // fresh Network, so that inherited listening fds actually work.
         {
-            // Step 1: Export listening socket state from the parent.
+            // Step 1: Export listening socket state from the parent's Network.
+            // `listening_tcp_sockets()` filters by network_id, so it only
+            // returns sockets owned by the parent (not other children).
             let parent_net_guard = parent_task.task.net.lock();
             let listeners = parent_net_guard.listening_tcp_sockets();
 
+            // Step 2: Walk the child's raw fd table to find network fds that
+            // correspond to listening sockets. We use the parent's Network
+            // to check since both share the same descriptor table entries.
+            let mut listening_raw_fds: Vec<(usize, u16)> = Vec::new();
             if !listeners.is_empty() {
-                // Step 2: Walk the child's raw fd table to find network fds that
-                // correspond to listening sockets. We use the parent's Network
-                // to check since both share the same descriptor table entries.
                 let alive_fds: Vec<usize> =
                     files.raw_descriptor_store.read().iter_alive().collect();
-
-                // Collect (raw_fd, port) pairs for listening sockets.
-                let mut listening_raw_fds: Vec<(usize, u16)> = Vec::new();
-                {
-                    let rds = files.raw_descriptor_store.read();
-                    for raw_fd in &alive_fds {
-                        let Ok(net_fd) = rds.fd_from_raw_integer::<Network<Platform>>(*raw_fd)
-                        else {
-                            continue;
-                        };
-                        if let Some(port) = parent_net_guard.listening_port(&net_fd) {
-                            listening_raw_fds.push((*raw_fd, port));
-                        }
+                let rds = files.raw_descriptor_store.read();
+                for raw_fd in &alive_fds {
+                    let Ok(net_fd) = rds.fd_from_raw_integer::<Network<Platform>>(*raw_fd) else {
+                        continue;
+                    };
+                    if let Some(port) = parent_net_guard.listening_port(&net_fd) {
+                        listening_raw_fds.push((*raw_fd, port));
                     }
                 }
+            }
 
-                // Release the parent lock before mutating the child.
-                drop(parent_net_guard);
+            // Release the parent lock before mutating the child.
+            drop(parent_net_guard);
 
+            if !listening_raw_fds.is_empty() {
                 // Step 3: Import listeners into the child's Network (creates new
                 // smoltcp sockets, binds, and listens).
                 let imported = child_net.import_listening_sockets(&listeners);

@@ -6,7 +6,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::event::Events;
 use crate::net::socket_channel::NetworkProxy;
@@ -48,6 +48,13 @@ const MAX_PACKET_COUNT: usize = 32;
 /// TCP connection timeout.
 const TCP_CONNECT_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(75);
 
+/// Global counter for assigning unique IDs to each [`Network`] instance.
+///
+/// This is used to tag descriptor table entries so that each Network only
+/// processes its own sockets in methods like `drain_all_socket_channel_buffers`
+/// and `close_pending_sockets`.
+static NEXT_NETWORK_ID: AtomicU64 = AtomicU64::new(1);
+
 /// The `Network` provides access to all networking related functionality provided by LiteBox.
 ///
 /// A LiteBox `Network` is parametric in the platform it runs on.
@@ -62,6 +69,10 @@ where
     Platform:
         platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider,
 {
+    /// Unique identifier for this Network instance. Used to tag descriptor
+    /// table entries so that iteration methods only process sockets belonging
+    /// to this instance.
+    id: u64,
     litebox: LiteBox<Platform>,
     /// The set of sockets
     socket_set: smoltcp::iface::SocketSet<'static>,
@@ -114,6 +125,7 @@ where
             _ => unreachable!(),
         }
         Self {
+            id: NEXT_NETWORK_ID.fetch_add(1, Ordering::Relaxed),
             litebox: litebox.clone(),
             socket_set: smoltcp::iface::SocketSet::new(vec![]),
             device,
@@ -130,6 +142,9 @@ where
 /// [`SocketHandle`] stores all relevant information for a specific [`SocketFd`], for easy access
 /// from [`SocketFd`], _except_ the `Socket` itself which is stored in the [`Network::socket_set`].
 pub(crate) struct SocketHandle<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+    /// The ID of the [`Network`] instance that owns this socket.
+    /// Used to filter iteration so each Network only processes its own sockets.
+    network_id: u64,
     /// Whether this socket handle is going away soon (i.e., `close` has been invoked upon it but
     /// it lingers for a bit to allow pending data to be sent).
     consider_closed: bool,
@@ -518,8 +533,12 @@ where
 
     /// Close all finished sockets that are marked as closed but waiting for pending data to be sent
     fn close_pending_sockets(&mut self) {
+        let my_id = self.id;
         let table = self.litebox.descriptor_table();
         for (_, mut handle) in table.iter_mut::<Network<Platform>>() {
+            if handle.entry.network_id != my_id {
+                continue;
+            }
             let socket_handle = &mut handle.entry;
             if socket_handle.consider_closed {
                 // check if there is pending data to be sent
@@ -553,11 +572,15 @@ where
         }
     }
 
-    /// Drain all socket channel buffers
+    /// Drain all socket channel buffers belonging to this Network instance.
     fn drain_all_socket_channel_buffers(&mut self) {
         let now = self.now();
+        let my_id = self.id;
         let table = self.litebox.descriptor_table();
         for (_, entry) in table.iter::<Network<Platform>>() {
+            if entry.entry.network_id != my_id {
+                continue;
+            }
             Self::drain_socket_channel_buffers(&mut self.socket_set, &entry.entry, now);
         }
     }
@@ -777,6 +800,7 @@ where
         };
 
         Ok(self.new_socket_fd_for(SocketHandle {
+            network_id: self.id,
             consider_closed: false,
             handle,
             specific: match protocol {
@@ -908,6 +932,7 @@ where
     /// Close the `socket_handle`
     fn close_handle(&mut self, socket_handle: SocketHandle<Platform>) {
         let SocketHandle {
+            network_id: _,
             consider_closed: _,
             handle,
             mut specific,
@@ -1479,6 +1504,7 @@ where
                 drop(descriptor_table);
                 // Create a new FD to hand it back out to the user
                 let handle = SocketHandle {
+                    network_id: self.id,
                     consider_closed: false,
                     handle: ready_handle,
                     specific: ProtocolSpecific::Tcp(TcpSpecific {
@@ -1856,21 +1882,41 @@ where
     Platform:
         platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider,
 {
-    /// Export the state of all listening TCP sockets.
+    /// Export the state of all listening TCP sockets owned by this Network.
     ///
-    /// Returns a [`ListeningSocketInfo`] for each TCP socket that has an active
-    /// server socket with a set backlog (i.e., `listen()` has been called).
+    /// Returns a [`ListeningSocketInfo`] for each unique listening port that has
+    /// an active server socket with a set backlog (i.e., `listen()` has been
+    /// called) and belongs to this Network instance (matched by network ID).
+    ///
+    /// Results are deduplicated by port because `fork_files_state()` creates
+    /// duplicated descriptor table entries that share the same underlying
+    /// `Arc` — multiple entries may represent the same physical listening
+    /// socket. Without deduplication, `import_listening_sockets()` would
+    /// attempt to bind the same port multiple times, causing
+    /// `PortAlreadyInUse`.
     ///
     /// This is used during fork to discover which listening sockets need to be
     /// re-created in the child's fresh [`Network`] instance.
     pub fn listening_tcp_sockets(&self) -> Vec<ListeningSocketInfo> {
+        let my_id = self.id;
         let descriptor_table = self.litebox.descriptor_table();
         let mut listeners = Vec::new();
         for (_internal_fd, entry) in descriptor_table.iter::<Network<Platform>>() {
+            if entry.entry.network_id != my_id {
+                continue;
+            }
             if let ProtocolSpecific::Tcp(tcp) = &entry.entry.specific
                 && let Some(server) = &tcp.server_socket
                 && let Some(backlog) = server.backlog
             {
+                let port = server.ip_listen_endpoint.port;
+                // Skip if we already have a listener for this port (see doc comment).
+                if listeners
+                    .iter()
+                    .any(|l: &ListeningSocketInfo| l.ip_listen_endpoint.port == port)
+                {
+                    continue;
+                }
                 listeners.push(ListeningSocketInfo {
                     backlog,
                     ip_listen_endpoint: server.ip_listen_endpoint,
