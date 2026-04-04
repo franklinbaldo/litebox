@@ -56,6 +56,7 @@ pub mod nr {
     pub const BSDTHREAD_TERMINATE: usize = 361;
     pub const BSDTHREAD_REGISTER: usize = 366;
     pub const BSDTHREAD_CTL: usize = 478;
+    pub const SIGRETURN: usize = 184;
 }
 
 /// Mach trap numbers (negative x16 values, stored as positive constants).
@@ -265,6 +266,11 @@ pub enum MacosSyscallRequest {
         arg2: usize,
         arg3: usize,
     },
+    /// `sigreturn(uctx, infostyle, token)` — restore context after signal handler.
+    Sigreturn {
+        uctx: usize,
+        infostyle: i32,
+    },
     Unknown {
         number: usize,
     },
@@ -449,6 +455,10 @@ impl MacosSyscallRequest {
                 freesize: a1,
                 port: a2 as u32,
                 sema_or_ulock: a3,
+            },
+            nr::SIGRETURN => MacosSyscallRequest::Sigreturn {
+                uctx: a0,
+                infostyle: a1 as i32,
             },
             nr::BSDTHREAD_CTL => Self::BsdthreadCtl {
                 cmd: a0,
