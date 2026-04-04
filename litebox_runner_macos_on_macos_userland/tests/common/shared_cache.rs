@@ -2,6 +2,9 @@
 // Licensed under the MIT license.
 
 use std::collections::BTreeMap;
+use std::fs;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 
 /// Memory protection for a shared cache mapping or region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +146,238 @@ impl CacheMap {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Sub-cache file reader
+// ---------------------------------------------------------------------------
+
+/// A single VM mapping entry from a sub-cache file header.
+struct SubCacheFileMapping {
+    pub vm_addr: u64,
+    pub vm_size: u64,
+    pub file_offset: u64,
+    pub init_prot: u32,
+}
+
+/// Represents a single sub-cache file with its parsed mapping table.
+struct SubCacheFile {
+    pub path: PathBuf,
+    pub mappings: Vec<SubCacheFileMapping>,
+}
+
+impl SubCacheFile {
+    /// Parse a sub-cache file by reading its header (~4KB).
+    /// Returns `None` if the file cannot be read or lacks the `dyld_v1` magic.
+    fn parse(path: &Path) -> Option<SubCacheFile> {
+        let mut f = fs::File::open(path).ok()?;
+        let mut header = vec![0u8; 4096];
+        let n = f.read(&mut header).ok()?;
+        if n < 24 {
+            return None;
+        }
+
+        // Validate magic: first 7 bytes must be "dyld_v1"
+        if &header[..7] != b"dyld_v1" {
+            return None;
+        }
+
+        // mapping_offset at offset 16 (u32 LE)
+        let mapping_offset = u32::from_le_bytes(header[16..20].try_into().ok()?) as usize;
+        // mapping_count at offset 20 (u32 LE)
+        let mapping_count = u32::from_le_bytes(header[20..24].try_into().ok()?) as usize;
+
+        if mapping_count == 0 {
+            return Some(SubCacheFile {
+                path: path.to_path_buf(),
+                mappings: Vec::new(),
+            });
+        }
+
+        // Each mapping entry is 32 bytes.
+        let end = mapping_offset + mapping_count * 32;
+        if end > n {
+            // Need to read more data.
+            header.resize(end, 0);
+            f.seek(SeekFrom::Start(n as u64)).ok()?;
+            f.read_exact(&mut header[n..end]).ok()?;
+        }
+
+        let mut mappings = Vec::with_capacity(mapping_count);
+        for i in 0..mapping_count {
+            let base = mapping_offset + i * 32;
+            let vm_addr = u64::from_le_bytes(header[base..base + 8].try_into().ok()?);
+            let vm_size = u64::from_le_bytes(header[base + 8..base + 16].try_into().ok()?);
+            let file_offset = u64::from_le_bytes(header[base + 16..base + 24].try_into().ok()?);
+            // max_prot at base+24..base+28 — skip
+            let init_prot = u32::from_le_bytes(header[base + 28..base + 32].try_into().ok()?);
+            mappings.push(SubCacheFileMapping {
+                vm_addr,
+                vm_size,
+                file_offset,
+                init_prot,
+            });
+        }
+
+        Some(SubCacheFile {
+            path: path.to_path_buf(),
+            mappings,
+        })
+    }
+
+    /// Returns `true` if any mapping in this sub-cache file contains `addr`.
+    fn contains_vmaddr(&self, addr: u64) -> bool {
+        self.mappings
+            .iter()
+            .any(|m| addr >= m.vm_addr && addr < m.vm_addr + m.vm_size)
+    }
+
+    /// Read bytes from `[vm_start, vm_end)` out of this sub-cache file.
+    ///
+    /// Finds the mapping that contains `vm_start`, computes the file offset,
+    /// and reads the bytes.  The read length is clamped to the mapping boundary.
+    fn read_region(&self, vm_start: u64, vm_end: u64) -> Option<Vec<u8>> {
+        let mapping = self
+            .mappings
+            .iter()
+            .find(|m| vm_start >= m.vm_addr && vm_start < m.vm_addr + m.vm_size)?;
+
+        let offset_in_mapping = vm_start - mapping.vm_addr;
+        let file_pos = mapping.file_offset + offset_in_mapping;
+
+        // Clamp to mapping boundary.
+        let mapping_remaining = mapping.vm_size - offset_in_mapping;
+        let requested = vm_end - vm_start;
+        let len = requested.min(mapping_remaining) as usize;
+
+        let mut f = fs::File::open(&self.path).ok()?;
+        f.seek(SeekFrom::Start(file_pos)).ok()?;
+        let mut buf = vec![0u8; len];
+        f.read_exact(&mut buf).ok()?;
+        Some(buf)
+    }
+}
+
+/// Discover all sub-cache files in `cache_dir` matching `dyld_shared_cache_arm64e*`,
+/// excluding `.map` and `.atlas` files.
+fn discover_subcache_files(cache_dir: &Path) -> Vec<SubCacheFile> {
+    let mut files = Vec::new();
+    let entries = match fs::read_dir(cache_dir) {
+        Ok(e) => e,
+        Err(_) => return files,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.starts_with("dyld_shared_cache_arm64e") {
+            continue;
+        }
+        if name_str.ends_with(".map") || name_str.ends_with(".atlas") {
+            continue;
+        }
+        if let Some(sc) = SubCacheFile::parse(&entry.path()) {
+            files.push(sc);
+        }
+    }
+    files
+}
+
+/// Determine the memory protection for a segment based on its name.
+///
+/// Falls back to the global cache mapping that contains `vm_start` for unknown
+/// segment names.
+fn segment_protection(seg_name: &str, vm_start: u64, mappings: &[CacheMapping]) -> Protection {
+    match seg_name {
+        "__TEXT" => Protection::ReadExecute,
+        "__DATA" | "__DATA_DIRTY" | "__AUTH" => Protection::ReadWrite,
+        "__DATA_CONST" | "__AUTH_CONST" | "__TPRO_CONST" | "__LINKEDIT" => Protection::ReadOnly,
+        _ => {
+            // Fall back to global mapping protection.
+            mappings
+                .iter()
+                .find(|m| vm_start >= m.vm_start && vm_start < m.vm_end)
+                .map(|m| m.prot)
+                .unwrap_or(Protection::ReadOnly)
+        }
+    }
+}
+
+/// Collect shared-cache regions for the given set of dylibs.
+///
+/// Reads the `.map` file from `cache_dir`, discovers sub-cache files, and reads
+/// the VM regions that correspond to the segments of the requested dylibs.
+pub fn collect_regions(cache_dir: &Path, needed_dylibs: &[&str]) -> Vec<SharedCacheRegion> {
+    let map_path = cache_dir.join("dyld_shared_cache_arm64e.map");
+    let map_text = fs::read_to_string(&map_path)
+        .unwrap_or_else(|e| panic!("failed to read map file {}: {e}", map_path.display()));
+    let cache_map = CacheMap::parse(&map_text);
+
+    let subcaches = discover_subcache_files(cache_dir);
+
+    // Deduplicate regions by (vm_start, vm_end).
+    let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+    let mut regions: Vec<SharedCacheRegion> = Vec::new();
+
+    // Collect LINKEDIT ranges separately so we can deduplicate them across dylibs.
+    let mut linkedit_ranges: Vec<(u64, u64)> = Vec::new();
+
+    for &dylib_path in needed_dylibs {
+        let entry = match cache_map.dylibs.get(dylib_path) {
+            Some(e) => e,
+            None => continue,
+        };
+
+        for seg in &entry.segments {
+            if seg.name == "__LINKEDIT" {
+                linkedit_ranges.push((seg.vm_start, seg.vm_end));
+                continue;
+            }
+
+            let key = (seg.vm_start, seg.vm_end);
+            if !seen.insert(key) {
+                continue;
+            }
+
+            let prot = segment_protection(&seg.name, seg.vm_start, &cache_map.mappings);
+
+            // Find the sub-cache file that contains this VM address.
+            let sc = match subcaches.iter().find(|s| s.contains_vmaddr(seg.vm_start)) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            if let Some(data) = sc.read_region(seg.vm_start, seg.vm_end) {
+                regions.push(SharedCacheRegion {
+                    guest_addr: seg.vm_start,
+                    data,
+                    prot,
+                });
+            }
+        }
+    }
+
+    // Deduplicate and read LINKEDIT ranges.
+    linkedit_ranges.sort();
+    linkedit_ranges.dedup();
+    for (vm_start, vm_end) in &linkedit_ranges {
+        let key = (*vm_start, *vm_end);
+        if !seen.insert(key) {
+            continue;
+        }
+        let sc = match subcaches.iter().find(|s| s.contains_vmaddr(*vm_start)) {
+            Some(s) => s,
+            None => continue,
+        };
+        if let Some(data) = sc.read_region(*vm_start, *vm_end) {
+            regions.push(SharedCacheRegion {
+                guest_addr: *vm_start,
+                data,
+                prot: Protection::ReadOnly,
+            });
+        }
+    }
+
+    regions
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,6 +451,48 @@ mapping  RO  120MB 0x1F73F0000 -> 0x1FEC78000
         assert!(
             !sys_paths.contains(&"/usr/lib/libobjc.A.dylib".to_string()),
             "system_dylib_paths should not include libobjc"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires access to /System/Cryptexes/OS/System/Library/dyld/"]
+    fn test_read_real_cache_regions() {
+        let cache_dir = std::path::Path::new("/System/Cryptexes/OS/System/Library/dyld/");
+        if !cache_dir.exists() {
+            eprintln!("Skipping: cache dir does not exist");
+            return;
+        }
+
+        let map_path = cache_dir.join("dyld_shared_cache_arm64e.map");
+        let map_text = std::fs::read_to_string(&map_path).expect("failed to read map file");
+        let cache_map = CacheMap::parse(&map_text);
+        let sys_paths = cache_map.system_dylib_paths();
+        let needed: Vec<&str> = sys_paths.iter().map(|s| s.as_str()).collect();
+
+        eprintln!("Collecting regions for {} dylibs...", needed.len());
+        let regions = collect_regions(cache_dir, &needed);
+
+        assert!(
+            !regions.is_empty(),
+            "expected at least one region from system dylibs"
+        );
+
+        let total_rx: usize = regions
+            .iter()
+            .filter(|r| r.prot == Protection::ReadExecute)
+            .map(|r| r.data.len())
+            .sum();
+
+        eprintln!(
+            "Collected {} regions, total RX = {:.2} MB",
+            regions.len(),
+            total_rx as f64 / (1024.0 * 1024.0)
+        );
+
+        // System dylibs should be well under 20 MB of RX data.
+        assert!(
+            total_rx < 20 * 1024 * 1024,
+            "total RX {total_rx} bytes exceeds 20 MB — are we loading too much?"
         );
     }
 }
