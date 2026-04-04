@@ -36,7 +36,7 @@ fn ratchet_globals() -> Result<()> {
             ("dev_bench/", 1),
             ("litebox/", 13),
             ("litebox_platform_linux_kernel/", 6),
-            ("litebox_platform_linux_userland/", 6),
+            ("litebox_platform_linux_userland/", 7),
             ("litebox_platform_lvbs/", 23),
             ("litebox_platform_multiplex/", 1),
             ("litebox_platform_windows_userland/", 8),
@@ -71,7 +71,7 @@ fn ratchet_maybe_uninit() -> Result<()> {
             ("dev_tests/", 1),
             ("litebox/", 1),
             ("litebox_common_linux/", 1),
-            ("litebox_platform_linux_userland/", 3),
+            ("litebox_platform_linux_userland/", 4),
             ("litebox_shim_linux/", 5),
         ],
         |file| {
