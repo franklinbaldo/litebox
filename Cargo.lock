@@ -1464,6 +1464,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_broker"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.11.0",
+ "clap",
+ "libc",
+ "litebox_common_linux",
+ "litebox_syscall_rewriter",
+ "smoltcp",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "litebox_common_linux"
 version = "0.1.0"
 dependencies = [
