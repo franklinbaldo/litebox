@@ -177,7 +177,7 @@ pub struct LinuxUserland {
     /// Pending terminal escape-sequence fragments split across stdout/stderr writes.
     terminal_osc_pending: Mutex<TerminalOscPending>,
     /// Extra CLI flags to forward when spawning worker host processes.
-    /// Set by the runner at startup via [`set_worker_spawn_flags`].
+    /// Set by the runner at startup via [`LinuxUserland::set_worker_spawn_flags`].
     worker_spawn_flags: std::sync::RwLock<Vec<std::ffi::CString>>,
     /// Serialize worker-host spawns so internal inheritable fds do not leak
     /// across concurrent worker launches.
