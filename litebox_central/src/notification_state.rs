@@ -62,7 +62,6 @@ pub(crate) struct ShmemSocket {
 
 /// Tracking info for a shmem-backed file fd.
 #[derive(Clone, Copy)]
-#[allow(dead_code)] // Fields read when file I/O handlers are wired up (future task).
 pub(crate) struct ShmemFile {
     /// Guest fd number.
     pub fd: i32,

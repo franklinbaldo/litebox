@@ -21,8 +21,9 @@ use litebox_ipc::messages::{
     MSG_THREAD_DEREGISTER, MSG_THREAD_REGISTER,
 };
 use litebox_ipc::ring::{
-    cq_flags, pipe_flags, sq_flags, CqEntry, SqEntry, TrampolineDescriptor, PIPE_SLOT_SIZE,
-    PIPE_ZONE_BASE_OFFSET, RING_MASK, SOCKET_SLOT_SIZE, SOCKET_ZONE_BASE_OFFSET,
+    cq_flags, pipe_flags, sq_flags, CqEntry, SqEntry, TrampolineDescriptor, FILE_SLOT_SIZE,
+    FILE_ZONE_BASE_OFFSET, PIPE_SLOT_SIZE, PIPE_ZONE_BASE_OFFSET, RING_MASK, SOCKET_SLOT_SIZE,
+    SOCKET_ZONE_BASE_OFFSET,
 };
 use litebox_ipc::sq::{sq_advance_head, sq_head_index, sq_try_consume};
 use litebox_ipc::wait::spin_u8_then_wait_u32;
@@ -487,6 +488,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 self.maybe_close_shmem_pipe_end(fd);
                 // If this fd was a shmem socket, set CLOSED flag and free slot.
                 self.maybe_close_shmem_socket(fd);
+                // If this fd was a shmem file, set CLOSED flag and free slot.
+                self.maybe_close_shmem_file(fd);
                 cq.result = 0;
                 return cq;
             }
@@ -707,6 +710,66 @@ impl<FS: ShimFS> ProcessServer<FS> {
         }
 
         cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+
+        // After dispatch_to_task succeeds for open/openat, allocate a shmem file slot.
+        // Note: SYS_creat is intentionally excluded — glibc maps creat() to openat(),
+        // so no real workload uses SYS_creat directly.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        if matches!(i64::from(nr), libc::SYS_open | libc::SYS_openat) && cq.result >= 0 {
+            let new_fd = cq.result as i32;
+            let mut ns = self.notification_state.borrow_mut();
+            if let Some((slot_index, slot_offset)) = ns.alloc_file_slot() {
+                // Determine if O_NONBLOCK was set.
+                let flags_arg = if i64::from(nr) == libc::SYS_openat {
+                    entry.args[2] as i32 // openat(dirfd, path, flags, mode)
+                } else {
+                    entry.args[1] as i32 // open(path, flags, mode)
+                };
+                let nonblock = flags_arg & libc::O_NONBLOCK != 0;
+
+                // Initialize the shmem ring header.
+                {
+                    let data_region = self.region.data_region_mut();
+                    #[allow(clippy::cast_ptr_alignment)]
+                    // slot offsets are 64-byte aligned by design
+                    let header_ptr = unsafe {
+                        data_region
+                            .as_mut_ptr()
+                            .add(slot_offset as usize)
+                            .cast::<litebox_ipc::socket_ring::ShmemSocketHeader>()
+                    };
+                    unsafe {
+                        litebox_ipc::socket_ring::socket_init(header_ptr, new_fd, nonblock);
+                    }
+                }
+
+                // Track the file slot.
+                ns.shmem_files.push(crate::notification_state::ShmemFile {
+                    fd: new_fd,
+                    slot_index,
+                });
+                drop(ns);
+
+                // Write OpenResponse to data region at offset 0 for micro.
+                let response = litebox_ipc::messages::OpenResponse {
+                    fd: new_fd,
+                    file_slot_offset: slot_offset,
+                };
+                let data_region = self.region.data_region_mut();
+                let resp_bytes: &[u8] = unsafe {
+                    core::slice::from_raw_parts(
+                        (&raw const response).cast::<u8>(),
+                        core::mem::size_of::<litebox_ipc::messages::OpenResponse>(),
+                    )
+                };
+                data_region[..resp_bytes.len()].copy_from_slice(resp_bytes);
+
+                cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
+                cq.data_offset = 0;
+                cq.data_len = core::mem::size_of::<litebox_ipc::messages::OpenResponse>() as u32;
+            }
+            // If no slot available, cq passes through normally (no shmem optimization).
+        }
 
         cq
     }
@@ -1945,6 +2008,58 @@ impl<FS: ShimFS> ProcessServer<FS> {
         // Remove from tracking and free the slot.
         ns.shmem_sockets.swap_remove(idx);
         ns.free_socket_slot(slot_index);
+    }
+
+    /// If `fd` is a shmem-backed file, set the CLOSED flag, wake blocked
+    /// readers/writers via futex, remove from tracking, and free the slot.
+    fn maybe_close_shmem_file(&self, fd: i32) {
+        let mut ns = self.notification_state.borrow_mut();
+        let Some(idx) = ns.shmem_files.iter().position(|f| f.fd == fd) else {
+            return;
+        };
+
+        let slot_index = ns.shmem_files[idx].slot_index;
+        let slot_offset = FILE_ZONE_BASE_OFFSET + slot_index as usize * FILE_SLOT_SIZE;
+
+        // Set the CLOSED flag in the shmem file header.
+        let data_region = self.region.data_region_mut();
+        #[allow(clippy::cast_ptr_alignment)] // slot offsets are 64-byte aligned by design
+        let header_ptr = unsafe {
+            data_region
+                .as_mut_ptr()
+                .add(slot_offset)
+                .cast::<litebox_ipc::socket_ring::ShmemSocketHeader>()
+        };
+        unsafe {
+            litebox_ipc::socket_ring::socket_set_flag(
+                header_ptr,
+                litebox_ipc::socket_ring::socket_flags::CLOSED,
+            );
+        }
+
+        // Futex-wake blocked readers (rx_tail) and writers (tx_head).
+        unsafe {
+            let rx_tail_ptr = &raw const (*header_ptr).rx_tail;
+            let tx_head_ptr = &raw const (*header_ptr).tx_head;
+            libc::syscall(
+                libc::SYS_futex,
+                rx_tail_ptr,
+                libc::FUTEX_WAKE,
+                i32::MAX,
+                std::ptr::null::<libc::timespec>(),
+            );
+            libc::syscall(
+                libc::SYS_futex,
+                tx_head_ptr,
+                libc::FUTEX_WAKE,
+                i32::MAX,
+                std::ptr::null::<libc::timespec>(),
+            );
+        }
+
+        // Remove from tracking and free the slot.
+        ns.shmem_files.swap_remove(idx);
+        ns.free_file_slot(slot_index);
     }
 
     /// Handle an execve syscall by deserializing the path/argv/envp from the
