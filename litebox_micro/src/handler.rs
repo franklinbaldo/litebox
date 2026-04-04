@@ -1271,6 +1271,17 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
         // Non-anonymous, MAP_FIXED, or explicit addr: fall through to central.
     }
 
+    // Unregister file fd tracking on close.  File I/O still goes through
+    // central, but micro tracks which fds have shmem slots so it must drop
+    // the mapping before the fd is actually closed.
+    #[allow(clippy::cast_possible_truncation)]
+    if i64::from(nr) == libc::SYS_close {
+        let fd = args.args[0] as i32;
+        let micro_mut = unsafe { &mut *(*tls).micro };
+        micro_mut.unregister_file_fd(fd);
+        // Fall through to submit_and_wait for central to handle close + slot cleanup
+    }
+
     // Shmem pipe fast-path: read/write on pipe fds bypass central entirely.
     {
         let micro = unsafe { &*(*tls).micro };
@@ -1456,6 +1467,27 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
                 }
             }
             return cq.result; // return the new fd
+        }
+
+        // open/openat: central allocated a shmem file slot, extract
+        // OpenResponse from data region.
+        #[allow(clippy::cast_ptr_alignment)] // data region is properly aligned for OpenResponse
+        if matches!(i64::from(nr), libc::SYS_open | libc::SYS_openat)
+            && cq.flags & cq_flags::HAS_DATA != 0
+            && cq.result >= 0
+            && cq.data_len == core::mem::size_of::<litebox_ipc::messages::OpenResponse>() as u32
+        {
+            let micro = unsafe { &mut *(*tls).micro };
+            let data_base = unsafe { micro.ring_base.add(micro.layout.data_region_offset) };
+            let resp = unsafe {
+                &*(data_base
+                    .add(cq.data_offset as usize)
+                    .cast::<litebox_ipc::messages::OpenResponse>())
+            };
+            if resp.file_slot_offset != 0 {
+                micro.register_file_fd(resp.fd, resp.file_slot_offset);
+            }
+            return cq.result; // return the fd
         }
 
         let micro = unsafe { &*(*tls).micro };
