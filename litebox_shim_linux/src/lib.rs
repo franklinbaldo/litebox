@@ -553,41 +553,40 @@ impl<FS: ShimFS> LinuxShim<FS> {
                         continue;
                     };
 
-                    // Set up metadata on the new fd.
-                    {
-                        let mut dt = self.global.litebox.descriptor_table_mut();
-                        let _old =
-                            dt.set_entry_metadata(new_fd, syscalls::net::SocketOptions::default());
-                        let _old =
-                            dt.set_entry_metadata(new_fd, litebox_common_linux::SockType::Stream);
-                        let _old = dt.set_entry_metadata(
-                            new_fd,
-                            syscalls::net::SocketOFlags(litebox::fs::OFlags::RDWR),
-                        );
-                    }
-
-                    // Copy FD_CLOEXEC from old fd if present.
-                    {
+                    // Read parent's metadata from the old fd BEFORE consuming it.
+                    let (parent_sock_opts, parent_oflags, parent_cloexec) = {
                         let rds = files.raw_descriptor_store.read();
                         let old_net_fd = rds
                             .fd_from_raw_integer::<Network<Platform>>(*raw_fd)
                             .expect("raw fd should still be alive");
                         let dt = self.global.litebox.descriptor_table();
+                        let sock_opts = dt
+                            .with_metadata(old_net_fd.as_ref(), |o: &syscalls::net::SocketOptions| {
+                                o.clone()
+                            })
+                            .unwrap_or_default();
+                        let oflags = dt
+                            .with_metadata(
+                                old_net_fd.as_ref(),
+                                |f: &syscalls::net::SocketOFlags| *f,
+                            )
+                            .unwrap_or(syscalls::net::SocketOFlags(litebox::fs::OFlags::RDWR));
                         let cloexec = dt
                             .with_metadata(
                                 old_net_fd.as_ref(),
                                 |flags: &litebox_common_linux::FileDescriptorFlags| *flags,
                             )
                             .unwrap_or(litebox_common_linux::FileDescriptorFlags::empty());
-                        drop(dt);
-                        drop(rds);
-                        if cloexec.contains(litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC) {
-                            let mut dt = self.global.litebox.descriptor_table_mut();
-                            let _old = dt.set_fd_metadata(
-                                new_fd,
-                                litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC,
-                            );
-                        }
+                        (sock_opts, oflags, cloexec)
+                    };
+
+                    // Set up metadata on the new fd (using parent's values).
+                    {
+                        let mut dt = self.global.litebox.descriptor_table_mut();
+                        let _old = dt.set_entry_metadata(new_fd, parent_sock_opts);
+                        let _old =
+                            dt.set_entry_metadata(new_fd, litebox_common_linux::SockType::Stream);
+                        let _old = dt.set_entry_metadata(new_fd, parent_oflags);
                     }
 
                     // Create and set a new proxy for the child's socket.
@@ -612,6 +611,19 @@ impl<FS: ShimFS> LinuxShim<FS> {
                         .descriptor_table_mut()
                         .duplicate(new_fd)
                         .expect("new fd should be valid");
+
+                    // Set FD_CLOEXEC on the dup_fd (not new_fd), since
+                    // duplicate() creates entries with empty metadata.
+                    if parent_cloexec
+                        .contains(litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC)
+                    {
+                        let mut dt = self.global.litebox.descriptor_table_mut();
+                        let _old = dt.set_fd_metadata(
+                            &dup_fd,
+                            litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC,
+                        );
+                    }
+
                     let mut rds = files.raw_descriptor_store.write();
                     let _old_fd = rds
                         .fd_consume_raw_integer::<Network<Platform>>(*raw_fd)
