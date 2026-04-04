@@ -326,6 +326,7 @@ impl SignalState {
     }
 }
 
+#[allow(clippy::unnecessary_wraps)]
 pub(super) fn restore_sigcontext(
     ctx: &mut litebox_common_linux::ExecutionContext,
     sigctx: &litebox_common_linux::signal::x86_64::Sigcontext,

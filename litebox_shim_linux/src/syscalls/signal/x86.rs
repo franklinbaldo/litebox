@@ -58,7 +58,7 @@ impl<FS: crate::ShimFS> Task<FS> {
         match restore_sigcontext(ctx, &lctx.sigcontext) {
             Ok(rax) => Ok(rax),
             Err(()) => {
-                self.signals.force_signal(Signal::SIGSEGV, false);
+                self.force_signal(Signal::SIGSEGV, false);
                 Err(Errno::EFAULT)
             }
         }
