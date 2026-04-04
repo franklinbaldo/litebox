@@ -1834,14 +1834,16 @@ impl<FS: ShimFS> Task<FS> {
         pathname: impl path::Arg,
         flags: AtFlags,
     ) -> Result<FileStat, Errno> {
-        let current_support_flags = AtFlags::AT_EMPTY_PATH;
-        if flags.contains(current_support_flags.complement()) {
-            todo!("unsupported flags");
+        let supported_flags =
+            AtFlags::AT_EMPTY_PATH | AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_NO_AUTOMOUNT;
+        if flags.intersects(!supported_flags) {
+            todo!("unsupported newfstatat flags");
         }
 
         let files = self.files.borrow();
         let get_cwd = || self.fs.borrow().cwd.read().clone();
-        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
+        let allow_empty = flags.contains(AtFlags::AT_EMPTY_PATH);
+        let fs_path = FsPath::new_inner(dirfd, pathname, get_cwd, allow_empty)?;
         let fstat: FileStat = match fs_path {
             FsPath::Absolute { path } => {
                 self.do_stat(path, !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW))?
