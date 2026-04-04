@@ -311,7 +311,7 @@ impl CentralPlatform {
 }
 
 // ---------------------------------------------------------------------------
-// Task 5: Thread-local TUN queue routing
+// Thread-local TUN queue routing
 // ---------------------------------------------------------------------------
 
 std::thread_local! {
@@ -325,7 +325,12 @@ impl CentralPlatform {
     ///
     /// All subsequent [`IPInterfaceProvider`] calls on this thread will route
     /// through the specified queue.
-    pub fn set_current_queue(queue: usize) {
+    ///
+    /// # Panics
+    ///
+    /// No immediate panic, but subsequent `IPInterfaceProvider` calls will
+    /// panic if `queue` is out of bounds for the TUN device's queue list.
+    pub fn set_current_tun_queue(queue: usize) {
         CURRENT_TUN_QUEUE.set(queue);
     }
 }

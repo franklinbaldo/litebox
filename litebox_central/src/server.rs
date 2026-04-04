@@ -145,7 +145,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
         // queue.  Syscall handlers (e.g. accept/connect) may lock the
         // per-process Network and invoke the platform device on this thread.
         if let Some(queue) = self.tun_queue {
-            litebox_platform_central::CentralPlatform::set_current_queue(queue);
+            litebox_platform_central::CentralPlatform::set_current_tun_queue(queue);
         }
 
         // Spawn a per-process net-worker thread if networking is enabled.
@@ -168,7 +168,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     const MAX_TIMEOUT: Duration = Duration::from_millis(1);
 
                     // Route IPInterfaceProvider calls to this process's TUN queue.
-                    litebox_platform_central::CentralPlatform::set_current_queue(queue);
+                    litebox_platform_central::CentralPlatform::set_current_tun_queue(queue);
 
                     while !shutdown_clone.load(Ordering::Relaxed) {
                         const MAX_IMMEDIATE_POLLS: u32 = 64;
