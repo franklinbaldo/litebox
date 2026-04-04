@@ -8,9 +8,9 @@
 
 use alloc::boxed::Box;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, ThreadProvider as _};
+use litebox_common_macos::PtRegs;
 use litebox_common_macos::errno::Errno;
 use litebox_common_macos::syscall::mach_trap;
-use litebox_common_macos::PtRegs;
 
 use crate::{MutPtr, ShimFS, Task};
 

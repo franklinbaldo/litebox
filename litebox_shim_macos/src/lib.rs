@@ -82,8 +82,11 @@ enum ThreadInitState {
 }
 
 /// Per-signal handler registration (matches macOS kernel-facing struct __sigaction layout).
-#[derive(Clone, Copy)]
-#[allow(dead_code, reason = "fields used by sigaction/sigreturn syscalls in future tasks")]
+#[derive(Clone, Copy, Default)]
+#[allow(
+    dead_code,
+    reason = "fields used by sigaction/sigreturn syscalls in future tasks"
+)]
 struct SignalHandler {
     /// Signal handler address, or SIG_DFL(0)/SIG_IGN(1).
     handler: u64,
@@ -93,17 +96,6 @@ struct SignalHandler {
     mask: u32,
     /// SA_* flags (SA_SIGINFO, SA_NODEFER, etc.).
     flags: u32,
-}
-
-impl Default for SignalHandler {
-    fn default() -> Self {
-        Self {
-            handler: 0, // SIG_DFL
-            tramp: 0,
-            mask: 0,
-            flags: 0,
-        }
-    }
 }
 
 /// Shared process state, accessible from all threads via `Arc`.
@@ -823,7 +815,10 @@ struct Task<FS: ShimFS> {
     /// Initialization state for this thread (set before first entry).
     init_state: litebox::sync::Mutex<Platform, ThreadInitState>,
     /// Per-thread blocked signal mask (macOS 32-bit sigset_t).
-    #[allow(dead_code, reason = "used by sigprocmask/signal delivery in future tasks")]
+    #[allow(
+        dead_code,
+        reason = "used by sigprocmask/signal delivery in future tasks"
+    )]
     blocked_signals: AtomicU32,
 }
 
