@@ -6,7 +6,7 @@
 use core::sync::atomic::Ordering::{Acquire, Relaxed};
 
 use litebox_ipc::cq::{cq_find_by_seq, cq_tail};
-use litebox_ipc::ring::{CqEntry, RingHeader, SharedRingLayout, SqEntry, cq_flags};
+use litebox_ipc::ring::{cq_flags, CqEntry, RingHeader, SharedRingLayout, SqEntry};
 use litebox_ipc::sq::{sq_acquire_slot, sq_publish};
 
 use litebox_ipc::wait::spin_then_wait;
@@ -254,7 +254,7 @@ unsafe fn handle_recvmsg_as_read(tls: *mut MicroTls, args: &SyscallArgs) -> i64 
         unsafe { core::ptr::write_unaligned(msg_control.add(8).cast::<i32>(), 1) }; // cmsg_level = SOL_SOCKET
         unsafe { core::ptr::write_unaligned(msg_control.add(12).cast::<i32>(), 1) }; // cmsg_type = SCM_RIGHTS
         unsafe { core::ptr::write_unaligned(msg_control.add(16).cast::<i32>(), -1) }; // fd = -1
-        // Set msg_controllen to CMSG_SPACE(sizeof(int)) = 24.
+                                                                                      // Set msg_controllen to CMSG_SPACE(sizeof(int)) = 24.
         unsafe { core::ptr::write_unaligned(msg_ptr.add(40).cast::<usize>(), 24) };
     } else if !msg_control.is_null() && msg_controllen > 0 {
         // Buffer too small for a fake cmsghdr — just zero everything.
@@ -785,7 +785,11 @@ fn bidirectional_input_info(nr: u32, args: &[u64; 6]) -> Option<(usize, usize)> 
         libc::SYS_prlimit64 => {
             // prlimit64(pid, resource, new_limit, old_limit): input=arg2 (new_limit)
             // Rlimit64 = 16 bytes (2 × u64)
-            if args[2] != 0 { Some((2, 16)) } else { None }
+            if args[2] != 0 {
+                Some((2, 16))
+            } else {
+                None
+            }
         }
         _ => None,
     }
@@ -1309,6 +1313,18 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
         }
     }
 
+    // Shmem socket close: unregister locally, then fall through to central.
+    #[allow(clippy::cast_possible_truncation)]
+    if i64::from(nr) == libc::SYS_close {
+        let fd = args.args[0] as i32;
+        let micro = unsafe { &*(*tls).micro };
+        if micro.find_socket_fd(fd).is_some() {
+            let micro_mut = unsafe { &mut *(*tls).micro };
+            micro_mut.unregister_socket_fd(fd);
+            // Fall through to submit_and_wait for central to handle close + shmem cleanup
+        }
+    }
+
     // exit_group: notify central (fire-and-forget) then die immediately.
     //
     // exit_group terminates the entire process. We must NOT use submit_and_wait
@@ -1384,6 +1400,35 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
             return 0; // success
         }
 
+        // accept/accept4: central allocated a shmem socket slot, extract
+        // AcceptResponse from data region.
+        #[allow(clippy::cast_ptr_alignment)] // data region is properly aligned for AcceptResponse
+        if matches!(i64::from(nr), libc::SYS_accept | libc::SYS_accept4)
+            && cq.flags & cq_flags::HAS_DATA != 0
+            && cq.result >= 0
+            && cq.data_len == core::mem::size_of::<litebox_ipc::messages::AcceptResponse>() as u32
+        {
+            let micro = unsafe { &mut *(*tls).micro };
+            let data_base = unsafe { micro.ring_base.add(micro.layout.data_region_offset) };
+            let resp = unsafe {
+                &*(data_base
+                    .add(cq.data_offset as usize)
+                    .cast::<litebox_ipc::messages::AcceptResponse>())
+            };
+            micro.register_socket_fd(resp.fd, resp.socket_slot_offset);
+            // Copy peer addr to guest's buffer if requested.
+            let addr_ptr = args.args[1] as *mut u8;
+            let addrlen_ptr = args.args[2] as *mut u32;
+            if !addr_ptr.is_null() && !addrlen_ptr.is_null() {
+                let copy_len = (resp.peer_addr_len as usize).min(16);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(resp.peer_addr.as_ptr(), addr_ptr, copy_len);
+                    core::ptr::write(addrlen_ptr, resp.peer_addr_len);
+                }
+            }
+            return cq.result; // return the new fd
+        }
+
         let micro = unsafe { &*(*tls).micro };
         let result = unsafe {
             execute_locally(
@@ -1413,6 +1458,7 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
         if is_fork && result > 0 {
             let micro_mut = unsafe { &mut *(*tls).micro };
             micro_mut.pipe_fds = [None; litebox_ipc::ring::MAX_PIPE_SLOTS];
+            micro_mut.socket_fds = [None; litebox_ipc::ring::MAX_SOCKET_SLOTS];
         }
 
         if !is_fork_child && (cq.flags & cq_flags::NO_REPORT == 0) {

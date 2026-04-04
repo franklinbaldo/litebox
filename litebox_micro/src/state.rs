@@ -4,9 +4,20 @@
 //! Global per-process micro-LiteBox state.
 
 use core::sync::atomic::{AtomicU32, AtomicUsize};
-use litebox_ipc::ring::{MAX_PIPE_SLOTS, SharedRingLayout};
+use litebox_ipc::ring::{MAX_PIPE_SLOTS, MAX_SOCKET_SLOTS, SharedRingLayout};
 
 use crate::stack_pool::StackPool;
+
+/// Entry in micro's local socket fd tracking table.
+///
+/// Maps a file descriptor to the shmem offset of its socket ring buffer.
+#[derive(Clone, Copy)]
+pub struct SocketFdEntry {
+    /// The file descriptor number.
+    pub fd: i32,
+    /// Offset within the data region to the socket's `ShmemSocketHeader`.
+    pub shmem_offset: u32,
+}
 
 /// Entry in micro's local pipe fd tracking table.
 ///
@@ -56,6 +67,9 @@ pub struct MicroState {
     /// Pipe fd tracking table. Each entry maps a guest fd to a shmem pipe
     /// ring buffer. Linear scan is fine — at most MAX_PIPE_SLOTS entries.
     pub pipe_fds: [Option<PipeFdEntry>; MAX_PIPE_SLOTS],
+    /// Socket fd tracking table. Each entry maps a guest fd to a shmem socket
+    /// ring buffer. Linear scan is fine — at most MAX_SOCKET_SLOTS entries.
+    pub socket_fds: [Option<SocketFdEntry>; MAX_SOCKET_SLOTS],
 }
 
 unsafe impl Send for MicroState {}
@@ -75,6 +89,7 @@ static mut MICRO_STATE: MicroState = MicroState {
     mmap_bump_next: AtomicUsize::new(0),
     mmap_bump_end: 0,
     pipe_fds: [None; MAX_PIPE_SLOTS],
+    socket_fds: [None; MAX_SOCKET_SLOTS],
 };
 
 /// Initialize the global micro-LiteBox state.
@@ -196,6 +211,41 @@ impl MicroState {
         false
     }
 
+    /// Look up a socket fd in the tracking table.
+    /// Returns the shmem offset if found.
+    pub fn find_socket_fd(&self, fd: i32) -> Option<u32> {
+        for e in self.socket_fds.iter().flatten() {
+            if e.fd == fd {
+                return Some(e.shmem_offset);
+            }
+        }
+        None
+    }
+
+    /// Register a socket fd in the tracking table. Returns `true` on success.
+    pub fn register_socket_fd(&mut self, fd: i32, shmem_offset: u32) -> bool {
+        for slot in &mut self.socket_fds {
+            if slot.is_none() {
+                *slot = Some(SocketFdEntry { fd, shmem_offset });
+                return true;
+            }
+        }
+        false // table full
+    }
+
+    /// Remove a socket fd from the tracking table. Returns `true` if found.
+    pub fn unregister_socket_fd(&mut self, fd: i32) -> bool {
+        for slot in &mut self.socket_fds {
+            if let Some(e) = slot
+                && e.fd == fd
+            {
+                *slot = None;
+                return true;
+            }
+        }
+        false
+    }
+
     #[cfg(test)]
     pub fn zeroed() -> Self {
         Self {
@@ -212,6 +262,7 @@ impl MicroState {
             mmap_bump_next: AtomicUsize::new(0),
             mmap_bump_end: 0,
             pipe_fds: [None; MAX_PIPE_SLOTS],
+            socket_fds: [None; MAX_SOCKET_SLOTS],
         }
     }
 }
@@ -264,5 +315,23 @@ mod tests {
         assert_eq!(off_r, off_w); // same pipe slot
         assert!(!wr_r);
         assert!(wr_w);
+    }
+
+    #[test]
+    fn socket_fd_register_and_find() {
+        let mut state = MicroState::zeroed();
+        assert!(state.find_socket_fd(5).is_none());
+        assert!(state.register_socket_fd(5, 0x800000));
+        let offset = state.find_socket_fd(5).unwrap();
+        assert_eq!(offset, 0x800000);
+    }
+
+    #[test]
+    fn socket_fd_unregister() {
+        let mut state = MicroState::zeroed();
+        state.register_socket_fd(5, 0x800000);
+        assert!(state.unregister_socket_fd(5));
+        assert!(state.find_socket_fd(5).is_none());
+        assert!(!state.unregister_socket_fd(5)); // already removed
     }
 }

@@ -53,7 +53,6 @@ pub(crate) struct ShmemPipe {
 
 /// Tracking info for a shmem-backed socket.
 #[derive(Clone, Copy)]
-#[allow(dead_code)] // Fields read when socket handlers are wired up (future task).
 pub(crate) struct ShmemSocket {
     /// Guest fd number.
     pub fd: i32,
@@ -91,11 +90,9 @@ pub(crate) struct ProcessNotificationState {
     pub shmem_pipes: Vec<ShmemPipe>,
 
     /// Shmem socket slot allocation bitset. Bit N = 1 means slot N is in use.
-    #[allow(dead_code)] // Used when socket handlers are wired up (future task).
     pub socket_slot_bitset: u64,
 
     /// Active shmem-backed sockets.
-    #[allow(dead_code)] // Used when socket handlers are wired up (future task).
     pub shmem_sockets: Vec<ShmemSocket>,
 }
 
@@ -153,7 +150,6 @@ impl ProcessNotificationState {
     }
 
     /// Allocate a free socket slot. Returns the slot index and data-region offset.
-    #[allow(dead_code)] // Used when socket handlers are wired up (future task).
     pub fn alloc_socket_slot(&mut self) -> Option<(u8, u32)> {
         if self.socket_slot_bitset == u64::MAX {
             return None;
@@ -169,7 +165,6 @@ impl ProcessNotificationState {
     }
 
     /// Free a socket slot.
-    #[allow(dead_code)] // Used when socket handlers are wired up (future task).
     pub fn free_socket_slot(&mut self, slot_index: u8) {
         debug_assert!(
             (slot_index as usize) < MAX_SOCKET_SLOTS,

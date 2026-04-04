@@ -8,8 +8,8 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -21,8 +21,8 @@ use litebox_ipc::messages::{
     MSG_THREAD_DEREGISTER, MSG_THREAD_REGISTER,
 };
 use litebox_ipc::ring::{
-    CqEntry, PIPE_SLOT_SIZE, PIPE_ZONE_BASE_OFFSET, RING_MASK, SqEntry, TrampolineDescriptor,
-    cq_flags, pipe_flags, sq_flags,
+    cq_flags, pipe_flags, sq_flags, CqEntry, SqEntry, TrampolineDescriptor, PIPE_SLOT_SIZE,
+    PIPE_ZONE_BASE_OFFSET, RING_MASK, SOCKET_SLOT_SIZE, SOCKET_ZONE_BASE_OFFSET,
 };
 use litebox_ipc::sq::{sq_advance_head, sq_head_index, sq_try_consume};
 use litebox_ipc::wait::spin_u8_then_wait_u32;
@@ -433,6 +433,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 // Shim recognized and closed the fd — return success directly.
                 // If this fd was a shmem pipe end, update flags and free slot.
                 self.maybe_close_shmem_pipe_end(fd);
+                // If this fd was a shmem socket, set CLOSED flag and free slot.
+                self.maybe_close_shmem_socket(fd);
                 cq.result = 0;
                 return cq;
             }
@@ -1337,8 +1339,9 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 }
             }
             // ── Socket output syscalls ──────────────────────────────────
-            // accept/accept4: redirect addr (rsi) and addrlen (rdx) to shmem.
-            // Layout: [0..128): sockaddr buffer, [128..132): addrlen as u32.
+            // accept/accept4: redirect addr (rsi) and addrlen (rdx) to shmem,
+            // dispatch through the shim, then allocate a shmem socket slot
+            // and return an AcceptResponse to micro via the data region.
             libc::SYS_accept | libc::SYS_accept4 => {
                 let has_addr = entry.args[1] != 0;
                 if has_addr {
@@ -1352,13 +1355,87 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 }
                 // For accept4: r10 = flags, already set from sq_entry_to_ptregs.
                 cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
-                if cq.result >= 0 && has_addr {
-                    cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
-                    cq.data_offset = 0;
-                    cq.data_len = 132; // sockaddr (128) + addrlen (4)
-                } else if cq.result >= 0 {
-                    // No addr requested — just return the new fd.
-                    // Don't set EXEC_LOCAL: result is the fd, micro uses it directly.
+                if cq.result >= 0 {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let new_fd = cq.result as i32;
+
+                    // Determine if SOCK_NONBLOCK was requested (accept4 only).
+                    let accept_flags = if i64::from(nr) == libc::SYS_accept4 {
+                        entry.args[3] as i32
+                    } else {
+                        0
+                    };
+                    let nonblock = accept_flags & libc::SOCK_NONBLOCK != 0;
+
+                    // Read peer address from data region before we overwrite it.
+                    let mut peer_addr = [0u8; 16];
+                    let mut peer_addr_len: u32 = 0;
+                    if has_addr {
+                        let mut raw_len = [0u8; 4];
+                        raw_len.copy_from_slice(&data_region[128..132]);
+                        peer_addr_len = u32::from_ne_bytes(raw_len);
+                        let copy_len = (peer_addr_len as usize).min(16);
+                        peer_addr[..copy_len].copy_from_slice(&data_region[..copy_len]);
+                    }
+
+                    // Try to allocate a shmem socket slot.
+                    let mut ns = self.notification_state.borrow_mut();
+                    if let Some((slot_index, slot_offset)) = ns.alloc_socket_slot() {
+                        // Initialize the socket ring buffer header.
+                        #[allow(clippy::cast_ptr_alignment)]
+                        // slot offsets are 64-byte aligned by design
+                        let header_ptr = unsafe {
+                            data_region
+                                .as_mut_ptr()
+                                .add(slot_offset as usize)
+                                .cast::<litebox_ipc::socket_ring::ShmemSocketHeader>()
+                        };
+                        unsafe {
+                            litebox_ipc::socket_ring::socket_init(header_ptr, new_fd, nonblock);
+                        }
+
+                        // Track the socket in notification state.
+                        ns.shmem_sockets
+                            .push(crate::notification_state::ShmemSocket {
+                                fd: new_fd,
+                                slot_index,
+                            });
+                        drop(ns);
+
+                        // Build AcceptResponse and write to data region at offset 0.
+                        let response = litebox_ipc::messages::AcceptResponse {
+                            fd: new_fd,
+                            socket_slot_offset: slot_offset,
+                            peer_addr,
+                            peer_addr_len,
+                            _pad: 0,
+                        };
+                        let resp_bytes: &[u8] = unsafe {
+                            core::slice::from_raw_parts(
+                                (&raw const response).cast::<u8>(),
+                                core::mem::size_of::<litebox_ipc::messages::AcceptResponse>(),
+                            )
+                        };
+                        data_region[..resp_bytes.len()].copy_from_slice(resp_bytes);
+
+                        cq.flags = cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
+                        cq.data_offset = 0;
+                        cq.data_len =
+                            core::mem::size_of::<litebox_ipc::messages::AcceptResponse>() as u32;
+                    } else {
+                        drop(ns);
+                        // No free socket slots — accept still succeeds, but without
+                        // shmem optimization. Fall back to old behavior.
+                        eprintln!(
+                            "[central] accept: no free socket slots, fd {new_fd} without shmem"
+                        );
+                        if has_addr {
+                            cq.flags =
+                                cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
+                            cq.data_offset = 0;
+                            cq.data_len = 132;
+                        }
+                    }
                 }
                 // Negative result: error, pass through directly.
             }
@@ -1741,6 +1818,58 @@ impl<FS: ShimFS> ProcessServer<FS> {
             ns.shmem_pipes.swap_remove(idx);
             ns.free_pipe_slot(slot_index);
         }
+    }
+
+    /// If `fd` is a shmem-backed socket, set the CLOSED flag, wake blocked
+    /// readers/writers via futex, remove from tracking, and free the slot.
+    fn maybe_close_shmem_socket(&self, fd: i32) {
+        let mut ns = self.notification_state.borrow_mut();
+        let Some(idx) = ns.shmem_sockets.iter().position(|s| s.fd == fd) else {
+            return;
+        };
+
+        let slot_index = ns.shmem_sockets[idx].slot_index;
+        let slot_offset = SOCKET_ZONE_BASE_OFFSET + slot_index as usize * SOCKET_SLOT_SIZE;
+
+        // Set the CLOSED flag in the shmem socket header.
+        let data_region = self.region.data_region_mut();
+        #[allow(clippy::cast_ptr_alignment)] // slot offsets are 64-byte aligned by design
+        let header_ptr = unsafe {
+            data_region
+                .as_mut_ptr()
+                .add(slot_offset)
+                .cast::<litebox_ipc::socket_ring::ShmemSocketHeader>()
+        };
+        unsafe {
+            litebox_ipc::socket_ring::socket_set_flag(
+                header_ptr,
+                litebox_ipc::socket_ring::socket_flags::CLOSED,
+            );
+        }
+
+        // Futex-wake blocked readers (rx_tail) and writers (tx_head).
+        unsafe {
+            let rx_tail_ptr = &raw const (*header_ptr).rx_tail;
+            let tx_head_ptr = &raw const (*header_ptr).tx_head;
+            libc::syscall(
+                libc::SYS_futex,
+                rx_tail_ptr,
+                libc::FUTEX_WAKE,
+                i32::MAX,
+                std::ptr::null::<libc::timespec>(),
+            );
+            libc::syscall(
+                libc::SYS_futex,
+                tx_head_ptr,
+                libc::FUTEX_WAKE,
+                i32::MAX,
+                std::ptr::null::<libc::timespec>(),
+            );
+        }
+
+        // Remove from tracking and free the slot.
+        ns.shmem_sockets.swap_remove(idx);
+        ns.free_socket_slot(slot_index);
     }
 
     /// Handle an execve syscall by deserializing the path/argv/envp from the
