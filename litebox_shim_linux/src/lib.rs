@@ -210,6 +210,12 @@ impl LinuxShimBuilder {
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
             elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
             epoll_graph_lock: litebox::sync::Mutex::new(()),
+            host_tty_foreground_pgrp: litebox::sync::Mutex::new(
+                litebox::process::ProcessGroupId::from(litebox::process::ProcessId::INIT),
+            ),
+            host_tty_shadow_termios: litebox::sync::Mutex::new(
+                alloc::collections::BTreeMap::new(),
+            ),
         });
         LinuxShim(global)
     }
@@ -253,6 +259,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 global: self.0.clone(),
                 thread: syscalls::process::ThreadState::new_process(pid),
                 wait_state: wait::WaitState::new(self.0.platform),
+                process_id: litebox::process::ProcessId::INIT,
                 pid,
                 ppid,
                 tid: pid,
@@ -357,6 +364,14 @@ fn default_fs(
 #[derive(Clone)]
 pub(crate) struct StdioStatusFlags(litebox::fs::OFlags);
 
+/// Marks an fd as originating from a host stdio stream (0=stdin, 1=stdout, 2=stderr).
+#[derive(Clone, Copy)]
+pub(crate) struct HostStdioSourceFd(pub i32);
+
+/// Marks an fd opened via `/dev/tty` as an alias of the host controlling terminal.
+#[derive(Clone, Copy)]
+pub(crate) struct HostTtyAlias;
+
 /// Status flags for pipes
 #[derive(Clone)]
 pub(crate) struct PipeStatusFlags(pub litebox::fs::OFlags);
@@ -382,6 +397,9 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
             let status_flags = OFlags::APPEND | OFlags::RDWR;
             debug_assert_eq!(OFlags::STATUS_FLAGS_MASK & status_flags, status_flags);
             let old = dt.set_entry_metadata(&fd, StdioStatusFlags(status_flags));
+            assert!(old.is_none());
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let old = dt.set_entry_metadata(&fd, HostStdioSourceFd(raw_fd as i32));
             assert!(old.is_none());
             let success = rds.fd_into_specific_raw_integer(fd, raw_fd);
             assert!(success);
@@ -1084,6 +1102,7 @@ impl<FS: ShimFS> Task<FS> {
             }
             SyscallRequest::Getpid => Ok(self.sys_getpid().reinterpret_as_unsigned() as usize),
             SyscallRequest::Getppid => Ok(self.sys_getppid().reinterpret_as_unsigned() as usize),
+            SyscallRequest::Getpgid { pid } => Ok(self.sys_getpgid(pid)? as usize),
             SyscallRequest::Getuid => Ok(self.sys_getuid() as usize),
             SyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
             SyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),
@@ -1327,12 +1346,29 @@ struct GlobalState<FS: ShimFS> {
     /// Serializes epoll graph mutations (add/remove nested epoll entries) to prevent
     /// TOCTOU races in cycle detection and parent tracking.
     epoll_graph_lock: litebox::sync::Mutex<Platform, ()>,
+    /// Foreground process group for the shared host tty backing stdio and
+    /// `/dev/tty`.
+    host_tty_foreground_pgrp: litebox::sync::Mutex<Platform, litebox::process::ProcessGroupId>,
+    /// Shadow terminal attributes keyed by ProcessId. When a non-init
+    /// process calls TCSETS on host stdio, the real terminal is unchanged
+    /// but the shadow is stored so subsequent TCGETS from that process
+    /// returns the values it set. Cleared when the init process modifies
+    /// the real terminal, and entries are removed on process exit.
+    host_tty_shadow_termios: litebox::sync::Mutex<
+        Platform,
+        alloc::collections::BTreeMap<
+            litebox::process::ProcessId,
+            litebox::platform::TerminalAttributes,
+        >,
+    >,
 }
 
 struct Task<FS: ShimFS> {
     global: Arc<GlobalState<FS>>,
     wait_state: wait::WaitState,
     thread: syscalls::process::ThreadState,
+    /// The process identity from the core ProcessRegistry.
+    process_id: litebox::process::ProcessId,
     /// Process ID
     pid: i32,
     /// Parent Process ID
@@ -1379,6 +1415,7 @@ mod test_utils {
             Task {
                 wait_state: wait::WaitState::new(self.platform),
                 thread: syscalls::process::ThreadState::new_process(pid),
+                process_id: litebox::process::ProcessId::INIT,
                 pid,
                 ppid: 0,
                 tid: pid,
@@ -1409,6 +1446,7 @@ mod test_utils {
                 wait_state: wait::WaitState::new(self.global.platform),
                 global: self.global.clone(),
                 thread: self.thread.new_thread(tid)?,
+                process_id: self.process_id,
                 pid: self.pid,
                 ppid: self.ppid,
                 tid,

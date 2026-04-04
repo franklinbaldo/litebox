@@ -16,7 +16,7 @@ use litebox::{
     fd::{FdEnabledSubsystem, MetadataError, TypedFd},
     fs::{Mode, OFlags, SeekWhence},
     path,
-    platform::{RawConstPointer, RawMutPointer},
+    platform::{RawConstPointer, RawMutPointer, StdioProvider as _},
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
@@ -28,6 +28,60 @@ use litebox_platform_multiplex::Platform;
 
 use crate::{ConstPtr, GlobalState, MutPtr, ShimFS, Task};
 use core::sync::atomic::{AtomicUsize, Ordering};
+
+fn host_stdio_source_for_path(path: &str) -> Option<i32> {
+    match path {
+        "/dev/stdin" => Some(0),
+        "/dev/stdout" => Some(1),
+        "/dev/stderr" => Some(2),
+        _ => None,
+    }
+}
+
+fn is_host_tty_path(path: &str) -> bool {
+    path == "/dev/tty"
+}
+
+/// Check if a path matches the host's actual PTY device path (e.g., `/dev/pts/156`).
+fn is_host_pty_device_path(path: &str, platform: &litebox_platform_multiplex::Platform) -> bool {
+    platform
+        .host_stdin_tty_device_info()
+        .is_some_and(|info| path == info.path)
+}
+
+/// Synthetic device IDs for anonymous descriptor pseudo-filesystems,
+/// mirroring the Linux kernel's `sockfs`, `pipefs`, and `anon_inodefs`.
+const SOCKFS_DEV: u64 = 0x000c;
+const PIPEFS_DEV: u64 = 0x000d;
+const ANON_INODE_DEV: u64 = 0x000e;
+
+/// Marker metadata attached to fds opened via the host PTY device path
+/// (e.g., `/dev/pts/156`). Causes the shim's `descriptor_stat()` to override
+/// `st_dev`, `st_ino`, and `st_rdev` with the real host PTY identity so that
+/// `fstat(reopened_fd)` is consistent with `fstat(0)`.
+#[derive(Clone)]
+struct HostPtyDeviceFd;
+
+/// Monotonically increasing counter for unique inode numbers assigned to
+/// anonymous file descriptors (sockets, pipes, eventfds, epoll instances).
+static ANON_INO_COUNTER: AtomicUsize = AtomicUsize::new(1);
+
+/// Stable inode number stored as entry metadata on anonymous descriptors.
+/// Assigned once on first stat and reused for the lifetime of the open file
+/// description (including across `dup`).
+#[derive(Clone)]
+struct AnonIno(u64);
+
+/// Classification of a file descriptor for terminal ioctl routing.
+#[allow(dead_code)]
+enum TerminalKind {
+    /// Host stdio device (major=5) — forward ioctls to host kernel.
+    HostStdio,
+    /// PTY slave device (major=136) — handle locally.
+    Pty,
+    /// Not a terminal device.
+    NotTerminal,
+}
 
 struct InotifyInstanceState {
     next_watch_descriptor: i32,
@@ -386,6 +440,118 @@ impl<FS: ShimFS> Task<FS> {
         Ok(resolved)
     }
 
+    /// Resolve an executable path to a canonical absolute path for /proc/self/exe.
+    ///
+    /// Linux always reports /proc/self/exe as the fully resolved path:
+    /// relative paths are made absolute against CWD, `..`/`.` segments are
+    /// normalized, and symlinks in every component are followed (like
+    /// `realpath`).
+    pub(crate) fn resolve_exe_path(&self, path: &str) -> String {
+        let abs = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            let cwd = self.fs.borrow().cwd.read().clone();
+            alloc::format!("{cwd}{path}")
+        };
+        self.canonicalize_path(&abs).unwrap_or(abs)
+    }
+
+    /// Open a synthetic /proc text file by piping the given contents
+    /// through a one-shot pipe. The write end is closed after filling.
+    #[allow(dead_code)] // caller (proc_self_maps) deferred to ProcessState PR
+    fn open_synthetic_proc_text(
+        &self,
+        flags: OFlags,
+        contents: alloc::string::String,
+    ) -> Result<u32, Errno> {
+        use litebox::pipes::Flags;
+
+        if flags.intersects(OFlags::WRONLY | OFlags::RDWR) {
+            return Err(Errno::EACCES);
+        }
+        if flags.contains(OFlags::DIRECTORY) {
+            return Err(Errno::ENOTDIR);
+        }
+
+        let mut pipe_flags = Flags::empty();
+        pipe_flags.set(Flags::NON_BLOCKING, flags.contains(OFlags::NONBLOCK));
+        let (writer, reader) = self.global.pipes.create_pipe(
+            DEFAULT_PIPE_BUF_SIZE,
+            pipe_flags,
+            core::num::NonZero::new(4096),
+        );
+
+        {
+            let initial_status = OFlags::from(pipe_flags);
+            let mut dt = self.global.litebox.descriptor_table_mut();
+            let old = dt.set_entry_metadata(
+                &reader,
+                crate::PipeStatusFlags(initial_status | OFlags::RDONLY),
+            );
+            assert!(old.is_none());
+            if flags.contains(OFlags::CLOEXEC) {
+                let None = dt.set_fd_metadata(&reader, FileDescriptorFlags::FD_CLOEXEC) else {
+                    unreachable!()
+                };
+            }
+        }
+
+        let write_result = self
+            .global
+            .pipes
+            .write(&self.wait_cx(), &writer, contents.as_bytes())
+            .map_err(Errno::from);
+        self.global.pipes.close(&writer).unwrap();
+        let written = write_result?;
+        debug_assert_eq!(written, contents.len());
+
+        let files = self.files.borrow();
+        let raw_fd = files.insert_raw_fd(reader).map_err(|reader| {
+            self.global.pipes.close(&reader).unwrap();
+            Errno::EMFILE
+        })?;
+        Ok(u32::try_from(raw_fd).unwrap())
+    }
+
+    /// Get the rdev for a PTY slave fd, if it is one (major=136).
+    #[allow(dead_code)] // caller (_pty_target_for_guest_fd) needed later
+    fn pty_rdev_for_raw_fd(&self, files: &FilesState<FS>, raw_fd: usize) -> Option<usize> {
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |fd| {
+                    let status = files.fs.fd_file_status(fd).ok()?;
+                    let rdev = status.node_info.rdev?.get();
+                    ((rdev >> 8) == 136).then_some(rdev)
+                },
+                |_fd| None,
+                |_fd| None,
+                |_fd| None,
+                |_fd| None,
+                |_fd| None,
+            )
+            .ok()
+            .flatten()
+    }
+
+    #[allow(dead_code)] // needed later
+    fn _pty_target_for_guest_fd(
+        &self,
+        files: &FilesState<FS>,
+        guest_fd: u32,
+    ) -> Option<(usize, usize)> {
+        let raw_fd = usize::try_from(guest_fd).ok()?;
+        if !files.raw_descriptor_store.read().is_alive(raw_fd) {
+            return None;
+        }
+        let rdev = self.pty_rdev_for_raw_fd(files, raw_fd)?;
+        Some((raw_fd, rdev))
+    }
+
+    fn trace_pty_open(&self, _path: &str, _guest_fd: u32, _raw_fd: usize, _rdev: Option<usize>) {}
+
+    fn maybe_trace_pty_dup(&self, _oldfd: u32, _newfd: u32) {}
+
     /// Validate that a file descriptor is open and valid.
     pub fn validate_fd(&self, fd: i32) -> Result<(), Errno> {
         let Ok(raw_fd) = usize::try_from(fd) else {
@@ -452,28 +618,92 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `open`
     pub fn sys_open(&self, path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
         let path = self.resolve_path(path)?;
+        let path = if path.to_str().ok() == Some("/proc/self/exe") {
+            let exe = self.fs.borrow().exe_path.read().clone();
+            if exe.is_empty() {
+                return Err(Errno::ENOENT);
+            }
+            CString::new(exe).map_err(|_| Errno::EINVAL)?
+        } else {
+            path
+        };
+        if path.to_str().ok() == Some("/sys/kernel/debug/tracing/trace_marker") {
+            return Err(Errno::EACCES);
+        }
         let mode = mode & !self.get_umask();
         let file = self
             .files
             .borrow()
             .fs
-            .open(path, flags - OFlags::CLOEXEC, mode)?;
-        if flags.contains(OFlags::CLOEXEC) {
-            let None = self
-                .global
-                .litebox
-                .descriptor_table_mut()
-                .set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC)
-            else {
+            .open(&*path, flags - OFlags::CLOEXEC, mode)
+            .map_err(Errno::from)?;
+        let status = flags & OFlags::STATUS_FLAGS_MASK;
+        // Query file status before acquiring the descriptor table write lock
+        // to avoid deadlock (fd_file_status takes a read lock on the same
+        // descriptor table internally).
+        let file_rdev_major = self
+            .files
+            .borrow()
+            .fs
+            .fd_file_status(&file)
+            .ok()
+            .and_then(|s| s.node_info.rdev)
+            .map(|rdev| rdev.get() >> 8);
+        {
+            let mut dt = self.global.litebox.descriptor_table_mut();
+            if flags.contains(OFlags::CLOEXEC) {
+                let None = dt.set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC) else {
+                    unreachable!()
+                };
+            }
+            // Store access mode + status flags so F_GETFL can return them.
+            let None = dt.set_entry_metadata(&file, crate::StdioStatusFlags(status)) else {
                 unreachable!()
             };
+            if let Ok(path_str) = path.to_str()
+                && let Some(source_fd) = host_stdio_source_for_path(path_str)
+            {
+                let old = dt.set_entry_metadata(&file, crate::HostStdioSourceFd(source_fd));
+                assert!(old.is_none());
+            }
+            if let Ok(path_str) = path.to_str()
+                && is_host_tty_path(path_str)
+            {
+                let old = dt.set_entry_metadata(&file, crate::HostTtyAlias);
+                assert!(old.is_none());
+            }
+            // Tag fds opened via the host PTY device path (e.g., /dev/pts/156)
+            // so that fstat returns the host PTY identity, not the default
+            // Device::Tty identity (rdev=0x500). Skip if the fd resolved to a
+            // sandbox PTY (major >= 136) rather than the host tty alias.
+            if let Ok(path_str) = path.to_str()
+                && is_host_pty_device_path(path_str, self.global.platform)
+                && file_rdev_major.is_none_or(|m| m < 136)
+            {
+                let old = dt.set_entry_metadata(&file, HostPtyDeviceFd);
+                assert!(old.is_none());
+            }
         }
+        self.files
+            .borrow()
+            .fs
+            .set_open_status_flags(&file, status)
+            .map_err(|_| Errno::EBADF)?;
         let files = self.files.borrow();
         let raw_fd = files.insert_raw_fd(file).map_err(|file| {
             files.fs.close(&file).unwrap();
             Errno::EMFILE
         })?;
-        Ok(u32::try_from(raw_fd).unwrap())
+        let guest_fd = u32::try_from(raw_fd).unwrap();
+
+        if let Ok(s) = path.to_str()
+            && (s == "/dev/ptmx" || s.starts_with("/dev/pts/"))
+        {
+            let rdev = self.pty_rdev_for_raw_fd(&files, raw_fd);
+            self.trace_pty_open(s, guest_fd, raw_fd, rdev);
+        }
+
+        Ok(guest_fd)
     }
 
     /// Handle syscall `openat`
@@ -517,6 +747,15 @@ impl<FS: ShimFS> Task<FS> {
                 |_fd| Err(Errno::EINVAL),
             )
             .flatten()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sys_rmdir(&self, pathname: impl path::Arg) -> Result<(), Errno> {
+        self.sys_unlinkat(
+            litebox_common_linux::AT_FDCWD,
+            pathname,
+            AtFlags::AT_REMOVEDIR,
+        )
     }
 
     /// Handle syscall `unlinkat`
@@ -1571,18 +1810,137 @@ impl<FS: ShimFS> Task<FS> {
     /// Note that this function only handles the following cases that we hardcoded:
     /// - `/proc/self/fd/<fd>`
     fn do_readlink(&self, fullpath: &str) -> Result<String, Errno> {
+        if fullpath == "/proc/self/cwd" {
+            let cwd = self.fs.borrow().cwd.read().clone();
+            // Strip trailing slash (except for root "/") — Linux's
+            // readlink("/proc/self/cwd") never includes one.
+            let trimmed = cwd.trim_end_matches('/');
+            return Ok(if trimmed.is_empty() {
+                "/".into()
+            } else {
+                trimmed.into()
+            });
+        }
+        if fullpath == "/proc/self/exe" {
+            let exe = self.fs.borrow().exe_path.read().clone();
+            if exe.is_empty() {
+                return Err(Errno::ENOENT);
+            }
+            return Ok(exe);
+        }
         if let Some(stripped) = fullpath.strip_prefix("/proc/self/fd/") {
             let fd = stripped.parse::<u32>().map_err(|_| Errno::EINVAL)?;
-            match fd {
-                0 => return Ok("/dev/stdin".to_string()),
-                1 => return Ok("/dev/stdout".to_string()),
-                2 => return Ok("/dev/stderr".to_string()),
-                _ => unimplemented!(),
+            if let 0..=2 = fd {
+                let raw_fd = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                if let Ok(typed_fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
+                    if let Ok(source_fd) =
+                        self.global.litebox.descriptor_table().with_metadata(
+                            typed_fd.as_ref(),
+                            |crate::HostStdioSourceFd(source_fd)| *source_fd,
+                        )
+                    {
+                        let stream = match source_fd {
+                            0 => Some(litebox::platform::StdioStream::Stdin),
+                            1 => Some(litebox::platform::StdioStream::Stdout),
+                            2 => Some(litebox::platform::StdioStream::Stderr),
+                            _ => None,
+                        };
+                        if let Some(stream) = stream
+                            && self.global.platform.is_a_tty(stream)
+                        {
+                            // Return the actual host PTY path if available,
+                            // so that ttyname_r() can discover and reopen
+                            // the controlling terminal by its real device path.
+                            if let Some(info) = self.global.platform.host_stdin_tty_device_info() {
+                                return Ok(info.path);
+                            }
+                            return Ok("/dev/tty".to_string());
+                        }
+                        return Ok(match source_fd {
+                            0 => "/dev/stdin".to_string(),
+                            1 => "/dev/stdout".to_string(),
+                            2 => "/dev/stderr".to_string(),
+                            _ => files.fs.fd_path(typed_fd.as_ref()).ok_or(Errno::ENOENT)?,
+                        });
+                    }
+                    if self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .with_metadata(typed_fd.as_ref(), |_alias: &crate::HostTtyAlias| ())
+                        .is_ok()
+                    {
+                        if let Some(info) = self.global.platform.host_stdin_tty_device_info() {
+                            return Ok(info.path);
+                        }
+                        return Ok("/dev/tty".to_string());
+                    }
+                    // Also check for HostPtyDeviceFd (reopened via /dev/pts/N)
+                    if self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .with_metadata(typed_fd.as_ref(), |_: &HostPtyDeviceFd| ())
+                        .is_ok()
+                    {
+                        if let Some(info) = self.global.platform.host_stdin_tty_device_info() {
+                            return Ok(info.path);
+                        }
+                        return Ok("/dev/tty".to_string());
+                    }
+                }
+                return Ok(match fd {
+                    0 => "/dev/stdin".to_string(),
+                    1 => "/dev/stdout".to_string(),
+                    2 => "/dev/stderr".to_string(),
+                    _ => unreachable!(),
+                });
+            } else {
+                // Check for HostPtyDeviceFd or HostTtyAlias metadata on
+                // non-stdio fds (e.g., fds reopened via /dev/pts/N or
+                // /dev/tty) so readlink returns a consistent PTY path.
+                let raw_fd = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                if let Ok(typed_fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
+                    let dt = self.global.litebox.descriptor_table();
+                    if dt
+                        .with_metadata(typed_fd.as_ref(), |_: &HostPtyDeviceFd| ())
+                        .is_ok()
+                        && let Some(info) = self.global.platform.host_stdin_tty_device_info()
+                    {
+                        return Ok(info.path);
+                    }
+                    if dt
+                        .with_metadata(typed_fd.as_ref(), |_: &crate::HostTtyAlias| ())
+                        .is_ok()
+                    {
+                        return Ok("/dev/tty".to_string());
+                    }
+                    return files.fs.fd_path(typed_fd.as_ref()).ok_or(Errno::ENOENT);
+                }
+                return Err(Errno::EBADF);
             }
         }
 
-        // TODO: we do not support symbolic links other than stdio yet.
-        Err(Errno::ENOENT)
+        // Try the filesystem for symlink resolution
+        let result = self.files.borrow().fs.read_link(fullpath);
+        match result {
+            Ok(target) => Ok(target),
+            Err(e) => {
+                use litebox::fs::errors::ReadLinkError;
+                match e {
+                    ReadLinkError::PathError(pe) => Err(Errno::from(pe)),
+                    ReadLinkError::ClosedFd => Err(Errno::EBADF),
+                    ReadLinkError::NotADirectory => Err(Errno::ENOTDIR),
+                    // Not a symlink, or FS doesn't support symlinks.
+                    ReadLinkError::NotASymlink | ReadLinkError::NotSupported => Err(Errno::EINVAL),
+                    _ => Err(Errno::EIO),
+                }
+            }
+        }
     }
 
     /// Handle syscall `readlink`
@@ -1636,7 +1994,9 @@ fn synthetic_symlink_stat(target_len: usize) -> FileStat {
 }
 
 fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileStat, Errno> {
-    let fstat = task
+    let uid = task.credentials.euid.truncate();
+    let gid = task.credentials.egid.truncate();
+    let mut fstat = task
         .files
         .borrow()
         .run_on_raw_fd(
@@ -1649,17 +2009,17 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                     .map(FileStat::from)
                     .map_err(Errno::from)
             },
-            |_fd| {
+            |fd| {
+                let ino = get_or_assign_anon_ino(task, fd);
                 Ok(FileStat {
-                    // TODO: give correct values
-                    st_dev: 0,
-                    st_ino: 0,
+                    st_dev: SOCKFS_DEV.truncate(),
+                    st_ino: ino.truncate(),
                     st_nlink: 1,
                     st_mode: (litebox_common_linux::InodeType::Socket as u32
                         | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits())
                     .truncate(),
-                    st_uid: 0,
-                    st_gid: 0,
+                    st_uid: uid,
+                    st_gid: gid,
                     st_rdev: 0,
                     st_size: 0,
                     st_blksize: 4096,
@@ -1673,16 +2033,16 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                     litebox::pipes::HalfPipeType::SenderHalf => Mode::WUSR,
                     litebox::pipes::HalfPipeType::ReceiverHalf => Mode::RUSR,
                 };
+                let ino = get_or_assign_anon_ino(task, fd);
                 Ok(FileStat {
-                    // TODO: give correct values
-                    st_dev: 0,
-                    st_ino: 0,
+                    st_dev: PIPEFS_DEV.truncate(),
+                    st_ino: ino.truncate(),
                     st_nlink: 1,
                     st_mode: (read_write_mode.bits()
                         | litebox_common_linux::InodeType::NamedPipe as u32)
                         .truncate(),
-                    st_uid: 0,
-                    st_gid: 0,
+                    st_uid: uid,
+                    st_gid: gid,
                     st_rdev: 0,
                     st_size: 0,
                     st_blksize: 4096,
@@ -1690,15 +2050,15 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                     ..Default::default()
                 })
             },
-            |_fd| {
+            |fd| {
+                let ino = get_or_assign_anon_ino(task, fd);
                 Ok(FileStat {
-                    // TODO: give correct values
-                    st_dev: 0,
-                    st_ino: 0,
+                    st_dev: ANON_INODE_DEV.truncate(),
+                    st_ino: ino.truncate(),
                     st_nlink: 1,
                     st_mode: (Mode::RUSR | Mode::WUSR).bits().truncate(),
-                    st_uid: 0,
-                    st_gid: 0,
+                    st_uid: uid,
+                    st_gid: gid,
                     st_rdev: 0,
                     st_size: 0,
                     st_blksize: 4096,
@@ -1706,15 +2066,15 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                     ..Default::default()
                 })
             },
-            |_fd| {
+            |fd| {
+                let ino = get_or_assign_anon_ino(task, fd);
                 Ok(FileStat {
-                    // TODO: give correct values
-                    st_dev: 0,
-                    st_ino: 0,
+                    st_dev: ANON_INODE_DEV.truncate(),
+                    st_ino: ino.truncate(),
                     st_nlink: 1,
                     st_mode: (Mode::RUSR | Mode::WUSR).bits().truncate(),
-                    st_uid: 0,
-                    st_gid: 0,
+                    st_uid: uid,
+                    st_gid: gid,
                     st_rdev: 0,
                     st_size: 0,
                     st_blksize: 0,
@@ -1722,17 +2082,17 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                     ..Default::default()
                 })
             },
-            |_fd| {
+            |fd| {
+                let ino = get_or_assign_anon_ino(task, fd);
                 Ok(FileStat {
-                    // TODO: give correct values
-                    st_dev: 0,
-                    st_ino: 0,
+                    st_dev: SOCKFS_DEV.truncate(),
+                    st_ino: ino.truncate(),
                     st_nlink: 1,
                     st_mode: (litebox_common_linux::InodeType::Socket as u32
                         | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits())
                     .truncate(),
-                    st_uid: 0,
-                    st_gid: 0,
+                    st_uid: uid,
+                    st_gid: gid,
                     st_rdev: 0,
                     st_size: 0,
                     st_blksize: 4096,
@@ -1742,7 +2102,79 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
             },
         )
         .flatten()?;
+
+    // Override st_dev/st_ino/st_rdev for fds that should report the host PTY
+    // identity. This applies to:
+    // - Inherited stdin/stdout/stderr (have HostStdioSourceFd metadata)
+    // - Fds opened via the host PTY device path (have HostPtyDeviceFd metadata)
+    if let Some(info) = task.global.platform.host_stdin_tty_device_info() {
+        let files = task.files.borrow();
+        let should_override = files.run_on_raw_fd(
+            raw_fd,
+            |fd| {
+                let table = task.global.litebox.descriptor_table();
+                // Check for HostPtyDeviceFd marker (reopened via /dev/pts/N)
+                if table.with_metadata(fd, |_: &HostPtyDeviceFd| ()).is_ok() {
+                    return true;
+                }
+                // Check for HostStdioSourceFd (inherited stdin/stdout/stderr)
+                if let Ok(crate::HostStdioSourceFd(source_fd)) =
+                    table.with_metadata(fd, |m: &crate::HostStdioSourceFd| *m)
+                    && (0..=2).contains(&source_fd)
+                    && task.global.platform.is_a_tty(match source_fd {
+                        0 => litebox::platform::StdioStream::Stdin,
+                        1 => litebox::platform::StdioStream::Stdout,
+                        _ => litebox::platform::StdioStream::Stderr,
+                    })
+                {
+                    return true;
+                }
+                // Check for HostTtyAlias (/dev/tty opens)
+                table
+                    .with_metadata(fd, |_: &crate::HostTtyAlias| ())
+                    .is_ok()
+            },
+            |_| false,
+            |_| false,
+            |_| false,
+            |_| false,
+            |_| false,
+        )?;
+        if should_override {
+            fstat.st_dev = info.dev.truncate();
+            fstat.st_ino = info.ino.truncate();
+            fstat.st_rdev = info.rdev.truncate();
+        }
+    }
+
     Ok(fstat)
+}
+
+/// Return a fresh inode number for an anonymous descriptor.
+fn next_anon_ino() -> u64 {
+    let ino = ANON_INO_COUNTER.fetch_add(1, Ordering::Relaxed);
+    assert_ne!(ino, usize::MAX, "anonymous inode counter overflow");
+    ino as u64
+}
+
+/// Retrieve the cached inode for an anonymous fd, or assign a new one.
+///
+/// The inode is stored as [`AnonIno`] entry metadata so that repeated `fstat`
+/// calls on the same fd (or a `dup`'d alias) return a stable `st_ino`.
+fn get_or_assign_anon_ino<FS: ShimFS, S: litebox::fd::FdEnabledSubsystem>(
+    task: &Task<FS>,
+    fd: &litebox::fd::TypedFd<S>,
+) -> u64 {
+    // Take the write lock upfront to avoid a TOCTOU race: two threads could
+    // both observe "no metadata" under a read lock and each store a different
+    // inode.
+    let mut dt = task.global.litebox.descriptor_table_mut();
+    if let Ok(ino) = dt.with_metadata::<S, AnonIno, _>(fd, |a| a.0) {
+        return ino;
+    }
+    let ino = next_anon_ino();
+    dt.set_entry_metadata(fd, AnonIno(ino));
+    ino
 }
 
 pub(crate) fn get_file_descriptor_flags<FS: ShimFS>(
@@ -2171,34 +2603,357 @@ impl<FS: ShimFS> Task<FS> {
         Ok(raw_fd.try_into().unwrap())
     }
 
-    fn stdio_ioctl(
+    /// Classify a file descriptor as a host stdio device, PTY device, or neither.
+    fn classify_terminal(&self, fs: &FS, fd: &TypedFd<FS>) -> Result<TerminalKind, Errno> {
+        match fs.fd_file_status(fd) {
+            Ok(status) => {
+                if status.file_type != litebox::fs::FileType::CharacterDevice {
+                    return Ok(TerminalKind::NotTerminal);
+                }
+                let major = status.node_info.rdev.map_or(0, |v| v.get() >> 8);
+                match major {
+                    // major 5: /dev/tty, /dev/console, /dev/ptmx — host stdio
+                    5 => Ok(TerminalKind::HostStdio),
+                    // major 136-143: Unix98 PTY slaves (/dev/pts/*)
+                    136..=143 => Ok(TerminalKind::Pty),
+                    _ => Ok(TerminalKind::NotTerminal),
+                }
+            }
+            Err(litebox::fs::errors::FileStatusError::ClosedFd) => Err(Errno::EBADF),
+            Err(_) => unimplemented!(),
+        }
+    }
+
+    fn host_stdio_stream_for_fd(
         &self,
+        fs: &FS,
+        fd: &TypedFd<FS>,
+    ) -> Result<litebox::platform::StdioStream, Errno> {
+        use litebox::platform::StdioStream;
+
+        // Use device-FS inode numbers to guess which host stdio stream this fd
+        // corresponds to.  These constants come from STDIN_NODE_INFO (ino=9),
+        // STDOUT_NODE_INFO (ino=10), STDERR_NODE_INFO (ino=11), and
+        // TTY_NODE_INFO (ino=12) in litebox/src/fs/devices.rs.
+        let status = fs.fd_file_status(fd).map_err(|_| Errno::EBADF)?;
+        let preferred = match status.node_info.ino {
+            9 => StdioStream::Stdin,
+            10 => StdioStream::Stdout,
+            11 => StdioStream::Stderr,
+            // /dev/tty (ino=12) and anything unknown — try stdin first since
+            // interactive programs typically read from it.
+            _ => StdioStream::Stdin,
+        };
+
+        if self.global.platform.is_a_tty(preferred) {
+            return Ok(preferred);
+        }
+
+        // Fallback: probe all three streams to find one that is actually a TTY.
+        [StdioStream::Stdin, StdioStream::Stdout, StdioStream::Stderr]
+            .into_iter()
+            .find(|s| self.global.platform.is_a_tty(*s))
+            .ok_or(Errno::ENOTTY)
+    }
+
+    fn host_tty_session_id(&self) -> Result<litebox::process::SessionId, Errno> {
+        self.global
+            .litebox
+            .process_registry()
+            .get_sid(self.process_id)
+            .ok_or(Errno::ESRCH)
+    }
+
+    fn set_host_tty_foreground_pgrp(&self, pgrp: i32) -> Result<(), Errno> {
+        use litebox::process::ProcessGroupId;
+
+        if pgrp <= 0 {
+            return Err(Errno::EINVAL);
+        }
+        let pgid = ProcessGroupId(u32::try_from(pgrp).map_err(|_| Errno::EINVAL)?);
+        let group_exists = self
+            .global
+            .litebox
+            .process_registry()
+            .process_group_exists_in_session(self.process_id, pgid)
+            .ok_or(Errno::ESRCH)?;
+        if !group_exists {
+            return Err(Errno::EPERM);
+        }
+        *self.global.host_tty_foreground_pgrp.lock() = pgid;
+        Ok(())
+    }
+
+    fn host_stdio_ioctl(
+        &self,
+        fs: &FS,
+        fd: &TypedFd<FS>,
         arg: &IoctlArg<litebox_platform_multiplex::Platform>,
     ) -> Result<u32, Errno> {
+        use litebox::platform::{SetTermiosWhen, StdioIoctlError};
+
+        /// Map a `StdioIoctlError` to an `Errno`.
+        fn ioctl_err_to_errno(e: StdioIoctlError) -> Errno {
+            match e {
+                StdioIoctlError::NotATerminal => Errno::ENOTTY,
+                _ => Errno::EIO,
+            }
+        }
+
+        let stream = self.host_stdio_stream_for_fd(fs, fd)?;
+
         match arg {
-            IoctlArg::TCGETS(termios) => {
-                termios
+            IoctlArg::TCGETS(termios_ptr) => {
+                // Non-init processes may have a per-process shadow termios
+                // from a silently-accepted TCSETS. Return it so TCGETS
+                // reflects what the caller set.
+                let attrs = if self.process_id == litebox::process::ProcessId::INIT {
+                    None
+                } else {
+                    self.global
+                        .host_tty_shadow_termios
+                        .lock()
+                        .get(&self.process_id)
+                        .cloned()
+                };
+                let attrs = attrs.map_or_else(
+                    || {
+                        self.global
+                            .platform
+                            .get_terminal_attributes(stream)
+                            .map_err(ioctl_err_to_errno)
+                    },
+                    Ok,
+                )?;
+                termios_ptr
                     .write_at_offset(
                         0,
                         litebox_common_linux::Termios {
-                            c_iflag: 0,
-                            c_oflag: 0,
-                            c_cflag: 0,
-                            c_lflag: 0,
-                            c_line: 0,
-                            c_cc: [0; 19],
+                            c_iflag: attrs.c_iflag,
+                            c_oflag: attrs.c_oflag,
+                            c_cflag: attrs.c_cflag,
+                            c_lflag: attrs.c_lflag,
+                            c_line: attrs.c_line,
+                            c_cc: attrs.c_cc,
                         },
                     )
                     .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
-            IoctlArg::TCSETS(_) => Ok(0), // TODO: implement
+            IoctlArg::TCSETS(termios_ptr) => {
+                let t: litebox_common_linux::Termios =
+                    termios_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                let attrs = litebox::platform::TerminalAttributes {
+                    c_iflag: t.c_iflag,
+                    c_oflag: t.c_oflag,
+                    c_cflag: t.c_cflag,
+                    c_lflag: t.c_lflag,
+                    c_line: t.c_line,
+                    c_cc: t.c_cc,
+                };
+                // Only the init process may change the real host terminal
+                // attributes. Child processes update a shadow so TCGETS
+                // reflects the change, but the real terminal is untouched.
+                if self.process_id != litebox::process::ProcessId::INIT {
+                    self.global
+                        .host_tty_shadow_termios
+                        .lock()
+                        .insert(self.process_id, attrs);
+                    return Ok(0);
+                }
+                self.global
+                    .platform
+                    .set_terminal_attributes(stream, &attrs, SetTermiosWhen::Now)
+                    .map_err(ioctl_err_to_errno)?;
+                // Clear stale shadow so non-init TCGETS sees the new real state.
+                self.global.host_tty_shadow_termios.lock().clear();
+                Ok(0)
+            }
+            IoctlArg::TCSETSW(termios_ptr) => {
+                let t: litebox_common_linux::Termios =
+                    termios_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                let attrs = litebox::platform::TerminalAttributes {
+                    c_iflag: t.c_iflag,
+                    c_oflag: t.c_oflag,
+                    c_cflag: t.c_cflag,
+                    c_lflag: t.c_lflag,
+                    c_line: t.c_line,
+                    c_cc: t.c_cc,
+                };
+                if self.process_id != litebox::process::ProcessId::INIT {
+                    self.global
+                        .host_tty_shadow_termios
+                        .lock()
+                        .insert(self.process_id, attrs);
+                    return Ok(0);
+                }
+                self.global
+                    .platform
+                    .set_terminal_attributes(stream, &attrs, SetTermiosWhen::AfterDrain)
+                    .map_err(ioctl_err_to_errno)?;
+                self.global.host_tty_shadow_termios.lock().clear();
+                Ok(0)
+            }
+            IoctlArg::TCSETSF(termios_ptr) => {
+                let t: litebox_common_linux::Termios =
+                    termios_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                let attrs = litebox::platform::TerminalAttributes {
+                    c_iflag: t.c_iflag,
+                    c_oflag: t.c_oflag,
+                    c_cflag: t.c_cflag,
+                    c_lflag: t.c_lflag,
+                    c_line: t.c_line,
+                    c_cc: t.c_cc,
+                };
+                if self.process_id != litebox::process::ProcessId::INIT {
+                    self.global
+                        .host_tty_shadow_termios
+                        .lock()
+                        .insert(self.process_id, attrs);
+                    return Ok(0);
+                }
+                self.global
+                    .platform
+                    .set_terminal_attributes(stream, &attrs, SetTermiosWhen::AfterDrainFlushInput)
+                    .map_err(ioctl_err_to_errno)?;
+                self.global.host_tty_shadow_termios.lock().clear();
+                Ok(0)
+            }
+            IoctlArg::TIOCGWINSZ(ws_ptr) => {
+                let size = self
+                    .global
+                    .platform
+                    .get_window_size(stream)
+                    .map_err(ioctl_err_to_errno)?;
+                ws_ptr
+                    .write_at_offset(
+                        0,
+                        litebox_common_linux::Winsize {
+                            row: size.rows,
+                            col: size.cols,
+                            xpixel: size.xpixel,
+                            ypixel: size.ypixel,
+                        },
+                    )
+                    .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TIOCSWINSZ(ws_ptr) => {
+                let ws: litebox_common_linux::Winsize =
+                    ws_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                let size = litebox::platform::WindowSize {
+                    rows: ws.row,
+                    cols: ws.col,
+                    xpixel: ws.xpixel,
+                    ypixel: ws.ypixel,
+                };
+                self.global
+                    .platform
+                    .set_window_size(stream, &size)
+                    .map_err(ioctl_err_to_errno)?;
+                Ok(0)
+            }
+            IoctlArg::TIOCGPGRP(pgrp) => {
+                // Return the caller's own pgid rather than the shared
+                // host_tty_foreground_pgrp.  After setsid() the child's
+                // pgid diverges from the init-owned foreground value, and
+                // /dev/tty always routes here (major 5), so returning the
+                // stored global would make the child think it's in the
+                // background.  Returning the caller's pgid guarantees
+                // tcgetpgrp() == getpgrp() for every process.
+                let caller_pgid = i32::try_from(self.sys_getpgid(0).unwrap_or(1)).unwrap_or(1);
+                pgrp.write_at_offset(0, caller_pgid).ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TIOCGSID(sid) => {
+                let session_id = i32::try_from(self.host_tty_session_id()?.as_u32())
+                    .map_err(|_| Errno::EINVAL)?;
+                sid.write_at_offset(0, session_id).ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TIOCSPGRP(pgrp) => {
+                let foreground_pgrp = pgrp.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                self.set_host_tty_foreground_pgrp(foreground_pgrp)?;
+                Ok(0)
+            }
+            // These are no-ops for stdio: TIOCSCTTY (already controlling terminal),
+            // TIOCNOTTY (detach), TIOCSPTLK (unlock PTY).
+            IoctlArg::TIOCSCTTY | IoctlArg::TIOCNOTTY | IoctlArg::TIOCSPTLK(_) => Ok(0),
+            _ => Err(Errno::ENOTTY),
+        }
+    }
+
+    /// Handle terminal ioctls for PTY slave devices (major=136).
+    fn pty_ioctl(
+        &self,
+        fs: &FS,
+        fd: &TypedFd<FS>,
+        arg: &IoctlArg<litebox_platform_multiplex::Platform>,
+    ) -> Result<u32, Errno> {
+        match arg {
+            IoctlArg::TCGETS(termios) => {
+                // Return stored terminal attributes for this PTY.
+                let stored = fs.get_pty_termios(fd).ok_or(Errno::ENOTTY)?;
+                termios
+                    .write_at_offset(
+                        0,
+                        litebox_common_linux::Termios {
+                            c_iflag: stored.c_iflag,
+                            c_oflag: stored.c_oflag,
+                            c_cflag: stored.c_cflag,
+                            c_lflag: stored.c_lflag,
+                            c_line: stored.c_line,
+                            c_cc: stored.c_cc,
+                        },
+                    )
+                    .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TCSETS(termios_ptr)
+            | IoctlArg::TCSETSW(termios_ptr)
+            | IoctlArg::TCSETSF(termios_ptr) => {
+                // Store the terminal attributes so future TCGETS and line
+                // discipline behaviour reflect what the application configured.
+                let t: litebox_common_linux::Termios =
+                    termios_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                let stored = litebox::platform::TerminalAttributes {
+                    c_iflag: t.c_iflag,
+                    c_oflag: t.c_oflag,
+                    c_cflag: t.c_cflag,
+                    c_lflag: t.c_lflag,
+                    c_line: t.c_line,
+                    c_cc: t.c_cc,
+                };
+                if !fs.set_pty_termios(fd, stored) {
+                    return Err(Errno::ENOTTY);
+                }
+                Ok(0)
+            }
+            IoctlArg::TIOCSWINSZ(_) | IoctlArg::TIOCSPTLK(_) | IoctlArg::TIOCNOTTY => Ok(0),
+            IoctlArg::TIOCSCTTY => {
+                // On real Linux, TIOCSCTTY sets the controlling terminal and
+                // initialises the foreground pgrp to the caller's pgid. Mirror
+                // that here so tcgetpgrp() returns the right value.
+                let pgid = i32::try_from(self.sys_getpgid(0).unwrap_or(1)).unwrap_or(1);
+                let _ = fs.set_pty_foreground_pgrp(fd, pgid);
+                Ok(0)
+            }
+            IoctlArg::TIOCSPGRP(pgrp_ptr) => {
+                let pgrp: i32 = pgrp_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                if pgrp <= 0 {
+                    return Err(Errno::EINVAL);
+                }
+                if !fs.set_pty_foreground_pgrp(fd, pgrp) {
+                    return Err(Errno::ENOTTY);
+                }
+                Ok(0)
+            }
             IoctlArg::TIOCGWINSZ(ws) => {
                 ws.write_at_offset(
                     0,
                     litebox_common_linux::Winsize {
-                        row: 20,
-                        col: 20,
+                        row: 40,
+                        col: 120,
                         xpixel: 0,
                         ypixel: 0,
                     },
@@ -2206,21 +2961,35 @@ impl<FS: ShimFS> Task<FS> {
                 .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
-            IoctlArg::TIOCGPTN(_) => Err(Errno::ENOTTY),
-            _ => todo!(),
-        }
-    }
-
-    fn is_stdio(&self, fs: &FS, fd: &TypedFd<FS>) -> Result<bool, Errno> {
-        match fs.fd_file_status(fd) {
-            Ok(status) => {
-                // See https://www.kernel.org/doc/Documentation/admin-guide/devices.txt
-                let major = status.node_info.rdev.map_or(0, |v| v.get() >> 8);
-                Ok((136..=143).contains(&major)
-                    && status.file_type == litebox::fs::FileType::CharacterDevice)
+            IoctlArg::TIOCGPTN(ptn) => {
+                let status = fs.fd_file_status(fd).map_err(|_| Errno::EBADF)?;
+                let rdev = status.node_info.rdev.ok_or(Errno::ENOTTY)?;
+                let major = rdev.get() >> 8;
+                if !(136..=143).contains(&major) {
+                    return Err(Errno::ENOTTY);
+                }
+                // Recover the full PTY index: major 136 holds indices
+                // 0-255, major 137 holds 256-511, etc.
+                let idx = u32::try_from((major - 136) * 256 + (rdev.get() & 0xFF))
+                    .map_err(|_| Errno::ENOTTY)?;
+                ptn.write_at_offset(0, idx).ok_or(Errno::EFAULT)?;
+                Ok(0)
             }
-            Err(litebox::fs::errors::FileStatusError::ClosedFd) => Err(Errno::EBADF),
-            Err(_) => unimplemented!(),
+            IoctlArg::TIOCGPGRP(pgrp) => {
+                // Always return the caller's own pgid.  This avoids a race
+                // between the parent setting the PTY foreground pgrp (via
+                // TIOCSPGRP on the master) and the child checking it (via
+                // TIOCGPGRP on the slave): with vfork the parent can only
+                // call tcsetpgrp *after* the child execs, but bash checks
+                // tcgetpgrp during early init, before the parent had a chance
+                // to call setpgid+tcsetpgrp.  Returning the caller's pgid
+                // guarantees tcgetpgrp() == getpgrp() so shells always see
+                // themselves in the foreground.
+                let value = i32::try_from(self.sys_getpgid(0).unwrap_or(1)).unwrap_or(1);
+                pgrp.write_at_offset(0, value).ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            _ => Err(Errno::ENOTTY),
         }
     }
 
@@ -2236,19 +3005,90 @@ impl<FS: ShimFS> Task<FS> {
 
         let files = self.files.borrow();
         match arg {
-            IoctlArg::FIONBIO(arg) => {
-                let val = arg.read_at_offset(0).ok_or(Errno::EFAULT)?;
-                self.files
-                    .borrow()
+            IoctlArg::FIONREAD(out) => {
+                // Return the number of bytes available to read.
+                files
                     .run_on_raw_fd(
                         desc,
-                        |_file_fd| {
-                            // TODO: stdio NONBLOCK?
-                            #[cfg(debug_assertions)]
-                            litebox::log_println!(
-                                self.global.platform,
-                                "Attempted to set non-blocking on raw fd; currently unimplemented"
-                            );
+                        |file_fd| {
+                            let available = match self.classify_terminal(&files.fs, file_fd)? {
+                                TerminalKind::HostStdio => self
+                                    .global
+                                    .platform
+                                    .get_terminal_input_bytes(
+                                        self.host_stdio_stream_for_fd(&files.fs, file_fd)?,
+                                    )
+                                    .map_err(|e| match e {
+                                        litebox::platform::StdioIoctlError::NotATerminal => {
+                                            Errno::ENOTTY
+                                        }
+                                        litebox::platform::StdioIoctlError::OsError(_) => {
+                                            Errno::EIO
+                                        }
+                                        _ => Errno::EIO,
+                                    })?,
+                                TerminalKind::Pty | TerminalKind::NotTerminal => {
+                                    // Known limitation: Linux returns st_size - offset for
+                                    // regular files, but we don't track the current position
+                                    // here.  ENOTTY is safe since most callers only use
+                                    // FIONREAD on terminals and sockets.
+                                    return Err(Errno::ENOTTY);
+                                }
+                            };
+                            let available = i32::try_from(available).unwrap_or(i32::MAX);
+                            out.write_at_offset(0, available).ok_or(Errno::EFAULT)?;
+                            Ok(0u32)
+                        },
+                        |socket_fd| {
+                            let proxy = self.global.get_proxy(socket_fd)?;
+                            let n = proxy.pending_rx_bytes();
+                            let n = i32::try_from(n).unwrap_or(i32::MAX);
+                            out.write_at_offset(0, n).ok_or(Errno::EFAULT)?;
+                            Ok(0u32)
+                        },
+                        |pipe_fd| {
+                            // Pipes: return actual buffered byte count.
+                            let n = self
+                                .global
+                                .pipes
+                                .readable_bytes(pipe_fd)
+                                .map_err(|_| Errno::EBADF)?;
+                            let n = i32::try_from(n).unwrap_or(i32::MAX);
+                            out.write_at_offset(0, n).ok_or(Errno::EFAULT)?;
+                            Ok(0u32)
+                        },
+                        |_fd| Err(Errno::ENOTTY),
+                        |_fd| Err(Errno::ENOTTY),
+                        |_fd| Err(Errno::ENOTTY),
+                    )
+                    .flatten()
+            }
+            IoctlArg::FIONBIO(arg) => {
+                let val = arg.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                let files = self.files.borrow();
+                files
+                    .run_on_raw_fd(
+                        desc,
+                        |file_fd| {
+                            let result = self
+                                .global
+                                .litebox
+                                .descriptor_table_mut()
+                                .with_metadata_mut(file_fd, |crate::StdioStatusFlags(flags)| {
+                                    flags.set(OFlags::NONBLOCK, val != 0);
+                                    *flags
+                                });
+                            match result {
+                                Ok(new_flags) => files
+                                    .fs
+                                    .set_open_status_flags(file_fd, new_flags)
+                                    .map_err(|_| Errno::EBADF)?,
+                                Err(MetadataError::ClosedFd) => return Err(Errno::EBADF),
+                                Err(MetadataError::NoSuchMetadata) => {
+                                    // Non-stdio file FD; non-blocking is irrelevant for
+                                    // in-memory files, so silently succeed.
+                                }
+                            }
                             Ok(())
                         },
                         |socket_fd| {
@@ -2326,8 +3166,22 @@ impl<FS: ShimFS> Task<FS> {
                         .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
                     Ok(0)
                 },
-                |_fd| todo!("net"),
-                |_fd| todo!("pipes"),
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                    Ok(0)
+                },
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                    Ok(0)
+                },
                 |fd| {
                     let _old = self
                         .global
@@ -2353,17 +3207,151 @@ impl<FS: ShimFS> Task<FS> {
                     Ok(0)
                 },
             )?,
-            IoctlArg::TCGETS(..)
-            | IoctlArg::TCSETS(..)
-            | IoctlArg::TIOCGPTN(..)
-            | IoctlArg::TIOCGWINSZ(..) => files.run_on_raw_fd(
+            IoctlArg::FIONCLEX => files.run_on_raw_fd(
                 desc,
                 |fd| {
-                    if self.is_stdio(&files.fs, fd)? {
-                        self.stdio_ioctl(&arg)
-                    } else {
-                        Err(Errno::ENOTTY)
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                    Ok(0)
+                },
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                    Ok(0)
+                },
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                    Ok(0)
+                },
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                    Ok(0)
+                },
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                    Ok(0)
+                },
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                    Ok(0)
+                },
+            )?,
+            IoctlArg::TIOCGPTPEER(open_flags) => {
+                // TIOCGPTPEER: open the slave side of a PTY master, returning a new fd.
+                // The argument contains O_RDWR|O_NOCTTY or similar open flags.
+                //
+                // We must open the slave through the device FS directly rather
+                // than via sys_open("/dev/pts/N"), because the layered FS might
+                // route /dev/pts/N to the 9P broker (host filesystem) instead of
+                // the sandbox's PTY manager — especially when the host's terminal
+                // happens to be /dev/pts/N.
+                //
+                // Note: we check major >= 136 which matches both masters and
+                // slaves.  In practice this is harmless — calling TIOCGPTPEER on
+                // a slave just re-opens the same slave.  A stricter check would
+                // require the device FS to distinguish master vs slave, which is
+                // not currently exposed.
+                let slave_fd = files.run_on_raw_fd(
+                    desc,
+                    |file_fd| {
+                        let status = files.fs.fd_file_status(file_fd).map_err(|_| Errno::EBADF)?;
+                        let rdev = status.node_info.rdev.ok_or(Errno::ENOTTY)?;
+                        let major = rdev.get() >> 8;
+                        if major < 136 {
+                            return Err(Errno::ENOTTY);
+                        }
+                        // Recover the full PTY index: major 136 holds indices
+                        // 0-255, major 137 holds 256-511, etc.
+                        let idx = u32::try_from((major - 136) * 256 + (rdev.get() & 0xFF))
+                            .map_err(|_| Errno::ENOTTY)?;
+                        let oflags =
+                            OFlags::from_bits_truncate(u32::try_from(open_flags).unwrap_or(0));
+                        let slave_path = alloc::format!("/dev/pts/{idx}");
+                        // Strip O_CLOEXEC before passing to the FS layer — the
+                        // layered FS does not support it (panics). CLOEXEC is
+                        // handled as fd-level metadata after insert.
+                        files
+                            .fs
+                            .open(
+                                slave_path.as_str(),
+                                oflags - OFlags::CLOEXEC,
+                                litebox::fs::Mode::empty(),
+                            )
+                            .map_err(|_| Errno::EIO)
+                    },
+                    |_| Err(Errno::ENOTTY),
+                    |_| Err(Errno::ENOTTY),
+                    |_| Err(Errno::ENOTTY),
+                    |_| Err(Errno::ENOTTY),
+                    |_| Err(Errno::ENOTTY),
+                )??;
+                drop(files);
+                let files = self.files.borrow();
+                let oflags = OFlags::from_bits_truncate(u32::try_from(open_flags).unwrap_or(0));
+                {
+                    let mut dt = self.global.litebox.descriptor_table_mut();
+                    let None = dt.set_entry_metadata(
+                        &slave_fd,
+                        crate::StdioStatusFlags(oflags & OFlags::STATUS_FLAGS_MASK),
+                    ) else {
+                        unreachable!()
+                    };
+                    // Propagate O_CLOEXEC to fd-level metadata so close_on_exec
+                    // sees it (the device FS only stores status flags, not
+                    // descriptor flags).
+                    if oflags.contains(OFlags::CLOEXEC) {
+                        dt.set_fd_metadata(
+                            &slave_fd,
+                            litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC,
+                        );
                     }
+                }
+                let raw_fd = files.insert_raw_fd(slave_fd).map_err(|fd| {
+                    let _ = files.fs.close(&fd);
+                    Errno::EMFILE
+                })?;
+                Ok(u32::try_from(raw_fd).unwrap_or(u32::MAX))
+            }
+            IoctlArg::TCGETS(..)
+            | IoctlArg::TCSETS(..)
+            | IoctlArg::TCSETSW(..)
+            | IoctlArg::TCSETSF(..)
+            | IoctlArg::TIOCGPTN(..)
+            | IoctlArg::TIOCSPTLK(..)
+            | IoctlArg::TIOCSCTTY
+            | IoctlArg::TIOCNOTTY
+            | IoctlArg::TIOCGSID(..)
+            | IoctlArg::TIOCGPGRP(..)
+            | IoctlArg::TIOCSPGRP(..)
+            | IoctlArg::TIOCGWINSZ(..)
+            | IoctlArg::TIOCSWINSZ(..) => files.run_on_raw_fd(
+                desc,
+                |term_fd| match self.classify_terminal(&files.fs, term_fd)? {
+                    TerminalKind::HostStdio => self.host_stdio_ioctl(&files.fs, term_fd, &arg),
+                    TerminalKind::Pty => self.pty_ioctl(&files.fs, term_fd, &arg),
+                    TerminalKind::NotTerminal => Err(Errno::ENOTTY),
                 },
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
@@ -2372,9 +3360,10 @@ impl<FS: ShimFS> Task<FS> {
                 |_fd| Err(Errno::ENOTTY),
             )?,
             _ => {
-                #[cfg(debug_assertions)]
-                litebox::log_println!(self.global.platform, "\n\n\n{:?}\n\n\n", arg);
-                todo!()
+                // Return ENOTTY for unsupported ioctls rather than panicking.
+                // Complex programs (e.g., bash) probe terminal capabilities and
+                // handle ENOTTY gracefully.
+                Err(Errno::ENOTTY)
             }
         }
     }

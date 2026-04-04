@@ -766,6 +766,7 @@ impl<FS: ShimFS> Task<FS> {
                         global: self.global.clone(),
                         wait_state: crate::wait::WaitState::new(self.global.platform),
                         thread,
+                        process_id: self.process_id,
                         pid: self.pid,
                         tid: child_tid,
                         ppid: self.ppid,
@@ -1252,6 +1253,25 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `getegid`.
     pub(crate) fn sys_getegid(&self) -> u32 {
         self.credentials.egid
+    }
+
+    /// Handle syscall `getpgid`. pid==0 means self.
+    pub(crate) fn sys_getpgid(&self, pid: i32) -> Result<u32, Errno> {
+        use litebox::process::{ProcessGroupId, ProcessId};
+        if pid < 0 {
+            return Err(Errno::EINVAL);
+        }
+        let target = if pid == 0 {
+            self.process_id
+        } else {
+            ProcessId(pid.cast_unsigned())
+        };
+        self.global
+            .litebox
+            .process_registry()
+            .get_pgid(target)
+            .map(ProcessGroupId::as_u32)
+            .ok_or(Errno::ESRCH)
     }
 }
 

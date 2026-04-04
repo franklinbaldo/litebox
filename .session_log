@@ -94,3 +94,75 @@
 - Build: pass, fmt: pass, clippy: pass, 339 tests pass
 - Pushed to remote
 - Next: PR 29 (net + unix enhancements)
+
+## Entry 11 — PR 29 complete (net + unix enhancements)
+- Branch: wdcui/stacked/pr29-net-unix-enhancements (3c92dc94)
+- Parent: wdcui/stacked/pr28-file-syscalls-2 (81de5c9f)
+- 8 files changed, 1704 insertions(+), 172 deletions(-)
+- Changes:
+  - net.rs: sendmsg/recvmsg/sendmmsg, SCM_RIGHTS cmsg parsing/building, shutdown, TCP keepalive, IP_TTL/IP_TOS
+  - unix.rs: seqpacket type, autobind, peercred (SO_PEERCRED), PassedFd plumbing, peer-close detection, shutdown fix (ENOTCONN)
+  - file.rs: Vec::new() threading for passed_fds/received_fds in all sendto/recvfrom callers
+  - signal/mod.rs: siginfo_kernel() helper
+  - lib.rs: current_ucred() on Task
+  - channel.rs: pub(crate) shutdown/is_peer_shutdown, manual WriteEnd Clone impl
+  - ratchet.rs: litebox_shim_linux/ statics bump 1→2 (AUTOBIND_COUNTER)
+- Build: pass, fmt: pass, clippy: pass, 350 tests pass, 65 skipped
+- Pushed to remote
+- Next: PR 30 (shared file mmap + mm.rs)
+
+## Entry 12 — PR 30 completed
+- Branch: wdcui/stacked/pr30-mm-improvements (a1d80208)
+- Parent: wdcui/stacked/pr29-net-unix-enhancements
+- 3 files changed, 579 insertions(+), 46 deletions(-)
+- Changes:
+  - litebox_common_linux/src/mm.rs: fd_writable param on do_mmap, POPULATE_PAGES_IMMEDIATELY uses MAP_POPULATE|MAP_LOCKED intersect !MAP_NONBLOCK, new CreatePagesFlags (FD_WRITABLE, NORESERVE, LOW_2G), PROT_READ_WRITE_EXEC→create_rwx_pages, expanded madvise (all advisory as no-ops, DontNeedLocked=DontNeed, Remove/HWPoison/SoftOffline→EINVAL)
+  - litebox_shim_linux/src/syscalls/mm.rs: ElfPatchState new fields (_base_addr, _trampoline_vaddr, file_path), SharedFileMapping/InternalHandle types (dead_code), internal fd helpers (dead_code), fd_path_for_raw helper, sys_mmap flag handling (MAP_SYNC→EOPNOTSUPP, MAP_GROWSDOWN→EINVAL, MAP_NONBLOCK for file→EINVAL, MAP_32BIT/MAP_LOCKED pass-through), init_elf_patch_state trace logging, check_trampoline_magic simplified read, maybe_patch_exec_segment warnings with file_path + trace logging, 9 new tests
+  - litebox_shim_optee/src/syscalls/mm.rs: added fd_writable=false param to do_mmap call
+- Build: pass, fmt: pass, clippy: pass, 358 tests pass, 65 skipped
+- Static analysis: no actionable issues
+- Pushed to remote
+- Next: PR 31 (signal XSAVE/FP overhaul)
+
+## Entry 13 — PR 31 committed and pushed
+- Branch: wdcui/stacked/pr31-signal-fp-overhaul (aac57e61)
+- Parent: wdcui/stacked/pr30-mm-improvements
+- 7 files changed, 1053 insertions(+), 55 deletions(-)
+- Changes:
+  - litebox_shim_linux/src/syscalls/signal/x86_64.rs: FULLY REWRITTEN — FP state constants (FPSTATE_SIZE, LEGACY_FPSTATE_SIZE, XSTATE offsets, FP_XSTATE_MAGIC1/2, XFEATURE masks, MXCSR masks), helper functions (validate_mxcsr, SignalFpStateBuf, reinit_guest_fp_state, read_host_mxcsr_mask, sanitize_xsave_image, xsave_area_size, fpstate_addr_from_frame, write_signal_frame_xstate_metadata), sigreturn_rax helper, get_signal_frame FP area reservation, restore_sigcontext with full FP state restore (cfg-gated), comprehensive test suite (~20 tests)
+  - litebox_shim_linux/src/syscalls/signal/mod.rs: reinit_guest_fp_state re-export, SEGV_MAPERR/SEGV_ACCERR in siginfo_exception, restore_mask field+accessors, reset_caught_handlers(), SA_RESETHAND support, sys_rt_sigreturn takes &mut ExecutionContext, process_signals takes &mut ExecutionContext, force_signal_with_info assert expansion, 3 unit tests
+  - litebox_shim_linux/src/syscalls/signal/x86.rs: sigreturn_rax helper, restore_sigcontext returns Result<usize, ()>
+  - litebox_shim_linux/src/lib.rs: enter_shim/handle_syscall_request/do_syscall changed from &mut PtRegs to &mut ExecutionContext
+  - litebox_shim_linux/src/wait.rs: prepare_to_run_guest changed from &mut PtRegs to &mut ExecutionContext
+  - litebox_shim_linux/src/syscalls/process.rs: handle_init_request signature change, test updated
+  - litebox_shim_optee/src/syscalls/mm.rs: import reorder (fmt)
+- Build: pass, fmt: pass, clippy: pass (only pre-existing warnings), 377 tests pass, 69 skipped
+- Pushed to remote
+- Next: PR 32 (file.rs part 3)
+
+## Entry 14 — PR 32 committed and pushed
+- Branch: wdcui/stacked/pr32-pty-proc-ioctl-misc
+- Parent: wdcui/stacked/pr31-signal-fp-overhaul (aac57e61)
+- Changes:
+  - litebox_shim_linux/src/lib.rs: HostStdioSourceFd(i32), HostTtyAlias types, HostStdioSourceFd metadata on stdio init, host_tty_foreground_pgrp: Mutex<ProcessGroupId> on GlobalState, host_tty_shadow_termios: Mutex<BTreeMap<ProcessId, TerminalAttributes>> on GlobalState, process_id: ProcessId on Task, SyscallRequest::Getpgid dispatch
+  - litebox_shim_linux/src/syscalls/file.rs: MAJOR rewrite — PTY/terminal infrastructure:
+    - Types/constants: HostPtyDeviceFd, AnonIno, TerminalKind enum, SOCKFS_DEV/PIPEFS_DEV/ANON_INODE_DEV, ANON_INO_COUNTER
+    - Helper functions: host_stdio_source_for_path, is_host_tty_path, is_host_pty_device_path, next_anon_ino, get_or_assign_anon_ino, classify_terminal, host_stdio_stream_for_fd (inode-based heuristic with fallback probe), host_tty_session_id, set_host_tty_foreground_pgrp
+    - Rewrote descriptor_stat: proper device IDs (SOCKFS_DEV/PIPEFS_DEV/ANON_INODE_DEV), uid/gid from credentials, get_or_assign_anon_ino for stable inodes, PTY device info override via host_stdin_tty_device_info()
+    - Rewrote do_readlink: /proc/self/cwd, /proc/self/exe, /proc/self/fd/N with HostStdioSourceFd/HostTtyAlias/HostPtyDeviceFd metadata lookup
+    - Rewrote sys_open: /proc/self/exe handling, /sys/kernel/debug reject, StdioStatusFlags+HostStdioSourceFd+HostTtyAlias+HostPtyDeviceFd metadata tagging, set_open_status_flags, trace_pty_open
+    - Removed stdio_ioctl/is_stdio helpers
+    - host_stdio_ioctl: full terminal ioctl handler (TCGETS with shadow termios, TCSETS/W/F init-only real writes, TIOCGWINSZ/TIOCSWINSZ, TIOCGPGRP/TIOCSPGRP, TIOCGSID, no-ops for TIOCSCTTY/TIOCNOTTY/TIOCSPTLK)
+    - pty_ioctl: PTY slave ioctl handler (TCGETS/TCSETS via FS trait, TIOCGPTN with >=256 fix, TIOCGPGRP, TIOCSCTTY, TIOCSPGRP, TIOCGWINSZ 40x120)
+    - Rewrote sys_ioctl: FIONREAD (terminal+socket+pipe), FIONBIO (all 6 fd types with proper metadata), FIOCLEX/FIONCLEX (all 6 fd types), TIOCGPTPEER (open PTY slave with oflags mask fix), classify_terminal routing, unknown→ENOTTY
+    - Dead code stubs: open_synthetic_proc_text, pty_rdev_for_raw_fd, _pty_target_for_guest_fd, trace_pty_open, resolve_exe_path, maybe_trace_pty_dup, sys_rmdir
+  - litebox_shim_linux/src/syscalls/process.rs: process_id in Task clone, sys_getpgid method
+  - dev_tests/src/ratchet.rs: litebox_shim_linux globals ratchet 2→3 (ANON_INO_COUNTER)
+- Static analysis fixes applied:
+  - TIOCGPTN: fixed to handle PTY index >= 256 (same formula as TIOCGPTPEER)
+  - TIOCGPTPEER: added comment about master-vs-slave check limitation, masked oflags with STATUS_FLAGS_MASK
+  - FIONREAD: added comment documenting regular-file limitation
+  - host_stdio_stream_for_fd: fixed inode mapping (stderr was wrong: ino 11, not fallback), added documentation of device-FS inode constants
+  - Removed unused imports: siginfo_kernel, core::fmt::Write, PROC_SELF_EXE_INO (deferred to caller PRs)
+- Build: pass, fmt: pass, clippy: pass (only pre-existing warnings), 377 tests pass, 69 skipped
+- Next: PR 33 (copy_file_range + dup rework + remaining file.rs independents)
