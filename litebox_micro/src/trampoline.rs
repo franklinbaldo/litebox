@@ -39,26 +39,50 @@ core::arch::global_asm!(
     "cmp rax, 15",
     "je .Lrt_sigreturn",
     //
-    "mov gs:[0x20], rcx", // save return addr
-    // Skip the 128-byte red zone mandated by the x86_64 ABI. Leaf functions
-    // (and inline-asm `syscall` sites) are allowed to use 128 bytes below RSP
-    // without adjusting it. We must not clobber that region.
+    // ── Signal-safe trampoline ────────────────────────────────────────
+    //
+    // A signal can be delivered at any point during this trampoline. If
+    // the signal handler issues a syscall it will RE-ENTER this very
+    // trampoline.  Therefore all state (return address, pre-alignment
+    // RSP) must be saved on the STACK, not in TLS slots that would be
+    // overwritten by the nested invocation.
+    //
+    // We still write the return address to gs:[0x20] because
+    // `handle_clone` reads it from there to bootstrap child threads.
+    // But we rely on the stack copy for our own restore.
+    //
+    // We use RBP as a frame pointer to recover RSP after alignment.
+    // RBP is callee-saved, so `micro_handle_syscall` preserves it.
+    // The guest's original RBP is saved/restored via push/pop.
+    //
+    // R11 is clobbered by the real `syscall` instruction, so the guest
+    // does not expect it to be preserved.  We use it as a scratch
+    // register.
     //
     // ── Stack layout (addresses grow upward) ──────────────────────────
     //
     //   +--------+------- original guest RSP (X)
     //   |  128B  |  red zone (untouched)
     //   +--------+------- X − 128
+    //   |   8B   |  saved guest RBP               (push rbp)
+    //   |   8B   |  saved return address (RCX)     (push rcx)
+    //   +--------+------- X − 144
     //   |  56B   |  SyscallArgs  [rsp+48 .. rsp+103]
-    //   +--------+------- X − 184
+    //   +--------+------- X − 200
     //   |  48B   |  saved guest regs: RDI, RSI, RDX, R10, R8, R9
-    //   +--------+------- X − 232  ← RSP at `call`
+    //   +--------+------- X − 248  ← save area base (= RBP)
     //
-    // Alignment: total sub = 128 + 104 = 232 ≡ 8 mod 16.
-    // This matches the old trampoline's 128+56 = 184 ≡ 8 mod 16,
-    // preserving the same alignment class for the CALL instruction.
+    // After building the save area, RBP ← RSP, then we subtract a
+    // 16-byte safety gap and `and rsp, -16` for alignment.
     //
     "sub rsp, 128", // skip red zone
+    //
+    // Save guest RBP and the return address (RCX) on the stack.
+    "push rbp",
+    "push rcx",
+    //
+    // Also write return address to gs:[0x20] for handle_clone's use.
+    "mov gs:[0x20], rcx",
     //
     // Save guest registers BEFORE clobbering RDI for the C call.
     // We save 6 registers × 8 bytes = 48 bytes, then SyscallArgs = 56
@@ -83,8 +107,28 @@ core::arch::global_asm!(
     //
     // RDI = &SyscallArgs for the C call.
     "lea rdi, [rsp+0x30]",
+    //
+    // Use RBP as a frame pointer: save RSP so we can restore it after
+    // the aligned call.  RBP is callee-saved by the C ABI, so
+    // `micro_handle_syscall` will preserve it.
+    "mov rbp, rsp",
+    //
+    // Force ABI-compliant 16-byte stack alignment.  The x86-64 ABI
+    // requires RSP ≡ 0 mod 16 at the `call` instruction (so RSP ≡ 8
+    // mod 16 at function entry after the return address is pushed).
+    // Guest RSP can be arbitrarily aligned, so we must force it.
+    //
+    // `and rsp, -16` may move RSP down by up to 8 bytes, and `call`
+    // pushes another 8 bytes (return address).  To prevent clobbering
+    // the save area above, we first subtract 16 bytes as a safety gap
+    // (worst case: 8 bytes from `and` + 8 bytes from `call` = 16).
+    "sub rsp, 16",
+    "and rsp, -16",
     "call micro_handle_syscall",
     // RAX = syscall return value.
+    //
+    // Restore the exact pre-alignment RSP via RBP (callee-saved).
+    "mov rsp, rbp",
     //
     // Restore saved guest registers.  The C call may have clobbered all
     // caller-saved registers, but the real `syscall` instruction would
@@ -95,9 +139,12 @@ core::arch::global_asm!(
     "mov r10, [rsp+0x18]",
     "mov r8,  [rsp+0x20]",
     "mov r9,  [rsp+0x28]",
-    "add rsp, 104",       // deallocate save area + SyscallArgs
-    "add rsp, 128",       // restore red zone
-    "mov rcx, gs:[0x20]", // restore return addr
+    "add rsp, 104", // deallocate save area + SyscallArgs
+    //
+    // Restore return address and guest RBP from the stack.
+    "pop rcx",      // saved return address
+    "pop rbp",      // guest RBP
+    "add rsp, 128", // restore red zone
     "jmp rcx",
     //
     // ── rt_sigreturn fast path ────────────────────────────────────────
