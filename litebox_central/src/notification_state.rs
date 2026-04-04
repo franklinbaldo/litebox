@@ -171,6 +171,10 @@ impl ProcessNotificationState {
     /// Free a socket slot.
     #[allow(dead_code)] // Used when socket handlers are wired up (future task).
     pub fn free_socket_slot(&mut self, slot_index: u8) {
+        debug_assert!(
+            (slot_index as usize) < MAX_SOCKET_SLOTS,
+            "slot_index {slot_index} out of range (max {MAX_SOCKET_SLOTS})"
+        );
         self.socket_slot_bitset &= !(1u64 << slot_index);
     }
 }

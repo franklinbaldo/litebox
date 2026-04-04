@@ -70,6 +70,12 @@ pub const MAX_SOCKET_SLOTS: usize = 64;
 pub const SOCKET_DATA_REGION_SIZE: usize =
     SOCKET_ZONE_BASE_OFFSET + MAX_SOCKET_SLOTS * SOCKET_SLOT_SIZE;
 
+// Compile-time assertion: pipe zone must not overlap socket zone.
+const _: () = assert!(
+    PIPE_ZONE_BASE_OFFSET + MAX_PIPE_SLOTS * PIPE_SLOT_SIZE <= SOCKET_ZONE_BASE_OFFSET,
+    // Note: const assert messages require string literals in stable Rust.
+);
+
 /// Flags for submission queue entries.
 pub mod sq_flags {
     /// Batch this entry with the next one.
@@ -412,6 +418,15 @@ mod tests {
         assert!(
             end <= DEFAULT_DATA_REGION_SIZE,
             "socket zone end ({end}) exceeds data region size ({DEFAULT_DATA_REGION_SIZE})"
+        );
+    }
+
+    #[test]
+    fn pipe_and_socket_zones_do_not_overlap() {
+        let pipe_end = PIPE_ZONE_BASE_OFFSET + MAX_PIPE_SLOTS * PIPE_SLOT_SIZE;
+        assert!(
+            pipe_end <= SOCKET_ZONE_BASE_OFFSET,
+            "pipe zone end ({pipe_end}) overlaps socket zone start ({SOCKET_ZONE_BASE_OFFSET})"
         );
     }
 
