@@ -22,6 +22,14 @@ struct TcpWriter {
     stream: TcpStream,
 }
 
+impl Drop for TcpWriter {
+    fn drop(&mut self) {
+        // Shut down the write half so the reader (which holds a cloned handle)
+        // observes EOF instead of blocking forever.
+        let _ = self.stream.shutdown(std::net::Shutdown::Write);
+    }
+}
+
 /// Read half of a TCP transport for the 9P worker thread.
 struct TcpReader {
     stream: TcpStream,
