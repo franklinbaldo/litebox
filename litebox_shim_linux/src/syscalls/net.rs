@@ -750,6 +750,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         self.net.lock().listen(fd, backlog).map_err(Errno::from)
     }
 
+    #[allow(dead_code)]
     fn shutdown(&self, fd: &SocketFd, read: bool, write: bool) -> Result<(), Errno> {
         self.net
             .lock()
@@ -1386,6 +1387,7 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Handle syscall `shutdown`
+    #[allow(dead_code)]
     pub(crate) fn sys_shutdown(&self, sockfd: i32, how: i32) -> Result<(), Errno> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
@@ -1399,6 +1401,7 @@ impl<FS: ShimFS> Task<FS> {
         };
         self.do_shutdown(sockfd, read, write)
     }
+    #[allow(dead_code)]
     fn do_shutdown(&self, sockfd: u32, read: bool, write: bool) -> Result<(), Errno> {
         self.files.borrow().with_socket(
             &self.global,
@@ -1618,6 +1621,7 @@ impl<FS: ShimFS> Task<FS> {
     /// Returns the number of fds that were actually written to the control
     /// buffer. The caller must close any excess fds (matching Linux semantics
     /// where truncated SCM_RIGHTS fds are closed by the kernel).
+    #[allow(dead_code)]
     fn write_recvmsg_cmsg(
         &self,
         hdr: &mut litebox_common_linux::UserMsgHdr<Platform>,
@@ -1789,6 +1793,7 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Handle syscall `sendmmsg` — send multiple messages on a socket.
+    #[allow(dead_code)]
     pub(crate) fn sys_sendmmsg(
         &self,
         fd: i32,
@@ -1874,6 +1879,7 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Handle syscall `recvmsg`
+    #[allow(dead_code)]
     pub(crate) fn sys_recvmsg(
         &self,
         fd: i32,

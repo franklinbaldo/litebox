@@ -5,7 +5,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use alloc::sync::{Arc, Weak};
 use litebox::{
-    event::{Events, observer::Observer, polling::Pollee},
+    event::{observer::Observer, polling::Pollee, Events},
     platform::TimeProvider,
     sync::{Mutex, RawSyncPrimitivesProvider},
 };
@@ -20,6 +20,7 @@ macro_rules! common_functions_for_channel {
         }
 
         /// Shut this channel down.
+        #[allow(dead_code)]
         pub(crate) fn shutdown(&self) {
             self.endpoint.shutdown();
         }
@@ -54,6 +55,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> EndPointer<Platform,
         self.is_shutdown.load(Ordering::Acquire)
     }
 
+    #[allow(dead_code)]
     fn shutdown(&self) {
         self.is_shutdown.store(true, Ordering::Release);
     }

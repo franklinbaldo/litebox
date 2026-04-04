@@ -1346,6 +1346,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
     }
 
     /// Returns `true` if this is a connected stream socket.
+    #[allow(dead_code)]
     pub(super) fn is_connected(&self) -> bool {
         match &self.inner {
             UnixSocketInner::Stream(stream) => stream.with_state_ref(|s| s.connected().is_some()),
@@ -1353,6 +1354,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
         }
     }
 
+    #[allow(dead_code)]
     pub(super) fn has_timeouts(&self) -> bool {
         let opts = self.options.lock();
         opts.recv_timeout.is_some() || opts.send_timeout.is_some()
@@ -1432,6 +1434,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
     }
 
     /// Blocking write for worker-exec stdio bridging (no Task needed).
+    #[allow(dead_code)]
     pub(crate) fn send_bytes(
         &self,
         cx: &WaitContext<'_, crate::Platform>,
@@ -1493,6 +1496,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
     }
 
     /// Shutdown the read side, write side, or both of a Unix socket.
+    #[allow(dead_code)]
     pub(super) fn shutdown(&self, read: bool, write: bool) -> Result<(), Errno> {
         match &self.inner {
             UnixSocketInner::Stream(stream) => {
