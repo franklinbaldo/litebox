@@ -7,8 +7,8 @@
 //! forking micro.
 
 use litebox_ipc::ring::{
-    MAX_PIPE_SLOTS, MAX_SOCKET_SLOTS, MAX_THREADS, PIPE_SLOT_SIZE, PIPE_ZONE_BASE_OFFSET,
-    SOCKET_SLOT_SIZE, SOCKET_ZONE_BASE_OFFSET,
+    FILE_SLOT_SIZE, FILE_ZONE_BASE_OFFSET, MAX_FILE_SLOTS, MAX_PIPE_SLOTS, MAX_SOCKET_SLOTS,
+    MAX_THREADS, PIPE_SLOT_SIZE, PIPE_ZONE_BASE_OFFSET, SOCKET_SLOT_SIZE, SOCKET_ZONE_BASE_OFFSET,
 };
 
 /// A VMA change event recorded from a Tier 2 notification.
@@ -60,6 +60,16 @@ pub(crate) struct ShmemSocket {
     pub slot_index: u8,
 }
 
+/// Tracking info for a shmem-backed file fd.
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // Fields read when file I/O handlers are wired up (future task).
+pub(crate) struct ShmemFile {
+    /// Guest fd number.
+    pub fd: i32,
+    /// Slot index in the file zone (0..MAX_FILE_SLOTS).
+    pub slot_index: u8,
+}
+
 /// Per-process notification state.
 ///
 /// Updated by central's notification handler when it receives Tier 2
@@ -94,6 +104,12 @@ pub(crate) struct ProcessNotificationState {
 
     /// Active shmem-backed sockets.
     pub shmem_sockets: Vec<ShmemSocket>,
+
+    /// Shmem file slot allocation bitset. Bit N = 1 means slot N is in use.
+    pub file_slot_bitset: u64,
+
+    /// Active shmem-backed file fds.
+    pub shmem_files: Vec<ShmemFile>,
 }
 
 impl Default for ProcessNotificationState {
@@ -109,6 +125,8 @@ impl Default for ProcessNotificationState {
             shmem_pipes: Vec::new(),
             socket_slot_bitset: 0,
             shmem_sockets: Vec::new(),
+            file_slot_bitset: 0,
+            shmem_files: Vec::new(),
         }
     }
 }
@@ -172,6 +190,30 @@ impl ProcessNotificationState {
         );
         self.socket_slot_bitset &= !(1u64 << slot_index);
     }
+
+    /// Allocate a free file slot. Returns the slot index and data-region offset.
+    pub fn alloc_file_slot(&mut self) -> Option<(u8, u32)> {
+        if self.file_slot_bitset == u64::MAX {
+            return None;
+        }
+        let free_bit = self.file_slot_bitset.trailing_ones();
+        if free_bit as usize >= MAX_FILE_SLOTS {
+            return None;
+        }
+        self.file_slot_bitset |= 1u64 << free_bit;
+        let offset = FILE_ZONE_BASE_OFFSET + (free_bit as usize) * FILE_SLOT_SIZE;
+        #[allow(clippy::cast_possible_truncation)]
+        Some((free_bit as u8, offset as u32))
+    }
+
+    /// Free a file slot.
+    pub fn free_file_slot(&mut self, slot_index: u8) {
+        debug_assert!(
+            (slot_index as usize) < MAX_FILE_SLOTS,
+            "slot_index {slot_index} out of range (max {MAX_FILE_SLOTS})"
+        );
+        self.file_slot_bitset &= !(1u64 << slot_index);
+    }
 }
 
 #[cfg(test)]
@@ -234,5 +276,34 @@ mod tests {
             assert!(state.alloc_socket_slot().is_some());
         }
         assert!(state.alloc_socket_slot().is_none()); // full
+    }
+
+    #[test]
+    fn alloc_file_slot_returns_sequential_indices() {
+        let mut state = ProcessNotificationState::default();
+        let (idx0, off0) = state.alloc_file_slot().unwrap();
+        let (idx1, off1) = state.alloc_file_slot().unwrap();
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        assert_eq!(off0 as usize, FILE_ZONE_BASE_OFFSET);
+        assert_eq!(off1 as usize, FILE_ZONE_BASE_OFFSET + FILE_SLOT_SIZE);
+    }
+
+    #[test]
+    fn free_file_slot_allows_reuse() {
+        let mut state = ProcessNotificationState::default();
+        let (idx, _) = state.alloc_file_slot().unwrap();
+        state.free_file_slot(idx);
+        let (idx2, _) = state.alloc_file_slot().unwrap();
+        assert_eq!(idx, idx2); // reused
+    }
+
+    #[test]
+    fn alloc_file_slot_exhaustion() {
+        let mut state = ProcessNotificationState::default();
+        for _ in 0..MAX_FILE_SLOTS {
+            assert!(state.alloc_file_slot().is_some());
+        }
+        assert!(state.alloc_file_slot().is_none()); // full
     }
 }
