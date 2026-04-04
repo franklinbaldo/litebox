@@ -210,6 +210,7 @@ pub fn run_macho_dynamic(
     binary_data: &[u8],
     argv: &[&str],
     cache: &shared_cache::CollectedCache,
+    exe_name: &str,
 ) -> (i32, Vec<u8>) {
     use litebox::fs::{FileSystem as _, Mode, OFlags};
 
@@ -228,9 +229,10 @@ pub fn run_macho_dynamic(
         let _ = fs.mkdir("/usr/bin", mode);
 
         // Write the main binary into the in-mem FS so dyld can open it.
+        let exe_path = format!("/usr/bin/{exe_name}");
         let fd = fs
             .open(
-                "/usr/bin/hello_dynamic",
+                &exe_path,
                 OFlags::CREAT | OFlags::WRONLY,
                 mode,
             )
@@ -259,8 +261,9 @@ pub fn run_macho_dynamic(
     shim.install_shared_cache(0x180000000, &regions_for_shim, &[]);
 
     // Use absolute path for argv[0] so dyld can resolve executable_path.
+    let exe_path = format!("/usr/bin/{exe_name}");
     let mut argv_cstrings: Vec<std::ffi::CString> = Vec::with_capacity(argv.len());
-    argv_cstrings.push(std::ffi::CString::new("/usr/bin/hello_dynamic").unwrap());
+    argv_cstrings.push(std::ffi::CString::new(exe_path).unwrap());
     for s in &argv[1..] {
         argv_cstrings.push(std::ffi::CString::new(*s).unwrap());
     }
