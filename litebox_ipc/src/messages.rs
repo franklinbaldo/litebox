@@ -170,3 +170,21 @@ pub struct AcceptResponse {
 }
 
 const _: () = assert!(core::mem::size_of::<AcceptResponse>() == 32);
+
+/// Response payload for `SYS_open` / `SYS_openat` when a shmem file slot
+/// is allocated for the opened fd.
+///
+/// Central writes this to the data region at offset 0. Micro reads it to
+/// learn the shmem offset for the new fd's ring buffers.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct OpenResponse {
+    /// The fd number returned by open/openat.
+    pub fd: i32,
+    /// Offset within the data region to the file slot header (reuses
+    /// `ShmemSocketHeader` layout). Zero means no shmem slot was allocated
+    /// (fd is not a regular file or slots are exhausted).
+    pub file_slot_offset: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<OpenResponse>() == 8);

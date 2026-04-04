@@ -21,12 +21,12 @@ pub const RING_MASK: usize = 255;
 /// Maximum number of guest threads that can be multiplexed.
 pub const MAX_THREADS: usize = 64;
 
-/// Default size of the shared data region (~40 MiB).
+/// Default size of the shared data region (~73 MiB).
 ///
 /// Must be large enough to hold the biggest mmap segment from an ELF
 /// binary plus the trampoline descriptor and code that follow it,
-/// as well as the pipe zone and socket zone.
-pub const DEFAULT_DATA_REGION_SIZE: usize = SOCKET_DATA_REGION_SIZE;
+/// as well as the pipe zone, socket zone, and file zone.
+pub const DEFAULT_DATA_REGION_SIZE: usize = FILE_DATA_REGION_SIZE;
 
 /// Base offset within the data region where pipe ring buffers start.
 ///
@@ -70,11 +70,30 @@ pub const MAX_SOCKET_SLOTS: usize = 64;
 pub const SOCKET_DATA_REGION_SIZE: usize =
     SOCKET_ZONE_BASE_OFFSET + MAX_SOCKET_SLOTS * SOCKET_SLOT_SIZE;
 
+/// Base offset within the data region where file I/O ring buffers start.
+/// Placed after the socket zone.
+pub const FILE_ZONE_BASE_OFFSET: usize =
+    SOCKET_ZONE_BASE_OFFSET + MAX_SOCKET_SLOTS * SOCKET_SLOT_SIZE;
+
+/// Maximum number of concurrent file shmem slots.
+/// Reuses the same slot size as sockets (~512 KiB per slot).
+pub const MAX_FILE_SLOTS: usize = 64;
+
+/// Size of each file slot (same as socket: header + RX + TX rings).
+pub const FILE_SLOT_SIZE: usize = SOCKET_SLOT_SIZE;
+
+/// Total data region size including file zone.
+pub const FILE_DATA_REGION_SIZE: usize = FILE_ZONE_BASE_OFFSET + MAX_FILE_SLOTS * FILE_SLOT_SIZE;
+
 // Compile-time assertion: pipe zone must not overlap socket zone.
 const _: () = assert!(
     PIPE_ZONE_BASE_OFFSET + MAX_PIPE_SLOTS * PIPE_SLOT_SIZE <= SOCKET_ZONE_BASE_OFFSET,
     // Note: const assert messages require string literals in stable Rust.
 );
+
+// Compile-time assertion: socket zone must not overlap file zone.
+const _: () =
+    assert!(SOCKET_ZONE_BASE_OFFSET + MAX_SOCKET_SLOTS * SOCKET_SLOT_SIZE <= FILE_ZONE_BASE_OFFSET);
 
 /// Flags for submission queue entries.
 pub mod sq_flags {
@@ -427,6 +446,24 @@ mod tests {
         assert!(
             pipe_end <= SOCKET_ZONE_BASE_OFFSET,
             "pipe zone end ({pipe_end}) overlaps socket zone start ({SOCKET_ZONE_BASE_OFFSET})"
+        );
+    }
+
+    #[test]
+    fn file_zone_fits_in_default_data_region() {
+        let end = FILE_ZONE_BASE_OFFSET + MAX_FILE_SLOTS * FILE_SLOT_SIZE;
+        assert!(
+            end <= DEFAULT_DATA_REGION_SIZE,
+            "file zone end ({end}) exceeds data region size ({DEFAULT_DATA_REGION_SIZE})"
+        );
+    }
+
+    #[test]
+    fn socket_and_file_zones_do_not_overlap() {
+        let socket_end = SOCKET_ZONE_BASE_OFFSET + MAX_SOCKET_SLOTS * SOCKET_SLOT_SIZE;
+        assert!(
+            socket_end <= FILE_ZONE_BASE_OFFSET,
+            "socket zone end ({socket_end}) overlaps file zone start ({FILE_ZONE_BASE_OFFSET})"
         );
     }
 
