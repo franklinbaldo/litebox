@@ -42,6 +42,7 @@ pub enum Errno {
     EDOM = 33,
     ERANGE = 34,
     EAGAIN = 35,
+    ENOTEMPTY = 66,
     ENOSYS = 78,
     ENOTSUP = 45,
 }

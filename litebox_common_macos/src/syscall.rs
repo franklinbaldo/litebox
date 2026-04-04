@@ -57,6 +57,15 @@ pub mod nr {
     pub const BSDTHREAD_REGISTER: usize = 366;
     pub const BSDTHREAD_CTL: usize = 478;
     pub const SIGRETURN: usize = 184;
+    pub const UNLINK: usize = 10;
+    pub const ACCESS: usize = 33;
+    pub const PIPE: usize = 42;
+    pub const FCHMOD: usize = 124;
+    pub const MKDIR: usize = 136;
+    pub const RMDIR: usize = 137;
+    pub const FTRUNCATE: usize = 201;
+    pub const SEMWAIT_SIGNAL: usize = 334;
+    pub const GETDIRENTRIES64: usize = 344;
 }
 
 /// Mach trap numbers (negative x16 values, stored as positive constants).
