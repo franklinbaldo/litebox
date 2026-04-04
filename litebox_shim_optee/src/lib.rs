@@ -52,7 +52,7 @@ pub struct OpteeShimEntrypoints {
 }
 
 impl litebox::shim::EnterShim for OpteeShimEntrypoints {
-    type ExecutionContext = litebox_common_linux::PtRegs;
+    type ExecutionContext = litebox_common_linux::ExecutionContext;
 
     fn init(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
         self.enter_shim(true, ctx, Task::handle_init_request)
@@ -104,10 +104,10 @@ impl OpteeShimEntrypoints {
     fn enter_shim(
         &self,
         _is_init: bool,
-        ctx: &mut litebox_common_linux::PtRegs,
+        ctx: &mut litebox_common_linux::ExecutionContext,
         f: impl FnOnce(&Task, &mut litebox_common_linux::PtRegs) -> ContinueOperation,
     ) -> ContinueOperation {
-        f(&self.task, ctx)
+        f(&self.task, &mut *ctx)
     }
 }
 

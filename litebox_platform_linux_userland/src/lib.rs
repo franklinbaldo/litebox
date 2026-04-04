@@ -3808,12 +3808,12 @@ fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
 /// and optionally sets `interrupt`. If `in_guest` was previously set, returns
 /// the guest context pointer (which does not necessarily have up-to-date guest
 /// register state yet).
-#[cfg(target_arch = "x86_64")]
 struct SignalGuestState {
     regs: *mut litebox_common_linux::PtRegs,
     kernel_mode: bool,
 }
 
+#[cfg(target_arch = "x86_64")]
 fn signal_handler_exit_guest(
     _context: &libc::ucontext_t,
     set_interrupt: bool,

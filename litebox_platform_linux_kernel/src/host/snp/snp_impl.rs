@@ -131,14 +131,17 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for SnpLinuxKernel {
 core::arch::global_asm!(include_str!("entry.S"));
 
 struct ThreadStartArgs {
-    ctx: litebox_common_linux::PtRegs,
-    init_thread:
-        Box<dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>>,
+    ctx: litebox_common_linux::ExecutionContext,
+    init_thread: Box<
+        dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::ExecutionContext>,
+    >,
 }
 
 struct ThreadState {
     shim: OnceCell<
-        Box<dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>>,
+        Box<
+            dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::ExecutionContext>,
+        >,
     >,
     shim_tls: Cell<*mut ()>,
 }
@@ -154,7 +157,7 @@ extern "C" fn thread_start(
 ) -> ! {
     ACTIVE_THREAD_COUNT.fetch_add(1, Ordering::Relaxed);
 
-    *regs = thread_start_args.ctx;
+    *regs = thread_start_args.ctx.regs;
 
     // Set up thread-local storage for the new thread. This is done by
     // calling the actual thread callback with the unpacked arguments
@@ -186,7 +189,9 @@ fn get_tls() -> *const ThreadState {
 ///
 /// The context must be valid guest context.
 pub unsafe fn run_thread(
-    shim: Box<dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>>,
+    shim: Box<
+        dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::ExecutionContext>,
+    >,
     regs: &mut litebox_common_linux::PtRegs,
 ) -> ! {
     let tls = unsafe { &*get_tls() };
@@ -196,8 +201,15 @@ pub unsafe fn run_thread(
         .expect("thread shim should not be initialized twice");
 
     let shim = tls.shim.get().unwrap().as_ref();
-    match shim.init(regs) {
-        litebox::shim::ContinueOperation::Resume => unsafe { crate::switch_to_guest(regs) },
+    let mut ctx = litebox_common_linux::ExecutionContext {
+        regs: regs.clone(),
+        fp_regs: litebox_common_linux::FpRegs::default(),
+    };
+    match shim.init(&mut ctx) {
+        litebox::shim::ContinueOperation::Resume => {
+            *regs = ctx.regs;
+            unsafe { crate::switch_to_guest(regs) }
+        }
         litebox::shim::ContinueOperation::Terminate => exit_thread(),
     }
 }
@@ -224,14 +236,21 @@ fn exit_thread() -> ! {
 /// Panics if the thread shim has not been initialized with [`run_thread`].
 pub fn handle_syscall(pt_regs: &mut litebox_common_linux::PtRegs) -> ! {
     let tls = unsafe { &*get_tls() };
-    match tls.shim.get().unwrap().syscall(pt_regs) {
-        litebox::shim::ContinueOperation::Resume => unsafe { crate::switch_to_guest(pt_regs) },
+    let mut ctx = litebox_common_linux::ExecutionContext {
+        regs: pt_regs.clone(),
+        fp_regs: litebox_common_linux::FpRegs::default(),
+    };
+    match tls.shim.get().unwrap().syscall(&mut ctx) {
+        litebox::shim::ContinueOperation::Resume => {
+            *pt_regs = ctx.regs;
+            unsafe { crate::switch_to_guest(pt_regs) }
+        }
         litebox::shim::ContinueOperation::Terminate => exit_thread(),
     }
 }
 
 impl litebox::platform::ThreadProvider for SnpLinuxKernel {
-    type ExecutionContext = litebox_common_linux::PtRegs;
+    type ExecutionContext = litebox_common_linux::ExecutionContext;
     type ThreadSpawnError = litebox_common_linux::errno::Errno;
     type ThreadHandle = u32;
 
@@ -239,7 +258,7 @@ impl litebox::platform::ThreadProvider for SnpLinuxKernel {
         &self,
         ctx: &Self::ExecutionContext,
         init_thread: Box<
-            dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>,
+            dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::ExecutionContext>,
         >,
     ) -> Result<(), Self::ThreadSpawnError> {
         let flags = CloneFlags::THREAD

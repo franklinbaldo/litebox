@@ -387,21 +387,21 @@ fn ensure_tls_index() {
 /// # Safety
 /// The context must be valid guest context.
 pub unsafe fn run_thread(
-    shim: impl litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
-    ctx: &mut litebox_common_linux::PtRegs,
+    shim: impl litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::ExecutionContext>,
+    ctx: &mut litebox_common_linux::ExecutionContext,
 ) {
     ensure_tls_index();
     run_thread_inner(&shim, ctx);
 }
 
 fn run_thread_inner(
-    shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
-    ctx: &mut litebox_common_linux::PtRegs,
+    shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::ExecutionContext>,
+    ctx: &mut litebox_common_linux::ExecutionContext,
 ) {
     let tls_state = TlsState::new();
     tls_state
         .guest_context_top
-        .set(std::ptr::from_mut(ctx).wrapping_add(1));
+        .set(std::ptr::from_mut(&mut ctx.regs).wrapping_add(1));
 
     let mut thread_ctx = ThreadContext {
         shim,
@@ -789,9 +789,9 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
 
 fn thread_start(
     init_thread: Box<
-        dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>,
+        dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::ExecutionContext>,
     >,
-    mut ctx: litebox_common_linux::PtRegs,
+    mut ctx: litebox_common_linux::ExecutionContext,
 ) {
     // Allow caller to run some code before we return to the new thread.
     let shim = init_thread.init();
@@ -800,15 +800,15 @@ fn thread_start(
 }
 
 impl litebox::platform::ThreadProvider for WindowsUserland {
-    type ExecutionContext = litebox_common_linux::PtRegs;
+    type ExecutionContext = litebox_common_linux::ExecutionContext;
     type ThreadSpawnError = std::io::Error;
     type ThreadHandle = ThreadHandle;
 
     unsafe fn spawn_thread(
         &self,
-        ctx: &litebox_common_linux::PtRegs,
+        ctx: &litebox_common_linux::ExecutionContext,
         init_thread: Box<
-            dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>,
+            dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::ExecutionContext>,
         >,
     ) -> Result<(), Self::ThreadSpawnError> {
         let ctx = ctx.clone();
@@ -2030,8 +2030,8 @@ unsafe extern "C-unwind" fn interrupt_handler(thread_ctx: &mut ThreadContext<'_>
 }
 
 struct ThreadContext<'a> {
-    shim: &'a dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
-    ctx: &'a mut litebox_common_linux::PtRegs,
+    shim: &'a dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::ExecutionContext>,
+    ctx: &'a mut litebox_common_linux::ExecutionContext,
     tls: &'a TlsState,
 }
 
@@ -2040,8 +2040,8 @@ impl ThreadContext<'_> {
     fn call_shim(
         &mut self,
         f: impl FnOnce(
-            &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
-            &mut litebox_common_linux::PtRegs,
+            &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::ExecutionContext>,
+            &mut litebox_common_linux::ExecutionContext,
             bool,
         ) -> ContinueOperation,
     ) {
@@ -2050,7 +2050,7 @@ impl ThreadContext<'_> {
         // before returning.
         let op = f(self.shim, self.ctx, self.tls.interrupt.replace(false));
         match op {
-            ContinueOperation::Resume => unsafe { switch_to_guest(self.ctx) },
+            ContinueOperation::Resume => unsafe { switch_to_guest(&self.ctx.regs) },
             ContinueOperation::Terminate => {}
         }
     }
