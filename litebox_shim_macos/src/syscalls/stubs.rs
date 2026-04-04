@@ -452,4 +452,28 @@ impl<FS: ShimFS> Task<FS> {
             }
         }
     }
+
+    /// Handle `__semwait_signal(cond_sem, mutex_sem, timeout, relative, tv_sec, tv_nsec)`.
+    ///
+    /// Used by `usleep()` in libSystem. If `timeout` is non-zero, sleeps for the
+    /// requested duration. Otherwise returns immediately.
+    #[allow(clippy::unnecessary_wraps)]
+    pub(crate) fn sys_semwait_signal(
+        &self,
+        _cond_sem: i32,
+        _mutex_sem: i32,
+        timeout: i32,
+        _relative: i32,
+        tv_sec: i64,
+        tv_nsec: i32,
+    ) -> Result<usize, Errno> {
+        if timeout != 0 && (tv_sec > 0 || tv_nsec > 0) {
+            let duration = core::time::Duration::new(tv_sec as u64, tv_nsec as u32);
+            // Use the wait state to perform an interruptible sleep.
+            // If the process is exiting, this will return early.
+            let cx = self.wait_cx().with_timeout(duration);
+            let _ = cx.sleep(); // returns WaitError::TimedOut or Interrupted
+        }
+        Ok(0)
+    }
 }

@@ -194,11 +194,14 @@ impl<FS: ShimFS> Task<FS> {
                 bufsize,
                 basep,
             } => self.sys_getdirentries64(fd, buf, bufsize, basep),
-            // Stubbed syscalls for future tasks:
-            MacosSyscallRequest::SemwaitSignal { .. } => {
-                log_unsupported!("unimplemented syscall");
-                Err(Errno::ENOSYS)
-            }
+            MacosSyscallRequest::SemwaitSignal {
+                cond_sem,
+                mutex_sem,
+                timeout,
+                relative,
+                tv_sec,
+                tv_nsec,
+            } => self.sys_semwait_signal(cond_sem, mutex_sem, timeout, relative, tv_sec, tv_nsec),
         }
     }
 }
