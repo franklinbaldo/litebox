@@ -182,14 +182,14 @@ impl<FS: ShimFS> Task<FS> {
             MacosSyscallRequest::Pipe => {
                 unreachable!("Pipe is handled in handle_syscall_request before do_syscall")
             }
-            // Stubbed syscalls for future pipe/fs tasks:
-            MacosSyscallRequest::Unlink { .. }
-            | MacosSyscallRequest::Access { .. }
-            | MacosSyscallRequest::Fchmod { .. }
-            | MacosSyscallRequest::Mkdir { .. }
-            | MacosSyscallRequest::Rmdir { .. }
-            | MacosSyscallRequest::Ftruncate { .. }
-            | MacosSyscallRequest::SemwaitSignal { .. }
+            MacosSyscallRequest::Unlink { path } => self.sys_unlink(path),
+            MacosSyscallRequest::Access { path, amode } => self.sys_access(path, amode),
+            MacosSyscallRequest::Fchmod { fd, mode } => self.sys_fchmod(fd, mode),
+            MacosSyscallRequest::Mkdir { path, mode } => self.sys_mkdir(path, mode),
+            MacosSyscallRequest::Rmdir { path } => self.sys_rmdir(path),
+            MacosSyscallRequest::Ftruncate { fd, length } => self.sys_ftruncate(fd, length),
+            // Stubbed syscalls for future tasks:
+            MacosSyscallRequest::SemwaitSignal { .. }
             | MacosSyscallRequest::Getdirentries64 { .. } => {
                 log_unsupported!("unimplemented syscall");
                 Err(Errno::ENOSYS)

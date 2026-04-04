@@ -612,4 +612,143 @@ impl<FS: ShimFS> Task<FS> {
         log_unsupported!("fstatat64: unsupported dirfd={dirfd}");
         Err(Errno::ENOSYS)
     }
+
+    /// Handle `unlink(path)`.
+    pub(crate) fn sys_unlink(&self, path_addr: usize) -> Result<usize, Errno> {
+        let path_ptr: ConstPtr<u8> = ConstPtr::from_usize(path_addr);
+        let path = read_cstring_from_guest(path_ptr, 4096).ok_or(Errno::EFAULT)?;
+        log_unsupported!("unlink({path:?})");
+
+        let cpath = alloc::ffi::CString::new(path.as_bytes()).map_err(|_| Errno::EINVAL)?;
+        self.global.fs.unlink(&cpath).map_err(|e| match e {
+            litebox::fs::errors::UnlinkError::PathError(ref pe) => {
+                use litebox::fs::errors::PathError;
+                match pe {
+                    PathError::NoSuchFileOrDirectory => Errno::ENOENT,
+                    PathError::ComponentNotADirectory => Errno::ENOTDIR,
+                    _ => Errno::EINVAL,
+                }
+            }
+            litebox::fs::errors::UnlinkError::IsADirectory => Errno::EPERM,
+            litebox::fs::errors::UnlinkError::NoWritePerms => Errno::EACCES,
+            litebox::fs::errors::UnlinkError::ReadOnlyFileSystem => Errno::EROFS,
+            _ => Errno::EIO,
+        })?;
+        Ok(0)
+    }
+
+    /// Handle `mkdir(path, mode)`.
+    pub(crate) fn sys_mkdir(&self, path_addr: usize, mode: u32) -> Result<usize, Errno> {
+        let path_ptr: ConstPtr<u8> = ConstPtr::from_usize(path_addr);
+        let path = read_cstring_from_guest(path_ptr, 4096).ok_or(Errno::EFAULT)?;
+        log_unsupported!("mkdir({path:?}, mode={mode:#o})");
+
+        let cpath = alloc::ffi::CString::new(path.as_bytes()).map_err(|_| Errno::EINVAL)?;
+        let fs_mode = litebox::fs::Mode::from_bits_truncate(mode);
+        self.global.fs.mkdir(&cpath, fs_mode).map_err(|e| match e {
+            litebox::fs::errors::MkdirError::PathError(ref pe) => {
+                use litebox::fs::errors::PathError;
+                match pe {
+                    PathError::NoSuchFileOrDirectory => Errno::ENOENT,
+                    PathError::ComponentNotADirectory => Errno::ENOTDIR,
+                    _ => Errno::EINVAL,
+                }
+            }
+            litebox::fs::errors::MkdirError::AlreadyExists => Errno::EEXIST,
+            litebox::fs::errors::MkdirError::NoWritePerms => Errno::EACCES,
+            litebox::fs::errors::MkdirError::ReadOnlyFileSystem => Errno::EROFS,
+            _ => Errno::EIO,
+        })?;
+        Ok(0)
+    }
+
+    /// Handle `rmdir(path)`.
+    pub(crate) fn sys_rmdir(&self, path_addr: usize) -> Result<usize, Errno> {
+        let path_ptr: ConstPtr<u8> = ConstPtr::from_usize(path_addr);
+        let path = read_cstring_from_guest(path_ptr, 4096).ok_or(Errno::EFAULT)?;
+        log_unsupported!("rmdir({path:?})");
+
+        let cpath = alloc::ffi::CString::new(path.as_bytes()).map_err(|_| Errno::EINVAL)?;
+        self.global.fs.rmdir(&cpath).map_err(|e| match e {
+            litebox::fs::errors::RmdirError::PathError(ref pe) => {
+                use litebox::fs::errors::PathError;
+                match pe {
+                    PathError::NoSuchFileOrDirectory => Errno::ENOENT,
+                    PathError::ComponentNotADirectory => Errno::ENOTDIR,
+                    _ => Errno::EINVAL,
+                }
+            }
+            litebox::fs::errors::RmdirError::NotEmpty => Errno::ENOTEMPTY,
+            litebox::fs::errors::RmdirError::NotADirectory => Errno::ENOTDIR,
+            litebox::fs::errors::RmdirError::NoWritePerms => Errno::EACCES,
+            litebox::fs::errors::RmdirError::Busy => Errno::EBUSY,
+            litebox::fs::errors::RmdirError::ReadOnlyFileSystem => Errno::EROFS,
+            _ => Errno::EIO,
+        })?;
+        Ok(0)
+    }
+
+    /// Handle `access(path, amode)` — check file accessibility.
+    ///
+    /// Stub: F_OK checks existence via `file_status()`, R_OK/W_OK/X_OK always succeed.
+    pub(crate) fn sys_access(&self, path_addr: usize, amode: i32) -> Result<usize, Errno> {
+        let path_ptr: ConstPtr<u8> = ConstPtr::from_usize(path_addr);
+        let path = read_cstring_from_guest(path_ptr, 4096).ok_or(Errno::EFAULT)?;
+        log_unsupported!("access({path:?}, amode={amode})");
+
+        let cpath = alloc::ffi::CString::new(path.as_bytes()).map_err(|_| Errno::EINVAL)?;
+        // F_OK (0) or any mode — just check existence.
+        self.global
+            .fs
+            .file_status(&cpath)
+            .map_err(|e| match e {
+                litebox::fs::errors::FileStatusError::PathError(ref pe) => {
+                    use litebox::fs::errors::PathError;
+                    match pe {
+                        PathError::NoSuchFileOrDirectory => Errno::ENOENT,
+                        PathError::ComponentNotADirectory => Errno::ENOTDIR,
+                        _ => Errno::EINVAL,
+                    }
+                }
+                _ => Errno::EIO,
+            })?;
+        // R_OK/W_OK/X_OK: always succeed in sandbox.
+        Ok(0)
+    }
+
+    /// Handle `fchmod(fd, mode)` — stub: return success.
+    ///
+    /// Permissions are not enforced in the sandbox, so this is a no-op.
+    #[allow(clippy::unnecessary_wraps)]
+    pub(crate) fn sys_fchmod(&self, fd: i32, mode: u32) -> Result<usize, Errno> {
+        log_unsupported!("fchmod(fd={fd}, mode={mode:#o}) → stub Ok(0)");
+        // Validate fd exists
+        let raw_fd = fd_to_usize(fd)?;
+        let rds = self.global.raw_descriptors.read();
+        crate::StrongFd::<FS>::from_raw(&rds, raw_fd)?;
+        Ok(0)
+    }
+
+    /// Handle `ftruncate(fd, length)`.
+    pub(crate) fn sys_ftruncate(&self, fd: i32, length: i64) -> Result<usize, Errno> {
+        let raw_fd = fd_to_usize(fd)?;
+        let typed_fd = {
+            let rds = self.global.raw_descriptors.read();
+            rds.fd_from_raw_integer::<FS>(raw_fd)
+                .map_err(|_| Errno::EBADF)?
+        };
+
+        let len = usize::try_from(length).map_err(|_| Errno::EINVAL)?;
+        self.global
+            .fs
+            .truncate(&typed_fd, len, false)
+            .map_err(|e| match e {
+                litebox::fs::errors::TruncateError::ClosedFd => Errno::EBADF,
+                litebox::fs::errors::TruncateError::IsDirectory => Errno::EINVAL,
+                litebox::fs::errors::TruncateError::NotForWriting => Errno::EINVAL,
+                litebox::fs::errors::TruncateError::IsTerminalDevice => Errno::EINVAL,
+                litebox::fs::errors::TruncateError::Io => Errno::EIO,
+            })?;
+        Ok(0)
+    }
 }
