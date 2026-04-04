@@ -95,7 +95,6 @@ const SEGV_MAPERR: i32 = 1;
 ///
 /// Most signals have the same number on both platforms. The notable
 /// exception is SIGBUS (Linux 7 → macOS 10).
-#[allow(dead_code)]
 pub(crate) fn linux_to_macos_signal(linux_sig: i32) -> i32 {
     match linux_sig {
         7 => 10,        // Linux SIGBUS=7 → macOS SIGBUS=10
@@ -223,7 +222,7 @@ impl<FS: ShimFS> Task<FS> {
     ///   siginfo_t    (104 bytes)   ← at new_sp + 0
     /// [new SP, 16-byte aligned]
     /// ```
-    #[allow(dead_code, clippy::cast_possible_wrap)]
+    #[allow(clippy::cast_possible_wrap)]
     pub(crate) fn deliver_signal(
         &self,
         ctx: &mut PtRegs,

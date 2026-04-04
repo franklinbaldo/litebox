@@ -83,10 +83,6 @@ enum ThreadInitState {
 
 /// Per-signal handler registration (matches macOS kernel-facing struct __sigaction layout).
 #[derive(Clone, Copy, Default)]
-#[allow(
-    dead_code,
-    reason = "fields used by sigaction/sigreturn syscalls in future tasks"
-)]
 struct SignalHandler {
     /// Signal handler address, or SIG_DFL(0)/SIG_IGN(1).
     handler: u64,
@@ -710,26 +706,56 @@ impl<FS: ShimFS> litebox::shim::EnterShim for MacosShimEntrypoints<FS> {
         ctx: &mut Self::ExecutionContext,
         info: &litebox::shim::ExceptionInfo,
     ) -> ContinueOperation {
-        // Log the exception to understand what went wrong.
-        log_unsupported!(
-            "EXCEPTION at pc={:#x} sp={:#x} info={:?}",
-            ctx.pc,
-            ctx.sp,
-            info
-        );
-        // Also log x0-x3 and x16 for context
-        log_unsupported!(
-            "  x0={:#x} x1={:#x} x2={:#x} x3={:#x} x16={:#x}",
-            ctx.regs[0],
-            ctx.regs[1],
-            ctx.regs[2],
-            ctx.regs[3],
-            ctx.regs[16]
-        );
-        // Signal process termination so wait() won't spin forever.
-        self.task.process.group_exit.store(true, Ordering::Release);
-        self.task.terminated.store(true, Ordering::Release);
-        ContinueOperation::Terminate
+        // The platform passes the Linux signal number in info.esr.
+        // Convert to macOS signal number for the guest.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let macos_signum = syscalls::signal::linux_to_macos_signal(info.esr as i32);
+
+        // Look up the handler for this signal.
+        let handler = {
+            let handlers = self.task.process.signal_handlers.lock();
+            #[allow(clippy::cast_sign_loss)]
+            handlers[macos_signum as usize]
+        };
+
+        match handler.handler {
+            0 => {
+                // SIG_DFL: terminate (default behavior for SIGSEGV, SIGBUS, etc.)
+                log_unsupported!(
+                    "EXCEPTION at pc={:#x} sp={:#x} signal={} (SIG_DFL → terminate)",
+                    ctx.pc,
+                    ctx.sp,
+                    macos_signum
+                );
+                log_unsupported!(
+                    "  x0={:#x} x1={:#x} x2={:#x} x3={:#x} x16={:#x} fault_addr={:#x}",
+                    ctx.regs[0],
+                    ctx.regs[1],
+                    ctx.regs[2],
+                    ctx.regs[3],
+                    ctx.regs[16],
+                    info.fault_address
+                );
+                self.task.process.group_exit.store(true, Ordering::Release);
+                self.task.terminated.store(true, Ordering::Release);
+                ContinueOperation::Terminate
+            }
+            1 => {
+                // SIG_IGN: ignore and resume.
+                log_unsupported!(
+                    "EXCEPTION at pc={:#x} signal={} (SIG_IGN → ignore)",
+                    ctx.pc,
+                    macos_signum
+                );
+                ContinueOperation::Resume
+            }
+            _ => {
+                // User handler: deliver signal via XNU signal frame.
+                self.task
+                    .deliver_signal(ctx, macos_signum, info.fault_address, &handler);
+                ContinueOperation::Resume
+            }
+        }
     }
 
     fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
@@ -815,10 +841,6 @@ struct Task<FS: ShimFS> {
     /// Initialization state for this thread (set before first entry).
     init_state: litebox::sync::Mutex<Platform, ThreadInitState>,
     /// Per-thread blocked signal mask (macOS 32-bit sigset_t).
-    #[allow(
-        dead_code,
-        reason = "used by sigprocmask/signal delivery in future tasks"
-    )]
     blocked_signals: AtomicU32,
 }
 
