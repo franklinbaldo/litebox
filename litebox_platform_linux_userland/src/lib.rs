@@ -797,7 +797,7 @@ impl LinuxUserland {
             path,
             rdev: stat_buf.st_rdev,
             dev: stat_buf.st_dev,
-            ino: stat_buf.st_ino as u64,
+            ino: u64::from(stat_buf.st_ino),
         })
     }
 

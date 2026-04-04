@@ -89,7 +89,7 @@ impl TestLauncher {
         unsafe {
             litebox_platform_windows_userland::run_thread(
                 program.entrypoints,
-                &mut litebox_common_linux::PtRegs::default(),
+                &mut litebox_common_linux::ExecutionContext::default(),
             );
         }
         assert_eq!(program.process.wait(), 0);
