@@ -503,6 +503,10 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
     /// This lets callers publish child-exit side effects (for example queueing
     /// `SIGCHLD`) before a waiting parent resumes from `wait4`.
     ///
+    /// **Note:** `before_notify` is invoked while the process-table write lock
+    /// is held.  The callback must not attempt to re-acquire this lock (e.g.
+    /// by calling other `ProcessRegistry` methods that read/write the table).
+    ///
     /// # Panics
     ///
     /// Panics if `id` does not exist in the process table.
@@ -606,9 +610,13 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
             } else {
                 None
             };
-        }
 
-        before_notify(exit_notification);
+            // Run the callback while the table lock is still held so that
+            // waiters in `wait_for_child_inner` cannot observe the zombie
+            // state until the callback has finished.  This guarantees the
+            // "before parent waiters are woken" contract.
+            before_notify(exit_notification);
+        }
 
         exit_subject.notify_observers(Events::IN | Events::HUP);
 
