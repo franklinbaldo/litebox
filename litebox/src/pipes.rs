@@ -390,7 +390,7 @@ struct WriteEnd<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
     /// Number of open file descriptors referencing this write end.
     /// Starts at 1 when created, incremented by fork, decremented by close.
     /// When this reaches 0, the write end is shut down and the read peer
-    /// receives HUP — even if the Arc<WriteEnd> itself hasn't been dropped yet.
+    /// receives HUP — even if the `Arc<WriteEnd>` itself hasn't been dropped yet.
     fd_ref_count: AtomicUsize,
 }
 

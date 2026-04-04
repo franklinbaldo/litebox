@@ -215,41 +215,6 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         None
     }
 
-    /// Get stored PTY termios for a file descriptor.
-    ///
-    /// Returns `Some(termios)` if the fd refers to a PTY device, `None` otherwise.
-    #[expect(unused_variables, reason = "default body, non-underscored param names")]
-    fn get_pty_termios(&self, fd: &TypedFd<Self>) -> Option<devices::PtyTermios> {
-        None
-    }
-
-    /// Set stored PTY termios for a file descriptor.
-    ///
-    /// Returns `true` if the fd refers to a PTY device and the termios was updated,
-    /// `false` otherwise.
-    #[expect(unused_variables, reason = "default body, non-underscored param names")]
-    fn set_pty_termios(&self, fd: &TypedFd<Self>, termios: devices::PtyTermios) -> bool {
-        false
-    }
-
-    /// Get the foreground process group for a PTY file descriptor.
-    ///
-    /// Returns `Some(pgrp)` if the fd refers to a PTY device, `None` otherwise.
-    /// A value of `0` means no foreground pgrp has been set yet.
-    #[expect(unused_variables, reason = "default body, non-underscored param names")]
-    fn get_pty_foreground_pgrp(&self, fd: &TypedFd<Self>) -> Option<i32> {
-        None
-    }
-
-    /// Set the foreground process group for a PTY file descriptor.
-    ///
-    /// Returns `true` if the fd refers to a PTY device and the pgrp was updated,
-    /// `false` otherwise.
-    #[expect(unused_variables, reason = "default body, non-underscored param names")]
-    fn set_pty_foreground_pgrp(&self, fd: &TypedFd<Self>, pgrp: i32) -> bool {
-        false
-    }
-
     /// Read the target of a symbolic link.
     ///
     /// Returns the link target as a string. The default implementation returns
