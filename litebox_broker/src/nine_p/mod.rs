@@ -7,12 +7,9 @@
 //! needed by the broker's 9P server. It is adapted from the guest-side
 //! implementation in `litebox/src/fs/nine_p/`.
 
-// The server (added in a subsequent PR) is the primary consumer of these types.
-#[allow(dead_code)]
 pub mod fcall;
-#[allow(dead_code)]
 pub mod fs_compat;
-#[allow(dead_code)]
+pub mod server;
 pub mod transport;
 
 /// Error type for 9P operations
