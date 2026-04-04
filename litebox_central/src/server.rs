@@ -510,9 +510,92 @@ impl<FS: ShimFS> ProcessServer<FS> {
         ) {
             let mut regs = crate::dispatch::sq_entry_to_ptregs(entry);
             let shim_result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+            #[allow(clippy::cast_sign_loss)]
             if shim_result >= 0 {
                 // Shim handled it (virtual fd) — return result directly.
                 cq.result = shim_result;
+
+                // For dup/dup2/dup3 (not fcntl), allocate a shmem file slot
+                // for the new fd if the source fd has one.
+                if matches!(
+                    i64::from(nr),
+                    libc::SYS_dup | libc::SYS_dup2 | libc::SYS_dup3
+                ) {
+                    let new_fd = shim_result as i32;
+                    let source_fd = entry.args[0] as i32;
+
+                    // For dup2/dup3, clean up the target fd's old shmem slot
+                    // (if any) before allocating a new one.  Must happen before
+                    // borrowing notification_state since it borrows internally.
+                    if matches!(
+                        i64::from(nr),
+                        libc::SYS_dup2 | libc::SYS_dup3
+                    ) {
+                        self.maybe_close_shmem_file(new_fd);
+                    }
+
+                    // Check if source fd has a shmem file slot.
+                    let source_has_slot = self
+                        .notification_state
+                        .borrow()
+                        .shmem_files
+                        .iter()
+                        .any(|f| f.fd == source_fd);
+
+                    if source_has_slot {
+                        let mut ns = self.notification_state.borrow_mut();
+                        if let Some((slot_index, slot_offset)) = ns.alloc_file_slot() {
+                            // Initialize the shmem ring header (non-blocking
+                            // inherited from source; default to false for dup).
+                            {
+                                let data_region = self.region.data_region_mut();
+                                #[allow(clippy::cast_ptr_alignment)]
+                                // slot offsets are 64-byte aligned by design
+                                let header_ptr = unsafe {
+                                    data_region
+                                        .as_mut_ptr()
+                                        .add(slot_offset as usize)
+                                        .cast::<litebox_ipc::socket_ring::ShmemSocketHeader>()
+                                };
+                                unsafe {
+                                    litebox_ipc::socket_ring::socket_init(
+                                        header_ptr, new_fd, false,
+                                    );
+                                }
+                            }
+
+                            // Track the file slot.
+                            ns.shmem_files.push(crate::notification_state::ShmemFile {
+                                fd: new_fd,
+                                slot_index,
+                            });
+                            drop(ns);
+
+                            // Write OpenResponse to data region at offset 0 for micro.
+                            let response = litebox_ipc::messages::OpenResponse {
+                                fd: new_fd,
+                                file_slot_offset: slot_offset,
+                            };
+                            let data_region = self.region.data_region_mut();
+                            let resp_bytes: &[u8] = unsafe {
+                                core::slice::from_raw_parts(
+                                    (&raw const response).cast::<u8>(),
+                                    core::mem::size_of::<litebox_ipc::messages::OpenResponse>(),
+                                )
+                            };
+                            data_region[..resp_bytes.len()].copy_from_slice(resp_bytes);
+
+                            cq.flags = cq_flags::EXEC_LOCAL
+                                | cq_flags::HAS_DATA
+                                | cq_flags::NO_REPORT;
+                            cq.data_offset = 0;
+                            cq.data_len =
+                                core::mem::size_of::<litebox_ipc::messages::OpenResponse>()
+                                    as u32;
+                        }
+                    }
+                }
+
                 return cq;
             }
             if shim_result == -i64::from(libc::EBADF) {

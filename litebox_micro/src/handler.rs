@@ -1282,6 +1282,15 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
         // Fall through to submit_and_wait for central to handle close + slot cleanup
     }
 
+    // For dup2/dup3 the target fd (args[1]) may have a file shmem slot.
+    // Unregister it before submitting, since central will free the old slot.
+    #[allow(clippy::cast_possible_truncation)]
+    if matches!(i64::from(nr), libc::SYS_dup2 | libc::SYS_dup3) {
+        let target_fd = args.args[1] as i32;
+        let micro_mut = unsafe { &mut *(*tls).micro };
+        micro_mut.unregister_file_fd(target_fd);
+    }
+
     // Shmem pipe fast-path: read/write on pipe fds bypass central entirely.
     {
         let micro = unsafe { &*(*tls).micro };
@@ -1553,11 +1562,13 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
             return cq.result; // return the new fd
         }
 
-        // open/openat: central allocated a shmem file slot, extract
-        // OpenResponse from data region.
+        // open/openat/dup/dup2/dup3: central allocated a shmem file slot,
+        // extract OpenResponse from data region.
         #[allow(clippy::cast_ptr_alignment)] // data region is properly aligned for OpenResponse
-        if matches!(i64::from(nr), libc::SYS_open | libc::SYS_openat)
-            && cq.flags & cq_flags::HAS_DATA != 0
+        if matches!(
+            i64::from(nr),
+            libc::SYS_open | libc::SYS_openat | libc::SYS_dup | libc::SYS_dup2 | libc::SYS_dup3
+        ) && cq.flags & cq_flags::HAS_DATA != 0
             && cq.result >= 0
             && cq.data_len == core::mem::size_of::<litebox_ipc::messages::OpenResponse>() as u32
         {
