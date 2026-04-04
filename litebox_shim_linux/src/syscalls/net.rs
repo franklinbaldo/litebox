@@ -2376,7 +2376,7 @@ impl<FS: ShimFS> Task<FS> {
 }
 
 #[cfg(target_os = "linux")]
-#[cfg(test)]
+#[cfg(all(test, feature = "platform_linux_userland"))]
 mod tests {
     use core::net::SocketAddr;
 
@@ -3277,7 +3277,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "platform_linux_userland"))]
 mod unix_tests {
     use core::time::Duration;
 
