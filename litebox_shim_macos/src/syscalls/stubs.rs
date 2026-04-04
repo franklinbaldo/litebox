@@ -8,9 +8,9 @@
 
 use alloc::boxed::Box;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, ThreadProvider as _};
+use litebox_common_macos::PtRegs;
 use litebox_common_macos::errno::Errno;
 use litebox_common_macos::syscall::mach_trap;
-use litebox_common_macos::PtRegs;
 
 use crate::{MutPtr, ShimFS, Task};
 
@@ -457,7 +457,7 @@ impl<FS: ShimFS> Task<FS> {
     ///
     /// Used by `usleep()` in libSystem. If `timeout` is non-zero, sleeps for the
     /// requested duration. Otherwise returns immediately.
-    #[allow(clippy::unnecessary_wraps)]
+    #[allow(clippy::unnecessary_wraps, clippy::similar_names)]
     pub(crate) fn sys_semwait_signal(
         &self,
         _cond_sem: i32,
@@ -468,7 +468,9 @@ impl<FS: ShimFS> Task<FS> {
         tv_nsec: i32,
     ) -> Result<usize, Errno> {
         if timeout != 0 && (tv_sec > 0 || tv_nsec > 0) {
-            let duration = core::time::Duration::new(tv_sec as u64, tv_nsec as u32);
+            #[allow(clippy::cast_sign_loss)] // We guard tv_sec > 0 and tv_nsec > 0 above
+            let duration =
+                core::time::Duration::new(tv_sec.cast_unsigned(), tv_nsec.cast_unsigned());
             // Use the wait state to perform an interruptible sleep.
             // If the process is exiting, this will return early.
             let cx = self.wait_cx().with_timeout(duration);

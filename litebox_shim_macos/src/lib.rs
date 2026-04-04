@@ -27,8 +27,8 @@ use litebox::{
     shim::ContinueOperation,
     sync::futex::FutexManager,
 };
-use litebox_common_macos::errno::Errno;
 use litebox_common_macos::PtRegs;
+use litebox_common_macos::errno::Errno;
 use litebox_platform_multiplex::Platform;
 
 /// A trait required for file systems to be used in the shim.
@@ -925,13 +925,14 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle `pipe()` — create an anonymous pipe.
     ///
     /// Returns `(read_fd, write_fd)` as raw integer FDs.
+    #[allow(clippy::unnecessary_wraps)]
     fn sys_pipe(&self) -> Result<(usize, usize), Errno> {
         use core::num::NonZeroUsize;
 
         let (sender, receiver) = self.global.pipes.create_pipe(
-            65536,                                  // capacity (standard pipe buffer)
-            litebox::pipes::Flags::empty(),         // blocking mode
-            NonZeroUsize::new(4096),                // PIPE_BUF atomic guarantee
+            65536,                          // capacity (standard pipe buffer)
+            litebox::pipes::Flags::empty(), // blocking mode
+            NonZeroUsize::new(4096),        // PIPE_BUF atomic guarantee
         );
 
         let mut rds = self.global.raw_descriptors.write();

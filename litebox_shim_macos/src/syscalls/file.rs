@@ -218,8 +218,8 @@ impl<FS: ShimFS> Task<FS> {
     /// Convert a pipe `ReadError` to a macOS errno.
     fn pipe_read_error_to_errno(e: litebox::pipes::errors::ReadError) -> Errno {
         match e {
-            litebox::pipes::errors::ReadError::ClosedFd => Errno::EBADF,
-            litebox::pipes::errors::ReadError::NotForReading => Errno::EBADF,
+            litebox::pipes::errors::ReadError::ClosedFd
+            | litebox::pipes::errors::ReadError::NotForReading => Errno::EBADF,
             litebox::pipes::errors::ReadError::WouldBlock => Errno::EAGAIN,
             _ => Errno::EIO,
         }
@@ -228,9 +228,9 @@ impl<FS: ShimFS> Task<FS> {
     /// Convert a pipe `WriteError` to a macOS errno.
     fn pipe_write_error_to_errno(e: litebox::pipes::errors::WriteError) -> Errno {
         match e {
-            litebox::pipes::errors::WriteError::ClosedFd => Errno::EBADF,
+            litebox::pipes::errors::WriteError::ClosedFd
+            | litebox::pipes::errors::WriteError::NotForWriting => Errno::EBADF,
             litebox::pipes::errors::WriteError::ReadEndClosed => Errno::EPIPE,
-            litebox::pipes::errors::WriteError::NotForWriting => Errno::EBADF,
             litebox::pipes::errors::WriteError::WouldBlock => Errno::EAGAIN,
             _ => Errno::EIO,
         }
@@ -497,8 +497,7 @@ impl<FS: ShimFS> Task<FS> {
             let mut rds = self.global.raw_descriptors.write();
             if let Ok(existing_fd) = rds.fd_consume_raw_integer::<FS>(raw_newfd) {
                 let _ = self.global.fs.close(&existing_fd);
-            } else if let Ok(existing_fd) =
-                rds.fd_consume_raw_integer::<Pipes<Platform>>(raw_newfd)
+            } else if let Ok(existing_fd) = rds.fd_consume_raw_integer::<Pipes<Platform>>(raw_newfd)
             {
                 let _ = self.global.pipes.close(&existing_fd);
             }
@@ -698,20 +697,17 @@ impl<FS: ShimFS> Task<FS> {
 
         let cpath = alloc::ffi::CString::new(path.as_bytes()).map_err(|_| Errno::EINVAL)?;
         // F_OK (0) or any mode — just check existence.
-        self.global
-            .fs
-            .file_status(&cpath)
-            .map_err(|e| match e {
-                litebox::fs::errors::FileStatusError::PathError(ref pe) => {
-                    use litebox::fs::errors::PathError;
-                    match pe {
-                        PathError::NoSuchFileOrDirectory => Errno::ENOENT,
-                        PathError::ComponentNotADirectory => Errno::ENOTDIR,
-                        _ => Errno::EINVAL,
-                    }
+        self.global.fs.file_status(&cpath).map_err(|e| match e {
+            litebox::fs::errors::FileStatusError::PathError(ref pe) => {
+                use litebox::fs::errors::PathError;
+                match pe {
+                    PathError::NoSuchFileOrDirectory => Errno::ENOENT,
+                    PathError::ComponentNotADirectory => Errno::ENOTDIR,
+                    _ => Errno::EINVAL,
                 }
-                _ => Errno::EIO,
-            })?;
+            }
+            _ => Errno::EIO,
+        })?;
         // R_OK/W_OK/X_OK: always succeed in sandbox.
         Ok(0)
     }
@@ -744,9 +740,9 @@ impl<FS: ShimFS> Task<FS> {
             .truncate(&typed_fd, len, false)
             .map_err(|e| match e {
                 litebox::fs::errors::TruncateError::ClosedFd => Errno::EBADF,
-                litebox::fs::errors::TruncateError::IsDirectory => Errno::EINVAL,
-                litebox::fs::errors::TruncateError::NotForWriting => Errno::EINVAL,
-                litebox::fs::errors::TruncateError::IsTerminalDevice => Errno::EINVAL,
+                litebox::fs::errors::TruncateError::IsDirectory
+                | litebox::fs::errors::TruncateError::NotForWriting
+                | litebox::fs::errors::TruncateError::IsTerminalDevice => Errno::EINVAL,
                 litebox::fs::errors::TruncateError::Io => Errno::EIO,
             })?;
         Ok(0)
@@ -781,16 +777,11 @@ impl<FS: ShimFS> Task<FS> {
                 .map_err(|_| Errno::EBADF)?
         };
 
-        let entries = self
-            .global
-            .fs
-            .read_dir(&typed_fd)
-            .map_err(|e| match e {
-                litebox::fs::errors::ReadDirError::ClosedFd => Errno::EBADF,
-                litebox::fs::errors::ReadDirError::NotADirectory => Errno::ENOTDIR,
-                litebox::fs::errors::ReadDirError::Io => Errno::EIO,
-                _ => Errno::EIO,
-            })?;
+        let entries = self.global.fs.read_dir(&typed_fd).map_err(|e| match e {
+            litebox::fs::errors::ReadDirError::ClosedFd => Errno::EBADF,
+            litebox::fs::errors::ReadDirError::NotADirectory => Errno::ENOTDIR,
+            _ => Errno::EIO,
+        })?;
 
         // Serialize entries into macOS dirent format.
         let mut output = alloc::vec::Vec::with_capacity(bufsize.min(MAX_KERNEL_BUF_SIZE));
@@ -810,10 +801,10 @@ impl<FS: ShimFS> Task<FS> {
                 .as_ref()
                 .map_or(seek_offset, |info| info.ino as u64);
             let d_type: u8 = match entry.file_type {
-                litebox::fs::FileType::RegularFile => 8,        // DT_REG
-                litebox::fs::FileType::Directory => 4,           // DT_DIR
-                litebox::fs::FileType::CharacterDevice => 2,     // DT_CHR
-                _ => 0,                                          // DT_UNKNOWN
+                litebox::fs::FileType::RegularFile => 8,     // DT_REG
+                litebox::fs::FileType::Directory => 4,       // DT_DIR
+                litebox::fs::FileType::CharacterDevice => 2, // DT_CHR
+                _ => 0,                                      // DT_UNKNOWN
             };
 
             // d_ino (8 bytes)
@@ -840,9 +831,7 @@ impl<FS: ShimFS> Task<FS> {
         // Write output to user buffer
         if !output.is_empty() {
             let user_buf: MutPtr<u8> = MutPtr::from_usize(buf_addr);
-            user_buf
-                .copy_from_slice(0, &output)
-                .ok_or(Errno::EFAULT)?;
+            user_buf.copy_from_slice(0, &output).ok_or(Errno::EFAULT)?;
         }
 
         // Write basep (position) if non-null
