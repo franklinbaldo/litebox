@@ -403,6 +403,11 @@ impl<FS: ShimFS> LinuxShimTask<FS> {
         self.task.global.pm.set_initial_brk(brk);
     }
 
+    /// Return the process ID of this task.
+    pub fn pid(&self) -> i32 {
+        self.task.pid
+    }
+
     /// Perform queued network interactions for this task's process Network.
     ///
     /// This function should be invoked in a loop, based on the returned advice.
@@ -410,6 +415,14 @@ impl<FS: ShimFS> LinuxShimTask<FS> {
         &self,
     ) -> litebox::net::PlatformInteractionReinvocationAdvice {
         self.task.net.lock().perform_platform_interaction()
+    }
+
+    /// Return a clone of this task's per-process `Network` Arc.
+    ///
+    /// Used by `litebox_central`'s per-process net-worker thread, which needs
+    /// to call `perform_platform_interaction()` without borrowing the task.
+    pub fn net_mutex(&self) -> Arc<litebox::sync::Mutex<Platform, Network<Platform>>> {
+        self.task.net.clone()
     }
 }
 

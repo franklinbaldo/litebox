@@ -165,59 +165,6 @@ fn main() -> anyhow::Result<()> {
     // Wrap the shim in an Arc so it can be shared with child ProcessServers.
     let shim = std::sync::Arc::new(shim);
 
-    // Spawn a network worker thread to drive smoltcp ↔ TUN packet flow.
-    let net_shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
-    let net_worker = if args.tun_device.is_some() {
-        let shim = shim.clone();
-        let shutdown = net_shutdown.clone();
-        Some(
-            std::thread::Builder::new()
-                .name("net-worker".into())
-                .spawn(move || {
-                    const DEFAULT_TIMEOUT: core::time::Duration =
-                        core::time::Duration::from_micros(100);
-                    const MAX_TIMEOUT: core::time::Duration =
-                        core::time::Duration::from_millis(1);
-
-                    while !shutdown.load(core::sync::atomic::Ordering::Relaxed) {
-                        // Limit consecutive immediate re-polls to prevent the
-                        // net-worker from starving server threads when smoltcp
-                        // continuously reports SocketStateChanged (e.g. many
-                        // sockets in half-closed / TIME_WAIT states).
-                        const MAX_IMMEDIATE_POLLS: u32 = 64;
-                        let mut polls = 0u32;
-                        let timeout = loop {
-                            match shim.perform_network_interaction() {
-                                litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately => {
-                                    polls += 1;
-                                    if polls >= MAX_IMMEDIATE_POLLS {
-                                        // Yield to let server threads acquire
-                                        // the network lock, then try again
-                                        // with a real blocking wait.
-                                        break Some(MAX_TIMEOUT);
-                                    }
-                                }
-                                litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction { timeout } => {
-                                    break timeout;
-                                }
-                            }
-                        };
-                        platform.wait_on_tun(
-                            Some(timeout.unwrap_or(DEFAULT_TIMEOUT).min(MAX_TIMEOUT)),
-                        );
-                    }
-                    // Final flush
-                    while shim
-                        .perform_network_interaction()
-                        .call_again_immediately()
-                    {}
-                })
-                .expect("failed to spawn network worker thread"),
-        )
-    } else {
-        None
-    };
-
     // Create a headless task for syscall dispatch.
     // TODO: receive real TaskParams from the launcher via the ring buffer
     // or command-line arguments.
@@ -249,15 +196,16 @@ fn main() -> anyhow::Result<()> {
     // Register the initial ring so it gets signalled on exit/panic.
     register_active_ring(region.header());
 
-    let server = server::ProcessServer::new(region, task, shim, fs, ring_pool, -1);
+    let tun_queue = if args.tun_device.is_some() {
+        Some(0)
+    } else {
+        None
+    };
+    let server = server::ProcessServer::new(region, task, shim, fs, ring_pool, -1, tun_queue);
     let result = server.run();
 
     // Signal all micro processes that central is shutting down.
     signal_all_rings_exiting();
 
-    net_shutdown.store(true, core::sync::atomic::Ordering::Relaxed);
-    if let Some(handle) = net_worker {
-        let _ = handle.join();
-    }
     result
 }

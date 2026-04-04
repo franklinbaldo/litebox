@@ -8,8 +8,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use litebox_ipc::cq::{cq_notify_thread, cq_push};
 use litebox_ipc::messages::{
@@ -27,6 +29,23 @@ use litebox_ipc::wait::spin_u8_then_wait_u32;
 use litebox_shim_linux::ShimFS;
 
 use crate::shmem::{RingPool, SharedRegion};
+
+/// RAII guard that signals the net-worker shutdown flag and joins the thread
+/// on drop. Ensures the net-worker is cleaned up even if `ProcessServer::run()`
+/// panics.
+struct NetWorkerGuard {
+    shutdown: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for NetWorkerGuard {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
 
 /// Start of the reserved address range for micro's anonymous mmap bump
 /// allocator.  This range is communicated to micro via `ExecveHeader` and
@@ -77,6 +96,8 @@ pub struct ProcessServer<FS: ShimFS> {
     child_handles: RefCell<Vec<JoinHandle<()>>>,
     /// Per-process state from Tier 2 fire-and-forget notifications.
     notification_state: RefCell<crate::notification_state::ProcessNotificationState>,
+    /// TUN queue index for this process's net-worker.
+    tun_queue: Option<usize>,
 }
 
 impl<FS: ShimFS> ProcessServer<FS> {
@@ -89,6 +110,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
         fs: Arc<FS>,
         ring_pool: Arc<RingPool>,
         ring_fd: i32,
+        tun_queue: Option<usize>,
     ) -> Self {
         Self {
             region,
@@ -105,6 +127,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
             notification_state: RefCell::new(
                 crate::notification_state::ProcessNotificationState::default(),
             ),
+            tun_queue,
         }
     }
 
@@ -118,6 +141,63 @@ impl<FS: ShimFS> ProcessServer<FS> {
     /// Returns `Ok(())` when the guest exits cleanly.
     #[allow(clippy::unnecessary_wraps)] // Result kept for future error paths
     pub fn run(self) -> anyhow::Result<()> {
+        // Spawn a per-process net-worker thread if networking is enabled.
+        // The guard ensures the thread is joined even if run() panics.
+        let net_worker_guard = if let Some(queue) = self.tun_queue {
+            use litebox::net::PlatformInteractionReinvocationAdvice::{
+                CallAgainImmediately, WaitOnDeviceOrSocketInteraction,
+            };
+
+            let net = self.primary_task.net_mutex();
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown_clone = shutdown.clone();
+            let pid = self.primary_task.pid();
+            let platform = litebox_platform_multiplex::platform();
+
+            let handle = std::thread::Builder::new()
+                .name(format!("net-worker-{pid}"))
+                .spawn(move || {
+                    const DEFAULT_TIMEOUT: Duration = Duration::from_micros(100);
+                    const MAX_TIMEOUT: Duration = Duration::from_millis(1);
+
+                    while !shutdown_clone.load(Ordering::Relaxed) {
+                        const MAX_IMMEDIATE_POLLS: u32 = 64;
+                        let mut polls = 0u32;
+                        let timeout = loop {
+                            match net.lock().perform_platform_interaction() {
+                                CallAgainImmediately => {
+                                    polls += 1;
+                                    if polls >= MAX_IMMEDIATE_POLLS {
+                                        break Some(MAX_TIMEOUT);
+                                    }
+                                }
+                                WaitOnDeviceOrSocketInteraction { timeout } => {
+                                    break timeout;
+                                }
+                            }
+                        };
+                        platform.wait_on_tun_queue(
+                            queue,
+                            Some(timeout.unwrap_or(DEFAULT_TIMEOUT).min(MAX_TIMEOUT)),
+                        );
+                    }
+                    // Final flush
+                    while net
+                        .lock()
+                        .perform_platform_interaction()
+                        .call_again_immediately()
+                    {}
+                })
+                .expect("failed to spawn process net-worker");
+
+            Some(NetWorkerGuard {
+                shutdown,
+                handle: Some(handle),
+            })
+        } else {
+            None
+        };
+
         let header = self.region.header();
         let sq_entries = self.region.sq_entries();
 
@@ -235,6 +315,11 @@ impl<FS: ShimFS> ProcessServer<FS> {
         for handle in handles {
             let _ = handle.join();
         }
+
+        // The net-worker thread is stopped by `_net_worker_guard` drop (RAII).
+        // Dropping it here (before releasing the ring) ensures the net-worker
+        // has fully stopped before the ring memory is released.
+        drop(net_worker_guard);
 
         // Return this process's ring to the pool so it can be reused by a
         // future fork.  The root server (ring_fd == -1) did not get its ring
@@ -624,8 +709,21 @@ impl<FS: ShimFS> ProcessServer<FS> {
             let shim = self.shim.clone();
             let fs = self.fs.clone();
             let pool = Arc::clone(&self.ring_pool);
-            let child_server =
-                ProcessServer::new(child_region, child_task, shim, fs, pool, child_ring_fd);
+            let tun_queue = if self.tun_queue.is_some() {
+                let platform = litebox_platform_multiplex::platform();
+                Some(platform.open_new_queue())
+            } else {
+                None
+            };
+            let child_server = ProcessServer::new(
+                child_region,
+                child_task,
+                shim,
+                fs,
+                pool,
+                child_ring_fd,
+                tun_queue,
+            );
             child_server.next_child_pid.set(self.next_child_pid.get());
 
             let handle = std::thread::spawn(move || {
