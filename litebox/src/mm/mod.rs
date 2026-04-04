@@ -56,9 +56,9 @@ where
 
     /// Create a new `PageManager` instance for the given VA `range`.
     ///
-    /// For a single-process setup, pass the full platform range
-    /// `Platform::TASK_ADDR_MIN..Platform::TASK_ADDR_MAX`. For multi-process
-    /// setups, pass the sub-range obtained from
+    /// For a single-process setup (or the initial process), pass the full
+    /// platform range `Platform::TASK_ADDR_MIN..Platform::TASK_ADDR_MAX`.
+    /// For child processes, pass the sub-range obtained from
     /// [`AddressSpaceProvider::address_space_range()`](crate::platform::AddressSpaceProvider::address_space_range).
     pub fn new(litebox: &LiteBox<Platform>, range: Range<usize>) -> Self {
         let addr_min = range.start;
@@ -198,6 +198,39 @@ where
     {
         let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
         unsafe { self.create_pages(suggested_address, length, flags, perms, perms, op) }
+    }
+
+    /// Create readable, writable, and executable pages.
+    ///
+    /// Pages are created writable so `op` can initialize them, then upgraded to
+    /// their final RWX permissions before returning.
+    ///
+    /// # Safety
+    ///
+    /// Writable+executable mappings are inherently dangerous. Callers must only
+    /// use this for legitimate cases such as JITs that require RWX memory.
+    pub unsafe fn create_rwx_pages<F>(
+        &self,
+        suggested_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
+        flags: CreatePagesFlags,
+        op: F,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError>
+    where
+        F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
+    {
+        let before_perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
+        let after_perms = before_perms | MemoryRegionPermissions::EXEC;
+        unsafe {
+            self.create_pages(
+                suggested_address,
+                length,
+                flags,
+                before_perms,
+                after_perms,
+                op,
+            )
+        }
     }
 
     /// Create read-only pages.
@@ -348,6 +381,11 @@ where
         if vmem.brk_frontier < min_brk {
             vmem.brk_frontier = min_brk;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_logical_brk_for_test(&self, brk: usize) {
+        self.vmem.write().brk = brk;
     }
 
     /// Set the program break to the given address.
@@ -801,7 +839,7 @@ where
             let Some(range) = PageRange::new(fault_addr, start) else {
                 unreachable!()
             };
-            if unsafe {
+            if let Err(err) = unsafe {
                 vmem.insert_mapping(
                     range,
                     vma,
@@ -810,9 +848,8 @@ where
                     crate::platform::page_mgmt::FixedAddressBehavior::NoReplace,
                     false,
                 )
-            }
-            .is_err()
-            {
+            } {
+                let _ = err;
                 return Err(PageFaultError::AllocationFailed);
             }
         }

@@ -431,6 +431,20 @@ impl<
             },
         }
     }
+
+    /// Returns the PTY pair index if the given FD is a PTY master, or `None` otherwise.
+    pub fn get_pty_master_index(&self, fd: &FileFd<Platform>) -> Option<u32> {
+        let table = self.litebox.descriptor_table();
+        match table.get_entry(fd)?.entry {
+            Device::PtyMaster(idx) => Some(idx),
+            _ => None,
+        }
+    }
+
+    /// Returns a reference to the PTY manager for performing PTY operations.
+    pub fn pty_manager(&self) -> &PtyManager<Platform> {
+        &self.pty_manager
+    }
 }
 
 impl<
@@ -1059,25 +1073,6 @@ impl<
         _mode: Mode,
     ) -> Result<(), MkdirError> {
         Err(MkdirError::Io)
-    }
-}
-
-impl<
-    Platform: crate::platform::StdioProvider + crate::sync::RawSyncPrimitivesProvider + TimeProvider,
-> FileSystem<Platform>
-{
-    /// Returns the PTY pair index if the given FD is a PTY master, or `None` otherwise.
-    pub fn get_pty_master_index(&self, fd: &FileFd<Platform>) -> Option<u32> {
-        let table = self.litebox.descriptor_table();
-        match table.get_entry(fd)?.entry {
-            Device::PtyMaster(idx) => Some(idx),
-            _ => None,
-        }
-    }
-
-    /// Returns a reference to the PTY manager for performing PTY operations.
-    pub fn pty_manager(&self) -> &PtyManager<Platform> {
-        &self.pty_manager
     }
 }
 

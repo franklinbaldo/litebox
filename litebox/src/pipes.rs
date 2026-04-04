@@ -13,22 +13,22 @@ use core::{
 
 use alloc::sync::{Arc, Weak};
 use ringbuf::{
-    HeapCons, HeapProd, HeapRb,
     traits::{Consumer as _, Observer as _, Producer as _, Split as _},
+    HeapCons, HeapProd, HeapRb,
 };
 use thiserror::Error;
 
 use crate::{
-    LiteBox,
     event::{
-        Events, IOPollable,
         observer::Observer,
         polling::{Pollee, TryOpError},
         wait::{WaitContext, WaitError},
+        Events, IOPollable,
     },
     fs::OFlags,
     platform::TimeProvider,
     sync::{Mutex, RawSyncPrimitivesProvider},
+    LiteBox,
 };
 
 /// Support for unidirectional communication channels
@@ -112,7 +112,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     ///
     /// When `is_vfork_child` is true and a blocking read would deadlock
     /// (the only remaining write-end FD belongs to the blocked parent),
-    /// returns `Err(ReadError::Deadlock)` instead of blocking forever.
+    /// returns `Ok(0)` (EOF) instead of blocking forever.
     pub fn read_vfork_aware(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -220,6 +220,18 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
             PipeEnd::Receiver(p) => Ok(p.endpoint.rb.lock().occupied_len()),
             PipeEnd::Sender(_) => Ok(0),
+        }
+    }
+
+    /// Return the number of bytes that can still be written without blocking.
+    pub fn writable_bytes(&self, fd: &PipeFd<Platform>) -> Result<usize, errors::ClosedError> {
+        let dt = self.litebox.descriptor_table();
+        match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
+            PipeEnd::Receiver(_) => Ok(0),
+            PipeEnd::Sender(p) => {
+                let rb = p.endpoint.rb.lock();
+                Ok(rb.vacant_len())
+            }
         }
     }
 }
@@ -731,6 +743,7 @@ fn new_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider, T>(
 // We can't use the `enable_fds_for_subsystem!` macro here because we need
 // to override `on_dup()` and `on_close()` to properly track pipe writer
 // file descriptor counts across dup/fork.
+#[allow(unused, reason = "NOTE(jayb): remove this lint before merging the PR")]
 #[doc(hidden)]
 pub struct DescriptorEntry<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     entry: PipeEnd<Platform>,
@@ -745,13 +758,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> crate::fd::FdEnabledSub
 {
     fn on_dup(&self) {
         if let PipeEnd::Sender(w) = &self.entry {
-            w.fd_ref_count.fetch_add(1, Ordering::Release);
+            w.fd_ref_count.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     fn on_close(&self) {
         if let PipeEnd::Sender(w) = &self.entry {
-            w.fd_ref_count.fetch_sub(1, Ordering::Release);
+            w.fd_ref_count.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }

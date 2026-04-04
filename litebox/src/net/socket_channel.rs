@@ -292,6 +292,18 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
             NetworkProxy::Raw => false,
         }
     }
+
+    /// Return the number of bytes available to read without blocking.
+    ///
+    /// For TCP sockets this is the number of buffered bytes; for UDP it is
+    /// the number of queued datagrams (matching Linux FIONREAD semantics).
+    pub fn pending_rx_bytes(&self) -> usize {
+        match self {
+            NetworkProxy::Stream(channel) => channel.pending_rx_bytes(),
+            NetworkProxy::Datagram(channel) => channel.pending_rx_datagrams(),
+            NetworkProxy::Raw => 0,
+        }
+    }
 }
 
 /// A channel for stream (TCP) socket communication.
@@ -454,6 +466,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
             _ => return Err(SendError::SocketInInvalidState),
         }
 
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
         let mut tx_prod = self.inner.tx_prod.lock();
         let n = tx_prod.push_slice(buf);
 
@@ -613,6 +629,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
     /// Check if the socket has data available for reading.
     pub(super) fn is_readable(&self) -> bool {
         self.inner.rx_available.load(Ordering::Acquire) > 0
+    }
+
+    /// Return the number of bytes buffered and available for reading.
+    pub fn pending_rx_bytes(&self) -> usize {
+        self.inner.rx_available.load(Ordering::Acquire)
     }
 
     /// Manually set the readable state.
@@ -865,6 +886,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
         self.inner.rx_count.load(Ordering::Acquire) > 0
     }
 
+    /// Return the number of queued datagrams available for reading.
+    pub fn pending_rx_datagrams(&self) -> usize {
+        self.inner.rx_count.load(Ordering::Acquire)
+    }
+
     /// Check if the socket is writable.
     pub fn is_writable(&self) -> bool {
         self.inner.tx_space.load(Ordering::Acquire) > 0
@@ -1092,6 +1118,16 @@ mod tests {
         assert_eq!(&buf[..popped], data);
 
         // No more pending TX
+        assert!(!channel.has_pending_tx());
+    }
+
+    #[test]
+    fn stream_channel_zero_length_write_succeeds() {
+        let channel: StreamSocketChannel<TestPlatform> = StreamSocketChannel::new();
+        channel.set_state(SocketState::Connected);
+
+        let written = channel.try_write(&[]).unwrap();
+        assert_eq!(written, 0);
         assert!(!channel.has_pending_tx());
     }
 

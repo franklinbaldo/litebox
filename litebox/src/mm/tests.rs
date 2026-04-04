@@ -2,6 +2,8 @@
 // Licensed under the MIT license.
 
 use core::ops::Range;
+#[cfg(target_arch = "x86_64")]
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -10,6 +12,7 @@ use crate::{
     mm::linux::{CreatePagesFlags, NonZeroAddress},
     platform::{
         PageManagementProvider, RawConstPointer,
+        mock::MockRawMutex,
         page_mgmt::MemoryRegionPermissions,
         trivial_providers::{TransparentConstPtr, TransparentMutPtr},
     },
@@ -23,9 +26,73 @@ use super::linux::{
 /// A dummy implementation of [`VmemBackend`] that does nothing.
 struct DummyVmemBackend;
 
+static DUMMY_VMEM_BACKEND: DummyVmemBackend = DummyVmemBackend;
+#[cfg(target_arch = "x86_64")]
+static RETRY_LOW_2G_BACKEND: RetryLow2gBackend = RetryLow2gBackend;
+#[cfg(target_arch = "x86_64")]
+static RETRY_LOW_2G_BLOCKED_START: AtomicUsize = AtomicUsize::new(0);
+
 impl crate::platform::RawPointerProvider for DummyVmemBackend {
     type RawConstPointer<T: FromBytes> = TransparentConstPtr<T>;
     type RawMutPointer<T: FromBytes + IntoBytes> = TransparentMutPtr<T>;
+}
+
+#[cfg(target_arch = "x86_64")]
+struct RetryLow2gBackend;
+
+#[cfg(target_arch = "x86_64")]
+impl crate::platform::RawPointerProvider for RetryLow2gBackend {
+    type RawConstPointer<T: FromBytes> = TransparentConstPtr<T>;
+    type RawMutPointer<T: FromBytes + IntoBytes> = TransparentMutPtr<T>;
+}
+
+impl crate::platform::RawMutexProvider for DummyVmemBackend {
+    type RawMutex = MockRawMutex;
+}
+
+#[cfg(target_arch = "x86_64")]
+impl crate::platform::RawMutexProvider for RetryLow2gBackend {
+    type RawMutex = MockRawMutex;
+}
+
+#[cfg(feature = "lock_tracing")]
+impl crate::platform::TimeProvider for DummyVmemBackend {
+    type Instant = crate::platform::mock::MockInstant;
+    type SystemTime = crate::platform::mock::MockSystemTime;
+
+    fn now(&self) -> Self::Instant {
+        crate::platform::mock::MockInstant { time: 0 }
+    }
+
+    fn current_time(&self) -> Self::SystemTime {
+        crate::platform::mock::MockSystemTime { time: 0 }
+    }
+}
+
+#[cfg(feature = "lock_tracing")]
+#[cfg(target_arch = "x86_64")]
+impl crate::platform::TimeProvider for RetryLow2gBackend {
+    type Instant = crate::platform::mock::MockInstant;
+    type SystemTime = crate::platform::mock::MockSystemTime;
+
+    fn now(&self) -> Self::Instant {
+        crate::platform::mock::MockInstant { time: 0 }
+    }
+
+    fn current_time(&self) -> Self::SystemTime {
+        crate::platform::mock::MockSystemTime { time: 0 }
+    }
+}
+
+#[cfg(feature = "lock_tracing")]
+impl crate::platform::DebugLogProvider for DummyVmemBackend {
+    fn debug_log_print(&self, _msg: &str) {}
+}
+
+#[cfg(feature = "lock_tracing")]
+#[cfg(target_arch = "x86_64")]
+impl crate::platform::DebugLogProvider for RetryLow2gBackend {
+    fn debug_log_print(&self, _msg: &str) {}
 }
 
 #[expect(unused_variables, reason = "dummy/mock backend")]
@@ -43,7 +110,7 @@ impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
         initial_permissions: crate::platform::page_mgmt::MemoryRegionPermissions,
         can_grow_down: bool,
         populate_pages_immediately: bool,
-        _noreserve: bool,
+        noreserve: bool,
         fixed_address_behavior: crate::platform::page_mgmt::FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, crate::platform::page_mgmt::AllocationError> {
         Ok(TransparentMutPtr::from_usize(suggested_range.start))
@@ -78,8 +145,81 @@ impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
     }
 }
 
+#[expect(unused_variables, reason = "dummy/mock backend")]
+#[cfg(target_arch = "x86_64")]
+impl crate::platform::PageManagementProvider<PAGE_SIZE> for RetryLow2gBackend {
+    #[cfg(target_os = "linux")]
+    const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
+    #[cfg(all(target_arch = "x86", target_os = "linux"))]
+    const TASK_ADDR_MAX: usize = 0xC000_0000; // 3 GiB (see arch/x86/include/asm/page_32_types.h)
+
+    fn allocate_pages(
+        &self,
+        suggested_range: Range<usize>,
+        initial_permissions: crate::platform::page_mgmt::MemoryRegionPermissions,
+        can_grow_down: bool,
+        populate_pages_immediately: bool,
+        noreserve: bool,
+        fixed_address_behavior: crate::platform::page_mgmt::FixedAddressBehavior,
+    ) -> Result<Self::RawMutPointer<u8>, crate::platform::page_mgmt::AllocationError> {
+        if fixed_address_behavior == crate::platform::page_mgmt::FixedAddressBehavior::NoReplace
+            && suggested_range.start == RETRY_LOW_2G_BLOCKED_START.load(Ordering::Relaxed)
+        {
+            return Err(crate::platform::page_mgmt::AllocationError::AddressInUse);
+        }
+        Ok(TransparentMutPtr::from_usize(suggested_range.start))
+    }
+
+    unsafe fn deallocate_pages(
+        &self,
+        range: Range<usize>,
+    ) -> Result<(), crate::platform::page_mgmt::DeallocationError> {
+        Ok(())
+    }
+
+    unsafe fn remap_pages(
+        &self,
+        old_range: Range<usize>,
+        new_range: Range<usize>,
+        permissions: crate::platform::page_mgmt::MemoryRegionPermissions,
+    ) -> Result<Self::RawMutPointer<u8>, crate::platform::page_mgmt::RemapError> {
+        Ok(TransparentMutPtr::from_usize(new_range.start))
+    }
+
+    unsafe fn update_permissions(
+        &self,
+        range: Range<usize>,
+        new_permissions: crate::platform::page_mgmt::MemoryRegionPermissions,
+    ) -> Result<(), crate::platform::page_mgmt::PermissionUpdateError> {
+        Ok(())
+    }
+
+    fn reserved_pages(&self) -> impl Iterator<Item = &Range<usize>> {
+        core::iter::empty()
+    }
+}
+
 fn collect_mappings(vmm: &Vmem<DummyVmemBackend, PAGE_SIZE>) -> Vec<Range<usize>> {
     vmm.iter().map(|v| v.0.start..v.0.end).collect()
+}
+
+fn make_page_manager() -> super::PageManager<DummyVmemBackend, PAGE_SIZE> {
+    let litebox = crate::LiteBox::new(&DUMMY_VMEM_BACKEND);
+    super::PageManager::new(
+        &litebox,
+        DummyVmemBackend::TASK_ADDR_MIN..DummyVmemBackend::TASK_ADDR_MAX,
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+fn make_retry_low_2g_page_manager() -> super::PageManager<RetryLow2gBackend, PAGE_SIZE> {
+    let litebox = crate::LiteBox::new(&RETRY_LOW_2G_BACKEND);
+    super::PageManager::new(
+        &litebox,
+        RetryLow2gBackend::TASK_ADDR_MIN..RetryLow2gBackend::TASK_ADDR_MAX,
+    )
 }
 
 #[test]
@@ -299,5 +439,149 @@ fn test_vmm_mapping() {
             start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
             DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
         ]
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_low_2g_mapping_retries_lower_gap_when_first_choice_is_busy() {
+    let pm = make_retry_low_2g_page_manager();
+    let len = NonZeroPageSize::new(PAGE_SIZE * 2).unwrap();
+    let first_choice = 0x8000_0000 - (PAGE_SIZE * 2);
+    RETRY_LOW_2G_BLOCKED_START.store(first_choice, Ordering::Relaxed);
+
+    let addr = unsafe {
+        pm.create_pages(
+            None,
+            len,
+            CreatePagesFlags::LOW_2G,
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            |_| Ok(0),
+        )
+        .unwrap()
+    };
+
+    assert_eq!(addr.as_usize(), first_choice - PAGE_SIZE);
+    RETRY_LOW_2G_BLOCKED_START.store(0, Ordering::Relaxed);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_low_2g_mapping_ignores_unrelated_high_vmas() {
+    let pm = make_page_manager();
+    let len = NonZeroPageSize::new(PAGE_SIZE).unwrap();
+
+    unsafe {
+        pm.create_pages(
+            Some(NonZeroAddress::new(0x1_0000_0000).unwrap()),
+            len,
+            CreatePagesFlags::FIXED_ADDR,
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            |_| Ok(0),
+        )
+        .unwrap();
+    }
+
+    let addr = unsafe {
+        pm.create_pages(
+            None,
+            len,
+            CreatePagesFlags::LOW_2G,
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            |_| Ok(0),
+        )
+        .unwrap()
+    };
+
+    assert_eq!(addr.as_usize(), 0x8000_0000 - PAGE_SIZE);
+}
+
+#[test]
+fn test_stack_mapping_sets_growsdown_flag() {
+    let pm = make_page_manager();
+    let len = NonZeroPageSize::new(PAGE_SIZE).unwrap();
+
+    let addr = unsafe {
+        pm.create_pages(
+            None,
+            len,
+            CreatePagesFlags::IS_STACK,
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            |_| Ok(0),
+        )
+        .unwrap()
+    };
+
+    let mappings = pm.mappings();
+    let (_, flags) = mappings
+        .iter()
+        .find(|(range, _)| range.start <= addr.as_usize() && addr.as_usize() < range.end)
+        .expect("mapping should exist");
+    assert!(flags.contains(VmFlags::VM_GROWSDOWN));
+}
+
+#[test]
+fn brk_backfills_hole_after_logical_jump() {
+    let pm = make_page_manager();
+    pm.set_initial_brk(0x10_000);
+
+    unsafe {
+        assert_eq!(pm.brk(0x12_000).unwrap(), 0x12_000);
+    }
+    assert_eq!(pm.current_brk(), 0x12_000);
+    assert_eq!(pm.current_brk_frontier(), 0x12_000);
+
+    pm.force_logical_brk_for_test(0x20_000);
+    assert_eq!(pm.current_brk(), 0x20_000);
+    assert_eq!(pm.current_brk_frontier(), 0x12_000);
+
+    unsafe {
+        assert_eq!(pm.brk(0x14_000).unwrap(), 0x14_000);
+    }
+    assert_eq!(pm.current_brk(), 0x14_000);
+    assert_eq!(pm.current_brk_frontier(), 0x14_000);
+    assert!(
+        pm.mappings()
+            .iter()
+            .any(|(range, _)| *range == (0x10_000..0x14_000))
+    );
+}
+
+#[test]
+fn brk_rejects_requests_below_initial_brk() {
+    let pm = make_page_manager();
+    pm.set_initial_brk(0x10_000);
+
+    unsafe {
+        assert_eq!(pm.brk(0x0f_000).unwrap(), 0x10_000);
+    }
+    assert_eq!(pm.current_brk(), 0x10_000);
+    assert_eq!(pm.current_brk_frontier(), 0x10_000);
+    assert!(pm.mappings().is_empty());
+}
+
+#[test]
+fn ensure_brk_past_makes_floor_sticky() {
+    let pm = make_page_manager();
+    pm.set_initial_brk(0x10_000);
+    pm.ensure_brk_past(0x20_000);
+
+    assert_eq!(pm.current_brk(), 0x20_000);
+    assert_eq!(pm.current_brk_frontier(), 0x20_000);
+
+    unsafe {
+        assert_eq!(pm.brk(0x18_000).unwrap(), 0x20_000);
+        assert_eq!(pm.brk(0x24_000).unwrap(), 0x24_000);
+    }
+    assert_eq!(pm.current_brk(), 0x24_000);
+    assert_eq!(pm.current_brk_frontier(), 0x24_000);
+    assert!(
+        pm.mappings()
+            .iter()
+            .any(|(range, _)| *range == (0x20_000..0x24_000))
     );
 }

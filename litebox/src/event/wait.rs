@@ -74,7 +74,7 @@ impl<Platform: RawSyncPrimitivesProvider> Waker<Platform> {
         self.0.wake();
     }
 
-    /// Returns `true` if two `Waker`s refer to the same underlying wait state.
+    /// Returns `true` if both wakers refer to the same thread's wait state.
     pub fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }

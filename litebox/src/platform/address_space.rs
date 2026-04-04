@@ -111,17 +111,14 @@ pub trait AddressSpaceProvider {
     /// On kernel platforms implementations **must** restore the prior address
     /// space even if `f` panics (use a guard / RAII pattern). Userland
     /// platforms may keep this as a thin wrapper.
-    ///
-    /// The default returns [`AddressSpaceError::NotSupported`]. Platforms that
-    /// implement [`activate_address_space`](Self::activate_address_space) should
-    /// also override this method with a proper save/restore sequence.
     fn with_address_space<R>(
         &self,
         id: Self::AddressSpaceId,
         f: impl FnOnce() -> R,
     ) -> Result<R, AddressSpaceError> {
-        let _ = (id, f);
-        Err(AddressSpaceError::NotSupported)
+        self.activate_address_space(id)?;
+        let result = f();
+        Ok(result)
     }
 
     /// Whether the platform requires eager copy-on-write snapshots during
