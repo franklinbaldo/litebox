@@ -87,20 +87,17 @@ impl SignalState {
     }
 
     /// Get the current blocked signal mask.
-    #[expect(dead_code)] // Used by later PRs (fork, vfork).
     pub fn get_blocked(&self) -> SigSet {
         self.blocked.get()
     }
 
     /// Set the blocked signal mask.
-    #[expect(dead_code)] // Used by later PRs (fork, vfork).
     pub fn set_blocked(&self, mask: SigSet) {
         self.blocked.set(mask);
     }
 
     /// Schedule a deferred mask restore. The mask will be restored after the
     /// next `process_signals` call delivers any unblocked signals.
-    #[expect(dead_code)] // Used by later PRs (ppoll/pselect signal mask restore).
     pub fn set_restore_mask(&self, mask: SigSet) {
         self.restore_mask.set(Some(mask));
     }

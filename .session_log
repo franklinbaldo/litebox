@@ -166,3 +166,50 @@
   - Removed unused imports: siginfo_kernel, core::fmt::Write, PROC_SELF_EXE_INO (deferred to caller PRs)
 - Build: pass, fmt: pass, clippy: pass (only pre-existing warnings), 377 tests pass, 69 skipped
 - Next: PR 33 (copy_file_range + dup rework + remaining file.rs independents)
+
+## Entry 15 — PR 33 committed and pushed
+- Branch: wdcui/stacked/pr33-copy-file-range-dup-openat
+- Parent: wdcui/stacked/pr32-pty-proc-ioctl-misc (f21ae2aa)
+- 4 files changed, ~816 insertions(+), ~144 deletions(-)
+- Changes:
+  - litebox_shim_linux/src/syscalls/file.rs:
+    - Added siginfo_kernel import, PROC_SELF_EXE_INO static, file_position_lock Mutex on FilesState
+    - Removed dead_code attrs from TerminalKind, FsState::with_cwd/current_working_directory (re-added as needed), validate_removedir_path_str, open_synthetic_proc_text, pty_rdev_for_raw_fd, _pty_target_for_guest_fd
+    - FsPath::FdRelative comment improvement
+    - Implemented openat FdRelative path: open_at delegation, metadata tagging (StdioStatusFlags, HostStdioSourceFd, HostTtyAlias, HostPtyDeviceFd), set_open_status_flags
+    - sys_open: added PROC_SELF_EXE_INO compare-exchange for stable inode identity
+    - sys_unlinkat: validate_removedir_path_str call, FdRelative delegation via unlink_at
+    - sys_mkdirat: FdRelative delegation via mkdir_at
+    - sys_read: file_position_lock for regular files, SIGPIPE signal delivery on write errors
+    - copy_file_range: full implementation with explicit offset helpers (copy_file_range_explicit_offset, finish_copy_file_range_explicit_offset, regular_file_open_flags, validate_regular_file_typed_fd, sys_copy_file_range)
+    - sys_readv: fixed CRITICAL bug — position lock now acquired outside the loop (was per-iov-element, breaking atomicity)
+    - sys_write: file_position_lock for regular files, SIGPIPE on BrokenPipe
+    - sys_writev: already had correct lock placement (outside loop)
+    - sys_lseek: file_position_lock for regular files
+    - do_dup_at_or_above: new helper function for dup-at-or-above semantics
+    - sys_dup: uses do_dup_at_or_above
+    - sys_dup3: full rewrite with metadata cloning, cloexec propagation
+    - sys_fcntl: F_DUPFD/F_DUPFD_CLOEXEC use do_dup_at_or_above, metadata cloning
+    - descriptor_stat: added PROC_SELF_EXE_INO lookup for /proc/self/exe inode
+    - sys_newfstatat: Cwd/FdRelative path delegation via stat_at
+    - sys_faccessat: FdRelative delegation via access_at
+    - sys_renameat2: FdRelative delegation via rename_at, cross-directory rename support
+    - sys_linkat: FdRelative delegation via link_at
+    - sys_symlinkat: FdRelative delegation via symlink_at
+    - sys_ppoll: signal mask save/restore via set_blocked/set_restore_mask
+    - sys_pselect6: signal mask save/restore
+    - epoll_ctl: event_ptr parameter naming improvement
+    - host_stdio_stream_for_fd: re-applied ino=11→Stderr fix from PR 32 (reverted by subagent)
+    - TIOCGPTN: re-applied >=256 PTY index fix from PR 32
+    - TIOCGPTPEER: re-applied STATUS_FLAGS_MASK fix and master-vs-slave comment from PR 32
+    - FIONREAD: re-applied regular-file limitation comment from PR 32
+  - litebox_shim_linux/src/lib.rs: CopyFileRange dispatch to sys_copy_file_range
+  - litebox_shim_linux/src/syscalls/signal/mod.rs: removed dead_code attrs from get_blocked, set_blocked, set_restore_mask (now called by ppoll/pselect)
+  - dev_tests/src/ratchet.rs: litebox_shim_linux globals ratchet 3→4 (PROC_SELF_EXE_INO)
+- Static analysis findings fixed:
+  - CRITICAL: readv position lock was per-iov-element (fixed: moved outside loop)
+  - MODERATE: TIOCGPTN major range reverted by subagent (re-applied PR 32 fix)
+  - MODERATE: host_stdio_stream_for_fd default changed (re-applied PR 32 fix)
+  - MINOR: TIOCGPTPEER STATUS_FLAGS_MASK reverted by subagent (re-applied)
+- Build: pass, fmt: pass, clippy: pass (only pre-existing warnings), 377 tests pass, 69 skipped, ratchet pass
+- Next: PR 34 (elf.rs loader overhaul + tests.rs test harness)

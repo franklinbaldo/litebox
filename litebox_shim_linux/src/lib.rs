@@ -1173,6 +1173,14 @@ impl<FS: ShimFS> Task<FS> {
                 self.validate_fd(fd)?;
                 Ok(0)
             }
+            SyscallRequest::CopyFileRange {
+                fd_in,
+                off_in,
+                fd_out,
+                off_out,
+                len,
+                flags,
+            } => self.sys_copy_file_range(fd_in, off_in, fd_out, off_out, len, flags),
             SyscallRequest::XattrGetPath {
                 pathname,
                 name,
