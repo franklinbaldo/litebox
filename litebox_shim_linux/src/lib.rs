@@ -91,11 +91,11 @@ impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
     type ExecutionContext = litebox_common_linux::ExecutionContext;
 
     fn init(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        self.enter_shim(true, &mut ctx.regs, Task::handle_init_request)
+        self.enter_shim(true, ctx, Task::handle_init_request)
     }
 
     fn syscall(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        self.enter_shim(false, &mut ctx.regs, Task::handle_syscall_request)
+        self.enter_shim(false, ctx, Task::handle_syscall_request)
     }
 
     fn exception(
@@ -117,13 +117,13 @@ impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
                 return ContinueOperation::Terminate;
             }
         }
-        self.enter_shim(false, &mut ctx.regs, |task, _ctx| {
-            task.handle_exception_request(info);
+        self.enter_shim(false, ctx, |task, ctx| {
+            task.handle_exception_request(info, ctx);
         })
     }
 
     fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        self.enter_shim(false, &mut ctx.regs, |_, _| {})
+        self.enter_shim(false, ctx, |_, _| {})
     }
 }
 
@@ -131,8 +131,8 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
     fn enter_shim(
         &self,
         is_init: bool,
-        ctx: &mut litebox_common_linux::PtRegs,
-        f: impl FnOnce(&Task<FS>, &mut litebox_common_linux::PtRegs),
+        ctx: &mut litebox_common_linux::ExecutionContext,
+        f: impl FnOnce(&Task<FS>, &mut litebox_common_linux::ExecutionContext),
     ) -> ContinueOperation {
         if !is_init {
             self.task.enter_from_guest();
@@ -519,7 +519,7 @@ impl<FS: ShimFS> Task<FS> {
     /// # Panics
     ///
     /// Unsupported syscalls or arguments would trigger a panic for development purposes.
-    fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
+    fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::ExecutionContext) {
         let return_value = match self.do_syscall(ctx) {
             Ok(v) => v,
             Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
@@ -534,7 +534,7 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
-    fn do_syscall(&self, ctx: &mut litebox_common_linux::PtRegs) -> Result<usize, Errno> {
+    fn do_syscall(&self, ctx: &mut litebox_common_linux::ExecutionContext) -> Result<usize, Errno> {
         // Helper macro to unify the return value from `sys_*`.
         macro_rules! syscall {
             ($func:ident($($args:expr),*)) => {

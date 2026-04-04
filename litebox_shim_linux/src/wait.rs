@@ -35,7 +35,10 @@ impl<FS: ShimFS> Task<FS> {
     /// Prepares to return to run guest code. Returns `false` if the task should
     /// exit instead.
     #[must_use]
-    pub(crate) fn prepare_to_run_guest(&self, ctx: &mut litebox_common_linux::PtRegs) -> bool {
+    pub(crate) fn prepare_to_run_guest(
+        &self,
+        ctx: &mut litebox_common_linux::ExecutionContext,
+    ) -> bool {
         self.wait_state.0.prepare_to_run_guest(|| {
             use litebox::platform::SignalProvider as _;
             self.global.platform.take_pending_signals(|signal| {

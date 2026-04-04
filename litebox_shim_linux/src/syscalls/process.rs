@@ -1471,7 +1471,7 @@ impl<FS: ShimFS> Task<FS> {
         Ok(())
     }
 
-    pub(crate) fn handle_init_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
+    pub(crate) fn handle_init_request(&self, ctx: &mut litebox_common_linux::ExecutionContext) {
         self.init_thread_context(ctx);
         // Attach the thread handle so that the thread can be interrupted.
         self.thread
@@ -1747,12 +1747,12 @@ mod tests {
             // `process_signals` is called when about to switch back to userspace, so simulate that here.
             let mut stack = [0u8; 4096];
             #[cfg(target_arch = "x86_64")]
-            let mut regs = litebox_common_linux::PtRegs { rsp: stack.as_mut_ptr() as usize + stack.len(), ..Default::default() };
+            let mut ctx = litebox_common_linux::ExecutionContext { regs: litebox_common_linux::PtRegs { rsp: stack.as_mut_ptr() as usize + stack.len(), ..Default::default() }, ..Default::default() };
             #[cfg(target_arch = "x86")]
-            let mut regs = litebox_common_linux::PtRegs { esp: stack.as_mut_ptr() as usize + stack.len(), ..Default::default() };
-            task.process_signals(&mut regs);
+            let mut ctx = litebox_common_linux::ExecutionContext { regs: litebox_common_linux::PtRegs { esp: stack.as_mut_ptr() as usize + stack.len(), ..Default::default() }, ..Default::default() };
+            task.process_signals(&mut ctx);
             assert_eq!(
-                regs.get_ip(), callback_addr,
+                ctx.get_ip(), callback_addr,
                 "after processing signals, execution should be redirected to the custom handler"
             );
 

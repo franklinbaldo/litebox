@@ -8,6 +8,14 @@ pub(crate) mod x86;
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 
+/// Reinitializes the guest FP/SIMD state for a fresh process image.
+/// Call after `execve` resets registers but before re-entering the guest.
+#[cfg(target_arch = "x86_64")]
+#[expect(dead_code)] // Called by execve in a later PR.
+pub(crate) fn reinit_guest_fp_state(fp_regs: &mut litebox_common_linux::FpRegs) {
+    x86_64::reinit_guest_fp_state(fp_regs);
+}
+
 use litebox_common_linux::signal::SignalDisposition;
 #[cfg(target_arch = "x86")]
 use x86 as arch;
@@ -27,8 +35,8 @@ use litebox::{
     utils::ReinterpretUnsignedExt as _,
 };
 use litebox_common_linux::signal::{
-    MINSIGSTKSZ, NSIG, SI_KERNEL, SI_USER, SIG_DFL, SIG_IGN, SaFlags, SigAction, SigAltStack,
-    SigSet, Siginfo, SiginfoData, SigmaskHow, Signal, SsFlags, Ucontext,
+    MINSIGSTKSZ, NSIG, SEGV_ACCERR, SEGV_MAPERR, SI_KERNEL, SI_USER, SIG_DFL, SIG_IGN, SaFlags,
+    SigAction, SigAltStack, SigSet, Siginfo, SiginfoData, SigmaskHow, Signal, SsFlags, Ucontext,
 };
 use litebox_common_linux::{PtRegs, errno::Errno};
 use litebox_platform_multiplex::Platform;
@@ -46,6 +54,12 @@ pub(crate) struct SignalState {
     altstack: Cell<SigAltStack>,
     /// The last exception info recorded for signal delivery.
     last_exception: Cell<litebox::shim::ExceptionInfo>,
+    /// Deferred mask restore (like Linux's TIF_RESTORE_SIGMASK).
+    ///
+    /// When set, `process_signals` will restore this mask after delivering
+    /// pending signals. Used by `epoll_pwait` / `ppoll` to atomically
+    /// unblock signals during the wait and re-block them afterwards.
+    restore_mask: Cell<Option<SigSet>>,
 }
 
 impl SignalState {
@@ -68,7 +82,32 @@ impl SignalState {
                 cr2: 0,
                 kernel_mode: false,
             }),
+            restore_mask: Cell::new(None),
         }
+    }
+
+    /// Get the current blocked signal mask.
+    #[expect(dead_code)] // Used by later PRs (fork, vfork).
+    pub fn get_blocked(&self) -> SigSet {
+        self.blocked.get()
+    }
+
+    /// Set the blocked signal mask.
+    #[expect(dead_code)] // Used by later PRs (fork, vfork).
+    pub fn set_blocked(&self, mask: SigSet) {
+        self.blocked.set(mask);
+    }
+
+    /// Schedule a deferred mask restore. The mask will be restored after the
+    /// next `process_signals` call delivers any unblocked signals.
+    #[expect(dead_code)] // Used by later PRs (ppoll/pselect signal mask restore).
+    pub fn set_restore_mask(&self, mask: SigSet) {
+        self.restore_mask.set(Some(mask));
+    }
+
+    #[expect(dead_code)] // Used by later PRs.
+    pub(crate) fn last_exception(&self) -> litebox::shim::ExceptionInfo {
+        self.last_exception.get()
     }
 
     pub fn clone_for_new_task(&self) -> Self {
@@ -92,29 +131,36 @@ impl SignalState {
             .into(),
             // Preserve last exception
             last_exception: self.last_exception.clone(),
+            restore_mask: Cell::new(None),
+        }
+    }
+
+    /// Resets user-installed signal handlers to `SIG_DFL`.
+    ///
+    /// Signals already set to `SIG_DFL` or `SIG_IGN` are left untouched.
+    /// Used by both `execve` (which also clears the altstack) and
+    /// `CLONE_CLEAR_SIGHAND` (which does not touch the altstack).
+    pub(crate) fn reset_caught_handlers(&self) {
+        let mut handlers = self.handlers.borrow_mut();
+        // Ensure that the signal handlers are no longer shared.
+        let handlers = Arc::make_mut(&mut handlers);
+        for handler in &mut handlers.inner.get_mut().handlers {
+            if handler.action.sigaction != SIG_DFL && handler.action.sigaction != SIG_IGN {
+                handler.action = SigAction {
+                    sigaction: SIG_DFL,
+                    restorer: 0,
+                    flags: SaFlags::empty(),
+                    mask: SigSet::empty(),
+                    #[cfg(target_arch = "x86_64")]
+                    __pad: 0,
+                };
+            }
         }
     }
 
     /// Resets signal state for an `execve` call.
     pub(crate) fn reset_for_exec(&self) {
-        let mut handlers = self.handlers.borrow_mut();
-        // Ensure that the signal handlers are no longer shared.
-        let handlers = Arc::make_mut(&mut handlers);
-        // Reset the handlers to defaults.
-        for handler in &mut handlers.inner.get_mut().handlers {
-            handler.action = SigAction {
-                sigaction: if handler.action.sigaction == SIG_IGN {
-                    SIG_IGN
-                } else {
-                    SIG_DFL
-                },
-                restorer: 0,
-                flags: SaFlags::empty(),
-                mask: SigSet::empty(),
-                #[cfg(target_arch = "x86_64")]
-                __pad: 0,
-            };
-        }
+        self.reset_caught_handlers();
         self.clear_sigaltstack();
     }
 }
@@ -185,7 +231,7 @@ impl Clone for SignalHandlers {
     }
 }
 
-struct PendingSignals {
+pub(crate) struct PendingSignals {
     /// The set of pending signals.
     pending: SigSet,
     /// The queue of pending siginfo structures.
@@ -193,7 +239,7 @@ struct PendingSignals {
 }
 
 impl PendingSignals {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             pending: SigSet::empty(),
             queue: VecDeque::new(),
@@ -273,11 +319,30 @@ fn is_on_stack(stack: &SigAltStack, sp: usize) -> bool {
 }
 
 /// Creates a `Siginfo` for an exception signal.
-fn siginfo_exception(signal: Signal, fault_address: usize) -> Siginfo {
+///
+/// For `SIGSEGV`, the `page_fault_error_code` is used to distinguish between
+/// `SEGV_MAPERR` (non-present page, bit 0 clear) and `SEGV_ACCERR`
+/// (protection fault, bit 0 set). Other signals use `SI_KERNEL`.
+fn siginfo_exception(
+    signal: Signal,
+    fault_address: usize,
+    page_fault_error_code: Option<u64>,
+) -> Siginfo {
+    let code = match (signal, page_fault_error_code) {
+        (Signal::SIGSEGV, Some(error_code)) => {
+            if (error_code & 0x1) == 0 {
+                SEGV_MAPERR
+            } else {
+                SEGV_ACCERR
+            }
+        }
+        _ => SI_KERNEL,
+    };
+
     Siginfo {
         signo: signal.as_i32(),
         errno: 0,
-        code: SI_KERNEL,
+        code,
         #[cfg(target_arch = "x86_64")]
         __pad: 0,
         data: SiginfoData::new_addr(fault_address),
@@ -462,7 +527,10 @@ impl<FS: ShimFS> Task<FS> {
         Ok(0)
     }
 
-    pub(crate) fn sys_rt_sigreturn(&self, ctx: &mut PtRegs) -> Result<usize, Errno> {
+    pub(crate) fn sys_rt_sigreturn(
+        &self,
+        ctx: &mut litebox_common_linux::ExecutionContext,
+    ) -> Result<usize, Errno> {
         let uctx_addr = arch::uctx_addr(ctx);
         let uctx_ptr = ConstPtr::<Ucontext>::from_usize(uctx_addr);
         let Some(uctx) = uctx_ptr.read_at_offset(0) else {
@@ -475,7 +543,19 @@ impl<FS: ShimFS> Task<FS> {
 
         self.signals.set_signal_mask(uctx.sigmask);
 
-        Ok(arch::restore_sigcontext(ctx, &uctx.mcontext))
+        arch::restore_sigcontext(ctx, &uctx.mcontext).map_err(|()| {
+            // FP state validation failed (e.g., invalid MXCSR in
+            // guest-controlled signal frame). Force SIGSEGV matching
+            // Linux kernel behavior for malformed signal frames.
+            self.force_signal(Signal::SIGSEGV, false);
+            Errno::EFAULT
+        })?;
+
+        // Return the restored RAX/EAX so that the caller's unconditional
+        // writeback (ctx.rax = return_value) is idempotent. Without this,
+        // rt_sigreturn would resume with RAX=0 instead of the value from
+        // the signal frame.
+        Ok(arch::sigreturn_rax(ctx))
     }
 
     pub(crate) fn sys_rt_sigaction(
@@ -564,7 +644,7 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Deliver any pending signals.
-    pub(crate) fn process_signals(&self, ctx: &mut PtRegs) {
+    pub(crate) fn process_signals(&self, ctx: &mut litebox_common_linux::ExecutionContext) {
         loop {
             let blocked = self.signals.blocked.get();
             let (signal, siginfo) = {
@@ -586,7 +666,23 @@ impl<FS: ShimFS> Task<FS> {
                 return;
             }
 
-            let action = self.signals.handlers.borrow().inner.lock()[signal].action;
+            let action = {
+                let handlers = self.signals.handlers.borrow();
+                let mut inner = handlers.inner.lock();
+                let action = inner[signal].action;
+                // SA_RESETHAND: atomically reset to SIG_DFL while still
+                // holding the handler lock, before any other thread can
+                // snapshot this handler for a concurrent delivery.
+                if action.flags.contains(SaFlags::RESETHAND)
+                    && action.sigaction != SIG_DFL
+                    && action.sigaction != SIG_IGN
+                {
+                    inner[signal].action.sigaction = SIG_DFL;
+                    inner[signal].action.flags &= !SaFlags::RESETHAND;
+                }
+                action
+            };
+
             #[expect(clippy::match_same_arms)]
             match action.sigaction {
                 SIG_DFL => {
@@ -624,6 +720,13 @@ impl<FS: ShimFS> Task<FS> {
                     }
                 }
             }
+        }
+
+        // If a deferred mask restore is pending (set by epoll_pwait/ppoll),
+        // restore the original signal mask now that signals have been delivered
+        // with the temporarily-unblocked mask.
+        if let Some(old_mask) = self.signals.restore_mask.take() {
+            self.signals.blocked.set(old_mask);
         }
     }
 
@@ -719,7 +822,16 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     fn force_signal_with_info(&self, signal: Signal, force_exit: bool, siginfo: Siginfo) {
-        assert!(matches!(signal, Signal::SIGKILL | Signal::SIGSEGV));
+        assert!(matches!(
+            signal,
+            Signal::SIGKILL
+                | Signal::SIGSEGV
+                | Signal::SIGABRT
+                | Signal::SIGBUS
+                | Signal::SIGFPE
+                | Signal::SIGILL
+                | Signal::SIGTRAP
+        ));
 
         self.signals
             .pending
@@ -750,7 +862,11 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
-    pub(crate) fn handle_exception_request(&self, info: &litebox::shim::ExceptionInfo) {
+    pub(crate) fn handle_exception_request(
+        &self,
+        info: &litebox::shim::ExceptionInfo,
+        _ctx: &PtRegs,
+    ) {
         let signal = match info.exception {
             Exception::DIVIDE_ERROR => Signal::SIGFPE,
             Exception::BREAKPOINT => Signal::SIGTRAP,
@@ -766,6 +882,39 @@ impl<FS: ShimFS> Task<FS> {
             0
         };
         self.signals.last_exception.set(*info);
-        self.force_signal_with_info(signal, false, siginfo_exception(signal, fault_address));
+        self.force_signal_with_info(
+            signal,
+            false,
+            siginfo_exception(
+                signal,
+                fault_address,
+                (info.exception == Exception::PAGE_FAULT).then_some(info.error_code.into()),
+            ),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sigsegv_page_fault_uses_maperr_for_nonpresent_pages() {
+        // Error code 0x6 = bit 0 clear → non-present page → SEGV_MAPERR
+        let siginfo = siginfo_exception(Signal::SIGSEGV, 0x1234, Some(0x6));
+        assert_eq!(siginfo.code, SEGV_MAPERR);
+    }
+
+    #[test]
+    fn sigsegv_page_fault_uses_accerr_for_protection_faults() {
+        // Error code 0x7 = bit 0 set → protection fault → SEGV_ACCERR
+        let siginfo = siginfo_exception(Signal::SIGSEGV, 0x1234, Some(0x7));
+        assert_eq!(siginfo.code, SEGV_ACCERR);
+    }
+
+    #[test]
+    fn non_page_fault_exceptions_keep_kernel_code() {
+        let siginfo = siginfo_exception(Signal::SIGILL, 0, None);
+        assert_eq!(siginfo.code, SI_KERNEL);
     }
 }
