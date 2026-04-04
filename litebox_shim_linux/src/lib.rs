@@ -604,8 +604,14 @@ impl<FS: ShimFS> LinuxShim<FS> {
                         let _old = dt
                             .set_entry_metadata(new_fd, syscalls::net::SocketProxy(proxy.clone()));
                     }
-                    let proxy_set = child_net.set_socket_proxy(new_fd, proxy);
+                    let proxy_set = child_net.set_socket_proxy(new_fd, proxy.clone());
                     assert!(proxy_set, "failed to set proxy on imported socket");
+
+                    // The proxy was created with default state (Closed), but the
+                    // socket is already listening.  Without this, check_io_events()
+                    // returns HUP (always-polled), causing epoll_wait to return
+                    // immediately in an infinite spin loop.
+                    proxy.set_state(litebox::net::socket_channel::SocketState::Listening);
 
                     // Replace the child's raw fd entry: consume the old
                     // (parent-shared) fd and insert the new (child-owned) one.
