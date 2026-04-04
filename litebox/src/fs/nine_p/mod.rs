@@ -26,6 +26,7 @@ use crate::{LiteBox, sync};
 
 mod client;
 mod fcall;
+mod pending_table;
 
 pub mod transport;
 
@@ -54,6 +55,9 @@ pub enum Error {
     #[error("I/O error")]
     Io,
 
+    #[error("Operation interrupted")]
+    Interrupted,
+
     #[error("Invalid response from server")]
     InvalidResponse,
 
@@ -77,6 +81,7 @@ impl From<Error> for OpenError {
                 ENAMETOOLONG => OpenError::PathError(PathError::InvalidPathname),
                 _ => OpenError::Io,
             },
+            Error::Interrupted => OpenError::Interrupted,
             Error::Io | Error::InvalidResponse => OpenError::Io,
         }
     }
@@ -85,6 +90,7 @@ impl From<Error> for OpenError {
 impl From<Error> for ReadError {
     fn from(e: Error) -> Self {
         match e {
+            Error::Interrupted => ReadError::Interrupted,
             Error::Remote(errno) => match errno {
                 ENOENT | EISDIR => ReadError::NotAFile,
                 EPERM | EACCES => ReadError::NotForReading,
@@ -98,6 +104,7 @@ impl From<Error> for ReadError {
 impl From<Error> for WriteError {
     fn from(e: Error) -> Self {
         match e {
+            Error::Interrupted => WriteError::Interrupted,
             Error::Remote(errno) => match errno {
                 ENOENT | EISDIR => WriteError::NotAFile,
                 EPERM | EACCES => WriteError::NotForWriting,
@@ -120,7 +127,7 @@ impl From<Error> for MkdirError {
                 ENAMETOOLONG => MkdirError::PathError(PathError::InvalidPathname),
                 _ => MkdirError::Io,
             },
-            Error::Io | Error::InvalidResponse => MkdirError::Io,
+            Error::Io | Error::InvalidResponse | Error::Interrupted => MkdirError::Io,
         }
     }
 }
@@ -132,7 +139,9 @@ impl From<Error> for ReadDirError {
                 ENOENT | ENOTDIR => ReadDirError::NotADirectory,
                 _ => ReadDirError::Io,
             },
-            Error::Io | Error::InvalidResponse | Error::InvalidPathname => ReadDirError::Io,
+            Error::Io | Error::InvalidResponse | Error::InvalidPathname | Error::Interrupted => {
+                ReadDirError::Io
+            }
         }
     }
 }
@@ -149,7 +158,7 @@ impl From<Error> for UnlinkError {
                 ENAMETOOLONG => UnlinkError::PathError(PathError::InvalidPathname),
                 _ => UnlinkError::Io,
             },
-            Error::Io | Error::InvalidResponse => UnlinkError::Io,
+            Error::Io | Error::InvalidResponse | Error::Interrupted => UnlinkError::Io,
         }
     }
 }
@@ -166,7 +175,7 @@ impl From<Error> for RmdirError {
                 ENOTEMPTY => RmdirError::NotEmpty,
                 _ => RmdirError::Io,
             },
-            Error::Io | Error::InvalidResponse => RmdirError::Io,
+            Error::Io | Error::InvalidResponse | Error::Interrupted => RmdirError::Io,
         }
     }
 }
@@ -187,7 +196,7 @@ impl From<Error> for FileStatusError {
                 }),
                 _ => FileStatusError::Io,
             },
-            Error::Io | Error::InvalidResponse => FileStatusError::Io,
+            Error::Io | Error::InvalidResponse | Error::Interrupted => FileStatusError::Io,
         }
     }
 }
@@ -201,7 +210,9 @@ impl From<Error> for SeekError {
                 ESPIPE => SeekError::NonSeekable,
                 _ => SeekError::Io,
             },
-            _ => SeekError::Io,
+            Error::Io | Error::InvalidResponse | Error::InvalidPathname | Error::Interrupted => {
+                SeekError::Io
+            }
         }
     }
 }
@@ -215,7 +226,9 @@ impl From<Error> for TruncateError {
                 EPERM | EACCES => TruncateError::NotForWriting,
                 _ => TruncateError::Io,
             },
-            Error::Io | Error::InvalidResponse | Error::InvalidPathname => TruncateError::Io,
+            Error::Io | Error::InvalidResponse | Error::InvalidPathname | Error::Interrupted => {
+                TruncateError::Io
+            }
         }
     }
 }
@@ -230,7 +243,7 @@ impl From<Error> for ChmodError {
                 EPERM | EACCES => ChmodError::NotTheOwner,
                 _ => ChmodError::Io,
             },
-            Error::Io | Error::InvalidResponse => ChmodError::Io,
+            Error::Io | Error::InvalidResponse | Error::Interrupted => ChmodError::Io,
         }
     }
 }
@@ -245,7 +258,7 @@ impl From<Error> for ChownError {
                 EPERM | EACCES => ChownError::NotTheOwner,
                 _ => ChownError::Io,
             },
-            Error::Io | Error::InvalidResponse => ChownError::Io,
+            Error::Io | Error::InvalidResponse | Error::Interrupted => ChownError::Io,
         }
     }
 }
@@ -266,15 +279,12 @@ impl From<Rlerror> for Error {
 ///
 /// - `Platform`: The platform provider that supplies synchronization primitives and other
 ///   platform-specific functionality.
-/// - `T`: The transport type that implements both `Read` and `Write` traits.
-pub struct FileSystem<
-    Platform: sync::RawSyncPrimitivesProvider,
-    T: transport::Read + transport::Write,
-> {
+/// - `W`: The transport write half type that implements the `Write` trait.
+pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> {
     /// Reference to the LiteBox instance
     litebox: LiteBox<Platform>,
     /// 9P client for protocol operations
-    client: client::Client<Platform, T>,
+    client: client::Client<Platform, W>,
     /// Root (attached to the root of the remote filesystem)
     root: (fcall::Qid, fcall::Fid, String),
     // cwd invariant: always ends with a `/`
@@ -283,19 +293,23 @@ pub struct FileSystem<
     unlinkat_supported: AtomicBool,
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::Write>
-    FileSystem<Platform, T>
-{
+impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> FileSystem<Platform, W> {
     /// Construct a new `FileSystem` instance
     ///
     /// This function is expected to only be invoked once per platform, as an initialization step,
     /// and the created `FileSystem` handle is expected to be shared across all usage over the
     /// system.
     ///
+    /// Version negotiation and attach are performed synchronously using both
+    /// the writer and reader halves. After construction the reader is returned
+    /// for use by the response worker thread (see
+    /// [`WorkerHandle::poll_responses`]).
+    ///
     /// # Arguments
     ///
     /// * `litebox` - Reference to the LiteBox instance for platform access
-    /// * `transport` - The transport for 9P communication
+    /// * `writer` - Write half of the 9P transport
+    /// * `reader` - Read half of the 9P transport (returned after handshake)
     /// * `msize` - Maximum message size to negotiate
     /// * `username` - Username for authentication
     /// * `path` - Attach path (typically the root directory path)
@@ -303,23 +317,75 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     /// # Errors
     ///
     /// Returns an error if version negotiation or attach fails.
-    pub fn new(
+    pub fn new<R: transport::Read>(
         litebox: &LiteBox<Platform>,
-        transport: T,
+        writer: W,
+        reader: R,
+        msize: u32,
+        username: &str,
+        path: &str,
+    ) -> Result<(Self, R), Error> {
+        let (client, reader, qid, fid) =
+            client::Client::new_with_handshake(writer, reader, msize, username, path)?;
+
+        Ok((
+            Self {
+                litebox: litebox.clone(),
+                client,
+                root: (qid, fid, String::from(path)),
+                current_working_dir: String::from("/"),
+                unlinkat_supported: AtomicBool::new(true),
+            },
+            reader,
+        ))
+    }
+
+    /// Construct a synchronous (single-threaded) `FileSystem` instance.
+    ///
+    /// Unlike [`new`](Self::new), this variant stores the reader inside the
+    /// client so that `fcall()` reads responses inline after each send.
+    /// No background worker thread is needed.
+    ///
+    /// Use this for platforms that cannot spawn threads (e.g. SNP kernel).
+    pub fn new_sync<R: transport::Read + Send + 'static>(
+        litebox: &LiteBox<Platform>,
+        writer: W,
+        reader: R,
         msize: u32,
         username: &str,
         path: &str,
     ) -> Result<Self, Error> {
-        let client = client::Client::new(transport, msize)?;
-        let (qid, fid) = client.attach(username, path)?;
+        let (fs, reader) = Self::new(litebox, writer, reader, msize, username, path)?;
+        fs.client
+            .set_inline_reader(alloc::boxed::Box::new(reader), fs.client.msize());
+        Ok(fs)
+    }
 
-        Ok(Self {
-            litebox: litebox.clone(),
-            client,
-            root: (qid, fid, String::from(path)),
-            current_working_dir: String::from("/"),
-            unlinkat_supported: AtomicBool::new(true),
-        })
+    /// Returns the negotiated maximum message size.
+    pub fn msize(&self) -> u32 {
+        self.client.msize()
+    }
+
+    /// Create a worker handle that can be sent to a background thread.
+    ///
+    /// The handle holds an `Arc` reference to the shared client inner
+    /// state (pending table + poison flag) but **not** to the transport
+    /// writer.  This ensures that dropping the `FileSystem` closes the
+    /// writer, letting the worker observe EOF and exit cleanly.
+    ///
+    /// ```ignore
+    /// let (fs, mut reader) = FileSystem::new(litebox, writer, reader, ...)?;
+    /// let worker_handle = fs.worker_handle();
+    /// let msize = fs.msize();
+    /// std::thread::spawn(move || {
+    ///     let mut buf = Vec::with_capacity(msize as usize);
+    ///     while worker_handle.poll_responses(&mut reader, &mut buf) {}
+    /// });
+    /// ```
+    pub fn worker_handle(&self) -> WorkerHandle {
+        WorkerHandle {
+            inner: self.client.shared_inner(),
+        }
     }
 
     /// Gives the absolute path for `path`, resolving any `.` or `..`s, and making sure to account
@@ -512,7 +578,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             let result =
                 self.client
                     .unlinkat(parent_fid, name, if is_file { 0 } else { AT_REMOVEDIR });
-            let _ = self.client.clunk(parent_fid);
+            self.client.clunk_async(parent_fid);
             if let Err(Error::Remote(ENOSYS | EOPNOTSUPP)) = &result {
                 self.unlinkat_supported.store(false, Ordering::SeqCst);
                 // fall back to `remove`
@@ -528,21 +594,21 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     }
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::Write> Drop
-    for FileSystem<Platform, T>
+impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> Drop
+    for FileSystem<Platform, W>
 {
     fn drop(&mut self) {
-        let _ = self.client.clunk(self.root.1);
+        self.client.clunk_async(self.root.1);
     }
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::Write>
-    super::private::Sealed for FileSystem<Platform, T>
+impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::private::Sealed
+    for FileSystem<Platform, W>
 {
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::Write>
-    super::FileSystem for FileSystem<Platform, T>
+impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::FileSystem
+    for FileSystem<Platform, W>
 {
     #[allow(clippy::similar_names)]
     fn open(
@@ -550,7 +616,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         path: impl crate::path::Arg,
         flags: super::OFlags,
         mode: super::Mode,
-    ) -> Result<FileFd<Platform, T>, super::errors::OpenError> {
+    ) -> Result<FileFd<Platform, W>, super::errors::OpenError> {
         // TODO: we don't support non-blocking, so ignore that flag instead of returning an error
         let flags = flags - OFlags::NONBLOCK;
         let currently_supported_oflags: OFlags = OFlags::RDONLY
@@ -595,7 +661,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         Ok(fd)
     }
 
-    fn close(&self, fd: &FileFd<Platform, T>) -> Result<(), super::errors::CloseError> {
+    fn close(&self, fd: &FileFd<Platform, W>) -> Result<(), super::errors::CloseError> {
         let entry = self.litebox.descriptor_table_mut().remove(fd);
         if let Some(entry) = entry {
             let _ = self.client.clunk(entry.entry.fid);
@@ -605,7 +671,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
     fn read(
         &self,
-        fd: &FileFd<Platform, T>,
+        fd: &FileFd<Platform, W>,
         buf: &mut [u8],
         offset: Option<usize>,
     ) -> Result<usize, super::errors::ReadError> {
@@ -638,7 +704,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
     fn write(
         &self,
-        fd: &FileFd<Platform, T>,
+        fd: &FileFd<Platform, W>,
         buf: &[u8],
         offset: Option<usize>,
     ) -> Result<usize, super::errors::WriteError> {
@@ -671,7 +737,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
     fn seek(
         &self,
-        fd: &FileFd<Platform, T>,
+        fd: &FileFd<Platform, W>,
         offset: isize,
         whence: super::SeekWhence,
     ) -> Result<usize, SeekError> {
@@ -705,7 +771,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
     fn truncate(
         &self,
-        fd: &FileFd<Platform, T>,
+        fd: &FileFd<Platform, W>,
         length: usize,
         reset_offset: bool,
     ) -> Result<(), super::errors::TruncateError> {
@@ -818,7 +884,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
     fn read_dir(
         &self,
-        fd: &FileFd<Platform, T>,
+        fd: &FileFd<Platform, W>,
     ) -> Result<Vec<crate::fs::DirEntry>, super::errors::ReadDirError> {
         // Extract fid and qid, releasing the descriptor table lock
         // before performing potentially blocking I/O.
@@ -876,7 +942,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
     fn fd_file_status(
         &self,
-        fd: &FileFd<Platform, T>,
+        fd: &FileFd<Platform, W>,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
         // Extract fid, releasing the descriptor table lock
         // before performing potentially blocking I/O.
@@ -904,9 +970,46 @@ struct Descriptor {
     qid: fcall::Qid,
 }
 
+/// Handle for the 9P response worker thread.
+///
+/// Holds an `Arc` reference to the shared client inner state (pending table
+/// and poison flag) so the worker can dispatch responses while the main
+/// [`FileSystem`] is in use by guest threads.
+///
+/// Crucially, this does **not** hold a reference to the transport writer.
+/// When the `FileSystem` is dropped the writer is closed immediately,
+/// allowing the worker to observe EOF on the reader and exit.
+pub struct WorkerHandle {
+    inner: alloc::sync::Arc<client::ClientInner>,
+}
+
+impl WorkerHandle {
+    /// Read one response from the reader and dispatch it to the pending table.
+    ///
+    /// Returns `false` when the connection is dead (EOF or error),
+    /// signalling the worker to exit its loop.
+    pub fn poll_responses<R: transport::Read>(
+        &self,
+        reader: &mut R,
+        reader_buf: &mut Vec<u8>,
+    ) -> bool {
+        self.inner.poll_responses(reader, reader_buf)
+    }
+
+    /// Returns a string describing why the client was poisoned (for diagnostics).
+    pub fn poison_reason_str(&self) -> &'static str {
+        self.inner.poison_reason_str()
+    }
+
+    /// Returns true if the client is poisoned.
+    pub fn is_poisoned(&self) -> bool {
+        self.inner.is_poisoned()
+    }
+}
+
 crate::fd::enable_fds_for_subsystem! {
-    @Platform: { sync::RawSyncPrimitivesProvider }, T: { transport::Read + transport::Write };
-    FileSystem<Platform, T>;
+    @Platform: { sync::RawSyncPrimitivesProvider }, W: { transport::Write };
+    FileSystem<Platform, W>;
     Descriptor;
-    -> FileFd<Platform, T>;
+    -> FileFd<Platform, W>;
 }

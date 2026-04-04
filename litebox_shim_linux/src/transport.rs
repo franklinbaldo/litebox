@@ -38,6 +38,16 @@ impl<FS: ShimFS> DropGuard for SocketDropGuard<FS> {
     }
 }
 
+/// Shared wrapper around a [`DropGuard`] so that both halves of a split
+/// transport can share ownership of the socket lifetime.
+struct SharedSocketDropGuard(Box<dyn DropGuard>);
+
+impl Drop for SharedSocketDropGuard {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 /// A spin-polling TCP transport backed by a raw `SocketFd` and its [`NetworkProxy`].
 ///
 /// The socket lives in the litebox descriptor table (for metadata / proxy) but is
@@ -95,37 +105,75 @@ impl ShimTransport {
     }
 }
 
+impl ShimTransport {
+    /// Split the transport into independent write and read halves.
+    ///
+    /// The underlying socket is kept alive until both halves are dropped.
+    pub fn split(self) -> (ShimTransportWriter, ShimTransportReader) {
+        // Prevent the original ShimTransport::drop from closing the socket;
+        // the shared drop guard takes over that responsibility.
+        let mut this = core::mem::ManuallyDrop::new(self);
+        // SAFETY: we consume `self` through ManuallyDrop and will not access
+        // these fields again through `this`.
+        let drop_guard = unsafe { core::ptr::read(&raw mut this.drop_guard) };
+        let proxy = unsafe { core::ptr::read(&raw mut this.proxy) };
+
+        let shared_guard = Arc::new(SharedSocketDropGuard(drop_guard));
+
+        (
+            ShimTransportWriter {
+                proxy: Arc::clone(&proxy),
+                _drop_guard: Arc::clone(&shared_guard),
+            },
+            ShimTransportReader {
+                proxy,
+                _drop_guard: shared_guard,
+            },
+        )
+    }
+}
+
 impl Drop for ShimTransport {
     fn drop(&mut self) {
         self.drop_guard.close();
     }
 }
 
-impl transport::Read for ShimTransport {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, transport::ReadError> {
-        loop {
-            match self.proxy.try_read(buf, ReceiveFlags::empty(), None) {
-                Ok(0) => {
-                    // No data yet — spin until something arrives.
-                    core::hint::spin_loop();
-                }
-                Ok(n) => return Ok(n),
-                Err(_) => return Err(transport::ReadError),
-            }
-        }
-    }
+/// Write half of a [`ShimTransport`].
+pub struct ShimTransportWriter {
+    proxy: Arc<NetworkProxy<Platform>>,
+    _drop_guard: Arc<SharedSocketDropGuard>,
 }
 
-impl transport::Write for ShimTransport {
+impl transport::Write for ShimTransportWriter {
     fn write(&mut self, buf: &[u8]) -> Result<usize, transport::WriteError> {
         loop {
             match self.proxy.try_write(buf, SendFlags::empty(), None) {
                 Ok(n) => return Ok(n),
                 Err(litebox::net::errors::SendError::BufferFull) => {
-                    // TX ring full — spin until space opens up.
                     core::hint::spin_loop();
                 }
-                Err(_) => return Err(transport::WriteError),
+                Err(_) => return Err(transport::WriteError::Io),
+            }
+        }
+    }
+}
+
+/// Read half of a [`ShimTransport`].
+pub struct ShimTransportReader {
+    proxy: Arc<NetworkProxy<Platform>>,
+    _drop_guard: Arc<SharedSocketDropGuard>,
+}
+
+impl transport::Read for ShimTransportReader {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, transport::ReadError> {
+        loop {
+            match self.proxy.try_read(buf, ReceiveFlags::empty(), None) {
+                Ok(0) => {
+                    core::hint::spin_loop();
+                }
+                Ok(n) => return Ok(n),
+                Err(_) => return Err(transport::ReadError::Io),
             }
         }
     }
@@ -260,18 +308,55 @@ mod tests {
     fn connect_9p(
         task: &crate::Task<crate::DefaultFS>,
         server: &DiodServer,
-    ) -> nine_p::FileSystem<crate::Platform, ShimTransport> {
+    ) -> (
+        nine_p::FileSystem<crate::Platform, ShimTransportWriter>,
+        ShimTransportReader,
+    ) {
         let addr = socket_addr([10, 0, 0, 1], server.port);
         let transport = ShimTransport::connect(task.global.clone(), addr)
             .expect("failed to connect to 9P server via shim network");
 
+        let (writer, reader) = transport.split();
         let aname = server.export_path().to_str().unwrap();
         let username = std::env::var("USER")
             .or_else(|_| std::env::var("LOGNAME"))
             .unwrap_or_else(|_| std::string::String::from("nobody"));
 
-        nine_p::FileSystem::new(&task.global.litebox, transport, 65536, &username, aname)
-            .expect("failed to create 9P filesystem")
+        nine_p::FileSystem::new(
+            &task.global.litebox,
+            writer,
+            reader,
+            65536,
+            &username,
+            aname,
+        )
+        .expect("failed to create 9P filesystem")
+    }
+
+    /// Helper that creates a 9P filesystem with a background worker thread.
+    struct NinePHandle {
+        fs: nine_p::FileSystem<crate::Platform, ShimTransportWriter>,
+        _worker: std::thread::JoinHandle<()>,
+    }
+
+    impl NinePHandle {
+        fn new(task: &crate::Task<crate::DefaultFS>, server: &DiodServer) -> Self {
+            let (fs, mut reader) = connect_9p(task, server);
+            let worker_handle = fs.worker_handle();
+            let msize = fs.msize();
+            let worker = std::thread::spawn(move || {
+                let mut buf = alloc::vec::Vec::with_capacity(msize as usize);
+                while worker_handle.poll_responses(&mut reader, &mut buf) {}
+            });
+            Self {
+                fs,
+                _worker: worker,
+            }
+        }
+
+        fn fs(&self) -> &nine_p::FileSystem<crate::Platform, ShimTransportWriter> {
+            &self.fs
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -283,7 +368,8 @@ mod tests {
         let task = init_platform(Some(TUN_DEVICE_NAME));
 
         let server = DiodServer::start();
-        let fs = connect_9p(&task, &server);
+        let handle = NinePHandle::new(&task, &server);
+        let fs = handle.fs();
 
         // Create a file and write to it.
         let fd = fs
@@ -327,7 +413,8 @@ mod tests {
         )
         .unwrap();
 
-        let fs = connect_9p(&task, &server);
+        let handle = NinePHandle::new(&task, &server);
+        let fs = handle.fs();
 
         // Read file created on the host through 9P.
         let fd = fs
