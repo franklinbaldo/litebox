@@ -334,4 +334,15 @@ mod tests {
         assert!(state.find_socket_fd(5).is_none());
         assert!(!state.unregister_socket_fd(5)); // already removed
     }
+
+    #[test]
+    fn socket_fd_table_full() {
+        let mut state = MicroState::zeroed();
+        for i in 0..litebox_ipc::ring::MAX_SOCKET_SLOTS {
+            assert!(state.register_socket_fd(i as i32, (i * 0x1000) as u32));
+        }
+        // Table is full — next registration should fail.
+        assert!(!state.register_socket_fd(999, 0xDEAD));
+        assert!(state.find_socket_fd(999).is_none());
+    }
 }
