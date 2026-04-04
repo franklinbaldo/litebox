@@ -29,7 +29,11 @@ extern crate alloc;
 /// device file descriptor for raw IP networking.
 #[derive(Debug)]
 pub struct CentralPlatform {
-    tun_fd: RwLock<Option<OwnedFd>>,
+    /// The TUN device name (needed to open additional queues on fork).
+    tun_device_name: Option<String>,
+    /// TUN queue file descriptors. Queue 0 is created at startup;
+    /// additional queues are created via `open_new_queue()` on fork.
+    tun_queues: RwLock<Vec<OwnedFd>>,
 }
 
 impl CentralPlatform {
@@ -47,6 +51,7 @@ impl CentralPlatform {
     pub fn new(tun_device_name: Option<&str>) -> Self {
         const IFF_TUN: libc::c_short = 0x0001;
         const IFF_NO_PI: libc::c_short = 0x1000;
+        const IFF_MULTI_QUEUE: libc::c_short = 0x0100;
 
         #[repr(C)]
         struct Ifreq {
@@ -72,7 +77,7 @@ impl CentralPlatform {
             // TUNSETIFF ioctl
             let mut ifreq = Ifreq {
                 ifr_name: [0; 16],
-                ifr_flags: IFF_TUN | IFF_NO_PI,
+                ifr_flags: IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE,
                 _pad: [0; 22],
             };
             assert!(name.len() < 16, "TUN device name too long");
@@ -146,33 +151,166 @@ impl CentralPlatform {
         });
 
         Self {
-            tun_fd: RwLock::new(tun_fd),
+            tun_device_name: tun_device_name.map(String::from),
+            tun_queues: RwLock::new(if let Some(fd) = tun_fd {
+                vec![fd]
+            } else {
+                vec![]
+            }),
         }
     }
 
-    /// Block until the TUN device has data to read, or the timeout expires.
+    /// Open an additional file descriptor to the same TUN device.
     ///
-    /// Returns immediately if no TUN device is configured.
+    /// Called when a worker is forked. Returns the queue index.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no TUN device was configured at startup, if `/dev/net/tun`
+    /// cannot be opened, or if the `TUNSETIFF` ioctl fails.
+    pub fn open_new_queue(&self) -> usize {
+        const IFF_TUN: libc::c_short = 0x0001;
+        const IFF_NO_PI: libc::c_short = 0x1000;
+        const IFF_MULTI_QUEUE: libc::c_short = 0x0100;
+
+        #[repr(C)]
+        struct Ifreq {
+            ifr_name: [libc::c_char; 16],
+            ifr_flags: libc::c_short,
+            _pad: [u8; 22],
+        }
+
+        let name = self
+            .tun_device_name
+            .as_deref()
+            .expect("cannot open TUN queue: no TUN device configured");
+
+        let fd = unsafe {
+            libc::open(
+                c"/dev/net/tun".as_ptr(),
+                libc::O_RDWR | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        };
+        assert!(
+            fd >= 0,
+            "failed to open /dev/net/tun for new queue: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let mut ifreq = Ifreq {
+            ifr_name: [0; 16],
+            ifr_flags: IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE,
+            _pad: [0; 22],
+        };
+        assert!(name.len() < 16, "TUN device name too long");
+        for (i, b) in name.bytes().enumerate() {
+            ifreq.ifr_name[i] = b.cast_signed();
+        }
+
+        let ret = unsafe { libc::ioctl(fd, 0x400454CA, &raw const ifreq) };
+        assert!(
+            ret >= 0,
+            "TUNSETIFF failed for new queue: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut queues = self.tun_queues.write().unwrap();
+        let idx = queues.len();
+        queues.push(owned);
+        idx
+    }
+
+    /// Send an IP packet via a specific TUN queue.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the queue index is out of bounds or the write fails.
+    pub fn send_ip_packet_on_queue(&self, queue: usize, packet: &[u8]) {
+        let guard = self.tun_queues.read().unwrap();
+        let fd = &guard[queue];
+        let ret = unsafe { libc::write(fd.as_raw_fd(), packet.as_ptr().cast(), packet.len()) };
+        assert!(
+            ret >= 0,
+            "TUN queue {queue} write failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// Receive an IP packet from a specific TUN queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReceiveError::WouldBlock`](litebox::platform::ReceiveError::WouldBlock)
+    /// if no data is available (non-blocking).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the queue index is out of bounds or an unexpected read error
+    /// occurs.
+    pub fn receive_ip_packet_on_queue(
+        &self,
+        queue: usize,
+        packet: &mut [u8],
+    ) -> Result<usize, litebox::platform::ReceiveError> {
+        let guard = self.tun_queues.read().unwrap();
+        let fd = &guard[queue];
+        let ret = unsafe { libc::read(fd.as_raw_fd(), packet.as_mut_ptr().cast(), packet.len()) };
+        if ret < 0 {
+            let errno = unsafe { *libc::__errno_location() };
+            if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+                return Err(litebox::platform::ReceiveError::WouldBlock);
+            }
+            panic!(
+                "TUN queue {queue} read failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(ret.cast_unsigned())
+    }
+
+    /// Block until a specific TUN queue has data to read, or the timeout
+    /// expires.
+    ///
+    /// Returns immediately if the queue index is out of bounds.
     ///
     /// # Panics
     ///
     /// Panics if the internal `RwLock` is poisoned.
-    pub fn wait_on_tun(&self, timeout: Option<Duration>) {
-        let guard = self.tun_fd.read().unwrap();
-        let Some(fd) = guard.as_ref() else { return };
+    pub fn wait_on_tun_queue(&self, queue: usize, timeout: Option<Duration>) {
+        let guard = self.tun_queues.read().unwrap();
+        if queue >= guard.len() {
+            return;
+        }
+        let fd = &guard[queue];
         let mut pfd = libc::pollfd {
             fd: fd.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
-        // Round sub-millisecond non-zero timeouts UP to 1 ms so that poll()
-        // actually blocks instead of returning immediately.
         let timeout_ms = timeout.map_or(-1, |t| {
             let ms = t.as_millis();
             let ms = if ms == 0 && !t.is_zero() { 1 } else { ms };
             i32::try_from(ms).unwrap_or(i32::MAX)
         });
         unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
+    }
+
+    /// Block until the TUN device has data to read, or the timeout expires.
+    ///
+    /// Delegates to queue 0. Returns immediately if no TUN device is
+    /// configured.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    pub fn wait_on_tun(&self, timeout: Option<Duration>) {
+        let guard = self.tun_queues.read().unwrap();
+        if guard.is_empty() {
+            return;
+        }
+        drop(guard);
+        self.wait_on_tun_queue(0, timeout);
     }
 }
 
@@ -188,16 +326,7 @@ impl litebox::platform::DebugLogProvider for CentralPlatform {
 
 impl litebox::platform::IPInterfaceProvider for CentralPlatform {
     fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
-        let guard = self.tun_fd.read().unwrap();
-        let fd = guard
-            .as_ref()
-            .expect("networking not enabled (no TUN device)");
-        let ret = unsafe { libc::write(fd.as_raw_fd(), packet.as_ptr().cast(), packet.len()) };
-        assert!(
-            ret >= 0,
-            "TUN write failed: {}",
-            std::io::Error::last_os_error()
-        );
+        self.send_ip_packet_on_queue(0, packet);
         Ok(())
     }
 
@@ -205,19 +334,7 @@ impl litebox::platform::IPInterfaceProvider for CentralPlatform {
         &self,
         packet: &mut [u8],
     ) -> Result<usize, litebox::platform::ReceiveError> {
-        let guard = self.tun_fd.read().unwrap();
-        let fd = guard
-            .as_ref()
-            .expect("networking not enabled (no TUN device)");
-        let ret = unsafe { libc::read(fd.as_raw_fd(), packet.as_mut_ptr().cast(), packet.len()) };
-        if ret < 0 {
-            let errno = unsafe { *libc::__errno_location() };
-            if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
-                return Err(litebox::platform::ReceiveError::WouldBlock);
-            }
-            panic!("TUN read failed: {}", std::io::Error::last_os_error());
-        }
-        Ok(ret.cast_unsigned())
+        self.receive_ip_packet_on_queue(0, packet)
     }
 }
 
