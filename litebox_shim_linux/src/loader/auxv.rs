@@ -78,6 +78,31 @@ impl<FS: ShimFS> Task<FS> {
         aux.insert(AuxKey::AT_GID, user_info.gid as usize);
         aux.insert(AuxKey::AT_EGID, user_info.egid as usize);
 
+        // AT_SECURE: not a setuid/setgid process.
+        aux.insert(AuxKey::AT_SECURE, 0);
+
+        // AT_CLKTCK: USER_HZ (100 on Linux).
+        aux.insert(AuxKey::AT_CLKTCK, 100);
+
+        // AT_FLAGS: always 0 on Linux.
+        aux.insert(AuxKey::AT_FLAGS, 0);
+
+        // AT_HWCAP / AT_HWCAP2: CPU feature flags used by glibc/musl for
+        // IFUNC dispatch. Report the host CPU capabilities.
+        #[cfg(target_arch = "x86_64")]
+        {
+            // x86_64 HWCAP is typically 0 (features are detected via cpuid).
+            // glibc uses AT_HWCAP2 bit 1 (HWCAP2_RING3MWAIT) and bit 2
+            // (HWCAP2_FSGSBASE). Report 0 for both — safe default.
+            aux.insert(AuxKey::AT_HWCAP, 0);
+            aux.insert(AuxKey::AT_HWCAP2, 0);
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            aux.insert(AuxKey::AT_HWCAP, 0);
+            aux.insert(AuxKey::AT_HWCAP2, 0);
+        }
+
         if let Some(vdso_base) = self.global.platform.get_vdso_address() {
             aux.insert(AuxKey::AT_SYSINFO_EHDR, vdso_base);
         }

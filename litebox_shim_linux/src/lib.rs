@@ -537,6 +537,24 @@ impl<FS: ShimFS> Task<FS> {
         let syscall_number = ctx.orig_eax;
         #[cfg(target_arch = "x86_64")]
         let syscall_number = ctx.orig_rax;
+
+        // close_range is not in the SyscallRequest enum, so handle it before try_from_raw.
+        if syscall_number == ::syscalls::Sysno::close_range as usize {
+            use litebox::utils::TruncateExt as _;
+            #[cfg(target_arch = "x86")]
+            return self.sys_close_range(
+                ctx.ebx.truncate(),
+                ctx.ecx.truncate(),
+                ctx.edx.truncate(),
+            );
+            #[cfg(target_arch = "x86_64")]
+            return self.sys_close_range(
+                ctx.rdi.truncate(),
+                ctx.rsi.truncate(),
+                ctx.rdx.truncate(),
+            );
+        }
+
         let request =
             SyscallRequest::<Platform>::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
 
@@ -611,6 +629,13 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Mkdir { pathname, mode } => pathname
                 .to_cstring()
                 .map_or(Err(Errno::EINVAL), |path| syscall!(sys_mkdir(path, mode))),
+            SyscallRequest::Mkdirat {
+                dirfd,
+                pathname,
+                mode,
+            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                syscall!(sys_mkdirat(dirfd, path, mode))
+            }),
             SyscallRequest::Chdir { pathname } => pathname
                 .to_cstring()
                 .map_or(Err(Errno::EINVAL), |path| syscall!(sys_chdir(path))),
@@ -881,6 +906,37 @@ impl<FS: ShimFS> Task<FS> {
             } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
                 syscall!(sys_unlinkat(dirfd, path, flags))
             }),
+            SyscallRequest::Renameat2 {
+                olddirfd,
+                oldpath,
+                newdirfd,
+                newpath,
+                flags,
+            } => {
+                let old = oldpath.to_cstring().ok_or(Errno::EFAULT)?;
+                let new = newpath.to_cstring().ok_or(Errno::EFAULT)?;
+                syscall!(sys_renameat2(olddirfd, old, newdirfd, new, flags))
+            }
+            SyscallRequest::Symlinkat {
+                target,
+                newdirfd,
+                linkpath,
+            } => {
+                let target = target.to_cstring().ok_or(Errno::EFAULT)?;
+                let linkpath = linkpath.to_cstring().ok_or(Errno::EFAULT)?;
+                syscall!(sys_symlinkat(target, newdirfd, linkpath))
+            }
+            SyscallRequest::Linkat {
+                olddirfd,
+                oldpath,
+                newdirfd,
+                newpath,
+                flags,
+            } => {
+                let old = oldpath.to_cstring().ok_or(Errno::EFAULT)?;
+                let new = newpath.to_cstring().ok_or(Errno::EFAULT)?;
+                syscall!(sys_linkat(olddirfd, old, newdirfd, new, flags))
+            }
             SyscallRequest::Stat { pathname, buf } => {
                 pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
                     self.sys_stat(path).and_then(|stat| {

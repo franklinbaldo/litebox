@@ -82,7 +82,7 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for ElfFile<'_, FS> {
         let mapping_ptr = self
             .task
             .sys_mmap(
-                super::DEFAULT_LOW_ADDR,
+                super::PIE_LOAD_OFFSET,
                 mapping_len,
                 litebox_common_linux::ProtFlags::PROT_NONE,
                 litebox_common_linux::MapFlags::MAP_ANONYMOUS
@@ -352,13 +352,14 @@ impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
         // this, both paths would map the same region — the second MAP_FIXED
         // destroys the first mapping.
         //
-        // When patched_data is Some the PatchedMapper path doesn't go through
-        // do_mmap_file so the flag is a no-op, but setting it is harmless and
-        // keeps the logic simple.
-        self.file
-            .task
-            .suppress_elf_runtime_patch
-            .set(self.patched_data.is_some() || self.parsed.has_trampoline());
+        // Only suppress when using the ElfFile mapper (which routes through
+        // do_mmap_file → maybe_patch_exec_segment) AND the loader actually
+        // has a trampoline to map. When patched_data is None and there's no
+        // trampoline (e.g. the rewriter declined the binary), the runtime
+        // fallback must remain enabled.
+        let has_loader_trampoline = self.patched_data.is_some() || self.parsed.has_trampoline();
+        let suppress = has_loader_trampoline && self.patched_data.is_none();
+        self.file.task.suppress_elf_runtime_patch.set(suppress);
         let result = if let Some(ref data) = self.patched_data {
             let mut mapper = PatchedMapper {
                 inner: &mut self.file,
@@ -397,6 +398,7 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
         argv: Vec<CString>,
         envp: Vec<CString>,
         mut aux: AuxVec,
+        exec_filename: Option<&CString>,
     ) -> Result<ElfLoadInfo, ElfLoaderError> {
         let global = &self.main.file.task.global;
 
@@ -433,8 +435,10 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
         };
         let mut stack = UserStack::new(sp, super::DEFAULT_STACK_SIZE)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
+        let mut at_random = [0u8; 16];
+        <_ as litebox::platform::CrngProvider>::fill_bytes_crng(global.platform, &mut at_random);
         stack
-            .init(argv, envp, aux)
+            .init(argv, envp, aux, exec_filename, at_random)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
 
         Ok(ElfLoadInfo {
@@ -467,7 +471,10 @@ impl From<ElfLoaderError> for litebox_common_linux::errno::Errno {
     fn from(value: ElfLoaderError) -> Self {
         match value {
             ElfLoaderError::OpenError(e) => e,
-            ElfLoaderError::ParseError(e) => e.into(),
+            // Non-ELF files that also lack a #! shebang (handled earlier in
+            // sys_execve) reach here. Map to ENOENT to prevent glibc from
+            // retrying execution via /bin/sh for opaque binaries.
+            ElfLoaderError::ParseError(_) => litebox_common_linux::errno::Errno::ENOENT,
             ElfLoaderError::InvalidStackAddr | ElfLoaderError::MappingError(_) => {
                 litebox_common_linux::errno::Errno::ENOMEM
             }

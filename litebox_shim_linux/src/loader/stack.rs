@@ -115,15 +115,18 @@ impl UserStack {
 
     /// Push a vector of strings with null terminators to the stack.
     ///
-    /// Returns the offsets of the strings in the stack.
-    /// Returns `None` if the stack has insufficient space.
+    /// Returns the offsets of the strings in the stack, in the same order
+    /// as the input. Strings are pushed in reverse order so that their
+    /// addresses increase with index, matching the Linux ABI expectation
+    /// that `argv[0]` points to a lower address than `argv[1]`.
     fn push_cstrings(&mut self, vals: &[CString]) -> Option<Vec<usize>> {
-        let mut envp = Vec::with_capacity(vals.len());
-        for val in vals {
+        let mut offsets = Vec::with_capacity(vals.len());
+        for val in vals.iter().rev() {
             self.push_cstring(val)?;
-            envp.push(self.pos);
+            offsets.push(self.pos);
         }
-        Some(envp)
+        offsets.reverse();
+        Some(offsets)
     }
 
     /// Push a vector of stack pointers to the stack.
@@ -159,11 +162,15 @@ impl UserStack {
     }
 
     /// Initialize the stack for the new process.
+    ///
+    /// `exec_filename` is the pathname passed to execve, used for `AT_EXECFN`.
     pub(super) fn init(
         &mut self,
         argv: Vec<CString>,
         env: Vec<CString>,
         mut aux: BTreeMap<AuxKey, usize>,
+        exec_filename: Option<&CString>,
+        at_random: [u8; 16],
     ) -> Option<()> {
         // end markers
         self.pos = self.pos.checked_sub(size_of::<usize>())?;
@@ -173,11 +180,30 @@ impl UserStack {
         let envp = self.push_cstrings(&env)?;
         let argvp = self.push_cstrings(&argv)?;
 
-        // TODO: generate a random value
-        self.push_bytes(&[
-            0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD,
-            0xBE, 0xEF,
-        ])?;
+        // Push the AT_EXECFN string (exec pathname, not argv[0]).
+        if let Some(filename) = exec_filename {
+            self.push_cstring(filename)?;
+            aux.insert(AuxKey::AT_EXECFN, self.stack_top.as_usize() + self.pos);
+        }
+
+        // Push the AT_PLATFORM string identifying the CPU architecture.
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.push_bytes(b"x86_64\0")?;
+            aux.insert(AuxKey::AT_PLATFORM, self.stack_top.as_usize() + self.pos);
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            self.push_bytes(b"i686\0")?;
+            aux.insert(AuxKey::AT_PLATFORM, self.stack_top.as_usize() + self.pos);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.push_bytes(b"aarch64\0")?;
+            aux.insert(AuxKey::AT_PLATFORM, self.stack_top.as_usize() + self.pos);
+        }
+
+        self.push_bytes(&at_random)?;
         aux.insert(AuxKey::AT_RANDOM, self.stack_top.as_usize() + self.pos);
 
         let align_down = |pos: usize, alignment: usize| -> usize {
@@ -200,5 +226,76 @@ impl UserStack {
         self.push_usize(argv.len())?;
         assert_eq!(self.pos, align_down(self.pos, Self::STACK_ALIGNMENT));
         Some(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::{collections::btree_map::BTreeMap, ffi::CString, vec, vec::Vec};
+    use core::{ffi::CStr, mem::size_of};
+    use litebox::platform::RawConstPointer as _;
+
+    use super::UserStack;
+    use crate::ConstPtr;
+
+    #[test]
+    fn init_keeps_argv_and_env_strings_in_linux_order() {
+        let mut backing = vec![0u8; 8192 + 16];
+        let base = backing.as_mut_ptr() as usize;
+        let aligned_base = (base + 15) & !15;
+        let align_slack = aligned_base - base;
+        let stack_len = backing.len() - align_slack;
+        let stack_len = stack_len & !15;
+        let stack_top = crate::MutPtr::<u8>::from_usize(aligned_base);
+        let mut stack = UserStack::new(stack_top, stack_len).expect("create test stack");
+
+        let argv = vec![
+            CString::new("node").unwrap(),
+            CString::new("/tmp/npm").unwrap(),
+            CString::new("--version").unwrap(),
+        ];
+        let env = vec![
+            CString::new("FOO=1").unwrap(),
+            CString::new("BAR=2").unwrap(),
+        ];
+
+        stack
+            .init(argv.clone(), env.clone(), BTreeMap::new(), None, [0; 16])
+            .expect("initialize user stack");
+
+        let sp = stack.get_cur_stack_top();
+        let argc_value = ConstPtr::<usize>::from_usize(sp)
+            .read_at_offset(0)
+            .expect("argc present");
+        assert_eq!(argc_value, argv.len());
+
+        let argv_base = sp + size_of::<usize>();
+        let argv_ptrs: Vec<usize> = (0..argv.len())
+            .map(|i| {
+                ConstPtr::<usize>::from_usize(argv_base + i * size_of::<usize>())
+                    .read_at_offset(0)
+                    .expect("argv pointer present")
+            })
+            .collect();
+        assert!(argv_ptrs.windows(2).all(|w| w[0] < w[1]));
+        for (ptr, expected) in argv_ptrs.iter().zip(argv.iter()) {
+            let actual = unsafe { CStr::from_ptr(*ptr as *const i8) };
+            assert_eq!(actual.to_bytes_with_nul(), expected.as_bytes_with_nul());
+        }
+
+        let env_base = argv_base + (argv.len() + 1) * size_of::<usize>();
+        let env_ptrs: Vec<usize> = (0..env.len())
+            .map(|i| {
+                ConstPtr::<usize>::from_usize(env_base + i * size_of::<usize>())
+                    .read_at_offset(0)
+                    .expect("env pointer present")
+            })
+            .collect();
+        assert!(env_ptrs.windows(2).all(|w| w[0] < w[1]));
+        assert!(argv_ptrs.last().unwrap() < env_ptrs.first().unwrap());
+        for (ptr, expected) in env_ptrs.iter().zip(env.iter()) {
+            let actual = unsafe { CStr::from_ptr(*ptr as *const i8) };
+            assert_eq!(actual.to_bytes_with_nul(), expected.as_bytes_with_nul());
+        }
     }
 }

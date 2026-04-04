@@ -107,7 +107,6 @@ enum FsPath {
     /// Current working directory
     Cwd,
     /// Path is relative to a file descriptor
-    #[expect(dead_code, reason = "currently unused, might want to use later")]
     FdRelative { fd: u32, path: CString },
     /// Fd
     Fd(u32),
@@ -546,6 +545,316 @@ impl<FS: ShimFS> Task<FS> {
         self.do_close(raw_fd)
     }
 
+    fn set_close_on_exec(&self, raw_fd: usize) -> Result<(), Errno> {
+        let files = self.files.borrow();
+        files.run_on_raw_fd(
+            raw_fd,
+            |fd| {
+                let _old = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+            },
+            |fd| {
+                let _old = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+            },
+            |fd| {
+                let _old = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+            },
+            |fd| {
+                let _old = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+            },
+            |fd| {
+                let _old = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+            },
+            |fd| {
+                let _old = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+            },
+        )
+    }
+
+    pub(crate) fn sys_close_range(
+        &self,
+        first: u32,
+        last: u32,
+        flags: u32,
+    ) -> Result<usize, Errno> {
+        const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
+
+        if first > last || flags & !CLOSE_RANGE_CLOEXEC != 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        let first = first as usize;
+        let last = last as usize;
+        let alive_fds: alloc::vec::Vec<usize> = {
+            let files = self.files.borrow();
+            files.raw_descriptor_store.read().iter_alive().collect()
+        };
+
+        for raw_fd in alive_fds {
+            if raw_fd < first || raw_fd > last {
+                continue;
+            }
+            if flags == CLOSE_RANGE_CLOEXEC {
+                let _ = self.set_close_on_exec(raw_fd);
+            } else {
+                if let Ok(fd) = i32::try_from(raw_fd) {
+                    self.finalize_elf_patch(fd);
+                }
+                let _ = self.do_close(raw_fd);
+            }
+        }
+
+        Ok(0)
+    }
+
+    /// Handle syscall `mkdirat`
+    pub fn sys_mkdirat(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        mode: u32,
+    ) -> Result<(), Errno> {
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
+        let mode = Mode::from_bits_retain(mode) & !self.get_umask();
+        match fs_path {
+            FsPath::Absolute { path } => self
+                .files
+                .borrow()
+                .fs
+                .mkdir(path, mode)
+                .map_err(Errno::from),
+            FsPath::Cwd => self
+                .files
+                .borrow()
+                .fs
+                .mkdir(get_cwd(), mode)
+                .map_err(Errno::from),
+            FsPath::Fd(_fd) => Err(Errno::EEXIST),
+            FsPath::FdRelative { fd, path } => {
+                let Ok(raw_fd) = usize::try_from(fd) else {
+                    return Err(Errno::EBADF);
+                };
+                let files = self.files.borrow();
+                files.run_on_raw_fd(
+                    raw_fd,
+                    |dirfd| files.fs.mkdir_at(dirfd, path, mode).map_err(Errno::from),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                )?
+            }
+        }
+    }
+
+    /// Resolve an `FsPath::FdRelative` to an absolute path, validating that
+    /// the dirfd refers to a directory (not a regular file).
+    fn resolve_dirfd_path(&self, fd: u32, rel_path: &CString) -> Result<String, Errno> {
+        let raw_fd = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
+        let files = self.files.borrow();
+        files.run_on_raw_fd(
+            raw_fd,
+            |dirfd| {
+                let status = files.fs.fd_file_status(dirfd).map_err(Errno::from)?;
+                if !matches!(status.file_type, litebox::fs::FileType::Directory) {
+                    return Err(Errno::ENOTDIR);
+                }
+                let dir_path = files.fs.fd_path(dirfd).ok_or(Errno::EBADF)?;
+                let rel = rel_path.to_str().map_err(|_| Errno::EINVAL)?;
+                Ok(if rel.is_empty() || rel == "." {
+                    dir_path
+                } else if rel.starts_with('/') {
+                    rel.to_string()
+                } else if dir_path.ends_with('/') {
+                    alloc::format!("{dir_path}{rel}")
+                } else {
+                    alloc::format!("{dir_path}/{rel}")
+                })
+            },
+            |_| Err(Errno::ENOTDIR),
+            |_| Err(Errno::ENOTDIR),
+            |_| Err(Errno::ENOTDIR),
+            |_| Err(Errno::ENOTDIR),
+            |_| Err(Errno::ENOTDIR),
+        )?
+    }
+
+    /// Helper to resolve an `FsPath` to an absolute path string.
+    fn resolve_fs_path_to_string(
+        &self,
+        fs_path: FsPath,
+        get_cwd: &impl Fn() -> String,
+    ) -> Result<String, Errno> {
+        match fs_path {
+            FsPath::Absolute { path } => path.into_string().map_err(|_| Errno::EINVAL),
+            FsPath::Cwd => Ok(get_cwd()),
+            FsPath::Fd(_) => Err(Errno::EINVAL),
+            FsPath::FdRelative { fd, path } => self.resolve_dirfd_path(fd, &path),
+        }
+    }
+
+    /// Handle `symlinkat` — create a symbolic link.
+    pub fn sys_symlinkat(
+        &self,
+        target: impl path::Arg,
+        newdirfd: i32,
+        linkpath: impl path::Arg,
+    ) -> Result<(), Errno> {
+        let target_str = target.as_rust_str().map_err(|_| Errno::EINVAL)?.to_string();
+
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let fs_path = FsPath::new(newdirfd, linkpath, get_cwd)?;
+        match fs_path {
+            FsPath::Absolute { path } => self
+                .files
+                .borrow()
+                .fs
+                .symlink(target_str, path)
+                .map_err(Errno::from),
+            FsPath::Cwd => self
+                .files
+                .borrow()
+                .fs
+                .symlink(target_str, get_cwd())
+                .map_err(Errno::from),
+            FsPath::Fd(_) => Err(Errno::EEXIST),
+            FsPath::FdRelative { fd, path } => {
+                let abs = self.resolve_dirfd_path(fd, &path)?;
+                let files = self.files.borrow();
+                files.fs.symlink(target_str, abs).map_err(Errno::from)
+            }
+        }
+    }
+
+    /// Handle `linkat` — create a hard link.
+    #[allow(clippy::needless_borrows_for_generic_args)]
+    pub fn sys_linkat(
+        &self,
+        olddirfd: i32,
+        oldpath: impl path::Arg,
+        newdirfd: i32,
+        newpath: impl path::Arg,
+        _flags: AtFlags,
+    ) -> Result<(), Errno> {
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let old_fs = FsPath::new(olddirfd, oldpath, &get_cwd)?;
+        let new_fs = FsPath::new(newdirfd, newpath, &get_cwd)?;
+
+        let old_abs = self.resolve_fs_path_to_string(old_fs, &get_cwd)?;
+        let new_abs = self.resolve_fs_path_to_string(new_fs, &get_cwd)?;
+        self.files
+            .borrow()
+            .fs
+            .link(old_abs, new_abs)
+            .map_err(Errno::from)
+    }
+
+    pub(crate) fn sys_renameat2(
+        &self,
+        olddirfd: i32,
+        oldpath: impl path::Arg,
+        newdirfd: i32,
+        newpath: impl path::Arg,
+        flags: u32,
+    ) -> Result<(), Errno> {
+        const RENAME_NOREPLACE: u32 = 1;
+        const RENAME_EXCHANGE: u32 = 2;
+        const RENAME_WHITEOUT: u32 = 4;
+        let supported = RENAME_NOREPLACE;
+        if flags & !supported != 0 {
+            if flags & (RENAME_EXCHANGE | RENAME_WHITEOUT) != 0 {
+                return Err(Errno::EINVAL);
+            }
+            return Err(Errno::EINVAL);
+        }
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let old = FsPath::new(olddirfd, oldpath, get_cwd)?;
+        let new = FsPath::new(newdirfd, newpath, get_cwd)?;
+
+        // Resolve both paths to absolute strings, supporting FdRelative.
+        let resolve = |fspath: FsPath| -> Result<CString, Errno> {
+            match fspath {
+                FsPath::Absolute { path } => Ok(path),
+                FsPath::Cwd => CString::new(get_cwd()).map_err(|_| Errno::EINVAL),
+                FsPath::Fd(_) => Err(Errno::EINVAL),
+                FsPath::FdRelative { fd, path } => {
+                    let Ok(raw_fd) = usize::try_from(fd) else {
+                        return Err(Errno::EBADF);
+                    };
+
+                    let files = self.files.borrow();
+                    files.run_on_raw_fd(
+                        raw_fd,
+                        |dirfd| {
+                            // Verify dirfd refers to a directory.
+                            let status = files.fs.fd_file_status(dirfd).map_err(Errno::from)?;
+                            if !matches!(status.file_type, litebox::fs::FileType::Directory) {
+                                return Err(Errno::ENOTDIR);
+                            }
+                            let dir_path = files.fs.fd_path(dirfd).ok_or(Errno::EBADF)?;
+                            let rel = path.to_str().map_err(|_| Errno::EINVAL)?;
+                            // Linux returns EBUSY for rename(".") or rename("").
+                            if rel.is_empty() || rel == "." {
+                                return Err(Errno::EBUSY);
+                            }
+                            let abs = if rel.starts_with('/') {
+                                rel.into()
+                            } else if dir_path.ends_with('/') {
+                                alloc::format!("{dir_path}{rel}")
+                            } else {
+                                alloc::format!("{dir_path}/{rel}")
+                            };
+                            CString::new(abs).map_err(|_| Errno::EINVAL)
+                        },
+                        |_| Err(Errno::ENOTDIR),
+                        |_| Err(Errno::ENOTDIR),
+                        |_| Err(Errno::ENOTDIR),
+                        |_| Err(Errno::ENOTDIR),
+                        |_| Err(Errno::ENOTDIR),
+                    )?
+                }
+            }
+        };
+        let old_path = resolve(old)?;
+        let new_path = resolve(new)?;
+        if flags & RENAME_NOREPLACE != 0 {
+            // Check if target exists — RENAME_NOREPLACE fails with EEXIST.
+            if self.files.borrow().fs.file_status(&*new_path).is_ok() {
+                return Err(Errno::EEXIST);
+            }
+        }
+        self.files
+            .borrow()
+            .fs
+            .rename(old_path, new_path)
+            .map_err(Errno::from)
+    }
+
     /// Handle syscall `readv`
     pub fn sys_readv(
         &self,
@@ -558,51 +867,103 @@ impl<FS: ShimFS> Task<FS> {
         };
         let iovs: &[IoReadVec<MutPtr<u8>>] = &iovec.to_owned_slice(iovcnt).ok_or(Errno::EFAULT)?;
         let files = self.files.borrow();
-        let mut total_read = 0;
-        let mut kernel_buffer = vec![
-            0u8;
-            iovs.iter()
-                .map(|i| i.iov_len)
-                .max()
-                .unwrap_or_default()
-                .min(super::super::MAX_KERNEL_BUF_SIZE)
-        ];
-        for iov in iovs {
-            if iov.iov_len == 0 {
-                continue;
-            }
-            let Ok(_iov_len) = isize::try_from(iov.iov_len) else {
-                return Err(Errno::EINVAL);
-            };
-            // TODO: The data transfers performed by readv() and writev() are atomic: the data
-            // written by writev() is written as a single block that is not intermingled with
-            // output from writes in other processes
-            let size = files
-                .run_on_raw_fd(
-                    raw_fd,
-                    |fd| {
-                        files
+        // TODO: The data transfers performed by readv() and writev() are atomic: the data
+        // written by writev() is written as a single block that is not intermingled with
+        // output from writes in other processes
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |fd| {
+                    let mut total_read = 0;
+                    let kernel_buffer =
+                        core::cell::RefCell::new(vec![
+                            0u8;
+                            iovs.iter()
+                                .map(|i| i.iov_len)
+                                .max()
+                                .unwrap_or_default()
+                                .min(super::super::MAX_KERNEL_BUF_SIZE)
+                        ]);
+                    for iov in iovs {
+                        if iov.iov_len == 0 {
+                            continue;
+                        }
+                        let Ok(_iov_len) = isize::try_from(iov.iov_len) else {
+                            return Err(Errno::EINVAL);
+                        };
+                        let size = files
                             .fs
-                            .read(fd, &mut kernel_buffer, None)
+                            .read(fd, &mut kernel_buffer.borrow_mut(), None)
+                            .map_err(Errno::from)?;
+                        iov.iov_base
+                            .copy_from_slice(0, &kernel_buffer.borrow()[..size])
+                            .ok_or(Errno::EFAULT)?;
+                        total_read += size;
+                        if size < iov.iov_len {
+                            break;
+                        }
+                    }
+                    Ok(total_read)
+                },
+                |fd| {
+                    read_once_to_iovecs(iovs, |buf| {
+                        self.global.receive(
+                            &self.wait_cx(),
+                            fd,
+                            buf,
+                            litebox_common_linux::ReceiveFlags::empty(),
+                            None,
+                        )
+                    })
+                },
+                |fd| {
+                    read_once_to_iovecs(iovs, |buf| {
+                        self.global
+                            .pipes
+                            .read(&self.wait_cx(), fd, buf)
                             .map_err(Errno::from)
-                    },
-                    |_fd| todo!("net"),
-                    |_fd| todo!("pipes"),
-                    |_fd| todo!("eventfd"),
-                    |_fd| Err(Errno::EINVAL),
-                    |_fd| todo!("unix"),
-                )
-                .flatten()?;
-            iov.iov_base
-                .copy_from_slice(0, &kernel_buffer[..size])
-                .ok_or(Errno::EFAULT)?;
-            total_read += size;
-            if size < iov.iov_len {
-                // Okay to transfer fewer bytes than requested
-                break;
-            }
-        }
-        Ok(total_read)
+                    })
+                },
+                |fd| {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|file| {
+                        let total_len = total_readv_len(iovs)?;
+                        if total_len == 0 {
+                            return Ok(0);
+                        }
+                        if total_len < size_of::<u64>() {
+                            return Err(Errno::EINVAL);
+                        }
+                        let bytes = file.read(&self.wait_cx())?.to_le_bytes();
+                        scatter_bytes_to_iovecs(iovs, &bytes)
+                    })
+                },
+                |_fd| Err(Errno::EINVAL),
+                |fd| {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|file| {
+                        read_once_to_iovecs(iovs, |buf| {
+                            file.recvfrom(
+                                &self.wait_cx(),
+                                buf,
+                                litebox_common_linux::ReceiveFlags::empty(),
+                                None,
+                            )
+                        })
+                    })
+                },
+            )
+            .flatten()
     }
 }
 
@@ -627,6 +988,179 @@ where
         }
     }
     Ok(total_written)
+}
+
+fn total_readv_len(iovs: &[IoReadVec<MutPtr<u8>>]) -> Result<usize, Errno> {
+    iovs.iter().try_fold(0usize, |total, iov| {
+        let Ok(_iov_len) = isize::try_from(iov.iov_len) else {
+            return Err(Errno::EINVAL);
+        };
+        total.checked_add(iov.iov_len).ok_or(Errno::EINVAL)
+    })
+}
+
+fn total_writev_len(iovs: &[IoWriteVec<ConstPtr<u8>>]) -> Result<usize, Errno> {
+    iovs.iter().try_fold(0usize, |total, iov| {
+        let Ok(_iov_len) = isize::try_from(iov.iov_len) else {
+            return Err(Errno::EINVAL);
+        };
+        total.checked_add(iov.iov_len).ok_or(Errno::EINVAL)
+    })
+}
+
+fn alloc_zeroed_kernel_buf(len: usize) -> Result<alloc::vec::Vec<u8>, Errno> {
+    let mut buf = alloc::vec::Vec::new();
+    buf.try_reserve_exact(len).map_err(|_| Errno::ENOMEM)?;
+    buf.resize(len, 0);
+    Ok(buf)
+}
+
+fn scatter_bytes_to_iovecs(iovs: &[IoReadVec<MutPtr<u8>>], bytes: &[u8]) -> Result<usize, Errno> {
+    let mut copied = 0;
+    for iov in iovs {
+        if copied == bytes.len() {
+            break;
+        }
+        if iov.iov_len == 0 {
+            continue;
+        }
+        let chunk_len = core::cmp::min(iov.iov_len, bytes.len() - copied);
+        iov.iov_base
+            .copy_from_slice(0, &bytes[copied..copied + chunk_len])
+            .ok_or(Errno::EFAULT)?;
+        copied += chunk_len;
+    }
+    Ok(copied)
+}
+
+fn read_once_to_iovecs<F>(iovs: &[IoReadVec<MutPtr<u8>>], read_fn: F) -> Result<usize, Errno>
+where
+    F: FnOnce(&mut [u8]) -> Result<usize, Errno>,
+{
+    let total_len = total_readv_len(iovs)?.min(super::super::MAX_KERNEL_BUF_SIZE);
+    if total_len == 0 {
+        return Ok(0);
+    }
+    let mut kernel_buf = alloc_zeroed_kernel_buf(total_len)?;
+    let size = read_fn(&mut kernel_buf)?;
+    scatter_bytes_to_iovecs(iovs, &kernel_buf[..size])
+}
+
+fn gather_iovecs(iovs: &[IoWriteVec<ConstPtr<u8>>]) -> Result<alloc::vec::Vec<u8>, Errno> {
+    let total_len = total_writev_len(iovs)?.min(super::super::MAX_KERNEL_BUF_SIZE);
+    let mut gathered = alloc::vec::Vec::new();
+    gathered
+        .try_reserve_exact(total_len)
+        .map_err(|_| Errno::ENOMEM)?;
+    let mut remaining = total_len;
+    for iov in iovs {
+        if remaining == 0 {
+            break;
+        }
+        if iov.iov_len == 0 {
+            continue;
+        }
+        let slice = iov
+            .iov_base
+            .to_owned_slice(iov.iov_len)
+            .ok_or(Errno::EFAULT)?;
+        let chunk_len = core::cmp::min(slice.len(), remaining);
+        gathered.extend_from_slice(&slice[..chunk_len]);
+        remaining -= chunk_len;
+    }
+    Ok(gathered)
+}
+
+fn write_once_from_iovecs<F>(iovs: &[IoWriteVec<ConstPtr<u8>>], write_fn: F) -> Result<usize, Errno>
+where
+    F: FnOnce(&[u8]) -> Result<usize, Errno>,
+{
+    let gathered = gather_iovecs(iovs)?;
+    if gathered.is_empty() {
+        return Ok(0);
+    }
+    write_fn(&gathered)
+}
+
+fn fcntl_status_flags<FS: ShimFS>(
+    task: &Task<FS>,
+    files: &FilesState<FS>,
+    desc: usize,
+) -> Result<OFlags, Errno> {
+    macro_rules! getfl_from_metadata {
+        ($fd:expr, $MetaType:path) => {
+            Ok(task
+                .global
+                .litebox
+                .descriptor_table()
+                .with_metadata($fd, |$MetaType(flags)| *flags)
+                .unwrap_or(OFlags::empty()))
+        };
+    }
+    macro_rules! getfl_from_handle {
+        ($fd:ident) => {{
+            let handle = task
+                .global
+                .litebox
+                .descriptor_table()
+                .entry_handle($fd)
+                .ok_or(Errno::EBADF)?;
+            handle.with_entry(|file| Ok(file.get_status()))
+        }};
+    }
+    files
+        .run_on_raw_fd(
+            desc,
+            |fd| getfl_from_metadata!(fd, crate::StdioStatusFlags),
+            |fd| getfl_from_metadata!(fd, crate::syscalls::net::SocketOFlags),
+            |fd| getfl_from_metadata!(fd, crate::PipeStatusFlags),
+            |fd| getfl_from_handle!(fd),
+            |fd| getfl_from_handle!(fd),
+            |fd| getfl_from_handle!(fd),
+        )
+        .flatten()
+        .map(|flags| flags & OFlags::STATUS_FLAGS_MASK)
+}
+
+fn validate_fcntl_lock_fd(open_flags: OFlags) -> Result<OFlags, Errno> {
+    if open_flags.contains(OFlags::PATH) {
+        return Err(Errno::EBADF);
+    }
+    Ok(open_flags & (OFlags::WRONLY | OFlags::RDWR))
+}
+
+fn emulate_fcntl_getlk(
+    lock: MutPtr<litebox_common_linux::Flock>,
+    park_before_guest_write: impl FnOnce(),
+) -> Result<u32, Errno> {
+    let mut flock = lock.read_at_offset(0).ok_or(Errno::EFAULT)?;
+    let lock_type =
+        litebox_common_linux::FlockType::try_from(flock.type_).map_err(|_| Errno::EINVAL)?;
+    if let litebox_common_linux::FlockType::Unlock = lock_type {
+        return Err(Errno::EINVAL);
+    }
+    flock.type_ = litebox_common_linux::FlockType::Unlock as i16;
+    park_before_guest_write();
+    lock.write_at_offset(0, flock).ok_or(Errno::EFAULT)?;
+    Ok(0)
+}
+
+fn emulate_fcntl_setlk(
+    lock: ConstPtr<litebox_common_linux::Flock>,
+    open_flags: OFlags,
+) -> Result<u32, Errno> {
+    let flock = lock.read_at_offset(0).ok_or(Errno::EFAULT)?;
+    let lock_type =
+        litebox_common_linux::FlockType::try_from(flock.type_).map_err(|_| Errno::EINVAL)?;
+    let access = validate_fcntl_lock_fd(open_flags)?;
+    if matches!(lock_type, litebox_common_linux::FlockType::ReadLock) && access == OFlags::WRONLY {
+        return Err(Errno::EBADF);
+    }
+    if matches!(lock_type, litebox_common_linux::FlockType::WriteLock) && access == OFlags::empty()
+    {
+        return Err(Errno::EBADF);
+    }
+    Ok(0)
 }
 
 impl<FS: ShimFS> Task<FS> {
@@ -655,7 +1189,7 @@ impl<FS: ShimFS> Task<FS> {
                     })
                 },
                 |fd| {
-                    write_to_iovec(iovs, |buf| {
+                    write_once_from_iovecs(iovs, |buf| {
                         self.global.sendto(
                             &self.wait_cx(),
                             fd,
@@ -665,14 +1199,58 @@ impl<FS: ShimFS> Task<FS> {
                         )
                     })
                 },
-                |_fd| todo!("pipes"),
-                |_fd| todo!("eventfd"),
+                |fd| {
+                    write_once_from_iovecs(iovs, |buf| {
+                        self.global
+                            .pipes
+                            .write(&self.wait_cx(), fd, buf)
+                            .map_err(Errno::from)
+                    })
+                },
+                |fd| {
+                    let total_len = total_writev_len(iovs)?;
+                    if total_len == 0 {
+                        return Ok(0);
+                    }
+                    let Some(first_iov) = iovs.first() else {
+                        return Ok(0);
+                    };
+                    if first_iov.iov_len != size_of::<u64>() {
+                        return Err(Errno::EINVAL);
+                    }
+                    let bytes = first_iov
+                        .iov_base
+                        .to_owned_slice(size_of::<u64>())
+                        .ok_or(Errno::EFAULT)?;
+                    let value: u64 =
+                        u64::from_le_bytes(bytes.as_ref().try_into().map_err(|_| Errno::EINVAL)?);
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|file| file.write(&self.wait_cx(), value))
+                },
                 |_fd| Err(Errno::EINVAL),
-                |_fd| todo!("unix"),
+                |fd| {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|file| {
+                        write_once_from_iovecs(iovs, |buf| {
+                            file.sendto(self, buf, litebox_common_linux::SendFlags::empty(), None)
+                        })
+                    })
+                },
             )
             .flatten();
         if let Err(Errno::EPIPE) = res {
-            unimplemented!("send SIGPIPE to the current task");
+            // TODO: send SIGPIPE to the current task once signal infrastructure is complete.
+            log_unsupported!("SIGPIPE delivery not yet implemented");
         }
         res
     }
@@ -1013,44 +1591,7 @@ impl<FS: ShimFS> Task<FS> {
             FcntlArg::SETFD(flags) => {
                 set_file_descriptor_flags(desc, &self.global, &files, flags).map(|()| 0)
             }
-            FcntlArg::GETFL => {
-                macro_rules! getfl_from_metadata {
-                    ($fd:expr, $MetaType:path) => {
-                        Ok(self
-                            .global
-                            .litebox
-                            .descriptor_table()
-                            .with_metadata($fd, |$MetaType(flags)| {
-                                *flags & OFlags::STATUS_FLAGS_MASK
-                            })
-                            .unwrap_or(OFlags::empty()))
-                    };
-                }
-                macro_rules! getfl_from_handle {
-                    ($fd:ident) => {{
-                        // TODO: Consider shared metadata table?
-                        let handle = self
-                            .global
-                            .litebox
-                            .descriptor_table()
-                            .entry_handle($fd)
-                            .ok_or(Errno::EBADF)?;
-                        handle.with_entry(|file| Ok(file.get_status()))
-                    }};
-                }
-                Ok(files
-                    .run_on_raw_fd(
-                        desc,
-                        |fd| getfl_from_metadata!(fd, crate::StdioStatusFlags),
-                        |fd| getfl_from_metadata!(fd, crate::syscalls::net::SocketOFlags),
-                        |fd| getfl_from_metadata!(fd, crate::PipeStatusFlags),
-                        |fd| getfl_from_handle!(fd),
-                        |fd| getfl_from_handle!(fd),
-                        |fd| getfl_from_handle!(fd),
-                    )
-                    .flatten()?
-                    .bits())
-            }
+            FcntlArg::GETFL => Ok(fcntl_status_flags(self, &files, desc)?.bits()),
             FcntlArg::SETFL(flags) => {
                 let setfl_mask = OFlags::APPEND
                     | OFlags::NONBLOCK
@@ -1147,53 +1688,13 @@ impl<FS: ShimFS> Task<FS> {
                 Ok(0)
             }
             FcntlArg::GETLK(lock) => {
-                self.files
-                    .borrow()
-                    .run_on_raw_fd(
-                        desc,
-                        |_fd| {
-                            let mut flock = lock.read_at_offset(0).ok_or(Errno::EFAULT)?;
-                            let lock_type = litebox_common_linux::FlockType::try_from(flock.type_)
-                                .map_err(|_| Errno::EINVAL)?;
-                            if let litebox_common_linux::FlockType::Unlock = lock_type {
-                                return Err(Errno::EINVAL);
-                            }
-
-                            // Note LiteBox does not support multiple processes yet, and one process
-                            // can always acquire the lock it owns, so return `Unlock` unconditionally.
-                            flock.type_ = litebox_common_linux::FlockType::Unlock as i16;
-                            lock.write_at_offset(0, flock).ok_or(Errno::EFAULT)?;
-                            Ok(0)
-                        },
-                        |_fd| todo!("net"),
-                        |_fd| todo!("pipes"),
-                        |_fd| Err(Errno::EBADF),
-                        |_fd| Err(Errno::EBADF),
-                        |_fd| Err(Errno::EBADF),
-                    )
-                    .flatten()
+                let open_flags = fcntl_status_flags(self, &files, desc)?;
+                validate_fcntl_lock_fd(open_flags)?;
+                emulate_fcntl_getlk(lock, || {})
             }
             FcntlArg::SETLK(lock) | FcntlArg::SETLKW(lock) => {
-                self.files
-                    .borrow()
-                    .run_on_raw_fd(
-                        desc,
-                        |_fd| {
-                            let flock = lock.read_at_offset(0).ok_or(Errno::EFAULT)?;
-                            let _ = litebox_common_linux::FlockType::try_from(flock.type_)
-                                .map_err(|_| Errno::EINVAL)?;
-
-                            // Note LiteBox does not support multiple processes yet, and one process
-                            // can always acquire the lock it owns, so we don't need to maintain anything.
-                            Ok(0)
-                        },
-                        |_fd| todo!("net"),
-                        |_fd| todo!("pipes"),
-                        |_fd| Err(Errno::EBADF),
-                        |_fd| Err(Errno::EBADF),
-                        |_fd| Err(Errno::EBADF),
-                    )
-                    .flatten()
+                let open_flags = fcntl_status_flags(self, &files, desc)?;
+                emulate_fcntl_setlk(lock, open_flags)
             }
             FcntlArg::DUPFD { cloexec, min_fd } => {
                 let new_file = self.do_dup(

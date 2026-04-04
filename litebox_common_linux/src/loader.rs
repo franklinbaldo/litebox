@@ -45,6 +45,12 @@ pub struct MappingInfo {
     pub phdrs_addr: usize,
     /// The number of program headers.
     pub num_phdrs: usize,
+    /// Page-aligned start of the zero-filled (`.bss`) portion of the writable
+    /// PT_LOAD segment. Zero if no writable segment has a zero-filled region.
+    pub bss_start: usize,
+    /// Page-aligned end of the zero-filled (`.bss`) portion of the writable
+    /// PT_LOAD segment. Zero if no writable segment has a zero-filled region.
+    pub bss_end: usize,
 }
 
 impl MappingInfo {
@@ -226,6 +232,32 @@ impl ElfParsedFile {
         self.trampoline.is_some()
     }
 
+    /// For `ET_EXEC` binaries, returns the page-aligned VA range that will be
+    /// mapped (lowest `p_vaddr` to highest `p_vaddr + p_memsz`).
+    ///
+    /// Returns `None` for `ET_DYN` (PIE) binaries, whose load address is
+    /// determined dynamically by [`MapMemory::reserve`].
+    ///
+    /// Callers can use this to reject non-PIE binaries whose fixed addresses
+    /// fall outside the target process's VA partition.
+    pub fn fixed_load_range(&self) -> Option<core::ops::Range<usize>> {
+        if self.header.e_type != elf::abi::ET_EXEC {
+            return None;
+        }
+        let mut min = usize::MAX;
+        let mut max = 0usize;
+        for ph in self.pt_loads() {
+            min = min.min(ph.p_vaddr.truncate());
+            let end: usize = ph.p_vaddr.checked_add(ph.p_memsz)?.truncate();
+            max = max.max(end);
+        }
+        if min >= max {
+            return None;
+        }
+        let aligned_max = max.checked_next_multiple_of(PAGE_SIZE)?;
+        Some(page_align_down(min)..aligned_max)
+    }
+
     /// Parse the LiteBox trampoline data, if any.
     ///
     /// The trampoline header is located at the end of the file (last 32/20 bytes).
@@ -404,15 +436,22 @@ impl ElfParsedFile {
             }
             let min = page_align_down(min);
             let max = page_align_up(max);
+            // Subtract `min` so that `base_addr + p_vaddr` lands inside the
+            // reserved region.  Without this, PIE binaries whose lowest
+            // p_vaddr is non-zero (e.g. Go uses 0x400000) would map segments
+            // past the end of the reservation.
             mapper
                 .reserve(max - min, align)
                 .map_err(ElfLoadError::Map)?
+                - min
         } else {
             // For ET_EXEC, load at the fixed addresses specified in the ELF.
             0
         };
 
         let mut brk = 0;
+        let mut bss_start = 0;
+        let mut bss_end = 0;
         let mut phdrs_addr = 0;
         for ph in self.pt_loads() {
             let p_vaddr: usize = ph.p_vaddr.truncate();
@@ -468,6 +507,13 @@ impl ElfParsedFile {
             // Update the end address of the last PT_LOAD segment.
             brk = brk.max(load_end);
 
+            // Track the .bss region: the zero-filled portion of writable segments
+            // where copy-relocated symbols (e.g., __environ) reside.
+            if prot.write && load_end > file_end {
+                bss_start = file_end;
+                bss_end = load_end;
+            }
+
             // Track the location of the program headers in memory; this is used
             // for `AT_PHDR`.
             if ph.p_offset <= self.header.e_phoff && self.header.e_phoff < ph.p_offset + ph.p_filesz
@@ -483,6 +529,8 @@ impl ElfParsedFile {
             entry_point: base_addr.wrapping_add(self.header.e_entry.truncate()),
             phdrs_addr,
             num_phdrs: self.header.e_phnum.into(),
+            bss_start,
+            bss_end,
         };
 
         if self.trampoline.is_some() {
@@ -562,6 +610,8 @@ impl ElfParsedFile {
             entry_point: 0,
             phdrs_addr: 0,
             num_phdrs: 0,
+            bss_start: 0,
+            bss_end: 0,
         };
         self.load_trampoline(mapper, mem, &mut info)
     }
@@ -579,6 +629,8 @@ pub trait ReadAt {
     fn size(&mut self) -> Result<u64, Self::Error>;
 }
 
+/// Blanket [`ReadAt`] implementation for byte slices, useful for parsing
+/// in-memory ELF binaries (e.g. after syscall-rewriter patching).
 impl ReadAt for &[u8] {
     type Error = Errno;
 

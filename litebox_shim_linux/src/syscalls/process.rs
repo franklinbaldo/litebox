@@ -1461,7 +1461,7 @@ impl<FS: ShimFS> Task<FS> {
             filter(&mut envp);
         }
 
-        let load_info = loader.load(argv, envp, self.init_auxv())?;
+        let load_info = loader.load(argv, envp, self.init_auxv(), None)?;
 
         self.set_task_comm(loader.comm());
 
