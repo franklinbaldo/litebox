@@ -4,7 +4,7 @@
 //! Implementation of memory management related syscalls, eg., `mmap`, `munmap`, etc.
 
 use litebox::mm::linux::{MappingError, PAGE_SIZE};
-use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
+use litebox_common_linux::{errno::Errno, MapFlags, ProtFlags};
 
 use crate::{Task, UserMutPtr};
 
@@ -30,6 +30,7 @@ impl Task {
             len,
             prot,
             flags,
+            false,
             false,
             op,
         )
