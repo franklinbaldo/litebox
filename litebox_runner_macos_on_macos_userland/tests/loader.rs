@@ -134,11 +134,38 @@ fn test_efault() {
     let bin_path = common::compile_macho_dynamic("./tests/efault.c", "efault");
     let binary_data = std::fs::read(&bin_path).expect("read binary");
 
-    let (exit_code, _stdout) = common::run_macho_dynamic(
-        &binary_data,
-        &["/usr/bin/efault"],
-        &cache_result,
-        "efault",
-    );
+    let (exit_code, _stdout) =
+        common::run_macho_dynamic(&binary_data, &["/usr/bin/efault"], &cache_result, "efault");
     assert_eq!(exit_code, 0, "process exited with non-zero code");
+}
+
+#[test]
+#[allow(clippy::cast_precision_loss)]
+fn test_signal() {
+    let cache_dir = std::path::Path::new("/System/Cryptexes/OS/System/Library/dyld");
+    assert!(
+        cache_dir.exists(),
+        "Shared cache not found at {}. This test requires macOS with dyld shared cache.",
+        cache_dir.display()
+    );
+
+    let map_path = cache_dir.join("dyld_shared_cache_arm64e.map");
+    let map_text = std::fs::read_to_string(&map_path).unwrap();
+    let cache_map = common::shared_cache::CacheMap::parse(&map_text);
+    let system_dylibs = cache_map.system_dylib_paths();
+    let dylib_refs: Vec<&str> = system_dylibs
+        .iter()
+        .map(std::string::String::as_str)
+        .collect();
+    let cache_result = common::shared_cache::collect_regions(cache_dir, &cache_map, &dylib_refs);
+
+    let bin_path = common::compile_macho_dynamic("./tests/signal.c", "signal");
+    let binary_data = std::fs::read(&bin_path).expect("read binary");
+
+    let (exit_code, _stdout) =
+        common::run_macho_dynamic(&binary_data, &["/usr/bin/signal"], &cache_result, "signal");
+    assert_eq!(
+        exit_code, 0,
+        "signal test: process exited with non-zero code (signal handler may have failed)"
+    );
 }
