@@ -1717,7 +1717,7 @@ unsafe fn shmem_socket_read(
         if result == 0 {
             return 0; // EOF (RX_SHUTDOWN + empty)
         }
-        if result != -11 {
+        if result != -i64::from(libc::EAGAIN) {
             return result; // error (ECONNRESET, etc.)
         }
         // -EAGAIN: buffer empty
@@ -1739,7 +1739,7 @@ unsafe fn shmem_socket_read(
                 crate::raw_syscall::futex4(
                     core::ptr::from_ref(rx_tail_ptr).cast::<u8>() as usize,
                     libc::FUTEX_WAIT,
-                    current_tail as u32,
+                    current_tail as u32, // compare low 32 bits
                     0,
                 );
             }
@@ -1826,7 +1826,7 @@ unsafe fn shmem_socket_write(
                 crate::raw_syscall::futex4(
                     core::ptr::from_ref(tx_head_ptr).cast::<u8>() as usize,
                     libc::FUTEX_WAIT,
-                    current_head as u32,
+                    current_head as u32, // compare low 32 bits
                     0,
                 );
             }
