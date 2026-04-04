@@ -1238,7 +1238,7 @@ fcall_types! {
 /// Tagged 9P message
 ///
 /// Every 9P message carries a `tag` chosen by the client to match requests
-/// with their responses. The special value [`NOTAG`] is reserved for
+/// with their responses. The special value `NOTAG` is reserved for
 /// `Tversion`/`Rversion` messages.
 #[derive(Clone, Debug)]
 pub(crate) struct TaggedFcall<'a> {

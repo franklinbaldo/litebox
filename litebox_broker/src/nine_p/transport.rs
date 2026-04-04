@@ -149,7 +149,7 @@ pub type ShmemRingReader = litebox_common_windows::shmem_ring::RingReader;
 ///
 /// Wraps the platform-specific shared-memory ring writer and reader into a
 /// single type that implements both [`Read`] and [`Write`], suitable for
-/// passing to [`Server::serve`](super::server::Server::serve).
+/// passing to `Server::serve`.
 #[cfg(any(unix, windows))]
 pub struct RingTransport {
     /// Write half — sends data to the remote process.
