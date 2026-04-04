@@ -179,10 +179,12 @@ impl<FS: ShimFS> Task<FS> {
             MacosSyscallRequest::Sigreturn { .. } => {
                 unreachable!("Sigreturn is handled in handle_syscall_request before do_syscall")
             }
+            MacosSyscallRequest::Pipe => {
+                unreachable!("Pipe is handled in handle_syscall_request before do_syscall")
+            }
             // Stubbed syscalls for future pipe/fs tasks:
             MacosSyscallRequest::Unlink { .. }
             | MacosSyscallRequest::Access { .. }
-            | MacosSyscallRequest::Pipe
             | MacosSyscallRequest::Fchmod { .. }
             | MacosSyscallRequest::Mkdir { .. }
             | MacosSyscallRequest::Rmdir { .. }

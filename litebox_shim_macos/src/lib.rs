@@ -922,6 +922,26 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
+    /// Handle `pipe()` — create an anonymous pipe.
+    ///
+    /// Returns `(read_fd, write_fd)` as raw integer FDs.
+    fn sys_pipe(&self) -> Result<(usize, usize), Errno> {
+        use core::num::NonZeroUsize;
+
+        let (sender, receiver) = self.global.pipes.create_pipe(
+            65536,                                  // capacity (standard pipe buffer)
+            litebox::pipes::Flags::empty(),         // blocking mode
+            NonZeroUsize::new(4096),                // PIPE_BUF atomic guarantee
+        );
+
+        let mut rds = self.global.raw_descriptors.write();
+        let read_fd = rds.fd_into_raw_integer(receiver);
+        let write_fd = rds.fd_into_raw_integer(sender);
+
+        log_unsupported!("pipe() → read_fd={read_fd}, write_fd={write_fd}");
+        Ok((read_fd, write_fd))
+    }
+
     /// Handle a macOS syscall and write the result back to the register context.
     #[allow(
         clippy::cast_possible_wrap,
@@ -961,6 +981,23 @@ impl<FS: ShimFS> Task<FS> {
         if let litebox_common_macos::syscall::MacosSyscallRequest::Sigreturn { uctx, .. } = &request
         {
             self.sys_sigreturn(ctx, *uctx);
+            return;
+        }
+
+        // Pipe returns two values (read_fd in x0, write_fd in x1) via the macOS
+        // dual-register return convention. set_syscall_return only sets x0, so
+        // we handle pipe specially.
+        if let litebox_common_macos::syscall::MacosSyscallRequest::Pipe = &request {
+            match self.sys_pipe() {
+                Ok((read_fd, write_fd)) => {
+                    ctx.regs[0] = read_fd;
+                    ctx.regs[1] = write_fd;
+                    ctx.pstate &= !litebox_common_macos::syscall::CARRY_BIT;
+                }
+                Err(errno) => {
+                    litebox_common_macos::syscall::set_syscall_return(ctx, Err(errno));
+                }
+            }
             return;
         }
 
