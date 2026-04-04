@@ -165,11 +165,18 @@ impl<FS: ShimFS> Task<FS> {
                 pthread,
                 flags,
             } => self.sys_bsdthread_create(func, func_arg, stack, pthread, flags, ctx),
-            MacosSyscallRequest::BsdthreadTerminate { .. }
-            | MacosSyscallRequest::BsdthreadCtl { .. } => {
-                log_unsupported!("bsdthread syscall not yet implemented");
-                Err(Errno::ENOSYS)
-            }
+            MacosSyscallRequest::BsdthreadTerminate {
+                stackaddr,
+                freesize,
+                port,
+                sema_or_ulock,
+            } => self.sys_bsdthread_terminate(stackaddr, freesize, port, sema_or_ulock),
+            MacosSyscallRequest::BsdthreadCtl {
+                cmd,
+                arg1,
+                arg2,
+                arg3,
+            } => self.sys_bsdthread_ctl(cmd, arg1, arg2, arg3),
         }
     }
 }

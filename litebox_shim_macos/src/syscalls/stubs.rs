@@ -410,4 +410,62 @@ impl<FS: ShimFS> Task<FS> {
         // Return the pthread address (what the kernel returns on success).
         Ok(pthread)
     }
+
+    /// Handle `bsdthread_terminate` — terminate the calling thread.
+    ///
+    /// On real macOS, the kernel frees the thread's stack, deallocates its
+    /// Mach port, and signals a semaphore/ulock. We skip stack freeing
+    /// (the host thread owns its stack) and just mark the thread terminated.
+    pub(crate) fn sys_bsdthread_terminate(
+        &self,
+        _stackaddr: usize,
+        _freesize: usize,
+        _port: u32,
+        _sema_or_ulock: usize,
+    ) -> Result<usize, Errno> {
+        use core::sync::atomic::Ordering;
+
+        log_unsupported!("bsdthread_terminate(tid={})", self.tid);
+
+        // Decrement thread count.
+        let prev = self.process.nr_threads.fetch_sub(1, Ordering::Release);
+        if prev <= 1 {
+            // Last thread exiting — treat as process exit with code 0.
+            self.process
+                .exit_code
+                .compare_exchange(0, 0, Ordering::AcqRel, Ordering::Acquire)
+                .ok();
+            self.process.group_exit.store(true, Ordering::Release);
+        }
+
+        self.terminated.store(true, Ordering::Release);
+        Ok(0)
+    }
+
+    /// Handle `bsdthread_ctl` — thread control operations.
+    ///
+    /// Most commands are stubs. We handle the minimum needed for libpthread.
+    #[allow(clippy::unnecessary_wraps)]
+    pub(crate) fn sys_bsdthread_ctl(
+        &self,
+        cmd: usize,
+        _arg1: usize,
+        _arg2: usize,
+        _arg3: usize,
+    ) -> Result<usize, Errno> {
+        const BSDTHREAD_CTL_SET_QOS: usize = 0x10;
+        const BSDTHREAD_CTL_GET_QOS: usize = 0x20;
+        const BSDTHREAD_CTL_SET_SELF: usize = 0x100;
+        const BSDTHREAD_CTL_QOS_MAX_PARALLELISM: usize = 0x800;
+
+        match cmd {
+            BSDTHREAD_CTL_SET_SELF => Ok(0),
+            BSDTHREAD_CTL_QOS_MAX_PARALLELISM => Ok(1),
+            BSDTHREAD_CTL_SET_QOS | BSDTHREAD_CTL_GET_QOS => Ok(0),
+            _ => {
+                log_unsupported!("bsdthread_ctl(cmd={cmd:#x}): unsupported");
+                Ok(0)
+            }
+        }
+    }
 }
