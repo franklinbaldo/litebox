@@ -280,6 +280,43 @@ pub enum MacosSyscallRequest {
         uctx: usize,
         infostyle: i32,
     },
+    Unlink {
+        path: usize,
+    },
+    Access {
+        path: usize,
+        amode: i32,
+    },
+    Pipe,
+    Fchmod {
+        fd: i32,
+        mode: u32,
+    },
+    Mkdir {
+        path: usize,
+        mode: u32,
+    },
+    Rmdir {
+        path: usize,
+    },
+    Ftruncate {
+        fd: i32,
+        length: i64,
+    },
+    SemwaitSignal {
+        cond_sem: i32,
+        mutex_sem: i32,
+        timeout: i32,
+        relative: i32,
+        tv_sec: i64,
+        tv_nsec: i32,
+    },
+    Getdirentries64 {
+        fd: i32,
+        buf: usize,
+        bufsize: usize,
+        basep: usize,
+    },
     Unknown {
         number: usize,
     },
@@ -474,6 +511,39 @@ impl MacosSyscallRequest {
                 arg1: a1,
                 arg2: a2,
                 arg3: a3,
+            },
+            nr::UNLINK => MacosSyscallRequest::Unlink { path: a0 },
+            nr::ACCESS => MacosSyscallRequest::Access {
+                path: a0,
+                amode: a1 as i32,
+            },
+            nr::PIPE => MacosSyscallRequest::Pipe,
+            nr::FCHMOD => MacosSyscallRequest::Fchmod {
+                fd: a0 as i32,
+                mode: a1 as u32,
+            },
+            nr::MKDIR => MacosSyscallRequest::Mkdir {
+                path: a0,
+                mode: a1 as u32,
+            },
+            nr::RMDIR => MacosSyscallRequest::Rmdir { path: a0 },
+            nr::FTRUNCATE => MacosSyscallRequest::Ftruncate {
+                fd: a0 as i32,
+                length: a1 as i64,
+            },
+            nr::SEMWAIT_SIGNAL => MacosSyscallRequest::SemwaitSignal {
+                cond_sem: a0 as i32,
+                mutex_sem: a1 as i32,
+                timeout: a2 as i32,
+                relative: a3 as i32,
+                tv_sec: a4 as i64,
+                tv_nsec: a5 as i32,
+            },
+            nr::GETDIRENTRIES64 => MacosSyscallRequest::Getdirentries64 {
+                fd: a0 as i32,
+                buf: a1,
+                bufsize: a2,
+                basep: a3,
             },
             _ => MacosSyscallRequest::Unknown { number: nr_raw },
         }
