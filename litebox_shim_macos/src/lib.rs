@@ -661,6 +661,10 @@ struct GlobalState<FS: ShimFS> {
     /// Base address of the installed shared cache (0 if not installed).
     pub(crate) shared_cache_base: AtomicU64,
     /// Optional sysroot prefix for path rewriting in sys_open.
+    #[expect(
+        dead_code,
+        reason = "will be used when sys_open path rewriting is implemented"
+    )]
     sysroot: Option<alloc::string::String>,
 }
 

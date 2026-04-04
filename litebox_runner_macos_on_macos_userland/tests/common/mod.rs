@@ -267,62 +267,6 @@ pub fn run_macho_dynamic(
         .collect();
     shim.install_shared_cache(0x180000000, &regions_for_shim, &[]);
 
-    // Verify the dynamic config data is correctly mapped.
-    unsafe {
-        let header_ptr = 0x180000000u64 as *const u8;
-        let dyn_off = u64::from_le_bytes(
-            std::slice::from_raw_parts(header_ptr.add(0x1F0), 8)
-                .try_into()
-                .unwrap(),
-        );
-        let dyn_addr = 0x180000000u64 + dyn_off;
-        let dyn_ptr = dyn_addr as *const u8;
-        let magic = std::slice::from_raw_parts(dyn_ptr, 16);
-        eprintln!(
-            "Verification: dynamicDataOffset={:#X}, addr={:#X}, magic={:?}",
-            dyn_off,
-            dyn_addr,
-            std::str::from_utf8(magic).unwrap_or("<non-utf8>")
-        );
-
-        // Dump the internal mapping table from the cache header.
-        let mapping_offset = u32::from_le_bytes(
-            std::slice::from_raw_parts(header_ptr.add(16), 4)
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        let mapping_count = u32::from_le_bytes(
-            std::slice::from_raw_parts(header_ptr.add(20), 4)
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        eprintln!(
-            "Cache header: mapping_offset={:#X}, mapping_count={}",
-            mapping_offset, mapping_count
-        );
-        // Each mapping entry is 32 bytes: {u64 vm_addr, u64 vm_size, u64 file_offset, u32 max_prot, u32 init_prot}
-        for i in 0..mapping_count.min(10) {
-            let base = mapping_offset + i * 32;
-            let vm_addr = u64::from_le_bytes(
-                std::slice::from_raw_parts(header_ptr.add(base), 8)
-                    .try_into()
-                    .unwrap(),
-            );
-            let vm_size = u64::from_le_bytes(
-                std::slice::from_raw_parts(header_ptr.add(base + 8), 8)
-                    .try_into()
-                    .unwrap(),
-            );
-            eprintln!(
-                "  mapping[{}]: vm_addr={:#X}, vm_size={:#X}, end={:#X}",
-                i,
-                vm_addr,
-                vm_size,
-                vm_addr + vm_size
-            );
-        }
-    }
-
     // Use absolute path for argv[0] so dyld can resolve executable_path.
     let mut argv_cstrings: Vec<std::ffi::CString> = Vec::with_capacity(argv.len());
     argv_cstrings.push(std::ffi::CString::new("/usr/bin/hello_dynamic").unwrap());

@@ -155,7 +155,7 @@ struct SubCacheFileMapping {
     pub vm_addr: u64,
     pub vm_size: u64,
     pub file_offset: u64,
-    pub init_prot: u32,
+    pub _init_prot: u32,
 }
 
 /// Represents a single sub-cache file with its parsed mapping table.
@@ -208,12 +208,12 @@ impl SubCacheFile {
             let vm_size = u64::from_le_bytes(header[base + 8..base + 16].try_into().ok()?);
             let file_offset = u64::from_le_bytes(header[base + 16..base + 24].try_into().ok()?);
             // max_prot at base+24..base+28 — skip
-            let init_prot = u32::from_le_bytes(header[base + 28..base + 32].try_into().ok()?);
+            let _init_prot = u32::from_le_bytes(header[base + 28..base + 32].try_into().ok()?);
             mappings.push(SubCacheFileMapping {
                 vm_addr,
                 vm_size,
                 file_offset,
-                init_prot,
+                _init_prot,
             });
         }
 
