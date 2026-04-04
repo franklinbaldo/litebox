@@ -13,22 +13,22 @@ use core::{
 
 use alloc::sync::{Arc, Weak};
 use ringbuf::{
-    traits::{Consumer as _, Observer as _, Producer as _, Split as _},
     HeapCons, HeapProd, HeapRb,
+    traits::{Consumer as _, Observer as _, Producer as _, Split as _},
 };
 use thiserror::Error;
 
 use crate::{
+    LiteBox,
     event::{
+        Events, IOPollable,
         observer::Observer,
         polling::{Pollee, TryOpError},
         wait::{WaitContext, WaitError},
-        Events, IOPollable,
     },
     fs::OFlags,
     platform::TimeProvider,
     sync::{Mutex, RawSyncPrimitivesProvider},
-    LiteBox,
 };
 
 /// Support for unidirectional communication channels
