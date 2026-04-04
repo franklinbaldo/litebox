@@ -1407,7 +1407,10 @@ impl<FS: ShimFS> Task<FS> {
             &self.global,
             sockfd,
             |fd| self.global.shutdown(fd, read, write),
-            |file| file.shutdown(read, write),
+            |file| {
+                file.shutdown(read, write);
+                Ok(())
+            },
         )
     }
 

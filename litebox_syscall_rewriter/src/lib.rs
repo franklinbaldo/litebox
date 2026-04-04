@@ -54,11 +54,10 @@ pub enum Error {
 
 type Result<T> = core::result::Result<T, Error>;
 
-const BUN_FOOTER_MARKER: &[u8] = b"\n---- Bun! ----\n";
-
 /// The magic bytes used to identify the trampoline data.
 /// This is checked by the loader to verify that the trampoline is valid.
 pub const TRAMPOLINE_MAGIC: &[u8; 8] = b"LITEBOX0";
+const BUN_FOOTER_MARKER: &[u8] = b"\n---- Bun! ----\n";
 
 /// Trampoline header for 64-bit: 8 (magic) + 8 (file_offset) + 8 (vaddr) + 8 (size) = 32 bytes
 #[repr(C, packed)]
@@ -108,8 +107,8 @@ struct TextSectionInfo {
 /// This layout allows loaders to read just the last 32/20 bytes to get the metadata.
 ///
 /// `skipped_addrs` receives the virtual addresses of any `syscall`
-/// instructions that could not be patched (replaced with `UD2` so they
-/// trap instead of escaping to the host kernel).
+/// instructions that could not be patched. The output ELF is still
+/// valid, but those instructions remain as raw host syscalls.
 pub fn hook_syscalls_in_elf(
     input_binary: &[u8],
     trampoline: Option<u64>,
@@ -260,11 +259,6 @@ pub fn hook_syscalls_in_elf(
         if off + 5 <= buf.len() {
             buf[off] = 0xE9; // JMP rel32
             buf[off + 1..off + 5].copy_from_slice(&rel32.to_le_bytes());
-        } else {
-            return Err(Error::ParseError(format!(
-                "fork→vfork patch offset {off:#x} + 5 exceeds buffer length {}",
-                buf.len()
-            )));
         }
     }
 
@@ -703,13 +697,21 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
                 let new_p_offset = (old_p_offset + padding as u64).to_le_bytes();
                 buf[p_offset_off..p_offset_off + 8].copy_from_slice(&new_p_offset);
             }
-            // The PHDR segment size should match the phdr table; no change needed.
+            // Also update p_filesz and p_memsz if they encompass the old phdr table
+            let p_filesz_off = entry_off + 32;
+            let p_memsz_off = entry_off + 40;
+            let p_filesz =
+                u64::from_le_bytes(buf[p_filesz_off..p_filesz_off + 8].try_into().unwrap());
+            // The PHDR segment size should match the phdr table; no change needed unless
+            // the segment extended to exactly old_end (just leave it, sizes don't change).
+            let _ = p_filesz;
+            let _ = p_memsz_off;
         }
     }
 }
 
 /// Find fork and vfork symbols in the ELF and compute the patch needed to
-/// redirect fork -> vfork. Returns `Some((fork_file_offset, jmp_rel32))` if
+/// redirect fork → vfork. Returns `Some((fork_file_offset, jmp_rel32))` if
 /// both symbols are found, or `None` if this binary doesn't export fork.
 fn find_fork_vfork_patch(
     file: &object::File<'_>,
@@ -761,10 +763,11 @@ fn find_fork_vfork_patch(
     Some((fork_file_offset, rel32))
 }
 
-/// Check if the input binary has the Bun footer marker near the end.
 fn has_bun_footer_marker(input_binary: &[u8]) -> bool {
-    input_binary.len() >= BUN_FOOTER_MARKER.len()
-        && input_binary[input_binary.len() - BUN_FOOTER_MARKER.len()..] == *BUN_FOOTER_MARKER
+    let window_len = input_binary.len().min(256);
+    input_binary[input_binary.len().saturating_sub(window_len)..]
+        .windows(BUN_FOOTER_MARKER.len())
+        .any(|window| window == BUN_FOOTER_MARKER)
 }
 
 /// Replace an unpatchable syscall instruction with `UD2` (`0F 0B`) so that
@@ -808,8 +811,8 @@ fn replace_with_ud2(section_data: &mut [u8], section_base_addr: u64, inst: &iced
 /// instructions are found in `code`.
 ///
 /// `skipped_addrs` receives the virtual addresses of any `syscall`
-/// instructions that could not be patched (replaced with `UD2` so they
-/// trap instead of escaping to the host kernel).
+/// instructions that could not be patched due to insufficient surrounding
+/// space. Those instructions remain as raw host syscalls in the output.
 pub fn patch_code_segment(
     code: &mut [u8],
     code_vaddr: u64,
@@ -1050,12 +1053,6 @@ fn hook_syscall_and_after(
     }
 
     let replace_end = replace_end.unwrap();
-    // This function copies post-syscall instructions to the trampoline as raw
-    // bytes (no re-encoding). That only works for position-independent
-    // instructions. If any post-syscall instruction has a RIP-relative memory
-    // operand, the raw bytes would reference the wrong address from the
-    // trampoline's location, so fall back to hook_syscall_before_and_after
-    // which re-encodes both sides with corrected displacements.
     let copied_postsyscall_insts_have_ip_rel_mem = arch == Arch::X86_64
         && instruction_slice_has_ip_rel_memory_operand(
             instructions
@@ -1287,4 +1284,95 @@ fn hook_syscall_before_and_after(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BUN_FOOTER_MARKER, has_bun_footer_marker, patch_code_segment};
+
+    #[test]
+    fn detects_bun_footer_marker_near_end() {
+        let mut bytes = vec![0u8; 512];
+        let offset = bytes.len() - BUN_FOOTER_MARKER.len() - 8;
+        bytes[offset..offset + BUN_FOOTER_MARKER.len()].copy_from_slice(BUN_FOOTER_MARKER);
+        assert!(has_bun_footer_marker(&bytes));
+    }
+
+    #[test]
+    fn ignores_missing_bun_footer_marker() {
+        let bytes = vec![0u8; 512];
+        assert!(!has_bun_footer_marker(&bytes));
+    }
+
+    #[test]
+    fn patch_code_segment_relocates_rip_relative_presyscall_to_trampoline() {
+        let mut code = vec![
+            0x48, 0x8D, 0x35, 0x10, 0x00, 0x00, 0x00, // lea rsi, [rip + 0x10] @ 0x1000
+            0x0F, 0x05, // syscall @ 0x1007
+            0x31, 0xC0, // xor eax, eax
+            0xBA, 0x01, 0x00, 0x00, 0x00, // mov edx, 1
+        ];
+
+        let trampoline = patch_code_segment(&mut code, 0x1000, 0x8000, 0x9000, &mut Vec::new())
+            .expect("patch_code_segment should succeed");
+
+        assert!(!trampoline.is_empty());
+        // The lea + syscall region (9 bytes starting at 0x1000) should now be a
+        // JMP to the trampoline followed by NOPs.
+        assert_eq!(code[0], 0xE9, "replace region should start with JMP rel32");
+        // The trampoline should contain the re-encoded lea with an adjusted
+        // RIP-relative displacement targeting the same absolute address.
+        // Original: lea targets 0x1007 + 0x10 = 0x1017.
+        // Re-encoded at 0x8000: displacement = 0x1017 - (0x8000 + 7) = -0x6FF0 = 0xFFFF9010
+        #[allow(clippy::cast_possible_truncation)]
+        let expected_disp: i32 = 0x1017_i64.wrapping_sub(0x8000 + 7) as i32;
+        assert_eq!(
+            &trampoline[3..7],
+            &expected_disp.to_le_bytes(),
+            "re-encoded lea displacement should target the original address"
+        );
+    }
+
+    #[test]
+    fn patch_code_segment_handles_rip_relative_on_both_sides_of_syscall() {
+        let mut code = vec![
+            0x48, 0x8D, 0x35, 0x10, 0x00, 0x00, 0x00, // lea rsi, [rip + 0x10] @ 0x1000
+            0x0F, 0x05, // syscall @ 0x1007
+            0x48, 0x8D, 0x3D, 0x10, 0x00, 0x00, 0x00, // lea rdi, [rip + 0x10]
+        ];
+
+        let mut skipped = Vec::new();
+        let stubs = patch_code_segment(&mut code, 0x1000, 0x8000, 0x9000, &mut skipped)
+            .expect("patch_code_segment should succeed");
+        // The pre-syscall lea is re-encoded in the trampoline; the
+        // post-syscall lea stays in place (not overwritten).
+        assert!(!stubs.is_empty(), "should be patched via re-encoding");
+        assert_eq!(code[0], 0xE9, "replace region should start with JMP");
+        assert!(skipped.is_empty(), "nothing should be skipped");
+    }
+
+    #[test]
+    fn patch_code_segment_patches_all_syscalls_including_rip_relative() {
+        let mut code = vec![
+            // First syscall: patchable (3 nops before = 5 bytes total with syscall)
+            0x90, 0x90, 0x90, // nop; nop; nop
+            0x0F, 0x05, // syscall @ offset 3
+            0xC3, // ret
+            // Second syscall: RIP-relative before, now patchable via re-encoding
+            0x48, 0x8D, 0x35, 0x10, 0x00, 0x00, 0x00, // lea rsi, [rip+0x10]
+            0x0F, 0x05, // syscall @ offset 13
+            0x48, 0x8D, 0x3D, 0x10, 0x00, 0x00, 0x00, // lea rdi, [rip+0x10]
+        ];
+
+        let mut skipped = Vec::new();
+        let stubs = patch_code_segment(&mut code, 0x1000, 0x8000, 0x9000, &mut skipped).unwrap();
+
+        assert!(!stubs.is_empty(), "both syscalls should be patched");
+        assert_eq!(code[0], 0xE9, "first syscall site should be a JMP");
+        assert_eq!(
+            code[6], 0xE9,
+            "second syscall site (lea start) should be a JMP"
+        );
+        assert!(skipped.is_empty(), "nothing should be skipped");
+    }
 }

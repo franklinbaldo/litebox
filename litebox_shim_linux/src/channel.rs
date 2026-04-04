@@ -119,7 +119,6 @@ pub(crate) struct WriteEnd<T> {
     peer: alloc::sync::Weak<EndPointer<crate::Platform, ringbuf::HeapCons<T>>>,
 }
 
-// Manual Clone impl: Arc/Weak are always Clone regardless of T.
 impl<T> Clone for WriteEnd<T> {
     fn clone(&self) -> Self {
         Self {
@@ -164,6 +163,26 @@ impl<T> WriteEnd<T> {
     }
 
     common_functions_for_channel!();
+}
+
+impl<T> Drop for WriteEnd<T> {
+    fn drop(&mut self) {
+        // Only notify when this is the last clone — the channel is truly closing.
+        if Arc::strong_count(&self.endpoint) == 1
+            && let Some(peer) = self.peer.upgrade()
+        {
+            peer.pollee
+                .notify_observers(Events::IN | Events::HUP | Events::RDHUP);
+        }
+    }
+}
+
+impl<T> Drop for ReadEnd<T> {
+    fn drop(&mut self) {
+        if let Some(peer) = self.peer.upgrade() {
+            peer.pollee.notify_observers(Events::HUP | Events::ERR);
+        }
+    }
 }
 
 pub(crate) struct Channel<T> {

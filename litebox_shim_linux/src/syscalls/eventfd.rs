@@ -34,7 +34,6 @@ impl FdEnabledSubsystem for EventfdSubsystem {
 }
 impl FdEnabledSubsystemEntry for EventFile<Platform> {}
 
-#[allow(dead_code)] // Pidfd/Timerfd variants are constructed by syscalls added in later PRs
 enum EventFileInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     Eventfd {
         counter: u64,
@@ -47,7 +46,6 @@ enum EventFileInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     Timerfd(TimerFileState<Platform>),
 }
 
-#[allow(dead_code)] // fields used when TimerFileState is constructed by sys_timerfd_create (later PR)
 struct TimerFileState<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     platform: &'static Platform,
     clockid: ClockId,
@@ -79,7 +77,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         }
     }
 
-    #[allow(dead_code)] // called by sys_timerfd_create added in a later PR
     pub(crate) fn new_timer(
         platform: &'static Platform,
         boot_time: Platform::Instant,
@@ -103,7 +100,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         }
     }
 
-    #[allow(dead_code)] // called by sys_pidfd_open added in a later PR
     pub(crate) fn new_pidfd(
         exited: Arc<AtomicBool>,
         subject: Arc<Subject<Events, Events, Platform>>,
@@ -123,7 +119,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     }
 
     #[cfg(feature = "trace_syscalls")]
-    #[allow(dead_code)] // called by trace logging in file.rs (added in a later PR)
     pub(crate) fn kind_name(&self) -> &'static str {
         match &*self.inner.lock() {
             EventFileInner::Eventfd { .. } => "eventfd",
@@ -255,7 +250,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
             .map_err(Errno::from)
     }
 
-    #[allow(dead_code)] // called by sys_timerfd_settime added in a later PR
     pub(crate) fn set_timer(
         &self,
         flags: TimerfdTimerFlags,
@@ -272,7 +266,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         Ok(old_value)
     }
 
-    #[allow(dead_code)] // called by sys_timerfd_gettime added in a later PR
     pub(crate) fn get_timer(&self) -> Result<ItimerSpec, Errno> {
         let mut inner = self.inner.lock();
         let EventFileInner::Timerfd(timer) = &mut *inner else {
@@ -329,7 +322,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for EventFil
     }
 }
 
-#[allow(dead_code)] // methods used when TimerFileState is constructed (later PR)
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> TimerFileState<Platform> {
     fn current_time(&self) -> Result<Duration, Errno> {
         match self.clockid {

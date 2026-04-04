@@ -1496,31 +1496,15 @@ impl<FS: ShimFS> UnixSocket<FS> {
     }
 
     /// Shutdown the read side, write side, or both of a Unix socket.
-    #[allow(dead_code)]
-    pub(super) fn shutdown(&self, read: bool, write: bool) -> Result<(), Errno> {
-        match &self.inner {
-            UnixSocketInner::Stream(stream) => {
-                let state = stream.state.read();
-                match &*state {
-                    Some(UnixStreamState::Connected(conn)) => {
-                        if read {
-                            conn.recv_channel.shutdown();
-                        }
-                        if write {
-                            conn.connected_send_channel.shutdown();
-                        }
-                        Ok(())
-                    }
-                    _ => Err(Errno::ENOTCONN),
+    pub(super) fn shutdown(&self, read: bool, write: bool) {
+        if let UnixSocketInner::Stream(stream) = &self.inner {
+            let state = stream.state.read();
+            if let Some(UnixStreamState::Connected(conn)) = &*state {
+                if read {
+                    conn.recv_channel.shutdown();
                 }
-            }
-            UnixSocketInner::Datagram(datagram) => {
-                let inner = datagram.inner.read();
-                if inner.connected_send_channel.is_some() {
-                    // Datagram sockets allow shutdown if "connected"
-                    Ok(())
-                } else {
-                    Err(Errno::ENOTCONN)
+                if write {
+                    conn.connected_send_channel.shutdown();
                 }
             }
         }

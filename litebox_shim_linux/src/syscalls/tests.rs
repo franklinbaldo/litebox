@@ -1,12 +1,22 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use litebox::fs::{FileSystem as _, Mode, OFlags};
-use litebox::platform::RawConstPointer as _;
-use litebox_common_linux::{AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, errno::Errno};
-use litebox_platform_multiplex::{Platform, set_platform};
+use core::time::Duration;
 
-use crate::MutPtr;
+use litebox::platform::RawConstPointer as _;
+use litebox::{
+    event::Events,
+    fs::{FileSystem as _, Mode, OFlags},
+};
+use litebox_common_linux::{
+    AddressFamily, AtFlags, ClockId, EfdFlags, EpollCreateFlags, EpollEvent, EpollOp, FcntlArg,
+    FileDescriptorFlags, Flock, FlockType, ItimerSpec, MemfdFlags, SockType, TimeParam,
+    TimerfdFlags, TimerfdTimerFlags, errno::Errno,
+};
+use litebox_platform_multiplex::{Platform, set_platform};
+use std::vec::Vec;
+
+use crate::{ConstPtr, MutPtr};
 
 extern crate std;
 
@@ -94,6 +104,305 @@ fn test_fcntl() {
         .expect("Failed to create eventfd");
     let eventfd = i32::try_from(eventfd).unwrap();
     check(eventfd, OFlags::RDWR | OFlags::NONBLOCK, OFlags::RDWR);
+
+    let memfd = task
+        .sys_memfd_create(
+            alloc::ffi::CString::new("fcntl-memfd").unwrap(),
+            MemfdFlags::CLOEXEC,
+        )
+        .expect("Failed to create memfd");
+    let memfd = i32::try_from(memfd).unwrap();
+    check(
+        memfd,
+        OFlags::RDWR | OFlags::LARGEFILE,
+        OFlags::RDWR | OFlags::LARGEFILE,
+    );
+
+    let epoll = task
+        .sys_epoll_create(EpollCreateFlags::EPOLL_CLOEXEC)
+        .expect("Failed to create epoll fd");
+    let epoll = i32::try_from(epoll).unwrap();
+    assert_eq!(
+        task.sys_fcntl(epoll, FcntlArg::GETFL).unwrap(),
+        OFlags::RDWR.bits()
+    );
+    task.sys_fcntl(epoll, FcntlArg::SETFL(OFlags::RDWR | OFlags::NONBLOCK))
+        .expect("Failed to set epoll O_NONBLOCK");
+    assert_eq!(
+        task.sys_fcntl(epoll, FcntlArg::GETFL).unwrap(),
+        (OFlags::RDWR | OFlags::NONBLOCK).bits()
+    );
+
+    let timerfd = task
+        .sys_timerfd_create(
+            ClockId::Monotonic,
+            TimerfdFlags::NONBLOCK | TimerfdFlags::CLOEXEC,
+        )
+        .expect("Failed to create timerfd");
+    let timerfd = i32::try_from(timerfd).unwrap();
+    assert_eq!(
+        task.sys_fcntl(timerfd, FcntlArg::GETFL).unwrap(),
+        (OFlags::RDWR | OFlags::NONBLOCK).bits()
+    );
+
+    let stdin = task
+        .sys_open(
+            "/dev/stdin",
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("Failed to open non-blocking stdin");
+    let stdin = i32::try_from(stdin).unwrap();
+    check(stdin, OFlags::RDONLY | OFlags::NONBLOCK, OFlags::RDONLY);
+}
+
+#[test]
+fn test_fcntl_dupfd_respects_min_fd() {
+    let task = init_platform(None);
+
+    let fd = task
+        .sys_open("/dev/stdin", OFlags::RDONLY, Mode::empty())
+        .expect("Failed to open stdin");
+    let fd = i32::try_from(fd).unwrap();
+
+    let min_fd = u32::try_from(fd + 10).unwrap();
+    let duped = task
+        .sys_fcntl(
+            fd,
+            FcntlArg::DUPFD {
+                cloexec: false,
+                min_fd,
+            },
+        )
+        .expect("F_DUPFD should succeed");
+    assert_eq!(duped, min_fd);
+
+    let cloexec_duped = task
+        .sys_fcntl(
+            fd,
+            FcntlArg::DUPFD {
+                cloexec: true,
+                min_fd: min_fd + 1,
+            },
+        )
+        .expect("F_DUPFD_CLOEXEC should succeed");
+    assert_eq!(cloexec_duped, min_fd + 1);
+    assert_eq!(
+        task.sys_fcntl(i32::try_from(cloexec_duped).unwrap(), FcntlArg::GETFD)
+            .unwrap(),
+        FileDescriptorFlags::FD_CLOEXEC.bits()
+    );
+}
+
+#[test]
+fn test_ftruncate_rejects_non_file_descriptors() {
+    let task = init_platform(None);
+
+    let (read_fd, write_fd) = task.sys_pipe2(OFlags::empty()).unwrap();
+    let read_fd = i32::try_from(read_fd).unwrap();
+    let write_fd = i32::try_from(write_fd).unwrap();
+
+    let udp_fd = task
+        .sys_socket(AddressFamily::INET as u32, SockType::Datagram as u32, 0)
+        .expect("Failed to create UDP socket");
+    let udp_fd = i32::try_from(udp_fd).unwrap();
+
+    let eventfd = task
+        .sys_eventfd2(0, EfdFlags::empty())
+        .expect("Failed to create eventfd");
+    let eventfd = i32::try_from(eventfd).unwrap();
+
+    let epoll = task
+        .sys_epoll_create(EpollCreateFlags::empty())
+        .expect("Failed to create epoll fd");
+    let epoll = i32::try_from(epoll).unwrap();
+
+    let timerfd = task
+        .sys_timerfd_create(ClockId::Monotonic, TimerfdFlags::empty())
+        .expect("Failed to create timerfd");
+    let timerfd = i32::try_from(timerfd).unwrap();
+
+    let mut sv = [0u32; 2];
+    task.sys_socketpair(
+        AddressFamily::UNIX as u32,
+        SockType::Stream as u32,
+        0,
+        MutPtr::from_usize(sv.as_mut_ptr() as usize),
+    )
+    .expect("Failed to create unix socketpair");
+    let unix_fd = i32::try_from(sv[0]).unwrap();
+    let unix_peer = i32::try_from(sv[1]).unwrap();
+
+    for fd in [read_fd, write_fd, udp_fd, eventfd, epoll, timerfd, unix_fd] {
+        assert_eq!(task.sys_ftruncate(fd, 0).unwrap_err(), Errno::EINVAL);
+    }
+
+    task.sys_close(read_fd).unwrap();
+    task.sys_close(write_fd).unwrap();
+    task.sys_close(udp_fd).unwrap();
+    task.sys_close(eventfd).unwrap();
+    task.sys_close(epoll).unwrap();
+    task.sys_close(timerfd).unwrap();
+    task.sys_close(unix_fd).unwrap();
+    task.sys_close(unix_peer).unwrap();
+}
+
+#[test]
+fn test_inotify_stub() {
+    let task = init_platform(None);
+
+    let fd = task
+        .sys_inotify_init1(OFlags::CLOEXEC | OFlags::NONBLOCK)
+        .expect("Failed to create inotify stub");
+    let fd = i32::try_from(fd).unwrap();
+
+    assert_eq!(
+        task.sys_fcntl(fd, FcntlArg::GETFD).unwrap(),
+        FileDescriptorFlags::FD_CLOEXEC.bits()
+    );
+    assert_eq!(
+        task.sys_fcntl(fd, FcntlArg::GETFL).unwrap(),
+        (OFlags::RDWR | OFlags::NONBLOCK).bits()
+    );
+
+    let wd = task
+        .sys_inotify_add_watch(fd, "/", 0)
+        .expect("Failed to add watch");
+    let wd = i32::try_from(wd).unwrap();
+
+    let dup_fd = task.sys_dup(fd, None, None).expect("dup failed");
+    let dup_fd = i32::try_from(dup_fd).unwrap();
+    let dup_watch = task
+        .sys_inotify_add_watch(dup_fd, "/", 0)
+        .expect("Failed to add watch through dup fd");
+    let dup_watch = i32::try_from(dup_watch).unwrap();
+
+    task.sys_inotify_rm_watch(fd, dup_watch)
+        .expect("Failed to remove watch through original fd");
+    task.sys_inotify_rm_watch(dup_fd, wd)
+        .expect("Failed to remove watch through dup fd");
+    assert_eq!(task.sys_inotify_rm_watch(fd, wd), Err(Errno::EINVAL));
+}
+
+#[test]
+fn test_fcntl_locking_on_non_file_descriptors() {
+    let task = init_platform(None);
+
+    let new_flock = |lock_type: FlockType| Flock {
+        type_: lock_type as i16,
+        whence: 0,
+        #[cfg(target_pointer_width = "64")]
+        __pad0: 0,
+        start: 0,
+        len: 0,
+        pid: 0,
+        #[cfg(target_pointer_width = "64")]
+        __pad1: 0,
+    };
+
+    let (read_fd, write_fd) = task.sys_pipe2(OFlags::empty()).unwrap();
+    let read_fd = i32::try_from(read_fd).unwrap();
+    let write_fd = i32::try_from(write_fd).unwrap();
+
+    let udp_fd = task
+        .sys_socket(AddressFamily::INET as u32, SockType::Datagram as u32, 0)
+        .expect("Failed to create UDP socket");
+    let udp_fd = i32::try_from(udp_fd).unwrap();
+
+    let eventfd = task
+        .sys_eventfd2(0, EfdFlags::empty())
+        .expect("Failed to create eventfd");
+    let eventfd = i32::try_from(eventfd).unwrap();
+
+    let epoll = task
+        .sys_epoll_create(EpollCreateFlags::empty())
+        .expect("Failed to create epoll fd");
+    let epoll = i32::try_from(epoll).unwrap();
+
+    let mut sv = [0u32; 2];
+    task.sys_socketpair(
+        AddressFamily::UNIX as u32,
+        SockType::Stream as u32,
+        0,
+        MutPtr::from_usize(sv.as_mut_ptr() as usize),
+    )
+    .expect("Failed to create unix socketpair");
+    let unix_fd = i32::try_from(sv[0]).unwrap();
+    let unix_peer = i32::try_from(sv[1]).unwrap();
+
+    let read_lock = new_flock(FlockType::ReadLock);
+    let write_lock = new_flock(FlockType::WriteLock);
+    let unlock = new_flock(FlockType::Unlock);
+
+    let mut getlk = new_flock(FlockType::WriteLock);
+    task.sys_fcntl(
+        eventfd,
+        FcntlArg::GETLK(MutPtr::from_usize((&raw mut getlk) as usize)),
+    )
+    .expect("GETLK should succeed on eventfd");
+    assert_eq!(getlk.type_, FlockType::Unlock as i16);
+
+    let mut bad_getlk = new_flock(FlockType::Unlock);
+    assert_eq!(
+        task.sys_fcntl(
+            eventfd,
+            FcntlArg::GETLK(MutPtr::from_usize((&raw mut bad_getlk) as usize)),
+        )
+        .unwrap_err(),
+        Errno::EINVAL
+    );
+
+    assert_eq!(
+        task.sys_fcntl(
+            read_fd,
+            FcntlArg::SETLK(ConstPtr::from_usize((&raw const read_lock) as usize)),
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        task.sys_fcntl(
+            read_fd,
+            FcntlArg::SETLK(ConstPtr::from_usize((&raw const unlock) as usize)),
+        )
+        .unwrap(),
+        0
+    );
+
+    for fd in [udp_fd, eventfd, epoll, unix_fd] {
+        assert_eq!(
+            task.sys_fcntl(
+                fd,
+                FcntlArg::SETLK(ConstPtr::from_usize((&raw const read_lock) as usize)),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            task.sys_fcntl(
+                fd,
+                FcntlArg::SETLK(ConstPtr::from_usize((&raw const write_lock) as usize)),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            task.sys_fcntl(
+                fd,
+                FcntlArg::SETLK(ConstPtr::from_usize((&raw const unlock) as usize)),
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    task.sys_close(read_fd).unwrap();
+    task.sys_close(write_fd).unwrap();
+    task.sys_close(udp_fd).unwrap();
+    task.sys_close(eventfd).unwrap();
+    task.sys_close(epoll).unwrap();
+    task.sys_close(unix_fd).unwrap();
+    task.sys_close(unix_peer).unwrap();
 }
 
 #[test]
@@ -400,6 +709,450 @@ fn test_getdent64() {
         all_entries,
         alloc::vec![".", "..", "bar", "foo", "test_file1.txt", "test_file2.txt"]
     );
+}
+
+#[test]
+fn test_getdent64_returns_enotdir_for_non_directory_fds() {
+    let task = init_platform(None);
+    let mut buffer = [0u8; 256];
+
+    let (read_fd, write_fd) = task.sys_pipe2(OFlags::empty()).unwrap();
+    let read_fd = i32::try_from(read_fd).unwrap();
+    let write_fd = i32::try_from(write_fd).unwrap();
+
+    let udp_fd = task
+        .sys_socket(AddressFamily::INET as u32, SockType::Datagram as u32, 0)
+        .expect("Failed to create UDP socket");
+    let udp_fd = i32::try_from(udp_fd).unwrap();
+
+    let eventfd = task
+        .sys_eventfd2(0, EfdFlags::empty())
+        .expect("Failed to create eventfd");
+    let eventfd = i32::try_from(eventfd).unwrap();
+
+    let epoll = task
+        .sys_epoll_create(EpollCreateFlags::empty())
+        .expect("Failed to create epoll fd");
+    let epoll = i32::try_from(epoll).unwrap();
+
+    let timerfd = task
+        .sys_timerfd_create(ClockId::Monotonic, TimerfdFlags::empty())
+        .expect("Failed to create timerfd");
+    let timerfd = i32::try_from(timerfd).unwrap();
+
+    let mut sv = [0u32; 2];
+    task.sys_socketpair(
+        AddressFamily::UNIX as u32,
+        SockType::Stream as u32,
+        0,
+        MutPtr::from_usize(sv.as_mut_ptr() as usize),
+    )
+    .expect("Failed to create unix socketpair");
+    let unix_fd = i32::try_from(sv[0]).unwrap();
+    let unix_peer = i32::try_from(sv[1]).unwrap();
+
+    for fd in [read_fd, write_fd, udp_fd, eventfd, epoll, timerfd, unix_fd] {
+        assert_eq!(
+            task.sys_getdirent64(
+                fd,
+                MutPtr::from_usize(buffer.as_mut_ptr() as usize),
+                buffer.len()
+            )
+            .unwrap_err(),
+            Errno::ENOTDIR
+        );
+    }
+
+    task.sys_close(read_fd).unwrap();
+    task.sys_close(write_fd).unwrap();
+    task.sys_close(udp_fd).unwrap();
+    task.sys_close(eventfd).unwrap();
+    task.sys_close(epoll).unwrap();
+    task.sys_close(timerfd).unwrap();
+    task.sys_close(unix_fd).unwrap();
+    task.sys_close(unix_peer).unwrap();
+}
+
+#[test]
+fn test_nested_epoll_propagates_readiness_and_rejects_cycles() {
+    let task = init_platform(None);
+
+    let outer = task
+        .sys_epoll_create(EpollCreateFlags::empty())
+        .expect("Failed to create outer epoll");
+    let outer = i32::try_from(outer).unwrap();
+    let middle = task
+        .sys_epoll_create(EpollCreateFlags::empty())
+        .expect("Failed to create middle epoll");
+    let middle = i32::try_from(middle).unwrap();
+    let inner = task
+        .sys_epoll_create(EpollCreateFlags::empty())
+        .expect("Failed to create inner epoll");
+    let inner = i32::try_from(inner).unwrap();
+    let outer_dup = i32::try_from(task.sys_dup(outer, None, None).unwrap()).unwrap();
+
+    let nested_event = EpollEvent {
+        events: Events::IN.bits(),
+        data: 0x2222,
+    };
+    assert_eq!(
+        task.sys_epoll_ctl(
+            outer,
+            EpollOp::EpollCtlAdd,
+            outer,
+            ConstPtr::from_usize((&raw const nested_event) as usize),
+        )
+        .unwrap_err(),
+        Errno::EINVAL
+    );
+    assert_eq!(
+        task.sys_epoll_ctl(
+            outer,
+            EpollOp::EpollCtlAdd,
+            outer_dup,
+            ConstPtr::from_usize((&raw const nested_event) as usize),
+        )
+        .unwrap_err(),
+        Errno::EINVAL
+    );
+
+    let (read_fd, write_fd) = task.sys_pipe2(OFlags::empty()).unwrap();
+    let read_fd = i32::try_from(read_fd).unwrap();
+    let write_fd = i32::try_from(write_fd).unwrap();
+    let pipe_event = EpollEvent {
+        events: Events::IN.bits(),
+        data: 0x1111,
+    };
+    task.sys_epoll_ctl(
+        inner,
+        EpollOp::EpollCtlAdd,
+        read_fd,
+        ConstPtr::from_usize((&raw const pipe_event) as usize),
+    )
+    .expect("Failed to add pipe to inner epoll");
+    task.sys_epoll_ctl(
+        outer,
+        EpollOp::EpollCtlAdd,
+        middle,
+        ConstPtr::from_usize((&raw const nested_event) as usize),
+    )
+    .expect("Failed to add middle epoll to outer epoll");
+    let middle_event = EpollEvent {
+        events: Events::IN.bits(),
+        data: 0x3334,
+    };
+    task.sys_epoll_ctl(
+        middle,
+        EpollOp::EpollCtlAdd,
+        inner,
+        ConstPtr::from_usize((&raw const middle_event) as usize),
+    )
+    .expect("Failed to add inner epoll to middle epoll");
+    assert_eq!(
+        task.sys_epoll_ctl(
+            inner,
+            EpollOp::EpollCtlAdd,
+            outer,
+            ConstPtr::from_usize((&raw const nested_event) as usize),
+        )
+        .unwrap_err(),
+        Errno::ELOOP
+    );
+
+    assert_eq!(task.sys_write(write_fd, b"x", None).unwrap(), 1);
+    let mut events = [EpollEvent { events: 0, data: 0 }; 4];
+    let ready = task
+        .sys_epoll_pwait(
+            outer,
+            MutPtr::from_usize(events.as_mut_ptr() as usize),
+            events.len().try_into().unwrap(),
+            TimeParam::Milliseconds(1000),
+            None,
+            0,
+        )
+        .expect("nested epoll wait failed");
+    assert_eq!(ready, 1);
+    let data = events[0].data;
+    let event_bits = events[0].events;
+    let nested_data = nested_event.data;
+    assert_eq!(data, nested_data);
+    assert_ne!(event_bits & Events::IN.bits(), 0);
+
+    task.sys_close(read_fd).unwrap();
+    task.sys_close(write_fd).unwrap();
+    task.sys_close(outer_dup).unwrap();
+    task.sys_close(inner).unwrap();
+    task.sys_close(middle).unwrap();
+    task.sys_close(outer).unwrap();
+}
+
+#[test]
+fn test_nested_epoll_respects_host_poll_exclusive_and_depth_limit() {
+    let task = init_platform(None);
+
+    let outer = task
+        .sys_epoll_create(EpollCreateFlags::empty())
+        .expect("Failed to create outer epoll");
+    let outer = i32::try_from(outer).unwrap();
+    let middle = task
+        .sys_epoll_create(EpollCreateFlags::empty())
+        .expect("Failed to create middle epoll");
+    let middle = i32::try_from(middle).unwrap();
+    let inner = task
+        .sys_epoll_create(EpollCreateFlags::empty())
+        .expect("Failed to create inner epoll");
+    let inner = i32::try_from(inner).unwrap();
+    let nested_event = EpollEvent {
+        events: Events::IN.bits(),
+        data: 0x3333,
+    };
+    task.sys_epoll_ctl(
+        outer,
+        EpollOp::EpollCtlAdd,
+        middle,
+        ConstPtr::from_usize((&raw const nested_event) as usize),
+    )
+    .expect("Failed to add middle epoll to outer epoll");
+    let middle_event = EpollEvent {
+        events: Events::IN.bits(),
+        data: 0x3334,
+    };
+    task.sys_epoll_ctl(
+        middle,
+        EpollOp::EpollCtlAdd,
+        inner,
+        ConstPtr::from_usize((&raw const middle_event) as usize),
+    )
+    .expect("Failed to add inner epoll to middle epoll");
+
+    let timerfd = task
+        .sys_timerfd_create(ClockId::Monotonic, TimerfdFlags::empty())
+        .expect("Failed to create timerfd");
+    let timerfd = i32::try_from(timerfd).unwrap();
+    let timer_event = EpollEvent {
+        events: Events::IN.bits(),
+        data: 0x4444,
+    };
+    task.sys_epoll_ctl(
+        inner,
+        EpollOp::EpollCtlAdd,
+        timerfd,
+        ConstPtr::from_usize((&raw const timer_event) as usize),
+    )
+    .expect("Failed to add timerfd to inner epoll");
+    task.sys_timerfd_settime(
+        timerfd,
+        TimerfdTimerFlags::empty(),
+        ItimerSpec {
+            interval: Duration::ZERO.into(),
+            value: Duration::from_millis(1).into(),
+        },
+        None,
+    )
+    .expect("Failed to arm timerfd");
+
+    let mut events = [EpollEvent { events: 0, data: 0 }; 4];
+    let ready = task
+        .sys_epoll_pwait(
+            outer,
+            MutPtr::from_usize(events.as_mut_ptr() as usize),
+            events.len().try_into().unwrap(),
+            TimeParam::Milliseconds(1000),
+            None,
+            0,
+        )
+        .expect("nested epoll wait with timerfd failed");
+    assert_eq!(ready, 1);
+    let data = events[0].data;
+    let event_bits = events[0].events;
+    let nested_data = nested_event.data;
+    assert_eq!(data, nested_data);
+    assert_ne!(event_bits & Events::IN.bits(), 0);
+
+    let exclusive_outer = task
+        .sys_epoll_create(EpollCreateFlags::empty())
+        .expect("Failed to create exclusive outer epoll");
+    let exclusive_outer = i32::try_from(exclusive_outer).unwrap();
+    let exclusive_inner = task
+        .sys_epoll_create(EpollCreateFlags::empty())
+        .expect("Failed to create exclusive inner epoll");
+    let exclusive_inner = i32::try_from(exclusive_inner).unwrap();
+    let exclusive_event = EpollEvent {
+        events: Events::IN.bits() | (1 << 28),
+        data: 0,
+    };
+    assert_eq!(
+        task.sys_epoll_ctl(
+            exclusive_outer,
+            EpollOp::EpollCtlAdd,
+            exclusive_inner,
+            ConstPtr::from_usize((&raw const exclusive_event) as usize),
+        )
+        .unwrap_err(),
+        Errno::EINVAL
+    );
+
+    let chain: Vec<i32> = (0..6)
+        .map(|_| {
+            i32::try_from(
+                task.sys_epoll_create(EpollCreateFlags::empty())
+                    .expect("Failed to create chain epoll"),
+            )
+            .unwrap()
+        })
+        .collect();
+    let chain_event = EpollEvent {
+        events: Events::IN.bits(),
+        data: 0x5555,
+    };
+    for idx in 1..5 {
+        task.sys_epoll_ctl(
+            chain[idx - 1],
+            EpollOp::EpollCtlAdd,
+            chain[idx],
+            ConstPtr::from_usize((&raw const chain_event) as usize),
+        )
+        .expect("Expected nested epoll add within Linux depth limit to succeed");
+    }
+    assert_eq!(
+        task.sys_epoll_ctl(
+            chain[4],
+            EpollOp::EpollCtlAdd,
+            chain[5],
+            ConstPtr::from_usize((&raw const chain_event) as usize),
+        )
+        .unwrap_err(),
+        Errno::ELOOP
+    );
+
+    task.sys_close(timerfd).unwrap();
+    task.sys_close(inner).unwrap();
+    task.sys_close(middle).unwrap();
+    task.sys_close(outer).unwrap();
+    task.sys_close(exclusive_inner).unwrap();
+    task.sys_close(exclusive_outer).unwrap();
+    for fd in chain.into_iter().rev() {
+        task.sys_close(fd).unwrap();
+    }
+}
+
+#[test]
+fn test_nested_epoll_survives_closing_added_fd_alias() {
+    let task = init_platform(None);
+
+    let outer = i32::try_from(task.sys_epoll_create(EpollCreateFlags::empty()).unwrap()).unwrap();
+    let inner = i32::try_from(task.sys_epoll_create(EpollCreateFlags::empty()).unwrap()).unwrap();
+    let inner_dup = i32::try_from(task.sys_dup(inner, None, None).unwrap()).unwrap();
+    let (read_fd, write_fd) = task.sys_pipe2(OFlags::empty()).unwrap();
+    let read_fd = i32::try_from(read_fd).unwrap();
+    let write_fd = i32::try_from(write_fd).unwrap();
+
+    let pipe_event = EpollEvent {
+        events: Events::IN.bits(),
+        data: 0x6666,
+    };
+    task.sys_epoll_ctl(
+        inner_dup,
+        EpollOp::EpollCtlAdd,
+        read_fd,
+        ConstPtr::from_usize((&raw const pipe_event) as usize),
+    )
+    .expect("Failed to add pipe to inner epoll");
+
+    let nested_event = EpollEvent {
+        events: Events::IN.bits(),
+        data: 0x7777,
+    };
+    task.sys_epoll_ctl(
+        outer,
+        EpollOp::EpollCtlAdd,
+        inner,
+        ConstPtr::from_usize((&raw const nested_event) as usize),
+    )
+    .expect("Failed to add inner epoll to outer epoll");
+
+    task.sys_close(inner)
+        .expect("Closing the added epoll fd alias should succeed");
+    assert_eq!(task.sys_write(write_fd, b"x", None).unwrap(), 1);
+
+    let mut events = [EpollEvent { events: 0, data: 0 }; 4];
+    let ready = task
+        .sys_epoll_pwait(
+            outer,
+            MutPtr::from_usize(events.as_mut_ptr() as usize),
+            events.len().try_into().unwrap(),
+            TimeParam::Milliseconds(1000),
+            None,
+            0,
+        )
+        .expect("nested epoll wait after closing added alias failed");
+    assert_eq!(ready, 1);
+    let data = events[0].data;
+    let event_bits = events[0].events;
+    let nested_data = nested_event.data;
+    assert_eq!(data, nested_data);
+    assert_ne!(event_bits & Events::IN.bits(), 0);
+
+    task.sys_close(read_fd).unwrap();
+    task.sys_close(write_fd).unwrap();
+    task.sys_close(inner_dup).unwrap();
+    task.sys_close(outer).unwrap();
+}
+
+#[test]
+fn test_nested_epoll_stops_after_last_child_fd_closes() {
+    let task = init_platform(None);
+
+    let outer = i32::try_from(task.sys_epoll_create(EpollCreateFlags::empty()).unwrap()).unwrap();
+    let inner = i32::try_from(task.sys_epoll_create(EpollCreateFlags::empty()).unwrap()).unwrap();
+    let (read_fd, write_fd) = task.sys_pipe2(OFlags::empty()).unwrap();
+    let read_fd = i32::try_from(read_fd).unwrap();
+    let write_fd = i32::try_from(write_fd).unwrap();
+
+    let pipe_event = EpollEvent {
+        events: Events::IN.bits(),
+        data: 0x8888,
+    };
+    task.sys_epoll_ctl(
+        inner,
+        EpollOp::EpollCtlAdd,
+        read_fd,
+        ConstPtr::from_usize((&raw const pipe_event) as usize),
+    )
+    .expect("Failed to add pipe to inner epoll");
+
+    let nested_event = EpollEvent {
+        events: Events::IN.bits(),
+        data: 0x9999,
+    };
+    task.sys_epoll_ctl(
+        outer,
+        EpollOp::EpollCtlAdd,
+        inner,
+        ConstPtr::from_usize((&raw const nested_event) as usize),
+    )
+    .expect("Failed to add inner epoll to outer epoll");
+
+    task.sys_close(inner)
+        .expect("Closing the last child epoll fd should succeed");
+    assert_eq!(task.sys_write(write_fd, b"x", None).unwrap(), 1);
+
+    let mut events = [EpollEvent { events: 0, data: 0 }; 4];
+    let ready = task
+        .sys_epoll_pwait(
+            outer,
+            MutPtr::from_usize(events.as_mut_ptr() as usize),
+            events.len().try_into().unwrap(),
+            TimeParam::Milliseconds(100),
+            None,
+            0,
+        )
+        .expect("nested epoll wait after closing last child fd failed");
+    assert_eq!(ready, 0);
+
+    task.sys_close(read_fd).unwrap();
+    task.sys_close(write_fd).unwrap();
+    task.sys_close(outer).unwrap();
 }
 
 #[test]

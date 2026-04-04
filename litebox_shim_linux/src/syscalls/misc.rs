@@ -31,7 +31,9 @@ impl<FS: ShimFS> Task<FS> {
             <_ as litebox::platform::CrngProvider>::fill_bytes_crng(self.global.platform, kbuf);
             buf.copy_from_slice(offset, kbuf).ok_or(Errno::EFAULT)?;
             offset += len;
-            // TODO: check for interrupt here and break out.
+            if self.has_pending_signals() {
+                break;
+            }
         }
         Ok(offset)
     }
@@ -55,8 +57,8 @@ const fn to_fixed_size_array<const N: usize>(s: &str) -> [u8; N] {
     }
     arr
 }
-const SYS_INFO: litebox_common_linux::Utsname = litebox_common_linux::Utsname {
-    sysname: to_fixed_size_array::<65>("LiteBox"),
+const FALLBACK_SYS_INFO: litebox_common_linux::Utsname = litebox_common_linux::Utsname {
+    sysname: to_fixed_size_array::<65>("Linux"),
     nodename: to_fixed_size_array::<65>("litebox"),
     release: to_fixed_size_array::<65>("5.11.0"), // libc seems to expect this to be not too old
     version: to_fixed_size_array::<65>("5.11.0"),
@@ -67,31 +69,40 @@ const SYS_INFO: litebox_common_linux::Utsname = litebox_common_linux::Utsname {
     domainname: to_fixed_size_array::<65>(""),
 };
 
+fn current_utsname() -> litebox_common_linux::Utsname {
+    FALLBACK_SYS_INFO
+}
+
 impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `uname`.
     pub(crate) fn sys_uname(
         &self,
         buf: crate::MutPtr<litebox_common_linux::Utsname>,
     ) -> Result<(), Errno> {
-        buf.write_at_offset(0, SYS_INFO).ok_or(Errno::EFAULT)
+        buf.write_at_offset(0, current_utsname())
+            .ok_or(Errno::EFAULT)
     }
 
     /// Handle syscall `sysinfo`.
     pub(crate) fn sys_sysinfo(&self) -> litebox_common_linux::Sysinfo {
         let now = self.global.platform.now();
+        let uptime_secs = now.duration_since(&self.global.boot_time).as_secs();
+        // Approximate load averages. Use a small non-zero value to indicate
+        // the system is alive. SI_LOAD_SHIFT=16, so 655 ≈ 0.01 load.
+        let load_1min: usize = if uptime_secs > 0 { 655 } else { 0 };
         litebox_common_linux::Sysinfo {
-            uptime: now
-                .duration_since(&self.global.boot_time)
-                .as_secs()
-                .truncate(),
-            // TODO: Populate these fields with actual values
-            loads: [0; 3],
+            uptime: uptime_secs.truncate(),
+            loads: [
+                load_1min.truncate(),
+                load_1min.truncate(),
+                load_1min.truncate(),
+            ],
             #[cfg(target_arch = "x86_64")]
             totalram: 4 * 1024 * 1024 * 1024,
             #[cfg(target_arch = "x86")]
             totalram: 3 * 1024 * 1024 * 1024,
             freeram: 2 * 1024 * 1024 * 1024,
-            sharedram: 0, // We don't support shared memory
+            sharedram: 0,
             bufferram: 0,
             totalswap: 0,
             freeswap: 0,
@@ -168,6 +179,8 @@ impl<FS: ShimFS> Task<FS> {
 mod tests {
     use core::mem::MaybeUninit;
 
+    use litebox::utils::TruncateExt as _;
+
     use crate::syscalls::tests::init_platform;
 
     #[test]
@@ -198,11 +211,27 @@ mod tests {
         task.sys_uname(ptr).expect("uname failed");
         let utsname = unsafe { utsname.assume_init() };
 
-        assert_eq!(utsname.sysname, super::SYS_INFO.sysname);
-        assert_eq!(utsname.nodename, super::SYS_INFO.nodename);
-        assert_eq!(utsname.release, super::SYS_INFO.release);
-        assert_eq!(utsname.version, super::SYS_INFO.version);
-        assert_eq!(utsname.machine, super::SYS_INFO.machine);
-        assert_eq!(utsname.domainname, super::SYS_INFO.domainname);
+        let expected = super::current_utsname();
+        assert_eq!(utsname.sysname, expected.sysname);
+        assert_eq!(utsname.nodename, expected.nodename);
+        assert_eq!(utsname.release, expected.release);
+        assert_eq!(utsname.version, expected.version);
+        assert_eq!(utsname.machine, expected.machine);
+        assert_eq!(utsname.domainname, expected.domainname);
+    }
+
+    #[test]
+    fn test_sysinfo_is_shim_owned() {
+        let task = init_platform(None);
+
+        let info = task.sys_sysinfo();
+        assert_eq!(info.loads, [0; 3]);
+        assert_eq!(info.procs, task.process().nr_threads().truncate());
+        assert_eq!(info.mem_unit, 1);
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(info.totalram, 4 * 1024 * 1024 * 1024);
+        #[cfg(target_arch = "x86")]
+        assert_eq!(info.totalram, 3 * 1024 * 1024 * 1024);
+        assert_eq!(info.freeram, 2 * 1024 * 1024 * 1024);
     }
 }
