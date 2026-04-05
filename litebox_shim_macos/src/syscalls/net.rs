@@ -1488,14 +1488,65 @@ impl<FS: ShimFS> Task<FS> {
         Err(Errno::ENOTSOCK)
     }
 
-    /// Placeholder for AF_UNIX socketpair (implemented in unix.rs, Task 15).
+    /// Handle `socketpair(domain, type, protocol, sv)`.
     pub(crate) fn sys_socketpair(
         &self,
-        _domain: u32,
-        _sock_type: u32,
+        domain: u32,
+        sock_type: u32,
         _protocol: u32,
-        _sv: u64,
+        sv: u64,
     ) -> Result<(), Errno> {
-        Err(Errno::EAFNOSUPPORT)
+        if domain != AF_UNIX {
+            return Err(Errno::EAFNOSUPPORT);
+        }
+
+        let ty = SockType::try_from_raw(sock_type)?;
+
+        let sock_a = Arc::new(crate::syscalls::unix::UnixSocket::<FS>::new(ty));
+        let sock_b = Arc::new(crate::syscalls::unix::UnixSocket::<FS>::new(ty));
+
+        match ty {
+            SockType::Stream => {
+                let chan_a = Arc::new(crate::syscalls::unix::Channel::new(65536));
+                let chan_b = Arc::new(crate::syscalls::unix::Channel::new(65536));
+
+                // A reads from chan_a, writes to chan_b
+                // B reads from chan_b, writes to chan_a
+                sock_a.set_connected_stream(
+                    chan_a.clone(),
+                    chan_b.clone(),
+                    UnixSocketAddr::Unnamed,
+                );
+                sock_b.set_connected_stream(chan_b, chan_a, UnixSocketAddr::Unnamed);
+            }
+            SockType::Datagram => {
+                let dg_a = Arc::new(crate::syscalls::unix::DatagramChannel::new(64));
+                let dg_b = Arc::new(crate::syscalls::unix::DatagramChannel::new(64));
+
+                sock_a.set_connected_datagram(dg_a.clone(), dg_b.clone(), UnixSocketAddr::Unnamed);
+                sock_b.set_connected_datagram(dg_b, dg_a, UnixSocketAddr::Unnamed);
+            }
+        }
+
+        let fd_a = self
+            .global
+            .unix_fd_counter
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let fd_b = self
+            .global
+            .unix_fd_counter
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+        self.global.unix_sockets.write().insert(fd_a, sock_a);
+        self.global.unix_sockets.write().insert(fd_b, sock_b);
+
+        // Write fd pair to guest memory: sv[0] = fd_a, sv[1] = fd_b.
+        let sv_ptr: MutPtr<u8> = MutPtr::from_usize(sv as usize);
+        let mut sv_bytes = [0u8; 8];
+        sv_bytes[0..4].copy_from_slice(&(fd_a as u32).to_ne_bytes());
+        sv_bytes[4..8].copy_from_slice(&(fd_b as u32).to_ne_bytes());
+        sv_ptr.copy_from_slice(0, &sv_bytes).ok_or(Errno::EFAULT)?;
+
+        Ok(())
     }
 }
