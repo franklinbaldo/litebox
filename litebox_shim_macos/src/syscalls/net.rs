@@ -16,8 +16,7 @@ use litebox::net::socket_channel::{
     DatagramSocketChannel, NetworkProxy as NetworkProxyEnum, SocketState, StreamSocketChannel,
 };
 use litebox::net::{
-    CloseBehavior, Network, NetworkProxy, Protocol, ReceiveFlags, SendFlags, TcpOptionData,
-    TcpOptionName,
+    CloseBehavior, Network, Protocol, ReceiveFlags, SendFlags, TcpOptionData, TcpOptionName,
 };
 use litebox_common_macos::errno::Errno;
 
@@ -301,7 +300,7 @@ pub(crate) fn write_sockaddr_inet_to_user(
     }
 
     let len_mut: MutPtr<u32> = MutPtr::from_usize(len_ptr as usize);
-    let buf_len_bytes = len_mut.to_owned_slice(1).ok_or(Errno::EFAULT)?;
+    let _buf_len_bytes = len_mut.to_owned_slice(1).ok_or(Errno::EFAULT)?;
     // Read current buffer length (it's a u32 at *len_ptr)
     let buf_len_raw: ConstPtr<u32> = ConstPtr::from_usize(len_ptr as usize);
     let buf_len_val = buf_len_raw.to_owned_slice(1).ok_or(Errno::EFAULT)?;
@@ -551,7 +550,7 @@ impl<FS: ShimFS> Task<FS> {
             }
         };
 
-        self.global.net.lock().set_socket_proxy(fd, proxy);
+        let _ = self.global.net.lock().set_socket_proxy(fd, proxy);
     }
 
     /// Placeholder for AF_UNIX socket creation (implemented in unix.rs later).

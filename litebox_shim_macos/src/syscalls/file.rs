@@ -41,6 +41,7 @@ pub(crate) fn read_cstring_from_guest(ptr: ConstPtr<u8>, max_len: usize) -> Opti
 enum DuplicatedFd<FS: ShimFS> {
     FileSystem(litebox::fd::TypedFd<FS>),
     Pipes(litebox::fd::TypedFd<Pipes<Platform>>),
+    Network(litebox::fd::TypedFd<Network<Platform>>),
 }
 
 /// Translate macOS open(2) flags to litebox OFlags.
@@ -509,6 +510,13 @@ impl<FS: ShimFS> Task<FS> {
                 .duplicate(typed_fd)
                 .ok_or(Errno::EBADF)
                 .map(DuplicatedFd::Pipes),
+            crate::StrongFd::Network(typed_fd) => self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .duplicate(typed_fd)
+                .ok_or(Errno::EBADF)
+                .map(DuplicatedFd::Network),
         }?;
 
         // If newfd is already open, close it first (try all subsystems).
@@ -519,6 +527,14 @@ impl<FS: ShimFS> Task<FS> {
             } else if let Ok(existing_fd) = rds.fd_consume_raw_integer::<Pipes<Platform>>(raw_newfd)
             {
                 let _ = self.global.pipes.close(&existing_fd);
+            } else if let Ok(existing_fd) =
+                rds.fd_consume_raw_integer::<Network<Platform>>(raw_newfd)
+            {
+                let _ = self
+                    .global
+                    .net
+                    .lock()
+                    .close(&existing_fd, CloseBehavior::GracefulIfNoPendingData);
             }
         }
 
@@ -530,6 +546,9 @@ impl<FS: ShimFS> Task<FS> {
                     rds.fd_into_specific_raw_integer(typed_fd, raw_newfd)
                 }
                 DuplicatedFd::Pipes(typed_fd) => {
+                    rds.fd_into_specific_raw_integer(typed_fd, raw_newfd)
+                }
+                DuplicatedFd::Network(typed_fd) => {
                     rds.fd_into_specific_raw_integer(typed_fd, raw_newfd)
                 }
             };
