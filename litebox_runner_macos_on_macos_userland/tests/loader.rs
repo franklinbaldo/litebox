@@ -372,3 +372,38 @@ fn test_unix_stream() {
         "unix_stream test failed with exit code {exit_code}"
     );
 }
+
+#[test]
+#[allow(clippy::cast_precision_loss)]
+fn test_socketpair() {
+    let cache_dir = std::path::Path::new("/System/Cryptexes/OS/System/Library/dyld");
+    assert!(
+        cache_dir.exists(),
+        "Shared cache not found at {}. This test requires macOS with dyld shared cache.",
+        cache_dir.display()
+    );
+
+    let map_path = cache_dir.join("dyld_shared_cache_arm64e.map");
+    let map_text = std::fs::read_to_string(&map_path).unwrap();
+    let cache_map = common::shared_cache::CacheMap::parse(&map_text);
+    let system_dylibs = cache_map.system_dylib_paths();
+    let dylib_refs: Vec<&str> = system_dylibs
+        .iter()
+        .map(std::string::String::as_str)
+        .collect();
+    let cache_result = common::shared_cache::collect_regions(cache_dir, &cache_map, &dylib_refs);
+
+    let bin_path = common::compile_macho_dynamic("./tests/socketpair.c", "socketpair_test");
+    let binary_data = std::fs::read(&bin_path).expect("read binary");
+
+    let (exit_code, _stdout) = common::run_macho_dynamic(
+        &binary_data,
+        &["/usr/bin/socketpair_test"],
+        &cache_result,
+        "socketpair_test",
+    );
+    assert_eq!(
+        exit_code, 0,
+        "socketpair test failed with exit code {exit_code}"
+    );
+}
