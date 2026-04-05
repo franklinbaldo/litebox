@@ -544,3 +544,143 @@ fn test_select_socket() {
         "select_socket test failed with exit code {exit_code}"
     );
 }
+
+#[test]
+#[allow(clippy::cast_precision_loss)]
+fn test_getentropy() {
+    let cache_dir = std::path::Path::new("/System/Cryptexes/OS/System/Library/dyld");
+    assert!(
+        cache_dir.exists(),
+        "Shared cache not found at {}. This test requires macOS with dyld shared cache.",
+        cache_dir.display()
+    );
+
+    let map_path = cache_dir.join("dyld_shared_cache_arm64e.map");
+    let map_text = std::fs::read_to_string(&map_path).unwrap();
+    let cache_map = common::shared_cache::CacheMap::parse(&map_text);
+    let system_dylibs = cache_map.system_dylib_paths();
+    let dylib_refs: Vec<&str> = system_dylibs
+        .iter()
+        .map(std::string::String::as_str)
+        .collect();
+    let cache_result = common::shared_cache::collect_regions(cache_dir, &cache_map, &dylib_refs);
+
+    let bin_path = common::compile_macho_dynamic("./tests/getentropy.c", "getentropy_test");
+    let binary_data = std::fs::read(&bin_path).expect("read binary");
+
+    let (exit_code, _stdout) = common::run_macho_dynamic(
+        &binary_data,
+        &["/usr/bin/getentropy_test"],
+        &cache_result,
+        "getentropy_test",
+    );
+    assert_eq!(
+        exit_code, 0,
+        "getentropy test failed with exit code {exit_code}"
+    );
+}
+
+#[test]
+#[allow(clippy::cast_precision_loss)]
+fn test_gettimeofday() {
+    let cache_dir = std::path::Path::new("/System/Cryptexes/OS/System/Library/dyld");
+    assert!(
+        cache_dir.exists(),
+        "Shared cache not found at {}. This test requires macOS with dyld shared cache.",
+        cache_dir.display()
+    );
+
+    let map_path = cache_dir.join("dyld_shared_cache_arm64e.map");
+    let map_text = std::fs::read_to_string(&map_path).unwrap();
+    let cache_map = common::shared_cache::CacheMap::parse(&map_text);
+    let system_dylibs = cache_map.system_dylib_paths();
+    let dylib_refs: Vec<&str> = system_dylibs
+        .iter()
+        .map(std::string::String::as_str)
+        .collect();
+    let cache_result = common::shared_cache::collect_regions(cache_dir, &cache_map, &dylib_refs);
+
+    let bin_path = common::compile_macho_dynamic("./tests/gettimeofday.c", "gettimeofday_test");
+    let binary_data = std::fs::read(&bin_path).expect("read binary");
+
+    let (exit_code, _stdout) = common::run_macho_dynamic(
+        &binary_data,
+        &["/usr/bin/gettimeofday_test"],
+        &cache_result,
+        "gettimeofday_test",
+    );
+    assert_eq!(
+        exit_code, 0,
+        "gettimeofday test failed with exit code {exit_code}"
+    );
+}
+
+#[test]
+#[allow(clippy::cast_precision_loss)]
+fn test_readv_writev() {
+    let cache_dir = std::path::Path::new("/System/Cryptexes/OS/System/Library/dyld");
+    assert!(
+        cache_dir.exists(),
+        "Shared cache not found at {}. This test requires macOS with dyld shared cache.",
+        cache_dir.display()
+    );
+
+    let map_path = cache_dir.join("dyld_shared_cache_arm64e.map");
+    let map_text = std::fs::read_to_string(&map_path).unwrap();
+    let cache_map = common::shared_cache::CacheMap::parse(&map_text);
+    let system_dylibs = cache_map.system_dylib_paths();
+    let dylib_refs: Vec<&str> = system_dylibs
+        .iter()
+        .map(std::string::String::as_str)
+        .collect();
+    let cache_result = common::shared_cache::collect_regions(cache_dir, &cache_map, &dylib_refs);
+
+    let bin_path = common::compile_macho_dynamic("./tests/readv_writev.c", "readv_writev_test");
+    let binary_data = std::fs::read(&bin_path).expect("read binary");
+
+    let (exit_code, _stdout) = common::run_macho_dynamic(
+        &binary_data,
+        &["/usr/bin/readv_writev_test"],
+        &cache_result,
+        "readv_writev_test",
+    );
+    assert_eq!(
+        exit_code, 0,
+        "readv_writev test failed with exit code {exit_code}"
+    );
+}
+
+#[test]
+#[allow(clippy::cast_precision_loss)]
+fn test_getcwd() {
+    let cache_dir = std::path::Path::new("/System/Cryptexes/OS/System/Library/dyld");
+    assert!(
+        cache_dir.exists(),
+        "Shared cache not found at {}. This test requires macOS with dyld shared cache.",
+        cache_dir.display()
+    );
+
+    let map_path = cache_dir.join("dyld_shared_cache_arm64e.map");
+    let map_text = std::fs::read_to_string(&map_path).unwrap();
+    let cache_map = common::shared_cache::CacheMap::parse(&map_text);
+    let system_dylibs = cache_map.system_dylib_paths();
+    let dylib_refs: Vec<&str> = system_dylibs
+        .iter()
+        .map(std::string::String::as_str)
+        .collect();
+    let cache_result = common::shared_cache::collect_regions(cache_dir, &cache_map, &dylib_refs);
+
+    let bin_path = common::compile_macho_dynamic("./tests/getcwd.c", "getcwd_test");
+    let binary_data = std::fs::read(&bin_path).expect("read binary");
+
+    let (exit_code, _stdout) = common::run_macho_dynamic(
+        &binary_data,
+        &["/usr/bin/getcwd_test"],
+        &cache_result,
+        "getcwd_test",
+    );
+    assert_eq!(
+        exit_code, 0,
+        "getcwd test failed with exit code {exit_code}"
+    );
+}
