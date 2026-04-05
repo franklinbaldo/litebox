@@ -6,9 +6,13 @@
 
 use litebox_ipc::ring::{CqEntry, cq_flags};
 
+use crate::perf;
 use crate::state::MicroState;
 use crate::tls::MicroTls;
 use crate::trampoline::SyscallArgs;
+
+/// Global exec counter for profiling (atomic, no_std safe).
+static EXEC_SERIAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 // ── Data structures ──────────────────────────────────────────────────────
 
@@ -54,6 +58,14 @@ pub struct ExecveHeader {
     pub mmap_bump_start: u64,
     /// End (exclusive) of the bump-allocator range.
     pub mmap_bump_end: u64,
+    /// Base address of the main binary's virtual address range.
+    pub main_range_base: u64,
+    /// Total length of the main binary's virtual address range.
+    pub main_range_len: u64,
+    /// Base address of the interpreter's virtual address range (0 if no interp).
+    pub interp_range_base: u64,
+    /// Total length of the interpreter's virtual address range (0 if no interp).
+    pub interp_range_len: u64,
 }
 
 /// Describes a loaded ELF segment that micro must map.
@@ -72,6 +84,9 @@ pub struct ExecveSegment {
     /// after the file-backed data. The trampoline data has format:
     /// [u32 LE: vaddr_offset from base_addr] [u32 LE: trampoline_code_size] [trampoline_code bytes]
     pub has_trampoline: u32,
+    /// Offset into the tar shmem region where this segment's file data starts.
+    /// `u64::MAX` means data is in the ring data region at `data_offset` (non-tar binary).
+    pub tar_data_offset: u64,
     /// Offset in data region where this segment's file data starts (relative to header start).
     pub data_offset: u64,
 }
@@ -364,6 +379,7 @@ fn build_exec_stack(
     clippy::cast_possible_wrap
 )]
 pub unsafe fn handle_execve(tls: *mut MicroTls, args: &SyscallArgs) -> i64 {
+    let t0 = perf::now_ns();
     let micro = unsafe { &*(*tls).micro };
 
     // Extract execve arguments.
@@ -388,6 +404,8 @@ pub unsafe fn handle_execve(tls: *mut MicroTls, args: &SyscallArgs) -> i64 {
         return -i64::from(libc::E2BIG);
     };
 
+    let t_serialized = perf::now_ns();
+
     // Submit SYS_execve to central with the serialized data.
     // We build a custom SQ entry with data_offset=0, data_len=serialized length.
     // The submit_and_wait function handles the normal pathname copy, but for execve
@@ -396,6 +414,8 @@ pub unsafe fn handle_execve(tls: *mut MicroTls, args: &SyscallArgs) -> i64 {
     // Override the args so central knows where the data is.
     // We'll use a special submission that sets data fields.
     let cq = unsafe { submit_execve_sq(tls, args.nr as u32, &sq_args, data_len as u32) };
+
+    let t_roundtrip = perf::now_ns();
 
     if cq.result < 0 {
         return cq.result;
@@ -406,8 +426,17 @@ pub unsafe fn handle_execve(tls: *mut MicroTls, args: &SyscallArgs) -> i64 {
         return -i64::from(libc::ENOEXEC);
     }
 
+    // Record timing info and pass to execute_execve.
+    let serial = EXEC_SERIAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let timing = ExecveTiming {
+        serial,
+        t0,
+        t_serialized,
+        t_roundtrip,
+    };
+
     // Point of no return — execute the new binary.
-    unsafe { execute_execve(tls, &cq, micro) }
+    unsafe { execute_execve(tls, &cq, micro, &timing) }
 }
 
 /// Submit an execve SQ entry with pre-populated data region.
@@ -512,7 +541,97 @@ unsafe fn submit_execve_sq(
     }
 }
 
+// ── Helpers ─────────────────────────────────────────────────────────────
+
+/// Maximum number of segment extents tracked per binary range for gap
+/// protection.  Must be large enough for the segment count of any single
+/// binary (main or interpreter) plus its trampoline.
+const MAX_SEGS_PER_RANGE: usize = 16;
+
+/// Protect gaps between mapped segments within a bulk-mapped range.
+///
+/// `extents` contains `count` initialized `(start, end)` pairs (not
+/// necessarily sorted).  Any region within `[range_base, range_base +
+/// range_len)` that is NOT covered by any extent is mprotect'd to
+/// `PROT_NONE`.
+///
+/// This function uses an insertion sort on the stack-allocated extent
+/// array (at most `MAX_SEGS_PER_RANGE` entries) to avoid heap allocation.
+fn protect_range_gaps(
+    range_base: usize,
+    range_len: usize,
+    extents: &[core::mem::MaybeUninit<(usize, usize)>; MAX_SEGS_PER_RANGE],
+    count: usize,
+) {
+    if range_len == 0 || count == 0 {
+        return;
+    }
+
+    // Copy into a sortable stack array.
+    let mut sorted: [(usize, usize); MAX_SEGS_PER_RANGE] = [(0, 0); MAX_SEGS_PER_RANGE];
+    for i in 0..count {
+        sorted[i] = unsafe { extents[i].assume_init() };
+    }
+
+    // Insertion sort by start address (count is small, typically 5-8).
+    for i in 1..count {
+        let key = sorted[i];
+        let mut j = i;
+        while j > 0 && sorted[j - 1].0 > key.0 {
+            sorted[j] = sorted[j - 1];
+            j -= 1;
+        }
+        sorted[j] = key;
+    }
+
+    // Merge overlapping/adjacent extents and protect gaps.
+    let range_end = range_base + range_len;
+    let mut cursor = range_base;
+
+    let mut i = 0;
+    while i < count {
+        let (mut ext_start, mut ext_end) = sorted[i];
+
+        // Merge with subsequent overlapping/adjacent extents.
+        while i + 1 < count && sorted[i + 1].0 <= ext_end {
+            i += 1;
+            ext_end = ext_end.max(sorted[i].1);
+        }
+
+        // Clamp to range boundaries.
+        ext_start = ext_start.max(range_base);
+        ext_end = ext_end.min(range_end);
+
+        // Gap before this extent?
+        if ext_start > cursor {
+            unsafe {
+                crate::raw_syscall::mprotect(cursor, ext_start - cursor, libc::PROT_NONE);
+            }
+        }
+        cursor = ext_end;
+        i += 1;
+    }
+
+    // Trailing gap after last extent?
+    if cursor < range_end {
+        unsafe {
+            crate::raw_syscall::mprotect(cursor, range_end - cursor, libc::PROT_NONE);
+        }
+    }
+}
+
 // ── Execute execve ──────────────────────────────────────────────────────
+
+/// Timing data collected in `handle_execve` and passed to `execute_execve`.
+struct ExecveTiming {
+    serial: u64,
+    /// Timestamp at the start of `handle_execve`.
+    t0: u64,
+    /// Timestamp after serializing args.
+    t_serialized: u64,
+    /// Timestamp after the ring round-trip to central.
+    t_roundtrip: u64,
+}
 
 /// Execute an execve prepared by central. Does NOT return.
 ///
@@ -525,7 +644,7 @@ unsafe fn submit_execve_sq(
     clippy::cast_ptr_alignment,
     clippy::too_many_lines
 )]
-unsafe fn execute_execve(tls: *mut MicroTls, cq: &CqEntry, micro: &MicroState) -> ! {
+unsafe fn execute_execve(tls: *mut MicroTls, cq: &CqEntry, micro: &MicroState, timing: &ExecveTiming) -> ! {
     let data_region_ptr = unsafe { micro.ring_base.add(micro.layout.data_region_offset) };
     let data_base = unsafe { data_region_ptr.add(cq.data_offset as usize) };
 
@@ -573,6 +692,8 @@ unsafe fn execute_execve(tls: *mut MicroTls, cq: &CqEntry, micro: &MicroState) -
     let argv_refs: &[&[u8]] = &argv_strings[..argc];
     let envp_refs: &[&[u8]] = &envp_strings[..envc];
 
+    let t_parse = perf::now_ns();
+
     // Allocate a new stack (must happen before segment mapping too).
     let stack_ret = unsafe {
         crate::raw_syscall::mmap(
@@ -591,6 +712,8 @@ unsafe fn execute_execve(tls: *mut MicroTls, cq: &CqEntry, micro: &MicroState) -
     }
 
     let stack_pointer = build_exec_stack(stack_base, STACK_SIZE, argv_refs, envp_refs, header);
+
+    let t_stack = perf::now_ns();
 
     let entry_point = header.entry_point as usize;
 
@@ -619,8 +742,83 @@ unsafe fn execute_execve(tls: *mut MicroTls, cq: &CqEntry, micro: &MicroState) -
 
     // ── Map segments (point of no return) ──────────────────────────────
     //
-    // After this loop, no heap allocations or glibc calls are safe.
-    // Only raw syscalls via libc::syscall() are allowed.
+    // After this point, no heap allocations or glibc calls are safe.
+    // Only raw syscalls via inline asm are allowed.
+    //
+    // Coalesced mapping: instead of one mmap per segment (~11 kernel
+    // calls), we do two bulk mmaps — one for the main binary's entire
+    // virtual address range and one for the interpreter's.  Then we
+    // memcpy each segment's data and mprotect to final permissions.
+    // Gaps between segments within each range are protected PROT_NONE.
+
+    let t_pre_map = perf::now_ns();
+
+    // ── Phase 1: Bulk mmap — one per binary ───────────────────────────
+
+    let main_base = header.main_range_base as usize;
+    let main_len = header.main_range_len as usize;
+    let interp_base = header.interp_range_base as usize;
+    let interp_len = header.interp_range_len as usize;
+
+    if main_len > 0 {
+        let ret = unsafe {
+            crate::raw_syscall::mmap(
+                main_base,
+                main_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if crate::raw_syscall::is_error(ret) {
+            unsafe { crate::raw_syscall::syscall1(libc::SYS_exit_group, 127) };
+            unreachable!();
+        }
+    }
+
+    if interp_len > 0 {
+        let ret = unsafe {
+            crate::raw_syscall::mmap(
+                interp_base,
+                interp_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if crate::raw_syscall::is_error(ret) {
+            unsafe { crate::raw_syscall::syscall1(libc::SYS_exit_group, 127) };
+            unreachable!();
+        }
+    }
+
+    // ── Phase 2: Copy data + set permissions per segment ──────────────
+    //
+    // The bulk mmap already created RW anonymous pages across each
+    // binary's entire span.  We only need to memcpy file data into each
+    // segment and then mprotect segments whose final permissions differ
+    // from RW.
+
+    // Track segment extents for gap computation (max 16 segments per range).
+    // Each entry is (vaddr, end_vaddr).
+    let mut main_extents: [core::mem::MaybeUninit<(usize, usize)>; MAX_SEGS_PER_RANGE] =
+        unsafe { core::mem::MaybeUninit::uninit().assume_init() };
+    let mut interp_extents: [core::mem::MaybeUninit<(usize, usize)>; MAX_SEGS_PER_RANGE] =
+        unsafe { core::mem::MaybeUninit::uninit().assume_init() };
+    let mut main_ext_count: usize = 0;
+    let mut interp_ext_count: usize = 0;
+
+    // Track trampolines for deferred RX mprotect (max 2: one per binary).
+    let mut tramp_mprotects: [(usize, usize); 2] = [(0, 0); 2];
+    let mut tramp_mprotect_count: usize = 0;
+
+    // ── Pass 1: Copy all data while everything is still RW ────────────
+    //
+    // The bulk mmap created the entire range as RW.  We copy file data
+    // and handle trampolines (which need to write-then-patch) before
+    // any mprotect changes permissions.
 
     for i in 0..num_segments {
         let seg = unsafe {
@@ -632,45 +830,38 @@ unsafe fn execute_execve(tls: *mut MicroTls, cq: &CqEntry, micro: &MicroState) -
         let vaddr = seg.vaddr as usize;
         let map_len = seg.map_len as usize;
         let data_len = seg.data_len as usize;
-        let final_prot = seg.prot as i32;
 
         if map_len == 0 {
             continue;
         }
 
-        // 1. Create anonymous writable mapping at the target address.
-        let ptr_ret = unsafe {
-            crate::raw_syscall::mmap(
-                vaddr,
-                map_len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        if crate::raw_syscall::is_error(ptr_ret) {
-            // Cannot recover — abort.
-            unsafe { crate::raw_syscall::syscall1(libc::SYS_exit_group, 127) };
-            unreachable!();
-        }
-
-        // 2. Copy file data from data region.
+        // Copy file data from data region (no kernel call — already mapped RW).
         if data_len > 0 {
-            let src = unsafe { data_base.add(seg.data_offset as usize) };
+            let src = if seg.tar_data_offset == u64::MAX {
+                // Ring data region path
+                unsafe { data_base.add(seg.data_offset as usize) }
+            } else {
+                // Tar shmem path
+                let tar_off = seg.tar_data_offset as usize;
+                if tar_off + data_len > micro.tar_size {
+                    unsafe { crate::raw_syscall::syscall1(libc::SYS_exit_group, 127) };
+                }
+                unsafe { micro.tar_base.add(tar_off) }
+            };
             unsafe {
-                core::ptr::copy_nonoverlapping(src, ptr_ret as *mut u8, data_len);
+                core::ptr::copy_nonoverlapping(src, vaddr as *mut u8, data_len);
             }
         }
 
-        // 3. Set final permissions.
-        if final_prot != (libc::PROT_READ | libc::PROT_WRITE) {
-            unsafe { crate::raw_syscall::mprotect(ptr_ret as usize, map_len, final_prot) };
-        }
-
-        // 4. Handle trampoline data if present.
+        // Handle trampoline data: copy + patch while still writable.
         if seg.has_trampoline != 0 {
-            let tramp_desc_ptr = unsafe { data_base.add(seg.data_offset as usize + data_len) };
+            let tramp_desc_ptr = if seg.tar_data_offset == u64::MAX {
+                // Non-tar: trampoline desc follows file data in ring
+                unsafe { data_base.add(seg.data_offset as usize + data_len) }
+            } else {
+                // Tar-backed: trampoline desc is at data_offset directly (no file data in ring)
+                unsafe { data_base.add(seg.data_offset as usize) }
+            };
             let tramp_vaddr_offset = unsafe {
                 u32::from_le_bytes(
                     core::slice::from_raw_parts(tramp_desc_ptr, 4)
@@ -691,43 +882,121 @@ unsafe fn execute_execve(tls: *mut MicroTls, cq: &CqEntry, micro: &MicroState) -
                 let tramp_addr = tramp_vaddr_offset;
                 let tramp_page_size = (tramp_size + 0xFFF) & !0xFFF;
 
-                let tramp_ret = unsafe {
-                    crate::raw_syscall::mmap(
-                        tramp_addr,
-                        tramp_page_size,
-                        libc::PROT_READ | libc::PROT_WRITE,
-                        libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                        -1,
-                        0,
-                    )
-                };
-                if !crate::raw_syscall::is_error(tramp_ret) {
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            tramp_data_src,
-                            tramp_ret as *mut u8,
-                            tramp_size,
-                        );
-                    }
+                // Copy trampoline code (region is still RW from bulk mmap).
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        tramp_data_src,
+                        tramp_addr as *mut u8,
+                        tramp_size,
+                    );
+                }
 
-                    // Patch the syscall entry point at offset 0 with micro's
-                    // own trampoline entry (central sends 0 as a placeholder).
-                    let entry_addr = crate::trampoline::get_syscall_entry_point() as u64;
-                    unsafe {
-                        *(tramp_ret as *mut u64) = entry_addr;
-                    }
+                // Patch the syscall entry point at offset 0 with micro's
+                // own trampoline entry (central sends 0 as a placeholder).
+                let entry_addr = crate::trampoline::get_syscall_entry_point() as u64;
+                unsafe {
+                    *(tramp_addr as *mut u64) = entry_addr;
+                }
 
-                    unsafe {
-                        crate::raw_syscall::mprotect(
-                            tramp_ret as usize,
-                            tramp_page_size,
-                            libc::PROT_READ | libc::PROT_EXEC,
-                        );
-                    }
+                // Defer mprotect(RX) to pass 2.
+                if tramp_mprotect_count < 2 {
+                    tramp_mprotects[tramp_mprotect_count] = (tramp_addr, tramp_page_size);
+                    tramp_mprotect_count += 1;
+                }
+
+                // Record trampoline extent for gap computation.
+                let tramp_end = tramp_addr + tramp_page_size;
+                if main_len > 0
+                    && tramp_addr >= main_base
+                    && tramp_end <= main_base + main_len
+                    && main_ext_count < MAX_SEGS_PER_RANGE
+                {
+                    main_extents[main_ext_count].write((tramp_addr, tramp_end));
+                    main_ext_count += 1;
+                } else if interp_len > 0
+                    && tramp_addr >= interp_base
+                    && tramp_end <= interp_base + interp_len
+                    && interp_ext_count < MAX_SEGS_PER_RANGE
+                {
+                    interp_extents[interp_ext_count].write((tramp_addr, tramp_end));
+                    interp_ext_count += 1;
                 }
             }
         }
+
+        // Record this segment's extent for gap computation.
+        let seg_end = vaddr + map_len;
+        if main_len > 0
+            && vaddr >= main_base
+            && seg_end <= main_base + main_len
+            && main_ext_count < MAX_SEGS_PER_RANGE
+        {
+            main_extents[main_ext_count].write((vaddr, seg_end));
+            main_ext_count += 1;
+        } else if interp_len > 0
+            && vaddr >= interp_base
+            && seg_end <= interp_base + interp_len
+            && interp_ext_count < MAX_SEGS_PER_RANGE
+        {
+            interp_extents[interp_ext_count].write((vaddr, seg_end));
+            interp_ext_count += 1;
+        }
     }
+
+    // ── Pass 2: Set final permissions ─────────────────────────────────
+    //
+    // Now that all data is copied and trampolines are patched, apply
+    // final protections.  This avoids needing to toggle trampoline pages
+    // back to RW (saves 2 kernel calls).
+
+    for i in 0..num_segments {
+        let seg = unsafe {
+            &*(segments_ptr
+                .add(i * core::mem::size_of::<ExecveSegment>())
+                .cast::<ExecveSegment>())
+        };
+
+        let vaddr = seg.vaddr as usize;
+        let map_len = seg.map_len as usize;
+        let final_prot = seg.prot as i32;
+
+        if map_len == 0 {
+            continue;
+        }
+
+        if final_prot != (libc::PROT_READ | libc::PROT_WRITE) {
+            unsafe { crate::raw_syscall::mprotect(vaddr, map_len, final_prot) };
+        }
+    }
+
+    // Apply RX protection to trampolines.
+    for &(addr, size) in tramp_mprotects.iter().take(tramp_mprotect_count) {
+        unsafe {
+            crate::raw_syscall::mprotect(addr, size, libc::PROT_READ | libc::PROT_EXEC);
+        }
+    }
+
+    // ── Phase 3: Protect gaps between segments with PROT_NONE ─────────
+    //
+    // Walk each range's extents in address order.  Any gap between
+    // consecutive extents (or between range boundary and first/last
+    // extent) is mprotect'd to PROT_NONE so stray accesses fault.
+
+    protect_range_gaps(main_base, main_len, &main_extents, main_ext_count);
+    protect_range_gaps(interp_base, interp_len, &interp_extents, interp_ext_count);
+
+    // ── Write profiling data (BEFORE the asm jump) ─────────────────────
+    let t_mapped = perf::now_ns();
+    perf::write_perf_line(timing.serial, &[
+        ("serialize_ns", timing.t_serialized.wrapping_sub(timing.t0)),
+        ("roundtrip_ns", timing.t_roundtrip.wrapping_sub(timing.t_serialized)),
+        ("parse_ns", t_parse.wrapping_sub(timing.t_roundtrip)),
+        ("stack_ns", t_stack.wrapping_sub(t_parse)),
+        ("setup_ns", t_pre_map.wrapping_sub(t_stack)),
+        ("map_segments_ns", t_mapped.wrapping_sub(t_pre_map)),
+        ("num_segments", num_segments as u64),
+        ("total_ns", t_mapped.wrapping_sub(timing.t0)),
+    ]);
 
     // Jump to the new entry point. This never returns.
     //
@@ -812,16 +1081,16 @@ mod tests {
         // Verify the struct is a reasonable size (no unexpected padding).
         let size = core::mem::size_of::<ExecveHeader>();
         assert!(size > 0);
-        // ExecveHeader has: 2*u32 + 4*u64 + 2*u32 + u64 + 2*u32 + 4*u32 + u64 + 2*u64
-        // = 8 + 32 + 8 + 8 + 8 + 16 + 8 + 16 = 104 bytes
-        assert_eq!(size, 104);
+        // ExecveHeader has: 2*u32 + 4*u64 + 2*u32 + u64 + 2*u32 + 4*u32 + u64 + 2*u64 + 4*u64
+        // = 8 + 32 + 8 + 8 + 8 + 16 + 8 + 16 + 32 = 136 bytes
+        assert_eq!(size, 136);
     }
 
     #[test]
     fn execve_segment_size() {
         let size = core::mem::size_of::<ExecveSegment>();
-        // ExecveSegment: 3*u64 + 2*u32 + u64 = 24 + 8 + 8 = 40 bytes
-        assert_eq!(size, 40);
+        // ExecveSegment: 3*u64 + 2*u32 + 2*u64 = 24 + 8 + 16 = 48 bytes
+        assert_eq!(size, 48);
     }
 
     #[test]
@@ -893,6 +1162,10 @@ mod tests {
             syscall_entry_point: 0,
             mmap_bump_start: 0,
             mmap_bump_end: 0,
+            main_range_base: 0,
+            main_range_len: 0,
+            interp_range_base: 0,
+            interp_range_len: 0,
         };
 
         let sp = build_exec_stack(base, stack_size, &argv, &envp, &header);

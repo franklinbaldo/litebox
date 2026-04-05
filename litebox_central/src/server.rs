@@ -2647,12 +2647,23 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 } else {
                     0
                 },
+                tar_data_offset: compute_tar_offset(
+                    &file_data,
+                    seg.file_offset,
+                    self.tar_shmem_base.0,
+                    self.tar_shmem_size,
+                ),
             });
         }
 
         // Interp segments.
         if let Some((ref _iinfo, ref imapper, _)) = interp_info {
             for seg in &imapper.segments {
+                let interp_source = if let Some((ref idata, _)) = interp_data {
+                    idata.as_slice()
+                } else {
+                    &[]
+                };
                 segments.push(SegmentInfo {
                     vaddr: seg.address as u64,
                     map_len: seg.len as u64,
@@ -2666,6 +2677,12 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     } else {
                         0
                     },
+                    tar_data_offset: compute_tar_offset(
+                        interp_source,
+                        seg.file_offset,
+                        self.tar_shmem_base.0,
+                        self.tar_shmem_size,
+                    ),
                 });
             }
         }
@@ -2705,7 +2722,10 @@ impl<FS: ShimFS> ProcessServer<FS> {
 
         for seg in &segments {
             let seg_data_offset = data_cursor;
-            data_cursor += seg.data_len as usize;
+            if seg.tar_data_offset == u64::MAX {
+                // Non-tar: file data goes into ring
+                data_cursor += seg.data_len as usize;
+            }
 
             let tramp_desc_len = if seg.has_trampoline {
                 // We need to compute the trampoline descriptor size.
@@ -2814,6 +2834,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 data_len: seg.data_len,
                 prot: seg.prot,
                 has_trampoline: u32::from(seg.has_trampoline && layout.tramp_desc_len > 0),
+                tar_data_offset: seg.tar_data_offset,
                 data_offset: layout.data_offset as u64,
             };
             let seg_bytes: &[u8] = unsafe {
@@ -2850,24 +2871,31 @@ impl<FS: ShimFS> ProcessServer<FS> {
             // Copy file-backed data for this segment.
             let file_offset = seg.file_data_offset as usize;
             let copy_len = seg.data_len as usize;
-            if copy_len > 0 && file_offset + copy_len <= source_data.len() {
-                data_region[layout.data_offset..layout.data_offset + copy_len]
-                    .copy_from_slice(&source_data[file_offset..file_offset + copy_len]);
-            } else if copy_len > 0 {
-                // File data shorter than expected — zero-fill.
-                let available = source_data.len().saturating_sub(file_offset);
-                if available > 0 {
-                    data_region[layout.data_offset..layout.data_offset + available]
-                        .copy_from_slice(&source_data[file_offset..file_offset + available]);
+            if seg.tar_data_offset == u64::MAX {
+                // Non-tar: copy file data into ring
+                if copy_len > 0 && file_offset + copy_len <= source_data.len() {
+                    data_region[layout.data_offset..layout.data_offset + copy_len]
+                        .copy_from_slice(&source_data[file_offset..file_offset + copy_len]);
+                } else if copy_len > 0 {
+                    // File data shorter than expected — zero-fill.
+                    let available = source_data.len().saturating_sub(file_offset);
+                    if available > 0 {
+                        data_region[layout.data_offset..layout.data_offset + available]
+                            .copy_from_slice(&source_data[file_offset..file_offset + available]);
+                    }
+                    // Rest is already zeroed (or will be by mmap on micro side).
                 }
-                // Rest is already zeroed (or will be by mmap on micro side).
             }
 
             // Copy trampoline data if present.
             if seg.has_trampoline && layout.tramp_desc_len > 0 {
                 let tramp_info = read_trampoline_header(source_data);
                 if let Some((tramp_file_offset, tramp_size)) = tramp_info {
-                    let desc_start = layout.data_offset + copy_len;
+                    let desc_start = if seg.tar_data_offset == u64::MAX {
+                        layout.data_offset + copy_len
+                    } else {
+                        layout.data_offset
+                    };
                     // Read vaddr from trampoline header.
                     let tramp_hdr_offset = source_data.len() - 32;
                     let tramp_vaddr = u64::from_le_bytes(
@@ -2912,6 +2940,11 @@ impl<FS: ShimFS> ProcessServer<FS> {
             // Find which segment contains this BSS address and zero it
             // in the packed data region.
             for (i, seg) in segments.iter().enumerate() {
+                // Skip tar-backed segments — their file data is not in the ring
+                // data region; BSS will be zero from the anonymous mmap on micro side.
+                if seg.tar_data_offset != u64::MAX {
+                    continue;
+                }
                 let seg_start = seg.vaddr as usize;
                 let seg_end = seg_start + seg.data_len as usize;
                 if *bss_addr >= seg_start && *bss_addr < seg_end {
@@ -3292,6 +3325,7 @@ struct ExecveSegmentCentral {
     data_len: u64,
     prot: u32,
     has_trampoline: u32,
+    tar_data_offset: u64,
     data_offset: u64,
 }
 
@@ -3318,6 +3352,7 @@ struct SegmentInfo {
     file_data_source: FileSource,
     has_trampoline: bool,
     trampoline_base: usize,
+    tar_data_offset: u64,
 }
 
 /// A `ReadAt` implementation that reads from an in-memory byte slice.
@@ -3613,6 +3648,30 @@ fn deserialize_string_vector(data: &[u8], mut pos: usize) -> Option<(Vec<&[u8]>,
         pos += len;
     }
     Some((result, pos))
+}
+
+/// Compute the offset of segment file data within the tar shmem region.
+///
+/// Returns `u64::MAX` if the data is not in the tar shmem region (i.e. the
+/// binary was not loaded from the tar archive and its data must be copied
+/// into the ring data region).
+fn compute_tar_offset(
+    source_data: &[u8],
+    file_data_offset: u64,
+    tar_shmem_base: *const u8,
+    tar_shmem_size: usize,
+) -> u64 {
+    if tar_shmem_size == 0 || source_data.is_empty() {
+        return u64::MAX;
+    }
+    let src_ptr = source_data.as_ptr() as usize;
+    let base = tar_shmem_base as usize;
+    if src_ptr >= base && src_ptr < base + tar_shmem_size {
+        let file_start_in_tar = src_ptr - base;
+        (file_start_in_tar as u64) + file_data_offset
+    } else {
+        u64::MAX
+    }
 }
 
 /// Read the trampoline header from the end of an ELF file's data.
