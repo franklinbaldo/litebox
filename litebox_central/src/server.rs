@@ -125,6 +125,10 @@ pub struct ProcessServer<FS: ShimFS> {
     tar_shmem_base: SendPtr,
     /// Size in bytes of the tar shmem region.
     tar_shmem_size: usize,
+    /// Map of tar file paths (without leading `/`) to their data byte ranges
+    /// within the tar shmem region.  Used to populate `OpenResponse::tar_offset`
+    /// / `tar_len` for read-only opens of tar-backed files.
+    tar_file_map: Arc<HashMap<String, std::ops::Range<usize>>>,
 }
 
 impl<FS: ShimFS> ProcessServer<FS> {
@@ -142,6 +146,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
         tun_enabled: bool,
         tar_shmem_base: *const u8,
         tar_shmem_size: usize,
+        tar_file_map: Arc<HashMap<String, std::ops::Range<usize>>>,
     ) -> Self {
         // If this process has no TUN queue but TUN is enabled, it's the master.
         // Queue 0 (created by CentralPlatform::new) should be given to the
@@ -171,6 +176,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
             initial_child_queue,
             tar_shmem_base: SendPtr(tar_shmem_base),
             tar_shmem_size,
+            tar_file_map,
         }
     }
 
@@ -597,6 +603,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
                             let response = litebox_ipc::messages::OpenResponse {
                                 fd: new_fd,
                                 file_slot_offset: slot_offset,
+                                tar_offset: 0,
+                                tar_len: 0,
                             };
                             let data_region = self.region.data_region_mut();
                             let resp_bytes: &[u8] = unsafe {
@@ -855,10 +863,38 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 });
                 drop(ns);
 
+                // For read-only opens, check if the file is in the tar shmem
+                // region and populate tar_offset/tar_len so micro can serve
+                // reads locally without a central round-trip.
+                let is_rdonly = flags_arg & (libc::O_WRONLY | libc::O_RDWR) == 0;
+                let (tar_off, tar_ln) = if is_rdonly && !pathname_buf.is_empty() {
+                    // pathname_buf is a null-terminated C string from micro.
+                    let path_bytes = if let Some(nul) = pathname_buf.iter().position(|&b| b == 0) {
+                        &pathname_buf[..nul]
+                    } else {
+                        &pathname_buf[..]
+                    };
+                    if let Ok(path_str) = core::str::from_utf8(path_bytes) {
+                        // Tar paths are stored without leading '/'.
+                        let normalized = path_str.strip_prefix('/').unwrap_or(path_str);
+                        if let Some(range) = self.tar_file_map.get(normalized) {
+                            (range.start as u64, (range.end - range.start) as u64)
+                        } else {
+                            (0, 0)
+                        }
+                    } else {
+                        (0, 0)
+                    }
+                } else {
+                    (0, 0)
+                };
+
                 // Write OpenResponse to data region at offset 0 for micro.
                 let response = litebox_ipc::messages::OpenResponse {
                     fd: new_fd,
                     file_slot_offset: slot_offset,
+                    tar_offset: tar_off,
+                    tar_len: tar_ln,
                 };
                 let data_region = self.region.data_region_mut();
                 let resp_bytes: &[u8] = unsafe {
@@ -964,6 +1000,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
             let tun_enabled = self.tun_enabled;
             let tar_shmem_base = self.tar_shmem_base.0;
             let tar_shmem_size = self.tar_shmem_size;
+            let tar_file_map = Arc::clone(&self.tar_file_map);
             let child_server = ProcessServer::new(
                 child_region,
                 child_task,
@@ -975,6 +1012,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 tun_enabled,
                 tar_shmem_base,
                 tar_shmem_size,
+                tar_file_map,
             );
             child_server.next_child_pid.set(self.next_child_pid.get());
 

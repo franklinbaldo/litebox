@@ -175,7 +175,8 @@ const _: () = assert!(core::mem::size_of::<AcceptResponse>() == 32);
 /// is allocated for the opened fd.
 ///
 /// Central writes this to the data region at offset 0. Micro reads it to
-/// learn the shmem offset for the new fd's ring buffers.
+/// learn the shmem offset for the new fd's ring buffers, and for tar-backed
+/// files, the offset/length within the tar shmem region.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct OpenResponse {
@@ -185,6 +186,11 @@ pub struct OpenResponse {
     /// `ShmemSocketHeader` layout). Zero means no shmem slot was allocated
     /// (fd is not a regular file or slots are exhausted).
     pub file_slot_offset: u32,
+    /// Byte offset into the tar shmem where this file's data starts.
+    /// Zero means not a tar-backed file (use shmem ring path).
+    pub tar_offset: u64,
+    /// Size of the file data in the tar (file length).
+    pub tar_len: u64,
 }
 
-const _: () = assert!(core::mem::size_of::<OpenResponse>() == 8);
+const _: () = assert!(core::mem::size_of::<OpenResponse>() == 24);

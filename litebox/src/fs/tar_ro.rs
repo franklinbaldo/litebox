@@ -30,18 +30,17 @@ use core::ops::Range;
 use hashbrown::HashMap;
 
 use crate::{
-    LiteBox,
     fs::{DirEntry, FileType},
     path::Arg as _,
-    sync,
+    sync, LiteBox,
 };
 
 use super::{
-    Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
     errors::{
         ChmodError, ChownError, CloseError, MkdirError, OpenError, PathError, ReadDirError,
         ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
     },
+    Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
 };
 
 /// Just a random constant that is distinct from other file systems. In this case, it is
@@ -87,6 +86,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
             tar_index: TarIndex::new(tar_data),
             current_working_dir: "/".into(),
         }
+    }
+
+    /// Iterate over all file paths and their data byte ranges within the tar.
+    ///
+    /// Paths are returned without a leading `/` (matching the tar's internal
+    /// representation). Callers that need to look up by absolute path should
+    /// strip the leading `/` before querying.
+    pub fn all_file_data_ranges(&self) -> impl Iterator<Item = (&str, Range<usize>)> + '_ {
+        self.tar_index.all_file_data_ranges()
     }
 
     /// Gives the absolute path for `path`, resolving any `.` or `..`s, and making sure to account
@@ -233,6 +241,13 @@ impl TarIndex {
     fn dir_by_path(&self, path: &str) -> Option<(usize, &IndexedDir)> {
         let dir_idx = *self.dirs_by_path.get(path)?;
         Some((dir_idx, &self.dirs[dir_idx]))
+    }
+
+    /// Iterate over all file paths and their data byte ranges within the tar.
+    fn all_file_data_ranges(&self) -> impl Iterator<Item = (&str, Range<usize>)> + '_ {
+        self.files_by_path
+            .iter()
+            .map(move |(path, &idx)| (path.as_str(), self.files[idx].data_range.clone()))
     }
 }
 

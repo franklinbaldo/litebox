@@ -1374,6 +1374,95 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
         }
     }
 
+    // Tar shmem file fast-path: read/pread64 on tar-backed fds bypass central.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
+    {
+        let micro = unsafe { &mut *(*tls).micro };
+        let fd = args.args[0] as i32;
+        let tar_base = micro.tar_base;
+        let tar_size = micro.tar_size;
+        if let Some(entry) = micro.find_tar_file_fd_mut(fd) {
+            match i64::from(nr) {
+                libc::SYS_read => {
+                    let buf = args.args[1] as *mut u8;
+                    let count = args.args[2] as usize;
+                    let remaining = entry.tar_len.saturating_sub(entry.cursor) as usize;
+                    let to_read = count.min(remaining);
+                    if to_read > 0 {
+                        let src_offset = entry.tar_offset + entry.cursor;
+                        if (src_offset as usize) + to_read > tar_size {
+                            return -i64::from(libc::EIO);
+                        }
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                tar_base.add(src_offset as usize),
+                                buf,
+                                to_read,
+                            );
+                        }
+                        entry.cursor += to_read as u64;
+                    }
+                    return to_read as i64;
+                }
+                libc::SYS_pread64 => {
+                    let buf = args.args[1] as *mut u8;
+                    let count = args.args[2] as usize;
+                    let offset = args.args[3];
+                    if offset >= entry.tar_len {
+                        return 0;
+                    }
+                    let remaining = (entry.tar_len - offset) as usize;
+                    let to_read = count.min(remaining);
+                    if to_read > 0 {
+                        let src_offset = entry.tar_offset + offset;
+                        if (src_offset as usize) + to_read > tar_size {
+                            return -i64::from(libc::EIO);
+                        }
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                tar_base.add(src_offset as usize),
+                                buf,
+                                to_read,
+                            );
+                        }
+                    }
+                    return to_read as i64;
+                }
+                _ => {} // other syscalls fall through
+            }
+        }
+    }
+
+    // lseek on tar-backed fds: handle locally.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss
+    )]
+    if i64::from(nr) == libc::SYS_lseek {
+        let micro = unsafe { &mut *(*tls).micro };
+        let fd = args.args[0] as i32;
+        if let Some(entry) = micro.find_tar_file_fd_mut(fd) {
+            let offset = args.args[1] as i64;
+            let whence = args.args[2] as i32;
+            let new_pos: i64 = match whence {
+                libc::SEEK_SET => offset,
+                libc::SEEK_CUR => entry.cursor as i64 + offset,
+                libc::SEEK_END => entry.tar_len as i64 + offset,
+                _ => return -i64::from(libc::EINVAL),
+            };
+            if new_pos < 0 {
+                return -i64::from(libc::EINVAL);
+            }
+            entry.cursor = new_pos as u64;
+            return new_pos;
+        }
+    }
+
     // exit_group: notify central (fire-and-forget) then die immediately.
     //
     // exit_group terminates the entire process. We must NOT use submit_and_wait
@@ -1580,7 +1669,12 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
                     .cast::<litebox_ipc::messages::OpenResponse>())
             };
             if resp.file_slot_offset != 0 {
-                micro.register_file_fd(resp.fd, resp.file_slot_offset);
+                micro.register_file_fd(
+                    resp.fd,
+                    resp.file_slot_offset,
+                    resp.tar_offset,
+                    resp.tar_len,
+                );
             }
             return cq.result; // return the fd
         }

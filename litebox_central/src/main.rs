@@ -183,6 +183,17 @@ fn main() -> anyhow::Result<()> {
     });
 
     let tar_ro = litebox::fs::tar_ro::FileSystem::new(lb, tar_data);
+
+    // Build a lookup table mapping tar paths to their byte ranges before
+    // the tar_ro filesystem is moved into the layered FS.  This map is
+    // shared (via Arc) with every ProcessServer so it can populate
+    // OpenResponse tar fields without traversing the layered FS.
+    let tar_file_map: std::collections::HashMap<String, std::ops::Range<usize>> = tar_ro
+        .all_file_data_ranges()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+    let tar_file_map = std::sync::Arc::new(tar_file_map);
+
     let inner = litebox::fs::layered::FileSystem::new(
         lb,
         devices,
@@ -248,6 +259,7 @@ fn main() -> anyhow::Result<()> {
         tun_enabled,
         tar_shmem_base,
         tar_shmem_size,
+        tar_file_map,
     );
     let result = server.run();
 

@@ -25,6 +25,12 @@ pub struct FileFdEntry {
     pub fd: i32,
     /// Offset within the data region to the file slot header (reuses ShmemSocketHeader layout).
     pub shmem_offset: u32,
+    /// Byte offset into tar shmem where file data starts (0 = not tar-backed).
+    pub tar_offset: u64,
+    /// File size in tar.
+    pub tar_len: u64,
+    /// Current file position for sequential read().
+    pub cursor: u64,
 }
 
 /// Entry in micro's local pipe fd tracking table.
@@ -278,11 +284,23 @@ impl MicroState {
         None
     }
 
-    /// Register a file fd with its shmem slot offset.
-    pub fn register_file_fd(&mut self, fd: i32, shmem_offset: u32) -> bool {
+    /// Register a file fd with its shmem slot offset and optional tar backing.
+    pub fn register_file_fd(
+        &mut self,
+        fd: i32,
+        shmem_offset: u32,
+        tar_offset: u64,
+        tar_len: u64,
+    ) -> bool {
         for slot in &mut self.file_fds {
             if slot.is_none() {
-                *slot = Some(FileFdEntry { fd, shmem_offset });
+                *slot = Some(FileFdEntry {
+                    fd,
+                    shmem_offset,
+                    tar_offset,
+                    tar_len,
+                    cursor: 0,
+                });
                 return true;
             }
         }
@@ -300,6 +318,14 @@ impl MicroState {
             }
         }
         false
+    }
+
+    /// Find a tar-backed file fd entry (mutable reference for cursor updates).
+    pub fn find_tar_file_fd_mut(&mut self, fd: i32) -> Option<&mut FileFdEntry> {
+        self.file_fds
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.fd == fd && entry.tar_offset != 0)
     }
 
     #[cfg(test)]
