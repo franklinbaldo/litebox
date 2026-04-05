@@ -8,16 +8,26 @@
 //! is a MIG call we don't fully emulate).
 
 use alloc::collections::{BTreeMap, VecDeque};
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
 use litebox::event::wait::{WaitError, Waker};
 
 use crate::{Platform, ShimFS, Task};
+
+/// A blocked waiter: the waker to wake plus a shared flag to signal readiness.
+struct BlockedWaiter {
+    waker: Waker<Platform>,
+    /// Set to `true` by the signaler before calling `waker.wake()`.
+    /// The waiter's `wait_until` predicate polls this flag.
+    signaled: Arc<AtomicBool>,
+}
 
 /// Per-semaphore state.
 struct SemaphoreState {
     /// Signed count — negative means that many waiters are blocked.
     count: i32,
     /// Queue of blocked waiters (FIFO).
-    waiters: VecDeque<Waker<Platform>>,
+    waiters: VecDeque<BlockedWaiter>,
 }
 
 /// Manager for all Mach semaphores in the process.
@@ -54,9 +64,10 @@ impl MachSemaphoreManager {
         let sem = Self::get_or_create(&mut guard, port);
         sem.count += 1;
         if sem.count <= 0
-            && let Some(waker) = sem.waiters.pop_front()
+            && let Some(waiter) = sem.waiters.pop_front()
         {
-            waker.wake();
+            waiter.signaled.store(true, Ordering::Release);
+            waiter.waker.wake();
         }
         KERN_SUCCESS
     }
@@ -67,8 +78,9 @@ impl MachSemaphoreManager {
     pub(crate) fn signal_all(&self, port: u32) -> usize {
         let mut guard = self.semaphores.lock();
         let sem = Self::get_or_create(&mut guard, port);
-        for waker in sem.waiters.drain(..) {
-            waker.wake();
+        for waiter in sem.waiters.drain(..) {
+            waiter.signaled.store(true, Ordering::Release);
+            waiter.waker.wake();
         }
         if sem.count < 0 {
             sem.count = 0;
@@ -82,6 +94,8 @@ impl<FS: ShimFS> Task<FS> {
     ///
     /// Decrement count. If count < 0, push waker and block until woken.
     pub(crate) fn sys_semaphore_wait(&self, port: u32) -> usize {
+        let signaled = Arc::new(AtomicBool::new(false));
+
         // Decrement and check under lock.
         {
             let mut guard = self.global.semaphore_manager.semaphores.lock();
@@ -92,19 +106,25 @@ impl<FS: ShimFS> Task<FS> {
             }
             // Need to block — register waker while holding lock.
             let cx = self.wait_cx();
-            sem.waiters.push_back(cx.waker().clone());
+            sem.waiters.push_back(BlockedWaiter {
+                waker: cx.waker().clone(),
+                signaled: Arc::clone(&signaled),
+            });
             // Drop lock before blocking.
         }
-        // Block until woken.
+        // Block until signaled.
         let cx = self.wait_cx();
-        match cx.wait_until(|| {
-            // We've been woken by signal/signal_all — check is trivially true.
-            // The waker was already consumed from the queue by the signaler.
-            true
-        }) {
+        match cx.wait_until(|| signaled.load(Ordering::Acquire)) {
             Ok(()) => KERN_SUCCESS,
-            Err(WaitError::Interrupted) => KERN_ABORTED,
-            Err(WaitError::TimedOut) => KERN_OPERATION_TIMED_OUT,
+            Err(WaitError::Interrupted) => {
+                self.cancel_wait(port, &signaled);
+                KERN_ABORTED
+            }
+            Err(WaitError::TimedOut) => {
+                // Untimed wait shouldn't time out, but handle defensively.
+                self.cancel_wait(port, &signaled);
+                KERN_OPERATION_TIMED_OUT
+            }
         }
     }
 
@@ -113,6 +133,8 @@ impl<FS: ShimFS> Task<FS> {
     ///
     /// Same as wait but with timeout.
     pub(crate) fn sys_semaphore_timedwait(&self, port: u32, sec: u32, nsec: u32) -> usize {
+        let signaled = Arc::new(AtomicBool::new(false));
+
         // Decrement and check under lock.
         {
             let mut guard = self.global.semaphore_manager.semaphores.lock();
@@ -123,16 +145,47 @@ impl<FS: ShimFS> Task<FS> {
             }
             // Need to block — register waker while holding lock.
             let cx = self.wait_cx();
-            sem.waiters.push_back(cx.waker().clone());
+            sem.waiters.push_back(BlockedWaiter {
+                waker: cx.waker().clone(),
+                signaled: Arc::clone(&signaled),
+            });
             // Drop lock before blocking.
         }
         // Block with timeout.
         let timeout = core::time::Duration::new(u64::from(sec), nsec);
         let cx = self.wait_cx().with_timeout(timeout);
-        match cx.wait_until(|| true) {
+        match cx.wait_until(|| signaled.load(Ordering::Acquire)) {
             Ok(()) => KERN_SUCCESS,
-            Err(WaitError::TimedOut) => KERN_OPERATION_TIMED_OUT,
-            Err(WaitError::Interrupted) => KERN_ABORTED,
+            Err(WaitError::TimedOut) => {
+                self.cancel_wait(port, &signaled);
+                KERN_OPERATION_TIMED_OUT
+            }
+            Err(WaitError::Interrupted) => {
+                self.cancel_wait(port, &signaled);
+                KERN_ABORTED
+            }
+        }
+    }
+
+    /// Cancel a wait that timed out or was interrupted.
+    ///
+    /// Removes our waiter from the queue (if still present) and restores
+    /// the count.  If the signaler already consumed our waiter (signaled
+    /// flag is true), the count was already adjusted by the signaler, so
+    /// we don't need to undo anything.
+    fn cancel_wait(&self, port: u32, signaled: &Arc<AtomicBool>) {
+        let mut guard = self.global.semaphore_manager.semaphores.lock();
+        if let Some(sem) = guard.get_mut(&port) {
+            // Check if we were signaled between the wait_until return and
+            // acquiring the lock.  If so, the signal already consumed our
+            // slot — don't double-undo.
+            if signaled.load(Ordering::Acquire) {
+                return;
+            }
+            // Remove our waiter from the queue and undo the count decrement.
+            sem.waiters
+                .retain(|w| !Arc::ptr_eq(&w.signaled, signaled));
+            sem.count += 1;
         }
     }
 }

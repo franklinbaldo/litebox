@@ -59,7 +59,7 @@ fn test_hello_dynamic() {
         cache_result
             .regions
             .iter()
-            .map(|r| r.data.len())
+            .map(|r| r.data().len())
             .sum::<usize>() as f64
             / (1024.0 * 1024.0),
     );
@@ -828,4 +828,139 @@ fn test_mach_semaphore() {
         exit_code, 0,
         "mach_semaphore test failed with exit code {exit_code}"
     );
+}
+
+/// Attempt to run the real `/usr/bin/true` system binary under litebox.
+///
+/// This is an exploratory test: `/usr/bin/true` has zero imports and simply
+/// returns 0, making it the simplest possible real macOS binary to attempt.
+#[test]
+#[allow(clippy::cast_precision_loss)]
+fn test_run_system_true() {
+    let true_path = std::path::Path::new("/usr/bin/true");
+    assert!(
+        true_path.exists(),
+        "/usr/bin/true not found on this system"
+    );
+
+    let cache_dir = std::path::Path::new("/System/Cryptexes/OS/System/Library/dyld");
+    assert!(
+        cache_dir.exists(),
+        "Shared cache not found at {}",
+        cache_dir.display()
+    );
+
+    let map_path = cache_dir.join("dyld_shared_cache_arm64e.map");
+    let map_text = std::fs::read_to_string(&map_path).unwrap();
+    let cache_map = common::shared_cache::CacheMap::parse(&map_text);
+    let system_dylibs = cache_map.system_dylib_paths();
+    let dylib_refs: Vec<&str> = system_dylibs
+        .iter()
+        .map(std::string::String::as_str)
+        .collect();
+    let cache_result = common::shared_cache::collect_regions(cache_dir, &cache_map, &dylib_refs);
+
+    eprintln!(
+        "Loaded {} cache regions ({:.1} MB total)",
+        cache_result.regions.len(),
+        cache_result
+            .regions
+            .iter()
+            .map(|r| r.data().len())
+            .sum::<usize>() as f64
+            / (1024.0 * 1024.0),
+    );
+
+    // Read the real system binary (fat Mach-O with arm64e slice)
+    let binary_data = std::fs::read(true_path).expect("read /usr/bin/true");
+    eprintln!("Read /usr/bin/true: {} bytes", binary_data.len());
+
+    let (exit_code, _stdout) = common::run_macho_dynamic(
+        &binary_data,
+        &["/usr/bin/true"],
+        &cache_result,
+        "true",
+    );
+    assert_eq!(exit_code, 0, "/usr/bin/true exited with code {exit_code}");
+}
+
+/// Attempt to run the real `/bin/echo` system binary under litebox.
+///
+/// `/bin/echo` has ~10 imports and calls write(2) to produce output.
+/// We verify it exits with code 0.
+#[test]
+#[allow(clippy::cast_precision_loss)]
+fn test_run_system_echo() {
+    let echo_path = std::path::Path::new("/bin/echo");
+    assert!(echo_path.exists(), "/bin/echo not found on this system");
+
+    let cache_dir = std::path::Path::new("/System/Cryptexes/OS/System/Library/dyld");
+    assert!(
+        cache_dir.exists(),
+        "Shared cache not found at {}",
+        cache_dir.display()
+    );
+
+    let map_path = cache_dir.join("dyld_shared_cache_arm64e.map");
+    let map_text = std::fs::read_to_string(&map_path).unwrap();
+    let cache_map = common::shared_cache::CacheMap::parse(&map_text);
+    let system_dylibs = cache_map.system_dylib_paths();
+    let dylib_refs: Vec<&str> = system_dylibs
+        .iter()
+        .map(std::string::String::as_str)
+        .collect();
+    let cache_result = common::shared_cache::collect_regions(cache_dir, &cache_map, &dylib_refs);
+
+    let binary_data = std::fs::read(echo_path).expect("read /bin/echo");
+    eprintln!("Read /bin/echo: {} bytes", binary_data.len());
+
+    let (exit_code, _stdout) = common::run_macho_dynamic(
+        &binary_data,
+        &["/bin/echo", "hello", "litebox"],
+        &cache_result,
+        "echo",
+    );
+    assert_eq!(exit_code, 0, "/bin/echo exited with code {exit_code}");
+}
+
+/// Attempt to run the real `/bin/ls` system binary under litebox.
+///
+/// `/bin/ls` has many imports including FTS, ACL, ncurses, etc.
+/// This is an exploratory test to see how far we get.
+#[test]
+#[allow(clippy::cast_precision_loss)]
+fn test_run_system_ls() {
+    let ls_path = std::path::Path::new("/bin/ls");
+    assert!(ls_path.exists(), "/bin/ls not found on this system");
+
+    let cache_dir = std::path::Path::new("/System/Cryptexes/OS/System/Library/dyld");
+    assert!(
+        cache_dir.exists(),
+        "Shared cache not found at {}",
+        cache_dir.display()
+    );
+
+    let map_path = cache_dir.join("dyld_shared_cache_arm64e.map");
+    let map_text = std::fs::read_to_string(&map_path).unwrap();
+    let cache_map = common::shared_cache::CacheMap::parse(&map_text);
+    let system_dylibs = cache_map.system_dylib_paths();
+    let dylib_refs: Vec<&str> = system_dylibs
+        .iter()
+        .map(std::string::String::as_str)
+        .collect();
+    let cache_result = common::shared_cache::collect_regions(cache_dir, &cache_map, &dylib_refs);
+
+    let binary_data = std::fs::read(ls_path).expect("read /bin/ls");
+    eprintln!("Read /bin/ls: {} bytes", binary_data.len());
+
+    // Try to list /tmp — a directory we create in the in-mem FS.
+    let (exit_code, _stdout) = common::run_macho_dynamic(
+        &binary_data,
+        &["/bin/ls", "/tmp"],
+        &cache_result,
+        "ls",
+    );
+    // ls /tmp on an empty dir should exit 0
+    eprintln!("/bin/ls exited with code {exit_code}");
+    assert_eq!(exit_code, 0, "/bin/ls /tmp exited with code {exit_code}");
 }

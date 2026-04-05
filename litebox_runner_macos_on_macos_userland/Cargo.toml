@@ -19,5 +19,8 @@ memmap2 = "0.9.8"
 name = "litebox_runner_macos_on_macos_userland"
 path = "src/main.rs"
 
+[dev-dependencies]
+libc = "0.2"
+
 [lints]
 workspace = true

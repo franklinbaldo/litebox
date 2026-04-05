@@ -104,14 +104,14 @@ use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::time::Duration;
 
 use litebox::fs::OFlags;
-use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::{
     CowAllocationError, FixedAddressBehavior, MemoryRegionPermissions,
 };
+use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer as _};
 use litebox::shim::ContinueOperation;
 use litebox::utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt};
-use litebox_common_linux::{MapFlags, ProtFlags, PunchthroughSyscall, vmap::VmapManager};
+use litebox_common_linux::{vmap::VmapManager, MapFlags, ProtFlags, PunchthroughSyscall};
 
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -167,7 +167,12 @@ const ULF_WAKE_ALL: u32 = 0x0000_0100;
 /// `VM_FLAGS_ANYWHERE`: Let the kernel choose any available address.
 const VM_FLAGS_ANYWHERE: i32 = 1;
 
-/// Maximum number of edge pages we track for fault-and-toggle W^X.
+/// `VM_FLAGS_FIXED`: Use the specified address exactly.
+const VM_FLAGS_FIXED: i32 = 0;
+
+/// `VM_FLAGS_OVERWRITE`: Allow overwriting existing mappings (including
+/// kernel-managed shared region mappings like the dyld shared cache).
+const VM_FLAGS_OVERWRITE: i32 = 0x4000;
 ///
 /// Edge pages are 16KB host pages that contain 4KB guest sub-pages with
 /// conflicting permissions (e.g., RW data + RX code). Since macOS rejects
@@ -1458,6 +1463,13 @@ impl RawMutex {
 
         let timeout_us = timeout.map_or(0, |d| u32::try_from(d.as_micros()).unwrap_or(u32::MAX));
 
+        // __ulock_wait treats timeout_us=0 as "no timeout" (infinite wait).
+        // If a finite timeout was requested but rounds to 0μs, report an
+        // immediate timeout instead of waiting forever.
+        if timeout.is_some() && timeout_us == 0 {
+            return Ok(UnblockedOrTimedOut::TimedOut);
+        }
+
         loop {
             let ret = unsafe {
                 __ulock_wait(
@@ -1990,17 +2002,56 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                     };
                     if r == libc::MAP_FAILED {
                         let err = std::io::Error::last_os_error();
-                        return Err(match err.raw_os_error() {
+                        match err.raw_os_error() {
                             Some(libc::ENOMEM) => {
-                                litebox::platform::page_mgmt::AllocationError::OutOfMemory
+                                return Err(
+                                    litebox::platform::page_mgmt::AllocationError::OutOfMemory,
+                                );
                             }
                             Some(libc::EACCES | libc::EPERM) => {
                                 // MAP_FIXED on a region owned by the platform
                                 // (e.g. the host shared cache) returns EACCES.
-                                litebox::platform::page_mgmt::AllocationError::AddressInUseByPlatform
+                                // Fall back to mach_vm_allocate with VM_FLAGS_OVERWRITE
+                                // which can replace kernel-managed shared region mappings.
+                                let mut addr = inner_start as u64;
+                                let size = (inner_end - inner_start) as u64;
+                                let kr = unsafe {
+                                    mach_vm_allocate(
+                                        mach_task_self(),
+                                        &raw mut addr,
+                                        size,
+                                        VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                                    )
+                                };
+                                if kr != 0 {
+                                    // KERN_SUCCESS == 0; any other value is failure.
+                                    return Err(litebox::platform::page_mgmt::AllocationError::AddressInUseByPlatform);
+                                }
+                                // mach_vm_allocate gives RW pages. Set the
+                                // requested protection.
+                                if prot != (libc::PROT_READ | libc::PROT_WRITE) {
+                                    let r = unsafe {
+                                        libc::mprotect(
+                                            inner_start as *mut libc::c_void,
+                                            inner_end - inner_start,
+                                            prot,
+                                        )
+                                    };
+                                    if r != 0 {
+                                        // mprotect failed; deallocate and fail.
+                                        unsafe {
+                                            mach_vm_deallocate(
+                                                mach_task_self(),
+                                                inner_start as u64,
+                                                size,
+                                            );
+                                        }
+                                        return Err(litebox::platform::page_mgmt::AllocationError::AddressInUseByPlatform);
+                                    }
+                                }
                             }
                             _ => panic!("unhandled mmap error {err}"),
-                        });
+                        }
                     }
                 }
 
@@ -2272,11 +2323,55 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 )
             };
             if r != 0 {
-                // mprotect can fail with EACCES when the range includes pages
-                // that aren't ours (e.g., brk zone pages that weren't
-                // gap-reserved because a host mapping occupied them).  Return
-                // Unallocated so callers (like brk grow) can fall back.
-                return Err(litebox::platform::page_mgmt::PermissionUpdateError::Unallocated);
+                let err = std::io::Error::last_os_error();
+                match err.raw_os_error() {
+                    Some(libc::EACCES | libc::EPERM) => {
+                        // mprotect fails with EACCES on host shared cache pages.
+                        // Use mach_vm_allocate(VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE)
+                        // to claim the pages, then retry mprotect.
+                        let mut addr = inner_start as u64;
+                        let size = (inner_end - inner_start) as u64;
+                        let kr = unsafe {
+                            mach_vm_allocate(
+                                mach_task_self(),
+                                &raw mut addr,
+                                size,
+                                VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                            )
+                        };
+                        if kr != 0 {
+                            return Err(
+                                litebox::platform::page_mgmt::PermissionUpdateError::Unallocated,
+                            );
+                        }
+                        // mach_vm_allocate gives RW pages. Set requested protection.
+                        if prot != (libc::PROT_READ | libc::PROT_WRITE) {
+                            let r = unsafe {
+                                libc::mprotect(
+                                    inner_start as *mut libc::c_void,
+                                    inner_end - inner_start,
+                                    prot,
+                                )
+                            };
+                            if r != 0 {
+                                // mprotect failed after allocate; deallocate and fail.
+                                unsafe {
+                                    mach_vm_deallocate(mach_task_self(), inner_start as u64, size);
+                                }
+                                return Err(
+                                    litebox::platform::page_mgmt::PermissionUpdateError::Unallocated,
+                                );
+                            }
+                        }
+                    }
+                    _ => {
+                        // Other errors (e.g. brk zone pages not gap-reserved).
+                        // Return Unallocated so callers can fall back.
+                        return Err(
+                            litebox::platform::page_mgmt::PermissionUpdateError::Unallocated,
+                        );
+                    }
+                }
             }
         }
 
@@ -2765,9 +2860,40 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for MacosUserland {
 static mut NEXT_SA: [libc::sigaction; 64] = unsafe { core::mem::zeroed() };
 static INTERRUPT_SIGNAL_NUMBER: AtomicI32 = AtomicI32::new(0);
 
+/// Module-level `Once` for [`register_exception_handlers`].
+///
+/// Promoted from a function-local `static` so that [`reset_exception_handler_once`]
+/// can reset it after `fork()`.
+static EXCEPTION_HANDLER_ONCE: std::sync::Once = std::sync::Once::new();
+
+/// Reset the exception-handler registration guard so that
+/// [`register_exception_handlers`] will re-register signal handlers on the
+/// next call to [`MacosUserland::new`].
+///
+/// This is intended **only** for use in a `fork()`ed child process.  After
+/// `fork()`, the child inherits the parent's signal handlers, but those may
+/// have been overwritten by test infrastructure (e.g. a crash handler).  The
+/// child must re-register its own handlers so that guest page faults are
+/// handled by the platform's exception handler rather than the test's crash
+/// handler.
+///
+/// # Safety
+///
+/// - Must only be called from a single-threaded context (e.g. immediately
+///   after `fork()` in the child, before spawning any threads).
+/// - The caller must call [`MacosUserland::new`] again afterward.
+pub unsafe fn reset_exception_handler_once() {
+    // `std::sync::Once` contains an internal state word.  We reset it by
+    // overwriting with a fresh `Once`.
+    let ptr: *const std::sync::Once = &raw const EXCEPTION_HANDLER_ONCE;
+    let ptr_mut = ptr.cast_mut();
+    unsafe {
+        ptr_mut.write(std::sync::Once::new());
+    }
+}
+
 fn register_exception_handlers() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
+    EXCEPTION_HANDLER_ONCE.call_once(|| {
         fn sigaction(sig: i32, sa: Option<&libc::sigaction>, old_sa: &mut libc::sigaction) {
             unsafe {
                 let r = libc::sigaction(
@@ -2791,11 +2917,6 @@ fn register_exception_handlers() {
             sa.sa_sigaction = interrupt_signal_handler as *const () as usize;
             let mut old_sa = unsafe { core::mem::zeroed() };
             sigaction(sig, Some(&sa), &mut old_sa);
-            assert_eq!(
-                old_sa.sa_sigaction,
-                libc::SIG_DFL,
-                "signal {sig} handler already installed",
-            );
             INTERRUPT_SIGNAL_NUMBER.store(sig, Ordering::Relaxed);
             sig
         };
@@ -2944,7 +3065,14 @@ fn with_signal_alt_stack<R>(host_tls: usize, f: impl FnOnce() -> R) -> R {
         // Ensure the write is visible before we restore the old alt-stack.
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-        let r = libc::sigaltstack(&raw const oss, std::ptr::null_mut());
+        // macOS sigaltstack rejects ss_size < MINSIGSTKSZ even when
+        // SS_DISABLE is set (arguably a kernel bug). Ensure the size
+        // meets the minimum so restoration of a "disabled" state works.
+        let mut restored = oss;
+        if restored.ss_flags & libc::SS_DISABLE != 0 && restored.ss_size < libc::MINSIGSTKSZ {
+            restored.ss_size = libc::MINSIGSTKSZ;
+        }
+        let r = libc::sigaltstack(&raw const restored, std::ptr::null_mut());
         assert!(
             r >= 0,
             "failed to restore original signal stack: {}",

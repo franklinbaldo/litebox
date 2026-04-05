@@ -47,6 +47,7 @@ pub mod nr {
     pub const KDEBUG_TRACE_STRING: usize = 178;
     pub const REBOOT: usize = 55;
     pub const STATFS64: usize = 345;
+    pub const GETFSSTAT64: usize = 347;
     pub const TERMINATE_WITH_PAYLOAD: usize = 520;
     pub const ABORT_WITH_PAYLOAD: usize = 521;
     pub const STAT64: usize = 338;
@@ -65,6 +66,7 @@ pub mod nr {
     pub const RMDIR: usize = 137;
     pub const FTRUNCATE: usize = 201;
     pub const SEMWAIT_SIGNAL: usize = 334;
+    pub const PROC_RLIMIT_CONTROL: usize = 336;
     pub const GETDIRENTRIES64: usize = 344;
     pub const RECVMSG: usize = 27;
     pub const SENDMSG: usize = 28;
@@ -89,6 +91,7 @@ pub mod nr {
     pub const WRITEV: usize = 121;
     pub const KEVENT: usize = 363;
     pub const GETCWD: usize = 304;
+    pub const FSGETPATH: usize = 427;
 }
 
 /// Mach trap numbers (negative x16 values, stored as positive constants).
@@ -341,6 +344,11 @@ pub enum MacosSyscallRequest {
         tv_sec: i64,
         tv_nsec: i32,
     },
+    ProcRlimitControl {
+        pid: i32,
+        flavor: i32,
+        arg: usize,
+    },
     Getdirentries64 {
         fd: i32,
         buf: usize,
@@ -469,6 +477,19 @@ pub enum MacosSyscallRequest {
     Getcwd {
         buf: usize,
         size: usize,
+    },
+    /// `getfsstat64(buf, bufsize, flags)` — enumerate mounted filesystems.
+    Getfsstat64 {
+        buf: usize,
+        bufsize: usize,
+        flags: i32,
+    },
+    /// `fsgetpath(buf, bufsize, fsid, objid)` — get path for a filesystem object.
+    Fsgetpath {
+        buf: usize,
+        bufsize: usize,
+        fsid: usize,
+        objid: u64,
     },
     Unknown {
         number: usize,
@@ -692,6 +713,11 @@ impl MacosSyscallRequest {
                 tv_sec: a4 as i64,
                 tv_nsec: a5 as i32,
             },
+            nr::PROC_RLIMIT_CONTROL => MacosSyscallRequest::ProcRlimitControl {
+                pid: a0 as i32,
+                flavor: a1 as i32,
+                arg: a2,
+            },
             nr::GETDIRENTRIES64 => MacosSyscallRequest::Getdirentries64 {
                 fd: a0 as i32,
                 buf: a1,
@@ -815,6 +841,17 @@ impl MacosSyscallRequest {
                 iovcnt: a2,
             },
             nr::GETCWD => MacosSyscallRequest::Getcwd { buf: a0, size: a1 },
+            nr::GETFSSTAT64 => MacosSyscallRequest::Getfsstat64 {
+                buf: a0,
+                bufsize: a1,
+                flags: a2 as i32,
+            },
+            nr::FSGETPATH => MacosSyscallRequest::Fsgetpath {
+                buf: a0,
+                bufsize: a1,
+                fsid: a2,
+                objid: a3 as u64,
+            },
             _ => MacosSyscallRequest::Unknown { number: nr_raw },
         }
     }

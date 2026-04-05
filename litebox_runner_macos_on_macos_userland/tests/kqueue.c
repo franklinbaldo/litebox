@@ -28,6 +28,11 @@ int main(void) {
     if ((int)event.ident != fds[0]) return 12;
     if (event.filter != EVFILT_READ) return 13;
 
+    // Remove EVFILT_READ before Test 2 so only the write interest fires
+    struct kevent del_read;
+    EV_SET(&del_read, fds[0], EVFILT_READ, EV_DELETE, 0, 0, (void *)0);
+    if (kevent(kq, &del_read, 1, (struct kevent *)0, 0, (struct timespec *)0) < 0) return 14;
+
     // Test 2: EVFILT_WRITE on write end — pipe not full, should fire
     struct kevent change2;
     EV_SET(&change2, fds[1], EVFILT_WRITE, EV_ADD, 0, 0, (void *)0);
@@ -39,7 +44,11 @@ int main(void) {
     if ((int)event2.ident != fds[1]) return 22;
     if (event2.filter != EVFILT_WRITE) return 23;
 
-    // Test 3: EV_DELETE — remove read interest, verify no longer fires
+    // Test 3: EV_DELETE — re-add read interest, then delete it, verify no longer fires
+    struct kevent re_add;
+    EV_SET(&re_add, fds[0], EVFILT_READ, EV_ADD, 0, 0, (void *)0);
+    if (kevent(kq, &re_add, 1, (struct kevent *)0, 0, (struct timespec *)0) < 0) return 29;
+
     struct kevent change3;
     EV_SET(&change3, fds[0], EVFILT_READ, EV_DELETE, 0, 0, (void *)0);
     if (kevent(kq, &change3, 1, (struct kevent *)0, 0, (struct timespec *)0) < 0) return 30;

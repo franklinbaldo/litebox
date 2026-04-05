@@ -149,8 +149,26 @@ impl<FS: ShimFS> Task<FS> {
             MacosSyscallRequest::Readv { fd, iov, iovcnt } => self.sys_readv(fd, iov, iovcnt),
             MacosSyscallRequest::Writev { fd, iov, iovcnt } => self.sys_writev(fd, iov, iovcnt),
             MacosSyscallRequest::Getcwd { buf, size } => self.sys_getcwd(buf, size),
+            MacosSyscallRequest::Getfsstat64 {
+                buf,
+                bufsize,
+                flags,
+            } => self.sys_getfsstat64(buf, bufsize, flags),
+            MacosSyscallRequest::Fsgetpath {
+                buf,
+                bufsize,
+                fsid,
+                objid,
+            } => self.sys_fsgetpath(buf, bufsize, fsid, objid),
             MacosSyscallRequest::Unknown { number } => {
                 log_unsupported!("macOS syscall {number}");
+                Err(Errno::ENOSYS)
+            }
+            MacosSyscallRequest::ProcRlimitControl { pid, flavor, arg } => {
+                let _ = (pid, flavor, arg);
+                log_unsupported!(
+                    "proc_rlimit_control(pid={pid}, flavor={flavor}, arg={arg:#x}) → ENOSYS"
+                );
                 Err(Errno::ENOSYS)
             }
             MacosSyscallRequest::BsdthreadRegister {

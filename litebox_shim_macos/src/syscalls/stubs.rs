@@ -10,9 +10,9 @@ use alloc::boxed::Box;
 use litebox::platform::{
     Instant as _, RawConstPointer as _, RawMutPointer as _, ThreadProvider as _, TimeProvider as _,
 };
-use litebox_common_macos::PtRegs;
 use litebox_common_macos::errno::Errno;
 use litebox_common_macos::syscall::mach_trap;
+use litebox_common_macos::PtRegs;
 
 use crate::{MutPtr, ShimFS, Task};
 
@@ -47,6 +47,21 @@ impl<FS: ShimFS> Task<FS> {
             .shared_cache_base
             .load(core::sync::atomic::Ordering::Acquire);
         if base != 0 {
+            // Guard: skip writing to clearly invalid pointers (e.g. 0xFFFF...) that
+            // would crash the host via TransparentMutPtr's unchecked write.  The dead
+            // code in dyld's `start()` (which runs after `restartWithDyldInCache`
+            // returns) calls `shared_region_check_np(0xFFFFFFFFFFFFFFFF)`.  Returning
+            // EFAULT makes the dead code think no cache exists, triggering assertion
+            // failures in shared cache libraries.  Returning success (without writing)
+            // keeps the code on the "cache is installed" path.
+            if start_address > 0x0000_7FFF_FFFF_FFF8 {
+                log_unsupported!(
+                    "shared_region_check_np: invalid address {:#x}, skipping write but returning success (cache at {:#x})",
+                    start_address,
+                    base,
+                );
+                return Ok(0);
+            }
             let ptr: MutPtr<u64> = MutPtr::from_usize(start_address);
             ptr.write_at_offset(0, base).ok_or(Errno::EFAULT)?;
             log_unsupported!("shared_region_check_np: cache installed at {:#x}", base);
@@ -529,5 +544,89 @@ impl<FS: ShimFS> Task<FS> {
             let _ = cx.sleep(); // returns WaitError::TimedOut or Interrupted
         }
         Ok(0)
+    }
+
+    /// Handle `getfsstat64(buf, bufsize, flags)` — enumerate mounted filesystems.
+    ///
+    /// dyld calls this during startup to discover mounted volumes.  We report
+    /// a single root filesystem so dyld gets a valid count and can proceed.
+    #[allow(clippy::unnecessary_wraps)]
+    pub(crate) fn sys_getfsstat64(
+        &self,
+        buf: usize,
+        bufsize: usize,
+        flags: i32,
+    ) -> Result<usize, Errno> {
+        const STATFS_SIZE: usize = 0x878;
+
+        log_unsupported!("getfsstat64(buf={buf:#x}, bufsize={bufsize:#x}, flags={flags})");
+
+        if buf == 0 {
+            // Query mode: return count of mounted filesystems (just root).
+            return Ok(1);
+        }
+
+        if bufsize < STATFS_SIZE {
+            return Err(Errno::EINVAL);
+        }
+
+        // Fill one statfs64 struct for the root filesystem "/" (same as sys_statfs64).
+        let zeros = alloc::vec![0u8; STATFS_SIZE];
+        let dest: MutPtr<u8> = MutPtr::from_usize(buf);
+        dest.copy_from_slice(0, &zeros).ok_or(Errno::EFAULT)?;
+
+        let buf32: MutPtr<u32> = MutPtr::from_usize(buf);
+        buf32.write_at_offset(0, 4096).ok_or(Errno::EFAULT)?; // f_bsize
+        buf32.write_at_offset(1, 4096).ok_or(Errno::EFAULT)?; // f_iosize
+
+        let buf64: MutPtr<u64> = MutPtr::from_usize(buf);
+        buf64.write_at_offset(1, 1_000_000).ok_or(Errno::EFAULT)?; // f_blocks
+        buf64.write_at_offset(2, 500_000).ok_or(Errno::EFAULT)?; // f_bfree
+        buf64.write_at_offset(3, 500_000).ok_or(Errno::EFAULT)?; // f_bavail
+        buf64.write_at_offset(4, 100_000).ok_or(Errno::EFAULT)?; // f_files
+        buf64.write_at_offset(5, 50_000).ok_or(Errno::EFAULT)?; // f_ffree
+
+        // f_fstypename at offset 0x48
+        let fstypename = b"apfs\0";
+        let fstypename_dest: MutPtr<u8> = MutPtr::from_usize(buf + 0x48);
+        fstypename_dest
+            .copy_from_slice(0, fstypename)
+            .ok_or(Errno::EFAULT)?;
+
+        // f_mntonname at offset 0x58
+        let mntonname = b"/\0";
+        let mntonname_dest: MutPtr<u8> = MutPtr::from_usize(buf + 0x58);
+        mntonname_dest
+            .copy_from_slice(0, mntonname)
+            .ok_or(Errno::EFAULT)?;
+
+        // f_mntfromname at offset 0x458
+        let mntfromname = b"litebox\0";
+        let mntfromname_dest: MutPtr<u8> = MutPtr::from_usize(buf + 0x458);
+        mntfromname_dest
+            .copy_from_slice(0, mntfromname)
+            .ok_or(Errno::EFAULT)?;
+
+        // Return count of entries filled (1).
+        Ok(1)
+    }
+
+    /// Handle `fsgetpath(buf, bufsize, fsid, objid)` — get filesystem path.
+    ///
+    /// dyld uses this to discover the path of the shared cache file on disk.
+    /// We return ENOTSUP since our shared cache is directly mapped into memory
+    /// and doesn't have a meaningful on-disk path in the guest FS.
+    #[allow(clippy::unnecessary_wraps)]
+    pub(crate) fn sys_fsgetpath(
+        &self,
+        buf: usize,
+        bufsize: usize,
+        fsid: usize,
+        objid: u64,
+    ) -> Result<usize, Errno> {
+        log_unsupported!(
+            "fsgetpath(buf={buf:#x}, bufsize={bufsize:#x}, fsid={fsid:#x}, objid={objid:#x})"
+        );
+        Err(Errno::ENOTSUP)
     }
 }

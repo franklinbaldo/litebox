@@ -6,6 +6,19 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+// Mach VM API for fallback allocation over host shared cache pages.
+unsafe extern "C" {
+    fn mach_task_self() -> u32;
+    fn mach_vm_allocate(target_task: u32, address: *mut u64, size: u64, flags: i32) -> i32;
+    fn mach_vm_deallocate(target_task: u32, address: u64, size: u64) -> i32;
+}
+
+/// `VM_FLAGS_FIXED`: Use the specified address exactly.
+const VM_FLAGS_FIXED: i32 = 0;
+/// `VM_FLAGS_OVERWRITE`: Allow overwriting existing mappings (including
+/// kernel-managed shared region mappings like the dyld shared cache).
+const VM_FLAGS_OVERWRITE: i32 = 0x4000;
+
 /// Memory protection for a shared cache mapping or region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::enum_variant_names)]
@@ -39,11 +52,257 @@ pub struct DylibEntry {
 }
 
 /// A region of shared cache data ready to be mapped into guest memory.
-#[derive(Debug, Clone)]
+///
+/// Data may be heap-allocated (`Vec<u8>`) or file-backed (`MmappedRegion`).
+/// The `data()` method returns a `&[u8]` regardless of backing.
+#[derive(Debug)]
 pub struct SharedCacheRegion {
     pub guest_addr: u64,
-    pub data: Vec<u8>,
     pub prot: Protection,
+    backing: RegionBacking,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+enum RegionBacking {
+    Heap(Vec<u8>),
+    Mmap(MmappedRegion),
+}
+
+/// A file-backed mmap region.  Dropped automatically via `munmap`.
+///
+/// When pages overlap the host shared cache, `mach_vm_allocate` is used
+/// instead of `mmap(MAP_FIXED)`.  The `vm_allocated` flag tracks this so
+/// `Drop` uses the correct deallocation API.
+struct MmappedRegion {
+    ptr: *mut u8,
+    len: usize,
+    /// `true` when the region was allocated via `mach_vm_allocate` (must use
+    /// `mach_vm_deallocate` to free); `false` for normal `mmap` regions
+    /// (freed via `munmap`).
+    vm_allocated: bool,
+}
+
+// SAFETY: The mmap'd data is read-only file content, safe to share.
+unsafe impl Send for MmappedRegion {}
+unsafe impl Sync for MmappedRegion {}
+
+impl std::fmt::Debug for MmappedRegion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MmappedRegion")
+            .field("ptr", &self.ptr)
+            .field("len", &self.len)
+            .field("vm_allocated", &self.vm_allocated)
+            .finish()
+    }
+}
+
+impl Drop for MmappedRegion {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() && self.len > 0 {
+            unsafe {
+                if self.vm_allocated {
+                    mach_vm_deallocate(mach_task_self(), self.ptr as u64, self.len as u64);
+                } else {
+                    libc::munmap(self.ptr.cast::<libc::c_void>(), self.len);
+                }
+            }
+        }
+    }
+}
+
+impl MmappedRegion {
+    /// mmap a region from a file.  Returns `None` on failure.
+    #[allow(dead_code)]
+    fn from_file(file: &fs::File, offset: u64, len: usize) -> Option<MmappedRegion> {
+        Self::from_file_at(file, offset, len, None)
+    }
+
+    /// mmap a region from a file, optionally at a fixed address.
+    ///
+    /// If `fixed_addr` is `Some(addr)`, uses `MAP_FIXED` to place the mapping
+    /// at exactly `addr`.  This is used for macOS-on-macOS where the guest
+    /// address space IS the host process address space.
+    ///
+    /// When `MAP_FIXED` fails (EACCES/EPERM — typically because the target
+    /// address overlaps the host's kernel-managed shared cache), falls back to
+    /// `mach_vm_allocate(VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE)` which CAN
+    /// replace shared region pages.  The file data is then `pread` into the
+    /// allocated anonymous pages and the pages are set to PROT_READ.
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    fn from_file_at(
+        file: &fs::File,
+        offset: u64,
+        len: usize,
+        fixed_addr: Option<u64>,
+    ) -> Option<MmappedRegion> {
+        use std::os::unix::io::AsRawFd;
+        if len == 0 {
+            return None;
+        }
+        let (hint, flags) = match fixed_addr {
+            Some(addr) => (
+                addr as usize as *mut libc::c_void,
+                libc::MAP_PRIVATE | libc::MAP_FIXED,
+            ),
+            None => (std::ptr::null_mut(), libc::MAP_PRIVATE),
+        };
+        let ptr = unsafe {
+            libc::mmap(
+                hint,
+                len,
+                libc::PROT_READ,
+                flags,
+                file.as_raw_fd(),
+                offset as libc::off_t,
+            )
+        };
+        if ptr != libc::MAP_FAILED {
+            return Some(MmappedRegion {
+                ptr: ptr.cast::<u8>(),
+                len,
+                vm_allocated: false,
+            });
+        }
+
+        // mmap failed.  If this was a MAP_FIXED request, the address may
+        // overlap the host's shared cache (kernel returns EACCES).  Try
+        // the Mach VM API which can overwrite shared region pages.
+        let fixed_addr = fixed_addr?;
+        let errno = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(0);
+        if errno != libc::EACCES && errno != libc::EPERM {
+            return None;
+        }
+
+        // Phase 1: Allocate anonymous RW pages at the exact address.
+        let mut addr = fixed_addr;
+        let kr = unsafe {
+            mach_vm_allocate(
+                mach_task_self(),
+                &raw mut addr,
+                len as u64,
+                VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+            )
+        };
+        if kr != 0 {
+            eprintln!(
+                "MmappedRegion: mach_vm_allocate at {fixed_addr:#x} len {len:#x} failed: kern_return {kr}",
+            );
+            return None;
+        }
+
+        // Phase 2: Read the file data into the allocated pages.
+        // Use pread to avoid seeking the shared file descriptor.
+        let buf_ptr = addr as *mut libc::c_void;
+        let mut remaining = len;
+        let mut buf_off: usize = 0;
+        let mut file_off = offset as libc::off_t;
+        while remaining > 0 {
+            let n = unsafe {
+                libc::pread(
+                    file.as_raw_fd(),
+                    (buf_ptr as usize + buf_off) as *mut libc::c_void,
+                    remaining,
+                    file_off,
+                )
+            };
+            if n <= 0 {
+                // Read error or EOF.  Zero-fill the rest (already zero from
+                // mach_vm_allocate) and break.
+                break;
+            }
+            let n = n.cast_unsigned();
+            remaining -= n;
+            buf_off += n;
+            file_off += n as libc::off_t;
+        }
+
+        // Phase 3: Set pages to read-only (matching file-backed mmap behavior).
+        let r = unsafe { libc::mprotect(buf_ptr, len, libc::PROT_READ) };
+        if r != 0 {
+            eprintln!(
+                "MmappedRegion: mprotect PROT_READ at {addr:#x} len {len:#x} failed: {}",
+                std::io::Error::last_os_error(),
+            );
+            // Pages are still RW — usable but not ideal.  Continue anyway.
+        }
+
+        eprintln!(
+            "MmappedRegion: mach_vm_allocate fallback at {addr:#x} len {len:#x} OK \
+             (read {buf_off:#x} bytes from file offset {offset:#x})",
+        );
+
+        Some(MmappedRegion {
+            ptr: addr as *mut u8,
+            len,
+            vm_allocated: true,
+        })
+    }
+
+    /// Allocate zero-filled pages at a fixed address via `mach_vm_allocate`.
+    ///
+    /// Used for regions that overlap the host shared cache where file-backed
+    /// mmap is rejected by the kernel.  The pages are anonymous and read-only
+    /// (zero-filled).  Dylib-specific segments will be overlaid later by the
+    /// heap-based region loader (`install_shared_cache`).
+    #[allow(clippy::cast_possible_truncation, dead_code)]
+    fn zero_filled_at(addr: u64, len: usize) -> Option<MmappedRegion> {
+        if len == 0 {
+            return None;
+        }
+        let mut alloc_addr = addr;
+        let kr = unsafe {
+            mach_vm_allocate(
+                mach_task_self(),
+                &raw mut alloc_addr,
+                len as u64,
+                VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+            )
+        };
+        if kr != 0 {
+            eprintln!(
+                "MmappedRegion::zero_filled_at: mach_vm_allocate at {addr:#x} len {len:#x} \
+                 failed: kern_return {kr}",
+            );
+            return None;
+        }
+
+        // Set pages to read-only.  They're zero-filled which is enough to
+        // prevent SIGBUS.  Dyld may read metadata from these pages and get
+        // zeros, but the critical dylib segments are installed separately.
+        let r = unsafe {
+            libc::mprotect(alloc_addr as *mut libc::c_void, len, libc::PROT_READ)
+        };
+        if r != 0 {
+            eprintln!(
+                "MmappedRegion::zero_filled_at: mprotect PROT_READ at {alloc_addr:#x} \
+                 len {len:#x} failed: {}",
+                std::io::Error::last_os_error(),
+            );
+        }
+
+        Some(MmappedRegion {
+            ptr: alloc_addr as *mut u8,
+            len,
+            vm_allocated: true,
+        })
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl SharedCacheRegion {
+    /// Get the region data as a byte slice.
+    pub fn data(&self) -> &[u8] {
+        match &self.backing {
+            RegionBacking::Heap(v) => v,
+            RegionBacking::Mmap(m) => m.as_slice(),
+        }
+    }
 }
 
 /// Parsed representation of a dyld shared cache `.map` file.
@@ -256,6 +515,63 @@ impl SubCacheFile {
         f.read_exact(&mut buf).ok()?;
         Some(buf)
     }
+
+    /// Memory-map a region from `[vm_start, vm_end)` using file-backed mmap.
+    ///
+    /// This is more efficient than `read_region` for large ranges because the
+    /// OS only pages in data that's actually accessed.
+    #[allow(dead_code)]
+    #[allow(clippy::cast_possible_truncation)]
+    fn mmap_region(&self, vm_start: u64, vm_end: u64) -> Option<MmappedRegion> {
+        self.mmap_region_inner(vm_start, vm_end, None)
+    }
+
+    /// Memory-map a region at a fixed guest address using `MAP_FIXED`.
+    ///
+    /// Used for macOS-on-macOS where the guest address space is the host
+    /// process. Maps the file content directly at `vm_start` so data is
+    /// lazily paged in by the OS — no copy required.
+    #[allow(clippy::cast_possible_truncation, dead_code)]
+    fn mmap_region_fixed(&self, vm_start: u64, vm_end: u64) -> Option<MmappedRegion> {
+        self.mmap_region_inner(vm_start, vm_end, Some(vm_start))
+    }
+
+    /// Memory-map file data for unslid `[vm_start, vm_end)` but place it at
+    /// `target_addr` (which may be slid).  The file offset is computed from
+    /// the unslid addresses (matching the on-disk subcache mappings), but the
+    /// `MAP_FIXED` address is `target_addr`.
+    #[allow(clippy::cast_possible_truncation)]
+    fn mmap_region_fixed_at(
+        &self,
+        vm_start: u64,
+        vm_end: u64,
+        target_addr: u64,
+    ) -> Option<MmappedRegion> {
+        self.mmap_region_inner(vm_start, vm_end, Some(target_addr))
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn mmap_region_inner(
+        &self,
+        vm_start: u64,
+        vm_end: u64,
+        fixed_addr: Option<u64>,
+    ) -> Option<MmappedRegion> {
+        let mapping = self
+            .mappings
+            .iter()
+            .find(|m| vm_start >= m.vm_addr && vm_start < m.vm_addr + m.vm_size)?;
+
+        let offset_in_mapping = vm_start - mapping.vm_addr;
+        let file_pos = mapping.file_offset + offset_in_mapping;
+
+        let mapping_remaining = mapping.vm_size - offset_in_mapping;
+        let requested = vm_end - vm_start;
+        let len = requested.min(mapping_remaining) as usize;
+
+        let f = fs::File::open(&self.path).ok()?;
+        MmappedRegion::from_file_at(&f, file_pos, len, fixed_addr)
+    }
 }
 
 /// Discover all sub-cache files in `cache_dir` matching `dyld_shared_cache_arm64e*`,
@@ -300,25 +616,138 @@ fn segment_protection(seg_name: &str, vm_start: u64, mappings: &[CacheMapping]) 
     }
 }
 
+/// Query the host process's shared cache range using `_dyld_get_shared_cache_range`.
+///
+/// Returns `(base_address, length)` or `None` if the function is unavailable.
+fn host_shared_cache_range() -> Option<(u64, u64)> {
+    // Link to the dyld SPI
+    unsafe extern "C" {
+        fn _dyld_get_shared_cache_range(length: *mut u64) -> u64;
+    }
+    let mut length: u64 = 0;
+    let base = unsafe { _dyld_get_shared_cache_range(&raw mut length) };
+    if base == 0 || length == 0 {
+        return None;
+    }
+    Some((base, length))
+}
+
 /// Result of collecting shared cache regions.
 pub struct CollectedCache {
     /// Regions to be mapped via `install_shared_cache`.
     pub regions: Vec<SharedCacheRegion>,
+    /// Extents that were directly mmap'd at guest addresses (MAP_FIXED).
+    /// These are already installed and should NOT be passed through
+    /// `install_shared_cache`. They should be passed as `reserved_extents`
+    /// so the trampoline allocator avoids them.
+    /// Each entry is `(start_addr, end_addr)`.
+    pub preinstalled_extents: Vec<(u64, u64)>,
+    /// __TEXT segments that are already mapped by the host's shared cache
+    /// and only need SVC patching in place (no re-mapping).
+    ///
+    /// Each entry is `(guest_addr, length)`.  The `install_shared_cache`
+    /// function will `mprotect(RW)` → SVC-patch → `mprotect(RX)` these
+    /// in place, letting the kernel COW-fault the pages on first write.
+    pub patch_in_place_text: Vec<(u64, usize)>,
+    /// __DATA segments that are host-resident but need resetting to pristine
+    /// (uninitialised) state.  The host process's dyld has already written
+    /// to these COW-ed pages (e.g. `sMemoryManagerInitialized`), so the
+    /// guest sees stale state.  We overwrite them with pristine data read
+    /// from the subcache files.
+    ///
+    /// Each entry is `(slid_guest_addr, pristine_data)`.
+    pub reset_in_place_data: Vec<(u64, Vec<u8>)>,
+    /// File-backed sources for demand-paging shared cache pages on SIGBUS.
+    ///
+    /// Each source maps a VM address range to a subcache file + offset so
+    /// the shim's exception handler can fill pages with correct data instead
+    /// of zeros.
+    pub demand_page_sources: Vec<litebox_shim_macos::DemandPageSource>,
+    /// The host's ASLR-slid shared cache base address.
+    ///
+    /// On macOS-on-macOS, we accept the host's slide: the guest uses the
+    /// host's already-rebased shared cache data at slid addresses instead
+    /// of trying to map its own copy at unslid addresses.  This value is
+    /// passed to `install_shared_cache` as `cache_base` so that
+    /// `shared_region_check_np` returns the correct (slid) address to dyld.
+    pub host_cache_base: u64,
+    /// MmappedRegions that must be kept alive for the duration of the guest
+    /// process.  Dropping them would unmap the guest memory.
+    #[allow(dead_code)]
+    preinstalled_mmaps: Vec<MmappedRegion>,
+    /// Open file handles for subcache files referenced by `demand_page_sources`.
+    /// Must be kept alive for the duration of the guest process so the FDs
+    /// remain valid.
+    #[allow(dead_code)]
+    demand_page_files: Vec<fs::File>,
+}
+
+/// Map a sub-region of a global mapping via file-backed mmap at a fixed address.
+///
+/// `sub_start`/`sub_end` are the *slid* (guest) addresses where data will be
+/// placed.  `slide` is subtracted to compute the *unslid* addresses used for
+/// subcache file lookup (the on-disk files use unslid addresses).
+#[allow(clippy::cast_possible_truncation, clippy::too_many_arguments)]
+fn phase0_mmap_subregion(
+    sub_start: u64,
+    sub_end: u64,
+    slide: u64,
+    subcaches: &[SubCacheFile],
+    preinstalled_extents: &mut Vec<(u64, u64)>,
+    preinstalled_mmaps: &mut Vec<MmappedRegion>,
+    seen: &mut std::collections::HashSet<(u64, u64)>,
+    label: &str,
+) {
+    // Unslid addresses for subcache lookup.
+    let unslid_start = sub_start - slide;
+    let unslid_end = sub_end - slide;
+    let Some(sc) = subcaches.iter().find(|s| s.contains_vmaddr(unslid_start)) else {
+        #[allow(clippy::cast_precision_loss)]
+        let sub_size = (sub_end - sub_start) as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "    → {label} {sub_start:#x}..{sub_end:#x} ({sub_size:.1} MB): no subcache \
+             (unslid {unslid_start:#x})",
+        );
+        return;
+    };
+    // Look up file data via unslid addresses, but map at the slid target.
+    if let Some(mmap) = sc.mmap_region_fixed_at(unslid_start, unslid_end, sub_start) {
+        let actual_len = mmap.len as u64;
+        let actual_end = sub_start + actual_len;
+        #[allow(clippy::cast_precision_loss)]
+        let actual_mb = actual_len as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "    → {label} {sub_start:#x}..{actual_end:#x} ({actual_mb:.1} MB): mapped OK",
+        );
+        preinstalled_extents.push((sub_start, actual_end));
+        seen.insert((sub_start, actual_end));
+        preinstalled_mmaps.push(mmap);
+    } else {
+        #[allow(clippy::cast_precision_loss)]
+        let sub_size = (sub_end - sub_start) as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "    → {label} {sub_start:#x}..{sub_end:#x} ({sub_size:.1} MB): mmap failed",
+        );
+    }
 }
 
 /// Collect shared-cache regions for the given set of dylibs.
 ///
-/// Maps a complete, independent copy of the cache at UNSLID addresses.
-/// The host's shared cache is at SLID addresses (ASLR), so mapping at
-/// unslid addresses does not interfere with the host process.
+/// Uses the "accept host's slide" strategy: the host process's shared cache
+/// (at ASLR-slid addresses) is left in place and registered as preinstalled.
+/// Dylib segments are read from subcache files at unslid addresses but placed
+/// at slid guest addresses so the guest sees a consistent address space.
 ///
 /// Includes:
-/// - The cache header (first global mapping, typically 544KB)
+/// - ALL global mapping regions registered as preinstalled (host data in place)
+/// - After-host portions of global mappings via file-backed mmap at slid addresses
 /// - All segments (__TEXT, __DATA_CONST, __DATA, __AUTH, etc.) of needed dylibs
-/// - Deduplicated __LINKEDIT ranges
+///   at slid addresses
+/// - Deduplicated __LINKEDIT ranges at slid addresses
+/// - Demand-page sources for gaps in the slid address space
 ///
-/// The dynamic config data region is returned separately in `CollectedCache`
-/// because it may overlap with the host's slid cache and needs special handling.
+/// Global mapping regions are left as-is (host's data). Only the __TEXT segments
+/// of explicitly needed dylibs are marked executable and SVC-patched.
 #[allow(clippy::cast_possible_truncation)]
 pub fn collect_regions(
     cache_dir: &Path,
@@ -326,97 +755,151 @@ pub fn collect_regions(
     needed_dylibs: &[&str],
 ) -> CollectedCache {
     let subcaches = discover_subcache_files(cache_dir);
+    eprintln!("collect_regions: discovered {} subcache files", subcaches.len());
+
+    // Query the host's shared cache address range so we can split global
+    // mappings around it.  All portions (overlapping and non-overlapping)
+    // get file-backed mmap — overlapping portions use MAP_FIXED|MAP_PRIVATE
+    // which gives the process a COW view without affecting the shared region.
+    let host_range = host_shared_cache_range();
+    let (host_start, host_end) = if let Some((base, len)) = host_range {
+        let end = base + len;
+        #[allow(clippy::cast_precision_loss)]
+        let size_mb = len as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "collect_regions: host shared cache at {base:#x}..{end:#x} ({size_mb:.0} MB)",
+        );
+        (base, end)
+    } else {
+        eprintln!("collect_regions: could not query host shared cache range");
+        (0, 0)
+    };
 
     // Deduplicate regions by (vm_start, vm_end).
     let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
     let mut regions: Vec<SharedCacheRegion> = Vec::new();
+    let mut patch_in_place_text: Vec<(u64, usize)> = Vec::new();
+    let reset_in_place_data: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut preinstalled_extents: Vec<(u64, u64)> = Vec::new();
+    let mut preinstalled_mmaps: Vec<MmappedRegion> = Vec::new();
 
-    // Map the cache header — dyld reads magic, dynamicDataOffset, slide info,
-    // and other metadata from the first global mapping.
-    if let Some(first_mapping) = cache_map.mappings.first() {
-        let header_start = first_mapping.vm_start;
-        let header_end = first_mapping.vm_end;
-        if let Some(sc) = subcaches.iter().find(|s| s.contains_vmaddr(header_start))
-            && let Some(mut data) = sc.read_region(header_start, header_end)
-        {
-            seen.insert((header_start, header_end));
+    // Compute the host's ASLR slide.  With the "accept host's slide"
+    // strategy, we tell the guest dyld that the cache starts at the host's
+    // slid base instead of the unslid base (0x180000000).  The host's
+    // already-rebased data is then correct — no need to replace overlap pages.
+    let unslid_base = cache_map.mappings.first().map_or(0x180000000, |m| m.vm_start);
+    let host_slide = if host_start > 0 { host_start - unslid_base } else { 0 };
+    eprintln!(
+        "collect_regions: accepting host slide {host_slide:#x} \
+         (unslid base {unslid_base:#x}, slid base {host_start:#x})",
+    );
 
-            // Parse dynamicDataOffset and dynamicDataMaxSize from the cache
-            // header. The original offset points to an address that overlaps
-            // with the host's slid shared cache (kernel-protected), so we
-            // relocate the dynamic config data to the end of the first
-            // mapping (which is the header itself) and patch our copy.
-            // dyld validates that dynamicDataOffset falls within one of the
-            // cache's global mapping ranges, so we must place it INSIDE
-            // an existing mapping — not adjacent to one.
-            if data.len() >= 0x200 {
-                let orig_off = u64::from_le_bytes(data[0x1F0..0x1F8].try_into().unwrap());
-                let max_size = u64::from_le_bytes(data[0x1F8..0x200].try_into().unwrap());
-                if orig_off != 0 && max_size != 0 {
-                    let size = max_size as usize;
-                    let header_size = data.len();
+    // Phase 0: Register the host's shared cache as preinstalled.
+    //
+    // With the "accept host's slide" strategy, the host's shared cache at
+    // [host_start, host_end) already contains correctly-rebased data.  We
+    // do NOT mmap anything over it — we simply register the entire range as
+    // preinstalled so the trampoline allocator avoids it.
+    //
+    // For portions of global mappings that fall OUTSIDE the host cache
+    // (after-host sub-regions), we still need file-backed mmap at slid
+    // addresses.
+    for (i, mapping) in cache_map.mappings.iter().enumerate() {
+        let vm_start = mapping.vm_start;
+        let vm_end = mapping.vm_end;
+        // Slid addresses: where the host has this mapping's data.
+        let slid_start = vm_start + host_slide;
+        let slid_end = vm_end + host_slide;
+        #[allow(clippy::cast_precision_loss)]
+        let size_mb = (vm_end - vm_start) as f64 / (1024.0 * 1024.0);
+        let prot = mapping.prot;
+        eprintln!(
+            "  Phase 0: mapping {i} slid {slid_start:#x}..{slid_end:#x} \
+             ({size_mb:.1} MB, {prot:?})",
+        );
+        // Use slid addresses as the dedup key.
+        let key = (slid_start, slid_end);
+        if !seen.insert(key) {
+            eprintln!("    → skipped (duplicate)");
+            continue;
+        }
 
-                    // Place the dynamic config data at the end of the
-                    // header mapping. The mapping covers `header_start..
-                    // header_end` and we own all the data, so we can write
-                    // the synthesized struct at the tail.
-                    let new_offset = (header_size - size) as u64;
-                    // Ensure page alignment (16KB pages).
-                    let new_offset = new_offset & !0x3FFF;
-                    let dyn_guest_addr = header_start + new_offset;
-
-                    eprintln!(
-                        "Relocating dyld dynamic config data: orig VM {:#X} → new VM {:#X} \
-                         (offset {:#X} → {:#X}, size {:#X})",
-                        header_start + orig_off,
-                        dyn_guest_addr,
-                        orig_off,
-                        new_offset,
-                        max_size
-                    );
-
-                    // Patch dynamicDataOffset in our copy of the header.
-                    data[0x1F0..0x1F8].copy_from_slice(&new_offset.to_le_bytes());
-
-                    // Write the synthesized dynamic config data struct
-                    // into our header data buffer.
-                    //
-                    // DynamicRegion layout (from dyld open source):
-                    //   char     _magic[16]             — "dyld_data    v3\0"
-                    //   fsid_t   _dyldCache.fsid        — { int32_t val[2] } = 8 bytes
-                    //   fsobj_id _dyldCache.fsobjid     — { u32 fid_objno; u32 fid_generation } = 8 bytes
-                    //   uint32_t _osCryptexPathOffset   — 4 bytes (v1)
-                    //   uint32_t _cachePathOffset       — 4 bytes (v2)
-                    //   ...more v3 fields...
-                    let write_start = new_offset as usize;
-                    let magic = b"dyld_data    v3\0";
-                    // Zero-fill the region first.
-                    data[write_start..write_start + size].fill(0);
-                    data[write_start..write_start + 16].copy_from_slice(magic);
-                    // FileIdTuple at bytes 16..32: must be non-zero so
-                    // FileIdTuple::operator bool() returns true and dyld
-                    // doesn't halt.  Write fake but non-zero values.
-                    // fsid.val[0] (i32 LE) at offset 16
-                    data[write_start + 16..write_start + 20].copy_from_slice(&1_i32.to_le_bytes());
-                    // fsid.val[1] (i32 LE) at offset 20
-                    data[write_start + 20..write_start + 24].copy_from_slice(&0_i32.to_le_bytes());
-                    // fsobjid.fid_objno (u32 LE) at offset 24
-                    data[write_start + 24..write_start + 28].copy_from_slice(&1_u32.to_le_bytes());
-                    // fsobjid.fid_generation (u32 LE) at offset 28
-                    data[write_start + 28..write_start + 32].copy_from_slice(&0_u32.to_le_bytes());
-                }
+        if host_start > 0 && host_end > host_start {
+            // The portion within [host_start, host_end) is already mapped
+            // by the host — just register as preinstalled.
+            let overlap_start = slid_start.max(host_start);
+            let overlap_end = slid_end.min(host_end);
+            if overlap_end > overlap_start {
+                #[allow(clippy::cast_precision_loss)]
+                let overlap_mb = (overlap_end - overlap_start) as f64 / (1024.0 * 1024.0);
+                eprintln!(
+                    "    → overlap {overlap_start:#x}..{overlap_end:#x} ({overlap_mb:.1} MB): \
+                     host data in place (accepted slide)",
+                );
+                preinstalled_extents.push((overlap_start, overlap_end));
             }
 
-            regions.push(SharedCacheRegion {
-                guest_addr: header_start,
-                data,
-                prot: first_mapping.prot,
-            });
+            // Portion after the host cache: file-backed mmap at slid address.
+            let after_start = slid_start.max(host_end);
+            let after_end = slid_end;
+            if after_end > after_start {
+                phase0_mmap_subregion(
+                    after_start,
+                    after_end,
+                    host_slide,
+                    &subcaches,
+                    &mut preinstalled_extents,
+                    &mut preinstalled_mmaps,
+                    &mut seen,
+                    "after-host",
+                );
+            }
+        } else {
+            // No host cache info — map the whole thing via file-backed mmap.
+            phase0_mmap_subregion(
+                slid_start,
+                slid_end,
+                host_slide,
+                &subcaches,
+                &mut preinstalled_extents,
+                &mut preinstalled_mmaps,
+                &mut seen,
+                "full",
+            );
         }
     }
 
+    eprintln!(
+        "collect_regions: Phase 0 done — {} preinstalled extents",
+        preinstalled_extents.len()
+    );
+
+    // Phase 1: Cache header.
+    //
+    // With the "accept host's slide" strategy, the host's cache header at
+    // `host_start` is already in place and correct — the kernel set up the
+    // dynamic config data and applied the ASLR slide.  We don't need to map
+    // or patch a separate header copy.  The preinstalled extent from Phase 0
+    // already covers the header region.
+    eprintln!("collect_regions: Phase 1 (header) — skipped (using host's header at {host_start:#x})");
+
     // Collect LINKEDIT ranges separately so we can deduplicate them across dylibs.
+    // Store as (unslid_start, unslid_end) — slide is applied when creating regions.
     let mut linkedit_ranges: Vec<(u64, u64)> = Vec::new();
+
+    // With the "accept host's slide" strategy, the host's shared cache already
+    // contains correctly-rebased data at slid addresses.  Non-executable
+    // segments (DATA, DATA_CONST, AUTH, etc.) don't need to be overwritten —
+    // the host's copy is identical.  Only __TEXT segments need heap regions
+    // because they must be SVC-patched by install_shared_cache.
+    //
+    // Segments that fall entirely within a preinstalled extent are considered
+    // "host-resident" and are skipped for non-executable segments.
+    let is_host_resident = |slid_start: u64, slid_end: u64| -> bool {
+        preinstalled_extents
+            .iter()
+            .any(|&(ext_start, ext_end)| slid_start >= ext_start && slid_end <= ext_end)
+    };
 
     for &dylib_path in needed_dylibs {
         let Some(entry) = cache_map.dylibs.get(dylib_path) else {
@@ -429,49 +912,172 @@ pub fn collect_regions(
                 continue;
             }
 
-            let key = (seg.vm_start, seg.vm_end);
+            // Use slid addresses for dedup (consistent with Phase 0).
+            let slid_start = seg.vm_start + host_slide;
+            let slid_end = seg.vm_end + host_slide;
+            let key = (slid_start, slid_end);
             if !seen.insert(key) {
                 continue;
             }
 
             let prot = segment_protection(&seg.name, seg.vm_start, &cache_map.mappings);
+            let host_resident = is_host_resident(slid_start, slid_end);
 
-            // Find the sub-cache file that contains this VM address.
+            // Host-resident __TPRO_CONST segments — skip for now.
+            // The loaded dyld uses PC-relative (ADRP) addressing to reference
+            // its own __TPRO_CONST copy which is fresh from disk (all zeros).
+            // The shared cache libdyld's __TPRO_CONST is hardware write-
+            // protected (TPRO/SPRR) and cannot be reset without hanging.
+            // Since the loaded dyld doesn't reference the shared cache copy,
+            // we don't need to reset it.
+            if seg.name == "__TPRO_CONST" && host_resident {
+                continue;
+            }
+
+            // Host-resident ReadOnly segments — host data is identical, skip.
+            if prot == Protection::ReadOnly && host_resident {
+                continue;
+            }
+
+            // Host-resident ReadWrite segments — the host may have written to
+            // these COW pages.  We skip resetting regular __DATA/__DATA_DIRTY
+            // because overwriting them corrupts the host process's runtime
+            // (malloc, threading, etc.).  Only __TPRO_CONST is reset (above).
+            if prot == Protection::ReadWrite && host_resident {
+                continue;
+            }
+
+            // Host-resident __TEXT: don't re-map, just record for in-place
+            // SVC patching (mprotect RW → patch → mprotect RX).
+            if prot == Protection::ReadExecute && host_resident {
+                // Page-align the length for mprotect.
+                let len = (slid_end - slid_start) as usize;
+                patch_in_place_text.push((slid_start, len));
+                continue;
+            }
+
+            // Non-host-resident segment: read from subcache and emit as a
+            // heap-backed region for install_shared_cache to map.
             let Some(sc) = subcaches.iter().find(|s| s.contains_vmaddr(seg.vm_start)) else {
                 continue;
             };
 
             if let Some(data) = sc.read_region(seg.vm_start, seg.vm_end) {
                 regions.push(SharedCacheRegion {
-                    guest_addr: seg.vm_start,
-                    data,
+                    guest_addr: slid_start,
                     prot,
+                    backing: RegionBacking::Heap(data),
                 });
             }
         }
     }
 
     // Deduplicate and read LINKEDIT ranges.
+    // With the slid approach, LINKEDIT is read-only and host-resident.
+    // Skip LINKEDIT ranges that are entirely within the host's preinstalled
+    // extents — the host data is identical.
     linkedit_ranges.sort_unstable();
     linkedit_ranges.dedup();
     for (vm_start, vm_end) in &linkedit_ranges {
-        let key = (*vm_start, *vm_end);
+        // Use slid addresses for dedup and guest placement.
+        let slid_start = vm_start + host_slide;
+        let slid_end = vm_end + host_slide;
+        let key = (slid_start, slid_end);
         if !seen.insert(key) {
             continue;
         }
+        // Skip host-resident LINKEDIT ranges.
+        if is_host_resident(slid_start, slid_end) {
+            continue;
+        }
+        // Subcache lookup uses unslid addresses.
         let Some(sc) = subcaches.iter().find(|s| s.contains_vmaddr(*vm_start)) else {
             continue;
         };
         if let Some(data) = sc.read_region(*vm_start, *vm_end) {
             regions.push(SharedCacheRegion {
-                guest_addr: *vm_start,
-                data,
+                guest_addr: slid_start,
                 prot: Protection::ReadOnly,
+                backing: RegionBacking::Heap(data),
             });
         }
     }
 
-    CollectedCache { regions }
+    eprintln!(
+        "collect_regions: done — {} heap regions, {} patch-in-place text, {} reset-in-place data, {} preinstalled extents",
+        regions.len(),
+        patch_in_place_text.len(),
+        reset_in_place_data.len(),
+        preinstalled_extents.len()
+    );
+
+    // Build demand-page sources for gaps in the guest address space.
+    //
+    // The host's shared cache is left in place, but there may be gaps between
+    // subcache file mappings where no physical page exists.  When the guest
+    // (dyld) touches such a page, it gets SIGBUS.  We create DemandPageSource
+    // entries at *slid* addresses so the shim's exception handler can pread
+    // the correct file data into the faulting page.
+    //
+    // We cover the full range of each subcache file mapping (translated to
+    // slid addresses) — not just the host overlap region — because after-host
+    // regions also benefit from demand-paging for unmapped gaps.
+    let mut demand_page_sources: Vec<litebox_shim_macos::DemandPageSource> = Vec::new();
+    let mut demand_page_files: Vec<fs::File> = Vec::new();
+
+    {
+        // Open each subcache file once and create sources for all mappings.
+        for sc in &subcaches {
+            let mut file_opened = false;
+            let mut fd: i32 = -1;
+
+            for mapping in &sc.mappings {
+                // Subcache mappings are at unslid addresses.  Translate to slid.
+                let slid_m_start = mapping.vm_addr + host_slide;
+                let slid_m_end = mapping.vm_addr + mapping.vm_size + host_slide;
+
+                // Open the file lazily (only if we have mappings to register).
+                if !file_opened {
+                    if let Ok(f) = fs::File::open(&sc.path) {
+                        use std::os::unix::io::AsRawFd;
+                        fd = f.as_raw_fd();
+                        demand_page_files.push(f);
+                        file_opened = true;
+                    } else {
+                        eprintln!(
+                            "collect_regions: WARNING: cannot open {} for demand-paging",
+                            sc.path.display()
+                        );
+                        break;
+                    }
+                }
+
+                demand_page_sources.push(litebox_shim_macos::DemandPageSource {
+                    vm_start: slid_m_start,
+                    vm_end: slid_m_end,
+                    fd,
+                    file_offset: mapping.file_offset,
+                });
+            }
+        }
+
+        demand_page_sources.sort_unstable_by_key(|s| s.vm_start);
+        eprintln!(
+            "collect_regions: {} demand-page sources covering slid address space",
+            demand_page_sources.len()
+        );
+    }
+
+    CollectedCache {
+        regions,
+        preinstalled_extents,
+        patch_in_place_text,
+        reset_in_place_data,
+        demand_page_sources,
+        host_cache_base: host_start,
+        preinstalled_mmaps,
+        demand_page_files,
+    }
 }
 
 #[cfg(test)]
@@ -578,7 +1184,7 @@ mapping  RO  120MB 0x1F73F0000 -> 0x1FEC78000
             .regions
             .iter()
             .filter(|r| r.prot == Protection::ReadExecute)
-            .map(|r| r.data.len())
+            .map(|r| r.data().len())
             .sum();
 
         eprintln!(

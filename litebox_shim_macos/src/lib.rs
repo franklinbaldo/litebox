@@ -164,6 +164,76 @@ mod semaphore;
 pub mod syscalls;
 mod wait;
 
+// Mach VM API and POSIX I/O for demand-paging shared cache pages on SIGBUS.
+#[allow(dead_code)]
+unsafe extern "C" {
+    fn mach_task_self() -> u32;
+    fn mach_vm_allocate(target_task: u32, address: *mut u64, size: u64, flags: i32) -> i32;
+    fn mach_vm_deallocate(target_task: u32, address: u64, size: u64) -> i32;
+    fn mach_vm_protect(
+        target_task: u32,
+        address: u64,
+        size: u64,
+        set_maximum: i32,
+        new_protection: i32,
+    ) -> i32;
+    fn pread(fd: i32, buf: *mut u8, count: usize, offset: i64) -> isize;
+    fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+}
+/// `VM_FLAGS_FIXED`: Use the specified address exactly.
+const VM_FLAGS_FIXED: i32 = 0;
+/// `VM_FLAGS_OVERWRITE`: Allow overwriting existing mappings (including
+/// kernel-managed shared region mappings).
+const VM_FLAGS_OVERWRITE: i32 = 0x4000;
+/// `VM_FLAGS_ANYWHERE`: Let the kernel pick any available address.
+#[allow(dead_code)]
+const VM_FLAGS_ANYWHERE: i32 = 1;
+/// `VM_PROT_COPY`: Tell `mach_vm_protect` to create a COW copy of the page
+/// (required for shared region pages that don't allow direct protection change).
+#[allow(dead_code)]
+const VM_PROT_COPY: i32 = 0x10;
+/// macOS signal number for SIGBUS (differs from Linux SIGBUS=7).
+const MACOS_SIGBUS: i32 = 10;
+/// Hardware page size on macOS arm64 (16 KB).
+const HW_PAGE_SIZE: u64 = 16384;
+
+/// Debug-print to stderr (for `#![no_std]` crate).
+/// Uses the POSIX `write` syscall on fd 2.
+macro_rules! debug_eprintln {
+    ($($arg:tt)*) => {{
+        use core::fmt::Write;
+        struct StderrWriter;
+        impl Write for StderrWriter {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                unsafe { write(2, s.as_ptr(), s.len()) };
+                Ok(())
+            }
+        }
+        let _ = writeln!(StderrWriter, $($arg)*);
+    }};
+}
+
+/// A file-backed source for demand-paging shared cache pages.
+///
+/// When a SIGBUS occurs at a faulting address within `[vm_start, vm_end)`,
+/// the exception handler allocates a fresh 16 KB page and fills it with
+/// data from the subcache file at the corresponding file offset.
+///
+/// The raw file descriptor must remain open for the lifetime of the guest.
+/// Ownership of the FD is managed by the caller (the test harness holds
+/// the `File` objects alive in `CollectedCache`).
+#[derive(Debug, Clone, Copy)]
+pub struct DemandPageSource {
+    /// Start of the VM address range (page-aligned).
+    pub vm_start: u64,
+    /// End of the VM address range (page-aligned).
+    pub vm_end: u64,
+    /// Raw file descriptor for the subcache file (host-side, not guest).
+    pub fd: i32,
+    /// File offset that corresponds to `vm_start`.
+    pub file_offset: u64,
+}
+
 pub type DefaultFS = MacosFS;
 pub(crate) type MacosFS = litebox::fs::layered::FileSystem<
     Platform,
@@ -272,6 +342,9 @@ impl<FS: ShimFS> MacosShimBuilder<FS> {
             kqueue_fd_counter: AtomicUsize::new(0x2_0000),
             net_proxies: litebox::sync::RwLock::new(BTreeMap::new()),
             shared_cache_base: AtomicU64::new(0),
+            shared_cache_end: AtomicU64::new(0),
+            demand_page_ranges: litebox::sync::RwLock::new(Vec::new()),
+            demand_page_sources: litebox::sync::RwLock::new(Vec::new()),
             sysroot: self.sysroot,
         });
         MacosShim(global)
@@ -359,14 +432,22 @@ impl<FS: ShimFS> MacosShim<FS> {
     /// RX (executable) regions are patched for SVC rewriting before being made
     /// executable. The cache base address is recorded for `shared_region_check_np`.
     ///
-    /// `cache_base` is typically `0x180000000`.
+    /// `cache_base` is typically the host's ASLR-slid base (e.g. `0x181AC0000`).
     /// `regions` is a slice of `(guest_addr, data, is_executable)` tuples.
+    /// `patch_in_place_text` lists `(addr, len)` of __TEXT segments already mapped
+    /// by the host's shared cache — these are SVC-patched in place via
+    /// `mprotect(RW)` → patch → `mprotect(RX)` without re-mapping.
+    /// `demand_page_sources` provides file-backed data for SIGBUS demand-paging
+    /// of shared cache pages that the host's shared region doesn't serve.
     #[allow(clippy::missing_panics_doc, clippy::cast_possible_truncation)]
     pub fn install_shared_cache(
         &self,
         cache_base: u64,
         regions: &[(u64, &[u8], bool)],
         reserved_extents: &[(u64, u64)],
+        patch_in_place_text: &[(u64, usize)],
+        reset_in_place_data: &[(u64, Vec<u8>)],
+        demand_page_sources: &[DemandPageSource],
     ) {
         use litebox::mm::linux::PAGE_SIZE;
         use litebox::platform::{
@@ -387,6 +468,12 @@ impl<FS: ShimFS> MacosShim<FS> {
             let aligned_start = guest_addr & !(PAGE_SIZE as u64 - 1);
             let aligned_end =
                 (guest_addr + data.len() as u64 + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
+            (aligned_start, aligned_end)
+        }));
+        all_extents.extend(patch_in_place_text.iter().map(|&(addr, len)| {
+            let aligned_start = addr & !(PAGE_SIZE as u64 - 1);
+            let aligned_end =
+                (addr + len as u64 + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
             (aligned_start, aligned_end)
         }));
         all_extents.sort_unstable();
@@ -450,6 +537,68 @@ impl<FS: ShimFS> MacosShim<FS> {
             }
         }
 
+        // Pass 1.5: register VMAs for reserved extents (overlapping host cache
+        // pages) so that the VMA system knows about them.  Without this,
+        // mach_vm_protect / mprotect calls on these addresses fail with
+        // "no mapping at this address" (InvalidRange → EACCES).
+        //
+        // We use `register_existing_mapping` which only inserts VMA entries
+        // without touching the actual memory — the host's shared cache pages
+        // remain in place.
+        {
+            use litebox::mm::linux::PageRange;
+            use litebox::platform::page_mgmt::MemoryRegionPermissions;
+
+            for &(start, end) in reserved_extents {
+                let start_usize = start as usize;
+                let end_usize = end as usize;
+                // Ensure alignment to PAGE_SIZE (should already be aligned).
+                let aligned_start = start_usize & !(PAGE_SIZE - 1);
+                let aligned_end = (end_usize + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+                if let Some(page_range) = PageRange::<PAGE_SIZE>::new(aligned_start, aligned_end) {
+                    // SAFETY: These pages are already mapped by the host's
+                    // shared cache (readable).  We register them as READ-only
+                    // so the VMA system can find them for future mprotect calls.
+                    // SAFETY: These pages are already mapped by the host's
+                    // shared cache (readable).  We register them as READ-only
+                    // so the VMA system can find them for future mprotect calls.
+                    let registered = unsafe {
+                        self.0.pm.register_existing_mapping(
+                            page_range,
+                            MemoryRegionPermissions::READ,
+                            /* is_file_backed */ false,
+                            /* replace */ true,
+                            /* shared */ false,
+                        )
+                    };
+                    if registered.is_none() {
+                        log_unsupported!(
+                            "install_shared_cache: failed to register VMA for \
+                             reserved extent {:#x}..{:#x}",
+                            aligned_start,
+                            aligned_end
+                        );
+                    }
+                }
+            }
+        }
+
+        // Store the reserved extents as demand-page ranges so the exception
+        // handler can serve correct file data on SIGBUS instead of terminating.
+        {
+            let mut ranges = self.0.demand_page_ranges.write();
+            ranges.extend_from_slice(reserved_extents);
+        }
+
+        // Store file-backed demand-page sources (sorted by vm_start) so the
+        // exception handler can look up the correct subcache file and offset
+        // for any faulting address.
+        {
+            let mut sources = self.0.demand_page_sources.write();
+            sources.extend_from_slice(demand_page_sources);
+            sources.sort_unstable_by_key(|s| s.vm_start);
+        }
+
         // Pass 2: for each executable region that was successfully mapped,
         // find a nearby gap for the trampoline, patch SVC sites, and set R-X
         // permissions.
@@ -470,14 +619,14 @@ impl<FS: ShimFS> MacosShim<FS> {
             // for a gap within ±128MB of the code region's midpoint.
             let code_mid = aligned_start + aligned_len as u64 / 2;
             let branch_range: u64 = 128 * 1024 * 1024; // ±128MB
-            let tramp_addr = Self::find_trampoline_gap(
+            let candidates = Self::find_trampoline_gap_candidates(
                 &all_extents,
                 code_mid,
                 branch_range,
                 tramp_size as u64,
                 PAGE_SIZE as u64,
-            )
-            .unwrap_or_else(|| {
+            );
+            let tramp_addr = *candidates.first().unwrap_or_else(|| {
                 panic!(
                     "install_shared_cache: no gap for trampoline near code at {:#x} (size {:#x})",
                     aligned_start, aligned_len
@@ -547,31 +696,85 @@ impl<FS: ShimFS> MacosShim<FS> {
             .expect("install_shared_cache: code mprotect failed");
         }
 
+        // Pass 3: patch-in-place text segments — SKIPPED.
+        //
+        // On macOS-on-macOS, the shared cache code uses real macOS SVCs that
+        // execute correctly on the host kernel.  We skip SVC patching for these
+        // segments because:
+        //  1. The macOS kernel deadlocks on any attempt to modify shared region
+        //     pages (mach_vm_protect, mach_vm_allocate OVERWRITE, mach_vm_deallocate
+        //     all hang on shared cache __TEXT pages).
+        //  2. The shared cache SVCs are legitimate macOS syscalls that should
+        //     pass through to the host kernel (we only need to intercept
+        //     guest binary SVCs, which are patched in Pass 2).
+        let _ = &patch_in_place_text;
+        debug_eprintln!(
+            "  Pass 3: skipping {} patch-in-place segments (shared cache SVCs pass through to host)",
+            patch_in_place_text.len(),
+        );
+
+        // Pass 4: reset in-place __DATA segments to pristine state.
+        //
+        // On macOS-on-macOS, the host process's dyld has already COW-ed shared
+        // cache __DATA pages (e.g. setting sMemoryManagerInitialized = true).
+        // The guest's dyld will see this stale state and hit assertions.
+        // We fix this by overwriting the host-dirty __DATA pages with pristine
+        // data read from the subcache files.  Since these pages are RW, the
+        // kernel will COW them automatically on write — no mprotect needed.
+        debug_eprintln!(
+            "  Pass 4: resetting {} __DATA segments to pristine state",
+            reset_in_place_data.len(),
+        );
+        for &(addr, ref data) in reset_in_place_data {
+            debug_eprintln!(
+                "    reset __DATA: {:#x}..{:#x} ({} bytes)",
+                addr,
+                addr + data.len() as u64,
+                data.len(),
+            );
+            // SAFETY: addr points to a RW shared cache __DATA page that is
+            // already mapped in our address space.  We are overwriting it with
+            // pristine content of the same size.  The kernel will COW the page.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    addr as *mut u8,
+                    data.len(),
+                );
+            }
+        }
+        debug_eprintln!("  Pass 4: done");
+
         // Record the cache base address.
         self.0
             .shared_cache_base
             .store(cache_base, Ordering::Release);
+        // Record the cache end address from reserved_extents.
+        if let Some(max_end) = reserved_extents.iter().map(|&(_, end)| end).max() {
+            self.0
+                .shared_cache_end
+                .store(max_end, Ordering::Release);
+        }
     }
 
-    /// Find a page-aligned gap within `±branch_range` of `code_mid` that can
-    /// hold `tramp_size` bytes without overlapping any extent in `extents`.
+    /// Find page-aligned gap candidates within `±branch_range` of `code_mid`
+    /// that can hold `tramp_size` bytes without overlapping any extent in
+    /// `extents`.
     ///
-    /// `extents` must be sorted by start address.  Returns the gap start
-    /// address, or `None` if no suitable gap exists.
-    fn find_trampoline_gap(
+    /// `extents` must be sorted by start address.  Returns candidates sorted
+    /// by distance from `code_mid` (closest first).
+    fn find_trampoline_gap_candidates(
         extents: &[(u64, u64)],
         code_mid: u64,
         branch_range: u64,
         tramp_size: u64,
         page_size: u64,
-    ) -> Option<u64> {
+    ) -> alloc::vec::Vec<u64> {
         let range_lo = code_mid.saturating_sub(branch_range);
         let range_hi = code_mid.saturating_add(branch_range);
 
-        // Candidate gaps: before the first extent, between consecutive extents,
-        // and after the last extent — all clipped to [range_lo, range_hi].
-        // Pick the gap whose midpoint is closest to `code_mid`.
-        let mut best: Option<(u64, u64)> = None; // (distance_to_code, gap_start)
+        // Collect all candidates from gaps, sorted by distance to code_mid.
+        let mut candidates: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new(); // (distance, addr)
 
         // Helper to consider a candidate gap [gap_lo, gap_hi) clipped to the
         // branch range.
@@ -598,9 +801,7 @@ impl<FS: ShimFS> MacosShim<FS> {
                 return;
             }
             let dist = code_mid.abs_diff(candidate + tramp_size / 2);
-            if best.is_none_or(|(d, _)| dist < d) {
-                best = Some((dist, candidate));
-            }
+            candidates.push((dist, candidate));
         };
 
         // Gap before the first extent.
@@ -616,7 +817,9 @@ impl<FS: ShimFS> MacosShim<FS> {
             consider(last_end, u64::MAX - page_size);
         }
 
-        best.map(|(_, addr)| addr)
+        // Sort by distance (closest first).
+        candidates.sort_by_key(|&(d, _)| d);
+        candidates.into_iter().map(|(_, addr)| addr).collect()
     }
 
     /// Initialize stdio file descriptors (0=stdin, 1=stdout, 2=stderr).
@@ -722,6 +925,110 @@ impl<FS: ShimFS> litebox::shim::EnterShim for MacosShimEntrypoints<FS> {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let macos_signum = syscalls::signal::linux_to_macos_signal(info.esr as i32);
 
+        // Demand-paging for shared cache overlap regions.
+        //
+        // On macOS-on-macOS, the host's shared cache occupies addresses that
+        // overlap with the guest's unslid shared cache.  The host only
+        // serves pages for its own ASLR slide, so some guest addresses have
+        // no physical backing and cause SIGBUS.  When a SIGBUS occurs at an
+        // address within a registered demand-page range, we allocate a fresh
+        // 16 KB page and fill it with correct data from the subcache file.
+        if macos_signum == MACOS_SIGBUS {
+            let fault_addr = info.fault_address as u64;
+            let in_demand_range = {
+                let ranges = self.task.global.demand_page_ranges.read();
+                ranges.iter().any(|&(start, end)| fault_addr >= start && fault_addr < end)
+            };
+            if in_demand_range {
+                let hw_page_mask = HW_PAGE_SIZE - 1;
+                let page_addr = fault_addr & !hw_page_mask;
+
+                // Allocate a fresh page at the faulting address.
+                let mut alloc_addr = page_addr;
+                let kr = unsafe {
+                    mach_vm_allocate(
+                        mach_task_self(),
+                        &raw mut alloc_addr,
+                        HW_PAGE_SIZE,
+                        VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                    )
+                };
+                if kr != 0 {
+                    log_unsupported!(
+                        "SIGBUS demand-page: mach_vm_allocate at {:#x} failed: kern_return {}",
+                        page_addr,
+                        kr
+                    );
+                    // Fall through to normal exception handling.
+                } else {
+                    // Try to fill the page with correct data from a subcache file.
+                    let filled = {
+                        let sources = self.task.global.demand_page_sources.read();
+                        // Binary search for the source containing page_addr.
+                        let idx = sources.partition_point(|s| s.vm_start <= page_addr);
+                        if idx > 0 {
+                            let src = &sources[idx - 1];
+                            if page_addr >= src.vm_start && page_addr < src.vm_end {
+                                let offset_in_source = page_addr - src.vm_start;
+                                let file_offset = src.file_offset + offset_in_source;
+                                // Clamp read length to not exceed the source range.
+                                let remaining = src.vm_end - page_addr;
+                                #[allow(clippy::cast_possible_truncation)]
+                                let read_len = HW_PAGE_SIZE.min(remaining) as usize;
+
+                                #[allow(clippy::cast_possible_wrap)]
+                                let n = unsafe {
+                                    pread(
+                                        src.fd,
+                                        alloc_addr as *mut u8,
+                                        read_len,
+                                        file_offset as i64,
+                                    )
+                                };
+                                if n > 0 {
+                                    log_unsupported!(
+                                        "SIGBUS demand-page: mapped file-backed page at {:#x} \
+                                         (fault_addr={:#x}, pc={:#x}, fd={}, offset={:#x}, read={})",
+                                        page_addr,
+                                        fault_addr,
+                                        ctx.pc,
+                                        src.fd,
+                                        file_offset,
+                                        n
+                                    );
+                                    true
+                                } else {
+                                    log_unsupported!(
+                                        "SIGBUS demand-page: pread failed at {:#x} \
+                                         (fd={}, offset={:#x}, n={}), using zero page",
+                                        page_addr,
+                                        src.fd,
+                                        file_offset,
+                                        n
+                                    );
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    };
+                    if !filled {
+                        log_unsupported!(
+                            "SIGBUS demand-page: mapped zero page at {:#x} \
+                             (fault_addr={:#x}, pc={:#x}, no file source)",
+                            page_addr,
+                            fault_addr,
+                            ctx.pc
+                        );
+                    }
+                    return ContinueOperation::Resume;
+                }
+            }
+        }
+
         // Look up the handler for this signal.
         let handler = {
             let handlers = self.task.process.signal_handlers.lock();
@@ -747,6 +1054,11 @@ impl<FS: ShimFS> litebox::shim::EnterShim for MacosShimEntrypoints<FS> {
                     ctx.regs[16],
                     info.fault_address
                 );
+                // Set exit code to 128+signal (Unix convention for signal death).
+                self.task
+                    .process
+                    .exit_code
+                    .store(128 + macos_signum, Ordering::Release);
                 self.task.process.group_exit.store(true, Ordering::Release);
                 self.task.terminated.store(true, Ordering::Release);
                 ContinueOperation::Terminate
@@ -839,6 +1151,23 @@ struct GlobalState<FS: ShimFS> {
     >,
     /// Base address of the installed shared cache (0 if not installed).
     pub(crate) shared_cache_base: AtomicU64,
+    /// End address (exclusive) of the installed shared cache (0 if not installed).
+    pub(crate) shared_cache_end: AtomicU64,
+    /// Address ranges for demand-paging shared cache pages on SIGBUS.
+    ///
+    /// These are the overlapping regions between the guest's unslid shared cache
+    /// and the host's ASLR-slid shared cache.  The host's shared region only
+    /// serves pages for its own slide, so some addresses within these ranges
+    /// have no physical backing and cause SIGBUS when accessed.  When a SIGBUS
+    /// occurs at an address within one of these ranges, the exception handler
+    /// maps a page filled with correct file data and resumes execution.
+    demand_page_ranges: litebox::sync::RwLock<Platform, Vec<(u64, u64)>>,
+    /// File-backed sources for demand-paging.
+    ///
+    /// Sorted by `vm_start`.  When a SIGBUS fault address falls within a
+    /// source's `[vm_start, vm_end)`, the handler reads the correct page data
+    /// from the subcache file at the computed offset.
+    demand_page_sources: litebox::sync::RwLock<Platform, Vec<DemandPageSource>>,
     /// Optional sysroot prefix for path rewriting in sys_open.
     #[expect(
         dead_code,

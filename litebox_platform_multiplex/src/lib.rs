@@ -71,3 +71,26 @@ pub fn platform() -> &'static Platform {
         .get()
         .expect("set_platform should have already been called before this point")
 }
+
+/// Reset the global platform to uninitialized state.
+///
+/// This is intended **only** for use in a `fork()`ed child process that needs
+/// to create a fresh platform with new Hypervisor framework state.  The old
+/// platform object is deliberately leaked (the child will call `_exit()` to
+/// skip destructors).
+///
+/// # Safety
+///
+/// - Must only be called from a single-threaded context (e.g. immediately
+///   after `fork()` in the child, before spawning any threads).
+/// - The caller must not use the old platform reference after this call.
+/// - The caller must call [`set_platform`] again before using [`platform`].
+pub unsafe fn reset_platform() {
+    // OnceRef stores an AtomicPtr internally.  We cast through a raw pointer
+    // to reset it to null, allowing set_platform to succeed again.
+    let ptr: *const once_cell::race::OnceRef<'static, Platform> = &raw const PLATFORM;
+    let atomic_ptr = ptr.cast::<core::sync::atomic::AtomicPtr<Platform>>();
+    unsafe {
+        (*atomic_ptr).store(core::ptr::null_mut(), core::sync::atomic::Ordering::Release);
+    }
+}

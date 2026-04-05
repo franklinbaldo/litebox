@@ -16,9 +16,14 @@ impl<FS: ShimFS> Task<FS> {
         self.terminated.store(true, Ordering::Release);
     }
 
-    /// Handle `getpid()` — return a fixed PID (single-process phase 1).
+    /// Handle `getpid()` — return a fixed PID.
+    ///
+    /// We use PID 42 instead of PID 1 because macOS dyld treats PID 1
+    /// as the init process (launchd) and triggers the libignition boot
+    /// sequence, which fails in the emulated environment and causes dyld
+    /// to fall into a simulator fallback code path.
     pub(crate) fn sys_getpid(&self) -> i32 {
-        1
+        42
     }
 
     /// Handle `getuid()`.

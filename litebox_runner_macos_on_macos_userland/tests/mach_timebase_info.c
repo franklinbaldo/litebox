@@ -10,11 +10,13 @@ int main(void) {
     kern_return_t kr = mach_timebase_info(&info);
     if (kr != 0) return 1;
 
-    // Test 2: on Apple Silicon, numer should be 1
-    if (info.numer != 1) return 2;
+    // Test 2: numer should be non-zero
+    // (the actual value is hardware-dependent; on some Apple Silicon it's 1,
+    //  on others it's 125)
+    if (info.numer == 0) return 2;
 
-    // Test 3: on Apple Silicon, denom should be 1
-    if (info.denom != 1) return 3;
+    // Test 3: denom should be non-zero
+    if (info.denom == 0) return 3;
 
     return 0;
 }

@@ -14,12 +14,12 @@ use alloc::ffi::CString;
 use alloc::vec::Vec;
 use litebox::mm::linux::{CreatePagesFlags, PAGE_SIZE};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, SystemInfoProvider as _};
-use object::Endianness;
 use object::macho;
 use object::read::macho::MachHeader;
+use object::Endianness;
 
 use super::stack::UserStack;
-use super::{DEFAULT_LOW_ADDR, DEFAULT_STACK_SIZE, DyldLoadInfo, MachoLoadInfo, MachoLoaderError};
+use super::{DyldLoadInfo, MachoLoadInfo, MachoLoaderError, DEFAULT_LOW_ADDR, DEFAULT_STACK_SIZE};
 use crate::{MutPtr, ShimFS, Task};
 
 /// Byte offset of the PC register within an LC_UNIXTHREAD ARM64 thread state command.
@@ -45,6 +45,13 @@ pub(crate) fn load<FS: ShimFS>(
     envp: Vec<CString>,
     dyld_bytes: Option<&[u8]>,
 ) -> Result<MachoLoadInfo, MachoLoaderError> {
+    // If this is a fat/universal binary, extract the arm64(e) slice first.
+    let data = if let Some((offset, size)) = extract_arm64_slice(data) {
+        &data[offset..offset + size]
+    } else {
+        data
+    };
+
     // Parse header
     let header = macho::MachHeader64::<Endianness>::parse(data, 0)
         .map_err(|e| MachoLoaderError::ParseError(alloc::format!("invalid header: {e}")))?;
@@ -297,9 +304,9 @@ pub(crate) fn load<FS: ShimFS>(
     const TLS_TABLE_TOTAL_ENTRIES: usize = TLS_TABLE_USABLE_ENTRIES + TLS_TABLE_OVERFLOW_ENTRIES;
     #[allow(clippy::items_after_statements)]
     const TLS_TABLE_SIZE: usize = TLS_TABLE_TOTAL_ENTRIES * TLS_ENTRY_SIZE; // 4224 bytes
-    // On macOS aarch64, the host page size is 16KB. Align the TLS table
-    // to 16KB to ensure it gets its own host page and doesn't share a
-    // page with any trampoline (which may be mprotected to R-X).
+                                                                            // On macOS aarch64, the host page size is 16KB. Align the TLS table
+                                                                            // to 16KB to ensure it gets its own host page and doesn't share a
+                                                                            // page with any trampoline (which may be mprotected to R-X).
     #[allow(clippy::items_after_statements)]
     const HOST_PAGE_SIZE: usize = 16384;
 
@@ -547,8 +554,52 @@ fn load_dyld<FS: ShimFS>(
     };
 
     // Rewrite SVC #0x80 instructions in dyld
-    let rewritten = litebox_syscall_rewriter_macho::hook_syscalls_in_macho(slice_data)
+    let mut rewritten = litebox_syscall_rewriter_macho::hook_syscalls_in_macho(slice_data)
         .map_err(|e| MachoLoaderError::ParseError(alloc::format!("dyld rewrite failed: {e}")))?;
+
+    // Patch out `restartWithDyldInCache` call.
+    //
+    // On macOS-on-macOS the shared cache's copy of dyld already has host-
+    // dirty state (e.g. `sMemoryManagerInitialized = 1` in TPRO pages that
+    // are hardware write-protected and cannot be reset).  If the loaded dyld
+    // calls `restartWithDyldInCache`, it jumps into the shared cache's dyld
+    // `start` which calls `MemoryManager::init` again and hits the assertion
+    // `!sMemoryManagerInitialized`.
+    //
+    // We prevent this by scanning for the `bl restartWithDyldInCache`
+    // instruction (`restartWithDyldInCache` has the signature
+    //   mov sp, x0       (0x9100001F)
+    //   br  x3           (0xD61F0060)
+    // ) and NOPing the BL that targets it.
+    patch_restart_with_dyld_in_cache(&mut rewritten);
+
+    // Patch out library initializer execution.
+    //
+    // On macOS-on-macOS the host process has already fully initialised
+    // libSystem, pthread, malloc, etc. via the shared cache.  When the
+    // guest dyld reaches `runAllInitializersForMain()`, it calls
+    // `PrebuiltLoader::runInitializers()` for every library — including
+    // libSystem.  `libSystem_initializer` calls `__pthread_init` which
+    // detects re-initialisation and executes `brk #0xB001`, which the
+    // kernel translates to an uncatchable SIGKILL.
+    //
+    // We fix this by NOPing the `bl findAndRunAllInitializers` inside
+    // `PrebuiltLoader::runInitializers`.  The rest of that function still
+    // runs (marking each loader as "initialised" in dyld's state tables),
+    // so dyld's bookkeeping stays consistent — but no actual initialiser
+    // code executes.
+    patch_skip_initializers(&mut rewritten);
+
+    // Layer 6: Redirect the non-simulator exit path in dyld's `start()`.
+    //
+    // After `main()` returns, dyld calls `LibSystemHelpersWrapper::exit()`
+    // which goes through the shared cache's `exit()` → real `SVC #0x80` →
+    // terminates the HOST process.  We redirect that `BL` to call the
+    // loaded dyld's own `___exit` stub instead.  That stub (`mov x16, #1;
+    // svc #0x80`) was already rewritten by the SVC patcher, so the exit
+    // goes through the shim and is handled correctly.
+    patch_exit_to_host(&mut rewritten);
+
     let data: &[u8] = &rewritten;
 
     // Parse dyld Mach-O header
@@ -797,4 +848,234 @@ fn prot_from_macho(prot: u32) -> litebox_common_linux::ProtFlags {
         flags |= litebox_common_linux::ProtFlags::PROT_EXEC;
     }
     flags
+}
+
+/// ARM64 NOP instruction encoding.
+const ARM64_NOP: u32 = 0xD503_201F;
+
+/// Patch `restartWithDyldInCache` to return immediately instead of jumping to
+/// the shared-cache copy of dyld.
+///
+/// `restartWithDyldInCache` is a two-instruction function:
+///     mov sp, x0    (0x9100_001F)   — overwrite stack pointer
+///     br  x3        (0xD61F_0060)   — jump to shared-cache dyld
+///
+/// We replace these with:
+///     ret           (0xD65F_03C0)   — return to caller
+///     nop           (0xD503_201F)   — padding
+///
+/// This lets the code *after* `bl restartWithDyldInCache` in dyld's `start()`
+/// execute normally.  That code was previously unreachable ("dead code") because
+/// `restartWithDyldInCache` never returned — it jumped to the shared-cache dyld.
+/// But it contains essential initialisation (e.g. `SharedCacheLoader` setup)
+/// that downstream code depends on.
+///
+/// On macOS-on-macOS the shared cache's dyld has stale TPRO state that cannot
+/// be reset (hardware write-protected).  If the loaded dyld restarts into the
+/// cached copy, `MemoryManager::init` hits `assert(!sMemoryManagerInitialized)`.
+/// Making the function return prevents the restart and keeps execution in the
+/// loaded dyld's pristine (disk-loaded) code.
+///
+/// The previously-dead code may call `shared_region_check_np` with an invalid
+/// address and toggle TPRO protection on shared cache pages; both of those are
+/// handled by guards in `sys_shared_region_check_np` (rejects invalid addresses)
+/// and `sys_mach_vm_protect` (skips shared cache pages).
+fn patch_restart_with_dyld_in_cache(data: &mut [u8]) {
+    const MOV_SP_X0: u32 = 0x9100_001F; // mov sp, x0
+    const BR_X3: u32 = 0xD61F_0060; // br  x3
+    const ARM64_RET: u32 = 0xD65F_03C0; // ret
+
+    // Scan for the two-instruction signature.
+    let mut i = 0;
+    while i + 8 <= data.len() {
+        let w0 = u32::from_le_bytes(data[i..i + 4].try_into().unwrap());
+        let w1 = u32::from_le_bytes(data[i + 4..i + 8].try_into().unwrap());
+        if w0 == MOV_SP_X0 && w1 == BR_X3 {
+            log_unsupported!(
+                "patch_restart_with_dyld_in_cache: found at offset {:#x}, replacing with RET+NOP",
+                i,
+            );
+            data[i..i + 4].copy_from_slice(&ARM64_RET.to_le_bytes());
+            data[i + 4..i + 8].copy_from_slice(&ARM64_NOP.to_le_bytes());
+            return;
+        }
+        i += 4;
+    }
+
+    log_unsupported!("patch_restart_with_dyld_in_cache: signature not found, skipping");
+}
+
+/// Patch `PrebuiltLoader::runInitializers` to skip the call to
+/// `findAndRunAllInitializers`, preventing shared-cache library
+/// initialisers from running on macOS-on-macOS.
+///
+/// `PrebuiltLoader::runInitializers` has this prologue:
+///
+/// ```text
+///     pacibsp                      (0xD503_237F)
+///     stp  x20, x19, [sp, #-0x20]! (0xA9BE_4FF4)
+///     stp  x29, x30, [sp, #0x10]  (0xA901_7BFD)
+///     add  x29, sp, #0x10         (0x9100_43FD)
+///     mov  x19, x1                (0xAA01_03F3)
+///     mov  x20, x0                (0xAA00_03F4)
+///     ldrh w8, [x0, #0x2c]        (0x7940_5808)
+///     tbz  w8, #0, +0xC           (0x3600_0088)
+///     mov  x0, x20                (0xAA14_03E0)
+///     mov  x1, x19                (0xAA13_03E1)
+///     bl   findAndRunAllInitializers  ← NOP this
+/// ```
+///
+/// We scan for the unique five-instruction signature:
+///     ldrh w8, [x0, #0x2c]  /  tbz w8, #0, +0xC  /
+///     mov x0, x20  /  mov x1, x19  /  bl ...
+/// and NOP the BL.
+///
+/// After this patch `runInitializers` still marks each loader as
+/// "initialised" (state byte = 9 at offset `[loader_array + idx]`), so
+/// dyld's bookkeeping remains consistent.  No actual initialiser code
+/// runs — which is correct on macOS-on-macOS because the host already
+/// ran all shared-cache initialisers.
+fn patch_skip_initializers(data: &mut [u8]) {
+    // Five-instruction signature preceding the BL.
+    const LDRH_W8_X0_0X2C: u32 = 0x7940_5808;
+    const TBZ_W8_0_PLUS_0XC: u32 = 0x3600_0088;
+    const MOV_X0_X20: u32 = 0xAA14_03E0;
+    const MOV_X1_X19: u32 = 0xAA13_03E1;
+
+    let mut i = 0;
+    while i + 20 <= data.len() {
+        let w0 = u32::from_le_bytes(data[i..i + 4].try_into().unwrap());
+        let w1 = u32::from_le_bytes(data[i + 4..i + 8].try_into().unwrap());
+        let w2 = u32::from_le_bytes(data[i + 8..i + 12].try_into().unwrap());
+        let w3 = u32::from_le_bytes(data[i + 12..i + 16].try_into().unwrap());
+        let w4 = u32::from_le_bytes(data[i + 16..i + 20].try_into().unwrap());
+
+        if w0 == LDRH_W8_X0_0X2C
+            && w1 == TBZ_W8_0_PLUS_0XC
+            && w2 == MOV_X0_X20
+            && w3 == MOV_X1_X19
+            && (w4 >> 26) == 0b100101
+        // BL opcode (bit 31 distinguishes BL from B)
+        {
+            let bl_offset = i + 16;
+            log_unsupported!(
+                "patch_skip_initializers: found BL to findAndRunAllInitializers at offset {:#x}, \
+                 replacing with NOP",
+                bl_offset,
+            );
+            data[bl_offset..bl_offset + 4].copy_from_slice(&ARM64_NOP.to_le_bytes());
+            return;
+        }
+        i += 4;
+    }
+
+    log_unsupported!("patch_skip_initializers: signature not found, skipping");
+}
+
+/// Redirect `dyld4::start()`'s call to `LibSystemHelpersWrapper::exit()` so
+/// that it calls the loaded dyld's own `___exit` instead.
+///
+/// After `main()` returns, dyld calls `exit()`.  On non-simulator platforms
+/// it dispatches through `LibSystemHelpersWrapper::exit()`, which calls the
+/// shared cache's `exit()` implementation via a vtable.  That function
+/// executes a real `SVC #0x80` (not intercepted) that terminates the *host*
+/// process rather than the guest.
+///
+/// The loaded dyld already contains its own `___exit` stub
+/// (`mov x16, #0x1; svc #0x80`) whose SVC *is* rewritten by the SVC
+/// patcher — so calling it goes through the shim correctly.
+///
+/// The two calls sit next to each other in `dyld4::start()`:
+///
+/// ```text
+///     cbz  w0, +0xC              (0x3400_0060)
+///     mov  x0, x19               (0xAA13_03E0)     ← simulator path
+///     bl   ___exit               (BL_A)
+///     ldr  x8, [sp, #0x1d0]     (0xF940_EBE8)     ← non-simulator path
+///     add  x0, x8, #0xa0        (0x9102_8100)
+///     mov  x1, x19              (0xAA13_03E1)
+///     bl   LibSystemHelpersWrapper::exit  (BL_B)
+/// ```
+///
+/// `LibSystemHelpersWrapper::exit` takes `(self, exitCode)` — exit code in
+/// `x1`.  But `___exit` takes exit code in `x0`.  So we rewrite the
+/// non-simulator path to:
+///
+/// ```text
+///     mov  x0, x19              ← put exit code in x0
+///     NOP
+///     NOP
+///     bl   ___exit              ← adjusted BL
+/// ```
+fn patch_exit_to_host(data: &mut [u8]) {
+    const CBZ_W0_PLUS_0XC: u32 = 0x3400_0060;
+    const MOV_X0_X19: u32 = 0xAA13_03E0;
+    const LDR_X8_SP_0X1D0: u32 = 0xF940_EBE8;
+    const ADD_X0_X8_0XA0: u32 = 0x9102_8100;
+    const MOV_X1_X19: u32 = 0xAA13_03E1;
+
+    let mut i = 0;
+    while i + 28 <= data.len() {
+        let w0 = u32::from_le_bytes(data[i..i + 4].try_into().unwrap());
+        let w1 = u32::from_le_bytes(data[i + 4..i + 8].try_into().unwrap());
+        let w2 = u32::from_le_bytes(data[i + 8..i + 12].try_into().unwrap()); // BL_A
+        let w3 = u32::from_le_bytes(data[i + 12..i + 16].try_into().unwrap());
+        let w4 = u32::from_le_bytes(data[i + 16..i + 20].try_into().unwrap());
+        let w5 = u32::from_le_bytes(data[i + 20..i + 24].try_into().unwrap());
+        let w6 = u32::from_le_bytes(data[i + 24..i + 28].try_into().unwrap()); // BL_B
+
+        if w0 == CBZ_W0_PLUS_0XC
+            && w1 == MOV_X0_X19
+            && (w2 >> 26) == 0b100101 // BL_A
+            && w3 == LDR_X8_SP_0X1D0
+            && w4 == ADD_X0_X8_0XA0
+            && w5 == MOV_X1_X19
+            && (w6 >> 26) == 0b100101
+        // BL_B
+        {
+            // Extract BL_A's signed imm26.
+            let bl_a_imm26 = {
+                let raw = (w2 & 0x03FF_FFFF).cast_signed();
+                if raw & (1 << 25) != 0 {
+                    raw | (!0x03FF_FFFF_u32).cast_signed()
+                } else {
+                    raw
+                }
+            };
+            // BL_A is at file offset (i+8), targeting ___exit at some offset.
+            // BL_B is at file offset (i+24).
+            // The ___exit offset = (i+8) + bl_a_imm26 * 4.
+            // New imm26 for BL_B = (___exit_offset - (i+24)) / 4
+            //                    = bl_a_imm26 + (i+8)/4 - (i+24)/4
+            //                    = bl_a_imm26 - 4
+            let new_imm26 = bl_a_imm26 - 4;
+            let new_bl = (0b100101_u32 << 26) | (new_imm26.cast_unsigned() & 0x03FF_FFFF);
+
+            // Rewrite the non-simulator path: put exit code (x19) into x0,
+            // NOP the two now-unnecessary instructions, and redirect BL.
+            //
+            //   w3 (ldr x8, ...) → mov x0, x19
+            //   w4 (add x0, ...) → NOP
+            //   w5 (mov x1, ...) → NOP
+            //   w6 (bl wrapper)  → bl ___exit (adjusted)
+            let w3_offset = i + 12;
+            data[w3_offset..w3_offset + 4].copy_from_slice(&MOV_X0_X19.to_le_bytes());
+            data[w3_offset + 4..w3_offset + 8].copy_from_slice(&ARM64_NOP.to_le_bytes());
+            data[w3_offset + 8..w3_offset + 12].copy_from_slice(&ARM64_NOP.to_le_bytes());
+
+            let bl_b_offset = i + 24;
+            log_unsupported!(
+                "patch_exit_to_host: redirecting BL at offset {:#x} to ___exit \
+                 (was {:#010x}, now {:#010x})",
+                bl_b_offset,
+                w6,
+                new_bl,
+            );
+            data[bl_b_offset..bl_b_offset + 4].copy_from_slice(&new_bl.to_le_bytes());
+            return;
+        }
+        i += 4;
+    }
+
+    log_unsupported!("patch_exit_to_host: signature not found, skipping");
 }

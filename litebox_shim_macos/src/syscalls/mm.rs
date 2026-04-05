@@ -8,8 +8,8 @@
 
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, SystemInfoProvider as _};
 use litebox_common_linux::{MapFlags, ProtFlags};
-use litebox_common_macos::PtRegs;
 use litebox_common_macos::errno::Errno;
+use litebox_common_macos::PtRegs;
 
 use crate::{ConstPtr, MutPtr, ShimFS, Task};
 
@@ -382,6 +382,25 @@ impl<FS: ShimFS> Task<FS> {
         log_unsupported!(
             "mach_vm_protect(addr={addr:#x}, size={size:#x}→{aligned_size:#x}, prot={new_prot})"
         );
+
+        // Skip mprotect on shared cache pages.  On macOS-on-macOS the host's
+        // shared cache occupies the same address range and any VM API call on
+        // those pages causes a kernel deadlock.  The guest's TPRO toggles and
+        // other protection changes on shared cache pages are harmless no-ops
+        // since we let shared cache code execute natively.
+        let cache_base = self
+            .global
+            .shared_cache_base
+            .load(core::sync::atomic::Ordering::Acquire) as usize;
+        let cache_end = self
+            .global
+            .shared_cache_end
+            .load(core::sync::atomic::Ordering::Acquire) as usize;
+        if cache_base != 0 && addr >= cache_base && addr < cache_end {
+            log_unsupported!("mach_vm_protect: skipping (shared cache page)");
+            return Ok(0);
+        }
+
         let result = self.sys_mprotect(addr, aligned_size, new_prot);
         if let Err(ref e) = result {
             log_unsupported!("mach_vm_protect FAILED: {e:?}");
