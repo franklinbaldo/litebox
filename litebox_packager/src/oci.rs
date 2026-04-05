@@ -386,7 +386,9 @@ fn extract_tar<R: Read>(
 
     for entry_result in archive.entries()? {
         let mut entry = entry_result.context("failed to read tar entry")?;
-        let path = entry.path()?.into_owned();
+        // Normalize the path to prevent path traversal (../ and absolute paths)
+        // and to strip inconsistent ./ prefixes that tar entries may carry.
+        let path = normalize_path(&entry.path()?);
         let path_str = path.to_string_lossy();
 
         // Handle OCI whiteout files
@@ -409,9 +411,17 @@ fn extract_tar<R: Read>(
                     }
                     // Also prune in-memory symlinks under this directory so
                     // they are not resurrected by materialize_symlinks.
-                    symlinks.retain(|s| !s.rel_path.starts_with(parent));
-                    // Prune permissions for files under the cleared directory.
-                    permissions.retain(|p, _| !p.starts_with(parent));
+                    // Guard: Path::starts_with("") matches everything, so skip
+                    // pruning when parent is empty (root-level opaque whiteout
+                    // already cleared the filesystem above).
+                    if parent.as_os_str().is_empty() {
+                        symlinks.clear();
+                        permissions.clear();
+                    } else {
+                        symlinks.retain(|s| !s.rel_path.starts_with(parent));
+                        // Prune permissions for files under the cleared directory.
+                        permissions.retain(|p, _| !p.starts_with(parent));
+                    }
                 }
                 continue;
             }
@@ -452,10 +462,11 @@ fn extract_tar<R: Read>(
         // can fail if the target hasn't been extracted yet (ordering issue),
         // and the litebox filesystem doesn't support hard links anyway.
         if entry_type == tar::EntryType::Link {
-            let link_name = entry
-                .link_name()?
-                .context("hard link entry has no link name")?
-                .into_owned();
+            let link_name = normalize_path(
+                &entry
+                    .link_name()?
+                    .context("hard link entry has no link name")?,
+            );
             let link_source = rootfs.join(&link_name);
             if link_source.exists() {
                 std::fs::copy(&link_source, &target).with_context(|| {

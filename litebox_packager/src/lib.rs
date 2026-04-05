@@ -94,7 +94,18 @@ struct IncludeEntry {
 }
 
 fn parse_include(spec: &str) -> anyhow::Result<IncludeEntry> {
-    let Some(colon_idx) = spec.find(':') else {
+    // On Windows, skip past a drive letter prefix (e.g., `C:`) when searching
+    // for the HOST_PATH:TAR_PATH separator.
+    let search_start = if cfg!(windows)
+        && spec.len() >= 2
+        && spec.as_bytes()[0].is_ascii_alphabetic()
+        && spec.as_bytes()[1] == b':'
+    {
+        2
+    } else {
+        0
+    };
+    let Some(colon_idx) = spec[search_start..].find(':').map(|i| i + search_start) else {
         bail!("invalid --include format: expected HOST_PATH:TAR_PATH, got: {spec}");
     };
     let host_path = PathBuf::from(&spec[..colon_idx]);
