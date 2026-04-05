@@ -9,7 +9,7 @@
 //! IP networking, guest memory pointers).
 
 use core::ops::RangeBounds;
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::time::Duration;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::RwLock;
@@ -60,6 +60,12 @@ pub struct CentralPlatform {
     /// TUN queue file descriptors. Queue 0 is created at startup;
     /// additional queues are created via `open_new_queue()` on fork.
     tun_queues: RwLock<Vec<OwnedFd>>,
+    /// When `true`, page management operations (`allocate_pages`,
+    /// `deallocate_pages`, `update_permissions`) skip real syscalls and
+    /// return success immediately. Used to let the shim's `PageManager`
+    /// track VMA metadata without creating real pages in central's address
+    /// space ("phantom pages").
+    phantom_mode: AtomicBool,
 }
 
 impl CentralPlatform {
@@ -171,6 +177,7 @@ impl CentralPlatform {
             } else {
                 vec![]
             }),
+            phantom_mode: AtomicBool::new(false),
         }
     }
 
@@ -852,6 +859,10 @@ impl litebox::platform::PageManagementProvider<4096> for CentralPlatform {
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
         use litebox::platform::page_mgmt::{AllocationError, FixedAddressBehavior};
 
+        if self.phantom_mode.load(Ordering::Acquire) {
+            return Ok(GuestMutPtr::from_usize(suggested_range.start));
+        }
+
         let mut flags: libc::c_int = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
         match fixed_address_behavior {
             FixedAddressBehavior::Hint => {}
@@ -895,6 +906,10 @@ impl litebox::platform::PageManagementProvider<4096> for CentralPlatform {
         &self,
         range: core::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
+        if self.phantom_mode.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
         // SAFETY: Caller guarantees the pages are not in active use.
         let ret = unsafe { libc::munmap(range.start as *mut libc::c_void, range.len()) };
         if ret != 0 {
@@ -908,6 +923,10 @@ impl litebox::platform::PageManagementProvider<4096> for CentralPlatform {
         range: core::ops::Range<usize>,
         new_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
     ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
+        if self.phantom_mode.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
         let prot = prot_flags(new_permissions);
         // SAFETY: Caller guarantees the permissions don't conflict with active usage.
         let ret = unsafe { libc::mprotect(range.start as *mut libc::c_void, range.len(), prot) };
@@ -919,6 +938,26 @@ impl litebox::platform::PageManagementProvider<4096> for CentralPlatform {
 
     fn reserved_pages(&self) -> impl Iterator<Item = &core::ops::Range<usize>> {
         core::iter::empty()
+    }
+}
+
+/// RAII guard that enables phantom mode on a `CentralPlatform` for its
+/// lifetime. When dropped, phantom mode is disabled.
+pub struct PhantomModeGuard<'a> {
+    platform: &'a CentralPlatform,
+}
+
+impl<'a> PhantomModeGuard<'a> {
+    /// Enable phantom mode on `platform` for the duration of this guard.
+    pub fn new(platform: &'a CentralPlatform) -> Self {
+        platform.phantom_mode.store(true, Ordering::Release);
+        Self { platform }
+    }
+}
+
+impl Drop for PhantomModeGuard<'_> {
+    fn drop(&mut self) {
+        self.platform.phantom_mode.store(false, Ordering::Release);
     }
 }
 
