@@ -9,6 +9,8 @@ pub(crate) mod process;
 pub(crate) mod signal;
 pub(crate) mod stubs;
 
+pub(crate) mod net;
+
 use litebox_common_macos::{PtRegs, errno::Errno, syscall::MacosSyscallRequest};
 
 use crate::{ShimFS, Task};
@@ -202,6 +204,66 @@ impl<FS: ShimFS> Task<FS> {
                 tv_sec,
                 tv_nsec,
             } => self.sys_semwait_signal(cond_sem, mutex_sem, timeout, relative, tv_sec, tv_nsec),
+            MacosSyscallRequest::Socket {
+                domain,
+                sock_type,
+                protocol,
+            } => self.sys_socket(domain, sock_type, protocol),
+            MacosSyscallRequest::Bind { fd, addr, addrlen } => {
+                self.sys_bind(fd, addr, addrlen).map(|()| 0)
+            }
+            MacosSyscallRequest::Listen { fd, backlog } => {
+                self.sys_listen(fd, backlog).map(|()| 0)
+            }
+            MacosSyscallRequest::Accept { fd, addr, addrlen } => self.sys_accept(fd, addr, addrlen),
+            MacosSyscallRequest::Connect { fd, addr, addrlen } => {
+                self.sys_connect(fd, addr, addrlen).map(|()| 0)
+            }
+            MacosSyscallRequest::Sendto {
+                fd,
+                buf,
+                len,
+                flags,
+                dest_addr,
+                addrlen,
+            } => self.sys_sendto(fd, buf, len, flags, dest_addr, addrlen),
+            MacosSyscallRequest::Recvfrom {
+                fd,
+                buf,
+                len,
+                flags,
+                src_addr,
+                addrlen,
+            } => self.sys_recvfrom(fd, buf, len, flags, src_addr, addrlen),
+            MacosSyscallRequest::Sendmsg { fd, msg, flags } => self.sys_sendmsg(fd, msg, flags),
+            MacosSyscallRequest::Recvmsg { fd, msg, flags } => self.sys_recvmsg(fd, msg, flags),
+            MacosSyscallRequest::Shutdown { fd, how } => self.sys_shutdown(fd, how).map(|()| 0),
+            MacosSyscallRequest::Socketpair {
+                domain,
+                sock_type,
+                protocol,
+                sv,
+            } => self.sys_socketpair(domain, sock_type, protocol, sv).map(|()| 0),
+            MacosSyscallRequest::Setsockopt {
+                fd,
+                level,
+                optname,
+                optval,
+                optlen,
+            } => self.sys_setsockopt(fd, level, optname, optval, optlen).map(|()| 0),
+            MacosSyscallRequest::Getsockopt {
+                fd,
+                level,
+                optname,
+                optval,
+                optlen,
+            } => self.sys_getsockopt(fd, level, optname, optval, optlen).map(|()| 0),
+            MacosSyscallRequest::Getsockname { fd, addr, addrlen } => {
+                self.sys_getsockname(fd, addr, addrlen).map(|()| 0)
+            }
+            MacosSyscallRequest::Getpeername { fd, addr, addrlen } => {
+                self.sys_getpeername(fd, addr, addrlen).map(|()| 0)
+            }
         }
     }
 }
