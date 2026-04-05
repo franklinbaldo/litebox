@@ -11,6 +11,7 @@ pub(crate) mod stubs;
 
 pub(crate) mod kqueue;
 pub(crate) mod net;
+mod poll;
 pub(crate) mod unix;
 
 use litebox_common_macos::{PtRegs, errno::Errno, syscall::MacosSyscallRequest};
@@ -270,14 +271,18 @@ impl<FS: ShimFS> Task<FS> {
             MacosSyscallRequest::Getpeername { fd, addr, addrlen } => {
                 self.sys_getpeername(fd, addr, addrlen).map(|()| 0)
             }
-            MacosSyscallRequest::Select { .. } => {
-                log_unsupported!("select() not yet implemented");
-                Err(Errno::ENOSYS)
-            }
-            MacosSyscallRequest::Poll { .. } => {
-                log_unsupported!("poll() not yet implemented");
-                Err(Errno::ENOSYS)
-            }
+            MacosSyscallRequest::Select {
+                nfds,
+                readfds,
+                writefds,
+                errorfds,
+                timeout,
+            } => self.sys_select(nfds, readfds, writefds, errorfds, timeout),
+            MacosSyscallRequest::Poll {
+                fds,
+                nfds,
+                timeout,
+            } => self.sys_poll(fds, nfds, timeout),
             MacosSyscallRequest::Kqueue => {
                 log_unsupported!("kqueue() not yet implemented");
                 Err(Errno::ENOSYS)
