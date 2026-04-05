@@ -56,6 +56,8 @@ impl CentralProcess {
         tar_fd: Option<i32>,
         tar_size: Option<usize>,
         tun_device: Option<&str>,
+        aligned_fd: Option<i32>,
+        aligned_size: Option<usize>,
     ) -> anyhow::Result<Self> {
         // SAFETY: We call `fork()` which is safe here because the launcher is
         // single-threaded at the point of spawning. The child either execs
@@ -113,6 +115,13 @@ impl CentralProcess {
                     c_args.push(CString::new(format!("--tar-size={tsz}")).unwrap());
                 }
 
+                if let Some(afd) = aligned_fd {
+                    c_args.push(CString::new(format!("--aligned-fd={afd}")).unwrap());
+                }
+                if let Some(asz) = aligned_size {
+                    c_args.push(CString::new(format!("--aligned-size={asz}")).unwrap());
+                }
+
                 if let Some(name) = tun_device {
                     c_args.push(CString::new(format!("--tun-device={name}")).unwrap());
                 }
@@ -152,7 +161,7 @@ mod tests {
 
     #[test]
     fn spawn_and_wait() {
-        let proc = CentralProcess::spawn(0, 0, None, None, None).expect("spawn should succeed");
+        let proc = CentralProcess::spawn(0, 0, None, None, None, None, None).expect("spawn should succeed");
         assert!(proc.pid() > 0);
         let mut status: i32 = 0;
         // SAFETY: `proc.pid()` is a valid child PID returned by `fork()`.

@@ -91,6 +91,13 @@ pub struct MicroState {
     pub tar_base: *const u8,
     /// Size of the tar shmem region in bytes.
     pub tar_size: usize,
+    /// File descriptor for the aligned data memfd (for mmap during exec).
+    /// -1 if no aligned data available.
+    pub aligned_fd: i32,
+    /// Base pointer of the aligned data memfd mapping (null if none).
+    pub aligned_base: *const u8,
+    /// Size of the aligned data memfd in bytes.
+    pub aligned_size: usize,
 }
 
 unsafe impl Send for MicroState {}
@@ -114,6 +121,9 @@ static mut MICRO_STATE: MicroState = MicroState {
     file_fds: [None; MAX_FILE_SLOTS],
     tar_base: core::ptr::null(),
     tar_size: 0,
+    aligned_fd: -1,
+    aligned_base: core::ptr::null(),
+    aligned_size: 0,
 };
 
 /// Initialize the global micro-LiteBox state.
@@ -122,6 +132,7 @@ static mut MICRO_STATE: MicroState = MicroState {
 ///
 /// Must be called exactly once, before any guest code runs and before any
 /// threads are spawned.
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn micro_init(
     ring_fd: i32,
     ring_base: *mut u8,
@@ -132,6 +143,9 @@ pub unsafe fn micro_init(
     syscall_entry_point: usize,
     tar_base: *const u8,
     tar_size: usize,
+    aligned_fd: i32,
+    aligned_base: *const u8,
+    aligned_size: usize,
 ) {
     unsafe {
         MICRO_STATE.ring_base = ring_base;
@@ -143,6 +157,9 @@ pub unsafe fn micro_init(
         MICRO_STATE.syscall_entry_point = syscall_entry_point;
         MICRO_STATE.tar_base = tar_base;
         MICRO_STATE.tar_size = tar_size;
+        MICRO_STATE.aligned_fd = aligned_fd;
+        MICRO_STATE.aligned_base = aligned_base;
+        MICRO_STATE.aligned_size = aligned_size;
         // Compute the layout from the ring_size. The data_region_size is the
         // remaining space after header + SQ + CQ entries.
         let base_layout = SharedRingLayout::new(0);
@@ -348,6 +365,9 @@ impl MicroState {
             file_fds: [None; MAX_FILE_SLOTS],
             tar_base: core::ptr::null(),
             tar_size: 0,
+            aligned_fd: -1,
+            aligned_base: core::ptr::null(),
+            aligned_size: 0,
         }
     }
 }

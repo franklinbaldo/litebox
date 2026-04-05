@@ -55,6 +55,16 @@ fn main() -> anyhow::Result<()> {
         .map(shmem::TarSharedRegion::from_file)
         .transpose()?;
 
+    // 1c. Create aligned data region from the tar (page-aligned file offsets
+    // for mmap-based ELF loading during exec).
+    let aligned_data = tar_shmem
+        .as_ref()
+        .map(|ts| {
+            let tar_bytes = unsafe { core::slice::from_raw_parts(ts.base_ptr(), ts.size()) };
+            shmem::AlignedDataRegion::from_tar_bytes(tar_bytes)
+        })
+        .transpose()?;
+
     // 2. Load the guest ELF binary (need brk for central initialization).
     let syscall_entry = litebox_micro::get_syscall_entry_point();
     // Pass the host environment through to the guest.  Benchmarks such as
@@ -82,6 +92,8 @@ fn main() -> anyhow::Result<()> {
         tar_shmem.as_ref().map(shmem::TarSharedRegion::fd_raw),
         tar_shmem.as_ref().map(shmem::TarSharedRegion::size),
         tun_device.as_deref(),
+        aligned_data.as_ref().map(shmem::AlignedDataRegion::fd_raw),
+        aligned_data.as_ref().map(shmem::AlignedDataRegion::size),
     )?;
 
     // Give central time to initialize (platform, shim, server loop).
@@ -102,6 +114,11 @@ fn main() -> anyhow::Result<()> {
             syscall_entry,                 // syscall_entry_point
             tar_shmem.as_ref().map_or(core::ptr::null(), shmem::TarSharedRegion::base_ptr),
             tar_shmem.as_ref().map_or(0, shmem::TarSharedRegion::size),
+            aligned_data.as_ref().map_or(-1, shmem::AlignedDataRegion::fd_raw),
+            aligned_data
+                .as_ref()
+                .map_or(core::ptr::null(), shmem::AlignedDataRegion::base_ptr),
+            aligned_data.as_ref().map_or(0, shmem::AlignedDataRegion::size),
         );
     }
 
