@@ -96,7 +96,9 @@ impl<FS: ShimFS> Task<FS> {
                 let mut kernel_buf = vec![0u8; read_len];
                 let size = socket.read(&mut kernel_buf)?;
                 let user_buf: MutPtr<u8> = MutPtr::from_usize(buf_addr);
-                user_buf.copy_from_slice(0, &kernel_buf[..size]).ok_or(Errno::EFAULT)?;
+                user_buf
+                    .copy_from_slice(0, &kernel_buf[..size])
+                    .ok_or(Errno::EFAULT)?;
                 return Ok(size);
             }
             return Err(Errno::EBADF);

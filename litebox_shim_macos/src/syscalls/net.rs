@@ -3,17 +3,21 @@
 
 //! AF_INET socket syscall handlers and shared socket types.
 
+// All `u64 as usize` (and vice versa) casts in this module are safe — this is a
+// 64-bit-only crate where usize == u64.  Similarly, small fixed-size struct
+// sizes (< 256 bytes) are safely truncated to u8/u32.
+#![allow(clippy::cast_possible_truncation)]
+
 use alloc::sync::Arc;
 use alloc::vec;
 use core::time::Duration;
 
-use litebox::fd::TypedFd;
 use litebox::net::errors::{
     AcceptError, BindError, CloseError, ConnectError, GetTcpOptionError, ListenError,
     LocalAddrError, ReceiveError, RemoteAddrError, SendError, SetTcpOptionError, SocketError,
 };
 use litebox::net::socket_channel::{
-    DatagramSocketChannel, NetworkProxy as NetworkProxyEnum, SocketState, StreamSocketChannel,
+    DatagramSocketChannel, NetworkProxy as NetworkProxyEnum, StreamSocketChannel,
 };
 use litebox::net::{
     CloseBehavior, Network, Protocol, ReceiveFlags, SendFlags, TcpOptionData, TcpOptionName,
@@ -162,6 +166,7 @@ impl SocketOptionName {
 // ---------------------------------------------------------------------------
 
 /// Per-socket option state, shared between inet and unix paths.
+#[expect(dead_code)]
 #[derive(Default)]
 pub(crate) struct SocketOptions {
     pub(crate) reuse_address: bool,
@@ -179,6 +184,7 @@ pub(crate) struct SocketOptions {
 /// macOS `sockaddr_in` (BSD 4.4 style with length prefix).
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
+#[allow(clippy::struct_field_names)]
 pub(crate) struct CSockInetAddr {
     pub(crate) sin_len: u8,
     pub(crate) sin_family: u8,
@@ -192,6 +198,8 @@ const UNIX_PATH_MAX: usize = 104;
 /// macOS `sockaddr_un` (BSD 4.4 style with length prefix).
 #[repr(C)]
 #[derive(Clone)]
+#[expect(dead_code)]
+#[allow(clippy::struct_field_names)]
 pub(crate) struct CSockUnixAddr {
     pub(crate) sun_len: u8,
     pub(crate) sun_family: u8,
@@ -249,7 +257,7 @@ pub(crate) fn read_sockaddr_from_user(addr_ptr: u64, addrlen: u32) -> Result<Soc
     let family_bytes = ptr.to_owned_slice(2).ok_or(Errno::EFAULT)?;
     let family = family_bytes[1]; // sin_family / sun_family
 
-    match family as u32 {
+    match u32::from(family) {
         AF_INET => {
             if (addrlen as usize) < core::mem::size_of::<CSockInetAddr>() {
                 return Err(Errno::EINVAL);
@@ -318,9 +326,8 @@ pub(crate) fn write_sockaddr_inet_to_user(
             sin_zero: [0; 8],
         };
 
-        let sa_bytes: &[u8] = unsafe {
-            core::slice::from_raw_parts((&sa as *const CSockInetAddr).cast::<u8>(), sa_size)
-        };
+        let sa_bytes: &[u8] =
+            unsafe { core::slice::from_raw_parts((&raw const sa).cast::<u8>(), sa_size) };
 
         let buf_mut: MutPtr<u8> = MutPtr::from_usize(buf_ptr as usize);
         buf_mut
@@ -329,8 +336,8 @@ pub(crate) fn write_sockaddr_inet_to_user(
     }
 
     // Write back the actual length.
-    let len_out: MutPtr<u32> = MutPtr::from_usize(len_ptr as usize);
-    len_out
+    let len_out_ptr: MutPtr<u32> = MutPtr::from_usize(len_ptr as usize);
+    len_out_ptr
         .copy_from_slice(0, &[sa_size as u32])
         .ok_or(Errno::EFAULT)?;
 
@@ -396,7 +403,6 @@ pub(crate) fn bind_error_to_errno(e: BindError) -> Errno {
         BindError::InvalidFd => Errno::EBADF,
         BindError::UnsupportedAddress(_) => Errno::EAFNOSUPPORT,
         BindError::PortAlreadyInUse(_) => Errno::EADDRINUSE,
-        BindError::AlreadyBound => Errno::EINVAL,
         _ => Errno::EINVAL,
     }
 }
@@ -404,8 +410,6 @@ pub(crate) fn bind_error_to_errno(e: BindError) -> Errno {
 pub(crate) fn listen_error_to_errno(e: ListenError) -> Errno {
     match e {
         ListenError::InvalidFd => Errno::EBADF,
-        ListenError::InvalidAddress => Errno::EINVAL,
-        ListenError::InvalidState => Errno::EINVAL,
         ListenError::NoAvailableFreeEphemeralPorts => Errno::EADDRINUSE,
         _ => Errno::EINVAL,
     }
@@ -414,7 +418,6 @@ pub(crate) fn listen_error_to_errno(e: ListenError) -> Errno {
 pub(crate) fn accept_error_to_errno(e: AcceptError) -> Errno {
     match e {
         AcceptError::InvalidFd => Errno::EBADF,
-        AcceptError::NotListening => Errno::EINVAL,
         AcceptError::NoConnectionsReady => Errno::EAGAIN,
         _ => Errno::EINVAL,
     }
@@ -436,7 +439,6 @@ pub(crate) fn send_error_to_errno(e: SendError) -> Errno {
     match e {
         SendError::InvalidFd => Errno::EBADF,
         SendError::SocketInInvalidState => Errno::EPIPE,
-        SendError::Unaddressable => Errno::EINVAL,
         SendError::BufferFull => Errno::EAGAIN,
         SendError::PortAllocationFailure(_) => Errno::EADDRINUSE,
         SendError::UnnecessaryDestinationAddress => Errno::EISCONN,
@@ -457,7 +459,6 @@ pub(crate) fn receive_error_to_errno(e: ReceiveError) -> Errno {
 pub(crate) fn close_error_to_errno(e: CloseError) -> Errno {
     match e {
         CloseError::InvalidFd => Errno::EBADF,
-        CloseError::DataPending => Errno::EIO,
         _ => Errno::EIO,
     }
 }
@@ -485,6 +486,7 @@ pub(crate) fn set_tcp_option_error_to_errno(e: SetTcpOptionError) -> Errno {
     }
 }
 
+#[expect(dead_code)]
 pub(crate) fn get_tcp_option_error_to_errno(e: GetTcpOptionError) -> Errno {
     match e {
         GetTcpOptionError::InvalidFd => Errno::EBADF,
@@ -553,6 +555,7 @@ impl<FS: ShimFS> Task<FS> {
         let _ = self.global.net.lock().set_socket_proxy(fd, proxy);
     }
 
+    #[allow(clippy::unnecessary_wraps)]
     fn do_socket_unix(&self, sock_type: SockType) -> Result<usize, Errno> {
         let socket = Arc::new(crate::syscalls::unix::UnixSocket::new(sock_type));
         let fd = self
@@ -578,7 +581,7 @@ impl<FS: ShimFS> Task<FS> {
                     .bind(&typed_fd, &core::net::SocketAddr::V4(endpoint))
                     .map_err(bind_error_to_errno)
             }
-            SocketAddress::Unix(_unix_addr) => self.do_bind_unix(fd, _unix_addr),
+            SocketAddress::Unix(unix_addr) => self.do_bind_unix(fd, unix_addr),
         }
     }
 
@@ -627,7 +630,7 @@ impl<FS: ShimFS> Task<FS> {
                     .global
                     .net
                     .lock()
-                    .listen(&typed_fd, backlog.min(u16::MAX as u32) as u16)
+                    .listen(&typed_fd, backlog.min(u32::from(u16::MAX)) as u16)
                     .map_err(listen_error_to_errno);
             }
         }
@@ -809,8 +812,8 @@ impl<FS: ShimFS> Task<FS> {
         let dest = if dest_addr != 0 && addrlen > 0 {
             match read_sockaddr_from_user(dest_addr, addrlen)? {
                 SocketAddress::Inet(ep) => Some(core::net::SocketAddr::V4(ep)),
-                SocketAddress::Unix(_addr) => {
-                    return self.do_sendto_unix(fd, &data, Some(_addr));
+                SocketAddress::Unix(addr) => {
+                    return self.do_sendto_unix(fd, &data, Some(addr));
                 }
             }
         } else {
@@ -980,14 +983,20 @@ impl<FS: ShimFS> Task<FS> {
                 Ok(None)
             } else {
                 Ok(Some(Duration::new(
-                    tv.tv_sec as u64,
-                    tv.tv_usec as u32 * 1000,
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        tv.tv_sec as u64
+                    },
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        tv.tv_usec as u32 * 1000
+                    },
                 )))
             }
         };
 
         // Helper to read a linger struct.
-        let _read_linger = || -> Result<Option<Duration>, Errno> {
+        let read_linger = || -> Result<Option<Duration>, Errno> {
             if optlen < core::mem::size_of::<CLinger>() as u32 {
                 return Err(Errno::EINVAL);
             }
@@ -998,6 +1007,7 @@ impl<FS: ShimFS> Task<FS> {
             if lg.l_onoff == 0 {
                 Ok(None)
             } else {
+                #[allow(clippy::cast_sign_loss)]
                 Ok(Some(Duration::from_secs(lg.l_linger as u64)))
             }
         };
@@ -1019,7 +1029,13 @@ impl<FS: ShimFS> Task<FS> {
         drop(rds);
 
         match opt {
-            SocketOptionName::ReuseAddr => {
+            SocketOptionName::ReuseAddr
+            | SocketOptionName::Broadcast
+            | SocketOptionName::SndBuf
+            | SocketOptionName::RcvBuf
+            | SocketOptionName::TcpKeepIntvl
+            | SocketOptionName::TcpKeepCnt
+            | SocketOptionName::IpTos => {
                 let _val = read_u32()?;
                 Ok(())
             }
@@ -1036,23 +1052,11 @@ impl<FS: ShimFS> Task<FS> {
                     .set_tcp_option(&typed_fd, TcpOptionData::KEEPALIVE(keepalive))
                     .map_err(set_tcp_option_error_to_errno)
             }
-            SocketOptionName::Broadcast => {
-                let _val = read_u32()?;
-                Ok(())
-            }
-            SocketOptionName::SndBuf | SocketOptionName::RcvBuf => {
-                let _val = read_u32()?;
-                Ok(())
-            }
             SocketOptionName::Linger | SocketOptionName::LingerSec => {
-                let _linger = _read_linger()?;
+                let _linger = read_linger()?;
                 Ok(())
             }
-            SocketOptionName::RcvTimeo => {
-                let _timeout = read_timeval()?;
-                Ok(())
-            }
-            SocketOptionName::SndTimeo => {
+            SocketOptionName::RcvTimeo | SocketOptionName::SndTimeo => {
                 let _timeout = read_timeval()?;
                 Ok(())
             }
@@ -1075,7 +1079,7 @@ impl<FS: ShimFS> Task<FS> {
             SocketOptionName::TcpKeepAlive => {
                 let val = read_u32()?;
                 let keepalive = if val > 0 {
-                    Some(Duration::from_secs(val as u64))
+                    Some(Duration::from_secs(u64::from(val)))
                 } else {
                     None
                 };
@@ -1084,18 +1088,6 @@ impl<FS: ShimFS> Task<FS> {
                     .lock()
                     .set_tcp_option(&typed_fd, TcpOptionData::KEEPALIVE(keepalive))
                     .map_err(set_tcp_option_error_to_errno)
-            }
-            SocketOptionName::TcpKeepIntvl => {
-                let _val = read_u32()?;
-                Ok(())
-            }
-            SocketOptionName::TcpKeepCnt => {
-                let _val = read_u32()?;
-                Ok(())
-            }
-            SocketOptionName::IpTos => {
-                let _val = read_u32()?;
-                Ok(())
             }
             SocketOptionName::Type | SocketOptionName::Error => Err(Errno::ENOPROTOOPT),
         }
@@ -1128,13 +1120,19 @@ impl<FS: ShimFS> Task<FS> {
         if let Ok(typed_fd) = rds.fd_from_raw_integer::<Network<Platform>>(fd as usize) {
             drop(rds);
             return match opt {
-                SocketOptionName::ReuseAddr => write_u32(0),
                 SocketOptionName::Type => write_u32(SOCK_STREAM),
-                SocketOptionName::Broadcast => write_u32(0),
-                SocketOptionName::SndBuf => write_u32(SOCKET_BUFFER_SIZE),
-                SocketOptionName::RcvBuf => write_u32(SOCKET_BUFFER_SIZE),
-                SocketOptionName::KeepAlive => write_u32(0),
-                SocketOptionName::Error => write_u32(0),
+                SocketOptionName::SndBuf | SocketOptionName::RcvBuf => {
+                    write_u32(SOCKET_BUFFER_SIZE)
+                }
+                SocketOptionName::ReuseAddr
+                | SocketOptionName::Broadcast
+                | SocketOptionName::KeepAlive
+                | SocketOptionName::Error
+                | SocketOptionName::TcpNoPush
+                | SocketOptionName::TcpKeepAlive
+                | SocketOptionName::TcpKeepIntvl
+                | SocketOptionName::TcpKeepCnt
+                | SocketOptionName::IpTos => write_u32(0),
                 SocketOptionName::Linger | SocketOptionName::LingerSec => {
                     let lg = CLinger {
                         l_onoff: 0,
@@ -1142,7 +1140,7 @@ impl<FS: ShimFS> Task<FS> {
                     };
                     let bytes: &[u8] = unsafe {
                         core::slice::from_raw_parts(
-                            (&lg as *const CLinger).cast::<u8>(),
+                            (&raw const lg).cast::<u8>(),
                             core::mem::size_of::<CLinger>(),
                         )
                     };
@@ -1158,7 +1156,7 @@ impl<FS: ShimFS> Task<FS> {
                     };
                     let bytes: &[u8] = unsafe {
                         core::slice::from_raw_parts(
-                            (&tv as *const CTimeval).cast::<u8>(),
+                            (&raw const tv).cast::<u8>(),
                             core::mem::size_of::<CTimeval>(),
                         )
                     };
@@ -1178,11 +1176,6 @@ impl<FS: ShimFS> Task<FS> {
                         _ => write_u32(0),
                     }
                 }
-                SocketOptionName::TcpNoPush => write_u32(0),
-                SocketOptionName::TcpKeepAlive => write_u32(0),
-                SocketOptionName::TcpKeepIntvl => write_u32(0),
-                SocketOptionName::TcpKeepCnt => write_u32(0),
-                SocketOptionName::IpTos => write_u32(0),
             };
         }
         drop(rds);
@@ -1200,7 +1193,6 @@ impl<FS: ShimFS> Task<FS> {
                         };
                         write_u32(val)
                     }
-                    SocketOptionName::Error => write_u32(0),
                     SocketOptionName::SndBuf | SocketOptionName::RcvBuf => {
                         write_u32(SOCKET_BUFFER_SIZE)
                     }
@@ -1316,7 +1308,9 @@ impl<FS: ShimFS> Task<FS> {
 
         // Gather data from iovec array.
         let mut gathered = alloc::vec::Vec::new();
-        for i in 0..msg_iovlen.max(0) as usize {
+        #[allow(clippy::cast_sign_loss)]
+        let iov_count = msg_iovlen.max(0) as usize;
+        for i in 0..iov_count {
             let iov_ptr: ConstPtr<u8> = ConstPtr::from_usize(msg_iov as usize + i * 16);
             let iov_bytes = iov_ptr.to_owned_slice(16).ok_or(Errno::EFAULT)?;
             let iov_base = u64::from_ne_bytes(iov_bytes[0..8].try_into().unwrap());
@@ -1380,7 +1374,9 @@ impl<FS: ShimFS> Task<FS> {
         // Calculate total buffer size from iovecs.
         let mut total_len = 0usize;
         let mut iovecs = alloc::vec::Vec::new();
-        for i in 0..msg_iovlen.max(0) as usize {
+        #[allow(clippy::cast_sign_loss)]
+        let iov_count = msg_iovlen.max(0) as usize;
+        for i in 0..iov_count {
             let iov_ptr: ConstPtr<u8> = ConstPtr::from_usize(msg_iov as usize + i * 16);
             let iov_bytes = iov_ptr.to_owned_slice(16).ok_or(Errno::EFAULT)?;
             let iov_base = u64::from_ne_bytes(iov_bytes[0..8].try_into().unwrap());

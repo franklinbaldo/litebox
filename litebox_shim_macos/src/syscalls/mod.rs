@@ -213,9 +213,7 @@ impl<FS: ShimFS> Task<FS> {
             MacosSyscallRequest::Bind { fd, addr, addrlen } => {
                 self.sys_bind(fd, addr, addrlen).map(|()| 0)
             }
-            MacosSyscallRequest::Listen { fd, backlog } => {
-                self.sys_listen(fd, backlog).map(|()| 0)
-            }
+            MacosSyscallRequest::Listen { fd, backlog } => self.sys_listen(fd, backlog).map(|()| 0),
             MacosSyscallRequest::Accept { fd, addr, addrlen } => self.sys_accept(fd, addr, addrlen),
             MacosSyscallRequest::Connect { fd, addr, addrlen } => {
                 self.sys_connect(fd, addr, addrlen).map(|()| 0)
@@ -244,21 +242,27 @@ impl<FS: ShimFS> Task<FS> {
                 sock_type,
                 protocol,
                 sv,
-            } => self.sys_socketpair(domain, sock_type, protocol, sv).map(|()| 0),
+            } => self
+                .sys_socketpair(domain, sock_type, protocol, sv)
+                .map(|()| 0),
             MacosSyscallRequest::Setsockopt {
                 fd,
                 level,
                 optname,
                 optval,
                 optlen,
-            } => self.sys_setsockopt(fd, level, optname, optval, optlen).map(|()| 0),
+            } => self
+                .sys_setsockopt(fd, level, optname, optval, optlen)
+                .map(|()| 0),
             MacosSyscallRequest::Getsockopt {
                 fd,
                 level,
                 optname,
                 optval,
                 optlen,
-            } => self.sys_getsockopt(fd, level, optname, optval, optlen).map(|()| 0),
+            } => self
+                .sys_getsockopt(fd, level, optname, optval, optlen)
+                .map(|()| 0),
             MacosSyscallRequest::Getsockname { fd, addr, addrlen } => {
                 self.sys_getsockname(fd, addr, addrlen).map(|()| 0)
             }

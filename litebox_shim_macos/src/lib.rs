@@ -810,9 +810,15 @@ struct GlobalState<FS: ShimFS> {
     /// Maps raw fd numbers to their open paths (for `F_GETPATH` support).
     fd_paths: litebox::sync::RwLock<Platform, BTreeMap<usize, String>>,
     /// Maps virtual fd numbers to Unix socket objects.
-    unix_sockets: litebox::sync::RwLock<Platform, BTreeMap<usize, Arc<crate::syscalls::unix::UnixSocket<FS>>>>,
+    unix_sockets: litebox::sync::RwLock<
+        Platform,
+        BTreeMap<usize, Arc<crate::syscalls::unix::UnixSocket<FS>>>,
+    >,
     /// Maps Unix socket paths to their bound entries.
-    unix_addr_table: litebox::sync::RwLock<Platform, BTreeMap<alloc::string::String, crate::syscalls::unix::UnixAddrEntry<FS>>>,
+    unix_addr_table: litebox::sync::RwLock<
+        Platform,
+        BTreeMap<alloc::string::String, crate::syscalls::unix::UnixAddrEntry<FS>>,
+    >,
     /// Counter for allocating virtual fd numbers for Unix sockets.
     unix_fd_counter: AtomicUsize,
     /// Base address of the installed shared cache (0 if not installed).

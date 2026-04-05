@@ -9,12 +9,11 @@
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
 
 use litebox_common_macos::errno::Errno;
 
-use crate::syscalls::net::{SockType, SocketOptions, UnixSocketAddr, SHUT_RD, SHUT_WR, SHUT_RDWR};
-use crate::{Platform, ShimFS, Task};
+use crate::syscalls::net::{SHUT_RD, SHUT_RDWR, SHUT_WR, SockType, UnixSocketAddr};
+use crate::{Platform, ShimFS};
 
 // ---------------------------------------------------------------------------
 // Channel â VecDeque-backed ring buffer for Unix socket data transfer
@@ -95,11 +94,13 @@ impl Channel {
     }
 
     /// Check if the channel has data available for reading.
+    #[expect(dead_code)]
     pub(crate) fn has_data(&self) -> bool {
         !self.buf.lock().data.is_empty()
     }
 
     /// Check if the write end is closed.
+    #[expect(dead_code)]
     pub(crate) fn is_write_closed(&self) -> bool {
         self.buf.lock().write_closed
     }
@@ -111,7 +112,9 @@ impl Channel {
 
 /// A single datagram message.
 pub(crate) struct DatagramMessage {
+    #[expect(dead_code)]
     pub(crate) data: Vec<u8>,
+    #[expect(dead_code)]
     pub(crate) from: UnixSocketAddr,
 }
 
@@ -197,13 +200,12 @@ enum UnixSocketInner<FS: ShimFS> {
         /// Our receive queue (peer sends to this).
         rx: Arc<DatagramChannel>,
         /// Peer's receive queue (we send to this).
+        #[expect(dead_code)]
         tx: Arc<DatagramChannel>,
         peer_addr: UnixSocketAddr,
     },
     /// Bound datagram socket (has a receive queue registered in addr table).
-    BoundDatagram {
-        rx: Arc<DatagramChannel>,
-    },
+    BoundDatagram { rx: Arc<DatagramChannel> },
     /// Shut down.
     Closed,
 }
@@ -232,8 +234,8 @@ impl<FS: ShimFS> UnixSocket<FS> {
     pub(crate) fn peer_addr(&self) -> UnixSocketAddr {
         let inner = self.inner.lock();
         match &*inner {
-            UnixSocketInner::ConnectedStream { peer_addr, .. } => peer_addr.clone(),
-            UnixSocketInner::ConnectedDatagram { peer_addr, .. } => peer_addr.clone(),
+            UnixSocketInner::ConnectedStream { peer_addr, .. }
+            | UnixSocketInner::ConnectedDatagram { peer_addr, .. } => peer_addr.clone(),
             _ => UnixSocketAddr::Unnamed,
         }
     }
@@ -344,11 +346,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
         peer_addr: UnixSocketAddr,
     ) {
         let mut inner = self.inner.lock();
-        *inner = UnixSocketInner::ConnectedStream {
-            rx,
-            tx,
-            peer_addr,
-        };
+        *inner = UnixSocketInner::ConnectedStream { rx, tx, peer_addr };
     }
 
     /// Set up as a connected datagram socket (used by socketpair).
@@ -359,11 +357,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
         peer_addr: UnixSocketAddr,
     ) {
         let mut inner = self.inner.lock();
-        *inner = UnixSocketInner::ConnectedDatagram {
-            rx,
-            tx,
-            peer_addr,
-        };
+        *inner = UnixSocketInner::ConnectedDatagram { rx, tx, peer_addr };
     }
 
     /// Set up as a bound datagram socket.
@@ -373,7 +367,12 @@ impl<FS: ShimFS> UnixSocket<FS> {
     }
 
     /// Send a datagram.
-    pub(crate) fn send_datagram(&self, data: &[u8], target: &DatagramChannel) -> Result<usize, Errno> {
+    #[expect(dead_code)]
+    pub(crate) fn send_datagram(
+        &self,
+        data: &[u8],
+        target: &DatagramChannel,
+    ) -> Result<usize, Errno> {
         let msg = DatagramMessage {
             data: data.to_vec(),
             from: self.bound_addr(),
@@ -383,11 +382,12 @@ impl<FS: ShimFS> UnixSocket<FS> {
     }
 
     /// Receive a datagram.
+    #[expect(dead_code)]
     pub(crate) fn recv_datagram(&self) -> Result<DatagramMessage, Errno> {
         let inner = self.inner.lock();
         match &*inner {
-            UnixSocketInner::ConnectedDatagram { rx, .. } => rx.try_recv(),
-            UnixSocketInner::BoundDatagram { rx } => rx.try_recv(),
+            UnixSocketInner::ConnectedDatagram { rx, .. }
+            | UnixSocketInner::BoundDatagram { rx } => rx.try_recv(),
             _ => Err(Errno::ENOTCONN),
         }
     }
@@ -400,10 +400,8 @@ impl<FS: ShimFS> UnixSocket<FS> {
                 tx.shutdown_write();
                 rx.shutdown_read();
             }
-            UnixSocketInner::ConnectedDatagram { rx, .. } => {
-                rx.close();
-            }
-            UnixSocketInner::BoundDatagram { rx } => {
+            UnixSocketInner::ConnectedDatagram { rx, .. }
+            | UnixSocketInner::BoundDatagram { rx } => {
                 rx.close();
             }
             _ => {}
