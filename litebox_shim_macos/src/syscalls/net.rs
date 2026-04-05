@@ -66,9 +66,9 @@ const IP_TOS: u32 = 3;
 const SOCKET_BUFFER_SIZE: u32 = 65536 * 4;
 
 /// macOS shutdown(2) `how` values.
-const SHUT_RD: u32 = 0;
-const SHUT_WR: u32 = 1;
-const SHUT_RDWR: u32 = 2;
+pub(crate) const SHUT_RD: u32 = 0;
+pub(crate) const SHUT_WR: u32 = 1;
+pub(crate) const SHUT_RDWR: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Socket type enum

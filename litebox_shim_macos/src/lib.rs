@@ -16,7 +16,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use litebox::{
     LiteBox,
     fd::{RawDescriptorStorage, TypedFd},
@@ -263,6 +263,9 @@ impl<FS: ShimFS> MacosShimBuilder<FS> {
             litebox: self.litebox,
             raw_descriptors: litebox::sync::RwLock::new(RawDescriptorStorage::new()),
             fd_paths: litebox::sync::RwLock::new(BTreeMap::new()),
+            unix_sockets: litebox::sync::RwLock::new(BTreeMap::new()),
+            unix_addr_table: litebox::sync::RwLock::new(BTreeMap::new()),
+            unix_fd_counter: AtomicUsize::new(0x1_0000),
             shared_cache_base: AtomicU64::new(0),
             sysroot: self.sysroot,
         });
@@ -806,6 +809,12 @@ struct GlobalState<FS: ShimFS> {
     raw_descriptors: litebox::sync::RwLock<Platform, RawDescriptorStorage>,
     /// Maps raw fd numbers to their open paths (for `F_GETPATH` support).
     fd_paths: litebox::sync::RwLock<Platform, BTreeMap<usize, String>>,
+    /// Maps virtual fd numbers to Unix socket objects.
+    unix_sockets: litebox::sync::RwLock<Platform, BTreeMap<usize, Arc<crate::syscalls::unix::UnixSocket<FS>>>>,
+    /// Maps Unix socket paths to their bound entries.
+    unix_addr_table: litebox::sync::RwLock<Platform, BTreeMap<alloc::string::String, crate::syscalls::unix::UnixAddrEntry<FS>>>,
+    /// Counter for allocating virtual fd numbers for Unix sockets.
+    unix_fd_counter: AtomicUsize,
     /// Base address of the installed shared cache (0 if not installed).
     pub(crate) shared_cache_base: AtomicU64,
     /// Optional sysroot prefix for path rewriting in sys_open.

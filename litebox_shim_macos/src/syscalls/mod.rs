@@ -10,6 +10,7 @@ pub(crate) mod signal;
 pub(crate) mod stubs;
 
 pub(crate) mod net;
+pub(crate) mod unix;
 
 use litebox_common_macos::{PtRegs, errno::Errno, syscall::MacosSyscallRequest};
 
