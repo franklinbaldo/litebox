@@ -4,7 +4,7 @@
 //! Local execution of syscalls authorized by central.
 
 use crate::raw_syscall;
-use litebox_ipc::ring::{CqEntry, cq_flags};
+use litebox_ipc::ring::{cq_flags, CqEntry};
 
 /// Execute a locally-authorized syscall.
 ///
@@ -33,7 +33,90 @@ pub unsafe fn execute_locally(
 ) -> i64 {
     match syscall_nr {
         nr if nr == libc::SYS_mmap as u32 => {
-            if cq.flags & litebox_ipc::ring::cq_flags::HAS_DATA != 0 {
+            if cq.flags & cq_flags::MMAP_FROM_ALIGNED != 0 {
+                // Direct mmap from the aligned data memfd.
+                // Decode u64 offset from data_offset (low 32) + data_len (high 32).
+                let aligned_offset = u64::from(cq.data_offset) | (u64::from(cq.data_len) << 32);
+                let map_addr = cq.result as usize;
+                let map_len = args[1] as usize;
+                let final_prot = args[2] as i32;
+
+                // Get the aligned memfd fd from micro state.
+                let state = unsafe { crate::state::global_micro_state() };
+                let aligned_fd = state.aligned_fd;
+
+                // Single mmap from the aligned memfd with MAP_PRIVATE (CoW).
+                let result = unsafe {
+                    raw_syscall::mmap(
+                        map_addr,
+                        map_len,
+                        final_prot,
+                        libc::MAP_PRIVATE | libc::MAP_FIXED,
+                        aligned_fd,
+                        aligned_offset as i64,
+                    )
+                };
+
+                if raw_syscall::is_error(result) {
+                    return -i64::from(libc::ENOMEM);
+                }
+
+                // Handle trampoline if present.
+                // When MMAP_FROM_ALIGNED is set, trampoline data is written at
+                // offset 0 in the data region (since data_offset/data_len are
+                // repurposed for the aligned offset).
+                if cq.flags & cq_flags::TRAMPOLINE != 0 && !ring_base.is_null() {
+                    let data_region_base = unsafe { ring_base.add(layout.data_region_offset) };
+                    // TrampolineDescriptor starts at offset 0 in the data region.
+                    let desc_ptr = data_region_base;
+                    let vaddr_offset = unsafe {
+                        u32::from_le_bytes(
+                            core::slice::from_raw_parts(desc_ptr, 4).try_into().unwrap(),
+                        ) as usize
+                    };
+                    let tramp_size = unsafe {
+                        u32::from_le_bytes(
+                            core::slice::from_raw_parts(desc_ptr.add(4), 4)
+                                .try_into()
+                                .unwrap(),
+                        ) as usize
+                    };
+
+                    if tramp_size > 0 {
+                        let tramp_data_src = unsafe { desc_ptr.add(8) };
+                        let tramp_addr = map_addr + vaddr_offset;
+                        let tramp_page_size = (tramp_size + 0xFFF) & !0xFFF;
+
+                        let tramp_ret = unsafe {
+                            raw_syscall::mmap(
+                                tramp_addr,
+                                tramp_page_size,
+                                libc::PROT_READ | libc::PROT_WRITE,
+                                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                                -1,
+                                0,
+                            )
+                        };
+                        if !raw_syscall::is_error(tramp_ret) {
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    tramp_data_src,
+                                    tramp_ret as *mut u8,
+                                    tramp_size,
+                                );
+                                *(tramp_ret as *mut u64) = syscall_entry_point as u64;
+                                raw_syscall::mprotect(
+                                    tramp_ret as usize,
+                                    tramp_page_size,
+                                    libc::PROT_READ | libc::PROT_EXEC,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                map_addr as i64
+            } else if cq.flags & litebox_ipc::ring::cq_flags::HAS_DATA != 0 {
                 // File-backed mmap: central populated the data in the shmem data region.
                 let map_addr = cq.result as usize;
                 let map_len = args[1] as usize;
