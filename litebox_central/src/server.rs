@@ -135,6 +135,10 @@ pub struct ProcessServer<FS: ShimFS> {
     aligned_file_map: Arc<HashMap<String, (usize, usize)>>,
     /// Size in bytes of the aligned memfd region.
     aligned_size: usize,
+    /// Map of guest fd → normalized file path (without leading `/`).
+    /// Populated by the openat handler for tar-backed files.
+    /// Used by the mmap handler to resolve fd → aligned memfd offset.
+    fd_path_map: RefCell<HashMap<i32, String>>,
 }
 
 impl<FS: ShimFS> ProcessServer<FS> {
@@ -187,6 +191,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
             tar_file_map,
             aligned_file_map,
             aligned_size,
+            fd_path_map: RefCell::new(HashMap::new()),
         }
     }
 
@@ -528,6 +533,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 self.maybe_close_shmem_socket(fd);
                 // If this fd was a shmem file, set CLOSED flag and free slot.
                 self.maybe_close_shmem_file(fd);
+                // Remove from fd -> path mapping.
+                self.fd_path_map.borrow_mut().remove(&fd);
                 cq.result = 0;
                 return cq;
             }
@@ -567,6 +574,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     // borrowing notification_state since it borrows internally.
                     if matches!(i64::from(nr), libc::SYS_dup2 | libc::SYS_dup3) {
                         self.maybe_close_shmem_file(new_fd);
+                        // Remove the overwritten fd from the fd -> path mapping.
+                        self.fd_path_map.borrow_mut().remove(&new_fd);
                     }
 
                     // Check if source fd has a shmem file slot.
@@ -872,7 +881,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 // region and populate tar_offset/tar_len so micro can serve
                 // reads locally without a central round-trip.
                 let is_rdonly = flags_arg & (libc::O_WRONLY | libc::O_RDWR) == 0;
-                let (tar_off, tar_ln) = if is_rdonly && !pathname_buf.is_empty() {
+                let (tar_off, tar_ln, tar_path) = if is_rdonly && !pathname_buf.is_empty() {
                     // pathname_buf is a null-terminated C string from micro.
                     let path_bytes = if let Some(nul) = pathname_buf.iter().position(|&b| b == 0) {
                         &pathname_buf[..nul]
@@ -883,16 +892,23 @@ impl<FS: ShimFS> ProcessServer<FS> {
                         // Tar paths are stored without leading '/'.
                         let normalized = path_str.strip_prefix('/').unwrap_or(path_str);
                         if let Some(range) = self.tar_file_map.get(normalized) {
-                            (range.start as u64, (range.end - range.start) as u64)
+                            (range.start as u64, (range.end - range.start) as u64, Some(normalized.to_string()))
                         } else {
-                            (0, 0)
+                            (0, 0, None)
                         }
                     } else {
-                        (0, 0)
+                        (0, 0, None)
                     }
                 } else {
-                    (0, 0)
+                    (0, 0, None)
                 };
+
+                // Cache the fd -> path mapping for the mmap handler.
+                if let Some(path) = tar_path {
+                    self.fd_path_map
+                        .borrow_mut()
+                        .insert(new_fd, path);
+                }
 
                 // Write OpenResponse to data region at offset 0 for micro.
                 let response = litebox_ipc::messages::OpenResponse {
@@ -1018,6 +1034,12 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 aligned_size,
             );
             child_server.next_child_pid.set(self.next_child_pid.get());
+            // Inherit the parent's fd -> path mapping so the child can resolve
+            // fds opened before fork in its mmap handler.
+            child_server
+                .fd_path_map
+                .borrow_mut()
+                .clone_from(&self.fd_path_map.borrow());
 
             let handle = std::thread::spawn(move || {
                 if let Err(e) = child_server.run() {
