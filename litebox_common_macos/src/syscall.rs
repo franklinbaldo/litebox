@@ -84,7 +84,11 @@ pub mod nr {
     pub const SELECT: usize = 93;
     pub const POLL: usize = 230;
     pub const KQUEUE: usize = 362;
+    pub const GETTIMEOFDAY: usize = 116;
+    pub const READV: usize = 120;
+    pub const WRITEV: usize = 121;
     pub const KEVENT: usize = 363;
+    pub const GETCWD: usize = 304;
 }
 
 /// Mach trap numbers (negative x16 values, stored as positive constants).
@@ -441,6 +445,24 @@ pub enum MacosSyscallRequest {
         nevents: i32,
         timeout: usize,
     },
+    Gettimeofday {
+        tv: usize,
+        tz: usize,
+    },
+    Readv {
+        fd: i32,
+        iov: usize,
+        iovcnt: usize,
+    },
+    Writev {
+        fd: i32,
+        iov: usize,
+        iovcnt: usize,
+    },
+    Getcwd {
+        buf: usize,
+        size: usize,
+    },
     Unknown {
         number: usize,
     },
@@ -773,6 +795,24 @@ impl MacosSyscallRequest {
                 eventlist: a3,
                 nevents: a4 as i32,
                 timeout: a5,
+            },
+            nr::GETTIMEOFDAY => MacosSyscallRequest::Gettimeofday {
+                tv: a0 as usize,
+                tz: a1 as usize,
+            },
+            nr::READV => MacosSyscallRequest::Readv {
+                fd: a0 as i32,
+                iov: a1 as usize,
+                iovcnt: a2 as usize,
+            },
+            nr::WRITEV => MacosSyscallRequest::Writev {
+                fd: a0 as i32,
+                iov: a1 as usize,
+                iovcnt: a2 as usize,
+            },
+            nr::GETCWD => MacosSyscallRequest::Getcwd {
+                buf: a0 as usize,
+                size: a1 as usize,
             },
             _ => MacosSyscallRequest::Unknown { number: nr_raw },
         }
