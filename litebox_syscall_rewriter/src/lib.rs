@@ -606,8 +606,8 @@ fn hook_syscalls_in_section(
             trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
             trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
             trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-                                                              // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
-                                                              // We want: EAX + offset = syscall_entry_addr
+            // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
+            // We want: EAX + offset = syscall_entry_addr
             let call_base = checked_add_u64(
                 trampoline_base_addr,
                 trampoline_data.len() as u64 - 3,
@@ -1219,8 +1219,8 @@ fn hook_syscall_and_after(
         trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
         trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
         trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-                                                          // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
-                                                          // We want: EAX + offset = syscall_entry_addr
+        // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
+        // We want: EAX + offset = syscall_entry_addr
         let call_base = checked_add_u64(
             trampoline_base_addr,
             trampoline_data.len() as u64,
@@ -1371,8 +1371,8 @@ fn hook_syscall_before_and_after(
     trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
     trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
     trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-                                                      // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
-                                                      // We want: EAX + offset = syscall_entry_addr
+    // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
+    // We want: EAX + offset = syscall_entry_addr
     let call_base = checked_add_u64(
         trampoline_base_addr,
         trampoline_data.len() as u64,
