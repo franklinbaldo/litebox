@@ -112,13 +112,19 @@ fn main() -> anyhow::Result<()> {
             0,                             // ppid — no parent
             central.pid().cast_unsigned(), // central_pid — for /proc fd passing
             syscall_entry,                 // syscall_entry_point
-            tar_shmem.as_ref().map_or(core::ptr::null(), shmem::TarSharedRegion::base_ptr),
+            tar_shmem
+                .as_ref()
+                .map_or(core::ptr::null(), shmem::TarSharedRegion::base_ptr),
             tar_shmem.as_ref().map_or(0, shmem::TarSharedRegion::size),
-            aligned_data.as_ref().map_or(-1, shmem::AlignedDataRegion::fd_raw),
+            aligned_data
+                .as_ref()
+                .map_or(-1, shmem::AlignedDataRegion::fd_raw),
             aligned_data
                 .as_ref()
                 .map_or(core::ptr::null(), shmem::AlignedDataRegion::base_ptr),
-            aligned_data.as_ref().map_or(0, shmem::AlignedDataRegion::size),
+            aligned_data
+                .as_ref()
+                .map_or(0, shmem::AlignedDataRegion::size),
         );
     }
 

@@ -47,6 +47,7 @@ pub(crate) fn sq_entry_to_ptregs(entry: &SqEntry) -> PtRegs {
 ///
 /// Unsupported or unknown syscall numbers are logged to stderr and produce
 /// an `Err(Errno)`.
+#[allow(dead_code)] // Reserved for future use; module is used for sq_entry_to_ptregs
 pub fn parse_sq_entry(entry: &SqEntry) -> Result<SyscallRequest<Platform>, Errno> {
     let regs = sq_entry_to_ptregs(entry);
     SyscallRequest::<Platform>::try_from_raw(entry.syscall_nr as usize, &regs, |args| {

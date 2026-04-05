@@ -9,8 +9,8 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::Write as _;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -22,9 +22,9 @@ use litebox_ipc::messages::{
     MSG_THREAD_DEREGISTER, MSG_THREAD_REGISTER,
 };
 use litebox_ipc::ring::{
-    cq_flags, pipe_flags, sq_flags, CqEntry, SqEntry, TrampolineDescriptor, FILE_SLOT_SIZE,
-    FILE_ZONE_BASE_OFFSET, PIPE_SLOT_SIZE, PIPE_ZONE_BASE_OFFSET, RING_MASK, SOCKET_RING_CAPACITY,
-    SOCKET_SLOT_SIZE, SOCKET_ZONE_BASE_OFFSET,
+    CqEntry, FILE_SLOT_SIZE, FILE_ZONE_BASE_OFFSET, PIPE_SLOT_SIZE, PIPE_ZONE_BASE_OFFSET,
+    RING_MASK, SOCKET_RING_CAPACITY, SOCKET_SLOT_SIZE, SOCKET_ZONE_BASE_OFFSET, SqEntry,
+    TrampolineDescriptor, cq_flags, pipe_flags, sq_flags,
 };
 use litebox_ipc::sq::{sq_advance_head, sq_head_index, sq_try_consume};
 use litebox_ipc::wait::spin_u8_then_wait_u32;
@@ -566,10 +566,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     // For dup2/dup3, clean up the target fd's old shmem slot
                     // (if any) before allocating a new one.  Must happen before
                     // borrowing notification_state since it borrows internally.
-                    if matches!(
-                        i64::from(nr),
-                        libc::SYS_dup2 | libc::SYS_dup3
-                    ) {
+                    if matches!(i64::from(nr), libc::SYS_dup2 | libc::SYS_dup3) {
                         self.maybe_close_shmem_file(new_fd);
                     }
 
@@ -626,13 +623,11 @@ impl<FS: ShimFS> ProcessServer<FS> {
                             };
                             data_region[..resp_bytes.len()].copy_from_slice(resp_bytes);
 
-                            cq.flags = cq_flags::EXEC_LOCAL
-                                | cq_flags::HAS_DATA
-                                | cq_flags::NO_REPORT;
+                            cq.flags =
+                                cq_flags::EXEC_LOCAL | cq_flags::HAS_DATA | cq_flags::NO_REPORT;
                             cq.data_offset = 0;
                             cq.data_len =
-                                core::mem::size_of::<litebox_ipc::messages::OpenResponse>()
-                                    as u32;
+                                core::mem::size_of::<litebox_ipc::messages::OpenResponse>() as u32;
                         }
                     }
                 }
@@ -2720,12 +2715,10 @@ impl<FS: ShimFS> ProcessServer<FS> {
         // Interp segments.
         if let Some((ref _iinfo, ref imapper, _)) = interp_info {
             // Convert interpreter path to a str for aligned offset lookups.
-            let interp_path_str = interp_name
-                .as_ref()
-                .map_or("", |name| {
-                    let bytes = name.to_bytes();
-                    core::str::from_utf8(bytes).unwrap_or("")
-                });
+            let interp_path_str = interp_name.as_ref().map_or("", |name| {
+                let bytes = name.to_bytes();
+                core::str::from_utf8(bytes).unwrap_or("")
+            });
             for seg in &imapper.segments {
                 segments.push(SegmentInfo {
                     vaddr: seg.address as u64,
@@ -2889,8 +2882,39 @@ impl<FS: ShimFS> ProcessServer<FS> {
         data_region[..header_size].copy_from_slice(hdr_bytes);
 
         // Write ExecveSegment entries.
+        //
+        // Compute bss_zero_offset per segment: the byte offset within the
+        // segment where BSS (zero-fill) begins.  For segments with tar-backed
+        // data, micro must zero [vaddr + bss_zero_offset, vaddr + data_len)
+        // after copying from aligned_base.
+        let all_bss_ranges: Vec<(usize, usize)> = {
+            let mut ranges = main_mem.bss_ranges.clone();
+            if let Some((_, _, ref imem)) = interp_info {
+                ranges.extend_from_slice(&imem.bss_ranges);
+            }
+            ranges
+        };
         for (i, seg) in segments.iter().enumerate() {
             let layout = &seg_layouts[i];
+
+            // Find BSS offset within this segment.
+            let bss_zero_offset = if seg.tar_data_offset == u64::MAX {
+                // Ring path: central already zeroed BSS in the packed data.
+                seg.data_len
+            } else {
+                // Tar-backed: find BSS range within this segment.
+                let seg_start = seg.vaddr as usize;
+                let seg_end = seg_start + seg.data_len as usize;
+                let mut found_offset = seg.data_len; // default: no BSS to zero
+                for &(bss_addr, _bss_len) in &all_bss_ranges {
+                    if bss_addr >= seg_start && bss_addr < seg_end {
+                        found_offset = (bss_addr - seg_start) as u64;
+                        break;
+                    }
+                }
+                found_offset
+            };
+
             let seg_entry = ExecveSegmentCentral {
                 vaddr: seg.vaddr,
                 map_len: seg.map_len,
@@ -2899,6 +2923,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 has_trampoline: u32::from(seg.has_trampoline && layout.tramp_desc_len > 0),
                 tar_data_offset: seg.tar_data_offset,
                 data_offset: layout.data_offset as u64,
+                bss_zero_offset,
             };
             let seg_bytes: &[u8] = unsafe {
                 core::slice::from_raw_parts(
@@ -3389,6 +3414,7 @@ struct ExecveSegmentCentral {
     has_trampoline: u32,
     tar_data_offset: u64,
     data_offset: u64,
+    bss_zero_offset: u64,
 }
 
 /// Which source file a segment's data comes from.
@@ -3540,12 +3566,7 @@ impl SimpleMapper {
             (self.base_addr, self.next_addr - self.base_addr)
         } else {
             // ET_EXEC: compute from recorded segments.
-            let lo = self
-                .segments
-                .iter()
-                .map(|s| s.address)
-                .min()
-                .unwrap_or(0);
+            let lo = self.segments.iter().map(|s| s.address).min().unwrap_or(0);
             let hi = self
                 .segments
                 .iter()

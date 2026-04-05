@@ -4,7 +4,6 @@
 //! Central LiteBox — host process serving syscalls for guest processes
 //! via shared-memory ring buffer IPC.
 
-#[allow(dead_code)]
 mod dispatch;
 mod notification_state;
 mod server;
@@ -214,8 +213,14 @@ fn main() -> anyhow::Result<()> {
             let page_size: usize = 4096;
             let mut offset: usize = 0;
             for (path, range) in tar_ro.all_file_data_ranges_ordered() {
-                offset = (offset + page_size - 1) & !(page_size - 1);
                 let file_size = range.end - range.start;
+                // Skip zero-length entries — the launcher's
+                // `compute_aligned_offsets()` skips them too, so we must
+                // match to keep the offset maps consistent.
+                if file_size == 0 {
+                    continue;
+                }
+                offset = (offset + page_size - 1) & !(page_size - 1);
                 map.insert(path.to_string(), (offset, file_size));
                 offset += file_size;
             }

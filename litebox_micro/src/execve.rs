@@ -89,6 +89,15 @@ pub struct ExecveSegment {
     pub tar_data_offset: u64,
     /// Offset in data region where this segment's file data starts (relative to header start).
     pub data_offset: u64,
+    /// Byte offset within this segment where BSS (zero-fill) begins.
+    ///
+    /// When copying file data from the aligned data memfd, the raw file bytes
+    /// past `p_filesz` may contain non-zero data (section headers, trampoline
+    /// data, etc.) that must be zeroed because the ELF spec requires it.
+    /// Micro must zero `[vaddr + bss_zero_offset, vaddr + data_len)` after
+    /// copying from aligned_base.  If `bss_zero_offset == data_len`, there
+    /// is no BSS to zero.
+    pub bss_zero_offset: u64,
 }
 
 // ── Serialization (micro → central) ─────────────────────────────────────
@@ -644,7 +653,12 @@ struct ExecveTiming {
     clippy::cast_ptr_alignment,
     clippy::too_many_lines
 )]
-unsafe fn execute_execve(tls: *mut MicroTls, cq: &CqEntry, micro: &MicroState, timing: &ExecveTiming) -> ! {
+unsafe fn execute_execve(
+    tls: *mut MicroTls,
+    cq: &CqEntry,
+    micro: &MicroState,
+    timing: &ExecveTiming,
+) -> ! {
     let data_region_ptr = unsafe { micro.ring_base.add(micro.layout.data_region_offset) };
     let data_base = unsafe { data_region_ptr.add(cq.data_offset as usize) };
 
@@ -846,24 +860,33 @@ unsafe fn execute_execve(tls: *mut MicroTls, cq: &CqEntry, micro: &MicroState, t
 
             // Try mmap path: offset must be page-aligned and aligned_fd must be valid.
             #[allow(clippy::similar_names)]
-            if tar_off.is_multiple_of(4096) && micro.aligned_fd >= 0 && map_len > 0 {
-                let seg_mmap_len = if data_len > map_len { data_len } else { map_len };
-                let seg_mmap_rounded = (seg_mmap_len + 4095) & !4095;
+            if tar_off.is_multiple_of(4096) && micro.aligned_fd >= 0 {
+                // Only mmap the file-backed portion (data_len), page-rounded.
+                // The BSS beyond data_len is already zero from the bulk anonymous mmap.
+                let seg_mmap_rounded = (data_len + 4095) & !4095;
 
-                let result = unsafe {
-                    crate::raw_syscall::mmap(
-                        vaddr,
-                        seg_mmap_rounded,
-                        libc::PROT_READ | libc::PROT_WRITE,
-                        libc::MAP_PRIVATE | libc::MAP_FIXED,
-                        micro.aligned_fd,
-                        tar_off as i64,
-                    )
+                // Bounds check: ensure the mmap region fits within the aligned memfd.
+                // If not, skip mmap and fall through to memcpy below.
+                let mmap_ok = tar_off + seg_mmap_rounded <= micro.aligned_size;
+
+                let result = if mmap_ok {
+                    unsafe {
+                        crate::raw_syscall::mmap(
+                            vaddr,
+                            seg_mmap_rounded,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                            libc::MAP_PRIVATE | libc::MAP_FIXED,
+                            micro.aligned_fd,
+                            tar_off as i64,
+                        )
+                    }
+                } else {
+                    -1_i64 // Force fallback to memcpy
                 };
 
                 if crate::raw_syscall::is_error(result) {
                     // mmap failed — fall through to memcpy from aligned_base.
-                    if tar_off + data_len > micro.aligned_size {
+                    if micro.aligned_base.is_null() || tar_off + data_len > micro.aligned_size {
                         unsafe { crate::raw_syscall::syscall1(libc::SYS_exit_group, 127) };
                     }
                     unsafe {
@@ -874,20 +897,13 @@ unsafe fn execute_execve(tls: *mut MicroTls, cq: &CqEntry, micro: &MicroState, t
                         );
                     }
                 } else {
-                    // mmap succeeded — zero BSS if data doesn't fill the mapping.
-                    if data_len < map_len {
-                        unsafe {
-                            core::ptr::write_bytes(
-                                (vaddr + data_len) as *mut u8,
-                                0,
-                                map_len - data_len,
-                            );
-                        }
-                    }
+                    // mmap succeeded — BSS within file-backed pages is handled
+                    // by bss_zero_offset zeroing below.  BSS beyond data_len
+                    // is already zero from the bulk anonymous mmap.
                 }
             } else {
                 // Non-aligned offset or no aligned_fd — memcpy from aligned_base.
-                if tar_off + data_len > micro.aligned_size {
+                if micro.aligned_base.is_null() || tar_off + data_len > micro.aligned_size {
                     unsafe { crate::raw_syscall::syscall1(libc::SYS_exit_group, 127) };
                 }
                 unsafe {
@@ -896,6 +912,18 @@ unsafe fn execute_execve(tls: *mut MicroTls, cq: &CqEntry, micro: &MicroState, t
                         vaddr as *mut u8,
                         data_len,
                     );
+                }
+            }
+
+            // Zero BSS within the file-backed portion of tar-backed segments.
+            //
+            // The raw file data past p_filesz may contain section headers,
+            // trampoline data, or other non-zero bytes.  The ELF spec requires
+            // BSS to be zero, so we zero from bss_zero_offset to data_len.
+            let bss_off = seg.bss_zero_offset as usize;
+            if bss_off < data_len {
+                unsafe {
+                    core::ptr::write_bytes((vaddr + bss_off) as *mut u8, 0, data_len - bss_off);
                 }
             }
         } else if data_len > 0 {
@@ -1043,16 +1071,22 @@ unsafe fn execute_execve(tls: *mut MicroTls, cq: &CqEntry, micro: &MicroState, t
 
     // ── Write profiling data (BEFORE the asm jump) ─────────────────────
     let t_mapped = perf::now_ns();
-    perf::write_perf_line(timing.serial, &[
-        ("serialize_ns", timing.t_serialized.wrapping_sub(timing.t0)),
-        ("roundtrip_ns", timing.t_roundtrip.wrapping_sub(timing.t_serialized)),
-        ("parse_ns", t_parse.wrapping_sub(timing.t_roundtrip)),
-        ("stack_ns", t_stack.wrapping_sub(t_parse)),
-        ("setup_ns", t_pre_map.wrapping_sub(t_stack)),
-        ("map_segments_ns", t_mapped.wrapping_sub(t_pre_map)),
-        ("num_segments", num_segments as u64),
-        ("total_ns", t_mapped.wrapping_sub(timing.t0)),
-    ]);
+    perf::write_perf_line(
+        timing.serial,
+        &[
+            ("serialize_ns", timing.t_serialized.wrapping_sub(timing.t0)),
+            (
+                "roundtrip_ns",
+                timing.t_roundtrip.wrapping_sub(timing.t_serialized),
+            ),
+            ("parse_ns", t_parse.wrapping_sub(timing.t_roundtrip)),
+            ("stack_ns", t_stack.wrapping_sub(t_parse)),
+            ("setup_ns", t_pre_map.wrapping_sub(t_stack)),
+            ("map_segments_ns", t_mapped.wrapping_sub(t_pre_map)),
+            ("num_segments", num_segments as u64),
+            ("total_ns", t_mapped.wrapping_sub(timing.t0)),
+        ],
+    );
 
     // Jump to the new entry point. This never returns.
     //
@@ -1145,8 +1179,8 @@ mod tests {
     #[test]
     fn execve_segment_size() {
         let size = core::mem::size_of::<ExecveSegment>();
-        // ExecveSegment: 3*u64 + 2*u32 + 2*u64 = 24 + 8 + 16 = 48 bytes
-        assert_eq!(size, 48);
+        // ExecveSegment: 3*u64 + 2*u32 + 3*u64 = 24 + 8 + 24 = 56 bytes
+        assert_eq!(size, 56);
     }
 
     #[test]

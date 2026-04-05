@@ -24,7 +24,6 @@ use litebox_ipc::ring::SharedRingLayout;
 /// `LauncherSharedRegion` owns both the file descriptor and the mapping. It is
 /// `Send` but deliberately not `Sync` — a single owner should manage the
 /// region.
-#[allow(dead_code)] // Used by launcher orchestration in later phases
 pub struct LauncherSharedRegion {
     fd: OwnedFd,
     ptr: NonNull<u8>,
@@ -36,7 +35,6 @@ pub struct LauncherSharedRegion {
 // thread is safe. We intentionally do NOT implement `Sync`.
 unsafe impl Send for LauncherSharedRegion {}
 
-#[allow(dead_code)] // Methods used by launcher orchestration in later phases
 impl LauncherSharedRegion {
     /// Create a new shared memory region with the default layout.
     ///
@@ -156,7 +154,6 @@ impl Drop for LauncherSharedRegion {
 ///
 /// `TarSharedRegion` owns both the file descriptor and the mapping. It is
 /// `Send` but deliberately not `Sync`.
-#[allow(dead_code)] // Used by launcher orchestration in later phases
 pub struct TarSharedRegion {
     fd: OwnedFd,
     ptr: NonNull<u8>,
@@ -168,7 +165,6 @@ pub struct TarSharedRegion {
 // thread is safe. We intentionally do NOT implement `Sync`.
 unsafe impl Send for TarSharedRegion {}
 
-#[allow(dead_code)] // Methods used by launcher orchestration in later phases
 impl TarSharedRegion {
     /// Create a `TarSharedRegion` by reading a tar file from disk.
     ///
@@ -314,10 +310,9 @@ const PAGE_SIZE: usize = 4096;
 ///
 /// This function is intentionally duplicated from `litebox_central` so that
 /// both sides can reconstruct the offset map independently from the same tar.
-#[allow(dead_code)] // Used by launcher orchestration in later phases
 pub fn compute_aligned_offsets(tar_data: &[u8]) -> Vec<(String, usize, usize)> {
-    let archive =
-        tar_no_std::TarArchiveRef::new(tar_data).expect("invalid tar data in compute_aligned_offsets");
+    let archive = tar_no_std::TarArchiveRef::new(tar_data)
+        .expect("invalid tar data in compute_aligned_offsets");
     let mut result = Vec::new();
     let mut offset: usize = 0;
 
@@ -352,7 +347,6 @@ pub fn compute_aligned_offsets(tar_data: &[u8]) -> Vec<(String, usize, usize)> {
 ///
 /// `AlignedDataRegion` owns both the file descriptor and the mapping. It is
 /// `Send` but deliberately not `Sync`.
-#[allow(dead_code)] // Used by launcher orchestration in later phases
 pub struct AlignedDataRegion {
     fd: OwnedFd,
     ptr: NonNull<u8>,
@@ -364,7 +358,6 @@ pub struct AlignedDataRegion {
 // thread is safe. We intentionally do NOT implement `Sync`.
 unsafe impl Send for AlignedDataRegion {}
 
-#[allow(dead_code)] // Methods used by launcher orchestration in later phases
 impl AlignedDataRegion {
     /// Create an `AlignedDataRegion` from raw tar bytes.
     ///
@@ -575,8 +568,7 @@ mod tests {
     #[test]
     fn create_tar_shared_region() {
         let data = b"fake tar data for testing";
-        let region =
-            TarSharedRegion::from_bytes(data).expect("failed to create tar shared region");
+        let region = TarSharedRegion::from_bytes(data).expect("failed to create tar shared region");
 
         assert!(!region.base_ptr().is_null());
         assert_eq!(region.size(), data.len());
@@ -586,8 +578,7 @@ mod tests {
     #[test]
     fn tar_shmem_data_is_readable() {
         let data = b"hello from tar shmem";
-        let region =
-            TarSharedRegion::from_bytes(data).expect("failed to create tar shared region");
+        let region = TarSharedRegion::from_bytes(data).expect("failed to create tar shared region");
 
         // SAFETY: The mapping is valid and readable for `region.size()` bytes.
         let mapped = unsafe { std::slice::from_raw_parts(region.base_ptr(), region.size()) };
@@ -597,8 +588,7 @@ mod tests {
     #[test]
     fn tar_shmem_fd_is_inheritable() {
         let data = b"inheritable check";
-        let region =
-            TarSharedRegion::from_bytes(data).expect("failed to create tar shared region");
+        let region = TarSharedRegion::from_bytes(data).expect("failed to create tar shared region");
 
         let raw_fd = region.fd_raw();
 
@@ -617,8 +607,7 @@ mod tests {
     #[test]
     fn tar_shmem_visible_from_second_mmap() {
         let data = b"visible across mappings";
-        let region =
-            TarSharedRegion::from_bytes(data).expect("failed to create tar shared region");
+        let region = TarSharedRegion::from_bytes(data).expect("failed to create tar shared region");
 
         // Create a second mapping of the same fd.
         let ptr2 = unsafe {
@@ -667,7 +656,11 @@ mod tests {
             .expect("failed to create AlignedDataRegion");
 
         // Size must be page-aligned.
-        assert_eq!(region.size() % PAGE_SIZE, 0, "region size should be page-aligned");
+        assert_eq!(
+            region.size() % PAGE_SIZE,
+            0,
+            "region size should be page-aligned"
+        );
         assert!(region.size() > 0);
 
         // Verify data is at correct offsets using compute_aligned_offsets.
@@ -676,14 +669,9 @@ mod tests {
 
         for (name, offset, size) in &offsets {
             // SAFETY: The mapping is valid and readable for `region.size()` bytes.
-            let mapped = unsafe {
-                std::slice::from_raw_parts(region.base_ptr().add(*offset), *size)
-            };
-            let expected: &[u8] = if name == "a.txt" {
-                file_a
-            } else {
-                file_b
-            };
+            let mapped =
+                unsafe { std::slice::from_raw_parts(region.base_ptr().add(*offset), *size) };
+            let expected: &[u8] = if name == "a.txt" { file_a } else { file_b };
             assert_eq!(mapped, expected, "data mismatch for {name}");
         }
     }

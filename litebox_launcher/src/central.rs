@@ -161,7 +161,8 @@ mod tests {
 
     #[test]
     fn spawn_and_wait() {
-        let proc = CentralProcess::spawn(0, 0, None, None, None, None, None).expect("spawn should succeed");
+        let proc = CentralProcess::spawn(0, 0, None, None, None, None, None)
+            .expect("spawn should succeed");
         assert!(proc.pid() > 0);
         let mut status: i32 = 0;
         // SAFETY: `proc.pid()` is a valid child PID returned by `fork()`.

@@ -6,7 +6,7 @@
 use core::sync::atomic::Ordering::{Acquire, Relaxed};
 
 use litebox_ipc::cq::{cq_find_by_seq, cq_tail};
-use litebox_ipc::ring::{cq_flags, CqEntry, RingHeader, SharedRingLayout, SqEntry};
+use litebox_ipc::ring::{CqEntry, RingHeader, SharedRingLayout, SqEntry, cq_flags};
 use litebox_ipc::sq::{sq_acquire_slot, sq_publish};
 
 use litebox_ipc::wait::spin_then_wait;
@@ -240,7 +240,7 @@ unsafe fn handle_recvmsg_as_read(tls: *mut MicroTls, args: &SyscallArgs) -> i64 
         unsafe { core::ptr::write_unaligned(msg_control.add(8).cast::<i32>(), 1) }; // cmsg_level = SOL_SOCKET
         unsafe { core::ptr::write_unaligned(msg_control.add(12).cast::<i32>(), 1) }; // cmsg_type = SCM_RIGHTS
         unsafe { core::ptr::write_unaligned(msg_control.add(16).cast::<i32>(), -1) }; // fd = -1
-                                                                                      // Set msg_controllen to CMSG_SPACE(sizeof(int)) = 24.
+        // Set msg_controllen to CMSG_SPACE(sizeof(int)) = 24.
         unsafe { core::ptr::write_unaligned(msg_ptr.add(40).cast::<usize>(), 24) };
     } else if !msg_control.is_null() && msg_controllen > 0 {
         // Buffer too small for a fake cmsghdr — just zero everything.
@@ -771,11 +771,7 @@ fn bidirectional_input_info(nr: u32, args: &[u64; 6]) -> Option<(usize, usize)> 
         libc::SYS_prlimit64 => {
             // prlimit64(pid, resource, new_limit, old_limit): input=arg2 (new_limit)
             // Rlimit64 = 16 bytes (2 × u64)
-            if args[2] != 0 {
-                Some((2, 16))
-            } else {
-                None
-            }
+            if args[2] != 0 { Some((2, 16)) } else { None }
         }
         _ => None,
     }

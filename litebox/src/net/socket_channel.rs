@@ -684,21 +684,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         let (first, second) = slices;
         if !first.is_empty() {
             // Write first slice to shmem RX ring
-            let written = unsafe {
-                litebox_ipc::socket_ring::socket_rx_fill(header, first)
-            };
+            let written = unsafe { litebox_ipc::socket_ring::socket_rx_fill(header, first) };
             if written > 0 {
                 total += written as usize;
             }
 
             // Write second slice if first was fully consumed
-            if written >= 0
-                && (written as usize) == first.len()
-                && !second.is_empty()
-            {
-                let written2 = unsafe {
-                    litebox_ipc::socket_ring::socket_rx_fill(header, second)
-                };
+            if written >= 0 && (written as usize) == first.len() && !second.is_empty() {
+                let written2 = unsafe { litebox_ipc::socket_ring::socket_rx_fill(header, second) };
                 if written2 > 0 {
                     total += written2 as usize;
                 }

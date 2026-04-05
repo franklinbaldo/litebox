@@ -822,7 +822,8 @@ where
             let contiguous = available.min(capacity - start);
 
             // Send the contiguous chunk to smoltcp.
-            let first_slice = unsafe { core::slice::from_raw_parts(tx_data.add(start), contiguous) };
+            let first_slice =
+                unsafe { core::slice::from_raw_parts(tx_data.add(start), contiguous) };
             let sent = tcp_socket.send_slice(first_slice).unwrap_or(0);
             if sent > 0 {
                 head = head.wrapping_add(sent as u64);
@@ -968,7 +969,6 @@ where
                 });
         }
     }
-
 }
 
 impl<Platform> Network<Platform>
@@ -1101,9 +1101,7 @@ where
         };
         let table = self.litebox.descriptor_table();
         for (_, mut entry) in table.iter_mut::<Network<Platform>>() {
-            if entry.entry.network_id == self.id
-                && entry.entry.handle == smoltcp_handle
-            {
+            if entry.entry.network_id == self.id && entry.entry.handle == smoltcp_handle {
                 // Drain any data that the HeapRb path accumulated before the
                 // shmem header was set. This can happen when
                 // `perform_platform_interaction()` runs during `do_accept()`
@@ -1130,9 +1128,7 @@ where
     ///
     /// The caller (net-worker) uses these to futex-wake blocked
     /// readers/writers in the guest after each poll cycle.
-    pub fn active_shmem_headers(
-        &self,
-    ) -> Vec<*mut litebox_ipc::socket_ring::ShmemSocketHeader> {
+    pub fn active_shmem_headers(&self) -> Vec<*mut litebox_ipc::socket_ring::ShmemSocketHeader> {
         let table = self.litebox.descriptor_table();
         let mut headers = Vec::new();
         for (_, entry) in table.iter::<Network<Platform>>() {
