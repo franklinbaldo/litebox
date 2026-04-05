@@ -2459,78 +2459,108 @@ impl<FS: ShimFS> ProcessServer<FS> {
         let mut cq = Self::base_cq(entry);
         let thread_slot = entry.thread_slot;
 
-        // Open the file via shim dispatch (SYS_openat with AT_FDCWD).
-        // Build a null-terminated path in a local buffer.
-        let mut path_cstr = vec![0u8; path_bytes.len() + 1];
-        path_cstr[..path_bytes.len()].copy_from_slice(path_bytes);
-        // Ensure null terminated — path_bytes may already include NUL.
-        if path_bytes.last() == Some(&0) {
-            path_cstr.truncate(path_bytes.len());
-        } else {
-            path_cstr[path_bytes.len()] = 0;
-        }
-
-        let fd = {
-            let mut regs = litebox_common_linux::PtRegs::default();
-            regs.orig_rax = libc::SYS_openat as usize;
-            regs.rdi = libc::AT_FDCWD as usize;
-            regs.rsi = path_cstr.as_ptr() as usize;
-            regs.rdx = libc::O_RDONLY as usize;
-            self.dispatch_to_task(thread_slot, &mut regs)
+        // Compute a normalized path string for tar shmem lookup.
+        let main_path_str_for_lookup = {
+            let pb = if path_bytes.last() == Some(&0) {
+                &path_bytes[..path_bytes.len() - 1]
+            } else {
+                path_bytes
+            };
+            core::str::from_utf8(pb).unwrap_or("")
         };
-        if fd < 0 {
-            cq.result = fd;
-            return cq;
-        }
-        let fd = fd as i32;
+        let normalized_main = main_path_str_for_lookup
+            .strip_prefix('/')
+            .unwrap_or(main_path_str_for_lookup);
 
-        // Get file size via fstat.
-        let file_size = {
-            let mut stat_buf = [0u8; 144];
-            let mut regs = litebox_common_linux::PtRegs::default();
-            regs.orig_rax = libc::SYS_fstat as usize;
-            regs.rdi = fd as usize;
-            regs.rsi = stat_buf.as_mut_ptr() as usize;
-            let result = self.dispatch_to_task(thread_slot, &mut regs);
-            if result < 0 {
-                self.close_fd(thread_slot, fd);
-                cq.result = result;
+        // Try zero-copy fast path: if the binary is in the tar shmem region,
+        // reference it directly instead of openat/pread.
+        #[allow(unused_assignments)]
+        let mut file_data_vec: Vec<u8> = Vec::new();
+        let file_data: &[u8] = if let Some(range) = self.tar_file_map.get(normalized_main) {
+            let len = range.end - range.start;
+            if range.end > self.tar_shmem_size {
+                cq.result = -i64::from(libc::EFAULT);
                 return cq;
             }
-            i64::from_le_bytes(stat_buf[48..56].try_into().unwrap()) as usize
-        };
+            // SAFETY: tar_shmem_base is an mmap'd region that lives for the
+            // entire lifetime of the process. The slice we create here is only
+            // used within this function call, so the pointer remains valid.
+            unsafe { core::slice::from_raw_parts(self.tar_shmem_base.0.add(range.start), len) }
+        } else {
+            // Slow path: open/fstat/pread64/close via shim dispatch.
+            // Build a null-terminated path in a local buffer.
+            let mut path_cstr = vec![0u8; path_bytes.len() + 1];
+            path_cstr[..path_bytes.len()].copy_from_slice(path_bytes);
+            // Ensure null terminated — path_bytes may already include NUL.
+            if path_bytes.last() == Some(&0) {
+                path_cstr.truncate(path_bytes.len());
+            } else {
+                path_cstr[path_bytes.len()] = 0;
+            }
 
-        // Read the entire file.
-        let mut file_data = vec![0u8; file_size];
-        {
-            let mut offset = 0usize;
-            while offset < file_size {
-                let chunk = (file_size - offset).min(1024 * 1024); // 1 MiB chunks
+            let fd = {
                 let mut regs = litebox_common_linux::PtRegs::default();
-                regs.orig_rax = libc::SYS_pread64 as usize;
+                regs.orig_rax = libc::SYS_openat as usize;
+                regs.rdi = libc::AT_FDCWD as usize;
+                regs.rsi = path_cstr.as_ptr() as usize;
+                regs.rdx = libc::O_RDONLY as usize;
+                self.dispatch_to_task(thread_slot, &mut regs)
+            };
+            if fd < 0 {
+                cq.result = fd;
+                return cq;
+            }
+            let fd = fd as i32;
+
+            // Get file size via fstat.
+            let file_size = {
+                let mut stat_buf = [0u8; 144];
+                let mut regs = litebox_common_linux::PtRegs::default();
+                regs.orig_rax = libc::SYS_fstat as usize;
                 regs.rdi = fd as usize;
-                regs.rsi = file_data[offset..].as_mut_ptr() as usize;
-                regs.rdx = chunk;
-                regs.r10 = offset;
+                regs.rsi = stat_buf.as_mut_ptr() as usize;
                 let result = self.dispatch_to_task(thread_slot, &mut regs);
-                if result <= 0 {
+                if result < 0 {
                     self.close_fd(thread_slot, fd);
-                    cq.result = if result == 0 {
-                        -i64::from(libc::EIO)
-                    } else {
-                        result
-                    };
+                    cq.result = result;
                     return cq;
                 }
-                offset += result as usize;
+                i64::from_le_bytes(stat_buf[48..56].try_into().unwrap()) as usize
+            };
+
+            // Read the entire file.
+            file_data_vec = vec![0u8; file_size];
+            {
+                let mut offset = 0usize;
+                while offset < file_size {
+                    let chunk = (file_size - offset).min(1024 * 1024); // 1 MiB chunks
+                    let mut regs = litebox_common_linux::PtRegs::default();
+                    regs.orig_rax = libc::SYS_pread64 as usize;
+                    regs.rdi = fd as usize;
+                    regs.rsi = file_data_vec[offset..].as_mut_ptr() as usize;
+                    regs.rdx = chunk;
+                    regs.r10 = offset;
+                    let result = self.dispatch_to_task(thread_slot, &mut regs);
+                    if result <= 0 {
+                        self.close_fd(thread_slot, fd);
+                        cq.result = if result == 0 {
+                            -i64::from(libc::EIO)
+                        } else {
+                            result
+                        };
+                        return cq;
+                    }
+                    offset += result as usize;
+                }
             }
-        }
-        self.close_fd(thread_slot, fd);
+            self.close_fd(thread_slot, fd);
+            &file_data_vec
+        };
         // If the file starts with `#!`, parse the interpreter path and optional
         // argument, rebuild argv per Linux convention, and re-dispatch with the
         // interpreter binary as the target. Limited to one level of indirection
         // (the interpreter must be an ELF binary).
-        if let Some((interp_path, interp_arg)) = parse_shebang(&file_data) {
+        if let Some((interp_path, interp_arg)) = parse_shebang(file_data) {
             let mut new_argv: Vec<&[u8]> = Vec::new();
             new_argv.push(interp_path);
             if let Some(arg) = interp_arg {
@@ -2548,7 +2578,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
         }
 
         // Parse the ELF.
-        let mut reader = MemReader(&file_data);
+        let mut reader = MemReader(file_data);
         let Ok(mut parsed) = litebox_common_linux::loader::ElfParsedFile::parse(&mut reader) else {
             cq.result = -i64::from(libc::ENOEXEC);
             return cq;
@@ -2673,14 +2703,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
 
         // Main ELF segments.
         // Convert path_bytes to a str for aligned offset lookups.
-        let main_path_str = {
-            let pb = if path_bytes.last() == Some(&0) {
-                &path_bytes[..path_bytes.len() - 1]
-            } else {
-                path_bytes
-            };
-            core::str::from_utf8(pb).unwrap_or("")
-        };
+        let main_path_str = main_path_str_for_lookup;
         for seg in &main_mapper.segments {
             segments.push(SegmentInfo {
                 vaddr: seg.address as u64,
@@ -2781,7 +2804,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 // Actually, we use the parse_trampoline info from the parsed ELF.
                 // For simplicity in this first implementation, compute from file data.
                 let source_data = match seg.file_data_source {
-                    FileSource::Main => &file_data,
+                    FileSource::Main => file_data,
                     FileSource::Interp => {
                         if let Some((ref idata, _)) = interp_data {
                             idata.as_slice()
@@ -2938,7 +2961,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
         for (i, seg) in segments.iter().enumerate() {
             let layout = &seg_layouts[i];
             let source_data = match seg.file_data_source {
-                FileSource::Main => &file_data,
+                FileSource::Main => file_data,
                 FileSource::Interp => {
                     if let Some((ref idata, _)) = interp_data {
                         idata.as_slice()
