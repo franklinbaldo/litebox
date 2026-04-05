@@ -835,21 +835,77 @@ unsafe fn execute_execve(tls: *mut MicroTls, cq: &CqEntry, micro: &MicroState, t
             continue;
         }
 
-        // Copy file data from data region (no kernel call — already mapped RW).
-        if data_len > 0 {
-            let src = if seg.tar_data_offset == u64::MAX {
-                // Ring data region path
-                unsafe { data_base.add(seg.data_offset as usize) }
+        // Copy file data into the segment.
+        //
+        // For tar-backed segments with page-aligned offsets, try mmap(MAP_FIXED)
+        // from the aligned data memfd.  This avoids a memcpy and lets the kernel
+        // page-fault data in lazily (demand paging).  Falls back to memcpy if the
+        // offset is not page-aligned or the mmap call fails.
+        if data_len > 0 && seg.tar_data_offset != u64::MAX {
+            let tar_off = seg.tar_data_offset as usize;
+
+            // Try mmap path: offset must be page-aligned and aligned_fd must be valid.
+            #[allow(clippy::similar_names)]
+            if tar_off.is_multiple_of(4096) && micro.aligned_fd >= 0 && map_len > 0 {
+                let seg_mmap_len = if data_len > map_len { data_len } else { map_len };
+                let seg_mmap_rounded = (seg_mmap_len + 4095) & !4095;
+
+                let result = unsafe {
+                    crate::raw_syscall::mmap(
+                        vaddr,
+                        seg_mmap_rounded,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_FIXED,
+                        micro.aligned_fd,
+                        tar_off as i64,
+                    )
+                };
+
+                if crate::raw_syscall::is_error(result) {
+                    // mmap failed — fall through to memcpy from aligned_base.
+                    if tar_off + data_len > micro.aligned_size {
+                        unsafe { crate::raw_syscall::syscall1(libc::SYS_exit_group, 127) };
+                    }
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            micro.aligned_base.add(tar_off),
+                            vaddr as *mut u8,
+                            data_len,
+                        );
+                    }
+                } else {
+                    // mmap succeeded — zero BSS if data doesn't fill the mapping.
+                    if data_len < map_len {
+                        unsafe {
+                            core::ptr::write_bytes(
+                                (vaddr + data_len) as *mut u8,
+                                0,
+                                map_len - data_len,
+                            );
+                        }
+                    }
+                }
             } else {
-                // Tar shmem path
-                let tar_off = seg.tar_data_offset as usize;
-                if tar_off + data_len > micro.tar_size {
+                // Non-aligned offset or no aligned_fd — memcpy from aligned_base.
+                if tar_off + data_len > micro.aligned_size {
                     unsafe { crate::raw_syscall::syscall1(libc::SYS_exit_group, 127) };
                 }
-                unsafe { micro.tar_base.add(tar_off) }
-            };
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        micro.aligned_base.add(tar_off),
+                        vaddr as *mut u8,
+                        data_len,
+                    );
+                }
+            }
+        } else if data_len > 0 {
+            // Ring data region path (non-tar binary, tar_data_offset == u64::MAX)
             unsafe {
-                core::ptr::copy_nonoverlapping(src, vaddr as *mut u8, data_len);
+                core::ptr::copy_nonoverlapping(
+                    data_base.add(seg.data_offset as usize),
+                    vaddr as *mut u8,
+                    data_len,
+                );
             }
         }
 
