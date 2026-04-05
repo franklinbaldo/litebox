@@ -8,7 +8,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::io::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -934,17 +933,14 @@ impl<FS: ShimFS> ProcessServer<FS> {
     /// - `data_len`: child ring fd number in central's fd table
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn handle_fork(&self, entry: &SqEntry) -> CqEntry {
-        let fork_start = std::time::Instant::now();
         let mut cq = Self::base_cq(entry);
 
         // 1. Acquire a ring for the child from the pool.
-        let t0 = std::time::Instant::now();
         let Ok((child_region, child_ring_fd)) = self.ring_pool.acquire() else {
             eprintln!("[CENTRAL] handle_fork: FAILED to acquire ring (ENOMEM)");
             cq.result = -i64::from(libc::ENOMEM);
             return cq;
         };
-        let ring_acquire_us = t0.elapsed().as_micros();
 
         // Register the child ring so it gets signalled on central exit/panic.
         crate::register_active_ring(child_region.header());
@@ -954,7 +950,6 @@ impl<FS: ShimFS> ProcessServer<FS> {
         self.next_child_pid.set(child_pid + 1);
 
         // 3. Create child task via the shim, inheriting parent's fds and cwd.
-        let t1 = std::time::Instant::now();
         let params = litebox_common_linux::TaskParams {
             pid: child_pid,
             ppid: 1, // parent is the main process
@@ -976,7 +971,6 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 return cq;
             }
         };
-        let fork_task_us = t1.elapsed().as_micros();
 
         // 4. Spawn the child server immediately.
         //
@@ -984,7 +978,6 @@ impl<FS: ShimFS> ProcessServer<FS> {
         // after post-fork initialization.  The child server must already be
         // running its event loop so it can consume that message (and all
         // subsequent syscalls from the child).
-        let t2 = std::time::Instant::now();
         {
             let shim = self.shim.clone();
             let fs = self.fs.clone();
@@ -1033,7 +1026,6 @@ impl<FS: ShimFS> ProcessServer<FS> {
             });
             self.child_handles.borrow_mut().push(handle);
         }
-        let thread_spawn_us = t2.elapsed().as_micros();
 
         // 5. Return info to micro.
         let central_pid = std::process::id();
@@ -1041,19 +1033,6 @@ impl<FS: ShimFS> ProcessServer<FS> {
         cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
         cq.data_offset = child_pid as u32;
         cq.data_len = child_ring_fd as u32;
-
-        let total_us = fork_start.elapsed().as_micros();
-        // Write perf data to a dedicated file to avoid stderr buffering issues.
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/litebox_perf.log")
-        {
-            let _ = writeln!(
-                f,
-                "FORK pid={child_pid} total={total_us}us ring_acquire={ring_acquire_us}us fork_task={fork_task_us}us thread_spawn={thread_spawn_us}us"
-            );
-        }
 
         cq
     }
@@ -2702,6 +2681,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
             } else {
                 None
             };
+
         let mut main_mapper = SimpleMapper::new();
         let mut main_mem = SimpleMem::new();
         let Ok(main_info) = parsed.load(&mut main_mapper, &mut main_mem) else {
@@ -2893,6 +2873,77 @@ impl<FS: ShimFS> ProcessServer<FS> {
         let (interp_range_base, interp_range_len) = interp_info
             .as_ref()
             .map_or((0, 0), |(_, imapper, _)| imapper.range());
+
+        // Compute file base offsets for range-level mmap.
+        //
+        // For each binary, find the base offset in the aligned memfd and the
+        // page-rounded length of file data that covers the virtual address range.
+        // This allows micro to do a single mmap(MAP_FIXED, aligned_fd, base)
+        // instead of per-segment mmaps.
+        let (main_file_base_offset, main_file_map_len) = {
+            let normalized = normalized_main;
+            if let Some(&(aligned_start, file_size)) = self.aligned_file_map.get(normalized) {
+                // The file's first LOAD segment starts at p_offset which corresponds
+                // to aligned_start + p_offset in the memfd.  The loader adjusts
+                // vaddr to page_align_down(p_vaddr), so file_offset for segment 0
+                // is p_offset - (p_vaddr - page_align_down(p_vaddr)).  For PIE
+                // binaries, segment 0 typically has p_vaddr=0, so file_offset=0.
+                //
+                // main_range_base = base_addr + page_align_down(first_p_vaddr)
+                // The first segment's file_offset gives us how far into the file
+                // the main range starts.
+                let first_file_offset = main_mapper
+                    .segments
+                    .first()
+                    .map_or(0, |s| s.file_offset as usize);
+                let file_base = aligned_start + first_file_offset;
+                // The length is min(file_size - first_file_offset, main_range_len),
+                // page-rounded up.
+                let available = file_size.saturating_sub(first_file_offset);
+                let map_len = available.min(main_range_len);
+                let map_len_rounded = (map_len + 4095) & !4095;
+                // Bounds check
+                if file_base + map_len_rounded <= self.aligned_size {
+                    (file_base as u64, map_len_rounded as u64)
+                } else {
+                    (u64::MAX, 0u64)
+                }
+            } else {
+                (u64::MAX, 0u64)
+            }
+        };
+
+        let (interp_file_base_offset, interp_file_map_len) = if interp_range_len > 0 {
+            let interp_path_str = interp_name.as_ref().map_or("", |name| {
+                let bytes = name.to_bytes();
+                core::str::from_utf8(bytes).unwrap_or("")
+            });
+            let normalized_interp_for_range = interp_path_str
+                .strip_prefix('/')
+                .unwrap_or(interp_path_str);
+            if let Some(&(aligned_start, file_size)) =
+                self.aligned_file_map.get(normalized_interp_for_range)
+            {
+                let imapper = interp_info.as_ref().map(|(_, im, _)| im);
+                let first_file_offset = imapper
+                    .and_then(|im| im.segments.first())
+                    .map_or(0, |s| s.file_offset as usize);
+                let file_base = aligned_start + first_file_offset;
+                let available = file_size.saturating_sub(first_file_offset);
+                let map_len = available.min(interp_range_len);
+                let map_len_rounded = (map_len + 4095) & !4095;
+                if file_base + map_len_rounded <= self.aligned_size {
+                    (file_base as u64, map_len_rounded as u64)
+                } else {
+                    (u64::MAX, 0u64)
+                }
+            } else {
+                (u64::MAX, 0u64)
+            }
+        } else {
+            (u64::MAX, 0u64)
+        };
+
         let hdr = ExecveHeaderCentral {
             num_segments: num_segments as u32,
             _pad0: 0,
@@ -2916,6 +2967,10 @@ impl<FS: ShimFS> ProcessServer<FS> {
             main_range_len: main_range_len as u64,
             interp_range_base: interp_range_base as u64,
             interp_range_len: interp_range_len as u64,
+            main_file_base_offset,
+            main_file_map_len,
+            interp_file_base_offset,
+            interp_file_map_len,
         };
 
         // Copy header bytes.
@@ -3433,6 +3488,10 @@ struct ExecveHeaderCentral {
     main_range_len: u64,
     interp_range_base: u64,
     interp_range_len: u64,
+    main_file_base_offset: u64,
+    main_file_map_len: u64,
+    interp_file_base_offset: u64,
+    interp_file_map_len: u64,
 }
 
 /// Mirror of `ExecveSegment` from `litebox_micro::execve`.

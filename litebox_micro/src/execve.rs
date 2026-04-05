@@ -6,13 +6,9 @@
 
 use litebox_ipc::ring::{CqEntry, cq_flags};
 
-use crate::perf;
 use crate::state::MicroState;
 use crate::tls::MicroTls;
 use crate::trampoline::SyscallArgs;
-
-/// Global exec counter for profiling (atomic, no_std safe).
-static EXEC_SERIAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 // ── Data structures ──────────────────────────────────────────────────────
 
@@ -66,6 +62,16 @@ pub struct ExecveHeader {
     pub interp_range_base: u64,
     /// Total length of the interpreter's virtual address range (0 if no interp).
     pub interp_range_len: u64,
+    /// Offset in aligned memfd where the main binary's file data starts (for
+    /// range-level mmap).  `u64::MAX` means the main binary is not in aligned memfd.
+    pub main_file_base_offset: u64,
+    /// Page-rounded length of the main binary's file data to mmap from aligned memfd.
+    pub main_file_map_len: u64,
+    /// Offset in aligned memfd where the interpreter's file data starts.
+    /// `u64::MAX` means the interpreter is not in aligned memfd.
+    pub interp_file_base_offset: u64,
+    /// Page-rounded length of the interpreter's file data to mmap from aligned memfd.
+    pub interp_file_map_len: u64,
 }
 
 /// Describes a loaded ELF segment that micro must map.
@@ -388,7 +394,6 @@ fn build_exec_stack(
     clippy::cast_possible_wrap
 )]
 pub unsafe fn handle_execve(tls: *mut MicroTls, args: &SyscallArgs) -> i64 {
-    let t0 = perf::now_ns();
     let micro = unsafe { &*(*tls).micro };
 
     // Extract execve arguments.
@@ -413,8 +418,6 @@ pub unsafe fn handle_execve(tls: *mut MicroTls, args: &SyscallArgs) -> i64 {
         return -i64::from(libc::E2BIG);
     };
 
-    let t_serialized = perf::now_ns();
-
     // Submit SYS_execve to central with the serialized data.
     // We build a custom SQ entry with data_offset=0, data_len=serialized length.
     // The submit_and_wait function handles the normal pathname copy, but for execve
@@ -423,8 +426,6 @@ pub unsafe fn handle_execve(tls: *mut MicroTls, args: &SyscallArgs) -> i64 {
     // Override the args so central knows where the data is.
     // We'll use a special submission that sets data fields.
     let cq = unsafe { submit_execve_sq(tls, args.nr as u32, &sq_args, data_len as u32) };
-
-    let t_roundtrip = perf::now_ns();
 
     if cq.result < 0 {
         return cq.result;
@@ -435,17 +436,8 @@ pub unsafe fn handle_execve(tls: *mut MicroTls, args: &SyscallArgs) -> i64 {
         return -i64::from(libc::ENOEXEC);
     }
 
-    // Record timing info and pass to execute_execve.
-    let serial = EXEC_SERIAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let timing = ExecveTiming {
-        serial,
-        t0,
-        t_serialized,
-        t_roundtrip,
-    };
-
     // Point of no return — execute the new binary.
-    unsafe { execute_execve(tls, &cq, micro, &timing) }
+    unsafe { execute_execve(tls, &cq, micro) }
 }
 
 /// Submit an execve SQ entry with pre-populated data region.
@@ -631,17 +623,6 @@ fn protect_range_gaps(
 
 // ── Execute execve ──────────────────────────────────────────────────────
 
-/// Timing data collected in `handle_execve` and passed to `execute_execve`.
-struct ExecveTiming {
-    serial: u64,
-    /// Timestamp at the start of `handle_execve`.
-    t0: u64,
-    /// Timestamp after serializing args.
-    t_serialized: u64,
-    /// Timestamp after the ring round-trip to central.
-    t_roundtrip: u64,
-}
-
 /// Execute an execve prepared by central. Does NOT return.
 ///
 /// # Safety
@@ -657,7 +638,6 @@ unsafe fn execute_execve(
     tls: *mut MicroTls,
     cq: &CqEntry,
     micro: &MicroState,
-    timing: &ExecveTiming,
 ) -> ! {
     let data_region_ptr = unsafe { micro.ring_base.add(micro.layout.data_region_offset) };
     let data_base = unsafe { data_region_ptr.add(cq.data_offset as usize) };
@@ -706,8 +686,6 @@ unsafe fn execute_execve(
     let argv_refs: &[&[u8]] = &argv_strings[..argc];
     let envp_refs: &[&[u8]] = &envp_strings[..envc];
 
-    let t_parse = perf::now_ns();
-
     // Allocate a new stack (must happen before segment mapping too).
     let stack_ret = unsafe {
         crate::raw_syscall::mmap(
@@ -726,8 +704,6 @@ unsafe fn execute_execve(
     }
 
     let stack_pointer = build_exec_stack(stack_base, STACK_SIZE, argv_refs, envp_refs, header);
-
-    let t_stack = perf::now_ns();
 
     let entry_point = header.entry_point as usize;
 
@@ -765,46 +741,176 @@ unsafe fn execute_execve(
     // memcpy each segment's data and mprotect to final permissions.
     // Gaps between segments within each range are protected PROT_NONE.
 
-    let t_pre_map = perf::now_ns();
-
-    // ── Phase 1: Bulk mmap — one per binary ───────────────────────────
+    // ── Phase 1: Range-level mmap — one per binary ────────────────────
+    //
+    // Instead of bulk anonymous mmap + per-segment file-backed mmap overlays
+    // (~12 kernel calls), we do 1-2 mmaps per binary:
+    //   1. A single file-backed mmap(MAP_FIXED, MAP_PRIVATE, aligned_fd, file_base)
+    //      covering the file-backed portion of the virtual range.
+    //   2. If the virtual range extends beyond the file data (BSS tail),
+    //      an anonymous mmap for the remainder.
+    //
+    // This works because the entire ELF file is contiguous in the aligned
+    // memfd and ELF segments maintain a constant vaddr-to-file-offset
+    // relationship.  Gaps between segments within each range are later
+    // protected with PROT_NONE.
 
     let main_base = header.main_range_base as usize;
     let main_len = header.main_range_len as usize;
     let interp_base = header.interp_range_base as usize;
     let interp_len = header.interp_range_len as usize;
 
+    // Track whether file-backed range mmaps actually succeeded.
+    let mut main_file_mmap_ok = false;
+    let mut interp_file_mmap_ok = false;
+
+    // Map main binary range.
     if main_len > 0 {
-        let ret = unsafe {
-            crate::raw_syscall::mmap(
-                main_base,
-                main_len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        if crate::raw_syscall::is_error(ret) {
-            unsafe { crate::raw_syscall::syscall1(libc::SYS_exit_group, 127) };
-            unreachable!();
+        let file_base = header.main_file_base_offset;
+        let file_map_len = header.main_file_map_len as usize;
+
+        if file_base != u64::MAX && file_map_len > 0 && micro.aligned_fd >= 0 {
+            // File-backed mmap covering the entire main binary's file data.
+            let ret = unsafe {
+                crate::raw_syscall::mmap(
+                    main_base,
+                    file_map_len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_FIXED | libc::MAP_PRIVATE,
+                    micro.aligned_fd,
+                    file_base as i64,
+                )
+            };
+            if crate::raw_syscall::is_error(ret) {
+                // Fallback to anonymous mmap for the whole range.
+                let ret2 = unsafe {
+                    crate::raw_syscall::mmap(
+                        main_base,
+                        main_len,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                if crate::raw_syscall::is_error(ret2) {
+                    unsafe { crate::raw_syscall::syscall1(libc::SYS_exit_group, 127) };
+                    unreachable!();
+                }
+
+            } else {
+                main_file_mmap_ok = true;
+
+                // If the virtual range extends beyond file data (BSS tail),
+                // map the remainder as anonymous.
+                if main_len > file_map_len {
+                    let bss_base = main_base + file_map_len;
+                    let bss_len = main_len - file_map_len;
+                    let ret2 = unsafe {
+                        crate::raw_syscall::mmap(
+                            bss_base,
+                            bss_len,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                            libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                            -1,
+                            0,
+                        )
+                    };
+                    if crate::raw_syscall::is_error(ret2) {
+                        unsafe { crate::raw_syscall::syscall1(libc::SYS_exit_group, 127) };
+                        unreachable!();
+                    }
+    
+                }
+            }
+        } else {
+            // No aligned memfd — anonymous mmap for the whole range.
+            let ret = unsafe {
+                crate::raw_syscall::mmap(
+                    main_base,
+                    main_len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if crate::raw_syscall::is_error(ret) {
+                unsafe { crate::raw_syscall::syscall1(libc::SYS_exit_group, 127) };
+                unreachable!();
+            }
         }
     }
 
+    // Map interpreter range.
     if interp_len > 0 {
-        let ret = unsafe {
-            crate::raw_syscall::mmap(
-                interp_base,
-                interp_len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        if crate::raw_syscall::is_error(ret) {
-            unsafe { crate::raw_syscall::syscall1(libc::SYS_exit_group, 127) };
-            unreachable!();
+        let file_base = header.interp_file_base_offset;
+        let file_map_len = header.interp_file_map_len as usize;
+
+        if file_base != u64::MAX && file_map_len > 0 && micro.aligned_fd >= 0 {
+            let ret = unsafe {
+                crate::raw_syscall::mmap(
+                    interp_base,
+                    file_map_len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_FIXED | libc::MAP_PRIVATE,
+                    micro.aligned_fd,
+                    file_base as i64,
+                )
+            };
+            if crate::raw_syscall::is_error(ret) {
+                let ret2 = unsafe {
+                    crate::raw_syscall::mmap(
+                        interp_base,
+                        interp_len,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                if crate::raw_syscall::is_error(ret2) {
+                    unsafe { crate::raw_syscall::syscall1(libc::SYS_exit_group, 127) };
+                    unreachable!();
+                }
+
+            } else {
+                interp_file_mmap_ok = true;
+                if interp_len > file_map_len {
+                    let bss_base = interp_base + file_map_len;
+                    let bss_len = interp_len - file_map_len;
+                    let ret2 = unsafe {
+                        crate::raw_syscall::mmap(
+                            bss_base,
+                            bss_len,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                            libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                            -1,
+                            0,
+                        )
+                    };
+                    if crate::raw_syscall::is_error(ret2) {
+                        unsafe { crate::raw_syscall::syscall1(libc::SYS_exit_group, 127) };
+                        unreachable!();
+                    }
+    
+                }
+            }
+        } else {
+            let ret = unsafe {
+                crate::raw_syscall::mmap(
+                    interp_base,
+                    interp_len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if crate::raw_syscall::is_error(ret) {
+                unsafe { crate::raw_syscall::syscall1(libc::SYS_exit_group, 127) };
+                unreachable!();
+            }
         }
     }
 
@@ -828,11 +934,20 @@ unsafe fn execute_execve(
     let mut tramp_mprotects: [(usize, usize); 2] = [(0, 0); 2];
     let mut tramp_mprotect_count: usize = 0;
 
-    // ── Pass 1: Copy all data while everything is still RW ────────────
+    // ── Pass 1: BSS zeroing + non-tar data copy + trampoline patching ──
     //
-    // The bulk mmap created the entire range as RW.  We copy file data
-    // and handle trampolines (which need to write-then-patch) before
-    // any mprotect changes permissions.
+    // The range-level mmap in Phase 1 already placed file-backed data for
+    // tar-backed binaries.  We only need to:
+    //   (a) Zero BSS within file-backed pages (data past p_filesz may
+    //       contain section headers or trampoline data).
+    //   (b) Copy data for non-tar segments from the ring data region.
+    //   (c) Patch trampoline code while pages are still RW.
+    //
+    // Use the tracked mmap success flags instead of re-checking header
+    // fields, since the mmap itself may have failed even when headers
+    // indicated file-backed mapping was possible.
+    let main_range_mapped = main_file_mmap_ok;
+    let interp_range_mapped = interp_file_mmap_ok;
 
     for i in 0..num_segments {
         let seg = unsafe {
@@ -849,60 +964,41 @@ unsafe fn execute_execve(
             continue;
         }
 
-        // Copy file data into the segment.
-        //
-        // For tar-backed segments with page-aligned offsets, try mmap(MAP_FIXED)
-        // from the aligned data memfd.  This avoids a memcpy and lets the kernel
-        // page-fault data in lazily (demand paging).  Falls back to memcpy if the
-        // offset is not page-aligned or the mmap call fails.
         if data_len > 0 && seg.tar_data_offset != u64::MAX {
-            let tar_off = seg.tar_data_offset as usize;
-
-            // Try mmap path: offset must be page-aligned and aligned_fd must be valid.
-            #[allow(clippy::similar_names)]
-            if tar_off.is_multiple_of(4096) && micro.aligned_fd >= 0 {
-                // Only mmap the file-backed portion (data_len), page-rounded.
-                // The BSS beyond data_len is already zero from the bulk anonymous mmap.
-                let seg_mmap_rounded = (data_len + 4095) & !4095;
-
-                // Bounds check: ensure the mmap region fits within the aligned memfd.
-                // If not, skip mmap and fall through to memcpy below.
-                let mmap_ok = tar_off + seg_mmap_rounded <= micro.aligned_size;
-
-                let result = if mmap_ok {
-                    unsafe {
-                        crate::raw_syscall::mmap(
-                            vaddr,
-                            seg_mmap_rounded,
-                            libc::PROT_READ | libc::PROT_WRITE,
-                            libc::MAP_PRIVATE | libc::MAP_FIXED,
-                            micro.aligned_fd,
-                            tar_off as i64,
-                        )
-                    }
-                } else {
-                    -1_i64 // Force fallback to memcpy
-                };
-
-                if crate::raw_syscall::is_error(result) {
-                    // mmap failed — fall through to memcpy from aligned_base.
-                    if micro.aligned_base.is_null() || tar_off + data_len > micro.aligned_size {
-                        unsafe { crate::raw_syscall::syscall1(libc::SYS_exit_group, 127) };
-                    }
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            micro.aligned_base.add(tar_off),
-                            vaddr as *mut u8,
-                            data_len,
-                        );
-                    }
-                } else {
-                    // mmap succeeded — BSS within file-backed pages is handled
-                    // by bss_zero_offset zeroing below.  BSS beyond data_len
-                    // is already zero from the bulk anonymous mmap.
-                }
+            // Tar-backed segment.
+            //
+            // Check if this segment's binary had a successful range-level mmap
+            // AND that the range-level mmap placed the data at the correct
+            // virtual address for this specific segment.
+            //
+            // Range-level mmap assumes a constant vaddr-to-file-offset mapping:
+            //   data at vaddr V comes from memfd offset (file_base + V - range_base)
+            // But this invariant can break in PIE binaries where the linker
+            // inserts a virtual address gap between RO and RW segments (for
+            // RELRO).  When it breaks, the data at this segment's vaddr is
+            // from the WRONG file offset and must be corrected via memcpy.
+            let in_main_range = main_len > 0
+                && vaddr >= main_base
+                && vaddr + map_len <= main_base + main_len;
+            let (range_mapped, range_base, file_base_offset) = if in_main_range {
+                (main_range_mapped, main_base, header.main_file_base_offset)
             } else {
-                // Non-aligned offset or no aligned_fd — memcpy from aligned_base.
+                (interp_range_mapped, interp_base, header.interp_file_base_offset)
+            };
+
+            // Check if the range-level mmap placed data correctly for THIS segment.
+            // Expected memfd offset = file_base_offset + (vaddr - range_base)
+            // Actual per-segment memfd offset = seg.tar_data_offset
+            let data_correctly_placed = if range_mapped && file_base_offset != u64::MAX {
+                let expected = file_base_offset as usize + (vaddr - range_base);
+                expected == seg.tar_data_offset as usize
+            } else {
+                false
+            };
+
+            if !data_correctly_placed {
+                // Range-level mmap wasn't used or placed wrong data — memcpy.
+                let tar_off = seg.tar_data_offset as usize;
                 if micro.aligned_base.is_null() || tar_off + data_len > micro.aligned_size {
                     unsafe { crate::raw_syscall::syscall1(libc::SYS_exit_group, 127) };
                 }
@@ -1027,19 +1123,26 @@ unsafe fn execute_execve(
         }
     }
 
-    // ── Pass 2: Set final permissions ─────────────────────────────────
+    // ── Pass 2: Set final permissions (coalesced) ─────────────────────
     //
-    // Now that all data is copied and trampolines are patched, apply
-    // final protections.  This avoids needing to toggle trampoline pages
-    // back to RW (saves 2 kernel calls).
+    // Collect all segments + trampolines that need non-RW permissions,
+    // sort by vaddr, and merge adjacent entries with the same prot into
+    // single mprotect calls.  This reduces kernel syscalls from O(segments)
+    // to O(distinct protection regions).
 
+    // Max entries: num_segments + 2 trampolines.
+    #[allow(clippy::items_after_statements)]
+    const MAX_PROT_ENTRIES: usize = 18;
+    let mut prot_entries: [(usize, usize, i32); MAX_PROT_ENTRIES] = [(0, 0, 0); MAX_PROT_ENTRIES];
+    let mut prot_count: usize = 0;
+
+    // Collect segment entries that need non-RW protection.
     for i in 0..num_segments {
         let seg = unsafe {
             &*(segments_ptr
                 .add(i * core::mem::size_of::<ExecveSegment>())
                 .cast::<ExecveSegment>())
         };
-
         let vaddr = seg.vaddr as usize;
         let map_len = seg.map_len as usize;
         let final_prot = seg.prot as i32;
@@ -1047,16 +1150,51 @@ unsafe fn execute_execve(
         if map_len == 0 {
             continue;
         }
-
-        if final_prot != (libc::PROT_READ | libc::PROT_WRITE) {
-            unsafe { crate::raw_syscall::mprotect(vaddr, map_len, final_prot) };
+        if final_prot != (libc::PROT_READ | libc::PROT_WRITE) && prot_count < MAX_PROT_ENTRIES {
+            prot_entries[prot_count] = (vaddr, map_len, final_prot);
+            prot_count += 1;
         }
     }
 
-    // Apply RX protection to trampolines.
+    // Add trampoline entries (RX protection).
     for &(addr, size) in tramp_mprotects.iter().take(tramp_mprotect_count) {
-        unsafe {
-            crate::raw_syscall::mprotect(addr, size, libc::PROT_READ | libc::PROT_EXEC);
+        if prot_count < MAX_PROT_ENTRIES {
+            prot_entries[prot_count] = (addr, size, libc::PROT_READ | libc::PROT_EXEC);
+            prot_count += 1;
+        }
+    }
+
+    // Sort by vaddr (insertion sort — small array, no_std).
+    for i in 1..prot_count {
+        let mut j = i;
+        while j > 0 && prot_entries[j].0 < prot_entries[j - 1].0 {
+            prot_entries.swap(j, j - 1);
+            j -= 1;
+        }
+    }
+
+    // Merge adjacent entries with the same prot and emit coalesced mprotect calls.
+    {
+        let mut i = 0;
+        while i < prot_count {
+            let mut end = prot_entries[i].0 + prot_entries[i].1;
+            let prot = prot_entries[i].2;
+            let start = prot_entries[i].0;
+
+            // Merge with subsequent entries that have the same prot and are
+            // adjacent (or overlapping).
+            let mut j = i + 1;
+            while j < prot_count && prot_entries[j].2 == prot && prot_entries[j].0 <= end {
+                let j_end = prot_entries[j].0 + prot_entries[j].1;
+                if j_end > end {
+                    end = j_end;
+                }
+                j += 1;
+            }
+
+            unsafe { crate::raw_syscall::mprotect(start, end - start, prot) };
+
+            i = j;
         }
     }
 
@@ -1068,25 +1206,6 @@ unsafe fn execute_execve(
 
     protect_range_gaps(main_base, main_len, &main_extents, main_ext_count);
     protect_range_gaps(interp_base, interp_len, &interp_extents, interp_ext_count);
-
-    // ── Write profiling data (BEFORE the asm jump) ─────────────────────
-    let t_mapped = perf::now_ns();
-    perf::write_perf_line(
-        timing.serial,
-        &[
-            ("serialize_ns", timing.t_serialized.wrapping_sub(timing.t0)),
-            (
-                "roundtrip_ns",
-                timing.t_roundtrip.wrapping_sub(timing.t_serialized),
-            ),
-            ("parse_ns", t_parse.wrapping_sub(timing.t_roundtrip)),
-            ("stack_ns", t_stack.wrapping_sub(t_parse)),
-            ("setup_ns", t_pre_map.wrapping_sub(t_stack)),
-            ("map_segments_ns", t_mapped.wrapping_sub(t_pre_map)),
-            ("num_segments", num_segments as u64),
-            ("total_ns", t_mapped.wrapping_sub(timing.t0)),
-        ],
-    );
 
     // Jump to the new entry point. This never returns.
     //
@@ -1171,9 +1290,9 @@ mod tests {
         // Verify the struct is a reasonable size (no unexpected padding).
         let size = core::mem::size_of::<ExecveHeader>();
         assert!(size > 0);
-        // ExecveHeader has: 2*u32 + 4*u64 + 2*u32 + u64 + 2*u32 + 4*u32 + u64 + 2*u64 + 4*u64
-        // = 8 + 32 + 8 + 8 + 8 + 16 + 8 + 16 + 32 = 136 bytes
-        assert_eq!(size, 136);
+        // ExecveHeader has: 2*u32 + 4*u64 + 2*u32 + u64 + 2*u32 + 4*u32 + u64 + 2*u64 + 4*u64 + 4*u64
+        // = 8 + 32 + 8 + 8 + 8 + 16 + 8 + 16 + 32 + 32 = 168 bytes
+        assert_eq!(size, 168);
     }
 
     #[test]
@@ -1256,6 +1375,10 @@ mod tests {
             main_range_len: 0,
             interp_range_base: 0,
             interp_range_len: 0,
+            main_file_base_offset: u64::MAX,
+            main_file_map_len: 0,
+            interp_file_base_offset: u64::MAX,
+            interp_file_map_len: 0,
         };
 
         let sp = build_exec_stack(base, stack_size, &argv, &envp, &header);
