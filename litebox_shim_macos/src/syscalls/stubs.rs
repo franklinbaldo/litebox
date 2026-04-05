@@ -7,10 +7,12 @@
 //! bootstrap and hello.c execution.
 
 use alloc::boxed::Box;
-use litebox::platform::{RawConstPointer as _, RawMutPointer as _, ThreadProvider as _};
+use litebox::platform::{
+    Instant as _, RawConstPointer as _, RawMutPointer as _, ThreadProvider as _, TimeProvider as _,
+};
+use litebox_common_macos::PtRegs;
 use litebox_common_macos::errno::Errno;
 use litebox_common_macos::syscall::mach_trap;
-use litebox_common_macos::PtRegs;
 
 use crate::{MutPtr, ShimFS, Task};
 
@@ -212,10 +214,37 @@ impl<FS: ShimFS> Task<FS> {
     /// Dispatch a Mach trap by trap number.
     pub(crate) fn do_mach_trap(&self, number: usize, ctx: &mut PtRegs) -> Result<usize, Errno> {
         match number {
+            mach_trap::MACH_ABSOLUTE_TIME_TRAP => {
+                // mach_absolute_time() returns nanoseconds since boot on Apple Silicon
+                // (timebase is 1:1).
+                let now = self.global.platform.now();
+                let elapsed = now.duration_since(&self.global.boot_time);
+                #[allow(clippy::cast_possible_truncation)]
+                Ok(elapsed.as_nanos() as usize)
+            }
+            mach_trap::MACH_TIMEBASE_INFO_TRAP => {
+                // mach_timebase_info_trap(mach_timebase_info_t info)
+                // x0 = pointer to struct { uint32_t numer; uint32_t denom; }
+                // On Apple Silicon: numer=1, denom=1.
+                let info_ptr = MutPtr::<u32>::from_usize(ctx.regs[0]);
+                let _ = info_ptr.write_at_offset(0, 1_u32); // numer
+                let _ = info_ptr.write_at_offset(1, 1_u32); // denom
+                Ok(0) // KERN_SUCCESS
+            }
             mach_trap::KERNELRPC_MACH_VM_ALLOCATE_TRAP => self.sys_mach_vm_allocate(ctx),
             mach_trap::KERNELRPC_MACH_VM_DEALLOCATE_TRAP => self.sys_mach_vm_deallocate(ctx),
             mach_trap::KERNELRPC_MACH_VM_PROTECT_TRAP => self.sys_mach_vm_protect(ctx),
             mach_trap::KERNELRPC_MACH_VM_MAP_TRAP => self.sys_mach_vm_map(ctx),
+            mach_trap::KERNELRPC_MACH_PORT_DEALLOCATE_TRAP => {
+                // _kernelrpc_mach_port_deallocate_trap(target, name)
+                // No-op stub — we don't track port reference counts.
+                log_unsupported!(
+                    "mach_port_deallocate_trap(target={:#x}, name={:#x}) → KERN_SUCCESS",
+                    ctx.regs[0],
+                    ctx.regs[1]
+                );
+                Ok(0) // KERN_SUCCESS
+            }
             mach_trap::MACH_PORT_CONSTRUCT_TRAP => {
                 // mach_port_construct_trap(target, options, context, name_out)
                 // Used by dyld for port construction. Return KERN_SUCCESS.

@@ -806,7 +806,6 @@ struct GlobalState<FS: ShimFS> {
     /// The network subsystem (AF_INET sockets via smoltcp).
     net: litebox::sync::Mutex<Platform, Network<Platform>>,
     /// The time when the shim was started.
-    #[expect(dead_code, reason = "will be used for clock_gettime and similar")]
     boot_time: <Platform as TimeProvider>::Instant,
     /// Raw file descriptor mapping (integer fd -> TypedFd).
     raw_descriptors: litebox::sync::RwLock<Platform, RawDescriptorStorage>,

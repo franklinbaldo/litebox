@@ -94,10 +94,13 @@ pub mod nr {
 /// Mach trap numbers (negative x16 values, stored as positive constants).
 /// The actual x16 value is the negation of these.
 pub mod mach_trap {
+    pub const MACH_ABSOLUTE_TIME_TRAP: usize = 3;
+    pub const MACH_TIMEBASE_INFO_TRAP: usize = 6;
     pub const KERNELRPC_MACH_VM_ALLOCATE_TRAP: usize = 10;
     pub const KERNELRPC_MACH_VM_DEALLOCATE_TRAP: usize = 12;
     pub const KERNELRPC_MACH_VM_PROTECT_TRAP: usize = 14;
     pub const KERNELRPC_MACH_VM_MAP_TRAP: usize = 15;
+    pub const KERNELRPC_MACH_PORT_DEALLOCATE_TRAP: usize = 18;
     pub const MACH_PORT_CONSTRUCT_TRAP: usize = 24;
     pub const MACH_REPLY_PORT: usize = 26;
     pub const THREAD_SELF_TRAP: usize = 27;
