@@ -81,6 +81,10 @@ pub mod nr {
     pub const SENDTO: usize = 133;
     pub const SHUTDOWN: usize = 134;
     pub const SOCKETPAIR: usize = 135;
+    pub const SELECT: usize = 93;
+    pub const POLL: usize = 230;
+    pub const KQUEUE: usize = 362;
+    pub const KEVENT: usize = 363;
 }
 
 /// Mach trap numbers (negative x16 values, stored as positive constants).
@@ -416,6 +420,27 @@ pub enum MacosSyscallRequest {
         addr: u64,
         addrlen: u64,
     },
+    Select {
+        nfds: u32,
+        readfds: usize,
+        writefds: usize,
+        errorfds: usize,
+        timeout: usize,
+    },
+    Poll {
+        fds: usize,
+        nfds: u32,
+        timeout: i32,
+    },
+    Kqueue,
+    Kevent {
+        kq: i32,
+        changelist: usize,
+        nchanges: i32,
+        eventlist: usize,
+        nevents: i32,
+        timeout: usize,
+    },
     Unknown {
         number: usize,
     },
@@ -727,6 +752,27 @@ impl MacosSyscallRequest {
                 fd: a0 as u32,
                 addr: a1 as u64,
                 addrlen: a2 as u64,
+            },
+            nr::SELECT => MacosSyscallRequest::Select {
+                nfds: a0 as u32,
+                readfds: a1,
+                writefds: a2,
+                errorfds: a3,
+                timeout: a4,
+            },
+            nr::POLL => MacosSyscallRequest::Poll {
+                fds: a0,
+                nfds: a1 as u32,
+                timeout: a2 as i32,
+            },
+            nr::KQUEUE => MacosSyscallRequest::Kqueue,
+            nr::KEVENT => MacosSyscallRequest::Kevent {
+                kq: a0 as i32,
+                changelist: a1,
+                nchanges: a2 as i32,
+                eventlist: a3,
+                nevents: a4 as i32,
+                timeout: a5,
             },
             _ => MacosSyscallRequest::Unknown { number: nr_raw },
         }
