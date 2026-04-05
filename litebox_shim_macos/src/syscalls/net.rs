@@ -235,6 +235,8 @@ struct CTimeval {
 // Address read/write helpers
 // ---------------------------------------------------------------------------
 
+use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+
 use crate::{ConstPtr, MutPtr};
 
 /// Read a socket address from guest memory.
@@ -653,5 +655,576 @@ impl<FS: ShimFS> Task<FS> {
     /// Placeholder for AF_UNIX accept.
     fn do_accept_unix(&self, _fd: u32, _addr: u64, _addrlen: u64) -> Result<usize, Errno> {
         Err(Errno::ENOTSOCK)
+    }
+
+    /// Handle `connect(fd, addr, addrlen)`.
+    pub(crate) fn sys_connect(&self, fd: u32, addr: u64, addrlen: u32) -> Result<(), Errno> {
+        let sockaddr = read_sockaddr_from_user(addr, addrlen)?;
+        match sockaddr {
+            SocketAddress::Inet(endpoint) => {
+                let rds = self.global.raw_descriptors.read();
+                let typed_fd = rds
+                    .fd_from_raw_integer::<Network<Platform>>(fd as usize)
+                    .map_err(|_| Errno::ENOTSOCK)?;
+                drop(rds);
+                self.global
+                    .net
+                    .lock()
+                    .connect(&typed_fd, &core::net::SocketAddr::V4(endpoint), false)
+                    .map_err(connect_error_to_errno)
+            }
+            SocketAddress::Unix(_unix_addr) => {
+                // Unix connect will be implemented in Task 14.
+                Err(Errno::EAFNOSUPPORT)
+            }
+        }
+    }
+
+    /// Handle `sendto(fd, buf, len, flags, dest_addr, addrlen)`.
+    pub(crate) fn sys_sendto(
+        &self,
+        fd: u32,
+        buf: u64,
+        len: u64,
+        _flags: u32,
+        dest_addr: u64,
+        addrlen: u32,
+    ) -> Result<usize, Errno> {
+        // Read data from guest memory.
+        let user_buf: ConstPtr<u8> = ConstPtr::from_usize(buf as usize);
+        let data = user_buf.to_owned_slice(len as usize).ok_or(Errno::EFAULT)?;
+
+        // Parse destination address if provided.
+        let dest = if dest_addr != 0 && addrlen > 0 {
+            match read_sockaddr_from_user(dest_addr, addrlen)? {
+                SocketAddress::Inet(ep) => Some(core::net::SocketAddr::V4(ep)),
+                SocketAddress::Unix(_addr) => {
+                    // Unix sendto will be implemented in Task 14.
+                    return Err(Errno::EAFNOSUPPORT);
+                }
+            }
+        } else {
+            None
+        };
+
+        // Try inet.
+        let rds = self.global.raw_descriptors.read();
+        let typed_fd = rds
+            .fd_from_raw_integer::<Network<Platform>>(fd as usize)
+            .map_err(|_| Errno::ENOTSOCK)?;
+        drop(rds);
+
+        let send_flags = SendFlags::empty();
+        self.global
+            .net
+            .lock()
+            .send(&typed_fd, &data, send_flags, dest)
+            .map_err(send_error_to_errno)
+    }
+
+    /// Handle `recvfrom(fd, buf, len, flags, src_addr, addrlen)`.
+    pub(crate) fn sys_recvfrom(
+        &self,
+        fd: u32,
+        buf: u64,
+        len: u64,
+        _flags: u32,
+        src_addr: u64,
+        addrlen: u64,
+    ) -> Result<usize, Errno> {
+        let buf_len = len as usize;
+        let mut kernel_buf = vec![0u8; buf_len];
+
+        // Try inet.
+        let rds = self.global.raw_descriptors.read();
+        let typed_fd = rds
+            .fd_from_raw_integer::<Network<Platform>>(fd as usize)
+            .map_err(|_| Errno::ENOTSOCK)?;
+        drop(rds);
+
+        let recv_flags = ReceiveFlags::empty();
+        let mut source = if src_addr != 0 {
+            Some(None::<core::net::SocketAddr>)
+        } else {
+            None
+        };
+
+        let bytes_read = self
+            .global
+            .net
+            .lock()
+            .receive(&typed_fd, &mut kernel_buf, recv_flags, source.as_mut())
+            .map_err(receive_error_to_errno)?;
+
+        // Copy data to guest.
+        let user_buf: MutPtr<u8> = MutPtr::from_usize(buf as usize);
+        user_buf
+            .copy_from_slice(0, &kernel_buf[..bytes_read])
+            .ok_or(Errno::EFAULT)?;
+
+        // Write source address if requested.
+        if let Some(Some(ref ep)) = source {
+            write_sockaddr_inet_to_user(ep, src_addr, addrlen)?;
+        }
+
+        Ok(bytes_read)
+    }
+
+    /// Handle `setsockopt(fd, level, optname, optval, optlen)`.
+    pub(crate) fn sys_setsockopt(
+        &self,
+        fd: u32,
+        level: u32,
+        optname: u32,
+        optval: u64,
+        optlen: u32,
+    ) -> Result<(), Errno> {
+        let opt = SocketOptionName::try_from_raw(level, optname).ok_or(Errno::ENOPROTOOPT)?;
+
+        // Read the option value from guest memory.
+        let val_ptr: ConstPtr<u8> = ConstPtr::from_usize(optval as usize);
+
+        // Helper to read a u32 option value.
+        let read_u32 = || -> Result<u32, Errno> {
+            if optlen < 4 {
+                return Err(Errno::EINVAL);
+            }
+            let bytes = val_ptr.to_owned_slice(4).ok_or(Errno::EFAULT)?;
+            Ok(u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        };
+
+        // Helper to read a timeval.
+        let read_timeval = || -> Result<Option<Duration>, Errno> {
+            if optlen < core::mem::size_of::<CTimeval>() as u32 {
+                return Err(Errno::EINVAL);
+            }
+            let bytes = val_ptr
+                .to_owned_slice(core::mem::size_of::<CTimeval>())
+                .ok_or(Errno::EFAULT)?;
+            let tv: CTimeval = unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast()) };
+            if tv.tv_sec == 0 && tv.tv_usec == 0 {
+                Ok(None)
+            } else {
+                Ok(Some(Duration::new(
+                    tv.tv_sec as u64,
+                    tv.tv_usec as u32 * 1000,
+                )))
+            }
+        };
+
+        // Helper to read a linger struct.
+        let _read_linger = || -> Result<Option<Duration>, Errno> {
+            if optlen < core::mem::size_of::<CLinger>() as u32 {
+                return Err(Errno::EINVAL);
+            }
+            let bytes = val_ptr
+                .to_owned_slice(core::mem::size_of::<CLinger>())
+                .ok_or(Errno::EFAULT)?;
+            let lg: CLinger = unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast()) };
+            if lg.l_onoff == 0 {
+                Ok(None)
+            } else {
+                Ok(Some(Duration::from_secs(lg.l_linger as u64)))
+            }
+        };
+
+        // Inet socket path.
+        let rds = self.global.raw_descriptors.read();
+        let typed_fd = rds
+            .fd_from_raw_integer::<Network<Platform>>(fd as usize)
+            .map_err(|_| Errno::ENOTSOCK)?;
+        drop(rds);
+
+        match opt {
+            SocketOptionName::ReuseAddr => {
+                let _val = read_u32()?;
+                Ok(())
+            }
+            SocketOptionName::KeepAlive => {
+                let val = read_u32()?;
+                let keepalive = if val != 0 {
+                    Some(Duration::from_secs(7200))
+                } else {
+                    None
+                };
+                self.global
+                    .net
+                    .lock()
+                    .set_tcp_option(&typed_fd, TcpOptionData::KEEPALIVE(keepalive))
+                    .map_err(set_tcp_option_error_to_errno)
+            }
+            SocketOptionName::Broadcast => {
+                let _val = read_u32()?;
+                Ok(())
+            }
+            SocketOptionName::SndBuf | SocketOptionName::RcvBuf => {
+                let _val = read_u32()?;
+                Ok(())
+            }
+            SocketOptionName::Linger | SocketOptionName::LingerSec => {
+                let _linger = _read_linger()?;
+                Ok(())
+            }
+            SocketOptionName::RcvTimeo => {
+                let _timeout = read_timeval()?;
+                Ok(())
+            }
+            SocketOptionName::SndTimeo => {
+                let _timeout = read_timeval()?;
+                Ok(())
+            }
+            SocketOptionName::TcpNoDelay => {
+                let val = read_u32()?;
+                self.global
+                    .net
+                    .lock()
+                    .set_tcp_option(&typed_fd, TcpOptionData::NODELAY(val != 0))
+                    .map_err(set_tcp_option_error_to_errno)
+            }
+            SocketOptionName::TcpNoPush => {
+                let val = read_u32()?;
+                self.global
+                    .net
+                    .lock()
+                    .set_tcp_option(&typed_fd, TcpOptionData::NODELAY(val == 0))
+                    .map_err(set_tcp_option_error_to_errno)
+            }
+            SocketOptionName::TcpKeepAlive => {
+                let val = read_u32()?;
+                let keepalive = if val > 0 {
+                    Some(Duration::from_secs(val as u64))
+                } else {
+                    None
+                };
+                self.global
+                    .net
+                    .lock()
+                    .set_tcp_option(&typed_fd, TcpOptionData::KEEPALIVE(keepalive))
+                    .map_err(set_tcp_option_error_to_errno)
+            }
+            SocketOptionName::TcpKeepIntvl => {
+                let _val = read_u32()?;
+                Ok(())
+            }
+            SocketOptionName::TcpKeepCnt => {
+                let _val = read_u32()?;
+                Ok(())
+            }
+            SocketOptionName::IpTos => {
+                let _val = read_u32()?;
+                Ok(())
+            }
+            SocketOptionName::Type | SocketOptionName::Error => Err(Errno::ENOPROTOOPT),
+        }
+    }
+
+    /// Handle `getsockopt(fd, level, optname, optval, optlen)`.
+    pub(crate) fn sys_getsockopt(
+        &self,
+        fd: u32,
+        level: u32,
+        optname: u32,
+        optval: u64,
+        optlen: u64,
+    ) -> Result<(), Errno> {
+        let opt = SocketOptionName::try_from_raw(level, optname).ok_or(Errno::ENOPROTOOPT)?;
+
+        let out_ptr: MutPtr<u8> = MutPtr::from_usize(optval as usize);
+        let len_ptr: MutPtr<u32> = MutPtr::from_usize(optlen as usize);
+
+        // Helper to write a u32 result.
+        let write_u32 = |val: u32| -> Result<(), Errno> {
+            let bytes = val.to_ne_bytes();
+            out_ptr.copy_from_slice(0, &bytes).ok_or(Errno::EFAULT)?;
+            len_ptr.copy_from_slice(0, &[4u32]).ok_or(Errno::EFAULT)?;
+            Ok(())
+        };
+
+        // Try inet.
+        let rds = self.global.raw_descriptors.read();
+        if let Ok(typed_fd) = rds.fd_from_raw_integer::<Network<Platform>>(fd as usize) {
+            drop(rds);
+            return match opt {
+                SocketOptionName::ReuseAddr => write_u32(0),
+                SocketOptionName::Type => write_u32(SOCK_STREAM),
+                SocketOptionName::Broadcast => write_u32(0),
+                SocketOptionName::SndBuf => write_u32(SOCKET_BUFFER_SIZE),
+                SocketOptionName::RcvBuf => write_u32(SOCKET_BUFFER_SIZE),
+                SocketOptionName::KeepAlive => write_u32(0),
+                SocketOptionName::Error => write_u32(0),
+                SocketOptionName::Linger | SocketOptionName::LingerSec => {
+                    let lg = CLinger {
+                        l_onoff: 0,
+                        l_linger: 0,
+                    };
+                    let bytes: &[u8] = unsafe {
+                        core::slice::from_raw_parts(
+                            (&lg as *const CLinger).cast::<u8>(),
+                            core::mem::size_of::<CLinger>(),
+                        )
+                    };
+                    out_ptr.copy_from_slice(0, bytes).ok_or(Errno::EFAULT)?;
+                    let size = core::mem::size_of::<CLinger>() as u32;
+                    len_ptr.copy_from_slice(0, &[size]).ok_or(Errno::EFAULT)?;
+                    Ok(())
+                }
+                SocketOptionName::RcvTimeo | SocketOptionName::SndTimeo => {
+                    let tv = CTimeval {
+                        tv_sec: 0,
+                        tv_usec: 0,
+                    };
+                    let bytes: &[u8] = unsafe {
+                        core::slice::from_raw_parts(
+                            (&tv as *const CTimeval).cast::<u8>(),
+                            core::mem::size_of::<CTimeval>(),
+                        )
+                    };
+                    out_ptr.copy_from_slice(0, bytes).ok_or(Errno::EFAULT)?;
+                    let size = core::mem::size_of::<CTimeval>() as u32;
+                    len_ptr.copy_from_slice(0, &[size]).ok_or(Errno::EFAULT)?;
+                    Ok(())
+                }
+                SocketOptionName::TcpNoDelay => {
+                    match self
+                        .global
+                        .net
+                        .lock()
+                        .get_tcp_option(&typed_fd, TcpOptionName::NODELAY)
+                    {
+                        Ok(TcpOptionData::NODELAY(v)) => write_u32(u32::from(v)),
+                        _ => write_u32(0),
+                    }
+                }
+                SocketOptionName::TcpNoPush => write_u32(0),
+                SocketOptionName::TcpKeepAlive => write_u32(0),
+                SocketOptionName::TcpKeepIntvl => write_u32(0),
+                SocketOptionName::TcpKeepCnt => write_u32(0),
+                SocketOptionName::IpTos => write_u32(0),
+            };
+        }
+        drop(rds);
+
+        // Unix sockets not yet implemented — will be added in Task 13.
+        Err(Errno::ENOTSOCK)
+    }
+
+    /// Handle `getsockname(fd, addr, addrlen)`.
+    pub(crate) fn sys_getsockname(&self, fd: u32, addr: u64, addrlen: u64) -> Result<(), Errno> {
+        // Try inet.
+        let rds = self.global.raw_descriptors.read();
+        if let Ok(typed_fd) = rds.fd_from_raw_integer::<Network<Platform>>(fd as usize) {
+            drop(rds);
+            let local = self
+                .global
+                .net
+                .lock()
+                .get_local_addr(&typed_fd)
+                .map_err(local_addr_error_to_errno)?;
+            return write_sockaddr_inet_to_user(&local, addr, addrlen);
+        }
+        drop(rds);
+
+        // Unix sockets not yet implemented.
+        Err(Errno::ENOTSOCK)
+    }
+
+    /// Handle `getpeername(fd, addr, addrlen)`.
+    pub(crate) fn sys_getpeername(&self, fd: u32, addr: u64, addrlen: u64) -> Result<(), Errno> {
+        // Try inet.
+        let rds = self.global.raw_descriptors.read();
+        if let Ok(typed_fd) = rds.fd_from_raw_integer::<Network<Platform>>(fd as usize) {
+            drop(rds);
+            let remote = self
+                .global
+                .net
+                .lock()
+                .get_remote_addr(&typed_fd)
+                .map_err(remote_addr_error_to_errno)?;
+            return write_sockaddr_inet_to_user(&remote, addr, addrlen);
+        }
+        drop(rds);
+
+        Err(Errno::ENOTSOCK)
+    }
+
+    /// Handle `shutdown(fd, how)`.
+    pub(crate) fn sys_shutdown(&self, fd: u32, how: u32) -> Result<(), Errno> {
+        if how > SHUT_RDWR {
+            return Err(Errno::EINVAL);
+        }
+
+        // Try inet — close as pragmatic approximation (no half-close in Network API).
+        let rds = self.global.raw_descriptors.read();
+        if let Ok(typed_fd) = rds.fd_from_raw_integer::<Network<Platform>>(fd as usize) {
+            drop(rds);
+            return self
+                .global
+                .net
+                .lock()
+                .close(&typed_fd, CloseBehavior::Immediate)
+                .map_err(close_error_to_errno);
+        }
+        drop(rds);
+
+        // Unix sockets not yet implemented.
+        Err(Errno::ENOTSOCK)
+    }
+
+    /// Handle `sendmsg(fd, msg, flags)`.
+    pub(crate) fn sys_sendmsg(&self, fd: u32, msg: u64, _flags: u32) -> Result<usize, Errno> {
+        let hdr_ptr: ConstPtr<u8> = ConstPtr::from_usize(msg as usize);
+        let hdr_bytes = hdr_ptr.to_owned_slice(48).ok_or(Errno::EFAULT)?;
+
+        let msg_name = u64::from_ne_bytes(hdr_bytes[0..8].try_into().unwrap());
+        let msg_namelen = u32::from_ne_bytes(hdr_bytes[8..12].try_into().unwrap());
+        let msg_iov = u64::from_ne_bytes(hdr_bytes[16..24].try_into().unwrap());
+        let msg_iovlen = i32::from_ne_bytes(hdr_bytes[24..28].try_into().unwrap());
+        let msg_controllen = u32::from_ne_bytes(hdr_bytes[40..44].try_into().unwrap());
+
+        if msg_controllen != 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
+
+        // Gather data from iovec array.
+        let mut gathered = alloc::vec::Vec::new();
+        for i in 0..msg_iovlen.max(0) as usize {
+            let iov_ptr: ConstPtr<u8> = ConstPtr::from_usize(msg_iov as usize + i * 16);
+            let iov_bytes = iov_ptr.to_owned_slice(16).ok_or(Errno::EFAULT)?;
+            let iov_base = u64::from_ne_bytes(iov_bytes[0..8].try_into().unwrap());
+            let iov_len = u64::from_ne_bytes(iov_bytes[8..16].try_into().unwrap());
+            if iov_len > 0 {
+                let data_ptr: ConstPtr<u8> = ConstPtr::from_usize(iov_base as usize);
+                let data = data_ptr
+                    .to_owned_slice(iov_len as usize)
+                    .ok_or(Errno::EFAULT)?;
+                gathered.extend_from_slice(&data);
+            }
+        }
+
+        // Parse destination address if provided.
+        let dest = if msg_name != 0 && msg_namelen > 0 {
+            Some(read_sockaddr_from_user(msg_name, msg_namelen)?)
+        } else {
+            None
+        };
+
+        // Try inet.
+        let rds = self.global.raw_descriptors.read();
+        if let Ok(typed_fd) = rds.fd_from_raw_integer::<Network<Platform>>(fd as usize) {
+            drop(rds);
+            let inet_dest = match dest {
+                Some(SocketAddress::Inet(ep)) => Some(core::net::SocketAddr::V4(ep)),
+                None => None,
+                _ => return Err(Errno::EAFNOSUPPORT),
+            };
+            return self
+                .global
+                .net
+                .lock()
+                .send(&typed_fd, &gathered, SendFlags::empty(), inet_dest)
+                .map_err(send_error_to_errno);
+        }
+        drop(rds);
+
+        // Unix sockets not yet implemented.
+        Err(Errno::ENOTSOCK)
+    }
+
+    /// Handle `recvmsg(fd, msg, flags)`.
+    pub(crate) fn sys_recvmsg(&self, fd: u32, msg: u64, _flags: u32) -> Result<usize, Errno> {
+        let hdr_ptr: ConstPtr<u8> = ConstPtr::from_usize(msg as usize);
+        let hdr_bytes = hdr_ptr.to_owned_slice(48).ok_or(Errno::EFAULT)?;
+
+        let msg_name = u64::from_ne_bytes(hdr_bytes[0..8].try_into().unwrap());
+        let _msg_namelen = u32::from_ne_bytes(hdr_bytes[8..12].try_into().unwrap());
+        let msg_iov = u64::from_ne_bytes(hdr_bytes[16..24].try_into().unwrap());
+        let msg_iovlen = i32::from_ne_bytes(hdr_bytes[24..28].try_into().unwrap());
+
+        // Calculate total buffer size from iovecs.
+        let mut total_len = 0usize;
+        let mut iovecs = alloc::vec::Vec::new();
+        for i in 0..msg_iovlen.max(0) as usize {
+            let iov_ptr: ConstPtr<u8> = ConstPtr::from_usize(msg_iov as usize + i * 16);
+            let iov_bytes = iov_ptr.to_owned_slice(16).ok_or(Errno::EFAULT)?;
+            let iov_base = u64::from_ne_bytes(iov_bytes[0..8].try_into().unwrap());
+            let iov_len = u64::from_ne_bytes(iov_bytes[8..16].try_into().unwrap());
+            iovecs.push((iov_base, iov_len as usize));
+            total_len += iov_len as usize;
+        }
+
+        // Receive into a temporary buffer.
+        let mut kernel_buf = vec![0u8; total_len];
+
+        // Try inet.
+        let rds = self.global.raw_descriptors.read();
+        if let Ok(typed_fd) = rds.fd_from_raw_integer::<Network<Platform>>(fd as usize) {
+            drop(rds);
+            let mut source = if msg_name != 0 {
+                Some(None::<core::net::SocketAddr>)
+            } else {
+                None
+            };
+
+            let bytes_read = self
+                .global
+                .net
+                .lock()
+                .receive(
+                    &typed_fd,
+                    &mut kernel_buf,
+                    ReceiveFlags::empty(),
+                    source.as_mut(),
+                )
+                .map_err(receive_error_to_errno)?;
+
+            // Scatter into iovecs.
+            let mut offset = 0usize;
+            for (iov_base, iov_len) in &iovecs {
+                if offset >= bytes_read {
+                    break;
+                }
+                let to_copy = (*iov_len).min(bytes_read - offset);
+                let dst: MutPtr<u8> = MutPtr::from_usize(*iov_base as usize);
+                dst.copy_from_slice(0, &kernel_buf[offset..offset + to_copy])
+                    .ok_or(Errno::EFAULT)?;
+                offset += to_copy;
+            }
+
+            // Write source address if requested.
+            if let Some(Some(ref ep)) = source {
+                let hdr_mut: MutPtr<u8> = MutPtr::from_usize(msg as usize);
+                let sa_size = core::mem::size_of::<CSockInetAddr>() as u32;
+                hdr_mut
+                    .copy_from_slice(8, &sa_size.to_ne_bytes())
+                    .ok_or(Errno::EFAULT)?;
+                write_sockaddr_inet_to_user(ep, msg_name, msg + 8)?;
+            }
+
+            // Write msg_controllen = 0 and msg_flags = 0.
+            let hdr_mut: MutPtr<u8> = MutPtr::from_usize(msg as usize);
+            hdr_mut
+                .copy_from_slice(40, &0u32.to_ne_bytes())
+                .ok_or(Errno::EFAULT)?;
+            hdr_mut
+                .copy_from_slice(44, &0i32.to_ne_bytes())
+                .ok_or(Errno::EFAULT)?;
+
+            return Ok(bytes_read);
+        }
+        drop(rds);
+
+        // Unix sockets not yet implemented.
+        Err(Errno::ENOTSOCK)
+    }
+
+    /// Placeholder for AF_UNIX socketpair (implemented in unix.rs, Task 15).
+    pub(crate) fn sys_socketpair(
+        &self,
+        _domain: u32,
+        _sock_type: u32,
+        _protocol: u32,
+        _sv: u64,
+    ) -> Result<(), Errno> {
+        Err(Errno::EAFNOSUPPORT)
     }
 }
