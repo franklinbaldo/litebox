@@ -49,6 +49,12 @@ fn main() -> anyhow::Result<()> {
     // 1. Create shared memory region for IPC ring buffer.
     let shmem = shmem::LauncherSharedRegion::new()?;
 
+    // 1b. Create tar shmem region if a rootfs tar was specified.
+    let tar_shmem = rootfs_tar
+        .as_deref()
+        .map(shmem::TarSharedRegion::from_file)
+        .transpose()?;
+
     // 2. Load the guest ELF binary (need brk for central initialization).
     let syscall_entry = litebox_micro::get_syscall_entry_point();
     // Pass the host environment through to the guest.  Benchmarks such as
@@ -69,11 +75,12 @@ fn main() -> anyhow::Result<()> {
         rootfs_prefix.as_deref(),
     )?;
 
-    // 3. Spawn central process (child inherits the shmem fd + initial brk + rootfs tar + tun device).
+    // 3. Spawn central process (child inherits the shmem fd + initial brk + tar fd + tun device).
     let central = central::CentralProcess::spawn(
         shmem.fd_raw(),
         loaded.brk,
-        rootfs_tar.as_deref(),
+        tar_shmem.as_ref().map(|t| t.fd_raw()),
+        tar_shmem.as_ref().map(|t| t.size()),
         tun_device.as_deref(),
     )?;
 
@@ -93,6 +100,8 @@ fn main() -> anyhow::Result<()> {
             0,                             // ppid — no parent
             central.pid().cast_unsigned(), // central_pid — for /proc fd passing
             syscall_entry,                 // syscall_entry_point
+            tar_shmem.as_ref().map_or(core::ptr::null(), |t| t.base_ptr()),
+            tar_shmem.as_ref().map_or(0, |t| t.size()),
         );
     }
 

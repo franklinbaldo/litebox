@@ -81,6 +81,10 @@ pub struct MicroState {
     /// File fd tracking table. Each entry maps a guest fd to a shmem file
     /// ring buffer slot. Linear scan is fine — at most MAX_FILE_SLOTS entries.
     pub file_fds: [Option<FileFdEntry>; MAX_FILE_SLOTS],
+    /// Base pointer of the tar shmem region (null if no tar).
+    pub tar_base: *const u8,
+    /// Size of the tar shmem region in bytes.
+    pub tar_size: usize,
 }
 
 unsafe impl Send for MicroState {}
@@ -102,6 +106,8 @@ static mut MICRO_STATE: MicroState = MicroState {
     pipe_fds: [None; MAX_PIPE_SLOTS],
     socket_fds: [None; MAX_SOCKET_SLOTS],
     file_fds: [None; MAX_FILE_SLOTS],
+    tar_base: core::ptr::null(),
+    tar_size: 0,
 };
 
 /// Initialize the global micro-LiteBox state.
@@ -118,6 +124,8 @@ pub unsafe fn micro_init(
     parent_pid: u32,
     central_pid: u32,
     syscall_entry_point: usize,
+    tar_base: *const u8,
+    tar_size: usize,
 ) {
     unsafe {
         MICRO_STATE.ring_base = ring_base;
@@ -127,6 +135,8 @@ pub unsafe fn micro_init(
         MICRO_STATE.ppid = parent_pid;
         MICRO_STATE.central_pid = central_pid;
         MICRO_STATE.syscall_entry_point = syscall_entry_point;
+        MICRO_STATE.tar_base = tar_base;
+        MICRO_STATE.tar_size = tar_size;
         // Compute the layout from the ring_size. The data_region_size is the
         // remaining space after header + SQ + CQ entries.
         let base_layout = SharedRingLayout::new(0);
@@ -310,6 +320,8 @@ impl MicroState {
             pipe_fds: [None; MAX_PIPE_SLOTS],
             socket_fds: [None; MAX_SOCKET_SLOTS],
             file_fds: [None; MAX_FILE_SLOTS],
+            tar_base: core::ptr::null(),
+            tar_size: 0,
         }
     }
 }
