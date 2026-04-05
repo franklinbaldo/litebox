@@ -2598,68 +2598,99 @@ impl<FS: ShimFS> ProcessServer<FS> {
 
         // Check for interpreter.
         let interp_name = parsed.interp(&mut reader).ok().flatten();
-        let interp_data: Option<(Vec<u8>, litebox_common_linux::loader::ElfParsedFile)> =
+        #[allow(unused_assignments)]
+        let mut interp_data_vec: Vec<u8> = Vec::new();
+        let interp_data: Option<(&[u8], litebox_common_linux::loader::ElfParsedFile)> =
             if let Some(ref name) = interp_name {
-                let interp_path_bytes = name.to_bytes_with_nul();
-                let mut interp_cstr = vec![0u8; interp_path_bytes.len()];
-                interp_cstr.copy_from_slice(interp_path_bytes);
-
-                let interp_fd = {
-                    let mut regs = litebox_common_linux::PtRegs::default();
-                    regs.orig_rax = libc::SYS_openat as usize;
-                    regs.rdi = libc::AT_FDCWD as usize;
-                    regs.rsi = interp_cstr.as_ptr() as usize;
-                    regs.rdx = libc::O_RDONLY as usize;
-                    self.dispatch_to_task(thread_slot, &mut regs)
+                // Try tar shmem fast path for interpreter.
+                let interp_path_str = {
+                    let bytes = name.to_bytes();
+                    core::str::from_utf8(bytes).unwrap_or("")
                 };
-                if interp_fd < 0 {
-                    cq.result = interp_fd;
-                    return cq;
-                }
-                let interp_fd = interp_fd as i32;
+                let normalized_interp = interp_path_str
+                    .strip_prefix('/')
+                    .unwrap_or(interp_path_str);
 
-                let interp_size = {
-                    let mut stat_buf = [0u8; 144];
-                    let mut regs = litebox_common_linux::PtRegs::default();
-                    regs.orig_rax = libc::SYS_fstat as usize;
-                    regs.rdi = interp_fd as usize;
-                    regs.rsi = stat_buf.as_mut_ptr() as usize;
-                    let result = self.dispatch_to_task(thread_slot, &mut regs);
-                    if result < 0 {
-                        self.close_fd(thread_slot, interp_fd);
-                        cq.result = result;
-                        return cq;
-                    }
-                    i64::from_le_bytes(stat_buf[48..56].try_into().unwrap()) as usize
-                };
-
-                let mut interp_file_data = vec![0u8; interp_size];
-                {
-                    let mut offset = 0usize;
-                    while offset < interp_size {
-                        let chunk = (interp_size - offset).min(1024 * 1024);
-                        let mut regs = litebox_common_linux::PtRegs::default();
-                        regs.orig_rax = libc::SYS_pread64 as usize;
-                        regs.rdi = interp_fd as usize;
-                        regs.rsi = interp_file_data[offset..].as_mut_ptr() as usize;
-                        regs.rdx = chunk;
-                        regs.r10 = offset;
-                        let result = self.dispatch_to_task(thread_slot, &mut regs);
-                        if result <= 0 {
-                            self.close_fd(thread_slot, interp_fd);
-                            cq.result = if result == 0 {
-                                -i64::from(libc::EIO)
-                            } else {
-                                result
-                            };
+                let interp_slice: &[u8] =
+                    if let Some(range) = self.tar_file_map.get(normalized_interp) {
+                        let len = range.end - range.start;
+                        if range.end > self.tar_shmem_size {
+                            cq.result = -i64::from(libc::EFAULT);
                             return cq;
                         }
-                        offset += result as usize;
-                    }
-                }
-                self.close_fd(thread_slot, interp_fd);
+                        // SAFETY: tar_shmem_base is an mmap'd region that lives for the
+                        // entire lifetime of the process. The slice we create here is
+                        // only used within this function call, so the pointer remains valid.
+                        unsafe {
+                            core::slice::from_raw_parts(
+                                self.tar_shmem_base.0.add(range.start),
+                                len,
+                            )
+                        }
+                    } else {
+                        // Slow path: openat/fstat/pread64/close via shim dispatch.
+                        let interp_path_bytes = name.to_bytes_with_nul();
+                        let mut interp_cstr = vec![0u8; interp_path_bytes.len()];
+                        interp_cstr.copy_from_slice(interp_path_bytes);
 
-                let mut ireader = MemReader(&interp_file_data);
+                        let interp_fd = {
+                            let mut regs = litebox_common_linux::PtRegs::default();
+                            regs.orig_rax = libc::SYS_openat as usize;
+                            regs.rdi = libc::AT_FDCWD as usize;
+                            regs.rsi = interp_cstr.as_ptr() as usize;
+                            regs.rdx = libc::O_RDONLY as usize;
+                            self.dispatch_to_task(thread_slot, &mut regs)
+                        };
+                        if interp_fd < 0 {
+                            cq.result = interp_fd;
+                            return cq;
+                        }
+                        let interp_fd = interp_fd as i32;
+
+                        let interp_size = {
+                            let mut stat_buf = [0u8; 144];
+                            let mut regs = litebox_common_linux::PtRegs::default();
+                            regs.orig_rax = libc::SYS_fstat as usize;
+                            regs.rdi = interp_fd as usize;
+                            regs.rsi = stat_buf.as_mut_ptr() as usize;
+                            let result = self.dispatch_to_task(thread_slot, &mut regs);
+                            if result < 0 {
+                                self.close_fd(thread_slot, interp_fd);
+                                cq.result = result;
+                                return cq;
+                            }
+                            i64::from_le_bytes(stat_buf[48..56].try_into().unwrap()) as usize
+                        };
+
+                        interp_data_vec = vec![0u8; interp_size];
+                        {
+                            let mut offset = 0usize;
+                            while offset < interp_size {
+                                let chunk = (interp_size - offset).min(1024 * 1024);
+                                let mut regs = litebox_common_linux::PtRegs::default();
+                                regs.orig_rax = libc::SYS_pread64 as usize;
+                                regs.rdi = interp_fd as usize;
+                                regs.rsi = interp_data_vec[offset..].as_mut_ptr() as usize;
+                                regs.rdx = chunk;
+                                regs.r10 = offset;
+                                let result = self.dispatch_to_task(thread_slot, &mut regs);
+                                if result <= 0 {
+                                    self.close_fd(thread_slot, interp_fd);
+                                    cq.result = if result == 0 {
+                                        -i64::from(libc::EIO)
+                                    } else {
+                                        result
+                                    };
+                                    return cq;
+                                }
+                                offset += result as usize;
+                            }
+                        }
+                        self.close_fd(thread_slot, interp_fd);
+                        &interp_data_vec
+                    };
+
+                let mut ireader = MemReader(interp_slice);
                 let Ok(mut iparsed) =
                     litebox_common_linux::loader::ElfParsedFile::parse(&mut ireader)
                 else {
@@ -2667,7 +2698,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     return cq;
                 };
                 let _ = iparsed.parse_trampoline(&mut ireader, syscall_entry_point);
-                Some((interp_file_data, iparsed))
+                Some((interp_slice, iparsed))
             } else {
                 None
             };
@@ -2678,7 +2709,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
             return cq;
         };
 
-        let interp_info = if let Some((ref _idata, ref iparsed)) = interp_data {
+        let interp_info = if let Some((_idata, ref iparsed)) = interp_data {
             // Start the interpreter after the main binary's segments so they
             // don't overlap.  Align up to page boundary.
             let interp_start = (main_mapper.next_addr + 0xFFF) & !0xFFF;
@@ -2806,8 +2837,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 let source_data = match seg.file_data_source {
                     FileSource::Main => file_data,
                     FileSource::Interp => {
-                        if let Some((ref idata, _)) = interp_data {
-                            idata.as_slice()
+                        if let Some((idata, _)) = interp_data {
+                            idata
                         } else {
                             &[]
                         }
@@ -2963,8 +2994,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
             let source_data = match seg.file_data_source {
                 FileSource::Main => file_data,
                 FileSource::Interp => {
-                    if let Some((ref idata, _)) = interp_data {
-                        idata.as_slice()
+                    if let Some((idata, _)) = interp_data {
+                        idata
                     } else {
                         &[]
                     }
