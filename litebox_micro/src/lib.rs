@@ -9,6 +9,7 @@ pub mod execve;
 pub mod fork;
 pub mod handler;
 pub mod local_exec;
+pub mod perf;
 #[allow(clippy::missing_safety_doc, clippy::cast_sign_loss)]
 pub mod raw_syscall;
 pub mod stack_pool;

@@ -8,6 +8,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -1034,7 +1035,6 @@ impl<FS: ShimFS> ProcessServer<FS> {
 
         let total_us = fork_start.elapsed().as_micros();
         // Write perf data to a dedicated file to avoid stderr buffering issues.
-        use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -3022,7 +3022,6 @@ impl<FS: ShimFS> ProcessServer<FS> {
         let pack_us = t_pack.elapsed().as_micros();
         let total_exec_us = exec_start.elapsed().as_micros();
         // Write perf data to a dedicated file to avoid stderr buffering issues.
-        use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)

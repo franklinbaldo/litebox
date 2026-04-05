@@ -79,8 +79,8 @@ fn main() -> anyhow::Result<()> {
     let central = central::CentralProcess::spawn(
         shmem.fd_raw(),
         loaded.brk,
-        tar_shmem.as_ref().map(|t| t.fd_raw()),
-        tar_shmem.as_ref().map(|t| t.size()),
+        tar_shmem.as_ref().map(shmem::TarSharedRegion::fd_raw),
+        tar_shmem.as_ref().map(shmem::TarSharedRegion::size),
         tun_device.as_deref(),
     )?;
 
@@ -100,8 +100,8 @@ fn main() -> anyhow::Result<()> {
             0,                             // ppid — no parent
             central.pid().cast_unsigned(), // central_pid — for /proc fd passing
             syscall_entry,                 // syscall_entry_point
-            tar_shmem.as_ref().map_or(core::ptr::null(), |t| t.base_ptr()),
-            tar_shmem.as_ref().map_or(0, |t| t.size()),
+            tar_shmem.as_ref().map_or(core::ptr::null(), shmem::TarSharedRegion::base_ptr),
+            tar_shmem.as_ref().map_or(0, shmem::TarSharedRegion::size),
         );
     }
 
