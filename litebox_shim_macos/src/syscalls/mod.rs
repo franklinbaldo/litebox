@@ -283,14 +283,15 @@ impl<FS: ShimFS> Task<FS> {
                 nfds,
                 timeout,
             } => self.sys_poll(fds, nfds, timeout),
-            MacosSyscallRequest::Kqueue => {
-                log_unsupported!("kqueue() not yet implemented");
-                Err(Errno::ENOSYS)
-            }
-            MacosSyscallRequest::Kevent { .. } => {
-                log_unsupported!("kevent() not yet implemented");
-                Err(Errno::ENOSYS)
-            }
+            MacosSyscallRequest::Kqueue => kqueue::sys_kqueue(self),
+            MacosSyscallRequest::Kevent {
+                kq,
+                changelist,
+                nchanges,
+                eventlist,
+                nevents,
+                timeout,
+            } => kqueue::sys_kevent(self, kq, changelist, nchanges, eventlist, nevents, timeout),
         }
     }
 }

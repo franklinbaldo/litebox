@@ -830,7 +830,6 @@ struct GlobalState<FS: ShimFS> {
         BTreeMap<usize, Arc<syscalls::kqueue::KqueueFile<FS>>>,
     >,
     /// Counter for allocating virtual fd numbers for kqueues (starts at 0x2_0000).
-    #[expect(dead_code, reason = "will be used when kqueue syscalls are implemented")]
     pub(crate) kqueue_fd_counter: AtomicUsize,
     /// Maps raw fd numbers to their NetworkProxy, for polling support.
     pub(crate) net_proxies: litebox::sync::RwLock<
