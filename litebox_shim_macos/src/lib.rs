@@ -266,6 +266,9 @@ impl<FS: ShimFS> MacosShimBuilder<FS> {
             unix_sockets: litebox::sync::RwLock::new(BTreeMap::new()),
             unix_addr_table: litebox::sync::RwLock::new(BTreeMap::new()),
             unix_fd_counter: AtomicUsize::new(0x1_0000),
+            kqueues: litebox::sync::RwLock::new(BTreeMap::new()),
+            kqueue_fd_counter: AtomicUsize::new(0x2_0000),
+            net_proxies: litebox::sync::RwLock::new(BTreeMap::new()),
             shared_cache_base: AtomicU64::new(0),
             sysroot: self.sysroot,
         });
@@ -821,6 +824,20 @@ struct GlobalState<FS: ShimFS> {
     >,
     /// Counter for allocating virtual fd numbers for Unix sockets.
     unix_fd_counter: AtomicUsize,
+    /// Maps virtual fd numbers to kqueue objects.
+    #[expect(dead_code, reason = "will be used when kqueue syscalls are implemented")]
+    pub(crate) kqueues: litebox::sync::RwLock<
+        Platform,
+        BTreeMap<usize, Arc<syscalls::kqueue::KqueueFile<FS>>>,
+    >,
+    /// Counter for allocating virtual fd numbers for kqueues (starts at 0x2_0000).
+    #[expect(dead_code, reason = "will be used when kqueue syscalls are implemented")]
+    pub(crate) kqueue_fd_counter: AtomicUsize,
+    /// Maps raw fd numbers to their NetworkProxy, for polling support.
+    pub(crate) net_proxies: litebox::sync::RwLock<
+        Platform,
+        BTreeMap<usize, Arc<litebox::net::socket_channel::NetworkProxy<Platform>>>,
+    >,
     /// Base address of the installed shared cache (0 if not installed).
     pub(crate) shared_cache_base: AtomicU64,
     /// Optional sysroot prefix for path rewriting in sys_open.

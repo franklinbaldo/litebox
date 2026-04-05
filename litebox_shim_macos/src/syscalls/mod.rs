@@ -9,6 +9,7 @@ pub(crate) mod process;
 pub(crate) mod signal;
 pub(crate) mod stubs;
 
+pub(crate) mod kqueue;
 pub(crate) mod net;
 pub(crate) mod unix;
 
@@ -268,6 +269,22 @@ impl<FS: ShimFS> Task<FS> {
             }
             MacosSyscallRequest::Getpeername { fd, addr, addrlen } => {
                 self.sys_getpeername(fd, addr, addrlen).map(|()| 0)
+            }
+            MacosSyscallRequest::Select { .. } => {
+                log_unsupported!("select() not yet implemented");
+                Err(Errno::ENOSYS)
+            }
+            MacosSyscallRequest::Poll { .. } => {
+                log_unsupported!("poll() not yet implemented");
+                Err(Errno::ENOSYS)
+            }
+            MacosSyscallRequest::Kqueue => {
+                log_unsupported!("kqueue() not yet implemented");
+                Err(Errno::ENOSYS)
+            }
+            MacosSyscallRequest::Kevent { .. } => {
+                log_unsupported!("kevent() not yet implemented");
+                Err(Errno::ENOSYS)
             }
         }
     }

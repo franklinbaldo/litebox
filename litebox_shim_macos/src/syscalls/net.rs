@@ -532,7 +532,7 @@ impl<FS: ShimFS> Task<FS> {
             .map_err(socket_error_to_errno)?;
 
         // Initialize the NetworkProxy for this socket.
-        self.initialize_inet_socket(&socket_fd, sock_type);
+        let proxy = self.initialize_inet_socket(&socket_fd, sock_type);
 
         // Store in raw descriptor table and return the integer fd.
         let raw_fd = self
@@ -540,11 +540,20 @@ impl<FS: ShimFS> Task<FS> {
             .raw_descriptors
             .write()
             .fd_into_raw_integer(socket_fd);
+
+        // Store proxy in net_proxies for polling support.
+        self.global.net_proxies.write().insert(raw_fd, proxy);
+
         Ok(raw_fd)
     }
 
     /// Set up NetworkProxy and metadata for a newly created inet socket.
-    fn initialize_inet_socket(&self, fd: &SocketFd, sock_type: SockType) {
+    /// Returns the proxy Arc so the caller can store it in `net_proxies`.
+    fn initialize_inet_socket(
+        &self,
+        fd: &SocketFd,
+        sock_type: SockType,
+    ) -> Arc<NetworkProxyEnum<Platform>> {
         let proxy = match sock_type {
             SockType::Stream => Arc::new(NetworkProxyEnum::Stream(StreamSocketChannel::new())),
             SockType::Datagram => {
@@ -552,7 +561,8 @@ impl<FS: ShimFS> Task<FS> {
             }
         };
 
-        let _ = self.global.net.lock().set_socket_proxy(fd, proxy);
+        let _ = self.global.net.lock().set_socket_proxy(fd, proxy.clone());
+        proxy
     }
 
     #[allow(clippy::unnecessary_wraps)]
@@ -686,7 +696,7 @@ impl<FS: ShimFS> Task<FS> {
                 };
 
                 // Initialize the accepted socket's proxy.
-                self.initialize_inet_socket(&accepted_fd, SockType::Stream);
+                let proxy = self.initialize_inet_socket(&accepted_fd, SockType::Stream);
 
                 // Write peer address to user memory if requested.
                 if want_peer {
@@ -699,6 +709,10 @@ impl<FS: ShimFS> Task<FS> {
                     .raw_descriptors
                     .write()
                     .fd_into_raw_integer(accepted_fd);
+
+                // Store proxy in net_proxies for polling support.
+                self.global.net_proxies.write().insert(raw_fd, proxy);
+
                 return Ok(raw_fd);
             }
         }

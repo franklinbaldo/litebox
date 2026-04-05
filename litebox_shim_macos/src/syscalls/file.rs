@@ -17,7 +17,7 @@ use crate::{ConstPtr, MutPtr, Platform, ShimFS, Task};
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
 
 /// Convert a raw `i32` fd to a `usize` for lookup, returning EBADF on negative values.
-fn fd_to_usize(fd: i32) -> Result<usize, Errno> {
+pub(crate) fn fd_to_usize(fd: i32) -> Result<usize, Errno> {
     usize::try_from(fd).map_err(|_| Errno::EBADF)
 }
 
@@ -238,6 +238,8 @@ impl<FS: ShimFS> Task<FS> {
                 return self.global.pipes.close(&typed_fd).map_err(|_| Errno::EIO);
             }
             if let Ok(typed_fd) = rds.fd_consume_raw_integer::<Network<Platform>>(raw_fd) {
+                // Remove the proxy from net_proxies.
+                self.global.net_proxies.write().remove(&raw_fd);
                 return self
                     .global
                     .net
