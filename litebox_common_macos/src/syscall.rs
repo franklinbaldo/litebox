@@ -66,6 +66,21 @@ pub mod nr {
     pub const FTRUNCATE: usize = 201;
     pub const SEMWAIT_SIGNAL: usize = 334;
     pub const GETDIRENTRIES64: usize = 344;
+    pub const RECVMSG: usize = 27;
+    pub const SENDMSG: usize = 28;
+    pub const RECVFROM: usize = 29;
+    pub const ACCEPT: usize = 30;
+    pub const GETPEERNAME: usize = 31;
+    pub const GETSOCKNAME: usize = 32;
+    pub const SOCKET: usize = 97;
+    pub const CONNECT: usize = 98;
+    pub const BIND: usize = 104;
+    pub const SETSOCKOPT: usize = 105;
+    pub const LISTEN: usize = 106;
+    pub const GETSOCKOPT: usize = 118;
+    pub const SENDTO: usize = 133;
+    pub const SHUTDOWN: usize = 134;
+    pub const SOCKETPAIR: usize = 135;
 }
 
 /// Mach trap numbers (negative x16 values, stored as positive constants).
@@ -317,6 +332,90 @@ pub enum MacosSyscallRequest {
         bufsize: usize,
         basep: usize,
     },
+    Socket {
+        domain: u32,
+        sock_type: u32,
+        protocol: u32,
+    },
+    Bind {
+        fd: u32,
+        addr: u64,
+        addrlen: u32,
+    },
+    Listen {
+        fd: u32,
+        backlog: u32,
+    },
+    Accept {
+        fd: u32,
+        addr: u64,
+        addrlen: u64,
+    },
+    Connect {
+        fd: u32,
+        addr: u64,
+        addrlen: u32,
+    },
+    Sendto {
+        fd: u32,
+        buf: u64,
+        len: u64,
+        flags: u32,
+        dest_addr: u64,
+        addrlen: u32,
+    },
+    Recvfrom {
+        fd: u32,
+        buf: u64,
+        len: u64,
+        flags: u32,
+        src_addr: u64,
+        addrlen: u64,
+    },
+    Sendmsg {
+        fd: u32,
+        msg: u64,
+        flags: u32,
+    },
+    Recvmsg {
+        fd: u32,
+        msg: u64,
+        flags: u32,
+    },
+    Shutdown {
+        fd: u32,
+        how: u32,
+    },
+    Socketpair {
+        domain: u32,
+        sock_type: u32,
+        protocol: u32,
+        sv: u64,
+    },
+    Setsockopt {
+        fd: u32,
+        level: u32,
+        optname: u32,
+        optval: u64,
+        optlen: u32,
+    },
+    Getsockopt {
+        fd: u32,
+        level: u32,
+        optname: u32,
+        optval: u64,
+        optlen: u64,
+    },
+    Getsockname {
+        fd: u32,
+        addr: u64,
+        addrlen: u64,
+    },
+    Getpeername {
+        fd: u32,
+        addr: u64,
+        addrlen: u64,
+    },
     Unknown {
         number: usize,
     },
@@ -544,6 +643,90 @@ impl MacosSyscallRequest {
                 buf: a1,
                 bufsize: a2,
                 basep: a3,
+            },
+            nr::SOCKET => MacosSyscallRequest::Socket {
+                domain: a0 as u32,
+                sock_type: a1 as u32,
+                protocol: a2 as u32,
+            },
+            nr::BIND => MacosSyscallRequest::Bind {
+                fd: a0 as u32,
+                addr: a1 as u64,
+                addrlen: a2 as u32,
+            },
+            nr::LISTEN => MacosSyscallRequest::Listen {
+                fd: a0 as u32,
+                backlog: a1 as u32,
+            },
+            nr::ACCEPT => MacosSyscallRequest::Accept {
+                fd: a0 as u32,
+                addr: a1 as u64,
+                addrlen: a2 as u64,
+            },
+            nr::CONNECT => MacosSyscallRequest::Connect {
+                fd: a0 as u32,
+                addr: a1 as u64,
+                addrlen: a2 as u32,
+            },
+            nr::SENDTO => MacosSyscallRequest::Sendto {
+                fd: a0 as u32,
+                buf: a1 as u64,
+                len: a2 as u64,
+                flags: a3 as u32,
+                dest_addr: a4 as u64,
+                addrlen: a5 as u32,
+            },
+            nr::RECVFROM => MacosSyscallRequest::Recvfrom {
+                fd: a0 as u32,
+                buf: a1 as u64,
+                len: a2 as u64,
+                flags: a3 as u32,
+                src_addr: a4 as u64,
+                addrlen: a5 as u64,
+            },
+            nr::SENDMSG => MacosSyscallRequest::Sendmsg {
+                fd: a0 as u32,
+                msg: a1 as u64,
+                flags: a2 as u32,
+            },
+            nr::RECVMSG => MacosSyscallRequest::Recvmsg {
+                fd: a0 as u32,
+                msg: a1 as u64,
+                flags: a2 as u32,
+            },
+            nr::SHUTDOWN => MacosSyscallRequest::Shutdown {
+                fd: a0 as u32,
+                how: a1 as u32,
+            },
+            nr::SOCKETPAIR => MacosSyscallRequest::Socketpair {
+                domain: a0 as u32,
+                sock_type: a1 as u32,
+                protocol: a2 as u32,
+                sv: a3 as u64,
+            },
+            nr::SETSOCKOPT => MacosSyscallRequest::Setsockopt {
+                fd: a0 as u32,
+                level: a1 as u32,
+                optname: a2 as u32,
+                optval: a3 as u64,
+                optlen: a4 as u32,
+            },
+            nr::GETSOCKOPT => MacosSyscallRequest::Getsockopt {
+                fd: a0 as u32,
+                level: a1 as u32,
+                optname: a2 as u32,
+                optval: a3 as u64,
+                optlen: a4 as u64,
+            },
+            nr::GETSOCKNAME => MacosSyscallRequest::Getsockname {
+                fd: a0 as u32,
+                addr: a1 as u64,
+                addrlen: a2 as u64,
+            },
+            nr::GETPEERNAME => MacosSyscallRequest::Getpeername {
+                fd: a0 as u32,
+                addr: a1 as u64,
+                addrlen: a2 as u64,
             },
             _ => MacosSyscallRequest::Unknown { number: nr_raw },
         }
