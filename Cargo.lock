@@ -1524,6 +1524,8 @@ dependencies = [
  "litebox_ipc",
  "litebox_micro",
  "litebox_syscall_rewriter",
+ "tar",
+ "tar-no-std",
 ]
 
 [[package]]

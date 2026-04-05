@@ -9,9 +9,11 @@ litebox_micro = { path = "../litebox_micro" }
 litebox_common_linux = { path = "../litebox_common_linux" }
 libc = "0.2"
 anyhow = "1"
+tar-no-std = { version = "0.3", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 litebox_syscall_rewriter = { path = "../litebox_syscall_rewriter" }
+tar = "0.4"
 
 [lints]
 workspace = true

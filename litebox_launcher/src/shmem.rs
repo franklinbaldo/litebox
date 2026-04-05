@@ -304,6 +304,226 @@ impl Drop for TarSharedRegion {
     }
 }
 
+const PAGE_SIZE: usize = 4096;
+
+/// Compute page-aligned offsets for each file in a tar archive.
+///
+/// Returns a vector of `(filename, aligned_offset, file_size)` tuples using
+/// the deterministic alignment algorithm. Files with zero-length data are
+/// skipped.
+///
+/// This function is intentionally duplicated from `litebox_central` so that
+/// both sides can reconstruct the offset map independently from the same tar.
+#[allow(dead_code)] // Used by launcher orchestration in later phases
+pub fn compute_aligned_offsets(tar_data: &[u8]) -> Vec<(String, usize, usize)> {
+    let archive =
+        tar_no_std::TarArchiveRef::new(tar_data).expect("invalid tar data in compute_aligned_offsets");
+    let mut result = Vec::new();
+    let mut offset: usize = 0;
+
+    for entry in archive.entries() {
+        let filename = entry.filename();
+        let Ok(name) = filename.as_str() else {
+            continue;
+        };
+        let data = entry.data();
+        if data.is_empty() {
+            continue;
+        }
+
+        // Page-align the offset (first file starts at 0, which is already aligned).
+        offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        result.push((name.to_string(), offset, data.len()));
+        offset += data.len();
+    }
+
+    result
+}
+
+/// An owned, memory-mapped shared memory region holding file data at
+/// page-aligned offsets.
+///
+/// Each file from a tar archive is placed at a page-aligned offset within
+/// a memfd, enabling `mmap`-based ELF segment loading during exec. The memfd
+/// is created **without** `MFD_CLOEXEC` so that the file descriptor is
+/// inheritable across `fork`/`exec`.
+///
+/// # Safety
+///
+/// `AlignedDataRegion` owns both the file descriptor and the mapping. It is
+/// `Send` but deliberately not `Sync`.
+#[allow(dead_code)] // Used by launcher orchestration in later phases
+pub struct AlignedDataRegion {
+    fd: OwnedFd,
+    ptr: NonNull<u8>,
+    size: usize,
+}
+
+// SAFETY: The raw pointer is derived from an owned mmap region. Only one
+// `AlignedDataRegion` instance owns the mapping, so moving it to another
+// thread is safe. We intentionally do NOT implement `Sync`.
+unsafe impl Send for AlignedDataRegion {}
+
+#[allow(dead_code)] // Methods used by launcher orchestration in later phases
+impl AlignedDataRegion {
+    /// Create an `AlignedDataRegion` from raw tar bytes.
+    ///
+    /// Parses the tar, computes page-aligned offsets for each file, creates a
+    /// memfd, and copies each file's data to its aligned offset. The mapping
+    /// is downgraded to read-only after the data is written.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tar contains no files with data, or if any
+    /// syscall fails.
+    pub fn from_tar_bytes(tar_data: &[u8]) -> anyhow::Result<Self> {
+        // Phase 1: Parse tar and compute page-aligned offsets.
+        let entries = compute_aligned_offsets(tar_data);
+        if entries.is_empty() {
+            bail!("cannot create AlignedDataRegion: tar contains no files with data");
+        }
+
+        // Compute total size (round up to page boundary).
+        let last = entries.last().unwrap();
+        let raw_end = last.1 + last.2;
+        let total_size = (raw_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+        // We also need to collect the actual data bytes for Phase 2.
+        let archive = tar_no_std::TarArchiveRef::new(tar_data)
+            .map_err(|e| anyhow::anyhow!("invalid tar data: {e:?}"))?;
+        let mut file_data: Vec<(&[u8], usize)> = Vec::new();
+        let mut entry_idx = 0;
+
+        for entry in archive.entries() {
+            let filename = entry.filename();
+            let Ok(_name) = filename.as_str() else {
+                continue;
+            };
+            let data = entry.data();
+            if data.is_empty() {
+                continue;
+            }
+
+            if entry_idx < entries.len() {
+                file_data.push((data, entries[entry_idx].1));
+                entry_idx += 1;
+            }
+        }
+
+        // Phase 2: Create memfd, ftruncate, mmap, copy data, mprotect.
+        let name = c"litebox-aligned-data";
+
+        // SAFETY: `memfd_create` creates an anonymous file backed by memory.
+        // The name is a valid C string. We pass 0 for flags (no MFD_CLOEXEC)
+        // so the fd is inheritable by child processes.
+        let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), 0) };
+        if raw_fd < 0 {
+            return Err(anyhow::anyhow!(
+                "memfd_create failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        // SAFETY: `raw_fd` is a valid, newly created file descriptor.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+
+        // SAFETY: `ftruncate` sets the size of the memfd. The fd is valid and
+        // we own it exclusively at this point.
+        let ret = unsafe {
+            libc::ftruncate(
+                fd.as_raw_fd(),
+                i64::try_from(total_size).expect("total_size fits in i64"),
+            )
+        };
+        if ret != 0 {
+            return Err(anyhow::anyhow!(
+                "ftruncate failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        // SAFETY: We map the entire region as shared, read-write for the
+        // initial data copy. The fd is valid and has been sized to `total_size`.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                total_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(anyhow::anyhow!(
+                "mmap failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        // Copy each file's data to its page-aligned offset.
+        for (data, offset) in &file_data {
+            // SAFETY: `ptr` points to a valid mapping of `total_size` bytes.
+            // Each `offset + data.len()` is within `total_size` (guaranteed by
+            // the alignment algorithm).
+            unsafe {
+                let dst = ptr.cast::<u8>().add(*offset);
+                std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
+            }
+        }
+
+        // SAFETY: Downgrade the mapping to read-only now that the data has
+        // been written. `ptr` is page-aligned (from mmap) and `total_size`
+        // covers the entire mapping.
+        let ret = unsafe { libc::mprotect(ptr, total_size, libc::PROT_READ) };
+        if ret != 0 {
+            // Clean up the mapping before returning the error.
+            unsafe {
+                libc::munmap(ptr, total_size);
+            }
+            return Err(anyhow::anyhow!(
+                "mprotect failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        let non_null = NonNull::new(ptr.cast::<u8>()).expect("mmap succeeded but returned null");
+
+        Ok(Self {
+            fd,
+            ptr: non_null,
+            size: total_size,
+        })
+    }
+
+    /// Returns the raw file descriptor number for passing to child processes.
+    pub fn fd_raw(&self) -> i32 {
+        self.fd.as_raw_fd()
+    }
+
+    /// Returns a pointer to the start of the mapped region (read-only).
+    pub fn base_ptr(&self) -> *const u8 {
+        self.ptr.as_ptr()
+    }
+
+    /// Returns the total size of the mapped region in bytes.
+    pub fn size(&self) -> usize {
+        self.size
+    }
+}
+
+impl Drop for AlignedDataRegion {
+    fn drop(&mut self) {
+        // SAFETY: `self.ptr` was obtained from a successful `mmap` call with
+        // size `self.size`. We unmap the entire region. After this, the pointer
+        // is invalid — but since we're in `drop`, no further access is possible.
+        unsafe {
+            let ret = libc::munmap(self.ptr.as_ptr().cast(), self.size);
+            debug_assert_eq!(ret, 0, "munmap failed during drop");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
@@ -421,5 +641,93 @@ mod tests {
         unsafe {
             libc::munmap(ptr2, region.size());
         }
+    }
+
+    /// Helper: build a tar archive in memory with the given files.
+    fn build_test_tar(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (name, data) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(name).unwrap();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, &data[..]).unwrap();
+        }
+        builder.into_inner().unwrap()
+    }
+
+    #[test]
+    fn aligned_data_region_from_tar() {
+        let file_a = b"Hello, world!";
+        let file_b = b"Second file with more data inside it.";
+        let tar_data = build_test_tar(&[("a.txt", file_a), ("b.txt", file_b)]);
+
+        let region = AlignedDataRegion::from_tar_bytes(&tar_data)
+            .expect("failed to create AlignedDataRegion");
+
+        // Size must be page-aligned.
+        assert_eq!(region.size() % PAGE_SIZE, 0, "region size should be page-aligned");
+        assert!(region.size() > 0);
+
+        // Verify data is at correct offsets using compute_aligned_offsets.
+        let offsets = compute_aligned_offsets(&tar_data);
+        assert_eq!(offsets.len(), 2);
+
+        for (name, offset, size) in &offsets {
+            // SAFETY: The mapping is valid and readable for `region.size()` bytes.
+            let mapped = unsafe {
+                std::slice::from_raw_parts(region.base_ptr().add(*offset), *size)
+            };
+            let expected: &[u8] = if name == "a.txt" {
+                file_a
+            } else {
+                file_b
+            };
+            assert_eq!(mapped, expected, "data mismatch for {name}");
+        }
+    }
+
+    #[test]
+    fn aligned_data_page_alignment() {
+        let file_a = b"short";
+        let file_b = b"another file";
+        let file_c = b"third file with longer content that spans more bytes";
+        let tar_data = build_test_tar(&[
+            ("alpha.bin", file_a),
+            ("beta.bin", file_b),
+            ("gamma.bin", file_c),
+        ]);
+
+        let offsets = compute_aligned_offsets(&tar_data);
+        assert_eq!(offsets.len(), 3);
+
+        for (name, offset, _size) in &offsets {
+            assert_eq!(
+                offset % PAGE_SIZE,
+                0,
+                "offset for {name} ({offset}) should be a multiple of {PAGE_SIZE}"
+            );
+        }
+    }
+
+    #[test]
+    fn aligned_data_fd_inheritable() {
+        let tar_data = build_test_tar(&[("test.bin", b"data")]);
+        let region = AlignedDataRegion::from_tar_bytes(&tar_data)
+            .expect("failed to create AlignedDataRegion");
+
+        let raw_fd = region.fd_raw();
+
+        // Verify the fd is valid by checking its flags.
+        let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFD) };
+        assert!(flags >= 0, "fd should be valid");
+
+        // Verify CLOEXEC is NOT set (fd is inheritable).
+        assert_eq!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "fd should NOT have CLOEXEC set so children inherit it"
+        );
     }
 }
