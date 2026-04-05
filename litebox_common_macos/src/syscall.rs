@@ -796,24 +796,18 @@ impl MacosSyscallRequest {
                 nevents: a4 as i32,
                 timeout: a5,
             },
-            nr::GETTIMEOFDAY => MacosSyscallRequest::Gettimeofday {
-                tv: a0 as usize,
-                tz: a1 as usize,
-            },
+            nr::GETTIMEOFDAY => MacosSyscallRequest::Gettimeofday { tv: a0, tz: a1 },
             nr::READV => MacosSyscallRequest::Readv {
                 fd: a0 as i32,
-                iov: a1 as usize,
-                iovcnt: a2 as usize,
+                iov: a1,
+                iovcnt: a2,
             },
             nr::WRITEV => MacosSyscallRequest::Writev {
                 fd: a0 as i32,
-                iov: a1 as usize,
-                iovcnt: a2 as usize,
+                iov: a1,
+                iovcnt: a2,
             },
-            nr::GETCWD => MacosSyscallRequest::Getcwd {
-                buf: a0 as usize,
-                size: a1 as usize,
-            },
+            nr::GETCWD => MacosSyscallRequest::Getcwd { buf: a0, size: a1 },
             _ => MacosSyscallRequest::Unknown { number: nr_raw },
         }
     }

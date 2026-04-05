@@ -145,6 +145,10 @@ impl<FS: ShimFS> Task<FS> {
                 self.sys_exit(1);
                 Ok(0)
             }
+            MacosSyscallRequest::Gettimeofday { tv, tz } => self.sys_gettimeofday(tv, tz),
+            MacosSyscallRequest::Readv { fd, iov, iovcnt } => self.sys_readv(fd, iov, iovcnt),
+            MacosSyscallRequest::Writev { fd, iov, iovcnt } => self.sys_writev(fd, iov, iovcnt),
+            MacosSyscallRequest::Getcwd { buf, size } => self.sys_getcwd(buf, size),
             MacosSyscallRequest::Unknown { number } => {
                 log_unsupported!("macOS syscall {number}");
                 Err(Errno::ENOSYS)

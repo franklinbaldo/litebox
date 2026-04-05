@@ -425,20 +425,20 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
 
-        // Read timeout: struct timeval { int64 tv_sec; int64 tv_usec; } = 16 bytes.
+        // Read timeout: struct timeval { i64 tv_sec; i32 tv_usec; } = 16 bytes (with padding).
         let timeout = if timeout_addr == 0 {
             None // block indefinitely
         } else {
             let tv_sec_ptr: ConstPtr<i64> = ConstPtr::from_usize(timeout_addr);
-            let tv_usec_ptr: ConstPtr<i64> = ConstPtr::from_usize(timeout_addr + 8);
+            let tv_usec_ptr: ConstPtr<i32> = ConstPtr::from_usize(timeout_addr + 8);
             let tv_sec: i64 = tv_sec_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
-            let tv_usec: i64 = tv_usec_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            let tv_usec: i32 = tv_usec_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
             if tv_sec < 0 || tv_usec < 0 {
                 return Err(Errno::EINVAL);
             }
             Some(
                 Duration::from_secs(tv_sec.cast_unsigned())
-                    + Duration::from_micros(tv_usec.cast_unsigned()),
+                    + Duration::from_micros(u64::from(tv_usec.cast_unsigned())),
             )
         };
 

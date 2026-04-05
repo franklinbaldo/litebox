@@ -16,6 +16,9 @@ use crate::{ConstPtr, MutPtr, Platform, ShimFS, Task};
 /// Maximum kernel-side buffer size, to prevent OOM from huge read/write requests.
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
 
+/// Maximum number of iovec entries (macOS IOV_MAX).
+const IOV_MAX: usize = 1024;
+
 /// Convert a raw `i32` fd to a `usize` for lookup, returning EBADF on negative values.
 pub(crate) fn fd_to_usize(fd: i32) -> Result<usize, Errno> {
     usize::try_from(fd).map_err(|_| Errno::EBADF)
@@ -207,6 +210,84 @@ impl<FS: ShimFS> Task<FS> {
         };
 
         Ok(size)
+    }
+
+    /// Handle `readv(fd, iov, iovcnt)` — scatter read.
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn sys_readv(
+        &self,
+        fd: i32,
+        iov_addr: usize,
+        iovcnt: usize,
+    ) -> Result<usize, Errno> {
+        if iovcnt == 0 || iovcnt > IOV_MAX {
+            return Err(Errno::EINVAL);
+        }
+        let mut total: usize = 0;
+        for i in 0..iovcnt {
+            let base_ptr: ConstPtr<u64> = ConstPtr::from_usize(iov_addr + i * 16);
+            let len_ptr: ConstPtr<u64> = ConstPtr::from_usize(iov_addr + i * 16 + 8);
+            let iov_base: u64 = base_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            let iov_len: u64 = len_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            let iov_len = iov_len as usize;
+            if iov_len == 0 {
+                continue;
+            }
+            match self.sys_read(fd, iov_base as usize, iov_len) {
+                Ok(n) => {
+                    total += n;
+                    if n < iov_len {
+                        break; // short read
+                    }
+                }
+                Err(e) => {
+                    if total > 0 {
+                        break; // partial transfer — return what we have
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    /// Handle `writev(fd, iov, iovcnt)` — gather write.
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn sys_writev(
+        &self,
+        fd: i32,
+        iov_addr: usize,
+        iovcnt: usize,
+    ) -> Result<usize, Errno> {
+        if iovcnt == 0 || iovcnt > IOV_MAX {
+            return Err(Errno::EINVAL);
+        }
+        let mut total: usize = 0;
+        for i in 0..iovcnt {
+            let base_ptr: ConstPtr<u64> = ConstPtr::from_usize(iov_addr + i * 16);
+            let len_ptr: ConstPtr<u64> = ConstPtr::from_usize(iov_addr + i * 16 + 8);
+            let iov_base: u64 = base_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            let iov_len: u64 = len_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            let iov_len = iov_len as usize;
+            if iov_len == 0 {
+                continue;
+            }
+            match self.sys_write(fd, iov_base as usize, iov_len) {
+                Ok(n) => {
+                    total += n;
+                    if n < iov_len {
+                        break; // short write
+                    }
+                }
+                Err(e) => {
+                    if total > 0 {
+                        break; // partial transfer — return what we have
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok(total)
     }
 
     /// Handle `close(fd)`.

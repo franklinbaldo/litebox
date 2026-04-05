@@ -8,9 +8,9 @@
 
 use alloc::boxed::Box;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, ThreadProvider as _};
-use litebox_common_macos::PtRegs;
 use litebox_common_macos::errno::Errno;
 use litebox_common_macos::syscall::mach_trap;
+use litebox_common_macos::PtRegs;
 
 use crate::{MutPtr, ShimFS, Task};
 
@@ -55,20 +55,19 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
-    /// Handle `getentropy()` — fill buffer with pseudo-random bytes.
+    /// Handle `getentropy()` — fill buffer with cryptographically random bytes.
     pub(crate) fn sys_getentropy(&self, buf_addr: usize, count: usize) -> Result<usize, Errno> {
         if count > 256 {
             return Err(Errno::EIO);
         }
-        let data: alloc::vec::Vec<u8> = (0..count)
-            .map(|i| {
-                #[allow(clippy::cast_possible_truncation)]
-                let b = (i as u8).wrapping_mul(7).wrapping_add(13);
-                b
-            })
-            .collect();
+        let mut kbuf = [0u8; 256];
+        <_ as litebox::platform::CrngProvider>::fill_bytes_crng(
+            self.global.platform,
+            &mut kbuf[..count],
+        );
         let dest: MutPtr<u8> = MutPtr::from_usize(buf_addr);
-        dest.copy_from_slice(0, &data).ok_or(Errno::EFAULT)?;
+        dest.copy_from_slice(0, &kbuf[..count])
+            .ok_or(Errno::EFAULT)?;
         Ok(0)
     }
 
