@@ -82,9 +82,14 @@ struct Args {
     #[arg(long, default_value = "0")]
     initial_brk: usize,
 
-    /// Path to a .tar file containing the root filesystem (shared libraries, etc.).
+    /// Tar shmem file descriptor (inherited from launcher).
+    /// If not provided, an empty tar is used.
     #[arg(long)]
-    rootfs_tar: Option<String>,
+    tar_fd: Option<i32>,
+
+    /// Size in bytes of the tar shmem region.
+    #[arg(long, default_value = "0")]
+    tar_size: usize,
 
     /// Name of the TUN device to open for raw IP networking (e.g. "tun0").
     /// If not provided, IP networking is disabled.
@@ -117,13 +122,43 @@ fn main() -> anyhow::Result<()> {
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     let lb = shim_builder.litebox();
 
-    let tar_data: std::borrow::Cow<'static, [u8]> = if let Some(ref tar_path) = args.rootfs_tar {
-        let data = std::fs::read(tar_path)
-            .map_err(|e| anyhow::anyhow!("failed to read rootfs tar {tar_path}: {e}"))?;
-        std::borrow::Cow::Owned(data)
+    let tar_data: std::borrow::Cow<'static, [u8]> = if let Some(tar_fd) = args.tar_fd {
+        let size = args.tar_size;
+        if size == 0 {
+            eprintln!("litebox_central: --tar-fd provided but --tar-size is 0");
+            std::borrow::Cow::Borrowed(litebox::fs::tar_ro::EMPTY_TAR_FILE)
+        } else {
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    libc::PROT_READ,
+                    libc::MAP_SHARED,
+                    tar_fd,
+                    0,
+                )
+            };
+            if ptr == libc::MAP_FAILED {
+                eprintln!(
+                    "litebox_central: mmap tar shmem failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                std::borrow::Cow::Borrowed(litebox::fs::tar_ro::EMPTY_TAR_FILE)
+            } else {
+                // SAFETY: mmap succeeded, ptr valid for `size` bytes. The mapping
+                // lives for the process lifetime (never munmap'd). We cast to
+                // 'static because the data outlives all references.
+                let slice: &'static [u8] =
+                    unsafe { core::slice::from_raw_parts(ptr.cast::<u8>(), size) };
+                std::borrow::Cow::Borrowed(slice)
+            }
+        }
     } else {
         std::borrow::Cow::Borrowed(litebox::fs::tar_ro::EMPTY_TAR_FILE)
     };
+
+    let tar_shmem_base: *const u8 = tar_data.as_ptr();
+    let tar_shmem_size: usize = tar_data.len();
 
     let devices = litebox::fs::devices::FileSystem::new(lb);
     let mut in_mem = litebox::fs::in_mem::FileSystem::new(lb);
@@ -202,7 +237,18 @@ fn main() -> anyhow::Result<()> {
     // lost).  Queue 0 (created by CentralPlatform::new) is handed to the first
     // forked worker; subsequent workers get new queues via open_new_queue().
     let tun_enabled = args.tun_device.is_some();
-    let server = server::ProcessServer::new(region, task, shim, fs, ring_pool, -1, None, tun_enabled);
+    let server = server::ProcessServer::new(
+        region,
+        task,
+        shim,
+        fs,
+        ring_pool,
+        -1,
+        None,
+        tun_enabled,
+        tar_shmem_base,
+        tar_shmem_size,
+    );
     let result = server.run();
 
     // Signal all micro processes that central is shutting down.

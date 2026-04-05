@@ -60,6 +60,19 @@ const MMAP_BUMP_START: u64 = 0x1000_0000_0000;
 /// End (exclusive) of the bump allocator range. 1 TiB of space.
 const MMAP_BUMP_END: u64 = 0x1100_0000_0000;
 
+/// Wrapper for a `*const u8` that is safe to send across threads.
+///
+/// The pointer originates from an `mmap`'d region that lives for the entire
+/// process lifetime (never `munmap`'d), so it is always valid regardless of
+/// which thread accesses it.
+#[derive(Clone, Copy)]
+struct SendPtr(*const u8);
+
+// SAFETY: The wrapped pointer points to process-lifetime mmap'd memory that
+// is never freed. It is safe to read from any thread.
+unsafe impl Send for SendPtr {}
+unsafe impl Sync for SendPtr {}
+
 /// The central server that processes SQ entries and produces CQ completions.
 ///
 /// Manages one primary task (the main thread at slot 0) plus additional
@@ -107,6 +120,11 @@ pub struct ProcessServer<FS: ShimFS> {
     /// been given away or for non-master processes (which always call
     /// `open_new_queue()` for their children).
     initial_child_queue: Cell<Option<usize>>,
+    /// Base pointer of the mmap'd tar shmem region (shared with micro via
+    /// `ExecveHeader`). Passed through to forked children.
+    tar_shmem_base: SendPtr,
+    /// Size in bytes of the tar shmem region.
+    tar_shmem_size: usize,
 }
 
 impl<FS: ShimFS> ProcessServer<FS> {
@@ -122,6 +140,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
         ring_fd: i32,
         tun_queue: Option<usize>,
         tun_enabled: bool,
+        tar_shmem_base: *const u8,
+        tar_shmem_size: usize,
     ) -> Self {
         // If this process has no TUN queue but TUN is enabled, it's the master.
         // Queue 0 (created by CentralPlatform::new) should be given to the
@@ -149,6 +169,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
             tun_queue,
             tun_enabled,
             initial_child_queue,
+            tar_shmem_base: SendPtr(tar_shmem_base),
+            tar_shmem_size,
         }
     }
 
@@ -870,14 +892,17 @@ impl<FS: ShimFS> ProcessServer<FS> {
     /// - `data_len`: child ring fd number in central's fd table
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn handle_fork(&self, entry: &SqEntry) -> CqEntry {
+        let fork_start = std::time::Instant::now();
         let mut cq = Self::base_cq(entry);
 
         // 1. Acquire a ring for the child from the pool.
+        let t0 = std::time::Instant::now();
         let Ok((child_region, child_ring_fd)) = self.ring_pool.acquire() else {
             eprintln!("[CENTRAL] handle_fork: FAILED to acquire ring (ENOMEM)");
             cq.result = -i64::from(libc::ENOMEM);
             return cq;
         };
+        let ring_acquire_us = t0.elapsed().as_micros();
 
         // Register the child ring so it gets signalled on central exit/panic.
         crate::register_active_ring(child_region.header());
@@ -887,6 +912,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
         self.next_child_pid.set(child_pid + 1);
 
         // 3. Create child task via the shim, inheriting parent's fds and cwd.
+        let t1 = std::time::Instant::now();
         let params = litebox_common_linux::TaskParams {
             pid: child_pid,
             ppid: 1, // parent is the main process
@@ -908,6 +934,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 return cq;
             }
         };
+        let fork_task_us = t1.elapsed().as_micros();
 
         // 4. Spawn the child server immediately.
         //
@@ -915,6 +942,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
         // after post-fork initialization.  The child server must already be
         // running its event loop so it can consume that message (and all
         // subsequent syscalls from the child).
+        let t2 = std::time::Instant::now();
         {
             let shim = self.shim.clone();
             let fs = self.fs.clone();
@@ -934,6 +962,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 None
             };
             let tun_enabled = self.tun_enabled;
+            let tar_shmem_base = self.tar_shmem_base.0;
+            let tar_shmem_size = self.tar_shmem_size;
             let child_server = ProcessServer::new(
                 child_region,
                 child_task,
@@ -943,6 +973,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 child_ring_fd,
                 tun_queue,
                 tun_enabled,
+                tar_shmem_base,
+                tar_shmem_size,
             );
             child_server.next_child_pid.set(self.next_child_pid.get());
 
@@ -953,6 +985,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
             });
             self.child_handles.borrow_mut().push(handle);
         }
+        let thread_spawn_us = t2.elapsed().as_micros();
 
         // 5. Return info to micro.
         let central_pid = std::process::id();
@@ -960,6 +993,21 @@ impl<FS: ShimFS> ProcessServer<FS> {
         cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
         cq.data_offset = child_pid as u32;
         cq.data_len = child_ring_fd as u32;
+
+        let total_us = fork_start.elapsed().as_micros();
+        // Write perf data to a dedicated file to avoid stderr buffering issues.
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/litebox_perf.log")
+        {
+            let _ = writeln!(
+                f,
+                "FORK pid={child_pid} total={total_us}us ring_acquire={ring_acquire_us}us fork_task={fork_task_us}us thread_spawn={thread_spawn_us}us"
+            );
+        }
+
         cq
     }
 
@@ -2361,6 +2409,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
         argv_strs: &[&[u8]],
         envp_strs: &[&[u8]],
     ) -> CqEntry {
+        let exec_start = std::time::Instant::now();
         let mut cq = Self::base_cq(entry);
         let thread_slot = entry.thread_slot;
 
@@ -2375,6 +2424,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
             path_cstr[path_bytes.len()] = 0;
         }
 
+        let t_open = std::time::Instant::now();
         let fd = {
             let mut regs = litebox_common_linux::PtRegs::default();
             regs.orig_rax = libc::SYS_openat as usize;
@@ -2404,8 +2454,10 @@ impl<FS: ShimFS> ProcessServer<FS> {
             }
             i64::from_le_bytes(stat_buf[48..56].try_into().unwrap()) as usize
         };
+        let open_stat_us = t_open.elapsed().as_micros();
 
         // Read the entire file.
+        let t_read = std::time::Instant::now();
         let mut file_data = vec![0u8; file_size];
         {
             let mut offset = 0usize;
@@ -2431,8 +2483,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
             }
         }
         self.close_fd(thread_slot, fd);
-
-        //
+        let file_read_us = t_read.elapsed().as_micros();
         // If the file starts with `#!`, parse the interpreter path and optional
         // argument, rebuild argv per Linux convention, and re-dispatch with the
         // interpreter binary as the target. Limited to one level of indirection
@@ -2455,6 +2506,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
         }
 
         // Parse the ELF.
+        let t_parse = std::time::Instant::now();
         let mut reader = MemReader(&file_data);
         let Ok(mut parsed) = litebox_common_linux::loader::ElfParsedFile::parse(&mut reader) else {
             cq.result = -i64::from(libc::ENOEXEC);
@@ -2548,7 +2600,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
             } else {
                 None
             };
-        // We use SimpleMapper to capture the segments without actually mapping.
+        let elf_parse_interp_us = t_parse.elapsed().as_micros();
         let mut main_mapper = SimpleMapper::new();
         let mut main_mem = SimpleMem::new();
         let Ok(main_info) = parsed.load(&mut main_mapper, &mut main_mem) else {
@@ -2573,6 +2625,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
         };
 
         // Now pack everything into the data region for micro.
+        let t_pack = std::time::Instant::now();
         let data_region = self.region.data_region_mut();
         let data_region_size = data_region.len();
 
@@ -2714,6 +2767,10 @@ impl<FS: ShimFS> ProcessServer<FS> {
             .map_or(main_info.brk, |(iinfo, _, _)| main_info.brk.max(iinfo.brk));
 
         // Write ExecveHeader.
+        let (main_range_base, main_range_len) = main_mapper.range();
+        let (interp_range_base, interp_range_len) = interp_info
+            .as_ref()
+            .map_or((0, 0), |(_, imapper, _)| imapper.range());
         let hdr = ExecveHeaderCentral {
             num_segments: num_segments as u32,
             _pad0: 0,
@@ -2733,6 +2790,10 @@ impl<FS: ShimFS> ProcessServer<FS> {
             syscall_entry_point: 0, // micro will patch this from its own trampoline
             mmap_bump_start: MMAP_BUMP_START,
             mmap_bump_end: MMAP_BUMP_END,
+            main_range_base: main_range_base as u64,
+            main_range_len: main_range_len as u64,
+            interp_range_base: interp_range_base as u64,
+            interp_range_len: interp_range_len as u64,
         };
 
         // Copy header bytes.
@@ -2885,6 +2946,21 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     false,
                 );
             }
+        }
+
+        let pack_us = t_pack.elapsed().as_micros();
+        let total_exec_us = exec_start.elapsed().as_micros();
+        // Write perf data to a dedicated file to avoid stderr buffering issues.
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/litebox_perf.log")
+        {
+            let _ = writeln!(
+                f,
+                "EXEC size={file_size} total={total_exec_us}us open_stat={open_stat_us}us file_read={file_read_us}us elf_parse_interp={elf_parse_interp_us}us pack={pack_us}us"
+            );
         }
 
         cq.result = 0;
@@ -3201,6 +3277,10 @@ struct ExecveHeaderCentral {
     syscall_entry_point: u64,
     mmap_bump_start: u64,
     mmap_bump_end: u64,
+    main_range_base: u64,
+    main_range_len: u64,
+    interp_range_base: u64,
+    interp_range_len: u64,
 }
 
 /// Mirror of `ExecveSegment` from `litebox_micro::execve`.
@@ -3343,6 +3423,39 @@ impl SimpleMapper {
             segments: Vec::new(),
             base_addr: 0,
             next_addr: addr,
+        }
+    }
+
+    /// Return the `(base, len)` of the overall virtual address range occupied
+    /// by the segments recorded in this mapper.
+    ///
+    /// - For ET_DYN binaries (where `reserve()` was called and set `base_addr`):
+    ///   returns `(base_addr, next_addr - base_addr)`.
+    /// - For ET_EXEC binaries (`base_addr` stays 0, `reserve()` never called):
+    ///   computes the range from the recorded segments.
+    /// - If no segments were recorded, returns `(0, 0)`.
+    fn range(&self) -> (usize, usize) {
+        if self.segments.is_empty() {
+            return (0, 0);
+        }
+        if self.base_addr != 0 {
+            // ET_DYN: reserve() was called.
+            (self.base_addr, self.next_addr - self.base_addr)
+        } else {
+            // ET_EXEC: compute from recorded segments.
+            let lo = self
+                .segments
+                .iter()
+                .map(|s| s.address)
+                .min()
+                .unwrap_or(0);
+            let hi = self
+                .segments
+                .iter()
+                .map(|s| s.address + s.len)
+                .max()
+                .unwrap_or(0);
+            (lo, hi - lo)
         }
     }
 }
