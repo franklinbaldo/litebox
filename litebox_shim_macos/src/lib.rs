@@ -797,8 +797,7 @@ struct GlobalState<FS: ShimFS> {
     futex_manager: FutexManager<Platform>,
     /// The anonymous pipe implementation.
     pipes: Pipes<Platform>,
-    /// The network subsystem.
-    #[expect(dead_code, reason = "will be used when network syscalls are added")]
+    /// The network subsystem (AF_INET sockets via smoltcp).
     net: litebox::sync::Mutex<Platform, Network<Platform>>,
     /// The time when the shim was started.
     #[expect(dead_code, reason = "will be used for clock_gettime and similar")]
@@ -834,6 +833,7 @@ pub(crate) const MMAP_HOOK_TRAMPOLINE_SIZE: usize = 16 * 1024;
 enum StrongFd<FS: ShimFS> {
     FileSystem(Arc<TypedFd<FS>>),
     Pipes(Arc<TypedFd<Pipes<Platform>>>),
+    Network(Arc<TypedFd<Network<Platform>>>),
 }
 
 impl<FS: ShimFS> StrongFd<FS> {
@@ -844,6 +844,9 @@ impl<FS: ShimFS> StrongFd<FS> {
         }
         if let Ok(fd) = rds.fd_from_raw_integer::<Pipes<Platform>>(fd) {
             return Ok(StrongFd::Pipes(fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer::<Network<Platform>>(fd) {
+            return Ok(StrongFd::Network(fd));
         }
         Err(Errno::EBADF)
     }

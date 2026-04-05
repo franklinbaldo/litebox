@@ -6,6 +6,7 @@
 use alloc::string::String;
 use alloc::vec;
 use litebox::fs::{OFlags, SeekWhence};
+use litebox::net::{CloseBehavior, Network, ReceiveFlags, SendFlags};
 use litebox::pipes::Pipes;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox_common_macos::errno::Errno;
@@ -100,6 +101,11 @@ impl<FS: ShimFS> Task<FS> {
                     .read(&cx, typed_fd, &mut kernel_buf)
                     .map_err(Self::pipe_read_error_to_errno)?
             }
+            crate::StrongFd::Network(ref typed_fd) => {
+                let mut net = self.global.net.lock();
+                net.receive(typed_fd, &mut kernel_buf, ReceiveFlags::empty(), None)
+                    .map_err(crate::syscalls::net::receive_error_to_errno)?
+            }
         };
 
         let user_buf: MutPtr<u8> = MutPtr::from_usize(buf_addr);
@@ -149,6 +155,11 @@ impl<FS: ShimFS> Task<FS> {
                     .write(&cx, typed_fd, &data)
                     .map_err(Self::pipe_write_error_to_errno)?
             }
+            crate::StrongFd::Network(ref typed_fd) => {
+                let mut net = self.global.net.lock();
+                net.send(typed_fd, &data, SendFlags::empty(), None)
+                    .map_err(crate::syscalls::net::send_error_to_errno)?
+            }
         };
 
         Ok(size)
@@ -189,6 +200,14 @@ impl<FS: ShimFS> Task<FS> {
             }
             if let Ok(typed_fd) = rds.fd_consume_raw_integer::<Pipes<Platform>>(raw_fd) {
                 return self.global.pipes.close(&typed_fd).map_err(|_| Errno::EIO);
+            }
+            if let Ok(typed_fd) = rds.fd_consume_raw_integer::<Network<Platform>>(raw_fd) {
+                return self
+                    .global
+                    .net
+                    .lock()
+                    .close(&typed_fd, CloseBehavior::GracefulIfNoPendingData)
+                    .map_err(crate::syscalls::net::close_error_to_errno);
             }
         }
 
