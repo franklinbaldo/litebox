@@ -83,8 +83,25 @@ impl<FS: ShimFS> Task<FS> {
         let raw_fd = fd_to_usize(fd)?;
         let strong_fd = {
             let rds = self.global.raw_descriptors.read();
-            crate::StrongFd::from_raw(&rds, raw_fd)?
+            crate::StrongFd::from_raw(&rds, raw_fd).ok()
         };
+
+        // Check for unix socket if not found in the raw descriptor table.
+        if strong_fd.is_none() {
+            let unix_sockets = self.global.unix_sockets.read();
+            if let Some(socket) = unix_sockets.get(&raw_fd) {
+                let socket = socket.clone();
+                drop(unix_sockets);
+                let read_len = count.min(MAX_KERNEL_BUF_SIZE);
+                let mut kernel_buf = vec![0u8; read_len];
+                let size = socket.read(&mut kernel_buf)?;
+                let user_buf: MutPtr<u8> = MutPtr::from_usize(buf_addr);
+                user_buf.copy_from_slice(0, &kernel_buf[..size]).ok_or(Errno::EFAULT)?;
+                return Ok(size);
+            }
+            return Err(Errno::EBADF);
+        }
+        let strong_fd = strong_fd.unwrap();
 
         let read_len = count.min(MAX_KERNEL_BUF_SIZE);
         let mut kernel_buf = vec![0u8; read_len];
@@ -136,8 +153,24 @@ impl<FS: ShimFS> Task<FS> {
 
         let strong_fd = {
             let rds = self.global.raw_descriptors.read();
-            crate::StrongFd::from_raw(&rds, raw_fd)?
+            crate::StrongFd::from_raw(&rds, raw_fd).ok()
         };
+
+        // Check for unix socket if not found in the raw descriptor table.
+        if strong_fd.is_none() {
+            let unix_sockets = self.global.unix_sockets.read();
+            if let Some(socket) = unix_sockets.get(&raw_fd) {
+                let socket = socket.clone();
+                drop(unix_sockets);
+                let user_buf: ConstPtr<u8> = ConstPtr::from_usize(buf_addr);
+                let write_len = count.min(MAX_KERNEL_BUF_SIZE);
+                let data = user_buf.to_owned_slice(write_len).ok_or(Errno::EFAULT)?;
+                let size = socket.write(&data)?;
+                return Ok(size);
+            }
+            return Err(Errno::EBADF);
+        }
+        let strong_fd = strong_fd.unwrap();
 
         let user_buf: ConstPtr<u8> = ConstPtr::from_usize(buf_addr);
         let write_len = count.min(MAX_KERNEL_BUF_SIZE);
@@ -209,6 +242,20 @@ impl<FS: ShimFS> Task<FS> {
                     .lock()
                     .close(&typed_fd, CloseBehavior::GracefulIfNoPendingData)
                     .map_err(crate::syscalls::net::close_error_to_errno);
+            }
+        }
+
+        // Try Unix socket.
+        {
+            let mut unix_sockets = self.global.unix_sockets.write();
+            if let Some(socket) = unix_sockets.remove(&raw_fd) {
+                // Remove from address table if bound.
+                let bound = socket.bound_addr();
+                if let crate::syscalls::net::UnixSocketAddr::Path(ref path) = bound {
+                    self.global.unix_addr_table.write().remove(path);
+                }
+                socket.close();
+                return Ok(());
             }
         }
 

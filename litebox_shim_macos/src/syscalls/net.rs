@@ -553,9 +553,14 @@ impl<FS: ShimFS> Task<FS> {
         let _ = self.global.net.lock().set_socket_proxy(fd, proxy);
     }
 
-    /// Placeholder for AF_UNIX socket creation (implemented in unix.rs later).
-    fn do_socket_unix(&self, _sock_type: SockType) -> Result<usize, Errno> {
-        Err(Errno::EAFNOSUPPORT)
+    fn do_socket_unix(&self, sock_type: SockType) -> Result<usize, Errno> {
+        let socket = Arc::new(crate::syscalls::unix::UnixSocket::new(sock_type));
+        let fd = self
+            .global
+            .unix_fd_counter
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        self.global.unix_sockets.write().insert(fd, socket);
+        Ok(fd)
     }
 
     /// Handle `bind(fd, addr, addrlen)`.
@@ -577,9 +582,39 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
-    /// Placeholder for AF_UNIX bind.
-    fn do_bind_unix(&self, _fd: u32, _addr: UnixSocketAddr) -> Result<(), Errno> {
-        Err(Errno::EAFNOSUPPORT)
+    fn do_bind_unix(&self, fd: u32, addr: UnixSocketAddr) -> Result<(), Errno> {
+        let unix_sockets = self.global.unix_sockets.read();
+        let socket = unix_sockets
+            .get(&(fd as usize))
+            .ok_or(Errno::ENOTSOCK)?
+            .clone();
+        drop(unix_sockets);
+
+        match &addr {
+            UnixSocketAddr::Path(path) => {
+                // Check if address is already in use.
+                let addr_table = self.global.unix_addr_table.read();
+                if addr_table.contains_key(path) {
+                    return Err(Errno::EADDRINUSE);
+                }
+                drop(addr_table);
+
+                socket.set_bound_addr(addr.clone());
+
+                // For datagram sockets, register in addr table immediately.
+                if socket.sock_type() == SockType::Datagram {
+                    let rx = Arc::new(crate::syscalls::unix::DatagramChannel::new(64));
+                    socket.set_bound_datagram(rx.clone());
+                    self.global.unix_addr_table.write().insert(
+                        path.clone(),
+                        crate::syscalls::unix::UnixAddrEntry::DatagramReceiver(rx),
+                    );
+                }
+
+                Ok(())
+            }
+            UnixSocketAddr::Unnamed => Err(Errno::EINVAL),
+        }
     }
 
     /// Handle `listen(fd, backlog)`.
@@ -600,9 +635,26 @@ impl<FS: ShimFS> Task<FS> {
         self.do_listen_unix(fd, backlog)
     }
 
-    /// Placeholder for AF_UNIX listen.
-    fn do_listen_unix(&self, _fd: u32, _backlog: u32) -> Result<(), Errno> {
-        Err(Errno::ENOTSOCK)
+    fn do_listen_unix(&self, fd: u32, backlog: u32) -> Result<(), Errno> {
+        let unix_sockets = self.global.unix_sockets.read();
+        let socket = unix_sockets
+            .get(&(fd as usize))
+            .ok_or(Errno::ENOTSOCK)?
+            .clone();
+        drop(unix_sockets);
+
+        socket.listen(backlog)?;
+
+        // Register the socket in the address table so connect() can find it.
+        let bound_addr = socket.bound_addr();
+        if let UnixSocketAddr::Path(ref path) = bound_addr {
+            self.global.unix_addr_table.write().insert(
+                path.clone(),
+                crate::syscalls::unix::UnixAddrEntry::StreamListener(socket),
+            );
+        }
+
+        Ok(())
     }
 
     /// Handle `accept(fd, addr, addrlen)`.
@@ -651,9 +703,36 @@ impl<FS: ShimFS> Task<FS> {
         self.do_accept_unix(fd, addr, addrlen)
     }
 
-    /// Placeholder for AF_UNIX accept.
-    fn do_accept_unix(&self, _fd: u32, _addr: u64, _addrlen: u64) -> Result<usize, Errno> {
-        Err(Errno::ENOTSOCK)
+    fn do_accept_unix(&self, fd: u32, addr: u64, addrlen: u64) -> Result<usize, Errno> {
+        let unix_sockets = self.global.unix_sockets.read();
+        let socket = unix_sockets
+            .get(&(fd as usize))
+            .ok_or(Errno::ENOTSOCK)?
+            .clone();
+        drop(unix_sockets);
+
+        let (server_rx, server_tx, client_addr) = socket.try_accept()?;
+
+        // Create the accepted socket.
+        let accepted = Arc::new(crate::syscalls::unix::UnixSocket::<FS>::new(
+            SockType::Stream,
+        ));
+        accepted.set_connected_stream(server_rx, server_tx, client_addr.clone());
+
+        // Allocate fd and register.
+        let accepted_fd = self
+            .global
+            .unix_fd_counter
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        self.global
+            .unix_sockets
+            .write()
+            .insert(accepted_fd, accepted);
+
+        // Write client address back to user memory if requested.
+        write_sockaddr_unix_to_user(&client_addr, addr, addrlen)?;
+
+        Ok(accepted_fd)
     }
 
     /// Handle `connect(fd, addr, addrlen)`.
@@ -672,9 +751,42 @@ impl<FS: ShimFS> Task<FS> {
                     .connect(&typed_fd, &core::net::SocketAddr::V4(endpoint), false)
                     .map_err(connect_error_to_errno)
             }
-            SocketAddress::Unix(_unix_addr) => {
-                // Unix connect will be implemented in Task 14.
-                Err(Errno::EAFNOSUPPORT)
+            SocketAddress::Unix(unix_addr) => self.do_connect_unix(fd, unix_addr),
+        }
+    }
+
+    fn do_connect_unix(&self, fd: u32, addr: UnixSocketAddr) -> Result<(), Errno> {
+        let path = match &addr {
+            UnixSocketAddr::Path(p) => p.clone(),
+            UnixSocketAddr::Unnamed => return Err(Errno::EINVAL),
+        };
+
+        let unix_sockets = self.global.unix_sockets.read();
+        let client_socket = unix_sockets
+            .get(&(fd as usize))
+            .ok_or(Errno::ENOTSOCK)?
+            .clone();
+        drop(unix_sockets);
+
+        // Find the target in the address table.
+        let addr_table = self.global.unix_addr_table.read();
+        let entry = addr_table.get(&path).ok_or(Errno::ECONNREFUSED)?;
+
+        match entry {
+            crate::syscalls::unix::UnixAddrEntry::StreamListener(listener_socket) => {
+                let listener_socket = listener_socket.clone();
+                drop(addr_table);
+                let client_addr = client_socket.bound_addr();
+                client_socket.connect_to_listener(&listener_socket, client_addr)?;
+                Ok(())
+            }
+            crate::syscalls::unix::UnixAddrEntry::DatagramReceiver(rx) => {
+                let rx = rx.clone();
+                drop(addr_table);
+                // For datagram connect, store the target for future sends.
+                let my_rx = Arc::new(crate::syscalls::unix::DatagramChannel::new(64));
+                client_socket.set_connected_datagram(my_rx, rx, addr);
+                Ok(())
             }
         }
     }
@@ -698,13 +810,21 @@ impl<FS: ShimFS> Task<FS> {
             match read_sockaddr_from_user(dest_addr, addrlen)? {
                 SocketAddress::Inet(ep) => Some(core::net::SocketAddr::V4(ep)),
                 SocketAddress::Unix(_addr) => {
-                    // Unix sendto will be implemented in Task 14.
-                    return Err(Errno::EAFNOSUPPORT);
+                    return self.do_sendto_unix(fd, &data, Some(_addr));
                 }
             }
         } else {
             None
         };
+
+        // Try unix socket first (unix fd numbers are in a separate namespace).
+        {
+            let unix_sockets = self.global.unix_sockets.read();
+            if unix_sockets.contains_key(&(fd as usize)) {
+                drop(unix_sockets);
+                return self.do_sendto_unix(fd, &data, None);
+            }
+        }
 
         // Try inet.
         let rds = self.global.raw_descriptors.read();
@@ -733,6 +853,15 @@ impl<FS: ShimFS> Task<FS> {
     ) -> Result<usize, Errno> {
         let buf_len = len as usize;
         let mut kernel_buf = vec![0u8; buf_len];
+
+        // Try unix socket first.
+        {
+            let unix_sockets = self.global.unix_sockets.read();
+            if unix_sockets.contains_key(&(fd as usize)) {
+                drop(unix_sockets);
+                return self.do_recvfrom_unix(fd, buf, buf_len, src_addr, addrlen);
+            }
+        }
 
         // Try inet.
         let rds = self.global.raw_descriptors.read();
@@ -764,6 +893,52 @@ impl<FS: ShimFS> Task<FS> {
         // Write source address if requested.
         if let Some(Some(ref ep)) = source {
             write_sockaddr_inet_to_user(ep, src_addr, addrlen)?;
+        }
+
+        Ok(bytes_read)
+    }
+
+    fn do_sendto_unix(
+        &self,
+        fd: u32,
+        data: &[u8],
+        _addr: Option<UnixSocketAddr>,
+    ) -> Result<usize, Errno> {
+        let unix_sockets = self.global.unix_sockets.read();
+        let socket = unix_sockets
+            .get(&(fd as usize))
+            .ok_or(Errno::ENOTSOCK)?
+            .clone();
+        drop(unix_sockets);
+        socket.write(data)
+    }
+
+    fn do_recvfrom_unix(
+        &self,
+        fd: u32,
+        buf: u64,
+        len: usize,
+        src_addr: u64,
+        addrlen: u64,
+    ) -> Result<usize, Errno> {
+        let unix_sockets = self.global.unix_sockets.read();
+        let socket = unix_sockets
+            .get(&(fd as usize))
+            .ok_or(Errno::ENOTSOCK)?
+            .clone();
+        drop(unix_sockets);
+
+        let mut kernel_buf = alloc::vec![0u8; len];
+        let bytes_read = socket.read(&mut kernel_buf)?;
+
+        let user_buf: MutPtr<u8> = MutPtr::from_usize(buf as usize);
+        user_buf
+            .copy_from_slice(0, &kernel_buf[..bytes_read])
+            .ok_or(Errno::EFAULT)?;
+
+        // Write unnamed source address for stream sockets.
+        if src_addr != 0 {
+            write_sockaddr_unix_to_user(&UnixSocketAddr::Unnamed, src_addr, addrlen)?;
         }
 
         Ok(bytes_read)
@@ -826,6 +1001,15 @@ impl<FS: ShimFS> Task<FS> {
                 Ok(Some(Duration::from_secs(lg.l_linger as u64)))
             }
         };
+
+        // Check if it's a unix socket first — accept but ignore most options.
+        {
+            let unix_sockets = self.global.unix_sockets.read();
+            if unix_sockets.contains_key(&(fd as usize)) {
+                // Unix sockets accept setsockopt calls but largely ignore them.
+                return Ok(());
+            }
+        }
 
         // Inet socket path.
         let rds = self.global.raw_descriptors.read();
@@ -1003,7 +1187,28 @@ impl<FS: ShimFS> Task<FS> {
         }
         drop(rds);
 
-        // Unix sockets not yet implemented — will be added in Task 13.
+        // Unix socket — return sensible defaults.
+        {
+            let unix_sockets = self.global.unix_sockets.read();
+            if unix_sockets.contains_key(&(fd as usize)) {
+                return match opt {
+                    SocketOptionName::Type => {
+                        let sock = unix_sockets.get(&(fd as usize)).unwrap();
+                        let val = match sock.sock_type() {
+                            SockType::Stream => SOCK_STREAM,
+                            SockType::Datagram => SOCK_DGRAM,
+                        };
+                        write_u32(val)
+                    }
+                    SocketOptionName::Error => write_u32(0),
+                    SocketOptionName::SndBuf | SocketOptionName::RcvBuf => {
+                        write_u32(SOCKET_BUFFER_SIZE)
+                    }
+                    _ => write_u32(0), // Return 0 for most options on unix sockets
+                };
+            }
+        }
+
         Err(Errno::ENOTSOCK)
     }
 
@@ -1023,7 +1228,15 @@ impl<FS: ShimFS> Task<FS> {
         }
         drop(rds);
 
-        // Unix sockets not yet implemented.
+        // Try unix socket.
+        {
+            let unix_sockets = self.global.unix_sockets.read();
+            if let Some(socket) = unix_sockets.get(&(fd as usize)) {
+                let bound = socket.bound_addr();
+                return write_sockaddr_unix_to_user(&bound, addr, addrlen);
+            }
+        }
+
         Err(Errno::ENOTSOCK)
     }
 
@@ -1042,6 +1255,15 @@ impl<FS: ShimFS> Task<FS> {
             return write_sockaddr_inet_to_user(&remote, addr, addrlen);
         }
         drop(rds);
+
+        // Try unix socket.
+        {
+            let unix_sockets = self.global.unix_sockets.read();
+            if let Some(socket) = unix_sockets.get(&(fd as usize)) {
+                let peer = socket.peer_addr();
+                return write_sockaddr_unix_to_user(&peer, addr, addrlen);
+            }
+        }
 
         Err(Errno::ENOTSOCK)
     }
@@ -1066,6 +1288,14 @@ impl<FS: ShimFS> Task<FS> {
         drop(rds);
 
         // Unix sockets not yet implemented.
+        // Try unix socket.
+        {
+            let unix_sockets = self.global.unix_sockets.read();
+            if let Some(socket) = unix_sockets.get(&(fd as usize)) {
+                return socket.shutdown(how);
+            }
+        }
+
         Err(Errno::ENOTSOCK)
     }
 
@@ -1125,7 +1355,15 @@ impl<FS: ShimFS> Task<FS> {
         }
         drop(rds);
 
-        // Unix sockets not yet implemented.
+        // Try unix socket.
+        {
+            let unix_sockets = self.global.unix_sockets.read();
+            if unix_sockets.contains_key(&(fd as usize)) {
+                drop(unix_sockets);
+                return self.do_sendto_unix(fd, &gathered, None);
+            }
+        }
+
         Err(Errno::ENOTSOCK)
     }
 
@@ -1212,7 +1450,41 @@ impl<FS: ShimFS> Task<FS> {
         }
         drop(rds);
 
-        // Unix sockets not yet implemented.
+        // Try unix socket.
+        {
+            let unix_sockets = self.global.unix_sockets.read();
+            if unix_sockets.contains_key(&(fd as usize)) {
+                let socket = unix_sockets.get(&(fd as usize)).unwrap().clone();
+                drop(unix_sockets);
+
+                let bytes_read = socket.read(&mut kernel_buf)?;
+
+                // Scatter into iovecs.
+                let mut offset = 0usize;
+                for (iov_base, iov_len) in &iovecs {
+                    if offset >= bytes_read {
+                        break;
+                    }
+                    let to_copy = (*iov_len).min(bytes_read - offset);
+                    let dst: MutPtr<u8> = MutPtr::from_usize(*iov_base as usize);
+                    dst.copy_from_slice(0, &kernel_buf[offset..offset + to_copy])
+                        .ok_or(Errno::EFAULT)?;
+                    offset += to_copy;
+                }
+
+                // Write msg_controllen = 0 and msg_flags = 0.
+                let hdr_mut: MutPtr<u8> = MutPtr::from_usize(msg as usize);
+                hdr_mut
+                    .copy_from_slice(40, &0u32.to_ne_bytes())
+                    .ok_or(Errno::EFAULT)?;
+                hdr_mut
+                    .copy_from_slice(44, &0i32.to_ne_bytes())
+                    .ok_or(Errno::EFAULT)?;
+
+                return Ok(bytes_read);
+            }
+        }
+
         Err(Errno::ENOTSOCK)
     }
 
