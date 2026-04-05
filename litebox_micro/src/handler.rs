@@ -1191,14 +1191,12 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
         // Write case or pid != 0: fall through to central round-trip.
     }
 
-    // Anonymous mmap(NULL) fast-path: use the bump allocator to avoid a
-    // ring round-trip.  ld-linux issues ~1 anonymous mmap(NULL) call per
-    // exec; handling it locally saves ~144 µs per exec.
-    //
-    // Conditions: addr == NULL, MAP_ANONYMOUS set, MAP_FIXED not set, fd == -1.
-    // The bump allocator hands out addresses from a pre-reserved range
-    // (MMAP_BUMP_START..MMAP_BUMP_END) and sends a Tier 2 fire-and-forget
-    // notification so central can track the VMA for fork reconstruction.
+    // Anonymous mmap Tier 2: execute locally, notify central afterward.
+    // For addr==0 && !MAP_FIXED, use the bump allocator to choose an
+    // address from the pre-reserved range.  For MAP_FIXED or explicit
+    // addr, execute directly (the kernel validates the address).
+    // In all cases, send a fire-and-forget notification so central can
+    // record the VMA for fork reconstruction and address tracking.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     if nr == libc::SYS_mmap as u32 {
         let addr = args.args[0];
@@ -1210,65 +1208,109 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
         let is_anon = flags & libc::MAP_ANONYMOUS != 0;
         let is_fixed = flags & libc::MAP_FIXED != 0;
 
-        if addr == 0 && is_anon && !is_fixed && fd == -1 && len > 0 {
-            let state = unsafe { crate::state::global_micro_state() };
-            let bump_end = state.mmap_bump_end;
+        if is_anon && len > 0 {
+            let aligned_len = (len + 0xFFF) & !0xFFF;
 
-            if bump_end != 0 {
-                // Page-align the requested length.
-                let aligned_len = (len + 0xFFF) & !0xFFF;
-                let next = state
-                    .mmap_bump_next
-                    .fetch_add(aligned_len, core::sync::atomic::Ordering::Relaxed);
+            if addr == 0 && !is_fixed && fd == -1 {
+                // No explicit address — use the bump allocator.
+                let state = unsafe { crate::state::global_micro_state() };
+                let bump_end = state.mmap_bump_end;
 
-                if next + aligned_len <= bump_end {
-                    // Execute the mmap locally with MAP_FIXED at the bump address.
-                    let result = unsafe {
-                        crate::raw_syscall::mmap(
-                            next,
-                            aligned_len,
-                            prot,
-                            (flags | libc::MAP_FIXED) & !libc::MAP_GROWSDOWN,
-                            -1,
+                if bump_end != 0 {
+                    let next = state
+                        .mmap_bump_next
+                        .fetch_add(aligned_len, core::sync::atomic::Ordering::Relaxed);
+
+                    if next + aligned_len <= bump_end {
+                        let result = unsafe {
+                            crate::raw_syscall::mmap(
+                                next,
+                                aligned_len,
+                                prot,
+                                (flags | libc::MAP_FIXED) & !libc::MAP_GROWSDOWN,
+                                -1,
+                                0,
+                            )
+                        };
+
+                        if crate::raw_syscall::is_error(result) {
+                            state
+                                .mmap_bump_next
+                                .fetch_sub(aligned_len, core::sync::atomic::Ordering::Relaxed);
+                            return result;
+                        }
+
+                        let notify_args = [
+                            next as u64,
+                            aligned_len as u64,
+                            #[allow(clippy::cast_sign_loss)]
+                            {
+                                prot as u64
+                            },
+                            u64::from(flags.cast_unsigned()),
                             0,
-                        )
-                    };
-
-                    if crate::raw_syscall::is_error(result) {
-                        // Roll back the bump pointer on failure.
-                        state
-                            .mmap_bump_next
-                            .fetch_sub(aligned_len, core::sync::atomic::Ordering::Relaxed);
+                            0,
+                        ];
+                        unsafe {
+                            notify_central(
+                                tls,
+                                litebox_ipc::messages::MSG_NOTIFY_MMAP,
+                                &notify_args,
+                            );
+                        }
                         return result;
                     }
+                    // Bump exhausted — roll back.
+                    state
+                        .mmap_bump_next
+                        .fetch_sub(aligned_len, core::sync::atomic::Ordering::Relaxed);
+                }
+                // bump_end == 0 or exhausted: fall through to central round-trip.
+                // We need central to choose an address via PageManager since we
+                // don't have the bump allocator available.
+            } else {
+                // MAP_FIXED or explicit address: execute locally.
+                // The kernel validates the address; central trusts it.
+                let result = unsafe {
+                    crate::raw_syscall::mmap(
+                        addr as usize,
+                        aligned_len,
+                        prot,
+                        flags,
+                        fd,
+                        args.args[5] as i64,
+                    )
+                };
 
-                    // Tier 2 notification: tell central about the new mapping.
-                    // Protocol: addr, len, prot, flags, 0, 0
-                    let notify_args = [
-                        next as u64,
-                        aligned_len as u64,
-                        #[allow(clippy::cast_sign_loss)]
-                        {
-                            prot as u64
-                        },
-                        u64::from(flags.cast_unsigned()),
-                        0,
-                        0,
-                    ];
-                    unsafe {
-                        notify_central(tls, litebox_ipc::messages::MSG_NOTIFY_MMAP, &notify_args);
-                    }
-
+                if crate::raw_syscall::is_error(result) {
                     return result;
                 }
-                // Bump allocator exhausted — roll back and fall through to central.
-                state
-                    .mmap_bump_next
-                    .fetch_sub(aligned_len, core::sync::atomic::Ordering::Relaxed);
+
+                // Notify central about the mapping.
+                let actual_addr = if is_fixed {
+                    addr
+                } else {
+                    result.cast_unsigned()
+                };
+                let notify_args = [
+                    actual_addr,
+                    aligned_len as u64,
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        prot as u64
+                    },
+                    u64::from(flags.cast_unsigned()),
+                    0,
+                    0,
+                ];
+                unsafe {
+                    notify_central(tls, litebox_ipc::messages::MSG_NOTIFY_MMAP, &notify_args);
+                }
+                return result;
             }
-            // bump_end == 0 means pre-execve or not initialized; fall through.
         }
-        // Non-anonymous, MAP_FIXED, or explicit addr: fall through to central.
+        // Non-anonymous mmap or len == 0: fall through to central.
+        // Also falls through for addr==0/!MAP_FIXED when bump is unavailable.
     }
 
     // Unregister file fd tracking on close.  File I/O still goes through
