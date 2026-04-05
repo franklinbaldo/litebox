@@ -8,16 +8,16 @@ use alloc::vec;
 use core::time::Duration;
 
 use litebox::fd::TypedFd;
-use litebox::net::{
-    CloseBehavior, Network, NetworkProxy, Protocol, ReceiveFlags, SendFlags, TcpOptionData,
-    TcpOptionName,
-};
 use litebox::net::errors::{
     AcceptError, BindError, CloseError, ConnectError, GetTcpOptionError, ListenError,
     LocalAddrError, ReceiveError, RemoteAddrError, SendError, SetTcpOptionError, SocketError,
 };
 use litebox::net::socket_channel::{
     DatagramSocketChannel, NetworkProxy as NetworkProxyEnum, SocketState, StreamSocketChannel,
+};
+use litebox::net::{
+    CloseBehavior, Network, NetworkProxy, Protocol, ReceiveFlags, SendFlags, TcpOptionData,
+    TcpOptionName,
 };
 use litebox_common_macos::errno::Errno;
 
@@ -279,8 +279,7 @@ pub(crate) fn read_sockaddr_from_user(addr_ptr: u64, addrlen: u32) -> Result<Soc
                 // macOS does not support abstract namespace.
                 return Err(Errno::EINVAL);
             }
-            let path = core::str::from_utf8(&path_bytes[..end])
-                .map_err(|_| Errno::EINVAL)?;
+            let path = core::str::from_utf8(&path_bytes[..end]).map_err(|_| Errno::EINVAL)?;
             Ok(SocketAddress::Unix(UnixSocketAddr::Path(
                 alloc::string::String::from(path),
             )))
@@ -319,10 +318,7 @@ pub(crate) fn write_sockaddr_inet_to_user(
         };
 
         let sa_bytes: &[u8] = unsafe {
-            core::slice::from_raw_parts(
-                (&sa as *const CSockInetAddr).cast::<u8>(),
-                sa_size,
-            )
+            core::slice::from_raw_parts((&sa as *const CSockInetAddr).cast::<u8>(), sa_size)
         };
 
         let buf_mut: MutPtr<u8> = MutPtr::from_usize(buf_ptr as usize);
@@ -493,5 +489,169 @@ pub(crate) fn get_tcp_option_error_to_errno(e: GetTcpOptionError) -> Errno {
         GetTcpOptionError::InvalidFd => Errno::EBADF,
         GetTcpOptionError::NotTcpSocket => Errno::ENOPROTOOPT,
         _ => Errno::EINVAL,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AF_INET socket syscall handlers
+// ---------------------------------------------------------------------------
+
+type SocketFd = litebox::net::SocketFd<Platform>;
+
+impl<FS: ShimFS> Task<FS> {
+    /// Handle `socket(domain, type, protocol)`.
+    pub(crate) fn sys_socket(
+        &self,
+        domain: u32,
+        sock_type: u32,
+        _protocol: u32,
+    ) -> Result<usize, Errno> {
+        let ty = SockType::try_from_raw(sock_type)?;
+        match domain {
+            AF_UNIX => self.do_socket_unix(ty),
+            AF_INET => self.do_socket_inet(ty),
+            _ => Err(Errno::EAFNOSUPPORT),
+        }
+    }
+
+    /// Create an AF_INET socket via the Network subsystem.
+    fn do_socket_inet(&self, sock_type: SockType) -> Result<usize, Errno> {
+        let protocol = match sock_type {
+            SockType::Stream => Protocol::Tcp,
+            SockType::Datagram => Protocol::Udp,
+        };
+
+        let socket_fd = self
+            .global
+            .net
+            .lock()
+            .socket(protocol)
+            .map_err(socket_error_to_errno)?;
+
+        // Initialize the NetworkProxy for this socket.
+        self.initialize_inet_socket(&socket_fd, sock_type);
+
+        // Store in raw descriptor table and return the integer fd.
+        let raw_fd = self
+            .global
+            .raw_descriptors
+            .write()
+            .fd_into_raw_integer(socket_fd);
+        Ok(raw_fd)
+    }
+
+    /// Set up NetworkProxy and metadata for a newly created inet socket.
+    fn initialize_inet_socket(&self, fd: &SocketFd, sock_type: SockType) {
+        let proxy = match sock_type {
+            SockType::Stream => Arc::new(NetworkProxyEnum::Stream(StreamSocketChannel::new())),
+            SockType::Datagram => {
+                Arc::new(NetworkProxyEnum::Datagram(DatagramSocketChannel::new()))
+            }
+        };
+
+        self.global.net.lock().set_socket_proxy(fd, proxy);
+    }
+
+    /// Placeholder for AF_UNIX socket creation (implemented in unix.rs later).
+    fn do_socket_unix(&self, _sock_type: SockType) -> Result<usize, Errno> {
+        Err(Errno::EAFNOSUPPORT)
+    }
+
+    /// Handle `bind(fd, addr, addrlen)`.
+    pub(crate) fn sys_bind(&self, fd: u32, addr: u64, addrlen: u32) -> Result<(), Errno> {
+        let sockaddr = read_sockaddr_from_user(addr, addrlen)?;
+        match sockaddr {
+            SocketAddress::Inet(endpoint) => {
+                let rds = self.global.raw_descriptors.read();
+                let typed_fd = rds
+                    .fd_from_raw_integer::<Network<Platform>>(fd as usize)
+                    .map_err(|_| Errno::ENOTSOCK)?;
+                self.global
+                    .net
+                    .lock()
+                    .bind(&typed_fd, &core::net::SocketAddr::V4(endpoint))
+                    .map_err(bind_error_to_errno)
+            }
+            SocketAddress::Unix(_unix_addr) => self.do_bind_unix(fd, _unix_addr),
+        }
+    }
+
+    /// Placeholder for AF_UNIX bind.
+    fn do_bind_unix(&self, _fd: u32, _addr: UnixSocketAddr) -> Result<(), Errno> {
+        Err(Errno::EAFNOSUPPORT)
+    }
+
+    /// Handle `listen(fd, backlog)`.
+    pub(crate) fn sys_listen(&self, fd: u32, backlog: u32) -> Result<(), Errno> {
+        // Try inet first.
+        {
+            let rds = self.global.raw_descriptors.read();
+            if let Ok(typed_fd) = rds.fd_from_raw_integer::<Network<Platform>>(fd as usize) {
+                return self
+                    .global
+                    .net
+                    .lock()
+                    .listen(&typed_fd, backlog.min(u16::MAX as u32) as u16)
+                    .map_err(listen_error_to_errno);
+            }
+        }
+        // Try unix.
+        self.do_listen_unix(fd, backlog)
+    }
+
+    /// Placeholder for AF_UNIX listen.
+    fn do_listen_unix(&self, _fd: u32, _backlog: u32) -> Result<(), Errno> {
+        Err(Errno::ENOTSOCK)
+    }
+
+    /// Handle `accept(fd, addr, addrlen)`.
+    pub(crate) fn sys_accept(&self, fd: u32, addr: u64, addrlen: u64) -> Result<usize, Errno> {
+        // Try inet first.
+        {
+            let rds = self.global.raw_descriptors.read();
+            if let Ok(typed_fd) = rds.fd_from_raw_integer::<Network<Platform>>(fd as usize) {
+                drop(rds); // Release read lock before locking net.
+
+                // Prepare a peer address output if the caller wants it.
+                let want_peer = addr != 0;
+                let mut peer_ep = core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
+                    core::net::Ipv4Addr::UNSPECIFIED,
+                    0,
+                ));
+                let peer_arg = if want_peer { Some(&mut peer_ep) } else { None };
+
+                // Accept (non-blocking for now).
+                let accepted_fd = match self.global.net.lock().accept(&typed_fd, peer_arg) {
+                    Ok(new_fd) => new_fd,
+                    Err(AcceptError::NoConnectionsReady) => {
+                        return Err(Errno::EAGAIN);
+                    }
+                    Err(e) => return Err(accept_error_to_errno(e)),
+                };
+
+                // Initialize the accepted socket's proxy.
+                self.initialize_inet_socket(&accepted_fd, SockType::Stream);
+
+                // Write peer address to user memory if requested.
+                if want_peer {
+                    write_sockaddr_inet_to_user(&peer_ep, addr, addrlen)?;
+                }
+
+                // Store in raw descriptor table.
+                let raw_fd = self
+                    .global
+                    .raw_descriptors
+                    .write()
+                    .fd_into_raw_integer(accepted_fd);
+                return Ok(raw_fd);
+            }
+        }
+        // Try unix.
+        self.do_accept_unix(fd, addr, addrlen)
+    }
+
+    /// Placeholder for AF_UNIX accept.
+    fn do_accept_unix(&self, _fd: u32, _addr: u64, _addrlen: u64) -> Result<usize, Errno> {
+        Err(Errno::ENOTSOCK)
     }
 }
