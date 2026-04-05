@@ -27,6 +27,7 @@ use litebox_ipc::ring::{
 };
 use litebox_ipc::sq::{sq_advance_head, sq_head_index, sq_try_consume};
 use litebox_ipc::wait::spin_u8_then_wait_u32;
+use litebox_platform_central::PhantomModeGuard;
 use litebox_shim_linux::ShimFS;
 
 use crate::shmem::{RingPool, SharedRegion};
@@ -729,10 +730,34 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 return cq;
             }
 
-            // For mmap (and mremap): still dispatch through shim. The shim's
-            // PageManager tracks allocations, and for file-backed mmap the
-            // shim reads file data from tar_ro and populates memory that
-            // central then copies into the shmem data region.
+            // Check if this is a file-backed mmap of a tar file in the
+            // aligned memfd — if so, enable phantom mode during shim dispatch
+            // to avoid creating phantom pages in central.
+            let is_mmap = nr == libc::SYS_mmap as u32;
+            let tar_aligned_offset = if is_mmap {
+                let flags = entry.args[3] as i32;
+                let fd = entry.args[4] as i32;
+                let file_offset = entry.args[5] as usize;
+                if flags & libc::MAP_ANONYMOUS == 0 {
+                    self.fd_path_map.borrow().get(&fd).and_then(|path| {
+                        self.aligned_file_map.get(path).map(|&(base, _size)| {
+                            base + file_offset
+                        })
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Enable phantom mode if we have a tar fast path — the shim's
+            // PageManager will track the VMA without allocating real pages.
+            let _phantom_guard = tar_aligned_offset.map(|_| {
+                let platform = litebox_platform_multiplex::platform();
+                PhantomModeGuard::new(platform)
+            });
+
             let mut regs = crate::dispatch::sq_entry_to_ptregs(entry);
             cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
             if cq.result < 0 {
@@ -741,34 +766,50 @@ impl<FS: ShimFS> ProcessServer<FS> {
             }
             cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
 
-            // For file-backed mmap: copy the populated data into the data region.
-            // Also detect rewritten ELF trampolines and include trampoline data
-            // so micro can map the trampoline page in the guest address space.
-            if nr == libc::SYS_mmap as u32 {
+            if is_mmap {
                 let flags = entry.args[3] as i32;
                 if flags & libc::MAP_ANONYMOUS == 0 {
-                    // File-backed mmap: shim populated memory at cq.result.
-                    let addr = cq.result as usize;
-                    let len = entry.args[1] as usize;
-                    let data_region = self.region.data_region_mut();
-                    let copy_len = len.min(data_region.len());
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            addr as *const u8,
-                            data_region.as_mut_ptr(),
-                            copy_len,
-                        );
-                    }
-                    cq.flags |= cq_flags::HAS_DATA;
-                    cq.data_offset = 0;
-                    cq.data_len = copy_len as u32;
+                    if let Some(offset) = tar_aligned_offset {
+                        // Tar fast path: micro mmaps from aligned memfd.
+                        cq.flags |= cq_flags::MMAP_FROM_ALIGNED;
+                        #[allow(clippy::cast_possible_truncation)]
+                        {
+                            cq.data_offset = offset as u32;
+                            cq.data_len = (offset >> 32) as u32;
+                        }
 
-                    // For the initial reservation mmap (no MAP_FIXED), check if
-                    // the file is a rewritten ELF with a trampoline section.
-                    #[allow(clippy::cast_possible_truncation)]
-                    if flags & libc::MAP_FIXED == 0 {
-                        let fd = entry.args[4] as i32;
-                        self.try_append_trampoline(entry.thread_slot, fd, copy_len, &mut cq);
+                        // For the initial reservation mmap (no MAP_FIXED), check
+                        // for a rewritten ELF trampoline.
+                        #[allow(clippy::cast_possible_truncation)]
+                        if flags & libc::MAP_FIXED == 0 {
+                            let fd = entry.args[4] as i32;
+                            self.try_append_trampoline(entry.thread_slot, fd, 0, &mut cq);
+                        }
+                    } else {
+                        // Not tar-backed: existing path with data copy from
+                        // phantom pages to shmem data region.
+                        let addr = cq.result as usize;
+                        let len = entry.args[1] as usize;
+                        let data_region = self.region.data_region_mut();
+                        let copy_len = len.min(data_region.len());
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                addr as *const u8,
+                                data_region.as_mut_ptr(),
+                                copy_len,
+                            );
+                        }
+                        cq.flags |= cq_flags::HAS_DATA;
+                        cq.data_offset = 0;
+                        cq.data_len = copy_len as u32;
+
+                        // For the initial reservation mmap (no MAP_FIXED), check
+                        // for a trampoline.
+                        #[allow(clippy::cast_possible_truncation)]
+                        if flags & libc::MAP_FIXED == 0 {
+                            let fd = entry.args[4] as i32;
+                            self.try_append_trampoline(entry.thread_slot, fd, copy_len, &mut cq);
+                        }
                     }
                 }
             }
