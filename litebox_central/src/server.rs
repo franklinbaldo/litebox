@@ -130,6 +130,12 @@ pub struct ProcessServer<FS: ShimFS> {
     /// within the tar shmem region.  Used to populate `OpenResponse::tar_offset`
     /// / `tar_len` for read-only opens of tar-backed files.
     tar_file_map: Arc<HashMap<String, std::ops::Range<usize>>>,
+    /// Map of tar file paths (without leading `/`) to their `(offset, size)`
+    /// within the page-aligned memfd region.  Used by the exec handler to
+    /// provide aligned offsets for direct mmap by micro.
+    aligned_file_map: Arc<HashMap<String, (usize, usize)>>,
+    /// Size in bytes of the aligned memfd region.
+    aligned_size: usize,
 }
 
 impl<FS: ShimFS> ProcessServer<FS> {
@@ -148,6 +154,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
         tar_shmem_base: *const u8,
         tar_shmem_size: usize,
         tar_file_map: Arc<HashMap<String, std::ops::Range<usize>>>,
+        aligned_file_map: Arc<HashMap<String, (usize, usize)>>,
+        aligned_size: usize,
     ) -> Self {
         // If this process has no TUN queue but TUN is enabled, it's the master.
         // Queue 0 (created by CentralPlatform::new) should be given to the
@@ -178,6 +186,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
             tar_shmem_base: SendPtr(tar_shmem_base),
             tar_shmem_size,
             tar_file_map,
+            aligned_file_map,
+            aligned_size,
         }
     }
 
@@ -1002,6 +1012,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
             let tar_shmem_base = self.tar_shmem_base.0;
             let tar_shmem_size = self.tar_shmem_size;
             let tar_file_map = Arc::clone(&self.tar_file_map);
+            let aligned_file_map = Arc::clone(&self.aligned_file_map);
+            let aligned_size = self.aligned_size;
             let child_server = ProcessServer::new(
                 child_region,
                 child_task,
@@ -1014,6 +1026,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 tar_shmem_base,
                 tar_shmem_size,
                 tar_file_map,
+                aligned_file_map,
+                aligned_size,
             );
             child_server.next_child_pid.set(self.next_child_pid.get());
 
@@ -2671,6 +2685,15 @@ impl<FS: ShimFS> ProcessServer<FS> {
         let mut segments: Vec<SegmentInfo> = Vec::new();
 
         // Main ELF segments.
+        // Convert path_bytes to a str for aligned offset lookups.
+        let main_path_str = {
+            let pb = if path_bytes.last() == Some(&0) {
+                &path_bytes[..path_bytes.len() - 1]
+            } else {
+                path_bytes
+            };
+            core::str::from_utf8(pb).unwrap_or("")
+        };
         for seg in &main_mapper.segments {
             segments.push(SegmentInfo {
                 vaddr: seg.address as u64,
@@ -2685,23 +2708,25 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 } else {
                     0
                 },
-                tar_data_offset: compute_tar_offset(
-                    &file_data,
+                tar_data_offset: compute_aligned_offset(
+                    &self.aligned_file_map,
+                    main_path_str,
                     seg.file_offset,
-                    self.tar_shmem_base.0,
-                    self.tar_shmem_size,
+                    self.aligned_size,
                 ),
             });
         }
 
         // Interp segments.
         if let Some((ref _iinfo, ref imapper, _)) = interp_info {
+            // Convert interpreter path to a str for aligned offset lookups.
+            let interp_path_str = interp_name
+                .as_ref()
+                .map_or("", |name| {
+                    let bytes = name.to_bytes();
+                    core::str::from_utf8(bytes).unwrap_or("")
+                });
             for seg in &imapper.segments {
-                let interp_source = if let Some((ref idata, _)) = interp_data {
-                    idata.as_slice()
-                } else {
-                    &[]
-                };
                 segments.push(SegmentInfo {
                     vaddr: seg.address as u64,
                     map_len: seg.len as u64,
@@ -2715,11 +2740,11 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     } else {
                         0
                     },
-                    tar_data_offset: compute_tar_offset(
-                        interp_source,
+                    tar_data_offset: compute_aligned_offset(
+                        &self.aligned_file_map,
+                        interp_path_str,
                         seg.file_offset,
-                        self.tar_shmem_base.0,
-                        self.tar_shmem_size,
+                        self.aligned_size,
                     ),
                 });
             }
@@ -3687,25 +3712,31 @@ fn deserialize_string_vector(data: &[u8], mut pos: usize) -> Option<(Vec<&[u8]>,
     Some((result, pos))
 }
 
-/// Compute the offset of segment file data within the tar shmem region.
+/// Compute the offset of segment file data within the aligned memfd region.
 ///
-/// Returns `u64::MAX` if the data is not in the tar shmem region (i.e. the
-/// binary was not loaded from the tar archive and its data must be copied
-/// into the ring data region).
-fn compute_tar_offset(
-    source_data: &[u8],
+/// Looks up `file_path` in the aligned offset map. If found, returns the
+/// aligned start offset plus `file_data_offset` (the ELF segment's `p_offset`
+/// within the file). If not found or the aligned memfd is not configured,
+/// returns `u64::MAX` to signal that the data must be copied via the ring.
+#[allow(clippy::cast_possible_truncation)]
+fn compute_aligned_offset(
+    aligned_file_map: &HashMap<String, (usize, usize)>,
+    file_path: &str,
     file_data_offset: u64,
-    tar_shmem_base: *const u8,
-    tar_shmem_size: usize,
+    aligned_size: usize,
 ) -> u64 {
-    if tar_shmem_size == 0 || source_data.is_empty() {
+    if aligned_size == 0 {
         return u64::MAX;
     }
-    let src_ptr = source_data.as_ptr() as usize;
-    let base = tar_shmem_base as usize;
-    if src_ptr >= base && src_ptr < base + tar_shmem_size {
-        let file_start_in_tar = src_ptr - base;
-        (file_start_in_tar as u64) + file_data_offset
+    // Normalize: strip leading '/' to match tar-style paths.
+    let normalized = file_path.strip_prefix('/').unwrap_or(file_path);
+    if let Some(&(aligned_start, _file_size)) = aligned_file_map.get(normalized) {
+        let result = (aligned_start as u64) + file_data_offset;
+        if (result as usize) < aligned_size {
+            result
+        } else {
+            u64::MAX
+        }
     } else {
         u64::MAX
     }

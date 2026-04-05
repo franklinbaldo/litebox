@@ -91,6 +91,15 @@ struct Args {
     #[arg(long, default_value = "0")]
     tar_size: usize,
 
+    /// Aligned memfd file descriptor (inherited from launcher).
+    /// Contains page-aligned copies of tar file data for direct mmap by micro.
+    #[arg(long)]
+    aligned_fd: Option<i32>,
+
+    /// Size in bytes of the aligned memfd region.
+    #[arg(long, default_value = "0")]
+    aligned_size: usize,
+
     /// Name of the TUN device to open for raw IP networking (e.g. "tun0").
     /// If not provided, IP networking is disabled.
     #[arg(long)]
@@ -194,6 +203,27 @@ fn main() -> anyhow::Result<()> {
         .collect();
     let tar_file_map = std::sync::Arc::new(tar_file_map);
 
+    // Build the aligned offset map from the ordered tar entries.
+    // The launcher writes file data into the aligned memfd in tar-entry order,
+    // each file starting at a page-aligned offset. We reconstruct the same
+    // layout here so central can tell micro where each file lives in the
+    // aligned memfd for direct mmap.
+    let aligned_file_map: std::collections::HashMap<String, (usize, usize)> = {
+        let mut map = std::collections::HashMap::new();
+        if args.aligned_size > 0 {
+            let page_size: usize = 4096;
+            let mut offset: usize = 0;
+            for (path, range) in tar_ro.all_file_data_ranges_ordered() {
+                offset = (offset + page_size - 1) & !(page_size - 1);
+                let file_size = range.end - range.start;
+                map.insert(path.to_string(), (offset, file_size));
+                offset += file_size;
+            }
+        }
+        map
+    };
+    let aligned_file_map = std::sync::Arc::new(aligned_file_map);
+
     let inner = litebox::fs::layered::FileSystem::new(
         lb,
         devices,
@@ -260,6 +290,8 @@ fn main() -> anyhow::Result<()> {
         tar_shmem_base,
         tar_shmem_size,
         tar_file_map,
+        aligned_file_map,
+        args.aligned_size,
     );
     let result = server.run();
 
