@@ -2456,7 +2456,6 @@ impl<FS: ShimFS> ProcessServer<FS> {
         argv_strs: &[&[u8]],
         envp_strs: &[&[u8]],
     ) -> CqEntry {
-        let exec_start = std::time::Instant::now();
         let mut cq = Self::base_cq(entry);
         let thread_slot = entry.thread_slot;
 
@@ -2471,7 +2470,6 @@ impl<FS: ShimFS> ProcessServer<FS> {
             path_cstr[path_bytes.len()] = 0;
         }
 
-        let t_open = std::time::Instant::now();
         let fd = {
             let mut regs = litebox_common_linux::PtRegs::default();
             regs.orig_rax = libc::SYS_openat as usize;
@@ -2501,10 +2499,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
             }
             i64::from_le_bytes(stat_buf[48..56].try_into().unwrap()) as usize
         };
-        let open_stat_us = t_open.elapsed().as_micros();
 
         // Read the entire file.
-        let t_read = std::time::Instant::now();
         let mut file_data = vec![0u8; file_size];
         {
             let mut offset = 0usize;
@@ -2530,7 +2526,6 @@ impl<FS: ShimFS> ProcessServer<FS> {
             }
         }
         self.close_fd(thread_slot, fd);
-        let file_read_us = t_read.elapsed().as_micros();
         // If the file starts with `#!`, parse the interpreter path and optional
         // argument, rebuild argv per Linux convention, and re-dispatch with the
         // interpreter binary as the target. Limited to one level of indirection
@@ -2553,7 +2548,6 @@ impl<FS: ShimFS> ProcessServer<FS> {
         }
 
         // Parse the ELF.
-        let t_parse = std::time::Instant::now();
         let mut reader = MemReader(&file_data);
         let Ok(mut parsed) = litebox_common_linux::loader::ElfParsedFile::parse(&mut reader) else {
             cq.result = -i64::from(libc::ENOEXEC);
@@ -2647,7 +2641,6 @@ impl<FS: ShimFS> ProcessServer<FS> {
             } else {
                 None
             };
-        let elf_parse_interp_us = t_parse.elapsed().as_micros();
         let mut main_mapper = SimpleMapper::new();
         let mut main_mem = SimpleMem::new();
         let Ok(main_info) = parsed.load(&mut main_mapper, &mut main_mem) else {
@@ -2672,7 +2665,6 @@ impl<FS: ShimFS> ProcessServer<FS> {
         };
 
         // Now pack everything into the data region for micro.
-        let t_pack = std::time::Instant::now();
         let data_region = self.region.data_region_mut();
         let data_region_size = data_region.len();
 
@@ -3067,20 +3059,6 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     false,
                 );
             }
-        }
-
-        let pack_us = t_pack.elapsed().as_micros();
-        let total_exec_us = exec_start.elapsed().as_micros();
-        // Write perf data to a dedicated file to avoid stderr buffering issues.
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/litebox_perf.log")
-        {
-            let _ = writeln!(
-                f,
-                "EXEC size={file_size} total={total_exec_us}us open_stat={open_stat_us}us file_read={file_read_us}us elf_parse_interp={elf_parse_interp_us}us pack={pack_us}us"
-            );
         }
 
         cq.result = 0;
