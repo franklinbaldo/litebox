@@ -97,6 +97,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
         self.tar_index.all_file_data_ranges()
     }
 
+    /// Returns file data ranges in tar entry order (deterministic).
+    ///
+    /// Both launcher and central MUST iterate in this order for the
+    /// aligned data memfd offset map to be consistent.
+    ///
+    /// Paths are returned without a leading `/` (matching the tar's internal
+    /// representation).
+    pub fn all_file_data_ranges_ordered(&self) -> impl Iterator<Item = (&str, Range<usize>)> + '_ {
+        self.tar_index.all_file_data_ranges_ordered()
+    }
+
     /// Gives the absolute path for `path`, resolving any `.` or `..`s, and making sure to account
     /// for any relative paths from current working directory.
     ///
@@ -115,6 +126,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
 }
 
 struct IndexedFile {
+    path: String,
     data_range: Range<usize>,
     mode: Mode,
     owner: UserInfo,
@@ -153,7 +165,10 @@ impl TarIndex {
             let start = (data.as_ptr() as usize).checked_sub(base_ptr).unwrap();
             let end = start.checked_add(data.len()).unwrap();
 
+            let path_owned: String = path.into();
+
             let indexed_file = IndexedFile {
+                path: path_owned.clone(),
                 data_range: start..end,
                 mode: mode_of_modeflags(entry.posix_header().mode.to_flags().unwrap()),
                 owner: owner_from_posix_header(entry.posix_header()),
@@ -163,7 +178,7 @@ impl TarIndex {
 
             let file_idx = files.len();
             files.push(indexed_file);
-            let old = files_by_path.insert(path.into(), file_idx);
+            let old = files_by_path.insert(path_owned, file_idx);
             assert!(
                 old.is_none(),
                 "tar files with rewritten file contents are unsupported"
@@ -248,6 +263,16 @@ impl TarIndex {
         self.files_by_path
             .iter()
             .map(move |(path, &idx)| (path.as_str(), self.files[idx].data_range.clone()))
+    }
+
+    /// Returns file data ranges in tar entry order (deterministic).
+    ///
+    /// Both launcher and central MUST iterate in this order for the
+    /// aligned data memfd offset map to be consistent.
+    fn all_file_data_ranges_ordered(&self) -> impl Iterator<Item = (&str, Range<usize>)> + '_ {
+        self.files
+            .iter()
+            .map(|f| (f.path.as_str(), f.data_range.clone()))
     }
 }
 
