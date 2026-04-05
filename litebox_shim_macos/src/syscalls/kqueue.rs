@@ -20,10 +20,10 @@ use alloc::{
 };
 use litebox::{
     event::{
+        Events, IOPollable,
         observer::Observer,
         polling::{Pollee, TryOpError},
         wait::{WaitContext, WaitError},
-        Events, IOPollable,
     },
     platform::{RawConstPointer as _, RawMutPointer as _},
 };
@@ -66,6 +66,7 @@ const KEVENT_SIZE: usize = 32;
 // RawKevent — output struct written back to guest memory
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::similar_names)]
 struct RawKevent {
     ident: usize,
     filter: i16,
@@ -91,7 +92,9 @@ struct KqueueKey {
 
 struct KqueueEntry {
     key: KqueueKey,
+    #[allow(clippy::similar_names)]
     flags: u16,
+    #[allow(clippy::similar_names)]
     fflags: u32,
     udata: usize,
     ready: Arc<ReadySet>,
@@ -101,6 +104,7 @@ struct KqueueEntry {
 }
 
 impl KqueueEntry {
+    #[allow(clippy::similar_names)]
     fn new(
         key: KqueueKey,
         flags: u16,
@@ -278,6 +282,7 @@ impl<FS: ShimFS> KqueueFile<FS> {
         }
     }
 
+    #[allow(clippy::similar_names)]
     fn add_interest(
         &self,
         task: &Task<FS>,
@@ -370,10 +375,10 @@ impl<FS: ShimFS> IOPollable for KqueueFile<FS> {
     }
 
     fn check_io_events(&self) -> Events {
-        if !self.ready.entries.lock().is_empty() {
-            Events::IN
-        } else {
+        if self.ready.entries.lock().is_empty() {
             Events::empty()
+        } else {
+            Events::IN
         }
     }
 }
@@ -505,6 +510,7 @@ fn check_fd_events<FS: ShimFS>(task: &Task<FS>, fd: usize, filter: i16) -> Event
 // ---------------------------------------------------------------------------
 
 /// Create a new kqueue and return its virtual fd number.
+#[allow(clippy::unnecessary_wraps)] // dispatch arms expect Result<usize, Errno>
 pub(crate) fn sys_kqueue<FS: ShimFS>(task: &Task<FS>) -> Result<usize, Errno> {
     let kq = Arc::new(KqueueFile::new());
     let fd = task
@@ -516,6 +522,11 @@ pub(crate) fn sys_kqueue<FS: ShimFS>(task: &Task<FS>) -> Result<usize, Errno> {
 }
 
 /// Process changelist entries and/or wait for events on a kqueue.
+#[allow(
+    clippy::similar_names,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
 pub(crate) fn sys_kevent<FS: ShimFS>(
     task: &Task<FS>,
     kq_fd: i32,
@@ -613,7 +624,10 @@ pub(crate) fn sys_kevent<FS: ShimFS>(
         } else if tv_sec < 0 || tv_nsec < 0 {
             return Err(Errno::EINVAL);
         } else {
-            Some(Duration::from_secs(tv_sec as u64) + Duration::from_nanos(tv_nsec as u64))
+            Some(
+                Duration::from_secs(tv_sec.cast_unsigned())
+                    + Duration::from_nanos(tv_nsec.cast_unsigned()),
+            )
         }
     };
 
@@ -680,6 +694,7 @@ fn read_guest_u32(addr: usize) -> Result<u32, Errno> {
     ptr.read_at_offset(0).ok_or(Errno::EFAULT)
 }
 
+#[allow(clippy::similar_names)]
 fn write_kevent_to_guest(addr: usize, ev: &RawKevent) -> Result<(), Errno> {
     let ident_ptr: MutPtr<u64> = MutPtr::from_usize(addr);
     let filter_ptr: MutPtr<i16> = MutPtr::from_usize(addr + 8);

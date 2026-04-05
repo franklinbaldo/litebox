@@ -278,11 +278,7 @@ impl<FS: ShimFS> Task<FS> {
                 errorfds,
                 timeout,
             } => self.sys_select(nfds, readfds, writefds, errorfds, timeout),
-            MacosSyscallRequest::Poll {
-                fds,
-                nfds,
-                timeout,
-            } => self.sys_poll(fds, nfds, timeout),
+            MacosSyscallRequest::Poll { fds, nfds, timeout } => self.sys_poll(fds, nfds, timeout),
             MacosSyscallRequest::Kqueue => kqueue::sys_kqueue(self),
             MacosSyscallRequest::Kevent {
                 kq,

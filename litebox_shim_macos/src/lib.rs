@@ -825,10 +825,8 @@ struct GlobalState<FS: ShimFS> {
     /// Counter for allocating virtual fd numbers for Unix sockets.
     unix_fd_counter: AtomicUsize,
     /// Maps virtual fd numbers to kqueue objects.
-    pub(crate) kqueues: litebox::sync::RwLock<
-        Platform,
-        BTreeMap<usize, Arc<syscalls::kqueue::KqueueFile<FS>>>,
-    >,
+    pub(crate) kqueues:
+        litebox::sync::RwLock<Platform, BTreeMap<usize, Arc<syscalls::kqueue::KqueueFile<FS>>>>,
     /// Counter for allocating virtual fd numbers for kqueues (starts at 0x2_0000).
     pub(crate) kqueue_fd_counter: AtomicUsize,
     /// Maps raw fd numbers to their NetworkProxy, for polling support.

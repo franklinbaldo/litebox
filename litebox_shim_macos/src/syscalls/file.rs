@@ -101,6 +101,10 @@ impl<FS: ShimFS> Task<FS> {
                     .ok_or(Errno::EFAULT)?;
                 return Ok(size);
             }
+            // Kqueue FDs are not readable.
+            if self.global.kqueues.read().contains_key(&raw_fd) {
+                return Err(Errno::EBADF);
+            }
             return Err(Errno::EBADF);
         }
         let strong_fd = strong_fd.unwrap();
@@ -169,6 +173,10 @@ impl<FS: ShimFS> Task<FS> {
                 let data = user_buf.to_owned_slice(write_len).ok_or(Errno::EFAULT)?;
                 let size = socket.write(&data)?;
                 return Ok(size);
+            }
+            // Kqueue FDs are not writable.
+            if self.global.kqueues.read().contains_key(&raw_fd) {
+                return Err(Errno::EBADF);
             }
             return Err(Errno::EBADF);
         }
@@ -259,6 +267,14 @@ impl<FS: ShimFS> Task<FS> {
                     self.global.unix_addr_table.write().remove(path);
                 }
                 socket.close();
+                return Ok(());
+            }
+        }
+
+        // Try kqueue.
+        {
+            let removed = self.global.kqueues.write().remove(&raw_fd);
+            if removed.is_some() {
                 return Ok(());
             }
         }

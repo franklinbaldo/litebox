@@ -16,6 +16,7 @@ use litebox_common_macos::errno::Errno;
 use crate::{ConstPtr, MutPtr, Platform, ShimFS, Task};
 
 use super::file::fd_to_usize;
+use super::kqueue::KqueueFile;
 
 // macOS poll event flags.
 const POLLIN: i16 = 0x0001;
@@ -32,11 +33,13 @@ const FD_SETSIZE: u32 = 1024;
 const FD_SET_INTS: usize = 32;
 
 /// A reference to a pollable resource resolved from a guest file descriptor.
-enum PollableRef {
+enum PollableRef<FS: ShimFS> {
     /// A pipe file descriptor — holds the typed fd for `with_iopollable`.
     Pipe(Arc<TypedFd<Pipes<Platform>>>),
     /// A network socket — the proxy implements `IOPollable`.
     Network(Arc<litebox::net::socket_channel::NetworkProxy<Platform>>),
+    /// A kqueue file descriptor — implements `IOPollable`.
+    Kqueue(Arc<KqueueFile<FS>>),
     /// A Unix domain socket — always reports ready (no IOPollable impl yet).
     Unix,
     /// A regular file / stdio — always ready for I/O.
@@ -46,7 +49,7 @@ enum PollableRef {
 /// Resolve a guest file descriptor to a `PollableRef`.
 ///
 /// Returns `None` if the fd is invalid (not found in any subsystem).
-fn resolve_pollable<FS: ShimFS>(task: &Task<FS>, fd: i32) -> Option<PollableRef> {
+fn resolve_pollable<FS: ShimFS>(task: &Task<FS>, fd: i32) -> Option<PollableRef<FS>> {
     let raw_fd = fd_to_usize(fd).ok()?;
 
     // Try the raw descriptor table first.
@@ -83,9 +86,8 @@ fn resolve_pollable<FS: ShimFS>(task: &Task<FS>, fd: i32) -> Option<PollableRef>
     // Check kqueues.
     {
         let kqueues = task.global.kqueues.read();
-        if kqueues.contains_key(&raw_fd) {
-            // Kqueue fds are always ready for now (Task 4 will refine this).
-            return Some(PollableRef::AlwaysReady);
+        if let Some(kq) = kqueues.get(&raw_fd) {
+            return Some(PollableRef::Kqueue(kq.clone()));
         }
     }
 
@@ -150,19 +152,17 @@ impl PollSet {
 
             entry.revents = match resolve_pollable(task, entry.fd) {
                 None => Events::NVAL,
-                Some(PollableRef::AlwaysReady) | Some(PollableRef::Unix) => {
+                Some(PollableRef::AlwaysReady | PollableRef::Unix) => {
                     (Events::IN | Events::OUT) & entry.mask
                 }
                 Some(PollableRef::Pipe(typed_fd)) => {
                     let result = task.global.pipes.with_iopollable(&typed_fd, |pollable| {
                         let events = pollable.check_io_events() & entry.mask;
-                        if !is_ready {
-                            if let Some(waker) = waker {
-                                let observer = Arc::new(PollEntryObserver(waker.clone()));
-                                let weak = Arc::downgrade(&observer) as _;
-                                pollable.register_observer(weak, entry.mask);
-                                entry.observer = Some(observer);
-                            }
+                        if !is_ready && let Some(waker) = waker {
+                            let observer = Arc::new(PollEntryObserver(waker.clone()));
+                            let weak = Arc::downgrade(&observer) as _;
+                            pollable.register_observer(weak, entry.mask);
+                            entry.observer = Some(observer);
                         }
                         events
                     });
@@ -173,13 +173,21 @@ impl PollSet {
                 }
                 Some(PollableRef::Network(proxy)) => {
                     let events = proxy.check_io_events() & entry.mask;
-                    if !is_ready {
-                        if let Some(waker) = waker {
-                            let observer = Arc::new(PollEntryObserver(waker.clone()));
-                            let weak = Arc::downgrade(&observer) as _;
-                            proxy.register_observer(weak, entry.mask);
-                            entry.observer = Some(observer);
-                        }
+                    if !is_ready && let Some(waker) = waker {
+                        let observer = Arc::new(PollEntryObserver(waker.clone()));
+                        let weak = Arc::downgrade(&observer) as _;
+                        proxy.register_observer(weak, entry.mask);
+                        entry.observer = Some(observer);
+                    }
+                    events
+                }
+                Some(PollableRef::Kqueue(kq)) => {
+                    let events = kq.check_io_events() & entry.mask;
+                    if !is_ready && let Some(waker) = waker {
+                        let observer = Arc::new(PollEntryObserver(waker.clone()));
+                        let weak = Arc::downgrade(&observer) as _;
+                        kq.register_observer(weak, entry.mask);
+                        entry.observer = Some(observer);
                     }
                     events
                 }
@@ -294,8 +302,8 @@ fn read_fd_set(addr: usize, nfds: u32) -> Result<[u32; FD_SET_INTS], Errno> {
     let mut set = [0u32; FD_SET_INTS];
     let words_needed = (nfds as usize).div_ceil(32);
     let ptr: ConstPtr<u32> = ConstPtr::from_usize(addr);
-    for i in 0..words_needed {
-        set[i] = ptr.read_at_offset(i as isize).ok_or(Errno::EFAULT)?;
+    for (i, slot) in set.iter_mut().enumerate().take(words_needed) {
+        *slot = ptr.read_at_offset(i.cast_signed()).ok_or(Errno::EFAULT)?;
     }
     Ok(set)
 }
@@ -307,8 +315,8 @@ fn write_fd_set(addr: usize, set: &[u32; FD_SET_INTS], nfds: u32) -> Result<(), 
     }
     let words_needed = (nfds as usize).div_ceil(32);
     let ptr: MutPtr<u32> = MutPtr::from_usize(addr);
-    for i in 0..words_needed {
-        ptr.write_at_offset(i as isize, set[i])
+    for (i, &word) in set.iter().enumerate().take(words_needed) {
+        ptr.write_at_offset(i.cast_signed(), word)
             .ok_or(Errno::EFAULT)?;
     }
     Ok(())
@@ -368,7 +376,7 @@ impl<FS: ShimFS> Task<FS> {
         let timeout = match timeout_ms {
             -1 => None, // block indefinitely
             0 => Some(Duration::ZERO),
-            ms => Some(Duration::from_millis(ms as u64)),
+            ms => Some(Duration::from_millis(ms.cast_unsigned().into())),
         };
 
         // Wait for events.
@@ -404,6 +412,7 @@ impl<FS: ShimFS> Task<FS> {
     /// - `nfds`: highest fd + 1.
     /// - `readfds_addr`, `writefds_addr`, `errorfds_addr`: pointers to fd_set bitmaps (0 = NULL).
     /// - `timeout_addr`: pointer to timeval struct (0 = NULL = block indefinitely).
+    #[allow(clippy::similar_names)]
     pub(crate) fn sys_select(
         &self,
         nfds: u32,
@@ -427,7 +436,10 @@ impl<FS: ShimFS> Task<FS> {
             if tv_sec < 0 || tv_usec < 0 {
                 return Err(Errno::EINVAL);
             }
-            Some(Duration::from_secs(tv_sec as u64) + Duration::from_micros(tv_usec as u64))
+            Some(
+                Duration::from_secs(tv_sec.cast_unsigned())
+                    + Duration::from_micros(tv_usec.cast_unsigned()),
+            )
         };
 
         // Read fd_set bitmaps.
@@ -449,7 +461,7 @@ impl<FS: ShimFS> Task<FS> {
                 events |= Events::PRI;
             }
             if !events.is_empty() {
-                set.add_fd(fd as i32, events);
+                set.add_fd(fd.cast_signed(), events);
             }
         }
 
@@ -474,7 +486,7 @@ impl<FS: ShimFS> Task<FS> {
             if revents.contains(Events::NVAL) {
                 return Err(Errno::EBADF);
             }
-            let fdu = fd as u32;
+            let fdu = fd.cast_unsigned();
             if revents.intersects(Events::IN | Events::ALWAYS_POLLED) && is_fd_set(&readfds, fdu) {
                 set_fd_bit(&mut result_readfds, fdu);
                 ready_count += 1;
