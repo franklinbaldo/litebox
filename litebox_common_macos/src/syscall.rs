@@ -107,6 +107,10 @@ pub mod mach_trap {
     pub const TASK_SELF_TRAP: usize = 28;
     pub const HOST_SELF_TRAP: usize = 29;
     pub const MACH_MSG_TRAP: usize = 31;
+    pub const SEMAPHORE_SIGNAL_TRAP: usize = 36;
+    pub const SEMAPHORE_SIGNAL_ALL_TRAP: usize = 37;
+    pub const SEMAPHORE_WAIT_TRAP: usize = 39;
+    pub const SEMAPHORE_TIMEDWAIT_TRAP: usize = 40;
     pub const THREAD_GET_SPECIAL_REPLY_PORT: usize = 50;
 }
 

@@ -276,6 +276,30 @@ impl<FS: ShimFS> Task<FS> {
                 // Return MACH_SEND_INVALID_DEST (0x10000003)
                 Ok(0x1000_0003)
             }
+            mach_trap::SEMAPHORE_SIGNAL_TRAP => {
+                #[allow(clippy::cast_possible_truncation)]
+                let port = ctx.regs[0] as u32;
+                Ok(self.global.semaphore_manager.signal(port))
+            }
+            mach_trap::SEMAPHORE_SIGNAL_ALL_TRAP => {
+                #[allow(clippy::cast_possible_truncation)]
+                let port = ctx.regs[0] as u32;
+                Ok(self.global.semaphore_manager.signal_all(port))
+            }
+            mach_trap::SEMAPHORE_WAIT_TRAP => {
+                #[allow(clippy::cast_possible_truncation)]
+                let port = ctx.regs[0] as u32;
+                Ok(self.sys_semaphore_wait(port))
+            }
+            mach_trap::SEMAPHORE_TIMEDWAIT_TRAP => {
+                #[allow(clippy::cast_possible_truncation)]
+                let port = ctx.regs[0] as u32;
+                #[allow(clippy::cast_possible_truncation)]
+                let sec = ctx.regs[1] as u32;
+                #[allow(clippy::cast_possible_truncation)]
+                let nsec = ctx.regs[2] as u32;
+                Ok(self.sys_semaphore_timedwait(port, sec, nsec))
+            }
             mach_trap::THREAD_GET_SPECIAL_REPLY_PORT => Ok(0x0903),
             _ => {
                 log_unsupported!("Mach trap {number}");

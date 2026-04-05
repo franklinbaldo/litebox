@@ -160,6 +160,7 @@ impl<FS: ShimFS> litebox::shim::InitThread for NewThreadArgs<FS> {
 }
 
 pub mod loader;
+mod semaphore;
 pub mod syscalls;
 mod wait;
 
@@ -257,6 +258,7 @@ impl<FS: ShimFS> MacosShimBuilder<FS> {
                 .fs
                 .expect("File system must be set before calling build"),
             futex_manager: FutexManager::new(),
+            semaphore_manager: semaphore::MachSemaphoreManager::new(),
             pipes: Pipes::new(&self.litebox),
             net: litebox::sync::Mutex::new(net),
             boot_time: self.platform.now(),
@@ -801,6 +803,8 @@ struct GlobalState<FS: ShimFS> {
     /// The futex manager for handling futex operations.
     #[expect(dead_code, reason = "will be used when futex syscalls are added")]
     futex_manager: FutexManager<Platform>,
+    /// The Mach semaphore manager for semaphore trap emulation.
+    semaphore_manager: semaphore::MachSemaphoreManager,
     /// The anonymous pipe implementation.
     pipes: Pipes<Platform>,
     /// The network subsystem (AF_INET sockets via smoltcp).
