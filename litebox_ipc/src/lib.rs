@@ -9,6 +9,7 @@
 extern crate alloc;
 
 pub mod cq;
+pub mod inmem_shmem;
 pub mod messages;
 pub mod pipe;
 pub mod ring;

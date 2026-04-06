@@ -179,6 +179,7 @@ const _: () = assert!(core::mem::size_of::<AcceptResponse>() == 32);
 /// files, the offset/length within the tar shmem region.
 #[derive(Clone, Copy)]
 #[repr(C)]
+#[allow(clippy::pub_underscore_fields)]
 pub struct OpenResponse {
     /// The fd number returned by open/openat.
     pub fd: i32,
@@ -195,6 +196,12 @@ pub struct OpenResponse {
     /// data starts. Non-zero means micro can mmap directly from the aligned
     /// memfd instead of going through central.
     pub aligned_offset: u64,
+    /// Index into the in-memory shmem file-slot array, or
+    /// [`inmem_shmem::INMEM_NO_SLOT`](crate::inmem_shmem::INMEM_NO_SLOT)
+    /// when no in-memory slot is assigned.
+    pub inmem_slot_index: u32,
+    /// Padding to keep the struct size a multiple of 8.
+    pub _pad_inmem: u32,
 }
 
-const _: () = assert!(core::mem::size_of::<OpenResponse>() == 32);
+const _: () = assert!(core::mem::size_of::<OpenResponse>() == 40);

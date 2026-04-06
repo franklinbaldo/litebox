@@ -620,6 +620,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
                                 tar_offset: 0,
                                 tar_len: 0,
                                 aligned_offset: 0,
+                                inmem_slot_index: litebox_ipc::inmem_shmem::INMEM_NO_SLOT,
+                                _pad_inmem: 0,
                             };
                             let data_region = self.region.data_region_mut();
                             let resp_bytes: &[u8] = unsafe {
@@ -966,6 +968,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     tar_offset: tar_off,
                     tar_len: tar_ln,
                     aligned_offset: aligned_off,
+                    inmem_slot_index: litebox_ipc::inmem_shmem::INMEM_NO_SLOT,
+                    _pad_inmem: 0,
                 };
                 let data_region = self.region.data_region_mut();
                 let resp_bytes: &[u8] = unsafe {
