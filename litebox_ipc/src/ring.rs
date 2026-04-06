@@ -131,6 +131,10 @@ pub mod cq_flags {
     /// Central does not need a result report for this EXEC_LOCAL entry.
     /// Micro should skip `report_local_result()` after local execution.
     pub const NO_REPORT: u16 = 1 << 4;
+    /// The mmap should be executed from the aligned memfd. Micro should use
+    /// `mmap(MAP_FIXED, aligned_fd, aligned_offset + file_offset)` at the
+    /// address in `cq.result`.
+    pub const MMAP_USE_ALIGNED: u16 = 1 << 5;
 }
 
 /// Descriptor appended to the data region when `cq_flags::TRAMPOLINE` is set.

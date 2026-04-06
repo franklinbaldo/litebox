@@ -7,7 +7,7 @@
 //! handlers or control message handlers, and writes completion queue results.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -135,6 +135,10 @@ pub struct ProcessServer<FS: ShimFS> {
     aligned_file_map: Arc<HashMap<String, (usize, usize)>>,
     /// Size in bytes of the aligned memfd region.
     aligned_size: usize,
+    /// Guest fds whose backing tar file has an aligned memfd offset (`aligned_offset != 0`).
+    /// Used to detect mmap calls that can be dispatched via the phantom-mode
+    /// fast path instead of copying data through the shared data region.
+    fd_aligned_set: RefCell<HashSet<i32>>,
 }
 
 impl<FS: ShimFS> ProcessServer<FS> {
@@ -187,6 +191,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
             tar_file_map,
             aligned_file_map,
             aligned_size,
+            fd_aligned_set: RefCell::new(HashSet::new()),
         }
     }
 
@@ -528,6 +533,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 self.maybe_close_shmem_socket(fd);
                 // If this fd was a shmem file, set CLOSED flag and free slot.
                 self.maybe_close_shmem_file(fd);
+                // Remove from aligned fd tracking set.
+                self.fd_aligned_set.borrow_mut().remove(&fd);
                 cq.result = 0;
                 return cq;
             }
@@ -630,6 +637,11 @@ impl<FS: ShimFS> ProcessServer<FS> {
                                 core::mem::size_of::<litebox_ipc::messages::OpenResponse>() as u32;
                         }
                     }
+
+                    // Propagate aligned fd tracking for phantom-mode mmap.
+                    if self.fd_aligned_set.borrow().contains(&source_fd) {
+                        self.fd_aligned_set.borrow_mut().insert(new_fd);
+                    }
                 }
 
                 return cq;
@@ -722,6 +734,51 @@ impl<FS: ShimFS> ProcessServer<FS> {
             }
 
             let is_mmap = nr == libc::SYS_mmap as u32;
+
+            // Phantom-mode fast path for aligned tar file mmaps.
+            // Non-MAP_FIXED file-backed mmaps whose fd is in fd_aligned_set
+            // can skip the expensive data-copy path: dispatch as MAP_ANONYMOUS
+            // (to get an address from PageManager), then tell micro to mmap
+            // from the aligned memfd directly.
+            #[allow(clippy::cast_possible_truncation)]
+            if is_mmap {
+                let flags = entry.args[3] as i32;
+                let fd = entry.args[4] as i32;
+                if flags & libc::MAP_ANONYMOUS == 0
+                    && flags & libc::MAP_FIXED == 0
+                    && self.fd_aligned_set.borrow().contains(&fd)
+                {
+                    // Probe for a trampoline so we can include its pages in the
+                    // allocation. The trampoline lives just past the file
+                    // mapping; if we don't account for it the mmap will land too
+                    // high and the trampoline mmap in micro will extend beyond
+                    // the user address space limit.
+                    let tramp_extra = self.probe_trampoline_extra(entry.thread_slot, fd,
+                        entry.args[1] as usize);
+
+                    // Modify regs to dispatch as MAP_ANONYMOUS with fd=-1.
+                    let mut regs = crate::dispatch::sq_entry_to_ptregs(entry);
+                    regs.r10 |= libc::MAP_ANONYMOUS as usize;
+                    regs.r8 = usize::MAX; // fd = -1
+                    // Inflate the allocation size to cover the trampoline.
+                    regs.rsi += tramp_extra;
+
+                    // Enable phantom mode so PageManager allocates within the
+                    // bump region (per-thread — safe with concurrent servers).
+                    let platform = litebox_platform_multiplex::platform();
+                    let _guard = litebox_platform_central::PhantomModeGuard::new(platform);
+
+                    cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
+                    if cq.result < 0 {
+                        return cq;
+                    }
+
+                    cq.flags =
+                        cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT | cq_flags::MMAP_USE_ALIGNED;
+                    self.try_append_trampoline(entry.thread_slot, fd, 0, &mut cq);
+                    return cq;
+                }
+            }
 
             let mut regs = crate::dispatch::sq_entry_to_ptregs(entry);
             cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
@@ -897,6 +954,11 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     0
                 };
 
+                // Track fds with aligned offsets for phantom-mode mmap dispatch.
+                if aligned_off != 0 {
+                    self.fd_aligned_set.borrow_mut().insert(new_fd);
+                }
+
                 // Write OpenResponse to data region at offset 0 for micro.
                 let response = litebox_ipc::messages::OpenResponse {
                     fd: new_fd,
@@ -1022,6 +1084,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 aligned_size,
             );
             child_server.next_child_pid.set(self.next_child_pid.get());
+            child_server.fd_aligned_set.borrow_mut().clone_from(&self.fd_aligned_set.borrow());
 
             let handle = std::thread::spawn(move || {
                 if let Err(e) = child_server.run() {
@@ -1056,6 +1119,76 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 -i64::from(libc::ESRCH)
             }
         }
+    }
+
+    /// Probe a file for a LITEBOX0 trampoline header and return the extra
+    /// bytes (page-aligned) that need to be added to the mmap allocation to
+    /// ensure the trampoline pages fit within user address space.
+    ///
+    /// Returns 0 if the file has no trampoline or the trampoline already fits
+    /// within `map_len`.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn probe_trampoline_extra(
+        &self,
+        thread_slot: u16,
+        fd: i32,
+        map_len: usize,
+    ) -> usize {
+        const LITEBOX0_MAGIC: u64 = u64::from_le_bytes(*b"LITEBOX0");
+        const HEADER_SIZE: usize = 32;
+
+        // fstat to get file size.
+        let mut stat_buf = [0u8; 144];
+        {
+            let mut regs = litebox_common_linux::PtRegs::default();
+            regs.orig_rax = libc::SYS_fstat as usize;
+            regs.rdi = fd as usize;
+            regs.rsi = stat_buf.as_mut_ptr() as usize;
+            let result = self.dispatch_to_task(thread_slot, &mut regs);
+            if result < 0 {
+                return 0;
+            }
+        }
+        let file_size = i64::from_le_bytes(stat_buf[48..56].try_into().unwrap());
+        if (file_size as usize) < HEADER_SIZE {
+            return 0;
+        }
+
+        // pread the last 32 bytes for the trampoline header.
+        let mut header_buf = [0u8; HEADER_SIZE];
+        let header_offset = file_size - HEADER_SIZE as i64;
+        {
+            let mut regs = litebox_common_linux::PtRegs::default();
+            regs.orig_rax = libc::SYS_pread64 as usize;
+            regs.rdi = fd as usize;
+            regs.rsi = header_buf.as_mut_ptr() as usize;
+            regs.rdx = HEADER_SIZE;
+            regs.r10 = header_offset as usize;
+            let result = self.dispatch_to_task(thread_slot, &mut regs);
+            if result < HEADER_SIZE as i64 {
+                return 0;
+            }
+        }
+
+        let magic = u64::from_le_bytes(header_buf[0..8].try_into().unwrap());
+        if magic != LITEBOX0_MAGIC {
+            return 0;
+        }
+
+        let tramp_vaddr = u64::from_le_bytes(header_buf[16..24].try_into().unwrap()) as usize;
+        let tramp_size = u64::from_le_bytes(header_buf[24..32].try_into().unwrap()) as usize;
+
+        if tramp_size == 0 {
+            return 0;
+        }
+
+        // The trampoline needs pages from tramp_vaddr to
+        // tramp_vaddr + round_up(tramp_size). If this exceeds the
+        // original map_len (page-aligned), return the extra needed.
+        let tramp_page_size = (tramp_size + 0xFFF) & !0xFFF;
+        let tramp_end = tramp_vaddr + tramp_page_size;
+        let map_len_aligned = (map_len + 0xFFF) & !0xFFF;
+        tramp_end.saturating_sub(map_len_aligned)
     }
 
     /// Check if the file behind `fd` is a rewritten ELF with a trampoline.
@@ -2390,6 +2523,11 @@ impl<FS: ShimFS> ProcessServer<FS> {
     )]
     fn handle_execve(&self, entry: &SqEntry) -> CqEntry {
         let mut cq = Self::base_cq(entry);
+
+        // Execve replaces the process image. All file-backed mmap state from
+        // the old program is irrelevant. The dynamic linker of the new program
+        // will re-open libraries and populate the set via openat.
+        self.fd_aligned_set.borrow_mut().clear();
 
         // Read serialized path/argv/envp from the data region.
         let data = self.region.data_region();

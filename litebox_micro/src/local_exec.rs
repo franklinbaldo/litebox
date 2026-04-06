@@ -138,6 +138,104 @@ pub unsafe fn execute_locally(
                 }
 
                 map_addr as i64
+            } else if cq.flags & cq_flags::MMAP_USE_ALIGNED != 0 && cq.result > 0 {
+                // Phantom reservation mmap: central picked address via phantom
+                // PageManager. Map directly from the aligned memfd.
+                let map_addr = cq.result as usize;
+                let map_len = args[1] as usize;
+                let final_prot = args[2] as i32;
+                let fd = args[4] as i32;
+                let file_offset = args[5] as usize;
+
+                let state = unsafe { crate::state::global_micro_state() };
+                if let Some(entry) = state.find_file_fd_entry(fd) {
+                    let memfd_offset = entry.aligned_offset + file_offset as u64;
+
+                    let result = unsafe {
+                        raw_syscall::mmap(
+                            map_addr,
+                            map_len,
+                            final_prot,
+                            libc::MAP_PRIVATE | libc::MAP_FIXED,
+                            state.aligned_fd,
+                            memfd_offset as i64,
+                        )
+                    };
+                    if raw_syscall::is_error(result) {
+                        return -i64::from(libc::ENOMEM);
+                    }
+
+                    // Handle trampoline if present (same logic as HAS_DATA path).
+                    if cq.flags & cq_flags::TRAMPOLINE != 0 && !ring_base.is_null() {
+                        let desc_offset = cq.data_offset as usize + cq.data_len as usize;
+                        let data_region_base = unsafe { ring_base.add(layout.data_region_offset) };
+
+                        // Read TrampolineDescriptor (8 bytes: vaddr_offset u32 LE
+                        // + size u32 LE).
+                        let desc_ptr = unsafe { data_region_base.add(desc_offset) };
+                        let vaddr_offset = unsafe {
+                            u32::from_le_bytes(
+                                core::slice::from_raw_parts(desc_ptr, 4).try_into().unwrap(),
+                            ) as usize
+                        };
+                        let tramp_size = unsafe {
+                            u32::from_le_bytes(
+                                core::slice::from_raw_parts(desc_ptr.add(4), 4)
+                                    .try_into()
+                                    .unwrap(),
+                            ) as usize
+                        };
+
+                        if tramp_size > 0 {
+                            let tramp_data_src = unsafe { desc_ptr.add(8) };
+                            let tramp_addr = map_addr + vaddr_offset;
+                            let tramp_page_size = (tramp_size + 0xFFF) & !0xFFF;
+
+                            // Map anonymous writable page at the trampoline address.
+                            let tramp_ret = unsafe {
+                                raw_syscall::mmap(
+                                    tramp_addr,
+                                    tramp_page_size,
+                                    libc::PROT_READ | libc::PROT_WRITE,
+                                    libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                                    -1,
+                                    0,
+                                )
+                            };
+                            if !raw_syscall::is_error(tramp_ret) {
+                                // Copy trampoline code from the data region.
+                                unsafe {
+                                    core::ptr::copy_nonoverlapping(
+                                        tramp_data_src,
+                                        tramp_ret as *mut u8,
+                                        tramp_size,
+                                    );
+                                }
+
+                                // Patch the syscall entry point at offset 0
+                                // (first 8 bytes of the trampoline, used by the
+                                // rewritten `JMP [RIP+disp]` instructions).
+                                unsafe {
+                                    *(tramp_ret as *mut u64) = syscall_entry_point as u64;
+                                }
+
+                                // Protect as read + execute.
+                                unsafe {
+                                    raw_syscall::mprotect(
+                                        tramp_ret as usize,
+                                        tramp_page_size,
+                                        libc::PROT_READ | libc::PROT_EXEC,
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    map_addr as i64
+                } else {
+                    // fd not found in file table — shouldn't happen.
+                    -i64::from(libc::EBADF)
+                }
             } else if cq.result > 0 {
                 // Anonymous mmap: central chose the address via PageManager.
                 // Use MAP_FIXED at central's chosen address.
