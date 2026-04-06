@@ -100,7 +100,7 @@
 use std::cell::Cell;
 use std::os::fd::AsRawFd as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use litebox::fs::OFlags;
@@ -964,7 +964,51 @@ fn run_thread_inner(
         let tcb_addr = tcb_ptr as usize;
         // Set the thread-local (for Rust code) now.
         TCB_PTR.set(tcb_ptr);
+        // Register TLS entry early so that any libc calls during
+        // run_thread setup (e.g. mmap in with_signal_alt_stack) that go
+        // through patched shared cache SVC stubs can find this thread's
+        // TCB via the trampoline's TPIDRRO_EL0-keyed TLS table.
+        update_host_tls_entry();
+        // Re-register exception handlers.  install_shared_cache resets
+        // SIGBUS/SIGSEGV/SIGTRAP to SIG_DFL (because the install thread
+        // has no TLS entry and cannot use the platform's signal handler
+        // safely).  Now that the TLS entry is populated, libc calls from
+        // the handler will work through the gate, so it is safe to
+        // re-register.
+        unsafe {
+            reset_exception_handler_once();
+        }
+        // [diag] raw asm write to stderr
+        unsafe {
+            let msg = b">>> register_exception_handlers\n";
+            core::arch::asm!(
+                "mov x0, #2", "mov x1, {buf}", "mov x2, {len}",
+                "mov x16, #0x4", "movk x16, #0x200, lsl #16", "svc #0x80",
+                buf = in(reg) msg.as_ptr(), len = in(reg) msg.len(),
+                out("x0") _, out("x1") _, out("x2") _, out("x16") _,
+                clobber_abi("C"),
+            );
+        }
+        register_exception_handlers();
+        unsafe {
+            let msg = b">>> with_signal_alt_stack\n";
+            core::arch::asm!(
+                "mov x0, #2", "mov x1, {buf}", "mov x2, {len}",
+                "mov x16, #0x4", "movk x16, #0x200, lsl #16", "svc #0x80",
+                buf = in(reg) msg.as_ptr(), len = in(reg) msg.len(),
+                out("x0") _, out("x1") _, out("x2") _, out("x16") _,
+                clobber_abi("C"),
+            );
+        }
         with_signal_alt_stack(tcb_addr, || unsafe {
+            let msg = b">>> run_thread_arch\n";
+            core::arch::asm!(
+                "mov x0, #2", "mov x1, {buf}", "mov x2, {len}",
+                "mov x16, #0x4", "movk x16, #0x200, lsl #16", "svc #0x80",
+                buf = in(reg) msg.as_ptr(), len = in(reg) msg.len(),
+                out("x0") _, out("x1") _, out("x2") _, out("x16") _,
+                clobber_abi("C"),
+            );
             // Do NOT write TPIDR_EL0 here.  macOS system libraries
             // (libsystem_malloc's XZone allocator) use TPIDR_EL0 via
             // _os_cpu_number() for per-CPU cache lookups.  Writing our
@@ -976,12 +1020,26 @@ fn run_thread_inner(
             // sets the guest's virtual TPIDR_EL0 just before branching
             // into guest code.
             run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter), tcb_ptr);
+            // Diagnostic: confirm run_thread_arch returned.
+            let done_msg = b">>> run_thread_arch returned
+";
+            core::arch::asm!(
+                "mov x0, #2", "mov x1, {buf}", "mov x2, {len}",
+                "mov x16, #0x4", "movk x16, #0x200, lsl #16", "svc #0x80",
+                buf = in(reg) done_msg.as_ptr(), len = in(reg) done_msg.len(),
+                out("x0") _, out("x1") _, out("x2") _, out("x16") _,
+                clobber_abi("C"),
+            );
         });
-        // Remove our entry from the TLS table before the TCB is freed.
-        // This prevents stale entries from accumulating and exhausting
-        // the 256-entry table in long-running programs with many threads.
-        remove_host_tls_entries();
-        TCB_PTR.set(core::ptr::null_mut());
+        // After run_thread_arch returns, do NOT free the TCB or remove
+        // TLS entries.  Post-run cleanup code (defer guards, Arc/Mutex
+        // destructors, etc.) may call libc functions (free, munmap, ...)
+        // that go through the patched shared cache gate.  The gate's
+        // trampoline needs a valid TLS entry + TCB to function.
+        //
+        // Leak the TCB intentionally — the forked child is about to
+        // _exit() anyway, so the OS reclaims all memory.
+        core::mem::forget(tcb);
     });
 }
 
@@ -1085,8 +1143,15 @@ _syscall_callback:
     // from there instead of relying on x18, which XNU may have zeroed via
     // preemptive context switch between the trampoline and this point.
 
-    // Clear in_guest flag.
+    // ---- HOST PASSTHROUGH FAST-PATH ----
+    // If in_guest == 0, this is host-side code (e.g. free(), malloc(), _exit())
+    // going through the patched shared cache gate. Execute the original SVC
+    // transparently and return to the caller as if the gate wasn't there.
     ldr x17, [sp, #40]           // x17 = TCB (from trampoline-stored host_tls)
+    ldrb w16, [x17, #32]         // w16 = TCB.in_guest
+    cbz w16, 80f  // if !in_guest, bypass guest handling
+
+    // Clear in_guest flag.
     strb wzr, [x17, #32]         // TCB.in_guest = 0
 
     // Save guest TPIDR (from trampoline stack slot) to guest_tpidr TLS var.
@@ -1160,18 +1225,56 @@ _syscall_callback:
     bl {syscall_handler}
     // If syscall_handler returns, the thread is done.
     b .Ldone_aarch64
+
+80:
+    // Host code hit a patched SVC in the shared cache (e.g. free, malloc,
+    // _exit, mmap). in_guest == 0, so this is NOT a guest syscall.
+    // Restore the original registers from the gate frame, execute the
+    // real SVC, and continue at the instruction after the original SVC
+    // site, as if the gate was never there.
+    //
+    // Gate frame on stack:
+    //   [SP+0]  = original x16 (syscall number)
+    //   [SP+8]  = original x17
+    //   [SP+16] = original x30 (caller's LR)
+    //   [SP+24] = guest_tpidr (overwritten by shared handler; free slot)
+    //   [SP+32] = original x18
+    //   [SP+40] = TCB pointer
+    // x30 = address after original SVC site (set by gate instructions 4/5)
+    // x0-x15 = original values (untouched by gate/shared handler)
+
+    // Stash return-after-SVC address in a free slot.
+    str x30, [sp, #24]
+
+    // Restore original x16 (syscall number), x17, and x30 (caller's LR).
+    ldp x16, x17, [sp]
+    ldr x30, [sp, #16]
+
+    // Execute the real SVC. SP is 48 below the caller's SP, but macOS
+    // syscalls do not reference the user stack, so this is harmless.
+    svc #0x80
+
+    // Load return-after-SVC address (stashed earlier) into x16.
+    // x16 is a scratch register that the SVC already clobbered.
+    ldr x16, [sp, #24]
+    add sp, sp, #48              // undo gate's SUB SP, SP, #48
+    br x16                       // continue at instruction after original SVC
     .cfi_endproc
 
     .globl _exception_callback
 _exception_callback:
     .cfi_startproc
-    // x9 = host_tls (TCB pointer), passed via ucontext x[9] by set_signal_return.
+    // x9  = host_tls (TCB pointer), from ucontext x[9] set by set_signal_return.
+    // x1  = trapno  (from ucontext x[1])
+    // x2  = error   (from ucontext x[2])
+    // x3  = cr2     (from ucontext x[3])
     // Do NOT write TPIDR_EL0 — macOS system libraries use it for per-CPU data.
+
     // Restore host stack from TCB.
     ldr x10, [x9, #8]
     mov sp, x10
 
-    ldr x0, [sp]                  // thread_ctx
+    ldr x0, [sp]                  // thread_ctx (x1-x3 preserved as args 2-4)
     bl {exception_handler}
     b .Ldone_aarch64
     .cfi_endproc
@@ -1380,8 +1483,14 @@ impl ThreadHandle {
             *current = Some(handle);
         });
         let _guard = litebox::utils::defer(|| {
-            let current = CURRENT_THREAD.take().unwrap();
-            *current.0.lock().unwrap() = None;
+            // Use try_with to tolerate TLS destruction in forked children.
+            // After fork(), Rust TLS may already be torn down; panicking
+            // here would abort the child before it can _exit().
+            let _ = CURRENT_THREAD.try_with(|cell| {
+                if let Some(current) = cell.borrow_mut().take() {
+                    *current.0.lock().unwrap() = None;
+                }
+            });
         });
         f()
     }
@@ -1741,13 +1850,11 @@ impl litebox::platform::PunchthroughProvider for MacosUserland {
 
 impl litebox::platform::DebugLogProvider for MacosUserland {
     fn debug_log_print(&self, msg: &str) {
-        let _ = unsafe {
-            libc::write(
-                litebox_common_linux::STDERR_FILENO,
-                msg.as_ptr().cast(),
-                msg.len(),
-            )
-        };
+        // Use raw SVC write to bypass the patched shared cache gate.
+        // After install_shared_cache, libc::write goes through the gate →
+        // syscall_handler → handle_syscall_request → log_unsupported! →
+        // debug_log_print → libc::write → gate (infinite recursion → SIGKILL).
+        raw_debug_write(msg.as_bytes());
     }
 }
 
@@ -2602,6 +2709,111 @@ unsafe extern "C-unwind" fn reenter_handler(thread_ctx: &mut ThreadContext) {
 /// purposes.
 #[allow(clippy::cast_sign_loss)]
 unsafe extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext) {
+    // Intercept sigreturn (BSD 184) when called from _sigtramp.
+    //
+    // When a host signal handler (exception_signal_handler, etc.) is invoked
+    // while the guest is running, the handler modifies the ucontext via
+    // set_signal_return() to redirect sigreturn to exception_callback /
+    // interrupt_callback. The signal handler then returns to _sigtramp,
+    // which calls __sigreturn (in libsystem_kernel). But __sigreturn's SVC
+    // has been patched by install_shared_cache, so the gate intercepts it
+    // as a guest syscall.
+    //
+    // We detect this case by checking if the caller's LR points into
+    // _sigtramp. When it does, we execute a raw SVC to pass the sigreturn
+    // through to the host kernel, which restores the modified context and
+    // jumps to the appropriate callback.
+    //
+    // NOTE: this raw SVC does NOT return — the kernel replaces the entire
+    // CPU context, effectively longjmp-ing to the callback.
+    {
+        let nr = thread_ctx.ctx.regs[16];
+        // BSD sigreturn = 184 or 0x20000B8 (depending on the stub).
+        // The gate preserves x16 as-is from the SVC caller.
+        let is_sigreturn = nr == 184 || nr == 0x2000_00B8;
+        if is_sigreturn {
+            let lr = thread_ctx.ctx.regs[30];
+            let sigtramp = get_sigtramp_addr();
+
+            // Diagnostic: print what we see.
+            // Format: "[sigreturn-check] nr=XXXXXXXXXXXXXXXX lr=XXXXXXXXXXXXXXXX sigtramp=XXXXXXXXXXXXXXXX\n"
+            {
+                let mut buf = [0u8; 128];
+                let prefix = b"[sigreturn-check] nr=";
+                buf[..prefix.len()].copy_from_slice(prefix);
+                let mut pos = prefix.len();
+                pos = write_hex_to_buf(&mut buf, pos, nr as u64);
+                let s1 = b" lr=";
+                buf[pos..pos + s1.len()].copy_from_slice(s1);
+                pos += s1.len();
+                pos = write_hex_to_buf(&mut buf, pos, lr as u64);
+                let s2 = b" sigtramp=";
+                buf[pos..pos + s2.len()].copy_from_slice(s2);
+                pos += s2.len();
+                pos = write_hex_to_buf(&mut buf, pos, sigtramp as u64);
+                buf[pos] = b'\n';
+                pos += 1;
+                raw_debug_write(&buf[..pos]);
+            }
+
+            // _sigtramp is typically ~100 bytes; use 256 for safety.
+            if sigtramp != 0 && lr >= sigtramp && lr < sigtramp + 256 {
+                let uctx = thread_ctx.ctx.regs[0];
+
+                // Read the target PC and parameters from the ucontext.
+                // set_signal_return() wrote: pc=callback, x[0]=p0, x[1]=trapno,
+                // x[2]=err, x[3]=cr2, x[9]=host_tls.
+                //
+                // On macOS arm64:
+                //   uc_mcontext is at offset 48 in ucontext_t.
+                //   mcontext.__es = 16 bytes (__far:u64, __esr:u32, __exception:u32)
+                //   mcontext.__ss.__x[i] at offset 16 + i*8
+                //   mcontext.__ss.__pc at offset 16 + 29*8 + 8 + 8 + 8 = 272
+                let mctx_ptr = unsafe { core::ptr::read_volatile((uctx as *const usize).add(6)) }; // offset 48
+
+                if mctx_ptr != 0 {
+                    let mctx = mctx_ptr as *const u64;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let target_pc = unsafe { core::ptr::read_volatile(mctx.add(272 / 8)) } as usize;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let x1_val = unsafe { core::ptr::read_volatile(mctx.add(3)) } as usize; // trapno: offset (16+8)/8=3
+                    #[allow(clippy::cast_possible_truncation)]
+                    let x2_val = unsafe { core::ptr::read_volatile(mctx.add(4)) } as usize; // error: offset (16+16)/8=4
+                    #[allow(clippy::cast_possible_truncation)]
+                    let x3_val = unsafe { core::ptr::read_volatile(mctx.add(5)) } as usize; // cr2: offset (16+24)/8=5
+
+                    // Ensure that `run_thread_arch` is linked in.
+                    let _ = run_thread_arch as *const () as usize;
+
+                    let exc_cb = exception_callback as *const () as usize;
+                    let int_cb = interrupt_callback as *const () as usize;
+
+                    if target_pc == exc_cb {
+                        raw_debug_write(b"[sigreturn] -> exception_handler\n");
+                        exception_handler(thread_ctx, x1_val, x2_val, x3_val);
+                        return;
+                    } else if target_pc == int_cb {
+                        raw_debug_write(b"[sigreturn] -> interrupt_handler\n");
+                        interrupt_handler(thread_ctx);
+                        return;
+                    }
+
+                    // Unknown target — log and fall through to normal syscall dispatch
+                    // which will log it as unsupported.
+                    {
+                        let mut buf = [0u8; 128];
+                        let prefix = b"[sigreturn] unknown target_pc=";
+                        buf[..prefix.len()].copy_from_slice(prefix);
+                        let mut pos = prefix.len();
+                        pos = write_hex_to_buf(&mut buf, pos, target_pc as u64);
+                        buf[pos] = b'\n';
+                        pos += 1;
+                        raw_debug_write(&buf[..pos]);
+                    }
+                }
+            }
+        }
+    }
     thread_ctx.call_shim(|shim, ctx, _interrupt| shim.syscall(ctx));
 }
 
@@ -2611,12 +2823,14 @@ extern "C-unwind" fn exception_handler(
     error: usize,
     cr2: usize,
 ) {
+    raw_debug_write(b"[exception_handler] entered\n");
     let _ = error; // unused on aarch64; signal number is in trapno
     let info = litebox::shim::ExceptionInfo {
         fault_address: cr2,
         esr: trapno as u64,
     };
     thread_ctx.call_shim(|shim, ctx, _interrupt| shim.exception(ctx, &info));
+    raw_debug_write(b"[exception_handler] returning\n");
 }
 
 /// Update the TLS lookup table with the current thread's entry.
@@ -2721,6 +2935,7 @@ fn update_host_tls_entry() {
 ///
 /// Only the owning thread calls this for its own TPIDRRO_EL0 key,
 /// so there is no race on the entry being removed.
+#[allow(dead_code)]
 fn remove_host_tls_entries() {
     use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -2815,7 +3030,9 @@ impl ThreadContext<'_> {
                 let tcb = TCB_PTR.get();
                 unsafe { switch_to_guest(self.ctx, tcb) }
             }
-            ContinueOperation::Terminate => {}
+            ContinueOperation::Terminate => {
+                raw_debug_write(b"[call_shim] Terminate\n");
+            }
         }
     }
 }
@@ -2860,6 +3077,499 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for MacosUserland {
 static mut NEXT_SA: [libc::sigaction; 64] = unsafe { core::mem::zeroed() };
 static INTERRUPT_SIGNAL_NUMBER: AtomicI32 = AtomicI32::new(0);
 
+// ---------------------------------------------------------------------------
+// Raw host syscall helpers
+//
+// After `install_shared_cache` patches all SVC sites in the shared cache,
+// every `libc::*` function that issues a syscall goes through the litebox
+// gate → `syscall_callback` → shim dispatcher.  The shim handles these as
+// *guest* syscalls (virtual mmap, virtual sigaction, etc.), which is wrong
+// for host-side operations such as signal handler registration and alt-stack
+// setup.
+//
+// The helpers below issue the real macOS BSD SVC directly via inline assembly,
+// bypassing the patched gate entirely.
+// ---------------------------------------------------------------------------
+
+/// macOS BSD syscall numbers.
+const RAW_SYS_SIGACTION: u64 = 46;
+const RAW_SYS_SIGALTSTACK: u64 = 53;
+const RAW_SYS_MUNMAP: u64 = 73;
+const RAW_SYS_MPROTECT: u64 = 74;
+const RAW_SYS_WRITE: u64 = 4;
+const RAW_SYS_MMAP: u64 = 197;
+
+/// Raw `write(fd, buf, len)` via inline assembly.
+///
+/// Bypasses the patched shared cache gate entirely — safe to call from
+/// `syscall_handler` and other host-side code after `install_shared_cache`.
+/// Write a u64 value as hex (0x...) into buf starting at `pos`, return new pos.
+fn write_hex_to_buf(buf: &mut [u8], pos: usize, val: u64) -> usize {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut p = pos;
+    buf[p] = b'0';
+    buf[p + 1] = b'x';
+    p += 2;
+    // Find first non-zero nibble (or print 0)
+    let mut started = false;
+    for shift in (0..16).rev() {
+        let nibble = ((val >> (shift * 4)) & 0xf) as usize;
+        if nibble != 0 || started || shift == 0 {
+            buf[p] = HEX[nibble];
+            p += 1;
+            started = true;
+        }
+    }
+    p
+}
+
+fn raw_debug_write(buf: &[u8]) {
+    if buf.is_empty() {
+        return;
+    }
+    unsafe {
+        core::arch::asm!(
+            "mov x0, #2",            // fd = stderr
+            "mov x1, {buf}",
+            "mov x2, {len}",
+            "mov x16, {nr}",
+            "svc #0x80",
+            buf = in(reg) buf.as_ptr(),
+            len = in(reg) buf.len(),
+            nr = in(reg) RAW_SYS_WRITE | (0x200_0000u64),
+            out("x0") _,
+            out("x1") _,
+            out("x2") _,
+            out("x16") _,
+            clobber_abi("C"),
+        );
+    }
+}
+
+/// Raw `mmap(addr, len, prot, flags, fd, offset)` via inline assembly.
+///
+/// Returns the mapped address on success, or a negative errno on failure.
+///
+/// # Safety
+///
+/// Caller must ensure arguments are valid for the mmap syscall.
+#[allow(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::too_many_arguments
+)]
+unsafe fn raw_host_mmap(
+    addr: usize,
+    len: usize,
+    prot: i32,
+    flags: i32,
+    fd: i32,
+    offset: i64,
+) -> Result<usize, i32> {
+    let ret: u64;
+    let err_flag: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov x16, {syscall_nr}",
+            "svc #0x80",
+            "cset {err}, cs",
+            syscall_nr = in(reg) RAW_SYS_MMAP,
+            in("x0") addr as u64,
+            in("x1") len as u64,
+            in("x2") prot as u64,
+            in("x3") flags as u64,
+            in("x4") fd as u64,
+            in("x5") offset as u64,
+            err = out(reg) err_flag,
+            lateout("x0") ret,
+            out("x16") _,
+        );
+    }
+    if err_flag != 0 {
+        Err(ret as i32)
+    } else {
+        Ok(ret as usize)
+    }
+}
+
+/// Raw `munmap(addr, len)` via inline assembly.
+///
+/// # Safety
+///
+/// Caller must ensure arguments are valid for the munmap syscall.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+unsafe fn raw_host_munmap(addr: usize, len: usize) -> Result<(), i32> {
+    let ret: u64;
+    let err_flag: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov x16, {syscall_nr}",
+            "svc #0x80",
+            "cset {err}, cs",
+            syscall_nr = in(reg) RAW_SYS_MUNMAP,
+            in("x0") addr as u64,
+            in("x1") len as u64,
+            err = out(reg) err_flag,
+            lateout("x0") ret,
+            out("x16") _,
+        );
+    }
+    if err_flag != 0 {
+        Err(ret as i32)
+    } else {
+        Ok(())
+    }
+}
+
+/// Raw `mprotect(addr, len, prot)` via inline assembly.
+///
+/// # Safety
+///
+/// Caller must ensure arguments are valid for the mprotect syscall.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+unsafe fn raw_host_mprotect(addr: usize, len: usize, prot: i32) -> Result<(), i32> {
+    let ret: u64;
+    let err_flag: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov x16, {syscall_nr}",
+            "svc #0x80",
+            "cset {err}, cs",
+            syscall_nr = in(reg) RAW_SYS_MPROTECT,
+            in("x0") addr as u64,
+            in("x1") len as u64,
+            in("x2") prot as u64,
+            err = out(reg) err_flag,
+            lateout("x0") ret,
+            out("x16") _,
+        );
+    }
+    if err_flag != 0 {
+        Err(ret as i32)
+    } else {
+        Ok(())
+    }
+}
+
+/// Raw `__sigaction(signum, nact, oact)` via inline assembly.
+///
+/// `nact` points to a 24-byte `struct __sigaction` (kernel ABI):
+///   `[0..8]  sa_handler/sa_sigaction`
+///   `[8..16] sa_tramp (_sigtramp)`
+///   `[16..20] sa_mask`
+///   `[20..24] sa_flags`
+///
+/// `oact` points to a 16-byte `struct sigaction` (userspace ABI):
+///   `[0..8]  sa_handler/sa_sigaction`
+///   `[8..12] sa_mask`
+///   `[12..16] sa_flags`
+///
+/// # Safety
+///
+/// Caller must ensure `nact` and `oact` point to valid memory with the
+/// correct sizes.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+unsafe fn raw_host_sigaction(signum: i32, nact: *const u8, oact: *mut u8) -> Result<(), i32> {
+    let ret: u64;
+    let err_flag: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov x16, {syscall_nr}",
+            "svc #0x80",
+            "cset {err}, cs",
+            syscall_nr = in(reg) RAW_SYS_SIGACTION,
+            in("x0") signum as u64,
+            in("x1") nact as u64,
+            in("x2") oact as u64,
+            err = out(reg) err_flag,
+            lateout("x0") ret,
+            out("x16") _,
+        );
+    }
+    if err_flag != 0 {
+        Err(ret as i32)
+    } else {
+        Ok(())
+    }
+}
+
+/// Raw `sigaltstack(ss, oss)` via inline assembly.
+///
+/// Both `ss` and `oss` point to `struct stack_t` (24 bytes on macOS aarch64):
+///   `[0..8]  ss_sp`
+///   `[8..16] ss_size`
+///   `[16..20] ss_flags` (+ 4 bytes padding)
+///
+/// Either pointer may be null.
+///
+/// # Safety
+///
+/// Caller must ensure pointers (if non-null) point to valid `stack_t` structs.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+unsafe fn raw_host_sigaltstack(
+    ss: *const libc::stack_t,
+    oss: *mut libc::stack_t,
+) -> Result<(), i32> {
+    let ret: u64;
+    let err_flag: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov x16, {syscall_nr}",
+            "svc #0x80",
+            "cset {err}, cs",
+            syscall_nr = in(reg) RAW_SYS_SIGALTSTACK,
+            in("x0") ss as u64,
+            in("x1") oss as u64,
+            err = out(reg) err_flag,
+            lateout("x0") ret,
+            out("x16") _,
+        );
+    }
+    if err_flag != 0 {
+        Err(ret as i32)
+    } else {
+        Ok(())
+    }
+}
+
+/// Address of `_sigtramp` in libsystem_platform, resolved once via `dlsym`.
+///
+/// The kernel-level `__sigaction` struct requires `sa_tramp` to point to
+/// `_sigtramp`. The libc `sigaction()` wrapper adds this automatically, but
+/// our raw SVC bypass must provide it explicitly.
+///
+/// Stored as an `AtomicUsize` (instead of `OnceLock`) because `OnceLock` may
+/// not properly inherit its "initialized" state across `fork()` in all
+/// configurations.
+static SIGTRAMP_ADDR: AtomicUsize = AtomicUsize::new(0);
+
+/// Returns the address of `_sigtramp`, resolving it by walking the Mach-O
+/// symbol table of `libsystem_platform.dylib` on first call.
+///
+/// `_sigtramp` is a **local** text symbol (`t` in `nm`) — NOT an exported
+/// symbol.  `dlsym(RTLD_DEFAULT, "_sigtramp")` returns NULL.  We must parse
+/// the in-memory Mach-O headers to find it.
+///
+/// This function only reads in-memory data structures (no syscalls, no locks)
+/// and is safe to call both before and after `fork()`, and even after the
+/// shared cache `__TEXT` segments have been patched.
+///
+/// # Panics
+///
+/// Panics if `libsystem_platform.dylib` is not loaded or if `__sigtramp` is
+/// not found in its symbol table.
+pub fn get_sigtramp_addr() -> usize {
+    let addr = SIGTRAMP_ADDR.load(Ordering::Acquire);
+    if addr != 0 {
+        return addr;
+    }
+    let resolved = resolve_sigtramp_from_macho();
+    SIGTRAMP_ADDR.store(resolved, Ordering::Release);
+    resolved
+}
+
+/// Walk the loaded dyld images to find `__sigtramp` (C-mangled `_sigtramp`)
+/// in `libsystem_platform.dylib`'s symbol table.
+///
+/// # Safety
+///
+/// Reads Mach-O headers and symbol tables that are mapped into the process's
+/// address space by dyld.  No allocations, no syscalls, no locks.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_ptr_alignment,
+    clippy::cast_sign_loss,
+    deprecated
+)]
+fn resolve_sigtramp_from_macho() -> usize {
+    // Mach-O load command constants (not all exposed by libc crate).
+    const LC_SEGMENT_64: u32 = 0x19;
+    const LC_SYMTAB: u32 = 0x2;
+
+    /// Mach-O `symtab_command`.
+    #[repr(C)]
+    struct SymtabCmd {
+        cmd: u32,
+        cmdsize: u32,
+        symoff: u32,
+        nsyms: u32,
+        stroff: u32,
+        strsize: u32,
+    }
+
+    /// Mach-O `segment_command_64` (abbreviated — we only need a few fields).
+    #[repr(C)]
+    struct SegCmd64 {
+        cmd: u32,
+        cmdsize: u32,
+        segname: [u8; 16],
+        vmaddr: u64,
+        vmsize: u64,
+        fileoff: u64,
+        filesize: u64,
+        // remaining fields not needed
+    }
+
+    /// Mach-O `nlist_64`.
+    #[repr(C)]
+    struct SymEntry64 {
+        strx: u32,
+        sym_type: u8,
+        sect: u8,
+        desc: u16,
+        value: u64,
+    }
+
+    unsafe {
+        let count = libc::_dyld_image_count();
+        for i in 0..count {
+            let name_ptr = libc::_dyld_get_image_name(i);
+            if name_ptr.is_null() {
+                continue;
+            }
+            // Check if this image is libsystem_platform.dylib.
+            let name = core::ffi::CStr::from_ptr(name_ptr);
+            let name_bytes = name.to_bytes();
+            if !name_bytes
+                .windows(b"libsystem_platform".len())
+                .any(|w| w == b"libsystem_platform")
+            {
+                continue;
+            }
+
+            let header = libc::_dyld_get_image_header(i);
+            if header.is_null() {
+                continue;
+            }
+            let slide = libc::_dyld_get_image_vmaddr_slide(i);
+
+            // Cast to mach_header_64 to read ncmds.
+            let hdr = header.cast::<libc::mach_header_64>();
+            let ncmds = (*hdr).ncmds;
+
+            // Walk load commands.
+            let mut lc_ptr = hdr
+                .cast::<u8>()
+                .add(core::mem::size_of::<libc::mach_header_64>());
+            let mut linkedit_vmaddr: u64 = 0;
+            let mut linkedit_fileoff: u64 = 0;
+            let mut linkedit_found = false;
+            let mut symtab_ptr: *const SymtabCmd = core::ptr::null();
+
+            for _ in 0..ncmds {
+                let cmd = core::ptr::read_unaligned(lc_ptr.cast::<u32>());
+                let cmdsize = core::ptr::read_unaligned(lc_ptr.add(4).cast::<u32>());
+
+                if cmd == LC_SEGMENT_64 {
+                    let seg = lc_ptr.cast::<SegCmd64>();
+                    // Check for __LINKEDIT.
+                    let segname = core::ptr::addr_of!((*seg).segname).read_unaligned();
+                    if segname[..10] == *b"__LINKEDIT" {
+                        linkedit_vmaddr = core::ptr::addr_of!((*seg).vmaddr).read_unaligned();
+                        linkedit_fileoff = core::ptr::addr_of!((*seg).fileoff).read_unaligned();
+                        linkedit_found = true;
+                    }
+                } else if cmd == LC_SYMTAB {
+                    symtab_ptr = lc_ptr.cast::<SymtabCmd>();
+                }
+
+                lc_ptr = lc_ptr.add(cmdsize as usize);
+            }
+
+            assert!(
+                linkedit_found && !symtab_ptr.is_null(),
+                "libsystem_platform.dylib missing __LINKEDIT or LC_SYMTAB"
+            );
+
+            // Compute base of __LINKEDIT in memory.
+            let linkedit_base =
+                (linkedit_vmaddr as usize).wrapping_add(slide as usize) as *const u8;
+
+            let symoff = core::ptr::addr_of!((*symtab_ptr).symoff).read_unaligned() as usize;
+            let nsyms = core::ptr::addr_of!((*symtab_ptr).nsyms).read_unaligned() as usize;
+            let stroff = core::ptr::addr_of!((*symtab_ptr).stroff).read_unaligned() as usize;
+
+            let syms = linkedit_base
+                .add(symoff - linkedit_fileoff as usize)
+                .cast::<SymEntry64>();
+            let strtab = linkedit_base.add(stroff - linkedit_fileoff as usize);
+
+            for k in 0..nsyms {
+                let entry_ptr = syms.add(k);
+                let strx = core::ptr::addr_of!((*entry_ptr).strx).read_unaligned() as usize;
+                let value = core::ptr::addr_of!((*entry_ptr).value).read_unaligned();
+                let sym_name_ptr = strtab.add(strx);
+
+                // Compare against "__sigtramp" (C-mangled name of `_sigtramp`).
+                let target = b"__sigtramp\0";
+                let mut matches = true;
+                for (j, &b) in target.iter().enumerate() {
+                    if *sym_name_ptr.add(j) != b {
+                        matches = false;
+                        break;
+                    }
+                }
+                if matches {
+                    let addr = (value as usize).wrapping_add(slide as usize);
+                    assert!(addr != 0, "__sigtramp has zero address");
+                    return addr;
+                }
+            }
+
+            panic!("__sigtramp not found in libsystem_platform.dylib symbol table");
+        }
+    }
+    panic!("libsystem_platform.dylib not found among loaded images");
+}
+
+/// Build a kernel-level `__sigaction` struct (24 bytes) and call `SYS_SIGACTION`.
+///
+/// This is the raw equivalent of `libc::sigaction()`, bypassing the patched
+/// shared cache gate.
+///
+/// `handler` is the signal handler function pointer (`SA_SIGINFO`-style).
+/// `mask` is the signal mask to apply during handler execution.
+/// `flags` is the `SA_*` flags (e.g., `SA_SIGINFO | SA_ONSTACK`).
+/// `old_sa` receives the previous signal action (16-byte `struct sigaction`).
+///
+/// # Safety
+///
+/// Caller must ensure `handler` is a valid function pointer and `old_sa` is
+/// valid.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+unsafe fn raw_host_sigaction_install(
+    signum: i32,
+    handler: usize,
+    mask: libc::sigset_t,
+    flags: i32,
+    old_sa: &mut libc::sigaction,
+) {
+    let tramp = get_sigtramp_addr();
+    // Build kernel __sigaction (24 bytes):
+    //   [0..8]   sa_handler
+    //   [8..16]  sa_tramp
+    //   [16..20] sa_mask (sigset_t = u32 on macOS)
+    //   [20..24] sa_flags
+    let mut ksa = [0u8; 24];
+    ksa[0..8].copy_from_slice(&(handler as u64).to_ne_bytes());
+    ksa[8..16].copy_from_slice(&(tramp as u64).to_ne_bytes());
+    ksa[16..20].copy_from_slice(&mask.to_ne_bytes());
+    ksa[20..24].copy_from_slice(&flags.to_ne_bytes());
+
+    let r = unsafe {
+        raw_host_sigaction(
+            signum,
+            ksa.as_ptr(),
+            std::ptr::from_mut(old_sa).cast::<u8>(),
+        )
+    };
+    assert!(
+        r.is_ok(),
+        "raw_host_sigaction failed for signal {signum}: errno {}",
+        r.unwrap_err()
+    );
+}
+
 /// Module-level `Once` for [`register_exception_handlers`].
 ///
 /// Promoted from a function-local `static` so that [`reset_exception_handler_once`]
@@ -2894,29 +3604,25 @@ pub unsafe fn reset_exception_handler_once() {
 
 fn register_exception_handlers() {
     EXCEPTION_HANDLER_ONCE.call_once(|| {
-        fn sigaction(sig: i32, sa: Option<&libc::sigaction>, old_sa: &mut libc::sigaction) {
-            unsafe {
-                let r = libc::sigaction(
-                    sig,
-                    sa.map_or(std::ptr::null(), |sa| &raw const *sa),
-                    &raw mut *old_sa,
-                );
-                assert!(
-                    r >= 0,
-                    "failed to query existing signal handler for signal {}: {}",
-                    sig,
-                    std::io::Error::last_os_error()
-                );
-            }
-        }
+        // Use raw SVC-based sigaction to bypass the patched shared cache gate.
+        // After install_shared_cache, libc::sigaction goes through the gate →
+        // syscall_callback → shim, which handles it as a guest sigaction
+        // (updating the virtual signal table, not the real kernel disposition).
 
         let interrupt_signal = {
             let sig = libc::SIGUSR1;
-            let mut sa: libc::sigaction = unsafe { core::mem::zeroed() };
-            sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
-            sa.sa_sigaction = interrupt_signal_handler as *const () as usize;
-            let mut old_sa = unsafe { core::mem::zeroed() };
-            sigaction(sig, Some(&sa), &mut old_sa);
+            let mask: libc::sigset_t = 0;
+            let flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+            let mut old_sa: libc::sigaction = unsafe { core::mem::zeroed() };
+            unsafe {
+                raw_host_sigaction_install(
+                    sig,
+                    interrupt_signal_handler as *const () as usize,
+                    mask,
+                    flags,
+                    &mut old_sa,
+                );
+            }
             INTERRUPT_SIGNAL_NUMBER.store(sig, Ordering::Relaxed);
             sig
         };
@@ -2929,18 +3635,21 @@ fn register_exception_handlers() {
             libc::SIGTRAP,
         ];
         for &sig in exception_signals {
+            // Build a mask that blocks the interrupt signal during exception
+            // handling to avoid saving the exception handler state as guest state.
+            let mut mask: libc::sigset_t = 0;
             unsafe {
-                let mut sa: libc::sigaction = core::mem::zeroed();
-                sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
-                sa.sa_sigaction = exception_signal_handler as *const () as usize;
-                // Block the interrupt signal while handling exceptions to avoid
-                // saving the exception signal handler state as guest state.
-                libc::sigaddset(&raw mut sa.sa_mask, interrupt_signal);
-                // Note: the handler could start running before this call even
-                // returns, so pass `&mut NEXT_SA` directly.
-                sigaction(
+                libc::sigaddset(&raw mut mask, interrupt_signal);
+            }
+            let flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+            // Note: the handler could start running before this call even
+            // returns, so pass `&mut NEXT_SA` directly.
+            unsafe {
+                raw_host_sigaction_install(
                     sig,
-                    Some(&sa),
+                    exception_signal_handler as *const () as usize,
+                    mask,
+                    flags,
                     &mut NEXT_SA[sig.reinterpret_as_unsigned() as usize],
                 );
             }
@@ -2973,53 +3682,46 @@ fn with_signal_alt_stack<R>(host_tls: usize, f: impl FnOnce() -> R) -> R {
     let guard_page_size: usize = 0x1000;
     // Allocate double the size so we can find an aligned region within it.
     let alloc_size = ALT_STACK_ALLOC_SIZE * 2;
-    let raw_base = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
+    let raw_addr = unsafe {
+        raw_host_mmap(
+            0,
             alloc_size,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
             -1,
             0,
         )
-    };
-    assert!(
-        raw_base != libc::MAP_FAILED,
-        "failed to allocate memory for alternate signal stack: {}",
-        std::io::Error::last_os_error()
-    );
+    }
+    .expect("failed to allocate memory for alternate signal stack");
 
     // Find the aligned base within the allocation.
-    let raw_addr = raw_base as usize;
     let aligned_base = (raw_addr + ALT_STACK_ALLOC_SIZE - 1) & !(ALT_STACK_ALLOC_SIZE - 1);
 
     // Unmap the unused prefix and suffix.
     let prefix_size = aligned_base - raw_addr;
     if prefix_size > 0 {
-        unsafe { libc::munmap(raw_base, prefix_size) };
+        unsafe {
+            let _ = raw_host_munmap(raw_addr, prefix_size);
+        }
     }
     let suffix_start = aligned_base + ALT_STACK_ALLOC_SIZE;
     let suffix_size = (raw_addr + alloc_size) - suffix_start;
     if suffix_size > 0 {
-        unsafe { libc::munmap(suffix_start as *mut libc::c_void, suffix_size) };
+        unsafe {
+            let _ = raw_host_munmap(suffix_start, suffix_size);
+        }
     }
 
-    let aligned_ptr = aligned_base as *mut libc::c_void;
     let _unmap_guard = litebox::utils::defer(move || {
-        let r = unsafe { libc::munmap(aligned_ptr, ALT_STACK_ALLOC_SIZE) };
-        assert!(
-            r == 0,
-            "failed to free memory for alternate signal stack: {}",
-            std::io::Error::last_os_error()
-        );
+        let r = unsafe { raw_host_munmap(aligned_base, ALT_STACK_ALLOC_SIZE) };
+        assert!(r.is_ok(), "failed to free alternate signal stack memory");
     });
 
     // Set up a guard page at the bottom.
-    let r = unsafe { libc::mprotect(aligned_ptr, guard_page_size, libc::PROT_NONE) };
+    let r = unsafe { raw_host_mprotect(aligned_base, guard_page_size, libc::PROT_NONE) };
     assert!(
-        r == 0,
-        "failed to set guard page for alternate signal stack: {}",
-        std::io::Error::last_os_error()
+        r.is_ok(),
+        "failed to set guard page for alternate signal stack"
     );
 
     // Store host TLS pointer at aligned_base + ALT_STACK_ALLOC_SIZE - 8.
@@ -3048,12 +3750,8 @@ fn with_signal_alt_stack<R>(host_tls: usize, f: impl FnOnce() -> R) -> R {
         ss_size: 0,
     };
     unsafe {
-        let r = libc::sigaltstack(&raw const alt_stack, &raw mut oss);
-        assert!(
-            r >= 0,
-            "failed to set up alternate signal stack: {}",
-            std::io::Error::last_os_error(),
-        );
+        let r = raw_host_sigaltstack(&raw const alt_stack, &raw mut oss);
+        assert!(r.is_ok(), "failed to set up alternate signal stack");
     }
     let _restore_guard = litebox::utils::defer(|| unsafe {
         // Clear the magic value BEFORE restoring the old sigaltstack.
@@ -3072,12 +3770,8 @@ fn with_signal_alt_stack<R>(host_tls: usize, f: impl FnOnce() -> R) -> R {
         if restored.ss_flags & libc::SS_DISABLE != 0 && restored.ss_size < libc::MINSIGSTKSZ {
             restored.ss_size = libc::MINSIGSTKSZ;
         }
-        let r = libc::sigaltstack(&raw const restored, std::ptr::null_mut());
-        assert!(
-            r >= 0,
-            "failed to restore original signal stack: {}",
-            std::io::Error::last_os_error()
-        );
+        let r = raw_host_sigaltstack(&raw const restored, std::ptr::null_mut());
+        assert!(r.is_ok(), "failed to restore original signal stack");
     });
     f()
 }
@@ -3106,8 +3800,11 @@ fn signal_handler_exit_guest(
 ) -> Option<(*mut litebox_common_linux::PtRegs, usize)> {
     unsafe {
         let mut current_ss: libc::stack_t = core::mem::zeroed();
-        let ret = libc::sigaltstack(std::ptr::null(), &raw mut current_ss);
-        if ret != 0 || current_ss.ss_flags & libc::SS_ONSTACK == 0 {
+        // Use raw SVC to bypass the patched gate. libc::sigaltstack would
+        // go through the gate → syscall_callback → shim, which would
+        // clobber SP and process it as a guest syscall.
+        let ret = raw_host_sigaltstack(std::ptr::null(), &raw mut current_ss);
+        if ret.is_err() || current_ss.ss_flags & libc::SS_ONSTACK == 0 {
             // Not on our alt-stack (or syscall failed). Return None without
             // touching any SP-derived addresses.
             return None;
@@ -3272,26 +3969,26 @@ unsafe extern "C" fn exception_signal_handler(
             // EC 0x24/0x25 = Data Abort, check WnR (bit 6) for write → flip to RW
             let toggled = if ec == 0x20 || ec == 0x21 {
                 // Instruction abort: guest tried to execute, page is currently RW.
-                // Flip to RX.
-                let r = unsafe {
-                    libc::mprotect(
-                        page_addr as *mut libc::c_void,
+                // Flip to RX.  Use raw SVC to bypass the patched shared cache gate.
+                unsafe {
+                    raw_host_mprotect(
+                        page_addr,
                         HOST_PAGE_SIZE,
                         (ProtFlags::PROT_READ | ProtFlags::PROT_EXEC).bits(),
                     )
-                };
-                r == 0
+                }
+                .is_ok()
             } else if (ec == 0x24 || ec == 0x25) && (esr & (1 << 6)) != 0 {
                 // Data abort with WnR=1: guest/host tried to write, page is currently RX.
-                // Flip to RW.
-                let r = unsafe {
-                    libc::mprotect(
-                        page_addr as *mut libc::c_void,
+                // Flip to RW.  Use raw SVC to bypass the patched shared cache gate.
+                unsafe {
+                    raw_host_mprotect(
+                        page_addr,
                         HOST_PAGE_SIZE,
                         (ProtFlags::PROT_READ | ProtFlags::PROT_WRITE).bits(),
                     )
-                };
-                r == 0
+                }
+                .is_ok()
             } else {
                 false
             };
@@ -3336,9 +4033,89 @@ unsafe extern "C" fn exception_signal_handler(
         }
     }
 
+    // Diagnostic: log the incoming signal + PC + LR + ESR before doing anything else.
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        let pc = unsafe { (*context.uc_mcontext).__ss.__pc as usize };
+        let far = unsafe { (*context.uc_mcontext).__es.__far as usize };
+        let lr = unsafe { (*context.uc_mcontext).__ss.__lr as usize };
+        let esr = unsafe { u64::from((*context.uc_mcontext).__es.__esr) };
+        let mut buf = [0u8; 220];
+        let prefix = b"[exc_sig_handler] sig=";
+        buf[..prefix.len()].copy_from_slice(prefix);
+        let mut pos = prefix.len();
+        #[allow(clippy::cast_sign_loss)]
+        let sig_u = signum as u8;
+        if sig_u >= 10 {
+            buf[pos] = b'0' + sig_u / 10;
+            pos += 1;
+        }
+        buf[pos] = b'0' + sig_u % 10;
+        pos += 1;
+        let s1 = b" pc=";
+        buf[pos..pos + s1.len()].copy_from_slice(s1);
+        pos += s1.len();
+        pos = write_hex_to_buf(&mut buf, pos, pc as u64);
+        let s2 = b" lr=";
+        buf[pos..pos + s2.len()].copy_from_slice(s2);
+        pos += s2.len();
+        pos = write_hex_to_buf(&mut buf, pos, lr as u64);
+        let s3 = b" far=";
+        buf[pos..pos + s3.len()].copy_from_slice(s3);
+        pos += s3.len();
+        pos = write_hex_to_buf(&mut buf, pos, far as u64);
+        let s4 = b" esr=";
+        buf[pos..pos + s4.len()].copy_from_slice(s4);
+        pos += s4.len();
+        pos = write_hex_to_buf(&mut buf, pos, esr);
+        buf[pos] = b'\n';
+        pos += 1;
+        raw_debug_write(&buf[..pos]);
+    }
+
     let Some((regs, host_tls)) = signal_handler_exit_guest(context, false) else {
+        // Diagnostic: log that we're NOT in guest, plus TPIDRRO_EL0
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            let tpidrro = unsafe { litebox_common_linux::read_tpidrro_el0() } as u64;
+            let mut buf = [0u8; 128];
+            let msg = b"[exc_sig_handler] not-in-guest tpidrro=";
+            buf[..msg.len()].copy_from_slice(msg);
+            let mut pos = msg.len();
+            pos = write_hex_to_buf(&mut buf, pos, tpidrro);
+            buf[pos] = b'\n';
+            pos += 1;
+            raw_debug_write(&buf[..pos]);
+        }
         return unsafe { next_signal_handler(signum, info, context) };
     };
+
+    // Diagnostic: log that we're in guest and routing to exception_callback
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        let tpidrro = unsafe { litebox_common_linux::read_tpidrro_el0() } as u64;
+        let mut buf = [0u8; 180];
+        let msg = b"[exc_sig_handler] in-guest, exc_cb=";
+        buf[..msg.len()].copy_from_slice(msg);
+        let mut pos = msg.len();
+        pos = write_hex_to_buf(
+            &mut buf,
+            pos,
+            exception_callback as *const () as usize as u64,
+        );
+        let s1 = b" host_tls=";
+        buf[pos..pos + s1.len()].copy_from_slice(s1);
+        pos += s1.len();
+        pos = write_hex_to_buf(&mut buf, pos, host_tls as u64);
+        let s2 = b" tpidrro=";
+        buf[pos..pos + s2.len()].copy_from_slice(s2);
+        pos += s2.len();
+        pos = write_hex_to_buf(&mut buf, pos, tpidrro);
+        buf[pos] = b'\n';
+        pos += 1;
+        raw_debug_write(&buf[..pos]);
+    }
+
     copy_signal_context(unsafe { &mut *regs }, context);
 
     // Ensure that `run_thread_arch` is linked in so that `exception_callback` is visible.
@@ -3370,6 +4147,36 @@ unsafe fn next_signal_handler(
     info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
+    // Diagnostic: log signal number and faulting PC.
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        let pc = unsafe { (*context.uc_mcontext).__ss.__pc as usize };
+        let far = unsafe { (*context.uc_mcontext).__es.__far as usize };
+        let mut buf = [0u8; 128];
+        let prefix = b"[next_signal_handler] sig=";
+        buf[..prefix.len()].copy_from_slice(prefix);
+        let mut pos = prefix.len();
+        // Write signum as decimal (1-2 digits)
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let sig_u = signum as u8;
+        if sig_u >= 10 {
+            buf[pos] = b'0' + sig_u / 10;
+            pos += 1;
+        }
+        buf[pos] = b'0' + sig_u % 10;
+        pos += 1;
+        let s1 = b" pc=";
+        buf[pos..pos + s1.len()].copy_from_slice(s1);
+        pos += s1.len();
+        pos = write_hex_to_buf(&mut buf, pos, pc as u64);
+        let s2 = b" far=";
+        buf[pos..pos + s2.len()].copy_from_slice(s2);
+        pos += s2.len();
+        pos = write_hex_to_buf(&mut buf, pos, far as u64);
+        buf[pos] = b'\n';
+        pos += 1;
+        raw_debug_write(&buf[..pos]);
+    }
     // On macOS, memory faults can be delivered as either SIGSEGV or SIGBUS
     // (e.g., NULL dereference on ARM64 is typically SIGBUS). Check both
     // for exception table recovery.
@@ -3388,13 +4195,20 @@ unsafe fn next_signal_handler(
         let next_sa = &NEXT_SA[signum.reinterpret_as_unsigned() as usize];
         match next_sa.sa_sigaction {
             libc::SIG_DFL => {
-                // Block this signal and raise.
-                let mut set: libc::sigset_t = core::mem::zeroed();
-                libc::sigemptyset(&raw mut set);
-                libc::sigaddset(&raw mut set, signum);
-                libc::sigprocmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut());
-                libc::raise(signum);
-                unreachable!()
+                // Terminate the process with the conventional exit code for
+                // an unhandled signal.  We use a raw SVC _exit() to bypass
+                // the patched shared cache gate — libc::raise would go
+                // through the gate, get intercepted, and return normally,
+                // which would hit unreachable!().
+                #[allow(clippy::cast_sign_loss)]
+                let exit_code = (128 + signum) as u64;
+                core::arch::asm!(
+                    "mov x0, {code}",
+                    "mov x16, #1",  // SYS_exit = 1
+                    "svc #0x80",
+                    code = in(reg) exit_code,
+                    options(noreturn),
+                );
             }
             libc::SIG_IGN => {}
             _ => {

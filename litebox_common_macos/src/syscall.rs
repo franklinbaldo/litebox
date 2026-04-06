@@ -92,6 +92,8 @@ pub mod nr {
     pub const KEVENT: usize = 363;
     pub const GETCWD: usize = 304;
     pub const FSGETPATH: usize = 427;
+    pub const ULOCK_WAIT: usize = 515;
+    pub const ULOCK_WAKE: usize = 516;
 }
 
 /// Mach trap numbers (negative x16 values, stored as positive constants).
@@ -491,6 +493,19 @@ pub enum MacosSyscallRequest {
         fsid: usize,
         objid: u64,
     },
+    /// `__ulock_wait(operation, addr, value, timeout_us)` — wait on a userspace lock.
+    UlockWait {
+        operation: u32,
+        addr: usize,
+        value: u64,
+        timeout_us: u32,
+    },
+    /// `__ulock_wake(operation, addr, wake_value)` — wake waiters on a userspace lock.
+    UlockWake {
+        operation: u32,
+        addr: usize,
+        wake_value: u64,
+    },
     Unknown {
         number: usize,
     },
@@ -851,6 +866,17 @@ impl MacosSyscallRequest {
                 bufsize: a1,
                 fsid: a2,
                 objid: a3 as u64,
+            },
+            nr::ULOCK_WAIT => MacosSyscallRequest::UlockWait {
+                operation: a0 as u32,
+                addr: a1,
+                value: a2 as u64,
+                timeout_us: a3 as u32,
+            },
+            nr::ULOCK_WAKE => MacosSyscallRequest::UlockWake {
+                operation: a0 as u32,
+                addr: a1,
+                wake_value: a2 as u64,
             },
             _ => MacosSyscallRequest::Unknown { number: nr_raw },
         }

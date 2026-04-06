@@ -5,6 +5,46 @@
 
 use crate::{Error, Result};
 
+/// Write a `u32` in little-endian to `dst[0..4]` using volatile stores.
+///
+/// This avoids calling `memcpy` (which may live on non-executable shared
+/// cache pages during copy-and-patch).
+#[inline]
+unsafe fn volatile_write_le_u32(dst: *mut u8, val: u32) {
+    let bytes = val.to_le_bytes();
+    unsafe {
+        core::ptr::write_volatile(dst, bytes[0]);
+        core::ptr::write_volatile(dst.add(1), bytes[1]);
+        core::ptr::write_volatile(dst.add(2), bytes[2]);
+        core::ptr::write_volatile(dst.add(3), bytes[3]);
+    }
+}
+
+/// Write a `u64` in little-endian to `dst[0..8]` using volatile stores.
+#[inline]
+unsafe fn volatile_write_le_u64(dst: *mut u8, val: u64) {
+    let bytes = val.to_le_bytes();
+    let mut i = 0usize;
+    while i < 8 {
+        unsafe {
+            core::ptr::write_volatile(dst.add(i), bytes[i]);
+        }
+        i += 1;
+    }
+}
+
+/// Copy `src[0..len]` to `dst[0..len]` using volatile byte stores.
+#[inline]
+unsafe fn volatile_copy(dst: *mut u8, src: *const u8, len: usize) {
+    let mut i = 0usize;
+    while i < len {
+        unsafe {
+            core::ptr::write_volatile(dst.add(i), core::ptr::read(src.add(i)));
+        }
+        i += 1;
+    }
+}
+
 /// `SVC #0x80` encoding: 0xD4001001
 pub const SVC_0X80: u32 = 0xD4001001;
 
@@ -644,57 +684,168 @@ pub fn hook_syscalls_aarch64(
     Ok(trampoline_data)
 }
 
-/// Patch SVC #0x80 sites in a code buffer, emitting stubs into a trampoline slice.
+/// Scan a code buffer for `SVC #0x80` instructions and return their locations.
 ///
-/// This is used by the mmap-hook at runtime to patch dylib code segments as
-/// they are mapped by dyld. Unlike `hook_syscalls_aarch64` which works on a
-/// complete Mach-O file, this works on raw code bytes at a known VA.
+/// This function allocates a `Vec<PatchSite>`.  Call it **before** replacing
+/// shared cache pages (while `malloc` still works), then pass the result to
+/// [`patch_code_segment_prescan`] which is allocation-free.
 ///
-/// # Arguments
-/// - `code`: Mutable code segment bytes. SVC instructions are replaced in-place.
-/// - `code_vaddr`: Virtual address where this code segment is mapped.
-/// - `trampoline`: Mutable pre-allocated buffer for trampoline stubs.
-/// - `trampoline_vaddr`: Virtual address of the trampoline buffer.
-/// - `cursor`: Current write offset in the trampoline buffer.
-/// - `syscall_entry`: Address of the shim's syscall entry point.
-///
-/// # Returns
-/// The new trampoline cursor (byte offset past last written data).
-///
-/// # Invariant
-/// `cursor == 0` signals that the trampoline header and shared SVC handler
-/// have not been emitted yet. Callers must pass the cursor returned from the
-/// previous call (or 0 for the first call) and must not reset it to 0.
 /// # Panics
 ///
-/// Panics if a 4-byte slice cannot be converted to `[u8; 4]`, which cannot
-/// happen because the loop only reads when at least 4 bytes remain.
+/// Panics if `code.len()` is not aligned to 4 bytes (each instruction is 4
+/// bytes on AArch64).
+pub fn scan_svc_sites(code: &[u8], code_vaddr: u64) -> Vec<PatchSite> {
+    let estimated = code.len() / 64;
+    let mut sites = Vec::with_capacity(estimated);
+    let mut off = 0usize;
+    while off + 4 <= code.len() {
+        let insn = u32::from_le_bytes(code[off..off + 4].try_into().unwrap());
+        if insn == SVC_0X80 {
+            sites.push(PatchSite {
+                file_offset: off,
+                vaddr: code_vaddr + off as u64,
+                kind: PatchKind::Svc,
+            });
+        }
+        off += 4;
+    }
+    sites
+}
+
+/// Emit the shared SVC handler directly into a fixed-size `&mut [u8]` slice.
+///
+/// This is the allocation-free counterpart of [`emit_shared_svc_handler_macos`].
+/// The caller must ensure `out.len() >= SHARED_SVC_HANDLER_SIZE`.
+///
+/// Returns `Ok(SHARED_SVC_HANDLER_SIZE)` on success.
 #[allow(clippy::cast_possible_wrap)]
-pub fn patch_code_segment(
+fn emit_shared_svc_handler_to_slice(
+    out: &mut [u8],
+    handler_vaddr: u64,
+    trampoline_base_addr: u64,
+) -> crate::Result<usize> {
+    if out.len() < SHARED_SVC_HANDLER_SIZE {
+        return Err(crate::Error::ParseError("handler slice too small".into()));
+    }
+    let mut pos = 0usize;
+    let mut insn_idx: usize = 0;
+    let insn_vaddr = |idx: usize| -> u64 { handler_vaddr + (idx as u64) * 4 };
+    let tls_table_vaddr = trampoline_base_addr + HEADER_TLS_TABLE_OFFSET as u64;
+
+    macro_rules! emit {
+        ($insn:expr) => {{
+            // Use volatile write to avoid calling memcpy (which may be on
+            // non-executable shared cache pages during copy-and-patch).
+            unsafe {
+                volatile_write_le_u32(out.as_mut_ptr().add(pos), $insn);
+            }
+            pos += 4;
+            insn_idx += 1;
+        }};
+    }
+
+    // [0] MRS X17, TPIDRRO_EL0
+    emit!(encode_mrs_tpidrro_el0(17));
+    // [1] LDR X16, [PC, #offset] — X16 = TLS table base
+    let ldr_tls_vaddr = insn_vaddr(insn_idx);
+    let ldr_tls_offset = tls_table_vaddr as i64 - ldr_tls_vaddr as i64;
+    let ldr_tls_insn = encode_ldr_literal(16, ldr_tls_offset).ok_or_else(|| {
+        crate::Error::DisassemblyFailure(
+            "LDR literal out of range for shared SVC handler TLS load".into(),
+        )
+    })?;
+    emit!(ldr_tls_insn);
+    // [2] .Lloop: LDR X18, [X16, #0]
+    let loop_idx = insn_idx;
+    emit!(encode_ldr_imm_unsigned(18, 16, 0).expect("offset 0 valid"));
+    // [3] CMN X18, #1
+    emit!(encode_cmn_imm(18, 1).expect("imm12=1 fits"));
+    // [4] B.EQ .Ltrap -> [17]
+    let trap_idx = 17usize;
+    let beq_trap_offset = (trap_idx as i64 - insn_idx as i64) * 4;
+    let beq_trap = encode_b_cond(COND_EQ, beq_trap_offset).ok_or_else(|| {
+        crate::Error::DisassemblyFailure("B.EQ offset out of range in shared SVC handler".into())
+    })?;
+    emit!(beq_trap);
+    // [5] CMP X18, X17
+    emit!(encode_cmp_reg(18, 17));
+    // [6] B.EQ .Lfound -> [9]
+    let found_idx = 9usize;
+    let beq_found_offset = (found_idx as i64 - insn_idx as i64) * 4;
+    let beq_found = encode_b_cond(COND_EQ, beq_found_offset).ok_or_else(|| {
+        crate::Error::DisassemblyFailure("B.EQ offset out of range in shared SVC handler".into())
+    })?;
+    emit!(beq_found);
+    // [7] ADD X16, X16, #16
+    emit!(encode_add_imm(16, 16, 16).expect("imm12=16 fits"));
+    // [8] B .Lloop -> [2]
+    let b_loop_offset = (loop_idx as i64 - insn_idx as i64) * 4;
+    let b_loop = encode_b(b_loop_offset).ok_or_else(|| {
+        crate::Error::DisassemblyFailure("B offset out of range in shared SVC handler loop".into())
+    })?;
+    emit!(b_loop);
+    // [9] .Lfound: LDR X16, [X16, #8]
+    debug_assert_eq!(insn_idx, found_idx);
+    emit!(encode_ldr_imm_unsigned(16, 16, 8).expect("offset 8 valid"));
+    // [10] LDR X17, [X16, #24]
+    emit!(encode_ldr_imm_unsigned(17, 16, 24).expect("offset 24 valid"));
+    // [11] STR X17, [SP, #24]
+    emit!(encode_str_imm_unsigned(17, 31, 24).expect("offset 24 valid"));
+    // [12] LDR X17, [SP, #32]
+    emit!(encode_ldr_imm_unsigned(17, 31, 32).expect("offset 32 valid"));
+    // [13] STR X17, [X16, #40]
+    emit!(encode_str_imm_unsigned(17, 16, 40).expect("offset 40 valid"));
+    // [14] STR X16, [SP, #40]
+    emit!(encode_str_imm_unsigned(16, 31, 40).expect("offset 40 valid"));
+    // [15] LDR X16, [PC, #offset_to_callback]
+    let ldr_cb_vaddr = insn_vaddr(insn_idx);
+    let callback_vaddr = trampoline_base_addr + HEADER_CALLBACK_OFFSET as u64;
+    let ldr_cb_offset = callback_vaddr as i64 - ldr_cb_vaddr as i64;
+    let ldr_cb_insn = encode_ldr_literal(16, ldr_cb_offset).ok_or_else(|| {
+        crate::Error::DisassemblyFailure(
+            "LDR literal out of range for shared SVC handler callback".into(),
+        )
+    })?;
+    emit!(ldr_cb_insn);
+    // [16] BR X16
+    emit!(encode_br(16));
+    // [17] .Ltrap: BRK #1
+    debug_assert_eq!(insn_idx, trap_idx);
+    emit!(encode_brk(1));
+
+    debug_assert_eq!(insn_idx, SHARED_SVC_HANDLER_INSN_COUNT);
+    debug_assert_eq!(pos, SHARED_SVC_HANDLER_SIZE);
+
+    Ok(pos)
+}
+
+/// Patch SVC sites using a pre-scanned site list.  **Allocation-free.**
+///
+/// This function must be called when `malloc` may not work (e.g. after
+/// `mmap(MAP_FIXED)` has replaced shared cache code pages with RW pages).
+/// All error returns use static strings (no `format!`).
+///
+/// `sites` — pre-scanned by [`scan_svc_sites`].
+/// `code`  — the (now-RW) code region with original content restored.
+/// `code_vaddr` — virtual address of the start of `code` (used only for
+///   computing `offset_in_code` from `PatchSite::vaddr`; pass the same
+///   value used when scanning).
+///
+/// # Panics
+///
+/// Panics if internal instruction encoding helpers fail on values that are
+/// statically guaranteed to fit (e.g. `encode_sub_sp_imm(48)`).
+///
+/// Returns the updated trampoline cursor.
+#[allow(clippy::cast_possible_wrap)]
+pub fn patch_code_segment_prescan(
     code: &mut [u8],
-    code_vaddr: u64,
     trampoline: &mut [u8],
     trampoline_vaddr: u64,
     mut cursor: usize,
     syscall_entry: u64,
+    sites: &[PatchSite],
 ) -> crate::Result<usize> {
-    // Scan for SVC #0x80
-    let mut sites = Vec::new();
-    {
-        let mut off = 0usize;
-        while off + 4 <= code.len() {
-            let insn = u32::from_le_bytes(code[off..off + 4].try_into().unwrap());
-            if insn == SVC_0X80 {
-                sites.push(PatchSite {
-                    file_offset: off,
-                    vaddr: code_vaddr + off as u64,
-                    kind: PatchKind::Svc,
-                });
-            }
-            off += 4;
-        }
-    }
-
     if sites.is_empty() {
         return Ok(cursor);
     }
@@ -707,85 +858,86 @@ pub fn patch_code_segment(
             ));
         }
         // Write syscall entry callback address at offset 0
-        trampoline[0..8].copy_from_slice(&syscall_entry.to_le_bytes());
+        unsafe {
+            volatile_write_le_u64(trampoline.as_mut_ptr(), syscall_entry);
+        }
         // TLS table ptr at offset 8 — left as zero, caller fills it in.
 
-        // Emit shared handler into a temp vec, then copy.
-        // The handler emitter uses handler_offset to compute PC-relative
-        // addresses, and also uses trampoline_base_addr for the header
-        // data pointers (callback + TLS table). We pass the real
-        // trampoline_vaddr as base and SHARED_SVC_HANDLER_OFFSET as the
-        // handler_offset, but we must pre-pad handler_vec so that the
-        // debug_assert (len - handler_offset == SHARED_SVC_HANDLER_SIZE)
-        // holds.
-        let mut handler_vec = vec![0u8; SHARED_SVC_HANDLER_OFFSET];
-        emit_shared_svc_handler_macos(
-            &mut handler_vec,
-            SHARED_SVC_HANDLER_OFFSET,
+        // Emit shared handler directly into the trampoline slice.
+        let handler_vaddr = trampoline_vaddr + SHARED_SVC_HANDLER_OFFSET as u64;
+        emit_shared_svc_handler_to_slice(
+            &mut trampoline
+                [SHARED_SVC_HANDLER_OFFSET..SHARED_SVC_HANDLER_OFFSET + SHARED_SVC_HANDLER_SIZE],
+            handler_vaddr,
             trampoline_vaddr,
         )?;
-        // Copy only the handler portion (skip the padding)
-        trampoline[SHARED_SVC_HANDLER_OFFSET..SHARED_SVC_HANDLER_OFFSET + SHARED_SVC_HANDLER_SIZE]
-            .copy_from_slice(&handler_vec[SHARED_SVC_HANDLER_OFFSET..]);
         cursor = SHARED_SVC_HANDLER_OFFSET + SHARED_SVC_HANDLER_SIZE;
     }
 
-    // Emit per-site SVC gates
-    for site in &sites {
+    // Emit per-site SVC gates — pure computation, no allocations.
+    for site in sites {
         let gate_vaddr = trampoline_vaddr + cursor as u64;
         let return_addr = site.vaddr + 4;
 
-        // Build the 7-instruction gate directly into a fixed buffer
+        // Build the 7-instruction gate directly into a fixed buffer.
+        // Use volatile writes to avoid memcpy calls (memcpy may be on
+        // non-executable shared cache pages during copy-and-patch).
         let mut gate = [0u8; SVC_GATE_SIZE];
+        let gp = gate.as_mut_ptr();
 
         // [0] SUB SP, SP, #48
-        gate[0..4].copy_from_slice(&encode_sub_sp_imm(48).expect("imm12=48 fits").to_le_bytes());
+        unsafe {
+            volatile_write_le_u32(gp, encode_sub_sp_imm(48).expect("imm12=48 fits"));
+        }
         // [1] STP X16, X17, [SP]
-        gate[4..8].copy_from_slice(
-            &encode_stp_offset(16, 17, 31, 0)
-                .expect("offset 0 valid")
-                .to_le_bytes(),
-        );
+        unsafe {
+            volatile_write_le_u32(
+                gp.add(4),
+                encode_stp_offset(16, 17, 31, 0).expect("offset 0 valid"),
+            );
+        }
         // [2] STR X30, [SP, #16]
-        gate[8..12].copy_from_slice(
-            &encode_str_imm_unsigned(30, 31, 16)
-                .expect("offset 16 valid")
-                .to_le_bytes(),
-        );
+        unsafe {
+            volatile_write_le_u32(
+                gp.add(8),
+                encode_str_imm_unsigned(30, 31, 16).expect("offset 16 valid"),
+            );
+        }
         // [3] STR X18, [SP, #32]
-        gate[12..16].copy_from_slice(
-            &encode_str_imm_unsigned(18, 31, 32)
-                .expect("offset 32 valid")
-                .to_le_bytes(),
-        );
+        unsafe {
+            volatile_write_le_u32(
+                gp.add(12),
+                encode_str_imm_unsigned(18, 31, 32).expect("offset 32 valid"),
+            );
+        }
         // [4] ADRP X30, <return_page>
         let adrp_vaddr_val = gate_vaddr + 4 * 4;
         let adrp_base = adrp_vaddr_val & !0xFFF;
         let return_page = return_addr & !0xFFF;
         let page_offset = (return_page as i64 - adrp_base as i64) >> 12;
         let adrp_insn = encode_adrp(30, page_offset).ok_or_else(|| {
-            crate::Error::DisassemblyFailure(format!(
-                "ADRP out of range for SVC at {:#x}",
-                site.vaddr
-            ))
+            crate::Error::DisassemblyFailure("ADRP out of range for SVC gate".into())
         })?;
-        gate[16..20].copy_from_slice(&adrp_insn.to_le_bytes());
+        unsafe {
+            volatile_write_le_u32(gp.add(16), adrp_insn);
+        }
         // [5] ADD X30, X30, #pageoff
         let pageoff = (return_addr & 0xFFF) as u16;
-        gate[20..24].copy_from_slice(
-            &encode_add_imm(30, 30, pageoff)
-                .expect("page offset fits imm12")
-                .to_le_bytes(),
-        );
+        unsafe {
+            volatile_write_le_u32(
+                gp.add(20),
+                encode_add_imm(30, 30, pageoff).expect("page offset fits imm12"),
+            );
+        }
         // [6] B <shared_svc_handler>
         let handler_vaddr = trampoline_vaddr + SHARED_SVC_HANDLER_OFFSET as u64;
         let b_to_handler = handler_vaddr as i64 - (gate_vaddr + 6 * 4) as i64;
         let b_insn = encode_b(b_to_handler).ok_or_else(|| {
-            crate::Error::DisassemblyFailure(format!(
-                "B to handler out of range for gate at {gate_vaddr:#x}"
-            ))
+            crate::Error::DisassemblyFailure("B to handler out of range for SVC gate".into())
         })?;
-        gate[24..28].copy_from_slice(&b_insn.to_le_bytes());
+        unsafe {
+            volatile_write_le_u32(gp.add(24), b_insn);
+        }
 
         // Copy gate into trampoline
         if cursor + SVC_GATE_SIZE > trampoline.len() {
@@ -793,17 +945,22 @@ pub fn patch_code_segment(
                 "trampoline buffer too small for gate".into(),
             ));
         }
-        trampoline[cursor..cursor + SVC_GATE_SIZE].copy_from_slice(&gate);
+        unsafe {
+            volatile_copy(
+                trampoline.as_mut_ptr().add(cursor),
+                gate.as_ptr(),
+                SVC_GATE_SIZE,
+            );
+        }
 
         // Patch original SVC → B <gate>
         let b_offset = gate_vaddr as i64 - site.vaddr as i64;
         let b_to_gate = encode_b(b_offset).ok_or_else(|| {
-            crate::Error::DisassemblyFailure(format!(
-                "B offset {b_offset:#x} out of ±128MB for SVC at {:#x}",
-                site.vaddr
-            ))
+            crate::Error::DisassemblyFailure("B offset out of ±128MB for SVC patch".into())
         })?;
-        code[site.file_offset..site.file_offset + 4].copy_from_slice(&b_to_gate.to_le_bytes());
+        unsafe {
+            volatile_write_le_u32(code.as_mut_ptr().add(site.file_offset), b_to_gate);
+        }
 
         cursor += SVC_GATE_SIZE;
     }

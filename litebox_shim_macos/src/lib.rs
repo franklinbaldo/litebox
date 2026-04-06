@@ -47,8 +47,35 @@ pub(crate) fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {
     use litebox::platform::DebugLogProvider as _;
 
     if cfg!(debug_assertions) {
-        let msg = alloc::format!("WARNING: unsupported: {args}\n");
-        litebox_platform_multiplex::platform().debug_log_print(&msg);
+        // Use a fixed-size stack buffer to avoid heap allocation via
+        // alloc::format!.  After install_shared_cache patches all SVC sites,
+        // malloc/free go through the patched gate and could cause re-entrant
+        // syscall_handler calls.
+        struct StackWriter {
+            buf: [u8; 512],
+            pos: usize,
+        }
+        impl core::fmt::Write for StackWriter {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let bytes = s.as_bytes();
+                let remaining = self.buf.len() - self.pos;
+                let to_copy = bytes.len().min(remaining);
+                self.buf[self.pos..self.pos + to_copy].copy_from_slice(&bytes[..to_copy]);
+                self.pos += to_copy;
+                Ok(())
+            }
+        }
+        let mut w = StackWriter {
+            buf: [0u8; 512],
+            pos: 0,
+        };
+        let _ = core::fmt::Write::write_str(&mut w, "WARNING: unsupported: ");
+        let _ = core::fmt::Write::write_fmt(&mut w, args);
+        let _ = core::fmt::Write::write_str(&mut w, "\n");
+        litebox_platform_multiplex::platform().debug_log_print(
+            // SAFETY: the buffer is UTF-8 because we only wrote valid UTF-8 slices.
+            unsafe { core::str::from_utf8_unchecked(&w.buf[..w.pos]) },
+        );
     }
 }
 
@@ -197,20 +224,59 @@ const MACOS_SIGBUS: i32 = 10;
 /// Hardware page size on macOS arm64 (16 KB).
 const HW_PAGE_SIZE: u64 = 16384;
 
-/// Debug-print to stderr (for `#![no_std]` crate).
-/// Uses the POSIX `write` syscall on fd 2.
-macro_rules! debug_eprintln {
-    ($($arg:tt)*) => {{
-        use core::fmt::Write;
-        struct StderrWriter;
-        impl Write for StderrWriter {
-            fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                unsafe { write(2, s.as_ptr(), s.len()) };
-                Ok(())
-            }
-        }
-        let _ = writeln!(StderrWriter, $($arg)*);
-    }};
+/// Diagnostic: write a short message to stderr via raw SVC #0x80 (bypasses libc).
+/// Only used temporarily during debugging — remove when done.
+#[allow(dead_code)]
+unsafe fn raw_diag(msg: &[u8]) {
+    // write(2 /*stderr*/, msg, len) via raw SVC #0x80
+    unsafe {
+        core::arch::asm!(
+            "mov x0, #2",
+            "mov x16, #4",       // SYS_write = 4 on macOS
+            "svc #0x80",
+            in("x1") msg.as_ptr(),
+            in("x2") msg.len(),
+            lateout("x0") _,
+            lateout("x16") _,
+            options(nostack)
+        );
+    }
+}
+
+/// Diagnostic: write a prefix followed by a u64 value in hex, then newline.
+#[allow(dead_code)]
+unsafe fn raw_diag_hex(prefix: &[u8], val: u64) {
+    unsafe { raw_diag(prefix); }
+    let mut buf = [b'0'; 18]; // "0x" + 16 hex digits
+    buf[0] = b'0';
+    buf[1] = b'x';
+    let hex = b"0123456789abcdef";
+    for i in 0..16 {
+        let nibble = ((val >> (60 - i * 4)) & 0xF) as usize;
+        buf[2 + i] = hex[nibble];
+    }
+    unsafe { raw_diag(&buf); }
+    unsafe { raw_diag(b"\n"); }
+}
+
+/// Diagnostic: write a prefix followed by a u32 decimal value, then newline.
+#[allow(dead_code)]
+unsafe fn raw_diag_u32(prefix: &[u8], val: u32) {
+    unsafe { raw_diag(prefix); }
+    if val == 0 {
+        unsafe { raw_diag(b"0\n"); }
+        return;
+    }
+    let mut buf = [0u8; 10];
+    let mut v = val;
+    let mut pos = 10;
+    while v > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    unsafe { raw_diag(&buf[pos..]); }
+    unsafe { raw_diag(b"\n"); }
 }
 
 /// A file-backed source for demand-paging shared cache pages.
@@ -439,7 +505,7 @@ impl<FS: ShimFS> MacosShim<FS> {
     /// `mprotect(RW)` → patch → `mprotect(RX)` without re-mapping.
     /// `demand_page_sources` provides file-backed data for SIGBUS demand-paging
     /// of shared cache pages that the host's shared region doesn't serve.
-    #[allow(clippy::missing_panics_doc, clippy::cast_possible_truncation)]
+    #[allow(clippy::missing_panics_doc, clippy::cast_possible_truncation, clippy::too_many_arguments)]
     pub fn install_shared_cache(
         &self,
         cache_base: u64,
@@ -448,6 +514,7 @@ impl<FS: ShimFS> MacosShim<FS> {
         patch_in_place_text: &[(u64, usize)],
         reset_in_place_data: &[(u64, Vec<u8>)],
         demand_page_sources: &[DemandPageSource],
+        sigtramp_addr: u64,
     ) {
         use litebox::mm::linux::PAGE_SIZE;
         use litebox::platform::{
@@ -479,6 +546,7 @@ impl<FS: ShimFS> MacosShim<FS> {
         all_extents.sort_unstable();
 
         // Pass 1: map ALL regions as RW at their fixed addresses.
+        unsafe { raw_diag(b"[diag] Pass 1: map regions\n"); }
         // For regions on macOS-on-macOS, the host process may already have
         // these regions mapped from its own shared cache.  Mapping failures
         // are silently ignored — the host data is the same as what we would
@@ -538,6 +606,7 @@ impl<FS: ShimFS> MacosShim<FS> {
         }
 
         // Pass 1.5: register VMAs for reserved extents (overlapping host cache
+        unsafe { raw_diag(b"[diag] Pass 1.5: register VMAs\n"); }
         // pages) so that the VMA system knows about them.  Without this,
         // mach_vm_protect / mprotect calls on these addresses fail with
         // "no mapping at this address" (InvalidRange → EACCES).
@@ -600,6 +669,7 @@ impl<FS: ShimFS> MacosShim<FS> {
         }
 
         // Pass 2: for each executable region that was successfully mapped,
+        unsafe { raw_diag(b"[diag] Pass 2: patch heap-backed exec\n"); }
         // find a nearby gap for the trampoline, patch SVC sites, and set R-X
         // permissions.
         for (idx, &(guest_addr, data, is_executable)) in regions.iter().enumerate() {
@@ -666,15 +736,28 @@ impl<FS: ShimFS> MacosShim<FS> {
                 unsafe { core::slice::from_raw_parts_mut(tramp_addr_usize as *mut u8, tramp_size) };
 
             let mut tramp_cursor = 0usize;
-            tramp_cursor = litebox_syscall_rewriter_macho::patch_code_segment(
+            let sites = litebox_syscall_rewriter_macho::scan_svc_sites(
                 code_to_patch,
                 guest_addr,
+            );
+            tramp_cursor = litebox_syscall_rewriter_macho::patch_code_segment_prescan(
+                code_to_patch,
                 tramp_slice,
                 tramp_addr,
                 tramp_cursor,
                 syscall_entry as u64,
+                &sites,
             )
-            .expect("install_shared_cache: patch_code_segment failed");
+            .expect("install_shared_cache: patch_code_segment_prescan failed");
+
+            // Write the TLS table address into the trampoline header at offset 8.
+            // patch_code_segment_prescan writes the syscall entry callback at offset 0
+            // but leaves offset 8 (TLS table ptr) as zero for the caller to fill.
+            if tramp_cursor > 0 {
+                let tls_addr = litebox_common_linux::HOST_TLS_TABLE_ADDR
+                    .load(core::sync::atomic::Ordering::Acquire);
+                tramp_slice[8..16].copy_from_slice(&tls_addr.to_le_bytes());
+            }
             let _ = tramp_cursor;
 
             // mprotect trampoline to R-X.
@@ -696,24 +779,419 @@ impl<FS: ShimFS> MacosShim<FS> {
             .expect("install_shared_cache: code mprotect failed");
         }
 
-        // Pass 3: patch-in-place text segments — SKIPPED.
+        // Pass 3: patch-in-place text segments.
         //
-        // On macOS-on-macOS, the shared cache code uses real macOS SVCs that
-        // execute correctly on the host kernel.  We skip SVC patching for these
-        // segments because:
-        //  1. The macOS kernel deadlocks on any attempt to modify shared region
-        //     pages (mach_vm_protect, mach_vm_allocate OVERWRITE, mach_vm_deallocate
-        //     all hang on shared cache __TEXT pages).
-        //  2. The shared cache SVCs are legitimate macOS syscalls that should
-        //     pass through to the host kernel (we only need to intercept
-        //     guest binary SVCs, which are patched in Pass 2).
-        let _ = &patch_in_place_text;
-        debug_eprintln!(
-            "  Pass 3: skipping {} patch-in-place segments (shared cache SVCs pass through to host)",
+        // These are host-resident shared cache __TEXT segments.  The macOS
+        // kernel maps them into a shared region whose pages cannot be modified
+        // in the parent process (mach_vm_protect / mach_vm_allocate OVERWRITE /
+        // mach_vm_deallocate all deadlock).  However, inside a forked child
+        // process the COW semantics allow us to replace them with private
+        // anonymous pages via mmap(MAP_FIXED).  We copy the original code
+        // content into our private pages, then patch SVCs exactly as Pass 2
+        // does for heap-backed executable regions.
+        //
+        // CRITICAL: We use raw syscalls (inline assembly) instead of litebox's
+        // do_mmap / sys_mprotect for page replacement in this pass.  The
+        // litebox MM layer's VMA tracking uses a BTree that allocates via the
+        // global allocator (malloc).  Between the mmap(MAP_FIXED) call (which
+        // zeroes the old shared cache pages) and copying the saved content back,
+        // any malloc call would try to execute code on the now-zeroed pages,
+        // causing a SIGBUS → panic → format → malloc → SIGBUS infinite loop.
+        // Raw syscalls avoid this by returning control directly to our code
+        // with no intermediate allocations.
+        //
+        // ALSO CRITICAL: Once libsystem_kernel's __TEXT is patched, ALL libc
+        // calls (malloc, free, write, mmap, etc.) are intercepted by the
+        // litebox gate.  The gate requires a TLS table entry for the current
+        // thread, which doesn't exist during install_shared_cache.  Therefore
+        // we split Pass 3 into two phases:
+        //   Phase A: pre-compute all allocations (saved buffers, SVC sites,
+        //            trampoline addresses) while libc still works.
+        //   Phase B: patch all segments using only raw syscalls and pre-allocated
+        //            data, with ZERO malloc/free calls.
+        //
+        // This ensures ALL guest SVCs — including those in shared cache
+        // library code — are intercepted by the litebox shim.
+
+        // Phase A: pre-compute everything while libc/malloc still works.
+        unsafe { raw_diag(b"[diag] Pass 3 Phase A: pre-compute\n"); }
+        #[allow(clippy::items_after_statements)]
+        struct SegmentPlan {
+            aligned_start: u64,
+            aligned_len: usize,
+            saved: alloc::vec::Vec<u8>,
+            svc_sites: alloc::vec::Vec<litebox_syscall_rewriter_macho::PatchSite>,
+            tramp_addr: u64,
+            tramp_size: usize,
+        }
+
+        let tls_table_addr =
+            litebox_common_linux::HOST_TLS_TABLE_ADDR.load(core::sync::atomic::Ordering::Acquire);
+
+        // `_sigtramp` is the kernel's re-entry point for signal delivery; it
+        // uses `sigreturn` (SVC #0x80) to return from the handler.  If we patch
+        // that SVC, every signal delivery would go through the gate → TLS lookup
+        // → sentinel → BRK → infinite loop.  Even during guest execution,
+        // `sigreturn` must pass through to the host kernel.
+        //
+        // The caller resolves `_sigtramp` before the shared cache is patched
+        // (via Mach-O symbol table walk) and passes it as `sigtramp_addr`.
+        // A value of 0 means the caller could not resolve it; in that case
+        // we skip segment exclusion (all SVC sites get patched).
+
+        // Step 1: Compute aligned ranges for all segments, tracking which
+        // original segments belong to each aligned range.  Shared cache
+        // __TEXT segments are densely packed, so adjacent segments separated
+        // by less than 16KB will produce overlapping 16KB-aligned ranges.
+        // We MUST merge these to avoid a later MAP_FIXED destroying pages
+        // that an earlier iteration already patched and mprotected.
+        #[allow(clippy::items_after_statements)]
+        struct AlignedEntry {
+            aligned_start: u64,
+            aligned_end: u64,
+            /// Original segments (guest_addr, len) within this aligned range.
+            /// Segments containing `_sigtramp` are excluded from SVC scanning
+            /// but their pages are still included in the MAP_FIXED range.
+            segments: alloc::vec::Vec<(u64, usize)>,
+        }
+
+        // Compute aligned range for each original segment and sort.
+        let mut entries: alloc::vec::Vec<AlignedEntry> = alloc::vec::Vec::with_capacity(
             patch_in_place_text.len(),
         );
+        for &(guest_addr, len) in patch_in_place_text {
+            let a_start = guest_addr & !(HW_PAGE_SIZE - 1);
+            let a_end = (guest_addr + len as u64 + HW_PAGE_SIZE - 1) & !(HW_PAGE_SIZE - 1);
+            entries.push(AlignedEntry {
+                aligned_start: a_start,
+                aligned_end: a_end,
+                segments: alloc::vec![(guest_addr, len)],
+            });
+        }
+        entries.sort_by_key(|e| e.aligned_start);
+
+        // Step 2: Merge overlapping / adjacent aligned ranges.
+        let mut merged: alloc::vec::Vec<AlignedEntry> =
+            alloc::vec::Vec::with_capacity(entries.len());
+        for entry in entries {
+            if let Some(last) = merged.last_mut()
+                && entry.aligned_start <= last.aligned_end
+            {
+                // Overlapping or adjacent — extend.
+                if entry.aligned_end > last.aligned_end {
+                    last.aligned_end = entry.aligned_end;
+                }
+                last.segments.extend_from_slice(&entry.segments);
+                continue;
+            }
+            merged.push(entry);
+        }
+
+        // Step 3: Build plans from merged ranges.
+        let mut plans: alloc::vec::Vec<SegmentPlan> =
+            alloc::vec::Vec::with_capacity(merged.len());
+
+        for me in &merged {
+            let aligned_start = me.aligned_start;
+            let aligned_len = (me.aligned_end - me.aligned_start) as usize;
+
+            // Save the original code content before replacing the pages.
+            let mut saved = alloc::vec![0u8; aligned_len];
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    aligned_start as *const u8,
+                    saved.as_mut_ptr(),
+                    aligned_len,
+                );
+            }
+
+            // Pre-scan for SVC sites in each constituent segment.
+            // Skip scanning in segments that contain `_sigtramp` — their
+            // SVCs must NOT be patched.  We still include their pages in
+            // the MAP_FIXED range so that overlapping segments work.
+            let mut svc_sites: alloc::vec::Vec<litebox_syscall_rewriter_macho::PatchSite> =
+                alloc::vec::Vec::new();
+            let mut total_code_len: usize = 0;
+            for &(guest_addr, len) in &me.segments {
+                // Skip SVC scanning for segments containing `_sigtramp`.
+                if sigtramp_addr >= guest_addr && sigtramp_addr < guest_addr + len as u64 {
+                    continue;
+                }
+                total_code_len += len;
+                let offset_in_merged = (guest_addr - aligned_start) as usize;
+                let mut sites = litebox_syscall_rewriter_macho::scan_svc_sites(
+                    &saved[offset_in_merged..offset_in_merged + len],
+                    guest_addr,
+                );
+                // Adjust file_offset to be relative to the full aligned
+                // region (instead of relative to this sub-segment).
+                for site in &mut sites {
+                    site.file_offset += offset_in_merged;
+                }
+                svc_sites.extend(sites);
+            }
+
+            // If no code to patch (all segments were sigtramp), we still
+            // need to MAP_FIXED + copy to avoid leaving a hole.  But we
+            // can skip the trampoline.  Use total_code_len for sizing.
+            let code_len_for_tramp = if total_code_len == 0 { aligned_len } else { total_code_len };
+
+            // Find trampoline gap while malloc still works.
+            let tramp_size =
+                ((code_len_for_tramp / (1024 * 1024)) + 1) * 4 * HW_PAGE_SIZE as usize;
+            let code_mid = aligned_start + aligned_len as u64 / 2;
+            let branch_range: u64 = 128 * 1024 * 1024;
+            let candidates = Self::find_trampoline_gap_candidates(
+                &all_extents,
+                code_mid,
+                branch_range,
+                tramp_size as u64,
+                HW_PAGE_SIZE,
+            );
+            let Some(&tramp_addr) = candidates.first() else {
+                continue;
+            };
+
+            // Record trampoline extent so future iterations avoid it.
+            let tramp_extent = (tramp_addr, tramp_addr + tramp_size as u64);
+            let insert_pos = all_extents
+                .binary_search_by_key(&tramp_addr, |e| e.0)
+                .unwrap_or_else(|i| i);
+            all_extents.insert(insert_pos, tramp_extent);
+
+            plans.push(SegmentPlan {
+                aligned_start,
+                aligned_len,
+                saved,
+                svc_sites,
+                tramp_addr,
+                tramp_size,
+            });
+        }
+
+        // Reset SIGBUS, SIGSEGV, SIGTRAP to SIG_DFL before Phase B,
+        // saving the old handlers so we can restore them afterward.
+        //
+        // The platform's exception_signal_handler calls libc::sigaltstack()
+        // internally. Once Phase B patches libsystem_kernel's SVC stubs,
+        // that sigaltstack call would go through the litebox gate (no TLS
+        // entry for the install thread) → BRK #1 → SIGTRAP → recursive
+        // signal delivery → infinite CPU loop.
+        //
+        // By resetting to SIG_DFL, any signal during Phase B will crash
+        // the forked child with a visible signal number (parent sees it
+        // via waitpid). This replaces an infinite hang with a diagnosable
+        // crash.
+        let dfl_sa = [0u8; 24];
+        let mut saved_sigbus = [0u8; 24];
+        let mut saved_sigsegv = [0u8; 24];
+        let mut saved_sigtrap = [0u8; 24];
+        unsafe {
+            raw_sigaction_set(10, &dfl_sa, &mut saved_sigbus);  // SIGBUS
+            raw_sigaction_set(11, &dfl_sa, &mut saved_sigsegv); // SIGSEGV
+            raw_sigaction_set(5, &dfl_sa, &mut saved_sigtrap);  // SIGTRAP
+        }
+
+        // Phase B: replace shared cache __TEXT pages with private copies.
+        //
+        // This is split into three sub-phases to avoid calling `memcpy`
+        // (which lives in the shared cache) from non-executable pages:
+        //
+        //   B.1: For ALL plans: MAP_FIXED(RW) + volatile copy-back.
+        //        After this, all shared cache code is on RW pages with
+        //        correct content but NOT executable (W^X).
+        //
+        //   B.2: For ALL plans: mprotect code pages to R-X.
+        //        After this, all shared cache code is executable again.
+        //        `memcpy` and other libc functions work normally (their
+        //        code is on R-X pages with correct bytes).
+        //
+        //   B.3: For each plan with SVC sites:
+        //        - MAP_FIXED trampoline (RW)
+        //        - mprotect code to RW
+        //        - patch SVCs (can call memcpy — other plans' code is R-X)
+        //        - mprotect code + trampoline to R-X
+        //
+        // This avoids the chicken-and-egg problem: patching code requires
+        // writing to code pages (RW), but the patching code itself calls
+        // `memcpy` which must be on executable pages (R-X).
+        unsafe { raw_diag(b"[diag] Pass 3 Phase B: raw-syscall patching\n"); }
+
+        // B.1: MAP_FIXED + volatile copy-back for ALL plans.
+        for plan in &plans {
+            let map_result = unsafe {
+                raw_mmap(
+                    plan.aligned_start as usize,
+                    plan.aligned_len,
+                    RAW_PROT_READ | RAW_PROT_WRITE,
+                    RAW_MAP_ANON | RAW_MAP_PRIVATE | RAW_MAP_FIXED,
+                )
+            };
+            match map_result {
+                Err(_) | Ok(0) => { continue; },
+                Ok(returned_addr) => {
+                    if returned_addr != plan.aligned_start as usize {
+                        continue;
+                    }
+                }
+            }
+
+            // Copy saved content back using volatile byte-by-byte loop.
+            // Cannot use `copy_nonoverlapping` (calls `memcpy` which is
+            // in the shared cache — those pages may already be RW/zeroed
+            // from a prior iteration's MAP_FIXED).
+            unsafe {
+                let src = plan.saved.as_ptr();
+                let dst = plan.aligned_start as usize as *mut u8;
+                let len = plan.aligned_len;
+                let mut i = 0usize;
+                while i < len {
+                    core::ptr::write_volatile(dst.add(i), core::ptr::read_volatile(src.add(i)));
+                    i += 1;
+                }
+            }
+        }
+        unsafe { raw_diag(b"[B]copy-all\n"); }
+
+        // B.2: mprotect ALL code pages to R-X.
+        // After this, `memcpy` and other shared cache functions are
+        // executable again (correct code on R-X pages).
+        for plan in &plans {
+            let _ = unsafe {
+                raw_mprotect(
+                    plan.aligned_start as usize,
+                    plan.aligned_len,
+                    RAW_PROT_READ | RAW_PROT_EXEC,
+                )
+            };
+        }
+        unsafe { raw_diag(b"[B]prot-rx\n"); }
+
+        // B.3: Patch SVCs and set up trampolines.
+        // At this point, all shared cache code is R-X.  For each plan
+        // that has SVC sites, we temporarily make its pages RW, patch,
+        // then restore R-X.  `memcpy` calls during patching are safe
+        // because other plans' code pages (including the one containing
+        // `memcpy`) remain R-X.
+        for (pidx, plan) in plans.iter().enumerate() {
+            if plan.svc_sites.is_empty() {
+                continue;
+            }
+
+            // Diagnostic: which plan are we patching?
+            unsafe {
+                raw_diag(b"[B3]p=");
+                raw_diag_u32(b"", pidx as u32);
+                raw_diag_hex(b" a=", plan.aligned_start);
+                raw_diag_hex(b" l=", plan.aligned_len as u64);
+                raw_diag_u32(b" svcs=", plan.svc_sites.len() as u32);
+                raw_diag(b"\n");
+            }
+
+            // Allocate trampoline pages (RW).
+            let tramp_result = unsafe {
+                raw_mmap(
+                    plan.tramp_addr as usize,
+                    plan.tramp_size,
+                    RAW_PROT_READ | RAW_PROT_WRITE,
+                    RAW_MAP_ANON | RAW_MAP_PRIVATE | RAW_MAP_FIXED,
+                )
+            };
+            let Ok(tramp_addr_usize) = tramp_result else { continue; };
+
+            // Make code pages RW for patching.
+            let _ = unsafe {
+                raw_mprotect(
+                    plan.aligned_start as usize,
+                    plan.aligned_len,
+                    RAW_PROT_READ | RAW_PROT_WRITE,
+                )
+            };
+            unsafe { raw_diag(b"[B3]rw-ok\n"); }
+
+            // Patch SVCs.  The full aligned region is passed as code;
+            // SVC site file_offsets are relative to its start.
+            let code_slice = unsafe {
+                core::slice::from_raw_parts_mut(
+                    plan.aligned_start as usize as *mut u8,
+                    plan.aligned_len,
+                )
+            };
+            let tramp_slice = unsafe {
+                core::slice::from_raw_parts_mut(tramp_addr_usize as *mut u8, plan.tramp_size)
+            };
+
+            let Ok(tramp_cursor) = litebox_syscall_rewriter_macho::patch_code_segment_prescan(
+                code_slice,
+                tramp_slice,
+                plan.tramp_addr,
+                0,
+                syscall_entry as u64,
+                &plan.svc_sites,
+            ) else {
+                unsafe { raw_diag(b"[B3]patch-ERR\n"); }
+                // Restore R-X even on error.
+                let _ = unsafe {
+                    raw_mprotect(
+                        plan.aligned_start as usize,
+                        plan.aligned_len,
+                        RAW_PROT_READ | RAW_PROT_EXEC,
+                    )
+                };
+                continue;
+            };
+            unsafe { raw_diag(b"[B3]patch-ok\n"); }
+
+            // Write TLS table address into trampoline header at offset 8.
+            // Use volatile writes to avoid calling memcpy (which may be on
+            // RW shared cache pages for this plan).
+            if tramp_cursor > 0 {
+                let tls_bytes = tls_table_addr.to_le_bytes();
+                unsafe {
+                    let dst = tramp_slice.as_mut_ptr().add(8);
+                    let mut i = 0usize;
+                    while i < 8 {
+                        core::ptr::write_volatile(dst.add(i), tls_bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+
+            // Restore code and trampoline to R-X.
+            let _ = unsafe {
+                raw_mprotect(
+                    plan.aligned_start as usize,
+                    plan.aligned_len,
+                    RAW_PROT_READ | RAW_PROT_EXEC,
+                )
+            };
+            let _ = unsafe {
+                raw_mprotect(tramp_addr_usize, plan.tramp_size, RAW_PROT_READ | RAW_PROT_EXEC)
+            };
+        }
+        unsafe { raw_diag(b"[B]patched\n"); }
+
+        // NOTE: Signal handlers remain SIG_DFL here.  They cannot be
+        // restored yet because the install thread has no TLS entry —
+        // if the platform's exception handler ran, its libc calls would
+        // go through the gate → BRK #1 → infinite loop.  The handlers
+        // are re-registered by the platform's run_thread after the TLS
+        // entry is populated.
+
+        // Drop all saved buffers.  This calls free() which may go through
+        // patched libsystem_kernel.  We cannot avoid this, but free()
+        // typically just marks memory as available without calling munmap
+        // for small allocations.  For large allocations (>= ~64KB), the
+        // allocator may call munmap.  Since libsystem_kernel is now patched,
+        // munmap would go through the gate → BRK #1.
+        //
+        // To avoid this, we intentionally leak the saved buffers.  The
+        // process will exit shortly after (via _exit in the forked child),
+        // so the kernel will reclaim all memory.
+        core::mem::forget(plans);
 
         // Pass 4: reset in-place __DATA segments to pristine state.
+        unsafe { raw_diag(b"[diag] Pass 4: reset __DATA\n"); }
         //
         // On macOS-on-macOS, the host process's dyld has already COW-ed shared
         // cache __DATA pages (e.g. setting sMemoryManagerInitialized = true).
@@ -721,17 +1199,11 @@ impl<FS: ShimFS> MacosShim<FS> {
         // We fix this by overwriting the host-dirty __DATA pages with pristine
         // data read from the subcache files.  Since these pages are RW, the
         // kernel will COW them automatically on write — no mprotect needed.
-        debug_eprintln!(
-            "  Pass 4: resetting {} __DATA segments to pristine state",
-            reset_in_place_data.len(),
-        );
+        //
+        // NOTE: No debug_eprintln! here — libsystem_kernel's SVCs are patched
+        // by Pass 3, so libc write() would go through the litebox gate (which
+        // has no TLS entry for this thread).
         for &(addr, ref data) in reset_in_place_data {
-            debug_eprintln!(
-                "    reset __DATA: {:#x}..{:#x} ({} bytes)",
-                addr,
-                addr + data.len() as u64,
-                data.len(),
-            );
             // SAFETY: addr points to a RW shared cache __DATA page that is
             // already mapped in our address space.  We are overwriting it with
             // pristine content of the same size.  The kernel will COW the page.
@@ -743,7 +1215,6 @@ impl<FS: ShimFS> MacosShim<FS> {
                 );
             }
         }
-        debug_eprintln!("  Pass 4: done");
 
         // Record the cache base address.
         self.0
@@ -755,6 +1226,7 @@ impl<FS: ShimFS> MacosShim<FS> {
                 .shared_cache_end
                 .store(max_end, Ordering::Release);
         }
+        unsafe { raw_diag(b"[diag] install_shared_cache done\n"); }
     }
 
     /// Find page-aligned gap candidates within `±branch_range` of `code_mid`
@@ -1368,4 +1840,150 @@ impl<FS: ShimFS> Task<FS> {
         let result = self.do_syscall(request, ctx);
         litebox_common_macos::syscall::set_syscall_return(ctx, result);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Raw macOS aarch64 syscall helpers for Pass 3.
+//
+// These bypass the litebox MM layer (and its VMA-tracking BTree allocations)
+// to avoid triggering malloc on shared cache pages that may be temporarily
+// zeroed during the copy-and-patch replacement.
+// ---------------------------------------------------------------------------
+
+/// macOS BSD mmap protection flags (from <sys/mman.h>).
+const RAW_PROT_READ: i32 = 0x01;
+const RAW_PROT_WRITE: i32 = 0x02;
+const RAW_PROT_EXEC: i32 = 0x04;
+
+/// macOS BSD mmap flags (from <sys/mman.h>).
+const RAW_MAP_ANON: i32 = 0x1000;
+const RAW_MAP_PRIVATE: i32 = 0x0002;
+const RAW_MAP_FIXED: i32 = 0x0010;
+
+/// macOS BSD syscall numbers (from <sys/syscall.h>).
+const SYS_MMAP: u64 = 197;
+const SYS_MPROTECT: u64 = 74;
+
+/// Raw `mmap(addr, len, prot, flags, fd=-1, offset=0)` via inline assembly.
+///
+/// Returns `Ok(mapped_address)` or `Err(errno)`.
+///
+/// # Safety
+///
+/// Caller must ensure arguments are valid for the mmap syscall.
+#[allow(clippy::cast_sign_loss)] // Intentional: kernel ABI uses unsigned registers for signed args.
+#[allow(clippy::cast_possible_truncation)] // aarch64-only: usize == u64, errno fits i32.
+unsafe fn raw_mmap(addr: usize, len: usize, prot: i32, flags: i32) -> Result<usize, i32> {
+    let ret: u64;
+    let err_flag: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov x16, {syscall_nr}",
+            "svc #0x80",
+            // After svc: x0 = return value, carry flag set on error.
+            // Use cset to capture the carry flag (C = bit 29 of NZCV).
+            "cset {err}, cs",
+            syscall_nr = in(reg) SYS_MMAP,
+            // x0 = addr, x1 = len, x2 = prot, x3 = flags, x4 = fd, x5 = offset
+            in("x0") addr as u64,
+            in("x1") len as u64,
+            in("x2") prot as u64,
+            in("x3") flags as u64,
+            in("x4") u64::MAX,         // fd = -1 (MAP_ANON)
+            in("x5") 0u64,             // offset = 0
+            err = out(reg) err_flag,
+            lateout("x0") ret,
+            // x16 is clobbered by the syscall number.
+            out("x16") _,
+        );
+    }
+    if err_flag != 0 {
+        Err(ret as i32)
+    } else {
+        Ok(ret as usize)
+    }
+}
+
+/// Raw `mprotect(addr, len, prot)` via inline assembly.
+///
+/// Returns `Ok(())` or `Err(errno)`.
+///
+/// # Safety
+///
+/// Caller must ensure arguments are valid for the mprotect syscall.
+#[allow(clippy::cast_sign_loss)] // Intentional: kernel ABI uses unsigned registers for signed args.
+#[allow(clippy::cast_possible_truncation)] // aarch64-only: errno fits i32.
+unsafe fn raw_mprotect(addr: usize, len: usize, prot: i32) -> Result<(), i32> {
+    let ret: u64;
+    let err_flag: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov x16, {syscall_nr}",
+            "svc #0x80",
+            "cset {err}, cs",
+            syscall_nr = in(reg) SYS_MPROTECT,
+            in("x0") addr as u64,
+            in("x1") len as u64,
+            in("x2") prot as u64,
+            err = out(reg) err_flag,
+            lateout("x0") ret,
+            out("x16") _,
+        );
+    }
+    if err_flag != 0 {
+        Err(ret as i32)
+    } else {
+        Ok(())
+    }
+}
+
+/// macOS BSD syscall number for `sigaction`.
+const SYS_SIGACTION: u64 = 46;
+
+/// Reset signal `signum` to `SIG_DFL` via raw `sigaction` syscall.
+///
+/// Uses a zeroed `struct __sigaction` (24 bytes) on the stack, which sets
+/// `sa_handler = SIG_DFL (0)`, `sa_tramp = NULL`, `sa_mask = 0`, `sa_flags = 0`.
+///
+/// # Safety
+///
+/// Caller must ensure `signum` is a valid signal number (1..31).
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(dead_code)]
+unsafe fn raw_sigaction_dfl(signum: i32) {
+    let mut old_sa: [u8; 24] = [0; 24];
+    unsafe { raw_sigaction_set(signum, &[0u8; 24], &mut old_sa); }
+}
+
+/// Set a signal action via raw `SVC #0x80`, saving the old action.
+///
+/// `new_sa` and `old_sa` must both point to valid 24-byte `__sigaction`
+/// structs.
+#[allow(clippy::cast_sign_loss)]
+unsafe fn raw_sigaction_set(signum: i32, new_sa: &[u8; 24], old_sa: &mut [u8; 24]) {
+    // struct __sigaction layout (aarch64 macOS):
+    //   [0..8]  sa_handler  (SIG_DFL = 0)
+    //   [8..16] sa_tramp    (NULL)
+    //   [16..20] sa_mask    (0)
+    //   [20..24] sa_flags   (0)
+    let ret: u64;
+    let err_flag: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov x16, {syscall_nr}",
+            "svc #0x80",
+            "cset {err}, cs",
+            syscall_nr = in(reg) SYS_SIGACTION,
+            in("x0") signum as u64,
+            in("x1") new_sa.as_ptr() as u64,
+            in("x2") old_sa.as_mut_ptr() as u64,
+            err = out(reg) err_flag,
+            lateout("x0") ret,
+            out("x16") _,
+        );
+    }
+    if err_flag != 0 {
+        unsafe { raw_diag(b"[B]sigaction-fail\n"); }
+    }
+    let _ = ret;
 }

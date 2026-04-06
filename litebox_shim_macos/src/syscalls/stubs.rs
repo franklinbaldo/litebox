@@ -629,4 +629,103 @@ impl<FS: ShimFS> Task<FS> {
         );
         Err(Errno::ENOTSUP)
     }
+
+    /// Handle `__ulock_wait(operation, addr, value, timeout_us)` — wait on a userspace lock.
+    ///
+    /// In a single-threaded guest, no other thread can wake us, so blocking
+    /// would deadlock. Instead we implement compare-and-wait semantics:
+    ///
+    /// - If `*addr != value`, return 0 (spurious wakeup — value already changed).
+    /// - If `*addr == value`, also return 0 (pretend we were woken) to prevent
+    ///   the caller from blocking forever. The caller will retry its CAS loop
+    ///   and either succeed or call ulock_wait again.
+    ///
+    /// This is sufficient for dyld bootstrap where `os_unfair_lock` contention
+    /// is caused by our NOP of `findAndRunAllInitializers`, leaving an internal
+    /// lock in a "locked" state that was never actually contended.
+    #[allow(clippy::unnecessary_wraps)]
+    pub(crate) fn sys_ulock_wait(
+        &self,
+        operation: u32,
+        addr: usize,
+        value: u64,
+        timeout_us: u32,
+    ) -> Result<usize, Errno> {
+        const UL_COMPARE_AND_WAIT: u32 = 1;
+        const UL_COMPARE_AND_WAIT_SHARED: u32 = 3;
+        const UL_COMPARE_AND_WAIT64: u32 = 5;
+        const UL_COMPARE_AND_WAIT64_SHARED: u32 = 6;
+
+        // Strip flags from operation to get the base operation type.
+        let op = operation & 0x0000_FFFF;
+
+        match op {
+            UL_COMPARE_AND_WAIT | UL_COMPARE_AND_WAIT_SHARED => {
+                // 32-bit compare-and-wait: read the 32-bit value at addr.
+                let ptr: crate::ConstPtr<u32> = crate::ConstPtr::from_usize(addr);
+                let current = u64::from(ptr.read_at_offset(0).unwrap_or(0));
+                if current == value {
+                    // Value matches — lock is still held. In single-threaded mode,
+                    // no other thread will ever unlock it. Force-clear the lock word
+                    // to 0 (unlocked) so the caller's next CAS attempt succeeds.
+                    let wptr: MutPtr<u32> = MutPtr::from_usize(addr);
+                    let _ = wptr.write_at_offset(0, 0_u32);
+                    log_unsupported!(
+                        "ulock_wait(op={operation:#x}, addr={addr:#x}, value={value:#x}, \
+                         timeout={timeout_us}): force-unlocked for single-threaded guest"
+                    );
+                } else {
+                    // Value already changed — spurious wakeup.
+                    log_unsupported!(
+                        "ulock_wait(op={operation:#x}, addr={addr:#x}, value={value:#x}, \
+                         timeout={timeout_us}): current={current:#x} != value, spurious wakeup"
+                    );
+                }
+                Ok(0)
+            }
+            UL_COMPARE_AND_WAIT64 | UL_COMPARE_AND_WAIT64_SHARED => {
+                // 64-bit compare-and-wait: read the 64-bit value at addr.
+                let ptr: crate::ConstPtr<u64> = crate::ConstPtr::from_usize(addr);
+                let current = ptr.read_at_offset(0).unwrap_or(0);
+                if current == value {
+                    // Force-clear for single-threaded guest.
+                    let wptr: MutPtr<u64> = MutPtr::from_usize(addr);
+                    let _ = wptr.write_at_offset(0, 0_u64);
+                    log_unsupported!(
+                        "ulock_wait64(op={operation:#x}, addr={addr:#x}, value={value:#x}, \
+                         timeout={timeout_us}): force-unlocked for single-threaded guest"
+                    );
+                } else {
+                    log_unsupported!(
+                        "ulock_wait64(op={operation:#x}, addr={addr:#x}, value={value:#x}, \
+                         timeout={timeout_us}): current={current:#x} != value, spurious wakeup"
+                    );
+                }
+                Ok(0)
+            }
+            _ => {
+                log_unsupported!(
+                    "ulock_wait(op={operation:#x}, addr={addr:#x}, value={value:#x}, \
+                     timeout={timeout_us}): unsupported operation"
+                );
+                Err(Errno::ENOTSUP)
+            }
+        }
+    }
+
+    /// Handle `__ulock_wake(operation, addr, wake_value)` — wake waiters on a userspace lock.
+    ///
+    /// In a single-threaded guest, there are no waiters to wake. Return 0 (success).
+    #[allow(clippy::unnecessary_wraps)]
+    pub(crate) fn sys_ulock_wake(
+        &self,
+        operation: u32,
+        addr: usize,
+        wake_value: u64,
+    ) -> Result<usize, Errno> {
+        log_unsupported!(
+            "ulock_wake(op={operation:#x}, addr={addr:#x}, wake_value={wake_value:#x}): no-op"
+        );
+        Ok(0)
+    }
 }

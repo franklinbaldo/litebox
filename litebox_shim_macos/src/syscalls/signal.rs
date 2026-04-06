@@ -6,8 +6,8 @@
 use core::sync::atomic::Ordering;
 use litebox::platform::RawConstPointer as _;
 use litebox::platform::RawMutPointer as _;
-use litebox_common_macos::PtRegs;
 use litebox_common_macos::errno::Errno;
+use litebox_common_macos::PtRegs;
 
 use crate::{ConstPtr, MutPtr, ShimFS, Task};
 
@@ -375,6 +375,15 @@ impl<FS: ShimFS> Task<FS> {
     /// This modifies `ctx` directly and must NOT be followed by `set_syscall_return`.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     pub(crate) fn sys_sigreturn(&self, ctx: &mut PtRegs, uctx_addr: usize) {
+        // Log caller context BEFORE overwriting.
+        log_unsupported!(
+            "sigreturn: caller pc={:#x} lr={:#x} sp={:#x} uctx={:#x}",
+            ctx.pc,
+            ctx.regs[30],
+            ctx.sp,
+            uctx_addr
+        );
+
         // 1. Read uc_sigmask (4 bytes at offset 4 in ucontext_t).
         let sigmask_ptr: ConstPtr<u32> = ConstPtr::from_usize(uctx_addr + UCTX_SIGMASK);
         let sigmask = sigmask_ptr
@@ -388,6 +397,12 @@ impl<FS: ShimFS> Task<FS> {
         let mcontext_addr = mctx_ptr_ptr
             .read_at_offset(0)
             .expect("sigreturn: read uc_mcontext") as usize;
+
+        log_unsupported!(
+            "sigreturn: mcontext_addr={:#x} ss_addr={:#x}",
+            mcontext_addr,
+            mcontext_addr + MCTX_SS_BASE
+        );
 
         // 3. Restore registers from mcontext.__ss (272 bytes at offset 16).
         let ss_addr = mcontext_addr + MCTX_SS_BASE;
@@ -418,5 +433,15 @@ impl<FS: ShimFS> Task<FS> {
         // cpsr → pstate
         let cpsr_ptr: ConstPtr<u32> = ConstPtr::from_usize(ss_addr + SS_CPSR);
         ctx.pstate = cpsr_ptr.read_at_offset(0).expect("sigreturn: read cpsr") as usize;
+
+        log_unsupported!(
+            "sigreturn: restored pc={:#x} sp={:#x} lr={:#x} x0={:#x} x16={:#x} fp={:#x}",
+            ctx.pc,
+            ctx.sp,
+            ctx.regs[30],
+            ctx.regs[0],
+            ctx.regs[16],
+            ctx.regs[29]
+        );
     }
 }

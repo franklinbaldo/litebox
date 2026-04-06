@@ -310,6 +310,17 @@ impl<FS: ShimFS> Task<FS> {
                 nevents,
                 timeout,
             } => kqueue::sys_kevent(self, kq, changelist, nchanges, eventlist, nevents, timeout),
+            MacosSyscallRequest::UlockWait {
+                operation,
+                addr,
+                value,
+                timeout_us,
+            } => self.sys_ulock_wait(operation, addr, value, timeout_us),
+            MacosSyscallRequest::UlockWake {
+                operation,
+                addr,
+                wake_value,
+            } => self.sys_ulock_wake(operation, addr, wake_value),
         }
     }
 }

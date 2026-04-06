@@ -260,16 +260,17 @@ impl<FS: ShimFS> Task<FS> {
             )
         };
 
-        let new_cursor = litebox_syscall_rewriter_macho::patch_code_segment(
+        let sites = litebox_syscall_rewriter_macho::scan_svc_sites(&code_buf, mapped_addr as u64);
+        let new_cursor = litebox_syscall_rewriter_macho::patch_code_segment_prescan(
             &mut code_buf,
-            mapped_addr as u64,
             trampoline_slice,
             state.trampoline_addr as u64,
             state.trampoline_cursor,
             syscall_entry as u64,
+            &sites,
         )
         .map_err(|e| {
-            log_unsupported!("patch_code_segment failed for fd {fd}: {e}");
+            log_unsupported!("patch_code_segment_prescan failed for fd {fd}: {e}");
             Errno::EINVAL
         })?;
 

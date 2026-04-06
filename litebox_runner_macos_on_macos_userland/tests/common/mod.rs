@@ -328,6 +328,12 @@ pub fn run_macho_dynamic(
     // Serialize: only one test can use the platform + TLS table at a time.
     let _guard = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
+    // Resolve `_sigtramp` in the parent process before fork().
+    // dlsym is NOT async-signal-safe and may deadlock or return NULL in a
+    // forked child of a multi-threaded process.  The resolved address is
+    // stored in a global AtomicUsize and inherited by the child via COW.
+    litebox_platform_macos_userland::get_sigtramp_addr();
+
     // Set up a shared-memory region for the child to write the exit code.
     // We use mmap(MAP_SHARED|MAP_ANON) so both parent and child see the
     // same page.
@@ -473,29 +479,6 @@ fn run_macho_dynamic_inner(
     shim_builder.set_fs(fs);
     let shim = shim_builder.build();
 
-    // Install shared cache regions into guest address space.
-    // Global mapping regions were already mmap'd at guest addresses by
-    // collect_regions (MAP_FIXED).  Only heap-backed regions (dylib segments,
-    // patched header) go through install_shared_cache for SVC patching.
-    // The preinstalled extents are passed as reserved_extents so the
-    // trampoline allocator avoids overlapping them.
-    let regions_for_shim: Vec<(u64, &[u8], bool)> = cache
-        .regions
-        .iter()
-        .map(|r| {
-            let is_exec = matches!(r.prot, shared_cache::Protection::ReadExecute);
-            (r.guest_addr, r.data(), is_exec)
-        })
-        .collect();
-    shim.install_shared_cache(
-        cache.host_cache_base,
-        &regions_for_shim,
-        &cache.preinstalled_extents,
-        &cache.patch_in_place_text,
-        &cache.reset_in_place_data,
-        &cache.demand_page_sources,
-    );
-
     // Use absolute path for argv[0] so dyld can resolve executable_path.
     let exe_path = format!("/usr/bin/{exe_name}");
     let mut argv_cstrings: Vec<std::ffi::CString> = Vec::with_capacity(argv.len());
@@ -505,9 +488,16 @@ fn run_macho_dynamic_inner(
     }
     let envp = vec![std::ffi::CString::new("PATH=/bin").unwrap()];
 
-    // Read dyld from the host filesystem
+    // Read dyld from the host filesystem.  This MUST happen before
+    // install_shared_cache, which patches libsystem_kernel's SVCs —
+    // after that, libc calls (read/write/malloc/etc.) are intercepted
+    // by the shim and would crash because no TLS entry or TCB exists
+    // for the install thread.
     let dyld_data = std::fs::read("/usr/lib/dyld").expect("failed to read /usr/lib/dyld");
 
+    // Load the program (parses Mach-O, allocates stack, etc.) before
+    // install_shared_cache for the same reason: load_program uses the
+    // allocator and libc internally.
     let program = shim
         .load_program(effective_binary, argv_cstrings, envp, Some(&dyld_data))
         .expect("load_program failed");
@@ -518,8 +508,65 @@ fn run_macho_dynamic_inner(
         mut initial_ctx,
     } = program;
 
+    // Install shared cache regions into guest address space.
+    // Global mapping regions were already mmap'd at guest addresses by
+    // collect_regions (MAP_FIXED).  Only heap-backed regions (dylib segments,
+    // patched header) go through install_shared_cache for SVC patching.
+    // The preinstalled extents are passed as reserved_extents so the
+    // trampoline allocator avoids overlapping them.
+    //
+    // *** THIS MUST BE THE LAST STEP BEFORE run_thread. ***
+    // Pass 3 patches libsystem_kernel's SVC stubs, so after this call
+    // ANY libc call (malloc, write, read, etc.) will be intercepted by
+    // the litebox gate.  The gate requires a valid TLS table entry and
+    // TCB for the current thread, which only exist inside run_thread.
+    let regions_for_shim: Vec<(u64, &[u8], bool)> = cache
+        .regions
+        .iter()
+        .map(|r| {
+            let is_exec = matches!(r.prot, shared_cache::Protection::ReadExecute);
+            (r.guest_addr, r.data(), is_exec)
+        })
+        .collect();
+    eprintln!(">>> about to install_shared_cache");
+    shim.install_shared_cache(
+        cache.host_cache_base,
+        &regions_for_shim,
+        &cache.preinstalled_extents,
+        &cache.patch_in_place_text,
+        &cache.reset_in_place_data,
+        &cache.demand_page_sources,
+        litebox_platform_macos_userland::get_sigtramp_addr() as u64,
+    );
+
+    // NO LIBC CALLS BETWEEN install_shared_cache AND run_thread.
+    // libsystem_kernel's SVCs are now patched — any libc call would
+    // go through the litebox gate, which has no TLS entry for this
+    // thread and would hit BRK #1 → SIGTRAP → hang.
+    //
+    // Use raw inline asm write(2, ...) for any post-install diagnostics.
+    unsafe {
+        let msg = b">>> about to run_thread\n";
+        core::arch::asm!(
+            "mov x0, #2", "mov x1, {buf}", "mov x2, {len}",
+            "mov x16, #0x4", "movk x16, #0x200, lsl #16", "svc #0x80",
+            buf = in(reg) msg.as_ptr(), len = in(reg) msg.len(),
+            out("x0") _, out("x1") _, out("x2") _, out("x16") _,
+            clobber_abi("C"),
+        );
+    }
     unsafe {
         litebox_platform_macos_userland::run_thread(entrypoints, &mut initial_ctx);
+    }
+    unsafe {
+        let msg = b">>> run_thread returned\n";
+        core::arch::asm!(
+            "mov x0, #2", "mov x1, {buf}", "mov x2, {len}",
+            "mov x16, #0x4", "movk x16, #0x200, lsl #16", "svc #0x80",
+            buf = in(reg) msg.as_ptr(), len = in(reg) msg.len(),
+            out("x0") _, out("x1") _, out("x2") _, out("x16") _,
+            clobber_abi("C"),
+        );
     }
 
     process.wait()
