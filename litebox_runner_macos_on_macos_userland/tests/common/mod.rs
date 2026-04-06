@@ -471,6 +471,18 @@ fn run_macho_dynamic_inner(
         let _ = fs.mkdir("/usr", mode);
         let _ = fs.mkdir("/usr/bin", mode);
 
+        // Populate /tmp with a few files so /bin/ls exercises a non-empty directory.
+        for name in ["hello.txt", "world.txt", "data.bin"] {
+            let path = format!("/tmp/{name}");
+            let fd = fs
+                .open(&path, OFlags::CREAT | OFlags::WRONLY, mode)
+                .expect("create test file in /tmp");
+            fs.write(&fd, b"test content
+", None)
+                .expect("write test file data");
+            fs.close(&fd).expect("close test file");
+        }
+
         // Write the rewritten binary into the in-mem FS so dyld can open it.
         let exe_path = format!("/usr/bin/{exe_name}");
         let fd = fs
