@@ -306,6 +306,12 @@ impl MicroState {
         false
     }
 
+    /// Look up a file fd and return the full entry (immutable).
+    /// Used by the Tier 2 file-backed mmap path.
+    pub fn find_file_fd_entry(&self, fd: i32) -> Option<&FileFdEntry> {
+        self.file_fds.iter().flatten().find(|e| e.fd == fd)
+    }
+
     /// Find a file fd's shmem offset.
     pub fn find_file_fd(&self, fd: i32) -> Option<u32> {
         for e in self.file_fds.iter().flatten() {

@@ -1191,6 +1191,108 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
         // Write case or pid != 0: fall through to central round-trip.
     }
 
+    // Tier 2 file-backed mmap: for tar files with aligned_offset,
+    // execute locally and notify central afterward.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    if nr == libc::SYS_mmap as u32 {
+        let addr = args.args[0];
+        let len = args.args[1] as usize;
+        let prot = args.args[2] as i32;
+        let flags = args.args[3] as i32;
+        let fd = args.args[4] as i32;
+        let file_offset = args.args[5] as usize;
+
+        let is_anon = flags & libc::MAP_ANONYMOUS != 0;
+        let is_fixed = flags & libc::MAP_FIXED != 0;
+
+        if !is_anon && fd >= 0 && len > 0 {
+            let state = unsafe { crate::state::global_micro_state() };
+            if let Some(entry) = state.find_file_fd_entry(fd)
+                && entry.aligned_offset != 0
+            {
+                    let aligned_len = (len + 0xFFF) & !0xFFF;
+
+                    // Pick address: bump allocator for addr=0 && !MAP_FIXED,
+                    // or use provided addr for MAP_FIXED / explicit addr.
+                    let (map_addr, used_bump) = if addr == 0 && !is_fixed {
+                        let bump_end = state.mmap_bump_end;
+                        if bump_end != 0 {
+                            let next = state
+                                .mmap_bump_next
+                                .fetch_add(aligned_len, core::sync::atomic::Ordering::Relaxed);
+                            if next + aligned_len <= bump_end {
+                                (next, true)
+                            } else {
+                                state
+                                    .mmap_bump_next
+                                    .fetch_sub(aligned_len, core::sync::atomic::Ordering::Relaxed);
+                                (0usize, false) // Bump exhausted — fall through to central
+                            }
+                        } else {
+                            (0usize, false)
+                        }
+                    } else if is_fixed || addr != 0 {
+                        (addr as usize, false)
+                    } else {
+                        (0usize, false)
+                    };
+
+                    if map_addr != 0 || is_fixed {
+                        let memfd_offset = entry.aligned_offset + file_offset as u64;
+
+                        let result = unsafe {
+                            crate::raw_syscall::mmap(
+                                map_addr,
+                                aligned_len,
+                                prot,
+                                libc::MAP_PRIVATE | libc::MAP_FIXED,
+                                state.aligned_fd,
+                                memfd_offset as i64,
+                            )
+                        };
+
+                        if crate::raw_syscall::is_error(result) {
+                            if used_bump {
+                                state
+                                    .mmap_bump_next
+                                    .fetch_sub(aligned_len, core::sync::atomic::Ordering::Relaxed);
+                            }
+                            return result;
+                        }
+
+                        // Handle trampoline for the initial (non-MAP_FIXED) mmap.
+                        if !is_fixed && entry.tar_len >= 32 {
+                            unsafe {
+                                handle_tier2_trampoline(state, entry, map_addr);
+                            }
+                        }
+
+                        // Notify central about the mapping (fire-and-forget).
+                        let notify_args = [
+                            map_addr as u64,
+                            aligned_len as u64,
+                            #[allow(clippy::cast_sign_loss)]
+                            {
+                                prot as u64
+                            },
+                            u64::from(flags.cast_unsigned()),
+                            0,
+                            0,
+                        ];
+                        unsafe {
+                            notify_central(
+                                tls,
+                                litebox_ipc::messages::MSG_NOTIFY_MMAP,
+                                &notify_args,
+                            );
+                        }
+                        return result;
+                    }
+                    // map_addr == 0 && bump exhausted: fall through to central
+            }
+        }
+    }
+
     // Anonymous mmap Tier 2: execute locally, notify central afterward.
     // For addr==0 && !MAP_FIXED, use the bump allocator to choose an
     // address from the pre-reserved range.  For MAP_FIXED or explicit
@@ -2160,4 +2262,89 @@ unsafe fn shmem_socket_writev(
     }
 
     total_written
+}
+
+/// Check for and apply trampoline patching for a Tier 2 file-backed mmap.
+///
+/// The trampoline header (32 bytes) is at the end of the file in the aligned
+/// memfd. Since `aligned_base` is already mmap'd read-only, we can read it
+/// directly without a syscall.
+///
+/// Header layout: [magic: u64] [file_offset: u64] [vaddr: u64] [size: u64]
+#[allow(clippy::cast_possible_truncation, clippy::similar_names, clippy::cast_sign_loss)]
+unsafe fn handle_tier2_trampoline(
+    state: &crate::state::MicroState,
+    entry: &crate::state::FileFdEntry,
+    map_addr: usize,
+) {
+    const LITEBOX0_MAGIC: u64 = u64::from_le_bytes(*b"LITEBOX0");
+    const HEADER_SIZE: usize = 32;
+
+    if state.aligned_base.is_null() || entry.tar_len < HEADER_SIZE as u64 {
+        return;
+    }
+
+    // Read the 32-byte header from the end of the file in aligned memfd.
+    let header_ptr = unsafe {
+        state
+            .aligned_base
+            .add(entry.aligned_offset as usize)
+            .add(entry.tar_len as usize)
+            .sub(HEADER_SIZE)
+    };
+
+    // Read magic (first 8 bytes).
+    let magic = unsafe { core::ptr::read_unaligned(header_ptr.cast::<u64>()) };
+    if magic != LITEBOX0_MAGIC {
+        return;
+    }
+
+    // Parse header fields.
+    let tramp_file_offset = unsafe { core::ptr::read_unaligned(header_ptr.add(8).cast::<u64>()) };
+    let tramp_vaddr =
+        unsafe { core::ptr::read_unaligned(header_ptr.add(16).cast::<u64>()) } as usize;
+    let tramp_size =
+        unsafe { core::ptr::read_unaligned(header_ptr.add(24).cast::<u64>()) } as usize;
+
+    if tramp_size == 0 {
+        return;
+    }
+
+    // The trampoline code is at file_offset in the file data within the
+    // aligned memfd. We can read it directly from aligned_base.
+    let tramp_src = unsafe {
+        state
+            .aligned_base
+            .add(entry.aligned_offset as usize)
+            .add(tramp_file_offset as usize)
+    };
+
+    let tramp_addr = map_addr + tramp_vaddr;
+    let tramp_page_size = (tramp_size + 0xFFF) & !0xFFF;
+
+    // Map anonymous RW pages at the trampoline address.
+    let tramp_ret = unsafe {
+        crate::raw_syscall::mmap(
+            tramp_addr,
+            tramp_page_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if crate::raw_syscall::is_error(tramp_ret) {
+        return;
+    }
+
+    // Copy trampoline code and patch the syscall entry point.
+    unsafe {
+        core::ptr::copy_nonoverlapping(tramp_src, tramp_ret as *mut u8, tramp_size);
+        *(tramp_ret as *mut u64) = state.syscall_entry_point as u64;
+        crate::raw_syscall::mprotect(
+            tramp_ret as usize,
+            tramp_page_size,
+            libc::PROT_READ | libc::PROT_EXEC,
+        );
+    }
 }
