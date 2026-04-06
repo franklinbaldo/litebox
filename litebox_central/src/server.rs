@@ -73,6 +73,18 @@ struct SendPtr(*const u8);
 unsafe impl Send for SendPtr {}
 unsafe impl Sync for SendPtr {}
 
+/// Wrapper for a `*mut u8` that is safe to send across threads.
+///
+/// Same safety rationale as [`SendPtr`] — the pointer comes from process-lifetime
+/// `mmap`'d shared memory.
+#[derive(Clone, Copy)]
+struct SendMutPtr(*mut u8);
+
+// SAFETY: The wrapped pointer points to process-lifetime mmap'd memory that
+// is never freed. Writes are serialised by the single-threaded server loop.
+unsafe impl Send for SendMutPtr {}
+unsafe impl Sync for SendMutPtr {}
+
 /// The central server that processes SQ entries and produces CQ completions.
 ///
 /// Manages one primary task (the main thread at slot 0) plus additional
@@ -139,6 +151,12 @@ pub struct ProcessServer<FS: ShimFS> {
     /// Used to detect mmap calls that can be dispatched via the phantom-mode
     /// fast path instead of copying data through the shared data region.
     fd_aligned_set: RefCell<HashSet<i32>>,
+    /// Base pointer of the mmap'd inmem shmem region (read-write for central).
+    /// Central manages file data allocations in this region; micro reads from
+    /// its own mapping. Null if no inmem region was provided.
+    inmem_base: SendMutPtr,
+    /// Size in bytes of the inmem shmem region.
+    inmem_size: usize,
 }
 
 impl<FS: ShimFS> ProcessServer<FS> {
@@ -159,6 +177,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
         tar_file_map: Arc<HashMap<String, std::ops::Range<usize>>>,
         aligned_file_map: Arc<HashMap<String, (usize, usize)>>,
         aligned_size: usize,
+        inmem_base: *mut u8,
+        inmem_size: usize,
     ) -> Self {
         // If this process has no TUN queue but TUN is enabled, it's the master.
         // Queue 0 (created by CentralPlatform::new) should be given to the
@@ -192,6 +212,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
             aligned_file_map,
             aligned_size,
             fd_aligned_set: RefCell::new(HashSet::new()),
+            inmem_base: SendMutPtr(inmem_base),
+            inmem_size,
         }
     }
 
@@ -1072,6 +1094,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
             let tar_file_map = Arc::clone(&self.tar_file_map);
             let aligned_file_map = Arc::clone(&self.aligned_file_map);
             let aligned_size = self.aligned_size;
+            let inmem_base = self.inmem_base.0;
+            let inmem_size = self.inmem_size;
             let child_server = ProcessServer::new(
                 child_region,
                 child_task,
@@ -1086,6 +1110,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 tar_file_map,
                 aligned_file_map,
                 aligned_size,
+                inmem_base,
+                inmem_size,
             );
             child_server.next_child_pid.set(self.next_child_pid.get());
             child_server.fd_aligned_set.borrow_mut().clone_from(&self.fd_aligned_set.borrow());

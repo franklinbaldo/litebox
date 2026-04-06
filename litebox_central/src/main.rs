@@ -176,6 +176,38 @@ fn main() -> anyhow::Result<()> {
     let tar_shmem_base: *const u8 = tar_data.as_ptr();
     let tar_shmem_size: usize = tar_data.len();
 
+    // Map the in-memory filesystem shmem region if provided by the launcher.
+    // Central maps it read-write so it can manage file data allocations.
+    let (inmem_base, inmem_size) = if let Some(inmem_fd) = args.inmem_fd {
+        let size = args.inmem_size;
+        if size == 0 {
+            eprintln!("litebox_central: --inmem-fd provided but --inmem-size is 0");
+            (std::ptr::null_mut(), 0)
+        } else {
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    inmem_fd,
+                    0,
+                )
+            };
+            if ptr == libc::MAP_FAILED {
+                eprintln!(
+                    "litebox_central: mmap inmem shmem failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                (std::ptr::null_mut(), 0)
+            } else {
+                (ptr.cast::<u8>(), size)
+            }
+        }
+    } else {
+        (std::ptr::null_mut(), 0)
+    };
+
     let devices = litebox::fs::devices::FileSystem::new(lb);
     let mut in_mem = litebox::fs::in_mem::FileSystem::new(lb);
 
@@ -305,6 +337,8 @@ fn main() -> anyhow::Result<()> {
         tar_file_map,
         aligned_file_map,
         args.aligned_size,
+        inmem_base,
+        inmem_size,
     );
     let result = server.run();
 

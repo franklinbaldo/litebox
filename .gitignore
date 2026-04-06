@@ -193,3 +193,10 @@ venv/
 dev_bench/unixbench/prepared/
 dev_bench/unixbench/byte-unixbench-*/
 dev_bench/unixbench/*.zip
+
+### Build artifacts & rootfs ###
+*.tar
+nginx_rootfs_fixed/
+runner_stderr.log
+runner_stdout.log
+run_orig_litebox.sh
