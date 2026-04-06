@@ -383,11 +383,21 @@ impl MicroState {
     }
 
     /// Find an inmem-backed file fd entry (mutable reference for cursor updates).
+    ///
+    /// Also validates that the slot index fits within the inmem region bounds.
     pub fn find_inmem_file_fd_mut(&mut self, fd: i32) -> Option<&mut FileFdEntry> {
+        let inmem_size = self.inmem_size;
         self.file_fds
             .iter_mut()
             .flatten()
-            .find(|entry| entry.fd == fd && entry.inmem_slot_index != litebox_ipc::inmem_shmem::INMEM_NO_SLOT)
+            .find(|entry| {
+                entry.fd == fd
+                    && entry.inmem_slot_index != litebox_ipc::inmem_shmem::INMEM_NO_SLOT
+                    && (litebox_ipc::inmem_shmem::slots_offset()
+                        + (entry.inmem_slot_index as usize + 1)
+                            * litebox_ipc::inmem_shmem::FILE_SLOT_SIZE)
+                        <= inmem_size
+            })
     }
 
     #[cfg(test)]

@@ -1527,59 +1527,80 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
                 libc::SYS_read => {
                     let buf = args.args[1] as *mut u8;
                     let count = args.args[2] as usize;
-                    // Read metadata slot under seqlock.
+                    // Read metadata slot under seqlock, copy data, then
+                    // re-validate the snapshot to guard against concurrent
+                    // central updates (TOCTOU: central may free the old
+                    // data block while we copy from it).
                     let slot = unsafe {
                         litebox_ipc::inmem_shmem::slot_ptr(inmem_base, entry.inmem_slot_index)
                     };
-                    let snapshot = slot.read_snapshot();
-                    if snapshot.data_offset == 0 {
-                        return 0; // slot cleared (file deleted)
-                    }
-                    let remaining = snapshot.data_len.saturating_sub(entry.cursor) as usize;
-                    let to_read = count.min(remaining);
-                    if to_read > 0 {
-                        let src = snapshot.data_offset + entry.cursor;
-                        if (src as usize) + to_read > inmem_size {
-                            return -i64::from(libc::EIO);
+                    loop {
+                        let snapshot = slot.read_snapshot();
+                        if snapshot.data_offset == 0 {
+                            return 0; // slot cleared (file deleted)
                         }
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(
-                                inmem_base.add(src as usize),
-                                buf,
-                                to_read,
-                            );
+                        let remaining = snapshot.data_len.saturating_sub(entry.cursor) as usize;
+                        let to_read = count.min(remaining);
+                        if to_read > 0 {
+                            let src = snapshot.data_offset + entry.cursor;
+                            if (src as usize) + to_read > inmem_size {
+                                return -i64::from(libc::EIO);
+                            }
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    inmem_base.add(src as usize),
+                                    buf,
+                                    to_read,
+                                );
+                            }
+                            // Re-validate: ensure data wasn't freed during copy.
+                            let snap2 = slot.read_snapshot();
+                            if snap2.data_offset != snapshot.data_offset {
+                                continue; // data block changed — retry
+                            }
+                            entry.cursor += to_read as u64;
                         }
-                        entry.cursor += to_read as u64;
+                        return to_read as i64;
                     }
-                    return to_read as i64;
                 }
                 libc::SYS_pread64 => {
                     let buf = args.args[1] as *mut u8;
                     let count = args.args[2] as usize;
                     let offset = args.args[3];
+                    // Negative offset → EINVAL (pread64 takes signed off_t).
+                    if offset > i64::MAX as u64 {
+                        return -i64::from(libc::EINVAL);
+                    }
                     let slot = unsafe {
                         litebox_ipc::inmem_shmem::slot_ptr(inmem_base, entry.inmem_slot_index)
                     };
-                    let snapshot = slot.read_snapshot();
-                    if snapshot.data_offset == 0 || offset >= snapshot.data_len {
-                        return 0;
-                    }
-                    let remaining = (snapshot.data_len - offset) as usize;
-                    let to_read = count.min(remaining);
-                    if to_read > 0 {
-                        let src = snapshot.data_offset + offset;
-                        if (src as usize) + to_read > inmem_size {
-                            return -i64::from(libc::EIO);
+                    loop {
+                        let snapshot = slot.read_snapshot();
+                        if snapshot.data_offset == 0 || offset >= snapshot.data_len {
+                            return 0;
                         }
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(
-                                inmem_base.add(src as usize),
-                                buf,
-                                to_read,
-                            );
+                        let remaining = (snapshot.data_len - offset) as usize;
+                        let to_read = count.min(remaining);
+                        if to_read > 0 {
+                            let src = snapshot.data_offset + offset;
+                            if (src as usize) + to_read > inmem_size {
+                                return -i64::from(libc::EIO);
+                            }
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    inmem_base.add(src as usize),
+                                    buf,
+                                    to_read,
+                                );
+                            }
+                            // Re-validate: ensure data wasn't freed during copy.
+                            let snap2 = slot.read_snapshot();
+                            if snap2.data_offset != snapshot.data_offset {
+                                continue; // data block changed — retry
+                            }
                         }
+                        return to_read as i64;
                     }
-                    return to_read as i64;
                 }
                 _ => {} // other syscalls fall through
             }

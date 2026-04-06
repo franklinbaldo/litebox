@@ -2301,7 +2301,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
         clippy::field_reassign_with_default
     )]
     fn maybe_sync_inmem_write(&self, thread_slot: u16, fd: i32) {
-        // 1. Skip if fd not in fd_path_map (cheapest check — no lock needed).
+        // 1. Skip if fd not in fd_path_map (cheapest check — no mutex contention).
         let Some(path) = self.fd_path_map.borrow().get(&fd).cloned() else {
             return;
         };
