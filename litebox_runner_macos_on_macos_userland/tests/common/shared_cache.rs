@@ -169,9 +169,7 @@ impl MmappedRegion {
         // overlap the host's shared cache (kernel returns EACCES).  Try
         // the Mach VM API which can overwrite shared region pages.
         let fixed_addr = fixed_addr?;
-        let errno = std::io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(0);
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         if errno != libc::EACCES && errno != libc::EPERM {
             return None;
         }
@@ -272,9 +270,7 @@ impl MmappedRegion {
         // Set pages to read-only.  They're zero-filled which is enough to
         // prevent SIGBUS.  Dyld may read metadata from these pages and get
         // zeros, but the critical dylib segments are installed separately.
-        let r = unsafe {
-            libc::mprotect(alloc_addr as *mut libc::c_void, len, libc::PROT_READ)
-        };
+        let r = unsafe { libc::mprotect(alloc_addr as *mut libc::c_void, len, libc::PROT_READ) };
         if r != 0 {
             eprintln!(
                 "MmappedRegion::zero_filled_at: mprotect PROT_READ at {alloc_addr:#x} \
@@ -716,18 +712,14 @@ fn phase0_mmap_subregion(
         let actual_end = sub_start + actual_len;
         #[allow(clippy::cast_precision_loss)]
         let actual_mb = actual_len as f64 / (1024.0 * 1024.0);
-        eprintln!(
-            "    → {label} {sub_start:#x}..{actual_end:#x} ({actual_mb:.1} MB): mapped OK",
-        );
+        eprintln!("    → {label} {sub_start:#x}..{actual_end:#x} ({actual_mb:.1} MB): mapped OK",);
         preinstalled_extents.push((sub_start, actual_end));
         seen.insert((sub_start, actual_end));
         preinstalled_mmaps.push(mmap);
     } else {
         #[allow(clippy::cast_precision_loss)]
         let sub_size = (sub_end - sub_start) as f64 / (1024.0 * 1024.0);
-        eprintln!(
-            "    → {label} {sub_start:#x}..{sub_end:#x} ({sub_size:.1} MB): mmap failed",
-        );
+        eprintln!("    → {label} {sub_start:#x}..{sub_end:#x} ({sub_size:.1} MB): mmap failed",);
     }
 }
 
@@ -755,7 +747,10 @@ pub fn collect_regions(
     needed_dylibs: &[&str],
 ) -> CollectedCache {
     let subcaches = discover_subcache_files(cache_dir);
-    eprintln!("collect_regions: discovered {} subcache files", subcaches.len());
+    eprintln!(
+        "collect_regions: discovered {} subcache files",
+        subcaches.len()
+    );
 
     // Query the host's shared cache address range so we can split global
     // mappings around it.  All portions (overlapping and non-overlapping)
@@ -766,9 +761,7 @@ pub fn collect_regions(
         let end = base + len;
         #[allow(clippy::cast_precision_loss)]
         let size_mb = len as f64 / (1024.0 * 1024.0);
-        eprintln!(
-            "collect_regions: host shared cache at {base:#x}..{end:#x} ({size_mb:.0} MB)",
-        );
+        eprintln!("collect_regions: host shared cache at {base:#x}..{end:#x} ({size_mb:.0} MB)",);
         (base, end)
     } else {
         eprintln!("collect_regions: could not query host shared cache range");
@@ -787,8 +780,15 @@ pub fn collect_regions(
     // strategy, we tell the guest dyld that the cache starts at the host's
     // slid base instead of the unslid base (0x180000000).  The host's
     // already-rebased data is then correct — no need to replace overlap pages.
-    let unslid_base = cache_map.mappings.first().map_or(0x180000000, |m| m.vm_start);
-    let host_slide = if host_start > 0 { host_start - unslid_base } else { 0 };
+    let unslid_base = cache_map
+        .mappings
+        .first()
+        .map_or(0x180000000, |m| m.vm_start);
+    let host_slide = if host_start > 0 {
+        host_start - unslid_base
+    } else {
+        0
+    };
     eprintln!(
         "collect_regions: accepting host slide {host_slide:#x} \
          (unslid base {unslid_base:#x}, slid base {host_start:#x})",
@@ -881,7 +881,9 @@ pub fn collect_regions(
     // dynamic config data and applied the ASLR slide.  We don't need to map
     // or patch a separate header copy.  The preinstalled extent from Phase 0
     // already covers the header region.
-    eprintln!("collect_regions: Phase 1 (header) — skipped (using host's header at {host_start:#x})");
+    eprintln!(
+        "collect_regions: Phase 1 (header) — skipped (using host's header at {host_start:#x})"
+    );
 
     // Collect LINKEDIT ranges separately so we can deduplicate them across dylibs.
     // Store as (unslid_start, unslid_end) — slide is applied when creating regions.

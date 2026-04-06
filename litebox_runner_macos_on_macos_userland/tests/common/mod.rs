@@ -118,7 +118,11 @@ unsafe fn install_crash_handler() {
         let mut i = 0;
         while v > 0 {
             let digit = (v & 0xf) as u8;
-            tmp[i] = if digit < 10 { b'0' + digit } else { b'a' + digit - 10 };
+            tmp[i] = if digit < 10 {
+                b'0' + digit
+            } else {
+                b'a' + digit - 10
+            };
             v >>= 4;
             i += 1;
         }
@@ -259,7 +263,9 @@ pub fn run_macho_binary(binary_data: &[u8], argv: &[&str]) -> (i32, Vec<u8>) {
     use litebox::fs::{FileSystem as _, Mode};
 
     // Serialize: only one test can use the platform + TLS table at a time.
-    let _guard = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     ensure_platform();
 
@@ -326,7 +332,9 @@ pub fn run_macho_dynamic(
     exe_name: &str,
 ) -> (i32, Vec<u8>) {
     // Serialize: only one test can use the platform + TLS table at a time.
-    let _guard = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     // Resolve `_sigtramp` in the parent process before fork().
     // dlsym is NOT async-signal-safe and may deadlock or return NULL in a
@@ -450,8 +458,7 @@ fn run_macho_dynamic_inner(
     // System binaries (fat/universal Mach-Os, or other unsupported formats)
     // may fail to parse — this is fine because they only call libc from the
     // shared cache (whose SVCs pass through to the host kernel).
-    let rewritten_data =
-        litebox_syscall_rewriter_macho::hook_syscalls_in_macho(binary_data).ok();
+    let rewritten_data = litebox_syscall_rewriter_macho::hook_syscalls_in_macho(binary_data).ok();
     let effective_binary = rewritten_data.as_deref().unwrap_or(binary_data);
 
     let mut shim_builder =

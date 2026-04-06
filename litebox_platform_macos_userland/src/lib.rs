@@ -104,14 +104,14 @@ use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use litebox::fs::OFlags;
+use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::{
     CowAllocationError, FixedAddressBehavior, MemoryRegionPermissions,
 };
-use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer as _};
 use litebox::shim::ContinueOperation;
 use litebox::utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt};
-use litebox_common_linux::{vmap::VmapManager, MapFlags, ProtFlags, PunchthroughSyscall};
+use litebox_common_linux::{MapFlags, ProtFlags, PunchthroughSyscall, vmap::VmapManager};
 
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -2789,11 +2789,9 @@ unsafe extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext) {
                     let int_cb = interrupt_callback as *const () as usize;
 
                     if target_pc == exc_cb {
-                        raw_debug_write(b"[sigreturn] -> exception_handler\n");
                         exception_handler(thread_ctx, x1_val, x2_val, x3_val);
                         return;
                     } else if target_pc == int_cb {
-                        raw_debug_write(b"[sigreturn] -> interrupt_handler\n");
                         interrupt_handler(thread_ctx);
                         return;
                     }
@@ -2823,14 +2821,12 @@ extern "C-unwind" fn exception_handler(
     error: usize,
     cr2: usize,
 ) {
-    raw_debug_write(b"[exception_handler] entered\n");
     let _ = error; // unused on aarch64; signal number is in trapno
     let info = litebox::shim::ExceptionInfo {
         fault_address: cr2,
         esr: trapno as u64,
     };
     thread_ctx.call_shim(|shim, ctx, _interrupt| shim.exception(ctx, &info));
-    raw_debug_write(b"[exception_handler] returning\n");
 }
 
 /// Update the TLS lookup table with the current thread's entry.
@@ -3030,9 +3026,7 @@ impl ThreadContext<'_> {
                 let tcb = TCB_PTR.get();
                 unsafe { switch_to_guest(self.ctx, tcb) }
             }
-            ContinueOperation::Terminate => {
-                raw_debug_write(b"[call_shim] Terminate\n");
-            }
+            ContinueOperation::Terminate => {}
         }
     }
 }

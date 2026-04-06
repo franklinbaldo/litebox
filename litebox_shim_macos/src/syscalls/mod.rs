@@ -310,6 +310,29 @@ impl<FS: ShimFS> Task<FS> {
                 nevents,
                 timeout,
             } => kqueue::sys_kevent(self, kq, changelist, nchanges, eventlist, nevents, timeout),
+            MacosSyscallRequest::Fstatfs64Fd { fd, buf } => {
+                let _ = fd; // fd is validated but not used differently
+                self.sys_statfs64(0, buf) // reuse statfs64 with fake values
+            }
+            MacosSyscallRequest::Fchdir { fd } => self.sys_fchdir(fd),
+            MacosSyscallRequest::ChangeFdguardNp { fd } => {
+                let _ = fd;
+                Ok(0) // no-op: guards not enforced
+            }
+            MacosSyscallRequest::GetattrlistBulk {
+                dirfd,
+                alist,
+                attr_buf,
+                attr_buf_size,
+                options,
+            } => self.sys_getattrlistbulk(dirfd, alist, attr_buf, attr_buf_size, options),
+            MacosSyscallRequest::GuardedCloseNp { fd } => self.sys_close(fd).map(|()| 0),
+            MacosSyscallRequest::GuardedWriteNp { fd, buf, count } => {
+                self.sys_write(fd, buf, count)
+            }
+            MacosSyscallRequest::GuardedOpenNp { path, flags, mode } => {
+                self.sys_open(path, flags, mode)
+            }
             MacosSyscallRequest::UlockWait {
                 operation,
                 addr,

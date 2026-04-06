@@ -51,6 +51,10 @@ enum DuplicatedFd<FS: ShimFS> {
 ///
 /// macOS and Linux use different numeric values for O_CREAT, O_TRUNC, etc.
 fn translate_open_flags(macos_flags: i32) -> OFlags {
+    // O_RDONLY=0, O_WRONLY=1, O_RDWR=2, O_NONBLOCK=4, O_APPEND=8,
+    // O_SHLOCK=0x10, O_EXLOCK=0x20, O_NOFOLLOW=0x100, O_CREAT=0x200,
+    // O_TRUNC=0x400, O_EXCL=0x800, O_DIRECTORY=0x100000,
+    // O_CLOEXEC=0x1000000, O_NOFOLLOW_ANY=0x2000000
     let mut flags = OFlags::empty();
     let access = macos_flags & 0x3;
     if access == 1 {
@@ -147,14 +151,10 @@ impl<FS: ShimFS> Task<FS> {
     ///
     /// Dispatches to filesystem or pipe subsystem based on FD type.
     pub(crate) fn sys_write(&self, fd: i32, buf_addr: usize, count: usize) -> Result<usize, Errno> {
-        // Debug: log write calls to see dyld error messages (written to fd -1, 1, or 2)
-        if fd == -1 || fd == 1 || fd == 2 {
-            let user_buf_dbg: ConstPtr<u8> = ConstPtr::from_usize(buf_addr);
-            if let Some(data) = user_buf_dbg.to_owned_slice(count.min(256))
-                && let Ok(s) = core::str::from_utf8(&data)
-            {
-                log_unsupported!("write(fd={fd}, count={count}): {s:?}");
-            }
+        // Reject obviously-invalid buffer pointers early to avoid faulting in
+        // the shim itself (e.g. when a guest passes a corrupted buffer).
+        if buf_addr < 0x1000 && count > 0 {
+            return Err(Errno::EFAULT);
         }
 
         // fd -1 is invalid — return EBADF (but we've already logged the diagnostic above).
@@ -404,6 +404,21 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
+    /// Handle `fchdir(fd)` — change working directory to the directory referenced by fd.
+    ///
+    /// In the macOS-on-macOS runner with an in-memory filesystem, we don't track
+    /// CWD state. Return success so that programs like `/bin/ls` that save/restore
+    /// CWD via fchdir don't fail.
+    pub(crate) fn sys_fchdir(&self, fd: i32) -> Result<usize, Errno> {
+        // Verify the fd is valid.
+        let raw_fd = fd_to_usize(fd)?;
+        let rds = self.global.raw_descriptors.read();
+        let _strong: crate::StrongFd<FS> = crate::StrongFd::from_raw(&rds, raw_fd)?;
+        drop(rds);
+        // No-op: in-mem FS does not track CWD.
+        Ok(0)
+    }
+
     /// Handle `open(path, flags, mode)`.
     ///
     /// Dylib files are expected to already be populated in the in-mem FS at
@@ -417,10 +432,26 @@ impl<FS: ShimFS> Task<FS> {
         let path_ptr: ConstPtr<u8> = ConstPtr::from_usize(path_addr);
         let path = read_cstring_from_guest(path_ptr, 4096).ok_or(Errno::EFAULT)?;
 
-        log_unsupported!("sys_open({path:?}, flags={flags:#x})");
+        let mut oflags = translate_open_flags(flags);
 
-        let oflags = translate_open_flags(flags);
-        let cpath = alloc::ffi::CString::new(path.as_bytes()).map_err(|_| Errno::EINVAL)?;
+        // Translate "." to "/" — the in-mem FS root, since we don't track CWD.
+        let effective_path = if path == "." { "/" } else { &path };
+        let cpath =
+            alloc::ffi::CString::new(effective_path.as_bytes()).map_err(|_| Errno::EINVAL)?;
+
+        // If the target path is an existing directory, strip flags that are
+        // not meaningful for directories (O_CREAT, O_TRUNC, O_EXCL) and
+        // force read-only access mode.
+        if let Ok(status) = self.global.fs.file_status(&cpath)
+            && status.file_type == litebox::fs::FileType::Directory
+        {
+            oflags.remove(OFlags::CREAT);
+            oflags.remove(OFlags::TRUNC);
+            oflags.remove(OFlags::EXCL);
+            // Also force access mode to read-only for directories.
+            oflags.remove(OFlags::WRONLY);
+            oflags.remove(OFlags::RDWR);
+        }
 
         let typed_fd = match self
             .global
@@ -429,9 +460,7 @@ impl<FS: ShimFS> Task<FS> {
         {
             Ok(fd) => fd,
             Err(e) => {
-                let errno = Self::open_error_to_errno(e);
-                log_unsupported!("sys_open({path:?}) FAILED: {errno:?}");
-                return Err(errno);
+                return Err(Self::open_error_to_errno(e));
             }
         };
 
@@ -446,7 +475,6 @@ impl<FS: ShimFS> Task<FS> {
             paths.insert(raw_fd, path.clone());
         }
 
-        log_unsupported!("sys_open({path:?}) → fd={raw_fd}");
         Ok(raw_fd)
     }
 
@@ -713,7 +741,6 @@ impl<FS: ShimFS> Task<FS> {
             }
         }
 
-        log_unsupported!("dup2({oldfd}, {newfd}) → {raw_newfd}");
         Ok(raw_newfd)
     }
 
@@ -725,7 +752,6 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_stat64(&self, path_addr: usize, buf_addr: usize) -> Result<usize, Errno> {
         let path_ptr: ConstPtr<u8> = ConstPtr::from_usize(path_addr);
         let path = read_cstring_from_guest(path_ptr, 4096).ok_or(Errno::EFAULT)?;
-        log_unsupported!("stat64({path:?})");
 
         // Try to open the path read-only
         let cpath = alloc::ffi::CString::new(path.as_bytes()).map_err(|_| Errno::EINVAL)?;
@@ -762,7 +788,6 @@ impl<FS: ShimFS> Task<FS> {
     ) -> Result<usize, Errno> {
         let path_ptr: ConstPtr<u8> = ConstPtr::from_usize(path_addr);
         let path = read_cstring_from_guest(path_ptr, 4096).ok_or(Errno::EFAULT)?;
-        log_unsupported!("openat(dirfd={dirfd}, {path:?}, flags={flags:#x})");
 
         // AT_FDCWD on macOS is -2
         if dirfd == -2 || path.starts_with('/') {
@@ -787,7 +812,6 @@ impl<FS: ShimFS> Task<FS> {
     ) -> Result<usize, Errno> {
         let path_ptr: ConstPtr<u8> = ConstPtr::from_usize(path_addr);
         let path = read_cstring_from_guest(path_ptr, 4096).ok_or(Errno::EFAULT)?;
-        log_unsupported!("fstatat64(dirfd={dirfd}, {path:?})");
 
         // AT_FDCWD on macOS is -2
         if dirfd == -2 || path.starts_with('/') {
@@ -802,7 +826,6 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_unlink(&self, path_addr: usize) -> Result<usize, Errno> {
         let path_ptr: ConstPtr<u8> = ConstPtr::from_usize(path_addr);
         let path = read_cstring_from_guest(path_ptr, 4096).ok_or(Errno::EFAULT)?;
-        log_unsupported!("unlink({path:?})");
 
         let cpath = alloc::ffi::CString::new(path.as_bytes()).map_err(|_| Errno::EINVAL)?;
         self.global.fs.unlink(&cpath).map_err(|e| match e {
@@ -826,7 +849,6 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_mkdir(&self, path_addr: usize, mode: u32) -> Result<usize, Errno> {
         let path_ptr: ConstPtr<u8> = ConstPtr::from_usize(path_addr);
         let path = read_cstring_from_guest(path_ptr, 4096).ok_or(Errno::EFAULT)?;
-        log_unsupported!("mkdir({path:?}, mode={mode:#o})");
 
         let cpath = alloc::ffi::CString::new(path.as_bytes()).map_err(|_| Errno::EINVAL)?;
         let fs_mode = litebox::fs::Mode::from_bits_truncate(mode);
@@ -851,7 +873,6 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_rmdir(&self, path_addr: usize) -> Result<usize, Errno> {
         let path_ptr: ConstPtr<u8> = ConstPtr::from_usize(path_addr);
         let path = read_cstring_from_guest(path_ptr, 4096).ok_or(Errno::EFAULT)?;
-        log_unsupported!("rmdir({path:?})");
 
         let cpath = alloc::ffi::CString::new(path.as_bytes()).map_err(|_| Errno::EINVAL)?;
         self.global.fs.rmdir(&cpath).map_err(|e| match e {
@@ -876,10 +897,9 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle `access(path, amode)` — check file accessibility.
     ///
     /// Stub: F_OK checks existence via `file_status()`, R_OK/W_OK/X_OK always succeed.
-    pub(crate) fn sys_access(&self, path_addr: usize, amode: i32) -> Result<usize, Errno> {
+    pub(crate) fn sys_access(&self, path_addr: usize, _amode: i32) -> Result<usize, Errno> {
         let path_ptr: ConstPtr<u8> = ConstPtr::from_usize(path_addr);
         let path = read_cstring_from_guest(path_ptr, 4096).ok_or(Errno::EFAULT)?;
-        log_unsupported!("access({path:?}, amode={amode})");
 
         let cpath = alloc::ffi::CString::new(path.as_bytes()).map_err(|_| Errno::EINVAL)?;
         // F_OK (0) or any mode — just check existence.
@@ -902,8 +922,7 @@ impl<FS: ShimFS> Task<FS> {
     ///
     /// Permissions are not enforced in the sandbox, so this is a no-op.
     #[allow(clippy::unnecessary_wraps)]
-    pub(crate) fn sys_fchmod(&self, fd: i32, mode: u32) -> Result<usize, Errno> {
-        log_unsupported!("fchmod(fd={fd}, mode={mode:#o}) → stub Ok(0)");
+    pub(crate) fn sys_fchmod(&self, fd: i32, _mode: u32) -> Result<usize, Errno> {
         // Validate fd exists
         let raw_fd = fd_to_usize(fd)?;
         let rds = self.global.raw_descriptors.read();
@@ -969,11 +988,27 @@ impl<FS: ShimFS> Task<FS> {
             _ => Errno::EIO,
         })?;
 
-        // Serialize entries into macOS dirent format.
-        let mut output = alloc::vec::Vec::with_capacity(bufsize.min(MAX_KERNEL_BUF_SIZE));
-        let mut seek_offset: u64 = 1;
+        // Read the current seek position from basep to know how many entries
+        // have already been returned. If basep >= entry count, return 0
+        // (end-of-directory).
+        let start_offset: usize = if basep != 0 {
+            let basep_ptr: ConstPtr<u64> = ConstPtr::from_usize(basep);
+            basep_ptr.read_at_offset(0).unwrap_or(0) as usize
+        } else {
+            0
+        };
 
-        for entry in &entries {
+        let total_entries = entries.len();
+        if start_offset >= total_entries {
+            // All entries have been returned in previous calls.
+            return Ok(0);
+        }
+
+        // Serialize entries into macOS dirent format, starting from start_offset.
+        let mut output = alloc::vec::Vec::with_capacity(bufsize.min(MAX_KERNEL_BUF_SIZE));
+        let mut seek_offset: u64 = start_offset as u64 + 1;
+
+        for entry in &entries[start_offset..] {
             let name_bytes = entry.name.as_bytes();
             let namlen = name_bytes.len();
             // d_reclen = header (21 bytes) + name + NUL, rounded up to 8-byte alignment
@@ -1029,5 +1064,265 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         Ok(output.len())
+    }
+
+    /// Handle `getattrlistbulk(dirfd, alist, attributeBuffer, bufferSize, options)`.
+    ///
+    /// Returns the number of entries packed into `attributeBuffer`, or 0 for
+    /// end-of-directory. Each entry is a packed record with a leading `u32`
+    /// length field, followed by the requested attributes.
+    ///
+    /// We track the directory position using the fd's seek offset (via lseek).
+    pub(crate) fn sys_getattrlistbulk(
+        &self,
+        dirfd: i32,
+        alist_addr: usize,
+        attr_buf_addr: usize,
+        attr_buf_size: usize,
+        _options: u64,
+    ) -> Result<usize, Errno> {
+        // --- Constants for ATTR_CMN_* ---
+        const ATTR_CMN_RETURNED_ATTRS: u32 = 0x8000_0000;
+        const ATTR_CMN_NAME: u32 = 0x0000_0001;
+        const ATTR_CMN_OBJTYPE: u32 = 0x0000_0008;
+        const ATTR_CMN_OBJTAG: u32 = 0x0000_0010;
+        const ATTR_CMN_ACCESSMASK: u32 = 0x0002_0000;
+        const ATTR_CMN_FLAGS: u32 = 0x0004_0000;
+        const ATTR_CMN_FILEID: u32 = 0x0200_0000;
+
+        // --- Constants for ATTR_DIR_* ---
+        const ATTR_DIR_LINKCOUNT: u32 = 0x0000_0001;
+        const ATTR_DIR_ENTRYCOUNT: u32 = 0x0000_0002;
+
+        // --- Constants for ATTR_FILE_* ---
+        const ATTR_FILE_LINKCOUNT: u32 = 0x0000_0001;
+        const ATTR_FILE_TOTALSIZE: u32 = 0x0000_0002;
+        const ATTR_FILE_ALLOCSIZE: u32 = 0x0000_0004;
+        const ATTR_FILE_DATALENGTH: u32 = 0x0000_0200;
+        const ATTR_FILE_DATAALLOCSIZE: u32 = 0x0000_0400;
+
+        // VTYPE constants (vnode types)
+        const VREG: u32 = 1;
+        const VDIR: u32 = 2;
+        const VCHR: u32 = 4;
+
+        // VT tag constants
+        const VT_APFS: u32 = 27;
+
+        // --- Read the attrlist struct from guest memory ---
+        // struct attrlist { u16 bitmapcount, u16 reserved, u32 commonattr, u32 volattr,
+        //                   u32 dirattr, u32 fileattr, u32 forkattr }  = 24 bytes
+        let alist_ptr: ConstPtr<u8> = ConstPtr::from_usize(alist_addr);
+        let mut alist_raw = [0u8; 24];
+        for (i, byte) in alist_raw.iter_mut().enumerate() {
+            *byte = alist_ptr
+                .read_at_offset(i.cast_signed())
+                .ok_or(Errno::EFAULT)?;
+        }
+        let commonattr =
+            u32::from_le_bytes([alist_raw[4], alist_raw[5], alist_raw[6], alist_raw[7]]);
+        let dirattr =
+            u32::from_le_bytes([alist_raw[12], alist_raw[13], alist_raw[14], alist_raw[15]]);
+        let fileattr =
+            u32::from_le_bytes([alist_raw[16], alist_raw[17], alist_raw[18], alist_raw[19]]);
+
+        // --- Get directory entries ---
+        let raw_fd = fd_to_usize(dirfd)?;
+        let typed_fd = {
+            let rds = self.global.raw_descriptors.read();
+            rds.fd_from_raw_integer::<FS>(raw_fd)
+                .map_err(|_| Errno::EBADF)?
+        };
+
+        let entries = self.global.fs.read_dir(&typed_fd).map_err(|e| match e {
+            litebox::fs::errors::ReadDirError::ClosedFd => Errno::EBADF,
+            litebox::fs::errors::ReadDirError::NotADirectory => Errno::ENOTDIR,
+            _ => Errno::EIO,
+        })?;
+
+        // --- Determine seek position (which entries already returned) ---
+        // Directory fds don't have a seek position in our in-mem FS, so we
+        // track the enumeration position in Task::dir_positions.
+        let current_pos = {
+            let positions = self.dir_positions.lock();
+            positions.get(&raw_fd).copied().unwrap_or(0)
+        };
+
+        // Skip "." and ".." entries — getattrlistbulk doesn't return them
+        // (unlike getdirentries64 which does).
+        let real_entries: alloc::vec::Vec<_> = entries
+            .iter()
+            .filter(|e| e.name != "." && e.name != "..")
+            .collect();
+
+        let total = real_entries.len();
+        if current_pos >= total {
+            return Ok(0); // end of directory
+        }
+
+        // --- Pack entries into the attribute buffer ---
+        let mut output = alloc::vec::Vec::with_capacity(attr_buf_size.min(MAX_KERNEL_BUF_SIZE));
+        let mut entry_count: usize = 0;
+
+        for entry in &real_entries[current_pos..] {
+            // Build this entry's packed record in a temp buffer
+            let mut rec = alloc::vec::Vec::with_capacity(256);
+
+            // Reserve 4 bytes for the record length (we'll fill it at the end)
+            rec.extend_from_slice(&[0u8; 4]);
+
+            // ATTR_CMN_RETURNED_ATTRS: attribute_set_t (20 bytes)
+            if commonattr & ATTR_CMN_RETURNED_ATTRS != 0 {
+                // Report back what we're actually returning
+                let ret_common = commonattr; // we return everything requested
+                let ret_dir = dirattr;
+                let ret_file = fileattr;
+                rec.extend_from_slice(&ret_common.to_le_bytes());
+                rec.extend_from_slice(&0u32.to_le_bytes()); // volattr
+                rec.extend_from_slice(&ret_dir.to_le_bytes());
+                rec.extend_from_slice(&ret_file.to_le_bytes());
+                rec.extend_from_slice(&0u32.to_le_bytes()); // forkattr
+            }
+
+            // ATTR_CMN_NAME: attrreference_t (8 bytes) + variable-length name
+            // The name string is placed AFTER all fixed-size attributes.
+            // We'll use a placeholder here and fix up the offset later.
+            let name_ref_offset = rec.len();
+            let has_name = commonattr & ATTR_CMN_NAME != 0;
+            if has_name {
+                rec.extend_from_slice(&[0u8; 8]); // placeholder for attrreference_t
+            }
+
+            // ATTR_CMN_OBJTYPE: u32 (vnode type)
+            let is_dir = entry.file_type == litebox::fs::FileType::Directory;
+            if commonattr & ATTR_CMN_OBJTYPE != 0 {
+                let vtype = match entry.file_type {
+                    litebox::fs::FileType::Directory => VDIR,
+                    litebox::fs::FileType::CharacterDevice => VCHR,
+                    _ => VREG,
+                };
+                rec.extend_from_slice(&vtype.to_le_bytes());
+            }
+
+            // ATTR_CMN_OBJTAG: u32
+            if commonattr & ATTR_CMN_OBJTAG != 0 {
+                rec.extend_from_slice(&VT_APFS.to_le_bytes());
+            }
+
+            // ATTR_CMN_ACCESSMASK: u32
+            if commonattr & ATTR_CMN_ACCESSMASK != 0 {
+                let mode: u32 = if is_dir { 0o040755 } else { 0o100644 };
+                rec.extend_from_slice(&mode.to_le_bytes());
+            }
+
+            // ATTR_CMN_FLAGS: u32
+            if commonattr & ATTR_CMN_FLAGS != 0 {
+                rec.extend_from_slice(&0u32.to_le_bytes());
+            }
+
+            // ATTR_CMN_FILEID: u64
+            if commonattr & ATTR_CMN_FILEID != 0 {
+                let ino: u64 = entry
+                    .ino_info
+                    .as_ref()
+                    .map_or(current_pos as u64 + entry_count as u64 + 2, |info| {
+                        info.ino as u64
+                    });
+                rec.extend_from_slice(&ino.to_le_bytes());
+            }
+
+            // --- Directory-specific attributes (only if entry IS a directory) ---
+            if is_dir {
+                // ATTR_DIR_LINKCOUNT: u32
+                if dirattr & ATTR_DIR_LINKCOUNT != 0 {
+                    rec.extend_from_slice(&2u32.to_le_bytes());
+                }
+                // ATTR_DIR_ENTRYCOUNT: u32
+                if dirattr & ATTR_DIR_ENTRYCOUNT != 0 {
+                    rec.extend_from_slice(&0u32.to_le_bytes());
+                }
+            } else {
+                // --- File-specific attributes (only if entry is NOT a directory) ---
+                // ATTR_FILE_LINKCOUNT: u32
+                if fileattr & ATTR_FILE_LINKCOUNT != 0 {
+                    rec.extend_from_slice(&1u32.to_le_bytes());
+                }
+                // ATTR_FILE_TOTALSIZE: off_t (8 bytes)
+                if fileattr & ATTR_FILE_TOTALSIZE != 0 {
+                    rec.extend_from_slice(&0i64.to_le_bytes());
+                }
+                // ATTR_FILE_ALLOCSIZE: off_t (8 bytes)
+                if fileattr & ATTR_FILE_ALLOCSIZE != 0 {
+                    rec.extend_from_slice(&0i64.to_le_bytes());
+                }
+                // ATTR_FILE_DATALENGTH: off_t (8 bytes)
+                if fileattr & ATTR_FILE_DATALENGTH != 0 {
+                    rec.extend_from_slice(&0i64.to_le_bytes());
+                }
+                // ATTR_FILE_DATAALLOCSIZE: off_t (8 bytes)
+                if fileattr & ATTR_FILE_DATAALLOCSIZE != 0 {
+                    rec.extend_from_slice(&0i64.to_le_bytes());
+                }
+            }
+
+            // --- Now append the variable-length name string ---
+            if has_name {
+                let name_bytes = entry.name.as_bytes();
+                // The attrreference_t.attr_dataoffset is relative to the
+                // start of the attrreference_t field itself.
+                let name_data_start = rec.len();
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                let attr_dataoffset = (name_data_start - name_ref_offset) as i32;
+                #[allow(clippy::cast_possible_truncation)]
+                let attr_length = (name_bytes.len() + 1) as u32; // +1 for NUL
+
+                // Write the name string + NUL
+                rec.extend_from_slice(name_bytes);
+                rec.push(0); // NUL terminator
+
+                // Fix up the attrreference_t
+                rec[name_ref_offset..name_ref_offset + 4]
+                    .copy_from_slice(&attr_dataoffset.to_le_bytes());
+                rec[name_ref_offset + 4..name_ref_offset + 8]
+                    .copy_from_slice(&attr_length.to_le_bytes());
+            }
+
+            // Pad record to 4-byte alignment
+            while rec.len() % 4 != 0 {
+                rec.push(0);
+            }
+
+            // Write record length into the first 4 bytes
+            #[allow(clippy::cast_possible_truncation)]
+            let reclen = rec.len() as u32;
+            rec[0..4].copy_from_slice(&reclen.to_le_bytes());
+
+            // Check if this record fits in the remaining buffer space
+            if output.len() + rec.len() > attr_buf_size {
+                if entry_count == 0 {
+                    // Buffer too small for even one entry — return ERANGE
+                    return Err(Errno::ERANGE);
+                }
+                break; // buffer full, stop here
+            }
+
+            output.extend_from_slice(&rec);
+            entry_count += 1;
+        }
+
+        // --- Write output to user buffer ---
+        if !output.is_empty() {
+            let user_buf: MutPtr<u8> = MutPtr::from_usize(attr_buf_addr);
+            user_buf.copy_from_slice(0, &output).ok_or(Errno::EFAULT)?;
+        }
+
+        // --- Advance the directory enumeration position ---
+        {
+            let mut positions = self.dir_positions.lock();
+            positions.insert(raw_fd, current_pos + entry_count);
+        }
+
+        // Return the number of entries packed
+        Ok(entry_count)
     }
 }

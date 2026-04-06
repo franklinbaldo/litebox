@@ -10,9 +10,9 @@ use alloc::boxed::Box;
 use litebox::platform::{
     Instant as _, RawConstPointer as _, RawMutPointer as _, ThreadProvider as _, TimeProvider as _,
 };
+use litebox_common_macos::PtRegs;
 use litebox_common_macos::errno::Errno;
 use litebox_common_macos::syscall::mach_trap;
-use litebox_common_macos::PtRegs;
 
 use crate::{MutPtr, ShimFS, Task};
 
@@ -444,6 +444,7 @@ impl<FS: ShimFS> Task<FS> {
             }),
             blocked_signals: core::sync::atomic::AtomicU32::new(0),
             wait_state: crate::wait::WaitState::new(self.global.platform),
+            dir_positions: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
         };
 
         let r = unsafe {

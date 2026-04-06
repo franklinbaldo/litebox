@@ -838,10 +838,7 @@ fn test_mach_semaphore() {
 #[allow(clippy::cast_precision_loss)]
 fn test_run_system_true() {
     let true_path = std::path::Path::new("/usr/bin/true");
-    assert!(
-        true_path.exists(),
-        "/usr/bin/true not found on this system"
-    );
+    assert!(true_path.exists(), "/usr/bin/true not found on this system");
 
     let cache_dir = std::path::Path::new("/System/Cryptexes/OS/System/Library/dyld");
     assert!(
@@ -875,12 +872,8 @@ fn test_run_system_true() {
     let binary_data = std::fs::read(true_path).expect("read /usr/bin/true");
     eprintln!("Read /usr/bin/true: {} bytes", binary_data.len());
 
-    let (exit_code, _stdout) = common::run_macho_dynamic(
-        &binary_data,
-        &["/usr/bin/true"],
-        &cache_result,
-        "true",
-    );
+    let (exit_code, _stdout) =
+        common::run_macho_dynamic(&binary_data, &["/usr/bin/true"], &cache_result, "true");
     assert_eq!(exit_code, 0, "/usr/bin/true exited with code {exit_code}");
 }
 
@@ -954,12 +947,8 @@ fn test_run_system_ls() {
     eprintln!("Read /bin/ls: {} bytes", binary_data.len());
 
     // Try to list /tmp — a directory we create in the in-mem FS.
-    let (exit_code, _stdout) = common::run_macho_dynamic(
-        &binary_data,
-        &["/bin/ls", "/tmp"],
-        &cache_result,
-        "ls",
-    );
+    let (exit_code, _stdout) =
+        common::run_macho_dynamic(&binary_data, &["/bin/ls", "/tmp"], &cache_result, "ls");
     // ls /tmp on an empty dir should exit 0
     eprintln!("/bin/ls exited with code {exit_code}");
     assert_eq!(exit_code, 0, "/bin/ls /tmp exited with code {exit_code}");

@@ -224,61 +224,6 @@ const MACOS_SIGBUS: i32 = 10;
 /// Hardware page size on macOS arm64 (16 KB).
 const HW_PAGE_SIZE: u64 = 16384;
 
-/// Diagnostic: write a short message to stderr via raw SVC #0x80 (bypasses libc).
-/// Only used temporarily during debugging — remove when done.
-#[allow(dead_code)]
-unsafe fn raw_diag(msg: &[u8]) {
-    // write(2 /*stderr*/, msg, len) via raw SVC #0x80
-    unsafe {
-        core::arch::asm!(
-            "mov x0, #2",
-            "mov x16, #4",       // SYS_write = 4 on macOS
-            "svc #0x80",
-            in("x1") msg.as_ptr(),
-            in("x2") msg.len(),
-            lateout("x0") _,
-            lateout("x16") _,
-            options(nostack)
-        );
-    }
-}
-
-/// Diagnostic: write a prefix followed by a u64 value in hex, then newline.
-#[allow(dead_code)]
-unsafe fn raw_diag_hex(prefix: &[u8], val: u64) {
-    unsafe { raw_diag(prefix); }
-    let mut buf = [b'0'; 18]; // "0x" + 16 hex digits
-    buf[0] = b'0';
-    buf[1] = b'x';
-    let hex = b"0123456789abcdef";
-    for i in 0..16 {
-        let nibble = ((val >> (60 - i * 4)) & 0xF) as usize;
-        buf[2 + i] = hex[nibble];
-    }
-    unsafe { raw_diag(&buf); }
-    unsafe { raw_diag(b"\n"); }
-}
-
-/// Diagnostic: write a prefix followed by a u32 decimal value, then newline.
-#[allow(dead_code)]
-unsafe fn raw_diag_u32(prefix: &[u8], val: u32) {
-    unsafe { raw_diag(prefix); }
-    if val == 0 {
-        unsafe { raw_diag(b"0\n"); }
-        return;
-    }
-    let mut buf = [0u8; 10];
-    let mut v = val;
-    let mut pos = 10;
-    while v > 0 {
-        pos -= 1;
-        buf[pos] = b'0' + (v % 10) as u8;
-        v /= 10;
-    }
-    unsafe { raw_diag(&buf[pos..]); }
-    unsafe { raw_diag(b"\n"); }
-}
-
 /// A file-backed source for demand-paging shared cache pages.
 ///
 /// When a SIGBUS occurs at a faulting address within `[vm_start, vm_end)`,
@@ -450,6 +395,7 @@ impl<FS: ShimFS> MacosShim<FS> {
                 init_state: litebox::sync::Mutex::new(ThreadInitState::None),
                 blocked_signals: AtomicU32::new(0),
                 wait_state: wait::WaitState::new(self.0.platform),
+                dir_positions: litebox::sync::Mutex::new(BTreeMap::new()),
             },
         };
 
@@ -505,7 +451,11 @@ impl<FS: ShimFS> MacosShim<FS> {
     /// `mprotect(RW)` → patch → `mprotect(RX)` without re-mapping.
     /// `demand_page_sources` provides file-backed data for SIGBUS demand-paging
     /// of shared cache pages that the host's shared region doesn't serve.
-    #[allow(clippy::missing_panics_doc, clippy::cast_possible_truncation, clippy::too_many_arguments)]
+    #[allow(
+        clippy::missing_panics_doc,
+        clippy::cast_possible_truncation,
+        clippy::too_many_arguments
+    )]
     pub fn install_shared_cache(
         &self,
         cache_base: u64,
@@ -539,14 +489,12 @@ impl<FS: ShimFS> MacosShim<FS> {
         }));
         all_extents.extend(patch_in_place_text.iter().map(|&(addr, len)| {
             let aligned_start = addr & !(PAGE_SIZE as u64 - 1);
-            let aligned_end =
-                (addr + len as u64 + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
+            let aligned_end = (addr + len as u64 + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
             (aligned_start, aligned_end)
         }));
         all_extents.sort_unstable();
 
         // Pass 1: map ALL regions as RW at their fixed addresses.
-        unsafe { raw_diag(b"[diag] Pass 1: map regions\n"); }
         // For regions on macOS-on-macOS, the host process may already have
         // these regions mapped from its own shared cache.  Mapping failures
         // are silently ignored — the host data is the same as what we would
@@ -606,7 +554,6 @@ impl<FS: ShimFS> MacosShim<FS> {
         }
 
         // Pass 1.5: register VMAs for reserved extents (overlapping host cache
-        unsafe { raw_diag(b"[diag] Pass 1.5: register VMAs\n"); }
         // pages) so that the VMA system knows about them.  Without this,
         // mach_vm_protect / mprotect calls on these addresses fail with
         // "no mapping at this address" (InvalidRange → EACCES).
@@ -669,7 +616,6 @@ impl<FS: ShimFS> MacosShim<FS> {
         }
 
         // Pass 2: for each executable region that was successfully mapped,
-        unsafe { raw_diag(b"[diag] Pass 2: patch heap-backed exec\n"); }
         // find a nearby gap for the trampoline, patch SVC sites, and set R-X
         // permissions.
         for (idx, &(guest_addr, data, is_executable)) in regions.iter().enumerate() {
@@ -736,10 +682,7 @@ impl<FS: ShimFS> MacosShim<FS> {
                 unsafe { core::slice::from_raw_parts_mut(tramp_addr_usize as *mut u8, tramp_size) };
 
             let mut tramp_cursor = 0usize;
-            let sites = litebox_syscall_rewriter_macho::scan_svc_sites(
-                code_to_patch,
-                guest_addr,
-            );
+            let sites = litebox_syscall_rewriter_macho::scan_svc_sites(code_to_patch, guest_addr);
             tramp_cursor = litebox_syscall_rewriter_macho::patch_code_segment_prescan(
                 code_to_patch,
                 tramp_slice,
@@ -814,7 +757,6 @@ impl<FS: ShimFS> MacosShim<FS> {
         // library code — are intercepted by the litebox shim.
 
         // Phase A: pre-compute everything while libc/malloc still works.
-        unsafe { raw_diag(b"[diag] Pass 3 Phase A: pre-compute\n"); }
         #[allow(clippy::items_after_statements)]
         struct SegmentPlan {
             aligned_start: u64,
@@ -856,9 +798,8 @@ impl<FS: ShimFS> MacosShim<FS> {
         }
 
         // Compute aligned range for each original segment and sort.
-        let mut entries: alloc::vec::Vec<AlignedEntry> = alloc::vec::Vec::with_capacity(
-            patch_in_place_text.len(),
-        );
+        let mut entries: alloc::vec::Vec<AlignedEntry> =
+            alloc::vec::Vec::with_capacity(patch_in_place_text.len());
         for &(guest_addr, len) in patch_in_place_text {
             let a_start = guest_addr & !(HW_PAGE_SIZE - 1);
             let a_end = (guest_addr + len as u64 + HW_PAGE_SIZE - 1) & !(HW_PAGE_SIZE - 1);
@@ -888,8 +829,7 @@ impl<FS: ShimFS> MacosShim<FS> {
         }
 
         // Step 3: Build plans from merged ranges.
-        let mut plans: alloc::vec::Vec<SegmentPlan> =
-            alloc::vec::Vec::with_capacity(merged.len());
+        let mut plans: alloc::vec::Vec<SegmentPlan> = alloc::vec::Vec::with_capacity(merged.len());
 
         for me in &merged {
             let aligned_start = me.aligned_start;
@@ -934,11 +874,14 @@ impl<FS: ShimFS> MacosShim<FS> {
             // If no code to patch (all segments were sigtramp), we still
             // need to MAP_FIXED + copy to avoid leaving a hole.  But we
             // can skip the trampoline.  Use total_code_len for sizing.
-            let code_len_for_tramp = if total_code_len == 0 { aligned_len } else { total_code_len };
+            let code_len_for_tramp = if total_code_len == 0 {
+                aligned_len
+            } else {
+                total_code_len
+            };
 
             // Find trampoline gap while malloc still works.
-            let tramp_size =
-                ((code_len_for_tramp / (1024 * 1024)) + 1) * 4 * HW_PAGE_SIZE as usize;
+            let tramp_size = ((code_len_for_tramp / (1024 * 1024)) + 1) * 4 * HW_PAGE_SIZE as usize;
             let code_mid = aligned_start + aligned_len as u64 / 2;
             let branch_range: u64 = 128 * 1024 * 1024;
             let candidates = Self::find_trampoline_gap_candidates(
@@ -987,9 +930,9 @@ impl<FS: ShimFS> MacosShim<FS> {
         let mut saved_sigsegv = [0u8; 24];
         let mut saved_sigtrap = [0u8; 24];
         unsafe {
-            raw_sigaction_set(10, &dfl_sa, &mut saved_sigbus);  // SIGBUS
+            raw_sigaction_set(10, &dfl_sa, &mut saved_sigbus); // SIGBUS
             raw_sigaction_set(11, &dfl_sa, &mut saved_sigsegv); // SIGSEGV
-            raw_sigaction_set(5, &dfl_sa, &mut saved_sigtrap);  // SIGTRAP
+            raw_sigaction_set(5, &dfl_sa, &mut saved_sigtrap); // SIGTRAP
         }
 
         // Phase B: replace shared cache __TEXT pages with private copies.
@@ -1015,7 +958,6 @@ impl<FS: ShimFS> MacosShim<FS> {
         // This avoids the chicken-and-egg problem: patching code requires
         // writing to code pages (RW), but the patching code itself calls
         // `memcpy` which must be on executable pages (R-X).
-        unsafe { raw_diag(b"[diag] Pass 3 Phase B: raw-syscall patching\n"); }
 
         // B.1: MAP_FIXED + volatile copy-back for ALL plans.
         for plan in &plans {
@@ -1028,7 +970,9 @@ impl<FS: ShimFS> MacosShim<FS> {
                 )
             };
             match map_result {
-                Err(_) | Ok(0) => { continue; },
+                Err(_) | Ok(0) => {
+                    continue;
+                }
                 Ok(returned_addr) => {
                     if returned_addr != plan.aligned_start as usize {
                         continue;
@@ -1051,7 +995,6 @@ impl<FS: ShimFS> MacosShim<FS> {
                 }
             }
         }
-        unsafe { raw_diag(b"[B]copy-all\n"); }
 
         // B.2: mprotect ALL code pages to R-X.
         // After this, `memcpy` and other shared cache functions are
@@ -1065,7 +1008,6 @@ impl<FS: ShimFS> MacosShim<FS> {
                 )
             };
         }
-        unsafe { raw_diag(b"[B]prot-rx\n"); }
 
         // B.3: Patch SVCs and set up trampolines.
         // At this point, all shared cache code is R-X.  For each plan
@@ -1073,20 +1015,12 @@ impl<FS: ShimFS> MacosShim<FS> {
         // then restore R-X.  `memcpy` calls during patching are safe
         // because other plans' code pages (including the one containing
         // `memcpy`) remain R-X.
-        for (pidx, plan) in plans.iter().enumerate() {
+        for plan in &plans {
             if plan.svc_sites.is_empty() {
                 continue;
             }
 
-            // Diagnostic: which plan are we patching?
-            unsafe {
-                raw_diag(b"[B3]p=");
-                raw_diag_u32(b"", pidx as u32);
-                raw_diag_hex(b" a=", plan.aligned_start);
-                raw_diag_hex(b" l=", plan.aligned_len as u64);
-                raw_diag_u32(b" svcs=", plan.svc_sites.len() as u32);
-                raw_diag(b"\n");
-            }
+            // Patch SVC sites for this plan.
 
             // Allocate trampoline pages (RW).
             let tramp_result = unsafe {
@@ -1097,7 +1031,9 @@ impl<FS: ShimFS> MacosShim<FS> {
                     RAW_MAP_ANON | RAW_MAP_PRIVATE | RAW_MAP_FIXED,
                 )
             };
-            let Ok(tramp_addr_usize) = tramp_result else { continue; };
+            let Ok(tramp_addr_usize) = tramp_result else {
+                continue;
+            };
 
             // Make code pages RW for patching.
             let _ = unsafe {
@@ -1107,7 +1043,6 @@ impl<FS: ShimFS> MacosShim<FS> {
                     RAW_PROT_READ | RAW_PROT_WRITE,
                 )
             };
-            unsafe { raw_diag(b"[B3]rw-ok\n"); }
 
             // Patch SVCs.  The full aligned region is passed as code;
             // SVC site file_offsets are relative to its start.
@@ -1129,7 +1064,6 @@ impl<FS: ShimFS> MacosShim<FS> {
                 syscall_entry as u64,
                 &plan.svc_sites,
             ) else {
-                unsafe { raw_diag(b"[B3]patch-ERR\n"); }
                 // Restore R-X even on error.
                 let _ = unsafe {
                     raw_mprotect(
@@ -1140,7 +1074,6 @@ impl<FS: ShimFS> MacosShim<FS> {
                 };
                 continue;
             };
-            unsafe { raw_diag(b"[B3]patch-ok\n"); }
 
             // Write TLS table address into trampoline header at offset 8.
             // Use volatile writes to avoid calling memcpy (which may be on
@@ -1166,10 +1099,13 @@ impl<FS: ShimFS> MacosShim<FS> {
                 )
             };
             let _ = unsafe {
-                raw_mprotect(tramp_addr_usize, plan.tramp_size, RAW_PROT_READ | RAW_PROT_EXEC)
+                raw_mprotect(
+                    tramp_addr_usize,
+                    plan.tramp_size,
+                    RAW_PROT_READ | RAW_PROT_EXEC,
+                )
             };
         }
-        unsafe { raw_diag(b"[B]patched\n"); }
 
         // NOTE: Signal handlers remain SIG_DFL here.  They cannot be
         // restored yet because the install thread has no TLS entry —
@@ -1191,7 +1127,6 @@ impl<FS: ShimFS> MacosShim<FS> {
         core::mem::forget(plans);
 
         // Pass 4: reset in-place __DATA segments to pristine state.
-        unsafe { raw_diag(b"[diag] Pass 4: reset __DATA\n"); }
         //
         // On macOS-on-macOS, the host process's dyld has already COW-ed shared
         // cache __DATA pages (e.g. setting sMemoryManagerInitialized = true).
@@ -1208,11 +1143,7 @@ impl<FS: ShimFS> MacosShim<FS> {
             // already mapped in our address space.  We are overwriting it with
             // pristine content of the same size.  The kernel will COW the page.
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    data.as_ptr(),
-                    addr as *mut u8,
-                    data.len(),
-                );
+                core::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len());
             }
         }
 
@@ -1222,11 +1153,8 @@ impl<FS: ShimFS> MacosShim<FS> {
             .store(cache_base, Ordering::Release);
         // Record the cache end address from reserved_extents.
         if let Some(max_end) = reserved_extents.iter().map(|&(_, end)| end).max() {
-            self.0
-                .shared_cache_end
-                .store(max_end, Ordering::Release);
+            self.0.shared_cache_end.store(max_end, Ordering::Release);
         }
-        unsafe { raw_diag(b"[diag] install_shared_cache done\n"); }
     }
 
     /// Find page-aligned gap candidates within `±branch_range` of `code_mid`
@@ -1409,7 +1337,9 @@ impl<FS: ShimFS> litebox::shim::EnterShim for MacosShimEntrypoints<FS> {
             let fault_addr = info.fault_address as u64;
             let in_demand_range = {
                 let ranges = self.task.global.demand_page_ranges.read();
-                ranges.iter().any(|&(start, end)| fault_addr >= start && fault_addr < end)
+                ranges
+                    .iter()
+                    .any(|&(start, end)| fault_addr >= start && fault_addr < end)
             };
             if in_demand_range {
                 let hw_page_mask = HW_PAGE_SIZE - 1;
@@ -1702,6 +1632,9 @@ struct Task<FS: ShimFS> {
     blocked_signals: AtomicU32,
     /// Per-thread wait state for interruptible waits (pipes, futexes, etc.).
     wait_state: wait::WaitState,
+    /// Directory enumeration positions for getattrlistbulk.
+    /// Maps raw fd number -> number of entries already returned.
+    dir_positions: litebox::sync::Mutex<Platform, BTreeMap<usize, usize>>,
 }
 
 impl<FS: ShimFS> Task<FS> {
@@ -1785,30 +1718,6 @@ impl<FS: ShimFS> Task<FS> {
         clippy::cast_possible_truncation
     )]
     fn handle_syscall_request(&self, ctx: &mut PtRegs) {
-        // Debug: trace all syscall numbers
-        if cfg!(debug_assertions) {
-            let nr = ctx.regs[16];
-            if (nr as i64) < 0 {
-                let trap = (-(nr as i64)) as usize;
-                log_unsupported!(
-                    "TRACE: mach_trap({trap}) x0={:#x} x1={:#x} x2={:#x} x3={:#x}",
-                    ctx.regs[0],
-                    ctx.regs[1],
-                    ctx.regs[2],
-                    ctx.regs[3]
-                );
-            } else {
-                log_unsupported!(
-                    "TRACE: syscall({nr}) x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x} x5={:#x}",
-                    ctx.regs[0],
-                    ctx.regs[1],
-                    ctx.regs[2],
-                    ctx.regs[3],
-                    ctx.regs[4],
-                    ctx.regs[5]
-                );
-            }
-        }
         let request = litebox_common_macos::syscall::MacosSyscallRequest::try_from_raw(ctx);
 
         // Sigreturn restores the full register set (including pstate) and must
@@ -1952,7 +1861,9 @@ const SYS_SIGACTION: u64 = 46;
 #[allow(dead_code)]
 unsafe fn raw_sigaction_dfl(signum: i32) {
     let mut old_sa: [u8; 24] = [0; 24];
-    unsafe { raw_sigaction_set(signum, &[0u8; 24], &mut old_sa); }
+    unsafe {
+        raw_sigaction_set(signum, &[0u8; 24], &mut old_sa);
+    }
 }
 
 /// Set a signal action via raw `SVC #0x80`, saving the old action.
@@ -1982,8 +1893,5 @@ unsafe fn raw_sigaction_set(signum: i32, new_sa: &[u8; 24], old_sa: &mut [u8; 24
             out("x16") _,
         );
     }
-    if err_flag != 0 {
-        unsafe { raw_diag(b"[B]sigaction-fail\n"); }
-    }
-    let _ = ret;
+    let _ = (err_flag, ret);
 }

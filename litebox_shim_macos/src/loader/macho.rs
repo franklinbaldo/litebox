@@ -14,12 +14,12 @@ use alloc::ffi::CString;
 use alloc::vec::Vec;
 use litebox::mm::linux::{CreatePagesFlags, PAGE_SIZE};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, SystemInfoProvider as _};
+use object::Endianness;
 use object::macho;
 use object::read::macho::MachHeader;
-use object::Endianness;
 
 use super::stack::UserStack;
-use super::{DyldLoadInfo, MachoLoadInfo, MachoLoaderError, DEFAULT_LOW_ADDR, DEFAULT_STACK_SIZE};
+use super::{DEFAULT_LOW_ADDR, DEFAULT_STACK_SIZE, DyldLoadInfo, MachoLoadInfo, MachoLoaderError};
 use crate::{MutPtr, ShimFS, Task};
 
 /// Byte offset of the PC register within an LC_UNIXTHREAD ARM64 thread state command.
@@ -304,9 +304,9 @@ pub(crate) fn load<FS: ShimFS>(
     const TLS_TABLE_TOTAL_ENTRIES: usize = TLS_TABLE_USABLE_ENTRIES + TLS_TABLE_OVERFLOW_ENTRIES;
     #[allow(clippy::items_after_statements)]
     const TLS_TABLE_SIZE: usize = TLS_TABLE_TOTAL_ENTRIES * TLS_ENTRY_SIZE; // 4224 bytes
-                                                                            // On macOS aarch64, the host page size is 16KB. Align the TLS table
-                                                                            // to 16KB to ensure it gets its own host page and doesn't share a
-                                                                            // page with any trampoline (which may be mprotected to R-X).
+    // On macOS aarch64, the host page size is 16KB. Align the TLS table
+    // to 16KB to ensure it gets its own host page and doesn't share a
+    // page with any trampoline (which may be mprotected to R-X).
     #[allow(clippy::items_after_statements)]
     const HOST_PAGE_SIZE: usize = 16384;
 

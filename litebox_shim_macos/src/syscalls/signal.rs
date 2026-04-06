@@ -6,8 +6,8 @@
 use core::sync::atomic::Ordering;
 use litebox::platform::RawConstPointer as _;
 use litebox::platform::RawMutPointer as _;
-use litebox_common_macos::errno::Errno;
 use litebox_common_macos::PtRegs;
+use litebox_common_macos::errno::Errno;
 
 use crate::{ConstPtr, MutPtr, ShimFS, Task};
 

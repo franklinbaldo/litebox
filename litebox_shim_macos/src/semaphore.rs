@@ -183,8 +183,7 @@ impl<FS: ShimFS> Task<FS> {
                 return;
             }
             // Remove our waiter from the queue and undo the count decrement.
-            sem.waiters
-                .retain(|w| !Arc::ptr_eq(&w.signaled, signaled));
+            sem.waiters.retain(|w| !Arc::ptr_eq(&w.signaled, signaled));
             sem.count += 1;
         }
     }

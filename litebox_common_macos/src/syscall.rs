@@ -94,6 +94,17 @@ pub mod nr {
     pub const FSGETPATH: usize = 427;
     pub const ULOCK_WAIT: usize = 515;
     pub const ULOCK_WAKE: usize = 516;
+    pub const FCHDIR: usize = 13;
+    pub const FSTATFS64: usize = 346;
+    pub const READ_NOCANCEL: usize = 396;
+    pub const WRITE_NOCANCEL: usize = 397;
+    pub const OPEN_NOCANCEL: usize = 398;
+    pub const CLOSE_NOCANCEL: usize = 399;
+    pub const GUARDED_OPEN_NP: usize = 441;
+    pub const GUARDED_CLOSE_NP: usize = 442;
+    pub const CHANGE_FDGUARD_NP: usize = 444;
+    pub const GETATTRLISTBULK: usize = 461;
+    pub const GUARDED_WRITE_NP: usize = 485;
 }
 
 /// Mach trap numbers (negative x16 values, stored as positive constants).
@@ -506,6 +517,43 @@ pub enum MacosSyscallRequest {
         addr: usize,
         wake_value: u64,
     },
+    /// `fstatfs64(fd, buf)` — get filesystem info by fd.
+    Fstatfs64Fd {
+        fd: i32,
+        buf: usize,
+    },
+    /// `fchdir(fd)` — change working directory by fd.
+    Fchdir {
+        fd: i32,
+    },
+    /// `change_fdguard_np(fd, guard, guardflags, nguard, nguardflags, fdflagsp)` — change guard.
+    ChangeFdguardNp {
+        fd: i32,
+    },
+    /// `guarded_close_np(fd, guard)` — close a guarded fd.
+    GuardedCloseNp {
+        fd: i32,
+    },
+    /// `guarded_write_np(fd, guard, buf, nbyte)` — write to a guarded fd.
+    GuardedWriteNp {
+        fd: i32,
+        buf: usize,
+        count: usize,
+    },
+    /// `guarded_open_np(path, guard, guardflags, flags, mode)` — open with a guard.
+    GuardedOpenNp {
+        path: usize,
+        flags: i32,
+        mode: u32,
+    },
+    /// `getattrlistbulk(dirfd, alist, attributeBuffer, bufferSize, options)`
+    GetattrlistBulk {
+        dirfd: i32,
+        alist: usize,
+        attr_buf: usize,
+        attr_buf_size: usize,
+        options: u64,
+    },
     Unknown {
         number: usize,
     },
@@ -535,22 +583,22 @@ impl MacosSyscallRequest {
 
         match nr_raw {
             nr::EXIT => MacosSyscallRequest::Exit { status: a0 as i32 },
-            nr::READ => MacosSyscallRequest::Read {
+            nr::READ | nr::READ_NOCANCEL => MacosSyscallRequest::Read {
                 fd: a0 as i32,
                 buf: a1,
                 count: a2,
             },
-            nr::WRITE => MacosSyscallRequest::Write {
+            nr::WRITE | nr::WRITE_NOCANCEL => MacosSyscallRequest::Write {
                 fd: a0 as i32,
                 buf: a1,
                 count: a2,
             },
-            nr::OPEN => MacosSyscallRequest::Open {
+            nr::OPEN | nr::OPEN_NOCANCEL => MacosSyscallRequest::Open {
                 path: a0,
                 flags: a1 as i32,
                 mode: a2 as u32,
             },
-            nr::CLOSE => MacosSyscallRequest::Close { fd: a0 as i32 },
+            nr::CLOSE | nr::CLOSE_NOCANCEL => MacosSyscallRequest::Close { fd: a0 as i32 },
             nr::GETPID => MacosSyscallRequest::Getpid,
             nr::GETUID => MacosSyscallRequest::Getuid,
             nr::GETEUID => MacosSyscallRequest::Geteuid,
@@ -877,6 +925,37 @@ impl MacosSyscallRequest {
                 operation: a0 as u32,
                 addr: a1,
                 wake_value: a2 as u64,
+            },
+            nr::FSTATFS64 => MacosSyscallRequest::Fstatfs64Fd {
+                fd: a0 as i32,
+                buf: a1,
+            },
+            nr::FCHDIR => MacosSyscallRequest::Fchdir { fd: a0 as i32 },
+            // guarded variants — real syscall numbers (441, 442, 444, 485)
+            nr::GUARDED_OPEN_NP => MacosSyscallRequest::GuardedOpenNp {
+                path: a0,
+                // a1 = guard pointer (ignored)
+                // a2 = guardflags (ignored)
+                flags: a3 as i32,
+                mode: a4 as u32,
+            },
+            nr::GUARDED_CLOSE_NP => MacosSyscallRequest::GuardedCloseNp {
+                fd: a0 as i32,
+                // a1 = guard pointer (ignored)
+            },
+            nr::CHANGE_FDGUARD_NP => MacosSyscallRequest::ChangeFdguardNp { fd: a0 as i32 },
+            nr::GETATTRLISTBULK => MacosSyscallRequest::GetattrlistBulk {
+                dirfd: a0 as i32,
+                alist: a1,
+                attr_buf: a2,
+                attr_buf_size: a3,
+                options: a4 as u64,
+            },
+            nr::GUARDED_WRITE_NP => MacosSyscallRequest::GuardedWriteNp {
+                fd: a0 as i32,
+                // a1 = guard pointer (ignored)
+                buf: a2,
+                count: a3,
             },
             _ => MacosSyscallRequest::Unknown { number: nr_raw },
         }
