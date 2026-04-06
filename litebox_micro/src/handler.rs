@@ -1818,21 +1818,35 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
             && cq.result >= 0
             && cq.data_len == core::mem::size_of::<litebox_ipc::messages::OpenResponse>() as u32
         {
-            let micro = unsafe { &mut *(*tls).micro };
-            let data_base = unsafe { micro.ring_base.add(micro.layout.data_region_offset) };
+            // Use an immutable borrow first to read the response and look up source fd info
+            // for dup operations, before taking a mutable borrow for register_file_fd.
+            let state = unsafe { &*(*tls).micro };
+            let data_base = unsafe { state.ring_base.add(state.layout.data_region_offset) };
             let resp = unsafe {
                 &*(data_base
                     .add(cq.data_offset as usize)
                     .cast::<litebox_ipc::messages::OpenResponse>())
             };
             if resp.file_slot_offset != 0 {
-                micro.register_file_fd(
-                    resp.fd,
-                    resp.file_slot_offset,
-                    resp.tar_offset,
-                    resp.tar_len,
-                    resp.aligned_offset,
-                );
+                // For dup/dup2/dup3, inherit tar/aligned info from the source fd
+                // since central doesn't propagate it.
+                #[allow(clippy::cast_possible_truncation)]
+                let (tar_offset, tar_len, aligned_offset) =
+                    if matches!(i64::from(nr), libc::SYS_dup | libc::SYS_dup2 | libc::SYS_dup3) {
+                        let source_fd = args.args[0] as i32;
+                        if let Some(source_entry) = state.find_file_fd_entry(source_fd) {
+                            (source_entry.tar_offset, source_entry.tar_len, source_entry.aligned_offset)
+                        } else {
+                            (resp.tar_offset, resp.tar_len, resp.aligned_offset)
+                        }
+                    } else {
+                        (resp.tar_offset, resp.tar_len, resp.aligned_offset)
+                    };
+                let fd = resp.fd;
+                let file_slot_offset = resp.file_slot_offset;
+                // Now take the mutable borrow for registration.
+                let micro = unsafe { &mut *(*tls).micro };
+                micro.register_file_fd(fd, file_slot_offset, tar_offset, tar_len, aligned_offset);
             }
             return cq.result; // return the fd
         }
