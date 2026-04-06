@@ -974,35 +974,43 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 });
                 drop(ns);
 
-                // For read-only opens, check if the file is in the tar shmem
-                // region and populate tar_offset/tar_len so micro can serve
-                // reads locally without a central round-trip.
-                let is_rdonly = flags_arg & (libc::O_WRONLY | libc::O_RDWR) == 0;
-                let (tar_off, tar_ln, tar_path) = if is_rdonly && !pathname_buf.is_empty() {
-                    // pathname_buf is a null-terminated C string from micro.
+                // Parse the normalized path from pathname_buf once for both
+                // tar lookup and inmem tracking.
+                let normalized_path = if pathname_buf.is_empty() {
+                    None
+                } else {
                     let path_bytes = if let Some(nul) = pathname_buf.iter().position(|&b| b == 0) {
                         &pathname_buf[..nul]
                     } else {
                         &pathname_buf[..]
                     };
-                    if let Ok(path_str) = core::str::from_utf8(path_bytes) {
-                        // Tar paths are stored without leading '/'.
-                        let normalized = path_str.strip_prefix('/').unwrap_or(path_str);
-                        if let Some(range) = self.tar_file_map.get(normalized) {
-                            (range.start as u64, (range.end - range.start) as u64, Some(normalized.to_string()))
+                    core::str::from_utf8(path_bytes).ok().map(|s| {
+                        // Tar and inmem paths are stored without leading '/'.
+                        s.strip_prefix('/').unwrap_or(s).to_string()
+                    })
+                };
+
+                // For read-only opens, check if the file is in the tar shmem
+                // region and populate tar_offset/tar_len so micro can serve
+                // reads locally without a central round-trip.
+                let is_rdonly = flags_arg & (libc::O_WRONLY | libc::O_RDWR) == 0;
+                let (tar_off, tar_ln) = if is_rdonly {
+                    if let Some(ref np) = normalized_path {
+                        if let Some(range) = self.tar_file_map.get(np.as_str()) {
+                            (range.start as u64, (range.end - range.start) as u64)
                         } else {
-                            (0, 0, None)
+                            (0, 0)
                         }
                     } else {
-                        (0, 0, None)
+                        (0, 0)
                     }
                 } else {
-                    (0, 0, None)
+                    (0, 0)
                 };
 
                 // Look up the aligned memfd offset for tar-backed files.
                 let aligned_off = if tar_off != 0 {
-                    tar_path.as_deref()
+                    normalized_path.as_deref()
                         .and_then(|p| self.aligned_file_map.get(p))
                         .map_or(0, |&(start, _size)| start as u64)
                 } else {
@@ -1015,19 +1023,12 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 }
 
                 // For non-tar files, track fd→path and look up inmem shmem slot.
-                let inmem_slot = if tar_off == 0 && !pathname_buf.is_empty() {
-                    let path_bytes = if let Some(nul) = pathname_buf.iter().position(|&b| b == 0) {
-                        &pathname_buf[..nul]
-                    } else {
-                        &pathname_buf[..]
-                    };
-                    if let Ok(path_str) = core::str::from_utf8(path_bytes) {
-                        let normalized = path_str.strip_prefix('/').unwrap_or(path_str);
-                        let norm_owned = normalized.to_string();
-                        self.fd_path_map.borrow_mut().insert(new_fd, norm_owned.clone());
+                let inmem_slot = if tar_off == 0 {
+                    if let Some(ref np) = normalized_path {
+                        self.fd_path_map.borrow_mut().insert(new_fd, np.clone());
                         // Check if this path already has inmem shmem data.
                         self.inmem_file_map.lock().unwrap()
-                            .get(&norm_owned)
+                            .get(np)
                             .copied()
                             .unwrap_or(litebox_ipc::inmem_shmem::INMEM_NO_SLOT)
                     } else {
@@ -2290,8 +2291,9 @@ impl<FS: ShimFS> ProcessServer<FS> {
     /// After a successful write to an in-mem file, copy the file data to the
     /// inmem shmem region so micro can read it via the fast-path.
     ///
-    /// Uses `dispatch_to_task(SYS_lseek)` to query the file size and
-    /// `dispatch_to_task(SYS_pread64)` to read the data into shmem.
+    /// Uses `dispatch_to_task(SYS_fstat)` to query the file size (without
+    /// disturbing the cursor) and `dispatch_to_task(SYS_pread64)` to read
+    /// the data into shmem.
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -2299,13 +2301,10 @@ impl<FS: ShimFS> ProcessServer<FS> {
         clippy::field_reassign_with_default
     )]
     fn maybe_sync_inmem_write(&self, thread_slot: u16, fd: i32) {
-        // 1. Check if allocator is available.
-        {
-            let alloc = self.inmem_alloc.lock().unwrap();
-            if !alloc.is_available() {
-                return;
-            }
-        }
+        // 1. Skip if fd not in fd_path_map (cheapest check — no lock needed).
+        let Some(path) = self.fd_path_map.borrow().get(&fd).cloned() else {
+            return;
+        };
 
         // 2. Skip pipes and sockets.
         {
@@ -2318,51 +2317,31 @@ impl<FS: ShimFS> ProcessServer<FS> {
             }
         }
 
-        // 3. Skip if fd not in fd_path_map (not an in-mem file we're tracking).
-        let Some(path) = self.fd_path_map.borrow().get(&fd).cloned() else {
-            return;
-        };
-
-        // 4. Get file size via lseek(SEEK_END), saving and restoring position.
-        let old_pos = {
-            let mut regs = litebox_common_linux::PtRegs::default();
-            regs.orig_rax = libc::SYS_lseek as usize;
-            regs.rdi = fd as usize;
-            regs.rsi = 0;
-            regs.rdx = libc::SEEK_CUR as usize;
-            self.dispatch_to_task(thread_slot, &mut regs)
-        };
-        if old_pos < 0 {
-            return;
+        // 3. Check if allocator is available.
+        {
+            let alloc = self.inmem_alloc.lock().unwrap();
+            if !alloc.is_available() {
+                return;
+            }
         }
 
+        // 4. Get file size via fstat (does not disturb the file cursor,
+        //    preserving O_APPEND semantics).
+        let mut stat_buf = [0u8; 144];
         let file_size = {
             let mut regs = litebox_common_linux::PtRegs::default();
-            regs.orig_rax = libc::SYS_lseek as usize;
+            regs.orig_rax = libc::SYS_fstat as usize;
             regs.rdi = fd as usize;
-            regs.rsi = 0;
-            regs.rdx = libc::SEEK_END as usize;
-            self.dispatch_to_task(thread_slot, &mut regs)
+            regs.rsi = stat_buf.as_mut_ptr() as usize;
+            let result = self.dispatch_to_task(thread_slot, &mut regs);
+            if result < 0 {
+                return;
+            }
+            // st_size is at offset 48 in struct stat (i64, little-endian).
+            i64::from_le_bytes(stat_buf[48..56].try_into().unwrap())
         };
         if file_size <= 0 {
-            // Restore position.
-            let mut regs = litebox_common_linux::PtRegs::default();
-            regs.orig_rax = libc::SYS_lseek as usize;
-            regs.rdi = fd as usize;
-            regs.rsi = old_pos as usize;
-            regs.rdx = libc::SEEK_SET as usize;
-            self.dispatch_to_task(thread_slot, &mut regs);
             return;
-        }
-
-        // Restore position.
-        {
-            let mut regs = litebox_common_linux::PtRegs::default();
-            regs.orig_rax = libc::SYS_lseek as usize;
-            regs.rdi = fd as usize;
-            regs.rsi = old_pos as usize;
-            regs.rdx = libc::SEEK_SET as usize;
-            self.dispatch_to_task(thread_slot, &mut regs);
         }
 
         let size = file_size as usize;
@@ -2383,8 +2362,12 @@ impl<FS: ShimFS> ProcessServer<FS> {
             }
         };
 
-        // Get old snapshot to free old data.
-        let old_snapshot = alloc.slot(slot_index).read_snapshot();
+        // Save old data offset/capacity for freeing after update. We read
+        // the snapshot now while we hold the lock and save the values we
+        // need so that re-acquiring the lock later is safe (no stale
+        // pointer dereference).
+        let old_snap = alloc.slot(slot_index).read_snapshot();
+        let (old_data_offset, old_capacity) = (old_snap.data_offset, old_snap.capacity);
 
         // Allocate new data block.
         let Some(data_offset) = alloc.alloc_data(size) else {
@@ -2418,8 +2401,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
         alloc.update_slot(slot_index, data_offset, bytes_read as u64, size as u64);
 
         // Free old data block if one existed.
-        if old_snapshot.data_offset != 0 {
-            alloc.free_data(old_snapshot.data_offset, old_snapshot.capacity as usize);
+        if old_data_offset != 0 {
+            alloc.free_data(old_data_offset, old_capacity as usize);
         }
     }
 

@@ -50,6 +50,7 @@ pub struct InMemAllocator {
     /// Next bump offset (relative to data region start).
     bump: usize,
     /// Free blocks available for reclamation (first-fit).
+    // TODO: add coalescing of adjacent free blocks to reduce fragmentation.
     free_list: Vec<FreeBlock>,
     /// Maximum number of file slots.
     max_slots: u32,
@@ -126,9 +127,14 @@ impl InMemAllocator {
     ///
     /// # Panics
     ///
-    /// Panics if `index >= max_slots`.
+    /// Panics if `index >= max_slots` or (in debug mode) if the slot is
+    /// already in the free list.
     pub fn free_slot(&mut self, index: u32) {
         assert!(index < self.max_slots, "slot index out of range");
+        debug_assert!(
+            !self.slot_free_list.contains(&index),
+            "double-free of slot {index}"
+        );
         // SAFETY: base is valid and index is in range (checked above).
         // We are the sole writer (access serialised by Mutex).
         let slot = unsafe { inmem_shmem::slot_ptr(self.base, index) };
@@ -201,6 +207,8 @@ impl InMemAllocator {
     }
 
     /// Free a data block at the given offset (from region start) with given size.
+    ///
+    /// Returns early (with a warning) if the offset is outside the data region.
     #[allow(clippy::cast_possible_truncation)] // offsets fit in usize on 64-bit
     pub fn free_data(&mut self, offset: u64, size: usize) {
         if !self.is_available() || size == 0 {
@@ -208,10 +216,13 @@ impl InMemAllocator {
         }
 
         let offset_usize = offset as usize;
-        debug_assert!(
-            offset_usize >= self.data_offset,
-            "free_data: offset is before data region"
-        );
+        if offset_usize < self.data_offset {
+            eprintln!(
+                "[inmem_alloc] free_data: offset {offset:#x} is before data region ({:#x})",
+                self.data_offset
+            );
+            return;
+        }
         let relative_offset = offset_usize - self.data_offset;
         let aligned_size = align_up(size, DATA_ALIGNMENT);
 
