@@ -135,10 +135,6 @@ pub struct ProcessServer<FS: ShimFS> {
     aligned_file_map: Arc<HashMap<String, (usize, usize)>>,
     /// Size in bytes of the aligned memfd region.
     aligned_size: usize,
-    /// Map of guest fd → normalized file path (without leading `/`).
-    /// Populated by the openat handler for tar-backed files.
-    /// Used by the mmap handler to resolve fd → aligned memfd offset.
-    fd_path_map: RefCell<HashMap<i32, String>>,
 }
 
 impl<FS: ShimFS> ProcessServer<FS> {
@@ -191,7 +187,6 @@ impl<FS: ShimFS> ProcessServer<FS> {
             tar_file_map,
             aligned_file_map,
             aligned_size,
-            fd_path_map: RefCell::new(HashMap::new()),
         }
     }
 
@@ -750,8 +745,6 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 self.maybe_close_shmem_socket(fd);
                 // If this fd was a shmem file, set CLOSED flag and free slot.
                 self.maybe_close_shmem_file(fd);
-                // Remove from fd -> path mapping.
-                self.fd_path_map.borrow_mut().remove(&fd);
                 cq.result = 0;
                 return cq;
             }
@@ -791,8 +784,6 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     // borrowing notification_state since it borrows internally.
                     if matches!(i64::from(nr), libc::SYS_dup2 | libc::SYS_dup3) {
                         self.maybe_close_shmem_file(new_fd);
-                        // Remove the overwritten fd from the fd -> path mapping.
-                        self.fd_path_map.borrow_mut().remove(&new_fd);
                     }
 
                     // Check if source fd has a shmem file slot.
@@ -947,40 +938,11 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 return cq;
             }
 
-            // Check if this is a file-backed mmap of a tar file in the
-            // aligned memfd — if so, enable phantom mode during shim dispatch
-            // to avoid creating phantom pages in central.
             let is_mmap = nr == libc::SYS_mmap as u32;
-            let tar_aligned_offset = if is_mmap {
-                let flags = entry.args[3] as i32;
-                let fd = entry.args[4] as i32;
-                let file_offset = entry.args[5] as usize;
-                if flags & libc::MAP_ANONYMOUS == 0 {
-                    self.fd_path_map.borrow().get(&fd).and_then(|path| {
-                        self.aligned_file_map.get(path).map(|&(base, _size)| {
-                            base + file_offset
-                        })
-                    })
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            // Note: we do NOT enable phantom mode here. The shim's mmap path
-            // (do_mmap_file → try_cow_mmap_file / do_mmap_file_memcpy) needs
-            // real pages for VMA tracking and file data population. Phantom
-            // mode would cause SIGSEGV because the shim writes file data into
-            // pages returned by allocate_pages. Instead, we let the shim run
-            // normally and skip the expensive data-region copy when
-            // MMAP_FROM_ALIGNED is set (micro mmaps directly from the aligned
-            // memfd).
 
             let mut regs = crate::dispatch::sq_entry_to_ptregs(entry);
             cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
             if cq.result < 0 {
-                // Shim returned an error — pass it through without EXEC_LOCAL.
                 return cq;
             }
             cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
@@ -988,47 +950,27 @@ impl<FS: ShimFS> ProcessServer<FS> {
             if is_mmap {
                 let flags = entry.args[3] as i32;
                 if flags & libc::MAP_ANONYMOUS == 0 {
-                    if let Some(offset) = tar_aligned_offset {
-                        // Tar fast path: micro mmaps from aligned memfd.
-                        cq.flags |= cq_flags::MMAP_FROM_ALIGNED;
-                        #[allow(clippy::cast_possible_truncation)]
-                        {
-                            cq.data_offset = offset as u32;
-                            cq.data_len = (offset >> 32) as u32;
-                        }
+                    // File-backed mmap that reached central (non-tar or fallback).
+                    // Copy data from phantom pages to shmem data region.
+                    let addr = cq.result as usize;
+                    let len = entry.args[1] as usize;
+                    let data_region = self.region.data_region_mut();
+                    let copy_len = len.min(data_region.len());
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            addr as *const u8,
+                            data_region.as_mut_ptr(),
+                            copy_len,
+                        );
+                    }
+                    cq.flags |= cq_flags::HAS_DATA;
+                    cq.data_offset = 0;
+                    cq.data_len = copy_len as u32;
 
-                        // For the initial reservation mmap (no MAP_FIXED), check
-                        // for a rewritten ELF trampoline.
-                        #[allow(clippy::cast_possible_truncation)]
-                        if flags & libc::MAP_FIXED == 0 {
-                            let fd = entry.args[4] as i32;
-                            self.try_append_trampoline(entry.thread_slot, fd, 0, &mut cq);
-                        }
-                    } else {
-                        // Not tar-backed: existing path with data copy from
-                        // phantom pages to shmem data region.
-                        let addr = cq.result as usize;
-                        let len = entry.args[1] as usize;
-                        let data_region = self.region.data_region_mut();
-                        let copy_len = len.min(data_region.len());
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(
-                                addr as *const u8,
-                                data_region.as_mut_ptr(),
-                                copy_len,
-                            );
-                        }
-                        cq.flags |= cq_flags::HAS_DATA;
-                        cq.data_offset = 0;
-                        cq.data_len = copy_len as u32;
-
-                        // For the initial reservation mmap (no MAP_FIXED), check
-                        // for a trampoline.
-                        #[allow(clippy::cast_possible_truncation)]
-                        if flags & libc::MAP_FIXED == 0 {
-                            let fd = entry.args[4] as i32;
-                            self.try_append_trampoline(entry.thread_slot, fd, copy_len, &mut cq);
-                        }
+                    #[allow(clippy::cast_possible_truncation)]
+                    if flags & libc::MAP_FIXED == 0 {
+                        let fd = entry.args[4] as i32;
+                        self.try_append_trampoline(entry.thread_slot, fd, copy_len, &mut cq);
                     }
                 }
             }
@@ -1172,13 +1114,6 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     0
                 };
 
-                // Cache the fd -> path mapping for the mmap handler.
-                if let Some(path) = tar_path {
-                    self.fd_path_map
-                        .borrow_mut()
-                        .insert(new_fd, path);
-                }
-
                 // Write OpenResponse to data region at offset 0 for micro.
                 let response = litebox_ipc::messages::OpenResponse {
                     fd: new_fd,
@@ -1304,12 +1239,6 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 aligned_size,
             );
             child_server.next_child_pid.set(self.next_child_pid.get());
-            // Inherit the parent's fd -> path mapping so the child can resolve
-            // fds opened before fork in its mmap handler.
-            child_server
-                .fd_path_map
-                .borrow_mut()
-                .clone_from(&self.fd_path_map.borrow());
 
             let handle = std::thread::spawn(move || {
                 if let Err(e) = child_server.run() {
