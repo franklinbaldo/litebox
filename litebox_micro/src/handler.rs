@@ -1212,29 +1212,13 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
             {
                     let aligned_len = (len + 0xFFF) & !0xFFF;
 
-                    // Pick address: bump allocator for addr=0 && !MAP_FIXED,
-                    // or use provided addr for MAP_FIXED / explicit addr.
-                    let (map_addr, used_bump) = if addr == 0 && !is_fixed {
-                        let bump_end = state.mmap_bump_end;
-                        if bump_end != 0 {
-                            let next = state
-                                .mmap_bump_next
-                                .fetch_add(aligned_len, core::sync::atomic::Ordering::Relaxed);
-                            if next + aligned_len <= bump_end {
-                                (next, true)
-                            } else {
-                                state
-                                    .mmap_bump_next
-                                    .fetch_sub(aligned_len, core::sync::atomic::Ordering::Relaxed);
-                                (0usize, false) // Bump exhausted — fall through to central
-                            }
-                        } else {
-                            (0usize, false)
-                        }
-                    } else if is_fixed || addr != 0 {
-                        (addr as usize, false)
+                    // For MAP_FIXED or explicit addr, handle locally.
+                    // Non-MAP_FIXED (addr == 0) falls through to central so it
+                    // can choose the address and set up VMA state correctly.
+                    let map_addr = if is_fixed || addr != 0 {
+                        addr as usize
                     } else {
-                        (0usize, false)
+                        0usize
                     };
 
                     if map_addr != 0 || is_fixed {
@@ -1252,11 +1236,6 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
                         };
 
                         if crate::raw_syscall::is_error(result) {
-                            if used_bump {
-                                state
-                                    .mmap_bump_next
-                                    .fetch_sub(aligned_len, core::sync::atomic::Ordering::Relaxed);
-                            }
                             return result;
                         }
 
@@ -1288,7 +1267,7 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
                         }
                         return result;
                     }
-                    // map_addr == 0 && bump exhausted: fall through to central
+                    // map_addr == 0 && !is_fixed: fall through to central
             }
         }
     }
