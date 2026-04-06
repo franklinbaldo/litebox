@@ -1508,6 +1508,84 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
         }
     }
 
+    // Inmem shmem file fast-path: read/pread64 on inmem-backed fds bypass central.
+    // This takes priority over the tar fast-path because a file may have been
+    // written at runtime (e.g. sort.$$ in shell benchmarks) and its data lives
+    // in the inmem shmem region managed by central.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
+    {
+        let micro = unsafe { &mut *(*tls).micro };
+        let fd = args.args[0] as i32;
+        let inmem_base = micro.inmem_base;
+        let inmem_size = micro.inmem_size;
+        if let Some(entry) = micro.find_inmem_file_fd_mut(fd) {
+            match i64::from(nr) {
+                libc::SYS_read => {
+                    let buf = args.args[1] as *mut u8;
+                    let count = args.args[2] as usize;
+                    // Read metadata slot under seqlock.
+                    let slot = unsafe {
+                        litebox_ipc::inmem_shmem::slot_ptr(inmem_base, entry.inmem_slot_index)
+                    };
+                    let snapshot = slot.read_snapshot();
+                    if snapshot.data_offset == 0 {
+                        return 0; // slot cleared (file deleted)
+                    }
+                    let remaining = snapshot.data_len.saturating_sub(entry.cursor) as usize;
+                    let to_read = count.min(remaining);
+                    if to_read > 0 {
+                        let src = snapshot.data_offset + entry.cursor;
+                        if (src as usize) + to_read > inmem_size {
+                            return -i64::from(libc::EIO);
+                        }
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                inmem_base.add(src as usize),
+                                buf,
+                                to_read,
+                            );
+                        }
+                        entry.cursor += to_read as u64;
+                    }
+                    return to_read as i64;
+                }
+                libc::SYS_pread64 => {
+                    let buf = args.args[1] as *mut u8;
+                    let count = args.args[2] as usize;
+                    let offset = args.args[3];
+                    let slot = unsafe {
+                        litebox_ipc::inmem_shmem::slot_ptr(inmem_base, entry.inmem_slot_index)
+                    };
+                    let snapshot = slot.read_snapshot();
+                    if snapshot.data_offset == 0 || offset >= snapshot.data_len {
+                        return 0;
+                    }
+                    let remaining = (snapshot.data_len - offset) as usize;
+                    let to_read = count.min(remaining);
+                    if to_read > 0 {
+                        let src = snapshot.data_offset + offset;
+                        if (src as usize) + to_read > inmem_size {
+                            return -i64::from(libc::EIO);
+                        }
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                inmem_base.add(src as usize),
+                                buf,
+                                to_read,
+                            );
+                        }
+                    }
+                    return to_read as i64;
+                }
+                _ => {} // other syscalls fall through
+            }
+        }
+    }
+
     // Tar shmem file fast-path: read/pread64 on tar-backed fds bypass central.
     #[allow(
         clippy::cast_possible_truncation,
@@ -1568,6 +1646,40 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
                 }
                 _ => {} // other syscalls fall through
             }
+        }
+    }
+
+    // lseek on inmem-backed fds: handle locally, read data_len from shmem slot.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss
+    )]
+    if i64::from(nr) == libc::SYS_lseek {
+        let micro = unsafe { &mut *(*tls).micro };
+        let fd = args.args[0] as i32;
+        let inmem_base = micro.inmem_base;
+        if let Some(entry) = micro.find_inmem_file_fd_mut(fd) {
+            let offset = args.args[1] as i64;
+            let whence = args.args[2] as i32;
+            let file_len = {
+                let slot = unsafe {
+                    litebox_ipc::inmem_shmem::slot_ptr(inmem_base, entry.inmem_slot_index)
+                };
+                let snapshot = slot.read_snapshot();
+                snapshot.data_len
+            };
+            let new_pos: i64 = match whence {
+                libc::SEEK_SET => offset,
+                libc::SEEK_CUR => entry.cursor as i64 + offset,
+                libc::SEEK_END => file_len as i64 + offset,
+                _ => return -i64::from(libc::EINVAL),
+            };
+            if new_pos < 0 {
+                return -i64::from(libc::EINVAL);
+            }
+            entry.cursor = new_pos as u64;
+            return new_pos;
         }
     }
 
@@ -1807,25 +1919,27 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
                     .cast::<litebox_ipc::messages::OpenResponse>())
             };
             if resp.file_slot_offset != 0 {
-                // For dup/dup2/dup3, inherit tar/aligned info from the source fd
-                // since central doesn't propagate it.
+                // For dup/dup2/dup3, inherit tar/aligned/inmem info from the source fd
+                // since central doesn't propagate tar/aligned in dup responses.
+                // However, central DOES populate inmem_slot_index for dup, so
+                // we prefer the source fd's value for consistency.
                 #[allow(clippy::cast_possible_truncation)]
-                let (tar_offset, tar_len, aligned_offset) =
+                let (tar_offset, tar_len, aligned_offset, inmem_slot_index) =
                     if matches!(i64::from(nr), libc::SYS_dup | libc::SYS_dup2 | libc::SYS_dup3) {
                         let source_fd = args.args[0] as i32;
                         if let Some(source_entry) = state.find_file_fd_entry(source_fd) {
-                            (source_entry.tar_offset, source_entry.tar_len, source_entry.aligned_offset)
+                            (source_entry.tar_offset, source_entry.tar_len, source_entry.aligned_offset, source_entry.inmem_slot_index)
                         } else {
-                            (resp.tar_offset, resp.tar_len, resp.aligned_offset)
+                            (resp.tar_offset, resp.tar_len, resp.aligned_offset, resp.inmem_slot_index)
                         }
                     } else {
-                        (resp.tar_offset, resp.tar_len, resp.aligned_offset)
+                        (resp.tar_offset, resp.tar_len, resp.aligned_offset, resp.inmem_slot_index)
                     };
                 let fd = resp.fd;
                 let file_slot_offset = resp.file_slot_offset;
                 // Now take the mutable borrow for registration.
                 let micro = unsafe { &mut *(*tls).micro };
-                micro.register_file_fd(fd, file_slot_offset, tar_offset, tar_len, aligned_offset, litebox_ipc::inmem_shmem::INMEM_NO_SLOT);
+                micro.register_file_fd(fd, file_slot_offset, tar_offset, tar_len, aligned_offset, inmem_slot_index);
             }
             return cq.result; // return the fd
         }
