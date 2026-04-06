@@ -44,6 +44,9 @@ pub const PIPE_DATA_CAPACITY: usize = 65536;
 /// floor((8 MiB - 5 MiB) / PIPE_SLOT_SIZE) = floor(3145728 / 65600) = 47
 pub const MAX_PIPE_SLOTS: usize = 47;
 
+/// Total size of the pipe zone in the data region.
+pub const PIPE_ZONE_SIZE: usize = SOCKET_ZONE_BASE_OFFSET - PIPE_ZONE_BASE_OFFSET;
+
 /// Size of socket ring data buffer per direction (must be power-of-2).
 /// 256 KiB matches the current HeapRb socket channel size.
 pub const SOCKET_RING_CAPACITY: usize = 256 * 1024;

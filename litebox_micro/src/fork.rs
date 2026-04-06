@@ -196,6 +196,8 @@ pub unsafe fn handle_vfork(cq: &CqEntry) -> i64 {
     let saved_ppid = micro.ppid;
     let saved_layout = micro.layout;
     let saved_pipe_fds = micro.pipe_fds;
+    let saved_parent_pipe_zone = micro.parent_pipe_zone;
+    let saved_parent_pipe_zone_size = micro.parent_pipe_zone_size;
     let saved_guest_brk = micro.guest_brk.load(core::sync::atomic::Ordering::Acquire);
 
     let tls = unsafe { crate::tls::current_tls() };
@@ -232,6 +234,8 @@ pub unsafe fn handle_vfork(cq: &CqEntry) -> i64 {
         micro.ppid = saved_ppid;
         micro.layout = saved_layout;
         micro.pipe_fds = saved_pipe_fds;
+        micro.parent_pipe_zone = saved_parent_pipe_zone;
+        micro.parent_pipe_zone_size = saved_parent_pipe_zone_size;
         micro
             .guest_brk
             .store(saved_guest_brk, core::sync::atomic::Ordering::Release);
@@ -295,6 +299,8 @@ unsafe fn post_fork_child_vfork(child_ring_fd: i32, child_pid: u32) {
 
     // 3. Clear pipe fd tracking table.
     micro.pipe_fds = [None; litebox_ipc::ring::MAX_PIPE_SLOTS];
+    micro.parent_pipe_zone = core::ptr::null_mut();
+    micro.parent_pipe_zone_size = 0;
 
     // 4. Reset TLS.
     let tls = unsafe { crate::tls::current_tls() };
@@ -321,6 +327,18 @@ unsafe fn post_fork_child_vfork(child_ring_fd: i32, child_pid: u32) {
 /// Must be called in the child immediately after fork() returns 0.
 unsafe fn post_fork_child(child_ring_fd: i32, child_pid: u32) {
     let micro = unsafe { crate::state::global_micro_state_mut() };
+
+    // Save parent ring fd before we overwrite it — needed for pipe zone mmap.
+    let parent_ring_fd = micro.ring_fd;
+    // Check if there are active pipes before we lose the old pointers.
+    let has_parent_pipes = micro.pipe_fds.iter().any(Option::is_some);
+    // Save old pipe zone base for pointer rebasing.
+    let old_pipe_zone_base = unsafe {
+        micro
+            .ring_base
+            .add(micro.layout.data_region_offset)
+            .add(litebox_ipc::ring::PIPE_ZONE_BASE_OFFSET)
+    };
 
     // 1. Unmap parent's ring buffer.
     if !micro.ring_base.is_null() && micro.ring_size > 0 {
@@ -358,8 +376,46 @@ unsafe fn post_fork_child(child_ring_fd: i32, child_pid: u32) {
     // central_pid stays the same — same central process serves the child.
     micro.layout = layout;
 
-    // 3b. Clear the pipe fd tracking table.
-    micro.pipe_fds = [None; litebox_ipc::ring::MAX_PIPE_SLOTS];
+    // 3b. Re-establish pipe shmem access.
+    if has_parent_pipes {
+        // Map the parent's pipe zone so pipe header pointers remain valid.
+        let pipe_zone_file_offset =
+            layout.data_region_offset + litebox_ipc::ring::PIPE_ZONE_BASE_OFFSET;
+        let pipe_zone_size = litebox_ipc::ring::PIPE_ZONE_SIZE;
+        #[allow(clippy::cast_possible_wrap)]
+        let parent_zone = unsafe {
+            crate::raw_syscall::mmap(
+                0,
+                pipe_zone_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                parent_ring_fd,
+                pipe_zone_file_offset as i64,
+            )
+        };
+        if crate::raw_syscall::is_error(parent_zone) {
+            // Failed to map parent pipe zone — clear pipes as fallback.
+            micro.pipe_fds = [None; litebox_ipc::ring::MAX_PIPE_SLOTS];
+            micro.parent_pipe_zone = core::ptr::null_mut();
+            micro.parent_pipe_zone_size = 0;
+        } else {
+            // Rewrite pipe_fds header pointers to the new mapping.
+            let new_zone_base = parent_zone as *mut u8;
+            for entry in micro.pipe_fds.iter_mut().flatten() {
+                let offset_in_zone = (entry.header_ptr as usize) - (old_pipe_zone_base as usize);
+                entry.header_ptr = unsafe { new_zone_base.add(offset_in_zone) };
+            }
+            micro.parent_pipe_zone = new_zone_base;
+            micro.parent_pipe_zone_size = pipe_zone_size;
+        }
+    } else {
+        micro.pipe_fds = [None; litebox_ipc::ring::MAX_PIPE_SLOTS];
+        micro.parent_pipe_zone = core::ptr::null_mut();
+        micro.parent_pipe_zone_size = 0;
+    }
+
+    // Close parent ring fd — the pipe zone is now independently mapped.
+    unsafe { crate::raw_syscall::close(parent_ring_fd) };
 
     // 4. Reset TLS.
     let tls = unsafe { crate::tls::current_tls() };

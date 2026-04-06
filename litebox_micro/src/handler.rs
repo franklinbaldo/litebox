@@ -1354,6 +1354,17 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
                     // to central (which handles shim fd closure and shmem flags).
                     let micro_mut = unsafe { &mut *(*tls).micro };
                     micro_mut.unregister_pipe_fd(fd);
+                    // If no more pipe fds and we have a parent pipe zone, unmap it.
+                    if !micro_mut.has_any_pipe_fd() && !micro_mut.parent_pipe_zone.is_null() {
+                        unsafe {
+                            crate::raw_syscall::munmap(
+                                micro_mut.parent_pipe_zone as usize,
+                                micro_mut.parent_pipe_zone_size,
+                            );
+                        }
+                        micro_mut.parent_pipe_zone = core::ptr::null_mut();
+                        micro_mut.parent_pipe_zone_size = 0;
+                    }
                     // Fall through to submit_and_wait for central to handle close
                 }
                 _ => {} // dup, fcntl, etc. — fall through to central
@@ -1770,15 +1781,13 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
             || (nr == libc::SYS_clone as u32 && args.args[0] & 0x100 == 0); // no CLONE_VM → fork
         let is_fork_child = result == 0 && is_fork;
 
-        // After fork, clear the *parent's* pipe fd table.  The child will
-        // use its own shim task's virtual pipes (HeapRb).  The parent must
-        // also fall back to the shim so both processes share the same pipe
-        // data buffer.  Without this, parent writes to shmem but child
-        // reads from HeapRb → deadlock.  (Phase B will add cross-process
-        // shmem pipes; until then, post-fork pipe I/O goes through central.)
+        // After fork, the parent keeps its pipe_fds — both parent and child
+        // share the same shmem SPSC ring buffers. The child maps the parent's
+        // pipe zone separately.
+        // Socket and file fds are still cleared (not yet cross-process shmem).
         if is_fork && result > 0 {
             let micro_mut = unsafe { &mut *(*tls).micro };
-            micro_mut.pipe_fds = [None; litebox_ipc::ring::MAX_PIPE_SLOTS];
+            // pipe_fds: KEEP (shared shmem with child)
             micro_mut.socket_fds = [None; litebox_ipc::ring::MAX_SOCKET_SLOTS];
             micro_mut.file_fds = [None; litebox_ipc::ring::MAX_FILE_SLOTS];
         }

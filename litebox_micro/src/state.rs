@@ -98,6 +98,12 @@ pub struct MicroState {
     pub aligned_base: *const u8,
     /// Size of the aligned data memfd in bytes.
     pub aligned_size: usize,
+    /// Base pointer of the parent's pipe zone mapping (null if no parent pipes).
+    /// After fork, the child mmaps the parent's shmem pipe zone so both
+    /// processes share the same SPSC ring buffers for pipe I/O.
+    pub parent_pipe_zone: *mut u8,
+    /// Size of the parent pipe zone mapping in bytes (for munmap cleanup).
+    pub parent_pipe_zone_size: usize,
 }
 
 unsafe impl Send for MicroState {}
@@ -124,6 +130,8 @@ static mut MICRO_STATE: MicroState = MicroState {
     aligned_fd: -1,
     aligned_base: core::ptr::null(),
     aligned_size: 0,
+    parent_pipe_zone: core::ptr::null_mut(),
+    parent_pipe_zone_size: 0,
 };
 
 /// Initialize the global micro-LiteBox state.
@@ -241,6 +249,11 @@ impl MicroState {
             }
         }
         false // table full
+    }
+
+    /// Check if any pipe fds are still registered.
+    pub fn has_any_pipe_fd(&self) -> bool {
+        self.pipe_fds.iter().any(Option::is_some)
     }
 
     /// Remove a pipe fd from the tracking table. Returns `true` if found.
@@ -368,6 +381,8 @@ impl MicroState {
             aligned_fd: -1,
             aligned_base: core::ptr::null(),
             aligned_size: 0,
+            parent_pipe_zone: core::ptr::null_mut(),
+            parent_pipe_zone_size: 0,
         }
     }
 }
