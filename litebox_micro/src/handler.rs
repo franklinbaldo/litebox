@@ -1337,17 +1337,17 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
     {
         let micro = unsafe { &*(*tls).micro };
         let fd = args.args[0] as i32;
-        if let Some((shmem_offset, is_write_end)) = micro.find_pipe_fd(fd) {
+        if let Some((header_ptr, is_write_end)) = micro.find_pipe_fd(fd) {
             match i64::from(nr) {
                 libc::SYS_write if is_write_end => {
                     let buf = args.args[1] as *const u8;
                     let count = args.args[2] as usize;
-                    return unsafe { shmem_pipe_write(micro, shmem_offset, buf, count) };
+                    return unsafe { shmem_pipe_write(header_ptr, buf, count) };
                 }
                 libc::SYS_read if !is_write_end => {
                     let buf = args.args[1] as *mut u8;
                     let count = args.args[2] as usize;
-                    return unsafe { shmem_pipe_read(micro, shmem_offset, buf, count) };
+                    return unsafe { shmem_pipe_read(header_ptr, buf, count) };
                 }
                 libc::SYS_close => {
                     // Unregister the pipe fd locally, then let close fall through
@@ -1652,9 +1652,11 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
                     .add(cq.data_offset as usize)
                     .cast::<litebox_ipc::messages::Pipe2Response>())
             };
+            // Compute direct pointer to the pipe's ShmemPipeHeader.
+            let header_ptr = unsafe { data_base.add(resp.pipe_slot_offset as usize) };
             // Register both pipe fds for fast-path read/write.
-            micro.register_pipe_fd(resp.read_fd, resp.pipe_slot_offset, false);
-            micro.register_pipe_fd(resp.write_fd, resp.pipe_slot_offset, true);
+            micro.register_pipe_fd(resp.read_fd, header_ptr, false);
+            micro.register_pipe_fd(resp.write_fd, header_ptr, true);
             // Write fd pair to guest's output pointer.
             let fds_ptr = args.args[0] as *mut i32;
             unsafe {
@@ -1803,22 +1805,11 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
     clippy::cast_ptr_alignment,
     clippy::ptr_as_ptr
 )]
-unsafe fn shmem_pipe_write(
-    micro: &crate::state::MicroState,
-    shmem_offset: u32,
-    buf_ptr: *const u8,
-    count: usize,
-) -> i64 {
+unsafe fn shmem_pipe_write(header_ptr: *mut u8, buf_ptr: *const u8, count: usize) -> i64 {
     if count == 0 {
         return 0;
     }
-    let header = unsafe {
-        micro
-            .ring_base
-            .add(micro.layout.data_region_offset)
-            .add(shmem_offset as usize)
-            .cast::<litebox_ipc::ring::ShmemPipeHeader>()
-    };
+    let header = header_ptr.cast::<litebox_ipc::ring::ShmemPipeHeader>();
     let buf = unsafe { core::slice::from_raw_parts(buf_ptr, count) };
     let mut total_written = 0usize;
 
@@ -1890,22 +1881,11 @@ unsafe fn shmem_pipe_write(
     clippy::cast_ptr_alignment,
     clippy::ptr_as_ptr
 )]
-unsafe fn shmem_pipe_read(
-    micro: &crate::state::MicroState,
-    shmem_offset: u32,
-    buf_ptr: *mut u8,
-    count: usize,
-) -> i64 {
+unsafe fn shmem_pipe_read(header_ptr: *mut u8, buf_ptr: *mut u8, count: usize) -> i64 {
     if count == 0 {
         return 0;
     }
-    let header = unsafe {
-        micro
-            .ring_base
-            .add(micro.layout.data_region_offset)
-            .add(shmem_offset as usize)
-            .cast::<litebox_ipc::ring::ShmemPipeHeader>()
-    };
+    let header = header_ptr.cast::<litebox_ipc::ring::ShmemPipeHeader>();
     let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, count) };
 
     loop {

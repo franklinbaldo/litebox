@@ -35,13 +35,13 @@ pub struct FileFdEntry {
 
 /// Entry in micro's local pipe fd tracking table.
 ///
-/// Maps a file descriptor to the shmem offset of its pipe ring buffer.
+/// Maps a file descriptor to the shmem pipe ring buffer header.
 #[derive(Clone, Copy)]
 pub struct PipeFdEntry {
     /// The file descriptor number.
     pub fd: i32,
-    /// Offset within the data region to the pipe's `ShmemPipeHeader`.
-    pub shmem_offset: u32,
+    /// Direct pointer to the pipe's `ShmemPipeHeader` in shmem.
+    pub header_ptr: *mut u8,
     /// `true` if this fd is the write end, `false` if read end.
     pub is_write_end: bool,
 }
@@ -218,23 +218,23 @@ pub unsafe fn global_micro_state_mut() -> &'static mut MicroState {
 
 impl MicroState {
     /// Look up a pipe fd in the tracking table.
-    /// Returns `(shmem_offset, is_write_end)` if found.
-    pub fn find_pipe_fd(&self, fd: i32) -> Option<(u32, bool)> {
+    /// Returns `(header_ptr, is_write_end)` if found.
+    pub fn find_pipe_fd(&self, fd: i32) -> Option<(*mut u8, bool)> {
         for e in self.pipe_fds.iter().flatten() {
             if e.fd == fd {
-                return Some((e.shmem_offset, e.is_write_end));
+                return Some((e.header_ptr, e.is_write_end));
             }
         }
         None
     }
 
     /// Register a pipe fd in the tracking table. Returns `true` on success.
-    pub fn register_pipe_fd(&mut self, fd: i32, shmem_offset: u32, is_write_end: bool) -> bool {
+    pub fn register_pipe_fd(&mut self, fd: i32, header_ptr: *mut u8, is_write_end: bool) -> bool {
         for slot in &mut self.pipe_fds {
             if slot.is_none() {
                 *slot = Some(PipeFdEntry {
                     fd,
-                    shmem_offset,
+                    header_ptr,
                     is_write_end,
                 });
                 return true;
@@ -395,16 +395,18 @@ mod tests {
     fn pipe_fd_register_and_find() {
         let mut state = MicroState::zeroed();
         assert!(state.find_pipe_fd(5).is_none());
-        assert!(state.register_pipe_fd(5, 0x500000, false));
-        let (offset, is_write) = state.find_pipe_fd(5).unwrap();
-        assert_eq!(offset, 0x500000);
+        let fake_ptr = 0x500000 as *mut u8;
+        assert!(state.register_pipe_fd(5, fake_ptr, false));
+        let (ptr, is_write) = state.find_pipe_fd(5).unwrap();
+        assert_eq!(ptr, fake_ptr);
         assert!(!is_write);
     }
 
     #[test]
     fn pipe_fd_unregister() {
         let mut state = MicroState::zeroed();
-        state.register_pipe_fd(5, 0x500000, false);
+        let fake_ptr = 0x500000 as *mut u8;
+        state.register_pipe_fd(5, fake_ptr, false);
         assert!(state.unregister_pipe_fd(5));
         assert!(state.find_pipe_fd(5).is_none());
         assert!(!state.unregister_pipe_fd(5)); // already removed
@@ -413,11 +415,12 @@ mod tests {
     #[test]
     fn pipe_fd_register_both_ends() {
         let mut state = MicroState::zeroed();
-        assert!(state.register_pipe_fd(3, 0x500000, false)); // read end
-        assert!(state.register_pipe_fd(4, 0x500000, true)); // write end
-        let (off_r, wr_r) = state.find_pipe_fd(3).unwrap();
-        let (off_w, wr_w) = state.find_pipe_fd(4).unwrap();
-        assert_eq!(off_r, off_w); // same pipe slot
+        let fake_ptr = 0x500000 as *mut u8;
+        assert!(state.register_pipe_fd(3, fake_ptr, false)); // read end
+        assert!(state.register_pipe_fd(4, fake_ptr, true)); // write end
+        let (ptr_r, wr_r) = state.find_pipe_fd(3).unwrap();
+        let (ptr_w, wr_w) = state.find_pipe_fd(4).unwrap();
+        assert_eq!(ptr_r, ptr_w); // same pipe slot
         assert!(!wr_r);
         assert!(wr_w);
     }
