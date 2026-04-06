@@ -31,6 +31,8 @@ pub struct FileFdEntry {
     pub tar_len: u64,
     /// Byte offset into the aligned data memfd (0 = not aligned-backed, use central mmap path).
     pub aligned_offset: u64,
+    /// Index into the inmem shmem slot array (`INMEM_NO_SLOT` if not in shmem).
+    pub inmem_slot_index: u32,
     /// Current file position for sequential read().
     pub cursor: u64,
 }
@@ -106,6 +108,10 @@ pub struct MicroState {
     pub parent_pipe_zone: *mut u8,
     /// Size of the parent pipe zone mapping in bytes (for munmap cleanup).
     pub parent_pipe_zone_size: usize,
+    /// Base pointer of the inmem shmem region (null if none).
+    pub inmem_base: *const u8,
+    /// Size of the inmem shmem region in bytes.
+    pub inmem_size: usize,
 }
 
 unsafe impl Send for MicroState {}
@@ -134,6 +140,8 @@ static mut MICRO_STATE: MicroState = MicroState {
     aligned_size: 0,
     parent_pipe_zone: core::ptr::null_mut(),
     parent_pipe_zone_size: 0,
+    inmem_base: core::ptr::null(),
+    inmem_size: 0,
 };
 
 /// Initialize the global micro-LiteBox state.
@@ -156,6 +164,8 @@ pub unsafe fn micro_init(
     aligned_fd: i32,
     aligned_base: *const u8,
     aligned_size: usize,
+    inmem_base: *const u8,
+    inmem_size: usize,
 ) {
     unsafe {
         MICRO_STATE.ring_base = ring_base;
@@ -170,6 +180,8 @@ pub unsafe fn micro_init(
         MICRO_STATE.aligned_fd = aligned_fd;
         MICRO_STATE.aligned_base = aligned_base;
         MICRO_STATE.aligned_size = aligned_size;
+        MICRO_STATE.inmem_base = inmem_base;
+        MICRO_STATE.inmem_size = inmem_size;
         // Compute the layout from the ring_size. The data_region_size is the
         // remaining space after header + SQ + CQ entries.
         let base_layout = SharedRingLayout::new(0);
@@ -330,6 +342,7 @@ impl MicroState {
         tar_offset: u64,
         tar_len: u64,
         aligned_offset: u64,
+        inmem_slot_index: u32,
     ) -> bool {
         for slot in &mut self.file_fds {
             if slot.is_none() {
@@ -339,6 +352,7 @@ impl MicroState {
                     tar_offset,
                     tar_len,
                     aligned_offset,
+                    inmem_slot_index,
                     cursor: 0,
                 });
                 return true;
@@ -368,6 +382,14 @@ impl MicroState {
             .find(|entry| entry.fd == fd && entry.tar_offset != 0)
     }
 
+    /// Find an inmem-backed file fd entry (mutable reference for cursor updates).
+    pub fn find_inmem_file_fd_mut(&mut self, fd: i32) -> Option<&mut FileFdEntry> {
+        self.file_fds
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.fd == fd && entry.inmem_slot_index != litebox_ipc::inmem_shmem::INMEM_NO_SLOT)
+    }
+
     #[cfg(test)]
     pub fn zeroed() -> Self {
         Self {
@@ -393,6 +415,8 @@ impl MicroState {
             aligned_size: 0,
             parent_pipe_zone: core::ptr::null_mut(),
             parent_pipe_zone_size: 0,
+            inmem_base: core::ptr::null(),
+            inmem_size: 0,
         }
     }
 }

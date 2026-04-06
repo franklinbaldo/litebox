@@ -55,7 +55,12 @@ fn main() -> anyhow::Result<()> {
         .map(shmem::TarSharedRegion::from_file)
         .transpose()?;
 
-    // 1c. Create aligned data region from the tar (page-aligned file offsets
+    // 1c. Create in-memory filesystem shmem region.
+    let inmem_shmem = shmem::InMemSharedRegion::new(
+        litebox_ipc::inmem_shmem::DEFAULT_INMEM_REGION_SIZE,
+    )?;
+
+    // 1d. Create aligned data region from the tar (page-aligned file offsets
     // for mmap-based ELF loading during exec).
     let aligned_data = tar_shmem
         .as_ref()
@@ -94,6 +99,8 @@ fn main() -> anyhow::Result<()> {
         tun_device.as_deref(),
         aligned_data.as_ref().map(shmem::AlignedDataRegion::fd_raw),
         aligned_data.as_ref().map(shmem::AlignedDataRegion::size),
+        Some(inmem_shmem.fd_raw()),
+        Some(inmem_shmem.size()),
     )?;
 
     // Give central time to initialize (platform, shim, server loop).
@@ -125,6 +132,8 @@ fn main() -> anyhow::Result<()> {
             aligned_data
                 .as_ref()
                 .map_or(0, shmem::AlignedDataRegion::size),
+            inmem_shmem.base_ptr().cast_const(),
+            inmem_shmem.size(),
         );
     }
 

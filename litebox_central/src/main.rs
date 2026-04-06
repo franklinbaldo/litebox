@@ -99,6 +99,14 @@ struct Args {
     #[arg(long, default_value = "0")]
     aligned_size: usize,
 
+    /// In-memory filesystem shmem file descriptor (inherited from launcher).
+    #[arg(long)]
+    inmem_fd: Option<i32>,
+
+    /// Size in bytes of the inmem shmem region.
+    #[arg(long, default_value = "0")]
+    inmem_size: usize,
+
     /// Name of the TUN device to open for raw IP networking (e.g. "tun0").
     /// If not provided, IP networking is disabled.
     #[arg(long)]

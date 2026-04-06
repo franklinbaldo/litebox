@@ -50,6 +50,7 @@ impl CentralProcess {
     /// This function calls `libc::fork()`. The caller must ensure that forking
     /// is safe in the current process state (e.g. no other threads holding
     /// locks that the child would inherit in a locked state).
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         shmem_fd: i32,
         initial_brk: usize,
@@ -58,6 +59,8 @@ impl CentralProcess {
         tun_device: Option<&str>,
         aligned_fd: Option<i32>,
         aligned_size: Option<usize>,
+        inmem_fd: Option<i32>,
+        inmem_size: Option<usize>,
     ) -> anyhow::Result<Self> {
         // SAFETY: We call `fork()` which is safe here because the launcher is
         // single-threaded at the point of spawning. The child either execs
@@ -122,6 +125,13 @@ impl CentralProcess {
                     c_args.push(CString::new(format!("--aligned-size={asz}")).unwrap());
                 }
 
+                if let Some(ifd) = inmem_fd {
+                    c_args.push(CString::new(format!("--inmem-fd={ifd}")).unwrap());
+                }
+                if let Some(isz) = inmem_size {
+                    c_args.push(CString::new(format!("--inmem-size={isz}")).unwrap());
+                }
+
                 if let Some(name) = tun_device {
                     c_args.push(CString::new(format!("--tun-device={name}")).unwrap());
                 }
@@ -161,7 +171,7 @@ mod tests {
 
     #[test]
     fn spawn_and_wait() {
-        let proc = CentralProcess::spawn(0, 0, None, None, None, None, None)
+        let proc = CentralProcess::spawn(0, 0, None, None, None, None, None, None, None)
             .expect("spawn should succeed");
         assert!(proc.pid() > 0);
         let mut status: i32 = 0;

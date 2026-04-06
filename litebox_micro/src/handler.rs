@@ -1825,7 +1825,7 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
                 let file_slot_offset = resp.file_slot_offset;
                 // Now take the mutable borrow for registration.
                 let micro = unsafe { &mut *(*tls).micro };
-                micro.register_file_fd(fd, file_slot_offset, tar_offset, tar_len, aligned_offset);
+                micro.register_file_fd(fd, file_slot_offset, tar_offset, tar_len, aligned_offset, litebox_ipc::inmem_shmem::INMEM_NO_SLOT);
             }
             return cq.result; // return the fd
         }
