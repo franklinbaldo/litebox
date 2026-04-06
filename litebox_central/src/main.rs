@@ -122,6 +122,23 @@ fn main() -> anyhow::Result<()> {
         default_hook(info);
     }));
 
+    // Raise the file descriptor limit.  Each child process gets its own
+    // ring buffer backed by a memfd.  Under heavy fork workloads (e.g.
+    // shell benchmarks), hundreds of child server threads may be alive
+    // simultaneously, each holding an open memfd.  The default 1024 soft
+    // limit is quickly exhausted.
+    {
+        let mut rlim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut rlim) };
+        if rlim.rlim_cur < rlim.rlim_max {
+            rlim.rlim_cur = rlim.rlim_max;
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const rlim) };
+        }
+    }
+
     // Parse CLI args early — we need them for platform and FS construction.
     let args = Args::parse();
 

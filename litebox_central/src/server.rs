@@ -689,12 +689,14 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     }
 
                     // Propagate aligned fd tracking for phantom-mode mmap.
-                    if self.fd_aligned_set.borrow().contains(&source_fd) {
+                    let source_is_aligned = self.fd_aligned_set.borrow().contains(&source_fd);
+                    if source_is_aligned {
                         self.fd_aligned_set.borrow_mut().insert(new_fd);
                     }
 
                     // Propagate inmem fd→path tracking.
-                    if let Some(path) = self.fd_path_map.borrow().get(&source_fd).cloned() {
+                    let source_path = self.fd_path_map.borrow().get(&source_fd).cloned();
+                    if let Some(path) = source_path {
                         self.fd_path_map.borrow_mut().insert(new_fd, path);
                     }
                 }
@@ -1088,7 +1090,6 @@ impl<FS: ShimFS> ProcessServer<FS> {
             cq.result = -i64::from(libc::ENOMEM);
             return cq;
         };
-
         // Register the child ring so it gets signalled on central exit/panic.
         crate::register_active_ring(child_region.header());
 
@@ -2118,14 +2119,23 @@ impl<FS: ShimFS> ProcessServer<FS> {
         let nr = entry.syscall_nr;
         let mut cq = Self::base_cq(entry);
 
-        // Standard I/O fds (0=stdin, 1=stdout, 2=stderr) must always be
-        // handled locally by micro for write-family syscalls. The shim maps
-        // these to virtual /dev/std* devices in the in-memory filesystem,
-        // but the guest process needs writes to reach its real OS
-        // stdout/stderr (pipes, terminals, etc.).
+        // Standard I/O fds (0=stdin, 1=stdout, 2=stderr) normally must be
+        // handled locally by micro for write-family syscalls — the guest needs
+        // writes to reach the real OS stdout/stderr (pipes, terminals, etc.).
+        //
+        // However, when the shell redirects stdout to a file (e.g.
+        // `sort > sort.$$`), the dup2 updates both the shim's fd table and
+        // central's `fd_path_map`. In that case the write should go through
+        // the shim so the data reaches the in-mem filesystem (and gets
+        // synced to inmem shmem for fast reads).
+        //
         // sendto is excluded: socket fds are never 0-2.
         let fd = entry.args[0] as i32;
-        if i64::from(nr) != libc::SYS_sendto && (0..=2).contains(&fd) {
+        let has_path = self.fd_path_map.borrow().contains_key(&fd);
+        if i64::from(nr) != libc::SYS_sendto
+            && (0..=2).contains(&fd)
+            && !has_path
+        {
             cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
             return cq;
         }
@@ -2750,7 +2760,13 @@ impl<FS: ShimFS> ProcessServer<FS> {
         // Clear fd→path tracking (execve closes O_CLOEXEC fds and replaces
         // the process image). Don't free inmem data — other processes may
         // still reference those files.
-        self.fd_path_map.borrow_mut().clear();
+        //
+        // NOTE: We intentionally do NOT clear fd_path_map here. Non-CLOEXEC fds
+        // (like stdout redirected to a file) survive exec. If we cleared the map,
+        // writes to those inherited fds would never trigger inmem shmem sync.
+        // Stale entries for CLOEXEC fds are harmless — writes to them fail with
+        // EBADF (so maybe_sync_inmem_write exits early), and subsequent opens/closes
+        // will naturally overwrite or remove them.
 
         // Read serialized path/argv/envp from the data region.
         let data = self.region.data_region();

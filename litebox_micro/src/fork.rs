@@ -135,8 +135,73 @@ fn write_u32(buf: &mut [u8], start: usize, mut val: u32) -> usize {
     pos
 }
 
+/// Saved parent state for vfork.
+///
+/// Because `CLONE_VM | CLONE_VFORK` shares the address space, the child will
+/// reuse (and overwrite) the parent's stack frames as it returns through the
+/// syscall handler and eventually calls `execve`.  Storing the parent's saved
+/// state on the stack would therefore be corrupted by the time the parent
+/// resumes.  A static avoids this — safe because micro is single-threaded and
+/// `CLONE_VFORK` blocks the parent while the child runs.
+struct SavedVforkState {
+    ring_base: *mut u8,
+    ring_size: usize,
+    ring_fd: i32,
+    pid: u32,
+    ppid: u32,
+    layout: SharedRingLayout,
+    pipe_fds: [Option<crate::state::PipeFdEntry>; litebox_ipc::ring::MAX_PIPE_SLOTS],
+    parent_pipe_zone: *mut u8,
+    parent_pipe_zone_size: usize,
+    guest_brk: usize,
+    file_fds: [Option<crate::state::FileFdEntry>; litebox_ipc::ring::MAX_FILE_SLOTS],
+    socket_fds: [Option<crate::state::SocketFdEntry>; litebox_ipc::ring::MAX_SOCKET_SLOTS],
+    thread_slot: u64,
+    seq_counter: u64,
+}
+
+/// Static storage for the parent's vfork-saved state.
+///
+/// Only one vfork can be in progress at a time (parent is blocked), so a
+/// single static slot is sufficient.
+static mut SAVED_VFORK: core::mem::MaybeUninit<SavedVforkState> = core::mem::MaybeUninit::uninit();
+
+/// Restore parent's MicroState + TLS from the static `SAVED_VFORK` slot.
+///
+/// This is a separate `#[inline(never)]` function to ensure the compiler
+/// generates a fresh stack frame that does NOT depend on any stack state
+/// from before the `clone()` call. With `CLONE_VM | CLONE_VFORK`, the child
+/// shares the parent's stack and will have corrupted it by the time the
+/// parent resumes.
+#[inline(never)]
+unsafe fn restore_parent_vfork_state() {
+    let saved = unsafe { &*(&raw const SAVED_VFORK).cast::<SavedVforkState>() };
+
+    let micro = unsafe { crate::state::global_micro_state_mut() };
+    micro.ring_base = saved.ring_base;
+    micro.ring_size = saved.ring_size;
+    micro.ring_fd = saved.ring_fd;
+    micro.pid = saved.pid;
+    micro.ppid = saved.ppid;
+    micro.layout = saved.layout;
+    micro.pipe_fds = saved.pipe_fds;
+    micro.parent_pipe_zone = saved.parent_pipe_zone;
+    micro.parent_pipe_zone_size = saved.parent_pipe_zone_size;
+    micro
+        .guest_brk
+        .store(saved.guest_brk, core::sync::atomic::Ordering::Release);
+    micro.file_fds = saved.file_fds;
+    micro.socket_fds = saved.socket_fds;
+
+    let tls = unsafe { crate::tls::current_tls() };
+    unsafe {
+        (*tls).thread_slot = saved.thread_slot;
+        (*tls).seq_counter = saved.seq_counter;
+    }
+}
+
 /// Execute a vfork authorized by central — fast-path using
-/// `clone(CLONE_VM|CLONE_VFORK|SIGCHLD)` with a pooled stack.
+/// `clone(CLONE_VM|CLONE_VFORK|SIGCHLD)` with parent's stack.
 ///
 /// The CqEntry carries the same fields as [`handle_fork`].
 ///
@@ -147,7 +212,6 @@ fn write_u32(buf: &mut [u8], start: usize, mut val: u32) -> usize {
 /// - The global [`MicroState`] must be initialized.
 /// - TLS must be initialized for the calling thread.
 /// - `cq` must contain valid fork parameters from central.
-/// - The global stack pool must be initialized.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -180,74 +244,41 @@ pub unsafe fn handle_vfork(cq: &CqEntry) -> i64 {
         unsafe { crate::raw_syscall::close(local_fd as i32) };
     }
 
-    // Acquire a pooled stack for the child.
-    let Some(child_stack) = crate::state::global_stack_pool().acquire() else {
-        unsafe { crate::raw_syscall::close(RESERVED_CHILD_FD) };
-        return -i64::from(libc::ENOMEM);
-    };
+    // Save parent's MicroState + TLS fields into the static SAVED_VFORK slot.
+    // We use a static instead of stack locals because CLONE_VM shares the
+    // address space: the child will reuse and overwrite parent stack frames
+    // as it returns through the syscall handler before calling execve.
+    unsafe {
+        save_parent_vfork_state();
+    }
 
-    // Save parent's MicroState + TLS fields before clone.
-    // The child will mutate the shared global state (same address space).
-    let micro = unsafe { crate::state::global_micro_state_mut() };
-    let saved_ring_base = micro.ring_base;
-    let saved_ring_size = micro.ring_size;
-    let saved_ring_fd = micro.ring_fd;
-    let saved_pid = micro.pid;
-    let saved_ppid = micro.ppid;
-    let saved_layout = micro.layout;
-    let saved_pipe_fds = micro.pipe_fds;
-    let saved_parent_pipe_zone = micro.parent_pipe_zone;
-    let saved_parent_pipe_zone_size = micro.parent_pipe_zone_size;
-    let saved_guest_brk = micro.guest_brk.load(core::sync::atomic::Ordering::Acquire);
-
-    let tls = unsafe { crate::tls::current_tls() };
-    let saved_thread_slot = unsafe { (*tls).thread_slot };
-    let saved_seq_counter = unsafe { (*tls).seq_counter };
-
-    // clone(CLONE_VM | CLONE_VFORK | SIGCHLD, child_stack_top)
+    // clone(CLONE_VM | CLONE_VFORK | SIGCHLD, 0)
+    // Passing 0 for stack makes the child share the parent's stack.
+    // CLONE_VFORK blocks the parent until the child calls execve or _exit,
+    // so sharing the stack is safe.  The child WILL overwrite parent stack
+    // frames as it returns through the syscall handler — that's why we saved
+    // state into a static above, not into stack locals.
     let flags = CLONE_VM | CLONE_VFORK | SIGCHLD;
 
     let ret =
-        unsafe { crate::raw_syscall::syscall2(libc::SYS_clone, flags, child_stack.top() as u64) };
+        unsafe { crate::raw_syscall::syscall2(libc::SYS_clone, flags, 0) };
 
     if crate::raw_syscall::is_error(ret) {
-        // Error: release stack and close fd.
-        crate::state::global_stack_pool().release(child_stack);
         unsafe { crate::raw_syscall::close(RESERVED_CHILD_FD) };
         return ret;
     }
 
     if ret == 0 {
-        // CHILD — running on the pooled stack, sharing parent's address space.
+        // CHILD — running on parent's stack (safe because CLONE_VFORK blocks parent).
         unsafe {
             post_fork_child_vfork(RESERVED_CHILD_FD, child_pid_from_central);
         }
         0
     } else {
         // PARENT — resumed after child called execve or _exit.
-        // Restore all saved MicroState + TLS fields.
-        let micro = unsafe { crate::state::global_micro_state_mut() };
-        micro.ring_base = saved_ring_base;
-        micro.ring_size = saved_ring_size;
-        micro.ring_fd = saved_ring_fd;
-        micro.pid = saved_pid;
-        micro.ppid = saved_ppid;
-        micro.layout = saved_layout;
-        micro.pipe_fds = saved_pipe_fds;
-        micro.parent_pipe_zone = saved_parent_pipe_zone;
-        micro.parent_pipe_zone_size = saved_parent_pipe_zone_size;
-        micro
-            .guest_brk
-            .store(saved_guest_brk, core::sync::atomic::Ordering::Release);
-
-        let tls = unsafe { crate::tls::current_tls() };
-        unsafe {
-            (*tls).thread_slot = saved_thread_slot;
-            (*tls).seq_counter = saved_seq_counter;
-        }
-
-        // Release stack back to pool.
-        crate::state::global_stack_pool().release(child_stack);
+        // Restore state from the static slot via a separate function to avoid
+        // depending on any stack locals that the child may have overwritten.
+        unsafe { restore_parent_vfork_state() };
 
         // Close the reserved fd — child has its own ring mapped.
         unsafe { crate::raw_syscall::close(RESERVED_CHILD_FD) };
@@ -256,6 +287,37 @@ pub unsafe fn handle_vfork(cq: &CqEntry) -> i64 {
         ret
     }
 }
+
+/// Save parent's MicroState + TLS into the static `SAVED_VFORK` slot.
+///
+/// Separate function to keep `handle_vfork` lean — all the large struct
+/// copies happen here and won't occupy `handle_vfork`'s stack frame across
+/// the `clone()` syscall.
+#[inline(never)]
+unsafe fn save_parent_vfork_state() {
+    let micro = unsafe { crate::state::global_micro_state_mut() };
+    let tls = unsafe { crate::tls::current_tls() };
+
+    unsafe {
+        (&raw mut SAVED_VFORK).cast::<SavedVforkState>().write(SavedVforkState {
+            ring_base: micro.ring_base,
+            ring_size: micro.ring_size,
+            ring_fd: micro.ring_fd,
+            pid: micro.pid,
+            ppid: micro.ppid,
+            layout: micro.layout,
+            pipe_fds: micro.pipe_fds,
+            parent_pipe_zone: micro.parent_pipe_zone,
+            parent_pipe_zone_size: micro.parent_pipe_zone_size,
+            guest_brk: micro.guest_brk.load(core::sync::atomic::Ordering::Acquire),
+            file_fds: micro.file_fds,
+            socket_fds: micro.socket_fds,
+            thread_slot: (*tls).thread_slot,
+            seq_counter: (*tls).seq_counter,
+        });
+    }
+}
+
 
 /// Post-fork child initialization for vfork (CLONE_VM path).
 ///
@@ -301,6 +363,9 @@ unsafe fn post_fork_child_vfork(child_ring_fd: i32, child_pid: u32) {
     micro.pipe_fds = [None; litebox_ipc::ring::MAX_PIPE_SLOTS];
     micro.parent_pipe_zone = core::ptr::null_mut();
     micro.parent_pipe_zone_size = 0;
+    // Clear file and socket fd tables — entries point into the parent ring.
+    micro.file_fds = [None; litebox_ipc::ring::MAX_FILE_SLOTS];
+    micro.socket_fds = [None; litebox_ipc::ring::MAX_SOCKET_SLOTS];
 
     // 4. Reset TLS.
     let tls = unsafe { crate::tls::current_tls() };
@@ -416,6 +481,14 @@ unsafe fn post_fork_child(child_ring_fd: i32, child_pid: u32) {
 
     // Close parent ring fd — the pipe zone is now independently mapped.
     unsafe { crate::raw_syscall::close(parent_ring_fd) };
+
+    // Clear file fd table — entries point into the parent ring's data region
+    // which was unmapped. The child gets fresh file slots as it opens/dups
+    // files. Without this, writes via FILE_SHMEM use stale offsets and
+    // central can't find the TX ring header (child's shmem_files is empty).
+    micro.file_fds = [None; litebox_ipc::ring::MAX_FILE_SLOTS];
+    // Socket fds also point into the old ring — clear them too.
+    micro.socket_fds = [None; litebox_ipc::ring::MAX_SOCKET_SLOTS];
 
     // 4. Reset TLS.
     let tls = unsafe { crate::tls::current_tls() };

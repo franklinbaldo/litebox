@@ -305,6 +305,7 @@ impl RingPool {
         }
     }
 
+
     /// Return a ring to the pool after resetting its header and SQ flags.
     pub fn release(&self, region: SharedRegion, fd: i32) {
         use std::sync::atomic::Ordering::Relaxed;

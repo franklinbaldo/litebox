@@ -1405,13 +1405,18 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
         // Fall through to submit_and_wait for central to handle close + slot cleanup
     }
 
-    // For dup2/dup3 the target fd (args[1]) may have a file shmem slot.
-    // Unregister it before submitting, since central will free the old slot.
+    // For dup2/dup3 the target fd (args[1]) may have shmem slots (file,
+    // pipe, or socket). Unregister all of them before submitting so that
+    // the new fd semantics take effect. Without this, a dup2 that replaces
+    // a pipe fd with a file fd would leave the stale pipe_fd entry, causing
+    // writes to hit the pipe fast-path instead of reaching central.
     #[allow(clippy::cast_possible_truncation)]
     if matches!(i64::from(nr), libc::SYS_dup2 | libc::SYS_dup3) {
         let target_fd = args.args[1] as i32;
         let micro_mut = unsafe { &mut *(*tls).micro };
         micro_mut.unregister_file_fd(target_fd);
+        micro_mut.unregister_pipe_fd(target_fd);
+        micro_mut.unregister_socket_fd(target_fd);
     }
 
     // Shmem pipe fast-path: read/write on pipe fds bypass central entirely.

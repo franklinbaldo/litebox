@@ -196,7 +196,10 @@ dev_bench/unixbench/*.zip
 
 ### Build artifacts & rootfs ###
 *.tar
+nginx_rootfs/
 nginx_rootfs_fixed/
+nginx_original_binary
 runner_stderr.log
 runner_stdout.log
 run_orig_litebox.sh
+.opencode/
