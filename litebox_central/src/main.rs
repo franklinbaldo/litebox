@@ -5,6 +5,7 @@
 //! via shared-memory ring buffer IPC.
 
 mod dispatch;
+mod inmem_alloc;
 mod notification_state;
 mod server;
 mod shmem;
@@ -317,6 +318,12 @@ fn main() -> anyhow::Result<()> {
     // Register the initial ring so it gets signalled on exit/panic.
     register_active_ring(region.header());
 
+    // Create the in-memory shmem allocator (shared across parent/child
+    // ProcessServers via Arc).
+    let inmem_alloc = Arc::new(Mutex::new(inmem_alloc::InMemAllocator::new(
+        inmem_base, inmem_size,
+    )));
+
     // Master process does NOT get a TUN queue — only worker children do.
     // This prevents master's smoltcp from black-holing incoming TCP connections
     // (master never calls accept, so connections completed on its Network are
@@ -339,6 +346,7 @@ fn main() -> anyhow::Result<()> {
         args.aligned_size,
         inmem_base,
         inmem_size,
+        inmem_alloc,
     );
     let result = server.run();
 

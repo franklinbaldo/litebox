@@ -9,6 +9,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -157,6 +158,9 @@ pub struct ProcessServer<FS: ShimFS> {
     inmem_base: SendMutPtr,
     /// Size in bytes of the inmem shmem region.
     inmem_size: usize,
+    /// Bump + free-list allocator for the inmem shmem data region.
+    /// Shared across parent/child `ProcessServer` instances via `Arc`.
+    inmem_alloc: Arc<Mutex<crate::inmem_alloc::InMemAllocator>>,
 }
 
 impl<FS: ShimFS> ProcessServer<FS> {
@@ -179,6 +183,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
         aligned_size: usize,
         inmem_base: *mut u8,
         inmem_size: usize,
+        inmem_alloc: Arc<Mutex<crate::inmem_alloc::InMemAllocator>>,
     ) -> Self {
         // If this process has no TUN queue but TUN is enabled, it's the master.
         // Queue 0 (created by CentralPlatform::new) should be given to the
@@ -214,6 +219,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
             fd_aligned_set: RefCell::new(HashSet::new()),
             inmem_base: SendMutPtr(inmem_base),
             inmem_size,
+            inmem_alloc,
         }
     }
 
@@ -1096,6 +1102,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
             let aligned_size = self.aligned_size;
             let inmem_base = self.inmem_base.0;
             let inmem_size = self.inmem_size;
+            let inmem_alloc = Arc::clone(&self.inmem_alloc);
             let child_server = ProcessServer::new(
                 child_region,
                 child_task,
@@ -1112,6 +1119,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 aligned_size,
                 inmem_base,
                 inmem_size,
+                inmem_alloc,
             );
             child_server.next_child_pid.set(self.next_child_pid.get());
             child_server.fd_aligned_set.borrow_mut().clone_from(&self.fd_aligned_set.borrow());
