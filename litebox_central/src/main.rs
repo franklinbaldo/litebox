@@ -324,6 +324,12 @@ fn main() -> anyhow::Result<()> {
         inmem_base, inmem_size,
     )));
 
+    // Map from canonical file path to inmem shmem slot index, shared
+    // across parent/child ProcessServers so that a file written by one
+    // process can be served from shmem by another's openat.
+    let inmem_file_map: Arc<Mutex<std::collections::HashMap<String, u32>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+
     // Master process does NOT get a TUN queue — only worker children do.
     // This prevents master's smoltcp from black-holing incoming TCP connections
     // (master never calls accept, so connections completed on its Network are
@@ -347,6 +353,7 @@ fn main() -> anyhow::Result<()> {
         inmem_base,
         inmem_size,
         inmem_alloc,
+        inmem_file_map,
     );
     let result = server.run();
 

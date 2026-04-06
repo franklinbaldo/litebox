@@ -161,6 +161,13 @@ pub struct ProcessServer<FS: ShimFS> {
     /// Bump + free-list allocator for the inmem shmem data region.
     /// Shared across parent/child `ProcessServer` instances via `Arc`.
     inmem_alloc: Arc<Mutex<crate::inmem_alloc::InMemAllocator>>,
+    /// Map from guest fd to the canonical path of the file (for non-tar,
+    /// non-pipe, non-socket fds). Used to look up inmem shmem slots after
+    /// writes.
+    fd_path_map: RefCell<HashMap<i32, String>>,
+    /// Map from canonical file path to inmem shmem slot index.
+    /// Shared with forked children via `Arc<Mutex<>>`.
+    inmem_file_map: Arc<Mutex<HashMap<String, u32>>>,
 }
 
 impl<FS: ShimFS> ProcessServer<FS> {
@@ -184,6 +191,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
         inmem_base: *mut u8,
         inmem_size: usize,
         inmem_alloc: Arc<Mutex<crate::inmem_alloc::InMemAllocator>>,
+        inmem_file_map: Arc<Mutex<HashMap<String, u32>>>,
     ) -> Self {
         // If this process has no TUN queue but TUN is enabled, it's the master.
         // Queue 0 (created by CentralPlatform::new) should be given to the
@@ -220,6 +228,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
             inmem_base: SendMutPtr(inmem_base),
             inmem_size,
             inmem_alloc,
+            fd_path_map: RefCell::new(HashMap::new()),
+            inmem_file_map,
         }
     }
 
@@ -563,6 +573,9 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 self.maybe_close_shmem_file(fd);
                 // Remove from aligned fd tracking set.
                 self.fd_aligned_set.borrow_mut().remove(&fd);
+                // Remove from inmem fd→path tracking (don't free shmem data —
+                // other fds or future opens may reference the same file).
+                self.fd_path_map.borrow_mut().remove(&fd);
                 cq.result = 0;
                 return cq;
             }
@@ -602,6 +615,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     // borrowing notification_state since it borrows internally.
                     if matches!(i64::from(nr), libc::SYS_dup2 | libc::SYS_dup3) {
                         self.maybe_close_shmem_file(new_fd);
+                        self.fd_path_map.borrow_mut().remove(&new_fd);
                     }
 
                     // Check if source fd has a shmem file slot.
@@ -641,6 +655,12 @@ impl<FS: ShimFS> ProcessServer<FS> {
                             });
                             drop(ns);
 
+                            // Look up inmem slot for the source fd's path.
+                            let inmem_slot = self.fd_path_map.borrow()
+                                .get(&source_fd)
+                                .and_then(|p| self.inmem_file_map.lock().unwrap().get(p).copied())
+                                .unwrap_or(litebox_ipc::inmem_shmem::INMEM_NO_SLOT);
+
                             // Write OpenResponse to data region at offset 0 for micro.
                             let response = litebox_ipc::messages::OpenResponse {
                                 fd: new_fd,
@@ -648,7 +668,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                                 tar_offset: 0,
                                 tar_len: 0,
                                 aligned_offset: 0,
-                                inmem_slot_index: litebox_ipc::inmem_shmem::INMEM_NO_SLOT,
+                                inmem_slot_index: inmem_slot,
                                 _pad_inmem: 0,
                             };
                             let data_region = self.region.data_region_mut();
@@ -671,6 +691,11 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     // Propagate aligned fd tracking for phantom-mode mmap.
                     if self.fd_aligned_set.borrow().contains(&source_fd) {
                         self.fd_aligned_set.borrow_mut().insert(new_fd);
+                    }
+
+                    // Propagate inmem fd→path tracking.
+                    if let Some(path) = self.fd_path_map.borrow().get(&source_fd).cloned() {
+                        self.fd_path_map.borrow_mut().insert(new_fd, path);
                     }
                 }
 
@@ -989,6 +1014,29 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     self.fd_aligned_set.borrow_mut().insert(new_fd);
                 }
 
+                // For non-tar files, track fd→path and look up inmem shmem slot.
+                let inmem_slot = if tar_off == 0 && !pathname_buf.is_empty() {
+                    let path_bytes = if let Some(nul) = pathname_buf.iter().position(|&b| b == 0) {
+                        &pathname_buf[..nul]
+                    } else {
+                        &pathname_buf[..]
+                    };
+                    if let Ok(path_str) = core::str::from_utf8(path_bytes) {
+                        let normalized = path_str.strip_prefix('/').unwrap_or(path_str);
+                        let norm_owned = normalized.to_string();
+                        self.fd_path_map.borrow_mut().insert(new_fd, norm_owned.clone());
+                        // Check if this path already has inmem shmem data.
+                        self.inmem_file_map.lock().unwrap()
+                            .get(&norm_owned)
+                            .copied()
+                            .unwrap_or(litebox_ipc::inmem_shmem::INMEM_NO_SLOT)
+                    } else {
+                        litebox_ipc::inmem_shmem::INMEM_NO_SLOT
+                    }
+                } else {
+                    litebox_ipc::inmem_shmem::INMEM_NO_SLOT
+                };
+
                 // Write OpenResponse to data region at offset 0 for micro.
                 let response = litebox_ipc::messages::OpenResponse {
                     fd: new_fd,
@@ -996,7 +1044,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     tar_offset: tar_off,
                     tar_len: tar_ln,
                     aligned_offset: aligned_off,
-                    inmem_slot_index: litebox_ipc::inmem_shmem::INMEM_NO_SLOT,
+                    inmem_slot_index: inmem_slot,
                     _pad_inmem: 0,
                 };
                 let data_region = self.region.data_region_mut();
@@ -1103,6 +1151,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
             let inmem_base = self.inmem_base.0;
             let inmem_size = self.inmem_size;
             let inmem_alloc = Arc::clone(&self.inmem_alloc);
+            let inmem_file_map = Arc::clone(&self.inmem_file_map);
             let child_server = ProcessServer::new(
                 child_region,
                 child_task,
@@ -1120,9 +1169,12 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 inmem_base,
                 inmem_size,
                 inmem_alloc,
+                inmem_file_map,
             );
             child_server.next_child_pid.set(self.next_child_pid.get());
             child_server.fd_aligned_set.borrow_mut().clone_from(&self.fd_aligned_set.borrow());
+            // Forked children inherit the parent's fd table.
+            child_server.fd_path_map.borrow_mut().clone_from(&self.fd_path_map.borrow());
 
             let handle = std::thread::spawn(move || {
                 if let Err(e) = child_server.run() {
@@ -2117,6 +2169,10 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
                     if cq.result == -i64::from(libc::EBADF) {
                         cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
+                    } else if cq.result > 0 {
+                        // After successful write to a virtual fd, sync file
+                        // data to inmem shmem.
+                        self.maybe_sync_inmem_write(entry.thread_slot, fd);
                     }
                     return cq;
                 }
@@ -2214,16 +2270,157 @@ impl<FS: ShimFS> ProcessServer<FS> {
 
         cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
 
-        if cq.result >= 0 {
+        if cq.result > 0 {
             // Shim handled the write to a virtual fd — return result directly.
+            // Sync the written file data to inmem shmem (skip sendto — those
+            // are socket writes, never in-mem files).
+            if i64::from(nr) != libc::SYS_sendto {
+                self.maybe_sync_inmem_write(entry.thread_slot, fd);
+            }
         } else if cq.result == -i64::from(libc::EBADF) {
             // Fd not in shim's table — it's a real OS fd (e.g. stdout, pipe).
             // Tell micro to execute the write locally.
             cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
         }
-        // Other negative: error from shim, pass through directly.
+        // Other negative or zero: error from shim, pass through directly.
 
         cq
+    }
+
+    /// After a successful write to an in-mem file, copy the file data to the
+    /// inmem shmem region so micro can read it via the fast-path.
+    ///
+    /// Uses `dispatch_to_task(SYS_lseek)` to query the file size and
+    /// `dispatch_to_task(SYS_pread64)` to read the data into shmem.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::field_reassign_with_default
+    )]
+    fn maybe_sync_inmem_write(&self, thread_slot: u16, fd: i32) {
+        // 1. Check if allocator is available.
+        {
+            let alloc = self.inmem_alloc.lock().unwrap();
+            if !alloc.is_available() {
+                return;
+            }
+        }
+
+        // 2. Skip pipes and sockets.
+        {
+            let ns = self.notification_state.borrow();
+            if ns.shmem_pipes.iter().any(|p| p.read_fd == fd || p.write_fd == fd) {
+                return;
+            }
+            if ns.shmem_sockets.iter().any(|s| s.fd == fd) {
+                return;
+            }
+        }
+
+        // 3. Skip if fd not in fd_path_map (not an in-mem file we're tracking).
+        let Some(path) = self.fd_path_map.borrow().get(&fd).cloned() else {
+            return;
+        };
+
+        // 4. Get file size via lseek(SEEK_END), saving and restoring position.
+        let old_pos = {
+            let mut regs = litebox_common_linux::PtRegs::default();
+            regs.orig_rax = libc::SYS_lseek as usize;
+            regs.rdi = fd as usize;
+            regs.rsi = 0;
+            regs.rdx = libc::SEEK_CUR as usize;
+            self.dispatch_to_task(thread_slot, &mut regs)
+        };
+        if old_pos < 0 {
+            return;
+        }
+
+        let file_size = {
+            let mut regs = litebox_common_linux::PtRegs::default();
+            regs.orig_rax = libc::SYS_lseek as usize;
+            regs.rdi = fd as usize;
+            regs.rsi = 0;
+            regs.rdx = libc::SEEK_END as usize;
+            self.dispatch_to_task(thread_slot, &mut regs)
+        };
+        if file_size <= 0 {
+            // Restore position.
+            let mut regs = litebox_common_linux::PtRegs::default();
+            regs.orig_rax = libc::SYS_lseek as usize;
+            regs.rdi = fd as usize;
+            regs.rsi = old_pos as usize;
+            regs.rdx = libc::SEEK_SET as usize;
+            self.dispatch_to_task(thread_slot, &mut regs);
+            return;
+        }
+
+        // Restore position.
+        {
+            let mut regs = litebox_common_linux::PtRegs::default();
+            regs.orig_rax = libc::SYS_lseek as usize;
+            regs.rdi = fd as usize;
+            regs.rsi = old_pos as usize;
+            regs.rdx = libc::SEEK_SET as usize;
+            self.dispatch_to_task(thread_slot, &mut regs);
+        }
+
+        let size = file_size as usize;
+
+        // 5. Lock allocator and get/create slot.
+        let mut alloc = self.inmem_alloc.lock().unwrap();
+        let mut file_map = self.inmem_file_map.lock().unwrap();
+
+        let slot_index = if let Some(&existing) = file_map.get(&path) {
+            existing
+        } else {
+            match alloc.alloc_slot() {
+                Some(idx) => {
+                    file_map.insert(path.clone(), idx);
+                    idx
+                }
+                None => return, // no slots available
+            }
+        };
+
+        // Get old snapshot to free old data.
+        let old_snapshot = alloc.slot(slot_index).read_snapshot();
+
+        // Allocate new data block.
+        let Some(data_offset) = alloc.alloc_data(size) else {
+            return; // no space
+        };
+
+        let shmem_ptr = alloc.data_ptr_mut(data_offset);
+        drop(alloc);
+        drop(file_map);
+
+        // 6. Read file data into shmem via pread64.
+        let bytes_read = {
+            let mut regs = litebox_common_linux::PtRegs::default();
+            regs.orig_rax = libc::SYS_pread64 as usize;
+            regs.rdi = fd as usize;
+            regs.rsi = shmem_ptr as usize;
+            regs.rdx = size;
+            regs.r10 = 0; // offset = 0 (read from start)
+            self.dispatch_to_task(thread_slot, &mut regs)
+        };
+
+        if bytes_read <= 0 {
+            // Failed to read — free the data block.
+            let mut alloc = self.inmem_alloc.lock().unwrap();
+            alloc.free_data(data_offset, size);
+            return;
+        }
+
+        // 7. Update slot and free old data.
+        let mut alloc = self.inmem_alloc.lock().unwrap();
+        alloc.update_slot(slot_index, data_offset, bytes_read as u64, size as u64);
+
+        // Free old data block if one existed.
+        if old_snapshot.data_offset != 0 {
+            alloc.free_data(old_snapshot.data_offset, old_snapshot.capacity as usize);
+        }
     }
 
     /// Handle a `pipe2` syscall by creating virtual pipe fds in the shim's
@@ -2566,6 +2763,11 @@ impl<FS: ShimFS> ProcessServer<FS> {
         // the old program is irrelevant. The dynamic linker of the new program
         // will re-open libraries and populate the set via openat.
         self.fd_aligned_set.borrow_mut().clear();
+
+        // Clear fd→path tracking (execve closes O_CLOEXEC fds and replaces
+        // the process image). Don't free inmem data — other processes may
+        // still reference those files.
+        self.fd_path_map.borrow_mut().clear();
 
         // Read serialized path/argv/envp from the data region.
         let data = self.region.data_region();
