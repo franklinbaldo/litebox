@@ -27,7 +27,6 @@ use litebox_ipc::ring::{
 };
 use litebox_ipc::sq::{sq_advance_head, sq_head_index, sq_try_consume};
 use litebox_ipc::wait::spin_u8_then_wait_u32;
-use litebox_platform_central::PhantomModeGuard;
 use litebox_shim_linux::ShimFS;
 
 use crate::shmem::{RingPool, SharedRegion};
@@ -751,12 +750,14 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 None
             };
 
-            // Enable phantom mode if we have a tar fast path — the shim's
-            // PageManager will track the VMA without allocating real pages.
-            let _phantom_guard = tar_aligned_offset.map(|_| {
-                let platform = litebox_platform_multiplex::platform();
-                PhantomModeGuard::new(platform)
-            });
+            // Note: we do NOT enable phantom mode here. The shim's mmap path
+            // (do_mmap_file → try_cow_mmap_file / do_mmap_file_memcpy) needs
+            // real pages for VMA tracking and file data population. Phantom
+            // mode would cause SIGSEGV because the shim writes file data into
+            // pages returned by allocate_pages. Instead, we let the shim run
+            // normally and skip the expensive data-region copy when
+            // MMAP_FROM_ALIGNED is set (micro mmaps directly from the aligned
+            // memfd).
 
             let mut regs = crate::dispatch::sq_entry_to_ptregs(entry);
             cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
