@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use litebox_ipc::cq::{cq_notify_thread, cq_push};
 use litebox_ipc::messages::{
@@ -307,6 +307,11 @@ impl<FS: ShimFS> ProcessServer<FS> {
         let header = self.region.header();
         let sq_entries = self.region.sq_entries();
 
+        // --- Syscall profiling instrumentation (temporary) ---
+        // Tracks per-syscall-nr count and cumulative wall-clock time.
+        let mut syscall_stats: HashMap<u32, (u64, Duration)> = HashMap::new();
+        let loop_start = Instant::now();
+
         loop {
             let head = sq_head_index(header);
 
@@ -354,11 +359,19 @@ impl<FS: ShimFS> ProcessServer<FS> {
             // Entry is ready — extract fields and dispatch.
             let syscall_nr = entry.syscall_nr;
 
+            // Time the dispatch.
+            let dispatch_start = Instant::now();
+
             let cq_entry = if messages::is_control_message(syscall_nr) {
                 self.handle_control_message(entry)
             } else {
                 self.handle_syscall(entry)
             };
+
+            let dispatch_elapsed = dispatch_start.elapsed();
+            let stat = syscall_stats.entry(syscall_nr).or_insert((0, Duration::ZERO));
+            stat.0 += 1;
+            stat.1 += dispatch_elapsed;
 
             // Notification-only: central processed it, skip CQ response.
             let is_notify_only = entry.flags & sq_flags::NOTIFY_ONLY != 0;
@@ -413,6 +426,9 @@ impl<FS: ShimFS> ProcessServer<FS> {
             }
         }
 
+        // --- Dump syscall profiling stats ---
+        Self::dump_syscall_stats(&syscall_stats, loop_start.elapsed());
+
         // Wait for all child server threads to finish before returning.
         // This prevents the central process from exiting while children
         // are still processing syscalls (the OS would kill child threads,
@@ -447,6 +463,207 @@ impl<FS: ShimFS> ProcessServer<FS> {
             _pad: [0; 4],
             data_offset: 0,
             data_len: 0,
+        }
+    }
+
+    /// Dump collected syscall profiling stats to stderr (temporary instrumentation).
+    #[allow(clippy::cast_precision_loss)]
+    fn dump_syscall_stats(stats: &HashMap<u32, (u64, Duration)>, total_wall: Duration) {
+        use std::io::Write;
+        let stderr = std::io::stderr();
+        let mut out = stderr.lock();
+
+        let _ = writeln!(out, "\n=== SYSCALL PROFILE (pid {}) ===", unsafe {
+            libc::getpid()
+        });
+        let _ = writeln!(out, "Total wall time: {total_wall:.3?}");
+
+        // Sort by total time descending.
+        let mut entries: Vec<_> = stats.iter().collect();
+        entries.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+
+        let _ = writeln!(
+            out,
+            "{:<8} {:<30} {:>10} {:>14} {:>14}",
+            "NR", "NAME", "COUNT", "TOTAL_US", "AVG_US"
+        );
+        let _ = writeln!(out, "{}", "-".repeat(80));
+
+        let total_dispatch: Duration = stats.values().map(|(_, d)| *d).sum();
+        let mut cumulative_count: u64 = 0;
+
+        for (nr, (count, total_time)) in &entries {
+            let avg_us = if *count > 0 {
+                total_time.as_micros() as f64 / *count as f64
+            } else {
+                0.0
+            };
+            let name = Self::syscall_name(**nr);
+            let _ = writeln!(
+                out,
+                "{:<8} {:<30} {:>10} {:>14.1} {:>14.2}",
+                nr,
+                name,
+                count,
+                total_time.as_micros() as f64,
+                avg_us
+            );
+            cumulative_count += count;
+        }
+
+        let _ = writeln!(out, "{}", "-".repeat(80));
+        let _ = writeln!(
+            out,
+            "Total messages: {cumulative_count}, Total dispatch time: {total_dispatch:.3?}"
+        );
+        let _ = writeln!(out, "=== END PROFILE ===\n");
+    }
+
+    /// Map a syscall number to a human-readable name (best-effort).
+    #[allow(clippy::too_many_lines)]
+    fn syscall_name(nr: u32) -> &'static str {
+        // Control messages
+        if nr >= messages::MSG_BASE {
+            return match nr {
+                messages::MSG_THREAD_REGISTER => "MSG_THREAD_REGISTER",
+                messages::MSG_THREAD_DEREGISTER => "MSG_THREAD_DEREGISTER",
+                messages::MSG_FORK_RESULT => "MSG_FORK_RESULT",
+                messages::MSG_CHILD_READY => "MSG_CHILD_READY",
+                messages::MSG_LOCAL_RESULT => "MSG_LOCAL_RESULT",
+                messages::MSG_NOTIFY_SIGACTION => "MSG_NOTIFY_SIGACTION",
+                messages::MSG_NOTIFY_SIGPROCMASK => "MSG_NOTIFY_SIGPROCMASK",
+                messages::MSG_NOTIFY_SIGALTSTACK => "MSG_NOTIFY_SIGALTSTACK",
+                messages::MSG_NOTIFY_ALARM => "MSG_NOTIFY_ALARM",
+                messages::MSG_NOTIFY_PIPE2 => "MSG_NOTIFY_PIPE2",
+                messages::MSG_NOTIFY_WAIT4 => "MSG_NOTIFY_WAIT4",
+                messages::MSG_NOTIFY_MUNMAP => "MSG_NOTIFY_MUNMAP",
+                messages::MSG_NOTIFY_MPROTECT => "MSG_NOTIFY_MPROTECT",
+                messages::MSG_NOTIFY_MADVISE => "MSG_NOTIFY_MADVISE",
+                messages::MSG_NOTIFY_UMASK => "MSG_NOTIFY_UMASK",
+                messages::MSG_NOTIFY_MMAP => "MSG_NOTIFY_MMAP",
+                _ => "MSG_UNKNOWN",
+            };
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        match i64::from(nr) {
+            libc::SYS_read => "read",
+            libc::SYS_write => "write",
+            libc::SYS_open => "open",
+            libc::SYS_close => "close",
+            libc::SYS_stat => "stat",
+            libc::SYS_fstat => "fstat",
+            libc::SYS_lstat => "lstat",
+            libc::SYS_poll => "poll",
+            libc::SYS_lseek => "lseek",
+            libc::SYS_mmap => "mmap",
+            libc::SYS_mprotect => "mprotect",
+            libc::SYS_munmap => "munmap",
+            libc::SYS_brk => "brk",
+            libc::SYS_rt_sigaction => "rt_sigaction",
+            libc::SYS_rt_sigprocmask => "rt_sigprocmask",
+            libc::SYS_ioctl => "ioctl",
+            libc::SYS_pread64 => "pread64",
+            libc::SYS_pwrite64 => "pwrite64",
+            libc::SYS_readv => "readv",
+            libc::SYS_writev => "writev",
+            libc::SYS_access => "access",
+            libc::SYS_pipe => "pipe",
+            libc::SYS_pipe2 => "pipe2",
+            libc::SYS_dup => "dup",
+            libc::SYS_dup2 => "dup2",
+            libc::SYS_dup3 => "dup3",
+            libc::SYS_clone => "clone",
+            libc::SYS_fork => "fork",
+            libc::SYS_vfork => "vfork",
+            libc::SYS_execve => "execve",
+            libc::SYS_exit => "exit",
+            libc::SYS_exit_group => "exit_group",
+            libc::SYS_wait4 => "wait4",
+            libc::SYS_kill => "kill",
+            libc::SYS_fcntl => "fcntl",
+            libc::SYS_flock => "flock",
+            libc::SYS_fsync => "fsync",
+            libc::SYS_truncate => "truncate",
+            libc::SYS_ftruncate => "ftruncate",
+            libc::SYS_getdents => "getdents",
+            libc::SYS_getcwd => "getcwd",
+            libc::SYS_chdir => "chdir",
+            libc::SYS_fchdir => "fchdir",
+            libc::SYS_rename => "rename",
+            libc::SYS_mkdir => "mkdir",
+            libc::SYS_rmdir => "rmdir",
+            libc::SYS_unlink => "unlink",
+            libc::SYS_readlink => "readlink",
+            libc::SYS_chmod => "chmod",
+            libc::SYS_fchmod => "fchmod",
+            libc::SYS_chown => "chown",
+            libc::SYS_fchown => "fchown",
+            libc::SYS_umask => "umask",
+            libc::SYS_getuid => "getuid",
+            libc::SYS_getgid => "getgid",
+            libc::SYS_geteuid => "geteuid",
+            libc::SYS_getegid => "getegid",
+            libc::SYS_getpid => "getpid",
+            libc::SYS_getppid => "getppid",
+            libc::SYS_getpgrp => "getpgrp",
+            libc::SYS_setpgid => "setpgid",
+            libc::SYS_setsid => "setsid",
+            libc::SYS_getgroups => "getgroups",
+            libc::SYS_setgroups => "setgroups",
+            libc::SYS_uname => "uname",
+            libc::SYS_sysinfo => "sysinfo",
+            libc::SYS_times => "times",
+            libc::SYS_getrlimit => "getrlimit",
+            libc::SYS_setrlimit => "setrlimit",
+            libc::SYS_prlimit64 => "prlimit64",
+            libc::SYS_getrusage => "getrusage",
+            libc::SYS_clock_gettime => "clock_gettime",
+            libc::SYS_clock_getres => "clock_getres",
+            libc::SYS_gettimeofday => "gettimeofday",
+            libc::SYS_nanosleep => "nanosleep",
+            libc::SYS_socket => "socket",
+            libc::SYS_connect => "connect",
+            libc::SYS_accept => "accept",
+            libc::SYS_sendto => "sendto",
+            libc::SYS_recvfrom => "recvfrom",
+            libc::SYS_bind => "bind",
+            libc::SYS_listen => "listen",
+            libc::SYS_getsockname => "getsockname",
+            libc::SYS_getpeername => "getpeername",
+            libc::SYS_setsockopt => "setsockopt",
+            libc::SYS_getsockopt => "getsockopt",
+            libc::SYS_sendmsg => "sendmsg",
+            libc::SYS_recvmsg => "recvmsg",
+            libc::SYS_shutdown => "shutdown",
+            libc::SYS_openat => "openat",
+            libc::SYS_newfstatat => "newfstatat",
+            libc::SYS_faccessat => "faccessat",
+            libc::SYS_set_tid_address => "set_tid_address",
+            libc::SYS_set_robust_list => "set_robust_list",
+            libc::SYS_futex => "futex",
+            libc::SYS_sched_getaffinity => "sched_getaffinity",
+            libc::SYS_sched_yield => "sched_yield",
+            libc::SYS_epoll_create1 => "epoll_create1",
+            libc::SYS_epoll_ctl => "epoll_ctl",
+            libc::SYS_epoll_wait => "epoll_wait",
+            libc::SYS_eventfd2 => "eventfd2",
+            libc::SYS_signalfd4 => "signalfd4",
+            libc::SYS_timerfd_create => "timerfd_create",
+            libc::SYS_timerfd_settime => "timerfd_settime",
+            libc::SYS_madvise => "madvise",
+            libc::SYS_mremap => "mremap",
+            libc::SYS_arch_prctl => "arch_prctl",
+            libc::SYS_prctl => "prctl",
+            libc::SYS_sigaltstack => "sigaltstack",
+            libc::SYS_getdents64 => "getdents64",
+            libc::SYS_fadvise64 => "fadvise64",
+            libc::SYS_tgkill => "tgkill",
+            libc::SYS_alarm => "alarm",
+            libc::SYS_getrandom => "getrandom",
+            libc::SYS_statfs => "statfs",
+            libc::SYS_fstatfs => "fstatfs",
+            libc::SYS_rseq => "rseq",
+            _ => "UNKNOWN",
         }
     }
 
@@ -621,6 +838,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                                 file_slot_offset: slot_offset,
                                 tar_offset: 0,
                                 tar_len: 0,
+                                aligned_offset: 0,
                             };
                             let data_region = self.region.data_region_mut();
                             let resp_bytes: &[u8] = unsafe {
@@ -945,6 +1163,15 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     (0, 0, None)
                 };
 
+                // Look up the aligned memfd offset for tar-backed files.
+                let aligned_off = if tar_off != 0 {
+                    tar_path.as_deref()
+                        .and_then(|p| self.aligned_file_map.get(p))
+                        .map_or(0, |&(start, _size)| start as u64)
+                } else {
+                    0
+                };
+
                 // Cache the fd -> path mapping for the mmap handler.
                 if let Some(path) = tar_path {
                     self.fd_path_map
@@ -958,6 +1185,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     file_slot_offset: slot_offset,
                     tar_offset: tar_off,
                     tar_len: tar_ln,
+                    aligned_offset: aligned_off,
                 };
                 let data_region = self.region.data_region_mut();
                 let resp_bytes: &[u8] = unsafe {

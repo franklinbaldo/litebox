@@ -29,6 +29,8 @@ pub struct FileFdEntry {
     pub tar_offset: u64,
     /// File size in tar.
     pub tar_len: u64,
+    /// Byte offset into the aligned data memfd (0 = not aligned-backed, use central mmap path).
+    pub aligned_offset: u64,
     /// Current file position for sequential read().
     pub cursor: u64,
 }
@@ -321,6 +323,7 @@ impl MicroState {
         shmem_offset: u32,
         tar_offset: u64,
         tar_len: u64,
+        aligned_offset: u64,
     ) -> bool {
         for slot in &mut self.file_fds {
             if slot.is_none() {
@@ -329,6 +332,7 @@ impl MicroState {
                     shmem_offset,
                     tar_offset,
                     tar_len,
+                    aligned_offset,
                     cursor: 0,
                 });
                 return true;

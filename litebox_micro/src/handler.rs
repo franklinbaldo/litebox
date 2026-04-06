@@ -1729,6 +1729,7 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
                     resp.file_slot_offset,
                     resp.tar_offset,
                     resp.tar_len,
+                    resp.aligned_offset,
                 );
             }
             return cq.result; // return the fd

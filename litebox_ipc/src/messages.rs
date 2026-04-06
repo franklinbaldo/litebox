@@ -191,6 +191,10 @@ pub struct OpenResponse {
     pub tar_offset: u64,
     /// Size of the file data in the tar (file length).
     pub tar_len: u64,
+    /// Byte offset into the aligned data memfd where this file's page-aligned
+    /// data starts. Non-zero means micro can mmap directly from the aligned
+    /// memfd instead of going through central.
+    pub aligned_offset: u64,
 }
 
-const _: () = assert!(core::mem::size_of::<OpenResponse>() == 24);
+const _: () = assert!(core::mem::size_of::<OpenResponse>() == 32);
