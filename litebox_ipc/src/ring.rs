@@ -131,13 +131,6 @@ pub mod cq_flags {
     /// Central does not need a result report for this EXEC_LOCAL entry.
     /// Micro should skip `report_local_result()` after local execution.
     pub const NO_REPORT: u16 = 1 << 4;
-    /// The file-backed mmap can be served by mapping directly from the
-    /// aligned data memfd.  When set, `data_offset` and `data_len` encode
-    /// a `u64` aligned memfd offset as
-    /// `(data_offset as u64) | ((data_len as u64) << 32)`.
-    /// Micro should `mmap(addr, len, prot, MAP_PRIVATE|MAP_FIXED, aligned_fd, offset)`
-    /// instead of copying data from the shmem data region.
-    pub const MMAP_FROM_ALIGNED: u16 = 1 << 5;
 }
 
 /// Descriptor appended to the data region when `cq_flags::TRAMPOLINE` is set.
