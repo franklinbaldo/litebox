@@ -20,6 +20,7 @@ pub mod nr {
     pub const SIGACTION: usize = 46;
     pub const GETGID: usize = 47;
     pub const SIGPROCMASK: usize = 48;
+    pub const KILL: usize = 37;
     pub const SIGALTSTACK: usize = 53;
     pub const IOCTL: usize = 54;
     pub const MUNMAP: usize = 73;
@@ -33,6 +34,7 @@ pub mod nr {
     pub const SYSCTL: usize = 202;
     pub const SHARED_REGION_CHECK_NP: usize = 294;
     pub const ISSETUGID: usize = 327;
+    pub const PTHREAD_KILL: usize = 328;
     pub const FSTAT64: usize = 339;
     pub const THREAD_SELFID: usize = 372;
     pub const CSRCTL: usize = 483;
@@ -600,6 +602,14 @@ pub enum MacosSyscallRequest {
         path: usize,
         flag: i32,
     },
+    Kill {
+        pid: i32,
+        sig: i32,
+    },
+    PthreadKill {
+        port: u32,
+        sig: i32,
+    },
     Sigaltstack {
         ss: usize,
         old_ss: usize,
@@ -1061,8 +1071,14 @@ impl MacosSyscallRequest {
             // TODO(readlink): 58=readlink, 473=readlinkat — needs FileSystem
             //   trait extension to add a `readlink` method.
             nr::SIGALTSTACK => MacosSyscallRequest::Sigaltstack { ss: a0, old_ss: a1 },
-            // TODO(kill): 37=kill, 328=__pthread_kill — signal delivery to
-            //   threads (Linux shim: signal injection + thread interrupt).
+            nr::KILL => MacosSyscallRequest::Kill {
+                pid: a0 as i32,
+                sig: a1 as i32,
+            },
+            nr::PTHREAD_KILL => MacosSyscallRequest::PthreadKill {
+                port: a0 as u32,
+                sig: a1 as i32,
+            },
 
             // TODO(execve): 59=execve — full process teardown + reload
             //   (Linux shim: kill threads, close CLOEXEC, release memory,

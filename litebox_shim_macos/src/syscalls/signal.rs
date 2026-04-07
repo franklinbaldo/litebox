@@ -114,6 +114,18 @@ fn is_on_stack(stack: &litebox_common_macos::SigAltStack, sp: usize) -> bool {
     sp >= stack_start && sp < stack_end
 }
 
+/// Result of delivering a software-originated signal (kill, pthread_kill).
+///
+/// This tells the caller whether the signal was delivered via a user
+/// handler (and ctx was rewritten to the signal frame), so that
+/// `set_syscall_return` can be skipped.
+pub(crate) enum KillResult {
+    /// Signal delivered or ignored; syscall returns 0.  If a user handler
+    /// was invoked, ctx has already been rewritten to the signal frame and
+    /// the caller must NOT call `set_syscall_return`.
+    Delivered { frame_set: bool },
+}
+
 impl<FS: ShimFS> Task<FS> {
     /// Handle `sigaction()` (BSD syscall 46).
     ///
@@ -221,6 +233,107 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         Ok(0)
+    }
+
+    /// Handle `kill()` (BSD syscall 37).
+    ///
+    /// Only supports sending signals to the calling process (pid == getpid,
+    /// pid == 0, or pid == -1).  Other targets return ESRCH.
+    #[allow(clippy::cast_sign_loss)]
+    pub(crate) fn sys_kill(
+        &self,
+        pid: i32,
+        sig: i32,
+        ctx: &mut PtRegs,
+    ) -> Result<KillResult, Errno> {
+        // Only allow signals to self (pid 42 is our fixed getpid).
+        let my_pid = 42i32;
+        if pid != my_pid && pid != 0 && pid != -1 && pid != -(my_pid) {
+            log_unsupported!("kill: target pid {} not supported (only self)", pid);
+            return Err(Errno::ESRCH);
+        }
+        self.deliver_software_signal(sig, ctx)
+    }
+
+    /// Handle `__pthread_kill()` (BSD syscall 328).
+    ///
+    /// Only supports sending signals to the calling thread (matching mach
+    /// port).  Other targets return ESRCH.
+    #[allow(clippy::cast_sign_loss)]
+    pub(crate) fn sys_pthread_kill(
+        &self,
+        port: u32,
+        sig: i32,
+        ctx: &mut PtRegs,
+    ) -> Result<KillResult, Errno> {
+        let my_port = self.real_mach_port.load(Ordering::Relaxed);
+        if port != my_port && port != 0 {
+            log_unsupported!(
+                "__pthread_kill: target port {} != self port {} — not supported",
+                port,
+                my_port
+            );
+            return Err(Errno::ESRCH);
+        }
+        self.deliver_software_signal(sig, ctx)
+    }
+
+    /// Common signal delivery for kill / __pthread_kill.
+    ///
+    /// If `sig == 0` this is a permission check only (always succeeds).
+    /// Otherwise looks up the handler and either terminates (SIG_DFL for
+    /// fatal signals), ignores, or builds a signal frame.
+    #[allow(clippy::cast_sign_loss)]
+    fn deliver_software_signal(&self, sig: i32, ctx: &mut PtRegs) -> Result<KillResult, Errno> {
+        // Signal 0 is a null signal: permission check only.
+        if sig == 0 {
+            return Ok(KillResult::Delivered { frame_set: false });
+        }
+        // Validate signal range.
+        if !(1..=31).contains(&sig) {
+            return Err(Errno::EINVAL);
+        }
+
+        let handler = {
+            let handlers = self.process.signal_handlers.lock();
+            handlers[sig as usize]
+        };
+
+        match handler.handler {
+            0 => {
+                // SIG_DFL.  For most signals this means terminate.
+                // (SIGCHLD and SIGURG are ignored by default, others are fatal.)
+                match sig {
+                    // Signals ignored by default on macOS.
+                    16 /* SIGURG */ |
+                    19 /* SIGCONT — resume; no-op since we don't support stop */ |
+                    20 /* SIGCHLD */ |
+                    23 /* SIGIO */ |
+                    28 /* SIGWINCH */ => {
+                        Ok(KillResult::Delivered { frame_set: false })
+                    }
+                    _ => {
+                        // Fatal: set exit code to 128+sig and terminate.
+                        self.process
+                            .exit_code
+                            .store(128 + sig, Ordering::Release);
+                        self.process.group_exit.store(true, Ordering::Release);
+                        self.terminated.store(true, Ordering::Release);
+                        Ok(KillResult::Delivered { frame_set: false })
+                    }
+                }
+            }
+            1 => {
+                // SIG_IGN: silently ignore.
+                Ok(KillResult::Delivered { frame_set: false })
+            }
+            _ => {
+                // User handler: build a signal frame.
+                // deliver_signal rewrites ctx to point at _sigtramp.
+                self.deliver_signal(ctx, sig, 0, &handler);
+                Ok(KillResult::Delivered { frame_set: true })
+            }
+        }
     }
 
     /// Handle `sigaltstack()` (BSD syscall 53).

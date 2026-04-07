@@ -219,6 +219,12 @@ impl<FS: ShimFS> Task<FS> {
             MacosSyscallRequest::Pipe => {
                 unreachable!("Pipe is handled in handle_syscall_request before do_syscall")
             }
+            MacosSyscallRequest::Kill { .. } => {
+                unreachable!("Kill is handled in handle_syscall_request before do_syscall")
+            }
+            MacosSyscallRequest::PthreadKill { .. } => {
+                unreachable!("PthreadKill is handled in handle_syscall_request before do_syscall")
+            }
             MacosSyscallRequest::Unlink { path } => self.sys_unlink(path),
             MacosSyscallRequest::Access { path, amode } => self.sys_access(path, amode),
             MacosSyscallRequest::Faccessat {
