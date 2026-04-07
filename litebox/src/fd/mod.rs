@@ -477,7 +477,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     ) -> Option<T>
     where
         Subsystem: FdEnabledSubsystem,
-        T: core::any::Any + Send + Sync,
+        T: core::any::Any + Clone + Send + Sync,
     {
         self.entries[fd.x.as_usize()?]
             .as_ref()
@@ -506,7 +506,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     ) -> Option<T>
     where
         Subsystem: FdEnabledSubsystem,
-        T: core::any::Any + Send + Sync,
+        T: core::any::Any + Clone + Send + Sync,
     {
         self.entries[fd.x.as_usize()?]
             .as_mut()
