@@ -6,7 +6,6 @@ use alloc::string::ToString as _;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::LiteBox;
 use crate::fd::FdEnabledSubsystemEntry;
 use crate::fd::{ErrRawIntFd, FdEnabledSubsystem, TypedFd};
 use crate::platform::mock::MockPlatform;
@@ -29,14 +28,14 @@ struct MockEntry2 {
 }
 impl FdEnabledSubsystemEntry for MockEntry2 {}
 
-fn litebox() -> LiteBox<MockPlatform> {
-    LiteBox::new(MockPlatform::new())
+fn dt() -> super::DescriptorTable<MockPlatform> {
+    super::new_descriptor_table::<MockPlatform>()
 }
 
 #[test]
 fn test_insert_and_remove_entry() {
-    let litebox = litebox();
-    let mut descriptors = litebox.descriptor_table_mut();
+    let dt = dt();
+    let mut descriptors = dt.write();
 
     let entry = MockEntry {
         data: "test".to_string(),
@@ -52,8 +51,8 @@ fn test_insert_and_remove_entry() {
 
 #[test]
 fn test_iter_entries() {
-    let litebox = litebox();
-    let mut descriptors = litebox.descriptor_table_mut();
+    let dt = dt();
+    let mut descriptors = dt.write();
 
     let entry1 = MockEntry {
         data: "entry1".to_string(),
@@ -96,8 +95,8 @@ fn test_iter_entries() {
 
 #[test]
 fn test_with_entry() {
-    let litebox = litebox();
-    let mut descriptors = litebox.descriptor_table_mut();
+    let dt = dt();
+    let mut descriptors = dt.write();
 
     let entry = MockEntry {
         data: "test".to_string(),
@@ -118,8 +117,8 @@ fn test_with_entry() {
 
 #[test]
 fn test_fd_raw_integer() {
-    let litebox = litebox();
-    let mut descriptors = litebox.descriptor_table_mut();
+    let dt = dt();
+    let mut descriptors = dt.write();
 
     let mut rds = super::RawDescriptorStorage::new();
 

@@ -220,9 +220,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     litebox_platform_multiplex::set_platform(platform);
     let mut shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
-    let litebox = shim_builder.litebox();
+    let dt = litebox::fd::new_descriptor_table();
     let initial_file_system = {
-        let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
+        let mut in_mem = litebox::fs::in_mem::FileSystem::new();
 
         // When loading the program from the tar, we don't need to create ancestor
         // directories or write the program binary into the in-memory FS -- the program
@@ -241,16 +241,16 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 if prev_user == 0 {
                     // require root user
                     in_mem.with_root_privileges(|fs| {
-                        fs.mkdir(path.to_str().unwrap(), mode_and_user.0).unwrap();
+                        fs.mkdir(&dt, path.to_str().unwrap(), mode_and_user.0).unwrap();
                         if mode_and_user.1 != 0 {
                             // This file is owned by a non-root user, so we need to set the ownership to our default user
-                            fs.chown(path.to_str().unwrap(), Some(1000), Some(1000))
+                            fs.chown(&dt, path.to_str().unwrap(), Some(1000), Some(1000))
                                 .unwrap();
                         }
                     });
                 } else {
                     in_mem
-                        .mkdir(path.to_str().unwrap(), mode_and_user.0)
+                        .mkdir(&dt, path.to_str().unwrap(), mode_and_user.0)
                         .unwrap();
                 }
                 prev_user = mode_and_user.1;
@@ -262,13 +262,14 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                  mode| {
                     let fd = fs
                         .open(
+                            &dt,
                             path,
                             litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
                             mode,
                         )
                         .unwrap();
-                    fs.initialize_primarily_read_heavy_file(&fd, prog_data);
-                    fs.close(&fd).unwrap();
+                    fs.initialize_primarily_read_heavy_file(&dt, &fd, prog_data);
+                    fs.close(&dt, &fd).unwrap();
                 };
             let last = ancestor_modes_and_users.last().ok_or_else(|| {
                 anyhow!("program path has no ancestor directories (is it the root path?)")
@@ -278,7 +279,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                     open_file(fs, prog.to_str().unwrap(), last.0);
                     if last.1 != 0 {
                         // This file is owned by a non-root user, so we need to set the ownership to our default user
-                        fs.chown(prog.to_str().unwrap(), Some(1000), Some(1000))
+                        fs.chown(&dt, prog.to_str().unwrap(), Some(1000), Some(1000))
                             .unwrap();
                     }
                 });
@@ -288,10 +289,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         }
         in_mem.with_root_privileges(|fs| {
             let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
-            if let Err(err) = fs.mkdir("/tmp", mode) {
+            if let Err(err) = fs.mkdir(&dt, "/tmp", mode) {
                 match err {
                     litebox::fs::errors::MkdirError::AlreadyExists => {
-                        fs.chmod("/tmp", mode).expect("Failed to call chmod");
+                        fs.chmod(&dt, "/tmp", mode).expect("Failed to call chmod");
                     }
                     _ => panic!(),
                 }
@@ -307,19 +308,21 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 #[cfg(target_arch = "x86_64")]
                 in_mem.with_root_privileges(|fs| {
                     let rwxr_xr_x = Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH;
-                    let _ = fs.mkdir("/lib", rwxr_xr_x);
+                    let _ = fs.mkdir(&dt, "/lib", rwxr_xr_x);
                     let fd = fs
                         .open(
+                            &dt,
                             "/lib/litebox_rtld_audit.so",
                             litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
                             rwxr_xr_x,
                         )
                         .expect("Failed to create /lib/litebox_rtld_audit.so");
                     fs.initialize_primarily_read_heavy_file(
+                        &dt,
                         &fd,
                         include_bytes!(concat!(env!("OUT_DIR"), "/litebox_rtld_audit.so")).into(),
                     );
-                    fs.close(&fd)
+                    fs.close(&dt, &fd)
                         .expect("Failed to close /lib/litebox_rtld_audit.so");
                 });
             }
@@ -328,8 +331,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             }
         }
 
-        let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
-        shim_builder.default_fs(in_mem, tar_ro)
+        let tar_ro = litebox::fs::tar_ro::FileSystem::new(tar_data.into());
+        shim_builder.default_fs(&dt, in_mem, tar_ro)
     };
 
     // We need to get the file path before enabling seccomp.

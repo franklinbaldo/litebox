@@ -11,6 +11,7 @@ use litebox_platform_multiplex::Platform;
 pub struct TestLauncher {
     platform: &'static Platform,
     shim_builder: litebox_shim_linux::LinuxShimBuilder,
+    dt: litebox::fd::DescriptorTable<Platform>,
     fs: litebox_shim_linux::DefaultFS,
 }
 
@@ -23,25 +24,25 @@ impl TestLauncher {
         let platform = Platform::new();
         litebox_platform_multiplex::set_platform(platform);
         let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
-        let litebox = shim_builder.litebox();
 
-        let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
+        let dt = litebox::fd::new_descriptor_table();
+        let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new();
         in_mem_fs.with_root_privileges(|fs| {
-            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+            fs.chmod(&dt, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to set permissions on root");
         });
         let tar_ro_fs = litebox::fs::tar_ro::FileSystem::new(
-            litebox,
             if tar_data.is_empty() {
                 litebox::fs::tar_ro::EMPTY_TAR_FILE.into()
             } else {
                 tar_data.into()
             },
         );
-        let fs = shim_builder.default_fs(in_mem_fs, tar_ro_fs);
+        let fs = shim_builder.default_fs(&dt, in_mem_fs, tar_ro_fs);
         let mut this = Self {
             platform,
             shim_builder,
+            dt,
             fs,
         };
 
@@ -58,7 +59,7 @@ impl TestLauncher {
 
     pub fn install_dir(&mut self, path: &str) {
         self.fs
-            .mkdir(path, Mode::RWXU | Mode::RWXG | Mode::RWXO)
+            .mkdir(&self.dt, path, Mode::RWXU | Mode::RWXG | Mode::RWXO)
             .expect("Failed to create directory");
     }
 
@@ -66,13 +67,14 @@ impl TestLauncher {
         let fd = self
             .fs
             .open(
+                &self.dt,
                 out,
                 OFlags::CREAT | OFlags::WRONLY,
                 Mode::RWXG | Mode::RWXO | Mode::RWXU,
             )
             .unwrap();
-        self.fs.write(&fd, &contents, None).unwrap();
-        self.fs.close(&fd).unwrap();
+        self.fs.write(&self.dt, &fd, &contents, None).unwrap();
+        self.fs.close(&self.dt, &fd).unwrap();
     }
 
     pub fn test_load_exec_common(self, executable_path: &str) {

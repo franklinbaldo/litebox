@@ -20,7 +20,6 @@ use alloc::vec::Vec;
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 use litebox::{
-    LiteBox,
     fd::TypedFd,
     mm::{PageManager, linux::PAGE_SIZE},
     net::Network,
@@ -65,8 +64,8 @@ pub(crate) type LinuxFS = litebox::fs::layered::FileSystem<
 pub(crate) type FileFd<FS> = litebox::fd::TypedFd<FS>;
 
 /// A trait required for file systems to be used in the shim.
-pub trait ShimFS: litebox::fs::FileSystem + Send + Sync + 'static {}
-impl<T: litebox::fs::FileSystem + Send + Sync + 'static> ShimFS for T {}
+pub trait ShimFS: litebox::fs::FileSystem<Platform = Platform> + Send + Sync + 'static {}
+impl<T: litebox::fs::FileSystem<Platform = Platform> + Send + Sync + 'static> ShimFS for T {}
 
 /// On debug builds, logs that the user attempted to use an unsupported feature.
 fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {
@@ -145,7 +144,6 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
 /// The shim entry point structure.
 pub struct LinuxShimBuilder {
     platform: &'static Platform,
-    litebox: LiteBox<Platform>,
     load_filter: Option<LoadFilter>,
 }
 
@@ -161,23 +159,24 @@ impl LinuxShimBuilder {
         let platform = litebox_platform_multiplex::platform();
         Self {
             platform,
-            litebox: LiteBox::new(platform),
             load_filter: None,
         }
     }
 
-    /// Returns the litebox object for the shim.
-    pub fn litebox(&self) -> &LiteBox<Platform> {
-        &self.litebox
+
+    /// Returns the platform instance.
+    pub fn platform(&self) -> &'static Platform {
+        self.platform
     }
 
     /// Create a default layered file system with the given in-memory and tar read-only layers.
     pub fn default_fs(
         &self,
+        dt: &litebox::fd::DescriptorTable<Platform>,
         in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
         tar_ro_fs: litebox::fs::tar_ro::FileSystem<Platform>,
     ) -> DefaultFS {
-        default_fs(&self.litebox, in_mem_fs, tar_ro_fs)
+        default_fs(dt, self.platform, in_mem_fs, tar_ro_fs)
     }
 
     /// Set the load filter, which can augment envp or auxv when starting a new program.
@@ -187,26 +186,28 @@ impl LinuxShimBuilder {
 
     /// Build the shim.
     pub fn build<FS: ShimFS>(self) -> LinuxShim<FS> {
-        let mut net = Network::new(&self.litebox);
+        let root_dt = litebox::fd::new_descriptor_table();
+        let mut net = Network::new(self.platform, &root_dt);
         net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
         let root_net = Arc::new(litebox::sync::Mutex::new(net));
         let global = Arc::new(GlobalState {
             platform: self.platform,
-            pm: PageManager::new(&self.litebox),
+            pm: PageManager::new(self.platform),
             futex_manager: FutexManager::new(),
-            pipes: Pipes::new(&self.litebox),
+            pipes: Pipes::new(),
             boot_time: self.platform.now(),
             load_filter: self.load_filter,
             next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
-            litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
         });
-        LinuxShim { global, root_net }
+        LinuxShim { global, root_dt, root_net }
     }
 }
 
 pub struct LinuxShim<FS: ShimFS> {
     global: Arc<GlobalState<FS>>,
+    /// The root process's descriptor table.
+    root_dt: litebox::fd::DescriptorTable<Platform>,
     /// The root process's Network. The single net-worker in main.rs drives
     /// this via [`Self::perform_network_interaction`].
     root_net: Arc<litebox::sync::Mutex<Platform, Network<Platform>>>,
@@ -215,6 +216,7 @@ impl<FS: ShimFS> Clone for LinuxShim<FS> {
     fn clone(&self) -> Self {
         Self {
             global: self.global.clone(),
+            root_dt: self.root_dt.clone(),
             root_net: self.root_net.clone(),
         }
     }
@@ -240,7 +242,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
             egid,
         } = task;
 
-        let files = syscalls::file::FilesState::new(fs);
+        let files = syscalls::file::FilesState::new(litebox::fd::new_descriptor_table(), fs);
         files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR - 1);
         let files = Arc::new(files);
         files.initialize_stdio_in_shared_descriptors_table(&self.global);
@@ -303,11 +305,12 @@ impl<FS: ShimFS> LinuxShim<FS> {
         &self,
         addr: core::net::SocketAddr,
     ) -> Result<transport::ShimTransport, Errno> {
-        transport::ShimTransport::connect(self.global.clone(), self.root_net.clone(), addr)
+        transport::ShimTransport::connect(self.global.clone(), &self.root_dt, self.root_net.clone(), addr)
     }
 
-    pub fn litebox(&self) -> &LiteBox<Platform> {
-        &self.global.litebox
+    /// Returns the platform instance.
+    pub fn platform(&self) -> &'static Platform {
+        self.global.platform
     }
 }
 
@@ -445,7 +448,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
         params: litebox_common_linux::TaskParams,
         init_stdio: bool,
     ) -> LinuxShimTask<FS> {
-        let files = Arc::new(syscalls::file::FilesState::new(fs));
+        let files = Arc::new(syscalls::file::FilesState::new(litebox::fd::new_descriptor_table(), fs));
         files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR - 1);
         if init_stdio {
             files.initialize_stdio_in_shared_descriptors_table(&self.global);
@@ -507,7 +510,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
         let child_fs_state: Arc<syscalls::file::FsState> = Arc::new((*parent_fs).as_ref().clone());
 
         // Each forked process gets its own fresh Network instance.
-        let mut child_net = Network::new(&self.global.litebox);
+        let mut child_net = Network::new(self.global.platform, &files.dt);
         child_net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
 
         // Re-create listening sockets from the parent's Network into the child's
@@ -559,7 +562,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                         let old_net_fd = rds
                             .fd_from_raw_integer::<Network<Platform>>(*raw_fd)
                             .expect("raw fd should still be alive");
-                        let dt = self.global.litebox.descriptor_table();
+                        let dt = files.dt.read();
                         let sock_opts = dt
                             .with_metadata(
                                 old_net_fd.as_ref(),
@@ -589,7 +592,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
 
                     // Set up metadata on the new fd (using parent's values).
                     {
-                        let dt = self.global.litebox.descriptor_table();
+                        let dt = files.dt.read();
                         let _old = dt.set_entry_metadata(new_fd, parent_sock_opts);
                         let _old = dt.set_entry_metadata(new_fd, parent_sock_type);
                         let _old = dt.set_entry_metadata(new_fd, parent_oflags);
@@ -600,7 +603,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                         litebox::net::socket_channel::StreamSocketChannel::new(),
                     ));
                     {
-                        let dt = self.global.litebox.descriptor_table();
+                        let dt = files.dt.read();
                         let _old = dt
                             .set_entry_metadata(new_fd, syscalls::net::SocketProxy(proxy.clone()));
                     }
@@ -617,10 +620,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                     // (parent-shared) fd and insert the new (child-owned) one.
                     // Duplicate first (needs descriptor_table_mut), then swap
                     // in the raw descriptor store.
-                    let dup_fd = self
-                        .global
-                        .litebox
-                        .descriptor_table_mut()
+                    let dup_fd = files.dt.write()
                         .duplicate(new_fd)
                         .expect("new fd should be valid");
 
@@ -629,7 +629,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                     if parent_cloexec
                         .contains(litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC)
                     {
-                        let dt = self.global.litebox.descriptor_table();
+                        let dt = files.dt.read();
                         let _old = dt.set_fd_metadata(
                             &dup_fd,
                             litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC,
@@ -652,7 +652,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 // They have been duplicated into the raw fd table, so we remove them
                 // from the descriptor table to avoid leaking OwnedFds.
                 {
-                    let mut dt = self.global.litebox.descriptor_table_mut();
+                    let mut dt = files.dt.write();
                     for (_port, fd) in &imported {
                         let _ = dt.remove::<Network<Platform>>(fd);
                     }
@@ -689,16 +689,15 @@ impl<FS: ShimFS> LinuxShim<FS> {
 
 /// Create a default layered file system with the given in-memory and tar read-only layers.
 fn default_fs(
-    litebox: &LiteBox<Platform>,
+    _dt: &litebox::fd::DescriptorTable<Platform>,
+    platform: &'static Platform,
     in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
     tar_ro_fs: litebox::fs::tar_ro::FileSystem<Platform>,
 ) -> LinuxFS {
-    let dev_stdio = litebox::fs::devices::FileSystem::new(litebox);
+    let dev_stdio = litebox::fs::devices::FileSystem::new(platform);
     litebox::fs::layered::FileSystem::new(
-        litebox,
         in_mem_fs,
         litebox::fs::layered::FileSystem::new(
-            litebox,
             dev_stdio,
             tar_ro_fs,
             litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
@@ -714,21 +713,21 @@ pub(crate) struct StdioStatusFlags(litebox::fs::OFlags);
 pub(crate) struct PipeStatusFlags(pub litebox::fs::OFlags);
 
 impl<FS: ShimFS> syscalls::file::FilesState<FS> {
-    fn initialize_stdio_in_shared_descriptors_table(&self, global: &GlobalState<FS>) {
+    fn initialize_stdio_in_shared_descriptors_table(&self, _global: &GlobalState<FS>) {
         use litebox::fs::{Mode, OFlags};
         let stdin = self
             .fs
-            .open("/dev/stdin", OFlags::RDONLY, Mode::empty())
+            .open(&self.dt, "/dev/stdin", OFlags::RDONLY, Mode::empty())
             .unwrap();
         let stdout = self
             .fs
-            .open("/dev/stdout", OFlags::WRONLY, Mode::empty())
+            .open(&self.dt, "/dev/stdout", OFlags::WRONLY, Mode::empty())
             .unwrap();
         let stderr = self
             .fs
-            .open("/dev/stderr", OFlags::WRONLY, Mode::empty())
+            .open(&self.dt, "/dev/stderr", OFlags::WRONLY, Mode::empty())
             .unwrap();
-        let dt = global.litebox.descriptor_table();
+        let dt = self.dt.read();
         let mut rds = self.raw_descriptor_store.write();
         for (raw_fd, fd) in [(0, stdin), (1, stdout), (2, stderr)] {
             let status_flags = OFlags::APPEND | OFlags::RDWR;
@@ -808,51 +807,81 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
     /// copied.
     pub(crate) fn fork_files_state(
         &self,
-        global: &GlobalState<FS>,
+        _global: &GlobalState<FS>,
     ) -> Arc<syscalls::file::FilesState<FS>> {
         use litebox::fd::FdEnabledSubsystem;
         use litebox_common_linux::FileDescriptorFlags;
 
-        // Helper: duplicate one fd from parent to child, preserving metadata.
-        fn dup_one<FS2: ShimFS, S: FdEnabledSubsystem>(
-            global: &GlobalState<FS2>,
-            child: &syscalls::file::FilesState<FS2>,
+        // Helper: duplicate one fd from parent dt to child dt, preserving
+        // per-fd metadata (e.g. FD_CLOEXEC). The underlying entry Arc is
+        // shared between parent and child (same as dup within a single table).
+        fn dup_one<S: FdEnabledSubsystem>(
+            parent_dt: &litebox::fd::DescriptorTable<Platform>,
+            child_dt: &litebox::fd::DescriptorTable<Platform>,
+            child: &syscalls::file::FilesState<impl ShimFS>,
             parent_fd: &TypedFd<S>,
             raw_fd: usize,
         ) {
-            let mut dt = global.litebox.descriptor_table_mut();
-            let Some(new_fd) = dt.duplicate(parent_fd) else {
+            let parent_guard = parent_dt.read();
+            let Some(entry_arc) = parent_guard.entry_arc(parent_fd) else {
                 return; // fd was closed concurrently
             };
             // Copy FD_CLOEXEC if set on the parent fd.
-            let cloexec = dt
+            let cloexec = parent_guard
                 .with_metadata(parent_fd, |flags: &FileDescriptorFlags| *flags)
                 .unwrap_or(FileDescriptorFlags::empty());
+            drop(parent_guard);
+
+            let mut child_guard = child_dt.write();
+            let new_fd: TypedFd<S> = child_guard.insert_shared(entry_arc);
             if cloexec.contains(FileDescriptorFlags::FD_CLOEXEC) {
-                let _old = dt.set_fd_metadata(&new_fd, FileDescriptorFlags::FD_CLOEXEC);
+                let _old = child_guard.set_fd_metadata(&new_fd, FileDescriptorFlags::FD_CLOEXEC);
             }
-            drop(dt);
+            drop(child_guard);
 
             let mut rds = child.raw_descriptor_store.write();
             let success = rds.fd_into_specific_raw_integer(new_fd, raw_fd);
             assert!(success, "child raw fd {raw_fd} already occupied");
         }
 
-        let child = Arc::new(syscalls::file::FilesState::new(Arc::clone(&self.fs)));
+        let parent_dt = &self.dt;
+        let child = Arc::new(syscalls::file::FilesState::new(litebox::fd::new_descriptor_table(), Arc::clone(&self.fs)));
+        let child_dt = &child.dt;
 
         // Collect alive fds while holding the parent's RDS lock briefly.
         let alive_fds: Vec<usize> = self.raw_descriptor_store.read().iter_alive().collect();
 
         for raw_fd in alive_fds {
             // Use run_on_raw_fd to dispatch by subsystem type.
+            // The FS closure uses reopen_in_fork to create fresh inner fds
+            // in the child's descriptor table, avoiding the bug where the
+            // layered FS's inner TypedFd<Upper>/TypedFd<Lower> would index
+            // into the parent's table after an insert_shared.
             let _ = self.run_on_raw_fd(
                 raw_fd,
-                |fd| dup_one(global, &child, fd, raw_fd),
-                |fd| dup_one(global, &child, fd, raw_fd),
-                |fd| dup_one(global, &child, fd, raw_fd),
-                |fd| dup_one(global, &child, fd, raw_fd),
-                |fd| dup_one(global, &child, fd, raw_fd),
-                |fd| dup_one(global, &child, fd, raw_fd),
+                |fd| {
+                    // Try FS-level reopen first (layered FS needs this).
+                    if let Some(new_fd) = self.fs.reopen_in_fork(parent_dt, child_dt, fd) {
+                        // Copy FD_CLOEXEC metadata.
+                        let cloexec = parent_dt
+                            .read()
+                            .with_metadata(fd, |flags: &FileDescriptorFlags| *flags)
+                            .unwrap_or(FileDescriptorFlags::empty());
+                        if cloexec.contains(FileDescriptorFlags::FD_CLOEXEC) {
+                            let _old = child_dt.write().set_fd_metadata(&new_fd, FileDescriptorFlags::FD_CLOEXEC);
+                        }
+                        let mut rds = child.raw_descriptor_store.write();
+                        let success = rds.fd_into_specific_raw_integer(new_fd, raw_fd);
+                        assert!(success, "child raw fd {raw_fd} already occupied");
+                    } else {
+                        dup_one(parent_dt, child_dt, &child, fd, raw_fd);
+                    }
+                },
+                |fd| dup_one(parent_dt, child_dt, &child, fd, raw_fd),
+                |fd| dup_one(parent_dt, child_dt, &child, fd, raw_fd),
+                |fd| dup_one(parent_dt, child_dt, &child, fd, raw_fd),
+                |fd| dup_one(parent_dt, child_dt, &child, fd, raw_fd),
+                |fd| dup_one(parent_dt, child_dt, &child, fd, raw_fd),
             );
         }
 
@@ -1551,8 +1580,6 @@ impl<FS: ShimFS> Task<FS> {
 struct GlobalState<FS: ShimFS> {
     /// The platform instance used throughout the shim.
     platform: &'static Platform,
-    /// The LiteBox instance used throughout the shim.
-    litebox: litebox::LiteBox<Platform>,
     /// The page manager for managing virtual memory.
     pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
     /// The futex manager for handling futex operations.
@@ -1615,9 +1642,9 @@ mod test_utils {
             let pid = self
                 .next_thread_id
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            let files = Arc::new(syscalls::file::FilesState::new(fs));
+            let files = Arc::new(syscalls::file::FilesState::new(litebox::fd::new_descriptor_table(), fs));
             files.initialize_stdio_in_shared_descriptors_table(&self);
-            let mut net = Network::new(&self.litebox);
+            let mut net = Network::new(self.platform, &files.dt);
             net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
             Task {
                 wait_state: wait::WaitState::new(self.platform),

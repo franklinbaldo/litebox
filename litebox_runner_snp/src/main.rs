@@ -186,12 +186,12 @@ pub extern "C" fn sandbox_process_init(
     let shim = &raw const SHIM;
     #[allow(clippy::missing_panics_doc)]
     let shim = unsafe { (*shim).as_ref().expect("initialized") };
-    let litebox = shim.litebox();
-    let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
+    let dt = litebox::fd::new_descriptor_table();
+    let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new();
     in_mem_fs.with_root_privileges(|fs| {
         let mode = litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO;
-        if let Err(litebox::fs::errors::MkdirError::AlreadyExists) = fs.mkdir("/tmp", mode) {
-            let _ = fs.chmod("/tmp", mode);
+        if let Err(litebox::fs::errors::MkdirError::AlreadyExists) = fs.mkdir(&dt, "/tmp", mode) {
+            let _ = fs.chmod(&dt, "/tmp", mode);
         }
     });
 
@@ -207,7 +207,7 @@ pub extern "C" fn sandbox_process_init(
         );
     };
     let Ok(nine_p) =
-        litebox::fs::nine_p::FileSystem::new(litebox, transport, 65536, "root", "/tmp")
+        litebox::fs::nine_p::FileSystem::new(transport, 65536, "root", "/tmp")
     else {
         ghcb_prints("failed to create 9P filesystem");
         litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
@@ -215,12 +215,10 @@ pub extern "C" fn sandbox_process_init(
             globals::SM_TERM_GENERAL,
         );
     };
-    let dev_stdio = litebox::fs::devices::FileSystem::new(litebox);
+    let dev_stdio = litebox::fs::devices::FileSystem::new(litebox_platform_multiplex::platform());
     let default_fs = litebox::fs::layered::FileSystem::new(
-        litebox,
         in_mem_fs,
         litebox::fs::layered::FileSystem::new(
-            litebox,
             dev_stdio,
             nine_p,
             litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,

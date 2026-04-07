@@ -28,9 +28,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::ops::Range;
 use hashbrown::HashMap;
+use core::marker::PhantomData;
 
 use crate::{
-    LiteBox,
     fs::{DirEntry, FileType},
     path::Arg as _,
     sync,
@@ -60,10 +60,10 @@ const BLOCK_SIZE: usize = 0;
 /// A backing implementation for [`FileSystem`](super::FileSystem), storing all files in-memory, via
 /// a read-only `.tar` file.
 pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider> {
-    litebox: LiteBox<Platform>,
     tar_index: TarIndex,
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
+    _platform: PhantomData<Platform>,
 }
 
 /// An empty tar file to support an empty file system.
@@ -81,11 +81,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     ///
     /// Panics if the provided `tar_data` is found to be an invalid `.tar` file.
     #[must_use]
-    pub fn new(litebox: &LiteBox<Platform>, tar_data: alloc::borrow::Cow<'static, [u8]>) -> Self {
+    pub fn new(tar_data: alloc::borrow::Cow<'static, [u8]>) -> Self {
         Self {
-            litebox: litebox.clone(),
             tar_index: TarIndex::new(tar_data),
             current_working_dir: "/".into(),
+            _platform: PhantomData,
         }
     }
 
@@ -287,8 +287,11 @@ fn normalize_tar_filename(filename: &str) -> &str {
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem<Platform> {
+    type Platform = Platform;
+
     fn open(
         &self,
+        dt: &crate::fd::DescriptorTable<Platform>,
         path: impl crate::path::Arg,
         flags: OFlags,
         _mode: Mode,
@@ -319,9 +322,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 .tar_index
                 .dir_by_path("")
                 .expect("root directory always exists");
-            return Ok(self
-                .litebox
-                .descriptor_table_mut()
+            return Ok(dt
+                .write()
                 .insert(Descriptor::Dir { idx }));
         }
         assert!(path.starts_with('/'));
@@ -334,21 +336,21 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             if flags.contains(OFlags::DIRECTORY) {
                 return Err(OpenError::PathError(PathError::ComponentNotADirectory));
             }
-            self.litebox
-                .descriptor_table_mut()
+            dt
+                .write()
                 .insert(Descriptor::File { idx, position: 0 })
         } else if let Some((idx, _)) = self.tar_index.dir_by_path(path) {
-            self.litebox
-                .descriptor_table_mut()
+            dt
+                .write()
                 .insert(Descriptor::Dir { idx })
         } else {
             return Err(PathError::NoSuchFileOrDirectory)?;
         };
         if flags.contains(OFlags::TRUNC) {
-            match self.truncate(&fd, 0, true) {
+            match self.truncate(dt, &fd, 0, true) {
                 Ok(()) => {}
                 Err(e) => {
-                    self.close(&fd).unwrap();
+                    self.close(dt, &fd).unwrap();
                     return Err(e.into());
                 }
             }
@@ -356,18 +358,19 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         Ok(fd)
     }
 
-    fn close(&self, fd: &FileFd<Platform>) -> Result<(), CloseError> {
-        self.litebox.descriptor_table_mut().remove(fd);
+    fn close(&self, dt: &crate::fd::DescriptorTable<Platform>, fd: &FileFd<Platform>) -> Result<(), CloseError> {
+        dt.write().remove(fd);
         Ok(())
     }
 
     fn read(
         &self,
+        dt: &crate::fd::DescriptorTable<Platform>,
         fd: &FileFd<Platform>,
         buf: &mut [u8],
         mut offset: Option<usize>,
     ) -> Result<usize, ReadError> {
-        let descriptor_table = self.litebox.descriptor_table();
+        let descriptor_table = dt.read();
         let Descriptor::File { idx, position } = &mut descriptor_table
             .get_entry_mut(fd)
             .ok_or(ReadError::ClosedFd)?
@@ -388,13 +391,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
 
     fn write(
         &self,
+        dt: &crate::fd::DescriptorTable<Platform>,
         fd: &FileFd<Platform>,
         _buf: &[u8],
         _offset: Option<usize>,
     ) -> Result<usize, WriteError> {
-        match self
-            .litebox
-            .descriptor_table()
+        match dt
+            .read()
             .get_entry(fd)
             .ok_or(WriteError::ClosedFd)?
             .entry
@@ -406,11 +409,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
 
     fn seek(
         &self,
+        dt: &crate::fd::DescriptorTable<Platform>,
         fd: &FileFd<Platform>,
         offset: isize,
         whence: SeekWhence,
     ) -> Result<usize, SeekError> {
-        let descriptor_table = self.litebox.descriptor_table();
+        let descriptor_table = dt.read();
         let Descriptor::File { idx, position } = &mut descriptor_table
             .get_entry_mut(fd)
             .ok_or(SeekError::ClosedFd)?
@@ -437,13 +441,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
 
     fn truncate(
         &self,
+        dt: &crate::fd::DescriptorTable<Platform>,
         fd: &FileFd<Platform>,
         _length: usize,
         _reset_offset: bool,
     ) -> Result<(), TruncateError> {
-        match self
-            .litebox
-            .descriptor_table()
+        match dt
+            .read()
             .get_entry(fd)
             .ok_or(TruncateError::ClosedFd)?
             .entry
@@ -453,7 +457,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         }
     }
 
-    fn chmod(&self, path: impl crate::path::Arg, _mode: Mode) -> Result<(), ChmodError> {
+    fn chmod(&self, _dt: &crate::fd::DescriptorTable<Platform>, path: impl crate::path::Arg, _mode: Mode) -> Result<(), ChmodError> {
         let path = self.absolute_path(path)?;
         assert!(path.starts_with('/'));
         let path = &path[1..];
@@ -467,6 +471,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
 
     fn chown(
         &self,
+        _dt: &crate::fd::DescriptorTable<Platform>,
         path: impl crate::path::Arg,
         _user: Option<u16>,
         _group: Option<u16>,
@@ -482,7 +487,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         }
     }
 
-    fn unlink(&self, path: impl crate::path::Arg) -> Result<(), UnlinkError> {
+    fn unlink(&self, _dt: &crate::fd::DescriptorTable<Platform>, path: impl crate::path::Arg) -> Result<(), UnlinkError> {
         let path = self.absolute_path(path)?;
         assert!(path.starts_with('/'));
         let path = &path[1..];
@@ -495,20 +500,20 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         }
     }
 
-    fn mkdir(&self, _path: impl crate::path::Arg, _mode: Mode) -> Result<(), MkdirError> {
+    fn mkdir(&self, _dt: &crate::fd::DescriptorTable<Platform>, _path: impl crate::path::Arg, _mode: Mode) -> Result<(), MkdirError> {
         // TODO: Do we need to do the type of checks that are happening in the other functions, or
         // should the other functions be simplified to this?
         Err(MkdirError::ReadOnlyFileSystem)
     }
 
-    fn rmdir(&self, _path: impl crate::path::Arg) -> Result<(), RmdirError> {
+    fn rmdir(&self, _dt: &crate::fd::DescriptorTable<Platform>, _path: impl crate::path::Arg) -> Result<(), RmdirError> {
         // TODO: Do we need to do the type of checks that are happening in the other functions, or
         // should the other functions be simplified to this?
         Err(RmdirError::ReadOnlyFileSystem)
     }
 
-    fn read_dir(&self, fd: &FileFd<Platform>) -> Result<Vec<DirEntry>, ReadDirError> {
-        let descriptor_table = self.litebox.descriptor_table();
+    fn read_dir(&self, dt: &crate::fd::DescriptorTable<Platform>, fd: &FileFd<Platform>) -> Result<Vec<DirEntry>, ReadDirError> {
+        let descriptor_table = dt.read();
         let Descriptor::Dir { idx } = &descriptor_table
             .get_entry(fd)
             .ok_or(ReadDirError::ClosedFd)?
@@ -561,6 +566,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
 
     fn file_status(
         &self,
+        _dt: &crate::fd::DescriptorTable<Platform>,
         path: impl crate::path::Arg,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
         let path = self.absolute_path(path)?;
@@ -603,11 +609,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
 
     fn fd_file_status(
         &self,
+        dt: &crate::fd::DescriptorTable<Platform>,
         fd: &FileFd<Platform>,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
-        match &self
-            .litebox
-            .descriptor_table()
+        match &dt
+            .read()
             .get_entry(fd)
             .ok_or(super::errors::FileStatusError::ClosedFd)?
             .entry

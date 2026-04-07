@@ -9,7 +9,6 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use hashbrown::{HashMap, HashSet};
 
-use crate::LiteBox;
 use crate::fd::{InternalFd, TypedFd};
 use crate::path::Arg;
 use crate::sync;
@@ -58,7 +57,6 @@ pub struct FileSystem<
     Upper: super::FileSystem + 'static,
     Lower: super::FileSystem + 'static,
 > {
-    litebox: LiteBox<Platform>,
     upper: Upper,
     lower: Lower,
     // TODO: Possibly support a single-threaded variant that doesn't have the cost of requiring a
@@ -70,13 +68,12 @@ pub struct FileSystem<
     node_info_lookup: sync::RwLock<Platform, HashMap<NodeInfo, usize>>,
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower: super::FileSystem>
+impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem<Platform = Platform>, Lower: super::FileSystem<Platform = Platform>>
     FileSystem<Platform, Upper, Lower>
 {
     /// Construct a new `FileSystem` instance
     #[must_use]
     pub fn new(
-        litebox: &LiteBox<Platform>,
         upper: Upper,
         lower: Lower,
         layering_semantics: LayeringSemantics,
@@ -84,7 +81,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         let root = sync::RwLock::new(RootDir::new());
         let node_info_lookup = sync::RwLock::new(HashMap::new());
         Self {
-            litebox: litebox.clone(),
             upper,
             lower,
             root,
@@ -96,8 +92,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
 
     /// (private-only) check if the lower level has the path; if there is an I/O or path failure,
     /// propagate the relevant error.
-    fn ensure_lower_contains(&self, path: &str) -> Result<FileType, FileStatusError> {
-        self.lower.file_status(path).map(|stat| stat.file_type)
+    fn ensure_lower_contains(&self, dt: &crate::fd::DescriptorTable<Platform>, path: &str) -> Result<FileType, FileStatusError> {
+        self.lower.file_status(dt, path).map(|stat| stat.file_type)
     }
 
     /// (private-only) Create all parent/ancestor directories for a `path`, making sure that each of
@@ -106,19 +102,19 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
     ///
     /// NOTE: This is _not_ equivalent to running `mkdir -p {path}` or `mkdir {path}` or anything
     /// like that.
-    fn mkdir_migrating_ancestor_dirs(&self, path: &str) -> Result<(), MkdirError> {
+    fn mkdir_migrating_ancestor_dirs(&self, dt: &crate::fd::DescriptorTable<Platform>, path: &str) -> Result<(), MkdirError> {
         let path = self.absolute_path(path)?;
         for dir in path.increasing_ancestors().map_err(PathError::from)? {
             if dir == path {
                 return Ok(());
             }
-            match self.ensure_lower_contains(dir) {
+            match self.ensure_lower_contains(dt, dir) {
                 Ok(FileType::Directory) => {
                     // The dir does in fact exist; we just need to confirm that the upper layer also
                     // has it.
                     match self
                         .upper
-                        .mkdir(dir, self.lower.file_status(dir).unwrap().mode)
+                        .mkdir(dt, dir, self.lower.file_status(dt, dir).unwrap().mode)
                     {
                         Ok(()) => {
                             // fallthrough to next increasing ancestor
@@ -181,7 +177,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
     /// If `copy_data` is `true`, it copies over the lower data to the upper one, otherwise, it
     /// makes the upper file empty (similar to a truncate). Generally speaking, you want to use
     /// `true` for `copy_data`.
-    fn migrate_file_up(&self, path: &str, copy_data: bool) -> Result<(), MigrationError> {
+    fn migrate_file_up(&self, dt: &crate::fd::DescriptorTable<Platform>, path: &str, copy_data: bool) -> Result<(), MigrationError> {
         match self.layering_semantics {
             LayeringSemantics::LowerLayerReadOnly => {
                 // fallthrough
@@ -200,7 +196,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         }
 
         // We first open the file up at the lower level for reading
-        let lower_fd = match self.lower.open(path, OFlags::RDONLY, Mode::empty()) {
+        let lower_fd = match self.lower.open(dt, path, OFlags::RDONLY, Mode::empty()) {
             Ok(fd) => fd,
             Err(e) => match e {
                 OpenError::AccessNotAllowed => return Err(MigrationError::NoReadPerms),
@@ -221,14 +217,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         let mut upper_fd = None;
         let mut temp_buf = [0u8; 4096];
         loop {
-            match self.lower.read(&lower_fd, &mut temp_buf, None) {
+            match self.lower.read(dt, &lower_fd, &mut temp_buf, None) {
                 Ok(size) => {
                     if upper_fd.is_none() {
                         // We are here the first time around, and did not error out, yay! We can
                         // actually open up the file.
                         //
                         // First, we make sure we've set up the ancestor directories.
-                        match self.mkdir_migrating_ancestor_dirs(path) {
+                        match self.mkdir_migrating_ancestor_dirs(dt, path) {
                             Ok(()) => {}
                             Err(e) => unimplemented!("{e} when setting up ancestor dirs"),
                         }
@@ -236,16 +232,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         upper_fd = Some(
                             self.upper
                                 .open(
+                                    dt,
                                     path,
                                     OFlags::CREAT | OFlags::WRONLY,
-                                    self.lower.fd_file_status(&lower_fd).unwrap().mode,
+                                    self.lower.fd_file_status(dt, &lower_fd).unwrap().mode,
                                 )
                                 .unwrap(),
                         );
                     }
                     let upper_fd = upper_fd.as_ref().unwrap();
                     if size > 0 && copy_data {
-                        self.upper.write(upper_fd, &temp_buf[..size], None).expect(
+                        self.upper.write(dt, upper_fd, &temp_buf[..size], None).expect(
                             "writing to upper layer must succeed, or layered file migration is in serious trouble",
                         );
                     } else {
@@ -270,11 +267,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         if let Some(&layered_id) = self
             .node_info_lookup
             .read()
-            .get(&self.lower.fd_file_status(&lower_fd).unwrap().node_info)
+            .get(&self.lower.fd_file_status(dt, &lower_fd).unwrap().node_info)
         {
             let old = self.node_info_lookup.write().insert(
                 self.upper
-                    .fd_file_status(upper_fd.as_ref().unwrap())
+                    .fd_file_status(dt, upper_fd.as_ref().unwrap())
                     .unwrap()
                     .node_info,
                 layered_id,
@@ -283,8 +280,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         }
         // Now that we've migrated the data (and node-info) over, we can close out both of the file
         // descriptors.
-        self.upper.close(&upper_fd.unwrap()).unwrap();
-        self.lower.close(&lower_fd).unwrap();
+        self.upper.close(dt, &upper_fd.unwrap()).unwrap();
+        self.lower.close(dt, &lower_fd).unwrap();
 
         // Now we need to migrate all the descriptor entries over.
         //
@@ -296,9 +293,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         // First we figure out which entries need to be moved up. These entries are arc-cloned into
         // a `Vec` so that we can release the lock the file descriptor table when setting things up
         // within the upper layer.
-        let to_migrate: alloc::vec::Vec<(InternalFd, usize, OFlags, Entry<Upper, Lower>)> = self
-            .litebox
-            .descriptor_table()
+        let to_migrate: alloc::vec::Vec<(InternalFd, usize, OFlags, Entry<Upper, Lower>)> = dt
+            .read()
             .iter::<Self>()
             .filter_map(|(internal_fd, e)| {
                 if e.entry.path != path {
@@ -328,10 +324,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         // levels without trouble.
         for (internal_fd, position, flags, entry) in to_migrate {
             // First, we set up the upper entry we'll be swapping/placing in.
-            let upper_fd = self.upper.open(path, flags, Mode::empty()).unwrap();
+            let upper_fd = self.upper.open(dt, path, flags, Mode::empty()).unwrap();
             if position > 0 {
                 self.upper
                     .seek(
+                        dt,
                         &upper_fd,
                         isize::try_from(position).unwrap(),
                         SeekWhence::RelativeToBeginning,
@@ -350,9 +347,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     // Only two references: our local clone + descriptor table.
                     // This fd is independently opened (not sharing the root
                     // Arc), so we can replace and close directly.
-                    let old_entry = self
-                        .litebox
-                        .descriptor_table()
+                    let old_entry = dt
+                        .read()
                         .with_entry_mut_via_internal_fd::<Self, _, _>(internal_fd, |entry| {
                             core::mem::replace(&mut entry.entry.entry, upper_entry)
                         })
@@ -363,7 +359,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     match entry {
                         EntryX::Upper { .. } | EntryX::Tombstone => unreachable!(),
                         EntryX::Lower { fd } => {
-                            self.lower.close(&fd).unwrap();
+                            self.lower.close(dt, &fd).unwrap();
                         }
                     }
                 }
@@ -371,9 +367,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     // Perfect amount to trigger a `close` on the lower level, and remove
                     // the underlying root entry, since further syncing is no longer
                     // necessary.
-                    let old_entry = self
-                        .litebox
-                        .descriptor_table()
+                    let old_entry = dt
+                        .read()
                         .with_entry_mut_via_internal_fd::<Self, _, _>(internal_fd, |entry| {
                             core::mem::replace(&mut entry.entry.entry, upper_entry)
                         })
@@ -387,16 +382,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     match entry {
                         EntryX::Upper { .. } | EntryX::Tombstone => unreachable!(),
                         EntryX::Lower { fd } => {
-                            self.lower.close(&fd).unwrap();
+                            self.lower.close(dt, &fd).unwrap();
                         }
                     }
                 }
                 _ => {
                     // Other FDs are open with the same file too. We'll handle the open one
                     // here locally, and a future FD will take care of the relevant closing.
-                    let old_entry = self
-                        .litebox
-                        .descriptor_table()
+                    let old_entry = dt
+                        .read()
                         .with_entry_mut_via_internal_fd::<Self, _, _>(internal_fd, |entry| {
                             core::mem::replace(&mut entry.entry.entry, upper_entry)
                         })
@@ -453,19 +447,22 @@ pub enum MigrationError {
     PathError(#[from] PathError),
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower: super::FileSystem>
+impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem<Platform = Platform>, Lower: super::FileSystem<Platform = Platform>>
     super::private::Sealed for FileSystem<Platform, Upper, Lower>
 {
 }
 
 impl<
     Platform: sync::RawSyncPrimitivesProvider,
-    Upper: super::FileSystem + 'static,
-    Lower: super::FileSystem + 'static,
+    Upper: super::FileSystem<Platform = Platform> + 'static,
+    Lower: super::FileSystem<Platform = Platform> + 'static,
 > super::FileSystem for FileSystem<Platform, Upper, Lower>
 {
+    type Platform = Platform;
+
     fn open(
         &self,
+        dt: &crate::fd::DescriptorTable<Platform>,
         path: impl crate::path::Arg,
         flags: OFlags,
         mode: Mode,
@@ -489,13 +486,13 @@ impl<
         if flags.contains(OFlags::CREAT) {
             if flags.contains(OFlags::EXCL) {
                 // O_EXCL with O_CREAT: fail if file already exists anywhere (upper or lower layer)
-                if self.file_status(path.as_str()).is_ok() {
+                if self.file_status(dt, path.as_str()).is_ok() {
                     return Err(OpenError::AlreadyExists);
                 }
             } else {
                 // We must first attempt to open the file _without_ creating it, and only if that fails,
                 // do we fall-through and end up creating it (which will happen on the upper layer).
-                if let Ok(fd) = self.open(path.as_str(), flags - OFlags::CREAT, mode) {
+                if let Ok(fd) = self.open(dt, path.as_str(), flags - OFlags::CREAT, mode) {
                     return Ok(fd);
                 }
             }
@@ -535,9 +532,9 @@ impl<
                         LayeringSemantics::LowerLayerWritableFiles => {}
                     }
                     let new_entry = Arc::new(EntryX::Lower {
-                        fd: self.lower.open(path.as_str(), lower_flags, mode)?,
+                        fd: self.lower.open(dt, path.as_str(), lower_flags, mode)?,
                     });
-                    return Ok(self.litebox.descriptor_table_mut().insert(Descriptor {
+                    return Ok(dt.write().insert(Descriptor {
                         path,
                         flags,
                         entry: new_entry,
@@ -558,10 +555,10 @@ impl<
             }
         }
         // Otherwise, we first check the upper level, creating an entry if needed
-        match self.upper.open(&*path, flags, mode) {
+        match self.upper.open(dt, &*path, flags, mode) {
             Ok(fd) => {
                 let entry = Arc::new(EntryX::Upper { fd });
-                return Ok(self.litebox.descriptor_table_mut().insert(Descriptor {
+                return Ok(dt.write().insert(Descriptor {
                     path,
                     flags,
                     entry,
@@ -595,10 +592,10 @@ impl<
                     // We must check if the lower layer contains all the directories; if it does, we
                     // can create the same directories and then re-trigger the open.
                     let dirname = path.rsplit_once('/').unwrap().0;
-                    if let Ok(FileType::Directory) = self.ensure_lower_contains(dirname) {
+                    if let Ok(FileType::Directory) = self.ensure_lower_contains(dt, dirname) {
                         // We must migrate the directories above, and then re-trigger the open
-                        self.mkdir_migrating_ancestor_dirs(&path).unwrap();
-                        return self.open(path, flags, mode);
+                        self.mkdir_migrating_ancestor_dirs(dt, &path).unwrap();
+                        return self.open(dt, path, flags, mode);
                     }
                     // Otherwise, handle-able by a lower level, fallthrough
                 }
@@ -633,7 +630,7 @@ impl<
         // Any errors from lower level now _must_ propagate up, so we can just invoke
         // the lower level and set up the relevant descriptor upon success.
         let entry = Arc::new(EntryX::Lower {
-            fd: self.lower.open(path.as_str(), flags, mode)?,
+            fd: self.lower.open(dt, path.as_str(), flags, mode)?,
         });
         // Insert the entry for this path.  Another thread may have already
         // inserted an entry for the same lower-layer path concurrently (e.g.
@@ -644,7 +641,7 @@ impl<
             .write()
             .entries
             .insert(path.clone(), Arc::clone(&entry));
-        let fd = self.litebox.descriptor_table_mut().insert(Descriptor {
+        let fd = dt.write().insert(Descriptor {
             path,
             flags: original_flags,
             entry,
@@ -655,14 +652,14 @@ impl<
             // not exist at the upper level but exists at the lower level; in that case, our
             // `truncate` functionality (at the layered FS itself) should correctly migrate things
             // over and handle them.
-            match self.truncate(&fd, 0, true) {
+            match self.truncate(dt, &fd, 0, true) {
                 Ok(()) | Err(TruncateError::IsTerminalDevice) => {
                     // The terminal device is the one case we need to (due to Linux compatibility)
                     // explicitly ignore the truncation ability, and instead silently continue as if
                     // no error was thrown during truncation.
                 }
                 Err(e) => {
-                    self.close(&fd).unwrap();
+                    self.close(dt, &fd).unwrap();
                     return Err(e.into());
                 }
             }
@@ -670,8 +667,8 @@ impl<
         Ok(fd)
     }
 
-    fn close(&self, fd: &FileFd<Platform, Upper, Lower>) -> Result<(), CloseError> {
-        let Some(removed_entry) = self.litebox.descriptor_table_mut().remove(fd) else {
+    fn close(&self, dt: &crate::fd::DescriptorTable<Platform>, fd: &FileFd<Platform, Upper, Lower>) -> Result<(), CloseError> {
+        let Some(removed_entry) = dt.write().remove(fd) else {
             // Was duplicated, don't need to do anything.
             return Ok(());
         };
@@ -710,7 +707,7 @@ impl<
                 let EntryX::Upper { fd } = Arc::into_inner(entry).unwrap() else {
                     unreachable!()
                 };
-                self.upper.close(&fd)
+                self.upper.close(dt, &fd)
             }
             EntryX::Lower { .. } => {
                 // Lower level FDs almost always have a corresponding entry in the root. Thus, we
@@ -729,7 +726,7 @@ impl<
                         let EntryX::Lower { fd, .. } = Arc::into_inner(entry).unwrap() else {
                             unreachable!()
                         };
-                        return self.lower.close(&fd);
+                        return self.lower.close(dt, &fd);
                     }
                 }
 
@@ -756,7 +753,7 @@ impl<
                             Some(EntryX::Lower { fd }) => {
                                 // We are the sole remaining holder of the FD. Let us clean things
                                 // up at the lower level.
-                                return self.lower.close(&fd);
+                                return self.lower.close(dt, &fd);
                             }
                             None => {
                                 // Someone else's job. We can quit successfully.
@@ -777,13 +774,14 @@ impl<
                 let EntryX::Lower { fd, .. } = Arc::into_inner(entry).unwrap() else {
                     unreachable!()
                 };
-                self.lower.close(&fd)
+                self.lower.close(dt, &fd)
             }
         }
     }
 
     fn read(
         &self,
+        dt: &crate::fd::DescriptorTable<Platform>,
         fd: &FileFd<Platform, Upper, Lower>,
         buf: &mut [u8],
         offset: Option<usize>,
@@ -792,9 +790,8 @@ impl<
         // upper-level file, we don't actually need to worry about a desync; a write to lower-level
         // file will successfully be seen as just being an upper level file. Thus, it is sufficient
         // just to delegate this operation based whether the entry points to upper or lower layers.
-        let entry = self
-            .litebox
-            .descriptor_table()
+        let entry = dt
+            .read()
             .with_entry(fd, |descriptor| {
                 if !descriptor.entry.flags.contains(OFlags::RDONLY)
                     && !descriptor.entry.flags.contains(OFlags::RDWR)
@@ -808,15 +805,15 @@ impl<
             .flatten()?;
         // Perform the actual operation
         let num_bytes = match entry.as_ref() {
-            EntryX::Upper { fd } => self.upper.read(fd, buf, offset)?,
-            EntryX::Lower { fd } => self.lower.read(fd, buf, offset)?,
+            EntryX::Upper { fd } => self.upper.read(dt, fd, buf, offset)?,
+            EntryX::Lower { fd } => self.lower.read(dt, fd, buf, offset)?,
             EntryX::Tombstone => unreachable!(),
         };
         // Only advance position for regular reads (offset == None).
         // pread64 (offset == Some) should NOT modify the file position.
         if offset.is_none() {
-            self.litebox
-                .descriptor_table()
+            dt
+                .read()
                 .get_entry(fd)
                 .ok_or(ReadError::ClosedFd)?
                 .entry
@@ -828,6 +825,7 @@ impl<
 
     fn write(
         &self,
+        dt: &crate::fd::DescriptorTable<Platform>,
         fd: &FileFd<Platform, Upper, Lower>,
         buf: &[u8],
         offset: Option<usize>,
@@ -835,9 +833,8 @@ impl<
         // Writing needs to be careful of how it is performing the write. Any upper-level file can
         // instantly be written to; but a lower-level file must become a upper-level file, before
         // actually being written to.
-        let (entry, path) = self
-            .litebox
-            .descriptor_table()
+        let (entry, path) = dt
+            .read()
             .with_entry(fd, |descriptor| {
                 if !descriptor.entry.flags.contains(OFlags::WRONLY)
                     && !descriptor.entry.flags.contains(OFlags::RDWR)
@@ -854,10 +851,10 @@ impl<
             .flatten()?;
         match entry.as_ref() {
             EntryX::Upper { fd: upper_fd } => {
-                let num_bytes = self.upper.write(upper_fd, buf, offset)?;
+                let num_bytes = self.upper.write(dt, upper_fd, buf, offset)?;
                 if offset.is_none() {
-                    self.litebox
-                        .descriptor_table()
+                    dt
+                        .read()
                         .get_entry(fd)
                         .unwrap()
                         .entry
@@ -873,9 +870,9 @@ impl<
                     }
                     LayeringSemantics::LowerLayerWritableFiles => {
                         // Allow direct write to lower layer
-                        let num_bytes = self.lower.write(lower_fd, buf, offset)?;
+                        let num_bytes = self.lower.write(dt, lower_fd, buf, offset)?;
                         if offset.is_none()
-                            && let Some(e) = self.litebox.descriptor_table().get_entry(fd)
+                            && let Some(e) = dt.read().get_entry(fd)
                         {
                             e.entry.position.fetch_add(num_bytes, SeqCst);
                         }
@@ -887,7 +884,7 @@ impl<
         }
         // Change it to an upper-level file, also altering the file descriptor.
         drop(entry);
-        match self.migrate_file_up(&path, true) {
+        match self.migrate_file_up(dt, &path, true) {
             Ok(()) => {}
             Err(MigrationError::NoReadPerms) => unimplemented!(),
             Err(MigrationError::NotAFile) => return Err(WriteError::NotAFile),
@@ -896,9 +893,8 @@ impl<
         }
         // As a sanity check, in debug mode, confirm that it is now an upper file
         debug_assert!(matches!(
-            *self
-                .litebox
-                .descriptor_table()
+            *dt
+                .read()
                 .get_entry(fd)
                 .unwrap()
                 .entry
@@ -907,27 +903,27 @@ impl<
         ));
         // Since it has been migrated, we can just re-trigger, causing it to apply to the
         // upper layer
-        self.write(fd, buf, offset)
+        self.write(dt, fd, buf, offset)
     }
 
     fn seek(
         &self,
+        dt: &crate::fd::DescriptorTable<Platform>,
         fd: &FileFd<Platform, Upper, Lower>,
         offset: isize,
         whence: SeekWhence,
     ) -> Result<usize, SeekError> {
-        let entry = self
-            .litebox
-            .descriptor_table()
+        let entry = dt
+            .read()
             .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry))
             .ok_or(SeekError::ClosedFd)?;
         // Perform the seek, and update the position info
         let position = match entry.as_ref() {
-            EntryX::Upper { fd } => self.upper.seek(fd, offset, whence)?,
-            EntryX::Lower { fd } => self.lower.seek(fd, offset, whence)?,
+            EntryX::Upper { fd } => self.upper.seek(dt, fd, offset, whence)?,
+            EntryX::Lower { fd } => self.lower.seek(dt, fd, offset, whence)?,
             EntryX::Tombstone => unreachable!(),
         };
-        if let Some(e) = self.litebox.descriptor_table().get_entry(fd) {
+        if let Some(e) = dt.read().get_entry(fd) {
             e.entry.position.store(position, SeqCst);
         }
         Ok(position)
@@ -935,29 +931,29 @@ impl<
 
     fn truncate(
         &self,
+        dt: &crate::fd::DescriptorTable<Platform>,
         fd: &FileFd<Platform, Upper, Lower>,
         length: usize,
         reset_offset: bool,
     ) -> Result<(), TruncateError> {
-        let (flags, entry) = self
-            .litebox
-            .descriptor_table()
+        let (flags, entry) = dt
+            .read()
             .with_entry(fd, |descriptor| {
                 (descriptor.entry.flags, Arc::clone(&descriptor.entry.entry))
             })
             .ok_or(TruncateError::ClosedFd)?;
         let layered_fd = fd;
         match entry.as_ref() {
-            EntryX::Upper { fd } => self.upper.truncate(fd, length, reset_offset),
+            EntryX::Upper { fd } => self.upper.truncate(dt, fd, length, reset_offset),
             EntryX::Lower { fd } => {
                 match self.layering_semantics {
                     LayeringSemantics::LowerLayerWritableFiles => {
-                        self.lower.truncate(fd, length, reset_offset)
+                        self.lower.truncate(dt, fd, length, reset_offset)
                     }
                     LayeringSemantics::LowerLayerReadOnly => {
                         if flags.contains(OFlags::WRONLY) || flags.contains(OFlags::RDWR) {
                             // We might need to migrate the file up
-                            match self.lower.truncate(fd, length, reset_offset) {
+                            match self.lower.truncate(dt, fd, length, reset_offset) {
                                 Ok(()) | Err(TruncateError::ClosedFd) => unreachable!(),
                                 Err(TruncateError::IsDirectory) => Err(TruncateError::IsDirectory),
                                 Err(TruncateError::IsTerminalDevice) => {
@@ -969,14 +965,13 @@ impl<
                                     // We must first drop the cloned entry to make sure that the ref
                                     // counting works out correctly during migration.
                                     drop(entry);
-                                    let path = self
-                                        .litebox
-                                        .descriptor_table()
+                                    let path = dt
+                                        .read()
                                         .with_entry(layered_fd, |descriptor| {
                                             descriptor.entry.path.clone()
                                         })
                                         .ok_or(TruncateError::ClosedFd)?;
-                                    self.migrate_file_up(&path, false)
+                                    self.migrate_file_up(dt, &path, false)
                                         .expect("this migration should always succeed");
 
                                     Ok(())
@@ -986,7 +981,7 @@ impl<
                         } else {
                             // The lower level truncate will correctly identify dir/file and handle
                             // the difference in erroring.
-                            self.lower.truncate(fd, length, reset_offset)
+                            self.lower.truncate(dt, fd, length, reset_offset)
                         }
                     }
                 }
@@ -995,9 +990,9 @@ impl<
         }
     }
 
-    fn chmod(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), ChmodError> {
+    fn chmod(&self, dt: &crate::fd::DescriptorTable<Platform>, path: impl crate::path::Arg, mode: Mode) -> Result<(), ChmodError> {
         let path = self.absolute_path(path)?;
-        match self.upper.chmod(path.as_str(), mode) {
+        match self.upper.chmod(dt, path.as_str(), mode) {
             Ok(()) => return Ok(()),
             Err(e) => match e {
                 ChmodError::NotTheOwner
@@ -1017,13 +1012,13 @@ impl<
                 }
             },
         }
-        match self.ensure_lower_contains(&path) {
+        match self.ensure_lower_contains(dt, &path) {
             Ok(_) => {}
             Err(FileStatusError::Io) => return Err(ChmodError::Io),
             Err(FileStatusError::PathError(e)) => return Err(ChmodError::PathError(e)),
             Err(FileStatusError::ClosedFd) => unreachable!(),
         }
-        match self.migrate_file_up(&path, true) {
+        match self.migrate_file_up(dt, &path, true) {
             Ok(()) => {}
             Err(MigrationError::NoReadPerms) => unimplemented!(),
             Err(MigrationError::NotAFile) => unimplemented!(),
@@ -1032,17 +1027,18 @@ impl<
         }
         // Since it has been migrated, we can just re-trigger, causing it to apply to the
         // upper layer
-        self.chmod(path, mode)
+        self.chmod(dt, path, mode)
     }
 
     fn chown(
         &self,
+        dt: &crate::fd::DescriptorTable<Platform>,
         path: impl crate::path::Arg,
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
         let path = self.absolute_path(path)?;
-        match self.upper.chown(path.as_str(), user, group) {
+        match self.upper.chown(dt, path.as_str(), user, group) {
             Ok(()) => return Ok(()),
             Err(e) => match e {
                 ChownError::NotTheOwner
@@ -1062,13 +1058,13 @@ impl<
                 }
             },
         }
-        match self.ensure_lower_contains(&path) {
+        match self.ensure_lower_contains(dt, &path) {
             Ok(_) => {}
             Err(FileStatusError::Io) => return Err(ChownError::Io),
             Err(FileStatusError::PathError(e)) => return Err(ChownError::PathError(e)),
             Err(FileStatusError::ClosedFd) => unreachable!(),
         }
-        match self.migrate_file_up(&path, true) {
+        match self.migrate_file_up(dt, &path, true) {
             Ok(()) => {}
             Err(MigrationError::NoReadPerms) => unimplemented!(),
             Err(MigrationError::NotAFile) => unimplemented!(),
@@ -1077,16 +1073,16 @@ impl<
         }
         // Since it has been migrated, we can just re-trigger, causing it to apply to the
         // upper layer
-        self.chown(path, user, group)
+        self.chown(dt, path, user, group)
     }
 
-    fn unlink(&self, path: impl crate::path::Arg) -> Result<(), UnlinkError> {
+    fn unlink(&self, dt: &crate::fd::DescriptorTable<Platform>, path: impl crate::path::Arg) -> Result<(), UnlinkError> {
         let path = self.absolute_path(path)?;
-        match self.upper.unlink(path.as_str()) {
+        match self.upper.unlink(dt, path.as_str()) {
             Ok(()) => {
                 // If the lower level contains the file, then we need to place a tombstone in its
                 // path, to prevent the lower level from showing up above.
-                if self.ensure_lower_contains(&path).is_ok() {
+                if self.ensure_lower_contains(dt, &path).is_ok() {
                     // fallthrough to place the tombstone
                 } else {
                     // Lower level doesn't contain it, we are done (with success, since we actually
@@ -1111,7 +1107,7 @@ impl<
                 ) => {
                     // We must now check if the lower level contains the file; if it does not, we
                     // must exit with failure. Otherwise, we fallthrough to place the tombstone.
-                    match self.ensure_lower_contains(&path).map_err(|e| match e {
+                    match self.ensure_lower_contains(dt, &path).map_err(|e| match e {
                         FileStatusError::Io => UnlinkError::Io,
                         FileStatusError::PathError(p) => UnlinkError::PathError(p),
                         FileStatusError::ClosedFd => unreachable!(),
@@ -1136,14 +1132,14 @@ impl<
         Ok(())
     }
 
-    fn mkdir(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), MkdirError> {
+    fn mkdir(&self, dt: &crate::fd::DescriptorTable<Platform>, path: impl crate::path::Arg, mode: Mode) -> Result<(), MkdirError> {
         let path = self.absolute_path(path)?;
-        match self.upper.mkdir(path.as_str(), mode) {
+        match self.upper.mkdir(dt, path.as_str(), mode) {
             Ok(()) => {
                 // If we could successfully make the directory, we know that things are "sane" at
                 // the upper level, but we must also check the lower level to make sure that this
                 // directory didn't already exist.
-                if self.ensure_lower_contains(&path).is_ok() {
+                if self.ensure_lower_contains(dt, &path).is_ok() {
                     return Err(MkdirError::AlreadyExists);
                 }
                 return Ok(());
@@ -1171,12 +1167,12 @@ impl<
         // We know that at least one of the components is missing. We should check each of the
         // components individually, making directories for any components that already exist at the
         // lower layer, and erroring out if no lower layer component exists of that form.
-        self.mkdir_migrating_ancestor_dirs(&path)?;
+        self.mkdir_migrating_ancestor_dirs(dt, &path)?;
         // And then now we can make the upper directory.
-        self.upper.mkdir(path, mode)
+        self.upper.mkdir(dt, path, mode)
     }
 
-    fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), RmdirError> {
+    fn rmdir(&self, dt: &crate::fd::DescriptorTable<Platform>, path: impl crate::path::Arg) -> Result<(), RmdirError> {
         let path = self.absolute_path(path)?;
 
         // Prevent removing root explicitly (even if upper is empty).
@@ -1185,6 +1181,7 @@ impl<
         }
 
         let dir_fd = match self.open(
+            dt,
             path.as_str(),
             OFlags::RDONLY | OFlags::DIRECTORY,
             Mode::empty(),
@@ -1207,19 +1204,19 @@ impl<
                 }
             },
         };
-        let entries = match self.read_dir(&dir_fd) {
+        let entries = match self.read_dir(dt, &dir_fd) {
             Ok(entries) => entries,
             Err(ReadDirError::ClosedFd | ReadDirError::NotADirectory) => unreachable!(),
             Err(ReadDirError::Io) => return Err(RmdirError::Io),
         };
-        self.close(&dir_fd).expect("close dir fd failed");
+        self.close(dt, &dir_fd).expect("close dir fd failed");
         // "." and ".." are always present; anything more => not empty.
         if entries.len() > 2 {
             return Err(RmdirError::NotEmpty);
         }
 
         // blindly rmdir at upper layer, suppressing non-existence errors.
-        if let Err(e) = self.upper.rmdir(path.as_str()) {
+        if let Err(e) = self.upper.rmdir(dt, path.as_str()) {
             match e {
                 RmdirError::PathError(
                     PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
@@ -1246,7 +1243,7 @@ impl<
                 .insert(path, Arc::new(EntryX::Tombstone));
         } else {
             // If lower layer is writable, we can just rmdir there too, suppressing non-existence errors.
-            if let Err(e) = self.lower.rmdir(path.as_str()) {
+            if let Err(e) = self.lower.rmdir(dt, path.as_str()) {
                 match e {
                     RmdirError::PathError(
                         PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
@@ -1269,10 +1266,9 @@ impl<
         Ok(())
     }
 
-    fn read_dir(&self, fd: &FileFd<Platform, Upper, Lower>) -> Result<Vec<DirEntry>, ReadDirError> {
-        let (entry, path) = self
-            .litebox
-            .descriptor_table()
+    fn read_dir(&self, dt: &crate::fd::DescriptorTable<Platform>, fd: &FileFd<Platform, Upper, Lower>) -> Result<Vec<DirEntry>, ReadDirError> {
+        let (entry, path) = dt
+            .read()
             .with_entry(fd, |descriptor| {
                 (
                     Arc::clone(&descriptor.entry.entry),
@@ -1284,14 +1280,14 @@ impl<
         let mut entries = match entry.as_ref() {
             EntryX::Upper { fd } => {
                 // Get entries from upper layer
-                let mut upper_entries = self.upper.read_dir(fd)?;
+                let mut upper_entries = self.upper.read_dir(dt, fd)?;
 
                 // Try to get entries from lower layer for the same path
                 if let Ok(lower_fd) = self
                     .lower
-                    .open(path.as_str(), OFlags::RDONLY, Mode::empty())
+                    .open(dt, path.as_str(), OFlags::RDONLY, Mode::empty())
                 {
-                    if let Ok(lower_entries) = self.lower.read_dir(&lower_fd) {
+                    if let Ok(lower_entries) = self.lower.read_dir(dt, &lower_fd) {
                         // Merge entries, avoiding duplicates (upper layer takes precedence)
                         let upper_names: HashSet<String> =
                             upper_entries.iter().map(|e| e.name.clone()).collect();
@@ -1302,14 +1298,14 @@ impl<
                             }
                         }
                     }
-                    let _ = self.lower.close(&lower_fd);
+                    let _ = self.lower.close(dt, &lower_fd);
                 }
 
                 upper_entries
             }
             EntryX::Lower { fd } => {
                 // This is the easy case, nothing to deal with upper entries.
-                self.lower.read_dir(fd)?
+                self.lower.read_dir(dt, fd)?
             }
             EntryX::Tombstone => unreachable!(),
         };
@@ -1322,37 +1318,23 @@ impl<
         Ok(entries)
     }
 
-    fn file_status(&self, path: impl crate::path::Arg) -> Result<FileStatus, FileStatusError> {
+    fn file_status(&self, dt: &crate::fd::DescriptorTable<Platform>, path: impl crate::path::Arg) -> Result<FileStatus, FileStatusError> {
         // Note: we grab the info from the relevant level and then immediately spit back the same,
         // essentially to ask the compiler to remind us we need to update this when we support
         // inodes and such.
         let path = self.absolute_path(path)?;
-        if let Some(entry) = self.root.read().entries.get(&path) {
-            let FileStatus {
-                file_type,
-                mode,
-                size,
-                owner,
-                node_info,
-                blksize,
-            } = match entry.as_ref() {
-                EntryX::Upper { fd } => self.upper.fd_file_status(fd)?,
-                EntryX::Lower { fd } => self.lower.fd_file_status(fd)?,
-                EntryX::Tombstone => {
-                    return Err(PathError::NoSuchFileOrDirectory)?;
-                }
-            };
-            return Ok(FileStatus {
-                file_type,
-                mode,
-                size,
-                owner,
-                node_info: self.get_layered_nodeinfo(node_info),
-                blksize,
-            });
+        // Check for tombstone — if the file has been deleted at this layer, report it missing.
+        // We intentionally do NOT use cached TypedFds from RootDir entries here, because those
+        // fds index into the descriptor table of whichever process first opened the file, and
+        // are invalid in the caller's per-process descriptor table. Instead we fall through to
+        // path-based lookup on the appropriate layer, which is always correct.
+        if let Some(entry) = self.root.read().entries.get(&path)
+            && matches!(entry.as_ref(), EntryX::Tombstone)
+        {
+            return Err(PathError::NoSuchFileOrDirectory)?;
         }
-        // The file is not open, we must look at the levels themselves.
-        match self.upper.file_status(&*path) {
+        // Look at the levels themselves using path-based lookup.
+        match self.upper.file_status(dt, &*path) {
             Ok(FileStatus {
                 file_type,
                 mode,
@@ -1395,7 +1377,7 @@ impl<
             owner,
             node_info,
             blksize,
-        } = self.lower.file_status(path)?;
+        } = self.lower.file_status(dt, path)?;
         Ok(FileStatus {
             file_type,
             mode,
@@ -1408,11 +1390,11 @@ impl<
 
     fn fd_file_status(
         &self,
+        dt: &crate::fd::DescriptorTable<Platform>,
         fd: &FileFd<Platform, Upper, Lower>,
     ) -> Result<FileStatus, FileStatusError> {
-        let entry = self
-            .litebox
-            .descriptor_table()
+        let entry = dt
+            .read()
             .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry))
             .ok_or(FileStatusError::ClosedFd)?;
         let FileStatus {
@@ -1423,8 +1405,8 @@ impl<
             node_info,
             blksize,
         } = match entry.as_ref() {
-            EntryX::Upper { fd } => self.upper.fd_file_status(fd)?,
-            EntryX::Lower { fd } => self.lower.fd_file_status(fd)?,
+            EntryX::Upper { fd } => self.upper.fd_file_status(dt, fd)?,
+            EntryX::Lower { fd } => self.lower.fd_file_status(dt, fd)?,
             EntryX::Tombstone => unreachable!(),
         };
         // Note: we grab the info and then immediately spit back the same, essentially to ask the
@@ -1441,17 +1423,50 @@ impl<
 
     fn get_static_backing_data(
         &self,
+        dt: &crate::fd::DescriptorTable<Platform>,
         fd: &FileFd<Platform, Upper, Lower>,
     ) -> Option<&'static [u8]> {
-        let entry = self
-            .litebox
-            .descriptor_table()
+        let entry = dt
+            .read()
             .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry))?;
         match entry.as_ref() {
-            EntryX::Upper { fd } => self.upper.get_static_backing_data(fd),
-            EntryX::Lower { fd } => self.lower.get_static_backing_data(fd),
+            EntryX::Upper { fd } => self.upper.get_static_backing_data(dt, fd),
+            EntryX::Lower { fd } => self.lower.get_static_backing_data(dt, fd),
             EntryX::Tombstone => unreachable!(),
         }
+    }
+
+    fn reopen_in_fork(
+        &self,
+        src_dt: &crate::fd::DescriptorTable<Platform>,
+        dst_dt: &crate::fd::DescriptorTable<Platform>,
+        fd: &FileFd<Platform, Upper, Lower>,
+    ) -> Option<FileFd<Platform, Upper, Lower>> {
+        // Extract the path, flags, and current position from the source
+        // descriptor table. We must reopen the file in the destination table
+        // so that the inner TypedFd<Upper>/TypedFd<Lower> indexes into dst_dt
+        // rather than src_dt.
+        let (path, flags, position) = src_dt.read().with_entry(fd, |descriptor| {
+            (
+                descriptor.entry.path.clone(),
+                descriptor.entry.flags,
+                descriptor.entry.position.load(core::sync::atomic::Ordering::SeqCst),
+            )
+        })?;
+
+        // Strip O_CREAT, O_EXCL, and O_TRUNC — the file already exists, we
+        // just need to reopen it at the same position.
+        let reopen_flags = flags & !(OFlags::CREAT | OFlags::EXCL | OFlags::TRUNC);
+
+        // Open fresh in the destination descriptor table.
+        let new_fd = self.open(dst_dt, path.as_str(), reopen_flags, Mode::empty()).ok()?;
+
+        // Seek to the same position the parent was at.
+        if position > 0 {
+            let _ = self.seek(dst_dt, &new_fd, position.cast_signed(), super::SeekWhence::RelativeToBeginning);
+        }
+
+        Some(new_fd)
     }
 }
 

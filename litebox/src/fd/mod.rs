@@ -19,8 +19,21 @@ use thiserror::Error;
 use crate::sync::{RawSyncPrimitivesProvider, RwLock};
 use crate::utilities::anymap::AnyMap;
 
+/// A per-process descriptor table handle.
+pub type DescriptorTable<Platform> =
+    alloc::sync::Arc<crate::sync::RwLock<Platform, Descriptors<Platform>>>;
+
+/// Create a new empty descriptor table.
+pub fn new_descriptor_table<Platform: crate::sync::RawSyncPrimitivesProvider>(
+) -> DescriptorTable<Platform> {
+    alloc::sync::Arc::new(crate::sync::RwLock::new(
+        Descriptors::new_from_litebox_creation(),
+    ))
+}
+
 #[cfg(test)]
 mod tests;
+
 
 /// Storage of file descriptors and their entries.
 pub struct Descriptors<Platform: RawSyncPrimitivesProvider> {
@@ -64,6 +77,49 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
             _phantom: PhantomData,
             x: OwnedFd::new(idx),
         }
+    }
+    /// Insert a pre-existing shared entry into this table. Used during fork
+    /// to share the same underlying `DescriptorEntry` across process tables.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "panics impossible due to type invariants"
+    )]
+    #[must_use]
+    pub fn insert_shared<Subsystem: FdEnabledSubsystem>(
+        &mut self,
+        entry_arc: Arc<RwLock<Platform, DescriptorEntry>>,
+    ) -> TypedFd<Subsystem> {
+        let individual = IndividualEntry::new(entry_arc);
+        let idx = self
+            .entries
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or_else(|| {
+                self.entries.push(None);
+                self.entries.len() - 1
+            });
+        let old = self.entries[idx].replace(individual);
+        assert!(old.is_none());
+        TypedFd {
+            _phantom: PhantomData,
+            x: OwnedFd::new(idx),
+        }
+    }
+
+    /// Returns a clone of the internal `Arc` for the descriptor entry at `fd`.
+    ///
+    /// This is used for cross-table duplication (e.g., fork): the caller can
+    /// pass the returned `Arc` to [`Self::insert_shared`] on a different
+    /// `Descriptors` instance to share the underlying entry.
+    ///
+    /// Returns `None` if the fd has been closed.
+    pub fn entry_arc<Subsystem: FdEnabledSubsystem>(
+        &self,
+        fd: &TypedFd<Subsystem>,
+    ) -> Option<Arc<RwLock<Platform, DescriptorEntry>>> {
+        Some(Arc::clone(
+            &self.entries[fd.x.as_usize()?].as_ref()?.x,
+        ))
     }
 
     /// Create a duplicate of the provided `fd`.
@@ -822,7 +878,7 @@ impl<Platform: RawSyncPrimitivesProvider> IndividualEntry<Platform> {
 }
 
 /// A crate-internal entry for a descriptor.
-pub(crate) struct DescriptorEntry {
+pub struct DescriptorEntry {
     entry: alloc::boxed::Box<dyn FdEnabledSubsystemEntry>,
     metadata: AnyMap,
 }

@@ -8,7 +8,6 @@
 use alloc::string::String;
 
 use crate::{
-    LiteBox,
     fs::{
         FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
         errors::{
@@ -68,7 +67,7 @@ enum Device {
 pub struct FileSystem<
     Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioProvider + 'static,
 > {
-    litebox: LiteBox<Platform>,
+    platform: &'static Platform,
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
 }
@@ -82,9 +81,9 @@ impl<Platform: crate::platform::StdioProvider + crate::sync::RawSyncPrimitivesPr
     /// and the created `FileSystem` handle is expected to be shared across all usage over the
     /// system.
     #[must_use]
-    pub fn new(litebox: &LiteBox<Platform>) -> Self {
+    pub fn new(platform: &'static Platform) -> Self {
         Self {
-            litebox: litebox.clone(),
+            platform,
             current_working_dir: "/".into(),
         }
     }
@@ -150,8 +149,11 @@ impl<
         + crate::platform::CrngProvider,
 > super::FileSystem for FileSystem<Platform>
 {
+    type Platform = Platform;
+
     fn open(
         &self,
+        dt: &crate::fd::DescriptorTable<Platform>,
         path: impl Arg,
         flags: OFlags,
         mode: Mode,
@@ -202,32 +204,32 @@ impl<
         {
             unimplemented!("Non-blocking I/O is not supported for {:?}", device);
         }
-        let fd = self.litebox.descriptor_table_mut().insert(device);
+        let fd = dt.write().insert(device);
         if truncate {
             // Note: matching Linux behavior, this does not actually perform any truncation, and
             // instead, it is silently ignored if you attempt to truncate upon opening stdio.
             assert!(matches!(
-                self.truncate(&fd, 0, true),
+                self.truncate(dt, &fd, 0, true),
                 Err(TruncateError::IsTerminalDevice)
             ));
         }
         Ok(fd)
     }
 
-    fn close(&self, fd: &FileFd<Platform>) -> Result<(), CloseError> {
-        self.litebox.descriptor_table_mut().remove(fd);
+    fn close(&self, dt: &crate::fd::DescriptorTable<Platform>, fd: &FileFd<Platform>) -> Result<(), CloseError> {
+        dt.write().remove(fd);
         Ok(())
     }
 
     fn read(
         &self,
+        dt: &crate::fd::DescriptorTable<Platform>,
         fd: &FileFd<Platform>,
         buf: &mut [u8],
         offset: Option<usize>,
     ) -> Result<usize, ReadError> {
-        match &self
-            .litebox
-            .descriptor_table()
+        match &dt
+.read()
             .get_entry(fd)
             .ok_or(ReadError::ClosedFd)?
             .entry
@@ -241,16 +243,14 @@ impl<
                 return Ok(0);
             }
             Device::URandom => {
-                self.litebox.x.platform.fill_bytes_crng(buf);
+                self.platform.fill_bytes_crng(buf);
                 return Ok(buf.len());
             }
         }
         if offset.is_some() {
             unimplemented!()
         }
-        self.litebox
-            .x
-            .platform
+        self.platform
             .read_from_stdin(buf)
             .or_else(|e| match e {
                 // Closed stdin → EOF (0 bytes read), just like a real terminal
@@ -261,13 +261,13 @@ impl<
 
     fn write(
         &self,
+        dt: &crate::fd::DescriptorTable<Platform>,
         fd: &FileFd<Platform>,
         buf: &[u8],
         offset: Option<usize>,
     ) -> Result<usize, WriteError> {
-        let stream = match &self
-            .litebox
-            .descriptor_table()
+        let stream = match &dt
+.read()
             .get_entry(fd)
             .ok_or(WriteError::ClosedFd)?
             .entry
@@ -290,9 +290,7 @@ impl<
         if offset.is_some() {
             unimplemented!()
         }
-        self.litebox
-            .x
-            .platform
+        self.platform
             .write_to(stream, buf)
             .map_err(|e| match e {
                 StdioWriteError::Closed => unimplemented!(),
@@ -301,13 +299,13 @@ impl<
 
     fn seek(
         &self,
+        dt: &crate::fd::DescriptorTable<Platform>,
         fd: &FileFd<Platform>,
         _offset: isize,
         _whence: SeekWhence,
     ) -> Result<usize, SeekError> {
-        match &self
-            .litebox
-            .descriptor_table()
+        match &dt
+.read()
             .get_entry(fd)
             .ok_or(SeekError::ClosedFd)?
             .entry
@@ -322,6 +320,7 @@ impl<
 
     fn truncate(
         &self,
+        _dt: &crate::fd::DescriptorTable<Platform>,
         _fd: &FileFd<Platform>,
         _length: usize,
         _reset_offset: bool,
@@ -330,13 +329,14 @@ impl<
     }
 
     #[expect(unused_variables, reason = "unimplemented")]
-    fn chmod(&self, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
+    fn chmod(&self, _dt: &crate::fd::DescriptorTable<Platform>, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
         unimplemented!()
     }
 
     #[expect(unused_variables, reason = "unimplemented")]
     fn chown(
         &self,
+        _dt: &crate::fd::DescriptorTable<Platform>,
         path: impl Arg,
         user: Option<u16>,
         group: Option<u16>,
@@ -345,28 +345,29 @@ impl<
     }
 
     #[expect(unused_variables, reason = "unimplemented")]
-    fn unlink(&self, path: impl Arg) -> Result<(), UnlinkError> {
+    fn unlink(&self, _dt: &crate::fd::DescriptorTable<Platform>, path: impl Arg) -> Result<(), UnlinkError> {
         unimplemented!()
     }
 
     #[expect(unused_variables, reason = "unimplemented")]
-    fn mkdir(&self, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {
+    fn mkdir(&self, _dt: &crate::fd::DescriptorTable<Platform>, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {
         unimplemented!()
     }
 
     #[expect(unused_variables, reason = "unimplemented")]
-    fn rmdir(&self, path: impl Arg) -> Result<(), RmdirError> {
+    fn rmdir(&self, _dt: &crate::fd::DescriptorTable<Platform>, path: impl Arg) -> Result<(), RmdirError> {
         unimplemented!()
     }
 
     fn read_dir(
         &self,
+        _dt: &crate::fd::DescriptorTable<Platform>,
         _fd: &FileFd<Platform>,
     ) -> Result<alloc::vec::Vec<crate::fs::DirEntry>, ReadDirError> {
         Err(ReadDirError::NotADirectory)
     }
 
-    fn file_status(&self, path: impl Arg) -> Result<FileStatus, FileStatusError> {
+    fn file_status(&self, _dt: &crate::fd::DescriptorTable<Platform>, path: impl Arg) -> Result<FileStatus, FileStatusError> {
         let path = self.absolute_path(path)?;
         let device = match path.as_str() {
             "/dev/stdin" => Device::Stdin,
@@ -379,10 +380,9 @@ impl<
         Ok(Self::device_file_status(device))
     }
 
-    fn fd_file_status(&self, fd: &FileFd<Platform>) -> Result<FileStatus, FileStatusError> {
-        let device = self
-            .litebox
-            .descriptor_table()
+    fn fd_file_status(&self, dt: &crate::fd::DescriptorTable<Platform>, fd: &FileFd<Platform>) -> Result<FileStatus, FileStatusError> {
+        let device = dt
+.read()
             .get_entry(fd)
             .ok_or(FileStatusError::ClosedFd)?
             .entry;

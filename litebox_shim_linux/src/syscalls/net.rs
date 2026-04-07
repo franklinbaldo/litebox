@@ -71,7 +71,7 @@ impl<FS: ShimFS> super::file::FilesState<FS> {
     /// For Unix sockets, the `unix_op` closure is called with a cloned Arc to the socket.
     fn with_socket<R>(
         &self,
-        global: &GlobalState<FS>,
+        _global: &GlobalState<FS>,
         sockfd: u32,
         inet_op: impl FnOnce(&SocketFd) -> Result<R, Errno>,
         unix_op: impl FnOnce(&UnixSocket<FS>) -> Result<R, Errno>,
@@ -92,9 +92,7 @@ impl<FS: ShimFS> super::file::FilesState<FS> {
                 litebox::fd::ErrRawIntFd::NotFound => Errno::EBADF,
                 litebox::fd::ErrRawIntFd::InvalidSubsystem => Errno::ENOTSOCK,
             })?;
-        let handle = global
-            .litebox
-            .descriptor_table()
+        let handle = self.dt.read()
             .entry_handle(&unix)
             .ok_or(Errno::EBADF)?;
         handle.with_entry(|entry| unix_op(entry))
@@ -190,6 +188,7 @@ pub(super) enum SocketOptionValue {
 impl<FS: ShimFS> GlobalState<FS> {
     pub(crate) fn initialize_socket(
         &self,
+        dt: &litebox::fd::DescriptorTable<Platform>,
         net: &NetMutex,
         fd: &SocketFd,
         sock_type: SockType,
@@ -198,7 +197,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         let mut status = OFlags::RDWR;
         status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
 
-        let dt = self.litebox.descriptor_table();
+        let dt = dt.read();
         let old = dt.set_entry_metadata(fd, SocketOptions::default());
         assert!(old.is_none());
         if flags.contains(SockFlags::CLOEXEC) {
@@ -236,19 +235,18 @@ impl<FS: ShimFS> GlobalState<FS> {
         proxy
     }
 
-    fn with_socket_options<R>(&self, fd: &SocketFd, f: impl FnOnce(&SocketOptions) -> R) -> R {
-        self.litebox
-            .descriptor_table()
+    fn with_socket_options<R>(&self, dt: &litebox::fd::DescriptorTable<Platform>, fd: &SocketFd, f: impl FnOnce(&SocketOptions) -> R) -> R {
+        dt.read()
             .with_metadata(fd, |opt| f(opt))
             .unwrap()
     }
     fn with_socket_options_mut<R>(
         &self,
+        dt: &litebox::fd::DescriptorTable<Platform>,
         fd: &SocketFd,
         f: impl FnOnce(&mut SocketOptions) -> R,
     ) -> R {
-        self.litebox
-            .descriptor_table()
+        dt.read()
             .with_metadata_mut(fd, |opt| f(opt))
             .unwrap()
     }
@@ -314,6 +312,7 @@ impl<FS: ShimFS> GlobalState<FS> {
     }
     fn setsockopt(
         &self,
+        dt: &litebox::fd::DescriptorTable<Platform>,
         net: &NetMutex,
         fd: &SocketFd,
         optname: SocketOptionName,
@@ -326,7 +325,7 @@ impl<FS: ShimFS> GlobalState<FS> {
             // `with_socket_options_mut` holds a write lock on descriptors, while
             // `Network::set_tcp_option` acquires a read lock on the same RwLock.
             let mut deferred_tcp_option = None;
-            self.with_socket_options_mut(fd, |opt| {
+            self.with_socket_options_mut(dt, fd, |opt| {
                 match (so, value) {
                     (SocketOption::RCVTIMEO, SocketOptionValue::Timeout(timeout)) => {
                         opt.recv_timeout = timeout;
@@ -513,6 +512,7 @@ impl<FS: ShimFS> GlobalState<FS> {
     }
     fn getsockopt(
         &self,
+        dt: &litebox::fd::DescriptorTable<Platform>,
         net: &NetMutex,
         fd: &SocketFd,
         optname: SocketOptionName,
@@ -520,7 +520,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         len: u32,
     ) -> Result<usize, Errno> {
         match self.getsockopt_common(optname, optval, len, |sopt| {
-            self.with_socket_options(fd, |options| match sopt {
+            self.with_socket_options(dt, fd, |options| match sopt {
                 SocketOption::RCVTIMEO => SocketOptionValue::Timeout(options.recv_timeout),
                 SocketOption::SNDTIMEO => SocketOptionValue::Timeout(options.send_timeout),
                 SocketOption::LINGER => SocketOptionValue::Timeout(options.linger_timeout),
@@ -550,7 +550,7 @@ impl<FS: ShimFS> GlobalState<FS> {
                 }
                 SocketOption::ERROR => {
                     // SO_ERROR is self-clearing: atomically read and reset to 0.
-                    let proxy = self.get_proxy(fd)?;
+                    let proxy = self.get_proxy(dt, fd)?;
                     match proxy.get_async_error(true) {
                         Some(err) => {
                             let errno: Errno = err.into();
@@ -559,7 +559,7 @@ impl<FS: ShimFS> GlobalState<FS> {
                         None => 0,
                     }
                 }
-                SocketOption::TYPE => self.get_socket_type(fd)? as u32,
+                SocketOption::TYPE => self.get_socket_type(dt, fd)? as u32,
                 SocketOption::RCVBUF | SocketOption::SNDBUF => {
                     litebox::net::SOCKET_BUFFER_SIZE.truncate()
                 }
@@ -620,6 +620,7 @@ impl<FS: ShimFS> GlobalState<FS> {
 
     fn try_accept(
         &self,
+        _dt: &litebox::fd::DescriptorTable<Platform>,
         net: &NetMutex,
         fd: &SocketFd,
         peer: Option<&mut SocketAddr>,
@@ -633,20 +634,21 @@ impl<FS: ShimFS> GlobalState<FS> {
 
     fn accept(
         &self,
+        dt: &litebox::fd::DescriptorTable<Platform>,
         net: &NetMutex,
         cx: &WaitContext<'_, Platform>,
         fd: &SocketFd,
         mut peer: Option<&mut SocketAddr>,
     ) -> Result<SocketFd, Errno> {
         cx.wait_on_events(
-            self.get_status(fd).contains(OFlags::NONBLOCK),
+            self.get_status(dt, fd).contains(OFlags::NONBLOCK),
             Events::IN,
             |observer, filter| {
-                let proxy = self.get_proxy(fd)?;
+                let proxy = self.get_proxy(dt, fd)?;
                 proxy.register_observer(observer, filter);
                 Ok(())
             },
-            || self.try_accept(net, fd, peer.as_deref_mut()),
+            || self.try_accept(dt, net, fd, peer.as_deref_mut()),
         )
         .map_err(Errno::from)
     }
@@ -657,6 +659,7 @@ impl<FS: ShimFS> GlobalState<FS> {
 
     fn connect(
         &self,
+        dt: &litebox::fd::DescriptorTable<Platform>,
         net: &NetMutex,
         cx: &WaitContext<'_, Platform>,
         fd: &SocketFd,
@@ -667,10 +670,10 @@ impl<FS: ShimFS> GlobalState<FS> {
         }
         let mut check_progress = false;
         cx.wait_on_events::<_, Errno>(
-            self.get_status(fd).contains(OFlags::NONBLOCK),
+            self.get_status(dt, fd).contains(OFlags::NONBLOCK),
             Events::IN | Events::OUT,
             |observer, filter| {
-                let proxy = self.get_proxy(fd)?;
+                let proxy = self.get_proxy(dt, fd)?;
                 proxy.register_observer(observer, filter);
                 Ok(())
             },
@@ -697,8 +700,10 @@ impl<FS: ShimFS> GlobalState<FS> {
     ///
     /// This uses the channel-based approach where the user writes to a TX ring buffer,
     /// and the network worker later drains it.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn sendto(
         &self,
+        dt: &litebox::fd::DescriptorTable<Platform>,
         net: &NetMutex,
         cx: &WaitContext<'_, Platform>,
         fd: &SocketFd,
@@ -706,7 +711,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         flags: SendFlags,
         sockaddr: Option<SocketAddr>,
     ) -> Result<usize, Errno> {
-        let proxy = self.get_proxy(fd)?;
+        let proxy = self.get_proxy(dt, fd)?;
 
         // Auto-bind UDP sockets if not already bound (Linux behavior: sendto() on an unbound
         // UDP socket implicitly binds it to an ephemeral port before sending).
@@ -753,9 +758,9 @@ impl<FS: ShimFS> GlobalState<FS> {
             OOB,
         );
 
-        let timeout = self.with_socket_options(fd, |opt| opt.send_timeout);
+        let timeout = self.with_socket_options(dt, fd, |opt| opt.send_timeout);
         let is_nonblock =
-            self.get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT);
+            self.get_status(dt, fd).contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT);
 
         let ret = cx
             .with_timeout(timeout)
@@ -787,14 +792,15 @@ impl<FS: ShimFS> GlobalState<FS> {
     /// that the network worker populates.
     pub(crate) fn receive(
         &self,
+        dt: &litebox::fd::DescriptorTable<Platform>,
         cx: &WaitContext<'_, Platform>,
         fd: &SocketFd,
         buf: &mut [u8],
         flags: ReceiveFlags,
         mut source_addr: Option<&mut Option<SocketAddr>>,
     ) -> Result<usize, Errno> {
-        let timeout = self.with_socket_options(fd, |opt| opt.recv_timeout);
-        let is_nonblock = self.get_status(fd).contains(OFlags::NONBLOCK)
+        let timeout = self.with_socket_options(dt, fd, |opt| opt.recv_timeout);
+        let is_nonblock = self.get_status(dt, fd).contains(OFlags::NONBLOCK)
             || flags.contains(ReceiveFlags::DONTWAIT);
 
         let mut new_flags = convert_flags!(
@@ -809,7 +815,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         );
         // `MSG_TRUNC` behavior depends on the socket type
         if flags.contains(ReceiveFlags::TRUNC) {
-            match self.get_socket_type(fd)? {
+            match self.get_socket_type(dt, fd)? {
                 SockType::Datagram | SockType::Raw => {
                     new_flags.insert(litebox::net::ReceiveFlags::TRUNC);
                 }
@@ -820,7 +826,7 @@ impl<FS: ShimFS> GlobalState<FS> {
             }
         }
 
-        let proxy = self.get_proxy(fd)?;
+        let proxy = self.get_proxy(dt, fd)?;
         let ret = cx
             .with_timeout(timeout)
             .wait_on_events(
@@ -844,9 +850,8 @@ impl<FS: ShimFS> GlobalState<FS> {
         }
     }
 
-    fn get_socket_type(&self, fd: &SocketFd) -> Result<SockType, Errno> {
-        self.litebox
-            .descriptor_table()
+    fn get_socket_type(&self, dt: &litebox::fd::DescriptorTable<Platform>, fd: &SocketFd) -> Result<SockType, Errno> {
+        dt.read()
             .with_metadata(fd, |sock_type: &SockType| *sock_type)
             .map_err(|e| match e {
                 litebox::fd::MetadataError::NoSuchMetadata => Errno::ENOTSOCK,
@@ -854,17 +859,15 @@ impl<FS: ShimFS> GlobalState<FS> {
             })
     }
 
-    fn get_status(&self, fd: &SocketFd) -> litebox::fs::OFlags {
-        self.litebox
-            .descriptor_table()
+    fn get_status(&self, dt: &litebox::fd::DescriptorTable<Platform>, fd: &SocketFd) -> litebox::fs::OFlags {
+        dt.read()
             .with_metadata(fd, |SocketOFlags(flags)| *flags)
             .unwrap()
             & litebox::fs::OFlags::STATUS_FLAGS_MASK
     }
 
-    pub(crate) fn get_proxy(&self, fd: &SocketFd) -> Result<Arc<NetworkProxy<Platform>>, Errno> {
-        self.litebox
-            .descriptor_table()
+    pub(crate) fn get_proxy(&self, dt: &litebox::fd::DescriptorTable<Platform>, fd: &SocketFd) -> Result<Arc<NetworkProxy<Platform>>, Errno> {
+        dt.read()
             .with_metadata(fd, |SocketProxy(proxy)| proxy.clone())
             .map_err(|e| match e {
                 litebox::fd::MetadataError::NoSuchMetadata => unreachable!(),
@@ -875,18 +878,19 @@ impl<FS: ShimFS> GlobalState<FS> {
     pub(crate) fn close_socket(
         &self,
         net: &NetMutex,
+        dt: &litebox::fd::DescriptorTable<Platform>,
         cx: &WaitContext<'_, Platform>,
         fd: Arc<SocketFd>,
     ) -> Result<(), Errno> {
-        let linger_timeout = self.with_socket_options(&fd, |opt| opt.linger_timeout);
+        let linger_timeout = self.with_socket_options(dt, &fd, |opt| opt.linger_timeout);
         let behavior = match linger_timeout {
             Some(timeout) if timeout.is_zero() => CloseBehavior::Immediate,
             Some(_) => CloseBehavior::GracefulIfNoPendingData,
             None => CloseBehavior::Graceful,
         };
-        let proxy = self.get_proxy(&fd)?;
+        let proxy = self.get_proxy(dt, &fd)?;
         match cx.with_timeout(linger_timeout).wait_on_events(
-            self.get_status(&fd).contains(OFlags::NONBLOCK),
+            self.get_status(dt, &fd).contains(OFlags::NONBLOCK),
             Events::HUP,
             |observer, filter| {
                 proxy.register_observer(observer, filter);
@@ -944,6 +948,7 @@ impl<FS: ShimFS> Task<FS> {
         flags: SockFlags,
         protocol: u8,
     ) -> Result<u32, Errno> {
+        let dt = self.dt();
         let files = self.files.borrow();
         let file = match domain {
             AddressFamily::INET => {
@@ -968,7 +973,7 @@ impl<FS: ShimFS> Task<FS> {
                     _ => unimplemented!(),
                 };
                 let socket = self.net.lock().socket(protocol)?;
-                let _ = self.global.initialize_socket(&self.net, &socket, ty, flags);
+                let _ = self.global.initialize_socket(&dt, &self.net, &socket, ty, flags);
                 let Ok(raw_fd) = files.insert_raw_fd(socket) else {
                     unimplemented!()
                 };
@@ -977,22 +982,16 @@ impl<FS: ShimFS> Task<FS> {
             AddressFamily::UNIX => {
                 let _ = UnixProtocol::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?;
                 let socket = UnixSocket::new(ty, flags).ok_or(Errno::ESOCKTNOSUPPORT)?;
-                let typed = self
-                    .global
-                    .litebox
-                    .descriptor_table_mut()
+                let typed = dt.write()
                     .insert::<crate::syscalls::unix::UnixSocketSubsystem<FS>>(socket);
                 if flags.contains(SockFlags::CLOEXEC) {
-                    let old = self
-                        .global
-                        .litebox
-                        .descriptor_table()
+                    let old = dt.write()
                         .set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
                     assert!(old.is_none());
                 }
 
                 files.insert_raw_fd(typed).map_err(|typed| {
-                    let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+                    let _ = dt.write().remove(&typed);
                     Errno::EMFILE
                 })?
             }
@@ -1032,7 +1031,7 @@ impl<FS: ShimFS> Task<FS> {
                 let (sock1, sock2) =
                     UnixSocket::new_connected_pair(ty, flags).ok_or(Errno::ESOCKTNOSUPPORT)?;
                 let files = self.files.borrow();
-                let mut dt = self.global.litebox.descriptor_table_mut();
+                let mut dt = files.dt.write();
                 let typed1 = dt.insert::<crate::syscalls::unix::UnixSocketSubsystem<FS>>(sock1);
                 let typed2 = dt.insert::<crate::syscalls::unix::UnixSocketSubsystem<FS>>(sock2);
                 if flags.contains(SockFlags::CLOEXEC) {
@@ -1043,12 +1042,12 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 drop(dt);
                 let raw_fd1 = files.insert_raw_fd(typed1).map_err(|typed| {
-                    let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+                    let _ = files.dt.write().remove(&typed);
                     Errno::EMFILE
                 })?;
                 let raw_fd2 = files.insert_raw_fd(typed2).map_err(|typed| {
                     self.do_close(raw_fd1).unwrap();
-                    let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+                    let _ = files.dt.write().remove(&typed);
                     Errno::EMFILE
                 })?;
                 (raw_fd1, raw_fd2)
@@ -1209,23 +1208,24 @@ impl<FS: ShimFS> Task<FS> {
         peer: Option<&mut SocketAddress>,
         flags: SockFlags,
     ) -> Result<u32, Errno> {
+        let dt = self.dt();
         let files = self.files.borrow();
         let want_peer = peer.is_some();
         let (file, peer_addr) = files.with_socket(
             &self.global,
             sockfd,
             |fd| {
-                let sock_type = self.global.get_socket_type(fd)?;
+                let sock_type = self.global.get_socket_type(&dt, fd)?;
                 let mut socket_addr =
                     want_peer.then(|| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
                 let accepted_file =
                     self.global
-                        .accept(&self.net, &self.wait_cx(), fd, socket_addr.as_mut())?;
+                        .accept(&dt, &self.net, &self.wait_cx(), fd, socket_addr.as_mut())?;
                 let peer_addr = socket_addr.map(SocketAddress::Inet);
 
                 let proxy =
                     self.global
-                        .initialize_socket(&self.net, &accepted_file, sock_type, flags);
+                        .initialize_socket(&dt, &self.net, &accepted_file, sock_type, flags);
                 proxy.set_state(SocketState::Connected);
                 let _ = self.net.lock().perform_platform_interaction();
                 let Ok(raw_fd) = files.insert_raw_fd(accepted_file) else {
@@ -1237,16 +1237,16 @@ impl<FS: ShimFS> Task<FS> {
                 let mut socket_addr = want_peer.then_some(UnixSocketAddr::Unnamed);
                 let accepted_file = file.accept(&self.wait_cx(), flags, socket_addr.as_mut())?;
                 let peer_addr = socket_addr.map(SocketAddress::Unix);
-                let mut dt = self.global.litebox.descriptor_table_mut();
+                let mut dt_guard = files.dt.write();
                 let typed =
-                    dt.insert::<crate::syscalls::unix::UnixSocketSubsystem<FS>>(accepted_file);
+                    dt_guard.insert::<crate::syscalls::unix::UnixSocketSubsystem<FS>>(accepted_file);
                 if flags.contains(SockFlags::CLOEXEC) {
-                    let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
+                    let old = dt_guard.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
                     assert!(old.is_none());
                 }
-                drop(dt);
+                drop(dt_guard);
                 let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
-                    let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+                    let _ = files.dt.write().remove(&typed);
                     Errno::EMFILE
                 })?;
                 Ok((raw_fd, peer_addr))
@@ -1274,12 +1274,13 @@ impl<FS: ShimFS> Task<FS> {
         self.do_connect(fd, sockaddr)
     }
     fn do_connect(&self, sockfd: u32, sockaddr: SocketAddress) -> Result<(), Errno> {
+        let dt = self.dt();
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
             |fd| {
                 let addr = sockaddr.clone().inet().ok_or(Errno::EAFNOSUPPORT)?;
-                self.global.connect(&self.net, &self.wait_cx(), fd, addr)
+                self.global.connect(&dt, &self.net, &self.wait_cx(), fd, addr)
             },
             |file| {
                 let addr = sockaddr.clone().unix().ok_or(Errno::EAFNOSUPPORT)?;
@@ -1372,6 +1373,7 @@ impl<FS: ShimFS> Task<FS> {
         flags: SendFlags,
         sockaddr: Option<SocketAddress>,
     ) -> Result<usize, Errno> {
+        let dt = self.dt();
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
@@ -1381,7 +1383,7 @@ impl<FS: ShimFS> Task<FS> {
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
                 self.global
-                    .sendto(&self.net, &self.wait_cx(), fd, buf, flags, sockaddr)
+                    .sendto(&dt, &self.net, &self.wait_cx(), fd, buf, flags, sockaddr)
             },
             |file| {
                 let addr = sockaddr
@@ -1431,6 +1433,7 @@ impl<FS: ShimFS> Task<FS> {
             .msg_iov
             .to_owned_slice(msg.msg_iovlen)
             .ok_or(Errno::EFAULT)?;
+        let dt = self.dt();
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
@@ -1457,12 +1460,13 @@ impl<FS: ShimFS> Task<FS> {
                         let buf =
                             unsafe { core::slice::from_raw_parts(buf_addr as *const u8, len) };
                         self.global
-                            .sendto(&self.net, &self.wait_cx(), fd, buf, flags, sock_addr)?
+                            .sendto(&dt, &self.net, &self.wait_cx(), fd, buf, flags, sock_addr)?
                     };
                     #[cfg(not(feature = "platform_central"))]
                     let sent = {
                         let buf = base.to_owned_slice(len).ok_or(Errno::EFAULT)?;
                         self.global.sendto(
+                            &dt,
                             &self.net,
                             &self.wait_cx(),
                             fd,
@@ -1552,6 +1556,7 @@ impl<FS: ShimFS> Task<FS> {
         source_addr: Option<&mut Option<SocketAddress>>,
     ) -> Result<usize, Errno> {
         let want_source = source_addr.is_some();
+        let dt = self.dt();
         let files = self.files.borrow();
         let raw_fd = usize::try_from(sockfd).or(Err(Errno::EBADF))?;
         let (size, addr) = {
@@ -1564,6 +1569,7 @@ impl<FS: ShimFS> Task<FS> {
                 |fd| {
                     let mut addr = None;
                     let size = self.global.receive(
+                        &dt,
                         &self.wait_cx(),
                         fd,
                         &mut buf.borrow_mut(),
@@ -1622,12 +1628,13 @@ impl<FS: ShimFS> Task<FS> {
         optval: ConstPtr<u8>,
         optlen: usize,
     ) -> Result<(), Errno> {
+        let dt = self.dt();
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
             |fd| {
                 self.global
-                    .setsockopt(&self.net, fd, optname, optval, optlen)
+                    .setsockopt(&dt, &self.net, fd, optname, optval, optlen)
             },
             |file| file.setsockopt(&self.global, optname, optval, optlen),
         )
@@ -1669,10 +1676,11 @@ impl<FS: ShimFS> Task<FS> {
         optval: MutPtr<u8>,
         len: u32,
     ) -> Result<usize, Errno> {
+        let dt = self.dt();
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
-            |fd| self.global.getsockopt(&self.net, fd, optname, optval, len),
+            |fd| self.global.getsockopt(&dt, &self.net, fd, optname, optval, len),
             |file| file.getsockopt(&self.global, optname, optval, len),
         )
     }

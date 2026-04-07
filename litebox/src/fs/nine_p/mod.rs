@@ -22,7 +22,7 @@ use crate::fs::errors::{
 };
 use crate::fs::nine_p::fcall::Rlerror;
 use crate::path::Arg;
-use crate::{LiteBox, sync};
+use crate::sync;
 
 mod client;
 mod fcall;
@@ -271,8 +271,6 @@ pub struct FileSystem<
     Platform: sync::RawSyncPrimitivesProvider,
     T: transport::Read + transport::Write,
 > {
-    /// Reference to the LiteBox instance
-    litebox: LiteBox<Platform>,
     /// 9P client for protocol operations
     client: client::Client<Platform, T>,
     /// Root (attached to the root of the remote filesystem)
@@ -304,7 +302,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     ///
     /// Returns an error if version negotiation or attach fails.
     pub fn new(
-        litebox: &LiteBox<Platform>,
         transport: T,
         msize: u32,
         username: &str,
@@ -314,7 +311,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         let (qid, fid) = client.attach(username, path)?;
 
         Ok(Self {
-            litebox: litebox.clone(),
             client,
             root: (qid, fid, String::from(path)),
             current_working_dir: String::from("/"),
@@ -544,9 +540,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::Write>
     super::FileSystem for FileSystem<Platform, T>
 {
+    type Platform = Platform;
+
     #[allow(clippy::similar_names)]
     fn open(
         &self,
+        dt: &crate::fd::DescriptorTable<Platform>,
         path: impl crate::path::Arg,
         flags: super::OFlags,
         mode: super::Mode,
@@ -591,12 +590,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             qid: new_qid,
         };
 
-        let fd = self.litebox.descriptor_table_mut().insert(descriptor);
+        let fd = dt.write().insert(descriptor);
         Ok(fd)
     }
 
-    fn close(&self, fd: &FileFd<Platform, T>) -> Result<(), super::errors::CloseError> {
-        let entry = self.litebox.descriptor_table_mut().remove(fd);
+    fn close(&self, dt: &crate::fd::DescriptorTable<Platform>, fd: &FileFd<Platform, T>) -> Result<(), super::errors::CloseError> {
+        let entry = dt.write().remove(fd);
         if let Some(entry) = entry {
             let _ = self.client.clunk(entry.entry.fid);
         }
@@ -605,15 +604,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
     fn read(
         &self,
+        dt: &crate::fd::DescriptorTable<Platform>,
         fd: &FileFd<Platform, T>,
         buf: &mut [u8],
         offset: Option<usize>,
     ) -> Result<usize, super::errors::ReadError> {
         // Extract fid and current offset, releasing the descriptor table lock
         // before performing potentially blocking I/O.
-        let (fid, current_offset) = self
-            .litebox
-            .descriptor_table()
+        let (fid, current_offset) = dt
+            .read()
             .with_entry(fd, |desc| {
                 (desc.entry.fid, desc.entry.offset.load(Ordering::SeqCst))
             })
@@ -628,7 +627,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
         // Update offset if not using explicit offset
         if offset.is_none() {
-            self.litebox.descriptor_table().with_entry(fd, |desc| {
+            dt.read().with_entry(fd, |desc| {
                 desc.entry.offset.fetch_add(bytes_read, Ordering::SeqCst);
             });
         }
@@ -638,15 +637,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
     fn write(
         &self,
+        dt: &crate::fd::DescriptorTable<Platform>,
         fd: &FileFd<Platform, T>,
         buf: &[u8],
         offset: Option<usize>,
     ) -> Result<usize, super::errors::WriteError> {
         // Extract fid and current offset, releasing the descriptor table lock
         // before performing potentially blocking I/O.
-        let (fid, current_offset) = self
-            .litebox
-            .descriptor_table()
+        let (fid, current_offset) = dt
+            .read()
             .with_entry(fd, |desc| {
                 (desc.entry.fid, desc.entry.offset.load(Ordering::SeqCst))
             })
@@ -661,7 +660,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
         // Update offset if not using explicit offset
         if offset.is_none() {
-            self.litebox.descriptor_table().with_entry(fd, |desc| {
+            dt.read().with_entry(fd, |desc| {
                 desc.entry.offset.fetch_add(bytes_written, Ordering::SeqCst);
             });
         }
@@ -671,15 +670,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
     fn seek(
         &self,
+        dt: &crate::fd::DescriptorTable<Platform>,
         fd: &FileFd<Platform, T>,
         offset: isize,
         whence: super::SeekWhence,
     ) -> Result<usize, SeekError> {
         // Extract fid and current offset, releasing the descriptor table lock
         // before performing potentially blocking I/O (getattr for SeekWhence::RelativeToEnd).
-        let (fid, current_offset) = self
-            .litebox
-            .descriptor_table()
+        let (fid, current_offset) = dt
+            .read()
             .with_entry(fd, |desc| {
                 (desc.entry.fid, desc.entry.offset.load(Ordering::SeqCst))
             })
@@ -697,7 +696,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             .checked_add_signed(offset)
             .ok_or(SeekError::InvalidOffset)?;
 
-        self.litebox.descriptor_table().with_entry(fd, |desc| {
+        dt.read().with_entry(fd, |desc| {
             desc.entry.offset.store(new_offset, Ordering::SeqCst);
         });
         Ok(new_offset)
@@ -705,15 +704,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
     fn truncate(
         &self,
+        dt: &crate::fd::DescriptorTable<Platform>,
         fd: &FileFd<Platform, T>,
         length: usize,
         reset_offset: bool,
     ) -> Result<(), super::errors::TruncateError> {
         // Extract fid and qid, releasing the descriptor table lock
         // before performing potentially blocking I/O.
-        let (fid, qid) = self
-            .litebox
-            .descriptor_table()
+        let (fid, qid) = dt
+            .read()
             .with_entry(fd, |desc| (desc.entry.fid, desc.entry.qid))
             .ok_or(super::errors::TruncateError::ClosedFd)?;
 
@@ -732,7 +731,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         self.client.setattr(fid, fcall::SetattrMask::SIZE, stat)?;
 
         if reset_offset {
-            self.litebox.descriptor_table().with_entry(fd, |desc| {
+            dt.read().with_entry(fd, |desc| {
                 desc.entry.offset.store(0, Ordering::SeqCst);
             });
         }
@@ -742,6 +741,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
     fn chmod(
         &self,
+        _dt: &crate::fd::DescriptorTable<Platform>,
         path: impl crate::path::Arg,
         mode: super::Mode,
     ) -> Result<(), super::errors::ChmodError> {
@@ -761,6 +761,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
     fn chown(
         &self,
+        _dt: &crate::fd::DescriptorTable<Platform>,
         path: impl crate::path::Arg,
         user: Option<u16>,
         group: Option<u16>,
@@ -795,12 +796,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         result.map_err(ChownError::from)
     }
 
-    fn unlink(&self, path: impl crate::path::Arg) -> Result<(), super::errors::UnlinkError> {
+    fn unlink(&self, _dt: &crate::fd::DescriptorTable<Platform>, path: impl crate::path::Arg) -> Result<(), super::errors::UnlinkError> {
         self.remove_file_or_dir(path, true)
             .map_err(UnlinkError::from)
     }
 
-    fn mkdir(&self, path: impl crate::path::Arg, mode: super::Mode) -> Result<(), MkdirError> {
+    fn mkdir(&self, _dt: &crate::fd::DescriptorTable<Platform>, path: impl crate::path::Arg, mode: super::Mode) -> Result<(), MkdirError> {
         let path = self.absolute_path(path)?;
 
         let (parent_fid, name) = self.walk_to_parent(&path)?;
@@ -811,20 +812,20 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         result.map(|_| ()).map_err(MkdirError::from)
     }
 
-    fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), RmdirError> {
+    fn rmdir(&self, _dt: &crate::fd::DescriptorTable<Platform>, path: impl crate::path::Arg) -> Result<(), RmdirError> {
         self.remove_file_or_dir(path, false)
             .map_err(RmdirError::from)
     }
 
     fn read_dir(
         &self,
+        dt: &crate::fd::DescriptorTable<Platform>,
         fd: &FileFd<Platform, T>,
     ) -> Result<Vec<crate::fs::DirEntry>, super::errors::ReadDirError> {
         // Extract fid and qid, releasing the descriptor table lock
         // before performing potentially blocking I/O.
-        let (fid, qid) = self
-            .litebox
-            .descriptor_table()
+        let (fid, qid) = dt
+            .read()
             .with_entry(fd, |desc| (desc.entry.fid, desc.entry.qid))
             .ok_or(super::errors::ReadDirError::ClosedFd)?;
 
@@ -861,6 +862,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
     fn file_status(
         &self,
+        _dt: &crate::fd::DescriptorTable<Platform>,
         path: impl crate::path::Arg,
     ) -> Result<super::FileStatus, FileStatusError> {
         let path = self.absolute_path(path)?;
@@ -876,13 +878,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
     fn fd_file_status(
         &self,
+        dt: &crate::fd::DescriptorTable<Platform>,
         fd: &FileFd<Platform, T>,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
         // Extract fid, releasing the descriptor table lock
         // before performing potentially blocking I/O.
-        let fid = self
-            .litebox
-            .descriptor_table()
+        let fid = dt
+            .read()
             .with_entry(fd, |desc| desc.entry.fid)
             .ok_or(super::errors::FileStatusError::ClosedFd)?;
 

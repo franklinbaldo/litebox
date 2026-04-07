@@ -2826,6 +2826,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
         let mut cq = Self::base_cq(entry);
         let thread_slot = entry.thread_slot;
 
+        // DEBUG: log execve path
         // Compute a normalized path string for tar shmem lookup.
         let main_path_str_for_lookup = {
             let pb = if path_bytes.last() == Some(&0) {

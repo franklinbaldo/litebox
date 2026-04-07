@@ -3,7 +3,8 @@
 
 //! File-system related functionality
 
-use crate::fd::{FdEnabledSubsystem, TypedFd};
+use crate::fd::{DescriptorTable, FdEnabledSubsystem, TypedFd};
+use crate::sync;
 use crate::path;
 
 use alloc::vec::Vec;
@@ -44,11 +45,15 @@ mod private {
 /// However, users of any of these file systems might find benefit in having most of their code
 /// depend on this trait, rather than on any individual file system.
 pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
+    /// The platform type, used to parameterize the [`DescriptorTable`] passed to fd-based methods.
+    type Platform: sync::RawSyncPrimitivesProvider;
+
     /// Opens a file
     ///
     /// The `mode` is only significant when creating a file
     fn open(
         &self,
+        dt: &DescriptorTable<Self::Platform>,
         path: impl path::Arg,
         flags: OFlags,
         mode: Mode,
@@ -57,7 +62,7 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// Close the file at `fd`.
     ///
     /// Future operations on the `fd` will start to return `ClosedFd` errors.
-    fn close(&self, fd: &TypedFd<Self>) -> Result<(), CloseError>;
+    fn close(&self, dt: &DescriptorTable<Self::Platform>, fd: &TypedFd<Self>) -> Result<(), CloseError>;
 
     /// Read from a file descriptor at `offset` into a buffer
     ///
@@ -66,6 +71,7 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// If `offset` is Some, the file offset is not changed.
     fn read(
         &self,
+        dt: &DescriptorTable<Self::Platform>,
         fd: &TypedFd<Self>,
         buf: &mut [u8],
         offset: Option<usize>,
@@ -78,6 +84,7 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// If `offset` is Some, the file offset is not changed.
     fn write(
         &self,
+        dt: &DescriptorTable<Self::Platform>,
         fd: &TypedFd<Self>,
         buf: &[u8],
         offset: Option<usize>,
@@ -88,6 +95,7 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// Returns the resulting offset (in bytes from start of file) on success.
     fn seek(
         &self,
+        dt: &DescriptorTable<Self::Platform>,
         fd: &TypedFd<Self>,
         offset: isize,
         whence: SeekWhence,
@@ -101,41 +109,43 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// If `reset_offset` is true, the offset is reset to zero; otherwise, it remains unchanged.
     fn truncate(
         &self,
+        dt: &DescriptorTable<Self::Platform>,
         fd: &TypedFd<Self>,
         length: usize,
         reset_offset: bool,
     ) -> Result<(), TruncateError>;
 
     /// Change the permissions of a file
-    fn chmod(&self, path: impl path::Arg, mode: Mode) -> Result<(), ChmodError>;
+    fn chmod(&self, dt: &DescriptorTable<Self::Platform>, path: impl path::Arg, mode: Mode) -> Result<(), ChmodError>;
 
     /// Change the owner of a file
     fn chown(
         &self,
+        dt: &DescriptorTable<Self::Platform>,
         path: impl path::Arg,
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError>;
 
     /// Unlink a file
-    fn unlink(&self, path: impl path::Arg) -> Result<(), UnlinkError>;
+    fn unlink(&self, dt: &DescriptorTable<Self::Platform>, path: impl path::Arg) -> Result<(), UnlinkError>;
 
     /// Create a new directory
-    fn mkdir(&self, path: impl path::Arg, mode: Mode) -> Result<(), MkdirError>;
+    fn mkdir(&self, dt: &DescriptorTable<Self::Platform>, path: impl path::Arg, mode: Mode) -> Result<(), MkdirError>;
 
     /// Remove a directory
-    fn rmdir(&self, path: impl path::Arg) -> Result<(), RmdirError>;
+    fn rmdir(&self, dt: &DescriptorTable<Self::Platform>, path: impl path::Arg) -> Result<(), RmdirError>;
 
     /// Read directory entries from a directory file descriptor.
     ///
     /// Returns a list of file/directory names (explicitly _not_ including `.` or `..`).
-    fn read_dir(&self, fd: &TypedFd<Self>) -> Result<Vec<DirEntry>, ReadDirError>;
+    fn read_dir(&self, dt: &DescriptorTable<Self::Platform>, fd: &TypedFd<Self>) -> Result<Vec<DirEntry>, ReadDirError>;
 
     /// Obtain the status of a file/directory/... on the file-system.
-    fn file_status(&self, path: impl path::Arg) -> Result<FileStatus, FileStatusError>;
+    fn file_status(&self, dt: &DescriptorTable<Self::Platform>, path: impl path::Arg) -> Result<FileStatus, FileStatusError>;
 
     /// Equivalent to [`Self::file_status`], but open an open `fd` instead.
-    fn fd_file_status(&self, fd: &TypedFd<Self>) -> Result<FileStatus, FileStatusError>;
+    fn fd_file_status(&self, dt: &DescriptorTable<Self::Platform>, fd: &TypedFd<Self>) -> Result<FileStatus, FileStatusError>;
 
     /// Get static backing data for a file, if available and supported.
     ///
@@ -144,7 +154,30 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     ///
     /// Returns `None` if indicating no static backing data is available/supported.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
-    fn get_static_backing_data(&self, fd: &TypedFd<Self>) -> Option<&'static [u8]> {
+    fn get_static_backing_data(&self, dt: &DescriptorTable<Self::Platform>, fd: &TypedFd<Self>) -> Option<&'static [u8]> {
+        None
+    }
+
+    /// Re-open a file descriptor in a different descriptor table during fork.
+    ///
+    /// Some filesystem implementations store inner `TypedFd` values inside their
+    /// descriptor entries that index into the descriptor table that was current
+    /// when the file was originally opened. When forking, those inner fds become
+    /// invalid if the entry is shared via `insert_shared` because they index into
+    /// the parent's table, not the child's.
+    ///
+    /// This method allows the FS to re-open the file fresh in `dst_dt` so that
+    /// all inner fds are valid in the child's table.
+    ///
+    /// Returns `Some(new_fd)` if the FS handled the re-open, or `None` to fall
+    /// back to the default `insert_shared` behavior.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn reopen_in_fork(
+        &self,
+        src_dt: &DescriptorTable<Self::Platform>,
+        dst_dt: &DescriptorTable<Self::Platform>,
+        fd: &TypedFd<Self>,
+    ) -> Option<TypedFd<Self>> {
         None
     }
 }

@@ -20,7 +20,7 @@ use litebox::{
         polling::{Pollee, TryOpError},
         wait::WaitContext,
     },
-    fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry},
+    fd::{DescriptorTable, FdEnabledSubsystem, FdEnabledSubsystemEntry},
     fs::{Mode, OFlags, errors::OpenError},
     sync::{Mutex, RwLock},
     utils::TruncateExt as _,
@@ -31,7 +31,7 @@ use litebox_common_linux::{
 };
 
 use crate::{
-    ConstPtr, FileFd, GlobalState, MutPtr, ShimFS, Task,
+    ConstPtr, FileFd, GlobalState, MutPtr, Platform, ShimFS, Task,
     channel::{Channel, ReadEnd, WriteEnd},
     syscalls::net::{SocketOptionValue, SocketOptions},
 };
@@ -69,7 +69,7 @@ pub(crate) enum UnixSocketAddr {
 /// the socket file remains accessible. The file is automatically closed
 /// when this structure is dropped.
 enum UnixBoundSocketAddr<FS: ShimFS> {
-    Path((String, FileFd<FS>, Arc<FS>)),
+    Path((String, FileFd<FS>, Arc<FS>, DescriptorTable<Platform>)),
     Abstract(Vec<u8>),
 }
 
@@ -116,11 +116,11 @@ impl UnixSocketAddr {
                     OFlags::RDWR
                 };
                 // TODO: extend fs to support creating sock file (i.e., with type `InodeType::Socket`)
-                let file = task
-                    .files
-                    .borrow()
+                let files = task.files.borrow();
+                let file = files
                     .fs
                     .open(
+                        &files.dt,
                         path.as_str(),
                         flags,
                         Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
@@ -129,10 +129,14 @@ impl UnixSocketAddr {
                         OpenError::AlreadyExists => Errno::EADDRINUSE,
                         other => Errno::from(other),
                     })?;
+                let dt = files.dt.clone();
+                let fs = files.fs.clone();
+                drop(files);
                 Ok(UnixBoundSocketAddr::Path((
                     path,
                     file,
-                    task.files.borrow().fs.clone(),
+                    fs,
+                    dt,
                 )))
             }
             UnixSocketAddr::Abstract(data) => {
@@ -168,8 +172,8 @@ impl<FS: ShimFS> UnixBoundSocketAddr<FS> {
 impl<FS: ShimFS> Drop for UnixBoundSocketAddr<FS> {
     fn drop(&mut self) {
         match self {
-            Self::Path((_, file, fs)) => {
-                let _ = fs.close(file);
+            Self::Path((_, file, fs, dt)) => {
+                let _ = fs.close(dt, file);
             }
             Self::Abstract(_) => {}
         }

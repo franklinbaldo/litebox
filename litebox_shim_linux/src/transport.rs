@@ -64,6 +64,7 @@ impl ShimTransport {
     /// spin-polling when the operation cannot complete immediately.
     pub(crate) fn connect<FS: ShimFS>(
         global: Arc<GlobalState<FS>>,
+        dt: &litebox::fd::DescriptorTable<crate::Platform>,
         net: Arc<litebox::sync::Mutex<crate::Platform, litebox::net::Network<crate::Platform>>>,
         addr: core::net::SocketAddr,
     ) -> Result<Self, Errno> {
@@ -74,7 +75,7 @@ impl ShimTransport {
             .map_err(Errno::from)?;
 
         // 2. Initialise metadata / proxy in the litebox descriptor table.
-        let proxy = global.initialize_socket(&net, &sockfd, SockType::Stream, SockFlags::empty());
+        let proxy = global.initialize_socket(dt, &net, &sockfd, SockType::Stream, SockFlags::empty());
 
         // 3. Initiate the TCP connection.
         let mut check_progress = false;
@@ -266,7 +267,7 @@ mod tests {
         server: &DiodServer,
     ) -> nine_p::FileSystem<crate::Platform, ShimTransport> {
         let addr = socket_addr([10, 0, 0, 1], server.port);
-        let transport = ShimTransport::connect(task.global.clone(), task.net.clone(), addr)
+        let transport = ShimTransport::connect(task.global.clone(), &task.dt(), task.net.clone(), addr)
             .expect("failed to connect to 9P server via shim network");
 
         let aname = server.export_path().to_str().unwrap();
@@ -274,7 +275,7 @@ mod tests {
             .or_else(|_| std::env::var("LOGNAME"))
             .unwrap_or_else(|_| std::string::String::from("nobody"));
 
-        nine_p::FileSystem::new(&task.global.litebox, transport, 65536, &username, aname)
+        nine_p::FileSystem::new(&task.dt(), transport, 65536, &username, aname)
             .expect("failed to create 9P filesystem")
     }
 

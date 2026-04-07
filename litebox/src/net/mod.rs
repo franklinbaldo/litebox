@@ -12,7 +12,7 @@ use crate::event::Events;
 use crate::net::socket_channel::NetworkProxy;
 use crate::platform::{Instant, TimeProvider};
 use crate::sync::RawSyncPrimitivesProvider;
-use crate::{LiteBox, platform, sync};
+use crate::{fd::DescriptorTable, platform, sync};
 
 use bitflags::bitflags;
 use smoltcp::socket::{icmp, raw, tcp, udp};
@@ -73,7 +73,7 @@ where
     /// table entries so that iteration methods only process sockets belonging
     /// to this instance.
     id: u64,
-    litebox: LiteBox<Platform>,
+    dt: DescriptorTable<Platform>,
     /// The set of sockets
     socket_set: smoltcp::iface::SocketSet<'static>,
     /// The actual "physical" device, that connects to the platform
@@ -106,8 +106,8 @@ where
     /// This function is expected to only be invoked once per platform, as an initialization step,
     /// and the created `Network` handle is expected to be shared across all usage over the
     /// system.
-    pub fn new(litebox: &LiteBox<Platform>) -> Self {
-        let mut device = phy::Device::new(litebox.x.platform);
+    pub fn new(platform: &'static Platform, dt: &DescriptorTable<Platform>) -> Self {
+        let mut device = phy::Device::new(platform);
         let config = smoltcp::iface::Config::new(smoltcp::wire::HardwareAddress::Ip);
         let mut interface =
             smoltcp::iface::Interface::new(config, &mut device, smoltcp::time::Instant::ZERO);
@@ -129,11 +129,11 @@ where
         }
         Self {
             id: NEXT_NETWORK_ID.fetch_add(1, Ordering::Relaxed),
-            litebox: litebox.clone(),
+            dt: alloc::sync::Arc::clone(dt),
             socket_set: smoltcp::iface::SocketSet::new(vec![]),
             device,
             interface,
-            zero_time: litebox.x.platform.now(),
+            zero_time: platform.now(),
             local_port_allocator: LocalPortAllocator::new(),
             platform_interaction: PlatformInteraction::Automatic,
             queued_for_closure: vec![],
@@ -550,7 +550,7 @@ where
     /// Close all finished sockets that are marked as closed but waiting for pending data to be sent
     fn close_pending_sockets(&mut self) {
         let my_id = self.id;
-        let table = self.litebox.descriptor_table();
+        let table = self.dt.read();
         for (_, mut handle) in table.iter_mut::<Network<Platform>>() {
             if handle.entry.network_id != my_id {
                 continue;
@@ -604,7 +604,7 @@ where
     fn drain_all_socket_channel_buffers(&mut self) {
         let now = self.now();
         let my_id = self.id;
-        let table = self.litebox.descriptor_table();
+        let table = self.dt.read();
         for (_, entry) in table.iter::<Network<Platform>>() {
             if entry.entry.network_id != my_id {
                 continue;
@@ -1073,7 +1073,7 @@ where
 
     /// Creates a new [`SocketFd`] for a newly-created [`SocketHandle`].
     fn new_socket_fd_for(&mut self, socket_handle: SocketHandle<Platform>) -> SocketFd<Platform> {
-        self.litebox.descriptor_table_mut().insert(socket_handle)
+        self.dt.write().insert(socket_handle)
     }
 
     /// Set the shmem header pointer on the most recently accepted socket.
@@ -1099,7 +1099,7 @@ where
         let Some(smoltcp_handle) = self.last_accepted_smoltcp_handle.take() else {
             return false;
         };
-        let table = self.litebox.descriptor_table();
+        let table = self.dt.read();
         for (_, mut entry) in table.iter_mut::<Network<Platform>>() {
             if entry.entry.network_id == self.id && entry.entry.handle == smoltcp_handle {
                 // Drain any data that the HeapRb path accumulated before the
@@ -1129,7 +1129,7 @@ where
     /// The caller (net-worker) uses these to futex-wake blocked
     /// readers/writers in the guest after each poll cycle.
     pub fn active_shmem_headers(&self) -> Vec<*mut litebox_ipc::socket_ring::ShmemSocketHeader> {
-        let table = self.litebox.descriptor_table();
+        let table = self.dt.read();
         let mut headers = Vec::new();
         for (_, entry) in table.iter::<Network<Platform>>() {
             if entry.entry.network_id != self.id {
@@ -1157,7 +1157,7 @@ where
         fd: &SocketFd<Platform>,
         proxy: alloc::sync::Arc<NetworkProxy<Platform>>,
     ) -> bool {
-        let descriptor_table = self.litebox.descriptor_table();
+        let descriptor_table = self.dt.read();
         let Some(mut table_entry) = descriptor_table.get_entry_mut(fd) else {
             return false;
         };
@@ -1172,7 +1172,7 @@ where
         fd: &SocketFd<Platform>,
         behavior: CloseBehavior,
     ) -> Result<(), CloseError> {
-        let mut dt = self.litebox.descriptor_table_mut();
+        let mut dt = self.dt.write();
         // We close immediately if we can
         match dt
             .close_and_duplicate_if_shared(fd, |entry| {
@@ -1245,7 +1245,7 @@ where
             // fast path
             return false;
         }
-        let mut dt = self.litebox.descriptor_table_mut();
+        let mut dt = self.dt.write();
         let entries = dt.drain_entries_full_covered_by(&mut self.queued_for_closure);
         drop(dt);
         if entries.is_empty() {
@@ -1346,7 +1346,7 @@ where
     ) -> Result<(), errors::ShutdownError> {
         // First pass: update the proxy (channel-level shutdown + events).
         {
-            let dt = self.litebox.descriptor_table();
+            let dt = self.dt.read();
             let handle = dt
                 .entry_handle(fd)
                 .ok_or(errors::ShutdownError::InvalidFd)?;
@@ -1382,7 +1382,7 @@ where
         // false and the net-worker will never drain the remaining TX ring.
         if shut_wr {
             let smoltcp_handle_and_info = {
-                let dt = self.litebox.descriptor_table();
+                let dt = self.dt.read();
                 let handle = dt
                     .entry_handle(fd)
                     .ok_or(errors::ShutdownError::InvalidFd)?;
@@ -1440,7 +1440,7 @@ where
             return Err(ConnectError::UnsupportedAddress(*addr));
         };
 
-        let descriptor_table = self.litebox.descriptor_table();
+        let descriptor_table = self.dt.read();
         let mut table_entry = descriptor_table
             .get_entry_mut(fd)
             .ok_or(ConnectError::InvalidFd)?;
@@ -1541,7 +1541,7 @@ where
 
     /// Get the local address and port a socket is bound to.
     pub fn get_local_addr(&self, fd: &SocketFd<Platform>) -> Result<SocketAddr, LocalAddrError> {
-        let descriptor_table = self.litebox.descriptor_table();
+        let descriptor_table = self.dt.read();
         let mut table_entry = descriptor_table
             .get_entry_mut(fd)
             .ok_or(LocalAddrError::InvalidFd)?;
@@ -1579,7 +1579,7 @@ where
 
     /// Get the remote address and port a socket is connected to, if any.
     pub fn get_remote_addr(&self, fd: &SocketFd<Platform>) -> Result<SocketAddr, RemoteAddrError> {
-        let descriptor_table = self.litebox.descriptor_table();
+        let descriptor_table = self.dt.read();
         let mut table_entry = descriptor_table
             .get_entry_mut(fd)
             .ok_or(RemoteAddrError::InvalidFd)?;
@@ -1622,7 +1622,7 @@ where
             return Err(BindError::UnsupportedAddress(*socket_addr));
         };
 
-        let descriptor_table = self.litebox.descriptor_table();
+        let descriptor_table = self.dt.read();
         let mut table_entry = descriptor_table
             .get_entry_mut(fd)
             .ok_or(BindError::InvalidFd)?;
@@ -1691,7 +1691,7 @@ where
     /// the `fd` may grow. This function is allowed to silently cap the value to a reasonable upper
     /// bound.
     pub fn listen(&mut self, fd: &SocketFd<Platform>, backlog: u16) -> Result<(), ListenError> {
-        let descriptor_table = self.litebox.descriptor_table();
+        let descriptor_table = self.dt.read();
         let mut table_entry = descriptor_table
             .get_entry_mut(fd)
             .ok_or(ListenError::InvalidFd)?;
@@ -1786,7 +1786,7 @@ where
         peer: Option<&mut SocketAddr>,
     ) -> Result<SocketFd<Platform>, AcceptError> {
         self.automated_platform_interaction(PollDirection::Both);
-        let descriptor_table = self.litebox.descriptor_table();
+        let descriptor_table = self.dt.read();
         let mut table_entry = descriptor_table
             .get_entry_mut(fd)
             .ok_or(AcceptError::InvalidFd)?;
@@ -1881,7 +1881,7 @@ where
         flags: SendFlags,
         destination: Option<SocketAddr>,
     ) -> Result<usize, SendError> {
-        let descriptor_table = self.litebox.descriptor_table();
+        let descriptor_table = self.dt.read();
         let mut table_entry = descriptor_table
             .get_entry_mut(fd)
             .ok_or(SendError::InvalidFd)?;
@@ -1961,7 +1961,7 @@ where
         // doesn't hurt to do this too often (other than wasting energy), and this allows us to
         // possibly get packets where we might otherwise return with size 0 on the `receive`.
         self.automated_platform_interaction(PollDirection::Ingress);
-        let descriptor_table = self.litebox.descriptor_table();
+        let descriptor_table = self.dt.read();
         let mut table_entry = descriptor_table
             .get_entry_mut(fd)
             .ok_or(ReceiveError::InvalidFd)?;
@@ -2049,7 +2049,7 @@ where
         fd: &SocketFd<Platform>,
         data: TcpOptionData,
     ) -> Result<(), errors::SetTcpOptionError> {
-        let descriptor_table = self.litebox.descriptor_table();
+        let descriptor_table = self.dt.read();
         let mut table_entry = descriptor_table
             .get_entry_mut(fd)
             .ok_or(errors::SetTcpOptionError::InvalidFd)?;
@@ -2084,7 +2084,7 @@ where
         fd: &SocketFd<Platform>,
         name: TcpOptionName,
     ) -> Result<TcpOptionData, errors::GetTcpOptionError> {
-        let descriptor_table = self.litebox.descriptor_table();
+        let descriptor_table = self.dt.read();
         let mut table_entry = descriptor_table
             .get_entry_mut(fd)
             .ok_or(errors::GetTcpOptionError::InvalidFd)?;
@@ -2238,7 +2238,7 @@ where
     /// to still discover them for future forks.
     pub fn close_listening_smoltcp_sockets(&mut self) {
         let my_id = self.id;
-        let table = self.litebox.descriptor_table();
+        let table = self.dt.read();
         for (_, mut handle) in table.iter_mut::<Network<Platform>>() {
             if handle.entry.network_id != my_id {
                 continue;
@@ -2274,7 +2274,7 @@ where
     /// re-created in the child's fresh [`Network`] instance.
     pub fn listening_tcp_sockets(&self) -> Vec<ListeningSocketInfo> {
         let my_id = self.id;
-        let descriptor_table = self.litebox.descriptor_table();
+        let descriptor_table = self.dt.read();
         let mut listeners = Vec::new();
         for (_internal_fd, entry) in descriptor_table.iter::<Network<Platform>>() {
             if entry.entry.network_id != my_id {
@@ -2350,7 +2350,7 @@ where
     /// socket and a set backlog (i.e., `listen()` has been called on it).
     /// Returns `None` otherwise.
     pub fn listening_port(&self, fd: &SocketFd<Platform>) -> Option<u16> {
-        let descriptor_table = self.litebox.descriptor_table();
+        let descriptor_table = self.dt.read();
         descriptor_table.with_entry(fd, |entry| {
             if let ProtocolSpecific::Tcp(tcp) = &entry.entry.specific
                 && let Some(server) = &tcp.server_socket

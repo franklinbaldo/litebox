@@ -5,10 +5,7 @@
 
 use alloc::sync::Arc;
 
-use crate::{
-    fd::Descriptors,
-    sync::{RawSyncPrimitivesProvider, RwLock},
-};
+use crate::sync::RawSyncPrimitivesProvider;
 
 /// A full LiteBox system.
 ///
@@ -18,6 +15,7 @@ use crate::{
 /// For now, we assume that synchronization support (and the ability to exit) is a hard requirement
 /// in every LiteBox based system. In the future, this may be relaxed. Other requirements from the
 /// platform are dependent on the particular subsystems.
+#[allow(dead_code)]
 pub struct LiteBox<Platform: RawSyncPrimitivesProvider> {
     pub(crate) x: Arc<LiteBoxX<Platform>>,
 }
@@ -65,10 +63,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         crate::sync::lock_tracing::LockTracker::init(platform);
 
         Self {
-            x: Arc::new(LiteBoxX {
-                platform,
-                descriptors: RwLock::new(Descriptors::new_from_litebox_creation()),
-            }),
+            x: Arc::new(LiteBoxX { platform }),
         }
     }
 }
@@ -77,35 +72,16 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// An explicitly-crate-internal clone method to prevent outside users from cloning the
     /// [`LiteBox`] object, which could cause confusion as to the intended use. External users must
     /// only create it via [`Self::new`].
+    #[allow(dead_code)]
     pub(crate) fn clone(&self) -> Self {
         Self {
             x: Arc::clone(&self.x),
         }
     }
-
-    /// Access to the file descriptor table.
-    ///
-    /// Note: this takes a lock, and thus should ideally not be held on to for too long to prevent
-    /// potential deadlocks.
-    pub fn descriptor_table(
-        &self,
-    ) -> impl core::ops::Deref<Target = Descriptors<Platform>> + use<'_, Platform> {
-        self.x.descriptors.read()
-    }
-
-    /// Mutable access to the file descriptor table.
-    ///
-    /// Note: this takes a lock, and thus should ideally not be held on to for too long to prevent
-    /// potential deadlocks.
-    pub fn descriptor_table_mut(
-        &self,
-    ) -> impl core::ops::DerefMut<Target = Descriptors<Platform>> + use<'_, Platform> {
-        self.x.descriptors.write()
-    }
 }
 
 /// The actual body of [`LiteBox`], containing any components that might be shared.
+#[allow(dead_code)]
 pub(crate) struct LiteBoxX<Platform: RawSyncPrimitivesProvider> {
     pub(crate) platform: &'static Platform,
-    descriptors: RwLock<Platform, Descriptors<Platform>>,
 }

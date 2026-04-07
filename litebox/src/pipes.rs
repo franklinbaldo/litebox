@@ -19,13 +19,13 @@ use ringbuf::{
 use thiserror::Error;
 
 use crate::{
-    LiteBox,
     event::{
         Events, IOPollable,
         observer::Observer,
         polling::{Pollee, TryOpError},
         wait::{WaitContext, WaitError},
     },
+    fd::DescriptorTable,
     fs::OFlags,
     platform::TimeProvider,
     sync::{Mutex, RawSyncPrimitivesProvider},
@@ -33,7 +33,13 @@ use crate::{
 
 /// Support for unidirectional communication channels
 pub struct Pipes<Platform: RawSyncPrimitivesProvider + TimeProvider> {
-    litebox: LiteBox<Platform>,
+    _phantom: core::marker::PhantomData<Platform>,
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Default for Pipes<Platform> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
@@ -41,9 +47,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     ///
     /// This function is expected to only be invoked once per platform, as an initialization step,
     /// and the created `Pipes` handle is expected to be shared across all usage over the system.
-    pub fn new(litebox: &LiteBox<Platform>) -> Self {
+    pub fn new() -> Self {
         Self {
-            litebox: litebox.clone(),
+            _phantom: core::marker::PhantomData,
         }
     }
 
@@ -62,6 +68,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     /// writes and might be interleaved with other writes.
     pub fn create_pipe(
         &self,
+        dt: &DescriptorTable<Platform>,
         capacity: usize,
         flags: Flags,
         atomic_slice_guarantee_size: Option<NonZeroUsize>,
@@ -70,7 +77,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
             new_pipe::<Platform, u8>(capacity, OFlags::from(flags), atomic_slice_guarantee_size);
         let sender = PipeEnd::Sender(sender);
         let receiver = PipeEnd::Receiver(receiver);
-        let mut dt = self.litebox.descriptor_table_mut();
+        let mut dt = dt.write();
         let sender = dt.insert(sender);
         let receiver = dt.insert(receiver);
         (sender, receiver)
@@ -79,8 +86,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     /// Close the pipe at `fd`.
     ///
     /// Future operations on the `fd` will start to return `ClosedFd` errors.
-    pub fn close(&self, fd: &PipeFd<Platform>) -> Result<(), errors::CloseError> {
-        self.litebox.descriptor_table_mut().remove(fd);
+    pub fn close(&self, dt: &DescriptorTable<Platform>, fd: &PipeFd<Platform>) -> Result<(), errors::CloseError> {
+        dt.write().remove(fd);
         // Shutdowns are taken care of automatically by the drop implementations
         Ok(())
     }
@@ -93,11 +100,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     /// change in the future to an explicit "peer has shut down" error.
     pub fn read(
         &self,
+        dt: &DescriptorTable<Platform>,
         cx: &WaitContext<'_, Platform>,
         fd: &PipeFd<Platform>,
         buf: &mut [u8],
     ) -> Result<usize, errors::ReadError> {
-        let dt = self.litebox.descriptor_table();
+        let dt = dt.read();
         let p = match &dt.get_entry(fd).ok_or(errors::ReadError::ClosedFd)?.entry {
             PipeEnd::Receiver(p) => Arc::clone(p),
             PipeEnd::Sender(_) => return Err(errors::ReadError::NotForReading),
@@ -111,11 +119,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     /// See [`Self::create_pipe`] for details on blocking and atomicity of writes.
     pub fn write(
         &self,
+        dt: &DescriptorTable<Platform>,
         cx: &WaitContext<'_, Platform>,
         fd: &PipeFd<Platform>,
         buf: &[u8],
     ) -> Result<usize, errors::WriteError> {
-        let dt = self.litebox.descriptor_table();
+        let dt = dt.read();
         let p = match &dt.get_entry(fd).ok_or(errors::WriteError::ClosedFd)?.entry {
             PipeEnd::Sender(p) => Arc::clone(p),
             PipeEnd::Receiver(_) => return Err(errors::WriteError::NotForWriting),
@@ -127,9 +136,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     /// Whether the provided FD points to a reader or a writer end.
     pub fn half_pipe_type(
         &self,
+        dt: &DescriptorTable<Platform>,
         fd: &PipeFd<Platform>,
     ) -> Result<HalfPipeType, errors::ClosedError> {
-        let dt = self.litebox.descriptor_table();
+        let dt = dt.read();
         match dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
             PipeEnd::Sender(_) => Ok(HalfPipeType::SenderHalf),
             PipeEnd::Receiver(_) => Ok(HalfPipeType::ReceiverHalf),
@@ -137,8 +147,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     }
 
     /// Get the flags set on the pipe at `fd`.
-    pub fn get_flags(&self, fd: &PipeFd<Platform>) -> Result<Flags, errors::ClosedError> {
-        let dt = self.litebox.descriptor_table();
+    pub fn get_flags(&self, dt: &DescriptorTable<Platform>, fd: &PipeFd<Platform>) -> Result<Flags, errors::ClosedError> {
+        let dt = dt.read();
         let oflags = match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
             PipeEnd::Receiver(p) => p.get_status(),
             PipeEnd::Sender(p) => p.get_status(),
@@ -151,11 +161,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     /// Specifically, sets the bits in the `mask` to `on`, leaving the others unchanged.
     pub fn update_flags(
         &self,
+        dt: &DescriptorTable<Platform>,
         fd: &PipeFd<Platform>,
         mask: Flags,
         on: bool,
     ) -> Result<(), errors::ClosedError> {
-        let dt = self.litebox.descriptor_table();
+        let dt = dt.read();
         match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
             PipeEnd::Receiver(p) => p.set_status(OFlags::from(mask), on),
             PipeEnd::Sender(p) => p.set_status(OFlags::from(mask), on),
@@ -166,10 +177,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     /// Perform `f` with the [`IOPollable`] associated with the pipe at `fd`.
     pub fn with_iopollable<R>(
         &self,
+        dt: &DescriptorTable<Platform>,
         fd: &PipeFd<Platform>,
         f: impl FnOnce(&dyn IOPollable) -> R,
     ) -> Result<R, errors::ClosedError> {
-        let dt = self.litebox.descriptor_table();
+        let dt = dt.read();
         match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
             PipeEnd::Receiver(p) => Ok(f(p)),
             PipeEnd::Sender(p) => Ok(f(p)),
@@ -632,10 +644,10 @@ mod tests {
     #[test]
     fn test_blocking_channel() {
         let platform = crate::platform::mock::MockPlatform::new();
-        let litebox = &crate::LiteBox::new(platform);
-        let pipes = &super::Pipes::new(litebox);
+        let dt = &crate::fd::new_descriptor_table::<crate::platform::mock::MockPlatform>();
+        let pipes = &super::Pipes::new();
 
-        let (prod, cons) = pipes.create_pipe(2, super::Flags::empty(), None);
+        let (prod, cons) = pipes.create_pipe(dt, 2, super::Flags::empty(), None);
 
         std::thread::scope(|scope| {
             scope.spawn(move || {
@@ -643,11 +655,11 @@ mod tests {
                 let mut i = 0;
                 while i < data.len() {
                     let ret = pipes
-                        .write(&WaitState::new(platform).context(), &prod, &data[i..])
+                        .write(dt, &WaitState::new(platform).context(), &prod, &data[i..])
                         .unwrap();
                     i += ret;
                 }
-                pipes.close(&prod).unwrap();
+                pipes.close(dt, &prod).unwrap();
                 assert_eq!(i, data.len());
             });
 
@@ -655,10 +667,10 @@ mod tests {
             let mut i = 0;
             loop {
                 let ret = pipes
-                    .read(&WaitState::new(platform).context(), &cons, &mut buf[i..])
+                    .read(dt, &WaitState::new(platform).context(), &cons, &mut buf[i..])
                     .unwrap();
                 if ret == 0 {
-                    pipes.close(&cons).unwrap();
+                    pipes.close(dt, &cons).unwrap();
                     break;
                 }
                 i += ret;
@@ -670,17 +682,17 @@ mod tests {
     #[test]
     fn test_nonblocking_channel() {
         let platform = crate::platform::mock::MockPlatform::new();
-        let litebox = &crate::LiteBox::new(platform);
-        let pipes = &super::Pipes::new(litebox);
+        let dt = &crate::fd::new_descriptor_table::<crate::platform::mock::MockPlatform>();
+        let pipes = &super::Pipes::new();
 
-        let (prod, cons) = pipes.create_pipe(2, super::Flags::NON_BLOCKING, None);
+        let (prod, cons) = pipes.create_pipe(dt, 2, super::Flags::NON_BLOCKING, None);
 
         std::thread::scope(|scope| {
             scope.spawn(move || {
                 let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
                 let mut i = 0;
                 while i < data.len() {
-                    match pipes.write(&WaitState::new(platform).context(), &prod, &data[i..]) {
+                    match pipes.write(dt, &WaitState::new(platform).context(), &prod, &data[i..]) {
                         Ok(n) => {
                             i += n;
                         }
@@ -693,14 +705,14 @@ mod tests {
                         }
                     }
                 }
-                pipes.close(&prod).unwrap();
+                pipes.close(dt, &prod).unwrap();
                 assert_eq!(i, data.len());
             });
 
             let mut buf = [0; 10];
             let mut i = 0;
             loop {
-                match pipes.read(&WaitState::new(platform).context(), &cons, &mut buf[i..]) {
+                match pipes.read(dt, &WaitState::new(platform).context(), &cons, &mut buf[i..]) {
                     Ok(n) => {
                         if n == 0 {
                             break;
@@ -716,7 +728,7 @@ mod tests {
                     }
                 }
             }
-            pipes.close(&cons).unwrap();
+            pipes.close(dt, &cons).unwrap();
             assert_eq!(buf, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         });
     }

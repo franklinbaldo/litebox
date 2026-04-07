@@ -19,7 +19,6 @@ use linux::{
 };
 
 use crate::{
-    LiteBox,
     mm::linux::{NonZeroAddress, NonZeroPageSize, VmemResetError},
     platform::{
         PageManagementProvider, RawConstPointer,
@@ -41,8 +40,8 @@ where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
     /// Create a new `PageManager` instance.
-    pub fn new(litebox: &LiteBox<Platform>) -> Self {
-        let vmem = RwLock::new(linux::Vmem::new(litebox.x.platform));
+    pub fn new(platform: &'static Platform) -> Self {
+        let vmem = RwLock::new(linux::Vmem::new(platform));
         Self { vmem }
     }
 

@@ -91,15 +91,15 @@ fn bidi_tcp_comms(mut network: Network<MockPlatform>, comms: fn(&mut Network<Moc
 
 #[test]
 fn test_bidirectional_tcp_communication_default() {
-    let litebox = LiteBox::new(MockPlatform::new());
-    let network = Network::new(&litebox);
+    let dt = crate::fd::new_descriptor_table::<MockPlatform>();
+    let network = Network::new(MockPlatform::new(), &dt);
     bidi_tcp_comms(network, |_| {});
 }
 
 #[test]
 fn test_bidirectional_tcp_communication_manual() {
-    let litebox = LiteBox::new(MockPlatform::new());
-    let mut network = Network::new(&litebox);
+    let dt = crate::fd::new_descriptor_table::<MockPlatform>();
+    let mut network = Network::new(MockPlatform::new(), &dt);
     network.set_platform_interaction(PlatformInteraction::Manual);
     bidi_tcp_comms(network, |nw| {
         while nw.perform_platform_interaction().call_again_immediately() {}
@@ -108,16 +108,16 @@ fn test_bidirectional_tcp_communication_manual() {
 
 #[test]
 fn test_bidirectional_tcp_communication_automatic() {
-    let litebox = LiteBox::new(MockPlatform::new());
-    let mut network = Network::new(&litebox);
+    let dt = crate::fd::new_descriptor_table::<MockPlatform>();
+    let mut network = Network::new(MockPlatform::new(), &dt);
     network.set_platform_interaction(PlatformInteraction::Automatic);
     bidi_tcp_comms(network, |_| {});
 }
 
 #[test]
 fn test_accept_keeps_listener_readable_when_more_connections_are_ready() {
-    let litebox = LiteBox::new(MockPlatform::new());
-    let mut network = Network::new(&litebox);
+    let dt = crate::fd::new_descriptor_table::<MockPlatform>();
+    let mut network = Network::new(MockPlatform::new(), &dt);
     network.set_platform_interaction(PlatformInteraction::Manual);
 
     let listener_fd = network.socket(Protocol::Tcp).unwrap();
@@ -178,8 +178,8 @@ fn test_accept_keeps_listener_readable_when_more_connections_are_ready() {
 
 #[test]
 fn test_receive_reports_finished_after_peer_shutdown_write() {
-    let litebox = LiteBox::new(MockPlatform::new());
-    let mut network = Network::new(&litebox);
+    let dt = crate::fd::new_descriptor_table::<MockPlatform>();
+    let mut network = Network::new(MockPlatform::new(), &dt);
     network.set_platform_interaction(PlatformInteraction::Manual);
 
     let listener_fd = network.socket(Protocol::Tcp).unwrap();
@@ -224,8 +224,8 @@ fn test_receive_reports_finished_after_peer_shutdown_write() {
 
 #[test]
 fn test_accept_does_not_hand_out_socket_before_request_data_is_ready() {
-    let litebox = LiteBox::new(MockPlatform::new());
-    let mut network = Network::new(&litebox);
+    let dt = crate::fd::new_descriptor_table::<MockPlatform>();
+    let mut network = Network::new(MockPlatform::new(), &dt);
     network.set_platform_interaction(PlatformInteraction::Manual);
 
     let listener_fd = network.socket(Protocol::Tcp).unwrap();

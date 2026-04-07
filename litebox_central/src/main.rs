@@ -154,7 +154,8 @@ fn main() -> anyhow::Result<()> {
     // - devices provides /dev/stdin, /dev/stdout, /dev/stderr
     // - in_mem is the writable top layer for runtime state
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
-    let lb = shim_builder.litebox();
+    let dt = litebox::fd::new_descriptor_table();
+    let platform = shim_builder.platform();
 
     let tar_data: std::borrow::Cow<'static, [u8]> = if let Some(tar_fd) = args.tar_fd {
         let size = args.tar_size;
@@ -226,8 +227,8 @@ fn main() -> anyhow::Result<()> {
         (std::ptr::null_mut(), 0)
     };
 
-    let devices = litebox::fs::devices::FileSystem::new(lb);
-    let mut in_mem = litebox::fs::in_mem::FileSystem::new(lb);
+    let devices = litebox::fs::devices::FileSystem::new(platform);
+    let mut in_mem = litebox::fs::in_mem::FileSystem::new();
 
     // Create /tmp on the in-memory layer so guest programs can write
     // temporary files (e.g. fstime benchmark's creat("/tmp/dummy0-...")).
@@ -238,17 +239,17 @@ fn main() -> anyhow::Result<()> {
     // current working directory (which starts at /).
     in_mem.with_root_privileges(|fs| {
         let mode = litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO;
-        if let Err(err) = fs.chmod("/", mode) {
+        if let Err(err) = fs.chmod(&dt, "/", mode) {
             eprintln!("litebox_central: failed to chmod /: {err:?}");
         }
-        if let Err(err) = fs.mkdir("/tmp", mode)
+        if let Err(err) = fs.mkdir(&dt, "/tmp", mode)
             && !matches!(err, litebox::fs::errors::MkdirError::AlreadyExists)
         {
             eprintln!("litebox_central: failed to create /tmp: {err:?}");
         }
     });
 
-    let tar_ro = litebox::fs::tar_ro::FileSystem::new(lb, tar_data);
+    let tar_ro = litebox::fs::tar_ro::FileSystem::new(tar_data);
 
     // Build a lookup table mapping tar paths to their byte ranges before
     // the tar_ro filesystem is moved into the layered FS.  This map is
@@ -288,13 +289,11 @@ fn main() -> anyhow::Result<()> {
     let aligned_file_map = std::sync::Arc::new(aligned_file_map);
 
     let inner = litebox::fs::layered::FileSystem::new(
-        lb,
         devices,
         tar_ro,
         litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
     );
     let fs = std::sync::Arc::new(litebox::fs::layered::FileSystem::new(
-        lb,
         in_mem,
         inner,
         litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
