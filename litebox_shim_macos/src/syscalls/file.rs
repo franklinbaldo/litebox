@@ -101,6 +101,28 @@ fn translate_open_flags(macos_flags: i32) -> OFlags {
     flags
 }
 
+/// Normalize a path by resolving `." and `.." components.
+fn normalize_path(path: &str) -> alloc::string::String {
+    let mut components = alloc::vec::Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            _ => components.push(part),
+        }
+    }
+    let mut result = alloc::string::String::from("/");
+    for (i, c) in components.iter().enumerate() {
+        if i > 0 {
+            result.push('/');
+        }
+        result.push_str(c);
+    }
+    result
+}
+
 impl<FS: ShimFS> Task<FS> {
     /// Handle `read(fd, buf, count)`.
     ///
@@ -355,6 +377,9 @@ impl<FS: ShimFS> Task<FS> {
             paths.remove(&raw_fd);
         }
 
+        // Remove from CLOEXEC tracking.
+        self.global.cloexec_fds.write().remove(&raw_fd);
+
         // Try filesystem first, then pipes.
         {
             let mut rds = self.global.raw_descriptors.write();
@@ -442,18 +467,63 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
+    /// Handle `chdir(path)` — change the current working directory.
+    pub(crate) fn sys_chdir(&self, path_addr: usize) -> Result<usize, Errno> {
+        let path_ptr: ConstPtr<u8> = ConstPtr::from_usize(path_addr);
+        let path = read_cstring_from_guest(path_ptr, 4096).ok_or(Errno::EFAULT)?;
+
+        // Resolve relative to current cwd
+        let resolved = if path.starts_with('/') {
+            path.clone()
+        } else {
+            let cwd = self.process.cwd.read().clone();
+            let mut full = cwd;
+            if !full.ends_with('/') {
+                full.push('/');
+            }
+            full.push_str(&path);
+            full
+        };
+
+        // Normalize path (handle . and ..)
+        let normalized = normalize_path(&resolved);
+
+        // Verify it exists and is a directory
+        let cpath = alloc::ffi::CString::new(normalized.as_bytes()).map_err(|_| Errno::EINVAL)?;
+        let status = self.global.fs.file_status(&cpath).map_err(|e| match e {
+            litebox::fs::errors::FileStatusError::PathError(ref pe) => {
+                use litebox::fs::errors::PathError;
+                match pe {
+                    PathError::NoSuchFileOrDirectory => Errno::ENOENT,
+                    PathError::ComponentNotADirectory => Errno::ENOTDIR,
+                    _ => Errno::EINVAL,
+                }
+            }
+            _ => Errno::EIO,
+        })?;
+
+        if status.file_type != litebox::fs::FileType::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+
+        *self.process.cwd.write() = normalized;
+        Ok(0)
+    }
+
     /// Handle `fchdir(fd)` — change working directory to the directory referenced by fd.
-    ///
-    /// In the macOS-on-macOS runner with an in-memory filesystem, we don't track
-    /// CWD state. Return success so that programs like `/bin/ls` that save/restore
-    /// CWD via fchdir don't fail.
     pub(crate) fn sys_fchdir(&self, fd: i32) -> Result<usize, Errno> {
-        // Verify the fd is valid.
         let raw_fd = fd_to_usize(fd)?;
-        let rds = self.global.raw_descriptors.read();
-        let _strong: crate::StrongFd<FS> = crate::StrongFd::from_raw(&rds, raw_fd)?;
-        drop(rds);
-        // No-op: in-mem FS does not track CWD.
+        // Look up the path for this fd
+        let paths = self.global.fd_paths.read();
+        let path = paths.get(&raw_fd).ok_or(Errno::EBADF)?.clone();
+        drop(paths);
+        // Verify it's a directory
+        let cpath = alloc::ffi::CString::new(path.as_bytes()).map_err(|_| Errno::EINVAL)?;
+        let status = self.global.fs.file_status(&cpath).map_err(|_| Errno::EBADF)?;
+        if status.file_type != litebox::fs::FileType::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        *self.process.cwd.write() = path;
         Ok(0)
     }
 
@@ -467,8 +537,24 @@ impl<FS: ShimFS> Task<FS> {
 
         let mut oflags = translate_open_flags(flags);
 
-        // Translate "." to "/" — the in-mem FS root, since we don't track CWD.
-        let effective_path = if path == "." { "/" } else { &path };
+        // Resolve relative paths against the current working directory.
+        let effective_path_owned;
+        let effective_path = if path.starts_with('/') {
+            &path
+        } else {
+            let cwd = self.process.cwd.read().clone();
+            effective_path_owned = if path == "." {
+                cwd
+            } else {
+                let mut full = cwd;
+                if !full.ends_with('/') {
+                    full.push('/');
+                }
+                full.push_str(&path);
+                normalize_path(&full)
+            };
+            &effective_path_owned
+        };
         let cpath =
             alloc::ffi::CString::new(effective_path.as_bytes()).map_err(|_| Errno::EINVAL)?;
 
@@ -590,6 +676,35 @@ impl<FS: ShimFS> Task<FS> {
         Ok(size)
     }
 
+    /// Handle `pwrite(fd, buf, count, offset)` — write at offset without changing position.
+    pub(crate) fn sys_pwrite(
+        &self,
+        fd: i32,
+        buf_addr: usize,
+        count: usize,
+        offset: i64,
+    ) -> Result<usize, Errno> {
+        validate_guest_buf(buf_addr, count)?;
+        let raw_fd = fd_to_usize(fd)?;
+        let typed_fd = {
+            let rds = self.global.raw_descriptors.read();
+            rds.fd_from_raw_integer::<FS>(raw_fd)
+                .map_err(|_| Errno::EBADF)?
+        };
+
+        let user_buf: ConstPtr<u8> = ConstPtr::from_usize(buf_addr);
+        let write_len = count.min(MAX_KERNEL_BUF_SIZE);
+        let data = user_buf.to_owned_slice(write_len).ok_or(Errno::EFAULT)?;
+        let pos = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
+        let size = self
+            .global
+            .fs
+            .write(&typed_fd, &data, Some(pos))
+            .map_err(Self::write_error_to_errno)?;
+
+        Ok(size)
+    }
+
     /// Handle `fstat64(fd, buf)`.
     ///
     /// Writes a macOS `stat64` structure (144 bytes on aarch64) to guest memory.
@@ -663,6 +778,26 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_fcntl(&self, fd: i32, cmd: i32, arg: usize) -> Result<usize, Errno> {
         let raw_fd = fd_to_usize(fd)?;
         match cmd {
+            0 | 67 => {
+                // F_DUPFD (0) / F_DUPFD_CLOEXEC (67)
+                let cloexec = cmd == 67;
+                let new_fd = self.sys_dupfd(raw_fd, arg, cloexec)?;
+                Ok(new_fd)
+            }
+            1 => {
+                // F_GETFD: return file descriptor flags (FD_CLOEXEC).
+                let cloexec = self.global.cloexec_fds.read().contains(&raw_fd);
+                Ok(usize::from(cloexec))
+            }
+            2 => {
+                // F_SETFD: set file descriptor flags (FD_CLOEXEC = 1).
+                if arg & 1 != 0 {
+                    self.global.cloexec_fds.write().insert(raw_fd);
+                } else {
+                    self.global.cloexec_fds.write().remove(&raw_fd);
+                }
+                Ok(0)
+            }
             3 | 4 => Ok(0), // F_GETFL / F_SETFL
             50 => {
                 // F_GETPATH: write the file's path (NUL-terminated) to the
@@ -691,6 +826,12 @@ impl<FS: ShimFS> Task<FS> {
     /// Duplicates `oldfd` onto `newfd`. If `newfd` is already open, it is
     /// silently closed first. If `oldfd == newfd`, just validates oldfd and
     /// returns it.
+    /// Handle `dup(fd)` — duplicate fd to lowest available descriptor.
+    pub(crate) fn sys_dup(&self, fd: i32) -> Result<usize, Errno> {
+        let raw_fd = fd_to_usize(fd)?;
+        self.sys_dupfd(raw_fd, 0, false)
+    }
+
     pub(crate) fn sys_dup2(&self, oldfd: i32, newfd: i32) -> Result<usize, Errno> {
         let raw_oldfd = fd_to_usize(oldfd)?;
         let raw_newfd = fd_to_usize(newfd)?;
@@ -779,6 +920,71 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         Ok(raw_newfd)
+    }
+
+    /// Duplicate `raw_fd` onto the lowest available fd >= `min_fd`,
+    /// optionally setting CLOEXEC on the new descriptor.
+    fn sys_dupfd(&self, raw_fd: usize, min_fd: usize, cloexec: bool) -> Result<usize, Errno> {
+        // Resolve the old fd to validate it exists.
+        let strong_fd: crate::StrongFd<FS> = {
+            let rds = self.global.raw_descriptors.read();
+            crate::StrongFd::from_raw(&rds, raw_fd)?
+        };
+
+        // Duplicate the underlying descriptor.
+        let duplicated = match &strong_fd {
+            crate::StrongFd::FileSystem(typed_fd) => self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .duplicate(typed_fd)
+                .ok_or(Errno::EBADF)
+                .map(DuplicatedFd::FileSystem),
+            crate::StrongFd::Pipes(typed_fd) => self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .duplicate(typed_fd)
+                .ok_or(Errno::EBADF)
+                .map(DuplicatedFd::Pipes),
+            crate::StrongFd::Network(typed_fd) => self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .duplicate(typed_fd)
+                .ok_or(Errno::EBADF)
+                .map(DuplicatedFd::Network),
+        }?;
+
+        // Insert into the raw descriptor table.
+        let new_fd = {
+            let mut rds = self.global.raw_descriptors.write();
+            match duplicated {
+                DuplicatedFd::FileSystem(fd) => rds.fd_into_raw_integer(fd),
+                DuplicatedFd::Pipes(fd) => rds.fd_into_raw_integer(fd),
+                DuplicatedFd::Network(fd) => rds.fd_into_raw_integer(fd),
+            }
+        };
+
+        if new_fd < min_fd {
+            log_unsupported!(
+                "F_DUPFD: got fd {new_fd} but wanted >= {min_fd} (not yet supported)"
+            );
+        }
+
+        // Copy the path entry from raw_fd to new_fd for F_GETPATH support.
+        {
+            let mut paths = self.global.fd_paths.write();
+            if let Some(path) = paths.get(&raw_fd).cloned() {
+                paths.insert(new_fd, path);
+            }
+        }
+
+        if cloexec {
+            self.global.cloexec_fds.write().insert(new_fd);
+        }
+
+        Ok(new_fd)
     }
 
     /// Handle `stat64(path, buf)` — stat a file by path.

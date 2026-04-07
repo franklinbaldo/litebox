@@ -96,6 +96,12 @@ impl<FS: ShimFS> Task<FS> {
                 count,
                 offset,
             } => self.sys_pread(fd, buf, count, offset),
+            MacosSyscallRequest::Pwrite {
+                fd,
+                buf,
+                count,
+                offset,
+            } => self.sys_pwrite(fd, buf, count, offset),
             MacosSyscallRequest::Csops {
                 pid,
                 ops,
@@ -121,6 +127,7 @@ impl<FS: ShimFS> Task<FS> {
             MacosSyscallRequest::MachTrap { number } => self.do_mach_trap(number, ctx),
             MacosSyscallRequest::CrossarchTrap | MacosSyscallRequest::KdebugTraceString => Ok(0),
             MacosSyscallRequest::Csrctl => Err(Errno::EPERM),
+            MacosSyscallRequest::Dup { fd } => self.sys_dup(fd),
             MacosSyscallRequest::Dup2 { oldfd, newfd } => self.sys_dup2(oldfd, newfd),
             MacosSyscallRequest::MacSyscall => Err(Errno::ENOSYS),
             MacosSyscallRequest::Fsctl => Err(Errno::ENOTTY),
@@ -156,6 +163,8 @@ impl<FS: ShimFS> Task<FS> {
                 self.sys_exit(1);
                 Ok(0)
             }
+            MacosSyscallRequest::ClockGettime { clock_id, tp } => self.sys_clock_gettime(clock_id, tp),
+            MacosSyscallRequest::ClockGetres { clock_id, res } => self.sys_clock_getres(clock_id, res),
             MacosSyscallRequest::Gettimeofday { tv, tz } => self.sys_gettimeofday(tv, tz),
             MacosSyscallRequest::Readv { fd, iov, iovcnt } => self.sys_readv(fd, iov, iovcnt),
             MacosSyscallRequest::Writev { fd, iov, iovcnt } => self.sys_writev(fd, iov, iovcnt),
@@ -359,6 +368,7 @@ impl<FS: ShimFS> Task<FS> {
                 let _ = fd; // fd is validated but not used differently
                 self.sys_statfs64(0, buf) // reuse statfs64 with fake values
             }
+            MacosSyscallRequest::Chdir { path } => self.sys_chdir(path),
             MacosSyscallRequest::Fchdir { fd } => self.sys_fchdir(fd),
             MacosSyscallRequest::ChangeFdguardNp { fd } => {
                 let _ = fd;

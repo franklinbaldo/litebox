@@ -136,9 +136,70 @@ impl<FS: ShimFS> Task<FS> {
         Err(Errno::ENOENT)
     }
 
-    /// Handle `ioctl()` — return ENOTTY for all requests.
-    pub(crate) fn sys_ioctl(&self, _fd: i32, _request: usize, _arg: usize) -> Result<usize, Errno> {
-        Err(Errno::ENOTTY)
+    /// Handle `ioctl(fd, request, arg)` — I/O control.
+    ///
+    /// Supports a minimal set of ioctl commands:
+    /// - FIONBIO (0x8004667e): set/clear non-blocking — stub, returns success
+    /// - TIOCGWINSZ (0x40087468): get terminal window size — returns 80x24 for stdio
+    /// - FIOCLEX (0x20006601): set close-on-exec — updates cloexec_fds
+    /// - TIOCGETA (0x40487413): get terminal attributes — stub for stdio
+    /// - TIOCSETA (0x80487414): set terminal attributes — stub for stdio
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn sys_ioctl(&self, fd: i32, request: usize, arg: usize) -> Result<usize, Errno> {
+        const FIONBIO: usize = 0x8004667e;
+        const TIOCGWINSZ: usize = 0x40087468;
+        const FIOCLEX: usize = 0x20006601;
+        const TIOCGETA: usize = 0x40487413;
+        const TIOCSETA: usize = 0x80487414;
+
+        // Validate fd
+        let raw_fd = crate::syscalls::file::fd_to_usize(fd)?;
+
+        match request {
+            FIONBIO => {
+                // Set/clear non-blocking I/O. Currently a no-op stub.
+                log_unsupported!("ioctl(fd={fd}, FIONBIO, arg={arg:#x}) → ok (stub)");
+                Ok(0)
+            }
+            TIOCGWINSZ => {
+                // Return 80x24 terminal size for stdio fds, ENOTTY for others.
+                if raw_fd > 2 {
+                    return Err(Errno::ENOTTY);
+                }
+                if arg == 0 {
+                    return Err(Errno::EFAULT);
+                }
+                // struct winsize: ws_row(u16), ws_col(u16), ws_xpixel(u16), ws_ypixel(u16)
+                let buf: MutPtr<u16> = MutPtr::from_usize(arg);
+                buf.write_at_offset(0, 24u16).ok_or(Errno::EFAULT)?; // ws_row
+                buf.write_at_offset(1, 80u16).ok_or(Errno::EFAULT)?; // ws_col
+                buf.write_at_offset(2, 0u16).ok_or(Errno::EFAULT)?;  // ws_xpixel
+                buf.write_at_offset(3, 0u16).ok_or(Errno::EFAULT)?;  // ws_ypixel
+                Ok(0)
+            }
+            FIOCLEX => {
+                // Set close-on-exec flag.
+                self.global.cloexec_fds.write().insert(raw_fd);
+                Ok(0)
+            }
+            TIOCGETA | TIOCSETA => {
+                // Get/set terminal attributes — stub for stdio fds.
+                if raw_fd > 2 {
+                    return Err(Errno::ENOTTY);
+                }
+                if request == TIOCGETA && arg != 0 {
+                    // Zero out the termios struct (72 bytes on macOS aarch64).
+                    let buf: MutPtr<u8> = MutPtr::from_usize(arg);
+                    let zeros = [0u8; 72];
+                    buf.copy_from_slice(0, &zeros).ok_or(Errno::EFAULT)?;
+                }
+                Ok(0)
+            }
+            _ => {
+                log_unsupported!("ioctl(fd={fd}, request={request:#x}, arg={arg:#x}) → ENOTTY");
+                Err(Errno::ENOTTY)
+            }
+        }
     }
 
     /// Handle `statfs64(path, buf)` — return a fake filesystem stat.

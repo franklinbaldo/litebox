@@ -159,6 +159,8 @@ struct Process {
     /// `mach_vm_deallocate` on thread stacks before `pthread_join` reads them.
     /// Contains (pthread_addr) for each live spawned thread.
     thread_pthreads: litebox::sync::Mutex<Platform, alloc::collections::BTreeSet<usize>>,
+    /// Current working directory.
+    cwd: litebox::sync::RwLock<Platform, alloc::string::String>,
 }
 
 impl Process {
@@ -203,6 +205,7 @@ impl Process {
                 litebox::sync::Mutex::new(lim)
             }),
             thread_pthreads: litebox::sync::Mutex::new(alloc::collections::BTreeSet::new()),
+            cwd: litebox::sync::RwLock::new(alloc::string::String::from("/")),
         }
     }
 }
@@ -385,6 +388,7 @@ impl<FS: ShimFS> MacosShimBuilder<FS> {
             litebox: self.litebox,
             raw_descriptors: litebox::sync::RwLock::new(RawDescriptorStorage::new()),
             fd_paths: litebox::sync::RwLock::new(BTreeMap::new()),
+            cloexec_fds: litebox::sync::RwLock::new(alloc::collections::BTreeSet::new()),
             unix_sockets: litebox::sync::RwLock::new(BTreeMap::new()),
             unix_addr_table: litebox::sync::RwLock::new(BTreeMap::new()),
             unix_fd_counter: AtomicUsize::new(0x1_0000),
@@ -1643,6 +1647,8 @@ struct GlobalState<FS: ShimFS> {
     raw_descriptors: litebox::sync::RwLock<Platform, RawDescriptorStorage>,
     /// Maps raw fd numbers to their open paths (for `F_GETPATH` support).
     fd_paths: litebox::sync::RwLock<Platform, BTreeMap<usize, String>>,
+    /// Tracks which file descriptors have FD_CLOEXEC set.
+    cloexec_fds: litebox::sync::RwLock<Platform, alloc::collections::BTreeSet<usize>>,
     /// Maps virtual fd numbers to Unix socket objects.
     unix_sockets: litebox::sync::RwLock<
         Platform,

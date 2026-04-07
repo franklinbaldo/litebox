@@ -136,6 +136,77 @@ impl<FS: ShimFS> Task<FS> {
         Ok(0)
     }
 
+    /// Handle `__clock_gettime(clock_id, tp)` — get time from specified clock.
+    ///
+    /// macOS clock IDs: CLOCK_REALTIME=0, CLOCK_MONOTONIC=6, CLOCK_MONOTONIC_RAW=4,
+    /// CLOCK_UPTIME_RAW=8, CLOCK_PROCESS_CPUTIME_ID=12, CLOCK_THREAD_CPUTIME_ID=16.
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    pub(crate) fn sys_clock_gettime(&self, clock_id: u32, tp_addr: usize) -> Result<usize, Errno> {
+        use crate::MutPtr;
+        use litebox::platform::{
+            Instant as _, RawConstPointer as _, RawMutPointer as _, SystemTime, TimeProvider,
+        };
+
+        let duration = match clock_id {
+            0 => {
+                // CLOCK_REALTIME — wall clock
+                let system_time = <_ as TimeProvider>::current_time(self.global.platform);
+                SystemTime::duration_since(
+                    &system_time,
+                    &<<crate::Platform as TimeProvider>::SystemTime as SystemTime>::UNIX_EPOCH,
+                )
+                .map_err(|_| Errno::EINVAL)?
+            }
+            4 | 6 | 8 => {
+                // CLOCK_MONOTONIC_RAW (4), CLOCK_MONOTONIC (6), CLOCK_UPTIME_RAW (8)
+                // All map to monotonic time since boot.
+                let now = self.global.platform.now();
+                now.duration_since(&self.global.boot_time)
+            }
+            12 | 16 => {
+                // CLOCK_PROCESS_CPUTIME_ID (12), CLOCK_THREAD_CPUTIME_ID (16)
+                // Approximate with monotonic time.
+                let now = self.global.platform.now();
+                now.duration_since(&self.global.boot_time)
+            }
+            _ => {
+                log_unsupported!("clock_gettime: unsupported clock_id={clock_id}");
+                return Err(Errno::EINVAL);
+            }
+        };
+
+        if tp_addr != 0 {
+            let sec_ptr: MutPtr<i64> = MutPtr::from_usize(tp_addr);
+            sec_ptr.write_at_offset(0, duration.as_secs() as i64).ok_or(Errno::EFAULT)?;
+            let nsec_ptr: MutPtr<i64> = MutPtr::from_usize(tp_addr + 8);
+            nsec_ptr.write_at_offset(0, i64::from(duration.subsec_nanos())).ok_or(Errno::EFAULT)?;
+        }
+        Ok(0)
+    }
+
+    /// Handle `__clock_getres(clock_id, res)` — get clock resolution.
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    pub(crate) fn sys_clock_getres(&self, clock_id: u32, res_addr: usize) -> Result<usize, Errno> {
+        use crate::MutPtr;
+        use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+
+        let resolution = match clock_id {
+            0 | 4 | 6 | 8 | 12 | 16 => core::time::Duration::from_nanos(1), // 1ns resolution
+            _ => {
+                log_unsupported!("clock_getres: unsupported clock_id={clock_id}");
+                return Err(Errno::EINVAL);
+            }
+        };
+
+        if res_addr != 0 {
+            let sec_ptr: MutPtr<i64> = MutPtr::from_usize(res_addr);
+            sec_ptr.write_at_offset(0, resolution.as_secs() as i64).ok_or(Errno::EFAULT)?;
+            let nsec_ptr: MutPtr<i64> = MutPtr::from_usize(res_addr + 8);
+            nsec_ptr.write_at_offset(0, i64::from(resolution.subsec_nanos())).ok_or(Errno::EFAULT)?;
+        }
+        Ok(0)
+    }
+
     /// Handle `execve(path, argv, envp)` (BSD syscall 59).
     ///
     /// Replaces the current process image with a new program:

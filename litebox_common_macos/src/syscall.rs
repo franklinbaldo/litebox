@@ -30,6 +30,7 @@ pub mod nr {
     pub const MADVISE: usize = 75;
     pub const FCNTL: usize = 92;
     pub const PREAD: usize = 153;
+    pub const PWRITE: usize = 154;
     pub const CSOPS: usize = 169;
     pub const MMAP: usize = 197;
     pub const LSEEK: usize = 199;
@@ -45,6 +46,7 @@ pub mod nr {
     pub const MACH_MSG2_TRAP: usize = 0x8000_0000;
     pub const GETENTROPY: usize = 500;
     pub const CROSSARCH_TRAP: usize = 38;
+    pub const DUP: usize = 41;
     pub const DUP2: usize = 90;
     pub const FSCTL: usize = 242;
     pub const MAC_SYSCALL: usize = 381;
@@ -64,6 +66,7 @@ pub mod nr {
     pub const BSDTHREAD_CTL: usize = 478;
     pub const SIGRETURN: usize = 184;
     pub const UNLINK: usize = 10;
+    pub const CHDIR: usize = 12;
     pub const ACCESS: usize = 33;
     pub const PIPE: usize = 42;
     pub const FCHMOD: usize = 124;
@@ -123,6 +126,8 @@ pub mod nr {
     pub const READLINKAT: usize = 473;
     pub const GETRLIMIT: usize = 194;
     pub const SETRLIMIT: usize = 195;
+    pub const CLOCK_GETTIME: usize = 232;
+    pub const CLOCK_GETRES: usize = 233;
 }
 
 /// Mach trap numbers (negative x16 values, stored as positive constants).
@@ -228,6 +233,12 @@ pub enum MacosSyscallRequest {
         count: usize,
         offset: i64,
     },
+    Pwrite {
+        fd: i32,
+        buf: usize,
+        count: usize,
+        offset: i64,
+    },
     Csops {
         pid: i32,
         ops: u32,
@@ -271,6 +282,8 @@ pub enum MacosSyscallRequest {
     },
     CrossarchTrap,
     Csrctl,
+    /// `dup(fd)` — duplicate a file descriptor.
+    Dup { fd: i32 },
     Dup2 {
         oldfd: i32,
         newfd: i32,
@@ -549,6 +562,10 @@ pub enum MacosSyscallRequest {
     Fchdir {
         fd: i32,
     },
+    /// `chdir(path)` — change working directory.
+    Chdir {
+        path: usize,
+    },
     /// `change_fdguard_np(fd, guard, guardflags, nguard, nguardflags, fdflagsp)` — change guard.
     ChangeFdguardNp {
         fd: i32,
@@ -641,6 +658,10 @@ pub enum MacosSyscallRequest {
         resource: u32,
         rlim: usize,
     },
+    /// `__clock_gettime(clock_id, tp)` — get time from specified clock.
+    ClockGettime { clock_id: u32, tp: usize },
+    /// `__clock_getres(clock_id, res)` — get clock resolution.
+    ClockGetres { clock_id: u32, res: usize },
     Unknown {
         number: usize,
     },
@@ -722,6 +743,12 @@ impl MacosSyscallRequest {
                 count: a2,
                 offset: a3 as i64,
             },
+            nr::PWRITE => MacosSyscallRequest::Pwrite {
+                fd: a0 as i32,
+                buf: a1,
+                count: a2,
+                offset: a3 as i64,
+            },
             nr::CSOPS => MacosSyscallRequest::Csops {
                 pid: a0 as i32,
                 ops: a1 as u32,
@@ -775,6 +802,7 @@ impl MacosSyscallRequest {
             },
             nr::CROSSARCH_TRAP => MacosSyscallRequest::CrossarchTrap,
             nr::CSRCTL => MacosSyscallRequest::Csrctl,
+            nr::DUP => MacosSyscallRequest::Dup { fd: a0 as i32 },
             nr::DUP2 => MacosSyscallRequest::Dup2 {
                 oldfd: a0 as i32,
                 newfd: a1 as i32,
@@ -1059,6 +1087,7 @@ impl MacosSyscallRequest {
                 fd: a0 as i32,
                 buf: a1,
             },
+            nr::CHDIR => MacosSyscallRequest::Chdir { path: a0 },
             nr::FCHDIR => MacosSyscallRequest::Fchdir { fd: a0 as i32 },
             // guarded variants — real syscall numbers (441, 442, 444, 485)
             nr::GUARDED_OPEN_NP => MacosSyscallRequest::GuardedOpenNp {
@@ -1108,6 +1137,14 @@ impl MacosSyscallRequest {
                 sig: a1 as i32,
             },
 
+            nr::CLOCK_GETTIME => MacosSyscallRequest::ClockGettime {
+                clock_id: a0 as u32,
+                tp: a1,
+            },
+            nr::CLOCK_GETRES => MacosSyscallRequest::ClockGetres {
+                clock_id: a0 as u32,
+                res: a1,
+            },
             nr::EXECVE => MacosSyscallRequest::Execve {
                 path: a0,
                 argv: a1,
