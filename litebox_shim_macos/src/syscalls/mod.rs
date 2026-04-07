@@ -233,6 +233,15 @@ impl<FS: ShimFS> Task<FS> {
                 amode,
                 flag,
             } => self.sys_faccessat(dirfd, path, amode, flag),
+            MacosSyscallRequest::Readlink { path, buf, bufsize } => {
+                self.sys_readlink(path, buf, bufsize)
+            }
+            MacosSyscallRequest::Readlinkat {
+                dirfd,
+                path,
+                buf,
+                bufsize,
+            } => self.sys_readlinkat(dirfd, path, buf, bufsize),
             MacosSyscallRequest::Unlinkat { dirfd, path, flag } => {
                 self.sys_unlinkat(dirfd, path, flag)
             }

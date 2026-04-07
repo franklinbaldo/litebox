@@ -24,7 +24,7 @@ mod tests;
 
 use errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, ReadDirError,
-    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ReadError, ReadlinkError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
 };
 
 /// A private module, to help support writing sealed traits. This module should _itself_ never be
@@ -136,6 +136,17 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
 
     /// Equivalent to [`Self::file_status`], but open an open `fd` instead.
     fn fd_file_status(&self, fd: &TypedFd<Self>) -> Result<FileStatus, FileStatusError>;
+
+    /// Read the target of a symbolic link.
+    ///
+    /// Returns the target path as a byte vector.
+    ///
+    /// The default implementation returns [`ReadlinkError::NotASymlink`] since
+    /// most in-process file systems do not support symbolic links.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn readlink(&self, path: impl path::Arg) -> Result<Vec<u8>, ReadlinkError> {
+        Err(ReadlinkError::NotASymlink)
+    }
 
     /// Get static backing data for a file, if available and supported.
     ///

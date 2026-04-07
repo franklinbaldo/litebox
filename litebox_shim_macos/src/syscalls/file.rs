@@ -920,6 +920,58 @@ impl<FS: ShimFS> Task<FS> {
         self.sys_access(path_addr, amode)
     }
 
+    /// Handle `readlink(path, buf, bufsize)` (BSD syscall 58).
+    ///
+    /// Reads the target of a symbolic link and writes it to `buf`.
+    /// Returns the number of bytes written (not including a null terminator).
+    pub(crate) fn sys_readlink(
+        &self,
+        path_addr: usize,
+        buf_addr: usize,
+        bufsize: usize,
+    ) -> Result<usize, Errno> {
+        let path_ptr: ConstPtr<u8> = ConstPtr::from_usize(path_addr);
+        let path = read_cstring_from_guest(path_ptr, 4096).ok_or(Errno::EFAULT)?;
+
+        let cpath = alloc::ffi::CString::new(path.as_bytes()).map_err(|_| Errno::EINVAL)?;
+        let target = self.global.fs.readlink(&cpath).map_err(|e| match e {
+            litebox::fs::errors::ReadlinkError::NotASymlink => Errno::EINVAL,
+            litebox::fs::errors::ReadlinkError::PathError(ref pe) => {
+                use litebox::fs::errors::PathError;
+                match pe {
+                    PathError::NoSuchFileOrDirectory => Errno::ENOENT,
+                    PathError::ComponentNotADirectory => Errno::ENOTDIR,
+                    _ => Errno::EINVAL,
+                }
+            }
+            _ => Errno::EIO,
+        })?;
+
+        let copy_len = core::cmp::min(target.len(), bufsize);
+        if copy_len > 0 {
+            let buf_ptr: MutPtr<u8> = MutPtr::from_usize(buf_addr);
+            buf_ptr
+                .copy_from_slice(0, &target[..copy_len])
+                .ok_or(Errno::EFAULT)?;
+        }
+        Ok(copy_len)
+    }
+
+    /// Handle `readlinkat(dirfd, path, buf, bufsize)` (BSD syscall 473).
+    ///
+    /// `dirfd` is currently ignored — paths are resolved from the process
+    /// working directory (or absolute).
+    pub(crate) fn sys_readlinkat(
+        &self,
+        dirfd: i32,
+        path_addr: usize,
+        buf_addr: usize,
+        bufsize: usize,
+    ) -> Result<usize, Errno> {
+        let _ = dirfd; // TODO: resolve relative to dirfd when not AT_FDCWD
+        self.sys_readlink(path_addr, buf_addr, bufsize)
+    }
+
     /// Handle `mkdir(path, mode)`.
     pub(crate) fn sys_mkdir(&self, path_addr: usize, mode: u32) -> Result<usize, Errno> {
         let path_ptr: ConstPtr<u8> = ConstPtr::from_usize(path_addr);

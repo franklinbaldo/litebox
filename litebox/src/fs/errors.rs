@@ -207,6 +207,18 @@ pub enum FileStatusError {
     PathError(#[from] PathError),
 }
 
+/// Possible errors from [`FileSystem::readlink`](super::FileSystem::readlink)
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum ReadlinkError {
+    #[error("the named file is not a symbolic link")]
+    NotASymlink,
+    #[error("I/O error")]
+    Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
 /// Possible errors in any file-system function due to path errors.
 #[derive(Error, Debug)]
 pub enum PathError {

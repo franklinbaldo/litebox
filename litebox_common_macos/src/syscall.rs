@@ -22,6 +22,7 @@ pub mod nr {
     pub const SIGPROCMASK: usize = 48;
     pub const KILL: usize = 37;
     pub const SIGALTSTACK: usize = 53;
+    pub const READLINK: usize = 58;
     pub const IOCTL: usize = 54;
     pub const MUNMAP: usize = 73;
     pub const MPROTECT: usize = 74;
@@ -118,6 +119,7 @@ pub mod nr {
     pub const FCNTL_NOCANCEL: usize = 406;
     pub const FACCESSAT: usize = 466;
     pub const UNLINKAT: usize = 472;
+    pub const READLINKAT: usize = 473;
     pub const GETRLIMIT: usize = 194;
     pub const SETRLIMIT: usize = 195;
 }
@@ -602,6 +604,17 @@ pub enum MacosSyscallRequest {
         path: usize,
         flag: i32,
     },
+    Readlink {
+        path: usize,
+        buf: usize,
+        bufsize: usize,
+    },
+    Readlinkat {
+        dirfd: i32,
+        path: usize,
+        buf: usize,
+        bufsize: usize,
+    },
     Kill {
         pid: i32,
         sig: i32,
@@ -1068,8 +1081,17 @@ impl MacosSyscallRequest {
                 count: a3,
             },
             // ── Known gaps: syscalls with Linux shim parity still needed ──
-            // TODO(readlink): 58=readlink, 473=readlinkat — needs FileSystem
-            //   trait extension to add a `readlink` method.
+            nr::READLINK => MacosSyscallRequest::Readlink {
+                path: a0,
+                buf: a1,
+                bufsize: a2,
+            },
+            nr::READLINKAT => MacosSyscallRequest::Readlinkat {
+                dirfd: a0 as i32,
+                path: a1,
+                buf: a2,
+                bufsize: a3,
+            },
             nr::SIGALTSTACK => MacosSyscallRequest::Sigaltstack { ss: a0, old_ss: a1 },
             nr::KILL => MacosSyscallRequest::Kill {
                 pid: a0 as i32,
