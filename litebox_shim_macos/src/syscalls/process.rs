@@ -26,6 +26,19 @@ impl<FS: ShimFS> Task<FS> {
         42
     }
 
+    /// Handle `getppid()` — return parent process ID.
+    ///
+    /// Litebox runs a single process, so we return 1 (init).
+    pub(crate) fn sys_getppid(&self) -> i32 {
+        1
+    }
+
+    /// Handle `umask(cmask)` — set and return previous file creation mask.
+    pub(crate) fn sys_umask(&self, cmask: u32) -> u32 {
+        use core::sync::atomic::Ordering;
+        self.process.umask.swap(cmask & 0o777, Ordering::Relaxed)
+    }
+
     /// Handle `getuid()`.
     pub(crate) fn sys_getuid(&self) -> u32 {
         0

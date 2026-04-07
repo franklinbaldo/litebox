@@ -41,6 +41,12 @@ impl<FS: ShimFS> Task<FS> {
                 #[allow(clippy::cast_sign_loss)] // getpid always returns positive
                 Ok(self.sys_getpid() as usize)
             }
+            MacosSyscallRequest::Getppid =>
+            {
+                #[allow(clippy::cast_sign_loss)]
+                Ok(self.sys_getppid() as usize)
+            }
+            MacosSyscallRequest::Umask { cmask } => Ok(self.sys_umask(cmask) as usize),
             MacosSyscallRequest::Getuid => Ok(self.sys_getuid() as usize),
             MacosSyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),
             MacosSyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
@@ -210,6 +216,15 @@ impl<FS: ShimFS> Task<FS> {
             }
             MacosSyscallRequest::Unlink { path } => self.sys_unlink(path),
             MacosSyscallRequest::Access { path, amode } => self.sys_access(path, amode),
+            MacosSyscallRequest::Faccessat {
+                dirfd,
+                path,
+                amode,
+                flag,
+            } => self.sys_faccessat(dirfd, path, amode, flag),
+            MacosSyscallRequest::Unlinkat { dirfd, path, flag } => {
+                self.sys_unlinkat(dirfd, path, flag)
+            }
             MacosSyscallRequest::Fchmod { fd, mode } => self.sys_fchmod(fd, mode),
             MacosSyscallRequest::Mkdir { path, mode } => self.sys_mkdir(path, mode),
             MacosSyscallRequest::Rmdir { path } => self.sys_rmdir(path),
@@ -300,6 +315,14 @@ impl<FS: ShimFS> Task<FS> {
                 timeout,
             } => self.sys_select(nfds, readfds, writefds, errorfds, timeout),
             MacosSyscallRequest::Poll { fds, nfds, timeout } => self.sys_poll(fds, nfds, timeout),
+            MacosSyscallRequest::Pselect {
+                nfds,
+                readfds,
+                writefds,
+                errorfds,
+                timeout,
+                sigmask,
+            } => self.sys_pselect(nfds, readfds, writefds, errorfds, timeout, sigmask),
             MacosSyscallRequest::Kqueue => kqueue::sys_kqueue(self),
             MacosSyscallRequest::Kevent {
                 kq,

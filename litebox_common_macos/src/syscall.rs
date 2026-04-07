@@ -107,8 +107,14 @@ pub mod nr {
     pub const CHANGE_FDGUARD_NP: usize = 444;
     pub const GETATTRLISTBULK: usize = 461;
     pub const GUARDED_WRITE_NP: usize = 485;
+    pub const GETPPID: usize = 39;
+    pub const UMASK: usize = 60;
     pub const LSTAT64: usize = 340;
+    pub const PSELECT: usize = 394;
+    pub const PSELECT_NOCANCEL: usize = 395;
     pub const FCNTL_NOCANCEL: usize = 406;
+    pub const FACCESSAT: usize = 466;
+    pub const UNLINKAT: usize = 472;
 }
 
 /// Mach trap numbers (negative x16 values, stored as positive constants).
@@ -563,6 +569,34 @@ pub enum MacosSyscallRequest {
         attr_buf_size: usize,
         options: u64,
     },
+    /// `getppid()` — get parent process ID.
+    Getppid,
+    /// `umask(cmask)` — set file creation mask.
+    Umask {
+        cmask: u32,
+    },
+    /// `pselect(nfds, readfds, writefds, errorfds, timeout, sigmask)`.
+    Pselect {
+        nfds: u32,
+        readfds: usize,
+        writefds: usize,
+        errorfds: usize,
+        timeout: usize,
+        sigmask: usize,
+    },
+    /// `faccessat(dirfd, path, amode, flag)` — check file accessibility relative to dirfd.
+    Faccessat {
+        dirfd: i32,
+        path: usize,
+        amode: i32,
+        flag: i32,
+    },
+    /// `unlinkat(dirfd, path, flag)` — remove directory entry relative to dirfd.
+    Unlinkat {
+        dirfd: i32,
+        path: usize,
+        flag: i32,
+    },
     Unknown {
         number: usize,
     },
@@ -926,6 +960,27 @@ impl MacosSyscallRequest {
                 fsid: a2,
                 objid: a3 as u64,
             },
+            nr::GETPPID => MacosSyscallRequest::Getppid,
+            nr::UMASK => MacosSyscallRequest::Umask { cmask: a0 as u32 },
+            nr::PSELECT | nr::PSELECT_NOCANCEL => MacosSyscallRequest::Pselect {
+                nfds: a0 as u32,
+                readfds: a1,
+                writefds: a2,
+                errorfds: a3,
+                timeout: a4,
+                sigmask: a5,
+            },
+            nr::FACCESSAT => MacosSyscallRequest::Faccessat {
+                dirfd: a0 as i32,
+                path: a1,
+                amode: a2 as i32,
+                flag: a3 as i32,
+            },
+            nr::UNLINKAT => MacosSyscallRequest::Unlinkat {
+                dirfd: a0 as i32,
+                path: a1,
+                flag: a2 as i32,
+            },
             nr::ULOCK_WAIT => MacosSyscallRequest::UlockWait {
                 operation: a0 as u32,
                 addr: a1,
@@ -979,6 +1034,18 @@ impl MacosSyscallRequest {
                 buf: a2,
                 count: a3,
             },
+            // ── Known gaps: syscalls with Linux shim parity still needed ──
+            // TODO(readlink): 58=readlink, 473=readlinkat — needs FileSystem
+            //   trait extension to add a `readlink` method.
+            // TODO(sigaltstack): 53=sigaltstack — per-thread alt-stack tracking
+            //   and validation (Linux shim: signal/mod.rs Cell<SigAltStack>).
+            // TODO(kill): 37=kill, 328=__pthread_kill — signal delivery to
+            //   threads (Linux shim: signal injection + thread interrupt).
+            // TODO(rlimit): 194=getrlimit, 195=setrlimit — rlimit tracking
+            //   with sensible defaults (Linux shim: process.rs).
+            // TODO(execve): 59=execve — full process teardown + reload
+            //   (Linux shim: kill threads, close CLOEXEC, release memory,
+            //   reset signals, Mach-O load, reinit context).
             _ => MacosSyscallRequest::Unknown { number: nr_raw },
         }
     }

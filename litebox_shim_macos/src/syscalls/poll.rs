@@ -509,4 +509,114 @@ impl<FS: ShimFS> Task<FS> {
 
         Ok(ready_count)
     }
+
+    /// Handle `pselect(nfds, readfds, writefds, errorfds, timeout, sigmask)`.
+    ///
+    /// Like `select` but with `timespec` (not `timeval`) and an optional
+    /// signal mask that is atomically applied for the duration of the wait.
+    #[allow(clippy::similar_names)]
+    pub(crate) fn sys_pselect(
+        &self,
+        nfds: u32,
+        readfds_addr: usize,
+        writefds_addr: usize,
+        errorfds_addr: usize,
+        timeout_addr: usize,
+        sigmask_addr: usize,
+    ) -> Result<usize, Errno> {
+        // pselect uses struct timespec { i64 tv_sec; i64 tv_nsec; } = 16 bytes.
+        // Convert to the Duration that sys_select's internals expect, then
+        // reuse the same PollSet/wait infrastructure.
+
+        if nfds > FD_SETSIZE {
+            return Err(Errno::EINVAL);
+        }
+
+        let timeout = if timeout_addr == 0 {
+            None
+        } else {
+            let tv_sec_ptr: ConstPtr<i64> = ConstPtr::from_usize(timeout_addr);
+            let tv_nsec_ptr: ConstPtr<i64> = ConstPtr::from_usize(timeout_addr + 8);
+            let tv_sec: i64 = tv_sec_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            let tv_nsec: i64 = tv_nsec_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
+                return Err(Errno::EINVAL);
+            }
+            Some(
+                Duration::from_secs(tv_sec.cast_unsigned())
+                    + Duration::from_nanos(tv_nsec.cast_unsigned()),
+            )
+        };
+
+        // Atomically swap signal mask if provided.
+        // TODO: implement proper atomic sigmask swap when signal delivery
+        // is fully implemented. For now, ignore the sigmask parameter.
+        let _ = sigmask_addr;
+
+        // Read fd_set bitmaps.
+        let readfds = read_fd_set(readfds_addr, nfds)?;
+        let writefds = read_fd_set(writefds_addr, nfds)?;
+        let errorfds = read_fd_set(errorfds_addr, nfds)?;
+
+        // Build PollSet from set bits.
+        let mut set = PollSet::with_capacity(nfds as usize);
+        for fd in 0..nfds {
+            let mut events = Events::empty();
+            if is_fd_set(&readfds, fd) {
+                events |= Events::IN;
+            }
+            if is_fd_set(&writefds, fd) {
+                events |= Events::OUT;
+            }
+            if is_fd_set(&errorfds, fd) {
+                events |= Events::PRI;
+            }
+            if !events.is_empty() {
+                set.add_fd(fd.cast_signed(), events);
+            }
+        }
+
+        // Wait for events.
+        let cx = self.wait_cx().with_timeout(timeout);
+        match set.wait(self, &cx) {
+            Ok(()) => {}
+            Err(WaitError::Interrupted) => return Err(Errno::EINTR),
+            Err(WaitError::TimedOut) => {
+                set.scan(self, None);
+            }
+        }
+
+        // Build result fd_sets.
+        let mut result_readfds = [0u32; FD_SET_INTS];
+        let mut result_writefds = [0u32; FD_SET_INTS];
+        let mut result_errorfds = [0u32; FD_SET_INTS];
+        let mut ready_count = 0usize;
+
+        for (fd, revents) in set.revents_with_fds() {
+            if revents.contains(Events::NVAL) {
+                return Err(Errno::EBADF);
+            }
+            let fdu = fd.cast_unsigned();
+            if revents.intersects(Events::IN | Events::ALWAYS_POLLED) && is_fd_set(&readfds, fdu) {
+                set_fd_bit(&mut result_readfds, fdu);
+                ready_count += 1;
+            }
+            if revents.intersects(Events::OUT | Events::ALWAYS_POLLED) && is_fd_set(&writefds, fdu)
+            {
+                set_fd_bit(&mut result_writefds, fdu);
+                ready_count += 1;
+            }
+            if revents.intersects(Events::PRI) && is_fd_set(&errorfds, fdu) {
+                set_fd_bit(&mut result_errorfds, fdu);
+                ready_count += 1;
+            }
+        }
+
+        // Write result fd_sets back.
+        write_fd_set(readfds_addr, &result_readfds, nfds)?;
+        write_fd_set(writefds_addr, &result_writefds, nfds)?;
+        write_fd_set(errorfds_addr, &result_errorfds, nfds)?;
+
+        Ok(ready_count)
+    }
 }

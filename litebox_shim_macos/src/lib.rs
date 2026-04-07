@@ -144,6 +144,8 @@ struct Process {
     pthsize: AtomicU32,
     /// Offset from pthread_t to TSD base (set by bsdthread_register).
     tsd_offset: AtomicU32,
+    /// File creation mask (umask). Default 0o022.
+    umask: AtomicU32,
     /// Next thread ID to allocate (starts at 2; main thread is 1).
     next_tid: AtomicI32,
     /// Next Mach thread port to allocate.
@@ -166,6 +168,7 @@ impl Process {
             wqthread: AtomicU64::new(0),
             pthsize: AtomicU32::new(0),
             tsd_offset: AtomicU32::new(0),
+            umask: AtomicU32::new(0o022),
             next_tid: AtomicI32::new(2),
             next_mach_port: AtomicU32::new(0x0403),
             signal_handlers: litebox::sync::Mutex::new([SignalHandler::default(); 32]),

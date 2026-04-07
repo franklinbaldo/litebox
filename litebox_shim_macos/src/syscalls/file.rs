@@ -882,6 +882,44 @@ impl<FS: ShimFS> Task<FS> {
         Ok(0)
     }
 
+    /// Handle `unlinkat(dirfd, path, flag)`.
+    ///
+    /// If `flag` contains `AT_REMOVEDIR` (0x08 on macOS), behaves like `rmdir`.
+    /// Otherwise behaves like `unlink`.
+    ///
+    /// `dirfd` is currently ignored — paths are resolved from the process
+    /// working directory (or absolute). `AT_FDCWD` (-2 on macOS) is the
+    /// common case and is treated the same as any other dirfd value.
+    pub(crate) fn sys_unlinkat(
+        &self,
+        dirfd: i32,
+        path_addr: usize,
+        flag: i32,
+    ) -> Result<usize, Errno> {
+        const AT_REMOVEDIR: i32 = 0x08;
+        let _ = dirfd; // TODO: resolve relative to dirfd when not AT_FDCWD
+        if flag & AT_REMOVEDIR != 0 {
+            self.sys_rmdir(path_addr)
+        } else {
+            self.sys_unlink(path_addr)
+        }
+    }
+
+    /// Handle `faccessat(dirfd, path, amode, flag)`.
+    ///
+    /// `dirfd` is currently ignored — paths are resolved from the process
+    /// working directory (or absolute).
+    pub(crate) fn sys_faccessat(
+        &self,
+        dirfd: i32,
+        path_addr: usize,
+        amode: i32,
+        flag: i32,
+    ) -> Result<usize, Errno> {
+        let _ = (dirfd, flag); // TODO: resolve relative to dirfd; honor AT_EACCESS
+        self.sys_access(path_addr, amode)
+    }
+
     /// Handle `mkdir(path, mode)`.
     pub(crate) fn sys_mkdir(&self, path_addr: usize, mode: u32) -> Result<usize, Errno> {
         let path_ptr: ConstPtr<u8> = ConstPtr::from_usize(path_addr);
