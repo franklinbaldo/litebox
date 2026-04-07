@@ -580,7 +580,7 @@ where
     /// The caller must ensure that the released memory regions are no longer used.
     pub unsafe fn release_memory(
         &self,
-        releasable: fn(Range<usize>, VmFlags) -> bool,
+        releasable: impl Fn(Range<usize>, VmFlags) -> bool,
     ) -> Result<(), VmemUnmapError> {
         for (r, vma) in self.mappings() {
             if !releasable(r.clone(), vma) {

@@ -223,8 +223,24 @@ impl<FS: ShimFS> Task<FS> {
 
         // ── 4. Release existing memory mappings ──
 
-        let release =
-            |_range: core::ops::Range<usize>, vm: litebox::mm::linux::VmFlags| !vm.is_empty();
+        // Preserve shared cache mappings — they are host memory that is
+        // shared across execve and must remain mapped for dyld to work.
+        #[allow(clippy::cast_possible_truncation)]
+        let cache_base =
+            self.global.shared_cache_base.load(Ordering::Acquire) as usize;
+        #[allow(clippy::cast_possible_truncation)]
+        let cache_end =
+            self.global.shared_cache_end.load(Ordering::Acquire) as usize;
+        let release = |range: core::ops::Range<usize>, vm: litebox::mm::linux::VmFlags| {
+            if vm.is_empty() {
+                return false;
+            }
+            // Skip any mapping that overlaps with the shared cache region.
+            if cache_base != 0 && range.start < cache_end && range.end > cache_base {
+                return false;
+            }
+            true
+        };
         unsafe {
             self.global
                 .pm
