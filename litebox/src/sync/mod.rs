@@ -29,12 +29,30 @@ pub use rwlock::{
     MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
 
-#[cfg(not(feature = "lock_tracing"))]
+#[cfg(not(any(feature = "lock_tracing", feature = "trace_fs")))]
 /// A convenience name for specific requirements from the platform
 pub trait RawSyncPrimitivesProvider: platform::RawMutexProvider + Sync + 'static {}
-#[cfg(not(feature = "lock_tracing"))]
+#[cfg(not(any(feature = "lock_tracing", feature = "trace_fs")))]
 impl<Platform> RawSyncPrimitivesProvider for Platform where
     Platform: platform::RawMutexProvider + Sync + 'static
+{
+}
+
+// When `trace_fs` is enabled, filesystem tracing code logs through
+// `DebugLogProvider`. Since the platform type is threaded through
+// `RawSyncPrimitivesProvider` in fs-related contexts, the bound is added here
+// so it is available wherever the platform is used. `lock_tracing` already
+// includes `DebugLogProvider`, so this branch only applies when `trace_fs` is
+// enabled without `lock_tracing`.
+#[cfg(all(feature = "trace_fs", not(feature = "lock_tracing")))]
+/// A convenience name for specific requirements from the platform
+pub trait RawSyncPrimitivesProvider:
+    platform::RawMutexProvider + platform::DebugLogProvider + Sync + 'static
+{
+}
+#[cfg(all(feature = "trace_fs", not(feature = "lock_tracing")))]
+impl<Platform> RawSyncPrimitivesProvider for Platform where
+    Platform: platform::RawMutexProvider + platform::DebugLogProvider + Sync + 'static
 {
 }
 
