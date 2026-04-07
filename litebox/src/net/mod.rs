@@ -90,7 +90,7 @@ where
     /// and the created `Network` handle is expected to be shared across all usage over the
     /// system.
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
-        let mut device = phy::Device::new(litebox.x.platform);
+        let mut device = phy::Device::new(litebox.x.platform, INTERFACE_IP_ADDR);
         let config = smoltcp::iface::Config::new(smoltcp::wire::HardwareAddress::Ip);
         let mut interface =
             smoltcp::iface::Interface::new(config, &mut device, smoltcp::time::Instant::ZERO);
@@ -454,6 +454,28 @@ where
                     timeout: poll_at,
                 }
             }
+        }
+    }
+
+    /// Drive the network stack forward by polling the interface.
+    ///
+    /// In `Manual` mode this calls `interface.poll()` to process
+    /// pending ingress/egress packets (including loopback).  In
+    /// `Automatic` mode this is a no-op because `send()`/`receive()`
+    /// already poll inline.
+    ///
+    /// Unlike `internal_perform_platform_interaction()`, this does
+    /// **not** call `drain_all_socket_channel_buffers()`.  That drain
+    /// moves data from smoltcp sockets into proxy ring buffers, which
+    /// would make the data invisible to `receive()` (which reads from
+    /// smoltcp directly).  Syscall blocking-retry loops should call
+    /// this before each attempt so that data flows through the
+    /// smoltcp stack even when no dedicated network thread iteration
+    /// has run.
+    pub fn drive_network(&mut self) {
+        if matches!(self.platform_interaction, PlatformInteraction::Manual) {
+            self.interface
+                .poll(self.now(), &mut self.device, &mut self.socket_set);
         }
     }
 
@@ -1031,7 +1053,21 @@ where
                             Ok(SocketAddr::V4(SocketAddrV4::new(ipv4, endpoint.port)))
                         }
                     },
-                    None => Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))),
+                    None => {
+                        // The smoltcp socket doesn't know its local endpoint
+                        // yet (e.g. after bind but before listen/connect).
+                        // Fall back to the stored server socket info.
+                        if let Some(ref srv) = socket_handle.tcp().server_socket {
+                            let ip = match srv.ip_listen_endpoint.addr {
+                                Some(smoltcp::wire::IpAddress::Ipv4(ipv4)) => ipv4,
+                                None => Ipv4Addr::UNSPECIFIED,
+                            };
+                            let port = srv.ip_listen_endpoint.port;
+                            Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)))
+                        } else {
+                            Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))
+                        }
+                    }
                 }
             }
             Protocol::Udp => {

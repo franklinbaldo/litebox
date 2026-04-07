@@ -82,18 +82,4 @@ impl<FS: ShimFS> Task<FS> {
         }
         Ok(0)
     }
-
-    /// Handle `__getcwd(buf, size)` — return current working directory.
-    pub(crate) fn sys_getcwd(&self, buf_addr: usize, size: usize) -> Result<usize, Errno> {
-        use crate::MutPtr;
-        use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
-
-        // Always "/" — no chdir support yet.
-        if size < 2 {
-            return Err(Errno::ERANGE);
-        }
-        let ptr: MutPtr<u8> = MutPtr::from_usize(buf_addr);
-        ptr.copy_from_slice(0, b"/\0").ok_or(Errno::EFAULT)?;
-        Ok(0) // macOS __getcwd returns 0 on success
-    }
 }

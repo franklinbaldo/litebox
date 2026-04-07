@@ -277,13 +277,13 @@ impl<FS: ShimFS> Task<FS> {
             }
             mach_trap::MACH_REPLY_PORT => Ok(0x0703),
             mach_trap::THREAD_SELF_TRAP => {
-                if self.tid == 1 {
-                    Ok(0x0303)
-                } else {
-                    #[allow(clippy::cast_sign_loss)] // tid is always positive
-                    let port = ((self.tid as usize) + 2) << 8 | 0x03;
-                    Ok(port)
-                }
+                // Return the real kernel mach port stored during thread init.
+                // This must match tl_thport (pthread+248) so that os_unfair_lock
+                // deadlock detection sees a consistent thread identity.
+                let port = self
+                    .real_mach_port
+                    .load(core::sync::atomic::Ordering::Acquire);
+                Ok(port as usize)
             }
             mach_trap::TASK_SELF_TRAP => Ok(0x0103),
             mach_trap::HOST_SELF_TRAP => Ok(0x0503),
@@ -445,6 +445,8 @@ impl<FS: ShimFS> Task<FS> {
             blocked_signals: core::sync::atomic::AtomicU32::new(0),
             wait_state: crate::wait::WaitState::new(self.global.platform),
             dir_positions: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+            // Initialized to 0; handle_init_request will set to real mach_thread_self().
+            real_mach_port: core::sync::atomic::AtomicU32::new(0),
         };
 
         let r = unsafe {
@@ -459,6 +461,10 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EAGAIN);
         }
 
+        // Record this pthread address so we can suppress premature
+        // mach_vm_deallocate on the thread's stack allocation.
+        self.process.thread_pthreads.lock().insert(pthread);
+
         // Return the pthread address (what the kernel returns on success).
         Ok(pthread)
     }
@@ -471,14 +477,90 @@ impl<FS: ShimFS> Task<FS> {
     #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn sys_bsdthread_terminate(
         &self,
-        _stackaddr: usize,
-        _freesize: usize,
-        _port: u32,
-        _sema_or_ulock: usize,
+        stackaddr: usize,
+        freesize: usize,
+        port: u32,
+        sema_or_ulock: usize,
     ) -> Result<usize, Errno> {
         use core::sync::atomic::Ordering;
 
-        log_unsupported!("bsdthread_terminate(tid={})", self.tid);
+        log_unsupported!(
+            "bsdthread_terminate(tid={}, stackaddr={stackaddr:#x}, freesize={freesize:#x}, port={port:#x}, sema={sema_or_ulock:#x})",
+            self.tid
+        );
+
+        // On real macOS, the kernel atomically frees the thread stack,
+        // signals the join semaphore/ulock, and terminates the thread.
+        // We replicate the stack freeing here so that the guest's
+        // pthread_join can access the pthread struct (which is above the
+        // freed stack region, not inside it) without it being double-freed.
+        //
+        // Important: The kernel frees [stackaddr, stackaddr+freesize).
+        // The pthread struct lives ABOVE this region (at higher addresses)
+        // and is NOT freed — pthread_join reads it after the thread exits.
+
+        // Remove this thread's pthread from the tracking set.  The
+        // pthread struct sits at stackaddr+freesize (just above the
+        // freed region), so check a generous range.
+        if stackaddr != 0 {
+            let mut pthreads = self.process.thread_pthreads.lock();
+            // Remove any tracked pthread whose address falls in
+            // [stackaddr, stackaddr + freesize + pthsize_margin].
+            // On macOS the pthread is at the top of the mach_vm_map
+            // allocation, right above the freed stack region.
+            let pthsize = self.process.pthsize.load(Ordering::Acquire) as usize;
+            let range_end = stackaddr
+                .saturating_add(freesize)
+                .saturating_add(pthsize)
+                .saturating_add(0x1000);
+            let to_remove: alloc::vec::Vec<usize> = pthreads
+                .iter()
+                .copied()
+                .filter(|&p| p >= stackaddr && p < range_end)
+                .collect();
+            for p in to_remove {
+                log_unsupported!("bsdthread_terminate: removing tracked pthread {p:#x}");
+                pthreads.remove(&p);
+            }
+        }
+
+        if stackaddr != 0 && freesize != 0 {
+            // On real macOS the kernel atomically frees the stack AND
+            // terminates the thread in a single syscall.  We cannot
+            // replicate that atomicity: if we munmap the stack here,
+            // the current thread (or another guest thread whose
+            // allocation is adjacent) may crash accessing the freed
+            // region before we finish terminating.  Since the entire
+            // child process will \_exit(0) shortly, leaking the stack
+            // is harmless.
+            log_unsupported!(
+                "bsdthread_terminate: skipping stack free at {stackaddr:#x}, size {freesize:#x} (will leak; process exits soon)"
+            );
+        }
+
+        // Signal the ulock/semaphore to wake pthread_join.
+        //
+        // On real macOS, `bsdthread_terminate`'s last parameter is either:
+        //   - 0 (MACH_PORT_NULL): no joiner to wake
+        //   - A valid ulock/semaphore address: wake the joiner
+        //   - A small integer like 0x1: a sentinel/flag, not a real address
+        //
+        // Only attempt the ulock wake if the value looks like a plausible
+        // address (above the low guard region).
+        if sema_or_ulock > 0x1000 {
+            log_unsupported!("bsdthread_terminate: waking ulock at {sema_or_ulock:#x}");
+            // Write MACH_PORT_DEAD (0xFFFFFFFF) to the exit_gate word to
+            // indicate thread completion, then wake any waiters.
+            let ulock_ptr: MutPtr<u32> = MutPtr::from_usize(sema_or_ulock);
+            if let Some(()) = ulock_ptr.write_at_offset(0, 0xFFFF_FFFFu32) {
+                // UL_COMPARE_AND_WAIT = 1, ULF_WAKE_ALL = 0x100
+                let _ = self.sys_ulock_wake(0x100 | 1, sema_or_ulock, 0);
+            }
+        } else if sema_or_ulock != 0 {
+            log_unsupported!(
+                "bsdthread_terminate: ignoring non-address sema_or_ulock={sema_or_ulock:#x}"
+            );
+        }
 
         // Decrement thread count.
         let prev = self.process.nr_threads.fetch_sub(1, Ordering::Release);
@@ -633,18 +715,13 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle `__ulock_wait(operation, addr, value, timeout_us)` — wait on a userspace lock.
     ///
-    /// In a single-threaded guest, no other thread can wake us, so blocking
-    /// would deadlock. Instead we implement compare-and-wait semantics:
+    /// Uses the `FutexManager` for real blocking so that multi-threaded guests
+    /// (e.g. `pthread_join` waiting on `tl_exit_gate`) work correctly.
     ///
-    /// - If `*addr != value`, return 0 (spurious wakeup — value already changed).
-    /// - If `*addr == value`, also return 0 (pretend we were woken) to prevent
-    ///   the caller from blocking forever. The caller will retry its CAS loop
-    ///   and either succeed or call ulock_wait again.
-    ///
-    /// This is sufficient for dyld bootstrap where `os_unfair_lock` contention
-    /// is caused by our NOP of `findAndRunAllInitializers`, leaving an internal
-    /// lock in a "locked" state that was never actually contended.
-    #[allow(clippy::unnecessary_wraps)]
+    /// All 32-bit ulock operations (UL_COMPARE_AND_WAIT, UL_UNFAIR_LOCK, etc.)
+    /// have identical compare-and-wait semantics from the kernel's perspective:
+    /// compare `*addr` (32-bit) with `value` (truncated to 32 bits), and block
+    /// if they match until woken by `__ulock_wake` on the same address.
     pub(crate) fn sys_ulock_wait(
         &self,
         operation: u32,
@@ -652,62 +729,94 @@ impl<FS: ShimFS> Task<FS> {
         value: u64,
         timeout_us: u32,
     ) -> Result<usize, Errno> {
-        const UL_COMPARE_AND_WAIT: u32 = 1;
-        const UL_COMPARE_AND_WAIT_SHARED: u32 = 3;
-        const UL_COMPARE_AND_WAIT64: u32 = 5;
-        const UL_COMPARE_AND_WAIT64_SHARED: u32 = 6;
+        use litebox::sync::futex::FutexError;
 
         // Strip flags from operation to get the base operation type.
         let op = operation & 0x0000_FFFF;
 
+        // All 32-bit ulock operations use the same compare-and-wait
+        // mechanism on a 32-bit word.  UL_UNFAIR_LOCK (2) is used by
+        // pthread_join for tl_exit_gate; UL_COMPARE_AND_WAIT (1) is
+        // used by os_unfair_lock and other synchronization primitives.
+        //
+        // 64-bit variants (5, 6) are not yet supported with real blocking
+        // but fall through to a stub that force-clears for dyld bootstrap.
         match op {
-            UL_COMPARE_AND_WAIT | UL_COMPARE_AND_WAIT_SHARED => {
-                // 32-bit compare-and-wait: read the 32-bit value at addr.
-                let ptr: crate::ConstPtr<u32> = crate::ConstPtr::from_usize(addr);
-                let current = u64::from(ptr.read_at_offset(0).unwrap_or(0));
-                if current == value {
-                    // Value matches — lock is still held. In single-threaded mode,
-                    // no other thread will ever unlock it. Force-clear the lock word
-                    // to 0 (unlocked) so the caller's next CAS attempt succeeds.
-                    let wptr: MutPtr<u32> = MutPtr::from_usize(addr);
-                    let _ = wptr.write_at_offset(0, 0_u32);
-                    log_unsupported!(
-                        "ulock_wait(op={operation:#x}, addr={addr:#x}, value={value:#x}, \
-                         timeout={timeout_us}): force-unlocked for single-threaded guest"
-                    );
+            1..=4 => {
+                // 32-bit compare-and-wait via FutexManager.
+                #[allow(clippy::cast_possible_truncation)]
+                let expected = value as u32;
+                let futex_addr: MutPtr<u32> = MutPtr::from_usize(addr);
+
+                // Read current value at lock address for diagnostic.
+                let current_val = futex_addr.read_at_offset(0).unwrap_or(0xDEAD);
+
+                // Build a wait context, optionally with a timeout.
+                let base_cx = self.wait_cx();
+                let timeout = if timeout_us == 0 {
+                    None
                 } else {
-                    // Value already changed — spurious wakeup.
-                    log_unsupported!(
-                        "ulock_wait(op={operation:#x}, addr={addr:#x}, value={value:#x}, \
-                         timeout={timeout_us}): current={current:#x} != value, spurious wakeup"
-                    );
+                    Some(core::time::Duration::from_micros(u64::from(timeout_us)))
+                };
+                let cx = base_cx.with_timeout(timeout);
+
+                log_unsupported!(
+                    "ulock_wait(op={operation:#x}, addr={addr:#x}, expected={expected:#x},                       current={current_val:#x}, tid={}, timeout={timeout_us}): blocking via futex",
+                    self.tid
+                );
+
+                match self
+                    .global
+                    .futex_manager
+                    .wait(&cx, futex_addr, expected, None)
+                {
+                    Ok(()) => {
+                        let after_val = futex_addr.read_at_offset(0).unwrap_or(0xDEAD);
+                        log_unsupported!(
+                            "ulock_wait(addr={addr:#x}, tid={}): WOKEN, lock now={after_val:#x}",
+                            self.tid
+                        );
+                        Ok(0)
+                    }
+                    Err(FutexError::ImmediatelyWokenBecauseValueMismatch) => {
+                        let after_val = futex_addr.read_at_offset(0).unwrap_or(0xDEAD);
+                        log_unsupported!(
+                            "ulock_wait(addr={addr:#x}, tid={}): VALUE_MISMATCH expected={expected:#x} current={current_val:#x} now={after_val:#x}",
+                            self.tid
+                        );
+                        // Value already changed — spurious wakeup (thread exited).
+                        Ok(0)
+                    }
+                    Err(FutexError::WaitError(_)) => {
+                        // Interrupted or timed out.
+                        Err(Errno::EINTR)
+                    }
+                    Err(FutexError::Fault) => Err(Errno::EFAULT),
+                    Err(FutexError::NotAligned) => Err(Errno::EINVAL),
                 }
-                Ok(0)
             }
-            UL_COMPARE_AND_WAIT64 | UL_COMPARE_AND_WAIT64_SHARED => {
-                // 64-bit compare-and-wait: read the 64-bit value at addr.
+            5 | 6 => {
+                // 64-bit compare-and-wait: not yet backed by FutexManager
+                // (which operates on 32-bit words).  Fall back to the
+                // force-clear stub for dyld bootstrap compatibility.
                 let ptr: crate::ConstPtr<u64> = crate::ConstPtr::from_usize(addr);
                 let current = ptr.read_at_offset(0).unwrap_or(0);
                 if current == value {
-                    // Force-clear for single-threaded guest.
                     let wptr: MutPtr<u64> = MutPtr::from_usize(addr);
                     let _ = wptr.write_at_offset(0, 0_u64);
                     log_unsupported!(
-                        "ulock_wait64(op={operation:#x}, addr={addr:#x}, value={value:#x}, \
-                         timeout={timeout_us}): force-unlocked for single-threaded guest"
+                        "ulock_wait64(op={operation:#x}, addr={addr:#x}, value={value:#x},                          timeout={timeout_us}): force-unlocked (64-bit stub)"
                     );
                 } else {
                     log_unsupported!(
-                        "ulock_wait64(op={operation:#x}, addr={addr:#x}, value={value:#x}, \
-                         timeout={timeout_us}): current={current:#x} != value, spurious wakeup"
+                        "ulock_wait64(op={operation:#x}, addr={addr:#x}, value={value:#x},                          timeout={timeout_us}): current={current:#x} != value, spurious wakeup"
                     );
                 }
                 Ok(0)
             }
             _ => {
                 log_unsupported!(
-                    "ulock_wait(op={operation:#x}, addr={addr:#x}, value={value:#x}, \
-                     timeout={timeout_us}): unsupported operation"
+                    "ulock_wait(op={operation:#x}, addr={addr:#x}, value={value:#x},                      timeout={timeout_us}): unsupported operation"
                 );
                 Err(Errno::ENOTSUP)
             }
@@ -716,17 +825,43 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle `__ulock_wake(operation, addr, wake_value)` — wake waiters on a userspace lock.
     ///
-    /// In a single-threaded guest, there are no waiters to wake. Return 0 (success).
-    #[allow(clippy::unnecessary_wraps)]
+    /// Uses the `FutexManager` to wake threads blocked in `sys_ulock_wait`.
     pub(crate) fn sys_ulock_wake(
         &self,
         operation: u32,
         addr: usize,
-        wake_value: u64,
+        _wake_value: u64,
     ) -> Result<usize, Errno> {
+        use litebox::sync::futex::FutexError;
+
+        let flags = operation & 0xFFFF_0000;
+        let wake_all = flags & 0x0000_0100 != 0; // ULF_WAKE_ALL
+
+        let futex_addr: MutPtr<u32> = MutPtr::from_usize(addr);
+        let count = if wake_all {
+            core::num::NonZeroU32::new(u32::MAX).unwrap()
+        } else {
+            core::num::NonZeroU32::new(1).unwrap()
+        };
+
         log_unsupported!(
-            "ulock_wake(op={operation:#x}, addr={addr:#x}, wake_value={wake_value:#x}): no-op"
+            "ulock_wake(op={operation:#x}, addr={addr:#x}, wake_all={wake_all}, tid={})",
+            self.tid
         );
-        Ok(0)
+
+        match self.global.futex_manager.wake(futex_addr, count, None) {
+            Ok(woken) => {
+                if woken > 0 {
+                    log_unsupported!(
+                        "ulock_wake(addr={addr:#x}, tid={}): woke {woken} waiters",
+                        self.tid
+                    );
+                }
+                Ok(0)
+            }
+            Err(FutexError::NotAligned) => Err(Errno::EINVAL),
+            Err(FutexError::Fault) => Err(Errno::EFAULT),
+            Err(_) => Ok(0), // Other errors: treat as no waiters
+        }
     }
 }

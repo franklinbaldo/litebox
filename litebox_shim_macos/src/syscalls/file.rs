@@ -5,7 +5,9 @@
 
 use alloc::string::String;
 use alloc::vec;
+use core::time::Duration;
 use litebox::fs::{OFlags, SeekWhence};
+use litebox::net::errors::ReceiveError;
 use litebox::net::{CloseBehavior, Network, ReceiveFlags, SendFlags};
 use litebox::pipes::Pipes;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
@@ -15,6 +17,23 @@ use crate::{ConstPtr, MutPtr, Platform, ShimFS, Task};
 
 /// Maximum kernel-side buffer size, to prevent OOM from huge read/write requests.
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
+
+/// Minimum valid guest address.  On arm64 macOS the `__PAGEZERO` segment
+/// occupies 0..4 GB, so any user pointer below this threshold is invalid.
+const GUEST_ADDR_MIN: usize = 0x1_0000_0000;
+
+/// Validate that a guest buffer pointer is plausibly mapped.
+///
+/// Returns `Err(EFAULT)` if `addr` falls in the null page or `__PAGEZERO`
+/// (0..4 GB on arm64 macOS) and `count > 0`.  Addresses above `GUEST_ADDR_MIN`
+/// may still be unmapped, but catching PAGEZERO covers the most common
+/// accidental cases and prevents the shim from faulting on behalf of the guest.
+fn validate_guest_buf(addr: usize, count: usize) -> Result<(), Errno> {
+    if count > 0 && addr < GUEST_ADDR_MIN {
+        return Err(Errno::EFAULT);
+    }
+    Ok(())
+}
 
 /// Maximum number of iovec entries (macOS IOV_MAX).
 const IOV_MAX: usize = 1024;
@@ -87,6 +106,7 @@ impl<FS: ShimFS> Task<FS> {
     ///
     /// Dispatches to filesystem or pipe subsystem based on FD type.
     pub(crate) fn sys_read(&self, fd: i32, buf_addr: usize, count: usize) -> Result<usize, Errno> {
+        validate_guest_buf(buf_addr, count)?;
         let raw_fd = fd_to_usize(fd)?;
         let strong_fd = {
             let rds = self.global.raw_descriptors.read();
@@ -132,10 +152,30 @@ impl<FS: ShimFS> Task<FS> {
                     .read(&cx, typed_fd, &mut kernel_buf)
                     .map_err(Self::pipe_read_error_to_errno)?
             }
-            crate::StrongFd::Network(ref typed_fd) => {
-                let mut net = self.global.net.lock();
-                net.receive(typed_fd, &mut kernel_buf, ReceiveFlags::empty(), None)
-                    .map_err(crate::syscalls::net::receive_error_to_errno)?
+            crate::StrongFd::Network(ref _typed_fd) => {
+                // Read from the proxy ring buffer rather than directly from
+                // smoltcp.  The background network thread drains smoltcp →
+                // proxy, so reading smoltcp directly races with the drain.
+                let proxy = self
+                    .global
+                    .net_proxies
+                    .read()
+                    .get(&raw_fd)
+                    .cloned()
+                    .ok_or(Errno::EBADF)?;
+                // Blocking retry: data may not have been drained to the proxy
+                // yet (e.g. just after select() reported readability).
+                loop {
+                    match proxy.try_read(&mut kernel_buf, ReceiveFlags::empty(), None) {
+                        Ok(0) | Err(ReceiveError::SocketInInvalidState) => {
+                            let cx = self.wait_cx().with_timeout(Duration::from_millis(1));
+                            let _ = cx.sleep();
+                        }
+                        Ok(n) => break n,
+                        Err(ReceiveError::OperationFinished) => break 0,
+                        Err(e) => return Err(crate::syscalls::net::receive_error_to_errno(e)),
+                    }
+                }
             }
         };
 
@@ -153,9 +193,7 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_write(&self, fd: i32, buf_addr: usize, count: usize) -> Result<usize, Errno> {
         // Reject obviously-invalid buffer pointers early to avoid faulting in
         // the shim itself (e.g. when a guest passes a corrupted buffer).
-        if buf_addr < 0x1000 && count > 0 {
-            return Err(Errno::EFAULT);
-        }
+        validate_guest_buf(buf_addr, count)?;
 
         // fd -1 is invalid — return EBADF (but we've already logged the diagnostic above).
         let raw_fd = fd_to_usize(fd)?;
@@ -423,12 +461,7 @@ impl<FS: ShimFS> Task<FS> {
     ///
     /// Dylib files are expected to already be populated in the in-mem FS at
     /// their original guest paths (e.g., `/usr/lib/libSystem.B.dylib`).
-    pub(crate) fn sys_open(
-        &self,
-        path_addr: usize,
-        flags: i32,
-        _mode: u32,
-    ) -> Result<usize, Errno> {
+    pub(crate) fn sys_open(&self, path_addr: usize, flags: i32, mode: u32) -> Result<usize, Errno> {
         let path_ptr: ConstPtr<u8> = ConstPtr::from_usize(path_addr);
         let path = read_cstring_from_guest(path_ptr, 4096).ok_or(Errno::EFAULT)?;
 
@@ -453,16 +486,17 @@ impl<FS: ShimFS> Task<FS> {
             oflags.remove(OFlags::RDWR);
         }
 
-        let typed_fd = match self
-            .global
-            .fs
-            .open(&cpath, oflags, litebox::fs::Mode::empty())
-        {
-            Ok(fd) => fd,
-            Err(e) => {
-                return Err(Self::open_error_to_errno(e));
-            }
-        };
+        let typed_fd =
+            match self
+                .global
+                .fs
+                .open(&cpath, oflags, litebox::fs::Mode::from_bits_truncate(mode))
+            {
+                Ok(fd) => fd,
+                Err(e) => {
+                    return Err(Self::open_error_to_errno(e));
+                }
+            };
 
         let raw_fd = {
             let mut rds = self.global.raw_descriptors.write();
@@ -470,9 +504,12 @@ impl<FS: ShimFS> Task<FS> {
         };
 
         // Record the path for F_GETPATH support.
+        // Use effective_path (resolved) instead of the raw user path so
+        // that e.g. open(".") records "/" and fcntl(F_GETPATH) works
+        // correctly for getcwd().
         {
             let mut paths = self.global.fd_paths.write();
-            paths.insert(raw_fd, path.clone());
+            paths.insert(raw_fd, effective_path.into());
         }
 
         Ok(raw_fd)

@@ -915,6 +915,19 @@ pub unsafe fn run_thread<T>(shim: T, ctx: &mut litebox_common_linux::PtRegs)
 where
     T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
 {
+    // Re-register exception handlers for the main thread.
+    //
+    // `install_shared_cache` resets SIGBUS/SIGSEGV/SIGTRAP to SIG_DFL
+    // (because the install thread has no TLS entry).  We must reset the
+    // `Once` guard and re-register before entering guest code.
+    //
+    // This runs in `run_thread` (not `run_thread_inner`) because it must
+    // happen exactly once — spawned threads must NOT reset the `Once` or
+    // they will race with concurrent `call_once` callers.
+    unsafe {
+        reset_exception_handler_once();
+    }
+    register_exception_handlers();
     run_thread_inner(&shim, ctx, false);
 }
 
@@ -929,6 +942,11 @@ pub unsafe fn run_thread_ref<T>(shim: &T, ctx: &mut litebox_common_linux::PtRegs
 where
     T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
 {
+    // See `run_thread` — same reset+register before entering guest code.
+    unsafe {
+        reset_exception_handler_once();
+    }
+    register_exception_handlers();
     run_thread_inner(shim, ctx, false);
 }
 
@@ -969,46 +987,14 @@ fn run_thread_inner(
         // through patched shared cache SVC stubs can find this thread's
         // TCB via the trampoline's TPIDRRO_EL0-keyed TLS table.
         update_host_tls_entry();
-        // Re-register exception handlers.  install_shared_cache resets
-        // SIGBUS/SIGSEGV/SIGTRAP to SIG_DFL (because the install thread
-        // has no TLS entry and cannot use the platform's signal handler
-        // safely).  Now that the TLS entry is populated, libc calls from
-        // the handler will work through the gate, so it is safe to
-        // re-register.
-        unsafe {
-            reset_exception_handler_once();
-        }
-        // [diag] raw asm write to stderr
-        unsafe {
-            let msg = b">>> register_exception_handlers\n";
-            core::arch::asm!(
-                "mov x0, #2", "mov x1, {buf}", "mov x2, {len}",
-                "mov x16, #0x4", "movk x16, #0x200, lsl #16", "svc #0x80",
-                buf = in(reg) msg.as_ptr(), len = in(reg) msg.len(),
-                out("x0") _, out("x1") _, out("x2") _, out("x16") _,
-                clobber_abi("C"),
-            );
-        }
+        // Re-register exception handlers if not already done.
+        //
+        // For the main thread, `run_thread` already reset the `Once`
+        // guard and re-registered handlers.  For spawned threads, the
+        // `call_once` inside `register_exception_handlers` is a no-op
+        // because the main thread already completed it.
         register_exception_handlers();
-        unsafe {
-            let msg = b">>> with_signal_alt_stack\n";
-            core::arch::asm!(
-                "mov x0, #2", "mov x1, {buf}", "mov x2, {len}",
-                "mov x16, #0x4", "movk x16, #0x200, lsl #16", "svc #0x80",
-                buf = in(reg) msg.as_ptr(), len = in(reg) msg.len(),
-                out("x0") _, out("x1") _, out("x2") _, out("x16") _,
-                clobber_abi("C"),
-            );
-        }
         with_signal_alt_stack(tcb_addr, || unsafe {
-            let msg = b">>> run_thread_arch\n";
-            core::arch::asm!(
-                "mov x0, #2", "mov x1, {buf}", "mov x2, {len}",
-                "mov x16, #0x4", "movk x16, #0x200, lsl #16", "svc #0x80",
-                buf = in(reg) msg.as_ptr(), len = in(reg) msg.len(),
-                out("x0") _, out("x1") _, out("x2") _, out("x16") _,
-                clobber_abi("C"),
-            );
             // Do NOT write TPIDR_EL0 here.  macOS system libraries
             // (libsystem_malloc's XZone allocator) use TPIDR_EL0 via
             // _os_cpu_number() for per-CPU cache lookups.  Writing our
@@ -1020,16 +1006,6 @@ fn run_thread_inner(
             // sets the guest's virtual TPIDR_EL0 just before branching
             // into guest code.
             run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter), tcb_ptr);
-            // Diagnostic: confirm run_thread_arch returned.
-            let done_msg = b">>> run_thread_arch returned
-";
-            core::arch::asm!(
-                "mov x0, #2", "mov x1, {buf}", "mov x2, {len}",
-                "mov x16, #0x4", "movk x16, #0x200, lsl #16", "svc #0x80",
-                buf = in(reg) done_msg.as_ptr(), len = in(reg) done_msg.len(),
-                out("x0") _, out("x1") _, out("x2") _, out("x16") _,
-                clobber_abi("C"),
-            );
         });
         // After run_thread_arch returns, do NOT free the TCB or remove
         // TLS entries.  Post-run cleanup code (defer guards, Arc/Mutex
@@ -1227,38 +1203,24 @@ _syscall_callback:
     b .Ldone_aarch64
 
 80:
-    // Host code hit a patched SVC in the shared cache (e.g. free, malloc,
-    // _exit, mmap). in_guest == 0, so this is NOT a guest syscall.
-    // Restore the original registers from the gate frame, execute the
-    // real SVC, and continue at the instruction after the original SVC
-    // site, as if the gate was never there.
-    //
-    // Gate frame on stack:
-    //   [SP+0]  = original x16 (syscall number)
-    //   [SP+8]  = original x17
-    //   [SP+16] = original x30 (caller's LR)
-    //   [SP+24] = guest_tpidr (overwritten by shared handler; free slot)
-    //   [SP+32] = original x18
-    //   [SP+40] = TCB pointer
-    // x30 = address after original SVC site (set by gate instructions 4/5)
-    // x0-x15 = original values (untouched by gate/shared handler)
+    // Host code passthrough: in_guest == 0, NOT a guest syscall.
+    // The gate has already saved x16, x17, x30 to the 48-byte frame
+    // at [SP+0], [SP+8], [SP+16].
 
     // Stash return-after-SVC address in a free slot.
     str x30, [sp, #24]
 
-    // Restore original x16 (syscall number), x17, and x30 (caller's LR).
+    // Restore original x16 (syscall number), x17, and x30.
     ldp x16, x17, [sp]
     ldr x30, [sp, #16]
 
-    // Execute the real SVC. SP is 48 below the caller's SP, but macOS
-    // syscalls do not reference the user stack, so this is harmless.
+    // Execute the real SVC.
     svc #0x80
 
-    // Load return-after-SVC address (stashed earlier) into x16.
-    // x16 is a scratch register that the SVC already clobbered.
+    // Load return-after-SVC address and return.
     ldr x16, [sp, #24]
-    add sp, sp, #48              // undo gate's SUB SP, SP, #48
-    br x16                       // continue at instruction after original SVC
+    add sp, sp, #48
+    br x16
     .cfi_endproc
 
     .globl _exception_callback
@@ -1452,6 +1414,22 @@ fn thread_start(
     >,
     mut ctx: litebox_common_linux::PtRegs,
 ) {
+    // Register a temporary TLS entry before any heap operations.
+    //
+    // `init_thread.init()` drops the old Box (calling `free`) and allocates
+    // a new one (`malloc`).  Both go through the shared cache, whose SVC
+    // stubs are patched to jump through the litebox gate.  The gate's
+    // trampoline looks up the TCB via the TLS table keyed by TPIDRRO_EL0.
+    // Without an entry, the trampoline loads a garbage pointer and crashes.
+    //
+    // We create a stack-allocated TCB with `in_guest = 0` and register it
+    // in the TLS table.  The gate's host-passthrough path will then
+    // correctly forward SVCs to the real kernel.  `run_thread_inner` later
+    // replaces this with a heap-allocated TCB.
+    let mut temp_tcb = ThreadControlBlock::default();
+    TCB_PTR.set(&raw mut temp_tcb);
+    update_host_tls_entry();
+
     // Allow caller to run some code before we return to the new thread.
     let shim = init_thread.init();
 
@@ -2735,27 +2713,6 @@ unsafe extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext) {
             let lr = thread_ctx.ctx.regs[30];
             let sigtramp = get_sigtramp_addr();
 
-            // Diagnostic: print what we see.
-            // Format: "[sigreturn-check] nr=XXXXXXXXXXXXXXXX lr=XXXXXXXXXXXXXXXX sigtramp=XXXXXXXXXXXXXXXX\n"
-            {
-                let mut buf = [0u8; 128];
-                let prefix = b"[sigreturn-check] nr=";
-                buf[..prefix.len()].copy_from_slice(prefix);
-                let mut pos = prefix.len();
-                pos = write_hex_to_buf(&mut buf, pos, nr as u64);
-                let s1 = b" lr=";
-                buf[pos..pos + s1.len()].copy_from_slice(s1);
-                pos += s1.len();
-                pos = write_hex_to_buf(&mut buf, pos, lr as u64);
-                let s2 = b" sigtramp=";
-                buf[pos..pos + s2.len()].copy_from_slice(s2);
-                pos += s2.len();
-                pos = write_hex_to_buf(&mut buf, pos, sigtramp as u64);
-                buf[pos] = b'\n';
-                pos += 1;
-                raw_debug_write(&buf[..pos]);
-            }
-
             // _sigtramp is typically ~100 bytes; use 256 for safety.
             if sigtramp != 0 && lr >= sigtramp && lr < sigtramp + 256 {
                 let uctx = thread_ctx.ctx.regs[0];
@@ -4027,88 +3984,9 @@ unsafe extern "C" fn exception_signal_handler(
         }
     }
 
-    // Diagnostic: log the incoming signal + PC + LR + ESR before doing anything else.
-    #[allow(clippy::cast_possible_truncation)]
-    {
-        let pc = unsafe { (*context.uc_mcontext).__ss.__pc as usize };
-        let far = unsafe { (*context.uc_mcontext).__es.__far as usize };
-        let lr = unsafe { (*context.uc_mcontext).__ss.__lr as usize };
-        let esr = unsafe { u64::from((*context.uc_mcontext).__es.__esr) };
-        let mut buf = [0u8; 220];
-        let prefix = b"[exc_sig_handler] sig=";
-        buf[..prefix.len()].copy_from_slice(prefix);
-        let mut pos = prefix.len();
-        #[allow(clippy::cast_sign_loss)]
-        let sig_u = signum as u8;
-        if sig_u >= 10 {
-            buf[pos] = b'0' + sig_u / 10;
-            pos += 1;
-        }
-        buf[pos] = b'0' + sig_u % 10;
-        pos += 1;
-        let s1 = b" pc=";
-        buf[pos..pos + s1.len()].copy_from_slice(s1);
-        pos += s1.len();
-        pos = write_hex_to_buf(&mut buf, pos, pc as u64);
-        let s2 = b" lr=";
-        buf[pos..pos + s2.len()].copy_from_slice(s2);
-        pos += s2.len();
-        pos = write_hex_to_buf(&mut buf, pos, lr as u64);
-        let s3 = b" far=";
-        buf[pos..pos + s3.len()].copy_from_slice(s3);
-        pos += s3.len();
-        pos = write_hex_to_buf(&mut buf, pos, far as u64);
-        let s4 = b" esr=";
-        buf[pos..pos + s4.len()].copy_from_slice(s4);
-        pos += s4.len();
-        pos = write_hex_to_buf(&mut buf, pos, esr);
-        buf[pos] = b'\n';
-        pos += 1;
-        raw_debug_write(&buf[..pos]);
-    }
-
     let Some((regs, host_tls)) = signal_handler_exit_guest(context, false) else {
-        // Diagnostic: log that we're NOT in guest, plus TPIDRRO_EL0
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            let tpidrro = unsafe { litebox_common_linux::read_tpidrro_el0() } as u64;
-            let mut buf = [0u8; 128];
-            let msg = b"[exc_sig_handler] not-in-guest tpidrro=";
-            buf[..msg.len()].copy_from_slice(msg);
-            let mut pos = msg.len();
-            pos = write_hex_to_buf(&mut buf, pos, tpidrro);
-            buf[pos] = b'\n';
-            pos += 1;
-            raw_debug_write(&buf[..pos]);
-        }
         return unsafe { next_signal_handler(signum, info, context) };
     };
-
-    // Diagnostic: log that we're in guest and routing to exception_callback
-    #[allow(clippy::cast_possible_truncation)]
-    {
-        let tpidrro = unsafe { litebox_common_linux::read_tpidrro_el0() } as u64;
-        let mut buf = [0u8; 180];
-        let msg = b"[exc_sig_handler] in-guest, exc_cb=";
-        buf[..msg.len()].copy_from_slice(msg);
-        let mut pos = msg.len();
-        pos = write_hex_to_buf(
-            &mut buf,
-            pos,
-            exception_callback as *const () as usize as u64,
-        );
-        let s1 = b" host_tls=";
-        buf[pos..pos + s1.len()].copy_from_slice(s1);
-        pos += s1.len();
-        pos = write_hex_to_buf(&mut buf, pos, host_tls as u64);
-        let s2 = b" tpidrro=";
-        buf[pos..pos + s2.len()].copy_from_slice(s2);
-        pos += s2.len();
-        pos = write_hex_to_buf(&mut buf, pos, tpidrro);
-        buf[pos] = b'\n';
-        pos += 1;
-        raw_debug_write(&buf[..pos]);
-    }
 
     copy_signal_context(unsafe { &mut *regs }, context);
 
@@ -4141,36 +4019,6 @@ unsafe fn next_signal_handler(
     info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
-    // Diagnostic: log signal number and faulting PC.
-    #[allow(clippy::cast_possible_truncation)]
-    {
-        let pc = unsafe { (*context.uc_mcontext).__ss.__pc as usize };
-        let far = unsafe { (*context.uc_mcontext).__es.__far as usize };
-        let mut buf = [0u8; 128];
-        let prefix = b"[next_signal_handler] sig=";
-        buf[..prefix.len()].copy_from_slice(prefix);
-        let mut pos = prefix.len();
-        // Write signum as decimal (1-2 digits)
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        let sig_u = signum as u8;
-        if sig_u >= 10 {
-            buf[pos] = b'0' + sig_u / 10;
-            pos += 1;
-        }
-        buf[pos] = b'0' + sig_u % 10;
-        pos += 1;
-        let s1 = b" pc=";
-        buf[pos..pos + s1.len()].copy_from_slice(s1);
-        pos += s1.len();
-        pos = write_hex_to_buf(&mut buf, pos, pc as u64);
-        let s2 = b" far=";
-        buf[pos..pos + s2.len()].copy_from_slice(s2);
-        pos += s2.len();
-        pos = write_hex_to_buf(&mut buf, pos, far as u64);
-        buf[pos] = b'\n';
-        pos += 1;
-        raw_debug_write(&buf[..pos]);
-    }
     // On macOS, memory faults can be delivered as either SIGSEGV or SIGBUS
     // (e.g., NULL dereference on ARM64 is typically SIGBUS). Check both
     // for exception table recovery.

@@ -269,6 +269,7 @@ fn test_thread_exit() {
 }
 
 #[test]
+#[ignore = "requires root for utun IP configuration"]
 #[allow(clippy::cast_precision_loss)]
 fn test_tcp_echo() {
     let cache_dir = std::path::Path::new("/System/Cryptexes/OS/System/Library/dyld");
@@ -291,11 +292,12 @@ fn test_tcp_echo() {
     let bin_path = common::compile_macho_dynamic("./tests/tcp_echo.c", "tcp_echo");
     let binary_data = std::fs::read(&bin_path).expect("read binary");
 
-    let (exit_code, _stdout) = common::run_macho_dynamic(
+    let (exit_code, _stdout) = common::run_macho_dynamic_with_utun(
         &binary_data,
         &["/usr/bin/tcp_echo"],
         &cache_result,
         "tcp_echo",
+        Some("utun98"),
     );
     assert_eq!(
         exit_code, 0,
@@ -304,6 +306,7 @@ fn test_tcp_echo() {
 }
 
 #[test]
+#[ignore = "requires root for utun IP configuration"]
 #[allow(clippy::cast_precision_loss)]
 fn test_udp_sendrecv() {
     let cache_dir = std::path::Path::new("/System/Cryptexes/OS/System/Library/dyld");
@@ -326,11 +329,12 @@ fn test_udp_sendrecv() {
     let bin_path = common::compile_macho_dynamic("./tests/udp_sendrecv.c", "udp_sendrecv");
     let binary_data = std::fs::read(&bin_path).expect("read binary");
 
-    let (exit_code, _stdout) = common::run_macho_dynamic(
+    let (exit_code, _stdout) = common::run_macho_dynamic_with_utun(
         &binary_data,
         &["/usr/bin/udp_sendrecv"],
         &cache_result,
         "udp_sendrecv",
+        Some("utun97"),
     );
     assert_eq!(
         exit_code, 0,
@@ -511,6 +515,7 @@ fn test_kqueue() {
 }
 
 #[test]
+#[ignore = "requires root for utun IP configuration"]
 #[allow(clippy::cast_precision_loss)]
 fn test_select_socket() {
     let cache_dir = std::path::Path::new("/System/Cryptexes/OS/System/Library/dyld");
@@ -533,11 +538,12 @@ fn test_select_socket() {
     let bin_path = common::compile_macho_dynamic("./tests/select_socket.c", "select_socket_test");
     let binary_data = std::fs::read(&bin_path).expect("read binary");
 
-    let (exit_code, _stdout) = common::run_macho_dynamic(
+    let (exit_code, _stdout) = common::run_macho_dynamic_with_utun(
         &binary_data,
         &["/usr/bin/select_socket_test"],
         &cache_result,
         "select_socket_test",
+        Some("utun96"),
     );
     assert_eq!(
         exit_code, 0,

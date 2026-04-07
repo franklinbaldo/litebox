@@ -18,7 +18,7 @@ int main(void) {
     addr.sin_family = AF_INET;
     addr.sin_port = 0; // let kernel assign port
     unsigned char *ip = (unsigned char *)&addr.sin_addr;
-    ip[0] = 127; ip[1] = 0; ip[2] = 0; ip[3] = 1;
+    ip[0] = 10; ip[1] = 0; ip[2] = 0; ip[3] = 2;
 
     if (bind(server, (struct sockaddr *)&addr, sizeof(addr)) < 0) return 2;
     if (listen(server, 1) < 0) return 3;

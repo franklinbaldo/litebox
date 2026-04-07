@@ -7,13 +7,13 @@
 
 pub mod arm64;
 
+pub use arm64::PatchSite;
 pub use arm64::patch_code_segment_prescan;
 pub use arm64::scan_svc_sites;
-pub use arm64::PatchSite;
 
+use object::Endianness;
 use object::macho;
 use object::read::macho::{MachHeader, Segment};
-use object::Endianness;
 use thiserror::Error;
 
 #[derive(Error, Debug)]

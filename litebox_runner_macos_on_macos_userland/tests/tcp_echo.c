@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 // Test: TCP echo — server thread accepts a connection, echoes data back.
-// Uses threads: server binds to 127.0.0.1:0, getsockname() to discover port,
+// Uses threads: server binds to 10.0.0.2:0, getsockname() to discover port,
 // client connects and sends "hello tcp", verifies echoed data.
 // Exit codes: 0 = success, 1-20 = specific failure step.
 
@@ -28,13 +28,13 @@ static void *server_thread(void *arg) {
     int opt = 1;
     setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    // Bind to 127.0.0.1:0 (auto-assign port)
+    // Bind to 10.0.0.2:0 (auto-assign port)
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_len = sizeof(addr);
     addr.sin_family = AF_INET;
     addr.sin_port = 0;
-    addr.sin_addr.s_addr = htonl(0x7f000001); // 127.0.0.1
+    addr.sin_addr.s_addr = htonl(0x0a000002); // 10.0.0.2
 
     if (bind(sfd, (struct sockaddr *)&addr, sizeof(addr)) != 0) _exit(2);
 
@@ -87,7 +87,7 @@ int main(void) {
     srv_addr.sin_len = sizeof(srv_addr);
     srv_addr.sin_family = AF_INET;
     srv_addr.sin_port = htons((uint16_t)g_port);
-    srv_addr.sin_addr.s_addr = htonl(0x7f000001);
+    srv_addr.sin_addr.s_addr = htonl(0x0a000002);
 
     if (connect(cfd, (struct sockaddr *)&srv_addr, sizeof(srv_addr)) != 0) _exit(12);
 

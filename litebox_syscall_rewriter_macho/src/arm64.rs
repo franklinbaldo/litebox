@@ -48,6 +48,15 @@ unsafe fn volatile_copy(dst: *mut u8, src: *const u8, len: usize) {
 /// `SVC #0x80` encoding: 0xD4001001
 pub const SVC_0X80: u32 = 0xD4001001;
 
+/// `DMB ISH` (data memory barrier, inner shareable) encoding.
+///
+/// Ensures that all preceding data memory accesses from any core in the
+/// inner shareable domain are visible before any subsequent data memory
+/// accesses. Used in the shared SVC handler to guarantee that TLS table
+/// stores from `update_host_tls_entry` (which uses atomic compare-exchange)
+/// are visible to the handler's plain LDR loads on different cores.
+const DMB_ISH: u32 = 0xD503_3BBF;
+
 /// Metadata for an executable section in the Mach-O.
 #[derive(Debug)]
 pub struct TextSectionInfo {
@@ -274,6 +283,7 @@ fn encode_mrs_tpidrro_el0(rt: u8) -> u32 {
 }
 
 /// Encode `BRK #imm16` (breakpoint exception).
+#[allow(dead_code)]
 fn encode_brk(imm16: u16) -> u32 {
     0xD420_0000 | (u32::from(imm16) << 5)
 }
@@ -300,6 +310,28 @@ pub fn encode_stp_offset(rt: u8, rt2: u8, rn: u8, imm_bytes: i16) -> Option<u32>
     )
 }
 
+/// Encode `LDP Xt1, Xt2, [Xn, #imm]` (load pair, 64-bit, signed offset).
+///
+/// The offset must be a multiple of 8 and within [-512, 504].
+fn encode_ldp_offset(rt: u8, rt2: u8, rn: u8, imm_bytes: i16) -> Option<u32> {
+    if imm_bytes % 8 != 0 {
+        return None;
+    }
+    let imm7 = imm_bytes / 8;
+    if !(-64..=63).contains(&imm7) {
+        return None;
+    }
+    #[allow(clippy::cast_sign_loss)]
+    let imm7_u = (imm7 as u32) & 0x7F;
+    Some(
+        0xA940_0000
+            | (imm7_u << 15)
+            | (u32::from(rt2) << 10)
+            | (u32::from(rn) << 5)
+            | u32::from(rt),
+    )
+}
+
 // ============================================================
 // Trampoline layout constants
 // ============================================================
@@ -311,7 +343,7 @@ pub const HEADER_CALLBACK_OFFSET: usize = 0;
 pub const HEADER_TLS_TABLE_OFFSET: usize = 8;
 
 /// Number of instructions in the shared SVC handler (macOS).
-const SHARED_SVC_HANDLER_INSN_COUNT: usize = 18;
+const SHARED_SVC_HANDLER_INSN_COUNT: usize = 28;
 
 /// Size of the shared SVC handler in bytes.
 pub const SHARED_SVC_HANDLER_SIZE: usize = SHARED_SVC_HANDLER_INSN_COUNT * 4;
@@ -334,26 +366,37 @@ pub const SVC_GATE_SIZE: usize = SVC_GATE_INSN_COUNT * 4;
 /// This handler performs TLS lookup via TPIDRRO_EL0, then jumps to the
 /// syscall callback. It is shared by all SVC gates.
 ///
-/// Layout (18 instructions, 72 bytes):
+/// Layout (28 instructions, 112 bytes):
 /// ```text
 /// [0]  MRS  X17, TPIDRRO_EL0      ; per-thread key
 /// [1]  LDR  X16, [PC, #off]       ; X16 = TLS table base
-/// [2]  .Lloop: LDR X18, [X16, #0] ; entry.tpidrro
-/// [3]  CMN  X18, #1               ; sentinel?
-/// [4]  B.EQ .Ltrap                ; → [17]
-/// [5]  CMP  X18, X17              ; match?
-/// [6]  B.EQ .Lfound               ; → [9]
-/// [7]  ADD  X16, X16, #16         ; next entry
-/// [8]  B    .Lloop                ; → [2]
-/// [9]  .Lfound: LDR X16, [X16, #8] ; host_tls
-/// [10] LDR  X17, [X16, #24]       ; TCB.guest_tpidr
-/// [11] STR  X17, [SP, #24]        ; frame.guest_tpidr
-/// [12] LDR  X17, [SP, #32]        ; guest x18 (from gate)
-/// [13] STR  X17, [X16, #40]       ; TCB.guest_x18
-/// [14] STR  X16, [SP, #40]        ; host_tls → frame
-/// [15] LDR  X16, [PC, #off]       ; callback addr
-/// [16] BR   X16                   ; jump to callback
-/// [17] .Ltrap: BRK #1             ; unreachable
+/// [2]  DMB  ISH                    ; ensure cross-core TLS stores visible
+/// [3]  STR  X9,  [SP, #24]        ; save X9 (frame slot reused)
+/// [4]  .Lloop: LDR X9, [X16, #0]  ; entry key
+/// [5]  CMN  X9, #1                ; sentinel?
+/// [6]  B.EQ .Lpassthrough [20]
+/// [7]  CMP  X9, X17               ; match?
+/// [8]  B.EQ .Lfound [11]
+/// [9]  ADD  X16, X16, #16
+/// [10] B    .Lloop [4]
+/// [11] .Lfound: LDR X9, [SP, #24] ; restore X9
+/// [12] LDR  X16, [X16, #8]        ; TCB pointer
+/// [13] LDR  X17, [X16, #24]       ; guest_tpidr
+/// [14] STR  X17, [SP, #24]        ; frame[24] = guest_tpidr
+/// [15] LDR  X17, [SP, #32]        ; guest_x18
+/// [16] STR  X17, [X16, #40]       ; TCB.guest_x18
+/// [17] STR  X16, [SP, #40]        ; host_tls → frame
+/// [18] LDR  X16, [PC, #off]       ; callback addr
+/// [19] BR   X16                    ; jump to callback
+/// -- PASSTHROUGH (TLS scan hit sentinel) --
+/// [20] LDR  X9,  [SP, #24]        ; restore X9
+/// [21] STR  X30, [SP, #24]        ; stash return addr
+/// [22] LDP  X16, X17, [SP]        ; restore orig x16, x17
+/// [23] LDR  X30, [SP, #16]        ; restore LR
+/// [24] SVC  #0x80                 ; real syscall
+/// [25] LDR  X16, [SP, #24]        ; load return addr
+/// [26] ADD  SP, SP, #48           ; undo gate frame
+/// [27] BR   X16                   ; return
 /// ```
 /// # Panics
 ///
@@ -385,21 +428,44 @@ pub fn emit_shared_svc_handler_macos(
     trampoline_data.extend_from_slice(&ldr_tls_insn.to_le_bytes());
     insn_idx += 1;
 
-    // [2] .Lloop: LDR X18, [X16, #0]
+    // [2] DMB ISH — data memory barrier (inner shareable).
+    // Ensures that TLS table stores from other cores (via
+    // `update_host_tls_entry` using AtomicU64 compare_exchange) are
+    // visible to the plain LDR loads in the TLS scan loop below.
+    // Without this barrier, a spawned thread running on a different core
+    // can see stale (sentinel) values in the TLS table even though Rust
+    // has already written its entry.
+    trampoline_data.extend_from_slice(&DMB_ISH.to_le_bytes());
+    insn_idx += 1;
+
+    // [3] STR X9, [SP, #24] — save X9 (frame[24] is unused during TLS scan)
+    // Using X9 instead of X18 for TLS key scan: XNU zeros X18 on EVERY
+    // kernel→userspace transition (preemptive context switches via FIQ timer),
+    // not just signal delivery. Even though the scan loop is only ~4 instructions,
+    // on Apple Silicon the FIQ preemption timer can fire at any instruction
+    // boundary, leaving X18=0 mid-scan and causing the TLS lookup to fail.
+    trampoline_data.extend_from_slice(
+        &encode_str_imm_unsigned(9, 31, 24)
+            .expect("offset 24 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [4] .Lloop: LDR X9, [X16, #0]
     let loop_idx = insn_idx;
     trampoline_data.extend_from_slice(
-        &encode_ldr_imm_unsigned(18, 16, 0)
+        &encode_ldr_imm_unsigned(9, 16, 0)
             .expect("offset 0 valid")
             .to_le_bytes(),
     );
     insn_idx += 1;
 
-    // [3] CMN X18, #1
-    trampoline_data.extend_from_slice(&encode_cmn_imm(18, 1).expect("imm12=1 fits").to_le_bytes());
+    // [5] CMN X9, #1
+    trampoline_data.extend_from_slice(&encode_cmn_imm(9, 1).expect("imm12=1 fits").to_le_bytes());
     insn_idx += 1;
 
-    // [4] B.EQ .Ltrap -> [17]
-    let trap_idx = 17usize;
+    // [6] B.EQ .Lpassthrough -> [20]
+    let trap_idx = 20usize;
     let beq_trap_offset = (trap_idx as i64 - insn_idx as i64) * 4;
     let beq_trap = encode_b_cond(COND_EQ, beq_trap_offset).ok_or_else(|| {
         crate::Error::DisassemblyFailure(format!(
@@ -409,12 +475,12 @@ pub fn emit_shared_svc_handler_macos(
     trampoline_data.extend_from_slice(&beq_trap.to_le_bytes());
     insn_idx += 1;
 
-    // [5] CMP X18, X17
-    trampoline_data.extend_from_slice(&encode_cmp_reg(18, 17).to_le_bytes());
+    // [7] CMP X9, X17
+    trampoline_data.extend_from_slice(&encode_cmp_reg(9, 17).to_le_bytes());
     insn_idx += 1;
 
-    // [6] B.EQ .Lfound -> [9]
-    let found_idx = 9usize;
+    // [8] B.EQ .Lfound -> [11]
+    let found_idx = 11usize;
     let beq_found_offset = (found_idx as i64 - insn_idx as i64) * 4;
     let beq_found = encode_b_cond(COND_EQ, beq_found_offset).ok_or_else(|| {
         crate::Error::DisassemblyFailure(format!(
@@ -424,7 +490,7 @@ pub fn emit_shared_svc_handler_macos(
     trampoline_data.extend_from_slice(&beq_found.to_le_bytes());
     insn_idx += 1;
 
-    // [7] ADD X16, X16, #16
+    // [9] ADD X16, X16, #16
     trampoline_data.extend_from_slice(
         &encode_add_imm(16, 16, 16)
             .expect("imm12=16 fits")
@@ -432,7 +498,7 @@ pub fn emit_shared_svc_handler_macos(
     );
     insn_idx += 1;
 
-    // [8] B .Lloop -> [2]
+    // [10] B .Lloop -> [4]
     let b_loop_offset = (loop_idx as i64 - insn_idx as i64) * 4;
     let b_loop = encode_b(b_loop_offset).ok_or_else(|| {
         crate::Error::DisassemblyFailure(format!(
@@ -442,8 +508,16 @@ pub fn emit_shared_svc_handler_macos(
     trampoline_data.extend_from_slice(&b_loop.to_le_bytes());
     insn_idx += 1;
 
-    // [9] .Lfound: LDR X16, [X16, #8]
+    // [11] .Lfound: LDR X9, [SP, #24] — restore X9
     debug_assert_eq!(insn_idx, found_idx);
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(9, 31, 24)
+            .expect("offset 24 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [12] LDR X16, [X16, #8] — X16 = TCB pointer
     trampoline_data.extend_from_slice(
         &encode_ldr_imm_unsigned(16, 16, 8)
             .expect("offset 8 valid")
@@ -451,7 +525,7 @@ pub fn emit_shared_svc_handler_macos(
     );
     insn_idx += 1;
 
-    // [10] LDR X17, [X16, #24]
+    // [13] LDR X17, [X16, #24]
     trampoline_data.extend_from_slice(
         &encode_ldr_imm_unsigned(17, 16, 24)
             .expect("offset 24 valid")
@@ -459,7 +533,7 @@ pub fn emit_shared_svc_handler_macos(
     );
     insn_idx += 1;
 
-    // [11] STR X17, [SP, #24]
+    // [14] STR X17, [SP, #24]
     trampoline_data.extend_from_slice(
         &encode_str_imm_unsigned(17, 31, 24)
             .expect("offset 24 valid")
@@ -467,7 +541,7 @@ pub fn emit_shared_svc_handler_macos(
     );
     insn_idx += 1;
 
-    // [12] LDR X17, [SP, #32]
+    // [15] LDR X17, [SP, #32]
     trampoline_data.extend_from_slice(
         &encode_ldr_imm_unsigned(17, 31, 32)
             .expect("offset 32 valid")
@@ -475,7 +549,7 @@ pub fn emit_shared_svc_handler_macos(
     );
     insn_idx += 1;
 
-    // [13] STR X17, [X16, #40]
+    // [16] STR X17, [X16, #40]
     trampoline_data.extend_from_slice(
         &encode_str_imm_unsigned(17, 16, 40)
             .expect("offset 40 valid")
@@ -483,7 +557,7 @@ pub fn emit_shared_svc_handler_macos(
     );
     insn_idx += 1;
 
-    // [14] STR X16, [SP, #40]
+    // [17] STR X16, [SP, #40]
     trampoline_data.extend_from_slice(
         &encode_str_imm_unsigned(16, 31, 40)
             .expect("offset 40 valid")
@@ -491,7 +565,7 @@ pub fn emit_shared_svc_handler_macos(
     );
     insn_idx += 1;
 
-    // [15] LDR X16, [PC, #offset_to_callback]
+    // [18] LDR X16, [PC, #offset_to_callback]
     let ldr_cb_vaddr = insn_vaddr(insn_idx);
     let callback_vaddr = trampoline_base_addr + HEADER_CALLBACK_OFFSET as u64;
     let ldr_cb_offset = callback_vaddr as i64 - ldr_cb_vaddr as i64;
@@ -503,13 +577,65 @@ pub fn emit_shared_svc_handler_macos(
     trampoline_data.extend_from_slice(&ldr_cb_insn.to_le_bytes());
     insn_idx += 1;
 
-    // [16] BR X16
+    // [19] BR X16
     trampoline_data.extend_from_slice(&encode_br(16).to_le_bytes());
     insn_idx += 1;
 
-    // [17] .Ltrap: BRK #1
+    // [20] .Lpassthrough: LDR X9, [SP, #24] — restore X9
     debug_assert_eq!(insn_idx, trap_idx);
-    trampoline_data.extend_from_slice(&encode_brk(1).to_le_bytes());
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(9, 31, 24)
+            .expect("offset 24 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [21] STR X30, [SP, #24] — stash return addr
+    trampoline_data.extend_from_slice(
+        &encode_str_imm_unsigned(30, 31, 24)
+            .expect("offset 24 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [22] LDP X16, X17, [SP] — restore original x16 (syscall#), x17
+    trampoline_data.extend_from_slice(
+        &encode_ldp_offset(16, 17, 31, 0)
+            .expect("offset 0 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [23] LDR X30, [SP, #16] — restore caller's LR
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(30, 31, 16)
+            .expect("offset 16 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [24] SVC #0x80 — execute real syscall on host
+    trampoline_data.extend_from_slice(&SVC_0X80.to_le_bytes());
+    insn_idx += 1;
+
+    // [25] LDR X16, [SP, #24] — load stashed return addr
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(16, 31, 24)
+            .expect("offset 24 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [26] ADD SP, SP, #48 — undo gate's SUB SP, SP, #48
+    trampoline_data.extend_from_slice(
+        &encode_add_imm(31, 31, 48)
+            .expect("imm12=48 fits")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [27] BR X16 — return to instruction after original SVC
+    trampoline_data.extend_from_slice(&encode_br(16).to_le_bytes());
     insn_idx += 1;
 
     debug_assert_eq!(insn_idx, SHARED_SVC_HANDLER_INSN_COUNT);
@@ -755,49 +881,57 @@ fn emit_shared_svc_handler_to_slice(
         )
     })?;
     emit!(ldr_tls_insn);
-    // [2] .Lloop: LDR X18, [X16, #0]
+    // [2] DMB ISH — ensure cross-core TLS stores visible
+    emit!(DMB_ISH);
+    // [3] STR X9, [SP, #24] — save X9 (frame[24] is unused during TLS scan)
+    // Using X9 instead of X18 for TLS key scan: XNU zeros X18 on EVERY
+    // kernel→userspace transition (preemptive context switches via FIQ timer).
+    emit!(encode_str_imm_unsigned(9, 31, 24).expect("offset 24 valid"));
+    // [4] .Lloop: LDR X9, [X16, #0]
     let loop_idx = insn_idx;
-    emit!(encode_ldr_imm_unsigned(18, 16, 0).expect("offset 0 valid"));
-    // [3] CMN X18, #1
-    emit!(encode_cmn_imm(18, 1).expect("imm12=1 fits"));
-    // [4] B.EQ .Ltrap -> [17]
-    let trap_idx = 17usize;
+    emit!(encode_ldr_imm_unsigned(9, 16, 0).expect("offset 0 valid"));
+    // [5] CMN X9, #1
+    emit!(encode_cmn_imm(9, 1).expect("imm12=1 fits"));
+    // [6] B.EQ .Lpassthrough -> [20]
+    let trap_idx = 20usize;
     let beq_trap_offset = (trap_idx as i64 - insn_idx as i64) * 4;
     let beq_trap = encode_b_cond(COND_EQ, beq_trap_offset).ok_or_else(|| {
         crate::Error::DisassemblyFailure("B.EQ offset out of range in shared SVC handler".into())
     })?;
     emit!(beq_trap);
-    // [5] CMP X18, X17
-    emit!(encode_cmp_reg(18, 17));
-    // [6] B.EQ .Lfound -> [9]
-    let found_idx = 9usize;
+    // [7] CMP X9, X17
+    emit!(encode_cmp_reg(9, 17));
+    // [8] B.EQ .Lfound -> [11]
+    let found_idx = 11usize;
     let beq_found_offset = (found_idx as i64 - insn_idx as i64) * 4;
     let beq_found = encode_b_cond(COND_EQ, beq_found_offset).ok_or_else(|| {
         crate::Error::DisassemblyFailure("B.EQ offset out of range in shared SVC handler".into())
     })?;
     emit!(beq_found);
-    // [7] ADD X16, X16, #16
+    // [9] ADD X16, X16, #16
     emit!(encode_add_imm(16, 16, 16).expect("imm12=16 fits"));
-    // [8] B .Lloop -> [2]
+    // [10] B .Lloop -> [4]
     let b_loop_offset = (loop_idx as i64 - insn_idx as i64) * 4;
     let b_loop = encode_b(b_loop_offset).ok_or_else(|| {
         crate::Error::DisassemblyFailure("B offset out of range in shared SVC handler loop".into())
     })?;
     emit!(b_loop);
-    // [9] .Lfound: LDR X16, [X16, #8]
+    // [11] .Lfound: LDR X9, [SP, #24] — restore X9
     debug_assert_eq!(insn_idx, found_idx);
+    emit!(encode_ldr_imm_unsigned(9, 31, 24).expect("offset 24 valid"));
+    // [12] LDR X16, [X16, #8] — X16 = TCB pointer
     emit!(encode_ldr_imm_unsigned(16, 16, 8).expect("offset 8 valid"));
-    // [10] LDR X17, [X16, #24]
+    // [13] LDR X17, [X16, #24]
     emit!(encode_ldr_imm_unsigned(17, 16, 24).expect("offset 24 valid"));
-    // [11] STR X17, [SP, #24]
+    // [14] STR X17, [SP, #24]
     emit!(encode_str_imm_unsigned(17, 31, 24).expect("offset 24 valid"));
-    // [12] LDR X17, [SP, #32]
+    // [15] LDR X17, [SP, #32]
     emit!(encode_ldr_imm_unsigned(17, 31, 32).expect("offset 32 valid"));
-    // [13] STR X17, [X16, #40]
+    // [16] STR X17, [X16, #40]
     emit!(encode_str_imm_unsigned(17, 16, 40).expect("offset 40 valid"));
-    // [14] STR X16, [SP, #40]
+    // [17] STR X16, [SP, #40]
     emit!(encode_str_imm_unsigned(16, 31, 40).expect("offset 40 valid"));
-    // [15] LDR X16, [PC, #offset_to_callback]
+    // [18] LDR X16, [PC, #offset_to_callback]
     let ldr_cb_vaddr = insn_vaddr(insn_idx);
     let callback_vaddr = trampoline_base_addr + HEADER_CALLBACK_OFFSET as u64;
     let ldr_cb_offset = callback_vaddr as i64 - ldr_cb_vaddr as i64;
@@ -807,11 +941,25 @@ fn emit_shared_svc_handler_to_slice(
         )
     })?;
     emit!(ldr_cb_insn);
-    // [16] BR X16
+    // [19] BR X16
     emit!(encode_br(16));
-    // [17] .Ltrap: BRK #1
+    // [20] .Lpassthrough: LDR X9, [SP, #24] — restore X9
     debug_assert_eq!(insn_idx, trap_idx);
-    emit!(encode_brk(1));
+    emit!(encode_ldr_imm_unsigned(9, 31, 24).expect("offset 24 valid"));
+    // [21] STR X30, [SP, #24] — stash return addr
+    emit!(encode_str_imm_unsigned(30, 31, 24).expect("offset 24 valid"));
+    // [22] LDP X16, X17, [SP] — restore original x16 (syscall#), x17
+    emit!(encode_ldp_offset(16, 17, 31, 0).expect("offset 0 valid"));
+    // [23] LDR X30, [SP, #16] — restore caller's LR
+    emit!(encode_ldr_imm_unsigned(30, 31, 16).expect("offset 16 valid"));
+    // [24] SVC #0x80 — execute real syscall on host
+    emit!(SVC_0X80);
+    // [25] LDR X16, [SP, #24] — load stashed return addr
+    emit!(encode_ldr_imm_unsigned(16, 31, 24).expect("offset 24 valid"));
+    // [26] ADD SP, SP, #48 — undo gate's SUB SP, SP, #48
+    emit!(encode_add_imm(31, 31, 48).expect("imm12=48 fits"));
+    // [27] BR X16 — return to instruction after original SVC
+    emit!(encode_br(16));
 
     debug_assert_eq!(insn_idx, SHARED_SVC_HANDLER_INSN_COUNT);
     debug_assert_eq!(pos, SHARED_SVC_HANDLER_SIZE);

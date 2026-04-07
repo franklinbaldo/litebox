@@ -684,15 +684,25 @@ impl<FS: ShimFS> Task<FS> {
                     core::net::Ipv4Addr::UNSPECIFIED,
                     0,
                 ));
-                let peer_arg = if want_peer { Some(&mut peer_ep) } else { None };
-
-                // Accept (non-blocking for now).
-                let accepted_fd = match self.global.net.lock().accept(&typed_fd, peer_arg) {
-                    Ok(new_fd) => new_fd,
-                    Err(AcceptError::NoConnectionsReady) => {
-                        return Err(Errno::EAGAIN);
+                // Blocking accept: retry until a connection arrives or
+                // the process signals exit.  The in-memory network
+                // `accept` is non-blocking, so we spin with a short
+                // sleep to avoid burning CPU while waiting for a peer
+                // `connect` on another thread.
+                let accepted_fd = loop {
+                    let arg = if want_peer { Some(&mut peer_ep) } else { None };
+                    let mut net = self.global.net.lock();
+                    net.drive_network();
+                    match net.accept(&typed_fd, arg) {
+                        Ok(new_fd) => break new_fd,
+                        Err(AcceptError::NoConnectionsReady) => {
+                            drop(net);
+                            // Yield briefly and retry.
+                            let cx = self.wait_cx().with_timeout(Duration::from_millis(1));
+                            let _ = cx.sleep();
+                        }
+                        Err(e) => return Err(accept_error_to_errno(e)),
                     }
-                    Err(e) => return Err(accept_error_to_errno(e)),
                 };
 
                 // Initialize the accepted socket's proxy.
@@ -728,7 +738,18 @@ impl<FS: ShimFS> Task<FS> {
             .clone();
         drop(unix_sockets);
 
-        let (server_rx, server_tx, client_addr) = socket.try_accept()?;
+        // Blocking accept: retry until a connection is pushed into the
+        // backlog by a peer connect() on another thread.
+        let (server_rx, server_tx, client_addr) = loop {
+            match socket.try_accept() {
+                Ok(result) => break result,
+                Err(Errno::EAGAIN) => {
+                    let cx = self.wait_cx().with_timeout(Duration::from_millis(1));
+                    let _ = cx.sleep();
+                }
+                Err(e) => return Err(e),
+            }
+        };
 
         // Create the accepted socket.
         let accepted = Arc::new(crate::syscalls::unix::UnixSocket::<FS>::new(
@@ -762,11 +783,30 @@ impl<FS: ShimFS> Task<FS> {
                     .fd_from_raw_integer::<Network<Platform>>(fd as usize)
                     .map_err(|_| Errno::ENOTSOCK)?;
                 drop(rds);
-                self.global
-                    .net
-                    .lock()
-                    .connect(&typed_fd, &core::net::SocketAddr::V4(endpoint), false)
-                    .map_err(connect_error_to_errno)
+                // Initiate the connection.
+                {
+                    let mut net = self.global.net.lock();
+                    net.drive_network();
+                    match net.connect(&typed_fd, &core::net::SocketAddr::V4(endpoint), false) {
+                        Ok(()) => return Ok(()),
+                        Err(ConnectError::InProgress) => {}
+                        Err(e) => return Err(connect_error_to_errno(e)),
+                    }
+                }
+                // Blocking connect: the TCP handshake is in progress
+                // (SYN sent). Poll the network and retry until the
+                // connection is established or fails.
+                loop {
+                    let cx = self.wait_cx().with_timeout(Duration::from_millis(1));
+                    let _ = cx.sleep();
+                    let mut net = self.global.net.lock();
+                    net.drive_network();
+                    match net.connect(&typed_fd, &core::net::SocketAddr::V4(endpoint), true) {
+                        Ok(()) => return Ok(()),
+                        Err(ConnectError::InProgress) => {}
+                        Err(e) => return Err(connect_error_to_errno(e)),
+                    }
+                }
             }
             SocketAddress::Unix(unix_addr) => self.do_connect_unix(fd, unix_addr),
         }
@@ -851,11 +891,15 @@ impl<FS: ShimFS> Task<FS> {
         drop(rds);
 
         let send_flags = SendFlags::empty();
-        self.global
-            .net
-            .lock()
+        let mut net = self.global.net.lock();
+        let result = net
             .send(&typed_fd, &data, send_flags, dest)
-            .map_err(send_error_to_errno)
+            .map_err(send_error_to_errno);
+        // Drive the network stack so outgoing data is actually
+        // transmitted (important in Manual mode where the send()
+        // path doesn't poll the interface automatically).
+        net.drive_network();
+        result
     }
 
     /// Handle `recvfrom(fd, buf, len, flags, src_addr, addrlen)`.
@@ -880,13 +924,7 @@ impl<FS: ShimFS> Task<FS> {
             }
         }
 
-        // Try inet.
-        let rds = self.global.raw_descriptors.read();
-        let typed_fd = rds
-            .fd_from_raw_integer::<Network<Platform>>(fd as usize)
-            .map_err(|_| Errno::ENOTSOCK)?;
-        drop(rds);
-
+        // Try inet — read from proxy ring buffer.
         let recv_flags = ReceiveFlags::empty();
         let mut source = if src_addr != 0 {
             Some(None::<core::net::SocketAddr>)
@@ -894,12 +932,31 @@ impl<FS: ShimFS> Task<FS> {
             None
         };
 
-        let bytes_read = self
+        // Blocking receive via the proxy ring buffer.  The background
+        // network thread drains smoltcp sockets into proxy RX buffers,
+        // so reading directly from smoltcp here would race with the
+        // drain and miss data.  Instead we read from the proxy which
+        // is the canonical consumer-side buffer for inet sockets.
+        let proxy = self
             .global
-            .net
-            .lock()
-            .receive(&typed_fd, &mut kernel_buf, recv_flags, source.as_mut())
-            .map_err(receive_error_to_errno)?;
+            .net_proxies
+            .read()
+            .get(&(fd as usize))
+            .cloned()
+            .ok_or(Errno::ENOTSOCK)?;
+        let bytes_read = loop {
+            match proxy.try_read(&mut kernel_buf, recv_flags, source.as_mut()) {
+                // No data yet — yield and retry.
+                Ok(0) | Err(ReceiveError::SocketInInvalidState) => {
+                    let cx = self.wait_cx().with_timeout(Duration::from_millis(1));
+                    let _ = cx.sleep();
+                }
+                Ok(n) => break n,
+                // Peer closed connection (FIN) — return 0 (EOF).
+                Err(ReceiveError::OperationFinished) => break 0,
+                Err(e) => return Err(receive_error_to_errno(e)),
+            }
+        };
 
         // Copy data to guest.
         let user_buf: MutPtr<u8> = MutPtr::from_usize(buf as usize);
@@ -927,7 +984,17 @@ impl<FS: ShimFS> Task<FS> {
             .ok_or(Errno::ENOTSOCK)?
             .clone();
         drop(unix_sockets);
-        socket.write(data)
+        // Blocking send: retry on EAGAIN until buffer space is available.
+        loop {
+            match socket.write(data) {
+                Ok(n) => return Ok(n),
+                Err(Errno::EAGAIN) => {
+                    let cx = self.wait_cx().with_timeout(Duration::from_millis(1));
+                    let _ = cx.sleep();
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     fn do_recvfrom_unix(
@@ -946,7 +1013,18 @@ impl<FS: ShimFS> Task<FS> {
         drop(unix_sockets);
 
         let mut kernel_buf = alloc::vec![0u8; len];
-        let bytes_read = socket.read(&mut kernel_buf)?;
+        // Blocking recv: retry on EAGAIN until data arrives or the
+        // write-end is closed (EOF).
+        let bytes_read = loop {
+            match socket.read(&mut kernel_buf) {
+                Ok(n) => break n,
+                Err(Errno::EAGAIN) => {
+                    let cx = self.wait_cx().with_timeout(Duration::from_millis(1));
+                    let _ = cx.sleep();
+                }
+                Err(e) => return Err(e),
+            }
+        };
 
         let user_buf: MutPtr<u8> = MutPtr::from_usize(buf as usize);
         user_buf
@@ -1402,27 +1480,28 @@ impl<FS: ShimFS> Task<FS> {
         // Receive into a temporary buffer.
         let mut kernel_buf = vec![0u8; total_len];
 
-        // Try inet.
-        let rds = self.global.raw_descriptors.read();
-        if let Ok(typed_fd) = rds.fd_from_raw_integer::<Network<Platform>>(fd as usize) {
-            drop(rds);
+        // Try inet — read from proxy ring buffer (see sys_recvfrom for rationale).
+        let proxy = self.global.net_proxies.read().get(&(fd as usize)).cloned();
+        if let Some(proxy) = proxy {
             let mut source = if msg_name != 0 {
                 Some(None::<core::net::SocketAddr>)
             } else {
                 None
             };
 
-            let bytes_read = self
-                .global
-                .net
-                .lock()
-                .receive(
-                    &typed_fd,
-                    &mut kernel_buf,
-                    ReceiveFlags::empty(),
-                    source.as_mut(),
-                )
-                .map_err(receive_error_to_errno)?;
+            let bytes_read = loop {
+                match proxy.try_read(&mut kernel_buf, ReceiveFlags::empty(), source.as_mut()) {
+                    // No data yet or socket not in receivable state.
+                    Ok(0) | Err(ReceiveError::SocketInInvalidState) => {
+                        let cx = self.wait_cx().with_timeout(Duration::from_millis(1));
+                        let _ = cx.sleep();
+                    }
+                    Ok(n) => break n,
+                    // Peer closed (FIN) — EOF.
+                    Err(ReceiveError::OperationFinished) => break 0,
+                    Err(e) => return Err(receive_error_to_errno(e)),
+                }
+            };
 
             // Scatter into iovecs.
             let mut offset = 0usize;
@@ -1458,7 +1537,6 @@ impl<FS: ShimFS> Task<FS> {
 
             return Ok(bytes_read);
         }
-        drop(rds);
 
         // Try unix socket.
         {

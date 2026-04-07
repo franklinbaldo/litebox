@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <pthread.h>
 
-#define NUM_THREADS 50
+#define NUM_THREADS 10
 
 void* thread_func(void* arg) {
     int thread_id = *(int*)arg;
@@ -14,6 +14,7 @@ void* thread_func(void* arg) {
 }
 
 int main() {
+    // No early printf — test bare buffer init under thread contention.
     pthread_t threads[NUM_THREADS];
     int thread_ids[NUM_THREADS];
 

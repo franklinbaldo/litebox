@@ -66,6 +66,7 @@ pub mod nr {
     pub const RMDIR: usize = 137;
     pub const FTRUNCATE: usize = 201;
     pub const SEMWAIT_SIGNAL: usize = 334;
+    pub const SEMWAIT_SIGNAL_NOCANCEL: usize = 423;
     pub const PROC_RLIMIT_CONTROL: usize = 336;
     pub const GETDIRENTRIES64: usize = 344;
     pub const RECVMSG: usize = 27;
@@ -90,10 +91,11 @@ pub mod nr {
     pub const READV: usize = 120;
     pub const WRITEV: usize = 121;
     pub const KEVENT: usize = 363;
-    pub const GETCWD: usize = 304;
+    // macOS has no __getcwd syscall; libc getcwd uses fcntl(F_GETPATH).
     pub const FSGETPATH: usize = 427;
     pub const ULOCK_WAIT: usize = 515;
     pub const ULOCK_WAKE: usize = 516;
+    pub const ULOCK_WAIT2: usize = 544;
     pub const FCHDIR: usize = 13;
     pub const FSTATFS64: usize = 346;
     pub const READ_NOCANCEL: usize = 396;
@@ -105,6 +107,8 @@ pub mod nr {
     pub const CHANGE_FDGUARD_NP: usize = 444;
     pub const GETATTRLISTBULK: usize = 461;
     pub const GUARDED_WRITE_NP: usize = 485;
+    pub const LSTAT64: usize = 340;
+    pub const FCNTL_NOCANCEL: usize = 406;
 }
 
 /// Mach trap numbers (negative x16 values, stored as positive constants).
@@ -487,10 +491,7 @@ pub enum MacosSyscallRequest {
         iov: usize,
         iovcnt: usize,
     },
-    Getcwd {
-        buf: usize,
-        size: usize,
-    },
+
     /// `getfsstat64(buf, bufsize, flags)` — enumerate mounted filesystems.
     Getfsstat64 {
         buf: usize,
@@ -510,6 +511,14 @@ pub enum MacosSyscallRequest {
         addr: usize,
         value: u64,
         timeout_us: u32,
+    },
+
+    /// `__ulock_wait2(operation, addr, value, timeout_ns, value2)` — wait on a userspace lock (v2).
+    UlockWait2 {
+        operation: u32,
+        addr: usize,
+        value: u64,
+        timeout_ns: u64,
     },
     /// `__ulock_wake(operation, addr, wake_value)` — wake waiters on a userspace lock.
     UlockWake {
@@ -624,7 +633,7 @@ impl MacosSyscallRequest {
                 length: a1,
                 advice: a2 as i32,
             },
-            nr::FCNTL => MacosSyscallRequest::Fcntl {
+            nr::FCNTL | nr::FCNTL_NOCANCEL => MacosSyscallRequest::Fcntl {
                 fd: a0 as i32,
                 cmd: a1 as i32,
                 arg: a2,
@@ -706,7 +715,7 @@ impl MacosSyscallRequest {
                 namespace: a0,
                 code: a1,
             },
-            nr::STAT64 => MacosSyscallRequest::Stat64 { path: a0, buf: a1 },
+            nr::STAT64 | nr::LSTAT64 => MacosSyscallRequest::Stat64 { path: a0, buf: a1 },
             nr::OPENAT => MacosSyscallRequest::Openat {
                 dirfd: a0 as i32,
                 path: a1,
@@ -768,14 +777,16 @@ impl MacosSyscallRequest {
                 fd: a0 as i32,
                 length: a1 as i64,
             },
-            nr::SEMWAIT_SIGNAL => MacosSyscallRequest::SemwaitSignal {
-                cond_sem: a0 as i32,
-                mutex_sem: a1 as i32,
-                timeout: a2 as i32,
-                relative: a3 as i32,
-                tv_sec: a4 as i64,
-                tv_nsec: a5 as i32,
-            },
+            nr::SEMWAIT_SIGNAL | nr::SEMWAIT_SIGNAL_NOCANCEL => {
+                MacosSyscallRequest::SemwaitSignal {
+                    cond_sem: a0 as i32,
+                    mutex_sem: a1 as i32,
+                    timeout: a2 as i32,
+                    relative: a3 as i32,
+                    tv_sec: a4 as i64,
+                    tv_nsec: a5 as i32,
+                }
+            }
             nr::PROC_RLIMIT_CONTROL => MacosSyscallRequest::ProcRlimitControl {
                 pid: a0 as i32,
                 flavor: a1 as i32,
@@ -903,7 +914,7 @@ impl MacosSyscallRequest {
                 iov: a1,
                 iovcnt: a2,
             },
-            nr::GETCWD => MacosSyscallRequest::Getcwd { buf: a0, size: a1 },
+
             nr::GETFSSTAT64 => MacosSyscallRequest::Getfsstat64 {
                 buf: a0,
                 bufsize: a1,
@@ -920,6 +931,17 @@ impl MacosSyscallRequest {
                 addr: a1,
                 value: a2 as u64,
                 timeout_us: a3 as u32,
+            },
+            // NOTE: psynch_mutexwait (301) and psynch_mutexdrop (302) are
+            // intentionally NOT parsed here.  They fall through to Unknown
+            // so the raw_bsd_syscall6 passthrough (in handle_syscall_request)
+            // handles them with the correct x16 encoding and direct
+            // register-level return value propagation.
+            nr::ULOCK_WAIT2 => MacosSyscallRequest::UlockWait2 {
+                operation: a0 as u32,
+                addr: a1,
+                value: a2 as u64,
+                timeout_ns: a3 as u64,
             },
             nr::ULOCK_WAKE => MacosSyscallRequest::UlockWake {
                 operation: a0 as u32,

@@ -1159,7 +1159,6 @@ mapping  RO  120MB 0x1F73F0000 -> 0x1FEC78000
     }
 
     #[test]
-    #[ignore = "requires access to /System/Cryptexes/OS/System/Library/dyld/"]
     #[allow(clippy::cast_precision_loss)]
     fn test_read_real_cache_regions() {
         let cache_dir = std::path::Path::new("/System/Cryptexes/OS/System/Library/dyld/");
@@ -1177,9 +1176,19 @@ mapping  RO  120MB 0x1F73F0000 -> 0x1FEC78000
         eprintln!("Collecting regions for {} dylibs...", needed.len());
         let result = collect_regions(cache_dir, &cache_map, &needed);
 
+        // With the "accept host's slide" strategy, all segments are host-resident,
+        // so `regions` (heap-backed copies) may be empty.  Verify that the
+        // collector found *something* — either heap-backed regions, host-resident
+        // TEXT needing SVC patching, or preinstalled extents.
         assert!(
-            !result.regions.is_empty(),
-            "expected at least one region from system dylibs"
+            !result.regions.is_empty()
+                || !result.patch_in_place_text.is_empty()
+                || !result.preinstalled_extents.is_empty(),
+            "expected at least one region, patch-in-place text, or preinstalled extent \
+             from system dylibs (regions={}, patch_in_place={}, preinstalled={})",
+            result.regions.len(),
+            result.patch_in_place_text.len(),
+            result.preinstalled_extents.len(),
         );
 
         let total_rx: usize = result
@@ -1190,12 +1199,14 @@ mapping  RO  120MB 0x1F73F0000 -> 0x1FEC78000
             .sum();
 
         eprintln!(
-            "Collected {} regions, total RX = {:.2} MB",
+            "Collected {} regions (total RX = {:.2} MB), {} patch-in-place TEXT, {} preinstalled",
             result.regions.len(),
-            total_rx as f64 / (1024.0 * 1024.0)
+            total_rx as f64 / (1024.0 * 1024.0),
+            result.patch_in_place_text.len(),
+            result.preinstalled_extents.len(),
         );
 
-        // System dylibs should be well under 20 MB of RX data.
+        // System dylibs should be well under 20 MB of RX data in heap-backed regions.
         assert!(
             total_rx < 20 * 1024 * 1024,
             "total RX {total_rx} bytes exceeds 20 MB — are we loading too much?"

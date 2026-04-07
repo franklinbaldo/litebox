@@ -148,7 +148,6 @@ impl<FS: ShimFS> Task<FS> {
             MacosSyscallRequest::Gettimeofday { tv, tz } => self.sys_gettimeofday(tv, tz),
             MacosSyscallRequest::Readv { fd, iov, iovcnt } => self.sys_readv(fd, iov, iovcnt),
             MacosSyscallRequest::Writev { fd, iov, iovcnt } => self.sys_writev(fd, iov, iovcnt),
-            MacosSyscallRequest::Getcwd { buf, size } => self.sys_getcwd(buf, size),
             MacosSyscallRequest::Getfsstat64 {
                 buf,
                 bufsize,
@@ -339,6 +338,24 @@ impl<FS: ShimFS> Task<FS> {
                 value,
                 timeout_us,
             } => self.sys_ulock_wait(operation, addr, value, timeout_us),
+            MacosSyscallRequest::UlockWait2 {
+                operation,
+                addr,
+                value,
+                timeout_ns,
+            } => {
+                // Convert nanoseconds to microseconds for the existing handler.
+                // ulock_wait2 uses ns, ulock_wait uses us. 0 means infinite in both.
+                #[allow(clippy::cast_possible_truncation)]
+                let timeout_us = if timeout_ns == 0 {
+                    0
+                } else {
+                    let us = timeout_ns.div_ceil(1000);
+                    // Safe: clamped to u32::MAX before truncation.
+                    us.min(u64::from(u32::MAX)) as u32
+                };
+                self.sys_ulock_wait(operation, addr, value, timeout_us)
+            }
             MacosSyscallRequest::UlockWake {
                 operation,
                 addr,

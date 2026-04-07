@@ -43,7 +43,7 @@ impl TargetOs {
     pub const fn shared_svc_handler_insn_count(self) -> usize {
         match self {
             Self::Linux => 21, // Hash-based TLS lookup (3 hash instructions + 18 original)
-            Self::MacOs => 18,
+            Self::MacOs => 21,
             // Windows: 2 extra instructions to store host_tls to stack frame
             // (avoids X16 clobber by linker veneers on BR to callback).
             Self::Windows => 20,
@@ -2025,25 +2025,31 @@ fn emit_shared_svc_handler_windows(
 /// On match: loads host_tls (TCB ptr), saves guest x18 to TCB, loads guest_tpidr to frame.
 /// On sentinel: BRK (unknown thread = bug, not recoverable).
 ///
+/// Uses X9 (callee-saved, safe from XNU preemptive zeroing) as the scan scratch
+/// register instead of X18 (which XNU zeros on every kernel→userspace transition).
+///
 /// ```text
 ///  [0]  MRS  X17, TPIDRRO_EL0     ; stable per-thread key
 ///  [1]  LDR  X16, [PC, #off]      ; X16 = TLS table base
-///  [2]  LDR  X18, [X16, #0]       ; .Lloop: X18 = entry.tpidrro_el0
-///  [3]  CMN  X18, #1              ; sentinel?
-///  [4]  B.EQ .Ltrap               ; -> [17] (unknown thread = bug)
-///  [5]  CMP  X18, X17             ; match tpidrro?
-///  [6]  B.EQ .Lfound              ; -> [9]
-///  [7]  ADD  X16, X16, #16        ; next entry
-///  [8]  B    .Lloop               ; -> [2]
-///  [9]  LDR  X16, [X16, #8]       ; .Lfound: X16 = host_tls (safe register!)
-/// [10]  LDR  X17, [X16, #24]      ; X17 = TCB.guest_tpidr
-/// [11]  STR  X17, [SP, #24]       ; frame.guest_tpidr = guest_tpidr
-/// [12]  LDR  X17, [SP, #32]       ; X17 = guest x18 (saved by gate)
-/// [13]  STR  X17, [X16, #40]      ; TCB.guest_x18 = guest x18
-/// [14]  STR  X16, [SP, #40]       ; host_tls → frame slot for syscall_callback
-/// [15]  LDR  X16, [PC, #off]      ; callback addr
-/// [16]  BR   X16                  ; jump to callback
-/// [17]  BRK  #1                   ; .Ltrap: unreachable (unknown thread)
+///  [2]  DMB  ISH                  ; ensure TLS table stores are visible
+///  [3]  STR  X9, [SP, #24]        ; save X9 (will be restored before use of frame[24])
+///  [4]  LDR  X9, [X16, #0]        ; .Lloop: X9 = entry.tpidrro_el0
+///  [5]  CMN  X9, #1               ; sentinel?
+///  [6]  B.EQ .Ltrap               ; -> [20] (unknown thread = bug)
+///  [7]  CMP  X9, X17              ; match tpidrro?
+///  [8]  B.EQ .Lfound              ; -> [11]
+///  [9]  ADD  X16, X16, #16        ; next entry
+/// [10]  B    .Lloop               ; -> [4]
+/// [11]  LDR  X9, [SP, #24]        ; .Lfound: restore X9
+/// [12]  LDR  X16, [X16, #8]       ; X16 = host_tls (safe register!)
+/// [13]  LDR  X17, [X16, #24]      ; X17 = TCB.guest_tpidr
+/// [14]  STR  X17, [SP, #24]       ; frame.guest_tpidr = guest_tpidr
+/// [15]  LDR  X17, [SP, #32]       ; X17 = guest x18 (saved by gate)
+/// [16]  STR  X17, [X16, #40]      ; TCB.guest_x18 = guest x18
+/// [17]  STR  X16, [SP, #40]       ; host_tls → frame slot for syscall_callback
+/// [18]  LDR  X16, [PC, #off]      ; callback addr
+/// [19]  BR   X16                  ; jump to callback
+/// [20]  BRK  #1                   ; .Ltrap: unreachable (unknown thread)
 /// ```
 #[allow(clippy::cast_possible_wrap)]
 fn emit_shared_svc_handler_macos(
@@ -2056,6 +2062,10 @@ fn emit_shared_svc_handler_macos(
     let mut insn_idx: usize = 0;
     let insn_vaddr = |idx: usize| -> u64 { handler_vaddr + (idx as u64) * 4 };
     let tls_table_vaddr = trampoline_base_addr + HEADER_TLS_TABLE_OFFSET as u64;
+
+    // DMB ISH constant: Data Memory Barrier, Inner Shareable domain.
+    // Ensures TLS table stores from other cores are visible to loads below.
+    const DMB_ISH: u32 = 0xD503_3BBF;
 
     // [0] MRS X17, TPIDRRO_EL0 — stable per-thread key
     trampoline_data.extend_from_slice(&encode_mrs_tpidrro_el0(17).to_le_bytes());
@@ -2072,21 +2082,38 @@ fn emit_shared_svc_handler_macos(
     trampoline_data.extend_from_slice(&ldr_tls_insn.to_le_bytes());
     insn_idx += 1;
 
-    // [2] .Lloop: LDR X18, [X16, #0] — X18 = entry.tpidrro_el0
+    // [2] DMB ISH — ensure TLS table stores from other cores are visible
+    trampoline_data.extend_from_slice(&DMB_ISH.to_le_bytes());
+    insn_idx += 1;
+
+    // [3] STR X9, [SP, #24] — save X9 (frame[24] is unused during TLS scan)
+    // Using X9 instead of X18 for TLS key scan: XNU zeros X18 on EVERY
+    // kernel→userspace transition (preemptive context switches via FIQ timer),
+    // not just signal delivery. Even though the scan loop is only ~4 instructions,
+    // on Apple Silicon the FIQ preemption timer can fire at any instruction
+    // boundary, leaving X18=0 mid-scan and causing the TLS lookup to fail.
+    trampoline_data.extend_from_slice(
+        &encode_str_imm_unsigned(9, 31, 24)
+            .expect("offset 24 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [4] .Lloop: LDR X9, [X16, #0] — X9 = entry.tpidrro_el0
     let loop_idx = insn_idx;
     trampoline_data.extend_from_slice(
-        &encode_ldr_imm_unsigned(18, 16, 0)
+        &encode_ldr_imm_unsigned(9, 16, 0)
             .expect("offset 0 valid")
             .to_le_bytes(),
     );
     insn_idx += 1;
 
-    // [3] CMN X18, #1 — sentinel?
-    trampoline_data.extend_from_slice(&encode_cmn_imm(18, 1).expect("imm12=1 fits").to_le_bytes());
+    // [5] CMN X9, #1 — sentinel?
+    trampoline_data.extend_from_slice(&encode_cmn_imm(9, 1).expect("imm12=1 fits").to_le_bytes());
     insn_idx += 1;
 
-    // [4] B.EQ .Ltrap -> [17]
-    let trap_idx = 17usize;
+    // [6] B.EQ .Ltrap -> [20]
+    let trap_idx = 20usize;
     let beq_trap_offset = (trap_idx as i64 - insn_idx as i64) * 4;
     let beq_trap = encode_b_cond(COND_EQ, beq_trap_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
@@ -2096,12 +2123,12 @@ fn emit_shared_svc_handler_macos(
     trampoline_data.extend_from_slice(&beq_trap.to_le_bytes());
     insn_idx += 1;
 
-    // [5] CMP X18, X17 — match tpidrro?
-    trampoline_data.extend_from_slice(&encode_cmp_reg(18, 17).to_le_bytes());
+    // [7] CMP X9, X17 — match tpidrro?
+    trampoline_data.extend_from_slice(&encode_cmp_reg(9, 17).to_le_bytes());
     insn_idx += 1;
 
-    // [6] B.EQ .Lfound -> [9]
-    let found_idx = 9usize;
+    // [8] B.EQ .Lfound -> [11]
+    let found_idx = 11usize;
     let beq_found_offset = (found_idx as i64 - insn_idx as i64) * 4;
     let beq_found = encode_b_cond(COND_EQ, beq_found_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
@@ -2111,7 +2138,7 @@ fn emit_shared_svc_handler_macos(
     trampoline_data.extend_from_slice(&beq_found.to_le_bytes());
     insn_idx += 1;
 
-    // [7] ADD X16, X16, #16 — next entry
+    // [9] ADD X16, X16, #16 — next entry
     trampoline_data.extend_from_slice(
         &encode_add_imm(16, 16, 16)
             .expect("imm12=16 fits")
@@ -2119,7 +2146,7 @@ fn emit_shared_svc_handler_macos(
     );
     insn_idx += 1;
 
-    // [8] B .Lloop -> [2]
+    // [10] B .Lloop -> [4]
     let b_loop_offset = (loop_idx as i64 - insn_idx as i64) * 4;
     let b_loop = encode_b(b_loop_offset).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
@@ -2129,8 +2156,16 @@ fn emit_shared_svc_handler_macos(
     trampoline_data.extend_from_slice(&b_loop.to_le_bytes());
     insn_idx += 1;
 
-    // [9] .Lfound: LDR X16, [X16, #8] — X16 = host_tls (safe register, survives preemption)
+    // [11] .Lfound: LDR X9, [SP, #24] — restore X9
     debug_assert_eq!(insn_idx, found_idx);
+    trampoline_data.extend_from_slice(
+        &encode_ldr_imm_unsigned(9, 31, 24)
+            .expect("offset 24 valid")
+            .to_le_bytes(),
+    );
+    insn_idx += 1;
+
+    // [12] LDR X16, [X16, #8] — X16 = host_tls (safe register, survives preemption)
     trampoline_data.extend_from_slice(
         &encode_ldr_imm_unsigned(16, 16, 8)
             .expect("offset 8 valid")
@@ -2138,7 +2173,7 @@ fn emit_shared_svc_handler_macos(
     );
     insn_idx += 1;
 
-    // [10] LDR X17, [X16, #24] — X17 = TCB.guest_tpidr
+    // [13] LDR X17, [X16, #24] — X17 = TCB.guest_tpidr
     trampoline_data.extend_from_slice(
         &encode_ldr_imm_unsigned(17, 16, 24)
             .expect("offset 24 valid")
@@ -2146,7 +2181,7 @@ fn emit_shared_svc_handler_macos(
     );
     insn_idx += 1;
 
-    // [11] STR X17, [SP, #24] — frame.guest_tpidr = guest_tpidr
+    // [14] STR X17, [SP, #24] — frame.guest_tpidr = guest_tpidr
     trampoline_data.extend_from_slice(
         &encode_str_imm_unsigned(17, 31, 24)
             .expect("offset 24 valid")
@@ -2154,7 +2189,7 @@ fn emit_shared_svc_handler_macos(
     );
     insn_idx += 1;
 
-    // [12] LDR X17, [SP, #32] — X17 = guest x18 (saved by gate at [SP+32])
+    // [15] LDR X17, [SP, #32] — X17 = guest x18 (saved by gate at [SP+32])
     trampoline_data.extend_from_slice(
         &encode_ldr_imm_unsigned(17, 31, 32)
             .expect("offset 32 valid")
@@ -2162,7 +2197,7 @@ fn emit_shared_svc_handler_macos(
     );
     insn_idx += 1;
 
-    // [13] STR X17, [X16, #40] — TCB.guest_x18 = guest x18
+    // [16] STR X17, [X16, #40] — TCB.guest_x18 = guest x18
     trampoline_data.extend_from_slice(
         &encode_str_imm_unsigned(17, 16, 40)
             .expect("offset 40 valid")
@@ -2170,7 +2205,7 @@ fn emit_shared_svc_handler_macos(
     );
     insn_idx += 1;
 
-    // [14] STR X16, [SP, #40] — host_tls → frame slot for syscall_callback
+    // [17] STR X16, [SP, #40] — host_tls → frame slot for syscall_callback
     trampoline_data.extend_from_slice(
         &encode_str_imm_unsigned(16, 31, 40)
             .expect("offset 40 valid")
@@ -2178,7 +2213,7 @@ fn emit_shared_svc_handler_macos(
     );
     insn_idx += 1;
 
-    // [15] LDR X16, [PC, #offset_to_callback]
+    // [18] LDR X16, [PC, #offset_to_callback]
     let ldr_cb_vaddr = insn_vaddr(insn_idx);
     let callback_vaddr = trampoline_base_addr + HEADER_CALLBACK_OFFSET as u64;
     let ldr_cb_offset = callback_vaddr.cast_signed() - ldr_cb_vaddr.cast_signed();
@@ -2190,11 +2225,11 @@ fn emit_shared_svc_handler_macos(
     trampoline_data.extend_from_slice(&ldr_cb_insn.to_le_bytes());
     insn_idx += 1;
 
-    // [16] BR X16
+    // [19] BR X16
     trampoline_data.extend_from_slice(&encode_br(16).to_le_bytes());
     insn_idx += 1;
 
-    // [17] .Ltrap: BRK #1 — unreachable (unknown thread)
+    // [20] .Ltrap: BRK #1 — unreachable (unknown thread)
     debug_assert_eq!(insn_idx, trap_idx);
     trampoline_data.extend_from_slice(&encode_brk(1).to_le_bytes());
     insn_idx += 1;

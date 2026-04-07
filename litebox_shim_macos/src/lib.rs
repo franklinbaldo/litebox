@@ -150,6 +150,10 @@ struct Process {
     next_mach_port: AtomicU32,
     /// Per-signal handler table. Indexed by signal number (1-31; index 0 unused).
     signal_handlers: litebox::sync::Mutex<Platform, [SignalHandler; 32]>,
+    /// Active thread pthread addresses.  Used to suppress premature
+    /// `mach_vm_deallocate` on thread stacks before `pthread_join` reads them.
+    /// Contains (pthread_addr) for each live spawned thread.
+    thread_pthreads: litebox::sync::Mutex<Platform, alloc::collections::BTreeSet<usize>>,
 }
 
 impl Process {
@@ -165,6 +169,7 @@ impl Process {
             next_tid: AtomicI32::new(2),
             next_mach_port: AtomicU32::new(0x0403),
             signal_handlers: litebox::sync::Mutex::new([SignalHandler::default(); 32]),
+            thread_pthreads: litebox::sync::Mutex::new(alloc::collections::BTreeSet::new()),
         }
     }
 }
@@ -195,6 +200,7 @@ mod wait;
 #[allow(dead_code)]
 unsafe extern "C" {
     fn mach_task_self() -> u32;
+    fn mach_thread_self() -> u32;
     fn mach_vm_allocate(target_task: u32, address: *mut u64, size: u64, flags: i32) -> i32;
     fn mach_vm_deallocate(target_task: u32, address: u64, size: u64) -> i32;
     fn mach_vm_protect(
@@ -396,6 +402,7 @@ impl<FS: ShimFS> MacosShim<FS> {
                 blocked_signals: AtomicU32::new(0),
                 wait_state: wait::WaitState::new(self.0.platform),
                 dir_positions: litebox::sync::Mutex::new(BTreeMap::new()),
+                real_mach_port: AtomicU32::new(unsafe { mach_thread_self() }),
             },
         };
 
@@ -436,6 +443,15 @@ impl<FS: ShimFS> MacosShim<FS> {
     /// Get the global page manager.
     pub fn page_manager(&self) -> &PageManager<Platform, PAGE_SIZE> {
         &self.0.pm
+    }
+
+    /// Perform queued network interactions with the outside world.
+    ///
+    /// This function should be invoked in a loop, based on the returned advice.
+    pub fn perform_network_interaction(
+        &self,
+    ) -> litebox::net::PlatformInteractionReinvocationAdvice {
+        self.0.net.lock().perform_platform_interaction()
     }
 
     /// Install shared cache regions into the guest address space.
@@ -1056,14 +1072,15 @@ impl<FS: ShimFS> MacosShim<FS> {
                 core::slice::from_raw_parts_mut(tramp_addr_usize as *mut u8, plan.tramp_size)
             };
 
-            let Ok(tramp_cursor) = litebox_syscall_rewriter_macho::patch_code_segment_prescan(
+            let patch_result = litebox_syscall_rewriter_macho::patch_code_segment_prescan(
                 code_slice,
                 tramp_slice,
                 plan.tramp_addr,
                 0,
                 syscall_entry as u64,
                 &plan.svc_sites,
-            ) else {
+            );
+            let Ok(tramp_cursor) = patch_result else {
                 // Restore R-X even on error.
                 let _ = unsafe {
                     raw_mprotect(
@@ -1076,16 +1093,15 @@ impl<FS: ShimFS> MacosShim<FS> {
             };
 
             // Write TLS table address into trampoline header at offset 8.
-            // Use volatile writes to avoid calling memcpy (which may be on
-            // RW shared cache pages for this plan).
+            // Use byte-by-byte volatile writes (u64 write was silently failing).
             if tramp_cursor > 0 {
-                let tls_bytes = tls_table_addr.to_le_bytes();
                 unsafe {
-                    let dst = tramp_slice.as_mut_ptr().add(8);
-                    let mut i = 0usize;
-                    while i < 8 {
-                        core::ptr::write_volatile(dst.add(i), tls_bytes[i]);
-                        i += 1;
+                    let tls_bytes = (tls_table_addr as u64).to_le_bytes();
+                    let base = tramp_slice.as_mut_ptr();
+                    let mut j = 0usize;
+                    while j < 8 {
+                        core::ptr::write_volatile(base.add(8 + j), tls_bytes[j]);
+                        j += 1;
                     }
                 }
             }
@@ -1285,17 +1301,61 @@ impl MacosShimProcess {
 
     /// Wait for the process to exit, returning its exit code.
     ///
-    /// Spins until `group_exit` is set or `nr_threads` reaches 0.
+    /// Spins until all threads have exited (`nr_threads` reaches 0).
+    ///
+    /// When `group_exit` is set (the guest called `exit()`), we still
+    /// wait for `nr_threads` to reach 0.  Spawned threads will
+    /// eventually terminate: either they call a shim-handled syscall
+    /// (which checks `should_terminate` and returns `Terminate`), or
+    /// they call `bsdthread_terminate` (which decrements `nr_threads`).
+    /// If we returned immediately on `group_exit`, the child process
+    /// would call `_exit(0)` while host POSIX threads are still running,
+    /// causing SIGKILL.
     pub fn wait(&self) -> i32 {
+        let mut iter = 0u64;
         loop {
-            if self.0.group_exit.load(Ordering::Acquire) {
+            let exiting = self.0.group_exit.load(Ordering::Acquire);
+            let threads = self.0.nr_threads.load(Ordering::Acquire);
+            iter += 1;
+            if threads <= 0 {
                 return self.0.exit_code.load(Ordering::Acquire);
             }
-            if self.0.nr_threads.load(Ordering::Acquire) <= 0 {
+            if exiting && threads <= 1 {
+                // group_exit set and only the main thread remains
+                // (main thread doesn't decrement nr_threads via
+                // bsdthread_terminate, so it stays at 1).
+                return self.0.exit_code.load(Ordering::Acquire);
+            }
+            // If group_exit is set and we've been waiting a while, force
+            // return.  Spawned threads may be blocked in real kernel
+            // syscalls (e.g. psynch_mutexwait) that cannot be interrupted
+            // from userspace.  The forked child's _exit() will clean them
+            // up via the kernel.
+            if exiting && iter > 10_000_000 {
                 return self.0.exit_code.load(Ordering::Acquire);
             }
             core::hint::spin_loop();
         }
+    }
+
+    /// Synthetically register pthread thread-start addresses.
+    ///
+    /// When library initializers are skipped (to avoid double-init SIGKILL),
+    /// `bsdthread_register` is never called by the guest.  This method
+    /// provides the same information so that `bsdthread_create` works.
+    ///
+    /// Call this after `load_program` but before `run_thread`.
+    pub fn register_pthread_info(
+        &self,
+        threadstart: u64,
+        wqthread: u64,
+        pthsize: u32,
+        tsd_offset: u32,
+    ) {
+        self.0.threadstart.store(threadstart, Ordering::Release);
+        self.0.wqthread.store(wqthread, Ordering::Release);
+        self.0.pthsize.store(pthsize, Ordering::Release);
+        self.0.tsd_offset.store(tsd_offset, Ordering::Release);
     }
 }
 
@@ -1456,6 +1516,15 @@ impl<FS: ShimFS> litebox::shim::EnterShim for MacosShimEntrypoints<FS> {
                     ctx.regs[16],
                     info.fault_address
                 );
+                log_unsupported!(
+                    "  lr={:#x} x4={:#x} x5={:#x} x6={:#x} x7={:#x} x8={:#x}",
+                    ctx.regs[30],
+                    ctx.regs[4],
+                    ctx.regs[5],
+                    ctx.regs[6],
+                    ctx.regs[7],
+                    ctx.regs[8]
+                );
                 // Set exit code to 128+signal (Unix convention for signal death).
                 self.task
                     .process
@@ -1497,6 +1566,14 @@ impl<FS: ShimFS> MacosShimEntrypoints<FS> {
     ) -> ContinueOperation {
         f(&self.task, ctx);
         if self.task.should_terminate() {
+            // When a spawned thread is force-terminated because the main
+            // thread called exit() (group_exit), it never reaches
+            // bsdthread_terminate and therefore never decrements
+            // nr_threads.  Do it here so that process.wait() can finish.
+            if self.task.tid != 1 && !self.task.terminated.load(Ordering::Acquire) {
+                self.task.terminated.store(true, Ordering::Release);
+                self.task.process.nr_threads.fetch_sub(1, Ordering::Release);
+            }
             ContinueOperation::Terminate
         } else {
             ContinueOperation::Resume
@@ -1514,8 +1591,7 @@ struct GlobalState<FS: ShimFS> {
     pm: PageManager<Platform, PAGE_SIZE>,
     /// The filesystem implementation.
     fs: FS,
-    /// The futex manager for handling futex operations.
-    #[expect(dead_code, reason = "will be used when futex syscalls are added")]
+    /// The futex manager for handling futex operations (used by ulock syscalls).
     futex_manager: FutexManager<Platform>,
     /// The Mach semaphore manager for semaphore trap emulation.
     semaphore_manager: semaphore::MachSemaphoreManager,
@@ -1635,6 +1711,9 @@ struct Task<FS: ShimFS> {
     /// Directory enumeration positions for getattrlistbulk.
     /// Maps raw fd number -> number of entries already returned.
     dir_positions: litebox::sync::Mutex<Platform, BTreeMap<usize, usize>>,
+    /// Real kernel mach port for this thread (from mach_thread_self()).
+    /// Used by THREAD_SELF_TRAP to return a value consistent with tl_thport.
+    real_mach_port: AtomicU32,
 }
 
 impl<FS: ShimFS> Task<FS> {
@@ -1686,6 +1765,24 @@ impl<FS: ShimFS> Task<FS> {
                         .expect("Failed to get punchthrough token for SetTpidr");
                     token.execute().map(|_| ()).unwrap();
                 }
+
+                // Populate the kernel thread mach port in the pthread struct.
+                //
+                // `_pthread_start` validates `pthread->tl_thport` (offset 248)
+                // and aborts with BRK #0xB001 ("Unable to allocate thread port")
+                // if the field is zero or MACH_PORT_DEAD.  On real macOS, the
+                // kernel writes this field before starting the thread.  Since we
+                // create host POSIX threads, we fill it with the real kernel
+                // mach port of the current (spawned) thread.
+                let real_mach_port = unsafe { mach_thread_self() };
+                // Store the real port so THREAD_SELF_TRAP returns a consistent value.
+                self.real_mach_port.store(real_mach_port, Ordering::Release);
+                // Also pass the real port in x1 so _pthread_start has a
+                // consistent view.
+                ctx.regs[1] = real_mach_port as usize;
+                // Write to pthread + 248 (tl_thport, uint32_t).
+                let thport_ptr = (pthread + 248) as *mut u32;
+                unsafe { core::ptr::write_volatile(thport_ptr, real_mach_port) };
             }
         }
     }
@@ -1746,8 +1843,97 @@ impl<FS: ShimFS> Task<FS> {
             return;
         }
 
+        // Handle psynch synchronization syscalls (296-309).
+        //
+        // These are used by libpthread for internal mutex/condvar operations.
+        // Guest threads are real host threads and guest memory is host memory,
+        // so we pass them through to the real kernel.
+        //
+        // The kernel psynch calls are blocking; a thread stuck in the kernel
+        // cannot check `should_terminate()`.  To avoid hangs on process exit,
+        // we pass them through but accept that forked-child cleanup will
+        // `_exit()` and the kernel will clean up any leftover blocked threads.
+        if let litebox_common_macos::syscall::MacosSyscallRequest::Unknown { number } = &request
+            && matches!(*number, 296..=309)
+        {
+            let result = unsafe {
+                raw_bsd_syscall6(
+                    *number as u64,
+                    ctx.regs[0] as u64,
+                    ctx.regs[1] as u64,
+                    ctx.regs[2] as u64,
+                    ctx.regs[3] as u64,
+                    ctx.regs[4] as u64,
+                    ctx.regs[5] as u64,
+                )
+            };
+            match result {
+                Ok(val) => {
+                    ctx.regs[0] = val as usize;
+                    ctx.pstate &= !litebox_common_macos::syscall::CARRY_BIT;
+                }
+                Err(errno) => {
+                    ctx.regs[0] = errno as usize;
+                    ctx.pstate |= litebox_common_macos::syscall::CARRY_BIT;
+                }
+            }
+            return;
+        }
+
         let result = self.do_syscall(request, ctx);
         litebox_common_macos::syscall::set_syscall_return(ctx, result);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Raw macOS aarch64 syscall helpers.
+// ---------------------------------------------------------------------------
+
+/// Execute a raw BSD syscall with up to 6 arguments via inline assembly.
+///
+/// Returns `Ok(return_value)` on success or `Err(errno)` on failure.
+///
+/// # Safety
+///
+/// Caller must ensure the syscall number and arguments are valid.
+#[allow(clippy::cast_possible_truncation)]
+unsafe fn raw_bsd_syscall6(
+    nr: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+) -> Result<u64, i32> {
+    let ret: u64;
+    let err_flag: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov x16, x8",
+            "svc #0x80",
+            "cset x8, cs",
+            in("x8") nr,
+            inlateout("x0") a0 => ret,
+            in("x1") a1,
+            in("x2") a2,
+            in("x3") a3,
+            in("x4") a4,
+            in("x5") a5,
+            lateout("x8") err_flag,
+            lateout("x16") _,
+            lateout("x1") _,
+            lateout("x2") _,
+            lateout("x3") _,
+            lateout("x4") _,
+            lateout("x5") _,
+            options(nostack),
+        );
+    }
+    if err_flag != 0 {
+        Err(ret as i32)
+    } else {
+        Ok(ret)
     }
 }
 

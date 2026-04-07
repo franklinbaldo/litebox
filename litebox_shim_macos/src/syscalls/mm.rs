@@ -357,6 +357,29 @@ impl<FS: ShimFS> Task<FS> {
         let addr = ctx.regs[1];
         let size = ctx.regs[2];
         let aligned_size = align_up(size, PAGE_SIZE);
+        log_unsupported!("mach_vm_deallocate(addr={addr:#x}, size={size:#x})");
+
+        // Suppress deallocation of thread stacks.  On real macOS,
+        // `bsdthread_terminate` is a noreturn syscall — the kernel atomically
+        // frees the stack and terminates the thread.  In our shim it returns
+        // normally, so the guest's libpthread "unreachable" cleanup code runs
+        // and calls `mach_vm_deallocate` on its own stack.  That unmaps the
+        // pthread struct that `pthread_join` on another thread needs to read.
+        // We suppress the deallocation here; `bsdthread_terminate` will clean
+        // up later.
+        {
+            let pthreads = self.process.thread_pthreads.lock();
+            let range_end = addr.wrapping_add(aligned_size);
+            for &pthread_addr in pthreads.iter() {
+                if pthread_addr >= addr && pthread_addr < range_end {
+                    log_unsupported!(
+                        "mach_vm_deallocate: suppressing dealloc of thread stack                          (pthread={pthread_addr:#x} in [{addr:#x}..{range_end:#x}))"
+                    );
+                    return Ok(0);
+                }
+            }
+        }
+
         self.sys_munmap(addr, aligned_size).map(|()| 0)
     }
 
@@ -468,6 +491,7 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle `munmap(addr, length)`.
     pub(crate) fn sys_munmap(&self, addr: usize, length: usize) -> Result<(), Errno> {
+        log_unsupported!("munmap(addr={addr:#x}, length={length:#x})");
         let ptr: MutPtr<u8> = MutPtr::from_usize(addr);
         litebox_common_linux::mm::sys_munmap(&self.global.pm, ptr, length)
             .map_err(linux_errno_to_macos)
