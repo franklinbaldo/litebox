@@ -260,8 +260,7 @@ pub unsafe fn handle_vfork(cq: &CqEntry) -> i64 {
     // state into a static above, not into stack locals.
     let flags = CLONE_VM | CLONE_VFORK | SIGCHLD;
 
-    let ret =
-        unsafe { crate::raw_syscall::syscall2(libc::SYS_clone, flags, 0) };
+    let ret = unsafe { crate::raw_syscall::syscall2(libc::SYS_clone, flags, 0) };
 
     if crate::raw_syscall::is_error(ret) {
         unsafe { crate::raw_syscall::close(RESERVED_CHILD_FD) };
@@ -299,25 +298,26 @@ unsafe fn save_parent_vfork_state() {
     let tls = unsafe { crate::tls::current_tls() };
 
     unsafe {
-        (&raw mut SAVED_VFORK).cast::<SavedVforkState>().write(SavedVforkState {
-            ring_base: micro.ring_base,
-            ring_size: micro.ring_size,
-            ring_fd: micro.ring_fd,
-            pid: micro.pid,
-            ppid: micro.ppid,
-            layout: micro.layout,
-            pipe_fds: micro.pipe_fds,
-            parent_pipe_zone: micro.parent_pipe_zone,
-            parent_pipe_zone_size: micro.parent_pipe_zone_size,
-            guest_brk: micro.guest_brk.load(core::sync::atomic::Ordering::Acquire),
-            file_fds: micro.file_fds,
-            socket_fds: micro.socket_fds,
-            thread_slot: (*tls).thread_slot,
-            seq_counter: (*tls).seq_counter,
-        });
+        (&raw mut SAVED_VFORK)
+            .cast::<SavedVforkState>()
+            .write(SavedVforkState {
+                ring_base: micro.ring_base,
+                ring_size: micro.ring_size,
+                ring_fd: micro.ring_fd,
+                pid: micro.pid,
+                ppid: micro.ppid,
+                layout: micro.layout,
+                pipe_fds: micro.pipe_fds,
+                parent_pipe_zone: micro.parent_pipe_zone,
+                parent_pipe_zone_size: micro.parent_pipe_zone_size,
+                guest_brk: micro.guest_brk.load(core::sync::atomic::Ordering::Acquire),
+                file_fds: micro.file_fds,
+                socket_fds: micro.socket_fds,
+                thread_slot: (*tls).thread_slot,
+                seq_counter: (*tls).seq_counter,
+            });
     }
 }
-
 
 /// Post-fork child initialization for vfork (CLONE_VM path).
 ///

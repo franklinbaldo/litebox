@@ -634,11 +634,7 @@ fn protect_range_gaps(
     clippy::cast_ptr_alignment,
     clippy::too_many_lines
 )]
-unsafe fn execute_execve(
-    tls: *mut MicroTls,
-    cq: &CqEntry,
-    micro: &MicroState,
-) -> ! {
+unsafe fn execute_execve(tls: *mut MicroTls, cq: &CqEntry, micro: &MicroState) -> ! {
     let data_region_ptr = unsafe { micro.ring_base.add(micro.layout.data_region_offset) };
     let data_base = unsafe { data_region_ptr.add(cq.data_offset as usize) };
 
@@ -797,7 +793,6 @@ unsafe fn execute_execve(
                     unsafe { crate::raw_syscall::syscall1(libc::SYS_exit_group, 127) };
                     unreachable!();
                 }
-
             } else {
                 main_file_mmap_ok = true;
 
@@ -820,7 +815,6 @@ unsafe fn execute_execve(
                         unsafe { crate::raw_syscall::syscall1(libc::SYS_exit_group, 127) };
                         unreachable!();
                     }
-    
                 }
             }
         } else {
@@ -873,7 +867,6 @@ unsafe fn execute_execve(
                     unsafe { crate::raw_syscall::syscall1(libc::SYS_exit_group, 127) };
                     unreachable!();
                 }
-
             } else {
                 interp_file_mmap_ok = true;
                 if interp_len > file_map_len {
@@ -893,7 +886,6 @@ unsafe fn execute_execve(
                         unsafe { crate::raw_syscall::syscall1(libc::SYS_exit_group, 127) };
                         unreachable!();
                     }
-    
                 }
             }
         } else {
@@ -977,13 +969,16 @@ unsafe fn execute_execve(
             // inserts a virtual address gap between RO and RW segments (for
             // RELRO).  When it breaks, the data at this segment's vaddr is
             // from the WRONG file offset and must be corrected via memcpy.
-            let in_main_range = main_len > 0
-                && vaddr >= main_base
-                && vaddr + map_len <= main_base + main_len;
+            let in_main_range =
+                main_len > 0 && vaddr >= main_base && vaddr + map_len <= main_base + main_len;
             let (range_mapped, range_base, file_base_offset) = if in_main_range {
                 (main_range_mapped, main_base, header.main_file_base_offset)
             } else {
-                (interp_range_mapped, interp_base, header.interp_file_base_offset)
+                (
+                    interp_range_mapped,
+                    interp_base,
+                    header.interp_file_base_offset,
+                )
             };
 
             // Check if the range-level mmap placed data correctly for THIS segment.

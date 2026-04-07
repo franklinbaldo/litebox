@@ -6,7 +6,6 @@
 use core::sync::atomic::{AtomicU32, AtomicUsize};
 use litebox_ipc::ring::{MAX_FILE_SLOTS, MAX_PIPE_SLOTS, MAX_SOCKET_SLOTS, SharedRingLayout};
 
-
 /// Entry in micro's local socket fd tracking table.
 ///
 /// Maps a file descriptor to the shmem offset of its socket ring buffer.
@@ -360,17 +359,14 @@ impl MicroState {
     /// Also validates that the slot index fits within the inmem region bounds.
     pub fn find_inmem_file_fd_mut(&mut self, fd: i32) -> Option<&mut FileFdEntry> {
         let inmem_size = self.inmem_size;
-        self.file_fds
-            .iter_mut()
-            .flatten()
-            .find(|entry| {
-                entry.fd == fd
-                    && entry.inmem_slot_index != litebox_ipc::inmem_shmem::INMEM_NO_SLOT
-                    && (litebox_ipc::inmem_shmem::slots_offset()
-                        + (entry.inmem_slot_index as usize + 1)
-                            * litebox_ipc::inmem_shmem::FILE_SLOT_SIZE)
-                        <= inmem_size
-            })
+        self.file_fds.iter_mut().flatten().find(|entry| {
+            entry.fd == fd
+                && entry.inmem_slot_index != litebox_ipc::inmem_shmem::INMEM_NO_SLOT
+                && (litebox_ipc::inmem_shmem::slots_offset()
+                    + (entry.inmem_slot_index as usize + 1)
+                        * litebox_ipc::inmem_shmem::FILE_SLOT_SIZE)
+                    <= inmem_size
+        })
     }
 
     #[cfg(test)]

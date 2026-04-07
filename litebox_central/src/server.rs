@@ -656,7 +656,9 @@ impl<FS: ShimFS> ProcessServer<FS> {
                             drop(ns);
 
                             // Look up inmem slot for the source fd's path.
-                            let inmem_slot = self.fd_path_map.borrow()
+                            let inmem_slot = self
+                                .fd_path_map
+                                .borrow()
                                 .get(&source_fd)
                                 .and_then(|p| self.inmem_file_map.lock().unwrap().get(p).copied())
                                 .unwrap_or(litebox_ipc::inmem_shmem::INMEM_NO_SLOT);
@@ -810,8 +812,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     // mapping; if we don't account for it the mmap will land too
                     // high and the trampoline mmap in micro will extend beyond
                     // the user address space limit.
-                    let tramp_extra = self.probe_trampoline_extra(entry.thread_slot, fd,
-                        entry.args[1] as usize);
+                    let tramp_extra =
+                        self.probe_trampoline_extra(entry.thread_slot, fd, entry.args[1] as usize);
 
                     // Modify regs to dispatch as MAP_ANONYMOUS with fd=-1.
                     let mut regs = crate::dispatch::sq_entry_to_ptregs(entry);
@@ -1012,7 +1014,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
 
                 // Look up the aligned memfd offset for tar-backed files.
                 let aligned_off = if tar_off != 0 {
-                    normalized_path.as_deref()
+                    normalized_path
+                        .as_deref()
                         .and_then(|p| self.aligned_file_map.get(p))
                         .map_or(0, |&(start, _size)| start as u64)
                 } else {
@@ -1029,7 +1032,9 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     if let Some(ref np) = normalized_path {
                         self.fd_path_map.borrow_mut().insert(new_fd, np.clone());
                         // Check if this path already has inmem shmem data.
-                        self.inmem_file_map.lock().unwrap()
+                        self.inmem_file_map
+                            .lock()
+                            .unwrap()
                             .get(np)
                             .copied()
                             .unwrap_or(litebox_ipc::inmem_shmem::INMEM_NO_SLOT)
@@ -1174,9 +1179,15 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 inmem_file_map,
             );
             child_server.next_child_pid.set(self.next_child_pid.get());
-            child_server.fd_aligned_set.borrow_mut().clone_from(&self.fd_aligned_set.borrow());
+            child_server
+                .fd_aligned_set
+                .borrow_mut()
+                .clone_from(&self.fd_aligned_set.borrow());
             // Forked children inherit the parent's fd table.
-            child_server.fd_path_map.borrow_mut().clone_from(&self.fd_path_map.borrow());
+            child_server
+                .fd_path_map
+                .borrow_mut()
+                .clone_from(&self.fd_path_map.borrow());
 
             let handle = std::thread::spawn(move || {
                 if let Err(e) = child_server.run() {
@@ -1220,12 +1231,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
     /// Returns 0 if the file has no trampoline or the trampoline already fits
     /// within `map_len`.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    fn probe_trampoline_extra(
-        &self,
-        thread_slot: u16,
-        fd: i32,
-        map_len: usize,
-    ) -> usize {
+    fn probe_trampoline_extra(&self, thread_slot: u16, fd: i32, map_len: usize) -> usize {
         const LITEBOX0_MAGIC: u64 = u64::from_le_bytes(*b"LITEBOX0");
         const HEADER_SIZE: usize = 32;
 
@@ -2132,10 +2138,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
         // sendto is excluded: socket fds are never 0-2.
         let fd = entry.args[0] as i32;
         let has_path = self.fd_path_map.borrow().contains_key(&fd);
-        if i64::from(nr) != libc::SYS_sendto
-            && (0..=2).contains(&fd)
-            && !has_path
-        {
+        if i64::from(nr) != libc::SYS_sendto && (0..=2).contains(&fd) && !has_path {
             cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
             return cq;
         }
@@ -2319,7 +2322,11 @@ impl<FS: ShimFS> ProcessServer<FS> {
         // 2. Skip pipes and sockets.
         {
             let ns = self.notification_state.borrow();
-            if ns.shmem_pipes.iter().any(|p| p.read_fd == fd || p.write_fd == fd) {
+            if ns
+                .shmem_pipes
+                .iter()
+                .any(|p| p.read_fd == fd || p.write_fd == fd)
+            {
                 return;
             }
             if ns.shmem_sockets.iter().any(|s| s.fd == fd) {
@@ -2967,9 +2974,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
                     let bytes = name.to_bytes();
                     core::str::from_utf8(bytes).unwrap_or("")
                 };
-                let normalized_interp = interp_path_str
-                    .strip_prefix('/')
-                    .unwrap_or(interp_path_str);
+                let normalized_interp =
+                    interp_path_str.strip_prefix('/').unwrap_or(interp_path_str);
 
                 let interp_slice: &[u8] =
                     if let Some(range) = self.tar_file_map.get(normalized_interp) {
@@ -2982,10 +2988,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                         // entire lifetime of the process. The slice we create here is
                         // only used within this function call, so the pointer remains valid.
                         unsafe {
-                            core::slice::from_raw_parts(
-                                self.tar_shmem_base.0.add(range.start),
-                                len,
-                            )
+                            core::slice::from_raw_parts(self.tar_shmem_base.0.add(range.start), len)
                         }
                     } else {
                         // Slow path: openat/fstat/pread64/close via shim dispatch.
@@ -3299,9 +3302,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 let bytes = name.to_bytes();
                 core::str::from_utf8(bytes).unwrap_or("")
             });
-            let normalized_interp_for_range = interp_path_str
-                .strip_prefix('/')
-                .unwrap_or(interp_path_str);
+            let normalized_interp_for_range =
+                interp_path_str.strip_prefix('/').unwrap_or(interp_path_str);
             if let Some(&(aligned_start, file_size)) =
                 self.aligned_file_map.get(normalized_interp_for_range)
             {

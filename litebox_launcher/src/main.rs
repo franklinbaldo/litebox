@@ -56,9 +56,8 @@ fn main() -> anyhow::Result<()> {
         .transpose()?;
 
     // 1c. Create in-memory filesystem shmem region.
-    let inmem_shmem = shmem::InMemSharedRegion::new(
-        litebox_ipc::inmem_shmem::DEFAULT_INMEM_REGION_SIZE,
-    )?;
+    let inmem_shmem =
+        shmem::InMemSharedRegion::new(litebox_ipc::inmem_shmem::DEFAULT_INMEM_REGION_SIZE)?;
 
     // 1d. Create aligned data region from the tar (page-aligned file offsets
     // for mmap-based ELF loading during exec).

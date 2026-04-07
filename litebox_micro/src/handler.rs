@@ -6,7 +6,7 @@
 use core::sync::atomic::Ordering::{Acquire, Relaxed};
 
 use litebox_ipc::cq::{cq_find_by_seq, cq_tail};
-use litebox_ipc::ring::{cq_flags, CqEntry, RingHeader, SharedRingLayout, SqEntry};
+use litebox_ipc::ring::{CqEntry, RingHeader, SharedRingLayout, SqEntry, cq_flags};
 use litebox_ipc::sq::{sq_acquire_slot, sq_publish};
 
 use litebox_ipc::wait::spin_then_wait;
@@ -240,7 +240,7 @@ unsafe fn handle_recvmsg_as_read(tls: *mut MicroTls, args: &SyscallArgs) -> i64 
         unsafe { core::ptr::write_unaligned(msg_control.add(8).cast::<i32>(), 1) }; // cmsg_level = SOL_SOCKET
         unsafe { core::ptr::write_unaligned(msg_control.add(12).cast::<i32>(), 1) }; // cmsg_type = SCM_RIGHTS
         unsafe { core::ptr::write_unaligned(msg_control.add(16).cast::<i32>(), -1) }; // fd = -1
-                                                                                      // Set msg_controllen to CMSG_SPACE(sizeof(int)) = 24.
+        // Set msg_controllen to CMSG_SPACE(sizeof(int)) = 24.
         unsafe { core::ptr::write_unaligned(msg_ptr.add(40).cast::<usize>(), 24) };
     } else if !msg_control.is_null() && msg_controllen > 0 {
         // Buffer too small for a fake cmsghdr — just zero everything.
@@ -771,11 +771,7 @@ fn bidirectional_input_info(nr: u32, args: &[u64; 6]) -> Option<(usize, usize)> 
         libc::SYS_prlimit64 => {
             // prlimit64(pid, resource, new_limit, old_limit): input=arg2 (new_limit)
             // Rlimit64 = 16 bytes (2 × u64)
-            if args[2] != 0 {
-                Some((2, 16))
-            } else {
-                None
-            }
+            if args[2] != 0 { Some((2, 16)) } else { None }
         }
         _ => None,
     }
@@ -1210,64 +1206,60 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
             if let Some(entry) = state.find_file_fd_entry(fd)
                 && entry.aligned_offset != 0
             {
-                    let aligned_len = (len + 0xFFF) & !0xFFF;
+                let aligned_len = (len + 0xFFF) & !0xFFF;
 
-                    // For MAP_FIXED or explicit addr, handle locally.
-                    // Non-MAP_FIXED (addr == 0) falls through to central so it
-                    // can choose the address and set up VMA state correctly.
-                    let map_addr = if is_fixed || addr != 0 {
-                        addr as usize
-                    } else {
-                        0usize
+                // For MAP_FIXED or explicit addr, handle locally.
+                // Non-MAP_FIXED (addr == 0) falls through to central so it
+                // can choose the address and set up VMA state correctly.
+                let map_addr = if is_fixed || addr != 0 {
+                    addr as usize
+                } else {
+                    0usize
+                };
+
+                if map_addr != 0 || is_fixed {
+                    let memfd_offset = entry.aligned_offset + file_offset as u64;
+
+                    let result = unsafe {
+                        crate::raw_syscall::mmap(
+                            map_addr,
+                            aligned_len,
+                            prot,
+                            libc::MAP_PRIVATE | libc::MAP_FIXED,
+                            state.aligned_fd,
+                            memfd_offset as i64,
+                        )
                     };
 
-                    if map_addr != 0 || is_fixed {
-                        let memfd_offset = entry.aligned_offset + file_offset as u64;
-
-                        let result = unsafe {
-                            crate::raw_syscall::mmap(
-                                map_addr,
-                                aligned_len,
-                                prot,
-                                libc::MAP_PRIVATE | libc::MAP_FIXED,
-                                state.aligned_fd,
-                                memfd_offset as i64,
-                            )
-                        };
-
-                        if crate::raw_syscall::is_error(result) {
-                            return result;
-                        }
-
-                        // Handle trampoline for the initial (non-MAP_FIXED) mmap.
-                        if !is_fixed && entry.tar_len >= 32 {
-                            unsafe {
-                                handle_tier2_trampoline(state, entry, map_addr);
-                            }
-                        }
-
-                        // Notify central about the mapping (fire-and-forget).
-                        let notify_args = [
-                            map_addr as u64,
-                            aligned_len as u64,
-                            #[allow(clippy::cast_sign_loss)]
-                            {
-                                prot as u64
-                            },
-                            u64::from(flags.cast_unsigned()),
-                            0,
-                            0,
-                        ];
-                        unsafe {
-                            notify_central(
-                                tls,
-                                litebox_ipc::messages::MSG_NOTIFY_MMAP,
-                                &notify_args,
-                            );
-                        }
+                    if crate::raw_syscall::is_error(result) {
                         return result;
                     }
-                    // map_addr == 0 && !is_fixed: fall through to central
+
+                    // Handle trampoline for the initial (non-MAP_FIXED) mmap.
+                    if !is_fixed && entry.tar_len >= 32 {
+                        unsafe {
+                            handle_tier2_trampoline(state, entry, map_addr);
+                        }
+                    }
+
+                    // Notify central about the mapping (fire-and-forget).
+                    let notify_args = [
+                        map_addr as u64,
+                        aligned_len as u64,
+                        #[allow(clippy::cast_sign_loss)]
+                        {
+                            prot as u64
+                        },
+                        u64::from(flags.cast_unsigned()),
+                        0,
+                        0,
+                    ];
+                    unsafe {
+                        notify_central(tls, litebox_ipc::messages::MSG_NOTIFY_MMAP, &notify_args);
+                    }
+                    return result;
+                }
+                // map_addr == 0 && !is_fixed: fall through to central
             }
         }
     }
@@ -1950,22 +1942,46 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
                 // However, central DOES populate inmem_slot_index for dup, so
                 // we prefer the source fd's value for consistency.
                 #[allow(clippy::cast_possible_truncation)]
-                let (tar_offset, tar_len, aligned_offset, inmem_slot_index) =
-                    if matches!(i64::from(nr), libc::SYS_dup | libc::SYS_dup2 | libc::SYS_dup3) {
-                        let source_fd = args.args[0] as i32;
-                        if let Some(source_entry) = state.find_file_fd_entry(source_fd) {
-                            (source_entry.tar_offset, source_entry.tar_len, source_entry.aligned_offset, source_entry.inmem_slot_index)
-                        } else {
-                            (resp.tar_offset, resp.tar_len, resp.aligned_offset, resp.inmem_slot_index)
-                        }
+                let (tar_offset, tar_len, aligned_offset, inmem_slot_index) = if matches!(
+                    i64::from(nr),
+                    libc::SYS_dup | libc::SYS_dup2 | libc::SYS_dup3
+                ) {
+                    let source_fd = args.args[0] as i32;
+                    if let Some(source_entry) = state.find_file_fd_entry(source_fd) {
+                        (
+                            source_entry.tar_offset,
+                            source_entry.tar_len,
+                            source_entry.aligned_offset,
+                            source_entry.inmem_slot_index,
+                        )
                     } else {
-                        (resp.tar_offset, resp.tar_len, resp.aligned_offset, resp.inmem_slot_index)
-                    };
+                        (
+                            resp.tar_offset,
+                            resp.tar_len,
+                            resp.aligned_offset,
+                            resp.inmem_slot_index,
+                        )
+                    }
+                } else {
+                    (
+                        resp.tar_offset,
+                        resp.tar_len,
+                        resp.aligned_offset,
+                        resp.inmem_slot_index,
+                    )
+                };
                 let fd = resp.fd;
                 let file_slot_offset = resp.file_slot_offset;
                 // Now take the mutable borrow for registration.
                 let micro = unsafe { &mut *(*tls).micro };
-                micro.register_file_fd(fd, file_slot_offset, tar_offset, tar_len, aligned_offset, inmem_slot_index);
+                micro.register_file_fd(
+                    fd,
+                    file_slot_offset,
+                    tar_offset,
+                    tar_len,
+                    aligned_offset,
+                    inmem_slot_index,
+                );
             }
             return cq.result; // return the fd
         }
@@ -2404,7 +2420,11 @@ unsafe fn shmem_socket_writev(
 /// directly without a syscall.
 ///
 /// Header layout: [magic: u64] [file_offset: u64] [vaddr: u64] [size: u64]
-#[allow(clippy::cast_possible_truncation, clippy::similar_names, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::similar_names,
+    clippy::cast_sign_loss
+)]
 unsafe fn handle_tier2_trampoline(
     state: &crate::state::MicroState,
     entry: &crate::state::FileFdEntry,
