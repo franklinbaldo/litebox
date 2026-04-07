@@ -509,6 +509,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 MemoryRegionPermissions::from_bits(permissions).unwrap(),
                 vma.flags.contains(VmFlags::VM_GROWSDOWN),
                 populate_pages_immediately,
+                false,
                 platform_fixed_address_behavior,
             )
             .map_err(|err| match err {
