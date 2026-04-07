@@ -651,6 +651,8 @@ where
 pub enum StdioReadError {
     #[error("input stream has been closed")]
     Closed,
+    #[error("input would block")]
+    WouldBlock,
 }
 
 /// A non-exhaustive list of errors that can be thrown by [`StdioProvider::write_to`].
@@ -681,16 +683,230 @@ pub enum StdioStream {
     Stderr = 2,
 }
 
+/// Errors from terminal operations on [`StdioProvider`].
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum StdioIoctlError {
+    /// The stream is not a terminal.
+    #[error("not a terminal")]
+    NotATerminal,
+    /// The operation failed with an OS error code (errno on Linux, mapped
+    /// equivalent on other platforms).
+    #[error("ioctl failed: {0}")]
+    OsError(i32),
+}
+
+/// Platform-agnostic terminal attributes, mirroring the fields of Linux
+/// `struct termios`.
+///
+/// The shim layer translates these fields to and from the guest ABI.
+/// Platform implementations fill this struct using their native APIs (e.g.,
+/// direct ioctl forwarding on Linux, `GetConsoleMode`/`SetConsoleMode` on
+/// Windows).
+#[derive(Debug, Clone)]
+pub struct TerminalAttributes {
+    /// Input mode flags.
+    pub c_iflag: u32,
+    /// Output mode flags.
+    pub c_oflag: u32,
+    /// Control mode flags.
+    pub c_cflag: u32,
+    /// Local mode flags.
+    pub c_lflag: u32,
+    /// Line discipline (typically `0` for `N_TTY`).
+    pub c_line: u8,
+    /// Control characters.
+    pub c_cc: [u8; 19],
+}
+
+// Terminal attribute flag constants.
+const TERMATTR_ECHO: u32 = 0x0008;
+const TERMATTR_ICRNL: u32 = 0x0100;
+const TERMATTR_OPOST: u32 = 0x0001;
+const TERMATTR_ONLCR: u32 = 0x0004;
+
+impl TerminalAttributes {
+    /// Default terminal attributes matching a freshly opened Linux PTY.
+    ///
+    /// These are realistic values that satisfy terminal detection in programs
+    /// such as Node.js Ink. **All-zero termios causes such programs to reject
+    /// the terminal silently.**
+    pub fn new_default() -> Self {
+        Self {
+            c_iflag: 0x6d02, // ICRNL | IXON | IXANY | IMAXBEL | IUTF8
+            c_oflag: 0x0005, // OPOST | ONLCR
+            c_cflag: 0x04bf, // CS8 | CREAD | CLOCAL | B38400
+            c_lflag: 0x8a3b, // ECHO | ECHOE | ECHOK | ISIG | ICANON | IEXTEN | ECHOCTL | ECHOKE
+            c_line: 0,       // N_TTY
+            c_cc: [
+                0x03, 0x1c, 0x7f, 0x15, 0x04, 0x00, 0x01, 0x00, 0x11, 0x13, 0x1a, 0xff, 0x12, 0x0f,
+                0x17, 0x16, 0xff, 0x00, 0x00,
+            ],
+        }
+    }
+
+    /// Returns `true` if the `ECHO` local flag is set.
+    pub fn echo_enabled(&self) -> bool {
+        self.c_lflag & TERMATTR_ECHO != 0
+    }
+
+    /// Returns `true` if the `ICRNL` input flag is set.
+    pub fn icrnl_enabled(&self) -> bool {
+        self.c_iflag & TERMATTR_ICRNL != 0
+    }
+
+    /// Returns `true` if output post-processing with newline translation
+    /// (`OPOST | ONLCR`) is enabled.
+    pub fn onlcr_enabled(&self) -> bool {
+        (self.c_oflag & TERMATTR_OPOST != 0) && (self.c_oflag & TERMATTR_ONLCR != 0)
+    }
+}
+
+/// Platform-agnostic terminal window size.
+#[derive(Debug, Clone, Copy)]
+pub struct WindowSize {
+    /// Number of rows (height in characters).
+    pub rows: u16,
+    /// Number of columns (width in characters).
+    pub cols: u16,
+    /// Horizontal size in pixels (informational, often zero).
+    pub xpixel: u16,
+    /// Vertical size in pixels (informational, often zero).
+    pub ypixel: u16,
+}
+
+/// When to apply terminal attribute changes, corresponding to POSIX
+/// `tcsetattr()` actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetTermiosWhen {
+    /// Apply immediately.
+    Now,
+    /// Drain output first, then apply.
+    AfterDrain,
+    /// Drain output first, flush pending input, then apply.
+    AfterDrainFlushInput,
+}
+
 /// A provider of standard input/output functionality.
 pub trait StdioProvider {
     /// Read from standard input. Returns number of bytes read.
     fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, StdioReadError>;
+
+    /// Read from standard input without blocking.
+    ///
+    /// Platforms with exact nonblocking stdin support should override this
+    /// instead of emulating it with a separate readiness probe.
+    fn read_from_stdin_nonblocking(&self, buf: &mut [u8]) -> Result<usize, StdioReadError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if !self.poll_stdin_readable() {
+            return Err(StdioReadError::WouldBlock);
+        }
+        self.read_from_stdin(buf)
+    }
 
     /// Write to stdout/stderr. Returns number of bytes written.
     fn write_to(&self, stream: StdioOutStream, buf: &[u8]) -> Result<usize, StdioWriteError>;
 
     /// Check if a stream is connected to a TTY.
     fn is_a_tty(&self, stream: StdioStream) -> bool;
+
+    /// Get the terminal attributes for a stdio stream.
+    ///
+    /// Platform implementations query the host terminal and populate a
+    /// [`TerminalAttributes`] struct. The default returns
+    /// [`StdioIoctlError::NotATerminal`].
+    fn get_terminal_attributes(
+        &self,
+        _stream: StdioStream,
+    ) -> Result<TerminalAttributes, StdioIoctlError> {
+        Err(StdioIoctlError::NotATerminal)
+    }
+
+    /// Set the terminal attributes for a stdio stream.
+    ///
+    /// Platform implementations translate the requested attributes into native
+    /// terminal API calls. The default returns
+    /// [`StdioIoctlError::NotATerminal`].
+    fn set_terminal_attributes(
+        &self,
+        _stream: StdioStream,
+        _attrs: &TerminalAttributes,
+        _when: SetTermiosWhen,
+    ) -> Result<(), StdioIoctlError> {
+        Err(StdioIoctlError::NotATerminal)
+    }
+
+    /// Get the terminal window size for a stdio stream.
+    ///
+    /// The default returns [`StdioIoctlError::NotATerminal`].
+    fn get_window_size(&self, _stream: StdioStream) -> Result<WindowSize, StdioIoctlError> {
+        Err(StdioIoctlError::NotATerminal)
+    }
+
+    /// Get the number of input bytes currently readable from a terminal stream.
+    ///
+    /// Platforms that do not support terminal input-queue queries may return
+    /// [`StdioIoctlError::NotATerminal`].
+    fn get_terminal_input_bytes(&self, _stream: StdioStream) -> Result<u32, StdioIoctlError> {
+        Err(StdioIoctlError::NotATerminal)
+    }
+
+    /// Set the terminal window size for a stdio stream.
+    ///
+    /// On some platforms this stores the size so that subsequent
+    /// `get_window_size` calls return the stored value (the actual console
+    /// is not resized). The default returns
+    /// [`StdioIoctlError::NotATerminal`].
+    fn set_window_size(
+        &self,
+        _stream: StdioStream,
+        _size: &WindowSize,
+    ) -> Result<(), StdioIoctlError> {
+        Err(StdioIoctlError::NotATerminal)
+    }
+
+    /// Check if stdin has data available for reading without blocking.
+    ///
+    /// Returns `true` if a `read()` on stdin would return data immediately.
+    /// Used by epoll/poll to report stdin readability. The default returns
+    /// `false`.
+    fn poll_stdin_readable(&self) -> bool {
+        false
+    }
+
+    /// Cancel any pending `read_from_stdin()` call, causing it to return
+    /// [`StdioReadError::Closed`]. Used during process exit to unblock
+    /// threads waiting on stdin. The default is a no-op.
+    fn cancel_stdin(&self) {}
+
+    /// Returns the host terminal device identity for stdin, if it is
+    /// connected to a real terminal.
+    ///
+    /// Used to report correct device info in guest-visible stat and readlink
+    /// operations, so that runtimes can discover and reopen the controlling
+    /// terminal by its actual device path.
+    ///
+    /// Returns `None` when stdin is not a terminal (pipes, files) or on
+    /// platforms that do not expose terminal device paths.
+    fn host_stdin_tty_device_info(&self) -> Option<HostTtyDeviceInfo> {
+        None
+    }
+}
+
+/// Host terminal device identity, returned by
+/// [`StdioProvider::host_stdin_tty_device_info`].
+#[derive(Debug, Clone)]
+pub struct HostTtyDeviceInfo {
+    /// Device path on the host (e.g., a PTY path on Linux).
+    pub path: alloc::string::String,
+    /// Device number encoding (major/minor) from the host.
+    pub rdev: u64,
+    /// Device ID of the filesystem containing the device node.
+    pub dev: u64,
+    /// Inode number of the device node on the host.
+    pub ino: u64,
 }
 
 /// A provider for system information.
