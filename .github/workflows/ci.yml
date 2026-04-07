@@ -268,16 +268,50 @@ jobs:
         with:
           tool: nextest@${{ env.NEXTEST_VERSION }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --locked --verbose --all-targets --all-features -p litebox_runner_linux_on_macos_userland
-      - run: cargo build --locked --verbose -p litebox_runner_linux_on_macos_userland
-      - run: cargo nextest run --locked --profile ci -p litebox_runner_linux_on_macos_userland
+      - run: >-
+          cargo clippy --locked --verbose --all-targets --all-features
+          -p litebox_runner_linux_on_macos_userland
+          -p litebox_common_macos
+          -p litebox_shim_macos
+          -p litebox_platform_macos_userland
+          -p litebox_runner_macos_on_macos_userland
+          -p litebox_syscall_rewriter_macho
+      - run: >-
+          cargo build --locked --verbose
+          -p litebox_runner_linux_on_macos_userland
+          -p litebox_common_macos
+          -p litebox_shim_macos
+          -p litebox_platform_macos_userland
+          -p litebox_runner_macos_on_macos_userland
+          -p litebox_syscall_rewriter_macho
+      - run: >-
+          cargo nextest run --locked --profile ci
+          -p litebox_runner_linux_on_macos_userland
+          -p litebox_common_macos
+          -p litebox_shim_macos
+          -p litebox_platform_macos_userland
+          -p litebox_runner_macos_on_macos_userland
+          -p litebox_syscall_rewriter_macho
       - run: |
-          cargo test --locked --verbose --doc -p litebox_runner_linux_on_macos_userland
+          cargo test --locked --verbose --doc \
+            -p litebox_runner_linux_on_macos_userland \
+            -p litebox_common_macos \
+            -p litebox_shim_macos \
+            -p litebox_platform_macos_userland \
+            -p litebox_runner_macos_on_macos_userland \
+            -p litebox_syscall_rewriter_macho
           # We need to run `cargo test --doc` separately because doc tests
           # aren't included in nextest at the moment. See relevant discussion at
           # https://github.com/nextest-rs/nextest/issues/16
       - name: Build documentation (fail on warnings)
-        run: cargo doc --locked --verbose --no-deps --all-features --document-private-items -p litebox_runner_linux_on_macos_userland
+        run: >-
+          cargo doc --locked --verbose --no-deps --all-features --document-private-items
+          -p litebox_runner_linux_on_macos_userland
+          -p litebox_common_macos
+          -p litebox_shim_macos
+          -p litebox_platform_macos_userland
+          -p litebox_runner_macos_on_macos_userland
+          -p litebox_syscall_rewriter_macho
 
   build_and_test_snp:
     name: Build and Test SNP
@@ -349,6 +383,10 @@ jobs:
           #   access since it needs to actually access the file-system, pull in
           #   relevant files, and then actually trigger LiteBox itself.
           #
+          # - `litebox_runner_macos_on_macos_userland` is allowed to have `std`
+          #   access since it needs to actually access the file-system, pull in
+          #   relevant files, and then actually trigger LiteBox itself.
+          #
           # - `litebox_platform_lvbs` has a custom target (`no_std`), so it does
           #   not work with the current no_std checker.
           #
@@ -398,6 +436,7 @@ jobs:
             -not -path './litebox_platform_macos_userland/Cargo.toml' \
             -not -path './litebox_platform_windows_userland/Cargo.toml' \
             -not -path './litebox_runner_linux_on_macos_userland/Cargo.toml' \
+            -not -path './litebox_runner_macos_on_macos_userland/Cargo.toml' \
             -not -path './litebox_runner_linux_on_windows_userland/Cargo.toml' \
             -not -path './litebox_platform_lvbs/Cargo.toml' \
             -not -path './litebox_platform_multiplex/Cargo.toml' \
