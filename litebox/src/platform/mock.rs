@@ -210,7 +210,7 @@ impl IPInterfaceProvider for MockPlatform {
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct MockInstant {
-    time: u64,
+    pub(crate) time: u64,
 }
 
 impl Instant for MockInstant {
@@ -230,7 +230,7 @@ impl Instant for MockInstant {
 }
 
 pub(crate) struct MockSystemTime {
-    time: u64,
+    pub(crate) time: u64,
 }
 
 impl SystemTime for MockSystemTime {
@@ -290,6 +290,9 @@ impl RawPointerProvider for MockPlatform {
 
 impl StdioProvider for MockPlatform {
     fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, StdioReadError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let Some(front) = self.stdin_queue.write().unwrap().pop_front() else {
             return Err(StdioReadError::Closed);
         };

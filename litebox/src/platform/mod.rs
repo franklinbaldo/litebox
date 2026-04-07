@@ -23,11 +23,13 @@ pub use page_mgmt::PageManagementProvider;
 #[macro_export]
 macro_rules! log_println {
     ($platform:expr, $s:expr) => {{
+        #[allow(unused_imports)]
         use $crate::platform::DebugLogProvider as _;
         $platform.debug_log_print($s);
     }};
     ($platform:expr, $($tt:tt)*) => {{
         use core::fmt::Write as _;
+        #[allow(unused_imports)]
         use $crate::platform::DebugLogProvider as _;
         let mut t: arrayvec::ArrayString<8192> = arrayvec::ArrayString::new();
         writeln!(t, $($tt)*).unwrap();
@@ -666,6 +668,16 @@ pub trait SystemInfoProvider {
     /// Return `Some(address)` if the VDSO is available on the platform, or `None`
     /// if the platform does not support or provide a VDSO.
     fn get_vdso_address(&self) -> Option<usize>;
+
+    /// Returns the current processor number, used to emulate `getcpu`-family
+    /// syscalls and related VDSO interfaces.
+    ///
+    /// Platforms that do not expose a stable processor identifier, or that
+    /// virtualize CPU topology, may return `0`. Callers arrive in subsequent
+    /// stacked PRs.
+    fn current_processor_number(&self) -> u32 {
+        0
+    }
 }
 
 /// A provider for thread-local storage.
