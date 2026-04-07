@@ -48,6 +48,29 @@ pub trait IOPollable {
     /// calls are what notify observers. This particular function itself however _may_ be used to
     /// essentially get "the current status" of events for the system.
     fn check_io_events(&self) -> Events;
+
+    /// Returns `true` if this pollable cannot deliver asynchronous observer
+    /// notifications (e.g. host-backed stdin where the host has no callback
+    /// mechanism). Callers should use periodic polling instead of blocking
+    /// indefinitely on observer wakeups.
+    ///
+    /// Defaults to `false` (async notifications work). This is safe for all
+    /// existing implementors; callers that use this method arrive in subsequent
+    /// stacked PRs.
+    fn needs_host_poll(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` if reads on this pollable should block when no data is
+    /// available. Returns `false` for pollables whose callers perform
+    /// asynchronous readiness checks and expect a "would block" indication
+    /// immediately (e.g. PTY master side).
+    ///
+    /// Defaults to `true` (blocking reads). This is safe for all existing
+    /// implementors; callers arrive in subsequent stacked PRs.
+    fn should_block_read(&self) -> bool {
+        true
+    }
 }
 
 impl<T: IOPollable> IOPollable for alloc::sync::Arc<T> {
@@ -60,5 +83,11 @@ impl<T: IOPollable> IOPollable for alloc::sync::Arc<T> {
     }
     fn check_io_events(&self) -> Events {
         self.as_ref().check_io_events()
+    }
+    fn needs_host_poll(&self) -> bool {
+        self.as_ref().needs_host_poll()
+    }
+    fn should_block_read(&self) -> bool {
+        self.as_ref().should_block_read()
     }
 }
