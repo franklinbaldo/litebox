@@ -306,6 +306,18 @@ pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const 
     vmas: RangeMap<usize, VmArea>,
 }
 
+impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Clone
+    for Vmem<Platform, ALIGN>
+{
+    fn clone(&self) -> Self {
+        Self {
+            platform: self.platform,
+            brk: self.brk,
+            vmas: self.vmas.clone(),
+        }
+    }
+}
+
 impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem<Platform, ALIGN> {
     pub(super) const STACK_GUARD_GAP: usize = 256 << 12;
 

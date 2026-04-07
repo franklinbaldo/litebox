@@ -71,6 +71,43 @@ impl SignalState {
         }
     }
 
+    /// Creates signal state for a forked child process.
+    ///
+    /// Like Linux's `copy_sighand()` + `copy_signal()` for `fork()`:
+    /// - Signal handlers are **deep-copied** (independent from parent)
+    /// - Blocked mask is inherited
+    /// - Pending signals are cleared (not inherited)
+    /// - Shared pending is a new, independent instance
+    /// - Altstack is cleared
+    pub fn clone_for_fork(&self) -> Self {
+        // Deep-clone the handlers: the child gets an independent copy of the
+        // parent's signal handler table, not a shared reference.
+        let parent_handlers = self.handlers.borrow();
+        // Deref through Ref<Arc<SignalHandlers>> -> Arc<SignalHandlers> -> SignalHandlers,
+        // clone the SignalHandlers, then wrap in a new Arc.
+        let cloned_handlers = Arc::new(SignalHandlers::clone(&parent_handlers));
+        Self {
+            pending: RefCell::new(PendingSignals::new()),
+            shared_pending: Arc::new(Mutex::new(PendingSignals::new())),
+            blocked: Cell::new(self.blocked.get()),
+            handlers: RefCell::new(cloned_handlers),
+            altstack: SigAltStack {
+                flags: SsFlags::DISABLE,
+                sp: 0,
+                size: 0,
+                #[cfg(target_arch = "x86_64")]
+                __pad: 0,
+            }
+            .into(),
+            last_exception: Cell::new(litebox::shim::ExceptionInfo {
+                exception: litebox::shim::Exception(0),
+                error_code: 0,
+                cr2: 0,
+                kernel_mode: false,
+            }),
+        }
+    }
+
     pub fn clone_for_new_task(&self) -> Self {
         Self {
             // Reset pending

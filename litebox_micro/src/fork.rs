@@ -481,7 +481,6 @@ unsafe fn post_fork_child(child_ring_fd: i32, child_pid: u32) {
 
     // Close parent ring fd — the pipe zone is now independently mapped.
     unsafe { crate::raw_syscall::close(parent_ring_fd) };
-
     // Clear file fd table — entries point into the parent ring's data region
     // which was unmapped. The child gets fresh file slots as it opens/dups
     // files. Without this, writes via FILE_SHMEM use stale offsets and

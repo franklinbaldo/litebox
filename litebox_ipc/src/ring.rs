@@ -230,8 +230,13 @@ pub struct ShmemPipeHeader {
     pub read_fd: i32,
     /// The write-end fd number (for identification).
     pub write_fd: i32,
+    /// Reference count for the read end. Starts at 1; incremented on fork,
+    /// decremented on close. `READER_CLOSED` is set when this reaches 0.
+    pub reader_refcount: AtomicU8,
+    /// Reference count for the write end. Same semantics as `reader_refcount`.
+    pub writer_refcount: AtomicU8,
     /// Padding to fill to 64 bytes (one cache line).
-    pub _pad: [u8; 24],
+    pub _pad: [u8; 22],
 }
 
 const _: () = assert!(size_of::<ShmemPipeHeader>() == 64);

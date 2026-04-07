@@ -103,7 +103,6 @@ impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
         if info.kernel_mode && info.exception == litebox::shim::Exception::PAGE_FAULT {
             if unsafe {
                 self.task
-                    .global
                     .pm
                     .handle_page_fault(info.cr2, info.error_code.into())
             }
@@ -192,7 +191,6 @@ impl LinuxShimBuilder {
         let root_net = Arc::new(litebox::sync::Mutex::new(net));
         let global = Arc::new(GlobalState {
             platform: self.platform,
-            pm: PageManager::new(self.platform),
             futex_manager: FutexManager::new(),
             pipes: Pipes::new(),
             boot_time: self.platform.now(),
@@ -251,6 +249,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.global.clone(),
+                pm: alloc::sync::Arc::new(PageManager::new(self.global.platform)),
                 net: self.root_net.clone(),
                 thread: syscalls::process::ThreadState::new_process(pid),
                 wait_state: wait::WaitState::new(self.global.platform),
@@ -282,10 +281,11 @@ impl<FS: ShimFS> LinuxShim<FS> {
         })
     }
 
-    /// Get the global page manager
-    pub fn page_manager(&self) -> &PageManager<Platform, PAGE_SIZE> {
-        &self.global.pm
-    }
+    // page_manager() moved to LinuxShimTask
+
+
+
+
 
     /// Perform queued network interactions with the outside world.
     ///
@@ -381,6 +381,7 @@ impl<FS: ShimFS> LinuxShimTask<FS> {
         let child_task = LinuxShimTask {
             task: Task {
                 global: self.task.global.clone(),
+                pm: self.task.pm.clone(), // Arc clone: threads share the same address space
                 net: self.task.net.clone(),
                 wait_state: crate::wait::WaitState::new(self.task.global.platform),
                 thread,
@@ -403,7 +404,12 @@ impl<FS: ShimFS> LinuxShimTask<FS> {
     /// Must be called once before the first `brk()` syscall. Panics if
     /// called after brk is already initialized.
     pub fn set_initial_brk(&self, brk: usize) {
-        self.task.global.pm.set_initial_brk(brk);
+        self.task.pm.set_initial_brk(brk);
+    }
+
+    /// Get the per-process page manager.
+    pub fn page_manager(&self) -> &PageManager<Platform, PAGE_SIZE> {
+        &self.task.pm
     }
 
     /// Return the process ID of this task.
@@ -463,6 +469,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
         LinuxShimTask {
             task: Task {
                 global: self.global.clone(),
+                pm: alloc::sync::Arc::new(PageManager::new(self.global.platform)),
                 net: self.root_net.clone(),
                 thread: syscalls::process::ThreadState::new_process(params.pid),
                 wait_state: wait::WaitState::new(self.global.platform),
@@ -662,9 +669,16 @@ impl<FS: ShimFS> LinuxShim<FS> {
 
         let child_net = Arc::new(litebox::sync::Mutex::new(child_net));
 
+        // Clone the parent's PageManager so the child gets an independent copy
+        // of the virtual memory area map — just like Linux's fork() copies
+        // the mm_struct. This prevents the child's execve (which calls
+        // release_memory) from destroying the parent's mapping metadata.
+        let child_pm = alloc::sync::Arc::new(parent_task.task.pm.clone_for_fork());
+
         LinuxShimTask {
             task: Task {
                 global: self.global.clone(),
+                pm: child_pm,
                 net: child_net,
                 thread: syscalls::process::ThreadState::new_process(params.pid),
                 wait_state: wait::WaitState::new(self.global.platform),
@@ -681,7 +695,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 comm: Cell::new([0; litebox_common_linux::TASK_COMM_LEN]),
                 fs: child_fs_state.into(),
                 files: files.into(),
-                signals: syscalls::signal::SignalState::new_process(),
+                signals: parent_task.task.signals.clone_for_fork(),
             },
         }
     }
@@ -1580,8 +1594,6 @@ impl<FS: ShimFS> Task<FS> {
 struct GlobalState<FS: ShimFS> {
     /// The platform instance used throughout the shim.
     platform: &'static Platform,
-    /// The page manager for managing virtual memory.
-    pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
     /// The futex manager for handling futex operations.
     futex_manager: FutexManager<Platform>,
     /// The anonymous pipe implementation.
@@ -1599,6 +1611,11 @@ struct GlobalState<FS: ShimFS> {
 
 struct Task<FS: ShimFS> {
     global: Arc<GlobalState<FS>>,
+    /// Per-process page manager. Threads within the same process share this
+    /// via `Arc` (like Linux's `mm_struct` with `CLONE_VM`), but each forked
+    /// child gets its own independent clone (like Linux's `fork()` copying
+    /// `mm_struct`).
+    pm: alloc::sync::Arc<litebox::mm::PageManager<Platform, { PAGE_SIZE }>>,
     /// Per-process network state. Shared among threads in the same process
     /// via Arc, but each forked process gets its own instance.
     net: Arc<litebox::sync::Mutex<Platform, Network<Platform>>>,
@@ -1663,6 +1680,7 @@ mod test_utils {
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
+                pm: alloc::sync::Arc::new(PageManager::new(self.platform)),
                 global: self,
             }
         }
@@ -1678,6 +1696,7 @@ mod test_utils {
             let task = Task {
                 wait_state: wait::WaitState::new(self.global.platform),
                 global: self.global.clone(),
+                pm: self.pm.clone(),
                 net: self.net.clone(),
                 thread: self.thread.new_thread(tid)?,
                 pid: self.pid,

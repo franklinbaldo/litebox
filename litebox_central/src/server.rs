@@ -24,7 +24,7 @@ use litebox_ipc::messages::{
 use litebox_ipc::ring::{
     CqEntry, FILE_SLOT_SIZE, FILE_ZONE_BASE_OFFSET, PIPE_SLOT_SIZE, PIPE_ZONE_BASE_OFFSET,
     RING_MASK, SOCKET_RING_CAPACITY, SOCKET_SLOT_SIZE, SOCKET_ZONE_BASE_OFFSET, SqEntry,
-    TrampolineDescriptor, cq_flags, pipe_flags, sq_flags,
+    TrampolineDescriptor, cq_flags, sq_flags,
 };
 use litebox_ipc::sq::{sq_advance_head, sq_head_index, sq_try_consume};
 use litebox_ipc::wait::spin_u8_then_wait_u32;
@@ -409,6 +409,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 continue;
             }
 
+
             // SAFETY: `cq_entries` points to a valid array of RING_SIZE CqEntry
             // values in the shared memory region. We are the sole CQ producer
             // (single-process server loop), satisfying the single-producer
@@ -511,6 +512,8 @@ impl<FS: ShimFS> ProcessServer<FS> {
             let mut regs = crate::dispatch::sq_entry_to_ptregs(entry);
             cq.result = self.dispatch_to_task(entry.thread_slot, &mut regs);
             cq.flags = cq_flags::EXEC_LOCAL | cq_flags::NO_REPORT;
+            // Close all shmem pipe ends so sibling processes get EOF/EPIPE.
+            self.close_all_shmem_pipes();
             return cq;
         }
 
@@ -1188,6 +1191,49 @@ impl<FS: ShimFS> ProcessServer<FS> {
                 .fd_path_map
                 .borrow_mut()
                 .clone_from(&self.fd_path_map.borrow());
+
+            // Forked children inherit the parent's shmem pipes. Increment
+            // the refcounts in the shmem headers so READER_CLOSED /
+            // WRITER_CLOSED flags are only set when ALL holders close.
+            {
+                let parent_ns = self.notification_state.borrow();
+                if !parent_ns.shmem_pipes.is_empty() {
+                    let mut child_ns = child_server.notification_state.borrow_mut();
+                    for pipe in &parent_ns.shmem_pipes {
+                        // Increment refcounts in the shmem header.
+                        let slot_offset = litebox_ipc::ring::PIPE_ZONE_BASE_OFFSET
+                            + pipe.slot_index as usize
+                                * litebox_ipc::ring::PIPE_SLOT_SIZE;
+                        let data_region = self.region.data_region_mut();
+                        #[allow(clippy::cast_ptr_alignment)]
+                        let header_ptr = unsafe {
+                            data_region
+                                .as_mut_ptr()
+                                .add(slot_offset)
+                                .cast::<litebox_ipc::ring::ShmemPipeHeader>()
+                        };
+                        unsafe {
+                            litebox_ipc::pipe::pipe_inc_refcounts(header_ptr);
+                        }
+                        // Clone the pipe entry for the child, storing
+                        // the parent header address so the child server
+                        // can access the shmem header for refcount ops.
+                        child_ns.shmem_pipes.push(
+                            crate::notification_state::ShmemPipe {
+                                read_fd: pipe.read_fd,
+                                write_fd: pipe.write_fd,
+                                slot_index: pipe.slot_index,
+                                read_open: pipe.read_open,
+                                write_open: pipe.write_open,
+                                inherited_header_addr: header_ptr as usize,
+                            },
+                        );
+                    }
+                    // The child shares the same pipe slots — mark them
+                    // allocated in the child's bitset too.
+                    child_ns.pipe_slot_bitset = parent_ns.pipe_slot_bitset;
+                }
+            }
 
             let handle = std::thread::spawn(move || {
                 if let Err(e) = child_server.run() {
@@ -2486,7 +2532,9 @@ impl<FS: ShimFS> ProcessServer<FS> {
             read_fd,
             write_fd,
             slot_index,
-            open_ends: 2,
+            read_open: true,
+            write_open: true,
+            inherited_header_addr: 0,
         });
 
         // Write a Pipe2Response to the data region at offset 0 for micro.
@@ -2517,35 +2565,58 @@ impl<FS: ShimFS> ProcessServer<FS> {
         cq
     }
 
-    /// If `fd` is one end of a shmem pipe, set the appropriate closed flag,
-    /// futex-wake blocked readers/writers, and decrement `open_ends`. When
-    /// both ends are closed, free the pipe slot.
+    /// If `fd` is one end of a shmem pipe, decrement the appropriate
+    /// refcount in the shmem header (reader or writer). The refcount helpers
+    /// atomically set READER_CLOSED / WRITER_CLOSED only when the last
+    /// holder closes. Then futex-wake blocked peers, and decrement
+    /// `open_ends`. When both local ends are closed, remove tracking (and
+    /// free the slot only for locally-created pipes).
     fn maybe_close_shmem_pipe_end(&self, fd: i32) {
         let mut ns = self.notification_state.borrow_mut();
         let Some(pipe) = ns.find_shmem_pipe_mut(fd) else {
             return;
         };
 
-        // Determine which flag to set based on which end is being closed.
-        let flag = if fd == pipe.read_fd {
-            pipe_flags::READER_CLOSED
+        let is_reader = fd == pipe.read_fd;
+        let inherited = pipe.inherited_header_addr != 0;
+
+        // Guard: if this end is already closed locally, skip.
+        if is_reader && !pipe.read_open {
+            return;
+        }
+        if !is_reader && !pipe.write_open {
+            return;
+        }
+
+        // Get the shmem pipe header pointer. For inherited (forked) pipes,
+        // the header lives in the parent's ring data region — use the
+        // stored address. For locally-created pipes, compute from our own
+        // data region.
+        let header_ptr = if inherited {
+            pipe.inherited_header_addr
+                as *mut litebox_ipc::ring::ShmemPipeHeader
         } else {
-            pipe_flags::WRITER_CLOSED
+            let slot_offset =
+                PIPE_ZONE_BASE_OFFSET + pipe.slot_index as usize * PIPE_SLOT_SIZE;
+            let data_region = self.region.data_region_mut();
+            #[allow(clippy::cast_ptr_alignment)]
+            unsafe {
+                data_region
+                    .as_mut_ptr()
+                    .add(slot_offset)
+                    .cast::<litebox_ipc::ring::ShmemPipeHeader>()
+            }
         };
 
-        let slot_offset = PIPE_ZONE_BASE_OFFSET + pipe.slot_index as usize * PIPE_SLOT_SIZE;
-
-        // Set the closed flag in the shmem pipe header.
-        let data_region = self.region.data_region_mut();
-        #[allow(clippy::cast_ptr_alignment)] // slot offsets are 64-byte aligned by design
-        let header_ptr = unsafe {
-            data_region
-                .as_mut_ptr()
-                .add(slot_offset)
-                .cast::<litebox_ipc::ring::ShmemPipeHeader>()
-        };
+        // Decrement the appropriate refcount. The helpers atomically set
+        // READER_CLOSED / WRITER_CLOSED only when the refcount hits 0
+        // (i.e., ALL processes holding this end have closed it).
         unsafe {
-            litebox_ipc::pipe::pipe_set_flag(header_ptr, flag);
+            if is_reader {
+                litebox_ipc::pipe::pipe_dec_reader(header_ptr);
+            } else {
+                litebox_ipc::pipe::pipe_dec_writer(header_ptr);
+            }
         }
 
         // Futex-wake any blocked readers/writers on both head and tail.
@@ -2568,18 +2639,52 @@ impl<FS: ShimFS> ProcessServer<FS> {
             );
         }
 
-        // Decrement open_ends; free slot when both ends are closed.
-        pipe.open_ends -= 1;
-        if pipe.open_ends == 0 {
+        // Mark this end as closed locally. When both local ends are
+        // closed, remove tracking. Only free the slot for locally-created
+        // pipes — inherited pipes' slots are owned by the parent.
+        if is_reader {
+            pipe.read_open = false;
+        } else {
+            pipe.write_open = false;
+        }
+        if !pipe.read_open && !pipe.write_open {
             let slot_index = pipe.slot_index;
-            // Remove the pipe entry from the vec.
             let idx = ns
                 .shmem_pipes
                 .iter()
                 .position(|p| p.slot_index == slot_index)
                 .expect("pipe must exist");
             ns.shmem_pipes.swap_remove(idx);
-            ns.free_pipe_slot(slot_index);
+            if !inherited {
+                ns.free_pipe_slot(slot_index);
+            }
+        }
+    }
+
+    /// Close all shmem pipe ends for this process (used during exit cleanup).
+    ///
+    /// Collects all open pipe fds, then closes each one. This ensures that
+    /// sibling processes blocked on the other end of a pipe get EOF/EPIPE.
+    fn close_all_shmem_pipes(&self) {
+        // Collect open fds first to avoid holding the borrow across close calls.
+        let fds: Vec<i32> = {
+            let ns = self.notification_state.borrow();
+            ns.shmem_pipes
+                .iter()
+                .flat_map(|p| {
+                    let mut v = Vec::new();
+                    if p.read_open {
+                        v.push(p.read_fd);
+                    }
+                    if p.write_open {
+                        v.push(p.write_fd);
+                    }
+                    v
+                })
+                .collect()
+        };
+        for fd in fds {
+            self.maybe_close_shmem_pipe_end(fd);
         }
     }
 
@@ -3536,7 +3641,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
         // within MMAP_BUMP_START..MMAP_BUMP_END.  This prevents collisions
         // between central-allocated mappings and micro's local bump allocator.
         {
-            let pm = self.shim.page_manager();
+            let pm = self.primary_task.page_manager();
             let range = litebox::mm::linux::PageRange {
                 start: MMAP_BUMP_START as usize,
                 end: MMAP_BUMP_END as usize,
@@ -3700,7 +3805,7 @@ impl<FS: ShimFS> ProcessServer<FS> {
 
                 // Register in PageManager so central's address allocator
                 // knows this range is occupied (prevents future collisions).
-                let pm = self.shim.page_manager();
+                let pm = self.primary_task.page_manager();
                 #[allow(clippy::cast_possible_truncation)] // 64-bit only
                 let range = litebox::mm::linux::PageRange {
                     start: addr as usize,

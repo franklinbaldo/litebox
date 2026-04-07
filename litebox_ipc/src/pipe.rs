@@ -28,7 +28,9 @@ pub unsafe fn pipe_init(header: *mut ShmemPipeHeader, read_fd: i32, write_fd: i3
         (*header).flags = core::sync::atomic::AtomicU32::new(flags);
         (*header).read_fd = read_fd;
         (*header).write_fd = write_fd;
-        (*header)._pad = [0u8; 24];
+        (*header).reader_refcount = core::sync::atomic::AtomicU8::new(1);
+        (*header).writer_refcount = core::sync::atomic::AtomicU8::new(1);
+        (*header)._pad = [0u8; 22];
     }
 }
 
@@ -145,6 +147,58 @@ pub unsafe fn pipe_try_read(header: *mut ShmemPipeHeader, buf: &mut [u8]) -> i64
 pub unsafe fn pipe_set_flag(header: *mut ShmemPipeHeader, flag: u32) {
     let h = unsafe { &*header };
     h.flags.fetch_or(flag, Release);
+}
+
+/// Increment both reader and writer refcounts on a pipe header.
+///
+/// Called during fork so that READER_CLOSED/WRITER_CLOSED flags are only set
+/// when ALL holders of each end have closed it.
+///
+/// # Safety
+///
+/// `header` must point to a valid `ShmemPipeHeader` in shared memory.
+pub unsafe fn pipe_inc_refcounts(header: *mut ShmemPipeHeader) {
+    let h = unsafe { &*header };
+    h.reader_refcount.fetch_add(1, Release);
+    h.writer_refcount.fetch_add(1, Release);
+}
+
+/// Decrement the reader refcount. If it reaches 0, set `READER_CLOSED`.
+///
+/// Returns `true` if the `READER_CLOSED` flag was set (refcount hit 0).
+///
+/// # Safety
+///
+/// `header` must point to a valid `ShmemPipeHeader` in shared memory.
+pub unsafe fn pipe_dec_reader(header: *mut ShmemPipeHeader) -> bool {
+    let h = unsafe { &*header };
+    let prev = h.reader_refcount.fetch_sub(1, Release);
+    if prev == 1 {
+        // Last reader closed — set the flag.
+        h.flags.fetch_or(pipe_flags::READER_CLOSED, Release);
+        true
+    } else {
+        false
+    }
+}
+
+/// Decrement the writer refcount. If it reaches 0, set `WRITER_CLOSED`.
+///
+/// Returns `true` if the `WRITER_CLOSED` flag was set (refcount hit 0).
+///
+/// # Safety
+///
+/// `header` must point to a valid `ShmemPipeHeader` in shared memory.
+pub unsafe fn pipe_dec_writer(header: *mut ShmemPipeHeader) -> bool {
+    let h = unsafe { &*header };
+    let prev = h.writer_refcount.fetch_sub(1, Release);
+    if prev == 1 {
+        // Last writer closed — set the flag.
+        h.flags.fetch_or(pipe_flags::WRITER_CLOSED, Release);
+        true
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]

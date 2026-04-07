@@ -1416,6 +1416,7 @@ pub unsafe extern "C" fn micro_handle_syscall(args: *const SyscallArgs) -> i64 {
         let micro = unsafe { &*(*tls).micro };
         let fd = args.args[0] as i32;
         if let Some((header_ptr, is_write_end)) = micro.find_pipe_fd(fd) {
+
             match i64::from(nr) {
                 libc::SYS_write if is_write_end => {
                     let buf = args.args[1] as *const u8;
@@ -2076,6 +2077,7 @@ unsafe fn shmem_pipe_write(header_ptr: *mut u8, buf_ptr: *const u8, count: usize
 
     loop {
         let result = unsafe { litebox_ipc::pipe::pipe_try_write(header, &buf[total_written..]) };
+
         if result == -i64::from(libc::EPIPE) {
             if total_written > 0 {
                 return total_written as i64;
@@ -2086,11 +2088,11 @@ unsafe fn shmem_pipe_write(header_ptr: *mut u8, buf_ptr: *const u8, count: usize
         if result > 0 {
             total_written += result as usize;
             if total_written >= count {
-                // Wake reader (may be blocked on empty buffer)
-                let head_ptr = unsafe { &(*header).head };
+                // Wake reader (may be blocked waiting for data on tail)
+                let tail_ptr = unsafe { &(*header).tail };
                 unsafe {
                     crate::raw_syscall::futex4(
-                        core::ptr::from_ref(head_ptr).cast::<u8>() as usize,
+                        core::ptr::from_ref(tail_ptr).cast::<u8>() as usize,
                         libc::FUTEX_WAKE,
                         1,
                         0,
@@ -2152,11 +2154,11 @@ unsafe fn shmem_pipe_read(header_ptr: *mut u8, buf_ptr: *mut u8, count: usize) -
     loop {
         let result = unsafe { litebox_ipc::pipe::pipe_try_read(header, buf) };
         if result > 0 {
-            // Wake writer (may be blocked on full buffer)
-            let tail_ptr = unsafe { &(*header).tail };
+            // Wake writer (may be blocked waiting for space on head)
+            let head_ptr = unsafe { &(*header).head };
             unsafe {
                 crate::raw_syscall::futex4(
-                    core::ptr::from_ref(tail_ptr).cast::<u8>() as usize,
+                    core::ptr::from_ref(head_ptr).cast::<u8>() as usize,
                     libc::FUTEX_WAKE,
                     1,
                     0,

@@ -47,8 +47,15 @@ pub(crate) struct ShmemPipe {
     pub write_fd: i32,
     /// Slot index in the pipe zone (0..MAX_PIPE_SLOTS).
     pub slot_index: u8,
-    /// Reference count: how many fd endpoints are still open (0, 1, or 2).
-    pub open_ends: u8,
+    /// Whether the read end is still open in this process.
+    pub read_open: bool,
+    /// Whether the write end is still open in this process.
+    pub write_open: bool,
+    /// For inherited (forked) pipes: raw address of the ShmemPipeHeader
+    /// in the parent's ring data region. 0 means this pipe was created
+    /// locally and should use this process's own data region to find the
+    /// header.
+    pub inherited_header_addr: usize,
 }
 
 /// Tracking info for a shmem-backed socket.

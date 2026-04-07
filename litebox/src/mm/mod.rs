@@ -45,6 +45,20 @@ where
         Self { vmem }
     }
 
+    /// Create an independent clone of this `PageManager` for a forked child.
+    ///
+    /// The child gets its own copy of the virtual memory area map, so that
+    /// `release_memory` / `create_pages` in the child do not affect the
+    /// parent's address-space metadata — mirroring how `fork()` copies the
+    /// kernel's `mm_struct`.
+    #[must_use]
+    pub fn clone_for_fork(&self) -> Self {
+        let cloned_vmem = self.vmem.read().clone();
+        Self {
+            vmem: RwLock::new(cloned_vmem),
+        }
+    }
+
     /// Create a mapping with the given flags.
     ///
     /// `suggested_new_address` is the hint address for where to create the pages if it is not `None`.

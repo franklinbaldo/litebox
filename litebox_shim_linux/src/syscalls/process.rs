@@ -768,6 +768,7 @@ impl<FS: ShimFS> Task<FS> {
                 Box::new(NewThreadArgs {
                     task: Task {
                         global: self.global.clone(),
+                        pm: self.pm.clone(), // Arc clone: threads share address space
                         net: self.net.clone(),
                         wait_state: crate::wait::WaitState::new(self.global.platform),
                         thread,
@@ -1441,7 +1442,7 @@ impl<FS: ShimFS> Task<FS> {
 
         // Don't release reserved mappings.
         let release = |_r: Range<usize>, vm: VmFlags| !vm.is_empty();
-        unsafe { self.global.pm.release_memory(release) }
+        unsafe { self.pm.release_memory(release) }
             .expect("failed to release memory mappings");
 
         litebox_platform_multiplex::Platform::clear_guest_thread_local_storage(
