@@ -333,6 +333,10 @@ impl WindowsUserland {
 
 impl litebox::platform::RawMessageProvider for WindowsUserland {}
 
+impl litebox::platform::AddressSpaceProvider for WindowsUserland {
+    type AddressSpaceId = u32;
+}
+
 impl litebox::platform::Provider for WindowsUserland {}
 
 impl litebox::platform::SignalProvider for WindowsUserland {

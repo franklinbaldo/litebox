@@ -61,6 +61,12 @@ impl Provider for MockPlatform {}
 
 impl RawMessageProvider for MockPlatform {}
 
+impl AddressSpaceProvider for MockPlatform {
+    // All methods default to `Err(NotSupported)`, which is correct for the
+    // mock platform (single-process only).
+    type AddressSpaceId = u32;
+}
+
 pub(crate) struct MockRawMutex {
     inner: AtomicU32,
     internal_state: std::sync::RwLock<MockRawMutexInternalState>,

@@ -447,6 +447,10 @@ impl litebox::platform::Provider for LinuxUserland {}
 
 impl litebox::platform::RawMessageProvider for LinuxUserland {}
 
+impl litebox::platform::AddressSpaceProvider for LinuxUserland {
+    type AddressSpaceId = u32;
+}
+
 impl litebox::platform::SignalProvider for LinuxUserland {
     type Signal = litebox_common_linux::signal::Signal;
 

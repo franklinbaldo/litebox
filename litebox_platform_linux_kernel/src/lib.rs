@@ -87,6 +87,10 @@ impl<Host: HostInterface> Provider for LinuxKernel<Host> {}
 
 impl<Host: HostInterface> litebox::platform::RawMessageProvider for LinuxKernel<Host> {}
 
+impl<Host: HostInterface> litebox::platform::AddressSpaceProvider for LinuxKernel<Host> {
+    type AddressSpaceId = u32;
+}
+
 // TODO: implement pointer validation to ensure the pointers are in user space.
 type UserConstPtr<T> = litebox::platform::common_providers::userspace_pointers::UserConstPtr<
     litebox::platform::common_providers::userspace_pointers::NoValidation,
