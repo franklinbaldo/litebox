@@ -51,7 +51,11 @@ impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::Device for Device<Pl
                     buffer: &mut self.send_buffer,
                 },
             )),
-            Err(platform::ReceiveError::WouldBlock) => None,
+            Err(
+                platform::ReceiveError::WouldBlock
+                | platform::ReceiveError::ProtocolError
+                | platform::ReceiveError::Eof,
+            ) => None,
         }
     }
 

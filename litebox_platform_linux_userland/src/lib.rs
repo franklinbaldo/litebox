@@ -445,6 +445,8 @@ impl LinuxUserland {
 
 impl litebox::platform::Provider for LinuxUserland {}
 
+impl litebox::platform::RawMessageProvider for LinuxUserland {}
+
 impl litebox::platform::SignalProvider for LinuxUserland {
     type Signal = litebox_common_linux::signal::Signal;
 

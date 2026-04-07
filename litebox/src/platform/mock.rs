@@ -59,6 +59,8 @@ impl MockPlatform {
 
 impl Provider for MockPlatform {}
 
+impl RawMessageProvider for MockPlatform {}
+
 pub(crate) struct MockRawMutex {
     inner: AtomicU32,
     internal_state: std::sync::RwLock<MockRawMutexInternalState>,

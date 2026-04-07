@@ -1352,6 +1352,8 @@ impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<
     }
 }
 
+impl<Host: HostInterface> litebox::platform::RawMessageProvider for LinuxKernel<Host> {}
+
 #[cfg(feature = "optee_syscall")]
 /// Checks whether the given physical addresses are contiguous with respect to ALIGN.
 fn is_contiguous<const ALIGN: usize>(addrs: &[PhysPageAddr<ALIGN>]) -> bool {

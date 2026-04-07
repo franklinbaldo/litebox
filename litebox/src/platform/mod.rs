@@ -45,6 +45,7 @@ macro_rules! log_println {
 pub trait Provider:
     RawMutexProvider
     + IPInterfaceProvider
+    + RawMessageProvider
     + TimeProvider
     + PunchthroughProvider
     + DebugLogProvider
@@ -384,17 +385,54 @@ pub trait IPInterfaceProvider {
     fn receive_ip_packet(&self, packet: &mut [u8]) -> Result<usize, ReceiveError>;
 }
 
-/// A non-exhaustive list of errors that can be thrown by [`IPInterfaceProvider::send_ip_packet`].
+/// Errors from send operations on [`IPInterfaceProvider`] and [`RawMessageProvider`].
 #[derive(Error, Debug)]
 #[non_exhaustive]
-pub enum SendError {}
+pub enum SendError {
+    /// The underlying device returned an I/O error. The packet was not sent.
+    #[error("I/O error on send: errno {0}")]
+    Io(i32),
+    /// The channel is not available on this platform.
+    #[error("send channel unavailable")]
+    Unavailable,
+}
 
-/// A non-exhaustive list of errors that can be thrown by [`IPInterfaceProvider::receive_ip_packet`].
+/// Errors from receive operations on [`IPInterfaceProvider`] and [`RawMessageProvider`].
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum ReceiveError {
     #[error("Receive operation would block")]
     WouldBlock,
+    #[error("IPC protocol error: oversized frame")]
+    ProtocolError,
+    #[error("Channel closed (EOF)")]
+    Eof,
+}
+
+/// A raw byte-stream channel for direct message passing between the guest and
+/// the host (bypassing the IP network stack).
+///
+/// When available, this provides a fast path for protocols like 9P that would
+/// otherwise pay the overhead of traversing two smoltcp stacks.
+///
+/// The default implementation returns [`ReceiveError::WouldBlock`] /
+/// [`SendError::Unavailable`], indicating the channel is not available.
+/// Platforms that support direct messaging override these methods.
+pub trait RawMessageProvider {
+    /// Send bytes to the host over the raw channel.
+    ///
+    /// Returns `Ok(n)` with the number of bytes sent, or an error.
+    fn send_raw_message(&self, _data: &[u8]) -> Result<usize, SendError> {
+        Err(SendError::Unavailable)
+    }
+
+    /// Receive bytes from the host over the raw channel.
+    ///
+    /// Returns `Ok(n)` with the number of bytes read into `buf`, or
+    /// [`ReceiveError::WouldBlock`] if no data is available yet.
+    fn recv_raw_message(&self, _buf: &mut [u8]) -> Result<usize, ReceiveError> {
+        Err(ReceiveError::WouldBlock)
+    }
 }
 
 /// An interface to understanding time.
