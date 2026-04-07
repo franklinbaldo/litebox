@@ -318,6 +318,26 @@ impl StdioProvider for MockPlatform {
     fn is_a_tty(&self, _stream: StdioStream) -> bool {
         false
     }
+
+    fn get_terminal_input_bytes(&self, stream: StdioStream) -> Result<u32, StdioIoctlError> {
+        match stream {
+            StdioStream::Stdin => {
+                let len = self
+                    .stdin_queue
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .map(std::vec::Vec::len)
+                    .sum::<usize>();
+                Ok(u32::try_from(len).unwrap_or(u32::MAX))
+            }
+            StdioStream::Stdout | StdioStream::Stderr => Err(StdioIoctlError::NotATerminal),
+        }
+    }
+
+    fn poll_stdin_readable(&self) -> bool {
+        self.stdin_queue.read().unwrap().front().is_some()
+    }
 }
 
 impl CrngProvider for MockPlatform {
@@ -330,6 +350,29 @@ impl CrngProvider for MockPlatform {
             buf[off..off + max].copy_from_slice(&bytes.to_ne_bytes()[..max]);
             off += max;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MockPlatform, StdioProvider};
+
+    #[test]
+    fn nonblocking_stdin_reads_queued_input() {
+        let platform = MockPlatform::new();
+        platform
+            .stdin_queue
+            .write()
+            .unwrap()
+            .push_back(b"ready".to_vec());
+
+        let mut buf = [0u8; 8];
+        let read = platform
+            .read_from_stdin_nonblocking(&mut buf)
+            .expect("queued stdin should not block");
+
+        assert_eq!(read, 5);
+        assert_eq!(&buf[..read], b"ready");
     }
 }
 
