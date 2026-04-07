@@ -20,6 +20,7 @@ pub mod nr {
     pub const SIGACTION: usize = 46;
     pub const GETGID: usize = 47;
     pub const SIGPROCMASK: usize = 48;
+    pub const SIGALTSTACK: usize = 53;
     pub const IOCTL: usize = 54;
     pub const MUNMAP: usize = 73;
     pub const MPROTECT: usize = 74;
@@ -599,6 +600,10 @@ pub enum MacosSyscallRequest {
         path: usize,
         flag: i32,
     },
+    Sigaltstack {
+        ss: usize,
+        old_ss: usize,
+    },
     Getrlimit {
         resource: u32,
         rlim: usize,
@@ -1055,8 +1060,7 @@ impl MacosSyscallRequest {
             // ── Known gaps: syscalls with Linux shim parity still needed ──
             // TODO(readlink): 58=readlink, 473=readlinkat — needs FileSystem
             //   trait extension to add a `readlink` method.
-            // TODO(sigaltstack): 53=sigaltstack — per-thread alt-stack tracking
-            //   and validation (Linux shim: signal/mod.rs Cell<SigAltStack>).
+            nr::SIGALTSTACK => MacosSyscallRequest::Sigaltstack { ss: a0, old_ss: a1 },
             // TODO(kill): 37=kill, 328=__pthread_kill — signal delivery to
             //   threads (Linux shim: signal injection + thread interrupt).
 

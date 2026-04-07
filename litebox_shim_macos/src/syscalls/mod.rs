@@ -80,6 +80,9 @@ impl<FS: ShimFS> Task<FS> {
             MacosSyscallRequest::Sigprocmask { how, set, oldset } => {
                 self.sys_sigprocmask(how, set, oldset)
             }
+            MacosSyscallRequest::Sigaltstack { ss, old_ss } => {
+                self.sys_sigaltstack(ss, old_ss, ctx)
+            }
             MacosSyscallRequest::Ioctl { fd, request, arg } => self.sys_ioctl(fd, request, arg),
             MacosSyscallRequest::Madvise {
                 addr,

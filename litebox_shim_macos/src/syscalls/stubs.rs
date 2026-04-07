@@ -443,6 +443,7 @@ impl<FS: ShimFS> Task<FS> {
                 tsd_offset,
             }),
             blocked_signals: core::sync::atomic::AtomicU32::new(0),
+            altstack: litebox::sync::Mutex::new(litebox_common_macos::SigAltStack::DISABLED),
             wait_state: crate::wait::WaitState::new(self.global.platform),
             dir_positions: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
             // Initialized to 0; handle_init_request will set to real mach_thread_self().

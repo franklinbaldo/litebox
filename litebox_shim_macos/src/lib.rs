@@ -433,6 +433,7 @@ impl<FS: ShimFS> MacosShim<FS> {
                 patch_cache: litebox::sync::Mutex::new(BTreeMap::new()),
                 init_state: litebox::sync::Mutex::new(ThreadInitState::None),
                 blocked_signals: AtomicU32::new(0),
+                altstack: litebox::sync::Mutex::new(litebox_common_macos::SigAltStack::DISABLED),
                 wait_state: wait::WaitState::new(self.0.platform),
                 dir_positions: litebox::sync::Mutex::new(BTreeMap::new()),
                 real_mach_port: AtomicU32::new(unsafe { mach_thread_self() }),
@@ -1739,6 +1740,8 @@ struct Task<FS: ShimFS> {
     init_state: litebox::sync::Mutex<Platform, ThreadInitState>,
     /// Per-thread blocked signal mask (macOS 32-bit sigset_t).
     blocked_signals: AtomicU32,
+    /// Per-thread alternate signal stack (set by sigaltstack).
+    altstack: litebox::sync::Mutex<Platform, litebox_common_macos::SigAltStack>,
     /// Per-thread wait state for interruptible waits (pipes, futexes, etc.).
     wait_state: wait::WaitState,
     /// Directory enumeration positions for getattrlistbulk.

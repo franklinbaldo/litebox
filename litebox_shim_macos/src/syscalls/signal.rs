@@ -21,6 +21,8 @@ const _SIGSTOP: i32 = 17;
 const _SA_SIGINFO: u32 = 0x0040;
 #[allow(dead_code)]
 const SA_NODEFER: u32 = 0x0010;
+/// SA_ONSTACK: deliver signal on alternate signal stack.
+const SA_ONSTACK: u32 = 0x0001;
 
 // sigprocmask `how` constants.
 const SIG_BLOCK: i32 = 1;
@@ -100,6 +102,16 @@ pub(crate) fn linux_to_macos_signal(linux_sig: i32) -> i32 {
         7 => 10,        // Linux SIGBUS=7 → macOS SIGBUS=10
         _ => linux_sig, // SIGILL(4), SIGTRAP(5), SIGFPE(8), SIGSEGV(11) are the same
     }
+}
+
+/// Check if a stack pointer falls within the given alternate signal stack range.
+fn is_on_stack(stack: &litebox_common_macos::SigAltStack, sp: usize) -> bool {
+    if stack.ss_flags & litebox_common_macos::SS_DISABLE != 0 {
+        return false;
+    }
+    let stack_start = stack.ss_sp;
+    let stack_end = stack.ss_sp + stack.ss_size;
+    sp >= stack_start && sp < stack_end
 }
 
 impl<FS: ShimFS> Task<FS> {
@@ -211,6 +223,71 @@ impl<FS: ShimFS> Task<FS> {
         Ok(0)
     }
 
+    /// Handle `sigaltstack()` (BSD syscall 53).
+    ///
+    /// If `old_ss` is non-null, writes the current alternate signal stack.
+    /// If `ss` is non-null, validates and installs a new alternate signal stack.
+    /// Cannot change the stack while executing on it.
+    pub(crate) fn sys_sigaltstack(
+        &self,
+        ss_addr: usize,
+        old_ss_addr: usize,
+        ctx: &PtRegs,
+    ) -> Result<usize, Errno> {
+        let mut altstack = self.altstack.lock();
+        let sp = ctx.sp;
+
+        // Check if we are currently on the alternate stack.
+        let on_alt = is_on_stack(&altstack, sp);
+
+        // Write old stack info to user space.
+        if old_ss_addr != 0 {
+            let mut out = *altstack;
+            if on_alt {
+                out.ss_flags |= litebox_common_macos::SS_ONSTACK;
+            }
+            let ptr: MutPtr<litebox_common_macos::SigAltStack> = MutPtr::from_usize(old_ss_addr);
+            ptr.write_at_offset(0, out).ok_or(Errno::EFAULT)?;
+        }
+
+        // Read and install new stack.
+        if ss_addr != 0 {
+            // Cannot change the altstack while executing on it.
+            if on_alt {
+                return Err(Errno::EPERM);
+            }
+            let ptr: ConstPtr<litebox_common_macos::SigAltStack> = ConstPtr::from_usize(ss_addr);
+            let ss = ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+
+            if ss.ss_flags & litebox_common_macos::SS_DISABLE != 0 {
+                // Disable the altstack.
+                *altstack = litebox_common_macos::SigAltStack::DISABLED;
+            } else {
+                // Validate: size must be at least MINSIGSTKSZ, sp+size must not overflow.
+                if ss.ss_size < litebox_common_macos::MINSIGSTKSZ {
+                    return Err(Errno::ENOMEM);
+                }
+                if ss.ss_sp.checked_add(ss.ss_size).is_none() {
+                    return Err(Errno::EINVAL);
+                }
+                // Only valid flag for new stack is 0 (no flags) — reject unknown bits.
+                // (SS_ONSTACK is output-only, SS_DISABLE handled above.)
+                let valid_input_flags = litebox_common_macos::SS_DISABLE;
+                if ss.ss_flags & !valid_input_flags != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                *altstack = litebox_common_macos::SigAltStack {
+                    ss_sp: ss.ss_sp,
+                    ss_size: ss.ss_size,
+                    ss_flags: 0,
+                    pad: 0,
+                };
+            }
+        }
+
+        Ok(0)
+    }
+
     /// Build an XNU signal frame on the guest stack and set registers for `_sigtramp`.
     ///
     /// The frame layout (high to low addresses):
@@ -230,9 +307,21 @@ impl<FS: ShimFS> Task<FS> {
         fault_address: usize,
         handler: &crate::SignalHandler,
     ) {
-        // 1. Compute new stack pointer.
+        // 1. Compute new stack pointer (with altstack support).
         let frame_size = SIGINFO_SIZE + UCONTEXT_SIZE + MCONTEXT_SIZE; // 976
-        let new_sp = (ctx.sp - REDZONE_SIZE - frame_size) & !0xF; // 16-byte aligned
+        let altstack = self.altstack.lock();
+        let on_alt = is_on_stack(&altstack, ctx.sp);
+        let use_altstack = (handler.flags & SA_ONSTACK != 0)
+            && !on_alt
+            && (altstack.ss_flags & litebox_common_macos::SS_DISABLE == 0);
+        let base_sp = if use_altstack {
+            // Place frame at top of alternate signal stack.
+            altstack.ss_sp + altstack.ss_size
+        } else {
+            ctx.sp
+        };
+        drop(altstack);
+        let new_sp = (base_sp - REDZONE_SIZE - frame_size) & !0xF; // 16-byte aligned
 
         let siginfo_addr = new_sp;
         let ucontext_addr = new_sp + SIGINFO_SIZE; // new_sp + 104
@@ -291,13 +380,19 @@ impl<FS: ShimFS> Task<FS> {
             .copy_from_slice(0, &uctx_zeros)
             .expect("deliver_signal: write ucontext zeros");
 
-        // uc_onstack (4 bytes at offset 0) = 0 (already zero)
+        // uc_onstack (4 bytes at offset 0): 1 if on altstack, else 0.
+        if use_altstack || on_alt {
+            let onstack_ptr: MutPtr<u32> = MutPtr::from_usize(ucontext_addr);
+            onstack_ptr
+                .write_at_offset(0, 1)
+                .expect("deliver_signal: write uc_onstack");
+        }
         // uc_sigmask (4 bytes at offset 4) = current blocked mask
         let uctx_mask_ptr: MutPtr<u32> = MutPtr::from_usize(ucontext_addr + UCTX_SIGMASK);
         uctx_mask_ptr
             .write_at_offset(0, self.blocked_signals.load(Ordering::Relaxed))
             .expect("deliver_signal: write uc_sigmask");
-        // uc_stack (24 bytes at offset 8) = zeros (no altstack)
+        // uc_stack (24 bytes at offset 8) = altstack info (ss_sp, ss_size, ss_flags, pad)
         // uc_link (8 bytes at offset 32) = 0
         // uc_mcsize (8 bytes at offset 40) = 816
         let uctx_u64: MutPtr<u64> = MutPtr::from_usize(ucontext_addr);
