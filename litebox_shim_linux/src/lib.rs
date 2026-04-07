@@ -589,7 +589,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
 
                     // Set up metadata on the new fd (using parent's values).
                     {
-                        let mut dt = self.global.litebox.descriptor_table_mut();
+                        let dt = self.global.litebox.descriptor_table();
                         let _old = dt.set_entry_metadata(new_fd, parent_sock_opts);
                         let _old = dt.set_entry_metadata(new_fd, parent_sock_type);
                         let _old = dt.set_entry_metadata(new_fd, parent_oflags);
@@ -600,7 +600,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                         litebox::net::socket_channel::StreamSocketChannel::new(),
                     ));
                     {
-                        let mut dt = self.global.litebox.descriptor_table_mut();
+                        let dt = self.global.litebox.descriptor_table();
                         let _old = dt
                             .set_entry_metadata(new_fd, syscalls::net::SocketProxy(proxy.clone()));
                     }
@@ -629,7 +629,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                     if parent_cloexec
                         .contains(litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC)
                     {
-                        let mut dt = self.global.litebox.descriptor_table_mut();
+                        let dt = self.global.litebox.descriptor_table();
                         let _old = dt.set_fd_metadata(
                             &dup_fd,
                             litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC,
@@ -728,7 +728,7 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
             .fs
             .open("/dev/stderr", OFlags::WRONLY, Mode::empty())
             .unwrap();
-        let mut dt = global.litebox.descriptor_table_mut();
+        let dt = global.litebox.descriptor_table();
         let mut rds = self.raw_descriptor_store.write();
         for (raw_fd, fd) in [(0, stdin), (1, stdout), (2, stderr)] {
             let status_flags = OFlags::APPEND | OFlags::RDWR;

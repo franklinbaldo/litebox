@@ -213,7 +213,7 @@ impl<FS: ShimFS> Task<FS> {
             let None = self
                 .global
                 .litebox
-                .descriptor_table_mut()
+                .descriptor_table()
                 .set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC)
             else {
                 unreachable!()
@@ -966,10 +966,7 @@ fn set_file_descriptor_flags<FS: ShimFS>(
         fd: &TypedFd<S>,
         flags: FileDescriptorFlags,
     ) {
-        let _old = global
-            .litebox
-            .descriptor_table_mut()
-            .set_fd_metadata(fd, flags);
+        let _old = global.litebox.descriptor_table().set_fd_metadata(fd, flags);
     }
 
     files.run_on_raw_fd(
@@ -1145,7 +1142,7 @@ impl<FS: ShimFS> Task<FS> {
                     ($fd:expr, $MetaType:path, $no_metadata_msg:expr, $check_diff:expr) => {
                         self.global
                             .litebox
-                            .descriptor_table_mut()
+                            .descriptor_table()
                             .with_metadata_mut($fd, |$MetaType(f)| {
                                 let diff = (*f & setfl_mask) ^ flags;
                                 $check_diff(diff);
@@ -1368,7 +1365,7 @@ impl<FS: ShimFS> Task<FS> {
 
         {
             let initial_status = OFlags::from(pipe_flags);
-            let mut dt = self.global.litebox.descriptor_table_mut();
+            let dt = self.global.litebox.descriptor_table();
             let old = dt.set_entry_metadata(
                 &writer,
                 crate::PipeStatusFlags(initial_status | OFlags::WRONLY),
@@ -1382,7 +1379,7 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         if cloexec {
-            let mut dt = self.global.litebox.descriptor_table_mut();
+            let dt = self.global.litebox.descriptor_table();
             let None = dt.set_fd_metadata(&writer, FileDescriptorFlags::FD_CLOEXEC) else {
                 unreachable!()
             };
@@ -1517,11 +1514,8 @@ impl<FS: ShimFS> Task<FS> {
                             Ok(())
                         },
                         |socket_fd| {
-                            if let Err(e) = self
-                                .global
-                                .litebox
-                                .descriptor_table_mut()
-                                .with_metadata_mut(
+                            if let Err(e) =
+                                self.global.litebox.descriptor_table().with_metadata_mut(
                                     socket_fd,
                                     |crate::syscalls::net::SocketOFlags(flags)| {
                                         flags.set(OFlags::NONBLOCK, val != 0);
@@ -1594,7 +1588,7 @@ impl<FS: ShimFS> Task<FS> {
                     let _old = self
                         .global
                         .litebox
-                        .descriptor_table_mut()
+                        .descriptor_table()
                         .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
                     Ok(0)
                 },
@@ -1604,7 +1598,7 @@ impl<FS: ShimFS> Task<FS> {
                     let _old = self
                         .global
                         .litebox
-                        .descriptor_table_mut()
+                        .descriptor_table()
                         .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
                     Ok(0)
                 },
@@ -1612,7 +1606,7 @@ impl<FS: ShimFS> Task<FS> {
                     let _old = self
                         .global
                         .litebox
-                        .descriptor_table_mut()
+                        .descriptor_table()
                         .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
                     Ok(0)
                 },
@@ -1620,7 +1614,7 @@ impl<FS: ShimFS> Task<FS> {
                     let _old = self
                         .global
                         .litebox
-                        .descriptor_table_mut()
+                        .descriptor_table()
                         .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
                     Ok(0)
                 },
@@ -2181,7 +2175,7 @@ impl<FS: ShimFS> Task<FS> {
                 let _old = self
                     .global
                     .litebox
-                    .descriptor_table_mut()
+                    .descriptor_table()
                     .set_fd_metadata(file, Diroff(dir_off));
                 Ok(nbytes)
             },

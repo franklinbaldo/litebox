@@ -198,7 +198,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         let mut status = OFlags::RDWR;
         status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
 
-        let mut dt = self.litebox.descriptor_table_mut();
+        let dt = self.litebox.descriptor_table();
         let old = dt.set_entry_metadata(fd, SocketOptions::default());
         assert!(old.is_none());
         if flags.contains(SockFlags::CLOEXEC) {
@@ -248,7 +248,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         f: impl FnOnce(&mut SocketOptions) -> R,
     ) -> R {
         self.litebox
-            .descriptor_table_mut()
+            .descriptor_table()
             .with_metadata_mut(fd, |opt| f(opt))
             .unwrap()
     }
@@ -986,7 +986,7 @@ impl<FS: ShimFS> Task<FS> {
                     let old = self
                         .global
                         .litebox
-                        .descriptor_table_mut()
+                        .descriptor_table()
                         .set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
                     assert!(old.is_none());
                 }

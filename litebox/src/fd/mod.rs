@@ -419,15 +419,19 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         let ind_entry = self.entries[fd.x.as_usize().ok_or(MetadataError::ClosedFd)?]
             .as_ref()
             .unwrap();
-        match ind_entry.metadata.get::<T>() {
-            Some(m) => Ok(f(m)),
-            None => ind_entry
-                .read()
-                .metadata
-                .get::<T>()
-                .map(f)
-                .ok_or(MetadataError::NoSuchMetadata),
+        {
+            let fd_meta = ind_entry.metadata.read();
+            if let Some(m) = fd_meta.get::<T>() {
+                return Ok(f(m));
+            }
         }
+        ind_entry
+            .x
+            .read()
+            .metadata
+            .get::<T>()
+            .map(f)
+            .ok_or(MetadataError::NoSuchMetadata)
     }
 
     /// Similar to [`Self::with_metadata`] but mutable.
@@ -436,7 +440,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         reason = "the invariants guarantee that the unwrap panics cannot occur"
     )]
     pub fn with_metadata_mut<Subsystem, T, R>(
-        &mut self,
+        &self,
         fd: &TypedFd<Subsystem>,
         f: impl FnOnce(&mut T) -> R,
     ) -> Result<R, MetadataError>
@@ -445,17 +449,21 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         T: core::any::Any + Send + Sync,
     {
         let ind_entry = self.entries[fd.x.as_usize().ok_or(MetadataError::ClosedFd)?]
-            .as_mut()
+            .as_ref()
             .unwrap();
-        match ind_entry.metadata.get_mut::<T>() {
-            Some(m) => Ok(f(m)),
-            None => ind_entry
-                .write()
-                .metadata
-                .get_mut::<T>()
-                .map(f)
-                .ok_or(MetadataError::NoSuchMetadata),
+        {
+            let mut fd_meta = ind_entry.metadata.write();
+            if let Some(m) = fd_meta.get_mut::<T>() {
+                return Ok(f(m));
+            }
         }
+        ind_entry
+            .x
+            .write()
+            .metadata
+            .get_mut::<T>()
+            .map(f)
+            .ok_or(MetadataError::NoSuchMetadata)
     }
 
     /// Store arbitrary metadata into a file.
@@ -471,7 +479,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         reason = "the invariants guarantee that the unwrap panics cannot occur"
     )]
     pub fn set_entry_metadata<Subsystem, T>(
-        &mut self,
+        &self,
         fd: &TypedFd<Subsystem>,
         metadata: T,
     ) -> Option<T>
@@ -499,19 +507,16 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         clippy::missing_panics_doc,
         reason = "the invariants guarantee that the unwrap panics cannot occur"
     )]
-    pub fn set_fd_metadata<Subsystem, T>(
-        &mut self,
-        fd: &TypedFd<Subsystem>,
-        metadata: T,
-    ) -> Option<T>
+    pub fn set_fd_metadata<Subsystem, T>(&self, fd: &TypedFd<Subsystem>, metadata: T) -> Option<T>
     where
         Subsystem: FdEnabledSubsystem,
         T: core::any::Any + Send + Sync,
     {
         self.entries[fd.x.as_usize()?]
-            .as_mut()
+            .as_ref()
             .unwrap()
             .metadata
+            .write()
             .insert(metadata)
     }
 }
@@ -799,7 +804,7 @@ pub enum MetadataError {
 /// A module-internal fd-specific individual entry
 struct IndividualEntry<Platform: RawSyncPrimitivesProvider> {
     x: Arc<RwLock<Platform, DescriptorEntry>>,
-    metadata: AnyMap,
+    metadata: RwLock<Platform, AnyMap>,
 }
 impl<Platform: RawSyncPrimitivesProvider> core::ops::Deref for IndividualEntry<Platform> {
     type Target = Arc<RwLock<Platform, DescriptorEntry>>;
@@ -811,7 +816,7 @@ impl<Platform: RawSyncPrimitivesProvider> IndividualEntry<Platform> {
     fn new(x: Arc<RwLock<Platform, DescriptorEntry>>) -> Self {
         Self {
             x,
-            metadata: AnyMap::new(),
+            metadata: RwLock::new(AnyMap::new()),
         }
     }
 }
