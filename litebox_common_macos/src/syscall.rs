@@ -23,6 +23,7 @@ pub mod nr {
     pub const KILL: usize = 37;
     pub const SIGALTSTACK: usize = 53;
     pub const READLINK: usize = 58;
+    pub const EXECVE: usize = 59;
     pub const IOCTL: usize = 54;
     pub const MUNMAP: usize = 73;
     pub const MPROTECT: usize = 74;
@@ -604,6 +605,11 @@ pub enum MacosSyscallRequest {
         path: usize,
         flag: i32,
     },
+    Execve {
+        path: usize,
+        argv: usize,
+        envp: usize,
+    },
     Readlink {
         path: usize,
         buf: usize,
@@ -1102,9 +1108,11 @@ impl MacosSyscallRequest {
                 sig: a1 as i32,
             },
 
-            // TODO(execve): 59=execve — full process teardown + reload
-            //   (Linux shim: kill threads, close CLOEXEC, release memory,
-            //   reset signals, Mach-O load, reinit context).
+            nr::EXECVE => MacosSyscallRequest::Execve {
+                path: a0,
+                argv: a1,
+                envp: a2,
+            },
             _ => MacosSyscallRequest::Unknown { number: nr_raw },
         }
     }

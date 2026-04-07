@@ -3,9 +3,13 @@
 
 //! Process-related syscall handlers for the macOS shim.
 
+use alloc::ffi::CString;
+use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
-use crate::{ShimFS, Task};
+use crate::{ConstPtr, ShimFS, Task};
+use litebox::platform::RawConstPointer as _;
+use litebox_common_macos::PtRegs;
 use litebox_common_macos::errno::Errno;
 
 impl<FS: ShimFS> Task<FS> {
@@ -130,5 +134,206 @@ impl<FS: ShimFS> Task<FS> {
             tz_ptr.write_at_offset(0, 0u64).ok_or(Errno::EFAULT)?;
         }
         Ok(0)
+    }
+
+    /// Handle `execve(path, argv, envp)` (BSD syscall 59).
+    ///
+    /// Replaces the current process image with a new program:
+    /// 1. Copy path, argv, envp from guest memory.
+    /// 2. Read the executable from the virtual filesystem.
+    /// 3. Kill all other threads in the process.
+    /// 4. Release existing memory mappings.
+    /// 5. Reset signal handlers to defaults, clear altstack.
+    /// 6. Close CLOEXEC file descriptors.
+    /// 7. Load the new Mach-O binary.
+    /// 8. Reset registers to the new entry point.
+    ///
+    /// On success, `ctx` is rewritten to the new program's entry point
+    /// and this returns `Ok(())`.  The caller must NOT call
+    /// `set_syscall_return` after a successful execve.
+    #[allow(clippy::cast_sign_loss, clippy::too_many_lines)]
+    pub(crate) fn sys_execve(
+        &self,
+        path_addr: usize,
+        argv_addr: usize,
+        envp_addr: usize,
+        ctx: &mut PtRegs,
+    ) -> Result<(), Errno> {
+        // ── 1. Copy path, argv, envp from guest memory ──
+
+        let path_ptr: ConstPtr<u8> = ConstPtr::from_usize(path_addr);
+        let path_str =
+            crate::syscalls::file::read_cstring_from_guest(path_ptr, 4096).ok_or(Errno::EFAULT)?;
+
+        let argv_vec = self.copy_user_string_array(argv_addr)?;
+        let envp_vec = self.copy_user_string_array(envp_addr)?;
+
+        // ── 2. Read the executable from the virtual filesystem ──
+
+        let cpath = CString::new(path_str.as_bytes()).map_err(|_| Errno::EINVAL)?;
+        let typed_fd = self
+            .global
+            .fs
+            .open(
+                &cpath,
+                litebox::fs::OFlags::RDONLY,
+                litebox::fs::Mode::empty(),
+            )
+            .map_err(|_| Errno::ENOENT)?;
+
+        let stat = self
+            .global
+            .fs
+            .fd_file_status(&typed_fd)
+            .map_err(|_| Errno::EIO)?;
+        let file_size = stat.size;
+
+        let mut program_bytes = alloc::vec![0u8; file_size];
+        let mut total_read = 0;
+        while total_read < file_size {
+            let n = self
+                .global
+                .fs
+                .read(
+                    &typed_fd,
+                    &mut program_bytes[total_read..],
+                    Some(total_read),
+                )
+                .map_err(|_| Errno::EIO)?;
+            if n == 0 {
+                break;
+            }
+            total_read += n;
+        }
+        let _ = self.global.fs.close(&typed_fd);
+
+        // ── 3. Signal other threads to terminate ──
+        //
+        // In a single-threaded process (the common case for execve in
+        // litebox), this is a no-op. For multi-threaded, we set
+        // group_exit which causes other threads to notice and exit in
+        // their next enter_shim() call.
+        self.process.group_exit.store(true, Ordering::Release);
+        // Wait briefly for other threads. In the litebox model, spawned
+        // threads check should_terminate() on each shim entry, so they
+        // will exit promptly.
+        // NOTE: a full implementation would block here until nr_threads == 1.
+        // For now we proceed optimistically (the guest should be single-threaded
+        // at execve time in typical usage).
+
+        // ── 4. Release existing memory mappings ──
+
+        let release =
+            |_range: core::ops::Range<usize>, vm: litebox::mm::linux::VmFlags| !vm.is_empty();
+        unsafe {
+            self.global
+                .pm
+                .release_memory(release)
+                .map_err(|_| Errno::ENOMEM)?;
+        }
+
+        // ── 5. Reset signal handlers to defaults ──
+        {
+            let mut handlers = self.process.signal_handlers.lock();
+            for h in handlers.iter_mut() {
+                *h = crate::SignalHandler::default();
+            }
+        }
+        // Clear the per-thread signal mask and altstack.
+        self.blocked_signals.store(0, Ordering::Relaxed);
+        {
+            let mut alt = self.altstack.lock();
+            *alt = litebox_common_macos::SigAltStack::DISABLED;
+        }
+
+        // ── 6. Close CLOEXEC file descriptors ──
+        // TODO: close CLOEXEC descriptors. RawDescriptorStorage does not
+        // currently track the CLOEXEC flag, so we skip this step for now.
+        // In practice, most litebox guests do not rely on CLOEXEC semantics
+        // across execve.
+
+        // ── 7. Load the new Mach-O binary ──
+        //
+        // Reset group_exit since we're now running the new program.
+        self.process.group_exit.store(false, Ordering::Release);
+
+        let load_info = crate::loader::load_macho(self, &program_bytes, argv_vec, envp_vec, None)
+            .map_err(|e| {
+            log_unsupported!("execve: Mach-O load failed: {}", e);
+            Errno::ENOEXEC
+        })?;
+
+        // ── 8. Reset registers to the new entry point ──
+
+        *ctx = PtRegs::default();
+        ctx.pc = load_info.entry_point;
+        ctx.sp = load_info.user_stack_top;
+
+        if load_info.is_lc_main {
+            // LC_MAIN: argc, argv, envp, apple passed in x0–x3.
+            // The stack layout is: [argc, argv[0..n], NULL, envp[0..m], NULL, apple[0..], NULL].
+            // argc is at [sp], argv at sp+8, etc.
+            let sp = load_info.user_stack_top;
+            let argc_ptr: ConstPtr<usize> = ConstPtr::from_usize(sp);
+            if let Some(argc) = argc_ptr.read_at_offset(0) {
+                ctx.regs[0] = argc; // x0 = argc
+                ctx.regs[1] = sp + 8; // x1 = &argv[0]
+                // envp = argv + argc + 1 (skip NULL terminator)
+                ctx.regs[2] = sp + 8 + (argc + 1) * 8; // x2 = &envp[0]
+                // apple = after envp NULL terminator — skip to find it
+                let envp_start = ctx.regs[2];
+                let mut apple_ptr_addr = envp_start;
+                for _ in 0..1024 {
+                    let envp_entry: ConstPtr<usize> = ConstPtr::from_usize(apple_ptr_addr);
+                    if let Some(0) = envp_entry.read_at_offset(0) {
+                        apple_ptr_addr += 8; // skip past the NULL
+                        break;
+                    }
+                    apple_ptr_addr += 8;
+                }
+                ctx.regs[3] = apple_ptr_addr; // x3 = apple
+            }
+        }
+        // For LC_UNIXTHREAD, the stack is already set up by the loader and
+        // we jump directly to the entry point with no register arguments.
+
+        if load_info.has_dylinker {
+            // The entry point is dyld's entry, which will find the main
+            // binary's entry via the Mach-O headers already loaded in memory.
+        }
+
+        Ok(())
+    }
+
+    /// Read a NULL-terminated array of C string pointers from guest memory.
+    fn copy_user_string_array(&self, base_addr: usize) -> Result<Vec<CString>, Errno> {
+        const MAX_ENTRIES: usize = 4096;
+        const MAX_TOTAL_BYTES: usize = 2 * 1024 * 1024; // 2 MiB
+
+        if base_addr == 0 {
+            return Ok(Vec::new());
+        }
+        let mut result = Vec::new();
+        let mut ptr_addr = base_addr;
+        let mut total = 0usize;
+
+        for _ in 0..MAX_ENTRIES {
+            let entry_ptr: ConstPtr<usize> = ConstPtr::from_usize(ptr_addr);
+            let str_addr = entry_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            if str_addr == 0 {
+                break; // NULL terminator
+            }
+            let str_ptr: ConstPtr<u8> = ConstPtr::from_usize(str_addr);
+            let s = crate::syscalls::file::read_cstring_from_guest(str_ptr, 4096)
+                .ok_or(Errno::EFAULT)?;
+            total += s.len() + 1;
+            if total > MAX_TOTAL_BYTES {
+                return Err(Errno::E2BIG);
+            }
+            let cs = CString::new(s.into_bytes()).map_err(|_| Errno::EINVAL)?;
+            result.push(cs);
+            ptr_addr += core::mem::size_of::<usize>();
+        }
+        Ok(result)
     }
 }

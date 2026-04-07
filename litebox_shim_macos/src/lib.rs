@@ -1916,6 +1916,24 @@ impl<FS: ShimFS> Task<FS> {
             }
         }
 
+        // execve replaces the entire process image.  On success, ctx is
+        // rewritten to the new entry point and set_syscall_return must be
+        // skipped.  On failure, return the error normally.
+        if let litebox_common_macos::syscall::MacosSyscallRequest::Execve { path, argv, envp } =
+            &request
+        {
+            match self.sys_execve(*path, *argv, *envp, ctx) {
+                Ok(()) => {
+                    // ctx now points to the new program's entry point.
+                    return;
+                }
+                Err(errno) => {
+                    litebox_common_macos::syscall::set_syscall_return(ctx, Err(errno));
+                    return;
+                }
+            }
+        }
+
         // Pipe returns two values (read_fd in x0, write_fd in x1) via the macOS
         // dual-register return convention. set_syscall_return only sets x0, so
         // we handle pipe specially.
