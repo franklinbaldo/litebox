@@ -42,8 +42,7 @@ impl TargetOs {
     // Shared SVC handler
     pub const fn shared_svc_handler_insn_count(self) -> usize {
         match self {
-            Self::Linux => 21, // Hash-based TLS lookup (3 hash instructions + 18 original)
-            Self::MacOs => 21,
+            Self::Linux | Self::MacOs => 21, // Hash-based TLS lookup (3 hash instructions + 18 original)
             // Windows: 2 extra instructions to store host_tls to stack frame
             // (avoids X16 clobber by linker veneers on BR to callback).
             Self::Windows => 20,
@@ -56,8 +55,7 @@ impl TargetOs {
     // SVC gate
     pub const fn svc_gate_insn_count(self) -> usize {
         match self {
-            Self::Linux | Self::Windows => 7,
-            Self::MacOs => 7,
+            Self::Linux | Self::Windows | Self::MacOs => 7,
         }
     }
     pub const fn svc_gate_size(self) -> usize {
@@ -1991,14 +1989,14 @@ fn emit_shared_svc_handler_windows(
     insn_idx += 1;
 
     // [14] LDR X17, [PC, #off_cb] — callback
-    let ldr_cb_vaddr_14 = insn_vaddr(insn_idx);
-    let ldr_cb_offset_14 = callback_vaddr.cast_signed() - ldr_cb_vaddr_14.cast_signed();
-    let ldr_cb_insn_14 = encode_ldr_literal(17, ldr_cb_offset_14).ok_or_else(|| {
+    let ldr_cb_vaddr_fb = insn_vaddr(insn_idx);
+    let ldr_cb_offset_fb = callback_vaddr.cast_signed() - ldr_cb_vaddr_fb.cast_signed();
+    let ldr_cb_insn_fb = encode_ldr_literal(17, ldr_cb_offset_fb).ok_or_else(|| {
         Error::DisassemblyFailure(format!(
-            "LDR literal offset {ldr_cb_offset_14:#x} out of range for Windows SVC handler callback (fallback)"
+            "LDR literal offset {ldr_cb_offset_fb:#x} out of range for Windows SVC handler callback (fallback)"
         ))
     })?;
-    trampoline_data.extend_from_slice(&ldr_cb_insn_14.to_le_bytes());
+    trampoline_data.extend_from_slice(&ldr_cb_insn_fb.to_le_bytes());
     insn_idx += 1;
 
     // [15] BR X17 — jump to callback
@@ -2058,14 +2056,14 @@ fn emit_shared_svc_handler_macos(
     trampoline_base_addr: u64,
     target_os: TargetOs,
 ) -> Result<()> {
+    // DMB ISH constant: Data Memory Barrier, Inner Shareable domain.
+    // Ensures TLS table stores from other cores are visible to loads below.
+    const DMB_ISH: u32 = 0xD503_3BBF;
+
     let handler_vaddr = trampoline_base_addr + handler_offset as u64;
     let mut insn_idx: usize = 0;
     let insn_vaddr = |idx: usize| -> u64 { handler_vaddr + (idx as u64) * 4 };
     let tls_table_vaddr = trampoline_base_addr + HEADER_TLS_TABLE_OFFSET as u64;
-
-    // DMB ISH constant: Data Memory Barrier, Inner Shareable domain.
-    // Ensures TLS table stores from other cores are visible to loads below.
-    const DMB_ISH: u32 = 0xD503_3BBF;
 
     // [0] MRS X17, TPIDRRO_EL0 — stable per-thread key
     trampoline_data.extend_from_slice(&encode_mrs_tpidrro_el0(17).to_le_bytes());
@@ -5412,7 +5410,7 @@ mod tests {
         // Verify Rd=SP and Rn=SP
         assert_eq!(insn & 0x1F, 31); // Rd
         assert_eq!((insn >> 5) & 0x1F, 31); // Rn
-        // Verify imm12
+                                            // Verify imm12
         assert_eq!((insn >> 10) & 0xFFF, 32);
     }
 
@@ -5504,7 +5502,7 @@ mod tests {
         assert_eq!(insn & 0x1F, 31); // Rd = XZR
         assert_eq!((insn >> 5) & 0x1F, 16); // Rn
         assert_eq!((insn >> 16) & 0x1F, 18); // Rm
-        // Verify top bits: 111_01011_00_0
+                                             // Verify top bits: 111_01011_00_0
         assert_eq!(insn & 0xFFE0_FC00, 0xEB00_0000);
     }
 
@@ -5515,7 +5513,7 @@ mod tests {
         assert_eq!(insn & 0x1F, 31); // Rd = XZR
         assert_eq!((insn >> 5) & 0x1F, 16); // Rn
         assert_eq!((insn >> 10) & 0xFFF, 1); // imm12
-        // Verify opcode: 1_0_1_10001_00 = 0xB1000000
+                                             // Verify opcode: 1_0_1_10001_00 = 0xB1000000
         assert_eq!(insn & 0xFF00_0000, 0xB100_0000);
     }
 
@@ -7177,8 +7175,8 @@ mod tests {
         // opc=00 (32-bit), imm7=60 (240/4), Rt2=8, Rn=SP(31), Rt=17
         // After +48: 288/4 = 72 > 63 (imm7 max), so needs SP fixup
         let insn: u32 = 0x295e23f1; // LDP W17, W8, [SP, #240]
-        // After x18→x17 rewrite, x18 is not present in this encoding (it's W17, W8)
-        // but the instruction has Rn=SP and would overflow
+                                    // After x18→x17 rewrite, x18 is not present in this encoding (it's W17, W8)
+                                    // but the instruction has Rn=SP and would overflow
         assert!(
             needs_sp_fixup(insn, 48),
             "LDP W17, W8, [SP, #240] should need SP fixup (imm7 overflow)"

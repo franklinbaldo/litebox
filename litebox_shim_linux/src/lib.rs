@@ -676,7 +676,7 @@ impl<FS: ShimFS> Task<FS> {
             }
         };
 
-        let result = match request {
+        match request {
             SyscallRequest::Exit { status } => {
                 self.sys_exit(status);
                 Ok(0)
@@ -789,10 +789,8 @@ impl<FS: ShimFS> Task<FS> {
                 fd,
                 offset,
             } => {
-                let r = self
-                    .sys_mmap(addr, length, prot, flags, fd, offset)
-                    .map(|ptr| ptr.as_usize());
-                r
+                self.sys_mmap(addr, length, prot, flags, fd, offset)
+                    .map(|ptr| ptr.as_usize())
             }
             SyscallRequest::Mprotect { addr, length, prot } => {
                 syscall!(sys_mprotect(addr, length, prot))
@@ -1208,9 +1206,7 @@ impl<FS: ShimFS> Task<FS> {
                 log_unsupported!("{request:?}");
                 Err(Errno::ENOSYS)
             }
-        };
-
-        result
+        }
     }
 }
 
