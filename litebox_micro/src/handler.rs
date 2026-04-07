@@ -2121,13 +2121,15 @@ unsafe fn shmem_pipe_write(header_ptr: *mut u8, buf_ptr: *const u8, count: usize
             }
         }
         if head_ptr.load(core::sync::atomic::Ordering::Relaxed) == current_head {
-            // Still no progress — futex wait on head
+            // Still no progress — timed futex wait on head (1 ms timeout
+            // to recover from rare lost wakes across processes).
+            let ts = libc::timespec { tv_sec: 0, tv_nsec: 100_000 };
             unsafe {
                 crate::raw_syscall::futex4(
                     core::ptr::from_ref(head_ptr).cast::<u8>() as usize,
                     libc::FUTEX_WAIT,
                     current_head as u32, // compare low 32 bits
-                    0,
+                    core::ptr::from_ref(&ts) as usize,
                 );
             }
         }
@@ -2185,12 +2187,15 @@ unsafe fn shmem_pipe_read(header_ptr: *mut u8, buf_ptr: *mut u8, count: usize) -
             }
         }
         if tail_ptr.load(core::sync::atomic::Ordering::Relaxed) == current_tail {
+            // Timed futex wait (1 ms timeout) to recover from rare
+            // lost wakes across processes.
+            let ts = libc::timespec { tv_sec: 0, tv_nsec: 100_000 };
             unsafe {
                 crate::raw_syscall::futex4(
                     core::ptr::from_ref(tail_ptr).cast::<u8>() as usize,
                     libc::FUTEX_WAIT,
                     current_tail as u32,
-                    0,
+                    core::ptr::from_ref(&ts) as usize,
                 );
             }
         }
