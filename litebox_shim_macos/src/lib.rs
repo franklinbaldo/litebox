@@ -393,6 +393,10 @@ impl<FS: ShimFS> MacosShimBuilder<FS> {
             net_proxies: litebox::sync::RwLock::new(BTreeMap::new()),
             shared_cache_base: AtomicU64::new(0),
             shared_cache_end: AtomicU64::new(0),
+            dyld_entry_point: AtomicUsize::new(0),
+            dyld_base: AtomicUsize::new(0),
+            dyld_end: AtomicUsize::new(0),
+            dyld_bytes: litebox::sync::RwLock::new(None),
             demand_page_ranges: litebox::sync::RwLock::new(Vec::new()),
             demand_page_sources: litebox::sync::RwLock::new(Vec::new()),
             sysroot: self.sysroot,
@@ -1665,6 +1669,16 @@ struct GlobalState<FS: ShimFS> {
     pub(crate) shared_cache_base: AtomicU64,
     /// End address (exclusive) of the installed shared cache (0 if not installed).
     pub(crate) shared_cache_end: AtomicU64,
+    /// dyld's entry point address, stored after each load_dyld call.
+    pub(crate) dyld_entry_point: AtomicUsize,
+    /// Base address of the currently-loaded dyld binary (0 if not loaded).
+    pub(crate) dyld_base: AtomicUsize,
+    /// End address (exclusive) of the currently-loaded dyld binary (0 if not loaded).
+    pub(crate) dyld_end: AtomicUsize,
+    /// Raw bytes of /usr/lib/dyld, stored so execve can re-load dyld fresh
+    /// (with pristine __DATA segments) on every exec, matching real macOS
+    /// kernel behavior.
+    pub(crate) dyld_bytes: litebox::sync::RwLock<Platform, Option<Vec<u8>>>,
     /// Address ranges for demand-paging shared cache pages on SIGBUS.
     ///
     /// These are the overlapping regions between the guest's unslid shared cache

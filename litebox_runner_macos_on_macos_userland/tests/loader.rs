@@ -170,7 +170,6 @@ fn test_signal() {
     );
 }
 #[test]
-#[ignore = "execve hangs: load_macho re-loads dyld which conflicts with preserved shared cache mappings"]
 #[allow(clippy::cast_precision_loss)]
 fn test_execve() {
     let cache_dir = std::path::Path::new("/System/Cryptexes/OS/System/Library/dyld");

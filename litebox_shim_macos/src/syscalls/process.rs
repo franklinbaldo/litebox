@@ -223,14 +223,15 @@ impl<FS: ShimFS> Task<FS> {
 
         // ── 4. Release existing memory mappings ──
 
-        // Preserve shared cache mappings — they are host memory that is
-        // shared across execve and must remain mapped for dyld to work.
+        // Preserve only the shared cache — it is host-mapped memory that
+        // must survive across execve.  dyld is NOT preserved: it will be
+        // freshly re-loaded by load_macho (matching real macOS kernel
+        // behavior where dyld is mapped from disk with pristine __DATA
+        // segments on every execve).
         #[allow(clippy::cast_possible_truncation)]
-        let cache_base =
-            self.global.shared_cache_base.load(Ordering::Acquire) as usize;
+        let cache_base = self.global.shared_cache_base.load(Ordering::Acquire) as usize;
         #[allow(clippy::cast_possible_truncation)]
-        let cache_end =
-            self.global.shared_cache_end.load(Ordering::Acquire) as usize;
+        let cache_end = self.global.shared_cache_end.load(Ordering::Acquire) as usize;
         let release = |range: core::ops::Range<usize>, vm: litebox::mm::linux::VmFlags| {
             if vm.is_empty() {
                 return false;

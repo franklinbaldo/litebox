@@ -53,6 +53,10 @@ pub(crate) struct DyldLoadInfo {
     /// The slide applied to dyld's segments.
     #[expect(dead_code, reason = "will be used when dyld debugging is needed")]
     pub(crate) slide: usize,
+    /// Base address of the mapped dyld binary.
+    pub(crate) base: usize,
+    /// End address (exclusive) of the mapped dyld binary.
+    pub(crate) end: usize,
 }
 
 /// Load a rewritten Mach-O binary and prepare it for execution.

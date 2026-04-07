@@ -420,12 +420,49 @@ pub(crate) fn load<FS: ShimFS>(
     // intercepts for code patching).
     let mut dyld_entry: Option<usize> = None;
     if has_dylinker {
-        let dyld_data = dyld_bytes.ok_or_else(|| {
-            MachoLoaderError::ParseError(
-                "binary requires dyld (LC_LOAD_DYLINKER) but no dyld_bytes provided".into(),
-            )
-        })?;
-        let dyld_info = load_dyld(task, dyld_data)?;
+        // Determine the dyld binary data to use.  On initial load the caller
+        // passes dyld_bytes directly.  On re-exec (execve) the caller passes
+        // None and we retrieve the previously-stored bytes from Global.
+        let dyld_data_owned: Option<alloc::vec::Vec<u8>> = if let Some(data) = dyld_bytes {
+            // First load: store a copy in Global for future execve calls.
+            {
+                let mut stored = task.global.dyld_bytes.write();
+                *stored = Some(data.to_vec());
+            }
+            None // signal to use dyld_bytes directly below
+        } else {
+            // Re-exec path: read the stored bytes.
+            let stored = task.global.dyld_bytes.read();
+            if let Some(ref bytes) = *stored {
+                Some(bytes.clone())
+            } else {
+                return Err(MachoLoaderError::ParseError(
+                    "binary requires dyld but no dyld_bytes provided and no prior dyld loaded"
+                        .into(),
+                ));
+            }
+        };
+
+        // Load dyld fresh — always, even on re-exec.  This ensures dyld's
+        // __DATA segments start pristine, matching real macOS kernel behavior
+        // where dyld is freshly mapped from disk on every execve().
+        let dyld_slice: &[u8] = match (&dyld_data_owned, dyld_bytes) {
+            (Some(owned), _) => owned.as_slice(),
+            (None, Some(orig)) => orig,
+            _ => unreachable!(),
+        };
+        let dyld_info = load_dyld(task, dyld_slice)?;
+        // Store dyld address range so release_memory can skip it if needed,
+        // and store entry point for reference.
+        task.global
+            .dyld_entry_point
+            .store(dyld_info.entry_point, core::sync::atomic::Ordering::Release);
+        task.global
+            .dyld_base
+            .store(dyld_info.base, core::sync::atomic::Ordering::Release);
+        task.global
+            .dyld_end
+            .store(dyld_info.end, core::sync::atomic::Ordering::Release);
         dyld_entry = Some(dyld_info.entry_point);
     }
 
@@ -832,7 +869,12 @@ fn load_dyld<FS: ShimFS>(
         })?;
     }
 
-    Ok(DyldLoadInfo { entry_point, slide })
+    Ok(DyldLoadInfo {
+        entry_point,
+        slide,
+        base: reserved_base,
+        end: reserved_base + total_span,
+    })
 }
 
 /// Convert macOS VM_PROT_* flags to litebox ProtFlags.
