@@ -11,11 +11,11 @@ use alloc::vec::Vec;
 use rangemap::RangeMap;
 use thiserror::Error;
 
-use crate::platform::PageManagementProvider;
-use crate::platform::RawConstPointer;
 use crate::platform::page_mgmt::AllocationError;
 use crate::platform::page_mgmt::FixedAddressBehavior;
 use crate::platform::page_mgmt::MemoryRegionPermissions;
+use crate::platform::PageManagementProvider;
+use crate::platform::RawConstPointer;
 
 /// Page size in bytes
 pub const PAGE_SIZE: usize = 4096;
@@ -509,6 +509,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 MemoryRegionPermissions::from_bits(permissions).unwrap(),
                 vma.flags.contains(VmFlags::VM_GROWSDOWN),
                 populate_pages_immediately,
+                false,
                 platform_fixed_address_behavior,
             )
             .map_err(|err| match err {

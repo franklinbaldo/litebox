@@ -1661,6 +1661,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         initial_permissions: MemoryRegionPermissions,
         can_grow_down: bool,
         populate_pages_immediately: bool,
+        _noreserve: bool,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, AllocationError> {
         debug_assert!(ALIGN.is_multiple_of(self.sys_info.read().unwrap().dwPageSize as usize));
@@ -2180,6 +2181,7 @@ mod tests {
             MemoryRegionPermissions::WRITE,
             false,
             true,
+            false,
             FixedAddressBehavior::Hint,
         )
         .unwrap()
@@ -2206,6 +2208,7 @@ mod tests {
             MemoryRegionPermissions::WRITE,
             false,
             true,
+            false,
             FixedAddressBehavior::Hint,
         )
         .unwrap()
@@ -2238,6 +2241,7 @@ mod tests {
             MemoryRegionPermissions::WRITE,
             false,
             true,
+            false,
             FixedAddressBehavior::Hint,
         )
         .unwrap()

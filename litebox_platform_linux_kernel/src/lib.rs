@@ -10,15 +10,15 @@ use core::sync::atomic::AtomicU64;
 use core::{arch::asm, sync::atomic::AtomicU32};
 
 use litebox::mm::linux::PageRange;
-use litebox::platform::RawPointerProvider;
 use litebox::platform::page_mgmt::FixedAddressBehavior;
+use litebox::platform::RawPointerProvider;
 use litebox::platform::{
     DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider, Provider,
     Punchthrough, PunchthroughProvider, PunchthroughToken, RawMutexProvider, TimeProvider,
     UnblockedOrTimedOut,
 };
-use litebox_common_linux::PunchthroughSyscall;
 use litebox_common_linux::errno::Errno;
+use litebox_common_linux::PunchthroughSyscall;
 
 extern crate alloc;
 
@@ -424,6 +424,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         initial_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
         can_grow_down: bool,
         populate_pages_immediately: bool,
+        _noreserve: bool,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
         let range = PageRange::new(suggested_range.start, suggested_range.end)

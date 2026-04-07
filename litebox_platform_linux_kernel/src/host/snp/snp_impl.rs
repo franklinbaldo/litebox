@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 //! An implementation of [`HostInterface`] for SNP VMM
-use ::alloc::boxed::Box;
+use alloc::boxed::Box;
 use core::{
     arch::asm,
     cell::{Cell, OnceCell},
@@ -38,8 +38,8 @@ type ArgsArray = [u64; MAX_ARGS_SIZE];
 
 #[cfg(not(test))]
 mod alloc {
-    use crate::HostInterface;
     use crate::mm::MemoryProvider;
+    use crate::HostInterface;
     use litebox::utils::TruncateExt as _;
 
     const HEAP_ORDER: usize = super::bindings::SNP_VMPL_ALLOC_MAX_ORDER as usize + 12 + 1;

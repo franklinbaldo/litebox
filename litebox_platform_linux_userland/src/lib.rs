@@ -1728,6 +1728,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         initial_permissions: MemoryRegionPermissions,
         can_grow_down: bool,
         populate_pages_immediately: bool,
+        noreserve: bool,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
         let flags = MapFlags::MAP_PRIVATE
@@ -1744,6 +1745,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             }
             | if populate_pages_immediately {
                 MapFlags::MAP_POPULATE
+            } else {
+                MapFlags::empty()
+            }
+            | if noreserve {
+                MapFlags::MAP_NORESERVE
             } else {
                 MapFlags::empty()
             };
