@@ -1291,7 +1291,7 @@ impl<FS: ShimFS> Task<FS> {
                 let Some(count) = core::num::NonZeroU32::new(count) else {
                     return Ok(0);
                 };
-                self.global.futex_manager.wake(addr, count, None)? as usize
+                self.global.futex_manager.wake(addr, count, None, 0)? as usize
             }
             FutexArgs::Wait {
                 addr,
@@ -1306,6 +1306,7 @@ impl<FS: ShimFS> Task<FS> {
                     addr,
                     val,
                     None,
+                    0,
                 )?;
                 0
             }
@@ -1333,6 +1334,7 @@ impl<FS: ShimFS> Task<FS> {
                     addr,
                     val,
                     core::num::NonZeroU32::new(bitmask),
+                    0,
                 )?;
                 0
             }
