@@ -47,6 +47,8 @@ impl<FS: ShimFS> Task<FS> {
                 Ok(self.sys_getppid() as usize)
             }
             MacosSyscallRequest::Umask { cmask } => Ok(self.sys_umask(cmask) as usize),
+            MacosSyscallRequest::Getrlimit { resource, rlim } => self.sys_getrlimit(resource, rlim),
+            MacosSyscallRequest::Setrlimit { resource, rlim } => self.sys_setrlimit(resource, rlim),
             MacosSyscallRequest::Getuid => Ok(self.sys_getuid() as usize),
             MacosSyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),
             MacosSyscallRequest::Getgid => Ok(self.sys_getgid() as usize),

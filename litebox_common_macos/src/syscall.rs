@@ -115,6 +115,8 @@ pub mod nr {
     pub const FCNTL_NOCANCEL: usize = 406;
     pub const FACCESSAT: usize = 466;
     pub const UNLINKAT: usize = 472;
+    pub const GETRLIMIT: usize = 194;
+    pub const SETRLIMIT: usize = 195;
 }
 
 /// Mach trap numbers (negative x16 values, stored as positive constants).
@@ -597,6 +599,14 @@ pub enum MacosSyscallRequest {
         path: usize,
         flag: i32,
     },
+    Getrlimit {
+        resource: u32,
+        rlim: usize,
+    },
+    Setrlimit {
+        resource: u32,
+        rlim: usize,
+    },
     Unknown {
         number: usize,
     },
@@ -981,6 +991,14 @@ impl MacosSyscallRequest {
                 path: a1,
                 flag: a2 as i32,
             },
+            nr::GETRLIMIT => MacosSyscallRequest::Getrlimit {
+                resource: a0 as u32,
+                rlim: a1,
+            },
+            nr::SETRLIMIT => MacosSyscallRequest::Setrlimit {
+                resource: a0 as u32,
+                rlim: a1,
+            },
             nr::ULOCK_WAIT => MacosSyscallRequest::UlockWait {
                 operation: a0 as u32,
                 addr: a1,
@@ -1041,8 +1059,7 @@ impl MacosSyscallRequest {
             //   and validation (Linux shim: signal/mod.rs Cell<SigAltStack>).
             // TODO(kill): 37=kill, 328=__pthread_kill — signal delivery to
             //   threads (Linux shim: signal injection + thread interrupt).
-            // TODO(rlimit): 194=getrlimit, 195=setrlimit — rlimit tracking
-            //   with sensible defaults (Linux shim: process.rs).
+
             // TODO(execve): 59=execve — full process teardown + reload
             //   (Linux shim: kill threads, close CLOEXEC, release memory,
             //   reset signals, Mach-O load, reinit context).

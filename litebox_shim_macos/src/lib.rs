@@ -152,6 +152,9 @@ struct Process {
     next_mach_port: AtomicU32,
     /// Per-signal handler table. Indexed by signal number (1-31; index 0 unused).
     signal_handlers: litebox::sync::Mutex<Platform, [SignalHandler; 32]>,
+    /// Resource limits (RLIMIT_*). Indexed by RlimitResource as usize.
+    rlimits: [litebox::sync::Mutex<Platform, litebox_common_macos::Rlimit>;
+        litebox_common_macos::RlimitResource::COUNT],
     /// Active thread pthread addresses.  Used to suppress premature
     /// `mach_vm_deallocate` on thread stacks before `pthread_join` reads them.
     /// Contains (pthread_addr) for each live spawned thread.
@@ -172,6 +175,33 @@ impl Process {
             next_tid: AtomicI32::new(2),
             next_mach_port: AtomicU32::new(0x0403),
             signal_handlers: litebox::sync::Mutex::new([SignalHandler::default(); 32]),
+            rlimits: core::array::from_fn(|i| {
+                use litebox_common_macos::{Rlimit, RlimitResource};
+                #[allow(clippy::cast_possible_truncation)]
+                let lim = match RlimitResource::from_raw(i as u32) {
+                    Some(RlimitResource::Nofile) => Rlimit {
+                        rlim_cur: 256,
+                        rlim_max: u64::MAX,
+                    },
+                    Some(RlimitResource::Stack) => Rlimit {
+                        rlim_cur: 8 * 1024 * 1024,
+                        rlim_max: 64 * 1024 * 1024,
+                    },
+                    Some(RlimitResource::Nproc) => Rlimit {
+                        rlim_cur: 2048,
+                        rlim_max: 2048,
+                    },
+                    Some(RlimitResource::Core) => Rlimit {
+                        rlim_cur: 0,
+                        rlim_max: u64::MAX,
+                    },
+                    _ => Rlimit {
+                        rlim_cur: u64::MAX,
+                        rlim_max: u64::MAX,
+                    },
+                };
+                litebox::sync::Mutex::new(lim)
+            }),
             thread_pthreads: litebox::sync::Mutex::new(alloc::collections::BTreeSet::new()),
         }
     }

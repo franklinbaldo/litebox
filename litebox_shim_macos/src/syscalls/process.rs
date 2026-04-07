@@ -64,6 +64,42 @@ impl<FS: ShimFS> Task<FS> {
         0
     }
 
+    /// Handle `getrlimit(resource, rlim)`.
+    pub(crate) fn sys_getrlimit(&self, resource: u32, rlim_addr: usize) -> Result<usize, Errno> {
+        use crate::MutPtr;
+        use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+        use litebox_common_macos::{Rlimit, RlimitResource};
+
+        let res = RlimitResource::from_raw(resource).ok_or(Errno::EINVAL)?;
+        let lim = *self.process.rlimits[res as usize].lock();
+        let ptr: MutPtr<Rlimit> = MutPtr::from_usize(rlim_addr);
+        ptr.write_at_offset(0, lim).ok_or(Errno::EFAULT)?;
+        Ok(0)
+    }
+
+    /// Handle `setrlimit(resource, rlim)`.
+    pub(crate) fn sys_setrlimit(&self, resource: u32, rlim_addr: usize) -> Result<usize, Errno> {
+        use crate::ConstPtr;
+        use litebox::platform::RawConstPointer as _;
+        use litebox_common_macos::{Rlimit, RlimitResource};
+
+        let res = RlimitResource::from_raw(resource).ok_or(Errno::EINVAL)?;
+        let ptr: ConstPtr<Rlimit> = ConstPtr::from_usize(rlim_addr);
+        let new_lim: Rlimit = ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+
+        // Soft limit must not exceed hard limit.
+        if new_lim.rlim_cur > new_lim.rlim_max {
+            return Err(Errno::EINVAL);
+        }
+        // Cannot raise hard limit (no CAP_SYS_RESOURCE equivalent).
+        let mut stored = self.process.rlimits[res as usize].lock();
+        if new_lim.rlim_max > stored.rlim_max {
+            return Err(Errno::EPERM);
+        }
+        *stored = new_lim;
+        Ok(0)
+    }
+
     /// Handle `gettimeofday(tv, tz)` — return wall-clock time.
     #[allow(clippy::similar_names)]
     pub(crate) fn sys_gettimeofday(&self, tv_addr: usize, tz_addr: usize) -> Result<usize, Errno> {

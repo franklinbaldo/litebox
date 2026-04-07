@@ -1572,6 +1572,7 @@ version = "0.1.0"
 dependencies = [
  "litebox",
  "litebox_common_linux",
+ "zerocopy",
 ]
 
 [[package]]
