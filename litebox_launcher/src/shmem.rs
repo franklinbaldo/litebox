@@ -422,6 +422,25 @@ impl InMemSharedRegion {
             std::ptr::write(ptr.cast::<RegionHeader>(), header);
         }
 
+        // Downgrade the launcher/micro mapping to read-only.  Central runs
+        // in a separate process and creates its own PROT_READ|PROT_WRITE
+        // mapping of the same memfd, so it can still write.  This ensures
+        // that guest code running in micro cannot corrupt the inmem region
+        // at the hardware/MMU level.
+        //
+        // SAFETY: `ptr` is page-aligned (from mmap) and `size` covers the
+        // entire mapping.
+        let ret = unsafe { libc::mprotect(ptr, size, libc::PROT_READ) };
+        if ret != 0 {
+            unsafe {
+                libc::munmap(ptr, size);
+            }
+            return Err(anyhow::anyhow!(
+                "mprotect failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
         let non_null = NonNull::new(ptr.cast::<u8>()).expect("mmap succeeded but returned null");
 
         Ok(Self {
@@ -436,7 +455,8 @@ impl InMemSharedRegion {
         self.fd.as_raw_fd()
     }
 
-    /// Returns a pointer to the raw mapped region.
+    /// Returns a pointer to the raw mapped region (read-only after
+    /// construction; the underlying pages are `PROT_READ`).
     pub fn base_ptr(&self) -> *mut u8 {
         self.ptr.as_ptr()
     }
