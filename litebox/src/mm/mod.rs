@@ -56,6 +56,33 @@ where
     #[cfg(not(target_os = "macos"))]
     pub const BRK_RESERVE_SIZE: usize = 32 << 20; // 32 MiB
 
+    /// Diagnostic: raw write to stderr via inline asm (aarch64 only).
+    /// Uses a direct SVC #0x80 that does NOT go through patched shared cache.
+    #[cfg(target_os = "macos")]
+    fn _diag_write(buf: &[u8]) {
+        if buf.is_empty() {
+            return;
+        }
+        unsafe {
+            core::arch::asm!(
+                "mov x0, #2",            // fd = stderr
+                "mov x1, {buf}",
+                "mov x2, {len}",
+                "mov x16, #4",           // SYS_write = 4
+                "movk x16, #0x200, lsl #16", // BSD flag
+                "svc #0x80",
+                buf = in(reg) buf.as_ptr(),
+                len = in(reg) buf.len(),
+                out("x0") _,
+                out("x1") _,
+                out("x2") _,
+                out("x16") _,
+                out("x17") _,
+                options(nostack),
+            );
+        }
+    }
+
     /// Create a new `PageManager` instance.
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
         let vmem = RwLock::new(linux::Vmem::new(litebox.x.platform));
@@ -303,7 +330,16 @@ where
     ///
     /// Panics if the initial program break is already set.
     pub fn set_initial_brk(&self, brk: usize) {
+        // Diagnostic: raw write to stderr via inline asm (signal-safe).
+        #[cfg(target_os = "macos")]
+        {
+            Self::_diag_write(b"[set_initial_brk] acquiring write lock\n");
+        }
         let mut vmem = self.vmem.write();
+        #[cfg(target_os = "macos")]
+        {
+            Self::_diag_write(b"[set_initial_brk] write lock acquired\n");
+        }
         assert_eq!(vmem.brk, 0, "initial brk is already set");
         vmem.brk = brk;
         // Reserve a region above brk for future brk growth so that the
@@ -324,6 +360,7 @@ where
         // Clobbering them would hang or crash the process.
         #[cfg(target_os = "macos")]
         {
+            Self::_diag_write(b"[set_initial_brk] enumerating gaps\n");
             let brk_start = brk_aligned;
             let brk_end = vmem.brk_reserved_end;
             if brk_start < brk_end {
@@ -332,8 +369,9 @@ where
                 let gaps: alloc::vec::Vec<core::ops::Range<usize>> =
                     vmem.gaps_in_range(brk_start..brk_end);
 
+                Self::_diag_write(b"[set_initial_brk] gaps enumerated, reserving\n");
                 let mut any_reserved = false;
-                for gap in gaps {
+                for gap in &gaps {
                     // Align gap to page boundaries (should already be aligned,
                     // but be defensive).
                     let gap_start = gap.start.next_multiple_of(linux::PAGE_SIZE);
@@ -341,6 +379,7 @@ where
                     if gap_start >= gap_end {
                         continue;
                     }
+                    Self::_diag_write(b"[set_initial_brk] allocate_pages for gap\n");
                     if vmem
                         .platform
                         .allocate_pages(
@@ -352,6 +391,7 @@ where
                         )
                         .is_ok()
                     {
+                        Self::_diag_write(b"[set_initial_brk] gap reserved OK\n");
                         // Track the reserved gap in the VMA tree.
                         if let Some(pr) = linux::PageRange::new(gap_start, gap_end) {
                             vmem.register_existing_mapping_overwrite(
@@ -360,6 +400,8 @@ where
                             );
                         }
                         any_reserved = true;
+                    } else {
+                        Self::_diag_write(b"[set_initial_brk] gap reserve FAILED\n");
                     }
                     // If allocation failed, the host may have placed something
                     // there between enumeration and mmap.  Continue with
@@ -367,13 +409,22 @@ where
                 }
                 vmem.brk_hard_reserved = any_reserved;
             }
+            Self::_diag_write(b"[set_initial_brk] gap reservation done\n");
         }
 
         // Evict any pre-existing host reservation VMAs (from reserved_pages)
         // that overlap the brk zone.  These were inserted at Vmem::new() time
         // before the brk address was known and would cause brk() to fail with
         // ENOMEM when it finds them via overlapping().
+        #[cfg(target_os = "macos")]
+        {
+            Self::_diag_write(b"[set_initial_brk] evicting reserved from brk zone\n");
+        }
         vmem.evict_reserved_from_brk_zone();
+        #[cfg(target_os = "macos")]
+        {
+            Self::_diag_write(b"[set_initial_brk] done\n");
+        }
     }
 
     /// Find a free region of at least `size` bytes at or above `min_addr`.

@@ -451,6 +451,11 @@ pub(crate) fn load<FS: ShimFS>(
 
     // Set the initial brk now that all segments and TLS table are mapped.
     log_unsupported!("load_macho: __LITEBOX check done, about to call set_initial_brk (brk={brk:#x})");
+    // Diagnostic: check vmem brk state before calling set_initial_brk
+    {
+        let mappings = task.global.pm.mappings();
+        log_unsupported!("load_macho: pre-set_initial_brk: {} VMA entries in tree", mappings.len());
+    }
     task.global.pm.set_initial_brk(brk);
     log_unsupported!("load_macho: set_initial_brk done (brk={brk:#x})");
 

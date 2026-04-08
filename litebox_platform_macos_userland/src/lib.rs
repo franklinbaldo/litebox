@@ -2085,6 +2085,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 Err(litebox::platform::page_mgmt::AllocationError::OutOfMemory)
             }
             FixedAddressBehavior::Replace | FixedAddressBehavior::NoReplace => {
+                raw_debug_write(b"[allocate_pages] Fixed/NoReplace entry\n");
                 if fixed_address_behavior == FixedAddressBehavior::Replace {
                     clear_edge_page_mapping(suggested_range.clone());
                 }
