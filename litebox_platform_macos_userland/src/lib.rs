@@ -2085,17 +2085,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 Err(litebox::platform::page_mgmt::AllocationError::OutOfMemory)
             }
             FixedAddressBehavior::Replace | FixedAddressBehavior::NoReplace => {
-                raw_debug_write(b"[allocate_pages] Fixed/NoReplace entry range=");
-                raw_debug_write_hex(suggested_range.start);
-                raw_debug_write(b"..");
-                raw_debug_write_hex(suggested_range.end);
-                raw_debug_write(b" behavior=");
-                if fixed_address_behavior == FixedAddressBehavior::NoReplace {
-                    raw_debug_write(b"NoReplace");
-                } else {
-                    raw_debug_write(b"Replace");
-                }
-                raw_debug_write(b"\n");
                 if fixed_address_behavior == FixedAddressBehavior::Replace {
                     clear_edge_page_mapping(suggested_range.clone());
                 }
@@ -2135,10 +2124,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                             )
                         };
                         if kr != 0 {
-                            raw_debug_write(b"[allocate_pages] NoReplace mach_vm_allocate failed kr=");
-                            #[allow(clippy::cast_sign_loss)]
-                            raw_debug_write_hex(kr as usize);
-                            raw_debug_write(b"\n");
                             return Err(
                                 litebox::platform::page_mgmt::AllocationError::AddressInUseByPlatform,
                             );
@@ -2849,18 +2834,6 @@ unsafe extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext) {
                         return;
                     }
 
-                    // Unknown target — log and fall through to normal syscall dispatch
-                    // which will log it as unsupported.
-                    {
-                        let mut buf = [0u8; 128];
-                        let prefix = b"[sigreturn] unknown target_pc=";
-                        buf[..prefix.len()].copy_from_slice(prefix);
-                        let mut pos = prefix.len();
-                        pos = write_hex_to_buf(&mut buf, pos, target_pc as u64);
-                        buf[pos] = b'\n';
-                        pos += 1;
-                        raw_debug_write(&buf[..pos]);
-                    }
                 }
             }
         }
@@ -2918,23 +2891,17 @@ pub fn update_host_tls_entry() {
 
     let table_addr = litebox_common_linux::HOST_TLS_TABLE_ADDR.load(Ordering::Acquire);
     if table_addr == 0 {
-        raw_debug_write(b"update_host_tls_entry: table_addr=0, returning early
-");
         return; // No TLS table allocated (not using rewriter-based trampoline)
     }
 
     let tcb = TCB_PTR.get();
     if tcb.is_null() {
-        raw_debug_write(b"update_host_tls_entry: TCB_PTR is null, returning early
-");
         return; // No TCB yet (first exec, before run_thread)
     }
     let host_tls = tcb as usize;
 
     // TPIDRRO_EL0 is the lookup key — stable per-pthread, never clobbered.
     let tpidrro = unsafe { litebox_common_linux::read_tpidrro_el0() } as u64;
-    raw_debug_write(b"update_host_tls_entry: scanning TLS table
-");
 
     'retry: loop {
         let mut first_free: Option<usize> = None;
@@ -2948,8 +2915,6 @@ pub fn update_host_tls_entry() {
                 // Found our entry — update host_tls in case it changed.
                 let val_ptr = (table_addr + index * 16 + 8) as *mut u64;
                 unsafe { val_ptr.write_volatile(host_tls as u64) };
-                raw_debug_write(b"update_host_tls_entry: updated existing entry
-");
                 return;
             }
 
@@ -2988,8 +2953,6 @@ pub fn update_host_tls_entry() {
         {
             // Claimed. Write host_tls value.
             unsafe { val_ptr.write_volatile(host_tls as u64) };
-            raw_debug_write(b"update_host_tls_entry: claimed new slot
-");
             return;
         }
         // CAS failed — another thread grabbed this slot. Rescan.
@@ -3175,26 +3138,6 @@ const RAW_SYS_MMAP: u64 = 197;
 ///
 /// Bypasses the patched shared cache gate entirely — safe to call from
 /// `syscall_handler` and other host-side code after `install_shared_cache`.
-/// Write a u64 value as hex (0x...) into buf starting at `pos`, return new pos.
-fn write_hex_to_buf(buf: &mut [u8], pos: usize, val: u64) -> usize {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut p = pos;
-    buf[p] = b'0';
-    buf[p + 1] = b'x';
-    p += 2;
-    // Find first non-zero nibble (or print 0)
-    let mut started = false;
-    for shift in (0..16).rev() {
-        let nibble = ((val >> (shift * 4)) & 0xf) as usize;
-        if nibble != 0 || started || shift == 0 {
-            buf[p] = HEX[nibble];
-            p += 1;
-            started = true;
-        }
-    }
-    p
-}
-
 fn raw_debug_write(buf: &[u8]) {
     if buf.is_empty() {
         return;
@@ -3216,12 +3159,6 @@ fn raw_debug_write(buf: &[u8]) {
             clobber_abi("C"),
         );
     }
-}
-
-fn raw_debug_write_hex(val: usize) {
-    let mut buf = [0u8; 20]; // "0x" + up to 16 hex digits + margin
-    let len = write_hex_to_buf(&mut buf, 0, val as u64);
-    raw_debug_write(&buf[..len]);
 }
 
 /// Raw `mmap(addr, len, prot, flags, fd, offset)` via inline assembly.
