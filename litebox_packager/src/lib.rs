@@ -13,25 +13,6 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use tar::{Builder, Header};
 
-/// Return Unix permission mode bits for a file.
-///
-/// On Unix this returns the real mode from metadata. On other platforms it
-/// returns 0o755 for files with a read-only attribute cleared, 0o644 otherwise.
-#[cfg(unix)]
-fn file_mode(metadata: &std::fs::Metadata) -> u32 {
-    use std::os::unix::fs::MetadataExt as _;
-    metadata.mode()
-}
-
-#[cfg(not(unix))]
-fn file_mode(metadata: &std::fs::Metadata) -> u32 {
-    if metadata.permissions().readonly() {
-        0o644
-    } else {
-        0o755
-    }
-}
-
 /// Package Linux ELF programs for execution under LiteBox.
 ///
 /// Discovers shared library dependencies, rewrites all ELF files using the
@@ -64,19 +45,17 @@ pub struct CliArgs {
     #[arg(short = 'o', long = "output", default_value = "litebox_packager.tar")]
     pub output: PathBuf,
 
-    /// Include extra files in the tar.
+    /// Include extra files in the tar (host mode only).
+    /// ELF files are automatically run through the syscall rewriter; non-ELF
+    /// files are included as-is.
     /// Format: HOST_PATH:TAR_PATH (split on the first colon, so the tar path
     /// may contain colons but the host path must not).
-    #[arg(long = "include", value_name = "HOST_PATH:TAR_PATH")]
+    #[arg(
+        long = "include",
+        value_name = "HOST_PATH:TAR_PATH",
+        conflicts_with = "oci_image"
+    )]
     pub include: Vec<String>,
-
-    /// Include extra ELF files in the tar **with** syscall rewriting.
-    /// Use this for shared libraries that are loaded at runtime via `dlopen`
-    /// (e.g., NSS modules like `libnss_dns.so.2`) and therefore not discovered
-    /// by the automatic dependency scan.
-    /// Format: HOST_PATH:TAR_PATH (same as `--include`).
-    #[arg(long = "rewrite-include", value_name = "HOST_PATH:TAR_PATH")]
-    pub rewrite_include: Vec<String>,
 
     /// Skip rewriting specific files (by their absolute path on the host).
     #[arg(long = "no-rewrite", value_name = "PATH")]
@@ -88,24 +67,15 @@ pub struct CliArgs {
 }
 
 /// Parsed `--include` entry.
+#[cfg(target_os = "linux")]
 struct IncludeEntry {
     host_path: PathBuf,
     tar_path: String,
 }
 
+#[cfg(target_os = "linux")]
 fn parse_include(spec: &str) -> anyhow::Result<IncludeEntry> {
-    // On Windows, skip past a drive letter prefix (e.g., `C:`) when searching
-    // for the HOST_PATH:TAR_PATH separator.
-    let search_start = if cfg!(windows)
-        && spec.len() >= 2
-        && spec.as_bytes()[0].is_ascii_alphabetic()
-        && spec.as_bytes()[1] == b':'
-    {
-        2
-    } else {
-        0
-    };
-    let Some(colon_idx) = spec[search_start..].find(':').map(|i| i + search_start) else {
+    let Some(colon_idx) = spec.find(':') else {
         bail!("invalid --include format: expected HOST_PATH:TAR_PATH, got: {spec}");
     };
     let host_path = PathBuf::from(&spec[..colon_idx]);
@@ -206,10 +176,12 @@ fn run_host_mode(args: CliArgs) -> anyhow::Result<()> {
         .map(|(real_path, tar_paths): (&PathBuf, &Vec<PathBuf>)| {
             let data = std::fs::read(real_path)
                 .with_context(|| format!("failed to read {}", real_path.display()))?;
-            let mode = file_mode(
-                &std::fs::metadata(real_path)
-                    .with_context(|| format!("failed to stat {}", real_path.display()))?,
-            );
+            let mode = {
+                use std::os::unix::fs::MetadataExt as _;
+                std::fs::metadata(real_path)
+                    .with_context(|| format!("failed to stat {}", real_path.display()))?
+                    .mode()
+            };
 
             let rewritten = if no_rewrite.contains(real_path) {
                 if verbose {
@@ -247,7 +219,47 @@ fn run_host_mode(args: CliArgs) -> anyhow::Result<()> {
         }
     }
 
-    finalize_tar(tar_entries, added_tar_paths, &args)?;
+    // Append --include files (ELF files are automatically rewritten).
+    let includes: Vec<IncludeEntry> = args
+        .include
+        .iter()
+        .map(|s| parse_include(s))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    for inc in &includes {
+        if !inc.host_path.exists() {
+            bail!("included file does not exist: {}", inc.host_path.display());
+        }
+        if !added_tar_paths.insert(inc.tar_path.clone()) {
+            bail!(
+                "duplicate tar path from --include: '{}' (already present)",
+                inc.tar_path
+            );
+        }
+        let data = std::fs::read(&inc.host_path)
+            .with_context(|| format!("failed to read included file {}", inc.host_path.display()))?;
+        let mode = {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::metadata(&inc.host_path)
+                .map(|m| m.mode())
+                .unwrap_or(0o755)
+        };
+        let rewritten = rewrite_elf(&data, &inc.host_path, args.verbose)?;
+        if args.verbose {
+            eprintln!(
+                "  including {} as {}",
+                inc.host_path.display(),
+                inc.tar_path
+            );
+        }
+        tar_entries.push(TarEntry {
+            tar_path: inc.tar_path.clone(),
+            data: rewritten,
+            mode,
+        });
+    }
+
+    finalize_tar(tar_entries, &args)?;
 
     Ok(())
 }
@@ -361,101 +373,17 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
         }
     }
 
-    finalize_tar(tar_entries, added_tar_paths, args)?;
+    finalize_tar(tar_entries, args)?;
 
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Shared finalization: includes, tar build, size report
+// Shared finalization: tar build, size report
 // ---------------------------------------------------------------------------
 
-/// Append `--include` and `--rewrite-include` files, build the output tar,
-/// and print a size summary.
-///
-/// Both host mode and OCI mode call this after producing their rewritten
-/// `TarEntry` list.
-fn finalize_tar(
-    mut tar_entries: Vec<TarEntry>,
-    mut added_tar_paths: BTreeSet<String>,
-    args: &CliArgs,
-) -> anyhow::Result<()> {
-    // Parse and append --include files.
-    let includes: Vec<IncludeEntry> = args
-        .include
-        .iter()
-        .map(|s| parse_include(s))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-
-    for inc in &includes {
-        if !inc.host_path.exists() {
-            bail!("included file does not exist: {}", inc.host_path.display());
-        }
-        if !added_tar_paths.insert(inc.tar_path.clone()) {
-            bail!(
-                "duplicate tar path from --include: '{}' (already present)",
-                inc.tar_path
-            );
-        }
-        let data = std::fs::read(&inc.host_path)
-            .with_context(|| format!("failed to read included file {}", inc.host_path.display()))?;
-        let mode = std::fs::metadata(&inc.host_path)
-            .map(|m| file_mode(&m))
-            .unwrap_or(0o644);
-        if args.verbose {
-            eprintln!(
-                "  including {} as {}",
-                inc.host_path.display(),
-                inc.tar_path
-            );
-        }
-        tar_entries.push(TarEntry {
-            tar_path: inc.tar_path.clone(),
-            data,
-            mode,
-        });
-    }
-
-    // Include extra ELF files **with** rewriting (for dlopen'd libraries).
-    let rewrite_includes: Vec<IncludeEntry> = args
-        .rewrite_include
-        .iter()
-        .map(|s| parse_include(s))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-
-    for inc in &rewrite_includes {
-        if !inc.host_path.exists() {
-            bail!(
-                "rewrite-included file does not exist: {}",
-                inc.host_path.display()
-            );
-        }
-        if !added_tar_paths.insert(inc.tar_path.clone()) {
-            bail!(
-                "duplicate tar path from --rewrite-include: '{}' (already present)",
-                inc.tar_path
-            );
-        }
-        let data = std::fs::read(&inc.host_path)
-            .with_context(|| format!("failed to read {}", inc.host_path.display()))?;
-        let mode = std::fs::metadata(&inc.host_path)
-            .map(|m| file_mode(&m))
-            .unwrap_or(0o755);
-        let rewritten = rewrite_elf(&data, &inc.host_path, args.verbose)?;
-        if args.verbose {
-            eprintln!(
-                "  rewrite-including {} as {}",
-                inc.host_path.display(),
-                inc.tar_path
-            );
-        }
-        tar_entries.push(TarEntry {
-            tar_path: inc.tar_path.clone(),
-            data: rewritten,
-            mode,
-        });
-    }
-
+/// Build the output tar and print a size summary.
+fn finalize_tar(tar_entries: Vec<TarEntry>, args: &CliArgs) -> anyhow::Result<()> {
     // Build tar.
     eprintln!("Creating {}...", args.output.display());
     build_tar(&tar_entries, &args.output)?;
@@ -474,10 +402,6 @@ fn finalize_tar(
 
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Dependency discovery (via ldd) — Linux only
-// ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
 struct ResolvedDep {
@@ -694,11 +618,6 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> anyhow::Result<Vec<u8
             }
             Ok(data.to_vec())
         }
-        Err(litebox_syscall_rewriter::Error::UnsupportedBunExecutable) => bail!(
-            "{} is a Bun-packaged executable and cannot be packaged as-is: \
-             tar-loaded programs must already contain LiteBox syscall trampolines",
-            path.display()
-        ),
         Err(litebox_syscall_rewriter::Error::NoTextSectionFound) => {
             if verbose {
                 eprintln!(
@@ -751,18 +670,4 @@ fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
 
     builder.finish().context("failed to finalize tar archive")?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::rewrite_elf;
-    use std::path::Path;
-
-    #[test]
-    fn rewrite_elf_skips_non_elf_files() {
-        // Non-ELF data should be returned unmodified.
-        let data = b"#!/bin/sh\necho hello\n";
-        let result = rewrite_elf(data, Path::new("/tmp/script.sh"), false).unwrap();
-        assert_eq!(result, data);
-    }
 }

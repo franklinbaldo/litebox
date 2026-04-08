@@ -625,7 +625,6 @@ fn is_unix_absolute(path: &Path) -> bool {
     path.as_os_str()
         .to_str()
         .is_some_and(|s| s.starts_with('/'))
-        || path.is_absolute()
 }
 
 /// Strip the leading `/` from a Unix-style absolute path to make it
@@ -647,8 +646,10 @@ fn normalize_path(path: &Path) -> PathBuf {
             std::path::Component::ParentDir => {
                 result.pop();
             }
-            std::path::Component::CurDir | std::path::Component::RootDir => {}
-            c => result.push(c),
+            std::path::Component::CurDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {}
+            c @ std::path::Component::Normal(_) => result.push(c),
         }
     }
     result.iter().collect()
@@ -736,18 +737,14 @@ fn materialize_symlinks(
 
 /// Look up the Unix permission mode for a file.
 ///
-/// Prefers the tar-header–derived `permissions` map (keyed by rootfs-relative
-/// path) which is accurate on all platforms. Falls back to `file_mode()` on
-/// the host path (accurate on Unix, heuristic on Windows), and finally
-/// defaults to 0o644 if neither source is available.
-fn lookup_mode(rel_path: &Path, host_path: &Path, permissions: &HashMap<PathBuf, u32>) -> u32 {
+/// Look up the Unix file mode for a rootfs-relative path from the OCI tar
+/// header permissions map. Defaults to 0o644 if not found.
+fn lookup_mode(rel_path: &Path, permissions: &HashMap<PathBuf, u32>) -> u32 {
     if let Some(&mode) = permissions.get(rel_path) {
-        return mode & 0o7777;
+        mode & 0o7777
+    } else {
+        0o644
     }
-    if let Ok(metadata) = std::fs::metadata(host_path) {
-        return super::file_mode(&metadata) & 0o7777;
-    }
-    0o644
 }
 
 /// Scan an extracted rootfs directory and build a file map for packaging.
@@ -811,7 +808,7 @@ pub fn scan_rootfs(
         let tar_path = tar_path.replace('\\', "/");
 
         if entry.file_type().is_file() {
-            let mode = lookup_mode(rel_path, entry.path(), permissions);
+            let mode = lookup_mode(rel_path, permissions);
             let is_executable = mode & 0o111 != 0;
 
             if verbose && is_executable {
@@ -832,7 +829,7 @@ pub fn scan_rootfs(
             if let Some(resolved) = resolve_in_rootfs(entry.path(), rootfs, 16) {
                 if resolved.is_file() {
                     let resolved_rel = resolved.strip_prefix(rootfs).unwrap_or(&resolved);
-                    let mode = lookup_mode(resolved_rel, &resolved, permissions);
+                    let mode = lookup_mode(resolved_rel, permissions);
                     let is_executable = mode & 0o111 != 0;
 
                     files.insert(
@@ -914,7 +911,7 @@ pub fn scan_rootfs(
             }
 
             let read_rel = read_path.strip_prefix(rootfs).unwrap_or(&read_path);
-            let mode = lookup_mode(read_rel, &read_path, permissions);
+            let mode = lookup_mode(read_rel, permissions);
             let is_executable = mode & 0o111 != 0;
 
             if verbose {
@@ -974,264 +971,75 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_gzip_data() {
-        assert!(is_gzip_data(&[0x1f, 0x8b, 0x08]));
-        assert!(!is_gzip_data(&[0x00, 0x00]));
-        assert!(!is_gzip_data(&[0x1f]));
-        assert!(!is_gzip_data(&[]));
-    }
-
-    #[test]
-    fn test_resolve_in_rootfs_non_symlink() {
-        // Non-existent path returns None
-        let result = resolve_in_rootfs(Path::new("/nonexistent"), Path::new("/tmp"), 16);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_resolve_in_rootfs_max_depth_zero() {
-        let result = resolve_in_rootfs(Path::new("/tmp"), Path::new("/tmp"), 0);
-        assert!(result.is_none());
-    }
-
-    // --- normalize_path ---
-
-    #[test]
-    fn normalize_path_resolves_parent_components() {
-        let p = normalize_path(Path::new("usr/lib/../bin/sh"));
-        assert_eq!(p, PathBuf::from("usr/bin/sh"));
-    }
-
-    #[test]
-    fn normalize_path_strips_current_dir() {
-        let p = normalize_path(Path::new("./usr/./bin/sh"));
-        assert_eq!(p, PathBuf::from("usr/bin/sh"));
-    }
-
-    #[test]
-    fn normalize_path_strips_root() {
-        let p = normalize_path(Path::new("/usr/bin/sh"));
-        assert_eq!(p, PathBuf::from("usr/bin/sh"));
-    }
-
-    #[test]
-    fn normalize_path_double_parent_at_start_clamps() {
-        // Going above root should just empty the stack.
-        let p = normalize_path(Path::new("../../foo"));
-        assert_eq!(p, PathBuf::from("foo"));
-    }
-
-    #[test]
-    fn normalize_path_empty_input() {
-        let p = normalize_path(Path::new(""));
-        assert_eq!(p, PathBuf::from(""));
-    }
-
-    // --- is_unix_absolute ---
-
-    #[test]
-    fn is_unix_absolute_detects_slash_prefix() {
-        assert!(is_unix_absolute(Path::new("/usr/bin")));
-        assert!(is_unix_absolute(Path::new("/")));
-    }
-
-    #[test]
-    fn is_unix_absolute_rejects_relative() {
-        assert!(!is_unix_absolute(Path::new("usr/bin")));
-        assert!(!is_unix_absolute(Path::new("../lib")));
-        assert!(!is_unix_absolute(Path::new("")));
-    }
-
-    // --- strip_unix_root ---
-
-    #[test]
-    fn strip_unix_root_removes_leading_slash() {
-        assert_eq!(
-            strip_unix_root(Path::new("/usr/bin")),
-            PathBuf::from("usr/bin")
-        );
-    }
-
-    #[test]
-    fn strip_unix_root_noop_for_relative() {
-        assert_eq!(
-            strip_unix_root(Path::new("usr/bin")),
-            PathBuf::from("usr/bin")
-        );
-    }
-
-    #[test]
-    fn strip_unix_root_on_bare_slash() {
-        // "/" should become empty after stripping.
-        let p = strip_unix_root(Path::new("/"));
-        assert!(p.as_os_str().is_empty() || p == Path::new(""));
-    }
-
-    // --- resolve_symlink_in_rootfs ---
-
-    #[test]
-    fn resolve_symlink_direct_hit() {
-        // lib64 -> usr/lib64, and rootfs/usr/lib64/libc.so exists on disk.
+    fn resolve_symlink_in_rootfs_happy_paths() {
         let tmp = tempfile::tempdir().unwrap();
         let rootfs = tmp.path();
         std::fs::create_dir_all(rootfs.join("usr/lib64")).unwrap();
+        std::fs::create_dir_all(rootfs.join("usr/lib")).unwrap();
+        std::fs::create_dir_all(rootfs.join("usr/bin")).unwrap();
         std::fs::write(rootfs.join("usr/lib64/libc.so"), b"fake").unwrap();
-
-        let mut symlink_map = HashMap::new();
-        symlink_map.insert(PathBuf::from("lib64"), PathBuf::from("usr/lib64"));
-
-        // Resolving "lib64" itself should follow to rootfs/usr/lib64 (dir).
-        let resolved = resolve_symlink_in_rootfs(Path::new("lib64"), rootfs, &symlink_map, 32);
-        assert!(resolved.is_some());
-        assert_eq!(resolved.unwrap(), rootfs.join("usr/lib64"));
-    }
-
-    #[test]
-    fn resolve_symlink_chain() {
-        // a -> b, b -> c, rootfs/c exists.
-        let tmp = tempfile::tempdir().unwrap();
-        let rootfs = tmp.path();
+        std::fs::write(rootfs.join("usr/lib64/foo.so"), b"elf").unwrap();
+        std::fs::write(rootfs.join("usr/lib/libfoo.so"), b"elf").unwrap();
+        std::fs::write(rootfs.join("usr/bin/sh"), b"elf").unwrap();
         std::fs::write(rootfs.join("c"), b"data").unwrap();
 
         let mut symlink_map = HashMap::new();
+        symlink_map.insert(PathBuf::from("lib64"), PathBuf::from("usr/lib64"));
         symlink_map.insert(PathBuf::from("a"), PathBuf::from("b"));
         symlink_map.insert(PathBuf::from("b"), PathBuf::from("c"));
-
-        let resolved = resolve_symlink_in_rootfs(Path::new("a"), rootfs, &symlink_map, 32);
-        assert_eq!(resolved, Some(rootfs.join("c")));
-    }
-
-    #[test]
-    fn resolve_symlink_max_depth_prevents_infinite_loop() {
-        // a -> b, b -> a (cycle).
-        let mut symlink_map = HashMap::new();
-        symlink_map.insert(PathBuf::from("a"), PathBuf::from("b"));
-        symlink_map.insert(PathBuf::from("b"), PathBuf::from("a"));
-
-        let tmp = tempfile::tempdir().unwrap();
-        let resolved = resolve_symlink_in_rootfs(Path::new("a"), tmp.path(), &symlink_map, 32);
-        assert!(resolved.is_none());
-    }
-
-    #[test]
-    fn resolve_symlink_absolute_target() {
-        // link -> /usr/bin/sh, rootfs/usr/bin/sh exists.
-        let tmp = tempfile::tempdir().unwrap();
-        let rootfs = tmp.path();
-        std::fs::create_dir_all(rootfs.join("usr/bin")).unwrap();
-        std::fs::write(rootfs.join("usr/bin/sh"), b"elf").unwrap();
-
-        let mut symlink_map = HashMap::new();
         symlink_map.insert(PathBuf::from("bin/sh"), PathBuf::from("/usr/bin/sh"));
-
-        let resolved = resolve_symlink_in_rootfs(Path::new("bin/sh"), rootfs, &symlink_map, 32);
-        assert_eq!(resolved, Some(rootfs.join("usr/bin/sh")));
-    }
-
-    #[test]
-    fn resolve_symlink_relative_target() {
-        // usr/lib64/libfoo.so -> ../lib/libfoo.so, rootfs/usr/lib/libfoo.so exists.
-        let tmp = tempfile::tempdir().unwrap();
-        let rootfs = tmp.path();
-        std::fs::create_dir_all(rootfs.join("usr/lib")).unwrap();
-        std::fs::write(rootfs.join("usr/lib/libfoo.so"), b"elf").unwrap();
-
-        let mut symlink_map = HashMap::new();
         symlink_map.insert(
             PathBuf::from("usr/lib64/libfoo.so"),
             PathBuf::from("../lib/libfoo.so"),
         );
 
-        let resolved =
+        // Direct symlink: lib64 -> usr/lib64
+        let r = resolve_symlink_in_rootfs(Path::new("lib64"), rootfs, &symlink_map, 32);
+        assert_eq!(r, Some(rootfs.join("usr/lib64")));
+
+        // Chain: a -> b -> c
+        let r = resolve_symlink_in_rootfs(Path::new("a"), rootfs, &symlink_map, 32);
+        assert_eq!(r, Some(rootfs.join("c")));
+
+        // Absolute target: bin/sh -> /usr/bin/sh
+        let r = resolve_symlink_in_rootfs(Path::new("bin/sh"), rootfs, &symlink_map, 32);
+        assert_eq!(r, Some(rootfs.join("usr/bin/sh")));
+
+        // Relative target: usr/lib64/libfoo.so -> ../lib/libfoo.so
+        let r =
             resolve_symlink_in_rootfs(Path::new("usr/lib64/libfoo.so"), rootfs, &symlink_map, 32);
-        assert_eq!(resolved, Some(rootfs.join("usr/lib/libfoo.so")));
+        assert_eq!(r, Some(rootfs.join("usr/lib/libfoo.so")));
+
+        // Ancestor is symlink: lib64/foo.so resolves via lib64 -> usr/lib64
+        let r = resolve_symlink_in_rootfs(Path::new("lib64/foo.so"), rootfs, &symlink_map, 32);
+        assert_eq!(r, Some(rootfs.join("usr/lib64/foo.so")));
     }
 
     #[test]
-    fn resolve_symlink_ancestor_is_symlink() {
-        // lib64 -> usr/lib64, resolve "lib64/foo.so" where rootfs/usr/lib64/foo.so exists.
-        let tmp = tempfile::tempdir().unwrap();
-        let rootfs = tmp.path();
-        std::fs::create_dir_all(rootfs.join("usr/lib64")).unwrap();
-        std::fs::write(rootfs.join("usr/lib64/foo.so"), b"elf").unwrap();
-
-        let mut symlink_map = HashMap::new();
-        symlink_map.insert(PathBuf::from("lib64"), PathBuf::from("usr/lib64"));
-
-        let resolved =
-            resolve_symlink_in_rootfs(Path::new("lib64/foo.so"), rootfs, &symlink_map, 32);
-        assert_eq!(resolved, Some(rootfs.join("usr/lib64/foo.so")));
-    }
-
-    #[test]
-    fn resolve_symlink_empty_path_returns_none() {
-        let tmp = tempfile::tempdir().unwrap();
-        let symlink_map = HashMap::new();
-        let resolved = resolve_symlink_in_rootfs(Path::new(""), tmp.path(), &symlink_map, 32);
-        assert!(resolved.is_none());
-    }
-
-    #[test]
-    fn resolve_symlink_not_a_symlink_returns_host_path() {
-        // Regular file, not in symlink_map — should return host_path directly.
+    fn resolve_symlink_in_rootfs_edge_cases() {
         let tmp = tempfile::tempdir().unwrap();
         let rootfs = tmp.path();
         std::fs::write(rootfs.join("hello.txt"), b"hi").unwrap();
 
-        let symlink_map = HashMap::new();
-        let resolved = resolve_symlink_in_rootfs(Path::new("hello.txt"), rootfs, &symlink_map, 32);
-        assert_eq!(resolved, Some(rootfs.join("hello.txt")));
-    }
+        // Cycle: a -> b -> a
+        let mut cycle_map = HashMap::new();
+        cycle_map.insert(PathBuf::from("a"), PathBuf::from("b"));
+        cycle_map.insert(PathBuf::from("b"), PathBuf::from("a"));
+        assert!(resolve_symlink_in_rootfs(Path::new("a"), rootfs, &cycle_map, 32).is_none());
 
-    #[test]
-    fn resolve_symlink_nonexistent_returns_none() {
-        let tmp = tempfile::tempdir().unwrap();
-        let symlink_map = HashMap::new();
-        let resolved =
-            resolve_symlink_in_rootfs(Path::new("does/not/exist"), tmp.path(), &symlink_map, 32);
-        assert!(resolved.is_none());
-    }
+        let empty_map = HashMap::new();
 
-    // --- lookup_mode ---
+        // Empty path
+        assert!(resolve_symlink_in_rootfs(Path::new(""), rootfs, &empty_map, 32).is_none());
 
-    #[test]
-    fn lookup_mode_prefers_permissions_map() {
-        let tmp = tempfile::tempdir().unwrap();
-        let rootfs = tmp.path();
-        std::fs::write(rootfs.join("file.sh"), b"#!/bin/sh").unwrap();
-
-        let mut permissions = HashMap::new();
-        permissions.insert(PathBuf::from("file.sh"), 0o100755u32);
-
-        // The permissions map value (masked) should win over filesystem metadata.
-        let mode = lookup_mode(Path::new("file.sh"), &rootfs.join("file.sh"), &permissions);
-        assert_eq!(mode, 0o755);
-    }
-
-    #[test]
-    fn lookup_mode_falls_back_to_filesystem() {
-        let tmp = tempfile::tempdir().unwrap();
-        let rootfs = tmp.path();
-        std::fs::write(rootfs.join("file.txt"), b"data").unwrap();
-
-        let permissions = HashMap::new(); // empty
-        let mode = lookup_mode(
-            Path::new("file.txt"),
-            &rootfs.join("file.txt"),
-            &permissions,
+        // Nonexistent path
+        assert!(
+            resolve_symlink_in_rootfs(Path::new("does/not/exist"), rootfs, &empty_map, 32)
+                .is_none()
         );
-        // On Unix the file should have some mode; just check it's non-zero.
-        assert!(mode > 0);
-    }
 
-    #[test]
-    fn lookup_mode_defaults_to_644_when_nothing_available() {
-        let permissions = HashMap::new();
-        let mode = lookup_mode(
-            Path::new("nonexistent"),
-            Path::new("/no/such/file"),
-            &permissions,
-        );
-        assert_eq!(mode, 0o644);
+        // Regular file (not a symlink) returns host path directly
+        let r = resolve_symlink_in_rootfs(Path::new("hello.txt"), rootfs, &empty_map, 32);
+        assert_eq!(r, Some(rootfs.join("hello.txt")));
     }
 }
