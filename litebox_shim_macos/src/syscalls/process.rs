@@ -319,6 +319,7 @@ impl<FS: ShimFS> Task<FS> {
                 .release_memory(release)
                 .map_err(|_| Errno::ENOMEM)?;
         }
+        log_unsupported!("execve: release_memory done (cache_base={cache_base:#x} cache_end={cache_end:#x})");
 
         // ── 5. Reset signal handlers to defaults ──
         {
@@ -345,11 +346,16 @@ impl<FS: ShimFS> Task<FS> {
         // Reset group_exit since we're now running the new program.
         self.process.group_exit.store(false, Ordering::Release);
 
+        log_unsupported!("execve: about to call load_macho (dyld_bytes=None, program_bytes len={})", program_bytes.len());
         let load_info = crate::loader::load_macho(self, &program_bytes, argv_vec, envp_vec, None)
             .map_err(|e| {
             log_unsupported!("execve: Mach-O load failed: {}", e);
             Errno::ENOEXEC
         })?;
+        log_unsupported!(
+            "execve: load_macho OK: entry={:#x} sp={:#x} is_lc_main={} has_dylinker={}",
+            load_info.entry_point, load_info.user_stack_top, load_info.is_lc_main, load_info.has_dylinker
+        );
 
         // ── 8. Reset registers to the new entry point ──
 

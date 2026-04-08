@@ -312,6 +312,9 @@ pub(crate) fn load<FS: ShimFS>(
 
     let tls_table_addr = brk.next_multiple_of(HOST_PAGE_SIZE);
     let tls_table_end = (tls_table_addr + TLS_TABLE_SIZE).next_multiple_of(PAGE_SIZE);
+    log_unsupported!(
+        "load_macho: about to alloc TLS table at {tls_table_addr:#x}..{tls_table_end:#x} (brk={brk:#x})"
+    );
 
     let tls_flags = litebox_common_linux::MapFlags::MAP_ANONYMOUS
         | litebox_common_linux::MapFlags::MAP_PRIVATE
@@ -331,6 +334,7 @@ pub(crate) fn load<FS: ShimFS>(
         ))
     })?;
 
+    log_unsupported!("load_macho: TLS table allocated OK");
     // Initialize all guest_tpidr fields with sentinel 0xFFFFFFFFFFFFFFFF.
     let sentinel: u64 = 0xFFFF_FFFF_FFFF_FFFF;
     let tls_dest: MutPtr<u8> = MutPtr::from_usize(tls_table_addr);
@@ -350,6 +354,7 @@ pub(crate) fn load<FS: ShimFS>(
 
     // Update brk past the TLS table.
     brk = brk.max(tls_table_end);
+    log_unsupported!("load_macho: TLS table initialized, HOST_TLS_TABLE_ADDR set to {tls_table_addr:#x}");
 
     // --- Initialize trampoline callback address (if __LITEBOX segment exists) ---
     //
@@ -368,6 +373,9 @@ pub(crate) fn load<FS: ShimFS>(
     {
         let trampoline_start = (litebox_seg.vmaddr as usize).wrapping_add(slide);
         let trampoline_size = (litebox_seg.vmsize as usize).next_multiple_of(PAGE_SIZE);
+        log_unsupported!(
+            "load_macho: __LITEBOX trampoline at {trampoline_start:#x} size {trampoline_size:#x}"
+        );
 
         // Make the trampoline writable so we can fill in the callback and TLS
         // table pointer. It was already mprotected to R-X during segment mapping.
@@ -407,10 +415,12 @@ pub(crate) fn load<FS: ShimFS>(
                 "mprotect __LITEBOX R-X after init: {e:?}"
             ))
         })?;
+        log_unsupported!("load_macho: __LITEBOX trampoline initialized OK");
     }
 
     // Set the initial brk now that all segments and TLS table are mapped.
     task.global.pm.set_initial_brk(brk);
+    log_unsupported!("load_macho: set_initial_brk done (brk={brk:#x})");
 
     // --- Load dyld if the binary has LC_LOAD_DYLINKER ---
     //
@@ -419,7 +429,12 @@ pub(crate) fn load<FS: ShimFS>(
     // for loading shared libraries at runtime (via mmap, which our mmap-hook
     // intercepts for code patching).
     let mut dyld_entry: Option<usize> = None;
+    log_unsupported!(
+        "load_macho: binary mapped. has_dylinker={} entry_point={entry_point:#x} reserved_base={reserved_base:#x} slide={slide:#x}",
+        has_dylinker
+    );
     if has_dylinker {
+        log_unsupported!("load_macho: has_dylinker=true, dyld_bytes.is_some()={}", dyld_bytes.is_some());
         // Determine the dyld binary data to use.  On initial load the caller
         // passes dyld_bytes directly.  On re-exec (execve) the caller passes
         // None and we retrieve the previously-stored bytes from Global.
@@ -443,6 +458,7 @@ pub(crate) fn load<FS: ShimFS>(
             }
         };
 
+        log_unsupported!("load_macho: dyld_data_owned.is_some()={}", dyld_data_owned.is_some());
         // Load dyld fresh — always, even on re-exec.  This ensures dyld's
         // __DATA segments start pristine, matching real macOS kernel behavior
         // where dyld is freshly mapped from disk on every execve().
@@ -451,7 +467,9 @@ pub(crate) fn load<FS: ShimFS>(
             (None, Some(orig)) => orig,
             _ => unreachable!(),
         };
+        log_unsupported!("load_macho: about to call load_dyld (slice len={})", dyld_slice.len());
         let dyld_info = load_dyld(task, dyld_slice)?;
+        log_unsupported!("load_macho: load_dyld OK: entry={:#x} base={:#x} end={:#x}", dyld_info.entry_point, dyld_info.base, dyld_info.end);
         // Store dyld address range so release_memory can skip it if needed,
         // and store entry point for reference.
         task.global
@@ -593,8 +611,10 @@ fn load_dyld<FS: ShimFS>(
     };
 
     // Rewrite SVC #0x80 instructions in dyld
+    log_unsupported!("load_dyld: rewriting dyld (slice len={})", slice_data.len());
     let mut rewritten = litebox_syscall_rewriter_macho::hook_syscalls_in_macho(slice_data)
         .map_err(|e| MachoLoaderError::ParseError(alloc::format!("dyld rewrite failed: {e}")))?;
+    log_unsupported!("load_dyld: rewrite done (rewritten len={})", rewritten.len());
 
     // Patch out `restartWithDyldInCache` call.
     //
@@ -742,6 +762,7 @@ fn load_dyld<FS: ShimFS>(
     .as_usize();
 
     let slide = reserved_base.wrapping_sub(page_aligned_min);
+    log_unsupported!("load_dyld: reserved at {reserved_base:#x}, slide={slide:#x}, total_span={total_span:#x}");
 
     // Map each segment
     for seg in &segments {
@@ -773,6 +794,10 @@ fn load_dyld<FS: ShimFS>(
             ))
         })?;
 
+        log_unsupported!(
+            "load_dyld: mapped segment {:?} at {vm_addr:#x} size {vm_size:#x}",
+            core::str::from_utf8(&seg.segname).unwrap_or("<invalid>")
+        );
         let file_size = seg.filesize as usize;
         if file_size > 0 {
             let file_off = seg.fileoff as usize;
@@ -786,6 +811,7 @@ fn load_dyld<FS: ShimFS>(
                 .ok_or(MachoLoaderError::MemoryError(
                     "failed to copy dyld segment data".into(),
                 ))?;
+            log_unsupported!("load_dyld: copied {file_size:#x} bytes from file offset {file_off:#x}");
         }
 
         if final_prot != litebox_common_linux::ProtFlags::PROT_READ_WRITE {
