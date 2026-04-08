@@ -294,15 +294,34 @@ impl<FS: ShimFS> Task<FS> {
 
         // ── 4. Release existing memory mappings ──
 
-        // Preserve only the shared cache — it is host-mapped memory that
-        // must survive across execve.  dyld is NOT preserved: it will be
-        // freshly re-loaded by load_macho (matching real macOS kernel
-        // behavior where dyld is mapped from disk with pristine __DATA
-        // segments on every execve).
+        // Preserve the shared cache AND its trampolines — both are needed
+        // across execve.  dyld is NOT preserved: it will be freshly
+        // re-loaded by load_macho (matching real macOS kernel behavior
+        // where dyld is mapped from disk with pristine __DATA segments on
+        // every execve).
+        //
+        // Trampolines may be placed by `find_trampoline_gap_candidates` in
+        // gaps OUTSIDE the `[cache_base, cache_end)` range (before the
+        // first extent or after the last).  We must preserve them too,
+        // otherwise `update_shared_cache_tls_addrs` will try to access
+        // unmapped memory → SIGSEGV.
         #[allow(clippy::cast_possible_truncation)]
         let cache_base = self.global.shared_cache_base.load(Ordering::Acquire) as usize;
         #[allow(clippy::cast_possible_truncation)]
         let cache_end = self.global.shared_cache_end.load(Ordering::Acquire) as usize;
+
+        // Snapshot trampoline addresses so the release closure can check
+        // them without holding the RwLock.  Only Pass 2 trampolines are
+        // in the VMA tree (Pass 3 used raw_mmap and aren't tracked), but
+        // we check all of them for robustness.
+        #[allow(clippy::cast_possible_truncation)]
+        let trampoline_addrs: alloc::vec::Vec<(usize, usize)> = {
+            let list = self.global.shared_cache_trampoline_addrs.read();
+            list.iter()
+                .map(|&(addr, size)| (addr as usize, size))
+                .collect()
+        };
+
         let release = |range: core::ops::Range<usize>, vm: litebox::mm::linux::VmFlags| {
             if vm.is_empty() {
                 return false;
@@ -310,6 +329,14 @@ impl<FS: ShimFS> Task<FS> {
             // Skip any mapping that overlaps with the shared cache region.
             if cache_base != 0 && range.start < cache_end && range.end > cache_base {
                 return false;
+            }
+            // Skip any mapping that overlaps with a shared cache trampoline.
+            // Trampolines can be in gaps outside [cache_base, cache_end).
+            for &(tramp_addr, tramp_size) in &trampoline_addrs {
+                let tramp_end = tramp_addr + tramp_size;
+                if range.start < tramp_end && range.end > tramp_addr {
+                    return false;
+                }
             }
             true
         };
