@@ -566,7 +566,15 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> anyhow::Result<Vec<u8
     }
 
     match litebox_syscall_rewriter::hook_syscalls_in_elf(data, None) {
-        Ok(rewritten) => {
+        Ok((rewritten, skipped_addrs)) => {
+            if !skipped_addrs.is_empty() {
+                eprintln!(
+                    "  warning: {} has {} unpatchable syscall instruction(s) at {:?}",
+                    path.display(),
+                    skipped_addrs.len(),
+                    skipped_addrs,
+                );
+            }
             if verbose {
                 eprintln!("  {} (rewritten)", path.display());
             }
