@@ -72,7 +72,7 @@
 //! ## Signal differences
 //!
 //! * **SIGBUS number:** macOS `SIGBUS` = 10, Linux `SIGBUS` = 7.
-//!   [`macos_signal_to_linux`] translates macOS signal numbers to their
+//!   `macos_signal_to_linux` translates macOS signal numbers to their
 //!   Linux equivalents before forwarding to the shim.
 //! * **sigreturn behavior:** macOS sigreturn clobbers `TPIDR_EL0` to the
 //!   pthread value and does **not** restore `x18`.  Signal handlers must
@@ -86,7 +86,7 @@
 //! A 32 MiB region is reserved above the main binary base to serve as the
 //! guest's brk heap.  Anonymous `mmap` calls that the macOS kernel places
 //! inside this reserved zone are retried until a non-conflicting address is
-//! obtained.  See [`litebox::mm::linux::BRK_RESERVE_SIZE`].
+//! obtained.  See `BRK_RESERVE_SIZE` in `litebox::mm`.
 //!
 //! ## ELF interpreter placement
 //!
@@ -3592,7 +3592,7 @@ unsafe fn raw_host_sigaction_install(
 static EXCEPTION_HANDLER_ONCE: std::sync::Once = std::sync::Once::new();
 
 /// Reset the exception-handler registration guard so that
-/// [`register_exception_handlers`] will re-register signal handlers on the
+/// `register_exception_handlers` will re-register signal handlers on the
 /// next call to [`MacosUserland::new`].
 ///
 /// This is intended **only** for use in a `fork()`ed child process.  After
