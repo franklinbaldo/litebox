@@ -3593,16 +3593,26 @@ fn register_exception_handlers() {
                 libc::sigaddset(&raw mut mask, interrupt_signal);
             }
             let flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
-            // Note: the handler could start running before this call even
-            // returns, so pass `&mut NEXT_SA` directly.
+            let mut old_sa: libc::sigaction = unsafe { core::mem::zeroed() };
             unsafe {
                 raw_host_sigaction_install(
                     sig,
                     exception_signal_handler as *const () as usize,
                     mask,
                     flags,
-                    &mut NEXT_SA[sig.reinterpret_as_unsigned() as usize],
+                    &mut old_sa,
                 );
+            }
+            // Guard against circular handler chain: if the old handler IS
+            // exception_signal_handler (e.g. after fork + reset_exception_handler_once),
+            // store SIG_DFL instead to avoid infinite recursion in next_signal_handler.
+            let our_handler = exception_signal_handler as *const () as usize;
+            if old_sa.sa_sigaction == our_handler {
+                old_sa.sa_sigaction = libc::SIG_DFL;
+                old_sa.sa_flags = 0;
+            }
+            unsafe {
+                NEXT_SA[sig.reinterpret_as_unsigned() as usize] = old_sa;
             }
         }
     });

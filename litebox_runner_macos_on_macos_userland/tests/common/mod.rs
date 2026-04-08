@@ -401,8 +401,11 @@ pub fn run_macho_dynamic_with_utun(
 
     // Set up a shared-memory region for the child to write the exit code
     // and diagnostic state.  Layout: [exit_code: i32, diag_state: i32]
-    // diag_state values: 0=init, 1=entered_inner, 2=run_thread_done,
-    //                    3=wait_done, 4=about_to_exit
+    // diag_state values: 0=init, 1=entered_inner, 2=reset_platform,
+    //   3=reset_exception_handler, 4=MacosUserland::new, 5=set_platform,
+    //   6=about_to_rewrite, 7=rewriter_done, 8=shim_built, 9=dyld_read,
+    //   10=load_program_done, 11=destructured, 12=register_pthread,
+    //   13=regions_built, 52=run_thread_done, 53=wait_done, 54=about_to_exit
     let shared_page: *mut i32 = unsafe {
         let ptr = libc::mmap(
             std::ptr::null_mut(),
@@ -445,7 +448,7 @@ pub fn run_macho_dynamic_with_utun(
             tun_device_name,
         );
         unsafe {
-            core::ptr::write_volatile(diag_state_ptr, 4); // about_to_exit
+            core::ptr::write_volatile(diag_state_ptr, 54); // about_to_exit
             core::ptr::write_volatile(exit_code_ptr, exit_code);
             // Use a raw SVC to call _exit(0), bypassing the shared
             // cache whose __DATA is corrupted by guest execution.
@@ -536,6 +539,17 @@ fn run_macho_dynamic_inner(
         core::ptr::write_volatile(diag_state_ptr, 1);
     } // entered_inner
 
+    // Fine-grained diagnostic helper — uses raw write(2) for signal safety.
+    #[allow(clippy::items_after_statements)]
+    #[inline(never)]
+    fn diag_write(msg: &[u8]) {
+        unsafe {
+            libc::write(2, msg.as_ptr().cast(), msg.len());
+        }
+    }
+
+    diag_write(b">>> [diag] state=1 entered_inner\n");
+
     // Re-initialize the platform in the child process.  macOS Hypervisor
     // framework state does not survive fork() — we must create a fresh one.
     // The parent's OnceRef is already set (inherited), so we must reset it
@@ -549,10 +563,24 @@ fn run_macho_dynamic_inner(
     // guest page faults are handled incorrectly.
     unsafe {
         litebox_platform_multiplex::reset_platform();
+    }
+    diag_write(b">>> [diag] state=2 reset_platform done\n");
+    unsafe { core::ptr::write_volatile(diag_state_ptr, 2); }
+
+    unsafe {
         litebox_platform_macos_userland::reset_exception_handler_once();
     }
+    diag_write(b">>> [diag] state=3 reset_exception_handler_once done\n");
+    unsafe { core::ptr::write_volatile(diag_state_ptr, 3); }
+
     let platform = litebox_platform_macos_userland::MacosUserland::new(tun_device_name);
+    diag_write(b">>> [diag] state=4 MacosUserland::new done\n");
+    unsafe { core::ptr::write_volatile(diag_state_ptr, 4); }
+
     litebox_platform_multiplex::set_platform(platform);
+    diag_write(b">>> [diag] state=5 set_platform done\n");
+    unsafe { core::ptr::write_volatile(diag_state_ptr, 5); }
+
     litebox_common_linux::HOST_TLS_TABLE_ADDR.store(0, std::sync::atomic::Ordering::Release);
 
     // Rewrite the guest binary through the syscall rewriter so that inline
@@ -567,8 +595,12 @@ fn run_macho_dynamic_inner(
     // System binaries (fat/universal Mach-Os, or other unsupported formats)
     // may fail to parse — this is fine because they only call libc from the
     // shared cache (whose SVCs pass through to the host kernel).
+    diag_write(b">>> [diag] state=6 about to rewrite binary\n");
+    unsafe { core::ptr::write_volatile(diag_state_ptr, 6); }
     let rewritten_data = litebox_syscall_rewriter_macho::hook_syscalls_in_macho(binary_data).ok();
     let effective_binary = rewritten_data.as_deref().unwrap_or(binary_data);
+    diag_write(b">>> [diag] state=7 rewriter done\n");
+    unsafe { core::ptr::write_volatile(diag_state_ptr, 7); }
 
     let mut shim_builder =
         litebox_shim_macos::MacosShimBuilder::<litebox_shim_macos::DefaultFS>::new();
@@ -610,6 +642,8 @@ fn run_macho_dynamic_inner(
     let fs = shim_builder.default_fs(in_mem_fs, tar_ro_fs);
     shim_builder.set_fs(fs);
     let shim = shim_builder.build();
+    diag_write(b">>> [diag] state=8 shim built\n");
+    unsafe { core::ptr::write_volatile(diag_state_ptr, 8); }
 
     // Use absolute path for argv[0] so dyld can resolve executable_path.
     let exe_path = format!("/usr/bin/{exe_name}");
@@ -626,6 +660,8 @@ fn run_macho_dynamic_inner(
     // by the shim and would crash because no TLS entry or TCB exists
     // for the install thread.
     let dyld_data = std::fs::read("/usr/lib/dyld").expect("failed to read /usr/lib/dyld");
+    diag_write(b">>> [diag] state=9 dyld read done\n");
+    unsafe { core::ptr::write_volatile(diag_state_ptr, 9); }
 
     // Load the program (parses Mach-O, allocates stack, etc.) before
     // install_shared_cache for the same reason: load_program uses the
@@ -777,7 +813,7 @@ fn run_macho_dynamic_inner(
         litebox_platform_macos_userland::run_thread(entrypoints, &mut initial_ctx);
     }
     unsafe {
-        core::ptr::write_volatile(diag_state_ptr, 2);
+        core::ptr::write_volatile(diag_state_ptr, 52);
     } // run_thread_done
 
     // Signal the network polling thread to shut down.  This is a pure
@@ -801,7 +837,7 @@ fn run_macho_dynamic_inner(
 
     let exit_code = process.wait();
     unsafe {
-        core::ptr::write_volatile(diag_state_ptr, 3);
+        core::ptr::write_volatile(diag_state_ptr, 53);
     } // wait_done
     exit_code
 }
