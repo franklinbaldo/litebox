@@ -370,6 +370,21 @@ pub(crate) fn load<FS: ShimFS>(
         task.global.update_shared_cache_tls_addrs(tls_table_addr);
     }
 
+    // Register the current host thread in the NEW TLS table so that
+    // subsequent libc calls (sys_mprotect, set_initial_brk, load_dyld)
+    // that go through patched shared-cache SVCs can find this thread's
+    // TCB.  Without this, the trampoline's linear scan hits only sentinel
+    // entries and crashes with BRK #1 (SIGSEGV).
+    //
+    // This is only needed during re-exec (execve): on first exec the
+    // shared cache SVCs are not yet patched, so libc calls go directly
+    // to the kernel.  On re-exec, install_shared_cache has already
+    // patched them.
+    #[cfg(feature = "platform_macos_userland")]
+    {
+        litebox_platform_macos_userland::update_host_tls_entry();
+    }
+
     // --- Initialize trampoline callback address (if __LITEBOX segment exists) ---
     //
     // The __LITEBOX segment contains the trampoline code emitted by the

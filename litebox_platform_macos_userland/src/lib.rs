@@ -2835,7 +2835,20 @@ extern "C-unwind" fn exception_handler(
 const TLS_TABLE_ENTRIES: usize = 256;
 const TLS_TABLE_SENTINEL: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 
-fn update_host_tls_entry() {
+/// Register (or update) the current host thread in the TLS lookup table.
+///
+/// Must be called after a new TLS table is allocated and the trampoline
+/// headers are updated (e.g. after execve re-creates the TLS table),
+/// so that subsequent libc calls through patched shared-cache SVCs can
+/// find this thread's TCB via the TPIDRRO_EL0 key.
+///
+/// Returns silently if no TLS table is allocated or if the current
+/// thread has no TCB (e.g. during first exec before `run_thread`).
+///
+/// # Panics
+///
+/// Panics if the TLS table is full (more than 256 concurrent threads).
+pub fn update_host_tls_entry() {
     use core::sync::atomic::{AtomicU64, Ordering};
 
     let table_addr = litebox_common_linux::HOST_TLS_TABLE_ADDR.load(Ordering::Acquire);
@@ -2844,7 +2857,9 @@ fn update_host_tls_entry() {
     }
 
     let tcb = TCB_PTR.get();
-    assert!(!tcb.is_null(), "update_host_tls_entry called without TCB");
+    if tcb.is_null() {
+        return; // No TCB yet (first exec, before run_thread)
+    }
     let host_tls = tcb as usize;
 
     // TPIDRRO_EL0 is the lookup key — stable per-pthread, never clobbered.
