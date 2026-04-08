@@ -1773,22 +1773,49 @@ impl<FS: ShimFS> GlobalState<FS> {
                 // raw_mmap(MAP_FIXED), which atomically replaces the old
                 // mapping with a new private anonymous page.
                 //
+                // CRITICAL: We must NOT use any heap allocation (alloc::vec!,
+                // Box, etc.) here because malloc goes through the shared cache
+                // SVCs whose trampolines still have the STALE TLS address —
+                // causing SIGSEGV. All memory must come from raw_mmap (inline
+                // asm syscall that bypasses the patched SVCs entirely).
+                //
                 // Steps:
-                // 1. Read the existing R-X trampoline data into a buffer
-                // 2. raw_mmap(MAP_FIXED) to get a fresh RW page
-                // 3. Copy the saved data back with the updated TLS address
-                // 4. raw_mprotect to R-X (succeeds on private anonymous pages)
+                // 1. Allocate a temporary buffer via raw_mmap (NOT heap)
+                // 2. Read the existing R-X trampoline data into the buffer
+                // 3. raw_mmap(MAP_FIXED) to replace the trampoline page
+                // 4. Copy the saved data back with the updated TLS address
+                // 5. raw_mprotect to R-X (succeeds on private anonymous pages)
+                // 6. Free the temporary buffer via raw_munmap
 
-                // Step 1: Read existing data (page is currently R-X = readable).
-                let src = unsafe {
-                    core::slice::from_raw_parts(tramp_addr_usize as *const u8, tramp_size)
+                // Step 1: Allocate temporary save buffer via raw_mmap.
+                let save_buf = unsafe {
+                    raw_mmap(
+                        0,
+                        tramp_size,
+                        RAW_PROT_READ | RAW_PROT_WRITE,
+                        RAW_MAP_ANON | RAW_MAP_PRIVATE,
+                    )
                 };
-                // Use a fixed-size stack buffer for small trampolines, heap for large.
-                // Most trampolines are 16KB-64KB.
-                let mut saved = alloc::vec![0u8; tramp_size];
-                saved.copy_from_slice(src);
+                let save_buf = match save_buf {
+                    Ok(addr) => addr,
+                    Err(errno) => {
+                        log_unsupported!(
+                            "update_shared_cache_tls_addrs: raw_mmap for temp buffer failed (errno={errno})"
+                        );
+                        continue;
+                    }
+                };
 
-                // Step 2: Replace with fresh anonymous RW page.
+                // Step 2: Copy existing trampoline data (page is R-X = readable).
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        tramp_addr_usize as *const u8,
+                        save_buf as *mut u8,
+                        tramp_size,
+                    );
+                }
+
+                // Step 3: Replace trampoline with fresh anonymous RW page.
                 let mmap_result = unsafe {
                     raw_mmap(
                         tramp_addr_usize,
@@ -1798,17 +1825,27 @@ impl<FS: ShimFS> GlobalState<FS> {
                     )
                 };
                 if mmap_result.is_err() {
+                    // Clean up temp buffer and skip this trampoline.
+                    unsafe { let _ = raw_munmap(save_buf, tramp_size); }
                     log_unsupported!(
                         "update_shared_cache_tls_addrs: raw_mmap MAP_FIXED failed for tramp at {tramp_addr_usize:#x}"
                     );
                     continue;
                 }
 
-                // Step 3: Copy saved data back.
-                let dst = unsafe {
-                    core::slice::from_raw_parts_mut(tramp_addr_usize as *mut u8, tramp_size)
-                };
-                dst.copy_from_slice(&saved);
+                // Step 4: Copy saved data back to the (now-writable) trampoline.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        save_buf as *const u8,
+                        tramp_addr_usize as *mut u8,
+                        tramp_size,
+                    );
+                }
+
+                // Step 5 (below): write new TLS + mprotect RX.
+
+                // Step 6: Free temporary buffer.
+                unsafe { let _ = raw_munmap(save_buf, tramp_size); }
             }
 
             // Write the new TLS table address at offset 8 using volatile writes
@@ -2221,6 +2258,7 @@ const RAW_MAP_FIXED: i32 = 0x0010;
 /// macOS BSD syscall numbers (from <sys/syscall.h>).
 const SYS_MMAP: u64 = 197;
 const SYS_MPROTECT: u64 = 74;
+const SYS_MUNMAP: u64 = 73;
 
 /// Raw `mmap(addr, len, prot, flags, fd=-1, offset=0)` via inline assembly.
 ///
@@ -2283,6 +2321,37 @@ unsafe fn raw_mprotect(addr: usize, len: usize, prot: i32) -> Result<(), i32> {
             in("x0") addr as u64,
             in("x1") len as u64,
             in("x2") prot as u64,
+            err = out(reg) err_flag,
+            lateout("x0") ret,
+            out("x16") _,
+        );
+    }
+    if err_flag != 0 {
+        Err(ret as i32)
+    } else {
+        Ok(())
+    }
+}
+
+/// Raw `munmap(addr, len)` via inline assembly.
+///
+/// Returns `Ok(())` or `Err(errno)`.
+///
+/// # Safety
+///
+/// Caller must ensure arguments are valid for the munmap syscall.
+#[allow(clippy::cast_possible_truncation)]
+unsafe fn raw_munmap(addr: usize, len: usize) -> Result<(), i32> {
+    let ret: u64;
+    let err_flag: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov x16, {syscall_nr}",
+            "svc #0x80",
+            "cset {err}, cs",
+            syscall_nr = in(reg) SYS_MUNMAP,
+            in("x0") addr as u64,
+            in("x1") len as u64,
             err = out(reg) err_flag,
             lateout("x0") ret,
             out("x16") _,
