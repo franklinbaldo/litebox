@@ -567,9 +567,18 @@ fn hook_syscalls_in_section(
             // that SA_RESTART can rewind ctx.rip to re-enter the trampoline.
             // The real `syscall` instruction clobbers R11 with RFLAGS, so
             // this register is free from the guest's perspective.
+            //
+            // CONTRACT: R11 carries the call-site restart address from this
+            // point until the platform callback saves it to a dedicated TLS
+            // variable (saved_restart_addr). The platform MUST preserve R11
+            // before any clobbering instructions (fsbase swap, TLS lookup).
             // LEA R11, [RIP + disp32] = 4C 8D 1D <disp32>
-            let r11_disp = i64::try_from(replace_start).unwrap()
-                - i64::try_from(trampoline_base_addr + trampoline_data.len() as u64 + 7).unwrap();
+            let r11_rip = checked_add_u64(
+                trampoline_base_addr,
+                trampoline_data.len() as u64 + 7,
+                "x86_64 trampoline R11 displacement base",
+            )?;
+            let r11_disp = i64::try_from(replace_start).unwrap() - i64::try_from(r11_rip).unwrap();
             trampoline_data.extend_from_slice(&[0x4C, 0x8D, 0x1D]); // LEA R11, [RIP + disp32]
             trampoline_data.extend_from_slice(&(i32::try_from(r11_disp).unwrap().to_le_bytes()));
 
@@ -1190,9 +1199,18 @@ fn hook_syscall_and_after(
 
         // Put the address of the original JMP (call-site) into R11 so
         // that SA_RESTART can rewind ctx.rip to re-enter the trampoline.
+        //
+        // CONTRACT: R11 carries the call-site restart address from this
+        // point until the platform callback saves it to a dedicated TLS
+        // variable (saved_restart_addr). The platform MUST preserve R11
+        // before any clobbering instructions (fsbase swap, TLS lookup).
         // LEA R11, [RIP + disp32] = 4C 8D 1D <disp32>
-        let r11_disp = i64::try_from(replace_start).unwrap()
-            - i64::try_from(trampoline_base_addr + trampoline_data.len() as u64 + 7).unwrap();
+        let r11_rip = checked_add_u64(
+            trampoline_base_addr,
+            trampoline_data.len() as u64 + 7,
+            "x86_64 trampoline R11 displacement base",
+        )?;
+        let r11_disp = i64::try_from(replace_start).unwrap() - i64::try_from(r11_rip).unwrap();
         trampoline_data.extend_from_slice(&[0x4C, 0x8D, 0x1D]); // LEA R11, [RIP + disp32]
         trampoline_data.extend_from_slice(&(i32::try_from(r11_disp).unwrap().to_le_bytes()));
 

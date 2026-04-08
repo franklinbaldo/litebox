@@ -195,7 +195,13 @@ impl<'a> FileAndParsed<'a> {
         let file = ElfFileInMemory::new(task, elf_buf);
         let mut parsed = litebox_common_linux::loader::ElfParsedFile::parse(&mut &file)
             .map_err(ElfLoaderError::ParseError)?;
-        parsed.parse_trampoline(&mut &file, task.global.platform.get_syscall_entry_point())?;
+        match parsed.parse_trampoline(&mut &file, task.global.platform.get_syscall_entry_point()) {
+            Ok(()) | Err(litebox_common_linux::loader::ElfParseError::UnpatchedBinary) => {
+                // Unpatched binary is expected in the LVBS scenario where not
+                // all binaries are rewritten. Proceed without a trampoline.
+            }
+            Err(e) => return Err(ElfLoaderError::ParseError(e)),
+        }
         Ok(Self { file, parsed })
     }
 }

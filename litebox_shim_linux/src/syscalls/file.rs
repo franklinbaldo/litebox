@@ -2016,8 +2016,14 @@ impl<FS: ShimFS> Task<FS> {
                     Ok(oldfd)
                 };
             }
-            // Close whatever is at newfd before duping into it
+            // Close whatever is at newfd before duping into it.
+            // Finalize any in-progress ELF patching for the target fd first,
+            // since dup2/dup3 implicitly closes it without going through
+            // sys_close.
             let newfd_usize = usize::try_from(newfd).or(Err(Errno::EBADF))?;
+            if let Ok(fd) = i32::try_from(newfd) {
+                self.finalize_elf_patch(fd);
+            }
             let _ = self.do_close(newfd_usize);
             self.do_dup_inner(
                 oldfd_usize,
