@@ -44,6 +44,10 @@ pub struct MachoLoadInfo {
     pub is_lc_main: bool,
     /// True if the binary has an LC_LOAD_DYLINKER command.
     pub has_dylinker: bool,
+    /// The base address of the reserved memory region (for diagnostics).
+    pub reserved_base: usize,
+    /// The slide applied to the binary segments (for diagnostics).
+    pub slide: usize,
 }
 
 /// Load info returned by `load_dyld`.

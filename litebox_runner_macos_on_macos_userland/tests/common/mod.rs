@@ -4,6 +4,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, Once};
 
+use litebox::platform::SystemInfoProvider as _;
+
 pub mod shared_cache;
 
 /// Resolve a symbol from `libsystem_pthread.dylib` using `dlsym`.
@@ -279,6 +281,13 @@ pub fn rewrite_macho(input: &Path) -> Vec<u8> {
 pub fn run_macho_binary(binary_data: &[u8], argv: &[&str]) -> (i32, Vec<u8>) {
     use litebox::fs::{FileSystem as _, Mode};
 
+    // Print the host process base address for conflict detection.
+    eprintln!(
+        ">>> [static] host: run_macho_binary={:#x} main={:#x}",
+        run_macho_binary as *const () as usize,
+        ensure_platform as *const () as usize,
+    );
+
     // Serialize: only one test can use the platform + TLS table at a time.
     let _guard = TEST_LOCK
         .lock()
@@ -321,7 +330,16 @@ pub fn run_macho_binary(binary_data: &[u8], argv: &[&str]) -> (i32, Vec<u8>) {
         entrypoints,
         process,
         mut initial_ctx,
+        reserved_base,
+        slide,
     } = program;
+
+    let tls_table = litebox_common_linux::HOST_TLS_TABLE_ADDR.load(std::sync::atomic::Ordering::Acquire);
+    let callback = litebox_platform_multiplex::platform().get_syscall_entry_point();
+    eprintln!(
+        ">>> [static] load_program done: entry_pc={:#x} sp={:#x} reserved_base={:#x} slide={:#x} binary_len={} tls_table={:#x} callback={:#x}",
+        initial_ctx.pc, initial_ctx.sp, reserved_base, slide, binary_data.len(), tls_table, callback
+    );
 
     unsafe {
         litebox_platform_macos_userland::run_thread(entrypoints, &mut initial_ctx);
@@ -615,12 +633,21 @@ fn run_macho_dynamic_inner(
     let program = shim
         .load_program(effective_binary, argv_cstrings, envp, Some(&dyld_data))
         .expect("load_program failed");
+    unsafe { core::ptr::write_volatile(diag_state_ptr, 10); } // load_program done
+
+    eprintln!(
+        ">>> [dynamic] load_program done: entry_pc={:#x} sp={:#x} reserved_base={:#x} slide={:#x} binary_len={}",
+        program.initial_ctx.pc, program.initial_ctx.sp, program.reserved_base, program.slide, effective_binary.len()
+    );
 
     let litebox_shim_macos::LoadedProgram {
         entrypoints,
         process,
         mut initial_ctx,
+        reserved_base: _,
+        slide: _,
     } = program;
+    unsafe { core::ptr::write_volatile(diag_state_ptr, 11); } // destructured
 
     // Synthetically register pthread thread-start addresses.
     //
@@ -631,6 +658,7 @@ fn run_macho_dynamic_inner(
     // pthsize = page_align(0x18E0) on 16K-page aarch64 = 0x4000
     // tsd_offset = 0xA0 (from disassembly of __pthread_bsdthread_init)
     process.register_pthread_info(thread_start_addr, start_wqthread_addr, 0x4000, 0xA0);
+    unsafe { core::ptr::write_volatile(diag_state_ptr, 12); } // register_pthread_info done
 
     // Install shared cache regions into guest address space.
     // Global mapping regions were already mmap'd at guest addresses by
@@ -643,6 +671,22 @@ fn run_macho_dynamic_inner(
     // any SVC goes through the trampoline.  Threads NOT in the TLS
     // table (this thread, the network thread) use the passthrough
     // path and execute real SVCs, so libc calls still work here.
+    eprintln!(
+        ">>> [dynamic] cache: host_base={:#x} regions={} preinstalled={}",
+        cache.host_cache_base,
+        cache.regions.len(),
+        cache.preinstalled_extents.len(),
+    );
+    // Print first few region addresses
+    for (i, r) in cache.regions.iter().enumerate().take(5) {
+        eprintln!(
+            ">>>   region[{}]: guest_addr={:#x} len={:#x} prot={:?}",
+            i, r.guest_addr, r.data().len(), r.prot
+        );
+    }
+    if cache.regions.len() > 5 {
+        eprintln!(">>>   ... and {} more regions", cache.regions.len() - 5);
+    }
     let regions_for_shim: Vec<(u64, &[u8], bool)> = cache
         .regions
         .iter()
@@ -651,6 +695,16 @@ fn run_macho_dynamic_inner(
             (r.guest_addr, r.data(), is_exec)
         })
         .collect();
+    unsafe { core::ptr::write_volatile(diag_state_ptr, 13); } // regions_for_shim built
+
+    eprintln!(
+        ">>> [dynamic] regions_for_shim: count={} preinstalled={} patch_text={} reset_data={} demand_pages={}",
+        regions_for_shim.len(),
+        cache.preinstalled_extents.len(),
+        cache.patch_in_place_text.len(),
+        cache.reset_in_place_data.len(),
+        cache.demand_page_sources.len(),
+    );
     eprintln!(">>> about to install_shared_cache");
     shim.install_shared_cache(
         cache.host_cache_base,

@@ -88,6 +88,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         entrypoints,
         process,
         mut initial_ctx,
+        ..
     } = program;
 
     // Run thread

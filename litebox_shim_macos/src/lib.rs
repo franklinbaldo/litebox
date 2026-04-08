@@ -479,6 +479,8 @@ impl<FS: ShimFS> MacosShim<FS> {
             entrypoints,
             process: MacosShimProcess(process),
             initial_ctx,
+            reserved_base: load_info.reserved_base,
+            slide: load_info.slide,
         })
     }
 
@@ -1328,6 +1330,10 @@ pub struct LoadedProgram<FS: ShimFS> {
     pub process: MacosShimProcess,
     /// The initial register state.
     pub initial_ctx: PtRegs,
+    /// The base address of the reserved memory region (for diagnostics).
+    pub reserved_base: usize,
+    /// The slide applied to the binary segments (for diagnostics).
+    pub slide: usize,
 }
 
 /// A handle to a process loaded via [`MacosShim::load_program`].

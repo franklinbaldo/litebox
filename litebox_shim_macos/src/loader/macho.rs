@@ -528,6 +528,8 @@ pub(crate) fn load<FS: ShimFS>(
         user_stack_top: stack.get_cur_stack_top(),
         is_lc_main: final_is_lc_main,
         has_dylinker,
+        reserved_base,
+        slide,
     })
 }
 
