@@ -283,9 +283,8 @@ impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
                 .read_at(0, &mut buf)
                 .map_err(ElfLoaderError::OpenError)?;
 
-            let mut skipped_addrs = alloc::vec::Vec::new();
-            match litebox_syscall_rewriter::hook_syscalls_in_elf(&buf, None, &mut skipped_addrs) {
-                Ok(patched) => {
+            match litebox_syscall_rewriter::hook_syscalls_in_elf(&buf, None) {
+                Ok((patched, skipped_addrs)) => {
                     if !skipped_addrs.is_empty() {
                         litebox::log_println!(
                             task.global.platform,
@@ -304,8 +303,8 @@ impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
                     Some(patched)
                 }
                 Err(
-                    litebox_syscall_rewriter::Error::UnsupportedBunExecutable
-                    | litebox_syscall_rewriter::Error::UnsupportedObjectFile
+                    litebox_syscall_rewriter::Error::UnsupportedExecutable(_)
+                    | litebox_syscall_rewriter::Error::UnsupportedObjectFile(_)
                     | litebox_syscall_rewriter::Error::NoTextSectionFound
                     | litebox_syscall_rewriter::Error::NoSyscallInstructionsFound
                     | litebox_syscall_rewriter::Error::AlreadyHooked,

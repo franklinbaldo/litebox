@@ -562,7 +562,7 @@ unsafe extern "C-unwind" fn run_thread_arch(thread_ctx: &mut ThreadContext, tls_
     // All other registers hold guest state.
     .globl  syscall_callback_redzone
 syscall_callback_redzone:
-    // Save guest R11 (restart address from rewriter trampoline) on the
+    // Save guest R11 (restart address from rewriter trampoline) to
     // TEB.ArbitraryUserPointer (gs:[0x28]) before the TLS index lookup
     // clobbers R11.  This slot is per-thread and the window is very
     // narrow: only ~20 instructions of inline asm with no API calls,
@@ -573,7 +573,10 @@ syscall_callback_redzone:
     mov     r11d, DWORD PTR [rip + {TLS_INDEX}]
     mov     r11, QWORD PTR gs:[r11 * 8 + TEB_TLS_SLOTS_OFFSET]
     mov     BYTE PTR [r11 + {IS_IN_GUEST}], 0
-    // Move the restart address from the stack into the TLS field.
+    // Recover the restart address from the TEB slot and store it in TLS.
+    // We use SCRATCH as a temporary since all guest GPRs must be preserved
+    // and RSP modifications would break the stack pointer recovery below.
+    push    QWORD PTR gs:[0x28]
     pop     QWORD PTR [r11 + {SAVED_RESTART_ADDR}]
     // Recover the architectural guest stack pointer (undo the 128-byte
     // red zone reservation) and store it in SCRATCH.  LEA is used instead

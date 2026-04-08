@@ -772,22 +772,26 @@ impl<FS: ShimFS> Task<FS> {
         let trampoline_write_vaddr = (state.trampoline_addr + state.trampoline_cursor) as u64;
         let syscall_entry_addr = state.trampoline_addr as u64;
 
-        let mut skipped_addrs = alloc::vec::Vec::new();
         let patch_result = litebox_syscall_rewriter::patch_code_segment(
             &mut code_buf,
             code_vaddr,
             trampoline_write_vaddr,
             syscall_entry_addr,
-            &mut skipped_addrs,
         );
-        if !skipped_addrs.is_empty() {
-            litebox::log_println!(
-                self.global.platform,
-                "warning: {} syscall instruction(s) could not be patched (addresses: {:?})",
-                skipped_addrs.len(),
-                skipped_addrs,
-            );
-        }
+        let patch_result = match patch_result {
+            Ok((stubs, addrs)) => {
+                if !addrs.is_empty() {
+                    litebox::log_println!(
+                        self.global.platform,
+                        "warning: {} syscall instruction(s) could not be patched (addresses: {:?})",
+                        addrs.len(),
+                        addrs,
+                    );
+                }
+                Ok(stubs)
+            }
+            Err(e) => Err(e),
+        };
         match patch_result {
             Ok(stubs) if !stubs.is_empty() => {
                 let Some(new_cursor) = state.trampoline_cursor.checked_add(stubs.len()) else {
