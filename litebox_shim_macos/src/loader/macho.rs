@@ -1024,7 +1024,7 @@ fn patch_restart_with_dyld_in_cache(data: &mut [u8]) {
 /// ```
 ///
 /// We scan for the unique five-instruction signature:
-///     ldrh w8, [x0, #0x2c]  /  tbz w8, #0, +0xC  /
+///     ldrh w8, \[x0, #0x2c\]  /  tbz w8, #0, +0xC  /
 ///     mov x0, x20  /  mov x1, x19  /  bl ...
 /// and NOP the BL.
 ///

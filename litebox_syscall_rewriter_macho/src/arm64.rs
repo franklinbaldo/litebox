@@ -290,7 +290,7 @@ fn encode_brk(imm16: u16) -> u32 {
 
 /// Encode `STP Xt1, Xt2, [Xn, #imm]` (store pair, 64-bit, signed offset).
 ///
-/// The offset must be a multiple of 8 and within [-512, 504].
+/// The offset must be a multiple of 8 and within \[-512, 504\].
 pub fn encode_stp_offset(rt: u8, rt2: u8, rn: u8, imm_bytes: i16) -> Option<u32> {
     if imm_bytes % 8 != 0 {
         return None;
@@ -312,7 +312,7 @@ pub fn encode_stp_offset(rt: u8, rt2: u8, rn: u8, imm_bytes: i16) -> Option<u32>
 
 /// Encode `LDP Xt1, Xt2, [Xn, #imm]` (load pair, 64-bit, signed offset).
 ///
-/// The offset must be a multiple of 8 and within [-512, 504].
+/// The offset must be a multiple of 8 and within \[-512, 504\].
 fn encode_ldp_offset(rt: u8, rt2: u8, rn: u8, imm_bytes: i16) -> Option<u32> {
     if imm_bytes % 8 != 0 {
         return None;
@@ -650,7 +650,7 @@ pub fn emit_shared_svc_handler_macos(
 
 /// Emit a per-site SVC gate for macOS.
 ///
-/// 7 instructions, 28 bytes, 48-byte frame (includes x18 save at [SP+32]).
+/// 7 instructions, 28 bytes, 48-byte frame (includes x18 save at \[SP+32\]).
 ///
 /// ```text
 /// [0] SUB  SP, SP, #48            ; 48-byte frame
