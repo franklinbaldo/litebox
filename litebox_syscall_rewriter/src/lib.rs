@@ -153,7 +153,14 @@ pub fn hook_syscalls_in_elf(
     fixup_phdr_alignment(buf);
 
     // Parse the ELF and extract all metadata we need, then drop the borrow so we can mutate buf.
-    let (arch, dl_sysinfo_int80, text_sections, control_transfer_targets, trampoline_base_addr) = {
+    let (
+        arch,
+        dl_sysinfo_int80,
+        text_sections,
+        control_transfer_targets,
+        trampoline_base_addr,
+        fork_to_vfork_patch,
+    ) = {
         let file = object::File::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
 
         let arch = match file {
@@ -178,12 +185,15 @@ pub fn hook_syscalls_in_elf(
 
         let trampoline_base_addr = find_addr_for_trampoline_code(&file)?;
 
+        let fork_to_vfork_patch = find_fork_vfork_patch(&file, &text_sections);
+
         (
             arch,
             dl_sysinfo_int80,
             text_sections,
             control_transfer_targets,
             trampoline_base_addr,
+            fork_to_vfork_patch,
         )
     };
 
@@ -246,7 +256,7 @@ pub fn hook_syscalls_in_elf(
             };
             out.extend_from_slice(header.as_bytes());
         }
-        return Ok(out);
+        return Ok((out, skipped_addrs));
     }
 
     // Patch fork → vfork: overwrite the first bytes of __libc_fork with a
@@ -539,7 +549,7 @@ fn hook_syscalls_in_section(
                     ) {
                         Ok(()) => {}
                         Err(Error::InsufficientBytesBeforeOrAfter(_)) => {
-                            replace_with_ud2(section_data, section_base_addr, inst);
+                            replace_with_trap(section_data, section_base_addr, inst);
                             skipped_addrs.push(inst.ip());
                         }
                         Err(e) => return Err(e),
@@ -848,12 +858,6 @@ fn find_fork_vfork_patch(
     let rel32 = i32::try_from(rel32).ok()?;
 
     Some((fork_file_offset, fork_patch_end, rel32))
-}
-
-/// Check if the input binary has the Bun footer marker near the end.
-fn has_bun_footer_marker(input_binary: &[u8]) -> bool {
-    input_binary.len() >= BUN_FOOTER_MARKER.len()
-        && input_binary[input_binary.len() - BUN_FOOTER_MARKER.len()..] == *BUN_FOOTER_MARKER
 }
 
 /// Replace an unpatchable syscall instruction with `ICEBP; HLT` (`F1 F4`) so
