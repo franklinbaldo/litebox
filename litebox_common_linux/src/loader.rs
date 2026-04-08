@@ -582,9 +582,9 @@ impl ReadAt for &[u8] {
 
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
         let offset: usize = offset.truncate();
-        let end = offset.checked_add(buf.len()).ok_or(Errno::ENODATA)?;
+        let end = offset.checked_add(buf.len()).ok_or(Errno::EINVAL)?;
         if end > self.len() {
-            return Err(Errno::ENODATA);
+            return Err(Errno::EINVAL);
         }
         buf.copy_from_slice(&self[offset..end]);
         Ok(())

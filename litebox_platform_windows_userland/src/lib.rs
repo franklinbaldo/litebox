@@ -414,6 +414,10 @@ struct TlsState {
     host_bp: Cell<*mut u128>,
     guest_context_top: Cell<*mut litebox_common_linux::PtRegs>,
     scratch: Cell<usize>,
+    /// Syscall call-site restart address from the rewriter trampoline,
+    /// saved here for future SA_RESTART support. Not stored in pt_regs
+    /// (which holds RFLAGS in the r11 slot per the kernel ABI).
+    saved_restart_addr: Cell<usize>,
     is_in_guest: Cell<bool>,
     interrupt: Cell<bool>,
     continue_context:
@@ -433,6 +437,7 @@ impl TlsState {
             host_bp: Cell::new(core::ptr::null_mut()),
             guest_context_top: core::ptr::null_mut::<litebox_common_linux::PtRegs>().into(),
             scratch: 0.into(),
+            saved_restart_addr: 0.into(),
             is_in_guest: false.into(),
             interrupt: false.into(),
             continue_context: Box::default(),
@@ -557,7 +562,7 @@ unsafe extern "C-unwind" fn run_thread_arch(thread_ctx: &mut ThreadContext, tls_
     // All other registers hold guest state.
     .globl  syscall_callback_redzone
 syscall_callback_redzone:
-    // Save guest R11 (restart address from rewriter trampoline) into
+    // Save guest R11 (restart address from rewriter trampoline) on the
     // TEB.ArbitraryUserPointer (gs:[0x28]) before the TLS index lookup
     // clobbers R11.  This slot is per-thread and the window is very
     // narrow: only ~20 instructions of inline asm with no API calls,
@@ -568,6 +573,8 @@ syscall_callback_redzone:
     mov     r11d, DWORD PTR [rip + {TLS_INDEX}]
     mov     r11, QWORD PTR gs:[r11 * 8 + TEB_TLS_SLOTS_OFFSET]
     mov     BYTE PTR [r11 + {IS_IN_GUEST}], 0
+    // Move the restart address from the stack into the TLS field.
+    pop     QWORD PTR [r11 + {SAVED_RESTART_ADDR}]
     // Recover the architectural guest stack pointer (undo the 128-byte
     // red zone reservation) and store it in SCRATCH.  LEA is used instead
     // of ADD to avoid clobbering RFLAGS before pushfq.
@@ -594,8 +601,7 @@ syscall_callback_redzone:
     push    r8          // pt_regs->r8
     push    r9          // pt_regs->r9
     push    r10         // pt_regs->r10
-    mov     r10, gs:[0x28]          // recover guest R11 saved at entry
-    push    r10         // pt_regs->r11 = guest R11 (restart addr from rewriter)
+    push    [rsp + 88]  // pt_regs->r11 = rflags (matching real syscall ABI)
     push    rbx         // pt_regs->bx
     push    rbp         // pt_regs->bp
     push    r12
@@ -660,6 +666,7 @@ interrupt_callback:
     HOST_BP = const core::mem::offset_of!(TlsState, host_bp),
     GUEST_CONTEXT_TOP = const core::mem::offset_of!(TlsState, guest_context_top),
     SCRATCH = const core::mem::offset_of!(TlsState, scratch),
+    SAVED_RESTART_ADDR = const core::mem::offset_of!(TlsState, saved_restart_addr),
     IS_IN_GUEST = const core::mem::offset_of!(TlsState, is_in_guest),
     );
 }

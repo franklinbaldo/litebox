@@ -181,6 +181,12 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for PatchedMapper<'_, '
     ) -> Result<(), Self::Error> {
         // Allocate anonymous RW pages, copy from the in-memory buffer, then
         // apply the requested protection.
+        //
+        // TODO: if the copy or protect step fails, the pages allocated by
+        // map_zero are leaked because the MapMemory trait has no unmap
+        // method, and no caller cleans up partially-mapped segments either.
+        // Add an `unmap` method to MapMemory and clean up the reserved
+        // region on failure in ElfParsedFile::load().
         self.inner.map_zero(
             address,
             len,

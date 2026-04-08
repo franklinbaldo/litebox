@@ -444,6 +444,12 @@ impl<FS: ShimFS> Task<FS> {
         let e_phnum = u16::from_le_bytes(ehdr_buf[56..58].try_into().unwrap()) as usize;
         let e_type = u16::from_le_bytes(ehdr_buf[16..18].try_into().unwrap());
 
+        // Validate e_phentsize: must be at least sizeof(Elf64_Phdr) = 56 bytes,
+        // otherwise the field accesses (e.g. ph[40..48] for p_memsz) will panic.
+        if e_phentsize < 56 {
+            return;
+        }
+
         // Read program headers to find max PT_LOAD end
         let phdrs_size = e_phentsize * e_phnum;
         if phdrs_size == 0 || phdrs_size > 0x10000 {
@@ -518,26 +524,40 @@ impl<FS: ShimFS> Task<FS> {
     /// Check if a file has the LITEBOX trampoline magic at its tail.
     /// Returns (is_pre_patched, file_offset, vaddr, trampoline_size).
     fn check_trampoline_magic(&self, fd: i32) -> (bool, u64, u64, u64) {
+        let header_size: usize = if cfg!(target_pointer_width = "64") {
+            32 // TrampolineHeader64: magic(8) + file_offset(8) + vaddr(8) + size(8)
+        } else {
+            20 // TrampolineHeader32: magic(8) + file_offset(4) + vaddr(4) + size(4)
+        };
         let Ok(stat) = self.sys_fstat(fd) else {
             return (false, 0, 0, 0);
         };
         let file_size = stat.st_size;
-        if file_size < 32 {
+        if file_size < header_size {
             return (false, 0, 0, 0);
         }
-        let mut tail = [0u8; 32];
-        match self.sys_read(fd, &mut tail, Some(file_size - 32)) {
+        let mut tail = [0u8; 32]; // max header size
+        let tail = &mut tail[..header_size];
+        match self.sys_read(fd, tail, Some(file_size - header_size)) {
             Ok(n) if n == tail.len() => {}
             _ => return (false, 0, 0, 0),
         }
         if &tail[0..8] != litebox_syscall_rewriter::TRAMPOLINE_MAGIC {
             return (false, 0, 0, 0);
         }
-        // Parse header: magic(8) | file_offset(8) | vaddr(8) | size(8)
-        let file_offset = u64::from_le_bytes(tail[8..16].try_into().unwrap());
-        let vaddr = u64::from_le_bytes(tail[16..24].try_into().unwrap());
-        let trampoline_size = u64::from_le_bytes(tail[24..32].try_into().unwrap());
-        (true, file_offset, vaddr, trampoline_size)
+        if cfg!(target_pointer_width = "64") {
+            // Parse 64-bit header: magic(8) | file_offset(8) | vaddr(8) | size(8)
+            let file_offset = u64::from_le_bytes(tail[8..16].try_into().unwrap());
+            let vaddr = u64::from_le_bytes(tail[16..24].try_into().unwrap());
+            let trampoline_size = u64::from_le_bytes(tail[24..32].try_into().unwrap());
+            (true, file_offset, vaddr, trampoline_size)
+        } else {
+            // Parse 32-bit header: magic(8) | file_offset(4) | vaddr(4) | size(4)
+            let file_offset = u64::from(u32::from_le_bytes(tail[8..12].try_into().unwrap()));
+            let vaddr = u64::from(u32::from_le_bytes(tail[12..16].try_into().unwrap()));
+            let trampoline_size = u64::from(u32::from_le_bytes(tail[16..20].try_into().unwrap()));
+            (true, file_offset, vaddr, trampoline_size)
+        }
     }
 
     /// Patch an executable segment in-place after it has been mapped.
@@ -565,6 +585,9 @@ impl<FS: ShimFS> Task<FS> {
             self.init_elf_patch_state(fd, mapped_addr.as_usize());
         }
 
+        // This lock guards the elf_patch_cache and is held for the entire
+        // patching operation. In practice this is fine because the dynamic
+        // linker loads shared libraries sequentially.
         let mut cache = self.global.elf_patch_cache.lock();
         let Some(state) = cache.get_mut(&fd) else {
             return true; // No patch state — not an ELF we're tracking
@@ -728,6 +751,7 @@ impl<FS: ShimFS> Task<FS> {
             )
             .is_err()
         {
+            restore_trampoline_rx(self, state);
             return true;
         }
 
