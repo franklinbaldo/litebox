@@ -146,7 +146,7 @@ pub fn encode_b(offset: i64) -> Option<u32> {
 /// The immediate is a signed 21-bit page offset (each unit = 4KB page).
 /// The PC is rounded down to a 4KB boundary, then the page offset is added.
 /// Range: ±4GB.
-/// The encoding splits the immediate: `immlo` in bits [30:29], `immhi` in bits [23:5].
+/// The encoding splits the immediate: `immlo` in bits \[30:29\], `immhi` in bits \[23:5\].
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn encode_adrp(rd: u8, page_offset: i64) -> Option<u32> {
     if !(-(1 << 20)..(1 << 20)).contains(&page_offset) {
