@@ -83,6 +83,37 @@ where
         }
     }
 
+    /// Diagnostic: write a usize as decimal.
+    #[cfg(target_os = "macos")]
+    fn _diag_write_usize(val: usize) {
+        let mut buf = [0u8; 20];
+        let mut pos = buf.len();
+        let mut v = val;
+        if v == 0 {
+            Self::_diag_write(b"0");
+            return;
+        }
+        while v > 0 {
+            pos -= 1;
+            buf[pos] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+        Self::_diag_write(&buf[pos..]);
+    }
+
+    /// Diagnostic: write a usize as hex with 0x prefix.
+    #[cfg(target_os = "macos")]
+    fn _diag_write_hex(val: usize) {
+        let mut buf = [0u8; 18]; // "0x" + 16 hex digits
+        buf[0] = b'0';
+        buf[1] = b'x';
+        let hex = b"0123456789abcdef";
+        for i in 0..16 {
+            buf[2 + i] = hex[(val >> (60 - i * 4)) & 0xF];
+        }
+        Self::_diag_write(&buf);
+    }
+
     /// Create a new `PageManager` instance.
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
         let vmem = RwLock::new(linux::Vmem::new(litebox.x.platform));
@@ -369,17 +400,28 @@ where
                 let gaps: alloc::vec::Vec<core::ops::Range<usize>> =
                     vmem.gaps_in_range(brk_start..brk_end);
 
-                Self::_diag_write(b"[set_initial_brk] gaps enumerated, reserving\n");
+                Self::_diag_write(b"[set_initial_brk] gaps enumerated, count=");
+                Self::_diag_write_usize(gaps.len());
+                Self::_diag_write(b"\n");
                 let mut any_reserved = false;
-                for gap in &gaps {
+                for (gap_idx, gap) in gaps.iter().enumerate() {
                     // Align gap to page boundaries (should already be aligned,
                     // but be defensive).
                     let gap_start = gap.start.next_multiple_of(linux::PAGE_SIZE);
                     let gap_end = gap.end & !(linux::PAGE_SIZE - 1);
                     if gap_start >= gap_end {
+                        Self::_diag_write(b"[set_initial_brk] gap ");
+                        Self::_diag_write_usize(gap_idx);
+                        Self::_diag_write(b" skipped (empty)\n");
                         continue;
                     }
-                    Self::_diag_write(b"[set_initial_brk] allocate_pages for gap\n");
+                    Self::_diag_write(b"[set_initial_brk] gap ");
+                    Self::_diag_write_usize(gap_idx);
+                    Self::_diag_write(b" allocate_pages ");
+                    Self::_diag_write_hex(gap_start);
+                    Self::_diag_write(b"..");
+                    Self::_diag_write_hex(gap_end);
+                    Self::_diag_write(b"\n");
                     if vmem
                         .platform
                         .allocate_pages(
@@ -391,7 +433,9 @@ where
                         )
                         .is_ok()
                     {
-                        Self::_diag_write(b"[set_initial_brk] gap reserved OK\n");
+                        Self::_diag_write(b"[set_initial_brk] gap ");
+                        Self::_diag_write_usize(gap_idx);
+                        Self::_diag_write(b" reserved OK\n");
                         // Track the reserved gap in the VMA tree.
                         if let Some(pr) = linux::PageRange::new(gap_start, gap_end) {
                             vmem.register_existing_mapping_overwrite(
@@ -401,7 +445,9 @@ where
                         }
                         any_reserved = true;
                     } else {
-                        Self::_diag_write(b"[set_initial_brk] gap reserve FAILED\n");
+                        Self::_diag_write(b"[set_initial_brk] gap ");
+                        Self::_diag_write_usize(gap_idx);
+                        Self::_diag_write(b" reserve FAILED\n");
                     }
                     // If allocation failed, the host may have placed something
                     // there between enumeration and mmap.  Continue with
