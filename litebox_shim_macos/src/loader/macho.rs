@@ -356,6 +356,20 @@ pub(crate) fn load<FS: ShimFS>(
     brk = brk.max(tls_table_end);
     log_unsupported!("load_macho: TLS table initialized, HOST_TLS_TABLE_ADDR set to {tls_table_addr:#x}");
 
+    // --- Update shared cache trampoline TLS pointers ---
+    //
+    // After execve, the old TLS table is unmapped and a new one is allocated
+    // (potentially at a different address).  The shared cache trampolines
+    // still have the old TLS address baked in at offset 8.  We must update
+    // them NOW — before any code goes through the shared cache's patched SVC
+    // gate (which happens in set_initial_brk → allocate_pages → libc::mmap,
+    // and in the __LITEBOX segment init's sys_mprotect below).
+    //
+    // SAFETY: tls_table_addr points to a freshly allocated, valid TLS table.
+    unsafe {
+        task.global.update_shared_cache_tls_addrs(tls_table_addr);
+    }
+
     // --- Initialize trampoline callback address (if __LITEBOX segment exists) ---
     //
     // The __LITEBOX segment contains the trampoline code emitted by the

@@ -401,6 +401,7 @@ impl<FS: ShimFS> MacosShimBuilder<FS> {
             dyld_base: AtomicUsize::new(0),
             dyld_end: AtomicUsize::new(0),
             dyld_bytes: litebox::sync::RwLock::new(None),
+            shared_cache_trampoline_addrs: litebox::sync::RwLock::new(Vec::new()),
             demand_page_ranges: litebox::sync::RwLock::new(Vec::new()),
             demand_page_sources: litebox::sync::RwLock::new(Vec::new()),
             sysroot: self.sysroot,
@@ -761,6 +762,14 @@ impl<FS: ShimFS> MacosShim<FS> {
                     .load(core::sync::atomic::Ordering::Acquire);
                 tramp_slice[8..16].copy_from_slice(&tls_addr.to_le_bytes());
             }
+            // Record the trampoline address so we can update its TLS table
+            // pointer after execve.
+            if tramp_cursor > 0 {
+                self.0
+                    .shared_cache_trampoline_addrs
+                    .write()
+                    .push((tramp_addr, tramp_size));
+            }
             let _ = tramp_cursor;
 
             // mprotect trampoline to R-X.
@@ -970,6 +979,14 @@ impl<FS: ShimFS> MacosShim<FS> {
                 tramp_addr,
                 tramp_size,
             });
+        }
+
+        // Record Pass 3 trampoline addresses for future TLS table updates.
+        {
+            let mut addrs = self.0.shared_cache_trampoline_addrs.write();
+            for plan in &plans {
+                addrs.push((plan.tramp_addr, plan.tramp_size));
+            }
         }
 
         // Reset SIGBUS, SIGSEGV, SIGTRAP to SIG_DFL before Phase B,
@@ -1691,6 +1708,13 @@ struct GlobalState<FS: ShimFS> {
     /// (with pristine __DATA segments) on every exec, matching real macOS
     /// kernel behavior.
     pub(crate) dyld_bytes: litebox::sync::RwLock<Platform, Option<Vec<u8>>>,
+    /// Addresses and sizes of shared cache trampoline regions.
+    ///
+    /// Each entry is `(trampoline_addr, trampoline_size)`.  These are populated
+    /// during `install_shared_cache` and used by `update_shared_cache_tls_addrs`
+    /// to patch the TLS table pointer (at offset 8) in each trampoline after
+    /// execve allocates a new TLS table.
+    pub(crate) shared_cache_trampoline_addrs: litebox::sync::RwLock<Platform, Vec<(u64, usize)>>,
     /// Address ranges for demand-paging shared cache pages on SIGBUS.
     ///
     /// These are the overlapping regions between the guest's unslid shared cache
@@ -1712,6 +1736,111 @@ struct GlobalState<FS: ShimFS> {
         reason = "will be used when sys_open path rewriting is implemented"
     )]
     sysroot: Option<alloc::string::String>,
+}
+
+impl<FS: ShimFS> GlobalState<FS> {
+    /// Update the TLS table pointer in all shared cache trampoline headers.
+    ///
+    /// Each trampoline's first 16 bytes are: `[callback_addr (8 bytes), tls_table_addr (8 bytes)]`.
+    /// After execve, the old TLS table is unmapped and a new one is allocated at a
+    /// potentially different address.  This method patches offset 8 in every shared cache
+    /// trampoline to point to the new TLS table.
+    ///
+    /// IMPORTANT: This uses raw `mprotect` syscalls (inline assembly) instead of
+    /// `libc::mprotect`, because the libc call would go through the very trampolines
+    /// we are trying to fix — their stale TLS pointer would cause a SIGSEGV.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `new_tls_addr` points to a valid, mapped TLS table.
+    #[allow(clippy::cast_possible_truncation, clippy::similar_names)]
+    pub(crate) unsafe fn update_shared_cache_tls_addrs(&self, new_tls_addr: usize) {
+        let trampoline_list = self.shared_cache_trampoline_addrs.read();
+        let tls_bytes = (new_tls_addr as u64).to_le_bytes();
+        let mut updated = 0usize;
+        for &(tramp_addr, tramp_size) in trampoline_list.iter() {
+            let tramp_addr_usize = tramp_addr as usize;
+
+            // Try mprotect(RW) first — works for non-shared-cache trampolines.
+            let rw_ok = unsafe {
+                raw_mprotect(tramp_addr_usize, tramp_size, RAW_PROT_READ | RAW_PROT_WRITE)
+            }
+            .is_ok();
+
+            if !rw_ok {
+                // mprotect failed (EACCES on shared cache region pages).
+                // Replace the page with a fresh anonymous mapping via
+                // raw_mmap(MAP_FIXED), which atomically replaces the old
+                // mapping with a new private anonymous page.
+                //
+                // Steps:
+                // 1. Read the existing R-X trampoline data into a buffer
+                // 2. raw_mmap(MAP_FIXED) to get a fresh RW page
+                // 3. Copy the saved data back with the updated TLS address
+                // 4. raw_mprotect to R-X (succeeds on private anonymous pages)
+
+                // Step 1: Read existing data (page is currently R-X = readable).
+                let src = unsafe {
+                    core::slice::from_raw_parts(tramp_addr_usize as *const u8, tramp_size)
+                };
+                // Use a fixed-size stack buffer for small trampolines, heap for large.
+                // Most trampolines are 16KB-64KB.
+                let mut saved = alloc::vec![0u8; tramp_size];
+                saved.copy_from_slice(src);
+
+                // Step 2: Replace with fresh anonymous RW page.
+                let mmap_result = unsafe {
+                    raw_mmap(
+                        tramp_addr_usize,
+                        tramp_size,
+                        RAW_PROT_READ | RAW_PROT_WRITE,
+                        RAW_MAP_ANON | RAW_MAP_PRIVATE | RAW_MAP_FIXED,
+                    )
+                };
+                if mmap_result.is_err() {
+                    log_unsupported!(
+                        "update_shared_cache_tls_addrs: raw_mmap MAP_FIXED failed for tramp at {tramp_addr_usize:#x}"
+                    );
+                    continue;
+                }
+
+                // Step 3: Copy saved data back.
+                let dst = unsafe {
+                    core::slice::from_raw_parts_mut(tramp_addr_usize as *mut u8, tramp_size)
+                };
+                dst.copy_from_slice(&saved);
+            }
+
+            // Write the new TLS table address at offset 8 using volatile writes
+            // (same technique as install_shared_cache Pass 3).
+            unsafe {
+                let base = tramp_addr_usize as *mut u8;
+                let mut j = 0usize;
+                while j < 8 {
+                    core::ptr::write_volatile(base.add(8 + j), tls_bytes[j]);
+                    j += 1;
+                }
+            }
+
+            // Restore the trampoline to R-X using raw mprotect.
+            // For mmap-replaced pages, this works because they are private anonymous.
+            let rx_result = unsafe {
+                raw_mprotect(tramp_addr_usize, tramp_size, RAW_PROT_READ | RAW_PROT_EXEC)
+            };
+            if let Err(errno) = rx_result {
+                log_unsupported!(
+                    "update_shared_cache_tls_addrs: raw_mprotect RX failed for tramp at {tramp_addr_usize:#x} (errno={errno})"
+                );
+            }
+            updated += 1;
+        }
+        if updated > 0 {
+            log_unsupported!(
+                "update_shared_cache_tls_addrs: updated {updated}/{} trampolines to TLS addr {new_tls_addr:#x}",
+                trampoline_list.len()
+            );
+        }
+    }
 }
 
 /// Per-fd state for tracking mmap-hook code patching.
