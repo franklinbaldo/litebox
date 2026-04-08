@@ -1846,6 +1846,7 @@ dependencies = [
  "litebox",
  "litebox_common_linux",
  "litebox_common_macos",
+ "litebox_platform_macos_userland",
  "litebox_platform_multiplex",
  "litebox_syscall_rewriter_macho",
  "object",

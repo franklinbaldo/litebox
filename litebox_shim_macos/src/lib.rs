@@ -287,6 +287,208 @@ pub struct DemandPageSource {
     pub file_offset: u64,
 }
 
+
+// ── Global demand-page handler state (async-signal-safe) ─────────────────
+//
+// These statics mirror the demand-page data from GlobalState but are
+// accessible from a plain `fn(usize) -> bool` signal handler without
+// any instance reference.  They are populated once during
+// `install_shared_cache` and persist across execve (the shared cache
+// and its demand-page sources are preserved).
+
+/// Maximum number of demand-page ranges we can track.
+const MAX_DEMAND_PAGE_RANGES: usize = 128;
+/// Maximum number of demand-page sources we can track.
+const MAX_DEMAND_PAGE_SOURCES: usize = 256;
+
+/// Demand-page range entries: (start, end) pairs stored as two separate
+/// arrays of AtomicU64 for async-signal-safe access.
+#[allow(clippy::declare_interior_mutable_const)]
+static DEMAND_RANGE_STARTS: [AtomicU64; MAX_DEMAND_PAGE_RANGES] =
+    { const INIT: AtomicU64 = AtomicU64::new(0); [INIT; MAX_DEMAND_PAGE_RANGES] };
+#[allow(clippy::declare_interior_mutable_const)]
+static DEMAND_RANGE_ENDS: [AtomicU64; MAX_DEMAND_PAGE_RANGES] =
+    { const INIT: AtomicU64 = AtomicU64::new(0); [INIT; MAX_DEMAND_PAGE_RANGES] };
+/// Number of valid demand-page range entries.
+static DEMAND_RANGE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Demand-page source entries stored as parallel arrays of atomics.
+#[allow(clippy::declare_interior_mutable_const)]
+static DEMAND_SRC_VM_STARTS: [AtomicU64; MAX_DEMAND_PAGE_SOURCES] =
+    { const INIT: AtomicU64 = AtomicU64::new(0); [INIT; MAX_DEMAND_PAGE_SOURCES] };
+#[allow(clippy::declare_interior_mutable_const)]
+static DEMAND_SRC_VM_ENDS: [AtomicU64; MAX_DEMAND_PAGE_SOURCES] =
+    { const INIT: AtomicU64 = AtomicU64::new(0); [INIT; MAX_DEMAND_PAGE_SOURCES] };
+#[allow(clippy::declare_interior_mutable_const)]
+static DEMAND_SRC_FDS: [AtomicI32; MAX_DEMAND_PAGE_SOURCES] =
+    { const INIT: AtomicI32 = AtomicI32::new(-1); [INIT; MAX_DEMAND_PAGE_SOURCES] };
+#[allow(clippy::declare_interior_mutable_const)]
+static DEMAND_SRC_FILE_OFFSETS: [AtomicU64; MAX_DEMAND_PAGE_SOURCES] =
+    { const INIT: AtomicU64 = AtomicU64::new(0); [INIT; MAX_DEMAND_PAGE_SOURCES] };
+/// Number of valid demand-page source entries.
+static DEMAND_SRC_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Populate the global demand-page statics from the given ranges and sources.
+///
+/// This must be called exactly once (during `install_shared_cache`).
+/// After this call, `demand_page_handler_fn` can serve faults.
+fn populate_demand_page_globals(
+    ranges: &[(u64, u64)],
+    sources: &[DemandPageSource],
+) {
+    let range_count = ranges.len().min(MAX_DEMAND_PAGE_RANGES);
+    for (i, &(start, end)) in ranges[..range_count].iter().enumerate() {
+        DEMAND_RANGE_STARTS[i].store(start, Ordering::Relaxed);
+        DEMAND_RANGE_ENDS[i].store(end, Ordering::Relaxed);
+    }
+    // Release fence so the handler sees all stores above.
+    core::sync::atomic::fence(Ordering::Release);
+    DEMAND_RANGE_COUNT.store(range_count, Ordering::Release);
+
+    // Sources must be sorted by vm_start (caller ensures this).
+    let src_count = sources.len().min(MAX_DEMAND_PAGE_SOURCES);
+    for (i, src) in sources[..src_count].iter().enumerate() {
+        DEMAND_SRC_VM_STARTS[i].store(src.vm_start, Ordering::Relaxed);
+        DEMAND_SRC_VM_ENDS[i].store(src.vm_end, Ordering::Relaxed);
+        DEMAND_SRC_FDS[i].store(src.fd, Ordering::Relaxed);
+        DEMAND_SRC_FILE_OFFSETS[i].store(src.file_offset, Ordering::Relaxed);
+    }
+    core::sync::atomic::fence(Ordering::Release);
+    DEMAND_SRC_COUNT.store(src_count, Ordering::Release);
+}
+
+/// Async-signal-safe demand-page handler called from the platform's
+/// `exception_signal_handler` via `DEMAND_PAGE_HANDLER`.
+///
+/// Returns `true` if the fault was handled (page allocated and filled),
+/// `false` if the address is not in a demand-page range.
+///
+/// # Safety
+///
+/// Must only be called from signal handler context.  Uses only raw Mach
+/// VM calls and `pread` (both async-signal-safe on macOS).
+unsafe fn demand_page_handler_fn(fault_addr: usize) -> bool {
+    let fault_addr64 = fault_addr as u64;
+
+    // Check if fault address is in any demand-page range.
+    let range_count = DEMAND_RANGE_COUNT.load(Ordering::Acquire);
+    let mut in_range = false;
+    for i in 0..range_count {
+        let start = DEMAND_RANGE_STARTS[i].load(Ordering::Relaxed);
+        let end = DEMAND_RANGE_ENDS[i].load(Ordering::Relaxed);
+        if fault_addr64 >= start && fault_addr64 < end {
+            in_range = true;
+            break;
+        }
+    }
+    if !in_range {
+        return false;
+    }
+
+    let hw_page_mask = HW_PAGE_SIZE - 1;
+    let page_addr = fault_addr64 & !hw_page_mask;
+
+    // Allocate a fresh page at the faulting address using Mach VM.
+    // We must use raw SVC inline assembly to avoid going through the
+    // patched shared cache — the C wrapper for mach_vm_allocate is in
+    // the shared cache and may touch demand-paged DATA pages itself,
+    // causing infinite recursive SIGBUS.
+    let mut alloc_addr = page_addr;
+    let kr: i32;
+    // SAFETY: raw Mach trap — async-signal-safe, no shared cache dependency.
+    // mach_task_self_ is a global port number (always the same value, the
+    // kernel caches it at known address).  We use the mach_task_self()
+    // trap (trap number -28) to get it, then mach_vm_allocate (trap -10).
+    unsafe {
+        let task_self: u64;
+        // mach_task_self() → Mach trap -28
+        core::arch::asm!(
+            "movn x16, #27",   // x16 = !27 = -28
+            "svc #0x80",
+            lateout("x0") task_self,
+            out("x16") _,
+            options(nomem, nostack),
+        );
+        // mach_vm_allocate(target, &mut addr, size, flags) → Mach trap -10
+        let ret: u64;
+        let addr_ptr = &raw mut alloc_addr as usize as u64;
+        core::arch::asm!(
+            "movn x16, #9",    // x16 = !9 = -10
+            "svc #0x80",
+            in("x0") task_self,
+            in("x1") addr_ptr,
+            in("x2") HW_PAGE_SIZE,
+            in("x3") (VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) as u64,
+            lateout("x0") ret,
+            out("x16") _,
+        );
+        #[allow(clippy::cast_possible_truncation)]
+        { kr = ret as i32; }
+    }
+    if kr != 0 {
+        return false;
+    }
+
+    // Try to fill the page with correct data from a subcache file.
+    // Binary search for the source containing page_addr.
+    let src_count = DEMAND_SRC_COUNT.load(Ordering::Acquire);
+    if src_count > 0 {
+        // Manual binary search (partition_point equivalent).
+        let mut lo = 0usize;
+        let mut hi = src_count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if DEMAND_SRC_VM_STARTS[mid].load(Ordering::Relaxed) <= page_addr {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        // lo is now the partition_point: first index where vm_start > page_addr.
+        // The candidate source is at lo - 1 (if it exists).
+        if lo > 0 {
+            let idx = lo - 1;
+            let src_start = DEMAND_SRC_VM_STARTS[idx].load(Ordering::Relaxed);
+            let src_end = DEMAND_SRC_VM_ENDS[idx].load(Ordering::Relaxed);
+            let src_fd = DEMAND_SRC_FDS[idx].load(Ordering::Relaxed);
+            let src_offset = DEMAND_SRC_FILE_OFFSETS[idx].load(Ordering::Relaxed);
+
+            if page_addr >= src_start && page_addr < src_end {
+                let offset_in_source = page_addr - src_start;
+                let file_offset = src_offset + offset_in_source;
+                let remaining = src_end - page_addr;
+                #[allow(clippy::cast_possible_truncation)]
+                let read_len = HW_PAGE_SIZE.min(remaining) as usize;
+
+                // Use raw SVC for pread to avoid shared cache dependency.
+                // pread is Unix syscall 153 (SYS_pread) on macOS.
+                // SAFETY: alloc_addr points to a freshly allocated page.
+                #[allow(clippy::cast_possible_wrap)]
+                let _n: i64 = unsafe {
+                    let ret: u64;
+                    #[allow(clippy::cast_sign_loss)]
+                    let fd_u64 = src_fd as u64;
+                    core::arch::asm!(
+                        "mov x16, {nr}",
+                        "svc #0x80",
+                        nr = in(reg) (0x200_0000u64 | 0x19eu64), // SYS_pread_nocancel=414 + BSD flag
+                        in("x0") fd_u64,
+                        in("x1") alloc_addr,
+                        in("x2") read_len as u64,
+                        in("x3") file_offset,
+                        lateout("x0") ret,
+                        out("x16") _,
+                        options(nostack),
+                    );
+                    ret as i64
+                };
+            }
+        }
+    }
+
+    true
+}
+
 pub type DefaultFS = MacosFS;
 pub(crate) type MacosFS = litebox::fs::layered::FileSystem<
     Platform,
@@ -1231,6 +1433,19 @@ impl<FS: ShimFS> MacosShim<FS> {
         // Record the cache end address from reserved_extents.
         if let Some(max_end) = reserved_extents.iter().map(|&(_, end)| end).max() {
             self.0.shared_cache_end.store(max_end, Ordering::Release);
+        }
+
+        // Populate the global demand-page statics and register the handler
+        // with the platform's signal handler.  This allows HOST-side SIGBUS
+        // faults (e.g. libc wrappers accessing shared cache DATA pages
+        // during the second exec after execve) to be resolved without going
+        // through the shim's exception() method.
+        populate_demand_page_globals(reserved_extents, demand_page_sources);
+        #[cfg(feature = "platform_macos_userland")]
+        unsafe {
+            litebox_platform_macos_userland::register_demand_page_handler(
+                demand_page_handler_fn,
+            );
         }
     }
 

@@ -197,6 +197,37 @@ static EDGE_PAGES: [std::sync::atomic::AtomicUsize; MAX_EDGE_PAGES] = {
 };
 static EDGE_PAGE_LOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Global function pointer for demand-page handling.
+///
+/// When a SIGBUS occurs at an address that is NOT an edge page,
+/// `exception_signal_handler` calls this function (if non-null) to attempt
+/// demand-page resolution.  The function should allocate a fresh page at the
+/// faulting address and fill it with the correct data from the subcache file.
+///
+/// Returns `true` if the page was successfully served (fault resolved),
+/// `false` otherwise.
+///
+/// This is set by the shim's `install_shared_cache` and persists across
+/// execve (the shared cache and its demand-page sources are preserved).
+///
+/// # Safety
+///
+/// The function must be async-signal-safe (only raw syscalls, no heap).
+static DEMAND_PAGE_HANDLER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register a demand-page handler that will be called from the signal handler
+/// for SIGBUS faults that are not edge-page faults.
+///
+/// The handler function signature is `unsafe fn(fault_addr: usize) -> bool`.
+///
+/// # Safety
+///
+/// The provided function pointer must be valid for the lifetime of the process
+/// and must be async-signal-safe.
+pub unsafe fn register_demand_page_handler(handler: unsafe fn(usize) -> bool) {
+    DEMAND_PAGE_HANDLER.store(handler as usize, Ordering::Release);
+}
+
 // ── Per-sub-page edge page permission tracking ──────────────────────────────
 //
 // Each 16KB host page that straddles a 4KB permission boundary needs
@@ -3991,6 +4022,41 @@ unsafe extern "C" fn exception_signal_handler(
                 return;
             }
             // If we couldn't toggle (unexpected EC), fall through to normal handling.
+        }
+    }
+
+    // Demand-page check: serve SIGBUS faults on shared-cache pages that
+    // have no physical backing.  This handles BOTH guest and host faults
+    // (e.g. libc::mmap wrapper accessing shared-cache data during the
+    // second exec after execve, when the demand-page shim handler would
+    // not be reachable via signal_handler_exit_guest).
+    if signum == libc::SIGBUS {
+        let handler_addr = DEMAND_PAGE_HANDLER.load(Ordering::Acquire);
+        if handler_addr != 0 {
+            let sigctx_dp = unsafe { &*context.uc_mcontext };
+            let fault_addr = sigctx_dp.__es.__far as usize;
+            let handler: unsafe fn(usize) -> bool =
+                unsafe { core::mem::transmute(handler_addr) };
+            if unsafe { handler(fault_addr) } {
+                // Page was served.  If we were in guest code, we must NOT
+                // simply return — macOS sigreturn clobbers TPIDR_EL0 to the
+                // pthread value, which would break the guest's TLS.  Route
+                // through interrupt_callback → switch_to_guest to restore
+                // the correct TPIDR_EL0 before resuming guest execution.
+                if let Some((regs, host_tls)) = signal_handler_exit_guest(context, false) {
+                    let ip = sigctx_dp.__ss.__pc as usize;
+                    let in_switch_to_guest = (switch_to_guest_start as *const () as usize
+                        ..switch_to_guest_end as *const () as usize)
+                        .contains(&ip);
+                    if !in_switch_to_guest {
+                        copy_signal_context(unsafe { &mut *regs }, context);
+                    }
+                    let _ = run_thread_arch as *const () as usize;
+                    set_signal_return(context, interrupt_callback, host_tls, 0, 0, 0, 0);
+                }
+                // Host-side fault: just return — sigreturn is fine for host code.
+                return;
+            }
         }
     }
 
