@@ -819,6 +819,7 @@ impl<FS: ShimFS> Task<FS> {
             let my_pgid = self.sys_getpgid(0).unwrap_or(0);
             let is_own_group = target_pgid.as_u32() == my_pgid;
             let mut delivered = false;
+            let mut first_error: Option<Errno> = None;
 
             // Deliver to self first (if in the target group).
             if is_own_group {
@@ -846,16 +847,23 @@ impl<FS: ShimFS> Task<FS> {
                         delivered = true;
                         continue;
                     }
-                    if self
-                        .do_remote_process_kill(member_pid, None, signal)
-                        .is_ok()
-                    {
-                        delivered = true;
+                    match self.do_remote_process_kill(member_pid, None, signal) {
+                        Ok(_) => delivered = true,
+                        Err(e) if first_error.is_none() && e != Errno::ESRCH => {
+                            first_error = Some(e);
+                        }
+                        Err(_) => {}
                     }
                 }
             }
 
-            if !delivered && members.is_empty() {
+            if delivered {
+                return Ok(0);
+            }
+            if let Some(err) = first_error {
+                return Err(err);
+            }
+            if members.is_empty() {
                 return Err(Errno::ESRCH);
             }
             return Ok(0);
@@ -876,23 +884,26 @@ impl<FS: ShimFS> Task<FS> {
                 .process_registry()
                 .all_running_except(self.process_id);
             let mut delivered = false;
+            let mut first_error: Option<Errno> = None;
             for target in all_pids {
                 if target == litebox::process::ProcessId::INIT {
                     continue; // skip PID 1, matching Linux semantics
                 }
                 let target_pid = i32::try_from(target.0).unwrap_or(-1);
-                if target_pid > 0
-                    && self
-                        .do_remote_process_kill(target_pid, None, signal)
-                        .is_ok()
-                {
-                    delivered = true;
+                if target_pid > 0 {
+                    match self.do_remote_process_kill(target_pid, None, signal) {
+                        Ok(_) => delivered = true,
+                        Err(e) if first_error.is_none() && e != Errno::ESRCH => {
+                            first_error = Some(e);
+                        }
+                        Err(_) => {}
+                    }
                 }
             }
-            if !delivered {
-                return Err(Errno::ESRCH);
+            if delivered {
+                return Ok(0);
             }
-            return Ok(0);
+            return Err(first_error.unwrap_or(Errno::ESRCH));
         }
         if pid > 0 && pid != self.pid {
             return self.do_remote_process_kill(pid, None, signal);

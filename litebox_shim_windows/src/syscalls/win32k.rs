@@ -1,61 +1,298 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Minimal Win32k / CSR handlers for USER32/GDI32 initialization.
+//! Minimal headless Win32k handlers for USER32/GDI initialization.
 //!
-//! We don't implement the full Win32k subsystem.  We provide just enough
-//! for USER32.dll's DllMain (`UserClientDllInitialize`) to succeed.
-//!
-//! ## `CsrClientConnectToServer` (pseudo-syscall 0x2000)
-//!
-//! USER32's `_UserClientDllInitialize` calls `CsrClientConnectToServer`
-//! (an ntdll function, not a win32k syscall) with `ServerDllIndex = 3`
-//! (USER subsystem).  In real Windows this establishes an LPC/ALPC
-//! connection to CSRSS and returns a SHAREDINFO structure in the
-//! ConnectionInformation output buffer.  USER32 then copies that buffer
-//! (0x248 bytes) into the global `gSharedInfo`.
-//!
-//! In our sandbox there is no CSRSS, so we patch `CsrClientConnectToServer`
-//! into a pseudo-syscall that jumps through the trampoline to the shim.
-//! The handler below allocates a minimal SERVERINFO page and fills in the
-//! ConnectionInformation buffer so that `gSharedInfo.psi` is non-NULL.
-//!
-//! ## `NtGdiInit` / `NtGdiInit2` (win32k syscalls 0x12E7 / 0x12E8)
-//!
-//! `gdi32full!GdiDllInitialize_OLD` calls `NtGdiInit2` to establish the
-//! per-process GDI connection.  The return value is a non-NULL "cookie"
-//! stored in `gCookie`.  If `NtGdiInit2` returns NULL, GdiDllInitialize
-//! fails, which in turn causes USER32's DllMain to return FALSE.
-//!
-//! `GdiProcessSetup` later calls `NtGdiInit` for further GDI state setup.
-//! Both return opaque handles/pointers that are used in subsequent GDI
-//! calls.  In our sandbox we allocate dummy pages so the pointers are
-//! valid but all fields are zero (no GDI rendering capability).
+//! The goal here is not to implement Win32k. We only provide enough for the
+//! guest's real `win32u.dll` stubs to stay inside the NT shim so USER32/GDI
+//! initialization does not fall through to host win32k callbacks.
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use litebox::mm::linux::{CreatePagesFlags, NonZeroPageSize};
 use litebox::platform::RawConstPointer as _;
 use litebox_common_windows::ntstatus::NtStatus;
+use litebox_common_windows::pe_parser::PeParsedFile;
 
-use super::NtSyscallArgs;
 use crate::{NtProcessState, PAGE_SIZE};
 
-/// NtUserProcessConnect — establish Win32k subsystem connection.
+use super::NtSyscallArgs;
+
+const STUB_PREFIX: [u8; 4] = [0x4C, 0x8B, 0xD1, 0xB8];
+const CFG_CHECK: [u8; 8] = [0xF6, 0x04, 0x25, 0x08, 0x03, 0xFE, 0x7F, 0x01];
+const SYSCALL_TAIL: [u8; 5] = [0x75, 0x03, 0x0F, 0x05, 0xC3];
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Win32kSyscallId {
+    NtUserGetThreadState,
+    NtUserProcessConnect,
+    NtUserGetDpiForCurrentProcess,
+    NtUserSetProcessDpiAwarenessContext,
+    NtUserDisableProcessWindowFiltering,
+    NtUserSetProcessMousewheelRoutingMode,
+    NtUserLoadUserApiHook,
+    NtUserRegisterWindowMessage,
+    NtUserGetSystemMetrics,
+    NtGdiInit,
+    NtGdiInit2,
+}
+
+pub(crate) struct Win32kSyscallMap {
+    table: Vec<Option<Win32kSyscallId>>,
+}
+
+impl Win32kSyscallMap {
+    pub(crate) fn from_pairs(pairs: &[(u32, Win32kSyscallId)]) -> Self {
+        let max_nr = pairs.iter().map(|(nr, _)| *nr).max().unwrap_or(0) as usize;
+        let mut table = alloc::vec![None; max_nr + 1];
+        for &(nr, id) in pairs {
+            table[nr as usize] = Some(id);
+        }
+        Self { table }
+    }
+
+    #[inline]
+    pub(crate) fn lookup(&self, raw_nr: u32) -> Option<Win32kSyscallId> {
+        self.table.get(raw_nr as usize).copied().flatten()
+    }
+}
+
+pub(crate) fn build_win32k_syscall_map(parsed: &PeParsedFile, pe_data: &[u8]) -> Win32kSyscallMap {
+    let mut pairs = Vec::new();
+
+    for export in parsed.exports(pe_data) {
+        let Some(name) = export.name else {
+            continue;
+        };
+        let Some(id) = name_to_win32k_syscall_id(name) else {
+            continue;
+        };
+        if export.forwarder.is_some() {
+            continue;
+        }
+        let Some(raw_nr) = read_win32k_stub_number(parsed, pe_data, export.rva) else {
+            continue;
+        };
+        pairs.push((raw_nr, id));
+    }
+
+    Win32kSyscallMap::from_pairs(&pairs)
+}
+
+fn name_to_win32k_syscall_id(name: &str) -> Option<Win32kSyscallId> {
+    let id = match name {
+        "NtUserGetThreadState" => Win32kSyscallId::NtUserGetThreadState,
+        "NtUserProcessConnect" => Win32kSyscallId::NtUserProcessConnect,
+        "NtUserGetDpiForCurrentProcess" => Win32kSyscallId::NtUserGetDpiForCurrentProcess,
+        "NtUserSetProcessDpiAwarenessContext" => {
+            Win32kSyscallId::NtUserSetProcessDpiAwarenessContext
+        }
+        "NtUserDisableProcessWindowFiltering" => {
+            Win32kSyscallId::NtUserDisableProcessWindowFiltering
+        }
+        "NtUserSetProcessMousewheelRoutingMode" => {
+            Win32kSyscallId::NtUserSetProcessMousewheelRoutingMode
+        }
+        "NtUserLoadUserApiHook" => Win32kSyscallId::NtUserLoadUserApiHook,
+        "NtUserRegisterWindowMessage" => Win32kSyscallId::NtUserRegisterWindowMessage,
+        "NtUserGetSystemMetrics" => Win32kSyscallId::NtUserGetSystemMetrics,
+        "NtGdiInit" => Win32kSyscallId::NtGdiInit,
+        "NtGdiInit2" => Win32kSyscallId::NtGdiInit2,
+        _ => return None,
+    };
+    Some(id)
+}
+
+fn read_win32k_stub_number(parsed: &PeParsedFile, pe_data: &[u8], rva: u32) -> Option<u32> {
+    let off = parsed.rva_to_file_offset(rva)?;
+    let stub = pe_data.get(off..off + 21)?;
+    if stub[0..4] != STUB_PREFIX || stub[8..16] != CFG_CHECK || stub[16..21] != SYSCALL_TAIL {
+        return None;
+    }
+    Some(u32::from_le_bytes(stub[4..8].try_into().ok()?))
+}
+
+fn alloc_zeroed_user_region(
+    process_state: &Arc<NtProcessState>,
+    size: usize,
+) -> Result<usize, NtStatus> {
+    let Some(nz_size) = NonZeroPageSize::<PAGE_SIZE>::new(size) else {
+        return Err(NtStatus::STATUS_NO_MEMORY);
+    };
+
+    let ptr = unsafe {
+        process_state.pm.create_writable_pages(
+            None,
+            nz_size,
+            CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
+            |_| Ok(0),
+        )
+    }
+    .map_err(|_| NtStatus::STATUS_NO_MEMORY)?;
+
+    let base = ptr.as_usize();
+    process_state.track_section_view(base, size);
+    Ok(base)
+}
+
+fn alloc_zeroed_user_page(process_state: &Arc<NtProcessState>) -> Result<usize, NtStatus> {
+    alloc_zeroed_user_region(process_state, PAGE_SIZE)
+}
+
+fn ensure_user_thread_ready(
+    process_state: &Arc<NtProcessState>,
+    teb_va: usize,
+) -> Result<(), NtStatus> {
+    const WIN32_CLIENT_BASE_SIZE: usize = PAGE_SIZE * 2;
+    const WIN32_CLIENT_DATA_OFFSET: usize = 0x10E0;
+    const WIN32_CLIENT_BOUND: u32 = 0x0600;
+    const WIN32_CLIENT_HINTS: u64 = 0x0000_0000_0409_0409;
+    const WIN32_CLIENT_CACHE_18: u64 = 0x0000_0000_0003_6380;
+    const WIN32_CLIENT_CACHE_20: u64 = 0x0000_0000_0000_8D10;
+    const WIN32_CLIENT_CACHE_28: u64 = 0x0000_0000_0003_6380;
+    const WIN32_CLIENT_CACHE_38: u64 = 0x0000_0000_0005_03B6;
+    const WIN32_CLIENT_CACHE_48: u64 = 0x0008_0000_0000_0000;
+    const WIN32_CLIENT_CACHE_58: u64 = 0x0000_0000_0000_0039;
+    const WIN32_CLIENT_DATA_QWORD0: u64 = 0x0000_0000_0001_000C;
+    const WIN32_CLIENT_DATA_QWORD8: u64 = WIN32_CLIENT_DATA_OFFSET as u64;
+
+    if teb_va == 0 {
+        return Err(NtStatus::STATUS_UNSUCCESSFUL);
+    }
+
+    let thread_info_addr = teb_va + crate::peb_teb::teb_offsets::WIN32_THREAD_INFO;
+    let client_ptr_addr = teb_va + crate::peb_teb::teb_offsets::WIN32_CLIENT_INFO_PTR20;
+    let client_base_addr = teb_va + crate::peb_teb::teb_offsets::WIN32_CLIENT_INFO_PTR28;
+
+    let (existing_thread_info, existing_client_ptr, existing_client_base) = unsafe {
+        // SAFETY: `teb_va` is the current thread's guest TEB base and points to a
+        // writable user allocation that the shim owns for the lifetime of the thread.
+        (
+            core::ptr::read(thread_info_addr as *const u64),
+            core::ptr::read(client_ptr_addr as *const u64),
+            core::ptr::read(client_base_addr as *const u64),
+        )
+    };
+
+    if existing_thread_info != 0 && existing_client_ptr != 0 && existing_client_base != 0 {
+        return Ok(());
+    }
+
+    let thread_info_va = alloc_zeroed_user_page(process_state)?;
+    let client_info_va = alloc_zeroed_user_page(process_state)?;
+    let client_base_va = alloc_zeroed_user_region(process_state, WIN32_CLIENT_BASE_SIZE)?;
+
+    unsafe {
+        // SAFETY: The TEB and newly allocated USER pages belong to the current guest
+        // process. USER32 only reads these fields after `NtUserGetThreadState(0xE)`
+        // reports readiness, so seeding them here is the shim-owned lazy-init point.
+        core::ptr::write(thread_info_addr as *mut u64, thread_info_va as u64);
+        core::ptr::write(
+            (teb_va + crate::peb_teb::teb_offsets::WIN32_CLIENT_INFO_QWORD0) as *mut u64,
+            8,
+        );
+        core::ptr::write(
+            (teb_va + crate::peb_teb::teb_offsets::WIN32_CLIENT_INFO_DWORD10) as *mut u32,
+            WIN32_CLIENT_BOUND,
+        );
+        core::ptr::write(
+            (teb_va + crate::peb_teb::teb_offsets::WIN32_CLIENT_INFO_DWORD14) as *mut u32,
+            0,
+        );
+        core::ptr::write(
+            (teb_va + crate::peb_teb::teb_offsets::WIN32_CLIENT_INFO_DWORD18) as *mut u32,
+            0,
+        );
+        core::ptr::write(
+            (teb_va + crate::peb_teb::teb_offsets::WIN32_CLIENT_INFO_DWORD1C) as *mut u32,
+            0,
+        );
+        core::ptr::write(client_ptr_addr as *mut u64, client_info_va as u64);
+        core::ptr::write(client_base_addr as *mut u64, client_base_va as u64);
+        core::ptr::write(
+            (teb_va + crate::peb_teb::teb_offsets::WIN32_CLIENT_INFO_DWORD38) as *mut u32,
+            0,
+        );
+        core::ptr::write(
+            (teb_va + crate::peb_teb::teb_offsets::WIN32_CLIENT_INFO_QWORD90) as *mut u64,
+            WIN32_CLIENT_HINTS,
+        );
+
+        core::ptr::write(client_info_va as *mut u32, 4);
+        core::ptr::write(
+            (client_info_va + 0x08) as *mut u64,
+            WIN32_CLIENT_DATA_OFFSET as u64,
+        );
+        core::ptr::write((client_info_va + 0x10) as *mut u32, 0);
+        core::ptr::write((client_info_va + 0x18) as *mut u64, WIN32_CLIENT_CACHE_18);
+        core::ptr::write((client_info_va + 0x20) as *mut u64, WIN32_CLIENT_CACHE_20);
+        core::ptr::write((client_info_va + 0x28) as *mut u64, WIN32_CLIENT_CACHE_28);
+        core::ptr::write((client_info_va + 0x38) as *mut u64, WIN32_CLIENT_CACHE_38);
+        core::ptr::write((client_info_va + 0x40) as *mut u64, 1);
+        core::ptr::write((client_info_va + 0x48) as *mut u64, WIN32_CLIENT_CACHE_48);
+        core::ptr::write((client_info_va + 0x58) as *mut u64, WIN32_CLIENT_CACHE_58);
+
+        // USER32/GDI helper wrappers treat `client_base + *(client_info+0x8)` as a
+        // tiny metadata record, so seed the non-pointer scalars they probe there.
+        core::ptr::write(
+            client_base_va.wrapping_add(WIN32_CLIENT_DATA_OFFSET) as *mut u64,
+            WIN32_CLIENT_DATA_QWORD0,
+        );
+        core::ptr::write(
+            client_base_va.wrapping_add(WIN32_CLIENT_DATA_OFFSET + 0x08) as *mut u64,
+            WIN32_CLIENT_DATA_QWORD8,
+        );
+    }
+
+    #[cfg(feature = "trace_debug")]
+    {
+        use litebox::platform::DebugLogProvider as _;
+        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+            "NT shim: seeded USER thread state teb=0x{teb_va:X} win32_thread=0x{thread_info_va:X} \
+client_info=0x{client_info_va:X} client_base=0x{client_base_va:X}\n",
+        ));
+    }
+
+    Ok(())
+}
+
+/// `NtUserGetThreadState` gates parts of USER32 initialization.
 ///
-/// Signature:
-/// ```text
-/// NTSTATUS NtUserProcessConnect(
-///     HANDLE ProcessHandle,    // r10 (ignored)
-///     PVOID  pUserConnect,     // rdx — output buffer
-///     ULONG  UserConnectSize   // r8  — buffer size (usually 0x88)
-/// );
-/// ```
-///
-/// USER32's `UserClientDllInitialize` reads the connection output to set
-/// `gSharedInfo` and `gpsi`.  We allocate a zero-filled page as a minimal
-/// SHAREDINFO structure.  All-zeros means "no capabilities / no IMM /
-/// headless" which is exactly what we want for a sandboxed console process.
+/// The current guest USER32 path uses selector `0xE` as a lazy "Win32 thread
+/// state is initialized" probe. Returning `1` is not enough: USER32
+/// immediately starts reading `TEB.Win32ThreadInfo` and `TEB.Win32ClientInfo`.
+pub(crate) fn nt_user_get_thread_state(
+    ctx: &mut crate::ExecutionContext,
+    process_state: &Arc<NtProcessState>,
+    teb_va: usize,
+) -> NtStatus {
+    const THREAD_STATE_USER_READY: u32 = 0xE;
+
+    let args = NtSyscallArgs::from_ctx(ctx);
+    let selector = args.arg0 as u32;
+    let (value, status) = match selector {
+        THREAD_STATE_USER_READY => match ensure_user_thread_ready(process_state, teb_va) {
+            Ok(()) => (1usize, NtStatus::STATUS_SUCCESS),
+            Err(status) => (0usize, status),
+        },
+        _ => (0usize, NtStatus::STATUS_SUCCESS),
+    };
+
+    ctx.regs.rax = value;
+
+    #[cfg(feature = "trace_debug")]
+    {
+        use litebox::platform::DebugLogProvider as _;
+        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+            "NT shim: NtUserGetThreadState(selector=0x{selector:X}) -> 0x{value:X}\n",
+        ));
+    }
+
+    status
+}
+
+/// `NtUserProcessConnect` establishes the guest USER32 shared-info view.
 pub(crate) fn nt_user_process_connect(
     ctx: &mut crate::ExecutionContext,
     process_state: &Arc<NtProcessState>,
@@ -63,292 +300,280 @@ pub(crate) fn nt_user_process_connect(
     const USER_CONNECT_MIN_SIZE: usize = 0x20;
 
     let args = NtSyscallArgs::from_ctx(ctx);
-    let user_connect_ptr = args.arg1; // rdx
-    let user_connect_size = args.arg2 as usize; // r8
-
-    #[cfg(debug_assertions)]
-    {
-        use litebox::platform::DebugLogProvider as _;
-        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-            "NT shim: NtUserProcessConnect(buf=0x{:X}, size=0x{:X})\n",
-            user_connect_ptr,
-            user_connect_size,
-        ));
-    }
+    let user_connect_ptr = args.arg1;
+    let user_connect_size = args.arg2;
 
     if user_connect_ptr == 0 || user_connect_size < USER_CONNECT_MIN_SIZE {
         return NtStatus::STATUS_INVALID_PARAMETER;
     }
 
-    // Allocate a zero-filled page for the SHAREDINFO / SERVERINFO structure.
-    // USER32 will store this pointer in gSharedInfo.  Since all fields are
-    // zero, USER32 treats it as "no Win32k capabilities" and skips IMM init.
-    let Some(nz_size) = NonZeroPageSize::<PAGE_SIZE>::new(PAGE_SIZE) else {
-        return NtStatus::STATUS_NO_MEMORY;
-    };
-    let shared_info_va = match unsafe {
-        process_state.pm.create_writable_pages(
-            None,
-            nz_size,
-            CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
-            |_| Ok(0),
-        )
-    } {
-        Ok(ptr) => ptr.as_usize(),
-        Err(_) => return NtStatus::STATUS_NO_MEMORY,
+    let shared_info_va = match alloc_zeroed_user_page(process_state) {
+        Ok(va) => va,
+        Err(status) => return status,
     };
 
-    // Zero-fill the output buffer.
-    // Safety: user_connect_ptr was validated non-zero above and the guest
-    // memory at that address was set up by USER32 before invoking the syscall.
     unsafe {
         core::ptr::write_bytes(user_connect_ptr as *mut u8, 0, user_connect_size);
-    }
 
-    // USERCONNECT_INFO layout (reverse-engineered from USER32 init):
-    //   offset 0x00: ulVersion (ULONG) — connection protocol version
-    //   offset 0x08: pSharedInfo (PVOID) — pointer to SHAREDINFO
-    //   offset 0x10: pServerInfo (PVOID) — pointer to SERVERINFO (psi)
-    //   ... other fields ...
-    //
-    // USER32's init code does approximately:
-    //   gSharedInfo = pUserConnect->pSharedInfo;
-    //   gpsi = gSharedInfo->psi;
-    //
-    // We set pSharedInfo to our zero-filled page and populate a few pointer
-    // fields so that regardless of which exact offset USER32 reads, it gets
-    // a valid (non-NULL) pointer.
-
-    // Safety: the buffer is guest-mapped and large enough for the 0x20-byte
-    // prefix we populate below.
-    unsafe {
         let buf = user_connect_ptr as *mut u64;
-        // offset 0x00: version field (Win Vista+)
         core::ptr::write(buf, 0x0600);
-        // offset 0x08: SHAREDINFO pointer
         core::ptr::write(buf.add(1), shared_info_va as u64);
-        // offset 0x10: another pointer (sometimes pDesktopInfo)
         core::ptr::write(buf.add(2), shared_info_va as u64);
-        // offset 0x18: yet another pointer
         core::ptr::write(buf.add(3), shared_info_va as u64);
 
-        // Inside the SHAREDINFO structure:
-        //   +0x00: dwFlags  — leave as 0 (no capabilities)
-        //   +0x08: psi (SERVERINFO pointer) — point within our page
-        let si = shared_info_va as *mut u64;
-        core::ptr::write(si.add(1), (shared_info_va + 0x100) as u64);
-        // +0x10: aheList (USER handle table) — leave as NULL; USER32
-        //        checks for NULL before use.
+        let shared_info = shared_info_va as *mut u64;
+        core::ptr::write(shared_info.add(1), (shared_info_va + 0x100) as u64);
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "trace_debug")]
     {
         use litebox::platform::DebugLogProvider as _;
         litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-            "NT shim: NtUserProcessConnect → shared_info at 0x{:X}\n",
-            shared_info_va,
+            "NT shim: NtUserProcessConnect shared_info=0x{shared_info_va:X}\n",
         ));
     }
 
     NtStatus::STATUS_SUCCESS
 }
 
-/// `NtGdiInit2` — win32k syscall 0x12E8.
+/// `NtUserGetDpiForCurrentProcess` reports the process DPI used by USER32's
+/// awareness helpers. A headless console sandbox behaves like the default
+/// 96-DPI environment.
+pub(crate) fn nt_user_get_dpi_for_current_process(ctx: &mut crate::ExecutionContext) -> NtStatus {
+    const DEFAULT_PROCESS_DPI: usize = 96;
+
+    ctx.regs.rax = DEFAULT_PROCESS_DPI;
+
+    #[cfg(feature = "trace_debug")]
+    {
+        use litebox::platform::DebugLogProvider as _;
+        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+            "NT shim: NtUserGetDpiForCurrentProcess -> {DEFAULT_PROCESS_DPI}\n",
+        ));
+    }
+
+    NtStatus::STATUS_SUCCESS
+}
+
+/// `NtUserSetProcessDpiAwarenessContext` applies USER32's normalized
+/// awareness context. In the headless sandbox USER32 caches the chosen context
+/// in user mode, so reporting success is sufficient.
+pub(crate) fn nt_user_set_process_dpi_awareness_context(
+    ctx: &mut crate::ExecutionContext,
+) -> NtStatus {
+    let args = NtSyscallArgs::from_ctx(ctx);
+    let context = args.arg0 as isize;
+    ctx.regs.rax = 1;
+
+    #[cfg(feature = "trace_debug")]
+    {
+        use litebox::platform::DebugLogProvider as _;
+        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+            "NT shim: NtUserSetProcessDpiAwarenessContext(context=0x{context:X}) -> 1\n",
+        ));
+    }
+
+    NtStatus::STATUS_SUCCESS
+}
+
+/// `NtUserDisableProcessWindowFiltering` only toggles GUI-only filtering
+/// behavior. In the headless sandbox it is a success-shaped no-op.
+pub(crate) fn nt_user_disable_process_window_filtering(
+    ctx: &mut crate::ExecutionContext,
+) -> NtStatus {
+    ctx.regs.rax = 1;
+
+    #[cfg(feature = "trace_debug")]
+    {
+        use litebox::platform::DebugLogProvider as _;
+        litebox_platform_multiplex::platform()
+            .debug_log_print("NT shim: NtUserDisableProcessWindowFiltering -> 1\n");
+    }
+
+    NtStatus::STATUS_SUCCESS
+}
+
+/// `NtUserSetProcessMousewheelRoutingMode` configures GUI input routing.
+/// Console guests have no mouse-wheel routing, but USER32 treats a nonzero
+/// result as success.
+pub(crate) fn nt_user_set_process_mousewheel_routing_mode(
+    ctx: &mut crate::ExecutionContext,
+) -> NtStatus {
+    let args = NtSyscallArgs::from_ctx(ctx);
+    let mode = args.arg0 as u32;
+    ctx.regs.rax = 1;
+
+    #[cfg(feature = "trace_debug")]
+    {
+        use litebox::platform::DebugLogProvider as _;
+        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+            "NT shim: NtUserSetProcessMousewheelRoutingMode(mode={mode}) -> 1\n",
+        ));
+    }
+
+    NtStatus::STATUS_SUCCESS
+}
+
+/// `NtUserLoadUserApiHook` lazily loads optional USER API hook state.
+/// Returning zero keeps USER32 on the no-hook path without surfacing a hard
+/// failure.
+pub(crate) fn nt_user_load_user_api_hook(ctx: &mut crate::ExecutionContext) -> NtStatus {
+    ctx.regs.rax = 0;
+
+    #[cfg(feature = "trace_debug")]
+    {
+        use litebox::platform::DebugLogProvider as _;
+        litebox_platform_multiplex::platform()
+            .debug_log_print("NT shim: NtUserLoadUserApiHook -> 0\n");
+    }
+
+    NtStatus::STATUS_SUCCESS
+}
+
+/// `NtGdiInit2` returns a non-null per-process GDI shared section.
 ///
-/// Called by `gdi32full!GdiDllInitialize_OLD` to establish the per-process
-/// GDI connection.  Returns an opaque "cookie" pointer stored in `gCookie`.
-/// If the return is NULL, `GdiDllInitialize_OLD` fails, which causes USER32's
-/// `_UserClientDllInitialize` to return FALSE (DLL init failure).
+/// On real Windows the kernel maps a ~2 MB shared section that carries the
+/// GDI handle-table, ETW trace handles and miscellaneous subsystem state.
+/// `gdi32full!GdiDllInitialize` later reads entries at offsets up to
+/// `0x180210+` via `pGdiSharedMemory`; if any of the checked slots are zero
+/// the init fails.  We therefore allocate a region large enough to cover the
+/// known offsets and seed the required entries with non-zero sentinels.
 ///
-/// In our sandbox we allocate a zero-filled page and return its address as
-/// the cookie.  All-zeros means "no GDI rendering state", which is correct
-/// for a headless console sandbox.
+/// Additionally, `gdi32full!GdiProcessSetup` reads `PEB+0xF8`
+/// (GdiSharedHandleTable) and sets `pGdiSharedMemory = base + 0x180000`.
+/// We must write the shared section base to PEB+0xF8 so both paths converge
+/// on the same allocation.
 pub(crate) fn nt_gdi_init2(
     ctx: &mut crate::ExecutionContext,
     process_state: &Arc<NtProcessState>,
+    teb_va: usize,
 ) -> NtStatus {
-    let Some(nz_size) = NonZeroPageSize::<PAGE_SIZE>::new(PAGE_SIZE) else {
-        return NtStatus::STATUS_NO_MEMORY;
-    };
-    let cookie_va = match unsafe {
-        process_state.pm.create_writable_pages(
-            None,
-            nz_size,
-            CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
-            |_| Ok(0),
-        )
-    } {
-        Ok(ptr) => ptr.as_usize(),
-        Err(_) => return NtStatus::STATUS_NO_MEMORY,
+    // The largest known access is at 0x180210 + 21*8 = 0x180318.
+    // Round up generously to 0x182000 (pages).
+    const GDI_SHARED_SIZE: usize = 0x182000;
+
+    let shared_va = match alloc_zeroed_user_region(process_state, GDI_SHARED_SIZE) {
+        Ok(va) => va,
+        Err(status) => return status,
     };
 
-    ctx.regs.rax = cookie_va;
+    // Seed the three table ranges that `gdi32full` probes during init:
+    //   0x1800B0 + i*8  (main trace-handle table, indices 0..=21)
+    //   0x180160 + i*8  (alternate trace-handle table)
+    //   0x180210 + i*8  (extended subsystem table)
+    // And single entries:
+    //   0x180138  (fallback entry)
+    //   0x1801E8  (fallback entry)
+    // A non-zero sentinel of `1` satisfies the `cmp ..., 0 / je fail` checks
+    // in `gdi32full!GdiDllInitialize` without being a valid function pointer.
+    const SENTINEL: u64 = 1;
+    unsafe {
+        let base = shared_va as *mut u8;
 
-    #[cfg(debug_assertions)]
+        // Main table: 0x1800B0 + i*8 for i in 0..22
+        for i in 0u64..22 {
+            let off = 0x1800B0usize + (i as usize) * 8;
+            core::ptr::write((base.add(off)) as *mut u64, SENTINEL);
+        }
+
+        // Alternate table: 0x180160 + i*8 for i in 0..22
+        for i in 0u64..22 {
+            let off = 0x180160usize + (i as usize) * 8;
+            core::ptr::write((base.add(off)) as *mut u64, SENTINEL);
+        }
+
+        // Extended table: 0x180210 + i*8 for i in 0..22
+        for i in 0u64..22 {
+            let off = 0x180210usize + (i as usize) * 8;
+            core::ptr::write((base.add(off)) as *mut u64, SENTINEL);
+        }
+
+        // Single fallback entries
+        core::ptr::write((base.add(0x180138)) as *mut u64, SENTINEL);
+        core::ptr::write((base.add(0x1801E8)) as *mut u64, SENTINEL);
+    }
+
+    // Write the shared section base to PEB.GdiSharedHandleTable (PEB+0xF8)
+    // so that GdiProcessSetup can derive pGdiSharedMemory = base + 0x180000.
+    if teb_va != 0 {
+        unsafe {
+            // SAFETY: TEB and PEB are writable guest allocations that the shim
+            // owns for the lifetime of the process.
+            let peb_va = core::ptr::read((teb_va + 0x60) as *const u64) as usize;
+            if peb_va != 0 {
+                core::ptr::write(
+                    (peb_va + crate::peb_teb::peb_offsets::GDI_SHARED_HANDLE_TABLE) as *mut u64,
+                    shared_va as u64,
+                );
+            }
+        }
+    }
+
+    ctx.regs.rax = shared_va;
+
+    #[cfg(feature = "trace_debug")]
     {
         use litebox::platform::DebugLogProvider as _;
         litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-            "NT shim: NtGdiInit2 → cookie at 0x{:X}\n",
-            cookie_va,
+            "NT shim: NtGdiInit2 shared=0x{shared_va:X} size=0x{GDI_SHARED_SIZE:X}\n",
         ));
     }
 
     NtStatus::STATUS_SUCCESS
 }
 
-/// `NtGdiInit` — win32k syscall 0x12E7.
-///
-/// Called by `gdi32full!GdiProcessSetup` during GDI initialization.
-/// Returns a handle/pointer to GDI shared memory.  We return a dummy
-/// non-NULL pointer (same pattern as `NtGdiInit2`).
+/// `NtGdiInit` returns a non-null GDI shared-memory anchor.
 pub(crate) fn nt_gdi_init(
     ctx: &mut crate::ExecutionContext,
     process_state: &Arc<NtProcessState>,
 ) -> NtStatus {
-    let Some(nz_size) = NonZeroPageSize::<PAGE_SIZE>::new(PAGE_SIZE) else {
-        return NtStatus::STATUS_NO_MEMORY;
-    };
-    let gdi_shared_va = match unsafe {
-        process_state.pm.create_writable_pages(
-            None,
-            nz_size,
-            CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
-            |_| Ok(0),
-        )
-    } {
-        Ok(ptr) => ptr.as_usize(),
-        Err(_) => return NtStatus::STATUS_NO_MEMORY,
+    let shared_va = match alloc_zeroed_user_page(process_state) {
+        Ok(va) => va,
+        Err(status) => return status,
     };
 
-    ctx.regs.rax = gdi_shared_va;
+    ctx.regs.rax = shared_va;
 
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "trace_debug")]
     {
         use litebox::platform::DebugLogProvider as _;
         litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-            "NT shim: NtGdiInit → gdi_shared at 0x{:X}\n",
-            gdi_shared_va,
+            "NT shim: NtGdiInit shared=0x{shared_va:X}\n",
         ));
     }
 
     NtStatus::STATUS_SUCCESS
 }
 
-/// `CsrClientConnectToServer` pseudo-syscall handler.
+/// `NtUserGetSystemMetrics` returns system metric values.
 ///
-/// Signature (Windows x64 calling convention, captured via trampoline):
-/// ```text
-/// NTSTATUS CsrClientConnectToServer(
-///     PWSTR  ObjectDirectory,              // r10 (moved from rcx)
-///     ULONG  ServerDllIndex,               // rdx
-///     PVOID  ConnectionInformation,        // r8  — output buffer
-///     ULONG  ConnectionInformationLength,  // r9
-///     PBOOLEAN CalledFromServer            // [rsp+0x28]
-/// );
-/// ```
-///
-/// For `ServerDllIndex == 3` (USER subsystem), USER32 copies the entire
-/// `ConnectionInformation` buffer (0x248 bytes) into `gSharedInfo`.
-/// The first QWORD of that buffer must be a valid `psi` (SERVERINFO
-/// pointer) or USER32's init code will crash on `test byte [psi], 4`.
-///
-/// We allocate a zero-filled SERVERINFO page and write its address into
-/// `ConnectionInformation[0]`.  Zero flags in SERVERINFO means "no Win32k
-/// capabilities / headless" — exactly right for sandboxed console apps.
-pub(crate) fn csr_client_connect_to_server(
-    ctx: &mut crate::ExecutionContext,
-    process_state: &Arc<NtProcessState>,
-) -> NtStatus {
+/// In the headless sandbox we return sensible defaults for well-known metrics.
+/// Critically, `SM_CLEANBOOT` (67) must return `0` (normal boot) — libuv's
+/// `uv__winsock_init()` skips `WSAStartup()` entirely when this returns `1`,
+/// which breaks all networking.
+pub(crate) fn nt_user_get_system_metrics(ctx: &mut crate::ExecutionContext) -> NtStatus {
+    const SM_CLEANBOOT: u32 = 67;
+    const SM_CXSCREEN: u32 = 0;
+    const SM_CYSCREEN: u32 = 1;
+
     let args = NtSyscallArgs::from_ctx(ctx);
-    let _object_directory = args.arg0; // r10 — not used
-    let server_dll_index = args.arg1 as u32; // rdx
-    let conn_info_ptr = args.arg2; // r8
-    let conn_info_len = args.arg3; // r9 — length value
+    let index = args.arg0 as u32;
 
-    if conn_info_ptr == 0 {
-        return NtStatus::STATUS_INVALID_PARAMETER;
-    }
+    let value: usize = match index {
+        SM_CLEANBOOT => 0, // Normal boot — critical for WinSock init
+        SM_CXSCREEN => 1920,
+        SM_CYSCREEN => 1080,
+        _ => 0,
+    };
 
-    #[cfg(debug_assertions)]
+    ctx.regs.rax = value;
+
+    #[cfg(feature = "trace_debug")]
     {
         use litebox::platform::DebugLogProvider as _;
         litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-            "NT shim: CsrClientConnectToServer(server={}, buf=0x{:X}, len=0x{:X})\n",
-            server_dll_index,
-            conn_info_ptr,
-            conn_info_len,
+            "NT shim: NtUserGetSystemMetrics(index={index}) -> {value}\n",
         ));
-    }
-
-    // The 5th arg (CalledFromServer) is a pointer to BOOLEAN in USER32's
-    // `gfServerProcess`.  It's zero-initialized (.bss), so we don't need
-    // to write to it — FALSE (0) is already the correct value.
-
-    // Zero the output buffer for all subsystem indices.
-    let buf_size = conn_info_len.min(0x1000); // cap at one page
-    if buf_size > 0 {
-        unsafe {
-            core::ptr::write_bytes(conn_info_ptr as *mut u8, 0, buf_size);
-        }
-    }
-
-    // For the USER subsystem (index 3), fill in a minimal SERVERINFO
-    // so that gSharedInfo.psi (= gpsi) is non-NULL.
-    //
-    // Buffer layout observed from real CsrClientConnectToServer via cdb:
-    //   +0x00: ulVersion / flags (DWORD, not copied into gSharedInfo)
-    //   +0x08: psi (PSERVERINFO) — becomes gSharedInfo[0] = gpsi
-    //   +0x10: desktop heap ptr  — becomes gSharedInfo[1]
-    //   +0x18: cbHandleEntry     — becomes gSharedInfo[2]
-    //   +0x20: aheList           — becomes gSharedInfo[3]
-    //   ...
-    //
-    // USER32 copies buffer[0x08..0x248] (0x240 bytes) into gSharedInfo.
-    // Then: gpsi = gSharedInfo[0]; test byte [gpsi], 4.
-    if server_dll_index == 3 {
-        // Allocate a zero-filled page for the SERVERINFO structure.
-        let Some(nz_size) = NonZeroPageSize::<PAGE_SIZE>::new(PAGE_SIZE) else {
-            return NtStatus::STATUS_NO_MEMORY;
-        };
-        let server_info_va = match unsafe {
-            process_state.pm.create_writable_pages(
-                None,
-                nz_size,
-                CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
-                |_| Ok(0),
-            )
-        } {
-            Ok(ptr) => ptr.as_usize(),
-            Err(_) => return NtStatus::STATUS_NO_MEMORY,
-        };
-
-        // Populate SERVERINFO.dwSRVIFlags at the start of the page.
-        // Real Windows has 0x0d14 here.  USER32 checks `test byte [gpsi], 4`
-        // (bit 2 = SRVIF_*); if set, it initializes IMM.  We clear bit 2
-        // to skip IMM init since the sandbox has no IME support.
-        // The remaining flags (0x0d10) still look reasonable.
-        unsafe {
-            core::ptr::write(server_info_va as *mut u32, 0x0d10_u32);
-        }
-
-        // Write psi at buffer+0x08 (NOT +0x00).
-        if buf_size >= 0x10 {
-            unsafe {
-                let buf = conn_info_ptr as *mut u64;
-                // +0x08: SERVERINFO pointer → gSharedInfo[0] = gpsi
-                core::ptr::write(buf.add(1), server_info_va as u64);
-            }
-        }
-
-        #[cfg(debug_assertions)]
-        {
-            use litebox::platform::DebugLogProvider as _;
-            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                "NT shim: CsrClientConnectToServer(USER) → SERVERINFO at 0x{:X}, buf_size=0x{:X}\n",
-                server_info_va,
-                buf_size,
-            ));
-        }
     }
 
     NtStatus::STATUS_SUCCESS

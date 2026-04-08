@@ -102,6 +102,12 @@ impl<Platform: RawSyncPrimitivesProvider> WaitState<Platform> {
         WaitContext::new(&self.waker)
     }
 
+    /// Returns a clone of this thread's waker, suitable for storing externally
+    /// so that other threads can wake this thread from a blocking wait.
+    pub fn clone_waker(&self) -> Waker<Platform> {
+        self.waker.clone()
+    }
+
     /// Returns a handle that can be used to interrupt the current thread,
     /// whether it is waiting or running guest code.
     pub fn thread_handle(&self) -> ThreadHandle<Platform>

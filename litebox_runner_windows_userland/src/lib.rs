@@ -3,10 +3,9 @@
 
 //! Windows userland PE runner for LiteBox.
 //!
-//! Loads a PE executable into a LiteBox address space using the NT shim,
-//! generates stub DLLs (ntdll.dll, kernel32.dll, advapi32.dll, ws2_32.dll),
-//! resolves imports, synthesizes PEB/TEB, and runs the guest until it
-//! terminates.
+//! Loads a PE executable and real guest DLLs into a LiteBox address space
+//! using the NT shim. Only real NT syscall stubs from guest `ntdll.dll` are
+//! rewritten to jump to the shim trampoline; other guest DLL code runs as-is.
 //!
 //! ## Usage
 //!
@@ -14,9 +13,6 @@
 //! litebox_runner_windows_userland --dll-tar node_windows.tar --pe-file node.exe -- --version
 //! ```
 //!
-//! For Phase 1, static PE executables that import from the built-in stub DLLs
-//! are supported. The guest uses `syscall` to communicate with the NT shim.
-
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 #![allow(
     // PE format code inherently involves cross-width casts and integer wrapping.
@@ -47,8 +43,10 @@ mod real_dlls;
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering::Relaxed};
 
 use litebox::mm::linux::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize};
 use litebox::platform::{AddressSpaceProvider, RawConstPointer, RawMutPointer, SystemInfoProvider};
@@ -93,7 +91,7 @@ fn write_trace_log(file_name: &str, data: &[u8]) {
 }
 
 #[cfg(all(debug_assertions, feature = "trace_debug"))]
-static mut CRASH_FILE_HANDLE: *mut core::ffi::c_void = core::ptr::null_mut();
+static CRASH_FILE_HANDLE: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Run Windows PE programs with LiteBox.
 #[derive(Parser, Debug)]
@@ -156,6 +154,194 @@ fn build_guest_command_line(program_name: &str, guest_arguments: &[String]) -> S
         .map(quote_windows_command_line_arg)
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn drive_path_to_vfs(path: &str) -> Option<String> {
+    if let Some(unc) = path.strip_prefix("\\\\?\\UNC\\") {
+        return Some(format!("//{}", unc.replace('\\', "/").to_ascii_lowercase()));
+    }
+    let path = path
+        .strip_prefix("\\??\\")
+        .or_else(|| path.strip_prefix("\\DosDevices\\"))
+        .or_else(|| path.strip_prefix("\\\\?\\"))
+        .unwrap_or(path);
+    if path.len() < 2 || path.as_bytes()[1] != b':' {
+        return None;
+    }
+
+    let drive = (path.as_bytes()[0] as char).to_ascii_lowercase();
+    let rest = if path.len() > 2 { &path[2..] } else { "" };
+    Some(format!(
+        "/{drive}{}",
+        rest.replace('\\', "/").to_ascii_lowercase()
+    ))
+}
+
+fn push_guest_host_file(
+    host_path: PathBuf,
+    mirrored: &mut Vec<(String, PathBuf)>,
+    seen: &mut std::collections::BTreeSet<String>,
+) {
+    let Some(host_path_str) = host_path.to_str() else {
+        return;
+    };
+    let Some(vfs_path) = drive_path_to_vfs(host_path_str) else {
+        return;
+    };
+    if !seen.insert(vfs_path.clone()) {
+        return;
+    }
+    mirrored.push((vfs_path, host_path));
+}
+
+fn collect_host_tree_files(
+    root: &Path,
+    mirrored: &mut Vec<(String, PathBuf)>,
+    seen: &mut std::collections::BTreeSet<String>,
+) -> Result<()> {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).map_err(|e| {
+            anyhow!(
+                "Could not enumerate guest host directory {}: {e}",
+                dir.display()
+            )
+        })? {
+            let entry = entry.map_err(|e| {
+                anyhow!(
+                    "Could not read guest host directory entry in {}: {e}",
+                    dir.display()
+                )
+            })?;
+            let file_type = entry.file_type().map_err(|e| {
+                anyhow!(
+                    "Could not query guest host entry type for {}: {e}",
+                    entry.path().display()
+                )
+            })?;
+            let path = entry.path();
+            if file_type.is_dir() {
+                pending.push(path);
+            } else if file_type.is_file() {
+                let host_path = path.canonicalize().unwrap_or(path);
+                push_guest_host_file(host_path, mirrored, seen);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_guest_argument_host_files(
+    guest_arguments: &[String],
+    launch_cwd: &Path,
+) -> Result<Vec<(String, PathBuf)>> {
+    let mut mirrored = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut mirrored_roots = std::collections::BTreeSet::new();
+
+    for arg in guest_arguments {
+        let path = Path::new(arg);
+        let is_relative_guest_path = !path.is_absolute();
+        let host_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            launch_cwd.join(path)
+        };
+        let host_path = host_path.canonicalize().unwrap_or(host_path);
+        if !host_path.is_file() {
+            continue;
+        }
+
+        push_guest_host_file(host_path.clone(), &mut mirrored, &mut seen);
+        if is_relative_guest_path
+            && let Some(root) = host_path.parent().map(Path::to_path_buf)
+            && mirrored_roots.insert(root.clone())
+        {
+            collect_host_tree_files(&root, &mut mirrored, &mut seen)?;
+        }
+    }
+
+    Ok(mirrored)
+}
+
+fn ensure_vfs_parent_dirs<F: litebox::fs::FileSystem>(
+    fs: &F,
+    path: &str,
+    dir_mode: litebox::fs::Mode,
+) {
+    let mut current = String::new();
+    let mut parts = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .peekable();
+    while let Some(segment) = parts.next() {
+        if parts.peek().is_none() {
+            break;
+        }
+        current.push('/');
+        current.push_str(segment);
+        let _ = fs.mkdir(current.as_str(), dir_mode);
+    }
+}
+
+fn mirror_guest_host_files_into_vfs<F: litebox::fs::FileSystem>(
+    fs: &F,
+    files: &[(String, PathBuf)],
+    dir_mode: litebox::fs::Mode,
+    file_mode: litebox::fs::Mode,
+) -> Result<()> {
+    use std::io::Read as _;
+
+    for (vfs_path, host_path) in files {
+        ensure_vfs_parent_dirs(fs, vfs_path, dir_mode);
+        let fd = fs
+            .open(
+                vfs_path.as_str(),
+                litebox::fs::OFlags::CREAT
+                    | litebox::fs::OFlags::WRONLY
+                    | litebox::fs::OFlags::TRUNC,
+                file_mode,
+            )
+            .map_err(|e| anyhow!("Could not mirror {vfs_path} into guest VFS: {e:?}"))?;
+
+        let mut host_file = std::fs::File::open(host_path).map_err(|e| {
+            anyhow!(
+                "Could not open guest host file {}: {e}",
+                host_path.display()
+            )
+        })?;
+        #[allow(clippy::large_stack_arrays)] // 64 KiB read buffer avoids many small reads
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let read = host_file.read(&mut buf).map_err(|e| {
+                anyhow!(
+                    "Could not read guest host file {}: {e}",
+                    host_path.display()
+                )
+            })?;
+            if read == 0 {
+                break;
+            }
+            let mut written = 0;
+            while written < read {
+                let n = fs.write(&fd, &buf[written..read], None).map_err(|e| {
+                    anyhow!("Could not write mirrored guest file {vfs_path}: {e:?}")
+                })?;
+                if n == 0 {
+                    let _ = fs.close(&fd);
+                    return Err(anyhow!(
+                        "Mirrored guest file write made no progress for {vfs_path}"
+                    ));
+                }
+                written += n;
+            }
+        }
+
+        fs.close(&fd)
+            .map_err(|e| anyhow!("Could not close mirrored guest file {vfs_path}: {e:?}"))?;
+    }
+
+    Ok(())
 }
 
 const LDRP_HASH_BUCKET_COUNT: usize = 32;
@@ -288,7 +474,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         #[cfg(all(debug_assertions, feature = "trace_debug"))]
         {
             // Keep a raw handle ready for zero-allocation crash logging.
-            CRASH_FILE_HANDLE = open_trace_log_handle("crash_filter.txt");
+            CRASH_FILE_HANDLE.store(open_trace_log_handle("crash_filter.txt"), Relaxed);
         }
         unsafe extern "system" fn crash_filter(info: *mut ExceptionPointers) -> i32 {
             unsafe {
@@ -364,10 +550,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                     buf[pos] = b'\n';
                     pos += 1;
 
-                    if !CRASH_FILE_HANDLE.is_null() && CRASH_FILE_HANDLE != (-1isize) as *mut _ {
+                    let cfh = CRASH_FILE_HANDLE.load(Relaxed);
+                    if !cfh.is_null() && cfh != (-1isize) as *mut _ {
                         let mut w = 0u32;
                         WriteFile(
-                            CRASH_FILE_HANDLE,
+                            cfh,
                             buf.as_ptr(),
                             pos as u32,
                             &raw mut w,
@@ -376,9 +563,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                     }
                 }
 
+                // Get runner image base for RVA calculation.
+                unsafe extern "system" {
+                    fn GetModuleHandleW(name: *const u16) -> usize;
+                }
+                let image_base = GetModuleHandleW(core::ptr::null()) as u64;
+                let rva = rip.saturating_sub(image_base);
                 eprintln!(
-                    "[CRASH] Unhandled exception: code=0x{:08X} addr=0x{:X} rip=0x{:X} rsp=0x{:X}",
-                    rec.exception_code, rec.exception_address, rip, rsp,
+                    "[CRASH] Unhandled exception: code=0x{:08X} addr=0x{:X} rip=0x{:X} (base=0x{:X} rva=0x{:X}) rsp=0x{:X}",
+                    rec.exception_code, rec.exception_address, rip, image_base, rva, rsp,
                 );
                 if rec.number_parameters >= 2 {
                     eprintln!(
@@ -386,7 +579,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                         rec.exception_information[0], rec.exception_information[1],
                     );
                 }
-                -1 // EXCEPTION_EXECUTE_HANDLER
+                1 // EXCEPTION_EXECUTE_HANDLER
             }
         }
         unsafe extern "system" {
@@ -418,13 +611,23 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 ovl: *mut core::ffi::c_void,
             ) -> i32;
         }
-        static mut STDERR_HANDLE: *mut core::ffi::c_void = core::ptr::null_mut();
-        static mut LOG_FILE_HANDLE: *mut core::ffi::c_void = core::ptr::null_mut();
-        STDERR_HANDLE = GetStdHandle(0xFFFF_FFF4u32); // STD_ERROR_HANDLE
+        static STDERR_HANDLE: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(core::ptr::null_mut());
+        static LOG_FILE_HANDLE: AtomicPtr<core::ffi::c_void> =
+            AtomicPtr::new(core::ptr::null_mut());
+        static RUNNER_IMAGE_BASE: AtomicU64 = AtomicU64::new(0);
+        STDERR_HANDLE.store(GetStdHandle(0xFFFF_FFF4u32), Relaxed); // STD_ERROR_HANDLE
+        // Capture image base while GS is still host TEB.
+        {
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn GetModuleHandleW(name: *const u16) -> usize;
+            }
+            RUNNER_IMAGE_BASE.store(GetModuleHandleW(core::ptr::null()) as u64, Relaxed);
+        }
         #[cfg(all(debug_assertions, feature = "trace_debug"))]
         {
             // Keep a raw handle ready for zero-allocation crash logging.
-            LOG_FILE_HANDLE = open_trace_log_handle("veh_log.txt");
+            LOG_FILE_HANDLE.store(open_trace_log_handle("veh_log.txt"), Relaxed);
         }
         unsafe extern "system" fn early_veh(info: *mut ExPtrs2) -> i32 {
             unsafe {
@@ -435,7 +638,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 let rip = core::ptr::read_unaligned(ctx.add(0xF8).cast::<u64>());
                 let rsp = core::ptr::read_unaligned(ctx.add(0x98).cast::<u64>());
                 // Format into a stack buffer (no heap allocation).
-                let mut buf = [0u8; 200];
+                let mut buf = [0u8; 280];
                 let len = {
                     let prefix = b"[EARLY-VEH] code=0x";
                     buf[..prefix.len()].copy_from_slice(prefix);
@@ -445,6 +648,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                     buf[pos..pos + mid.len()].copy_from_slice(mid);
                     pos += mid.len();
                     pos += hex_u64(&mut buf[pos..], rip);
+                    // Add RVA from pre-captured image base
+                    let rva_tag = b" rva=0x";
+                    buf[pos..pos + rva_tag.len()].copy_from_slice(rva_tag);
+                    pos += rva_tag.len();
+                    let rva = rip.saturating_sub(RUNNER_IMAGE_BASE.load(Relaxed));
+                    pos += hex_u64(&mut buf[pos..], rva);
                     let mid2 = b" rsp=0x";
                     buf[pos..pos + mid2.len()].copy_from_slice(mid2);
                     pos += mid2.len();
@@ -454,18 +663,17 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 };
                 let mut written = 0u32;
                 WriteFile(
-                    STDERR_HANDLE,
+                    STDERR_HANDLE.load(Relaxed),
                     buf.as_ptr(),
                     len as u32,
                     &raw mut written,
                     core::ptr::null_mut(),
                 );
                 // Also write to dedicated log file.
-                if !LOG_FILE_HANDLE.is_null()
-                    && LOG_FILE_HANDLE != (-1isize) as *mut core::ffi::c_void
-                {
+                let lfh = LOG_FILE_HANDLE.load(Relaxed);
+                if !lfh.is_null() && lfh != (-1isize) as *mut core::ffi::c_void {
                     WriteFile(
-                        LOG_FILE_HANDLE,
+                        lfh,
                         buf.as_ptr(),
                         len as u32,
                         &raw mut written,
@@ -513,14 +721,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         // VEH self-test: trigger a deliberate access violation and verify VEH fires.
         #[cfg(debug_assertions)]
         {
-            static mut VEH_TEST_FIRED: bool = false;
+            static VEH_TEST_FIRED: core::sync::atomic::AtomicBool =
+                core::sync::atomic::AtomicBool::new(false);
             unsafe extern "system" fn veh_test_handler(info: *mut ExPtrs2) -> i32 {
                 unsafe {
                     let info = &*info;
                     let code = core::ptr::read_unaligned(info.exception_record.cast::<u32>());
                     if code == 0xC0000005 {
                         // ACCESS_VIOLATION — skip the faulting instruction
-                        VEH_TEST_FIRED = true;
+                        VEH_TEST_FIRED.store(true, Relaxed);
                         let ctx = info.context_record.cast_mut();
                         let rip = core::ptr::read_unaligned(ctx.add(0xF8).cast::<u64>());
                         // Skip 2 bytes (the faulting mov [0], al instruction)
@@ -542,7 +751,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 fn RemoveVectoredExceptionHandler(handle: usize) -> u32;
             }
             RemoveVectoredExceptionHandler(test_h);
-            if !VEH_TEST_FIRED {
+            if !VEH_TEST_FIRED.load(Relaxed) {
                 eprintln!("[VEH-TEST] FAIL: VEH handler did NOT fire for test exception!");
             }
         }
@@ -581,6 +790,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
 
     // Allocate guest address space.
+    // NOTE: prefer_slot0_for_first_address_space() is NOT used here.
+    // Unlike the Linux-on-Windows runner, the Windows runner must NOT use
+    // slot 0 because the host process's ASLR allocations overlap with
+    // guest VA ranges in slot 0, causing STATUS_DLL_INIT_FAILED during
+    // ntdll loader initialization.
     let as_id = platform
         .create_address_space()
         .map_err(|e| anyhow!("Failed to allocate address space: {e:?}"))?;
@@ -594,6 +808,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let PEB_TEB_BASE = guest_va_start + PEB_TEB_OFFSET;
 
     let pm = litebox::mm::PageManager::new(&litebox, as_range);
+    let syscall_entry = platform.get_syscall_entry_point() as u64;
 
     // Create the process state that will be shared with the shim.
     // The runner uses pm via process_state.pm for all mapping operations.
@@ -624,6 +839,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         ldrp_hash_table_va: usize,
         /// Guest VA of ntdll's internal PebLdr.
         pebldr_va: usize,
+        /// Cached ntdll boot data for child process spawning.
+        ntdll_boot_data: alloc::sync::Arc<litebox_shim_windows::NtdllBootData>,
     }
 
     let load_result = {
@@ -642,18 +859,29 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             cli_args.dll_tar.display(),
             tar_data.len(),
         );
+        let host_launch_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("C:\\"));
+        let host_launch_cwd = host_launch_cwd.canonicalize().unwrap_or(host_launch_cwd);
+        let guest_host_files =
+            collect_guest_argument_host_files(&cli_args.guest_arguments, &host_launch_cwd)?;
+
         // Create layered VFS early so both boot loading and the shim share it.
         // Architecture: InMemFS (writable) → DeviceFS → TarFS (read-only).
         let vfs_arc = {
+            let dev_fs = litebox::fs::devices::FileSystem::new(&litebox);
+            let tar_fs =
+                litebox::fs::tar_ro::FileSystem::new(&litebox, alloc::borrow::Cow::Owned(tar_data));
+
             let mut in_mem = litebox::fs::in_mem::FileSystem::new(&litebox);
+            let mut mirror_result: Result<()> = Ok(());
             in_mem.with_root_privileges(|fs| {
                 use litebox::fs::FileSystem as _;
 
+                // 0o777 — writable by all users so that user 1000 (the
+                // sandbox guest) can create files in any directory.
+                // This is a single-user sandbox so world-writable is fine.
                 const DIR_MODE: litebox::fs::Mode = litebox::fs::Mode::RWXU
-                    .union(litebox::fs::Mode::RGRP)
-                    .union(litebox::fs::Mode::XGRP)
-                    .union(litebox::fs::Mode::ROTH)
-                    .union(litebox::fs::Mode::XOTH);
+                    .union(litebox::fs::Mode::RWXG)
+                    .union(litebox::fs::Mode::RWXO);
                 const FILE_MODE: litebox::fs::Mode = litebox::fs::Mode::RUSR
                     .union(litebox::fs::Mode::WUSR)
                     .union(litebox::fs::Mode::RGRP)
@@ -664,6 +892,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                     "/c/program files",
                     "/c/program files/common files",
                     "/c/program files/common files/ssl",
+                    // Temp directories — Python/Node.js expect writable TEMP/TMP
+                    "/c/windows",
+                    "/c/windows/temp",
+                    // User-profile temp path (matches %USERPROFILE%\AppData\Local\Temp)
+                    "/c/users",
+                    "/c/users/sandbox",
+                    "/c/users/sandbox/appdata",
+                    "/c/users/sandbox/appdata/local",
+                    "/c/users/sandbox/appdata/local/temp",
                 ] {
                     let _ = fs.mkdir(dir, DIR_MODE);
                 }
@@ -676,11 +913,40 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 ) {
                     let _ = fs.close(&fd);
                 }
-            });
 
-            let dev_fs = litebox::fs::devices::FileSystem::new(&litebox);
-            let tar_fs =
-                litebox::fs::tar_ro::FileSystem::new(&litebox, alloc::borrow::Cow::Owned(tar_data));
+                // Create the cwd directory (and ancestors) in VFS so
+                // NtQueryAttributesFile checks on the cwd succeed.
+                if let Some(cwd_str) = host_launch_cwd.to_str() {
+                    let cwd_cleaned = cwd_str
+                        .strip_prefix("\\\\?\\")
+                        .unwrap_or(cwd_str);
+                    if cwd_cleaned.len() >= 2 && cwd_cleaned.as_bytes()[1] == b':' {
+                        let drive = (cwd_cleaned.as_bytes()[0] as char).to_ascii_lowercase();
+                        let rest = &cwd_cleaned[2..];
+                        let vfs_cwd = alloc::format!(
+                            "/{drive}{}",
+                            rest.replace('\\', "/").to_ascii_lowercase()
+                        );
+                        // Create each ancestor of the vfs_cwd path.
+                        let mut accum = String::new();
+                        for seg in vfs_cwd.split('/').filter(|s| !s.is_empty()) {
+                            accum.push('/');
+                            accum.push_str(seg);
+                            let _ = fs.mkdir(&accum, DIR_MODE);
+                        }
+                    }
+                }
+
+                if mirror_result.is_ok() {
+                    mirror_result = mirror_guest_host_files_into_vfs(
+                        fs,
+                        &guest_host_files,
+                        DIR_MODE,
+                        FILE_MODE,
+                    );
+                }
+            });
+            mirror_result?;
 
             let inner = litebox::fs::layered::FileSystem::new(
                 &litebox,
@@ -717,6 +983,73 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             }
         }
 
+        // Mirror the --pe-file EXE into the VFS so that child processes
+        // (spawned via NtCreateUserProcess) can read the same binary from
+        // the virtual filesystem.
+        if !pe_data.is_empty() {
+            if let Some(pe_path) = &cli_args.pe_file {
+                let canon = pe_path
+                    .canonicalize()
+                    .ok()
+                    .and_then(|p| p.to_str().map(std::string::ToString::to_string));
+                let win32 = canon.unwrap_or_else(|| {
+                    pe_path
+                        .to_str()
+                        .unwrap_or("C:\\app\\unknown.exe")
+                        .to_string()
+                });
+                let win32 = win32.strip_prefix("\\\\?\\").unwrap_or(&win32);
+                // Convert to VFS path: C:\Program Files\nodejs\node.exe → /c/program files/nodejs/node.exe
+                if win32.len() >= 2 && win32.as_bytes()[1] == b':' {
+                    let drive = (win32.as_bytes()[0] as char).to_ascii_lowercase();
+                    let rest = &win32[2..];
+                    let vfs_exe_path = format!(
+                        "/{drive}{}",
+                        rest.replace('\\', "/").to_ascii_lowercase()
+                    );
+                    use litebox::fs::FileSystem as _;
+                    // Ensure parent directories exist.
+                    ensure_vfs_parent_dirs(
+                        &*vfs_arc,
+                        &vfs_exe_path,
+                        litebox::fs::Mode::RWXU
+                            .union(litebox::fs::Mode::RWXG)
+                            .union(litebox::fs::Mode::RWXO),
+                    );
+                    // Write the PE bytes.
+                    if let Ok(fd) = vfs_arc.open(
+                        &vfs_exe_path,
+                        litebox::fs::OFlags::CREAT
+                            | litebox::fs::OFlags::WRONLY
+                            | litebox::fs::OFlags::TRUNC,
+                        litebox::fs::Mode::RUSR
+                            .union(litebox::fs::Mode::WUSR)
+                            .union(litebox::fs::Mode::RGRP)
+                            .union(litebox::fs::Mode::ROTH),
+                    ) {
+                        let mut offset = 0;
+                        while offset < pe_data.len() {
+                            match vfs_arc.write(&fd, &pe_data[offset..], None) {
+                                Ok(n) if n > 0 => offset += n,
+                                _ => break,
+                            }
+                        }
+                        let _ = vfs_arc.close(&fd);
+                        trace_debugln!(
+                            "[vfs] Mirrored PE file into VFS: {} ({} bytes)",
+                            vfs_exe_path,
+                            pe_data.len()
+                        );
+                    } else {
+                        trace_debugln!(
+                            "[vfs] WARNING: Failed to mirror PE file into VFS: {}",
+                            vfs_exe_path
+                        );
+                    }
+                }
+            }
+        }
+
         // If no --pe-file, look for an EXE inside the VFS.
         let pe_data = if pe_data.is_empty() {
             let exe_path = real_dlls::find_vfs_file_by_name(&vfs_arc, ".exe")
@@ -749,45 +1082,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             pe_data
         };
 
-        let mut pe_data = pe_data;
         let exe_parsed = PeParsedFile::parse(&pe_data)
             .map_err(|e| anyhow!("Failed to parse PE executable: {e}"))?;
-
-        // Patch int 0x29 (__fastfail) → int 3 (breakpoint) only inside
-        // executable sections before loading. Scanning the entire PE corrupts
-        // arbitrary data blobs such as V8's embedded snapshot in .rdata.
-        {
-            let mut patched = 0usize;
-            for section in &exe_parsed.sections {
-                if section.characteristics
-                    & litebox_common_windows::pe::section_chars::IMAGE_SCN_MEM_EXECUTE
-                    == 0
-                {
-                    continue;
-                }
-
-                let start = section.pointer_to_raw_data as usize;
-                let size = section.size_of_raw_data as usize;
-                if size < 2 || start >= pe_data.len() {
-                    continue;
-                }
-                let end = start.saturating_add(size).min(pe_data.len());
-                let section_bytes = &mut pe_data[start..end];
-
-                for i in 0..section_bytes.len().saturating_sub(1) {
-                    if section_bytes[i] == 0xCD && section_bytes[i + 1] == 0x29 {
-                        section_bytes[i] = 0xCC; // int 3
-                        section_bytes[i + 1] = 0x90; // nop
-                        patched += 1;
-                    }
-                }
-            }
-            if patched > 0 {
-                trace_debugln!(
-                    "[real-dlls] Patched {patched} __fastfail (int 0x29) in EXE → int 3"
-                );
-            }
-        }
 
         let preferred_base = exe_parsed.image_base as usize;
         let exe_base = if preferred_base >= guest_va_start && preferred_base < guest_va_end {
@@ -831,18 +1127,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         let result = real_dlls::load_ntdll_for_init(&vfs_arc, &mut pm_mapper, guest_va_start)?;
 
         // Map the trampoline page.
-        let syscall_entry = platform.get_syscall_entry_point() as u64;
-        let fwd_gs_table_ptr = platform.forward_gs_table_ptr() as u64;
-        let rev_gs_table_ptr = platform.reverse_gs_table_ptr() as u64;
         let tramp_va = result.trampoline_va;
         let entry_off = result.entry_ptr_offset;
-        let gs_off = result.gs_table_ptr_offset;
-        let rev_gs_off = result.reverse_gs_table_ptr_offset;
 
         let mut tramp_data = result.trampoline;
         tramp_data[entry_off..entry_off + 8].copy_from_slice(&syscall_entry.to_le_bytes());
-        tramp_data[gs_off..gs_off + 8].copy_from_slice(&fwd_gs_table_ptr.to_le_bytes());
-        tramp_data[rev_gs_off..rev_gs_off + 8].copy_from_slice(&rev_gs_table_ptr.to_le_bytes());
 
         pm_mapper
             .pre_reserve(tramp_va, PAGE_SIZE)
@@ -860,13 +1149,25 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             "[real-dlls] Trampoline at 0x{tramp_va:X}, entry ptr at +0x{entry_off:X} = 0x{syscall_entry:X}"
         );
         // Store the trampoline code VA for win32k stub patching.
-        // The first 0x18 bytes are three 8-byte pointer slots; code starts at +0x18.
-        process_state.set_trampoline_code_va(tramp_va + 0x18);
+        // The first 0x08 bytes are one 8-byte pointer slot (shim entry);
+        // code starts at +0x08.
+        process_state.set_trampoline_code_va(tramp_va + 0x08);
+        // Register the full trampoline page range with the platform so the
+        // NtContinue/NtContinueEx gate excludes it from gating.  The trampoline
+        // is transition code that happens to live in guest VA.
+        litebox_platform_windows_userland::WindowsUserland::set_syscall_trampoline_range(
+            tramp_va,
+            tramp_va + PAGE_SIZE,
+        );
         // Store KiUserInvertedFunctionTable VA so the shim can register DLLs
         // loaded via NtMapViewOfSection (needed for SEH unwinding).
         if result.inverted_function_table_va != 0 {
             process_state.set_inverted_function_table_va(result.inverted_function_table_va);
         }
+        process_state.set_rtl_dispatch_exception_va(result.rtl_dispatch_exception_va);
+        process_state.set_rtl_restore_context_va(result.rtl_restore_context_va);
+        process_state.set_zw_raise_exception_va(result.zw_raise_exception_va);
+        process_state.set_rtl_raise_status_va(result.rtl_raise_status_va);
         trace_debugln!(
             "[real-dlls] {} stubs rewritten ({} identified)",
             result.stubs_rewritten,
@@ -898,6 +1199,35 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 image_size: result.ntdll.image_size,
             },
         ];
+        for module in &module_bases {
+            process_state.register_module(module.clone());
+            process_state.track_image_mapping(module.base_address, module.image_size);
+        }
+
+        // Build cached NtdllBootData for child process spawning.
+        // All VAs are converted to RVAs (relative to ntdll load base at
+        // partition_start + REAL_DLL_OFFSET) so they're partition-independent.
+        let ntdll_base = result.ntdll.base_address;
+        let to_rva = |va: usize| -> usize {
+            if va == 0 { 0 } else { va - ntdll_base }
+        };
+        let ntdll_boot_data = alloc::sync::Arc::new(litebox_shim_windows::NtdllBootData {
+            image: result.ntdll.pe_data,
+            trampoline: tramp_data.clone(),
+            syscall_entry,
+            syscall_map: result.syscall_map.clone(),
+            unhandled_stubs: result.unhandled_stubs.clone(),
+            ldr_init_thunk_rva: to_rva(result.ldr_init_thunk_va),
+            rtl_user_thread_start_rva: to_rva(result.rtl_user_thread_start_va),
+            ki_user_exception_dispatcher_rva: result.ki_user_exception_dispatcher_rva,
+            rtl_dispatch_exception_rva: to_rva(result.rtl_dispatch_exception_va),
+            rtl_restore_context_rva: to_rva(result.rtl_restore_context_va),
+            zw_raise_exception_rva: to_rva(result.zw_raise_exception_va),
+            rtl_raise_status_rva: to_rva(result.rtl_raise_status_va),
+            inverted_function_table_rva: to_rva(result.inverted_function_table_va),
+            ldrp_hash_table_rva: to_rva(result.ldrp_hash_table_va),
+            pebldr_rva: to_rva(result.pebldr_va),
+        });
 
         LoadResult {
             exe_entry_point: exe_info.entry_point,
@@ -912,6 +1242,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             ki_user_exception_dispatcher_rva: result.ki_user_exception_dispatcher_rva,
             ldrp_hash_table_va: result.ldrp_hash_table_va,
             pebldr_va: result.pebldr_va,
+            ntdll_boot_data,
         }
     };
 
@@ -943,11 +1274,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     // Synthesize PEB/TEB.
     let mut shim =
-        litebox_shim_windows::NtShimEntrypoints::new(alloc::sync::Arc::clone(&process_state));
+        litebox_shim_windows::NtShimEntrypoints::new(
+            alloc::sync::Arc::clone(&process_state),
+            litebox.clone(),
+        );
     shim.set_syscall_map(load_result.syscall_map);
     if !load_result.unhandled_stubs.is_empty() {
         shim.set_unhandled_stubs(load_result.unhandled_stubs);
     }
+    shim.set_ntdll_boot_data(load_result.ntdll_boot_data);
     let (stdin_h, stdout_h, stderr_h) = shim.stdio_handles();
 
     let peb_teb_layout = PebTebLayout::at_base(PEB_TEB_BASE);
@@ -982,6 +1317,18 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     } else {
         ("C:\\app\\hello.exe".to_string(), "hello.exe".to_string())
     };
+    let startup_cwd = std::env::current_dir()
+        .map(|cwd| cwd.canonicalize().unwrap_or(cwd))
+        .ok()
+        .and_then(|cwd| cwd.to_str().map(std::string::ToString::to_string))
+        .unwrap_or_else(|| String::from("C:\\"));
+    let mut startup_cwd = startup_cwd
+        .strip_prefix("\\\\?\\")
+        .unwrap_or(&startup_cwd)
+        .to_string();
+    if !startup_cwd.ends_with('\\') {
+        startup_cwd.push('\\');
+    }
 
     // Read the host's API set map address from the host PEB. The guest runs
     // in the same address space, so the host's map is directly accessible.
@@ -1031,6 +1378,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             .collect(),
         exe_full_path: exe_full_path_str.encode_utf16().collect(),
         exe_base_name: exe_base_name_str.encode_utf16().collect(),
+        current_directory_wide: startup_cwd.encode_utf16().collect(),
         stdin_handle: u64::from(stdin_h),
         stdout_handle: u64::from(stdout_h),
         stderr_handle: u64::from(stderr_h),
@@ -1228,9 +1576,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         guest_va_start,
         guest_va_end,
         exe_path: exe_full_path,
+        current_directory: startup_cwd,
         initial_rcx: context_ptr_arg,
         initial_rdx: ntdll_base_arg,
         rtl_user_thread_start_va: load_result.rtl_user_thread_start_va,
+        ldr_init_thunk_va: load_result.ldr_init_thunk_va,
         ki_user_exception_dispatcher_rva: load_result.ki_user_exception_dispatcher_rva,
     });
 
@@ -1252,118 +1602,116 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let network_thread = start_network_worker(net.as_ref(), &shutdown);
 
     // Run the guest.
-    // Tell the platform to set GS = guest TEB before entering guest code.
-    litebox_platform_windows_userland::WindowsUserland::set_guest_gs_base(
+    // Tell the platform to set FS = guest TEB before entering guest code.
+    litebox_platform_windows_userland::WindowsUserland::set_guest_va_range(
+        guest_va_start..guest_va_end,
+    );
+    litebox_platform_windows_userland::WindowsUserland::set_guest_teb_base(
         peb_teb_layout.teb_va as u64,
     );
     let mut ctx = litebox_common_linux::ExecutionContext::default();
 
-    // Debug watchdog: after 2 seconds, suspend the thread and dump RIP.
-    #[cfg(any())] // disabled — watchdog interferes with guest timing
-    let _watchdog = {
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn GetCurrentThread() -> *mut core::ffi::c_void;
-            fn SuspendThread(h: *mut core::ffi::c_void) -> u32;
-            fn ResumeThread(h: *mut core::ffi::c_void) -> u32;
-            fn GetThreadContext(h: *mut core::ffi::c_void, ctx: *mut u8) -> i32;
-            fn DuplicateHandle(
-                src_proc: *mut core::ffi::c_void,
-                src: *mut core::ffi::c_void,
-                dst_proc: *mut core::ffi::c_void,
-                dst: *mut *mut core::ffi::c_void,
-                access: u32,
-                inherit: i32,
-                options: u32,
-            ) -> i32;
-            fn GetCurrentProcess() -> *mut core::ffi::c_void;
-        }
-        let proc = unsafe { GetCurrentProcess() };
-        let mut real_handle: *mut core::ffi::c_void = core::ptr::null_mut();
-        unsafe {
-            DuplicateHandle(
-                proc,
-                GetCurrentThread(),
-                proc,
-                &raw mut real_handle,
-                0,
-                0,
-                2,
-            );
-        }
-        let handle_val = real_handle as usize;
-        Some(std::thread::spawn(move || {
-            let thread_handle = handle_val as *mut core::ffi::c_void;
-            // Wait 1 second for init, then sample at 10ms intervals
+    // Diagnostic watchdog: monitors thread progress and force-terminates
+    // the process if all threads appear stuck.
+    let diag = shim.diagnostics();
+    let _watchdog = std::thread::spawn(move || {
+        // Wait for the guest to get past init before checking.
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        // Check every second for stuck threads.
+        let mut prev_terminated = 0u32;
+        let mut stall_count = 0u32;
+        loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
-            // Sample RIP 20 times at 10ms intervals
-            for sample in 0..20 {
-                unsafe {
-                    SuspendThread(thread_handle);
-                    let mut ctx_buf = vec![0u8; 1232];
-                    let flags: u32 = 0x10_0001; // CONTEXT_CONTROL
-                    ctx_buf[48..52].copy_from_slice(&flags.to_le_bytes());
-                    GetThreadContext(thread_handle, ctx_buf.as_mut_ptr());
-                    let rip = u64::from_le_bytes(ctx_buf[248..256].try_into().unwrap());
-                    let rsp = u64::from_le_bytes(ctx_buf[152..160].try_into().unwrap());
+            let created = diag.created_count();
+            let terminated = diag.terminated_count();
+            let live = diag.live_child_count();
 
-                    // Read 16 bytes at RIP
-                    let code_bytes: [u8; 16] = {
-                        let mut buf = [0u8; 16];
-                        let src = rip as *const u8;
-                        for (i, byte) in buf.iter_mut().enumerate() {
-                            *byte = *src.add(i);
-                        }
-                        buf
-                    };
-                    let hex: String = code_bytes
-                        .iter()
-                        .map(|b| format!("{b:02X}"))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    eprintln!("[watchdog #{sample}] RIP=0x{rip:X} RSP=0x{rsp:X} code=[{hex}]");
-
-                    // If RIP is a JMP [RIP+disp32], read the IAT target
-                    if code_bytes[0] == 0x48 && code_bytes[1] == 0xFF && code_bytes[2] == 0x25 {
-                        let disp = i32::from_le_bytes(code_bytes[3..7].try_into().unwrap());
-                        let iat_addr = (rip as i64 + 7 + i64::from(disp)) as u64;
-                        let iat_val = *(iat_addr as *const u64);
-                        eprintln!("[watchdog #{sample}]   IAT at 0x{iat_addr:X} -> 0x{iat_val:X}");
-                        // Read first 32 bytes at target
-                        let mut tgt_bytes = [0u8; 32];
-                        for (i, byte) in tgt_bytes.iter_mut().enumerate() {
-                            *byte = *((iat_val as *const u8).add(i));
-                        }
-                        let thex: String = tgt_bytes
-                            .iter()
-                            .map(|b| format!("{b:02X}"))
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        eprintln!("[watchdog #{sample}]   target code=[{thex}]");
-                    }
-
-                    // Read top 8 stack entries
-                    let rsp_val = rsp;
-                    let mut stack_hex = String::new();
-                    for i in 0..8 {
-                        let addr = rsp_val + i * 8;
-                        let val = *(addr as *const u64);
-                        use core::fmt::Write as _;
-                        let _ = write!(stack_hex, " 0x{val:X}");
-                    }
-                    eprintln!("[watchdog #{sample}]   stack:{stack_hex}");
-
-                    ResumeThread(thread_handle);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
+            if diag.process_exit_requested() {
+                // Process is shutting down normally.
+                break;
             }
-            eprintln!("[watchdog] Done sampling");
-        }))
-    };
+            if created == 0 {
+                // Not started yet, keep waiting.
+                stall_count = 0;
+                prev_terminated = 0;
+                continue;
+            }
+            if live == 0 {
+                // All children done.
+                stall_count = 0;
+                prev_terminated = terminated;
+                continue;
+            }
+            // There are live children. Check for progress.
+            if terminated == prev_terminated {
+                stall_count += 1;
+            } else {
+                stall_count = 0;
+                prev_terminated = terminated;
+            }
+            // After 5 seconds of no progress (5 checks × 1s), dump state
+            // and force-terminate.
+            if stall_count >= 5 {
+                let states = diag.thread_states();
+                let recent_alert_posts = diag.recent_alert_posts();
+                let recent_chain_events = diag.recent_chain_events();
+                let mut msg = format!(
+                    "[watchdog] No progress for 10s. created={created} terminated={terminated} live={live}\n"
+                );
+                for (
+                    tid,
+                    nr,
+                    syscall_id,
+                    last_rip,
+                    last_rsp,
+                    last_caller_ret,
+                    last_wait_alert_addr,
+                    last_incoming_alert_lock,
+                    last_outgoing_alert_target_tid,
+                    last_outgoing_alert_lock,
+                    pending_any,
+                    pending_by_id,
+                    alert_waiters,
+                    alert_by_id_waiters,
+                    alert_posts,
+                    alert_consumes,
+                    tls_array_ptr,
+                    tls_recopied,
+                    tls_null,
+                    tls_skipped,
+                    alert_history,
+                    debug_stage,
+                    exit_stage,
+                    exited,
+                ) in &states
+                {
+                    use std::fmt::Write;
+                    let _ = writeln!(
+                        msg,
+                        "[watchdog]   tid={tid} last_syscall=0x{nr:X} ({syscall_id:?}) last_rip=0x{last_rip:X} last_rsp=0x{last_rsp:X} caller=0x{last_caller_ret:X} wait_addr=0x{last_wait_alert_addr:X} incoming_lock=0x{last_incoming_alert_lock:X} outgoing={last_outgoing_alert_target_tid}/0x{last_outgoing_alert_lock:X} pending={pending_any}/{pending_by_id} waiters={alert_waiters}/{alert_by_id_waiters} alerts={alert_posts}/{alert_consumes} tls=0x{tls_array_ptr:X}/{tls_recopied}/{tls_null}/{tls_skipped} hist={alert_history} debug_stage=0x{debug_stage:X} exit_stage={exit_stage} exited={exited}"
+                    );
+                }
+                if !recent_alert_posts.is_empty() {
+                    msg.push_str("[watchdog]   recent_alert_posts=");
+                    msg.push_str(&recent_alert_posts);
+                    msg.push('\n');
+                }
+                if !recent_chain_events.is_empty() {
+                    msg.push_str("[watchdog]   recent_chain_events=");
+                    msg.push_str(&recent_chain_events);
+                    msg.push('\n');
+                }
+                eprint!("{msg}");
+                diag.force_terminate(0);
+                break;
+            }
+        }
+    });
 
     unsafe {
         litebox_platform_windows_userland::run_thread_ref(&shim, &mut ctx);
     }
+    eprintln!("[runner] run_thread_ref returned");
 
     // Signal network worker to stop and wait for it.
     shutdown.store(true, core::sync::atomic::Ordering::Relaxed);
@@ -1376,19 +1724,43 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     }
 
     let exit_code = shim.exit_code();
-    // Write to a file (avoids any stderr buffering/handle issues).
+    let (created, terminated, live) = shim.thread_diagnostics();
+    let diagnostics = shim.diagnostics();
+    let recent_chain_events = diagnostics.recent_chain_events();
+    let recent_vm_teardowns = diagnostics.recent_vm_teardowns();
     let msg = format!(
-        "[runner] Exiting with code 0x{:X} ({}). Regs: rip=0x{:X} rsp=0x{:X} rax=0x{:X}\n",
-        exit_code as u32, exit_code, ctx.regs.rip, ctx.regs.rsp, ctx.regs.rax,
+        "[runner] Exiting with code 0x{:X} ({}). Regs: rip=0x{:X} rsp=0x{:X} rax=0x{:X} threads: created={} terminated={} live={}\n",
+        exit_code as u32,
+        exit_code,
+        ctx.regs.rip,
+        ctx.regs.rsp,
+        ctx.regs.rax,
+        created,
+        terminated,
+        live,
     );
     #[cfg(all(debug_assertions, feature = "trace_debug"))]
     write_trace_log("runner_exit.txt", msg.as_bytes());
-    if exit_code != 0 {
+    // Only print to stderr when there was an error or stuck threads.
+    if exit_code != 0 || live != 0 {
         eprintln!("{msg}");
-    } else {
-        trace_debugln!("{msg}");
+        if !recent_chain_events.is_empty() {
+            eprintln!("[runner] recent_chain_events={recent_chain_events}");
+        }
+        if !recent_vm_teardowns.is_empty() {
+            eprintln!("[runner] recent_vm_teardowns={recent_vm_teardowns}");
+        }
     }
-    std::process::exit(exit_code)
+    // Use TerminateProcess to forcibly exit, bypassing atexit handlers and
+    // DLL detach notifications that may deadlock if child host threads are
+    // still in the process of shutting down.
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        fn TerminateProcess(handle: *mut core::ffi::c_void, code: u32) -> i32;
+    }
+    unsafe { TerminateProcess(GetCurrentProcess(), exit_code as u32) };
+    unreachable!()
 }
 
 /// PM-backed mapper for real DLL loading.
@@ -1450,7 +1822,8 @@ impl PeMemoryMapper for PmMapper<'_> {
         // Copy section data.
         if !data.is_empty() {
             unsafe {
-                core::ptr::copy_nonoverlapping(data.as_ptr(), va as *mut u8, data.len());
+                let copy_len = data.len().min(size);
+                core::ptr::copy_nonoverlapping(data.as_ptr(), va as *mut u8, copy_len);
             }
         }
         if data.len() < size {
@@ -1852,6 +2225,16 @@ fn capture_host_nls_data() -> Option<litebox_shim_windows::NlsData> {
         let ret = VirtualQuery(base, (&raw mut mbi).cast(), core::mem::size_of::<Mbi>());
         let section_size = if ret != 0 { mbi.region_size } else { 0xD3000 };
         let section = core::slice::from_raw_parts(base, section_size).to_vec();
+
+        // Compute sub-table offsets within the combined NLS section.
+        // The combined section layout is: [ANSI CP | OEM CP | Unicode case table].
+        // ANSI CP always starts at offset 0. To find where the OEM CP starts, we
+        // search for the first bytes of the individually-captured OEM section within
+        // the combined section. The Unicode case table follows immediately after.
+        let base_addr = base as usize;
+        let mut oem_cp_offset: usize = 0;
+        let mut unicode_case_offset: usize = 0;
+
         let mut sections = alloc::vec::Vec::new();
         if let Some(get_section) = get_section {
             for section_data in [1252_u32, 437_u32, 10000_u32] {
@@ -1875,12 +2258,40 @@ fn capture_host_nls_data() -> Option<litebox_shim_windows::NlsData> {
                 }
             }
         }
+        // Compute OEM CP and Unicode case table offsets by searching the combined
+        // section for the individually-captured OEM code page data.
+        // The OEM CP is code page 437 (section_data=437). Find it in the captured sections.
+        let oem_section_data = sections.iter().find(|s| s.section_data == 437);
+        if let Some(oem_sec) = oem_section_data {
+            // Search for the first 32 bytes of the OEM section within the combined section.
+            // The OEM CP starts after the ANSI CP, so search from a reasonable minimum offset.
+            let needle_len = 32.min(oem_sec.bytes.len());
+            let needle = &oem_sec.bytes[..needle_len];
+            // Start searching from offset 0x1000 (ANSI CP is at least a few KB).
+            for offset in (0x1000..section.len().saturating_sub(needle_len)).step_by(2) {
+                if &section[offset..offset + needle_len] == needle {
+                    oem_cp_offset = offset;
+                    // Unicode case table starts right after the OEM section.
+                    unicode_case_offset = offset + oem_sec.bytes.len();
+                    eprintln!(
+                        "[runner] NLS offsets found: oem_cp=0x{:X} unicode_case=0x{:X}",
+                        oem_cp_offset, unicode_case_offset
+                    );
+                    break;
+                }
+            }
+        }
+        if oem_cp_offset == 0 {
+            eprintln!("[runner] WARNING: could not find OEM CP offset in combined NLS section");
+        }
         Some(litebox_shim_windows::NlsData {
             section,
             locale_id: locale,
             casing_size: casing,
             version,
             sections,
+            oem_cp_offset,
+            unicode_case_offset,
         })
     }
 }

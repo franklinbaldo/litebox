@@ -13,178 +13,16 @@ use alloc::vec::Vec;
 use litebox::mm::linux::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize};
 use litebox::platform::{RawConstPointer, RawPointerProvider};
 use litebox_common_windows::ntstatus::NtStatus;
-use litebox_common_windows::pe::section_chars;
 use litebox_common_windows::pe_loader::{PeLoadError, PeMemoryMapper, SectionPermissions};
 use litebox_common_windows::pe_parser::PeParsedFile;
 
 use crate::handle_table::{HandleTable, NtObject};
-use crate::{NtInitState, NtProcessState, PAGE_SIZE, Platform};
+use crate::{NtInitState, NtProcessState, Platform, PAGE_SIZE};
 
 use super::NtSyscallArgs;
 
 /// SEC_IMAGE flag (0x01000000) ΓÇö indicates an image section.
 const SEC_IMAGE: u32 = 0x0100_0000;
-const MIN_TLS_VECTOR_SLOTS: usize = 64;
-
-fn known_tls_vector_slots(shared: &crate::NtSharedState, teb_va: usize) -> usize {
-    shared
-        .tls_vector_slots
-        .lock()
-        .get(&teb_va)
-        .copied()
-        .unwrap_or(MIN_TLS_VECTOR_SLOTS)
-}
-
-fn page_aligned_alloc_len(len: usize) -> usize {
-    len.max(1)
-        .checked_add(PAGE_SIZE - 1)
-        .map(|v| v & !(PAGE_SIZE - 1))
-        .unwrap_or(len.max(1))
-}
-
-fn free_tls_allocation(shared: &crate::NtSharedState, allocation: crate::TrackedGuestAllocation) {
-    if !allocation.owned_by_shim || allocation.base == 0 || allocation.len == 0 {
-        return;
-    }
-
-    use litebox::platform::{RawConstPointer as _, RawPointerProvider};
-    let ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(allocation.base);
-    let _ = unsafe { shared.process_state.pm.remove_pages(ptr, allocation.len) };
-}
-
-fn replace_thread_tls_vector_allocation(
-    shared: &crate::NtSharedState,
-    teb_va: usize,
-    vector_base: usize,
-    slot_count: usize,
-    owned_by_shim: bool,
-) -> Option<crate::TrackedGuestAllocation> {
-    let slot_count = slot_count.max(MIN_TLS_VECTOR_SLOTS);
-    shared.tls_vector_slots.lock().insert(teb_va, slot_count);
-    let mut tls_allocations = shared.tls_allocations.lock();
-    let thread_allocations = tls_allocations.entry(teb_va).or_default();
-    thread_allocations
-        .vector
-        .replace(crate::TrackedGuestAllocation {
-            base: vector_base,
-            len: page_aligned_alloc_len(slot_count * core::mem::size_of::<usize>()),
-            owned_by_shim,
-        })
-}
-
-pub(crate) fn set_thread_tls_vector_allocation(
-    shared: &crate::NtSharedState,
-    teb_va: usize,
-    vector_base: usize,
-    slot_count: usize,
-) {
-    let _ = replace_thread_tls_vector_allocation(shared, teb_va, vector_base, slot_count, false);
-}
-
-fn push_thread_tls_block_allocation(
-    shared: &crate::NtSharedState,
-    teb_va: usize,
-    block_base: usize,
-    block_len: usize,
-) {
-    shared
-        .tls_allocations
-        .lock()
-        .entry(teb_va)
-        .or_default()
-        .blocks
-        .push(crate::TrackedGuestAllocation {
-            base: block_base,
-            len: page_aligned_alloc_len(block_len),
-            owned_by_shim: true,
-        });
-}
-
-pub(crate) fn free_thread_tls_allocations(shared: &crate::NtSharedState, teb_va: usize) {
-    shared.tls_vector_slots.lock().remove(&teb_va);
-    let Some(thread_allocations) = shared.tls_allocations.lock().remove(&teb_va) else {
-        return;
-    };
-
-    if let Some(vector) = thread_allocations.vector {
-        free_tls_allocation(shared, vector);
-    }
-    for block in thread_allocations.blocks {
-        free_tls_allocation(shared, block);
-    }
-}
-
-fn image_contains_range(image_base: usize, image_size: usize, start: usize, len: usize) -> bool {
-    let Some(image_end) = image_base.checked_add(image_size) else {
-        return false;
-    };
-    let Some(range_end) = start.checked_add(len) else {
-        return false;
-    };
-    start >= image_base && range_end <= image_end
-}
-
-fn read_image_u32(image_base: usize, image_size: usize, addr: usize) -> Option<u32> {
-    if !image_contains_range(image_base, image_size, addr, core::mem::size_of::<u32>()) {
-        return None;
-    }
-    Some(unsafe { core::ptr::read(addr as *const u32) })
-}
-
-fn mapped_tls_directory(
-    image_base: usize,
-    image_size: usize,
-) -> Option<(litebox_common_windows::pe::ImageTlsDirectory64, usize)> {
-    use litebox_common_windows::pe::{IMAGE_DIRECTORY_ENTRY_TLS, ImageTlsDirectory64};
-
-    let pe_offset = read_image_u32(image_base, image_size, image_base.checked_add(0x3C)?)? as usize;
-    let opt = image_base.checked_add(pe_offset)?.checked_add(24)?;
-    let num_dd = read_image_u32(image_base, image_size, opt.checked_add(0x6C)?)? as usize;
-    if num_dd <= IMAGE_DIRECTORY_ENTRY_TLS {
-        return None;
-    }
-
-    let tls_dd = opt.checked_add(0x70 + IMAGE_DIRECTORY_ENTRY_TLS * 8)?;
-    let tls_rva = read_image_u32(image_base, image_size, tls_dd)? as usize;
-    let tls_size = read_image_u32(image_base, image_size, tls_dd.checked_add(4)?)? as usize;
-    if tls_rva == 0 || tls_size < core::mem::size_of::<ImageTlsDirectory64>() {
-        return None;
-    }
-
-    let tls_dir_va = image_base.checked_add(tls_rva)?;
-    if !image_contains_range(
-        image_base,
-        image_size,
-        tls_dir_va,
-        core::mem::size_of::<ImageTlsDirectory64>(),
-    ) {
-        return None;
-    }
-    let tls_dir = unsafe { core::ptr::read(tls_dir_va as *const ImageTlsDirectory64) };
-
-    let addr_of_index = tls_dir.address_of_index as usize;
-    if !image_contains_range(
-        image_base,
-        image_size,
-        addr_of_index,
-        core::mem::size_of::<u32>(),
-    ) {
-        return None;
-    }
-
-    let raw_start = tls_dir.start_address_of_raw_data as usize;
-    let raw_end = tls_dir.end_address_of_raw_data as usize;
-    if raw_end < raw_start {
-        return None;
-    }
-    let raw_len = raw_end - raw_start;
-    if raw_len != 0 && !image_contains_range(image_base, image_size, raw_start, raw_len) {
-        return None;
-    }
-
-    Some((tls_dir, addr_of_index))
-}
-
 // ========================================================================
 // NtCreateSection
 // ========================================================================
@@ -218,9 +56,12 @@ pub(crate) fn nt_create_section(
     let _max_size_ptr = args.arg3;
 
     // Stack arguments.
-    let _page_protection = unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const u32) };
-    let alloc_attributes = unsafe { core::ptr::read((ctx.regs.rsp + 0x30) as *const u32) };
-    let file_handle = unsafe { core::ptr::read((ctx.regs.rsp + 0x38) as *const u32) };
+    let _page_protection =
+        crate::try_read_guest_value_unaligned::<u32>(ctx.regs.rsp + 0x28).unwrap_or(0);
+    let alloc_attributes =
+        crate::try_read_guest_value_unaligned::<u32>(ctx.regs.rsp + 0x30).unwrap_or(0);
+    let file_handle =
+        crate::try_read_guest_value_unaligned::<u32>(ctx.regs.rsp + 0x38).unwrap_or(0);
 
     if section_handle_ptr == 0 {
         return NtStatus::STATUS_INVALID_PARAMETER;
@@ -232,7 +73,7 @@ pub(crate) fn nt_create_section(
         // Non-image (data) section ΓÇö anonymous shared memory.
         // Read MaximumSize from r9.
         let max_size = if _max_size_ptr != 0 {
-            (unsafe { core::ptr::read(_max_size_ptr as *const i64) }) as u64
+            (crate::try_read_guest_value_unaligned::<i64>(_max_size_ptr).unwrap_or(0)) as u64
         } else {
             0x10000 // default 64KB
         };
@@ -247,14 +88,48 @@ pub(crate) fn nt_create_section(
         }
 
         let handle = handles.insert(NtObject::DataSection { max_size });
-        unsafe {
-            core::ptr::write(section_handle_ptr as *mut u32, handle);
+        if !crate::try_write_guest_value_unaligned(section_handle_ptr, handle) {
+            return NtStatus::STATUS_ACCESS_VIOLATION;
         }
         return NtStatus::STATUS_SUCCESS;
     }
 
     // SEC_IMAGE: read PE data from the file handle.
-    let Some(pe_data) = read_pe_from_handle(handles, file_handle, shared) else {
+    // First check if this is a phantom executable handle — if so, return a
+    // stub section that lets NtCreateUserProcess work with virtual processes.
+    let phantom_path = handles
+        .with(file_handle, |entry| match &entry.object {
+            NtObject::PhantomExe { path } => Some(path.clone()),
+            _ => None,
+        })
+        .flatten();
+    if let Some(phantom_path) = phantom_path {
+        #[cfg(any(debug_assertions, feature = "trace_debug"))]
+        {
+            use litebox::platform::DebugLogProvider as _;
+            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                "NT shim: NtCreateSection SEC_IMAGE phantom exe path={phantom_path:?}\n",
+            ));
+        }
+        // Create a minimal stub section — NtCreateUserProcess reads the command
+        // line from RTL_USER_PROCESS_PARAMETERS, not from the section data.
+        let handle = handles.insert(NtObject::Section {
+            pe_data: Arc::new(Vec::new()),
+            module_path: Some(phantom_path),
+            module_name: Some(alloc::string::String::from("phantom.exe")),
+            image_size: 0x1000,
+            image_base: 0x0040_0000,
+            entry_point: 0x1000,
+            section_alignment: 0x1000,
+            is_dll: false,
+        });
+        if !crate::try_write_guest_value_unaligned(section_handle_ptr, handle) {
+            return NtStatus::STATUS_ACCESS_VIOLATION;
+        }
+        return NtStatus::STATUS_SUCCESS;
+    }
+
+    let Some((pe_data, section_path)) = read_pe_from_handle(handles, file_handle, shared) else {
         #[cfg(debug_assertions)]
         {
             use litebox::platform::DebugLogProvider as _;
@@ -294,8 +169,13 @@ pub(crate) fn nt_create_section(
         litebox_platform_multiplex::platform().debug_log_print(&msg);
     }
 
+    let export_name = get_pe_export_dll_name(&parsed, &pe_data);
+    let module_path = normalize_module_path(section_path.as_deref(), export_name);
+    let module_name = module_name_from_image(&parsed, &pe_data, section_path.as_deref());
     let handle = handles.insert(NtObject::Section {
         pe_data: Arc::new(pe_data),
+        module_path,
+        module_name: Some(module_name),
         image_size: parsed.size_of_image,
         image_base: parsed.image_base,
         entry_point: parsed.entry_point,
@@ -303,8 +183,22 @@ pub(crate) fn nt_create_section(
         is_dll: parsed.is_dll,
     });
 
-    unsafe {
-        core::ptr::write(section_handle_ptr as *mut u32, handle);
+    if !crate::try_write_guest_value_unaligned(section_handle_ptr, handle) {
+        return NtStatus::STATUS_ACCESS_VIOLATION;
+    }
+    NtStatus::STATUS_SUCCESS
+}
+
+pub(crate) fn open_csr_shared_section(
+    handles: &mut HandleTable,
+    section_handle_ptr: usize,
+) -> NtStatus {
+    let handle = handles.insert(NtObject::Stub {
+        kind: alloc::string::String::from("CsrSharedSection"),
+        io_completion: None,
+    });
+    if !crate::try_write_guest_value_unaligned(section_handle_ptr, handle) {
+        return NtStatus::STATUS_ACCESS_VIOLATION;
     }
     NtStatus::STATUS_SUCCESS
 }
@@ -314,35 +208,87 @@ fn read_pe_from_handle(
     handles: &HandleTable,
     file_handle: u32,
     shared: &crate::NtSharedState,
-) -> Option<Vec<u8>> {
-    match handles.get(file_handle)? {
-        NtObject::File { raw_fd, .. } => {
-            // Read from VFS.
-            let fs = shared.fs.get()?;
-            let typed_fd = {
-                let rds = shared.raw_fds.lock();
-                rds.fd_from_raw_integer::<crate::NtFS>(*raw_fd).ok()?
-            };
-            // Get file size via fd_file_status, then read the entire file.
-            use litebox::fs::FileSystem as _;
-            let status = fs.fd_file_status(&typed_fd).ok()?;
-            let size = status.size;
-            if size == 0 || size > 256 * 1024 * 1024 {
-                return None;
+) -> Option<(Vec<u8>, Option<alloc::string::String>)> {
+    let (vfs_fd, path) = handles
+        .with(file_handle, |entry| match &entry.object {
+            NtObject::File { vfs_fd, path, .. } => {
+                Some((alloc::sync::Arc::clone(vfs_fd), path.clone()))
             }
-            let mut buf = alloc::vec![0u8; size];
-            let mut offset = 0usize;
-            while offset < size {
-                let bytes_read = fs.read(&typed_fd, &mut buf[offset..], Some(offset)).ok()?;
-                if bytes_read == 0 {
-                    return None;
-                }
-                offset = offset.checked_add(bytes_read)?;
-            }
-            Some(buf)
-        }
-        _ => None,
+            _ => None,
+        })
+        .flatten()?;
+
+    // Read from VFS.
+    let fs = shared.fs.get()?;
+    // Get file size via fd_file_status, then read the entire file.
+    use litebox::fs::FileSystem as _;
+    let status = fs.fd_file_status(&vfs_fd).ok()?;
+    let size = status.size;
+    if size == 0 || size > 256 * 1024 * 1024 {
+        return None;
     }
+    let mut buf = alloc::vec![0u8; size];
+    let mut offset = 0usize;
+    while offset < size {
+        let bytes_read = fs.read(&vfs_fd, &mut buf[offset..], Some(offset)).ok()?;
+        if bytes_read == 0 {
+            return None;
+        }
+        offset = offset.checked_add(bytes_read)?;
+    }
+    Some((buf, Some(path)))
+}
+
+fn module_name_from_image(
+    parsed: &PeParsedFile,
+    pe_data: &[u8],
+    section_path: Option<&str>,
+) -> alloc::string::String {
+    if let Some(name) = get_pe_export_dll_name(parsed, pe_data) {
+        return alloc::string::String::from(name);
+    }
+
+    if let Some(path) = section_path {
+        let trimmed = path
+            .strip_suffix('\\')
+            .or_else(|| path.strip_suffix('/'))
+            .unwrap_or(path);
+        if let Some((_, tail)) = trimmed
+            .rsplit_once('\\')
+            .or_else(|| trimmed.rsplit_once('/'))
+        {
+            return alloc::string::String::from(tail);
+        }
+        return alloc::string::String::from(trimmed);
+    }
+
+    alloc::string::String::from(if parsed.is_dll {
+        "mapped-image.dll"
+    } else {
+        "mapped-image.exe"
+    })
+}
+
+fn normalize_module_path(
+    section_path: Option<&str>,
+    export_name: Option<&str>,
+) -> Option<alloc::string::String> {
+    let normalized = section_path.map(|path| {
+        if let Some(rest) = path
+            .strip_prefix("\\??\\")
+            .or_else(|| path.strip_prefix("\\DosDevices\\"))
+        {
+            alloc::string::String::from(rest)
+        } else if let Some(rest) = path.strip_prefix("\\SystemRoot\\") {
+            alloc::format!("C:\\Windows\\{rest}")
+        } else if let Some(rest) = path.strip_prefix("\\KnownDlls\\") {
+            alloc::format!("C:\\Windows\\System32\\{rest}")
+        } else {
+            alloc::string::String::from(path)
+        }
+    });
+
+    normalized.or_else(|| export_name.map(|name| alloc::format!("C:\\Windows\\System32\\{name}")))
 }
 
 // ========================================================================
@@ -397,9 +343,18 @@ pub(crate) fn nt_map_view_of_section(
     }
 
     // Stack arguments.
-    let _commit_size = unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
-    let _section_offset_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x30) as *const usize) };
-    let view_size_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x38) as *const usize) };
+    let _commit_size =
+        crate::try_read_guest_value_unaligned::<usize>(ctx.regs.rsp + 0x28).unwrap_or(0);
+    let _section_offset_ptr =
+        crate::try_read_guest_value_unaligned::<usize>(ctx.regs.rsp + 0x30).unwrap_or(0);
+    let view_size_ptr =
+        crate::try_read_guest_value_unaligned::<usize>(ctx.regs.rsp + 0x38).unwrap_or(0);
+    let _inherit_disposition =
+        crate::try_read_guest_value_unaligned::<u32>(ctx.regs.rsp + 0x40).unwrap_or(0);
+    let _allocation_type =
+        crate::try_read_guest_value_unaligned::<u32>(ctx.regs.rsp + 0x48).unwrap_or(0);
+    let _win32_protect =
+        crate::try_read_guest_value_unaligned::<u32>(ctx.regs.rsp + 0x50).unwrap_or(0);
 
     #[cfg(debug_assertions)]
     {
@@ -418,47 +373,79 @@ pub(crate) fn nt_map_view_of_section(
     enum SectionType {
         Image {
             pe_data: Arc<Vec<u8>>,
+            module_path: Option<alloc::string::String>,
+            module_name: Option<alloc::string::String>,
             image_size: u32,
             image_base: u64,
         },
         Data {
             max_size: u64,
         },
+        StaticView {
+            base: usize,
+            size: usize,
+        },
     }
 
-    let section_type = match handles.get(section_handle) {
-        Some(NtObject::Section {
-            pe_data,
-            image_size,
-            image_base,
-            ..
-        }) => SectionType::Image {
-            pe_data: pe_data.clone(),
-            image_size: *image_size,
-            image_base: *image_base,
-        },
-        Some(NtObject::DataSection { max_size }) => SectionType::Data {
-            max_size: *max_size,
-        },
-        _ => {
-            #[cfg(debug_assertions)]
-            {
-                use litebox::platform::DebugLogProvider as _;
-                let msg = alloc::format!(
-                    "NT shim: NtMapViewOfSection ΓÇö invalid section handle 0x{section_handle:X}\n",
-                );
-                litebox_platform_multiplex::platform().debug_log_print(&msg);
+    let section_type = handles
+        .with(section_handle, |entry| match &entry.object {
+            NtObject::Section {
+                pe_data,
+                module_path,
+                module_name,
+                image_size,
+                image_base,
+                ..
+            } => Some(SectionType::Image {
+                pe_data: Arc::clone(pe_data),
+                module_path: module_path.clone(),
+                module_name: module_name.clone(),
+                image_size: *image_size,
+                image_base: *image_base,
+            }),
+            NtObject::DataSection { max_size } => Some(SectionType::Data {
+                max_size: *max_size,
+            }),
+            NtObject::Stub { kind, .. } if kind == "CsrSharedSection" => {
+                let csr = *shim_shared.csr_state.lock();
+                Some(SectionType::StaticView {
+                    base: csr.shared_section_base,
+                    size: csr.shared_section_size,
+                })
             }
-            return NtStatus::STATUS_INVALID_HANDLE;
+            _ => None,
+        })
+        .flatten();
+
+    let Some(section_type) = section_type else {
+        #[cfg(debug_assertions)]
+        {
+            use litebox::platform::DebugLogProvider as _;
+            let msg = alloc::format!(
+                "NT shim: NtMapViewOfSection — invalid section handle 0x{section_handle:X}\n",
+            );
+            litebox_platform_multiplex::platform().debug_log_print(&msg);
         }
+        return NtStatus::STATUS_INVALID_HANDLE;
     };
 
     match section_type {
         SectionType::Data { max_size } => {
             map_data_section(ctx, process_state, base_addr_ptr, view_size_ptr, max_size)
         }
+        SectionType::StaticView { base, size } => {
+            if !crate::try_write_guest_value_unaligned(base_addr_ptr, base) {
+                return NtStatus::STATUS_ACCESS_VIOLATION;
+            }
+            if view_size_ptr != 0 {
+                crate::try_write_guest_value_unaligned(view_size_ptr, size);
+            }
+            NtStatus::STATUS_SUCCESS
+        }
         SectionType::Image {
             pe_data,
+            module_path,
+            module_name,
             image_size,
             image_base: preferred_base,
         } => map_image_section(
@@ -469,6 +456,150 @@ pub(crate) fn nt_map_view_of_section(
             base_addr_ptr,
             view_size_ptr,
             &pe_data,
+            module_path.as_deref(),
+            module_name.as_deref(),
+            image_size,
+            preferred_base,
+        ),
+    }
+}
+
+/// NtMapViewOfSectionEx — map a section using the Win10+ extended ABI.
+///
+/// The Ex variant differs from NtMapViewOfSection after the third argument:
+/// `SectionOffset` is passed in `r9`, `ViewSize` moves to `[rsp+0x28]`, and the
+/// remaining stack parameters shift down by one slot. Parsing it with the
+/// legacy layout corrupts the view-size pointer the guest loader / segment
+/// heap relies on.
+pub(crate) fn nt_map_view_of_section_ex(
+    ctx: &mut super::super::ExecutionContext,
+    handles: &HandleTable,
+    shim_shared: &crate::NtSharedState,
+    init_state: Option<&NtInitState>,
+) -> NtStatus {
+    let process_state = &shim_shared.process_state;
+    let args = NtSyscallArgs::from_ctx(ctx);
+    let section_handle = args.arg0 as u32;
+    let _process_handle = args.arg1; // should be NtCurrentProcess (-1)
+    let base_addr_ptr = args.arg2;
+    let _section_offset_ptr = args.arg3;
+    let view_size_ptr =
+        crate::try_read_guest_value_unaligned::<usize>(ctx.regs.rsp + 0x28).unwrap_or(0);
+    let _allocation_type =
+        crate::try_read_guest_value_unaligned::<u32>(ctx.regs.rsp + 0x30).unwrap_or(0);
+    let _win32_protect =
+        crate::try_read_guest_value_unaligned::<u32>(ctx.regs.rsp + 0x38).unwrap_or(0);
+    let _extended_parameters =
+        crate::try_read_guest_value_unaligned::<usize>(ctx.regs.rsp + 0x40).unwrap_or(0);
+    let _extended_parameter_count =
+        crate::try_read_guest_value_unaligned::<u32>(ctx.regs.rsp + 0x48).unwrap_or(0);
+
+    #[cfg(debug_assertions)]
+    {
+        use litebox::platform::DebugLogProvider as _;
+        let msg = alloc::format!(
+            "NT shim: NtMapViewOfSectionEx args: section=0x{:X} process=0x{:X} base_ptr=0x{:X} offset_ptr=0x{:X} view_size_ptr=0x{view_size_ptr:X} ext=0x{_extended_parameters:X} count={_extended_parameter_count} rsp=0x{:X}\n",
+            section_handle,
+            _process_handle,
+            base_addr_ptr,
+            _section_offset_ptr,
+            ctx.regs.rsp,
+        );
+        litebox_platform_multiplex::platform().debug_log_print(&msg);
+    }
+
+    if base_addr_ptr == 0 {
+        return NtStatus::STATUS_INVALID_PARAMETER;
+    }
+
+    enum SectionType {
+        Image {
+            pe_data: Arc<Vec<u8>>,
+            module_path: Option<alloc::string::String>,
+            module_name: Option<alloc::string::String>,
+            image_size: u32,
+            image_base: u64,
+        },
+        Data {
+            max_size: u64,
+        },
+        StaticView {
+            base: usize,
+            size: usize,
+        },
+    }
+
+    let section_type = handles
+        .with(section_handle, |entry| match &entry.object {
+            NtObject::Section {
+                pe_data,
+                module_path,
+                module_name,
+                image_size,
+                image_base,
+                ..
+            } => Some(SectionType::Image {
+                pe_data: Arc::clone(pe_data),
+                module_path: module_path.clone(),
+                module_name: module_name.clone(),
+                image_size: *image_size,
+                image_base: *image_base,
+            }),
+            NtObject::DataSection { max_size } => Some(SectionType::Data {
+                max_size: *max_size,
+            }),
+            NtObject::Stub { kind, .. } if kind == "CsrSharedSection" => {
+                let csr = *shim_shared.csr_state.lock();
+                Some(SectionType::StaticView {
+                    base: csr.shared_section_base,
+                    size: csr.shared_section_size,
+                })
+            }
+            _ => None,
+        })
+        .flatten();
+
+    let Some(section_type) = section_type else {
+        #[cfg(debug_assertions)]
+        {
+            use litebox::platform::DebugLogProvider as _;
+            let msg = alloc::format!(
+                "NT shim: NtMapViewOfSection — invalid section handle 0x{section_handle:X}\n",
+            );
+            litebox_platform_multiplex::platform().debug_log_print(&msg);
+        }
+        return NtStatus::STATUS_INVALID_HANDLE;
+    };
+
+    match section_type {
+        SectionType::Data { max_size } => {
+            map_data_section(ctx, process_state, base_addr_ptr, view_size_ptr, max_size)
+        }
+        SectionType::StaticView { base, size } => {
+            if !crate::try_write_guest_value_unaligned(base_addr_ptr, base) {
+                return NtStatus::STATUS_ACCESS_VIOLATION;
+            }
+            if view_size_ptr != 0 {
+                crate::try_write_guest_value_unaligned(view_size_ptr, size);
+            }
+            NtStatus::STATUS_SUCCESS
+        }
+        SectionType::Image {
+            pe_data,
+            module_path,
+            module_name,
+            image_size,
+            image_base: preferred_base,
+        } => map_image_section(
+            ctx,
+            shim_shared,
+            process_state,
+            init_state,
+            base_addr_ptr,
+            view_size_ptr,
+            &pe_data,
+            module_path.as_deref(),
+            module_name.as_deref(),
             image_size,
             preferred_base,
         ),
@@ -483,21 +614,55 @@ fn map_data_section(
     view_size_ptr: usize,
     max_size: u64,
 ) -> NtStatus {
-    let suggested_base = unsafe { core::ptr::read(base_addr_ptr as *const usize) };
+    let suggested_base = crate::try_read_guest_value_unaligned::<usize>(base_addr_ptr).unwrap_or(0);
     let view_size = if view_size_ptr != 0 {
-        let vs = unsafe { core::ptr::read(view_size_ptr as *const usize) };
-        if vs != 0 { vs } else { max_size as usize }
+        let vs = crate::try_read_guest_value_unaligned::<usize>(view_size_ptr).unwrap_or(0);
+        if vs != 0 {
+            vs
+        } else {
+            max_size as usize
+        }
     } else {
         max_size as usize
     };
 
+    let (mapped_addr, aligned_size) =
+        match map_data_section_pages(process_state, suggested_base, view_size) {
+            Ok(mapped) => mapped,
+            Err(status) => return status,
+        };
+
+    if !crate::try_write_guest_value_unaligned(base_addr_ptr, mapped_addr) {
+        return NtStatus::STATUS_ACCESS_VIOLATION;
+    }
+    if view_size_ptr != 0 {
+        crate::try_write_guest_value_unaligned(view_size_ptr, aligned_size);
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        use litebox::platform::DebugLogProvider as _;
+        let msg = alloc::format!(
+            "NT shim: NtMapViewOfSection data at 0x{mapped_addr:X} (size=0x{aligned_size:X})\n",
+        );
+        litebox_platform_multiplex::platform().debug_log_print(&msg);
+    }
+
+    NtStatus::STATUS_SUCCESS
+}
+
+pub(crate) fn map_data_section_pages(
+    process_state: &Arc<NtProcessState>,
+    suggested_base: usize,
+    view_size: usize,
+) -> Result<(usize, usize), NtStatus> {
     let aligned_size = (view_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     if aligned_size == 0 {
-        return NtStatus::STATUS_INVALID_PARAMETER;
+        return Err(NtStatus::STATUS_INVALID_PARAMETER);
     }
 
     let Some(nz_size) = NonZeroPageSize::<PAGE_SIZE>::new(aligned_size) else {
-        return NtStatus::STATUS_INVALID_PARAMETER;
+        return Err(NtStatus::STATUS_INVALID_PARAMETER);
     };
 
     let suggested = if suggested_base != 0 {
@@ -523,29 +688,10 @@ fn map_data_section(
             use litebox::platform::RawConstPointer as _;
             let mapped_addr = ptr.as_usize();
 
-            unsafe {
-                core::ptr::write(base_addr_ptr as *mut usize, mapped_addr);
-            }
-            if view_size_ptr != 0 {
-                unsafe {
-                    core::ptr::write(view_size_ptr as *mut usize, aligned_size);
-                }
-            }
-
             process_state.track_section_view(mapped_addr, aligned_size);
-
-            #[cfg(debug_assertions)]
-            {
-                use litebox::platform::DebugLogProvider as _;
-                let msg = alloc::format!(
-                    "NT shim: NtMapViewOfSection data at 0x{mapped_addr:X} (size=0x{aligned_size:X})\n",
-                );
-                litebox_platform_multiplex::platform().debug_log_print(&msg);
-            }
-
-            NtStatus::STATUS_SUCCESS
+            Ok((mapped_addr, aligned_size))
         }
-        Err(_) => NtStatus::STATUS_NO_MEMORY,
+        Err(_) => Err(NtStatus::STATUS_NO_MEMORY),
     }
 }
 
@@ -558,6 +704,8 @@ fn map_image_section(
     base_addr_ptr: usize,
     view_size_ptr: usize,
     pe_data: &[u8],
+    module_path: Option<&str>,
+    module_name: Option<&str>,
     image_size: u32,
     preferred_base: u64,
 ) -> NtStatus {
@@ -567,7 +715,7 @@ fn map_image_section(
     };
 
     // Determine load address.
-    let suggested_base = unsafe { core::ptr::read(base_addr_ptr as *const usize) };
+    let suggested_base = crate::try_read_guest_value_unaligned::<usize>(base_addr_ptr).unwrap_or(0);
     let preferred = if suggested_base != 0 {
         suggested_base
     } else {
@@ -712,7 +860,7 @@ fn map_image_section(
         litebox_platform_multiplex::platform().debug_log_print(&msg);
 
         // Log TLS directory info for this PE if present
-        use litebox_common_windows::pe::{IMAGE_DIRECTORY_ENTRY_TLS, ImageTlsDirectory64};
+        use litebox_common_windows::pe::{ImageTlsDirectory64, IMAGE_DIRECTORY_ENTRY_TLS};
         if let Some(tls_dd) = parsed.data_directory(IMAGE_DIRECTORY_ENTRY_TLS) {
             let tls_rva = tls_dd.virtual_address as usize;
             let tls_va = load_info.image_base + tls_rva;
@@ -746,83 +894,48 @@ fn map_image_section(
         }
     }
 
-    unsafe {
-        core::ptr::write(base_addr_ptr as *mut usize, load_info.image_base);
+    if !crate::try_write_guest_value_unaligned(base_addr_ptr, load_info.image_base) {
+        return NtStatus::STATUS_ACCESS_VIOLATION;
     }
     if view_size_ptr != 0 {
-        unsafe {
-            core::ptr::write(view_size_ptr as *mut usize, load_info.image_size);
-        }
+        crate::try_write_guest_value_unaligned(view_size_ptr, load_info.image_size);
     }
 
     // Track this image mapping so NtQueryVirtualMemory returns MEM_IMAGE type.
     process_state.track_image_mapping(load_info.image_base, load_info.image_size);
+    process_state.register_module(crate::ModuleBase {
+        name: module_name
+            .map(alloc::string::String::from)
+            .unwrap_or_else(|| module_name_from_image(&parsed, pe_data, module_path)),
+        path: normalize_module_path(module_path, get_pe_export_dll_name(&parsed, pe_data))
+            .unwrap_or_else(|| {
+                alloc::format!(
+                    "C:\\image_{:X}.{}",
+                    load_info.image_base,
+                    if parsed.is_dll { "dll" } else { "exe" }
+                )
+            }),
+        base_address: load_info.image_base,
+        image_size: load_info.image_size,
+    });
 
-    backfill_static_tls(shim_shared, init_state, &parsed, load_info.image_base);
+    // Static TLS belongs to the guest loader. Mapping an image must not
+    // pre-populate module TLS indices, vectors, or blocks from the shim.
 
-    // ── Neutralise Win32k syscall stubs (win32u.dll / gdi32full.dll) ──
-    //
-    // Only ntdll.dll has its syscall stubs rewritten to go through the
-    // sandbox trampoline.  Other DLLs such as win32u.dll contain stubs
-    // for Win32k system calls (window manager, GDI) that would execute
-    // real `syscall` instructions and reach the host kernel's win32k
-    // driver.  This is both unnecessary (console programs don't use
-    // Win32k) and actively harmful: the host kernel may convert the
-    // thread to a "GUI thread", dispatch user-mode callbacks, or
-    // corrupt sandbox-internal state.
-    //
-    // We detect these stubs by the standard Windows syscall stub
-    // pattern (`mov r10,rcx; mov eax,<nr>; … syscall; ret`) with
-    // syscall numbers ≥ 0x1000 (the Win32k range) and patch each
-    // stub to immediately return STATUS_NOT_IMPLEMENTED (0xC0000002).
-    // This tells the calling DLL (user32, gdi32full, etc.) that
-    // Win32k services are unavailable, letting it fall back to its
-    // "no Win32 subsystem" code path gracefully.
-    patch_win32k_stubs(
-        load_info.image_base,
-        load_info.image_size,
-        &process_state.pm,
-        process_state.trampoline_code_va(),
-    );
-
-    // ── Neutralise __fastfail (int 0x29) in all loaded DLLs ──
-    //
-    // __fastfail (CD 29) is a software interrupt that bypasses ALL
-    // user-mode exception handlers (VEH, SEH, UEF) and directly
-    // terminates the process.  The ntdll rewriter already patches
-    // ntdll's __fastfail sites.  We must also patch DLLs loaded by
-    // ntdll (kernelbase, kernel32, ucrtbase, etc.) to prevent them
-    // from killing the host process on stack cookie failures, range
-    // check failures, or other __fastfail scenarios.
-    //
-    // Patch: CD 29 → EB 00 (jmp +0, two-byte NOP).  This makes
-    // __fastfail a no-op; the code after it (typically a `ret`)
-    // executes normally.
-    patch_fastfail(&parsed, load_info.image_base, &process_state.pm);
-
-    // ── Patch gdi32full.dll: set gbFirst = 0 ──
-    //
-    // gdi32full!GdiProcessSetup checks a global `gbFirst` variable.
-    // When gbFirst == 1 (the initial file value), GdiProcessSetup takes
-    // the full GDI kernel initialization path, which requires a real
-    // Win32k kernel and always fails in our sandbox.  When gbFirst == 0,
-    // it takes a fast shortcut that reads PEB+0xF8 (GdiSharedHandleTable),
-    // stores pointers in globals, and returns STATUS_SUCCESS.
-    //
-    // We detect gdi32full by reading the DLL name from its PE export
-    // directory, then patch gbFirst at the known RVA from 1 to 0.
-    patch_gdi32full_gbfirst(&parsed, pe_data, load_info.image_base, &process_state.pm);
-
-    // ── Patch USER32.dll: force _UserClientDllInitialize past GdiDllInitialize check ──
-    //
-    // USER32's DllMain (_UserClientDllInitialize) calls GdiDllInitialize and
-    // checks the return value: `test eax,eax; jns continue`.  In a sandbox
-    // without Win32k, various GDI init sub-steps may fail, causing a negative
-    // NTSTATUS return.  We patch the `jns` (opcode 0x79 0x07) at RVA 0x6E2AF
-    // to an unconditional `jmp short` (0xEB 0x07), forcing the init to
-    // continue regardless of the GdiDllInitialize return value.  Console
-    // programs don't use GDI rendering, so this is safe.
-    patch_user32_gdi_check(&parsed, pe_data, load_info.image_base, &process_state.pm);
+    // Real guest DLL code must run unmodified here. The supported
+    // interception boundary in this path is the real guest syscall entry:
+    // ntdll stubs plus the current guest win32u.dll Win32k stubs that are
+    // rewritten into the trampoline.
+    if module_name.is_some_and(|name| name.eq_ignore_ascii_case("win32u.dll")) {
+        patch_win32k_stubs(
+            load_info.image_base,
+            load_info.image_size,
+            &process_state.pm,
+            process_state.trampoline_code_va(),
+        );
+        let map = super::win32k::build_win32k_syscall_map(&parsed, pe_data);
+        let _ = shim_shared.win32k_syscall_map.call_once(|| map);
+    }
 
     // ── Register in the inverted function table for SEH unwinding ──
     //
@@ -851,202 +964,6 @@ fn map_image_section(
         NtStatus::STATUS_SUCCESS
     } else {
         NtStatus::STATUS_IMAGE_NOT_AT_BASE
-    }
-}
-
-fn tls_alignment(characteristics: u32) -> usize {
-    let nibble = (characteristics >> 20) & 0xF;
-    let shift = if nibble == 0 { 0 } else { nibble - 1 };
-    core::cmp::max(1usize << shift, 16)
-}
-
-fn next_static_tls_index(process_state: &NtProcessState) -> u32 {
-    let mut max_idx = 0u32;
-    for (base, size) in process_state.image_mappings_snapshot() {
-        let Some((_tls_dir, addr_of_index)) = mapped_tls_directory(base, size) else {
-            continue;
-        };
-        let idx = unsafe { core::ptr::read(addr_of_index as *const u32) };
-        max_idx = max_idx.max(idx);
-    }
-    core::cmp::max(max_idx.saturating_add(1), 1)
-}
-
-fn ensure_thread_tls_vector(
-    shared: &crate::NtSharedState,
-    teb_va: usize,
-    required_slots: usize,
-) -> usize {
-    let process_state = &shared.process_state;
-    let tls_vector_ptr = unsafe {
-        core::ptr::read((teb_va + crate::peb_teb::teb_offsets::TLS_POINTER) as *const usize)
-    };
-    if tls_vector_ptr != 0 {
-        let known_slots = known_tls_vector_slots(shared, teb_va);
-        if required_slots <= known_slots {
-            return tls_vector_ptr;
-        }
-
-        let new_slots = required_slots.max(known_slots);
-        let new_vec_va = process_state.alloc_rw_bytes(new_slots * 8);
-        if new_vec_va == 0 {
-            return 0;
-        }
-
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                tls_vector_ptr as *const u8,
-                new_vec_va as *mut u8,
-                known_slots * 8,
-            );
-            core::ptr::write(
-                (teb_va + crate::peb_teb::teb_offsets::TLS_POINTER) as *mut usize,
-                new_vec_va,
-            );
-        }
-        if let Some(old_vector) =
-            replace_thread_tls_vector_allocation(shared, teb_va, new_vec_va, new_slots, true)
-        {
-            free_tls_allocation(shared, old_vector);
-        }
-        return new_vec_va;
-    }
-
-    let slot_count = core::cmp::max(required_slots, MIN_TLS_VECTOR_SLOTS);
-    let vec_va = process_state.alloc_rw_bytes(slot_count * 8);
-    if vec_va != 0 {
-        unsafe {
-            core::ptr::write(
-                (teb_va + crate::peb_teb::teb_offsets::TLS_POINTER) as *mut usize,
-                vec_va,
-            );
-        }
-        let _ = replace_thread_tls_vector_allocation(shared, teb_va, vec_va, slot_count, true);
-    }
-    vec_va
-}
-
-fn backfill_static_tls_for_mapped_image(
-    shared: &crate::NtSharedState,
-    teb_va: usize,
-    image_base: usize,
-    image_size: usize,
-) -> Option<u32> {
-    if teb_va == 0 {
-        return None;
-    }
-    let (tls_dir, addr_of_index) = mapped_tls_directory(image_base, image_size)?;
-
-    let mut tls_index = unsafe { core::ptr::read(addr_of_index as *const u32) };
-    if tls_index == 0 {
-        tls_index = next_static_tls_index(&shared.process_state);
-        unsafe {
-            core::ptr::write(addr_of_index as *mut u32, tls_index);
-        }
-    }
-
-    let tls_vector = ensure_thread_tls_vector(shared, teb_va, tls_index as usize + 1);
-    if tls_vector == 0 {
-        return None;
-    }
-
-    let slot_addr = tls_vector + tls_index as usize * 8;
-    let existing = unsafe { core::ptr::read(slot_addr as *const usize) };
-    if existing != 0 {
-        return Some(tls_index);
-    }
-
-    let raw_size = (tls_dir.end_address_of_raw_data as usize)
-        .saturating_sub(tls_dir.start_address_of_raw_data as usize);
-    let zero_fill = tls_dir.size_of_zero_fill as usize;
-    let align = tls_alignment(tls_dir.characteristics);
-    let total = raw_size.saturating_add(zero_fill).saturating_add(align);
-    let block_base = shared.process_state.alloc_rw_bytes(total.max(16));
-    if block_base == 0 {
-        return None;
-    }
-
-    let aligned = (block_base + align - 1) & !(align - 1);
-    if raw_size != 0 {
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                tls_dir.start_address_of_raw_data as *const u8,
-                aligned as *mut u8,
-                raw_size,
-            );
-        }
-    }
-    if zero_fill != 0 {
-        unsafe {
-            core::ptr::write_bytes((aligned + raw_size) as *mut u8, 0, zero_fill);
-        }
-    }
-    unsafe {
-        core::ptr::write(slot_addr as *mut usize, aligned);
-    }
-    push_thread_tls_block_allocation(shared, teb_va, block_base, total.max(16));
-
-    #[cfg(debug_assertions)]
-    {
-        use litebox::platform::DebugLogProvider as _;
-        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-            "  [TLS-backfill] base=0x{image_base:X} idx={} vec=0x{tls_vector:X} slot=0x{:X} data=0x{aligned:X} raw=0x{:X} zero=0x{:X}\n",
-            tls_index,
-            slot_addr,
-            raw_size,
-            zero_fill,
-        ));
-    }
-
-    Some(tls_index)
-}
-
-pub(crate) fn initialize_static_tls_for_teb(shared: &crate::NtSharedState, teb_va: usize) {
-    for (base, size) in shared.process_state.image_mappings_snapshot() {
-        let _ = backfill_static_tls_for_mapped_image(shared, teb_va, base, size);
-    }
-}
-
-fn backfill_static_tls(
-    shared: &crate::NtSharedState,
-    init_state: Option<&NtInitState>,
-    parsed: &PeParsedFile,
-    image_base: usize,
-) {
-    let Some(init) = init_state else {
-        return;
-    };
-
-    if parsed
-        .data_directory(litebox_common_windows::pe::IMAGE_DIRECTORY_ENTRY_TLS)
-        .is_none()
-    {
-        return;
-    }
-
-    let teb_va = init.teb_va;
-    let Some(tls_index) = backfill_static_tls_for_mapped_image(
-        shared,
-        teb_va,
-        image_base,
-        parsed.size_of_image as usize,
-    ) else {
-        return;
-    };
-
-    if let Some(ntdll_base) = init
-        .module_bases
-        .iter()
-        .find(|m| m.name.eq_ignore_ascii_case("ntdll.dll"))
-        .map(|m| m.base_address)
-    {
-        let tls_bitmap_size = ntdll_base + 0x1D2720;
-        let current = unsafe { core::ptr::read(tls_bitmap_size as *const u32) };
-        if current <= tls_index {
-            unsafe {
-                core::ptr::write(tls_bitmap_size as *mut u32, tls_index + 1);
-            }
-        }
     }
 }
 
@@ -1112,91 +1029,55 @@ pub fn nt_unmap_view_of_section(process_state: &NtProcessState, base_address: us
     }
 }
 
-/// Scan a freshly-mapped PE image for Win32k syscall stubs and rewrite
+/// Scan a freshly mapped PE image for Win32k syscall stubs and rewrite
 /// each one to jump through the sandbox trampoline.
 ///
-/// A Win32k stub has the same layout as an ntdll stub:
-///
-/// ```text
-/// +00: 4C 8B D1              mov  r10, rcx
-/// +03: B8 xx xx xx xx        mov  eax, <syscall_nr>     (nr ≥ 0x1000)
-/// +08: F6 04 25 08 03 FE 7F  test byte [0x7FFE0308], 1
-/// +0F: 01
-/// +10: 75 03                 jne  +3
-/// +12: 0F 05                 syscall
-/// +14: C3                    ret
-/// ```
-///
-/// We preserve the first 16 bytes (which set up r10 and eax) and overwrite
-/// bytes +10..+1E with an indirect JMP to the trampoline:
-///
-/// ```text
-/// +10: FF 25 00 00 00 00     jmp  [rip+0]     (6 bytes)
-/// +16: <8-byte trampoline_code_va>             (absolute address)
-/// ```
-///
-/// This routes win32k syscalls through the same trampoline as ntdll stubs,
-/// allowing the shim to dispatch them (or return STATUS_NOT_IMPLEMENTED).
+/// The current guest bundle places the needed `NtUser*` and `NtGdi*` stubs
+/// in `win32u.dll`. Rewriting those entry points keeps USER32/GDI startup on
+/// the same syscall boundary as ntdll instead of letting the guest reach host
+/// win32k and host callback machinery.
 fn patch_win32k_stubs(
     image_base: usize,
     image_size: usize,
     pm: &litebox::mm::PageManager<Platform, PAGE_SIZE>,
     trampoline_code_va: usize,
 ) {
-    // Walk the mapped image looking for the syscall stub prefix.
-    // The prefix is: 4C 8B D1 B8 xx xx xx xx (8 bytes).
-    // We require syscall_nr >= 0x1000 to only target Win32k stubs.
-    const STUB_LEN: usize = 0x20; // 32-byte aligned stubs
-    const PREFIX: [u8; 3] = [0x4C, 0x8B, 0xD1]; // mov r10, rcx
-    const SYSCALL_BYTES: [u8; 2] = [0x0F, 0x05]; // syscall
-
-    // Replacement at offset +0x10: JMP [rip+0] followed by 8-byte address.
-    // FF 25 00 00 00 00 = jmp qword ptr [rip+0]
+    const STUB_LEN: usize = 0x20;
+    const PREFIX: [u8; 3] = [0x4C, 0x8B, 0xD1];
+    const SYSCALL_BYTES: [u8; 2] = [0x0F, 0x05];
     const JMP_INDIRECT: [u8; 6] = [0xFF, 0x25, 0x00, 0x00, 0x00, 0x00];
-    let tramp_addr_bytes = (trampoline_code_va as u64).to_le_bytes();
 
     if trampoline_code_va == 0 {
-        // Trampoline not set up yet — fall back to the old behavior of
-        // returning STATUS_NOT_IMPLEMENTED so we don't crash.
         #[cfg(debug_assertions)]
         {
             use litebox::platform::DebugLogProvider as _;
-            litebox_platform_multiplex::platform().debug_log_print(
-                "NT shim: WARNING: trampoline_code_va is 0, skipping win32k stub patching\n",
-            );
+            litebox_platform_multiplex::platform()
+                .debug_log_print("NT shim: skipping Win32k stub patching (trampoline=0)\n");
         }
         return;
     }
 
+    let tramp_addr_bytes = (trampoline_code_va as u64).to_le_bytes();
     let end = image_base + image_size;
     let mut patched = 0u32;
     let mut pos = image_base;
 
     while pos + STUB_LEN <= end {
-        // Safety: the image was just mapped, so these addresses are valid.
+        // Safety: the image was just mapped into guest memory.
         let bytes = unsafe { core::slice::from_raw_parts(pos as *const u8, STUB_LEN) };
 
-        // Check prefix: mov r10, rcx; mov eax, <nr>
         if bytes[0..3] == PREFIX && bytes[3] == 0xB8 {
             let nr = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-
-            // Only patch Win32k stubs (syscall numbers >= 0x1000).
             if nr >= 0x1000 {
-                // Verify the stub contains `syscall` somewhere in the expected range.
                 let has_syscall = (8..STUB_LEN - 1)
                     .any(|i| bytes[i] == SYSCALL_BYTES[0] && bytes[i + 1] == SYSCALL_BYTES[1]);
-
                 if has_syscall {
-                    // Make the page writable so we can patch.
                     let page_addr = pos & !(PAGE_SIZE - 1);
-                    use litebox::platform::{RawConstPointer as _, RawPointerProvider};
                     let ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(
                         page_addr,
                     );
                     let _ = unsafe { pm.make_pages_writable(ptr, PAGE_SIZE) };
 
-                    // If the patch straddles a page boundary, make the next page
-                    // writable too (patch spans offset +0x10 to +0x1D = 14 bytes).
                     let patch_end_page = (pos + 0x1D) & !(PAGE_SIZE - 1);
                     if patch_end_page != page_addr {
                         let next_ptr =
@@ -1206,7 +1087,6 @@ fn patch_win32k_stubs(
                         let _ = unsafe { pm.make_pages_writable(next_ptr, PAGE_SIZE) };
                     }
 
-                    // Write JMP [rip+0] at offset +0x10.
                     let patch_base = pos + 0x10;
                     unsafe {
                         core::ptr::copy_nonoverlapping(
@@ -1214,15 +1094,15 @@ fn patch_win32k_stubs(
                             patch_base as *mut u8,
                             JMP_INDIRECT.len(),
                         );
-                        // Write the 8-byte trampoline address at offset +0x16.
                         core::ptr::copy_nonoverlapping(
                             tramp_addr_bytes.as_ptr(),
                             (patch_base + 6) as *mut u8,
                             8,
                         );
                     }
+
                     patched += 1;
-                    pos += 0x20; // stubs are typically 32-byte aligned
+                    pos += STUB_LEN;
                     continue;
                 }
             }
@@ -1236,299 +1116,9 @@ fn patch_win32k_stubs(
         {
             use litebox::platform::DebugLogProvider as _;
             litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                "NT shim: patched {patched} Win32k stubs at 0x{image_base:X} → trampoline JMP\n",
+                "NT shim: patched {patched} Win32k stubs at 0x{image_base:X}\n",
             ));
         }
-        let _ = patched;
-    }
-}
-
-/// Scan the executable sections of a freshly-mapped PE image for `int 0x29`
-/// (__fastfail) instructions and replace each with `jmp +0` (EB 00), a
-/// two-byte NOP.
-///
-/// __fastfail bypasses all user-mode exception handlers.  On a real
-/// Windows system the kernel handles int 0x29 and terminates the process.
-/// In the sandbox we don't intercept int 0x29, so it would reach the
-/// host kernel and kill the host process.  Neutralising it lets the
-/// code fall through to whatever comes after (usually a `ret`).
-fn patch_fastfail(
-    parsed: &PeParsedFile,
-    image_base: usize,
-    pm: &litebox::mm::PageManager<Platform, PAGE_SIZE>,
-) {
-    let mut patched = 0u32;
-
-    for section in &parsed.sections {
-        if section.characteristics & section_chars::IMAGE_SCN_MEM_EXECUTE == 0 {
-            continue;
-        }
-
-        let exec_size = (section.virtual_size as usize).max(section.size_of_raw_data as usize);
-        if exec_size < 2 {
-            continue;
-        }
-
-        let mut pos = image_base + section.virtual_address as usize;
-        let end = pos.saturating_add(exec_size);
-        while pos + 2 <= end {
-            // Safety: the image was just mapped into guest VA.
-            let b0 = unsafe { core::ptr::read(pos as *const u8) };
-            let b1 = unsafe { core::ptr::read((pos + 1) as *const u8) };
-
-            if b0 == 0xCD && b1 == 0x29 {
-                // Make the page writable so we can patch.
-                let page_addr = pos & !(PAGE_SIZE - 1);
-                use litebox::platform::{RawConstPointer as _, RawPointerProvider};
-                let ptr =
-                    <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(page_addr);
-                let _ = unsafe { pm.make_pages_writable(ptr, PAGE_SIZE) };
-
-                // Replace CD 29 (int 0x29) with EB 00 (jmp +0 = NOP).
-                unsafe {
-                    core::ptr::write(pos as *mut u8, 0xEB);
-                    core::ptr::write((pos + 1) as *mut u8, 0x00);
-                }
-                patched += 1;
-                pos += 2;
-                continue;
-            }
-
-            pos += 1;
-        }
-    }
-
-    if patched > 0 {
-        #[cfg(debug_assertions)]
-        {
-            use litebox::platform::DebugLogProvider as _;
-            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                "NT shim: patched {patched} __fastfail sites at 0x{image_base:X}\n",
-            ));
-        }
-        let _ = patched;
-    }
-}
-
-/// Patch gdi32full.dll's `gbFirst` global from 1 to 0 after it is mapped.
-///
-/// `gbFirst` lives at a known RVA in gdi32full's `.data` section.  When it
-/// is 1 (the on-disk default), `GdiProcessSetup` takes the full kernel GDI
-/// init path that requires Win32k — which fails in a sandbox.  Setting it
-/// to 0 makes `GdiProcessSetup` take the fast shortcut path that reads
-/// `PEB+0xF8` (GdiSharedHandleTable) and returns `STATUS_SUCCESS`.
-///
-/// We identify gdi32full by reading the DLL name from the PE export
-/// directory.  If the name doesn't match, or has no export directory, this
-/// function is a no-op.
-fn patch_gdi32full_gbfirst(
-    parsed: &PeParsedFile,
-    pe_data: &[u8],
-    image_base: usize,
-    pm: &litebox::mm::PageManager<Platform, PAGE_SIZE>,
-) {
-    const GDI32FULL_SUPPORTED_TIMESTAMP: u32 = 0x2106_886A;
-    const GDI32FULL_SUPPORTED_SIZE: u32 = 0x0012_C000;
-    // gbFirst RVA in gdi32full.dll (Windows 10 build 19041, x86_64).
-    // Located in the .data section at RVA 0x10B474.
-    const GBFIRST_RVA: usize = 0x10B474;
-
-    // Read the DLL name from the PE export directory.
-    let dll_name = match get_pe_export_dll_name(parsed, pe_data) {
-        Some(name) => name,
-        None => return,
-    };
-
-    if !dll_name.eq_ignore_ascii_case("gdi32full.dll") {
-        return;
-    }
-    if parsed.file_header.time_date_stamp != GDI32FULL_SUPPORTED_TIMESTAMP
-        || parsed.size_of_image != GDI32FULL_SUPPORTED_SIZE
-    {
-        #[cfg(debug_assertions)]
-        {
-            use litebox::platform::DebugLogProvider as _;
-            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                "NT shim: skipping gdi32full patch for unsupported build ts=0x{:X} size=0x{:X}\n",
-                parsed.file_header.time_date_stamp,
-                parsed.size_of_image,
-            ));
-        }
-        return;
-    }
-
-    // Verify that the RVA is within the image bounds.
-    if GBFIRST_RVA >= parsed.size_of_image as usize {
-        return;
-    }
-
-    let gbfirst_va = image_base + GBFIRST_RVA;
-
-    // Read the current value.
-    let current = unsafe { core::ptr::read(gbfirst_va as *const u8) };
-    if current != 1 {
-        // Already 0 or unexpected value — don't patch.
-        #[cfg(debug_assertions)]
-        {
-            use litebox::platform::DebugLogProvider as _;
-            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                "NT shim: gdi32full gbFirst at 0x{gbfirst_va:X} already = {current} (not patching)\n",
-            ));
-        }
-        return;
-    }
-
-    // Make the page writable and patch gbFirst from 1 to 0.
-    let page_addr = gbfirst_va & !(PAGE_SIZE - 1);
-    use litebox::platform::{RawConstPointer as _, RawPointerProvider};
-    let ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(page_addr);
-    let _ = unsafe { pm.make_pages_writable(ptr, PAGE_SIZE) };
-
-    unsafe {
-        core::ptr::write(gbfirst_va as *mut u8, 0);
-    }
-
-    #[cfg(debug_assertions)]
-    {
-        use litebox::platform::DebugLogProvider as _;
-        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-            "NT shim: patched gdi32full gbFirst at 0x{gbfirst_va:X} (1 → 0)\n",
-        ));
-    }
-}
-
-/// Patch USER32.dll's `_UserClientDllInitialize` to always succeed, bypassing
-/// the GdiDllInitialize return-value check.
-///
-/// `_UserClientDllInitialize` is USER32's DllMain.  Its return value is
-/// computed from `ebx`:
-///
-///   ```asm
-///   0x6E2A2:  mov  ebx, eax        ; save GdiDllInitialize return
-///   0x6E2A4:  cmp  edi, 1
-///   0x6E2A7:  jne  epilogue
-///   0x6E2AD:  test eax, eax
-///   0x6E2AF:  jns  +7              ; if non-negative → continue init
-///   0x6E2B1:  xor  eax, eax        ; failure → eax = 0
-///   0x6E2B3:  jmp  epilogue
-///   0x6E2B8:  <continuation>       ; call InitProcessDpiAwareness etc.
-///   ...
-///   epilogue:
-///   0x6E38C:  not  ebx             ; NTSTATUS→BOOL: negative→FALSE
-///   0x6E38E:  shr  ebx, 0x1F
-///   0x6E391:  mov  eax, ebx
-///   ```
-///
-/// In the sandbox without Win32k, GdiDllInitialize may return a negative
-/// NTSTATUS, which makes ebx negative → `not+shr` = 0 (FALSE).
-///
-/// We apply two patches:
-///   1. `mov ebx, eax` (8B D8) → `xor ebx, ebx` (31 DB) at RVA 0x6E2A2
-///      Forces ebx = 0 so the epilogue produces TRUE (1).
-///   2. `jns +7` (79 07) → `jmp short +7` (EB 07) at RVA 0x6E2AF
-///      Forces the full init path even if GdiDllInitialize failed.
-///
-/// Console programs don't use GDI rendering, so this is safe.
-fn patch_user32_gdi_check(
-    parsed: &PeParsedFile,
-    pe_data: &[u8],
-    image_base: usize,
-    pm: &litebox::mm::PageManager<Platform, PAGE_SIZE>,
-) {
-    const USER32_SUPPORTED_TIMESTAMP: u32 = 0x881D_14CA;
-    const USER32_SUPPORTED_SIZE: u32 = 0x001C_5000;
-    const MOV_EBX_EAX_RVA: usize = 0x6E2A2;
-    const JNS_RVA: usize = 0x6E2AF;
-
-    let dll_name = match get_pe_export_dll_name(parsed, pe_data) {
-        Some(name) => name,
-        None => return,
-    };
-
-    if !dll_name.eq_ignore_ascii_case("user32.dll") {
-        return;
-    }
-    if parsed.file_header.time_date_stamp != USER32_SUPPORTED_TIMESTAMP
-        || parsed.size_of_image != USER32_SUPPORTED_SIZE
-    {
-        #[cfg(debug_assertions)]
-        {
-            use litebox::platform::DebugLogProvider as _;
-            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                "NT shim: skipping USER32 patch for unsupported build ts=0x{:X} size=0x{:X}\n",
-                parsed.file_header.time_date_stamp,
-                parsed.size_of_image,
-            ));
-        }
-        return;
-    }
-
-    if MOV_EBX_EAX_RVA + 2 > parsed.size_of_image as usize
-        || JNS_RVA + 2 > parsed.size_of_image as usize
-    {
-        return;
-    }
-
-    let mov_va = image_base + MOV_EBX_EAX_RVA;
-    let jns_va = image_base + JNS_RVA;
-
-    // Verify expected instruction bytes before patching.
-    let mov_b0 = unsafe { core::ptr::read(mov_va as *const u8) };
-    let mov_b1 = unsafe { core::ptr::read((mov_va + 1) as *const u8) };
-    let jns_b0 = unsafe { core::ptr::read(jns_va as *const u8) };
-    let jns_b1 = unsafe { core::ptr::read((jns_va + 1) as *const u8) };
-
-    if mov_b0 != 0x8B || mov_b1 != 0xD8 {
-        #[cfg(debug_assertions)]
-        {
-            use litebox::platform::DebugLogProvider as _;
-            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                "NT shim: USER32 patch: unexpected bytes at 0x{mov_va:X}: {mov_b0:02X} {mov_b1:02X} (expected 8B D8)\n",
-            ));
-        }
-        return;
-    }
-    if jns_b0 != 0x79 || jns_b1 != 0x07 {
-        #[cfg(debug_assertions)]
-        {
-            use litebox::platform::DebugLogProvider as _;
-            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                "NT shim: USER32 patch: unexpected bytes at 0x{jns_va:X}: {jns_b0:02X} {jns_b1:02X} (expected 79 07)\n",
-            ));
-        }
-        return;
-    }
-
-    // Make both pages writable (they're likely on the same page in .text).
-    use litebox::platform::{RawConstPointer as _, RawPointerProvider};
-    let page_addr = mov_va & !(PAGE_SIZE - 1);
-    let ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(page_addr);
-    let _ = unsafe { pm.make_pages_writable(ptr, PAGE_SIZE) };
-
-    // If jns_va is on a different page, make that writable too.
-    let jns_page = jns_va & !(PAGE_SIZE - 1);
-    if jns_page != page_addr {
-        let ptr2 = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(jns_page);
-        let _ = unsafe { pm.make_pages_writable(ptr2, PAGE_SIZE) };
-    }
-
-    // Patch 1: mov ebx, eax (8B D8) → xor ebx, ebx (31 DB)
-    unsafe {
-        core::ptr::write(mov_va as *mut u8, 0x31);
-        core::ptr::write((mov_va + 1) as *mut u8, 0xDB);
-    }
-
-    // Patch 2: jns +7 (79 07) → jmp short +7 (EB 07)
-    unsafe {
-        core::ptr::write(jns_va as *mut u8, 0xEB);
-    }
-
-    #[cfg(debug_assertions)]
-    {
-        use litebox::platform::DebugLogProvider as _;
-        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-            "NT shim: patched USER32 _UserClientDllInitialize: 0x{mov_va:X} (mov→xor ebx) + 0x{jns_va:X} (jns→jmp)\n",
-        ));
     }
 }
 
@@ -1743,25 +1333,33 @@ pub(crate) fn nt_query_section(
     let buffer_ptr = args.arg2;
     let buffer_len = args.arg3;
 
-    let return_length_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
+    let return_length_ptr =
+        crate::try_read_guest_value_unaligned::<usize>(ctx.regs.rsp + 0x28).unwrap_or(0);
 
-    let section = match handles.get(section_handle) {
-        Some(NtObject::Section {
-            image_size,
-            image_base,
-            entry_point,
-            section_alignment,
-            is_dll,
-            pe_data,
-        }) => (
-            *image_size,
-            *image_base,
-            *entry_point,
-            *section_alignment,
-            *is_dll,
-            pe_data.clone(),
-        ),
-        _ => return NtStatus::STATUS_INVALID_HANDLE,
+    let section = handles
+        .with(section_handle, |entry| match &entry.object {
+            NtObject::Section {
+                image_size,
+                image_base,
+                entry_point,
+                section_alignment,
+                is_dll,
+                pe_data,
+                ..
+            } => Some((
+                *image_size,
+                *image_base,
+                *entry_point,
+                *section_alignment,
+                *is_dll,
+                Arc::clone(pe_data),
+            )),
+            _ => None,
+        })
+        .flatten();
+
+    let Some(section) = section else {
+        return NtStatus::STATUS_INVALID_HANDLE;
     };
 
     let (image_size, image_base, entry_point, section_alignment, is_dll, pe_data) = section;
@@ -1787,13 +1385,14 @@ pub(crate) fn nt_query_section(
                 _pad: 0,
                 size: image_size as i64,
             };
+            if !crate::is_addr_range_writable(buffer_ptr, size) {
+                return NtStatus::STATUS_ACCESS_VIOLATION;
+            }
             unsafe {
-                core::ptr::write(buffer_ptr as *mut SectionBasicInfo, info);
+                core::ptr::write_unaligned(buffer_ptr as *mut SectionBasicInfo, info);
             }
             if return_length_ptr != 0 {
-                unsafe {
-                    core::ptr::write(return_length_ptr as *mut usize, size);
-                }
+                crate::try_write_guest_value_unaligned(return_length_ptr, size);
             }
             NtStatus::STATUS_SUCCESS
         }
@@ -1849,13 +1448,14 @@ pub(crate) fn nt_query_section(
                 image_file_size: pe_data.len() as u32,
                 checksum: parsed.optional_header.checksum,
             };
+            if !crate::is_addr_range_writable(buffer_ptr, size) {
+                return NtStatus::STATUS_ACCESS_VIOLATION;
+            }
             unsafe {
-                core::ptr::write(buffer_ptr as *mut SectionImageInfo, info);
+                core::ptr::write_unaligned(buffer_ptr as *mut SectionImageInfo, info);
             }
             if return_length_ptr != 0 {
-                unsafe {
-                    core::ptr::write(return_length_ptr as *mut usize, size);
-                }
+                crate::try_write_guest_value_unaligned(return_length_ptr, size);
             }
             NtStatus::STATUS_SUCCESS
         }

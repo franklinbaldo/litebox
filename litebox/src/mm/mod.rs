@@ -780,6 +780,28 @@ where
             .collect()
     }
 
+    /// Execute a callback under the PM write lock.
+    ///
+    /// The callback receives mutable access to the [`Vmem`] for atomic
+    /// multi-step operations (check+modify, create+metadata, etc.).
+    ///
+    /// **WARNING:** The callback **must not** call [`PageManager`] methods
+    /// (they re-acquire the lock and will deadlock). Call [`Vmem`] methods
+    /// directly on the provided reference instead.
+    pub fn with_write_lock<R>(&self, f: impl FnOnce(&mut Vmem<Platform, ALIGN>) -> R) -> R {
+        let mut vmem = self.vmem.write();
+        f(&mut vmem)
+    }
+
+    /// Execute a callback under the PM read lock.
+    ///
+    /// The callback receives shared access to the [`Vmem`] for consistent
+    /// multi-field queries without TOCTOU.
+    pub fn with_read_lock<R>(&self, f: impl FnOnce(&Vmem<Platform, ALIGN>) -> R) -> R {
+        let vmem = self.vmem.read();
+        f(&vmem)
+    }
+
     /// Get the memory permissions of a given address range.
     ///
     /// `ptr` specifies the start address of the memory range.
@@ -795,9 +817,49 @@ where
     ) -> Option<MemoryRegionPermissions> {
         let vmem = self.vmem.read();
         let start = ptr.as_usize();
-        let end = start + len.as_usize();
+        let end = start.checked_add(len.as_usize())?;
         let page_range = PageRange::<ALIGN>::new(start, end)?;
         vmem.get_memory_permissions(page_range)
+    }
+
+    /// Atomically check-and-upgrade an inaccessible page for demand-commit.
+    ///
+    /// Under a single write-lock acquisition, verifies that the page at
+    /// `addr` with size `len` is currently mapped with empty (inaccessible)
+    /// permissions, and if so upgrades it to `new_permissions`.
+    ///
+    /// Returns `Ok(true)` if the page was inaccessible and successfully
+    /// upgraded. Returns `Ok(false)` if the page is not mapped or not
+    /// inaccessible (no modification is made). Returns `Err` on platform
+    /// errors during the permission change.
+    ///
+    /// This eliminates the TOCTOU race inherent in separate
+    /// [`get_memory_permissions`](Self::get_memory_permissions) +
+    /// [`make_pages_writable`](Self::make_pages_writable) calls in the
+    /// demand-fault handler.
+    pub fn try_demand_commit_page(
+        &self,
+        addr: NonZeroAddress<ALIGN>,
+        len: NonZeroPageSize<ALIGN>,
+        new_permissions: MemoryRegionPermissions,
+    ) -> Result<bool, VmemProtectError> {
+        let mut vmem = self.vmem.write();
+        let start = addr.as_usize();
+        let Some(end) = start.checked_add(len.as_usize()) else {
+            return Ok(false);
+        };
+        let Some(page_range) = PageRange::<ALIGN>::new(start, end) else {
+            return Ok(false);
+        };
+        match vmem.get_memory_permissions(page_range) {
+            Some(perms) if perms.is_empty() => {
+                // Safety: the page is currently inaccessible (empty permissions),
+                // so there can be no concurrent access to the memory region.
+                unsafe { vmem.protect_mapping(page_range, new_permissions) }?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 }
 

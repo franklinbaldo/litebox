@@ -11,16 +11,16 @@ use alloc::vec::Vec;
 use crate::{
     mm::linux::{CreatePagesFlags, NonZeroAddress},
     platform::{
-        PageManagementProvider, RawConstPointer,
         mock::MockRawMutex,
         page_mgmt::MemoryRegionPermissions,
         trivial_providers::{TransparentConstPtr, TransparentMutPtr},
+        PageManagementProvider, RawConstPointer,
     },
 };
 use zerocopy::{FromBytes, IntoBytes};
 
 use super::linux::{
-    NonZeroPageSize, PAGE_SIZE, PageRange, VmArea, VmFlags, Vmem, VmemProtectError, VmemResizeError,
+    NonZeroPageSize, PageRange, VmArea, VmFlags, Vmem, VmemProtectError, VmemResizeError, PAGE_SIZE,
 };
 
 /// A dummy implementation of [`VmemBackend`] that does nothing.
@@ -300,15 +300,13 @@ fn test_vmm_mapping() {
         Err(VmemProtectError::InvalidRange(_))
     ));
 
-    assert!(
-        unsafe {
-            vmm.resize_mapping(
-                PageRange::new(start_addr, start_addr + 2 * PAGE_SIZE).unwrap(),
-                NonZeroPageSize::new(PAGE_SIZE * 4).unwrap(),
-            )
-        }
-        .is_ok()
-    );
+    assert!(unsafe {
+        vmm.resize_mapping(
+            PageRange::new(start_addr, start_addr + 2 * PAGE_SIZE).unwrap(),
+            NonZeroPageSize::new(PAGE_SIZE * 4).unwrap(),
+        )
+    }
+    .is_ok());
     // Grow and merge, [(0x1_0000, 0x1_c000)]
     assert_eq!(
         collect_mappings(&vmm),
@@ -326,15 +324,13 @@ fn test_vmm_mapping() {
         Err(VmemProtectError::NoAccess { .. })
     ));
 
-    assert!(
-        unsafe {
-            vmm.protect_mapping(
-                PageRange::new(start_addr + 2 * PAGE_SIZE, start_addr + 4 * PAGE_SIZE).unwrap(),
-                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
-            )
-        }
-        .is_ok()
-    );
+    assert!(unsafe {
+        vmm.protect_mapping(
+            PageRange::new(start_addr + 2 * PAGE_SIZE, start_addr + 4 * PAGE_SIZE).unwrap(),
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+        )
+    }
+    .is_ok());
     // Change permission, [(0x1_0000, 0x1_2000), (0x1_2000, 0x1_4000), (0x1_4000, 0x1_c000)]
     assert_eq!(
         collect_mappings(&vmm),
@@ -351,16 +347,14 @@ fn test_vmm_mapping() {
         unsafe { vmm.resize_mapping(r, NonZeroPageSize::new(PAGE_SIZE * 4).unwrap()) },
         Err(VmemResizeError::RangeOccupied(_))
     ));
-    assert!(
-        unsafe {
-            vmm.move_mappings(
-                r,
-                Some(NonZeroAddress::new(start_addr + 12 * PAGE_SIZE).unwrap()),
-                NonZeroPageSize::new(PAGE_SIZE * 4).unwrap(),
-            )
-        }
-        .is_ok_and(|v| v.as_usize() == start_addr + 12 * PAGE_SIZE)
-    );
+    assert!(unsafe {
+        vmm.move_mappings(
+            r,
+            Some(NonZeroAddress::new(start_addr + 12 * PAGE_SIZE).unwrap()),
+            NonZeroPageSize::new(PAGE_SIZE * 4).unwrap(),
+        )
+    }
+    .is_ok_and(|v| v.as_usize() == start_addr + 12 * PAGE_SIZE));
     assert_eq!(
         collect_mappings(&vmm),
         vec![
@@ -420,15 +414,13 @@ fn test_vmm_mapping() {
     );
 
     // shrink mapping
-    assert!(
-        unsafe {
-            vmm.resize_mapping(
-                PageRange::new(start_addr + 4 * PAGE_SIZE, start_addr + 8 * PAGE_SIZE).unwrap(),
-                NonZeroPageSize::new(2 * PAGE_SIZE).unwrap(),
-            )
-        }
-        .is_ok()
-    );
+    assert!(unsafe {
+        vmm.resize_mapping(
+            PageRange::new(start_addr + 4 * PAGE_SIZE, start_addr + 8 * PAGE_SIZE).unwrap(),
+            NonZeroPageSize::new(2 * PAGE_SIZE).unwrap(),
+        )
+    }
+    .is_ok());
     assert_eq!(
         collect_mappings(&vmm),
         vec![
@@ -544,11 +536,10 @@ fn brk_backfills_hole_after_logical_jump() {
     }
     assert_eq!(pm.current_brk(), 0x14_000);
     assert_eq!(pm.current_brk_frontier(), 0x14_000);
-    assert!(
-        pm.mappings()
-            .iter()
-            .any(|(range, _)| *range == (0x10_000..0x14_000))
-    );
+    assert!(pm
+        .mappings()
+        .iter()
+        .any(|(range, _)| *range == (0x10_000..0x14_000)));
 }
 
 #[test]
@@ -579,9 +570,17 @@ fn ensure_brk_past_makes_floor_sticky() {
     }
     assert_eq!(pm.current_brk(), 0x24_000);
     assert_eq!(pm.current_brk_frontier(), 0x24_000);
-    assert!(
-        pm.mappings()
-            .iter()
-            .any(|(range, _)| *range == (0x20_000..0x24_000))
-    );
+    assert!(pm
+        .mappings()
+        .iter()
+        .any(|(range, _)| *range == (0x20_000..0x24_000)));
+}
+
+#[test]
+fn get_memory_permissions_rejects_overflowing_range() {
+    let pm = make_page_manager();
+    let start = NonZeroAddress::new(usize::MAX & !(PAGE_SIZE - 1)).unwrap();
+    let len = NonZeroPageSize::new(PAGE_SIZE).unwrap();
+
+    assert!(pm.get_memory_permissions(start, len).is_none());
 }

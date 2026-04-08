@@ -3,9 +3,9 @@
 
 //! A shim that provides a Windows NT-compatible ABI via LiteBox.
 //!
-//! This shim intercepts `syscall` instructions issued by NT stub DLLs
-//! (ntdll.dll, kernel32.dll, etc.) and dispatches them to handlers that
-//! implement the NT kernel interface on top of the LiteBox core.
+//! This shim intercepts rewritten real `ntdll.dll` syscall stubs and selected
+//! real `win32u.dll` Win32k stubs, then dispatches them to handlers that
+//! implement the guest-visible kernel interface on top of the LiteBox core.
 //!
 //! ## Syscall Calling Convention
 //!
@@ -65,42 +65,37 @@
 
 extern crate alloc;
 
-use core::sync::atomic::{AtomicI32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use spin::Mutex;
 
 use litebox::event::wait::WaitState;
 use litebox::mm::PageManager;
 use litebox::shim::{ContinueOperation, ExceptionInfo};
 use litebox_common_windows::ntstatus::NtStatus;
-use litebox_common_windows::stub_dlls;
 use litebox_common_windows::{NtSyscallId, NtSyscallMap};
 use litebox_platform_multiplex::Platform;
 
-/// Check if a memory address is committed (readable) using host VirtualQuery.
-///
-/// Used by the exception handler to avoid recursive faults when reading
-/// guest stack or code memory that might not be mapped.
-fn is_addr_committed(addr: usize) -> bool {
-    #[repr(C)]
-    struct MemoryBasicInformation {
-        base_address: usize,
-        allocation_base: usize,
-        allocation_protect: u32,
-        _pad1: u32,
-        region_size: usize,
-        state: u32,
-        _protect: u32,
-        _type: u32,
-        _pad2: u32,
-    }
-    unsafe extern "system" {
-        fn VirtualQuery(
-            address: usize,
-            buffer: *mut MemoryBasicInformation,
-            length: usize,
-        ) -> usize;
-    }
-    const MEM_COMMIT: u32 = 0x1000;
+mod trace;
+pub(crate) use trace::TraceKind;
+
+#[repr(C)]
+struct MemoryBasicInformation {
+    base_address: usize,
+    allocation_base: usize,
+    allocation_protect: u32,
+    _pad1: u32,
+    region_size: usize,
+    state: u32,
+    protect: u32,
+    _type: u32,
+    _pad2: u32,
+}
+
+unsafe extern "system" {
+    fn VirtualQuery(address: usize, buffer: *mut MemoryBasicInformation, length: usize) -> usize;
+}
+
+fn query_host_memory_basic_information(addr: usize) -> Option<MemoryBasicInformation> {
     let mut mbi = core::mem::MaybeUninit::<MemoryBasicInformation>::zeroed();
     // Safety: VirtualQuery reads the host process's virtual memory info.
     let ret = unsafe {
@@ -110,138 +105,236 @@ fn is_addr_committed(addr: usize) -> bool {
             core::mem::size_of::<MemoryBasicInformation>(),
         )
     };
-    if ret != 0 {
-        let mbi = unsafe { mbi.assume_init() };
-        mbi.state == MEM_COMMIT
-    } else {
-        false
-    }
+    (ret != 0).then(|| unsafe { mbi.assume_init() })
 }
 
-#[cfg(target_os = "windows")]
-fn query_host_registry_value(
-    nt_path: &str,
-    value_name: &str,
-) -> Option<(u32, alloc::vec::Vec<u8>)> {
-    unsafe extern "system" {
-        fn RegOpenKeyExW(
-            hkey: isize,
-            subkey: *const u16,
-            options: u32,
-            sam_desired: u32,
-            result: *mut isize,
-        ) -> u32;
-        fn RegQueryValueExW(
-            hkey: isize,
-            value_name: *const u16,
-            reserved: *mut u32,
-            reg_type: *mut u32,
-            data: *mut u8,
-            data_len: *mut u32,
-        ) -> u32;
-        fn RegCloseKey(hkey: isize) -> u32;
+const MEM_COMMIT: u32 = 0x1000;
+const PAGE_NOACCESS: u32 = 0x01;
+const PAGE_READONLY: u32 = 0x02;
+const PAGE_READWRITE: u32 = 0x04;
+const PAGE_WRITECOPY: u32 = 0x08;
+const PAGE_EXECUTE: u32 = 0x10;
+const PAGE_EXECUTE_READ: u32 = 0x20;
+const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
+const PAGE_GUARD: u32 = 0x100;
+const PAGE_PROTECTION_MASK: u32 = 0xFF;
+
+fn host_page_is_readable(mbi: &MemoryBasicInformation) -> bool {
+    if mbi.state != MEM_COMMIT
+        || (mbi.protect & PAGE_GUARD) != 0
+        || (mbi.protect & PAGE_NOACCESS) != 0
+    {
+        return false;
     }
+    matches!(
+        mbi.protect & PAGE_PROTECTION_MASK,
+        PAGE_READONLY
+            | PAGE_READWRITE
+            | PAGE_WRITECOPY
+            | PAGE_EXECUTE
+            | PAGE_EXECUTE_READ
+            | PAGE_EXECUTE_READWRITE
+            | PAGE_EXECUTE_WRITECOPY
+    )
+}
 
-    const ERROR_SUCCESS: u32 = 0;
-    const KEY_QUERY_VALUE: u32 = 0x0001;
-    const HKEY_LOCAL_MACHINE: isize = 0x8000_0002u32 as i32 as isize;
-    const HKEY_USERS: isize = 0x8000_0003u32 as i32 as isize;
+fn host_page_is_writable(mbi: &MemoryBasicInformation) -> bool {
+    if !host_page_is_readable(mbi) {
+        return false;
+    }
+    matches!(
+        mbi.protect & PAGE_PROTECTION_MASK,
+        PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+    )
+}
 
-    let (root, subkey) = if let Some(suffix) = nt_path
-        .strip_prefix("\\REGISTRY\\MACHINE\\")
-        .or_else(|| nt_path.strip_prefix("\\Registry\\Machine\\"))
-    {
-        (HKEY_LOCAL_MACHINE, suffix)
-    } else if let Some(suffix) = nt_path
-        .strip_prefix("\\REGISTRY\\USER\\")
-        .or_else(|| nt_path.strip_prefix("\\Registry\\User\\"))
-    {
-        (HKEY_USERS, suffix)
-    } else {
-        return None;
+fn is_addr_range_accessible(
+    addr: usize,
+    len: usize,
+    page_is_accessible: impl Fn(&MemoryBasicInformation) -> bool,
+) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let Some(end) = addr.checked_add(len - 1) else {
+        return false;
     };
 
-    let subkey_wide: alloc::vec::Vec<u16> =
-        subkey.encode_utf16().chain(core::iter::once(0)).collect();
-    let value_wide: alloc::vec::Vec<u16> = value_name
-        .encode_utf16()
-        .chain(core::iter::once(0))
-        .collect();
-
-    let mut key = 0isize;
-    if unsafe { RegOpenKeyExW(root, subkey_wide.as_ptr(), 0, KEY_QUERY_VALUE, &mut key) }
-        != ERROR_SUCCESS
-    {
-        return None;
+    let mut cursor = addr;
+    while cursor <= end {
+        let Some(mbi) = query_host_memory_basic_information(cursor) else {
+            return false;
+        };
+        if !page_is_accessible(&mbi) {
+            return false;
+        }
+        let Some(region_end) = mbi.base_address.checked_add(mbi.region_size) else {
+            return false;
+        };
+        if region_end <= cursor {
+            return false;
+        }
+        if end < region_end {
+            return true;
+        }
+        cursor = region_end;
     }
 
-    let result = (|| {
-        let mut reg_type = 0u32;
-        let mut data_len = 0u32;
-        if unsafe {
-            RegQueryValueExW(
-                key,
-                value_wide.as_ptr(),
-                core::ptr::null_mut(),
-                &mut reg_type,
-                core::ptr::null_mut(),
-                &mut data_len,
-            )
-        } != ERROR_SUCCESS
-        {
-            return None;
-        }
-
-        let mut data = alloc::vec![0u8; data_len as usize];
-        if unsafe {
-            RegQueryValueExW(
-                key,
-                value_wide.as_ptr(),
-                core::ptr::null_mut(),
-                &mut reg_type,
-                data.as_mut_ptr(),
-                &mut data_len,
-            )
-        } != ERROR_SUCCESS
-        {
-            return None;
-        }
-        data.truncate(data_len as usize);
-        Some((reg_type, data))
-    })();
-
-    unsafe {
-        RegCloseKey(key);
-    }
-
-    result
+    true
 }
 
-#[cfg(not(target_os = "windows"))]
-fn query_host_registry_value(
-    _nt_path: &str,
-    _value_name: &str,
-) -> Option<(u32, alloc::vec::Vec<u8>)> {
-    None
+/// Check if a memory address is committed and readable using host VirtualQuery.
+///
+/// This is used by both debug-only diagnostics and live syscall helpers that
+/// need to probe optional guest memory regions without faulting.
+pub(crate) fn is_addr_committed(addr: usize) -> bool {
+    query_host_memory_basic_information(addr)
+        .map(|mbi| host_page_is_readable(&mbi))
+        .unwrap_or(false)
+}
+
+pub(crate) fn is_addr_range_committed(addr: usize, len: usize) -> bool {
+    is_addr_range_accessible(addr, len, host_page_is_readable)
+}
+
+pub(crate) fn is_addr_range_writable(addr: usize, len: usize) -> bool {
+    is_addr_range_accessible(addr, len, host_page_is_writable)
+}
+
+pub(crate) fn exception_frame_rsp(rsp: usize, frame_size: usize) -> Option<usize> {
+    let new_rsp = rsp.checked_sub(frame_size)? & !0x3F;
+    is_addr_range_writable(new_rsp, frame_size).then_some(new_rsp)
+}
+
+const AMD64_EXCEPTION_RECORD_SIZE: usize = 0x98;
+const AMD64_MACHINE_FRAME_SIZE: usize = 5 * core::mem::size_of::<u64>();
+const AMD64_MACHINE_FRAME_ALIGN: usize = 0x10;
+const AMD64_USER_CS: u64 = 0x33;
+const AMD64_USER_SS: u64 = 0x2B;
+
+fn align_up_pow2(value: usize, align: usize) -> usize {
+    debug_assert!(align.is_power_of_two());
+    (value + (align - 1)) & !(align - 1)
+}
+
+fn ki_user_exception_dispatcher_machine_frame_offset(exception_record_offset: usize) -> usize {
+    align_up_pow2(
+        exception_record_offset + AMD64_EXCEPTION_RECORD_SIZE,
+        AMD64_MACHINE_FRAME_ALIGN,
+    )
+}
+
+fn ki_user_exception_dispatcher_frame_size(exception_record_offset: usize) -> usize {
+    align_up_pow2(
+        ki_user_exception_dispatcher_machine_frame_offset(exception_record_offset)
+            + AMD64_MACHINE_FRAME_SIZE,
+        0x40,
+    )
+}
+
+unsafe fn write_ki_user_exception_dispatcher_machine_frame(
+    frame_base: usize,
+    exception_record_offset: usize,
+) {
+    let context = frame_base as *const u8;
+    let rip = unsafe { core::ptr::read_unaligned(context.add(0xF8) as *const u64) };
+    let rsp = unsafe { core::ptr::read_unaligned(context.add(0x98) as *const u64) };
+    let eflags = unsafe { core::ptr::read_unaligned(context.add(0x44) as *const u32) } as u64;
+    let machine_frame = (frame_base
+        + ki_user_exception_dispatcher_machine_frame_offset(exception_record_offset))
+        as *mut u8;
+
+    // KiUserExceptionDispatcher's unwind info includes UWOP_PUSH_MACHFRAME, so
+    // the synthetic CONTEXT/EXCEPTION_RECORD frame also needs the hardware-style
+    // machine-frame tail that carries the pre-exception RIP/RSP.
+    unsafe {
+        core::ptr::write_unaligned(machine_frame.add(0x00) as *mut u64, rip);
+        core::ptr::write_unaligned(machine_frame.add(0x08) as *mut u64, AMD64_USER_CS);
+        core::ptr::write_unaligned(machine_frame.add(0x10) as *mut u64, eflags);
+        core::ptr::write_unaligned(machine_frame.add(0x18) as *mut u64, rsp);
+        core::ptr::write_unaligned(machine_frame.add(0x20) as *mut u64, AMD64_USER_SS);
+    }
 }
 
 #[cfg(target_os = "windows")]
 unsafe extern "system" {
     fn NtGetMUIRegistryInfo(flags: u32, data_size: *mut u32, data: *mut core::ffi::c_void) -> i32;
     fn QueryDosDeviceW(device_name: *const u16, target_path: *mut u16, max_chars: u32) -> u32;
+    fn GetCurrentProcess() -> *mut core::ffi::c_void;
+    fn FlushInstructionCache(
+        process: *mut core::ffi::c_void,
+        base_address: *const core::ffi::c_void,
+        size: usize,
+    ) -> i32;
 }
 
-fn read_guest_unicode_string_lossy(value_name_ptr: usize) -> alloc::string::String {
-    if value_name_ptr == 0 {
-        return alloc::string::String::new();
-    }
-    let len = unsafe { core::ptr::read_unaligned(value_name_ptr as *const u16) } as usize;
-    let buf = unsafe { core::ptr::read_unaligned((value_name_ptr + 8) as *const u64) };
+fn read_guest_utf16_lossy(buf: usize, len: usize) -> alloc::string::String {
     if buf == 0 || len == 0 {
         return alloc::string::String::new();
     }
-    let wchars = unsafe { core::slice::from_raw_parts(buf as *const u16, len / 2) };
-    alloc::string::String::from_utf16_lossy(wchars)
+    let mut wchars = alloc::vec::Vec::with_capacity(len / 2);
+    for i in 0..(len / 2) {
+        let Some(addr) = buf.checked_add(i * 2) else {
+            break;
+        };
+        wchars.push(unsafe { core::ptr::read_unaligned(addr as *const u16) });
+    }
+    alloc::string::String::from_utf16_lossy(&wchars)
+}
+
+pub(crate) fn try_read_guest_value_unaligned<T: Copy>(addr: usize) -> Option<T> {
+    let len = core::mem::size_of::<T>();
+    if len == 0 || !is_addr_range_committed(addr, len) {
+        return None;
+    }
+    Some(unsafe { core::ptr::read_unaligned(addr as *const T) })
+}
+
+pub(crate) fn try_write_guest_value_unaligned<T: Copy>(addr: usize, value: T) -> bool {
+    let len = core::mem::size_of::<T>();
+    if len == 0 || !is_addr_range_writable(addr, len) {
+        return false;
+    }
+    unsafe {
+        core::ptr::write_unaligned(addr as *mut T, value);
+    }
+    true
+}
+
+fn try_read_guest_utf16_lossy(
+    buf: usize,
+    len: usize,
+    max_len: usize,
+) -> Option<alloc::string::String> {
+    if buf == 0 || len == 0 {
+        return Some(alloc::string::String::new());
+    }
+    if !len.is_multiple_of(2) || len > max_len || !is_addr_range_committed(buf, len) {
+        return None;
+    }
+    Some(read_guest_utf16_lossy(buf, len))
+}
+
+fn try_read_guest_unicode_string_lossy(
+    unicode_string_ptr: usize,
+    max_len: usize,
+) -> Option<alloc::string::String> {
+    if unicode_string_ptr == 0 {
+        return Some(alloc::string::String::new());
+    }
+    let len = try_read_guest_value_unaligned::<u16>(unicode_string_ptr)? as usize;
+    let buffer = try_read_guest_value_unaligned::<u64>(unicode_string_ptr + 8)? as usize;
+    try_read_guest_utf16_lossy(buffer, len, max_len)
+}
+
+fn read_guest_unicode_string_lossy(value_name_ptr: usize) -> Option<alloc::string::String> {
+    if value_name_ptr == 0 {
+        return Some(alloc::string::String::new());
+    }
+    let len = try_read_guest_value_unaligned::<u16>(value_name_ptr)? as usize;
+    let buf = try_read_guest_value_unaligned::<u64>(value_name_ptr + 8)?;
+    Some(read_guest_utf16_lossy(buf as usize, len))
 }
 
 fn encode_reg_sz(value: &str) -> alloc::vec::Vec<u8> {
@@ -257,35 +350,35 @@ fn encode_reg_dword(value: u32) -> alloc::vec::Vec<u8> {
     alloc::vec::Vec::from(value.to_le_bytes())
 }
 
-fn read_object_attributes_name(obj_attrs_ptr: usize) -> alloc::string::String {
+fn read_object_attributes_name(obj_attrs_ptr: usize) -> Option<alloc::string::String> {
     if obj_attrs_ptr == 0 {
-        return alloc::string::String::new();
+        return Some(alloc::string::String::new());
     }
-    let name_ptr = unsafe { core::ptr::read_unaligned((obj_attrs_ptr + 0x10) as *const usize) };
+    let name_ptr = try_read_guest_value_unaligned::<usize>(obj_attrs_ptr + 0x10)?;
     read_guest_unicode_string_lossy(name_ptr)
 }
 
-fn read_object_attributes_root_directory(obj_attrs_ptr: usize) -> u32 {
+fn read_object_attributes_root_directory(obj_attrs_ptr: usize) -> Option<u32> {
     if obj_attrs_ptr == 0 {
-        return 0;
+        return Some(0);
     }
-    unsafe { core::ptr::read_unaligned((obj_attrs_ptr + 0x08) as *const u64) as u32 }
+    Some(try_read_guest_value_unaligned::<u64>(obj_attrs_ptr + 0x08)? as u32)
 }
 
 fn resolve_object_attributes_name(
     obj_attrs_ptr: usize,
     handles: &handle_table::HandleTable,
 ) -> alloc::string::String {
-    let name = read_object_attributes_name(obj_attrs_ptr);
+    let name = read_object_attributes_name(obj_attrs_ptr).unwrap_or_default();
     if name.is_empty() || name.starts_with('\\') {
         return name;
     }
-    let root = read_object_attributes_root_directory(obj_attrs_ptr);
+    let root = read_object_attributes_root_directory(obj_attrs_ptr).unwrap_or(0);
     if root == 0 {
         return name;
     }
-    match handles.get(root) {
-        Some(handle_table::NtObject::Stub { kind }) => {
+    handles.with(root, |entry| match &entry.object {
+        handle_table::NtObject::Stub { kind, .. } => {
             if let Some(prefix) = kind.strip_prefix("DirectoryObject:") {
                 if prefix.ends_with('\\') {
                     alloc::format!("{prefix}{name}")
@@ -293,11 +386,11 @@ fn resolve_object_attributes_name(
                     alloc::format!("{prefix}\\{name}")
                 }
             } else {
-                name
+                name.clone()
             }
         }
-        _ => name,
-    }
+        _ => name.clone(),
+    }).unwrap_or(name)
 }
 
 #[cfg(target_os = "windows")]
@@ -316,6 +409,184 @@ fn query_host_dos_device(device: &str) -> Option<alloc::string::String> {
 #[cfg(not(target_os = "windows"))]
 fn query_host_dos_device(_device: &str) -> Option<alloc::string::String> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_current_thread_pseudohandle_binds_real_thread_object() {
+        let current_thread =
+            alloc::sync::Arc::new(handle_table::ThreadObject::new(0x1234, 0, 0x7777));
+
+        match duplicated_pseudo_handle_object(0xFFFF_FFFE, Some(&current_thread)) {
+            Some(handle_table::NtObject::Thread(thread)) => {
+                assert!(alloc::sync::Arc::ptr_eq(&thread, &current_thread));
+            }
+            _ => panic!("NtCurrentThread pseudo-handle should duplicate as a real thread object"),
+        }
+    }
+
+    #[test]
+    fn process_tls_thread_ref_prefers_handle_over_tid_collision() {
+        let mut threads = alloc::collections::BTreeMap::new();
+        threads.insert(
+            4,
+            alloc::sync::Arc::new(handle_table::ThreadObject::new(4, 0, 0x1111)),
+        );
+
+        let mut handles = handle_table::HandleTable::new();
+        let thread_handle = handles.insert(handle_table::NtObject::Thread(alloc::sync::Arc::new(
+            handle_table::ThreadObject::new(0x1234, 0, 0x2222),
+        )));
+        assert_eq!(thread_handle, 4);
+
+        let teb = resolve_process_tls_thread_teb(&threads, &handles, 0x9999, 0xAAAA, 4, 2);
+        assert_eq!(teb, 0x2222);
+    }
+
+    #[test]
+    fn process_tls_thread_ref_still_falls_back_to_tid_for_legacy_callers() {
+        let mut threads = alloc::collections::BTreeMap::new();
+        threads.insert(
+            0x1234,
+            alloc::sync::Arc::new(handle_table::ThreadObject::new(0x1234, 0, 0x3333)),
+        );
+
+        let handles = handle_table::HandleTable::new();
+
+        let teb = resolve_process_tls_thread_teb(&threads, &handles, 0x9999, 0xAAAA, 0x1234, 2);
+        assert_eq!(teb, 0x3333);
+    }
+
+    #[test]
+    fn highest_aligned_free_base_prefers_highest_hole() {
+        let occupied = alloc::vec![(0x12_000, 0x18_000), (0x1A_000, 0x1C_000)];
+
+        assert_eq!(
+            highest_aligned_free_base(0x10_000, 0x20_000, 0x4_000, 0xFFF, &occupied),
+            Some(0x1C_000)
+        );
+    }
+
+    #[test]
+    fn highest_aligned_free_base_respects_alignment_floor() {
+        let occupied = alloc::vec![];
+
+        assert_eq!(
+            highest_aligned_free_base(0x18_000, 0x20_000, 0x4_000, 0xFFFF, &occupied),
+            None
+        );
+    }
+
+    #[test]
+    fn find_section_view_scans_past_non_covering_predecessor() {
+        let mut views = alloc::collections::BTreeMap::new();
+        views.insert(0x1_000, 0x8_000);
+        views.insert(0x6_000, 0x1_000);
+
+        assert_eq!(find_section_view(&views, 0x7_000), Some((0x1_000, 0x8_000)));
+    }
+
+    #[test]
+    fn find_section_view_returns_none_without_covering_range() {
+        let mut views = alloc::collections::BTreeMap::new();
+        views.insert(0x1_000, 0x2_000);
+        views.insert(0x6_000, 0x1_000);
+
+        assert_eq!(find_section_view(&views, 0x4_000), None);
+    }
+
+    #[repr(C)]
+    struct GuestUnicodeString {
+        length: u16,
+        maximum_length: u16,
+        _padding: u32,
+        buffer: u64,
+    }
+
+    #[test]
+    fn checked_guest_unicode_string_reads_valid_buffer() {
+        let wide: alloc::vec::Vec<u16> = "hello".encode_utf16().collect();
+        let header = GuestUnicodeString {
+            length: (wide.len() * 2) as u16,
+            maximum_length: (wide.len() * 2) as u16,
+            _padding: 0,
+            buffer: wide.as_ptr() as usize as u64,
+        };
+
+        assert_eq!(
+            try_read_guest_unicode_string_lossy(core::ptr::from_ref(&header) as usize, 64),
+            Some(alloc::string::String::from("hello"))
+        );
+        assert_eq!(try_read_guest_unicode_string_lossy(1, 64), None);
+    }
+}
+
+pub(crate) fn duplicated_pseudo_handle_object(
+    source_handle: u32,
+    current_thread: Option<&alloc::sync::Arc<handle_table::ThreadObject>>,
+) -> Option<handle_table::NtObject> {
+    match source_handle {
+        0xFFFF_FFFF => Some(handle_table::NtObject::CurrentProcess),
+        0xFFFF_FFFE => Some(match current_thread {
+            Some(current_thread) => {
+                handle_table::NtObject::Thread(alloc::sync::Arc::clone(current_thread))
+            }
+            None => handle_table::NtObject::CurrentThread,
+        }),
+        _ => None,
+    }
+}
+
+fn highest_aligned_free_base(
+    floor: usize,
+    ceiling: usize,
+    aligned_size: usize,
+    align_mask: usize,
+    occupied: &[(usize, usize)],
+) -> Option<usize> {
+    if floor >= ceiling || ceiling.saturating_sub(floor) < aligned_size {
+        return None;
+    }
+
+    let mut intervals = occupied
+        .iter()
+        .filter_map(|&(start, end)| {
+            let start = start.max(floor);
+            let end = end.min(ceiling);
+            (start < end).then_some((start, end))
+        })
+        .collect::<alloc::vec::Vec<_>>();
+    intervals.sort_unstable_by_key(|(start, _)| *start);
+
+    let mut merged = alloc::vec::Vec::<(usize, usize)>::new();
+    for (start, end) in intervals {
+        if let Some((_, last_end)) = merged.last_mut()
+            && start <= *last_end
+        {
+            *last_end = (*last_end).max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+
+    let mut hole_end = ceiling;
+    for (start, end) in merged.iter().rev().copied() {
+        if end < hole_end {
+            let latest_start = hole_end.checked_sub(aligned_size)?;
+            let candidate = latest_start & !align_mask;
+            if candidate >= end {
+                return Some(candidate);
+            }
+        }
+        hole_end = hole_end.min(start);
+    }
+
+    let latest_start = hole_end.checked_sub(aligned_size)?;
+    let candidate = latest_start & !align_mask;
+    (candidate >= floor).then_some(candidate)
 }
 
 fn symbolic_link_target_for_name(name: &str) -> Option<alloc::string::String> {
@@ -372,19 +643,6 @@ fn lookup_registry_value_bytes(
 ) -> Option<(u32, alloc::vec::Vec<u8>)> {
     let key_lower = key_path.to_ascii_lowercase();
     let name_lower = value_name.to_ascii_lowercase();
-
-    let host_reg_value = if key_lower.contains(
-        "\\system\\currentcontrolset\\services\\winsock2\\parameters\\protocol_catalog9\\catalog_entries",
-    ) || key_lower.contains(
-        "\\system\\currentcontrolset\\services\\winsock2\\parameters\\namespace_catalog5\\catalog_entries",
-    ) {
-        query_host_registry_value(key_path, value_name)
-    } else {
-        None
-    };
-    if let Some((reg_type, reg_data)) = host_reg_value {
-        return Some((reg_type, reg_data));
-    }
 
     let reg_sz: Option<(&str, u32)> = if key_lower.ends_with("\\control panel\\international") {
         match name_lower.as_str() {
@@ -514,6 +772,123 @@ fn lookup_registry_value_bytes(
     reg_dword.map(|value| (4, encode_reg_dword(value)))
 }
 
+/// Return the names of all hardcoded registry values for the given key path.
+///
+/// This allows `NtEnumerateValueKey` to include hardcoded fallback values
+/// alongside VFS-backed values.  Names are returned in the display casing
+/// used by the hardcoded table (e.g. `"LocaleName"`, `"ACP"`).
+fn enumerate_hardcoded_value_names(key_path: &str) -> alloc::vec::Vec<&'static str> {
+    let key_lower = key_path.to_ascii_lowercase();
+
+    if key_lower.ends_with("\\control panel\\international") {
+        alloc::vec![
+            "LocaleName",
+            "sList",
+            "sDecimal",
+            "sThousand",
+            "sGrouping",
+            "sNativeDigits",
+            "sMonDecimalSep",
+            "sMonThousandSep",
+            "sMonGrouping",
+            "sPositiveSign",
+            "sNegativeSign",
+            "sTimeFormat",
+            "sShortTime",
+            "s1159",
+            "s2359",
+            "sShortDate",
+            "sYearMonth",
+            "sLongDate",
+            "iCountry",
+            "iMeasure",
+            "iPaperSize",
+            "iDigits",
+            "iLZero",
+            "iNegNumber",
+            "NumShape",
+            "iCurrDigits",
+            "iCurrency",
+            "iNegCurr",
+            "iFirstDayOfWeek",
+            "iFirstWeekOfYear",
+            "sCurrency",
+            "iCalendarType",
+        ]
+    } else if key_lower.ends_with("\\control panel\\desktop\\muicached") {
+        alloc::vec!["MachinePreferredUILanguages"]
+    } else if key_lower
+        .ends_with("\\system\\currentcontrolset\\services\\winsock2\\parameters")
+    {
+        alloc::vec![
+            "AutoDialDLL",
+            "Namespace_Callout",
+            "Winsock_Registry_Version",
+            "Current_NameSpace_Catalog",
+            "Current_Protocol_Catalog",
+        ]
+    } else if key_lower
+        .ends_with("\\software\\microsoft\\cryptography\\defaults\\provider types\\type 001")
+    {
+        alloc::vec!["Name", "TypeName"]
+    } else if key_lower
+        .ends_with("\\software\\microsoft\\cryptography\\defaults\\provider types\\type 024")
+    {
+        alloc::vec!["Name", "TypeName"]
+    } else if key_lower.ends_with(
+        "\\software\\microsoft\\cryptography\\defaults\\provider\\microsoft strong cryptographic provider",
+    ) {
+        alloc::vec!["Image Path", "SigInFile", "Type"]
+    } else if key_lower.ends_with(
+        "\\software\\microsoft\\cryptography\\defaults\\provider\\microsoft enhanced rsa and aes cryptographic provider",
+    ) {
+        alloc::vec!["Image Path", "SigInFile", "Type"]
+    } else if key_lower.ends_with("\\system\\currentcontrolset\\control\\nls\\codepage")
+        || key_lower.ends_with("\\nls\\codepage")
+    {
+        alloc::vec!["ACP", "OEMCP", "MACCP"]
+    } else if key_lower.ends_with(
+        "\\system\\currentcontrolset\\services\\winsock2\\parameters\\namespace_catalog5",
+    ) {
+        alloc::vec![
+            "Num_Catalog_Entries",
+            "Num_Catalog_Entries64",
+            "Serial_Access_Num",
+        ]
+    } else if key_lower.ends_with(
+        "\\system\\currentcontrolset\\services\\winsock2\\parameters\\protocol_catalog9",
+    ) {
+        alloc::vec![
+            "Num_Catalog_Entries",
+            "Num_Catalog_Entries64",
+            "Next_Catalog_Entry_Id",
+            "Serial_Access_Num",
+        ]
+    } else {
+        alloc::vec![]
+    }
+}
+
+/// Look up a registry value, checking VFS-backed registry first, then
+/// falling back to the hardcoded table.
+fn lookup_registry_value(
+    shared: &NtSharedState,
+    key_path: &str,
+    value_name: &str,
+) -> Option<(u32, alloc::vec::Vec<u8>)> {
+    // Try VFS-backed registry first.
+    if let Some(vfs_path) = registry::registry_key_to_vfs_path(key_path) {
+        if let Some(fs) = shared.fs.get() {
+            if let Some(result) = registry::read_registry_value(fs.as_ref(), &vfs_path, value_name)
+            {
+                return Some(result);
+            }
+        }
+    }
+    // Fall back to hardcoded values.
+    lookup_registry_value_bytes(key_path, value_name)
+}
+
 /// Concrete layered filesystem type used by the NT shim.
 /// Same architecture as the Linux shim: in-memory (writable) on top of
 /// devices on top of tar read-only.
@@ -557,12 +932,756 @@ pub struct NlsData {
     pub version: u32,
     /// Individual NtGetNlsSectionPtr payloads captured from the host.
     pub sections: alloc::vec::Vec<NlsSectionData>,
+    /// Byte offset of the OEM code page table within the combined section.
+    /// On the host: PEB.OemCodePageData - NtInitializeNlsFiles base address.
+    pub oem_cp_offset: usize,
+    /// Byte offset of the Unicode case table within the combined section.
+    /// On the host: PEB.UnicodeCaseTableData - NtInitializeNlsFiles base address.
+    pub unicode_case_offset: usize,
 }
 
-#[derive(Clone, Copy)]
-struct TrackedAlloc {
-    size: usize,
-    allocation_protect: u32,
+/// Per-page NT-specific metadata, accessed under the PM's RwLock
+/// via [`NtProcessState::with_memory()`] / [`NtProcessState::with_memory_read()`].
+/// NOT separately locked — relies on PM lock for synchronization.
+pub struct NtMemoryState {
+    /// VA-only reservations (no PM backing). Key = base VA, Value = size.
+    pub reservations: alloc::collections::BTreeMap<usize, usize>,
+    /// Committed sub-ranges within VA reservations. Key = base, Value = (size, NT protect).
+    pub committed: alloc::collections::BTreeMap<usize, (usize, u32)>,
+    /// Decommitted sub-ranges within direct PM-backed private allocations.
+    /// Key = base VA, Value = size.
+    pub pm_decommitted: alloc::collections::BTreeMap<usize, usize>,
+    /// Guard pages. Key = page-aligned VA, Value = base NT protection.
+    pub guard_pages: alloc::collections::BTreeMap<usize, u32>,
+    /// Allocation tracking. Key = base, Value = (size, allocation_protect).
+    pub alloc_tracker: alloc::collections::BTreeMap<usize, (usize, u32)>,
+    /// Bump pointer for VA-only reservations. Grows downward.
+    pub va_reserve_bump: usize,
+    /// Floor for the bump allocator (guest VA start).
+    pub va_reserve_floor: usize,
+    /// Guest VA ceiling (set once).
+    pub va_reserve_ceiling: usize,
+}
+
+impl NtMemoryState {
+    /// Create a new, empty NT memory state with all maps empty and the bump
+    /// allocator uninitialized (caller must set `va_reserve_bump`,
+    /// `va_reserve_floor`, and `va_reserve_ceiling` before first use).
+    fn new() -> Self {
+        Self {
+            reservations: alloc::collections::BTreeMap::new(),
+            committed: alloc::collections::BTreeMap::new(),
+            pm_decommitted: alloc::collections::BTreeMap::new(),
+            guard_pages: alloc::collections::BTreeMap::new(),
+            alloc_tracker: alloc::collections::BTreeMap::new(),
+            va_reserve_bump: 0,
+            va_reserve_floor: 0,
+            va_reserve_ceiling: 0,
+        }
+    }
+
+    /// Mark every page in `[base, base+size)` as a guard page with the given
+    /// base protection (the NT protection minus the `PAGE_GUARD` flag).
+    pub fn set_guard_pages(&mut self, base: usize, size: usize, base_protect: u32) {
+        let mut addr = base & !(PAGE_SIZE - 1);
+        let end = (base + size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        while addr < end {
+            self.guard_pages.insert(addr, base_protect);
+            addr += PAGE_SIZE;
+        }
+    }
+
+    /// Remove the guard-page flag from the page containing `addr`.
+    /// Returns the base protection if the page was a guard page, `None` otherwise.
+    pub fn take_guard_page(&mut self, addr: usize) -> Option<u32> {
+        let page = addr & !(PAGE_SIZE - 1);
+        self.guard_pages.remove(&page)
+    }
+
+    /// Returns `true` if the page containing `addr` is marked as a guard page.
+    pub fn is_guard_page(&self, addr: usize) -> bool {
+        let page = addr & !(PAGE_SIZE - 1);
+        self.guard_pages.contains_key(&page)
+    }
+
+    /// Remove the guard-page flag from every page in `[base, base+size)`.
+    pub fn clear_guard_pages(&mut self, base: usize, size: usize) {
+        let start = base & !(PAGE_SIZE - 1);
+        let end = (base + size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let keys: alloc::vec::Vec<usize> = self
+            .guard_pages
+            .range(start..end)
+            .map(|(&k, _)| k)
+            .collect();
+        for k in keys {
+            self.guard_pages.remove(&k);
+        }
+    }
+
+    /// Record an allocation (base address → size in bytes).
+    pub fn track_alloc(&mut self, base: usize, size: usize, allocation_protect: u32) {
+        self.alloc_tracker.insert(base, (size, allocation_protect));
+        self.pm_recommit(base, size);
+    }
+
+    /// Returns the tracked allocation containing `addr`.
+    pub fn tracked_alloc_at(&self, addr: usize) -> Option<(usize, usize, u32)> {
+        let (&base, &(size, prot)) = self.alloc_tracker.range(..=addr).next_back()?;
+        if addr < base.saturating_add(size) {
+            Some((base, size, prot))
+        } else {
+            None
+        }
+    }
+
+    /// Updates tracked allocation boundaries after a successful partial or full
+    /// MEM_RELEASE of `[release_base, release_base + release_size)`.
+    pub fn release_tracked_alloc_range(
+        &mut self,
+        release_base: usize,
+        release_size: usize,
+    ) -> Option<(usize, usize, u32)> {
+        let release_end = release_base.checked_add(release_size)?;
+        let (&alloc_base, &(alloc_size, alloc_prot)) =
+            self.alloc_tracker.range(..=release_base).next_back()?;
+        let alloc_end = alloc_base.checked_add(alloc_size)?;
+        if release_base < alloc_base || release_end > alloc_end {
+            return None;
+        }
+
+        self.alloc_tracker.remove(&alloc_base);
+        if alloc_base < release_base {
+            self.alloc_tracker
+                .insert(alloc_base, (release_base - alloc_base, alloc_prot));
+        }
+        if release_end < alloc_end {
+            self.alloc_tracker
+                .insert(release_end, (alloc_end - release_end, alloc_prot));
+        }
+        self.pm_recommit(release_base, release_size);
+        Some((alloc_base, alloc_size, alloc_prot))
+    }
+
+    /// Mark a direct PM-backed range as decommitted.
+    pub fn pm_decommit(&mut self, base: usize, size: usize) {
+        let new_end = base.saturating_add(size);
+        let overlapping: alloc::vec::Vec<(usize, usize)> = self
+            .pm_decommitted
+            .range(..new_end)
+            .filter_map(|(&dbase, &dsize)| {
+                if dbase.saturating_add(dsize) > base {
+                    Some((dbase, dsize))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut merged_base = base;
+        let mut merged_end = new_end;
+        for (dbase, dsize) in overlapping {
+            self.pm_decommitted.remove(&dbase);
+            merged_base = merged_base.min(dbase);
+            merged_end = merged_end.max(dbase.saturating_add(dsize));
+        }
+        self.pm_decommitted
+            .insert(merged_base, merged_end.saturating_sub(merged_base));
+    }
+
+    /// Remove any direct PM-backed decommitted markers overlapping a range.
+    pub fn pm_recommit(&mut self, base: usize, size: usize) {
+        let recommit_end = base.saturating_add(size);
+        let overlapping: alloc::vec::Vec<(usize, usize)> = self
+            .pm_decommitted
+            .range(..recommit_end)
+            .filter_map(|(&dbase, &dsize)| {
+                if dbase.saturating_add(dsize) > base {
+                    Some((dbase, dsize))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for (dbase, dsize) in overlapping {
+            let dend = dbase.saturating_add(dsize);
+            self.pm_decommitted.remove(&dbase);
+            if dbase < base {
+                self.pm_decommitted.insert(dbase, base - dbase);
+            }
+            if dend > recommit_end {
+                self.pm_decommitted
+                    .insert(recommit_end, dend - recommit_end);
+            }
+        }
+    }
+
+    /// Returns `true` if the page containing `addr` is decommitted within a
+    /// direct PM-backed private allocation.
+    pub fn pm_is_decommitted(&self, addr: usize) -> bool {
+        if let Some((&base, &size)) = self.pm_decommitted.range(..=addr).next_back() {
+            return addr < base.saturating_add(size);
+        }
+        false
+    }
+
+    /// Returns `true` if any part of `[base, base + size)` is marked as
+    /// decommitted within a direct PM-backed private allocation.
+    pub fn pm_range_is_decommitted(&self, base: usize, size: usize) -> bool {
+        let end = match base.checked_add(size) {
+            Some(end) => end,
+            None => return true,
+        };
+        self.pm_decommitted.range(..end).any(|(&dbase, &dsize)| {
+            let dend = dbase.saturating_add(dsize);
+            dend > base
+        })
+    }
+
+    /// Reserve a VA range without allocating host memory.
+    /// If `requested_base` is 0, picks a free address via bump allocator.
+    /// `pm_mappings` is a snapshot of the current PM VMA ranges for overlap
+    /// checks. Returns the base address on success, or 0 on failure.
+    pub fn va_reserve(
+        &mut self,
+        pm_mappings: &[(core::ops::Range<usize>, litebox::mm::linux::VmFlags)],
+        requested_base: usize,
+        size: usize,
+        alignment: usize,
+    ) -> usize {
+        let granularity = alignment.max(0x10000);
+        let align_mask = granularity - 1;
+        let aligned_size = (size + align_mask) & !align_mask;
+
+        if requested_base != 0 {
+            let aligned_base = requested_base & !align_mask;
+            let new_end = match aligned_base.checked_add(aligned_size) {
+                Some(end) => end,
+                None => return 0,
+            };
+
+            if aligned_base < self.va_reserve_floor || new_end > self.va_reserve_ceiling {
+                return 0;
+            }
+
+            if let Some((&base, &sz)) = self.reservations.range(..new_end).next_back() {
+                if base.saturating_add(sz) > aligned_base {
+                    return 0;
+                }
+            }
+
+            for (range, _) in pm_mappings {
+                if range.start < new_end && aligned_base < range.end {
+                    return 0;
+                }
+            }
+
+            self.reservations.insert(aligned_base, aligned_size);
+            aligned_base
+        } else {
+            loop {
+                let current = self.va_reserve_bump;
+                if current < aligned_size {
+                    return 0;
+                }
+                let base = (current - aligned_size) & !align_mask;
+                if base < self.va_reserve_floor {
+                    return 0;
+                }
+
+                let new_end = base.saturating_add(aligned_size);
+                let pm_overlap = pm_mappings
+                    .iter()
+                    .any(|(range, _)| range.start < new_end && base < range.end);
+
+                let va_overlap = self
+                    .reservations
+                    .range(..new_end)
+                    .any(|entry| entry.0.saturating_add(*entry.1) > base);
+
+                if pm_overlap || va_overlap {
+                    let pm_lowest = pm_mappings
+                        .iter()
+                        .filter(|(range, _)| range.start < new_end && base < range.end)
+                        .map(|(range, _)| range.start)
+                        .min();
+                    let va_lowest = self
+                        .reservations
+                        .range(..new_end)
+                        .filter(|entry| entry.0.saturating_add(*entry.1) > base)
+                        .map(|entry| *entry.0)
+                        .min();
+                    let lowest_conflict =
+                        pm_lowest.into_iter().chain(va_lowest).min().unwrap_or(base);
+                    let next_bump = lowest_conflict & !align_mask;
+                    self.va_reserve_bump = next_bump;
+                    continue;
+                }
+
+                self.va_reserve_bump = base;
+                self.reservations.insert(base, aligned_size);
+                return base;
+            }
+        }
+    }
+
+    /// Reserve a VA range while honoring caller-provided starting/ending bounds.
+    /// If no bounds are provided, falls back to [`va_reserve`](Self::va_reserve).
+    pub fn va_reserve_with_bounds(
+        &mut self,
+        pm_mappings: &[(core::ops::Range<usize>, litebox::mm::linux::VmFlags)],
+        requested_base: usize,
+        size: usize,
+        alignment: usize,
+        lowest_address: usize,
+        highest_address: usize,
+    ) -> usize {
+        if lowest_address == 0 && highest_address == 0 {
+            return self.va_reserve(pm_mappings, requested_base, size, alignment);
+        }
+
+        let granularity = alignment.max(0x10000);
+        let align_mask = granularity - 1;
+        let aligned_size = (size + align_mask) & !align_mask;
+
+        let floor = if lowest_address != 0 {
+            let Some(aligned_floor) = lowest_address
+                .checked_add(align_mask)
+                .map(|value| value & !align_mask)
+            else {
+                return 0;
+            };
+            aligned_floor.max(self.va_reserve_floor)
+        } else {
+            self.va_reserve_floor
+        };
+        let ceiling = if highest_address != 0 {
+            highest_address
+                .saturating_add(1)
+                .min(self.va_reserve_ceiling)
+        } else {
+            self.va_reserve_ceiling
+        };
+
+        if floor >= ceiling || ceiling.saturating_sub(floor) < aligned_size {
+            return 0;
+        }
+
+        if requested_base != 0 {
+            let aligned_base = requested_base & !align_mask;
+            let Some(new_end) = aligned_base.checked_add(aligned_size) else {
+                return 0;
+            };
+            if aligned_base < floor || new_end > ceiling {
+                return 0;
+            }
+
+            if let Some((&base, &sz)) = self.reservations.range(..new_end).next_back()
+                && base.saturating_add(sz) > aligned_base
+            {
+                return 0;
+            }
+            for (range, _) in pm_mappings {
+                if range.start < new_end && aligned_base < range.end {
+                    return 0;
+                }
+            }
+
+            self.reservations.insert(aligned_base, aligned_size);
+            return aligned_base;
+        }
+
+        let mut occupied = alloc::vec::Vec::new();
+        for (&base, &sz) in &self.reservations {
+            let end = base.saturating_add(sz);
+            if base < ceiling && end > floor {
+                occupied.push((base, end));
+            }
+        }
+        for (range, _) in pm_mappings {
+            if range.start < ceiling && range.end > floor {
+                occupied.push((range.start, range.end));
+            }
+        }
+
+        let Some(base) =
+            highest_aligned_free_base(floor, ceiling, aligned_size, align_mask, &occupied)
+        else {
+            return 0;
+        };
+        self.reservations.insert(base, aligned_size);
+        base
+    }
+
+    /// Check if an address falls within a VA-only reservation.
+    /// Returns Some((base, size)) if found.
+    pub fn va_reservation_at(&self, addr: usize) -> Option<(usize, usize)> {
+        if let Some((&base, &size)) = self.reservations.range(..=addr).next_back() {
+            if addr < base.saturating_add(size) {
+                return Some((base, size));
+            }
+        }
+        None
+    }
+
+    /// Check if the *entire* range `[addr, addr+len)` falls within a single
+    /// VA-only reservation.  Returns `Some((base, size))` if so.
+    pub fn va_reservation_contains_range(&self, addr: usize, len: usize) -> Option<(usize, usize)> {
+        let end = addr.checked_add(len)?;
+        if let Some((&base, &size)) = self.reservations.range(..=addr).next_back() {
+            let res_end = base.checked_add(size)?;
+            if addr >= base && end <= res_end {
+                return Some((base, size));
+            }
+        }
+        None
+    }
+
+    /// Release a sub-range inside a VA-only reservation.
+    pub fn va_release_range(&mut self, base: usize, size: usize) -> Option<usize> {
+        if size == 0 {
+            return None;
+        }
+
+        let release_end = base.checked_add(size)?;
+        let (res_base, res_size) = {
+            let (&res_base, &res_size) = self.reservations.range(..=base).next_back()?;
+            if base >= res_base.saturating_add(res_size) {
+                return None;
+            }
+            (res_base, res_size)
+        };
+        let res_end = res_base.checked_add(res_size)?;
+        if release_end > res_end {
+            return None;
+        }
+
+        self.reservations.remove(&res_base)?;
+        if res_base < base {
+            self.reservations.insert(res_base, base - res_base);
+        }
+        if release_end < res_end {
+            self.reservations.insert(release_end, res_end - release_end);
+        }
+
+        let decommit_end = base.saturating_add(size);
+        let overlapping: alloc::vec::Vec<(usize, usize, u32)> = self
+            .committed
+            .range(..decommit_end)
+            .filter_map(|(&cbase, &(csize, prot))| {
+                if cbase.saturating_add(csize) > base {
+                    Some((cbase, csize, prot))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (cbase, csize, prot) in overlapping {
+            let cend = cbase.saturating_add(csize);
+            self.committed.remove(&cbase);
+            if cbase < base {
+                self.committed.insert(cbase, (base - cbase, prot));
+            }
+            if cend > decommit_end {
+                self.committed
+                    .insert(decommit_end, (cend - decommit_end, prot));
+            }
+        }
+
+        Some(size)
+    }
+
+    /// Remove a VA reservation. Returns the size if found.
+    /// Also removes all committed sub-ranges within the reservation.
+    pub fn va_unreserve(&mut self, base: usize) -> Option<usize> {
+        let size = self.reservations.remove(&base)?;
+        let range_end = base.saturating_add(size);
+        let keys_to_remove: alloc::vec::Vec<usize> = self
+            .committed
+            .range(base..range_end)
+            .map(|(&k, _)| k)
+            .collect();
+        for k in keys_to_remove {
+            self.committed.remove(&k);
+        }
+        Some(size)
+    }
+
+    /// Split a VA reservation (placeholder) at `base + size`.
+    pub fn va_split_placeholder(&mut self, base: usize, size: usize) -> bool {
+        let Some(split_end) = base.checked_add(size) else {
+            return false;
+        };
+        let (res_base, res_size) = {
+            let Some((&rb, &rs)) = self.reservations.range(..=base).next_back() else {
+                return false;
+            };
+            if base >= rb.saturating_add(rs) {
+                return false;
+            }
+            (rb, rs)
+        };
+        let Some(res_end) = res_base.checked_add(res_size) else {
+            return false;
+        };
+        if split_end > res_end {
+            return false;
+        }
+
+        self.reservations.remove(&res_base);
+        if res_base < base {
+            self.reservations.insert(res_base, base - res_base);
+        }
+        self.reservations.insert(base, size);
+        if split_end < res_end {
+            self.reservations.insert(split_end, res_end - split_end);
+        }
+        true
+    }
+
+    /// Coalesce adjacent VA reservations (placeholders) that cover
+    /// `[base, base+size)` into a single reservation.
+    pub fn va_coalesce_range(&mut self, base: usize, size: usize) -> bool {
+        let Some(coalesce_end) = base.checked_add(size) else {
+            return false;
+        };
+
+        let mut collected: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
+        for (&rb, &rs) in &self.reservations {
+            let re = rb.saturating_add(rs);
+            if rb < coalesce_end && re > base {
+                collected.push((rb, rs));
+            }
+        }
+
+        if collected.is_empty() {
+            return false;
+        }
+
+        collected.sort_unstable_by_key(|&(b, _)| b);
+
+        for i in 1..collected.len() {
+            let prev_end = collected[i - 1].0.saturating_add(collected[i - 1].1);
+            if collected[i].0 != prev_end {
+                return false;
+            }
+        }
+
+        let min_base = collected.first().unwrap().0;
+        let last = collected.last().unwrap();
+        let max_end = last.0.saturating_add(last.1);
+
+        for &(rb, _) in &collected {
+            self.reservations.remove(&rb);
+        }
+
+        self.reservations.insert(min_base, max_end - min_base);
+        true
+    }
+
+    /// Insert a new VA reservation entry without any overlap checks.
+    pub fn va_insert_reservation(&mut self, base: usize, size: usize) {
+        self.reservations.insert(base, size);
+    }
+
+    /// Remove a VA reservation sub-range for replacement with committed pages.
+    pub fn va_remove_placeholder(&mut self, base: usize, size: usize) -> bool {
+        let Some(remove_end) = base.checked_add(size) else {
+            return false;
+        };
+        let (res_base, res_size) = {
+            let Some((&rb, &rs)) = self.reservations.range(..=base).next_back() else {
+                return false;
+            };
+            if base >= rb.saturating_add(rs) {
+                return false;
+            }
+            (rb, rs)
+        };
+        let Some(res_end) = res_base.checked_add(res_size) else {
+            return false;
+        };
+        if remove_end > res_end {
+            return false;
+        }
+
+        self.reservations.remove(&res_base);
+        if res_base < base {
+            self.reservations.insert(res_base, base - res_base);
+        }
+        if remove_end < res_end {
+            self.reservations.insert(remove_end, res_end - remove_end);
+        }
+        true
+    }
+
+    /// Record a committed sub-range within a VA-only reservation.
+    pub fn va_commit(&mut self, base: usize, size: usize, protect: u32) {
+        let new_end = base.saturating_add(size);
+
+        let overlapping: alloc::vec::Vec<(usize, usize, u32)> = self
+            .committed
+            .range(..new_end)
+            .filter_map(|(&cbase, &(csize, prot))| {
+                if cbase.saturating_add(csize) > base {
+                    Some((cbase, csize, prot))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for (cbase, csize, cprot) in overlapping {
+            let cend = cbase.saturating_add(csize);
+            self.committed.remove(&cbase);
+
+            if cbase < base {
+                self.committed.insert(cbase, (base - cbase, cprot));
+            }
+            if cend > new_end {
+                self.committed.insert(new_end, (cend - new_end, cprot));
+            }
+        }
+
+        self.committed.insert(base, (size, protect));
+    }
+
+    /// Decommit a sub-range within a VA-only reservation.
+    pub fn va_decommit(&mut self, base: usize, size: usize) -> bool {
+        let decommit_end = base.saturating_add(size);
+        let mut modified = false;
+
+        let overlapping: alloc::vec::Vec<(usize, usize, u32)> = self
+            .committed
+            .range(..decommit_end)
+            .filter_map(|(&cbase, &(csize, prot))| {
+                if cbase.saturating_add(csize) > base {
+                    Some((cbase, csize, prot))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for (cbase, csize, prot) in overlapping {
+            let cend = cbase.saturating_add(csize);
+            self.committed.remove(&cbase);
+            modified = true;
+
+            if cbase < base {
+                self.committed.insert(cbase, (base - cbase, prot));
+            }
+            if cend > decommit_end {
+                self.committed
+                    .insert(decommit_end, (cend - decommit_end, prot));
+            }
+        }
+        modified
+    }
+
+    /// Check if an address was committed within a VA reservation.
+    pub fn va_committed_protect(&self, addr: usize) -> Option<u32> {
+        if let Some((&cbase, &(csize, prot))) = self.committed.range(..=addr).next_back() {
+            if addr < cbase.saturating_add(csize) {
+                return Some(prot);
+            }
+        }
+        None
+    }
+
+    /// Check if the entire range `[base, base+size)` is committed.
+    pub fn va_committed_fully(&self, base: usize, size: usize) -> bool {
+        let end = match base.checked_add(size) {
+            Some(e) => e,
+            None => return false,
+        };
+        let mut cursor = base;
+
+        while cursor < end {
+            if let Some((&cbase, &(csize, _))) = self.committed.range(..=cursor).next_back() {
+                let cend = cbase.saturating_add(csize);
+                if cursor >= cbase && cursor < cend {
+                    cursor = cend;
+                    continue;
+                }
+            }
+            return false;
+        }
+        true
+    }
+
+    /// Compute the region size (contiguous run of same state) starting at
+    /// `addr` within a VA reservation of `[res_base, res_base+res_size)`.
+    pub fn va_region_size_at(&self, addr: usize, res_base: usize, res_size: usize) -> usize {
+        let res_end = res_base.saturating_add(res_size);
+
+        if let Some((&cbase, &(csize, prot))) = self.committed.range(..=addr).next_back() {
+            let cend = cbase.saturating_add(csize);
+            if addr >= cbase && addr < cend {
+                let mut end = cend;
+                for (&next_base, &(next_size, next_prot)) in self.committed.range(cend..) {
+                    if next_base == end && next_prot == prot && end < res_end {
+                        end = next_base.saturating_add(next_size);
+                    } else {
+                        break;
+                    }
+                }
+                return end.min(res_end) - addr;
+            }
+        }
+
+        if let Some((&next_base, _)) = self.committed.range(addr + 1..).next() {
+            if next_base < res_end {
+                return next_base - addr;
+            }
+        }
+        res_end - addr
+    }
+}
+
+/// Offset for the real-DLL region (ntdll) relative to partition start.
+/// Must match the runner's `REAL_DLL_OFFSET`.
+pub(crate) const REAL_DLL_OFFSET: usize = 0x7F_0000_0000;
+
+/// Offset for the ntdll syscall trampoline relative to partition start.
+/// Must match the runner's `TRAMPOLINE_OFFSET`.
+pub(crate) const TRAMPOLINE_OFFSET: usize = REAL_DLL_OFFSET - 0x1_0000;
+
+/// Cached, partition-independent ntdll data for spawning child processes.
+///
+/// The rewritten ntdll image and trampoline use relative addressing
+/// (`JMP rel32` from syscall stubs to trampoline, `lea rip+disp32` in
+/// trampoline), so the same bytes work at any partition's fixed offsets:
+///   ntdll  → partition_start + `REAL_DLL_OFFSET`  (0x7F_0000_0000)
+///   tramp  → partition_start + `TRAMPOLINE_OFFSET` (0x7E_FFFF_0000)
+///
+/// Populated lazily from the runner's initial ntdll load result via
+/// `NtShimEntrypoints::set_ntdll_boot_data()`.
+pub struct NtdllBootData {
+    /// Rewritten ntdll PE image (syscall stubs patched with JMP rel32).
+    pub image: alloc::vec::Vec<u8>,
+    /// Trampoline page bytes (code at +8, entry ptr slot at +0).
+    /// Already has the shim entry pointer written at `entry_ptr_offset`.
+    pub trampoline: alloc::vec::Vec<u8>,
+    /// Host VA of the syscall callback (same for all partitions).
+    pub syscall_entry: u64,
+    /// Mapping from real Windows syscall numbers → `NtSyscallId`.
+    pub syscall_map: NtSyscallMap,
+    /// Syscall number → export name for unhandled stubs (debug logging).
+    pub unhandled_stubs: alloc::vec::Vec<(u32, alloc::string::String)>,
+    /// Key export RVAs (relative to ntdll load VA, i.e. partition_start + REAL_DLL_OFFSET).
+    pub ldr_init_thunk_rva: usize,
+    pub rtl_user_thread_start_rva: usize,
+    pub ki_user_exception_dispatcher_rva: Option<usize>,
+    pub rtl_dispatch_exception_rva: usize,
+    pub rtl_restore_context_rva: usize,
+    pub zw_raise_exception_rva: usize,
+    pub rtl_raise_status_rva: usize,
+    pub inverted_function_table_rva: usize,
+    /// RVA of `LdrpHashTable` (found via pattern search in ntdll .text).
+    pub ldrp_hash_table_rva: usize,
+    /// RVA of `PebLdr` (found via pattern search in ntdll .text).
+    pub pebldr_rva: usize,
 }
 
 /// Per-process state shared across all threads in an NT guest process.
@@ -573,137 +1692,88 @@ struct TrackedAlloc {
 pub struct NtProcessState {
     /// Page manager for the guest address space.
     pub pm: PageManager<Platform, PAGE_SIZE>,
-    /// Tracks private allocation base → metadata for MEM_RELEASE and
-    /// NtQueryVirtualMemory. Windows preserves allocation boundaries even
-    /// when adjacent reservations have identical protections.
-    alloc_tracker: Mutex<alloc::collections::BTreeMap<usize, TrackedAlloc>>,
+    /// NT-specific memory metadata. Accessed ONLY under `pm.with_write_lock()`
+    /// or `pm.with_read_lock()`. No separate lock.
+    nt_mem: core::cell::UnsafeCell<NtMemoryState>,
     /// Tracks SEC_IMAGE mappings (base → size) for NtQueryVirtualMemory.
-    /// Pages within these ranges should report `MEM_IMAGE` type instead of
-    /// `MEM_PRIVATE`, matching real NT kernel behavior.
     image_mappings: Mutex<alloc::collections::BTreeMap<usize, usize>>,
-    /// Tracks non-image section views (base → size) so NtUnmapViewOfSection
-    /// can actually release their address ranges instead of returning
-    /// success-shaped no-ops.
+    /// Tracks loaded module metadata by image base.
+    loaded_modules: Mutex<alloc::collections::BTreeMap<usize, ModuleBase>>,
+    /// Tracks non-image section views (base → size).
     section_views: Mutex<alloc::collections::BTreeMap<usize, usize>>,
-    /// Tracks MEM_RESERVE-only VA ranges (no committed pages, no host alloc).
-    /// Key = base VA, Value = reserved size. Pure bookkeeping.
-    va_reservations: Mutex<alloc::collections::BTreeMap<usize, usize>>,
-    /// Tracks committed sub-ranges within VA-only reservations.
-    /// Key = page-aligned base VA, Value = (size, NT protection constant).
-    /// Only populated for pages inside `va_reservations`; small PM-backed
-    /// allocations go directly through the page manager.
-    va_committed: Mutex<alloc::collections::BTreeMap<usize, (usize, u32)>>,
-    /// Bump pointer for finding free VA for MEM_RESERVE-only allocations.
-    /// Grows downward from just below the guest VA end.
-    va_reserve_bump: core::sync::atomic::AtomicUsize,
-    /// Floor for the bump allocator (guest VA start). Bump must not go below.
-    va_reserve_floor: core::sync::atomic::AtomicUsize,
-    /// Immutable guest VA ceiling (set once). Fixed-base reservations are
-    /// validated against this, not the moving bump pointer.
-    va_reserve_ceiling: core::sync::atomic::AtomicUsize,
-    /// Guest VA of the trampoline code entry point.  Set by the runner
-    /// after the trampoline page is mapped.  Win32k stub patching reads
-    /// this to emit `JMP [rip+0]` sequences that reach the trampoline.
+    /// Guest VA of the trampoline code entry point.
     trampoline_code_va: core::sync::atomic::AtomicUsize,
-    /// Guest VA of `ntdll!KiUserInvertedFunctionTable`.  Set by the runner.
-    /// The shim writes new entries here when mapping SEC_IMAGE sections so
-    /// that SEH unwinding can find .pdata for every loaded DLL.
+    /// Guest VA of `ntdll!KiUserInvertedFunctionTable`.
     inverted_function_table_va: core::sync::atomic::AtomicUsize,
+    /// Guest VA of `ntdll!RtlDispatchException`.
+    rtl_dispatch_exception_va: core::sync::atomic::AtomicUsize,
+    /// Guest VA of `ntdll!RtlRestoreContext`.
+    rtl_restore_context_va: core::sync::atomic::AtomicUsize,
+    /// Guest VA of `ntdll!ZwRaiseException`.
+    zw_raise_exception_va: core::sync::atomic::AtomicUsize,
+    /// Guest VA of `ntdll!RtlRaiseStatus`.
+    rtl_raise_status_va: core::sync::atomic::AtomicUsize,
+    /// Guest VA of the KERNELBASE-local exception dispatch stub.
+    rtl_raise_exception_dispatch_stub_va: core::sync::atomic::AtomicUsize,
 }
+
+// Safety: NtMemoryState in the UnsafeCell is only ever accessed through
+// with_memory() (PM write lock) and with_memory_read() (PM read lock),
+// which provide exclusive-write / shared-read synchronization.
+// All other fields are inherently Sync (Mutex, AtomicUsize, PageManager).
+unsafe impl Sync for NtProcessState {}
 
 impl NtProcessState {
     /// Create a new process state with the given page manager.
     pub fn new(pm: PageManager<Platform, PAGE_SIZE>) -> Self {
         Self {
             pm,
-            alloc_tracker: Mutex::new(alloc::collections::BTreeMap::new()),
+            nt_mem: core::cell::UnsafeCell::new(NtMemoryState::new()),
             image_mappings: Mutex::new(alloc::collections::BTreeMap::new()),
+            loaded_modules: Mutex::new(alloc::collections::BTreeMap::new()),
             section_views: Mutex::new(alloc::collections::BTreeMap::new()),
-            va_reservations: Mutex::new(alloc::collections::BTreeMap::new()),
-            va_committed: Mutex::new(alloc::collections::BTreeMap::new()),
-            va_reserve_bump: core::sync::atomic::AtomicUsize::new(0),
-            va_reserve_floor: core::sync::atomic::AtomicUsize::new(0),
-            va_reserve_ceiling: core::sync::atomic::AtomicUsize::new(0),
             trampoline_code_va: core::sync::atomic::AtomicUsize::new(0),
             inverted_function_table_va: core::sync::atomic::AtomicUsize::new(0),
+            rtl_dispatch_exception_va: core::sync::atomic::AtomicUsize::new(0),
+            rtl_restore_context_va: core::sync::atomic::AtomicUsize::new(0),
+            zw_raise_exception_va: core::sync::atomic::AtomicUsize::new(0),
+            rtl_raise_status_va: core::sync::atomic::AtomicUsize::new(0),
+            rtl_raise_exception_dispatch_stub_va: core::sync::atomic::AtomicUsize::new(0),
         }
     }
 
-    /// Record an allocation (base address ΓåÆ size in bytes).
-    pub fn track_alloc(&self, base: usize, size: usize, allocation_protect: u32) {
-        self.alloc_tracker.lock().insert(
-            base,
-            TrackedAlloc {
-                size,
-                allocation_protect,
-            },
-        );
-    }
-
-    /// Look up and remove the tracked allocation size for `base`.
-    /// Returns `None` if the base was never tracked.
-    pub fn untrack_alloc(&self, base: usize) -> Option<usize> {
-        self.alloc_tracker
-            .lock()
-            .remove(&base)
-            .map(|alloc| alloc.size)
-    }
-
-    /// Returns the tracked allocation containing `addr`.
-    pub fn tracked_alloc_at(&self, addr: usize) -> Option<(usize, usize, u32)> {
-        let tracker = self.alloc_tracker.lock();
-        let (&base, alloc) = tracker.range(..=addr).next_back()?;
-        if addr < base.saturating_add(alloc.size) {
-            Some((base, alloc.size, alloc.allocation_protect))
-        } else {
-            None
-        }
-    }
-
-    /// Updates tracked allocation boundaries after a successful partial or full
-    /// MEM_RELEASE of `[release_base, release_base + release_size)`.
+    /// Access NT memory state under PM write lock.
     ///
-    /// Windows splits a reservation into distinct allocation bases when a
-    /// middle sub-range is released; preserving that boundary is important for
-    /// later NtQueryVirtualMemory results.
-    pub fn release_tracked_alloc_range(
+    /// The callback receives mutable access to both the [`Vmem`] and
+    /// [`NtMemoryState`] for atomic multi-step operations.
+    ///
+    /// **WARNING:** Do **not** call [`PageManager`] methods inside the
+    /// callback — they re-acquire the lock and will deadlock. Use the
+    /// provided [`Vmem`] reference directly.
+    pub fn with_memory<R>(
         &self,
-        release_base: usize,
-        release_size: usize,
-    ) -> Option<(usize, usize, u32)> {
-        let release_end = release_base.checked_add(release_size)?;
-        let mut tracker = self.alloc_tracker.lock();
-        let (&alloc_base, &alloc) = tracker.range(..=release_base).next_back()?;
-        let alloc_end = alloc_base.checked_add(alloc.size)?;
-        if release_base < alloc_base || release_end > alloc_end {
-            return None;
-        }
-
-        tracker.remove(&alloc_base);
-        if alloc_base < release_base {
-            tracker.insert(
-                alloc_base,
-                TrackedAlloc {
-                    size: release_base - alloc_base,
-                    allocation_protect: alloc.allocation_protect,
-                },
-            );
-        }
-        if release_end < alloc_end {
-            tracker.insert(
-                release_end,
-                TrackedAlloc {
-                    size: alloc_end - release_end,
-                    allocation_protect: alloc.allocation_protect,
-                },
-            );
-        }
-        Some((alloc_base, alloc.size, alloc.allocation_protect))
+        f: impl FnOnce(&mut litebox::mm::linux::Vmem<Platform, PAGE_SIZE>, &mut NtMemoryState) -> R,
+    ) -> R {
+        self.pm.with_write_lock(|vmem| {
+            // Safety: The PM write lock guarantees exclusive access.
+            let mem = unsafe { &mut *self.nt_mem.get() };
+            f(vmem, mem)
+        })
     }
 
-    /// Returns `true` if `addr` falls within any tracked allocation range.
-    pub fn is_tracked_alloc(&self, addr: usize) -> bool {
-        self.tracked_alloc_at(addr).is_some()
+    /// Read NT memory state under PM read lock.
+    ///
+    /// The callback receives shared access to both the [`Vmem`] and
+    /// [`NtMemoryState`] for consistent multi-field queries.
+    pub fn with_memory_read<R>(
+        &self,
+        f: impl FnOnce(&litebox::mm::linux::Vmem<Platform, PAGE_SIZE>, &NtMemoryState) -> R,
+    ) -> R {
+        self.pm.with_read_lock(|vmem| {
+            // Safety: The PM read lock guarantees no concurrent writers.
+            let mem = unsafe { &*self.nt_mem.get() };
+            f(vmem, mem)
+        })
     }
 
     /// Allocate a small RW region in guest VA. Returns the guest VA of the
@@ -722,7 +1792,11 @@ impl NtProcessState {
                 .create_writable_pages(None, nz_size, CreatePagesFlags::empty(), |_| Ok(0))
         };
         match result {
-            Ok(ptr) => ptr.as_usize(),
+            Ok(ptr) => {
+                let base = ptr.as_usize();
+                self.track_section_view(base, aligned);
+                base
+            }
             Err(_) => 0,
         }
     }
@@ -739,6 +1813,7 @@ impl NtProcessState {
         let (&base, &size) = mappings.range(..=addr).next_back()?;
         if addr < base.saturating_add(size) {
             mappings.remove(&base);
+            self.loaded_modules.lock().remove(&base);
             Some((base, size))
         } else {
             None
@@ -747,12 +1822,19 @@ impl NtProcessState {
 
     /// Returns `true` if `addr` falls within a SEC_IMAGE mapping.
     pub fn is_image_mapping(&self, addr: usize) -> bool {
+        self.image_mapping_at(addr).is_some()
+    }
+
+    /// Returns `(base, size)` of the SEC_IMAGE mapping containing `addr`,
+    /// or `None` if `addr` is not inside any image mapping.
+    pub fn image_mapping_at(&self, addr: usize) -> Option<(usize, usize)> {
         let mappings = self.image_mappings.lock();
         if let Some((&base, &size)) = mappings.range(..=addr).next_back() {
-            addr < base + size
-        } else {
-            false
+            if addr < base + size {
+                return Some((base, size));
+            }
         }
+        None
     }
 
     /// Snapshot the current SEC_IMAGE mappings.
@@ -764,43 +1846,69 @@ impl NtProcessState {
             .collect()
     }
 
+    /// Record or replace a loaded module by image base.
+    pub fn register_module(&self, module: ModuleBase) {
+        self.loaded_modules
+            .lock()
+            .insert(module.base_address, module);
+    }
+
+    /// Snapshot the current loaded-module registry.
+    pub fn module_bases_snapshot(&self) -> alloc::vec::Vec<ModuleBase> {
+        self.loaded_modules.lock().values().cloned().collect()
+    }
+
     /// Record a non-image section view.
     pub fn track_section_view(&self, base: usize, size: usize) {
         self.section_views.lock().insert(base, size);
+    }
+
+    /// Return the tracked non-image section view containing `addr`.
+    /// If bookkeeping ever contains split or shadowing entries, scan
+    /// backwards until we find a range that actually covers the address.
+    pub fn section_view_at(&self, addr: usize) -> Option<(usize, usize)> {
+        let views = self.section_views.lock();
+        find_section_view(&views, addr)
+    }
+
+    /// Return the nearest tracked non-image section view whose base is
+    /// less than or equal to `addr`, even if it does not cover `addr`.
+    pub fn nearest_section_view_before(&self, addr: usize) -> Option<(usize, usize)> {
+        let views = self.section_views.lock();
+        views
+            .range(..=addr)
+            .next_back()
+            .map(|(&base, &size)| (base, size))
     }
 
     /// Remove the non-image section view containing `addr`.
     /// Returns `(base, size)` if found.
     pub fn untrack_section_view(&self, addr: usize) -> Option<(usize, usize)> {
         let mut views = self.section_views.lock();
-        let (&base, &size) = views.range(..=addr).next_back()?;
-        if addr < base.saturating_add(size) {
-            views.remove(&base);
-            Some((base, size))
-        } else {
-            None
-        }
+        let (base, size) = find_section_view(&views, addr)?;
+        views.remove(&base);
+        Some((base, size))
     }
 
-    /// Initialize the VA reserve bump pointer and floor. Called once from the
+    /// Initialize the VA reserve bump pointer and ceiling. Called once from the
     /// runner after guest_va_start/end are known.
     pub fn set_va_reserve_ceiling(&self, ceiling: usize) {
-        // Align down to 64K boundary (Windows allocation granularity).
         let aligned = ceiling & !0xFFFF;
-        self.va_reserve_bump
-            .store(aligned, core::sync::atomic::Ordering::Release);
-        self.va_reserve_ceiling
-            .store(aligned, core::sync::atomic::Ordering::Release);
+        self.with_memory(|_vmem, mem| {
+            mem.va_reserve_bump = aligned;
+            mem.va_reserve_ceiling = aligned;
+        });
     }
 
     /// Set the minimum VA the bump allocator may reach.
     pub fn set_va_reserve_floor(&self, floor: usize) {
-        let aligned = (floor + 0xFFFF) & !0xFFFF; // align up
-        self.va_reserve_floor
-            .store(aligned, core::sync::atomic::Ordering::Release);
+        let aligned = (floor + 0xFFFF) & !0xFFFF;
+        self.with_memory(|_vmem, mem| {
+            mem.va_reserve_floor = aligned;
+        });
     }
 
-    /// Store the trampoline code VA so win32k stub patching can use it.
+    /// Store the trampoline code VA used by rewritten real ntdll syscall stubs.
     pub fn set_trampoline_code_va(&self, va: usize) {
         self.trampoline_code_va
             .store(va, core::sync::atomic::Ordering::Release);
@@ -824,360 +1932,69 @@ impl NtProcessState {
             .load(core::sync::atomic::Ordering::Acquire)
     }
 
-    /// Reserve a VA range without allocating host memory.
-    /// If `requested_base` is 0, picks a free address via bump allocator.
-    /// Returns the base address on success, or 0 on failure.
-    pub fn va_reserve(&self, requested_base: usize, size: usize) -> usize {
-        // Align size up to 64K (Windows allocation granularity).
-        let aligned_size = (size + 0xFFFF) & !0xFFFF;
-        let mut reservations = self.va_reservations.lock();
-
-        if requested_base != 0 {
-            // Fixed address: check for overlaps with existing reservations.
-            let aligned_base = requested_base & !0xFFFF;
-            let new_end = match aligned_base.checked_add(aligned_size) {
-                Some(end) => end,
-                None => return 0, // Overflow — reject.
-            };
-
-            // Validate against guest VA bounds (immutable ceiling, not
-            // the moving bump pointer).
-            let floor = self
-                .va_reserve_floor
-                .load(core::sync::atomic::Ordering::Acquire);
-            let ceiling = self
-                .va_reserve_ceiling
-                .load(core::sync::atomic::Ordering::Acquire);
-            if aligned_base < floor || new_end > ceiling {
-                return 0; // Outside guest VA bounds.
-            }
-
-            // Check reservation that starts at or before our end.
-            if let Some((&base, &sz)) = reservations.range(..new_end).next_back() {
-                if base.saturating_add(sz) > aligned_base {
-                    return 0; // Overlaps an existing reservation.
-                }
-            }
-
-            // Reject if the range overlaps any existing PM mapping (EXE, DLLs,
-            // stacks, heap pages, etc.).  This prevents a later demand-fault
-            // from silently replacing live pages with FIXED_ADDR.
-            for (range, _) in self.pm.mappings() {
-                if range.start < new_end && aligned_base < range.end {
-                    return 0; // Overlaps an existing PM mapping.
-                }
-            }
-
-            reservations.insert(aligned_base, aligned_size);
-            aligned_base
-        } else {
-            // Bump-allocate downward.  Use a CAS loop so concurrent callers
-            // cannot both claim the same VA range.
-            //
-            // NOTE: the PM overlap check below is not atomic with the CAS
-            // insertion.  A concurrent PM allocation could race with us.
-            // In practice this is safe because large VA reservations only
-            // happen during single-threaded ntdll init (LdrpInitializeProcess),
-            // and the bump region is at the top of the 128 TB VA space, far
-            // from where PM allocations land.
-            let floor = self
-                .va_reserve_floor
-                .load(core::sync::atomic::Ordering::Acquire);
-
-            // Cache PM mappings once for the overlap check (same approach as
-            // the fixed-base path).
-            let all_mappings = self.pm.mappings();
-
-            loop {
-                let current = self
-                    .va_reserve_bump
-                    .load(core::sync::atomic::Ordering::Acquire);
-                if current < aligned_size {
-                    return 0; // No space
-                }
-                let base = (current - aligned_size) & !0xFFFF;
-                if base < floor {
-                    return 0; // Would go below the guest VA floor.
-                }
-
-                // Reject if the candidate range overlaps any PM mapping.
-                let new_end = base.saturating_add(aligned_size);
-                let pm_overlap = all_mappings
-                    .iter()
-                    .any(|(range, _)| range.start < new_end && base < range.end);
-
-                // Also check existing VA-only reservations (lock already held).
-                let va_overlap = reservations
-                    .range(..new_end)
-                    .any(|entry| entry.0.saturating_add(*entry.1) > base);
-
-                if pm_overlap || va_overlap {
-                    // Skip past the conflicting region by trying a lower base.
-                    let pm_lowest = all_mappings
-                        .iter()
-                        .filter(|(range, _)| range.start < new_end && base < range.end)
-                        .map(|(range, _)| range.start)
-                        .min();
-                    let va_lowest = reservations
-                        .range(..new_end)
-                        .filter(|entry| entry.0.saturating_add(*entry.1) > base)
-                        .map(|entry| *entry.0)
-                        .min();
-                    let lowest_conflict =
-                        pm_lowest.into_iter().chain(va_lowest).min().unwrap_or(base);
-                    let next_bump = lowest_conflict & !0xFFFF;
-                    // Try to move the bump pointer below the conflict.
-                    let _ = self.va_reserve_bump.compare_exchange_weak(
-                        current,
-                        next_bump,
-                        core::sync::atomic::Ordering::AcqRel,
-                        core::sync::atomic::Ordering::Acquire,
-                    );
-                    continue; // Retry with updated bump.
-                }
-
-                if self
-                    .va_reserve_bump
-                    .compare_exchange_weak(
-                        current,
-                        base,
-                        core::sync::atomic::Ordering::AcqRel,
-                        core::sync::atomic::Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    reservations.insert(base, aligned_size);
-                    return base;
-                }
-                // Another thread won the race — retry with the updated value.
-            }
-        }
+    pub fn set_rtl_dispatch_exception_va(&self, va: usize) {
+        self.rtl_dispatch_exception_va
+            .store(va, core::sync::atomic::Ordering::Release);
     }
 
-    /// Check if an address falls within a VA-only reservation.
-    /// Returns Some((base, size)) if found.
-    pub fn va_reservation_at(&self, addr: usize) -> Option<(usize, usize)> {
-        let reservations = self.va_reservations.lock();
-        if let Some((&base, &size)) = reservations.range(..=addr).next_back() {
-            if addr < base.saturating_add(size) {
-                return Some((base, size));
-            }
-        }
-        None
+    pub fn rtl_dispatch_exception_va(&self) -> usize {
+        self.rtl_dispatch_exception_va
+            .load(core::sync::atomic::Ordering::Acquire)
     }
 
-    /// Check if the *entire* range `[addr, addr+len)` falls within a single
-    /// VA-only reservation.  Returns `Some((base, size))` if so.
-    pub fn va_reservation_contains_range(&self, addr: usize, len: usize) -> Option<(usize, usize)> {
-        let end = addr.checked_add(len)?;
-        let reservations = self.va_reservations.lock();
-        if let Some((&base, &size)) = reservations.range(..=addr).next_back() {
-            let res_end = base.checked_add(size)?;
-            if addr >= base && end <= res_end {
-                return Some((base, size));
-            }
-        }
-        None
+    pub fn set_rtl_restore_context_va(&self, va: usize) {
+        self.rtl_restore_context_va
+            .store(va, core::sync::atomic::Ordering::Release);
     }
 
-    /// Release a sub-range inside a VA-only reservation.
-    ///
-    /// The caller must pass a non-zero range that is already aligned to the
-    /// desired release granularity and lies fully within a single reservation.
-    /// Returns the released size on success.
-    pub fn va_release_range(&self, base: usize, size: usize) -> Option<usize> {
-        if size == 0 {
-            return None;
-        }
-
-        let release_end = base.checked_add(size)?;
-        let mut reservations = self.va_reservations.lock();
-        let (res_base, res_size) = {
-            let (&res_base, &res_size) = reservations.range(..=base).next_back()?;
-            if base >= res_base.saturating_add(res_size) {
-                return None;
-            }
-            (res_base, res_size)
-        };
-        let res_end = res_base.checked_add(res_size)?;
-        if release_end > res_end {
-            return None;
-        }
-
-        reservations.remove(&res_base)?;
-        if res_base < base {
-            reservations.insert(res_base, base - res_base);
-        }
-        if release_end < res_end {
-            reservations.insert(release_end, res_end - release_end);
-        }
-        drop(reservations);
-
-        let _ = self.va_decommit(base, size);
-        Some(size)
+    pub fn rtl_restore_context_va(&self) -> usize {
+        self.rtl_restore_context_va
+            .load(core::sync::atomic::Ordering::Acquire)
     }
 
-    /// Remove a VA reservation. Returns the size if found.
-    /// Also removes all committed sub-ranges within the reservation.
-    pub fn va_unreserve(&self, base: usize) -> Option<usize> {
-        let size = self.va_reservations.lock().remove(&base)?;
-        // Remove committed sub-ranges that fall within [base, base+size).
-        let mut committed = self.va_committed.lock();
-        let range_end = base.saturating_add(size);
-        let keys_to_remove: alloc::vec::Vec<usize> =
-            committed.range(base..range_end).map(|(&k, _)| k).collect();
-        for k in keys_to_remove {
-            committed.remove(&k);
-        }
-        Some(size)
+    pub fn set_zw_raise_exception_va(&self, va: usize) {
+        self.zw_raise_exception_va
+            .store(va, core::sync::atomic::Ordering::Release);
     }
 
-    /// Record a committed sub-range within a VA-only reservation.
-    /// `protect` is the raw NT protection constant (e.g. `PAGE_READWRITE`).
-    /// Handles overlapping/nested commits by splitting and merging existing
-    /// entries so that `va_committed_protect()` always returns the correct
-    /// protection for every address.
-    pub fn va_commit(&self, base: usize, size: usize, protect: u32) {
-        let mut committed = self.va_committed.lock();
-        let new_end = base.saturating_add(size);
-
-        // Collect all existing entries that overlap [base, new_end).
-        let overlapping: alloc::vec::Vec<(usize, usize, u32)> = committed
-            .range(..new_end)
-            .filter_map(|(&cbase, &(csize, prot))| {
-                if cbase.saturating_add(csize) > base {
-                    Some((cbase, csize, prot))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Remove overlapping entries and re-insert non-overlapping tails/heads.
-        for (cbase, csize, cprot) in overlapping {
-            let cend = cbase.saturating_add(csize);
-            committed.remove(&cbase);
-
-            // Preserve the portion before our new range.
-            if cbase < base {
-                committed.insert(cbase, (base - cbase, cprot));
-            }
-            // Preserve the portion after our new range.
-            if cend > new_end {
-                committed.insert(new_end, (cend - new_end, cprot));
-            }
-        }
-
-        // Insert the new committed range.
-        committed.insert(base, (size, protect));
+    pub fn zw_raise_exception_va(&self) -> usize {
+        self.zw_raise_exception_va
+            .load(core::sync::atomic::Ordering::Acquire)
     }
 
-    /// Decommit a sub-range within a VA-only reservation.
-    /// Removes committed tracking for pages in `[base, base+size)`.
-    /// Returns `true` if any committed ranges were removed/split.
-    pub fn va_decommit(&self, base: usize, size: usize) -> bool {
-        let mut committed = self.va_committed.lock();
-        let decommit_end = base.saturating_add(size);
-        let mut modified = false;
-
-        // Collect entries that overlap with [base, decommit_end).
-        // An entry at `cbase` with length `csize` overlaps if
-        // cbase < decommit_end && cbase+csize > base.
-        let overlapping: alloc::vec::Vec<(usize, usize, u32)> = committed
-            .range(..decommit_end)
-            .filter_map(|(&cbase, &(csize, prot))| {
-                if cbase.saturating_add(csize) > base {
-                    Some((cbase, csize, prot))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        for (cbase, csize, prot) in overlapping {
-            let cend = cbase.saturating_add(csize);
-            committed.remove(&cbase);
-            modified = true;
-
-            // Re-insert the portion before the decommit region.
-            if cbase < base {
-                committed.insert(cbase, (base - cbase, prot));
-            }
-            // Re-insert the portion after the decommit region.
-            if cend > decommit_end {
-                committed.insert(decommit_end, (cend - decommit_end, prot));
-            }
-        }
-        modified
+    pub fn set_rtl_raise_status_va(&self, va: usize) {
+        self.rtl_raise_status_va
+            .store(va, core::sync::atomic::Ordering::Release);
     }
 
-    /// Check if an address was committed within a VA reservation.
-    /// Returns `Some(nt_protect)` if the page at `addr` is committed.
-    pub fn va_committed_protect(&self, addr: usize) -> Option<u32> {
-        let committed = self.va_committed.lock();
-        if let Some((&cbase, &(csize, prot))) = committed.range(..=addr).next_back() {
-            if addr < cbase.saturating_add(csize) {
-                return Some(prot);
-            }
-        }
-        None
+    pub fn rtl_raise_status_va(&self) -> usize {
+        self.rtl_raise_status_va
+            .load(core::sync::atomic::Ordering::Acquire)
     }
 
-    /// Check if the entire range `[base, base+size)` is committed.
-    /// Returns `true` only if every page in the range is covered by
-    /// committed entries (there may be multiple adjacent entries with
-    /// different protections).
-    pub fn va_committed_fully(&self, base: usize, size: usize) -> bool {
-        let committed = self.va_committed.lock();
-        let end = match base.checked_add(size) {
-            Some(e) => e,
-            None => return false,
-        };
-        let mut cursor = base;
-
-        while cursor < end {
-            if let Some((&cbase, &(csize, _))) = committed.range(..=cursor).next_back() {
-                let cend = cbase.saturating_add(csize);
-                if cursor >= cbase && cursor < cend {
-                    cursor = cend; // advance past this committed range
-                    continue;
-                }
-            }
-            return false; // gap found
-        }
-        true
+    pub fn set_rtl_raise_exception_dispatch_stub_va(&self, va: usize) {
+        self.rtl_raise_exception_dispatch_stub_va
+            .store(va, core::sync::atomic::Ordering::Release);
     }
 
-    /// Compute the region size (contiguous run of same state) starting at
-    /// `addr` within a VA reservation of `[res_base, res_base+res_size)`.
-    /// Returns the distance to the next state/protection boundary.
-    pub fn va_region_size_at(&self, addr: usize, res_base: usize, res_size: usize) -> usize {
-        let committed = self.va_committed.lock();
-        let res_end = res_base.saturating_add(res_size);
-
-        // Check if addr is inside a committed range.
-        if let Some((&cbase, &(csize, _prot))) = committed.range(..=addr).next_back() {
-            let cend = cbase.saturating_add(csize);
-            if addr >= cbase && addr < cend {
-                // Inside a committed range — region extends to end of this
-                // committed entry (capped by reservation end).
-                return cend.min(res_end) - addr;
-            }
-        }
-
-        // addr is in an uncommitted gap.  Find the start of the next committed
-        // range (or the reservation end).
-        if let Some((&next_base, _)) = committed.range(addr + 1..).next() {
-            if next_base < res_end {
-                return next_base - addr;
-            }
-        }
-        res_end - addr
+    pub fn rtl_raise_exception_dispatch_stub_va(&self) -> usize {
+        self.rtl_raise_exception_dispatch_stub_va
+            .load(core::sync::atomic::Ordering::Acquire)
     }
+}
+
+fn find_section_view(
+    views: &alloc::collections::BTreeMap<usize, usize>,
+    addr: usize,
+) -> Option<(usize, usize)> {
+    views
+        .range(..=addr)
+        .rev()
+        .find_map(|(&base, &size)| (addr < base.saturating_add(size)).then_some((base, size)))
 }
 macro_rules! log_unimplemented {
     ($($arg:tt)*) => {
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "trace_debug"))]
         {
             use litebox::platform::DebugLogProvider as _;
             let msg = alloc::format!("NT shim: unimplemented: {}\n", core::format_args!($($arg)*));
@@ -1188,6 +2005,7 @@ macro_rules! log_unimplemented {
 
 pub mod handle_table;
 pub mod peb_teb;
+pub mod registry;
 pub mod syscalls;
 
 /// The execution context type. We reuse the same `PtRegs`+`FpRegs` layout
@@ -1204,6 +2022,22 @@ pub mod syscalls;
 /// - stack: arg4, arg5, ...
 pub type ExecutionContext = litebox_common_linux::ExecutionContext;
 
+/// State saved during user-mode APC delivery.
+///
+/// When the shim delivers user APCs, it saves the original guest execution
+/// context and queues up the remaining APCs.  Each APC routine runs in the
+/// guest; when it returns (hitting the APC return stub), the shim dispatches
+/// the next pending APC.  Once all APCs are delivered, the shim restores the
+/// saved context.
+struct PendingApcDelivery {
+    /// The execution context to restore after all APCs are delivered.
+    saved_ctx: ExecutionContext,
+    /// Remaining APCs to deliver (already drained from the ThreadObject).
+    remaining: alloc::vec::Vec<handle_table::PendingUserApc>,
+    /// The NtStatus to return after APC delivery completes.
+    return_status: litebox_common_windows::ntstatus::NtStatus,
+}
+
 /// The NT shim entrypoints, implementing the `EnterShim` trait.
 ///
 /// Each platform thread gets its own instance. Thread-local state (e.g., the
@@ -1213,12 +2047,14 @@ pub struct NtShimEntrypoints {
     /// Exit code set by NtTerminateProcess. The runner reads this after
     /// `run_thread` returns to propagate the guest exit status.
     exit_code: AtomicI32,
+    /// Set to `true` once the guest explicitly requests termination (e.g.
+    /// via NtTerminateProcess).  The breakpoint handler uses this to avoid
+    /// overriding a clean exit code with STATUS_BREAKPOINT when V8 crashes
+    /// during shutdown.
+    exit_requested: core::sync::atomic::AtomicBool,
     /// Initial thread state set by the runner before calling `run_thread`.
     /// The `init` callback reads this to set rip, rsp, and GS base.
     init_state: Option<NtInitState>,
-    /// For child threads: the argument to pass in RCX on entry.
-    /// None for the main thread (main thread uses sysret fast path with RCX = RIP).
-    child_thread_argument: Option<usize>,
     /// FLS slot values (fiber-local storage, treated as thread-local for Phase 2).
     /// Per-thread because FLS is per-fiber/per-thread.
     fls_slots: Mutex<[usize; 128]>,
@@ -1234,18 +2070,49 @@ pub struct NtShimEntrypoints {
     /// we've forwarded an exception to KiUserExceptionDispatcher without the
     /// guest successfully resuming (syscall resets this to 0).
     seh_forward_count: core::sync::atomic::AtomicU32,
+    /// Set when a guard page fault is being forwarded to guest SEH.
+    last_guard_page_fault: core::sync::atomic::AtomicBool,
+    /// One-shot normal-path probe armed when a continue resumes to guest
+    /// `RtlUserThreadStart`; consumed by the first subsequent guest syscall.
+    rtl_user_thread_start_syscall_probe_pending: core::sync::atomic::AtomicBool,
+    /// Per-thread syscall/exception trace ring buffer (last [`TRACE_RING_SIZE`](trace::TRACE_RING_SIZE) events).
+    /// Wrapped in `UnsafeCell` because trace recording needs `&mut` access
+    /// from `&self` methods. This is sound because each `NtShimEntrypoints`
+    /// instance is owned by exactly one thread and never shared.
+    trace_ring: core::cell::UnsafeCell<trace::TraceRing>,
+    /// Pending APC delivery state.
+    ///
+    /// When user-mode APCs are drained at an alertable wait or NtTestAlert,
+    /// the current execution context is saved here and the guest is redirected
+    /// to run the first APC routine.  On APC return (detected by the
+    /// `APC_RETURN_MARKER` syscall number), the shim either dispatches the
+    /// next pending APC or restores the saved context and returns.
+    pending_apc_state: core::cell::UnsafeCell<Option<PendingApcDelivery>>,
     /// Process-wide shared state (handles, env, CWD, etc.).
     shared: alloc::sync::Arc<NtSharedState>,
 }
 
 /// Process-wide state shared by all threads via `Arc`.
 pub(crate) struct NtSharedState {
+    /// LiteBox instance for creating child-process PageManagers.
+    /// Each child process needs its own PageManager with its own VA partition
+    /// so it gets a private heap/ntdll, avoiding TEB corruption on exit.
+    pub litebox: litebox::LiteBox<Platform>,
+    /// Cached ntdll boot data for spawning child processes.
+    /// Populated by the runner via `set_ntdll_boot_data()` after loading ntdll.
+    pub ntdll_boot_data: spin::Once<alloc::sync::Arc<NtdllBootData>>,
     /// NT object handle table.
     pub handles: Mutex<handle_table::HandleTable>,
     /// Pre-allocated stdio handle values for GetStdHandle dispatch.
     pub stdin_handle: u32,
     pub stdout_handle: u32,
     pub stderr_handle: u32,
+    /// Process-wide termination flag: set by any thread that calls
+    /// NtTerminateProcess.  Other threads' breakpoint/exception handlers
+    /// check this to avoid overriding a clean exit code.
+    pub process_exit_requested: core::sync::atomic::AtomicBool,
+    /// Process-wide exit code set by the first NtTerminateProcess call.
+    pub process_exit_code: AtomicI32,
     /// Shared process state (PageManager, etc.).
     pub process_state: alloc::sync::Arc<NtProcessState>,
     /// Next TLS slot index to allocate.
@@ -1269,22 +2136,29 @@ pub(crate) struct NtSharedState {
     /// Live threads indexed by guest-visible thread ID.
     pub threads_by_id:
         Mutex<alloc::collections::BTreeMap<u32, alloc::sync::Arc<handle_table::ThreadObject>>>,
-    /// Minimum known TLS vector slot count per TEB.
-    ///
-    /// This tracks shim-allocated vectors plus ntdll-driven replacements so
-    /// later static-TLS backfills can grow an existing vector without copying
-    /// past the currently provisioned slots.
-    pub tls_vector_slots: Mutex<alloc::collections::BTreeMap<usize, usize>>,
-    /// TLS vector and static-TLS block allocations owned by each thread TEB.
-    pub tls_allocations: Mutex<alloc::collections::BTreeMap<usize, ThreadTlsAllocations>>,
+    /// Condition variables keyed by guest address.
+    pub condition_variables: Mutex<
+        alloc::collections::BTreeMap<
+            usize,
+            alloc::sync::Arc<handle_table::ConditionVariableObject>,
+        >,
+    >,
+    /// Guest-registered dynamic unwind tables keyed by the function-table pointer.
+    pub dynamic_function_tables: Mutex<alloc::collections::BTreeMap<usize, DynamicFunctionTable>>,
+    /// SRW locks keyed by guest address.
+    pub srw_locks:
+        Mutex<alloc::collections::BTreeMap<usize, alloc::sync::Arc<handle_table::SrwLockObject>>>,
     /// Optional smoltcp network stack for WinSock syscalls.
     /// Set by the runner after creating the Network instance.
     pub net: spin::Once<alloc::sync::Arc<spin::Mutex<litebox::net::Network<Platform>>>>,
-    /// Socket storage: maps socket IDs ΓåÆ owned `SocketFd` handles.
-    /// Socket IDs are also stored in the handle table as `NtObject::Socket { sock_id }`.
-    pub sockets: Mutex<alloc::collections::BTreeMap<u32, litebox::net::SocketFd<Platform>>>,
-    /// Next socket ID to allocate.
-    pub next_socket_id: Mutex<u32>,
+
+    /// Live Timer2 objects for expiry checking.
+    ///
+    /// The IOCP wait loop checks this list to compute the minimum timeout and
+    /// fire expired timers.  Timer2 objects are added on `NtCreateTimer2` and
+    /// removed when the handle is closed.
+    pub timer2_list: Mutex<alloc::vec::Vec<alloc::sync::Arc<handle_table::Timer2Object>>>,
+
     /// Carry-over buffer for ReadConsoleW: bytes read from host stdin that
     /// have not yet been returned to the guest.  Preserves excess and
     /// incomplete UTF-8 tails across calls.
@@ -1292,7 +2166,10 @@ pub(crate) struct NtSharedState {
     /// Pre-captured NLS combined section data, locale ID, casing size, and
     /// individual NtGetNlsSectionPtr payloads.
     /// Set by the runner so the shim doesn't need to call host APIs.
-    pub nls_data: spin::Once<NlsData>,
+    pub nls_data: spin::Once<alloc::sync::Arc<NlsData>>,
+    /// Shim-owned CSR connection state used to emulate the ApiPort/SharedSection
+    /// handshake without a real CSRSS process.
+    pub csr_state: Mutex<CsrState>,
     /// Guest-local WNF state table keyed by state name.
     pub wnf_states: Mutex<alloc::collections::BTreeMap<u64, WnfStateValue>>,
     /// Cached guest mappings for NtGetNlsSectionPtr results keyed by
@@ -1303,38 +2180,548 @@ pub(crate) struct NtSharedState {
     /// ETW provider-registration handles that already had traits set via
     /// NtTraceControl(0x1E).
     pub etw_provider_traits_set: Mutex<alloc::collections::BTreeSet<u32>>,
+    /// ProcessDefaultHardErrorMode value returned by ProcessInformationClass 12.
+    pub default_hard_error_mode: AtomicU32,
+    /// Next RegisterWindowMessage ID (starts at 0xC000).
+    pub next_registered_msg_id: AtomicU32,
     /// Litebox core VFS for file I/O.
     pub fs: spin::Once<alloc::sync::Arc<NtFS>>,
     /// Guest address space VA range (start..end) for pointer validation.
     pub guest_va_start: core::sync::atomic::AtomicUsize,
     pub guest_va_end: core::sync::atomic::AtomicUsize,
-    /// Raw descriptor storage for VFS file descriptors.
-    /// Maps raw integer fd indices to `TypedFd<NtFS>` handles.
-    pub raw_fds: Mutex<litebox::fd::RawDescriptorStorage>,
     /// Mapping from real Windows syscall numbers to `NtSyscallId`.
     /// Populated by the ntdll rewriter; used for dispatch.
     pub syscall_map: spin::Once<NtSyscallMap>,
+    /// Mapping from real win32u syscall numbers to logical Win32k handlers.
+    /// Populated when the guest maps win32u.dll; used for dynamic Win32k dispatch.
+    pub win32k_syscall_map: spin::Once<syscalls::win32k::Win32kSyscallMap>,
     /// Syscall number ΓåÆ export name for unhandled stubs (debug logging).
     pub unhandled_stubs: spin::Once<alloc::vec::Vec<(u32, alloc::string::String)>>,
-}
-
-#[derive(Default)]
-pub(crate) struct ThreadTlsAllocations {
-    pub vector: Option<TrackedGuestAllocation>,
-    pub blocks: alloc::vec::Vec<TrackedGuestAllocation>,
+    /// Per-module TLS template data captured during main-thread init.
+    /// Used to allocate per-thread TLS blocks for child threads (the NT
+    /// kernel normally does this inside NtCreateThread, but the shim must
+    /// replicate it).
+    pub tls_templates: spin::Once<alloc::vec::Vec<TlsTemplateEntry>>,
+    /// Wakers for all live threads, indexed by thread ID.
+    /// Used to wake threads blocked in waits.
+    pub thread_wakers:
+        Mutex<alloc::collections::BTreeMap<u32, litebox::event::wait::Waker<Platform>>>,
+    /// Full thread handles (with interrupt capability) for all live threads.
+    /// Populated lazily during thread init once the platform thread handle is
+    /// available.  Used by NtTerminateProcess phase 1 to interrupt threads
+    /// running in guest code.
+    pub thread_interrupt_handles:
+        Mutex<alloc::collections::BTreeMap<u32, litebox::event::wait::ThreadHandle<Platform>>>,
+    /// Number of live child threads (excludes the main thread).  When this
+    /// reaches zero and `process_exit_requested` is not yet set, a timer
+    /// starts that will interrupt the main thread if NtTerminateProcess is
+    /// not called within a short window.
+    pub live_child_thread_count: core::sync::atomic::AtomicU32,
+    /// Thread ID of the main thread (set at construction).
+    pub main_thread_id: u32,
+    /// Number of child threads that have called NtTerminateThread (diagnostic).
+    pub child_threads_terminated: core::sync::atomic::AtomicU32,
+    /// Total number of child threads ever created (diagnostic).
+    pub child_threads_created: core::sync::atomic::AtomicU32,
+    /// Best-effort last-syscall cache indexed by `thread_id % 64`.
+    /// Updated on every syscall entry; may alias and is not used by the watchdog.
+    pub thread_last_syscall: [core::sync::atomic::AtomicU32; 64],
+    /// Recent by-thread-id alert posts retained after poster threads exit.
+    recent_alert_posts: Mutex<alloc::collections::VecDeque<AlertPostRecord>>,
+    /// Recent cross-thread handoff events for wake-chain debugging.
+    pub(crate) recent_chain_events: Mutex<alloc::collections::VecDeque<alloc::string::String>>,
+    /// One-shot guest breakpoint probes keyed by absolute guest VA.
+    guest_gs_breakpoint_probes: Mutex<alloc::collections::BTreeMap<usize, GuestGsBreakpointProbe>>,
+    /// Recent virtual-memory lifecycle events retained for fault correlation.
+    recent_vm_teardowns: Mutex<alloc::collections::VecDeque<RecentVmTeardown>>,
+    /// Named pipe registry: maps pipe names (lowercased) to shared buffers.
+    /// Populated by NtCreateNamedPipeFile, consumed by NtCreateFile/NtOpenFile.
+    pub pipe_registry:
+        Mutex<alloc::collections::BTreeMap<alloc::string::String, alloc::sync::Arc<handle_table::PipeBuffer>>>,
+    /// Next virtual process ID for NtCreateUserProcess.
+    pub next_process_id: Mutex<u32>,
+    /// VFS directory path of the main executable. Used by NtOpenSection to
+    /// search for DLLs in the exe's directory (e.g. `/c/users/.../python`).
+    /// Set from the exe path during init.
+    pub exe_directory_vfs: Mutex<alloc::string::String>,
+    /// Whether this process has a console session attached.
+    /// `true` for the main (parent) process, `false` for child processes
+    /// spawned with redirected stdio (pipes).  When `false`, NtCreateFile
+    /// for `\Device\ConDrv\*` paths returns STATUS_INVALID_HANDLE, matching
+    /// real Windows kernel behaviour for console-less processes.
+    pub has_console: bool,
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct TrackedGuestAllocation {
-    pub base: usize,
-    pub len: usize,
-    pub owned_by_shim: bool,
+struct AlertPostRecord {
+    source_tid: u32,
+    target_tid: u32,
+    lock: usize,
+    is_ex: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RecentVmTeardown {
+    tid: u32,
+    kind: u8,
+    base: usize,
+    size: usize,
+    detail: usize,
+    caller: usize,
+}
+
+#[derive(Clone, Copy)]
+struct GuestGsBreakpointProbe {
+    rva: usize,
+    original_byte: u8,
+    armed: bool,
+}
+
+/// Convert a Win32 directory path (e.g. `C:\Users\foo\bar`) to a VFS
+/// directory path (e.g. `/c/users/foo/bar`).
+fn win32_path_to_vfs_dir(win32_dir: &str) -> alloc::string::String {
+    let mut vfs = alloc::string::String::with_capacity(win32_dir.len() + 1);
+    vfs.push('/');
+    for ch in win32_dir.chars() {
+        if ch == '\\' {
+            vfs.push('/');
+        } else {
+            for lc in ch.to_lowercase() {
+                vfs.push(lc);
+            }
+        }
+    }
+    // Remove the colon after drive letter: /c:/foo → /c/foo
+    if vfs.len() >= 3 && vfs.as_bytes()[2] == b':' {
+        vfs.remove(2);
+    }
+    vfs
+}
+
+pub(crate) fn push_recent_chain_event(
+    queue: &Mutex<alloc::collections::VecDeque<alloc::string::String>>,
+    event: alloc::string::String,
+) {
+    let mut q = queue.lock();
+    if q.len() >= 256 {
+        q.pop_front();
+    }
+    q.push_back(event);
+}
+
+fn push_recent_vm_teardown(
+    queue: &Mutex<alloc::collections::VecDeque<RecentVmTeardown>>,
+    event: RecentVmTeardown,
+) {
+    let mut q = queue.lock();
+    if q.len() >= 256 {
+        q.pop_front();
+    }
+    q.push_back(event);
+}
+
+/// Thread-safe diagnostic handle that can be shared with a watchdog thread
+/// while `run_thread_ref` is blocking.  Clones the process-wide shared
+/// state Arc so it remains valid even after the main shim reference is
+/// consumed.
+pub struct ProcessDiagnostics {
+    shared: alloc::sync::Arc<NtSharedState>,
+}
+
+impl ProcessDiagnostics {
+    /// Number of child threads currently alive.
+    pub fn live_child_count(&self) -> u32 {
+        self.shared
+            .live_child_thread_count
+            .load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Total child threads ever created.
+    pub fn created_count(&self) -> u32 {
+        self.shared
+            .child_threads_created
+            .load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Number of child threads that called NtTerminateThread.
+    pub fn terminated_count(&self) -> u32 {
+        self.shared
+            .child_threads_terminated
+            .load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether process exit has been requested.
+    pub fn process_exit_requested(&self) -> bool {
+        self.shared
+            .process_exit_requested
+            .load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn recent_alert_posts(&self) -> alloc::string::String {
+        let posts = self.shared.recent_alert_posts.lock();
+        if posts.is_empty() {
+            return alloc::string::String::new();
+        }
+        let mut out = alloc::string::String::new();
+        for (idx, post) in posts.iter().enumerate() {
+            if idx != 0 {
+                out.push('|');
+            }
+            out.push_str(&alloc::format!(
+                "{}:{}->{}@0x{:X}",
+                if post.is_ex { "ex" } else { "id" },
+                post.source_tid,
+                post.target_tid,
+                post.lock
+            ));
+        }
+        out
+    }
+
+    pub fn recent_chain_events(&self) -> alloc::string::String {
+        let events = self.shared.recent_chain_events.lock();
+        if events.is_empty() {
+            return alloc::string::String::new();
+        }
+        let mut out = alloc::string::String::new();
+        for (idx, event) in events.iter().enumerate() {
+            if idx != 0 {
+                out.push('|');
+            }
+            out.push_str(event);
+        }
+        out
+    }
+
+    pub fn recent_vm_teardowns(&self) -> alloc::string::String {
+        let events = self.shared.recent_vm_teardowns.lock();
+        if events.is_empty() {
+            return alloc::string::String::new();
+        }
+        let mut out = alloc::string::String::new();
+        for (idx, event) in events.iter().enumerate() {
+            if idx != 0 {
+                out.push('|');
+            }
+            let kind = match event.kind {
+                1 => "free",
+                2 => "unmap",
+                3 => "unmapex",
+                4 => "alloc",
+                5 => "allocx",
+                6 => "mapview",
+                7 => "mapviewex",
+                _ => "vm",
+            };
+            out.push_str(&alloc::format!(
+                "{}:{}:0x{:X}:0x{:X}:0x{:X}:0x{:X}",
+                kind,
+                event.tid,
+                event.base,
+                event.size,
+                event.detail,
+                event.caller
+            ));
+        }
+        out
+    }
+
+    /// Returns `(thread_id, last_syscall_nr, resolved_syscall_id, last_rip, last_rsp, last_caller_ret, last_wait_alert_addr, last_incoming_alert_lock, last_outgoing_alert_target_tid, last_outgoing_alert_lock, pending_any, pending_by_id, alert_waiters, alert_by_id_waiters, alert_posts, alert_consumes, tls_array_ptr, tls_recopied, tls_null, tls_skipped, alert_history, debug_stage, exit_stage, has_exited)`
+    /// for each known thread.
+    pub fn thread_states(
+        &self,
+    ) -> alloc::vec::Vec<(
+        u32,
+        u32,
+        Option<litebox_common_windows::NtSyscallId>,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        u32,
+        usize,
+        bool,
+        bool,
+        usize,
+        usize,
+        u32,
+        u32,
+        usize,
+        u32,
+        u32,
+        u32,
+        alloc::string::String,
+        u32,
+        u32,
+        bool,
+    )> {
+        let threads = self.shared.threads_by_id.lock();
+        let mut result = alloc::vec::Vec::with_capacity(threads.len());
+        for (&tid, tobj) in threads.iter() {
+            let nr = tobj.last_syscall();
+            let syscall_id = self.shared.syscall_map.get().and_then(|m| m.lookup(nr));
+            let (last_rip, last_rsp) = tobj.last_guest_context();
+            let last_caller_ret = tobj.last_caller_ret();
+            let last_wait_alert_addr = tobj.last_wait_alert_addr();
+            let last_incoming_alert_lock = tobj.last_incoming_alert_lock();
+            let (last_outgoing_alert_target_tid, last_outgoing_alert_lock) =
+                tobj.last_outgoing_alert();
+            let (pending_any, pending_by_id, alert_waiters, alert_by_id_waiters) =
+                tobj.alert_by_id_snapshot();
+            let (alert_posts, alert_consumes) = tobj.alert_by_id_counters();
+            let (tls_array_ptr, tls_recopied, tls_null, tls_skipped) = tobj.tls_repair_stats();
+            let alert_history = tobj.format_alert_history();
+            result.push((
+                tid,
+                nr,
+                syscall_id,
+                last_rip,
+                last_rsp,
+                last_caller_ret,
+                last_wait_alert_addr,
+                last_incoming_alert_lock,
+                last_outgoing_alert_target_tid,
+                last_outgoing_alert_lock,
+                pending_any,
+                pending_by_id,
+                alert_waiters,
+                alert_by_id_waiters,
+                alert_posts,
+                alert_consumes,
+                tls_array_ptr,
+                tls_recopied,
+                tls_null,
+                tls_skipped,
+                alert_history,
+                tobj.debug_stage(),
+                tobj.exit_stage(),
+                tobj.has_exited(),
+            ));
+        }
+        result
+    }
+
+    /// Force-terminate the process: sets `process_exit_requested` and
+    /// interrupts all threads (both WAITING and RUNNING_IN_GUEST).
+    pub fn force_terminate(&self, exit_code: i32) {
+        if !self
+            .shared
+            .process_exit_requested
+            .swap(true, core::sync::atomic::Ordering::AcqRel)
+        {
+            self.shared
+                .process_exit_code
+                .store(exit_code, core::sync::atomic::Ordering::Release);
+        }
+        // Interrupt all threads via their interrupt handles.
+        let handles = self.shared.thread_interrupt_handles.lock();
+        for handle in handles.values() {
+            handle.interrupt();
+        }
+        // Also wake any threads in WAITING state via their wakers.
+        let wakers = self.shared.thread_wakers.lock();
+        for waker in wakers.values() {
+            waker.wake();
+        }
+    }
+}
+
+/// Describes one module's implicit-TLS (IMAGE_TLS_DIRECTORY64) template.
+#[derive(Clone, Debug)]
+pub(crate) struct TlsTemplateEntry {
+    /// The loader-assigned TLS index (written to *AddressOfIndex).
+    pub tls_index: u32,
+    /// Guest VA of the template data start (StartAddressOfRawData).
+    pub template_va: usize,
+    /// Size of the template data (End - Start).
+    pub template_size: usize,
+    /// Extra zero bytes appended after the template data.
+    pub zero_fill: u32,
+}
+
+/// Scan all loaded modules' PE headers in guest memory to discover
+/// IMAGE_TLS_DIRECTORY64 entries.  Returns one `TlsTemplateEntry` per
+/// module that has implicit TLS, sorted by TLS index.
+pub(crate) fn capture_tls_templates(modules: &[ModuleBase]) -> alloc::vec::Vec<TlsTemplateEntry> {
+    use litebox_common_windows::pe::{IMAGE_DIRECTORY_ENTRY_TLS, ImageTlsDirectory64};
+    let mut entries = alloc::vec::Vec::new();
+
+    for module in modules {
+        let base = module.base_address;
+        if base == 0 || module.image_size == 0 {
+            continue;
+        }
+        // Read DOS header -> e_lfanew (offset to PE header).
+        let Some(e_lfanew) = try_read_guest_value_unaligned::<u32>(base + 0x3C) else {
+            continue;
+        };
+        let pe_hdr = base + e_lfanew as usize;
+        // Verify PE signature "PE\0\0" (0x00004550).
+        let Some(sig) = try_read_guest_value_unaligned::<u32>(pe_hdr) else {
+            continue;
+        };
+        if sig != 0x0000_4550 {
+            continue;
+        }
+        // COFF header size (20 bytes) + OptionalHeader offset.
+        let opt_hdr = pe_hdr + 4 + 20;
+        // Read magic to confirm PE32+ (0x20b).
+        let Some(magic) = try_read_guest_value_unaligned::<u16>(opt_hdr) else {
+            continue;
+        };
+        if magic != 0x20b {
+            continue;
+        }
+        // NumberOfRvaAndSizes at offset 108 in the optional header.
+        let Some(num_dirs) = try_read_guest_value_unaligned::<u32>(opt_hdr + 108) else {
+            continue;
+        };
+        if (num_dirs as usize) <= IMAGE_DIRECTORY_ENTRY_TLS {
+            continue;
+        }
+        // Data directory array starts at offset 112.
+        let dd_base = opt_hdr + 112;
+        let tls_dd_offset = dd_base + IMAGE_DIRECTORY_ENTRY_TLS * 8;
+        let Some(tls_rva) = try_read_guest_value_unaligned::<u32>(tls_dd_offset) else {
+            continue;
+        };
+        let Some(tls_size) = try_read_guest_value_unaligned::<u32>(tls_dd_offset + 4) else {
+            continue;
+        };
+        if tls_rva == 0 || tls_size == 0 {
+            continue;
+        }
+        let tls_va = base + tls_rva as usize;
+        let Some(tls_dir) = try_read_guest_value_unaligned::<ImageTlsDirectory64>(tls_va) else {
+            continue;
+        };
+        // Read the loader-assigned TLS index from the guest variable.
+        let idx_va = tls_dir.address_of_index as usize;
+        let Some(tls_index) = try_read_guest_value_unaligned::<u32>(idx_va) else {
+            continue;
+        };
+        let template_size = tls_dir
+            .end_address_of_raw_data
+            .saturating_sub(tls_dir.start_address_of_raw_data);
+        entries.push(TlsTemplateEntry {
+            tls_index,
+            template_va: tls_dir.start_address_of_raw_data as usize,
+            template_size: template_size as usize,
+            zero_fill: tls_dir.size_of_zero_fill,
+        });
+    }
+    entries.sort_by_key(|e| e.tls_index);
+    entries
+}
+
+/// Allocate per-thread TLS for a child thread.
+///
+/// Mimics what the NT kernel does inside `NtCreateThread`:
+/// - allocates a TLS pointer array
+/// - for each module with implicit TLS, copies the template data into a
+///   freshly-allocated per-thread data block
+/// - writes the array pointer to the child's TEB+0x58
+///
+/// Returns `true` on success (or if no TLS templates exist).
+pub(crate) fn allocate_child_thread_tls(
+    pm: &litebox::mm::PageManager<Platform, PAGE_SIZE>,
+    child_teb_va: usize,
+    templates: &[TlsTemplateEntry],
+) -> bool {
+    use litebox::platform::RawConstPointer as _;
+
+    if templates.is_empty() {
+        return true;
+    }
+    let max_index = templates.iter().map(|t| t.tls_index).max().unwrap_or(0) as usize;
+    let array_count = max_index + 1;
+    let array_bytes = array_count * core::mem::size_of::<usize>();
+
+    // Compute total data bytes needed (one block per template).
+    let total_data: usize = templates
+        .iter()
+        .filter_map(|t| t.template_size.checked_add(t.zero_fill as usize))
+        .sum();
+
+    // Round up to page size.
+    let total = array_bytes + total_data;
+    let alloc_size = (total + (crate::PAGE_SIZE - 1)) & !(crate::PAGE_SIZE - 1);
+    let alloc_size = alloc_size.max(crate::PAGE_SIZE);
+
+    let nz = match litebox::mm::linux::NonZeroPageSize::<{ crate::PAGE_SIZE }>::new(alloc_size) {
+        Some(v) => v,
+        None => return false,
+    };
+
+    let base = unsafe {
+        pm.create_writable_pages(
+            None,
+            nz,
+            litebox::mm::linux::CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
+            |_| Ok(0),
+        )
+    };
+    let base_va = match base {
+        Ok(ptr) => ptr.as_usize(),
+        Err(_) => return false,
+    };
+
+    // Layout: [TLS pointer array][data block 0][data block 1]...
+    let array_va = base_va;
+    let mut data_cursor = base_va + array_bytes;
+
+    for t in templates {
+        let block_va = data_cursor;
+        let block_size = t.template_size + t.zero_fill as usize;
+
+        // Copy template data from the module's TLS directory.
+        if t.template_size > 0 && t.template_va != 0 {
+            // Safety: template_va points into a mapped PE image in guest memory.
+            // Use fallible copy in case pages are concurrently unmapped.
+            let _ = unsafe {
+                litebox::mm::exception_table::memcpy_fallible(
+                    block_va as *mut u8,
+                    t.template_va as *const u8,
+                    t.template_size,
+                )
+            };
+        }
+        // Zero-fill is already zero from the fresh page allocation.
+
+        // Write the data block pointer into the TLS array.
+        let slot_va = array_va + (t.tls_index as usize) * core::mem::size_of::<usize>();
+        unsafe {
+            core::ptr::write(slot_va as *mut usize, block_va);
+        }
+
+        data_cursor += block_size;
+    }
+
+    // Write the TLS array pointer to the child's TEB+0x58.
+    unsafe {
+        core::ptr::write(
+            (child_teb_va + crate::peb_teb::teb_offsets::TLS_POINTER) as *mut usize,
+            array_va,
+        );
+    }
+    true
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct WnfStateValue {
     pub change_stamp: u32,
     pub data: alloc::vec::Vec<u8>,
+}
+
+const WNF_STATE_FEATURE_CONFIGURATION: u64 = 0x0280_032E_A3BC_0875;
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CsrState {
+    pub shared_section_base: usize,
+    pub shared_static_server_data: usize,
+    pub shared_section_size: usize,
+    pub server_process_id: usize,
 }
 
 /// State set by the runner to configure the initial thread.
@@ -1365,12 +2752,19 @@ pub struct NtInitState {
     pub guest_va_end: usize,
     /// Full path of the main executable (for GetModuleFileNameW).
     pub exe_path: alloc::string::String,
+    /// Initial current directory used by Win32 path helpers.
+    pub current_directory: alloc::string::String,
     /// For ntdll-driven init: RCX value (CONTEXT* pointer on guest stack).
     pub initial_rcx: usize,
     /// For ntdll-driven init: RDX value (ntdll base address).
     pub initial_rdx: usize,
     /// Absolute VA of ntdll!RtlUserThreadStart for child thread startup.
     pub rtl_user_thread_start_va: usize,
+    /// Absolute VA of ntdll!LdrInitializeThunk for child thread startup.
+    /// When set, child threads enter through LdrInitializeThunk (which calls
+    /// LdrpInitializeThread → DLL_THREAD_ATTACH) instead of jumping directly
+    /// to RtlUserThreadStart.
+    pub ldr_init_thunk_va: usize,
     /// RVA of KiUserExceptionDispatcher in ntdll, resolved from PE exports.
     pub ki_user_exception_dispatcher_rva: Option<usize>,
 }
@@ -1388,21 +2782,92 @@ pub struct ModuleBase {
     pub image_size: usize,
 }
 
+/// A guest-registered dynamic unwind table installed via RtlAddFunctionTable.
+#[derive(Clone, Copy)]
+pub struct DynamicFunctionTable {
+    /// Guest pointer to the PRUNTIME_FUNCTION array.
+    pub function_table: usize,
+    /// Number of entries in the array.
+    pub entry_count: usize,
+    /// Maximum number of entries the table may grow to.
+    pub maximum_entry_count: usize,
+    /// Base address that the array's RVAs are relative to.
+    pub base_address: usize,
+}
+
+fn resolve_process_tls_thread_teb(
+    threads: &alloc::collections::BTreeMap<u32, alloc::sync::Arc<handle_table::ThreadObject>>,
+    handles: &handle_table::HandleTable,
+    current_thread_id: u32,
+    current_teb_va: usize,
+    thread_ref: u64,
+    thread_count: u32,
+) -> usize {
+    let thread_handle = thread_ref as u32;
+    let current_thread_pseudo = u64::MAX - 1;
+
+    if thread_ref == 0 || thread_ref == current_thread_pseudo {
+        return current_teb_va;
+    }
+
+    // THREAD_TLS_INFORMATION.ThreadId is a HANDLE. Prefer handle lookup so a
+    // thread handle that numerically overlaps another live thread ID doesn't
+    // retarget TLS bookkeeping onto the wrong TEB.
+    // Outer Option: None = handle not found. Inner: Some(teb_va) = Thread, None = CurrentThread.
+    // For "wrong type" we also want to fall through, so we use a nested result.
+    enum ThreadLookup { Thread(usize), Current, Other }
+    let lookup = handles.with(thread_handle, |entry| match &entry.object {
+        handle_table::NtObject::Thread(thread) => ThreadLookup::Thread(thread.teb_va()),
+        handle_table::NtObject::CurrentThread => ThreadLookup::Current,
+        _ => ThreadLookup::Other,
+    });
+    match lookup {
+        Some(ThreadLookup::Thread(teb_va)) => return teb_va,
+        Some(ThreadLookup::Current) => return current_teb_va,
+        _ => {} // not found or wrong type — fall through
+    }
+
+    if thread_handle == current_thread_id {
+        return current_teb_va;
+    }
+
+    if let Some(thread) = threads.get(&thread_handle) {
+        return thread.teb_va();
+    }
+
+    if thread_count == 1 { current_teb_va } else { 0 }
+}
+
 impl NtShimEntrypoints {
     /// Create a new NT shim entrypoints for the initial thread.
     #[must_use]
-    pub fn new(process_state: alloc::sync::Arc<NtProcessState>) -> Self {
-        let (handles, stdin, stdout, stderr) = handle_table::HandleTable::with_stdio();
+    pub fn new(
+        process_state: alloc::sync::Arc<NtProcessState>,
+        litebox: litebox::LiteBox<Platform>,
+    ) -> Self {
+        let (handles, stdin, stdout, stderr) = handle_table::HandleTable::with_stdio(litebox.clone());
         let main_thread_id = crate::peb_teb::SYNTHETIC_MAIN_THREAD_ID;
         let main_thread_obj =
             alloc::sync::Arc::new(handle_table::ThreadObject::new(main_thread_id, 0, 0));
         let mut threads_by_id = alloc::collections::BTreeMap::new();
         threads_by_id.insert(main_thread_id, alloc::sync::Arc::clone(&main_thread_obj));
+        let mut wnf_states = alloc::collections::BTreeMap::new();
+        wnf_states.insert(
+            WNF_STATE_FEATURE_CONFIGURATION,
+            WnfStateValue {
+                change_stamp: 0x35,
+                data: alloc::vec![0x35, 0, 0, 0, 0, 0, 0, 0],
+            },
+        );
         let shared = alloc::sync::Arc::new(NtSharedState {
+            litebox,
+            ntdll_boot_data: spin::Once::new(),
             handles: Mutex::new(handles),
             stdin_handle: stdin,
             stdout_handle: stdout,
             stderr_handle: stderr,
+            process_exit_requested: core::sync::atomic::AtomicBool::new(false),
+            process_exit_code: AtomicI32::new(0),
             process_state,
             tls_next: Mutex::new(0),
             tls_free_list: Mutex::new(alloc::vec::Vec::new()),
@@ -1416,33 +2881,62 @@ impl NtShimEntrypoints {
                 main_thread_id + crate::peb_teb::SYNTHETIC_THREAD_ID_INCREMENT,
             ),
             threads_by_id: Mutex::new(threads_by_id),
-            tls_vector_slots: Mutex::new(alloc::collections::BTreeMap::new()),
-            tls_allocations: Mutex::new(alloc::collections::BTreeMap::new()),
+            condition_variables: Mutex::new(alloc::collections::BTreeMap::new()),
+            dynamic_function_tables: Mutex::new(alloc::collections::BTreeMap::new()),
+            srw_locks: Mutex::new(alloc::collections::BTreeMap::new()),
             net: spin::Once::new(),
-            sockets: Mutex::new(alloc::collections::BTreeMap::new()),
-            next_socket_id: Mutex::new(1),
+            timer2_list: Mutex::new(alloc::vec::Vec::new()),
+
             console_input_pending: Mutex::new(alloc::vec::Vec::new()),
             nls_data: spin::Once::new(),
-            wnf_states: Mutex::new(alloc::collections::BTreeMap::new()),
+            csr_state: Mutex::new(CsrState::default()),
+            wnf_states: Mutex::new(wnf_states),
             nls_section_mappings: Mutex::new(alloc::collections::BTreeMap::new()),
             trace_notification_event: Mutex::new(None),
             etw_provider_traits_set: Mutex::new(alloc::collections::BTreeSet::new()),
+            default_hard_error_mode: AtomicU32::new(0x8002),
+            next_registered_msg_id: AtomicU32::new(0xC000),
             fs: spin::Once::new(),
             guest_va_start: core::sync::atomic::AtomicUsize::new(0),
             guest_va_end: core::sync::atomic::AtomicUsize::new(usize::MAX),
-            raw_fds: Mutex::new(litebox::fd::RawDescriptorStorage::new()),
             syscall_map: spin::Once::new(),
+            win32k_syscall_map: spin::Once::new(),
             unhandled_stubs: spin::Once::new(),
+            tls_templates: spin::Once::new(),
+            thread_wakers: Mutex::new(alloc::collections::BTreeMap::new()),
+            thread_interrupt_handles: Mutex::new(alloc::collections::BTreeMap::new()),
+            live_child_thread_count: core::sync::atomic::AtomicU32::new(0),
+            main_thread_id,
+            child_threads_terminated: core::sync::atomic::AtomicU32::new(0),
+            child_threads_created: core::sync::atomic::AtomicU32::new(0),
+            thread_last_syscall: core::array::from_fn(|_| core::sync::atomic::AtomicU32::new(0)),
+            recent_alert_posts: Mutex::new(alloc::collections::VecDeque::new()),
+            recent_chain_events: Mutex::new(alloc::collections::VecDeque::new()),
+            guest_gs_breakpoint_probes: Mutex::new(alloc::collections::BTreeMap::new()),
+            recent_vm_teardowns: Mutex::new(alloc::collections::VecDeque::new()),
+            pipe_registry: Mutex::new(alloc::collections::BTreeMap::new()),
+            next_process_id: Mutex::new(1000),
+            exe_directory_vfs: Mutex::new(alloc::string::String::new()),
+            has_console: true,
         });
+        let wait_state = WaitState::new(litebox_platform_multiplex::platform());
+        shared
+            .thread_wakers
+            .lock()
+            .insert(main_thread_id, wait_state.clone_waker());
         Self {
             exit_code: AtomicI32::new(0),
+            exit_requested: core::sync::atomic::AtomicBool::new(false),
             init_state: None,
-            child_thread_argument: None,
             fls_slots: Mutex::new([0usize; 128]),
             thread_obj: Some(main_thread_obj),
             thread_id: main_thread_id,
-            wait_state: WaitState::new(litebox_platform_multiplex::platform()),
+            wait_state,
             seh_forward_count: core::sync::atomic::AtomicU32::new(0),
+            last_guard_page_fault: core::sync::atomic::AtomicBool::new(false),
+            rtl_user_thread_start_syscall_probe_pending: core::sync::atomic::AtomicBool::new(false),
+            trace_ring: core::cell::UnsafeCell::new(trace::TraceRing::new(main_thread_id)),
+            pending_apc_state: core::cell::UnsafeCell::new(None),
             shared,
         }
     }
@@ -1460,7 +2954,7 @@ impl NtShimEntrypoints {
 
     /// Install pre-captured NLS data so the shim doesn't call host APIs.
     pub fn set_nls_data(&self, data: NlsData) {
-        let _ = self.shared.nls_data.call_once(|| data);
+        let _ = self.shared.nls_data.call_once(|| alloc::sync::Arc::new(data));
     }
 
     /// Install the litebox core VFS for file I/O.
@@ -1468,43 +2962,343 @@ impl NtShimEntrypoints {
         let _ = self.shared.fs.call_once(|| fs);
     }
 
+    /// Install cached ntdll boot data for spawning child processes.
+    pub fn set_ntdll_boot_data(&self, data: alloc::sync::Arc<NtdllBootData>) {
+        let _ = self.shared.ntdll_boot_data.call_once(|| data);
+    }
+
+    fn current_module_bases(&self) -> alloc::vec::Vec<ModuleBase> {
+        let modules = self.shared.process_state.module_bases_snapshot();
+        if modules.is_empty() {
+            self.init_state
+                .as_ref()
+                .map_or_else(alloc::vec::Vec::new, |s| s.module_bases.clone())
+        } else {
+            modules
+        }
+    }
+
     /// Returns a wait context for the current thread, suitable for blocking
     /// waits (sleep, event waits, etc.). Uses the platform's blocking
     /// primitives instead of busy-spinning.
+    ///
+    /// The returned context is interruptible: if another thread sets
+    /// `process_exit_requested` (via NtTerminateProcess phase 1) and wakes
+    /// this thread's waker, `wait_until` will return `WaitError::Interrupted`.
     pub(crate) fn wait_cx(&self) -> litebox::event::wait::WaitContext<'_, Platform> {
-        self.wait_state.context()
+        self.wait_state.context().with_check_for_interrupt(self)
+    }
+
+    fn enter_from_guest(&self) {
+        self.wait_state.finish_running_guest();
+    }
+
+    fn resume_guest(&self, ctx: &mut ExecutionContext) -> ContinueOperation {
+        if self.wait_state.prepare_to_run_guest(|| {
+            !self
+                .shared
+                .process_exit_requested
+                .load(core::sync::atomic::Ordering::Acquire)
+        }) {
+            ContinueOperation::Resume
+        } else {
+            let code = self
+                .shared
+                .process_exit_code
+                .load(core::sync::atomic::Ordering::Acquire);
+            self.mark_current_thread_exited(code);
+            ctx.regs.rax = 0;
+            ContinueOperation::Terminate
+        }
+    }
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    fn maybe_arm_rtl_user_thread_start_gs_probe(
+        &self,
+        ctx: &mut litebox_common_linux::ExecutionContext,
+        event_tag: &str,
+    ) {
+        let steps = litebox_platform_windows_userland::WindowsUserland::startup_gs_probe_budget();
+        if steps == 0 {
+            return;
+        }
+        let Some(init) = self.init_state.as_ref() else {
+            return;
+        };
+        if ctx.regs.rip != init.rtl_user_thread_start_va {
+            return;
+        }
+        litebox_platform_windows_userland::WindowsUserland::arm_post_continue_single_step_budget(
+            steps,
+        );
+        push_recent_chain_event(
+            &self.shared.recent_chain_events,
+            alloc::format!(
+                "{event_tag}:{}:{}:0x{:X}",
+                self.thread_id,
+                steps,
+                ctx.regs.rip
+            ),
+        );
+    }
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    fn maybe_arm_rtl_user_thread_start_syscall_probe(
+        &self,
+        ctx: &mut litebox_common_linux::ExecutionContext,
+        event_tag: &str,
+    ) {
+        let Some(init) = self.init_state.as_ref() else {
+            return;
+        };
+        if ctx.regs.rip != init.rtl_user_thread_start_va {
+            return;
+        }
+        self.rtl_user_thread_start_syscall_probe_pending
+            .store(true, Ordering::Relaxed);
+        push_recent_chain_event(
+            &self.shared.recent_chain_events,
+            alloc::format!("{event_tag}:{}:0x{:X}", self.thread_id, ctx.regs.rip),
+        );
+    }
+
+    #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+    fn maybe_arm_rtl_user_thread_start_syscall_probe(
+        &self,
+        _ctx: &mut litebox_common_linux::ExecutionContext,
+        _event_tag: &str,
+    ) {
+    }
+
+    #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+    fn maybe_arm_rtl_user_thread_start_gs_probe(
+        &self,
+        _ctx: &mut litebox_common_linux::ExecutionContext,
+        _event_tag: &str,
+    ) {
+    }
+
+    #[cfg(target_os = "windows")]
+    fn maybe_install_guest_gs_breakpoint_probes(&self, state: &NtInitState) {
+        let probe_rvas =
+            litebox_platform_windows_userland::WindowsUserland::guest_gs_breakpoint_probe_rvas();
+        if probe_rvas.is_empty() {
+            return;
+        }
+        let Some(ntdll_base) = state
+            .module_bases
+            .iter()
+            .find(|m| m.name.eq_ignore_ascii_case("ntdll.dll"))
+            .map(|m| m.base_address)
+        else {
+            return;
+        };
+
+        let mut armed = alloc::vec::Vec::new();
+        {
+            use litebox::platform::RawConstPointer as _;
+            let mut probes = self.shared.guest_gs_breakpoint_probes.lock();
+            if !probes.is_empty() {
+                return;
+            }
+
+            use litebox::platform::RawPointerProvider;
+            let pm = &self.shared.process_state.pm;
+            for &rva in probe_rvas {
+                let Some(probe_va) = ntdll_base.checked_add(rva) else {
+                    continue;
+                };
+                if probe_va < state.guest_va_start || probe_va >= state.guest_va_end {
+                    continue;
+                }
+
+                let page = probe_va & !(PAGE_SIZE - 1);
+                let ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(page);
+                let _ = unsafe { pm.make_pages_writable(ptr, PAGE_SIZE) };
+                let original_byte = unsafe { core::ptr::read(probe_va as *const u8) };
+                if original_byte == 0xCC {
+                    let _ = unsafe { pm.make_pages_executable(ptr, PAGE_SIZE) };
+                    continue;
+                }
+                unsafe { core::ptr::write(probe_va as *mut u8, 0xCC) };
+                let flush_ok =
+                    unsafe { FlushInstructionCache(GetCurrentProcess(), probe_va as *const _, 1) };
+                assert!(
+                    flush_ok != 0,
+                    "Failed to install guest GS breakpoint probe: FlushInstructionCache failed"
+                );
+                let _ = unsafe { pm.make_pages_executable(ptr, PAGE_SIZE) };
+
+                probes.insert(
+                    probe_va,
+                    GuestGsBreakpointProbe {
+                        rva,
+                        original_byte,
+                        armed: true,
+                    },
+                );
+                armed.push((rva, probe_va, original_byte));
+            }
+        }
+
+        if !armed.is_empty() {
+            use litebox::platform::DebugLogProvider as _;
+            for (rva, probe_va, original_byte) in armed {
+                self.trace(
+                    TraceKind::Probe,
+                    0x51A7F,
+                    rva,
+                    probe_va,
+                    original_byte as usize,
+                );
+                push_recent_chain_event(
+                    &self.shared.recent_chain_events,
+                    alloc::format!(
+                        "gsprobearm:{:X}:0x{:X}:0x{:X}:0x{:02X}",
+                        self.thread_id,
+                        rva,
+                        probe_va,
+                        original_byte
+                    ),
+                );
+                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                    "NT shim: armed guest GS breakpoint probe tid={} rva=0x{:X} va=0x{:X} original=0x{:02X}\n",
+                    self.thread_id,
+                    rva,
+                    probe_va,
+                    original_byte,
+                ));
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn maybe_install_guest_gs_breakpoint_probes(&self, _state: &NtInitState) {}
+
+    #[cfg(target_os = "windows")]
+    fn restore_guest_gs_breakpoint_probe_byte(&self, probe_va: usize, original_byte: u8) {
+        use litebox::platform::RawConstPointer as _;
+        use litebox::platform::RawPointerProvider;
+
+        let page = probe_va & !(PAGE_SIZE - 1);
+        let ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(page);
+        let pm = &self.shared.process_state.pm;
+        let _ = unsafe { pm.make_pages_writable(ptr, PAGE_SIZE) };
+        unsafe { core::ptr::write(probe_va as *mut u8, original_byte) };
+        let flush_ok =
+            unsafe { FlushInstructionCache(GetCurrentProcess(), probe_va as *const _, 1) };
+        assert!(
+            flush_ok != 0,
+            "Failed to restore guest GS breakpoint probe: FlushInstructionCache failed"
+        );
+        let _ = unsafe { pm.make_pages_executable(ptr, PAGE_SIZE) };
+    }
+
+    #[cfg(target_os = "windows")]
+    fn try_handle_guest_gs_breakpoint_probe(
+        &self,
+        ctx: &mut litebox_common_linux::ExecutionContext,
+    ) -> bool {
+        let trap_rip = ctx.regs.rip;
+        let candidates = [trap_rip.saturating_sub(1), trap_rip];
+        let matched = {
+            let mut probes = self.shared.guest_gs_breakpoint_probes.lock();
+            let mut matched = None;
+            for probe_va in candidates {
+                if let Some(probe) = probes.get_mut(&probe_va) {
+                    let restore = probe.armed;
+                    if restore {
+                        probe.armed = false;
+                    }
+                    matched = Some((probe_va, probe.rva, probe.original_byte, restore));
+                    break;
+                }
+            }
+            matched
+        };
+
+        let Some((probe_va, probe_rva, original_byte, restore)) = matched else {
+            return false;
+        };
+
+        if restore {
+            self.restore_guest_gs_breakpoint_probe_byte(probe_va, original_byte);
+        }
+
+        // GS snapshot diagnostics removed — GS is always host TEB now.
+        self.trace(TraceKind::Probe, 0x51A80, probe_rva, probe_va, trap_rip);
+        self.trace(TraceKind::Probe, 0x51A81, 0, 0, 0);
+        self.trace(TraceKind::Probe, 0x51A82, 0, 0, ctx.regs.rsp);
+        push_recent_chain_event(
+            &self.shared.recent_chain_events,
+            alloc::format!(
+                "gsprobe:{:X}:0x{:X}:0x{:X}:0:0:0:0:0:0x{:X}",
+                self.thread_id,
+                probe_rva,
+                probe_va,
+                trap_rip
+            ),
+        );
+        {
+            use litebox::platform::DebugLogProvider as _;
+            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                "NT shim: guest GS breakpoint probe hit tid={} rva=0x{:X} va=0x{:X} trap_rip=0x{:X}{}\n",
+                self.thread_id,
+                probe_rva,
+                probe_va,
+                trap_rip,
+                if restore { "" } else { " (already restored)" },
+            ));
+        }
+        ctx.regs.rip = probe_va;
+        true
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn try_handle_guest_gs_breakpoint_probe(
+        &self,
+        _ctx: &mut litebox_common_linux::ExecutionContext,
+    ) -> bool {
+        false
     }
 
     /// Create a new NT shim entrypoints for a child thread.
     ///
     /// Shares all process-wide state with the parent through `Arc<NtSharedState>`.
     /// The child gets its own per-thread state (init_state, fls_slots, thread_obj).
+    ///
+    /// The caller (nt_create_thread_ex) is responsible for computing the
+    /// entry point and initial register values.  When LdrInitializeThunk is
+    /// available, the entry point is LdrInitializeThunk with RCX=CONTEXT*
+    /// and RDX=ntdll_base.  Otherwise it falls back to RtlUserThreadStart
+    /// or the start routine directly.
     fn new_for_child_thread(
         shared: alloc::sync::Arc<NtSharedState>,
         thread_obj: alloc::sync::Arc<handle_table::ThreadObject>,
         thread_id: u32,
         parent_init: &NtInitState,
-        child_entry: usize,
+        child_entry_point: usize,
         child_stack_top: usize,
         child_teb_va: usize,
-        child_argument: usize,
+        child_initial_rcx: usize,
+        child_initial_rdx: usize,
     ) -> Self {
-        let (entry_point, initial_rcx, initial_rdx, child_thread_argument) =
-            if parent_init.rtl_user_thread_start_va != 0 {
-                (
-                    parent_init.rtl_user_thread_start_va,
-                    child_entry,
-                    child_argument,
-                    None,
-                )
-            } else {
-                (child_entry, 0, 0, Some(child_argument))
-            };
-
+        shared
+            .live_child_thread_count
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        shared
+            .child_threads_created
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let wait_state = WaitState::new(litebox_platform_multiplex::platform());
+        shared
+            .thread_wakers
+            .lock()
+            .insert(thread_id, wait_state.clone_waker());
         Self {
             exit_code: AtomicI32::new(0),
+            exit_requested: core::sync::atomic::AtomicBool::new(false),
             init_state: Some(NtInitState {
-                entry_point,
+                entry_point: child_entry_point,
                 stack_top: child_stack_top,
                 teb_va: child_teb_va,
                 peb_va: parent_init.peb_va,
@@ -1517,17 +3311,60 @@ impl NtShimEntrypoints {
                 guest_va_start: parent_init.guest_va_start,
                 guest_va_end: parent_init.guest_va_end,
                 exe_path: parent_init.exe_path.clone(),
-                initial_rcx,
-                initial_rdx,
+                current_directory: parent_init.current_directory.clone(),
+                initial_rcx: child_initial_rcx,
+                initial_rdx: child_initial_rdx,
                 rtl_user_thread_start_va: parent_init.rtl_user_thread_start_va,
+                ldr_init_thunk_va: parent_init.ldr_init_thunk_va,
                 ki_user_exception_dispatcher_rva: parent_init.ki_user_exception_dispatcher_rva,
             }),
-            child_thread_argument,
             fls_slots: Mutex::new([0usize; 128]),
             thread_obj: Some(thread_obj),
             thread_id,
-            wait_state: WaitState::new(litebox_platform_multiplex::platform()),
+            wait_state,
             seh_forward_count: core::sync::atomic::AtomicU32::new(0),
+            last_guard_page_fault: core::sync::atomic::AtomicBool::new(false),
+            rtl_user_thread_start_syscall_probe_pending: core::sync::atomic::AtomicBool::new(false),
+            trace_ring: core::cell::UnsafeCell::new(trace::TraceRing::new(thread_id)),
+            pending_apc_state: core::cell::UnsafeCell::new(None),
+            shared,
+        }
+    }
+
+    /// Create a shim for a child process's initial thread.
+    ///
+    /// Similar to `new_for_child_thread` but takes a child process's own
+    /// `NtSharedState` (separate from the parent's). The child process runs
+    /// in its own address space with its own handle table.
+    pub(crate) fn new_for_child_process(
+        shared: alloc::sync::Arc<NtSharedState>,
+        thread_id: u32,
+        teb_va: usize,
+    ) -> Self {
+        let thread_obj =
+            alloc::sync::Arc::new(handle_table::ThreadObject::new(thread_id, 0, teb_va));
+        shared
+            .threads_by_id
+            .lock()
+            .insert(thread_id, alloc::sync::Arc::clone(&thread_obj));
+        let wait_state = WaitState::new(litebox_platform_multiplex::platform());
+        shared
+            .thread_wakers
+            .lock()
+            .insert(thread_id, wait_state.clone_waker());
+        Self {
+            exit_code: AtomicI32::new(0),
+            exit_requested: core::sync::atomic::AtomicBool::new(false),
+            init_state: None,
+            fls_slots: Mutex::new([0usize; 128]),
+            thread_obj: Some(thread_obj),
+            thread_id,
+            wait_state,
+            seh_forward_count: core::sync::atomic::AtomicU32::new(0),
+            last_guard_page_fault: core::sync::atomic::AtomicBool::new(false),
+            rtl_user_thread_start_syscall_probe_pending: core::sync::atomic::AtomicBool::new(false),
+            trace_ring: core::cell::UnsafeCell::new(trace::TraceRing::new(thread_id)),
+            pending_apc_state: core::cell::UnsafeCell::new(None),
             shared,
         }
     }
@@ -1586,10 +3423,31 @@ impl NtShimEntrypoints {
         self.shared
             .process_state
             .track_image_mapping(state.image_base, state.image_size);
-        crate::syscalls::section::initialize_static_tls_for_teb(&self.shared, state.teb_va);
+        self.shared
+            .current_directory
+            .lock()
+            .clone_from(&state.current_directory);
+        // Set the exe directory VFS path for NtOpenSection DLL search.
+        // Convert Win32 path C:\Users\...\python.exe → /c/users/.../python
+        {
+            let exe_dir = state.exe_path.rfind('\\').map_or(
+                state.exe_path.as_str(),
+                |i| &state.exe_path[..i],
+            );
+            let vfs_dir = win32_path_to_vfs_dir(exe_dir);
+            *self.shared.exe_directory_vfs.lock() = vfs_dir;
+        }
+        let peb_teb_layout = crate::peb_teb::PebTebLayout::at_base(state.teb_va);
+        *self.shared.csr_state.lock() = CsrState {
+            shared_section_base: peb_teb_layout.static_server_data_va,
+            shared_static_server_data: peb_teb_layout.static_server_data_va,
+            shared_section_size: crate::peb_teb::STATIC_SERVER_DATA_SIZE,
+            server_process_id: 4,
+        };
         if let Some(ref thread_obj) = self.thread_obj {
             thread_obj.set_teb_va(state.teb_va);
         }
+        self.maybe_install_guest_gs_breakpoint_probes(&state);
         self.init_state = Some(state);
     }
 
@@ -1599,26 +3457,108 @@ impl NtShimEntrypoints {
         self.exit_code.load(Ordering::Acquire)
     }
 
+    /// Returns diagnostic thread counters: (created, terminated, live).
+    pub fn thread_diagnostics(&self) -> (u32, u32, u32) {
+        (
+            self.shared.child_threads_created.load(Ordering::Relaxed),
+            self.shared.child_threads_terminated.load(Ordering::Relaxed),
+            self.shared.live_child_thread_count.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Returns the last syscall number for each known thread (for diagnostics).
+    pub fn thread_last_syscalls(&self) -> alloc::vec::Vec<(u32, u32)> {
+        let threads = self.shared.threads_by_id.lock();
+        let mut result = alloc::vec::Vec::new();
+        for (&tid, _) in threads.iter() {
+            let nr = self.shared.thread_last_syscall[(tid as usize) % 64].load(Ordering::Relaxed);
+            result.push((tid, nr));
+        }
+        result
+    }
+
+    /// Creates a thread-safe diagnostic handle that can be shared with a
+    /// watchdog thread while the main thread is inside `run_thread_ref`.
+    pub fn diagnostics(&self) -> ProcessDiagnostics {
+        ProcessDiagnostics {
+            shared: alloc::sync::Arc::clone(&self.shared),
+        }
+    }
+
+    fn mark_process_exit_requested(&self, exit_code: i32) {
+        #[cfg(all(debug_assertions, feature = "trace_debug"))]
+        {
+            use litebox::platform::DebugLogProvider as _;
+            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                "NT shim: mark_process_exit_requested(tid={}, exit_code=0x{:X})\n",
+                self.thread_id,
+                exit_code
+            ));
+        }
+        if !self
+            .shared
+            .process_exit_requested
+            .swap(true, core::sync::atomic::Ordering::AcqRel)
+        {
+            // First thread to request termination stores the exit code.
+            self.shared
+                .process_exit_code
+                .store(exit_code, Ordering::Release);
+        }
+    }
+
     fn mark_current_thread_exited(&self, exit_code: i32) {
+        self.trace(TraceKind::ThreadExit, exit_code as u32, 0, 0, 0);
+        push_recent_chain_event(
+            &self.shared.recent_chain_events,
+            alloc::format!("exit:{}:0x{:X}", self.thread_id, exit_code as u32),
+        );
+        if let Some(ref obj) = self.thread_obj {
+            obj.set_exit_stage(1);
+        }
+        // Dump trace on non-zero exit code (failure path).
+        if exit_code != 0 {
+            self.dump_trace();
+        }
+        #[cfg(all(debug_assertions, feature = "trace_debug"))]
+        {
+            use litebox::platform::DebugLogProvider as _;
+            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                "NT shim: mark_current_thread_exited(tid={}, exit_code=0x{:X})\n",
+                self.thread_id,
+                exit_code
+            ));
+        }
         self.exit_code.store(exit_code, Ordering::Release);
+        self.exit_requested
+            .store(true, core::sync::atomic::Ordering::Release);
+        if let Some(ref obj) = self.thread_obj {
+            obj.set_exit_stage(2);
+        }
 
         let mut seen_mutants = alloc::vec::Vec::new();
         let owned_mutants = {
+            if let Some(ref obj) = self.thread_obj {
+                obj.set_exit_stage(3);
+            }
             let handles = self.shared.handles.lock();
             let mut mutants = alloc::vec::Vec::new();
-            for obj in handles.values() {
-                let handle_table::NtObject::Mutant(mutant) = obj else {
-                    continue;
+            handles.for_each(|_handle, entry| {
+                let handle_table::NtObject::Mutant(mutant) = &entry.object else {
+                    return;
                 };
                 let mutant_ptr = alloc::sync::Arc::as_ptr(mutant) as usize;
                 if seen_mutants.contains(&mutant_ptr) {
-                    continue;
+                    return;
                 }
                 seen_mutants.push(mutant_ptr);
                 mutants.push(alloc::sync::Arc::clone(mutant));
-            }
+            });
             mutants
         };
+        if let Some(ref obj) = self.thread_obj {
+            obj.set_exit_stage(4);
+        }
 
         for mutant in owned_mutants {
             let mut state = mutant.state.lock();
@@ -1632,11 +3572,127 @@ impl NtShimEntrypoints {
         }
 
         if let Some(ref obj) = self.thread_obj {
+            obj.set_exit_stage(5);
             obj.set_exited(exit_code);
+        }
+
+        // If this is a child thread, decrement the live child count and
+        // track completed thread count for diagnostics.
+        // NOTE: We intentionally do NOT trigger process exit when the last
+        // child thread exits.  The main thread is typically still alive
+        // (e.g. waiting on NtWaitForSingleObject for the child handle) and
+        // must be allowed to continue executing guest code.  Process exit
+        // is only initiated by explicit NtTerminateProcess calls from the
+        // guest.  The previous "last child → force exit" logic caused
+        // Bug A: main thread was prematurely terminated after t.join().
+        if self.thread_id != self.shared.main_thread_id {
+            self.shared
+                .child_threads_terminated
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            self.shared
+                .live_child_thread_count
+                .fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+        }
+        if let Some(ref obj) = self.thread_obj {
+            obj.set_exit_stage(6);
         }
     }
 
-    fn cleanup_current_thread_resources(&self) {
+    fn mark_current_thread_exited_as_process_exit(&self, exit_code: i32) {
+        self.mark_process_exit_requested(exit_code);
+        // Dump trace on non-zero exit (failure/crash) for post-mortem analysis.
+        if exit_code != 0 {
+            self.dump_trace();
+        }
+        self.mark_current_thread_exited(exit_code);
+    }
+
+    /// Verify and repair implicit TLS for a child thread after
+    /// LdrpInitializeThread completes.
+    ///
+    /// LdrpInitializeThread allocates per-thread TLS storage and copies the
+    /// `.tls` template data from each module's PE image.  In the sandbox, this
+    /// may intermittently fail (e.g., LdrpInitializeThread may overwrite the
+    /// pre-allocated array with a larger one but skip the data copy for modules
+    /// it considers already initialized).  This method checks every known TLS
+    /// slot and, if the data block is NULL or the first bytes are all zeros
+    /// (indicating a failed template copy), re-copies the template data in
+    /// place.
+    fn repair_child_thread_tls(&self, teb_va: usize, templates: &[TlsTemplateEntry]) {
+        let Some(thread_obj) = self.thread_obj.as_ref() else {
+            return;
+        };
+        if teb_va == 0 || templates.is_empty() {
+            thread_obj.set_tls_repair_stats(0, 0, 0, 0);
+            return;
+        }
+        if !is_addr_committed(teb_va + crate::peb_teb::teb_offsets::TLS_POINTER) {
+            thread_obj.set_tls_repair_stats(0, 0, 0, 0);
+            return;
+        }
+        let tls_array_ptr = unsafe {
+            core::ptr::read((teb_va + crate::peb_teb::teb_offsets::TLS_POINTER) as *const usize)
+        };
+        if tls_array_ptr == 0 || !is_addr_committed(tls_array_ptr) {
+            thread_obj.set_tls_repair_stats(tls_array_ptr, 0, 0, 0);
+            return;
+        }
+        let mut recopied = 0u32;
+        let mut null_slots = 0u32;
+        let mut skipped = 0u32;
+        for t in templates {
+            let slot_va = tls_array_ptr + (t.tls_index as usize) * core::mem::size_of::<usize>();
+            if !is_addr_committed(slot_va) {
+                skipped = skipped.saturating_add(1);
+                continue;
+            }
+            let block_va = unsafe { core::ptr::read(slot_va as *const usize) };
+            if block_va == 0 || !is_addr_committed(block_va) {
+                // Slot is NULL — TLS was not allocated for this module.
+                // We cannot fix this without allocating memory.
+                null_slots = null_slots.saturating_add(1);
+                continue;
+            }
+            // Check whether the template data was copied: if the first 8 bytes
+            // of the template are non-zero but the block is all-zero, re-copy.
+            if t.template_size > 0 && t.template_va != 0 {
+                let block_size = match t.template_size.checked_add(t.zero_fill as usize) {
+                    Some(s) => s,
+                    None => {
+                        skipped = skipped.saturating_add(1);
+                        continue;
+                    }
+                };
+                if !is_addr_range_committed(block_va, block_size.min(8)) {
+                    skipped = skipped.saturating_add(1);
+                    continue;
+                }
+                if !is_addr_range_committed(t.template_va, t.template_size) {
+                    skipped = skipped.saturating_add(1);
+                    continue;
+                }
+                let first_template_byte = unsafe { core::ptr::read(t.template_va as *const u8) };
+                let first_block_byte = unsafe { core::ptr::read(block_va as *const u8) };
+                // If the template has non-zero data but the block starts with
+                // zero, re-copy the template.  This catches the case where
+                // LdrpInitializeThread allocated fresh (zeroed) storage but
+                // didn't copy the initial values.
+                if first_template_byte != 0 && first_block_byte == 0 {
+                    let _ = unsafe {
+                        litebox::mm::exception_table::memcpy_fallible(
+                            block_va as *mut u8,
+                            t.template_va as *const u8,
+                            t.template_size,
+                        )
+                    };
+                    recopied = recopied.saturating_add(1);
+                }
+            }
+        }
+        thread_obj.set_tls_repair_stats(tls_array_ptr, recopied, null_slots, skipped);
+    }
+
+    pub(crate) fn cleanup_current_thread_resources(&self) {
         let Some(thread_obj) = self.thread_obj.as_ref() else {
             return;
         };
@@ -1645,9 +3701,20 @@ impl NtShimEntrypoints {
         }
 
         self.shared.threads_by_id.lock().remove(&self.thread_id);
+        self.shared.thread_wakers.lock().remove(&self.thread_id);
+        self.shared
+            .thread_interrupt_handles
+            .lock()
+            .remove(&self.thread_id);
 
         let teb_va = thread_obj.teb_va();
         if teb_va == 0 {
+            return;
+        }
+        if !is_addr_committed(teb_va + peb_teb::teb_offsets::STACK_BASE)
+            || !is_addr_committed(teb_va + peb_teb::teb_offsets::STACK_LIMIT)
+            || !is_addr_committed(teb_va + peb_teb::teb_offsets::DEALLOCATION_STACK)
+        {
             return;
         }
 
@@ -1666,7 +3733,6 @@ impl NtShimEntrypoints {
         };
         let stack_len = stack_top.saturating_sub(stack_base);
 
-        crate::syscalls::section::free_thread_tls_allocations(&self.shared, teb_va);
         thread_obj.set_teb_va(0);
 
         use litebox::platform::{RawConstPointer as _, RawPointerProvider};
@@ -1696,6 +3762,205 @@ impl NtShimEntrypoints {
         self.shared.net.call_once(|| net);
     }
 
+    /// Record a trace event into the per-thread ring buffer.
+    ///
+    /// No allocation, no I/O, no locks — just a write to the pre-allocated ring.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    pub(crate) fn trace(&self, kind: TraceKind, code: u32, arg0: usize, arg1: usize, arg2: usize) {
+        // Safety: the trace ring is per-thread and never accessed from other
+        // threads. `NtShimEntrypoints` is !Sync by design (each instance is
+        // owned by exactly one thread).
+        unsafe { &mut *self.trace_ring.get() }.record(kind, code, arg0, arg1, arg2);
+    }
+
+    /// Dump the trace ring buffer to stderr.
+    fn dump_trace(&self) {
+        // Safety: same single-thread-ownership guarantee as `trace()`.
+        unsafe { &*self.trace_ring.get() }.dump();
+    }
+
+    // -----------------------------------------------------------------------
+    // APC delivery helpers
+    // -----------------------------------------------------------------------
+
+    /// Compute the guest VA of the APC return stub.
+    ///
+    /// The APC return stub lives at `trampoline_page + 0x20`.  Since
+    /// `trampoline_code_va` is `trampoline_page + 0x08`, the stub is at
+    /// `trampoline_code_va + 0x18`.
+    fn apc_return_stub_va(&self) -> usize {
+        self.shared.process_state.trampoline_code_va()
+            + (litebox_common_windows::ntdll_rewriter::APC_RETURN_STUB_OFFSET - 0x08)
+    }
+
+    /// Begin user-mode APC delivery.
+    ///
+    /// Saves the current execution context and sets up the guest to execute
+    /// the first APC routine.  When the routine returns (via the APC return
+    /// stub), `handle_apc_return()` dispatches the next APC or restores the
+    /// saved context.
+    ///
+    /// `apcs` must be non-empty.  `return_status` is the NTSTATUS to return
+    /// to the original syscall after all APCs have been delivered.
+    ///
+    /// Returns `(status, false)` — the status is irrelevant because the
+    /// caller must treat this as a context switch (don't overwrite `rax`).
+    fn begin_apc_delivery(
+        &self,
+        ctx: &mut ExecutionContext,
+        mut apcs: alloc::vec::Vec<handle_table::PendingUserApc>,
+        return_status: NtStatus,
+    ) -> (NtStatus, bool) {
+        debug_assert!(!apcs.is_empty());
+
+        // Pop the first APC to dispatch now; the rest go into pending state.
+        let first = apcs.remove(0);
+
+        #[cfg(any(debug_assertions, feature = "trace_debug"))]
+        {
+            use litebox::platform::DebugLogProvider as _;
+            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                "[apc-deliver] begin: {} APCs, first routine=0x{:X} ctx=0x{:X} rip=0x{:X}\n",
+                apcs.len() + 1,
+                first.routine,
+                first.context,
+                ctx.regs.rip,
+            ));
+        }
+
+        // Save the current execution context.
+        let saved_ctx = ctx.clone();
+
+        // Store the pending APC delivery state.
+        // Safety: `pending_apc_state` is per-thread, single-threaded access.
+        unsafe {
+            *self.pending_apc_state.get() = Some(PendingApcDelivery {
+                saved_ctx,
+                remaining: apcs,
+                return_status,
+            });
+        }
+
+        // Set up the guest to call the first APC routine.
+        // Windows x64 APC calling convention:
+        //   rcx = NormalContext
+        //   rdx = SystemArgument1
+        //   r8  = SystemArgument2
+        ctx.regs.rip = first.routine;
+        ctx.regs.rcx = first.context;
+        ctx.regs.rdx = first.system_arg1;
+        ctx.regs.r8 = first.system_arg2;
+
+        // Push the APC return stub address as the return address on the
+        // guest stack.  When the APC routine `ret`s, it will jump to the
+        // stub which sets eax = APC_RETURN_MARKER and re-enters the shim.
+        ctx.regs.rsp -= 8;
+        let ret_addr = self.apc_return_stub_va() as u64;
+        unsafe {
+            core::ptr::write(ctx.regs.rsp as *mut u64, ret_addr);
+        }
+
+        // Allocate shadow space (32 bytes) for the callee, as required by
+        // the Windows x64 calling convention.  The APC routine expects
+        // this space above its return address.
+        ctx.regs.rsp -= 32;
+
+        // Return a marker status.  The caller (EnterShim::syscall) will
+        // detect that `pending_apc_state` is set and treat this as a
+        // context switch, skipping the rax writeback.
+        (NtStatus::STATUS_SUCCESS, false)
+    }
+
+    /// Handle the APC return stub: an APC routine just returned.
+    ///
+    /// If more APCs are pending, dispatch the next one.  Otherwise, restore
+    /// the saved context and return the original wait status.
+    fn handle_apc_return(&self, ctx: &mut ExecutionContext) -> (NtStatus, bool) {
+        // Safety: `pending_apc_state` is per-thread, single-threaded access.
+        let state = unsafe { &mut *self.pending_apc_state.get() };
+
+        let delivery = match state {
+            Some(d) => d,
+            None => {
+                // No pending APC state — shouldn't happen, but be defensive.
+                #[cfg(any(debug_assertions, feature = "trace_debug"))]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(
+                        "[apc-return] ERROR: APC_RETURN_MARKER with no pending state!\n",
+                    );
+                }
+                return (NtStatus::STATUS_SUCCESS, false);
+            }
+        };
+
+        if !delivery.remaining.is_empty() {
+            // Dispatch the next APC.
+            let next = delivery.remaining.remove(0);
+
+            #[cfg(any(debug_assertions, feature = "trace_debug"))]
+            {
+                use litebox::platform::DebugLogProvider as _;
+                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                    "[apc-return] dispatching next APC: routine=0x{:X} ({} remaining)\n",
+                    next.routine,
+                    delivery.remaining.len(),
+                ));
+            }
+
+            // Set up the guest for the next APC routine.
+            ctx.regs.rip = next.routine;
+            ctx.regs.rcx = next.context;
+            ctx.regs.rdx = next.system_arg1;
+            ctx.regs.r8 = next.system_arg2;
+
+            // Push return address and shadow space.
+            // Note: the previous APC routine has returned, so rsp is back
+            // at the trampoline's view.  We need to set up a fresh call frame.
+            // After returning from the APC stub, rsp points past the
+            // previous return address.  Use the saved rsp from saved_ctx
+            // as the base, then push the APC return stub.
+            ctx.regs.rsp = delivery.saved_ctx.regs.rsp;
+            ctx.regs.rsp -= 8;
+            let ret_addr = self.apc_return_stub_va() as u64;
+            unsafe {
+                core::ptr::write(ctx.regs.rsp as *mut u64, ret_addr);
+            }
+            ctx.regs.rsp -= 32; // shadow space
+
+            // Return: treat as context switch, don't overwrite rax.
+            (NtStatus::STATUS_SUCCESS, false)
+        } else {
+            // All APCs delivered — restore the saved context.
+            let return_status = delivery.return_status;
+            let saved = delivery.saved_ctx.clone();
+
+            #[cfg(any(debug_assertions, feature = "trace_debug"))]
+            {
+                use litebox::platform::DebugLogProvider as _;
+                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                    "[apc-return] all APCs done, restoring ctx rip=0x{:X} status=0x{:X}\n",
+                    saved.regs.rip,
+                    return_status.0 as u32,
+                ));
+            }
+
+            // Clear the pending state.
+            *state = None;
+
+            // Restore the saved execution context.
+            *ctx = saved;
+
+            // Write rax directly: the outer EnterShim::syscall code won't
+            // overwrite rax for nr >= 0x1000 (the APC_RETURN_MARKER is
+            // 0xFFFFFFFE), so we must set it ourselves.
+            ctx.regs.rax = return_status.0 as u32 as usize;
+
+            (return_status, false)
+        }
+    }
+
     /// Dispatch an NT syscall or kernel32 syscall.
     ///
     /// Reads the syscall number from `orig_rax` (the platform's
@@ -1705,6 +3970,11 @@ impl NtShimEntrypoints {
     fn dispatch_syscall(&self, ctx: &mut ExecutionContext) -> (NtStatus, bool) {
         let nr = ctx.regs.orig_rax as u32;
 
+        // Handle APC return stub: the guest APC routine just returned.
+        if nr == litebox_common_windows::ntdll_rewriter::APC_RETURN_MARKER {
+            return self.handle_apc_return(ctx);
+        }
+
         // First try NT syscalls via the rewriter-produced mapping.
         if let Some(map) = self.shared.syscall_map.get()
             && let Some(id) = map.lookup(nr)
@@ -1712,854 +3982,11 @@ impl NtShimEntrypoints {
             return self.dispatch_nt_syscall(id, nr, ctx);
         }
 
-        // Then try kernel32 pseudo-syscalls and win32k syscalls (both in 0x1000+ range).
-        match nr {
-            stub_dlls::K32_GET_STD_HANDLE => {
-                syscalls::k32_get_std_handle(
-                    ctx,
-                    self.shared.stdin_handle,
-                    self.shared.stdout_handle,
-                    self.shared.stderr_handle,
-                );
-                // GetStdHandle returns the handle in rax (already set by the handler),
-                // not an NTSTATUS. Don't overwrite rax in the caller.
-                return (NtStatus::STATUS_SUCCESS, false);
-            }
-            stub_dlls::K32_WRITE_CONSOLE_A => {
-                let status = syscalls::k32_write_console_a(ctx, &self.shared.handles.lock());
-                return (status, false);
-            }
-            stub_dlls::K32_WRITE_CONSOLE_W => {
-                let status = syscalls::k32_write_console_w(ctx, &self.shared.handles.lock());
-                return (status, false);
-            }
-            stub_dlls::K32_EXIT_PROCESS => {
-                let (status, terminate, exit_code) = syscalls::k32_exit_process(ctx);
-                if terminate {
-                    self.exit_code.store(exit_code, Ordering::Release);
-                }
-                return (status, terminate);
-            }
-            stub_dlls::K32_GET_COMMAND_LINE_W => {
-                // GetCommandLineW returns a pointer to the UNICODE_STRING
-                // buffer inside RTL_USER_PROCESS_PARAMETERS.
-                if let Some(state) = &self.init_state {
-                    let buf_va = state.process_params_va
-                        + peb_teb::process_params_offsets::COMMAND_LINE_BUFFER;
-                    // Read the Buffer pointer from the UNICODE_STRING struct.
-                    // Safety: guest memory is directly accessible on userland.
-                    let ptr = unsafe { *(buf_va as *const u64) };
-                    ctx.regs.rax = ptr as usize;
-                    #[cfg(debug_assertions)]
-                    {
-                        use litebox::platform::DebugLogProvider as _;
-                        let cmdline = read_wide_string_checked(
-                            &self.shared.process_state.pm,
-                            ptr as usize,
-                            state.guest_va_start,
-                            state.guest_va_end,
-                            MAX_WIDE_STRING_CHARS,
-                        );
-                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                            "NT shim: GetCommandLineW -> ptr=0x{ptr:X} value={cmdline:?}\n"
-                        ));
-                    }
-                } else {
-                    ctx.regs.rax = 0;
-                }
-                return (NtStatus::STATUS_SUCCESS, false);
-            }
-            stub_dlls::K32_GET_COMMAND_LINE_A => {
-                // GetCommandLineA ΓÇö return pointer to the ANSI command line
-                // buffer that was built alongside the UTF-16 version in the
-                // PEB/TEB region.
-                if let Some(state) = &self.init_state {
-                    ctx.regs.rax = state.cmdline_ansi_va;
-                    #[cfg(debug_assertions)]
-                    {
-                        use litebox::platform::DebugLogProvider as _;
-                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                            "NT shim: GetCommandLineA -> ptr=0x{:X}\n",
-                            state.cmdline_ansi_va
-                        ));
-                    }
-                } else {
-                    ctx.regs.rax = 0;
-                }
-                return (NtStatus::STATUS_SUCCESS, false);
-            }
-            stub_dlls::K32_GET_MODULE_HANDLE_W => {
-                // GetModuleHandleW(lpModuleName).
-                // NULL ΓåÆ image base of the main executable.
-                // Non-null ΓåÆ case-insensitive lookup in loaded modules.
-                let module_name_va = ctx.regs.r10; // arg0
-                if module_name_va == 0 {
-                    if let Some(state) = &self.init_state {
-                        ctx.regs.rax = state.image_base;
-                    } else {
-                        ctx.regs.rax = 0;
-                    }
-                } else if let Some(state) = &self.init_state {
-                    // Read the UTF-16LE module name from guest memory,
-                    // validating the pointer against the guest VA range.
-                    let name = read_wide_string_checked(
-                        &self.shared.process_state.pm,
-                        module_name_va,
-                        state.guest_va_start,
-                        state.guest_va_end,
-                        MAX_WIDE_STRING_CHARS,
-                    );
-                    if let Some(name) = name {
-                        // Case-insensitive match against known modules.
-                        // Also strip any leading path components so both
-                        // "kernel32.dll" and "C:\Windows\System32\kernel32.dll"
-                        // match.
-                        let name_lower = name.to_ascii_lowercase();
-                        let basename = name_lower
-                            .rsplit_once('\\')
-                            .map_or(name_lower.as_str(), |(_, b)| b);
-                        let found = state
-                            .module_bases
-                            .iter()
-                            .find(|m| m.name.to_ascii_lowercase() == basename);
-                        ctx.regs.rax = found.map_or(0, |m| m.base_address);
-                        if ctx.regs.rax == 0 {
-                            log_unimplemented!("GetModuleHandleW({:?}) not found", name);
-                        }
-                    } else {
-                        // Unterminated or invalid pointer ΓÇö return NULL.
-                        log_unimplemented!(
-                            "GetModuleHandleW: bad lpModuleName VA 0x{:X}",
-                            module_name_va
-                        );
-                        ctx.regs.rax = 0;
-                    }
-                } else {
-                    ctx.regs.rax = 0;
-                }
-                return (NtStatus::STATUS_SUCCESS, false);
-            }
-            // --- Phase 2: Heap ---
-            stub_dlls::K32_GET_PROCESS_HEAP => {
-                syscalls::heap::k32_get_process_heap(ctx);
-                return (NtStatus::STATUS_SUCCESS, false);
-            }
-            stub_dlls::K32_HEAP_ALLOC => {
-                let status = syscalls::heap::k32_heap_alloc(ctx, &self.shared.process_state.pm);
-                return (status, false);
-            }
-            stub_dlls::K32_HEAP_FREE => {
-                let status = syscalls::heap::k32_heap_free(ctx, &self.shared.process_state.pm);
-                return (status, false);
-            }
-            stub_dlls::K32_HEAP_REALLOC => {
-                let status = syscalls::heap::k32_heap_realloc(ctx, &self.shared.process_state.pm);
-                return (status, false);
-            }
-            stub_dlls::K32_HEAP_SIZE => {
-                let status = syscalls::heap::k32_heap_size(ctx);
-                return (status, false);
-            }
-            // --- Phase 2: VirtualAlloc/Free/Protect/Query ---
-            stub_dlls::K32_VIRTUAL_ALLOC => {
-                let status =
-                    syscalls::k32_handlers::k32_virtual_alloc(ctx, &self.shared.process_state);
-                return (status, false);
-            }
-            stub_dlls::K32_VIRTUAL_FREE => {
-                let status =
-                    syscalls::k32_handlers::k32_virtual_free(ctx, &self.shared.process_state);
-                return (status, false);
-            }
-            stub_dlls::K32_VIRTUAL_PROTECT => {
-                let status =
-                    syscalls::k32_handlers::k32_virtual_protect(ctx, &self.shared.process_state.pm);
-                return (status, false);
-            }
-            stub_dlls::K32_VIRTUAL_QUERY => {
-                let status =
-                    syscalls::k32_handlers::k32_virtual_query(ctx, &self.shared.process_state.pm);
-                return (status, false);
-            }
-            // --- Phase 2: System info ---
-            stub_dlls::K32_GET_SYSTEM_INFO => {
-                let status = syscalls::k32_handlers::k32_get_system_info(ctx);
-                return (status, false);
-            }
-            stub_dlls::K32_IS_PROCESSOR_FEATURE => {
-                let status = syscalls::k32_handlers::k32_is_processor_feature(ctx);
-                return (status, false);
-            }
-            stub_dlls::K32_GET_SYSTEM_TIME_AS_FT => {
-                let status = syscalls::k32_handlers::k32_get_system_time_as_ft(ctx);
-                return (status, false);
-            }
-            stub_dlls::K32_QUERY_PERF_COUNTER => {
-                let status = syscalls::k32_handlers::k32_query_perf_counter(ctx);
-                return (status, false);
-            }
-            stub_dlls::K32_QUERY_PERF_FREQUENCY => {
-                let status = syscalls::k32_handlers::k32_query_perf_frequency(ctx);
-                return (status, false);
-            }
-            // --- Phase 2: TLS ---
-            stub_dlls::K32_TLS_ALLOC => {
-                let status = syscalls::k32_handlers::k32_tls_alloc(
-                    ctx,
-                    &mut self.shared.tls_next.lock(),
-                    &mut self.shared.tls_free_list.lock(),
-                );
-                return (status, false);
-            }
-            stub_dlls::K32_TLS_GET_VALUE => {
-                let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
-                let status = syscalls::k32_handlers::k32_tls_get_value(ctx, teb_va);
-                return (status, false);
-            }
-            stub_dlls::K32_TLS_SET_VALUE => {
-                let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
-                let status = syscalls::k32_handlers::k32_tls_set_value(
-                    ctx,
-                    teb_va,
-                    &self.shared.process_state,
-                );
-                return (status, false);
-            }
-            stub_dlls::K32_TLS_FREE => {
-                let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
-                let tls_next = *self.shared.tls_next.lock();
-                let status = syscalls::k32_handlers::k32_tls_free(
-                    ctx,
-                    tls_next,
-                    &mut self.shared.tls_free_list.lock(),
-                    teb_va,
-                );
-                return (status, false);
-            }
-            // --- Phase 2: FLS ---
-            stub_dlls::K32_FLS_ALLOC => {
-                let status = syscalls::k32_handlers::k32_fls_alloc(
-                    ctx,
-                    &mut self.shared.fls_next.lock(),
-                    &mut self.shared.fls_free_list.lock(),
-                );
-                return (status, false);
-            }
-            stub_dlls::K32_FLS_GET_VALUE => {
-                let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
-                let status =
-                    syscalls::k32_handlers::k32_fls_get_value(ctx, &self.fls_slots.lock(), teb_va);
-                return (status, false);
-            }
-            stub_dlls::K32_FLS_SET_VALUE => {
-                let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
-                let status = syscalls::k32_handlers::k32_fls_set_value(
-                    ctx,
-                    &mut self.fls_slots.lock(),
-                    teb_va,
-                );
-                return (status, false);
-            }
-            stub_dlls::K32_FLS_FREE => {
-                let fls_next = *self.shared.fls_next.lock();
-                let status = syscalls::k32_handlers::k32_fls_free(
-                    ctx,
-                    fls_next,
-                    &mut self.shared.fls_free_list.lock(),
-                    &mut self.fls_slots.lock(),
-                );
-                return (status, false);
-            }
-            // --- Phase 2: Exception handling ---
-            stub_dlls::K32_SET_UNHANDLED_EXCEPTION_FILTER => {
-                let status = syscalls::k32_handlers::k32_set_unhandled_exception_filter(
-                    ctx,
-                    &mut self.shared.unhandled_exception_filter.lock(),
-                );
-                return (status, false);
-            }
-            stub_dlls::K32_RAISE_EXCEPTION => {
-                let (status, terminate) = syscalls::k32_handlers::k32_raise_exception(ctx);
-                if terminate {
-                    self.exit_code.store(ctx.regs.rax as i32, Ordering::Release);
-                }
-                return (status, terminate);
-            }
-            stub_dlls::K32_UNHANDLED_EXCEPTION_FILTER => {
-                let status = syscalls::k32_handlers::k32_unhandled_exception_filter(ctx);
-                return (status, false);
-            }
-            // --- Phase 2: Environment ---
-            stub_dlls::K32_GET_ENVIRONMENT_STRINGS_W => {
-                let status = syscalls::k32_handlers::k32_get_environment_strings_w(
-                    ctx,
-                    &self.shared.env_vars.lock(),
-                    &self.shared.process_state,
-                    &self.shared.env_block_pool,
-                );
-                return (status, false);
-            }
-            stub_dlls::K32_GET_ENVIRONMENT_VARIABLE_W => {
-                let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
-                let status = syscalls::k32_handlers::k32_get_environment_variable_w(
-                    ctx,
-                    &self.shared.env_vars.lock(),
-                    teb_va,
-                );
-                return (status, false);
-            }
-            // --- Phase 2: Module ---
-            stub_dlls::K32_GET_MODULE_FILE_NAME_W => {
-                let (exe_path, module_bases, image_base, teb_va) =
-                    if let Some(s) = self.init_state.as_ref() {
-                        (
-                            s.exe_path.as_str(),
-                            s.module_bases.as_slice(),
-                            s.image_base,
-                            s.teb_va,
-                        )
-                    } else {
-                        ("C:\\app.exe", &[][..], 0usize, 0usize)
-                    };
-                let status = syscalls::k32_handlers::k32_get_module_file_name_w(
-                    ctx,
-                    exe_path,
-                    module_bases,
-                    image_base,
-                    teb_va,
-                );
-                return (status, false);
-            }
-
-            // --- String conversion ---
-            stub_dlls::K32_MULTI_BYTE_TO_WIDE_CHAR => {
-                let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
-                let status = syscalls::k32_handlers::k32_multi_byte_to_wide_char(ctx, teb_va);
-                return (status, false);
-            }
-            stub_dlls::K32_WIDE_CHAR_TO_MULTI_BYTE => {
-                let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
-                let status = syscalls::k32_handlers::k32_wide_char_to_multi_byte(ctx, teb_va);
-                return (status, false);
-            }
-            stub_dlls::K32_GET_CP_INFO => {
-                let status = syscalls::k32_handlers::k32_get_cp_info(ctx);
-                return (status, false);
-            }
-            stub_dlls::K32_GET_STRING_TYPE_W => {
-                let status = syscalls::k32_handlers::k32_get_string_type_w(ctx);
-                return (status, false);
-            }
-            stub_dlls::K32_LC_MAP_STRING_W => {
-                let status = syscalls::k32_handlers::k32_lc_map_string_w(ctx);
-                return (status, false);
-            }
-            stub_dlls::K32_COMPARE_STRING_W => {
-                let status = syscalls::k32_handlers::k32_compare_string_w(ctx);
-                return (status, false);
-            }
-
-            // --- Kernel32 file I/O wrappers ---
-            stub_dlls::K32_CREATE_FILE_W => {
-                let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
-                let cwd = self.shared.current_directory.lock();
-                let status = syscalls::k32_handlers::k32_create_file_w(
-                    ctx,
-                    &mut self.shared.handles.lock(),
-                    teb_va,
-                    &cwd,
-                    &self.shared,
-                );
-                return (status, false);
-            }
-            stub_dlls::K32_READ_FILE => {
-                let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
-                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
-                let h_file = args.arg0 as u32;
-
-                // Snapshot handle info under lock, then drop lock before I/O
-                // so that potentially blocking reads (UNC, pipes) don't stall
-                // the global handle table.
-                enum ReadTarget {
-                    VfsFile {
-                        raw_fd: usize,
-                        position: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
-                    },
-                    Console,
-                }
-                let target = {
-                    let handles = self.shared.handles.lock();
-                    match handles.get(h_file) {
-                        Some(crate::handle_table::NtObject::File {
-                            raw_fd, position, ..
-                        }) => ReadTarget::VfsFile {
-                            raw_fd: *raw_fd,
-                            position: position.clone(),
-                        },
-                        Some(crate::handle_table::NtObject::ConsoleInput) => ReadTarget::Console,
-                        _ => {
-                            syscalls::k32_handlers::set_guest_last_error(teb_va, 6);
-                            ctx.regs.rax = 0;
-                            return (NtStatus::STATUS_SUCCESS, false);
-                        }
-                    }
-                };
-                // Handle lock dropped.
-                let status = match target {
-                    ReadTarget::VfsFile { raw_fd, position } => {
-                        syscalls::k32_handlers::k32_read_file_vfs(
-                            ctx,
-                            raw_fd,
-                            &position,
-                            teb_va,
-                            &self.shared,
-                        )
-                    }
-                    ReadTarget::Console => syscalls::k32_handlers::k32_read_file_console(
-                        ctx,
-                        teb_va,
-                        &self.shared.console_input_pending,
-                    ),
-                };
-                return (status, false);
-            }
-            stub_dlls::K32_WRITE_FILE => {
-                let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
-                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
-                let h_file = args.arg0 as u32;
-
-                // Snapshot handle info under lock, drop before I/O.
-                enum WriteTarget {
-                    Console {
-                        is_stderr: bool,
-                    },
-                    VfsFile {
-                        raw_fd: usize,
-                        position: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
-                    },
-                }
-                let target = {
-                    let handles = self.shared.handles.lock();
-                    match handles.get(h_file) {
-                        Some(crate::handle_table::NtObject::ConsoleOutput { is_stderr }) => {
-                            WriteTarget::Console {
-                                is_stderr: *is_stderr,
-                            }
-                        }
-                        Some(crate::handle_table::NtObject::File {
-                            raw_fd, position, ..
-                        }) => WriteTarget::VfsFile {
-                            raw_fd: *raw_fd,
-                            position: position.clone(),
-                        },
-                        _ => {
-                            syscalls::k32_handlers::set_guest_last_error(teb_va, 6);
-                            ctx.regs.rax = 0;
-                            return (NtStatus::STATUS_SUCCESS, false);
-                        }
-                    }
-                };
-                let status = match target {
-                    WriteTarget::Console { is_stderr: _ } => {
-                        syscalls::k32_handlers::k32_write_file_console(ctx)
-                    }
-                    WriteTarget::VfsFile { raw_fd, position } => {
-                        syscalls::k32_handlers::k32_write_file_vfs(
-                            ctx,
-                            raw_fd,
-                            &position,
-                            teb_va,
-                            &self.shared,
-                        )
-                    }
-                };
-                return (status, false);
-            }
-            stub_dlls::K32_CLOSE_HANDLE => {
-                let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
-                let status = syscalls::k32_handlers::k32_close_handle(
-                    ctx,
-                    &mut self.shared.handles.lock(),
-                    teb_va,
-                    &self.shared,
-                );
-                return (status, false);
-            }
-            stub_dlls::K32_GET_FILE_TYPE => {
-                let status =
-                    syscalls::k32_handlers::k32_get_file_type(ctx, &self.shared.handles.lock());
-                return (status, false);
-            }
-            stub_dlls::K32_GET_FILE_SIZE_EX => {
-                let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
-                let status = syscalls::k32_handlers::k32_get_file_size_ex(
-                    ctx,
-                    &self.shared.handles.lock(),
-                    teb_va,
-                    &self.shared,
-                );
-                return (status, false);
-            }
-            stub_dlls::K32_SET_FILE_POINTER_EX => {
-                let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
-                let status = syscalls::k32_handlers::k32_set_file_pointer_ex(
-                    ctx,
-                    &mut self.shared.handles.lock(),
-                    teb_va,
-                    &self.shared,
-                );
-                return (status, false);
-            }
-            stub_dlls::K32_SET_END_OF_FILE => {
-                let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
-                let status = syscalls::k32_handlers::k32_set_end_of_file(
-                    ctx,
-                    &mut self.shared.handles.lock(),
-                    teb_va,
-                    &self.shared,
-                );
-                return (status, false);
-            }
-
-            // --- Console mode ---
-            stub_dlls::K32_GET_CONSOLE_MODE => {
-                let status = syscalls::k32_handlers::k32_get_console_mode(ctx);
-                return (status, false);
-            }
-            stub_dlls::K32_SET_CONSOLE_MODE => {
-                let status = syscalls::k32_handlers::k32_set_console_mode(ctx);
-                return (status, false);
-            }
-            stub_dlls::K32_READ_CONSOLE_W => {
-                let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
-                let handle = ctx.regs.r10 as u32;
-                let is_console_input = matches!(
-                    self.shared.handles.lock().get(handle),
-                    Some(crate::handle_table::NtObject::ConsoleInput)
-                );
-                let status = if is_console_input {
-                    syscalls::k32_handlers::k32_read_console_w(
-                        ctx,
-                        is_console_input,
-                        teb_va,
-                        &self.shared.console_input_pending,
-                    )
-                } else {
-                    syscalls::k32_handlers::set_guest_last_error(teb_va, 6);
-                    ctx.regs.rax = 0;
-                    NtStatus::STATUS_SUCCESS
-                };
-                return (status, false);
-            }
-
-            // --- Version info ---
-            stub_dlls::K32_GET_VERSION_EX_W => {
-                let status = syscalls::k32_handlers::k32_get_version_ex_w(ctx);
-                return (status, false);
-            }
-
-            // --- Module loading ---
-            stub_dlls::K32_GET_PROC_ADDRESS => {
-                let (module_bases, teb_va) = if let Some(s) = self.init_state.as_ref() {
-                    (s.module_bases.as_slice(), s.teb_va)
-                } else {
-                    (&[][..], 0usize)
-                };
-                let status =
-                    syscalls::k32_handlers::k32_get_proc_address(ctx, module_bases, teb_va);
-                return (status, false);
-            }
-            stub_dlls::K32_LOAD_LIBRARY_EX_W => {
-                let (module_bases, teb_va) = if let Some(s) = self.init_state.as_ref() {
-                    (s.module_bases.as_slice(), s.teb_va)
-                } else {
-                    (&[][..], 0usize)
-                };
-                let status =
-                    syscalls::k32_handlers::k32_load_library_ex_w(ctx, module_bases, teb_va);
-                return (status, false);
-            }
-
-            // --- Debug output ---
-            stub_dlls::K32_OUTPUT_DEBUG_STRING_A => {
-                let status = syscalls::k32_handlers::k32_output_debug_string_a(ctx);
-                return (status, false);
-            }
-            stub_dlls::K32_OUTPUT_DEBUG_STRING_W => {
-                let status = syscalls::k32_handlers::k32_output_debug_string_w(ctx);
-                return (status, false);
-            }
-
-            // --- Heap (additional) ---
-            stub_dlls::K32_HEAP_CREATE => {
-                let status = syscalls::k32_handlers::k32_heap_create(ctx);
-                return (status, false);
-            }
-            stub_dlls::K32_HEAP_DESTROY => {
-                let status = syscalls::k32_handlers::k32_heap_destroy(ctx);
-                return (status, false);
-            }
-
-            // --- Path / directory ---
-            stub_dlls::K32_GET_FULL_PATH_NAME_W => {
-                let cwd = self.shared.current_directory.lock();
-                let status = syscalls::k32_handlers::k32_get_full_path_name_w(ctx, &cwd);
-                return (status, false);
-            }
-            stub_dlls::K32_GET_TEMP_PATH_W => {
-                let status = syscalls::k32_handlers::k32_get_temp_path_w(ctx);
-                return (status, false);
-            }
-            stub_dlls::K32_GET_CURRENT_DIRECTORY_W => {
-                let cwd = self.shared.current_directory.lock();
-                let status = syscalls::k32_handlers::k32_get_current_directory_w(ctx, &cwd);
-                return (status, false);
-            }
-            stub_dlls::K32_SET_CURRENT_DIRECTORY_W => {
-                let mut cwd = self.shared.current_directory.lock();
-                let status = syscalls::k32_handlers::k32_set_current_directory_w(
-                    ctx,
-                    &mut cwd,
-                    &self.shared,
-                );
-                return (status, false);
-            }
-
-            // --- Handle duplication ---
-            stub_dlls::K32_DUPLICATE_HANDLE => {
-                let status = syscalls::k32_handlers::k32_duplicate_handle(
-                    ctx,
-                    &mut self.shared.handles.lock(),
-                );
-                return (status, false);
-            }
-
-            // --- Environment (additional) ---
-            stub_dlls::K32_SET_ENVIRONMENT_VARIABLE_W => {
-                let status = syscalls::k32_handlers::k32_set_environment_variable_w(
-                    ctx,
-                    &mut self.shared.env_vars.lock(),
-                );
-                return (status, false);
-            }
-            stub_dlls::K32_FREE_ENVIRONMENT_STRINGS_W => {
-                let status = syscalls::k32_handlers::k32_free_environment_strings_w(
-                    ctx,
-                    &self.shared.process_state,
-                    &self.shared.env_block_pool,
-                );
-                return (status, false);
-            }
-
-            // --- Console handle ---
-            stub_dlls::K32_SET_STD_HANDLE => {
-                let status = syscalls::k32_handlers::k32_set_std_handle(ctx);
-                return (status, false);
-            }
-
-            // --- File search ---
-            stub_dlls::K32_FIND_FIRST_FILE_EX_W => {
-                let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
-                let cwd = self.shared.current_directory.lock();
-                let status = syscalls::k32_handlers::k32_find_first_file_ex_w(
-                    ctx,
-                    &mut self.shared.handles.lock(),
-                    teb_va,
-                    &cwd,
-                    &self.shared,
-                );
-                return (status, false);
-            }
-            stub_dlls::K32_FIND_NEXT_FILE_W => {
-                let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
-                let status = syscalls::k32_handlers::k32_find_next_file_w(
-                    ctx,
-                    &mut self.shared.handles.lock(),
-                    teb_va,
-                );
-                return (status, false);
-            }
-            stub_dlls::K32_FIND_CLOSE => {
-                let status = syscalls::k32_handlers::k32_find_close(
-                    ctx,
-                    &mut self.shared.handles.lock(),
-                    &self.shared,
-                );
-                return (status, false);
-            }
-
-            // --- SEH / unwinding ---
-            stub_dlls::K32_RTL_CAPTURE_CONTEXT => {
-                let status = syscalls::k32_handlers::k32_rtl_capture_context(ctx);
-                return (status, false);
-            }
-            stub_dlls::K32_RTL_LOOKUP_FUNCTION_ENTRY => {
-                let mods = self
-                    .init_state
-                    .as_ref()
-                    .map_or(&[][..], |s| s.module_bases.as_slice());
-                let status = syscalls::k32_handlers::k32_rtl_lookup_function_entry(ctx, mods);
-                return (status, false);
-            }
-            stub_dlls::K32_RTL_VIRTUAL_UNWIND => {
-                let mods = self
-                    .init_state
-                    .as_ref()
-                    .map_or(&[][..], |s| s.module_bases.as_slice());
-                let status = syscalls::k32_handlers::k32_rtl_virtual_unwind(ctx, mods);
-                return (status, false);
-            }
-            stub_dlls::K32_RTL_UNWIND_EX => {
-                let mods = self
-                    .init_state
-                    .as_ref()
-                    .map_or(&[][..], |s| s.module_bases.as_slice());
-                let status = syscalls::k32_handlers::k32_rtl_unwind_ex(ctx, mods);
-                return (status, false);
-            }
-            stub_dlls::K32_RTL_PC_TO_FILE_HEADER => {
-                let mods = self
-                    .init_state
-                    .as_ref()
-                    .map_or(&[][..], |s| s.module_bases.as_slice());
-                let status = syscalls::k32_handlers::k32_rtl_pc_to_file_header(ctx, mods);
-                return (status, false);
-            }
-            // --- Phase 3B: Sleep ---
-            stub_dlls::K32_SLEEP => {
-                let status = syscalls::k32_handlers::k32_sleep(ctx, &self.wait_cx());
-                return (status, false);
-            }
-            stub_dlls::K32_SLEEP_EX => {
-                let status = syscalls::k32_handlers::k32_sleep_ex(ctx, &self.wait_cx());
-                return (status, false);
-            }
-            // --- Phase 3B: Critical sections ---
-            stub_dlls::K32_INIT_CRITICAL_SECTION => {
-                let status = syscalls::k32_handlers::k32_init_critical_section(ctx);
-                return (status, false);
-            }
-            stub_dlls::K32_INIT_CRITICAL_SECTION_EX => {
-                let status = syscalls::k32_handlers::k32_init_critical_section_ex(ctx);
-                return (status, false);
-            }
-            stub_dlls::K32_INIT_CRITICAL_SECTION_AND_SPIN_COUNT => {
-                let status = syscalls::k32_handlers::k32_init_critical_section_and_spin_count(ctx);
-                return (status, false);
-            }
-            stub_dlls::K32_ENTER_CRITICAL_SECTION => {
-                let status =
-                    syscalls::k32_handlers::k32_enter_critical_section(ctx, self.thread_id);
-                return (status, false);
-            }
-            stub_dlls::K32_TRY_ENTER_CRITICAL_SECTION => {
-                let status =
-                    syscalls::k32_handlers::k32_try_enter_critical_section(ctx, self.thread_id);
-                return (status, false);
-            }
-            stub_dlls::K32_LEAVE_CRITICAL_SECTION => {
-                let status =
-                    syscalls::k32_handlers::k32_leave_critical_section(ctx, self.thread_id);
-                return (status, false);
-            }
-            stub_dlls::K32_DELETE_CRITICAL_SECTION => {
-                let status = syscalls::k32_handlers::k32_delete_critical_section(ctx);
-                return (status, false);
-            }
-            // --- Phase 3B: Wait APIs ---
-            stub_dlls::K32_WAIT_FOR_SINGLE_OBJECT | stub_dlls::K32_WAIT_FOR_SINGLE_OBJECT_EX => {
-                // WaitForSingleObject(hHandle, dwMilliseconds)
-                // WaitForSingleObjectEx(hHandle, dwMilliseconds, bAlertable)
-                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
-                let handle = args.arg0 as u32;
-                let millis = args.arg1 as u32;
-                let waitable = {
-                    let handles = self.shared.handles.lock();
-                    syscalls::sync::lookup_waitable(&handles, handle)
-                };
-                let timeout = if millis == 0xFFFF_FFFF {
-                    None // INFINITE
-                } else {
-                    Some(core::time::Duration::from_millis(u64::from(millis)))
-                };
-                let status = match waitable {
-                    Some(w) => match &w {
-                        syscalls::sync::Waitable::Event(e) => {
-                            syscalls::sync::wait_event_with_timeout(e, timeout, &self.wait_cx())
-                        }
-                        syscalls::sync::Waitable::Semaphore(s) => {
-                            syscalls::sync::wait_semaphore_with_timeout(s, timeout, &self.wait_cx())
-                        }
-                        syscalls::sync::Waitable::Mutant(m) => {
-                            syscalls::sync::wait_mutant_with_timeout(
-                                m,
-                                timeout,
-                                &self.wait_cx(),
-                                self.thread_id,
-                            )
-                        }
-                        syscalls::sync::Waitable::Thread(t) => {
-                            syscalls::sync::wait_thread_with_timeout(t, timeout, &self.wait_cx())
-                        }
-                    },
-                    None => NtStatus::STATUS_INVALID_HANDLE,
-                };
-                // Return value in rax: WAIT_OBJECT_0 (0) on success, WAIT_TIMEOUT (258)
-                ctx.regs.rax = match status {
-                    NtStatus::STATUS_SUCCESS => 0,     // WAIT_OBJECT_0
-                    NtStatus::STATUS_TIMEOUT => 0x102, // WAIT_TIMEOUT
-                    _ => 0xFFFF_FFFF,                  // WAIT_FAILED
-                };
-                return (NtStatus::STATUS_SUCCESS, false);
-            }
-            // --- Thread identity ---
-            stub_dlls::K32_GET_CURRENT_THREAD_ID => {
-                ctx.regs.rax = self.thread_id as usize;
-                return (NtStatus::STATUS_SUCCESS, false);
-            }
-            // --- Registry stubs ---
-            stub_dlls::K32_REG_OPEN_KEY_EX_W => {
-                // RegOpenKeyExW / RegOpenKeyExA ΓÇö always return ERROR_FILE_NOT_FOUND.
-                // In a sandbox, no registry keys exist.
-                ctx.regs.rax = 2; // ERROR_FILE_NOT_FOUND
-                return (NtStatus::STATUS_SUCCESS, false);
-            }
-            stub_dlls::K32_REG_QUERY_VALUE_EX_W => {
-                ctx.regs.rax = 2; // ERROR_FILE_NOT_FOUND
-                return (NtStatus::STATUS_SUCCESS, false);
-            }
-            stub_dlls::K32_REG_CLOSE_KEY => {
-                // RegCloseKey ΓÇö always succeeds (nothing to close).
-                ctx.regs.rax = 0; // ERROR_SUCCESS
-                return (NtStatus::STATUS_SUCCESS, false);
-            }
-
-            // --- WinSock (ws2_32) syscalls ---
-            nr if nr >= stub_dlls::WS2_STARTUP && nr < stub_dlls::WS2_END => {
-                let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
-                return syscalls::net::dispatch_ws2_syscall(&self.shared, nr, ctx, teb_va);
-            }
-
-            // --- CSRSS client pseudo-syscalls ---
-            stub_dlls::CSR_CLIENT_CONNECT_TO_SERVER => {
-                // CsrClientConnectToServer was patched into a trampoline
-                // pseudo-syscall.  The trampoline leaves the return address
-                // on the stack, so ctx.regs.rsp is the callee RSP — no
-                // adjustment needed.
-                let status =
-                    syscalls::win32k::csr_client_connect_to_server(ctx, &self.shared.process_state);
-                ctx.regs.rax = status.0 as u32 as usize;
-                return (status, false);
-            }
-
-            _ => {
-                // Win32k syscalls (0x1000-0x1FFF) from rewritten win32u.dll stubs.
-                // Checked here (after K32 match arms) to avoid intercepting K32
-                // pseudo-syscalls which share the same 0x1000+ number space.
-                if nr >= 0x1000 && nr < 0x2000 {
-                    return self.dispatch_win32k_syscall(nr, ctx);
-                }
-            }
+        // Then handle Win32k syscalls routed through rewritten win32u.dll
+        // stubs in the raw 0x1000..0x1FFF range. Their raw numbers are
+        // discovered dynamically from the loaded guest win32u export table.
+        if (0x1000..0x2000).contains(&nr) {
+            return self.dispatch_win32k_syscall(nr, ctx);
         }
 
         // Look up the name from unhandled_stubs if available.
@@ -2577,64 +4004,98 @@ impl NtShimEntrypoints {
         (NtStatus::STATUS_NOT_IMPLEMENTED, false)
     }
 
-    /// Dispatch a Win32k syscall (from rewritten win32u.dll stubs).
+    /// Dispatch a rewritten Win32k syscall from win32u.dll.
     ///
-    /// Like ntdll stubs, these go through the trampoline which leaves the
-    /// return address on the stack, so ctx.regs.rsp is the callee RSP.
-    /// Stack-arg offsets (+0x28 = arg5, +0x30 = arg6) work identically to
-    /// the PE-builder stub path.
-    /// The result NTSTATUS is written directly to rax because the outer
-    /// handler treats nr ≥ 0x1000 as "kernel32" and skips the status write.
+    /// Like ntdll stubs, the trampoline preserves the return address on the
+    /// stack, so stack arguments remain at the normal Windows x64 offsets.
+    /// The 0x1000+ range bypasses the outer NTSTATUS writeback path, so each
+    /// handler here is responsible for leaving the final return value in rax.
     fn dispatch_win32k_syscall(&self, nr: u32, ctx: &mut ExecutionContext) -> (NtStatus, bool) {
-        #[cfg(debug_assertions)]
+        #[cfg(feature = "trace_debug")]
         {
             use litebox::platform::DebugLogProvider as _;
             litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                "NT shim: win32k nr=0x{:04X} r10=0x{:X} rdx=0x{:X} r8=0x{:X}\n",
-                nr,
+                "NT shim: win32k nr=0x{nr:04X} r10=0x{:X} rdx=0x{:X} r8=0x{:X}\n",
                 ctx.regs.r10,
                 ctx.regs.rdx,
                 ctx.regs.r8,
             ));
         }
 
-        let status = match nr {
-            // NtUserGetThreadState — USER32 calls this early in DllMain.
-            // Returns a DWORD_PTR (not NTSTATUS).  0 = no thread state
-            // (thread not connected to win32k subsystem).
-            0x1000 => {
-                ctx.regs.rax = 0;
+        let win32k_id = self
+            .shared
+            .win32k_syscall_map
+            .get()
+            .and_then(|map| map.lookup(nr));
+        let current_teb_va = self
+            .thread_obj
+            .as_ref()
+            .map(|thread| thread.teb_va())
+            .or_else(|| self.init_state.as_ref().map(|init| init.teb_va))
+            .unwrap_or(0);
+
+        let status = match win32k_id {
+            Some(syscalls::win32k::Win32kSyscallId::NtUserGetThreadState) => {
+                syscalls::win32k::nt_user_get_thread_state(
+                    ctx,
+                    &self.shared.process_state,
+                    current_teb_va,
+                )
+            }
+            Some(syscalls::win32k::Win32kSyscallId::NtUserProcessConnect) => {
+                syscalls::win32k::nt_user_process_connect(ctx, &self.shared.process_state)
+            }
+            Some(syscalls::win32k::Win32kSyscallId::NtUserGetDpiForCurrentProcess) => {
+                syscalls::win32k::nt_user_get_dpi_for_current_process(ctx)
+            }
+            Some(syscalls::win32k::Win32kSyscallId::NtUserSetProcessDpiAwarenessContext) => {
+                syscalls::win32k::nt_user_set_process_dpi_awareness_context(ctx)
+            }
+            Some(syscalls::win32k::Win32kSyscallId::NtUserDisableProcessWindowFiltering) => {
+                syscalls::win32k::nt_user_disable_process_window_filtering(ctx)
+            }
+            Some(syscalls::win32k::Win32kSyscallId::NtUserSetProcessMousewheelRoutingMode) => {
+                syscalls::win32k::nt_user_set_process_mousewheel_routing_mode(ctx)
+            }
+            Some(syscalls::win32k::Win32kSyscallId::NtUserLoadUserApiHook) => {
+                syscalls::win32k::nt_user_load_user_api_hook(ctx)
+            }
+            Some(syscalls::win32k::Win32kSyscallId::NtUserRegisterWindowMessage) => {
+                // RegisterWindowMessage returns a unique UINT in 0xC000..0xFFFF.
+                // We allocate from a per-process counter.
+                let id = self
+                    .shared
+                    .next_registered_msg_id
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                ctx.regs.rax = id as usize;
                 NtStatus::STATUS_SUCCESS
             }
-            // NtUserProcessConnect — USER32's DllMain needs this to set up
-            // gSharedInfo.  Without it, gSharedInfo is NULL and USER32 crashes.
-            0x10E3 => syscalls::win32k::nt_user_process_connect(ctx, &self.shared.process_state),
-            // NtGdiInit — called by gdi32full!GdiProcessSetup.
-            0x12E7 => syscalls::win32k::nt_gdi_init(ctx, &self.shared.process_state),
-            // NtGdiInit2 — called by gdi32full!GdiDllInitialize_OLD.
-            // Must return non-NULL or GdiDllInitialize fails → USER32 init fails.
-            0x12E8 => syscalls::win32k::nt_gdi_init2(ctx, &self.shared.process_state),
+            Some(syscalls::win32k::Win32kSyscallId::NtGdiInit) => {
+                syscalls::win32k::nt_gdi_init(ctx, &self.shared.process_state)
+            }
+            Some(syscalls::win32k::Win32kSyscallId::NtGdiInit2) => {
+                syscalls::win32k::nt_gdi_init2(ctx, &self.shared.process_state, current_teb_va)
+            }
+            Some(syscalls::win32k::Win32kSyscallId::NtUserGetSystemMetrics) => {
+                syscalls::win32k::nt_user_get_system_metrics(ctx)
+            }
             _ => {
-                #[cfg(debug_assertions)]
+                #[cfg(feature = "trace_debug")]
                 {
                     use litebox::platform::DebugLogProvider as _;
                     litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                        "NT shim: unhandled win32k syscall 0x{:04X}\n",
-                        nr,
+                        "NT shim: unhandled win32k syscall 0x{nr:04X}\n",
                     ));
                 }
-                // Unknown win32k syscalls are errors, not value-returning
-                // success cases, so surface STATUS_NOT_IMPLEMENTED to the guest.
                 ctx.regs.rax = NtStatus::STATUS_NOT_IMPLEMENTED.raw() as usize;
                 NtStatus::STATUS_NOT_IMPLEMENTED
             }
         };
 
-        // For calls that set rax directly (NtUserGetThreadState etc.),
-        // don't overwrite it with the NTSTATUS.  Only overwrite for calls
-        // that genuinely return NTSTATUS (like NtUserProcessConnect).
-        let returns_ntstatus = matches!(nr, 0x10E3);
-        if returns_ntstatus {
+        if matches!(
+            win32k_id,
+            Some(syscalls::win32k::Win32kSyscallId::NtUserProcessConnect)
+        ) {
             ctx.regs.rax = status.0 as u32 as usize;
         }
 
@@ -2653,6 +4114,84 @@ impl NtShimEntrypoints {
         raw_nr: u32,
         ctx: &mut ExecutionContext,
     ) -> (NtStatus, bool) {
+        #[cfg(feature = "trace_debug")]
+        if let Some(init) = self.init_state.as_ref() {
+            let teb_va = init.teb_va;
+            if teb_va != 0 && is_addr_committed(teb_va + 0x58) {
+                unsafe {
+                    let tls_ptr = core::ptr::read((teb_va + 0x58) as *const u64);
+                    const V8_THREAD_TLS_INDEX_OFFSET: usize = 0x58A85D8;
+                    if let Some(node_mod) = init
+                        .module_bases
+                        .iter()
+                        .find(|m| m.name.eq_ignore_ascii_case("node.exe"))
+                    {
+                        let tls_index_va = node_mod.base_address + V8_THREAD_TLS_INDEX_OFFSET;
+                        if is_addr_committed(tls_index_va)
+                            && is_addr_committed(tls_index_va + 3)
+                            && tls_ptr > 0x10000
+                            && tls_ptr < 0x7FFF_FFFF_FFFF
+                        {
+                            let tls_index = core::ptr::read(tls_index_va as *const u32) as usize;
+                            let slot_va = tls_ptr as usize + tls_index * 8;
+                            if is_addr_committed(slot_va) && is_addr_committed(slot_va + 7) {
+                                let slot_ptr = core::ptr::read(slot_va as *const usize);
+                                let slot_isolate =
+                                    if slot_ptr >= 0x10000 && is_addr_committed(slot_ptr + 0xE7) {
+                                        core::ptr::read((slot_ptr + 0xE0) as *const usize)
+                                    } else {
+                                        0
+                                    };
+                                if slot_isolate >= 0x10000 {
+                                    let isolate_entry_stack =
+                                        if is_addr_committed(slot_isolate + 0xFB8F) {
+                                            core::ptr::read((slot_isolate + 0xFB88) as *const usize)
+                                        } else {
+                                            0
+                                        };
+                                    let allow_heap_depth =
+                                        if is_addr_committed(slot_isolate + 0xF09F) {
+                                            core::ptr::read((slot_isolate + 0xF098) as *const usize)
+                                        } else {
+                                            0
+                                        };
+                                    let allow_heap_flag_a =
+                                        if is_addr_committed(slot_isolate + 0x10EF9) {
+                                            core::ptr::read((slot_isolate + 0x10EF9) as *const u8)
+                                                as usize
+                                        } else {
+                                            0
+                                        };
+                                    let allow_heap_flag_b =
+                                        if is_addr_committed(slot_isolate + 0x10EFA) {
+                                            core::ptr::read((slot_isolate + 0x10EFA) as *const u8)
+                                                as usize
+                                        } else {
+                                            0
+                                        };
+                                    if allow_heap_flag_a == 0 && allow_heap_flag_b == 1 {
+                                        use litebox::platform::DebugLogProvider as _;
+                                        litebox_platform_multiplex::platform().debug_log_print(
+                                            &alloc::format!(
+                                                "[V8-AH-BEFORE] tid={} Before {:?}(0x{:04X}): slot=0x{:X} isolate=0x{:X} depth=0x{:X} entry=0x{:X}\n",
+                                                self.thread_id,
+                                                nt_nr,
+                                                raw_nr,
+                                                slot_ptr,
+                                                slot_isolate,
+                                                allow_heap_depth,
+                                                isolate_entry_stack,
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let result = self.dispatch_nt_syscall_inner(nt_nr, raw_nr, ctx);
 
         #[cfg(debug_assertions)]
@@ -2765,9 +4304,42 @@ impl NtShimEntrypoints {
                     if tls_ptr != prev {
                         use litebox::platform::DebugLogProvider as _;
                         litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                            "[TLS-VEC] After {:?}(0x{:04X}): TEB+0x58 changed 0x{prev:X} → 0x{tls_ptr:X}\n",
-                            nt_nr, raw_nr,
+                            "[TLS-VEC] tid={} After {:?}(0x{:04X}): TEB+0x58 changed 0x{prev:X} → 0x{tls_ptr:X}\n",
+                            self.thread_id, nt_nr, raw_nr,
                         ));
+                        if tls_ptr > 0x10000 && tls_ptr < 0x7FFF_FFFF_FFFF {
+                            let tls_ptr_usize = tls_ptr as usize;
+                            let mut dump =
+                                alloc::string::String::from("  TLS vector qwords [-2..12]:\n");
+                            for slot in -2i32..=12 {
+                                let addr = if slot.is_negative() {
+                                    tls_ptr_usize.saturating_sub(((-slot) as usize) * 8)
+                                } else {
+                                    tls_ptr_usize.saturating_add((slot as usize) * 8)
+                                };
+                                let label = if slot.is_negative() {
+                                    alloc::format!("[{slot}]")
+                                } else {
+                                    alloc::format!("[+{slot}]")
+                                };
+                                if is_addr_range_committed(addr, 8) {
+                                    let value = core::ptr::read(addr as *const u64);
+                                    dump.push_str(&alloc::format!(
+                                        "    {} @ 0x{:X} = 0x{:016X}\n",
+                                        label,
+                                        addr,
+                                        value
+                                    ));
+                                } else {
+                                    dump.push_str(&alloc::format!(
+                                        "    {} @ 0x{:X} = <unmapped>\n",
+                                        label,
+                                        addr
+                                    ));
+                                }
+                            }
+                            litebox_platform_multiplex::platform().debug_log_print(&dump);
+                        }
                         TLS_PTR_PREV.store(tls_ptr, core::sync::atomic::Ordering::Relaxed);
                     }
                     // Also monitor TLS[9] for the combase slot.
@@ -2779,10 +4351,271 @@ impl NtShimEntrypoints {
                         if tls9 != prev9 {
                             use litebox::platform::DebugLogProvider as _;
                             litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                                "[TLS9] After {:?}(0x{:04X}): TLS[9] changed 0x{prev9:X} → 0x{tls9:X}\n",
-                                nt_nr, raw_nr,
+                                "[TLS9] tid={} After {:?}(0x{:04X}): TLS[9] changed 0x{prev9:X} → 0x{tls9:X}\n",
+                                self.thread_id, nt_nr, raw_nr,
                             ));
                             TLS9_PREV.store(tls9, core::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    #[cfg(feature = "trace_debug")]
+                    {
+                        const V8_THREAD_TLS_INDEX_OFFSET: usize = 0x58A85D8;
+                        #[allow(clippy::type_complexity)]
+                        static V8_TLS_PREV: spin::Mutex<
+                            alloc::vec::Vec<(
+                                u32,
+                                usize,
+                                usize,
+                                usize,
+                                usize,
+                                usize,
+                                usize,
+                                usize,
+                                usize,
+                                usize,
+                                usize,
+                            )>,
+                        > = spin::Mutex::new(alloc::vec::Vec::new());
+
+                        if let Some(node_mod) = init
+                            .module_bases
+                            .iter()
+                            .find(|m| m.name.eq_ignore_ascii_case("node.exe"))
+                        {
+                            let tls_index_va = node_mod.base_address + V8_THREAD_TLS_INDEX_OFFSET;
+                            if is_addr_committed(tls_index_va)
+                                && is_addr_committed(tls_index_va + 3)
+                                && tls_ptr > 0x10000
+                                && tls_ptr < 0x7FFF_FFFF_FFFF
+                            {
+                                let tls_index =
+                                    core::ptr::read(tls_index_va as *const u32) as usize;
+                                let slot_va = tls_ptr as usize + tls_index * 8;
+                                if is_addr_committed(slot_va) && is_addr_committed(slot_va + 7) {
+                                    let slot_ptr = core::ptr::read(slot_va as *const usize);
+                                    let per_thread_ptr = if slot_ptr >= 0x10000
+                                        && is_addr_committed(slot_ptr + 0xDF)
+                                    {
+                                        core::ptr::read((slot_ptr + 0xD8) as *const usize)
+                                    } else {
+                                        0
+                                    };
+                                    let per_thread_isolate = if per_thread_ptr >= 0x10000
+                                        && is_addr_committed(per_thread_ptr + 7)
+                                    {
+                                        core::ptr::read(per_thread_ptr as *const usize)
+                                    } else {
+                                        0
+                                    };
+                                    let slot_isolate = if slot_ptr >= 0x10000
+                                        && is_addr_committed(slot_ptr + 0xE7)
+                                    {
+                                        core::ptr::read((slot_ptr + 0xE0) as *const usize)
+                                    } else {
+                                        0
+                                    };
+                                    let isolate_entry_stack = if slot_isolate >= 0x10000
+                                        && is_addr_committed(slot_isolate + 0xFB8F)
+                                    {
+                                        core::ptr::read((slot_isolate + 0xFB88) as *const usize)
+                                    } else {
+                                        0
+                                    };
+                                    let state_byte = if slot_ptr >= 0x10000
+                                        && is_addr_committed(slot_ptr + 0xE8)
+                                    {
+                                        core::ptr::read((slot_ptr + 0xE8) as *const u8) as usize
+                                    } else {
+                                        usize::MAX
+                                    };
+                                    let allow_heap_depth = if slot_isolate >= 0x10000
+                                        && is_addr_committed(slot_isolate + 0xF09F)
+                                    {
+                                        core::ptr::read((slot_isolate + 0xF098) as *const usize)
+                                    } else {
+                                        0
+                                    };
+                                    let allow_heap_flag_a = if slot_isolate >= 0x10000
+                                        && is_addr_committed(slot_isolate + 0x10EF9)
+                                    {
+                                        core::ptr::read((slot_isolate + 0x10EF9) as *const u8)
+                                            as usize
+                                    } else {
+                                        0
+                                    };
+                                    let allow_heap_flag_b = if slot_isolate >= 0x10000
+                                        && is_addr_committed(slot_isolate + 0x10EFA)
+                                    {
+                                        core::ptr::read((slot_isolate + 0x10EFA) as *const u8)
+                                            as usize
+                                    } else {
+                                        0
+                                    };
+                                    let snapshot = (
+                                        tls_index,
+                                        slot_ptr,
+                                        per_thread_ptr,
+                                        per_thread_isolate,
+                                        slot_isolate,
+                                        isolate_entry_stack,
+                                        state_byte,
+                                        allow_heap_depth,
+                                        allow_heap_flag_a,
+                                        allow_heap_flag_b,
+                                    );
+                                    let mut prev = V8_TLS_PREV.lock();
+                                    let changed = if let Some(entry) =
+                                        prev.iter_mut().find(|entry| entry.0 == self.thread_id)
+                                    {
+                                        if entry.1 != snapshot.0
+                                            || entry.2 != snapshot.1
+                                            || entry.3 != snapshot.2
+                                            || entry.4 != snapshot.3
+                                            || entry.5 != snapshot.4
+                                            || entry.6 != snapshot.5
+                                            || entry.7 != snapshot.6
+                                            || entry.8 != snapshot.7
+                                            || entry.9 != snapshot.8
+                                            || entry.10 != snapshot.9
+                                        {
+                                            *entry = (
+                                                self.thread_id,
+                                                snapshot.0,
+                                                snapshot.1,
+                                                snapshot.2,
+                                                snapshot.3,
+                                                snapshot.4,
+                                                snapshot.5,
+                                                snapshot.6,
+                                                snapshot.7,
+                                                snapshot.8,
+                                                snapshot.9,
+                                            );
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        prev.push((
+                                            self.thread_id,
+                                            snapshot.0,
+                                            snapshot.1,
+                                            snapshot.2,
+                                            snapshot.3,
+                                            snapshot.4,
+                                            snapshot.5,
+                                            snapshot.6,
+                                            snapshot.7,
+                                            snapshot.8,
+                                            snapshot.9,
+                                        ));
+                                        true
+                                    };
+                                    if changed {
+                                        use litebox::platform::DebugLogProvider as _;
+                                        let state_desc = if state_byte == usize::MAX {
+                                            alloc::string::String::from("??")
+                                        } else {
+                                            alloc::format!("{:02X}", state_byte)
+                                        };
+                                        litebox_platform_multiplex::platform().debug_log_print(
+                                            &alloc::format!(
+                                                "[V8-TLS] tid={} After {:?}(0x{:04X}): idx={} slot=0x{:X} per_thread=0x{:X} per_thread[0]=0x{:X} slot+0xE0=0x{:X} isolate+0xFB88=0x{:X} isolate+0xF098=0x{:X} isolate+0x10EF9=0x{:02X} isolate+0x10EFA=0x{:02X} slot+0xE8=0x{}\n",
+                                                self.thread_id,
+                                                nt_nr,
+                                                raw_nr,
+                                                tls_index,
+                                                slot_ptr,
+                                                per_thread_ptr,
+                                                per_thread_isolate,
+                                                slot_isolate,
+                                                isolate_entry_stack,
+                                                allow_heap_depth,
+                                                allow_heap_flag_a,
+                                                allow_heap_flag_b,
+                                                state_desc,
+                                            ),
+                                        );
+                                        if slot_isolate >= 0x10000
+                                            && allow_heap_flag_a == 0
+                                            && allow_heap_flag_b == 1
+                                        {
+                                            litebox_platform_multiplex::platform().debug_log_print(
+                                                &alloc::format!(
+                                                    "[V8-AH] tid={} After {:?}(0x{:04X}): slot=0x{:X} isolate=0x{:X} depth=0x{:X} entry=0x{:X}\n",
+                                                    self.thread_id,
+                                                    nt_nr,
+                                                    raw_nr,
+                                                    slot_ptr,
+                                                    slot_isolate,
+                                                    allow_heap_depth,
+                                                    isolate_entry_stack,
+                                                ),
+                                            );
+                                        }
+                                        if slot_isolate >= 0x10000 && isolate_entry_stack == 0 {
+                                            let describe_module = |addr: usize| {
+                                                init.module_bases
+                                                    .iter()
+                                                    .find(|m| {
+                                                        addr >= m.base_address
+                                                            && addr
+                                                                < m.base_address
+                                                                    .saturating_add(m.image_size)
+                                                    })
+                                                    .map(|m| {
+                                                        alloc::format!(
+                                                            "{}+0x{:X}",
+                                                            m.name,
+                                                            addr.saturating_sub(m.base_address)
+                                                        )
+                                                    })
+                                                    .unwrap_or_else(|| alloc::format!("0x{addr:X}"))
+                                            };
+                                            let mut guest_stack = alloc::string::String::new();
+                                            if ctx.regs.rsp >= 0x10000 {
+                                                for i in 0..12usize {
+                                                    let slot_va = ctx.regs.rsp as usize + i * 8;
+                                                    if !is_addr_committed(slot_va)
+                                                        || !is_addr_committed(slot_va + 7)
+                                                    {
+                                                        continue;
+                                                    }
+                                                    let value =
+                                                        core::ptr::read(slot_va as *const usize);
+                                                    let value_desc = if value >= 0x10000 {
+                                                        let desc = describe_module(value);
+                                                        if desc.starts_with("0x") {
+                                                            alloc::string::String::new()
+                                                        } else {
+                                                            alloc::format!(" ({desc})")
+                                                        }
+                                                    } else {
+                                                        alloc::string::String::new()
+                                                    };
+                                                    guest_stack.push_str(&alloc::format!(
+                                                        "    [rsp+0x{:02X}] = 0x{:X}{}\n",
+                                                        i * 8,
+                                                        value,
+                                                        value_desc,
+                                                    ));
+                                                }
+                                            }
+                                            litebox_platform_multiplex::platform().debug_log_print(
+                                                &alloc::format!(
+                                                    "[V8-BAD] tid={} After {:?}(0x{:04X}): next_rip={} rsp=0x{:X}\n{}",
+                                                    self.thread_id,
+                                                    nt_nr,
+                                                    raw_nr,
+                                                    describe_module(ctx.regs.rip as usize),
+                                                    ctx.regs.rsp,
+                                                    guest_stack,
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -2795,259 +4628,529 @@ impl NtShimEntrypoints {
     /// Handle NtSetInformationProcess(ProcessTlsInformation, 0x23).
     ///
     /// ntdll calls this to atomically replace each thread's TLS vector
-    /// (TEB+0x58 = ThreadLocalStoragePointer) when a new DLL with TLS is
-    /// loaded after `LdrpActiveThreadCount > 0`.
+    /// (TEB+0x58 = ThreadLocalStoragePointer) or a specific TLS slot when a
+    /// DLL with TLS is loaded after `LdrpActiveThreadCount > 0`.
     ///
     /// PROCESS_TLS_INFORMATION layout (x64):
     ///   +0x00  ULONG  Flags
     ///   +0x04  ULONG  OperationType  (0 = ReplaceIndex, 1 = ReplaceVector)
     ///   +0x08  ULONG  ThreadDataCount
-    ///   +0x0C  ULONG  TlsIndex
-    ///   +0x10  ULONG  PreviousCount
-    ///   +0x18  THREAD_TLS_INFORMATION[ThreadDataCount]
+    ///   +0x0C  ULONG  TlsIndex / OperationData
+    ///   +0x10  ULONG  PreviousCount            (modern layout only)
+    ///   +0x18  THREAD_TLS_INFORMATION[...]     (modern layout only)
     ///
-    /// THREAD_TLS_INFORMATION layout (x64, 0x20 bytes each):
+    /// Modern THREAD_TLS_INFORMATION layout (x64, 0x20 bytes each):
     ///   +0x00  ULONG  Flags
     ///   +0x08  PVOID  NewTlsData   (input)
-    ///   +0x10  PVOID  OldTlsData   (output — kernel writes previous value)
-    ///   +0x18  HANDLE ThreadId
-    unsafe fn handle_process_tls_information(&self, info_ptr: u64) -> NtStatus {
-        unsafe {
-            let flags = core::ptr::read(info_ptr as *const u32);
-            let op_type = core::ptr::read((info_ptr + 4) as *const u32);
-            let thread_count = core::ptr::read((info_ptr + 8) as *const u32);
-            let tls_index = core::ptr::read((info_ptr + 0xC) as *const u32);
-            let prev_count = core::ptr::read((info_ptr + 0x10) as *const u32);
+    ///   +0x10  PVOID  OldTlsData   (output)
+    ///   +0x18  HANDLE ThreadRef
+    ///
+    /// Older/current-thread call sites can still present the leaner layout:
+    ///   header = 0x10 bytes, entry = 0x18 bytes, OldTlsData written back at +0x08.
+    fn handle_process_tls_information(&self, info_ptr: usize, info_len: usize) -> NtStatus {
+        const PROCESS_TLS_INFO_HEADER_SIZE_SIMPLE: usize = 0x10;
+        const THREAD_TLS_INFO_SIZE_SIMPLE: usize = 0x18;
+        const PROCESS_TLS_INFO_HEADER_SIZE_EXTENDED: usize = 0x18;
+        const THREAD_TLS_INFO_SIZE_EXTENDED: usize = 0x20;
 
-            let current_teb_va = self.init_state.as_ref().map(|s| s.teb_va).unwrap_or(0);
+        if info_ptr == 0 {
+            return NtStatus::STATUS_INVALID_PARAMETER;
+        }
+        if info_len < PROCESS_TLS_INFO_HEADER_SIZE_SIMPLE {
+            return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
+        }
 
-            #[cfg(debug_assertions)]
-            {
-                use litebox::platform::DebugLogProvider as _;
-                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                "  ProcessTlsInformation: flags=0x{flags:X} op={op_type} threads={thread_count} \
-                 idx={tls_index} TEB=0x{current_teb_va:X}\n",
-            ));
-            }
-
-            if current_teb_va == 0 {
-                return NtStatus::STATUS_SUCCESS;
-            }
-
-            let threads = self.shared.threads_by_id.lock();
-            let handles = self.shared.handles.lock();
-            let resolve_teb_va = |thread_ref: u64| -> usize {
-                let thread_id = thread_ref as u32;
-                if let Some(thread) = threads.get(&thread_id) {
-                    return thread.teb_va();
-                }
-
-                let current_thread_pseudo = u64::MAX - 1;
-                if thread_ref == 0
-                    || thread_ref == current_thread_pseudo
-                    || thread_id == self.thread_id
-                {
-                    return current_teb_va;
-                }
-
-                match handles.get(thread_id) {
-                    Some(handle_table::NtObject::Thread(thread)) => thread.teb_va(),
-                    Some(handle_table::NtObject::CurrentThread) => current_teb_va,
-                    _ if thread_count == 1 => current_teb_va,
-                    _ => 0,
-                }
+        let Some(flags) = try_read_guest_value_unaligned::<u32>(info_ptr) else {
+            return NtStatus::STATUS_ACCESS_VIOLATION;
+        };
+        let Some(op_type) = try_read_guest_value_unaligned::<u32>(info_ptr + 4) else {
+            return NtStatus::STATUS_ACCESS_VIOLATION;
+        };
+        let Some(thread_count) = try_read_guest_value_unaligned::<u32>(info_ptr + 8) else {
+            return NtStatus::STATUS_ACCESS_VIOLATION;
+        };
+        let Some(header_data) = try_read_guest_value_unaligned::<u32>(info_ptr + 0xC) else {
+            return NtStatus::STATUS_ACCESS_VIOLATION;
+        };
+        let Some(entries_len_extended) =
+            (thread_count as usize).checked_mul(THREAD_TLS_INFO_SIZE_EXTENDED)
+        else {
+            return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
+        };
+        let Some(required_len_extended) =
+            PROCESS_TLS_INFO_HEADER_SIZE_EXTENDED.checked_add(entries_len_extended)
+        else {
+            return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
+        };
+        let Some(entries_len_simple) =
+            (thread_count as usize).checked_mul(THREAD_TLS_INFO_SIZE_SIMPLE)
+        else {
+            return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
+        };
+        let Some(required_len_simple) =
+            PROCESS_TLS_INFO_HEADER_SIZE_SIMPLE.checked_add(entries_len_simple)
+        else {
+            return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
+        };
+        let (extended_layout, required_len, header_size, entry_size, previous_count) =
+            if info_len >= required_len_extended {
+                let Some(previous_count) = try_read_guest_value_unaligned::<u32>(info_ptr + 0x10)
+                else {
+                    return NtStatus::STATUS_ACCESS_VIOLATION;
+                };
+                (
+                    true,
+                    required_len_extended,
+                    PROCESS_TLS_INFO_HEADER_SIZE_EXTENDED,
+                    THREAD_TLS_INFO_SIZE_EXTENDED,
+                    previous_count,
+                )
+            } else if info_len >= required_len_simple {
+                (
+                    false,
+                    required_len_simple,
+                    PROCESS_TLS_INFO_HEADER_SIZE_SIMPLE,
+                    THREAD_TLS_INFO_SIZE_SIMPLE,
+                    0,
+                )
+            } else {
+                return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
             };
+        if info_len < required_len {
+            return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
+        }
+        if !is_addr_range_committed(info_ptr, required_len) {
+            return NtStatus::STATUS_ACCESS_VIOLATION;
+        }
+        if !is_addr_range_writable(info_ptr, required_len) {
+            return NtStatus::STATUS_ACCESS_VIOLATION;
+        }
 
-            match op_type {
-                // ProcessTlsReplaceVector (1): replace TEB+0x58 with the new
-                // TLS array pointer. ntdll allocated a larger vector, copied
-                // old entries, and wants us to swap TEB.ThreadLocalStoragePointer.
-                1 => {
-                    for i in 0..thread_count {
-                        let entry = info_ptr + 0x18 + (i as u64) * 0x20;
-                        let raw_q0 = core::ptr::read(entry as *const u64);
-                        let thread_ref = core::ptr::read((entry + 0x18) as *const u64);
-                        let mut teb_va = resolve_teb_va(thread_ref);
-                        if teb_va == 0 {
-                            #[cfg(debug_assertions)]
-                            {
-                                use litebox::platform::DebugLogProvider as _;
-                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                                "    ReplaceVector[{i}]: unresolved thread_ref=0x{thread_ref:X}\n",
-                            ));
-                            }
-                            continue;
-                        }
+        let current_teb_va = self.init_state.as_ref().map(|s| s.teb_va).unwrap_or(0);
+        let guest_va_start = self.shared.guest_va_start.load(Ordering::Acquire);
+        let guest_va_end = self.shared.guest_va_end.load(Ordering::Acquire);
 
-                        #[cfg(debug_assertions)]
-                        {
-                            use litebox::platform::DebugLogProvider as _;
-                            let mut dump =
-                                alloc::string::String::from("    ReplaceVector entry hex: ");
-                            for off in (0..0x20u64).step_by(8) {
-                                let val = core::ptr::read((entry + off) as *const u64);
-                                dump.push_str(&alloc::format!("+0x{off:02X}={val:016X} "));
-                            }
-                            dump.push('\n');
-                            litebox_platform_multiplex::platform().debug_log_print(&dump);
-                        }
+        #[cfg(debug_assertions)]
+        {
+            use litebox::platform::DebugLogProvider as _;
+            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                "  ProcessTlsInformation: flags=0x{flags:X} op={op_type} threads={thread_count} \
+                 data=0x{header_data:X} prev=0x{previous_count:X} layout={} TEB=0x{current_teb_va:X}\n",
+                if extended_layout { "0x18/0x20" } else { "0x10/0x18" },
+            ));
+        }
 
-                        let mut new_tls_data = core::ptr::read((entry + 0x08) as *const u64);
-                        if thread_count == 1
-                            && thread_ref == 0
-                            && new_tls_data == 0
-                            && raw_q0 > 0x10000
-                        {
-                            teb_va = current_teb_va;
-                            new_tls_data = raw_q0;
-                            let old_vector = core::ptr::read(
-                                (teb_va + crate::peb_teb::teb_offsets::TLS_POINTER) as *const u64,
-                            );
+        if current_teb_va == 0 {
+            return NtStatus::STATUS_SUCCESS;
+        }
 
-                            core::ptr::write(
-                                (teb_va + crate::peb_teb::teb_offsets::TLS_POINTER) as *mut u64,
-                                new_tls_data,
-                            );
-                            crate::syscalls::section::set_thread_tls_vector_allocation(
-                                &self.shared,
-                                teb_va,
-                                new_tls_data as usize,
-                                core::cmp::max(tls_index as usize + 1, prev_count as usize),
-                            );
-                            core::ptr::write((entry + 0x08) as *mut u64, old_vector);
+        let threads = self.shared.threads_by_id.lock();
+        let handles = self.shared.handles.lock();
+        let resolve_teb_va = |thread_ref: u64| -> usize {
+            if thread_ref == 0 {
+                current_teb_va
+            } else {
+                resolve_process_tls_thread_teb(
+                    &threads,
+                    &handles,
+                    self.thread_id,
+                    current_teb_va,
+                    thread_ref,
+                    thread_count,
+                )
+            }
+        };
+        // Detect whether the old TLS vector is a real heap-allocated array
+        // (with a plausible count header at vector-0x10) or a stale/bogus
+        // pointer.  When the main PE has no TLS directory, ntdll may
+        // transiently set TEB+0x58 to the *address of TEB+0x58* (i.e.,
+        // self-referential) before calling ProcessTlsInformation.  Blindly
+        // copying a "prefix" from such a pointer would read TEB bytes as
+        // TLS slot values, corrupting the heap.
+        let is_old_vector_in_teb = |old_vector: u64| -> bool {
+            if current_teb_va == 0 {
+                return false;
+            }
+            let v = old_vector as usize;
+            v >= current_teb_va && v < current_teb_va + crate::peb_teb::TEB_SIZE
+        };
+        let should_suppress_old_tls_vector = |old_vector: u64| -> bool {
+            if old_vector <= 0x10010 {
+                return false;
+            }
+            // If the old vector points into the TEB, it's not a real TLS
+            // array — suppress it to prevent garbage copies.
+            if is_old_vector_in_teb(old_vector) {
+                return true;
+            }
+            let header_addr = old_vector as usize - 0x10;
+            let Some(old_count) = try_read_guest_value_unaligned::<u32>(header_addr) else {
+                return false;
+            };
+            if old_count == 0 || old_count > 0x1000 {
+                return false;
+            }
+            header_data >= old_count
+        };
+        let copy_old_tls_vector_prefix =
+            |old_vector: u64,
+             new_vector: u64|
+             -> Result<Option<(u32, u32, u32, u64, u32, u64)>, NtStatus> {
+                if old_vector <= 0x10010 || new_vector <= 0x10010 {
+                    return Ok(None);
+                }
+                // If the old vector points into the TEB, it's a bogus
+                // self-referential pointer — do not copy garbage.
+                if is_old_vector_in_teb(old_vector) {
+                    return Ok(None);
+                }
+                let old_header_addr = old_vector as usize - 0x10;
+                let Some(old_count) = try_read_guest_value_unaligned::<u32>(old_header_addr) else {
+                    return Ok(None);
+                };
+                if old_count == 0 || old_count > 0x1000 {
+                    return Ok(None);
+                }
 
-                            #[cfg(debug_assertions)]
-                            {
-                                use litebox::platform::DebugLogProvider as _;
-                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                                "    ReplaceVector[{i}]: legacy-current teb=0x{teb_va:X} old=0x{old_vector:X} → new=0x{new_tls_data:X}\n",
-                            ));
-                            }
-                            continue;
-                        }
-
-                        let old_vector = core::ptr::read(
-                            (teb_va + crate::peb_teb::teb_offsets::TLS_POINTER) as *const u64,
-                        );
-
-                        // Swap TEB+0x58 to the new (larger) vector.
-                        core::ptr::write(
-                            (teb_va + crate::peb_teb::teb_offsets::TLS_POINTER) as *mut u64,
-                            new_tls_data,
-                        );
-                        crate::syscalls::section::set_thread_tls_vector_allocation(
-                            &self.shared,
-                            teb_va,
-                            new_tls_data as usize,
-                            core::cmp::max(tls_index as usize + 1, prev_count as usize),
-                        );
-                        // Write back the old vector pointer so ntdll can free it.
-                        core::ptr::write((entry + 0x10) as *mut u64, old_vector);
-
-                        #[cfg(debug_assertions)]
-                        {
-                            use litebox::platform::DebugLogProvider as _;
-                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                            "    ReplaceVector[{i}]: thread_ref=0x{thread_ref:X} teb=0x{teb_va:X} old=0x{old_vector:X} → new=0x{new_tls_data:X}\n",
-                        ));
+                let new_header_addr = new_vector as usize - 0x10;
+                let new_count = try_read_guest_value_unaligned::<u32>(new_header_addr)
+                    .filter(|count| *count != 0 && *count <= 0x1000)
+                    .unwrap_or(old_count);
+                let copy_count = core::cmp::min(old_count, new_count) as usize;
+                let mut bad_count = 0u32;
+                let mut bad0_idx = u32::MAX;
+                let mut bad0_val = 0u64;
+                let mut bad1_idx = u32::MAX;
+                let mut bad1_val = 0u64;
+                for slot in 0..copy_count {
+                    let Some(slot_value) =
+                        try_read_guest_value_unaligned::<u64>(old_vector as usize + slot * 8)
+                    else {
+                        return Err(NtStatus::STATUS_ACCESS_VIOLATION);
+                    };
+                    let looks_like_pointer = slot_value > 0x1_0000;
+                    let in_guest_partition = !looks_like_pointer
+                        || ((slot_value as usize) >= guest_va_start
+                            && (slot_value as usize) < guest_va_end);
+                    if looks_like_pointer && !in_guest_partition {
+                        bad_count = bad_count.saturating_add(1);
+                        if bad0_idx == u32::MAX {
+                            bad0_idx = slot as u32;
+                            bad0_val = slot_value;
+                        } else if bad1_idx == u32::MAX {
+                            bad1_idx = slot as u32;
+                            bad1_val = slot_value;
                         }
                     }
-                }
-                // ProcessTlsReplaceIndex (0): replace a specific TLS slot
-                // at TlsIndex within the current TLS array.
-                0 => {
-                    for i in 0..thread_count {
-                        let entry = info_ptr + 0x18 + (i as u64) * 0x20;
-                        let raw_q0 = core::ptr::read(entry as *const u64);
-                        let thread_ref = core::ptr::read((entry + 0x18) as *const u64);
-                        let mut teb_va = resolve_teb_va(thread_ref);
-                        if teb_va == 0 {
-                            #[cfg(debug_assertions)]
-                            {
-                                use litebox::platform::DebugLogProvider as _;
-                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                                "    ReplaceIndex[{i}]: unresolved thread_ref=0x{thread_ref:X}\n",
-                            ));
-                            }
-                            continue;
-                        }
-
-                        let tls_array = core::ptr::read(
-                            (teb_va + crate::peb_teb::teb_offsets::TLS_POINTER) as *const u64,
-                        );
-                        if tls_array == 0 {
-                            continue;
-                        }
-
-                        let mut new_tls_data = core::ptr::read((entry + 0x08) as *const u64);
-                        if thread_count == 1
-                            && thread_ref == 0
-                            && new_tls_data == 0
-                            && raw_q0 > 0x10000
-                        {
-                            teb_va = current_teb_va;
-                            let tls_array = core::ptr::read(
-                                (teb_va + crate::peb_teb::teb_offsets::TLS_POINTER) as *const u64,
-                            );
-                            if tls_array == 0 {
-                                continue;
-                            }
-
-                            new_tls_data = raw_q0;
-                            let slot_addr = tls_array + (tls_index as u64) * 8;
-                            let old_data = core::ptr::read(slot_addr as *const u64);
-                            core::ptr::write(slot_addr as *mut u64, new_tls_data);
-                            crate::syscalls::section::set_thread_tls_vector_allocation(
-                                &self.shared,
-                                teb_va,
-                                tls_array as usize,
-                                core::cmp::max(tls_index as usize + 1, prev_count as usize),
-                            );
-                            core::ptr::write((entry + 0x08) as *mut u64, old_data);
-
-                            #[cfg(debug_assertions)]
-                            {
-                                use litebox::platform::DebugLogProvider as _;
-                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                                "    ReplaceIndex[{i}]: legacy-current teb=0x{teb_va:X} slot[{tls_index}] old=0x{old_data:X} → new=0x{new_tls_data:X}\n",
-                            ));
-                            }
-                            continue;
-                        }
-
-                        let slot_addr = tls_array + (tls_index as u64) * 8;
-                        let old_data = core::ptr::read(slot_addr as *const u64);
-                        core::ptr::write(slot_addr as *mut u64, new_tls_data);
-                        crate::syscalls::section::set_thread_tls_vector_allocation(
-                            &self.shared,
-                            teb_va,
-                            tls_array as usize,
-                            core::cmp::max(tls_index as usize + 1, prev_count as usize),
-                        );
-                        core::ptr::write((entry + 0x10) as *mut u64, old_data);
-
-                        #[cfg(debug_assertions)]
-                        {
-                            use litebox::platform::DebugLogProvider as _;
-                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                            "    ReplaceIndex[{i}]: thread_ref=0x{thread_ref:X} teb=0x{teb_va:X} slot[{tls_index}] old=0x{old_data:X} → new=0x{new_tls_data:X}\n",
-                        ));
-                        }
+                    if !try_write_guest_value_unaligned::<u64>(
+                        new_vector as usize + slot * 8,
+                        slot_value,
+                    ) {
+                        return Err(NtStatus::STATUS_ACCESS_VIOLATION);
                     }
                 }
-                _ => {
+                Ok(Some((
+                    copy_count as u32,
+                    bad_count,
+                    bad0_idx,
+                    bad0_val,
+                    bad1_idx,
+                    bad1_val,
+                )))
+            };
+        match op_type {
+            1 => {
+                for i in 0..thread_count {
+                    let entry = info_ptr + header_size + (i as usize) * entry_size;
+
                     #[cfg(debug_assertions)]
                     {
                         use litebox::platform::DebugLogProvider as _;
+                        let mut dump = alloc::string::String::from("    ReplaceVector entry hex: ");
+                        for off in (0..entry_size).step_by(8) {
+                            let val =
+                                try_read_guest_value_unaligned::<u64>(entry + off).unwrap_or(0);
+                            dump.push_str(&alloc::format!("+0x{off:02X}={val:016X} "));
+                        }
+                        dump.push('\n');
+                        litebox_platform_multiplex::platform().debug_log_print(&dump);
+                    }
+
+                    let raw_q0 = if extended_layout {
+                        match try_read_guest_value_unaligned::<u64>(entry) {
+                            Some(value) => value,
+                            None => return NtStatus::STATUS_ACCESS_VIOLATION,
+                        }
+                    } else {
+                        0
+                    };
+                    let thread_ref_offset = if extended_layout { 0x18 } else { 0x10 };
+                    let Some(thread_ref) =
+                        try_read_guest_value_unaligned::<u64>(entry + thread_ref_offset)
+                    else {
+                        return NtStatus::STATUS_ACCESS_VIOLATION;
+                    };
+                    let teb_va = resolve_teb_va(thread_ref);
+                    if teb_va == 0 {
+                        #[cfg(debug_assertions)]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "    ReplaceVector[{i}]: unresolved thread_ref=0x{thread_ref:X}\n",
+                            ));
+                        }
+                        continue;
+                    }
+
+                    let Some(mut new_tls_data) =
+                        try_read_guest_value_unaligned::<u64>(entry + 0x08)
+                    else {
+                        return NtStatus::STATUS_ACCESS_VIOLATION;
+                    };
+
+                    let tls_pointer_addr = teb_va + crate::peb_teb::teb_offsets::TLS_POINTER;
+                    let Some(old_vector) = try_read_guest_value_unaligned::<u64>(tls_pointer_addr)
+                    else {
+                        return NtStatus::STATUS_ACCESS_VIOLATION;
+                    };
+                    let suppress_old_vector = should_suppress_old_tls_vector(old_vector);
+                    let copied_prefix_diag =
+                        match copy_old_tls_vector_prefix(old_vector, new_tls_data) {
+                            Ok(value) => value,
+                            Err(status) => return status,
+                        };
+                    let copied_prefix = copied_prefix_diag.map_or(0, |diag| diag.0);
+                    if let Some((_, bad_count, bad0_idx, bad0_val, bad1_idx, bad1_val)) =
+                        copied_prefix_diag
+                    {
+                        if bad_count != 0 {
+                            push_recent_chain_event(
+                                &self.shared.recent_chain_events,
+                                alloc::format!(
+                                    "tlscopybad:{:X}:0x{:X}:0x{:X}:{:X}:{:X}:0x{:X}:{:X}:0x{:X}",
+                                    self.thread_id,
+                                    old_vector,
+                                    new_tls_data,
+                                    bad_count,
+                                    bad0_idx,
+                                    bad0_val,
+                                    bad1_idx,
+                                    bad1_val
+                                ),
+                            );
+                        }
+                    }
+
+                    if extended_layout
+                        && thread_count == 1
+                        && thread_ref == 0
+                        && new_tls_data == 0
+                        && raw_q0 > 0x10000
+                    {
+                        new_tls_data = raw_q0;
+                        if !try_write_guest_value_unaligned::<u64>(tls_pointer_addr, new_tls_data)
+                            || !try_write_guest_value_unaligned::<u64>(entry + 0x08, old_vector)
+                        {
+                            return NtStatus::STATUS_ACCESS_VIOLATION;
+                        }
+
+                        #[cfg(debug_assertions)]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(
+                                &alloc::format!(
+                                    "    ReplaceVector[{i}]: legacy-current teb=0x{teb_va:X} old=0x{old_vector:X} -> new=0x{new_tls_data:X}\n",
+                                ),
+                            );
+                        }
+                        continue;
+                    }
+
+                    if !try_write_guest_value_unaligned::<u64>(tls_pointer_addr, new_tls_data) {
+                        return NtStatus::STATUS_ACCESS_VIOLATION;
+                    }
+                    let old_out_offset = if extended_layout { 0x10 } else { 0x08 };
+                    let old_vector_for_guest = if suppress_old_vector { 0 } else { old_vector };
+                    if !try_write_guest_value_unaligned::<u64>(
+                        entry + old_out_offset,
+                        old_vector_for_guest,
+                    ) {
+                        return NtStatus::STATUS_ACCESS_VIOLATION;
+                    }
+                    if suppress_old_vector && !try_write_guest_value_unaligned::<u32>(entry, 0x2) {
+                        return NtStatus::STATUS_ACCESS_VIOLATION;
+                    }
+
+                    #[cfg(debug_assertions)]
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        let which = if thread_ref == 0 {
+                            alloc::format!("current teb=0x{teb_va:X}")
+                        } else {
+                            alloc::format!("thread_ref=0x{thread_ref:X} teb=0x{teb_va:X}")
+                        };
                         litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                            "    ProcessTlsInformation: unknown OperationType {op_type}\n",
+                            "    ReplaceVector[{i}]: {which} old=0x{old_vector_for_guest:X} (raw=0x{old_vector:X}) -> new=0x{new_tls_data:X} copied_prefix={copied_prefix}\n",
                         ));
                     }
                 }
             }
+            0 => {
+                let tls_index = header_data;
+                for i in 0..thread_count {
+                    let entry = info_ptr + header_size + (i as usize) * entry_size;
 
-            NtStatus::STATUS_SUCCESS
+                    #[cfg(debug_assertions)]
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        let mut dump = alloc::string::String::from("    ReplaceIndex entry hex: ");
+                        for off in (0..entry_size).step_by(8) {
+                            let val =
+                                try_read_guest_value_unaligned::<u64>(entry + off).unwrap_or(0);
+                            dump.push_str(&alloc::format!("+0x{off:02X}={val:016X} "));
+                        }
+                        dump.push('\n');
+                        litebox_platform_multiplex::platform().debug_log_print(&dump);
+                    }
+
+                    let raw_q0 = if extended_layout {
+                        match try_read_guest_value_unaligned::<u64>(entry) {
+                            Some(value) => value,
+                            None => return NtStatus::STATUS_ACCESS_VIOLATION,
+                        }
+                    } else {
+                        0
+                    };
+                    let thread_ref_offset = if extended_layout { 0x18 } else { 0x10 };
+                    let Some(thread_ref) =
+                        try_read_guest_value_unaligned::<u64>(entry + thread_ref_offset)
+                    else {
+                        return NtStatus::STATUS_ACCESS_VIOLATION;
+                    };
+                    let teb_va = resolve_teb_va(thread_ref);
+                    if teb_va == 0 {
+                        #[cfg(debug_assertions)]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "    ReplaceIndex[{i}]: unresolved thread_ref=0x{thread_ref:X}\n",
+                            ));
+                        }
+                        continue;
+                    }
+
+                    let tls_pointer_addr = teb_va + crate::peb_teb::teb_offsets::TLS_POINTER;
+                    let Some(tls_array) = try_read_guest_value_unaligned::<u64>(tls_pointer_addr)
+                    else {
+                        return NtStatus::STATUS_ACCESS_VIOLATION;
+                    };
+                    if tls_array == 0 {
+                        continue;
+                    }
+
+                    let Some(mut new_tls_data) =
+                        try_read_guest_value_unaligned::<u64>(entry + 0x08)
+                    else {
+                        return NtStatus::STATUS_ACCESS_VIOLATION;
+                    };
+                    let slot_addr = tls_array + (tls_index as u64) * 8;
+
+                    if extended_layout
+                        && thread_count == 1
+                        && thread_ref == 0
+                        && new_tls_data == 0
+                        && raw_q0 > 0x10000
+                    {
+                        new_tls_data = raw_q0;
+                        let Some(old_data) =
+                            try_read_guest_value_unaligned::<u64>(slot_addr as usize)
+                        else {
+                            return NtStatus::STATUS_ACCESS_VIOLATION;
+                        };
+                        if !try_write_guest_value_unaligned::<u64>(slot_addr as usize, new_tls_data)
+                            || !try_write_guest_value_unaligned::<u64>(entry + 0x08, old_data)
+                            || !try_write_guest_value_unaligned::<u32>(entry, 0x2)
+                        {
+                            return NtStatus::STATUS_ACCESS_VIOLATION;
+                        }
+
+                        #[cfg(debug_assertions)]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(
+                                &alloc::format!(
+                                    "    ReplaceIndex[{i}]: legacy-current teb=0x{teb_va:X} slot[{tls_index}] old=0x{old_data:X} -> new=0x{new_tls_data:X}\n",
+                                ),
+                            );
+                        }
+                        continue;
+                    }
+
+                    let Some(old_data) = try_read_guest_value_unaligned::<u64>(slot_addr as usize)
+                    else {
+                        return NtStatus::STATUS_ACCESS_VIOLATION;
+                    };
+                    if old_data > 0x1_0000
+                        && ((old_data as usize) < guest_va_start
+                            || (old_data as usize) >= guest_va_end)
+                    {
+                        push_recent_chain_event(
+                            &self.shared.recent_chain_events,
+                            alloc::format!(
+                                "tlsindexbad:{:X}:{:X}:0x{:X}",
+                                self.thread_id,
+                                tls_index,
+                                old_data
+                            ),
+                        );
+                    }
+                    if !try_write_guest_value_unaligned::<u64>(slot_addr as usize, new_tls_data) {
+                        return NtStatus::STATUS_ACCESS_VIOLATION;
+                    }
+                    let old_out_offset = if extended_layout { 0x10 } else { 0x08 };
+                    if !try_write_guest_value_unaligned::<u64>(entry + old_out_offset, old_data) {
+                        return NtStatus::STATUS_ACCESS_VIOLATION;
+                    }
+                    if thread_ref == 0 && !try_write_guest_value_unaligned::<u32>(entry, 0x2) {
+                        return NtStatus::STATUS_ACCESS_VIOLATION;
+                    }
+
+                    #[cfg(debug_assertions)]
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        let which = if thread_ref == 0 {
+                            alloc::format!("current teb=0x{teb_va:X}")
+                        } else {
+                            alloc::format!("thread_ref=0x{thread_ref:X} teb=0x{teb_va:X}")
+                        };
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "    ReplaceIndex[{i}]: {which} slot[{tls_index}] old=0x{old_data:X} -> new=0x{new_tls_data:X}\n",
+                        ));
+                    }
+                }
+            }
+            _ => {
+                #[cfg(debug_assertions)]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "    ProcessTlsInformation: unknown OperationType {op_type}\n",
+                    ));
+                }
+            }
         }
+
+        // Lazily capture TLS template data from PE headers after the first
+        // successful ReplaceVector (op=1).  Child threads will use these
+        // templates to initialize their per-thread TLS blocks.
+        if op_type == 1 {
+            self.shared.tls_templates.call_once(|| {
+                let modules = self.current_module_bases();
+                capture_tls_templates(&modules)
+            });
+        }
+
+        NtStatus::STATUS_SUCCESS
     }
 
     /// Inner dispatch after RSP normalization.
@@ -3057,16 +5160,18 @@ impl NtShimEntrypoints {
         raw_nr: u32,
         ctx: &mut ExecutionContext,
     ) -> (NtStatus, bool) {
-        #[cfg(debug_assertions)]
+        #[cfg(feature = "trace_debug")]
         {
             use litebox::platform::DebugLogProvider as _;
             litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                "NT shim: {:?} (nr=0x{:04X}) r10=0x{:X} rdx=0x{:X} r8=0x{:X}\n",
+                "[tid={}] NT shim: {:?} (nr=0x{:04X}) r10=0x{:X} rdx=0x{:X} r8=0x{:X} r9=0x{:X}\n",
+                self.thread_id,
                 nt_nr,
                 raw_nr,
                 ctx.regs.r10,
                 ctx.regs.rdx,
                 ctx.regs.r8,
+                ctx.regs.r9,
             ));
         }
         match nt_nr {
@@ -3074,21 +5179,188 @@ impl NtShimEntrypoints {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let handle = args.arg0;
                 let exit_status = args.arg1 as i32;
+                if exit_status as u32 == 0xC000_0374 {
+                    let caller = self
+                        .thread_obj
+                        .as_ref()
+                        .map_or(0, |obj| obj.last_caller_ret());
+                    self.trace(
+                        TraceKind::ExitRequest,
+                        exit_status as u32,
+                        handle,
+                        caller,
+                        ctx.regs.rip,
+                    );
+                    push_recent_chain_event(
+                        &self.shared.recent_chain_events,
+                        alloc::format!(
+                            "termproc:{}:0x{:X}:0x{:X}:0x{:X}:0x{:X}",
+                            self.thread_id,
+                            handle,
+                            ctx.regs.rip,
+                            ctx.regs.rsp,
+                            caller
+                        ),
+                    );
+                    if let Some(ref obj) = self.thread_obj {
+                        obj.set_debug_stage(0xC3741001);
+                        obj.set_last_guest_context(ctx.regs.rip, ctx.regs.rsp);
+                        obj.set_last_caller_ret(caller);
+                    }
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "[heapcorr-exit] NtTerminateProcess tid={} handle=0x{:X} rip=0x{:X} rsp=0x{:X} caller=0x{:X}\n",
+                        self.thread_id, handle, ctx.regs.rip, ctx.regs.rsp, caller
+                    ));
+                }
+                {
+                    #[cfg(feature = "trace_debug")]
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "[shim-exit] NtTerminateProcess entry: tid={} handle=0x{:X} exit_status=0x{:X}\n",
+                            self.thread_id, handle, exit_status as u32
+                        ));
+                    }
+                }
                 let is_current_handle = handle == NT_CURRENT_PROCESS_HANDLE
-                    || handle == 0
                     || self
                         .shared
                         .handles
                         .lock()
-                        .get(handle as u32)
-                        .is_some_and(|obj| matches!(obj, handle_table::NtObject::CurrentProcess));
+                        .with(handle as u32, |entry| matches!(&entry.object, handle_table::NtObject::CurrentProcess))
+                        .unwrap_or(false);
 
+                // On real Windows there are two phases:
+                //   Phase 1: NtTerminateProcess(NtCurrentProcess(), code) — kills
+                //            all OTHER threads; the calling thread continues.
+                //   Phase 2: NtTerminateProcess(NULL/0, code) — terminates the
+                //            process completely (no return).
+                // ntdll!RtlExitUserProcess calls Phase 1, then
+                // LdrShutdownProcess(), then Phase 2.
                 if is_current_handle {
-                    self.mark_current_thread_exited(exit_status);
+                    // Phase 1: terminate all OTHER threads; caller keeps running.
+                    {
+                        // Always-on diagnostic: show which threads are still alive.
+                        let live = self
+                            .shared
+                            .live_child_thread_count
+                            .load(core::sync::atomic::Ordering::Relaxed);
+                        if live > 0 {
+                            let mut info = alloc::format!(
+                                "[shim-exit] Phase 1: {} live child thread(s), last syscalls:",
+                                live
+                            );
+                            let threads = self.shared.threads_by_id.lock();
+                            for (&tid, tobj) in threads.iter() {
+                                if tid == self.thread_id {
+                                    continue;
+                                }
+                                let nr = self.shared.thread_last_syscall[(tid as usize) % 64]
+                                    .load(core::sync::atomic::Ordering::Relaxed);
+                                let exited = tobj.has_exited();
+                                use core::fmt::Write;
+                                let _ =
+                                    write!(info, " tid={}(nr=0x{:X},exited={})", tid, nr, exited);
+                            }
+                            drop(threads);
+                            info.push('\n');
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(&info);
+                        }
+                    }
+                    {
+                        #[cfg(feature = "trace_debug")]
+                        {
+                            let thread_count = self.shared.threads_by_id.lock().len();
+                            let waker_count = self.shared.thread_wakers.lock().len();
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "[shim-exit] Phase 1: tid={} exit_status=0x{:X} threads={} wakers={}\n",
+                                self.thread_id, exit_status as u32, thread_count, waker_count
+                            ));
+                        }
+                    }
+                    self.mark_process_exit_requested(exit_status);
+                    let threads = self.shared.threads_by_id.lock();
+                    for thread_obj in threads.values() {
+                        if thread_obj.thread_id == self.thread_id {
+                            continue; // skip self
+                        }
+                        thread_obj.alert_by_id(false, 0);
+                    }
+                    drop(threads);
+                    // Interrupt all other threads via ThreadHandle (handles
+                    // both WAITING and RUNNING_IN_GUEST states).  Fall back
+                    // to Waker for threads whose interrupt handle hasn't been
+                    // registered yet.
+                    {
+                        let int_handles = self.shared.thread_interrupt_handles.lock();
+                        let wakers = self.shared.thread_wakers.lock();
+                        for (&tid, waker) in wakers.iter() {
+                            if tid == self.thread_id {
+                                continue;
+                            }
+                            if let Some(handle) = int_handles.get(&tid) {
+                                handle.interrupt();
+                            } else {
+                                waker.wake();
+                            }
+                        }
+                    }
+                    {
+                        #[cfg(feature = "trace_debug")]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform()
+                                .debug_log_print("[shim-exit] Phase 1 done, returning to guest\n");
+                        }
+                    }
+                    (NtStatus::STATUS_SUCCESS, false)
+                } else if handle == 0 {
+                    // Phase 2: terminate the process entirely (no return).
+                    {
+                        #[cfg(feature = "trace_debug")]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(
+                                &alloc::format!(
+                                    "[shim-exit] Phase 2: tid={} exit_status=0x{:X}\n",
+                                    self.thread_id,
+                                    exit_status as u32
+                                ),
+                            );
+                        }
+                    }
+                    self.mark_current_thread_exited_as_process_exit(exit_status);
                     (NtStatus::STATUS_SUCCESS, true)
                 } else {
-                    log_unimplemented!("NtTerminateProcess on remote handle 0x{:X}", handle);
-                    (NtStatus::STATUS_NOT_IMPLEMENTED, false)
+                    // Check if this is a virtual child process handle
+                    let is_child_process = self
+                        .shared
+                        .handles
+                        .lock()
+                        .with(handle as u32, |entry| matches!(&entry.object, handle_table::NtObject::Process { .. }))
+                        .unwrap_or(false);
+                    if is_child_process {
+                        // Terminate a virtual child process — just mark it as
+                        // terminated and return success.  The process was already
+                        // "completed" at NtCreateUserProcess time.
+                        #[cfg(feature = "trace_debug")]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(
+                                &alloc::format!(
+                                    "[shim-exit] NtTerminateProcess on child handle 0x{:X} — returning SUCCESS\n",
+                                    handle
+                                ),
+                            );
+                        }
+                        (NtStatus::STATUS_SUCCESS, false)
+                    } else {
+                        log_unimplemented!("NtTerminateProcess on remote handle 0x{:X}", handle);
+                        (NtStatus::STATUS_NOT_IMPLEMENTED, false)
+                    }
                 }
             }
             NtSyscallId::NtWriteFile => {
@@ -3101,34 +5373,95 @@ impl NtShimEntrypoints {
                         is_stderr: bool,
                     },
                     VfsFile {
-                        raw_fd: usize,
+                        vfs_fd: alloc::sync::Arc<litebox::fd::TypedFd<NtFS>>,
                         position: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
+                    },
+                    Pipe {
+                        buffer: alloc::sync::Arc<crate::handle_table::PipeBuffer>,
                     },
                     Invalid,
                 }
+                #[cfg(feature = "trace_debug")]
+                let mut target_desc = alloc::string::String::from("invalid");
                 let target = {
                     let handles = self.shared.handles.lock();
-                    match handles.get(file_handle) {
-                        Some(crate::handle_table::NtObject::ConsoleOutput { is_stderr }) => {
+                    handles.with(file_handle, |entry| match &entry.object {
+                        crate::handle_table::NtObject::ConsoleOutput { is_stderr } => {
+                            #[cfg(feature = "trace_debug")]
+                            {
+                                target_desc = alloc::format!("console(stderr={})", is_stderr);
+                            }
                             NtWriteTarget::Console {
                                 is_stderr: *is_stderr,
                             }
                         }
-                        Some(crate::handle_table::NtObject::File {
-                            raw_fd, position, ..
-                        }) => NtWriteTarget::VfsFile {
-                            raw_fd: *raw_fd,
-                            position: position.clone(),
-                        },
+                        crate::handle_table::NtObject::File {
+                            vfs_fd,
+                            position,
+                            path,
+                            ..
+                        } => {
+                            #[cfg(feature = "trace_debug")]
+                            {
+                                target_desc =
+                                    alloc::format!("file(path={})", path);
+                            }
+                            NtWriteTarget::VfsFile {
+                                vfs_fd: alloc::sync::Arc::clone(vfs_fd),
+                                position: position.clone(),
+                            }
+                        }
+                        crate::handle_table::NtObject::Pipe { buffer, .. } => {
+                            #[cfg(feature = "trace_debug")]
+                            {
+                                target_desc = alloc::format!("pipe");
+                            }
+                            NtWriteTarget::Pipe {
+                                buffer: buffer.clone(),
+                            }
+                        }
                         _ => NtWriteTarget::Invalid,
-                    }
+                    }).unwrap_or(NtWriteTarget::Invalid)
                 };
+                #[cfg(feature = "trace_debug")]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    let buffer = syscalls::NtSyscallArgs::arg5(ctx);
+                    let length = unsafe { *((ctx.regs.rsp + 0x38) as *const u32) } as usize;
+                    let preview_len = core::cmp::min(length, 24usize);
+                    let mut preview = alloc::string::String::new();
+                    if buffer >= 0x10000 && preview_len != 0 {
+                        let bytes = unsafe {
+                            core::slice::from_raw_parts(buffer as *const u8, preview_len)
+                        };
+                        for &byte in bytes {
+                            match byte {
+                                b' '..=b'~' => preview.push(byte as char),
+                                b'\r' => preview.push_str("\\r"),
+                                b'\n' => preview.push_str("\\n"),
+                                _ => {
+                                    let _ = core::fmt::Write::write_fmt(
+                                        &mut preview,
+                                        format_args!("\\x{byte:02X}"),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NT shim: NtWriteFile handle=0x{:X} target={} buffer=0x{:X} len=0x{:X} preview=\"{}\"\n",
+                        file_handle, target_desc, buffer, length, preview
+                    ));
+                }
                 let status = match target {
                     NtWriteTarget::Console { is_stderr } => {
                         syscalls::file::nt_write_file_console(ctx, is_stderr)
                     }
-                    NtWriteTarget::VfsFile { raw_fd, position } => {
-                        syscalls::file::nt_write_file_vfs(ctx, raw_fd, &position, &self.shared)
+                    NtWriteTarget::VfsFile { vfs_fd, position } => {
+                        syscalls::file::nt_write_file_vfs(ctx, &vfs_fd, &position, &self.shared)
+                    }
+                    NtWriteTarget::Pipe { buffer } => {
+                        syscalls::file::nt_write_file_pipe(ctx, &buffer)
                     }
                     NtWriteTarget::Invalid => NtStatus::STATUS_INVALID_HANDLE,
                 };
@@ -3139,7 +5472,6 @@ impl NtShimEntrypoints {
                 let status = syscalls::nt_close(
                     &mut self.shared.handles.lock(),
                     args.arg0 as u32,
-                    &self.shared,
                 );
                 (status, false)
             }
@@ -3167,30 +5499,104 @@ impl NtShimEntrypoints {
                 // Snapshot handle info under lock, drop before I/O.
                 enum NtReadTarget {
                     VfsFile {
-                        raw_fd: usize,
+                        vfs_fd: alloc::sync::Arc<litebox::fd::TypedFd<NtFS>>,
                         position: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
                     },
                     Console,
+                    Pipe {
+                        buffer: alloc::sync::Arc<crate::handle_table::PipeBuffer>,
+                    },
+                    PipeAsync {
+                        buffer: alloc::sync::Arc<crate::handle_table::PipeBuffer>,
+                        port: alloc::sync::Arc<crate::handle_table::IoCompletionObject>,
+                        key: usize,
+                    },
                     Invalid,
                 }
                 let target = {
                     let handles = self.shared.handles.lock();
-                    match handles.get(file_handle) {
-                        Some(crate::handle_table::NtObject::File {
-                            raw_fd, position, ..
-                        }) => NtReadTarget::VfsFile {
-                            raw_fd: *raw_fd,
+                    handles.with(file_handle, |entry| match &entry.object {
+                        crate::handle_table::NtObject::File {
+                            vfs_fd, position, ..
+                        } => NtReadTarget::VfsFile {
+                            vfs_fd: alloc::sync::Arc::clone(vfs_fd),
                             position: position.clone(),
                         },
-                        Some(crate::handle_table::NtObject::ConsoleInput) => NtReadTarget::Console,
+                        crate::handle_table::NtObject::ConsoleInput => NtReadTarget::Console,
+                        crate::handle_table::NtObject::Pipe {
+                            buffer,
+                            io_completion: Some((port, key)),
+                            ..
+                        } => NtReadTarget::PipeAsync {
+                            buffer: buffer.clone(),
+                            port: alloc::sync::Arc::clone(port),
+                            key: *key,
+                        },
+                        crate::handle_table::NtObject::Pipe { buffer, .. } => {
+                            NtReadTarget::Pipe {
+                                buffer: buffer.clone(),
+                            }
+                        }
                         _ => NtReadTarget::Invalid,
-                    }
+                    }).unwrap_or(NtReadTarget::Invalid)
                 };
+                #[cfg(feature = "trace_debug")]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    let desc = match &target {
+                        NtReadTarget::VfsFile { .. } => "VfsFile",
+                        NtReadTarget::Console => "Console",
+                        NtReadTarget::Pipe { .. } => "Pipe(sync)",
+                        NtReadTarget::PipeAsync { .. } => "PipeAsync",
+                        NtReadTarget::Invalid => "Invalid",
+                    };
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NT shim: NtReadFile handle=0x{file_handle:X} target={desc}\n",
+                    ));
+                }
                 let status = match target {
-                    NtReadTarget::VfsFile { raw_fd, position } => {
-                        syscalls::file::nt_read_file_vfs(ctx, raw_fd, &position, &self.shared)
+                    NtReadTarget::VfsFile { vfs_fd, position } => {
+                        syscalls::file::nt_read_file_vfs(ctx, &vfs_fd, &position, &self.shared)
                     }
                     NtReadTarget::Console => syscalls::file::nt_read_file_console(ctx),
+                    NtReadTarget::Pipe { buffer } => {
+                        syscalls::file::nt_read_file_pipe(ctx, &buffer, &self.wait_cx())
+                    }
+                    NtReadTarget::PipeAsync { buffer, port, key } => {
+                        // Resolve the optional Event handle (arg1/rdx) for
+                        // signaling on completion.
+                        let event_handle = syscalls::NtSyscallArgs::from_ctx(ctx).arg1 as u32;
+                        let event_obj = if event_handle != 0 {
+                            self.shared.handles.lock().with(event_handle, |entry| match &entry.object {
+                                crate::handle_table::NtObject::Event(e) => {
+                                    Some(alloc::sync::Arc::clone(e))
+                                }
+                                _ => None,
+                            }).flatten()
+                        } else {
+                            None
+                        };
+                        #[cfg(feature = "trace_debug")]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "NT shim: PipeAsync dispatch -> PipeBuffer={:#X} IOCP={:#X} key={:#X} event_handle=0x{event_handle:X} event_resolved={}\n",
+                                alloc::sync::Arc::as_ptr(&buffer) as usize,
+                                alloc::sync::Arc::as_ptr(&port) as usize,
+                                key,
+                                event_obj.is_some(),
+                            ));
+                        }
+                        let st = syscalls::file::nt_read_file_pipe_async(ctx, &buffer, &port, key, event_obj);
+                        #[cfg(feature = "trace_debug")]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "NT shim: PipeAsync returned status={:?}\n", st,
+                            ));
+                        }
+                        st
+                    }
                     NtReadTarget::Invalid => NtStatus::STATUS_INVALID_HANDLE,
                 };
                 (status, false)
@@ -3205,45 +5611,226 @@ impl NtShimEntrypoints {
             }
             NtSyscallId::NtSetInformationFile => {
                 let status =
-                    syscalls::file::nt_set_information_file(ctx, &mut self.shared.handles.lock());
+                    syscalls::file::nt_set_information_file(ctx, &mut self.shared.handles.lock(), &self.shared);
                 (status, false)
             }
             NtSyscallId::NtQueryAttributesFile => {
-                let status = syscalls::file::nt_query_attributes_file(ctx, &self.shared);
+                let handles = self.shared.handles.lock();
+                let status = syscalls::file::nt_query_attributes_file(ctx, &handles, &self.shared);
+                (status, false)
+            }
+            NtSyscallId::NtQueryFullAttributesFile => {
+                let handles = self.shared.handles.lock();
+                let status = syscalls::file::nt_query_full_attributes_file(ctx, &handles, &self.shared);
+                (status, false)
+            }
+            NtSyscallId::NtQueryInformationByName => {
+                let handles = self.shared.handles.lock();
+                let status =
+                    syscalls::file::nt_query_information_by_name(ctx, &handles, &self.shared);
+                (status, false)
+            }
+            NtSyscallId::NtDeleteFile => {
+                let status = syscalls::file::nt_delete_file(ctx, &self.shared);
                 (status, false)
             }
             // Phase 2: Memory management
             NtSyscallId::NtAllocateVirtualMemory => {
+                let base_ptr = ctx.regs.rdx;
+                let size_ptr = ctx.regs.r8;
+                let caller = self
+                    .thread_obj
+                    .as_ref()
+                    .map_or(0, |obj| obj.last_caller_ret());
                 let status =
                     syscalls::memory::nt_allocate_virtual_memory(ctx, &self.shared.process_state);
+                // Log dereferenced output values for memory debugging.
+                let base = crate::try_read_guest_value_unaligned::<usize>(base_ptr).unwrap_or(0);
+                let size = crate::try_read_guest_value_unaligned::<usize>(size_ptr).unwrap_or(0);
+                if status == NtStatus::STATUS_SUCCESS {
+                    push_recent_vm_teardown(
+                        &self.shared.recent_vm_teardowns,
+                        RecentVmTeardown {
+                            tid: self.thread_id,
+                            kind: 4,
+                            base,
+                            size,
+                            detail: 0,
+                            caller,
+                        },
+                    );
+                }
+                self.trace(
+                    TraceKind::MemOp,
+                    0x01, /* alloc */
+                    base,
+                    size,
+                    status.0 as usize,
+                );
                 (status, false)
             }
             NtSyscallId::NtAllocateVirtualMemoryEx => {
+                let base_ptr = ctx.regs.rdx;
+                let size_ptr = ctx.regs.r8;
+                let caller = self
+                    .thread_obj
+                    .as_ref()
+                    .map_or(0, |obj| obj.last_caller_ret());
                 let status = syscalls::memory::nt_allocate_virtual_memory_ex(
                     ctx,
                     &self.shared.process_state,
                 );
+                let base = crate::try_read_guest_value_unaligned::<usize>(base_ptr).unwrap_or(0);
+                let size = crate::try_read_guest_value_unaligned::<usize>(size_ptr).unwrap_or(0);
+                if status == NtStatus::STATUS_SUCCESS {
+                    push_recent_vm_teardown(
+                        &self.shared.recent_vm_teardowns,
+                        RecentVmTeardown {
+                            tid: self.thread_id,
+                            kind: 5,
+                            base,
+                            size,
+                            detail: 0,
+                            caller,
+                        },
+                    );
+                }
+                self.trace(
+                    TraceKind::MemOp,
+                    0x02, /* alloc_ex */
+                    base,
+                    size,
+                    status.0 as usize,
+                );
                 (status, false)
             }
             NtSyscallId::NtFreeVirtualMemory => {
+                let base_ptr = ctx.regs.rdx;
+                let size_ptr = ctx.regs.r8;
+                let pre_base =
+                    crate::try_read_guest_value_unaligned::<usize>(base_ptr).unwrap_or(0);
+                let pre_size =
+                    crate::try_read_guest_value_unaligned::<usize>(size_ptr).unwrap_or(0);
+                let free_type = ctx.regs.r9 as u32;
+                let caller = self
+                    .thread_obj
+                    .as_ref()
+                    .map_or(0, |obj| obj.last_caller_ret());
                 let status =
                     syscalls::memory::nt_free_virtual_memory(ctx, &self.shared.process_state);
+                let post_base =
+                    crate::try_read_guest_value_unaligned::<usize>(base_ptr).unwrap_or(pre_base);
+                let post_size =
+                    crate::try_read_guest_value_unaligned::<usize>(size_ptr).unwrap_or(0);
+                if status == NtStatus::STATUS_SUCCESS {
+                    push_recent_vm_teardown(
+                        &self.shared.recent_vm_teardowns,
+                        RecentVmTeardown {
+                            tid: self.thread_id,
+                            kind: 1,
+                            base: post_base,
+                            size: post_size,
+                            detail: free_type as usize,
+                            caller,
+                        },
+                    );
+                }
+                if let Some(ntdll_base) = self.init_state.as_ref().and_then(|s| {
+                    s.module_bases
+                        .iter()
+                        .find(|m| m.name == "ntdll.dll")
+                        .map(|m| m.base_address)
+                }) && caller == ntdll_base.saturating_add(0xD1C7F)
+                {
+                    let parent_ret = if ctx.regs.rsp != 0 {
+                        crate::try_read_guest_value_unaligned::<usize>(
+                            ctx.regs.rsp.saturating_add(0x30),
+                        )
+                        .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    let grandparent_ret = if ctx.regs.rsp != 0 {
+                        crate::try_read_guest_value_unaligned::<usize>(
+                            ctx.regs.rsp.saturating_add(0x58),
+                        )
+                        .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    self.trace(
+                        TraceKind::Probe,
+                        0xD1C7F,
+                        pre_base,
+                        pre_size,
+                        free_type as usize,
+                    );
+                    self.trace(
+                        TraceKind::Probe,
+                        0xD1C80,
+                        post_base,
+                        post_size,
+                        status.0 as usize,
+                    );
+                    self.trace(
+                        TraceKind::Probe,
+                        0xD1C81,
+                        caller,
+                        parent_ret,
+                        grandparent_ret,
+                    );
+                    push_recent_chain_event(
+                        &self.shared.recent_chain_events,
+                        alloc::format!(
+                            "destroyheapfree:{}:0x{:X}:0x{:X}:0x{:X}:0x{:X}:0x{:X}:0x{:X}:0x{:X}",
+                            self.thread_id,
+                            pre_base,
+                            pre_size,
+                            post_base,
+                            post_size,
+                            free_type,
+                            parent_ret,
+                            grandparent_ret
+                        ),
+                    );
+                }
+                push_recent_chain_event(
+                    &self.shared.recent_chain_events,
+                    alloc::format!(
+                        "memfree:{}:0x{:X}:0x{:X}:0x{:X}:0x{:X}",
+                        self.thread_id,
+                        pre_base,
+                        post_size,
+                        status.0 as u32,
+                        caller
+                    ),
+                );
+                self.trace(
+                    TraceKind::MemOp,
+                    0x03, /* free */
+                    pre_base,
+                    post_size,
+                    status.0 as usize,
+                );
                 (status, false)
             }
             NtSyscallId::NtProtectVirtualMemory => {
+                let base_ptr = ctx.regs.rdx;
+                let size_ptr = ctx.regs.r8;
+                let new_protect = ctx.regs.r9 as u32;
                 let status =
                     syscalls::memory::nt_protect_virtual_memory(ctx, &self.shared.process_state);
+                let base = crate::try_read_guest_value_unaligned::<usize>(base_ptr).unwrap_or(0);
+                let size = crate::try_read_guest_value_unaligned::<usize>(size_ptr).unwrap_or(0);
+                self.trace(TraceKind::MemOp, new_protect, base, size, status.0 as usize);
                 (status, false)
             }
             NtSyscallId::NtQueryVirtualMemory => {
-                let module_bases = self
-                    .init_state
-                    .as_ref()
-                    .map_or(&[][..], |s| s.module_bases.as_slice());
+                let module_bases = self.current_module_bases();
                 let status = syscalls::memory::nt_query_virtual_memory(
                     ctx,
                     &self.shared.process_state,
-                    module_bases,
+                    module_bases.as_slice(),
                 );
                 (status, false)
             }
@@ -3265,8 +5852,11 @@ impl NtShimEntrypoints {
                 (status, false)
             }
             NtSyscallId::NtQueryInformationProcess => {
-                let status =
-                    syscalls::sysinfo::nt_query_information_process(ctx, self.init_state.as_ref());
+                let status = syscalls::sysinfo::nt_query_information_process(
+                    ctx,
+                    self.init_state.as_ref(),
+                    &self.shared,
+                );
                 (status, false)
             }
             NtSyscallId::NtOpenProcess => {
@@ -3277,10 +5867,10 @@ impl NtShimEntrypoints {
                     (NtStatus::STATUS_INVALID_PARAMETER, false)
                 } else {
                     let target_process = if client_id_ptr != 0 {
-                        let client_id = unsafe {
-                            core::ptr::read(
-                                client_id_ptr as *const litebox_common_windows::nt_types::ClientId,
-                            )
+                        let Some(client_id) = crate::try_read_guest_value_unaligned::<
+                            litebox_common_windows::nt_types::ClientId,
+                        >(client_id_ptr) else {
+                            return (NtStatus::STATUS_ACCESS_VIOLATION, false);
                         };
                         client_id.unique_process
                     } else {
@@ -3296,8 +5886,8 @@ impl NtShimEntrypoints {
                             .handles
                             .lock()
                             .insert(handle_table::NtObject::CurrentProcess);
-                        unsafe {
-                            core::ptr::write(process_handle_ptr as *mut u32, handle);
+                        if !crate::try_write_guest_value_unaligned(process_handle_ptr, handle) {
+                            return (NtStatus::STATUS_ACCESS_VIOLATION, false);
                         }
                         (NtStatus::STATUS_SUCCESS, false)
                     } else {
@@ -3319,17 +5909,83 @@ impl NtShimEntrypoints {
                 (status, false)
             }
             NtSyscallId::NtSetInformationThread => {
-                // Commonly called for thread name, affinity, etc.
-                // Return success for now ΓÇö most info classes are optional.
-                (NtStatus::STATUS_SUCCESS, false)
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let thread_handle = args.arg0 as u32;
+                let info_class = args.arg1 as u32;
+                let info_ptr = args.arg2;
+                let info_len = args.arg3 as u32;
+
+                let validate_thread_handle = || -> Result<(), NtStatus> {
+                    if thread_handle == 0xFFFF_FFFE || thread_handle as i32 == -2 {
+                        return Ok(());
+                    }
+
+                    let handles = self.shared.handles.lock();
+                    match handles.with(thread_handle, |entry| match &entry.object {
+                        handle_table::NtObject::Thread(_)
+                        | handle_table::NtObject::CurrentThread => Ok(()),
+                        _ => Err(NtStatus::STATUS_OBJECT_TYPE_MISMATCH),
+                    }) {
+                        Some(result) => result,
+                        None => Err(NtStatus::STATUS_INVALID_HANDLE),
+                    }
+                };
+
+                match info_class {
+                    0xA => {
+                        if info_len != core::mem::size_of::<u32>() as u32 {
+                            (NtStatus::STATUS_INFO_LENGTH_MISMATCH, false)
+                        } else if info_ptr == 0 {
+                            (NtStatus::STATUS_INVALID_PARAMETER, false)
+                        } else {
+                            match validate_thread_handle() {
+                                Ok(()) => {
+                                    let Some(tls_index) =
+                                        try_read_guest_value_unaligned::<u32>(info_ptr)
+                                    else {
+                                        return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                                    };
+                                    if tls_index >= 1088 {
+                                        (NtStatus::STATUS_INVALID_PARAMETER, false)
+                                    } else {
+                                        syscalls::k32_handlers::zero_explicit_tls_slot_process_wide(
+                                            &self.shared,
+                                            tls_index,
+                                        );
+                                        (NtStatus::STATUS_SUCCESS, false)
+                                    }
+                                }
+                                Err(status) => (status, false),
+                            }
+                        }
+                    }
+                    // ThreadNameInformation (0x26 = 38) — optional thread name for
+                    // debugger display. Safe to ignore in the sandbox.
+                    0x26 => (NtStatus::STATUS_SUCCESS, false),
+                    _ => {
+                        // Commonly called for optional thread metadata.
+                        log_unimplemented!("NtSetInformationThread class {}", info_class);
+                        (NtStatus::STATUS_SUCCESS, false)
+                    }
+                }
             }
             NtSyscallId::NtQueryVolumeInformationFile => {
-                // Stub: return basic volume information.
-                let status = syscalls::file::nt_query_volume_information_file(ctx);
+                let status = syscalls::file::nt_query_volume_information_file(
+                    ctx,
+                    &self.shared.handles.lock(),
+                );
                 (status, false)
             }
             NtSyscallId::NtQueryDirectoryFile => {
                 let status = syscalls::file::nt_query_directory_file(
+                    ctx,
+                    &mut self.shared.handles.lock(),
+                    &self.shared,
+                );
+                (status, false)
+            }
+            NtSyscallId::NtQueryDirectoryFileEx => {
+                let status = syscalls::file::nt_query_directory_file_ex(
                     ctx,
                     &mut self.shared.handles.lock(),
                     &self.shared,
@@ -3350,7 +6006,12 @@ impl NtShimEntrypoints {
                 };
                 match keyed {
                     Some(k) => (
-                        syscalls::sync::wait_for_keyed_event(ctx, &k, &self.wait_cx()),
+                        syscalls::sync::wait_for_keyed_event(
+                            ctx,
+                            &k,
+                            &self.wait_cx(),
+                            self.thread_obj.as_ref(),
+                        ),
                         false,
                     ),
                     None => (NtStatus::STATUS_INVALID_HANDLE, false),
@@ -3364,7 +6025,12 @@ impl NtShimEntrypoints {
                 };
                 match keyed {
                     Some(k) => (
-                        syscalls::sync::release_keyed_event(ctx, &k, &self.wait_cx()),
+                        syscalls::sync::release_keyed_event(
+                            ctx,
+                            &k,
+                            &self.wait_cx(),
+                            self.thread_obj.as_ref(),
+                        ),
                         false,
                     ),
                     None => (NtStatus::STATUS_INVALID_HANDLE, false),
@@ -3398,7 +6064,7 @@ impl NtShimEntrypoints {
             NtSyscallId::NtOpenSemaphore => {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let obj_attrs_ptr = args.arg2;
-                let name = read_object_attributes_name(obj_attrs_ptr);
+                let name = read_object_attributes_name(obj_attrs_ptr).unwrap_or_default();
                 #[cfg(debug_assertions)]
                 {
                     use litebox::platform::DebugLogProvider as _;
@@ -3418,15 +6084,20 @@ impl NtShimEntrypoints {
                 };
                 match waitable {
                     Some(w) => {
-                        let status =
-                            syscalls::sync::wait_single(ctx, &w, &self.wait_cx(), self.thread_id);
+                        let status = syscalls::sync::wait_single(
+                            ctx,
+                            &w,
+                            &self.wait_cx(),
+                            self.thread_id,
+                            self.thread_obj.as_ref(),
+                        );
                         #[cfg(debug_assertions)]
                         {
                             use litebox::platform::DebugLogProvider as _;
                             let timeout_raw = if timeout_ptr == 0 {
                                 None
                             } else {
-                                Some(unsafe { core::ptr::read(timeout_ptr as *const i64) })
+                                try_read_guest_value_unaligned::<i64>(timeout_ptr)
                             };
                             let (kind, manual_reset, signaled_now) = match &w {
                                 syscalls::sync::Waitable::Event(event) => {
@@ -3445,6 +6116,7 @@ impl NtShimEntrypoints {
                                     )
                                 }
                                 syscalls::sync::Waitable::Thread(_) => ("thread", None, None),
+                                syscalls::sync::Waitable::Process(_) => ("process", None, None),
                             };
                             litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
                                 "NT shim: NtWaitForSingleObject(handle=0x{handle:X}, kind={kind}, timeout_ptr=0x{timeout_ptr:X}, timeout_raw={timeout_raw:?}, manual_reset={manual_reset:?}, signaled_now={signaled_now:?}) -> {:?}\n",
@@ -3462,6 +6134,7 @@ impl NtShimEntrypoints {
                     &self.shared.handles,
                     &self.wait_cx(),
                     self.thread_id,
+                    self.thread_obj.as_ref(),
                 );
                 (status, false)
             }
@@ -3474,13 +6147,8 @@ impl NtShimEntrypoints {
                 let mut handles = self.shared.handles.lock();
 
                 // Handle pseudo-handles: -1 = current process, -2 = current thread.
-                let new_obj = if source_handle == 0xFFFFFFFF {
-                    Some(handle_table::NtObject::CurrentProcess)
-                } else if source_handle == 0xFFFFFFFE {
-                    Some(handle_table::NtObject::CurrentThread)
-                } else {
-                    None
-                };
+                let new_obj =
+                    duplicated_pseudo_handle_object(source_handle, self.thread_obj.as_ref());
 
                 let result = if let Some(obj) = new_obj {
                     let h = handles.insert(obj);
@@ -3491,8 +6159,12 @@ impl NtShimEntrypoints {
 
                 if let Some(new_handle) = result {
                     if target_handle_va != 0 {
-                        unsafe {
-                            core::ptr::write(target_handle_va as *mut u32, new_handle);
+                        if !try_write_guest_value_unaligned::<usize>(
+                            target_handle_va,
+                            new_handle as usize,
+                        ) {
+                            let _ = handles.close(new_handle);
+                            return (NtStatus::STATUS_ACCESS_VIOLATION, false);
                         }
                     }
                     (NtStatus::STATUS_SUCCESS, false)
@@ -3508,7 +6180,7 @@ impl NtShimEntrypoints {
                 let info_class = args.arg1 as u32;
                 let info_ptr = args.arg2;
                 let info_len = args.arg3 as u32;
-                let return_len_ptr = unsafe { syscalls::NtSyscallArgs::arg4(ctx) };
+                let return_len_ptr = syscalls::NtSyscallArgs::arg4(ctx);
 
                 let handle_valid = match handle as i32 {
                     -1 | -2 | -4 | -5 | -6 => true,
@@ -3526,15 +6198,16 @@ impl NtShimEntrypoints {
                             // } OBJECT_HANDLE_FLAG_INFORMATION;
                             let needed: u32 = 2;
                             if return_len_ptr != 0 {
-                                unsafe {
-                                    core::ptr::write(return_len_ptr as *mut u32, needed);
-                                }
+                                crate::try_write_guest_value_unaligned(return_len_ptr, needed);
                             }
                             if info_len < needed {
                                 (NtStatus::STATUS_INFO_LENGTH_MISMATCH, false)
                             } else if info_ptr == 0 {
                                 (NtStatus::STATUS_INVALID_PARAMETER, false)
                             } else {
+                                if !crate::is_addr_range_writable(info_ptr, needed as usize) {
+                                    return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                                }
                                 unsafe {
                                     core::ptr::write(info_ptr as *mut u8, 0);
                                     core::ptr::write((info_ptr + 1) as *mut u8, 0);
@@ -3612,32 +6285,89 @@ impl NtShimEntrypoints {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let handle = args.arg0 as u32;
                 let exit_code = args.arg1 as i32;
+                if exit_code as u32 == 0xC000_0374 {
+                    let caller = self
+                        .thread_obj
+                        .as_ref()
+                        .map_or(0, |obj| obj.last_caller_ret());
+                    self.trace(
+                        TraceKind::ExitRequest,
+                        exit_code as u32,
+                        handle as usize,
+                        caller,
+                        ctx.regs.rip,
+                    );
+                    push_recent_chain_event(
+                        &self.shared.recent_chain_events,
+                        alloc::format!(
+                            "termthread:{}:0x{:X}:0x{:X}:0x{:X}:0x{:X}",
+                            self.thread_id,
+                            handle,
+                            ctx.regs.rip,
+                            ctx.regs.rsp,
+                            caller
+                        ),
+                    );
+                    if let Some(ref obj) = self.thread_obj {
+                        obj.set_debug_stage(0xC3742001);
+                        obj.set_last_guest_context(ctx.regs.rip, ctx.regs.rsp);
+                        obj.set_last_caller_ret(caller);
+                    }
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "[heapcorr-exit] NtTerminateThread tid={} handle=0x{:X} rip=0x{:X} rsp=0x{:X} caller=0x{:X}\n",
+                        self.thread_id, handle, ctx.regs.rip, ctx.regs.rsp, caller
+                    ));
+                }
 
-                // -2 (0xFFFFFFFE) = NtCurrentThread pseudo-handle.
-                let is_current = handle == 0xFFFFFFFE || handle as i32 == -2;
+                // Real ntdll's RtlExitUserThread issues ZwTerminateThread with a
+                // NULL handle for the current thread, and user code may also use
+                // the conventional NtCurrentThread pseudo-handle (-2).
+                let is_current = handle == 0 || handle == 0xFFFFFFFE || handle as i32 == -2;
                 if is_current {
+                    if let Some(ref obj) = self.thread_obj {
+                        obj.set_debug_stage(0x5301);
+                    }
+                    {
+                        #[cfg(feature = "trace_debug")]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "[shim-exit] NtTerminateThread(self): tid={} exit_code=0x{:X}\n",
+                                self.thread_id, exit_code as u32
+                            ));
+                        }
+                    }
                     self.mark_current_thread_exited(exit_code);
                     return (NtStatus::STATUS_SUCCESS, true);
                 }
 
                 // Look up the handle and validate it's a thread object.
-                let handles = self.shared.handles.lock();
-                match handles.get(handle) {
-                    Some(handle_table::NtObject::Thread(t)) => {
+                enum TermLookup { OwnThread, OtherThread, WrongType }
+                let lookup = self.shared.handles.lock().with(handle, |entry| match &entry.object {
+                    handle_table::NtObject::Thread(t) => {
                         if t.thread_id == self.thread_id {
-                            // Handle resolves to our own thread.
-                            drop(handles);
-                            self.mark_current_thread_exited(exit_code);
-                            (NtStatus::STATUS_SUCCESS, true)
+                            TermLookup::OwnThread
                         } else {
-                            log_unimplemented!(
-                                "NtTerminateThread: cross-thread termination (handle=0x{:X})",
-                                handle
-                            );
-                            (NtStatus::STATUS_NOT_IMPLEMENTED, false)
+                            TermLookup::OtherThread
                         }
                     }
-                    Some(_) => {
+                    _ => TermLookup::WrongType,
+                });
+                match lookup {
+                    Some(TermLookup::OwnThread) => {
+                        // Handle resolves to our own thread.
+                        self.mark_current_thread_exited(exit_code);
+                        (NtStatus::STATUS_SUCCESS, true)
+                    }
+                    Some(TermLookup::OtherThread) => {
+                        log_unimplemented!(
+                            "NtTerminateThread: cross-thread termination (handle=0x{:X})",
+                            handle
+                        );
+                        (NtStatus::STATUS_NOT_IMPLEMENTED, false)
+                    }
+                    Some(TermLookup::WrongType) => {
                         // Handle exists but is not a thread object.
                         (NtStatus::STATUS_OBJECT_TYPE_MISMATCH, false)
                     }
@@ -3656,34 +6386,56 @@ impl NtShimEntrypoints {
                     self.shared
                         .handles
                         .lock()
-                        .get(handle)
-                        .and_then(|obj| match obj {
+                        .with(handle, |entry| match &entry.object {
                             handle_table::NtObject::Thread(t) => Some(t.clone()),
                             handle_table::NtObject::CurrentThread => self.thread_obj.clone(),
                             _ => None,
                         })
+                        .flatten()
                 };
 
-                match thread_obj {
+                // Check if this is a virtual thread handle (from NtCreateUserProcess).
+                // If so, the "thread" is already finished — just return success with
+                // previous suspend count = 1 (simulating a suspended-then-resumed thread).
+                let is_virtual_thread = if handle != 0xFFFFFFFE && handle as i32 != -2 {
+                    self.shared
+                        .handles
+                        .lock()
+                        .with(handle, |entry| matches!(&entry.object, handle_table::NtObject::VirtualThread { .. }))
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+
+                if is_virtual_thread {
+                    if suspend_count_ptr != 0 {
+                        // Write previous suspend count = 1 (was suspended, now resumed).
+                        crate::try_write_guest_value_unaligned(suspend_count_ptr, 1u32);
+                    }
+                    (NtStatus::STATUS_SUCCESS, false)
+                } else {
+                    match thread_obj {
                     Some(thread_obj) => {
                         let previous = thread_obj.resume();
                         if should_alert {
-                            thread_obj.alert_by_id();
+                            thread_obj.post_plain_alert();
                         }
-                        if suspend_count_ptr != 0 {
-                            unsafe {
-                                core::ptr::write(suspend_count_ptr as *mut u32, previous);
-                            }
+                        if suspend_count_ptr != 0
+                            && !crate::try_write_guest_value_unaligned(suspend_count_ptr, previous)
+                        {
+                            return (NtStatus::STATUS_ACCESS_VIOLATION, false);
                         }
                         (NtStatus::STATUS_SUCCESS, false)
                     }
                     None => (NtStatus::STATUS_INVALID_HANDLE, false),
+                    }
                 }
             }
             NtSyscallId::NtWaitForAlertByThreadId => match self.thread_obj.as_ref() {
                 Some(thread_obj) => (
                     syscalls::sync::nt_wait_for_alert_by_thread_id(
                         ctx,
+                        &self.shared,
                         thread_obj,
                         &self.wait_cx(),
                     ),
@@ -3697,18 +6449,101 @@ impl NtShimEntrypoints {
             NtSyscallId::NtAlertThreadByThreadId | NtSyscallId::NtAlertThreadByThreadIdEx => {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let target_thread_id = args.arg0 as u32;
+                let alert_lock = if nt_nr == NtSyscallId::NtAlertThreadByThreadIdEx {
+                    args.arg1
+                } else {
+                    0
+                };
+                {
+                    let mut posts = self.shared.recent_alert_posts.lock();
+                    if posts.len() >= 16 {
+                        posts.pop_front();
+                    }
+                    posts.push_back(AlertPostRecord {
+                        source_tid: self.thread_id,
+                        target_tid: target_thread_id,
+                        lock: alert_lock,
+                        is_ex: nt_nr == NtSyscallId::NtAlertThreadByThreadIdEx,
+                    });
+                }
+                push_recent_chain_event(
+                    &self.shared.recent_chain_events,
+                    alloc::format!(
+                        "{}:{}->{}@0x{:X}",
+                        if nt_nr == NtSyscallId::NtAlertThreadByThreadIdEx {
+                            "postex"
+                        } else {
+                            "postid"
+                        },
+                        self.thread_id,
+                        target_thread_id,
+                        alert_lock
+                    ),
+                );
+                let alert_stage_base = if nt_nr == NtSyscallId::NtAlertThreadByThreadIdEx {
+                    0x7200
+                } else {
+                    0x7100
+                };
+                if let Some(current_thread_obj) = self.thread_obj.as_ref() {
+                    current_thread_obj.set_last_outgoing_alert(target_thread_id, alert_lock);
+                    current_thread_obj.set_debug_stage(alert_stage_base + 1);
+                }
                 let thread_obj = self
                     .shared
                     .threads_by_id
                     .lock()
                     .get(&target_thread_id)
                     .cloned();
+                if let Some(current_thread_obj) = self.thread_obj.as_ref() {
+                    current_thread_obj.set_debug_stage(alert_stage_base + 2);
+                }
                 match thread_obj {
                     Some(thread_obj) => {
-                        thread_obj.alert_by_id();
+                        #[cfg(feature = "trace_debug")]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(
+                                &alloc::format!(
+                                    "NT shim: {:?}(caller_tid={}, target_tid={})\n",
+                                    nt_nr,
+                                    self.thread_id,
+                                    target_thread_id,
+                                ),
+                            );
+                        }
+                        // Both NtAlertThreadByThreadId and
+                        // NtAlertThreadByThreadIdEx are unconditional
+                        // per-thread wakes (the Ex address is informational
+                        // only). They use the by-thread-id mechanism, which
+                        // is separate from NtAlertThread / alertable waits.
+                        if let Some(current_thread_obj) = self.thread_obj.as_ref() {
+                            current_thread_obj.set_debug_stage(alert_stage_base + 3);
+                        }
+                        thread_obj.alert_by_id(true, alert_lock);
+                        if let Some(current_thread_obj) = self.thread_obj.as_ref() {
+                            current_thread_obj.set_debug_stage(alert_stage_base + 4);
+                        }
                         (NtStatus::STATUS_SUCCESS, false)
                     }
-                    None => (NtStatus::STATUS_INVALID_CID, false),
+                    None => {
+                        if let Some(current_thread_obj) = self.thread_obj.as_ref() {
+                            current_thread_obj.set_debug_stage(alert_stage_base + 0xF);
+                        }
+                        #[cfg(feature = "trace_debug")]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(
+                                &alloc::format!(
+                                    "NT shim: {:?}(caller_tid={}, target_tid={}) -> INVALID_CID\n",
+                                    nt_nr,
+                                    self.thread_id,
+                                    target_thread_id,
+                                ),
+                            );
+                        }
+                        (NtStatus::STATUS_INVALID_CID, false)
+                    }
                 }
             }
             // --- Registry stubs (NT level) ---
@@ -3717,23 +6552,24 @@ impl NtShimEntrypoints {
                 let key_handle_ptr = args.arg0; // PHANDLE
                 let obj_attrs_ptr = args.arg2; // POBJECT_ATTRIBUTES
                 let disposition_ptr =
-                    unsafe { core::ptr::read((ctx.regs.rsp + 0x38) as *const usize) };
+                    crate::try_read_guest_value_unaligned::<usize>(ctx.regs.rsp + 0x38)
+                        .unwrap_or(0);
 
                 let key_name = if obj_attrs_ptr != 0 {
                     let root_directory =
-                        unsafe { core::ptr::read_unaligned((obj_attrs_ptr + 0x08) as *const u64) }
-                            as u32;
+                        crate::try_read_guest_value_unaligned::<u64>(obj_attrs_ptr + 0x08)
+                            .unwrap_or(0) as u32;
                     let name_ptr =
-                        unsafe { core::ptr::read_unaligned((obj_attrs_ptr + 0x10) as *const u64) };
+                        crate::try_read_guest_value_unaligned::<u64>(obj_attrs_ptr + 0x10)
+                            .unwrap_or(0);
                     let raw_name = if name_ptr != 0 {
-                        let len =
-                            unsafe { core::ptr::read_unaligned(name_ptr as *const u16) } as usize;
+                        let len = crate::try_read_guest_value_unaligned::<u16>(name_ptr as usize)
+                            .unwrap_or(0) as usize;
                         let buf =
-                            unsafe { core::ptr::read_unaligned((name_ptr + 8) as *const u64) };
+                            crate::try_read_guest_value_unaligned::<u64>(name_ptr as usize + 8)
+                                .unwrap_or(0);
                         if buf != 0 && len > 0 {
-                            let wchars =
-                                unsafe { core::slice::from_raw_parts(buf as *const u16, len / 2) };
-                            alloc::string::String::from_utf16_lossy(wchars)
+                            read_guest_utf16_lossy(buf as usize, len)
                         } else {
                             alloc::string::String::from("<empty>")
                         }
@@ -3746,11 +6582,11 @@ impl NtShimEntrypoints {
                             .shared
                             .handles
                             .lock()
-                            .get(root_directory)
-                            .and_then(|obj| match obj {
+                            .with(root_directory, |entry| match &entry.object {
                                 handle_table::NtObject::RegistryKey { path } => Some(path.clone()),
                                 _ => None,
                             })
+                            .flatten()
                     {
                         if raw_name.is_empty() || raw_name == "<null>" || raw_name == "<empty>" {
                             base_path
@@ -3777,16 +6613,32 @@ impl NtShimEntrypoints {
                 if key_handle_ptr == 0 || obj_attrs_ptr == 0 {
                     (NtStatus::STATUS_INVALID_PARAMETER, false)
                 } else {
+                    // Check if the key already exists (VFS directory or
+                    // hardcoded values) to return the correct disposition.
+                    let key_exists = {
+                        let vfs_exists =
+                            if let Some(vfs_path) = registry::registry_key_to_vfs_path(&key_name) {
+                                if let Some(fs) = self.shared.fs.get() {
+                                    registry::registry_key_exists(fs.as_ref(), &vfs_path)
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+                        vfs_exists || !enumerate_hardcoded_value_names(&key_name).is_empty()
+                    };
                     let handle_val = self
                         .shared
                         .handles
                         .lock()
                         .insert(handle_table::NtObject::RegistryKey { path: key_name });
-                    unsafe {
-                        core::ptr::write(key_handle_ptr as *mut u32, handle_val);
-                        if disposition_ptr != 0 {
-                            core::ptr::write(disposition_ptr as *mut u32, 1); // REG_CREATED_NEW_KEY
-                        }
+                    if !crate::try_write_guest_value_unaligned(key_handle_ptr, handle_val) {
+                        return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                    }
+                    if disposition_ptr != 0 {
+                        let disposition: u32 = if key_exists { 3 } else { 1 }; // REG_OPENED_EXISTING_KEY or REG_CREATED_NEW_KEY
+                        crate::try_write_guest_value_unaligned(disposition_ptr, disposition);
                     }
                     (NtStatus::STATUS_SUCCESS, false)
                 }
@@ -3808,20 +6660,20 @@ impl NtShimEntrypoints {
                     //   +0x20: PVOID SecurityDescriptor
                     //   +0x28: PVOID SecurityQualityOfService
                     let root_directory =
-                        unsafe { core::ptr::read_unaligned((obj_attrs_ptr + 0x08) as *const u64) }
-                            as u32;
+                        crate::try_read_guest_value_unaligned::<u64>(obj_attrs_ptr + 0x08)
+                            .unwrap_or(0) as u32;
                     let name_ptr =
-                        unsafe { core::ptr::read_unaligned((obj_attrs_ptr + 0x10) as *const u64) };
+                        crate::try_read_guest_value_unaligned::<u64>(obj_attrs_ptr + 0x10)
+                            .unwrap_or(0);
                     let raw_name = if name_ptr != 0 {
                         // UNICODE_STRING: Length (u16) + MaxLength (u16) + Buffer (ptr)
-                        let len =
-                            unsafe { core::ptr::read_unaligned(name_ptr as *const u16) } as usize;
+                        let len = crate::try_read_guest_value_unaligned::<u16>(name_ptr as usize)
+                            .unwrap_or(0) as usize;
                         let buf =
-                            unsafe { core::ptr::read_unaligned((name_ptr + 8) as *const u64) };
+                            crate::try_read_guest_value_unaligned::<u64>(name_ptr as usize + 8)
+                                .unwrap_or(0);
                         if buf != 0 && len > 0 {
-                            let wchars =
-                                unsafe { core::slice::from_raw_parts(buf as *const u16, len / 2) };
-                            alloc::string::String::from_utf16_lossy(wchars)
+                            read_guest_utf16_lossy(buf as usize, len)
                         } else {
                             alloc::string::String::from("<empty>")
                         }
@@ -3834,11 +6686,11 @@ impl NtShimEntrypoints {
                             .shared
                             .handles
                             .lock()
-                            .get(root_directory)
-                            .and_then(|obj| match obj {
+                            .with(root_directory, |entry| match &entry.object {
                                 handle_table::NtObject::RegistryKey { path } => Some(path.clone()),
                                 _ => None,
                             })
+                            .flatten()
                     {
                         if raw_name.is_empty() || raw_name == "<null>" || raw_name == "<empty>" {
                             base_path
@@ -3854,7 +6706,7 @@ impl NtShimEntrypoints {
                     alloc::string::String::from("<no-attrs>")
                 };
 
-                #[cfg(debug_assertions)]
+                #[cfg(feature = "trace_debug")]
                 {
                     use litebox::platform::DebugLogProvider as _;
                     let msg = alloc::format!("NT shim: NtOpenKey(name={key_name:?})\n");
@@ -3865,76 +6717,54 @@ impl NtShimEntrypoints {
                 // dummy key handle so ntdll can probe values under them even
                 // when we don't model the full registry tree.
                 let key_lower = key_name.to_ascii_lowercase();
-                let is_absent_heap_policy_key = key_lower
-                    == "\\registry\\machine\\software\\microsoft\\windows nt\\currentversion\\image file execution options\\node.exe"
-                    || key_lower
-                        == "\\registry\\machine\\system\\currentcontrolset\\control\\session manager\\segment heap";
-                if is_absent_heap_policy_key {
-                    return (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false);
-                }
-                let is_winsock_key = if let Some(suffix) = key_lower
-                    .strip_prefix("\\registry\\machine\\system\\currentcontrolset\\services\\winsock2\\parameters")
-                {
-                    let is_numbered_catalog_entry = |prefix: &str, max_entry: u32| -> bool {
-                        if let Some(entry) = suffix.strip_prefix(prefix)
-                            && entry.len() == 12
-                            && entry.bytes().all(|b| b.is_ascii_digit())
-                            && let Ok(parsed) = entry.parse::<u32>()
-                        {
-                            (1..=max_entry).contains(&parsed)
+
+                // Check VFS-backed registry first.
+                let vfs_key_exists =
+                    if let Some(vfs_path) = registry::registry_key_to_vfs_path(&key_name) {
+                        if let Some(fs) = self.shared.fs.get() {
+                            // Key exists if the directory exists OR if it has a
+                            // __values/ subdirectory (some keys only have values,
+                            // no explicit directory entry in the tar).
+                            registry::registry_key_exists(fs.as_ref(), &vfs_path)
+                                || registry::registry_key_exists(
+                                    fs.as_ref(),
+                                    &alloc::format!("{vfs_path}/__values"),
+                                )
                         } else {
                             false
                         }
+                    } else {
+                        false
                     };
 
-                    matches!(
-                        suffix,
-                        ""
-                            | "\\appid_catalog"
-                            | "\\namespace_catalog5"
-                            | "\\namespace_catalog5\\catalog_entries"
-                            | "\\namespace_catalog5\\catalog_entries64"
-                            | "\\protocol_catalog9"
-                            | "\\protocol_catalog9\\catalog_entries"
-                            | "\\protocol_catalog9\\catalog_entries64"
-                    ) || matches!(
-                        suffix.strip_prefix("\\appid_catalog\\"),
-                        Some(
-                            "06ebdcb1"
-                                | "07761dd8"
-                                | "1178a89f"
-                                | "17c2aa53"
-                                | "251585a4"
-                                | "2c69d9f1"
-                                | "343305c9"
-                                | "34dd6a3a"
-                        )
-                    ) || is_numbered_catalog_entry("\\namespace_catalog5\\catalog_entries\\", 5)
-                        || is_numbered_catalog_entry("\\namespace_catalog5\\catalog_entries64\\", 5)
-                        || is_numbered_catalog_entry("\\protocol_catalog9\\catalog_entries\\", 14)
-                        || is_numbered_catalog_entry("\\protocol_catalog9\\catalog_entries64\\", 14)
-                } else {
-                    false
-                };
-                let is_crypto_provider_key = key_lower
-                    .starts_with("\\registry\\machine\\software\\microsoft\\cryptography\\defaults\\provider\\")
-                    || key_lower.starts_with(
-                        "\\registry\\machine\\software\\microsoft\\cryptography\\defaults\\provider types\\",
-                    );
+                // IFEO subkeys (e.g. "...\Image File Execution Options\foo.exe")
+                // and the Segment Heap policy key should only be opened when
+                // they actually exist in the VFS.  Returning a dummy handle
+                // for a non-existent IFEO key causes ntdll/UCRT heap init to
+                // loop infinitely on NtQueryValueKey probing heap policy
+                // values (DisableHeapLookaside, UseFilter, etc.).
+                let is_ifeo_subkey = key_lower.contains("image file execution options\\");
+                let is_segment_heap_key = key_lower
+                    == "\\registry\\machine\\system\\currentcontrolset\\control\\session manager\\segment heap";
+                if (is_ifeo_subkey || is_segment_heap_key) && !vfs_key_exists {
+                    return (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false);
+                }
 
+                // Fall back to the hardcoded "critical key" heuristic for
+                // paths not yet in the VFS registry (e.g. Session Manager,
+                // KnownDlls, NLS, Control Panel).
                 let is_critical_key = key_lower.contains("session manager")
                     || key_lower.contains("knowndlls")
                     || key_lower.contains("nls")
                     || key_lower.contains("muilanguages")
                     || key_lower.contains("currentversion")
-                    || is_winsock_key
-                    || is_crypto_provider_key
+                    || key_lower.contains("control panel")
                     || key_lower == "\\registry\\machine"
                     || key_lower == "\\registry\\user"
                     || key_lower.contains("\\registry\\user\\")
-                    || key_lower.contains("control panel")
                     || key_lower.ends_with(".exe");
-                if is_critical_key {
+
+                if vfs_key_exists || is_critical_key {
                     // Dump PEB NLS fields for debugging
                     #[cfg(debug_assertions)]
                     if key_lower.contains("control panel")
@@ -3947,11 +6777,11 @@ impl NtShimEntrypoints {
                         let oemcp_id =
                             unsafe { core::ptr::read_unaligned((peb + 0x34E) as *const u16) };
                         let ansi_data =
-                            unsafe { core::ptr::read_unaligned((peb + 0x350) as *const u64) };
+                            unsafe { core::ptr::read_unaligned((peb + 0xA0) as *const u64) };
                         let oem_data =
-                            unsafe { core::ptr::read_unaligned((peb + 0x358) as *const u64) };
+                            unsafe { core::ptr::read_unaligned((peb + 0xA8) as *const u64) };
                         let case_data =
-                            unsafe { core::ptr::read_unaligned((peb + 0x360) as *const u64) };
+                            unsafe { core::ptr::read_unaligned((peb + 0xB0) as *const u64) };
                         litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
                             "NT shim: PEB NLS fields:\n  \
                                      ACP=0x{acp_id:X} OEMCP=0x{oemcp_id:X}\n  \
@@ -3979,19 +6809,365 @@ impl NtShimEntrypoints {
                                 path: key_name.clone(),
                             });
                     if key_handle_ptr != 0 {
-                        unsafe {
-                            core::ptr::write(key_handle_ptr as *mut u32, handle_val);
-                        }
+                        crate::try_write_guest_value_unaligned(key_handle_ptr, handle_val);
+                    }
+                    #[cfg(feature = "trace_debug")]
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "  NtOpenKey OK handle=0x{handle_val:X} vfs={vfs_key_exists} critical={is_critical_key}\n",
+                        ));
                     }
                     (NtStatus::STATUS_SUCCESS, false)
                 } else {
+                    #[cfg(feature = "trace_debug")]
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "  NtOpenKey FAIL name={key_name:?}\n",
+                        ));
+                    }
                     (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false)
                 }
             }
-            NtSyscallId::NtEnumerateKey | NtSyscallId::NtEnumerateValueKey => {
-                // Our dummy registry keys have no subkeys or values.
-                // Return STATUS_NO_MORE_ENTRIES to stop enumeration loops.
-                (NtStatus::STATUS_NO_MORE_ENTRIES, false)
+            NtSyscallId::NtEnumerateKey => {
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let key_handle = args.arg0 as u32;
+                let index = args.arg1 as usize;
+                let info_class = args.arg2 as u32;
+                let info_ptr = args.arg3;
+                let info_length = syscalls::NtSyscallArgs::arg4(ctx) as u32;
+                let result_length_ptr = syscalls::NtSyscallArgs::arg5(ctx);
+
+                let key_path =
+                    self.shared
+                        .handles
+                        .lock()
+                        .with(key_handle, |entry| match &entry.object {
+                            handle_table::NtObject::RegistryKey { path } => Some(path.clone()),
+                            _ => None,
+                        })
+                        .flatten();
+
+                if let Some(key_path) = key_path {
+                    let subkeys =
+                        if let Some(vfs_path) = registry::registry_key_to_vfs_path(&key_path) {
+                            if let Some(fs) = self.shared.fs.get() {
+                                registry::enumerate_subkeys(fs.as_ref(), &vfs_path)
+                            } else {
+                                alloc::vec::Vec::new()
+                            }
+                        } else {
+                            alloc::vec::Vec::new()
+                        };
+
+                    if index >= subkeys.len() {
+                        (NtStatus::STATUS_NO_MORE_ENTRIES, false)
+                    } else {
+                        let subkey_name = &subkeys[index];
+                        // Encode name as UTF-16LE
+                        let name_wide: alloc::vec::Vec<u16> = subkey_name.encode_utf16().collect();
+                        let name_bytes = name_wide.len() * 2;
+
+                        // KEY_BASIC_INFORMATION (class 0):
+                        //   LARGE_INTEGER LastWriteTime (8)
+                        //   ULONG TitleIndex (4)
+                        //   ULONG NameLength (4)
+                        //   WCHAR Name[1] (variable)
+                        if info_class == 0 {
+                            let total = 16 + name_bytes;
+                            if result_length_ptr != 0 {
+                                crate::try_write_guest_value_unaligned(
+                                    result_length_ptr,
+                                    total as u32,
+                                );
+                            }
+                            if info_ptr == 0 || (info_length as usize) < 16 {
+                                (NtStatus::STATUS_BUFFER_TOO_SMALL, false)
+                            } else {
+                                if !crate::is_addr_range_writable(info_ptr, info_length as usize) {
+                                    return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                                }
+                                unsafe {
+                                    let base = info_ptr as *mut u8;
+                                    // LastWriteTime = 0
+                                    core::ptr::write_bytes(base, 0, 8);
+                                    // TitleIndex = 0
+                                    core::ptr::write_unaligned(base.add(8).cast::<u32>(), 0);
+                                    // NameLength
+                                    core::ptr::write_unaligned(
+                                        base.add(12).cast::<u32>(),
+                                        name_bytes as u32,
+                                    );
+                                    let copy_len = core::cmp::min(
+                                        name_bytes,
+                                        (info_length as usize).saturating_sub(16),
+                                    );
+                                    if copy_len > 0 {
+                                        core::ptr::copy_nonoverlapping(
+                                            name_wide.as_ptr() as *const u8,
+                                            base.add(16),
+                                            copy_len,
+                                        );
+                                    }
+                                }
+                                if (info_length as usize) < 16 + name_bytes {
+                                    (NtStatus::STATUS_BUFFER_OVERFLOW, false)
+                                } else {
+                                    (NtStatus::STATUS_SUCCESS, false)
+                                }
+                            }
+                        } else if info_class == 1 {
+                            // KEY_NODE_INFORMATION (class 1):
+                            //   LARGE_INTEGER LastWriteTime (8)
+                            //   ULONG TitleIndex (4)
+                            //   ULONG ClassOffset (4)
+                            //   ULONG ClassLength (4)
+                            //   ULONG NameLength (4)
+                            //   WCHAR Name[1] (variable)
+                            // We report no class string (ClassOffset=0xFFFFFFFF, ClassLength=0).
+                            let header_size = 24usize;
+                            let total = header_size + name_bytes;
+                            if result_length_ptr != 0 {
+                                crate::try_write_guest_value_unaligned(
+                                    result_length_ptr,
+                                    total as u32,
+                                );
+                            }
+                            if info_ptr == 0 || (info_length as usize) < header_size {
+                                (NtStatus::STATUS_BUFFER_TOO_SMALL, false)
+                            } else {
+                                if !crate::is_addr_range_writable(info_ptr, info_length as usize) {
+                                    return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                                }
+                                unsafe {
+                                    let base = info_ptr as *mut u8;
+                                    // LastWriteTime = 0
+                                    core::ptr::write_bytes(base, 0, 8);
+                                    // TitleIndex = 0
+                                    core::ptr::write_unaligned(base.add(8).cast::<u32>(), 0);
+                                    // ClassOffset = 0xFFFFFFFF (no class)
+                                    core::ptr::write_unaligned(
+                                        base.add(12).cast::<u32>(),
+                                        0xFFFF_FFFFu32,
+                                    );
+                                    // ClassLength = 0
+                                    core::ptr::write_unaligned(base.add(16).cast::<u32>(), 0);
+                                    // NameLength
+                                    core::ptr::write_unaligned(
+                                        base.add(20).cast::<u32>(),
+                                        name_bytes as u32,
+                                    );
+                                    let copy_len = core::cmp::min(
+                                        name_bytes,
+                                        (info_length as usize).saturating_sub(header_size),
+                                    );
+                                    if copy_len > 0 {
+                                        core::ptr::copy_nonoverlapping(
+                                            name_wide.as_ptr() as *const u8,
+                                            base.add(header_size),
+                                            copy_len,
+                                        );
+                                    }
+                                }
+                                if (info_length as usize) < total {
+                                    (NtStatus::STATUS_BUFFER_OVERFLOW, false)
+                                } else {
+                                    (NtStatus::STATUS_SUCCESS, false)
+                                }
+                            }
+                        } else {
+                            // Other info classes: return size only
+                            let total = 16 + name_bytes;
+                            if result_length_ptr != 0 {
+                                crate::try_write_guest_value_unaligned(
+                                    result_length_ptr,
+                                    total as u32,
+                                );
+                            }
+                            (NtStatus::STATUS_NOT_IMPLEMENTED, false)
+                        }
+                    }
+                } else {
+                    (NtStatus::STATUS_INVALID_HANDLE, false)
+                }
+            }
+            NtSyscallId::NtEnumerateValueKey => {
+                // Enumerate values for a registry key.  Merges VFS-backed
+                // values with hardcoded fallback values (deduplicating).
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let key_handle = args.arg0 as u32;
+                let index = args.arg1 as usize;
+                let info_class = args.arg2 as u32;
+                let info_ptr = args.arg3;
+                let info_length = syscalls::NtSyscallArgs::arg4(ctx) as u32;
+                let result_length_ptr = syscalls::NtSyscallArgs::arg5(ctx);
+
+                let key_path =
+                    self.shared
+                        .handles
+                        .lock()
+                        .with(key_handle, |entry| match &entry.object {
+                            handle_table::NtObject::RegistryKey { path } => Some(path.clone()),
+                            _ => None,
+                        })
+                        .flatten();
+
+                if let Some(key_path) = key_path {
+                    // Get VFS values.
+                    let mut value_names =
+                        if let Some(vfs_path) = registry::registry_key_to_vfs_path(&key_path) {
+                            if let Some(fs) = self.shared.fs.get() {
+                                registry::enumerate_values(fs.as_ref(), &vfs_path)
+                            } else {
+                                alloc::vec::Vec::new()
+                            }
+                        } else {
+                            alloc::vec::Vec::new()
+                        };
+
+                    // Merge hardcoded fallback value names (skip names
+                    // already present from VFS, case-insensitive).
+                    let hardcoded = enumerate_hardcoded_value_names(&key_path);
+                    for hc_name in hardcoded {
+                        let hc_lower = hc_name.to_ascii_lowercase();
+                        let already_present = value_names
+                            .iter()
+                            .any(|v| v.to_ascii_lowercase() == hc_lower);
+                        if !already_present {
+                            value_names.push(alloc::string::String::from(hc_name));
+                        }
+                    }
+
+                    if index >= value_names.len() {
+                        (NtStatus::STATUS_NO_MORE_ENTRIES, false)
+                    } else {
+                        let value_name = &value_names[index];
+                        // Read the actual value data (VFS first, then fallback).
+                        let value_data =
+                            lookup_registry_value(&self.shared, &key_path, value_name);
+
+                        let (reg_type, data) = value_data.unwrap_or((0, alloc::vec::Vec::new()));
+                        let name_wide: alloc::vec::Vec<u16> = value_name.encode_utf16().collect();
+                        let name_bytes = name_wide.len() * 2;
+
+                        // KEY_VALUE_BASIC_INFORMATION (class 0):
+                        //   ULONG TitleIndex (4), ULONG Type (4),
+                        //   ULONG NameLength (4), WCHAR Name[1]
+                        // KEY_VALUE_FULL_INFORMATION (class 1):
+                        //   TitleIndex(4), Type(4), DataOffset(4),
+                        //   DataLength(4), NameLength(4), Name[], Data[]
+                        // KEY_VALUE_PARTIAL_INFORMATION (class 2):
+                        //   TitleIndex(4), Type(4), DataLength(4), Data[]
+                        if info_class == 0 {
+                            let total = 12 + name_bytes;
+                            if result_length_ptr != 0 {
+                                crate::try_write_guest_value_unaligned(
+                                    result_length_ptr,
+                                    total as u32,
+                                );
+                            }
+                            if info_ptr == 0 || (info_length as usize) < 12 {
+                                (NtStatus::STATUS_BUFFER_TOO_SMALL, false)
+                            } else {
+                                if !crate::is_addr_range_writable(info_ptr, info_length as usize) {
+                                    return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                                }
+                                unsafe {
+                                    let base = info_ptr as *mut u8;
+                                    core::ptr::write_unaligned(base.cast::<u32>(), 0); // TitleIndex
+                                    core::ptr::write_unaligned(base.add(4).cast::<u32>(), reg_type);
+                                    core::ptr::write_unaligned(
+                                        base.add(8).cast::<u32>(),
+                                        name_bytes as u32,
+                                    );
+                                    let copy_len = core::cmp::min(
+                                        name_bytes,
+                                        (info_length as usize).saturating_sub(12),
+                                    );
+                                    if copy_len > 0 {
+                                        core::ptr::copy_nonoverlapping(
+                                            name_wide.as_ptr() as *const u8,
+                                            base.add(12),
+                                            copy_len,
+                                        );
+                                    }
+                                }
+                                if (info_length as usize) < total {
+                                    (NtStatus::STATUS_BUFFER_OVERFLOW, false)
+                                } else {
+                                    (NtStatus::STATUS_SUCCESS, false)
+                                }
+                            }
+                        } else if info_class == 1 {
+                            // KEY_VALUE_FULL_INFORMATION
+                            // Header: 5 * u32 = 20 bytes, then Name, then Data
+                            let data_offset = 20 + name_bytes;
+                            let total = data_offset + data.len();
+                            if result_length_ptr != 0 {
+                                crate::try_write_guest_value_unaligned(
+                                    result_length_ptr,
+                                    total as u32,
+                                );
+                            }
+                            if info_ptr == 0 || (info_length as usize) < 20 {
+                                (NtStatus::STATUS_BUFFER_TOO_SMALL, false)
+                            } else {
+                                if !crate::is_addr_range_writable(info_ptr, info_length as usize) {
+                                    return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                                }
+                                unsafe {
+                                    let base = info_ptr as *mut u8;
+                                    core::ptr::write_unaligned(base.cast::<u32>(), 0); // TitleIndex
+                                    core::ptr::write_unaligned(base.add(4).cast::<u32>(), reg_type);
+                                    core::ptr::write_unaligned(
+                                        base.add(8).cast::<u32>(),
+                                        data_offset as u32,
+                                    );
+                                    core::ptr::write_unaligned(
+                                        base.add(12).cast::<u32>(),
+                                        data.len() as u32,
+                                    );
+                                    core::ptr::write_unaligned(
+                                        base.add(16).cast::<u32>(),
+                                        name_bytes as u32,
+                                    );
+                                    let name_copy = core::cmp::min(
+                                        name_bytes,
+                                        (info_length as usize).saturating_sub(20),
+                                    );
+                                    if name_copy > 0 {
+                                        core::ptr::copy_nonoverlapping(
+                                            name_wide.as_ptr() as *const u8,
+                                            base.add(20),
+                                            name_copy,
+                                        );
+                                    }
+                                    let data_copy = core::cmp::min(
+                                        data.len(),
+                                        (info_length as usize).saturating_sub(data_offset),
+                                    );
+                                    if data_copy > 0 {
+                                        core::ptr::copy_nonoverlapping(
+                                            data.as_ptr(),
+                                            base.add(data_offset),
+                                            data_copy,
+                                        );
+                                    }
+                                }
+                                if (info_length as usize) < total {
+                                    (NtStatus::STATUS_BUFFER_OVERFLOW, false)
+                                } else {
+                                    (NtStatus::STATUS_SUCCESS, false)
+                                }
+                            }
+                        } else {
+                            (NtStatus::STATUS_NOT_IMPLEMENTED, false)
+                        }
+                    }
+                } else {
+                    (NtStatus::STATUS_INVALID_HANDLE, false)
+                }
             }
             NtSyscallId::NtQueryValueKey => {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
@@ -3999,56 +7175,56 @@ impl NtShimEntrypoints {
                 let value_name_ptr = args.arg1; // PUNICODE_STRING
                 let info_class = args.arg2 as u32;
                 let info_ptr = args.arg3;
-                let info_length = unsafe { syscalls::NtSyscallArgs::arg4(ctx) } as u32;
-                let result_length_ptr = unsafe { syscalls::NtSyscallArgs::arg5(ctx) };
+                let info_length = syscalls::NtSyscallArgs::arg4(ctx) as u32;
+                let result_length_ptr = syscalls::NtSyscallArgs::arg5(ctx);
                 let key_path = self
                     .shared
                     .handles
                     .lock()
-                    .get(key_handle)
-                    .and_then(|obj| match obj {
+                    .with(key_handle, |entry| match &entry.object {
                         handle_table::NtObject::RegistryKey { path } => Some(path.clone()),
                         _ => None,
                     })
+                    .flatten()
                     .unwrap_or_else(|| alloc::format!("<handle 0x{key_handle:X}>"));
 
-                let value_name = read_guest_unicode_string_lossy(value_name_ptr);
+                let value_name =
+                    read_guest_unicode_string_lossy(value_name_ptr).unwrap_or_default();
 
-                #[cfg(debug_assertions)]
+                #[cfg(any(debug_assertions, feature = "trace_debug"))]
                 {
                     use litebox::platform::DebugLogProvider as _;
-                    // Dump raw stack slots around the args
-                    let rsp = ctx.regs.rsp;
-                    let mut stack_dump = alloc::string::String::from("  stack: ");
-                    for i in 0..8 {
-                        let off = i * 8;
-                        let val = unsafe { core::ptr::read_unaligned((rsp + off) as *const u64) };
-                        stack_dump.push_str(&alloc::format!("+0x{off:02X}={val:016X} "));
-                    }
                     let msg = alloc::format!(
-                        "NT shim: NtQueryValueKey(key={key_path:?}, name={value_name:?}, class={info_class}) info_ptr=0x{info_ptr:X} len={info_length} res_ptr=0x{result_length_ptr:X}\n{stack_dump}\n"
+                        "  NtQueryValueKey(key={key_path:?}, name={value_name:?}, class={info_class}) len={info_length}\n"
                     );
                     litebox_platform_multiplex::platform().debug_log_print(&msg);
                 }
 
                 if let Some((reg_type, reg_data)) =
-                    lookup_registry_value_bytes(&key_path, &value_name)
+                    lookup_registry_value(&self.shared, &key_path, &value_name)
                 {
                     let data_bytes = reg_data.len();
                     let total_size = 12 + data_bytes;
                     if result_length_ptr != 0 {
-                        unsafe {
-                            core::ptr::write(result_length_ptr as *mut u32, total_size as u32);
-                        }
+                        crate::try_write_guest_value_unaligned(
+                            result_length_ptr,
+                            total_size as u32,
+                        );
                     }
                     if info_ptr == 0 || info_length < 12 {
                         (NtStatus::STATUS_BUFFER_TOO_SMALL, false)
                     } else if info_class == 2 {
+                        if !crate::is_addr_range_writable(info_ptr, info_length as usize) {
+                            return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                        }
                         unsafe {
                             let base = info_ptr as *mut u8;
-                            core::ptr::write(base.cast::<u32>(), 0);
-                            core::ptr::write(base.add(4).cast::<u32>(), reg_type);
-                            core::ptr::write(base.add(8).cast::<u32>(), data_bytes as u32);
+                            core::ptr::write_unaligned(base.cast::<u32>(), 0);
+                            core::ptr::write_unaligned(base.add(4).cast::<u32>(), reg_type);
+                            core::ptr::write_unaligned(
+                                base.add(8).cast::<u32>(),
+                                data_bytes as u32,
+                            );
                             let copy_len = core::cmp::min(
                                 data_bytes,
                                 (info_length as usize).saturating_sub(12),
@@ -4071,13 +7247,11 @@ impl NtShimEntrypoints {
                     }
                 } else {
                     let status = NtStatus::STATUS_OBJECT_NAME_NOT_FOUND;
-                    #[cfg(debug_assertions)]
+                    #[cfg(any(debug_assertions, feature = "trace_debug"))]
                     {
                         use litebox::platform::DebugLogProvider as _;
-                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                            "NT shim: NtQueryValueKey returned 0x{:08X}\n",
-                            status.0 as u32,
-                        ));
+                        litebox_platform_multiplex::platform()
+                            .debug_log_print(&alloc::format!("  NtQueryValueKey -> NOT_FOUND\n",));
                     }
                     (status, false)
                 }
@@ -4088,17 +7262,17 @@ impl NtShimEntrypoints {
                 let value_entries_ptr = args.arg1;
                 let entry_count = args.arg2 as usize;
                 let value_buffer = args.arg3;
-                let buffer_length_ptr = unsafe { syscalls::NtSyscallArgs::arg4(ctx) };
-                let required_length_ptr = unsafe { syscalls::NtSyscallArgs::arg5(ctx) };
+                let buffer_length_ptr = syscalls::NtSyscallArgs::arg4(ctx);
+                let required_length_ptr = syscalls::NtSyscallArgs::arg5(ctx);
                 let key_path =
                     self.shared
                         .handles
                         .lock()
-                        .get(key_handle)
-                        .and_then(|obj| match obj {
+                        .with(key_handle, |entry| match &entry.object {
                             handle_table::NtObject::RegistryKey { path } => Some(path.clone()),
                             _ => None,
-                        });
+                        })
+                        .flatten();
 
                 #[cfg(debug_assertions)]
                 {
@@ -4111,20 +7285,20 @@ impl NtShimEntrypoints {
                 if value_entries_ptr == 0 || buffer_length_ptr == 0 || value_buffer == 0 {
                     (NtStatus::STATUS_INVALID_PARAMETER, false)
                 } else if let Some(key_path) = key_path {
-                    let available =
-                        unsafe { core::ptr::read_unaligned(buffer_length_ptr as *const u32) }
-                            as usize;
+                    let available = crate::try_read_guest_value_unaligned::<u32>(buffer_length_ptr)
+                        .unwrap_or(0) as usize;
                     let mut required = 0usize;
                     let mut resolved = alloc::vec::Vec::with_capacity(entry_count);
                     let mut missing_name = None;
 
                     for index in 0..entry_count {
                         let entry_ptr = value_entries_ptr + index * 24;
-                        let value_name_ptr =
-                            unsafe { core::ptr::read_unaligned(entry_ptr as *const u64) } as usize;
-                        let value_name = read_guest_unicode_string_lossy(value_name_ptr);
+                        let value_name_ptr = crate::try_read_guest_value_unaligned::<u64>(entry_ptr)
+                            .unwrap_or(0) as usize;
+                        let value_name =
+                            read_guest_unicode_string_lossy(value_name_ptr).unwrap_or_default();
                         if let Some((reg_type, reg_data)) =
-                            lookup_registry_value_bytes(&key_path, &value_name)
+                            lookup_registry_value(&self.shared, &key_path, &value_name)
                         {
                             required = required.saturating_add(reg_data.len());
                             resolved.push((entry_ptr, reg_type, reg_data));
@@ -4135,9 +7309,10 @@ impl NtShimEntrypoints {
                     }
 
                     if required_length_ptr != 0 {
-                        unsafe {
-                            core::ptr::write(required_length_ptr as *mut u32, required as u32);
-                        }
+                        crate::try_write_guest_value_unaligned(
+                            required_length_ptr,
+                            required as u32,
+                        );
                     }
 
                     if let Some(value_name) = missing_name {
@@ -4149,20 +7324,22 @@ impl NtShimEntrypoints {
                             ));
                         }
                         if buffer_length_ptr != 0 {
-                            unsafe {
-                                core::ptr::write(buffer_length_ptr as *mut u32, 0);
-                            }
+                            crate::try_write_guest_value_unaligned(buffer_length_ptr, 0u32);
                         }
                         (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false)
                     } else if available < required {
-                        unsafe {
-                            core::ptr::write(buffer_length_ptr as *mut u32, 0);
-                        }
+                        crate::try_write_guest_value_unaligned(buffer_length_ptr, 0u32);
                         (NtStatus::STATUS_BUFFER_OVERFLOW, false)
                     } else {
                         let mut offset = 0usize;
                         for (entry_ptr, reg_type, reg_data) in resolved {
                             if !reg_data.is_empty() {
+                                if !crate::is_addr_range_writable(
+                                    value_buffer + offset,
+                                    reg_data.len(),
+                                ) {
+                                    return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                                }
                                 unsafe {
                                     core::ptr::copy_nonoverlapping(
                                         reg_data.as_ptr(),
@@ -4171,19 +7348,15 @@ impl NtShimEntrypoints {
                                     );
                                 }
                             }
-                            unsafe {
-                                core::ptr::write(
-                                    (entry_ptr + 8) as *mut u32,
-                                    reg_data.len() as u32,
-                                );
-                                core::ptr::write((entry_ptr + 12) as *mut u32, offset as u32);
-                                core::ptr::write((entry_ptr + 16) as *mut u32, reg_type);
-                            }
+                            crate::try_write_guest_value_unaligned(
+                                entry_ptr + 8,
+                                reg_data.len() as u32,
+                            );
+                            crate::try_write_guest_value_unaligned(entry_ptr + 12, offset as u32);
+                            crate::try_write_guest_value_unaligned(entry_ptr + 16, reg_type);
                             offset += reg_data.len();
                         }
-                        unsafe {
-                            core::ptr::write(buffer_length_ptr as *mut u32, required as u32);
-                        }
+                        crate::try_write_guest_value_unaligned(buffer_length_ptr, required as u32);
                         (NtStatus::STATUS_SUCCESS, false)
                     }
                 } else {
@@ -4196,17 +7369,15 @@ impl NtShimEntrypoints {
                 let type_ptr = args.arg1;
                 let data_ptr = args.arg2;
                 let data_len = args.arg3 as u32;
-                let result_length_ptr = unsafe { syscalls::NtSyscallArgs::arg4(ctx) };
+                let result_length_ptr = syscalls::NtSyscallArgs::arg4(ctx);
 
                 let value_name = if value_name_ptr != 0 {
-                    let len =
-                        unsafe { core::ptr::read_unaligned(value_name_ptr as *const u16) } as usize;
-                    let buf =
-                        unsafe { core::ptr::read_unaligned((value_name_ptr + 8) as *const u64) };
+                    let len = crate::try_read_guest_value_unaligned::<u16>(value_name_ptr)
+                        .unwrap_or(0) as usize;
+                    let buf = crate::try_read_guest_value_unaligned::<u64>(value_name_ptr + 8)
+                        .unwrap_or(0);
                     if buf != 0 && len > 0 {
-                        let wchars =
-                            unsafe { core::slice::from_raw_parts(buf as *const u16, len / 2) };
-                        alloc::string::String::from_utf16_lossy(wchars)
+                        read_guest_utf16_lossy(buf as usize, len)
                     } else {
                         alloc::string::String::new()
                     }
@@ -4228,18 +7399,16 @@ impl NtShimEntrypoints {
                     //   -> STATUS_SUCCESS, type = REG_DWORD (4), data = 0, return_length = 4
                     "TerminalServices-RemoteConnectionManager-AllowAppServerMode" => {
                         if result_length_ptr != 0 {
-                            unsafe {
-                                core::ptr::write(result_length_ptr as *mut u32, 4);
-                            }
+                            crate::try_write_guest_value_unaligned(result_length_ptr, 4u32);
                         }
                         if data_ptr == 0 || data_len < 4 {
                             (NtStatus::STATUS_BUFFER_TOO_SMALL, false)
                         } else {
-                            unsafe {
-                                if type_ptr != 0 {
-                                    core::ptr::write(type_ptr as *mut u32, 4);
-                                }
-                                core::ptr::write(data_ptr as *mut u32, 0);
+                            if type_ptr != 0 {
+                                crate::try_write_guest_value_unaligned(type_ptr, 4u32);
+                            }
+                            if !crate::try_write_guest_value_unaligned(data_ptr, 0u32) {
+                                return (NtStatus::STATUS_ACCESS_VIOLATION, false);
                             }
                             (NtStatus::STATUS_SUCCESS, false)
                         }
@@ -4273,8 +7442,8 @@ impl NtShimEntrypoints {
                     // Match the rest of the sandbox's synthesized locale state.
                     // The NLS loader and MUI fallback paths are currently all
                     // configured around en-US (0x0409).
-                    unsafe {
-                        core::ptr::write(lang_id_ptr as *mut u16, 0x0409);
+                    if !crate::try_write_guest_value_unaligned(lang_id_ptr, 0x0409u16) {
+                        return (NtStatus::STATUS_ACCESS_VIOLATION, false);
                     }
                     #[cfg(debug_assertions)]
                     {
@@ -4289,74 +7458,43 @@ impl NtShimEntrypoints {
 
             // --- NtContinue: restore CONTEXT and resume ---
             NtSyscallId::NtContinue => {
+                if let Some(ref obj) = self.thread_obj {
+                    obj.set_debug_stage(0x4301);
+                }
+                push_recent_chain_event(
+                    &self.shared.recent_chain_events,
+                    alloc::format!("cont-enter:{}", self.thread_id),
+                );
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let context_ptr = args.arg0; // RCX (saved in R10) = CONTEXT*
-                // Read the CONTEXT structure from guest memory and update
-                // the execution context registers so the platform resumes
-                // at the new RIP/RSP/etc.
-                // CONTEXT offsets (x64):
-                //   0x44 = EFlags, 0x78 = Rax, 0x80 = Rcx, 0x88 = Rdx,
-                //   0x90 = Rbx, 0x98 = Rsp, 0xA0 = Rbp, 0xA8 = Rsi,
-                //   0xB0 = Rdi, 0xB8 = R8, 0xC0 = R9, 0xC8 = R10,
-                //   0xD0 = R11, 0xD8 = R12, 0xE0 = R13, 0xE8 = R14,
-                //   0xF0 = R15, 0xF8 = Rip
-                unsafe {
-                    let p = context_ptr as *const u8;
-                    let r64 = |off: usize| {
-                        u64::from_le_bytes(
-                            core::slice::from_raw_parts(p.add(off), 8)
-                                .try_into()
-                                .unwrap(),
-                        ) as usize
-                    };
-                    let r32 = |off: usize| {
-                        u32::from_le_bytes(
-                            core::slice::from_raw_parts(p.add(off), 4)
-                                .try_into()
-                                .unwrap(),
-                        )
-                    };
-                    ctx.regs.rip = r64(0xF8);
-                    ctx.regs.rsp = r64(0x98);
-                    ctx.regs.rax = r64(0x78);
-                    ctx.regs.rcx = r64(0x80);
-                    ctx.regs.rdx = r64(0x88);
-                    ctx.regs.rbx = r64(0x90);
-                    ctx.regs.rbp = r64(0xA0);
-                    ctx.regs.rsi = r64(0xA8);
-                    ctx.regs.rdi = r64(0xB0);
-                    ctx.regs.r8 = r64(0xB8);
-                    ctx.regs.r9 = r64(0xC0);
-                    ctx.regs.r10 = r64(0xC8);
-                    ctx.regs.r11 = r64(0xD0);
-                    ctx.regs.r12 = r64(0xD8);
-                    ctx.regs.r13 = r64(0xE0);
-                    ctx.regs.r14 = r64(0xE8);
-                    ctx.regs.r15 = r64(0xF0);
-                    // Restore EFlags (offset 0x44 in CONTEXT).
-                    ctx.eflags = r32(0x44) as usize;
-                    // Restore FP state from CONTEXT.FltSave (offset 0x100,
-                    // 512-byte FXSAVE area) and initialize the XSAVE header
-                    // so that xrstor64 restores x87/SSE correctly.
-                    let flt_save_offset = 0x100;
-                    let fxsave_size = 512.min(ctx.fp_regs.data.len());
-                    core::ptr::copy_nonoverlapping(
-                        p.add(flt_save_offset),
-                        ctx.fp_regs.data.as_mut_ptr(),
-                        fxsave_size,
-                    );
-                    // Zero the XSAVE tail (header + extended state) and set
-                    // xstate_bv bits for x87|SSE so xrstor64 loads the FXSAVE
-                    // data above instead of re-initializing those components.
-                    if ctx.fp_regs.data.len() > 512 {
-                        core::ptr::write_bytes(
-                            ctx.fp_regs.data.as_mut_ptr().add(512),
-                            0,
-                            ctx.fp_regs.data.len() - 512,
-                        );
-                        let xstate_bv = ctx.fp_regs.data.as_mut_ptr().add(512) as *mut u64;
-                        *xstate_bv = 0x3; // x87 (bit 0) | SSE (bit 1)
+                if context_ptr == 0 || !crate::is_addr_range_committed(context_ptr, 0x100) {
+                    return (NtStatus::STATUS_ACCESS_VIOLATION, true);
+                }
+                #[cfg(debug_assertions)]
+                {
+                    // Dump CONTEXT before restore to check for corruption
+                    use litebox::platform::DebugLogProvider as _;
+                    if crate::is_addr_range_committed(context_ptr, 0x120) {
+                        let ctx_flags =
+                            unsafe { core::ptr::read((context_ptr + 0x30) as *const u32) };
+                        let ctx_mxcsr =
+                            unsafe { core::ptr::read((context_ptr + 0x34) as *const u32) };
+                        // FXSAVE area at CONTEXT+0x100: dump FCW, MXCSR, xstate_bv area
+                        let flt_fcw =
+                            unsafe { core::ptr::read((context_ptr + 0x100) as *const u16) };
+                        let flt_mxcsr =
+                            unsafe { core::ptr::read((context_ptr + 0x100 + 24) as *const u32) };
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "NtContinue PRE: ctx=0x{context_ptr:X} flags=0x{ctx_flags:X} mxcsr_hdr=0x{ctx_mxcsr:X} flt_fcw=0x{flt_fcw:X} flt_mxcsr=0x{flt_mxcsr:X}\n",
+                        ));
                     }
+                }
+                unsafe {
+                    syscalls::k32_handlers::restore_guest_context_from_ptr(ctx, context_ptr, false);
+                }
+                if let Some(ref obj) = self.thread_obj {
+                    obj.set_debug_stage(0x4302);
+                    obj.set_last_guest_context(ctx.regs.rip, ctx.regs.rsp);
                 }
                 #[cfg(debug_assertions)]
                 {
@@ -4368,9 +7506,30 @@ impl NtShimEntrypoints {
                         ctx.regs.rcx,
                         ctx.regs.rdx
                     ));
-                    // TF (Trap Flag) tracing disabled — fires in host ASM
-                    // (switch_to_guest_sysret popfq) before reaching guest code.
                 }
+
+                // For child threads, verify and repair TLS after
+                // LdrpInitializeThread completes and NtContinue transitions
+                // to RtlUserThreadStart. LdrpInitializeThread may reallocate
+                // the TLS array we set up in NtCreateThreadEx, potentially
+                // leaving stale or zero-filled entries.
+                if self.thread_id != crate::peb_teb::SYNTHETIC_MAIN_THREAD_ID {
+                    if let Some(ref init) = self.init_state {
+                        if let Some(templates) = self.shared.tls_templates.get() {
+                            self.repair_child_thread_tls(init.teb_va, templates);
+                        }
+                    }
+                }
+                if let Some(ref obj) = self.thread_obj {
+                    obj.set_debug_stage(0x4303);
+                }
+                push_recent_chain_event(
+                    &self.shared.recent_chain_events,
+                    alloc::format!("cont-ready:{}:0x{:X}", self.thread_id, ctx.regs.rip),
+                );
+                self.maybe_arm_rtl_user_thread_start_syscall_probe(ctx, "cont-sysprobe");
+                self.maybe_arm_rtl_user_thread_start_gs_probe(ctx, "cont-step");
+
                 // NtContinue does not return an NTSTATUS — it switches context.
                 // We return STATUS_SUCCESS but the dispatch loop must NOT
                 // overwrite rax (it was already set from the CONTEXT).
@@ -4384,60 +7543,24 @@ impl NtShimEntrypoints {
             // continuation).  We ignore it and treat this identically to
             // NtContinue: restore the CONTEXT and resume.
             NtSyscallId::NtContinueEx => {
+                if let Some(ref obj) = self.thread_obj {
+                    obj.set_debug_stage(0x43E1);
+                }
+                push_recent_chain_event(
+                    &self.shared.recent_chain_events,
+                    alloc::format!("contex-enter:{}", self.thread_id),
+                );
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let context_ptr = args.arg0;
+                if context_ptr == 0 || !crate::is_addr_range_committed(context_ptr, 0x100) {
+                    return (NtStatus::STATUS_ACCESS_VIOLATION, true);
+                }
                 unsafe {
-                    let p = context_ptr as *const u8;
-                    let r64 = |off: usize| {
-                        u64::from_le_bytes(
-                            core::slice::from_raw_parts(p.add(off), 8)
-                                .try_into()
-                                .unwrap(),
-                        ) as usize
-                    };
-                    let r32 = |off: usize| {
-                        u32::from_le_bytes(
-                            core::slice::from_raw_parts(p.add(off), 4)
-                                .try_into()
-                                .unwrap(),
-                        )
-                    };
-                    ctx.regs.rip = r64(0xF8);
-                    ctx.regs.rsp = r64(0x98);
-                    ctx.regs.rax = r64(0x78);
-                    ctx.regs.rcx = r64(0x80);
-                    ctx.regs.rdx = r64(0x88);
-                    ctx.regs.rbx = r64(0x90);
-                    ctx.regs.rbp = r64(0xA0);
-                    ctx.regs.rsi = r64(0xA8);
-                    ctx.regs.rdi = r64(0xB0);
-                    ctx.regs.r8 = r64(0xB8);
-                    ctx.regs.r9 = r64(0xC0);
-                    ctx.regs.r10 = r64(0xC8);
-                    ctx.regs.r11 = r64(0xD0);
-                    ctx.regs.r12 = r64(0xD8);
-                    ctx.regs.r13 = r64(0xE0);
-                    ctx.regs.r14 = r64(0xE8);
-                    ctx.regs.r15 = r64(0xF0);
-                    ctx.eflags = r32(0x44) as usize;
-                    // Restore FP state and initialize XSAVE header (same as
-                    // NtContinue above).
-                    let flt_save_offset = 0x100;
-                    let fxsave_size = 512.min(ctx.fp_regs.data.len());
-                    core::ptr::copy_nonoverlapping(
-                        p.add(flt_save_offset),
-                        ctx.fp_regs.data.as_mut_ptr(),
-                        fxsave_size,
-                    );
-                    if ctx.fp_regs.data.len() > 512 {
-                        core::ptr::write_bytes(
-                            ctx.fp_regs.data.as_mut_ptr().add(512),
-                            0,
-                            ctx.fp_regs.data.len() - 512,
-                        );
-                        let xstate_bv = ctx.fp_regs.data.as_mut_ptr().add(512) as *mut u64;
-                        *xstate_bv = 0x3; // x87 (bit 0) | SSE (bit 1)
-                    }
+                    syscalls::k32_handlers::restore_guest_context_from_ptr(ctx, context_ptr, false);
+                }
+                if let Some(ref obj) = self.thread_obj {
+                    obj.set_debug_stage(0x43E2);
+                    obj.set_last_guest_context(ctx.regs.rip, ctx.regs.rsp);
                 }
                 #[cfg(debug_assertions)]
                 {
@@ -4450,34 +7573,174 @@ impl NtShimEntrypoints {
                         ctx.regs.rdx
                     ));
                 }
+                if let Some(ref obj) = self.thread_obj {
+                    obj.set_debug_stage(0x43E3);
+                }
+                push_recent_chain_event(
+                    &self.shared.recent_chain_events,
+                    alloc::format!("contex-ready:{}:0x{:X}", self.thread_id, ctx.regs.rip),
+                );
+                self.maybe_arm_rtl_user_thread_start_syscall_probe(ctx, "contex-sysprobe");
+                self.maybe_arm_rtl_user_thread_start_gs_probe(ctx, "contex-step");
                 (NtStatus::STATUS_SUCCESS, false)
             }
 
             // --- ntdll-driven init: section syscalls for DLL loading ---
             NtSyscallId::NtCreateSection => {
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let alloc_attributes =
+                    crate::try_read_guest_value_unaligned::<u32>(ctx.regs.rsp + 0x30).unwrap_or(0);
+                let max_size = if args.arg3 != 0 {
+                    (crate::try_read_guest_value_unaligned::<i64>(args.arg3).unwrap_or(0)) as u64
+                } else {
+                    0
+                };
                 let status = syscalls::section::nt_create_section(
                     ctx,
                     &mut self.shared.handles.lock(),
                     &self.shared,
                 );
+                if status == NtStatus::STATUS_SUCCESS && args.arg0 != 0 {
+                    let handle =
+                        crate::try_read_guest_value_unaligned::<u32>(args.arg0).unwrap_or(0);
+                    push_recent_chain_event(
+                        &self.shared.recent_chain_events,
+                        alloc::format!(
+                            "createsection:{}:0x{:X}:0x{:X}:0x{:X}",
+                            self.thread_id,
+                            handle,
+                            alloc_attributes,
+                            max_size
+                        ),
+                    );
+                }
                 (status, false)
             }
             NtSyscallId::NtMapViewOfSection => {
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let view_size_ptr =
+                    crate::try_read_guest_value_unaligned::<usize>(ctx.regs.rsp + 0x38)
+                        .unwrap_or(0);
+                let caller = self
+                    .thread_obj
+                    .as_ref()
+                    .map_or(0, |obj| obj.last_caller_ret());
                 let status = syscalls::section::nt_map_view_of_section(
                     ctx,
                     &self.shared.handles.lock(),
                     &self.shared,
                     self.init_state.as_ref(),
                 );
+                if status == NtStatus::STATUS_SUCCESS {
+                    let mapped_base =
+                        crate::try_read_guest_value_unaligned::<usize>(args.arg2).unwrap_or(0);
+                    let mapped_size = if view_size_ptr != 0 {
+                        crate::try_read_guest_value_unaligned::<usize>(view_size_ptr).unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    push_recent_vm_teardown(
+                        &self.shared.recent_vm_teardowns,
+                        RecentVmTeardown {
+                            tid: self.thread_id,
+                            kind: 6,
+                            base: mapped_base,
+                            size: mapped_size,
+                            detail: args.arg0,
+                            caller,
+                        },
+                    );
+                    push_recent_chain_event(
+                        &self.shared.recent_chain_events,
+                        alloc::format!(
+                            "mapview:{}:0x{:X}:0x{:X}:0x{:X}",
+                            self.thread_id,
+                            args.arg0,
+                            mapped_base,
+                            mapped_size
+                        ),
+                    );
+                }
                 (status, false)
             }
             NtSyscallId::NtUnmapViewOfSection => {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let unmap_base = args.arg1 as usize;
+                let caller = self
+                    .thread_obj
+                    .as_ref()
+                    .map_or(0, |obj| obj.last_caller_ret());
+                let image_mapping = self.shared.process_state.image_mapping_at(unmap_base);
+                let section_view = self.shared.process_state.section_view_at(unmap_base);
+                let nearest_section_view = self
+                    .shared
+                    .process_state
+                    .nearest_section_view_before(unmap_base);
                 let status = syscalls::section::nt_unmap_view_of_section(
                     &self.shared.process_state,
                     unmap_base,
                 );
+                if status == NtStatus::STATUS_SUCCESS {
+                    let (record_base, record_size) =
+                        image_mapping.or(section_view).unwrap_or((unmap_base, 0));
+                    push_recent_vm_teardown(
+                        &self.shared.recent_vm_teardowns,
+                        RecentVmTeardown {
+                            tid: self.thread_id,
+                            kind: 2,
+                            base: record_base,
+                            size: record_size,
+                            detail: 0,
+                            caller,
+                        },
+                    );
+                }
+                push_recent_chain_event(
+                    &self.shared.recent_chain_events,
+                    alloc::format!(
+                        "unmap:{}:0x{:X}:0x{:X}:0x{:X}",
+                        self.thread_id,
+                        unmap_base,
+                        status.0 as u32,
+                        caller
+                    ),
+                );
+                if status == NtStatus::STATUS_SUCCESS {
+                    if let Some((base, size)) = image_mapping {
+                        push_recent_chain_event(
+                            &self.shared.recent_chain_events,
+                            alloc::format!(
+                                "unmaphitimg:{}:0x{:X}:0x{:X}:0x{:X}",
+                                self.thread_id,
+                                unmap_base,
+                                base,
+                                size
+                            ),
+                        );
+                    } else if let Some((base, size)) = section_view {
+                        push_recent_chain_event(
+                            &self.shared.recent_chain_events,
+                            alloc::format!(
+                                "unmaphitsec:{}:0x{:X}:0x{:X}:0x{:X}",
+                                self.thread_id,
+                                unmap_base,
+                                base,
+                                size
+                            ),
+                        );
+                    } else if let Some((base, size)) = nearest_section_view {
+                        push_recent_chain_event(
+                            &self.shared.recent_chain_events,
+                            alloc::format!(
+                                "unmapnearsec:{}:0x{:X}:0x{:X}:0x{:X}",
+                                self.thread_id,
+                                unmap_base,
+                                base,
+                                size
+                            ),
+                        );
+                    }
+                }
                 (status, false)
             }
             NtSyscallId::NtUnmapViewOfSectionEx => {
@@ -4487,10 +7750,82 @@ impl NtShimEntrypoints {
                 // implement placeholders, but unmapping is identical.
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let unmap_base = args.arg1 as usize;
+                let caller = self
+                    .thread_obj
+                    .as_ref()
+                    .map_or(0, |obj| obj.last_caller_ret());
+                let image_mapping = self.shared.process_state.image_mapping_at(unmap_base);
+                let section_view = self.shared.process_state.section_view_at(unmap_base);
+                let nearest_section_view = self
+                    .shared
+                    .process_state
+                    .nearest_section_view_before(unmap_base);
                 let status = syscalls::section::nt_unmap_view_of_section(
                     &self.shared.process_state,
                     unmap_base,
                 );
+                if status == NtStatus::STATUS_SUCCESS {
+                    let (record_base, record_size) =
+                        image_mapping.or(section_view).unwrap_or((unmap_base, 0));
+                    push_recent_vm_teardown(
+                        &self.shared.recent_vm_teardowns,
+                        RecentVmTeardown {
+                            tid: self.thread_id,
+                            kind: 3,
+                            base: record_base,
+                            size: record_size,
+                            detail: args.arg2,
+                            caller,
+                        },
+                    );
+                }
+                push_recent_chain_event(
+                    &self.shared.recent_chain_events,
+                    alloc::format!(
+                        "unmapex:{}:0x{:X}:0x{:X}:0x{:X}:0x{:X}",
+                        self.thread_id,
+                        unmap_base,
+                        args.arg2,
+                        status.0 as u32,
+                        caller
+                    ),
+                );
+                if status == NtStatus::STATUS_SUCCESS {
+                    if let Some((base, size)) = image_mapping {
+                        push_recent_chain_event(
+                            &self.shared.recent_chain_events,
+                            alloc::format!(
+                                "unmapexhitimg:{}:0x{:X}:0x{:X}:0x{:X}",
+                                self.thread_id,
+                                unmap_base,
+                                base,
+                                size
+                            ),
+                        );
+                    } else if let Some((base, size)) = section_view {
+                        push_recent_chain_event(
+                            &self.shared.recent_chain_events,
+                            alloc::format!(
+                                "unmapexhitsec:{}:0x{:X}:0x{:X}:0x{:X}",
+                                self.thread_id,
+                                unmap_base,
+                                base,
+                                size
+                            ),
+                        );
+                    } else if let Some((base, size)) = nearest_section_view {
+                        push_recent_chain_event(
+                            &self.shared.recent_chain_events,
+                            alloc::format!(
+                                "unmapexnearsec:{}:0x{:X}:0x{:X}:0x{:X}",
+                                self.thread_id,
+                                unmap_base,
+                                base,
+                                size
+                            ),
+                        );
+                    }
+                }
                 (status, false)
             }
 
@@ -4502,32 +7837,14 @@ impl NtShimEntrypoints {
                 // NtOpenFile ΓåÆ NtCreateSection path.
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let handle_out_ptr = args.arg0;
-                let _desired_access = args.arg1 as u32;
                 let obj_attrs_ptr = args.arg2;
 
-                // Extract the name from OBJECT_ATTRIBUTES.
-                let name = if obj_attrs_ptr != 0 {
-                    let name_ptr =
-                        unsafe { core::ptr::read((obj_attrs_ptr + 0x10) as *const usize) };
-                    if name_ptr != 0 {
-                        let len = unsafe { core::ptr::read(name_ptr as *const u16) as usize };
-                        let buf = unsafe { core::ptr::read((name_ptr + 8) as *const usize) };
-                        if buf != 0 && len > 0 {
-                            let chars = len / 2;
-                            let slice =
-                                unsafe { core::slice::from_raw_parts(buf as *const u16, chars) };
-                            alloc::string::String::from_utf16_lossy(slice)
-                        } else {
-                            alloc::string::String::new()
-                        }
-                    } else {
-                        alloc::string::String::new()
-                    }
-                } else {
-                    alloc::string::String::new()
+                let name = {
+                    let handles = self.shared.handles.lock();
+                    resolve_object_attributes_name(obj_attrs_ptr, &handles)
                 };
 
-                #[cfg(debug_assertions)]
+                #[cfg(any(debug_assertions, feature = "trace_debug"))]
                 {
                     use litebox::platform::DebugLogProvider as _;
                     litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
@@ -4540,16 +7857,29 @@ impl NtShimEntrypoints {
                 let dll_name = name.rsplit('\\').next().unwrap_or(&name).to_lowercase();
 
                 // Try to find this DLL in the VFS (tar_ro layer).
-                // The tar stores DLLs under c/windows/system32/, so in the VFS
-                // they appear at /c/windows/system32/{dll_name}.  We also check
-                // the root as a fallback.
+                // For \KnownDlls\ requests, ONLY search system32 — real Windows
+                // KnownDlls only contains system DLLs.  App-specific DLLs
+                // (python314.dll, VCRUNTIME140.dll, etc.) must be found via the
+                // NtOpenFile fallback path, which uses the proper DLL search order
+                // derived from ProcessParameters.ImagePathName.
+                // For other NtOpenSection calls, also search the exe dir and root.
+                let is_known_dlls = name.to_lowercase().starts_with("\\knowndlls\\");
                 let found = if dll_name.ends_with(".dll") {
                     if let Some(fs) = self.shared.fs.get() {
                         use litebox::fs::FileSystem as _;
-                        let search_paths = [
+                        let mut search_paths = alloc::vec![
                             alloc::format!("/c/windows/system32/{dll_name}"),
-                            alloc::format!("/{dll_name}"),
                         ];
+                        if !is_known_dlls {
+                            // Add the exe's directory to the search path.
+                            {
+                                let exe_dir = self.shared.exe_directory_vfs.lock();
+                                if !exe_dir.is_empty() && exe_dir.as_str() != "/c/windows/system32" {
+                                    search_paths.push(alloc::format!("{}/{dll_name}", *exe_dir));
+                                }
+                            }
+                            search_paths.push(alloc::format!("/{dll_name}"));
+                        }
                         let mut result = None;
                         for vfs_path in &search_paths {
                             if let Ok(fd) = fs.open(
@@ -4564,7 +7894,7 @@ impl NtShimEntrypoints {
                                 buf.truncate(bytes_read);
                                 let _ = fs.close(&fd);
                                 if !buf.is_empty() {
-                                    result = Some(buf);
+                                    result = Some((buf, vfs_path.clone()));
                                     break;
                                 }
                             }
@@ -4577,13 +7907,42 @@ impl NtShimEntrypoints {
                     None
                 };
 
-                if let Some(pe_data) = found {
+                if let Some((pe_data, found_vfs_path)) = found {
+                    // Derive a Win32 module path from the VFS path where we found the DLL.
+                    // e.g. /c/windows/system32/kernel32.dll → C:\Windows\System32\kernel32.dll
+                    // e.g. /c/users/foo/app/mylib.dll → C:\users\foo\app\mylib.dll
+                    let module_path = {
+                        let without_leading = found_vfs_path.strip_prefix('/').unwrap_or(&found_vfs_path);
+                        let mut win_path = alloc::string::String::with_capacity(without_leading.len() + 2);
+                        let mut first = true;
+                        for ch in without_leading.chars() {
+                            if first {
+                                // Uppercase drive letter
+                                for uc in ch.to_uppercase() {
+                                    win_path.push(uc);
+                                }
+                                first = false;
+                            } else if ch == '/' {
+                                win_path.push('\\');
+                            } else {
+                                win_path.push(ch);
+                            }
+                        }
+                        // Insert colon after drive letter: C\foo → C:\foo
+                        if win_path.len() >= 2 && win_path.as_bytes()[1] == b'\\' {
+                            win_path.insert(1, ':');
+                        }
+                        win_path
+                    };
+
                     // Parse PE and create a Section handle (like NtCreateSection).
                     match litebox_common_windows::pe_parser::PeParsedFile::parse(&pe_data) {
                         Ok(parsed) => {
                             let handle = self.shared.handles.lock().insert(
                                 crate::handle_table::NtObject::Section {
                                     pe_data: alloc::sync::Arc::new(pe_data.clone()),
+                                    module_path: Some(module_path),
+                                    module_name: Some(dll_name.clone()),
                                     image_size: parsed.size_of_image,
                                     image_base: parsed.image_base,
                                     entry_point: parsed.entry_point,
@@ -4592,10 +7951,17 @@ impl NtShimEntrypoints {
                                 },
                             );
                             if handle_out_ptr != 0 {
-                                unsafe {
-                                    core::ptr::write(handle_out_ptr as *mut u32, handle);
-                                }
+                                crate::try_write_guest_value_unaligned(handle_out_ptr, handle);
                             }
+                            push_recent_chain_event(
+                                &self.shared.recent_chain_events,
+                                alloc::format!(
+                                    "opensection:{}:0x{:X}:{}",
+                                    self.thread_id,
+                                    handle,
+                                    dll_name
+                                ),
+                            );
                             #[cfg(debug_assertions)]
                             {
                                 use litebox::platform::DebugLogProvider as _;
@@ -4620,15 +7986,51 @@ impl NtShimEntrypoints {
                             (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false)
                         }
                     }
+                } else if name.ends_with("\\SharedSection") {
+                    let status = syscalls::section::open_csr_shared_section(
+                        &mut self.shared.handles.lock(),
+                        handle_out_ptr,
+                    );
+                    if status == NtStatus::STATUS_SUCCESS && handle_out_ptr != 0 {
+                        let handle = crate::try_read_guest_value_unaligned::<u32>(handle_out_ptr)
+                            .unwrap_or(0);
+                        push_recent_chain_event(
+                            &self.shared.recent_chain_events,
+                            alloc::format!(
+                                "opensection:{}:0x{:X}:SharedSection",
+                                self.thread_id,
+                                handle
+                            ),
+                        );
+                    }
+                    (status, false)
                 } else {
-                    #[cfg(debug_assertions)]
+                    #[cfg(any(debug_assertions, feature = "trace_debug"))]
                     {
                         use litebox::platform::DebugLogProvider as _;
                         litebox_platform_multiplex::platform()
-                            .debug_log_print("NT shim: NtOpenSection returned 0xC0000034\n");
+                            .debug_log_print(&alloc::format!(
+                                "NT shim: NtOpenSection NOT_FOUND name=\"{name}\" dll=\"{dll_name}\"\n"
+                            ));
                     }
                     (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false)
                 }
+            }
+            NtSyscallId::NtConnectPort => {
+                let status = syscalls::port::nt_connect_port(
+                    ctx,
+                    &mut self.shared.handles.lock(),
+                    &self.shared,
+                );
+                (status, false)
+            }
+            NtSyscallId::NtAlpcSendWaitReceivePort => {
+                let status = syscalls::port::nt_alpc_send_wait_receive_port(
+                    ctx,
+                    &self.shared.handles.lock(),
+                    &self.shared,
+                );
+                (status, false)
             }
             NtSyscallId::NtQuerySection => {
                 let status = syscalls::section::nt_query_section(ctx, &self.shared.handles.lock());
@@ -4643,9 +8045,36 @@ impl NtShimEntrypoints {
                     // The kernel atomically swaps TLS pointers in each thread's
                     // TEB so that the expanded vector becomes visible.
                     0x23 => {
-                        let info_ptr = ctx.regs.r8 as u64;
-                        let status = unsafe { self.handle_process_tls_information(info_ptr) };
+                        let info_ptr = ctx.regs.r8 as usize;
+                        let info_len = ctx.regs.r9 as usize;
+                        let status = self.handle_process_tls_information(info_ptr, info_len);
                         (status, false)
+                    }
+                    // ProcessDefaultHardErrorMode (0xC = 12)
+                    0xC => {
+                        let info_ptr = ctx.regs.r8 as usize;
+                        let info_len = ctx.regs.r9 as usize;
+                        if info_ptr == 0 || info_len < 4 {
+                            (NtStatus::STATUS_INFO_LENGTH_MISMATCH, false)
+                        } else {
+                            let Some(mode) = crate::try_read_guest_value_unaligned::<u32>(info_ptr)
+                            else {
+                                return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                            };
+                            self.shared
+                                .default_hard_error_mode
+                                .store(mode, Ordering::Release);
+                            #[cfg(debug_assertions)]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "  NtSetInformationProcess(0xC): default_hard_error_mode=0x{mode:X}\n",
+                                    ),
+                                );
+                            }
+                            (NtStatus::STATUS_SUCCESS, false)
+                        }
                     }
                     // ProcessMappingInformation (0x70 = 112): ntdll uses this
                     // to register the MI_MAP_INFO region with the kernel. The
@@ -4663,7 +8092,14 @@ impl NtShimEntrypoints {
                         }
                         (NtStatus(0xC0000003_u32 as i32), false) // STATUS_INVALID_INFO_CLASS
                     }
+                    // ProcessPowerThrottlingState (0x31 = 49): hint for power
+                    // management / EcoQoS. Safe to ignore in the sandbox.
+                    0x31 => (NtStatus::STATUS_SUCCESS, false),
+                    // ProcessLeapSecondInformation (0x35 = 53): opt-in for
+                    // leap-second-aware timestamps. No effect in sandbox.
+                    0x35 => (NtStatus::STATUS_SUCCESS, false),
                     _ => {
+                        log_unimplemented!("NtSetInformationProcess class 0x{:X}", info_class);
                         #[cfg(debug_assertions)]
                         {
                             use litebox::platform::DebugLogProvider as _;
@@ -4685,7 +8121,11 @@ impl NtShimEntrypoints {
                 let obj_attrs_ptr = args.arg2;
                 let initial_owner = args.arg3 != 0;
 
-                let name = read_object_attributes_name(obj_attrs_ptr);
+                if handle_out_ptr == 0 {
+                    return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                }
+
+                let name = read_object_attributes_name(obj_attrs_ptr).unwrap_or_default();
 
                 let handle = self
                     .shared
@@ -4695,10 +8135,8 @@ impl NtShimEntrypoints {
                         handle_table::MutantObject::new(initial_owner, self.thread_id),
                     )));
 
-                if handle_out_ptr != 0 {
-                    unsafe {
-                        core::ptr::write(handle_out_ptr as *mut u32, handle);
-                    }
+                if !try_write_guest_value_unaligned::<u32>(handle_out_ptr, handle) {
+                    return (NtStatus::STATUS_ACCESS_VIOLATION, false);
                 }
 
                 #[cfg(debug_assertions)]
@@ -4719,17 +8157,22 @@ impl NtShimEntrypoints {
 
                 let mutant = {
                     let handles = self.shared.handles.lock();
-                    match handles.get(handle) {
-                        Some(handle_table::NtObject::Mutant(mutant)) => {
-                            alloc::sync::Arc::clone(mutant)
+                    let val = handles.with(handle, |entry| match &entry.object {
+                        handle_table::NtObject::Mutant(mutant) => {
+                            Some(alloc::sync::Arc::clone(mutant))
                         }
-                        _ => return (NtStatus::STATUS_INVALID_HANDLE, false),
+                        _ => None,
+                    }).flatten();
+                    match val {
+                        Some(m) => m,
+                        None => return (NtStatus::STATUS_INVALID_HANDLE, false),
                     }
                 };
 
                 let mut state = mutant.state.lock();
                 if state.owner_thread_id != Some(self.thread_id) || state.recursion_count == 0 {
-                    (NtStatus::STATUS_ACCESS_DENIED, false)
+                    // STATUS_MUTANT_NOT_OWNED
+                    (NtStatus(0xC000_0046u32 as i32), false)
                 } else {
                     let previous_count = state.recursion_count as i32;
                     state.recursion_count -= 1;
@@ -4740,9 +8183,10 @@ impl NtShimEntrypoints {
                     drop(state);
 
                     if previous_count_ptr != 0 {
-                        unsafe {
-                            core::ptr::write(previous_count_ptr as *mut i32, previous_count);
-                        }
+                        let _ = try_write_guest_value_unaligned::<i32>(
+                            previous_count_ptr,
+                            previous_count,
+                        );
                     }
 
                     (NtStatus::STATUS_SUCCESS, false)
@@ -4754,7 +8198,22 @@ impl NtShimEntrypoints {
                 let info_class = args.arg1 as u32;
                 let info_ptr = args.arg2;
                 let info_len = args.arg3 as u32;
-                let return_len_ptr = unsafe { syscalls::NtSyscallArgs::arg4(ctx) };
+                let return_len_ptr = syscalls::NtSyscallArgs::arg4(ctx);
+
+                let resolve_target_thread = || {
+                    if thread_handle == 0xFFFF_FFFE || thread_handle as i32 == -2 {
+                        self.thread_obj.clone()
+                    } else {
+                        self.shared
+                            .handles
+                            .lock()
+                            .with(thread_handle, |entry| match &entry.object {
+                                handle_table::NtObject::Thread(t) => Some(t.clone()),
+                                handle_table::NtObject::CurrentThread => self.thread_obj.clone(),
+                                _ => None,
+                            }).flatten()
+                    }
+                };
 
                 match info_class {
                     0 => {
@@ -4768,28 +8227,16 @@ impl NtShimEntrypoints {
                         if info_len < 48 || info_ptr == 0 {
                             (NtStatus::STATUS_INFO_LENGTH_MISMATCH, false)
                         } else {
-                            let target_thread =
-                                if thread_handle == 0xFFFF_FFFE || thread_handle as i32 == -2 {
-                                    self.thread_obj.clone()
-                                } else {
-                                    self.shared
-                                        .handles
-                                        .lock()
-                                        .get(thread_handle)
-                                        .and_then(|obj| match obj {
-                                            handle_table::NtObject::Thread(t) => Some(t.clone()),
-                                            handle_table::NtObject::CurrentThread => {
-                                                self.thread_obj.clone()
-                                            }
-                                            _ => None,
-                                        })
-                                };
+                            let target_thread = resolve_target_thread();
                             let Some(target_thread) = target_thread else {
                                 return (NtStatus::STATUS_INVALID_HANDLE, false);
                             };
                             let teb_va = target_thread.teb_va();
                             let exit_status = (*target_thread.exit_status.lock())
                                 .map_or(0x103u32, |status| status as u32);
+                            if !crate::is_addr_range_writable(info_ptr, 48) {
+                                return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                            }
                             unsafe {
                                 let p = info_ptr as *mut u8;
                                 core::ptr::write_bytes(p, 0, 48);
@@ -4811,9 +8258,40 @@ impl NtShimEntrypoints {
                                 core::ptr::write(p.add(0x2C) as *mut i32, 8);
                             }
                             if return_len_ptr != 0 {
-                                unsafe {
-                                    core::ptr::write(return_len_ptr as *mut u32, 48);
-                                }
+                                crate::try_write_guest_value_unaligned(return_len_ptr, 48u32);
+                            }
+                            (NtStatus::STATUS_SUCCESS, false)
+                        }
+                    }
+                    12 => {
+                        // ThreadAmILastThread: returns a BOOLEAN/ULONG indicating
+                        // whether the queried thread is the only live thread in
+                        // the process.
+                        if info_len < 4 || info_ptr == 0 {
+                            (NtStatus::STATUS_INFO_LENGTH_MISMATCH, false)
+                        } else {
+                            let target_thread = resolve_target_thread();
+                            let Some(target_thread) = target_thread else {
+                                return (NtStatus::STATUS_INVALID_HANDLE, false);
+                            };
+                            let live_threads = self
+                                .shared
+                                .threads_by_id
+                                .lock()
+                                .values()
+                                .filter(|thread| !thread.has_exited())
+                                .count();
+                            let is_last_thread =
+                                u32::from(live_threads == 1 && !target_thread.has_exited());
+                            if !crate::is_addr_range_writable(info_ptr, core::mem::size_of::<u32>())
+                            {
+                                return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                            }
+                            unsafe {
+                                core::ptr::write(info_ptr as *mut u32, is_last_thread);
+                            }
+                            if return_len_ptr != 0 {
+                                crate::try_write_guest_value_unaligned(return_len_ptr, 4u32);
                             }
                             (NtStatus::STATUS_SUCCESS, false)
                         }
@@ -4836,9 +8314,10 @@ impl NtShimEntrypoints {
                         .lock()
                         .insert(handle_table::NtObject::Stub {
                             kind: alloc::string::String::from("Token"),
+                            io_completion: None,
                         });
-                    unsafe {
-                        core::ptr::write(token_handle_ptr as *mut u32, handle);
+                    if !crate::try_write_guest_value_unaligned(token_handle_ptr, handle) {
+                        return (NtStatus::STATUS_ACCESS_VIOLATION, false);
                     }
                     (NtStatus::STATUS_SUCCESS, false)
                 }
@@ -4860,7 +8339,7 @@ impl NtShimEntrypoints {
                 let info_class = args.arg1 as u32;
                 let info_ptr = args.arg2;
                 let info_len = args.arg3 as u32;
-                let return_len_ptr = unsafe { syscalls::NtSyscallArgs::arg4(ctx) };
+                let return_len_ptr = syscalls::NtSyscallArgs::arg4(ctx);
 
                 match info_class {
                     1 => {
@@ -4876,19 +8355,20 @@ impl NtShimEntrypoints {
                         let needed = header_size + sid_size;
 
                         if return_len_ptr != 0 {
-                            unsafe {
-                                core::ptr::write(return_len_ptr as *mut u32, needed);
-                            }
+                            crate::try_write_guest_value_unaligned(return_len_ptr, needed);
                         }
                         if info_len < needed {
                             (NtStatus(0xC0000023_u32 as i32), false) // STATUS_BUFFER_TOO_SMALL
                         } else if info_ptr == 0 {
                             (NtStatus::STATUS_INVALID_PARAMETER, false)
                         } else {
+                            if !crate::is_addr_range_writable(info_ptr, needed as usize) {
+                                return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                            }
                             let buf = info_ptr as *mut u8;
                             unsafe {
                                 core::ptr::write_bytes(buf, 0, needed as usize);
-                                // PSID pointer ΓåÆ right after header
+                                // PSID pointer → right after header
                                 let sid_va = info_ptr + header_size as usize;
                                 core::ptr::write(buf as *mut u64, sid_va as u64);
                                 // Attributes = 0 (already zeroed)
@@ -4907,25 +8387,120 @@ impl NtShimEntrypoints {
                             (NtStatus::STATUS_SUCCESS, false)
                         }
                     }
+                    4 => {
+                        // TokenOwner: TOKEN_OWNER { PSID Owner; }
+                        // The owner SID is the same as the user SID.
+                        // TOKEN_OWNER on x64 is 8 bytes (one pointer), followed
+                        // by the SID data inline.
+                        let sid_size: u32 = 8 + 5 * 4; // 28 bytes
+                        let header_size: u32 = 8; // TOKEN_OWNER = { PSID }
+                        let needed = header_size + sid_size;
+
+                        if return_len_ptr != 0 {
+                            crate::try_write_guest_value_unaligned(return_len_ptr, needed);
+                        }
+                        if info_len < needed {
+                            (NtStatus(0xC0000023_u32 as i32), false) // STATUS_BUFFER_TOO_SMALL
+                        } else if info_ptr == 0 {
+                            (NtStatus::STATUS_INVALID_PARAMETER, false)
+                        } else {
+                            if !crate::is_addr_range_writable(info_ptr, needed as usize) {
+                                return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                            }
+                            let buf = info_ptr as *mut u8;
+                            unsafe {
+                                core::ptr::write_bytes(buf, 0, needed as usize);
+                                // PSID pointer → right after header
+                                let sid_va = info_ptr + header_size as usize;
+                                core::ptr::write(buf as *mut u64, sid_va as u64);
+                                // SID body: S-1-5-21-0-0-0-1000
+                                let sid = sid_va as *mut u8;
+                                *sid = 1; // Revision
+                                *sid.add(1) = 5; // SubAuthorityCount
+                                *sid.add(7) = 5; // IdentifierAuthority = {0,0,0,0,0,5}
+                                core::ptr::write((sid.add(8)) as *mut u32, 21);
+                                // SubAuthority[1..3] = 0 (already zeroed)
+                                core::ptr::write((sid.add(24)) as *mut u32, 1000);
+                            }
+                            (NtStatus::STATUS_SUCCESS, false)
+                        }
+                    }
+                    3 => {
+                        // TokenPrimaryGroup: TOKEN_PRIMARY_GROUP { PSID PrimaryGroup; }
+                        // Return a group SID inline after the header.
+                        // Use "None" (S-1-5-21-0-0-0-513 = Domain Users equivalent).
+                        let sid_size: u32 = 8 + 5 * 4; // 28 bytes
+                        let header_size: u32 = 8; // { PSID }
+                        let needed = header_size + sid_size;
+
+                        if return_len_ptr != 0 {
+                            crate::try_write_guest_value_unaligned(return_len_ptr, needed);
+                        }
+                        if info_len < needed {
+                            (NtStatus(0xC0000023_u32 as i32), false)
+                        } else if info_ptr == 0 {
+                            (NtStatus::STATUS_INVALID_PARAMETER, false)
+                        } else {
+                            if !crate::is_addr_range_writable(info_ptr, needed as usize) {
+                                return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                            }
+                            let buf = info_ptr as *mut u8;
+                            unsafe {
+                                core::ptr::write_bytes(buf, 0, needed as usize);
+                                let sid_va = info_ptr + header_size as usize;
+                                core::ptr::write(buf as *mut u64, sid_va as u64);
+                                let sid = sid_va as *mut u8;
+                                *sid = 1; // Revision
+                                *sid.add(1) = 5; // SubAuthorityCount
+                                *sid.add(7) = 5; // IdentifierAuthority
+                                core::ptr::write((sid.add(8)) as *mut u32, 21);
+                                // SubAuthority[4] = 513 (Domain Users)
+                                core::ptr::write((sid.add(24)) as *mut u32, 513);
+                            }
+                            (NtStatus::STATUS_SUCCESS, false)
+                        }
+                    }
+                    6 => {
+                        // TokenDefaultDacl: TOKEN_DEFAULT_DACL { PACL DefaultDacl; }
+                        // Return a minimal empty ACL allowing full access.
+                        // ACL header is 8 bytes. We place it right after the
+                        // TOKEN_DEFAULT_DACL header (8 bytes pointer).
+                        let acl_size: u32 = 8; // minimal ACL header (no ACEs)
+                        let header_size: u32 = 8; // { PACL }
+                        let needed = header_size + acl_size;
+
+                        if return_len_ptr != 0 {
+                            crate::try_write_guest_value_unaligned(return_len_ptr, needed);
+                        }
+                        if info_len < needed {
+                            (NtStatus(0xC0000023_u32 as i32), false)
+                        } else if info_ptr == 0 {
+                            (NtStatus::STATUS_INVALID_PARAMETER, false)
+                        } else {
+                            if !crate::is_addr_range_writable(info_ptr, needed as usize) {
+                                return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                            }
+                            let buf = info_ptr as *mut u8;
+                            unsafe {
+                                core::ptr::write_bytes(buf, 0, needed as usize);
+                                let acl_va = info_ptr + header_size as usize;
+                                core::ptr::write(buf as *mut u64, acl_va as u64);
+                                // ACL header: AclRevision=2, AclSize=8, AceCount=0
+                                let acl = acl_va as *mut u8;
+                                *acl = 2; // AclRevision
+                                // Sbz1 = 0 (already zeroed)
+                                core::ptr::write(acl.add(2) as *mut u16, acl_size as u16); // AclSize
+                                // AceCount = 0 (already zeroed)
+                                // Sbz2 = 0 (already zeroed)
+                            }
+                            (NtStatus::STATUS_SUCCESS, false)
+                        }
+                    }
                     10 => {
                         // TokenStatistics
-                        // typedef struct _TOKEN_STATISTICS {
-                        //   LUID TokenId;
-                        //   LUID AuthenticationId;
-                        //   LARGE_INTEGER ExpirationTime;
-                        //   TOKEN_TYPE TokenType;
-                        //   SECURITY_IMPERSONATION_LEVEL ImpersonationLevel;
-                        //   DWORD DynamicCharged;
-                        //   DWORD DynamicAvailable;
-                        //   DWORD GroupCount;
-                        //   DWORD PrivilegeCount;
-                        //   LUID ModifiedId;
-                        // } TOKEN_STATISTICS;
                         let needed: u32 = 56;
                         if return_len_ptr != 0 {
-                            unsafe {
-                                core::ptr::write(return_len_ptr as *mut u32, needed);
-                            }
+                            crate::try_write_guest_value_unaligned(return_len_ptr, needed);
                         }
                         if info_len < needed {
                             (NtStatus(0xC0000023_u32 as i32), false) // STATUS_BUFFER_TOO_SMALL
@@ -4938,21 +8513,20 @@ impl NtShimEntrypoints {
                                 2_u32 // TokenImpersonation
                             };
                             let impersonation_level = if token_type == 1 { 0_u32 } else { 2_u32 };
+                            if !crate::is_addr_range_writable(info_ptr, needed as usize) {
+                                return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                            }
                             let buf = info_ptr as *mut u8;
                             unsafe {
                                 core::ptr::write_bytes(buf, 0, needed as usize);
-                                // TokenId.LowPart / HighPart
                                 core::ptr::write(buf.add(0) as *mut u32, 1);
                                 core::ptr::write(buf.add(4) as *mut i32, 0);
-                                // AuthenticationId.LowPart / HighPart
                                 core::ptr::write(buf.add(8) as *mut u32, 0x3E7);
                                 core::ptr::write(buf.add(12) as *mut i32, 0);
-                                // ExpirationTime stays 0 (never expires in practice here)
                                 core::ptr::write(buf.add(24) as *mut u32, token_type);
                                 core::ptr::write(buf.add(28) as *mut u32, impersonation_level);
                                 core::ptr::write(buf.add(40) as *mut u32, 1); // GroupCount
                                 core::ptr::write(buf.add(44) as *mut u32, 0); // PrivilegeCount
-                                // ModifiedId.LowPart / HighPart
                                 core::ptr::write(buf.add(48) as *mut u32, 1);
                                 core::ptr::write(buf.add(52) as *mut i32, 0);
                             }
@@ -4963,13 +8537,11 @@ impl NtShimEntrypoints {
                         // TokenSessionId: ULONG
                         let needed: u32 = 4;
                         if return_len_ptr != 0 {
-                            unsafe {
-                                core::ptr::write(return_len_ptr as *mut u32, needed);
-                            }
+                            crate::try_write_guest_value_unaligned(return_len_ptr, needed);
                         }
                         if info_len >= needed && info_ptr != 0 {
-                            unsafe {
-                                core::ptr::write(info_ptr as *mut u32, 1);
+                            if !crate::try_write_guest_value_unaligned(info_ptr, 1u32) {
+                                return (NtStatus::STATUS_ACCESS_VIOLATION, false);
                             }
                             (NtStatus::STATUS_SUCCESS, false)
                         } else {
@@ -4980,13 +8552,11 @@ impl NtShimEntrypoints {
                         // TokenElevation: DWORD = 0 (not elevated)
                         let needed: u32 = 4;
                         if return_len_ptr != 0 {
-                            unsafe {
-                                core::ptr::write(return_len_ptr as *mut u32, needed);
-                            }
+                            crate::try_write_guest_value_unaligned(return_len_ptr, needed);
                         }
                         if info_len >= needed && info_ptr != 0 {
-                            unsafe {
-                                core::ptr::write(info_ptr as *mut u32, 0);
+                            if !crate::try_write_guest_value_unaligned(info_ptr, 0u32) {
+                                return (NtStatus::STATUS_ACCESS_VIOLATION, false);
                             }
                             (NtStatus::STATUS_SUCCESS, false)
                         } else {
@@ -4997,13 +8567,11 @@ impl NtShimEntrypoints {
                         // TokenUIAccess: DWORD = 0 (UIAccess disabled)
                         let needed: u32 = 4;
                         if return_len_ptr != 0 {
-                            unsafe {
-                                core::ptr::write(return_len_ptr as *mut u32, needed);
-                            }
+                            crate::try_write_guest_value_unaligned(return_len_ptr, needed);
                         }
                         if info_len >= needed && info_ptr != 0 {
-                            unsafe {
-                                core::ptr::write(info_ptr as *mut u32, 0);
+                            if !crate::try_write_guest_value_unaligned(info_ptr, 0u32) {
+                                return (NtStatus::STATUS_ACCESS_VIOLATION, false);
                             }
                             (NtStatus::STATUS_SUCCESS, false)
                         } else {
@@ -5014,13 +8582,11 @@ impl NtShimEntrypoints {
                         // TokenIsAppContainer: DWORD = 0 for a normal desktop process token.
                         let needed: u32 = 4;
                         if return_len_ptr != 0 {
-                            unsafe {
-                                core::ptr::write(return_len_ptr as *mut u32, needed);
-                            }
+                            crate::try_write_guest_value_unaligned(return_len_ptr, needed);
                         }
                         if info_len >= needed && info_ptr != 0 {
-                            unsafe {
-                                core::ptr::write(info_ptr as *mut u32, 0);
+                            if !crate::try_write_guest_value_unaligned(info_ptr, 0u32) {
+                                return (NtStatus::STATUS_ACCESS_VIOLATION, false);
                             }
                             (NtStatus::STATUS_SUCCESS, false)
                         } else {
@@ -5031,13 +8597,11 @@ impl NtShimEntrypoints {
                         // TokenPrivateNameSpace: DWORD = 0 for a normal desktop token.
                         let needed: u32 = 4;
                         if return_len_ptr != 0 {
-                            unsafe {
-                                core::ptr::write(return_len_ptr as *mut u32, needed);
-                            }
+                            crate::try_write_guest_value_unaligned(return_len_ptr, needed);
                         }
                         if info_len >= needed && info_ptr != 0 {
-                            unsafe {
-                                core::ptr::write(info_ptr as *mut u32, 0);
+                            if !crate::try_write_guest_value_unaligned(info_ptr, 0u32) {
+                                return (NtStatus::STATUS_ACCESS_VIOLATION, false);
                             }
                             (NtStatus::STATUS_SUCCESS, false)
                         } else {
@@ -5049,15 +8613,16 @@ impl NtShimEntrypoints {
                         // 16-byte zeroed structure on this machine.
                         let needed: u32 = 16;
                         if return_len_ptr != 0 {
-                            unsafe {
-                                core::ptr::write(return_len_ptr as *mut u32, needed);
-                            }
+                            crate::try_write_guest_value_unaligned(return_len_ptr, needed);
                         }
                         if info_len < needed {
                             (NtStatus(0xC0000023_u32 as i32), false)
                         } else if info_ptr == 0 {
                             (NtStatus::STATUS_INVALID_PARAMETER, false)
                         } else {
+                            if !crate::is_addr_range_writable(info_ptr, needed as usize) {
+                                return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                            }
                             unsafe {
                                 core::ptr::write_bytes(info_ptr as *mut u8, 0, needed as usize);
                             }
@@ -5084,8 +8649,8 @@ impl NtShimEntrypoints {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let token_handle = args.arg0 as i64;
                 let buffer_ptr = args.arg3;
-                let length = unsafe { syscalls::NtSyscallArgs::arg4(ctx) } as u32;
-                let return_len_ptr = unsafe { syscalls::NtSyscallArgs::arg5(ctx) };
+                let length = syscalls::NtSyscallArgs::arg4(ctx) as u32;
+                let return_len_ptr = syscalls::NtSyscallArgs::arg5(ctx);
 
                 // TOKEN_SECURITY_ATTRIBUTES_INFORMATION header on x64:
                 // USHORT Version, USHORT Reserved, ULONG AttributeCount, PVOID AttributeV1
@@ -5095,15 +8660,16 @@ impl NtShimEntrypoints {
                     -5 => (NtStatus::STATUS_NO_TOKEN, false),
                     -4 | -6 => {
                         if return_len_ptr != 0 {
-                            unsafe {
-                                core::ptr::write(return_len_ptr as *mut u32, needed);
-                            }
+                            crate::try_write_guest_value_unaligned(return_len_ptr, needed);
                         }
                         if length < needed {
                             (NtStatus::STATUS_BUFFER_TOO_SMALL, false)
                         } else if buffer_ptr == 0 {
                             (NtStatus::STATUS_INVALID_PARAMETER, false)
                         } else {
+                            if !crate::is_addr_range_writable(buffer_ptr, needed as usize) {
+                                return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                            }
                             unsafe {
                                 core::ptr::write_bytes(buffer_ptr as *mut u8, 0, needed as usize);
                                 core::ptr::write(buffer_ptr as *mut u16, 1); // Version
@@ -5126,6 +8692,9 @@ impl NtShimEntrypoints {
                             } else if buffer_ptr == 0 {
                                 (NtStatus::STATUS_INVALID_PARAMETER, false)
                             } else {
+                                if !crate::is_addr_range_writable(buffer_ptr, needed as usize) {
+                                    return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                                }
                                 unsafe {
                                     core::ptr::write_bytes(
                                         buffer_ptr as *mut u8,
@@ -5156,14 +8725,14 @@ impl NtShimEntrypoints {
             }
             NtSyscallId::NtRtlExitUserThread => {
                 // Thread exit. For the main thread, treat as process exit.
-                if self.thread_obj.is_some() {
+                if self.thread_id != crate::peb_teb::SYNTHETIC_MAIN_THREAD_ID {
                     let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                     self.mark_current_thread_exited(args.arg0 as i32);
                     (NtStatus::STATUS_SUCCESS, true)
                 } else {
                     // Main thread exiting.
                     let args = syscalls::NtSyscallArgs::from_ctx(ctx);
-                    self.exit_code.store(args.arg0 as i32, Ordering::Release);
+                    self.mark_current_thread_exited_as_process_exit(args.arg0 as i32);
                     (NtStatus::STATUS_SUCCESS, true)
                 }
             }
@@ -5174,9 +8743,115 @@ impl NtShimEntrypoints {
                 (NtStatus::STATUS_SUCCESS, false)
             }
             NtSyscallId::NtTestAlert => {
-                // APC delivery probe. We do not queue APCs in the sandbox yet, so
-                // the empty-queue behavior is simply success.
-                (NtStatus::STATUS_SUCCESS, false)
+                // Check for pending user-mode APCs. If any were queued via
+                // NtQueueApcThread, return STATUS_USER_APC. The actual drain
+                // and delivery happens in EnterShim::syscall() after
+                // dispatch_syscall returns, where we have access to ctx.
+                if let Some(ref t) = self.thread_obj {
+                    if t.has_pending_user_apcs() {
+                        #[cfg(any(debug_assertions, feature = "trace_debug"))]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(
+                                "NtTestAlert: pending user APCs found, returning STATUS_USER_APC\n",
+                            );
+                        }
+                        // STATUS_USER_APC (0xC0)
+                        return (NtStatus(0xC0u32 as i32), false);
+                    }
+                }
+                // Fall back to plain alert check.
+                let alerted = self
+                    .thread_obj
+                    .as_ref()
+                    .is_some_and(|t| t.take_pending_alert());
+                if alerted {
+                    // STATUS_ALERTED
+                    (NtStatus(0x101u32 as i32), false)
+                } else {
+                    (NtStatus::STATUS_SUCCESS, false)
+                }
+            }
+            NtSyscallId::NtAlertThread => {
+                // NtAlertThread(ThreadHandle) — set the plain thread alert
+                // flag so the next alertable wait or NtTestAlert returns
+                // STATUS_ALERTED.
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let handle = args.arg0 as u32;
+                let thread_obj = if handle == 0xFFFFFFFE || handle as i32 == -2 {
+                    self.thread_obj.clone()
+                } else {
+                    self.shared
+                        .handles
+                        .lock()
+                        .with(handle, |entry| match &entry.object {
+                            handle_table::NtObject::Thread(t) => Some(t.clone()),
+                            handle_table::NtObject::CurrentThread => self.thread_obj.clone(),
+                            _ => None,
+                        }).flatten()
+                };
+                match thread_obj {
+                    Some(t) => {
+                        t.post_plain_alert();
+                        (NtStatus::STATUS_SUCCESS, false)
+                    }
+                    None => (NtStatus::STATUS_INVALID_HANDLE, false),
+                }
+            }
+            NtSyscallId::NtQueueApcThread | NtSyscallId::NtQueueApcThreadEx => {
+                // NtQueueApcThread(ThreadHandle, ApcRoutine, NormalContext,
+                //                  SystemArgument1, SystemArgument2)
+                // Queue a user-mode APC to the target thread. The APC will
+                // be delivered when the thread enters an alertable wait or
+                // calls NtTestAlert.
+                //
+                // NOTE: APC routines are not yet executed — they are drained
+                // and discarded at delivery points. If a caller depends on
+                // the routine actually running, this will need to be extended
+                // with full CONTEXT save/restore + guest execution.
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let thread_handle = args.arg0 as u32;
+                let apc_routine = args.arg1 as usize;
+                let normal_context = args.arg2 as usize;
+                let system_arg1 = args.arg3 as usize;
+                let system_arg2 = syscalls::NtSyscallArgs::arg4(ctx);
+
+                let thread_obj = if thread_handle == 0xFFFFFFFE
+                    || thread_handle as i32 == -2
+                {
+                    self.thread_obj.clone()
+                } else {
+                    self.shared
+                        .handles
+                        .lock()
+                        .with(thread_handle, |entry| match &entry.object {
+                            handle_table::NtObject::Thread(t) => Some(t.clone()),
+                            handle_table::NtObject::CurrentThread => self.thread_obj.clone(),
+                            _ => None,
+                        })
+                        .flatten()
+                };
+
+                match thread_obj {
+                    Some(t) => {
+                        #[cfg(any(debug_assertions, feature = "trace_debug"))]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "NtQueueApcThread: queued APC routine=0x{apc_routine:X} ctx=0x{normal_context:X} arg1=0x{system_arg1:X} arg2=0x{system_arg2:X} -> tid {}\n",
+                                t.thread_id,
+                            ));
+                        }
+                        t.queue_user_apc(handle_table::PendingUserApc {
+                            routine: apc_routine,
+                            context: normal_context,
+                            system_arg1,
+                            system_arg2,
+                        });
+                        (NtStatus::STATUS_SUCCESS, false)
+                    }
+                    None => (NtStatus::STATUS_INVALID_HANDLE, false),
+                }
             }
             NtSyscallId::NtManageHotPatch => {
                 // Hotpatching ΓÇö not supported in sandbox.
@@ -5188,20 +8863,43 @@ impl NtShimEntrypoints {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let status = args.arg0 as u32;
                 let num_params = args.arg1 as u32;
+                let unicode_mask = args.arg2 as u32;
                 let params_ptr = args.arg3; // PULONG_PTR *Parameters
                 {
                     use litebox::platform::DebugLogProvider as _;
                     litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                        "NtRaiseHardError: status=0x{status:08X} num_params={num_params}\n",
+                        "NtRaiseHardError: status=0x{status:08X} num_params={num_params} unicode_mask=0x{unicode_mask:X}\n",
                     ));
                     if params_ptr != 0 && num_params > 0 {
                         for i in 0..num_params.min(4) {
-                            let param = unsafe {
-                                core::ptr::read((params_ptr + (i as usize) * 8) as *const u64)
+                            let param_addr = params_ptr + (i as usize) * 8;
+                            let Some(param) = try_read_guest_value_unaligned::<u64>(param_addr)
+                            else {
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "  param[{i}] unreadable at 0x{param_addr:016X}\n"
+                                    ),
+                                );
+                                continue;
                             };
                             litebox_platform_multiplex::platform().debug_log_print(
                                 &alloc::format!("  param[{i}] = 0x{param:016X}\n"),
                             );
+                            if (unicode_mask & (1u32 << i)) != 0 && param != 0 {
+                                let maybe_text =
+                                    try_read_guest_unicode_string_lossy(param as usize, 1024);
+                                if let Some(text) = maybe_text {
+                                    litebox_platform_multiplex::platform().debug_log_print(
+                                        &alloc::format!("  param[{i}] str = {text:?}\n"),
+                                    );
+                                } else {
+                                    litebox_platform_multiplex::platform().debug_log_print(
+                                        &alloc::format!(
+                                            "  param[{i}] str unreadable at 0x{param:016X}\n"
+                                        ),
+                                    );
+                                }
+                            }
                         }
                     }
                     // Dump RSP, RIP, and all GPRs
@@ -5229,29 +8927,105 @@ impl NtShimEntrypoints {
                         ctx.regs.r14,
                         ctx.regs.r15,
                     ));
+                    let teb_va = self
+                        .thread_obj
+                        .as_ref()
+                        .map(|thread| thread.teb_va())
+                        .filter(|teb| *teb != 0)
+                        .or_else(|| self.init_state.as_ref().map(|init| init.teb_va))
+                        .unwrap_or(0);
+                    if teb_va != 0 {
+                        let last_error = try_read_guest_value_unaligned::<u32>(
+                            teb_va + peb_teb::teb_offsets::LAST_ERROR,
+                        );
+                        let win32_thread_info = try_read_guest_value_unaligned::<u64>(
+                            teb_va + peb_teb::teb_offsets::WIN32_THREAD_INFO,
+                        );
+                        let win32_qword0 = try_read_guest_value_unaligned::<u64>(
+                            teb_va + peb_teb::teb_offsets::WIN32_CLIENT_INFO_QWORD0,
+                        );
+                        let win32_dword10 = try_read_guest_value_unaligned::<u32>(
+                            teb_va + peb_teb::teb_offsets::WIN32_CLIENT_INFO_DWORD10,
+                        );
+                        let win32_dword18 = try_read_guest_value_unaligned::<u32>(
+                            teb_va + peb_teb::teb_offsets::WIN32_CLIENT_INFO_DWORD18,
+                        );
+                        let win32_ptr20 = try_read_guest_value_unaligned::<u64>(
+                            teb_va + peb_teb::teb_offsets::WIN32_CLIENT_INFO_PTR20,
+                        );
+                        let win32_ptr28 = try_read_guest_value_unaligned::<u64>(
+                            teb_va + peb_teb::teb_offsets::WIN32_CLIENT_INFO_PTR28,
+                        );
+                        let win32_dword38 = try_read_guest_value_unaligned::<u32>(
+                            teb_va + peb_teb::teb_offsets::WIN32_CLIENT_INFO_DWORD38,
+                        );
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "  guest teb=0x{teb_va:X} last_error={:#010X?} \
+win32_thread={:#018X?} win32_qword0={:#018X?}\n  \
+win32_dword10={:#010X?} win32_dword18={:#010X?} \
+win32_ptr20={:#018X?} win32_ptr28={:#018X?} win32_dword38={:#010X?}\n",
+                            last_error,
+                            win32_thread_info,
+                            win32_qword0,
+                            win32_dword10,
+                            win32_dword18,
+                            win32_ptr20,
+                            win32_ptr28,
+                            win32_dword38,
+                        ));
+                    }
+                    // Dump PEB fields critical to USER32/GDI init
+                    if let Some(init) = self.init_state.as_ref() {
+                        let peb = init.peb_va;
+                        let kernel_cb_table = try_read_guest_value_unaligned::<u64>(
+                            peb + peb_teb::peb_offsets::KERNEL_CALLBACK_TABLE,
+                        );
+                        let gdi_handle_table = try_read_guest_value_unaligned::<u64>(
+                            peb + peb_teb::peb_offsets::GDI_SHARED_HANDLE_TABLE,
+                        );
+                        let bitfield = try_read_guest_value_unaligned::<u8>(peb + 3);
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "  PEB+0x58 KernelCallbackTable={:#018X?} \
+PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
+                            kernel_cb_table,
+                            gdi_handle_table,
+                            bitfield,
+                        ));
+                    }
                     // Walk the stack to find return addresses (likely ntdll code)
-                    let (ntdll_base, ntdll_end) = self
+                    let modules: alloc::vec::Vec<(&str, usize, usize)> = self
                         .init_state
                         .as_ref()
-                        .and_then(|s| s.module_bases.iter().find(|m| m.name == "ntdll.dll"))
-                        .map_or((0, 0), |m| (m.base_address, m.base_address + m.image_size));
-                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                        "  ntdll range: 0x{ntdll_base:X}..0x{ntdll_end:X}\n",
-                    ));
-                    // Scan stack for all values (not just ntdll range)
+                        .map(|s| {
+                            s.module_bases
+                                .iter()
+                                .map(|m| {
+                                    (
+                                        m.name.as_str(),
+                                        m.base_address,
+                                        m.base_address + m.image_size,
+                                    )
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    // Scan stack for all values, annotating with any known module
                     let rsp = ctx.regs.rsp as usize;
                     litebox_platform_multiplex::platform().debug_log_print("  Full stack dump:\n");
-                    for off in (0..256).step_by(8) {
+                    for off in (0..512).step_by(8) {
                         let addr = rsp + off;
-                        if addr > 0 {
+                        if addr > 0 && crate::is_addr_committed(addr) {
                             let val = unsafe { core::ptr::read(addr as *const u64) };
-                            let annotation =
-                                if val as usize >= ntdll_base && (val as usize) < ntdll_end {
-                                    let rva = val as usize - ntdll_base;
-                                    alloc::format!(" (ntdll+0x{rva:X})")
-                                } else {
-                                    alloc::string::String::new()
-                                };
+                            let annotation = modules
+                                .iter()
+                                .find(|(_, base, end)| {
+                                    val as usize >= *base && (val as usize) < *end
+                                })
+                                .map(|(name, base, _)| {
+                                    let rva = val as usize - base;
+                                    alloc::format!(" ({name}+0x{rva:X})")
+                                })
+                                .unwrap_or_default();
                             litebox_platform_multiplex::platform().debug_log_print(
                                 &alloc::format!(
                                     "    [RSP+0x{off:X}] = 0x{val:016X}{annotation}\n",
@@ -5264,14 +9038,17 @@ impl NtShimEntrypoints {
                         for m in &init.module_bases {
                             if m.name.to_ascii_lowercase().contains("kernelbase") {
                                 let marker_addr = m.base_address + 0x39C868;
-                                let marker =
-                                    unsafe { core::ptr::read_unaligned(marker_addr as *const u16) };
-                                litebox_platform_multiplex::platform().debug_log_print(
-                                    &alloc::format!(
-                                        "  kernelbase progress: 0x{marker:X} (base=0x{:X})\n",
-                                        m.base_address
-                                    ),
-                                );
+                                if crate::is_addr_committed(marker_addr) {
+                                    let marker = unsafe {
+                                        core::ptr::read_unaligned(marker_addr as *const u16)
+                                    };
+                                    litebox_platform_multiplex::platform().debug_log_print(
+                                        &alloc::format!(
+                                            "  kernelbase progress: 0x{marker:X} (base=0x{:X})\n",
+                                            m.base_address
+                                        ),
+                                    );
+                                }
                             }
                         }
                     }
@@ -5282,62 +9059,73 @@ impl NtShimEntrypoints {
                     use litebox::platform::DebugLogProvider as _;
                     let peb = init.peb_va;
                     // PEB+0x18 = Ldr (PEB_LDR_DATA*)
-                    let ldr = unsafe { core::ptr::read((peb + 0x18) as *const usize) };
-                    if ldr != 0 {
-                        // PEB_LDR_DATA+0x10 = InLoadOrderModuleList (LIST_ENTRY)
-                        let list_head = ldr + 0x10;
-                        let mut entry = unsafe { core::ptr::read(list_head as *const usize) };
-                        let mut count = 0u32;
-                        litebox_platform_multiplex::platform()
-                            .debug_log_print("  Loaded modules (InLoadOrder):\n");
-                        while entry != list_head && count < 50 {
-                            // LDR_DATA_TABLE_ENTRY:
-                            //   +0x30 = DllBase (PVOID)
-                            //   +0x40 = SizeOfImage (ULONG)
-                            //   +0x48 = FullDllName (UNICODE_STRING)
-                            //   +0x58 = BaseDllName (UNICODE_STRING)
-                            //   +0x68 = Flags (ULONG)
-                            let dll_base =
-                                unsafe { core::ptr::read((entry + 0x30) as *const usize) };
-                            let size_of_image =
-                                unsafe { core::ptr::read((entry + 0x40) as *const u32) };
-                            let name_len = unsafe { core::ptr::read((entry + 0x58) as *const u16) };
-                            let name_buf =
-                                unsafe { core::ptr::read((entry + 0x58 + 8) as *const usize) };
-                            let flags = unsafe { core::ptr::read((entry + 0x68) as *const u32) };
+                    if crate::is_addr_committed(peb + 0x18) {
+                        let ldr = unsafe { core::ptr::read((peb + 0x18) as *const usize) };
+                        if ldr != 0 && crate::is_addr_committed(ldr + 0x10) {
+                            // PEB_LDR_DATA+0x10 = InLoadOrderModuleList (LIST_ENTRY)
+                            let list_head = ldr + 0x10;
+                            let mut entry = unsafe { core::ptr::read(list_head as *const usize) };
+                            let mut count = 0u32;
+                            litebox_platform_multiplex::platform()
+                                .debug_log_print("  Loaded modules (InLoadOrder):\n");
+                            while entry != list_head
+                                && count < 50
+                                && crate::is_addr_range_committed(entry, 0x70)
+                            {
+                                // LDR_DATA_TABLE_ENTRY:
+                                //   +0x30 = DllBase (PVOID)
+                                //   +0x40 = SizeOfImage (ULONG)
+                                //   +0x48 = FullDllName (UNICODE_STRING)
+                                //   +0x58 = BaseDllName (UNICODE_STRING)
+                                //   +0x68 = Flags (ULONG)
+                                let dll_base =
+                                    unsafe { core::ptr::read((entry + 0x30) as *const usize) };
+                                let size_of_image =
+                                    unsafe { core::ptr::read((entry + 0x40) as *const u32) };
+                                let name_len =
+                                    unsafe { core::ptr::read((entry + 0x58) as *const u16) };
+                                let name_buf =
+                                    unsafe { core::ptr::read((entry + 0x58 + 8) as *const usize) };
+                                let flags =
+                                    unsafe { core::ptr::read((entry + 0x68) as *const u32) };
 
-                            let name = if name_buf != 0 && name_len > 0 {
-                                let chars = unsafe {
-                                    core::slice::from_raw_parts(
-                                        name_buf as *const u16,
-                                        (name_len / 2) as usize,
-                                    )
+                                let name_byte_len = (name_len / 2) as usize;
+                                let name = if name_buf != 0
+                                    && name_len > 0
+                                    && crate::is_addr_range_committed(name_buf, name_len as usize)
+                                {
+                                    let chars = unsafe {
+                                        core::slice::from_raw_parts(
+                                            name_buf as *const u16,
+                                            name_byte_len,
+                                        )
+                                    };
+                                    alloc::string::String::from_utf16_lossy(chars)
+                                } else {
+                                    alloc::string::String::from("???")
                                 };
-                                alloc::string::String::from_utf16_lossy(chars)
-                            } else {
-                                alloc::string::String::from("???")
-                            };
 
-                            // Flag 0x80000 = LDRP_PROCESS_ATTACH_CALLED
-                            // Flag 0x100000 = LDRP_PROCESS_ATTACH_FAILED
-                            let init_status = if flags & 0x10_0000 != 0 {
-                                "FAILED"
-                            } else if flags & 0x8_0000 != 0 {
-                                "OK"
-                            } else {
-                                "not-called"
-                            };
-                            litebox_platform_multiplex::platform().debug_log_print(
-                                &alloc::format!(
-                                    "    {name}: base=0x{dll_base:X} size=0x{size_of_image:X} flags=0x{flags:X} init={init_status}\n",
-                                ),
-                            );
-                            entry = unsafe { core::ptr::read(entry as *const usize) };
-                            count += 1;
+                                // Flag 0x80000 = LDRP_PROCESS_ATTACH_CALLED
+                                // Flag 0x100000 = LDRP_PROCESS_ATTACH_FAILED
+                                let init_status = if flags & 0x10_0000 != 0 {
+                                    "FAILED"
+                                } else if flags & 0x8_0000 != 0 {
+                                    "OK"
+                                } else {
+                                    "not-called"
+                                };
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "    {name}: base=0x{dll_base:X} size=0x{size_of_image:X} flags=0x{flags:X} init={init_status}\n",
+                                    ),
+                                );
+                                entry = unsafe { core::ptr::read(entry as *const usize) };
+                                count += 1;
+                            }
                         }
                     }
                 }
-                self.exit_code.store(status as i32, Ordering::Release);
+                self.mark_current_thread_exited(status as i32);
                 (NtStatus::STATUS_SUCCESS, true)
             }
             NtSyscallId::NtQueryKey => {
@@ -5350,17 +9138,17 @@ impl NtShimEntrypoints {
                 let info_ptr = args.arg2;
                 let info_length = args.arg3 as u32;
                 let result_length_ptr =
-                    unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
+                    crate::try_read_guest_value_unaligned::<usize>(ctx.regs.rsp + 0x28)
+                        .unwrap_or(0);
 
                 let key_path =
                     self.shared
                         .handles
                         .lock()
-                        .get(key_handle)
-                        .and_then(|obj| match obj {
+                        .with(key_handle, |entry| match &entry.object {
                             handle_table::NtObject::RegistryKey { path } => Some(path.clone()),
                             _ => None,
-                        });
+                        }).flatten();
                 if let Some(key_path) = key_path {
                     // Minimum fixed-header sizes per NT ABI:
                     //   KeyBasicInformation:  LARGE_INTEGER + 2*ULONG = 16 bytes (+ Name)
@@ -5389,15 +9177,16 @@ impl NtShimEntrypoints {
                         _ => return (NtStatus::STATUS_INVALID_INFO_CLASS, false),
                     };
                     if result_length_ptr != 0 {
-                        unsafe {
-                            core::ptr::write(result_length_ptr as *mut u32, required);
-                        }
+                        crate::try_write_guest_value_unaligned(result_length_ptr, required);
                     }
                     if info_class == 3 {
                         if info_length < 4 {
                             (NtStatus::STATUS_BUFFER_TOO_SMALL, false)
                         } else {
                             if info_ptr != 0 {
+                                if !crate::is_addr_range_writable(info_ptr, info_length as usize) {
+                                    return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                                }
                                 unsafe {
                                     core::ptr::write_bytes(
                                         info_ptr as *mut u8,
@@ -5426,6 +9215,9 @@ impl NtShimEntrypoints {
                         (NtStatus::STATUS_BUFFER_TOO_SMALL, false)
                     } else {
                         if info_ptr != 0 && info_length > 0 {
+                            if !crate::is_addr_range_writable(info_ptr, info_length as usize) {
+                                return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                            }
                             unsafe {
                                 core::ptr::write_bytes(
                                     info_ptr as *mut u8,
@@ -5453,8 +9245,8 @@ impl NtShimEntrypoints {
                     .shared
                     .handles
                     .lock()
-                    .get(key_handle)
-                    .is_some_and(|obj| matches!(obj, handle_table::NtObject::RegistryKey { .. }));
+                    .with(key_handle, |entry| matches!(entry.object, handle_table::NtObject::RegistryKey { .. }))
+                    .unwrap_or(false);
 
                 if !key_valid {
                     (NtStatus::STATUS_INVALID_HANDLE, false)
@@ -5495,29 +9287,38 @@ impl NtShimEntrypoints {
                 let apc_routine = args.arg2;
                 let apc_context = args.arg3;
                 let io_status_ptr =
-                    unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
+                    crate::try_read_guest_value_unaligned::<usize>(ctx.regs.rsp + 0x28)
+                        .unwrap_or(0);
                 let completion_filter =
-                    unsafe { core::ptr::read((ctx.regs.rsp + 0x30) as *const u32) };
-                let watch_tree =
-                    unsafe { core::ptr::read((ctx.regs.rsp + 0x38) as *const u8) } != 0;
-                let buffer_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x40) as *const usize) };
-                let buffer_size = unsafe { core::ptr::read((ctx.regs.rsp + 0x48) as *const u32) };
-                let asynchronous =
-                    unsafe { core::ptr::read((ctx.regs.rsp + 0x50) as *const u8) } != 0;
+                    crate::try_read_guest_value_unaligned::<u32>(ctx.regs.rsp + 0x30).unwrap_or(0);
+                let watch_tree = crate::try_read_guest_value_unaligned::<u8>(ctx.regs.rsp + 0x38)
+                    .unwrap_or(0)
+                    != 0;
+                let buffer_ptr =
+                    crate::try_read_guest_value_unaligned::<usize>(ctx.regs.rsp + 0x40)
+                        .unwrap_or(0);
+                let buffer_size =
+                    crate::try_read_guest_value_unaligned::<u32>(ctx.regs.rsp + 0x48).unwrap_or(0);
+                let asynchronous = crate::try_read_guest_value_unaligned::<u8>(ctx.regs.rsp + 0x50)
+                    .unwrap_or(0)
+                    != 0;
 
                 let handles = self.shared.handles.lock();
-                let key_path = match handles.get(key_handle) {
-                    Some(handle_table::NtObject::RegistryKey { path }) => Some(path.clone()),
+                let key_path = handles.with(key_handle, |entry| match &entry.object {
+                    handle_table::NtObject::RegistryKey { path } => Some(path.clone()),
                     _ => None,
-                };
+                }).flatten();
                 let event_obj = if event_handle == 0 {
                     None
                 } else {
-                    match handles.get(event_handle) {
-                        Some(handle_table::NtObject::Event(event)) => {
+                    match handles.with(event_handle, |entry| match &entry.object {
+                        handle_table::NtObject::Event(event) => {
                             Some(alloc::sync::Arc::clone(event))
                         }
-                        _ => return (NtStatus::STATUS_INVALID_HANDLE, false),
+                        _ => None,
+                    }).flatten() {
+                        Some(ev) => Some(ev),
+                        None => return (NtStatus::STATUS_INVALID_HANDLE, false),
                     }
                 };
                 drop(handles);
@@ -5542,10 +9343,8 @@ impl NtShimEntrypoints {
                         *event.state.lock() = false;
                     }
                     if io_status_ptr != 0 {
-                        unsafe {
-                            core::ptr::write(io_status_ptr as *mut i32, NtStatus::STATUS_PENDING.0);
-                            core::ptr::write((io_status_ptr + 8) as *mut usize, 0);
-                        }
+                        try_write_guest_value_unaligned(io_status_ptr, NtStatus::STATUS_PENDING.0);
+                        try_write_guest_value_unaligned(io_status_ptr + 8, 0usize);
                     }
                     #[cfg(debug_assertions)]
                     {
@@ -5605,18 +9404,19 @@ impl NtShimEntrypoints {
                     Ok(addr) => {
                         let va = addr.as_usize();
                         if base_addr_out != 0 {
-                            unsafe { core::ptr::write(base_addr_out as *mut u64, va as u64) }
+                            crate::try_write_guest_value_unaligned(base_addr_out, va as u64);
                         }
                         if locale_id_out != 0 {
-                            unsafe { core::ptr::write(locale_id_out as *mut u32, nls.locale_id) }
+                            crate::try_write_guest_value_unaligned(locale_id_out, nls.locale_id);
                         }
                         if casing_size_out != 0 {
-                            unsafe {
-                                core::ptr::write(casing_size_out as *mut i64, nls.casing_size);
-                            }
+                            crate::try_write_guest_value_unaligned(
+                                casing_size_out,
+                                nls.casing_size,
+                            );
                         }
                         if version_out != 0 {
-                            unsafe { core::ptr::write(version_out as *mut u32, nls.version) }
+                            crate::try_write_guest_value_unaligned(version_out, nls.version);
                         }
                         #[cfg(debug_assertions)]
                         {
@@ -5626,6 +9426,58 @@ impl NtShimEntrypoints {
                                 data.len(), nls.locale_id
                             ));
                         }
+
+                        // Populate PEB NLS data pointers so ntdll can initialize
+                        // its NLS function tables (RtlpInitNlsTables).
+                        // The combined section layout is:
+                        //   [ANSI CP data | OEM CP data | Unicode case table]
+                        // ANSI CP starts at offset 0.
+                        let peb_va = self.init_state.as_ref().map_or(0, |s| s.peb_va);
+                        if peb_va != 0 {
+                            // PEB+0x350: AnsiCodePageData = section base (offset 0)
+                            unsafe {
+                                core::ptr::write_unaligned(
+                                    (peb_va + crate::peb_teb::peb_offsets::ANSI_CODE_PAGE_DATA)
+                                        as *mut u64,
+                                    va as u64,
+                                );
+                            }
+                            // PEB+0x358: OemCodePageData
+                            if nls.oem_cp_offset > 0 && nls.oem_cp_offset < data.len() {
+                                unsafe {
+                                    core::ptr::write_unaligned(
+                                        (peb_va + crate::peb_teb::peb_offsets::OEM_CODE_PAGE_DATA)
+                                            as *mut u64,
+                                        (va + nls.oem_cp_offset) as u64,
+                                    );
+                                }
+                            }
+                            // PEB+0x360: UnicodeCaseTableData
+                            if nls.unicode_case_offset > 0 && nls.unicode_case_offset < data.len()
+                            {
+                                unsafe {
+                                    core::ptr::write_unaligned(
+                                        (peb_va
+                                            + crate::peb_teb::peb_offsets::UNICODE_CASE_TABLE_DATA)
+                                            as *mut u64,
+                                        (va + nls.unicode_case_offset) as u64,
+                                    );
+                                }
+                            }
+                            #[cfg(debug_assertions)]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "NT shim: PEB NLS pointers set: AnsiCP=0x{:X} OemCP=0x{:X} UniCase=0x{:X}\n",
+                                        va,
+                                        va + nls.oem_cp_offset,
+                                        va + nls.unicode_case_offset,
+                                    ),
+                                );
+                            }
+                        }
+
                         (NtStatus::STATUS_SUCCESS, false)
                     }
                     Err(_) => (NtStatus::STATUS_NO_MEMORY, false),
@@ -5648,7 +9500,7 @@ impl NtShimEntrypoints {
                 let section_type = args.arg0 as u32;
                 let section_data = args.arg1 as u32;
                 let section_ptr_out = args.arg3;
-                let section_size_out = unsafe { syscalls::NtSyscallArgs::arg4(ctx) };
+                let section_size_out = syscalls::NtSyscallArgs::arg4(ctx);
 
                 #[cfg(debug_assertions)]
                 {
@@ -5659,7 +9511,7 @@ impl NtShimEntrypoints {
                     litebox_platform_multiplex::platform().debug_log_print(&msg);
                 }
 
-                if section_ptr_out == 0 || section_size_out == 0 {
+                if section_ptr_out == 0 {
                     (NtStatus::STATUS_INVALID_PARAMETER, false)
                 } else if let Some((mapped_va, mapped_size)) = self
                     .shared
@@ -5668,9 +9520,9 @@ impl NtShimEntrypoints {
                     .get(&(section_type, section_data))
                     .copied()
                 {
-                    unsafe {
-                        core::ptr::write(section_ptr_out as *mut u64, mapped_va as u64);
-                        core::ptr::write(section_size_out as *mut u32, mapped_size);
+                    crate::try_write_guest_value_unaligned(section_ptr_out, mapped_va as u64);
+                    if section_size_out != 0 {
+                        crate::try_write_guest_value_unaligned(section_size_out, mapped_size);
                     }
                     (NtStatus::STATUS_SUCCESS, false)
                 } else {
@@ -5718,9 +9570,12 @@ impl NtShimEntrypoints {
                                 .nls_section_mappings
                                 .lock()
                                 .insert((section_type, section_data), (mapped_va, section_len));
-                            unsafe {
-                                core::ptr::write(section_ptr_out as *mut u64, mapped_va as u64);
-                                core::ptr::write(section_size_out as *mut u32, section_len);
+                            crate::try_write_guest_value_unaligned(
+                                section_ptr_out,
+                                mapped_va as u64,
+                            );
+                            if section_size_out != 0 {
+                                crate::try_write_guest_value_unaligned(section_size_out, section_len);
                             }
                             #[cfg(debug_assertions)]
                             {
@@ -5751,15 +9606,17 @@ impl NtShimEntrypoints {
                         Ok(data) => {
                             let needed = data.len() as u32;
                             let provided =
-                                unsafe { core::ptr::read_unaligned(data_size_ptr as *const u32) };
-                            unsafe {
-                                core::ptr::write(data_size_ptr as *mut u32, needed);
-                            }
+                                crate::try_read_guest_value_unaligned::<u32>(data_size_ptr)
+                                    .unwrap_or(0);
+                            crate::try_write_guest_value_unaligned(data_size_ptr, needed);
                             if data_ptr == 0 {
                                 (NtStatus::STATUS_SUCCESS, false)
                             } else if provided < needed {
                                 (NtStatus::STATUS_BUFFER_TOO_SMALL, false)
                             } else {
+                                if !crate::is_addr_range_writable(data_ptr, data.len()) {
+                                    return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                                }
                                 unsafe {
                                     core::ptr::copy_nonoverlapping(
                                         data.as_ptr(),
@@ -5782,9 +9639,11 @@ impl NtShimEntrypoints {
                 let mut handles = self.shared.handles.lock();
                 let h = handles.insert(handle_table::NtObject::Stub {
                     kind: alloc::string::String::from("WaitCompletionPacket"),
+                    io_completion: None,
                 });
-                unsafe {
-                    *(handle_ptr as *mut u64) = h as u64;
+                if handle_ptr == 0 || !crate::try_write_guest_value_unaligned(handle_ptr, h as u64)
+                {
+                    return (NtStatus::STATUS_ACCESS_VIOLATION, false);
                 }
                 (NtStatus::STATUS_SUCCESS, false)
             }
@@ -5813,6 +9672,7 @@ impl NtShimEntrypoints {
                             &port,
                             &self.shared.process_state.pm,
                             &self.wait_cx(),
+                            &self.shared.timer2_list,
                         ),
                         false,
                     ),
@@ -5839,6 +9699,8 @@ impl NtShimEntrypoints {
                             &port,
                             &self.shared.process_state.pm,
                             &self.wait_cx(),
+                            self.thread_obj.as_ref(),
+                            &self.shared.timer2_list,
                         ),
                         false,
                     ),
@@ -5847,59 +9709,330 @@ impl NtShimEntrypoints {
             }
 
             NtSyscallId::NtCreateWorkerFactory => {
-                // Worker factory ΓÇö ntdll's thread pool creates worker threads
-                // through this syscall. Allocate a dummy handle; the actual
-                // thread creation won't happen but the pool init will succeed.
+                // NtCreateWorkerFactory(
+                //   OUT PHANDLE WorkerFactoryHandle,   // r10 (arg0)
+                //   IN ACCESS_MASK DesiredAccess,       // rdx (arg1)
+                //   IN POBJECT_ATTRIBUTES ObjectAttributes, // r8 (arg2)
+                //   IN HANDLE CompletionPortHandle,     // r9 (arg3)
+                //   IN HANDLE WorkerProcessHandle,      // [rsp+0x28] (arg4)
+                //   IN PVOID StartRoutine,              // [rsp+0x30] (arg5)
+                //   IN PVOID StartParameter,            // [rsp+0x38] (arg6)
+                //   IN ULONG MaxThreadCount,            // [rsp+0x40] (arg7)
+                //   ...
+                // )
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
-                let handle_ptr = args.arg0; // PHANDLE
-                let mut handles = self.shared.handles.lock();
-                let h = handles.insert(handle_table::NtObject::Stub {
-                    kind: alloc::string::String::from("WorkerFactory"),
+                let handle_ptr = args.arg0; // PHANDLE — output
+                let iocp_handle = args.arg3 as u32; // CompletionPortHandle
+                let start_routine = syscalls::NtSyscallArgs::arg5(ctx);
+                let start_parameter = syscalls::NtSyscallArgs::arg6(ctx);
+
+                // Look up the associated I/O completion port.
+                let iocp = {
+                    let handles = self.shared.handles.lock();
+                    handles.with(iocp_handle, |entry| match &entry.object {
+                        handle_table::NtObject::IoCompletion(port) => {
+                            Some(alloc::sync::Arc::clone(port))
+                        }
+                        _ => None,
+                    }).flatten().unwrap_or_else(|| {
+                        // IOCP handle not found — still create the factory
+                        // with a dummy IOCP so handle management succeeds.
+                        // This matches the previous stub behavior.
+                        alloc::sync::Arc::new(handle_table::IoCompletionObject::new())
+                    })
+                };
+
+                let factory = alloc::sync::Arc::new(handle_table::WorkerFactoryObject {
+                    iocp,
+                    start_routine,
+                    start_parameter,
+                    threads_spawned: core::sync::atomic::AtomicU32::new(0),
                 });
-                unsafe {
-                    *(handle_ptr as *mut u64) = h as u64;
+
+                let h = self
+                    .shared
+                    .handles
+                    .lock()
+                    .insert(handle_table::NtObject::WorkerFactory(factory));
+
+                if handle_ptr == 0 || !crate::try_write_guest_value_unaligned(handle_ptr, h as u64)
+                {
+                    return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                }
+                {
+                    #[cfg(feature = "trace_debug")]
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "NT shim: NtCreateWorkerFactory -> handle=0x{h:X} iocp=0x{iocp_handle:X} start=0x{start_routine:X} param=0x{start_parameter:X}\n"
+                        ));
+                    }
                 }
                 (NtStatus::STATUS_SUCCESS, false)
             }
 
             NtSyscallId::NtReleaseWorkerFactoryWorker => {
-                // Stubbed worker factories do not maintain kernel scheduling
-                // state, but ntdll expects this bookkeeping syscall to succeed
-                // once the factory handle exists.
+                // NtReleaseWorkerFactoryWorker releases (wakes) a worker thread
+                // that is blocked in NtWaitForWorkViaWorkerFactory.  It is NOT
+                // a blocking call — it returns immediately.  The actual blocking
+                // wait for work items is done by worker threads via
+                // NtRemoveIoCompletionEx on the factory's IOCP (older pattern)
+                // or NtWaitForWorkViaWorkerFactory (Win8+ pattern).
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let handle = args.arg0 as u32;
-                let handles = self.shared.handles.lock();
-                match handles.get(handle) {
-                    Some(handle_table::NtObject::Stub { kind }) if kind == "WorkerFactory" => {
-                        (NtStatus::STATUS_SUCCESS, false)
-                    }
-                    _ => (NtStatus::STATUS_INVALID_HANDLE, false),
+
+                // Validate the handle exists.
+                let factory_exists = {
+                    let handles = self.shared.handles.lock();
+                    handles.with(handle, |entry| matches!(entry.object, handle_table::NtObject::WorkerFactory(_)))
+                        .unwrap_or(false)
+                };
+                if !factory_exists {
+                    return (NtStatus::STATUS_INVALID_HANDLE, false);
                 }
+
+                {
+                    #[cfg(feature = "trace_debug")]
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "NT shim: NtReleaseWorkerFactoryWorker tid={} handle=0x{handle:X} — returning SUCCESS\n",
+                            self.thread_id
+                        ));
+                    }
+                }
+
+                (NtStatus::STATUS_SUCCESS, false)
+            }
+
+            NtSyscallId::NtWorkerFactoryWorkerReady => {
+                // NtWorkerFactoryWorkerReady is called by a newly spawned
+                // worker thread to signal that it has completed its
+                // initialization and is ready to accept work items.  The
+                // kernel updates the factory's internal counters (e.g.
+                // WaitingWorkerCount) and may block the calling thread
+                // until a work item arrives on the IOCP.  For our
+                // purposes, returning STATUS_SUCCESS lets the worker
+                // continue into its work-dispatch loop (which calls
+                // NtRemoveIoCompletionEx on the factory's IOCP).
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let handle = args.arg0 as u32;
+
+                // Validate the handle.
+                let factory_exists = {
+                    let handles = self.shared.handles.lock();
+                    handles.with(handle, |entry| matches!(entry.object, handle_table::NtObject::WorkerFactory(_)))
+                        .unwrap_or(false)
+                };
+                if !factory_exists {
+                    return (NtStatus::STATUS_INVALID_HANDLE, false);
+                }
+
+                {
+                    #[cfg(feature = "trace_debug")]
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "NT shim: NtWorkerFactoryWorkerReady tid={} handle=0x{handle:X}\n",
+                            self.thread_id
+                        ));
+                    }
+                }
+
+                (NtStatus::STATUS_SUCCESS, false)
+            }
+
+            NtSyscallId::NtWaitForWorkViaWorkerFactory => {
+                // NtWaitForWorkViaWorkerFactory(
+                //   IN  HANDLE WorkerFactoryHandle,                 // r10 (arg0)
+                //   OUT FILE_IO_COMPLETION_INFORMATION *MiniPackets, // rdx (arg1)
+                //   IN  ULONG Count,                                // r8  (arg2)
+                //   OUT ULONG *PacketsReturned,                     // r9  (arg3)
+                //   IN  PVOID DeferredWork                          // [rsp+0x28] (arg4)
+                // )
+                //
+                // This is the Win8+ replacement for the older pattern of
+                // worker threads calling NtRemoveIoCompletionEx directly.
+                // It blocks the calling worker thread until at least one
+                // completion packet arrives on the factory's IOCP, then
+                // dequeues and returns the packets.
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let handle = args.arg0 as u32;
+                let packets_ptr = args.arg1;
+                let count = args.arg2;
+                let returned_ptr = args.arg3;
+
+                // Look up the factory's IOCP.
+                let iocp = {
+                    let handles = self.shared.handles.lock();
+                    let val = handles.with(handle, |entry| match &entry.object {
+                        handle_table::NtObject::WorkerFactory(f) => {
+                            Some(alloc::sync::Arc::clone(&f.iocp))
+                        }
+                        _ => None,
+                    }).flatten();
+                    match val {
+                        Some(p) => p,
+                        None => return (NtStatus::STATUS_INVALID_HANDLE, false),
+                    }
+                };
+
+                if count == 0 {
+                    if returned_ptr != 0 {
+                        let _ = crate::try_write_guest_value_unaligned(returned_ptr, 0u32);
+                    }
+                    return (NtStatus::STATUS_INVALID_PARAMETER, false);
+                }
+
+                {
+                    #[cfg(feature = "trace_debug")]
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "NT shim: NtWaitForWorkViaWorkerFactory tid={} handle=0x{handle:X} count={count} — blocking\n",
+                            self.thread_id
+                        ));
+                    }
+                }
+
+                // Block until the IOCP has completions or the process exits.
+                let wait_cx = self.wait_cx();
+                let entries = match syscalls::sync::wait_for_io_completion_packets_pub(
+                    &iocp, count, None, &wait_cx, None, &self.shared.timer2_list,
+                ) {
+                    Ok(entries) => entries,
+                    Err(status) => {
+                        // If we got a timeout/interrupt, check process exit.
+                        if self
+                            .shared
+                            .process_exit_requested
+                            .load(core::sync::atomic::Ordering::Acquire)
+                            || self.exit_requested.load(core::sync::atomic::Ordering::Acquire)
+                        {
+                            if returned_ptr != 0 {
+                                let _ = crate::try_write_guest_value_unaligned(
+                                    returned_ptr,
+                                    0u32,
+                                );
+                            }
+                            return (NtStatus::STATUS_SUCCESS, true);
+                        }
+                        if returned_ptr != 0 {
+                            let _ =
+                                crate::try_write_guest_value_unaligned(returned_ptr, 0u32);
+                        }
+                        return (status, false);
+                    }
+                };
+
+                // Write output packets.
+                let entry_size = 32usize; // sizeof(FILE_IO_COMPLETION_INFORMATION)
+                for (index, entry) in entries.iter().enumerate() {
+                    let slot_ptr = packets_ptr + index * entry_size;
+                    syscalls::sync::write_file_io_completion_information_pub(slot_ptr, *entry);
+                }
+                if returned_ptr != 0 {
+                    let _ = crate::try_write_guest_value_unaligned(
+                        returned_ptr,
+                        entries.len() as u32,
+                    );
+                }
+
+                {
+                    #[cfg(feature = "trace_debug")]
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "NT shim: NtWaitForWorkViaWorkerFactory tid={} returned {} packets\n",
+                            self.thread_id, entries.len()
+                        ));
+                    }
+                }
+
+                (NtStatus::STATUS_SUCCESS, false)
             }
 
             NtSyscallId::NtCreateTimer2 => {
-                // Timer2 ΓÇö used by the thread pool for delayed work items.
-                // Allocate a dummy handle so pool init doesn't abort.
+                // Timer2 — used by the thread pool for delayed work items.
+                // Create a real Timer2 object that can be armed/disarmed.
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let handle_ptr = args.arg0; // PHANDLE
+                let timer = alloc::sync::Arc::new(handle_table::Timer2Object::new());
+                self.shared.timer2_list.lock().push(alloc::sync::Arc::clone(&timer));
                 let mut handles = self.shared.handles.lock();
-                let h = handles.insert(handle_table::NtObject::Stub {
-                    kind: alloc::string::String::from("Timer2"),
-                });
-                unsafe {
-                    *(handle_ptr as *mut u64) = h as u64;
+                let h = handles.insert(handle_table::NtObject::Timer2(timer));
+                if handle_ptr == 0 || !crate::try_write_guest_value_unaligned(handle_ptr, h as u64)
+                {
+                    return (NtStatus::STATUS_ACCESS_VIOLATION, false);
                 }
                 (NtStatus::STATUS_SUCCESS, false)
             }
             NtSyscallId::NtSetTimer2 => {
+                // NtSetTimer2(Handle, DueTime, Period, ...)
+                // DueTime: PLARGE_INTEGER — negative = relative 100ns, positive = absolute FILETIME
+                // Period: PLARGE_INTEGER — repeat interval in 100ns, 0 = one-shot
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let handle = args.arg0 as u32;
+                let due_time_raw = args.arg1 as i64;
+                let period_raw = args.arg2 as i64;
+
+                let handles = self.shared.handles.lock();
+                let timer = handles.with(handle, |entry| match &entry.object {
+                    handle_table::NtObject::Timer2(t) => Some(alloc::sync::Arc::clone(t)),
+                    _ => None,
+                }).flatten();
+                drop(handles);
+
+                match timer {
+                    Some(t) => {
+                        // Convert relative due time to absolute FILETIME.
+                        let now = syscalls::sysinfo::windows_filetime_now_pub();
+                        let abs_due_time = if due_time_raw < 0 {
+                            // Relative: add absolute value to current time.
+                            now.saturating_add(due_time_raw.unsigned_abs() as i64)
+                        } else if due_time_raw == 0 {
+                            // Already expired — fire immediately.
+                            now
+                        } else {
+                            // Absolute FILETIME.
+                            due_time_raw
+                        };
+
+                        *t.armed.lock() = Some(handle_table::Timer2Armed {
+                            due_time: abs_due_time,
+                            period: if period_raw < 0 { period_raw.unsigned_abs() as i64 } else { period_raw },
+                        });
+
+                        #[cfg(feature = "trace_debug")]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "NT shim: NtSetTimer2: handle={handle:#X} due_time_raw={due_time_raw} abs_due={abs_due_time} period={period_raw}\n"
+                            ));
+                        }
+
+                        (NtStatus::STATUS_SUCCESS, false)
+                    }
+                    None => (NtStatus::STATUS_INVALID_HANDLE, false),
+                }
+            }
+            NtSyscallId::NtCancelTimer2 => {
+                // Cancel a Timer2 timer — disarm so it won't fire.
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let handle = args.arg0 as u32;
                 let handles = self.shared.handles.lock();
-                match handles.get(handle) {
-                    Some(handle_table::NtObject::Stub { kind }) if kind == "Timer2" => {
+                let timer = handles.with(handle, |entry| match &entry.object {
+                    handle_table::NtObject::Timer2(t) => Some(alloc::sync::Arc::clone(t)),
+                    _ => None,
+                }).flatten();
+                drop(handles);
+
+                match timer {
+                    Some(t) => {
+                        *t.armed.lock() = None;
                         (NtStatus::STATUS_SUCCESS, false)
                     }
-                    _ => (NtStatus::STATUS_INVALID_HANDLE, false),
+                    None => (NtStatus::STATUS_INVALID_HANDLE, false),
                 }
             }
             NtSyscallId::NtQueryTimerResolution => {
@@ -5910,10 +10043,11 @@ impl NtShimEntrypoints {
                 if max_ptr == 0 || min_ptr == 0 || cur_ptr == 0 {
                     (NtStatus::STATUS_INVALID_PARAMETER, false)
                 } else {
-                    unsafe {
-                        core::ptr::write(max_ptr as *mut u32, 156_250);
-                        core::ptr::write(min_ptr as *mut u32, 5_000);
-                        core::ptr::write(cur_ptr as *mut u32, 156_250);
+                    if !crate::try_write_guest_value_unaligned(max_ptr, 156_250u32)
+                        || !crate::try_write_guest_value_unaligned(min_ptr, 5_000u32)
+                        || !crate::try_write_guest_value_unaligned(cur_ptr, 156_250u32)
+                    {
+                        return (NtStatus::STATUS_ACCESS_VIOLATION, false);
                     }
                     (NtStatus::STATUS_SUCCESS, false)
                 }
@@ -5929,12 +10063,16 @@ impl NtShimEntrypoints {
                     let handles = self.shared.handles.lock();
                     resolve_object_attributes_name(args.arg2, &handles)
                 };
-                let handle_ptr = args.arg0 as *mut u64;
+                let handle_ptr = args.arg0;
                 let mut handles = self.shared.handles.lock();
                 let h = handles.insert(handle_table::NtObject::Stub {
                     kind: alloc::format!("DirectoryObject:{name}"),
+                    io_completion: None,
                 });
-                unsafe { core::ptr::write(handle_ptr, h as u64) };
+                if handle_ptr == 0 || !crate::try_write_guest_value_unaligned(handle_ptr, h as u64)
+                {
+                    return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                }
                 #[cfg(debug_assertions)]
                 {
                     use litebox::platform::DebugLogProvider as _;
@@ -5958,42 +10096,51 @@ impl NtShimEntrypoints {
                 // the process. We do the same to avoid infinite loops.
                 //
                 // Stack layout for KiUserExceptionDispatcher:
-                //   [RSP+0x000]: CONTEXT         (0x4D0 bytes)
-                //   [RSP+0x4F0]: EXCEPTION_RECORD (0x98 bytes)
+                //   [RSP+0x000]: CONTEXT + CONTEXT_EX padding (legacy total 0x4F0)
+                //   [RSP+0x4F0]: EXCEPTION_RECORD              (0x98 bytes)
+                //   [RSP+0x590]: synthetic machine frame tail for UWOP_PUSH_MACHFRAME
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let exc_record_ptr = args.arg0; // EXCEPTION_RECORD*
                 let context_ptr = args.arg1; // CONTEXT*
                 let first_chance = args.arg2; // BOOLEAN (0 = second chance)
 
-                let exc_code = unsafe { *(exc_record_ptr as *const u32) };
+                let exc_code =
+                    crate::try_read_guest_value_unaligned::<u32>(exc_record_ptr).unwrap_or(0);
 
-                #[cfg(debug_assertions)]
+                #[cfg(feature = "trace_debug")]
                 {
                     use litebox::platform::DebugLogProvider as _;
-                    let exc_addr = unsafe { *((exc_record_ptr + 0x10) as *const u64) };
+                    let exc_addr = if crate::is_addr_committed(exc_record_ptr + 0x10) {
+                        unsafe { *((exc_record_ptr + 0x10) as *const u64) }
+                    } else {
+                        0
+                    };
                     litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
                         "NtRaiseException: code=0x{exc_code:X} addr=0x{exc_addr:X} first_chance={first_chance} rsp=0x{:X}\n",
                         ctx.regs.rsp,
                     ));
-                    // Dump TEB stack limits for diagnosis of STATUS_BAD_STACK
-                    if exc_code == 0xC0000028 {
-                        if let Some(ref init) = self.init_state {
-                            let teb = init.teb_va;
+                }
+
+                // Detailed STATUS_BAD_STACK diagnostic (debug builds only).
+                #[cfg(debug_assertions)]
+                if exc_code == 0xC0000028 {
+                    if let Some(ref init) = self.init_state {
+                        use litebox::platform::DebugLogProvider as _;
+                        let teb = init.teb_va;
+                        if crate::is_addr_range_committed(teb, 0x1480) {
                             let stack_base = unsafe { *((teb + 0x08) as *const u64) };
                             let stack_limit = unsafe { *((teb + 0x10) as *const u64) };
                             let dealloc_stack = unsafe { *((teb + 0x1478) as *const u64) };
                             let teb_self = unsafe { *((teb + 0x30) as *const u64) };
-                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                                "  STATUS_BAD_STACK diag: teb_va=0x{teb:X} self=0x{teb_self:X}\n  \
-                                 StackBase=0x{stack_base:X} StackLimit=0x{stack_limit:X} \
-                                 DeallocationStack=0x{dealloc_stack:X}\n  \
-                                 guest_rsp=0x{:X}\n",
-                                ctx.regs.rsp,
-                            ));
-                            // Dump guest stack to find the caller chain of
-                            // RtlRaiseStatus(STATUS_BAD_STACK).
-                            // The RtlRaiseStatus frame is ~0x598 bytes, so we
-                            // need to scan well past it to find the return addr.
+                            litebox_platform_multiplex::platform().debug_log_print(
+                                &alloc::format!(
+                                    "  STATUS_BAD_STACK diag: teb_va=0x{teb:X} self=0x{teb_self:X}\n  \
+                                     StackBase=0x{stack_base:X} StackLimit=0x{stack_limit:X} \
+                                     DeallocationStack=0x{dealloc_stack:X}\n  \
+                                     guest_rsp=0x{:X}\n",
+                                    ctx.regs.rsp,
+                                ),
+                            );
                             let rsp = ctx.regs.rsp as usize;
                             let ntdll_lo = init
                                 .module_bases
@@ -6014,6 +10161,9 @@ impl NtShimEntrypoints {
                                 if addr >= stack_base as usize {
                                     break;
                                 }
+                                if !crate::is_addr_committed(addr) {
+                                    break;
+                                }
                                 let val = unsafe { *(addr as *const u64) };
                                 let v = val as usize;
                                 if v >= ntdll_lo && v < ntdll_hi {
@@ -6026,25 +10176,23 @@ impl NtShimEntrypoints {
                             }
                             litebox_platform_multiplex::platform().debug_log_print(&trace);
 
-                            // Dump bytes around the caller of RtlRaiseStatus so
-                            // we can disassemble the failing inline stack check.
-                            // From the stack scan, the call is at ntdll+0xE6EE
-                            // (return addr = ntdll+0xE6F3).
                             let dump_rvas: &[usize] = &[0xE6C0, 0xE310];
                             for &base_rva in dump_rvas {
                                 let dump_addr = ntdll_lo + base_rva;
-                                let mut hex = alloc::format!(
-                                    "  Bytes at ntdll+0x{base_rva:X} (VA=0x{dump_addr:X}):\n    ",
-                                );
-                                for j in 0..64usize {
-                                    let b = unsafe { *((dump_addr + j) as *const u8) };
-                                    hex.push_str(&alloc::format!("{b:02X} "));
-                                    if j % 16 == 15 && j < 63 {
-                                        hex.push_str("\n    ");
+                                if crate::is_addr_range_committed(dump_addr, 64) {
+                                    let mut hex = alloc::format!(
+                                        "  Bytes at ntdll+0x{base_rva:X} (VA=0x{dump_addr:X}):\n    ",
+                                    );
+                                    for j in 0..64usize {
+                                        let b = unsafe { *((dump_addr + j) as *const u8) };
+                                        hex.push_str(&alloc::format!("{b:02X} "));
+                                        if j % 16 == 15 && j < 63 {
+                                            hex.push_str("\n    ");
+                                        }
                                     }
+                                    hex.push('\n');
+                                    litebox_platform_multiplex::platform().debug_log_print(&hex);
                                 }
-                                hex.push('\n');
-                                litebox_platform_multiplex::platform().debug_log_print(&hex);
                             }
                         }
                     }
@@ -6052,17 +10200,74 @@ impl NtShimEntrypoints {
 
                 // Second-chance: terminate the guest process.
                 if first_chance == 0 {
-                    self.exit_code.store(exc_code as i32, Ordering::Release);
+                    #[cfg(debug_assertions)]
+                    if exc_code == 0xC000_00FF {
+                        use litebox::platform::{StdioOutStream, StdioProvider as _};
+                        let exc_addr = if crate::is_addr_committed(exc_record_ptr + 0x10) {
+                            unsafe { *((exc_record_ptr + 0x10) as *const u64) as usize }
+                        } else {
+                            0
+                        };
+                        let context_rip = if crate::is_addr_committed(context_ptr + 0xF8) {
+                            unsafe { *((context_ptr + 0xF8) as *const u64) as usize }
+                        } else {
+                            0
+                        };
+                        let context_rsp = if crate::is_addr_committed(context_ptr + 0x98) {
+                            unsafe { *((context_ptr + 0x98) as *const u64) as usize }
+                        } else {
+                            0
+                        };
+                        let describe_module = |addr: usize| {
+                            self.init_state
+                                .as_ref()
+                                .and_then(|init| {
+                                    init.module_bases.iter().find(|m| {
+                                        addr >= m.base_address
+                                            && addr < m.base_address.saturating_add(m.image_size)
+                                    })
+                                })
+                                .map(|m| {
+                                    alloc::format!(
+                                        "{}+0x{:X}",
+                                        m.name,
+                                        addr.saturating_sub(m.base_address)
+                                    )
+                                })
+                                .unwrap_or_else(|| alloc::format!("0x{addr:X}"))
+                        };
+                        let _ = litebox_platform_multiplex::platform().write_to(
+                            StdioOutStream::Stderr,
+                            alloc::format!(
+                                "[bad-function-table] exc_addr={} ctx_rip={} ctx_rsp=0x{context_rsp:X}\n",
+                                describe_module(exc_addr),
+                                describe_module(context_rip),
+                            )
+                            .as_bytes(),
+                        );
+                    }
+                    self.mark_current_thread_exited(exc_code as i32);
                     return (NtStatus(exc_code as i32), true);
                 }
 
-                const CONTEXT_SIZE: usize = 0x4D0;
-                const EXCEPTION_RECORD_SIZE: usize = 0x98;
-                const EXCEPTION_RECORD_OFFSET: usize = 0x4F0;
-                // Total frame: EXCEPTION_RECORD_OFFSET + EXCEPTION_RECORD_SIZE,
-                // rounded up to 16-byte alignment.
-                const FRAME_SIZE: usize =
-                    (EXCEPTION_RECORD_OFFSET + EXCEPTION_RECORD_SIZE + 0xF) & !0xF;
+                let guest_context_size = syscalls::k32_handlers::guest_context_size(context_ptr);
+                let dispatch_stub_va = self
+                    .shared
+                    .process_state
+                    .rtl_raise_exception_dispatch_stub_va();
+                let use_xstate_layout = dispatch_stub_va != 0
+                    && guest_context_size > syscalls::k32_handlers::LEGACY_CONTEXT_SIZE_AMD64;
+                let context_size = if use_xstate_layout {
+                    guest_context_size
+                } else {
+                    syscalls::k32_handlers::LEGACY_CONTEXT_SIZE_AMD64
+                };
+                let exception_record_offset = if use_xstate_layout {
+                    syscalls::k32_handlers::XSTATE_EXCEPTION_RECORD_OFFSET_AMD64
+                } else {
+                    syscalls::k32_handlers::LEGACY_EXCEPTION_RECORD_OFFSET_AMD64
+                };
+                let frame_size = ki_user_exception_dispatcher_frame_size(exception_record_offset);
 
                 // Find KiUserExceptionDispatcher address from ntdll base + RVA.
                 let dispatcher_va = self.init_state.as_ref().and_then(|s| {
@@ -6075,41 +10280,67 @@ impl NtShimEntrypoints {
                     Some(base + rva)
                 });
 
-                if let Some(dispatcher_va) = dispatcher_va {
+                let target_va = if dispatch_stub_va != 0 {
+                    Some(dispatch_stub_va)
+                } else {
+                    dispatcher_va
+                };
+
+                if let Some(target_va) = target_va {
                     // Allocate frame on guest stack.
-                    let new_rsp = (ctx.regs.rsp - FRAME_SIZE) & !0xF;
+                    let Some(new_rsp) = exception_frame_rsp(ctx.regs.rsp, frame_size) else {
+                        self.mark_current_thread_exited(NtStatus::STATUS_ACCESS_VIOLATION.0);
+                        return (NtStatus::STATUS_ACCESS_VIOLATION, true);
+                    };
 
                     // Copy CONTEXT and EXCEPTION_RECORD to guest stack.
+                    // Use fallible copies — guest stack or exception record
+                    // pointers may reference unmapped pages.
                     unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            context_ptr as *const u8,
+                        let _ = litebox::mm::exception_table::memcpy_fallible(
                             new_rsp as *mut u8,
-                            CONTEXT_SIZE,
+                            context_ptr as *const u8,
+                            context_size,
                         );
                         // Zero the gap between CONTEXT end and EXCEPTION_RECORD.
                         core::ptr::write_bytes(
-                            (new_rsp + CONTEXT_SIZE) as *mut u8,
+                            (new_rsp + context_size) as *mut u8,
                             0,
-                            EXCEPTION_RECORD_OFFSET - CONTEXT_SIZE,
+                            exception_record_offset - context_size,
                         );
-                        core::ptr::copy_nonoverlapping(
+                        let _ = litebox::mm::exception_table::memcpy_fallible(
+                            (new_rsp + exception_record_offset) as *mut u8,
                             exc_record_ptr as *const u8,
-                            (new_rsp + EXCEPTION_RECORD_OFFSET) as *mut u8,
-                            EXCEPTION_RECORD_SIZE,
+                            AMD64_EXCEPTION_RECORD_SIZE,
+                        );
+                        if !use_xstate_layout {
+                            core::ptr::write(
+                                (new_rsp + 0x30) as *mut u32,
+                                syscalls::k32_handlers::CONTEXT_AMD64_FULL,
+                            );
+                        }
+                        write_ki_user_exception_dispatcher_machine_frame(
+                            new_rsp,
+                            exception_record_offset,
                         );
                     }
 
                     // Redirect guest execution to KiUserExceptionDispatcher.
                     ctx.regs.rsp = new_rsp;
-                    ctx.regs.rip = dispatcher_va;
-                    ctx.regs.rcx = dispatcher_va; // for sysret fast path
+                    ctx.regs.rip = target_va;
+                    ctx.regs.rcx = target_va; // for sysret fast path
 
                     #[cfg(debug_assertions)]
                     {
                         use litebox::platform::DebugLogProvider as _;
                         let exc_code = unsafe { *(exc_record_ptr as *const u32) };
                         litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                            "NtRaiseException: code=0x{exc_code:X} ΓåÆ KiUserExceptionDispatcher @ 0x{dispatcher_va:X}\n",
+                            "NtRaiseException: code=0x{exc_code:X} -> {} @ 0x{target_va:X}\n",
+                            if use_xstate_layout {
+                                "guest RtlDispatchException stub"
+                            } else {
+                                "KiUserExceptionDispatcher"
+                            },
                         ));
                     }
                     (NtStatus::STATUS_SUCCESS, false)
@@ -6121,7 +10352,7 @@ impl NtShimEntrypoints {
             NtSyscallId::NtOpenEvent => {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let obj_attrs_ptr = args.arg2;
-                let name = read_object_attributes_name(obj_attrs_ptr);
+                let name = read_object_attributes_name(obj_attrs_ptr).unwrap_or_default();
                 #[cfg(debug_assertions)]
                 {
                     use litebox::platform::DebugLogProvider as _;
@@ -6133,12 +10364,378 @@ impl NtShimEntrypoints {
             }
 
             NtSyscallId::NtSetInformationWorkerFactory => {
-                // Configure thread pool (min/max threads, etc.). Stub as success.
+                // NtSetInformationWorkerFactory(
+                //   IN HANDLE WorkerFactoryHandle,         // arg0 (r10)
+                //   IN WORKER_FACTORY_INFORMATION_CLASS,    // arg1 (rdx)
+                //   IN PVOID WorkerFactoryInformation,      // arg2 (r8)
+                //   IN ULONG WorkerFactoryInformationLength // arg3 (r9)
+                // )
+                //
+                // Info classes:
+                //   4 = WorkerFactoryThreadMinimum — spawn threads if below min
+                //   5 = WorkerFactoryThreadMaximum — set max threads (ignored)
+                //   Others: stub as success
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let handle = args.arg0 as u32;
+                let info_class = args.arg1 as u32;
+                let info_ptr = args.arg2;
+
+                const WORKER_FACTORY_THREAD_MINIMUM: u32 = 4;
+
+                if info_class == WORKER_FACTORY_THREAD_MINIMUM && info_ptr != 0 {
+                    // Read the minimum thread count (ULONG).
+                    let min_threads = match crate::try_read_guest_value_unaligned::<u32>(info_ptr) {
+                        Some(v) => v,
+                        None => return (NtStatus::STATUS_ACCESS_VIOLATION, false),
+                    };
+
+                    if min_threads > 0 {
+                        // Look up the factory and spawn threads if needed.
+                        let factory = {
+                            let handles = self.shared.handles.lock();
+                            let val = handles.with(handle, |entry| match &entry.object {
+                                handle_table::NtObject::WorkerFactory(f) => {
+                                    Some(alloc::sync::Arc::clone(f))
+                                }
+                                _ => None,
+                            }).flatten();
+                            match val {
+                                Some(f) => f,
+                                None => return (NtStatus::STATUS_INVALID_HANDLE, false),
+                            }
+                        };
+
+                        let current = factory
+                            .threads_spawned
+                            .load(core::sync::atomic::Ordering::Relaxed);
+                        if current < min_threads {
+                            let to_spawn = min_threads - current;
+                            for _ in 0..to_spawn {
+                                match syscalls::thread::spawn_worker_factory_thread(
+                                    self,
+                                    factory.start_routine,
+                                    factory.start_parameter,
+                                ) {
+                                    Ok(_tid) => {
+                                        factory.threads_spawned.fetch_add(
+                                            1,
+                                            core::sync::atomic::Ordering::Relaxed,
+                                        );
+                                    }
+                                    Err(_status) => {
+                                        // Thread creation failed — stop spawning
+                                        // but don't fail the whole call.
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 (NtStatus::STATUS_SUCCESS, false)
             }
 
             NtSyscallId::NtAssociateWaitCompletionPacket => {
-                // Associates a wait packet with a completion port. Stub as success.
+                // NtAssociateWaitCompletionPacket(
+                //   WaitCompletionPacketHandle,  // arg0 — handle to the wait packet
+                //   IoCompletionHandle,           // arg1 — IOCP to post to
+                //   TargetObjectHandle,           // arg2 — object to wait on
+                //   KeyContext,                   // arg3 — completion key
+                //   ApcContext,                   // arg4 — APC context
+                //   IoStatus,                     // arg5 — status for IOCP entry
+                //   IoStatusInformation,          // arg6 — information for IOCP entry
+                //   AlreadySignaled               // arg7 — output: BOOLEAN ptr
+                // )
+                //
+                // When the target object becomes signaled, the kernel posts an
+                // IoCompletionEntry to the specified IOCP with the given key, apc,
+                // status, and information values.
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let _wait_pkt_handle = args.arg0 as u32;
+                let iocp_handle = args.arg1 as u32;
+                let target_handle = args.arg2 as u32;
+                let key_context = args.arg3;
+                let apc_context = syscalls::NtSyscallArgs::arg4(ctx);
+                let io_status_raw = syscalls::NtSyscallArgs::arg5(ctx) as u32;
+                let io_status_info = syscalls::NtSyscallArgs::arg6(ctx);
+                let already_signaled_ptr = syscalls::NtSyscallArgs::arg7(ctx);
+
+                let entry = handle_table::IoCompletionEntry {
+                    key_context,
+                    apc_context,
+                    status: NtStatus::from_raw(io_status_raw),
+                    information: io_status_info,
+                };
+
+                let handles = self.shared.handles.lock();
+
+                // Look up the IOCP.
+                let iocp = match handles.with(iocp_handle, |entry| match &entry.object {
+                    handle_table::NtObject::IoCompletion(port) => {
+                        Some(alloc::sync::Arc::clone(port))
+                    }
+                    _ => None,
+                }).flatten() {
+                    Some(p) => p,
+                    None => {
+                        #[cfg(feature = "trace_debug")]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "NT shim: NtAssociateWaitCompletionPacket: invalid IOCP handle {iocp_handle:#X}\n"
+                            ));
+                        }
+                        return (NtStatus::STATUS_INVALID_HANDLE, false);
+                    }
+                };
+
+                // Look up the target object and check if already signaled.
+                // If signaled, post immediately; otherwise register for deferred
+                // notification.
+                match handles.with(target_handle, |entry| match &entry.object {
+                    handle_table::NtObject::Process { state } => Some(handle_table::NtObject::Process { state: state.clone() }),
+                    handle_table::NtObject::VirtualThread { process } => Some(handle_table::NtObject::VirtualThread { process: process.clone() }),
+                    handle_table::NtObject::Thread(t) => Some(handle_table::NtObject::Thread(t.clone())),
+                    handle_table::NtObject::Stub { kind, io_completion } => Some(handle_table::NtObject::Stub { kind: kind.clone(), io_completion: io_completion.clone() }),
+                    handle_table::NtObject::Timer2(t) => Some(handle_table::NtObject::Timer2(alloc::sync::Arc::clone(t))),
+                    handle_table::NtObject::Event(ev) => Some(handle_table::NtObject::Event(alloc::sync::Arc::clone(ev))),
+                    _ => None,
+                }).flatten() {
+                    Some(handle_table::NtObject::Process { state }) => {
+                        if state
+                            .exited
+                            .load(core::sync::atomic::Ordering::Acquire)
+                        {
+                            // Already signaled — post immediately.
+                            #[cfg(feature = "trace_debug")]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                    "NT shim: NtAssociateWaitCompletionPacket: process {target_handle:#X} already exited, posting immediately\n"
+                                ));
+                            }
+                            drop(handles);
+                            iocp.push(entry);
+                            if already_signaled_ptr != 0 {
+                                crate::try_write_guest_value_unaligned(
+                                    already_signaled_ptr,
+                                    1u8,
+                                );
+                            }
+                        } else {
+                            // Not signaled — register for deferred notification.
+                            #[cfg(feature = "trace_debug")]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                    "NT shim: NtAssociateWaitCompletionPacket: registering IOCP waiter on process {target_handle:#X}\n"
+                                ));
+                            }
+                            state
+                                .iocp_waiters
+                                .lock()
+                                .push((alloc::sync::Arc::clone(&iocp), entry));
+                            if already_signaled_ptr != 0 {
+                                crate::try_write_guest_value_unaligned(
+                                    already_signaled_ptr,
+                                    0u8,
+                                );
+                            }
+                        }
+                    }
+                    Some(handle_table::NtObject::VirtualThread { process }) => {
+                        if process
+                            .exited
+                            .load(core::sync::atomic::Ordering::Acquire)
+                        {
+                            #[cfg(feature = "trace_debug")]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                    "NT shim: NtAssociateWaitCompletionPacket: virtual thread {target_handle:#X} already exited, posting immediately\n"
+                                ));
+                            }
+                            drop(handles);
+                            iocp.push(entry);
+                            if already_signaled_ptr != 0 {
+                                crate::try_write_guest_value_unaligned(
+                                    already_signaled_ptr,
+                                    1u8,
+                                );
+                            }
+                        } else {
+                            #[cfg(feature = "trace_debug")]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                    "NT shim: NtAssociateWaitCompletionPacket: registering IOCP waiter on virtual thread {target_handle:#X}\n"
+                                ));
+                            }
+                            process
+                                .iocp_waiters
+                                .lock()
+                                .push((alloc::sync::Arc::clone(&iocp), entry));
+                            if already_signaled_ptr != 0 {
+                                crate::try_write_guest_value_unaligned(
+                                    already_signaled_ptr,
+                                    0u8,
+                                );
+                            }
+                        }
+                    }
+                    Some(handle_table::NtObject::Thread(t)) => {
+                        // Thread objects can also be waited on.
+                        let exited =
+                            t.exit_status.lock().is_some();
+                        if exited {
+                            #[cfg(feature = "trace_debug")]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                    "NT shim: NtAssociateWaitCompletionPacket: thread {target_handle:#X} already exited, posting immediately\n"
+                                ));
+                            }
+                            drop(handles);
+                            iocp.push(entry);
+                            if already_signaled_ptr != 0 {
+                                crate::try_write_guest_value_unaligned(
+                                    already_signaled_ptr,
+                                    1u8,
+                                );
+                            }
+                        } else {
+                            #[cfg(any(debug_assertions, feature = "trace_debug"))]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                    "NT shim: NtAssociateWaitCompletionPacket: registering IOCP waiter on thread {target_handle:#X}\n"
+                                ));
+                            }
+                            t.iocp_waiters
+                                .lock()
+                                .push((alloc::sync::Arc::clone(&iocp), entry));
+                            if already_signaled_ptr != 0 {
+                                crate::try_write_guest_value_unaligned(
+                                    already_signaled_ptr,
+                                    0u8,
+                                );
+                            }
+                        }
+                    }
+                    Some(handle_table::NtObject::Timer2(t)) => {
+                        // Timer2 target: register the IOCP waiter on the timer
+                        // so that when it fires, the completion entry is posted.
+                        // Check if already expired.
+                        let armed = t.armed.lock().clone();
+                        let already_fired = if let Some(ref a) = armed {
+                            syscalls::sysinfo::windows_filetime_now_pub() >= a.due_time
+                        } else {
+                            false
+                        };
+                        if already_fired {
+                            #[cfg(feature = "trace_debug")]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                    "NT shim: NtAssociateWaitCompletionPacket: Timer2 {target_handle:#X} already expired, posting immediately\n"
+                                ));
+                            }
+                            drop(handles);
+                            iocp.push(entry);
+                            if already_signaled_ptr != 0 {
+                                crate::try_write_guest_value_unaligned(
+                                    already_signaled_ptr,
+                                    1u8,
+                                );
+                            }
+                        } else {
+                            // Not yet expired — register for deferred notification.
+                            *t.iocp_waiter.lock() = Some((alloc::sync::Arc::clone(&iocp), entry));
+                            if already_signaled_ptr != 0 {
+                                crate::try_write_guest_value_unaligned(
+                                    already_signaled_ptr,
+                                    0u8,
+                                );
+                            }
+                        }
+                    }
+                    Some(handle_table::NtObject::Stub { .. }) => {
+                        // Stub objects (e.g. Timer2, IRTimer) never actually
+                        // signal in our sandbox, so registering a wait packet
+                        // is a no-op. Report "not yet signaled".
+                        #[cfg(feature = "trace_debug")]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "NT shim: NtAssociateWaitCompletionPacket: stub target {target_handle:#X}, accepting as not-signaled\n"
+                            ));
+                        }
+                        if already_signaled_ptr != 0 {
+                            crate::try_write_guest_value_unaligned(
+                                already_signaled_ptr,
+                                0u8,
+                            );
+                        }
+                    }
+                    Some(handle_table::NtObject::Event(ev)) => {
+                        // Event objects can be wait targets. Check if already
+                        // signaled; if so, post immediately. Otherwise register
+                        // as not-signaled. For events like WNF notification
+                        // events that never fire in the sandbox, this is fine.
+                        let signaled = *ev.state.lock();
+                        if signaled {
+                            #[cfg(feature = "trace_debug")]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                    "NT shim: NtAssociateWaitCompletionPacket: event {target_handle:#X} already signaled, posting immediately\n"
+                                ));
+                            }
+                            drop(handles);
+                            iocp.push(entry);
+                            if already_signaled_ptr != 0 {
+                                crate::try_write_guest_value_unaligned(
+                                    already_signaled_ptr,
+                                    1u8,
+                                );
+                            }
+                        } else {
+                            #[cfg(feature = "trace_debug")]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                    "NT shim: NtAssociateWaitCompletionPacket: event {target_handle:#X} not signaled, accepting\n"
+                                ));
+                            }
+                            if already_signaled_ptr != 0 {
+                                crate::try_write_guest_value_unaligned(
+                                    already_signaled_ptr,
+                                    0u8,
+                                );
+                            }
+                        }
+                    }
+                    _ => {
+                        #[cfg(any(debug_assertions, feature = "trace_debug"))]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "NT shim: NtAssociateWaitCompletionPacket: unknown target handle {target_handle:#X}, treating as success\n"
+                            ));
+                        }
+                        // For unrecognized targets, just return success without
+                        // registering anything. This avoids breaking callers
+                        // that associate wait packets with unsupported object types.
+                        if already_signaled_ptr != 0 {
+                            crate::try_write_guest_value_unaligned(
+                                already_signaled_ptr,
+                                0u8,
+                            );
+                        }
+                    }
+                }
+
                 (NtStatus::STATUS_SUCCESS, false)
             }
 
@@ -6160,8 +10757,8 @@ impl NtShimEntrypoints {
                 let input_buffer = args.arg1;
                 let input_length = args.arg2 as u32;
                 let output_buffer = args.arg3;
-                let output_length = unsafe { syscalls::NtSyscallArgs::arg4(ctx) } as u32;
-                let return_length_ptr = unsafe { syscalls::NtSyscallArgs::arg5(ctx) };
+                let output_length = syscalls::NtSyscallArgs::arg4(ctx) as u32;
+                let return_length_ptr = syscalls::NtSyscallArgs::arg5(ctx);
 
                 if return_length_ptr == 0 {
                     (NtStatus::STATUS_INVALID_PARAMETER, false)
@@ -6174,18 +10771,16 @@ impl NtShimEntrypoints {
                             if input_buffer == 0 || input_length != 4 {
                                 (NtStatus::STATUS_INVALID_PARAMETER, false)
                             } else {
-                                let event_handle = unsafe {
-                                    core::ptr::read_unaligned(input_buffer as *const u32)
-                                };
+                                let event_handle =
+                                    crate::try_read_guest_value_unaligned::<u32>(input_buffer)
+                                        .unwrap_or(0);
                                 if event_handle == 0 {
                                     (NtStatus::STATUS_INVALID_PARAMETER, false)
                                 } else {
                                     let is_event = {
                                         let handles = self.shared.handles.lock();
-                                        matches!(
-                                            handles.get(event_handle),
-                                            Some(handle_table::NtObject::Event(_))
-                                        )
+                                        handles.with(event_handle, |entry| matches!(entry.object, handle_table::NtObject::Event(_)))
+                                            .unwrap_or(false)
                                     };
                                     if !is_event {
                                         (NtStatus::STATUS_INVALID_HANDLE, false)
@@ -6196,16 +10791,10 @@ impl NtShimEntrypoints {
                                             (NtStatus::STATUS_UNSUCCESSFUL, false)
                                         } else {
                                             *registered = Some(event_handle);
-                                            unsafe {
-                                                core::ptr::write(return_length_ptr as *mut u32, 0);
-                                                if output_buffer != 0 && output_length != 0 {
-                                                    core::ptr::write_bytes(
-                                                        output_buffer as *mut u8,
-                                                        0,
-                                                        output_length as usize,
-                                                    );
-                                                }
-                                            }
+                                            crate::try_write_guest_value_unaligned(
+                                                return_length_ptr,
+                                                0u32,
+                                            );
                                             (NtStatus::STATUS_SUCCESS, false)
                                         }
                                     }
@@ -6225,8 +10814,12 @@ impl NtShimEntrypoints {
                                 let reg_handle = self.shared.handles.lock().insert(
                                     handle_table::NtObject::Stub {
                                         kind: alloc::string::String::from("EtwReg"),
+                                        io_completion: None,
                                     },
                                 );
+                                if !crate::is_addr_range_writable(output_buffer, 0xA0) {
+                                    return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                                }
                                 unsafe {
                                     if output_buffer != input_buffer {
                                         core::ptr::copy_nonoverlapping(
@@ -6244,10 +10837,9 @@ impl NtShimEntrypoints {
                                         (output_buffer + 0x18) as *mut u64,
                                         reg_handle as u64,
                                     );
-                                    // ETW_NOTIFICATION_HEADER.NotificationSize
                                     core::ptr::write((output_buffer + 0x28) as *mut u32, 0xA0);
-                                    core::ptr::write(return_length_ptr as *mut u32, 0xA0);
                                 }
+                                crate::try_write_guest_value_unaligned(return_length_ptr, 0xA0u32);
                                 (NtStatus::STATUS_SUCCESS, false)
                             }
                         }
@@ -6260,32 +10852,39 @@ impl NtShimEntrypoints {
                             {
                                 (NtStatus::STATUS_INVALID_PARAMETER, false)
                             } else {
-                                let reg_handle = unsafe {
-                                    core::ptr::read_unaligned(input_buffer as *const u64)
-                                } as u32;
-                                let traits_ptr = unsafe {
-                                    core::ptr::read_unaligned((input_buffer + 0x08) as *const u64)
-                                } as usize;
-                                let traits_len = unsafe {
-                                    core::ptr::read_unaligned((input_buffer + 0x10) as *const u16)
-                                } as usize;
+                                let reg_handle =
+                                    crate::try_read_guest_value_unaligned::<u64>(input_buffer)
+                                        .unwrap_or(0) as u32;
+                                let traits_ptr = crate::try_read_guest_value_unaligned::<u64>(
+                                    input_buffer + 0x08,
+                                )
+                                .unwrap_or(0)
+                                    as usize;
+                                let traits_len = crate::try_read_guest_value_unaligned::<u16>(
+                                    input_buffer + 0x10,
+                                )
+                                .unwrap_or(0)
+                                    as usize;
                                 if traits_ptr == 0 || traits_len == 0 {
                                     (NtStatus::STATUS_INVALID_PARAMETER, false)
                                 } else {
                                     let is_etw_reg = {
                                         let handles = self.shared.handles.lock();
-                                        matches!(
-                                            handles.get(reg_handle),
-                                            Some(handle_table::NtObject::Stub { kind })
+                                        handles.with(reg_handle, |entry| matches!(
+                                            &entry.object,
+                                            handle_table::NtObject::Stub { kind, .. }
                                                 if kind == "EtwReg"
-                                        )
+                                        )).unwrap_or(false)
                                     };
                                     if !is_etw_reg {
                                         (NtStatus::STATUS_INVALID_HANDLE, false)
                                     } else {
-                                        let declared_len = unsafe {
-                                            core::ptr::read_unaligned(traits_ptr as *const u16)
-                                        }
+                                        let declared_len = crate::try_read_guest_value_unaligned::<
+                                            u16,
+                                        >(
+                                            traits_ptr
+                                        )
+                                        .unwrap_or(0)
                                             as usize;
                                         if traits_len < 3 || declared_len != traits_len {
                                             (NtStatus::STATUS_INVALID_PARAMETER, false)
@@ -6295,17 +10894,10 @@ impl NtShimEntrypoints {
                                             if !traits_set.insert(reg_handle) {
                                                 (NtStatus::STATUS_UNSUCCESSFUL, false)
                                             } else {
-                                                unsafe {
-                                                    core::ptr::write_bytes(
-                                                        output_buffer as *mut u8,
-                                                        0,
-                                                        output_length as usize,
-                                                    );
-                                                    core::ptr::write(
-                                                        return_length_ptr as *mut u32,
-                                                        0,
-                                                    );
-                                                }
+                                                crate::try_write_guest_value_unaligned(
+                                                    return_length_ptr,
+                                                    0u32,
+                                                );
                                                 (NtStatus::STATUS_SUCCESS, false)
                                             }
                                         }
@@ -6332,18 +10924,26 @@ impl NtShimEntrypoints {
                 let length = args.arg2 as u32;
                 let _type_id = args.arg3;
                 let explicit_scope =
-                    unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
+                    crate::try_read_guest_value_unaligned::<usize>(ctx.regs.rsp + 0x28)
+                        .unwrap_or(0);
                 let matching_change_stamp =
-                    unsafe { core::ptr::read((ctx.regs.rsp + 0x30) as *const u32) };
-                let check_stamp =
-                    unsafe { core::ptr::read((ctx.regs.rsp + 0x38) as *const u32) } != 0;
+                    crate::try_read_guest_value_unaligned::<u32>(ctx.regs.rsp + 0x30).unwrap_or(0);
+                let check_stamp = crate::try_read_guest_value_unaligned::<u32>(ctx.regs.rsp + 0x38)
+                    .unwrap_or(0)
+                    != 0;
 
                 if state_name_ptr == 0 || (buffer_ptr == 0 && length != 0) {
                     (NtStatus::STATUS_INVALID_PARAMETER, false)
                 } else {
-                    let state_name =
-                        unsafe { core::ptr::read_unaligned(state_name_ptr as *const u64) };
+                    let Some(state_name) =
+                        crate::try_read_guest_value_unaligned::<u64>(state_name_ptr)
+                    else {
+                        return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                    };
                     let data = if buffer_ptr != 0 && length != 0 {
+                        if !crate::is_addr_range_committed(buffer_ptr, length as usize) {
+                            return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                        }
                         unsafe {
                             core::slice::from_raw_parts(buffer_ptr as *const u8, length as usize)
                         }
@@ -6410,15 +11010,50 @@ impl NtShimEntrypoints {
             }
 
             NtSyscallId::NtMapViewOfSectionEx => {
-                // NtMapViewOfSectionEx is the modern (Win10+) superset of
-                // NtMapViewOfSection with extra parameters. Delegate to
-                // existing handler which reads the standard 10 arguments.
-                let status = syscalls::section::nt_map_view_of_section(
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let view_size_ptr =
+                    crate::try_read_guest_value_unaligned::<usize>(ctx.regs.rsp + 0x28)
+                        .unwrap_or(0);
+                let caller = self
+                    .thread_obj
+                    .as_ref()
+                    .map_or(0, |obj| obj.last_caller_ret());
+                let status = syscalls::section::nt_map_view_of_section_ex(
                     ctx,
                     &self.shared.handles.lock(),
                     &self.shared,
                     self.init_state.as_ref(),
                 );
+                if status == NtStatus::STATUS_SUCCESS {
+                    let mapped_base =
+                        crate::try_read_guest_value_unaligned::<usize>(args.arg2).unwrap_or(0);
+                    let mapped_size = if view_size_ptr != 0 {
+                        crate::try_read_guest_value_unaligned::<usize>(view_size_ptr).unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    push_recent_vm_teardown(
+                        &self.shared.recent_vm_teardowns,
+                        RecentVmTeardown {
+                            tid: self.thread_id,
+                            kind: 7,
+                            base: mapped_base,
+                            size: mapped_size,
+                            detail: args.arg0,
+                            caller,
+                        },
+                    );
+                    push_recent_chain_event(
+                        &self.shared.recent_chain_events,
+                        alloc::format!(
+                            "mapviewex:{}:0x{:X}:0x{:X}:0x{:X}",
+                            self.thread_id,
+                            args.arg0,
+                            mapped_base,
+                            mapped_size
+                        ),
+                    );
+                }
                 (status, false)
             }
 
@@ -6436,12 +11071,16 @@ impl NtShimEntrypoints {
                     let handles = self.shared.handles.lock();
                     resolve_object_attributes_name(args.arg2, &handles)
                 };
-                let handle_ptr = args.arg0 as *mut u64;
+                let handle_ptr = args.arg0;
                 let mut handles = self.shared.handles.lock();
                 let h = handles.insert(handle_table::NtObject::Stub {
                     kind: alloc::format!("SymbolicLink:{name}"),
+                    io_completion: None,
                 });
-                unsafe { core::ptr::write(handle_ptr, h as u64) };
+                if handle_ptr == 0 || !crate::try_write_guest_value_unaligned(handle_ptr, h as u64)
+                {
+                    return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                }
                 #[cfg(debug_assertions)]
                 {
                     use litebox::platform::DebugLogProvider as _;
@@ -6462,13 +11101,13 @@ impl NtShimEntrypoints {
                 let ustr_ptr = args.arg1;
                 let name = {
                     let handles = self.shared.handles.lock();
-                    match handles.get(handle) {
-                        Some(handle_table::NtObject::Stub { kind }) => kind
+                    handles.with(handle, |entry| match &entry.object {
+                        handle_table::NtObject::Stub { kind, .. } => kind
                             .strip_prefix("SymbolicLink:")
                             .map(alloc::string::String::from)
                             .unwrap_or_default(),
                         _ => alloc::string::String::new(),
-                    }
+                    }).unwrap_or_default()
                 };
                 let Some(target) = symbolic_link_target_for_name(&name) else {
                     #[cfg(debug_assertions)]
@@ -6483,28 +11122,31 @@ impl NtShimEntrypoints {
                 let path: alloc::vec::Vec<u16> = target.encode_utf16().collect();
                 let byte_len = (path.len() * 2) as u16;
 
+                let Some(max_len) = crate::try_read_guest_value_unaligned::<u16>(ustr_ptr + 2)
+                else {
+                    return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                };
+                if max_len < byte_len {
+                    return (NtStatus::STATUS_BUFFER_TOO_SMALL, false);
+                }
+                crate::try_write_guest_value_unaligned(ustr_ptr, byte_len);
+                let Some(buf_va) = crate::try_read_guest_value_unaligned::<usize>(ustr_ptr + 8)
+                else {
+                    return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                };
+                if !crate::is_addr_range_writable(buf_va, path.len() * 2) {
+                    return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                }
                 unsafe {
-                    // Read MaximumLength from UNICODE_STRING.
-                    let max_len = core::ptr::read_unaligned((ustr_ptr + 2) as *const u16);
-                    if max_len < byte_len {
-                        return (NtStatus::STATUS_BUFFER_TOO_SMALL, false);
-                    }
-                    // Write Length.
-                    core::ptr::write_unaligned(ustr_ptr as *mut u16, byte_len);
-                    // Copy path into Buffer.
-                    let buf_ptr =
-                        core::ptr::read_unaligned((ustr_ptr + 8) as *const usize) as *mut u16;
+                    let buf_ptr = buf_va as *mut u16;
                     core::ptr::copy_nonoverlapping(path.as_ptr(), buf_ptr, path.len());
                     if max_len >= byte_len + 2 {
                         core::ptr::write(buf_ptr.add(path.len()), 0);
                     }
                 }
-                // If caller provides a return-length pointer (arg2), write it.
                 let ret_len_ptr = args.arg2;
                 if ret_len_ptr != 0 {
-                    unsafe {
-                        core::ptr::write(ret_len_ptr as *mut u32, byte_len as u32);
-                    }
+                    crate::try_write_guest_value_unaligned(ret_len_ptr, byte_len as u32);
                 }
                 #[cfg(debug_assertions)]
                 {
@@ -6524,63 +11166,126 @@ impl NtShimEntrypoints {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let file_handle = args.arg0 as u32;
                 let io_status_ptr =
-                    unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
-                let ioctl_code = unsafe { core::ptr::read((ctx.regs.rsp + 0x30) as *const u32) };
-                let _input_buffer =
-                    unsafe { core::ptr::read((ctx.regs.rsp + 0x38) as *const usize) };
-                let _input_length = unsafe { core::ptr::read((ctx.regs.rsp + 0x40) as *const u32) };
+                    try_read_guest_value_unaligned::<usize>(ctx.regs.rsp + 0x28).unwrap_or(0);
+                let ioctl_code =
+                    try_read_guest_value_unaligned::<u32>(ctx.regs.rsp + 0x30).unwrap_or(0);
+                let input_buffer =
+                    try_read_guest_value_unaligned::<usize>(ctx.regs.rsp + 0x38).unwrap_or(0);
+                let input_length =
+                    try_read_guest_value_unaligned::<u32>(ctx.regs.rsp + 0x40).unwrap_or(0);
                 let output_buffer =
-                    unsafe { core::ptr::read((ctx.regs.rsp + 0x48) as *const usize) };
-                let output_length = unsafe { core::ptr::read((ctx.regs.rsp + 0x50) as *const u32) };
+                    try_read_guest_value_unaligned::<usize>(ctx.regs.rsp + 0x48).unwrap_or(0);
+                let output_length =
+                    try_read_guest_value_unaligned::<u32>(ctx.regs.rsp + 0x50).unwrap_or(0);
 
                 enum IoctlTarget {
                     ConDrv,
                     Cng,
+                    KsecDD,
+                    Console { is_stderr: bool },
+                    ConsoleIn,
+                    /// Socket handle — carries the NT handle value for lookups.
+                    Socket { handle: u32 },
+                    /// Afd stub handle (e.g., \Device\Afd\AsyncConnectHlp).
+                    /// Used for async connect operations.
+                    AfdStub,
                 }
                 let target = {
                     let handles = self.shared.handles.lock();
-                    match handles.get(file_handle) {
-                        Some(handle_table::NtObject::Stub { kind }) if kind == "ConDrv" => {
+                    handles.with(file_handle, |entry| match &entry.object {
+                        handle_table::NtObject::Stub { kind, .. } if kind == "ConDrv" => {
                             Some(IoctlTarget::ConDrv)
                         }
-                        Some(handle_table::NtObject::Stub { kind }) if kind == "CNG" => {
+                        handle_table::NtObject::Stub { kind, .. } if kind == "CNG" => {
                             Some(IoctlTarget::Cng)
                         }
+                        handle_table::NtObject::Stub { kind, .. } if kind == "KsecDD" => {
+                            Some(IoctlTarget::KsecDD)
+                        }
+                        handle_table::NtObject::ConsoleOutput { is_stderr } => {
+                            Some(IoctlTarget::Console { is_stderr: *is_stderr })
+                        }
+                        handle_table::NtObject::ConsoleInput => {
+                            Some(IoctlTarget::ConsoleIn)
+                        }
+                        handle_table::NtObject::Socket { .. } => {
+                            Some(IoctlTarget::Socket { handle: file_handle })
+                        }
+                        handle_table::NtObject::Stub { kind, .. } if kind == "Afd" => {
+                            Some(IoctlTarget::AfdStub)
+                        }
                         _ => None,
-                    }
+                    }).flatten()
                 };
 
                 match target {
                     Some(IoctlTarget::ConDrv) => {
-                        #[cfg(debug_assertions)]
+                        #[cfg(feature = "trace_debug")]
                         {
                             use litebox::platform::DebugLogProvider as _;
                             litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                                "NT shim: NtDeviceIoControlFile ConDrv ioctl=0x{ioctl_code:X} ΓåÆ stub success\n"
+                                "NT shim: NtDeviceIoControlFile ConDrv handle=0x{file_handle:X} ioctl=0x{ioctl_code:X} in_buf=0x{input_buffer:X} in_len=0x{input_length:X} out_buf=0x{output_buffer:X} out_len=0x{output_length:X}\n"
                             ));
                         }
-                        if io_status_ptr != 0 {
-                            unsafe {
-                                core::ptr::write(io_status_ptr as *mut u64, 0); // Status
-                                core::ptr::write((io_status_ptr + 8) as *mut u64, 0); // Information
+                        // IOCTL_CONDRV_GET_CONSOLE_MODE = 0x500023
+                        // Fail this so the CRT treats stdout/stderr as file
+                        // handles and routes output through NtWriteFile instead
+                        // of WriteConsoleW (which requires real ConDrv support).
+                        if ioctl_code == 0x0050_0023 {
+                            if io_status_ptr != 0 {
+                                try_write_guest_value_unaligned(
+                                    io_status_ptr,
+                                    NtStatus::STATUS_INVALID_HANDLE.0 as u64,
+                                );
+                                try_write_guest_value_unaligned(io_status_ptr + 8, 0u64);
                             }
+                            (NtStatus::STATUS_INVALID_HANDLE, false)
+                        } else if ioctl_code == 0x0050_0016 {
+                            // IOCTL_CONDRV_SET_CONSOLE_MODE = 0x500016
+                            // FAIL SetConsoleMode on ConDrv stub (Connect handle).
+                            // If we succeed, kernelbase caches the mode for the
+                            // target I/O handle.  Later GetConsoleMode() reads
+                            // from this cache (bypassing our IOCTL handler) and
+                            // returns TRUE — causing libuv to classify the handle
+                            // as TTY and use WriteConsoleW (user-mode ConDrv shared
+                            // memory path that bypasses our syscall boundary).
+                            if io_status_ptr != 0 {
+                                try_write_guest_value_unaligned(
+                                    io_status_ptr,
+                                    NtStatus::STATUS_INVALID_HANDLE.0 as u64,
+                                );
+                                try_write_guest_value_unaligned(io_status_ptr + 8, 0u64);
+                            }
+                            (NtStatus::STATUS_INVALID_HANDLE, false)
+                        } else {
+                            // Succeed for other ConDrv IOCTLs (init, etc.)
+                            // The ConDrv Server IOCTL (0x500037) must succeed or the
+                            // CRT will crash during DLL init.  We accept all ConDrv
+                            // IOCTLs except GetConsoleMode and SetConsoleMode to keep
+                            // the CRT happy.
+                            if io_status_ptr != 0 {
+                                try_write_guest_value_unaligned(io_status_ptr, 0u64);
+                                try_write_guest_value_unaligned(io_status_ptr + 8, 0u64);
+                            }
+                            (NtStatus::STATUS_SUCCESS, false)
                         }
-                        (NtStatus::STATUS_SUCCESS, false)
                     }
                     Some(IoctlTarget::Cng) => match ioctl_code {
                         0x0039_0008 => {
                             if output_buffer == 0 || output_length == 0 {
                                 if io_status_ptr != 0 {
-                                    unsafe {
-                                        core::ptr::write(
-                                            io_status_ptr as *mut u64,
-                                            NtStatus::STATUS_INVALID_PARAMETER.0 as u64,
-                                        );
-                                        core::ptr::write((io_status_ptr + 8) as *mut u64, 0);
-                                    }
+                                    try_write_guest_value_unaligned(
+                                        io_status_ptr,
+                                        NtStatus::STATUS_INVALID_PARAMETER.0 as u64,
+                                    );
+                                    try_write_guest_value_unaligned(io_status_ptr + 8, 0u64);
                                 }
                                 (NtStatus::STATUS_INVALID_PARAMETER, false)
+                            } else if !is_addr_range_writable(output_buffer, output_length as usize)
+                            {
+                                (NtStatus::STATUS_ACCESS_VIOLATION, false)
                             } else {
+                                // Safety: range validated above.
                                 let out = unsafe {
                                     core::slice::from_raw_parts_mut(
                                         output_buffer as *mut u8,
@@ -6590,13 +11295,11 @@ impl NtShimEntrypoints {
                                 use litebox::platform::CrngProvider as _;
                                 litebox_platform_multiplex::platform().fill_bytes_crng(out);
                                 if io_status_ptr != 0 {
-                                    unsafe {
-                                        core::ptr::write(io_status_ptr as *mut u64, 0); // Status
-                                        core::ptr::write(
-                                            (io_status_ptr + 8) as *mut u64,
-                                            output_length as u64,
-                                        );
-                                    }
+                                    try_write_guest_value_unaligned(io_status_ptr, 0u64);
+                                    try_write_guest_value_unaligned(
+                                        io_status_ptr + 8,
+                                        output_length as u64,
+                                    );
                                 }
                                 #[cfg(debug_assertions)]
                                 {
@@ -6624,7 +11327,2097 @@ impl NtShimEntrypoints {
                             (NtStatus::STATUS_NOT_SUPPORTED, false)
                         }
                     },
+                    Some(IoctlTarget::KsecDD) => match ioctl_code {
+                        // IOCTL_KSEC_CONNECT_LSA (0x00390000) — bcrypt calls
+                        // this during DllMain to "connect" to the LSA subsystem.
+                        // Returning success with zeroed IoStatusBlock is enough.
+                        0x0039_0000 => {
+                            #[cfg(feature = "trace_debug")]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "NT shim: NtDeviceIoControlFile KsecDD CONNECT_LSA ioctl=0x{ioctl_code:X} → stub success\n"
+                                    ),
+                                );
+                            }
+                            if io_status_ptr != 0 {
+                                try_write_guest_value_unaligned(io_status_ptr, 0u64);
+                                try_write_guest_value_unaligned(io_status_ptr + 8, 0u64);
+                            }
+                            (NtStatus::STATUS_SUCCESS, false)
+                        }
+                        // IOCTL_KSEC_IPC_MESSAGE (0x00390400) — used by BCrypt.
+                        //
+                        // The input starts with a 4-byte magic (0x1A2B3C4D) then
+                        // a 4-byte command code. We inspect the command to decide
+                        // what to return:
+                        //   * 0x00010500 (ProcessOpen) → return a dummy 8-byte handle
+                        //   * 0x00020000 (GenRandom)   → return random bytes
+                        //   * anything else            → zero-fill output
+                        //
+                        // IOCTL_KSEC_RNG (0x00390004) and
+                        // IOCTL_KSEC_GENERATE_RANDOM (0x00390008) are simpler:
+                        // just fill the output buffer with random bytes.
+                        0x0039_0004 | 0x0039_0008 | 0x0039_0400 => {
+                            if output_buffer != 0
+                                && output_length > 0
+                                && is_addr_range_writable(output_buffer, output_length as usize)
+                            {
+                                let out = unsafe {
+                                    core::slice::from_raw_parts_mut(
+                                        output_buffer as *mut u8,
+                                        output_length as usize,
+                                    )
+                                };
+                                if ioctl_code == 0x0039_0400 {
+                                    // Read command code from input buffer offset 4.
+                                    let cmd = if input_buffer != 0 && input_length >= 8 {
+                                        try_read_guest_value_unaligned::<u32>(input_buffer + 4)
+                                            .unwrap_or(0)
+                                    } else {
+                                        0
+                                    };
+                                    match cmd {
+                                        // ProcessOpen (0x00010500) — return a dummy handle.
+                                        0x0001_0500 => {
+                                            for b in out.iter_mut() {
+                                                *b = 0;
+                                            }
+                                            // Write a non-zero handle value at offset 0.
+                                            if output_length >= 8 {
+                                                try_write_guest_value_unaligned(
+                                                    output_buffer,
+                                                    0x0000_0001_0000_0001u64,
+                                                );
+                                            }
+                                        }
+                                        // GenRandom (0x00020000) — return random data.
+                                        0x0002_0000 => {
+                                            use litebox::platform::CrngProvider as _;
+                                            litebox_platform_multiplex::platform()
+                                                .fill_bytes_crng(out);
+                                        }
+                                        // Unknown — zero fill.
+                                        _ => {
+                                            for b in out.iter_mut() {
+                                                *b = 0;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // For 0x390004/0x390008: fill everything with random.
+                                    use litebox::platform::CrngProvider as _;
+                                    litebox_platform_multiplex::platform().fill_bytes_crng(out);
+                                }
+                            }
+                            if io_status_ptr != 0 {
+                                try_write_guest_value_unaligned(io_status_ptr, 0u64);
+                                try_write_guest_value_unaligned(
+                                    io_status_ptr + 8,
+                                    output_length as u64,
+                                );
+                            }
+                            #[cfg(feature = "trace_debug")]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                // Dump first 32 bytes of input buffer for debugging.
+                                let mut hex = alloc::string::String::new();
+                                let dump_len = core::cmp::min(input_length as usize, 64);
+                                if input_buffer != 0 && dump_len > 0 {
+                                    let buf = unsafe {
+                                        core::slice::from_raw_parts(
+                                            input_buffer as *const u8,
+                                            dump_len,
+                                        )
+                                    };
+                                    for (i, b) in buf.iter().enumerate() {
+                                        if i > 0 && i % 4 == 0 {
+                                            hex.push(' ');
+                                        }
+                                        hex.push_str(&alloc::format!("{b:02X}"));
+                                    }
+                                }
+                                // Dump output buffer too.
+                                let mut out_hex = alloc::string::String::new();
+                                let out_dump_len = core::cmp::min(output_length as usize, 32);
+                                if output_buffer != 0 && out_dump_len > 0 {
+                                    let buf = unsafe {
+                                        core::slice::from_raw_parts(
+                                            output_buffer as *const u8,
+                                            out_dump_len,
+                                        )
+                                    };
+                                    for (i, b) in buf.iter().enumerate() {
+                                        if i > 0 && i % 4 == 0 {
+                                            out_hex.push(' ');
+                                        }
+                                        out_hex.push_str(&alloc::format!("{b:02X}"));
+                                    }
+                                }
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "NT shim: KsecDD ioctl=0x{ioctl_code:X} in[{input_length}]={hex} out[{output_length}]={out_hex}\n",
+                                    ),
+                                );
+                            }
+                            (NtStatus::STATUS_SUCCESS, false)
+                        }
+                        _ => {
+                            #[cfg(feature = "trace_debug")]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "NT shim: unsupported KsecDD ioctl=0x{ioctl_code:X}\n"
+                                    ),
+                                );
+                            }
+                            // Return success for unknown KsecDD IOCTLs to
+                            // avoid blocking bcrypt.dll DllMain.
+                            if io_status_ptr != 0 {
+                                try_write_guest_value_unaligned(io_status_ptr, 0u64);
+                                try_write_guest_value_unaligned(io_status_ptr + 8, 0u64);
+                            }
+                            (NtStatus::STATUS_SUCCESS, false)
+                        }
+                    },
+                    Some(IoctlTarget::Console { .. }) | Some(IoctlTarget::ConsoleIn) => {
+                        // Console handles: handle GetConsoleMode / SetConsoleMode IOCTLs.
+                        // The UCRT calls GetConsoleMode on stdio handles during CRT init
+                        // to determine if the handle is a console (for _isatty, buffering, etc.).
+                        match ioctl_code {
+                            // IOCTL_CONDRV_GET_CONSOLE_MODE = 0x500023
+                            0x0050_0023 => {
+                                // FAIL GetConsoleMode.  If we return success here,
+                                // kernelbase caches the result in its user-mode
+                                // console client.  Subsequent GetConsoleMode calls
+                                // from libuv / CPython then go through that cache
+                                // (never hitting our shim) and classify the handle
+                                // as a real console TTY.  Libuv then uses
+                                // WriteConsoleW which goes through the user-mode
+                                // ConDrv path — completely bypassing our syscall
+                                // boundary — so output disappears.
+                                //
+                                // By failing here, kernelbase never caches anything:
+                                // - libuv sees "not a TTY" → uses NtWriteFile (pipe)
+                                // - CPython sees "not a console" → uses FileIO
+                                // - CRT handles this gracefully (same as no-console)
+                                if io_status_ptr != 0 {
+                                    try_write_guest_value_unaligned(
+                                        io_status_ptr,
+                                        NtStatus::STATUS_INVALID_HANDLE.0 as u64,
+                                    );
+                                    try_write_guest_value_unaligned(io_status_ptr + 8, 0u64);
+                                }
+                                (NtStatus::STATUS_INVALID_HANDLE, false)
+                            }
+                            // IOCTL_CONDRV_SET_CONSOLE_MODE = 0x500016
+                            0x0050_0016 => {
+                                // FAIL SetConsoleMode on Console handles too.
+                                // Prevents kernelbase from caching console mode.
+                                if io_status_ptr != 0 {
+                                    try_write_guest_value_unaligned(
+                                        io_status_ptr,
+                                        NtStatus::STATUS_INVALID_HANDLE.0 as u64,
+                                    );
+                                    try_write_guest_value_unaligned(io_status_ptr + 8, 0u64);
+                                }
+                                (NtStatus::STATUS_INVALID_HANDLE, false)
+                            }
+                            // IOCTL_CONDRV_GET_NUMBER_OF_INPUT_EVENTS = 0x50002F
+                            // Used by GetNumberOfConsoleInputEvents.  CPython's
+                            // _get_console_type() calls this to distinguish input
+                            // vs output handles: succeeds → 'r' (input), fails → 'w' (output).
+                            // Must succeed on ConsoleIn and fail on ConsoleOutput.
+                            0x0050_002F => {
+                                match &target {
+                                    Some(IoctlTarget::ConsoleIn) => {
+                                        // Report 0 pending input events.
+                                        if output_buffer != 0 && output_length >= 4 {
+                                            try_write_guest_value_unaligned(output_buffer, 0u32);
+                                        }
+                                        if io_status_ptr != 0 {
+                                            try_write_guest_value_unaligned(io_status_ptr, 0u64);
+                                            try_write_guest_value_unaligned(io_status_ptr + 8, 4u64);
+                                        }
+                                        (NtStatus::STATUS_SUCCESS, false)
+                                    }
+                                    _ => {
+                                        // Output handle — must fail so CPython classifies it as 'w'.
+                                        if io_status_ptr != 0 {
+                                            try_write_guest_value_unaligned(
+                                                io_status_ptr,
+                                                NtStatus::STATUS_INVALID_HANDLE.0 as u64,
+                                            );
+                                            try_write_guest_value_unaligned(io_status_ptr + 8, 0u64);
+                                        }
+                                        (NtStatus::STATUS_INVALID_HANDLE, false)
+                                    }
+                                }
+                            }
+                            _ => {
+                                // Unknown console IOCTL — succeed with zero-filled output.
+                                // Libuv and the UCRT issue many console IOCTLs (WriteConsole,
+                                // ReadConsole, GetConsoleScreenBufferInfo, etc.) that we don't
+                                // specifically handle.  Returning failure causes silent output
+                                // loss in Node.js.  Succeeding with zeroed output is safe.
+                                #[cfg(feature = "trace_debug")]
+                                {
+                                    use litebox::platform::DebugLogProvider as _;
+                                    litebox_platform_multiplex::platform().debug_log_print(
+                                        &alloc::format!(
+                                            "NT shim: NtDeviceIoControlFile Console handle=0x{file_handle:X} unknown ioctl=0x{ioctl_code:X}\n"
+                                        ),
+                                    );
+                                }
+                                if io_status_ptr != 0 {
+                                    try_write_guest_value_unaligned(io_status_ptr, 0u64);
+                                    try_write_guest_value_unaligned(io_status_ptr + 8, 0u64);
+                                }
+                                (NtStatus::STATUS_SUCCESS, false)
+                            }
+                        }
+                    }
+                    Some(IoctlTarget::Socket { handle: sock_handle }) => {
+                        // AFD IOCTL dispatch for WinSock sockets.
+                        //
+                        // mswsock.dll communicates with the AFD driver via
+                        // NtDeviceIoControlFile IOCTLs on the socket handle.
+                        // We intercept these and delegate to the litebox Network
+                        // core where appropriate.
+
+                        // AFD IOCTL code constants.
+                        const IOCTL_AFD_BIND: u32 = 0x12003;
+                        const IOCTL_AFD_CONNECT: u32 = 0x12007;
+                        const IOCTL_AFD_START_LISTEN: u32 = 0x1200B;
+                        const IOCTL_AFD_RECV: u32 = 0x12017;
+                        const IOCTL_AFD_SEND: u32 = 0x1201F;
+                        const IOCTL_AFD_SELECT: u32 = 0x12024;
+                        const IOCTL_AFD_GET_INFO: u32 = 0x1207B;
+                        const IOCTL_AFD_SET_INFO: u32 = 0x1203B;
+                        const IOCTL_AFD_SET_CONTEXT: u32 = 0x12047;
+                        const IOCTL_AFD_GET_CONTEXT: u32 = 0x12043;
+                        const IOCTL_AFD_TRANSPORT_IOCTL: u32 = 0x120BF;
+                        const IOCTL_AFD_GET_SOCK_NAME: u32 = 0x1202F;
+                        const IOCTL_AFD_GET_PEER_NAME: u32 = 0x12033;
+                        const IOCTL_AFD_GET_CONTEXT_SIZE: u32 = 0x1203F;
+                        const IOCTL_AFD_SUPER_CONNECT: u32 = 0x120C7;
+
+                        // AFD_INFO InformationClass values.
+                        const AFD_INFO_BLOCKING_MODE: u32 = 0x02;
+                        const AFD_INFO_RECEIVE_WINDOW_SIZE: u32 = 0x06;
+                        const AFD_INFO_SEND_WINDOW_SIZE: u32 = 0x07;
+                        const AFD_INFO_RECEIVE_CONTENT_SIZE: u32 = 0x11;
+                        const AFD_INFO_GROUP_ID_TYPE: u32 = 0x10;
+
+                        // AFD_INFO structure (16 bytes):
+                        //   +0x00: u32  InformationClass
+                        //   +0x04: u32  padding (alignment)
+                        //   +0x08: u64  Information (LARGE_INTEGER union)
+                        #[repr(C)]
+                        #[derive(Clone, Copy)]
+                        struct AfdInfo {
+                            information_class: u32,
+                            _pad: u32,
+                            information: u64,
+                        }
+
+                        let event_handle = args.arg1 as u32;
+
+                        #[cfg(feature = "trace_debug")]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "NT shim: AFD IOCTL handle=0x{sock_handle:X} ioctl=0x{ioctl_code:X} event=0x{event_handle:X} in_buf=0x{input_buffer:X} in_len=0x{input_length:X} out_buf=0x{output_buffer:X} out_len=0x{output_length:X}\n"
+                            ));
+                        }
+
+                        // Number of bytes to report in IO_STATUS_BLOCK.Information.
+                        // Most IOCTLs report 0; SEND/RECV report the transfer count.
+                        let mut io_information: usize = 0;
+
+                        let status = match ioctl_code {
+                            IOCTL_AFD_GET_INFO => {
+                                // Read AFD_INFO from input buffer.
+                                if input_length < 16 || input_buffer == 0 {
+                                    NtStatus::STATUS_INVALID_PARAMETER
+                                } else if let Some(info) =
+                                    try_read_guest_value_unaligned::<AfdInfo>(input_buffer)
+                                {
+                                    let info_class = info.information_class;
+                                    let result_value: u64 = match info_class {
+                                        AFD_INFO_SEND_WINDOW_SIZE => {
+                                            // Default send buffer size (SO_SNDBUF).
+                                            65536
+                                        }
+                                        AFD_INFO_RECEIVE_WINDOW_SIZE => {
+                                            // Default receive buffer size (SO_RCVBUF).
+                                            65536
+                                        }
+                                        AFD_INFO_BLOCKING_MODE => {
+                                            // 0 = blocking (default).
+                                            0
+                                        }
+                                        AFD_INFO_RECEIVE_CONTENT_SIZE => {
+                                            // Bytes available to read (FIONREAD).
+                                            0
+                                        }
+                                        AFD_INFO_GROUP_ID_TYPE => {
+                                            // No group.
+                                            0
+                                        }
+                                        _ => {
+                                            #[cfg(debug_assertions)]
+                                            {
+                                                use litebox::platform::DebugLogProvider as _;
+                                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                    "NT shim: AFD GET_INFO unknown class=0x{info_class:X}\n"
+                                                ));
+                                            }
+                                            0
+                                        }
+                                    };
+
+                                    // Write the result back. The output uses the same AFD_INFO layout.
+                                    let out_ptr = if output_buffer != 0 { output_buffer } else { input_buffer };
+                                    let result_info = AfdInfo {
+                                        information_class: info_class,
+                                        _pad: 0,
+                                        information: result_value,
+                                    };
+                                    try_write_guest_value_unaligned(out_ptr, result_info);
+
+                                    #[cfg(debug_assertions)]
+                                    {
+                                        use litebox::platform::DebugLogProvider as _;
+                                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                            "NT shim: AFD GET_INFO class=0x{info_class:X} → value={result_value}\n"
+                                        ));
+                                    }
+
+                                    NtStatus::STATUS_SUCCESS
+                                } else {
+                                    NtStatus::STATUS_INVALID_PARAMETER
+                                }
+                            }
+
+                            IOCTL_AFD_SET_CONTEXT => {
+                                // mswsock stores an opaque SOCKET_CONTEXT blob.
+                                // We don't need it — accept silently.
+                                #[cfg(debug_assertions)]
+                                {
+                                    use litebox::platform::DebugLogProvider as _;
+                                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                        "NT shim: AFD SET_CONTEXT sock_id={sock_id} size={input_length} → accepted\n"
+                                    ));
+                                }
+                                NtStatus::STATUS_SUCCESS
+                            }
+
+                            IOCTL_AFD_SET_INFO => {
+                                // SetSocketInformation — accept silently for now.
+                                #[cfg(debug_assertions)]
+                                {
+                                    use litebox::platform::DebugLogProvider as _;
+                                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                        "NT shim: AFD SET_INFO sock_id={sock_id} → stub success\n"
+                                    ));
+                                }
+                                NtStatus::STATUS_SUCCESS
+                            }
+
+                            IOCTL_AFD_GET_CONTEXT => {
+                                // Return zeros — we didn't store the context.
+                                if output_buffer != 0 && output_length > 0 {
+                                    let zero_len = core::cmp::min(output_length as usize, 256);
+                                    let zeros = [0u8; 256];
+                                    unsafe {
+                                        core::ptr::copy_nonoverlapping(
+                                            zeros.as_ptr(),
+                                            output_buffer as *mut u8,
+                                            zero_len,
+                                        );
+                                    }
+                                }
+                                NtStatus::STATUS_SUCCESS
+                            }
+
+                            IOCTL_AFD_GET_CONTEXT_SIZE => {
+                                // Returns the size of the socket context blob.
+                                // msafd uses this before GET_CONTEXT/SET_CONTEXT.
+                                // The context is 0xA8 bytes (SOCKET_CONTEXT on x64).
+                                if output_buffer != 0 && output_length >= 4 {
+                                    try_write_guest_value_unaligned(output_buffer, 0xA8u32);
+                                    io_information = 4;
+                                }
+                                NtStatus::STATUS_SUCCESS
+                            }
+
+                            IOCTL_AFD_TRANSPORT_IOCTL => {
+                                // Pass-through IOCTL for setsockopt/getsockopt/ioctlsocket.
+                                // Input is AFD_TL_IO_CONTROL_INFO (0x20 bytes on x64):
+                                //   +0x00: u32  Type (1=setsockopt, 2=getsockopt, 3=ioctlsocket)
+                                //   +0x04: u32  Level (SOL_SOCKET, IPPROTO_TCP, etc.)
+                                //   +0x08: u32  IoControlCode (SO_*, TCP_*, SIO_*, etc.)
+                                //   +0x0C: u8   EndpointIoctl (must be TRUE)
+                                //   +0x0D: [u8;3] padding
+                                //   +0x10: u64  InputBuffer pointer
+                                //   +0x18: u64  InputBufferLength
+                                #[repr(C)]
+                                #[derive(Clone, Copy)]
+                                struct AfdTlIoControlInfo {
+                                    io_type: u32,
+                                    level: u32,
+                                    io_control_code: u32,
+                                    endpoint_ioctl: u8,
+                                    _pad: [u8; 3],
+                                    input_buffer_ptr: u64,
+                                    input_buffer_length: u64,
+                                }
+
+                                if input_length < 0x20 || input_buffer == 0 {
+                                    NtStatus::STATUS_INVALID_PARAMETER
+                                } else if let Some(tl_info) =
+                                    try_read_guest_value_unaligned::<AfdTlIoControlInfo>(input_buffer)
+                                {
+                                    #[cfg(debug_assertions)]
+                                    {
+                                        use litebox::platform::DebugLogProvider as _;
+                                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                            "NT shim: AFD TRANSPORT_IOCTL sock_id={sock_id} type={} level=0x{:X} code=0x{:X} buf=0x{:X} len={}\n",
+                                            tl_info.io_type, tl_info.level, tl_info.io_control_code,
+                                            tl_info.input_buffer_ptr, tl_info.input_buffer_length,
+                                        ));
+                                    }
+                                    // Accept all setsockopt/getsockopt/ioctlsocket calls.
+                                    // For getsockopt, return zeros in the output buffer.
+                                    if tl_info.io_type == 2 && output_buffer != 0 && output_length > 0 {
+                                        // getsockopt — fill output with zeros.
+                                        let zero_len = core::cmp::min(output_length as usize, 256);
+                                        let zeros = [0u8; 256];
+                                        unsafe {
+                                            core::ptr::copy_nonoverlapping(
+                                                zeros.as_ptr(),
+                                                output_buffer as *mut u8,
+                                                zero_len,
+                                            );
+                                        }
+                                    }
+                                    NtStatus::STATUS_SUCCESS
+                                } else {
+                                    NtStatus::STATUS_INVALID_PARAMETER
+                                }
+                            }
+
+                            IOCTL_AFD_BIND => {
+                                // Bind a socket to a local address.
+                                // Input structure (from ReactOS AFD_BIND_DATA):
+                                //   +0x00: u32  ShareType (exclusive/shared/wildcard)
+                                //   +0x04: [u8] SOCKADDR (16 bytes for AF_INET)
+                                // The SOCKADDR starts at offset 4.
+                                if input_length < 20 || input_buffer == 0 {
+                                    NtStatus::STATUS_INVALID_PARAMETER
+                                } else {
+                                    // Read the sockaddr_in from offset +4.
+                                    #[repr(C, packed)]
+                                    #[derive(Clone, Copy)]
+                                    struct SockAddrIn {
+                                        family: u16,
+                                        port: u16,   // network byte order
+                                        addr: [u8; 4],
+                                        _pad: [u8; 8],
+                                    }
+
+                                    let sa_ptr = input_buffer + 4;
+                                    if let Some(sa) = try_read_guest_value_unaligned::<SockAddrIn>(sa_ptr) {
+                                        let port = u16::from_be(sa.port);
+                                        let ip = core::net::Ipv4Addr::from(sa.addr);
+                                        let sock_addr = core::net::SocketAddr::V4(
+                                            core::net::SocketAddrV4::new(ip, port),
+                                        );
+
+                                        #[cfg(debug_assertions)]
+                                        {
+                                            use litebox::platform::DebugLogProvider as _;
+                                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                "NT shim: AFD BIND sock_id={sock_id} addr={sock_addr}\n"
+                                            ));
+                                        }
+
+                                        // If binding to 0.0.0.0:0, this is an implicit bind
+                                        // that lets the connect allocate an ephemeral port.
+                                        // Don't forward to the core — connect() handles it.
+                                        if port == 0 && ip.is_unspecified() {
+                                            #[cfg(debug_assertions)]
+                                            {
+                                                use litebox::platform::DebugLogProvider as _;
+                                                litebox_platform_multiplex::platform().debug_log_print(
+                                                    "NT shim: AFD BIND 0.0.0.0:0 → implicit (skipped)\n"
+                                                );
+                                            }
+                                            // Write back a dummy address in the output buffer.
+                                            if output_buffer != 0 && output_length >= 16 {
+                                                let out_sa = SockAddrIn {
+                                                    family: 2, // AF_INET
+                                                    port: 0,
+                                                    addr: [0u8; 4],
+                                                    _pad: [0u8; 8],
+                                                };
+                                                try_write_guest_value_unaligned(output_buffer, out_sa);
+                                            }
+                                            NtStatus::STATUS_SUCCESS
+                                        } else {
+                                            // Get the SocketFd and call Network::bind().
+                                        let bind_result = {
+                                            let handles = self.shared.handles.lock();
+                                            handles.with(sock_handle, |entry| match &entry.object {
+                                                handle_table::NtObject::Socket { socket_fd, .. } => {
+                                                    if let Some(net_arc) = self.shared.net.get() {
+                                                        let result = net_arc.lock().bind(socket_fd, &sock_addr);
+                                                        Some(result)
+                                                    } else {
+                                                        None
+                                                    }
+                                                }
+                                                _ => None,
+                                            }).flatten()
+                                        };
+
+                                        match bind_result {
+                                            Some(Ok(())) => {
+                                                // Write the bound address to the output buffer
+                                                // (mswsock expects the local address back).
+                                                if output_buffer != 0 && output_length >= 16 {
+                                                    let out_sa = SockAddrIn {
+                                                        family: 2, // AF_INET
+                                                        port: sa.port,
+                                                        addr: sa.addr,
+                                                        _pad: [0u8; 8],
+                                                    };
+                                                    try_write_guest_value_unaligned(output_buffer, out_sa);
+                                                }
+                                                NtStatus::STATUS_SUCCESS
+                                            }
+                                            Some(Err(e)) => {
+                                                #[cfg(debug_assertions)]
+                                                {
+                                                    use litebox::platform::DebugLogProvider as _;
+                                                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                        "NT shim: AFD BIND failed: {e:?}\n"
+                                                    ));
+                                                }
+                                                // Map bind errors to NT status codes.
+                                                NtStatus::STATUS_ADDRESS_ALREADY_ASSOCIATED
+                                            }
+                                            None => NtStatus::STATUS_INVALID_HANDLE,
+                                        }
+                                        } // else: non-0.0.0.0:0 bind
+                                    } else {
+                                        NtStatus::STATUS_INVALID_PARAMETER
+                                    }
+                                }
+                            }
+
+                            IOCTL_AFD_CONNECT => {
+                                // Connect a socket to a remote address.
+                                // Input structure (from ReactOS AFD_CONNECT_INFO):
+                                //   +0x00: u8   UseSAN
+                                //   +0x01: [u8;3] padding
+                                //   +0x04: u32  Root (endpoint handle for root/leaf joins)
+                                //   +0x08: u32  Unknown
+                                //   +0x0C: [u8] SOCKADDR (16 bytes for AF_INET)
+                                // SOCKADDR starts at offset 0x0C (12).
+                                if input_length < 28 || input_buffer == 0 {
+                                    NtStatus::STATUS_INVALID_PARAMETER
+                                } else {
+                                    #[repr(C, packed)]
+                                    #[derive(Clone, Copy)]
+                                    struct SockAddrIn {
+                                        family: u16,
+                                        port: u16,   // network byte order
+                                        addr: [u8; 4],
+                                        _pad: [u8; 8],
+                                    }
+
+                                    let sa_ptr = input_buffer + 0x0C;
+                                    if let Some(sa) = try_read_guest_value_unaligned::<SockAddrIn>(sa_ptr) {
+                                        let port = u16::from_be(sa.port);
+                                        let ip = core::net::Ipv4Addr::from(sa.addr);
+                                        let sock_addr = core::net::SocketAddr::V4(
+                                            core::net::SocketAddrV4::new(ip, port),
+                                        );
+
+                                        #[cfg(debug_assertions)]
+                                        {
+                                            use litebox::platform::DebugLogProvider as _;
+                                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                "NT shim: AFD CONNECT handle=0x{sock_handle:X} addr={sock_addr}\n"
+                                            ));
+                                        }
+
+                                        if port == 0 || ip.is_unspecified() {
+                                            NtStatus::STATUS_NETWORK_UNREACHABLE
+                                        } else {
+                                            // Initiate the connection.
+                                            let connect_result = {
+                                                let handles = self.shared.handles.lock();
+                                                handles.with(sock_handle, |entry| match &entry.object {
+                                                    handle_table::NtObject::Socket { socket_fd, .. } => {
+                                                        if let Some(net_arc) = self.shared.net.get() {
+                                                            let result = net_arc.lock().connect(socket_fd, &sock_addr, false);
+                                                            Some(result)
+                                                        } else {
+                                                            None
+                                                        }
+                                                    }
+                                                    _ => None,
+                                                }).flatten()
+                                            };
+
+                                            match connect_result {
+                                                Some(Ok(())) => {
+                                                    #[cfg(debug_assertions)]
+                                                    {
+                                                        use litebox::platform::DebugLogProvider as _;
+                                                        litebox_platform_multiplex::platform().debug_log_print(
+                                                            "NT shim: AFD CONNECT immediate success\n"
+                                                        );
+                                                    }
+                                                    NtStatus::STATUS_SUCCESS
+                                                }
+                                                Some(Err(litebox::net::errors::ConnectError::InProgress)) => {
+                                                    #[cfg(debug_assertions)]
+                                                    {
+                                                        use litebox::platform::DebugLogProvider as _;
+                                                        litebox_platform_multiplex::platform().debug_log_print(
+                                                            "NT shim: AFD CONNECT in progress, polling...\n"
+                                                        );
+                                                    }
+
+                                                    let mut connected = false;
+                                                    for _attempt in 0..10000 {
+                                                        core::hint::spin_loop();
+                                                        let handles = self.shared.handles.lock();
+                                                        let retry_result = handles.with(sock_handle, |entry| match &entry.object {
+                                                            handle_table::NtObject::Socket { socket_fd, .. } => {
+                                                                if let Some(net_arc) = self.shared.net.get() {
+                                                                    Some(net_arc.lock().connect(socket_fd, &sock_addr, true))
+                                                                } else {
+                                                                    None
+                                                                }
+                                                            }
+                                                            _ => None,
+                                                        }).flatten();
+                                                        if let Some(retry_res) = retry_result {
+                                                            match retry_res {
+                                                                    Ok(()) => {
+                                                                        connected = true;
+                                                                        break;
+                                                                    }
+                                                                    Err(litebox::net::errors::ConnectError::InProgress) => {
+                                                                    }
+                                                                    Err(e) => {
+                                                            #[cfg(feature = "trace_debug")]
+                                                                        {
+                                                                            use litebox::platform::DebugLogProvider as _;
+                                                                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                                                "NT shim: AFD CONNECT poll failed: {e:?}\n"
+                                                                            ));
+                                                                        }
+                                                                        break;
+                                                                    }
+                                                                }
+                                                            }
+                                                        drop(handles);
+                                                        // Yield for ~1ms between polls.
+                                                        for _ in 0..100_000 {
+                                                            core::hint::spin_loop();
+                                                        }
+                                                    }
+
+                                                    if connected {
+                                                        #[cfg(debug_assertions)]
+                                                        {
+                                                            use litebox::platform::DebugLogProvider as _;
+                                                            litebox_platform_multiplex::platform().debug_log_print(
+                                                                "NT shim: AFD CONNECT completed after polling\n"
+                                                            );
+                                                        }
+                                                        NtStatus::STATUS_SUCCESS
+                                                    } else {
+                                                        #[cfg(debug_assertions)]
+                                                        {
+                                                            use litebox::platform::DebugLogProvider as _;
+                                                            litebox_platform_multiplex::platform().debug_log_print(
+                                                                "NT shim: AFD CONNECT timed out\n"
+                                                            );
+                                                        }
+                                                        NtStatus::STATUS_IO_TIMEOUT
+                                                    }
+                                                }
+                                                Some(Err(e)) => {
+                                                    #[cfg(debug_assertions)]
+                                                    {
+                                                        use litebox::platform::DebugLogProvider as _;
+                                                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                            "NT shim: AFD CONNECT failed: {e:?}\n"
+                                                        ));
+                                                    }
+                                                    NtStatus::STATUS_NETWORK_UNREACHABLE
+                                                }
+                                                None => NtStatus::STATUS_INVALID_HANDLE,
+                                            }
+                                        }
+                                    } else {
+                                        NtStatus::STATUS_INVALID_PARAMETER
+                                    }
+                                }
+                            }
+
+                            IOCTL_AFD_SELECT => {
+                                // AFD_SELECT / AFD_POLL: check socket readiness.
+                                // Input/Output structure (METHOD_BUFFERED — same buffer):
+                                //   +0x00: i64  Timeout (100ns intervals; 0=immediate, negative=relative)
+                                //   +0x08: u32  NumberOfHandles
+                                //   +0x0C: u32  Exclusive
+                                //   +0x10: AFD_POLL_HANDLE_INFO[] (16 bytes each on x64):
+                                //     +0x00: u64  Handle
+                                //     +0x08: u32  Events (input: requested, output: signaled)
+                                //     +0x0C: u32  Status (output: NTSTATUS)
+                                const AFD_POLL_RECEIVE: u32 = 0x01;
+                                const _AFD_POLL_RECEIVE_EXPEDITED: u32 = 0x02;
+                                const AFD_POLL_SEND: u32 = 0x04;
+                                const AFD_POLL_CONNECT: u32 = 0x08;
+                                const _AFD_POLL_ACCEPT: u32 = 0x10;
+                                const AFD_POLL_DISCONNECT: u32 = 0x20;
+                                const AFD_POLL_ABORT: u32 = 0x40;
+                                const AFD_POLL_CONNECT_FAIL: u32 = 0x100;
+
+                                let buf = output_buffer;
+                                let buf_len = output_length as usize;
+
+                                if buf == 0 || buf_len < 0x10 {
+                                    NtStatus::STATUS_INVALID_PARAMETER
+                                } else {
+                                    let num_handles = try_read_guest_value_unaligned::<u32>(buf + 0x08).unwrap_or(0);
+
+                                    #[cfg(debug_assertions)]
+                                    {
+                                        use litebox::platform::DebugLogProvider as _;
+                                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                            "NT shim: AFD SELECT sock_id={sock_id} num_handles={num_handles}\n"
+                                        ));
+                                    }
+
+                                    let required = 0x10 + (num_handles as usize) * 16;
+                                    if buf_len < required {
+                                        NtStatus::STATUS_BUFFER_TOO_SMALL
+                                    } else {
+                                        // Pump the network stack so proxy ring buffers are up to date.
+                                        if let Some(net_arc) = self.shared.net.get() {
+                                            let _ = net_arc.lock().perform_platform_interaction();
+                                        }
+
+                                        let mut any_ready = false;
+                                        for i in 0..num_handles {
+                                            let entry_base = buf + 0x10 + (i as usize) * 16;
+                                            let handle_val = try_read_guest_value_unaligned::<u64>(entry_base).unwrap_or(0);
+                                            let requested = try_read_guest_value_unaligned::<u32>(entry_base + 8).unwrap_or(0);
+
+                                            // Look up the socket proxy by handle.
+                                            let proxy_opt = {
+                                                let handles = self.shared.handles.lock();
+                                                handles.with(handle_val as u32, |entry| match &entry.object {
+                                                    handle_table::NtObject::Socket { proxy, .. } => Some(alloc::sync::Arc::clone(proxy)),
+                                                    _ => None,
+                                                }).flatten()
+                                            };
+
+                                            let mut signaled: u32 = 0;
+                                            let mut entry_status: u32 = 0; // STATUS_SUCCESS
+
+                                            if let Some(proxy) = proxy_opt {
+                                                // Check events via the proxy's check_io_events().
+                                                use litebox::event::IOPollable as _;
+                                                let events = proxy.check_io_events();
+
+                                                // Map litebox Events to AFD_POLL events.
+                                                if events.contains(litebox::event::Events::IN) && (requested & AFD_POLL_RECEIVE) != 0 {
+                                                    signaled |= AFD_POLL_RECEIVE;
+                                                }
+                                                if events.contains(litebox::event::Events::OUT) {
+                                                    if (requested & AFD_POLL_SEND) != 0 {
+                                                        signaled |= AFD_POLL_SEND;
+                                                    }
+                                                    if (requested & AFD_POLL_CONNECT) != 0 {
+                                                        signaled |= AFD_POLL_CONNECT;
+                                                    }
+                                                }
+                                                if events.contains(litebox::event::Events::HUP) && (requested & AFD_POLL_DISCONNECT) != 0 {
+                                                    signaled |= AFD_POLL_DISCONNECT;
+                                                }
+                                                if events.contains(litebox::event::Events::ERR) {
+                                                    if (requested & AFD_POLL_ABORT) != 0 {
+                                                        signaled |= AFD_POLL_ABORT;
+                                                    }
+                                                    if (requested & AFD_POLL_CONNECT_FAIL) != 0 {
+                                                        signaled |= AFD_POLL_CONNECT_FAIL;
+                                                    }
+                                                }
+                                            } else {
+                                                entry_status = 0xC000_0008; // STATUS_INVALID_HANDLE
+                                            }
+
+                                            if signaled != 0 {
+                                                any_ready = true;
+                                            }
+
+                                            // Write back Events (signaled) and Status.
+                                            try_write_guest_value_unaligned(entry_base + 8, signaled);
+                                            try_write_guest_value_unaligned(entry_base + 12, entry_status);
+                                        }
+
+                                        #[cfg(debug_assertions)]
+                                        {
+                                            use litebox::platform::DebugLogProvider as _;
+                                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                "NT shim: AFD SELECT completed any_ready={any_ready}\n"
+                                            ));
+                                        }
+
+                                        if any_ready {
+                                            // Write IO_STATUS_BLOCK Information = output size.
+                                            if io_status_ptr != 0 {
+                                                try_write_guest_value_unaligned(io_status_ptr + 8, required);
+                                            }
+                                            NtStatus::STATUS_SUCCESS
+                                        } else {
+                                            // No handles ready. The Timeout field determines behavior:
+                                            // 0 = immediate poll → STATUS_SUCCESS with 0 handles ready
+                                            // We return success with NumberOfHandles=0 to indicate nothing ready.
+                                            try_write_guest_value_unaligned(buf + 0x08, 0u32);
+                                            if io_status_ptr != 0 {
+                                                try_write_guest_value_unaligned(io_status_ptr + 8, 0x10usize);
+                                            }
+                                            NtStatus::STATUS_SUCCESS
+                                        }
+                                    }
+                                }
+                            }
+
+                            IOCTL_AFD_GET_SOCK_NAME => {
+                                // Return the local address of the socket.
+                                // Output: SOCKADDR_IN (16 bytes) at output_buffer.
+                                if output_buffer == 0 || output_length < 16 {
+                                    NtStatus::STATUS_INVALID_PARAMETER
+                                } else {
+                                    let addr_result = {
+                                        let handles = self.shared.handles.lock();
+                                        handles.with(sock_handle, |entry| match &entry.object {
+                                            handle_table::NtObject::Socket { socket_fd, .. } => {
+                                                if let Some(net_arc) = self.shared.net.get() {
+                                                    Some(net_arc.lock().get_local_addr(socket_fd))
+                                                } else {
+                                                    None
+                                                }
+                                            }
+                                            _ => None,
+                                        }).flatten()
+                                    };
+
+                                    match addr_result {
+                                        Some(Ok(core::net::SocketAddr::V4(v4))) => {
+                                            // Write SOCKADDR_IN: family(2) + port(2) + addr(4) + pad(8)
+                                            let mut sa = [0u8; 16];
+                                            sa[0..2].copy_from_slice(&2u16.to_ne_bytes()); // AF_INET
+                                            sa[2..4].copy_from_slice(&v4.port().to_be_bytes());
+                                            sa[4..8].copy_from_slice(&v4.ip().octets());
+                                            for (i, &b) in sa.iter().enumerate() {
+                                                try_write_guest_value_unaligned(output_buffer + i, b);
+                                            }
+                                            io_information = 16;
+
+                                            #[cfg(debug_assertions)]
+                                            {
+                                                use litebox::platform::DebugLogProvider as _;
+                                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                    "NT shim: AFD GET_SOCK_NAME handle=0x{sock_handle:X} addr={v4}\n"
+                                                ));
+                                            }
+
+                                            NtStatus::STATUS_SUCCESS
+                                        }
+                                        Some(Ok(_)) => {
+                                            // IPv6 not supported.
+                                            NtStatus::STATUS_NOT_SUPPORTED
+                                        }
+                                        Some(Err(_)) | None => {
+                                            NtStatus::STATUS_INVALID_HANDLE
+                                        }
+                                    }
+                                }
+                            }
+
+                            IOCTL_AFD_GET_PEER_NAME => {
+                                // Return the remote address of the socket.
+                                // Output: SOCKADDR_IN (16 bytes) at output_buffer.
+                                if output_buffer == 0 || output_length < 16 {
+                                    NtStatus::STATUS_INVALID_PARAMETER
+                                } else {
+                                    let addr_result = {
+                                        let handles = self.shared.handles.lock();
+                                        handles.with(sock_handle, |entry| match &entry.object {
+                                            handle_table::NtObject::Socket { socket_fd, .. } => {
+                                                if let Some(net_arc) = self.shared.net.get() {
+                                                    Some(net_arc.lock().get_remote_addr(socket_fd))
+                                                } else {
+                                                    None
+                                                }
+                                            }
+                                            _ => None,
+                                        }).flatten()
+                                    };
+
+                                    match addr_result {
+                                        Some(Ok(core::net::SocketAddr::V4(v4))) => {
+                                            let mut sa = [0u8; 16];
+                                            sa[0..2].copy_from_slice(&2u16.to_ne_bytes()); // AF_INET
+                                            sa[2..4].copy_from_slice(&v4.port().to_be_bytes());
+                                            sa[4..8].copy_from_slice(&v4.ip().octets());
+                                            for (i, &b) in sa.iter().enumerate() {
+                                                try_write_guest_value_unaligned(output_buffer + i, b);
+                                            }
+                                            io_information = 16;
+
+                                            #[cfg(debug_assertions)]
+                                            {
+                                                use litebox::platform::DebugLogProvider as _;
+                                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                    "NT shim: AFD GET_PEER_NAME sock_id={sock_id} addr={v4}\n"
+                                                ));
+                                            }
+
+                                            NtStatus::STATUS_SUCCESS
+                                        }
+                                        Some(Ok(_)) => {
+                                            NtStatus::STATUS_NOT_SUPPORTED
+                                        }
+                                        Some(Err(litebox::net::errors::RemoteAddrError::NotConnected)) => {
+                                            NtStatus::STATUS_INVALID_CONNECTION
+                                        }
+                                        Some(Err(_)) | None => {
+                                            NtStatus::STATUS_INVALID_HANDLE
+                                        }
+                                    }
+                                }
+                            }
+
+                            IOCTL_AFD_SEND => {
+                                // Send data on a connected socket.
+                                //
+                                // Input buffer: AFD_SEND_INFO (on x64):
+                                //   +0x00: u64  BufferArray — pointer to WSABUF[] in guest memory
+                                //   +0x08: u32  BufferCount
+                                //   +0x0C: u32  AfdFlags   (AFD_OVERLAPPED=0x2, AFD_IMMEDIATE=0x4)
+                                //   +0x10: u32  TdiFlags   (MSG_OOB etc.)
+                                //
+                                // WSABUF on x64 (16 bytes each):
+                                //   +0x00: u32  len
+                                //   +0x04: u32  (padding)
+                                //   +0x08: u64  buf — pointer to data
+                                //
+                                // On success, IO_STATUS_BLOCK.Information = bytes sent.
+                                //
+                                // Following the Linux shim pattern from net.rs sendto():
+                                //   1. Gather buffers from the WSABUF scatter list
+                                //   2. Call proxy.try_write(buf, SendFlags::empty(), None)
+                                //   3. If BufferFull, spin-wait (blocking) or return STATUS_DEVICE_NOT_READY
+
+                                if input_length < 0x14 || input_buffer == 0 {
+                                    NtStatus::STATUS_INVALID_PARAMETER
+                                } else {
+                                    let buffer_array_ptr = try_read_guest_value_unaligned::<u64>(input_buffer).unwrap_or(0);
+                                    let buffer_count = try_read_guest_value_unaligned::<u32>(input_buffer + 0x08).unwrap_or(0);
+                                    let _afd_flags = try_read_guest_value_unaligned::<u32>(input_buffer + 0x0C).unwrap_or(0);
+                                    let _tdi_flags = try_read_guest_value_unaligned::<u32>(input_buffer + 0x10).unwrap_or(0);
+
+                                    #[cfg(debug_assertions)]
+                                    {
+                                        use litebox::platform::DebugLogProvider as _;
+                                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                            "NT shim: AFD SEND sock_id={sock_id} buf_array=0x{buffer_array_ptr:X} count={buffer_count} afd_flags=0x{_afd_flags:X} tdi_flags=0x{_tdi_flags:X}\n"
+                                        ));
+                                    }
+
+                                    if buffer_count == 0 || buffer_array_ptr == 0 {
+                                        NtStatus::STATUS_INVALID_PARAMETER
+                                    } else {
+                                        // Gather data from WSABUF array (like Linux shim's copy_sendmsg_iovs).
+                                        let mut send_buf = alloc::vec::Vec::new();
+                                        let mut gather_ok = true;
+                                        for i in 0..buffer_count {
+                                            let wsabuf_base = buffer_array_ptr + (i as u64) * 16;
+                                            let len = try_read_guest_value_unaligned::<u32>(wsabuf_base as usize).unwrap_or(0) as usize;
+                                            let _pad = try_read_guest_value_unaligned::<u32>(wsabuf_base as usize + 4).unwrap_or(0);
+                                            let buf_ptr = try_read_guest_value_unaligned::<u64>(wsabuf_base as usize + 8).unwrap_or(0) as usize;
+
+                                            if len > 0 && buf_ptr != 0 {
+                                                let start = send_buf.len();
+                                                send_buf.resize(start + len, 0u8);
+                                                for j in 0..len {
+                                                    if let Some(b) = try_read_guest_value_unaligned::<u8>(buf_ptr + j) {
+                                                        send_buf[start + j] = b;
+                                                    } else {
+                                                        gather_ok = false;
+                                                        break;
+                                                    }
+                                                }
+                                                if !gather_ok { break; }
+                                            }
+                                        }
+
+                                        if !gather_ok || send_buf.is_empty() {
+                                            NtStatus::STATUS_INVALID_PARAMETER
+                                        } else {
+                                            // Get proxy and try_write (lock-free path, like Linux shim).
+                                            let proxy_opt = {
+                                                let handles = self.shared.handles.lock();
+                                                handles.with(sock_handle, |entry| match &entry.object {
+                                                    handle_table::NtObject::Socket { proxy, .. } => Some(alloc::sync::Arc::clone(proxy)),
+                                                    _ => None,
+                                                }).flatten()
+                                            };
+
+                                            if let Some(proxy) = proxy_opt {
+                                                // Spin-wait loop for send, similar to how CONNECT polls.
+                                                // The Linux shim uses wait_on_events with Events::OUT;
+                                                // we emulate this with a polling loop + network pump.
+                                                let mut result_status = NtStatus::STATUS_IO_TIMEOUT;
+                                                for _attempt in 0..10000 {
+                                                    match proxy.try_write(&send_buf, litebox::net::SendFlags::empty(), None) {
+                                                        Ok(n) if n > 0 => {
+                                                            io_information = n;
+                                                            result_status = NtStatus::STATUS_SUCCESS;
+
+                                                            #[cfg(debug_assertions)]
+                                                            {
+                                                                use litebox::platform::DebugLogProvider as _;
+                                                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                                    "NT shim: AFD SEND handle=0x{sock_handle:X} sent={n}\n"
+                                                                ));
+                                                            }
+                                                            break;
+                                                        }
+                                                        Ok(_) => {
+                                                            // Buffer full (Ok(0)), retry after pump.
+                                                            // The Linux shim treats Ok(0) as TryAgain.
+                                                            if let Some(net_arc) = self.shared.net.get() {
+                                                                let _ = net_arc.lock().perform_platform_interaction();
+                                                            }
+                                                            for _ in 0..10_000 {
+                                                                core::hint::spin_loop();
+                                                            }
+                                                        }
+                                                        Err(litebox::net::errors::SendError::BufferFull) => {
+                                                            // TX ring buffer full — pump network to drain it.
+                                                            if let Some(net_arc) = self.shared.net.get() {
+                                                                let _ = net_arc.lock().perform_platform_interaction();
+                                                            }
+                                                            for _ in 0..10_000 {
+                                                                core::hint::spin_loop();
+                                                            }
+                                                        }
+                                                        Err(litebox::net::errors::SendError::SocketInInvalidState) => {
+                                                            result_status = NtStatus::STATUS_CONNECTION_RESET;
+                                                            break;
+                                                        }
+                                                        Err(litebox::net::errors::SendError::InvalidFd) => {
+                                                            result_status = NtStatus::STATUS_INVALID_HANDLE;
+                                                            break;
+                                                        }
+                                                        Err(_e) => {
+                                                            #[cfg(debug_assertions)]
+                                                            {
+                                                                use litebox::platform::DebugLogProvider as _;
+                                                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                                    "NT shim: AFD SEND error: {_e:?}\n"
+                                                                ));
+                                                            }
+                                                            result_status = NtStatus::STATUS_INVALID_PARAMETER;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                result_status
+                                            } else {
+                                                NtStatus::STATUS_INVALID_HANDLE
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            IOCTL_AFD_RECV => {
+                                // Receive data from a connected socket.
+                                //
+                                // Input buffer: AFD_RECV_INFO (on x64):
+                                //   +0x00: u64  BufferArray — pointer to WSABUF[] in guest memory
+                                //   +0x08: u32  BufferCount
+                                //   +0x0C: u32  AfdFlags
+                                //   +0x10: u32  TdiFlags   (AFD_MSG_PEEK=0x80, AFD_MSG_WAITALL=0x4000, etc.)
+                                //
+                                // On success, IO_STATUS_BLOCK.Information = bytes received.
+                                //
+                                // Following the Linux shim pattern from net.rs receive():
+                                //   1. Pump the network stack (populate RX ring buffer)
+                                //   2. Allocate temp buffer, call proxy.try_read()
+                                //   3. Scatter received data into guest WSABUF array
+                                //   4. If no data available, spin-wait (blocking)
+
+                                // AFD TDI flags for recv.
+                                const AFD_MSG_PEEK: u32 = 0x0080;
+
+                                if input_length < 0x14 || input_buffer == 0 {
+                                    NtStatus::STATUS_INVALID_PARAMETER
+                                } else {
+                                    let buffer_array_ptr = try_read_guest_value_unaligned::<u64>(input_buffer).unwrap_or(0);
+                                    let buffer_count = try_read_guest_value_unaligned::<u32>(input_buffer + 0x08).unwrap_or(0);
+                                    let _afd_flags = try_read_guest_value_unaligned::<u32>(input_buffer + 0x0C).unwrap_or(0);
+                                    let tdi_flags = try_read_guest_value_unaligned::<u32>(input_buffer + 0x10).unwrap_or(0);
+
+                                    #[cfg(feature = "trace_debug")]
+                                    {
+                                        use litebox::platform::DebugLogProvider as _;
+                                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                            "NT shim: AFD RECV handle=0x{sock_handle:X} buf_array=0x{buffer_array_ptr:X} count={buffer_count} afd_flags=0x{_afd_flags:X} tdi_flags=0x{tdi_flags:X}\n"
+                                        ));
+                                    }
+
+                                    if buffer_count == 0 || buffer_array_ptr == 0 {
+                                        #[cfg(feature = "trace_debug")]
+                                        {
+                                            use litebox::platform::DebugLogProvider as _;
+                                            litebox_platform_multiplex::platform().debug_log_print(
+                                                "NT shim: AFD RECV failed: buffer_count=0 or buffer_array_ptr=0\n"
+                                            );
+                                        }
+                                        NtStatus::STATUS_INVALID_PARAMETER
+                                    } else {
+                                        // Compute total receive buffer size from WSABUFs.
+                                        let mut total_len: usize = 0;
+                                        let mut wsabuf_entries = alloc::vec::Vec::new();
+                                        let mut parse_ok = true;
+                                        for i in 0..buffer_count {
+                                            let wsabuf_base = buffer_array_ptr + (i as u64) * 16;
+                                            let len = try_read_guest_value_unaligned::<u32>(wsabuf_base as usize).unwrap_or(0) as usize;
+                                            let buf_ptr = try_read_guest_value_unaligned::<u64>(wsabuf_base as usize + 8).unwrap_or(0) as usize;
+                                            if len > 0 && buf_ptr == 0 {
+                                                parse_ok = false;
+                                                break;
+                                            }
+                                            wsabuf_entries.push((buf_ptr, len));
+                                            total_len = total_len.saturating_add(len);
+                                        }
+
+                                        if !parse_ok {
+                                            #[cfg(feature = "trace_debug")]
+                                            {
+                                                use litebox::platform::DebugLogProvider as _;
+                                                litebox_platform_multiplex::platform().debug_log_print(
+                                                    "NT shim: AFD RECV failed: WSABUF parse error\n"
+                                                );
+                                            }
+                                            NtStatus::STATUS_INVALID_PARAMETER
+                                        } else if total_len == 0 {
+                                            // 0-byte receive: libuv uses this as a
+                                            // notification mechanism via IOCP.  When data
+                                            // becomes available (or HUP/ERR), complete
+                                            // with 0 bytes transferred.
+                                            let apc_context = args.arg3;
+                                            let (proxy_opt, iocp_info) = {
+                                                let handles = self.shared.handles.lock();
+                                                let proxy = handles.with(sock_handle, |entry| match &entry.object {
+                                                    handle_table::NtObject::Socket { proxy, .. } => Some(alloc::sync::Arc::clone(proxy)),
+                                                    _ => None,
+                                                }).flatten();
+                                                let iocp = handles.with(sock_handle, |entry| match &entry.object {
+                                                    handle_table::NtObject::Socket { io_completion: Some((port, key)), .. } => {
+                                                        Some((alloc::sync::Arc::clone(port), *key))
+                                                    }
+                                                    _ => None,
+                                                }).flatten();
+                                                (proxy, iocp)
+                                            };
+
+                                            if let Some(proxy) = proxy_opt {
+                                                // Fast path: data already available?
+                                                use litebox::event::IOPollable as _;
+                                                let events = proxy.check_io_events();
+                                                if events.contains(litebox::event::Events::IN) || events.contains(litebox::event::Events::HUP) {
+                                                    io_information = 0;
+                                                    #[cfg(feature = "trace_debug")]
+                                                    {
+                                                        use litebox::platform::DebugLogProvider as _;
+                                                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                            "NT shim: AFD RECV 0-byte fast-path events={events:?}\n"
+                                                        ));
+                                                    }
+                                                    NtStatus::STATUS_SUCCESS
+                                                } else if events.contains(litebox::event::Events::ERR) {
+                                                    NtStatus::STATUS_CONNECTION_RESET
+                                                } else if apc_context != 0 {
+                                                    // Async path: register an observer on the
+                                                    // socket's pollee and return STATUS_PENDING.
+                                                    // The observer will post the IOCP completion
+                                                    // when data arrives.
+                                                    if let Some((port, key)) = iocp_info {
+                                                        let observer = alloc::sync::Arc::new(
+                                                            handle_table::SocketIocpObserver::new(
+                                                                port,
+                                                                key,
+                                                                apc_context,
+                                                                io_status_ptr,
+                                                                event_handle,
+                                                            ),
+                                                        );
+                                                        proxy.register_observer(
+                                                            alloc::sync::Arc::downgrade(&observer)
+                                                                as alloc::sync::Weak<
+                                                                    dyn litebox::event::observer::Observer<
+                                                                        litebox::event::Events,
+                                                                    >,
+                                                                >,
+                                                            litebox::event::Events::IN
+                                                                | litebox::event::Events::HUP,
+                                                        );
+
+                                                        // Store the observer Arc in the socket so
+                                                        // it stays alive as long as the socket does.
+                                                        // (The Weak in the pollee would otherwise be
+                                                        // immediately dead.)
+                                                        // Also prune previously-fired observers to
+                                                        // prevent unbounded memory growth.
+                                                        {
+                                                            let handles = self.shared.handles.lock();
+                                                            handles.with_mut(sock_handle, |entry| {
+                                                                if let handle_table::NtObject::Socket {
+                                                                    ref mut pending_observers, ..
+                                                                } = entry.object
+                                                                {
+                                                                    pending_observers.retain(|o| !o.is_fired());
+                                                                    pending_observers.push(observer);
+                                                                }
+                                                            });
+                                                        }
+
+                                                        #[cfg(feature = "trace_debug")]
+                                                        {
+                                                            use litebox::platform::DebugLogProvider as _;
+                                                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                                "NT shim: AFD RECV 0-byte async pending apc=0x{apc_context:X}\n"
+                                                            ));
+                                                        }
+                                                        NtStatus::STATUS_PENDING
+                                                    } else {
+                                                        // No IOCP binding — fall through to
+                                                        // synchronous poll (shouldn't happen for
+                                                        // libuv, but handle gracefully).
+                                                        NtStatus::STATUS_IO_TIMEOUT
+                                                    }
+                                                } else {
+                                                    // Synchronous 0-byte recv (no IOCP).
+                                                    // Spin-wait until data arrives.
+                                                    let mut result_status = NtStatus::STATUS_IO_TIMEOUT;
+                                                    for _attempt in 0..100_000u32 {
+                                                        if let Some(net_arc) = self.shared.net.get() {
+                                                            let _ = net_arc.lock().perform_platform_interaction();
+                                                        }
+                                                        let ev = proxy.check_io_events();
+                                                        if ev.contains(litebox::event::Events::IN) || ev.contains(litebox::event::Events::HUP) {
+                                                            io_information = 0;
+                                                            result_status = NtStatus::STATUS_SUCCESS;
+                                                            break;
+                                                        }
+                                                        if ev.contains(litebox::event::Events::ERR) {
+                                                            result_status = NtStatus::STATUS_CONNECTION_RESET;
+                                                            break;
+                                                        }
+                                                        for _ in 0..100_000u32 {
+                                                            core::hint::spin_loop();
+                                                        }
+                                                    }
+                                                    #[cfg(feature = "trace_debug")]
+                                                    {
+                                                        use litebox::platform::DebugLogProvider as _;
+                                                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                            "NT shim: AFD RECV 0-byte sync result=0x{:X}\n", result_status.0
+                                                        ));
+                                                    }
+                                                    result_status
+                                                }
+                                            } else {
+                                                NtStatus::STATUS_INVALID_HANDLE
+                                            }
+                                        } else {
+                                            // Build ReceiveFlags from TDI flags
+                                            // (like Linux shim's convert_flags! for ReceiveFlags).
+                                            let mut recv_flags = litebox::net::ReceiveFlags::empty();
+                                            if tdi_flags & AFD_MSG_PEEK != 0 {
+                                                recv_flags |= litebox::net::ReceiveFlags::PEEK;
+                                            }
+
+                                            let apc_context = args.arg3;
+
+                                            // Get proxy and IOCP binding.
+                                            let (proxy_opt, iocp_info) = {
+                                                let handles = self.shared.handles.lock();
+                                                let proxy = handles.with(sock_handle, |entry| match &entry.object {
+                                                    handle_table::NtObject::Socket { proxy, .. } => Some(alloc::sync::Arc::clone(proxy)),
+                                                    _ => None,
+                                                }).flatten();
+                                                let iocp = handles.with(sock_handle, |entry| match &entry.object {
+                                                    handle_table::NtObject::Socket { io_completion: Some((port, key)), .. } => {
+                                                        Some((alloc::sync::Arc::clone(port), *key))
+                                                    }
+                                                    _ => None,
+                                                }).flatten();
+                                                (proxy, iocp)
+                                            };
+
+                                            if let Some(proxy) = proxy_opt {
+                                                // Fast path: pump and try_read immediately.
+                                                if let Some(net_arc) = self.shared.net.get() {
+                                                    let _ = net_arc.lock().perform_platform_interaction();
+                                                }
+
+                                                let mut recv_buf = alloc::vec![0u8; total_len];
+                                                match proxy.try_read(&mut recv_buf, recv_flags, None) {
+                                                    Ok(n) if n > 0 => {
+                                                        // Data available — scatter and complete.
+                                                        let mut offset = 0usize;
+                                                        for &(buf_ptr, len) in &wsabuf_entries {
+                                                            if offset >= n { break; }
+                                                            let chunk = core::cmp::min(len, n - offset);
+                                                            for j in 0..chunk {
+                                                                try_write_guest_value_unaligned(buf_ptr + j, recv_buf[offset + j]);
+                                                            }
+                                                            offset += chunk;
+                                                        }
+                                                        io_information = n;
+
+                                                        #[cfg(debug_assertions)]
+                                                        {
+                                                            use litebox::platform::DebugLogProvider as _;
+                                                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                                "NT shim: AFD RECV handle=0x{sock_handle:X} received={n} (fast path)\n"
+                                                            ));
+                                                        }
+                                                        NtStatus::STATUS_SUCCESS
+                                                    }
+                                                    Ok(_) if apc_context != 0 => {
+                                                        // Async path: no data yet, register observer.
+                                                        if let Some((port, key)) = iocp_info {
+                                                            let observer = alloc::sync::Arc::new(
+                                                                handle_table::SocketRecvIocpObserver::new(
+                                                                    alloc::sync::Arc::clone(&proxy),
+                                                                    total_len,
+                                                                    wsabuf_entries.clone(),
+                                                                    recv_flags,
+                                                                    port,
+                                                                    key,
+                                                                    apc_context,
+                                                                    io_status_ptr,
+                                                                    event_handle,
+                                                                ),
+                                                            );
+                                                            proxy.register_observer(
+                                                                alloc::sync::Arc::downgrade(&observer)
+                                                                    as alloc::sync::Weak<
+                                                                        dyn litebox::event::observer::Observer<
+                                                                            litebox::event::Events,
+                                                                        >,
+                                                                    >,
+                                                                litebox::event::Events::IN
+                                                                    | litebox::event::Events::HUP,
+                                                            );
+
+                                                            // "Register then check" pattern: retry after
+                                                            // registration to avoid missed wakeups.
+                                                            if let Some(net_arc) = self.shared.net.get() {
+                                                                let _ = net_arc.lock().perform_platform_interaction();
+                                                            }
+                                                            // If events are already set (data arrived between
+                                                            // fast path and registration), try to complete now.
+                                                            use litebox::event::IOPollable as _;
+                                                            let events = proxy.check_io_events();
+                                                            if events.contains(litebox::event::Events::IN)
+                                                                || events.contains(litebox::event::Events::HUP)
+                                                                || events.contains(litebox::event::Events::ERR)
+                                                            {
+                                                                observer.try_complete_now();
+                                                            }
+
+                                                            // Store observer Arc (keeps Weak alive).
+                                                            // Also prune fired observers.
+                                                            {
+                                                                let handles = self.shared.handles.lock();
+                                                                handles.with_mut(sock_handle, |entry| {
+                                                                    if let handle_table::NtObject::Socket {
+                                                                        ref mut pending_recv_observers, ..
+                                                                    } = entry.object
+                                                                    {
+                                                                        pending_recv_observers.retain(|o| !o.is_fired());
+                                                                        pending_recv_observers.push(observer);
+                                                                    }
+                                                                });
+                                                            }
+
+                                                            #[cfg(feature = "trace_debug")]
+                                                            {
+                                                                use litebox::platform::DebugLogProvider as _;
+                                                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                                    "NT shim: AFD RECV {total_len}-byte async pending apc=0x{apc_context:X}\n"
+                                                                ));
+                                                            }
+                                                            NtStatus::STATUS_PENDING
+                                                        } else {
+                                                            // No IOCP binding — fall back to sync spin-wait.
+                                                            NtStatus::STATUS_IO_TIMEOUT
+                                                        }
+                                                    }
+                                                    Ok(_) => {
+                                                        // Synchronous path (apc_context == 0): spin-wait.
+                                                        let mut result_status = NtStatus::STATUS_IO_TIMEOUT;
+                                                        for _attempt in 0..100_000u32 {
+                                                            if let Some(net_arc) = self.shared.net.get() {
+                                                                let _ = net_arc.lock().perform_platform_interaction();
+                                                            }
+                                                            match proxy.try_read(&mut recv_buf, recv_flags, None) {
+                                                                Ok(0) => {
+                                                                    for _ in 0..100_000u32 {
+                                                                        core::hint::spin_loop();
+                                                                    }
+                                                                }
+                                                                Ok(n) => {
+                                                                    let mut offset = 0usize;
+                                                                    for &(buf_ptr, len) in &wsabuf_entries {
+                                                                        if offset >= n { break; }
+                                                                        let chunk = core::cmp::min(len, n - offset);
+                                                                        for j in 0..chunk {
+                                                                            try_write_guest_value_unaligned(buf_ptr + j, recv_buf[offset + j]);
+                                                                        }
+                                                                        offset += chunk;
+                                                                    }
+                                                                    io_information = n;
+                                                                    result_status = NtStatus::STATUS_SUCCESS;
+
+                                                                    #[cfg(debug_assertions)]
+                                                                    {
+                                                                        use litebox::platform::DebugLogProvider as _;
+                                                                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                                            "NT shim: AFD RECV handle=0x{sock_handle:X} received={n} (sync)\n"
+                                                                        ));
+                                                                    }
+                                                                    break;
+                                                                }
+                                                                Err(litebox::net::errors::ReceiveError::SocketInInvalidState) => {
+                                                                    use litebox::event::IOPollable as _;
+                                                                    let events = proxy.check_io_events();
+                                                                    if events.contains(litebox::event::Events::HUP) {
+                                                                        io_information = 0;
+                                                                        result_status = NtStatus::STATUS_SUCCESS;
+                                                                    } else if events.contains(litebox::event::Events::ERR) {
+                                                                        result_status = NtStatus::STATUS_CONNECTION_RESET;
+                                                                    } else {
+                                                                        for _ in 0..100_000u32 {
+                                                                            core::hint::spin_loop();
+                                                                        }
+                                                                        continue;
+                                                                    }
+                                                                    break;
+                                                                }
+                                                                Err(litebox::net::errors::ReceiveError::OperationFinished) => {
+                                                                    io_information = 0;
+                                                                    result_status = NtStatus::STATUS_SUCCESS;
+                                                                    break;
+                                                                }
+                                                                Err(litebox::net::errors::ReceiveError::InvalidFd) => {
+                                                                    result_status = NtStatus::STATUS_INVALID_HANDLE;
+                                                                    break;
+                                                                }
+                                                                Err(_) => {
+                                                                    result_status = NtStatus::STATUS_CONNECTION_RESET;
+                                                                    break;
+                                                                }
+                                                            }
+                                                        }
+                                                        result_status
+                                                    }
+                                                    Err(litebox::net::errors::ReceiveError::SocketInInvalidState) => {
+                                                        // Fast-path terminal check.
+                                                        use litebox::event::IOPollable as _;
+                                                        let events = proxy.check_io_events();
+                                                        if events.contains(litebox::event::Events::HUP) {
+                                                            io_information = 0;
+                                                            NtStatus::STATUS_SUCCESS
+                                                        } else if events.contains(litebox::event::Events::ERR) {
+                                                            NtStatus::STATUS_CONNECTION_RESET
+                                                        } else if apc_context != 0 {
+                                                            // Async: register observer for state change.
+                                                            if let Some((port, key)) = iocp_info {
+                                                                let observer = alloc::sync::Arc::new(
+                                                                    handle_table::SocketRecvIocpObserver::new(
+                                                                        alloc::sync::Arc::clone(&proxy),
+                                                                        total_len,
+                                                                        wsabuf_entries.clone(),
+                                                                        recv_flags,
+                                                                        port,
+                                                                        key,
+                                                                        apc_context,
+                                                                        io_status_ptr,
+                                                                        event_handle,
+                                                                    ),
+                                                                );
+                                                                proxy.register_observer(
+                                                                    alloc::sync::Arc::downgrade(&observer)
+                                                                        as alloc::sync::Weak<
+                                                                            dyn litebox::event::observer::Observer<
+                                                                                litebox::event::Events,
+                                                                            >,
+                                                                        >,
+                                                                    litebox::event::Events::IN
+                                                                        | litebox::event::Events::HUP,
+                                                                );
+                                                                {
+                                                                    let handles = self.shared.handles.lock();
+                                                                    handles.with_mut(sock_handle, |entry| {
+                                                                        if let handle_table::NtObject::Socket {
+                                                                            ref mut pending_recv_observers, ..
+                                                                        } = entry.object
+                                                                        {
+                                                                            pending_recv_observers.retain(|o| !o.is_fired());
+                                                                            pending_recv_observers.push(observer);
+                                                                        }
+                                                                    });
+                                                                }
+                                                                NtStatus::STATUS_PENDING
+                                                            } else {
+                                                                NtStatus::STATUS_IO_TIMEOUT
+                                                            }
+                                                        } else {
+                                                            // Sync: spin-wait for state change.
+                                                            let mut result_status = NtStatus::STATUS_IO_TIMEOUT;
+                                                            for _attempt in 0..100_000u32 {
+                                                                if let Some(net_arc) = self.shared.net.get() {
+                                                                    let _ = net_arc.lock().perform_platform_interaction();
+                                                                }
+                                                                let ev = proxy.check_io_events();
+                                                                if ev.contains(litebox::event::Events::HUP) {
+                                                                    io_information = 0;
+                                                                    result_status = NtStatus::STATUS_SUCCESS;
+                                                                    break;
+                                                                }
+                                                                if ev.contains(litebox::event::Events::ERR) {
+                                                                    result_status = NtStatus::STATUS_CONNECTION_RESET;
+                                                                    break;
+                                                                }
+                                                                for _ in 0..100_000u32 {
+                                                                    core::hint::spin_loop();
+                                                                }
+                                                            }
+                                                            result_status
+                                                        }
+                                                    }
+                                                    Err(litebox::net::errors::ReceiveError::OperationFinished) => {
+                                                        io_information = 0;
+                                                        NtStatus::STATUS_SUCCESS
+                                                    }
+                                                    Err(litebox::net::errors::ReceiveError::InvalidFd) => {
+                                                        NtStatus::STATUS_INVALID_HANDLE
+                                                    }
+                                                    Err(_) => {
+                                                        NtStatus::STATUS_CONNECTION_RESET
+                                                    }
+                                                }
+                                            } else {
+                                                NtStatus::STATUS_INVALID_HANDLE
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            IOCTL_AFD_SUPER_CONNECT => {
+                                // ConnectEx via AFD_SUPER_CONNECT_INFO:
+                                //   +0x00: SanActive (BOOLEAN, 1 byte + 3 pad)
+                                //   +0x04: TRANSPORT_ADDRESS.TAAddressCount (LONG)
+                                //   +0x08: TA_ADDRESS.AddressLength (USHORT)
+                                //   +0x0A: TA_ADDRESS.AddressType (USHORT) = sa_family
+                                //   +0x0C: TDI_ADDRESS_IP (sin_port + in_addr + sin_zero)
+                                // Total for IPv4: 0x1A (26) bytes.
+                                // Differs from AFD_CONNECT_INFO which has Root/Unknown
+                                // fields making its TRANSPORT_ADDRESS start at +0x0C.
+                                if input_length < 0x1A || input_buffer == 0 {
+                                    NtStatus::STATUS_INVALID_PARAMETER
+                                } else {
+                                    #[repr(C, packed)]
+                                    #[derive(Clone, Copy)]
+                                    struct SockAddrIn {
+                                        family: u16,
+                                        port: u16,
+                                        addr: [u8; 4],
+                                        _pad: [u8; 8],
+                                    }
+
+                                    // AddressType at +0x0A acts as sa_family
+                                    let sa_ptr = input_buffer + 0x0A;
+                                    if let Some(sa) = try_read_guest_value_unaligned::<SockAddrIn>(sa_ptr) {
+                                        let port = u16::from_be(sa.port);
+                                        let ip = core::net::Ipv4Addr::from(sa.addr);
+                                        let sock_addr = core::net::SocketAddr::V4(
+                                            core::net::SocketAddrV4::new(ip, port),
+                                        );
+
+                                        #[cfg(feature = "trace_debug")]
+                                        {
+                                            use litebox::platform::DebugLogProvider as _;
+                                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                "NT shim: AFD SUPER_CONNECT handle=0x{sock_handle:X} addr={sock_addr}\n"
+                                            ));
+                                        }
+
+                                        if port == 0 || ip.is_unspecified() {
+                                            NtStatus::STATUS_NETWORK_UNREACHABLE
+                                        } else {
+                                            let connect_result = {
+                                                let handles = self.shared.handles.lock();
+                                                handles.with(sock_handle, |entry| match &entry.object {
+                                                    handle_table::NtObject::Socket { socket_fd, .. } => {
+                                                        if let Some(net_arc) = self.shared.net.get() {
+                                                            Some(net_arc.lock().connect(socket_fd, &sock_addr, false))
+                                                        } else {
+                                                            None
+                                                        }
+                                                    }
+                                                    _ => None,
+                                                }).flatten()
+                                            };
+
+                                            match connect_result {
+                                                Some(Ok(())) => NtStatus::STATUS_SUCCESS,
+                                                Some(Err(litebox::net::errors::ConnectError::InProgress)) => {
+                                                    #[cfg(feature = "trace_debug")]
+                                                    {
+                                                        use litebox::platform::DebugLogProvider as _;
+                                                        litebox_platform_multiplex::platform().debug_log_print(
+                                                            "NT shim: AFD SUPER_CONNECT in progress, polling...\n"
+                                                        );
+                                                    }
+
+                                                    let mut connected = false;
+                                                    for _attempt in 0..10000 {
+                                                        core::hint::spin_loop();
+                                                        let handles = self.shared.handles.lock();
+                                                        let retry_result = handles.with(sock_handle, |entry| match &entry.object {
+                                                            handle_table::NtObject::Socket { socket_fd, .. } => {
+                                                                if let Some(net_arc) = self.shared.net.get() {
+                                                                    Some(net_arc.lock().connect(socket_fd, &sock_addr, true))
+                                                                } else { None }
+                                                            }
+                                                            _ => None,
+                                                        }).flatten();
+                                                        if let Some(retry_res) = retry_result {
+                                                            match retry_res {
+                                                                Ok(()) => {
+                                                                    connected = true;
+                                                                    break;
+                                                                }
+                                                                Err(litebox::net::errors::ConnectError::InProgress) => {}
+                                                                Err(_) => break,
+                                                            }
+                                                        }
+                                                        drop(handles);
+                                                        for _ in 0..100_000 { core::hint::spin_loop(); }
+                                                    }
+
+                                                    if connected {
+                                                        #[cfg(feature = "trace_debug")]
+                                                        {
+                                                            use litebox::platform::DebugLogProvider as _;
+                                                            litebox_platform_multiplex::platform().debug_log_print(
+                                                                "NT shim: AFD SUPER_CONNECT completed after polling\n"
+                                                            );
+                                                        }
+                                                        NtStatus::STATUS_SUCCESS
+                                                    } else {
+                                                        NtStatus::STATUS_IO_TIMEOUT
+                                                    }
+                                                }
+                                                Some(Err(e)) => {
+                                                    #[cfg(feature = "trace_debug")]
+                                                    {
+                                                        use litebox::platform::DebugLogProvider as _;
+                                                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                            "NT shim: AFD SUPER_CONNECT failed: {e:?}\n"
+                                                        ));
+                                                    }
+                                                    NtStatus::STATUS_NETWORK_UNREACHABLE
+                                                }
+                                                None => NtStatus::STATUS_INVALID_HANDLE,
+                                            }
+                                        }
+                                    } else {
+                                        NtStatus::STATUS_INVALID_PARAMETER
+                                    }
+                                }
+                            }
+
+                            _ => {
+                                // Unknown AFD IOCTL.
+                                #[cfg(debug_assertions)]
+                                {
+                                    use litebox::platform::DebugLogProvider as _;
+                                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                        "NT shim: AFD unknown IOCTL=0x{ioctl_code:X} handle=0x{file_handle:X}\n"
+                                    ));
+                                }
+                                log_unimplemented!(
+                                    "AFD IOCTL=0x{:X} handle=0x{:X}",
+                                    ioctl_code,
+                                    file_handle
+                                );
+                                NtStatus::STATUS_NOT_IMPLEMENTED
+                            }
+                        };
+
+                        // Write the IO_STATUS_BLOCK for all completed operations.
+                        // For STATUS_PENDING, write the pending status so the
+                        // caller knows the operation is in progress; the observer
+                        // will overwrite it when the operation completes.
+                        if io_status_ptr != 0 {
+                            try_write_guest_value_unaligned(io_status_ptr, status.0 as i32);
+                            if status != NtStatus::STATUS_PENDING {
+                                try_write_guest_value_unaligned(io_status_ptr + 8, io_information);
+                            }
+                        }
+
+                        // Signal the Event handle if provided (synchronous completion).
+                        // Skip for STATUS_PENDING — the observer handles signaling.
+                        if status == NtStatus::STATUS_SUCCESS && event_handle != 0 {
+                            let handles = self.shared.handles.lock();
+                            let event_arc = handles.with(event_handle, |entry| match &entry.object {
+                                handle_table::NtObject::Event(event) => Some(alloc::sync::Arc::clone(event)),
+                                _ => None,
+                            }).flatten();
+                            if let Some(event) = event_arc {
+                                let mut signaled = event.state.lock();
+                                *signaled = true;
+                                drop(signaled);
+                                event.wake_waiters();
+                            }
+                        }
+
+                        // Post IOCP completion if the socket has an IOCP binding
+                        // and this was an async operation (apc_context != 0).
+                        // Synchronous IOCTLs (bind, setsockopt, etc.) use event
+                        // handles and have apc_context=0 — they do NOT post IOCP.
+                        // STATUS_PENDING means the observer will post the completion.
+                        if status != NtStatus::STATUS_PENDING {
+                            let apc_context = args.arg3;
+                            if apc_context != 0 {
+                                let handles = self.shared.handles.lock();
+                                let iocp_info = handles.with(sock_handle, |entry| match &entry.object {
+                                    handle_table::NtObject::Socket { io_completion: Some((port, key)), .. } => {
+                                        Some((alloc::sync::Arc::clone(port), *key))
+                                    }
+                                    _ => None,
+                                }).flatten();
+                                if let Some((port, key)) = iocp_info {
+                                    #[cfg(feature = "trace_debug")]
+                                    {
+                                        use litebox::platform::DebugLogProvider as _;
+                                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                            "NT shim: AFD Socket posting IOCP completion key=0x{key:X} apc_ctx=0x{apc_context:X} status=0x{:X} info={io_information}\n",
+                                            status.0
+                                        ));
+                                    }
+                                    port.push(handle_table::IoCompletionEntry {
+                                        key_context: key,
+                                        apc_context,
+                                        status,
+                                        information: io_information,
+                                    });
+                                }
+                            }
+                        }
+
+                        (status, false)
+                    }
+                    Some(IoctlTarget::AfdStub) => {
+                        // AFD Stub handle (e.g., \Device\Afd\AsyncConnectHlp).
+                        // mswsock.dll uses this for async connect operations.
+                        // The IOCTL_AFD_CONNECT input on this handle includes
+                        // the real socket handle at the start of the buffer.
+                        let event_handle = args.arg1 as u32;
+                        let apc_context = args.arg3;
+
+                        #[cfg(debug_assertions)]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "NT shim: AFD Stub IOCTL handle=0x{file_handle:X} ioctl=0x{ioctl_code:X} event=0x{event_handle:X} in_buf=0x{input_buffer:X} in_len=0x{input_length:X}\n"
+                            ));
+                            // Dump input buffer for debugging.
+                            if input_buffer != 0 && input_length > 0 {
+                                let dump_len = core::cmp::min(input_length as usize, 64);
+                                let mut hex = alloc::string::String::new();
+                                for i in 0..dump_len {
+                                    if let Some(b) = try_read_guest_value_unaligned::<u8>(input_buffer + i) {
+                                        use core::fmt::Write;
+                                        let _ = write!(hex, "{b:02X}");
+                                        if i % 4 == 3 { hex.push(' '); }
+                                    }
+                                }
+                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                    "NT shim: AFD Stub input dump: {hex}\n"
+                                ));
+                            }
+                        }
+
+                        let status = if ioctl_code == 0x12007 {
+                            // IOCTL_AFD_CONNECT on AsyncConnectHlp.
+                            //
+                            // Input buffer layout (40 bytes, from dump analysis):
+                            //   +0x00: u32  ShareType / Flags (e.g. 0x300)
+                            //   +0x04: u32  padding
+                            //   +0x08: u64  zeros
+                            //   +0x10: u32  SocketHandle (the real socket handle!)
+                            //   +0x14: u32  padding
+                            //   +0x18: SOCKADDR (16 bytes: family=2, port, addr, pad)
+                            //   +0x28: end
+                            if input_length < 0x28 || input_buffer == 0 {
+                                NtStatus::STATUS_INVALID_PARAMETER
+                            } else {
+                                // Read the socket handle at offset +0x10.
+                                let sock_handle_val =
+                                    try_read_guest_value_unaligned::<u32>(input_buffer + 0x10)
+                                        .unwrap_or(0);
+
+                                // Look up the socket for this handle.
+                                let socket_found = {
+                                    let handles = self.shared.handles.lock();
+                                    handles.with(sock_handle_val, |entry| matches!(entry.object, handle_table::NtObject::Socket { .. }))
+                                        .unwrap_or(false)
+                                };
+
+                                #[cfg(debug_assertions)]
+                                {
+                                    use litebox::platform::DebugLogProvider as _;
+                                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                        "NT shim: AFD AsyncConnect sock_handle=0x{sock_handle_val:X} found={socket_found}\n"
+                                    ));
+                                }
+
+                                if socket_found {
+                                    // Read the sockaddr at offset +0x18.
+                                    #[repr(C, packed)]
+                                    #[derive(Clone, Copy)]
+                                    struct SockAddrIn {
+                                        family: u16,
+                                        port: u16,
+                                        addr: [u8; 4],
+                                        _pad: [u8; 8],
+                                    }
+
+                                    let sa_ptr = input_buffer + 0x18;
+                                    if let Some(sa) = try_read_guest_value_unaligned::<SockAddrIn>(sa_ptr) {
+                                        let port = u16::from_be(sa.port);
+                                        let ip = core::net::Ipv4Addr::from(sa.addr);
+                                        let sock_addr = core::net::SocketAddr::V4(
+                                            core::net::SocketAddrV4::new(ip, port),
+                                        );
+
+                                        #[cfg(debug_assertions)]
+                                        {
+                                            use litebox::platform::DebugLogProvider as _;
+                                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                "NT shim: AFD AsyncConnect handle=0x{sock_handle_val:X} addr={sock_addr}\n"
+                                            ));
+                                        }
+
+                                        if port == 0 || ip.is_unspecified() {
+                                            NtStatus::STATUS_NETWORK_UNREACHABLE
+                                        } else {
+                                            // Initiate connect.
+                                            let connect_result = {
+                                                let handles = self.shared.handles.lock();
+                                                handles.with(sock_handle_val, |entry| match &entry.object {
+                                                    handle_table::NtObject::Socket { socket_fd, .. } => {
+                                                        if let Some(net_arc) = self.shared.net.get() {
+                                                            Some(net_arc.lock().connect(socket_fd, &sock_addr, false))
+                                                        } else { None }
+                                                    }
+                                                    _ => None,
+                                                }).flatten()
+                                            };
+
+                                            match connect_result {
+                                                Some(Ok(())) => NtStatus::STATUS_SUCCESS,
+                                                Some(Err(litebox::net::errors::ConnectError::InProgress)) => {
+                                                    #[cfg(debug_assertions)]
+                                                    {
+                                                        use litebox::platform::DebugLogProvider as _;
+                                                        litebox_platform_multiplex::platform().debug_log_print(
+                                                            "NT shim: AFD AsyncConnect in progress, polling...\n"
+                                                        );
+                                                    }
+
+                                                    let mut connected = false;
+                                                    for _attempt in 0..10000 {
+                                                        core::hint::spin_loop();
+                                                        let handles = self.shared.handles.lock();
+                                                        let retry_result = handles.with(sock_handle_val, |entry| match &entry.object {
+                                                            handle_table::NtObject::Socket { socket_fd, .. } => {
+                                                                if let Some(net_arc) = self.shared.net.get() {
+                                                                    Some(net_arc.lock().connect(socket_fd, &sock_addr, true))
+                                                                } else { None }
+                                                            }
+                                                            _ => None,
+                                                        }).flatten();
+                                                        if let Some(retry_res) = retry_result {
+                                                            match retry_res {
+                                                                Ok(()) => {
+                                                                    connected = true;
+                                                                    break;
+                                                                }
+                                                                Err(litebox::net::errors::ConnectError::InProgress) => {}
+                                                                Err(_) => break,
+                                                            }
+                                                        }
+                                                        drop(handles);
+                                                        for _ in 0..100_000 { core::hint::spin_loop(); }
+                                                    }
+
+                                                    if connected {
+                                                        #[cfg(debug_assertions)]
+                                                        {
+                                                            use litebox::platform::DebugLogProvider as _;
+                                                            litebox_platform_multiplex::platform().debug_log_print(
+                                                                "NT shim: AFD AsyncConnect completed\n"
+                                                            );
+                                                        }
+                                                        NtStatus::STATUS_SUCCESS
+                                                    } else {
+                                                        NtStatus::STATUS_IO_TIMEOUT
+                                                    }
+                                                }
+                                                Some(Err(_)) => NtStatus::STATUS_NETWORK_UNREACHABLE,
+                                                None => NtStatus::STATUS_INVALID_HANDLE,
+                                            }
+                                        }
+                                    } else {
+                                        NtStatus::STATUS_INVALID_PARAMETER
+                                    }
+                                } else {
+                                    // Socket handle not found at offset +0x10.
+                                    #[cfg(debug_assertions)]
+                                    {
+                                        use litebox::platform::DebugLogProvider as _;
+                                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                            "NT shim: AFD AsyncConnect sock_handle=0x{sock_handle_val:X} not found\n"
+                                        ));
+                                    }
+                                    NtStatus::STATUS_INVALID_HANDLE
+                                }
+                            }
+                        } else {
+                            // Other IOCTLs on Afd stubs — not expected.
+                            #[cfg(debug_assertions)]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                    "NT shim: AFD Stub unexpected IOCTL=0x{ioctl_code:X}\n"
+                                ));
+                            }
+                            NtStatus::STATUS_NOT_IMPLEMENTED
+                        };
+
+                        // Write IO_STATUS_BLOCK on success.
+                        if status == NtStatus::STATUS_SUCCESS && io_status_ptr != 0 {
+                            try_write_guest_value_unaligned(io_status_ptr, 0i32);
+                            try_write_guest_value_unaligned(io_status_ptr + 8, 0usize);
+                        }
+
+                        // Signal Event on success.
+                        if status == NtStatus::STATUS_SUCCESS && event_handle != 0 {
+                            let handles = self.shared.handles.lock();
+                            let event_arc = handles.with(event_handle, |entry| match &entry.object {
+                                handle_table::NtObject::Event(event) => Some(alloc::sync::Arc::clone(event)),
+                                _ => None,
+                            }).flatten();
+                            if let Some(event) = event_arc {
+                                let mut signaled = event.state.lock();
+                                *signaled = true;
+                                drop(signaled);
+                                event.wake_waiters();
+                            }
+                        }
+
+                        // Post IOCP completion if the file handle has an IOCP binding.
+                        if status == NtStatus::STATUS_SUCCESS {
+                            let handles = self.shared.handles.lock();
+                            let iocp_info = handles.with(file_handle, |entry| match &entry.object {
+                                handle_table::NtObject::Stub { io_completion: Some((port, key)), .. } => {
+                                    Some((alloc::sync::Arc::clone(port), *key))
+                                }
+                                _ => None,
+                            }).flatten();
+                            if let Some((port, key)) = iocp_info {
+                                #[cfg(debug_assertions)]
+                                {
+                                    use litebox::platform::DebugLogProvider as _;
+                                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                        "NT shim: AFD Stub posting IOCP completion key=0x{key:X} apc_ctx=0x{apc_context:X}\n"
+                                    ));
+                                }
+                                port.push(handle_table::IoCompletionEntry {
+                                    key_context: key,
+                                    apc_context,
+                                    status: NtStatus::STATUS_SUCCESS,
+                                    information: 0,
+                                });
+                            }
+                        }
+
+                        (status, false)
+                    }
                     None => {
+                        #[cfg(feature = "trace_debug")]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            let kind_str = {
+                                let handles = self.shared.handles.lock();
+                                handles.with(file_handle, |entry| match &entry.object {
+                                    handle_table::NtObject::ConsoleOutput { is_stderr } => {
+                                        alloc::format!("ConsoleOutput(stderr={})", is_stderr)
+                                    }
+                                    handle_table::NtObject::ConsoleInput => {
+                                        alloc::string::String::from("ConsoleInput")
+                                    }
+                                    handle_table::NtObject::File { path, .. } => {
+                                        alloc::format!("File({})", path)
+                                    }
+                                    handle_table::NtObject::Stub { kind, .. } => {
+                                        alloc::format!("Stub({})", kind)
+                                    }
+                                    _ => alloc::string::String::from("<other>"),
+                                }).unwrap_or_else(|| alloc::string::String::from("<not found>"))
+                            };
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "NT shim: NtDeviceIoControlFile UNMATCHED handle=0x{file_handle:X} kind={kind_str} ioctl=0x{ioctl_code:X} in_buf=0x{input_buffer:X} in_len=0x{input_length:X} out_buf=0x{output_buffer:X} out_len=0x{output_length:X}\n"
+                            ));
+                        }
                         log_unimplemented!(
                             "NtDeviceIoControlFile handle=0x{:X} ioctl=0x{:X}",
                             file_handle,
@@ -6638,10 +13431,11 @@ impl NtShimEntrypoints {
             NtSyscallId::NtCallbackReturn => {
                 // NtCallbackReturn is used to return from a user-mode callback
                 // dispatched by the kernel (e.g., KiUserCallbackDispatcher).
-                // In our sandbox, we don't dispatch real kernel callbacks, so
-                // this should never be called from guest ntdll. If it is, it
-                // means the host kernel dispatched a callback to our thread
-                // (perhaps from user32/win32k). Just return success.
+                // The sandbox does not model a real kernel callback frame, but
+                // user-mode can still reach this stub while USER32/win32u are
+                // initializing. Returning success is the least-disruptive
+                // behavior here: it preserves the historical bringup path
+                // instead of forcing a spurious STATUS_NO_CALLBACK_ACTIVE.
                 (NtStatus::STATUS_SUCCESS, false)
             }
 
@@ -6653,31 +13447,51 @@ impl NtShimEntrypoints {
                 let _type_id = args.arg1;
                 let _explicit_scope = args.arg2;
                 let change_stamp_ptr = args.arg3;
-                let buffer_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
+                let buffer_ptr =
+                    crate::try_read_guest_value_unaligned::<usize>(ctx.regs.rsp + 0x28)
+                        .unwrap_or(0);
                 let buffer_len_ptr =
-                    unsafe { core::ptr::read((ctx.regs.rsp + 0x30) as *const usize) };
+                    crate::try_read_guest_value_unaligned::<usize>(ctx.regs.rsp + 0x30)
+                        .unwrap_or(0);
 
                 if state_name_ptr == 0 || buffer_len_ptr == 0 {
                     (NtStatus::STATUS_INVALID_PARAMETER, false)
                 } else {
-                    let state_name =
-                        unsafe { core::ptr::read_unaligned(state_name_ptr as *const u64) };
+                    let Some(state_name) =
+                        crate::try_read_guest_value_unaligned::<u64>(state_name_ptr)
+                    else {
+                        return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                    };
+                    #[cfg(debug_assertions)]
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        let buffer_len =
+                            crate::try_read_guest_value_unaligned::<u32>(buffer_len_ptr)
+                                .unwrap_or(0);
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "NT shim: NtQueryWnfStateData(state=0x{state_name:016X}, change_stamp_ptr=0x{change_stamp_ptr:X}, buf=0x{buffer_ptr:X}, len={buffer_len})\n",
+                        ));
+                    }
                     let states = self.shared.wnf_states.lock();
                     if let Some(state) = states.get(&state_name) {
                         let required = state.data.len() as u32;
-                        let buffer_len = unsafe { core::ptr::read(buffer_len_ptr as *const u32) };
-                        unsafe {
-                            core::ptr::write(buffer_len_ptr as *mut u32, required);
-                        }
+                        let buffer_len =
+                            crate::try_read_guest_value_unaligned::<u32>(buffer_len_ptr)
+                                .unwrap_or(0);
+                        crate::try_write_guest_value_unaligned(buffer_len_ptr, required);
                         if change_stamp_ptr != 0 {
-                            unsafe {
-                                core::ptr::write(change_stamp_ptr as *mut u32, state.change_stamp);
-                            }
+                            crate::try_write_guest_value_unaligned(
+                                change_stamp_ptr,
+                                state.change_stamp,
+                            );
                         }
                         if required != 0 && (buffer_ptr == 0 || buffer_len < required) {
                             (NtStatus::STATUS_BUFFER_TOO_SMALL, false)
                         } else {
                             if required != 0 {
+                                if !crate::is_addr_range_writable(buffer_ptr, required as usize) {
+                                    return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                                }
                                 unsafe {
                                     core::ptr::copy_nonoverlapping(
                                         state.data.as_ptr(),
@@ -6703,13 +13517,14 @@ impl NtShimEntrypoints {
                 let name_info_class = args.arg1 as u32;
                 let explicit_scope = args.arg2;
                 let buffer = args.arg3;
-                let buffer_len = unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const u32) };
+                let buffer_len =
+                    crate::try_read_guest_value_unaligned::<u32>(ctx.regs.rsp + 0x28).unwrap_or(0);
 
                 #[cfg(debug_assertions)]
                 {
                     use litebox::platform::DebugLogProvider as _;
                     let state_name = if state_name_ptr != 0 {
-                        unsafe { core::ptr::read_unaligned(state_name_ptr as *const u64) }
+                        crate::try_read_guest_value_unaligned::<u64>(state_name_ptr).unwrap_or(0)
                     } else {
                         0
                     };
@@ -6762,33 +13577,424 @@ impl NtShimEntrypoints {
                 let buffer = args.arg2;
                 let bytes_to_read = args.arg3;
                 let bytes_read_ptr =
-                    unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
+                    crate::try_read_guest_value_unaligned::<usize>(ctx.regs.rsp + 0x28)
+                        .unwrap_or(0);
                 let is_current_process = handle == NT_CURRENT_PROCESS_HANDLE
                     || self
                         .shared
                         .handles
                         .lock()
-                        .get(handle as u32)
-                        .is_some_and(|obj| matches!(obj, handle_table::NtObject::CurrentProcess));
+                        .with(handle as u32, |entry| matches!(entry.object, handle_table::NtObject::CurrentProcess))
+                        .unwrap_or(false);
 
                 if is_current_process {
-                    // Self-process: simple memcpy.
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            base_address as *const u8,
-                            buffer as *mut u8,
-                            bytes_to_read,
-                        );
-                    }
-                    if bytes_read_ptr != 0 {
-                        unsafe {
-                            core::ptr::write(bytes_read_ptr as *mut usize, bytes_to_read);
+                    // Self-process: fallible memcpy that gracefully handles
+                    // unmapped guest pages via the exception table instead
+                    // of crashing the host.
+                    if bytes_to_read > 0 {
+                        let result = unsafe {
+                            litebox::mm::exception_table::memcpy_fallible(
+                                buffer as *mut u8,
+                                base_address as *const u8,
+                                bytes_to_read,
+                            )
+                        };
+                        match result {
+                            Ok(()) => {
+                                if bytes_read_ptr != 0 {
+                                    crate::try_write_guest_value_unaligned::<usize>(
+                                        bytes_read_ptr,
+                                        bytes_to_read,
+                                    );
+                                }
+                                (NtStatus::STATUS_SUCCESS, false)
+                            }
+                            Err(_) => (NtStatus::STATUS_ACCESS_VIOLATION, false),
                         }
+                    } else {
+                        if bytes_read_ptr != 0 {
+                            crate::try_write_guest_value_unaligned::<usize>(bytes_read_ptr, 0);
+                        }
+                        (NtStatus::STATUS_SUCCESS, false)
                     }
-                    (NtStatus::STATUS_SUCCESS, false)
                 } else {
                     (NtStatus::STATUS_NOT_IMPLEMENTED, false)
                 }
+            }
+
+            // Phase 3: Pipe Support + Process Spawning
+            NtSyscallId::NtCreateNamedPipeFile => {
+                let status = syscalls::file::nt_create_named_pipe_file(
+                    ctx,
+                    &mut self.shared.handles.lock(),
+                    &self.shared,
+                );
+                (status, false)
+            }
+            NtSyscallId::NtFsControlFile => {
+                let status = syscalls::file::nt_fs_control_file(
+                    ctx,
+                    &self.shared.handles.lock(),
+                    &self.shared,
+                );
+                (status, false)
+            }
+
+            // ── Job object syscalls ──────────────────────────────────────
+            //
+            // Job objects group processes for resource/lifetime management.
+            // The sandbox creates a real handle so callers can pass it to
+            // Set/Assign/Query, but we do not enforce any job limits.
+            NtSyscallId::NtCreateJobObject => {
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let handle_out_ptr = args.arg0; // r10 = OUT PHANDLE
+                // arg1 = DesiredAccess (ignored)
+                // arg2 = POBJECT_ATTRIBUTES (ignored — no named job support)
+
+                if handle_out_ptr == 0 {
+                    return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                }
+
+                let handle = self
+                    .shared
+                    .handles
+                    .lock()
+                    .insert(handle_table::NtObject::JobObject);
+
+                if !try_write_guest_value_unaligned::<u32>(handle_out_ptr, handle) {
+                    return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                }
+
+                #[cfg(feature = "trace_debug")]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NtCreateJobObject => handle=0x{:X}\n",
+                        handle,
+                    ));
+                }
+
+                (NtStatus::STATUS_SUCCESS, false)
+            }
+            NtSyscallId::NtSetInformationJobObject => {
+                // arg0 (r10) = JobHandle
+                // arg1 (rdx) = JobObjectInformationClass
+                // arg2 (r8)  = JobObjectInformation buffer pointer
+                // arg3 (r9)  = JobObjectInformationLength
+                //
+                // Accept all classes — the sandbox does not enforce limits.
+                let _args = syscalls::NtSyscallArgs::from_ctx(ctx);
+
+                #[cfg(feature = "trace_debug")]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NtSetInformationJobObject handle=0x{:X} class={}\n",
+                        _args.arg0 as u32,
+                        _args.arg1 as u32,
+                    ));
+                }
+
+                (NtStatus::STATUS_SUCCESS, false)
+            }
+            NtSyscallId::NtAssignProcessToJobObject => {
+                // arg0 (r10) = JobHandle
+                // arg1 (rdx) = ProcessHandle
+                //
+                // Accept silently — the sandbox doesn't enforce job membership.
+                let _args = syscalls::NtSyscallArgs::from_ctx(ctx);
+
+                #[cfg(feature = "trace_debug")]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NtAssignProcessToJobObject job=0x{:X} process=0x{:X}\n",
+                        _args.arg0 as u32,
+                        _args.arg1 as u32,
+                    ));
+                }
+
+                (NtStatus::STATUS_SUCCESS, false)
+            }
+
+            // ── NtCancelIoFileEx ──────────────────────────────────
+            //
+            // NTSTATUS NtCancelIoFileEx(
+            //     HANDLE FileHandle,                   // r10 (arg0)
+            //     PIO_STATUS_BLOCK IoRequestToCancel,   // rdx (arg1) — IOSB of pending request
+            //     PIO_STATUS_BLOCK IoStatusBlock         // r8  (arg2) — output
+            // );
+            //
+            // Cancels a specific pending I/O identified by its IOSB address.
+            // If no matching pending request exists, returns STATUS_NOT_FOUND.
+            // libuv relies on this: `assert(r || GetLastError() == ERROR_NOT_FOUND)`.
+            NtSyscallId::NtCancelIoFileEx => {
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let file_handle = args.arg0 as u32;
+                let cancel_iosb_ptr = args.arg1;   // IOSB of the request to cancel
+                let out_iosb_ptr = args.arg2;       // output IOSB
+
+                let pipe_buf = {
+                    let handles = self.shared.handles.lock();
+                    handles.with(file_handle, |entry| match &entry.object {
+                        handle_table::NtObject::Pipe { buffer, .. } => {
+                            Some(alloc::sync::Arc::clone(buffer))
+                        }
+                        _ => None,
+                    }).flatten()
+                };
+
+                let status = if let Some(buf) = pipe_buf {
+                    let mut pending = buf.pending_reads.lock();
+                    if cancel_iosb_ptr != 0 {
+                        // Cancel the specific pending read whose iosb_ptr matches.
+                        if let Some(pos) = pending.iter().position(|r| r.iosb_ptr == cancel_iosb_ptr)
+                        {
+                            let cancelled = pending.remove(pos);
+                            // Write STATUS_CANCELLED into the cancelled request's IOSB.
+                            let iosb = litebox_common_windows::nt_types::IoStatusBlock {
+                                status: NtStatus::STATUS_CANCELLED.0,
+                                _pad: 0,
+                                information: 0,
+                            };
+                            crate::try_write_guest_value_unaligned(cancelled.iosb_ptr, iosb);
+                            // Post cancellation to the IOCP.
+                            cancelled.port.push(handle_table::IoCompletionEntry {
+                                key_context: cancelled.key,
+                                apc_context: cancelled.apc_context,
+                                status: NtStatus::STATUS_CANCELLED,
+                                information: 0,
+                            });
+                            NtStatus::STATUS_SUCCESS
+                        } else {
+                            NtStatus::STATUS_NOT_FOUND
+                        }
+                    } else {
+                        // cancel_iosb_ptr == NULL: cancel all pending reads.
+                        if pending.is_empty() {
+                            NtStatus::STATUS_NOT_FOUND
+                        } else {
+                            for cancelled in pending.drain(..) {
+                                let iosb = litebox_common_windows::nt_types::IoStatusBlock {
+                                    status: NtStatus::STATUS_CANCELLED.0,
+                                    _pad: 0,
+                                    information: 0,
+                                };
+                                crate::try_write_guest_value_unaligned(cancelled.iosb_ptr, iosb);
+                                cancelled.port.push(handle_table::IoCompletionEntry {
+                                    key_context: cancelled.key,
+                                    apc_context: cancelled.apc_context,
+                                    status: NtStatus::STATUS_CANCELLED,
+                                    information: 0,
+                                });
+                            }
+                            NtStatus::STATUS_SUCCESS
+                        }
+                    }
+                } else {
+                    // Not a pipe — for non-pipe handles (VFS files), there are
+                    // no pending async operations, so always STATUS_NOT_FOUND.
+                    NtStatus::STATUS_NOT_FOUND
+                };
+
+                // Write the output IOSB.
+                if out_iosb_ptr != 0 {
+                    let iosb = litebox_common_windows::nt_types::IoStatusBlock {
+                        status: status.0,
+                        _pad: 0,
+                        information: 0,
+                    };
+                    crate::try_write_guest_value_unaligned(out_iosb_ptr, iosb);
+                }
+
+                #[cfg(feature = "trace_debug")]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NtCancelIoFileEx handle=0x{:X} cancel_iosb=0x{:X} => 0x{:X}\n",
+                        file_handle, cancel_iosb_ptr, status.0 as u32,
+                    ));
+                }
+
+                (status, false)
+            }
+
+            // ── NtCancelIoFile ──────────────────────────────────
+            //
+            // NTSTATUS NtCancelIoFile(
+            //     HANDLE FileHandle,               // r10 (arg0)
+            //     PIO_STATUS_BLOCK IoStatusBlock     // rdx (arg1) — output
+            // );
+            //
+            // Cancels ALL pending I/O on the file handle for the calling thread.
+            // We don't track per-thread ownership of pending reads, so we cancel
+            // all pending reads on the pipe.
+            NtSyscallId::NtCancelIoFile => {
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let file_handle = args.arg0 as u32;
+                let out_iosb_ptr = args.arg1;
+
+                let pipe_buf = {
+                    let handles = self.shared.handles.lock();
+                    handles.with(file_handle, |entry| match &entry.object {
+                        handle_table::NtObject::Pipe { buffer, .. } => {
+                            Some(alloc::sync::Arc::clone(buffer))
+                        }
+                        _ => None,
+                    }).flatten()
+                };
+
+                let status = if let Some(buf) = pipe_buf {
+                    let mut pending = buf.pending_reads.lock();
+                    if pending.is_empty() {
+                        NtStatus::STATUS_NOT_FOUND
+                    } else {
+                        for cancelled in pending.drain(..) {
+                            let iosb = litebox_common_windows::nt_types::IoStatusBlock {
+                                status: NtStatus::STATUS_CANCELLED.0,
+                                _pad: 0,
+                                information: 0,
+                            };
+                            crate::try_write_guest_value_unaligned(cancelled.iosb_ptr, iosb);
+                            cancelled.port.push(handle_table::IoCompletionEntry {
+                                key_context: cancelled.key,
+                                apc_context: cancelled.apc_context,
+                                status: NtStatus::STATUS_CANCELLED,
+                                information: 0,
+                            });
+                        }
+                        NtStatus::STATUS_SUCCESS
+                    }
+                } else {
+                    NtStatus::STATUS_NOT_FOUND
+                };
+
+                if out_iosb_ptr != 0 {
+                    let iosb = litebox_common_windows::nt_types::IoStatusBlock {
+                        status: status.0,
+                        _pad: 0,
+                        information: 0,
+                    };
+                    crate::try_write_guest_value_unaligned(out_iosb_ptr, iosb);
+                }
+
+                #[cfg(feature = "trace_debug")]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NtCancelIoFile handle=0x{:X} => 0x{:X}\n",
+                        file_handle, status.0 as u32,
+                    ));
+                }
+
+                (status, false)
+            }
+
+            NtSyscallId::NtQueryDebugFilterState => {
+                // NtQueryDebugFilterState(ComponentId, Level) — returns whether
+                // debug output is enabled for a given component/level.
+                // We are not a debugger; return FALSE (debug output disabled).
+                (NtStatus(0), false)  // STATUS_SUCCESS = FALSE (not filtered)
+            }
+
+            NtSyscallId::NtCreateUserProcess => {
+                let create_info_ptr_pre =
+                    crate::try_read_guest_value_unaligned::<usize>(ctx.regs.rsp + 0x50)
+                        .unwrap_or(0);
+                let attr_list_ptr_pre =
+                    crate::try_read_guest_value_unaligned::<usize>(ctx.regs.rsp + 0x58)
+                        .unwrap_or(0);
+                let status = syscalls::file::nt_create_user_process(
+                    ctx,
+                    &self.shared,
+                );
+                // Post-dispatch instrumentation: dump PS_CREATE_INFO as the guest will see it.
+                #[cfg(feature = "trace_debug")]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    if create_info_ptr_pre != 0 && crate::is_addr_range_writable(create_info_ptr_pre, 0x50) {
+                        unsafe {
+                            let ci_size = core::ptr::read(create_info_ptr_pre as *const usize);
+                            let ci_state = core::ptr::read((create_info_ptr_pre + 8) as *const u32);
+                            let ci_output_flags = core::ptr::read((create_info_ptr_pre + 0x10) as *const u32);
+                            let ci_file_handle = core::ptr::read((create_info_ptr_pre + 0x18) as *const u64);
+                            let ci_section_handle = core::ptr::read((create_info_ptr_pre + 0x20) as *const u64);
+                            let ci_user_params = core::ptr::read((create_info_ptr_pre + 0x28) as *const u64);
+                            let ci_param_flags = core::ptr::read((create_info_ptr_pre + 0x30) as *const u32);
+                            let ci_peb_addr = core::ptr::read((create_info_ptr_pre + 0x38) as *const u64);
+                            let ci_manifest_addr = core::ptr::read((create_info_ptr_pre + 0x40) as *const u64);
+                            let ci_manifest_size = core::ptr::read((create_info_ptr_pre + 0x48) as *const u32);
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "[NtCreateUserProcess-post] PS_CREATE_INFO @ 0x{:X}: Size={} State={} OutputFlags=0x{:X} FileHandle=0x{:X} SectionHandle=0x{:X} UserParams=0x{:X} ParamFlags=0x{:X} PebAddr=0x{:X} ManifestAddr=0x{:X} ManifestSize={}\n",
+                                create_info_ptr_pre, ci_size, ci_state, ci_output_flags, ci_file_handle,
+                                ci_section_handle, ci_user_params, ci_param_flags, ci_peb_addr,
+                                ci_manifest_addr, ci_manifest_size,
+                            ));
+                        }
+                    }
+                    if attr_list_ptr_pre != 0 {
+                        let total_len = crate::try_read_guest_value_unaligned::<usize>(attr_list_ptr_pre).unwrap_or(0);
+                        let entry_size = 4 * core::mem::size_of::<usize>();
+                        let num_attrs = if total_len > 8 { (total_len - 8) / entry_size } else { 0 };
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "[NtCreateUserProcess-post] PS_ATTRIBUTE_LIST @ 0x{:X}: TotalLen={} NumAttrs={}\n",
+                            attr_list_ptr_pre, total_len, num_attrs,
+                        ));
+                        for i in 0..num_attrs {
+                            let ab = attr_list_ptr_pre + 8 + i * entry_size;
+                            let attr_id = crate::try_read_guest_value_unaligned::<usize>(ab).unwrap_or(0);
+                            let attr_sz = crate::try_read_guest_value_unaligned::<usize>(ab + 8).unwrap_or(0);
+                            let attr_val = crate::try_read_guest_value_unaligned::<usize>(ab + 16).unwrap_or(0);
+                            let attr_ret = crate::try_read_guest_value_unaligned::<usize>(ab + 24).unwrap_or(0);
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "  Attr[{}]: id=0x{:X} size={} value=0x{:X} retLen_ptr=0x{:X}",
+                                i, attr_id, attr_sz, attr_val, attr_ret,
+                            ));
+                            // For CLIENT_ID (0x10003), dump the actual values
+                            if attr_id == 0x10003 && attr_val != 0 {
+                                let pid = crate::try_read_guest_value_unaligned::<usize>(attr_val).unwrap_or(0);
+                                let tid = crate::try_read_guest_value_unaligned::<usize>(attr_val + 8).unwrap_or(0);
+                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                    " -> CLIENT_ID {{ pid={}, tid={} }}", pid, tid,
+                                ));
+                            }
+                            // For IMAGE_INFO (0x20005), dump returned value
+                            if attr_id == 0x20005 && attr_val != 0 {
+                                let img_info_val = crate::try_read_guest_value_unaligned::<usize>(attr_val).unwrap_or(0);
+                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                    " -> IMAGE_INFO=0x{:X}", img_info_val,
+                                ));
+                            }
+                            litebox_platform_multiplex::platform().debug_log_print("\n");
+                        }
+                    }
+                    // Dump guest registers that will be restored.
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "[NtCreateUserProcess-post] regs: rip=0x{:X} rsp=0x{:X} rax(will_be_status)=0x{:X} rcx=0x{:X} rdx=0x{:X} rbx=0x{:X} rbp=0x{:X} rsi=0x{:X} rdi=0x{:X} r12=0x{:X} r13=0x{:X} r14=0x{:X} r15=0x{:X}\n",
+                        ctx.regs.rip, ctx.regs.rsp, status.0 as u32 as usize,
+                        ctx.regs.rcx, ctx.regs.rdx, ctx.regs.rbx, ctx.regs.rbp,
+                        ctx.regs.rsi, ctx.regs.rdi, ctx.regs.r12, ctx.regs.r13,
+                        ctx.regs.r14, ctx.regs.r15,
+                    ));
+                    // Also dump what process/thread handles were written to
+                    let proc_handle_out = ctx.regs.r10 as usize;  // arg0 is in r10
+                    let thread_handle_out = ctx.regs.rdx as usize;
+                    if proc_handle_out != 0 {
+                        let ph = crate::try_read_guest_value_unaligned::<usize>(proc_handle_out).unwrap_or(0);
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "[NtCreateUserProcess-post] *ProcessHandle (@ 0x{:X}) = 0x{:X}\n",
+                            proc_handle_out, ph,
+                        ));
+                    }
+                    if thread_handle_out != 0 {
+                        let th = crate::try_read_guest_value_unaligned::<usize>(thread_handle_out).unwrap_or(0);
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "[NtCreateUserProcess-post] *ThreadHandle (@ 0x{:X}) = 0x{:X}\n",
+                            thread_handle_out, th,
+                        ));
+                    }
+                }
+                (status, false)
             }
 
             other => {
@@ -6799,39 +14005,386 @@ impl NtShimEntrypoints {
     }
 }
 
+impl litebox::event::wait::CheckForInterrupt for NtShimEntrypoints {
+    fn check_for_interrupt(&self) -> bool {
+        self.shared
+            .process_exit_requested
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+}
+
 impl litebox::shim::EnterShim for NtShimEntrypoints {
     type ExecutionContext = ExecutionContext;
 
     fn init(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+        // Register this thread's interrupt handle now that the platform
+        // thread handle is available (we're inside run_with_handle).
+        self.shared
+            .thread_interrupt_handles
+            .lock()
+            .insert(self.thread_id, self.wait_state.thread_handle());
+
+        {
+            #[cfg(feature = "trace_debug")]
+            {
+                use litebox::platform::DebugLogProvider as _;
+                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                    "[shim-lifecycle] init: tid={} rip=0x{:X}\n",
+                    self.thread_id,
+                    ctx.regs.rip,
+                ));
+            }
+        }
+
         // Set up initial thread state from the runner-provided init state.
         if let Some(state) = &self.init_state {
             ctx.regs.rip = state.entry_point;
             ctx.regs.rsp = state.stack_top;
-
-            if let Some(argument) = self.child_thread_argument {
-                // Fallback child-thread entry: call StartRoutine(Parameter)
-                // directly if the runner did not resolve RtlUserThreadStart.
-                ctx.regs.rcx = argument;
-            } else if state.initial_rcx != 0 {
-                // ntdll-driven init: main thread enters with
-                // RCX=CONTEXT*/RDX=ntdll base for LdrInitializeThunk, while
-                // child threads enter with RCX=StartRoutine/RDX=Parameter for
-                // RtlUserThreadStart.
-                ctx.regs.rcx = state.initial_rcx;
-                ctx.regs.rdx = state.initial_rdx;
-            } else {
-                ctx.regs.rcx = state.entry_point;
-            }
+            ctx.regs.rcx = state.initial_rcx;
+            ctx.regs.rdx = state.initial_rdx;
         }
-        ContinueOperation::Resume
+        self.resume_guest(ctx)
     }
 
     fn syscall(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+        self.enter_from_guest();
         // A successful syscall means the guest resumed after any prior
         // exception forwarding.  Reset the SEH forward counter.
         self.seh_forward_count.store(0, Ordering::Relaxed);
+        if let Some(ref obj) = self.thread_obj {
+            obj.set_debug_stage(0);
+        }
 
         let nr = ctx.regs.orig_rax as u32;
+        let caller_ret = if ctx.regs.rsp != 0 {
+            crate::try_read_guest_value_unaligned::<usize>(ctx.regs.rsp).unwrap_or(0)
+        } else {
+            0
+        };
+        let parent_ret = if ctx.regs.rsp != 0 {
+            crate::try_read_guest_value_unaligned::<usize>(ctx.regs.rsp.saturating_add(0x30))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let grandparent_ret = if ctx.regs.rsp != 0 {
+            crate::try_read_guest_value_unaligned::<usize>(ctx.regs.rsp.saturating_add(0x58))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        if self
+            .rtl_user_thread_start_syscall_probe_pending
+            .swap(false, Ordering::Relaxed)
+        {
+            // GS snapshot diagnostics removed — GS is always host TEB now.
+            let (current_gs, guest_gs, last_entry_gs, last_entry_gs_observed) =
+                (0usize, 0usize, 0usize, 0usize);
+            let thread_teb_va = self
+                .thread_obj
+                .as_ref()
+                .map_or(0usize, |thread| thread.teb_va());
+            let thread_teb_peb = if thread_teb_va != 0 {
+                try_read_guest_value_unaligned::<u64>(
+                    thread_teb_va + crate::peb_teb::teb_offsets::PEB_PTR,
+                )
+                .unwrap_or(0) as usize
+            } else {
+                0
+            };
+
+            self.trace(
+                TraceKind::Probe,
+                0x51A70,
+                nr as usize,
+                caller_ret,
+                current_gs,
+            );
+            self.trace(
+                TraceKind::Probe,
+                0x51A71,
+                guest_gs,
+                last_entry_gs,
+                last_entry_gs_observed,
+            );
+            self.trace(
+                TraceKind::Probe,
+                0x51A72,
+                thread_teb_va,
+                thread_teb_peb,
+                parent_ret,
+            );
+            push_recent_chain_event(
+                &self.shared.recent_chain_events,
+                alloc::format!(
+                    "startupsys:{:X}:0x{:X}:0x{:X}:0:0:0:0:0x{:X}:0x{:X}",
+                    self.thread_id,
+                    nr,
+                    caller_ret,
+                    thread_teb_va,
+                    thread_teb_peb
+                ),
+            );
+        }
+
+        // Track last syscall number per thread for diagnostics (zero overhead).
+        self.shared.thread_last_syscall[(self.thread_id as usize) % 64]
+            .store(nr, core::sync::atomic::Ordering::Relaxed);
+        if let Some(ref obj) = self.thread_obj {
+            obj.set_last_syscall(nr);
+            obj.set_last_guest_context(ctx.regs.rip, ctx.regs.rsp);
+            obj.set_last_caller_ret(caller_ret);
+        }
+        if matches!(
+            nr,
+            0x19 | 0x1C
+                | 0x28
+                | 0x2A
+                | 0x2C
+                | 0x36
+                | 0x3C
+                | 0x40
+                | 0x48
+                | 0x4A
+                | 0x5E
+                | 0x171
+                | 0x1E1
+        ) {
+            if let Some((ntdll_base, ntdll_size)) = self.init_state.as_ref().and_then(|s| {
+                s.module_bases
+                    .iter()
+                    .find(|m| m.name == "ntdll.dll")
+                    .map(|m| (m.base_address, m.image_size))
+            }) {
+                let in_ntdll = |addr: usize| {
+                    addr >= ntdll_base && addr < ntdll_base.saturating_add(ntdll_size)
+                };
+                if in_ntdll(caller_ret) {
+                    if nr == 0x19 && caller_ret == ntdll_base.saturating_add(0x8EA8F) {
+                        let exc_record = ctx.regs.rbp;
+                        let context_record = ctx.regs.rsi;
+                        let read_ctx_u64 = |offset: usize| {
+                            crate::try_read_guest_value_unaligned::<u64>(
+                                context_record.saturating_add(offset),
+                            )
+                            .unwrap_or(0)
+                        };
+                        let read_guest_u64 = |addr: usize| {
+                            crate::try_read_guest_value_unaligned::<u64>(addr).unwrap_or(0)
+                        };
+                        let inspect_addr = |addr: usize| {
+                            let page = addr & !(PAGE_SIZE - 1);
+                            let meta = self.shared.process_state.with_memory_read(|vmem, mem| {
+                                let perms_bits = page
+                                    .checked_add(PAGE_SIZE)
+                                    .and_then(|page_end| {
+                                        litebox::mm::linux::PageRange::<PAGE_SIZE>::new(
+                                            page, page_end,
+                                        )
+                                    })
+                                    .and_then(|page_range| vmem.get_memory_permissions(page_range))
+                                    .map(|perms| perms.bits() as usize)
+                                    .unwrap_or(0xFF);
+                                let reserved = mem.va_reservation_at(addr).is_some();
+                                let image =
+                                    self.shared.process_state.image_mapping_at(addr).is_some();
+                                perms_bits | ((reserved as usize) << 8) | ((image as usize) << 9)
+                            });
+                            (page, meta)
+                        };
+                        let inspect_host_addr = |addr: usize| {
+                            query_host_memory_basic_information(addr)
+                                .map(|mbi| {
+                                    (mbi.state as usize)
+                                        | ((mbi.protect as usize) << 16)
+                                        | ((mbi._type as usize) << 32)
+                                })
+                                .unwrap_or(0)
+                        };
+                        let exc_code =
+                            crate::try_read_guest_value_unaligned::<u32>(exc_record).unwrap_or(0);
+                        let exc_address = crate::try_read_guest_value_unaligned::<u64>(
+                            exc_record.saturating_add(0x10),
+                        )
+                        .unwrap_or(0);
+                        let exc_info0 = crate::try_read_guest_value_unaligned::<u64>(
+                            exc_record.saturating_add(0x20),
+                        )
+                        .unwrap_or(0);
+                        let exc_info1 = crate::try_read_guest_value_unaligned::<u64>(
+                            exc_record.saturating_add(0x28),
+                        )
+                        .unwrap_or(0);
+                        let ctx_rax = read_ctx_u64(0x78);
+                        let ctx_rcx = read_ctx_u64(0x80);
+                        let ctx_rdx = read_ctx_u64(0x88);
+                        let ctx_rbx = read_ctx_u64(0x90);
+                        let ctx_rsp = read_ctx_u64(0x98);
+                        let ctx_rsi = read_ctx_u64(0xA8);
+                        let ctx_rdi = read_ctx_u64(0xB0);
+                        let ctx_r8 = read_ctx_u64(0xB8);
+                        let ctx_r9 = read_ctx_u64(0xC0);
+                        let ctx_r12 = read_ctx_u64(0xD8);
+                        let ctx_r13 = read_ctx_u64(0xE0);
+                        let ctx_r15 = read_ctx_u64(0xF0);
+                        let ctx_rip = read_ctx_u64(0xF8);
+                        self.trace(
+                            TraceKind::Probe,
+                            0x8EA8F,
+                            exc_record,
+                            context_record,
+                            ctx.regs.rdi,
+                        );
+                        self.trace(
+                            TraceKind::Probe,
+                            0x8EA90,
+                            exc_code as usize,
+                            exc_address as usize,
+                            ctx_rip as usize,
+                        );
+                        self.trace(
+                            TraceKind::Probe,
+                            0x8EA91,
+                            exc_info0 as usize,
+                            exc_info1 as usize,
+                            ctx_rsp as usize,
+                        );
+                        let exc_ntdll_rip = (exc_address as usize).saturating_sub(ntdll_base);
+                        if exc_code == 0xC000_0374 && exc_ntdll_rip == 0x1176B5 {
+                            let (rbx_page, rbx_meta) = inspect_addr(ctx_rbx as usize);
+                            let (rsi_page, rsi_meta) = inspect_addr(ctx_rsi as usize);
+                            let (r12_page, r12_meta) = inspect_addr(ctx_r12 as usize);
+                            let (r13_page, r13_meta) = inspect_addr(ctx_r13 as usize);
+                            let (r15_page, r15_meta) = inspect_addr(ctx_r15 as usize);
+                            self.trace(
+                                TraceKind::Probe,
+                                0x8EA92,
+                                ctx_rbx as usize,
+                                ctx_rsi as usize,
+                                ctx_r12 as usize,
+                            );
+                            self.trace(
+                                TraceKind::Probe,
+                                0x8EA93,
+                                ctx_r13 as usize,
+                                ctx_r15 as usize,
+                                ctx_rip as usize,
+                            );
+                            self.trace(TraceKind::Probe, 0x8EA94, rbx_page, rbx_meta, rsi_page);
+                            self.trace(TraceKind::Probe, 0x8EA95, rsi_meta, r12_page, r12_meta);
+                            self.trace(TraceKind::Probe, 0x8EA96, r13_page, r13_meta, r15_page);
+                            self.trace(
+                                TraceKind::Probe,
+                                0x8EA97,
+                                r15_meta,
+                                exc_info0 as usize,
+                                exc_info1 as usize,
+                            );
+                            let raise_helper_ret =
+                                read_guest_u64((ctx_rsp as usize).saturating_add(0x48));
+                            let raise_caller_ret =
+                                read_guest_u64((ctx_rsp as usize).saturating_add(0x138));
+                            let raise_caller_ret_next =
+                                read_guest_u64((ctx_rsp as usize).saturating_add(0x140));
+                            let raise_parent_ret =
+                                read_guest_u64((ctx_rsp as usize).saturating_add(0x168));
+                            let raise_parent_ret_next =
+                                read_guest_u64((ctx_rsp as usize).saturating_add(0x170));
+                            self.trace(
+                                TraceKind::Probe,
+                                0x8EA98,
+                                ctx_rdi as usize,
+                                raise_helper_ret as usize,
+                                raise_caller_ret as usize,
+                            );
+                            self.trace(
+                                TraceKind::Probe,
+                                0x8EA99,
+                                raise_caller_ret_next as usize,
+                                ctx_rsp as usize,
+                                ctx_rip as usize,
+                            );
+                            self.trace(
+                                TraceKind::Probe,
+                                0x8EA9C,
+                                raise_parent_ret as usize,
+                                raise_parent_ret_next as usize,
+                                ctx_rsp as usize,
+                            );
+                            let mut stack_ntdll = [0usize; 4];
+                            let mut stack_ntdll_count = 0usize;
+                            for slot in 0..0x40usize {
+                                let value =
+                                    read_guest_u64((ctx_rsp as usize).saturating_add(slot * 8))
+                                        as usize;
+                                if in_ntdll(value) {
+                                    if stack_ntdll_count == 0
+                                        || stack_ntdll[stack_ntdll_count - 1] != value
+                                    {
+                                        stack_ntdll[stack_ntdll_count] = value;
+                                        stack_ntdll_count += 1;
+                                        if stack_ntdll_count == stack_ntdll.len() {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            self.trace(
+                                TraceKind::Probe,
+                                0x8EA9A,
+                                stack_ntdll[0],
+                                stack_ntdll[1],
+                                stack_ntdll[2],
+                            );
+                            self.trace(
+                                TraceKind::Probe,
+                                0x8EA9B,
+                                stack_ntdll[3],
+                                stack_ntdll_count,
+                                ctx_rsp as usize,
+                            );
+                        }
+                        if exc_code == 0xC000_0005 && exc_ntdll_rip == 0x167280 {
+                            let (rax_page, rax_meta) = inspect_addr(ctx_rax as usize);
+                            let rax_host = inspect_host_addr(ctx_rax as usize);
+                            let dispatch_ret0 = read_guest_u64(ctx_rsp as usize);
+                            let dispatch_ret1 =
+                                read_guest_u64((ctx_rsp as usize).saturating_add(8));
+                            self.trace(
+                                TraceKind::Probe,
+                                0x8EAA0,
+                                ctx_rax as usize,
+                                dispatch_ret0 as usize,
+                                dispatch_ret1 as usize,
+                            );
+                            self.trace(TraceKind::Probe, 0x8EAA1, rax_page, rax_meta, rax_host);
+                            self.trace(
+                                TraceKind::Probe,
+                                0x8EAA2,
+                                ctx_rcx as usize,
+                                ctx_rdx as usize,
+                                ctx_r8 as usize,
+                            );
+                            self.trace(
+                                TraceKind::Probe,
+                                0x8EAA3,
+                                ctx_r9 as usize,
+                                exc_info0 as usize,
+                                exc_info1 as usize,
+                            );
+                        }
+                    }
+                    self.trace(
+                        TraceKind::Probe,
+                        nr,
+                        caller_ret,
+                        parent_ret,
+                        grandparent_ret,
+                    );
+                }
+            }
+        }
 
         #[cfg(debug_assertions)]
         {
@@ -6842,17 +14395,30 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
             } else {
                 0
             };
-            // Also read [rsp-8] to see what's below
+            // Also read [rsp-8] to see what's below and a couple of higher return
+            // addresses to recover the path above the immediate syscall site.
             let below_rsp = if ctx.regs.rsp >= 8 {
                 unsafe { core::ptr::read_unaligned((ctx.regs.rsp - 8) as *const u64) }
             } else {
                 0
             };
+            let parent_ret = if ctx.regs.rsp != 0 {
+                unsafe { core::ptr::read_unaligned((ctx.regs.rsp + 0x30) as *const u64) }
+            } else {
+                0
+            };
+            let grandparent_ret = if ctx.regs.rsp != 0 {
+                unsafe { core::ptr::read_unaligned((ctx.regs.rsp + 0x58) as *const u64) }
+            } else {
+                0
+            };
             let msg = alloc::format!(
-                "NT shim: syscall nr=0x{:04X} rip=0x{:X} caller=0x{:X} r10=0x{:X} rdx=0x{:X} rsp=0x{:X} [rsp-8]=0x{:X}\n",
+                "NT shim: syscall nr=0x{:04X} rip=0x{:X} caller=0x{:X} parent=0x{:X} grandparent=0x{:X} r10=0x{:X} rdx=0x{:X} rsp=0x{:X} [rsp-8]=0x{:X}\n",
                 nr,
                 ctx.regs.rip,
                 caller_ret,
+                parent_ret,
+                grandparent_ret,
                 ctx.regs.r10,
                 ctx.regs.rdx,
                 ctx.regs.rsp,
@@ -6869,7 +14435,48 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
             0
         };
 
-        let (status, terminate) = self.dispatch_syscall(ctx);
+        // If another thread called NtTerminateProcess, terminate this child
+        // thread immediately. The main thread must keep running to perform
+        // LdrShutdownProcess and the Phase 2 NtTerminateProcess(0).
+        if self.thread_id != self.shared.main_thread_id
+            && self
+                .shared
+                .process_exit_requested
+                .load(core::sync::atomic::Ordering::Acquire)
+        {
+            let clean_code = self
+                .shared
+                .process_exit_code
+                .load(core::sync::atomic::Ordering::Acquire);
+            {
+                #[cfg(feature = "trace_debug")]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "[shim-exit] process_exit_requested check fired: tid={} nr=0x{:X} clean_code=0x{:X}\n",
+                        self.thread_id, nr, clean_code as u32
+                    ));
+                }
+            }
+            self.mark_current_thread_exited(clean_code);
+            ctx.regs.rax = 0;
+            return ContinueOperation::Terminate;
+        }
+
+        self.trace(
+            TraceKind::SyscallEntry,
+            nr,
+            ctx.regs.r10,
+            ctx.regs.rdx,
+            ctx.regs.r8,
+        );
+        let (mut status, mut terminate) = self.dispatch_syscall(ctx);
+        if let Some(ref obj) = self.thread_obj
+            && obj.debug_stage() == 0
+        {
+            obj.set_debug_stage(0xD001);
+        }
+        self.trace(TraceKind::SyscallExit, nr, status.0 as usize, 0, 0);
 
         // Verify [rsp] hasn't changed after dispatch
         #[cfg(debug_assertions)]
@@ -6888,21 +14495,88 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
             }
         }
 
-        // Kernel32 functions in the 0x1000+ range return values in rax
-        // directly (the dispatch handler sets rax). NT syscalls return
+        // APC delivery: if the syscall returned STATUS_USER_APC (0xC0),
+        // drain the thread's pending APCs and begin executing them in the
+        // guest context.  This replaces the current ctx with the first APC
+        // routine call frame; subsequent APCs are chained via
+        // handle_apc_return().
+        let mut apc_delivery_active = false;
+        if status.0 as u32 == 0xC0 && nr != litebox_common_windows::ntdll_rewriter::APC_RETURN_MARKER {
+            if let Some(ref t) = self.thread_obj {
+                let apcs = t.drain_pending_user_apcs();
+                if !apcs.is_empty() {
+                    let (s, t) = self.begin_apc_delivery(ctx, apcs, status);
+                    status = s;
+                    terminate = t;
+                    apc_delivery_active = true;
+                }
+            }
+        }
+        // Also check if dispatch_syscall handled an APC return that started
+        // a new delivery (handle_apc_return dispatching next APC).
+        if !apc_delivery_active {
+            // Safety: per-thread, single-threaded access.
+            apc_delivery_active = unsafe { (*self.pending_apc_state.get()).is_some() };
+        }
+
+        // Non-NT entries in the 0x1000+ range return values in rax directly
+        // (the dispatch handler sets rax). NT syscalls return
         // NTSTATUS in rax.
         // Special case: NtContinue restores the full context including rax,
         // so we must not overwrite it.
-        let is_kernel32 = nr >= 0x1000;
+        let is_non_nt_direct_return = nr >= 0x1000;
         let syscall_id = self.shared.syscall_map.get().and_then(|m| m.lookup(nr));
+
+        #[cfg(debug_assertions)]
+        if status.0 as u32 == 0xC000_00FF {
+            use litebox::platform::{StdioOutStream, StdioProvider as _};
+            let _ = litebox_platform_multiplex::platform().write_to(
+                StdioOutStream::Stderr,
+                alloc::format!(
+                    "[mystery-status] nr=0x{nr:04X} id={syscall_id:?} status=0x{:08X} rip=0x{:X} rsp=0x{:X}\n",
+                    status.0 as u32,
+                    ctx.regs.rip,
+                    ctx.regs.rsp,
+                )
+                .as_bytes(),
+            );
+        }
+
         let is_context_switch = syscall_id == Some(NtSyscallId::NtContinue)
-            || syscall_id == Some(NtSyscallId::NtContinueEx);
-        if !is_kernel32 && !is_context_switch {
+            || syscall_id == Some(NtSyscallId::NtContinueEx)
+            || apc_delivery_active;
+        if !is_non_nt_direct_return && !is_context_switch {
             ctx.regs.rax = status.0 as u32 as usize;
         }
 
         if terminate {
             return ContinueOperation::Terminate;
+        }
+
+        // Post-dispatch: if process exit was requested while we were
+        // inside dispatch_syscall (i.e. another thread set
+        // process_exit_requested while this thread was RUNNING_IN_HOST),
+        // terminate now instead of returning to guest code where the
+        // thread might get stuck in an infinite loop (e.g. corrupted
+        // FLS / onexit table).
+        if self
+            .shared
+            .process_exit_requested
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            let clean_code = self
+                .shared
+                .process_exit_code
+                .load(core::sync::atomic::Ordering::Acquire);
+            self.mark_current_thread_exited(clean_code);
+            ctx.regs.rax = 0;
+            return ContinueOperation::Terminate;
+        }
+
+        if let Some(ref obj) = self.thread_obj
+            && obj.debug_stage() == 0xD001
+        {
+            obj.set_debug_stage(0xD002);
         }
 
         #[cfg(debug_assertions)]
@@ -6916,8 +14590,13 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                 ctx.regs.rcx
             ));
         }
+        if let Some(ref obj) = self.thread_obj
+            && obj.debug_stage() == 0xD002
+        {
+            obj.set_debug_stage(0xD003);
+        }
 
-        ContinueOperation::Resume
+        self.resume_guest(ctx)
     }
 
     fn exception(
@@ -6925,15 +14604,56 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
         ctx: &mut Self::ExecutionContext,
         info: &ExceptionInfo,
     ) -> ContinueOperation {
-        // Entry-point trace for every exception the shim sees.
-        #[cfg(debug_assertions)]
+        self.enter_from_guest();
+
+        // Unconditional exception trace — always fires regardless of build config.
         {
             use litebox::platform::DebugLogProvider as _;
             litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                "NT shim: exception() ENTRY: exc={:?} rip=0x{:X} rsp=0x{:X} cr2=0x{:X} err=0x{:X}\n",
-                info.exception, ctx.regs.rip, ctx.regs.rsp, info.cr2, info.error_code,
+                "[EXCEPTION] tid={} exc={:?} rip=0x{:X} rsp=0x{:X} cr2=0x{:X} err=0x{:X}\n",
+                self.thread_id,
+                info.exception,
+                ctx.regs.rip,
+                ctx.regs.rsp,
+                info.cr2,
+                info.error_code,
             ));
+        }
 
+        // Diagnostic: log exceptions on the main thread during exit
+        // path to detect page-fault loops on freed TEB/stack memory.
+        #[cfg(feature = "trace_debug")]
+        if self.thread_id == crate::peb_teb::SYNTHETIC_MAIN_THREAD_ID {
+            use core::sync::atomic::Ordering;
+            static EXIT_EXC_COUNT: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let n = EXIT_EXC_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < 5 || (n < 100 && n.is_multiple_of(20)) {
+                use litebox::platform::DebugLogProvider as _;
+                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                    "[shim-exit] main-thread exception #{}: exc={:?} rip=0x{:X} rsp=0x{:X} cr2=0x{:X}\n",
+                    n, info.exception, ctx.regs.rip, ctx.regs.rsp, info.cr2,
+                ));
+            }
+        }
+
+        // Entry-point trace for every exception the shim sees.
+        #[cfg(feature = "trace_debug")]
+        {
+            use litebox::platform::DebugLogProvider as _;
+            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                "[tid={}] NT shim: exception() exc={:?} rip=0x{:X} rsp=0x{:X} cr2=0x{:X}\n",
+                self.thread_id,
+                info.exception,
+                ctx.regs.rip,
+                ctx.regs.rsp,
+                info.cr2,
+            ));
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            use litebox::platform::DebugLogProvider as _;
             if let Some(init) = self.init_state.as_ref()
                 && let Some(ntdll_base) = init
                     .module_bases
@@ -6989,7 +14709,7 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
         // the sentinel). We verify both RIP and RSP to distinguish a legitimate
         // return from an accidental indirect call/jump to the sentinel address.
         if ctx.regs.rip == syscalls::thread::THREAD_EXIT_SENTINEL
-            && self.thread_obj.is_some()
+            && self.thread_id != crate::peb_teb::SYNTHETIC_MAIN_THREAD_ID
             && self
                 .init_state
                 .as_ref()
@@ -7006,6 +14726,9 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
         // from our __fastfail rewrites (if we switch back to CC).  Log
         // and terminate the guest with STATUS_BREAKPOINT.
         if info.exception == litebox::shim::Exception::BREAKPOINT {
+            if self.try_handle_guest_gs_breakpoint_probe(ctx) {
+                return self.resume_guest(ctx);
+            }
             #[cfg(debug_assertions)]
             {
                 use litebox::platform::DebugLogProvider as _;
@@ -7027,11 +14750,321 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                     ret0,
                     ret1,
                 ));
+
+                let current_teb_va = self
+                    .thread_obj
+                    .as_ref()
+                    .map(|thread| thread.teb_va())
+                    .filter(|teb| *teb != 0)
+                    .or_else(|| self.init_state.as_ref().map(|init| init.teb_va))
+                    .unwrap_or(0);
+                if current_teb_va != 0 {
+                    if let Some(init) = self.init_state.as_ref() {
+                        unsafe {
+                            let tls_ptr_array =
+                                core::ptr::read((current_teb_va + 0x58) as *const u64);
+                            let platform_guest_teb =
+                                litebox_platform_windows_userland::WindowsUserland::current_guest_teb_base();
+                            litebox_platform_multiplex::platform().debug_log_print(
+                                &alloc::format!(
+                                    "  BREAKPOINT TLS diag: TEB=0x{:X} TEB+0x58 (TlsArrayPtr)=0x{:X} init_teb=0x{:X} platform_guest_teb=0x{:X}\n",
+                                    current_teb_va,
+                                    tls_ptr_array,
+                                    init.teb_va,
+                                    platform_guest_teb,
+                                ),
+                            );
+
+                            if let Some(node_mod) = init
+                                .module_bases
+                                .iter()
+                                .find(|m| m.name.eq_ignore_ascii_case("node.exe"))
+                            {
+                                const V8_ALLOW_HEAP_TLS_INDEX_OFFSET: usize = 0x58A85D8;
+                                let tls_index_va =
+                                    node_mod.base_address + V8_ALLOW_HEAP_TLS_INDEX_OFFSET;
+                                if is_addr_committed(tls_index_va)
+                                    && is_addr_committed(tls_index_va + 3)
+                                {
+                                    let tls_index =
+                                        core::ptr::read(tls_index_va as *const u32) as usize;
+                                    litebox_platform_multiplex::platform().debug_log_print(
+                                        &alloc::format!(
+                                            "  V8 AllowHeap TLS index: {} (va=0x{:X})\n",
+                                            tls_index,
+                                            tls_index_va,
+                                        ),
+                                    );
+                                    if tls_ptr_array != 0 {
+                                        let slot_va = tls_ptr_array as usize + tls_index * 8;
+                                        if is_addr_committed(slot_va)
+                                            && is_addr_committed(slot_va + 7)
+                                        {
+                                            let slot_ptr =
+                                                core::ptr::read(slot_va as *const u64) as usize;
+                                            litebox_platform_multiplex::platform()
+                                                .debug_log_print(&alloc::format!(
+                                                    "  V8 AllowHeap TLS slot[{}] @ 0x{:X} -> 0x{:X}\n",
+                                                    tls_index,
+                                                    slot_va,
+                                                    slot_ptr,
+                                                ));
+                                            if slot_ptr >= 0x10000
+                                                && is_addr_committed(slot_ptr)
+                                                && is_addr_committed(slot_ptr + 0xE8)
+                                            {
+                                                let per_thread_ptr =
+                                                    if is_addr_committed(slot_ptr + 0xDF) {
+                                                        core::ptr::read(
+                                                            (slot_ptr + 0xD8) as *const usize,
+                                                        )
+                                                    } else {
+                                                        0
+                                                    };
+                                                let slot_isolate =
+                                                    if is_addr_committed(slot_ptr + 0xE7) {
+                                                        core::ptr::read(
+                                                            (slot_ptr + 0xE0) as *const usize,
+                                                        )
+                                                    } else {
+                                                        0
+                                                    };
+                                                let entry_stack = if slot_isolate >= 0x10000
+                                                    && is_addr_committed(slot_isolate + 0xFB8F)
+                                                {
+                                                    core::ptr::read(
+                                                        (slot_isolate + 0xFB88) as *const usize,
+                                                    )
+                                                } else {
+                                                    0
+                                                };
+                                                let isolate_scope_head = if slot_isolate >= 0x10000
+                                                    && is_addr_committed(slot_isolate + 0x237)
+                                                {
+                                                    core::ptr::read(
+                                                        (slot_isolate + 0x230) as *const usize,
+                                                    )
+                                                } else {
+                                                    0
+                                                };
+                                                let isolate_scope_limit = if slot_isolate >= 0x10000
+                                                    && is_addr_committed(slot_isolate + 0x23F)
+                                                {
+                                                    core::ptr::read(
+                                                        (slot_isolate + 0x238) as *const usize,
+                                                    )
+                                                } else {
+                                                    0
+                                                };
+                                                let isolate_scope_depth = if slot_isolate >= 0x10000
+                                                    && is_addr_committed(slot_isolate + 0x243)
+                                                {
+                                                    core::ptr::read(
+                                                        (slot_isolate + 0x240) as *const u32,
+                                                    )
+                                                } else {
+                                                    0
+                                                };
+                                                let allow_heap_depth = if slot_isolate >= 0x10000
+                                                    && is_addr_committed(slot_isolate + 0xF09F)
+                                                {
+                                                    core::ptr::read(
+                                                        (slot_isolate + 0xF098) as *const usize,
+                                                    )
+                                                } else {
+                                                    0
+                                                };
+                                                let allow_heap_flag_a = if slot_isolate >= 0x10000
+                                                    && is_addr_committed(slot_isolate + 0x10EF9)
+                                                {
+                                                    core::ptr::read(
+                                                        (slot_isolate + 0x10EF9) as *const u8,
+                                                    )
+                                                } else {
+                                                    0
+                                                };
+                                                let allow_heap_flag_b = if slot_isolate >= 0x10000
+                                                    && is_addr_committed(slot_isolate + 0x10EFA)
+                                                {
+                                                    core::ptr::read(
+                                                        (slot_isolate + 0x10EFA) as *const u8,
+                                                    )
+                                                } else {
+                                                    0
+                                                };
+                                                let state_byte =
+                                                    core::ptr::read((slot_ptr + 0xE8) as *const u8);
+                                                litebox_platform_multiplex::platform()
+                                                    .debug_log_print(&alloc::format!(
+                                                        "  V8 AllowHeap TLS slot+0xD8=0x{:X} slot+0xE0=0x{:X} isolate+0x230=0x{:X} isolate+0x238=0x{:X} isolate+0x240={} isolate+0xF098=0x{:X} isolate+0xFB88=0x{:X} isolate+0x10EF9=0x{:02X} isolate+0x10EFA=0x{:02X} state@+0xE8=0x{:02X}\n",
+                                                        per_thread_ptr,
+                                                        slot_isolate,
+                                                        isolate_scope_head,
+                                                        isolate_scope_limit,
+                                                        isolate_scope_depth,
+                                                        allow_heap_depth,
+                                                        entry_stack,
+                                                        allow_heap_flag_a,
+                                                        allow_heap_flag_b,
+                                                        state_byte,
+                                                    ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let module_bases = self.current_module_bases();
+                if !module_bases.is_empty() && ctx.regs.rsp >= 0x10000 {
+                    let describe_module = |addr: usize| {
+                        module_bases
+                            .iter()
+                            .find(|m| {
+                                addr >= m.base_address
+                                    && addr < m.base_address.saturating_add(m.image_size)
+                            })
+                            .map(|m| {
+                                alloc::format!(
+                                    "{}+0x{:X}",
+                                    m.name,
+                                    addr.saturating_sub(m.base_address)
+                                )
+                            })
+                            .unwrap_or_else(|| alloc::format!("0x{addr:X}"))
+                    };
+                    let mut guest_stack =
+                        alloc::string::String::from("  BREAKPOINT guest stack scan:\n");
+                    let mut found_frames = 0usize;
+                    for i in 0..64usize {
+                        let slot_va = ctx.regs.rsp as usize + i * 8;
+                        if !is_addr_committed(slot_va) || !is_addr_committed(slot_va + 7) {
+                            continue;
+                        }
+                        let ret = unsafe { core::ptr::read(slot_va as *const usize) };
+                        let in_module = module_bases.iter().any(|m| {
+                            ret >= m.base_address
+                                && ret < m.base_address.saturating_add(m.image_size)
+                        });
+                        if in_module {
+                            found_frames += 1;
+                            guest_stack.push_str(&alloc::format!(
+                                "    [rsp+0x{:03X}] = {}\n",
+                                i * 8,
+                                describe_module(ret),
+                            ));
+                        }
+                    }
+                    if found_frames != 0 {
+                        litebox_platform_multiplex::platform().debug_log_print(&guest_stack);
+                    }
+                }
+
+                let dispatch_stub_va = self
+                    .shared
+                    .process_state
+                    .rtl_raise_exception_dispatch_stub_va();
+                if dispatch_stub_va != 0
+                    && (ctx.regs.rip == dispatch_stub_va + 71
+                        || ctx.regs.rip == dispatch_stub_va + 70)
+                    && ctx.regs.rcx >= 0x10000
+                    && ctx.regs.rdx >= 0x10000
+                    && is_addr_committed(ctx.regs.rcx + 0x20)
+                    && is_addr_committed(ctx.regs.rdx + 0xF8)
+                {
+                    unsafe {
+                        let exc_code = core::ptr::read(ctx.regs.rcx as *const u32);
+                        let exc_flags = core::ptr::read((ctx.regs.rcx + 0x04) as *const u32);
+                        let exc_record = core::ptr::read((ctx.regs.rcx + 0x08) as *const u64);
+                        let exc_addr = core::ptr::read((ctx.regs.rcx + 0x10) as *const u64);
+                        let num_params = core::ptr::read((ctx.regs.rcx + 0x18) as *const u32);
+                        let ctx_rip = core::ptr::read((ctx.regs.rdx + 0xF8) as *const u64);
+                        let ctx_rsp = core::ptr::read((ctx.regs.rdx + 0x98) as *const u64);
+                        let ctx_rax = core::ptr::read((ctx.regs.rdx + 0x78) as *const u64);
+                        let ctx_rbx = core::ptr::read((ctx.regs.rdx + 0x90) as *const u64);
+                        let ctx_rcx = core::ptr::read((ctx.regs.rdx + 0x80) as *const u64);
+                        let ctx_rdx = core::ptr::read((ctx.regs.rdx + 0x88) as *const u64);
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "  RaiseException dispatch-stub unhandled probe: EXR(code=0x{:X} flags=0x{:X} nested=0x{:X} addr=0x{:X} params={}) CTX(rip=0x{:X} rsp=0x{:X} rax=0x{:X} rbx=0x{:X} rcx=0x{:X} rdx=0x{:X})\n",
+                            exc_code,
+                            exc_flags,
+                            exc_record,
+                            exc_addr,
+                            num_params,
+                            ctx_rip,
+                            ctx_rsp,
+                            ctx_rax,
+                            ctx_rbx,
+                            ctx_rcx,
+                            ctx_rdx,
+                        ));
+                        for i in 0..core::cmp::min(num_params as usize, 4) {
+                            let param =
+                                core::ptr::read((ctx.regs.rcx + 0x20 + i * 8) as *const u64);
+                            litebox_platform_multiplex::platform().debug_log_print(
+                                &alloc::format!("    EXR.param[{i}] = 0x{:X}\n", param),
+                            );
+                        }
+                        if exc_code == 0xC000_0374 {
+                            push_recent_chain_event(
+                                &self.shared.recent_chain_events,
+                                alloc::format!(
+                                    "heapcorr:{}:0x{:X}:0x{:X}",
+                                    self.thread_id,
+                                    ctx_rip,
+                                    exc_addr
+                                ),
+                            );
+                            if let Some(ref obj) = self.thread_obj {
+                                obj.set_debug_stage(0xC3740001);
+                                obj.set_last_guest_context(ctx_rip as usize, ctx_rsp as usize);
+                            }
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "  HEAP_CORRUPTION tid={} rip=0x{:X} rsp=0x{:X} exc_addr=0x{:X} params={}\n",
+                                self.thread_id, ctx_rip, ctx_rsp, exc_addr, num_params,
+                            ));
+                        }
+                    }
+                }
             }
-            self.exit_code.store(
-                NtStatus::STATUS_BREAKPOINT.0 as i32,
-                core::sync::atomic::Ordering::Release,
-            );
+            // Preserve the guest's clean exit code when V8 crashes during
+            // shutdown (e.g. AllowHeapAllocationInRelease assertion after
+            // process.exit).  Check both the per-thread flag (same thread
+            // called NtTerminateProcess) and the process-wide flag (another
+            // thread already requested termination).  Only override with
+            // STATUS_BREAKPOINT when no explicit exit was requested anywhere.
+            let thread_exit = self
+                .exit_requested
+                .load(core::sync::atomic::Ordering::Acquire);
+            let process_exit = self
+                .shared
+                .process_exit_requested
+                .load(core::sync::atomic::Ordering::Acquire);
+            #[cfg(all(debug_assertions, feature = "trace_debug"))]
+            {
+                use litebox::platform::DebugLogProvider as _;
+                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                    "  BREAKPOINT exit flags: tid={} thread_exit={} thread_code=0x{:X} process_exit={} process_code=0x{:X}\n",
+                    self.thread_id,
+                    thread_exit,
+                    self.exit_code.load(core::sync::atomic::Ordering::Acquire),
+                    process_exit,
+                    self.shared.process_exit_code.load(core::sync::atomic::Ordering::Acquire),
+                ));
+            }
+            if !thread_exit && !process_exit {
+                self.mark_current_thread_exited(NtStatus::STATUS_BREAKPOINT.0 as i32);
+            } else if !thread_exit {
+                // Another thread requested exit — propagate the process-wide
+                // exit code to this thread so the runner picks it up.
+                let code = self
+                    .shared
+                    .process_exit_code
+                    .load(core::sync::atomic::Ordering::Acquire);
+                self.mark_current_thread_exited(code);
+            }
             return ContinueOperation::Terminate;
         }
 
@@ -7043,6 +15076,7 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
         // demand-commit it here by upgrading the faulting page to read-write.
         if info.exception == litebox::shim::Exception::PAGE_FAULT {
             let fault_addr = info.cr2 & !(PAGE_SIZE - 1);
+            let is_not_present_fault = (info.error_code & 1) == 0;
 
             #[cfg(debug_assertions)]
             {
@@ -7107,35 +15141,131 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                 }
             }
 
-            // First: check if this is a PM-backed inaccessible page.
-            // This handles demand-commit for pages created via small
-            // MEM_RESERVE|MEM_COMMIT (PM placeholder pages) and stack growth.
-            // NOTE: this also auto-commits pure MEM_RESERVE pages on touch,
-            // which differs from real Windows (should fault).  In practice
-            // small MEM_RESERVE is always followed by MEM_COMMIT before
-            // access, so this is safe for current guests.  A proper fix
-            // would track PM-level commit state separately.
-            if let (Some(addr), Some(page_size)) = (
-                litebox::mm::linux::NonZeroAddress::<PAGE_SIZE>::new(fault_addr),
-                litebox::mm::linux::NonZeroPageSize::<PAGE_SIZE>::new(PAGE_SIZE),
-            ) && let Some(perms) = self
-                .shared
-                .process_state
-                .pm
-                .get_memory_permissions(addr, page_size)
-                && perms.is_empty()
-            {
-                use litebox::platform::{RawConstPointer as _, RawPointerProvider};
-                let ptr =
-                    <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(fault_addr);
-                if unsafe {
-                    self.shared
-                        .process_state
-                        .pm
-                        .make_pages_writable(ptr, PAGE_SIZE)
+            enum FaultPageAction {
+                None,
+                Resume,
+                Guard(u32),
+                DemandCommit(u32),
+            }
+
+            // First: check if this is an existing PM-backed page that is currently
+            // inaccessible. Use a single with_memory() transaction so guard /
+            // committed state and PM permissions cannot race each other.
+            let pm_fault_action = self.shared.process_state.with_memory(|vmem, mem| {
+                let Some(page_end) = fault_addr.checked_add(PAGE_SIZE) else {
+                    return FaultPageAction::None;
+                };
+                let Some(page_range) =
+                    litebox::mm::linux::PageRange::<PAGE_SIZE>::new(fault_addr, page_end)
+                else {
+                    return FaultPageAction::None;
+                };
+                let Some(perms) = vmem.get_memory_permissions(page_range) else {
+                    return FaultPageAction::None;
+                };
+                if !perms.is_empty() {
+                    // Page is already accessible. Another thread may have
+                    // committed/unguarded this page between the CPU fault and
+                    // now (is_page_committed TOCTOU via VirtualQuery).
+                    // Resume unless the access genuinely violates permissions.
+                    let is_write = (info.error_code & 2) != 0;
+                    let is_exec = (info.error_code & 0x10) != 0;
+                    let read_ok =
+                        perms.contains(litebox::platform::page_mgmt::MemoryRegionPermissions::READ);
+                    let write_ok = perms
+                        .contains(litebox::platform::page_mgmt::MemoryRegionPermissions::WRITE);
+                    let exec_ok =
+                        perms.contains(litebox::platform::page_mgmt::MemoryRegionPermissions::EXEC);
+                    let access_ok = if is_exec {
+                        exec_ok
+                    } else if is_write {
+                        write_ok
+                    } else {
+                        read_ok
+                    };
+                    return if access_ok {
+                        FaultPageAction::Resume
+                    } else {
+                        FaultPageAction::None
+                    };
                 }
-                .is_ok()
-                {
+
+                let nt_protect_to_perms = |protect: u32| {
+                    match crate::syscalls::memory::nt_protect_to_page_op_pub(protect) {
+                        crate::syscalls::memory::PageOp::ReadWrite
+                        | crate::syscalls::memory::PageOp::WriteCopy => {
+                            litebox::platform::page_mgmt::MemoryRegionPermissions::READ
+                                | litebox::platform::page_mgmt::MemoryRegionPermissions::WRITE
+                        }
+                        crate::syscalls::memory::PageOp::ReadOnly => {
+                            litebox::platform::page_mgmt::MemoryRegionPermissions::READ
+                        }
+                        crate::syscalls::memory::PageOp::Execute
+                        | crate::syscalls::memory::PageOp::ExecuteRead => {
+                            litebox::platform::page_mgmt::MemoryRegionPermissions::READ
+                                | litebox::platform::page_mgmt::MemoryRegionPermissions::EXEC
+                        }
+                        crate::syscalls::memory::PageOp::ExecuteReadWrite => {
+                            litebox::platform::page_mgmt::MemoryRegionPermissions::READ
+                                | litebox::platform::page_mgmt::MemoryRegionPermissions::WRITE
+                                | litebox::platform::page_mgmt::MemoryRegionPermissions::EXEC
+                        }
+                        crate::syscalls::memory::PageOp::NoAccess => {
+                            litebox::platform::page_mgmt::MemoryRegionPermissions::empty()
+                        }
+                    }
+                };
+
+                if let Some(base_protect) = mem.take_guard_page(fault_addr) {
+                    let new_perms = nt_protect_to_perms(base_protect);
+                    if unsafe { vmem.protect_mapping(page_range, new_perms) }.is_ok() {
+                        if mem
+                            .va_reservation_contains_range(fault_addr, PAGE_SIZE)
+                            .is_some()
+                        {
+                            mem.va_commit(fault_addr, PAGE_SIZE, base_protect);
+                        }
+                        FaultPageAction::Guard(base_protect)
+                    } else {
+                        mem.guard_pages
+                            .insert(fault_addr & !(PAGE_SIZE - 1), base_protect);
+                        FaultPageAction::None
+                    }
+                } else if mem.va_reservation_at(fault_addr).is_some() {
+                    if let Some(nt_prot) = mem.va_committed_protect(fault_addr) {
+                        let new_perms = nt_protect_to_perms(nt_prot);
+                        if new_perms.is_empty() {
+                            FaultPageAction::None
+                        } else if unsafe { vmem.protect_mapping(page_range, new_perms) }.is_ok() {
+                            FaultPageAction::DemandCommit(nt_prot)
+                        } else {
+                            FaultPageAction::None
+                        }
+                    } else {
+                        FaultPageAction::None
+                    }
+                } else {
+                    FaultPageAction::None
+                }
+            });
+            match pm_fault_action {
+                FaultPageAction::Guard(base_protect) => {
+                    self.trace(
+                        TraceKind::GuardPageFault,
+                        base_protect as u32,
+                        fault_addr,
+                        0,
+                        0,
+                    );
+                    self.last_guard_page_fault
+                        .store(true, core::sync::atomic::Ordering::Release);
+                    // Skip demand-commit — let fault propagate to SEH.
+                }
+                FaultPageAction::Resume => {
+                    return self.resume_guest(ctx);
+                }
+                FaultPageAction::DemandCommit(_nt_prot) => {
+                    self.trace(TraceKind::DemandCommit, 0, fault_addr, ctx.regs.rip, 0);
                     #[cfg(debug_assertions)]
                     {
                         use litebox::platform::DebugLogProvider as _;
@@ -7150,7 +15280,11 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                         if ctx.regs.rax == 0x905A4D {
                             let teb_base = self.init_state.as_ref().map_or(0, |s| s.teb_va);
                             let tls_ptr_addr = teb_base + 0x58;
-                            let tls_ptr = unsafe { core::ptr::read(tls_ptr_addr as *const u64) };
+                            let tls_ptr = if crate::is_addr_committed(tls_ptr_addr as usize) {
+                                unsafe { core::ptr::read(tls_ptr_addr as *const u64) }
+                            } else {
+                                0
+                            };
                             litebox_platform_multiplex::platform().debug_log_print(
                                 &alloc::format!(
                                     "  TLS DIAG: TEB=0x{:X} ThreadLocalStoragePointer=0x{:X}\n",
@@ -7161,8 +15295,11 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                             if tls_ptr != 0 {
                                 // Dump first 16 TLS slots
                                 for i in 0..16u64 {
-                                    let slot =
-                                        unsafe { core::ptr::read((tls_ptr + i * 8) as *const u64) };
+                                    let addr = (tls_ptr + i * 8) as usize;
+                                    if !crate::is_addr_committed(addr) {
+                                        break;
+                                    }
+                                    let slot = unsafe { core::ptr::read(addr as *const u64) };
                                     if slot != 0 {
                                         litebox_platform_multiplex::platform().debug_log_print(
                                             &alloc::format!("  TLS[{}] = 0x{:X}\n", i, slot,),
@@ -7227,11 +15364,23 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                             let imgs = self.shared.process_state.image_mappings.lock();
                             for (&base, &_sz) in imgs.iter() {
                                 // Read PE sig offset from DOS header
+                                if !crate::is_addr_committed(base + 0x3C) {
+                                    litebox_platform_multiplex::platform().debug_log_print(
+                                        &alloc::format!("  IMG 0x{base:X}  <unmapped>\n",),
+                                    );
+                                    continue;
+                                }
                                 let e_lfanew =
                                     unsafe { core::ptr::read((base as *const u32).byte_add(0x3C)) }
                                         as usize;
                                 let opt_hdr = base + e_lfanew + 0x18;
                                 // NumberOfRvaAndSizes at opt_hdr + 0x6C (PE32+)
+                                if !crate::is_addr_committed(opt_hdr + 0x6C) {
+                                    litebox_platform_multiplex::platform().debug_log_print(
+                                        &alloc::format!("  IMG 0x{base:X} opt_hdr  <unmapped>\n",),
+                                    );
+                                    continue;
+                                }
                                 let num_dd =
                                     unsafe { core::ptr::read((opt_hdr + 0x6C) as *const u32) };
                                 if num_dd <= 9 {
@@ -7239,6 +15388,12 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                                 }
                                 // Data Directory[9] (TLS) is at opt_hdr + 0x70 + 9*8
                                 let dd_tls = opt_hdr + 0x70 + 9 * 8;
+                                if !crate::is_addr_committed(dd_tls) {
+                                    litebox_platform_multiplex::platform().debug_log_print(
+                                        &alloc::format!("  IMG 0x{base:X} dd_tls  <unmapped>\n",),
+                                    );
+                                    continue;
+                                }
                                 let tls_rva =
                                     unsafe { core::ptr::read(dd_tls as *const u32) } as usize;
                                 let tls_size =
@@ -7248,6 +15403,12 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                                 }
                                 // Read TLS directory: AddressOfIndex at offset 0x10
                                 let tls_va = base + tls_rva;
+                                if !crate::is_addr_committed(tls_va + 0x10) {
+                                    litebox_platform_multiplex::platform().debug_log_print(
+                                        &alloc::format!("  IMG 0x{base:X} TLS dir  <unmapped>\n",),
+                                    );
+                                    continue;
+                                }
                                 let addr_of_index =
                                     unsafe { core::ptr::read((tls_va + 0x10) as *const u64) }
                                         as usize;
@@ -7271,105 +15432,138 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                             // Walk InLoadOrderModuleList to count modules
                             let peb_va = self.init_state.as_ref().map_or(0, |s| s.peb_va);
                             if peb_va != 0 {
-                                let ldr_ptr =
-                                    unsafe { core::ptr::read((peb_va + 0x18) as *const usize) };
+                                let ldr_ptr = if crate::is_addr_committed(peb_va + 0x18) {
+                                    unsafe { core::ptr::read((peb_va + 0x18) as *const usize) }
+                                } else {
+                                    litebox_platform_multiplex::platform()
+                                        .debug_log_print("  PEB.Ldr  <unmapped>\n");
+                                    0
+                                };
                                 if ldr_ptr != 0 {
                                     // InLoadOrderModuleList is at Ldr+0x10
                                     let list_head = ldr_ptr + 0x10;
-                                    let head_flink =
-                                        unsafe { core::ptr::read(list_head as *const usize) };
-                                    let head_blink =
-                                        unsafe { core::ptr::read((list_head + 8) as *const usize) };
-                                    litebox_platform_multiplex::platform().debug_log_print(
+                                    if !crate::is_addr_committed(list_head) {
+                                        litebox_platform_multiplex::platform()
+                                            .debug_log_print("  LDR list_head  <unmapped>\n");
+                                    } else {
+                                        let head_flink =
+                                            unsafe { core::ptr::read(list_head as *const usize) };
+                                        let head_blink = unsafe {
+                                            core::ptr::read((list_head + 8) as *const usize)
+                                        };
+                                        litebox_platform_multiplex::platform().debug_log_print(
                                         &alloc::format!(
                                             "  PEB.Ldr=0x{ldr_ptr:X} head=0x{list_head:X} \
                                              head.Flink=0x{head_flink:X} head.Blink=0x{head_blink:X}\n",
                                         ),
                                     );
-                                    let mut count = 0u32;
-                                    let mut cur = head_flink;
-                                    while cur != list_head && cur != 0 && count < 30 {
-                                        // Bail if cur is outside any plausible guest range
-                                        if cur < 0x10000 || cur > 0x7FFF_FFFF_FFFF {
-                                            litebox_platform_multiplex::platform().debug_log_print(
+                                        let mut count = 0u32;
+                                        let mut cur = head_flink;
+                                        while cur != list_head && cur != 0 && count < 30 {
+                                            // Bail if cur is outside any plausible guest range
+                                            if cur < 0x10000 || cur > 0x7FFF_FFFF_FFFF {
+                                                litebox_platform_multiplex::platform().debug_log_print(
                                                 &alloc::format!(
                                                     "  LDR[{count}] @0x{cur:X} — out of range, stopping\n",
                                                 ),
                                             );
-                                            break;
-                                        }
-                                        // DllBase is at offset 0x30, SizeOfImage at 0x40
-                                        let dll_base =
-                                            unsafe { core::ptr::read((cur + 0x30) as *const u64) };
-                                        let size =
-                                            unsafe { core::ptr::read((cur + 0x40) as *const u32) };
-                                        let flink = unsafe { core::ptr::read(cur as *const usize) };
-                                        litebox_platform_multiplex::platform().debug_log_print(
+                                                break;
+                                            }
+                                            if !crate::is_addr_committed(cur) {
+                                                litebox_platform_multiplex::platform()
+                                                    .debug_log_print(&alloc::format!(
+                                                        "  LDR[{count}] @0x{cur:X}  <unmapped>\n",
+                                                    ));
+                                                break;
+                                            }
+                                            // DllBase is at offset 0x30, SizeOfImage at 0x40
+                                            let dll_base = unsafe {
+                                                core::ptr::read((cur + 0x30) as *const u64)
+                                            };
+                                            let size = unsafe {
+                                                core::ptr::read((cur + 0x40) as *const u32)
+                                            };
+                                            let flink =
+                                                unsafe { core::ptr::read(cur as *const usize) };
+                                            litebox_platform_multiplex::platform().debug_log_print(
                                             &alloc::format!(
                                                 "  LDR[{}] @0x{:X} base=0x{:X} size=0x{:X} flink=0x{:X}\n",
                                                 count, cur, dll_base, size, flink,
                                             ),
                                         );
-                                        // Stop if data looks corrupt
-                                        if size > 0x1000_0000 || dll_base == 0 {
-                                            break;
+                                            // Stop if data looks corrupt
+                                            if size > 0x1000_0000 || dll_base == 0 {
+                                                break;
+                                            }
+                                            count += 1;
+                                            cur = flink;
                                         }
-                                        count += 1;
-                                        cur = flink;
-                                    }
-                                    litebox_platform_multiplex::platform().debug_log_print(
-                                        &alloc::format!(
-                                            "  LDR total={} head=0x{:X} final_cur=0x{:X}\n",
-                                            count,
-                                            list_head,
-                                            cur,
-                                        ),
-                                    );
-                                    // Walk the Blink chain (backwards) to see entries after corruption
-                                    litebox_platform_multiplex::platform()
-                                        .debug_log_print("  === BLINK walk (last→first) ===\n");
-                                    let mut bcur = head_blink;
-                                    let mut bcount = 0u32;
-                                    while bcur != list_head && bcur != 0 && bcount < 30 {
-                                        if bcur < 0x10000 || bcur > 0x7FFF_FFFF_FFFF {
-                                            litebox_platform_multiplex::platform().debug_log_print(
+                                        litebox_platform_multiplex::platform().debug_log_print(
+                                            &alloc::format!(
+                                                "  LDR total={} head=0x{:X} final_cur=0x{:X}\n",
+                                                count,
+                                                list_head,
+                                                cur,
+                                            ),
+                                        );
+                                        // Walk the Blink chain (backwards) to see entries after corruption
+                                        litebox_platform_multiplex::platform()
+                                            .debug_log_print("  === BLINK walk (last→first) ===\n");
+                                        let mut bcur = head_blink;
+                                        let mut bcount = 0u32;
+                                        while bcur != list_head && bcur != 0 && bcount < 30 {
+                                            if bcur < 0x10000 || bcur > 0x7FFF_FFFF_FFFF {
+                                                litebox_platform_multiplex::platform().debug_log_print(
                                                 &alloc::format!(
                                                     "  BLDR[{bcount}] @0x{bcur:X} — out of range, stopping\n",
                                                 ),
                                             );
-                                            break;
-                                        }
-                                        let dll_base =
-                                            unsafe { core::ptr::read((bcur + 0x30) as *const u64) };
-                                        let size =
-                                            unsafe { core::ptr::read((bcur + 0x40) as *const u32) };
-                                        let blink =
-                                            unsafe { core::ptr::read((bcur + 8) as *const usize) };
-                                        litebox_platform_multiplex::platform().debug_log_print(
+                                                break;
+                                            }
+                                            if !crate::is_addr_committed(bcur) {
+                                                litebox_platform_multiplex::platform().debug_log_print(
+                                                        &alloc::format!(
+                                                            "  BLDR[{bcount}] @0x{bcur:X}  <unmapped>\n",
+                                                        ),
+                                                    );
+                                                break;
+                                            }
+                                            let dll_base = unsafe {
+                                                core::ptr::read((bcur + 0x30) as *const u64)
+                                            };
+                                            let size = unsafe {
+                                                core::ptr::read((bcur + 0x40) as *const u32)
+                                            };
+                                            let blink = unsafe {
+                                                core::ptr::read((bcur + 8) as *const usize)
+                                            };
+                                            litebox_platform_multiplex::platform().debug_log_print(
                                             &alloc::format!(
                                                 "  BLDR[{}] @0x{:X} base=0x{:X} size=0x{:X} blink=0x{:X}\n",
                                                 bcount, bcur, dll_base, size, blink,
                                             ),
                                         );
-                                        if size > 0x1000_0000 || dll_base == 0 {
-                                            break;
+                                            if size > 0x1000_0000 || dll_base == 0 {
+                                                break;
+                                            }
+                                            bcount += 1;
+                                            bcur = blink;
                                         }
-                                        bcount += 1;
-                                        bcur = blink;
-                                    }
-                                    litebox_platform_multiplex::platform().debug_log_print(
-                                        &alloc::format!(
-                                            "  BLDR total={} final=0x{:X}\n",
-                                            bcount,
-                                            bcur,
-                                        ),
-                                    );
+                                        litebox_platform_multiplex::platform().debug_log_print(
+                                            &alloc::format!(
+                                                "  BLDR total={} final=0x{:X}\n",
+                                                bcount,
+                                                bcur,
+                                            ),
+                                        );
+                                    } // else: list_head is committed
                                 }
                             }
                         }
                     }
-                    return ContinueOperation::Resume;
+                    return self.resume_guest(ctx);
                 }
+                FaultPageAction::None => {}
             }
 
             // Second: check if this is inside a VA-only reservation.
@@ -7379,99 +15573,158 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
             if self
                 .shared
                 .process_state
-                .va_reservation_at(fault_addr)
-                .is_some()
+                .with_memory_read(|_vmem, mem| mem.va_reservation_at(fault_addr).is_some())
+                && !self
+                    .last_guard_page_fault
+                    .load(core::sync::atomic::Ordering::Acquire)
             {
-                // Look up the committed protection for this page.
-                if let Some(nt_prot) = self.shared.process_state.va_committed_protect(fault_addr) {
-                    use crate::syscalls::memory::{PageOp, nt_protect_to_page_op_pub};
-                    use litebox::mm::linux::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize};
-                    if let (Some(nz_addr), Some(nz_size)) = (
-                        NonZeroAddress::<PAGE_SIZE>::new(fault_addr),
-                        NonZeroPageSize::<PAGE_SIZE>::new(PAGE_SIZE),
-                    ) {
-                        let flags = CreatePagesFlags::FIXED_ADDR;
-                        let result = match nt_protect_to_page_op_pub(nt_prot) {
-                            PageOp::ReadWrite | PageOp::WriteCopy => unsafe {
-                                self.shared.process_state.pm.create_writable_pages(
-                                    Some(nz_addr),
-                                    nz_size,
-                                    flags,
-                                    |_| Ok(0),
-                                )
-                            },
-                            PageOp::ReadOnly => unsafe {
-                                self.shared.process_state.pm.create_readable_pages(
-                                    Some(nz_addr),
-                                    nz_size,
-                                    flags,
-                                    |_| Ok(0),
-                                )
-                            },
-                            PageOp::Execute | PageOp::ExecuteRead => unsafe {
-                                self.shared.process_state.pm.create_executable_pages(
-                                    Some(nz_addr),
-                                    nz_size,
-                                    flags,
-                                    |_| Ok(0),
-                                )
-                            },
-                            PageOp::ExecuteReadWrite => {
-                                // RWX: create as writable, then upgrade to RWX.
-                                let mut r = unsafe {
-                                    self.shared.process_state.pm.create_writable_pages(
-                                        Some(nz_addr),
-                                        nz_size,
-                                        flags,
-                                        |_| Ok(0),
-                                    )
-                                };
-                                if r.is_ok() {
-                                    use litebox::platform::{
-                                        RawConstPointer as _, RawPointerProvider,
-                                    };
-                                    let ptr =
-                                        <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(fault_addr);
-                                    if unsafe {
-                                        self.shared.process_state.pm.make_pages_rwx(ptr, PAGE_SIZE)
-                                    }
-                                    .is_err()
-                                    {
-                                        // RWX upgrade failed — remove the RW page
-                                        // to avoid leaving a non-executable page.
-                                        let _ = unsafe {
-                                            self.shared
-                                                .process_state
-                                                .pm
-                                                .remove_pages(ptr, PAGE_SIZE)
-                                        };
-                                        r = Err(litebox::mm::linux::MappingError::OutOfMemory);
-                                    }
-                                }
-                                r
-                            }
-                            PageOp::NoAccess => {
-                                // Committed with PAGE_NOACCESS: the page exists but
-                                // should fault.  Don't allocate — fall through.
-                                Err(litebox::mm::linux::MappingError::OutOfMemory)
-                            }
+                let reservation_fault_action =
+                    self.shared.process_state.with_memory(|vmem, mem| {
+                        let Some(page_end) = fault_addr.checked_add(PAGE_SIZE) else {
+                            return FaultPageAction::None;
                         };
-                        if result.is_ok() {
-                            #[cfg(debug_assertions)]
-                            {
-                                use litebox::platform::DebugLogProvider as _;
-                                litebox_platform_multiplex::platform().debug_log_print(
-                                    &alloc::format!(
-                                        "NT shim: demand-page at 0x{:X} prot=0x{:X} (rip=0x{:X})\n",
-                                        fault_addr,
-                                        nt_prot,
-                                        ctx.regs.rip,
-                                    ),
+                        if mem.va_reservation_at(fault_addr).is_none() {
+                            return FaultPageAction::None;
+                        }
+                        if let Some(page_range) =
+                            litebox::mm::linux::PageRange::<PAGE_SIZE>::new(fault_addr, page_end)
+                            && let Some(perms) = vmem.get_memory_permissions(page_range)
+                        {
+                            return if perms.is_empty() {
+                                FaultPageAction::None
+                            } else {
+                                // Page already accessible — another thread
+                                // resolved the fault. Check permissions.
+                                let is_write = (info.error_code & 2) != 0;
+                                let is_exec = (info.error_code & 0x10) != 0;
+                                let read_ok = perms.contains(
+                                    litebox::platform::page_mgmt::MemoryRegionPermissions::READ,
                                 );
-                            }
-                            return ContinueOperation::Resume;
+                                let write_ok = perms.contains(
+                                    litebox::platform::page_mgmt::MemoryRegionPermissions::WRITE,
+                                );
+                                let exec_ok = perms.contains(
+                                    litebox::platform::page_mgmt::MemoryRegionPermissions::EXEC,
+                                );
+                                let access_ok = if is_exec {
+                                    exec_ok
+                                } else if is_write {
+                                    write_ok
+                                } else {
+                                    read_ok
+                                };
+                                if access_ok {
+                                    FaultPageAction::Resume
+                                } else {
+                                    FaultPageAction::None
+                                }
+                            };
+                        }
+
+                        let nt_protect_to_perms = |protect: u32| {
+                            match crate::syscalls::memory::nt_protect_to_page_op_pub(protect) {
+                        crate::syscalls::memory::PageOp::ReadWrite
+                        | crate::syscalls::memory::PageOp::WriteCopy => {
+                            litebox::platform::page_mgmt::MemoryRegionPermissions::READ
+                                | litebox::platform::page_mgmt::MemoryRegionPermissions::WRITE
+                        }
+                        crate::syscalls::memory::PageOp::ReadOnly => {
+                            litebox::platform::page_mgmt::MemoryRegionPermissions::READ
+                        }
+                        crate::syscalls::memory::PageOp::Execute
+                        | crate::syscalls::memory::PageOp::ExecuteRead => {
+                            litebox::platform::page_mgmt::MemoryRegionPermissions::READ
+                                | litebox::platform::page_mgmt::MemoryRegionPermissions::EXEC
+                        }
+                        crate::syscalls::memory::PageOp::ExecuteReadWrite => {
+                            litebox::platform::page_mgmt::MemoryRegionPermissions::READ
+                                | litebox::platform::page_mgmt::MemoryRegionPermissions::WRITE
+                                | litebox::platform::page_mgmt::MemoryRegionPermissions::EXEC
+                        }
+                        crate::syscalls::memory::PageOp::NoAccess => {
+                            litebox::platform::page_mgmt::MemoryRegionPermissions::empty()
                         }
                     }
+                        };
+
+                        let create_fault_page =
+                            |vmem: &mut litebox::mm::linux::Vmem<Platform, PAGE_SIZE>,
+                             protect: u32| {
+                                let Some(nz_addr) =
+                                    litebox::mm::linux::NonZeroAddress::<PAGE_SIZE>::new(
+                                        fault_addr,
+                                    )
+                                else {
+                                    return false;
+                                };
+                                let Some(nz_size) =
+                                    litebox::mm::linux::NonZeroPageSize::<PAGE_SIZE>::new(
+                                        PAGE_SIZE,
+                                    )
+                                else {
+                                    return false;
+                                };
+                                let flags = litebox::mm::linux::CreatePagesFlags::FIXED_ADDR
+                                    | litebox::mm::linux::CreatePagesFlags::NOREPLACE;
+                                let perms = nt_protect_to_perms(protect);
+                                unsafe { vmem.create_pages(Some(nz_addr), nz_size, flags, perms) }
+                                    .is_ok()
+                            };
+
+                        if let Some(base_protect) = mem.take_guard_page(fault_addr) {
+                            if create_fault_page(vmem, base_protect) {
+                                mem.va_commit(fault_addr, PAGE_SIZE, base_protect);
+                                FaultPageAction::Guard(base_protect)
+                            } else {
+                                mem.guard_pages
+                                    .insert(fault_addr & !(PAGE_SIZE - 1), base_protect);
+                                FaultPageAction::None
+                            }
+                        } else if let Some(nt_prot) = mem.va_committed_protect(fault_addr) {
+                            let new_perms = nt_protect_to_perms(nt_prot);
+                            if new_perms.is_empty() {
+                                FaultPageAction::None
+                            } else if create_fault_page(vmem, nt_prot) {
+                                FaultPageAction::DemandCommit(nt_prot)
+                            } else {
+                                FaultPageAction::None
+                            }
+                        } else {
+                            FaultPageAction::None
+                        }
+                    });
+                match reservation_fault_action {
+                    FaultPageAction::Guard(base_protect) => {
+                        self.trace(
+                            TraceKind::GuardPageFault,
+                            base_protect as u32,
+                            fault_addr,
+                            0,
+                            0,
+                        );
+                        self.last_guard_page_fault
+                            .store(true, core::sync::atomic::Ordering::Release);
+                        // Skip demand-commit — let fault propagate to SEH.
+                    }
+                    FaultPageAction::Resume => {
+                        return self.resume_guest(ctx);
+                    }
+                    FaultPageAction::DemandCommit(nt_prot) => {
+                        #[cfg(debug_assertions)]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(
+                                &alloc::format!(
+                                    "NT shim: demand-page at 0x{:X} prot=0x{:X} (rip=0x{:X})\n",
+                                    fault_addr,
+                                    nt_prot,
+                                    ctx.regs.rip,
+                                ),
+                            );
+                        }
+                        return self.resume_guest(ctx);
+                    }
+                    FaultPageAction::None => {}
                 }
                 // Address is reserved but not committed — fall through to
                 // unhandled exception (crash), matching real Windows.
@@ -7501,12 +15754,25 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
         //   mov rcx, [rcx+0xF8]     ; PEB.pShimData → NULL
         //   cmp dword [rcx+disp32], 0  ; crash at 0 + disp32
         //
-        //   For non-zero low addresses, we can map a zero-filled read-only
-        //   page via PageManager. The DLL init code reads zeros ("not
-        //   initialized") and takes the appropriate fallback path.
+        //   For non-zero low addresses, we can map a zero-filled writable
+        //   host region that lets the guest observe zeros and lazily fill in
+        //   a synthetic fallback structure.
+        //
+        // Pattern C — NULL virtual call through a missing interface vtable:
+        //   mov rax, [rdi]          ; NULL
+        //   call qword ptr [rax+50h]
+        //   test al, al
+        //   je   fallback
+        //
+        //   When the base register is NULL, emulate the call as returning
+        //   false so the guest takes its fallback branch instead of raising
+        //   a fatal user-mode AV.
         if info.exception == litebox::shim::Exception::PAGE_FAULT
             && info.cr2 < 0x200000
             && (info.error_code & 2) == 0
+            && !self
+                .last_guard_page_fault
+                .load(core::sync::atomic::Ordering::Acquire)
         // read fault only (bit 1 = write)
         {
             if info.cr2 == 0 {
@@ -7529,7 +15795,31 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                         ctx.regs.rip += 3;
                         // ZF=1 (bit 6), clear SF/CF/OF/AF/PF
                         ctx.regs.eflags = (ctx.regs.eflags & !0x8D5) | 0x40;
-                        return ContinueOperation::Resume;
+                        self.trace(TraceKind::NullFixup, 0, rip, info.cr2, 0);
+                        return self.resume_guest(ctx);
+                    }
+                }
+            } else if info.cr2 < 0x10000 {
+                // Pattern C: `call qword ptr [rax+imm8]` with RAX==0.
+                let rip = ctx.regs.rip;
+                if ctx.regs.rax == 0 && is_addr_committed(rip) && is_addr_committed(rip + 2) {
+                    let b0 = unsafe { core::ptr::read(rip as *const u8) };
+                    let b1 = unsafe { core::ptr::read((rip + 1) as *const u8) };
+                    let b2 = unsafe { core::ptr::read((rip + 2) as *const u8) };
+                    // FF 50 xx = call qword ptr [rax + disp8]
+                    if b0 == 0xFF && b1 == 0x50 {
+                        #[cfg(debug_assertions)]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "NT shim: NULL fixup (pattern C) at rip=0x{:X}: call qword ptr [rax=0+0x{:02X}] → skip, return false\n",
+                                rip, b2,
+                            ));
+                        }
+                        ctx.regs.rip += 3;
+                        ctx.regs.rax = 0;
+                        self.trace(TraceKind::NullFixup, 0, rip, info.cr2, 0);
+                        return self.resume_guest(ctx);
                     }
                 }
             } else {
@@ -7542,7 +15832,11 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                 // For fault addresses in the first 64KB, we skip this and
                 // fall through to SEH forwarding.
                 let fault_page = info.cr2 & !(PAGE_SIZE - 1);
-                if fault_page >= 0x10000 {
+                const ALLOCATION_GRANULARITY: usize = 0x10000;
+                // MEM_RESERVE requires 64 KiB alignment on Windows, even if the
+                // actual faulting address is only page-aligned.
+                let reservation_base = info.cr2 & !(ALLOCATION_GRANULARITY - 1);
+                if reservation_base >= 0x10000 {
                     unsafe extern "system" {
                         fn VirtualAlloc(
                             address: usize,
@@ -7553,31 +15847,34 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                     }
                     const MEM_COMMIT: u32 = 0x1000;
                     const MEM_RESERVE: u32 = 0x2000;
-                    const PAGE_READONLY: u32 = 0x02;
-                    // Safety: VirtualAlloc is a host Win32 API; we ask for a
-                    // single read-only zero page at the faulting page address.
+                    const PAGE_READWRITE: u32 = 0x04;
+                    // Safety: VirtualAlloc is a host Win32 API; reserve+commit a
+                    // single 64 KiB zero-filled region that covers the low
+                    // faulting page so guest code can both observe zeros and
+                    // lazily initialize the synthetic structure in place.
                     let result = unsafe {
                         VirtualAlloc(
-                            fault_page,
-                            PAGE_SIZE,
+                            reservation_base,
+                            ALLOCATION_GRANULARITY,
                             MEM_COMMIT | MEM_RESERVE,
-                            PAGE_READONLY,
+                            PAGE_READWRITE,
                         )
                     };
-                    // VirtualAlloc must return the exact requested address.
+                    // VirtualAlloc must return the exact reservation base.
                     // If it returns a different address, that's a stray
                     // allocation — we can't use it (the fault page is still
                     // unmapped and the instruction would fault again).
-                    if result == fault_page {
+                    if result == reservation_base {
                         #[cfg(debug_assertions)]
                         {
                             use litebox::platform::DebugLogProvider as _;
                             litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                                "NT shim: NULL fixup (pattern B): host VirtualAlloc page at 0x{:X} for read at 0x{:X} (rip=0x{:X})\n",
-                                fault_page, info.cr2, ctx.regs.rip,
+                                "NT shim: NULL fixup (pattern B): host VirtualAlloc region at 0x{:X}+0x{:X} covering read at 0x{:X} (rip=0x{:X})\n",
+                                reservation_base, ALLOCATION_GRANULARITY, info.cr2, ctx.regs.rip,
                             ));
                         }
-                        return ContinueOperation::Resume;
+                        self.trace(TraceKind::NullFixup, 0, ctx.regs.rip, info.cr2, 0);
+                        return self.resume_guest(ctx);
                     }
                     // If we got a different address, free the stray allocation.
                     if result != 0 {
@@ -7612,8 +15909,9 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
         // exceptions terminate the process unnecessarily.
         //
         // Stack layout for KiUserExceptionDispatcher (x64):
-        //   [RSP+0x000]: CONTEXT          (0x4D0 bytes)
-        //   [RSP+0x4F0]: EXCEPTION_RECORD (0x98 bytes)
+        //   [RSP+0x000]: CONTEXT + CONTEXT_EX padding (legacy total 0x4F0)
+        //   [RSP+0x4F0]: EXCEPTION_RECORD              (0x98 bytes)
+        //   [RSP+0x590]: synthetic machine frame tail for UWOP_PUSH_MACHFRAME
         //
         // Guard: limit forwarding to MAX_SEH_FORWARDS per thread to prevent
         // infinite loops (e.g., if the SEH handler itself faults on the same
@@ -7629,8 +15927,17 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                 let rva = s.ki_user_exception_dispatcher_rva?;
                 Some(base + rva)
             });
+            let dispatch_stub_va = self
+                .shared
+                .process_state
+                .rtl_raise_exception_dispatch_stub_va();
+            let seh_target_va = if dispatch_stub_va != 0 {
+                Some(dispatch_stub_va)
+            } else {
+                dispatcher_va
+            };
 
-            if let Some(dispatcher_va) = dispatcher_va {
+            if let Some(seh_target_va) = seh_target_va {
                 let fwd_count = self.seh_forward_count.fetch_add(1, Ordering::Relaxed);
                 #[cfg(debug_assertions)]
                 {
@@ -7647,16 +15954,26 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                     ));
                 }
 
-                const CONTEXT_SIZE: usize = 0x4D0;
-                const EXCEPTION_RECORD_OFFSET: usize = 0x4F0;
-                const EXCEPTION_RECORD_SIZE: usize = 0x98;
-                const FRAME_SIZE: usize =
-                    (EXCEPTION_RECORD_OFFSET + EXCEPTION_RECORD_SIZE + 0xF) & !0xF;
+                let use_xstate_layout = dispatch_stub_va != 0;
+                let context_size = if use_xstate_layout {
+                    syscalls::k32_handlers::XSTATE_CONTEXT_SIZE_AMD64
+                } else {
+                    syscalls::k32_handlers::LEGACY_CONTEXT_SIZE_AMD64
+                };
+                let exception_record_offset = if use_xstate_layout {
+                    syscalls::k32_handlers::XSTATE_EXCEPTION_RECORD_OFFSET_AMD64
+                } else {
+                    syscalls::k32_handlers::LEGACY_EXCEPTION_RECORD_OFFSET_AMD64
+                };
+                let frame_size = ki_user_exception_dispatcher_frame_size(exception_record_offset);
 
-                let new_rsp = (ctx.regs.rsp - FRAME_SIZE) & !0xF;
+                let Some(new_rsp) = exception_frame_rsp(ctx.regs.rsp, frame_size) else {
+                    self.mark_current_thread_exited(NtStatus::STATUS_ACCESS_VIOLATION.0);
+                    return ContinueOperation::Terminate;
+                };
 
                 // Zero the entire frame first.
-                unsafe { core::ptr::write_bytes(new_rsp as *mut u8, 0, FRAME_SIZE) };
+                unsafe { core::ptr::write_bytes(new_rsp as *mut u8, 0, frame_size) };
 
                 // ── Build CONTEXT at [new_rsp] ──
                 //
@@ -7665,9 +15982,24 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                 // (or RtlRestoreContext), the guest resumes correctly.
                 let c = new_rsp as *mut u8;
                 unsafe {
-                    // ContextFlags: CONTEXT_FULL = CONTEXT_CONTROL |
-                    //               CONTEXT_INTEGER | CONTEXT_FLOATING_POINT
-                    core::ptr::write(c.add(0x30) as *mut u32, 0x10_000B);
+                    // Build an XSTATE-capable CONTEXT so guest ntdll can use
+                    // RtlRestoreContext's XRSTOR path instead of falling back to
+                    // ZwContinue with truncated AVX state.
+                    core::ptr::write(
+                        c.add(0x30) as *mut u32,
+                        if use_xstate_layout {
+                            syscalls::k32_handlers::CONTEXT_AMD64_FULL_XSTATE
+                        } else {
+                            syscalls::k32_handlers::CONTEXT_AMD64_FULL
+                        },
+                    );
+                    if ctx.fp_regs.data.len() >= 28 {
+                        core::ptr::copy_nonoverlapping(
+                            ctx.fp_regs.data[24..28].as_ptr(),
+                            c.add(0x34),
+                            4,
+                        );
+                    }
                     // Segment selectors (standard x64 user mode values).
                     core::ptr::write(c.add(0x38) as *mut u16, 0x33); // SegCs
                     core::ptr::write(c.add(0x42) as *mut u16, 0x2B); // SegSs
@@ -7681,6 +16013,29 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                         c.add(0x100),
                         fxsave_size,
                     );
+                    if use_xstate_layout {
+                        core::ptr::copy_nonoverlapping(
+                            ctx.fp_regs.data.as_ptr(),
+                            c.add(0x300),
+                            litebox_common_linux::FP_STATE_SIZE.min(ctx.fp_regs.data.len()),
+                        );
+                        core::ptr::write(
+                            c.add(0x4D0) as *mut i32,
+                            -(syscalls::k32_handlers::LEGACY_CONTEXT_SIZE_AMD64 as i32),
+                        );
+                        core::ptr::write(c.add(0x4D4) as *mut u32, context_size as u32);
+                        core::ptr::write(
+                            c.add(0x4D8) as *mut i32,
+                            -(syscalls::k32_handlers::LEGACY_CONTEXT_SIZE_AMD64 as i32),
+                        );
+                        core::ptr::write(
+                            c.add(0x4DC) as *mut u32,
+                            syscalls::k32_handlers::LEGACY_CONTEXT_SIZE_AMD64 as u32,
+                        );
+                        core::ptr::write(c.add(0x4E0) as *mut i32, 0x30);
+                        core::ptr::write(c.add(0x4E4) as *mut u32, 0x150);
+                        core::ptr::write(c.add(0x4E8) as *mut u64, 0);
+                    }
                     // Integer registers
                     core::ptr::write(c.add(0x78) as *mut u64, ctx.regs.rax as u64);
                     core::ptr::write(c.add(0x80) as *mut u64, ctx.regs.rcx as u64);
@@ -7701,13 +16056,951 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                     core::ptr::write(c.add(0xF8) as *mut u64, ctx.regs.rip as u64);
                 }
 
-                // ── Build EXCEPTION_RECORD at [new_rsp + 0x4F0] ──
-                let e = (new_rsp + EXCEPTION_RECORD_OFFSET) as *mut u8;
+                // ── Build EXCEPTION_RECORD after the CONTEXT block ──
+                let e = (new_rsp + exception_record_offset) as *mut u8;
                 let exc_code = match info.exception {
-                    litebox::shim::Exception::PAGE_FAULT => 0xC000_0005u32, // ACCESS_VIOLATION
+                    litebox::shim::Exception::PAGE_FAULT => {
+                        if self
+                            .last_guard_page_fault
+                            .swap(false, core::sync::atomic::Ordering::AcqRel)
+                        {
+                            0x8000_0001u32 // STATUS_GUARD_PAGE_VIOLATION
+                        } else {
+                            0xC000_0005u32 // ACCESS_VIOLATION
+                        }
+                    }
                     litebox::shim::Exception::INVALID_OPCODE => 0xC000_001Du32, // ILLEGAL_INSTRUCTION
+                    litebox::shim::Exception::DIVIDE_ERROR => {
+                        // Use error_code if provided (may carry STATUS_INTEGER_OVERFLOW).
+                        if info.error_code != 0 {
+                            info.error_code
+                        } else {
+                            0xC000_0094u32 // STATUS_INTEGER_DIVIDE_BY_ZERO
+                        }
+                    }
+                    litebox::shim::Exception::MATH_FAULT
+                    | litebox::shim::Exception::SIMD_EXCEPTION => {
+                        // The platform encoded the specific FP NTSTATUS in error_code.
+                        if info.error_code != 0 {
+                            info.error_code
+                        } else {
+                            0xC000_0090u32 // STATUS_FLOAT_INVALID_OPERATION
+                        }
+                    }
                     _ => 0xC000_0005u32,
                 };
+                self.trace(
+                    TraceKind::ExceptionForward,
+                    exc_code,
+                    info.cr2,
+                    ctx.regs.rip,
+                    0,
+                );
+                if let Some(ref obj) = self.thread_obj {
+                    obj.set_last_guest_context(ctx.regs.rip, ctx.regs.rsp);
+                }
+                if let Some(ntdll_base) = self.init_state.as_ref().and_then(|s| {
+                    s.module_bases
+                        .iter()
+                        .find(|m| m.name == "ntdll.dll")
+                        .map(|m| m.base_address)
+                }) {
+                    let ntdll_rip = ctx.regs.rip.saturating_sub(ntdll_base);
+                    if exc_code == 0xC000_0005 {
+                        if ntdll_rip == 0x1D6FC || ntdll_rip == 0x1DB8B {
+                            #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+                            {
+                                litebox_platform_windows_userland::WindowsUserland::dump_current_transition_trace(
+                                    "exc-forward-heapav",
+                                );
+                            }
+                            let inspect_addr = |addr: usize| {
+                                let page = addr & !(PAGE_SIZE - 1);
+                                let meta =
+                                    self.shared.process_state.with_memory_read(|vmem, mem| {
+                                        let perms_bits = page
+                                            .checked_add(PAGE_SIZE)
+                                            .and_then(|page_end| {
+                                                litebox::mm::linux::PageRange::<PAGE_SIZE>::new(
+                                                    page, page_end,
+                                                )
+                                            })
+                                            .and_then(|page_range| {
+                                                vmem.get_memory_permissions(page_range)
+                                            })
+                                            .map(|perms| perms.bits() as usize)
+                                            .unwrap_or(0xFF);
+                                        let reserved = mem.va_reservation_at(addr).is_some();
+                                        let image = self
+                                            .shared
+                                            .process_state
+                                            .image_mapping_at(addr)
+                                            .is_some();
+                                        perms_bits
+                                            | ((reserved as usize) << 8)
+                                            | ((image as usize) << 9)
+                                    });
+                                let host_flags = query_host_memory_basic_information(addr)
+                                    .map(|mbi| {
+                                        (host_page_is_readable(&mbi) as usize)
+                                            | ((host_page_is_writable(&mbi) as usize) << 1)
+                                    })
+                                    .unwrap_or(0);
+                                (page, meta, host_flags)
+                            };
+                            let heap_word0 =
+                                try_read_guest_value_unaligned::<u64>(ctx.regs.rbx & !0x7)
+                                    .unwrap_or(0);
+                            let heap_word1 = try_read_guest_value_unaligned::<u64>(
+                                (ctx.regs.rbx & !0x7).saturating_add(8),
+                            )
+                            .unwrap_or(0);
+                            let rsi_18 = try_read_guest_value_unaligned::<u32>(
+                                ctx.regs.rsi.saturating_add(0x18),
+                            )
+                            .unwrap_or(0);
+                            let r12_ptr =
+                                try_read_guest_value_unaligned::<u64>(ctx.regs.r12).unwrap_or(0);
+                            let (bad_page, bad_meta, bad_host) =
+                                inspect_addr(ctx.regs.rbx.saturating_add(0xF));
+                            let (rsi_page, rsi_meta, rsi_host) = inspect_addr(ctx.regs.rsi);
+                            let (r12_page, r12_meta, r12_host) = inspect_addr(ctx.regs.r12);
+                            let (r13_page, r13_meta, r13_host) = inspect_addr(ctx.regs.r13);
+                            let (r15_page, r15_meta, r15_host) = inspect_addr(ctx.regs.r15);
+                            let guest_va_start = self.shared.guest_va_start.load(Ordering::Acquire);
+                            let guest_va_end = self.shared.guest_va_end.load(Ordering::Acquire);
+                            let guest_slot = guest_va_start >> 40;
+                            let in_guest = |addr: usize| {
+                                guest_va_start != 0 && addr >= guest_va_start && addr < guest_va_end
+                            };
+                            let (
+                                (bad_alloc_base, bad_alloc_size),
+                                (rsi_alloc_base, rsi_alloc_size),
+                                (r12_alloc_base, r12_alloc_size),
+                                (r13_alloc_base, r13_alloc_size),
+                                (r15_alloc_base, r15_alloc_size),
+                            ) = self.shared.process_state.with_memory_read(|_vmem, mem| {
+                                let pack = |addr: usize| {
+                                    mem.tracked_alloc_at(addr)
+                                        .map(|(base, size, _)| (base, size))
+                                        .unwrap_or((0, 0))
+                                };
+                                (
+                                    pack(ctx.regs.rbx.saturating_add(0xF)),
+                                    pack(ctx.regs.rsi),
+                                    pack(ctx.regs.r12),
+                                    pack(ctx.regs.r13),
+                                    pack(ctx.regs.r15),
+                                )
+                            });
+                            let teb_va = self.init_state.as_ref().map_or(0usize, |s| s.teb_va);
+                            let tls_ptr = if teb_va != 0 {
+                                try_read_guest_value_unaligned::<u64>(
+                                    teb_va + crate::peb_teb::teb_offsets::TLS_POINTER,
+                                )
+                                .unwrap_or(0)
+                            } else {
+                                0
+                            };
+                            let tls_expansion_slots = if teb_va != 0 {
+                                try_read_guest_value_unaligned::<u64>(
+                                    teb_va + crate::peb_teb::teb_offsets::TLS_EXPANSION_SLOTS,
+                                )
+                                .unwrap_or(0)
+                            } else {
+                                0
+                            };
+                            let heap_fls_data = if teb_va != 0 {
+                                try_read_guest_value_unaligned::<u64>(
+                                    teb_va + crate::peb_teb::teb_offsets::HEAP_FLS_DATA,
+                                )
+                                .unwrap_or(0)
+                            } else {
+                                0
+                            };
+                            let fls_data = if teb_va != 0 {
+                                try_read_guest_value_unaligned::<u64>(
+                                    teb_va + crate::peb_teb::teb_offsets::FLS_DATA,
+                                )
+                                .unwrap_or(0)
+                            } else {
+                                0
+                            };
+                            let (
+                                tls_count,
+                                tls_bad_count,
+                                tls_bad0_idx,
+                                tls_bad0_val,
+                                tls_bad1_idx,
+                                tls_bad1_val,
+                            ) = if tls_ptr > 0x10010 {
+                                let count = try_read_guest_value_unaligned::<u32>(
+                                    (tls_ptr as usize).saturating_sub(0x10),
+                                )
+                                .filter(|count| *count != 0 && *count <= 0x1000)
+                                .unwrap_or(0);
+                                let mut bad_count = 0u32;
+                                let mut bad0_idx = u32::MAX;
+                                let mut bad0_val = 0u64;
+                                let mut bad1_idx = u32::MAX;
+                                let mut bad1_val = 0u64;
+                                let scan_count = core::cmp::min(count as usize, 64);
+                                for slot in 0..scan_count {
+                                    let Some(slot_value) = try_read_guest_value_unaligned::<u64>(
+                                        tls_ptr as usize + slot * core::mem::size_of::<u64>(),
+                                    ) else {
+                                        break;
+                                    };
+                                    let looks_like_pointer = slot_value > 0x1_0000;
+                                    let in_guest_partition = !looks_like_pointer
+                                        || ((slot_value as usize) >= guest_va_start
+                                            && (slot_value as usize) < guest_va_end);
+                                    if looks_like_pointer && !in_guest_partition {
+                                        bad_count = bad_count.saturating_add(1);
+                                        if bad0_idx == u32::MAX {
+                                            bad0_idx = slot as u32;
+                                            bad0_val = slot_value;
+                                        } else if bad1_idx == u32::MAX {
+                                            bad1_idx = slot as u32;
+                                            bad1_val = slot_value;
+                                        }
+                                    }
+                                }
+                                (count, bad_count, bad0_idx, bad0_val, bad1_idx, bad1_val)
+                            } else {
+                                (0, 0, u32::MAX, 0, u32::MAX, 0)
+                            };
+                            let heap_host_mbis = [
+                                query_host_memory_basic_information(bad_page)
+                                    .map(|mbi| {
+                                        (
+                                            bad_page,
+                                            mbi.allocation_base,
+                                            mbi.region_size,
+                                            mbi.state,
+                                            mbi.protect,
+                                            mbi._type,
+                                        )
+                                    })
+                                    .unwrap_or((bad_page, 0, 0, 0, 0, 0)),
+                                query_host_memory_basic_information(r15_page)
+                                    .map(|mbi| {
+                                        (
+                                            r15_page,
+                                            mbi.allocation_base,
+                                            mbi.region_size,
+                                            mbi.state,
+                                            mbi.protect,
+                                            mbi._type,
+                                        )
+                                    })
+                                    .unwrap_or((r15_page, 0, 0, 0, 0, 0)),
+                                query_host_memory_basic_information(r12_page)
+                                    .map(|mbi| {
+                                        (
+                                            r12_page,
+                                            mbi.allocation_base,
+                                            mbi.region_size,
+                                            mbi.state,
+                                            mbi.protect,
+                                            mbi._type,
+                                        )
+                                    })
+                                    .unwrap_or((r12_page, 0, 0, 0, 0, 0)),
+                                query_host_memory_basic_information(r13_page)
+                                    .map(|mbi| {
+                                        (
+                                            r13_page,
+                                            mbi.allocation_base,
+                                            mbi.region_size,
+                                            mbi.state,
+                                            mbi.protect,
+                                            mbi._type,
+                                        )
+                                    })
+                                    .unwrap_or((r13_page, 0, 0, 0, 0, 0)),
+                                query_host_memory_basic_information(rsi_page)
+                                    .map(|mbi| {
+                                        (
+                                            rsi_page,
+                                            mbi.allocation_base,
+                                            mbi.region_size,
+                                            mbi.state,
+                                            mbi.protect,
+                                            mbi._type,
+                                        )
+                                    })
+                                    .unwrap_or((rsi_page, 0, 0, 0, 0, 0)),
+                            ];
+                            self.trace(
+                                TraceKind::Probe,
+                                0x1DB8B,
+                                info.cr2,
+                                ctx.regs.rbx,
+                                ctx.regs.rsi,
+                            );
+                            self.trace(
+                                TraceKind::Probe,
+                                0x1DB8C,
+                                ctx.regs.r12,
+                                ctx.regs.r13,
+                                ctx.regs.r15,
+                            );
+                            self.trace(
+                                TraceKind::Probe,
+                                0x1DB8D,
+                                heap_word0 as usize,
+                                heap_word1 as usize,
+                                (((r12_ptr & 0xFFFF_FFFF) << 32) | rsi_18 as u64) as usize,
+                            );
+                            self.trace(TraceKind::Probe, 0x1D6FA, bad_page, bad_meta, r15_page);
+                            self.trace(TraceKind::Probe, 0x1D6FB, r15_meta, r12_page, r12_meta);
+                            self.trace(
+                                TraceKind::Probe,
+                                0x1D6FC,
+                                r13_page,
+                                r13_meta,
+                                ((rsi_meta & 0xFFFF) << 16) | (rsi_page & 0xFFFF),
+                            );
+                            push_recent_chain_event(
+                                &self.shared.recent_chain_events,
+                                alloc::format!(
+                                    "heapav1:{:X}:{:X}:{:X}:{:X}:{:X}",
+                                    self.thread_id,
+                                    info.cr2,
+                                    ctx.regs.rbx,
+                                    ctx.regs.rsi,
+                                    ctx.regs.r12
+                                ),
+                            );
+                            push_recent_chain_event(
+                                &self.shared.recent_chain_events,
+                                alloc::format!(
+                                    "heapav2:{:X}:{:X}:{:X}:{:X}:{:X}",
+                                    self.thread_id,
+                                    ctx.regs.r13,
+                                    ctx.regs.r15,
+                                    ((heap_word1 & 0xFFFF_FFFF) << 32) | (heap_word0 >> 32),
+                                    ((r12_ptr & 0xFFFF_FFFF) << 32) | rsi_18 as u64
+                                ),
+                            );
+                            push_recent_chain_event(
+                                &self.shared.recent_chain_events,
+                                alloc::format!(
+                                    "heapvm:{:X}:{:X}:{:X}:{:X}:{:X}:{:X}",
+                                    self.thread_id,
+                                    bad_meta,
+                                    r15_meta,
+                                    r12_meta,
+                                    r13_meta,
+                                    rsi_meta
+                                ),
+                            );
+                            push_recent_chain_event(
+                                &self.shared.recent_chain_events,
+                                alloc::format!(
+                                    "heaphost:{:X}:{:X}:{:X}:{:X}:{:X}:{:X}",
+                                    self.thread_id,
+                                    bad_host,
+                                    r15_host,
+                                    r12_host,
+                                    r13_host,
+                                    rsi_host
+                                ),
+                            );
+                            push_recent_chain_event(
+                                &self.shared.recent_chain_events,
+                                alloc::format!(
+                                    "heaptrk:{:X}:0x{:X}:0x{:X}:0x{:X}:0x{:X}:0x{:X}:0x{:X}:0x{:X}:0x{:X}:0x{:X}:0x{:X}",
+                                    self.thread_id,
+                                    bad_alloc_base,
+                                    bad_alloc_size,
+                                    r15_alloc_base,
+                                    r15_alloc_size,
+                                    r12_alloc_base,
+                                    r12_alloc_size,
+                                    r13_alloc_base,
+                                    r13_alloc_size,
+                                    rsi_alloc_base,
+                                    rsi_alloc_size
+                                ),
+                            );
+                            push_recent_chain_event(
+                                &self.shared.recent_chain_events,
+                                alloc::format!(
+                                    "heapslot:{:X}:{:X}:{:X}:{:X}:{:X}:{:X}:{:X}:{:X}:{:X}:{:X}:{:X}:{:X}",
+                                    self.thread_id,
+                                    guest_slot,
+                                    bad_page >> 40,
+                                    r15_page >> 40,
+                                    r12_page >> 40,
+                                    r13_page >> 40,
+                                    rsi_page >> 40,
+                                    in_guest(bad_page) as usize,
+                                    in_guest(r15_page) as usize,
+                                    in_guest(r12_page) as usize,
+                                    in_guest(r13_page) as usize,
+                                    in_guest(rsi_page) as usize
+                                ),
+                            );
+                            push_recent_chain_event(
+                                &self.shared.recent_chain_events,
+                                alloc::format!(
+                                    "heapteb:{:X}:0x{:X}:0x{:X}:0x{:X}:0x{:X}:0x{:X}:{:X}:{:X}:{:X}:{:X}",
+                                    self.thread_id,
+                                    teb_va,
+                                    tls_ptr,
+                                    tls_expansion_slots,
+                                    heap_fls_data,
+                                    fls_data,
+                                    (tls_ptr as usize) >> 40,
+                                    (tls_expansion_slots as usize) >> 40,
+                                    (heap_fls_data as usize) >> 40,
+                                    (fls_data as usize) >> 40
+                                ),
+                            );
+                            push_recent_chain_event(
+                                &self.shared.recent_chain_events,
+                                alloc::format!(
+                                    "heaptls:{:X}:0x{:X}:{:X}:{:X}:{:X}:0x{:X}:{:X}:0x{:X}",
+                                    self.thread_id,
+                                    tls_ptr,
+                                    tls_count,
+                                    tls_bad_count,
+                                    tls_bad0_idx,
+                                    tls_bad0_val,
+                                    tls_bad1_idx,
+                                    tls_bad1_val
+                                ),
+                            );
+                            for (idx, (addr, alloc_base, region_size, state, protect, mem_type)) in
+                                heap_host_mbis.iter().enumerate()
+                            {
+                                push_recent_chain_event(
+                                    &self.shared.recent_chain_events,
+                                    alloc::format!(
+                                        "heapmbi:{:X}:{:X}:0x{:X}:0x{:X}:0x{:X}:{:X}:{:X}:{:X}:{:X}",
+                                        self.thread_id,
+                                        idx,
+                                        addr,
+                                        alloc_base,
+                                        region_size,
+                                        state,
+                                        protect,
+                                        mem_type,
+                                        alloc_base >> 40
+                                    ),
+                                );
+                            }
+                            let recent_teardown_hits: alloc::vec::Vec<_> = {
+                                let candidate_pages =
+                                    [bad_page, rsi_page, r12_page, r13_page, r15_page];
+                                let teardowns = self.shared.recent_vm_teardowns.lock();
+                                teardowns
+                                    .iter()
+                                    .rev()
+                                    .filter(|td| {
+                                        let end = td.base.saturating_add(td.size);
+                                        td.size != 0
+                                            && candidate_pages
+                                                .iter()
+                                                .any(|&page| page >= td.base && page < end)
+                                    })
+                                    .take(4)
+                                    .copied()
+                                    .collect()
+                            };
+                            for (idx, td) in recent_teardown_hits.iter().enumerate() {
+                                self.trace(
+                                    TraceKind::Probe,
+                                    0x1D700 + idx as u32,
+                                    td.base,
+                                    td.size,
+                                    td.caller,
+                                );
+                                push_recent_chain_event(
+                                    &self.shared.recent_chain_events,
+                                    alloc::format!(
+                                        "heaptd:{:X}:{:X}:{:X}:0x{:X}:0x{:X}:0x{:X}:0x{:X}",
+                                        self.thread_id,
+                                        td.kind,
+                                        td.tid,
+                                        td.base,
+                                        td.size,
+                                        td.detail,
+                                        td.caller
+                                    ),
+                                );
+                            }
+                        } else if ntdll_rip == 0x78F76 {
+                            #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+                            {
+                                litebox_platform_windows_userland::WindowsUserland::dump_current_transition_trace(
+                                    "exc-forward-freeav",
+                                );
+                            }
+                            let inspect_addr = |addr: usize| {
+                                let page = addr & !(PAGE_SIZE - 1);
+                                let meta =
+                                    self.shared.process_state.with_memory_read(|vmem, mem| {
+                                        let perms_bits = page
+                                            .checked_add(PAGE_SIZE)
+                                            .and_then(|page_end| {
+                                                litebox::mm::linux::PageRange::<PAGE_SIZE>::new(
+                                                    page, page_end,
+                                                )
+                                            })
+                                            .and_then(|page_range| {
+                                                vmem.get_memory_permissions(page_range)
+                                            })
+                                            .map(|perms| perms.bits() as usize)
+                                            .unwrap_or(0xFF);
+                                        let reserved = mem.va_reservation_at(addr).is_some();
+                                        let image = self
+                                            .shared
+                                            .process_state
+                                            .image_mapping_at(addr)
+                                            .is_some();
+                                        perms_bits
+                                            | ((reserved as usize) << 8)
+                                            | ((image as usize) << 9)
+                                    });
+                                let host = query_host_memory_basic_information(addr)
+                                    .map(|mbi| {
+                                        (mbi.state as usize)
+                                            | ((mbi.protect as usize) << 16)
+                                            | ((mbi._type as usize) << 32)
+                                    })
+                                    .unwrap_or(0);
+                                (page, meta, host)
+                            };
+                            let free_shift = ((ctx.regs.rcx as u32) as usize) >> 12;
+                            let computed_slot_base = ctx.regs.rsi.saturating_sub(free_shift);
+                            let (fault_page, fault_meta, fault_host) = inspect_addr(info.cr2);
+                            let (rsi_page, rsi_meta, rsi_host) = inspect_addr(ctx.regs.rsi);
+                            let (rdi_page, rdi_meta, rdi_host) = inspect_addr(ctx.regs.rdi);
+                            let (r14_page, r14_meta, r14_host) = inspect_addr(ctx.regs.r14);
+                            let free_caller_ret = try_read_guest_value_unaligned::<u64>(
+                                ctx.regs.rsp.saturating_add(0xE8),
+                            )
+                            .unwrap_or(0);
+                            let free_caller_ret_next = try_read_guest_value_unaligned::<u64>(
+                                ctx.regs.rsp.saturating_add(0xF0),
+                            )
+                            .unwrap_or(0);
+                            let (peb_va, peb_process_heap) =
+                                self.init_state.as_ref().map_or((0usize, 0usize), |s| {
+                                    let process_heap = if s.peb_va != 0 {
+                                        try_read_guest_value_unaligned::<u64>(
+                                            s.peb_va + crate::peb_teb::peb_offsets::PROCESS_HEAP,
+                                        )
+                                        .unwrap_or(0)
+                                            as usize
+                                    } else {
+                                        0
+                                    };
+                                    (s.peb_va, process_heap)
+                                });
+                            // GS snapshot diagnostics removed — GS is always host TEB now.
+                            let (
+                                fault_pre_veh_gs,
+                                fault_current_gs,
+                                platform_guest_gs,
+                                last_guest_entry_gs_reserved,
+                                last_guest_entry_gs_observed_reserved,
+                            ) = (0usize, 0usize, 0usize, 0usize, 0usize);
+                            let thread_teb_va = self
+                                .thread_obj
+                                .as_ref()
+                                .map_or(0usize, |thread| thread.teb_va());
+                            let thread_teb_peb = if thread_teb_va != 0 {
+                                try_read_guest_value_unaligned::<u64>(
+                                    thread_teb_va + crate::peb_teb::teb_offsets::PEB_PTR,
+                                )
+                                .unwrap_or(0) as usize
+                            } else {
+                                0
+                            };
+                            self.trace(
+                                TraceKind::Probe,
+                                0x78F70,
+                                info.cr2,
+                                ctx.regs.r14,
+                                ctx.regs.r15,
+                            );
+                            self.trace(
+                                TraceKind::Probe,
+                                0x78F71,
+                                ctx.regs.rdi,
+                                ctx.regs.rsi,
+                                ctx.regs.rcx,
+                            );
+                            self.trace(
+                                TraceKind::Probe,
+                                0x78F72,
+                                computed_slot_base,
+                                free_caller_ret as usize,
+                                peb_process_heap,
+                            );
+                            self.trace(
+                                TraceKind::Probe,
+                                0x78F73,
+                                fault_page,
+                                fault_meta,
+                                fault_host,
+                            );
+                            self.trace(TraceKind::Probe, 0x78F74, rsi_page, rsi_meta, rsi_host);
+                            self.trace(TraceKind::Probe, 0x78F75, rdi_page, rdi_meta, rdi_host);
+                            self.trace(TraceKind::Probe, 0x78F76, r14_page, r14_meta, r14_host);
+                            self.trace(
+                                TraceKind::Probe,
+                                0x78F77,
+                                free_caller_ret_next as usize,
+                                peb_va,
+                                peb_process_heap,
+                            );
+                            self.trace(
+                                TraceKind::Probe,
+                                0x78F78,
+                                fault_pre_veh_gs,
+                                fault_current_gs,
+                                platform_guest_gs,
+                            );
+                            self.trace(
+                                TraceKind::Probe,
+                                0x78F79,
+                                last_guest_entry_gs_reserved,
+                                last_guest_entry_gs_observed_reserved,
+                                thread_teb_va,
+                            );
+                            self.trace(
+                                TraceKind::Probe,
+                                0x78F7A,
+                                thread_teb_peb,
+                                peb_va,
+                                peb_process_heap,
+                            );
+                            self.trace(TraceKind::Probe, 0x78F7B, peb_va, peb_process_heap, 0);
+                            push_recent_chain_event(
+                                &self.shared.recent_chain_events,
+                                alloc::format!(
+                                    "freeav:{:X}:0x{:X}:0x{:X}:0x{:X}:0x{:X}:0x{:X}:0x{:X}:0x{:X}:0x{:X}:0x{:X}",
+                                    self.thread_id,
+                                    info.cr2,
+                                    ctx.regs.r14,
+                                    ctx.regs.r15,
+                                    ctx.regs.rdi,
+                                    ctx.regs.rsi,
+                                    ctx.regs.rcx,
+                                    computed_slot_base,
+                                    free_caller_ret,
+                                    peb_process_heap
+                                ),
+                            );
+                            push_recent_chain_event(
+                                &self.shared.recent_chain_events,
+                                alloc::format!(
+                                    "freeavgs:{:X}:0x{:X}:0x{:X}:0x{:X}:0x{:X}:0x{:X}:0x{:X}:0x{:X}:0x{:X}:0x{:X}",
+                                    self.thread_id,
+                                    fault_pre_veh_gs,
+                                    fault_current_gs,
+                                    platform_guest_gs,
+                                    last_guest_entry_gs_reserved,
+                                    last_guest_entry_gs_observed_reserved,
+                                    thread_teb_va,
+                                    thread_teb_peb,
+                                    peb_va,
+                                    peb_process_heap
+                                ),
+                            );
+                        } else if ntdll_rip == 0x101FC {
+                            let rdi_qword =
+                                try_read_guest_value_unaligned::<u64>(ctx.regs.rdi).unwrap_or(0);
+                            let rdx_qword =
+                                try_read_guest_value_unaligned::<u64>(ctx.regs.rdx).unwrap_or(0);
+                            let r15_f8 = try_read_guest_value_unaligned::<u64>(
+                                ctx.regs.r15.saturating_add(0xF8),
+                            )
+                            .unwrap_or(0);
+                            let rsp_e8 = try_read_guest_value_unaligned::<u64>(ctx.regs.rsp + 0xE8)
+                                .unwrap_or(0);
+                            let rsp_f0 = try_read_guest_value_unaligned::<u64>(ctx.regs.rsp + 0xF0)
+                                .unwrap_or(0);
+                            let rsp_f8_q =
+                                try_read_guest_value_unaligned::<u64>(ctx.regs.rsp + 0xF8)
+                                    .unwrap_or(0);
+                            let rsp_f8_d =
+                                try_read_guest_value_unaligned::<u32>(ctx.regs.rsp + 0xF8)
+                                    .unwrap_or(0);
+                            let rsp_100 =
+                                try_read_guest_value_unaligned::<u64>(ctx.regs.rsp + 0x100)
+                                    .unwrap_or(0);
+                            let rsp_108 =
+                                try_read_guest_value_unaligned::<u64>(ctx.regs.rsp + 0x108)
+                                    .unwrap_or(0);
+                            let guest_va_start = self.shared.guest_va_start.load(Ordering::Acquire);
+                            let guest_va_end = self.shared.guest_va_end.load(Ordering::Acquire);
+                            let in_guest = |addr: usize| {
+                                guest_va_start != 0 && addr >= guest_va_start && addr < guest_va_end
+                            };
+                            let inspect_unwind_ptr = |addr: usize| {
+                                let page = addr & !(PAGE_SIZE - 1);
+                                let (alloc_base, alloc_size) =
+                                    self.shared.process_state.with_memory_read(|_vmem, mem| {
+                                        mem.tracked_alloc_at(addr)
+                                            .map(|(base, size, _)| (base, size))
+                                            .unwrap_or((0, 0))
+                                    });
+                                let (
+                                    host_alloc_base,
+                                    host_region_size,
+                                    host_state,
+                                    host_protect,
+                                    host_type,
+                                ) = query_host_memory_basic_information(addr)
+                                    .map(|mbi| {
+                                        (
+                                            mbi.allocation_base,
+                                            mbi.region_size,
+                                            mbi.state,
+                                            mbi.protect,
+                                            mbi._type,
+                                        )
+                                    })
+                                    .unwrap_or((0, 0, 0, 0, 0));
+                                (
+                                    page,
+                                    in_guest(addr) as usize,
+                                    addr >> 40,
+                                    alloc_base,
+                                    alloc_size,
+                                    host_alloc_base,
+                                    host_region_size,
+                                    host_state,
+                                    host_protect,
+                                    host_type,
+                                )
+                            };
+                            let unwind_ptrs = [
+                                (ctx.regs.rdi, inspect_unwind_ptr(ctx.regs.rdi)),
+                                (ctx.regs.rdx, inspect_unwind_ptr(ctx.regs.rdx)),
+                                (ctx.regs.r15, inspect_unwind_ptr(ctx.regs.r15)),
+                                (info.cr2, inspect_unwind_ptr(info.cr2)),
+                                (ctx.regs.rsp, inspect_unwind_ptr(ctx.regs.rsp)),
+                                (rsp_f8_d as usize, inspect_unwind_ptr(rsp_f8_d as usize)),
+                            ];
+                            let modules = self.current_module_bases();
+                            let ntdll_base = modules
+                                .iter()
+                                .find(|m| m.name.eq_ignore_ascii_case("ntdll.dll"))
+                                .map_or(0usize, |m| m.base_address);
+                            let kernel32_base = modules
+                                .iter()
+                                .find(|m| m.name.eq_ignore_ascii_case("kernel32.dll"))
+                                .map_or(0usize, |m| m.base_address);
+                            let kernelbase_base = modules
+                                .iter()
+                                .find(|m| m.name.eq_ignore_ascii_case("kernelbase.dll"))
+                                .map_or(0usize, |m| m.base_address);
+                            let exe_base =
+                                self.init_state.as_ref().map_or(0usize, |s| s.image_base);
+                            let ift_va = self.shared.process_state.inverted_function_table_va();
+                            let (
+                                ift_count,
+                                exe_in_ift,
+                                ntdll_in_ift,
+                                kernel32_in_ift,
+                                kernelbase_in_ift,
+                            ) = if ift_va != 0 {
+                                let count =
+                                    try_read_guest_value_unaligned::<u32>(ift_va).unwrap_or(0);
+                                let mut exe_hit = 0usize;
+                                let mut ntdll_hit = 0usize;
+                                let mut kernel32_hit = 0usize;
+                                let mut kernelbase_hit = 0usize;
+                                for i in 0..count as usize {
+                                    let entry = ift_va + 0x10 + i * 0x18;
+                                    let entry_base =
+                                        try_read_guest_value_unaligned::<u64>(entry + 8)
+                                            .unwrap_or(0)
+                                            as usize;
+                                    exe_hit |= (exe_base != 0 && entry_base == exe_base) as usize;
+                                    ntdll_hit |=
+                                        (ntdll_base != 0 && entry_base == ntdll_base) as usize;
+                                    kernel32_hit |= (kernel32_base != 0
+                                        && entry_base == kernel32_base)
+                                        as usize;
+                                    kernelbase_hit |= (kernelbase_base != 0
+                                        && entry_base == kernelbase_base)
+                                        as usize;
+                                }
+                                (
+                                    count as usize,
+                                    exe_hit,
+                                    ntdll_hit,
+                                    kernel32_hit,
+                                    kernelbase_hit,
+                                )
+                            } else {
+                                (0, 0, 0, 0, 0)
+                            };
+                            let recent_unwind_teardowns: alloc::vec::Vec<_> = {
+                                let candidate_pages = [
+                                    info.cr2 & !(PAGE_SIZE - 1),
+                                    ctx.regs.rdx & !(PAGE_SIZE - 1),
+                                    ctx.regs.r15 & !(PAGE_SIZE - 1),
+                                ];
+                                let teardowns = self.shared.recent_vm_teardowns.lock();
+                                teardowns
+                                    .iter()
+                                    .rev()
+                                    .filter(|td| {
+                                        let end = td.base.saturating_add(td.size);
+                                        td.size != 0
+                                            && candidate_pages
+                                                .iter()
+                                                .any(|&page| page >= td.base && page < end)
+                                    })
+                                    .take(4)
+                                    .copied()
+                                    .collect()
+                            };
+                            self.trace(
+                                TraceKind::Probe,
+                                0x101FC,
+                                info.cr2,
+                                ctx.regs.rdi,
+                                ctx.regs.rbx,
+                            );
+                            self.trace(
+                                TraceKind::Probe,
+                                0x101FD,
+                                ctx.regs.rdx,
+                                ctx.regs.r15,
+                                rdi_qword as usize,
+                            );
+                            self.trace(
+                                TraceKind::Probe,
+                                0x101FE,
+                                rdx_qword as usize,
+                                r15_f8 as usize,
+                                0,
+                            );
+                            push_recent_chain_event(
+                                &self.shared.recent_chain_events,
+                                alloc::format!(
+                                    "unwav1:{:X}:{:X}:{:X}:{:X}:{:X}",
+                                    self.thread_id,
+                                    info.cr2,
+                                    ctx.regs.rdi,
+                                    ctx.regs.rbx,
+                                    ctx.regs.rdx
+                                ),
+                            );
+                            push_recent_chain_event(
+                                &self.shared.recent_chain_events,
+                                alloc::format!(
+                                    "unwav2:{:X}:{:X}:{:X}:{:X}",
+                                    self.thread_id,
+                                    ctx.regs.r15,
+                                    rdi_qword,
+                                    r15_f8 ^ rdx_qword
+                                ),
+                            );
+                            push_recent_chain_event(
+                                &self.shared.recent_chain_events,
+                                alloc::format!(
+                                    "unwavift:{:X}:0x{:X}:{:X}:{:X}:{:X}:{:X}:{:X}:0x{:X}:0x{:X}:0x{:X}:0x{:X}",
+                                    self.thread_id,
+                                    ift_va,
+                                    ift_count,
+                                    exe_in_ift,
+                                    ntdll_in_ift,
+                                    kernel32_in_ift,
+                                    kernelbase_in_ift,
+                                    exe_base,
+                                    ntdll_base,
+                                    kernel32_base,
+                                    kernelbase_base
+                                ),
+                            );
+                            push_recent_chain_event(
+                                &self.shared.recent_chain_events,
+                                alloc::format!(
+                                    "unwavstk:{:X}:0x{:X}:0x{:X}:0x{:X}:0x{:X}:{:X}:0x{:X}:0x{:X}",
+                                    self.thread_id,
+                                    ctx.regs.rsp,
+                                    rsp_e8,
+                                    rsp_f0,
+                                    rsp_f8_q,
+                                    rsp_f8_d,
+                                    rsp_100,
+                                    rsp_108
+                                ),
+                            );
+                            for (
+                                idx,
+                                (
+                                    addr,
+                                    (
+                                        page,
+                                        guest_hit,
+                                        slot,
+                                        alloc_base,
+                                        alloc_size,
+                                        host_alloc_base,
+                                        host_region_size,
+                                        host_state,
+                                        host_protect,
+                                        host_type,
+                                    ),
+                                ),
+                            ) in unwind_ptrs.iter().enumerate()
+                            {
+                                push_recent_chain_event(
+                                    &self.shared.recent_chain_events,
+                                    alloc::format!(
+                                        "unwavptr:{:X}:{:X}:0x{:X}:0x{:X}:{:X}:{:X}:0x{:X}:0x{:X}:0x{:X}:0x{:X}:{:X}:{:X}:{:X}",
+                                        self.thread_id,
+                                        idx,
+                                        addr,
+                                        page,
+                                        guest_hit,
+                                        slot,
+                                        alloc_base,
+                                        alloc_size,
+                                        host_alloc_base,
+                                        host_region_size,
+                                        host_state,
+                                        host_protect,
+                                        host_type
+                                    ),
+                                );
+                            }
+                            for (idx, td) in recent_unwind_teardowns.iter().enumerate() {
+                                push_recent_chain_event(
+                                    &self.shared.recent_chain_events,
+                                    alloc::format!(
+                                        "unwavtd:{:X}:{:X}:{:X}:0x{:X}:0x{:X}:0x{:X}:0x{:X}",
+                                        self.thread_id,
+                                        idx,
+                                        td.kind,
+                                        td.base,
+                                        td.size,
+                                        td.detail,
+                                        td.caller
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    unsafe {
+                        write_ki_user_exception_dispatcher_machine_frame(
+                            new_rsp,
+                            exception_record_offset,
+                        );
+                    }
+                }
                 unsafe {
                     // ExceptionCode (+0x00)
                     core::ptr::write(e.add(0x00) as *mut u32, exc_code);
@@ -7719,7 +17012,13 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                     if info.exception == litebox::shim::Exception::PAGE_FAULT {
                         core::ptr::write(e.add(0x18) as *mut u32, 2);
                         // ExceptionInformation[0]: 0=read, 1=write, 8=DEP
-                        let access_type: u64 = if (info.error_code & 2) != 0 { 1 } else { 0 };
+                        let access_type: u64 = if (info.error_code & 0x10) != 0 {
+                            8 // DEP (instruction fetch on NX page)
+                        } else if (info.error_code & 2) != 0 {
+                            1 // write
+                        } else {
+                            0 // read
+                        };
                         core::ptr::write(e.add(0x20) as *mut u64, access_type);
                         // ExceptionInformation[1]: faulting virtual address
                         core::ptr::write(e.add(0x28) as *mut u64, info.cr2 as u64);
@@ -7729,9 +17028,14 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                 #[cfg(debug_assertions)]
                 {
                     use litebox::platform::DebugLogProvider as _;
+                    let seh_target_name = if dispatch_stub_va != 0 {
+                        "guest RtlDispatchException stub"
+                    } else {
+                        "KiUserExceptionDispatcher"
+                    };
                     litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                        "NT shim: forwarding exception to guest SEH: code=0x{:X} addr=0x{:X} rip=0x{:X} → KiUserExceptionDispatcher @ 0x{:X}\n",
-                        exc_code, info.cr2, ctx.regs.rip, dispatcher_va,
+                        "NT shim: forwarding exception to guest SEH: code=0x{:X} addr=0x{:X} rip=0x{:X} → {} @ 0x{:X}\n",
+                        exc_code, info.cr2, ctx.regs.rip, seh_target_name, seh_target_va,
                     ));
 
                     // Dump TLS state and IFT count to diagnose TLS/SEH issues.
@@ -7753,6 +17057,169 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                                 "  Crash regs: rdx=0x{:X} rdi=0x{:X} r8=0x{:X} r13=0x{:X} r14=0x{:X} rbx=0x{:X} rax=0x{:X} rsi=0x{:X}\n",
                                 ctx.regs.rdx, ctx.regs.rdi, ctx.regs.r8, ctx.regs.r13, ctx.regs.r14, ctx.regs.rbx, ctx.regs.rax, ctx.regs.rsi,
                             ));
+                            // Dump PEB.ProcessHeap and heap header for heap corruption analysis
+                            if peb_va != 0 {
+                                let process_heap = core::ptr::read((peb_va + 0x30) as *const usize);
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!("  PEB.ProcessHeap=0x{:X}\n", process_heap,),
+                                );
+                                let guest_start = self
+                                    .init_state
+                                    .as_ref()
+                                    .map_or(0usize, |s| s.guest_va_start);
+                                let guest_end =
+                                    self.init_state.as_ref().map_or(0usize, |s| s.guest_va_end);
+                                for (name, val) in [
+                                    ("rsi", ctx.regs.rsi),
+                                    ("rbx", ctx.regs.rbx),
+                                    ("rax", ctx.regs.rax),
+                                    ("r13", ctx.regs.r13),
+                                ] {
+                                    if val > 0x10000 && (val < guest_start || val >= guest_end) {
+                                        let mut hex = alloc::format!("  {name}=0x{val:X} (HOST!) ");
+                                        if is_addr_range_committed(val, 64) {
+                                            hex.push_str("bytes: ");
+                                            for i in 0..64usize {
+                                                let b = core::ptr::read((val + i) as *const u8);
+                                                hex.push_str(&alloc::format!("{b:02X}"));
+                                                if i % 8 == 7 {
+                                                    hex.push(' ');
+                                                }
+                                            }
+                                        } else {
+                                            hex.push_str("NOT COMMITTED");
+                                        }
+                                        hex.push('\n');
+                                        litebox_platform_multiplex::platform()
+                                            .debug_log_print(&hex);
+                                    }
+                                }
+                                if process_heap != 0 && is_addr_range_committed(process_heap, 0x600)
+                                {
+                                    let mut heap_dump = alloc::format!(
+                                        "  Heap dump (first 128 bytes of ProcessHeap at 0x{process_heap:X}):\n"
+                                    );
+                                    for row in 0..8usize {
+                                        let base = process_heap + row * 16;
+                                        heap_dump
+                                            .push_str(&alloc::format!("    +{:03X}: ", row * 16));
+                                        for col in 0..2usize {
+                                            let val =
+                                                core::ptr::read((base + col * 8) as *const u64);
+                                            heap_dump.push_str(&alloc::format!("{val:016X} "));
+                                        }
+                                        heap_dump.push('\n');
+                                    }
+                                    litebox_platform_multiplex::platform()
+                                        .debug_log_print(&heap_dump);
+                                }
+                            }
+                            let kernelbase_fault = self.init_state.as_ref().and_then(|s| {
+                                s.module_bases
+                                    .iter()
+                                    .find(|m| m.name.eq_ignore_ascii_case("KERNELBASE.dll"))
+                                    .map(|m| ctx.regs.rip == m.base_address + 0x37BC4)
+                            }) == Some(true);
+                            if kernelbase_fault && peb_va != 0 {
+                                let ro_base = core::ptr::read(
+                                    (peb_va
+                                        + crate::peb_teb::peb_offsets::READ_ONLY_SHARED_MEMORY_BASE)
+                                        as *const u64,
+                                ) as usize;
+                                let ro_array = core::ptr::read(
+                                    (peb_va
+                                        + crate::peb_teb::peb_offsets::READ_ONLY_STATIC_SERVER_DATA)
+                                        as *const u64,
+                                ) as usize;
+                                let ro_delta =
+                                    core::ptr::read((peb_va + 0x380) as *const u64) as usize;
+                                let arr0 = if is_addr_range_committed(ro_array, 8) {
+                                    core::ptr::read(ro_array as *const u64) as usize
+                                } else {
+                                    0
+                                };
+                                let arr1 = if is_addr_range_committed(ro_array + 8, 8) {
+                                    core::ptr::read((ro_array + 8) as *const u64) as usize
+                                } else {
+                                    0
+                                };
+                                let anchor0 = if is_addr_range_committed(ro_base + 0x9E8, 8) {
+                                    core::ptr::read((ro_base + 0x9E8) as *const u64) as usize
+                                } else {
+                                    0
+                                };
+                                let anchor1 = if is_addr_range_committed(ro_base + 0x14E8, 8) {
+                                    core::ptr::read((ro_base + 0x14E8) as *const u64) as usize
+                                } else {
+                                    0
+                                };
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "  KERNELBASE static-data diag: PEB+0x88=0x{:X} PEB+0x98=0x{:X} PEB+0x380=0x{:X} arr[0]=0x{:X} arr[1]=0x{:X} anchor0=0x{:X} anchor1=0x{:X}\n",
+                                        ro_base, ro_array, ro_delta, arr0, arr1, anchor0, anchor1,
+                                    ),
+                                );
+                            }
+                            let guest_start =
+                                self.init_state.as_ref().map_or(0, |s| s.guest_va_start);
+                            let guest_end = self.init_state.as_ref().map_or(0, |s| s.guest_va_end);
+                            if info.cr2 < guest_start || info.cr2 >= guest_end {
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "  Fault address 0x{:X} is outside guest range 0x{:X}..0x{:X}\n",
+                                        info.cr2,
+                                        guest_start,
+                                        guest_end,
+                                    ),
+                                );
+                                let rsp = ctx.regs.rsp;
+                                let mut stack_dump = alloc::string::String::from(
+                                    "  Fault stack (rsp-32..rsp+96):\n",
+                                );
+                                for offset in -4i64..=12 {
+                                    let addr = (rsp as i64 + offset * 8) as usize;
+                                    let marker = if offset == 0 { " <-- RSP" } else { "" };
+                                    if is_addr_committed(addr) {
+                                        let value = core::ptr::read(addr as *const u64);
+                                        stack_dump.push_str(&alloc::format!(
+                                            "    [0x{:X}] = 0x{:016X}{}\n",
+                                            addr,
+                                            value,
+                                            marker,
+                                        ));
+                                    } else {
+                                        stack_dump.push_str(&alloc::format!(
+                                            "    [0x{:X}] = <unmapped>{}\n",
+                                            addr,
+                                            marker,
+                                        ));
+                                    }
+                                }
+                                litebox_platform_multiplex::platform().debug_log_print(&stack_dump);
+
+                                let rip = ctx.regs.rip;
+                                let mut code_dump = alloc::string::String::from(
+                                    "  Fault code bytes (rip-16..rip+16):\n",
+                                );
+                                for addr in rip.saturating_sub(16)..rip.saturating_add(16) {
+                                    if (addr - rip.saturating_sub(16)) % 8 == 0 {
+                                        code_dump.push_str(&alloc::format!("    0x{:X}:", addr));
+                                    }
+                                    if is_addr_committed(addr) {
+                                        let byte = core::ptr::read(addr as *const u8);
+                                        code_dump.push_str(&alloc::format!(" {:02X}", byte));
+                                    } else {
+                                        code_dump.push_str(" ??");
+                                    }
+                                    if (addr - rip.saturating_sub(16)) % 8 == 7 {
+                                        code_dump.push('\n');
+                                    }
+                                }
+                                if (rip.saturating_add(16) - rip.saturating_sub(16)) % 8 != 0 {
+                                    code_dump.push('\n');
+                                }
+                                litebox_platform_multiplex::platform().debug_log_print(&code_dump);
+                            }
                             let rbx = ctx.regs.rbx;
                             let r14_plus_rdi = ctx.regs.r14.wrapping_add(ctx.regs.rdi);
                             litebox_platform_multiplex::platform().debug_log_print(
@@ -8149,12 +17616,13 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                     }
                 }
 
-                // Redirect guest execution to KiUserExceptionDispatcher.
+                // Redirect guest execution to the guest SEH dispatcher path.
                 ctx.regs.rsp = new_rsp;
-                ctx.regs.rip = dispatcher_va;
+                ctx.regs.rip = seh_target_va;
                 // Set RCX = RIP for the platform's sysret fast-path check.
-                ctx.regs.rcx = dispatcher_va;
-                return ContinueOperation::Resume;
+                ctx.regs.rcx = seh_target_va;
+                ctx.regs.rax = 0;
+                return self.resume_guest(ctx);
             }
         }
 
@@ -8313,7 +17781,21 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
             }
         }
 
-        self.mark_current_thread_exited(status.0);
+        // If another thread already requested a clean exit (NtTerminateProcess),
+        // preserve that exit code instead of overriding with the exception status.
+        if self
+            .shared
+            .process_exit_requested
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            let clean_code = self
+                .shared
+                .process_exit_code
+                .load(core::sync::atomic::Ordering::Acquire);
+            self.mark_current_thread_exited(clean_code);
+        } else {
+            self.mark_current_thread_exited_as_process_exit(status.0);
+        }
         log_unimplemented!(
             "exception {:?} at rip=0x{:X} (exit code 0x{:08X})",
             info.exception,
@@ -8323,12 +17805,23 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
         ContinueOperation::Terminate
     }
 
-    fn interrupt(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        // Note: Guest GS base is NOT restored here ΓÇö interrupts are delivered
-        // via the platform's VEH which runs with host GS (restored by the
-        // kernel for exception delivery). The trampoline return path handles
-        // guest GS restoration for the syscall path.
-        ContinueOperation::Resume
+    fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+        self.enter_from_guest();
+        // Check whether the process is exiting.  If so, terminate this thread
+        // instead of resuming guest execution.
+        if self
+            .shared
+            .process_exit_requested
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            let code = self
+                .shared
+                .process_exit_code
+                .load(core::sync::atomic::Ordering::Acquire);
+            self.mark_current_thread_exited(code);
+            return ContinueOperation::Terminate;
+        }
+        self.resume_guest(ctx)
     }
 
     fn thread_terminated(&self) {
@@ -8341,11 +17834,27 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
 fn exception_to_ntstatus(info: &ExceptionInfo) -> NtStatus {
     use litebox::shim::Exception;
     match info.exception {
-        Exception::DIVIDE_ERROR => NtStatus::STATUS_INTEGER_DIVIDE_BY_ZERO,
+        Exception::DIVIDE_ERROR => {
+            if info.error_code != 0 {
+                NtStatus(info.error_code as i32)
+            } else {
+                NtStatus::STATUS_INTEGER_DIVIDE_BY_ZERO
+            }
+        }
         Exception::BREAKPOINT => NtStatus::STATUS_BREAKPOINT,
         Exception::INVALID_OPCODE => NtStatus::STATUS_ILLEGAL_INSTRUCTION,
         Exception::GENERAL_PROTECTION_FAULT => NtStatus::STATUS_ACCESS_VIOLATION,
         Exception::PAGE_FAULT => NtStatus::STATUS_ACCESS_VIOLATION,
+        Exception::MATH_FAULT | Exception::SIMD_EXCEPTION => {
+            // The platform encoded the original Win32/NTSTATUS FP exception
+            // code in error_code. If present, use it directly so the guest
+            // sees the specific FP exception (e.g. STATUS_FLOAT_INEXACT_RESULT).
+            if info.error_code != 0 {
+                NtStatus(info.error_code as i32)
+            } else {
+                NtStatus::STATUS_FLOAT_INVALID_OPERATION
+            }
+        }
         _ => NtStatus::STATUS_UNSUCCESSFUL,
     }
 }

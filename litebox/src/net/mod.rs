@@ -609,6 +609,20 @@ where
                     proxy.set_state(socket_channel::SocketState::Connected);
                     proxy.clear_async_error();
                 }
+
+                // Detect peer-initiated half-close: the remote sent FIN, so
+                // `may_recv()` is false, but the socket is still "open" (we
+                // haven't sent our FIN yet — e.g. CloseWait state).  Once all
+                // buffered data has been drained into the ring buffer, notify
+                // `Events::HUP` so readers waiting for data can observe EOF.
+                if tcp_socket.is_open()
+                    && !tcp_socket.may_recv()
+                    && !proxy.is_readable()
+                    && proxy.state() == socket_channel::SocketState::Connected
+                {
+                    proxy.set_state(socket_channel::SocketState::Closed);
+                }
+
                 let tcp_specific = socket_handle.specific.tcp();
                 // Update socket state in the channel
                 // server socket that is listening also has closed state

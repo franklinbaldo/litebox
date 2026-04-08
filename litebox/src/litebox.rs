@@ -86,10 +86,15 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
-    /// An explicitly-crate-internal clone method to prevent outside users from cloning the
-    /// [`LiteBox`] object, which could cause confusion as to the intended use. External users must
-    /// only create it via [`Self::new`].
-    pub(crate) fn clone(&self) -> Self {
+    /// Clone the [`LiteBox`] handle, sharing the underlying state (descriptor
+    /// table, process registry, etc.) via `Arc`.
+    ///
+    /// Multiple clones refer to the same global state — this is an `Arc::clone`,
+    /// not a deep copy. Subsystems that need a reference to the `LiteBox` (e.g.
+    /// `Network`, `PageManager`, filesystem layers) use this internally. Runners
+    /// and shims may also clone the handle to share it across components that
+    /// operate on the same sandbox instance.
+    pub fn clone(&self) -> Self {
         Self {
             x: Arc::clone(&self.x),
         }

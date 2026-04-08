@@ -35,11 +35,35 @@ pub mod teb_offsets {
     pub const PEB_PTR: usize = 0x0060;
     /// LastErrorValue
     pub const LAST_ERROR: usize = 0x0068;
+    /// Win32ThreadInfo — nonzero once USER32 lazily connects the thread.
+    pub const WIN32_THREAD_INFO: usize = 0x0078;
+    /// Win32ClientInfo[0] inline storage.
+    pub const WIN32_CLIENT_INFO_QWORD0: usize = 0x0800;
+    /// Win32ClientInfo scalar fields observed by USER32.
+    pub const WIN32_CLIENT_INFO_DWORD10: usize = 0x0810;
+    pub const WIN32_CLIENT_INFO_DWORD14: usize = 0x0814;
+    pub const WIN32_CLIENT_INFO_DWORD18: usize = 0x0818;
+    pub const WIN32_CLIENT_INFO_DWORD1C: usize = 0x081C;
+    /// Win32ClientInfo pointer/delta pair used by USER32 helper wrappers.
+    pub const WIN32_CLIENT_INFO_PTR20: usize = 0x0820;
+    pub const WIN32_CLIENT_INFO_PTR28: usize = 0x0828;
+    /// Additional Win32ClientInfo flags ORed into USER32 state probes.
+    pub const WIN32_CLIENT_INFO_DWORD38: usize = 0x0838;
+    /// Additional USER/GDI scalar metadata read from the Win32ClientInfo window.
+    pub const WIN32_CLIENT_INFO_QWORD90: usize = 0x0890;
+    /// HeapFlsData — per-thread heap-manager FLS state.
+    pub const HEAP_FLS_DATA: usize = 0x0258;
+    /// TlsSlots[64] inline storage.
+    pub const TLS_SLOTS: usize = 0x1480;
     /// DeallocationStack — base of the stack allocation (lowest address).
     /// ntdll's `RtlpGetStackLimits` returns STATUS_BAD_STACK when this is 0.
     pub const DEALLOCATION_STACK: usize = 0x1478;
     /// GuaranteedStackBytes — minimum stack guarantee for the thread.
     pub const GUARANTEED_STACK_BYTES: usize = 0x1748;
+    /// TlsExpansionSlots pointer.
+    pub const TLS_EXPANSION_SLOTS: usize = 0x1780;
+    /// FlsData — ntdll's per-thread FLS data pointer.
+    pub const FLS_DATA: usize = 0x17C8;
 }
 
 /// Offsets within the 64-bit PEB structure.
@@ -63,7 +87,7 @@ pub mod peb_offsets {
     /// ReadOnlySharedMemoryBase (used in rebasing ReadOnlyStaticServerData pointers)
     pub const READ_ONLY_SHARED_MEMORY_BASE: usize = 0x0088;
     /// ReadOnlyStaticServerData (pointer to array of per-server-DLL data pointers)
-    /// Normally populated by CSRSS during CsrClientConnectToServer.
+    /// Normally populated by CSRSS during process initialization.
     pub const READ_ONLY_STATIC_SERVER_DATA: usize = 0x0098;
     /// Number of processors
     pub const NUMBER_OF_PROCESSORS: usize = 0x00B8;
@@ -85,12 +109,22 @@ pub mod peb_offsets {
     pub const IMAGE_SUBSYSTEM_MAJOR_VERSION: usize = 0x012C;
     /// ImageSubsystemMinorVersion
     pub const IMAGE_SUBSYSTEM_MINOR_VERSION: usize = 0x0130;
+    /// KernelCallbackTable (pointer). USER32 sets this during
+    /// `_UserClientDllInitialize` to point at its internal apfnDispatch
+    /// table. A non-zero value after init confirms CSR connect succeeded.
+    pub const KERNEL_CALLBACK_TABLE: usize = 0x0058;
     /// GdiSharedHandleTable (pointer to GDI shared handle table region).
     /// Populated by the kernel; read by gdi32full!GdiProcessSetup when
     /// `gbFirst` is 0 to store `gpHandleTable` and `pGdiSharedMemory`.
     pub const GDI_SHARED_HANDLE_TABLE: usize = 0x00F8;
     /// SessionId
     pub const SESSION_ID: usize = 0x02C0;
+    /// AnsiCodePageData (pointer to CPTABLEINFO for ACP, e.g. code page 1252)
+    pub const ANSI_CODE_PAGE_DATA: usize = 0x00A0;
+    /// OemCodePageData (pointer to CPTABLEINFO for OEM code page, e.g. 437)
+    pub const OEM_CODE_PAGE_DATA: usize = 0x00A8;
+    /// UnicodeCaseTableData (pointer to Unicode upper-case table)
+    pub const UNICODE_CASE_TABLE_DATA: usize = 0x00B0;
 }
 
 /// Offsets within RTL_USER_PROCESS_PARAMETERS.
@@ -163,8 +197,9 @@ pub const FAST_PEB_LOCK_SIZE: usize = 0x400;
 ///   +0x000: pointer array (3 × 8 = 24 bytes) — entries for basesrv, winsrv, user32
 ///   +0x100: BASE_STATIC_SERVER_DATA buffer (zeroed, ~2KB)
 ///
-/// Normally populated by CSRSS during CsrClientConnectToServer. Since we patch
-/// CSR out, we provide a zeroed buffer so kernelbase's init code (which reads
+/// Normally populated by CSRSS during process initialization. Since LiteBox
+/// does not provide a CSRSS client connection, we provide a zeroed buffer so
+/// kernelbase's init code (which reads
 /// `PEB->ReadOnlyStaticServerData[1]`) doesn't crash on null dereference.
 pub const STATIC_SERVER_DATA_SIZE: usize = 0x1000;
 
@@ -277,6 +312,8 @@ pub struct PebTebParams {
     pub exe_full_path: alloc::vec::Vec<u16>,
     /// Base filename for LDR BaseDllName (e.g. `node.exe`).
     pub exe_base_name: alloc::vec::Vec<u16>,
+    /// DOS-style current directory (e.g. `C:\work\repo\`).
+    pub current_directory_wide: alloc::vec::Vec<u16>,
     /// Standard I/O handle values (from the handle table).
     pub stdin_handle: u64,
     pub stdout_handle: u64,
@@ -415,9 +452,9 @@ pub fn build_peb_teb_bytes(layout: &PebTebLayout, params: &PebTebParams) -> allo
     // OSPlatformId = VER_PLATFORM_WIN32_NT (2)
     write_u32(peb, peb_offsets::OS_PLATFORM_ID, 2);
     // ImageSubsystem = IMAGE_SUBSYSTEM_WINDOWS_CUI (3) for console apps.
-    // The CSR connection is patched out at load time (CsrClientConnectToServer → ret 0)
-    // so setting CUI here is safe and maintains compatibility with other ntdll checks
-    // that read the subsystem type.
+    // LiteBox does not provide a CSRSS client connection, so setting CUI here
+    // is safe and maintains compatibility with other ntdll checks that read the
+    // subsystem type.
     write_u32(peb, peb_offsets::IMAGE_SUBSYSTEM, 3);
     // Subsystem version: 10.0 (Windows 10)
     write_u32(peb, peb_offsets::IMAGE_SUBSYSTEM_MAJOR_VERSION, 10);
@@ -589,9 +626,14 @@ pub fn build_peb_teb_bytes(layout: &PebTebLayout, params: &PebTebParams) -> allo
         layout.image_path_buffer_va as u64,
     );
 
-    // CurrentDirectory.DosPath — use "C:\" as default
-    let cur_dir: &[u16] = &encode_utf16_static(b"C:\\");
-    let cur_dir_byte_len = (cur_dir.len() * 2) as u16;
+    // CurrentDirectory.DosPath
+    let max_cur_dir_chars = (CUR_DIR_BUFFER_SIZE / 2).saturating_sub(1);
+    let cur_dir_chars = if params.current_directory_wide.len() > max_cur_dir_chars {
+        &params.current_directory_wide[..max_cur_dir_chars]
+    } else {
+        &params.current_directory_wide
+    };
+    let cur_dir_byte_len = (cur_dir_chars.len() * 2) as u16;
     write_u16(
         pp,
         process_params_offsets::CUR_DIR_DOS_PATH_LENGTH,
@@ -697,6 +739,14 @@ pub fn build_peb_teb_bytes(layout: &PebTebLayout, params: &PebTebParams) -> allo
         "PATH=C:\\Windows\\System32",
         "TEMP=C:\\Windows\\Temp",
         "TMP=C:\\Windows\\Temp",
+        "USERPROFILE=C:\\Users\\sandbox",
+        "HOMEDRIVE=C:",
+        "HOMEPATH=\\Users\\sandbox",
+        "APPDATA=C:\\Users\\sandbox\\AppData",
+        "LOCALAPPDATA=C:\\Users\\sandbox\\AppData\\Local",
+        "PYTHONHASHSEED=0",
+        "PYTHONLEGACYWINDOWSSTDIO=1",
+        "PYTHONUNBUFFERED=1",
     ];
     let mut off = env_start;
     for s in env_strings {
@@ -740,7 +790,7 @@ pub fn build_peb_teb_bytes(layout: &PebTebLayout, params: &PebTebParams) -> allo
     write_utf16(
         &mut data[cur_dir_start..cur_dir_start + CUR_DIR_BUFFER_SIZE],
         0,
-        cur_dir,
+        cur_dir_chars,
     );
 
     // ---- PEB_LDR_DATA + LDR_DATA_TABLE_ENTRY for EXE and ntdll ----
@@ -793,7 +843,7 @@ pub fn build_peb_teb_bytes(layout: &PebTebLayout, params: &PebTebParams) -> allo
     // InLoadOrderLinks
     write_u64(ldr, exe_off + 0x00, ntdll_entry_va as u64); // Flink → ntdll
     write_u64(ldr, exe_off + 0x08, head_load as u64); // Blink → Head
-    // InMemoryOrderLinks
+                                                      // InMemoryOrderLinks
     write_u64(ldr, exe_off + 0x10, (ntdll_entry_va + 0x10) as u64);
     write_u64(ldr, exe_off + 0x18, head_mem as u64);
     // InInitializationOrderLinks (EXE is not on the initial init-order list)
@@ -803,7 +853,7 @@ pub fn build_peb_teb_bytes(layout: &PebTebLayout, params: &PebTebParams) -> allo
     write_u64(ldr, exe_off + 0x30, params.image_base as u64);
     // EntryPoint
     write_u64(ldr, exe_off + 0x38, 0); // filled by loader later
-    // SizeOfImage
+                                       // SizeOfImage
     write_u32(ldr, exe_off + 0x40, params.image_size as u32);
     // FullDllName UNICODE_STRING → name at LDR region +0x300
     let exe_full_name: &[u16] = &params.exe_full_path;
@@ -812,7 +862,7 @@ pub fn build_peb_teb_bytes(layout: &PebTebLayout, params: &PebTebParams) -> allo
     write_u16(ldr, exe_off + 0x48, exe_full_name_bytes); // Length
     write_u16(ldr, exe_off + 0x4A, exe_full_name_bytes + 2); // MaximumLength
     write_u64(ldr, exe_off + 0x50, exe_full_name_va as u64); // Buffer
-    // BaseDllName UNICODE_STRING → name at LDR region +0x400
+                                                             // BaseDllName UNICODE_STRING → name at LDR region +0x400
     let exe_base_name: &[u16] = &params.exe_base_name;
     let exe_base_name_va = ldr_va + 0x400;
     let exe_base_name_bytes = (exe_base_name.len() * 2) as u16;
@@ -838,7 +888,7 @@ pub fn build_peb_teb_bytes(layout: &PebTebLayout, params: &PebTebParams) -> allo
     // InLoadOrderLinks
     write_u64(ldr, ntdll_off + 0x00, head_load as u64); // Flink → Head
     write_u64(ldr, ntdll_off + 0x08, exe_entry_va as u64); // Blink → EXE
-    // InMemoryOrderLinks
+                                                           // InMemoryOrderLinks
     write_u64(ldr, ntdll_off + 0x10, head_mem as u64);
     write_u64(ldr, ntdll_off + 0x18, (exe_entry_va + 0x10) as u64);
     // InInitializationOrderLinks: ntdll is the sole initial entry.
@@ -1002,6 +1052,7 @@ mod tests {
             image_path_wide: "\\??\\C:\\hello.exe".encode_utf16().collect(),
             exe_full_path: "C:\\hello.exe".encode_utf16().collect(),
             exe_base_name: "hello.exe".encode_utf16().collect(),
+            current_directory_wide: "C:\\".encode_utf16().collect(),
             stdin_handle: 4,
             stdout_handle: 8,
             stderr_handle: 12,

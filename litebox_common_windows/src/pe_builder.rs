@@ -33,26 +33,12 @@ use crate::pe::{
 
 /// Size of the data header reserved at the start of .text in stub DLLs.
 ///
-/// Layout (24 bytes):
+/// Layout (8 bytes):
 /// - `[0..8]`: callback pointer (address of `syscall_callback`)
-/// - `[8..16]`: forward GS table pointer (guest→host)
-/// - `[16..24]`: reverse GS table pointer (host→guest)
-///
-/// The forward GS table maps guest GS base → host GS base. The reverse
-/// table maps host GS base → guest GS base. Both are allocated and owned
-/// by the platform (not in guest-writable memory). Each trampoline reads
-/// both table pointers so it can handle the case where GS is already the
-/// host TEB (e.g., after Windows kernel resets GS during APC/exception).
-pub const TEXT_HEADER_SIZE: usize = 24;
+pub const TEXT_HEADER_SIZE: usize = 8;
 
 /// RVA of the callback pointer within a stub DLL (offset 0 in .text).
 pub const CALLBACK_PTR_RVA: u32 = 0x1000;
-
-/// RVA of the forward GS lookup table pointer within a stub DLL (offset 8 in .text).
-pub const GS_TABLE_PTR_RVA: u32 = 0x1008;
-
-/// RVA of the reverse GS lookup table pointer within a stub DLL (offset 16 in .text).
-pub const REVERSE_GS_TABLE_PTR_RVA: u32 = 0x1010;
 
 /// An export to include in the generated stub DLL.
 #[derive(Clone, Debug)]
@@ -68,39 +54,25 @@ pub struct StubExport {
 pub enum StubExportKind {
     /// A syscall stub that jumps to the platform's `syscall_callback`.
     ///
-    /// Generated code layout (82 bytes — see `emit_syscall_trampoline`):
+    /// Generated code layout (22 bytes — see `emit_syscall_trampoline`):
     /// ```text
     /// mov r10, rcx                   ;  3 — save arg0
     /// mov eax, <NR>                  ;  5 — syscall number
-    /// rdgsbase r11                   ;  5 — read current GS
-    /// mov rcx, [rip + fwd_gs_tbl]    ;  7 — load forward GS table pointer
-    /// ; Phase 1: forward scan (guest → host)
-    /// cmp [rcx], r11                 ;  3 — match?
-    /// je .found_guest                ;  2 — yes → swap GS
-    /// add rcx, 16                    ;  4 — next entry
-    /// cmp qword [rcx], 0             ;  4 — sentinel?
-    /// jne .probe_fwd                 ;  2 — loop
-    /// ; Phase 2: reverse scan (host → guest) — GS may already be host
-    /// mov rcx, [rip + rev_gs_tbl]    ;  7 — load reverse GS table pointer
-    /// cmp [rcx], r11                 ;  3 — match?
-    /// je .already_host               ;  2 — yes → skip swap
-    /// add rcx, 16                    ;  4 — next entry
-    /// cmp qword [rcx], 0             ;  4 — sentinel?
-    /// jne .probe_rev                 ;  2 — loop
-    /// ud2                            ;  2 — no match → crash
-    /// .found_guest:
-    /// mov rcx, [rcx + 8]            ;  4 — host_gs
-    /// wrgsbase rcx                   ;  5 — restore host GS
-    /// .already_host:
-    /// lea rcx, [rip + <ret>]        ;  7 — return address
-    /// jmp qword [rip + callback]    ;  6 — jump to callback
-    /// ret                           ;  1 — (after callback resumes)
+    /// lea rcx, [rip + <ret>]         ;  7 — return address
+    /// jmp qword [rip + callback]     ;  6 — jump to callback
+    /// ret                            ;  1 — (after callback resumes)
     /// ```
+    ///
+    /// GS is always host TEB now (no GS table scan needed). The trampoline
+    /// simply sets up the syscall number and return address, then jumps
+    /// directly to the host syscall callback.
     SyscallTrampoline { syscall_nr: u32 },
     /// A stub that returns a fixed NTSTATUS immediately.
     ReturnStatus { status: i32 },
     /// Raw code bytes (pre-assembled).
     RawCode { code: Vec<u8> },
+    /// A forwarded export target in `DLL.Function` form.
+    Forwarder { target: String },
 }
 
 impl StubExport {
@@ -128,30 +100,40 @@ impl StubExport {
         }
     }
 
-    /// GetLastError: `mov eax, dword gs:[0x68]; ret`
+    /// Create a forwarded export entry.
+    pub fn forward(name: &str, target: &str) -> Self {
+        Self {
+            name: String::from(name),
+            kind: StubExportKind::Forwarder {
+                target: String::from(target),
+            },
+        }
+    }
+
+    /// GetLastError: `mov eax, dword fs:[0x68]; ret`
     ///
-    /// Reads TEB.LastErrorValue directly via GS segment, matching real
-    /// Windows. Works because GS points to the guest TEB during guest
-    /// execution.
+    /// Reads TEB.LastErrorValue directly via FS segment. Guest TEB is
+    /// accessed through FS (rewritten from GS) so that kernel clobbers
+    /// produce a catchable fault instead of silent corruption.
     pub fn get_last_error() -> Self {
-        // 65 8B 04 25 68 00 00 00 = mov eax, dword ptr gs:[0x68]
+        // 64 8B 04 25 68 00 00 00 = mov eax, dword ptr fs:[0x68]
         // C3                       = ret
         Self::raw(
             "GetLastError",
-            vec![0x65, 0x8B, 0x04, 0x25, 0x68, 0x00, 0x00, 0x00, 0xC3],
+            vec![0x64, 0x8B, 0x04, 0x25, 0x68, 0x00, 0x00, 0x00, 0xC3],
         )
     }
 
-    /// SetLastError: `mov dword gs:[0x68], ecx; ret`
+    /// SetLastError: `mov dword fs:[0x68], ecx; ret`
     ///
     /// Writes TEB.LastErrorValue. Arg is in rcx (Windows x64 calling
     /// convention: first integer arg in rcx).
     pub fn set_last_error() -> Self {
-        // 65 89 0C 25 68 00 00 00 = mov dword ptr gs:[0x68], ecx
+        // 64 89 0C 25 68 00 00 00 = mov dword ptr fs:[0x68], ecx
         // C3                       = ret
         Self::raw(
             "SetLastError",
-            vec![0x65, 0x89, 0x0C, 0x25, 0x68, 0x00, 0x00, 0x00, 0xC3],
+            vec![0x64, 0x89, 0x0C, 0x25, 0x68, 0x00, 0x00, 0x00, 0xC3],
         )
     }
 
@@ -161,14 +143,14 @@ impl StubExport {
     ///
     /// Generated code:
     /// ```text
-    /// mov dword gs:[0x68], <error>   ; set LastError
+    /// mov dword fs:[0x68], <error>   ; set LastError
     /// mov eax, <retval>              ; return value
     /// ret
     /// ```
     pub fn return_status_with_last_error(name: &str, retval: i32, last_error: u32) -> Self {
         let mut code = Vec::with_capacity(18);
-        // mov dword ptr gs:[0x68], imm32
-        code.extend_from_slice(&[0x65, 0xC7, 0x04, 0x25, 0x68, 0x00, 0x00, 0x00]);
+        // mov dword ptr fs:[0x68], imm32
+        code.extend_from_slice(&[0x64, 0xC7, 0x04, 0x25, 0x68, 0x00, 0x00, 0x00]);
         code.extend_from_slice(&last_error.to_le_bytes());
         // mov eax, imm32
         code.push(0xB8);
@@ -181,7 +163,9 @@ impl StubExport {
 
 /// Alignment helpers.
 fn align_up(value: u32, alignment: u32) -> u32 {
-    (value + alignment - 1) & !(alignment - 1)
+    value
+        .checked_add(alignment - 1)
+        .map_or(u32::MAX, |v| v & !(alignment - 1))
 }
 
 /// Build a minimal PE DLL with the given exports.
@@ -208,111 +192,53 @@ pub fn build_stub_dll(dll_name: &str, exports: &[StubExport], image_base: u64) -
     sorted_exports.sort_by(|a, b| a.1.name.as_bytes().cmp(b.1.name.as_bytes()));
 
     // ---- Build .text section content (all function code) ----
-    // Reserve the first 24 bytes for the data header:
-    //   [0..8]   = callback pointer        (patched before load)
-    //   [8..16]  = forward GS table ptr    (patched before load)
-    //   [16..24] = reverse GS table ptr    (patched before load)
+    // Reserve the first 8 bytes for the callback pointer (patched before load).
     let mut text_data = vec![0u8; TEXT_HEADER_SIZE];
 
     // Map from original export index → offset within .text
     let mut code_offsets: Vec<u32> = vec![0; exports.len()];
     for (i, export) in exports.iter().enumerate() {
-        // Align each function to 16 bytes.
-        while !text_data.len().is_multiple_of(16) {
-            text_data.push(0xCC); // INT3 padding
-        }
-        let stub_offset = text_data.len() as u32;
-        code_offsets[i] = stub_offset;
-
         match &export.kind {
+            StubExportKind::Forwarder { .. } => {}
             StubExportKind::SyscallTrampoline { syscall_nr } => {
-                // Two-phase GS scan trampoline (82 bytes):
+                // Align each function to 16 bytes.
+                while !text_data.len().is_multiple_of(16) {
+                    text_data.push(0xCC); // INT3 padding
+                }
+                let stub_offset = text_data.len() as u32;
+                code_offsets[i] = stub_offset;
+                // Simplified trampoline (22 bytes). GS is always host TEB
+                // (never swapped to guest), so no GS table scan is needed.
                 //
                 //  0: mov r10, rcx                          — 3
                 //  3: mov eax, <NR>                         — 5
-                //  8: rdgsbase r11                          — 5
-                // 13: mov rcx, [rip+disp] (fwd GS table)   — 7
-                //     === Phase 1: forward scan (guest → host) ===
-                // 20: cmp [rcx], r11  (.probe_fwd)          — 3
-                // 23: je .found_guest (+34 → 59)            — 2
-                // 25: add rcx, 16                           — 4
-                // 29: cmp qword [rcx], 0                    — 4
-                // 33: jne .probe_fwd (-15 → 20)             — 2
-                //     === Phase 2: reverse scan (host → guest) ===
-                // 35: mov rcx, [rip+disp] (rev GS table)   — 7
-                // 42: cmp [rcx], r11  (.probe_rev)          — 3
-                // 45: je .already_host (+21 → 68)           — 2
-                // 47: add rcx, 16                           — 4
-                // 51: cmp qword [rcx], 0                    — 4
-                // 55: jne .probe_rev (-15 → 42)             — 2
-                // 57: ud2             (miss → crash)        — 2
-                //     === found guest: swap GS ===
-                // 59: mov rcx, [rcx+8]  (.found_guest)     — 4
-                // 63: wrgsbase rcx                          — 5
-                //     === already_host: skip swap ===
-                // 68: lea rcx, [rip+6]  (.already_host)    — 7
-                // 75: jmp [rip+disp]    (callback)          — 6
-                // 81: ret                                   — 1
-                // Total: 82 bytes
+                //  8: lea rcx, [rip+6]                      — 7
+                // 15: jmp qword [rip+disp] (→ callback)     — 6
+                // 21: ret                                   — 1
+                // Total: 22 bytes
 
                 //  0: mov r10, rcx  (49 89 CA)
                 text_data.extend_from_slice(&[0x49, 0x89, 0xCA]);
                 //  3: mov eax, imm32  (B8 xx xx xx xx)
                 text_data.push(0xB8);
                 text_data.extend_from_slice(&syscall_nr.to_le_bytes());
-                //  8: rdgsbase r11  (F3 49 0F AE CB)
-                text_data.extend_from_slice(&[0xF3, 0x49, 0x0F, 0xAE, 0xCB]);
-                // 13: mov rcx, [rip+disp32] — forward GS table ptr at byte 8
-                let rip_after_fwd_load = stub_offset + 20;
-                let fwd_gs_ptr_file_offset = 8u32;
-                let fwd_disp =
-                    (fwd_gs_ptr_file_offset as i32).wrapping_sub(rip_after_fwd_load as i32);
-                text_data.extend_from_slice(&[0x48, 0x8B, 0x0D]);
-                text_data.extend_from_slice(&fwd_disp.to_le_bytes());
-                // 20: cmp [rcx], r11  (4C 39 19)
-                text_data.extend_from_slice(&[0x4C, 0x39, 0x19]);
-                // 23: je .found_guest (+34 → 59)  (74 22)
-                text_data.extend_from_slice(&[0x74, 0x22]);
-                // 25: add rcx, 16  (48 83 C1 10)
-                text_data.extend_from_slice(&[0x48, 0x83, 0xC1, 0x10]);
-                // 29: cmp qword [rcx], 0  (48 83 39 00)
-                text_data.extend_from_slice(&[0x48, 0x83, 0x39, 0x00]);
-                // 33: jne .probe_fwd (-15 → 20)  (75 F1)
-                text_data.extend_from_slice(&[0x75, 0xF1]);
-                // 35: mov rcx, [rip+disp32] — reverse GS table ptr at byte 16
-                let rip_after_rev_load = stub_offset + 42;
-                let rev_gs_ptr_file_offset = 16u32;
-                let rev_disp =
-                    (rev_gs_ptr_file_offset as i32).wrapping_sub(rip_after_rev_load as i32);
-                text_data.extend_from_slice(&[0x48, 0x8B, 0x0D]);
-                text_data.extend_from_slice(&rev_disp.to_le_bytes());
-                // 42: cmp [rcx], r11  (4C 39 19)
-                text_data.extend_from_slice(&[0x4C, 0x39, 0x19]);
-                // 45: je .already_host (+21 → 68)  (74 15)
-                text_data.extend_from_slice(&[0x74, 0x15]);
-                // 47: add rcx, 16  (48 83 C1 10)
-                text_data.extend_from_slice(&[0x48, 0x83, 0xC1, 0x10]);
-                // 51: cmp qword [rcx], 0  (48 83 39 00)
-                text_data.extend_from_slice(&[0x48, 0x83, 0x39, 0x00]);
-                // 55: jne .probe_rev (-15 → 42)  (75 F1)
-                text_data.extend_from_slice(&[0x75, 0xF1]);
-                // 57: ud2 (miss → crash)
-                text_data.extend_from_slice(&[0x0F, 0x0B]);
-                // 59: mov rcx, [rcx+8]  (48 8B 49 08)
-                text_data.extend_from_slice(&[0x48, 0x8B, 0x49, 0x08]);
-                // 63: wrgsbase rcx  (F3 48 0F AE D9)
-                text_data.extend_from_slice(&[0xF3, 0x48, 0x0F, 0xAE, 0xD9]);
-                // 68: lea rcx, [rip+6]  (48 8D 0D 06 00 00 00)
+                //  8: lea rcx, [rip+6]  (48 8D 0D 06 00 00 00)
                 text_data.extend_from_slice(&[0x48, 0x8D, 0x0D, 0x06, 0x00, 0x00, 0x00]);
-                // 75: jmp qword [rip+disp32] → callback ptr at offset 0
-                let rip_after_jmp = stub_offset + 81;
+                // 15: jmp qword [rip+disp32] → callback ptr at offset 0
+                let rip_after_jmp = stub_offset + 21;
                 let jmp_disp = 0i32.wrapping_sub(rip_after_jmp as i32);
                 text_data.extend_from_slice(&[0xFF, 0x25]);
                 text_data.extend_from_slice(&jmp_disp.to_le_bytes());
-                // 81: ret  (C3)
+                // 21: ret  (C3)
                 text_data.push(0xC3);
             }
             StubExportKind::ReturnStatus { status } => {
+                // Align each function to 16 bytes.
+                while !text_data.len().is_multiple_of(16) {
+                    text_data.push(0xCC); // INT3 padding
+                }
+                let stub_offset = text_data.len() as u32;
+                code_offsets[i] = stub_offset;
                 // mov eax, imm32
                 text_data.push(0xB8);
                 text_data.extend_from_slice(&(*status as u32).to_le_bytes());
@@ -320,6 +246,12 @@ pub fn build_stub_dll(dll_name: &str, exports: &[StubExport], image_base: u64) -
                 text_data.push(0xC3);
             }
             StubExportKind::RawCode { code } => {
+                // Align each function to 16 bytes.
+                while !text_data.len().is_multiple_of(16) {
+                    text_data.push(0xCC); // INT3 padding
+                }
+                let stub_offset = text_data.len() as u32;
+                code_offsets[i] = stub_offset;
                 text_data.extend_from_slice(code);
             }
         }
@@ -342,6 +274,7 @@ pub fn build_stub_dll(dll_name: &str, exports: &[StubExport], image_base: u64) -
     //   [ordinal array]            offset 40 + 8*N
     //   [DLL name string]          offset 40 + 10*N
     //   [function name strings]    after DLL name
+    //   [forwarder strings]        after function names
 
     let export_dir_size = size_of::<ImageExportDirectory>() as u32; // 40
     let func_rva_array_offset = export_dir_size;
@@ -360,6 +293,15 @@ pub fn build_stub_dll(dll_name: &str, exports: &[StubExport], image_base: u64) -
         name_offsets_in_strings.push(strings.len() as u32);
         strings.extend_from_slice(export.name.as_bytes());
         strings.push(0);
+    }
+
+    let mut forwarder_offsets_in_strings: Vec<u32> = vec![0; exports.len()];
+    for (orig_idx, export) in exports.iter().enumerate() {
+        if let StubExportKind::Forwarder { target } = &export.kind {
+            forwarder_offsets_in_strings[orig_idx] = strings.len() as u32;
+            strings.extend_from_slice(target.as_bytes());
+            strings.push(0);
+        }
     }
 
     let edata_total_size = strings_offset + strings.len() as u32;
@@ -387,9 +329,14 @@ pub fn build_stub_dll(dll_name: &str, exports: &[StubExport], image_base: u64) -
     // Function RVA array (indexed by ordinal - base)
     // We need to map sorted order back to ordinal order. For simplicity, use
     // the original order as ordinal order: ordinal i → function i.
-    for i in 0..num_exports {
-        let rva = text_section_rva + code_offsets[i as usize];
-        let off = (func_rva_array_offset + i * 4) as usize;
+    for i in 0..num_exports as usize {
+        let rva = match &exports[i].kind {
+            StubExportKind::Forwarder { .. } => {
+                edata_section_rva + strings_offset + forwarder_offsets_in_strings[i]
+            }
+            _ => text_section_rva + code_offsets[i],
+        };
+        let off = (func_rva_array_offset + (i as u32) * 4) as usize;
         edata_data[off..off + 4].copy_from_slice(&rva.to_le_bytes());
     }
 
@@ -1093,6 +1040,48 @@ mod tests {
 
         // Preferred image base should match what we passed
         assert_eq!(parsed.image_base, 0x1800_0000_0000);
+    }
+
+    #[test]
+    fn build_and_parse_forwarded_exports() {
+        let exports = vec![
+            StubExport::forward(
+                "AcquireSRWLockExclusive",
+                "ntdll.RtlAcquireSRWLockExclusive",
+            ),
+            StubExport::forward(
+                "SleepConditionVariableSRW",
+                "kernelbase.SleepConditionVariableSRW",
+            ),
+            StubExport::syscall_stub("WakeByAddressSingle", 0x1234),
+        ];
+
+        let dll_bytes = build_stub_dll("kernel32.dll", &exports, 0x1800_0001_0000);
+        let parsed = PeParsedFile::parse(&dll_bytes).expect("should parse");
+        let pe_exports = parsed.exports(&dll_bytes);
+
+        let acquire = pe_exports
+            .iter()
+            .find(|e| e.name == Some("AcquireSRWLockExclusive"))
+            .expect("AcquireSRWLockExclusive export");
+        let sleep = pe_exports
+            .iter()
+            .find(|e| e.name == Some("SleepConditionVariableSRW"))
+            .expect("SleepConditionVariableSRW export");
+        let wake = pe_exports
+            .iter()
+            .find(|e| e.name == Some("WakeByAddressSingle"))
+            .expect("WakeByAddressSingle export");
+
+        let acquire_forwarder = acquire.forwarder.as_ref().expect("forwarded export");
+        assert_eq!(acquire_forwarder.dll, "ntdll");
+        assert_eq!(acquire_forwarder.function, "RtlAcquireSRWLockExclusive");
+
+        let sleep_forwarder = sleep.forwarder.as_ref().expect("forwarded export");
+        assert_eq!(sleep_forwarder.dll, "kernelbase");
+        assert_eq!(sleep_forwarder.function, "SleepConditionVariableSRW");
+
+        assert!(wake.forwarder.is_none());
     }
 
     #[test]

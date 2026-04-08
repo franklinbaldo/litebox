@@ -80,6 +80,54 @@ pub struct ClientId {
     pub unique_thread: u64,
 }
 
+/// SECURITY_QUALITY_OF_SERVICE: LPC/ALPC connection security settings.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes)]
+pub struct SecurityQualityOfService {
+    pub length: u32,
+    pub impersonation_level: u32,
+    pub context_tracking_mode: u8,
+    pub effective_only: u8,
+    pub _pad: [u8; 2],
+}
+
+/// PORT_VIEW: client-side section mapping description for NtConnectPort.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes)]
+pub struct PortView {
+    pub length: u32,
+    pub _pad0: u32,
+    pub section_handle: u64,
+    pub section_offset: u32,
+    pub _pad1: u32,
+    pub view_size: u64,
+    pub view_base: u64,
+    pub view_remote_base: u64,
+}
+
+/// REMOTE_PORT_VIEW: server-side mapping description returned by NtConnectPort.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes)]
+pub struct RemotePortView {
+    pub length: u32,
+    pub _pad0: u32,
+    pub view_size: u64,
+    pub view_base: u64,
+}
+
+/// PORT_MESSAGE: LPC/ALPC message header.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PortMessage {
+    pub data_length: u16,
+    pub total_length: u16,
+    pub type_: u16,
+    pub data_info_offset: u16,
+    pub client_id: ClientId,
+    pub message_id: u32,
+    pub client_view_size_or_callback_id: u64,
+}
+
 /// FILE_BASIC_INFORMATION (class 4).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes)]
@@ -88,6 +136,21 @@ pub struct FileBasicInformation {
     pub last_access_time: i64,
     pub last_write_time: i64,
     pub change_time: i64,
+    pub file_attributes: u32,
+    pub _pad: u32,
+}
+
+/// FILE_NETWORK_OPEN_INFORMATION (class 34).
+/// Returned by NtQueryFullAttributesFile.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes)]
+pub struct FileNetworkOpenInformation {
+    pub creation_time: i64,
+    pub last_access_time: i64,
+    pub last_write_time: i64,
+    pub change_time: i64,
+    pub allocation_size: i64,
+    pub end_of_file: i64,
     pub file_attributes: u32,
     pub _pad: u32,
 }
@@ -102,6 +165,51 @@ pub struct FileStandardInformation {
     pub delete_pending: u8,
     pub directory: u8,
     pub _pad: [u8; 2],
+}
+
+/// FILE_ID_128.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes)]
+pub struct FileId128 {
+    pub identifier: [u8; 16],
+}
+
+/// FILE_STAT_INFORMATION (class 68).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes)]
+pub struct FileStatInformation {
+    pub file_id: i64,
+    pub creation_time: i64,
+    pub last_access_time: i64,
+    pub last_write_time: i64,
+    pub change_time: i64,
+    pub allocation_size: i64,
+    pub end_of_file: i64,
+    pub file_attributes: u32,
+    pub reparse_tag: u32,
+    pub number_of_links: u32,
+    pub effective_access: u32,
+}
+
+/// FILE_STAT_BASIC_INFORMATION (class 77).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes)]
+pub struct FileStatBasicInformation {
+    pub file_id: i64,
+    pub creation_time: i64,
+    pub last_access_time: i64,
+    pub last_write_time: i64,
+    pub change_time: i64,
+    pub allocation_size: i64,
+    pub end_of_file: i64,
+    pub file_attributes: u32,
+    pub reparse_tag: u32,
+    pub number_of_links: u32,
+    pub device_type: u32,
+    pub device_characteristics: u32,
+    pub reserved: u32,
+    pub volume_serial_number: i64,
+    pub file_id128: FileId128,
 }
 
 /// FILE_POSITION_INFORMATION (class 14).
@@ -183,6 +291,17 @@ pub mod mem_alloc_type {
     pub const MEM_RELEASE: u32 = 0x8000;
     pub const MEM_RESET: u32 = 0x0008_0000;
     pub const MEM_TOP_DOWN: u32 = 0x0010_0000;
+
+    // Placeholder memory flags (Windows 10 1803+).
+    // Used by V8 and other JIT engines for virtual memory reservation management.
+    pub const MEM_COALESCE_PLACEHOLDERS: u32 = 0x0000_0001;
+    pub const MEM_PRESERVE_PLACEHOLDER: u32 = 0x0000_0002;
+    /// Passed with MEM_RESERVE in VirtualAlloc2/NtAllocateVirtualMemoryEx.
+    pub const MEM_RESERVE_PLACEHOLDER: u32 = 0x0004_0000;
+    /// Passed with MEM_COMMIT|MEM_RESERVE in VirtualAlloc2 to replace a
+    /// placeholder with committed pages. Same numeric value as MEM_DECOMMIT
+    /// but used in allocation context, not free context.
+    pub const MEM_REPLACE_PLACEHOLDER: u32 = 0x0000_4000;
 }
 
 /// Memory state constants returned by NtQueryVirtualMemory.

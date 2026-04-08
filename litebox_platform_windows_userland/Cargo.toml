@@ -21,6 +21,7 @@ windows-sys = { version = "0.60.2", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_ProcessStatus",
     "Win32_System_WindowsProgramming",
+    "Win32_System_Pipes",
 ] }
 zerocopy = { version = "0.8", default-features = false }
 

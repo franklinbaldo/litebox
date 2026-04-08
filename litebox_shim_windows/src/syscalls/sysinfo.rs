@@ -38,11 +38,12 @@ pub(crate) fn nt_query_system_information(ctx: &mut super::super::ExecutionConte
             const SBI_SIZE: usize = 64;
             if (info_length as usize) < SBI_SIZE || info_ptr == 0 {
                 if return_length_ptr != 0 {
-                    unsafe {
-                        core::ptr::write(return_length_ptr as *mut u32, SBI_SIZE as u32);
-                    }
+                    crate::try_write_guest_value_unaligned(return_length_ptr, SBI_SIZE as u32);
                 }
                 return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
+            }
+            if !crate::is_addr_range_writable(info_ptr, SBI_SIZE) {
+                return NtStatus::STATUS_ACCESS_VIOLATION;
             }
             // Zero-fill then set key fields.
             // Layout (x64, 64 bytes):
@@ -83,9 +84,7 @@ pub(crate) fn nt_query_system_information(ctx: &mut super::super::ExecutionConte
                 core::ptr::write(base.add(0x38), GUEST_ACTIVE_PROCESSOR_COUNT);
             }
             if return_length_ptr != 0 {
-                unsafe {
-                    core::ptr::write(return_length_ptr as *mut u32, SBI_SIZE as u32);
-                }
+                crate::try_write_guest_value_unaligned(return_length_ptr, SBI_SIZE as u32);
             }
             NtStatus::STATUS_SUCCESS
         }
@@ -94,11 +93,12 @@ pub(crate) fn nt_query_system_information(ctx: &mut super::super::ExecutionConte
             const SPI_SIZE: usize = 12;
             if (info_length as usize) < SPI_SIZE || info_ptr == 0 {
                 if return_length_ptr != 0 {
-                    unsafe {
-                        core::ptr::write(return_length_ptr as *mut u32, SPI_SIZE as u32);
-                    }
+                    crate::try_write_guest_value_unaligned(return_length_ptr, SPI_SIZE as u32);
                 }
                 return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
+            }
+            if !crate::is_addr_range_writable(info_ptr, SPI_SIZE) {
+                return NtStatus::STATUS_ACCESS_VIOLATION;
             }
             unsafe {
                 core::ptr::write_bytes(info_ptr as *mut u8, 0, SPI_SIZE);
@@ -111,9 +111,7 @@ pub(crate) fn nt_query_system_information(ctx: &mut super::super::ExecutionConte
                 core::ptr::write(base.add(4).cast::<u16>(), 0x4E03);
             }
             if return_length_ptr != 0 {
-                unsafe {
-                    core::ptr::write(return_length_ptr as *mut u32, SPI_SIZE as u32);
-                }
+                crate::try_write_guest_value_unaligned(return_length_ptr, SPI_SIZE as u32);
             }
             NtStatus::STATUS_SUCCESS
         }
@@ -123,13 +121,13 @@ pub(crate) fn nt_query_system_information(ctx: &mut super::super::ExecutionConte
             if (info_length as usize) < 8 || info_ptr == 0 {
                 return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
             }
+            let write_len = core::cmp::min(info_length as usize, 48);
+            if !crate::is_addr_range_writable(info_ptr, write_len) {
+                return NtStatus::STATUS_ACCESS_VIOLATION;
+            }
             let now = windows_filetime_now();
             unsafe {
-                core::ptr::write_bytes(
-                    info_ptr as *mut u8,
-                    0,
-                    core::cmp::min(info_length as usize, 48),
-                );
+                core::ptr::write_bytes(info_ptr as *mut u8, 0, write_len);
                 core::ptr::write(info_ptr as *mut i64, now);
             }
             NtStatus::STATUS_SUCCESS
@@ -138,6 +136,9 @@ pub(crate) fn nt_query_system_information(ctx: &mut super::super::ExecutionConte
         50 => {
             if (info_length as usize) < 8 || info_ptr == 0 {
                 return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
+            }
+            if !crate::is_addr_range_writable(info_ptr, 8) {
+                return NtStatus::STATUS_ACCESS_VIOLATION;
             }
             // Kernel range start on Windows x64.
             unsafe {
@@ -150,11 +151,12 @@ pub(crate) fn nt_query_system_information(ctx: &mut super::super::ExecutionConte
             const SBIE_SIZE: usize = 64;
             if (info_length as usize) < SBIE_SIZE || info_ptr == 0 {
                 if return_length_ptr != 0 {
-                    unsafe {
-                        core::ptr::write(return_length_ptr as *mut u32, SBIE_SIZE as u32);
-                    }
+                    crate::try_write_guest_value_unaligned(return_length_ptr, SBIE_SIZE as u32);
                 }
                 return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
+            }
+            if !crate::is_addr_range_writable(info_ptr, SBIE_SIZE) {
+                return NtStatus::STATUS_ACCESS_VIOLATION;
             }
             unsafe {
                 core::ptr::write_bytes(info_ptr as *mut u8, 0, SBIE_SIZE);
@@ -172,9 +174,7 @@ pub(crate) fn nt_query_system_information(ctx: &mut super::super::ExecutionConte
                 core::ptr::write(base.add(0x38), GUEST_ACTIVE_PROCESSOR_COUNT);
             }
             if return_length_ptr != 0 {
-                unsafe {
-                    core::ptr::write(return_length_ptr as *mut u32, SBIE_SIZE as u32);
-                }
+                crate::try_write_guest_value_unaligned(return_length_ptr, SBIE_SIZE as u32);
             }
             NtStatus::STATUS_SUCCESS
         }
@@ -192,11 +192,12 @@ pub(crate) fn nt_query_system_information(ctx: &mut super::super::ExecutionConte
             const PGI_SIZE: usize = 48;
             if (info_length as usize) < PGI_SIZE || info_ptr == 0 {
                 if return_length_ptr != 0 {
-                    unsafe {
-                        core::ptr::write(return_length_ptr as *mut u32, PGI_SIZE as u32);
-                    }
+                    crate::try_write_guest_value_unaligned(return_length_ptr, PGI_SIZE as u32);
                 }
                 return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
+            }
+            if !crate::is_addr_range_writable(info_ptr, PGI_SIZE) {
+                return NtStatus::STATUS_ACCESS_VIOLATION;
             }
             unsafe {
                 core::ptr::write_bytes(info_ptr as *mut u8, 0, PGI_SIZE);
@@ -209,9 +210,7 @@ pub(crate) fn nt_query_system_information(ctx: &mut super::super::ExecutionConte
                 core::ptr::write(base.add(40).cast::<u64>(), GUEST_ACTIVE_PROCESSOR_MASK);
             }
             if return_length_ptr != 0 {
-                unsafe {
-                    core::ptr::write(return_length_ptr as *mut u32, PGI_SIZE as u32);
-                }
+                crate::try_write_guest_value_unaligned(return_length_ptr, PGI_SIZE as u32);
             }
             NtStatus::STATUS_SUCCESS
         }
@@ -220,11 +219,12 @@ pub(crate) fn nt_query_system_information(ctx: &mut super::super::ExecutionConte
             const SCI_SIZE: usize = 8;
             if (info_length as usize) < SCI_SIZE || info_ptr == 0 {
                 if return_length_ptr != 0 {
-                    unsafe {
-                        core::ptr::write(return_length_ptr as *mut u32, SCI_SIZE as u32);
-                    }
+                    crate::try_write_guest_value_unaligned(return_length_ptr, SCI_SIZE as u32);
                 }
                 return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
+            }
+            if !crate::is_addr_range_writable(info_ptr, SCI_SIZE) {
+                return NtStatus::STATUS_ACCESS_VIOLATION;
             }
             unsafe {
                 core::ptr::write_bytes(info_ptr as *mut u8, 0, SCI_SIZE);
@@ -235,9 +235,7 @@ pub(crate) fn nt_query_system_information(ctx: &mut super::super::ExecutionConte
                 core::ptr::write(base.add(4).cast::<u32>(), 0x40);
             }
             if return_length_ptr != 0 {
-                unsafe {
-                    core::ptr::write(return_length_ptr as *mut u32, SCI_SIZE as u32);
-                }
+                crate::try_write_guest_value_unaligned(return_length_ptr, SCI_SIZE as u32);
             }
             NtStatus::STATUS_SUCCESS
         }
@@ -248,15 +246,16 @@ pub(crate) fn nt_query_system_information(ctx: &mut super::super::ExecutionConte
             if (info_length as usize) < 8 || info_ptr == 0 {
                 return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
             }
+            if !crate::is_addr_range_writable(info_ptr, 8) {
+                return NtStatus::STATUS_ACCESS_VIOLATION;
+            }
             // Return 0 (no hypervisor shared page available). ntdll should
             // fall back to syscall-based time queries.
             unsafe {
                 core::ptr::write(info_ptr as *mut u64, 0);
             }
             if return_length_ptr != 0 {
-                unsafe {
-                    core::ptr::write(return_length_ptr as *mut u32, 8);
-                }
+                crate::try_write_guest_value_unaligned(return_length_ptr, 8u32);
             }
             NtStatus::STATUS_SUCCESS
         }
@@ -265,13 +264,14 @@ pub(crate) fn nt_query_system_information(ctx: &mut super::super::ExecutionConte
             // Return zeroed data for reasonable buffer sizes to satisfy queries
             // we don't need to implement precisely (NUMA info, security, etc.).
             if info_ptr != 0 && info_length > 0 && info_length <= 0x10000 {
+                if !crate::is_addr_range_writable(info_ptr, info_length as usize) {
+                    return NtStatus::STATUS_ACCESS_VIOLATION;
+                }
                 unsafe {
                     core::ptr::write_bytes(info_ptr as *mut u8, 0, info_length as usize);
                 }
                 if return_length_ptr != 0 {
-                    unsafe {
-                        core::ptr::write(return_length_ptr as *mut u32, info_length);
-                    }
+                    crate::try_write_guest_value_unaligned(return_length_ptr, info_length);
                 }
                 NtStatus::STATUS_SUCCESS
             } else {
@@ -302,8 +302,12 @@ pub(crate) fn nt_query_system_information_ex(ctx: &mut super::super::ExecutionCo
     let args = NtSyscallArgs::from_ctx(ctx);
     let info_class = args.arg0 as u32;
     let info_ptr = args.arg3;
-    let info_length = unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const u32) };
-    let return_length_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x30) as *const usize) };
+    let Some(info_length) = crate::try_read_guest_value_unaligned::<u32>(ctx.regs.rsp + 0x28)
+    else {
+        return NtStatus::STATUS_ACCESS_VIOLATION;
+    };
+    let return_length_ptr =
+        crate::try_read_guest_value_unaligned::<usize>(ctx.regs.rsp + 0x30).unwrap_or(0);
 
     #[cfg(debug_assertions)]
     {
@@ -344,9 +348,7 @@ pub(crate) fn nt_query_system_information_ex(ctx: &mut super::super::ExecutionCo
             const ENTRY_SIZE: u32 = 80;
             if info_ptr == 0 || info_length < ENTRY_SIZE {
                 if return_length_ptr != 0 {
-                    unsafe {
-                        core::ptr::write(return_length_ptr as *mut u32, ENTRY_SIZE);
-                    }
+                    crate::try_write_guest_value_unaligned(return_length_ptr, ENTRY_SIZE);
                 }
                 #[cfg(debug_assertions)]
                 {
@@ -356,6 +358,9 @@ pub(crate) fn nt_query_system_information_ex(ctx: &mut super::super::ExecutionCo
                     ));
                 }
                 return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
+            }
+            if !crate::is_addr_range_writable(info_ptr, ENTRY_SIZE as usize) {
+                return NtStatus::STATUS_ACCESS_VIOLATION;
             }
             unsafe {
                 let base = info_ptr as *mut u8;
@@ -377,9 +382,7 @@ pub(crate) fn nt_query_system_information_ex(ctx: &mut super::super::ExecutionCo
                 core::ptr::write(base.add(0x48).cast::<u64>(), GUEST_ACTIVE_PROCESSOR_MASK);
             }
             if return_length_ptr != 0 {
-                unsafe {
-                    core::ptr::write(return_length_ptr as *mut u32, ENTRY_SIZE);
-                }
+                crate::try_write_guest_value_unaligned(return_length_ptr, ENTRY_SIZE);
             }
             NtStatus::STATUS_SUCCESS
         }
@@ -391,14 +394,15 @@ pub(crate) fn nt_query_system_information_ex(ctx: &mut super::super::ExecutionCo
         0xD2 | 0xD3 => {
             // Zero the output buffer (may already be zero, but be safe).
             if info_ptr != 0 && info_length > 0 {
+                if !crate::is_addr_range_writable(info_ptr, info_length as usize) {
+                    return NtStatus::STATUS_ACCESS_VIOLATION;
+                }
                 unsafe {
                     core::ptr::write_bytes(info_ptr as *mut u8, 0, info_length as usize);
                 }
             }
             if return_length_ptr != 0 {
-                unsafe {
-                    core::ptr::write(return_length_ptr as *mut u32, info_length);
-                }
+                crate::try_write_guest_value_unaligned(return_length_ptr, info_length);
             }
             NtStatus::STATUS_SUCCESS
         }
@@ -415,9 +419,7 @@ pub(crate) fn nt_query_system_information_ex(ctx: &mut super::super::ExecutionCo
                 ));
             }
             if return_length_ptr != 0 {
-                unsafe {
-                    core::ptr::write(return_length_ptr as *mut u32, 0);
-                }
+                crate::try_write_guest_value_unaligned(return_length_ptr, 0u32);
             }
             NtStatus(0xC0000004_u32 as i32) // STATUS_INFO_NOT_FOUND
         }
@@ -442,28 +444,19 @@ pub(crate) fn nt_query_performance_counter(ctx: &mut super::super::ExecutionCont
         return NtStatus::STATUS_ACCESS_VIOLATION;
     }
 
-    // Use the platform's monotonic clock for the counter value.
-    // On Windows, QPC frequency is typically 10 MHz.
-    // We'll use a fixed 10 MHz frequency and derive the counter from
-    // the current FILETIME (100ns intervals).
-    const QPC_FREQUENCY: i64 = 10_000_000; // 10 MHz
+    let (counter_value, frequency_value) =
+        host_query_performance_counter().unwrap_or((windows_filetime_now(), 10_000_000));
 
-    // Get current time as 100ns intervals since boot (approximation).
-    // We use FILETIME as a monotonic-ish source. For proper monotonic
-    // time, we'd use QueryPerformanceCounter, but from no_std we
-    // approximate with system time.
-    let now = windows_filetime_now();
-    // Scale: FILETIME is 100ns units, QPC at 10MHz is also 100ns.
-    let counter_value = now;
+    if !crate::is_addr_range_writable(counter_ptr, core::mem::size_of::<i64>()) {
+        return NtStatus::STATUS_ACCESS_VIOLATION;
+    }
 
     unsafe {
         core::ptr::write(counter_ptr as *mut i64, counter_value);
     }
 
     if frequency_ptr != 0 {
-        unsafe {
-            core::ptr::write(frequency_ptr as *mut i64, QPC_FREQUENCY);
-        }
+        crate::try_write_guest_value_unaligned(frequency_ptr, frequency_value);
     }
 
     NtStatus::STATUS_SUCCESS
@@ -482,6 +475,10 @@ pub(crate) fn nt_query_system_time(ctx: &mut super::super::ExecutionContext) -> 
     let time_ptr = args.arg0;
 
     if time_ptr == 0 {
+        return NtStatus::STATUS_ACCESS_VIOLATION;
+    }
+
+    if !crate::is_addr_range_writable(time_ptr, core::mem::size_of::<i64>()) {
         return NtStatus::STATUS_ACCESS_VIOLATION;
     }
 
@@ -508,14 +505,41 @@ pub(crate) fn nt_query_system_time(ctx: &mut super::super::ExecutionContext) -> 
 pub(crate) fn nt_query_information_process(
     ctx: &mut super::super::ExecutionContext,
     init_state: Option<&super::super::NtInitState>,
+    shared: &super::super::NtSharedState,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
-    let _handle = args.arg0;
+    let handle = args.arg0;
     let info_class = args.arg1 as u32;
     let info_ptr = args.arg2;
     let info_length = args.arg3 as u32;
 
-    let return_length_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
+    let return_length_ptr =
+        crate::try_read_guest_value_unaligned::<usize>(ctx.regs.rsp + 0x28).unwrap_or(0);
+
+    // Check if this is a virtual process handle (not the current-process pseudo-handle).
+    let virtual_process_exit_code: Option<i32> = {
+        let handle_u32 = handle as u32;
+        // Pseudo-handles: -1 (0xFFFFFFFF) = current process, -2 = current thread.
+        if handle != usize::MAX && handle != (usize::MAX - 1) {
+            let handles = shared.handles.lock();
+            handles
+                .with(handle_u32, |entry| {
+                    if let crate::handle_table::NtObject::Process { state } = &entry.object {
+                        if state.exited.load(core::sync::atomic::Ordering::Acquire) {
+                            Some(state.exit_code.load(core::sync::atomic::Ordering::Acquire))
+                        } else {
+                            // Still running — ExitStatus = STATUS_PENDING (0x103).
+                            Some(0x103)
+                        }
+                    } else {
+                        None
+                    }
+                })
+                .flatten()
+        } else {
+            None
+        }
+    };
 
     match info_class {
         // ProcessBasicInformation (0)
@@ -525,106 +549,139 @@ pub(crate) fn nt_query_information_process(
             if (info_length as usize) < PBI_SIZE || info_ptr == 0 {
                 return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
             }
+            if !crate::is_addr_range_writable(info_ptr, PBI_SIZE) {
+                return NtStatus::STATUS_ACCESS_VIOLATION;
+            }
             unsafe {
                 core::ptr::write_bytes(info_ptr as *mut u8, 0, PBI_SIZE);
                 let base = info_ptr as *mut u8;
-                // ExitStatus at offset 0 (NTSTATUS) — 0x103 = STATUS_PENDING
-                core::ptr::write(base.cast::<u32>(), 0x103);
+                // ExitStatus at offset 0 (NTSTATUS) — 0x103 = STATUS_PENDING for current process.
+                let exit_status = virtual_process_exit_code.unwrap_or(0x103) as u32;
+                core::ptr::write(base.cast::<u32>(), exit_status);
                 // PebBaseAddress at offset 8 (PPEB)
-                let peb_va = init_state.map_or(0usize, |s| s.peb_va);
+                let peb_va = if virtual_process_exit_code.is_some() {
+                    0usize // Virtual process has no PEB.
+                } else {
+                    init_state.map_or(0usize, |s| s.peb_va)
+                };
                 core::ptr::write(base.add(8).cast::<u64>(), peb_va as u64);
                 // UniqueProcessId at offset 16 (ULONG_PTR)
                 core::ptr::write(base.add(16).cast::<u64>(), 4); // fake PID
-                // InheritedFromUniqueProcessId at offset 24 ... leave as 0
+                                                                 // InheritedFromUniqueProcessId at offset 24 ... leave as 0
             }
             if return_length_ptr != 0 {
-                unsafe {
-                    core::ptr::write(return_length_ptr as *mut u32, PBI_SIZE as u32);
-                }
+                crate::try_write_guest_value_unaligned(return_length_ptr, PBI_SIZE as u32);
             }
             NtStatus::STATUS_SUCCESS
         }
         // ProcessDebugPort (7) — no debugger attached.
         7 => {
             if info_ptr != 0 && info_length >= 8 {
+                if !crate::is_addr_range_writable(info_ptr, 8) {
+                    return NtStatus::STATUS_ACCESS_VIOLATION;
+                }
                 unsafe {
                     core::ptr::write(info_ptr as *mut u64, 0); // no debug port
                 }
             }
             if return_length_ptr != 0 {
-                unsafe {
-                    core::ptr::write(return_length_ptr as *mut u32, 8);
-                }
+                crate::try_write_guest_value_unaligned(return_length_ptr, 8u32);
             }
             NtStatus::STATUS_SUCCESS
         }
         // ProcessDebugFlags (0x1F = 31)
         0x1F => {
             if info_ptr != 0 && info_length >= 4 {
+                if !crate::is_addr_range_writable(info_ptr, 4) {
+                    return NtStatus::STATUS_ACCESS_VIOLATION;
+                }
                 unsafe {
                     // 1 = PROCESS_DEBUG_INHERIT (not being debugged)
                     core::ptr::write(info_ptr as *mut u32, 1);
                 }
             }
             if return_length_ptr != 0 {
-                unsafe {
-                    core::ptr::write(return_length_ptr as *mut u32, 4);
+                crate::try_write_guest_value_unaligned(return_length_ptr, 4u32);
+            }
+            NtStatus::STATUS_SUCCESS
+        }
+        // ProcessDefaultHardErrorMode (0xC = 12)
+        12 => {
+            if info_ptr == 0 || info_length < 4 {
+                if return_length_ptr != 0 {
+                    crate::try_write_guest_value_unaligned(return_length_ptr, 4u32);
                 }
+                return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
+            }
+            if !crate::is_addr_range_writable(info_ptr, 4) {
+                return NtStatus::STATUS_ACCESS_VIOLATION;
+            }
+            let mode = shared
+                .default_hard_error_mode
+                .load(core::sync::atomic::Ordering::Acquire);
+            unsafe {
+                core::ptr::write(info_ptr as *mut u32, mode);
+            }
+            if return_length_ptr != 0 {
+                crate::try_write_guest_value_unaligned(return_length_ptr, 4u32);
             }
             NtStatus::STATUS_SUCCESS
         }
         // ProcessCookie (0x24 = 36) — returns a random non-zero u32 cookie
         36 => {
             if info_ptr != 0 && info_length >= 4 {
+                if !crate::is_addr_range_writable(info_ptr, 4) {
+                    return NtStatus::STATUS_ACCESS_VIOLATION;
+                }
                 unsafe {
                     // Return a fixed non-zero cookie value (real kernel returns random)
                     core::ptr::write(info_ptr as *mut u32, 0x5981937B_u32);
                 }
             }
             if return_length_ptr != 0 {
-                unsafe {
-                    core::ptr::write(return_length_ptr as *mut u32, 4);
-                }
+                crate::try_write_guest_value_unaligned(return_length_ptr, 4u32);
             }
             NtStatus::STATUS_SUCCESS
         }
         // ProcessHandleCount (0x14 = 20)
         0x14 => {
             if info_ptr != 0 && info_length >= 4 {
+                if !crate::is_addr_range_writable(info_ptr, 4) {
+                    return NtStatus::STATUS_ACCESS_VIOLATION;
+                }
                 unsafe {
                     core::ptr::write(info_ptr as *mut u32, 16); // fake handle count
                 }
             }
             if return_length_ptr != 0 {
-                unsafe {
-                    core::ptr::write(return_length_ptr as *mut u32, 4);
-                }
+                crate::try_write_guest_value_unaligned(return_length_ptr, 4u32);
             }
             NtStatus::STATUS_SUCCESS
         }
         // ProcessHandleCheckingMode (0x25 = 37) — return 0 (disabled)
         37 => {
             if info_ptr != 0 && info_length >= 4 {
+                if !crate::is_addr_range_writable(info_ptr, 4) {
+                    return NtStatus::STATUS_ACCESS_VIOLATION;
+                }
                 unsafe {
                     core::ptr::write(info_ptr as *mut u32, 0);
                 }
             }
             if return_length_ptr != 0 {
-                unsafe {
-                    core::ptr::write(return_length_ptr as *mut u32, 4);
-                }
+                crate::try_write_guest_value_unaligned(return_length_ptr, 4u32);
             }
             NtStatus::STATUS_SUCCESS
         }
         // ProcessImageInformation (44) — return success with zeroed data.
         44 => {
             if info_ptr != 0 && info_length >= 8 {
+                let write_len = core::cmp::min(info_length as usize, 64);
+                if !crate::is_addr_range_writable(info_ptr, write_len) {
+                    return NtStatus::STATUS_ACCESS_VIOLATION;
+                }
                 unsafe {
-                    core::ptr::write_bytes(
-                        info_ptr as *mut u8,
-                        0,
-                        core::cmp::min(info_length as usize, 64),
-                    );
+                    core::ptr::write_bytes(info_ptr as *mut u8, 0, write_len);
                 }
             }
             NtStatus::STATUS_SUCCESS
@@ -633,12 +690,12 @@ pub(crate) fn nt_query_information_process(
         52 | 63 => {
             // Return zeroed data (no mitigations enabled).
             if info_ptr != 0 && info_length > 0 {
+                let write_len = core::cmp::min(info_length as usize, 128);
+                if !crate::is_addr_range_writable(info_ptr, write_len) {
+                    return NtStatus::STATUS_ACCESS_VIOLATION;
+                }
                 unsafe {
-                    core::ptr::write_bytes(
-                        info_ptr as *mut u8,
-                        0,
-                        core::cmp::min(info_length as usize, 128),
-                    );
+                    core::ptr::write_bytes(info_ptr as *mut u8, 0, write_len);
                 }
             }
             NtStatus::STATUS_SUCCESS
@@ -669,13 +726,23 @@ pub(crate) fn nt_delay_execution(
         return NtStatus::STATUS_ACCESS_VIOLATION;
     }
 
-    let delay_100ns = unsafe { core::ptr::read(delay_ptr as *const i64) };
+    let Some(delay_100ns) = crate::try_read_guest_value_unaligned::<i64>(delay_ptr) else {
+        return NtStatus::STATUS_ACCESS_VIOLATION;
+    };
 
     // Negative = relative time in 100ns units.
+    // Positive = absolute time (100ns since 1601-01-01); convert to relative.
     let sleep_us = match delay_100ns.cmp(&0) {
         core::cmp::Ordering::Less => delay_100ns.unsigned_abs() / 10,
         core::cmp::Ordering::Equal => 0,
-        core::cmp::Ordering::Greater => 0,
+        core::cmp::Ordering::Greater => {
+            let now = windows_filetime_now() as u64;
+            if (delay_100ns as u64) > now {
+                (delay_100ns as u64 - now) / 10
+            } else {
+                0 // deadline already passed
+            }
+        }
     };
 
     if sleep_us > 0 {
@@ -724,9 +791,8 @@ pub(crate) fn windows_filetime_now_pub() -> i64 {
     windows_filetime_now()
 }
 
-/// Read a high-resolution monotonic counter in nanoseconds (approximate).
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-fn perf_counter_now() -> u64 {
+pub(crate) fn host_query_performance_counter() -> Option<(i64, i64)> {
     unsafe extern "system" {
         fn QueryPerformanceCounter(counter: *mut i64) -> i32;
         fn QueryPerformanceFrequency(freq: *mut i64) -> i32;
@@ -735,12 +801,27 @@ fn perf_counter_now() -> u64 {
     let mut counter: i64 = 0;
     let mut freq: i64 = 0;
     unsafe {
-        QueryPerformanceCounter(&raw mut counter);
-        QueryPerformanceFrequency(&raw mut freq);
+        if QueryPerformanceCounter(&raw mut counter) == 0
+            || QueryPerformanceFrequency(&raw mut freq) == 0
+            || freq <= 0
+        {
+            return None;
+        }
     }
-    if freq == 0 {
+    Some((counter, freq))
+}
+
+#[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+pub(crate) fn host_query_performance_counter() -> Option<(i64, i64)> {
+    None
+}
+
+/// Read a high-resolution monotonic counter in nanoseconds (approximate).
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+fn perf_counter_now() -> u64 {
+    let Some((counter, freq)) = host_query_performance_counter() else {
         return 0;
-    }
+    };
     // Convert to nanoseconds: counter * 1_000_000_000 / freq
     // Use 128-bit math to avoid overflow.
     ((counter as u128 * 1_000_000_000) / freq as u128) as u64

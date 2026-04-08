@@ -130,6 +130,8 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
     #[cold]
     fn read_contended(&self) {
         let mut state = self.spin_read();
+        let mut attempted_stale_writer_recovery = false;
+        let mut stale_writer_notify_seq = 0;
 
         loop {
             // If we can lock it, lock it.
@@ -143,9 +145,58 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
                     Ok(_) => return, // Locked!
                     Err(s) => {
                         state = s;
+                        attempted_stale_writer_recovery = false;
                         continue;
                     }
                 }
+            }
+
+            if state == WRITERS_WAITING {
+                // LiteBox can tear down a waiter thread while it is contending
+                // on this lock. If that happens, the writers-waiting bit can be
+                // left behind with no live writer to consume it, and readers
+                // would otherwise sleep forever on an unlocked lock. Give any
+                // real blocked writer one wake attempt plus a short spin window
+                // to claim the lock; if the state remains stuck at the exact
+                // writers-waiting sentinel after that, atomically clear the
+                // stale waiter bit, then give blocked writers one more wake
+                // opportunity before any reader tries to recover the lock.
+                if !attempted_stale_writer_recovery {
+                    stale_writer_notify_seq = self.writer_notify.underlying_atomic().load(Acquire);
+                    self.wake_writer();
+                    stale_writer_notify_seq = stale_writer_notify_seq.wrapping_add(1);
+                    attempted_stale_writer_recovery = true;
+                    state = self.spin_until(|s| s != WRITERS_WAITING);
+                    if state != WRITERS_WAITING {
+                        attempted_stale_writer_recovery = false;
+                    }
+                    continue;
+                }
+                if self.writer_notify.underlying_atomic().load(Acquire) != stale_writer_notify_seq {
+                    state = self.spin_read();
+                    attempted_stale_writer_recovery = false;
+                    continue;
+                }
+                match self.state.underlying_atomic().compare_exchange(
+                    WRITERS_WAITING,
+                    0,
+                    Relaxed,
+                    Relaxed,
+                ) {
+                    Ok(_) => {
+                        self.wake_writer();
+                        state = self.spin_until(|s| s != 0);
+                        attempted_stale_writer_recovery = false;
+                    }
+                    Err(s) => {
+                        state = s;
+                        attempted_stale_writer_recovery = false;
+                    }
+                }
+                if !is_read_lockable(state) {
+                    state = self.spin_read();
+                }
+                continue;
             }
 
             // Check for overflow.
@@ -164,6 +215,7 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
                 )
             {
                 state = s;
+                attempted_stale_writer_recovery = false;
                 continue;
             }
 
@@ -173,6 +225,7 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
 
             // Spin again after waking up.
             state = self.spin_read();
+            attempted_stale_writer_recovery = false;
         }
     }
 
@@ -709,3 +762,31 @@ unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send> Send for RwLock<Platfo
 // writer can transfer `T` between threads, but the `Sync` bound is necessary,
 // too, since readers on multiple threads can share `T` simultaneously.
 unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send + Sync> Sync for RwLock<Platform, T> {}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use core::sync::atomic::Ordering::Relaxed;
+
+    use super::{READ_LOCKED, RawRwLock, WRITERS_WAITING};
+    use crate::platform::{RawMutex as _, mock::MockPlatform};
+
+    #[test]
+    fn reader_recovers_from_unowned_writer_wait_bit() {
+        let lock = RawRwLock::<MockPlatform>::new();
+        lock.state
+            .underlying_atomic()
+            .store(WRITERS_WAITING, Relaxed);
+
+        lock.read();
+
+        assert_eq!(lock.state.underlying_atomic().load(Relaxed), READ_LOCKED);
+
+        unsafe {
+            lock.read_unlock();
+        }
+
+        assert_eq!(lock.state.underlying_atomic().load(Relaxed), 0);
+    }
+}

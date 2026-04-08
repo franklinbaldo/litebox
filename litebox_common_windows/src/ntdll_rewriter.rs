@@ -38,7 +38,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::{NtSyscallId, NtSyscallMap, name_to_syscall_id};
+use crate::{name_to_syscall_id, NtSyscallId, NtSyscallMap};
 
 /// Result of rewriting an ntdll image.
 pub struct NtdllRewriteResult {
@@ -50,16 +50,6 @@ pub struct NtdllRewriteResult {
     /// The runner must write the actual shim syscall_entry address here
     /// after mapping the trampoline.
     pub entry_ptr_offset: usize,
-    /// Offset within the trampoline where the 8-byte forward GS table pointer
-    /// lives (guest_gs → host_gs). The runner must write the platform's
-    /// forward GS lookup table address here.
-    pub gs_table_ptr_offset: usize,
-    /// Offset within the trampoline where the 8-byte reverse GS table pointer
-    /// lives (host_gs → guest_gs). The runner must write the platform's
-    /// reverse GS lookup table address here. This table is used to detect
-    /// that GS is already the host TEB (e.g., after kernel exception dispatch)
-    /// and skip the swap.
-    pub reverse_gs_table_ptr_offset: usize,
     /// Number of syscall stubs that were rewritten (JMP-patched).
     pub stubs_rewritten: usize,
     /// Number of stubs whose export name matched a known `NtSyscallId`.
@@ -70,8 +60,8 @@ pub struct NtdllRewriteResult {
     /// Syscall number → export name for stubs NOT in `NtSyscallId`.
     /// Useful for debugging which unhandled syscalls are being called.
     pub unhandled_stubs: Vec<(u32, String)>,
-    /// Number of `int 0x29` (__fastfail) instructions that were replaced
-    /// with `int 3` (breakpoint) to keep them catchable by VEH.
+    /// Reserved for compatibility; fastfail patching is disabled so the
+    /// strict syscall-only boundary does not rewrite non-syscall instructions.
     pub fastfail_patched: usize,
 }
 
@@ -86,6 +76,18 @@ const SYSCALL_TAIL: [u8; 5] = [0x75, 0x03, 0x0F, 0x05, 0xC3];
 
 /// Size of one page (trampoline allocation unit).
 const PAGE_SIZE: usize = 4096;
+
+/// Offset within the trampoline page of the APC return stub.
+///
+/// Guest-VA code that re-enters the shim when a user-mode APC routine
+/// completes.  The shim pushes this address as the APC routine's return
+/// address.  When the routine `ret`s here, `eax` is set to
+/// [`APC_RETURN_MARKER`] and control transfers to the trampoline entry.
+pub const APC_RETURN_STUB_OFFSET: usize = 0x20;
+
+/// Synthetic syscall number used by the APC return stub to signal "APC
+/// routine just returned" rather than a real NT syscall.
+pub const APC_RETURN_MARKER: u32 = 0xFFFF_FFFE;
 
 /// Rewrite an ntdll.dll PE image in memory.
 ///
@@ -149,16 +151,12 @@ pub fn rewrite_ntdll(
     //
     // Layout:
     //   +0x00: 8-byte shim entry pointer (filled by runner)
-    //   +0x08: 8-byte forward GS table pointer (guest→host, filled by runner)
-    //   +0x10: 8-byte reverse GS table pointer (host→guest, filled by runner)
-    //   +0x18: trampoline code
+    //   +0x08: trampoline code
 
     let mut trampoline = vec![0xCCu8; PAGE_SIZE]; // fill with INT3 for safety
 
     let entry_ptr_offset = 0usize; // shim entry ptr at +0x00
-    let gs_table_ptr_offset = 8usize; // forward GS table ptr at +0x08
-    let reverse_gs_table_ptr_offset = 16usize; // reverse GS table ptr at +0x10
-    let code_offset = 24usize; // code starts at +0x18
+    let code_offset = 8usize; // code starts at +0x08
     let trampoline_code_va = trampoline_va + code_offset as u64;
 
     let mut off = code_offset;
@@ -175,100 +173,13 @@ pub fn rewrite_ntdll(
     // that follows the JMP.  The platform pushes RCX as pt_regs->ip.
     // When the guest resumes there, the `ret` pops the real return
     // address and control returns to the original caller.
-
-    // rdgsbase r11  (F3 49 0F AE CB) — current GS → R11
-    trampoline[off..off + 5].copy_from_slice(&[0xF3, 0x49, 0x0F, 0xAE, 0xCB]);
-    off += 5;
-
-    // === Phase 1: scan forward table (guest_gs → host_gs) ===
     //
-    // mov rcx, [rip+disp32]  (48 8B 0D xx xx xx xx) — load forward GS table ptr
-    let rip_after_fwd_mov = off + 7;
-    let fwd_mov_disp = (gs_table_ptr_offset as i32) - (rip_after_fwd_mov as i32);
-    trampoline[off..off + 3].copy_from_slice(&[0x48, 0x8B, 0x0D]);
-    trampoline[off + 3..off + 7].copy_from_slice(&fwd_mov_disp.to_le_bytes());
-    off += 7;
-
-    // .probe_fwd:
-    let probe_fwd_off = off;
-    // cmp [rcx], r11  (4C 39 19)
-    trampoline[off..off + 3].copy_from_slice(&[0x4C, 0x39, 0x19]);
-    off += 3;
-
-    // je .found_guest  (74 xx) — forward jump, will patch
-    let je_found_guest_off = off;
-    trampoline[off] = 0x74;
-    off += 2;
-
-    // add rcx, 16  (48 83 C1 10)
-    trampoline[off..off + 4].copy_from_slice(&[0x48, 0x83, 0xC1, 0x10]);
-    off += 4;
-
-    // cmp qword [rcx], 0  (48 83 39 00) — sentinel?
-    trampoline[off..off + 4].copy_from_slice(&[0x48, 0x83, 0x39, 0x00]);
-    off += 4;
-
-    // jne .probe_fwd  (75 xx)
-    let back_disp = (probe_fwd_off as i32) - (off as i32 + 2);
-    trampoline[off] = 0x75;
-    trampoline[off + 1] = back_disp as u8;
-    off += 2;
-
-    // === Phase 2: scan reverse table (host_gs → guest_gs) ===
-    // Not found in forward table. Check if GS is already the host TEB.
-    //
-    // mov rcx, [rip+disp32]  (48 8B 0D xx xx xx xx) — load reverse GS table ptr
-    let rip_after_rev_mov = off + 7;
-    let rev_mov_disp = (reverse_gs_table_ptr_offset as i32) - (rip_after_rev_mov as i32);
-    trampoline[off..off + 3].copy_from_slice(&[0x48, 0x8B, 0x0D]);
-    trampoline[off + 3..off + 7].copy_from_slice(&rev_mov_disp.to_le_bytes());
-    off += 7;
-
-    // .probe_rev:
-    let probe_rev_off = off;
-    // cmp [rcx], r11  (4C 39 19)
-    trampoline[off..off + 3].copy_from_slice(&[0x4C, 0x39, 0x19]);
-    off += 3;
-
-    // je .already_host  (74 xx) — forward jump, will patch
-    let je_already_host_off = off;
-    trampoline[off] = 0x74;
-    off += 2;
-
-    // add rcx, 16  (48 83 C1 10)
-    trampoline[off..off + 4].copy_from_slice(&[0x48, 0x83, 0xC1, 0x10]);
-    off += 4;
-
-    // cmp qword [rcx], 0  (48 83 39 00) — sentinel?
-    trampoline[off..off + 4].copy_from_slice(&[0x48, 0x83, 0x39, 0x00]);
-    off += 4;
-
-    // jne .probe_rev  (75 xx)
-    let back_disp_rev = (probe_rev_off as i32) - (off as i32 + 2);
-    trampoline[off] = 0x75;
-    trampoline[off + 1] = back_disp_rev as u8;
-    off += 2;
-
-    // ud2 (0F 0B) — not in either table
-    trampoline[off..off + 2].copy_from_slice(&[0x0F, 0x0B]);
-    off += 2;
-
-    // .found_guest: swap GS from guest to host
-    let found_guest_off = off;
-    trampoline[je_found_guest_off + 1] = (found_guest_off - (je_found_guest_off + 2)) as u8;
-
-    // mov rcx, [rcx+8]  (48 8B 49 08) — host GS from forward table
-    trampoline[off..off + 4].copy_from_slice(&[0x48, 0x8B, 0x49, 0x08]);
-    off += 4;
-
-    // wrgsbase rcx  (F3 48 0F AE D9) — swap to host GS
-    trampoline[off..off + 5].copy_from_slice(&[0xF3, 0x48, 0x0F, 0xAE, 0xD9]);
-    off += 5;
-
-    // .already_host: GS is already host TEB, skip swap
-    let already_host_off = off;
-    trampoline[je_already_host_off + 1] = (already_host_off - (je_already_host_off + 2)) as u8;
-
+    // The trampoline is deliberately trivial: no GS swap, no RFLAGS
+    // manipulation.  The GS swap is done by `syscall_callback` in host
+    // code, following the same architecture as the Linux platform.
+    // This eliminates the reentrancy window where an exception in the
+    // guest-VA trampoline during a GS swap could cause `switch_to_guest`
+    // to re-apply guest GS, breaking the transition.
     // lea rcx, [rip+6]  (48 8D 0D 06 00 00 00) — rcx = addr of `ret` below
     trampoline[off..off + 7].copy_from_slice(&[0x48, 0x8D, 0x0D, 0x06, 0x00, 0x00, 0x00]);
     off += 7;
@@ -283,6 +194,25 @@ pub fn rewrite_ntdll(
 
     // ret  (C3) — resume point: pops the caller's actual return address
     trampoline[off] = 0xC3;
+    off += 1;
+
+    // Pad to offset 0x20 for alignment.
+    off = 0x20;
+
+    // APC return stub at +0x20: guest-VA code that re-enters the shim when
+    // a user-mode APC routine completes (i.e. the APC routine `ret`s to this
+    // address).  Sets EAX to a special marker so the shim knows this is an
+    // APC return rather than a regular syscall, then jumps to the trampoline.
+    //
+    //   +0x20: mov eax, 0xFFFFFFFE    (B8 FE FF FF FF)  — APC return marker
+    //   +0x25: jmp <trampoline_code>  (EB xx)           — short jump to +0x08
+    trampoline[off] = 0xB8; // mov eax, imm32
+    trampoline[off + 1..off + 5].copy_from_slice(&0xFFFF_FFFEu32.to_le_bytes());
+    off += 5;
+    // Short JMP: offset = target - (current + 2) = 0x08 - (0x27) = -0x1F
+    trampoline[off] = 0xEB; // jmp rel8
+    trampoline[off + 1] = (-0x1Fi8) as u8;
+    let _ = off;
 
     // Now scan the image for syscall stubs and rewrite them.
 
@@ -300,8 +230,6 @@ pub fn rewrite_ntdll(
                 image,
                 trampoline,
                 entry_ptr_offset,
-                gs_table_ptr_offset,
-                reverse_gs_table_ptr_offset,
                 stubs_rewritten: 0,
                 stubs_identified: 0,
                 syscall_map: NtSyscallMap::from_pairs(&[]),
@@ -328,9 +256,18 @@ pub fn rewrite_ntdll(
             let stub_rva = (i - text_file_start) as u64 + u64::from(text_rva);
             let jmp_site_va = ntdll_load_va + stub_rva + 16;
             let jmp_rip = jmp_site_va + 5;
-            let rel32 = (trampoline_code_va as i64 - jmp_rip as i64) as i32;
+            let distance = trampoline_code_va as i64 - jmp_rip as i64;
+            assert!(
+                distance.abs() < i64::from(i32::MAX),
+                "trampoline too far from ntdll stub: distance={distance:#x}"
+            );
+            let rel32 = distance as i32;
             image[i + 16] = 0xE9;
             image[i + 17..i + 21].copy_from_slice(&rel32.to_le_bytes());
+            // Overwrite the remaining int 2e; ret tail with INT3 to prevent bypass.
+            image[i + 21] = 0xCC;
+            image[i + 22] = 0xCC;
+            image[i + 23] = 0xCC;
 
             // If the stub has an export name we recognise, record the mapping.
             // The syscall number in the stub is NOT modified — it stays as the
@@ -353,34 +290,7 @@ pub fn rewrite_ntdll(
         i += 1;
     }
 
-    // ── Neutralize `int 0x29` (__fastfail) instructions ──
-    //
-    // `int 0x29` triggers the Windows __fastfail mechanism, which
-    // terminates the process WITHOUT delivering the exception to VEH
-    // handlers.  Since the guest runs in the same host process, an
-    // uncaught __fastfail kills the sandbox.
-    //
-    // We replace every `CD 29` in ntdll's .text section with `EB 00`
-    // (JMP +0, i.e. jump to next instruction = NOP).  This is safer
-    // than `90 90` (two NOPs) because `90 90` could interfere with
-    // instruction alignment if the scanner hits a false-positive
-    // `CD 29` that is actually operand bytes.  `EB 00` is a 2-byte
-    // no-op that preserves the instruction boundary.
-    //
-    // When __fastfail is neutralized, the code after it (typically a
-    // `ret`) executes normally.  If the stack cookie WAS corrupted,
-    // the guest will likely crash at a subsequent access, which the
-    // sandbox CAN catch via VEH.
-    let mut fastfail_patched = 0usize;
-    let mut j = text_file_start;
-    while j + 1 < text_file_end {
-        if image[j] == 0xCD && image[j + 1] == 0x29 {
-            image[j] = 0xEB; // JMP rel8
-            image[j + 1] = 0x00; // offset 0 → fall through
-            fastfail_patched += 1;
-        }
-        j += 1;
-    }
+    let fastfail_patched = 0usize;
 
     let syscall_map = NtSyscallMap::from_pairs(&syscall_pairs);
 
@@ -388,8 +298,6 @@ pub fn rewrite_ntdll(
         image,
         trampoline,
         entry_ptr_offset,
-        gs_table_ptr_offset,
-        reverse_gs_table_ptr_offset,
         stubs_rewritten,
         stubs_identified,
         syscall_map,
@@ -494,7 +402,8 @@ fn build_export_rva_map(pe_data: &[u8]) -> Vec<(u32, String)> {
             let sec_vsize = u32::from_le_bytes(pe_data[off + 8..off + 12].try_into().ok()?);
             let range = sec_raw_size.max(sec_vsize);
             if rva >= sec_va && rva < sec_va + range {
-                return Some((sec_raw_ptr + (rva - sec_va)) as usize);
+                let file_off = sec_raw_ptr.checked_add(rva - sec_va)?;
+                return Some(file_off as usize);
             }
         }
         None
@@ -544,10 +453,11 @@ fn build_export_rva_map(pe_data: &[u8]) -> Vec<(u32, String)> {
             None => continue,
         };
         // Read NUL-terminated name.
-        let name_end = pe_data[name_file..]
+        let remaining = pe_data.len().saturating_sub(name_file);
+        let name_end = pe_data[name_file..pe_data.len().min(name_file + 256)]
             .iter()
             .position(|&b| b == 0)
-            .unwrap_or(256);
+            .unwrap_or(remaining.min(256));
         let name = match core::str::from_utf8(&pe_data[name_file..name_file + name_end]) {
             Ok(s) => String::from(s),
             Err(_) => continue,

@@ -266,6 +266,11 @@ static API_SET_MAP: &[ApiSetEntry] = &[
         prefix: "api-ms-win-eventing-provider-l1-1",
         target: "kernelbase.dll",
     },
+    // GDI runtime delay-load contracts
+    ApiSetEntry {
+        prefix: "ext-ms-win-gdi-internal-uap-init-l1-1",
+        target: "gdi32full.dll",
+    },
     // Fibers
     ApiSetEntry {
         prefix: "api-ms-win-core-fibers-l1-1",
@@ -363,6 +368,10 @@ mod tests {
         assert_eq!(
             resolve_apiset("api-ms-win-core-file-l1-1-1.dll"),
             Some("kernelbase.dll")
+        );
+        assert_eq!(
+            resolve_apiset("ext-ms-win-gdi-internal-uap-init-l1-1-0.dll"),
+            Some("gdi32full.dll")
         );
         // Case-insensitive
         assert_eq!(

@@ -11,7 +11,6 @@
     clippy::unused_self,
     reason = "by convention, syscalls and related methods take &self even if unused"
 )]
-#![cfg_attr(feature = "trace_syscalls", allow(clippy::used_underscore_binding))]
 
 extern crate alloc;
 
@@ -49,7 +48,6 @@ pub(crate) mod channel;
 pub mod loader;
 #[cfg_attr(not(test), allow(dead_code))]
 mod multihost;
-pub mod multiplexer;
 pub(crate) mod stdio;
 pub mod syscalls;
 pub mod transport;
@@ -95,103 +93,6 @@ pub struct LinuxShimEntrypoints<FS: ShimFS> {
     // The task should not be moved once it's bound to a platform thread so that
     // we preserve the ability to use TLS in the future.
     _not_send: core::marker::PhantomData<*const ()>,
-}
-
-impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
-    /// Install a host-backed pipe FD into the restored child's descriptor table.
-    ///
-    /// Called by the runner after `restore_process` to replace virtual pipe
-    /// endpoints with real OS pipe FDs for cross-host-process communication.
-    /// This replaces any existing pipe endpoint at the given guest FD number.
-    pub fn install_host_pipe_fd(
-        &self,
-        guest_fd: usize,
-        host_fd: i32,
-        direction: syscalls::host_pipe::HostPipeDirection,
-    ) {
-        let entry = syscalls::host_pipe::HostPipeFd::new(host_fd, direction);
-        let mut dt = self.task.global.litebox.descriptor_table_mut();
-        let typed_fd: litebox::fd::TypedFd<syscalls::host_pipe::HostPipeSubsystem> =
-            dt.insert(entry);
-        drop(dt);
-
-        let files = self.task.files.borrow();
-        let mut rds = files.raw_descriptor_store.write();
-
-        // Remove the existing entry at this slot, regardless of subsystem type.
-        // The slot might hold a virtual Pipe (from snapshot), a StdioFd (from
-        // the init process if fd_table restore is not yet implemented), or
-        // nothing at all.  Close the consumed descriptor properly to avoid
-        // leaking descriptor-table entries.
-        if let Ok(old_pipe) =
-            rds.fd_consume_raw_integer::<litebox::pipes::Pipes<Platform>>(guest_fd)
-        {
-            drop(rds);
-            let _ = self.task.global.pipes.close(&old_pipe);
-            rds = files.raw_descriptor_store.write();
-        } else if let Ok(old_fs) = rds.fd_consume_raw_integer::<FS>(guest_fd) {
-            drop(rds);
-            let _ = files.fs.close(&old_fs);
-            rds = files.raw_descriptor_store.write();
-        } else if let Ok(old_sock) =
-            rds.fd_consume_raw_integer::<syscalls::unix::UnixSocketSubsystem<FS>>(guest_fd)
-        {
-            // Remove descriptor table entry to avoid leaking the socket.
-            drop(rds);
-            let _ = self
-                .task
-                .global
-                .litebox
-                .descriptor_table_mut()
-                .remove(&old_sock);
-            rds = files.raw_descriptor_store.write();
-        }
-
-        // Install the HostPipe FD at the same guest fd number.
-        let ok = rds.fd_into_specific_raw_integer(typed_fd, guest_fd);
-        debug_assert!(ok, "install_host_pipe_fd: slot {guest_fd} still occupied");
-    }
-
-    /// Install a virtual pipe FD for a multiplexer stream endpoint.
-    ///
-    /// Called by the runner after `restore_process` to replace the restored
-    /// virtual fd at `guest_fd` with the given pipe endpoint (half of a new
-    /// virtual pipe pair whose other half is connected to the mux dispatcher).
-    pub fn install_mux_pipe_fd(
-        &self,
-        guest_fd: usize,
-        pipe_fd: litebox::fd::TypedFd<litebox::pipes::Pipes<Platform>>,
-    ) {
-        let files = self.task.files.borrow();
-        let mut rds = files.raw_descriptor_store.write();
-
-        // Consume the existing entry at this slot.
-        if let Ok(old_pipe) =
-            rds.fd_consume_raw_integer::<litebox::pipes::Pipes<Platform>>(guest_fd)
-        {
-            drop(rds);
-            let _ = self.task.global.pipes.close(&old_pipe);
-            rds = files.raw_descriptor_store.write();
-        } else if let Ok(old_fs) = rds.fd_consume_raw_integer::<FS>(guest_fd) {
-            drop(rds);
-            let _ = files.fs.close(&old_fs);
-            rds = files.raw_descriptor_store.write();
-        } else if let Ok(old_sock) =
-            rds.fd_consume_raw_integer::<syscalls::unix::UnixSocketSubsystem<FS>>(guest_fd)
-        {
-            drop(rds);
-            let _ = self
-                .task
-                .global
-                .litebox
-                .descriptor_table_mut()
-                .remove(&old_sock);
-            rds = files.raw_descriptor_store.write();
-        }
-
-        let ok = rds.fd_into_specific_raw_integer(pipe_fd, guest_fd);
-        debug_assert!(ok, "install_mux_pipe_fd: slot {guest_fd} still occupied");
-    }
 }
 
 impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
@@ -382,12 +283,11 @@ impl LinuxShimBuilder {
             host_tty_foreground_pgrp: litebox::sync::Mutex::new(
                 litebox::process::ProcessGroupId::from(litebox::process::ProcessId::INIT),
             ),
-            host_tty_shadow_termios: litebox::sync::Mutex::new(None),
+            host_tty_shadow_termios: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
             local_control_plane_pump_active: core::sync::atomic::AtomicBool::new(false),
             transport_interrupt: alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false)),
             epoll_graph_lock: litebox::sync::Mutex::new(()),
             control_plane,
-            fork_child_host_pids: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
         });
         LinuxShim {
             global,
@@ -487,9 +387,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 syscall_restartable: Cell::new(false),
                 in_syscall: Cell::new(false),
                 deferred_vfork_park: Cell::new(false),
-                delayed_fork_pending: Cell::new(false),
-                migrated_to_remote: Cell::new(false),
-                mux_pipe_pair_ids: RefCell::new(Vec::new()),
+                suppress_elf_runtime_patch: Cell::new(false),
             },
         };
         let exec_filename = alloc::ffi::CString::new(exec_filename).ok();
@@ -561,603 +459,6 @@ impl<FS: ShimFS> LinuxShim<FS> {
 
     pub fn litebox(&self) -> &LiteBox<Platform> {
         &self.global.litebox
-    }
-
-    /// Restore a child process from a fork snapshot.
-    ///
-    /// Instead of loading an ELF binary, this reconstructs the child process
-    /// state from the serialized snapshot captured at the fork trap. The
-    /// returned [`LoadedProgram`] can be passed to `run_thread()` just like
-    /// a freshly loaded program.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if restore fails (e.g., the snapshot references
-    /// unsupported state).
-    #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
-    pub fn restore_process(
-        &self,
-        snapshot: syscalls::fork_snapshot::ForkSnapshot,
-        fs: alloc::sync::Arc<FS>,
-    ) -> Result<LoadedProgram<FS>, Errno> {
-        use litebox::mm::linux::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize, VmFlags};
-        use litebox::platform::AddressSpaceProvider;
-        use litebox::platform::RawMutex as _;
-
-        let is_delayed_fork = snapshot.is_delayed_fork;
-        let syscalls::fork_snapshot::ForkSnapshot {
-            identity: id,
-            process_wide: pw,
-            thread: th,
-            signal: sig,
-            fs: fs_snap,
-            fd_table,
-            memory: mem,
-            is_delayed_fork: _,
-        } = snapshot;
-
-        // Reserve the child's thread ID so future clone() calls don't collide.
-        self.global.reserve_thread_id(id.pid);
-
-        // --- 1. Allocate the same VA partition slot used by the parent. ------
-        // The snapshot addresses are absolute within the parent's partition.
-        // Rather than rebasing all addresses, we allocate the same slot in the
-        // child worker so va_rebase == 0.
-        //
-        // The worker's init process occupies slot 0.  If the snapshot came from
-        // a different slot (e.g. slot 1), we allocate slots sequentially until
-        // we get the matching one, then free the extras and init's slot.
-        let init_as_id = self.process_state.address_space_id;
-        let snapshot_va_start = mem.metadata.va_range.start;
-
-        // Determine which slot the snapshot was taken from by finding the slot
-        // whose range contains the snapshot's VA start.
-        // Destroy init's slot first so it's available for reuse.
-        self.global
-            .platform
-            .destroy_address_space(init_as_id)
-            .map_err(|_| Errno::ENOMEM)?;
-
-        // Allocate slots until we get one whose range matches the snapshot.
-        let mut temp_slots = alloc::vec::Vec::new();
-        let child_as_id = loop {
-            let id = self.global.platform.create_address_space().map_err(|_| {
-                // Clean up any temp slots on failure.
-                for &s in &temp_slots {
-                    let _ = self.global.platform.destroy_address_space(s);
-                }
-                Errno::ENOMEM
-            })?;
-            let range = self.global.platform.address_space_range(id).map_err(|_| {
-                // Clean up the just-created slot and all temp slots.
-                let _ = self.global.platform.destroy_address_space(id);
-                for &s in &temp_slots {
-                    let _ = self.global.platform.destroy_address_space(s);
-                }
-                Errno::ENOMEM
-            })?;
-            if range.start <= snapshot_va_start && snapshot_va_start < range.end {
-                break id;
-            }
-            temp_slots.push(id);
-        };
-        // Free the temporary slots we allocated to skip past.
-        for s in temp_slots {
-            let _ = self.global.platform.destroy_address_space(s);
-        }
-
-        let as_range = self
-            .global
-            .platform
-            .address_space_range(child_as_id)
-            .map_err(|_| Errno::ENOMEM)?;
-
-        let child_pm: PageManager<Platform, { PAGE_SIZE }> =
-            PageManager::new(&self.global.litebox, as_range.clone());
-
-        // Compute VA rebase offset (should be 0 since we matched the slot).
-        let snapshot_va_start = mem.metadata.va_range.start;
-        let child_va_start = as_range.start;
-        let va_rebase: isize = child_va_start as isize - snapshot_va_start as isize;
-        debug_assert_eq!(
-            va_rebase, 0,
-            "non-zero va_rebase not fully supported: signal handlers would be stale"
-        );
-
-        // --- 2. Restore memory regions. ------------------------------------
-        for region in &mem.regions {
-            let vm_flags = VmFlags::from_bits_truncate(region.vm_flags);
-            let has_read = vm_flags.contains(VmFlags::VM_READ);
-            let has_write = vm_flags.contains(VmFlags::VM_WRITE);
-            let has_exec = vm_flags.contains(VmFlags::VM_EXEC);
-
-            let rebased_addr = (region.addr as isize + va_rebase) as usize;
-
-            // Clip regions that extend past the partition ceiling (e.g. ld.so
-            // mapped at the very top with last page spilling over).
-            let region_end = rebased_addr.saturating_add(region.len);
-            let clipped_len = if region_end > as_range.end {
-                as_range.end.saturating_sub(rebased_addr)
-            } else {
-                region.len
-            };
-            if clipped_len == 0 {
-                continue;
-            }
-
-            let addr = NonZeroAddress::<PAGE_SIZE>::new(rebased_addr).ok_or(Errno::EINVAL)?;
-            let len = NonZeroPageSize::<PAGE_SIZE>::new(clipped_len).ok_or(Errno::EINVAL)?;
-
-            let mut flags = CreatePagesFlags::FIXED_ADDR;
-            if region.is_shared {
-                flags |= CreatePagesFlags::SHARED;
-            }
-
-            let data = if region.data.len() > clipped_len {
-                &region.data[..clipped_len]
-            } else {
-                &region.data
-            };
-
-            // Choose the create method that matches the final permissions.
-            unsafe {
-                match (has_read, has_write, has_exec) {
-                    (true, true, true) => {
-                        child_pm.create_rwx_pages(Some(addr), len, flags, |ptr| {
-                            if !data.is_empty() {
-                                ptr.write_slice_at_offset(0, data)
-                                    .ok_or(litebox::mm::linux::MappingError::OutOfMemory)?;
-                            }
-                            Ok(data.len())
-                        })
-                    }
-                    (true | false, false, true) => {
-                        child_pm.create_executable_pages(Some(addr), len, flags, |ptr| {
-                            if !data.is_empty() {
-                                ptr.write_slice_at_offset(0, data)
-                                    .ok_or(litebox::mm::linux::MappingError::OutOfMemory)?;
-                            }
-                            Ok(data.len())
-                        })
-                    }
-                    (true | false, true, false) => {
-                        child_pm.create_writable_pages(Some(addr), len, flags, |ptr| {
-                            if !data.is_empty() {
-                                ptr.write_slice_at_offset(0, data)
-                                    .ok_or(litebox::mm::linux::MappingError::OutOfMemory)?;
-                            }
-                            Ok(data.len())
-                        })
-                    }
-                    (true, false, false) => {
-                        child_pm.create_readable_pages(Some(addr), len, flags, |ptr| {
-                            if !data.is_empty() {
-                                ptr.write_slice_at_offset(0, data)
-                                    .ok_or(litebox::mm::linux::MappingError::OutOfMemory)?;
-                            }
-                            Ok(data.len())
-                        })
-                    }
-                    // PROT_NONE or other combinations: create writable first
-                    // to copy data, then downgrade to inaccessible.
-                    _ => {
-                        let ptr =
-                            child_pm.create_writable_pages(Some(addr), len, flags, |ptr| {
-                                if !data.is_empty() {
-                                    ptr.write_slice_at_offset(0, data)
-                                        .ok_or(litebox::mm::linux::MappingError::OutOfMemory)?;
-                                }
-                                Ok(data.len())
-                            })?;
-                        child_pm
-                            .make_pages_inaccessible(ptr, len.as_usize())
-                            .map_err(|_| litebox::mm::linux::MappingError::OutOfMemory)?;
-                        Ok(ptr)
-                    }
-                }
-                .map_err(|e| {
-                    litebox::log_println!(
-                        self.global.platform,
-                        "[FORK-RESTORE-DIAG] region addr={:#x} len={:#x} rwx={}/{}/{} err={:?}",
-                        rebased_addr,
-                        region.len,
-                        has_read,
-                        has_write,
-                        has_exec,
-                        e
-                    );
-                    Errno::ENOMEM
-                })?;
-            }
-        }
-
-        // --- 3. Restore brk metadata (pages already mapped above). ----------
-        let pm_meta = &mem.metadata;
-        if pm_meta.brk_base != 0 {
-            let rb = |addr: usize| (addr as isize + va_rebase) as usize;
-            child_pm.restore_brk_metadata(
-                rb(pm_meta.brk_base),
-                rb(pm_meta.brk),
-                rb(pm_meta.brk_frontier),
-            );
-        }
-
-        // --- 4. Build the child ProcessState. -------------------------------
-        let rb = |addr: usize| (addr as isize + va_rebase) as usize;
-        let elf_patch_cache: alloc::collections::BTreeMap<i32, syscalls::mm::ElfPatchState> =
-            pm_meta
-                .elf_patch_entries
-                .iter()
-                .map(|e| {
-                    (
-                        e.fd,
-                        syscalls::mm::ElfPatchState {
-                            _base_addr: rb(e.base_addr),
-                            pre_patched: e.pre_patched,
-                            trampoline_file_offset: e.trampoline_file_offset,
-                            trampoline_file_size: e.trampoline_file_size,
-                            _trampoline_vaddr: e.trampoline_vaddr,
-                            trampoline_addr: rb(e.trampoline_addr),
-                            trampoline_cursor: rb(e.trampoline_cursor),
-                            trampoline_mapped: e.trampoline_mapped,
-                            trampoline_mapped_len: e.trampoline_mapped_len,
-                            runtime_patches_committed: e.runtime_patches_committed,
-                            file_path: e.file_path.clone(),
-                        },
-                    )
-                })
-                .collect();
-
-        let proc_map_paths: Vec<(core::ops::Range<usize>, alloc::string::String)> = pm_meta
-            .proc_map_paths
-            .iter()
-            .map(|(range, path)| (rb(range.start)..rb(range.end), path.clone()))
-            .collect();
-
-        // --- 5. Re-patch trampoline entry points. ---------------------------
-        // Each rewriter trampoline region starts with an 8-byte pointer to the
-        // host's syscall_callback. The snapshot captured the parent host's
-        // address; update it to the child host's address.
-        let new_syscall_entry = {
-            use litebox::platform::SystemInfoProvider as _;
-            self.global.platform.get_syscall_entry_point()
-        };
-        let old_syscall_entry = pm_meta.old_syscall_entry_point;
-        if new_syscall_entry != 0
-            && old_syscall_entry != 0
-            && new_syscall_entry != old_syscall_entry
-        {
-            use litebox::platform::RawMutPointer as _;
-
-            // First patch any entries tracked in the elf_patch_cache (runtime-
-            // patched libraries).
-            for state in elf_patch_cache.values() {
-                if !state.trampoline_mapped {
-                    continue;
-                }
-                let tramp_addr = state.trampoline_addr;
-                let tramp_page_len = state.trampoline_mapped_len;
-                let tramp_ptr = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer::<
-                    u8,
-                >::from_usize(tramp_addr);
-                // SAFETY: no concurrent access — child hasn't started yet.
-                unsafe {
-                    let _ = child_pm.make_pages_writable(tramp_ptr, tramp_page_len);
-                }
-                let _ = tramp_ptr.copy_from_slice(0, &new_syscall_entry.to_le_bytes());
-                unsafe {
-                    let _ = child_pm.make_pages_executable(tramp_ptr, tramp_page_len);
-                }
-            }
-
-            // Also scan all restored RX memory regions for trampolines that
-            // were created by the ELF loader (not in elf_patch_cache).
-            // A trampoline region's first 8 bytes contain the host's syscall
-            // entry point address.
-            let old_bytes = old_syscall_entry.to_le_bytes();
-            for region in &mem.regions {
-                let vm_flags = VmFlags::from_bits_truncate(region.vm_flags);
-                if !vm_flags.contains(VmFlags::VM_EXEC) {
-                    continue;
-                }
-                // Check if the first 8 bytes of the region data match the old entry.
-                if region.data.len() >= 8 && region.data[..8] == old_bytes {
-                    let rebased_addr = (region.addr as isize + va_rebase) as usize;
-                    let page_len = (region.len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-                    let tramp_ptr =
-                        <Platform as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>
-                            ::from_usize(rebased_addr);
-                    // SAFETY: no concurrent access — child hasn't started yet.
-                    unsafe {
-                        let _ = child_pm.make_pages_writable(tramp_ptr, page_len);
-                    }
-                    let _ = tramp_ptr.copy_from_slice(0, &new_syscall_entry.to_le_bytes());
-                    unsafe {
-                        let _ = child_pm.make_pages_executable(tramp_ptr, page_len);
-                    }
-                }
-            }
-        }
-
-        let child_process_state = Arc::new(ProcessState {
-            pm: child_pm,
-            address_space_id: child_as_id,
-            thread_count: core::sync::atomic::AtomicI32::new(1),
-            active_vfork_layers: litebox::sync::Mutex::new(Vec::new()),
-            elf_patch_cache: litebox::sync::Mutex::new(elf_patch_cache),
-            shared_file_mappings: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
-            main_bss_start: core::sync::atomic::AtomicUsize::new(rb(pm_meta.main_bss_start)),
-            main_bss_end: core::sync::atomic::AtomicUsize::new(rb(pm_meta.main_bss_end)),
-            proc_map_paths: litebox::sync::Mutex::new(proc_map_paths),
-            vfork_parking: Arc::new(VforkParking {
-                park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
-                parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
-                deferred_lie_count: core::sync::atomic::AtomicU32::new(0),
-            }),
-        });
-
-        // --- 6. Build Process with restored rlimits. ------------------------
-        let child_thread_remote = Arc::new(syscalls::process::ThreadRemote::new());
-        let child_process = Arc::new(syscalls::process::Process::new_with_rlimits(
-            id.pid,
-            child_thread_remote.clone(),
-            &pw.rlimits,
-            pw.thp_disabled,
-        ));
-
-        // --- 7. Build ThreadState. ------------------------------------------
-        let child_thread = syscalls::process::ThreadState::new_from_restore(
-            id.pid,
-            child_process.clone(),
-            child_thread_remote,
-            th.clear_child_tid.map(rb),
-            th.robust_list.map(rb),
-        );
-
-        // --- 8. Restore signal state. ---------------------------------------
-        let rebased_altstack = litebox_common_linux::signal::SigAltStack {
-            sp: if sig.altstack.sp != 0 {
-                rb(sig.altstack.sp)
-            } else {
-                0
-            },
-            flags: sig.altstack.flags,
-            #[cfg(target_pointer_width = "64")]
-            __pad: sig.altstack.__pad,
-            size: sig.altstack.size,
-        };
-        let child_signals = syscalls::signal::SignalState::new_from_restore(
-            sig.blocked,
-            &sig.handlers,
-            rebased_altstack,
-        );
-
-        // --- 9. Restore filesystem state. -----------------------------------
-        let child_fs = {
-            let mut cwd = fs_snap.cwd.clone();
-            if !cwd.ends_with('/') {
-                cwd.push('/');
-            }
-            Arc::new(syscalls::file::FsState::from_restore(
-                cwd,
-                fs_snap.exe_path.clone(),
-                fs_snap.umask,
-            ))
-        };
-
-        // --- 10. Restore FD table. -------------------------------------------
-        let child_files = Arc::new(syscalls::file::FilesState::new(fs.clone()));
-        child_files.set_max_fd(
-            child_process
-                .limits
-                .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
-                .saturating_sub(1),
-        );
-        child_files.initialize_stdio_in_shared_descriptors_table(&self.global);
-
-        // Restore terminal fds beyond stdio.  Fds 0/1/2 are already
-        // populated by initialize_stdio; skip them to avoid slot collisions.
-        // Terminal filesystem fds (tty/pty metadata) are reconnected via
-        // /dev/tty; tty-backed stdio aliases use their original /dev/std* path.
-        {
-            use litebox::fs::{Mode, OFlags};
-            use syscalls::fork_snapshot::FdClass;
-
-            for entry in &fd_table.entries {
-                // Skip stdio slots (already initialized above) and non-FS fds.
-                if entry.fd <= 2 || entry.class != FdClass::FilesystemFd {
-                    continue;
-                }
-                let meta = &entry.metadata;
-                if !meta.is_host_tty_alias
-                    && !meta.is_host_pty_device
-                    && meta.host_stdio_source_fd.is_none()
-                {
-                    continue;
-                }
-
-                // Choose the right device path based on the fd's origin.
-                let (path, flags) = if meta.is_host_tty_alias || meta.is_host_pty_device {
-                    ("/dev/tty", OFlags::RDWR)
-                } else if let Some(source_fd) = meta.host_stdio_source_fd {
-                    match source_fd {
-                        0 => ("/dev/stdin", OFlags::RDONLY),
-                        1 => ("/dev/stdout", OFlags::WRONLY),
-                        _ => ("/dev/stderr", OFlags::WRONLY),
-                    }
-                } else {
-                    continue;
-                };
-
-                let Ok(fd_handle) = child_files.fs.open(path, flags, Mode::empty()) else {
-                    continue;
-                };
-
-                // Attach metadata markers matching the snapshot.
-                let mut dt = self.global.litebox.descriptor_table_mut();
-                let mut rds = child_files.raw_descriptor_store.write();
-                let status_flags = OFlags::APPEND | flags;
-                dt.set_entry_metadata(&fd_handle, StdioStatusFlags(status_flags));
-                if meta.is_host_tty_alias {
-                    dt.set_entry_metadata(&fd_handle, HostTtyAlias);
-                }
-                if meta.is_host_pty_device {
-                    dt.set_entry_metadata(&fd_handle, syscalls::file::HostPtyDeviceFd);
-                }
-                if let Some(source_fd) = meta.host_stdio_source_fd {
-                    dt.set_entry_metadata(&fd_handle, HostStdioSourceFd(source_fd));
-                }
-                let success = rds.fd_into_specific_raw_integer(fd_handle, entry.fd);
-                debug_assert!(success, "fd slot {} already occupied", entry.fd);
-                drop(rds);
-                drop(dt);
-            }
-
-            // Restore non-terminal FilesystemFd entries.  Reopen by path
-            // if available, fall back to /dev/null.  For stdio slots (0-2),
-            // consume the pre-populated entry first.
-            for entry in &fd_table.entries {
-                if entry.class != FdClass::FilesystemFd {
-                    continue;
-                }
-                let meta = &entry.metadata;
-                // Skip terminal fds and host stdio (already handled above).
-                if meta.is_host_tty_alias
-                    || meta.is_host_pty_device
-                    || meta.host_stdio_source_fd.is_some()
-                {
-                    continue;
-                }
-
-                let path = fd_table
-                    .open_file_descriptions
-                    .iter()
-                    .find(|ofd| ofd.object_id == entry.object_id)
-                    .and_then(|ofd| ofd.reopen_path.as_deref())
-                    .unwrap_or("/dev/null");
-                // Use captured access mode, falling back to RDONLY.
-                let access_bits = entry.status_flags & 0x3; // O_ACCMODE
-                let flags = match access_bits {
-                    1 => OFlags::WRONLY,
-                    2 => OFlags::RDWR,
-                    _ => OFlags::RDONLY,
-                };
-                let Ok(fd_handle) = child_files
-                    .fs
-                    .open(path, flags, Mode::empty())
-                    .or_else(|_| {
-                        // Try RDONLY if the original mode failed.
-                        child_files.fs.open(path, OFlags::RDONLY, Mode::empty())
-                    })
-                    .or_else(|_| {
-                        child_files
-                            .fs
-                            .open("/dev/null", OFlags::RDWR, Mode::empty())
-                    })
-                else {
-                    continue;
-                };
-
-                // For stdio slots, consume the pre-populated entry.
-                // For higher fds, the slot is empty.
-                let mut rds = child_files.raw_descriptor_store.write();
-                if entry.fd <= 2 {
-                    let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
-                }
-                let success = rds.fd_into_specific_raw_integer(fd_handle, entry.fd);
-                debug_assert!(success, "fd slot {} occupied during restore", entry.fd);
-                drop(rds);
-            }
-        }
-
-        // --- 11. Build credentials. -----------------------------------------
-        let child_credentials = Arc::new(syscalls::process::Credentials {
-            uid: id.credentials.uid,
-            euid: id.credentials.euid,
-            gid: id.credentials.gid,
-            egid: id.credentials.egid,
-        });
-
-        // --- 11. Build Task with execution context. ---------------------------
-        let mut exec_ctx = th.execution_context;
-
-        // Rebase all address-valued registers from the snapshot's VA partition
-        // to the child's VA partition.
-        if va_rebase != 0 {
-            #[cfg(target_arch = "x86_64")]
-            {
-                let rb_reg = |v: usize| (v as isize + va_rebase) as usize;
-                exec_ctx.regs.rip = rb_reg(exec_ctx.regs.rip);
-                exec_ctx.regs.rsp = rb_reg(exec_ctx.regs.rsp);
-                exec_ctx.regs.rbp = rb_reg(exec_ctx.regs.rbp);
-                exec_ctx.regs.rcx = rb_reg(exec_ctx.regs.rcx);
-                exec_ctx.regs.r11 = rb_reg(exec_ctx.regs.r11);
-            }
-        }
-
-        if !is_delayed_fork {
-            // True fork: fork() returns 0 in the child.
-            #[cfg(target_arch = "x86_64")]
-            {
-                exec_ctx.rax = 0;
-            }
-            #[cfg(target_arch = "x86")]
-            {
-                exec_ctx.eax = 0;
-            }
-        }
-        // For delayed fork the context already has rax = syscall number and
-        // rip backed up to the syscall instruction, so the guest replays the
-        // triggering syscall after restore.
-
-        let mut comm = [0u8; litebox_common_linux::TASK_COMM_LEN];
-        comm.copy_from_slice(&id.comm);
-
-        let entrypoints = LinuxShimEntrypoints {
-            _not_send: core::marker::PhantomData,
-            task: Task {
-                global: self.global.clone(),
-                process_state: child_process_state.into(),
-                thread: child_thread,
-                wait_state: wait::WaitState::new(self.global.platform),
-                process_id: litebox::process::ProcessId::INIT,
-                pid: id.pid,
-                ppid: id.ppid,
-                tid: id.tid,
-                credentials: child_credentials,
-                comm: Cell::new(comm),
-                fs: child_fs.into(),
-                files: child_files.into(),
-                signals: child_signals,
-                fork_context: RefCell::new(None),
-                last_shell_write: RefCell::new(None),
-                last_syscall: Cell::new(None),
-                syscall_restartable: Cell::new(false),
-                in_syscall: Cell::new(false),
-                deferred_vfork_park: Cell::new(false),
-                delayed_fork_pending: Cell::new(false),
-                migrated_to_remote: Cell::new(false),
-                mux_pipe_pair_ids: RefCell::new(Vec::new()),
-            },
-        };
-
-        // Set the init state so the first handle_init_request restores the
-        // full execution context (registers + TLS) from the snapshot.
-        entrypoints
-            .task
-            .thread
-            .init_state
-            .set(syscalls::process::ThreadInitState::ForkRestore {
-                exec_ctx: alloc::boxed::Box::new(exec_ctx),
-                tls_base: th.tls_base.map(rb),
-                set_child_tid: th.set_child_tid.map(rb),
-            });
-
-        let process = LinuxShimProcess(child_process);
-        Ok(LoadedProgram {
-            entrypoints,
-            process,
-        })
     }
 }
 
@@ -1633,19 +934,6 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
             return Ok(unix(&fd));
         }
         Err(Errno::EBADF)
-    }
-
-    /// Check if the given raw FD is a host-pipe FD.
-    ///
-    /// Returns a typed handle if it is, `None` otherwise.  Used by `sys_read`,
-    /// `sys_write`, and `sys_close` to fast-path host-pipe I/O without
-    /// modifying every `run_on_raw_fd` call site.
-    pub(crate) fn try_host_pipe_fd(
-        &self,
-        fd: usize,
-    ) -> Option<alloc::sync::Arc<TypedFd<syscalls::host_pipe::HostPipeSubsystem>>> {
-        let rds = self.raw_descriptor_store.read();
-        rds.fd_from_raw_integer(fd).ok()
     }
 }
 
@@ -2187,68 +1475,6 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
-    /// Returns `true` if the given syscall is in the pre-exec allowlist and
-    /// should be permitted to execute in vfork-style mode without triggering a
-    /// delayed true fork.
-    ///
-    /// The allowlist covers the syscalls that `posix_spawn` and runtime libraries
-    /// typically issue between `fork` and `execve`.  Any syscall *not* in this
-    /// list indicates the child intends to run independently and must be migrated
-    /// to its own worker host.
-    ///
-    /// Two syscalls (`fcntl` and `prctl`) require argument-level inspection
-    /// because they multiplex many operations through a single syscall number.
-    #[cfg(target_arch = "x86_64")]
-    fn is_pre_exec_syscall(ctx: &litebox_common_linux::ExecutionContext) -> bool {
-        use ::syscalls::Sysno;
-
-        let nr = ctx.orig_rax;
-
-        // Match on syscall number, with argument inspection for fcntl/prctl.
-        match Sysno::new(nr) {
-            // Number-only allowlisted syscalls.
-            Some(
-                // Terminal — child leaves vfork mode.
-                Sysno::execve | Sysno::execveat | Sysno::exit | Sysno::exit_group
-                // FD plumbing.
-                | Sysno::close | Sysno::close_range | Sysno::dup | Sysno::dup2 | Sysno::dup3
-                | Sysno::open | Sysno::openat | Sysno::openat2 | Sysno::pipe2 | Sysno::write
-                // Directory.
-                | Sysno::chdir | Sysno::fchdir
-                // Process group.
-                | Sysno::setpgid | Sysno::setsid
-                // Signal setup.
-                | Sysno::rt_sigaction | Sysno::rt_sigprocmask | Sysno::sigaltstack
-                // Identity.
-                | Sysno::setuid | Sysno::setgid | Sysno::setgroups
-                | Sysno::setreuid | Sysno::setregid
-                | Sysno::setresuid | Sysno::setresgid
-                // Scheduling.
-                | Sysno::sched_setscheduler | Sysno::sched_setaffinity
-                | Sysno::sched_setparam
-                // Resource limits.
-                | Sysno::setrlimit | Sysno::prlimit64
-                // No-ops (read-only queries).
-                | Sysno::getpid | Sysno::getppid | Sysno::gettid
-                | Sysno::getuid | Sysno::getgid | Sysno::getsid | Sysno::getpgid
-                // Stat queries — bash calls fstat between fork and exec
-                // to check terminal type and fd validity.
-                | Sysno::fstat | Sysno::stat | Sysno::newfstatat
-                // ioctl — bash calls ioctl(TIOCGPGRP) for job control
-                // between fork and exec.
-                | Sysno::ioctl,
-            ) => true,
-            // Argument-aware: fcntl — only allow fd flag / dup / status-flag operations.
-            // F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4, F_DUPFD_CLOEXEC=1030
-            Some(Sysno::fcntl) => matches!(ctx.rsi, 0 | 1 | 2 | 3 | 4 | 1030),
-            // Argument-aware: prctl — only allow SET_PDEATHSIG and SET_NAME.
-            // PR_SET_PDEATHSIG=1, PR_SET_NAME=15
-            Some(Sysno::prctl) => matches!(ctx.rdi, 1 | 15),
-            // Any unrecognized or non-allowlisted syscall triggers a delayed fork.
-            _ => false,
-        }
-    }
-
     fn do_syscall(&self, ctx: &mut litebox_common_linux::ExecutionContext) -> Result<usize, Errno> {
         // Helper macro to unify the return value from `sys_*`.
         macro_rules! syscall {
@@ -2261,70 +1487,6 @@ impl<FS: ShimFS> Task<FS> {
         let syscall_number = ctx.orig_eax;
         #[cfg(target_arch = "x86_64")]
         let syscall_number = ctx.orig_rax;
-
-        // Delayed fork trigger: if this task is a fork child waiting to be
-        // promoted to a true fork, check whether the current syscall is in
-        // the pre-exec allowlist.  If not, commit the delayed fork now.
-        #[cfg(target_arch = "x86_64")]
-        if self.delayed_fork_pending.get() {
-            let is_pre_exec = Self::is_pre_exec_syscall(ctx);
-            #[cfg(feature = "trace_syscalls")]
-            {
-                let sysname = ::syscalls::Sysno::new(ctx.orig_rax).map_or_else(
-                    || alloc::format!("unknown({})", ctx.orig_rax),
-                    |s| alloc::format!("{s:?}"),
-                );
-                let comm_bytes = self.comm.get();
-                let comm_str = core::str::from_utf8(
-                    &comm_bytes[..comm_bytes
-                        .iter()
-                        .position(|&b| b == 0)
-                        .unwrap_or(comm_bytes.len())],
-                )
-                .unwrap_or("<invalid>");
-                litebox::log_println!(
-                    self.global.platform,
-                    "[DELAYED-FORK-SYSCALL] pid={} comm={:?} ppid={}: syscall {} pre_exec={} args=({}, {}, {})",
-                    self.pid,
-                    comm_str,
-                    self.ppid,
-                    sysname,
-                    is_pre_exec,
-                    ctx.rdi,
-                    ctx.rsi,
-                    ctx.rdx,
-                );
-            }
-            if !is_pre_exec {
-                if self.commit_delayed_fork(ctx).is_ok() {
-                    // Child migrated to worker host.  Terminate this local task.
-                    #[cfg(feature = "trace_syscalls")]
-                    litebox::log_println!(
-                        self.global.platform,
-                        "[DELAYED-FORK-TRIGGER] pid={}: commit SUCCESS — child migrated, exiting local task",
-                        self.pid,
-                    );
-                    self.exit_thread(0);
-                    return Ok(0);
-                }
-                // Delayed fork could not migrate this child (e.g. unsupported
-                // fd types like sandbox PTY slaves on stdio).  Instead of
-                // killing the child, let it continue as a vfork child sharing
-                // the parent's address space.  The child will eventually
-                // execve (which detaches from the parent and signals
-                // VforkDone) or exit (which signals VforkDone via
-                // prepare_for_exit).  The parent remains blocked on
-                // VforkDone, which is correct vfork semantics.
-                #[cfg(feature = "trace_syscalls")]
-                litebox::log_println!(
-                    self.global.platform,
-                    "[DELAYED-FORK-TRIGGER] pid={}: commit FAILED — continuing as vfork child",
-                    self.pid,
-                );
-                self.delayed_fork_pending.set(false);
-                // Fall through to normal syscall handling.
-            }
-        }
 
         if syscall_number == ::syscalls::Sysno::close_range as usize {
             self.record_syscall_entry(ctx, syscall_number);
@@ -3241,12 +2403,18 @@ struct GlobalState<FS: ShimFS> {
     /// Foreground process group for the shared host tty backing stdio and
     /// `/dev/tty`.
     host_tty_foreground_pgrp: litebox::sync::Mutex<Platform, litebox::process::ProcessGroupId>,
-    /// Shadow terminal attributes for non-init processes. When a child calls
-    /// TCSETS on host stdio, the real terminal is not changed but the shadow
-    /// is updated so subsequent TCGETS returns the values the child expects.
-    /// The init process bypasses this and modifies the real terminal directly.
-    host_tty_shadow_termios:
-        litebox::sync::Mutex<Platform, Option<litebox::platform::TerminalAttributes>>,
+    /// Shadow terminal attributes keyed by ProcessId. When a non-init
+    /// process calls TCSETS on host stdio, the real terminal is unchanged
+    /// but the shadow is stored so subsequent TCGETS from that process
+    /// returns the values it set. Cleared when the init process modifies
+    /// the real terminal, and entries are removed on process exit.
+    host_tty_shadow_termios: litebox::sync::Mutex<
+        Platform,
+        alloc::collections::BTreeMap<
+            litebox::process::ProcessId,
+            litebox::platform::TerminalAttributes,
+        >,
+    >,
     /// Ensures only one task thread drains the local control-plane queue at a time.
     local_control_plane_pump_active: core::sync::atomic::AtomicBool,
     /// Flag set during vfork to break transport spin-loops and propagate EINTR.
@@ -3256,9 +2424,6 @@ struct GlobalState<FS: ShimFS> {
     epoll_graph_lock: litebox::sync::Mutex<Platform, ()>,
     /// Root-host coordinator state for the future multi-host exec handoff path.
     control_plane: multihost::ControlPlane<Platform>,
-    /// Mapping from fork child guest ProcessId.0 → worker host OS PID.
-    /// Used to forward signals (e.g. SIGKILL) to the correct worker host.
-    fork_child_host_pids: litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<u32, i32>>,
 }
 
 impl<FS: ShimFS> GlobalState<FS> {
@@ -3348,85 +2513,16 @@ pub(crate) struct VforkParking {
     pub deferred_lie_count: core::sync::atomic::AtomicU32,
 }
 
-/// Which virtual subsystem the replaced fd belonged to.
-#[derive(Debug, Clone, Copy)]
-enum ReplacedSubsystem {
-    Pipe,
-    UnixSocket,
-    Pty,
-}
-
-/// Describes a single fd endpoint that should be replaced with a host OS
-/// pipe after the delayed-fork child has been migrated.
+/// One-shot synchronization primitive for vfork parent blocking.
 ///
-/// Used by the exec-on-remote-host path.  The fork-restore path uses the
-/// stream multiplexer instead (see [`MuxParentStream`]).
-#[derive(Debug)]
-struct FdReplacement {
-    /// The guest FD number to replace.
-    guest_fd: usize,
-    /// The raw host OS file descriptor for the parent's end of the pipe.
-    host_fd: i32,
-    /// Whether this endpoint is a read or write end.
-    direction: syscalls::host_pipe::HostPipeDirection,
-    /// The virtual subsystem that owned the original fd.
-    #[allow(dead_code)] // Useful for debug logging; may drive close logic in future.
-    subsystem: ReplacedSubsystem,
-}
-
-/// Describes a single stream in the multiplexer that the parent dispatcher
-/// must service after the fork-restore child has been migrated.
-struct MuxParentStream {
-    /// Stream ID matching the child's `--mux-stream` argument.
-    stream_id: u32,
-    /// The guest FD number whose virtual endpoint is replaced with a new pipe.
-    /// For virtual pipe/socket streams, this is the parent's fd that gets a new
-    /// virtual pipe endpoint.  For host-backed streams, this is the child's
-    /// guest fd (informational only — no parent fd replacement occurs).
-    guest_fd: usize,
-    /// Read = parent reads (child writes, WorkerToParent).
-    /// Write = parent writes (child reads, ParentToWorker).
-    direction: syscalls::host_pipe::HostPipeDirection,
-    /// Which virtual subsystem owned the original fd.
-    #[allow(dead_code)] // Useful for debug logging; may drive close logic in future.
-    subsystem: ReplacedSubsystem,
-    /// Data drained from the virtual channel before migration.
-    /// Sent as the first mux message(s) when the parent dispatcher starts.
-    drained_data: Vec<u8>,
-    /// For host-backed pipes from prior bridges: the raw OS fd to relay.
-    /// The parent dispatcher bridges between this fd and the mux.
-    /// -1 for virtual pipe/socket streams (parent creates a new virtual pipe).
-    host_pipe_fd: i32,
-    /// When true, the parent's existing pipe at `guest_fd` is used directly
-    /// by the dispatcher (nested fork case — one-sided pipe, other end is in
-    /// the parent's own mux dispatcher).  The fd table entry is NOT replaced.
-    use_existing_pipe: bool,
-    /// For PTY-bridged streams: the PTY pair whose ring buffers the relay
-    /// thread reads/writes.  `None` for pipe/socket streams.
-    pty_pair: Option<Arc<litebox::fs::devices::PtyPair<Platform>>>,
-    /// For PTY-bridged streams: whether this is the master side of the pair.
-    /// When bridging a child's slave fd, the relay acts as a proxy for the
-    /// slave, so `pty_is_master` is `false`.
-    #[allow(dead_code)] // Reserved for future bidirectional PTY bridge logic.
-    pty_is_master: bool,
-}
-
+/// The parent creates this before spawning the child and calls [`wait`](Self::wait)
+/// after the spawn succeeds. The child holds a clone and calls [`signal`](Self::signal)
+/// when it execs or exits, unblocking the parent.
 struct VforkDone {
     done: core::sync::atomic::AtomicBool,
     /// Waker for the parent thread — calling `wake()` causes the parent's
     /// `wait_until` loop to re-evaluate the done flag.
     parent_waker: litebox::event::wait::Waker<Platform>,
-    /// FD replacements the parent should apply after VforkDone is signaled.
-    /// Filled by `commit_delayed_fork` (exec path), consumed by `do_fork` after resume.
-    fd_replacements: litebox::sync::Mutex<Platform, Vec<FdReplacement>>,
-    /// Parent's end of the multiplexer socketpair.  -1 if no mux is active.
-    /// Filled by `commit_delayed_fork` (fork-restore path).
-    mux_parent_fd: core::sync::atomic::AtomicI32,
-    /// Stream mappings for the parent mux dispatcher.
-    mux_parent_streams: litebox::sync::Mutex<Platform, Vec<MuxParentStream>>,
-    /// Stream IDs with no parent counterpart (broken pipe).
-    /// The parent dispatcher sends RESET for these at startup.
-    mux_orphan_streams: litebox::sync::Mutex<Platform, Vec<u32>>,
 }
 
 impl VforkDone {
@@ -3434,10 +2530,6 @@ impl VforkDone {
         Self {
             done: core::sync::atomic::AtomicBool::new(false),
             parent_waker,
-            fd_replacements: litebox::sync::Mutex::new(Vec::new()),
-            mux_parent_fd: core::sync::atomic::AtomicI32::new(-1),
-            mux_parent_streams: litebox::sync::Mutex::new(Vec::new()),
-            mux_orphan_streams: litebox::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -3508,37 +2600,6 @@ struct ForkContext {
     address_space_id: <Platform as litebox::platform::AddressSpaceProvider>::AddressSpaceId,
     /// Signals the parent to resume after the vfork child execs or exits.
     vfork_done: Arc<VforkDone>,
-    /// The exit signal from the fork/clone args (usually SIGCHLD).
-    /// Stored here so that `commit_delayed_fork` can include it in the snapshot.
-    exit_signal: i32,
-    /// The parent's ProcessId in the process registry.
-    /// Needed by `commit_delayed_fork` for the snapshot's parent identity.
-    parent_process_id: litebox::process::ProcessId,
-    /// Snapshot of the parent's pipe FDs at fork time: (guest_fd, direction, pipe_pair_id).
-    /// Used by `commit_delayed_fork` to find the parent's counterpart pipe endpoints
-    /// so both sides can be replaced with real OS pipes.
-    parent_pipe_fds: Vec<(usize, syscalls::host_pipe::HostPipeDirection, usize)>,
-    /// Snapshot of the parent's Unix socket FDs at fork time:
-    /// (guest_fd, socket_pair_id, object_id).
-    /// Used by `commit_delayed_fork` to find the parent's peer socket endpoints
-    /// so both sides can be bridged with real OS pipes.
-    parent_unix_socket_fds: Vec<(usize, usize, u64)>,
-    /// Snapshot of the parent's PTY master FDs at fork time:
-    /// (guest_fd, pty_pair_index).
-    /// Used by `commit_delayed_fork` to find the parent's PTY master endpoint
-    /// for bridging sandbox PTY slave fds in the child.
-    #[allow(dead_code)] // Diagnostic; actual lookup uses parent_pty_pairs.
-    parent_pty_master_fds: Vec<(usize, u32)>,
-    /// PTY pair Arcs captured at fork time, keyed by pty_pair_index.
-    /// Used by `commit_delayed_fork` to set up PTY relay threads that bridge
-    /// between the parent's PTY ring buffers and the mux.
-    parent_pty_pairs: Vec<(u32, Arc<litebox::fs::devices::PtyPair<Platform>>)>,
-    /// Pipe pair_ids of virtual pipes created by prior siblings' mux
-    /// dispatchers or fd-replacement relays.  Inherited from the parent's
-    /// `mux_pipe_pair_ids`.  Used by `commit_delayed_fork` to exclude
-    /// these infrastructure pipes from child_pipes, preventing nested
-    /// mux-over-mux bridging.
-    parent_mux_pipe_pair_ids: Vec<usize>,
 }
 
 const SHELL_WRITE_SCAN_LEN: usize = 1024;
@@ -3617,25 +2678,12 @@ struct Task<FS: ShimFS> {
     /// when the task resumes after vfork completes. `Cell` because the task
     /// owns this flag exclusively (no cross-thread sharing).
     deferred_vfork_park: Cell<bool>,
-    /// When true, this task is a fork child running in vfork-style mode that
-    /// should be upgraded to a true fork when it makes a non-pre-exec syscall.
-    /// Set by `do_fork` for `is_shared && !is_vfork` children.  Cleared by
-    /// `commit_delayed_fork` (on success) or the exit path (on failure).
-    ///
-    /// Distinct from `deferred_vfork_park`, which handles sibling-thread
-    /// parking coordination.
-    delayed_fork_pending: Cell<bool>,
-    /// Set by `commit_delayed_fork` on success.  When true, `prepare_for_exit`
-    /// skips exit notification and address-space cleanup because the process
-    /// was migrated to a remote worker host (the background waiter handles
-    /// the real exit).
-    migrated_to_remote: Cell<bool>,
-    /// Pipe pair_ids of virtual pipes created by the mux dispatcher or fd
-    /// replacement relay setup.  These are infrastructure pipes that should
-    /// NOT be bridged again when a subsequent child forks.  Tracked so that
-    /// `ForkContext.parent_pipe_fds` can exclude them, preventing nested
-    /// mux-over-mux bridging that destroys the first mux's endpoints.
-    mux_pipe_pair_ids: RefCell<Vec<usize>>,
+    /// Suppresses runtime ELF patching in `do_mmap_file` while the ELF loader
+    /// is actively loading a binary. The loader handles trampoline mapping
+    /// itself via `load_trampoline()`; running `maybe_patch_exec_segment` for
+    /// the same fd would double-map the trampoline (the second MAP_FIXED
+    /// destroys the first mapping and re-reads from the file).
+    suppress_elf_runtime_patch: Cell<bool>,
 }
 
 impl<FS: ShimFS> Drop for Task<FS> {
@@ -3683,9 +2731,7 @@ mod test_utils {
                 syscall_restartable: Cell::new(false),
                 in_syscall: Cell::new(false),
                 deferred_vfork_park: Cell::new(false),
-                delayed_fork_pending: Cell::new(false),
-                migrated_to_remote: Cell::new(false),
-                mux_pipe_pair_ids: RefCell::new(Vec::new()),
+                suppress_elf_runtime_patch: Cell::new(false),
                 process_state: self.process_state.into(),
                 global: self.global,
             }
@@ -3719,9 +2765,7 @@ mod test_utils {
                 syscall_restartable: Cell::new(false),
                 in_syscall: Cell::new(false),
                 deferred_vfork_park: Cell::new(false),
-                delayed_fork_pending: Cell::new(false),
-                migrated_to_remote: Cell::new(false),
-                mux_pipe_pair_ids: RefCell::new(Vec::new()),
+                suppress_elf_runtime_patch: Cell::new(false),
             };
             Some(task)
         }
@@ -3829,207 +2873,5 @@ mod tests {
                 .expect("fcntl F_GETFD should succeed"),
             FileDescriptorFlags::FD_CLOEXEC.bits()
         );
-    }
-
-    // ---- Delayed-fork allowlist tests (x86_64 only) ----
-
-    #[cfg(target_arch = "x86_64")]
-    /// Helper: build an ExecutionContext with the given syscall number and args.
-    fn make_syscall_ctx(
-        nr: usize,
-        arg0: usize,
-        arg1: usize,
-    ) -> litebox_common_linux::ExecutionContext {
-        let mut ctx = litebox_common_linux::ExecutionContext::default();
-        ctx.orig_rax = nr;
-        ctx.rdi = arg0;
-        ctx.rsi = arg1;
-        ctx
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    fn assert_allowed(nr: ::syscalls::Sysno) {
-        let ctx = make_syscall_ctx(nr as usize, 0, 0);
-        assert!(
-            Task::<DefaultFS>::is_pre_exec_syscall(&ctx),
-            "{nr:?} should be allowed"
-        );
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    fn assert_rejected(nr: ::syscalls::Sysno) {
-        let ctx = make_syscall_ctx(nr as usize, 0, 0);
-        assert!(
-            !Task::<DefaultFS>::is_pre_exec_syscall(&ctx),
-            "{nr:?} should be rejected"
-        );
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn pre_exec_syscall_allows_terminal_syscalls() {
-        use ::syscalls::Sysno;
-        assert_allowed(Sysno::execve);
-        assert_allowed(Sysno::execveat);
-        assert_allowed(Sysno::exit);
-        assert_allowed(Sysno::exit_group);
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn pre_exec_syscall_allows_fd_plumbing() {
-        use ::syscalls::Sysno;
-        assert_allowed(Sysno::close);
-        assert_allowed(Sysno::close_range);
-        assert_allowed(Sysno::dup);
-        assert_allowed(Sysno::dup2);
-        assert_allowed(Sysno::dup3);
-        assert_allowed(Sysno::open);
-        assert_allowed(Sysno::openat);
-        assert_allowed(Sysno::openat2);
-        assert_allowed(Sysno::pipe2);
-        assert_allowed(Sysno::write);
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn pre_exec_syscall_allows_directory() {
-        use ::syscalls::Sysno;
-        assert_allowed(Sysno::chdir);
-        assert_allowed(Sysno::fchdir);
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn pre_exec_syscall_allows_process_group() {
-        use ::syscalls::Sysno;
-        assert_allowed(Sysno::setpgid);
-        assert_allowed(Sysno::setsid);
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn pre_exec_syscall_allows_signal_setup() {
-        use ::syscalls::Sysno;
-        assert_allowed(Sysno::rt_sigaction);
-        assert_allowed(Sysno::rt_sigprocmask);
-        assert_allowed(Sysno::sigaltstack);
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn pre_exec_syscall_allows_identity() {
-        use ::syscalls::Sysno;
-        assert_allowed(Sysno::setuid);
-        assert_allowed(Sysno::setgid);
-        assert_allowed(Sysno::setgroups);
-        assert_allowed(Sysno::setreuid);
-        assert_allowed(Sysno::setregid);
-        assert_allowed(Sysno::setresuid);
-        assert_allowed(Sysno::setresgid);
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn pre_exec_syscall_allows_scheduling() {
-        use ::syscalls::Sysno;
-        assert_allowed(Sysno::sched_setscheduler);
-        assert_allowed(Sysno::sched_setaffinity);
-        assert_allowed(Sysno::sched_setparam);
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn pre_exec_syscall_allows_resource_limits() {
-        use ::syscalls::Sysno;
-        assert_allowed(Sysno::setrlimit);
-        assert_allowed(Sysno::prlimit64);
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn pre_exec_syscall_allows_readonly_queries() {
-        use ::syscalls::Sysno;
-        assert_allowed(Sysno::getpid);
-        assert_allowed(Sysno::getppid);
-        assert_allowed(Sysno::gettid);
-        assert_allowed(Sysno::getuid);
-        assert_allowed(Sysno::getgid);
-        assert_allowed(Sysno::getsid);
-        assert_allowed(Sysno::getpgid);
-        assert_allowed(Sysno::fstat);
-        assert_allowed(Sysno::stat);
-        assert_allowed(Sysno::newfstatat);
-        assert_allowed(Sysno::ioctl);
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn pre_exec_syscall_rejects_non_allowlisted() {
-        use ::syscalls::Sysno;
-        assert_rejected(Sysno::read);
-        assert_rejected(Sysno::mmap);
-        assert_rejected(Sysno::brk);
-        assert_rejected(Sysno::clone);
-        assert_rejected(Sysno::poll);
-        assert_rejected(Sysno::socket);
-        assert_rejected(Sysno::connect);
-        assert_rejected(Sysno::accept);
-        assert_rejected(Sysno::wait4);
-        assert_rejected(Sysno::kill);
-        assert_rejected(Sysno::futex);
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn pre_exec_syscall_fcntl_allows_fd_ops() {
-        use ::syscalls::Sysno;
-        // F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4, F_DUPFD_CLOEXEC=1030
-        for cmd in [0, 1, 2, 3, 4, 1030] {
-            let ctx = make_syscall_ctx(Sysno::fcntl as usize, 3, cmd);
-            assert!(
-                Task::<DefaultFS>::is_pre_exec_syscall(&ctx),
-                "fcntl cmd={cmd} should be allowed"
-            );
-        }
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn pre_exec_syscall_fcntl_rejects_non_fd_ops() {
-        use ::syscalls::Sysno;
-        // F_GETLK=5, F_SETLK=6, F_SETOWN=8
-        for cmd in [5, 6, 8] {
-            let ctx = make_syscall_ctx(Sysno::fcntl as usize, 3, cmd);
-            assert!(
-                !Task::<DefaultFS>::is_pre_exec_syscall(&ctx),
-                "fcntl cmd={cmd} should be rejected"
-            );
-        }
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn pre_exec_syscall_prctl_allows_pdeathsig_and_name() {
-        use ::syscalls::Sysno;
-        // PR_SET_PDEATHSIG=1, PR_SET_NAME=15
-        let ctx = make_syscall_ctx(Sysno::prctl as usize, 1, 9);
-        assert!(Task::<DefaultFS>::is_pre_exec_syscall(&ctx));
-        let ctx = make_syscall_ctx(Sysno::prctl as usize, 15, 0x1000);
-        assert!(Task::<DefaultFS>::is_pre_exec_syscall(&ctx));
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn pre_exec_syscall_prctl_rejects_other_ops() {
-        use ::syscalls::Sysno;
-        // PR_GET_NAME=16, PR_SET_SECCOMP=22, PR_SET_NO_NEW_PRIVS=38
-        for op in [16, 22, 38] {
-            let ctx = make_syscall_ctx(Sysno::prctl as usize, op, 0);
-            assert!(
-                !Task::<DefaultFS>::is_pre_exec_syscall(&ctx),
-                "prctl op={op} should be rejected"
-            );
-        }
     }
 }

@@ -16,6 +16,7 @@
 
 use alloc::vec::Vec;
 
+use crate::gs_to_fs_rewriter;
 use crate::pe::{
     IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_IMPORT, IMAGE_DIRECTORY_ENTRY_TLS,
     IMAGE_REL_BASED_DIR64, ImageBaseRelocation,
@@ -231,7 +232,17 @@ fn load_pe_inner(
             &[]
         };
 
-        mapper.map_section(section_va, file_data, map_size, perm)?;
+        // For executable sections, rewrite GS segment prefixes to FS so
+        // that guest TEB accesses go through FS (kernel clobbers FS to 0,
+        // producing catchable faults) instead of GS (kernel silently
+        // restores to host TEB).
+        if perm == SectionPermissions::ReadExecute && !file_data.is_empty() {
+            let mut rewritten = Vec::from(file_data);
+            gs_to_fs_rewriter::rewrite_gs_to_fs(&mut rewritten, section_va as u64);
+            mapper.map_section(section_va, &rewritten, map_size, perm)?;
+        } else {
+            mapper.map_section(section_va, file_data, map_size, perm)?;
+        }
     }
 
     // Collect import directory info.
@@ -286,7 +297,7 @@ pub fn apply_relocations_to_buffer(
         None => return Err(PeLoadError::Malformed),
     };
 
-    let reloc_end = offset + dd.size as usize;
+    let reloc_end = (offset + dd.size as usize).min(image.len());
 
     while offset + size_of::<ImageBaseRelocation>() <= reloc_end {
         let block: ImageBaseRelocation =
@@ -326,7 +337,10 @@ pub fn apply_relocations_to_buffer(
                     let new_val = old_val + delta;
                     image[fixup_off..fixup_off + 8].copy_from_slice(&new_val.to_le_bytes());
                 }
-                _ => {} // Unknown type — skip.
+                _ => {
+                    #[cfg(debug_assertions)]
+                    panic!("unknown relocation type {}", reloc_type);
+                }
             }
 
             entry_offset += 2;
@@ -720,5 +734,63 @@ mod tests {
 
         // ntdll has no imports, so no patches.
         assert!(patches.is_empty());
+    }
+
+    #[test]
+    fn resolve_forwarded_export_between_modules() {
+        let ntdll_exports = vec![StubExport::syscall_stub(
+            "RtlAcquireSRWLockExclusive",
+            0x2222,
+        )];
+        let kernel32_exports = vec![StubExport::forward(
+            "AcquireSRWLockExclusive",
+            "ntdll.RtlAcquireSRWLockExclusive",
+        )];
+
+        let ntdll_base: u64 = 0x1800_0000_0000;
+        let kernel32_base: u64 = 0x1800_0001_0000;
+
+        let ntdll_bytes = build_stub_dll("ntdll.dll", &ntdll_exports, ntdll_base);
+        let kernel32_bytes = build_stub_dll("kernel32.dll", &kernel32_exports, kernel32_base);
+        let ntdll_parsed = PeParsedFile::parse(&ntdll_bytes).unwrap();
+        let kernel32_parsed = PeParsedFile::parse(&kernel32_bytes).unwrap();
+
+        let modules = [
+            LoadedModule {
+                name: "ntdll.dll",
+                base_address: ntdll_base as usize,
+                pe_data: &ntdll_bytes,
+                parsed: &ntdll_parsed,
+            },
+            LoadedModule {
+                name: "kernel32.dll",
+                base_address: kernel32_base as usize,
+                pe_data: &kernel32_bytes,
+                parsed: &kernel32_parsed,
+            },
+        ];
+
+        let kernel32_export = kernel32_parsed
+            .exports(&kernel32_bytes)
+            .into_iter()
+            .find(|e| e.name == Some("AcquireSRWLockExclusive"))
+            .expect("kernel32 forwarder");
+        let ntdll_export = ntdll_parsed
+            .exports(&ntdll_bytes)
+            .into_iter()
+            .find(|e| e.name == Some("RtlAcquireSRWLockExclusive"))
+            .expect("ntdll export");
+
+        let resolved = resolve_export(
+            &kernel32_export,
+            &modules[1],
+            &modules,
+            kernel32_base as usize,
+            8,
+        );
+        assert_eq!(
+            resolved,
+            Some(ntdll_base as usize + ntdll_export.rva as usize)
+        );
     }
 }

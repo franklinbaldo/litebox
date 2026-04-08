@@ -158,4 +158,8 @@ impl Exception {
     pub const GENERAL_PROTECTION_FAULT: Self = Self(13);
     /// #PF
     pub const PAGE_FAULT: Self = Self(14);
+    /// #MF — x87 floating-point exception
+    pub const MATH_FAULT: Self = Self(16);
+    /// #XF — SIMD floating-point exception
+    pub const SIMD_EXCEPTION: Self = Self(19);
 }

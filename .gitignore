@@ -193,3 +193,16 @@ venv/
 dev_bench/unixbench/prepared/
 dev_bench/unixbench/byte-unixbench-*/
 dev_bench/unixbench/*.zip
+*.obj
+*.out
+*.run
+# Root-level temp tars only (not test fixtures)
+/*.tar
+*_diff_temp.txt
+diff_*.txt
+sync_diff.txt
+thread_diff.txt
+padding_test.*
+test_sizes.*
+hello_ucrt.*
+tmp_*.py

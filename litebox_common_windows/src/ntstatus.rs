@@ -78,11 +78,11 @@ impl NtStatus {
     pub const STATUS_NOT_SUPPORTED: Self = Self(0xC000_00BBu32 as i32);
     pub const STATUS_NOT_FOUND: Self = Self(0xC000_0225u32 as i32);
     pub const STATUS_NO_MORE_ENTRIES: Self = Self(0x8000_001Au32 as i32);
-    pub const STATUS_ILLEGAL_FUNCTION: Self = Self(0xC000_0061u32 as i32);
     pub const STATUS_BUFFER_TOO_SMALL: Self = Self(0xC000_0023u32 as i32);
     pub const STATUS_ACCESS_DENIED: Self = Self(0xC000_0022u32 as i32);
     pub const STATUS_SHARING_VIOLATION: Self = Self(0xC000_0043u32 as i32);
     pub const STATUS_NOT_A_DIRECTORY: Self = Self(0xC000_0103u32 as i32);
+    pub const STATUS_FILE_IS_A_DIRECTORY: Self = Self(0xC000_00BAu32 as i32);
     pub const STATUS_NO_MORE_FILES: Self = Self(0x8000_0006u32 as i32);
     pub const STATUS_TIMEOUT: Self = Self(0x0000_0102);
     pub const STATUS_SEMAPHORE_LIMIT_EXCEEDED: Self = Self(0xC000_004Bu32 as i32);
@@ -92,6 +92,15 @@ impl NtStatus {
     pub const STATUS_DLL_INIT_FAILED: Self = Self(0xC000_0142u32 as i32);
     pub const STATUS_DLL_NOT_FOUND: Self = Self(0xC000_0135u32 as i32);
     pub const STATUS_PROCEDURE_NOT_FOUND: Self = Self(0xC000_007Au32 as i32);
+    pub const STATUS_CANCELLED: Self = Self(0xC000_0120u32 as i32);
+    pub const STATUS_DEVICE_NOT_READY: Self = Self(0xC000_00A3u32 as i32);
+    pub const STATUS_INSUFFICIENT_RESOURCES: Self = Self(0xC000_009Au32 as i32);
+    pub const STATUS_ADDRESS_ALREADY_ASSOCIATED: Self = Self(0xC000_0238u32 as i32);
+    pub const STATUS_NETWORK_UNREACHABLE: Self = Self(0xC000_023Cu32 as i32);
+    pub const STATUS_IO_TIMEOUT: Self = Self(0xC000_00B5u32 as i32);
+    pub const STATUS_CONNECTION_REFUSED: Self = Self(0xC000_0236u32 as i32);
+    pub const STATUS_CONNECTION_RESET: Self = Self(0xC000_020Du32 as i32);
+    pub const STATUS_INVALID_CONNECTION: Self = Self(0xC000_0140u32 as i32);
 
     // ---- Exception status codes (used as exit codes on unhandled exceptions) ----
 
@@ -100,6 +109,16 @@ impl NtStatus {
     pub const STATUS_ILLEGAL_INSTRUCTION: Self = Self(0xC000_001Du32 as i32);
     pub const STATUS_IN_PAGE_ERROR: Self = Self(0xC000_0006u32 as i32);
     pub const STATUS_UNEXPECTED_IO_ERROR: Self = Self(0xC000_00E9u32 as i32);
+    pub const STATUS_FLOAT_INVALID_OPERATION: Self = Self(0xC000_0090u32 as i32);
+
+    // ---- Pipe status codes ----
+
+    pub const STATUS_PIPE_EMPTY: Self = Self(0xC000_00D9u32 as i32);
+    pub const STATUS_PIPE_BROKEN: Self = Self(0xC000_014Bu32 as i32);
+    pub const STATUS_PIPE_CONNECTED: Self = Self(0x0000_0003);
+    pub const STATUS_PIPE_CLOSING: Self = Self(0xC000_00B1u32 as i32);
+    pub const STATUS_PIPE_DISCONNECTED: Self = Self(0xC000_00B0u32 as i32);
+    pub const STATUS_INSTANCE_NOT_AVAILABLE: Self = Self(0xC000_0042u32 as i32);
 }
 
 impl core::fmt::Display for NtStatus {

@@ -1570,6 +1570,7 @@ name = "litebox_common_windows"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.11.0",
+ "iced-x86",
  "litebox",
  "thiserror",
  "windows-sys 0.60.2",

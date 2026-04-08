@@ -35,7 +35,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod apiset;
-pub mod gs_table;
+pub mod gs_to_fs_rewriter;
 pub mod nt_types;
 pub mod ntdll_rewriter;
 pub mod ntstatus;
@@ -45,7 +45,6 @@ pub mod pe_loader;
 pub mod pe_parser;
 #[cfg(all(feature = "std", target_os = "windows"))]
 pub mod shmem_ring;
-pub mod stub_dlls;
 
 /// Standard Windows HANDLEs for console I/O.
 pub const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6; // (DWORD)-10
@@ -83,6 +82,7 @@ pub enum NtSyscallId {
     NtSetInformationFile,
     NtQueryVolumeInformationFile,
     NtQueryDirectoryFile,
+    NtQueryDirectoryFileEx,
     NtDeleteFile,
     NtQueryAttributesFile,
     NtCreateSection,
@@ -125,6 +125,8 @@ pub enum NtSyscallId {
 
     NtContinue,
     NtOpenSection,
+    NtConnectPort,
+    NtAlpcSendWaitReceivePort,
     NtQuerySection,
     NtSetInformationProcess,
     NtFlushBuffersFile,
@@ -157,8 +159,11 @@ pub enum NtSyscallId {
     NtOpenDirectoryObject,
     NtCreateWorkerFactory,
     NtReleaseWorkerFactoryWorker,
+    NtWorkerFactoryWorkerReady,
+    NtWaitForWorkViaWorkerFactory,
     NtCreateTimer2,
     NtSetTimer2,
+    NtCancelTimer2,
     NtQueryTimerResolution,
     NtRaiseException,
     NtOpenEvent,
@@ -196,12 +201,25 @@ pub enum NtSyscallId {
     NtAlertThreadByThreadIdEx,
     NtRemoveIoCompletionEx,
     NtSetIoCompletionEx,
+    NtQueryInformationByName,
+    NtQueueApcThread,
+    NtQueueApcThreadEx,
+    NtAlertThread,
+    NtFsControlFile,
+    NtCreateJobObject,
+    NtSetInformationJobObject,
+    NtAssignProcessToJobObject,
+    NtCancelIoFileEx,
+    NtCancelIoFile,
+    NtQueryFullAttributesFile,
+    NtQueryDebugFilterState,
 }
 
 /// Mapping from real Windows syscall numbers to `NtSyscallId`.
 ///
 /// Produced by the ntdll rewriter after scanning the export table.
 /// The shim receives this at init and uses it for dispatch.
+#[derive(Clone)]
 pub struct NtSyscallMap {
     /// Sparse lookup: index = real Windows syscall number, value = Some(id).
     /// Sized to hold the maximum real number seen during rewriting + 1.
@@ -244,6 +262,7 @@ impl NtSyscallMap {
             NtSyscallId::NtSetInformationFile,
             NtSyscallId::NtQueryVolumeInformationFile,
             NtSyscallId::NtQueryDirectoryFile,
+            NtSyscallId::NtQueryDirectoryFileEx,
             NtSyscallId::NtDeleteFile,
             NtSyscallId::NtQueryAttributesFile,
             NtSyscallId::NtCreateSection,
@@ -311,8 +330,11 @@ impl NtSyscallMap {
             NtSyscallId::NtOpenDirectoryObject,
             NtSyscallId::NtCreateWorkerFactory,
             NtSyscallId::NtReleaseWorkerFactoryWorker,
+            NtSyscallId::NtWorkerFactoryWorkerReady,
+            NtSyscallId::NtWaitForWorkViaWorkerFactory,
             NtSyscallId::NtCreateTimer2,
             NtSyscallId::NtSetTimer2,
+            NtSyscallId::NtCancelTimer2,
             NtSyscallId::NtQueryTimerResolution,
             NtSyscallId::NtRaiseException,
             NtSyscallId::NtOpenEvent,
@@ -350,6 +372,18 @@ impl NtSyscallMap {
             NtSyscallId::NtAlertThreadByThreadIdEx,
             NtSyscallId::NtRemoveIoCompletionEx,
             NtSyscallId::NtSetIoCompletionEx,
+            NtSyscallId::NtQueryInformationByName,
+            NtSyscallId::NtQueueApcThread,
+            NtSyscallId::NtQueueApcThreadEx,
+            NtSyscallId::NtAlertThread,
+            NtSyscallId::NtFsControlFile,
+            NtSyscallId::NtCreateJobObject,
+            NtSyscallId::NtSetInformationJobObject,
+            NtSyscallId::NtAssignProcessToJobObject,
+            NtSyscallId::NtCancelIoFileEx,
+            NtSyscallId::NtCancelIoFile,
+            NtSyscallId::NtQueryFullAttributesFile,
+            NtSyscallId::NtQueryDebugFilterState,
         ];
         let pairs: alloc::vec::Vec<(u32, NtSyscallId)> =
             all.iter().map(|&id| (id as u32, id)).collect();
@@ -378,8 +412,10 @@ pub fn name_to_syscall_id(name: &str) -> Option<NtSyscallId> {
         "NtSetInformationFile" => NtSyscallId::NtSetInformationFile,
         "NtQueryVolumeInformationFile" => NtSyscallId::NtQueryVolumeInformationFile,
         "NtQueryDirectoryFile" => NtSyscallId::NtQueryDirectoryFile,
+        "NtQueryDirectoryFileEx" => NtSyscallId::NtQueryDirectoryFileEx,
         "NtDeleteFile" => NtSyscallId::NtDeleteFile,
         "NtQueryAttributesFile" => NtSyscallId::NtQueryAttributesFile,
+        "NtQueryInformationByName" => NtSyscallId::NtQueryInformationByName,
         "NtCreateSection" => NtSyscallId::NtCreateSection,
         "NtMapViewOfSection" => NtSyscallId::NtMapViewOfSection,
         "NtUnmapViewOfSection" => NtSyscallId::NtUnmapViewOfSection,
@@ -417,6 +453,8 @@ pub fn name_to_syscall_id(name: &str) -> Option<NtSyscallId> {
         "NtRemoveIoCompletion" => NtSyscallId::NtRemoveIoCompletion,
         "NtContinue" => NtSyscallId::NtContinue,
         "NtOpenSection" => NtSyscallId::NtOpenSection,
+        "NtConnectPort" => NtSyscallId::NtConnectPort,
+        "NtAlpcSendWaitReceivePort" => NtSyscallId::NtAlpcSendWaitReceivePort,
         "NtQuerySection" => NtSyscallId::NtQuerySection,
         "NtSetInformationProcess" => NtSyscallId::NtSetInformationProcess,
         "NtFlushBuffersFile" => NtSyscallId::NtFlushBuffersFile,
@@ -447,8 +485,11 @@ pub fn name_to_syscall_id(name: &str) -> Option<NtSyscallId> {
         "NtOpenDirectoryObject" => NtSyscallId::NtOpenDirectoryObject,
         "NtCreateWorkerFactory" => NtSyscallId::NtCreateWorkerFactory,
         "NtReleaseWorkerFactoryWorker" => NtSyscallId::NtReleaseWorkerFactoryWorker,
+        "NtWorkerFactoryWorkerReady" => NtSyscallId::NtWorkerFactoryWorkerReady,
+        "NtWaitForWorkViaWorkerFactory" => NtSyscallId::NtWaitForWorkViaWorkerFactory,
         "NtCreateTimer2" => NtSyscallId::NtCreateTimer2,
         "NtSetTimer2" => NtSyscallId::NtSetTimer2,
+        "NtCancelTimer2" => NtSyscallId::NtCancelTimer2,
         "NtQueryTimerResolution" => NtSyscallId::NtQueryTimerResolution,
         "NtRaiseException" => NtSyscallId::NtRaiseException,
         "NtOpenEvent" => NtSyscallId::NtOpenEvent,
@@ -486,6 +527,17 @@ pub fn name_to_syscall_id(name: &str) -> Option<NtSyscallId> {
         "NtAlertThreadByThreadIdEx" => NtSyscallId::NtAlertThreadByThreadIdEx,
         "NtRemoveIoCompletionEx" => NtSyscallId::NtRemoveIoCompletionEx,
         "NtSetIoCompletionEx" => NtSyscallId::NtSetIoCompletionEx,
+        "NtQueueApcThread" => NtSyscallId::NtQueueApcThread,
+        "NtQueueApcThreadEx" | "NtQueueApcThreadEx2" => NtSyscallId::NtQueueApcThreadEx,
+        "NtAlertThread" => NtSyscallId::NtAlertThread,
+        "NtFsControlFile" => NtSyscallId::NtFsControlFile,
+        "NtCreateJobObject" => NtSyscallId::NtCreateJobObject,
+        "NtSetInformationJobObject" => NtSyscallId::NtSetInformationJobObject,
+        "NtAssignProcessToJobObject" => NtSyscallId::NtAssignProcessToJobObject,
+        "NtCancelIoFileEx" => NtSyscallId::NtCancelIoFileEx,
+        "NtCancelIoFile" => NtSyscallId::NtCancelIoFile,
+        "NtQueryFullAttributesFile" => NtSyscallId::NtQueryFullAttributesFile,
+        "NtQueryDebugFilterState" => NtSyscallId::NtQueryDebugFilterState,
         _ => return None,
     };
     Some(id)

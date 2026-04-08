@@ -279,7 +279,7 @@ impl<const ALIGN: usize> NonZeroAddress<ALIGN> {
 
 /// Virtual memory area
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct VmArea {
+pub struct VmArea {
     /// Flags describing the properties of the memory region.
     flags: VmFlags,
     /// Whether this area is backed by a file
@@ -291,7 +291,7 @@ pub(super) struct VmArea {
 impl VmArea {
     /// Get the [flags](`VmFlags`) of this memory area.
     #[inline]
-    pub(super) fn flags(self) -> VmFlags {
+    pub fn flags(self) -> VmFlags {
         self.flags
     }
 
@@ -329,7 +329,7 @@ impl VmArea {
 ///
 /// This struct mantains the virtual memory ranges backed by a memory [backend](PageManagementProvider).
 /// Each range needs to be `ALIGN`-aligned.
-pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> {
+pub struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> {
     /// Memory backend that provides the actual memory.
     pub(super) platform: &'static Platform,
     /// Initial program break address. `brk` may not shrink below this value.
@@ -424,7 +424,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
 
     /// Gets an iterator over all pairs of ([`Range<usize>`], [`VmArea`]),
     /// ordered by key range.
-    pub(super) fn iter(&self) -> impl Iterator<Item = (&Range<usize>, &VmArea)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&Range<usize>, &VmArea)> {
         self.vmas.iter()
     }
 
@@ -443,7 +443,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
 
     /// Gets an iterator over all the stored ranges that are
     /// either partially or completely overlapped by the given range.
-    pub(super) fn overlapping(
+    pub fn overlapping(
         &self,
         range: Range<usize>,
     ) -> impl DoubleEndedIterator<Item = (&Range<usize>, &VmArea)> {
@@ -458,10 +458,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// # Safety
     ///
     /// The caller must ensure that the memory region is no longer used by any other.
-    pub(super) unsafe fn remove_mapping(
-        &mut self,
-        range: PageRange<ALIGN>,
-    ) -> Result<(), VmemUnmapError> {
+    pub unsafe fn remove_mapping(&mut self, range: PageRange<ALIGN>) -> Result<(), VmemUnmapError> {
         unsafe {
             self.platform
                 .deallocate_pages(range.into())
@@ -488,7 +485,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     ///
     /// The caller must ensure that the memory contents in the affected region are no longer accessed or
     /// relied upon. Any pointers or references to the previous contents become invalid.
-    pub(super) unsafe fn reset_pages(
+    pub unsafe fn reset_pages(
         &mut self,
         range: PageRange<ALIGN>,
         anonymous_only: bool,
@@ -897,7 +894,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     ///
     /// The caller must ensure it is safe to change the permissions of the given range, e.g., no more
     /// write access to the range if it is changed to read-only.
-    pub(super) unsafe fn protect_mapping(
+    ///
+    /// # Panics
+    ///
+    /// Panics if `permissions` contains bits outside the valid `VmFlags` range.
+    pub unsafe fn protect_mapping(
         &mut self,
         range: PageRange<ALIGN>,
         permissions: MemoryRegionPermissions,
@@ -984,7 +985,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
     ///
     /// Also, caller must ensure flags are set correctly.
-    pub(super) unsafe fn create_pages(
+    pub unsafe fn create_pages(
         &mut self,
         suggested_new_address: Option<NonZeroAddress<ALIGN>>,
         length: NonZeroPageSize<ALIGN>,
@@ -1019,7 +1020,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     ///
     /// `page_range` specifies the range of pages to check the memory permissions.
     /// This function returns `MemoryRegionPermissions` only if the range is valid.
-    pub(super) fn get_memory_permissions(
+    pub fn get_memory_permissions(
         &self,
         page_range: PageRange<ALIGN>,
     ) -> Option<MemoryRegionPermissions> {

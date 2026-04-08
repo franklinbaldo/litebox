@@ -201,7 +201,7 @@ impl PeParsedFile {
             if span == 0 {
                 continue;
             }
-            let sec_end = sec_start + span;
+            let sec_end = sec_start.saturating_add(span);
             if rva >= sec_start && rva < sec_end {
                 let offset_in_section = rva - sec_start;
                 if offset_in_section < section.size_of_raw_data {
@@ -326,8 +326,8 @@ impl PeParsedFile {
             Err(_) => return Vec::new(),
         };
 
-        let num_functions = export_dir.number_of_functions as usize;
-        let num_names = export_dir.number_of_names as usize;
+        let num_functions = (export_dir.number_of_functions as usize).min(65536);
+        let num_names = (export_dir.number_of_names as usize).min(65536);
 
         // Build a map from EAT index → names by walking the name/ordinal
         // arrays. Multiple names can alias the same EAT slot (export aliases),

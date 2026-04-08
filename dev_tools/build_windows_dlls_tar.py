@@ -21,6 +21,10 @@ import os
 import sys
 import tarfile
 
+# Import registry VFS builder (lives alongside this script).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from build_registry_vfs import build_registry_files, add_to_tar as add_registry_to_tar
+
 # DLLs required for ntdll-driven init of a typical Windows PE binary.
 # These are the DLLs that ntdll's LdrpInitialize loads for UCRT-linked
 # programs and Node.js.
@@ -75,6 +79,11 @@ def main():
         default=SYSTEM32,
         help=f"Path to System32 (default: {SYSTEM32})",
     )
+    parser.add_argument(
+        "--no-registry",
+        action="store_true",
+        help="Skip registry VFS export",
+    )
     args = parser.parse_args()
 
     dlls = DEFAULT_DLLS + args.extra
@@ -109,6 +118,13 @@ def main():
             info.mode = 0o644
             tar.addfile(info, io.BytesIO(data))
             print(f"  {tar_path} ({len(data)} bytes)")
+
+        # Add registry VFS entries
+        if not args.no_registry:
+            print("\nExporting host registry...")
+            registry_files = build_registry_files()
+            add_registry_to_tar(tar, registry_files)
+            print(f"  Added {len(registry_files)} registry values")
 
     if missing:
         print(f"\nWARNING: {len(missing)} DLLs not found: {', '.join(missing)}")

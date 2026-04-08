@@ -626,10 +626,9 @@ fn hook_syscalls_in_section(
             ) {
                 Ok(()) => {}
                 Err(Error::InsufficientBytesBeforeOrAfter(_)) => {
-                    // Skip this syscall instruction and continue patching the
-                    // rest of the section.  The unpatched instruction will
-                    // execute as a raw host syscall, which the caller should
-                    // log so it can be investigated.
+                    // Replace the unpatchable syscall with UD2 so it traps
+                    // instead of escaping to the host kernel.
+                    replace_with_ud2(section_data, section_base_addr, inst);
                     skipped_addrs.push(inst.ip());
                 }
                 Err(e) => return Err(e),
@@ -690,6 +689,7 @@ fn hook_syscalls_in_section(
                     ) {
                         Ok(()) => {}
                         Err(Error::InsufficientBytesBeforeOrAfter(_)) => {
+                            replace_with_ud2(section_data, section_base_addr, inst);
                             skipped_addrs.push(inst.ip());
                         }
                         Err(e) => return Err(e),
@@ -1225,6 +1225,24 @@ fn hook_syscall_and_after(
     }
 
     Ok(())
+}
+
+/// Replace an unpatchable syscall instruction with `UD2` (`0F 0B`) so that
+/// reaching it triggers SIGILL instead of silently escaping to the host kernel.
+///
+/// `syscall` (0F 05) and `int 0x80` (CD 80) are both 2 bytes — same size as
+/// `ud2`. For `call DWORD PTR gs:0x10` (7 bytes), the remaining 5 bytes are
+/// filled with NOPs.
+fn replace_with_ud2(section_data: &mut [u8], section_base_addr: u64, inst: &iced_x86::Instruction) {
+    let offset = usize::try_from(inst.ip() - section_base_addr).unwrap();
+    let len = inst.len();
+    // UD2 = 0F 0B
+    section_data[offset] = 0x0F;
+    section_data[offset + 1] = 0x0B;
+    // Fill any remaining bytes (e.g. 7-byte `call gs:0x10`) with NOPs.
+    for b in &mut section_data[offset + 2..offset + len] {
+        *b = 0x90;
+    }
 }
 
 fn instruction_slice_has_ip_rel_memory_operand<'a>(

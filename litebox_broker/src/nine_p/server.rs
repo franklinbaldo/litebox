@@ -39,9 +39,18 @@ const MAX_FIDS: usize = 8192;
 /// Linux `AT_REMOVEDIR` flag for `Tunlinkat`.
 const AT_REMOVEDIR: u32 = 0x200;
 
+/// Cache key for ELF patch invalidation: `(mtime_nsecs, file_size)`.
+///
+/// Using nanosecond-resolution mtime and file size together prevents stale
+/// cache hits when a binary is recompiled within the same second (common
+/// during rapid edit-compile-run cycles). Second-resolution mtime alone is
+/// insufficient because the linker can create a new binary with a different
+/// layout but the same mtime second.
+type ElfCacheKey = (u128, u64);
+
 /// Cache of patched ELF data, keyed by canonical path.
-/// Stores `(mtime_secs, patched_data)` to invalidate when the file changes.
-pub type ElfCache = HashMap<PathBuf, (i64, Arc<Vec<u8>>)>;
+/// Stores `(ElfCacheKey, patched_data)` to invalidate when the file changes.
+pub type ElfCache = HashMap<PathBuf, (ElfCacheKey, Arc<Vec<u8>>)>;
 
 /// State for a single FID (file identifier) in the 9P server.
 struct FidState {
@@ -857,6 +866,12 @@ impl Server {
 
         match opts.open(&resolved) {
             Ok(mut file) => {
+                // Invalidate ELF cache if the open truncates or writes,
+                // since the file content has changed.
+                if is_write {
+                    self.invalidate_elf_cache(&resolved);
+                }
+
                 let meta = match file.metadata() {
                     Ok(m) => m,
                     Err(e) => return io_error_response(e),
@@ -956,6 +971,9 @@ impl Server {
 
         match opts.open(&resolved_target) {
             Ok(file) => {
+                // Invalidate ELF cache — file was created or truncated.
+                self.invalidate_elf_cache(&resolved_target);
+
                 let meta = match file.metadata() {
                     Ok(m) => m,
                     Err(e) => return io_error_response(e),
@@ -1078,7 +1096,12 @@ impl Server {
         };
 
         match file.write_at(&data, offset) {
-            Ok(n) => Fcall::Rwrite(fcall::Rwrite { count: n as u32 }),
+            Ok(n) => {
+                // Invalidate ELF patch cache for this path — the file content
+                // has changed so any cached patched version is stale.
+                self.invalidate_elf_cache(&path);
+                Fcall::Rwrite(fcall::Rwrite { count: n as u32 })
+            }
             Err(e) => io_error_response(e),
         }
     }
@@ -1212,6 +1235,8 @@ impl Server {
                     return io_error_response(e);
                 }
             }
+            // Invalidate ELF cache — truncation changes the file content.
+            self.invalidate_elf_cache(&resolved);
         }
 
         Fcall::Rsetattr(fcall::Rsetattr {})
@@ -1387,7 +1412,13 @@ impl Server {
         };
 
         match result {
-            Ok(()) => Fcall::Runlinkat(fcall::Runlinkat {}),
+            Ok(()) => {
+                // Invalidate ELF cache — the file no longer exists at this path.
+                if !is_rmdir {
+                    self.invalidate_elf_cache(&target);
+                }
+                Fcall::Runlinkat(fcall::Runlinkat {})
+            }
             Err(e) => io_error_response(e),
         }
     }
@@ -1448,6 +1479,9 @@ impl Server {
 
         match fs::rename(&resolved_src, &dst) {
             Ok(()) => {
+                // Invalidate ELF cache for both old and new paths.
+                self.invalidate_elf_cache(&resolved_src);
+                self.invalidate_elf_cache(&dst);
                 // Update the FID's path to the new location
                 let mut state = write_lock(&src_arc, "fid");
                 state.path = dst;
@@ -1520,7 +1554,11 @@ impl Server {
         }
 
         match fs::rename(&src, &dst) {
-            Ok(()) => Fcall::Rrenameat(fcall::Rrenameat {}),
+            Ok(()) => {
+                self.invalidate_elf_cache(&src);
+                self.invalidate_elf_cache(&dst);
+                Fcall::Rrenameat(fcall::Rrenameat {})
+            }
             Err(e) => io_error_response(e),
         }
     }
@@ -1619,7 +1657,12 @@ impl Server {
         };
 
         match result {
-            Ok(()) => Fcall::Rremove(fcall::Rremove {}),
+            Ok(()) => {
+                if !is_dir {
+                    self.invalidate_elf_cache(&resolved);
+                }
+                Fcall::Rremove(fcall::Rremove {})
+            }
             Err(e) => io_error_response(e),
         }
     }
@@ -1649,10 +1692,18 @@ impl Server {
     // ELF patching
     // ========================================================================
 
+    /// Remove a path from the ELF patch cache. Called when the underlying file
+    /// is modified (write), deleted (unlink), or replaced (rename) so that
+    /// subsequent opens re-patch from the current file content.
+    fn invalidate_elf_cache(&self, path: &Path) {
+        let mut cache = mutex_lock(&self.elf_cache, "elf_cache");
+        cache.remove(path);
+    }
+
     /// Attempt to patch an ELF file with syscall trampolines.
     ///
     /// Only patches read-only opens when syscall rewriting is enabled.
-    /// The cache is keyed by path and invalidated when mtime changes.
+    /// The cache is keyed by path and invalidated when mtime or size changes.
     fn try_patch_elf(
         &self,
         file: &mut fs::File,
@@ -1663,21 +1714,24 @@ impl Server {
             return None;
         }
 
-        // Get current mtime for cache validation
-        let current_mtime = file
-            .metadata()
-            .ok()?
+        // Build cache key from mtime (nanosecond resolution) and file size.
+        // Using both fields prevents stale hits when a binary is recompiled
+        // within the same second — the file size almost always changes.
+        let meta = file.metadata().ok()?;
+        let mtime_ns = meta
             .modified()
             .ok()?
             .duration_since(SystemTime::UNIX_EPOCH)
             .ok()?
-            .as_secs() as i64;
+            .as_nanos();
+        let file_size = meta.len();
+        let cache_key: ElfCacheKey = (mtime_ns, file_size);
 
-        // Check cache with mtime validation
+        // Check cache with mtime+size validation
         {
             let cache = mutex_lock(&self.elf_cache, "elf_cache");
-            if let Some((cached_mtime, cached_data)) = cache.get(path)
-                && *cached_mtime == current_mtime
+            if let Some((cached_key, cached_data)) = cache.get(path)
+                && *cached_key == cache_key
             {
                 return Some(Arc::clone(cached_data));
             }
@@ -1727,7 +1781,7 @@ impl Server {
 
         let arc = Arc::new(patched);
         let mut cache = mutex_lock(&self.elf_cache, "elf_cache");
-        cache.insert(path.to_owned(), (current_mtime, Arc::clone(&arc)));
+        cache.insert(path.to_owned(), (cache_key, Arc::clone(&arc)));
         Some(arc)
     }
 }
