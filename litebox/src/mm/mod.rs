@@ -95,7 +95,10 @@ where
         }
         while v > 0 {
             pos -= 1;
-            buf[pos] = b'0' + (v % 10) as u8;
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                buf[pos] = b'0' + (v % 10) as u8;
+            }
             v /= 10;
         }
         Self::_diag_write(&buf[pos..]);

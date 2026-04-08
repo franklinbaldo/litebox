@@ -2085,7 +2085,17 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 Err(litebox::platform::page_mgmt::AllocationError::OutOfMemory)
             }
             FixedAddressBehavior::Replace | FixedAddressBehavior::NoReplace => {
-                raw_debug_write(b"[allocate_pages] Fixed/NoReplace entry\n");
+                raw_debug_write(b"[allocate_pages] Fixed/NoReplace entry range=");
+                raw_debug_write_hex(suggested_range.start);
+                raw_debug_write(b"..");
+                raw_debug_write_hex(suggested_range.end);
+                raw_debug_write(b" behavior=");
+                if fixed_address_behavior == FixedAddressBehavior::NoReplace {
+                    raw_debug_write(b"NoReplace");
+                } else {
+                    raw_debug_write(b"Replace");
+                }
+                raw_debug_write(b"\n");
                 if fixed_address_behavior == FixedAddressBehavior::Replace {
                     clear_edge_page_mapping(suggested_range.clone());
                 }
@@ -2100,74 +2110,128 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 // code on an edge page, the fault-and-toggle handler in
                 // exception_signal_handler will flip it to RX on demand.
 
-                // Step 1: mmap the 16KB-aligned interior with MAP_FIXED.
-                // This replaces only fully-enclosed host pages with fresh anonymous memory.
+                // Step 1: Map the 16KB-aligned interior.
+                //
+                // For NoReplace: use mach_vm_allocate(VM_FLAGS_FIXED) *without*
+                // VM_FLAGS_OVERWRITE. This fails cleanly with KERN_NO_SPACE if
+                // the region overlaps existing host mappings, without clobbering
+                // anything. This is critical for set_initial_brk's gap
+                // reservation, where the gap range may overlap live host memory
+                // (heap, system allocator) on some machines.
+                //
+                // For Replace: use MAP_FIXED to atomically replace existing
+                // mappings (the normal ELF segment loading path).
                 if inner_start < inner_end {
-                    let r = unsafe {
-                        libc::mmap(
-                            inner_start as *mut libc::c_void,
-                            inner_end - inner_start,
-                            prot,
-                            macos_mmap_flags(
-                                MapFlags::MAP_PRIVATE
-                                    | MapFlags::MAP_ANONYMOUS
-                                    | MapFlags::MAP_FIXED,
-                            ),
-                            -1,
-                            0,
-                        )
-                    };
-                    if r == libc::MAP_FAILED {
-                        let err = std::io::Error::last_os_error();
-                        match err.raw_os_error() {
-                            Some(libc::ENOMEM) => {
+                    if fixed_address_behavior == FixedAddressBehavior::NoReplace {
+                        // Safe non-clobbering path for NoReplace.
+                        let mut addr = inner_start as u64;
+                        let size = (inner_end - inner_start) as u64;
+                        let kr = unsafe {
+                            mach_vm_allocate(
+                                mach_task_self(),
+                                &raw mut addr,
+                                size,
+                                VM_FLAGS_FIXED,
+                            )
+                        };
+                        if kr != 0 {
+                            raw_debug_write(b"[allocate_pages] NoReplace mach_vm_allocate failed kr=");
+                            #[allow(clippy::cast_sign_loss)]
+                            raw_debug_write_hex(kr as usize);
+                            raw_debug_write(b"\n");
+                            return Err(
+                                litebox::platform::page_mgmt::AllocationError::AddressInUseByPlatform,
+                            );
+                        }
+                        // mach_vm_allocate gives RW. Set requested protection.
+                        if prot != (libc::PROT_READ | libc::PROT_WRITE) {
+                            let r = unsafe {
+                                libc::mprotect(
+                                    inner_start as *mut libc::c_void,
+                                    inner_end - inner_start,
+                                    prot,
+                                )
+                            };
+                            if r != 0 {
+                                unsafe {
+                                    mach_vm_deallocate(
+                                        mach_task_self(),
+                                        inner_start as u64,
+                                        size,
+                                    );
+                                }
                                 return Err(
-                                    litebox::platform::page_mgmt::AllocationError::OutOfMemory,
+                                    litebox::platform::page_mgmt::AllocationError::AddressInUseByPlatform,
                                 );
                             }
-                            Some(libc::EACCES | libc::EPERM) => {
-                                // MAP_FIXED on a region owned by the platform
-                                // (e.g. the host shared cache) returns EACCES.
-                                // Fall back to mach_vm_allocate with VM_FLAGS_OVERWRITE
-                                // which can replace kernel-managed shared region mappings.
-                                let mut addr = inner_start as u64;
-                                let size = (inner_end - inner_start) as u64;
-                                let kr = unsafe {
-                                    mach_vm_allocate(
-                                        mach_task_self(),
-                                        &raw mut addr,
-                                        size,
-                                        VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
-                                    )
-                                };
-                                if kr != 0 {
-                                    // KERN_SUCCESS == 0; any other value is failure.
-                                    return Err(litebox::platform::page_mgmt::AllocationError::AddressInUseByPlatform);
+                        }
+                    } else {
+                        // Replace path: MAP_FIXED atomically replaces existing
+                        // mappings with fresh anonymous memory.
+                        let r = unsafe {
+                            libc::mmap(
+                                inner_start as *mut libc::c_void,
+                                inner_end - inner_start,
+                                prot,
+                                macos_mmap_flags(
+                                    MapFlags::MAP_PRIVATE
+                                        | MapFlags::MAP_ANONYMOUS
+                                        | MapFlags::MAP_FIXED,
+                                ),
+                                -1,
+                                0,
+                            )
+                        };
+                        if r == libc::MAP_FAILED {
+                            let err = std::io::Error::last_os_error();
+                            match err.raw_os_error() {
+                                Some(libc::ENOMEM) => {
+                                    return Err(
+                                        litebox::platform::page_mgmt::AllocationError::OutOfMemory,
+                                    );
                                 }
-                                // mach_vm_allocate gives RW pages. Set the
-                                // requested protection.
-                                if prot != (libc::PROT_READ | libc::PROT_WRITE) {
-                                    let r = unsafe {
-                                        libc::mprotect(
-                                            inner_start as *mut libc::c_void,
-                                            inner_end - inner_start,
-                                            prot,
+                                Some(libc::EACCES | libc::EPERM) => {
+                                    // MAP_FIXED on a region owned by the platform
+                                    // (e.g. the host shared cache) returns EACCES.
+                                    // Fall back to mach_vm_allocate with VM_FLAGS_OVERWRITE
+                                    // which can replace kernel-managed shared region mappings.
+                                    let mut addr = inner_start as u64;
+                                    let size = (inner_end - inner_start) as u64;
+                                    let kr = unsafe {
+                                        mach_vm_allocate(
+                                            mach_task_self(),
+                                            &raw mut addr,
+                                            size,
+                                            VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
                                         )
                                     };
-                                    if r != 0 {
-                                        // mprotect failed; deallocate and fail.
-                                        unsafe {
-                                            mach_vm_deallocate(
-                                                mach_task_self(),
-                                                inner_start as u64,
-                                                size,
-                                            );
-                                        }
+                                    if kr != 0 {
                                         return Err(litebox::platform::page_mgmt::AllocationError::AddressInUseByPlatform);
                                     }
+                                    // mach_vm_allocate gives RW pages. Set the
+                                    // requested protection.
+                                    if prot != (libc::PROT_READ | libc::PROT_WRITE) {
+                                        let r = unsafe {
+                                            libc::mprotect(
+                                                inner_start as *mut libc::c_void,
+                                                inner_end - inner_start,
+                                                prot,
+                                            )
+                                        };
+                                        if r != 0 {
+                                            unsafe {
+                                                mach_vm_deallocate(
+                                                    mach_task_self(),
+                                                    inner_start as u64,
+                                                    size,
+                                                );
+                                            }
+                                            return Err(litebox::platform::page_mgmt::AllocationError::AddressInUseByPlatform);
+                                        }
+                                    }
                                 }
+                                _ => panic!("unhandled mmap error {err}"),
                             }
-                            _ => panic!("unhandled mmap error {err}"),
                         }
                     }
                 }
@@ -3152,6 +3216,12 @@ fn raw_debug_write(buf: &[u8]) {
             clobber_abi("C"),
         );
     }
+}
+
+fn raw_debug_write_hex(val: usize) {
+    let mut buf = [0u8; 20]; // "0x" + up to 16 hex digits + margin
+    let len = write_hex_to_buf(&mut buf, 0, val as u64);
+    raw_debug_write(&buf[..len]);
 }
 
 /// Raw `mmap(addr, len, prot, flags, fd, offset)` via inline assembly.
