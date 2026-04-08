@@ -123,16 +123,16 @@ pub struct ProcessServer<FS: ShimFS> {
     child_handles: RefCell<Vec<JoinHandle<()>>>,
     /// Per-process state from Tier 2 fire-and-forget notifications.
     notification_state: RefCell<crate::notification_state::ProcessNotificationState>,
-    /// TUN queue index for this process's net-worker.
-    tun_queue: Option<usize>,
+    /// TUN queue index for this process's net-worker.  Wrapped in `Cell` so
+    /// `handle_fork` (which takes `&self`) can detach the queue on first fork.
+    tun_queue: Cell<Option<usize>>,
     /// Whether TUN networking is available (independent of this process having
-    /// a queue — the master has `tun_queue = None` but `tun_enabled = true`).
+    /// a queue — the master may have given its queue to a child).
     tun_enabled: bool,
-    /// Initial TUN queue index to hand to the first forked child.  `Some(0)`
-    /// for the master (queue 0 was created at startup), `None` once it has
-    /// been given away or for non-master processes (which always call
-    /// `open_new_queue()` for their children).
-    initial_child_queue: Cell<Option<usize>>,
+    /// Shutdown signal for this process's net-worker thread.  Stored so that
+    /// `handle_fork` can signal the net-worker to stop after detaching the
+    /// master's TUN queue on first fork.
+    net_worker_shutdown: RefCell<Option<Arc<AtomicBool>>>,
     /// Base pointer of the mmap'd tar shmem region (shared with micro via
     /// `ExecveHeader`). Passed through to forked children.
     tar_shmem_base: SendPtr,
@@ -193,14 +193,6 @@ impl<FS: ShimFS> ProcessServer<FS> {
         inmem_alloc: Arc<Mutex<crate::inmem_alloc::InMemAllocator>>,
         inmem_file_map: Arc<Mutex<HashMap<String, u32>>>,
     ) -> Self {
-        // If this process has no TUN queue but TUN is enabled, it's the master.
-        // Queue 0 (created by CentralPlatform::new) should be given to the
-        // first forked child.
-        let initial_child_queue = if tun_queue.is_none() && tun_enabled {
-            Cell::new(Some(0))
-        } else {
-            Cell::new(None)
-        };
         Self {
             region,
             ring_pool,
@@ -216,9 +208,9 @@ impl<FS: ShimFS> ProcessServer<FS> {
             notification_state: RefCell::new(
                 crate::notification_state::ProcessNotificationState::default(),
             ),
-            tun_queue,
+            tun_queue: Cell::new(tun_queue),
             tun_enabled,
-            initial_child_queue,
+            net_worker_shutdown: RefCell::new(None),
             tar_shmem_base: SendPtr(tar_shmem_base),
             tar_shmem_size,
             tar_file_map,
@@ -246,19 +238,22 @@ impl<FS: ShimFS> ProcessServer<FS> {
         // Route IPInterfaceProvider calls on this thread to the process's TUN
         // queue.  Syscall handlers (e.g. accept/connect) may lock the
         // per-process Network and invoke the platform device on this thread.
-        if let Some(queue) = self.tun_queue {
+        if let Some(queue) = self.tun_queue.get() {
             litebox_platform_central::CentralPlatform::set_current_tun_queue(queue);
         }
 
         // Spawn a per-process net-worker thread if networking is enabled.
         // The guard ensures the thread is joined even if run() panics.
-        let net_worker_guard = if let Some(queue) = self.tun_queue {
+        let net_worker_guard = if let Some(queue) = self.tun_queue.get() {
             use litebox::net::PlatformInteractionReinvocationAdvice::{
                 CallAgainImmediately, WaitOnDeviceOrSocketInteraction,
             };
 
             let net = self.primary_task.net_mutex();
             let shutdown = Arc::new(AtomicBool::new(false));
+            // Store shutdown signal so handle_fork can stop the net-worker
+            // after detaching the TUN queue.
+            *self.net_worker_shutdown.borrow_mut() = Some(Arc::clone(&shutdown));
             let shutdown_clone = shutdown.clone();
             let pid = self.primary_task.pid();
             let platform = litebox_platform_multiplex::platform();
@@ -1139,11 +1134,20 @@ impl<FS: ShimFS> ProcessServer<FS> {
             let fs = self.fs.clone();
             let pool = Arc::clone(&self.ring_pool);
             let tun_queue = if self.tun_enabled {
-                // Use the pre-existing queue 0 for the first child (avoids
-                // wasting the queue created at startup), otherwise open a new
-                // one.
-                if let Some(q) = self.initial_child_queue.get() {
-                    self.initial_child_queue.set(None);
+                // Detach-on-fork: if the master still owns a TUN queue,
+                // take it away and give it to this first child.  This
+                // prevents the master from black-holing connections (it
+                // never calls accept when workers are present).  Signal
+                // the master's net-worker to shut down since its queue
+                // is now owned by the child.
+                if let Some(q) = self.tun_queue.get() {
+                    let platform = litebox_platform_multiplex::platform();
+                    platform.try_detach_queue(q);
+                    self.tun_queue.set(None);
+                    // Signal master's net-worker to stop.
+                    if let Some(shutdown) = self.net_worker_shutdown.borrow().as_ref() {
+                        shutdown.store(true, Ordering::Relaxed);
+                    }
                     Some(q)
                 } else {
                     let platform = litebox_platform_multiplex::platform();

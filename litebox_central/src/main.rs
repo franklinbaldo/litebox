@@ -346,12 +346,13 @@ fn main() -> anyhow::Result<()> {
     let inmem_file_map: Arc<Mutex<std::collections::HashMap<String, u32>>> =
         Arc::new(Mutex::new(std::collections::HashMap::new()));
 
-    // Master process does NOT get a TUN queue — only worker children do.
-    // This prevents master's smoltcp from black-holing incoming TCP connections
-    // (master never calls accept, so connections completed on its Network are
-    // lost).  Queue 0 (created by CentralPlatform::new) is handed to the first
-    // forked worker; subsequent workers get new queues via open_new_queue().
+    // Master starts with TUN queue 0 (works for single-process programs).
+    // If the process forks workers, handle_fork detaches queue 0 from the
+    // master and hands it to the first child, preventing the master from
+    // black-holing connections it never accepts.  Subsequent children get
+    // new queues via open_new_queue().
     let tun_enabled = args.tun_device.is_some();
+    let master_tun_queue: Option<usize> = if tun_enabled { Some(0) } else { None };
     let server = server::ProcessServer::new(
         region,
         task,
@@ -359,7 +360,7 @@ fn main() -> anyhow::Result<()> {
         fs,
         ring_pool,
         -1,
-        None,
+        master_tun_queue,
         tun_enabled,
         tar_shmem_base,
         tar_shmem_size,

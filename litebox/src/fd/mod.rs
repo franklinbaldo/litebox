@@ -19,6 +19,24 @@ use thiserror::Error;
 use crate::sync::{RawSyncPrimitivesProvider, RwLock};
 use crate::utilities::anymap::AnyMap;
 
+/// An opaque identity token for a descriptor table entry.
+///
+/// This wraps a raw `Arc` pointer and is used to detect slot recycling
+/// (the ABA problem): if the token at a given slot changes, the original
+/// entry was removed and a new one was inserted at the same index.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct EntryIdentity(*const ());
+
+// SAFETY: EntryIdentity is only used for pointer-identity comparison,
+// never dereferenced. It is safe to send/share across threads.
+unsafe impl Send for EntryIdentity {}
+unsafe impl Sync for EntryIdentity {}
+
+impl EntryIdentity {
+    /// A null identity, used as a sentinel when no entry exists.
+    pub const NULL: Self = Self(core::ptr::null());
+}
+
 /// A per-process descriptor table handle.
 pub type DescriptorTable<Platform> =
     alloc::sync::Arc<crate::sync::RwLock<Platform, Descriptors<Platform>>>;
@@ -71,7 +89,8 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 self.entries.push(None);
                 self.entries.len() - 1
             });
-        let old = self.entries[idx].replace(IndividualEntry::new(Arc::new(RwLock::new(entry))));
+        let arc = Arc::new(RwLock::new(entry));
+        let old = self.entries[idx].replace(IndividualEntry::new(arc));
         assert!(old.is_none());
         TypedFd {
             _phantom: PhantomData,
@@ -159,6 +178,24 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         })
     }
 
+    /// Returns an opaque identity token for the entry currently at `fd`'s slot.
+    ///
+    /// This is the raw `Arc` pointer of the underlying `DescriptorEntry`, cast to `*const ()`.
+    /// It can be used to detect entry recycling: if the token changes between two calls for the
+    /// same slot index, then the original entry was removed and a new one was inserted.
+    ///
+    /// Returns `None` if the fd is closed or the slot is empty.
+    pub fn entry_identity<Subsystem: FdEnabledSubsystem>(
+        &self,
+        fd: &TypedFd<Subsystem>,
+    ) -> Option<EntryIdentity> {
+        let idx = fd.x.as_usize()?;
+        self.entries
+            .get(idx)
+            .and_then(|e| e.as_ref())
+            .map(|e| EntryIdentity(Arc::as_ptr(&e.x).cast::<()>()))
+    }
+
     /// Removes the entry at `fd`, closing out the file descriptor.
     ///
     /// Returns the descriptor entry if it is unique (i.e., it was not duplicated, or all duplicates
@@ -169,7 +206,8 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         &mut self,
         fd: &TypedFd<Subsystem>,
     ) -> Option<Subsystem::Entry> {
-        let Some(old) = self.entries[fd.x.as_usize()?].take() else {
+        let idx = fd.x.as_usize()?;
+        let Some(old) = self.entries[idx].take() else {
             unreachable!();
         };
         fd.x.mark_as_closed();
@@ -543,8 +581,20 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         Subsystem: FdEnabledSubsystem,
         T: core::any::Any + Send + Sync,
     {
-        self.entries[fd.x.as_usize()?]
-            .as_ref()
+        let idx = fd.x.as_usize()?;
+        let entry = self.entries.get(idx).and_then(|e| e.as_ref());
+        if entry.is_none() {
+            // Diagnostic: enumerate which entries are Some/None around this index
+            let total = self.entries.len();
+            let self_ptr = core::ptr::from_ref::<Self>(self) as usize;
+            let occupied: alloc::vec::Vec<usize> = self.entries.iter().enumerate()
+                .filter_map(|(i, e)| e.as_ref().map(|_| i))
+                .collect();
+            panic!(
+                "set_entry_metadata: entries[{idx}] is None! dt={self_ptr:#x} total_slots={total}, occupied={occupied:?}"
+            );
+        }
+        entry
             .unwrap()
             .x
             .write()

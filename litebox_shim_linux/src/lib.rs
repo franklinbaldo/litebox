@@ -245,12 +245,18 @@ impl<FS: ShimFS> LinuxShim<FS> {
         let files = Arc::new(files);
         files.initialize_stdio_in_shared_descriptors_table(&self.global);
 
+        // Per-task Network backed by the task's descriptor table (same as
+        // create_task and fork_task).
+        let mut task_net = Network::new(self.global.platform, &files.dt);
+        task_net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
+        let task_net = Arc::new(litebox::sync::Mutex::new(task_net));
+
         let entrypoints = crate::LinuxShimEntrypoints {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.global.clone(),
                 pm: alloc::sync::Arc::new(PageManager::new(self.global.platform)),
-                net: self.root_net.clone(),
+                net: task_net,
                 thread: syscalls::process::ThreadState::new_process(pid),
                 wait_state: wait::WaitState::new(self.global.platform),
                 pid,
@@ -466,11 +472,19 @@ impl<FS: ShimFS> LinuxShim<FS> {
             files.set_min_alloc_fd(3);
         }
 
+        // Each task gets its own Network backed by the task's descriptor
+        // table, matching the pattern used by fork_task(). Sharing root_net
+        // causes a dt mismatch: Network::accept() inserts into root_net's dt
+        // while the syscall handler reads from the task's files.dt.
+        let mut task_net = Network::new(self.global.platform, &files.dt);
+        task_net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
+        let task_net = Arc::new(litebox::sync::Mutex::new(task_net));
+
         LinuxShimTask {
             task: Task {
                 global: self.global.clone(),
                 pm: alloc::sync::Arc::new(PageManager::new(self.global.platform)),
-                net: self.root_net.clone(),
+                net: task_net,
                 thread: syscalls::process::ThreadState::new_process(params.pid),
                 wait_state: wait::WaitState::new(self.global.platform),
                 pid: params.pid,

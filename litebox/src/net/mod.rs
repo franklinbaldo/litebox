@@ -11,6 +11,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::event::Events;
 use crate::net::socket_channel::NetworkProxy;
 use crate::platform::{Instant, TimeProvider};
+use crate::fd::EntryIdentity;
 use crate::sync::RawSyncPrimitivesProvider;
 use crate::{fd::DescriptorTable, platform, sync};
 
@@ -87,8 +88,9 @@ where
     local_port_allocator: LocalPortAllocator,
     /// Whether outside interaction is automatic or manual
     platform_interaction: PlatformInteraction,
-    /// FDs that are queued for eventual closure
-    queued_for_closure: Vec<SocketFd<Platform>>,
+    /// FDs that are queued for eventual closure, paired with the Arc identity
+    /// token of the entry at the time of queuing (to detect index reuse).
+    queued_for_closure: Vec<(SocketFd<Platform>, EntryIdentity)>,
     /// Sockets that are closing in the background
     closing_in_background: Vec<smoltcp::iface::SocketHandle>,
     /// The smoltcp handle of the most recently accepted socket.
@@ -1224,8 +1226,10 @@ where
             super::fd::CloseResult::Duplicated(dup_fd) => {
                 // It seems like there might be other duplicates around (e.g., due to `dup`), so we
                 // can't immediately close it out.
+                // Capture the Arc identity token so we can detect index reuse later.
+                let identity = dt.entry_identity(&dup_fd).unwrap_or(EntryIdentity::NULL);
                 // We attempt to queue it for future closure and then just return.
-                self.queued_for_closure.push(dup_fd);
+                self.queued_for_closure.push((dup_fd, identity));
             }
             super::fd::CloseResult::Deferred => {
                 let Some(()) = dt.with_entry_mut(fd, |entry| entry.entry.consider_closed = true)
@@ -1246,7 +1250,30 @@ where
             return false;
         }
         let mut dt = self.dt.write();
-        let entries = dt.drain_entries_full_covered_by(&mut self.queued_for_closure);
+        // Filter out stale entries whose slot has been recycled (ABA protection).
+        // A dup_fd is stale if the entry currently at its index has a different Arc
+        // identity than the one recorded when the dup_fd was queued.
+        self.queued_for_closure.retain(|(fd, expected_identity)| {
+            match dt.entry_identity(fd) {
+                Some(current_identity) => current_identity == *expected_identity,
+                // Entry was removed (slot is None) or fd was closed — discard.
+                None => false,
+            }
+        });
+        // Extract just the fds for drain_entries_full_covered_by.
+        let mut fds: Vec<SocketFd<Platform>> = self
+            .queued_for_closure
+            .drain(..)
+            .map(|(fd, _)| fd)
+            .collect();
+        let entries = dt.drain_entries_full_covered_by(&mut fds);
+        // Put back any fds that weren't drained (still have live duplicates).
+        if !fds.is_empty() {
+            for fd in fds {
+                let identity = dt.entry_identity(&fd).unwrap_or(EntryIdentity::NULL);
+                self.queued_for_closure.push((fd, identity));
+            }
+        }
         drop(dt);
         if entries.is_empty() {
             return false;
