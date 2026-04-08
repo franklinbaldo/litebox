@@ -288,8 +288,13 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Dispatch a Mach trap by trap number.
+    ///
+    /// Trap numbers match XNU's `mach_trap_table` in `osfmk/kern/syscall_sw.c`.
+    /// Unhandled traps return `KERN_INVALID_ARGUMENT` (4), matching XNU's
+    /// `kern_invalid()`.
     pub(crate) fn do_mach_trap(&self, number: usize, ctx: &mut PtRegs) -> Result<usize, Errno> {
         match number {
+            // ── Time ──────────────────────────────────────────────────
             mach_trap::MACH_ABSOLUTE_TIME_TRAP => {
                 // mach_absolute_time() returns nanoseconds since boot on Apple Silicon
                 // (timebase is 1:1).
@@ -307,35 +312,33 @@ impl<FS: ShimFS> Task<FS> {
                 let _ = info_ptr.write_at_offset(1, 1_u32); // denom
                 Ok(0) // KERN_SUCCESS
             }
+
+            // ── VM ────────────────────────────────────────────────────
             mach_trap::KERNELRPC_MACH_VM_ALLOCATE_TRAP => self.sys_mach_vm_allocate(ctx),
+            mach_trap::KERNELRPC_MACH_VM_PURGABLE_CONTROL_TRAP => {
+                self.sys_mach_vm_purgable_control(ctx)
+            }
             mach_trap::KERNELRPC_MACH_VM_DEALLOCATE_TRAP => self.sys_mach_vm_deallocate(ctx),
             mach_trap::KERNELRPC_MACH_VM_PROTECT_TRAP => self.sys_mach_vm_protect(ctx),
             mach_trap::KERNELRPC_MACH_VM_MAP_TRAP => self.sys_mach_vm_map(ctx),
+
+            // ── Ports ─────────────────────────────────────────────────
             mach_trap::KERNELRPC_MACH_PORT_DEALLOCATE_TRAP => {
                 // _kernelrpc_mach_port_deallocate_trap(target, name)
                 // No-op stub — we don't track port reference counts.
+                // XNU returns KERN_SUCCESS even for MACH_PORT_NULL/DEAD.
                 log_unsupported!(
-                    "mach_port_deallocate_trap(target={:#x}, name={:#x}) → KERN_SUCCESS",
+                    "mach_port_deallocate_trap(target={:#x}, name={:#x}) → KERN_SUCCESS (stub)",
                     ctx.regs[0],
                     ctx.regs[1]
                 );
                 Ok(0) // KERN_SUCCESS
             }
             mach_trap::MACH_PORT_CONSTRUCT_TRAP => {
-                // mach_port_construct_trap(target, options, context, name_out)
-                // Used by dyld for port construction. Return KERN_SUCCESS.
-                // x3 is a pointer to write the port name, but we don't
-                // implement real Mach ports yet — dyld handles failure
-                // gracefully when the port is never actually used.
-                log_unsupported!(
-                    "mach_port_construct_trap(target={:#x}, options={:#x}, context={:#x}, name_out={:#x}) → KERN_SUCCESS",
-                    ctx.regs[0],
-                    ctx.regs[1],
-                    ctx.regs[2],
-                    ctx.regs[3]
-                );
-                Ok(0) // KERN_SUCCESS
+                self.sys_mach_port_construct(ctx)
             }
+
+            // ── IPC ───────────────────────────────────────────────────
             mach_trap::MACH_REPLY_PORT => Ok(0x0703),
             mach_trap::THREAD_SELF_TRAP => {
                 // Return the real kernel mach port stored during thread init.
@@ -352,6 +355,9 @@ impl<FS: ShimFS> Task<FS> {
                 // Return MACH_SEND_INVALID_DEST (0x10000003)
                 Ok(0x1000_0003)
             }
+            mach_trap::THREAD_GET_SPECIAL_REPLY_PORT => Ok(0x0903),
+
+            // ── Semaphores (numbers corrected to match XNU) ───────────
             mach_trap::SEMAPHORE_SIGNAL_TRAP => {
                 #[allow(clippy::cast_possible_truncation)]
                 let port = ctx.regs[0] as u32;
@@ -376,10 +382,191 @@ impl<FS: ShimFS> Task<FS> {
                 let nsec = ctx.regs[2] as u32;
                 Ok(self.sys_semaphore_timedwait(port, sec, nsec))
             }
-            mach_trap::THREAD_GET_SPECIAL_REPLY_PORT => Ok(0x0903),
-            _ => {
-                log_unsupported!("Mach trap {number}");
+
+            // ── Scheduling (safe to stub) ─────────────────────────────
+            mach_trap::PFZ_EXIT | mach_trap::SWTCH | mach_trap::SWTCH_PRI => {
+                // Yield-type traps. Returning 0/false is safe — caller
+                // just doesn't yield.
                 Ok(0)
+            }
+            mach_trap::THREAD_SWITCH => {
+                // thread_switch(thread_name, option, option_time)
+                // Returning KERN_SUCCESS without yielding is safe.
+                Ok(0) // KERN_SUCCESS
+            }
+
+            // ── Named-but-unimplemented XNU traps ─────────────────────
+            // Each arm logs the trap name for diagnostics and returns
+            // KERN_INVALID_ARGUMENT, matching XNU's kern_invalid().
+            mach_trap::TASK_DYLD_PROCESS_INFO_NOTIFY_GET_TRAP => {
+                log_unsupported!("mach_trap: task_dyld_process_info_notify_get (13)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::KERNELRPC_MACH_PORT_ALLOCATE_TRAP => {
+                log_unsupported!("mach_trap: mach_port_allocate (16)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::KERNELRPC_MACH_PORT_MOD_REFS_TRAP => {
+                log_unsupported!("mach_trap: mach_port_mod_refs (19)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::KERNELRPC_MACH_PORT_MOVE_MEMBER_TRAP => {
+                log_unsupported!("mach_trap: mach_port_move_member (20)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::KERNELRPC_MACH_PORT_INSERT_RIGHT_TRAP => {
+                log_unsupported!("mach_trap: mach_port_insert_right (21)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::KERNELRPC_MACH_PORT_INSERT_MEMBER_TRAP => {
+                log_unsupported!("mach_trap: mach_port_insert_member (22)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::KERNELRPC_MACH_PORT_EXTRACT_MEMBER_TRAP => {
+                log_unsupported!("mach_trap: mach_port_extract_member (23)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::MACH_PORT_DESTRUCT_TRAP => {
+                log_unsupported!("mach_trap: mach_port_destruct (25)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::MACH_MSG_OVERWRITE_TRAP => {
+                log_unsupported!("mach_trap: mach_msg_overwrite (32)");
+                Ok(0x1000_0003) // MACH_SEND_INVALID_DEST (same as mach_msg)
+            }
+            mach_trap::SEMAPHORE_SIGNAL_THREAD_TRAP => {
+                log_unsupported!("mach_trap: semaphore_signal_thread (35)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::SEMAPHORE_WAIT_SIGNAL_TRAP => {
+                log_unsupported!("mach_trap: semaphore_wait_signal (37)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::SEMAPHORE_TIMEDWAIT_SIGNAL_TRAP => {
+                log_unsupported!("mach_trap: semaphore_timedwait_signal (39)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::KERNELRPC_MACH_PORT_GET_ATTRIBUTES_TRAP => {
+                log_unsupported!("mach_trap: mach_port_get_attributes (40)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::KERNELRPC_MACH_PORT_GUARD_TRAP => {
+                log_unsupported!("mach_trap: mach_port_guard (41)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::KERNELRPC_MACH_PORT_UNGUARD_TRAP => {
+                log_unsupported!("mach_trap: mach_port_unguard (42)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::MACH_GENERATE_ACTIVITY_ID => {
+                log_unsupported!("mach_trap: mach_generate_activity_id (43)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::TASK_NAME_FOR_PID => {
+                log_unsupported!("mach_trap: task_name_for_pid (44)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::TASK_FOR_PID => {
+                log_unsupported!("mach_trap: task_for_pid (45)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::PID_FOR_TASK => {
+                log_unsupported!("mach_trap: pid_for_task (46)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::MACH_MSG2_TRAP => {
+                // Trap 47 is `mach_msg2_trap` in the XNU table.
+                // Note: the BSD-style mach_msg2 (x16=0x80000000) is handled
+                // separately in sys_mach_msg2_trap(). This is the Mach trap
+                // table entry.
+                log_unsupported!("mach_trap: mach_msg2 (47)");
+                Ok(0x1000_0003) // MACH_SEND_INVALID_DEST
+            }
+            mach_trap::MACX_SWAPON => {
+                log_unsupported!("mach_trap: macx_swapon (48)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::MACX_SWAPOFF => {
+                log_unsupported!("mach_trap: macx_swapoff (49)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::MACX_TRIGGERS => {
+                log_unsupported!("mach_trap: macx_triggers (51)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::MACX_BACKING_STORE_SUSPEND => {
+                log_unsupported!("mach_trap: macx_backing_store_suspend (52)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::MACX_BACKING_STORE_RECOVERY => {
+                log_unsupported!("mach_trap: macx_backing_store_recovery (53)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::CLOCK_SLEEP_TRAP => {
+                log_unsupported!("mach_trap: clock_sleep_trap (62)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::MACH_VM_RECLAIM_UPDATE_KERNEL_ACCOUNTING_TRAP => {
+                log_unsupported!("mach_trap: mach_vm_reclaim_update_kernel_accounting (63)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::HOST_CREATE_MACH_VOUCHER_TRAP => {
+                log_unsupported!("mach_trap: host_create_mach_voucher (70)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::MACH_VOUCHER_EXTRACT_ATTR_RECIPE_TRAP => {
+                log_unsupported!("mach_trap: mach_voucher_extract_attr_recipe (72)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::KERNELRPC_MACH_PORT_TYPE_TRAP => {
+                log_unsupported!("mach_trap: mach_port_type (76)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::KERNELRPC_MACH_PORT_REQUEST_NOTIFICATION_TRAP => {
+                log_unsupported!("mach_trap: mach_port_request_notification (77)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::EXCLAVES_CTL_TRAP => {
+                log_unsupported!("mach_trap: exclaves_ctl (88)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::MACH_WAIT_UNTIL_TRAP => {
+                log_unsupported!("mach_trap: mach_wait_until (90)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::MK_TIMER_CREATE_TRAP => {
+                log_unsupported!("mach_trap: mk_timer_create (91)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::MK_TIMER_DESTROY_TRAP => {
+                log_unsupported!("mach_trap: mk_timer_destroy (92)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::MK_TIMER_ARM_TRAP => {
+                log_unsupported!("mach_trap: mk_timer_arm (93)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::MK_TIMER_CANCEL_TRAP => {
+                log_unsupported!("mach_trap: mk_timer_cancel (94)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::MK_TIMER_ARM_LEEWAY_TRAP => {
+                log_unsupported!("mach_trap: mk_timer_arm_leeway (95)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::DEBUG_CONTROL_PORT_FOR_PID => {
+                log_unsupported!("mach_trap: debug_control_port_for_pid (96)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+            mach_trap::IOKIT_USER_CLIENT_TRAP => {
+                log_unsupported!("mach_trap: iokit_user_client (100)");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
+            }
+
+            // ── Unknown / out-of-range ────────────────────────────────
+            _ => {
+                log_unsupported!("mach_trap: unknown ({number})");
+                Ok(mach_trap::KERN_INVALID_ARGUMENT)
             }
         }
     }
@@ -925,5 +1112,95 @@ impl<FS: ShimFS> Task<FS> {
             Err(FutexError::Fault) => Err(Errno::EFAULT),
             Err(_) => Ok(0), // Other errors: treat as no waiters
         }
+    }
+
+    /// Handle Mach trap 24 (`_kernelrpc_mach_port_construct_trap`).
+    ///
+    /// Arguments (from registers):
+    ///   x0 = target port (ignored — always self)
+    ///   x1 = options pointer (user_addr_t to `mach_port_options_t`)
+    ///   x2 = context (u64)
+    ///   x3 = name output pointer (user_addr_t to `mach_port_name_t`)
+    ///
+    /// Allocates a monotonically increasing fake port name and writes it to
+    /// the output pointer.  This is still a stub (no real Mach port object
+    /// exists), but callers at least get a unique, valid-looking name instead
+    /// of reading uninitialised memory.
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn sys_mach_port_construct(&self, ctx: &mut PtRegs) -> Result<usize, Errno> {
+        use core::sync::atomic::Ordering;
+
+        let name_out_addr = ctx.regs[3];
+        if name_out_addr == 0 {
+            return Ok(mach_trap::KERN_INVALID_ARGUMENT);
+        }
+
+        // Allocate a unique fake port name.  Real XNU port names look like
+        // (index << 8) | generation, producing values such as 0x0103, 0x0207,
+        // etc.  We use the process-wide `next_mach_port` counter which
+        // already increments by 0x100 per allocation.
+        let name = self
+            .process
+            .next_mach_port
+            .fetch_add(0x100, Ordering::Relaxed);
+
+        // Write the 32-bit port name to guest memory.
+        let out_ptr: MutPtr<u32> = MutPtr::from_usize(name_out_addr);
+        out_ptr
+            .write_at_offset(0, name)
+            .ok_or(Errno::EFAULT)?;
+
+        log_unsupported!(
+            "mach_port_construct_trap(target={:#x}, options={:#x}, context={:#x}, name_out={:#x}) → name={:#x}",
+            ctx.regs[0],
+            ctx.regs[1],
+            ctx.regs[2],
+            name_out_addr,
+            name,
+        );
+
+        Ok(0) // KERN_SUCCESS
+    }
+
+    /// Handle Mach trap 11 (`_kernelrpc_mach_vm_purgable_control_trap`).
+    ///
+    /// Arguments (from registers):
+    ///   x0 = target port (ignored — always self)
+    ///   x1 = address (`mach_vm_offset_t`)
+    ///   x2 = control (`VM_PURGABLE_SET_STATE` / `GET_STATE` / `PURGE_ALL`)
+    ///   x3 = state pointer (`user_addr_t` to `int`, IN/OUT)
+    ///
+    /// Stub: reports that memory is always non-volatile.  This is the safe
+    /// conservative answer — purgable control is advisory, and pretending
+    /// all memory is pinned means the kernel never reclaims pages, which
+    /// is correct for a userspace shim that controls its own memory.
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn sys_mach_vm_purgable_control(
+        &self,
+        ctx: &mut PtRegs,
+    ) -> Result<usize, Errno> {
+        const VM_PURGABLE_SET_STATE: usize = 1;
+        const VM_PURGABLE_GET_STATE: usize = 2;
+
+        let address = ctx.regs[1];
+        let control = ctx.regs[2];
+        let state_ptr_addr = ctx.regs[3];
+
+        log_unsupported!(
+            "mach_vm_purgable_control(addr={address:#x}, control={control}, state_ptr={state_ptr_addr:#x})"
+        );
+
+        // For both GET_STATE and SET_STATE, write VM_PURGABLE_NONVOLATILE (0)
+        // to the state pointer.  For SET_STATE this means "old state was
+        // nonvolatile"; for GET_STATE this means "current state is nonvolatile".
+        if state_ptr_addr != 0
+            && (control == VM_PURGABLE_SET_STATE || control == VM_PURGABLE_GET_STATE)
+        {
+            let state_ptr: MutPtr<i32> = MutPtr::from_usize(state_ptr_addr);
+            // VM_PURGABLE_NONVOLATILE = 0
+            state_ptr.write_at_offset(0, 0_i32).ok_or(Errno::EFAULT)?;
+        }
+
+        Ok(0) // KERN_SUCCESS
     }
 }

@@ -132,25 +132,105 @@ pub mod nr {
 
 /// Mach trap numbers (negative x16 values, stored as positive constants).
 /// The actual x16 value is the negation of these.
+///
+/// These values must match the XNU kernel's `mach_trap_table` in
+/// `osfmk/kern/syscall_sw.c`.  Any trap number not in this table maps to
+/// `kern_invalid` in XNU, which returns `KERN_INVALID_ARGUMENT` (4).
 pub mod mach_trap {
+    // --- Time ---
     pub const MACH_ABSOLUTE_TIME_TRAP: usize = 3;
-    pub const MACH_TIMEBASE_INFO_TRAP: usize = 6;
+
+    // --- VM ---
     pub const KERNELRPC_MACH_VM_ALLOCATE_TRAP: usize = 10;
+    pub const KERNELRPC_MACH_VM_PURGABLE_CONTROL_TRAP: usize = 11;
     pub const KERNELRPC_MACH_VM_DEALLOCATE_TRAP: usize = 12;
+    pub const TASK_DYLD_PROCESS_INFO_NOTIFY_GET_TRAP: usize = 13;
     pub const KERNELRPC_MACH_VM_PROTECT_TRAP: usize = 14;
     pub const KERNELRPC_MACH_VM_MAP_TRAP: usize = 15;
+
+    // --- Ports ---
+    pub const KERNELRPC_MACH_PORT_ALLOCATE_TRAP: usize = 16;
     pub const KERNELRPC_MACH_PORT_DEALLOCATE_TRAP: usize = 18;
+    pub const KERNELRPC_MACH_PORT_MOD_REFS_TRAP: usize = 19;
+    pub const KERNELRPC_MACH_PORT_MOVE_MEMBER_TRAP: usize = 20;
+    pub const KERNELRPC_MACH_PORT_INSERT_RIGHT_TRAP: usize = 21;
+    pub const KERNELRPC_MACH_PORT_INSERT_MEMBER_TRAP: usize = 22;
+    pub const KERNELRPC_MACH_PORT_EXTRACT_MEMBER_TRAP: usize = 23;
     pub const MACH_PORT_CONSTRUCT_TRAP: usize = 24;
+    pub const MACH_PORT_DESTRUCT_TRAP: usize = 25;
+
+    // --- IPC ---
     pub const MACH_REPLY_PORT: usize = 26;
     pub const THREAD_SELF_TRAP: usize = 27;
     pub const TASK_SELF_TRAP: usize = 28;
     pub const HOST_SELF_TRAP: usize = 29;
     pub const MACH_MSG_TRAP: usize = 31;
-    pub const SEMAPHORE_SIGNAL_TRAP: usize = 36;
-    pub const SEMAPHORE_SIGNAL_ALL_TRAP: usize = 37;
-    pub const SEMAPHORE_WAIT_TRAP: usize = 39;
-    pub const SEMAPHORE_TIMEDWAIT_TRAP: usize = 40;
+    pub const MACH_MSG_OVERWRITE_TRAP: usize = 32;
+
+    // --- Semaphores (CORRECTED: was 36/37/39/40, now matches XNU) ---
+    pub const SEMAPHORE_SIGNAL_TRAP: usize = 33;
+    pub const SEMAPHORE_SIGNAL_ALL_TRAP: usize = 34;
+    pub const SEMAPHORE_SIGNAL_THREAD_TRAP: usize = 35;
+    pub const SEMAPHORE_WAIT_TRAP: usize = 36;
+    pub const SEMAPHORE_WAIT_SIGNAL_TRAP: usize = 37;
+    pub const SEMAPHORE_TIMEDWAIT_TRAP: usize = 38;
+    pub const SEMAPHORE_TIMEDWAIT_SIGNAL_TRAP: usize = 39;
+
+    // --- Port attributes & guards ---
+    pub const KERNELRPC_MACH_PORT_GET_ATTRIBUTES_TRAP: usize = 40;
+    pub const KERNELRPC_MACH_PORT_GUARD_TRAP: usize = 41;
+    pub const KERNELRPC_MACH_PORT_UNGUARD_TRAP: usize = 42;
+
+    // --- Misc ---
+    pub const MACH_GENERATE_ACTIVITY_ID: usize = 43;
+    pub const TASK_NAME_FOR_PID: usize = 44;
+    pub const TASK_FOR_PID: usize = 45;
+    pub const PID_FOR_TASK: usize = 46;
+    pub const MACH_MSG2_TRAP: usize = 47;
+    pub const MACX_SWAPON: usize = 48;
+    pub const MACX_SWAPOFF: usize = 49;
     pub const THREAD_GET_SPECIAL_REPLY_PORT: usize = 50;
+    pub const MACX_TRIGGERS: usize = 51;
+    pub const MACX_BACKING_STORE_SUSPEND: usize = 52;
+    pub const MACX_BACKING_STORE_RECOVERY: usize = 53;
+
+    // --- Scheduling ---
+    pub const PFZ_EXIT: usize = 58;
+    pub const SWTCH_PRI: usize = 59;
+    pub const SWTCH: usize = 60;
+    pub const THREAD_SWITCH: usize = 61;
+    pub const CLOCK_SLEEP_TRAP: usize = 62;
+    pub const MACH_VM_RECLAIM_UPDATE_KERNEL_ACCOUNTING_TRAP: usize = 63;
+
+    // --- Vouchers ---
+    pub const HOST_CREATE_MACH_VOUCHER_TRAP: usize = 70;
+    pub const MACH_VOUCHER_EXTRACT_ATTR_RECIPE_TRAP: usize = 72;
+
+    // --- Port type & notification ---
+    pub const KERNELRPC_MACH_PORT_TYPE_TRAP: usize = 76;
+    pub const KERNELRPC_MACH_PORT_REQUEST_NOTIFICATION_TRAP: usize = 77;
+
+    // --- Exclaves ---
+    pub const EXCLAVES_CTL_TRAP: usize = 88;
+
+    // --- Timers ---
+    pub const MACH_TIMEBASE_INFO_TRAP: usize = 89;
+    pub const MACH_WAIT_UNTIL_TRAP: usize = 90;
+    pub const MK_TIMER_CREATE_TRAP: usize = 91;
+    pub const MK_TIMER_DESTROY_TRAP: usize = 92;
+    pub const MK_TIMER_ARM_TRAP: usize = 93;
+    pub const MK_TIMER_CANCEL_TRAP: usize = 94;
+    pub const MK_TIMER_ARM_LEEWAY_TRAP: usize = 95;
+
+    // --- Debug ---
+    pub const DEBUG_CONTROL_PORT_FOR_PID: usize = 96;
+
+    // --- IOKit ---
+    pub const IOKIT_USER_CLIENT_TRAP: usize = 100;
+
+    /// Return value for invalid/unhandled Mach traps, matching XNU's
+    /// `kern_invalid()` which returns `KERN_INVALID_ARGUMENT`.
+    pub const KERN_INVALID_ARGUMENT: usize = 4;
 }
 
 /// A decoded macOS BSD syscall request.

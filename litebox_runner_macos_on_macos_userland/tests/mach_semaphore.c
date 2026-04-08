@@ -11,10 +11,10 @@
 #include <stdint.h>
 
 // Mach trap numbers (x16 = negative value).
-#define SEMAPHORE_SIGNAL_TRAP     (-36)
-#define SEMAPHORE_SIGNAL_ALL_TRAP (-37)
-#define SEMAPHORE_WAIT_TRAP       (-39)
-#define SEMAPHORE_TIMEDWAIT_TRAP  (-40)
+#define SEMAPHORE_SIGNAL_TRAP     (-33)
+#define SEMAPHORE_SIGNAL_ALL_TRAP (-34)
+#define SEMAPHORE_WAIT_TRAP       (-36)
+#define SEMAPHORE_TIMEDWAIT_TRAP  (-38)
 
 #define KERN_SUCCESS              0
 #define KERN_OPERATION_TIMED_OUT  49

@@ -389,23 +389,35 @@ impl<FS: ShimFS> Task<FS> {
     ///   x0 = target port (ignored — always self)
     ///   x1 = address
     ///   x2 = size
-    ///   x3 = set_maximum (ignored)
+    ///   x3 = set_maximum (boolean: 0 = current protection, 1 = max protection)
     ///   x4 = new_protection (VM_PROT_* flags: READ=1, WRITE=2, EXECUTE=4)
+    ///
+    /// When `set_maximum` is true, XNU changes the protection *ceiling* for
+    /// the region (a one-way ratchet — you can only lower it).  In our shim
+    /// we don't track max vs current protection separately, so we apply the
+    /// mprotect regardless but log when `set_maximum` is used for diagnostics.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)] // Intentional: register value (usize/u64) → prot (i32).
     pub(crate) fn sys_mach_vm_protect(&self, ctx: &PtRegs) -> Result<usize, Errno> {
         use litebox::mm::linux::PAGE_SIZE;
 
         let addr = ctx.regs[1];
         let size = ctx.regs[2];
+        let set_maximum = ctx.regs[3] != 0;
         let new_prot = ctx.regs[4] as i32;
 
         // Mach VM operations use byte-precise sizes but the underlying page
         // manager operates in whole pages. Round up to page boundary.
         let aligned_size = align_up(size, PAGE_SIZE);
 
-        log_unsupported!(
-            "mach_vm_protect(addr={addr:#x}, size={size:#x}→{aligned_size:#x}, prot={new_prot})"
-        );
+        if set_maximum {
+            log_unsupported!(
+                "mach_vm_protect(addr={addr:#x}, size={size:#x}→{aligned_size:#x}, SET_MAXIMUM, prot={new_prot})"
+            );
+        } else {
+            log_unsupported!(
+                "mach_vm_protect(addr={addr:#x}, size={size:#x}→{aligned_size:#x}, prot={new_prot})"
+            );
+        }
 
         // Skip mprotect on shared cache pages.  On macOS-on-macOS the host's
         // shared cache occupies the same address range and any VM API call on
