@@ -380,10 +380,12 @@ pub(crate) fn load<FS: ShimFS>(
     // shared cache SVCs are not yet patched, so libc calls go directly
     // to the kernel.  On re-exec, install_shared_cache has already
     // patched them.
+    log_unsupported!("load_macho: about to call update_host_tls_entry");
     #[cfg(feature = "platform_macos_userland")]
     {
         litebox_platform_macos_userland::update_host_tls_entry();
     }
+    log_unsupported!("load_macho: update_host_tls_entry done");
 
     // --- Initialize trampoline callback address (if __LITEBOX segment exists) ---
     //
@@ -448,6 +450,7 @@ pub(crate) fn load<FS: ShimFS>(
     }
 
     // Set the initial brk now that all segments and TLS table are mapped.
+    log_unsupported!("load_macho: __LITEBOX check done, about to call set_initial_brk (brk={brk:#x})");
     task.global.pm.set_initial_brk(brk);
     log_unsupported!("load_macho: set_initial_brk done (brk={brk:#x})");
 

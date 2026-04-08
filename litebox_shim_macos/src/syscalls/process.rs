@@ -340,6 +340,43 @@ impl<FS: ShimFS> Task<FS> {
             }
             true
         };
+
+        // ── Neutralize the old TLS table before release_memory ──
+        //
+        // During release_memory, each munmap call goes through the shared
+        // cache's patched SVC gate → trampoline → TLS table scan.  If the
+        // old TLS table has already been unmapped (or is about to be), the
+        // trampoline reads freed memory → SIGBUS / hang on some machines.
+        //
+        // By writing TLS_TABLE_SENTINEL (0xFFFF_FFFF_FFFF_FFFF) to the
+        // first entry's key field, we make the trampoline's linear scan
+        // immediately hit the sentinel → passthrough to a real SVC #0x80.
+        // This is safe because we're single-threaded at execve time.
+        //
+        // We also clear HOST_TLS_TABLE_ADDR to 0 so that any Rust code
+        // checking the table address during this window (e.g.,
+        // update_host_tls_entry) knows there is no valid table.
+        {
+            let old_tls_addr = litebox_common_linux::HOST_TLS_TABLE_ADDR
+                .swap(0, Ordering::Release);
+            if old_tls_addr != 0 {
+                // Write sentinel to entry 0's key (byte offset 0).
+                // SAFETY: old_tls_addr points to a page we allocated; it
+                // has not been unmapped yet (release_memory hasn't run).
+                // We use write_volatile to prevent the compiler from
+                // eliding or reordering this store.
+                unsafe {
+                    core::ptr::write_volatile(
+                        old_tls_addr as *mut u64,
+                        0xFFFF_FFFF_FFFF_FFFFu64,
+                    );
+                }
+                log_unsupported!(
+                    "execve: neutralized old TLS table at {old_tls_addr:#x} (wrote sentinel to entry 0)"
+                );
+            }
+        }
+
         unsafe {
             self.global
                 .pm

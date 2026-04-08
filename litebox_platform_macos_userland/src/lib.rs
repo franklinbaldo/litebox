@@ -2853,17 +2853,23 @@ pub fn update_host_tls_entry() {
 
     let table_addr = litebox_common_linux::HOST_TLS_TABLE_ADDR.load(Ordering::Acquire);
     if table_addr == 0 {
+        raw_debug_write(b"update_host_tls_entry: table_addr=0, returning early
+");
         return; // No TLS table allocated (not using rewriter-based trampoline)
     }
 
     let tcb = TCB_PTR.get();
     if tcb.is_null() {
+        raw_debug_write(b"update_host_tls_entry: TCB_PTR is null, returning early
+");
         return; // No TCB yet (first exec, before run_thread)
     }
     let host_tls = tcb as usize;
 
     // TPIDRRO_EL0 is the lookup key — stable per-pthread, never clobbered.
     let tpidrro = unsafe { litebox_common_linux::read_tpidrro_el0() } as u64;
+    raw_debug_write(b"update_host_tls_entry: scanning TLS table
+");
 
     'retry: loop {
         let mut first_free: Option<usize> = None;
@@ -2877,6 +2883,8 @@ pub fn update_host_tls_entry() {
                 // Found our entry — update host_tls in case it changed.
                 let val_ptr = (table_addr + index * 16 + 8) as *mut u64;
                 unsafe { val_ptr.write_volatile(host_tls as u64) };
+                raw_debug_write(b"update_host_tls_entry: updated existing entry
+");
                 return;
             }
 
@@ -2915,6 +2923,8 @@ pub fn update_host_tls_entry() {
         {
             // Claimed. Write host_tls value.
             unsafe { val_ptr.write_volatile(host_tls as u64) };
+            raw_debug_write(b"update_host_tls_entry: claimed new slot
+");
             return;
         }
         // CAS failed — another thread grabbed this slot. Rescan.
