@@ -116,6 +116,11 @@ pub struct CliArgs {
     /// `--pe-file node.exe -- --version`.
     #[arg(trailing_var_arg = true, value_name = "ARGS", value_hint = clap::ValueHint::CommandWithArguments)]
     pub guest_arguments: Vec<String>,
+    /// Connect to a 9P file broker for host filesystem access. Accepts a
+    /// loopback TCP address (e.g. "127.0.0.1:9000") or an AF_UNIX socket
+    /// path. The broker must speak the LB9P protocol.
+    #[arg(long = "nine-p-broker", value_name = "ADDR_OR_PATH")]
+    pub nine_p_broker: Option<String>,
 }
 
 fn quote_windows_command_line_arg(arg: &str) -> String {
@@ -1246,8 +1251,121 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         }
     };
 
-    // ── Common path: stack, PEB/TEB, shim, execution ────────────
-    // Allocate guest stack.
+    // ── 9P broker: optionally layer remote filesystem ───────────
+    // If --nine-p-broker is specified, connect to the 9P file broker and
+    // layer its remote filesystem underneath the local tar/in-mem VFS.
+    // This is needed for large package trees (e.g. copilot) whose paths
+    // exceed USTAR's 100-char filename limit.
+    if let Some(ref broker_addr) = cli_args.nine_p_broker {
+        eprintln!("Connecting to 9P broker at {broker_addr}...");
+        let (ring_writer, ring_reader) = connect_nine_p_channel(broker_addr)?;
+
+        let writer = ShmemTransportWriter(ring_writer);
+        let reader = ShmemTransportReader(ring_reader);
+        let msize = 4 * 1024 * 1024u32;
+        let (nine_p_fs, mut reader) =
+            litebox::fs::nine_p::FileSystem::new(&litebox, writer, reader, msize, "root", "/")
+                .map_err(|e| anyhow!("9P attach failed: {e:?}"))?;
+        eprintln!("9P broker connected.");
+
+        // Spawn background 9P response worker thread.
+        let worker_handle = nine_p_fs.worker_handle();
+        let _nine_p_worker = std::thread::spawn(move || {
+            let mut buf = alloc::vec::Vec::with_capacity(msize as usize);
+            while worker_handle.poll_responses(&mut reader, &mut buf) {}
+        });
+
+        // Layer: local VFS (upper, writable) over 9P remote FS (lower, writable files).
+        let base_vfs = alloc::sync::Arc::try_unwrap(load_result.vfs)
+            .unwrap_or_else(|arc| {
+                // If there are other Arc references, clone the inner FS.
+                // This shouldn't happen in practice since load_result owns the only Arc.
+                panic!("Expected sole ownership of VFS Arc for 9P layering, but found {} references", alloc::sync::Arc::strong_count(&arc));
+            });
+        let combined = litebox::fs::layered::FileSystem::new(
+            &litebox,
+            base_vfs,
+            nine_p_fs,
+            litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
+        );
+        let combined_arc = alloc::sync::Arc::new(combined);
+
+        return create_shim_and_run(
+            combined_arc,
+            &cli_args,
+            &litebox,
+            load_result.syscall_map,
+            load_result.unhandled_stubs,
+            load_result.ntdll_boot_data,
+            load_result.exe_entry_point,
+            load_result.exe_image_base,
+            load_result.exe_image_size,
+            load_result.module_bases,
+            load_result.ldr_init_thunk_va,
+            load_result.rtl_user_thread_start_va,
+            load_result.ki_user_exception_dispatcher_rva,
+            load_result.ldrp_hash_table_va,
+            load_result.pebldr_va,
+            &process_state,
+            guest_va_start,
+            guest_va_end,
+            PEB_TEB_BASE,
+            net,
+        );
+    }
+
+    // ── No 9P: use the tar/in-mem VFS directly ─────────────────
+    create_shim_and_run(
+        load_result.vfs,
+        &cli_args,
+        &litebox,
+        load_result.syscall_map,
+        load_result.unhandled_stubs,
+        load_result.ntdll_boot_data,
+        load_result.exe_entry_point,
+        load_result.exe_image_base,
+        load_result.exe_image_size,
+        load_result.module_bases,
+        load_result.ldr_init_thunk_va,
+        load_result.rtl_user_thread_start_va,
+        load_result.ki_user_exception_dispatcher_rva,
+        load_result.ldrp_hash_table_va,
+        load_result.pebldr_va,
+        &process_state,
+        guest_va_start,
+        guest_va_end,
+        PEB_TEB_BASE,
+        net,
+    )
+}
+
+/// Create the NT shim with the given VFS, configure it, and run the guest.
+///
+/// Generic over the filesystem type `FS` so the same code works with either
+/// the plain tar/in-mem VFS (`NtFS`) or a 9P-layered variant.
+#[allow(clippy::too_many_arguments)]
+fn create_shim_and_run<FS: litebox_shim_windows::NtShimFS>(
+    vfs: alloc::sync::Arc<FS>,
+    cli_args: &CliArgs,
+    litebox: &litebox::LiteBox<Platform>,
+    syscall_map: litebox_common_windows::NtSyscallMap,
+    unhandled_stubs: Vec<(u32, String)>,
+    ntdll_boot_data: alloc::sync::Arc<litebox_shim_windows::NtdllBootData>,
+    exe_entry_point: usize,
+    exe_image_base: usize,
+    exe_image_size: usize,
+    module_bases: Vec<litebox_shim_windows::ModuleBase>,
+    ldr_init_thunk_va: usize,
+    rtl_user_thread_start_va: usize,
+    ki_user_exception_dispatcher_rva: Option<usize>,
+    ldrp_hash_table_va: usize,
+    pebldr_va: usize,
+    process_state: &alloc::sync::Arc<litebox_shim_windows::NtProcessState>,
+    guest_va_start: usize,
+    guest_va_end: usize,
+    #[allow(non_snake_case)] PEB_TEB_BASE: usize,
+    net: Option<Arc<spin::Mutex<litebox::net::Network<Platform>>>>,
+) -> Result<()> {
     let stack_size = NonZeroPageSize::<PAGE_SIZE>::new(GUEST_STACK_SIZE)
         .expect("stack size must be page-aligned");
     let stack_base_ptr = unsafe {
@@ -1278,11 +1396,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             alloc::sync::Arc::clone(&process_state),
             litebox.clone(),
         );
-    shim.set_syscall_map(load_result.syscall_map);
-    if !load_result.unhandled_stubs.is_empty() {
-        shim.set_unhandled_stubs(load_result.unhandled_stubs);
+    shim.set_syscall_map(syscall_map);
+    if !unhandled_stubs.is_empty() {
+        shim.set_unhandled_stubs(unhandled_stubs);
     }
-    shim.set_ntdll_boot_data(load_result.ntdll_boot_data);
+    shim.set_ntdll_boot_data(ntdll_boot_data);
     let (stdin_h, stdout_h, stderr_h) = shim.stdio_handles();
 
     let peb_teb_layout = PebTebLayout::at_base(PEB_TEB_BASE);
@@ -1369,8 +1487,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let peb_teb_params = PebTebParams {
         stack_base: stack_alloc_top,
         stack_limit: stack_base,
-        image_base: load_result.exe_image_base,
-        image_size: load_result.exe_image_size,
+        image_base: exe_image_base,
+        image_size: exe_image_size,
         process_heap,
         command_line_wide: guest_command_line.encode_utf16().collect(),
         image_path_wide: format!("\\??\\{exe_full_path_str}")
@@ -1382,13 +1500,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         stdin_handle: u64::from(stdin_h),
         stdout_handle: u64::from(stdout_h),
         stderr_handle: u64::from(stderr_h),
-        ntdll_base: load_result
-            .module_bases
+        ntdll_base: module_bases
             .iter()
             .find(|m| m.name == "ntdll.dll")
             .map_or(0, |m| m.base_address),
-        ntdll_size: load_result
-            .module_bases
+        ntdll_size: module_bases
             .iter()
             .find(|m| m.name == "ntdll.dll")
             .map_or(0, |m| m.image_size),
@@ -1421,20 +1537,20 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     unsafe {
         init_ntdll_pebldr(
             peb_teb_layout.peb_va,
-            load_result.pebldr_va,
+            pebldr_va,
             peb_teb_layout.ldr_data_va,
         );
-        init_ntdll_loader_globals(load_result.pebldr_va, peb_teb_layout.ldr_data_va);
-        init_ntdll_loader_hash_table(load_result.ldrp_hash_table_va, peb_teb_layout.ldr_data_va);
+        init_ntdll_loader_globals(pebldr_va, peb_teb_layout.ldr_data_va);
+        init_ntdll_loader_hash_table(ldrp_hash_table_va, peb_teb_layout.ldr_data_va);
     }
     trace_debugln!(
         "[real-dlls] Seeded internal PebLdr at 0x{:X}",
-        load_result.pebldr_va
+        pebldr_va
     );
     trace_debugln!("[real-dlls] Seeded LdrpImageEntry/LdrpNtDllDataTableEntry");
     trace_debugln!(
         "[real-dlls] Seeded LdrpHashTable at 0x{:X} with EXE/ntdll entries",
-        load_result.ldrp_hash_table_va
+        ldrp_hash_table_va
     );
 
     #[cfg(all(debug_assertions, feature = "trace_debug"))]
@@ -1452,7 +1568,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             let peb_ldr_ptr = core::ptr::read((peb_teb_layout.peb_va + 0x18) as *const u64);
             trace_debugln!(
                 "[LDR-verify] PEB.ImageBaseAddress=0x{peb_image_base:X}, PEB.Ldr=0x{peb_ldr_ptr:X} (synthetic 0x{ldr_va:X}, internal 0x{:X})",
-                load_result.pebldr_va
+                pebldr_va
             );
 
             // EXE entry at ldr_va + 0x60
@@ -1486,16 +1602,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     }
 
     // Derive the EXE path for bookkeeping.
-    let exe_full_path = load_result
-        .module_bases
+    let exe_full_path = module_bases
         .first()
         .map_or_else(|| String::from("C:\\app.exe"), |m| m.path.clone());
 
     // Build a CONTEXT on the guest stack and set the entry point to
     // LdrInitializeThunk. ntdll's loader will initialize the process and
     // then NtContinue to the real entry point (RtlUserThreadStart).
-    let ldr_init_va = load_result.ldr_init_thunk_va;
-    let rtl_uts_va = load_result.rtl_user_thread_start_va;
+    let ldr_init_va = ldr_init_thunk_va;
+    let rtl_uts_va = rtl_user_thread_start_va;
     let (effective_entry_point, effective_stack_top, context_ptr_arg, ntdll_base_arg) = {
         // Windows x64 CONTEXT structure layout (1232 = 0x4D0 bytes).
         const CONTEXT_SIZE: usize = 0x4D0;
@@ -1520,7 +1635,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         // SegSs at 0x42 = 0x2B (user-mode SS)
         ctx_bytes[0x42..0x44].copy_from_slice(&0x2Bu16.to_le_bytes());
         // Rcx at 0x80 = EXE entry point (first param to RtlUserThreadStart)
-        ctx_bytes[0x80..0x88].copy_from_slice(&(load_result.exe_entry_point as u64).to_le_bytes());
+        ctx_bytes[0x80..0x88].copy_from_slice(&(exe_entry_point as u64).to_le_bytes());
         // Rdx at 0x88 = 0 (second param: thread parameter)
         ctx_bytes[0x88..0x90].copy_from_slice(&0u64.to_le_bytes());
         // Rsp at 0x98 = clean stack below the context.
@@ -1545,17 +1660,16 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         }
 
         // ntdll base address for the 2nd parameter to LdrInitializeThunk.
-        let ntdll_base = load_result
-            .module_bases
+        let ntdll_base = module_bases
             .iter()
             .find(|m| m.name == "ntdll.dll")
             .map_or(0, |m| m.base_address);
 
         trace_debugln!(
             "[ntdll-init] CONTEXT at 0x{context_va:X} (Rip=0x{rtl_uts_va:X}, \
-                 Rcx=0x{:X}), LdrInitializeThunk at 0x{ldr_init_va:X}, RSP=0x{ldr_rsp:X}, \
+                  Rcx=0x{:X}), LdrInitializeThunk at 0x{ldr_init_va:X}, RSP=0x{ldr_rsp:X}, \
                  ntdll_base=0x{ntdll_base:X}",
-            load_result.exe_entry_point
+            exe_entry_point
         );
 
         (ldr_init_va, ldr_rsp, context_va, ntdll_base)
@@ -1567,21 +1681,21 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         stack_top: effective_stack_top,
         teb_va: peb_teb_layout.teb_va,
         peb_va: peb_teb_layout.peb_va,
-        image_base: load_result.exe_image_base,
-        image_size: load_result.exe_image_size,
+        image_base: exe_image_base,
+        image_size: exe_image_size,
         process_params_va: peb_teb_layout.process_params_va,
         cmdline_ansi_va: peb_teb_layout.cmdline_ansi_buffer_va,
         env_block_va: peb_teb_layout.env_block_va,
-        module_bases: load_result.module_bases,
+        module_bases: module_bases,
         guest_va_start,
         guest_va_end,
         exe_path: exe_full_path,
         current_directory: startup_cwd,
         initial_rcx: context_ptr_arg,
         initial_rdx: ntdll_base_arg,
-        rtl_user_thread_start_va: load_result.rtl_user_thread_start_va,
-        ldr_init_thunk_va: load_result.ldr_init_thunk_va,
-        ki_user_exception_dispatcher_rva: load_result.ki_user_exception_dispatcher_rva,
+        rtl_user_thread_start_va: rtl_user_thread_start_va,
+        ldr_init_thunk_va: ldr_init_thunk_va,
+        ki_user_exception_dispatcher_rva: ki_user_exception_dispatcher_rva,
     });
 
     // Capture NLS data from host and pass to shim (so shim doesn't call host APIs).
@@ -1590,7 +1704,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     }
 
     // Pass the pre-built VFS to the shim for file I/O.
-    shim.set_fs(load_result.vfs);
+    shim.set_fs(vfs);
 
     // Attach the network stack to the shim for WinSock syscall dispatch.
     if let Some(ref net_arc) = net {
@@ -1716,8 +1830,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // Signal network worker to stop and wait for it.
     shutdown.store(true, core::sync::atomic::Ordering::Relaxed);
     // Also mark the IPC transport dead so any in-progress send loop exits.
-    if platform.has_network() {
-        platform.poison_ipc();
+    {
+        let platform = litebox_platform_multiplex::platform();
+        if platform.has_network() {
+            platform.poison_ipc();
+        }
     }
     if let Some(handle) = network_thread {
         let _ = handle.join();
@@ -1857,7 +1974,134 @@ impl PeMemoryMapper for PmMapper<'_> {
 }
 
 // ---------------------------------------------------------------------------
-// Broker IPC helpers
+// 9P file broker support
+// ---------------------------------------------------------------------------
+
+/// Wraps a shmem ring writer for the 9P transport trait.
+struct ShmemTransportWriter(litebox_common_windows::shmem_ring::RingWriter);
+
+/// Wraps a shmem ring reader for the 9P transport trait.
+struct ShmemTransportReader(litebox_common_windows::shmem_ring::RingReader);
+
+impl litebox::fs::nine_p::transport::Write for ShmemTransportWriter {
+    fn write(
+        &mut self,
+        buf: &[u8],
+    ) -> core::result::Result<usize, litebox::fs::nine_p::transport::WriteError> {
+        std::io::Write::write(&mut self.0, buf).map_err(|err| match err.kind() {
+            std::io::ErrorKind::Interrupted => {
+                litebox::fs::nine_p::transport::WriteError::Interrupted
+            }
+            _ => litebox::fs::nine_p::transport::WriteError::Io,
+        })
+    }
+}
+
+impl litebox::fs::nine_p::transport::Read for ShmemTransportReader {
+    fn read(
+        &mut self,
+        buf: &mut [u8],
+    ) -> core::result::Result<usize, litebox::fs::nine_p::transport::ReadError> {
+        std::io::Read::read(&mut self.0, buf).map_err(|err| match err.kind() {
+            std::io::ErrorKind::Interrupted => {
+                litebox::fs::nine_p::transport::ReadError::Interrupted
+            }
+            _ => litebox::fs::nine_p::transport::ReadError::Io,
+        })
+    }
+}
+
+/// Send the LB9P magic to initiate a 9P channel over an IPC stream.
+fn perform_nine_p_ipc_handshake(
+    stream: &mut litebox_platform_windows_userland::IpcStream,
+) -> Result<()> {
+    use std::io::Write;
+
+    stream
+        .write_all(b"LB9P")
+        .map_err(|e| anyhow!("9P IPC handshake send failed: {e}"))
+}
+
+/// Upgrade an IPC stream to a shared-memory ring transport for 9P.
+fn upgrade_ipc_stream_to_nine_p_ring(
+    stream: &mut litebox_platform_windows_userland::IpcStream,
+) -> Result<(
+    litebox_common_windows::shmem_ring::RingWriter,
+    litebox_common_windows::shmem_ring::RingReader,
+)> {
+    use std::io::{Read as _, Write as _};
+
+    perform_nine_p_ipc_handshake(stream)?;
+
+    let (pair, info) = litebox_common_windows::shmem_ring::ShmemRingPair::create()
+        .map_err(|e| anyhow!("Failed to create 9P shmem ring pair: {e}"))?;
+    let metadata = info.encode();
+
+    stream
+        .write_all(&[litebox_common_windows::shmem_ring::TRANSPORT_MARKER])
+        .map_err(|e| anyhow!("Failed to send 9P ring transport marker: {e}"))?;
+    stream
+        .write_all(&metadata)
+        .map_err(|e| anyhow!("Failed to send 9P ring metadata: {e}"))?;
+
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .ok();
+    let mut ack = [0u8; 1];
+    stream
+        .read_exact(&mut ack)
+        .map_err(|e| anyhow!("9P ring handshake ACK failed: {e}"))?;
+    stream.set_read_timeout(None).ok();
+    if ack[0] != b'K' {
+        anyhow::bail!("9P ring handshake: broker did not ACK shared-memory metadata");
+    }
+
+    Ok(pair.into_parts())
+}
+
+/// Connect to a 9P broker endpoint with retries, returning a shmem ring pair.
+fn connect_nine_p_channel(
+    endpoint: &str,
+) -> Result<(
+    litebox_common_windows::shmem_ring::RingWriter,
+    litebox_common_windows::shmem_ring::RingReader,
+)> {
+    let mut attempts = 0;
+    loop {
+        let stream_result = match endpoint.parse::<std::net::SocketAddr>() {
+            Ok(sock_addr) => connect_to_broker_tcp(endpoint, sock_addr),
+            Err(_) => connect_to_broker_unix(endpoint),
+        };
+        match stream_result {
+            Ok(mut stream) => match upgrade_ipc_stream_to_nine_p_ring(&mut stream) {
+                Ok(parts) => return Ok(parts),
+                Err(err) => {
+                    attempts += 1;
+                    if attempts >= 50 {
+                        return Err(anyhow!(
+                            "Failed to connect to 9P broker at {endpoint} \
+                             after {attempts} attempts: {err}"
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            },
+            Err(err) => {
+                attempts += 1;
+                if attempts >= 50 {
+                    return Err(anyhow!(
+                        "Failed to connect to 9P broker at {endpoint} \
+                         after {attempts} attempts: {err}"
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Network Broker IPC helpers
 // ---------------------------------------------------------------------------
 
 /// IPC handshake constants (must match `litebox_broker` protocol).

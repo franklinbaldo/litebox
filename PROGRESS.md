@@ -1154,3 +1154,79 @@ limiting the sandbox to ~6-7 total child process spawns before `NoSpace`.
 - `litebox_shim_windows/src/syscalls/sync.rs` — fire_expired_timers(),
   timer2 integration in IOCP waits, peek-only alertable APC check
 - `litebox_shim_windows/src/syscalls/process.rs` — timer2_list in child state
+
+## 2026-04-08: Windows shim generic over FS type (commit 314abdb5)
+
+Made the Windows shim generic over `<FS: NtShimFS>` following the Linux shim's
+`ShimFS` pattern. This enables pluggable filesystem backends (needed for 9P).
+
+### Changes:
+- Added `NtShimFS` trait and `NtFS` concrete type alias in lib.rs
+- Parameterized `NtShimEntrypoints<FS>`, `NtSharedState<FS>`, `HandleTable<FS>`,
+  `NtObject<FS>`, `ProcessDiagnostics<FS>`, `NtChildProcessInit<FS>`,
+  `NtChildThreadInit<FS>`, `ChildProcessShim<FS>` over `<FS: NtShimFS>`
+- Propagated `FS` through all impl blocks and ~80 function signatures across
+  lib.rs, handle_table.rs, and all syscall modules (file, process, section,
+  sync, port, sysinfo, k32_handlers, thread, mod)
+- Fixed 290 compile errors: E0107 (95), E0308 (52), E0614 (27), E0282 (94),
+  E0277/E0425 (6) — mostly mechanical changes
+- Python and Node.js tests pass unchanged
+
+## 2026-04-09: 9P broker support — host filesystem sharing into sandbox
+
+### Goal
+Share host files into the sandbox via 9P filesystem protocol, needed for copilot's
+~95 MB package files whose paths exceed USTAR tar format's 100-char filename limit.
+
+### Architecture
+- The **broker** (`litebox_broker/`) serves as a 9P2000.L file server over shared memory
+- The **9P client** (`litebox/src/fs/nine_p/`) implements the `FileSystem` trait
+- Both use **shared-memory ring transport** (`ShmemRingPair`) for high-throughput IPC
+- The 9P filesystem is mounted as the **lower layer** of a `layered::FileSystem` with
+  `LowerLayerWritableFiles` semantics — upper layer (tar+in-mem) takes priority, but
+  9P files are accessible by direct path
+
+### Changes (litebox_runner_windows_userland/):
+
+1. **Added `--nine-p-broker` CLI arg** to `CliArgs` struct
+2. **Added `ShmemTransportWriter`/`ShmemTransportReader`** — thin wrappers adapting
+   shmem ring to 9P transport Read/Write traits (copied from linux-on-windows runner)
+3. **Added `perform_nine_p_ipc_handshake()`** — sends `b"LB9P"` magic bytes
+4. **Added `upgrade_ipc_stream_to_nine_p_ring()`** — creates `ShmemRingPair`, sends
+   `TRANSPORT_MARKER` + ring metadata, waits for `b'K'` ACK
+5. **Added `connect_nine_p_channel()`** — retry loop (50 attempts, 100ms apart) that
+   connects to the broker and upgrades to shared memory transport
+6. **Extracted `create_shim_and_run<FS>()`** — generic function (~20 parameters) that
+   creates shim, configures it, sets VFS, and runs the guest. Takes any FS: NtShimFS.
+7. **Modified `run()` to branch** on `--nine-p-broker`: if present, connects to 9P,
+   builds combined layered VFS (`base_vfs` upper + 9P lower), calls
+   `create_shim_and_run` with combined type; otherwise calls with `NtFS` directly.
+8. **Enabled `std` feature** on `litebox_common_windows` dependency in Cargo.toml
+   (needed for `shmem_ring` module)
+
+### Path mapping discovery
+- Windows NT paths (e.g., `\\??\\C:\\Users\\sandbox\\...`) are translated to VFS paths
+  (e.g., `/c/users/sandbox/...`) by the shim's `drive_path_to_vfs()` function
+- The 9P broker's `--root-dir` maps 1:1 onto the guest's `/` — no mount prefix
+- Therefore, to serve copilot files at `C:\Users\sandbox\AppData\Local\copilot\pkg\...`,
+  the broker root must contain `c/users/sandbox/appdata/local/copilot/pkg/...`
+- **Junctions/symlinks DON'T work**: the broker's `handle_walk` calls `canonicalize()`
+  at each step and checks `starts_with(&self.root)` — junctions resolve outside root
+
+### Test results
+- Python without 9P: `hello from sandbox` — PASS
+- Node.js without 9P: `hello from node` — PASS
+- Python with 9P (read copilot index.js): `EXISTS: True`, `CONTENT: #!/usr/bin/env node` — PASS
+- 9P broker serving copilot package files via staging directory — PASS
+
+### Staging directory setup
+```powershell
+$root = "C:\Users\wdcui\tmp\9p_root"
+$target = "$root\c\users\sandbox\appdata\local\copilot\pkg\universal\1.0.10-1"
+New-Item -ItemType Directory -Force -Path (Split-Path $target)
+Copy-Item -Recurse -Force "C:\Users\wdcui\AppData\Local\copilot\pkg\universal\1.0.10-1" $target
+# Start broker:
+litebox_broker.exe --network-proxy-listen 127.0.0.1:19877 --root-dir $root
+```
+
+### Next: Test copilot --version with 9P + network broker
