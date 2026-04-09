@@ -1230,3 +1230,39 @@ litebox_broker.exe --network-proxy-listen 127.0.0.1:19877 --root-dir $root
 ```
 
 ### Next: Test copilot --version with 9P + network broker
+
+---
+
+## 2026-04-09: Fixed child process environment propagation — copilot --version WORKS
+
+### Problem: Copilot infinite self-spawn loop
+- `copilot --version` spawned itself 5+ times via NtCreateUserProcess with identical args
+- Each child did full JS init, loaded all modules via 9P, then spawned another child
+- Root cause: copilot's `index.js` spawns itself with `COPILOT_RUN_APP=1` env var
+  to distinguish the "loader" from the "app" process
+- Child processes had **empty environment** — `env_vars` was initialized as `BTreeMap::new()`
+  and the PEB env block was hardcoded (13 basic vars, no COPILOT_RUN_APP)
+- Without seeing `COPILOT_RUN_APP=1`, each child took the loader code path and spawned again
+
+### Fix: Propagate caller-provided environment to child processes
+Four changes across three files:
+
+1. **`peb_teb.rs`**: Added `env_strings: Vec<String>` field to `PebTebParams`.
+   `build_peb_teb_bytes` now uses custom env vars if provided, falling back to
+   hardcoded defaults for the root process.
+
+2. **`file.rs`** (`nt_create_user_process`): Read `Environment` pointer at offset +0x80
+   from `RTL_USER_PROCESS_PARAMETERS`. Added `parse_env_block_from_guest()` to parse
+   the double-NUL terminated UTF-16LE block into `Vec<String>`. Passes env to
+   `spawn_child_process`.
+
+3. **`process.rs`** (`spawn_child_process`): Added `env_strings_for_child` parameter.
+   - If caller provides env: parse into BTreeMap and write into child PEB env block
+   - If empty: inherit parent's `env_vars` BTreeMap (clone)
+   - Set `env_block_va` in `NtInitState` so `set_init_state` also parses from PEB
+
+### Results
+- `copilot --version` → `GitHub Copilot CLI 1.0.10-1.` (exit code 0) — WORKING
+- No more infinite self-spawning (one child process only)
+- Console output now correctly appears on stdout
+- Python and Node.js tests still pass

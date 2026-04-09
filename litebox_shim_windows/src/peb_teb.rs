@@ -335,6 +335,11 @@ pub struct PebTebParams {
     /// `pGdiSharedMemory`. Must point to a region ≥ 0x200000 bytes.
     /// If 0, PEB+0xF8 is left as NULL.
     pub gdi_shared_handle_table: usize,
+    /// Custom environment variables for this process. Each entry is a
+    /// `"KEY=VALUE"` string. If empty, a hardcoded minimal set is used.
+    /// When spawning child processes, this is populated from the caller's
+    /// `RTL_USER_PROCESS_PARAMETERS.Environment` block.
+    pub env_strings: alloc::vec::Vec<alloc::string::String>,
 }
 
 /// Build the raw bytes for the TEB/PEB/ProcessParams region.
@@ -730,26 +735,39 @@ pub fn build_peb_teb_bytes(layout: &PebTebLayout, params: &PebTebParams) -> allo
     }
 
     // ---- Environment block (UTF-16LE, double-NUL terminated) ----
-    // Minimal environment for CRT init.
+    // Use custom env vars if provided, otherwise fall back to minimal defaults.
     let env_start =
         TEB_SIZE + PEB_SIZE + PROCESS_PARAMS_SIZE + CMDLINE_BUFFER_SIZE + CMDLINE_ANSI_BUFFER_SIZE;
-    let env_strings: &[&str] = &[
-        "SYSTEMROOT=C:\\Windows",
-        "COMSPEC=C:\\Windows\\System32\\cmd.exe",
-        "PATH=C:\\Windows\\System32",
-        "TEMP=C:\\Windows\\Temp",
-        "TMP=C:\\Windows\\Temp",
-        "USERPROFILE=C:\\Users\\sandbox",
-        "HOMEDRIVE=C:",
-        "HOMEPATH=\\Users\\sandbox",
-        "APPDATA=C:\\Users\\sandbox\\AppData",
-        "LOCALAPPDATA=C:\\Users\\sandbox\\AppData\\Local",
-        "PYTHONHASHSEED=0",
-        "PYTHONLEGACYWINDOWSSTDIO=1",
-        "PYTHONUNBUFFERED=1",
-    ];
+    let default_env: alloc::vec::Vec<alloc::string::String> = if params.env_strings.is_empty() {
+        [
+            "SYSTEMROOT=C:\\Windows",
+            "COMSPEC=C:\\Windows\\System32\\cmd.exe",
+            "PATH=C:\\Windows\\System32",
+            "TEMP=C:\\Windows\\Temp",
+            "TMP=C:\\Windows\\Temp",
+            "USERPROFILE=C:\\Users\\sandbox",
+            "HOMEDRIVE=C:",
+            "HOMEPATH=\\Users\\sandbox",
+            "APPDATA=C:\\Users\\sandbox\\AppData",
+            "LOCALAPPDATA=C:\\Users\\sandbox\\AppData\\Local",
+            "PYTHONHASHSEED=0",
+            "PYTHONLEGACYWINDOWSSTDIO=1",
+            "PYTHONUNBUFFERED=1",
+        ]
+        .iter()
+        .map(|s| alloc::string::String::from(*s))
+        .collect()
+    } else {
+        // Empty vec — we'll use params.env_strings directly.
+        alloc::vec::Vec::new()
+    };
+    let env_source: &[alloc::string::String] = if params.env_strings.is_empty() {
+        &default_env
+    } else {
+        &params.env_strings
+    };
     let mut off = env_start;
-    for s in env_strings {
+    for s in env_source {
         for &b in s.as_bytes() {
             if off + 2 <= data.len() {
                 data[off] = b;
@@ -1062,6 +1080,7 @@ mod tests {
             thread_id: 1004,
             api_set_map: 0,
             gdi_shared_handle_table: 0,
+            env_strings: alloc::vec::Vec::new(),
         };
 
         let data = build_peb_teb_bytes(&layout, &params);

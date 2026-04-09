@@ -1512,6 +1512,7 @@ fn create_shim_and_run<FS: litebox_shim_windows::NtShimFS>(
         thread_id: u64::from(litebox_shim_windows::peb_teb::SYNTHETIC_MAIN_THREAD_ID),
         api_set_map: host_api_set_map,
         gdi_shared_handle_table: gdi_shared_va,
+        env_strings: Vec::new(), // use default hardcoded env for root process
     };
     let peb_teb_bytes = build_peb_teb_bytes(&peb_teb_layout, &peb_teb_params);
 

@@ -267,6 +267,48 @@ fn read_unicode_string_from_guest(us_va: usize) -> Option<String> {
     Some(alloc::string::String::from_utf16_lossy(wchars))
 }
 
+/// Parse a double-NUL terminated UTF-16LE environment block from guest memory
+/// into a `Vec<String>` of `"KEY=VALUE"` strings.
+///
+/// The caller-provided `env_ptr` points to the start of the environment block
+/// in guest memory (from `RTL_USER_PROCESS_PARAMETERS.Environment`).
+fn parse_env_block_from_guest(env_ptr: usize) -> alloc::vec::Vec<alloc::string::String> {
+    let mut result = alloc::vec::Vec::new();
+    let mut ptr = env_ptr;
+    // Safety limit: don't read more than 128 KB of env data.
+    let end = env_ptr + 128 * 1024;
+    loop {
+        if ptr >= end {
+            break;
+        }
+        // Read one UTF-16 NUL-terminated string.
+        let mut chars = alloc::vec::Vec::new();
+        loop {
+            if ptr + 2 > end {
+                return result;
+            }
+            let ch = match crate::try_read_guest_value_unaligned::<u16>(ptr) {
+                Some(v) => v,
+                None => return result, // unmapped memory, stop
+            };
+            ptr += 2;
+            if ch == 0 {
+                break;
+            }
+            chars.push(ch);
+            if chars.len() > 32768 {
+                break; // single env var too long, bail
+            }
+        }
+        if chars.is_empty() {
+            break; // double-NUL = end of env block
+        }
+        let s = alloc::string::String::from_utf16_lossy(&chars);
+        result.push(s);
+    }
+    result
+}
+
 fn is_absolute_nt_or_dos_path(path: &str) -> bool {
     path.starts_with('\\') || path.as_bytes().get(1).is_some_and(|second| *second == b':')
 }
@@ -4124,12 +4166,27 @@ pub(crate) fn nt_create_user_process<FS: crate::NtShimFS>(
         0
     };
 
+    // Read Environment pointer from RTL_USER_PROCESS_PARAMETERS (+0x80).
+    // Parse the double-NUL terminated UTF-16LE environment block into a
+    // Vec of "KEY=VALUE" strings for the child process.
+    let child_env_strings: alloc::vec::Vec<alloc::string::String> = if process_params_ptr != 0 {
+        let env_ptr =
+            crate::try_read_guest_value_unaligned::<usize>(process_params_ptr + 0x80).unwrap_or(0);
+        if env_ptr != 0 {
+            parse_env_block_from_guest(env_ptr)
+        } else {
+            alloc::vec::Vec::new()
+        }
+    } else {
+        alloc::vec::Vec::new()
+    };
+
     #[cfg(any(debug_assertions, feature = "trace_debug"))]
     {
         use litebox::platform::DebugLogProvider as _;
         litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-            "NT shim: NtCreateUserProcess stdin=0x{:X} stdout=0x{:X} stderr=0x{:X}\n",
-            stdin_handle, stdout_handle, stderr_handle,
+            "NT shim: NtCreateUserProcess stdin=0x{:X} stdout=0x{:X} stderr=0x{:X} env_vars={}\n",
+            stdin_handle, stdout_handle, stderr_handle, child_env_strings.len(),
         ));
     }
 
@@ -4201,6 +4258,7 @@ pub(crate) fn nt_create_user_process<FS: crate::NtShimFS>(
         stdin_pipe,
         stdout_pipe,
         stderr_pipe,
+        child_env_strings,
     ) {
         Ok(result) => {
             // Write handles to caller.

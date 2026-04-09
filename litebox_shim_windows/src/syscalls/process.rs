@@ -147,6 +147,7 @@ pub(crate) fn spawn_child_process<FS: crate::NtShimFS>(
     stdin_pipe: Option<Arc<PipeBuffer>>,
     stdout_pipe: Option<Arc<PipeBuffer>>,
     stderr_pipe: Option<Arc<PipeBuffer>>,
+    env_strings_for_child: alloc::vec::Vec<alloc::string::String>,
 ) -> Result<SpawnResult, i32> {
     let boot_data = parent_shared
         .ntdll_boot_data
@@ -481,6 +482,7 @@ pub(crate) fn spawn_child_process<FS: crate::NtShimFS>(
         thread_id: u64::from(child_tid),
         api_set_map: host_api_set_map,
         gdi_shared_handle_table: gdi_shared_va,
+        env_strings: env_strings_for_child.clone(),
     };
 
     // ── Step 10: Create child NtSharedState ──────────────────────
@@ -746,7 +748,28 @@ pub(crate) fn spawn_child_process<FS: crate::NtShimFS>(
         fls_next: spin::Mutex::new(0),
         fls_free_list: spin::Mutex::new(Vec::new()),
         unhandled_exception_filter: spin::Mutex::new(0),
-        env_vars: spin::Mutex::new(alloc::collections::BTreeMap::new()),
+        env_vars: spin::Mutex::new({
+            // If the caller provided an explicit environment block, parse it.
+            // Otherwise inherit the parent's environment variables.
+            if env_strings_for_child.is_empty() {
+                parent_shared.env_vars.lock().clone()
+            } else {
+                let mut m = alloc::collections::BTreeMap::new();
+                for s in &env_strings_for_child {
+                    if let Some(eq_pos) = s.find('=') {
+                        let key = &s[..eq_pos];
+                        let val = &s[eq_pos + 1..];
+                        if !key.is_empty() {
+                            m.insert(
+                                alloc::string::String::from(key),
+                                alloc::string::String::from(val),
+                            );
+                        }
+                    }
+                }
+                m
+            }
+        }),
         env_block_pool: spin::Mutex::new(Vec::new()),
         current_directory: spin::Mutex::new(parent_shared.current_directory.lock().clone()),
         next_thread_id: spin::Mutex::new(child_tid + crate::peb_teb::SYNTHETIC_THREAD_ID_INCREMENT),
@@ -869,7 +892,7 @@ pub(crate) fn spawn_child_process<FS: crate::NtShimFS>(
             image_size: exe_info.image_size,
             process_params_va: peb_teb_layout.process_params_va,
             cmdline_ansi_va: 0,
-            env_block_va: 0,
+            env_block_va: peb_teb_layout.env_block_va,
             module_bases: alloc::vec![
                 crate::ModuleBase {
                     name: alloc::string::String::from(exe_base_name),
