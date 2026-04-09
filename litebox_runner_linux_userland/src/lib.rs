@@ -457,6 +457,14 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // processes spawned for non-PIE child execs.
     register_worker_spawn_flags(platform, &cli_args);
 
+    // Pre-open /dev/null for the forker to use for stdio wiring.
+    let dev_null_fd = unsafe { libc::open(b"/dev/null\0".as_ptr().cast(), libc::O_RDWR | libc::O_CLOEXEC) };
+    if dev_null_fd >= 0 {
+        if let Err(e) = platform.spawn_forker(dev_null_fd) {
+            eprintln!("warning: failed to spawn forker: {e}; fork-restore will use posix_spawn fallback");
+        }
+    }
+
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     let litebox = shim_builder.litebox();
     let (in_mem, tar_ro) = build_initial_fs(

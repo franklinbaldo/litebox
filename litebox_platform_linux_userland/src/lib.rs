@@ -247,6 +247,8 @@ pub struct LinuxUserland {
     worker_spawn_serial: Mutex<()>,
     /// Result pipes and proxy threads for in-flight worker host processes, keyed by host PID.
     worker_processes: std::sync::Mutex<BTreeMap<i32, WorkerHostProcess>>,
+    /// Handle for the forker process (if active).
+    forker_handle: std::sync::Mutex<Option<forker::ForkerHandle>>,
     /// Detached bridge threads that may outlive the waited worker while descendants still hold stdio.
     detached_worker_bridge_threads: std::sync::Mutex<Vec<DetachedWorkerBridge>>,
     /// Cached host stdin TTY device info (path, rdev, dev, ino).
@@ -820,6 +822,7 @@ impl LinuxUserland {
             worker_spawn_flags: std::sync::RwLock::new(Vec::new()),
             worker_spawn_serial: Mutex::new(()),
             worker_processes: std::sync::Mutex::new(BTreeMap::new()),
+            forker_handle: std::sync::Mutex::new(None),
             detached_worker_bridge_threads: std::sync::Mutex::new(Vec::new()),
             host_stdin_tty_info: std::sync::OnceLock::new(),
             background_handles: Mutex::new(Vec::new()),
@@ -848,6 +851,81 @@ impl LinuxUserland {
     /// Panics if the internal lock is poisoned.
     pub fn set_worker_spawn_flags(&self, flags: Vec<std::ffi::CString>) {
         *self.worker_spawn_flags.write().unwrap() = flags;
+    }
+
+    /// Spawn the forker child process.
+    ///
+    /// Creates a Unix socketpair for communication, forks a child that runs
+    /// [`forker::forker_main`], and stores the resulting [`ForkerHandle`] so
+    /// that later `try_spawn_via_forker` calls can send fork requests.
+    ///
+    /// Must be called while the runner is still single-threaded (before shim
+    /// threads are created).
+    pub fn spawn_forker(&'static self, dev_null_fd: std::os::fd::RawFd) -> Result<(), &'static str> {
+        use std::os::fd::{FromRawFd, OwnedFd};
+
+        let broker_fd = self.broker_raw_fd();
+
+        let mut fds = [0i32; 2];
+        if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0, fds.as_mut_ptr()) } != 0 {
+            return Err("socketpair failed");
+        }
+        let runner_sock = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let forker_sock_raw = fds[1];
+
+        if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
+            return Err("prctl(PR_SET_CHILD_SUBREAPER) failed");
+        }
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err("fork failed");
+        }
+        if pid == 0 {
+            // Forker child
+            drop(runner_sock);
+            let flags = unsafe { libc::fcntl(forker_sock_raw, libc::F_GETFD) };
+            if flags >= 0 {
+                unsafe { libc::fcntl(forker_sock_raw, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
+            }
+            forker::forker_main(forker_sock_raw, dev_null_fd, broker_fd);
+        }
+
+        // Runner parent
+        unsafe { libc::close(forker_sock_raw); }
+        let handle = forker::ForkerHandle::new(runner_sock);
+        *self.forker_handle.lock().unwrap() = Some(handle);
+        Ok(())
+    }
+
+    /// Extract the raw fd from the IPC network transport, if present.
+    fn broker_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        use std::os::fd::AsRawFd;
+        let guard = self.network_transport.read().unwrap();
+        match guard.as_ref() {
+            Some(NetworkTransport::Ipc(fd)) => Some(fd.as_raw_fd()),
+            _ => None,
+        }
+    }
+
+    /// Attempt to spawn a worker via the forker process.
+    ///
+    /// This is a skeleton that always returns `Err(())` — the real
+    /// implementation will pack stdio/fd descriptors into a [`ForkRequest`]
+    /// and send it over the forker socket in a later task.
+    fn try_spawn_via_forker<FS>(
+        &'static self,
+        _snapshot_bytes: &[u8],
+        _stdio: &WorkerExecStdioBindings<FS, LinuxUserland>,
+        _mux_fd: Option<i32>,
+        _mux_streams: &[(u32, usize, u8, u8, bool)],
+        _passthrough_fds: &[(usize, i32, bool)],
+        _local_pipe_pairs: &[(usize, usize, Vec<u8>, u32, u32)],
+    ) -> Result<i32, ()>
+    where
+        FS: litebox::fs::FileSystem + Send + Sync + 'static,
+    {
+        Err(())
     }
 
     /// Cancel any pending `read_from_stdin()` call, causing it to return EOF.
