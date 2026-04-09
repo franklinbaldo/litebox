@@ -1695,6 +1695,16 @@ impl ThreadContext<'_> {
 
 impl litebox::platform::SystemInfoProvider for LinuxUserland {
     fn get_syscall_entry_point(&self) -> usize {
+        // When the seccomp/systrap backend is active, syscall instructions are
+        // trapped via SIGSYS — no binary rewriting needed.
+        #[cfg(feature = "systrap_backend")]
+        if self
+            .seccomp_interception_enabled
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return 0;
+        }
+
         #[cfg(target_arch = "x86_64")]
         {
             syscall_callback_redzone as *const () as usize
