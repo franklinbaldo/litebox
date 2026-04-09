@@ -8,7 +8,7 @@
 //! Unix socketpair using a simple wire protocol with file-descriptor passing
 //! via `SCM_RIGHTS`.
 
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Mutex;
 
 /// Maximum number of file descriptors in a single `SCM_RIGHTS` message.
@@ -590,6 +590,252 @@ pub(crate) fn recv_fork_response(sock: RawFd) -> Result<ForkResponse, i32> {
         return Err(libc::EPROTO);
     }
     ForkResponse::deserialize(&buf).map_err(|_| libc::EPROTO)
+}
+
+// ---------------------------------------------------------------------------
+// Forker process main loop
+// ---------------------------------------------------------------------------
+
+/// Entry point for the forker process.
+///
+/// Called after `fork()` in the runner's single-threaded init window.
+/// The forker sits in a loop, receiving fork requests over `cmd_sock`,
+/// performing a double-fork to create orphaned worker processes, and
+/// sending the grandchild PID back to the runner.
+///
+/// # Safety
+///
+/// - `cmd_sock` must be a valid, connected Unix-domain socket fd.
+/// - `dev_null_fd` must be a valid fd open to `/dev/null`.
+/// - `broker_fd`, if `Some`, must be a valid fd (it will be closed immediately).
+///
+/// This function never returns.
+pub(crate) fn forker_main(cmd_sock: RawFd, dev_null_fd: RawFd, broker_fd: Option<RawFd>) -> ! {
+    // The forker doesn't use the broker socket — workers get their own via SCM_RIGHTS.
+    if let Some(fd) = broker_fd {
+        // SAFETY: `fd` is a valid open fd that we own.
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    loop {
+        // Block waiting for a fork request + fds from the runner.
+        let (req, fds) = match recv_fork_request(cmd_sock) {
+            Ok(pair) => pair,
+            Err(_) => {
+                // EOF or error — runner closed the socket, exit cleanly.
+                // SAFETY: _exit is always safe to call.
+                unsafe {
+                    libc::_exit(0);
+                }
+            }
+        };
+
+        // Create a pipe for the intermediate child to report the grandchild PID.
+        let mut pid_pipe = [0i32; 2];
+        // SAFETY: pipe2 with a valid array and O_CLOEXEC is safe.
+        if unsafe { libc::pipe2(pid_pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            // pipe2 failed — report error to the runner.
+            let errno = unsafe { *libc::__errno_location() };
+            drop(fds);
+            let _ = send_fork_response(cmd_sock, &ForkResponse { child_pid: -errno });
+            continue;
+        }
+        let pid_pipe_read = pid_pipe[0];
+        let pid_pipe_write = pid_pipe[1];
+
+        // SAFETY: fork() in a single-threaded process is safe.
+        let first_pid = unsafe { libc::fork() };
+
+        if first_pid < 0 {
+            // First fork failed.
+            let errno = unsafe { *libc::__errno_location() };
+            // SAFETY: closing valid pipe fds.
+            unsafe {
+                libc::close(pid_pipe_read);
+                libc::close(pid_pipe_write);
+            }
+            drop(fds);
+            let _ = send_fork_response(cmd_sock, &ForkResponse { child_pid: -errno });
+            continue;
+        }
+
+        if first_pid > 0 {
+            // ── Parent (forker) ──
+            // Close write end of pid_pipe — only the intermediate child writes.
+            // SAFETY: valid fd from pipe2.
+            unsafe {
+                libc::close(pid_pipe_write);
+            }
+            // Close the received fds — the forker doesn't need them, the
+            // grandchild inherited them via fork().
+            drop(fds);
+
+            // Reap the intermediate child (it exits immediately).
+            // SAFETY: first_pid is a valid child PID.
+            unsafe {
+                let mut status: i32 = 0;
+                loop {
+                    let ret = libc::waitpid(first_pid, &raw mut status, 0);
+                    if ret >= 0 || *libc::__errno_location() != libc::EINTR {
+                        break;
+                    }
+                }
+            }
+
+            // Read grandchild PID (or negative errno) from the pid pipe.
+            let mut grandchild_pid: i32 = 0;
+            // SAFETY: reading sizeof(i32) bytes into a valid i32 from a valid pipe fd.
+            let n = unsafe {
+                libc::read(
+                    pid_pipe_read,
+                    (&raw mut grandchild_pid).cast::<libc::c_void>(),
+                    std::mem::size_of::<i32>(),
+                )
+            };
+            // SAFETY: closing a valid fd.
+            unsafe {
+                libc::close(pid_pipe_read);
+            }
+
+            let child_pid = if n == std::mem::size_of::<i32>() as isize {
+                // If the intermediate child wrote a negative value, it's -errno
+                // from a failed second fork.
+                grandchild_pid
+            } else {
+                // Pipe read failed — shouldn't happen but report as EIO.
+                -(libc::EIO)
+            };
+
+            let _ = send_fork_response(cmd_sock, &ForkResponse { child_pid });
+            continue;
+        }
+
+        // ── Intermediate child (first_pid == 0) ──
+        // Close read end of pid_pipe — only the parent reads.
+        // SAFETY: valid fd from pipe2.
+        unsafe {
+            libc::close(pid_pipe_read);
+        }
+        // Close the command socket — only the forker parent uses it.
+        // SAFETY: valid fd.
+        unsafe {
+            libc::close(cmd_sock);
+        }
+
+        // Second fork to create the grandchild (actual worker).
+        // SAFETY: single-threaded process (intermediate child just forked).
+        let second_pid = unsafe { libc::fork() };
+
+        if second_pid < 0 {
+            // Second fork failed — write negative errno to pid_pipe, exit.
+            let errno = unsafe { *libc::__errno_location() };
+            let neg_errno = -errno;
+            // SAFETY: writing sizeof(i32) bytes from a valid i32 to a valid pipe fd.
+            unsafe {
+                libc::write(
+                    pid_pipe_write,
+                    (&raw const neg_errno).cast::<libc::c_void>(),
+                    std::mem::size_of::<i32>(),
+                );
+                libc::close(pid_pipe_write);
+            }
+            drop(fds);
+            // SAFETY: _exit is always safe.
+            unsafe {
+                libc::_exit(1);
+            }
+        }
+
+        if second_pid == 0 {
+            // ── Grandchild (worker) ──
+            // Close pid_pipe write end — only the intermediate parent uses it.
+            // SAFETY: valid fd from pipe2.
+            unsafe {
+                libc::close(pid_pipe_write);
+            }
+            // Hand off to the worker entry point (never returns).
+            worker_entry(req, fds, dev_null_fd);
+        }
+
+        // ── Intermediate parent (second_pid > 0) ──
+        // Write the grandchild PID to the pid pipe for the forker to read.
+        // SAFETY: writing sizeof(i32) bytes from a valid i32 to a valid pipe fd.
+        unsafe {
+            libc::write(
+                pid_pipe_write,
+                (&raw const second_pid).cast::<libc::c_void>(),
+                std::mem::size_of::<i32>(),
+            );
+            libc::close(pid_pipe_write);
+        }
+        // Drop the received fds — the grandchild inherited them.
+        drop(fds);
+        // SAFETY: _exit is always safe.
+        unsafe {
+            libc::_exit(0);
+        }
+    }
+}
+
+/// Worker entry point (placeholder).
+///
+/// Wires stdio according to the request, writes `ENOSYS` to the ack fd,
+/// and exits. This will be replaced with real worker logic in a later task.
+///
+/// This function never returns.
+pub(crate) fn worker_entry(req: ForkRequest, fds: Vec<OwnedFd>, dev_null_fd: RawFd) -> ! {
+    // Wire stdio according to req.stdio.
+    for (target_fd, binding) in req.stdio.iter().enumerate() {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let target_fd = target_fd as i32;
+        match binding {
+            StdioBinding::FromFdIndex(idx) => {
+                let idx = *idx as usize;
+                if idx < fds.len() {
+                    // SAFETY: both fds are valid.
+                    unsafe {
+                        libc::dup2(fds[idx].as_raw_fd(), target_fd);
+                    }
+                }
+            }
+            StdioBinding::DevNull => {
+                // SAFETY: dev_null_fd and target_fd are valid fds.
+                unsafe {
+                    libc::dup2(dev_null_fd, target_fd);
+                }
+            }
+            StdioBinding::Close => {
+                // SAFETY: target_fd is a valid stdio fd number.
+                unsafe {
+                    libc::close(target_fd);
+                }
+            }
+            StdioBinding::Inherit => {
+                // Leave the fd as-is.
+            }
+        }
+    }
+
+    // Write ENOSYS (-38) to the ack fd to signal "not implemented yet".
+    let ack_fd_idx = req.ack_fd_idx as usize;
+    if ack_fd_idx < fds.len() {
+        let enosys: i32 = -(libc::ENOSYS);
+        // SAFETY: writing sizeof(i32) bytes to a valid fd.
+        unsafe {
+            libc::write(
+                fds[ack_fd_idx].as_raw_fd(),
+                (&raw const enosys).cast::<libc::c_void>(),
+                std::mem::size_of::<i32>(),
+            );
+        }
+    }
+
+    // SAFETY: _exit is always safe.
+    unsafe {
+        libc::_exit(1);
+    }
 }
 
 // ---------------------------------------------------------------------------
