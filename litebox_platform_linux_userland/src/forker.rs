@@ -1,0 +1,849 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+//! Forker protocol types and SCM_RIGHTS helpers.
+//!
+//! The forker process sits between the runner and the worker, eliminating
+//! `execve`/`openat` from the fork-restore path. Communication happens over a
+//! Unix socketpair using a simple wire protocol with file-descriptor passing
+//! via `SCM_RIGHTS`.
+
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::sync::Mutex;
+
+/// Maximum number of file descriptors in a single `SCM_RIGHTS` message.
+pub(crate) const MAX_SCMRIGHTS_FDS: usize = 64;
+
+/// Magic bytes identifying a [`ForkRequest`] on the wire.
+const FORK_REQUEST_MAGIC: [u8; 4] = *b"LBFR";
+
+/// Wire-format version for [`ForkRequest`].
+const FORK_REQUEST_VERSION: u16 = 1;
+
+/// Magic bytes identifying a [`ForkResponse`] on the wire.
+const FORK_RESPONSE_MAGIC: [u8; 4] = *b"LBFP";
+
+// ---------------------------------------------------------------------------
+// ForkerHandle
+// ---------------------------------------------------------------------------
+
+/// The runner's end of the socketpair to the forker process.
+pub(crate) struct ForkerHandle {
+    sock: Mutex<OwnedFd>,
+}
+
+impl ForkerHandle {
+    /// Wrap a connected socket into a `ForkerHandle`.
+    pub(crate) fn new(sock: OwnedFd) -> Self {
+        Self {
+            sock: Mutex::new(sock),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StdioBinding
+// ---------------------------------------------------------------------------
+
+/// How to wire a single stdio fd (0, 1, or 2) in the worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StdioBinding {
+    /// `dup2` from the fd at this index in the SCM_RIGHTS array.
+    FromFdIndex(u8),
+    /// Open `/dev/null` (actually dup2 from an inherited `/dev/null` fd).
+    DevNull,
+    /// Close this fd.
+    Close,
+    /// Leave the fd as-is.
+    Inherit,
+}
+
+impl StdioBinding {
+    /// Wire encoding: tag byte followed by optional payload.
+    fn serialize(&self, out: &mut Vec<u8>) {
+        match self {
+            StdioBinding::FromFdIndex(idx) => {
+                out.push(0);
+                out.push(*idx);
+            }
+            StdioBinding::DevNull => out.push(1),
+            StdioBinding::Close => out.push(2),
+            StdioBinding::Inherit => out.push(3),
+        }
+    }
+
+    fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, &'static str> {
+        if *pos >= data.len() {
+            return Err("StdioBinding: unexpected end of data");
+        }
+        let tag = data[*pos];
+        *pos += 1;
+        match tag {
+            0 => {
+                if *pos >= data.len() {
+                    return Err("StdioBinding::FromFdIndex: missing index");
+                }
+                let idx = data[*pos];
+                *pos += 1;
+                Ok(StdioBinding::FromFdIndex(idx))
+            }
+            1 => Ok(StdioBinding::DevNull),
+            2 => Ok(StdioBinding::Close),
+            3 => Ok(StdioBinding::Inherit),
+            _ => Err("StdioBinding: unknown tag"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ForkRequest
+// ---------------------------------------------------------------------------
+
+/// Serializable request from the runner to the forker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ForkRequest {
+    /// Stdio bindings for fds 0, 1, 2.
+    pub stdio: [StdioBinding; 3],
+    /// Number of fds in the accompanying SCM_RIGHTS message.
+    pub num_fds: u16,
+    /// Index into the SCM_RIGHTS array for the snapshot fd (0xFF = none).
+    pub snapshot_fd_idx: u8,
+    /// Index for the acknowledgement fd (0xFF = none).
+    pub ack_fd_idx: u8,
+    /// Index for the result fd (0xFF = none).
+    pub result_fd_idx: u8,
+    /// Index for the mux fd (0xFF = none).
+    pub mux_fd_idx: u8,
+    /// Mux stream descriptors: (stream_id, guest_fd, direction, type, initial_eof).
+    pub mux_streams: Vec<(u32, usize, u8, u8, bool)>,
+    /// Pipe bridge descriptors: (guest_fd, host_fd_idx_in_array, is_read).
+    pub pipe_bridges: Vec<(usize, u8, bool)>,
+    /// Local pipe descriptors: (write_fd, read_fd, drain_fd_idx_or_0xFF, w_flags, r_flags).
+    pub local_pipes: Vec<(usize, usize, u8, u32, u32)>,
+}
+
+impl ForkRequest {
+    /// Serialize into wire format.
+    ///
+    /// Wire layout:
+    /// - magic "LBFR" (4 bytes)
+    /// - version u16 LE (2 bytes)
+    /// - stdio bindings (variable)
+    /// - num_fds u16 LE
+    /// - snapshot_fd_idx, ack_fd_idx, result_fd_idx, mux_fd_idx (4 bytes)
+    /// - mux_streams count u32 LE, then each entry
+    /// - pipe_bridges count u32 LE, then each entry
+    /// - local_pipes count u32 LE, then each entry
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+
+        // Header
+        out.extend_from_slice(&FORK_REQUEST_MAGIC);
+        out.extend_from_slice(&FORK_REQUEST_VERSION.to_le_bytes());
+
+        // Stdio bindings
+        for binding in &self.stdio {
+            binding.serialize(&mut out);
+        }
+
+        // Fd info
+        out.extend_from_slice(&self.num_fds.to_le_bytes());
+        out.push(self.snapshot_fd_idx);
+        out.push(self.ack_fd_idx);
+        out.push(self.result_fd_idx);
+        out.push(self.mux_fd_idx);
+
+        // Mux streams
+        #[allow(clippy::cast_possible_truncation)]
+        let mux_count = self.mux_streams.len() as u32;
+        out.extend_from_slice(&mux_count.to_le_bytes());
+        for &(stream_id, guest_fd, direction, ty, initial_eof) in &self.mux_streams {
+            out.extend_from_slice(&stream_id.to_le_bytes());
+            out.extend_from_slice(&(guest_fd as u64).to_le_bytes());
+            out.push(direction);
+            out.push(ty);
+            out.push(if initial_eof { 1 } else { 0 });
+        }
+
+        // Pipe bridges
+        #[allow(clippy::cast_possible_truncation)]
+        let bridge_count = self.pipe_bridges.len() as u32;
+        out.extend_from_slice(&bridge_count.to_le_bytes());
+        for &(guest_fd, host_fd_idx, is_read) in &self.pipe_bridges {
+            out.extend_from_slice(&(guest_fd as u64).to_le_bytes());
+            out.push(host_fd_idx);
+            out.push(if is_read { 1 } else { 0 });
+        }
+
+        // Local pipes
+        #[allow(clippy::cast_possible_truncation)]
+        let pipe_count = self.local_pipes.len() as u32;
+        out.extend_from_slice(&pipe_count.to_le_bytes());
+        for &(write_fd, read_fd, drain_fd_idx, w_flags, r_flags) in &self.local_pipes {
+            out.extend_from_slice(&(write_fd as u64).to_le_bytes());
+            out.extend_from_slice(&(read_fd as u64).to_le_bytes());
+            out.push(drain_fd_idx);
+            out.extend_from_slice(&w_flags.to_le_bytes());
+            out.extend_from_slice(&r_flags.to_le_bytes());
+        }
+
+        out
+    }
+
+    /// Deserialize from wire format.
+    pub fn deserialize(data: &[u8]) -> Result<Self, &'static str> {
+        let mut pos = 0;
+
+        // Magic
+        if data.len() < 6 {
+            return Err("ForkRequest: data too short for header");
+        }
+        if data[0..4] != FORK_REQUEST_MAGIC {
+            return Err("ForkRequest: bad magic");
+        }
+        pos += 4;
+
+        // Version
+        let version = u16::from_le_bytes([data[pos], data[pos + 1]]);
+        pos += 2;
+        if version != FORK_REQUEST_VERSION {
+            return Err("ForkRequest: unsupported version");
+        }
+
+        // Stdio
+        let mut stdio = [StdioBinding::Close; 3];
+        for binding in &mut stdio {
+            *binding = StdioBinding::deserialize(data, &mut pos)?;
+        }
+
+        // num_fds
+        if pos + 2 > data.len() {
+            return Err("ForkRequest: truncated num_fds");
+        }
+        let num_fds = u16::from_le_bytes([data[pos], data[pos + 1]]);
+        pos += 2;
+
+        // fd indices
+        if pos + 4 > data.len() {
+            return Err("ForkRequest: truncated fd indices");
+        }
+        let snapshot_fd_idx = data[pos];
+        let ack_fd_idx = data[pos + 1];
+        let result_fd_idx = data[pos + 2];
+        let mux_fd_idx = data[pos + 3];
+        pos += 4;
+
+        // Mux streams
+        if pos + 4 > data.len() {
+            return Err("ForkRequest: truncated mux_streams count");
+        }
+        let mux_count =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+
+        let mut mux_streams = Vec::with_capacity(mux_count);
+        for _ in 0..mux_count {
+            if pos + 15 > data.len() {
+                return Err("ForkRequest: truncated mux_stream entry");
+            }
+            let stream_id =
+                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+            pos += 4;
+            let guest_fd = u64::from_le_bytes([
+                data[pos],
+                data[pos + 1],
+                data[pos + 2],
+                data[pos + 3],
+                data[pos + 4],
+                data[pos + 5],
+                data[pos + 6],
+                data[pos + 7],
+            ]) as usize;
+            pos += 8;
+            let direction = data[pos];
+            pos += 1;
+            let ty = data[pos];
+            pos += 1;
+            let initial_eof = data[pos] != 0;
+            pos += 1;
+            mux_streams.push((stream_id, guest_fd, direction, ty, initial_eof));
+        }
+
+        // Pipe bridges
+        if pos + 4 > data.len() {
+            return Err("ForkRequest: truncated pipe_bridges count");
+        }
+        let bridge_count =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+
+        let mut pipe_bridges = Vec::with_capacity(bridge_count);
+        for _ in 0..bridge_count {
+            if pos + 10 > data.len() {
+                return Err("ForkRequest: truncated pipe_bridge entry");
+            }
+            let guest_fd = u64::from_le_bytes([
+                data[pos],
+                data[pos + 1],
+                data[pos + 2],
+                data[pos + 3],
+                data[pos + 4],
+                data[pos + 5],
+                data[pos + 6],
+                data[pos + 7],
+            ]) as usize;
+            pos += 8;
+            let host_fd_idx = data[pos];
+            pos += 1;
+            let is_read = data[pos] != 0;
+            pos += 1;
+            pipe_bridges.push((guest_fd, host_fd_idx, is_read));
+        }
+
+        // Local pipes
+        if pos + 4 > data.len() {
+            return Err("ForkRequest: truncated local_pipes count");
+        }
+        let pipe_count =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+
+        let mut local_pipes = Vec::with_capacity(pipe_count);
+        for _ in 0..pipe_count {
+            if pos + 25 > data.len() {
+                return Err("ForkRequest: truncated local_pipe entry");
+            }
+            let write_fd = u64::from_le_bytes([
+                data[pos],
+                data[pos + 1],
+                data[pos + 2],
+                data[pos + 3],
+                data[pos + 4],
+                data[pos + 5],
+                data[pos + 6],
+                data[pos + 7],
+            ]) as usize;
+            pos += 8;
+            let read_fd = u64::from_le_bytes([
+                data[pos],
+                data[pos + 1],
+                data[pos + 2],
+                data[pos + 3],
+                data[pos + 4],
+                data[pos + 5],
+                data[pos + 6],
+                data[pos + 7],
+            ]) as usize;
+            pos += 8;
+            let drain_fd_idx = data[pos];
+            pos += 1;
+            let w_flags =
+                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+            pos += 4;
+            let r_flags =
+                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+            pos += 4;
+            local_pipes.push((write_fd, read_fd, drain_fd_idx, w_flags, r_flags));
+        }
+
+        Ok(ForkRequest {
+            stdio,
+            num_fds,
+            snapshot_fd_idx,
+            ack_fd_idx,
+            result_fd_idx,
+            mux_fd_idx,
+            mux_streams,
+            pipe_bridges,
+            local_pipes,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ForkResponse
+// ---------------------------------------------------------------------------
+
+/// Fixed 8-byte response from the forker to the runner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ForkResponse {
+    /// PID of the child process (negative on error).
+    pub child_pid: i32,
+}
+
+impl ForkResponse {
+    /// Serialize to an 8-byte wire representation.
+    pub fn serialize(&self) -> [u8; 8] {
+        let mut buf = [0u8; 8];
+        buf[0..4].copy_from_slice(&FORK_RESPONSE_MAGIC);
+        buf[4..8].copy_from_slice(&self.child_pid.to_le_bytes());
+        buf
+    }
+
+    /// Deserialize from an 8-byte wire representation.
+    pub fn deserialize(data: &[u8; 8]) -> Result<Self, &'static str> {
+        if data[0..4] != FORK_RESPONSE_MAGIC {
+            return Err("ForkResponse: bad magic");
+        }
+        let child_pid = i32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        Ok(ForkResponse { child_pid })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SCM_RIGHTS helpers
+// ---------------------------------------------------------------------------
+
+/// Send a data buffer along with file descriptors over a Unix socket using `SCM_RIGHTS`.
+///
+/// # Safety
+///
+/// `sock` must be a valid, connected Unix-domain socket file descriptor.
+/// All entries in `fds` must be valid, open file descriptors.
+pub(crate) fn send_msg_with_fds(sock: RawFd, data: &[u8], fds: &[RawFd]) -> Result<(), i32> {
+    assert!(fds.len() <= MAX_SCMRIGHTS_FDS);
+
+    let fd_payload_size = fds.len() * size_of::<RawFd>();
+
+    // SAFETY: CMSG_SPACE with a valid payload size returns the correct buffer size.
+    #[allow(clippy::cast_possible_truncation)]
+    let cmsg_space = unsafe { libc::CMSG_SPACE(fd_payload_size as u32) as usize };
+
+    // Guarantees the control-message buffer is aligned for `cmsghdr`.
+    #[repr(C)]
+    struct AlignedBuf {
+        _align: [libc::cmsghdr; 0],
+        buf: [u8; 1024], // Large enough for MAX_SCMRIGHTS_FDS fds
+    }
+
+    let mut cmsg_buf = AlignedBuf {
+        _align: [],
+        buf: [0u8; 1024],
+    };
+    assert!(cmsg_space <= cmsg_buf.buf.len());
+
+    let mut iov = libc::iovec {
+        iov_base: data.as_ptr().cast_mut().cast(),
+        iov_len: data.len(),
+    };
+
+    // SAFETY: zeroing msghdr is safe; all-zero is a valid representation.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &raw mut iov;
+    msg.msg_iovlen = 1;
+
+    if !fds.is_empty() {
+        msg.msg_control = cmsg_buf.buf.as_mut_ptr().cast();
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            msg.msg_controllen = cmsg_space as _;
+        }
+
+        // SAFETY: `msg` has a properly sized and aligned control buffer.
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
+            if cmsg.is_null() {
+                return Err(libc::EINVAL);
+            }
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                (*cmsg).cmsg_len = libc::CMSG_LEN(fd_payload_size as u32) as _;
+            }
+            std::ptr::copy_nonoverlapping(
+                fds.as_ptr().cast::<u8>(),
+                libc::CMSG_DATA(cmsg),
+                fd_payload_size,
+            );
+        }
+    }
+
+    // SAFETY: `sock` is a valid connected Unix socket, `msg` is fully initialised.
+    let ret = unsafe { libc::sendmsg(sock, &raw const msg, libc::MSG_NOSIGNAL) };
+    if ret < 0 {
+        // SAFETY: reading thread-local errno immediately after a failed syscall.
+        let errno = unsafe { *libc::__errno_location() };
+        return Err(errno);
+    }
+    if ret as usize != data.len() {
+        return Err(libc::EIO);
+    }
+
+    Ok(())
+}
+
+/// Receive a data buffer and any accompanying file descriptors from a Unix socket.
+///
+/// Returns `(bytes_read, received_fds)`.
+///
+/// # Safety
+///
+/// `sock` must be a valid, connected Unix-domain socket file descriptor.
+/// `data_buf` must have sufficient capacity for the expected message.
+pub(crate) fn recv_msg_with_fds(
+    sock: RawFd,
+    data_buf: &mut [u8],
+) -> Result<(usize, Vec<OwnedFd>), i32> {
+    // SAFETY: CMSG_SPACE with a valid payload size returns the correct buffer size.
+    #[allow(clippy::cast_possible_truncation)]
+    let cmsg_space =
+        unsafe { libc::CMSG_SPACE((MAX_SCMRIGHTS_FDS * size_of::<RawFd>()) as u32) as usize };
+
+    #[repr(C)]
+    struct AlignedBuf {
+        _align: [libc::cmsghdr; 0],
+        buf: [u8; 1024],
+    }
+
+    let mut cmsg_buf = AlignedBuf {
+        _align: [],
+        buf: [0u8; 1024],
+    };
+    assert!(cmsg_space <= cmsg_buf.buf.len());
+
+    let mut iov = libc::iovec {
+        iov_base: data_buf.as_mut_ptr().cast(),
+        iov_len: data_buf.len(),
+    };
+
+    // SAFETY: zeroing msghdr is safe; all-zero is a valid representation.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &raw mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.buf.as_mut_ptr().cast();
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        msg.msg_controllen = cmsg_space as _;
+    }
+
+    // SAFETY: `sock` is a valid socket, `msg` is fully initialised.
+    let ret = unsafe { libc::recvmsg(sock, &raw mut msg, 0) };
+    if ret < 0 {
+        let errno = unsafe { *libc::__errno_location() };
+        return Err(errno);
+    }
+    if ret == 0 {
+        return Err(libc::ECONNRESET);
+    }
+
+    let bytes_read = ret as usize;
+
+    // Extract fds from ancillary data.
+    let mut received_fds = Vec::new();
+    // SAFETY: iterating through the cmsg chain using the standard CMSG macros.
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                let data_ptr = libc::CMSG_DATA(cmsg);
+                let data_len = (*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
+                let num_fds = data_len / size_of::<RawFd>();
+                for i in 0..num_fds {
+                    let mut raw_fd: RawFd = 0;
+                    std::ptr::copy_nonoverlapping(
+                        data_ptr.add(i * size_of::<RawFd>()),
+                        (&raw mut raw_fd).cast::<u8>(),
+                        size_of::<RawFd>(),
+                    );
+                    // SAFETY: the fd was just received via SCM_RIGHTS and is valid.
+                    received_fds.push(OwnedFd::from_raw_fd(raw_fd));
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(&raw const msg, cmsg);
+        }
+    }
+
+    Ok((bytes_read, received_fds))
+}
+
+/// Send a [`ForkRequest`] with accompanying file descriptors over a Unix socket.
+pub(crate) fn send_fork_request(
+    sock: RawFd,
+    request: &ForkRequest,
+    fds: &[RawFd],
+) -> Result<(), i32> {
+    let data = request.serialize();
+    send_msg_with_fds(sock, &data, fds)
+}
+
+/// Receive a [`ForkRequest`] and its accompanying file descriptors from a Unix socket.
+pub(crate) fn recv_fork_request(sock: RawFd) -> Result<(ForkRequest, Vec<OwnedFd>), i32> {
+    // 64 KiB should be more than enough for any reasonable ForkRequest.
+    let mut buf = vec![0u8; 65536];
+    let (n, fds) = recv_msg_with_fds(sock, &mut buf)?;
+    let request = ForkRequest::deserialize(&buf[..n]).map_err(|_| libc::EPROTO)?;
+    Ok((request, fds))
+}
+
+/// Send a [`ForkResponse`] over a Unix socket (no ancillary fds).
+pub(crate) fn send_fork_response(sock: RawFd, response: &ForkResponse) -> Result<(), i32> {
+    let data = response.serialize();
+    send_msg_with_fds(sock, &data, &[])
+}
+
+/// Receive a [`ForkResponse`] from a Unix socket.
+pub(crate) fn recv_fork_response(sock: RawFd) -> Result<ForkResponse, i32> {
+    let mut buf = [0u8; 8];
+    let (n, _fds) = recv_msg_with_fds(sock, &mut buf)?;
+    if n != 8 {
+        return Err(libc::EPROTO);
+    }
+    ForkResponse::deserialize(&buf).map_err(|_| libc::EPROTO)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    fn fork_request_round_trip_minimal() {
+        let req = ForkRequest {
+            stdio: [
+                StdioBinding::Inherit,
+                StdioBinding::DevNull,
+                StdioBinding::Close,
+            ],
+            num_fds: 0,
+            snapshot_fd_idx: 0xFF,
+            ack_fd_idx: 0xFF,
+            result_fd_idx: 0xFF,
+            mux_fd_idx: 0xFF,
+            mux_streams: vec![],
+            pipe_bridges: vec![],
+            local_pipes: vec![],
+        };
+
+        let data = req.serialize();
+        let decoded = ForkRequest::deserialize(&data).expect("deserialize should succeed");
+        assert_eq!(req, decoded);
+    }
+
+    #[test]
+    fn fork_request_round_trip_full() {
+        let req = ForkRequest {
+            stdio: [
+                StdioBinding::FromFdIndex(3),
+                StdioBinding::FromFdIndex(4),
+                StdioBinding::DevNull,
+            ],
+            num_fds: 10,
+            snapshot_fd_idx: 0,
+            ack_fd_idx: 1,
+            result_fd_idx: 2,
+            mux_fd_idx: 3,
+            mux_streams: vec![(100, 5, 0, 1, false), (200, 6, 1, 2, true)],
+            pipe_bridges: vec![(7, 4, true), (8, 5, false)],
+            local_pipes: vec![(10, 11, 0xFF, 0x1234, 0x5678), (20, 21, 6, 0, 0)],
+        };
+
+        let data = req.serialize();
+        let decoded = ForkRequest::deserialize(&data).expect("deserialize should succeed");
+        assert_eq!(req, decoded);
+    }
+
+    #[test]
+    fn fork_request_bad_magic() {
+        let mut data = ForkRequest {
+            stdio: [StdioBinding::Inherit; 3],
+            num_fds: 0,
+            snapshot_fd_idx: 0xFF,
+            ack_fd_idx: 0xFF,
+            result_fd_idx: 0xFF,
+            mux_fd_idx: 0xFF,
+            mux_streams: vec![],
+            pipe_bridges: vec![],
+            local_pipes: vec![],
+        }
+        .serialize();
+
+        data[0] = b'X';
+        assert!(ForkRequest::deserialize(&data).is_err());
+    }
+
+    #[test]
+    fn fork_request_bad_version() {
+        let mut data = ForkRequest {
+            stdio: [StdioBinding::Inherit; 3],
+            num_fds: 0,
+            snapshot_fd_idx: 0xFF,
+            ack_fd_idx: 0xFF,
+            result_fd_idx: 0xFF,
+            mux_fd_idx: 0xFF,
+            mux_streams: vec![],
+            pipe_bridges: vec![],
+            local_pipes: vec![],
+        }
+        .serialize();
+
+        // Set version to 99
+        data[4] = 99;
+        data[5] = 0;
+        assert!(ForkRequest::deserialize(&data).is_err());
+    }
+
+    #[test]
+    fn fork_request_truncated() {
+        assert!(ForkRequest::deserialize(&[]).is_err());
+        assert!(ForkRequest::deserialize(b"LBF").is_err());
+        assert!(ForkRequest::deserialize(b"LBFR\x01").is_err());
+    }
+
+    #[test]
+    fn fork_response_round_trip() {
+        let resp = ForkResponse { child_pid: 12345 };
+        let data = resp.serialize();
+        let decoded = ForkResponse::deserialize(&data).expect("deserialize should succeed");
+        assert_eq!(resp, decoded);
+    }
+
+    #[test]
+    fn fork_response_negative_pid() {
+        let resp = ForkResponse { child_pid: -1 };
+        let data = resp.serialize();
+        let decoded = ForkResponse::deserialize(&data).expect("deserialize should succeed");
+        assert_eq!(resp, decoded);
+        assert_eq!(decoded.child_pid, -1);
+    }
+
+    #[test]
+    fn fork_response_bad_magic() {
+        let data = [b'X', b'B', b'F', b'P', 0, 0, 0, 0];
+        assert!(ForkResponse::deserialize(&data).is_err());
+    }
+
+    #[test]
+    fn stdio_binding_all_variants() {
+        // Test each variant serializes and deserializes correctly.
+        let variants = [
+            StdioBinding::FromFdIndex(0),
+            StdioBinding::FromFdIndex(42),
+            StdioBinding::FromFdIndex(255),
+            StdioBinding::DevNull,
+            StdioBinding::Close,
+            StdioBinding::Inherit,
+        ];
+
+        for &variant in &variants {
+            let mut buf = Vec::new();
+            variant.serialize(&mut buf);
+            let mut pos = 0;
+            let decoded =
+                StdioBinding::deserialize(&buf, &mut pos).expect("deserialize should succeed");
+            assert_eq!(variant, decoded);
+            assert_eq!(pos, buf.len());
+        }
+    }
+
+    #[test]
+    fn fork_request_large_collections() {
+        let req = ForkRequest {
+            stdio: [
+                StdioBinding::FromFdIndex(1),
+                StdioBinding::Close,
+                StdioBinding::Inherit,
+            ],
+            num_fds: 64,
+            snapshot_fd_idx: 0,
+            ack_fd_idx: 1,
+            result_fd_idx: 2,
+            mux_fd_idx: 3,
+            mux_streams: (0..20)
+                .map(|i| (i, i as usize * 10, (i % 2) as u8, (i % 3) as u8, i % 2 == 0))
+                .collect(),
+            pipe_bridges: (0..10)
+                .map(|i| (i as usize * 5, i as u8, i % 2 == 0))
+                .collect(),
+            local_pipes: (0..5)
+                .map(|i| (i as usize, i as usize + 100, i as u8, i * 0x100, i * 0x200))
+                .collect(),
+        };
+
+        let data = req.serialize();
+        let decoded = ForkRequest::deserialize(&data).expect("deserialize should succeed");
+        assert_eq!(req, decoded);
+    }
+
+    #[test]
+    fn scm_rights_send_recv_via_socketpair() {
+        // Create a socketpair and test sending/receiving ForkRequest + fds.
+        let mut sv = [0i32; 2];
+        let ret = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                0,
+                sv.as_mut_ptr(),
+            )
+        };
+        assert_eq!(ret, 0, "socketpair failed");
+
+        let sock_a = unsafe { OwnedFd::from_raw_fd(sv[0]) };
+        let sock_b = unsafe { OwnedFd::from_raw_fd(sv[1]) };
+
+        let req = ForkRequest {
+            stdio: [
+                StdioBinding::Inherit,
+                StdioBinding::DevNull,
+                StdioBinding::Close,
+            ],
+            num_fds: 2,
+            snapshot_fd_idx: 0,
+            ack_fd_idx: 1,
+            result_fd_idx: 0xFF,
+            mux_fd_idx: 0xFF,
+            mux_streams: vec![(1, 3, 0, 1, false)],
+            pipe_bridges: vec![],
+            local_pipes: vec![],
+        };
+
+        // Create two pipes to use as test fds to send.
+        let mut pipe_fds = [0i32; 2];
+        let ret = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
+        assert_eq!(ret, 0, "pipe failed");
+
+        // Send the request with the pipe fds.
+        send_fork_request(sock_a.as_raw_fd(), &req, &pipe_fds).expect("send should succeed");
+
+        // Close our copies of the pipe fds (they've been sent).
+        unsafe {
+            libc::close(pipe_fds[0]);
+            libc::close(pipe_fds[1]);
+        }
+
+        // Receive on the other end.
+        let (decoded_req, received_fds) =
+            recv_fork_request(sock_b.as_raw_fd()).expect("recv should succeed");
+
+        assert_eq!(req, decoded_req);
+        assert_eq!(received_fds.len(), 2);
+    }
+
+    #[test]
+    fn scm_rights_fork_response_round_trip() {
+        let mut sv = [0i32; 2];
+        let ret = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                0,
+                sv.as_mut_ptr(),
+            )
+        };
+        assert_eq!(ret, 0, "socketpair failed");
+
+        let sock_a = unsafe { OwnedFd::from_raw_fd(sv[0]) };
+        let sock_b = unsafe { OwnedFd::from_raw_fd(sv[1]) };
+
+        let resp = ForkResponse { child_pid: 42 };
+        send_fork_response(sock_a.as_raw_fd(), &resp).expect("send should succeed");
+
+        let decoded = recv_fork_response(sock_b.as_raw_fd()).expect("recv should succeed");
+        assert_eq!(resp, decoded);
+    }
+}
