@@ -27,21 +27,21 @@ use litebox_platform_multiplex::Platform;
 /// not backed by a dedicated litebox core subsystem (like NtFS for files or
 /// Network for sockets) are stored as entries of this subsystem in the shared
 /// [`litebox::fd::Descriptors`] table.
-pub struct NtObjectSubsystem;
+pub struct NtObjectSubsystem<FS: crate::NtShimFS>(core::marker::PhantomData<FS>);
 
-impl litebox::fd::FdEnabledSubsystem for NtObjectSubsystem {
-    type Entry = NtObjectEntry;
+impl<FS: crate::NtShimFS> litebox::fd::FdEnabledSubsystem for NtObjectSubsystem<FS> {
+    type Entry = NtObjectEntry<FS>;
 }
 
 /// A descriptor-table entry wrapping an [`NtObject`].
 ///
 /// Implements [`FdEnabledSubsystemEntry`] with custom `on_dup`/`on_close`
 /// hooks for reference-counted objects (pipes, etc.).
-pub struct NtObjectEntry {
-    pub object: NtObject,
+pub struct NtObjectEntry<FS: crate::NtShimFS> {
+    pub object: NtObject<FS>,
 }
 
-impl litebox::fd::FdEnabledSubsystemEntry for NtObjectEntry {
+impl<FS: crate::NtShimFS> litebox::fd::FdEnabledSubsystemEntry for NtObjectEntry<FS> {
     fn on_dup(&self) {
         // Not used — HandleTable::duplicate() uses clone_nt_object() + insert()
         // instead of Descriptors::duplicate(), so this hook is never called.
@@ -73,13 +73,13 @@ impl litebox::fd::FdEnabledSubsystemEntry for NtObjectEntry {
     }
 }
 
-impl From<NtObject> for NtObjectEntry {
-    fn from(object: NtObject) -> Self {
+impl<FS: crate::NtShimFS> From<NtObject<FS>> for NtObjectEntry<FS> {
+    fn from(object: NtObject<FS>) -> Self {
         Self { object }
     }
 }
 
-impl NtObjectEntry {
+impl<FS: crate::NtShimFS> NtObjectEntry<FS> {
     /// Post-close cleanup that runs AFTER the `Descriptors` write lock is
     /// released (i.e., after `Descriptors::remove()` returns).
     ///
@@ -155,7 +155,7 @@ impl NtObjectEntry {
 }
 
 /// Type alias for the typed fd handle to an NT object in the descriptor table.
-pub type NtObjectFd = litebox::fd::TypedFd<NtObjectSubsystem>;
+pub type NtObjectFd<FS: crate::NtShimFS> = litebox::fd::TypedFd<NtObjectSubsystem<FS>>;
 
 /// Type alias for thread wakers used by sync object waiters.
 type SyncWaker = litebox::event::wait::Waker<Platform>;
@@ -171,7 +171,7 @@ const HANDLE_STEP: u32 = 4;
 pub type SharedFilePosition = Arc<core::sync::atomic::AtomicU64>;
 
 /// An NT kernel object.
-pub enum NtObject {
+pub enum NtObject<FS: crate::NtShimFS> {
     /// Console input stream (stdin).
     ConsoleInput,
     /// Console output stream (stdout or stderr).
@@ -192,12 +192,12 @@ pub enum NtObject {
         /// VFS file descriptor from the litebox core's Descriptors table.
         /// Shared via `Arc` across duplicated handles — only the last close
         /// actually calls `fs.close()` (detected via `Arc::try_unwrap()`).
-        vfs_fd: alloc::sync::Arc<litebox::fd::TypedFd<crate::NtFS>>,
+        vfs_fd: alloc::sync::Arc<litebox::fd::TypedFd<FS>>,
         /// When true, the file is deleted from the VFS when the last handle
         /// is closed (Windows `FILE_DELETE_ON_CLOSE` / `FileDispositionInformation`).
         delete_on_close: Arc<core::sync::atomic::AtomicBool>,
         /// Reference to the filesystem for close/unlink in `cleanup_after_close()`.
-        fs: alloc::sync::Arc<crate::NtFS>,
+        fs: alloc::sync::Arc<FS>,
     },
     /// A directory opened via NtCreateFile.
     Directory {
@@ -1960,20 +1960,21 @@ pub struct DirEnumEntry {
 /// Thread-safety: The handle table itself is not internally synchronized.
 /// The shim wraps it in a `Mutex` for multi-threaded access (Phase 3+).
 /// The underlying `Descriptors` table uses interior `RwLock`s.
-pub struct HandleTable {
+pub struct HandleTable<FS: crate::NtShimFS> {
     /// Maps raw NT handle values (as `usize`) to typed fds in the Descriptors table.
     raw_store: RawDescriptorStorage,
     /// Next handle value to allocate.
     next_handle: u32,
     /// Shared LiteBox instance providing access to the `Descriptors` table.
     litebox: LiteBox<Platform>,
+    _fs: core::marker::PhantomData<FS>,
 }
 
 /// Clone an `NtObject` for handle duplication.
 ///
 /// Returns `None` for variants that cannot be trivially duplicated (e.g.
 /// `Socket`, whose core `SocketFd` is not `Clone`).
-pub fn clone_nt_object(obj: &NtObject) -> Option<NtObject> {
+pub fn clone_nt_object<FS: crate::NtShimFS>(obj: &NtObject<FS>) -> Option<NtObject<FS>> {
     Some(match obj {
         NtObject::ConsoleInput => NtObject::ConsoleInput,
         NtObject::ConsoleOutput { is_stderr } => NtObject::ConsoleOutput {
@@ -2076,13 +2077,14 @@ pub fn clone_nt_object(obj: &NtObject) -> Option<NtObject> {
     })
 }
 
-impl HandleTable {
+impl<FS: crate::NtShimFS> HandleTable<FS> {
     /// Create a new empty handle table backed by the given `LiteBox`.
     pub fn new(litebox: LiteBox<Platform>) -> Self {
         Self {
             raw_store: RawDescriptorStorage::new(),
             next_handle: FIRST_HANDLE,
             litebox,
+            _fs: core::marker::PhantomData,
         }
     }
 
@@ -2101,7 +2103,7 @@ impl HandleTable {
     ///
     /// Inserts the object into the shared `Descriptors` table and maps the
     /// new handle value in the local `RawDescriptorStorage`.
-    pub fn insert(&mut self, object: NtObject) -> u32 {
+    pub fn insert(&mut self, object: NtObject<FS>) -> u32 {
         let handle = self.next_handle;
         self.next_handle += HANDLE_STEP;
 
@@ -2110,7 +2112,7 @@ impl HandleTable {
         let typed_fd = self
             .litebox
             .descriptor_table_mut()
-            .insert::<NtObjectSubsystem>(entry);
+            .insert::<NtObjectSubsystem<FS>>(entry);
 
         // Map the handle value to the typed fd.
         let ok = self
@@ -2125,10 +2127,10 @@ impl HandleTable {
     ///
     /// Returns `None` if the handle doesn't exist. Masks off the low 2 flag
     /// bits (protect-from-close / inherit) before lookup.
-    pub fn get_fd(&self, handle: u32) -> Option<Arc<NtObjectFd>> {
+    pub fn get_fd(&self, handle: u32) -> Option<Arc<NtObjectFd<FS>>> {
         let slot = (handle & !3u32) as usize;
         self.raw_store
-            .fd_from_raw_integer::<NtObjectSubsystem>(slot)
+            .fd_from_raw_integer::<NtObjectSubsystem<FS>>(slot)
             .ok()
     }
 
@@ -2138,12 +2140,12 @@ impl HandleTable {
     /// Returns `None` if the handle doesn't exist.
     pub fn with<F, R>(&self, handle: u32, f: F) -> Option<R>
     where
-        F: FnOnce(&NtObjectEntry) -> R,
+        F: FnOnce(&NtObjectEntry<FS>) -> R,
     {
         let fd = self.get_fd(handle)?;
         self.litebox
             .descriptor_table()
-            .with_entry::<NtObjectSubsystem, _, _>(&fd, f)
+            .with_entry::<NtObjectSubsystem<FS>, _, _>(&fd, f)
     }
 
     /// Access an object by handle (mutable).
@@ -2152,12 +2154,12 @@ impl HandleTable {
     /// Returns `None` if the handle doesn't exist.
     pub fn with_mut<F, R>(&self, handle: u32, f: F) -> Option<R>
     where
-        F: FnOnce(&mut NtObjectEntry) -> R,
+        F: FnOnce(&mut NtObjectEntry<FS>) -> R,
     {
         let fd = self.get_fd(handle)?;
         self.litebox
             .descriptor_table()
-            .with_entry_mut::<NtObjectSubsystem, _, _>(&fd, f)
+            .with_entry_mut::<NtObjectSubsystem<FS>, _, _>(&fd, f)
     }
 
     /// Close a handle, removing the object from the descriptor table.
@@ -2172,7 +2174,7 @@ impl HandleTable {
         let slot = (handle & !3u32) as usize;
         let fd = match self
             .raw_store
-            .fd_consume_raw_integer::<NtObjectSubsystem>(slot)
+            .fd_consume_raw_integer::<NtObjectSubsystem<FS>>(slot)
         {
             Ok(fd) => fd,
             Err(_) => return false,
@@ -2181,7 +2183,7 @@ impl HandleTable {
         let entry = self
             .litebox
             .descriptor_table_mut()
-            .remove::<NtObjectSubsystem>(&fd);
+            .remove::<NtObjectSubsystem<FS>>(&fd);
         // cleanup_after_close() runs outside the lock (fs.close, net.close).
         if let Some(entry) = entry {
             entry.cleanup_after_close();
@@ -2216,7 +2218,7 @@ impl HandleTable {
     /// Iterate all live handles, calling `f` for each.
     pub fn for_each<F>(&self, mut f: F)
     where
-        F: FnMut(u32, &NtObjectEntry),
+        F: FnMut(u32, &NtObjectEntry<FS>),
     {
         for slot in self.raw_store.iter_alive() {
             let handle = slot as u32;
@@ -2224,7 +2226,7 @@ impl HandleTable {
             if let Some(fd) = fd {
                 self.litebox
                     .descriptor_table()
-                    .with_entry::<NtObjectSubsystem, _, _>(&fd, |entry| {
+                    .with_entry::<NtObjectSubsystem<FS>, _, _>(&fd, |entry| {
                         f(handle, entry);
                     });
             }

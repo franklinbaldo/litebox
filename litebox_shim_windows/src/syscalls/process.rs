@@ -140,8 +140,8 @@ impl PeMemoryMapper for ChildPmMapper<'_> {
 /// Creates a new address space, loads ntdll + the child EXE, builds PEB/TEB,
 /// seeds the loader data structures, creates a child NtSharedState with
 /// inherited pipe handles, and spawns a host thread to run the child.
-pub(crate) fn spawn_child_process(
-    parent_shared: &Arc<NtSharedState>,
+pub(crate) fn spawn_child_process<FS: crate::NtShimFS>(
+    parent_shared: &Arc<NtSharedState<FS>>,
     exe_path_nt: &str,
     command_line: &str,
     stdin_pipe: Option<Arc<PipeBuffer>>,
@@ -325,7 +325,7 @@ pub(crate) fn spawn_child_process(
     let vfs_path = nt_path_to_vfs_path(exe_path_nt);
     let fs = parent_shared.fs.get().ok_or(0xC000_0001u32 as i32)?;
 
-    let exe_data = read_vfs_file(fs, &vfs_path).map_err(|_| 0xC000_0034u32 as i32)?; // STATUS_OBJECT_NAME_NOT_FOUND
+    let exe_data = read_vfs_file(&**fs, &vfs_path).map_err(|_| 0xC000_0034u32 as i32)?; // STATUS_OBJECT_NAME_NOT_FOUND
 
     let exe_parsed = PeParsedFile::parse(&exe_data).map_err(|_| 0xC000_0001u32 as i32)?;
 
@@ -926,8 +926,8 @@ pub(crate) fn spawn_child_process(
 /// Carries the child process's shim, init state, and cleanup info.
 /// Used with `platform.spawn_thread()` to start the child process's
 /// main thread following the same pattern as `NtChildThreadInit` in thread.rs.
-struct NtChildProcessInit {
-    child_shim: crate::NtShimEntrypoints,
+struct NtChildProcessInit<FS: crate::NtShimFS> {
+    child_shim: crate::NtShimEntrypoints<FS>,
     child_teb_va: usize,
     guest_va_start: usize,
     guest_va_end: usize,
@@ -937,9 +937,9 @@ struct NtChildProcessInit {
 
 // Safety: All fields are Send — NtShimEntrypoints fields are Mutex/Arc/Atomic,
 // ProcessObject is Arc-wrapped, NtInitState contains owned String/Vec.
-unsafe impl Send for NtChildProcessInit {}
+unsafe impl<FS: crate::NtShimFS> Send for NtChildProcessInit<FS> {}
 
-impl litebox::shim::InitThread for NtChildProcessInit {
+impl<FS: crate::NtShimFS> litebox::shim::InitThread for NtChildProcessInit<FS> {
     type ExecutionContext = litebox_common_linux::ExecutionContext;
 
     fn init(
@@ -979,12 +979,12 @@ impl litebox::shim::InitThread for NtChildProcessInit {
 ///
 /// When the child process terminates, `thread_terminated()` sets the exit code
 /// on the `ProcessObject` so the parent can observe it via NtWaitForSingleObject.
-struct ChildProcessShim {
-    inner: crate::NtShimEntrypoints,
+struct ChildProcessShim<FS: crate::NtShimFS> {
+    inner: crate::NtShimEntrypoints<FS>,
     process_obj: Arc<ProcessObject>,
 }
 
-impl litebox::shim::EnterShim for ChildProcessShim {
+impl<FS: crate::NtShimFS> litebox::shim::EnterShim for ChildProcessShim<FS> {
     type ExecutionContext = litebox_common_linux::ExecutionContext;
 
     fn init(&self, ctx: &mut Self::ExecutionContext) -> litebox::shim::ContinueOperation {
@@ -1276,7 +1276,7 @@ fn nt_path_to_vfs_path(nt_path: &str) -> alloc::string::String {
 }
 
 /// Read a file from VFS into a Vec<u8>.
-fn read_vfs_file(fs: &crate::NtFS, path: &str) -> Result<Vec<u8>, i32> {
+fn read_vfs_file<FS: crate::NtShimFS>(fs: &FS, path: &str) -> Result<Vec<u8>, i32> {
     use litebox::fs::FileSystem as _;
 
     let fd = fs

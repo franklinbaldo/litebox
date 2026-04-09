@@ -69,8 +69,8 @@ impl NtSyscallArgs {
 }
 
 /// NtClose — close a handle.
-pub(crate) fn nt_close(
-    handles: &mut HandleTable,
+pub(crate) fn nt_close<FS: crate::NtShimFS>(
+    handles: &mut HandleTable<FS>,
     handle: u32,
 ) -> NtStatus {
     if handles.close(handle) {

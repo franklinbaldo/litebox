@@ -44,10 +44,10 @@ const SEC_IMAGE: u32 = 0x0100_0000;
 ///
 /// For SEC_IMAGE sections, we read the PE data from the file handle,
 /// parse it, and store the parsed info in a Section handle.
-pub(crate) fn nt_create_section(
+pub(crate) fn nt_create_section<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    handles: &mut HandleTable,
-    shared: &crate::NtSharedState,
+    handles: &mut HandleTable<FS>,
+    shared: &crate::NtSharedState<FS>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let section_handle_ptr = args.arg0;
@@ -189,8 +189,8 @@ pub(crate) fn nt_create_section(
     NtStatus::STATUS_SUCCESS
 }
 
-pub(crate) fn open_csr_shared_section(
-    handles: &mut HandleTable,
+pub(crate) fn open_csr_shared_section<FS: crate::NtShimFS>(
+    handles: &mut HandleTable<FS>,
     section_handle_ptr: usize,
 ) -> NtStatus {
     let handle = handles.insert(NtObject::Stub {
@@ -204,10 +204,10 @@ pub(crate) fn open_csr_shared_section(
 }
 
 /// Read the full PE data from a file handle (VFS-backed).
-fn read_pe_from_handle(
-    handles: &HandleTable,
+fn read_pe_from_handle<FS: crate::NtShimFS>(
+    handles: &HandleTable<FS>,
     file_handle: u32,
-    shared: &crate::NtSharedState,
+    shared: &crate::NtSharedState<FS>,
 ) -> Option<(Vec<u8>, Option<alloc::string::String>)> {
     let (vfs_fd, path) = handles
         .with(file_handle, |entry| match &entry.object {
@@ -315,10 +315,10 @@ fn normalize_module_path(
 ///
 /// For SEC_IMAGE sections, we map the PE into guest memory using the
 /// page manager, applying relocations as needed.
-pub(crate) fn nt_map_view_of_section(
+pub(crate) fn nt_map_view_of_section<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    handles: &HandleTable,
-    shim_shared: &crate::NtSharedState,
+    handles: &HandleTable<FS>,
+    shim_shared: &crate::NtSharedState<FS>,
     init_state: Option<&NtInitState>,
 ) -> NtStatus {
     let process_state = &shim_shared.process_state;
@@ -471,10 +471,10 @@ pub(crate) fn nt_map_view_of_section(
 /// remaining stack parameters shift down by one slot. Parsing it with the
 /// legacy layout corrupts the view-size pointer the guest loader / segment
 /// heap relies on.
-pub(crate) fn nt_map_view_of_section_ex(
+pub(crate) fn nt_map_view_of_section_ex<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    handles: &HandleTable,
-    shim_shared: &crate::NtSharedState,
+    handles: &HandleTable<FS>,
+    shim_shared: &crate::NtSharedState<FS>,
     init_state: Option<&NtInitState>,
 ) -> NtStatus {
     let process_state = &shim_shared.process_state;
@@ -696,9 +696,9 @@ pub(crate) fn map_data_section_pages(
 }
 
 /// Map an image section (SEC_IMAGE PE) into guest address space.
-fn map_image_section(
+fn map_image_section<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    shim_shared: &crate::NtSharedState,
+    shim_shared: &crate::NtSharedState<FS>,
     process_state: &Arc<NtProcessState>,
     init_state: Option<&NtInitState>,
     base_addr_ptr: usize,
@@ -1323,9 +1323,9 @@ impl PeMemoryMapper for PmMapper<'_> {
 ///     PSIZE_T ReturnLength                   // [rsp+0x28]
 /// );
 /// ```
-pub(crate) fn nt_query_section(
+pub(crate) fn nt_query_section<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    handles: &HandleTable,
+    handles: &HandleTable<FS>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let section_handle = args.arg0 as u32;

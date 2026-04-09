@@ -38,9 +38,9 @@ use super::NtSyscallArgs;
 /// NtCreateKeyedEvent(OUT PHANDLE, IN ACCESS_MASK, IN POBJECT_ATTRIBUTES, IN ULONG)
 ///
 /// Creates a keyed event object. Returns the handle in *arg0.
-pub(crate) fn nt_create_keyed_event(
+pub(crate) fn nt_create_keyed_event<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    handles: &mut HandleTable,
+    handles: &mut HandleTable<FS>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let handle_out_va = args.arg0;
@@ -66,8 +66,8 @@ pub(crate) fn nt_create_keyed_event(
 // ---------------------------------------------------------------------------
 
 /// Look up a keyed event object by handle. Returns the Arc if found.
-pub(crate) fn lookup_keyed_event(
-    handles: &HandleTable,
+pub(crate) fn lookup_keyed_event<FS: crate::NtShimFS>(
+    handles: &HandleTable<FS>,
     handle: u32,
 ) -> Option<Arc<KeyedEventObject>> {
     handles
@@ -79,9 +79,9 @@ pub(crate) fn lookup_keyed_event(
 }
 
 /// Create an I/O completion port and return its handle.
-pub(crate) fn nt_create_io_completion(
+pub(crate) fn nt_create_io_completion<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    handles: &mut HandleTable,
+    handles: &mut HandleTable<FS>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let handle_out_va = args.arg0;
@@ -96,8 +96,8 @@ pub(crate) fn nt_create_io_completion(
 }
 
 /// Look up an I/O completion port by handle.
-pub(crate) fn lookup_io_completion(
-    handles: &HandleTable,
+pub(crate) fn lookup_io_completion<FS: crate::NtShimFS>(
+    handles: &HandleTable<FS>,
     handle: u32,
 ) -> Option<Arc<IoCompletionObject>> {
     handles
@@ -109,9 +109,9 @@ pub(crate) fn lookup_io_completion(
 }
 
 /// Queue a completion packet via NtSetIoCompletion.
-pub(crate) fn nt_set_io_completion(
+pub(crate) fn nt_set_io_completion<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    handles: &HandleTable,
+    handles: &HandleTable<FS>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let Some(port) = lookup_io_completion(handles, args.arg0 as u32) else {
@@ -129,9 +129,9 @@ pub(crate) fn nt_set_io_completion(
 }
 
 /// Queue a completion packet via NtSetIoCompletionEx.
-pub(crate) fn nt_set_io_completion_ex(
+pub(crate) fn nt_set_io_completion_ex<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    handles: &HandleTable,
+    handles: &HandleTable<FS>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let Some(port) = lookup_io_completion(handles, args.arg0 as u32) else {
@@ -521,7 +521,10 @@ pub(crate) enum Waitable {
 }
 
 /// Look up a waitable object by handle. Returns the typed Arc if found.
-pub(crate) fn lookup_waitable(handles: &HandleTable, handle: u32) -> Option<Waitable> {
+pub(crate) fn lookup_waitable<FS: crate::NtShimFS>(
+    handles: &HandleTable<FS>,
+    handle: u32,
+) -> Option<Waitable> {
     handles
         .with(handle, |entry| match &entry.object {
             NtObject::Event(e) => Some(Waitable::Event(Arc::clone(e))),
@@ -862,9 +865,9 @@ pub(crate) fn release_keyed_event(
 
 /// NtCreateEvent(OUT PHANDLE, IN ACCESS_MASK, IN POBJECT_ATTRIBUTES,
 ///               IN EVENT_TYPE, IN BOOLEAN InitialState)
-pub(crate) fn nt_create_event(
+pub(crate) fn nt_create_event<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    handles: &mut HandleTable,
+    handles: &mut HandleTable<FS>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let handle_out_va = args.arg0;
@@ -905,9 +908,9 @@ pub(crate) fn nt_create_event(
 // ---------------------------------------------------------------------------
 
 /// NtSetEvent(IN HANDLE, OUT PLONG PreviousState OPTIONAL)
-pub(crate) fn nt_set_event(
+pub(crate) fn nt_set_event<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    handles: &HandleTable,
+    handles: &HandleTable<FS>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let handle = args.arg0 as u32;
@@ -940,9 +943,9 @@ pub(crate) fn nt_set_event(
 // ---------------------------------------------------------------------------
 
 /// NtResetEvent(IN HANDLE, OUT PLONG PreviousState OPTIONAL)
-pub(crate) fn nt_reset_event(
+pub(crate) fn nt_reset_event<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    handles: &HandleTable,
+    handles: &HandleTable<FS>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let handle = args.arg0 as u32;
@@ -968,9 +971,9 @@ pub(crate) fn nt_reset_event(
 }
 
 /// NtClearEvent(IN HANDLE) — same as NtResetEvent without previous state output.
-pub(crate) fn nt_clear_event(
+pub(crate) fn nt_clear_event<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    handles: &HandleTable,
+    handles: &HandleTable<FS>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let handle = args.arg0 as u32;
@@ -995,9 +998,9 @@ pub(crate) fn nt_clear_event(
 
 /// NtCreateSemaphore(OUT PHANDLE, IN ACCESS_MASK, IN POBJECT_ATTRIBUTES,
 ///                   IN LONG InitialCount, IN LONG MaximumCount)
-pub(crate) fn nt_create_semaphore(
+pub(crate) fn nt_create_semaphore<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    handles: &mut HandleTable,
+    handles: &mut HandleTable<FS>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let handle_out_va = args.arg0;
@@ -1025,9 +1028,9 @@ pub(crate) fn nt_create_semaphore(
 }
 
 /// NtReleaseSemaphore(IN HANDLE, IN LONG ReleaseCount, OUT PLONG PreviousCount OPTIONAL)
-pub(crate) fn nt_release_semaphore(
+pub(crate) fn nt_release_semaphore<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    handles: &HandleTable,
+    handles: &HandleTable<FS>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let handle = args.arg0 as u32;
@@ -1135,9 +1138,9 @@ pub(crate) fn wait_thread_with_timeout(
 /// NtAlertThreadByThreadIdEx with a matching lock address. Plain alerts behave
 /// like a per-thread wildcard wake, while Ex alerts are keyed by the supplied
 /// address.
-pub(crate) fn nt_wait_for_alert_by_thread_id(
+pub(crate) fn nt_wait_for_alert_by_thread_id<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    shared: &crate::NtSharedState,
+    shared: &crate::NtSharedState<FS>,
     thread: &Arc<ThreadObject>,
     wait_cx: &WaitContext<'_, Platform>,
 ) -> NtStatus {
@@ -1237,9 +1240,9 @@ pub(crate) fn nt_wait_for_alert_by_thread_id(
 ///
 /// Takes &Mutex<HandleTable> so it can lock/unlock between poll iterations.
 /// Returns STATUS_WAIT_0 + index (for WaitAny) or STATUS_SUCCESS (for WaitAll).
-pub(crate) fn nt_wait_for_multiple_objects(
+pub(crate) fn nt_wait_for_multiple_objects<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    handles_mutex: &spin::Mutex<HandleTable>,
+    handles_mutex: &spin::Mutex<HandleTable<FS>>,
     wait_cx: &WaitContext<'_, Platform>,
     current_thread_id: u32,
     current_thread: Option<&Arc<ThreadObject>>,

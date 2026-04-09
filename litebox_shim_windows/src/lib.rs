@@ -365,9 +365,9 @@ fn read_object_attributes_root_directory(obj_attrs_ptr: usize) -> Option<u32> {
     Some(try_read_guest_value_unaligned::<u64>(obj_attrs_ptr + 0x08)? as u32)
 }
 
-fn resolve_object_attributes_name(
+fn resolve_object_attributes_name<FS: NtShimFS>(
     obj_attrs_ptr: usize,
-    handles: &handle_table::HandleTable,
+    handles: &handle_table::HandleTable<FS>,
 ) -> alloc::string::String {
     let name = read_object_attributes_name(obj_attrs_ptr).unwrap_or_default();
     if name.is_empty() || name.starts_with('\\') {
@@ -524,10 +524,10 @@ mod tests {
     }
 }
 
-pub(crate) fn duplicated_pseudo_handle_object(
+pub(crate) fn duplicated_pseudo_handle_object<FS: NtShimFS>(
     source_handle: u32,
     current_thread: Option<&alloc::sync::Arc<handle_table::ThreadObject>>,
-) -> Option<handle_table::NtObject> {
+) -> Option<handle_table::NtObject<FS>> {
     match source_handle {
         0xFFFF_FFFF => Some(handle_table::NtObject::CurrentProcess),
         0xFFFF_FFFE => Some(match current_thread {
@@ -871,8 +871,8 @@ fn enumerate_hardcoded_value_names(key_path: &str) -> alloc::vec::Vec<&'static s
 
 /// Look up a registry value, checking VFS-backed registry first, then
 /// falling back to the hardcoded table.
-fn lookup_registry_value(
-    shared: &NtSharedState,
+fn lookup_registry_value<FS: NtShimFS>(
+    shared: &NtSharedState<FS>,
     key_path: &str,
     value_name: &str,
 ) -> Option<(u32, alloc::vec::Vec<u8>)> {
@@ -889,9 +889,19 @@ fn lookup_registry_value(
     lookup_registry_value_bytes(key_path, value_name)
 }
 
-/// Concrete layered filesystem type used by the NT shim.
+/// Trait alias for filesystem types usable with the NT shim.
+///
+/// Mirrors the Linux shim's `ShimFS`: any `FileSystem` implementation that
+/// is thread-safe and `'static` qualifies automatically via the blanket impl.
+pub trait NtShimFS: litebox::fs::FileSystem + Send + Sync + 'static {}
+impl<T: litebox::fs::FileSystem + Send + Sync + 'static> NtShimFS for T {}
+
+/// Default layered filesystem type used when no 9P broker is configured.
 /// Same architecture as the Linux shim: in-memory (writable) on top of
 /// devices on top of tar read-only.
+///
+/// When a 9P broker is used the runner wraps this in an additional
+/// `layered(NtFS, nine_p)` layer and passes that as the `FS` parameter.
 pub type NtFS = litebox::fs::layered::FileSystem<
     Platform,
     litebox::fs::in_mem::FileSystem<Platform>,
@@ -2043,7 +2053,7 @@ struct PendingApcDelivery {
 /// Each platform thread gets its own instance. Thread-local state (e.g., the
 /// current TEB address) is stored here. Process-wide state is accessed through
 /// the shared `shared` reference (an `Arc<NtSharedState>`).
-pub struct NtShimEntrypoints {
+pub struct NtShimEntrypoints<FS: NtShimFS> {
     /// Exit code set by NtTerminateProcess. The runner reads this after
     /// `run_thread` returns to propagate the guest exit status.
     exit_code: AtomicI32,
@@ -2089,11 +2099,11 @@ pub struct NtShimEntrypoints {
     /// next pending APC or restores the saved context and returns.
     pending_apc_state: core::cell::UnsafeCell<Option<PendingApcDelivery>>,
     /// Process-wide shared state (handles, env, CWD, etc.).
-    shared: alloc::sync::Arc<NtSharedState>,
+    shared: alloc::sync::Arc<NtSharedState<FS>>,
 }
 
 /// Process-wide state shared by all threads via `Arc`.
-pub(crate) struct NtSharedState {
+pub(crate) struct NtSharedState<FS: NtShimFS> {
     /// LiteBox instance for creating child-process PageManagers.
     /// Each child process needs its own PageManager with its own VA partition
     /// so it gets a private heap/ntdll, avoiding TEB corruption on exit.
@@ -2102,7 +2112,7 @@ pub(crate) struct NtSharedState {
     /// Populated by the runner via `set_ntdll_boot_data()` after loading ntdll.
     pub ntdll_boot_data: spin::Once<alloc::sync::Arc<NtdllBootData>>,
     /// NT object handle table.
-    pub handles: Mutex<handle_table::HandleTable>,
+    pub handles: Mutex<handle_table::HandleTable<FS>>,
     /// Pre-allocated stdio handle values for GetStdHandle dispatch.
     pub stdin_handle: u32,
     pub stdout_handle: u32,
@@ -2185,7 +2195,7 @@ pub(crate) struct NtSharedState {
     /// Next RegisterWindowMessage ID (starts at 0xC000).
     pub next_registered_msg_id: AtomicU32,
     /// Litebox core VFS for file I/O.
-    pub fs: spin::Once<alloc::sync::Arc<NtFS>>,
+    pub fs: spin::Once<alloc::sync::Arc<FS>>,
     /// Guest address space VA range (start..end) for pointer validation.
     pub guest_va_start: core::sync::atomic::AtomicUsize,
     pub guest_va_end: core::sync::atomic::AtomicUsize,
@@ -2324,11 +2334,11 @@ fn push_recent_vm_teardown(
 /// while `run_thread_ref` is blocking.  Clones the process-wide shared
 /// state Arc so it remains valid even after the main shim reference is
 /// consumed.
-pub struct ProcessDiagnostics {
-    shared: alloc::sync::Arc<NtSharedState>,
+pub struct ProcessDiagnostics<FS: NtShimFS> {
+    shared: alloc::sync::Arc<NtSharedState<FS>>,
 }
 
-impl ProcessDiagnostics {
+impl<FS: NtShimFS> ProcessDiagnostics<FS> {
     /// Number of child threads currently alive.
     pub fn live_child_count(&self) -> u32 {
         self.shared
@@ -2795,9 +2805,9 @@ pub struct DynamicFunctionTable {
     pub base_address: usize,
 }
 
-fn resolve_process_tls_thread_teb(
+fn resolve_process_tls_thread_teb<FS: NtShimFS>(
     threads: &alloc::collections::BTreeMap<u32, alloc::sync::Arc<handle_table::ThreadObject>>,
-    handles: &handle_table::HandleTable,
+    handles: &handle_table::HandleTable<FS>,
     current_thread_id: u32,
     current_teb_va: usize,
     thread_ref: u64,
@@ -2838,7 +2848,7 @@ fn resolve_process_tls_thread_teb(
     if thread_count == 1 { current_teb_va } else { 0 }
 }
 
-impl NtShimEntrypoints {
+impl<FS: NtShimFS> NtShimEntrypoints<FS> {
     /// Create a new NT shim entrypoints for the initial thread.
     #[must_use]
     pub fn new(
@@ -2958,7 +2968,7 @@ impl NtShimEntrypoints {
     }
 
     /// Install the litebox core VFS for file I/O.
-    pub fn set_fs(&self, fs: alloc::sync::Arc<NtFS>) {
+    pub fn set_fs(&self, fs: alloc::sync::Arc<FS>) {
         let _ = self.shared.fs.call_once(|| fs);
     }
 
@@ -3273,7 +3283,7 @@ impl NtShimEntrypoints {
     /// and RDX=ntdll_base.  Otherwise it falls back to RtlUserThreadStart
     /// or the start routine directly.
     fn new_for_child_thread(
-        shared: alloc::sync::Arc<NtSharedState>,
+        shared: alloc::sync::Arc<NtSharedState<FS>>,
         thread_obj: alloc::sync::Arc<handle_table::ThreadObject>,
         thread_id: u32,
         parent_init: &NtInitState,
@@ -3337,7 +3347,7 @@ impl NtShimEntrypoints {
     /// `NtSharedState` (separate from the parent's). The child process runs
     /// in its own address space with its own handle table.
     pub(crate) fn new_for_child_process(
-        shared: alloc::sync::Arc<NtSharedState>,
+        shared: alloc::sync::Arc<NtSharedState<FS>>,
         thread_id: u32,
         teb_va: usize,
     ) -> Self {
@@ -3479,7 +3489,7 @@ impl NtShimEntrypoints {
 
     /// Creates a thread-safe diagnostic handle that can be shared with a
     /// watchdog thread while the main thread is inside `run_thread_ref`.
-    pub fn diagnostics(&self) -> ProcessDiagnostics {
+    pub fn diagnostics(&self) -> ProcessDiagnostics<FS> {
         ProcessDiagnostics {
             shared: alloc::sync::Arc::clone(&self.shared),
         }
@@ -5368,12 +5378,12 @@ impl NtShimEntrypoints {
                 let file_handle = args.arg0 as u32;
 
                 // Snapshot handle info under lock, drop before I/O.
-                enum NtWriteTarget {
+                enum NtWriteTarget<FS: NtShimFS> {
                     Console {
                         is_stderr: bool,
                     },
                     VfsFile {
-                        vfs_fd: alloc::sync::Arc<litebox::fd::TypedFd<NtFS>>,
+                        vfs_fd: alloc::sync::Arc<litebox::fd::TypedFd<FS>>,
                         position: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
                     },
                     Pipe {
@@ -5458,7 +5468,7 @@ impl NtShimEntrypoints {
                         syscalls::file::nt_write_file_console(ctx, is_stderr)
                     }
                     NtWriteTarget::VfsFile { vfs_fd, position } => {
-                        syscalls::file::nt_write_file_vfs(ctx, &vfs_fd, &position, &self.shared)
+                        syscalls::file::nt_write_file_vfs(ctx, &*vfs_fd, &position, &self.shared)
                     }
                     NtWriteTarget::Pipe { buffer } => {
                         syscalls::file::nt_write_file_pipe(ctx, &buffer)
@@ -5497,9 +5507,9 @@ impl NtShimEntrypoints {
                 let file_handle = args.arg0 as u32;
 
                 // Snapshot handle info under lock, drop before I/O.
-                enum NtReadTarget {
+                enum NtReadTarget<FS: NtShimFS> {
                     VfsFile {
-                        vfs_fd: alloc::sync::Arc<litebox::fd::TypedFd<NtFS>>,
+                        vfs_fd: alloc::sync::Arc<litebox::fd::TypedFd<FS>>,
                         position: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
                     },
                     Console,
@@ -5556,7 +5566,7 @@ impl NtShimEntrypoints {
                 }
                 let status = match target {
                     NtReadTarget::VfsFile { vfs_fd, position } => {
-                        syscalls::file::nt_read_file_vfs(ctx, &vfs_fd, &position, &self.shared)
+                        syscalls::file::nt_read_file_vfs(ctx, &*vfs_fd, &position, &self.shared)
                     }
                     NtReadTarget::Console => syscalls::file::nt_read_file_console(ctx),
                     NtReadTarget::Pipe { buffer } => {
@@ -9315,8 +9325,8 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                         handle_table::NtObject::Event(event) => {
                             Some(alloc::sync::Arc::clone(event))
                         }
-                        _ => None,
-                    }).flatten() {
+                    _ => None,
+                }).flatten() {
                         Some(ev) => Some(ev),
                         None => return (NtStatus::STATUS_INVALID_HANDLE, false),
                     }
@@ -10493,7 +10503,7 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                 // Look up the target object and check if already signaled.
                 // If signaled, post immediately; otherwise register for deferred
                 // notification.
-                match handles.with(target_handle, |entry| match &entry.object {
+                match handles.with(target_handle, |entry| -> Option<handle_table::NtObject<FS>> { match &entry.object {
                     handle_table::NtObject::Process { state } => Some(handle_table::NtObject::Process { state: state.clone() }),
                     handle_table::NtObject::VirtualThread { process } => Some(handle_table::NtObject::VirtualThread { process: process.clone() }),
                     handle_table::NtObject::Thread(t) => Some(handle_table::NtObject::Thread(t.clone())),
@@ -10501,7 +10511,7 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                     handle_table::NtObject::Timer2(t) => Some(handle_table::NtObject::Timer2(alloc::sync::Arc::clone(t))),
                     handle_table::NtObject::Event(ev) => Some(handle_table::NtObject::Event(alloc::sync::Arc::clone(ev))),
                     _ => None,
-                }).flatten() {
+                }}).flatten() {
                     Some(handle_table::NtObject::Process { state }) => {
                         if state
                             .exited
@@ -14005,7 +14015,7 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
     }
 }
 
-impl litebox::event::wait::CheckForInterrupt for NtShimEntrypoints {
+impl<FS: NtShimFS> litebox::event::wait::CheckForInterrupt for NtShimEntrypoints<FS> {
     fn check_for_interrupt(&self) -> bool {
         self.shared
             .process_exit_requested
@@ -14013,7 +14023,7 @@ impl litebox::event::wait::CheckForInterrupt for NtShimEntrypoints {
     }
 }
 
-impl litebox::shim::EnterShim for NtShimEntrypoints {
+impl<FS: NtShimFS> litebox::shim::EnterShim for NtShimEntrypoints<FS> {
     type ExecutionContext = ExecutionContext;
 
     fn init(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {

@@ -35,10 +35,10 @@ struct CsrApiConnectInfoX64 {
     connection_info: u64,
 }
 
-pub(crate) fn nt_connect_port(
+pub(crate) fn nt_connect_port<FS: crate::NtShimFS>(
     ctx: &mut crate::ExecutionContext,
-    handles: &mut HandleTable,
-    shared: &NtSharedState,
+    handles: &mut HandleTable<FS>,
+    shared: &NtSharedState<FS>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let port_handle_out_ptr = args.arg0;
@@ -152,10 +152,10 @@ pub(crate) fn nt_connect_port(
     NtStatus::STATUS_SUCCESS
 }
 
-pub(crate) fn nt_alpc_send_wait_receive_port(
+pub(crate) fn nt_alpc_send_wait_receive_port<FS: crate::NtShimFS>(
     ctx: &mut crate::ExecutionContext,
-    handles: &HandleTable,
-    shared: &NtSharedState,
+    handles: &HandleTable<FS>,
+    shared: &NtSharedState<FS>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let is_csr_port = handles.with(args.arg0 as u32, |entry| {
@@ -256,7 +256,7 @@ pub(crate) fn nt_alpc_send_wait_receive_port(
     NtStatus::STATUS_SUCCESS
 }
 
-fn populate_client_connect_reply(shared: &NtSharedState, reply_ptr: usize) -> Result<(), NtStatus> {
+fn populate_client_connect_reply<FS: crate::NtShimFS>(shared: &NtSharedState<FS>, reply_ptr: usize) -> Result<(), NtStatus> {
     let server_dll_index =
         try_read_guest_value_unaligned::<u32>(reply_ptr + CSR_CLIENT_CONNECT_SERVER_ID_OFFSET)
             .unwrap_or(0);
@@ -302,8 +302,8 @@ fn populate_client_connect_reply(shared: &NtSharedState, reply_ptr: usize) -> Re
     Ok(())
 }
 
-fn write_connect_info(
-    shared: &NtSharedState,
+fn write_connect_info<FS: crate::NtShimFS>(
+    shared: &NtSharedState<FS>,
     connection_information_ptr: usize,
     connection_information_length_ptr: usize,
 ) -> Result<(), NtStatus> {

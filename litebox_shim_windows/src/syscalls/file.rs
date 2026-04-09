@@ -279,9 +279,9 @@ fn join_nt_paths(root: &str, child: &str) -> String {
     }
 }
 
-fn resolve_object_attributes_path(
+fn resolve_object_attributes_path<FS: crate::NtShimFS>(
     obj_attr_ptr: usize,
-    handles: Option<&HandleTable>,
+    handles: Option<&HandleTable<FS>>,
 ) -> Result<String, NtStatus> {
     if obj_attr_ptr == 0 {
         return Err(NtStatus::STATUS_INVALID_PARAMETER);
@@ -314,18 +314,18 @@ fn resolve_object_attributes_path(
     Ok(nt_path)
 }
 
-fn query_object_attributes_file_status(
+fn query_object_attributes_file_status<FS: crate::NtShimFS>(
     obj_attr_ptr: usize,
-    handles: Option<&HandleTable>,
-    shared: &super::super::NtSharedState,
+    handles: Option<&HandleTable<FS>>,
+    shared: &super::super::NtSharedState<FS>,
 ) -> Result<litebox::fs::FileStatus, NtStatus> {
     let nt_path = resolve_object_attributes_path(obj_attr_ptr, handles)?;
     query_nt_path_file_status(&nt_path, shared)
 }
 
-fn query_nt_path_file_status(
+fn query_nt_path_file_status<FS: crate::NtShimFS>(
     nt_path: &str,
-    shared: &super::super::NtSharedState,
+    shared: &super::super::NtSharedState<FS>,
 ) -> Result<litebox::fs::FileStatus, NtStatus> {
     let translated = translate_nt_path(nt_path).ok_or(NtStatus::STATUS_OBJECT_NAME_NOT_FOUND)?;
     let path = match translated {
@@ -479,8 +479,8 @@ fn map_readdir_error_to_ntstatus(e: &litebox::fs::errors::ReadDirError) -> NtSta
 }
 
 /// Helper: insert a `NtObject::Directory` handle and write the IOSB.
-fn insert_directory_handle(
-    handles: &mut HandleTable,
+fn insert_directory_handle<FS: crate::NtShimFS>(
+    handles: &mut HandleTable<FS>,
     nt_path: &str,
     handle_out_ptr: usize,
     io_status_ptr: usize,
@@ -504,9 +504,9 @@ fn insert_directory_handle(
 }
 
 /// Helper: insert an arbitrary NT object handle and write a successful IOSB.
-fn insert_object_handle(
-    handles: &mut HandleTable,
-    obj: NtObject,
+fn insert_object_handle<FS: crate::NtShimFS>(
+    handles: &mut HandleTable<FS>,
+    obj: NtObject<FS>,
     handle_out_ptr: usize,
     io_status_ptr: usize,
     iosb_information: u64,
@@ -597,12 +597,12 @@ const AFD_OPEN_PACKET_EA_NAME: &[u8] = b"AfdOpenPacketXX";
 ///
 /// Returns `Some(status)` if the path was an AFD path (even on failure),
 /// or `None` if the path is not an AFD path.
-fn try_open_afd_socket(
+fn try_open_afd_socket<FS: crate::NtShimFS>(
     nt_path: &str,
     ea_buffer_ptr: usize,
     ea_length: u32,
-    handles: &mut HandleTable,
-    shared: &super::super::NtSharedState,
+    handles: &mut HandleTable<FS>,
+    shared: &super::super::NtSharedState<FS>,
     handle_out_ptr: usize,
     io_status_ptr: usize,
 ) -> Option<NtStatus> {
@@ -795,9 +795,9 @@ fn try_open_afd_socket(
 }
 
 /// Open synthetic device handles that are backed by shim logic rather than VFS.
-fn try_open_special_device(
+fn try_open_special_device<FS: crate::NtShimFS>(
     nt_path: &str,
-    handles: &mut HandleTable,
+    handles: &mut HandleTable<FS>,
     handle_out_ptr: usize,
     io_status_ptr: usize,
 ) -> Option<NtStatus> {
@@ -862,10 +862,10 @@ fn try_open_special_device(
 ///     ULONG EaLength                      // [rsp+0x58]
 /// );
 /// ```
-pub(crate) fn nt_create_file(
+pub(crate) fn nt_create_file<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    handles: &mut HandleTable,
-    shared: &super::super::NtSharedState,
+    handles: &mut HandleTable<FS>,
+    shared: &super::super::NtSharedState<FS>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let handle_out_ptr = args.arg0;
@@ -1402,11 +1402,11 @@ pub(crate) fn nt_create_file(
 ///
 /// Called after handle-table lock is dropped. Uses the raw_fd to look up
 /// the TypedFd in RawDescriptorStorage and reads via the VFS.
-pub(crate) fn nt_read_file_vfs(
+pub(crate) fn nt_read_file_vfs<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    vfs_fd: &litebox::fd::TypedFd<super::super::NtFS>,
+    vfs_fd: &litebox::fd::TypedFd<FS>,
     position: &alloc::sync::Arc<AtomicU64>,
-    shared: &super::super::NtSharedState,
+    shared: &super::super::NtSharedState<FS>,
 ) -> NtStatus {
     let io_status_ptr =
         crate::try_read_guest_value_unaligned::<usize>(ctx.regs.rsp + 0x28).unwrap_or(0);
@@ -1473,11 +1473,11 @@ pub(crate) fn nt_read_file_vfs(
 }
 
 /// NtWriteFile — write to a VFS file descriptor.
-pub(crate) fn nt_write_file_vfs(
+pub(crate) fn nt_write_file_vfs<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    vfs_fd: &litebox::fd::TypedFd<super::super::NtFS>,
+    vfs_fd: &litebox::fd::TypedFd<FS>,
     position: &alloc::sync::Arc<AtomicU64>,
-    shared: &super::super::NtSharedState,
+    shared: &super::super::NtSharedState<FS>,
 ) -> NtStatus {
     let io_status_ptr =
         crate::try_read_guest_value_unaligned::<usize>(ctx.regs.rsp + 0x28).unwrap_or(0);
@@ -1656,10 +1656,10 @@ pub(crate) fn nt_write_file_console(
 ///     FILE_INFORMATION_CLASS FileInfoClass  // [rsp+0x28]
 /// );
 /// ```
-pub(crate) fn nt_query_information_file(
+pub(crate) fn nt_query_information_file<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    handles: &HandleTable,
-    shared: &super::super::NtSharedState,
+    handles: &HandleTable<FS>,
+    shared: &super::super::NtSharedState<FS>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let file_handle = args.arg0 as u32;
@@ -2022,10 +2022,10 @@ pub(crate) fn nt_query_information_file(
 ///     FILE_INFORMATION_CLASS FileInfoClass  // [rsp+0x28]
 /// );
 /// ```
-pub(crate) fn nt_set_information_file(
+pub(crate) fn nt_set_information_file<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    handles: &mut HandleTable,
-    shared: &super::super::NtSharedState,
+    handles: &mut HandleTable<FS>,
+    shared: &super::super::NtSharedState<FS>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let file_handle = args.arg0 as u32;
@@ -2221,10 +2221,10 @@ pub(crate) fn nt_set_information_file(
 ///     PFILE_BASIC_INFORMATION FileInformation         // rdx
 /// );
 /// ```
-pub(crate) fn nt_query_attributes_file(
+pub(crate) fn nt_query_attributes_file<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    handles: &HandleTable,
-    shared: &super::super::NtSharedState,
+    handles: &HandleTable<FS>,
+    shared: &super::super::NtSharedState<FS>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let obj_attr_ptr = args.arg0;
@@ -2302,10 +2302,10 @@ pub(crate) fn nt_query_attributes_file(
 ///     PFILE_NETWORK_OPEN_INFORMATION NetworkInformation    // rdx
 /// );
 /// ```
-pub(crate) fn nt_query_full_attributes_file(
+pub(crate) fn nt_query_full_attributes_file<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    handles: &HandleTable,
-    shared: &super::super::NtSharedState,
+    handles: &HandleTable<FS>,
+    shared: &super::super::NtSharedState<FS>,
 ) -> NtStatus {
     use litebox_common_windows::nt_types::FileNetworkOpenInformation;
 
@@ -2409,10 +2409,10 @@ fn write_iosb(io_status_ptr: usize, status: NtStatus, info: usize) {
 ///     FILE_INFORMATION_CLASS FileInfoClass   // [rsp+0x28]
 /// );
 /// ```
-pub(crate) fn nt_query_information_by_name(
+pub(crate) fn nt_query_information_by_name<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    handles: &HandleTable,
-    shared: &super::super::NtSharedState,
+    handles: &HandleTable<FS>,
+    shared: &super::super::NtSharedState<FS>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let obj_attr_ptr = args.arg0;
@@ -2603,9 +2603,9 @@ fn map_win32_error_to_ntstatus(win_err: u32) -> NtStatus {
 ///     FS_INFORMATION_CLASS FsInformationClass   // [rsp+0x28]
 /// );
 /// ```
-pub(crate) fn nt_query_volume_information_file(
+pub(crate) fn nt_query_volume_information_file<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    handles: &HandleTable,
+    handles: &HandleTable<FS>,
 ) -> NtStatus {
     let args = super::NtSyscallArgs::from_ctx(ctx);
     let file_handle = args.arg0 as u32;
@@ -2746,10 +2746,10 @@ pub(crate) fn nt_query_volume_information_file(
 /// Supports FileDirectoryInformation (1), FileBothDirectoryInformation (3),
 /// and FileIdBothDirectoryInformation (37).
 /// Tracks enumeration state per directory handle for forward progress.
-pub(crate) fn nt_query_directory_file(
+pub(crate) fn nt_query_directory_file<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    handles: &mut crate::handle_table::HandleTable,
-    shared: &super::super::NtSharedState,
+    handles: &mut crate::handle_table::HandleTable<FS>,
+    shared: &super::super::NtSharedState<FS>,
 ) -> NtStatus {
     let args = super::NtSyscallArgs::from_ctx(ctx);
     let file_handle = args.arg0 as u32;
@@ -2794,7 +2794,7 @@ pub(crate) fn nt_query_directory_file(
 /// Shared inner implementation for both NtQueryDirectoryFile and
 /// NtQueryDirectoryFileEx. All parameters have already been extracted
 /// and validated by the caller.
-fn nt_query_directory_file_inner(
+fn nt_query_directory_file_inner<FS: crate::NtShimFS>(
     file_handle: u32,
     io_status_ptr: usize,
     info_ptr: usize,
@@ -2804,8 +2804,8 @@ fn nt_query_directory_file_inner(
     filename_ptr: usize,
     restart_scan: bool,
     ctx: &mut super::super::ExecutionContext,
-    handles: &mut crate::handle_table::HandleTable,
-    shared: &super::super::NtSharedState,
+    handles: &mut crate::handle_table::HandleTable<FS>,
+    shared: &super::super::NtSharedState<FS>,
 ) -> NtStatus {
     use crate::handle_table::DirEnumEntry;
 
@@ -3116,10 +3116,10 @@ fn nt_query_directory_file_inner(
 ///   0x10 = SL_INDEX_SPECIFIED
 ///
 /// Translates to the NtQueryDirectoryFile calling convention and delegates.
-pub(crate) fn nt_query_directory_file_ex(
+pub(crate) fn nt_query_directory_file_ex<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    handles: &mut crate::handle_table::HandleTable,
-    shared: &super::super::NtSharedState,
+    handles: &mut crate::handle_table::HandleTable<FS>,
+    shared: &super::super::NtSharedState<FS>,
 ) -> NtStatus {
     let args = super::NtSyscallArgs::from_ctx(ctx);
     let file_handle = args.arg0 as u32;
@@ -3187,10 +3187,10 @@ pub(crate) fn nt_query_directory_file_ex(
 /// During ntdll-driven initialization, ntdll's loader calls NtOpenFile to
 /// open DLL files. We first check the tar archive (dll_tar_files) and
 /// return a `MemoryFile` handle if found; otherwise fall back to the host.
-pub(crate) fn nt_open_file(
+pub(crate) fn nt_open_file<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    handles: &mut HandleTable,
-    shared: &super::super::NtSharedState,
+    handles: &mut HandleTable<FS>,
+    shared: &super::super::NtSharedState<FS>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let handle_out_ptr = args.arg0;
@@ -3478,9 +3478,9 @@ pub(crate) fn nt_open_file(
 ///     POBJECT_ATTRIBUTES ObjectAttributes  // r10
 /// );
 /// ```
-pub(crate) fn nt_delete_file(
+pub(crate) fn nt_delete_file<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    shared: &super::super::NtSharedState,
+    shared: &super::super::NtSharedState<FS>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let obj_attr_ptr = args.arg0;
@@ -3548,10 +3548,10 @@ pub(crate) fn nt_delete_file(
 ///     IN  ULONG              OutboundQuota,        // [rsp+0x68] (stack8)
 ///     IN  PLARGE_INTEGER     DefaultTimeout,       // [rsp+0x70] (stack9)
 ///   );
-pub(crate) fn nt_create_named_pipe_file(
+pub(crate) fn nt_create_named_pipe_file<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    handles: &mut HandleTable,
-    shared: &super::super::NtSharedState,
+    handles: &mut HandleTable<FS>,
+    shared: &super::super::NtSharedState<FS>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let handle_out = args.arg0;
@@ -3649,10 +3649,10 @@ pub(crate) fn nt_create_named_pipe_file(
 ///     OUT PVOID            OutputBuffer,          // [rsp+0x48] (stack4)
 ///     IN  ULONG            OutputBufferLength,    // [rsp+0x50] (stack5)
 ///   );
-pub(crate) fn nt_fs_control_file(
+pub(crate) fn nt_fs_control_file<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    handles: &HandleTable,
-    shared: &super::super::NtSharedState,
+    handles: &HandleTable<FS>,
+    shared: &super::super::NtSharedState<FS>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let file_handle = args.arg0 as u32;
@@ -4067,9 +4067,9 @@ pub(crate) fn nt_write_file_pipe(
 ///     IN OUT PPS_CREATE_INFO     CreateInfo,              // [rsp+0x50] (stack5)
 ///     IN  PPS_ATTRIBUTE_LIST     AttributeList,           // [rsp+0x58] (stack6)
 ///   );
-pub(crate) fn nt_create_user_process(
+pub(crate) fn nt_create_user_process<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    shared: &Arc<super::super::NtSharedState>,
+    shared: &Arc<super::super::NtSharedState<FS>>,
 ) -> NtStatus {
     // arg0 = r10 (not rcx! — the ntdll stub does `mov r10, rcx` before `syscall`,
     // and the CPU clobbers rcx with the return address during `syscall`).
@@ -4259,9 +4259,9 @@ fn is_cmd_exe_image(cmd_line: &str, image_path: Option<&str>) -> bool {
 
 /// Try executing as a builtin command. Returns (exit_code, output, was_recognized).
 /// `was_recognized` is false only for the `_` (catch-all) arm.
-fn try_execute_builtin_command(
+fn try_execute_builtin_command<FS: crate::NtShimFS>(
     cmd_line: &str,
-    shared: &super::super::NtSharedState,
+    shared: &super::super::NtSharedState<FS>,
 ) -> (i32, String, bool) {
     let body = parse_cmd_body(cmd_line);
     let args = shell_split(body);
@@ -4284,8 +4284,8 @@ fn try_execute_builtin_command(
 }
 
 /// Extract a PipeBuffer Arc from a handle, if it's a Pipe.
-fn extract_pipe_buffer(
-    handles: &HandleTable,
+fn extract_pipe_buffer<FS: crate::NtShimFS>(
+    handles: &HandleTable<FS>,
     handle: u32,
 ) -> Option<Arc<crate::handle_table::PipeBuffer>> {
     if handle == 0 {
@@ -4357,8 +4357,8 @@ fn extract_image_path_from_attributes(attribute_list_ptr: usize) -> Option<Strin
 /// Complete an inline (builtin) process creation — writes output to pipes,
 /// creates a fake process/thread, fills in return structures.
 #[allow(clippy::too_many_arguments)]
-fn finish_inline_process(
-    shared: &Arc<super::super::NtSharedState>,
+fn finish_inline_process<FS: crate::NtShimFS>(
+    shared: &Arc<super::super::NtSharedState<FS>>,
     process_handle_out: usize,
     thread_handle_out: usize,
     process_params_ptr: usize,
@@ -4539,9 +4539,9 @@ fn fill_attribute_list_output(attribute_list_ptr: usize, pid: u32, tid: u32) {
 ///
 /// Supported commands: echo, set, type, exit, ver, cd, dir, mkdir.
 /// Commands prefixed with `cmd.exe /c` or `cmd /c` are stripped first.
-fn execute_builtin_command(
+fn execute_builtin_command<FS: crate::NtShimFS>(
     cmd_line: &str,
-    shared: &super::super::NtSharedState,
+    shared: &super::super::NtSharedState<FS>,
 ) -> (i32, String) {
     let body = parse_cmd_body(cmd_line);
     let args = shell_split(body);

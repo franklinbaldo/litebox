@@ -502,10 +502,10 @@ pub(crate) fn nt_query_system_time(ctx: &mut super::super::ExecutionContext) -> 
 ///     PULONG ReturnLength                      // [rsp+0x28]
 /// );
 /// ```
-pub(crate) fn nt_query_information_process(
+pub(crate) fn nt_query_information_process<FS: super::super::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
     init_state: Option<&super::super::NtInitState>,
-    shared: &super::super::NtSharedState,
+    shared: &super::super::NtSharedState<FS>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let handle = args.arg0;

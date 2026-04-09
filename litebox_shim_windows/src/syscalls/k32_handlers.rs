@@ -88,7 +88,10 @@ fn zero_explicit_tls_slot_for_teb(teb_va: usize, index: u32) {
     }
 }
 
-pub(crate) fn zero_explicit_tls_slot_process_wide(shared: &crate::NtSharedState, index: u32) {
+pub(crate) fn zero_explicit_tls_slot_process_wide<FS: crate::NtShimFS>(
+    shared: &crate::NtSharedState<FS>,
+    index: u32,
+) {
     if index >= TLS_MAX_SLOT_COUNT {
         return;
     }
@@ -283,7 +286,7 @@ pub(crate) unsafe fn restore_guest_context_from_ptr(
 
 #[cfg(test)]
 mod tests {
-    use super::{TLS_INLINE_SLOT_COUNT, zero_explicit_tls_slot_for_teb};
+    use super::{zero_explicit_tls_slot_for_teb, TLS_INLINE_SLOT_COUNT};
 
     #[test]
     fn zero_explicit_tls_slot_validates_expansion_slot_pointer() {

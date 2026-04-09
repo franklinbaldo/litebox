@@ -63,9 +63,9 @@ fn initial_child_thread_rsp(stack_top: usize) -> usize {
 /// spawns a platform thread via `ThreadProvider::spawn_thread`. The child
 /// thread gets its own `NtShimEntrypoints` instance with shared process
 /// state but independent handle table (seeded with stdio handles).
-pub(crate) fn nt_create_thread_ex(
+pub(crate) fn nt_create_thread_ex<FS: crate::NtShimFS>(
     ctx: &mut super::super::ExecutionContext,
-    shim: &NtShimEntrypoints,
+    shim: &NtShimEntrypoints<FS>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let handle_out_va = args.arg0;
@@ -482,8 +482,8 @@ pub(crate) fn nt_create_thread_ex(
 /// When `init()` is called on the new host thread, it sets the FS base (guest
 /// TEB base) and returns the child shim as the `EnterShim` for the thread's
 /// execution loop.
-struct NtChildThreadInit {
-    child_shim: NtShimEntrypoints,
+struct NtChildThreadInit<FS: crate::NtShimFS> {
+    child_shim: NtShimEntrypoints<FS>,
     child_teb_va: usize,
     guest_va_start: usize,
     guest_va_end: usize,
@@ -491,9 +491,9 @@ struct NtChildThreadInit {
 
 // Safety: NtShimEntrypoints fields are all Send+Sync (Mutex, Arc, Atomic).
 // ThreadObject is Arc-wrapped. child_teb_va is a plain usize.
-unsafe impl Send for NtChildThreadInit {}
+unsafe impl<FS: crate::NtShimFS> Send for NtChildThreadInit<FS> {}
 
-impl litebox::shim::InitThread for NtChildThreadInit {
+impl<FS: crate::NtShimFS> litebox::shim::InitThread for NtChildThreadInit<FS> {
     type ExecutionContext = litebox_common_linux::ExecutionContext;
 
     fn init(
@@ -537,8 +537,8 @@ pub(crate) fn nt_terminate_thread(ctx: &mut super::super::ExecutionContext) -> (
 /// `NtCreateThreadEx`.
 ///
 /// Returns `Ok(thread_id)` on success or `Err(NtStatus)` on failure.
-pub(crate) fn spawn_worker_factory_thread(
-    shim: &NtShimEntrypoints,
+pub(crate) fn spawn_worker_factory_thread<FS: crate::NtShimFS>(
+    shim: &NtShimEntrypoints<FS>,
     start_routine: usize,
     start_parameter: usize,
 ) -> Result<u32, NtStatus> {
