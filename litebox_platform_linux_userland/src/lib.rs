@@ -33,7 +33,7 @@ use litebox_common_linux::{
 
 use zerocopy::{FromBytes, IntoBytes};
 
-mod forker;
+pub mod forker;
 mod syscall_intercept;
 
 extern crate alloc;
@@ -910,22 +910,227 @@ impl LinuxUserland {
 
     /// Attempt to spawn a worker via the forker process.
     ///
-    /// This is a skeleton that always returns `Err(())` — the real
-    /// implementation will pack stdio/fd descriptors into a [`ForkRequest`]
-    /// and send it over the forker socket in a later task.
+    /// Translates the posix_spawn arguments into a [`ForkRequest`], sends it
+    /// over the forker socket with SCM_RIGHTS, and receives the child PID.
+    /// Returns `Ok(pid)` on success, `Err(())` if the forker is not available
+    /// or the request fails.
     fn try_spawn_via_forker<FS>(
         &'static self,
-        _snapshot_bytes: &[u8],
-        _stdio: &WorkerExecStdioBindings<FS, LinuxUserland>,
-        _mux_fd: Option<i32>,
-        _mux_streams: &[(u32, usize, u8, u8, bool)],
-        _passthrough_fds: &[(usize, i32, bool)],
-        _local_pipe_pairs: &[(usize, usize, Vec<u8>, u32, u32)],
+        snapshot_bytes: &[u8],
+        stdio: &WorkerExecStdioBindings<FS, LinuxUserland>,
+        mux_fd: Option<i32>,
+        mux_streams: &[(u32, usize, u8, u8, bool)],
+        passthrough_fds: &[(usize, i32, bool)],
+        local_pipe_pairs: &[(usize, usize, Vec<u8>, u32, u32)],
     ) -> Result<i32, ()>
     where
         FS: litebox::fs::FileSystem + Send + Sync + 'static,
     {
-        Err(())
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        // 1. Lock forker handle. If None, return Err.
+        let forker_guard = self.forker_handle.lock().unwrap();
+        let forker = match forker_guard.as_ref() {
+            Some(h) => h,
+            None => return Err(()),
+        };
+
+        // 2. Create snapshot memfd.
+        let snapshot_fd = create_worker_fork_snapshot_fd(snapshot_bytes).map_err(|_| ())?;
+
+        // 3. Create ack pipe.
+        let (ack_read_fd, ack_write_fd) = create_worker_result_pipe().map_err(|_| ())?;
+
+        // 4. Create result pipe.
+        let (result_read_fd, result_write_fd) = create_worker_result_pipe().map_err(|_| ())?;
+
+        // 5. Build the fds array and ForkRequest.
+        let mut fds_array: Vec<std::os::fd::RawFd> = Vec::new();
+        // Keep OwnedFds alive until after send_fork_request.
+        let mut keep_alive_fds: Vec<OwnedFd> = Vec::new();
+
+        // Index 0: snapshot_fd
+        let snapshot_fd_idx = fds_array.len() as u8;
+        fds_array.push(snapshot_fd.as_raw_fd());
+
+        // Index 1: ack_write_fd
+        let ack_fd_idx = fds_array.len() as u8;
+        fds_array.push(ack_write_fd.as_raw_fd());
+
+        // Index 2: result_write_fd
+        let result_fd_idx = fds_array.len() as u8;
+        fds_array.push(result_write_fd.as_raw_fd());
+
+        // Index 3: mux_fd (if any)
+        let mux_fd_idx = if let Some(mux_fd) = mux_fd {
+            let idx = fds_array.len() as u8;
+            // Dup the mux fd so we can send it via SCM_RIGHTS without
+            // closing the original (which the caller may still reference).
+            let duped = unsafe { libc::fcntl(mux_fd, libc::F_DUPFD_CLOEXEC, 3) };
+            if duped < 0 {
+                return Err(());
+            }
+            let owned = unsafe { OwnedFd::from_raw_fd(duped) };
+            fds_array.push(owned.as_raw_fd());
+            keep_alive_fds.push(owned);
+            idx
+        } else {
+            0xFF
+        };
+
+        // Map stdio bindings.
+        let mut stdio_bindings = [forker::StdioBinding::DevNull; 3];
+
+        // stdin
+        match &stdio.stdin {
+            WorkerExecInputBinding::HostStdio { fd } | WorkerExecInputBinding::HostPipe { fd } => {
+                let duped = unsafe { libc::fcntl(*fd, libc::F_DUPFD_CLOEXEC, 3) };
+                if duped < 0 {
+                    return Err(());
+                }
+                let owned = unsafe { OwnedFd::from_raw_fd(duped) };
+                let idx = fds_array.len() as u8;
+                fds_array.push(owned.as_raw_fd());
+                keep_alive_fds.push(owned);
+                stdio_bindings[0] = forker::StdioBinding::FromFdIndex(idx);
+            }
+            WorkerExecInputBinding::Close => {
+                stdio_bindings[0] = forker::StdioBinding::Close;
+            }
+            _ => {
+                stdio_bindings[0] = forker::StdioBinding::DevNull;
+            }
+        }
+
+        // stdout, stderr
+        for (i, binding) in [(1usize, &stdio.stdout), (2usize, &stdio.stderr)] {
+            match binding {
+                WorkerExecOutputBinding::HostStdio { fd }
+                | WorkerExecOutputBinding::HostPipe { fd } => {
+                    let duped = unsafe { libc::fcntl(*fd, libc::F_DUPFD_CLOEXEC, 3) };
+                    if duped < 0 {
+                        return Err(());
+                    }
+                    let owned = unsafe { OwnedFd::from_raw_fd(duped) };
+                    let idx = fds_array.len() as u8;
+                    fds_array.push(owned.as_raw_fd());
+                    keep_alive_fds.push(owned);
+                    stdio_bindings[i] = forker::StdioBinding::FromFdIndex(idx);
+                }
+                WorkerExecOutputBinding::Close => {
+                    stdio_bindings[i] = forker::StdioBinding::Close;
+                }
+                _ => {
+                    stdio_bindings[i] = forker::StdioBinding::DevNull;
+                }
+            }
+        }
+
+        // Passthrough fds (pipe bridges): dup each and add to fds array.
+        let mut pipe_bridges_req: Vec<(usize, u8, bool)> = Vec::new();
+        for &(guest_fd, host_fd, is_read) in passthrough_fds {
+            let duped = unsafe { libc::fcntl(host_fd, libc::F_DUPFD_CLOEXEC, 3) };
+            if duped < 0 {
+                return Err(());
+            }
+            let owned = unsafe { OwnedFd::from_raw_fd(duped) };
+            let idx = fds_array.len() as u8;
+            fds_array.push(owned.as_raw_fd());
+            keep_alive_fds.push(owned);
+            pipe_bridges_req.push((guest_fd, idx, is_read));
+        }
+
+        // Local pipe pairs: create drain memfds for non-empty drained data.
+        let mut local_pipes_req: Vec<(usize, usize, u8, u32, u32)> = Vec::new();
+        let mut drain_owned_fds: Vec<OwnedFd> = Vec::new();
+        for &(write_fd, read_fd, ref drained, w_flags, r_flags) in local_pipe_pairs {
+            if drained.is_empty() {
+                local_pipes_req.push((write_fd, read_fd, 0xFF, w_flags, r_flags));
+            } else {
+                let drain_fd = create_worker_fork_snapshot_fd(drained).map_err(|_| ())?;
+                let idx = fds_array.len() as u8;
+                fds_array.push(drain_fd.as_raw_fd());
+                drain_owned_fds.push(drain_fd);
+                local_pipes_req.push((write_fd, read_fd, idx, w_flags, r_flags));
+            }
+        }
+
+        // Mux streams (these don't carry host fds, just metadata).
+        let mux_streams_req: Vec<(u32, usize, u8, u8, bool)> = mux_streams.to_vec();
+
+        #[allow(clippy::cast_possible_truncation)]
+        let request = forker::ForkRequest {
+            stdio: stdio_bindings,
+            num_fds: fds_array.len() as u16,
+            snapshot_fd_idx,
+            ack_fd_idx,
+            result_fd_idx,
+            mux_fd_idx,
+            mux_streams: mux_streams_req,
+            pipe_bridges: pipe_bridges_req,
+            local_pipes: local_pipes_req,
+        };
+
+        // 6. Send fork request.
+        let sock_guard = forker.sock.lock().unwrap();
+        forker::send_fork_request(sock_guard.as_raw_fd(), &request, &fds_array).map_err(|_| ())?;
+
+        // 7. Receive fork response.
+        let response = forker::recv_fork_response(sock_guard.as_raw_fd()).map_err(|_| ())?;
+        drop(sock_guard);
+        drop(forker_guard);
+
+        let child_pid = response.child_pid;
+        if child_pid < 0 {
+            return Err(());
+        }
+
+        // 8. Drop (close) the write ends, snapshot_fd, passed fds.
+        drop(ack_write_fd);
+        drop(result_write_fd);
+        drop(snapshot_fd);
+        drop(keep_alive_fds);
+        drop(drain_owned_fds);
+
+        // Close child-side passthrough pipe bridge FDs.
+        for &(_, host_fd, _) in passthrough_fds {
+            self.close_host_fd(host_fd);
+        }
+
+        // Close the worker's mux socketpair end.
+        if let Some(mux_fd) = mux_fd {
+            self.close_host_fd(mux_fd);
+        }
+
+        // 9. Read ack from ack_read_fd.
+        let ack_status = read_fork_restore_ack(ack_read_fd);
+
+        // 10. If ack != 0, reap child and return Err.
+        if ack_status != 0 {
+            // Reap the child synchronously.
+            let mut status: libc::c_int = 0;
+            loop {
+                let ret = unsafe { libc::waitpid(child_pid, core::ptr::addr_of_mut!(status), 0) };
+                if ret != -1
+                    || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                {
+                    break;
+                }
+            }
+            return Err(());
+        }
+
+        // 11. Register child in worker_processes.
+        self.worker_processes.lock().unwrap().insert(
+            child_pid,
+            WorkerHostProcess {
+                result_fd: result_read_fd,
+                bridge_threads: Vec::new(),
+            },
+        );
+
+        // 12. Return Ok(child_pid).
+        Ok(child_pid)
     }
 
     /// Cancel any pending `read_from_stdin()` call, causing it to return EOF.
@@ -1777,6 +1982,19 @@ impl LinuxUserland {
 
         let _spawn_guard = self.worker_spawn_serial.lock().unwrap();
         self.reap_finished_worker_bridge_threads();
+
+        // Try the forker path first (no execve, no openat).
+        if let Ok(pid) = self.try_spawn_via_forker(
+            snapshot_bytes,
+            &stdio,
+            mux_fd,
+            mux_streams,
+            passthrough_fds,
+            local_pipe_pairs,
+        ) {
+            return Ok(pid);
+        }
+        // Fall through to posix_spawn.
 
         // Create memfd with serialized snapshot.
         let snapshot_fd = create_worker_fork_snapshot_fd(snapshot_bytes).map_err(|_| -1_i32)?;

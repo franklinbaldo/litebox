@@ -12,7 +12,20 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Mutex;
 
 /// Maximum number of file descriptors in a single `SCM_RIGHTS` message.
-pub(crate) const MAX_SCMRIGHTS_FDS: usize = 64;
+pub const MAX_SCMRIGHTS_FDS: usize = 64;
+
+/// Callback that the runner registers for forked workers.
+/// Called in the grandchild after stdio wiring, with the request + fds.
+static WORKER_CALLBACK: std::sync::OnceLock<fn(ForkRequest, Vec<OwnedFd>, RawFd) -> !> =
+    std::sync::OnceLock::new();
+
+/// Register the worker callback function.
+///
+/// The runner calls this before spawning the forker so that forked workers
+/// can call back into the runner crate for restore logic.
+pub fn set_worker_callback(f: fn(ForkRequest, Vec<OwnedFd>, RawFd) -> !) {
+    WORKER_CALLBACK.set(f).ok();
+}
 
 /// Magic bytes identifying a [`ForkRequest`] on the wire.
 const FORK_REQUEST_MAGIC: [u8; 4] = *b"LBFR";
@@ -28,13 +41,13 @@ const FORK_RESPONSE_MAGIC: [u8; 4] = *b"LBFP";
 // ---------------------------------------------------------------------------
 
 /// The runner's end of the socketpair to the forker process.
-pub(crate) struct ForkerHandle {
-    sock: Mutex<OwnedFd>,
+pub struct ForkerHandle {
+    pub(crate) sock: Mutex<OwnedFd>,
 }
 
 impl ForkerHandle {
     /// Wrap a connected socket into a `ForkerHandle`.
-    pub(crate) fn new(sock: OwnedFd) -> Self {
+    pub fn new(sock: OwnedFd) -> Self {
         Self {
             sock: Mutex::new(sock),
         }
@@ -47,7 +60,7 @@ impl ForkerHandle {
 
 /// How to wire a single stdio fd (0, 1, or 2) in the worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StdioBinding {
+pub enum StdioBinding {
     /// `dup2` from the fd at this index in the SCM_RIGHTS array.
     FromFdIndex(u8),
     /// Open `/dev/null` (actually dup2 from an inherited `/dev/null` fd).
@@ -101,7 +114,7 @@ impl StdioBinding {
 
 /// Serializable request from the runner to the forker.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ForkRequest {
+pub struct ForkRequest {
     /// Stdio bindings for fds 0, 1, 2.
     pub stdio: [StdioBinding; 3],
     /// Number of fds in the accompanying SCM_RIGHTS message.
@@ -366,7 +379,7 @@ impl ForkRequest {
 
 /// Fixed 8-byte response from the forker to the runner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ForkResponse {
+pub struct ForkResponse {
     /// PID of the child process (negative on error).
     pub child_pid: i32,
 }
@@ -400,7 +413,7 @@ impl ForkResponse {
 ///
 /// `sock` must be a valid, connected Unix-domain socket file descriptor.
 /// All entries in `fds` must be valid, open file descriptors.
-pub(crate) fn send_msg_with_fds(sock: RawFd, data: &[u8], fds: &[RawFd]) -> Result<(), i32> {
+pub fn send_msg_with_fds(sock: RawFd, data: &[u8], fds: &[RawFd]) -> Result<(), i32> {
     assert!(fds.len() <= MAX_SCMRIGHTS_FDS);
 
     let fd_payload_size = fds.len() * size_of::<RawFd>();
@@ -481,10 +494,7 @@ pub(crate) fn send_msg_with_fds(sock: RawFd, data: &[u8], fds: &[RawFd]) -> Resu
 ///
 /// `sock` must be a valid, connected Unix-domain socket file descriptor.
 /// `data_buf` must have sufficient capacity for the expected message.
-pub(crate) fn recv_msg_with_fds(
-    sock: RawFd,
-    data_buf: &mut [u8],
-) -> Result<(usize, Vec<OwnedFd>), i32> {
+pub fn recv_msg_with_fds(sock: RawFd, data_buf: &mut [u8]) -> Result<(usize, Vec<OwnedFd>), i32> {
     // SAFETY: CMSG_SPACE with a valid payload size returns the correct buffer size.
     #[allow(clippy::cast_possible_truncation)]
     let cmsg_space =
@@ -558,17 +568,13 @@ pub(crate) fn recv_msg_with_fds(
 }
 
 /// Send a [`ForkRequest`] with accompanying file descriptors over a Unix socket.
-pub(crate) fn send_fork_request(
-    sock: RawFd,
-    request: &ForkRequest,
-    fds: &[RawFd],
-) -> Result<(), i32> {
+pub fn send_fork_request(sock: RawFd, request: &ForkRequest, fds: &[RawFd]) -> Result<(), i32> {
     let data = request.serialize();
     send_msg_with_fds(sock, &data, fds)
 }
 
 /// Receive a [`ForkRequest`] and its accompanying file descriptors from a Unix socket.
-pub(crate) fn recv_fork_request(sock: RawFd) -> Result<(ForkRequest, Vec<OwnedFd>), i32> {
+pub fn recv_fork_request(sock: RawFd) -> Result<(ForkRequest, Vec<OwnedFd>), i32> {
     // 64 KiB should be more than enough for any reasonable ForkRequest.
     let mut buf = vec![0u8; 65536];
     let (n, fds) = recv_msg_with_fds(sock, &mut buf)?;
@@ -577,13 +583,13 @@ pub(crate) fn recv_fork_request(sock: RawFd) -> Result<(ForkRequest, Vec<OwnedFd
 }
 
 /// Send a [`ForkResponse`] over a Unix socket (no ancillary fds).
-pub(crate) fn send_fork_response(sock: RawFd, response: &ForkResponse) -> Result<(), i32> {
+pub fn send_fork_response(sock: RawFd, response: &ForkResponse) -> Result<(), i32> {
     let data = response.serialize();
     send_msg_with_fds(sock, &data, &[])
 }
 
 /// Receive a [`ForkResponse`] from a Unix socket.
-pub(crate) fn recv_fork_response(sock: RawFd) -> Result<ForkResponse, i32> {
+pub fn recv_fork_response(sock: RawFd) -> Result<ForkResponse, i32> {
     let mut buf = [0u8; 8];
     let (n, _fds) = recv_msg_with_fds(sock, &mut buf)?;
     if n != 8 {
@@ -610,7 +616,7 @@ pub(crate) fn recv_fork_response(sock: RawFd) -> Result<ForkResponse, i32> {
 /// - `broker_fd`, if `Some`, must be a valid fd (it will be closed immediately).
 ///
 /// This function never returns.
-pub(crate) fn forker_main(cmd_sock: RawFd, dev_null_fd: RawFd, broker_fd: Option<RawFd>) -> ! {
+pub fn forker_main(cmd_sock: RawFd, dev_null_fd: RawFd, broker_fd: Option<RawFd>) -> ! {
     // The forker doesn't use the broker socket — workers get their own via SCM_RIGHTS.
     if let Some(fd) = broker_fd {
         // SAFETY: `fd` is a valid open fd that we own.
@@ -779,13 +785,16 @@ pub(crate) fn forker_main(cmd_sock: RawFd, dev_null_fd: RawFd, broker_fd: Option
     }
 }
 
-/// Worker entry point (placeholder).
+/// Worker entry point.
 ///
-/// Wires stdio according to the request, writes `ENOSYS` to the ack fd,
-/// and exits. This will be replaced with real worker logic in a later task.
+/// Wires stdio according to the request, then calls the registered worker
+/// callback (set by the runner via [`set_worker_callback`]) to restore guest
+/// state and resume execution.
+///
+/// If no callback is registered, writes `ENOSYS` to the ack fd and exits.
 ///
 /// This function never returns.
-pub(crate) fn worker_entry(req: ForkRequest, fds: Vec<OwnedFd>, dev_null_fd: RawFd) -> ! {
+pub fn worker_entry(req: ForkRequest, fds: Vec<OwnedFd>, dev_null_fd: RawFd) -> ! {
     // Wire stdio according to req.stdio.
     for (target_fd, binding) in req.stdio.iter().enumerate() {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -818,7 +827,13 @@ pub(crate) fn worker_entry(req: ForkRequest, fds: Vec<OwnedFd>, dev_null_fd: Raw
         }
     }
 
-    // Write ENOSYS (-38) to the ack fd to signal "not implemented yet".
+    // Call the registered worker callback (runner's restore logic).
+    if let Some(cb) = WORKER_CALLBACK.get() {
+        cb(req, fds, dev_null_fd);
+        // cb is -> !, so this is unreachable.
+    }
+
+    // Fallback if no callback registered: write ENOSYS to ack fd and exit.
     let ack_fd_idx = req.ack_fd_idx as usize;
     if ack_fd_idx < fds.len() {
         let enosys: i32 = -(libc::ENOSYS);
