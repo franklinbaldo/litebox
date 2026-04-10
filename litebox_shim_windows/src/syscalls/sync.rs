@@ -85,12 +85,22 @@ pub(crate) fn nt_create_io_completion<FS: crate::NtShimFS>(
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let handle_out_va = args.arg0;
-    let handle = handles.insert(NtObject::IoCompletion(Arc::new(IoCompletionObject::new())));
+    let iocp = Arc::new(IoCompletionObject::new());
+    #[cfg(feature = "trace_debug")]
+    let iocp_ptr = Arc::as_ptr(&iocp) as usize;
+    let handle = handles.insert(NtObject::IoCompletion(iocp));
     if handle_out_va == 0 {
         return NtStatus::STATUS_ACCESS_VIOLATION;
     }
     if !crate::try_write_guest_value_unaligned::<usize>(handle_out_va, handle as usize) {
         return NtStatus::STATUS_ACCESS_VIOLATION;
+    }
+    #[cfg(feature = "trace_debug")]
+    {
+        use litebox::platform::DebugLogProvider as _;
+        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+            "NT shim: NtCreateIoCompletion -> handle=0x{handle:X} iocp_ptr=0x{iocp_ptr:X}\n"
+        ));
     }
     NtStatus::STATUS_SUCCESS
 }
@@ -327,7 +337,7 @@ fn write_io_status_block(ptr: usize, entry: IoCompletionEntry) {
             core::ptr::write_unaligned(
                 ptr as *mut RawIoStatusBlock,
                 RawIoStatusBlock {
-                    status_or_pointer: entry.status.raw() as usize,
+                    status_or_pointer: (entry.status.raw() as u32) as usize,
                     information: entry.information,
                 },
             );
@@ -344,7 +354,7 @@ fn write_file_io_completion_information(ptr: usize, entry: IoCompletionEntry) {
                     key_context: entry.key_context,
                     apc_context: entry.apc_context,
                     io_status_block: RawIoStatusBlock {
-                        status_or_pointer: entry.status.raw() as usize,
+                        status_or_pointer: (entry.status.raw() as u32) as usize,
                         information: entry.information,
                     },
                 },
@@ -470,6 +480,14 @@ pub(crate) fn nt_remove_io_completion_ex(
         Ok(timeout) => timeout,
         Err(status) => return status,
     };
+    #[cfg(feature = "trace_debug")]
+    {
+        use litebox::platform::DebugLogProvider as _;
+        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+            "NT shim: NtRemoveIoCompletionEx timeout={timeout:?} iocp_ptr=0x{:X}\n",
+            Arc::as_ptr(port) as usize,
+        ));
+    }
     let alert_thread = if NtSyscallArgs::arg5(ctx) != 0 {
         current_thread
     } else {
@@ -502,6 +520,15 @@ pub(crate) fn nt_remove_io_completion_ex(
             return NtStatus::STATUS_ACCESS_VIOLATION;
         };
         write_file_io_completion_information(slot_ptr, entry);
+
+        #[cfg(feature = "trace_debug")]
+        {
+            use litebox::platform::DebugLogProvider as _;
+            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                "NT shim: IOCP dequeue entry[{index}] key=0x{:X} apc=0x{:X} status=0x{:X} info={}\n",
+                entry.key_context, entry.apc_context, entry.status.raw(), entry.information,
+            ));
+        }
     }
     if args.arg3 != 0 {
         unsafe {

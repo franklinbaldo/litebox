@@ -262,6 +262,12 @@ pub enum NtObject<FS: crate::NtShimFS> {
         /// Pending async RECV observers (non-zero-byte) registered on the
         /// socket's pollee.  Same lifetime semantics as `pending_observers`.
         pending_recv_observers: Vec<Arc<SocketRecvIocpObserver>>,
+        /// Pending async datagram RECV observers (event-based, no IOCP).
+        /// Same lifetime semantics as `pending_observers`.
+        pending_dgram_event_observers: Vec<Arc<SocketRecvDatagramEventObserver>>,
+        /// Pending async AFD_SELECT observers.
+        /// Same lifetime semantics as `pending_observers`.
+        pending_select_observers: Vec<Arc<SocketSelectIocpObserver>>,
     },
     /// An NT section object (NtCreateSection).
     Section {
@@ -1528,9 +1534,12 @@ impl litebox::event::observer::Observer<litebox::event::Events> for SocketIocpOb
         };
 
         // Write IO_STATUS_BLOCK to guest memory.
-        // Layout: Status (u32 at +0), Information (usize at +8).
+        // Layout on x64: Status/Pointer union (8 bytes at +0), Information (usize at +8).
         if self.io_status_block != 0 {
-            super::try_write_guest_value_unaligned::<u32>(self.io_status_block, status.0 as u32);
+            super::try_write_guest_value_unaligned::<u64>(
+                self.io_status_block,
+                (status.0 as u32) as u64,
+            );
             super::try_write_guest_value_unaligned::<usize>(self.io_status_block + 8, 0);
         }
 
@@ -1557,6 +1566,163 @@ impl litebox::event::observer::Observer<litebox::event::Events> for SocketIocpOb
             apc_context: self.apc_context,
             status,
             information: 0,
+        });
+    }
+}
+
+/// Observer that completes an async AFD_SELECT (poll) when events fire on the
+/// watched socket.
+///
+/// When none of the requested events are immediately available, the AFD_SELECT
+/// returns STATUS_PENDING.  This observer is registered on the *polled*
+/// socket's proxy.  When matching events arrive, it writes the AFD_SELECT
+/// output buffer and posts an IOCP completion to unblock the event loop.
+pub struct SocketSelectIocpObserver {
+    /// The I/O completion port to post to.
+    iocp: Arc<IoCompletionObject>,
+    /// Per-socket completion key (set by `FileCompletionInformation`).
+    key_context: usize,
+    /// The `OVERLAPPED*` / APC context value.
+    apc_context: usize,
+    /// Ensures we only fire once.
+    fired: core::sync::atomic::AtomicBool,
+    /// IO_STATUS_BLOCK address in guest memory.
+    io_status_block: usize,
+    /// Output buffer address (same as input for METHOD_BUFFERED).
+    output_buf: usize,
+    /// Total output buffer length.
+    output_buf_len: usize,
+    /// The polled socket handle value (written into the output entry).
+    polled_handle: u64,
+    /// Requested event mask (AFD_POLL_* bits).
+    requested_events: u32,
+}
+
+impl SocketSelectIocpObserver {
+    pub fn new(
+        iocp: Arc<IoCompletionObject>,
+        key_context: usize,
+        apc_context: usize,
+        io_status_block: usize,
+        output_buf: usize,
+        output_buf_len: usize,
+        polled_handle: u64,
+        requested_events: u32,
+    ) -> Self {
+        Self {
+            iocp,
+            key_context,
+            apc_context,
+            fired: core::sync::atomic::AtomicBool::new(false),
+            io_status_block,
+            output_buf,
+            output_buf_len,
+            polled_handle,
+            requested_events,
+        }
+    }
+
+    pub fn is_fired(&self) -> bool {
+        self.fired.load(core::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl litebox::event::observer::Observer<litebox::event::Events> for SocketSelectIocpObserver {
+    fn on_events(&self, events: &litebox::event::Events) {
+        // Only fire once.
+        if self.fired.swap(true, core::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+
+        // AFD_POLL event constants (from libuv's src/win/winsock.h).
+        const AFD_POLL_RECEIVE: u32 = 0x0001;
+        const AFD_POLL_SEND: u32 = 0x0004;
+        const AFD_POLL_DISCONNECT: u32 = 0x0008;
+        const AFD_POLL_ABORT: u32 = 0x0010;
+        const AFD_POLL_CONNECT_FAIL: u32 = 0x0100;
+
+        let mut signaled: u32 = 0;
+        if events.contains(litebox::event::Events::IN)
+            && (self.requested_events & AFD_POLL_RECEIVE) != 0
+        {
+            signaled |= AFD_POLL_RECEIVE;
+        }
+        if events.contains(litebox::event::Events::OUT)
+            && (self.requested_events & AFD_POLL_SEND) != 0
+        {
+            signaled |= AFD_POLL_SEND;
+        }
+        if events.contains(litebox::event::Events::HUP)
+            && (self.requested_events & AFD_POLL_DISCONNECT) != 0
+        {
+            signaled |= AFD_POLL_DISCONNECT;
+        }
+        if events.contains(litebox::event::Events::ERR) {
+            if (self.requested_events & AFD_POLL_ABORT) != 0 {
+                signaled |= AFD_POLL_ABORT;
+            }
+            if (self.requested_events & AFD_POLL_CONNECT_FAIL) != 0 {
+                signaled |= AFD_POLL_CONNECT_FAIL;
+            }
+        }
+
+        if signaled == 0 {
+            // Events fired but nothing we care about — re-arm.
+            self.fired
+                .store(false, core::sync::atomic::Ordering::Release);
+            return;
+        }
+
+        // Write AFD_SELECT output buffer:
+        //   +0x08: NumberOfHandles = 1
+        //   +0x10: Entry[0].Handle = polled_handle
+        //   +0x18: Entry[0].Events = signaled
+        //   +0x1C: Entry[0].Status = 0
+        let buf = self.output_buf;
+        if buf != 0 && self.output_buf_len >= 0x20 {
+            super::try_write_guest_value_unaligned::<u32>(buf + 0x08, 1u32); // 1 handle
+            super::try_write_guest_value_unaligned::<u64>(buf + 0x10, self.polled_handle);
+            super::try_write_guest_value_unaligned::<u32>(buf + 0x18, signaled);
+            super::try_write_guest_value_unaligned::<u32>(buf + 0x1C, 0u32); // STATUS_SUCCESS
+        }
+
+        // Write IO_STATUS_BLOCK.
+        let info_size = 0x20usize; // header + 1 entry
+        if self.io_status_block != 0 {
+            super::try_write_guest_value_unaligned::<u64>(self.io_status_block, 0u64); // STATUS_SUCCESS (full 8-byte union)
+            super::try_write_guest_value_unaligned::<usize>(self.io_status_block + 8, info_size);
+        }
+
+        #[cfg(feature = "trace_debug")]
+        {
+            use litebox::platform::DebugLogProvider as _;
+            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                "NT shim: SocketSelectIocpObserver fired events={events:?} signaled=0x{signaled:X} handle=0x{:X}\n",
+                self.polled_handle,
+            ));
+
+            // Readback the AFD_POLL output buffer to verify
+            if buf != 0 && self.output_buf_len >= 0x20 {
+                let mut poll_bytes = [0u8; 32];
+                for i in 0..32 {
+                    poll_bytes[i] =
+                        super::try_read_guest_value_unaligned::<u8>(buf + i).unwrap_or(0xFF);
+                }
+                let hex: alloc::string::String = poll_bytes
+                    .iter()
+                    .map(|b| alloc::format!("{:02X} ", b))
+                    .collect();
+                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                    "NT shim: AFD_POLL output readback at 0x{buf:X}: [{hex}]\n"
+                ));
+            }
+        }
+
+        self.iocp.push(IoCompletionEntry {
+            key_context: self.key_context,
+            apc_context: self.apc_context,
+            status: NtStatus::STATUS_SUCCESS,
+            information: info_size,
         });
     }
 }
@@ -1710,7 +1876,10 @@ impl SocketRecvIocpObserver {
     /// Write IO_STATUS_BLOCK and post IOCP completion.
     fn post_completion(&self, status: NtStatus, information: usize) {
         if self.io_status_block != 0 {
-            super::try_write_guest_value_unaligned::<u32>(self.io_status_block, status.0 as u32);
+            super::try_write_guest_value_unaligned::<u64>(
+                self.io_status_block,
+                (status.0 as u32) as u64,
+            );
             super::try_write_guest_value_unaligned::<usize>(self.io_status_block + 8, information);
         }
 
@@ -1733,6 +1902,182 @@ impl SocketRecvIocpObserver {
 }
 
 impl litebox::event::observer::Observer<litebox::event::Events> for SocketRecvIocpObserver {
+    fn on_events(&self, _events: &litebox::event::Events) {
+        self.do_try_read_and_complete();
+    }
+}
+
+/// Observer that completes an async event-based datagram RECV when data arrives.
+///
+/// Used by `AFD_RECV_DATAGRAM` when the caller provides an event handle but no
+/// IOCP (apc_context == 0).  On data arrival, scatters data into guest WSABUF
+/// buffers, writes the source address into the TDI output structure, updates the
+/// IO_STATUS_BLOCK, and signals the event.
+pub struct SocketRecvDatagramEventObserver {
+    /// Lock-free proxy for reading from the socket's RX ring buffer.
+    proxy: alloc::sync::Arc<litebox::net::socket_channel::NetworkProxy<Platform>>,
+    /// Temporary buffer for `try_read` output.
+    recv_buf: spin::Mutex<alloc::vec::Vec<u8>>,
+    /// Guest WSABUF entries: (guest_ptr, len) pairs.
+    wsabuf_entries: alloc::vec::Vec<(usize, usize)>,
+    /// Receive flags (e.g. PEEK).
+    recv_flags: litebox::net::ReceiveFlags,
+    /// SOCKADDR output address pointer (0 = none).
+    address_ptr: u64,
+    /// AddressLength output pointer (0 = none).
+    address_len_ptr: u64,
+    /// IO_STATUS_BLOCK address in guest memory.
+    io_status_block: usize,
+    /// The event object to signal on completion.
+    event: Arc<EventObject>,
+    /// Ensures at most one successful completion.
+    fired: core::sync::atomic::AtomicBool,
+}
+
+impl SocketRecvDatagramEventObserver {
+    /// Create a new observer for a pending async event-based datagram RECV.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        proxy: alloc::sync::Arc<litebox::net::socket_channel::NetworkProxy<Platform>>,
+        total_len: usize,
+        wsabuf_entries: alloc::vec::Vec<(usize, usize)>,
+        recv_flags: litebox::net::ReceiveFlags,
+        address_ptr: u64,
+        address_len_ptr: u64,
+        io_status_block: usize,
+        event: Arc<EventObject>,
+    ) -> Self {
+        Self {
+            proxy,
+            recv_buf: spin::Mutex::new(alloc::vec![0u8; total_len]),
+            wsabuf_entries,
+            recv_flags,
+            address_ptr,
+            address_len_ptr,
+            io_status_block,
+            event,
+            fired: core::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Returns `true` if this observer has already completed.
+    pub fn is_fired(&self) -> bool {
+        self.fired.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Attempt to complete the pending RECV right now (inline retry after
+    /// observer registration).
+    pub fn try_complete_now(&self) -> bool {
+        self.do_try_read_and_complete()
+    }
+
+    /// Core logic: try to read a datagram, scatter to guest buffers, write
+    /// source address, update IO_STATUS_BLOCK, and signal event.
+    fn do_try_read_and_complete(&self) -> bool {
+        if self.fired.swap(true, core::sync::atomic::Ordering::AcqRel) {
+            return true;
+        }
+
+        let mut buf = self.recv_buf.lock();
+        let mut source_addr: Option<core::net::SocketAddr> = None;
+        match self
+            .proxy
+            .try_read(&mut buf, self.recv_flags, Some(&mut source_addr))
+        {
+            Ok(n) if n > 0 => {
+                // Scatter received data into guest WSABUF array.
+                let mut offset = 0usize;
+                for &(buf_ptr, len) in &self.wsabuf_entries {
+                    if offset >= n {
+                        break;
+                    }
+                    let chunk = core::cmp::min(len, n - offset);
+                    for j in 0..chunk {
+                        super::try_write_guest_value_unaligned(buf_ptr + j, buf[offset + j]);
+                    }
+                    offset += chunk;
+                }
+                drop(buf);
+
+                // Write source address back as SOCKADDR_IN.
+                if self.address_ptr != 0 {
+                    if let Some(core::net::SocketAddr::V4(v4)) = source_addr {
+                        let addr = self.address_ptr as usize;
+                        super::try_write_guest_value_unaligned::<u16>(addr, 2u16); // AF_INET
+                        super::try_write_guest_value_unaligned::<u16>(addr + 2, v4.port().to_be());
+                        super::try_write_guest_value_unaligned(addr + 4, v4.ip().octets());
+                        // Zero out sin_zero
+                        super::try_write_guest_value_unaligned::<u64>(addr + 8, 0u64);
+                        // Update AddressLength if the pointer is provided.
+                        if self.address_len_ptr != 0 {
+                            super::try_write_guest_value_unaligned::<i32>(
+                                self.address_len_ptr as usize,
+                                16i32, // sizeof(SOCKADDR_IN)
+                            );
+                        }
+                    }
+                }
+
+                // Write IO_STATUS_BLOCK.
+                if self.io_status_block != 0 {
+                    super::try_write_guest_value_unaligned::<u64>(
+                        self.io_status_block,
+                        (NtStatus::STATUS_SUCCESS.0 as u32) as u64,
+                    );
+                    super::try_write_guest_value_unaligned::<usize>(self.io_status_block + 8, n);
+                }
+
+                #[cfg(feature = "trace_debug")]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NT shim: SocketRecvDatagramEventObserver completed bytes={n} from={source_addr:?}\n"
+                    ));
+                }
+
+                // Signal the event.
+                let mut signaled = self.event.state.lock();
+                *signaled = true;
+                drop(signaled);
+                self.event.wake_waiters();
+
+                true
+            }
+            Ok(_) => {
+                // No data yet — re-arm.
+                self.fired
+                    .store(false, core::sync::atomic::Ordering::Release);
+                false
+            }
+            Err(litebox::net::errors::ReceiveError::InvalidFd) => {
+                drop(buf);
+                if self.io_status_block != 0 {
+                    super::try_write_guest_value_unaligned::<u64>(
+                        self.io_status_block,
+                        (NtStatus::STATUS_INVALID_HANDLE.0 as u32) as u64,
+                    );
+                    super::try_write_guest_value_unaligned::<usize>(self.io_status_block + 8, 0);
+                }
+                let mut signaled = self.event.state.lock();
+                *signaled = true;
+                drop(signaled);
+                self.event.wake_waiters();
+                true
+            }
+            Err(_) => {
+                // Re-arm for transient errors.
+                drop(buf);
+                self.fired
+                    .store(false, core::sync::atomic::Ordering::Release);
+                false
+            }
+        }
+    }
+}
+
+impl litebox::event::observer::Observer<litebox::event::Events>
+    for SocketRecvDatagramEventObserver
+{
     fn on_events(&self, _events: &litebox::event::Events) {
         self.do_try_read_and_complete();
     }

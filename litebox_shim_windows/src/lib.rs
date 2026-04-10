@@ -9978,13 +9978,31 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                 (NtStatus::STATUS_SUCCESS, false)
             }
             NtSyscallId::NtSetTimer2 => {
-                // NtSetTimer2(Handle, DueTime, Period, ...)
-                // DueTime: PLARGE_INTEGER — negative = relative 100ns, positive = absolute FILETIME
-                // Period: PLARGE_INTEGER — repeat interval in 100ns, 0 = one-shot
+                // NtSetTimer2(Handle, DueTime: PLARGE_INTEGER, Period: PLARGE_INTEGER, Parameters)
+                // DueTime: pointer to LARGE_INTEGER — negative = relative 100ns, positive = absolute FILETIME
+                // Period: pointer to LARGE_INTEGER — repeat interval in 100ns, NULL or 0 = one-shot
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let handle = args.arg0 as u32;
-                let due_time_raw = args.arg1 as i64;
-                let period_raw = args.arg2 as i64;
+                let due_time_ptr = args.arg1;
+                let period_ptr = args.arg2;
+
+                // Dereference pointers to read the actual LARGE_INTEGER values.
+                let due_time_raw = if due_time_ptr != 0 {
+                    match try_read_guest_value_unaligned::<i64>(due_time_ptr) {
+                        Some(v) => v,
+                        None => { return (NtStatus::STATUS_ACCESS_VIOLATION, false); }
+                    }
+                } else {
+                    0i64  // NULL pointer → immediate
+                };
+                let period_raw = if period_ptr != 0 {
+                    match try_read_guest_value_unaligned::<i64>(period_ptr) {
+                        Some(v) => v,
+                        None => { return (NtStatus::STATUS_ACCESS_VIOLATION, false); }
+                    }
+                } else {
+                    0i64  // NULL pointer → one-shot
+                };
 
                 let handles = self.shared.handles.lock();
                 let timer = handles.with(handle, |entry| match &entry.object {
@@ -10017,7 +10035,7 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                         {
                             use litebox::platform::DebugLogProvider as _;
                             litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                                "NT shim: NtSetTimer2: handle={handle:#X} due_time_raw={due_time_raw} abs_due={abs_due_time} period={period_raw}\n"
+                                "NT shim: NtSetTimer2: handle={handle:#X} due_time_ptr={due_time_ptr:#X} due_time_raw={due_time_raw} abs_due={abs_due_time} period_ptr={period_ptr:#X} period={period_raw}\n"
                             ));
                         }
 
@@ -11602,7 +11620,9 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                         const IOCTL_AFD_CONNECT: u32 = 0x12007;
                         const IOCTL_AFD_START_LISTEN: u32 = 0x1200B;
                         const IOCTL_AFD_RECV: u32 = 0x12017;
+                        const IOCTL_AFD_RECV_DATAGRAM: u32 = 0x1201B;
                         const IOCTL_AFD_SEND: u32 = 0x1201F;
+                        const IOCTL_AFD_SEND_DATAGRAM: u32 = 0x12023;
                         const IOCTL_AFD_SELECT: u32 = 0x12024;
                         const IOCTL_AFD_GET_INFO: u32 = 0x1207B;
                         const IOCTL_AFD_SET_INFO: u32 = 0x1203B;
@@ -11634,6 +11654,19 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                         }
 
                         let event_handle = args.arg1 as u32;
+
+                        // The IO Manager resets the caller-supplied event to
+                        // non-signaled before starting any I/O operation. This
+                        // prevents stale signaled state from a previous IOCTL
+                        // from being visible to the caller.
+                        if event_handle != 0 {
+                            let handles = self.shared.handles.lock();
+                            handles.with(event_handle, |entry| {
+                                if let handle_table::NtObject::Event(event) = &entry.object {
+                                    *event.state.lock() = false;
+                                }
+                            });
+                        }
 
                         #[cfg(feature = "trace_debug")]
                         {
@@ -11931,16 +11964,32 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
 
                             IOCTL_AFD_CONNECT => {
                                 // Connect a socket to a remote address.
-                                // Input structure (from ReactOS AFD_CONNECT_INFO):
-                                //   +0x00: u8   UseSAN
-                                //   +0x01: [u8;3] padding
-                                //   +0x04: u32  Root (endpoint handle for root/leaf joins)
-                                //   +0x08: u32  Unknown
-                                //   +0x0C: [u8] SOCKADDR (16 bytes for AF_INET)
-                                // SOCKADDR starts at offset 0x0C (12).
-                                if input_length < 28 || input_buffer == 0 {
+                                // Input structure (AFD_CONNECT_JOIN_INFO_TL on x64):
+                                //   +0x00: u8     SanActive (+ 7 bytes padding)
+                                //   +0x08: u64    RootEndpoint (HANDLE, NULL for non-multipoint)
+                                //   +0x10: u64    ConnectEndpoint (HANDLE)
+                                //   +0x18: [u8]   SOCKADDR (16 bytes for AF_INET)
+                                // Total for IPv4: 0x28 (40) bytes.
+                                // SOCKADDR starts at offset 0x18 (24).
+                                if input_length < 0x28 || input_buffer == 0 {
                                     NtStatus::STATUS_INVALID_PARAMETER
                                 } else {
+                                    // Debug: dump the first 40 bytes of the CONNECT input buffer
+                                    #[cfg(feature = "trace_debug")]
+                                    {
+                                        use litebox::platform::DebugLogProvider as _;
+                                        let mut hex = alloc::string::String::new();
+                                        let dump_len = core::cmp::min(input_length as usize, 48);
+                                        for i in 0..dump_len {
+                                            if let Some(b) = try_read_guest_value_unaligned::<u8>(input_buffer + i) {
+                                                use core::fmt::Write;
+                                                let _ = write!(hex, "{b:02X} ");
+                                            }
+                                        }
+                                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                            "NT shim: AFD CONNECT raw input ({input_length} bytes): {hex}\n"
+                                        ));
+                                    }
                                     #[repr(C, packed)]
                                     #[derive(Clone, Copy)]
                                     struct SockAddrIn {
@@ -11950,7 +11999,7 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                                         _pad: [u8; 8],
                                     }
 
-                                    let sa_ptr = input_buffer + 0x0C;
+                                    let sa_ptr = input_buffer + 0x18;
                                     if let Some(sa) = try_read_guest_value_unaligned::<SockAddrIn>(sa_ptr) {
                                         let port = u16::from_be(sa.port);
                                         let ip = core::net::Ipv4Addr::from(sa.addr);
@@ -11958,7 +12007,7 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                                             core::net::SocketAddrV4::new(ip, port),
                                         );
 
-                                        #[cfg(debug_assertions)]
+                                        #[cfg(any(debug_assertions, feature = "trace_debug"))]
                                         {
                                             use litebox::platform::DebugLogProvider as _;
                                             litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
@@ -11987,7 +12036,7 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
 
                                             match connect_result {
                                                 Some(Ok(())) => {
-                                                    #[cfg(debug_assertions)]
+                                                    #[cfg(any(debug_assertions, feature = "trace_debug"))]
                                                     {
                                                         use litebox::platform::DebugLogProvider as _;
                                                         litebox_platform_multiplex::platform().debug_log_print(
@@ -11997,7 +12046,7 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                                                     NtStatus::STATUS_SUCCESS
                                                 }
                                                 Some(Err(litebox::net::errors::ConnectError::InProgress)) => {
-                                                    #[cfg(debug_assertions)]
+                                                    #[cfg(any(debug_assertions, feature = "trace_debug"))]
                                                     {
                                                         use litebox::platform::DebugLogProvider as _;
                                                         litebox_platform_multiplex::platform().debug_log_print(
@@ -12067,7 +12116,7 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                                                     }
                                                 }
                                                 Some(Err(e)) => {
-                                                    #[cfg(debug_assertions)]
+                                                    #[cfg(any(debug_assertions, feature = "trace_debug"))]
                                                     {
                                                         use litebox::platform::DebugLogProvider as _;
                                                         litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
@@ -12095,14 +12144,17 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                                 //     +0x00: u64  Handle
                                 //     +0x08: u32  Events (input: requested, output: signaled)
                                 //     +0x0C: u32  Status (output: NTSTATUS)
-                                const AFD_POLL_RECEIVE: u32 = 0x01;
-                                const _AFD_POLL_RECEIVE_EXPEDITED: u32 = 0x02;
-                                const AFD_POLL_SEND: u32 = 0x04;
-                                const AFD_POLL_CONNECT: u32 = 0x08;
-                                const _AFD_POLL_ACCEPT: u32 = 0x10;
-                                const AFD_POLL_DISCONNECT: u32 = 0x20;
-                                const AFD_POLL_ABORT: u32 = 0x40;
-                                const AFD_POLL_CONNECT_FAIL: u32 = 0x100;
+                                //
+                                // AFD_POLL event constants (from libuv's src/win/winsock.h):
+                                const AFD_POLL_RECEIVE: u32 = 0x0001;
+                                const _AFD_POLL_RECEIVE_EXPEDITED: u32 = 0x0002;
+                                const AFD_POLL_SEND: u32 = 0x0004;
+                                const AFD_POLL_DISCONNECT: u32 = 0x0008;
+                                const AFD_POLL_ABORT: u32 = 0x0010;
+                                const _AFD_POLL_LOCAL_CLOSE: u32 = 0x0020;
+                                const _AFD_POLL_CONNECT: u32 = 0x0040;
+                                const _AFD_POLL_ACCEPT: u32 = 0x0080;
+                                const AFD_POLL_CONNECT_FAIL: u32 = 0x0100;
 
                                 let buf = output_buffer;
                                 let buf_len = output_length as usize;
@@ -12112,11 +12164,12 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                                 } else {
                                     let num_handles = try_read_guest_value_unaligned::<u32>(buf + 0x08).unwrap_or(0);
 
-                                    #[cfg(debug_assertions)]
+                                    #[cfg(any(debug_assertions, feature = "trace_debug"))]
                                     {
                                         use litebox::platform::DebugLogProvider as _;
+                                        let timeout = try_read_guest_value_unaligned::<i64>(buf).unwrap_or(0);
                                         litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                                            "NT shim: AFD SELECT sock_id={sock_id} num_handles={num_handles}\n"
+                                            "NT shim: AFD SELECT handle=0x{sock_handle:X} num_handles={num_handles} timeout={timeout}\n"
                                         ));
                                     }
 
@@ -12130,10 +12183,17 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                                         }
 
                                         let mut any_ready = false;
+                                        // Save first entry's info for async path (before writeback).
+                                        let mut first_entry_handle: u64 = 0;
+                                        let mut first_entry_requested: u32 = 0;
                                         for i in 0..num_handles {
                                             let entry_base = buf + 0x10 + (i as usize) * 16;
                                             let handle_val = try_read_guest_value_unaligned::<u64>(entry_base).unwrap_or(0);
                                             let requested = try_read_guest_value_unaligned::<u32>(entry_base + 8).unwrap_or(0);
+                                            if i == 0 {
+                                                first_entry_handle = handle_val;
+                                                first_entry_requested = requested;
+                                            }
 
                                             // Look up the socket proxy by handle.
                                             let proxy_opt = {
@@ -12152,6 +12212,14 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                                                 use litebox::event::IOPollable as _;
                                                 let events = proxy.check_io_events();
 
+                                                #[cfg(feature = "trace_debug")]
+                                                {
+                                                    use litebox::platform::DebugLogProvider as _;
+                                                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                        "NT shim: AFD SELECT entry handle=0x{handle_val:X} requested=0x{requested:X} events={events:?}\n"
+                                                    ));
+                                                }
+
                                                 // Map litebox Events to AFD_POLL events.
                                                 if events.contains(litebox::event::Events::IN) && (requested & AFD_POLL_RECEIVE) != 0 {
                                                     signaled |= AFD_POLL_RECEIVE;
@@ -12160,9 +12228,12 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                                                     if (requested & AFD_POLL_SEND) != 0 {
                                                         signaled |= AFD_POLL_SEND;
                                                     }
-                                                    if (requested & AFD_POLL_CONNECT) != 0 {
-                                                        signaled |= AFD_POLL_CONNECT;
-                                                    }
+                                                    // Note: AFD_POLL_CONNECT is NOT mapped from Events::OUT.
+                                                    // CONNECT is a one-shot event signaled when an async TCP
+                                                    // connect completes. Our connects are synchronous, so we
+                                                    // never need to report it in poll results. When nothing is
+                                                    // ready (no IN data), the SELECT returns STATUS_PENDING and
+                                                    // completes via IOCP when actual data arrives.
                                                 }
                                                 if events.contains(litebox::event::Events::HUP) && (requested & AFD_POLL_DISCONNECT) != 0 {
                                                     signaled |= AFD_POLL_DISCONNECT;
@@ -12188,13 +12259,13 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                                             try_write_guest_value_unaligned(entry_base + 12, entry_status);
                                         }
 
-                                        #[cfg(debug_assertions)]
-                                        {
-                                            use litebox::platform::DebugLogProvider as _;
-                                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                                                "NT shim: AFD SELECT completed any_ready={any_ready}\n"
-                                            ));
-                                        }
+                                    #[cfg(any(debug_assertions, feature = "trace_debug"))]
+                                    {
+                                        use litebox::platform::DebugLogProvider as _;
+                                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                            "NT shim: AFD SELECT completed any_ready={any_ready}\n"
+                                        ));
+                                    }
 
                                         if any_ready {
                                             // Write IO_STATUS_BLOCK Information = output size.
@@ -12203,14 +12274,106 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                                             }
                                             NtStatus::STATUS_SUCCESS
                                         } else {
-                                            // No handles ready. The Timeout field determines behavior:
-                                            // 0 = immediate poll → STATUS_SUCCESS with 0 handles ready
-                                            // We return success with NumberOfHandles=0 to indicate nothing ready.
-                                            try_write_guest_value_unaligned(buf + 0x08, 0u32);
-                                            if io_status_ptr != 0 {
-                                                try_write_guest_value_unaligned(io_status_ptr + 8, 0x10usize);
+                                            // No handles ready — register an async observer if IOCP
+                                            // is associated with the control socket, and a socket
+                                            // proxy was found for the polled handle.
+                                            //
+                                            // For simplicity, we only support the single-handle case
+                                            // (num_handles == 1) which covers libuv/c-ares usage.
+                                            let mut async_registered = false;
+                                            if num_handles == 1 {
+                                                let handle_val = first_entry_handle;
+                                                let req_events = first_entry_requested;
+
+                                                // Get IOCP and proxy for the polled socket.
+                                                let iocp_and_proxy = {
+                                                    let handles = self.shared.handles.lock();
+                                                    let iocp_info = handles.with(sock_handle, |entry| match &entry.object {
+                                                        handle_table::NtObject::Socket { io_completion, .. } => {
+                                                            io_completion.as_ref().map(|(iocp, key)| (alloc::sync::Arc::clone(iocp), *key))
+                                                        }
+                                                        _ => None,
+                                                    }).flatten();
+                                                    let proxy_arc = handles.with(handle_val as u32, |entry| match &entry.object {
+                                                        handle_table::NtObject::Socket { proxy, .. } => Some(alloc::sync::Arc::clone(proxy)),
+                                                        _ => None,
+                                                    }).flatten();
+                                                    iocp_info.zip(proxy_arc)
+                                                };
+
+                                                if let Some(((iocp, key), proxy)) = iocp_and_proxy {
+                                                    let select_apc_context = args.arg3;
+                                                    #[cfg(feature = "trace_debug")]
+                                                    let iocp_ptr_for_log = alloc::sync::Arc::as_ptr(&iocp) as usize;
+                                                    let observer = alloc::sync::Arc::new(
+                                                        handle_table::SocketSelectIocpObserver::new(
+                                                            iocp,
+                                                            key,
+                                                            select_apc_context,
+                                                            io_status_ptr,
+                                                            buf,
+                                                            buf_len,
+                                                            handle_val,
+                                                            req_events,
+                                                        ),
+                                                    );
+
+                                                    // Register on the polled socket's proxy.
+                                                    use litebox::event::IOPollable as _;
+                                                    proxy.register_observer(
+                                                        alloc::sync::Arc::downgrade(&observer) as alloc::sync::Weak<dyn litebox::event::observer::Observer<litebox::event::Events>>,
+                                                        litebox::event::Events::IN | litebox::event::Events::OUT | litebox::event::Events::HUP | litebox::event::Events::ERR,
+                                                    );
+
+                                                    // "Register then check" — re-check after registration
+                                                    // to avoid a race where data arrived between check and register.
+                                                    let events = proxy.check_io_events();
+                                                    if !events.is_empty() {
+                                                        // Re-run the observer's on_events manually.
+                                                        use litebox::event::observer::Observer as _;
+                                                        observer.on_events(&events);
+                                                    }
+
+                                                    // Store the observer Arc to keep it alive.
+                                                    {
+                                                        let handles = self.shared.handles.lock();
+                                                        handles.with_mut(sock_handle, |entry| {
+                                                            if let handle_table::NtObject::Socket { pending_select_observers, .. } = &mut entry.object {
+                                                                // Prune fired observers.
+                                                                pending_select_observers.retain(|obs| !obs.is_fired());
+                                                                pending_select_observers.push(observer);
+                                                            }
+                                                        });
+                                                    }
+
+                                                    // Set IO_STATUS_BLOCK to STATUS_PENDING.
+                                                    if io_status_ptr != 0 {
+                                                        try_write_guest_value_unaligned::<u32>(io_status_ptr, NtStatus::STATUS_PENDING.0 as u32);
+                                                        try_write_guest_value_unaligned::<usize>(io_status_ptr + 8, 0);
+                                                    }
+
+                                                    async_registered = true;
+
+                                                    #[cfg(feature = "trace_debug")]
+                                                    {
+                                                        use litebox::platform::DebugLogProvider as _;
+                                                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                            "NT shim: AFD SELECT async pending, observer registered for handle=0x{handle_val:X} events=0x{req_events:X} iocp_ptr=0x{iocp_ptr_for_log:X} apc_ctx=0x{select_apc_context:X} io_status=0x{io_status_ptr:X}\n",
+                                                        ));
+                                                    }
+                                                }
                                             }
-                                            NtStatus::STATUS_SUCCESS
+
+                                            if async_registered {
+                                                NtStatus::STATUS_PENDING
+                                            } else {
+                                                // Fallback: immediate return with 0 handles.
+                                                try_write_guest_value_unaligned(buf + 0x08, 0u32);
+                                                if io_status_ptr != 0 {
+                                                    try_write_guest_value_unaligned(io_status_ptr + 8, 0x10usize);
+                                                }
+                                                NtStatus::STATUS_SUCCESS
+                                            }
                                         }
                                     }
                                 }
@@ -12410,11 +12573,13 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                                                             io_information = n;
                                                             result_status = NtStatus::STATUS_SUCCESS;
 
-                                                            #[cfg(debug_assertions)]
+                                                            #[cfg(feature = "trace_debug")]
                                                             {
                                                                 use litebox::platform::DebugLogProvider as _;
+                                                                let dump_len = core::cmp::min(n, 32);
+                                                                let hex: alloc::string::String = send_buf[..dump_len].iter().map(|b| alloc::format!("{:02X} ", b)).collect();
                                                                 litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                                                                    "NT shim: AFD SEND handle=0x{sock_handle:X} sent={n}\n"
+                                                                    "NT shim: AFD SEND handle=0x{sock_handle:X} sent={n} data=[{hex}]\n"
                                                                 ));
                                                             }
                                                             break;
@@ -12452,6 +12617,309 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                                                                 use litebox::platform::DebugLogProvider as _;
                                                                 litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
                                                                     "NT shim: AFD SEND error: {_e:?}\n"
+                                                                ));
+                                                            }
+                                                            result_status = NtStatus::STATUS_INVALID_PARAMETER;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                result_status
+                                            } else {
+                                                NtStatus::STATUS_INVALID_HANDLE
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            IOCTL_AFD_SEND_DATAGRAM => {
+                                // Send a datagram to a specified destination (UDP sendto).
+                                //
+                                // Input buffer: AFD_SEND_DATAGRAM_INFO (on x64):
+                                //   +0x00: u64  BufferArray — pointer to WSABUF[] in guest memory
+                                //   +0x08: u32  BufferCount
+                                //   +0x0C: u32  AfdFlags
+                                //   +0x10: u64  TdiConnection — pointer to TDI_CONNECTION_INFORMATION
+                                //
+                                // TDI_CONNECTION_INFORMATION (simplified):
+                                //   +0x00: u32  EventCounter (ignored)
+                                //   +0x04: u32  EndpointLength (sizeof TRANSPORT_ADDRESS)
+                                //   +0x08: u64  EndpointAddress — pointer to TRANSPORT_ADDRESS
+                                //
+                                // TRANSPORT_ADDRESS (simplified for IPv4):
+                                //   +0x00: i32  TAAddressCount (always 1)
+                                //   +0x04: u16  AddressLength (always 14 for IPv4)
+                                //   +0x06: u16  AddressType (TDI_ADDRESS_TYPE_IP = 2)
+                                //   +0x08: u16  sin_port (network byte order)
+                                //   +0x0A: u32  in_addr (network byte order)
+                                //
+                                // Following the Linux shim pattern from net.rs sendto():
+                                //   1. Auto-bind the UDP socket if unbound
+                                //   2. Gather buffers from the WSABUF scatter list
+                                //   3. Call proxy.try_write(buf, SendFlags::empty(), Some(dest))
+
+                                if input_length < 0x18 || input_buffer == 0 {
+                                    NtStatus::STATUS_INVALID_PARAMETER
+                                } else {
+                                    let buffer_array_ptr = try_read_guest_value_unaligned::<u64>(input_buffer).unwrap_or(0);
+                                    let buffer_count = try_read_guest_value_unaligned::<u32>(input_buffer + 0x08).unwrap_or(0);
+                                    let _afd_flags = try_read_guest_value_unaligned::<u32>(input_buffer + 0x0C).unwrap_or(0);
+                                    let tdi_conn_ptr = try_read_guest_value_unaligned::<u64>(input_buffer + 0x10).unwrap_or(0);
+
+                                    #[cfg(feature = "trace_debug")]
+                                    {
+                                        use litebox::platform::DebugLogProvider as _;
+                                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                            "NT shim: AFD SEND_DATAGRAM handle=0x{sock_handle:X} buf_count={buffer_count} tdi=0x{tdi_conn_ptr:X}\n"
+                                        ));
+                                        // Hex dump first 0x68 bytes of input buffer
+                                        let dump_len = core::cmp::min(input_length as usize, 0x68usize);
+                                        let mut hex = alloc::string::String::new();
+                                        for off in 0..dump_len {
+                                            if let Some(b) = try_read_guest_value_unaligned::<u8>(input_buffer + off) {
+                                                use core::fmt::Write;
+                                                let _ = write!(hex, "{b:02X} ");
+                                            }
+                                        }
+                                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                            "NT shim: AFD SEND_DATAGRAM hex[0..0x{dump_len:X}]: {hex}\n"
+                                        ));
+                                    }
+
+                                    // On newer Windows 10/11, the AFD_SEND_DATAGRAM_INFO structure
+                                    // may be larger (0x68 bytes). The TDI_CONNECTION_INFORMATION
+                                    // can be inline at a different offset. If tdi_conn_ptr is 0,
+                                    // try reading from the alternate inline location.
+                                    //
+                                    // Alternate layout (observed in_len=0x68):
+                                    //   +0x00: BufferArray ptr (8)
+                                    //   +0x08: BufferCount (4)
+                                    //   +0x0C: AfdFlags (4)
+                                    //   +0x10: TDI_REQUEST inline (~0x48 bytes)
+                                    //   +0x58: LONG EndpointLength (4)  
+                                    //   +0x5C: (4 pad)
+                                    //   +0x60: PVOID EndpointAddress (8)
+                                    // Total: 0x68
+                                    let effective_tdi_conn_ptr = if tdi_conn_ptr != 0 {
+                                        tdi_conn_ptr
+                                    } else if input_length >= 0x68 {
+                                        // Inline TDI_CONNECTION_INFORMATION at +0x54 within the buffer
+                                        // EventCounter at +0x54, EndpointLength at +0x58, EndpointAddress at +0x60
+                                        // But we read it directly, so set a sentinel to use the inline path.
+                                        0xFFFF_FFFF_FFFF_FFFF // sentinel: use inline path
+                                    } else {
+                                        0
+                                    };
+
+                                    let dest_addr = if effective_tdi_conn_ptr == 0xFFFF_FFFF_FFFF_FFFF {
+                                        // Inline path: read EndpointLength and EndpointAddress from fixed offsets
+                                        let endpoint_len = try_read_guest_value_unaligned::<u32>(input_buffer + 0x58).unwrap_or(0);
+                                        let endpoint_addr_ptr = try_read_guest_value_unaligned::<u64>(input_buffer + 0x60).unwrap_or(0);
+                                        #[cfg(feature = "trace_debug")]
+                                        {
+                                            use litebox::platform::DebugLogProvider as _;
+                                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                "NT shim: AFD SEND_DATAGRAM inline TDI: endpoint_len={endpoint_len} addr_ptr=0x{endpoint_addr_ptr:X}\n"
+                                            ));
+                                        }
+                                        if endpoint_addr_ptr != 0 && endpoint_len >= 0x0E {
+                                            // TRANSPORT_ADDRESS at endpoint_addr_ptr
+                                            // Hex dump the TRANSPORT_ADDRESS
+                                            #[cfg(feature = "trace_debug")]
+                                            {
+                                                use litebox::platform::DebugLogProvider as _;
+                                                let ta_dump_len = core::cmp::min(endpoint_len as usize, 0x20usize);
+                                                let mut hex = alloc::string::String::new();
+                                                for off in 0..ta_dump_len {
+                                                    if let Some(b) = try_read_guest_value_unaligned::<u8>(endpoint_addr_ptr as usize + off) {
+                                                        use core::fmt::Write;
+                                                        let _ = write!(hex, "{b:02X} ");
+                                                    }
+                                                }
+                                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                    "NT shim: AFD SEND_DATAGRAM TRANSPORT_ADDRESS hex: {hex}\n"
+                                                ));
+                                            }
+                                            // The EndpointAddress in the inline TDI path points
+                                            // directly to a SOCKADDR_IN (not TRANSPORT_ADDRESS):
+                                            //   +0x00: u16  sin_family (AF_INET = 2)
+                                            //   +0x02: u16  sin_port (network byte order)
+                                            //   +0x04: u32  sin_addr (network byte order)
+                                            let _sin_family = try_read_guest_value_unaligned::<u16>(endpoint_addr_ptr as usize).unwrap_or(0);
+                                            let sin_port = try_read_guest_value_unaligned::<u16>(endpoint_addr_ptr as usize + 0x02).unwrap_or(0);
+                                            let in_addr = try_read_guest_value_unaligned::<[u8; 4]>(endpoint_addr_ptr as usize + 0x04).unwrap_or([0; 4]);
+                                            let port = u16::from_be(sin_port);
+                                            let ip = core::net::Ipv4Addr::from(in_addr);
+                                            #[cfg(feature = "trace_debug")]
+                                            {
+                                                use litebox::platform::DebugLogProvider as _;
+                                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                    "NT shim: AFD SEND_DATAGRAM inline TDI parsed: port={port} ip={ip}\n"
+                                                ));
+                                            }
+                                            if port != 0 && !ip.is_unspecified() {
+                                                Some(core::net::SocketAddr::V4(
+                                                    core::net::SocketAddrV4::new(ip, port),
+                                                ))
+                                            } else {
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    } else if effective_tdi_conn_ptr != 0 {
+                                        // TDI_CONNECTION_INFORMATION:
+                                        //   +0x08: u64  EndpointAddress ptr (on x64)
+                                        let endpoint_addr_ptr = try_read_guest_value_unaligned::<u64>(tdi_conn_ptr as usize + 0x08).unwrap_or(0);
+                                        if endpoint_addr_ptr != 0 {
+                                            // TRANSPORT_ADDRESS:
+                                            //   +0x08: u16  sin_port (network byte order)
+                                            //   +0x0A: u32  in_addr (network byte order)
+                                            let sin_port = try_read_guest_value_unaligned::<u16>(endpoint_addr_ptr as usize + 0x08).unwrap_or(0);
+                                            let in_addr = try_read_guest_value_unaligned::<[u8; 4]>(endpoint_addr_ptr as usize + 0x0A).unwrap_or([0; 4]);
+                                            let port = u16::from_be(sin_port);
+                                            let ip = core::net::Ipv4Addr::from(in_addr);
+                                            if port != 0 && !ip.is_unspecified() {
+                                                Some(core::net::SocketAddr::V4(
+                                                    core::net::SocketAddrV4::new(ip, port),
+                                                ))
+                                            } else {
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    };
+
+                                    #[cfg(feature = "trace_debug")]
+                                    {
+                                        use litebox::platform::DebugLogProvider as _;
+                                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                            "NT shim: AFD SEND_DATAGRAM dest={dest_addr:?}\n"
+                                        ));
+                                    }
+
+                                    if buffer_count == 0 || buffer_array_ptr == 0 {
+                                        NtStatus::STATUS_INVALID_PARAMETER
+                                    } else {
+                                        // Gather data from WSABUF array (like AFD_SEND).
+                                        let mut send_buf = alloc::vec::Vec::new();
+                                        let mut gather_ok = true;
+                                        for i in 0..buffer_count {
+                                            let wsabuf_base = buffer_array_ptr + (i as u64) * 16;
+                                            let len = try_read_guest_value_unaligned::<u32>(wsabuf_base as usize).unwrap_or(0) as usize;
+                                            let _pad = try_read_guest_value_unaligned::<u32>(wsabuf_base as usize + 4).unwrap_or(0);
+                                            let buf_ptr = try_read_guest_value_unaligned::<u64>(wsabuf_base as usize + 8).unwrap_or(0) as usize;
+
+                                            if len > 0 && buf_ptr != 0 {
+                                                let start = send_buf.len();
+                                                send_buf.resize(start + len, 0u8);
+                                                for j in 0..len {
+                                                    if let Some(b) = try_read_guest_value_unaligned::<u8>(buf_ptr + j) {
+                                                        send_buf[start + j] = b;
+                                                    } else {
+                                                        gather_ok = false;
+                                                        break;
+                                                    }
+                                                }
+                                                if !gather_ok { break; }
+                                            }
+                                        }
+
+                                        if !gather_ok || send_buf.is_empty() {
+                                            NtStatus::STATUS_INVALID_PARAMETER
+                                        } else {
+                                            // Get proxy for send, and auto-bind if the UDP
+                                            // socket is unbound (matches Linux shim behavior
+                                            // in GlobalState::sendto).
+                                            let proxy_opt = {
+                                                let handles = self.shared.handles.lock();
+                                                // Auto-bind: do bind inside the handles lock
+                                                // so we can access socket_fd.
+                                                handles.with(sock_handle, |entry| match &entry.object {
+                                                    handle_table::NtObject::Socket { socket_fd, proxy, .. } => {
+                                                        if let litebox::net::socket_channel::NetworkProxy::Datagram(dg) = proxy.as_ref() {
+                                                            if dg.local_port() == 0 {
+                                                                if let Some(net_arc) = self.shared.net.get() {
+                                                                    let mut net = net_arc.lock();
+                                                                    let bind_addr = core::net::SocketAddr::V4(
+                                                                        core::net::SocketAddrV4::new(
+                                                                            core::net::Ipv4Addr::UNSPECIFIED, 0,
+                                                                        ),
+                                                                    );
+                                                                    match net.bind(socket_fd, &bind_addr) {
+                                                                        Ok(()) => {
+                                                                            if let Ok(local_addr) = net.get_local_addr(socket_fd) {
+                                                                                let _ = dg.set_local_port(local_addr.port());
+                                                                            }
+                                                                        }
+                                                                        Err(litebox::net::errors::BindError::AlreadyBound) => {}
+                                                                        Err(_e) => {
+                                                                            #[cfg(feature = "trace_debug")]
+                                                                            {
+                                                                                use litebox::platform::DebugLogProvider as _;
+                                                                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                                                    "NT shim: AFD SEND_DATAGRAM auto-bind failed: {_e:?}\n"
+                                                                                ));
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        Some(alloc::sync::Arc::clone(proxy))
+                                                    }
+                                                    _ => None,
+                                                }).flatten()
+                                            };
+
+                                            if let Some(proxy) = proxy_opt {
+                                                let mut result_status = NtStatus::STATUS_IO_TIMEOUT;
+                                                for _attempt in 0..10000 {
+                                                    match proxy.try_write(&send_buf, litebox::net::SendFlags::empty(), dest_addr) {
+                                                        Ok(n) if n > 0 => {
+                                                            io_information = n;
+                                                            result_status = NtStatus::STATUS_SUCCESS;
+
+                                                            #[cfg(feature = "trace_debug")]
+                                                            {
+                                                                use litebox::platform::DebugLogProvider as _;
+                                                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                                    "NT shim: AFD SEND_DATAGRAM sent={n} dest={dest_addr:?}\n"
+                                                                ));
+                                                            }
+                                                            break;
+                                                        }
+                                                        Ok(_) | Err(litebox::net::errors::SendError::BufferFull) => {
+                                                            // TX ring full — pump network and retry.
+                                                            if let Some(net_arc) = self.shared.net.get() {
+                                                                let _ = net_arc.lock().perform_platform_interaction();
+                                                            }
+                                                            for _ in 0..10_000 {
+                                                                core::hint::spin_loop();
+                                                            }
+                                                        }
+                                                        Err(litebox::net::errors::SendError::DestinationAddressRequired) => {
+                                                            result_status = NtStatus::STATUS_INVALID_PARAMETER;
+                                                            break;
+                                                        }
+                                                        Err(litebox::net::errors::SendError::Unaddressable) => {
+                                                            result_status = NtStatus::STATUS_NETWORK_UNREACHABLE;
+                                                            break;
+                                                        }
+                                                        Err(litebox::net::errors::SendError::InvalidFd) => {
+                                                            result_status = NtStatus::STATUS_INVALID_HANDLE;
+                                                            break;
+                                                        }
+                                                        Err(_e) => {
+                                                            #[cfg(feature = "trace_debug")]
+                                                            {
+                                                                use litebox::platform::DebugLogProvider as _;
+                                                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                                    "NT shim: AFD SEND_DATAGRAM error: {_e:?}\n"
                                                                 ));
                                                             }
                                                             result_status = NtStatus::STATUS_INVALID_PARAMETER;
@@ -12958,6 +13426,306 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                                 }
                             }
 
+                            IOCTL_AFD_RECV_DATAGRAM => {
+                                // Receive a datagram (UDP recvfrom).
+                                //
+                                // Input buffer: AFD_RECV_DATAGRAM_INFO (on x64):
+                                //   +0x00: u64  BufferArray — pointer to WSABUF[]
+                                //   +0x08: u32  BufferCount
+                                //   +0x0C: u32  AfdFlags
+                                //   +0x10: u32  TdiFlags (MSG_PEEK etc.)
+                                //   +0x14: u32  padding
+                                //   +0x18: u64  Address — pointer to SOCKADDR output buffer
+                                //                        (output: source addr written here)
+                                //   +0x20: u64  AddressLength — pointer to int with addr buf size
+                                //
+                                // On success, IO_STATUS_BLOCK.Information = bytes received.
+                                // Source address is written into the Address output buffer.
+
+                                if input_length < 0x18 || input_buffer == 0 {
+                                    NtStatus::STATUS_INVALID_PARAMETER
+                                } else {
+                                    let buffer_array_ptr = try_read_guest_value_unaligned::<u64>(input_buffer).unwrap_or(0);
+                                    let buffer_count = try_read_guest_value_unaligned::<u32>(input_buffer + 0x08).unwrap_or(0);
+                                    let afd_flags = try_read_guest_value_unaligned::<u32>(input_buffer + 0x0C).unwrap_or(0);
+                                    let tdi_flags = try_read_guest_value_unaligned::<u32>(input_buffer + 0x10).unwrap_or(0);
+                                    // Address output pointer (SOCKADDR buffer for source address).
+                                    let address_ptr = if input_length >= 0x20 {
+                                        try_read_guest_value_unaligned::<u64>(input_buffer + 0x18).unwrap_or(0)
+                                    } else {
+                                        0
+                                    };
+
+                                    const AFD_MSG_PEEK: u32 = 0x0080;
+                                    const AFD_OVERLAPPED: u32 = 0x02;
+
+                                    #[cfg(feature = "trace_debug")]
+                                    {
+                                        use litebox::platform::DebugLogProvider as _;
+                                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                            "NT shim: AFD RECV_DATAGRAM handle=0x{sock_handle:X} buf_count={buffer_count} tdi_flags=0x{tdi_flags:X} addr_ptr=0x{address_ptr:X}\n"
+                                        ));
+                                    }
+
+                                    if buffer_count == 0 || buffer_array_ptr == 0 {
+                                        NtStatus::STATUS_INVALID_PARAMETER
+                                    } else {
+                                        // Parse WSABUF array to get total buffer size.
+                                        let mut total_len: usize = 0;
+                                        let mut wsabuf_entries = alloc::vec::Vec::new();
+                                        let mut parse_ok = true;
+                                        for i in 0..buffer_count {
+                                            let wsabuf_base = buffer_array_ptr + (i as u64) * 16;
+                                            let len = try_read_guest_value_unaligned::<u32>(wsabuf_base as usize).unwrap_or(0) as usize;
+                                            let buf_ptr = try_read_guest_value_unaligned::<u64>(wsabuf_base as usize + 8).unwrap_or(0) as usize;
+                                            if len > 0 && buf_ptr == 0 {
+                                                parse_ok = false;
+                                                break;
+                                            }
+                                            wsabuf_entries.push((buf_ptr, len));
+                                            total_len = total_len.saturating_add(len);
+                                        }
+
+                                        if !parse_ok || total_len == 0 {
+                                            NtStatus::STATUS_INVALID_PARAMETER
+                                        } else {
+                                            let mut recv_flags = litebox::net::ReceiveFlags::empty();
+                                            if tdi_flags & AFD_MSG_PEEK != 0 {
+                                                recv_flags |= litebox::net::ReceiveFlags::PEEK;
+                                            }
+
+                                            let proxy_opt = {
+                                                let handles = self.shared.handles.lock();
+                                                handles.with(sock_handle, |entry| match &entry.object {
+                                                    handle_table::NtObject::Socket { proxy, .. } => Some(alloc::sync::Arc::clone(proxy)),
+                                                    _ => None,
+                                                }).flatten()
+                                            };
+
+                                            if let Some(proxy) = proxy_opt {
+                                                // Pump the network first to populate RX ring.
+                                                if let Some(net_arc) = self.shared.net.get() {
+                                                    let _ = net_arc.lock().perform_platform_interaction();
+                                                }
+
+                                                let mut recv_buf = alloc::vec![0u8; total_len];
+                                                let mut source_addr: Option<core::net::SocketAddr> = None;
+
+                                                // Fast path: try to read immediately.
+                                                match proxy.try_read(&mut recv_buf, recv_flags, Some(&mut source_addr)) {
+                                                    Ok(n) if n > 0 => {
+                                                        // Scatter received data into guest WSABUF array.
+                                                        let mut offset = 0usize;
+                                                        for &(buf_ptr, len) in &wsabuf_entries {
+                                                            if offset >= n { break; }
+                                                            let chunk = core::cmp::min(len, n - offset);
+                                                            for j in 0..chunk {
+                                                                try_write_guest_value_unaligned(buf_ptr + j, recv_buf[offset + j]);
+                                                            }
+                                                            offset += chunk;
+                                                        }
+                                                        io_information = n;
+
+                                                        #[cfg(feature = "trace_debug")]
+                                                        {
+                                                            use litebox::platform::DebugLogProvider as _;
+                                                            // Log WSABUF details
+                                                            for (i, &(bp, ln)) in wsabuf_entries.iter().enumerate() {
+                                                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                                    "NT shim: AFD RECV_DATAGRAM wsabuf[{i}] ptr=0x{bp:X} len={ln}\n"
+                                                                ));
+                                                            }
+                                                        }
+
+                                                        // Write source address as SOCKADDR_IN at
+                                                        // the Address output pointer and update the
+                                                        // AddressLength value.  The Address field in
+                                                        // AFD_RECV_DATAGRAM_INFO is a `struct sockaddr*`
+                                                        // (NOT a TDI_CONNECTION_INFORMATION*), and
+                                                        // AddressLength is an `int*`.
+                                                        if address_ptr != 0 {
+                                                            if let Some(core::net::SocketAddr::V4(v4)) = source_addr {
+                                                                // SOCKADDR_IN:
+                                                                //   +0x00: u16  sin_family = AF_INET (2)
+                                                                //   +0x02: u16  sin_port   (network byte order)
+                                                                //   +0x04: [u8;4] sin_addr (network byte order)
+                                                                //   +0x08: [u8;8] sin_zero
+                                                                let addr = address_ptr as usize;
+                                                                try_write_guest_value_unaligned::<u16>(addr, 2u16); // AF_INET
+                                                                try_write_guest_value_unaligned::<u16>(addr + 2, v4.port().to_be());
+                                                                try_write_guest_value_unaligned(addr + 4, v4.ip().octets());
+                                                                // Zero out sin_zero
+                                                                try_write_guest_value_unaligned::<u64>(addr + 8, 0u64);
+
+                                                                // Update AddressLength if the pointer is provided.
+                                                                if input_length >= 0x28 {
+                                                                    let addr_len_ptr = try_read_guest_value_unaligned::<u64>(input_buffer + 0x20).unwrap_or(0);
+                                                                    if addr_len_ptr != 0 {
+                                                                        try_write_guest_value_unaligned::<i32>(addr_len_ptr as usize, 16i32); // sizeof(SOCKADDR_IN)
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+
+                                                        #[cfg(feature = "trace_debug")]
+                                                        {
+                                                            use litebox::platform::DebugLogProvider as _;
+                                                            // Dump first 32 bytes of the DNS response for debugging
+                                                            let dump_len = core::cmp::min(n, 32);
+                                                            let hex: alloc::string::String = recv_buf[..dump_len].iter().map(|b| alloc::format!("{:02X} ", b)).collect();
+                                                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                                "NT shim: AFD RECV_DATAGRAM received={n} from={source_addr:?} data=[{hex}]\n"
+                                                            ));
+
+                                                            // Verify data was actually written to guest memory
+                                                            if let Some(&(buf_ptr, _)) = wsabuf_entries.first() {
+                                                                let mut readback = [0u8; 8];
+                                                                let rb_len = core::cmp::min(n, 8);
+                                                                for i in 0..rb_len {
+                                                                    readback[i] = try_read_guest_value_unaligned::<u8>(buf_ptr + i).unwrap_or(0xFF);
+                                                                }
+                                                                let rb_hex: alloc::string::String = readback[..rb_len].iter().map(|b| alloc::format!("{:02X} ", b)).collect();
+                                                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                                    "NT shim: AFD RECV_DATAGRAM readback first {rb_len} bytes at 0x{buf_ptr:X}: [{rb_hex}]\n"
+                                                                ));
+                                                            }
+
+                                                            // Verify SOCKADDR was written correctly
+                                                            if address_ptr != 0 {
+                                                                let addr = address_ptr as usize;
+                                                                let mut sockaddr_bytes = [0u8; 16];
+                                                                for i in 0..16 {
+                                                                    sockaddr_bytes[i] = try_read_guest_value_unaligned::<u8>(addr + i).unwrap_or(0xFF);
+                                                                }
+                                                                let sa_hex: alloc::string::String = sockaddr_bytes.iter().map(|b| alloc::format!("{:02X} ", b)).collect();
+                                                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                                    "NT shim: AFD RECV_DATAGRAM SOCKADDR readback at 0x{address_ptr:X}: [{sa_hex}]\n"
+                                                                ));
+                                                            }
+
+                                                            // Verify IO_STATUS_BLOCK will be written correctly
+                                                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                                "NT shim: AFD RECV_DATAGRAM io_status_ptr=0x{io_status_ptr:X} event=0x{event_handle:X}\n"
+                                                            ));
+                                                        }
+                                                        NtStatus::STATUS_SUCCESS
+                                                    }
+                                                    Ok(_) if event_handle != 0 && (afd_flags & AFD_OVERLAPPED) != 0 => {
+                                                        // No data yet but overlapped operation —
+                                                        // async event-based path.  Register an
+                                                        // observer that completes when data arrives
+                                                        // and return STATUS_PENDING.
+                                                        let event_arc = {
+                                                            let handles = self.shared.handles.lock();
+                                                            handles.with(event_handle, |entry| match &entry.object {
+                                                                handle_table::NtObject::Event(ev) => Some(alloc::sync::Arc::clone(ev)),
+                                                                _ => None,
+                                                            }).flatten()
+                                                        };
+
+                                                        if let Some(event_obj) = event_arc {
+                                                            // Reset the event before starting async.
+                                                            {
+                                                                let mut signaled = event_obj.state.lock();
+                                                                *signaled = false;
+                                                            }
+
+                                                            let observer = alloc::sync::Arc::new(
+                                                                handle_table::SocketRecvDatagramEventObserver::new(
+                                                                    alloc::sync::Arc::clone(&proxy),
+                                                                    total_len,
+                                                                    wsabuf_entries.clone(),
+                                                                    recv_flags,
+                                                                    address_ptr,
+                                                                    if input_length >= 0x28 {
+                                                                        try_read_guest_value_unaligned::<u64>(input_buffer + 0x20).unwrap_or(0)
+                                                                    } else {
+                                                                        0
+                                                                    },
+                                                                    io_status_ptr,
+                                                                    event_obj,
+                                                                ),
+                                                            );
+                                                            proxy.register_observer(
+                                                                alloc::sync::Arc::downgrade(&observer)
+                                                                    as alloc::sync::Weak<
+                                                                        dyn litebox::event::observer::Observer<
+                                                                            litebox::event::Events,
+                                                                        >,
+                                                                    >,
+                                                                litebox::event::Events::IN
+                                                                    | litebox::event::Events::HUP,
+                                                            );
+
+                                                            // "Register then check" pattern.
+                                                            if let Some(net_arc) = self.shared.net.get() {
+                                                                let _ = net_arc.lock().perform_platform_interaction();
+                                                            }
+                                                            use litebox::event::IOPollable as _;
+                                                            let events = proxy.check_io_events();
+                                                            if events.contains(litebox::event::Events::IN)
+                                                                || events.contains(litebox::event::Events::HUP)
+                                                                || events.contains(litebox::event::Events::ERR)
+                                                            {
+                                                                observer.try_complete_now();
+                                                            }
+
+                                                            // Store observer Arc (keeps Weak alive).
+                                                            {
+                                                                let handles = self.shared.handles.lock();
+                                                                handles.with_mut(sock_handle, |entry| {
+                                                                    if let handle_table::NtObject::Socket {
+                                                                        ref mut pending_dgram_event_observers, ..
+                                                                    } = entry.object
+                                                                    {
+                                                                        pending_dgram_event_observers.retain(|o| !o.is_fired());
+                                                                        pending_dgram_event_observers.push(observer);
+                                                                    }
+                                                                });
+                                                            }
+
+                                                            #[cfg(feature = "trace_debug")]
+                                                            {
+                                                                use litebox::platform::DebugLogProvider as _;
+                                                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                                    "NT shim: AFD RECV_DATAGRAM async pending event=0x{event_handle:X}\n"
+                                                                ));
+                                                            }
+                                                            NtStatus::STATUS_PENDING
+                                                        } else {
+                                                            // Event handle invalid — fall through to sync spin-wait.
+                                                            NtStatus::STATUS_IO_TIMEOUT
+                                                        }
+                                                    }
+                                                    Ok(_) => {
+                                                        // No data available and not an overlapped
+                                                        // operation.  Return STATUS_DEVICE_NOT_READY
+                                                        // which maps to WSAEWOULDBLOCK for non-blocking
+                                                        // sockets (the common case for c-ares / libuv).
+                                                        NtStatus::STATUS_DEVICE_NOT_READY // 0xC00000A3
+                                                    }
+                                                    Err(litebox::net::errors::ReceiveError::InvalidFd) => {
+                                                        NtStatus::STATUS_INVALID_HANDLE
+                                                    }
+                                                    Err(_e) => {
+                                                        #[cfg(feature = "trace_debug")]
+                                                        {
+                                                            use litebox::platform::DebugLogProvider as _;
+                                                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                                "NT shim: AFD RECV_DATAGRAM error: {_e:?}\n"
+                                                            ));
+                                                        }
+                                                        NtStatus::STATUS_CONNECTION_RESET
+                                                    }
+                                                }
+                                            } else {
+                                                NtStatus::STATUS_INVALID_HANDLE
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
                             IOCTL_AFD_SUPER_CONNECT => {
                                 // ConnectEx via AFD_SUPER_CONNECT_INFO:
                                 //   +0x00: SanActive (BOOLEAN, 1 byte + 3 pad)
@@ -13101,12 +13869,29 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                             }
                         };
 
+                        #[cfg(feature = "trace_debug")]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "NT shim: AFD IOCTL result handle=0x{sock_handle:X} ioctl=0x{ioctl_code:X} status=0x{:X} info={io_information}\n",
+                                status.0,
+                            ));
+                        }
+
                         // Write the IO_STATUS_BLOCK for all completed operations.
                         // For STATUS_PENDING, write the pending status so the
                         // caller knows the operation is in progress; the observer
                         // will overwrite it when the operation completes.
+                        //
+                        // IO_STATUS_BLOCK on x64:
+                        //   +0x00: union { NTSTATUS Status (4B); PVOID Pointer (8B); } — 8 bytes
+                        //   +0x08: ULONG_PTR Information — 8 bytes
+                        //
+                        // Write the full 8-byte Status/Pointer union so the upper
+                        // 4 bytes are zeroed (matching NT kernel behavior where
+                        // Status is a 4-byte field in an 8-byte-aligned union).
                         if io_status_ptr != 0 {
-                            try_write_guest_value_unaligned(io_status_ptr, status.0 as i32);
+                            try_write_guest_value_unaligned(io_status_ptr, (status.0 as u32) as u64);
                             if status != NtStatus::STATUS_PENDING {
                                 try_write_guest_value_unaligned(io_status_ptr + 8, io_information);
                             }
@@ -13126,6 +13911,17 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                                 drop(signaled);
                                 event.wake_waiters();
                             }
+                        }
+
+                        #[cfg(feature = "trace_debug")]
+                        if io_status_ptr != 0 && (ioctl_code == 0x1201B || ioctl_code == 0x12017) {
+                            // Read back IO_STATUS_BLOCK to verify it was written correctly
+                            let rb_status = try_read_guest_value_unaligned::<u64>(io_status_ptr).unwrap_or(0xDEAD);
+                            let rb_info = try_read_guest_value_unaligned::<u64>(io_status_ptr + 8).unwrap_or(0xDEAD);
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "NT shim: IO_STATUS_BLOCK readback at 0x{io_status_ptr:X}: status=0x{rb_status:X} info=0x{rb_info:X}\n"
+                            ));
                         }
 
                         // Post IOCP completion if the socket has an IOCP binding
@@ -13341,6 +14137,193 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                                     NtStatus::STATUS_INVALID_HANDLE
                                 }
                             }
+                        } else if ioctl_code == 0x12024 {
+                            // IOCTL_AFD_SELECT / IOCTL_AFD_POLL = 0x12024
+                            // AFD_POLL on the AFD Stub handle.
+                            // c-ares uses a private \Device\Afd handle for its
+                            // IOCP-based event system. The poll buffer contains
+                            // the data socket handle to monitor — same layout as
+                            // the Socket path's AFD_SELECT handler.
+                            //
+                            // METHOD_BUFFERED: input=output=output_buffer.
+                            let buf = output_buffer;
+                            let buf_len = output_length as usize;
+
+                            if buf == 0 || buf_len < 0x10 {
+                                NtStatus::STATUS_INVALID_PARAMETER
+                            } else {
+                                let num_handles = try_read_guest_value_unaligned::<u32>(buf + 0x08).unwrap_or(0);
+
+                                #[cfg(any(debug_assertions, feature = "trace_debug"))]
+                                {
+                                    use litebox::platform::DebugLogProvider as _;
+                                    let timeout = try_read_guest_value_unaligned::<i64>(buf).unwrap_or(0);
+                                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                        "NT shim: AFD Stub POLL num_handles={num_handles} timeout={timeout}\n"
+                                    ));
+                                }
+
+                                let required = 0x10 + (num_handles as usize) * 16;
+                                if buf_len < required {
+                                    NtStatus::STATUS_BUFFER_TOO_SMALL
+                                } else {
+                                    // Pump the network stack.
+                                    if let Some(net_arc) = self.shared.net.get() {
+                                        let _ = net_arc.lock().perform_platform_interaction();
+                                    }
+
+                                    // AFD_POLL event constants.
+                                    const AFD_POLL_RECEIVE: u32 = 0x0001;
+                                    const AFD_POLL_SEND: u32 = 0x0004;
+                                    const AFD_POLL_DISCONNECT: u32 = 0x0008;
+                                    const AFD_POLL_ABORT: u32 = 0x0010;
+                                    const AFD_POLL_CONNECT_FAIL: u32 = 0x0100;
+
+                                    let mut any_ready = false;
+                                    let mut first_entry_handle: u64 = 0;
+                                    let mut first_entry_requested: u32 = 0;
+                                    for i in 0..num_handles {
+                                        let entry_base = buf + 0x10 + (i as usize) * 16;
+                                        let handle_val = try_read_guest_value_unaligned::<u64>(entry_base).unwrap_or(0);
+                                        let requested = try_read_guest_value_unaligned::<u32>(entry_base + 8).unwrap_or(0);
+                                        if i == 0 {
+                                            first_entry_handle = handle_val;
+                                            first_entry_requested = requested;
+                                        }
+
+                                        let proxy_opt = {
+                                            let handles = self.shared.handles.lock();
+                                            handles.with(handle_val as u32, |entry| match &entry.object {
+                                                handle_table::NtObject::Socket { proxy, .. } => Some(alloc::sync::Arc::clone(proxy)),
+                                                _ => None,
+                                            }).flatten()
+                                        };
+
+                                        let mut signaled: u32 = 0;
+                                        let mut entry_status: u32 = 0;
+
+                                        if let Some(proxy) = proxy_opt {
+                                            use litebox::event::IOPollable as _;
+                                            let events = proxy.check_io_events();
+
+                                            if events.contains(litebox::event::Events::IN) && (requested & AFD_POLL_RECEIVE) != 0 {
+                                                signaled |= AFD_POLL_RECEIVE;
+                                            }
+                                            if events.contains(litebox::event::Events::OUT) && (requested & AFD_POLL_SEND) != 0 {
+                                                signaled |= AFD_POLL_SEND;
+                                            }
+                                            if events.contains(litebox::event::Events::HUP) && (requested & AFD_POLL_DISCONNECT) != 0 {
+                                                signaled |= AFD_POLL_DISCONNECT;
+                                            }
+                                            if events.contains(litebox::event::Events::ERR) {
+                                                if (requested & AFD_POLL_ABORT) != 0 { signaled |= AFD_POLL_ABORT; }
+                                                if (requested & AFD_POLL_CONNECT_FAIL) != 0 { signaled |= AFD_POLL_CONNECT_FAIL; }
+                                            }
+                                        } else {
+                                            entry_status = 0xC000_0008; // STATUS_INVALID_HANDLE
+                                        }
+
+                                        if signaled != 0 { any_ready = true; }
+                                        try_write_guest_value_unaligned(entry_base + 8, signaled);
+                                        try_write_guest_value_unaligned(entry_base + 12, entry_status);
+                                    }
+
+                                    if any_ready {
+                                        if io_status_ptr != 0 {
+                                            try_write_guest_value_unaligned(io_status_ptr + 8, required);
+                                        }
+                                        NtStatus::STATUS_SUCCESS
+                                    } else {
+                                        // Async path: register observer. Only single-handle case.
+                                        let mut async_registered = false;
+                                        if num_handles == 1 {
+                                            let handle_val = first_entry_handle;
+                                            let req_events = first_entry_requested;
+
+                                            // Get IOCP from the AfdStub handle, proxy from the polled socket.
+                                            let iocp_and_proxy = {
+                                                let handles = self.shared.handles.lock();
+                                                let iocp_info = handles.with(file_handle, |entry| match &entry.object {
+                                                    handle_table::NtObject::Stub { io_completion: Some((iocp, key)), .. } => {
+                                                        Some((alloc::sync::Arc::clone(iocp), *key))
+                                                    }
+                                                    _ => None,
+                                                }).flatten();
+                                                let proxy_arc = handles.with(handle_val as u32, |entry| match &entry.object {
+                                                    handle_table::NtObject::Socket { proxy, .. } => Some(alloc::sync::Arc::clone(proxy)),
+                                                    _ => None,
+                                                }).flatten();
+                                                iocp_info.zip(proxy_arc)
+                                            };
+
+                                            if let Some(((iocp, key), proxy)) = iocp_and_proxy {
+                                                let select_apc_context = args.arg3;
+                                                let observer = alloc::sync::Arc::new(
+                                                    handle_table::SocketSelectIocpObserver::new(
+                                                        iocp,
+                                                        key,
+                                                        select_apc_context,
+                                                        io_status_ptr,
+                                                        buf,
+                                                        buf_len,
+                                                        handle_val,
+                                                        req_events,
+                                                    ),
+                                                );
+
+                                                use litebox::event::IOPollable as _;
+                                                proxy.register_observer(
+                                                    alloc::sync::Arc::downgrade(&observer) as alloc::sync::Weak<dyn litebox::event::observer::Observer<litebox::event::Events>>,
+                                                    litebox::event::Events::IN | litebox::event::Events::OUT | litebox::event::Events::HUP | litebox::event::Events::ERR,
+                                                );
+
+                                                // "Register then check" to avoid races.
+                                                let events = proxy.check_io_events();
+                                                if !events.is_empty() {
+                                                    use litebox::event::observer::Observer as _;
+                                                    observer.on_events(&events);
+                                                }
+
+                                                // Store the observer on the polled socket to keep it alive.
+                                                {
+                                                    let handles = self.shared.handles.lock();
+                                                    handles.with_mut(handle_val as u32, |entry| {
+                                                        if let handle_table::NtObject::Socket { pending_select_observers, .. } = &mut entry.object {
+                                                            pending_select_observers.retain(|obs| !obs.is_fired());
+                                                            pending_select_observers.push(observer);
+                                                        }
+                                                    });
+                                                }
+
+                                                if io_status_ptr != 0 {
+                                                    try_write_guest_value_unaligned::<u32>(io_status_ptr, NtStatus::STATUS_PENDING.0 as u32);
+                                                    try_write_guest_value_unaligned::<usize>(io_status_ptr + 8, 0);
+                                                }
+
+                                                async_registered = true;
+
+                                                #[cfg(any(debug_assertions, feature = "trace_debug"))]
+                                                {
+                                                    use litebox::platform::DebugLogProvider as _;
+                                                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                        "NT shim: AFD Stub POLL async pending, observer for handle=0x{handle_val:X} events=0x{req_events:X} key=0x{key:X} apc_ctx=0x{select_apc_context:X}\n",
+                                                    ));
+                                                }
+                                            }
+                                        }
+
+                                        if async_registered {
+                                            NtStatus::STATUS_PENDING
+                                        } else {
+                                            try_write_guest_value_unaligned(buf + 0x08, 0u32);
+                                            if io_status_ptr != 0 {
+                                                try_write_guest_value_unaligned(io_status_ptr + 8, 0x10usize);
+                                            }
+                                            NtStatus::STATUS_SUCCESS
+                                        }
+                                    }
+                                }
+                            }
                         } else {
                             // Other IOCTLs on Afd stubs — not expected.
                             #[cfg(debug_assertions)]
@@ -13355,7 +14338,7 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
 
                         // Write IO_STATUS_BLOCK on success.
                         if status == NtStatus::STATUS_SUCCESS && io_status_ptr != 0 {
-                            try_write_guest_value_unaligned(io_status_ptr, 0i32);
+                            try_write_guest_value_unaligned(io_status_ptr, 0u64);
                             try_write_guest_value_unaligned(io_status_ptr + 8, 0usize);
                         }
 

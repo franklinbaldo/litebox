@@ -829,7 +829,7 @@ fn try_open_afd_socket<FS: crate::NtShimFS>(
     // Insert the Socket handle into the handle table.
     Some(insert_object_handle(
         handles,
-        NtObject::Socket { socket_fd, proxy, net: alloc::sync::Arc::clone(net_arc), io_completion: None, pending_observers: alloc::vec::Vec::new(), pending_recv_observers: alloc::vec::Vec::new() },
+        NtObject::Socket { socket_fd, proxy, net: alloc::sync::Arc::clone(net_arc), io_completion: None, pending_observers: alloc::vec::Vec::new(), pending_recv_observers: alloc::vec::Vec::new(), pending_dgram_event_observers: alloc::vec::Vec::new(), pending_select_observers: alloc::vec::Vec::new() },
         handle_out_ptr,
         io_status_ptr,
         1, // FILE_OPENED
@@ -2077,6 +2077,33 @@ pub(crate) fn nt_set_information_file<FS: crate::NtShimFS>(
 
     let info_class = crate::try_read_guest_value_unaligned::<u32>(ctx.regs.rsp + 0x28).unwrap_or(0);
 
+    // ── FileIoCompletionNotificationInformation (41) ────────────────
+    // Set completion notification modes on a handle.
+    // Layout: struct { ULONG Flags; } = 4 bytes.
+    //   FILE_SKIP_COMPLETION_PORT_ON_SUCCESS = 0x1
+    //   FILE_SKIP_SET_EVENT_ON_HANDLE        = 0x2
+    // Used by c-ares (via SetFileCompletionNotificationModes) on its
+    // private \Device\Afd handle.  We accept and store the flags but
+    // do not change behaviour — all our IOCP completions are posted
+    // explicitly, so the "skip" optimisations are already the default.
+    if info_class == 41 {
+        if (info_length as usize) < 4 || info_ptr == 0 {
+            return NtStatus::STATUS_INVALID_PARAMETER;
+        }
+        let _flags = crate::try_read_guest_value_unaligned::<u32>(info_ptr).unwrap_or(0);
+
+        #[cfg(feature = "trace_debug")]
+        {
+            use litebox::platform::DebugLogProvider as _;
+            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                "NT shim: NtSetInformationFile FileIoCompletionNotificationInfo handle=0x{file_handle:X} flags=0x{_flags:X}\n"
+            ));
+        }
+
+        write_iosb(io_status_ptr, NtStatus::STATUS_SUCCESS, 4);
+        return NtStatus::STATUS_SUCCESS;
+    }
+
     // ── FileCompletionInformation (30) ──────────────────────────────
     // Bind a file/pipe handle to an I/O Completion Port.
     // Layout: struct { HANDLE Port; PVOID Key; } = 16 bytes on x64.
@@ -2092,6 +2119,19 @@ pub(crate) fn nt_set_information_file<FS: crate::NtShimFS>(
             crate::try_read_guest_value_unaligned::<u64>(info_ptr).unwrap_or(0) as u32;
         let completion_key =
             crate::try_read_guest_value_unaligned::<usize>(info_ptr + 8).unwrap_or(0);
+
+        #[cfg(feature = "trace_debug")]
+        {
+            // Dump the raw 16 bytes of FILE_COMPLETION_INFORMATION for debugging
+            let mut raw = [0u8; 16];
+            for i in 0..16 {
+                raw[i] = crate::try_read_guest_value_unaligned::<u8>(info_ptr + i).unwrap_or(0xFF);
+            }
+            use litebox::platform::DebugLogProvider as _;
+            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                "NT shim: FileCompletionInfo raw bytes at 0x{info_ptr:X}: {:02X?}\n", raw
+            ));
+        }
 
         // Look up the IOCP object.
         let iocp_arc = super::sync::lookup_io_completion(handles, iocp_handle);
@@ -2143,7 +2183,8 @@ pub(crate) fn nt_set_information_file<FS: crate::NtShimFS>(
                     {
                         use litebox::platform::DebugLogProvider as _;
                         litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                            "NT shim: NtSetInformationFile FileCompletionInfo socket 0x{file_handle:X} -> IOCP 0x{iocp_handle:X} key=0x{completion_key:X}\n",
+                            "NT shim: NtSetInformationFile FileCompletionInfo socket 0x{file_handle:X} -> IOCP 0x{iocp_handle:X} key=0x{completion_key:X} iocp_ptr={:p}\n",
+                            Arc::as_ptr(&port),
                         ));
                     }
                     *io_completion = Some((Arc::clone(&port), completion_key));

@@ -1266,3 +1266,92 @@ Four changes across three files:
 - No more infinite self-spawning (one child process only)
 - Console output now correctly appears on stdout
 - Python and Node.js tests still pass
+
+---
+
+## 2026-04-10: UDP datagram support + async AFD_POLL — DNS resolution working
+
+### Goal
+Enable DNS resolution inside the sandbox so Node.js can make HTTPS API calls.
+Node.js uses c-ares (via libuv) for `dns.resolve4()` which sends UDP DNS
+queries to the network broker's DNS resolver.
+
+### Critical bug fix: WOULDBLOCK status in AFD_RECV_DATAGRAM
+**Root cause**: When c-ares called `recvfrom()` a second time to drain the UDP
+socket buffer (no data available), the shim returned `NtStatus(0xC00000AE)`
+(STATUS_PIPE_NOT_AVAILABLE) instead of `NtStatus::STATUS_DEVICE_NOT_READY`
+(0xC00000A3). mswsock.dll mapped the wrong status to an error that c-ares
+interpreted as ECONNREFUSED, causing DNS resolution to fail.
+
+**Fix**: One-line change in the AFD_RECV_DATAGRAM handler's non-overlapped
+WOULDBLOCK path.
+
+### New IOCTL handlers implemented
+
+| IOCTL | Name | Description |
+|-------|------|-------------|
+| 0x12023 | AFD_SEND_DATAGRAM | UDP sendto — parses AFD_SEND_DATAGRAM_INFO, handles two TDI layout variants (pointer-based and inline at +0x58), gathers WSABUF scatter data, auto-binds unbound sockets |
+| 0x1201B | AFD_RECV_DATAGRAM | UDP recvfrom — parses AFD_RECV_DATAGRAM_INFO, supports MSG_PEEK, scatters to WSABUFs, writes source SOCKADDR_IN, async IOCP path via SocketRecvDatagramEventObserver |
+
+### Bug fixes included in this commit
+
+1. **NtSetTimer2 pointer dereference** — DueTime/Period were read as raw values
+   instead of being dereferenced as pointers to LARGE_INTEGER
+2. **IO_STATUS_BLOCK write width** — Status field was written as i32 (4 bytes)
+   instead of u64 (8 bytes), leaving upper bytes as garbage on x64
+3. **AFD_CONNECT_INFO x64 layout** — SOCKADDR offset fixed from 0x0C to 0x18
+   for the 64-bit struct layout
+4. **AFD_POLL event constants** — Multiple bitmask values were wrong (e.g.,
+   AFD_POLL_CONNECT was 0x08, should be 0x0040)
+5. **Event reset before IOCTL dispatch** — IO Manager must reset caller event
+   to non-signaled before starting I/O, preventing stale wakeups
+6. **AFD_SELECT async IOCP path** — When no handles are immediately ready,
+   registers SocketSelectIocpObserver and returns STATUS_PENDING (was returning
+   SUCCESS with NumberOfHandles=0)
+7. **AFD_POLL on AfdStub handles** — c-ares opens a private \Device\Afd handle
+   for IOCP-based polling; the Stub handler now supports AFD_POLL with same
+   logic as the Socket path
+8. **NtSetInformationFile class 41** — FileIoCompletionNotificationInformation
+   stub for SetFileCompletionNotificationModes(), used by c-ares
+9. **IOCP IO_STATUS_BLOCK sign extension** — Status field in IOCP completion
+   entries was sign-extended from i32 to usize; now zero-extends via u32 cast
+
+### Test results
+- `dns.resolve4('example.com')` → `['104.18.27.120', '104.18.26.120']` ✅
+- HTTPS GET to example.com (explicit DNS + TLS) → Status 200, 528 bytes ✅
+- `copilot --version` → "GitHub Copilot CLI 1.0.10-1" ✅
+- `copilot -p "say hello"` with network → Runs fully, fails only on auth ✅
+- Python basic + HTTP: still pass ✅
+
+### Updated capability matrix
+| Capability | Python | Node.js |
+|---|---|---|
+| Basic execution | 200/200 ✅ | 200/200 ✅ |
+| Stdlib imports | 21/21 ✅ | 12/12 ✅ |
+| Crypto (native) | hashlib ✅ | crypto 70/70 ✅ |
+| Directory listing | os.listdir ✅ | readdirSync 50/50 ✅ |
+| File write | 20/20 ✅ | 50/50 ✅ |
+| File delete (unlink) | 50/50 ✅ | 50/50 ✅ |
+| Threading | 10/10 ✅ | Untested |
+| Subprocess | Python→Python ✅ | spawnSync ✅ |
+| TCP networking | HTTP GET ✅ | HTTP/HTTPS GET ✅ |
+| **UDP networking** | Untested | **dns.resolve4 ✅** |
+| **DNS resolution** | N/A | **c-ares ✅ (dns.lookup via getaddrinfo ❌)** |
+| **HTTPS** | Untested | **✅ (with explicit DNS)** |
+| **Copilot CLI** | N/A | **Runs, auth-gated** |
+
+### Known limitations
+- `dns.lookup()` (getaddrinfo via libuv thread pool) does not work — it uses
+  the system resolver which is not available in the sandbox. Only `dns.resolve4()`
+  (c-ares) works. Since Node.js `http.get()`/`https.get()` default to
+  `dns.lookup()`, HTTPS requires explicit DNS resolution first.
+- Copilot authentication requires tokens that are not propagated into the sandbox.
+
+### Files modified (4 files)
+- `litebox_shim_windows/src/lib.rs` — All IOCTL handlers, bug fixes, AFD_POLL
+- `litebox_shim_windows/src/handle_table.rs` — SocketSelectIocpObserver,
+  SocketRecvDatagramEventObserver, new Socket fields
+- `litebox_shim_windows/src/syscalls/file.rs` — FileIoCompletionNotificationInfo
+  stub, Socket constructor updates, trace logging
+- `litebox_shim_windows/src/syscalls/sync.rs` — IOCP status sign extension fix,
+  trace logging
