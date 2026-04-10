@@ -28,15 +28,14 @@ impl<FS: ShimFS> Task<FS> {
         msg_addr: usize,
         hdr: &MachMsgHeader,
     ) -> Result<usize, Errno> {
-        match hdr.msgh_id {
-            412 => self.mig_host_get_special_port(msg_addr, hdr),
-            _ => {
-                log_unsupported!(
-                    "mig_host_priv: unhandled msgh_id={}, returning MACH_SEND_INVALID_DEST",
-                    hdr.msgh_id,
-                );
-                Ok(MACH_SEND_INVALID_DEST)
-            }
+        if hdr.msgh_id == 412 {
+            self.mig_host_get_special_port(msg_addr, hdr)
+        } else {
+            log_unsupported!(
+                "mig_host_priv: unhandled msgh_id={}, returning MACH_SEND_INVALID_DEST",
+                hdr.msgh_id,
+            );
+            Ok(MACH_SEND_INVALID_DEST)
         }
     }
 
@@ -51,7 +50,7 @@ impl<FS: ShimFS> Task<FS> {
     /// - Header (24): bits=REPLY_BITS_COMPLEX, size=36,
     ///   remote=request.msgh_local_port, local=0, voucher=0, id=512
     /// - Body (4): descriptor_count=1
-    /// - Port descriptor (8): name=<port>, disposition=MOVE_SEND (17)
+    /// - Port descriptor (8): name=`port`, disposition=MOVE_SEND (17)
     fn mig_host_get_special_port(
         &self,
         msg_addr: usize,
@@ -70,10 +69,8 @@ impl<FS: ShimFS> Task<FS> {
 
         // Map `which` to a port name.
         let port = match which {
-            // HOST_PORT (1) -> HOST_SELF
-            1 => 0x0503u32,
-            // HOST_PRIV_PORT (2) -> HOST_SELF (we are the only task)
-            2 => 0x0503u32,
+            // HOST_PORT (1) / HOST_PRIV_PORT (2) -> HOST_SELF (we are the only task)
+            1 | 2 => 0x0503u32,
             // Unknown -- allocate a synthetic port.
             _ => self
                 .process
@@ -83,6 +80,7 @@ impl<FS: ShimFS> Task<FS> {
 
         // Write the reply in-place at msg_addr.
         // Total reply size: HEADER(24) + BODY(4) + PORT_DESC(8) = 36 bytes.
+        #[allow(clippy::cast_possible_truncation)]
         let reply_size: u32 = (HEADER_SIZE + BODY_SIZE + PORT_DESC_SIZE) as u32;
 
         // Write reply header.

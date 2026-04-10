@@ -20,6 +20,7 @@ use crate::{ConstPtr, ShimFS, Task};
 /// Mach message header (`mach_msg_header_t`), 24 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, IntoBytes)]
+#[allow(clippy::struct_field_names)]
 pub(crate) struct MachMsgHeader {
     pub msgh_bits: u32,
     pub msgh_size: u32,
@@ -55,7 +56,7 @@ impl MachMsgPortDescriptor {
     pub fn new(name: u32, disposition: u8) -> Self {
         Self {
             name,
-            disposition_type: (disposition as u32) << 16,
+            disposition_type: u32::from(disposition) << 0x10,
         }
     }
 }
@@ -87,7 +88,7 @@ pub(crate) const MACH_MSGH_BITS_COMPLEX: u32 = 0x8000_0000;
 /// Construct msgh_bits for a complex reply with MOVE_SEND_ONCE remote.
 ///
 /// Remote bits = 18 (MACH_MSG_TYPE_MOVE_SEND_ONCE) in bits 0..7.
-pub(crate) const REPLY_BITS_COMPLEX: u32 = MACH_MSGH_BITS_COMPLEX | 18;
+pub(crate) const REPLY_BITS_COMPLEX: u32 = MACH_MSGH_BITS_COMPLEX | 0x12;
 
 // -- Sizes -------------------------------------------------------------
 
@@ -136,18 +137,16 @@ impl<FS: ShimFS> Task<FS> {
         );
 
         // Route by msgh_id to subsystem handlers.
-        match hdr.msgh_id {
+        if (400..500).contains(&hdr.msgh_id) {
             // host_priv subsystem: base 400..499
-            400..500 => self.mig_host_priv(msg_addr, &hdr),
-
+            self.mig_host_priv(msg_addr, &hdr)
+        } else {
             // Unknown MIG subsystem -- return MACH_SEND_INVALID_DEST.
-            _ => {
-                log_unsupported!(
-                    "dispatch_mig: unknown msgh_id={}, returning MACH_SEND_INVALID_DEST",
-                    hdr.msgh_id,
-                );
-                Ok(MACH_SEND_INVALID_DEST)
-            }
+            log_unsupported!(
+                "dispatch_mig: unknown msgh_id={}, returning MACH_SEND_INVALID_DEST",
+                hdr.msgh_id,
+            );
+            Ok(MACH_SEND_INVALID_DEST)
         }
     }
 }
