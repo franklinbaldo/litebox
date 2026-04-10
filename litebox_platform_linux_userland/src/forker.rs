@@ -899,6 +899,273 @@ pub fn worker_entry(req: ForkRequest, fds: Vec<OwnedFd>, dev_null_fd: RawFd) -> 
 }
 
 // ---------------------------------------------------------------------------
+// WorkerExecParams
+// ---------------------------------------------------------------------------
+
+// Magic and version for WorkerExecParams
+const WORKER_EXEC_PARAMS_MAGIC: [u8; 4] = *b"LBWE";
+const WORKER_EXEC_PARAMS_VERSION: u16 = 1;
+
+/// Parameters for a worker-exec request, serialized into a memfd.
+///
+/// Carries the guest identity, arguments, environment, and infrastructure
+/// configuration that the worker child needs to boot a new shim and load
+/// the non-PIE binary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerExecParams {
+    /// The resolved binary path (load path for the shim loader).
+    pub guest_binary_path: String,
+    /// Original guest argv (argv[0] may differ from guest_binary_path for symlinks).
+    pub argv: Vec<String>,
+    /// Guest environment variables (KEY=VALUE strings).
+    pub envp: Vec<String>,
+    /// Guest working directory.
+    pub cwd: String,
+    /// Guest PID.
+    pub guest_pid: i32,
+    /// Guest parent PID.
+    pub guest_ppid: i32,
+    /// Guest UID.
+    pub guest_uid: u32,
+    /// Guest effective UID.
+    pub guest_euid: u32,
+    /// Guest GID.
+    pub guest_gid: u32,
+    /// Guest effective GID.
+    pub guest_egid: u32,
+    /// Path to the interpreter binary (for dynamically-linked non-PIE).
+    pub interp_path: Option<String>,
+    /// Infrastructure flags forwarded from the runner.
+    /// Flat list of (key, optional_value) pairs, e.g. [("--nine-p-broker", Some("/path"))].
+    pub infra_flags: Vec<(String, Option<String>)>,
+}
+
+fn write_string(out: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(bytes);
+}
+
+fn read_string(data: &[u8], pos: &mut usize) -> Result<String, &'static str> {
+    if *pos + 4 > data.len() {
+        return Err("WorkerExecParams: truncated string length");
+    }
+    let len =
+        u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]) as usize;
+    *pos += 4;
+    if *pos + len > data.len() {
+        return Err("WorkerExecParams: truncated string data");
+    }
+    let s = std::str::from_utf8(&data[*pos..*pos + len])
+        .map_err(|_| "WorkerExecParams: invalid UTF-8")?;
+    *pos += len;
+    Ok(s.to_string())
+}
+
+impl WorkerExecParams {
+    /// Serialize into wire format.
+    ///
+    /// Wire layout:
+    /// - magic "LBWE" (4 bytes)
+    /// - version u16 LE (2 bytes)
+    /// - guest_binary_path: u32 len + bytes
+    /// - argv_count u32 LE | for each: u32 len + bytes
+    /// - envp_count u32 LE | for each: u32 len + bytes
+    /// - cwd: u32 len + bytes
+    /// - guest_pid i32 LE | guest_ppid i32 LE
+    /// - guest_uid u32 LE | guest_euid u32 LE | guest_gid u32 LE | guest_egid u32 LE
+    /// - has_interp u8 (0 or 1) | if 1: u32 len + bytes
+    /// - infra_flags_count u32 LE | for each: key (u32 len + bytes) | has_value u8 | if 1: value (u32 len + bytes)
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+
+        // Header
+        out.extend_from_slice(&WORKER_EXEC_PARAMS_MAGIC);
+        out.extend_from_slice(&WORKER_EXEC_PARAMS_VERSION.to_le_bytes());
+
+        // guest_binary_path
+        write_string(&mut out, &self.guest_binary_path);
+
+        // argv
+        #[allow(clippy::cast_possible_truncation)]
+        let argv_count = self.argv.len() as u32;
+        out.extend_from_slice(&argv_count.to_le_bytes());
+        for arg in &self.argv {
+            write_string(&mut out, arg);
+        }
+
+        // envp
+        #[allow(clippy::cast_possible_truncation)]
+        let envp_count = self.envp.len() as u32;
+        out.extend_from_slice(&envp_count.to_le_bytes());
+        for env in &self.envp {
+            write_string(&mut out, env);
+        }
+
+        // cwd
+        write_string(&mut out, &self.cwd);
+
+        // guest identity
+        out.extend_from_slice(&self.guest_pid.to_le_bytes());
+        out.extend_from_slice(&self.guest_ppid.to_le_bytes());
+        out.extend_from_slice(&self.guest_uid.to_le_bytes());
+        out.extend_from_slice(&self.guest_euid.to_le_bytes());
+        out.extend_from_slice(&self.guest_gid.to_le_bytes());
+        out.extend_from_slice(&self.guest_egid.to_le_bytes());
+
+        // interp_path
+        match &self.interp_path {
+            None => out.push(0),
+            Some(path) => {
+                out.push(1);
+                write_string(&mut out, path);
+            }
+        }
+
+        // infra_flags
+        #[allow(clippy::cast_possible_truncation)]
+        let flags_count = self.infra_flags.len() as u32;
+        out.extend_from_slice(&flags_count.to_le_bytes());
+        for (key, value) in &self.infra_flags {
+            write_string(&mut out, key);
+            match value {
+                None => out.push(0),
+                Some(v) => {
+                    out.push(1);
+                    write_string(&mut out, v);
+                }
+            }
+        }
+
+        out
+    }
+
+    /// Deserialize from wire format.
+    pub fn deserialize(data: &[u8]) -> Result<Self, &'static str> {
+        let mut pos = 0;
+
+        // Magic
+        if data.len() < 6 {
+            return Err("WorkerExecParams: data too short for header");
+        }
+        if data[0..4] != WORKER_EXEC_PARAMS_MAGIC {
+            return Err("WorkerExecParams: bad magic");
+        }
+        pos += 4;
+
+        // Version
+        let version = u16::from_le_bytes([data[pos], data[pos + 1]]);
+        pos += 2;
+        if version != WORKER_EXEC_PARAMS_VERSION {
+            return Err("WorkerExecParams: unsupported version");
+        }
+
+        // guest_binary_path
+        let guest_binary_path = read_string(data, &mut pos)?;
+
+        // argv
+        if pos + 4 > data.len() {
+            return Err("WorkerExecParams: truncated argv count");
+        }
+        let argv_count =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+        let mut argv = Vec::with_capacity(argv_count);
+        for _ in 0..argv_count {
+            argv.push(read_string(data, &mut pos)?);
+        }
+
+        // envp
+        if pos + 4 > data.len() {
+            return Err("WorkerExecParams: truncated envp count");
+        }
+        let envp_count =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+        let mut envp = Vec::with_capacity(envp_count);
+        for _ in 0..envp_count {
+            envp.push(read_string(data, &mut pos)?);
+        }
+
+        // cwd
+        let cwd = read_string(data, &mut pos)?;
+
+        // guest identity
+        if pos + 24 > data.len() {
+            return Err("WorkerExecParams: truncated guest identity");
+        }
+        let guest_pid =
+            i32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        let guest_ppid =
+            i32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        let guest_uid =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        let guest_euid =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        let guest_gid =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        let guest_egid =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+
+        // interp_path
+        if pos >= data.len() {
+            return Err("WorkerExecParams: truncated interp_path flag");
+        }
+        let has_interp = data[pos];
+        pos += 1;
+        let interp_path = if has_interp != 0 {
+            Some(read_string(data, &mut pos)?)
+        } else {
+            None
+        };
+
+        // infra_flags
+        if pos + 4 > data.len() {
+            return Err("WorkerExecParams: truncated infra_flags count");
+        }
+        let flags_count =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+        let mut infra_flags = Vec::with_capacity(flags_count);
+        for _ in 0..flags_count {
+            let key = read_string(data, &mut pos)?;
+            if pos >= data.len() {
+                return Err("WorkerExecParams: truncated infra_flag value flag");
+            }
+            let has_value = data[pos];
+            pos += 1;
+            let value = if has_value != 0 {
+                Some(read_string(data, &mut pos)?)
+            } else {
+                None
+            };
+            infra_flags.push((key, value));
+        }
+
+        Ok(WorkerExecParams {
+            guest_binary_path,
+            argv,
+            envp,
+            cwd,
+            guest_pid,
+            guest_ppid,
+            guest_uid,
+            guest_euid,
+            guest_gid,
+            guest_egid,
+            interp_path,
+            infra_flags,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1194,5 +1461,101 @@ mod tests {
         let data = req.serialize();
         let decoded = ForkRequest::deserialize(&data).expect("deserialize");
         assert_eq!(req, decoded);
+    }
+
+    #[test]
+    fn worker_exec_params_round_trip_minimal() {
+        let params = WorkerExecParams {
+            guest_binary_path: "/usr/bin/echo".to_string(),
+            argv: vec!["echo".to_string(), "hello".to_string()],
+            envp: vec!["PATH=/bin".to_string()],
+            cwd: "/".to_string(),
+            guest_pid: 42,
+            guest_ppid: 1,
+            guest_uid: 1000,
+            guest_euid: 1000,
+            guest_gid: 1000,
+            guest_egid: 1000,
+            interp_path: None,
+            infra_flags: vec![],
+        };
+        let data = params.serialize();
+        let decoded = WorkerExecParams::deserialize(&data).unwrap();
+        assert_eq!(params, decoded);
+    }
+
+    #[test]
+    fn worker_exec_params_round_trip_full() {
+        let params = WorkerExecParams {
+            guest_binary_path: "/usr/bin/node".to_string(),
+            argv: vec!["node".to_string(), "index.js".to_string()],
+            envp: vec!["PATH=/bin".to_string(), "HOME=/root".to_string()],
+            cwd: "/app".to_string(),
+            guest_pid: 100,
+            guest_ppid: 1,
+            guest_uid: 0,
+            guest_euid: 0,
+            guest_gid: 0,
+            guest_egid: 0,
+            interp_path: Some("/lib64/ld-linux-x86-64.so.2".to_string()),
+            infra_flags: vec![
+                (
+                    "--nine-p-broker".to_string(),
+                    Some("/tmp/broker.sock".to_string()),
+                ),
+                ("--program-from-tar".to_string(), None),
+            ],
+        };
+        let data = params.serialize();
+        let decoded = WorkerExecParams::deserialize(&data).unwrap();
+        assert_eq!(params, decoded);
+    }
+
+    #[test]
+    fn worker_exec_params_empty_strings() {
+        let params = WorkerExecParams {
+            guest_binary_path: "".to_string(),
+            argv: vec![],
+            envp: vec![],
+            cwd: "".to_string(),
+            guest_pid: 0,
+            guest_ppid: 0,
+            guest_uid: 0,
+            guest_euid: 0,
+            guest_gid: 0,
+            guest_egid: 0,
+            interp_path: None,
+            infra_flags: vec![],
+        };
+        let data = params.serialize();
+        let decoded = WorkerExecParams::deserialize(&data).unwrap();
+        assert_eq!(params, decoded);
+    }
+
+    #[test]
+    fn worker_exec_params_bad_magic() {
+        let mut data = WorkerExecParams {
+            guest_binary_path: "/bin/ls".to_string(),
+            argv: vec!["ls".to_string()],
+            envp: vec![],
+            cwd: "/".to_string(),
+            guest_pid: 1,
+            guest_ppid: 0,
+            guest_uid: 0,
+            guest_euid: 0,
+            guest_gid: 0,
+            guest_egid: 0,
+            interp_path: None,
+            infra_flags: vec![],
+        }
+        .serialize();
+        data[0] = b'X';
+        assert!(WorkerExecParams::deserialize(&data).is_err());
+    }
+
+    #[test]
+    fn worker_exec_params_truncated() {
+        assert!(WorkerExecParams::deserialize(&[]).is_err());
+        assert!(WorkerExecParams::deserialize(b"LBWE").is_err());
     }
 }
