@@ -625,6 +625,11 @@ pub fn forker_main(cmd_sock: RawFd, dev_null_fd: RawFd, broker_fd: Option<RawFd>
         }
     }
 
+    // Install the host-level seccomp sandbox before processing any requests.
+    // Workers inherit this filter via fork(), so they are also sandboxed.
+    // This filter does NOT allow execve -- the main security win.
+    crate::sandbox_seccomp::install_forker_sandbox_filter();
+
     loop {
         // Block waiting for a fork request + fds from the runner.
         let (req, fds) = match recv_fork_request(cmd_sock) {

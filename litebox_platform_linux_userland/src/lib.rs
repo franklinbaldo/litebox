@@ -34,6 +34,7 @@ use litebox_common_linux::{
 use zerocopy::{FromBytes, IntoBytes};
 
 pub mod forker;
+pub mod sandbox_seccomp;
 mod syscall_intercept;
 
 extern crate alloc;
