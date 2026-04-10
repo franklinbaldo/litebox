@@ -123,7 +123,11 @@ impl<FS: ShimFS> Task<FS> {
             MacosSyscallRequest::Fstat64 { fd, buf } => self.sys_fstat64(fd, buf),
             MacosSyscallRequest::Getentropy { buf, count } => self.sys_getentropy(buf, count),
             MacosSyscallRequest::ThreadSelfid => self.sys_thread_selfid(),
-            MacosSyscallRequest::MachMsg2Trap { .. } => self.sys_mach_msg2_trap(),
+            MacosSyscallRequest::MachMsg2Trap {
+                data,
+                options,
+                ..
+            } => self.dispatch_mig(data, options),
             MacosSyscallRequest::MachTrap { number } => self.do_mach_trap(number, ctx),
             MacosSyscallRequest::CrossarchTrap | MacosSyscallRequest::KdebugTraceString => Ok(0),
             MacosSyscallRequest::Csrctl => Err(Errno::EPERM),
