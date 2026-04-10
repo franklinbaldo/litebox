@@ -1781,15 +1781,6 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
     if cli_args.program_and_arguments.is_empty() {
         anyhow::bail!("--worker-exec requires at least a load path");
     }
-    let load_path = &cli_args.program_and_arguments[0];
-    let guest_load_path = worker_load_program_path(&cli_args);
-    let guest_load_path_str = guest_load_path
-        .to_str()
-        .ok_or_else(|| anyhow!("Could not convert worker guest load path to a string"))?;
-    let guest_argv: Vec<std::ffi::CString> = cli_args.program_and_arguments[1..]
-        .iter()
-        .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
-        .collect();
     for fd in [
         cli_args.worker_exec_fd,
         cli_args.worker_result_fd,
@@ -1800,6 +1791,50 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
     {
         set_fd_cloexec(fd)?;
     }
+
+    let transferred_exec_image = if let Some(fd) = cli_args.worker_exec_fd {
+        Some(read_worker_exec_image(fd)?)
+    } else {
+        None
+    };
+    let transferred_interp_image = match (
+        cli_args.worker_interp_path.as_deref(),
+        cli_args.worker_interp_fd,
+    ) {
+        (Some(path), Some(fd)) => Some((path.to_owned(), read_worker_exec_image(fd)?)),
+        (None, None) => None,
+        _ => anyhow::bail!(
+            "worker interpreter handoff requires both --worker-interp-path and --worker-interp-fd"
+        ),
+    };
+
+    run_worker_exec_core(cli_args, transferred_exec_image, transferred_interp_image)
+}
+
+/// Shared core logic for running a non-PIE worker-exec.
+///
+/// Used by both the CLI-based `run_worker_exec` (posix_spawn path) and
+/// `run_forked_worker_exec` (forker path). The caller is responsible for
+/// reading the exec/interp images from wherever they come from (fd or memfd)
+/// and passing them in.
+#[allow(clippy::similar_names)]
+fn run_worker_exec_core(
+    cli_args: CliArgs,
+    transferred_exec_image: Option<alloc::borrow::Cow<'static, [u8]>>,
+    transferred_interp_image: Option<(String, alloc::borrow::Cow<'static, [u8]>)>,
+) -> Result<()> {
+    if cli_args.program_and_arguments.is_empty() {
+        anyhow::bail!("worker-exec requires at least a load path");
+    }
+    let load_path = cli_args.program_and_arguments[0].clone();
+    let guest_load_path = worker_load_program_path(&cli_args);
+    let guest_load_path_str = guest_load_path
+        .to_str()
+        .ok_or_else(|| anyhow!("Could not convert worker guest load path to a string"))?;
+    let guest_argv: Vec<std::ffi::CString> = cli_args.program_and_arguments[1..]
+        .iter()
+        .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
+        .collect();
 
     // Set up the platform with the same network transport as the parent.
     let platform = if cli_args.tun_device_name.is_some() {
@@ -1816,21 +1851,6 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
 
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     let litebox = shim_builder.litebox();
-    let transferred_exec_image = if let Some(fd) = cli_args.worker_exec_fd {
-        Some(read_worker_exec_image(fd)?)
-    } else {
-        None
-    };
-    let transferred_interp_image = match (
-        cli_args.worker_interp_path.as_deref(),
-        cli_args.worker_interp_fd,
-    ) {
-        (Some(path), Some(fd)) => Some((path, read_worker_exec_image(fd)?)),
-        (None, None) => None,
-        _ => anyhow::bail!(
-            "worker interpreter handoff requires both --worker-interp-path and --worker-interp-fd"
-        ),
-    };
 
     // Load tar data if --initial-files was forwarded.
     let tar_data: &'static [u8] = if let Some(tar_file) = cli_args.initial_files.as_ref() {
@@ -1850,7 +1870,7 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
     } else if cli_args.nine_p_broker.is_none() && !cli_args.program_from_tar {
         // If no transferred guest image was provided and the binary is on the
         // host filesystem, inject it into the in-memory FS.
-        let prog = resolve_host_program_path(load_path);
+        let prog = resolve_host_program_path(&load_path);
         if prog.exists() {
             let file = mmapped_file(&prog)?;
             let data: alloc::borrow::Cow<'static, [u8]> = file.data.into();
@@ -1885,7 +1905,7 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
         }
     }
     if let Some((interp_path, interp_data)) = transferred_interp_image {
-        inject_program_image_into_in_mem(&mut in_mem, Path::new(interp_path), interp_data)?;
+        inject_program_image_into_in_mem(&mut in_mem, Path::new(&interp_path), interp_data)?;
     }
 
     let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
@@ -2533,11 +2553,183 @@ fn register_worker_spawn_flags(platform: &Platform, cli_args: &CliArgs) {
     }
 }
 
+/// Build a `CliArgs` from `WorkerExecParams` — mirrors what the CLI parser
+/// would produce from `--worker-exec` flags, but sourced from the forker's
+/// serialized parameters instead.
+fn build_cli_args_from_exec_params(
+    params: &litebox_platform_linux_userland::forker::WorkerExecParams,
+    result_fd: Option<i32>,
+) -> CliArgs {
+    // Reconstruct infra flags into CliArgs fields.
+    let mut nine_p_broker = None;
+    let mut network_broker = None;
+    let mut tun_device_name = None;
+    let mut initial_files = None;
+    let mut program_from_tar = false;
+
+    for (key, value) in &params.infra_flags {
+        match key.as_str() {
+            "--nine-p-broker" => nine_p_broker = value.clone(),
+            "--network-broker" => network_broker = value.clone(),
+            "--tun-device-name" => tun_device_name = value.clone(),
+            "--initial-files" => initial_files = value.as_ref().map(PathBuf::from),
+            "--program-from-tar" => program_from_tar = true,
+            _ => {}
+        }
+    }
+
+    // program_and_arguments: [0] = guest_binary_path, [1..] = argv
+    let mut program_and_arguments = vec![params.guest_binary_path.clone()];
+    program_and_arguments.extend(params.argv.iter().cloned());
+
+    CliArgs {
+        program_and_arguments,
+        environment_variables: params.envp.clone(),
+        forward_environment_variables: false,
+        unstable: true,
+        insert_files: vec![],
+        initial_files,
+        rewrite_syscalls: false,
+        interception_backend: InterceptionBackend::Rewriter,
+        tun_device_name,
+        network_broker,
+        program_from_tar,
+        nine_p_broker,
+        working_directory: Some(params.cwd.clone()),
+        worker_exec: true,
+        worker_exec_fd: None, // image is passed directly, not via fd
+        worker_result_fd: result_fd,
+        worker_interp_fd: None,
+        worker_interp_path: params.interp_path.clone(),
+        guest_pid: Some(params.guest_pid),
+        guest_ppid: Some(params.guest_ppid),
+        guest_uid: Some(params.guest_uid),
+        guest_euid: Some(params.guest_euid),
+        guest_gid: Some(params.guest_gid),
+        guest_egid: Some(params.guest_egid),
+        fork_restore: false,
+        fork_restore_fd: None,
+        fork_restore_ack_fd: None,
+        pipe_bridge: vec![],
+        mux_fd: None,
+        mux_stream: vec![],
+        local_pipe: vec![],
+    }
+}
+
+/// Worker-exec callback for the forker path.
+///
+/// Reads the `WorkerExecParams`, exec image, and optional interp image from
+/// memfds passed via SCM_RIGHTS, builds a `CliArgs`, and delegates to
+/// `run_worker_exec_core`.
+///
+/// This function never returns.
+fn run_forked_worker_exec(
+    req: litebox_platform_linux_userland::forker::ForkRequest,
+    raw_fds: Vec<i32>,
+) -> ! {
+    use litebox_platform_linux_userland::forker::WorkerExecParams;
+
+    let get_fd = |idx: u8| -> Option<i32> {
+        if idx == 0xFF {
+            return None;
+        }
+        let i = idx as usize;
+        if i < raw_fds.len() {
+            Some(raw_fds[i])
+        } else {
+            None
+        }
+    };
+
+    // 1. Read WorkerExecParams from metadata memfd (snapshot_fd_idx is reused
+    //    for the params memfd in WorkerExec requests).
+    let params_fd = get_fd(req.snapshot_fd_idx).unwrap_or(-1);
+    if params_fd < 0 {
+        unsafe { libc::_exit(1); }
+    }
+    let params_data = match read_fork_snapshot_from_fd(params_fd) {
+        Ok(data) => data,
+        Err(_) => unsafe { libc::_exit(1); },
+    };
+    let params = match WorkerExecParams::deserialize(&params_data) {
+        Ok(p) => p,
+        Err(_) => unsafe { libc::_exit(1); },
+    };
+
+    // 2. Read exec image from memfd.
+    let exec_image_fd = get_fd(req.exec_image_fd_idx).unwrap_or(-1);
+    if exec_image_fd < 0 {
+        unsafe { libc::_exit(1); }
+    }
+    let exec_image = match read_worker_exec_image(exec_image_fd) {
+        Ok(data) => data,
+        Err(_) => unsafe { libc::_exit(1); },
+    };
+
+    // 3. Read interp image if present.
+    let interp_image = if let Some(interp_fd) = get_fd(req.interp_image_fd_idx) {
+        match read_worker_exec_image(interp_fd) {
+            Ok(data) => Some(data),
+            Err(_) => unsafe { libc::_exit(1); },
+        }
+    } else {
+        None
+    };
+
+    // 4. Get result_fd and set close-on-exec.
+    let result_fd = get_fd(req.result_fd_idx);
+    if let Some(fd) = result_fd {
+        let _ = set_fd_cloexec(fd);
+    }
+
+    // 5. Close remaining SCM_RIGHTS fds that we no longer need.
+    for (i, &fd) in raw_fds.iter().enumerate() {
+        let i_u8 = i as u8;
+        if i_u8 == req.snapshot_fd_idx {
+            continue; // Already closed by read_fork_snapshot_from_fd.
+        }
+        if i_u8 == req.exec_image_fd_idx {
+            continue; // Already closed by read_worker_exec_image.
+        }
+        if i_u8 == req.interp_image_fd_idx {
+            continue; // Already closed by read_worker_exec_image (or not present).
+        }
+        if i_u8 == req.result_fd_idx {
+            continue; // Still needed.
+        }
+        // Stdio source fds were already dup2'd by worker_entry.
+        let is_stdio_source = req.stdio.iter().any(|b| {
+            matches!(b, litebox_platform_linux_userland::forker::StdioBinding::FromFdIndex(idx) if *idx == i_u8)
+        });
+        if is_stdio_source {
+            unsafe { libc::close(fd); }
+            continue;
+        }
+        // Close any remaining unneeded fds.
+        unsafe { libc::close(fd); }
+    }
+
+    // 6. Build CliArgs from params and run worker exec logic.
+    let interp_path = params.interp_path.clone();
+    let cli_args = build_cli_args_from_exec_params(&params, result_fd);
+    let transferred_interp_image = interp_image.map(|data| {
+        (interp_path.unwrap_or_default(), data)
+    });
+
+    if run_worker_exec_core(cli_args, Some(exec_image), transferred_interp_image).is_err() {
+        unsafe { libc::_exit(1); }
+    }
+    // run_worker_exec_core calls run_program which never returns, so we only
+    // reach here on error.
+    unsafe { libc::_exit(1); }
+}
+
 /// Worker callback for forked workers.
 ///
 /// Called by the forker's `worker_entry` in the grandchild process after
-/// stdio has been wired. Restores guest state from the snapshot memfd,
-/// builds the filesystem, and resumes guest execution.
+/// stdio has been wired. Dispatches to either the fork-restore path or
+/// the worker-exec path based on the request kind.
 ///
 /// This function never returns.
 fn run_forked_worker(
@@ -2550,6 +2742,13 @@ fn run_forked_worker(
     // Convert the fds vec into raw fds, giving up OwnedFd ownership.
     // This prevents double-close when downstream code does from_raw_fd().
     let raw_fds: Vec<i32> = fds.into_iter().map(|fd| fd.into_raw_fd()).collect();
+
+    // Dispatch based on request kind.
+    match req.kind {
+        litebox_platform_linux_userland::forker::ForkRequestKind::WorkerExec => {
+            run_forked_worker_exec(req, raw_fds);
+        }
+        litebox_platform_linux_userland::forker::ForkRequestKind::ForkRestore => {
 
     // Helper to get a raw fd from the array by index (0xFF = not present).
     let get_fd = |idx: u8| -> Option<i32> {
@@ -2749,6 +2948,9 @@ fn run_forked_worker(
             unsafe { libc::_exit(1); }
         }
     }
+
+        } // ForkRestore
+    } // match req.kind
 }
 
 #[cfg(test)]
