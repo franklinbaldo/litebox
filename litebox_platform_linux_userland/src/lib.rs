@@ -1061,12 +1061,15 @@ impl LinuxUserland {
 
         #[allow(clippy::cast_possible_truncation)]
         let request = forker::ForkRequest {
+            kind: forker::ForkRequestKind::ForkRestore,
             stdio: stdio_bindings,
             num_fds: fds_array.len() as u16,
             snapshot_fd_idx,
             ack_fd_idx,
             result_fd_idx,
             mux_fd_idx,
+            exec_image_fd_idx: 0xFF,
+            interp_image_fd_idx: 0xFF,
             mux_streams: mux_streams_req,
             pipe_bridges: pipe_bridges_req,
             local_pipes: local_pipes_req,

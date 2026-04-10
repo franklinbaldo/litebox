@@ -31,7 +31,7 @@ pub fn set_worker_callback(f: fn(ForkRequest, Vec<OwnedFd>, RawFd) -> !) {
 const FORK_REQUEST_MAGIC: [u8; 4] = *b"LBFR";
 
 /// Wire-format version for [`ForkRequest`].
-const FORK_REQUEST_VERSION: u16 = 1;
+const FORK_REQUEST_VERSION: u16 = 2;
 
 /// Magic bytes identifying a [`ForkResponse`] on the wire.
 const FORK_RESPONSE_MAGIC: [u8; 4] = *b"LBFP";
@@ -109,12 +109,27 @@ impl StdioBinding {
 }
 
 // ---------------------------------------------------------------------------
+// ForkRequestKind
+// ---------------------------------------------------------------------------
+
+/// The kind of work the forked worker should perform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkRequestKind {
+    /// Restore from a ForkSnapshot memfd (existing fork-restore path).
+    ForkRestore = 0,
+    /// Boot a new shim and load a non-PIE binary from exec image memfd(s).
+    WorkerExec = 1,
+}
+
+// ---------------------------------------------------------------------------
 // ForkRequest
 // ---------------------------------------------------------------------------
 
 /// Serializable request from the runner to the forker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForkRequest {
+    /// The kind of work this forked worker should perform.
+    pub kind: ForkRequestKind,
     /// Stdio bindings for fds 0, 1, 2.
     pub stdio: [StdioBinding; 3],
     /// Number of fds in the accompanying SCM_RIGHTS message.
@@ -127,6 +142,10 @@ pub struct ForkRequest {
     pub result_fd_idx: u8,
     /// Index for the mux fd (0xFF = none).
     pub mux_fd_idx: u8,
+    /// Index for the exec image fd (0xFF = none).
+    pub exec_image_fd_idx: u8,
+    /// Index for the interpreter image fd (0xFF = none).
+    pub interp_image_fd_idx: u8,
     /// Mux stream descriptors: (stream_id, guest_fd, direction, type, initial_eof).
     pub mux_streams: Vec<(u32, usize, u8, u8, bool)>,
     /// Pipe bridge descriptors: (guest_fd, host_fd_idx_in_array, is_read).
@@ -154,6 +173,9 @@ impl ForkRequest {
         out.extend_from_slice(&FORK_REQUEST_MAGIC);
         out.extend_from_slice(&FORK_REQUEST_VERSION.to_le_bytes());
 
+        // Kind
+        out.push(self.kind as u8);
+
         // Stdio bindings
         for binding in &self.stdio {
             binding.serialize(&mut out);
@@ -165,6 +187,8 @@ impl ForkRequest {
         out.push(self.ack_fd_idx);
         out.push(self.result_fd_idx);
         out.push(self.mux_fd_idx);
+        out.push(self.exec_image_fd_idx);
+        out.push(self.interp_image_fd_idx);
 
         // Mux streams
         #[allow(clippy::cast_possible_truncation)]
@@ -223,6 +247,17 @@ impl ForkRequest {
             return Err("ForkRequest: unsupported version");
         }
 
+        // Kind
+        if pos >= data.len() {
+            return Err("ForkRequest: truncated kind");
+        }
+        let kind = match data[pos] {
+            0 => ForkRequestKind::ForkRestore,
+            1 => ForkRequestKind::WorkerExec,
+            _ => return Err("ForkRequest: unknown kind"),
+        };
+        pos += 1;
+
         // Stdio
         let mut stdio = [StdioBinding::Close; 3];
         for binding in &mut stdio {
@@ -237,14 +272,16 @@ impl ForkRequest {
         pos += 2;
 
         // fd indices
-        if pos + 4 > data.len() {
+        if pos + 6 > data.len() {
             return Err("ForkRequest: truncated fd indices");
         }
         let snapshot_fd_idx = data[pos];
         let ack_fd_idx = data[pos + 1];
         let result_fd_idx = data[pos + 2];
         let mux_fd_idx = data[pos + 3];
-        pos += 4;
+        let exec_image_fd_idx = data[pos + 4];
+        let interp_image_fd_idx = data[pos + 5];
+        pos += 6;
 
         // Mux streams
         if pos + 4 > data.len() {
@@ -360,12 +397,15 @@ impl ForkRequest {
         }
 
         Ok(ForkRequest {
+            kind,
             stdio,
             num_fds,
             snapshot_fd_idx,
             ack_fd_idx,
             result_fd_idx,
             mux_fd_idx,
+            exec_image_fd_idx,
+            interp_image_fd_idx,
             mux_streams,
             pipe_bridges,
             local_pipes,
@@ -870,6 +910,7 @@ mod tests {
     #[test]
     fn fork_request_round_trip_minimal() {
         let req = ForkRequest {
+            kind: ForkRequestKind::ForkRestore,
             stdio: [
                 StdioBinding::Inherit,
                 StdioBinding::DevNull,
@@ -880,6 +921,8 @@ mod tests {
             ack_fd_idx: 0xFF,
             result_fd_idx: 0xFF,
             mux_fd_idx: 0xFF,
+            exec_image_fd_idx: 0xFF,
+            interp_image_fd_idx: 0xFF,
             mux_streams: vec![],
             pipe_bridges: vec![],
             local_pipes: vec![],
@@ -893,6 +936,7 @@ mod tests {
     #[test]
     fn fork_request_round_trip_full() {
         let req = ForkRequest {
+            kind: ForkRequestKind::ForkRestore,
             stdio: [
                 StdioBinding::FromFdIndex(3),
                 StdioBinding::FromFdIndex(4),
@@ -903,6 +947,8 @@ mod tests {
             ack_fd_idx: 1,
             result_fd_idx: 2,
             mux_fd_idx: 3,
+            exec_image_fd_idx: 0xFF,
+            interp_image_fd_idx: 0xFF,
             mux_streams: vec![(100, 5, 0, 1, false), (200, 6, 1, 2, true)],
             pipe_bridges: vec![(7, 4, true), (8, 5, false)],
             local_pipes: vec![(10, 11, 0xFF, 0x1234, 0x5678), (20, 21, 6, 0, 0)],
@@ -916,12 +962,15 @@ mod tests {
     #[test]
     fn fork_request_bad_magic() {
         let mut data = ForkRequest {
+            kind: ForkRequestKind::ForkRestore,
             stdio: [StdioBinding::Inherit; 3],
             num_fds: 0,
             snapshot_fd_idx: 0xFF,
             ack_fd_idx: 0xFF,
             result_fd_idx: 0xFF,
             mux_fd_idx: 0xFF,
+            exec_image_fd_idx: 0xFF,
+            interp_image_fd_idx: 0xFF,
             mux_streams: vec![],
             pipe_bridges: vec![],
             local_pipes: vec![],
@@ -935,12 +984,15 @@ mod tests {
     #[test]
     fn fork_request_bad_version() {
         let mut data = ForkRequest {
+            kind: ForkRequestKind::ForkRestore,
             stdio: [StdioBinding::Inherit; 3],
             num_fds: 0,
             snapshot_fd_idx: 0xFF,
             ack_fd_idx: 0xFF,
             result_fd_idx: 0xFF,
             mux_fd_idx: 0xFF,
+            exec_image_fd_idx: 0xFF,
+            interp_image_fd_idx: 0xFF,
             mux_streams: vec![],
             pipe_bridges: vec![],
             local_pipes: vec![],
@@ -1009,6 +1061,7 @@ mod tests {
     #[test]
     fn fork_request_large_collections() {
         let req = ForkRequest {
+            kind: ForkRequestKind::ForkRestore,
             stdio: [
                 StdioBinding::FromFdIndex(1),
                 StdioBinding::Close,
@@ -1019,6 +1072,8 @@ mod tests {
             ack_fd_idx: 1,
             result_fd_idx: 2,
             mux_fd_idx: 3,
+            exec_image_fd_idx: 0xFF,
+            interp_image_fd_idx: 0xFF,
             mux_streams: (0..20)
                 .map(|i| (i, i as usize * 10, (i % 2) as u8, (i % 3) as u8, i % 2 == 0))
                 .collect(),
@@ -1053,6 +1108,7 @@ mod tests {
         let sock_b = unsafe { OwnedFd::from_raw_fd(sv[1]) };
 
         let req = ForkRequest {
+            kind: ForkRequestKind::ForkRestore,
             stdio: [
                 StdioBinding::Inherit,
                 StdioBinding::DevNull,
@@ -1063,6 +1119,8 @@ mod tests {
             ack_fd_idx: 1,
             result_fd_idx: 0xFF,
             mux_fd_idx: 0xFF,
+            exec_image_fd_idx: 0xFF,
+            interp_image_fd_idx: 0xFF,
             mux_streams: vec![(1, 3, 0, 1, false)],
             pipe_bridges: vec![],
             local_pipes: vec![],
@@ -1111,5 +1169,30 @@ mod tests {
 
         let decoded = recv_fork_response(sock_b.as_raw_fd()).expect("recv should succeed");
         assert_eq!(resp, decoded);
+    }
+
+    #[test]
+    fn fork_request_round_trip_worker_exec() {
+        let req = ForkRequest {
+            kind: ForkRequestKind::WorkerExec,
+            stdio: [
+                StdioBinding::Inherit,
+                StdioBinding::Inherit,
+                StdioBinding::Inherit,
+            ],
+            num_fds: 4,
+            snapshot_fd_idx: 0, // metadata memfd
+            ack_fd_idx: 0xFF,
+            result_fd_idx: 1,
+            mux_fd_idx: 0xFF,
+            exec_image_fd_idx: 2,
+            interp_image_fd_idx: 3,
+            mux_streams: vec![],
+            pipe_bridges: vec![],
+            local_pipes: vec![],
+        };
+        let data = req.serialize();
+        let decoded = ForkRequest::deserialize(&data).expect("deserialize");
+        assert_eq!(req, decoded);
     }
 }
