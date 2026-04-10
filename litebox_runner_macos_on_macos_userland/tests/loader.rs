@@ -989,3 +989,149 @@ fn test_run_system_ls() {
     eprintln!("/bin/ls exited with code {exit_code}");
     assert_eq!(exit_code, 0, "/bin/ls /tmp exited with code {exit_code}");
 }
+
+
+/// Run a real system binary under litebox and return its exit code.
+///
+/// This is a helper to avoid repeating the shared-cache boilerplate in every
+/// system-binary test.
+#[allow(clippy::cast_precision_loss)]
+fn run_system_binary(bin_path: &str, argv: &[&str], label: &str) -> i32 {
+    let path = std::path::Path::new(bin_path);
+    assert!(path.exists(), "{bin_path} not found on this system");
+
+    let cache_dir = std::path::Path::new("/System/Cryptexes/OS/System/Library/dyld");
+    assert!(
+        cache_dir.exists(),
+        "Shared cache not found at {}",
+        cache_dir.display()
+    );
+
+    let map_path = cache_dir.join("dyld_shared_cache_arm64e.map");
+    let map_text = std::fs::read_to_string(&map_path).unwrap();
+    let cache_map = common::shared_cache::CacheMap::parse(&map_text);
+    let system_dylibs = cache_map.system_dylib_paths();
+    let dylib_refs: Vec<&str> = system_dylibs
+        .iter()
+        .map(std::string::String::as_str)
+        .collect();
+    let cache_result = common::shared_cache::collect_regions(cache_dir, &cache_map, &dylib_refs);
+
+    let binary_data = std::fs::read(path).unwrap_or_else(|e| panic!("read {bin_path}: {e}"));
+    eprintln!("Read {bin_path}: {} bytes", binary_data.len());
+
+    let (exit_code, _stdout) =
+        common::run_macho_dynamic(&binary_data, argv, &cache_result, label);
+    eprintln!("{bin_path} exited with code {exit_code}");
+    exit_code
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Coreutils — trivial tier (no I/O beyond args and exit code)
+// ═══════════════════════════════════════════════════════════════════
+
+/// `/usr/bin/false` — should exit with code 1.
+#[test]
+fn test_run_system_false() {
+    let code = run_system_binary("/usr/bin/false", &["/usr/bin/false"], "false");
+    assert_eq!(code, 1, "/usr/bin/false should exit 1, got {code}");
+}
+
+/// `/usr/bin/basename /foo/bar/baz.txt` — pure string manipulation, exit 0.
+#[test]
+fn test_run_system_basename() {
+    let code = run_system_binary(
+        "/usr/bin/basename",
+        &["/usr/bin/basename", "/foo/bar/baz.txt"],
+        "basename",
+    );
+    assert_eq!(code, 0, "basename exited with code {code}");
+}
+
+/// `/usr/bin/dirname /foo/bar/baz.txt` — pure string manipulation, exit 0.
+#[test]
+fn test_run_system_dirname() {
+    let code = run_system_binary(
+        "/usr/bin/dirname",
+        &["/usr/bin/dirname", "/foo/bar/baz.txt"],
+        "dirname",
+    );
+    assert_eq!(code, 0, "dirname exited with code {code}");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Coreutils — light I/O tier (read system info, write stdout)
+// ═══════════════════════════════════════════════════════════════════
+
+/// `/bin/pwd` — calls getcwd(2), writes to stdout.
+#[test]
+fn test_run_system_pwd() {
+    let code = run_system_binary("/bin/pwd", &["/bin/pwd"], "pwd");
+    assert_eq!(code, 0, "pwd exited with code {code}");
+}
+
+/// `/usr/bin/uname -a` — reads sysctl, writes to stdout.
+#[test]
+fn test_run_system_uname() {
+    let code = run_system_binary("/usr/bin/uname", &["/usr/bin/uname", "-a"], "uname");
+    assert_eq!(code, 0, "uname exited with code {code}");
+}
+
+
+
+/// `/usr/bin/env` with no args — prints environment variables.
+#[test]
+fn test_run_system_env() {
+    let code = run_system_binary("/usr/bin/env", &["/usr/bin/env"], "env");
+    assert_eq!(code, 0, "env exited with code {code}");
+}
+
+/// `/usr/bin/printenv` — prints environment variables (similar to env).
+#[test]
+fn test_run_system_printenv() {
+    let code = run_system_binary("/usr/bin/printenv", &["/usr/bin/printenv"], "printenv");
+    assert_eq!(code, 0, "printenv exited with code {code}");
+}
+
+/// `/bin/hostname` — reads hostname, writes to stdout.
+#[test]
+fn test_run_system_hostname() {
+    let code = run_system_binary("/bin/hostname", &["/bin/hostname"], "hostname");
+    assert_eq!(code, 0, "hostname exited with code {code}");
+}
+
+/// `/usr/bin/printf` — formatted output.
+#[test]
+fn test_run_system_printf() {
+    let code = run_system_binary(
+        "/usr/bin/printf",
+        &["/usr/bin/printf", "hello %s\n", "litebox"],
+        "printf",
+    );
+    assert_eq!(code, 0, "printf exited with code {code}");
+}
+
+/// `/usr/bin/seq 1 5` — generate sequence of numbers.
+#[test]
+fn test_run_system_seq() {
+    let code = run_system_binary("/usr/bin/seq", &["/usr/bin/seq", "1", "5"], "seq");
+    assert_eq!(code, 0, "seq exited with code {code}");
+}
+
+/// `/usr/bin/wc` with a simple input via /dev/null — word count utility.
+/// With no stdin and no file args, wc reads stdin which will be empty.
+#[test]
+fn test_run_system_wc() {
+    // wc with /dev/null as arg should print "0 0 0" and exit 0
+    let code = run_system_binary("/usr/bin/wc", &["/usr/bin/wc", "/dev/null"], "wc");
+    assert_eq!(code, 0, "wc exited with code {code}");
+}
+
+/// `/bin/cat /dev/null` — should read empty file and exit 0.
+#[test]
+fn test_run_system_cat() {
+    let code = run_system_binary("/bin/cat", &["/bin/cat", "/dev/null"], "cat");
+    assert_eq!(code, 0, "cat /dev/null exited with code {code}");
+}
+
+
