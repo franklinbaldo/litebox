@@ -1135,3 +1135,28 @@ fn test_run_system_cat() {
 }
 
 
+
+// =====================================================================
+// Identity / metadata -- require MIG message emulation
+// =====================================================================
+
+#[test]
+#[ignore] // Requires iterative MIG subsystem expansion
+fn test_system_binary_whoami() {
+    let code = run_system_binary("/usr/bin/whoami", &["/usr/bin/whoami"], "whoami");
+    assert_eq!(code, 0, "whoami should exit 0");
+}
+
+#[test]
+#[ignore] // Requires iterative MIG subsystem expansion
+fn test_system_binary_id() {
+    let code = run_system_binary("/usr/bin/id", &["/usr/bin/id"], "id");
+    assert_eq!(code, 0, "id should exit 0");
+}
+
+#[test]
+#[ignore] // Requires iterative MIG subsystem expansion
+fn test_system_binary_stat() {
+    let code = run_system_binary("/usr/bin/stat", &["/usr/bin/stat", "/"], "stat");
+    assert_eq!(code, 0, "stat should exit 0");
+}
