@@ -228,6 +228,7 @@ impl<FS: ShimFS> litebox::shim::InitThread for NewThreadArgs<FS> {
 }
 
 pub mod loader;
+mod mig;
 mod semaphore;
 pub mod syscalls;
 mod wait;

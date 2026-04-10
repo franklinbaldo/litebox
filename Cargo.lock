@@ -1851,6 +1851,7 @@ dependencies = [
  "litebox_syscall_rewriter_macho",
  "object",
  "thiserror 2.0.17",
+ "zerocopy",
 ]
 
 [[package]]

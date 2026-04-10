@@ -12,6 +12,7 @@ litebox_platform_macos_userland = { path = "../litebox_platform_macos_userland/"
 litebox_syscall_rewriter_macho = { version = "0.1.0", path = "../litebox_syscall_rewriter_macho" }
 object = { version = "0.36.7", default-features = false, features = ["macho", "read", "std"] }
 thiserror = { version = "2.0.6", default-features = false }
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 
 [features]
 default = ["platform_macos_userland"]
