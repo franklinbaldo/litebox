@@ -6262,6 +6262,24 @@ impl<FS: ShimFS> Task<FS> {
                     (FdClass::Other, None, None, None)
                 };
 
+            // For NetworkSocket fds, probe listening state for fork snapshot.
+            let listening_socket = if subsystem_class == FdClass::NetworkSocket {
+                if let Ok(fd) =
+                    rds.fd_from_raw_integer::<litebox::net::Network<crate::Platform>>(raw_fd)
+                {
+                    let info = self.global.net.lock().get_listening_socket_info(&fd);
+                    info.map(|i| super::fork_snapshot::ListeningSocketSnapshot {
+                        bind_addr: i.bind_addr.map_or([0, 0, 0, 0], |a| a.octets()),
+                        port: i.port,
+                        backlog: i.backlog,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             // Promote to StdioFd only if this fd sits at a stdio slot AND
             // its object_id matches ANY of the original host stdio descriptors.
             // This handles aliases like dup2(1, 2) where fd 2 shares stdout's
@@ -6281,6 +6299,9 @@ impl<FS: ShimFS> Task<FS> {
             // stdio slots, connected Unix sockets on stdio slots.
             match class {
                 FdClass::StdioFd | FdClass::Pipe => {}
+                FdClass::NetworkSocket if listening_socket.is_some() => {
+                    // Listening TCP socket — accepted for fork snapshot.
+                }
                 FdClass::FilesystemFd
                     if terminal_meta.is_some()
                         && terminal_meta
@@ -6343,6 +6364,7 @@ impl<FS: ShimFS> Task<FS> {
                 status_flags: fs_status_flags,
                 object_id: object_id.map_or(0, litebox::fd::DescriptorObjectId::as_u64),
                 metadata: terminal_meta.unwrap_or_default(),
+                listening_socket,
             });
 
             // For non-terminal FilesystemFd, capture the reopen path so

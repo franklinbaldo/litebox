@@ -3645,6 +3645,17 @@ impl<FS: ShimFS> Task<FS> {
                 debug_assert!(new_file >= min_fd as usize);
                 Ok(new_file.try_into().unwrap())
             }
+            FcntlArg::SETOWN(_pid) => {
+                // F_SETOWN sets the process/group that receives SIGIO/SIGURG.
+                // Litebox does not implement async signal-driven I/O, so
+                // accept as a no-op to avoid breaking programs like nginx.
+                Ok(0)
+            }
+            FcntlArg::GETOWN => {
+                // F_GETOWN returns the process/group receiving SIGIO/SIGURG.
+                // Since we don't track this, return 0 (no owner set).
+                Ok(0)
+            }
             _ => unimplemented!(),
         }
     }
@@ -4701,6 +4712,13 @@ impl<FS: ShimFS> Task<FS> {
                     Ok(0)
                 },
             )?,
+            IoctlArg::FIOASYNC(_arg) => {
+                // FIOASYNC controls O_ASYNC (SIGIO delivery). Litebox does not
+                // implement asynchronous signal-driven I/O, so we accept the
+                // ioctl as a no-op to avoid breaking programs (like nginx) that
+                // probe for this capability.
+                Ok(0)
+            }
             IoctlArg::TIOCGPTPEER(open_flags) => {
                 // TIOCGPTPEER: open the slave side of a PTY master, returning a new fd.
                 // The argument contains O_RDWR|O_NOCTTY or similar open flags.

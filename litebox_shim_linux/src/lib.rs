@@ -1070,6 +1070,55 @@ impl<FS: ShimFS> LinuxShim<FS> {
             }
         }
 
+        // Restore listening TCP sockets from fork snapshot.
+        {
+            use syscalls::fork_snapshot::FdClass;
+
+            for entry in &fd_table.entries {
+                if entry.class != FdClass::NetworkSocket {
+                    continue;
+                }
+                let Some(ref ls) = entry.listening_socket else {
+                    continue;
+                };
+
+                let bind_ip = core::net::Ipv4Addr::from(ls.bind_addr);
+                let bind_addr = core::net::SocketAddr::V4(
+                    core::net::SocketAddrV4::new(bind_ip, ls.port),
+                );
+
+                // Create, bind, and listen on a new TCP socket.
+                let socket_fd = {
+                    let mut net = self.global.net.lock();
+                    let fd = net
+                        .socket(litebox::net::Protocol::Tcp)
+                        .expect("failed to create TCP socket for fork restore");
+                    net.bind(&fd, &bind_addr)
+                        .expect("failed to bind TCP socket for fork restore");
+                    net.listen(&fd, ls.backlog)
+                        .expect("failed to listen on TCP socket for fork restore");
+                    fd
+                };
+
+                // Initialize the socket in the shim layer (proxy, metadata).
+                let _ = self.global.initialize_socket(
+                    &socket_fd,
+                    litebox_common_linux::SockType::Stream,
+                    litebox_common_linux::SockFlags::empty(),
+                );
+
+                // Place at the correct fd slot.
+                let mut rds = child_files.raw_descriptor_store.write();
+                let success = rds.fd_into_specific_raw_integer(socket_fd, entry.fd);
+                debug_assert!(
+                    success,
+                    "fd slot {} occupied during network socket restore",
+                    entry.fd
+                );
+                drop(rds);
+            }
+        }
+
         // --- 11. Build credentials. -----------------------------------------
         let child_credentials = Arc::new(syscalls::process::Credentials {
             uid: id.credentials.uid,

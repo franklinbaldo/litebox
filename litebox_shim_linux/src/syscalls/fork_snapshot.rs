@@ -209,6 +209,8 @@ pub struct FdEntrySnapshot {
     /// Per-fd metadata that affects guest-visible behavior (tty routing,
     /// stat identity, directory stream position, etc.).
     pub metadata: FdMetadataSnapshot,
+    /// For listening TCP sockets: the socket state needed for restore.
+    pub listening_socket: Option<ListeningSocketSnapshot>,
 }
 
 /// Snapshot of per-fd metadata attached to a descriptor.
@@ -235,6 +237,20 @@ pub struct FdMetadataSnapshot {
     pub anon_ino: Option<u64>,
     /// Directory stream continuation offset for `getdents64`.
     pub diroff: Option<u64>,
+}
+
+/// Snapshot of a listening TCP socket's state for fork restore.
+///
+/// Captures the bind address, port, and backlog so the child process
+/// can reconstruct an equivalent listening socket via socket+bind+listen.
+#[derive(Debug, Clone)]
+pub struct ListeningSocketSnapshot {
+    /// IPv4 bind address octets.  `[0,0,0,0]` means INADDR_ANY.
+    pub bind_addr: [u8; 4],
+    /// TCP port the socket is listening on.
+    pub port: u16,
+    /// Listen backlog.
+    pub backlog: u16,
 }
 
 /// Classification of a file descriptor for export/import decisions.
@@ -950,6 +966,17 @@ impl FdEntrySnapshot {
         w.write_u32(self.status_flags);
         w.write_u64(self.object_id);
         self.metadata.write(w);
+        match &self.listening_socket {
+            Some(ls) => {
+                w.write_bool(true);
+                w.write_u32(u32::from_be_bytes(ls.bind_addr));
+                w.write_u32(ls.port as u32);
+                w.write_u32(ls.backlog as u32);
+            }
+            None => {
+                w.write_bool(false);
+            }
+        }
     }
 
     fn read(r: &mut SnapshotReader<'_>) -> Result<Self, SnapshotDeserializeError> {
@@ -960,6 +987,16 @@ impl FdEntrySnapshot {
             status_flags: r.read_u32()?,
             object_id: r.read_u64()?,
             metadata: FdMetadataSnapshot::read(r)?,
+            listening_socket: if r.read_bool()? {
+                let addr_u32 = r.read_u32()?;
+                Some(ListeningSocketSnapshot {
+                    bind_addr: addr_u32.to_be_bytes(),
+                    port: r.read_u32()? as u16,
+                    backlog: r.read_u32()? as u16,
+                })
+            } else {
+                None
+            },
         })
     }
 }
@@ -1343,6 +1380,7 @@ mod tests {
                         fd_flags: 0,
                         status_flags: 0,
                         object_id: 100,
+                        listening_socket: None,
                         metadata: FdMetadataSnapshot {
                             host_stdio_source_fd: Some(0),
                             is_host_tty_alias: false,
@@ -1359,6 +1397,7 @@ mod tests {
                         fd_flags: 0,
                         status_flags: 0,
                         object_id: 101,
+                        listening_socket: None,
                         metadata: FdMetadataSnapshot {
                             host_stdio_source_fd: Some(1),
                             is_host_tty_alias: false,
@@ -1375,6 +1414,7 @@ mod tests {
                         fd_flags: 1,         // FD_CLOEXEC
                         status_flags: 0x800, // O_NONBLOCK
                         object_id: 200,
+                        listening_socket: None,
                         metadata: FdMetadataSnapshot {
                             host_stdio_source_fd: None,
                             is_host_tty_alias: false,
@@ -1392,6 +1432,7 @@ mod tests {
                         fd_flags: 0,
                         status_flags: 0x800,
                         object_id: 200, // same OFD as fd 3
+                        listening_socket: None,
                         metadata: FdMetadataSnapshot {
                             host_stdio_source_fd: None,
                             is_host_tty_alias: true,

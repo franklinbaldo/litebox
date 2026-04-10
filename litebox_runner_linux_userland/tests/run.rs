@@ -188,6 +188,36 @@ impl Runner {
         );
         output.stdout
     }
+
+    /// Spawn the runner as a background child process, returning the handle.
+    ///
+    /// Unlike `run()` this does not wait for the process to exit. The caller
+    /// is responsible for killing or waiting on the returned `Child`.
+    #[cfg_attr(not(target_arch = "x86_64"), expect(dead_code))]
+    fn spawn(&mut self) -> std::process::Child {
+        assert!(!self.has_run);
+        self.has_run = true;
+
+        let tar_file = self
+            .dir_path
+            .join(format!("rootfs_{}.tar", self.unique_name));
+        let tar_success =
+            common::create_tar_with_cache(&self.tar_dir, &tar_file, &self.unique_name);
+        assert!(tar_success, "failed to create tar file");
+        println!("Tar file ready at: {}", tar_file.to_str().unwrap());
+
+        self.command
+            .arg("--initial-files")
+            .arg(tar_file)
+            .arg(&self.cmd_path)
+            .args(&self.cmd_args)
+            .stderr(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit());
+        println!("Spawning `{:?}`", self.command);
+        self.command
+            .spawn()
+            .expect("Failed to spawn litebox_runner_linux_userland")
+    }
 }
 
 /// Find all C test files in a directory
@@ -877,4 +907,121 @@ fn test_tun_with_curl() {
 
     let output_str = String::from_utf8_lossy(&output);
     assert!(output_str.contains(RESPONSE_BODY), "Unexpected curl output");
+}
+
+/// Run nginx inside litebox with TUN networking and benchmark it with wrk.
+///
+/// nginx runs in single-process mode (`master_process off`) because
+/// litebox's fork snapshot does not yet carry network socket state to
+/// child workers. This exercises the full HTTP serving path through the
+/// LiteBox sandboxed network stack (TUN + smoltcp).
+///
+/// To run with release build and see output:
+/// ```
+/// cargo test --package litebox_runner_linux_userland --test run --release -- test_nginx_with_wrk --exact --nocapture
+/// ```
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_nginx_with_wrk() {
+    let nginx_path = run_which("nginx");
+    let wrk_path = run_which("wrk");
+
+    // Build the runner with nginx, inject config into the tar filesystem.
+    let mut runner = Runner::new(Backend::Rewriter, &nginx_path, "nginx_wrk_rewriter");
+
+    // Stage the nginx config into the guest filesystem.
+    runner.with_fs_path(|tar_dir| {
+        let conf_dir = tar_dir.join("etc/nginx");
+        std::fs::create_dir_all(&conf_dir).unwrap();
+        std::fs::copy("./tests/net/nginx.conf", conf_dir.join("nginx.conf")).unwrap();
+
+        // Create temp directories nginx expects.
+        for dir in [
+            "tmp/nginx_client_body",
+            "tmp/nginx_proxy",
+            "tmp/nginx_fastcgi",
+            "tmp/nginx_uwsgi",
+            "tmp/nginx_scgi",
+            "var/log/nginx",
+        ] {
+            std::fs::create_dir_all(tar_dir.join(dir)).unwrap();
+        }
+
+        // nginx needs a mime.types file (can be empty for our test).
+        std::fs::write(conf_dir.join("mime.types"), "types {}\n").unwrap();
+    });
+
+    // Run nginx in foreground mode with our config.
+    runner
+        .args(["-c", "/etc/nginx/nginx.conf"])
+        .tun_device_name("tun99");
+
+    // Spawn nginx as a background process (it won't exit on its own).
+    let mut nginx_child = runner.spawn();
+
+    // Wait for nginx to start listening, then run wrk.
+    let wrk_result = std::thread::spawn(move || {
+        // Poll until nginx is accepting connections (up to ~10s).
+        let mut ready = false;
+        for attempt in 1..=100 {
+            match std::net::TcpStream::connect_timeout(
+                &"10.0.0.2:8080".parse().unwrap(),
+                std::time::Duration::from_millis(100),
+            ) {
+                Ok(_) => {
+                    ready = true;
+                    break;
+                }
+                Err(_) => {
+                    if attempt % 20 == 0 {
+                        eprintln!("nginx not ready yet (attempt {attempt}/100), retrying...");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        }
+        assert!(ready, "nginx did not start listening on 10.0.0.2:8080");
+
+        eprintln!("nginx is ready, starting wrk benchmark...");
+
+        // Run wrk: 2 threads, 10 connections, 5 seconds.
+        let output = std::process::Command::new(&wrk_path)
+            .args([
+                "-t2",
+                "-c10",
+                "-d5s",
+                "http://10.0.0.2:8080/",
+            ])
+            .output()
+            .expect("Failed to run wrk");
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        eprintln!("wrk stdout:\n{stdout}");
+        if !stderr.is_empty() {
+            eprintln!("wrk stderr:\n{stderr}");
+        }
+        assert!(
+            output.status.success(),
+            "wrk exited with failure: {}",
+            output.status
+        );
+        stdout
+    })
+    .join()
+    .expect("wrk thread panicked");
+
+    // Verify wrk completed requests successfully.
+    assert!(
+        wrk_result.contains("requests in"),
+        "wrk output does not contain expected summary:\n{wrk_result}",
+    );
+
+    // Shut down nginx gracefully.
+    unsafe {
+        libc::kill(nginx_child.id() as i32, libc::SIGTERM);
+    }
+    let status = nginx_child.wait().expect("Failed to wait for nginx");
+    // nginx exits with the signal status; accept either clean exit or signal termination.
+    eprintln!("nginx exited with status: {status}");
 }

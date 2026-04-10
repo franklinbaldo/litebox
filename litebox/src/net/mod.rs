@@ -1176,6 +1176,37 @@ where
         }
     }
 
+    /// Returns the listening socket info for a TCP server socket, or `None`
+    /// if the socket is not a listening TCP socket.  Used by the fork
+    /// snapshot path to capture enough state to reconstruct the socket in
+    /// the child.
+    pub fn get_listening_socket_info(
+        &self,
+        fd: &SocketFd<Platform>,
+    ) -> Option<ListeningSocketInfo> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let table_entry = descriptor_table.get_entry_mut(fd)?;
+        let socket_handle = &table_entry.entry;
+        match &socket_handle.specific {
+            ProtocolSpecific::Tcp(tcp) => {
+                let server = tcp.server_socket.as_ref()?;
+                let backlog = server.backlog?;
+                let bind_addr = server
+                    .ip_listen_endpoint
+                    .addr
+                    .map(|a| match a {
+                        smoltcp::wire::IpAddress::Ipv4(v4) => v4,
+                    });
+                Some(ListeningSocketInfo {
+                    bind_addr,
+                    port: server.ip_listen_endpoint.port,
+                    backlog,
+                })
+            }
+            _ => None,
+        }
+    }
+
     /// Bind a socket to a specific address and port. If the port is 0, an ephemeral port is allocated.
     pub fn bind(
         &mut self,
@@ -1311,9 +1342,11 @@ where
                     return Err(ListenError::InvalidAddress);
                 }
                 if server_socket.backlog.is_some() || !server_socket.socket_set_handles.is_empty() {
-                    // Need to change the amount of backlog; growing will just work, but truncating
-                    // might need some effort to pick which ones to keep/drop
-                    unimplemented!()
+                    // Re-listen: update the backlog.  Growing adds new
+                    // listening slots via `refill_to_backlog`.  Shrinking
+                    // just updates the cap — existing connections beyond
+                    // the new limit are left alone (same as Linux).
+                    server_socket.backlog = Some(backlog);
                 } else {
                     server_socket.backlog = Some(backlog);
                     server_socket.socket_set_handles = Vec::with_capacity(backlog.into());
@@ -1685,6 +1718,17 @@ pub enum Protocol {
     Udp,
     Icmp,
     Raw { protocol: u8 },
+}
+
+/// Information about a listening TCP socket, used for fork snapshot/restore.
+#[derive(Debug, Clone)]
+pub struct ListeningSocketInfo {
+    /// The IPv4 address the socket is bound to, or `None` for INADDR_ANY.
+    pub bind_addr: Option<core::net::Ipv4Addr>,
+    /// The port the socket is listening on.
+    pub port: u16,
+    /// The listen backlog.
+    pub backlog: u16,
 }
 
 bitflags! {

@@ -555,6 +555,10 @@ pub enum FcntlArg<Platform: litebox::platform::RawPointerProvider> {
     SETLKW(Platform::RawConstPointer<Flock>),
     /// Duplicate file descriptor
     DUPFD { cloexec: bool, min_fd: u32 },
+    /// Set the process ID or process group ID that will receive SIGIO/SIGURG.
+    SETOWN(i32),
+    /// Get the process ID or process group ID receiving SIGIO/SIGURG.
+    GETOWN,
 }
 
 #[repr(i16)]
@@ -598,6 +602,8 @@ const F_SETFL: i32 = 4;
 const F_GETLK: i32 = 5;
 const F_SETLK: i32 = 6;
 const F_SETLKW: i32 = 7;
+const F_SETOWN: i32 = 8;
+const F_GETOWN: i32 = 9;
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy)]
@@ -627,6 +633,8 @@ impl<Platform: litebox::platform::RawPointerProvider> FcntlArg<Platform> {
                 cloexec: true,
                 min_fd: arg.truncate(),
             },
+            F_SETOWN => Self::SETOWN(arg as i32),
+            F_GETOWN => Self::GETOWN,
             _ => return None,
         })
     }
@@ -714,6 +722,7 @@ pub const FIONBIO: u32 = 0x5421;
 pub const FIONREAD: u32 = 0x541b;
 pub const FIONCLEX: u32 = 0x5450;
 pub const FIOCLEX: u32 = 0x5451;
+pub const FIOASYNC: u32 = 0x5452;
 pub const TIOCGPTN: u32 = 0x80045430;
 pub const TIOCSPTLK: u32 = 0x40045431;
 
@@ -758,6 +767,8 @@ pub enum IoctlArg<Platform: litebox::platform::RawPointerProvider> {
     FIOCLEX,
     /// Clear close on exec
     FIONCLEX,
+    /// Enable/disable async (SIGIO) notification on a file descriptor.
+    FIOASYNC(Platform::RawConstPointer<i32>),
     Raw {
         cmd: u32,
         arg: Platform::RawMutPointer<u8>,
@@ -3006,6 +3017,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                         FIONREAD => IoctlArg::FIONREAD(ctx.sys_req_ptr(2)),
                         FIOCLEX => IoctlArg::FIOCLEX,
                         FIONCLEX => IoctlArg::FIONCLEX,
+                        FIOASYNC => IoctlArg::FIOASYNC(ctx.sys_req_ptr(2)),
                         _ => IoctlArg::Raw {
                             cmd,
                             arg: ctx.sys_req_ptr(2),
