@@ -1137,6 +1137,202 @@ impl LinuxUserland {
         Ok(child_pid)
     }
 
+    /// Attempt to spawn a worker-exec via the forker process.
+    ///
+    /// Like `try_spawn_via_forker` but for non-PIE execve: the grandchild
+    /// boots a fresh shim and loads the binary from the exec image memfd.
+    ///
+    /// Returns `Ok(pid)` on success, `Err(())` if the forker is not available.
+    #[allow(clippy::too_many_arguments)]
+    fn try_spawn_worker_exec_via_forker<FS>(
+        &'static self,
+        guest_binary_path: &str,
+        argv: &[alloc::ffi::CString],
+        envp: &[alloc::ffi::CString],
+        guest_cwd: &str,
+        guest_pid: i32,
+        guest_ppid: i32,
+        guest_uid: u32,
+        guest_euid: u32,
+        guest_gid: u32,
+        guest_egid: u32,
+        guest_exec_image: &[u8],
+        guest_interp_image: Option<(&str, &[u8])>,
+        stdio: &WorkerExecStdioBindings<FS, LinuxUserland>,
+    ) -> Result<i32, ()>
+    where
+        FS: litebox::fs::FileSystem + Send + Sync + 'static,
+    {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        // 1. Lock forker handle.
+        let forker_guard = self.forker_handle.lock().unwrap();
+        let forker = match forker_guard.as_ref() {
+            Some(h) => h,
+            None => return Err(()),
+        };
+
+        // 2. Build WorkerExecParams.
+        let argv_strings: Vec<String> = argv.iter()
+            .map(|c| c.to_string_lossy().into_owned())
+            .collect();
+        let envp_strings: Vec<String> = envp.iter()
+            .map(|c| c.to_string_lossy().into_owned())
+            .collect();
+        let infra_flags = {
+            let flags = self.worker_spawn_flags.read().unwrap();
+            parse_infra_flags_from_cstrings(&flags)
+        };
+        let params = forker::WorkerExecParams {
+            guest_binary_path: guest_binary_path.to_string(),
+            argv: argv_strings,
+            envp: envp_strings,
+            cwd: guest_cwd.to_string(),
+            guest_pid,
+            guest_ppid,
+            guest_uid,
+            guest_euid,
+            guest_gid,
+            guest_egid,
+            interp_path: guest_interp_image.map(|(path, _)| path.to_string()),
+            infra_flags,
+        };
+
+        // 3. Create metadata memfd.
+        let params_data = params.serialize();
+        let params_fd = create_worker_fork_snapshot_fd(&params_data).map_err(|_| ())?;
+
+        // 4. Create exec image memfd.
+        let exec_image_fd = create_worker_exec_image_fd(guest_exec_image).map_err(|_| ())?;
+
+        // 5. Create interp image memfd (optional).
+        let interp_image_fd = guest_interp_image
+            .map(|(_, image)| create_worker_exec_image_fd(image))
+            .transpose()
+            .map_err(|_| ())?;
+
+        // 6. Create result pipe.
+        let (result_read_fd, result_write_fd) = create_worker_result_pipe().map_err(|_| ())?;
+
+        // 7. Build fds array.
+        let mut fds_array: Vec<i32> = Vec::new();
+        let mut keep_alive_fds: Vec<OwnedFd> = Vec::new();
+
+        // Index 0: params_fd (metadata memfd)
+        let params_fd_idx = fds_array.len() as u8;
+        fds_array.push(params_fd.as_raw_fd());
+
+        // Index 1: result_write_fd
+        let result_fd_idx = fds_array.len() as u8;
+        fds_array.push(result_write_fd.as_raw_fd());
+
+        // Index 2: exec_image_fd
+        let exec_image_fd_idx = fds_array.len() as u8;
+        fds_array.push(exec_image_fd.as_raw_fd());
+
+        // Index 3: interp_image_fd (optional)
+        let interp_image_fd_idx = if let Some(ref interp_fd) = interp_image_fd {
+            let idx = fds_array.len() as u8;
+            fds_array.push(interp_fd.as_raw_fd());
+            idx
+        } else {
+            0xFF
+        };
+
+        // Map stdio bindings.
+        let mut stdio_bindings = [forker::StdioBinding::DevNull; 3];
+        // stdin
+        match &stdio.stdin {
+            WorkerExecInputBinding::HostStdio { fd } | WorkerExecInputBinding::HostPipe { fd } => {
+                let duped = unsafe { libc::fcntl(*fd, libc::F_DUPFD_CLOEXEC, 3) };
+                if duped < 0 { return Err(()); }
+                let owned = unsafe { OwnedFd::from_raw_fd(duped) };
+                let idx = fds_array.len() as u8;
+                fds_array.push(owned.as_raw_fd());
+                keep_alive_fds.push(owned);
+                stdio_bindings[0] = forker::StdioBinding::FromFdIndex(idx);
+            }
+            WorkerExecInputBinding::Close => {
+                stdio_bindings[0] = forker::StdioBinding::Close;
+            }
+            _ => {
+                stdio_bindings[0] = forker::StdioBinding::DevNull;
+            }
+        }
+        // stdout, stderr
+        for (i, binding) in [(1usize, &stdio.stdout), (2usize, &stdio.stderr)] {
+            match binding {
+                WorkerExecOutputBinding::HostStdio { fd }
+                | WorkerExecOutputBinding::HostPipe { fd } => {
+                    let duped = unsafe { libc::fcntl(*fd, libc::F_DUPFD_CLOEXEC, 3) };
+                    if duped < 0 { return Err(()); }
+                    let owned = unsafe { OwnedFd::from_raw_fd(duped) };
+                    let idx = fds_array.len() as u8;
+                    fds_array.push(owned.as_raw_fd());
+                    keep_alive_fds.push(owned);
+                    stdio_bindings[i] = forker::StdioBinding::FromFdIndex(idx);
+                }
+                WorkerExecOutputBinding::Close => {
+                    stdio_bindings[i] = forker::StdioBinding::Close;
+                }
+                _ => {
+                    stdio_bindings[i] = forker::StdioBinding::DevNull;
+                }
+            }
+        }
+
+        // 8. Build ForkRequest.
+        #[allow(clippy::cast_possible_truncation)]
+        let request = forker::ForkRequest {
+            kind: forker::ForkRequestKind::WorkerExec,
+            stdio: stdio_bindings,
+            num_fds: fds_array.len() as u16,
+            snapshot_fd_idx: params_fd_idx,  // repurposed: metadata memfd
+            ack_fd_idx: 0xFF,               // worker-exec doesn't use ack
+            result_fd_idx,
+            mux_fd_idx: 0xFF,
+            exec_image_fd_idx,
+            interp_image_fd_idx,
+            mux_streams: vec![],
+            pipe_bridges: vec![],
+            local_pipes: vec![],
+        };
+
+        // 9. Send fork request.
+        let sock_guard = forker.sock.lock().unwrap();
+        forker::send_fork_request(sock_guard.as_raw_fd(), &request, &fds_array)
+            .map_err(|_| ())?;
+
+        // 10. Receive fork response.
+        let response = forker::recv_fork_response(sock_guard.as_raw_fd())
+            .map_err(|_| ())?;
+        drop(sock_guard);
+        drop(forker_guard);
+
+        let child_pid = response.child_pid;
+        if child_pid < 0 {
+            return Err(());
+        }
+
+        // 11. Drop write ends and image fds.
+        drop(result_write_fd);
+        drop(params_fd);
+        drop(exec_image_fd);
+        drop(interp_image_fd);
+        drop(keep_alive_fds);
+
+        // 12. Register child in worker_processes.
+        self.worker_processes.lock().unwrap().insert(
+            child_pid,
+            WorkerHostProcess {
+                result_fd: result_read_fd,
+                bridge_threads: Vec::new(),
+            },
+        );
+
+        Ok(child_pid)
+    }
+
     /// Cancel any pending `read_from_stdin()` call, causing it to return EOF.
     /// Called when the guest process is exiting to unblock threads waiting on stdin.
     pub fn cancel_stdin(&self) {
@@ -2615,6 +2811,29 @@ fn create_worker_result_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os
         move_fd_away_from_stdio(read_fd)?,
         move_fd_away_from_stdio(write_fd)?,
     ))
+}
+
+/// Parse worker spawn flags from CString pairs back into structured form.
+fn parse_infra_flags_from_cstrings(
+    flags: &[std::ffi::CString],
+) -> Vec<(String, Option<String>)> {
+    let mut result = Vec::new();
+    let mut i = 0;
+    while i < flags.len() {
+        let key = flags[i].to_string_lossy().into_owned();
+        // If next element doesn't start with "--", it's a value
+        if i + 1 < flags.len() {
+            let next = flags[i + 1].to_string_lossy();
+            if !next.starts_with("--") {
+                result.push((key, Some(next.into_owned())));
+                i += 2;
+                continue;
+            }
+        }
+        result.push((key, None));
+        i += 1;
+    }
+    result
 }
 
 fn update_fd_nonblocking(fd: &std::os::fd::OwnedFd, nonblocking: bool) -> std::io::Result<()> {
