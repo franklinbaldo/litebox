@@ -121,6 +121,15 @@ pub struct CliArgs {
     /// path. The broker must speak the LB9P protocol.
     #[arg(long = "nine-p-broker", value_name = "ADDR_OR_PATH")]
     pub nine_p_broker: Option<String>,
+    /// Set an environment variable inside the sandbox. Can be specified
+    /// multiple times. Format: KEY=VALUE.
+    ///
+    /// When any `--env` values are provided, they are merged with the
+    /// default sandbox environment (SYSTEMROOT, PATH, TEMP, etc.).
+    ///
+    /// Example: `--env "GH_TOKEN=$(gh auth token)"`
+    #[arg(long = "env", value_name = "KEY=VALUE")]
+    pub env_vars: Vec<String>,
 }
 
 fn quote_windows_command_line_arg(arg: &str) -> String {
@@ -1512,7 +1521,30 @@ fn create_shim_and_run<FS: litebox_shim_windows::NtShimFS>(
         thread_id: u64::from(litebox_shim_windows::peb_teb::SYNTHETIC_MAIN_THREAD_ID),
         api_set_map: host_api_set_map,
         gdi_shared_handle_table: gdi_shared_va,
-        env_strings: Vec::new(), // use default hardcoded env for root process
+        env_strings: if cli_args.env_vars.is_empty() {
+            Vec::new() // use default hardcoded env for root process
+        } else {
+            // When extra env vars are provided, we must supply the full
+            // environment because the PEB builder replaces (not merges)
+            // when env_strings is non-empty.
+            let mut env = vec![
+                "SYSTEMROOT=C:\\Windows".into(),
+                "COMSPEC=C:\\Windows\\System32\\cmd.exe".into(),
+                "PATH=C:\\Windows\\System32".into(),
+                "TEMP=C:\\Windows\\Temp".into(),
+                "TMP=C:\\Windows\\Temp".into(),
+                "USERPROFILE=C:\\Users\\sandbox".into(),
+                "HOMEDRIVE=C:".into(),
+                "HOMEPATH=\\Users\\sandbox".into(),
+                "APPDATA=C:\\Users\\sandbox\\AppData".into(),
+                "LOCALAPPDATA=C:\\Users\\sandbox\\AppData\\Local".into(),
+                "PYTHONHASHSEED=0".into(),
+                "PYTHONLEGACYWINDOWSSTDIO=1".into(),
+                "PYTHONUNBUFFERED=1".into(),
+            ];
+            env.extend(cli_args.env_vars.iter().cloned());
+            env
+        },
     };
     let peb_teb_bytes = build_peb_teb_bytes(&peb_teb_layout, &peb_teb_params);
 
