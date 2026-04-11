@@ -981,8 +981,6 @@ impl LinuxUserland {
 
         // Map stdio bindings.
         let mut stdio_bindings = [forker::StdioBinding::DevNull; 3];
-        let mut stdin_bridge_write_fd: Option<OwnedFd> = None;
-        let mut output_bridge_read_fds: Vec<(libc::c_int, OwnedFd)> = Vec::new();
 
         // stdin
         match &stdio.stdin {
@@ -1004,14 +1002,10 @@ impl LinuxUserland {
                 stdio_bindings[0] = forker::StdioBinding::Inherit;
             }
             _ => {
-                // Complex binding (Fs/Pipe/Stream): create pipe, send read-end to child.
-                let (read_fd, write_fd) =
-                    create_worker_stdio_pipe(false, false, None).map_err(|_| ())?;
-                let idx = fds_array.len() as u8;
-                fds_array.push(read_fd.as_raw_fd());
-                keep_alive_fds.push(read_fd);
-                stdio_bindings[0] = forker::StdioBinding::FromFdIndex(idx);
-                stdin_bridge_write_fd = Some(write_fd);
+                // Complex bindings (Fs/Pipe/Stream) are handled by the mux
+                // mechanism (for pipes) or by the child's restored litebox
+                // state (for Fs/Stream).  Wire OS stdin to /dev/null.
+                stdio_bindings[0] = forker::StdioBinding::DevNull;
             }
         }
 
@@ -1037,14 +1031,10 @@ impl LinuxUserland {
                     stdio_bindings[i] = forker::StdioBinding::Inherit;
                 }
                 _ => {
-                    // Complex binding (Fs/Pipe/Stream): create pipe, send write-end to child.
-                    let (read_fd, write_fd) =
-                        create_worker_stdio_pipe(false, false, None).map_err(|_| ())?;
-                    let idx = fds_array.len() as u8;
-                    fds_array.push(write_fd.as_raw_fd());
-                    keep_alive_fds.push(write_fd);
-                    stdio_bindings[i] = forker::StdioBinding::FromFdIndex(idx);
-                    output_bridge_read_fds.push((i as libc::c_int, read_fd));
+                    // Complex bindings (Fs/Pipe/Stream) are handled by the mux
+                    // mechanism (for pipes) or by the child's restored litebox
+                    // state (for Fs/Stream).  Wire OS stdout/stderr to /dev/null.
+                    stdio_bindings[i] = forker::StdioBinding::DevNull;
                 }
             }
         }
@@ -1146,69 +1136,12 @@ impl LinuxUserland {
             return Err(());
         }
 
-        // Spawn bridge threads for complex stdio bindings.
-        let mut bridge_threads: Vec<DetachedWorkerBridge> = Vec::new();
-
-        if let Some(write_fd) = stdin_bridge_write_fd
-            && let Some(input_source) = collect_worker_exec_input_source(stdio)
-        {
-            if let Ok(bridge) = spawn_worker_input_bridge(self, input_source, write_fd) {
-                bridge_threads.push(bridge);
-            } else {
-                terminate_worker_after_bridge_spawn_failure(
-                    self,
-                    child_pid,
-                    bridge_threads,
-                );
-                return Err(());
-            }
-        }
-
-        let output_groups = collect_worker_exec_output_groups(stdio);
-        for (target_fd, read_fd) in output_bridge_read_fds {
-            // Find matching output sink for this target_fd.
-            let sink = output_groups.iter().find_map(|g| {
-                if g.target_fds.contains(&target_fd) {
-                    Some(match &g.sink {
-                        WorkerExecOutputSink::Fs { fs, fd } => WorkerExecOutputSink::Fs {
-                            fs: fs.clone(),
-                            fd: fd.clone(),
-                        },
-                        WorkerExecOutputSink::Pipe { pipes, fd } => WorkerExecOutputSink::Pipe {
-                            pipes: pipes.clone(),
-                            fd: fd.clone(),
-                        },
-                        WorkerExecOutputSink::Stream(writer) => {
-                            WorkerExecOutputSink::Stream(writer.clone())
-                        }
-                    })
-                } else {
-                    None
-                }
-            });
-            if let Some(sink) = sink {
-                if let Ok(handle) = spawn_worker_output_bridge(self, sink, read_fd) {
-                    bridge_threads.push(DetachedWorkerBridge {
-                        handle,
-                        input_control: None,
-                    });
-                } else {
-                    terminate_worker_after_bridge_spawn_failure(
-                        self,
-                        child_pid,
-                        bridge_threads,
-                    );
-                    return Err(());
-                }
-            }
-        }
-
         // 11. Register child in worker_processes.
         self.worker_processes.lock().unwrap().insert(
             child_pid,
             WorkerHostProcess {
                 result_fd: result_read_fd,
-                bridge_threads,
+                bridge_threads: Vec::new(),
             },
         );
 
