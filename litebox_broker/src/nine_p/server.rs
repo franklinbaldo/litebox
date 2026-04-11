@@ -138,11 +138,16 @@ impl Server {
 
     /// Canonicalize `path` and verify it is contained within the server root.
     ///
+    /// Uses chroot-aware resolution: absolute symlinks inside the rootfs are
+    /// resolved relative to the root, not the host `/`. This prevents
+    /// symlinks like `/bin/sh -> /bin/busybox` from escaping the jail when
+    /// the rootfs is an unpacked container image.
+    ///
     /// Returns the canonical path on success, or an `EPERM` error response
     /// value when the resolved path escapes the root directory (e.g. via a
     /// symlink pointing outside the jail).
     fn resolve_and_check(&self, path: &Path) -> Result<PathBuf, u32> {
-        let canonical = fs::canonicalize(path).map_err(io_errno)?;
+        let canonical = canonicalize_in_root(&self.root, path).map_err(io_errno)?;
         if canonical.starts_with(&self.root) || self.mount_table.is_under_mount(&canonical) {
             Ok(canonical)
         } else {
@@ -702,6 +707,8 @@ impl Server {
         // Component-by-component walk with containment check.
         // Symlinks are resolved transparently: we canonicalize after each
         // step so the stored path always points at the real location.
+        // Uses chroot-aware canonicalization so that absolute symlinks
+        // inside the rootfs are resolved relative to `self.root`.
         for name in &wnames {
             let component = match std::str::from_utf8(name) {
                 Ok(s) => s,
@@ -740,20 +747,24 @@ impl Server {
             // check for a mount point redirect.
             let resolved = if let Ok(guest_rel) = next.strip_prefix(&self.root) {
                 if let Some(host_path) = self.mount_table.resolve(guest_rel) {
-                    // Mount hit: canonicalize the host path
+                    // Mount hit: canonicalize the host path.
+                    // Mount targets are real host paths, not inside the
+                    // rootfs, so use standard fs::canonicalize.
                     match fs::canonicalize(&host_path) {
                         Ok(p) => p,
                         Err(_) => break,
                     }
                 } else {
-                    // No mount match, canonicalize as normal
-                    match fs::canonicalize(&next) {
+                    // No mount match — canonicalize with chroot-awareness
+                    // so absolute symlinks stay inside the rootfs.
+                    match canonicalize_in_root(&self.root, &next) {
                         Ok(p) => p,
                         Err(_) => break,
                     }
                 }
             } else {
-                // Path not under root (e.g., walking inside a mount target)
+                // Path not under root (e.g., walking inside a mount target).
+                // Use standard canonicalization for mount-target paths.
                 match fs::canonicalize(&next) {
                     Ok(p) => p,
                     Err(_) => break,
@@ -2063,6 +2074,102 @@ fn io_error_response<'a>(e: std::io::Error) -> Fcall<'a> {
 }
 
 /// Extract OS errno from an `io::Error`, defaulting to EIO.
+/// Chroot-aware path canonicalization.
+///
+/// Resolves `path` component-by-component, re-rooting absolute symlink
+/// targets to `root` instead of the host `/`. This matches `chroot`
+/// semantics: a symlink `/bin/sh -> /bin/busybox` inside an unpacked
+/// rootfs at `/tmp/rootfs` resolves to `/tmp/rootfs/bin/busybox`, not
+/// the host's `/bin/busybox`.
+///
+/// Returns the fully resolved canonical path (no symlinks remain).
+///
+/// # Errors
+///
+/// Returns `std::io::Error` if a component does not exist, or the
+/// symlink chain exceeds the depth limit.
+fn canonicalize_in_root(root: &Path, path: &Path) -> std::io::Result<PathBuf> {
+    const MAX_SYMLINK_DEPTH: u32 = 40;
+
+    // If the path is already under `root`, we need to resolve its suffix
+    // relative to root. If not, just delegate to std::fs::canonicalize.
+    let suffix = match path.strip_prefix(root) {
+        Ok(s) => s.to_path_buf(),
+        Err(_) => return fs::canonicalize(path),
+    };
+
+    let mut resolved = root.to_path_buf();
+    let mut remaining: Vec<std::ffi::OsString> = suffix.components()
+        .map(|c| c.as_os_str().to_owned())
+        .collect();
+    // Process components front-to-back by reversing so we can pop from the end.
+    remaining.reverse();
+
+    let mut symlink_count = 0u32;
+
+    while let Some(component) = remaining.pop() {
+        let comp_str = component.to_string_lossy();
+        if comp_str == "." || comp_str.is_empty() {
+            continue;
+        }
+        if comp_str == ".." {
+            // Don't escape above root.
+            if resolved > *root {
+                resolved.pop();
+            }
+            continue;
+        }
+
+        resolved.push(&component);
+
+        let meta = match fs::symlink_metadata(&resolved) {
+            Ok(m) => m,
+            Err(e) => {
+                // Component doesn't exist. Return the error with the
+                // partially-resolved path so callers see where it failed.
+                return Err(e);
+            }
+        };
+
+        if meta.file_type().is_symlink() {
+            symlink_count += 1;
+            if symlink_count > MAX_SYMLINK_DEPTH {
+                return Err(std::io::Error::from_raw_os_error(libc::ELOOP));
+            }
+            let target = fs::read_link(&resolved)?;
+            // Pop the symlink itself — we'll replace it with the target
+            // components.
+            resolved.pop();
+
+            if target.is_absolute() {
+                // Absolute symlink: re-root to the rootfs.
+                resolved = root.to_path_buf();
+                let target_components: Vec<std::ffi::OsString> = target
+                    .components()
+                    .filter(|c| matches!(c, std::path::Component::Normal(_)))
+                    .map(|c| c.as_os_str().to_owned())
+                    .collect();
+                // Push target components in reverse (we pop from end).
+                for c in target_components.into_iter().rev() {
+                    remaining.push(c);
+                }
+            } else {
+                // Relative symlink: resolve from current directory.
+                let target_components: Vec<std::ffi::OsString> = target
+                    .components()
+                    .map(|c| c.as_os_str().to_owned())
+                    .collect();
+                for c in target_components.into_iter().rev() {
+                    remaining.push(c);
+                }
+            }
+        }
+        // If it's not a symlink, resolved already has the component appended — move on.
+    }
+
+    Ok(resolved)
+}
+
 fn io_errno(e: std::io::Error) -> u32 {
     e.raw_os_error().unwrap_or(libc::EIO) as u32
 }

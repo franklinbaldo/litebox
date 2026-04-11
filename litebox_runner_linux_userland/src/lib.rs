@@ -279,7 +279,10 @@ fn initial_exec_path(cli_args: &CliArgs) -> PathBuf {
 }
 
 fn load_program_path(cli_args: &CliArgs) -> PathBuf {
-    if cli_args.program_from_tar {
+    if cli_args.program_from_tar || cli_args.nine_p_broker.is_some() {
+        // The program lives in the tar or on the 9P remote filesystem.
+        // Use the guest-side path as-is — the shim will open it via the
+        // virtual filesystem.
         PathBuf::from(&cli_args.program_and_arguments[0])
     } else {
         resolve_host_program_path(&cli_args.program_and_arguments[0])
@@ -395,7 +398,11 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     let (ancestor_modes_and_users, prog_data): (
         Vec<(litebox::fs::Mode, u32)>,
         Option<alloc::borrow::Cow<'static, [u8]>>,
-    ) = if cli_args.program_from_tar {
+    ) = if cli_args.program_from_tar || cli_args.nine_p_broker.is_some() {
+        // When --program-from-tar is set, the binary is in the tar file.
+        // When a 9P broker is active, the binary lives on the remote filesystem
+        // and will be loaded lazily from the 9P lower layer. In both cases,
+        // skip reading from the host filesystem.
         (Vec::new(), None)
     } else {
         let prog = resolve_host_program_path(&cli_args.program_and_arguments[0]);
@@ -407,33 +414,35 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
                      add --program-from-tar",
                 );
             }
+            if cli_args.nine_p_broker.is_none() {
+                msg.push_str(
+                    "\nhint: if the program is on a remote filesystem, \
+                     use --nine-p-broker",
+                );
+            }
             anyhow::bail!(msg);
         }
-        if cli_args.nine_p_broker.is_some() {
-            (Vec::new(), None)
-        } else {
-            let ancestors: Vec<_> = prog.ancestors().collect();
-            let modes: Vec<_> = ancestors
-                .into_iter()
-                .rev()
-                .skip(1)
-                .map(|path| {
-                    let metadata = path.metadata().unwrap();
-                    (
-                        litebox::fs::Mode::from_bits(metadata.st_mode()).unwrap(),
-                        metadata.st_uid(),
-                    )
-                })
-                .collect();
-            let file = mmapped_file(&prog)?;
-            let data = initial_program_data(
-                file,
-                cli_args.rewrite_syscalls,
-                &mut cow_eligible_regions,
-                &prog,
-            )?;
-            (modes, Some(data))
-        }
+        let ancestors: Vec<_> = prog.ancestors().collect();
+        let modes: Vec<_> = ancestors
+            .into_iter()
+            .rev()
+            .skip(1)
+            .map(|path| {
+                let metadata = path.metadata().unwrap();
+                (
+                    litebox::fs::Mode::from_bits(metadata.st_mode()).unwrap(),
+                    metadata.st_uid(),
+                )
+            })
+            .collect();
+        let file = mmapped_file(&prog)?;
+        let data = initial_program_data(
+            file,
+            cli_args.rewrite_syscalls,
+            &mut cow_eligible_regions,
+            &prog,
+        )?;
+        (modes, Some(data))
     };
     let tar_data: &'static [u8] = if let Some(tar_file) = cli_args.initial_files.as_ref() {
         if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
@@ -3159,46 +3168,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn load_program_path_canonicalizes_with_nine_p_for_relative_launcher() {
-        use std::os::unix::fs::symlink;
-
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let base = std::env::temp_dir().join(format!(
-            "litebox-runner-load-program-path-9p-{}-{unique}",
-            std::process::id()
-        ));
-        let guest_cwd = std::env::temp_dir().join(format!(
-            "litebox-runner-load-program-path-cwd-{}-{unique}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&base).unwrap();
-        std::fs::create_dir_all(&guest_cwd).unwrap();
-        let real = base.join("real-binary");
-        let launcher = base.join("launcher");
-        std::fs::write(&real, b"test").unwrap();
-        symlink(&real, &launcher).unwrap();
-
-        let old_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&base).unwrap();
-
+    fn load_program_path_preserves_guest_path_with_nine_p() {
+        // When a 9P broker is active, load_program_path should return the
+        // guest-side path as-is (not resolve on the host). The binary
+        // lives on the remote 9P filesystem.
         let mut cli = test_cli_args("./launcher");
         cli.nine_p_broker = Some("/tmp/litebox-broker.sock".to_string());
-        cli.working_directory = Some(guest_cwd.to_string_lossy().into_owned());
+        cli.working_directory = Some("/guest/cwd".to_string());
 
         assert_eq!(initial_exec_path(&cli), PathBuf::from("./launcher"));
-        assert_eq!(
-            load_program_path(&cli),
-            std::fs::canonicalize(&real).unwrap()
-        );
-
-        std::env::set_current_dir(old_cwd).unwrap();
-        let _ = std::fs::remove_file(&launcher);
-        let _ = std::fs::remove_file(&real);
-        let _ = std::fs::remove_dir(&base);
-        let _ = std::fs::remove_dir(&guest_cwd);
+        assert_eq!(load_program_path(&cli), PathBuf::from("./launcher"));
     }
 
     #[test]
