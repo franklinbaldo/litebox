@@ -1221,7 +1221,7 @@ impl LinuxUserland {
     /// Like `try_spawn_via_forker` but for non-PIE execve: the grandchild
     /// boots a fresh shim and loads the binary from the exec image memfd.
     ///
-    /// Returns `Ok(pid)` on success, `Err(())` if the forker is not available.
+    /// Returns `Ok(WorkerExecSpawnResult)` on success, `Err(())` if the forker is not available.
     #[allow(clippy::too_many_arguments)]
     fn try_spawn_worker_exec_via_forker<FS>(
         &'static self,
@@ -1238,11 +1238,12 @@ impl LinuxUserland {
         guest_exec_image: &[u8],
         guest_interp_image: Option<(&str, &[u8])>,
         stdio: &WorkerExecStdioBindings<FS, LinuxUserland>,
-    ) -> Result<i32, ()>
+        direct_pipe_io: bool,
+    ) -> Result<WorkerExecSpawnResult, ()>
     where
         FS: litebox::fs::FileSystem + Send + Sync + 'static,
     {
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 
         // 1. Lock forker handle.
         let forker_guard = self.forker_handle.lock().unwrap();
@@ -1322,6 +1323,8 @@ impl LinuxUserland {
 
         // Map stdio bindings.
         let mut stdio_bindings = [forker::StdioBinding::DevNull; 3];
+        let mut stdin_bridge_write_fd: Option<OwnedFd> = None;
+        let mut output_bridge_read_fds: Vec<(libc::c_int, OwnedFd)> = Vec::new();
         // stdin
         match &stdio.stdin {
             WorkerExecInputBinding::HostStdio { fd } | WorkerExecInputBinding::HostPipe { fd } => {
@@ -1340,7 +1343,14 @@ impl LinuxUserland {
                 stdio_bindings[0] = forker::StdioBinding::Inherit;
             }
             _ => {
-                stdio_bindings[0] = forker::StdioBinding::DevNull;
+                // Complex binding (Fs/Pipe/Stream): create pipe, send read-end to child.
+                let (read_fd, write_fd) =
+                    create_worker_stdio_pipe(false, false, None).map_err(|_| ())?;
+                let idx = fds_array.len() as u8;
+                fds_array.push(read_fd.as_raw_fd());
+                keep_alive_fds.push(read_fd);
+                stdio_bindings[0] = forker::StdioBinding::FromFdIndex(idx);
+                stdin_bridge_write_fd = Some(write_fd);
             }
         }
         // stdout, stderr
@@ -1362,8 +1372,35 @@ impl LinuxUserland {
                 WorkerExecOutputBinding::Inherit => {
                     stdio_bindings[i] = forker::StdioBinding::Inherit;
                 }
-                _ => {
-                    stdio_bindings[i] = forker::StdioBinding::DevNull;
+                WorkerExecOutputBinding::Pipe { pipes, fd } => {
+                    let write_nonblocking = pipes
+                        .get_flags(fd.as_ref())
+                        .map(|flags| flags.contains(litebox::pipes::Flags::NON_BLOCKING))
+                        .unwrap_or(false);
+                    let write_capacity = pipes
+                        .writable_bytes(fd.as_ref())
+                        .ok()
+                        .filter(|capacity| supports_bridge_pipe_capacity(*capacity));
+                    if write_nonblocking && write_capacity.is_none() {
+                        return Err(());
+                    }
+                    let (read_fd, write_fd) =
+                        create_worker_stdio_pipe(false, write_nonblocking, write_capacity)
+                            .map_err(|_| ())?;
+                    let idx = fds_array.len() as u8;
+                    fds_array.push(write_fd.as_raw_fd());
+                    keep_alive_fds.push(write_fd);
+                    stdio_bindings[i] = forker::StdioBinding::FromFdIndex(idx);
+                    output_bridge_read_fds.push((i as libc::c_int, read_fd));
+                }
+                WorkerExecOutputBinding::Fs { .. } | WorkerExecOutputBinding::Stream(_) => {
+                    let (read_fd, write_fd) =
+                        create_worker_stdio_pipe(false, false, None).map_err(|_| ())?;
+                    let idx = fds_array.len() as u8;
+                    fds_array.push(write_fd.as_raw_fd());
+                    keep_alive_fds.push(write_fd);
+                    stdio_bindings[i] = forker::StdioBinding::FromFdIndex(idx);
+                    output_bridge_read_fds.push((i as libc::c_int, read_fd));
                 }
             }
         }
@@ -1408,16 +1445,94 @@ impl LinuxUserland {
         drop(interp_image_fd);
         drop(keep_alive_fds);
 
+        // Spawn bridge threads (or direct_pipe_io entries) for complex stdio bindings.
+        let mut bridge_threads: Vec<DetachedWorkerBridge> = Vec::new();
+        let mut direct_pipes: Vec<ExecPipeDirectIo> = Vec::new();
+
+        if let Some(write_fd) = stdin_bridge_write_fd {
+            if let Some(input_source) = collect_worker_exec_input_source(stdio) {
+                if direct_pipe_io && matches!(&input_source, WorkerExecInputSource::Pipe { .. }) {
+                    let raw_fd = write_fd.into_raw_fd();
+                    direct_pipes.push(ExecPipeDirectIo {
+                        child_stdio_fd: 0,
+                        parent_os_fd: raw_fd,
+                    });
+                } else {
+                    match spawn_worker_input_bridge(self, input_source, write_fd) {
+                        Ok(bridge) => bridge_threads.push(bridge),
+                        Err(_) => {
+                            for dp in &direct_pipes {
+                                close_raw_fd(dp.parent_os_fd);
+                            }
+                            terminate_worker_after_bridge_spawn_failure(self, child_pid, bridge_threads);
+                            return Err(());
+                        }
+                    }
+                }
+            }
+        }
+
+        let output_groups = collect_worker_exec_output_groups(stdio);
+        for (target_fd, read_fd) in output_bridge_read_fds {
+            let sink = output_groups.iter().find_map(|g| {
+                if g.target_fds.contains(&target_fd) {
+                    Some(match &g.sink {
+                        WorkerExecOutputSink::Fs { fs, fd } => WorkerExecOutputSink::Fs {
+                            fs: fs.clone(),
+                            fd: fd.clone(),
+                        },
+                        WorkerExecOutputSink::Pipe { pipes, fd } => WorkerExecOutputSink::Pipe {
+                            pipes: pipes.clone(),
+                            fd: fd.clone(),
+                        },
+                        WorkerExecOutputSink::Stream(writer) => {
+                            WorkerExecOutputSink::Stream(writer.clone())
+                        }
+                    })
+                } else {
+                    None
+                }
+            });
+            if let Some(sink) = sink {
+                if direct_pipe_io && matches!(&sink, WorkerExecOutputSink::Pipe { .. }) {
+                    let raw_fd = read_fd.into_raw_fd();
+                    direct_pipes.push(ExecPipeDirectIo {
+                        child_stdio_fd: target_fd,
+                        parent_os_fd: raw_fd,
+                    });
+                } else {
+                    match spawn_worker_output_bridge(self, sink, read_fd) {
+                        Ok(handle) => {
+                            bridge_threads.push(DetachedWorkerBridge {
+                                handle,
+                                input_control: None,
+                            });
+                        }
+                        Err(_) => {
+                            for dp in &direct_pipes {
+                                close_raw_fd(dp.parent_os_fd);
+                            }
+                            terminate_worker_after_bridge_spawn_failure(self, child_pid, bridge_threads);
+                            return Err(());
+                        }
+                    }
+                }
+            }
+        }
+
         // 12. Register child in worker_processes.
         self.worker_processes.lock().unwrap().insert(
             child_pid,
             WorkerHostProcess {
                 result_fd: result_read_fd,
-                bridge_threads: Vec::new(),
+                bridge_threads,
             },
         );
 
-        Ok(child_pid)
+        Ok(WorkerExecSpawnResult {
+            host_pid: child_pid,
+            direct_pipes,
+        })
     }
 
     /// Cancel any pending `read_from_stdin()` call, causing it to return EOF.
@@ -1726,7 +1841,7 @@ impl LinuxUserland {
         FS: litebox::fs::FileSystem + Send + Sync + 'static,
     {
         // Try the forker path first (no execve, no openat).
-        if let Ok(pid) = self.try_spawn_worker_exec_via_forker(
+        if let Ok(result) = self.try_spawn_worker_exec_via_forker(
             guest_binary_path,
             argv,
             envp,
@@ -1740,19 +1855,9 @@ impl LinuxUserland {
             guest_exec_image,
             guest_interp_image,
             &stdio,
+            direct_pipe_io,
         ) {
-            // Forker succeeded — we have a child PID. The child's stdio was wired
-            // by the forker (simple bindings only). Complex bindings (Fs/Pipe/Stream)
-            // still need bridge threads, but the forker path currently handles only
-            // simple HostStdio/HostPipe/Close/Inherit bindings.
-            //
-            // For now, if the caller has complex stdio bindings, the forker path
-            // maps them to DevNull and the bridge threads don't apply.
-            // TODO: add bridge pipe support for forker worker-exec.
-            return Ok(WorkerExecSpawnResult {
-                host_pid: pid,
-                direct_pipes: vec![],
-            });
+            return Ok(result);
         }
         // Fall through to posix_spawn path.
 
