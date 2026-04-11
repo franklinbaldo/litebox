@@ -2299,10 +2299,14 @@ impl<FS: ShimFS> Task<FS> {
                 | Sysno::setrlimit | Sysno::prlimit64
                 // No-ops (read-only queries).
                 | Sysno::getpid | Sysno::getppid | Sysno::gettid
-                | Sysno::getuid | Sysno::getgid | Sysno::getsid | Sysno::getpgid
+                | Sysno::getuid | Sysno::geteuid | Sysno::getgid | Sysno::getegid
+                | Sysno::getsid | Sysno::getpgid
                 // Stat queries — bash calls fstat between fork and exec
                 // to check terminal type and fd validity.
                 | Sysno::fstat | Sysno::stat | Sysno::newfstatat
+                // access — bash calls access(X_OK) between fork and exec
+                // to verify the command is executable.
+                | Sysno::access | Sysno::faccessat | Sysno::faccessat2
                 // ioctl — bash calls ioctl(TIOCGPGRP) for job control
                 // between fork and exec.
                 | Sysno::ioctl,
@@ -4031,7 +4035,9 @@ mod tests {
         assert_allowed(Sysno::getppid);
         assert_allowed(Sysno::gettid);
         assert_allowed(Sysno::getuid);
+        assert_allowed(Sysno::geteuid);
         assert_allowed(Sysno::getgid);
+        assert_allowed(Sysno::getegid);
         assert_allowed(Sysno::getsid);
         assert_allowed(Sysno::getpgid);
         assert_allowed(Sysno::fstat);

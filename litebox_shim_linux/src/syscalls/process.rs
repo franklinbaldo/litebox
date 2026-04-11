@@ -5244,6 +5244,29 @@ impl<FS: ShimFS> Task<FS> {
                                     self.global.platform.close_host_fd(os_fd);
                                 }
                             }
+                            // Restore drained pipe data back to virtual ring buffers
+                            // so the virtual pipe remains functional after fallback.
+                            for (i, drained) in bridge_drained.iter().enumerate() {
+                                if !drained.is_empty()
+                                    && let Some(&(child_fd, _, HostPipeDirection::Read)) =
+                                        child_pipe_bridges.get(i)
+                                {
+                                    let files = self.files.borrow();
+                                    let rds = files.raw_descriptor_store.read();
+                                    if let Ok(typed) = rds.fd_from_raw_integer::<
+                                        litebox::pipes::Pipes<crate::Platform>,
+                                    >(
+                                        child_fd
+                                    ) {
+                                        drop(rds);
+                                        let _ =
+                                            self.global.pipes.undrain(&typed, drained);
+                                    } else {
+                                        drop(rds);
+                                    }
+                                    drop(files);
+                                }
+                            }
                             for pr in &parent_replacements {
                                 self.global.platform.close_host_fd(pr.host_fd);
                             }
@@ -5547,6 +5570,28 @@ impl<FS: ShimFS> Task<FS> {
                         self.global.platform.close_host_fd(os_fd);
                     }
                 }
+                // Restore drained pipe data back to virtual ring buffers
+                // so the virtual pipe remains functional after fallback.
+                for (i, drained) in bridge_drained.iter().enumerate() {
+                    if !drained.is_empty()
+                        && let Some(&(child_fd, _, super::host_pipe::HostPipeDirection::Read)) =
+                            child_pipe_bridges.get(i)
+                    {
+                        let files = self.files.borrow();
+                        let rds = files.raw_descriptor_store.read();
+                        if let Ok(typed) = rds.fd_from_raw_integer::<
+                            litebox::pipes::Pipes<crate::Platform>,
+                        >(
+                            child_fd
+                        ) {
+                            drop(rds);
+                            let _ = self.global.pipes.undrain(&typed, drained);
+                        } else {
+                            drop(rds);
+                        }
+                        drop(files);
+                    }
+                }
                 for pr in fc.vfork_done.fd_replacements.lock().drain(..) {
                     self.global.platform.close_host_fd(pr.host_fd);
                 }
@@ -5606,6 +5651,28 @@ impl<FS: ShimFS> Task<FS> {
                 // Clean up parent-side OS pipe FDs on failure.
                 for pr in fc.vfork_done.fd_replacements.lock().drain(..) {
                     self.global.platform.close_host_fd(pr.host_fd);
+                }
+                // Restore drained pipe data back to virtual ring buffers
+                // so the virtual pipe remains functional after fallback.
+                for (i, drained) in bridge_drained.iter().enumerate() {
+                    if !drained.is_empty()
+                        && let Some(&(child_fd, _, super::host_pipe::HostPipeDirection::Read)) =
+                            child_pipe_bridges.get(i)
+                    {
+                        let files = self.files.borrow();
+                        let rds = files.raw_descriptor_store.read();
+                        if let Ok(typed) = rds.fd_from_raw_integer::<
+                            litebox::pipes::Pipes<crate::Platform>,
+                        >(
+                            child_fd
+                        ) {
+                            drop(rds);
+                            let _ = self.global.pipes.undrain(&typed, drained);
+                        } else {
+                            drop(rds);
+                        }
+                        drop(files);
+                    }
                 }
                 put_fc_back(self, fc);
                 return Err(Errno::ENOMEM);

@@ -13,22 +13,22 @@ use core::{
 
 use alloc::sync::{Arc, Weak};
 use ringbuf::{
-    HeapCons, HeapProd, HeapRb,
     traits::{Consumer as _, Observer as _, Producer as _, Split as _},
+    HeapCons, HeapProd, HeapRb,
 };
 use thiserror::Error;
 
 use crate::{
-    LiteBox,
     event::{
-        Events, IOPollable,
         observer::Observer,
         polling::{Pollee, TryOpError},
         wait::{WaitContext, WaitError},
+        Events, IOPollable,
     },
     fs::OFlags,
     platform::TimeProvider,
     sync::{Mutex, RawSyncPrimitivesProvider},
+    LiteBox,
 };
 
 /// Support for unidirectional communication channels
@@ -282,6 +282,44 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
                 Ok(buf)
             }
             PipeEnd::Sender(_) => Ok(alloc::vec::Vec::new()),
+        }
+    }
+
+    /// Restore previously drained data back into a pipe receiver's ring buffer.
+    ///
+    /// This is the inverse of [`drain_available`] — it pushes data through the
+    /// write end of the pipe so that a subsequent read will see it.  Used to
+    /// undo a drain when the delayed-fork commit fails and the virtual pipe
+    /// must remain functional.
+    ///
+    /// Returns the number of bytes actually restored (may be less than
+    /// `data.len()` if the ring buffer has insufficient capacity).
+    pub fn undrain(
+        &self,
+        fd: &PipeFd<Platform>,
+        data: &[u8],
+    ) -> Result<usize, errors::ClosedError> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let dt = self.litebox.descriptor_table();
+        match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
+            PipeEnd::Receiver(p) => {
+                // Push via the write end (producer) so the data appears in the
+                // ring buffer for the next read.
+                if let Some(writer) = p.peer.upgrade() {
+                    let mut rb = writer.endpoint.rb.lock();
+                    let n = rb.push_slice(data);
+                    drop(rb);
+                    // Notify the read side that data is available.
+                    p.endpoint.pollee.notify_observers(Events::IN);
+                    Ok(n)
+                } else {
+                    // Write end is gone — can't restore.
+                    Ok(0)
+                }
+            }
+            PipeEnd::Sender(_) => Ok(0),
         }
     }
 
