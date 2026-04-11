@@ -16,6 +16,13 @@ extern crate alloc;
 /// build their read-only filesystem layer.
 static INHERITED_TAR_DATA: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
 
+/// Inherited 9P broker socket path, stored before forking the forker so
+/// that fork-restore grandchildren can connect their own 9P channels.
+static INHERITED_NINE_P_BROKER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Inherited network broker socket path.
+static INHERITED_NETWORK_BROKER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 /// Run Linux programs with LiteBox on unmodified Linux
 #[derive(Parser, Debug)]
 #[allow(clippy::struct_excessive_bools)]
@@ -465,6 +472,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // Store tar data and register the worker callback before forking the forker,
     // so that forked workers inherit the tar mmap and can call back into the runner.
     INHERITED_TAR_DATA.set(tar_data).ok();
+    if let Some(ref broker) = cli_args.nine_p_broker {
+        INHERITED_NINE_P_BROKER.set(broker.clone()).ok();
+    }
+    if let Some(ref broker) = cli_args.network_broker {
+        INHERITED_NETWORK_BROKER.set(broker.clone()).ok();
+    }
     litebox_platform_linux_userland::forker::set_worker_callback(run_forked_worker);
 
     // Pre-open /dev/null for the forker to use for stdio wiring.
@@ -1808,7 +1821,7 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
         ),
     };
 
-    run_worker_exec_core(cli_args, transferred_exec_image, transferred_interp_image)
+    run_worker_exec_core(cli_args, transferred_exec_image, transferred_interp_image, false)
 }
 
 /// Shared core logic for running a non-PIE worker-exec.
@@ -1822,12 +1835,27 @@ fn run_worker_exec_core(
     cli_args: CliArgs,
     transferred_exec_image: Option<alloc::borrow::Cow<'static, [u8]>>,
     transferred_interp_image: Option<(String, alloc::borrow::Cow<'static, [u8]>)>,
+    forker_grandchild: bool,
 ) -> Result<()> {
     if cli_args.program_and_arguments.is_empty() {
         anyhow::bail!("worker-exec requires at least a load path");
     }
     let load_path = cli_args.program_and_arguments[0].clone();
-    let guest_load_path = worker_load_program_path(&cli_args);
+    // When the exec image is transferred (either via --worker-exec-fd or via
+    // forker memfd), use the guest binary path directly — the image is already
+    // available and will be injected into the in-mem FS. Otherwise, resolve
+    // through the host filesystem.
+    let guest_load_path = if transferred_exec_image.is_some() || cli_args.worker_exec_fd.is_some() || cli_args.program_from_tar {
+        if Path::new(&load_path).is_absolute() {
+            PathBuf::from(&load_path)
+        } else if let Some(cwd) = cli_args.working_directory.as_deref() {
+            Path::new(cwd).join(&load_path)
+        } else {
+            PathBuf::from(&load_path)
+        }
+    } else {
+        worker_load_program_path(&cli_args)
+    };
     let guest_load_path_str = guest_load_path
         .to_str()
         .ok_or_else(|| anyhow!("Could not convert worker guest load path to a string"))?;
@@ -1846,7 +1874,17 @@ fn run_worker_exec_core(
     } else {
         Platform::new(None)
     };
-    litebox_platform_multiplex::set_platform(platform);
+    if forker_grandchild {
+        // In a forker grandchild, the inherited platform from the parent is
+        // stale (its network connections, forker handle, etc. belong to the
+        // parent). Replace it with our fresh platform.
+        //
+        // SAFETY: We are in a freshly-forked single-threaded child process.
+        // No other thread reads the platform concurrently.
+        unsafe { litebox_platform_multiplex::replace_platform(platform); }
+    } else {
+        litebox_platform_multiplex::set_platform(platform);
+    }
     register_worker_spawn_flags(platform, &cli_args);
 
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
@@ -2717,7 +2755,7 @@ fn run_forked_worker_exec(
         (interp_path.unwrap_or_default(), data)
     });
 
-    if run_worker_exec_core(cli_args, Some(exec_image), transferred_interp_image).is_err() {
+    if run_worker_exec_core(cli_args, Some(exec_image), transferred_interp_image, true).is_err() {
         unsafe { libc::_exit(1); }
     }
     // run_worker_exec_core calls run_program which never returns, so we only
@@ -2825,11 +2863,6 @@ fn run_forked_worker(
         .unwrap_or(litebox::fs::tar_ro::EMPTY_TAR_FILE);
     let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox_ref, tar_data.into());
     let default_fs = litebox_shim_linux::default_fs(litebox_ref, in_mem, tar_ro);
-    let initial_file_system = std::sync::Arc::new(default_fs);
-
-    let shim = shim_builder.build();
-    let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
-    let net_worker = start_network_worker(&shim, &shutdown);
 
     // Build pipe_bridges from request.
     let pipe_bridges: Vec<PipeBridgeSpec> = req
@@ -2930,22 +2963,79 @@ fn run_forked_worker(
     }
 
     // Call fork_restore_and_ack, then run_program.
-    match fork_restore_and_ack(
-        &shim,
-        snapshot,
-        initial_file_system,
-        ack_fd,
-        &pipe_bridges,
-        mux_fd,
-        &mux_streams,
-        &local_pipes,
-    ) {
-        Ok((program, mux_handle)) => {
-            run_program(program, shutdown, net_worker, result_fd, mux_handle);
+    // When a 9P broker is available, layer 9P on top of the default FS.
+    if let Some(broker_addr) = INHERITED_NINE_P_BROKER.get() {
+        let (ring_writer, ring_reader) = match connect_nine_p_channel(broker_addr) {
+            Ok(pair) => pair,
+            Err(_) => unsafe { libc::_exit(1) },
+        };
+
+        let shim = shim_builder.build();
+        let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let net_worker = start_network_worker(&shim, &shutdown);
+
+        let writer = ShmemTransportWriter(ring_writer);
+        let reader = ShmemTransportReader(ring_reader);
+        let litebox2 = shim.litebox();
+        let msize = 4 * 1024 * 1024u32;
+        let (nine_p_fs, mut nine_p_reader) =
+            match litebox::fs::nine_p::FileSystem::new(litebox2, writer, reader, msize, "root", "/") {
+                Ok(pair) => pair,
+                Err(_) => unsafe { libc::_exit(1) },
+            };
+        let worker_handle = nine_p_fs.worker_handle();
+        let _nine_p_worker = litebox_platform_linux_userland::spawn_host_thread(move || {
+            let mut buf = alloc::vec::Vec::with_capacity(msize as usize);
+            while worker_handle.poll_responses(&mut nine_p_reader, &mut buf) {}
+        });
+
+        let combined = litebox::fs::layered::FileSystem::new(
+            litebox2,
+            default_fs,
+            nine_p_fs,
+            litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
+        );
+        let combined_fs = std::sync::Arc::new(combined);
+
+        match fork_restore_and_ack(
+            &shim,
+            snapshot,
+            combined_fs,
+            ack_fd,
+            &pipe_bridges,
+            mux_fd,
+            &mux_streams,
+            &local_pipes,
+        ) {
+            Ok((program, mux_handle)) => {
+                run_program(program, shutdown, net_worker, result_fd, mux_handle);
+            }
+            Err(_) => {
+                unsafe { libc::_exit(1); }
+            }
         }
-        Err(_) => {
-            // Ack was already written by fork_restore_and_ack on failure.
-            unsafe { libc::_exit(1); }
+    } else {
+        let initial_file_system = std::sync::Arc::new(default_fs);
+        let shim = shim_builder.build();
+        let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let net_worker = start_network_worker(&shim, &shutdown);
+
+        match fork_restore_and_ack(
+            &shim,
+            snapshot,
+            initial_file_system,
+            ack_fd,
+            &pipe_bridges,
+            mux_fd,
+            &mux_streams,
+            &local_pipes,
+        ) {
+            Ok((program, mux_handle)) => {
+                run_program(program, shutdown, net_worker, result_fd, mux_handle);
+            }
+            Err(_) => {
+                unsafe { libc::_exit(1); }
+            }
         }
     }
 

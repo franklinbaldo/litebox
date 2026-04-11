@@ -1705,7 +1705,6 @@ dependencies = [
  "litebox_platform_linux_userland",
  "litebox_platform_lvbs",
  "litebox_platform_windows_userland",
- "once_cell",
 ]
 
 [[package]]

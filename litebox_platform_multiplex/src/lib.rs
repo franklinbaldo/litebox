@@ -42,7 +42,9 @@ cfg_if::cfg_if! {
     }
 }
 
-static PLATFORM: once_cell::race::OnceRef<'static, Platform> = once_cell::race::OnceRef::new();
+use core::sync::atomic::{AtomicPtr, Ordering};
+
+static PLATFORM: AtomicPtr<Platform> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Initialize the shim by providing a [LiteBox platform](../litebox/platform/index.html).
 ///
@@ -51,12 +53,38 @@ static PLATFORM: once_cell::race::OnceRef<'static, Platform> = once_cell::race::
 ///
 /// # Panics
 ///
-/// Panics if invoked more than once
+/// Panics if invoked more than once (in the same process, without a preceding
+/// [`replace_platform`] call).
 pub fn set_platform(platform: &'static Platform) {
-    match PLATFORM.set(platform) {
-        Ok(()) => {}
-        Err(()) => panic!("set_platform should only be called once per crate"),
+    let ptr = platform as *const Platform as *mut Platform;
+    let prev = PLATFORM.compare_exchange(
+        core::ptr::null_mut(),
+        ptr,
+        Ordering::Release,
+        Ordering::Relaxed,
+    );
+    match prev {
+        Ok(_) => {}
+        Err(_) => panic!("set_platform should only be called once per crate"),
     }
+}
+
+/// Replace the global platform reference.
+///
+/// # Safety
+///
+/// This is intended **exclusively** for use in a freshly-forked child process
+/// (e.g., a forker grandchild) where the inherited platform from the parent is
+/// stale and must be replaced. The caller must ensure:
+///
+/// 1. No other thread is concurrently reading or writing the platform pointer.
+/// 2. The new `platform` reference has `'static` lifetime.
+/// 3. The old platform will never be accessed again in this process.
+///
+/// In a forked single-threaded child these invariants are trivially satisfied.
+pub unsafe fn replace_platform(platform: &'static Platform) {
+    let ptr = platform as *const Platform as *mut Platform;
+    PLATFORM.store(ptr, Ordering::Release);
 }
 
 /// Get the global platform, or panic if [`set_platform`] has not yet been invoked.
@@ -65,7 +93,11 @@ pub fn set_platform(platform: &'static Platform) {
 ///
 /// Panics if [`set_platform`] has not been invoked before this
 pub fn platform() -> &'static Platform {
-    PLATFORM
-        .get()
-        .expect("set_platform should have already been called before this point")
+    let ptr = PLATFORM.load(Ordering::Acquire);
+    if ptr.is_null() {
+        panic!("set_platform should have already been called before this point");
+    }
+    // SAFETY: Non-null pointer was set by `set_platform` or `replace_platform`,
+    // both of which require a valid `&'static Platform`.
+    unsafe { &*ptr }
 }

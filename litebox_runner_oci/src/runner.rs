@@ -417,7 +417,7 @@ fn build_cli_args(
         insert_files: vec![],
         initial_files: None,
         rewrite_syscalls: false,
-        interception_backend: InterceptionBackend::Seccomp,
+        interception_backend: InterceptionBackend::Rewriter,
         tun_device_name,
         network_broker,
         program_from_tar: false,

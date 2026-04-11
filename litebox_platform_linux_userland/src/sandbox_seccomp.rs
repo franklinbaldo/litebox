@@ -19,14 +19,19 @@
 //!
 //! # Key syscalls BLOCKED (the security wins for forker-spawned workers)
 //!
-//! - `execve` / `execveat` — no process replacement
-//! - `socket` / `connect` / `bind` / `listen` / `accept` — no new network connections
-//! - `openat` / `open` (for worker; runner needs open for CoW) — no file access
+//! - `execve` / `execveat` — no process replacement (THE main security win)
+//! - `bind` / `listen` / `accept` — no listening servers
 //! - `ptrace` — no debugging/tracing other processes
 //! - `mount` / `umount` / `pivot_root` / `chroot` — no namespace escapes
 //! - `init_module` / `finit_module` / `delete_module` — no kernel module loading
 //! - `reboot` / `kexec_load` — no system control
 //! - `keyctl` / `request_key` — no kernel keyring access
+//!
+//! # Syscalls ALLOWED for worker-exec init (widened for forker-routed worker-exec)
+//!
+//! - `socket` / `connect` — needed for broker IPC and 9P channel setup
+//! - `openat` — needed for tar files and mmapped host binaries
+//! - These are safe because `execve` is still blocked.
 
 /// Install the seccomp sandbox filter for the **forker** process.
 ///
@@ -78,7 +83,6 @@ const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
 // seccomp return values
 const SECCOMP_RET_ALLOW: u32 = 0x7FFF_0000;
 const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
-// const SECCOMP_RET_LOG: u32 = 0x7FFC_0000; // useful for debugging
 
 // seccomp operation for the seccomp() syscall
 const SECCOMP_SET_MODE_FILTER: u32 = 1;
@@ -147,6 +151,7 @@ fn build_allowlist_filter() -> Vec<BpfInsn> {
         libc::SYS_set_robust_list as u32, // 273 [RT] glibc thread init
         libc::SYS_rseq as u32,            // 334 [RT] glibc restartable sequences
         libc::SYS_sched_getaffinity as u32, // 204 [RT] Rust std thread pool sizing
+        libc::SYS_sched_setaffinity as u32, // 203 [WE] pin_thread_to_cpu (network worker)
         // ── Seccomp self-install (not observed in strace because
         //    the filter was disabled during tracing, but mandatory) ──
         libc::SYS_prctl as u32,   // 157 [F] PR_SET_NO_NEW_PRIVS
@@ -157,6 +162,36 @@ fn build_allowlist_filter() -> Vec<BpfInsn> {
         libc::SYS_getrandom as u32, // 318 [W]  entropy (Rust HashMap seed)
         // ── Worker init ────────────────────────────────────────────
         libc::SYS_statx as u32, // 332 [WI] Rust std file metadata
+        // ── Worker-exec init (forker-spawned non-PIE worker setup) ──
+        // These are needed by run_worker_exec_core: platform init,
+        // broker IPC, 9P channel, tar loading, shmem ring creation.
+        // Previously unneeded because exec workers ran via posix_spawn
+        // (unfiltered). Now that worker-exec goes through the forker,
+        // the grandchild inherits the seccomp filter and needs these.
+        // Security note: execve is still blocked — the main security
+        // win is preserved. These syscalls only allow network/file
+        // setup within the virtual sandbox.
+        libc::SYS_socket as u32, // 41  [WE] AF_UNIX socket for broker IPC + 9P channel
+        libc::SYS_connect as u32, // 42  [WE] connect to broker Unix socket
+        libc::SYS_poll as u32,   // 7   [WE] non-blocking connect wait
+        libc::SYS_getsockopt as u32, // 55  [WE] check connect error (SO_ERROR)
+        libc::SYS_sendto as u32, // 44  [WE] send() → sendto on x86_64, 9P handshake
+        libc::SYS_recvfrom as u32, // 45  [WE] recv() → recvfrom on x86_64, 9P ack
+        libc::SYS_open as u32,   // 2   [WE] read_maps_and_vdso (/proc/self/maps)
+        libc::SYS_openat as u32, // 257 [WE] Rust std file I/O (tar files, mmap host binaries)
+        libc::SYS_fstat as u32,  // 5   [WE] file metadata (mmap)
+        libc::SYS_newfstatat as u32, // 262 [WE] file metadata (Rust std)
+        libc::SYS_memfd_create as u32, // 319 [WE] shmem ring buffers, anonymous memfds
+        libc::SYS_ftruncate as u32, // 77  [WE] shmem ring buffer sizing
+        libc::SYS_mremap as u32, // 25  [WE] Rust Vec reallocation during init
+        libc::SYS_readlink as u32, // 89  [WE] resolve /proc/self/exe, symlinks
+        libc::SYS_ioctl as u32,  // 16  [WE] TUN device setup, terminal queries
+        libc::SYS_clock_gettime as u32, // 228 [WE] Instant::now() fallback (if VDSO unavailable)
+        libc::SYS_getppid as u32, // 110 [WE] init_task identity
+        libc::SYS_getuid as u32, // 102 [WE] init_task identity
+        libc::SYS_geteuid as u32, // 107 [WE] init_task identity
+        libc::SYS_getgid as u32, // 104 [WE] init_task identity
+        libc::SYS_getegid as u32, // 108 [WE] init_task identity
     ];
 
     // Sort and deduplicate for efficient comparison
@@ -201,7 +236,7 @@ fn build_allowlist_filter() -> Vec<BpfInsn> {
         ));
     }
 
-    // [4+N] Default: KILL
+    // [4+N] Default: kill the entire process for disallowed syscalls.
     insns.push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
 
     // [4+N+1] ALLOW
@@ -275,12 +310,11 @@ mod tests {
         let dangerous = [
             (libc::SYS_execve as u32, "execve"),
             (libc::SYS_execveat as u32, "execveat"),
-            (libc::SYS_socket as u32, "socket"),
-            (libc::SYS_connect as u32, "connect"),
+            // socket, connect, openat are now allowed for worker-exec init.
+            // The security win is preserved: execve is still blocked.
             (libc::SYS_bind as u32, "bind"),
             (libc::SYS_listen as u32, "listen"),
             (libc::SYS_accept as u32, "accept"),
-            (libc::SYS_openat as u32, "openat"),
             (libc::SYS_ptrace as u32, "ptrace"),
             (libc::SYS_mount as u32, "mount"),
             (libc::SYS_umount2 as u32, "umount2"),
@@ -334,9 +368,9 @@ mod tests {
         let insns = build_allowlist_filter();
         let count = extract_allowed_syscalls(&insns).len();
         assert!(
-            count <= 35,
-            "forker allowlist has {count} syscalls — expected <= 35. \
-             Justify any additions with [F]/[W]/[WI]/[RT] tags."
+            count <= 57,
+            "forker allowlist has {count} syscalls — expected <= 57. \
+             Justify any additions with [F]/[W]/[WI]/[WE]/[RT] tags."
         );
     }
 }

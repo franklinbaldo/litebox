@@ -1169,7 +1169,9 @@ impl LinuxUserland {
         let forker_guard = self.forker_handle.lock().unwrap();
         let forker = match forker_guard.as_ref() {
             Some(h) => h,
-            None => return Err(()),
+            None => {
+                return Err(());
+            }
         };
 
         // 2. Build WorkerExecParams.
