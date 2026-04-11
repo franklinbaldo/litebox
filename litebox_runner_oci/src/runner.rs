@@ -423,6 +423,13 @@ fn build_cli_args(
         (None, Some(broker_socket.to_string()))
     };
 
+    // Detect proc mount in OCI spec
+    let has_proc_mount = spec
+        .mounts()
+        .as_ref()
+        .map(|mounts| mounts.iter().any(|m| m.typ().as_deref() == Some("proc")))
+        .unwrap_or(false);
+
     Ok(CliArgs {
         program_and_arguments,
         environment_variables,
@@ -437,6 +444,7 @@ fn build_cli_args(
         program_from_tar: false,
         nine_p_broker: Some(broker_socket.to_string()),
         working_directory,
+        proc_mount: has_proc_mount,
         // Internal worker flags — all default/inactive
         worker_exec: false,
         worker_exec_fd: None,
@@ -664,5 +672,54 @@ mod tests {
         assert_eq!(args.guest_euid, Some(0));
         assert_eq!(args.guest_gid, Some(0));
         assert_eq!(args.guest_egid, Some(0));
+    }
+
+    #[test]
+    fn build_cli_args_detects_proc_mount() {
+        use oci_spec::runtime::MountBuilder;
+        let user = UserBuilder::default().build().unwrap();
+        let proc_mount = MountBuilder::default()
+            .typ("proc".to_string())
+            .destination("/proc".to_string())
+            .build()
+            .unwrap();
+        let process = ProcessBuilder::default()
+            .args(vec!["sh".to_string()])
+            .user(user)
+            .cwd("/".to_string())
+            .build()
+            .unwrap();
+        let spec = SpecBuilder::default()
+            .process(process)
+            .mounts(vec![proc_mount])
+            .build()
+            .unwrap();
+        let args = build_cli_args(&spec, None, &[], "/tmp/test.sock", None).unwrap();
+        assert!(args.proc_mount);
+    }
+
+    #[test]
+    fn build_cli_args_no_proc_mount_by_default() {
+        use oci_spec::runtime::MountBuilder;
+        // Build a spec with an explicit non-proc mount only (no default mounts).
+        let user = UserBuilder::default().build().unwrap();
+        let bind_mount = MountBuilder::default()
+            .typ("bind".to_string())
+            .destination("/data".to_string())
+            .build()
+            .unwrap();
+        let process = ProcessBuilder::default()
+            .args(vec!["sh".to_string()])
+            .user(user)
+            .cwd("/".to_string())
+            .build()
+            .unwrap();
+        let spec = SpecBuilder::default()
+            .process(process)
+            .mounts(vec![bind_mount])
+            .build()
+            .unwrap();
+        let args = build_cli_args(&spec, None, &[], "/tmp/test.sock", None).unwrap();
+        assert!(!args.proc_mount);
     }
 }

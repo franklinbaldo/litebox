@@ -125,6 +125,11 @@ pub struct CliArgs {
     #[arg(long = "cwd", requires = "unstable", help_heading = "Unstable Options")]
     pub working_directory: Option<String>,
 
+    /// Whether to create /proc directories in the in-mem filesystem.
+    /// Set when OCI config.json has a proc mount type.
+    #[arg(skip)]
+    pub proc_mount: bool,
+
     /// Internal: run as a worker host process for a non-PIE child exec.
     ///
     /// When set, the runner loads the specified binary with the full VA space
@@ -163,20 +168,20 @@ pub struct CliArgs {
     #[arg(long = "guest-ppid", hide = true, requires = "worker_exec")]
     pub guest_ppid: Option<i32>,
 
-    /// Internal: guest UID for worker-exec mode.
-    #[arg(long = "guest-uid", hide = true, requires = "worker_exec")]
+    /// Internal: guest UID.
+    #[arg(long = "guest-uid", hide = true)]
     pub guest_uid: Option<u32>,
 
-    /// Internal: guest effective UID for worker-exec mode.
-    #[arg(long = "guest-euid", hide = true, requires = "worker_exec")]
+    /// Internal: guest effective UID.
+    #[arg(long = "guest-euid", hide = true)]
     pub guest_euid: Option<u32>,
 
-    /// Internal: guest GID for worker-exec mode.
-    #[arg(long = "guest-gid", hide = true, requires = "worker_exec")]
+    /// Internal: guest GID.
+    #[arg(long = "guest-gid", hide = true)]
     pub guest_gid: Option<u32>,
 
-    /// Internal: guest effective GID for worker-exec mode.
-    #[arg(long = "guest-egid", hide = true, requires = "worker_exec")]
+    /// Internal: guest effective GID.
+    #[arg(long = "guest-egid", hide = true)]
     pub guest_egid: Option<u32>,
 
     /// Internal: run as a worker host process to restore a fork child.
@@ -596,6 +601,17 @@ fn build_initial_fs(
             }
         }
     });
+
+    // When OCI spec requests a proc mount, create /proc and /proc/self directories.
+    // The actual /proc/self/* contents (maps, exe, cwd, fd/) are handled synthetically
+    // at the syscall level in litebox_shim_linux/src/syscalls/file.rs.
+    if cli_args.proc_mount {
+        in_mem.with_root_privileges(|fs| {
+            let proc_mode = Mode::RUSR | Mode::XUSR | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH;
+            let _ = fs.mkdir("/proc", proc_mode);
+            let _ = fs.mkdir("/proc/self", proc_mode);
+        });
+    }
 
     // When using the rewriter backend, the shim's mmap hook handles
     // syscall patching at runtime — no audit library needed.
@@ -2684,6 +2700,7 @@ fn build_cli_args_from_exec_params(
         program_from_tar,
         nine_p_broker,
         working_directory: Some(params.cwd.clone()),
+        proc_mount: false,
         worker_exec: true,
         worker_exec_fd: None, // image is passed directly, not via fd
         worker_result_fd: result_fd,
@@ -3112,6 +3129,7 @@ mod tests {
             program_from_tar: false,
             nine_p_broker: None,
             working_directory: None,
+            proc_mount: false,
             worker_exec: false,
             worker_exec_fd: None,
             worker_result_fd: None,
