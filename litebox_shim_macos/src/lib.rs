@@ -1427,6 +1427,61 @@ impl<FS: ShimFS> MacosShim<FS> {
             }
         }
 
+
+        // Pass 5: Patch `_tlv_bootstrap` to bypass the error handler.
+        //
+        // On macOS, the shared cache builder patches the first instruction of
+        // `_tlv_bootstrap` (the TLS variable resolver) to `B _tlv_bootstrap_error`.
+        // Normally, dyld's `PrebuiltLoader::runInitializers` patches this back
+        // to NOP after TLS infrastructure is set up.  Since we skip shared
+        // cache initializers (our `patch_skip_initializers` NOPs the BL to
+        // `findAndRunAllInitializers` in `PrebuiltLoader`), the TLS init never
+        // runs.  Every TLS access hits the error handler -> `abort()`, causing
+        // SIGABRT (exit code 134) in any binary that uses thread-local storage.
+        //
+        // The fix: patch the first instruction of `_tlv_bootstrap` from
+        // `B _tlv_bootstrap_error` to NOP, allowing the fast-path TLS lookup
+        // to execute.
+        #[cfg(feature = "platform_macos_userland")]
+        {
+            unsafe extern "C" {
+                fn dlsym(
+                    handle: *const core::ffi::c_void,
+                    symbol: *const u8,
+                ) -> *const core::ffi::c_void;
+            }
+            const RTLD_DEFAULT: *const core::ffi::c_void = -2_isize as *const core::ffi::c_void;
+
+            let addr = unsafe { dlsym(RTLD_DEFAULT, c"_tlv_bootstrap".as_ptr().cast()) };
+            if !addr.is_null() {
+                let addr_usize = addr as usize;
+                let insn = unsafe { core::ptr::read_volatile(addr_usize as *const u32) };
+                // Verify it is an unconditional branch (B) instruction.
+                // Encoding: bits [31:26] == 0b000101 => top byte & 0xFC == 0x14.
+                let is_branch = (insn & 0xFC00_0000) == 0x1400_0000;
+                if is_branch {
+                    let page_start = addr_usize & !(HW_PAGE_SIZE as usize - 1);
+                    let page_len = HW_PAGE_SIZE as usize;
+
+                    // Make the page writable.
+                    let mp = unsafe {
+                        raw_mprotect(page_start, page_len, RAW_PROT_READ | RAW_PROT_WRITE)
+                    };
+                    if mp.is_ok() {
+                        // Write NOP (0xD503201F).
+                        const AARCH64_NOP: u32 = 0xD503_201F;
+                        unsafe {
+                            core::ptr::write_volatile(addr_usize as *mut u32, AARCH64_NOP);
+                        }
+                        // Restore R-X.
+                        let _ = unsafe {
+                            raw_mprotect(page_start, page_len, RAW_PROT_READ | RAW_PROT_EXEC)
+                        };
+                    }
+                }
+            }
+        }
+
         // Record the cache base address.
         self.0
             .shared_cache_base

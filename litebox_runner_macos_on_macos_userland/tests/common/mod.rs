@@ -739,7 +739,7 @@ fn run_macho_dynamic_inner(
         process,
         mut initial_ctx,
         reserved_base: _,
-        slide: _,
+        slide,
     } = program;
     unsafe { core::ptr::write_volatile(diag_state_ptr, 11); } // destructured
 
@@ -812,7 +812,158 @@ fn run_macho_dynamic_inner(
         litebox_platform_macos_userland::get_sigtramp_addr() as u64,
     );
 
-        // Spawn the network polling thread AFTER install_shared_cache.
+    // ---- TLS descriptor fixup ----
+    // After install_shared_cache patches all SVCs, we fix up __thread_vars
+    // descriptors in the main binary so that _tlv_bootstrap's fast path
+    // reads a valid pthread key instead of 0 (which collides with the
+    // host's TLS slot 0, returning garbage).
+    //
+    // We parse the binary to find __thread_vars sections, allocate a real
+    // pthread key, and write it into each descriptor's key field (u32 at
+    // byte offset 8).  We also allocate initial TLS storage from
+    // __thread_data and register it via pthread_setspecific so the first
+    // access on the main thread hits the fast path.
+    {
+        // Parse the Mach-O to find __thread_vars and __thread_data sections.
+        let bin = effective_binary;
+        // Handle fat binary: find arm64 slice
+        let bin = if bin.len() >= 8 {
+            let magic = u32::from_be_bytes([bin[0], bin[1], bin[2], bin[3]]);
+            if magic == 0xcafe_babe || magic == 0xcafe_babf {
+                // Fat binary - find arm64 slice
+                let nfat = u32::from_be_bytes([bin[4], bin[5], bin[6], bin[7]]) as usize;
+                let mut found = None;
+                for i in 0..nfat {
+                    let off = 8 + i * 20;
+                    if off + 20 > bin.len() { break; }
+                    let cputype = u32::from_be_bytes([bin[off], bin[off+1], bin[off+2], bin[off+3]]);
+                    let file_offset = u32::from_be_bytes([bin[off+8], bin[off+9], bin[off+10], bin[off+11]]) as usize;
+                    let file_size = u32::from_be_bytes([bin[off+12], bin[off+13], bin[off+14], bin[off+15]]) as usize;
+                    // CPU_TYPE_ARM64 = 0x0100000C
+                    if cputype == 0x0100000C {
+                        found = Some(&bin[file_offset..file_offset + file_size]);
+                        break;
+                    }
+                }
+                found.unwrap_or(bin)
+            } else {
+                bin
+            }
+        } else {
+            bin
+        };
+
+        if bin.len() >= 32 {
+            let ncmds = u32::from_le_bytes([bin[16], bin[17], bin[18], bin[19]]) as usize;
+            let header_size = 32usize; // sizeof(mach_header_64)
+            let mut cursor = header_size;
+            let mut thread_vars_vmaddr: Option<u64> = None;
+            let mut thread_vars_size: Option<u64> = None;
+            let mut thread_data_size: Option<u64> = None;
+            let mut thread_data_fileoff: Option<u64> = None;
+
+            for _ in 0..ncmds {
+                if cursor + 8 > bin.len() { break; }
+                let cmd = u32::from_le_bytes([bin[cursor], bin[cursor+1], bin[cursor+2], bin[cursor+3]]);
+                let cmdsize = u32::from_le_bytes([bin[cursor+4], bin[cursor+5], bin[cursor+6], bin[cursor+7]]) as usize;
+                if cmdsize < 8 || cursor + cmdsize > bin.len() { break; }
+
+                // LC_SEGMENT_64 = 0x19
+                if cmd == 0x19 {
+                    // Parse sections within this segment
+                    let nsects_off = cursor + 64;
+                    if nsects_off + 4 <= bin.len() {
+                        let nsects = u32::from_le_bytes([
+                            bin[nsects_off], bin[nsects_off+1],
+                            bin[nsects_off+2], bin[nsects_off+3],
+                        ]) as usize;
+                        let sect_start = cursor + 72; // sizeof(segment_command_64)
+                        for s in 0..nsects {
+                            let soff = sect_start + s * 80; // sizeof(section_64)
+                            if soff + 80 > bin.len() { break; }
+                            let sectname = &bin[soff..soff+16];
+                            let sect_addr = u64::from_le_bytes([
+                                bin[soff+32], bin[soff+33], bin[soff+34], bin[soff+35],
+                                bin[soff+36], bin[soff+37], bin[soff+38], bin[soff+39],
+                            ]);
+                            let sect_size = u64::from_le_bytes([
+                                bin[soff+40], bin[soff+41], bin[soff+42], bin[soff+43],
+                                bin[soff+44], bin[soff+45], bin[soff+46], bin[soff+47],
+                            ]);
+                            let sect_offset = u64::from(u32::from_le_bytes([
+                                bin[soff+48], bin[soff+49], bin[soff+50], bin[soff+51],
+                            ]));
+
+                            if sectname.starts_with(b"__thread_vars\0") {
+                                thread_vars_vmaddr = Some(sect_addr);
+                                thread_vars_size = Some(sect_size);
+                            } else if sectname.starts_with(b"__thread_data\0") {
+                                thread_data_size = Some(sect_size);
+                                thread_data_fileoff = Some(sect_offset);
+                            }
+                        }
+                    }
+                }
+                cursor += cmdsize;
+            }
+
+            if let (Some(tv_addr), Some(tv_size)) = (thread_vars_vmaddr, thread_vars_size) {
+                let rt_addr = tv_addr.wrapping_add(slide as u64);
+                let num_descs = tv_size / 24; // each TLV descriptor is 24 bytes
+                // Compute the TLS image size and initial data.
+                let tls_init_data: Vec<u8> = if let (Some(td_size), Some(td_off)) =
+                    (thread_data_size, thread_data_fileoff)
+                {
+                    #[allow(clippy::cast_possible_truncation)] // aarch64-only target
+                    let off = td_off as usize;
+                    #[allow(clippy::cast_possible_truncation)] // aarch64-only target
+                    let sz = td_size as usize;
+                    if off + sz <= bin.len() {
+                        bin[off..off+sz].to_vec()
+                    } else {
+                        vec![0u8; sz]
+                    }
+                } else {
+                    Vec::new()
+                };
+
+                // Allocate a pthread key for the guest TLS.
+                let mut key: libc::pthread_key_t = 0;
+                let ret = unsafe { libc::pthread_key_create(&raw mut key, None) };
+                if ret == 0 {
+                    // Write the key into each TLV descriptor at byte offset 8 (u32).
+                    for i in 0..num_descs {
+                        let desc_addr = rt_addr + i * 24;
+                        let key_ptr = (desc_addr + 8) as *mut u32;
+                        unsafe {
+                            #[allow(clippy::cast_possible_truncation)] // pthread keys fit in u32
+                            core::ptr::write_volatile(key_ptr, key as u32);
+                        }
+                    }
+
+                    // Allocate the TLS block for the main thread and fill
+                    // with initial data from __thread_data.
+                    let block_size = if tls_init_data.is_empty() { 256 } else { tls_init_data.len().max(256) };
+                    let layout = std::alloc::Layout::from_size_align(block_size, 16).unwrap();
+                    let block = unsafe { std::alloc::alloc_zeroed(layout) };
+                    if !block.is_null() {
+                        if !tls_init_data.is_empty() {
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    tls_init_data.as_ptr(),
+                                    block,
+                                    tls_init_data.len(),
+                                );
+                            }
+                        }
+                        let _ret2 = unsafe { libc::pthread_setspecific(key, block as *const _) };
+                    }
+                }
+            }
+        }
+    }
+
+    // Spawn the network polling thread AFTER install_shared_cache.
     // The network thread is NOT registered in the TLS table, so when
     // it hits a patched SVC stub, the trampoline's scan hits the
     // sentinel and falls through to the passthrough path — executing
