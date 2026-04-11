@@ -371,7 +371,20 @@ pub fn run_macho_dynamic(
     cache: &shared_cache::CollectedCache,
     exe_name: &str,
 ) -> (i32, Vec<u8>) {
-    run_macho_dynamic_with_utun(binary_data, argv, cache, exe_name, None)
+    run_macho_dynamic_with_options(binary_data, argv, cache, exe_name, None, &[])
+}
+
+/// Like [`run_macho_dynamic`] but with extra host files injected into the
+/// guest VFS.  Each entry is `(guest_path, file_data)`.
+#[allow(dead_code)]
+pub fn run_macho_dynamic_with_guest_files(
+    binary_data: &[u8],
+    argv: &[&str],
+    cache: &shared_cache::CollectedCache,
+    exe_name: &str,
+    extra_guest_files: &[(&str, &[u8])],
+) -> (i32, Vec<u8>) {
+    run_macho_dynamic_with_options(binary_data, argv, cache, exe_name, None, extra_guest_files)
 }
 
 /// Like [`run_macho_dynamic`] but optionally opens a utun device for inet networking.
@@ -385,6 +398,18 @@ pub fn run_macho_dynamic_with_utun(
     cache: &shared_cache::CollectedCache,
     exe_name: &str,
     tun_device_name: Option<&str>,
+) -> (i32, Vec<u8>) {
+    run_macho_dynamic_with_options(binary_data, argv, cache, exe_name, tun_device_name, &[])
+}
+
+/// Full-options variant of [`run_macho_dynamic`] supporting utun and extra guest files.
+fn run_macho_dynamic_with_options(
+    binary_data: &[u8],
+    argv: &[&str],
+    cache: &shared_cache::CollectedCache,
+    exe_name: &str,
+    tun_device_name: Option<&str>,
+    extra_guest_files: &[(&str, &[u8])],
 ) -> (i32, Vec<u8>) {
     // Serialize: only one test can use the platform + TLS table at a time.
     let _guard = TEST_LOCK
@@ -451,6 +476,7 @@ pub fn run_macho_dynamic_with_utun(
             start_wqthread_addr,
             diag_state_ptr,
             tun_device_name,
+            extra_guest_files,
         );
         unsafe {
             core::ptr::write_volatile(diag_state_ptr, 54); // about_to_exit
@@ -537,6 +563,7 @@ fn run_macho_dynamic_inner(
     start_wqthread_addr: u64,
     diag_state_ptr: *mut i32,
     tun_device_name: Option<&str>,
+    extra_guest_files: &[(&str, &[u8])],
 ) -> i32 {
     use litebox::fs::{FileSystem as _, Mode, OFlags};
 
@@ -618,13 +645,45 @@ fn run_macho_dynamic_inner(
         }
 
         // Write the rewritten binary into the in-mem FS so dyld can open it.
-        let exe_path = format!("/usr/bin/{exe_name}");
+        let exe_path = if exe_name.starts_with('/') {
+            exe_name.to_string()
+        } else {
+            format!("/usr/bin/{exe_name}")
+        };
+        // Create parent directories for the executable path.
+        {
+            let mut dir = String::new();
+            let parts: Vec<&str> = exe_path.split('/').filter(|s| !s.is_empty()).collect();
+            for component in &parts[..parts.len().saturating_sub(1)] {
+                dir.push('/');
+                dir.push_str(component);
+                let _ = fs.mkdir(&dir, mode);
+            }
+        }
         let fd = fs
             .open(&exe_path, OFlags::CREAT | OFlags::WRONLY, mode)
             .expect("create executable in in-mem FS");
         fs.write(&fd, effective_binary, None)
             .expect("write executable data");
         fs.close(&fd).expect("close executable fd");
+
+        // Inject extra files into the guest VFS.
+        for &(guest_path, data) in extra_guest_files {
+            // Create parent directories recursively.
+            let mut dir = String::new();
+            let parts: Vec<&str> = guest_path.split('/').filter(|s| !s.is_empty()).collect();
+            for component in &parts[..parts.len().saturating_sub(1)] {
+                dir.push('/');
+                dir.push_str(component);
+                let _ = fs.mkdir(&dir, mode);
+            }
+            let fd = fs
+                .open(guest_path, OFlags::CREAT | OFlags::WRONLY, mode)
+                .unwrap_or_else(|e| panic!("create {guest_path} in guest VFS: {e:?}"));
+            fs.write(&fd, data, None)
+                .unwrap_or_else(|e| panic!("write {guest_path}: {e:?}"));
+            fs.close(&fd).expect("close extra file fd");
+        }
     });
     let tar_ro_fs =
         litebox::fs::tar_ro::FileSystem::new(litebox, litebox::fs::tar_ro::EMPTY_TAR_FILE.into());
@@ -634,7 +693,14 @@ fn run_macho_dynamic_inner(
     unsafe { core::ptr::write_volatile(diag_state_ptr, 8); }
 
     // Use absolute path for argv[0] so dyld can resolve executable_path.
-    let exe_path = format!("/usr/bin/{exe_name}");
+    // If exe_name is already an absolute path, use it as-is — this is
+    // required for binaries whose @rpath is relative to their
+    // actual install location.
+    let exe_path = if exe_name.starts_with('/') {
+        exe_name.to_string()
+    } else {
+        format!("/usr/bin/{exe_name}")
+    };
     let mut argv_cstrings: Vec<std::ffi::CString> = Vec::with_capacity(argv.len());
     argv_cstrings.push(std::ffi::CString::new(exe_path).unwrap());
     for s in &argv[1..] {

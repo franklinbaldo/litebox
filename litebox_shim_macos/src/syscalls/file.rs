@@ -816,6 +816,44 @@ impl<FS: ShimFS> Task<FS> {
                 log_unsupported!("fcntl(fd={fd}, F_GETPATH) → {path:?}");
                 Ok(0)
             }
+            61 | 103 => {
+                // F_ADDFILESIGS (61) / F_ADDFILESIGS_INFO (103):
+                // dyld uses these to register code signatures for
+                // loaded dylibs.  We skip validation and return success.
+                log_unsupported!(
+                    "fcntl(fd={fd}, F_ADDFILESIGS variant {cmd}) → ok (stub)"
+                );
+                Ok(0)
+            }
+            97 => {
+                // F_ADDFILESIGS_RETURN: like F_ADDFILESIGS but dyld
+                // expects the kernel to write back the signed range end
+                // into fsignatures_t::fs_file_start.  Layout (arm64):
+                //   offset 0: fs_file_start  (i64)
+                //   offset 8: fs_blob_start  (u64, actually code blob offset)
+                //   offset 16: fs_blob_size  (u64)
+                // We set fs_file_start = fs_blob_start + fs_blob_size so
+                // dyld believes the entire file up to the signature end
+                // has been validated.
+                let user_ptr: MutPtr<u64> = MutPtr::from_usize(arg);
+                let blob_start = user_ptr
+                    .read_at_offset(1)
+                    .unwrap_or(0);
+                let blob_size = user_ptr
+                    .read_at_offset(2)
+                    .unwrap_or(0);
+                let signed_end = blob_start.saturating_add(blob_size);
+                let _ = user_ptr.write_at_offset(0, signed_end);
+                log_unsupported!(
+                    "fcntl(fd={fd}, F_ADDFILESIGS_RETURN) → ok (signed_end={signed_end:#x})"
+                );
+                Ok(0)
+            }
+            98 => {
+                // F_CHECK_LV: Library Validation — allow everything.
+                log_unsupported!("fcntl(fd={fd}, F_CHECK_LV) → ok (stub)");
+                Ok(0)
+            }
             _ => Err(Errno::EINVAL),
         }
     }

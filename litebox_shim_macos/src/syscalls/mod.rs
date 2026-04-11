@@ -16,7 +16,9 @@ pub(crate) mod unix;
 
 use litebox_common_macos::{PtRegs, errno::Errno, syscall::MacosSyscallRequest};
 
-use crate::{ShimFS, Task};
+use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+
+use crate::{MutPtr, ShimFS, Task};
 
 impl<FS: ShimFS> Task<FS> {
     /// Dispatch a decoded macOS syscall request to the appropriate handler.
@@ -137,7 +139,11 @@ impl<FS: ShimFS> Task<FS> {
             MacosSyscallRequest::Csrctl => Err(Errno::EPERM),
             MacosSyscallRequest::Dup { fd } => self.sys_dup(fd),
             MacosSyscallRequest::Dup2 { oldfd, newfd } => self.sys_dup2(oldfd, newfd),
-            MacosSyscallRequest::MacSyscall => Err(Errno::ENOSYS),
+            MacosSyscallRequest::MacSyscall {
+                policy_name,
+                operation,
+                arg,
+            } => self.sys_mac_syscall(policy_name, operation, arg),
             MacosSyscallRequest::Fsctl => Err(Errno::ENOTTY),
             MacosSyscallRequest::SharedRegionMapAndSlide2Np => {
                 log_unsupported!("shared_region_map_and_slide_2_np: no-op (cache pre-mapped)");
@@ -191,6 +197,17 @@ impl<FS: ShimFS> Task<FS> {
                 fsid,
                 objid,
             } => self.sys_fsgetpath(buf, bufsize, fsid, objid),
+            MacosSyscallRequest::PthreadSigmask { how, set, oset } => {
+                let _ = (how, set, oset);
+                // Signal delivery is not implemented in the shim, so
+                // sigprocmask is a no-op.  If `oset` is non-null, write
+                // an empty signal set (all signals unblocked).
+                if oset != 0 {
+                    let ptr: MutPtr<u32> = MutPtr::from_usize(oset);
+                    let _ = ptr.write_at_offset(0, 0u32);
+                }
+                Ok(0)
+            }
             MacosSyscallRequest::Unknown { number } => {
                 log_unsupported!("macOS syscall {number}");
                 Err(Errno::ENOSYS)

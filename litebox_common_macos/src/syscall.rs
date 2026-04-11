@@ -139,6 +139,8 @@ pub mod nr {
     pub const UTIMENSAT: usize = 547;
     /// `map_with_linking_np(regions, region_count, link_info, link_info_size)` — map with linking (macOS 550).
     pub const MAP_WITH_LINKING_NP: usize = 550;
+    /// `__pthread_sigmask(how, set, oset)` — set/get signal mask for the calling thread.
+    pub const PTHREAD_SIGMASK: usize = 329;
 }
 
 /// Mach trap numbers (negative x16 values, stored as positive constants).
@@ -383,7 +385,11 @@ pub enum MacosSyscallRequest {
         oldfd: i32,
         newfd: i32,
     },
-    MacSyscall,
+    MacSyscall {
+        policy_name: usize,
+        operation: usize,
+        arg: usize,
+    },
     Fsctl,
     SharedRegionMapAndSlide2Np,
     KdebugTraceString,
@@ -790,6 +796,15 @@ pub enum MacosSyscallRequest {
     },
     /// `map_with_linking_np(regions, region_count, link_info, link_info_size)` — map regions with linking info.
     MapWithLinkingNp,
+    /// `__pthread_sigmask(how, set, oset)` — syscall 329.
+    PthreadSigmask {
+        /// `SIG_BLOCK`, `SIG_UNBLOCK`, or `SIG_SETMASK`.
+        how: i32,
+        /// Pointer to the new signal set (or 0/null).
+        set: usize,
+        /// Pointer to store the old signal set (or 0/null).
+        oset: usize,
+    },
     Unknown {
         number: usize,
     },
@@ -939,7 +954,11 @@ impl MacosSyscallRequest {
                 oldfd: a0 as i32,
                 newfd: a1 as i32,
             },
-            nr::MAC_SYSCALL => MacosSyscallRequest::MacSyscall,
+            nr::MAC_SYSCALL => MacosSyscallRequest::MacSyscall {
+                policy_name: a0,
+                operation: a1,
+                arg: a2,
+            },
             nr::FSCTL => MacosSyscallRequest::Fsctl,
             nr::SHARED_REGION_MAP_AND_SLIDE_2_NP => MacosSyscallRequest::SharedRegionMapAndSlide2Np,
             nr::KDEBUG_TRACE_STRING => MacosSyscallRequest::KdebugTraceString,
@@ -1305,6 +1324,11 @@ impl MacosSyscallRequest {
                 flag: a3 as i32,
             },
             nr::MAP_WITH_LINKING_NP => MacosSyscallRequest::MapWithLinkingNp,
+            nr::PTHREAD_SIGMASK => MacosSyscallRequest::PthreadSigmask {
+                how: a0 as i32,
+                set: a1,
+                oset: a2,
+            },
             nr::EXECVE => MacosSyscallRequest::Execve {
                 path: a0,
                 argv: a1,

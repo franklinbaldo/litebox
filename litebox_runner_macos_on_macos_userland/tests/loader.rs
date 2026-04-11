@@ -1476,3 +1476,4 @@ fn test_run_system_du() {
     let code = run_system_binary("/usr/bin/du", &["/usr/bin/du", "/tmp"], "du");
     assert_eq!(code, 0, "du exited with code {code}");
 }
+

@@ -677,6 +677,20 @@ fn load_dyld<FS: ShimFS>(
     // code executes.
     patch_skip_initializers(&mut rewritten);
 
+    // Patch out the @rpath / @loader_path security policy check.
+    //
+    // dyld reads AMFI flags to decide whether `@rpath` and `@loader_path`
+    // expansion is allowed.  Even though the shim returns the fully-
+    // permissive flag set via `__mac_syscall("AMFI")`, the flags are
+    // cached in a dyld-internal struct at an offset that varies across
+    // macOS versions.  Rather than chasing that offset, we patch the
+    // `TBNZ` branch that gates @path expansion: the instruction sits
+    // right before an ADRP+ADD pair that loads the error string
+    //   "(security policy does not allow @ path expansion)"
+    // and we replace the conditional `TBNZ` with an unconditional `B`
+    // so that @path expansion is always permitted.
+    patch_allow_at_paths(&mut rewritten);
+
     // Layer 6: Redirect the non-simulator exit path in dyld's `start()`.
     //
     // After `main()` returns, dyld calls `LibSystemHelpersWrapper::exit()`
@@ -1176,4 +1190,237 @@ fn patch_exit_to_host(data: &mut [u8]) {
     }
 
     log_unsupported!("patch_exit_to_host: signature not found, skipping");
+}
+
+
+/// Patch dyld to always allow `@rpath` / `@loader_path` expansion.
+///
+/// Dyld gates @path expansion on an AMFI policy flag (bit 0 of a cached
+/// byte).  The check is:
+///
+/// ```text
+///   LDRB  Wt, [Xn, #off]          ; load cached AMFI flags
+///   TBNZ  Wt, #0, <skip_error>    ; if ALLOW_AT_PATH, skip error
+///   ADRP  X1, <page>              ; \
+///   ADD   X1, X1, #pageoff        ; / load "(security policy does not...)"
+///   ...                            ; format + report error
+/// ```
+///
+/// We find the ADRP+ADD that references the error string, then replace
+/// the `TBNZ` 4 bytes before the ADRP with an unconditional `B` to the
+/// same target.  This makes @path expansion unconditionally allowed.
+fn patch_allow_at_paths(data: &mut [u8]) {
+    // -----------------------------------------------------------
+    // Patch 1: General @path expansion gate
+    // -----------------------------------------------------------
+    // dyld checks a security-policy flag before expanding any @-
+    // prefixed path (`@loader_path`, `@executable_path`, `@rpath`).
+    // The check is a `TBNZ` 4 bytes before an ADRP+ADD that loads:
+    //   ", (security policy does not allow @ path expansion)"
+    // We replace the `TBNZ` with an unconditional `B` to always
+    // permit @-path expansion.
+    patch_at_path_expansion_gate(data);
+
+    // -----------------------------------------------------------
+    // Patch 2: LC_RPATH @loader_path rejection in main executable
+    // -----------------------------------------------------------
+    // Even after Patch 1, dyld has a *second* security gate that
+    // rejects `@loader_path` inside LC_RPATH of the main binary.
+    // The code loads a security byte, compares it, and falls
+    // through to a diagnostic log referencing:
+    //   "    @loader_path in LC_RPATH from main executable not
+    //    expanded due to security policy"
+    // The LDRB instruction 12 bytes before the ADRP+ADD of that
+    // string is the start of the rejection zone.  We replace it
+    // with `B +8` (8 instructions forward to the success path at
+    // ADRP+20).
+    patch_rpath_security_gate(
+        data,
+        b"    @loader_path in LC_RPATH from main executable not expanded due to security policy",
+        "loader_path_rpath",
+    );
+
+    // -----------------------------------------------------------
+    // Patch 3: LC_RPATH @executable_path rejection
+    // -----------------------------------------------------------
+    // Same pattern for @executable_path in LC_RPATH.
+    patch_rpath_security_gate(
+        data,
+        b"    @executable_path not expanded due to security policy",
+        "executable_path_rpath",
+    );
+}
+
+/// Patch the TBNZ gate that prevents all @-path expansion.
+#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_lossless)]
+fn patch_at_path_expansion_gate(data: &mut [u8]) {
+    let needle = b", (security policy does not allow @ path expansion)";
+    let Some(str_off) = data.windows(needle.len()).position(|w| w == needle) else {
+        log_unsupported!("patch_allow_at_paths: @path gate string not found, skipping");
+        return;
+    };
+
+    let str_page = str_off & !0xFFF;
+    let str_page_off = str_off & 0xFFF;
+    let code_end = data.len().min(str_off);
+
+    // Find ADRP+ADD pair referencing the string.
+    let mut adrp_off = None;
+    let mut i = 0;
+    while i + 8 <= code_end {
+        let w0 = u32::from_le_bytes(data[i..i + 4].try_into().unwrap());
+        let w1 = u32::from_le_bytes(data[i + 4..i + 8].try_into().unwrap());
+
+        if (w0 & 0x9F00_0000) == 0x9000_0000 {
+            let rd = w0 & 0x1F;
+            let immhi = (w0 >> 5) & 0x7_FFFF;
+            let immlo = (w0 >> 29) & 0x3;
+            let mut imm21 = ((immhi << 2) | immlo) as i32;
+            if imm21 >= (1 << 20) {
+                imm21 -= 1 << 21;
+            }
+            let pc_page = (i as i64) & !0xFFF;
+            let adrp_result = pc_page + (imm21 as i64) * 4096;
+
+            if adrp_result == str_page as i64
+                && (w1 & 0xFFC0_0000) == 0x9100_0000
+            {
+                let add_rn = (w1 >> 5) & 0x1F;
+                let add_imm = (w1 >> 10) & 0xFFF;
+                if add_rn == rd && add_imm == str_page_off as u32 {
+                    adrp_off = Some(i);
+                    break;
+                }
+            }
+        }
+        i += 4;
+    }
+
+    let Some(adrp) = adrp_off else {
+        log_unsupported!("patch_allow_at_paths: @path gate ADRP+ADD not found, skipping");
+        return;
+    };
+
+    if adrp < 4 {
+        return;
+    }
+    let tbnz_off = adrp - 4;
+    let tbnz = u32::from_le_bytes(data[tbnz_off..tbnz_off + 4].try_into().unwrap());
+
+    // Verify TBNZ Wt, #0, <target>
+    if (tbnz & 0xFFF8_0000) != 0x3700_0000 {
+        log_unsupported!(
+            "patch_allow_at_paths: expected TBNZ at {tbnz_off:#x}, got {tbnz:#010x}, skipping"
+        );
+        return;
+    }
+
+    // Reuse the TBNZ branch offset for an unconditional B.
+    let imm14 = ((tbnz >> 5) & 0x3FFF) as i32;
+    let imm14 = if imm14 >= (1 << 13) { imm14 - (1 << 14) } else { imm14 };
+    let b_insn = 0x1400_0000_u32 | ((imm14 as u32) & 0x03FF_FFFF);
+
+    log_unsupported!(
+        "patch_allow_at_paths: patching TBNZ at {tbnz_off:#x} → B ({b_insn:#010x})"
+    );
+    data[tbnz_off..tbnz_off + 4].copy_from_slice(&b_insn.to_le_bytes());
+}
+
+/// Patch the LDRB-based security gate that rejects @loader_path or
+/// @executable_path inside LC_RPATH of the main executable.
+///
+/// Pattern (3 instructions before the ADRP+ADD referencing `needle`):
+/// ```text
+///   ADRP-12: LDRB  wN, [xM, #imm]   ; load security byte
+///   ADRP-8:  CMP   wN, #1
+///   ADRP-4:  B.ne  <return_0>
+///   ADRP+0:  ADRP  x1, <page>        ; error string reference
+///   ADRP+4:  ADD   x1, x1, #off
+///   ADRP+8:  MOV   x0, xK
+///   ADRP+12: BL    <log_fn>
+///   ADRP+16: B     <return_0>
+///   ADRP+20: <success_path>           ; rpath expansion continues
+/// ```
+///
+/// We replace the LDRB at ADRP-12 with `B +8` (jump 8 instructions
+/// forward to the success path at ADRP+20).
+#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_lossless)]
+fn patch_rpath_security_gate(data: &mut [u8], needle: &[u8], label: &str) {
+    let Some(str_off) = data.windows(needle.len()).position(|w| w == needle) else {
+        log_unsupported!(
+            "patch_allow_at_paths: {label} string not found, skipping"
+        );
+        return;
+    };
+
+    let str_page = str_off & !0xFFF;
+    let str_page_off = str_off & 0xFFF;
+    let code_end = data.len().min(str_off);
+
+    // Find ADRP+ADD referencing the string.
+    let mut adrp_off = None;
+    let mut i = 0;
+    while i + 8 <= code_end {
+        let w0 = u32::from_le_bytes(data[i..i + 4].try_into().unwrap());
+        let w1 = u32::from_le_bytes(data[i + 4..i + 8].try_into().unwrap());
+
+        if (w0 & 0x9F00_0000) == 0x9000_0000 {
+            let rd = w0 & 0x1F;
+            let immhi = (w0 >> 5) & 0x7_FFFF;
+            let immlo = (w0 >> 29) & 0x3;
+            let mut imm21 = ((immhi << 2) | immlo) as i32;
+            if imm21 >= (1 << 20) {
+                imm21 -= 1 << 21;
+            }
+            let pc_page = (i as i64) & !0xFFF;
+            let adrp_result = pc_page + (imm21 as i64) * 4096;
+
+            if adrp_result == str_page as i64
+                && (w1 & 0xFFC0_0000) == 0x9100_0000
+            {
+                let add_rn = (w1 >> 5) & 0x1F;
+                let add_imm = (w1 >> 10) & 0xFFF;
+                if add_rn == rd && add_imm == str_page_off as u32 {
+                    adrp_off = Some(i);
+                    break;
+                }
+            }
+        }
+        i += 4;
+    }
+
+    let Some(adrp) = adrp_off else {
+        log_unsupported!(
+            "patch_allow_at_paths: {label} ADRP+ADD not found, skipping"
+        );
+        return;
+    };
+
+    // The LDRB is 12 bytes before the ADRP.
+    if adrp < 12 {
+        log_unsupported!(
+            "patch_allow_at_paths: {label} ADRP too close to start, skipping"
+        );
+        return;
+    }
+    let ldrb_off = adrp - 12;
+    let ldrb = u32::from_le_bytes(data[ldrb_off..ldrb_off + 4].try_into().unwrap());
+
+    // Verify it looks like LDRB wN, [xM, #imm] (unsigned offset).
+    // LDRB encoding: 0011_1001_01_imm12_Rn_Rt
+    if (ldrb & 0xFFC0_0000) != 0x3940_0000 {
+        log_unsupported!(
+            "patch_allow_at_paths: {label} expected LDRB at {ldrb_off:#x}, got {ldrb:#010x}, skipping"
+        );
+        return;
+    }
+
+    // Replace LDRB with `B +8` (8 instructions forward: LDRB → ADRP+20).
+    // From LDRB (ADRP-12) to success (ADRP+20) = 32 bytes = 8 insns.
+    let b_insn: u32 = 0x1400_0008; // B +8
+
+    log_unsupported!(
+        "patch_allow_at_paths: {label} patching LDRB at {ldrb_off:#x} → B +8 ({b_insn:#010x})"
+    );
+    data[ldrb_off..ldrb_off + 4].copy_from_slice(&b_insn.to_le_bytes());
 }
