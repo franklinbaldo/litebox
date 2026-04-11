@@ -445,10 +445,10 @@ fn build_cli_args(
         worker_interp_path: None,
         guest_pid: None,
         guest_ppid: None,
-        guest_uid: None,
-        guest_euid: None,
-        guest_gid: None,
-        guest_egid: None,
+        guest_uid: Some(process.user().uid()),
+        guest_euid: Some(process.user().uid()),
+        guest_gid: Some(process.user().gid()),
+        guest_egid: Some(process.user().gid()),
         fork_restore: false,
         fork_restore_fd: None,
         fork_restore_ack_fd: None,
@@ -626,5 +626,43 @@ pub fn run_container(
     match result {
         Ok(exit_code) => Ok(exit_code),
         Err(e) => Err(e).context("litebox runner failed"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oci_spec::runtime::{ProcessBuilder, SpecBuilder, UserBuilder};
+
+    /// Helper: build a minimal OCI spec with a given UID/GID in process.user.
+    fn spec_with_user(uid: u32, gid: u32) -> Spec {
+        let user = UserBuilder::default().uid(uid).gid(gid).build().unwrap();
+        let process = ProcessBuilder::default()
+            .args(vec!["echo".to_string(), "hello".to_string()])
+            .user(user)
+            .cwd("/".to_string())
+            .build()
+            .unwrap();
+        SpecBuilder::default().process(process).build().unwrap()
+    }
+
+    #[test]
+    fn build_cli_args_sets_uid_gid_from_spec() {
+        let spec = spec_with_user(1000, 1000);
+        let args = build_cli_args(&spec, None, &[], "/tmp/test.sock", None).unwrap();
+        assert_eq!(args.guest_uid, Some(1000));
+        assert_eq!(args.guest_euid, Some(1000));
+        assert_eq!(args.guest_gid, Some(1000));
+        assert_eq!(args.guest_egid, Some(1000));
+    }
+
+    #[test]
+    fn build_cli_args_sets_root_uid_gid_when_zero() {
+        let spec = spec_with_user(0, 0);
+        let args = build_cli_args(&spec, None, &[], "/tmp/test.sock", None).unwrap();
+        assert_eq!(args.guest_uid, Some(0));
+        assert_eq!(args.guest_euid, Some(0));
+        assert_eq!(args.guest_gid, Some(0));
+        assert_eq!(args.guest_egid, Some(0));
     }
 }
