@@ -665,7 +665,7 @@ fn finish_run<FS: litebox_shim_linux::ShimFS>(
             exec_prog_path,
             argv,
             envp,
-            None,
+            task_override_from_cli_args(cli_args, platform),
             None,
         )
     } else {
@@ -677,7 +677,8 @@ fn finish_run<FS: litebox_shim_linux::ShimFS>(
 
         let program = shim.load_program_with_exec_filename(
             initial_file_system,
-            platform.init_task(),
+            task_override_from_cli_args(cli_args, platform)
+                .unwrap_or_else(|| platform.init_task()),
             load_prog_path,
             exec_prog_path,
             argv,
@@ -848,6 +849,30 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     )?;
 
     Ok(guest_wait_status_to_exit_code(run_program(program, shutdown, net_worker, worker_result_fd, None)))
+}
+
+/// Build a [`TaskParams`] override from CliArgs guest UID/GID fields, if any are set.
+///
+/// When the OCI runner provides `process.user` UID/GID, those values are stored in
+/// `guest_uid`/`guest_gid`. This function constructs a `TaskParams` that overrides
+/// the host process identity while keeping the host PID/PPID (needed for correct
+/// scheduling).
+fn task_override_from_cli_args(
+    cli_args: &CliArgs,
+    platform: &litebox_platform_multiplex::Platform,
+) -> Option<litebox_common_linux::TaskParams> {
+    if cli_args.guest_uid.is_none() && cli_args.guest_gid.is_none() {
+        return None;
+    }
+    let host = platform.init_task();
+    Some(litebox_common_linux::TaskParams {
+        pid: host.pid,
+        ppid: host.ppid,
+        uid: cli_args.guest_uid.unwrap_or(host.uid),
+        euid: cli_args.guest_euid.unwrap_or(cli_args.guest_uid.unwrap_or(host.euid)),
+        gid: cli_args.guest_gid.unwrap_or(host.gid),
+        egid: cli_args.guest_egid.unwrap_or(cli_args.guest_gid.unwrap_or(host.egid)),
+    })
 }
 
 #[allow(clippy::similar_names)]
