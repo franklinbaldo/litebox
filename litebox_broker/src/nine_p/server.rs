@@ -30,6 +30,7 @@ use super::fs_compat::{self, FileExt, MetadataExt, OpenOptionsExt};
 use tracing::{debug, error, trace, warn};
 
 use super::fcall::{self, Fcall, FcallStr, TaggedFcall};
+use super::mount_table::MountTable;
 use super::transport::{self, Read, Write};
 use crate::policy::{Action, Decision, Policy};
 
@@ -82,6 +83,8 @@ pub struct Server {
     /// Shared across all server instances via `Arc` so ELF patching is amortized
     /// across connections.
     elf_cache: Arc<Mutex<ElfCache>>,
+    /// Mount table mapping guest-relative prefixes to host directories.
+    mount_table: MountTable,
 }
 
 impl Server {
@@ -102,6 +105,7 @@ impl Server {
             policy,
             rewrite_syscalls,
             Arc::new(Mutex::new(HashMap::new())),
+            MountTable::new(),
         )
     }
 
@@ -114,6 +118,7 @@ impl Server {
         policy: Arc<dyn Policy>,
         rewrite_syscalls: bool,
         elf_cache: Arc<Mutex<ElfCache>>,
+        mount_table: MountTable,
     ) -> Self {
         Self {
             root,
@@ -122,6 +127,7 @@ impl Server {
             msize: AtomicU32::new(4 * 1024 * 1024),
             rewrite_syscalls,
             elf_cache,
+            mount_table,
         }
     }
 
@@ -137,7 +143,7 @@ impl Server {
     /// symlink pointing outside the jail).
     fn resolve_and_check(&self, path: &Path) -> Result<PathBuf, u32> {
         let canonical = fs::canonicalize(path).map_err(io_errno)?;
-        if canonical.starts_with(&self.root) {
+        if canonical.starts_with(&self.root) || self.mount_table.is_under_mount(&canonical) {
             Ok(canonical)
         } else {
             Err(libc::EPERM as u32)
@@ -159,7 +165,7 @@ impl Server {
     /// shortcut should be disabled.
     fn resolve_fid_path(&self, path: &Path, is_canonical: bool) -> Result<PathBuf, u32> {
         if is_canonical {
-            if path.starts_with(&self.root) {
+            if path.starts_with(&self.root) || self.mount_table.is_under_mount(path) {
                 Ok(path.to_path_buf())
             } else {
                 Err(libc::EPERM as u32)
@@ -729,15 +735,39 @@ impl Server {
                 readlink_path = Some(next.clone());
             }
 
-            // Canonicalize to follow symlinks. This resolves the real path
-            // so subsequent walk steps work correctly even through symlinks.
-            let resolved = match fs::canonicalize(&next) {
-                Ok(p) => p,
-                Err(_) => break,
+            // Try to resolve via mount table before canonicalization.
+            // If `next` is under the root, compute guest-relative path and
+            // check for a mount point redirect.
+            let resolved = if let Ok(guest_rel) = next.strip_prefix(&self.root) {
+                if let Some(host_path) = self.mount_table.resolve(guest_rel) {
+                    // Mount hit: canonicalize the host path
+                    match fs::canonicalize(&host_path) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            if host_path.exists() {
+                                host_path
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    // No mount match, canonicalize as normal
+                    match fs::canonicalize(&next) {
+                        Ok(p) => p,
+                        Err(_) => break,
+                    }
+                }
+            } else {
+                // Path not under root (e.g., walking inside a mount target)
+                match fs::canonicalize(&next) {
+                    Ok(p) => p,
+                    Err(_) => break,
+                }
             };
 
-            // Containment check on the resolved (real) path
-            if !resolved.starts_with(&self.root) {
+            // Containment check: path must be under root OR under a mount target
+            if !resolved.starts_with(&self.root) && !self.mount_table.is_under_mount(&resolved) {
                 break;
             }
 
@@ -1288,6 +1318,60 @@ impl Server {
             total_size += entry_size;
             entries.push(entry);
             offset_counter += 1;
+        }
+
+        // Inject mount point entries not already present in the real listing
+        if let Ok(guest_rel) = path.strip_prefix(&self.root) {
+            let mount_children = self.mount_table.children_of(guest_rel);
+            let existing_names: std::collections::HashSet<Vec<u8>> = entries
+                .iter()
+                .map(|e| match &e.name {
+                    FcallStr::Owned(v) => v.clone(),
+                    FcallStr::Borrowed(v) => v.to_vec(),
+                })
+                .collect();
+
+            for child_name in mount_children {
+                let name_bytes = child_name.to_string_lossy().into_owned().into_bytes();
+                if existing_names.contains(&name_bytes) {
+                    continue; // Real entry takes precedence
+                }
+
+                // Look up the mount's host path to get a proper QID
+                let child_guest_path = guest_rel.join(child_name);
+                let (qid, typ) =
+                    if let Some(host_path) = self.mount_table.resolve(&child_guest_path) {
+                        match fs::metadata(&host_path) {
+                            Ok(meta) => {
+                                let qid = metadata_to_qid(&meta);
+                                let typ = if meta.is_dir() {
+                                    fs_compat::DT_DIR
+                                } else {
+                                    fs_compat::DT_REG
+                                };
+                                (qid, typ)
+                            }
+                            Err(_) => continue,
+                        }
+                    } else {
+                        continue;
+                    };
+
+                let entry = fcall::DirEntry {
+                    qid,
+                    offset: offset_counter,
+                    typ,
+                    name: FcallStr::Owned(name_bytes),
+                };
+
+                let entry_size = entry.size();
+                if total_size + entry_size > max_bytes && !entries.is_empty() {
+                    break;
+                }
+                total_size += entry_size;
+                entries.push(entry);
+                offset_counter += 1;
+            }
         }
 
         Fcall::Rreaddir(fcall::Rreaddir {

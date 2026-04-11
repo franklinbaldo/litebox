@@ -9,6 +9,7 @@
 
 pub mod fcall;
 pub mod fs_compat;
+pub mod mount_table;
 pub mod server;
 pub mod transport;
 

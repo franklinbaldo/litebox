@@ -55,6 +55,11 @@ struct Cli {
     /// (e.g., 127.0.0.1:9999) or AF_UNIX socket path.
     #[arg(long, conflicts_with = "network_proxy_fd")]
     network_proxy_listen: Option<String>,
+
+    /// Bind mount a host directory at a guest path (read-only).
+    /// Format: guest_path:host_path (e.g., /etc/resolv.conf:/run/host-resolv.conf)
+    #[arg(long = "bind")]
+    binds: Vec<String>,
 }
 
 fn build_policy(cli: &Cli) -> Arc<dyn litebox_broker::policy::Policy> {
@@ -75,12 +80,31 @@ fn build_policy(cli: &Cli) -> Arc<dyn litebox_broker::policy::Policy> {
     }
 }
 
+fn build_mount_table(binds: &[String]) -> litebox_broker::nine_p::mount_table::MountTable {
+    let mut table = litebox_broker::nine_p::mount_table::MountTable::new();
+    for spec in binds {
+        // Format: guest_path:host_path
+        let parts: Vec<&str> = spec.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            tracing::warn!(spec, "ignoring malformed --bind spec (expected guest:host)");
+            continue;
+        }
+        let guest = parts[0].strip_prefix('/').unwrap_or(parts[0]);
+        let host = std::path::PathBuf::from(parts[1]);
+        let host = host.canonicalize().unwrap_or_else(|_| host.clone());
+        tracing::info!(guest, ?host, "adding bind mount");
+        table.add(std::path::PathBuf::from(guest), host);
+    }
+    table
+}
+
 /// Build a `LocalServiceRegistry` when `--root-dir` is provided alongside
 /// network proxy flags. The 9P file server is registered on port 5640 so the
 /// guest can reach it at `BROKER_IP:5640` without a real TCP listener.
 fn build_local_services(
     cli: &Cli,
     elf_cache: Arc<Mutex<litebox_broker::nine_p::server::ElfCache>>,
+    mount_table: litebox_broker::nine_p::mount_table::MountTable,
 ) -> Option<litebox_broker::net_proxy::LocalServiceRegistry> {
     let root_dir = cli.root_dir.as_ref()?;
     let root = root_dir.canonicalize().unwrap_or_else(|_| root_dir.clone());
@@ -94,12 +118,14 @@ fn build_local_services(
         let root = root.clone();
         let policy = Arc::clone(&policy);
         let elf_cache = Arc::clone(&elf_cache);
+        let mount_table = mount_table.clone();
         registry.register(
             5640,
             Box::new(move |stream| {
                 let root = root.clone();
                 let policy = Arc::clone(&policy);
                 let elf_cache = Arc::clone(&elf_cache);
+                let mount_table = mount_table.clone();
                 std::thread::spawn(move || {
                     let mut stream = stream;
                     let server = litebox_broker::nine_p::server::Server::with_elf_cache(
@@ -107,6 +133,7 @@ fn build_local_services(
                         policy,
                         rewrite_syscalls,
                         elf_cache,
+                        mount_table,
                     );
                     server.serve(&mut stream);
                     info!("9P local service session ended");
@@ -121,18 +148,21 @@ fn build_local_services(
         let root = root.clone();
         let policy = Arc::clone(&policy);
         let elf_cache = Arc::clone(&elf_cache);
+        let mount_table = mount_table.clone();
         registry.register_ring(
             5640,
             Arc::new(move |writer, reader| {
                 let root = root.clone();
                 let policy = Arc::clone(&policy);
                 let elf_cache = Arc::clone(&elf_cache);
+                let mount_table = mount_table.clone();
                 std::thread::spawn(move || {
                     let server = Arc::new(litebox_broker::nine_p::server::Server::with_elf_cache(
                         root,
                         policy,
                         rewrite_syscalls,
                         elf_cache,
+                        mount_table,
                     ));
                     litebox_broker::nine_p::server::Server::serve_threaded(
                         server, reader, writer, 8,
@@ -165,7 +195,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let fd = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd_num) };
         let ipc = IpcStream::from_owned_fd(fd);
         let elf_cache = litebox_broker::nine_p::server::Server::new_elf_cache();
-        let registry = build_local_services(&cli, elf_cache);
+        let registry = build_local_services(&cli, elf_cache, build_mount_table(&cli.binds));
         return litebox_broker::net_proxy::run(ipc, false, registry, None);
     }
     #[cfg(not(unix))]
@@ -193,7 +223,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // proxy event loop.  Stray/slow clients are rejected quickly so they
         // cannot block the real runner from connecting.
         loop {
-            let registry = build_local_services(&cli, Arc::clone(&elf_cache));
+            let registry =
+                build_local_services(&cli, Arc::clone(&elf_cache), build_mount_table(&cli.binds));
             let ipc = match litebox_broker::net_proxy::accept_ipc_client(
                 &listener,
                 registry.as_ref(),
@@ -229,6 +260,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = root_dir.canonicalize().expect("root directory must exist");
 
     let policy = build_policy(&cli);
+    let mount_table = build_mount_table(&cli.binds);
 
     info!(
         ?root,
@@ -255,10 +287,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        let server = litebox_broker::nine_p::server::Server::new(
+        let server = litebox_broker::nine_p::server::Server::with_elf_cache(
             root.clone(),
             Arc::clone(&policy),
             cli.rewrite_syscalls,
+            litebox_broker::nine_p::server::Server::new_elf_cache(),
+            mount_table.clone(),
         );
         server.serve(&mut stream);
         info!("9P client disconnected");
