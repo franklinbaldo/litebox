@@ -354,7 +354,7 @@ fn initial_program_data(
 /// Can panic if any particulars of the environment are not set up as expected. Ideally, would not
 /// panic. If it does actually panic, then ping the authors of LiteBox, and likely a better error
 /// message could be thrown instead.
-pub fn run(cli_args: CliArgs) -> Result<()> {
+pub fn run(cli_args: CliArgs) -> Result<i32> {
     // When running as a worker host for a non-PIE child exec, take the
     // simplified worker path that skips VA partitioning.
     if cli_args.worker_exec {
@@ -603,7 +603,7 @@ fn finish_run<FS: litebox_shim_linux::ShimFS>(
     mut shim_builder: litebox_shim_linux::LinuxShimBuilder,
     fs: FS,
     cli_args: &CliArgs,
-) -> Result<()> {
+) -> Result<i32> {
     let platform = litebox_platform_multiplex::platform();
 
     let load_prog = load_program_path(cli_args);
@@ -676,7 +676,7 @@ fn finish_run<FS: litebox_shim_linux::ShimFS>(
             cli_args.working_directory.clone(),
         )?;
 
-        run_program(program, shutdown, net_worker, None, None);
+        Ok(run_program(program, shutdown, net_worker, None, None))
     }
 }
 
@@ -722,7 +722,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     envp: Vec<alloc::ffi::CString>,
     task_override: Option<litebox_common_linux::TaskParams>,
     worker_result_fd: Option<i32>,
-) -> Result<()> {
+) -> Result<i32> {
     let broker_addr = cli_args.nine_p_broker.as_deref().unwrap();
     let is_tcp = broker_addr.parse::<core::net::SocketAddr>().is_ok();
 
@@ -768,7 +768,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
             cli_args.working_directory.clone(),
         )?;
 
-        run_program(program, shutdown, net_worker, worker_result_fd, None);
+        return Ok(run_program(program, shutdown, net_worker, worker_result_fd, None));
     }
 
     // TUN mode: connect via TCP through the guest's smoltcp network stack.
@@ -838,7 +838,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         cli_args.working_directory.clone(),
     )?;
 
-    run_program(program, shutdown, net_worker, worker_result_fd, None);
+    Ok(run_program(program, shutdown, net_worker, worker_result_fd, None))
 }
 
 #[allow(clippy::similar_names)]
@@ -978,6 +978,7 @@ fn inject_program_image_into_in_mem(
     }
 }
 
+#[allow(dead_code)]
 fn host_signal_should_raise(signal: i32) -> bool {
     litebox_common_linux::signal::Signal::try_from(signal)
         .map(|signal| {
@@ -990,6 +991,7 @@ fn host_signal_should_raise(signal: i32) -> bool {
         .unwrap_or(false)
 }
 
+#[allow(dead_code)]
 fn terminate_host_with_guest_wait_status(wait_status: i32) -> ! {
     if wait_status > 255 {
         let signal = wait_status - 256;
@@ -1008,6 +1010,19 @@ fn terminate_host_with_guest_wait_status(wait_status: i32) -> ! {
     std::process::exit(wait_status)
 }
 
+/// Convert a litebox guest wait_status into a conventional host exit code.
+///
+/// Normal exit: pass through the exit code (0–255).
+/// Signal death: return 128 + signal number (shell convention).
+fn guest_wait_status_to_exit_code(wait_status: i32) -> i32 {
+    if wait_status > 255 {
+        let signal = wait_status - 256;
+        128 + signal
+    } else {
+        wait_status
+    }
+}
+
 /// Run as a worker host process for a non-PIE child exec.
 ///
 /// This is the simplified path used when the parent host process detected that
@@ -1016,7 +1031,7 @@ fn terminate_host_with_guest_wait_status(wait_status: i32) -> ! {
 /// Reads the serialized fork snapshot from the inherited memfd, restores the
 /// child process state, and resumes guest execution. Writes a restore ack to
 /// the parent via the ack pipe before resuming.
-fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
+fn run_fork_restore(cli_args: CliArgs) -> Result<i32> {
     let snapshot_fd = cli_args
         .fork_restore_fd
         .ok_or_else(|| anyhow!("--fork-restore requires --fork-restore-fd"))?;
@@ -1129,13 +1144,13 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
             &mux_streams,
             &local_pipes,
         )?;
-        run_program(
+        Ok(run_program(
             program,
             shutdown,
             net_worker,
             cli_args.worker_result_fd,
             mux_handle,
-        );
+        ))
     } else {
         let initial_file_system = std::sync::Arc::new(default_fs);
 
@@ -1153,13 +1168,13 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
             &mux_streams,
             &local_pipes,
         )?;
-        run_program(
+        Ok(run_program(
             program,
             shutdown,
             net_worker,
             cli_args.worker_result_fd,
             mux_handle,
-        );
+        ))
     }
 }
 
@@ -1787,7 +1802,7 @@ fn spawn_worker_mux_dispatcher(
 /// The worker gets the full address space (no partitioning), loads the binary
 /// at its canonical addresses, runs it to completion, and exits with its code.
 #[allow(clippy::similar_names)]
-fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
+fn run_worker_exec(cli_args: CliArgs) -> Result<i32> {
     // program_and_arguments layout from the parent:
     //   [0] = resolved load path (the binary to load from the FS)
     //   [1..] = original guest argv (may be empty for argc==0 execs)
@@ -1836,7 +1851,7 @@ fn run_worker_exec_core(
     transferred_exec_image: Option<alloc::borrow::Cow<'static, [u8]>>,
     transferred_interp_image: Option<(String, alloc::borrow::Cow<'static, [u8]>)>,
     forker_grandchild: bool,
-) -> Result<()> {
+) -> Result<i32> {
     if cli_args.program_and_arguments.is_empty() {
         anyhow::bail!("worker-exec requires at least a load path");
     }
@@ -1983,26 +1998,24 @@ fn run_worker_exec_core(
             cli_args.working_directory.clone(),
         )?;
 
-        run_program(
+        Ok(run_program(
             program,
             shutdown,
             net_worker,
             cli_args.worker_result_fd,
             None,
-        );
+        ))
     }
 }
 
-/// Run the loaded program and exit with its return code.
-///
-/// This function never returns — it calls `std::process::exit()`.
+/// Run the loaded program and return its exit code.
 fn run_program<FS: litebox_shim_linux::ShimFS>(
     program: litebox_shim_linux::LoadedProgram<FS>,
     shutdown: std::sync::Arc<core::sync::atomic::AtomicBool>,
     net_worker: Option<std::thread::JoinHandle<()>>,
     worker_result_fd: Option<i32>,
     mux_handle: Option<std::thread::JoinHandle<()>>,
-) -> ! {
+) -> i32 {
     // NOTE: We intentionally do NOT install a seccomp filter on the runner.
     //
     // The runner's seccomp filter would be inherited by exec worker children
@@ -2069,7 +2082,7 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
     if let Some(worker_result_fd) = worker_result_fd {
         write_worker_result(wait_status, worker_result_fd);
     }
-    terminate_host_with_guest_wait_status(wait_status)
+    guest_wait_status_to_exit_code(wait_status)
 }
 
 /// Connect to a network broker via Unix domain socket.
@@ -2754,12 +2767,10 @@ fn run_forked_worker_exec(
         (interp_path.unwrap_or_default(), data)
     });
 
-    if run_worker_exec_core(cli_args, Some(exec_image), transferred_interp_image, true).is_err() {
-        unsafe { libc::_exit(1); }
+    match run_worker_exec_core(cli_args, Some(exec_image), transferred_interp_image, true) {
+        Ok(exit_code) => std::process::exit(exit_code),
+        Err(_) => unsafe { libc::_exit(1); },
     }
-    // run_worker_exec_core calls run_program which never returns, so we only
-    // reach here on error.
-    unsafe { libc::_exit(1); }
 }
 
 /// Worker callback for forked workers.
@@ -3007,7 +3018,8 @@ fn run_forked_worker(
             &local_pipes,
         ) {
             Ok((program, mux_handle)) => {
-                run_program(program, shutdown, net_worker, result_fd, mux_handle);
+                let exit_code = run_program(program, shutdown, net_worker, result_fd, mux_handle);
+                std::process::exit(exit_code);
             }
             Err(_) => {
                 unsafe { libc::_exit(1); }
@@ -3030,7 +3042,8 @@ fn run_forked_worker(
             &local_pipes,
         ) {
             Ok((program, mux_handle)) => {
-                run_program(program, shutdown, net_worker, result_fd, mux_handle);
+                let exit_code = run_program(program, shutdown, net_worker, result_fd, mux_handle);
+                std::process::exit(exit_code);
             }
             Err(_) => {
                 unsafe { libc::_exit(1); }

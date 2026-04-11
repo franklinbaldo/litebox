@@ -555,7 +555,7 @@ pub fn run_container(
         "launching sandboxed process"
     );
 
-    // 8. Call litebox_runner_linux_userland::run() — diverges on success
+    // 8. Call litebox_runner_linux_userland::run() — returns exit code on success
     let result = litebox_runner_linux_userland::run(cli_args);
 
     // 9. On error (or if run returns), clean up broker process and socket
@@ -564,7 +564,7 @@ pub fn run_container(
     let _ = std::fs::remove_file(&broker_socket_path);
 
     match result {
-        Ok(()) => Ok(0),
+        Ok(exit_code) => Ok(exit_code),
         Err(e) => Err(e).context("litebox runner failed"),
     }
 }
