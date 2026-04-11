@@ -322,18 +322,23 @@ fn wait_for_socket(path: &Path, timeout: std::time::Duration) -> Result<()> {
 ///
 /// Returns the child process handle. The broker will listen on `socket_path`
 /// for both LB9P (9P filesystem) and LBNP (network proxy) connections.
-fn spawn_broker(socket_path: &Path, rootfs: &Path) -> Result<Child> {
+fn spawn_broker(
+    socket_path: &Path,
+    rootfs: &Path,
+    bind_mounts: &[(String, String)],
+) -> Result<Child> {
     let broker_exe = find_broker_exe()?;
 
     tracing::info!(
         broker = %broker_exe.display(),
         socket = %socket_path.display(),
         rootfs = %rootfs.display(),
+        bind_mounts = ?bind_mounts,
         "spawning litebox_broker"
     );
 
-    let child = Command::new(&broker_exe)
-        .arg("--network-proxy-listen")
+    let mut cmd = Command::new(&broker_exe);
+    cmd.arg("--network-proxy-listen")
         .arg(socket_path)
         .arg("--root-dir")
         .arg(rootfs)
@@ -342,7 +347,14 @@ fn spawn_broker(socket_path: &Path, rootfs: &Path) -> Result<Child> {
         .arg("--writable-path")
         .arg("/tmp")
         .arg("--writable-path")
-        .arg("/var")
+        .arg("/var");
+
+    for (guest_path, host_path) in bind_mounts {
+        cmd.arg("--bind");
+        cmd.arg(format!("{}:{}", guest_path, host_path));
+    }
+
+    let child = cmd
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -507,7 +519,30 @@ pub fn run_container(
         }
     };
 
-    // 4. Generate broker socket path
+    // 4. Extract bind mounts from OCI spec
+    let bind_mounts: Vec<(String, String)> = spec
+        .mounts()
+        .as_ref()
+        .map(|mounts| {
+            mounts
+                .iter()
+                .filter(|m| {
+                    // Include bind mounts and mounts with a real source path
+                    let typ = m.typ().as_deref().unwrap_or("bind");
+                    typ == "bind" || typ == "none"
+                })
+                .filter_map(|m| {
+                    let source = m.source().as_ref()?.to_str()?;
+                    let dest = m.destination().to_str()?;
+                    // Strip leading / from dest for guest-relative path
+                    let guest_path = dest.strip_prefix('/').unwrap_or(dest);
+                    Some((guest_path.to_string(), source.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // 5. Generate broker socket path
     let broker_socket_path = PathBuf::from(format!(
         "/tmp/litebox-oci-broker-{}.sock",
         std::process::id()
@@ -517,10 +552,10 @@ pub fn run_container(
         .context("broker socket path is not valid UTF-8")?
         .to_string();
 
-    // 5. Spawn broker
-    let mut broker_child = spawn_broker(&broker_socket_path, &rootfs_path)?;
+    // 6. Spawn broker
+    let mut broker_child = spawn_broker(&broker_socket_path, &rootfs_path, &bind_mounts)?;
 
-    // 6. Wait for broker socket to appear (up to 5 seconds)
+    // 7. Wait for broker socket to appear (up to 5 seconds)
     if let Err(e) = wait_for_socket(&broker_socket_path, std::time::Duration::from_secs(5)) {
         // Clean up broker process on timeout
         let _ = broker_child.kill();
@@ -529,7 +564,7 @@ pub fn run_container(
         return Err(e).context("broker failed to start");
     }
 
-    // 7. Build CliArgs
+    // 8. Build CliArgs
     let cli_args = match build_cli_args(
         &spec,
         override_args,
@@ -555,10 +590,10 @@ pub fn run_container(
         "launching sandboxed process"
     );
 
-    // 8. Call litebox_runner_linux_userland::run() — returns exit code on success
+    // 9. Call litebox_runner_linux_userland::run() — returns exit code on success
     let result = litebox_runner_linux_userland::run(cli_args);
 
-    // 9. On error (or if run returns), clean up broker process and socket
+    // 10. On error (or if run returns), clean up broker process and socket
     let _ = broker_child.kill();
     let _ = broker_child.wait();
     let _ = std::fs::remove_file(&broker_socket_path);
