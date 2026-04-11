@@ -676,7 +676,7 @@ fn finish_run<FS: litebox_shim_linux::ShimFS>(
             cli_args.working_directory.clone(),
         )?;
 
-        Ok(run_program(program, shutdown, net_worker, None, None))
+        Ok(guest_wait_status_to_exit_code(run_program(program, shutdown, net_worker, None, None)))
     }
 }
 
@@ -768,7 +768,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
             cli_args.working_directory.clone(),
         )?;
 
-        return Ok(run_program(program, shutdown, net_worker, worker_result_fd, None));
+        return Ok(guest_wait_status_to_exit_code(run_program(program, shutdown, net_worker, worker_result_fd, None)));
     }
 
     // TUN mode: connect via TCP through the guest's smoltcp network stack.
@@ -838,7 +838,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         cli_args.working_directory.clone(),
     )?;
 
-    Ok(run_program(program, shutdown, net_worker, worker_result_fd, None))
+    Ok(guest_wait_status_to_exit_code(run_program(program, shutdown, net_worker, worker_result_fd, None)))
 }
 
 #[allow(clippy::similar_names)]
@@ -978,7 +978,6 @@ fn inject_program_image_into_in_mem(
     }
 }
 
-#[allow(dead_code)]
 fn host_signal_should_raise(signal: i32) -> bool {
     litebox_common_linux::signal::Signal::try_from(signal)
         .map(|signal| {
@@ -991,7 +990,6 @@ fn host_signal_should_raise(signal: i32) -> bool {
         .unwrap_or(false)
 }
 
-#[allow(dead_code)]
 fn terminate_host_with_guest_wait_status(wait_status: i32) -> ! {
     if wait_status > 255 {
         let signal = wait_status - 256;
@@ -1144,13 +1142,13 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<i32> {
             &mux_streams,
             &local_pipes,
         )?;
-        Ok(run_program(
+        Ok(guest_wait_status_to_exit_code(run_program(
             program,
             shutdown,
             net_worker,
             cli_args.worker_result_fd,
             mux_handle,
-        ))
+        )))
     } else {
         let initial_file_system = std::sync::Arc::new(default_fs);
 
@@ -1168,13 +1166,13 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<i32> {
             &mux_streams,
             &local_pipes,
         )?;
-        Ok(run_program(
+        Ok(guest_wait_status_to_exit_code(run_program(
             program,
             shutdown,
             net_worker,
             cli_args.worker_result_fd,
             mux_handle,
-        ))
+        )))
     }
 }
 
@@ -1837,6 +1835,7 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<i32> {
     };
 
     run_worker_exec_core(cli_args, transferred_exec_image, transferred_interp_image, false)
+        .map(guest_wait_status_to_exit_code)
 }
 
 /// Shared core logic for running a non-PIE worker-exec.
@@ -2008,7 +2007,12 @@ fn run_worker_exec_core(
     }
 }
 
-/// Run the loaded program and return its exit code.
+/// Run the loaded program and return the raw litebox wait_status.
+///
+/// The wait_status uses litebox encoding: 0–255 = exit code, 256+ = signal + 256.
+/// Callers in the `run()` chain should convert via `guest_wait_status_to_exit_code`.
+/// Forked worker callers should use `terminate_host_with_guest_wait_status` to
+/// properly propagate signal deaths to the parent.
 fn run_program<FS: litebox_shim_linux::ShimFS>(
     program: litebox_shim_linux::LoadedProgram<FS>,
     shutdown: std::sync::Arc<core::sync::atomic::AtomicBool>,
@@ -2082,7 +2086,7 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
     if let Some(worker_result_fd) = worker_result_fd {
         write_worker_result(wait_status, worker_result_fd);
     }
-    guest_wait_status_to_exit_code(wait_status)
+    wait_status
 }
 
 /// Connect to a network broker via Unix domain socket.
@@ -2768,7 +2772,7 @@ fn run_forked_worker_exec(
     });
 
     match run_worker_exec_core(cli_args, Some(exec_image), transferred_interp_image, true) {
-        Ok(exit_code) => std::process::exit(exit_code),
+        Ok(wait_status) => terminate_host_with_guest_wait_status(wait_status),
         Err(_) => unsafe { libc::_exit(1); },
     }
 }
@@ -3018,8 +3022,8 @@ fn run_forked_worker(
             &local_pipes,
         ) {
             Ok((program, mux_handle)) => {
-                let exit_code = run_program(program, shutdown, net_worker, result_fd, mux_handle);
-                std::process::exit(exit_code);
+                let wait_status = run_program(program, shutdown, net_worker, result_fd, mux_handle);
+                terminate_host_with_guest_wait_status(wait_status);
             }
             Err(_) => {
                 unsafe { libc::_exit(1); }
@@ -3042,8 +3046,8 @@ fn run_forked_worker(
             &local_pipes,
         ) {
             Ok((program, mux_handle)) => {
-                let exit_code = run_program(program, shutdown, net_worker, result_fd, mux_handle);
-                std::process::exit(exit_code);
+                let wait_status = run_program(program, shutdown, net_worker, result_fd, mux_handle);
+                terminate_host_with_guest_wait_status(wait_status);
             }
             Err(_) => {
                 unsafe { libc::_exit(1); }
