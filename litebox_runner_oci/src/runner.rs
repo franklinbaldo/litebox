@@ -445,6 +445,8 @@ fn build_cli_args(
         nine_p_broker: Some(broker_socket.to_string()),
         working_directory,
         proc_mount: has_proc_mount,
+        af_packet_fd: None,
+        network_config: None,
         // Internal worker flags — all default/inactive
         worker_exec: false,
         worker_exec_fd: None,

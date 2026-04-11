@@ -51,6 +51,7 @@ const TCP_CONNECT_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::fr
 /// Configuration for the guest network stack.
 ///
 /// Controls the smoltcp interface address, gateway, and link-layer mode.
+#[derive(Debug)]
 pub struct NetworkConfig {
     /// Hardware address: `HardwareAddress::Ip` for TUN/IPC, `Ethernet(mac)` for AF_PACKET.
     pub hardware_addr: smoltcp::wire::HardwareAddress,

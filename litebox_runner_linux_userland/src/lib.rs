@@ -130,6 +130,18 @@ pub struct CliArgs {
     #[arg(skip)]
     pub proc_mount: bool,
 
+    /// Pre-opened AF_PACKET socket fd for CNI veth networking.
+    /// When set, the platform uses `NetworkTransport::AfPacket` and smoltcp
+    /// runs in Ethernet mode.
+    #[arg(skip)]
+    pub af_packet_fd: Option<std::os::fd::OwnedFd>,
+
+    /// Network configuration for the guest smoltcp stack.
+    /// Used with AF_PACKET CNI networking to configure smoltcp with the real
+    /// CNI network parameters instead of the default 10.0.0.x subnet.
+    #[arg(skip)]
+    pub network_config: Option<litebox::net::NetworkConfig>,
+
     /// Internal: run as a worker host process for a non-PIE child exec.
     ///
     /// When set, the runner loads the specified binary with the full VA space
@@ -362,7 +374,7 @@ fn initial_program_data(
 /// Can panic if any particulars of the environment are not set up as expected. Ideally, would not
 /// panic. If it does actually panic, then ping the authors of LiteBox, and likely a better error
 /// message could be thrown instead.
-pub fn run(cli_args: CliArgs) -> Result<i32> {
+pub fn run(mut cli_args: CliArgs) -> Result<i32> {
     // When running as a worker host for a non-PIE child exec, take the
     // simplified worker path that skips VA partitioning.
     if cli_args.worker_exec {
@@ -463,7 +475,10 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     // TODO: We also need to pick the type of syscall interception based on whether we want
     // systrap/sigsys interception, or binary rewriting interception. Currently
     // `litebox_platform_linux_userland` does not provide a way to pick between the two.
-    let platform = if cli_args.tun_device_name.is_some() {
+    let platform = if let Some(af_packet_fd) = cli_args.af_packet_fd.take() {
+        use litebox_platform_linux_userland::NetworkTransport;
+        Platform::with_network(Some(NetworkTransport::AfPacket(af_packet_fd)))
+    } else if cli_args.tun_device_name.is_some() {
         Platform::new(cli_args.tun_device_name.as_deref())
     } else if let Some(broker_path) = &cli_args.network_broker {
         use litebox_platform_linux_userland::NetworkTransport;
@@ -502,7 +517,10 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         }
     }
 
-    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
+    let mut shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
+    if let Some(net_config) = cli_args.network_config.take() {
+        shim_builder.set_network_config(net_config);
+    }
     let litebox = shim_builder.litebox();
     let (in_mem, tar_ro) = build_initial_fs(
         litebox,
@@ -2701,6 +2719,8 @@ fn build_cli_args_from_exec_params(
         nine_p_broker,
         working_directory: Some(params.cwd.clone()),
         proc_mount: false,
+        af_packet_fd: None,
+        network_config: None,
         worker_exec: true,
         worker_exec_fd: None, // image is passed directly, not via fd
         worker_result_fd: result_fd,
@@ -3130,6 +3150,8 @@ mod tests {
             nine_p_broker: None,
             working_directory: None,
             proc_mount: false,
+            af_packet_fd: None,
+            network_config: None,
             worker_exec: false,
             worker_exec_fd: None,
             worker_result_fd: None,
