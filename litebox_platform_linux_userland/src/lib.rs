@@ -998,6 +998,9 @@ impl LinuxUserland {
             WorkerExecInputBinding::Close => {
                 stdio_bindings[0] = forker::StdioBinding::Close;
             }
+            WorkerExecInputBinding::Inherit => {
+                stdio_bindings[0] = forker::StdioBinding::Inherit;
+            }
             _ => {
                 stdio_bindings[0] = forker::StdioBinding::DevNull;
             }
@@ -1020,6 +1023,9 @@ impl LinuxUserland {
                 }
                 WorkerExecOutputBinding::Close => {
                     stdio_bindings[i] = forker::StdioBinding::Close;
+                }
+                WorkerExecOutputBinding::Inherit => {
+                    stdio_bindings[i] = forker::StdioBinding::Inherit;
                 }
                 _ => {
                     stdio_bindings[i] = forker::StdioBinding::DevNull;
@@ -1257,6 +1263,9 @@ impl LinuxUserland {
             WorkerExecInputBinding::Close => {
                 stdio_bindings[0] = forker::StdioBinding::Close;
             }
+            WorkerExecInputBinding::Inherit => {
+                stdio_bindings[0] = forker::StdioBinding::Inherit;
+            }
             _ => {
                 stdio_bindings[0] = forker::StdioBinding::DevNull;
             }
@@ -1276,6 +1285,9 @@ impl LinuxUserland {
                 }
                 WorkerExecOutputBinding::Close => {
                     stdio_bindings[i] = forker::StdioBinding::Close;
+                }
+                WorkerExecOutputBinding::Inherit => {
+                    stdio_bindings[i] = forker::StdioBinding::Inherit;
                 }
                 _ => {
                     stdio_bindings[i] = forker::StdioBinding::DevNull;
@@ -2375,7 +2387,10 @@ impl LinuxUserland {
                     return Err(-1_i32);
                 }
             }
-            // For Pipe/Stream/Fs/Inherit bindings, the mux handles all
+            WorkerExecInputBinding::Inherit => {
+                // Let fd 0 pass through from the parent — no file action needed.
+            }
+            // For Pipe/Stream/Fs bindings, the mux handles all
             // actual data flow via virtual pipes.  Redirect the worker's
             // host stdin to /dev/null so it cannot read from the terminal.
             _ => {
@@ -2428,7 +2443,10 @@ impl LinuxUserland {
                         return Err(-1_i32);
                     }
                 }
-                // For Pipe/Stream/Fs/Inherit bindings, the mux handles all
+                WorkerExecOutputBinding::Inherit => {
+                    // Let fd pass through from the parent — no file action needed.
+                }
+                // For Pipe/Stream/Fs bindings, the mux handles all
                 // actual data flow via virtual pipes.  Redirect the worker's
                 // host stdout/stderr to /dev/null so it cannot write to the
                 // terminal.
