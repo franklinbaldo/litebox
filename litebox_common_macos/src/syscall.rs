@@ -111,6 +111,7 @@ pub mod nr {
     pub const WRITE_NOCANCEL: usize = 397;
     pub const OPEN_NOCANCEL: usize = 398;
     pub const CLOSE_NOCANCEL: usize = 399;
+    pub const OPENAT_NOCANCEL: usize = 464;
     pub const GUARDED_OPEN_NP: usize = 441;
     pub const GUARDED_CLOSE_NP: usize = 442;
     pub const CHANGE_FDGUARD_NP: usize = 444;
@@ -911,7 +912,7 @@ impl MacosSyscallRequest {
                 code: a1,
             },
             nr::STAT64 | nr::LSTAT64 => MacosSyscallRequest::Stat64 { path: a0, buf: a1 },
-            nr::OPENAT => MacosSyscallRequest::Openat {
+            nr::OPENAT | nr::OPENAT_NOCANCEL => MacosSyscallRequest::Openat {
                 dirfd: a0 as i32,
                 path: a1,
                 flags: a2 as i32,

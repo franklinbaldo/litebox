@@ -1121,7 +1121,6 @@ fn test_run_system_seq() {
 /// `/usr/bin/wc` with a simple input via /dev/null — word count utility.
 /// With no stdin and no file args, wc reads stdin which will be empty.
 #[test]
-#[ignore = "wc crashes with SIGSEGV (exit 139) during binary loading"]
 fn test_run_system_wc() {
     // wc with /dev/null as arg should print "0 0 0" and exit 0
     let code = run_system_binary("/usr/bin/wc", &["/usr/bin/wc", "/dev/null"], "wc");
