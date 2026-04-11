@@ -127,6 +127,9 @@ pub enum NetworkTransport {
     /// IPC pipe to a network broker — no privileges needed.
     /// The fd is one end of a Unix `socketpair()`.
     Ipc(std::os::fd::OwnedFd),
+    /// AF_PACKET raw socket on an Ethernet interface (e.g. CNI veth).
+    /// Sends/receives complete Ethernet frames — no length framing.
+    AfPacket(std::os::fd::OwnedFd),
 }
 
 struct WorkerHostProcess {
@@ -2113,7 +2116,7 @@ impl LinuxUserland {
         let transport = self.network_transport.read().unwrap();
         let is_ipc = matches!(transport.as_ref(), Some(NetworkTransport::Ipc(_)));
         let fd = match transport.as_ref().expect("no network transport configured") {
-            NetworkTransport::Tun(fd) | NetworkTransport::Ipc(fd) => fd.as_raw_fd(),
+            NetworkTransport::Tun(fd) | NetworkTransport::Ipc(fd) | NetworkTransport::AfPacket(fd) => fd.as_raw_fd(),
         };
         let mut pfd = libc::pollfd {
             fd,
@@ -4139,6 +4142,14 @@ impl litebox::platform::RawMutex for RawMutex {
 }
 
 impl litebox::platform::IPInterfaceProvider for LinuxUserland {
+    fn medium(&self) -> smoltcp::phy::Medium {
+        let transport = self.network_transport.read().unwrap();
+        match transport.as_ref() {
+            Some(NetworkTransport::AfPacket(_)) => smoltcp::phy::Medium::Ethernet,
+            _ => smoltcp::phy::Medium::Ip,
+        }
+    }
+
     fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
         let transport = self.network_transport.read().unwrap();
         let transport = transport
@@ -4213,6 +4224,23 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
                     }
                 }
                 Ok(())
+            }
+            NetworkTransport::AfPacket(fd) => {
+                // AF_PACKET: data is a complete Ethernet frame from smoltcp.
+                let ret = unsafe {
+                    libc::send(
+                        fd.as_raw_fd(),
+                        packet.as_ptr().cast::<libc::c_void>(),
+                        packet.len(),
+                        libc::MSG_NOSIGNAL,
+                    )
+                };
+                if ret < 0 {
+                    let errno = unsafe { *libc::__errno_location() };
+                    Err(litebox::platform::SendError::Io(errno))
+                } else {
+                    Ok(())
+                }
             }
         }
     }
@@ -4352,6 +4380,27 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
                     }
                 }
                 Ok(pkt_len)
+            }
+            NetworkTransport::AfPacket(fd) => {
+                let ret = unsafe {
+                    libc::recv(
+                        fd.as_raw_fd(),
+                        packet.as_mut_ptr().cast::<libc::c_void>(),
+                        packet.len(),
+                        libc::MSG_DONTWAIT,
+                    )
+                };
+                if ret < 0 {
+                    let errno = unsafe { *libc::__errno_location() };
+                    if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+                        Err(litebox::platform::ReceiveError::WouldBlock)
+                    } else {
+                        Err(litebox::platform::ReceiveError::Eof)
+                    }
+                } else {
+                    #[allow(clippy::cast_sign_loss)]
+                    Ok(ret as usize)
+                }
             }
         }
     }
