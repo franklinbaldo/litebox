@@ -2151,10 +2151,6 @@ fn build_udp_packet(
 mod tests {
     use super::*;
     use std::io::{Read as _, Write as _};
-    use std::sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
-    };
     use std::time::Duration;
 
     #[test]
