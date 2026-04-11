@@ -386,6 +386,15 @@ pub trait IPInterfaceProvider {
     /// Returns size of packet received, or a [`ReceiveError`] if unable to receive an entire
     /// packet.
     fn receive_ip_packet(&self, packet: &mut [u8]) -> Result<usize, ReceiveError>;
+
+    /// The network medium for packet framing.
+    ///
+    /// Returns [`Medium::Ip`](smoltcp::phy::Medium::Ip) (no link-layer framing) by default.
+    /// Platforms using AF_PACKET on an Ethernet interface override this to
+    /// [`Medium::Ethernet`](smoltcp::phy::Medium::Ethernet).
+    fn medium(&self) -> smoltcp::phy::Medium {
+        smoltcp::phy::Medium::Ip
+    }
 }
 
 /// A non-exhaustive list of errors that can be thrown by [`IPInterfaceProvider::send_ip_packet`].
