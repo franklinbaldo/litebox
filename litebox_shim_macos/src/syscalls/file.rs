@@ -1021,7 +1021,8 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle `openat(dirfd, path, flags, mode)`.
     ///
     /// When `dirfd` is AT_FDCWD (-2 on macOS), this behaves like `open()`.
-    /// Other dirfd values are not yet supported.
+    /// For other dirfd values, the path is resolved relative to the directory
+    /// referenced by dirfd.
     pub(crate) fn sys_openat(
         &self,
         dirfd: i32,
@@ -1038,14 +1039,67 @@ impl<FS: ShimFS> Task<FS> {
             return self.sys_open(path_addr, flags, mode);
         }
 
-        // Non-AT_FDCWD relative paths are not yet supported
-        log_unsupported!("openat: unsupported dirfd={dirfd}");
-        Err(Errno::ENOSYS)
+        // Resolve relative to dirfd's path.
+        let raw_dirfd = fd_to_usize(dirfd)?;
+        let dir_path = {
+            let paths = self.global.fd_paths.read();
+            paths.get(&raw_dirfd).cloned().ok_or(Errno::EBADF)?
+        };
+
+        // Construct the full path: dir_path + "/" + relative_path
+        let mut full_path = dir_path;
+        if !full_path.ends_with('/') {
+            full_path.push('/');
+        }
+        full_path.push_str(&path);
+        let resolved = normalize_path(&full_path);
+
+        // Now open using the resolved absolute path.
+        let mut oflags = translate_open_flags(flags);
+
+        let cpath = alloc::ffi::CString::new(resolved.as_bytes()).map_err(|_| Errno::EINVAL)?;
+
+        // If the target is an existing directory, adjust flags.
+        if let Ok(status) = self.global.fs.file_status(&cpath)
+            && status.file_type == litebox::fs::FileType::Directory
+        {
+            oflags.remove(OFlags::CREAT);
+            oflags.remove(OFlags::TRUNC);
+            oflags.remove(OFlags::EXCL);
+            oflags.remove(OFlags::WRONLY);
+            oflags.remove(OFlags::RDWR);
+        }
+
+        let typed_fd =
+            match self
+                .global
+                .fs
+                .open(&cpath, oflags, litebox::fs::Mode::from_bits_truncate(mode))
+            {
+                Ok(fd) => fd,
+                Err(e) => {
+                    return Err(Self::open_error_to_errno(e));
+                }
+            };
+
+        let raw_fd = {
+            let mut rds = self.global.raw_descriptors.write();
+            rds.fd_into_raw_integer(typed_fd)
+        };
+
+        // Record the resolved path for F_GETPATH support.
+        {
+            let mut paths = self.global.fd_paths.write();
+            paths.insert(raw_fd, resolved);
+        }
+
+        Ok(raw_fd)
     }
 
     /// Handle `fstatat64(dirfd, path, buf, flag)`.
     ///
     /// When `dirfd` is AT_FDCWD (-2 on macOS), this behaves like `stat64()`.
+    /// For other dirfd values, resolves path relative to dirfd.
     pub(crate) fn sys_fstatat64(
         &self,
         dirfd: i32,
@@ -1061,8 +1115,39 @@ impl<FS: ShimFS> Task<FS> {
             return self.sys_stat64(path_addr, buf_addr);
         }
 
-        log_unsupported!("fstatat64: unsupported dirfd={dirfd}");
-        Err(Errno::ENOSYS)
+        // Resolve relative to dirfd.
+        let raw_dirfd = fd_to_usize(dirfd)?;
+        let dir_path = {
+            let paths = self.global.fd_paths.read();
+            paths.get(&raw_dirfd).cloned().ok_or(Errno::EBADF)?
+        };
+
+        let mut full_path = dir_path;
+        if !full_path.ends_with('/') {
+            full_path.push('/');
+        }
+        full_path.push_str(&path);
+        let resolved = normalize_path(&full_path);
+
+        // Stat the resolved path.
+        let cpath = alloc::ffi::CString::new(resolved.as_bytes()).map_err(|_| Errno::EINVAL)?;
+        let typed_fd = self
+            .global
+            .fs
+            .open(&cpath, OFlags::RDONLY, litebox::fs::Mode::empty())
+            .map_err(Self::open_error_to_errno)?;
+
+        let raw_fd = {
+            let mut rds = self.global.raw_descriptors.write();
+            rds.fd_into_raw_integer(typed_fd)
+        };
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let result = self.sys_fstat64(raw_fd as i32, buf_addr);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let _ = self.sys_close(raw_fd as i32);
+
+        result
     }
 
     /// Handle `unlink(path)`.
@@ -1657,5 +1742,231 @@ impl<FS: ShimFS> Task<FS> {
 
         // Return the number of entries packed
         Ok(entry_count)
+    }
+
+    /// Handle `fchmodat(dirfd, path, mode, flag)` — change file mode relative to dirfd.
+    ///
+    /// Stub: permissions are not enforced in the sandbox, so this is a no-op
+    /// as long as the target path exists.
+    pub(crate) fn sys_fchmodat(
+        &self,
+        dirfd: i32,
+        path_addr: usize,
+        _mode: u32,
+        _flag: i32,
+    ) -> Result<usize, Errno> {
+        let path_ptr: ConstPtr<u8> = ConstPtr::from_usize(path_addr);
+        let path = read_cstring_from_guest(path_ptr, 4096).ok_or(Errno::EFAULT)?;
+
+        // Resolve relative paths.
+        let effective_path = if path.starts_with('/') || dirfd == -2 {
+            // Absolute or AT_FDCWD — resolve relative to cwd.
+            if path.starts_with('/') {
+                path.clone()
+            } else {
+                let cwd = self.process.cwd.read().clone();
+                let mut full = cwd;
+                if !full.ends_with('/') {
+                    full.push('/');
+                }
+                full.push_str(&path);
+                normalize_path(&full)
+            }
+        } else {
+            log_unsupported!("fchmodat: unsupported dirfd={dirfd}");
+            return Err(Errno::ENOSYS);
+        };
+
+        // Verify the path exists.
+        let cpath = alloc::ffi::CString::new(effective_path.as_bytes()).map_err(|_| Errno::EINVAL)?;
+        self.global.fs.file_status(&cpath).map_err(|e| match e {
+            litebox::fs::errors::FileStatusError::PathError(ref pe) => {
+                use litebox::fs::errors::PathError;
+                match pe {
+                    PathError::NoSuchFileOrDirectory => Errno::ENOENT,
+                    PathError::ComponentNotADirectory => Errno::ENOTDIR,
+                    _ => Errno::EINVAL,
+                }
+            }
+            _ => Errno::EIO,
+        })?;
+
+        // Permissions are not enforced in the sandbox — return success.
+        Ok(0)
+    }
+
+    /// Handle `getattrlist(path, alist, attributeBuffer, bufferSize, options)`.
+    ///
+    /// Returns a minimal attribute buffer with the attributes that `du` needs:
+    /// - ATTR_CMN_RETURNED_ATTRS (if FSOPT_REPORT_FULLSIZE or ATTR_CMN_RETURNED_ATTRS requested)
+    /// - ATTR_CMN_OBJTYPE
+    /// - ATTR_FILE_DATALENGTH (for regular files)
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::items_after_statements)]
+    pub(crate) fn sys_getattrlist(
+        &self,
+        path_addr: usize,
+        alist_addr: usize,
+        attr_buf_addr: usize,
+        attr_buf_size: usize,
+        _options: u32,
+    ) -> Result<usize, Errno> {
+        let path_ptr: ConstPtr<u8> = ConstPtr::from_usize(path_addr);
+        let path = read_cstring_from_guest(path_ptr, 4096).ok_or(Errno::EFAULT)?;
+
+        // Read the attrlist struct (5 x u32 = 20 bytes):
+        //   bitmapcount: u16, reserved: u16, commonattr: u32, volattr: u32,
+        //   dirattr: u32, fileattr: u32
+        let alist_ptr: ConstPtr<u32> = ConstPtr::from_usize(alist_addr);
+        let _bitmapcount_and_reserved: u32 = alist_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+        let commonattr: u32 = alist_ptr.read_at_offset(1).ok_or(Errno::EFAULT)?;
+        let _volattr: u32 = alist_ptr.read_at_offset(2).ok_or(Errno::EFAULT)?;
+        let _dirattr: u32 = alist_ptr.read_at_offset(3).ok_or(Errno::EFAULT)?;
+        let fileattr: u32 = alist_ptr.read_at_offset(4).ok_or(Errno::EFAULT)?;
+
+        log_unsupported!(
+            "getattrlist({path:?}): commonattr={commonattr:#x}, fileattr={fileattr:#x}"
+        );
+
+        // Stat the path to get basic info.
+        let effective_path = if path.starts_with('/') {
+            path.clone()
+        } else {
+            let cwd = self.process.cwd.read().clone();
+            let mut full = cwd;
+            if !full.ends_with('/') {
+                full.push('/');
+            }
+            full.push_str(&path);
+            normalize_path(&full)
+        };
+
+        let cpath = alloc::ffi::CString::new(effective_path.as_bytes()).map_err(|_| Errno::EINVAL)?;
+        let status = self.global.fs.file_status(&cpath).map_err(|e| match e {
+            litebox::fs::errors::FileStatusError::PathError(ref pe) => {
+                use litebox::fs::errors::PathError;
+                match pe {
+                    PathError::NoSuchFileOrDirectory => Errno::ENOENT,
+                    PathError::ComponentNotADirectory => Errno::ENOTDIR,
+                    _ => Errno::EINVAL,
+                }
+            }
+            _ => Errno::EIO,
+        })?;
+
+        // Build the attribute buffer.
+        // First 4 bytes = total length (u32), then attribute data.
+        // We build a minimal response with the most common attributes.
+
+        // Attribute bit definitions (from <sys/attr.h>):
+        const ATTR_CMN_NAME: u32 = 0x0000_0001;
+        const ATTR_CMN_OBJTYPE: u32 = 0x0000_0008;
+        const ATTR_CMN_CRTIME: u32 = 0x0000_0200;
+        const ATTR_CMN_MODTIME: u32 = 0x0000_0400;
+        const ATTR_CMN_ACCTIME: u32 = 0x0000_1000;
+        const ATTR_CMN_RETURNED_ATTRS: u32 = 0x8000_0000;
+        const ATTR_FILE_DATALENGTH: u32 = 0x0000_0200;
+        const ATTR_FILE_TOTALSIZE: u32 = 0x0000_0002;
+        const ATTR_FILE_ALLOCSIZE: u32 = 0x0000_0004;
+
+        let mut buf = alloc::vec::Vec::with_capacity(256);
+
+        // Reserve 4 bytes for total length (will fill later).
+        buf.extend_from_slice(&[0u8; 4]);
+
+        // ATTR_CMN_RETURNED_ATTRS: write back what we're returning.
+        // This is a struct attribute_set_t { u32[5] } = 20 bytes.
+        if commonattr & ATTR_CMN_RETURNED_ATTRS != 0 {
+            let ret_common = commonattr & (ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_OBJTYPE | ATTR_CMN_CRTIME | ATTR_CMN_MODTIME | ATTR_CMN_ACCTIME | ATTR_CMN_NAME);
+            let ret_file = fileattr & (ATTR_FILE_DATALENGTH | ATTR_FILE_TOTALSIZE | ATTR_FILE_ALLOCSIZE);
+            // Write 5 x u32: commonattr, volattr, dirattr, fileattr, forkattr
+            buf.extend_from_slice(&ret_common.to_le_bytes());
+            buf.extend_from_slice(&0u32.to_le_bytes()); // volattr
+            buf.extend_from_slice(&0u32.to_le_bytes()); // dirattr
+            buf.extend_from_slice(&ret_file.to_le_bytes());
+            buf.extend_from_slice(&0u32.to_le_bytes()); // forkattr
+        }
+
+        // ATTR_CMN_NAME: attrreference_t { offset: i32, length: u32 }
+        // We defer the actual string to the end of the buffer.
+        let name_ref_offset = if commonattr & ATTR_CMN_NAME != 0 {
+            let off = buf.len();
+            buf.extend_from_slice(&[0u8; 8]); // placeholder for attrreference_t
+            Some(off)
+        } else {
+            None
+        };
+
+        // ATTR_CMN_OBJTYPE: u32 (VREG=1, VDIR=2, VLNK=5, VCHR=4)
+        if commonattr & ATTR_CMN_OBJTYPE != 0 {
+            let vtype: u32 = match status.file_type {
+                litebox::fs::FileType::Directory => 2,       // VDIR
+                litebox::fs::FileType::CharacterDevice => 4, // VCHR
+                _ => 1,                                       // VREG
+            };
+            buf.extend_from_slice(&vtype.to_le_bytes());
+        }
+
+        // ATTR_CMN_CRTIME, ATTR_CMN_MODTIME, ATTR_CMN_ACCTIME: struct timespec { i64, i64 }
+        // Return epoch (0, 0) for all timestamps.
+        if commonattr & ATTR_CMN_CRTIME != 0 {
+            buf.extend_from_slice(&0i64.to_le_bytes()); // tv_sec
+            buf.extend_from_slice(&0i64.to_le_bytes()); // tv_nsec
+        }
+        if commonattr & ATTR_CMN_MODTIME != 0 {
+            buf.extend_from_slice(&0i64.to_le_bytes());
+            buf.extend_from_slice(&0i64.to_le_bytes());
+        }
+        if commonattr & ATTR_CMN_ACCTIME != 0 {
+            buf.extend_from_slice(&0i64.to_le_bytes());
+            buf.extend_from_slice(&0i64.to_le_bytes());
+        }
+
+        // ATTR_FILE_TOTALSIZE: off_t (i64)
+        if fileattr & ATTR_FILE_TOTALSIZE != 0 {
+            buf.extend_from_slice(&(status.size as i64).to_le_bytes());
+        }
+
+        // ATTR_FILE_ALLOCSIZE: off_t (i64)
+        if fileattr & ATTR_FILE_ALLOCSIZE != 0 {
+            let alloc_size = status.size.div_ceil(4096) * 4096;
+            buf.extend_from_slice(&(alloc_size as i64).to_le_bytes());
+        }
+
+        // ATTR_FILE_DATALENGTH: off_t (i64)
+        if fileattr & ATTR_FILE_DATALENGTH != 0 {
+            buf.extend_from_slice(&(status.size as i64).to_le_bytes());
+        }
+
+        // Now append the name string if requested.
+        if let Some(ref_offset) = name_ref_offset {
+            let name_data_offset = buf.len();
+            // Extract the filename from the path.
+            let name = effective_path.rsplit('/').next().unwrap_or(&effective_path);
+            let name_bytes = name.as_bytes();
+            buf.extend_from_slice(name_bytes);
+            buf.push(0); // NUL terminator
+            // Pad to 4-byte alignment.
+            while buf.len() % 4 != 0 {
+                buf.push(0);
+            }
+            // Fill in the attrreference_t: offset relative to start of attrref field, length.
+            let rel_offset = (name_data_offset - ref_offset) as i32;
+            let name_len = (name_bytes.len() + 1) as u32; // include NUL
+            buf[ref_offset..ref_offset + 4].copy_from_slice(&rel_offset.to_le_bytes());
+            buf[ref_offset + 4..ref_offset + 8].copy_from_slice(&name_len.to_le_bytes());
+        }
+
+        // Write total length into the first 4 bytes.
+        let total_len = buf.len() as u32;
+        buf[0..4].copy_from_slice(&total_len.to_le_bytes());
+
+        // Truncate to user buffer size.
+        let copy_len = buf.len().min(attr_buf_size);
+        if copy_len > 0 {
+            let dest: MutPtr<u8> = MutPtr::from_usize(attr_buf_addr);
+            dest.copy_from_slice(0, &buf[..copy_len]).ok_or(Errno::EFAULT)?;
+        }
+
+        Ok(0)
     }
 }

@@ -1201,7 +1201,7 @@ fn test_run_system_cut() {
 ///
 /// Requires MIG task_info (msgh_id 3418) for locale setup.
 #[test]
-#[ignore = "needs MIG task_info (msgh_id 3418) for locale setup"]
+#[ignore = "startup failure: skipped library initializers break locale/collation setup"]
 fn test_run_system_sort() {
     let code = run_system_binary(
         "/usr/bin/sort",
@@ -1439,7 +1439,6 @@ fn test_run_system_rmdir() {
 
 /// `/bin/dd` — exits non-zero, needs investigation.
 #[test]
-#[ignore = "dd exits 1, needs investigation"]
 fn test_run_system_dd() {
     let code = run_system_binary(
         "/bin/dd",
@@ -1451,7 +1450,6 @@ fn test_run_system_dd() {
 
 /// `/bin/chmod` — exits 1, may need real FS support.
 #[test]
-#[ignore = "chmod exits 1, may need real FS passthrough for fchmodat"]
 fn test_run_system_chmod() {
     let code = run_system_binary(
         "/bin/chmod",
@@ -1463,7 +1461,6 @@ fn test_run_system_chmod() {
 
 /// `/usr/bin/touch` — exits 1, may need utimensat support.
 #[test]
-#[ignore = "touch exits 1, may need utimensat support"]
 fn test_run_system_touch() {
     let code = run_system_binary(
         "/usr/bin/touch",
@@ -1475,7 +1472,6 @@ fn test_run_system_touch() {
 
 /// `/usr/bin/du /tmp` — exits 1, may need directory traversal support.
 #[test]
-#[ignore = "du exits 1, may need directory traversal or stat improvements"]
 fn test_run_system_du() {
     let code = run_system_binary("/usr/bin/du", &["/usr/bin/du", "/tmp"], "du");
     assert_eq!(code, 0, "du exited with code {code}");

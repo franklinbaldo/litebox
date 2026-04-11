@@ -320,7 +320,11 @@ pub fn run_macho_binary(binary_data: &[u8], argv: &[&str]) -> (i32, Vec<u8>) {
         .iter()
         .map(|s| std::ffi::CString::new(*s).unwrap())
         .collect();
-    let envp = vec![std::ffi::CString::new("PATH=/bin").unwrap()];
+    let envp = vec![
+        std::ffi::CString::new("PATH=/bin").unwrap(),
+        std::ffi::CString::new("LC_ALL=C").unwrap(),
+        std::ffi::CString::new("LANG=C").unwrap(),
+    ];
 
     let program = shim
         .load_program(binary_data, argv_cstrings, envp, None)

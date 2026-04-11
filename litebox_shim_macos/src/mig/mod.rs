@@ -8,6 +8,7 @@
 //! handlers.
 
 pub(crate) mod host_priv;
+pub(crate) mod task;
 
 use litebox::platform::RawConstPointer as _;
 use litebox_common_macos::errno::Errno;
@@ -140,6 +141,9 @@ impl<FS: ShimFS> Task<FS> {
         if (400..500).contains(&hdr.msgh_id) {
             // host_priv subsystem: base 400..499
             self.mig_host_priv(msg_addr, &hdr)
+        } else if (3400..3500).contains(&hdr.msgh_id) {
+            // task subsystem: base 3400..3499
+            self.mig_task(msg_addr, &hdr)
         } else {
             // Unknown MIG subsystem -- return MACH_SEND_INVALID_DEST.
             log_unsupported!(

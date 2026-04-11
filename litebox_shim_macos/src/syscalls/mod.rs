@@ -419,6 +419,41 @@ impl<FS: ShimFS> Task<FS> {
                 };
                 self.sys_ulock_wait(operation, addr, value, timeout_us)
             }
+            MacosSyscallRequest::Fchmodat {
+                dirfd,
+                path,
+                mode,
+                flag,
+            } => self.sys_fchmodat(dirfd, path, mode, flag),
+            MacosSyscallRequest::Getattrlist {
+                path,
+                alist,
+                attr_buf,
+                attr_buf_size,
+                options,
+            } => self.sys_getattrlist(path, alist, attr_buf, attr_buf_size, options),
+            MacosSyscallRequest::Setattrlistat {
+                dirfd,
+                path,
+                alist,
+                attr_buf,
+                attr_buf_size,
+                options,
+            } => {
+                let _ = (dirfd, path, alist, attr_buf, attr_buf_size, options);
+                log_unsupported!("setattrlistat: stub returning success");
+                Ok(0)
+            }
+            MacosSyscallRequest::Utimensat {
+                dirfd,
+                path,
+                times,
+                flag,
+            } => {
+                let _ = (dirfd, path, times, flag);
+                log_unsupported!("utimensat: stub returning success");
+                Ok(0)
+            }
             MacosSyscallRequest::UlockWake {
                 operation,
                 addr,

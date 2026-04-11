@@ -130,6 +130,13 @@ pub mod nr {
     pub const SETRLIMIT: usize = 195;
     pub const CLOCK_GETTIME: usize = 232;
     pub const CLOCK_GETRES: usize = 233;
+    pub const FCHMODAT: usize = 467;
+    pub const GETATTRLIST: usize = 220;
+    pub const SETATTRLISTAT: usize = 524;
+    /// `futimens(fd, times)` — set file timestamps by fd (macOS 253).
+    pub const FUTIMENS: usize = 253;
+    /// `utimensat(dirfd, path, times, flag)` — set file timestamps (macOS 547).
+    pub const UTIMENSAT: usize = 547;
 }
 
 /// Mach trap numbers (negative x16 values, stored as positive constants).
@@ -748,6 +755,37 @@ pub enum MacosSyscallRequest {
     ClockGettime { clock_id: u32, tp: usize },
     /// `__clock_getres(clock_id, res)` — get clock resolution.
     ClockGetres { clock_id: u32, res: usize },
+    /// `fchmodat(dirfd, path, mode, flag)` — change file mode relative to dirfd.
+    Fchmodat {
+        dirfd: i32,
+        path: usize,
+        mode: u32,
+        flag: i32,
+    },
+    /// `getattrlist(path, alist, attributeBuffer, bufferSize, options)` — get file attributes.
+    Getattrlist {
+        path: usize,
+        alist: usize,
+        attr_buf: usize,
+        attr_buf_size: usize,
+        options: u32,
+    },
+    /// `setattrlistat(dirfd, path, alist, attributeBuffer, bufferSize, options)` — set file attributes.
+    Setattrlistat {
+        dirfd: i32,
+        path: usize,
+        alist: usize,
+        attr_buf: usize,
+        attr_buf_size: usize,
+        options: u32,
+    },
+    /// `utimensat(dirfd, path, times, flag)` — set file timestamps.
+    Utimensat {
+        dirfd: i32,
+        path: usize,
+        times: usize,
+        flag: i32,
+    },
     Unknown {
         number: usize,
     },
@@ -1234,6 +1272,33 @@ impl MacosSyscallRequest {
             nr::CLOCK_GETRES => MacosSyscallRequest::ClockGetres {
                 clock_id: a0 as u32,
                 res: a1,
+            },
+            nr::FCHMODAT => MacosSyscallRequest::Fchmodat {
+                dirfd: a0 as i32,
+                path: a1,
+                mode: a2 as u32,
+                flag: a3 as i32,
+            },
+            nr::GETATTRLIST => MacosSyscallRequest::Getattrlist {
+                path: a0,
+                alist: a1,
+                attr_buf: a2,
+                attr_buf_size: a3,
+                options: a4 as u32,
+            },
+            nr::SETATTRLISTAT => MacosSyscallRequest::Setattrlistat {
+                dirfd: a0 as i32,
+                path: a1,
+                alist: a2,
+                attr_buf: a3,
+                attr_buf_size: a4,
+                options: a5 as u32,
+            },
+            nr::UTIMENSAT => MacosSyscallRequest::Utimensat {
+                dirfd: a0 as i32,
+                path: a1,
+                times: a2,
+                flag: a3 as i32,
             },
             nr::EXECVE => MacosSyscallRequest::Execve {
                 path: a0,
