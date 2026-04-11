@@ -808,6 +808,14 @@ pub fn run_container(
         "launching sandboxed process"
     );
 
+    // 9c. Apply OCI rlimits to the host process before starting the sandbox.
+    // This bounds the litebox runner process itself (fd limits, etc.).
+    if let Some(process) = spec.process().as_ref() {
+        if let Some(rlimits) = process.rlimits() {
+            apply_rlimits(rlimits);
+        }
+    }
+
     // 10. Call litebox_runner_linux_userland::run() — returns exit code on success
     let result = litebox_runner_linux_userland::run(cli_args);
 
@@ -961,6 +969,66 @@ pub fn exec_container(
         override_cwd,
         override_user,
     )
+}
+
+// ---------------------------------------------------------------------------
+// OCI rlimits
+// ---------------------------------------------------------------------------
+
+/// Apply OCI rlimits to the current process via `setrlimit(2)`.
+///
+/// Each rlimit is applied best-effort: failures are logged but do not abort
+/// container startup (some limits like `RLIMIT_NPROC` may fail in rootless
+/// mode or when the requested value exceeds the hard limit).
+fn apply_rlimits(rlimits: &[oci_spec::runtime::PosixRlimit]) {
+    use oci_spec::runtime::PosixRlimitType;
+
+    for rl in rlimits {
+        let resource = match rl.typ() {
+            PosixRlimitType::RlimitCpu => libc::RLIMIT_CPU,
+            PosixRlimitType::RlimitFsize => libc::RLIMIT_FSIZE,
+            PosixRlimitType::RlimitData => libc::RLIMIT_DATA,
+            PosixRlimitType::RlimitStack => libc::RLIMIT_STACK,
+            PosixRlimitType::RlimitCore => libc::RLIMIT_CORE,
+            PosixRlimitType::RlimitRss => libc::RLIMIT_RSS,
+            PosixRlimitType::RlimitNproc => libc::RLIMIT_NPROC,
+            PosixRlimitType::RlimitNofile => libc::RLIMIT_NOFILE,
+            PosixRlimitType::RlimitMemlock => libc::RLIMIT_MEMLOCK,
+            PosixRlimitType::RlimitAs => libc::RLIMIT_AS,
+            PosixRlimitType::RlimitLocks => libc::RLIMIT_LOCKS,
+            PosixRlimitType::RlimitSigpending => libc::RLIMIT_SIGPENDING,
+            PosixRlimitType::RlimitMsgqueue => libc::RLIMIT_MSGQUEUE,
+            PosixRlimitType::RlimitNice => libc::RLIMIT_NICE,
+            PosixRlimitType::RlimitRtprio => libc::RLIMIT_RTPRIO,
+            PosixRlimitType::RlimitRttime => libc::RLIMIT_RTTIME,
+        };
+
+        let lim = libc::rlimit {
+            rlim_cur: rl.soft(),
+            rlim_max: rl.hard(),
+        };
+
+        // SAFETY: setrlimit is a standard POSIX call; we provide a valid
+        // resource constant and a properly initialised rlimit struct.
+        let rc = unsafe { libc::setrlimit(resource, &lim) };
+        if rc == 0 {
+            tracing::debug!(
+                typ = ?rl.typ(),
+                soft = rl.soft(),
+                hard = rl.hard(),
+                "applied rlimit"
+            );
+        } else {
+            let err = std::io::Error::last_os_error();
+            tracing::warn!(
+                typ = ?rl.typ(),
+                soft = rl.soft(),
+                hard = rl.hard(),
+                error = %err,
+                "failed to apply rlimit (continuing)"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

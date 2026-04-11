@@ -420,6 +420,40 @@ fn main() -> Result<()> {
             // Verify container exists
             let state = lifecycle.state(&container_id)?;
 
+            // Read resource limits from the OCI spec in the bundle
+            let (memory_limit, swap_limit, pids_limit) = {
+                let config_path = state.bundle.join("config.json");
+                std::fs::File::open(&config_path)
+                    .ok()
+                    .and_then(|f| serde_json::from_reader::<_, oci_spec::runtime::Spec>(f).ok())
+                    .map(|spec| {
+                        let (mem, swap, pids) = spec
+                            .linux()
+                            .as_ref()
+                            .and_then(|l| l.resources().as_ref())
+                            .map(|res| {
+                                let mem = res
+                                    .memory()
+                                    .as_ref()
+                                    .and_then(|m| m.limit())
+                                    .map_or(0_u64, |v| u64::try_from(v).unwrap_or(0));
+                                let swap = res
+                                    .memory()
+                                    .as_ref()
+                                    .and_then(|m| m.swap())
+                                    .map_or(0_u64, |v| u64::try_from(v).unwrap_or(0));
+                                let pids = res
+                                    .pids()
+                                    .as_ref()
+                                    .map_or(0_i64, |p| p.limit());
+                                (mem, swap, pids)
+                            })
+                            .unwrap_or((0, 0, 0));
+                        (mem, swap, pids)
+                    })
+                    .unwrap_or((0, 0, 0))
+            };
+
             // Try to get real stats from /proc if PID is available
             #[allow(clippy::similar_names)]
             let (memory_usage, cpu_user_ns, cpu_sys_ns) = if let Some(pid) = state.pid {
@@ -469,20 +503,20 @@ fn main() -> Result<()> {
                     },
                     "memory": {
                         "usage": {
-                            "limit": 0,
+                            "limit": memory_limit,
                             "usage": memory_usage,
                             "max": memory_usage,
                             "failcnt": 0
                         },
                         "swap": {
-                            "limit": 0,
+                            "limit": swap_limit,
                             "usage": 0,
                             "failcnt": 0
                         }
                     },
                     "pids": {
                         "current": i32::from(state.pid.is_some()),
-                        "limit": 0
+                        "limit": pids_limit
                     },
                     "blkio": {},
                     "hugetlb": {},
