@@ -107,12 +107,19 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Handle `getrlimit(resource, rlim)`.
+    ///
+    /// On macOS, the public `getrlimit()` wrapper in `libsystem_kernel` ORs
+    /// `0x1000` onto the resource number before executing the SVC. This flag
+    /// tells the kernel to use 64-bit `struct rlimit` instead of the legacy
+    /// 32-bit version. We strip it here so the shim sees the real resource.
     pub(crate) fn sys_getrlimit(&self, resource: u32, rlim_addr: usize) -> Result<usize, Errno> {
         use crate::MutPtr;
         use litebox::platform::RawConstPointer as _;
         use litebox_common_macos::{Rlimit, RlimitResource};
 
-        let res = RlimitResource::from_raw(resource).ok_or(Errno::EINVAL)?;
+        // Strip the 0x1000 "use 64-bit rlimit" flag added by _getrlimit.
+        let raw_resource = resource & !0x1000;
+        let res = RlimitResource::from_raw(raw_resource).ok_or(Errno::EINVAL)?;
         let lim = *self.process.rlimits[res as usize].lock();
         let ptr: MutPtr<Rlimit> = MutPtr::from_usize(rlim_addr);
         ptr.write_at_offset(0, lim).ok_or(Errno::EFAULT)?;
@@ -120,12 +127,17 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Handle `setrlimit(resource, rlim)`.
+    ///
+    /// Like `sys_getrlimit`, the public `setrlimit()` wrapper ORs `0x1000`
+    /// onto the resource number. We strip it.
     pub(crate) fn sys_setrlimit(&self, resource: u32, rlim_addr: usize) -> Result<usize, Errno> {
         use crate::ConstPtr;
         use litebox::platform::RawConstPointer as _;
         use litebox_common_macos::{Rlimit, RlimitResource};
 
-        let res = RlimitResource::from_raw(resource).ok_or(Errno::EINVAL)?;
+        // Strip the 0x1000 "use 64-bit rlimit" flag added by _setrlimit.
+        let raw_resource = resource & !0x1000;
+        let res = RlimitResource::from_raw(raw_resource).ok_or(Errno::EINVAL)?;
         let ptr: ConstPtr<Rlimit> = ConstPtr::from_usize(rlim_addr);
         let new_lim: Rlimit = ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
 
