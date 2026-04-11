@@ -30,6 +30,8 @@ pub struct NetworkConfig {
 pub struct CniNetworkConfig {
     /// Path to the network namespace.
     pub netns_path: Option<PathBuf>,
+    /// Name of the CNI network interface (e.g., "eth0").
+    pub iface_name: String,
     /// Container interface IP address.
     pub ip_addr: std::net::Ipv4Addr,
     /// Network prefix length.
@@ -166,6 +168,7 @@ fn read_netns_config(netns_path: Option<&PathBuf>) -> Option<CniNetworkConfig> {
 
     Some(CniNetworkConfig {
         netns_path: netns_path.cloned(),
+        iface_name,
         ip_addr,
         prefix_len,
         gateway,
@@ -194,67 +197,99 @@ fn parse_default_gateway(line: &str) -> Option<std::net::Ipv4Addr> {
     gw.parse().ok()
 }
 
-/// Set up a TUN device inside the container's CNI network namespace.
+/// Read the MAC address of a network interface from sysfs.
+fn read_interface_mac(iface: &str) -> Result<[u8; 6]> {
+    let path = format!("/sys/class/net/{iface}/address");
+    let mac_str = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read MAC from {path}"))?;
+    let mac_str = mac_str.trim();
+    let bytes: Vec<u8> = mac_str
+        .split(':')
+        .map(|b| u8::from_str_radix(b, 16))
+        .collect::<Result<Vec<u8>, _>>()
+        .with_context(|| format!("invalid MAC address: {mac_str}"))?;
+    if bytes.len() != 6 {
+        anyhow::bail!(
+            "MAC address has {} bytes, expected 6: {mac_str}",
+            bytes.len()
+        );
+    }
+    let mut mac = [0u8; 6];
+    mac.copy_from_slice(&bytes);
+    Ok(mac)
+}
+
+/// Open an AF_PACKET raw socket on the CNI veth interface.
 ///
-/// Creates a TUN device, configures IP forwarding and NAT so that smoltcp
-/// traffic is routed through the container's veth to the host network.
-fn setup_cni_tun(cni: &CniNetworkConfig) -> Result<String> {
-    let tun_name = "litebox0";
-    let tun_ip = "10.0.0.1";
-    let tun_subnet = "10.0.0.0/24";
+/// Returns the socket fd and a [`litebox::net::NetworkConfig`] for smoltcp
+/// (Ethernet mode with the veth's MAC, IP, prefix, and gateway).
+///
+/// The caller must already be in the CNI network namespace (via setns).
+fn setup_cni_af_packet(
+    cni: &CniNetworkConfig,
+) -> Result<(std::os::fd::OwnedFd, litebox::net::NetworkConfig)> {
+    use std::os::fd::{AsRawFd, FromRawFd};
 
-    // Enter the container's network namespace if a path is provided
-    if let Some(netns_path) = &cni.netns_path {
-        use std::os::unix::io::AsRawFd;
-        let netns_file = std::fs::File::open(netns_path)
-            .with_context(|| format!("failed to open netns {}", netns_path.display()))?;
+    // Read the veth MAC address
+    let mac = read_interface_mac(&cni.iface_name)?;
 
-        let clone_newnet: libc::c_int = 0x40000000;
-        // SAFETY: setns is a standard Linux syscall with a valid fd.
-        let ret = unsafe { libc::setns(netns_file.as_raw_fd(), clone_newnet) };
-        if ret != 0 {
-            anyhow::bail!("setns failed: {}", std::io::Error::last_os_error());
-        }
+    // Open AF_PACKET raw socket
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_PACKET,
+            libc::SOCK_RAW,
+            (libc::ETH_P_ALL as u16).to_be() as i32,
+        )
+    };
+    if fd < 0 {
+        anyhow::bail!(
+            "socket(AF_PACKET) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+
+    // Bind to the specific interface
+    let iface_cstr = std::ffi::CString::new(cni.iface_name.as_str())
+        .context("interface name contains null byte")?;
+    let ifindex = unsafe { libc::if_nametoindex(iface_cstr.as_ptr()) };
+    if ifindex == 0 {
+        anyhow::bail!(
+            "if_nametoindex({}) failed: {}",
+            cni.iface_name,
+            std::io::Error::last_os_error()
+        );
     }
 
-    // Create TUN device inside the netns
-    let status = Command::new("ip")
-        .args(["tuntap", "add", "dev", tun_name, "mode", "tun"])
-        .status()
-        .context("failed to create TUN device")?;
-    if !status.success() {
-        anyhow::bail!("ip tuntap add failed with {status}");
+    let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+    addr.sll_family = libc::AF_PACKET as u16;
+    addr.sll_protocol = (libc::ETH_P_ALL as u16).to_be();
+    addr.sll_ifindex = ifindex as i32;
+
+    let ret = unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            (&addr as *const libc::sockaddr_ll).cast::<libc::sockaddr>(),
+            std::mem::size_of::<libc::sockaddr_ll>() as u32,
+        )
+    };
+    if ret < 0 {
+        anyhow::bail!(
+            "bind(AF_PACKET, ifindex={ifindex}) failed: {}",
+            std::io::Error::last_os_error()
+        );
     }
 
-    // Configure TUN device
-    let _ = Command::new("ip")
-        .args(["addr", "add", &format!("{tun_ip}/24"), "dev", tun_name])
-        .status();
-    let _ = Command::new("ip")
-        .args(["link", "set", tun_name, "up"])
-        .status();
+    // Set non-blocking for the network worker poll loop
+    unsafe {
+        let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
+        libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
 
-    // Enable IP forwarding inside the netns
-    let _ = std::fs::write("/proc/sys/net/ipv4/ip_forward", "1");
+    let net_config =
+        litebox::net::NetworkConfig::ethernet(mac, cni.ip_addr, cni.prefix_len, cni.gateway);
 
-    // Set up NAT: masquerade TUN subnet traffic going out via the real interface
-    let _ = Command::new("iptables")
-        .args([
-            "-t",
-            "nat",
-            "-A",
-            "POSTROUTING",
-            "-s",
-            tun_subnet,
-            "!",
-            "-o",
-            tun_name,
-            "-j",
-            "MASQUERADE",
-        ])
-        .status();
-
-    Ok(tun_name.to_string())
+    Ok((fd, net_config))
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +411,8 @@ fn build_cli_args(
     extra_env: &[String],
     broker_socket: &str,
     tun_device: Option<String>,
+    af_packet_fd: Option<std::os::fd::OwnedFd>,
+    network_config: Option<litebox::net::NetworkConfig>,
 ) -> Result<CliArgs> {
     let process = spec
         .process()
@@ -414,8 +451,11 @@ fn build_cli_args(
         })
         .unwrap_or(None);
 
-    // Networking: TUN device vs broker-based networking
-    let (tun_device_name, network_broker) = if let Some(tun) = tun_device {
+    // Networking: AF_PACKET fd vs TUN device vs broker-based networking
+    let (tun_device_name, network_broker) = if af_packet_fd.is_some() {
+        // AF_PACKET provides networking — no TUN or broker needed for network
+        (None, None)
+    } else if let Some(tun) = tun_device {
         // TUN available: smoltcp reads directly from the TUN fd
         (Some(tun), None)
     } else {
@@ -445,8 +485,8 @@ fn build_cli_args(
         nine_p_broker: Some(broker_socket.to_string()),
         working_directory,
         proc_mount: has_proc_mount,
-        af_packet_fd: None,
-        network_config: None,
+        af_packet_fd,
+        network_config,
         // Internal worker flags — all default/inactive
         worker_exec: false,
         worker_exec_fd: None,
@@ -512,23 +552,36 @@ pub fn run_container(
         anyhow::bail!("rootfs not found at {}", rootfs_path.display());
     }
 
-    // 3. Detect CNI network from OCI spec (if no explicit tun_device)
-    let tun_device = if network.tun_device.is_some() {
-        network.tun_device.clone()
+    // 3. Detect CNI network from OCI spec — use AF_PACKET if available
+    let (af_packet_fd, af_packet_net_config) = if network.tun_device.is_some() {
+        (None, None) // explicit TUN overrides CNI detection
     } else {
         match detect_cni_network(&spec) {
-            Some(cni) => match setup_cni_tun(&cni) {
-                Ok(tun_name) => {
-                    tracing::info!(tun = %tun_name, "CNI TUN device created");
-                    Some(tun_name)
+            Some(cni) => match setup_cni_af_packet(&cni) {
+                Ok((fd, config)) => {
+                    tracing::info!(
+                        iface = %cni.iface_name,
+                        ip = %cni.ip_addr,
+                        "CNI AF_PACKET socket opened"
+                    );
+                    (Some(fd), Some(config))
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "CNI TUN setup failed, falling back to broker networking");
-                    None
+                    tracing::warn!(
+                        error = %e,
+                        "CNI AF_PACKET setup failed, falling back to broker networking"
+                    );
+                    (None, None)
                 }
             },
-            None => None,
+            None => (None, None),
         }
+    };
+    // If AF_PACKET is active, don't use TUN
+    let tun_device: Option<String> = if af_packet_fd.is_some() {
+        None
+    } else {
+        network.tun_device.clone()
     };
 
     // 4. Extract bind mounts from OCI spec
@@ -606,6 +659,8 @@ pub fn run_container(
         extra_env,
         &broker_socket_str,
         tun_device,
+        af_packet_fd,
+        af_packet_net_config,
     ) {
         Ok(args) => args,
         Err(e) => {
@@ -659,7 +714,7 @@ mod tests {
     #[test]
     fn build_cli_args_sets_uid_gid_from_spec() {
         let spec = spec_with_user(1000, 1000);
-        let args = build_cli_args(&spec, None, &[], "/tmp/test.sock", None).unwrap();
+        let args = build_cli_args(&spec, None, &[], "/tmp/test.sock", None, None, None).unwrap();
         assert_eq!(args.guest_uid, Some(1000));
         assert_eq!(args.guest_euid, Some(1000));
         assert_eq!(args.guest_gid, Some(1000));
@@ -669,7 +724,7 @@ mod tests {
     #[test]
     fn build_cli_args_sets_root_uid_gid_when_zero() {
         let spec = spec_with_user(0, 0);
-        let args = build_cli_args(&spec, None, &[], "/tmp/test.sock", None).unwrap();
+        let args = build_cli_args(&spec, None, &[], "/tmp/test.sock", None, None, None).unwrap();
         assert_eq!(args.guest_uid, Some(0));
         assert_eq!(args.guest_euid, Some(0));
         assert_eq!(args.guest_gid, Some(0));
@@ -696,7 +751,7 @@ mod tests {
             .mounts(vec![proc_mount])
             .build()
             .unwrap();
-        let args = build_cli_args(&spec, None, &[], "/tmp/test.sock", None).unwrap();
+        let args = build_cli_args(&spec, None, &[], "/tmp/test.sock", None, None, None).unwrap();
         assert!(args.proc_mount);
     }
 
@@ -721,7 +776,21 @@ mod tests {
             .mounts(vec![bind_mount])
             .build()
             .unwrap();
-        let args = build_cli_args(&spec, None, &[], "/tmp/test.sock", None).unwrap();
+        let args = build_cli_args(&spec, None, &[], "/tmp/test.sock", None, None, None).unwrap();
         assert!(!args.proc_mount);
+    }
+
+    #[test]
+    fn read_interface_mac_parses_loopback() {
+        // lo always exists and typically has MAC 00:00:00:00:00:00
+        let mac = read_interface_mac("lo");
+        assert!(mac.is_ok(), "failed to read lo MAC: {:?}", mac.err());
+        assert_eq!(mac.unwrap(), [0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn read_interface_mac_fails_for_nonexistent() {
+        let mac = read_interface_mac("nonexistent_iface_xyz");
+        assert!(mac.is_err());
     }
 }

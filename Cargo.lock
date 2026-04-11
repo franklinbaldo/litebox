@@ -1776,6 +1776,7 @@ dependencies = [
  "clap",
  "exec",
  "libc",
+ "litebox",
  "litebox_runner_linux_userland",
  "nix",
  "oci-spec 0.8.4",

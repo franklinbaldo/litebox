@@ -13,6 +13,7 @@ clap = { version = "4.5", features = ["derive"] }
 anyhow = "1.0"
 
 # LiteBox core
+litebox = { version = "0.1.0", path = "../litebox" }
 litebox_runner_linux_userland = { path = "../litebox_runner_linux_userland" }
 
 # Process exec (execv wrapper for child process)
