@@ -1245,26 +1245,238 @@ fn test_run_system_paste() {
 }
 
 // =====================================================================
-// Survey tests — exploratory, not expected to pass yet
+// Additional coreutils — verified to run correctly in the shim
 // =====================================================================
 
+/// `/bin/date +%Y` — prints the current year.
 #[test]
-#[ignore = "survey"]
-fn test_survey_dd() {
-    let code = run_system_binary("/bin/dd", &["/bin/dd", "if=/tmp/hello.txt", "of=/dev/null", "bs=1", "count=1"], "dd");
-    eprintln!("dd exited with code {code}");
+fn test_run_system_date() {
+    let code = run_system_binary("/bin/date", &["/bin/date", "+%Y"], "date");
+    assert_eq!(code, 0, "date exited with code {code}");
 }
 
+/// `/bin/expr 1 + 1` — evaluates arithmetic expression.
 #[test]
-#[ignore = "survey"]
-fn test_survey_chmod() {
-    let code = run_system_binary("/bin/chmod", &["/bin/chmod", "755", "/tmp/hello.txt"], "chmod");
-    eprintln!("chmod exited with code {code}");
+fn test_run_system_expr() {
+    let code = run_system_binary("/bin/expr", &["/bin/expr", "1", "+", "1"], "expr");
+    assert_eq!(code, 0, "expr exited with code {code}");
 }
 
+/// `/bin/sync` — flush filesystem buffers.
 #[test]
-#[ignore = "survey"]
-fn test_survey_rmdir() {
+fn test_run_system_sync() {
+    let code = run_system_binary("/bin/sync", &["/bin/sync"], "sync");
+    assert_eq!(code, 0, "sync exited with code {code}");
+}
+
+/// `/bin/test 1 -eq 1` — evaluate conditional expression.
+#[test]
+fn test_run_system_test_builtin() {
+    let code = run_system_binary("/bin/test", &["/bin/test", "1", "-eq", "1"], "test");
+    assert_eq!(code, 0, "test exited with code {code}");
+}
+
+/// `/bin/sleep 0` — sleep for zero seconds.
+#[test]
+fn test_run_system_sleep() {
+    let code = run_system_binary("/bin/sleep", &["/bin/sleep", "0"], "sleep");
+    assert_eq!(code, 0, "sleep exited with code {code}");
+}
+
+/// `/bin/kill -l` — list signal names.
+#[test]
+fn test_run_system_kill() {
+    let code = run_system_binary("/bin/kill", &["/bin/kill", "-l"], "kill");
+    assert_eq!(code, 0, "kill exited with code {code}");
+}
+
+/// `/usr/bin/tr a b < /dev/null` — transliterate characters (empty stdin).
+#[test]
+fn test_run_system_tr() {
+    let code = run_system_binary("/usr/bin/tr", &["/usr/bin/tr", "a", "b"], "tr");
+    assert_eq!(code, 0, "tr exited with code {code}");
+}
+
+/// `/usr/bin/od /dev/null` — octal dump of empty file.
+#[test]
+fn test_run_system_od() {
+    let code = run_system_binary("/usr/bin/od", &["/usr/bin/od", "/dev/null"], "od");
+    assert_eq!(code, 0, "od exited with code {code}");
+}
+
+/// `/usr/bin/nl /tmp/hello.txt` — number lines.
+#[test]
+fn test_run_system_nl() {
+    let code = run_system_binary("/usr/bin/nl", &["/usr/bin/nl", "/tmp/hello.txt"], "nl");
+    assert_eq!(code, 0, "nl exited with code {code}");
+}
+
+/// `/usr/bin/expand /tmp/hello.txt` — convert tabs to spaces.
+#[test]
+fn test_run_system_expand() {
+    let code = run_system_binary(
+        "/usr/bin/expand",
+        &["/usr/bin/expand", "/tmp/hello.txt"],
+        "expand",
+    );
+    assert_eq!(code, 0, "expand exited with code {code}");
+}
+
+/// `/usr/bin/unexpand /tmp/hello.txt` — convert spaces to tabs.
+#[test]
+fn test_run_system_unexpand() {
+    let code = run_system_binary(
+        "/usr/bin/unexpand",
+        &["/usr/bin/unexpand", "/tmp/hello.txt"],
+        "unexpand",
+    );
+    assert_eq!(code, 0, "unexpand exited with code {code}");
+}
+
+/// `/usr/bin/fold /tmp/hello.txt` — wrap each line to fit in specified width.
+#[test]
+fn test_run_system_fold() {
+    let code = run_system_binary(
+        "/usr/bin/fold",
+        &["/usr/bin/fold", "/tmp/hello.txt"],
+        "fold",
+    );
+    assert_eq!(code, 0, "fold exited with code {code}");
+}
+
+/// `/usr/bin/hexdump /dev/null` — hex dump of empty file.
+#[test]
+fn test_run_system_hexdump() {
+    let code = run_system_binary(
+        "/usr/bin/hexdump",
+        &["/usr/bin/hexdump", "/dev/null"],
+        "hexdump",
+    );
+    assert_eq!(code, 0, "hexdump exited with code {code}");
+}
+
+/// `/usr/bin/tty` — print terminal name; exits 1 when not a tty.
+#[test]
+fn test_run_system_tty() {
+    let code = run_system_binary("/usr/bin/tty", &["/usr/bin/tty"], "tty");
+    assert_eq!(code, 1, "tty should exit 1 (not a tty)");
+}
+
+/// `/usr/bin/groups` — print group memberships.
+#[test]
+fn test_run_system_groups() {
+    let code = run_system_binary("/usr/bin/groups", &["/usr/bin/groups"], "groups");
+    assert_eq!(code, 0, "groups exited with code {code}");
+}
+
+/// `/usr/bin/users` — print logged-in users.
+#[test]
+fn test_run_system_users() {
+    let code = run_system_binary("/usr/bin/users", &["/usr/bin/users"], "users");
+    assert_eq!(code, 0, "users exited with code {code}");
+}
+
+/// `/usr/bin/who` — print who is logged in.
+#[test]
+fn test_run_system_who() {
+    let code = run_system_binary("/usr/bin/who", &["/usr/bin/who"], "who");
+    assert_eq!(code, 0, "who exited with code {code}");
+}
+
+/// `/usr/bin/cal` — display a calendar.
+#[test]
+fn test_run_system_cal() {
+    let code = run_system_binary("/usr/bin/cal", &["/usr/bin/cal"], "cal");
+    assert_eq!(code, 0, "cal exited with code {code}");
+}
+
+/// `/usr/bin/getconf PAGE_SIZE` — query system configuration.
+#[test]
+fn test_run_system_getconf() {
+    let code = run_system_binary(
+        "/usr/bin/getconf",
+        &["/usr/bin/getconf", "PAGE_SIZE"],
+        "getconf",
+    );
+    assert_eq!(code, 0, "getconf exited with code {code}");
+}
+
+/// `/usr/bin/jot 3` — generate sequential data (1, 2, 3).
+#[test]
+fn test_run_system_jot() {
+    let code = run_system_binary("/usr/bin/jot", &["/usr/bin/jot", "3"], "jot");
+    assert_eq!(code, 0, "jot exited with code {code}");
+}
+
+/// `/usr/bin/look z /dev/null` — look up prefix in sorted file; exits 1 on no match.
+#[test]
+fn test_run_system_look() {
+    let code = run_system_binary(
+        "/usr/bin/look",
+        &["/usr/bin/look", "z", "/dev/null"],
+        "look",
+    );
+    assert_eq!(code, 1, "look should exit 1 (no match)");
+}
+
+/// `/bin/mkdir /tmp` — mkdir on existing dir exits 1 (not a crash).
+#[test]
+fn test_run_system_mkdir() {
+    let code = run_system_binary("/bin/mkdir", &["/bin/mkdir", "/tmp"], "mkdir");
+    assert_eq!(code, 1, "mkdir on existing dir should exit 1");
+}
+
+/// `/bin/rmdir /tmp` — rmdir on non-empty dir exits 1 (not a crash).
+#[test]
+fn test_run_system_rmdir() {
     let code = run_system_binary("/bin/rmdir", &["/bin/rmdir", "/tmp"], "rmdir");
-    eprintln!("rmdir exited with code {code}");
+    assert_eq!(code, 1, "rmdir on non-empty dir should exit 1");
+}
+
+// =====================================================================
+// Ignored tests — need additional shim support
+// =====================================================================
+
+/// `/bin/dd` — exits non-zero, needs investigation.
+#[test]
+#[ignore = "dd exits 1, needs investigation"]
+fn test_run_system_dd() {
+    let code = run_system_binary(
+        "/bin/dd",
+        &["/bin/dd", "if=/tmp/hello.txt", "of=/dev/null", "bs=1", "count=1"],
+        "dd",
+    );
+    assert_eq!(code, 0, "dd exited with code {code}");
+}
+
+/// `/bin/chmod` — exits 1, may need real FS support.
+#[test]
+#[ignore = "chmod exits 1, may need real FS passthrough for fchmodat"]
+fn test_run_system_chmod() {
+    let code = run_system_binary(
+        "/bin/chmod",
+        &["/bin/chmod", "755", "/tmp/hello.txt"],
+        "chmod",
+    );
+    assert_eq!(code, 0, "chmod exited with code {code}");
+}
+
+/// `/usr/bin/touch` — exits 1, may need utimensat support.
+#[test]
+#[ignore = "touch exits 1, may need utimensat support"]
+fn test_run_system_touch() {
+    let code = run_system_binary(
+        "/usr/bin/touch",
+        &["/usr/bin/touch", "/tmp/hello.txt"],
+        "touch",
+    );
+    assert_eq!(code, 0, "touch exited with code {code}");
+}
+
+/// `/usr/bin/du /tmp` — exits 1, may need directory traversal support.
+#[test]
+#[ignore = "du exits 1, may need directory traversal or stat improvements"]
+fn test_run_system_du() {
+    let code = run_system_binary("/usr/bin/du", &["/usr/bin/du", "/tmp"], "du");
+    assert_eq!(code, 0, "du exited with code {code}");
 }
