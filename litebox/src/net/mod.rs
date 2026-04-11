@@ -48,6 +48,50 @@ const MAX_PACKET_COUNT: usize = 32;
 /// TCP connection timeout.
 const TCP_CONNECT_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(75);
 
+/// Configuration for the guest network stack.
+///
+/// Controls the smoltcp interface address, gateway, and link-layer mode.
+pub struct NetworkConfig {
+    /// Hardware address: `HardwareAddress::Ip` for TUN/IPC, `Ethernet(mac)` for AF_PACKET.
+    pub hardware_addr: smoltcp::wire::HardwareAddress,
+    /// Guest IP address on the virtual interface.
+    pub ip_addr: Ipv4Addr,
+    /// Network prefix length (e.g. 24 for /24).
+    pub prefix_len: u8,
+    /// Default gateway IP.
+    pub gateway: Ipv4Addr,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            hardware_addr: smoltcp::wire::HardwareAddress::Ip,
+            ip_addr: INTERFACE_IP_ADDR,
+            prefix_len: 24,
+            gateway: GATEWAY_IP_ADDR,
+        }
+    }
+}
+
+impl NetworkConfig {
+    /// Create a config for Ethernet mode (AF_PACKET on a veth).
+    pub fn ethernet(
+        mac: [u8; 6],
+        ip: core::net::Ipv4Addr,
+        prefix_len: u8,
+        gateway: core::net::Ipv4Addr,
+    ) -> Self {
+        Self {
+            hardware_addr: smoltcp::wire::HardwareAddress::Ethernet(
+                smoltcp::wire::EthernetAddress(mac),
+            ),
+            ip_addr: ip,
+            prefix_len,
+            gateway,
+        }
+    }
+}
+
 /// The `Network` provides access to all networking related functionality provided by LiteBox.
 ///
 /// A LiteBox `Network` is parametric in the platform it runs on.
@@ -99,14 +143,22 @@ where
     /// and the created `Network` handle is expected to be shared across all usage over the
     /// system.
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
+        Self::with_config(litebox, NetworkConfig::default())
+    }
+
+    /// Construct a new `Network` with custom configuration.
+    pub fn with_config(litebox: &LiteBox<Platform>, config: NetworkConfig) -> Self {
         let mut device = phy::Device::new(litebox.x.platform);
-        let config = smoltcp::iface::Config::new(smoltcp::wire::HardwareAddress::Ip);
-        let mut interface =
-            smoltcp::iface::Interface::new(config, &mut device, smoltcp::time::Instant::ZERO);
+        let smoltcp_config = smoltcp::iface::Config::new(config.hardware_addr);
+        let mut interface = smoltcp::iface::Interface::new(
+            smoltcp_config,
+            &mut device,
+            smoltcp::time::Instant::ZERO,
+        );
         interface.update_ip_addrs(|ip_addrs| {
             match ip_addrs.push(smoltcp::wire::IpCidr::new(
-                smoltcp::wire::IpAddress::Ipv4(INTERFACE_IP_ADDR),
-                24,
+                smoltcp::wire::IpAddress::Ipv4(config.ip_addr),
+                config.prefix_len,
             )) {
                 Ok(()) => {}
                 Err(_) => unreachable!(),
@@ -114,7 +166,7 @@ where
         });
         match interface
             .routes_mut()
-            .add_default_ipv4_route(GATEWAY_IP_ADDR)
+            .add_default_ipv4_route(config.gateway)
         {
             Ok(None) => {}
             _ => unreachable!(),
