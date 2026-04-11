@@ -7,8 +7,8 @@ use alloc::ffi::CString;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
-use crate::{ConstPtr, ShimFS, Task};
-use litebox::platform::RawConstPointer as _;
+use crate::{ConstPtr, MutPtr, ShimFS, Task};
+use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox_common_macos::PtRegs;
 use litebox_common_macos::errno::Errno;
 
@@ -63,6 +63,44 @@ impl<FS: ShimFS> Task<FS> {
         0
     }
 
+    /// Handle `getgroups(gidsetsize, grouplist)` — return supplementary group IDs.
+    ///
+    /// Litebox runs as a single-user environment with gid=0. We report a
+    /// single supplementary group (gid 0) to match `sys_getgid()`.
+    pub(crate) fn sys_getgroups(
+        &self,
+        gidsetsize: i32,
+        grouplist: usize,
+    ) -> Result<usize, Errno> {
+        const NGROUPS: usize = 1;
+        let groups: [u32; NGROUPS] = [0]; // gid 0, matching sys_getgid()
+
+        if gidsetsize == 0 {
+            // Query mode: return the number of supplementary groups.
+            return Ok(NGROUPS);
+        }
+
+        if gidsetsize < 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        #[allow(clippy::cast_sign_loss)]
+        let size = gidsetsize as usize;
+        if size < NGROUPS {
+            return Err(Errno::EINVAL);
+        }
+
+        // Write group IDs to user buffer.
+        let dest: MutPtr<u32> = MutPtr::from_usize(grouplist);
+        for (i, &gid) in groups.iter().enumerate() {
+            #[allow(clippy::cast_possible_wrap)]
+            dest.write_at_offset(i as isize, gid)
+                .ok_or(Errno::EFAULT)?;
+        }
+
+        Ok(NGROUPS)
+    }
+
     /// Handle `issetugid()` — always returns 0 (not setuid/setgid).
     pub(crate) fn sys_issetugid(&self) -> i32 {
         0
@@ -71,7 +109,7 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle `getrlimit(resource, rlim)`.
     pub(crate) fn sys_getrlimit(&self, resource: u32, rlim_addr: usize) -> Result<usize, Errno> {
         use crate::MutPtr;
-        use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+        use litebox::platform::RawConstPointer as _;
         use litebox_common_macos::{Rlimit, RlimitResource};
 
         let res = RlimitResource::from_raw(resource).ok_or(Errno::EINVAL)?;

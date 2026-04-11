@@ -53,6 +53,9 @@ impl<FS: ShimFS> Task<FS> {
             MacosSyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),
             MacosSyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
             MacosSyscallRequest::Getegid => Ok(self.sys_getegid() as usize),
+            MacosSyscallRequest::Getgroups { gidsetsize, grouplist } => {
+                self.sys_getgroups(gidsetsize, grouplist)
+            }
             MacosSyscallRequest::Issetugid => {
                 #[allow(clippy::cast_sign_loss)] // issetugid returns 0 or 1
                 Ok(self.sys_issetugid() as usize)

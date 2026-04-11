@@ -28,6 +28,7 @@ pub mod nr {
     pub const MUNMAP: usize = 73;
     pub const MPROTECT: usize = 74;
     pub const MADVISE: usize = 75;
+    pub const GETGROUPS: usize = 79;
     pub const FCNTL: usize = 92;
     pub const PREAD: usize = 153;
     pub const PWRITE: usize = 154;
@@ -259,6 +260,10 @@ pub enum MacosSyscallRequest {
     Geteuid,
     Getgid,
     Getegid,
+    Getgroups {
+        gidsetsize: i32,
+        grouplist: usize,
+    },
     Issetugid,
     Mmap {
         addr: usize,
@@ -792,6 +797,10 @@ impl MacosSyscallRequest {
             nr::GETEUID => MacosSyscallRequest::Geteuid,
             nr::GETGID => MacosSyscallRequest::Getgid,
             nr::GETEGID => MacosSyscallRequest::Getegid,
+            nr::GETGROUPS => MacosSyscallRequest::Getgroups {
+                gidsetsize: a0 as i32,
+                grouplist: a1,
+            },
             nr::SIGACTION => MacosSyscallRequest::Sigaction {
                 signum: a0 as i32,
                 new_act: a1,
