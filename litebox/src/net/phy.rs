@@ -69,7 +69,7 @@ impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::Device for Device<Pl
 
     fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
         let mut caps = smoltcp::phy::DeviceCapabilities::default();
-        caps.medium = smoltcp::phy::Medium::Ip;
+        caps.medium = self.platform.medium();
         caps.max_transmission_unit = DEVICE_MTU;
         caps
     }
