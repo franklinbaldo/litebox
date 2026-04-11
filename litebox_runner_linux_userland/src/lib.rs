@@ -3272,4 +3272,22 @@ mod tests {
         assert!(host_signal_should_raise(segv));
         assert!(!host_signal_should_raise(stop));
     }
+
+    #[test]
+    fn guest_wait_status_to_exit_code_normal_exit() {
+        assert_eq!(guest_wait_status_to_exit_code(0), 0);
+        assert_eq!(guest_wait_status_to_exit_code(1), 1);
+        assert_eq!(guest_wait_status_to_exit_code(42), 42);
+        assert_eq!(guest_wait_status_to_exit_code(255), 255);
+    }
+
+    #[test]
+    fn guest_wait_status_to_exit_code_signal_death() {
+        // SIGKILL = 9, wait_status = 256 + 9 = 265, exit code = 128 + 9 = 137
+        assert_eq!(guest_wait_status_to_exit_code(256 + 9), 137);
+        // SIGTERM = 15, wait_status = 256 + 15 = 271, exit code = 128 + 15 = 143
+        assert_eq!(guest_wait_status_to_exit_code(256 + 15), 143);
+        // SIGSEGV = 11, wait_status = 256 + 11 = 267, exit code = 128 + 11 = 139
+        assert_eq!(guest_wait_status_to_exit_code(256 + 11), 139);
+    }
 }
