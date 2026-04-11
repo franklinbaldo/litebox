@@ -313,15 +313,13 @@ fn main() -> Result<()> {
                     .with_context(|| format!("failed to write pid file: {}", pid_file.display()))?;
             }
 
-            println!("{}", serde_json::to_string_pretty(&state)?);
             Ok(())
         }
 
         Command::Start { container_id } => {
             tracing::info!(container_id = %container_id, "starting container");
 
-            let state = lifecycle.start(&container_id)?;
-            println!("{}", serde_json::to_string_pretty(&state)?);
+            let _state = lifecycle.start(&container_id)?;
             Ok(())
         }
 
