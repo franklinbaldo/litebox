@@ -25,11 +25,11 @@ struct Cli {
     #[clap(long)]
     root: Option<PathBuf>,
 
-    /// Log file path (accepted for compatibility, logs to stderr)
+    /// Log file path (runtime logs are written here when provided)
     #[clap(long)]
     log: Option<PathBuf>,
 
-    /// Log format (accepted for compatibility)
+    /// Log format: "text" (default) or "json"
     #[clap(long, default_value = "text")]
     log_format: String,
 
@@ -267,8 +267,31 @@ fn parse_extra_env(env: &[String], env_file: Option<&PathBuf>) -> Result<Vec<Str
 }
 
 fn main() -> Result<()> {
-    // Only enable tracing if RUST_LOG is set
-    if std::env::var("RUST_LOG").is_ok() {
+    let cli = Cli::parse();
+
+    // Set up tracing: --log writes to file, RUST_LOG writes to stderr
+    if let Some(ref log_path) = cli.log {
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .with_context(|| format!("failed to open log file: {}", log_path.display()))?;
+        let filter = tracing_subscriber::EnvFilter::from_default_env()
+            .add_directive("tar_no_std=off".parse().unwrap())
+            .add_directive(tracing::Level::DEBUG.into());
+        if cli.log_format == "json" {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .json()
+                .with_writer(log_file)
+                .init();
+        } else {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(log_file)
+                .init();
+        }
+    } else if std::env::var("RUST_LOG").is_ok() {
         tracing_subscriber::fmt()
             .with_env_filter(
                 tracing_subscriber::EnvFilter::from_default_env()
@@ -276,8 +299,6 @@ fn main() -> Result<()> {
             )
             .init();
     }
-
-    let cli = Cli::parse();
     let root = cli.root.unwrap_or_else(|| {
         // Try XDG_RUNTIME_DIR first (works in rootless Podman and user sessions),
         // then /run for real root, then /tmp as last resort
