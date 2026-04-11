@@ -119,6 +119,18 @@ enum Command {
     /// List all containers
     List,
 
+    /// Pause a running container
+    Pause {
+        /// Container ID
+        container_id: String,
+    },
+
+    /// Resume a paused container
+    Resume {
+        /// Container ID
+        container_id: String,
+    },
+
     /// Display container events and statistics
     Events {
         /// Container ID
@@ -409,6 +421,16 @@ fn main() -> Result<()> {
                     );
                 }
             }
+            Ok(())
+        }
+
+        Command::Pause { container_id } => {
+            lifecycle.pause(&container_id)?;
+            Ok(())
+        }
+
+        Command::Resume { container_id } => {
+            lifecycle.resume(&container_id)?;
             Ok(())
         }
 

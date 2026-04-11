@@ -524,6 +524,16 @@ impl Lifecycle {
 
         let pid = state.pid.context("container has no PID")?;
 
+        // If the container is paused, resume it first so the signal can be
+        // delivered. SIGKILL works on stopped processes on Linux, but other
+        // signals would be queued until SIGCONT. CRI-O also expects this.
+        if state.status == Status::Paused {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid.cast_signed()),
+                nix::sys::signal::Signal::SIGCONT,
+            );
+        }
+
         let result = nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(pid.cast_signed()),
             nix::sys::signal::Signal::try_from(signal).ok(),
@@ -545,6 +555,70 @@ impl Lifecycle {
             });
         }
 
+        Ok(())
+    }
+
+    /// Pause a running container by sending SIGSTOP to its process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the container is not found, not running, or the
+    /// signal cannot be delivered.
+    pub fn pause(&self, id: &str) -> Result<()> {
+        let state = self.state_manager.refresh_state(id)?;
+
+        if state.status != Status::Running {
+            anyhow::bail!(
+                "cannot pause container {id}: status is {} (must be running)",
+                state.status
+            );
+        }
+
+        let pid = state.pid.context("container has no PID")?;
+
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid.cast_signed()),
+            nix::sys::signal::Signal::SIGSTOP,
+        )
+        .with_context(|| format!("failed to send SIGSTOP to process {pid}"))?;
+
+        self.state_manager.update(id, |s| {
+            s.status = Status::Paused;
+        })?;
+
+        tracing::info!(container_id = %id, pid, "container paused");
+        Ok(())
+    }
+
+    /// Resume a paused container by sending SIGCONT to its process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the container is not found, not paused, or the
+    /// signal cannot be delivered.
+    pub fn resume(&self, id: &str) -> Result<()> {
+        let state = self.state_manager.refresh_state(id)?;
+
+        if state.status != Status::Paused {
+            anyhow::bail!(
+                "cannot resume container {id}: status is {} (must be paused)",
+                state.status
+            );
+        }
+
+        let pid = state.pid.context("container has no PID")?;
+
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid.cast_signed()),
+            nix::sys::signal::Signal::SIGCONT,
+        )
+        .with_context(|| format!("failed to send SIGCONT to process {pid}"))?;
+
+        self.state_manager.update(id, |s| {
+            s.status = Status::Running;
+        })?;
+
+        tracing::info!(container_id = %id, pid, "container resumed");
         Ok(())
     }
 
@@ -574,6 +648,20 @@ impl Lifecycle {
             Status::Running if force => {
                 // Force kill
                 if let Some(pid) = state.pid {
+                    let _ = nix::sys::signal::kill(
+                        nix::unistd::Pid::from_raw(pid.cast_signed()),
+                        nix::sys::signal::Signal::SIGKILL,
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+            Status::Paused if force => {
+                // Resume then force kill
+                if let Some(pid) = state.pid {
+                    let _ = nix::sys::signal::kill(
+                        nix::unistd::Pid::from_raw(pid.cast_signed()),
+                        nix::sys::signal::Signal::SIGCONT,
+                    );
                     let _ = nix::sys::signal::kill(
                         nix::unistd::Pid::from_raw(pid.cast_signed()),
                         nix::sys::signal::Signal::SIGKILL,

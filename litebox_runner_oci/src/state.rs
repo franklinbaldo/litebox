@@ -19,6 +19,8 @@ pub enum Status {
     Created,
     /// Container is running
     Running,
+    /// Container is paused (SIGSTOP)
+    Paused,
     /// Container has exited
     Stopped,
 }
@@ -29,6 +31,7 @@ impl std::fmt::Display for Status {
             Status::Creating => write!(f, "creating"),
             Status::Created => write!(f, "created"),
             Status::Running => write!(f, "running"),
+            Status::Paused => write!(f, "paused"),
             Status::Stopped => write!(f, "stopped"),
         }
     }
@@ -201,7 +204,7 @@ impl StateManager {
     pub fn refresh_state(&self, id: &str) -> Result<ContainerState> {
         let mut state = self.load(id)?;
 
-        if state.status == Status::Running
+        if matches!(state.status, Status::Running | Status::Paused)
             && let Some(pid) = state.pid
             && !Self::is_process_alive(pid)
         {
@@ -254,6 +257,7 @@ mod tests {
         assert_eq!(Status::Creating.to_string(), "creating");
         assert_eq!(Status::Created.to_string(), "created");
         assert_eq!(Status::Running.to_string(), "running");
+        assert_eq!(Status::Paused.to_string(), "paused");
         assert_eq!(Status::Stopped.to_string(), "stopped");
     }
 
@@ -268,6 +272,10 @@ mod tests {
             serde_json::to_string(&Status::Running).unwrap(),
             "\"running\""
         );
+        assert_eq!(
+            serde_json::to_string(&Status::Paused).unwrap(),
+            "\"paused\""
+        );
 
         // Deserialize
         assert_eq!(
@@ -277,6 +285,10 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Status>("\"stopped\"").unwrap(),
             Status::Stopped
+        );
+        assert_eq!(
+            serde_json::from_str::<Status>("\"paused\"").unwrap(),
+            Status::Paused
         );
     }
 
