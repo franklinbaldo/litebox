@@ -469,6 +469,158 @@ impl<FS: ShimFS> Task<FS> {
         self.canonicalize_path(&abs).unwrap_or(abs)
     }
 
+    /// Generate synthetic content for common `/proc` files that tools like
+    /// `free`, `top`, `ps`, and `lscpu` depend on. Returns `None` when the
+    /// path is not a recognised synthetic proc entry.
+    fn synthetic_proc_content(&self, path: &str) -> Option<alloc::string::String> {
+        // Normalise `/proc/<pid>/…` to `/proc/self/…` when `<pid>` matches us.
+        let normalised: alloc::borrow::Cow<'_, str> = {
+            let prefix = alloc::format!("/proc/{}/", self.pid);
+            if path.starts_with(prefix.as_str()) {
+                alloc::borrow::Cow::Owned(alloc::format!(
+                    "/proc/self/{}",
+                    &path[prefix.len()..]
+                ))
+            } else {
+                alloc::borrow::Cow::Borrowed(path)
+            }
+        };
+        let path = normalised.as_ref();
+
+        match path {
+            "/proc/meminfo" => Some(self.proc_meminfo_contents()),
+            "/proc/stat" => Some(self.proc_stat_contents()),
+            "/proc/uptime" => Some(self.proc_uptime_contents()),
+            "/proc/cpuinfo" => Some(self.proc_cpuinfo_contents()),
+            "/proc/self/status" => Some(self.proc_self_status_contents()),
+            "/proc/self/stat" => Some(self.proc_self_stat_contents()),
+            _ => None,
+        }
+    }
+
+    /// Generate `/proc/meminfo` content from `sys_sysinfo()` values.
+    fn proc_meminfo_contents(&self) -> alloc::string::String {
+        let info = self.sys_sysinfo();
+        let unit = info.mem_unit as u64;
+        let total_kb = (info.totalram as u64 * unit) / 1024;
+        let free_kb = (info.freeram as u64 * unit) / 1024;
+        let swap_total_kb = (info.totalswap as u64 * unit) / 1024;
+        let swap_free_kb = (info.freeswap as u64 * unit) / 1024;
+        alloc::format!(
+            "MemTotal:       {total_kb:>8} kB\n\
+             MemFree:        {free_kb:>8} kB\n\
+             MemAvailable:   {free_kb:>8} kB\n\
+             Buffers:               0 kB\n\
+             Cached:                0 kB\n\
+             SwapCached:            0 kB\n\
+             SwapTotal:      {swap_total_kb:>8} kB\n\
+             SwapFree:       {swap_free_kb:>8} kB\n"
+        )
+    }
+
+    /// Generate `/proc/stat` content.
+    fn proc_stat_contents(&self) -> alloc::string::String {
+        use litebox::platform::{Instant as _, SystemTime as _, TimeProvider as _};
+        let now = self.global.platform.now();
+        let uptime_secs = now.duration_since(&self.global.boot_time).as_secs();
+        let real_time = self.global.platform.current_time();
+        let unix_epoch =
+            <litebox_platform_multiplex::Platform as litebox::platform::TimeProvider>::SystemTime::UNIX_EPOCH;
+        let epoch_secs = real_time
+            .duration_since(&unix_epoch)
+            .unwrap_or(core::time::Duration::ZERO)
+            .as_secs();
+        let btime = epoch_secs.saturating_sub(uptime_secs);
+        let procs_running = self.process().nr_threads();
+        alloc::format!(
+            "cpu  0 0 0 0 0 0 0 0 0 0\n\
+             cpu0 0 0 0 0 0 0 0 0 0 0\n\
+             intr 0\n\
+             ctxt 0\n\
+             btime {btime}\n\
+             processes 1\n\
+             procs_running {procs_running}\n\
+             procs_blocked 0\n"
+        )
+    }
+
+    /// Generate `/proc/uptime` content.
+    fn proc_uptime_contents(&self) -> alloc::string::String {
+        use litebox::platform::{Instant as _, TimeProvider as _};
+        let now = self.global.platform.now();
+        let uptime = now.duration_since(&self.global.boot_time);
+        let secs = uptime.as_secs();
+        let centis = uptime.subsec_millis() / 10;
+        alloc::format!("{secs}.{centis:02} 0.00\n")
+    }
+
+    /// Generate `/proc/cpuinfo` content (single virtual CPU).
+    fn proc_cpuinfo_contents(&self) -> alloc::string::String {
+        alloc::string::String::from(
+            "processor\t: 0\n\
+             vendor_id\t: GenuineIntel\n\
+             model name\t: Virtual CPU\n\
+             cpu MHz\t\t: 2400.000\n\
+             cache size\t: 4096 KB\n\
+             physical id\t: 0\n\
+             siblings\t: 1\n\
+             core id\t\t: 0\n\
+             cpu cores\t: 1\n\
+             bogomips\t: 4800.00\n\n",
+        )
+    }
+
+    /// Generate `/proc/self/status` content.
+    fn proc_self_status_contents(&self) -> alloc::string::String {
+        let comm = self.task_comm_preview();
+        let pid = self.pid;
+        let ppid = self.ppid;
+        let uid = self.credentials.uid;
+        let gid = self.credentials.gid;
+        let threads = self.process().nr_threads();
+        alloc::format!(
+            "Name:\t{comm}\n\
+             Umask:\t0022\n\
+             State:\tR (running)\n\
+             Tgid:\t{pid}\n\
+             Ngid:\t0\n\
+             Pid:\t{pid}\n\
+             PPid:\t{ppid}\n\
+             TracerPid:\t0\n\
+             Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n\
+             Gid:\t{gid}\t{gid}\t{gid}\t{gid}\n\
+             FDSize:\t256\n\
+             VmPeak:\t0 kB\n\
+             VmSize:\t0 kB\n\
+             VmRSS:\t0 kB\n\
+             Threads:\t{threads}\n\
+             voluntary_ctxt_switches:\t0\n\
+             nonvoluntary_ctxt_switches:\t0\n"
+        )
+    }
+
+    /// Generate `/proc/self/stat` content (single line, 52 fields).
+    fn proc_self_stat_contents(&self) -> alloc::string::String {
+        let comm = self.task_comm_preview();
+        let pid = self.pid;
+        let ppid = self.ppid;
+        let pgid = self
+            .sys_getpgid(0)
+            .unwrap_or(pid.cast_unsigned());
+        let sid = self
+            .sys_getsid(0)
+            .unwrap_or(pid.cast_unsigned());
+        let threads = self.process().nr_threads();
+        //  1 (pid) 2 (comm) 3 state 4 ppid 5 pgid 6 sid 7 tty 8 tpgid
+        //  9 flags 10 minflt 11 cminflt 12 majflt 13 cmajflt
+        // 14 utime 15 stime 16 cutime 17 cstime 18 priority 19 nice
+        // 20 threads 21 itrealvalue 22 starttime 23 vsize 24 rss
+        // 25 rsslim 26..52 (zeros)
+        alloc::format!(
+            "{pid} ({comm}) R {ppid} {pgid} {sid} 0 -1 0 0 0 0 0 0 0 0 0 20 0 {threads} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
+        )
+    }
+
     fn proc_self_maps_contents(&self) -> alloc::string::String {
         let ps = self.process_state.borrow();
         let mappings = ps.pm.mappings();
@@ -679,6 +831,12 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `open`
     pub fn sys_open(&self, path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
         let path = self.resolve_path(path)?;
+        // Intercept synthetic /proc files before falling through to the real FS.
+        if let Some(path_str) = path.to_str().ok() {
+            if let Some(content) = self.synthetic_proc_content(path_str) {
+                return self.open_synthetic_proc_text(flags, content);
+            }
+        }
         if path.to_str().ok() == Some("/proc/self/maps") {
             return self.open_synthetic_proc_text(flags, self.proc_self_maps_contents());
         }
