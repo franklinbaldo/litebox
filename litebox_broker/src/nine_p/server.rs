@@ -2099,7 +2099,8 @@ fn canonicalize_in_root(root: &Path, path: &Path) -> std::io::Result<PathBuf> {
     };
 
     let mut resolved = root.to_path_buf();
-    let mut remaining: Vec<std::ffi::OsString> = suffix.components()
+    let mut remaining: Vec<std::ffi::OsString> = suffix
+        .components()
         .map(|c| c.as_os_str().to_owned())
         .collect();
     // Process components front-to-back by reversing so we can pop from the end.

@@ -1097,9 +1097,8 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 };
 
                 let bind_ip = core::net::Ipv4Addr::from(ls.bind_addr);
-                let bind_addr = core::net::SocketAddr::V4(
-                    core::net::SocketAddrV4::new(bind_ip, ls.port),
-                );
+                let bind_addr =
+                    core::net::SocketAddr::V4(core::net::SocketAddrV4::new(bind_ip, ls.port));
 
                 // Create, bind, and listen on a new TCP socket.
                 let socket_fd = {

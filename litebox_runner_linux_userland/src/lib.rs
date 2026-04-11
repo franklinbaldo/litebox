@@ -510,10 +510,17 @@ pub fn run(mut cli_args: CliArgs) -> Result<i32> {
     litebox_platform_linux_userland::forker::set_worker_callback(run_forked_worker);
 
     // Pre-open /dev/null for the forker to use for stdio wiring.
-    let dev_null_fd = unsafe { libc::open(b"/dev/null\0".as_ptr().cast(), libc::O_RDWR | libc::O_CLOEXEC) };
+    let dev_null_fd = unsafe {
+        libc::open(
+            b"/dev/null\0".as_ptr().cast(),
+            libc::O_RDWR | libc::O_CLOEXEC,
+        )
+    };
     if dev_null_fd >= 0 {
         if let Err(e) = platform.spawn_forker(dev_null_fd) {
-            eprintln!("warning: failed to spawn forker: {e}; fork-restore and worker-exec will fail");
+            eprintln!(
+                "warning: failed to spawn forker: {e}; fork-restore and worker-exec will fail"
+            );
         }
     }
 
@@ -625,7 +632,8 @@ fn build_initial_fs(
     // at the syscall level in litebox_shim_linux/src/syscalls/file.rs.
     if cli_args.proc_mount {
         in_mem.with_root_privileges(|fs| {
-            let proc_mode = Mode::RUSR | Mode::XUSR | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH;
+            let proc_mode =
+                Mode::RUSR | Mode::XUSR | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH;
             let _ = fs.mkdir("/proc", proc_mode);
             let _ = fs.mkdir("/proc/self", proc_mode);
         });
@@ -711,8 +719,7 @@ fn finish_run<FS: litebox_shim_linux::ShimFS>(
 
         let program = shim.load_program_with_exec_filename(
             initial_file_system,
-            task_override_from_cli_args(cli_args, platform)
-                .unwrap_or_else(|| platform.init_task()),
+            task_override_from_cli_args(cli_args, platform).unwrap_or_else(|| platform.init_task()),
             load_prog_path,
             exec_prog_path,
             argv,
@@ -720,7 +727,9 @@ fn finish_run<FS: litebox_shim_linux::ShimFS>(
             cli_args.working_directory.clone(),
         )?;
 
-        Ok(guest_wait_status_to_exit_code(run_program(program, shutdown, net_worker, None, None)))
+        Ok(guest_wait_status_to_exit_code(run_program(
+            program, shutdown, net_worker, None, None,
+        )))
     }
 }
 
@@ -812,7 +821,13 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
             cli_args.working_directory.clone(),
         )?;
 
-        return Ok(guest_wait_status_to_exit_code(run_program(program, shutdown, net_worker, worker_result_fd, None)));
+        return Ok(guest_wait_status_to_exit_code(run_program(
+            program,
+            shutdown,
+            net_worker,
+            worker_result_fd,
+            None,
+        )));
     }
 
     // TUN mode: connect via TCP through the guest's smoltcp network stack.
@@ -882,7 +897,13 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         cli_args.working_directory.clone(),
     )?;
 
-    Ok(guest_wait_status_to_exit_code(run_program(program, shutdown, net_worker, worker_result_fd, None)))
+    Ok(guest_wait_status_to_exit_code(run_program(
+        program,
+        shutdown,
+        net_worker,
+        worker_result_fd,
+        None,
+    )))
 }
 
 /// Build a [`TaskParams`] override from CliArgs guest UID/GID fields, if any are set.
@@ -903,9 +924,13 @@ fn task_override_from_cli_args(
         pid: host.pid,
         ppid: host.ppid,
         uid: cli_args.guest_uid.unwrap_or(host.uid),
-        euid: cli_args.guest_euid.unwrap_or(cli_args.guest_uid.unwrap_or(host.euid)),
+        euid: cli_args
+            .guest_euid
+            .unwrap_or(cli_args.guest_uid.unwrap_or(host.euid)),
         gid: cli_args.guest_gid.unwrap_or(host.gid),
-        egid: cli_args.guest_egid.unwrap_or(cli_args.guest_gid.unwrap_or(host.egid)),
+        egid: cli_args
+            .guest_egid
+            .unwrap_or(cli_args.guest_gid.unwrap_or(host.egid)),
     })
 }
 
@@ -1902,8 +1927,13 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<i32> {
         ),
     };
 
-    run_worker_exec_core(cli_args, transferred_exec_image, transferred_interp_image, false)
-        .map(guest_wait_status_to_exit_code)
+    run_worker_exec_core(
+        cli_args,
+        transferred_exec_image,
+        transferred_interp_image,
+        false,
+    )
+    .map(guest_wait_status_to_exit_code)
 }
 
 /// Shared core logic for running a non-PIE worker-exec.
@@ -1927,7 +1957,10 @@ fn run_worker_exec_core(
     // forker memfd), use the guest binary path directly — the image is already
     // available and will be injected into the in-mem FS. Otherwise, resolve
     // through the host filesystem.
-    let guest_load_path = if transferred_exec_image.is_some() || cli_args.worker_exec_fd.is_some() || cli_args.program_from_tar {
+    let guest_load_path = if transferred_exec_image.is_some()
+        || cli_args.worker_exec_fd.is_some()
+        || cli_args.program_from_tar
+    {
         if Path::new(&load_path).is_absolute() {
             PathBuf::from(&load_path)
         } else if let Some(cwd) = cli_args.working_directory.as_deref() {
@@ -1963,7 +1996,9 @@ fn run_worker_exec_core(
         //
         // SAFETY: We are in a freshly-forked single-threaded child process.
         // No other thread reads the platform concurrently.
-        unsafe { litebox_platform_multiplex::replace_platform(platform); }
+        unsafe {
+            litebox_platform_multiplex::replace_platform(platform);
+        }
     } else {
         litebox_platform_multiplex::set_platform(platform);
     }
@@ -2771,32 +2806,44 @@ fn run_forked_worker_exec(
     //    for the params memfd in WorkerExec requests).
     let params_fd = get_fd(req.snapshot_fd_idx).unwrap_or(-1);
     if params_fd < 0 {
-        unsafe { libc::_exit(1); }
+        unsafe {
+            libc::_exit(1);
+        }
     }
     let params_data = match read_fork_snapshot_from_fd(params_fd) {
         Ok(data) => data,
-        Err(_) => unsafe { libc::_exit(1); },
+        Err(_) => unsafe {
+            libc::_exit(1);
+        },
     };
     let params = match WorkerExecParams::deserialize(&params_data) {
         Ok(p) => p,
-        Err(_) => unsafe { libc::_exit(1); },
+        Err(_) => unsafe {
+            libc::_exit(1);
+        },
     };
 
     // 2. Read exec image from memfd.
     let exec_image_fd = get_fd(req.exec_image_fd_idx).unwrap_or(-1);
     if exec_image_fd < 0 {
-        unsafe { libc::_exit(1); }
+        unsafe {
+            libc::_exit(1);
+        }
     }
     let exec_image = match read_worker_exec_image(exec_image_fd) {
         Ok(data) => data,
-        Err(_) => unsafe { libc::_exit(1); },
+        Err(_) => unsafe {
+            libc::_exit(1);
+        },
     };
 
     // 3. Read interp image if present.
     let interp_image = if let Some(interp_fd) = get_fd(req.interp_image_fd_idx) {
         match read_worker_exec_image(interp_fd) {
             Ok(data) => Some(data),
-            Err(_) => unsafe { libc::_exit(1); },
+            Err(_) => unsafe {
+                libc::_exit(1);
+            },
         }
     } else {
         None
@@ -2828,23 +2875,27 @@ fn run_forked_worker_exec(
             matches!(b, litebox_platform_linux_userland::forker::StdioBinding::FromFdIndex(idx) if *idx == i_u8)
         });
         if is_stdio_source {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
             continue;
         }
         // Close any remaining unneeded fds.
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
     }
 
     // 6. Build CliArgs from params and run worker exec logic.
     let interp_path = params.interp_path.clone();
     let cli_args = build_cli_args_from_exec_params(&params, result_fd);
-    let transferred_interp_image = interp_image.map(|data| {
-        (interp_path.unwrap_or_default(), data)
-    });
+    let transferred_interp_image = interp_image.map(|data| (interp_path.unwrap_or_default(), data));
 
     match run_worker_exec_core(cli_args, Some(exec_image), transferred_interp_image, true) {
         Ok(wait_status) => terminate_host_with_guest_wait_status(wait_status),
-        Err(_) => unsafe { libc::_exit(1); },
+        Err(_) => unsafe {
+            libc::_exit(1);
+        },
     }
 }
 
@@ -2872,260 +2923,280 @@ fn run_forked_worker(
             run_forked_worker_exec(req, raw_fds);
         }
         litebox_platform_linux_userland::forker::ForkRequestKind::ForkRestore => {
-
-    // Helper to get a raw fd from the array by index (0xFF = not present).
-    let get_fd = |idx: u8| -> Option<i32> {
-        if idx == 0xFF {
-            return None;
-        }
-        let i = idx as usize;
-        if i < raw_fds.len() {
-            Some(raw_fds[i])
-        } else {
-            None
-        }
-    };
-
-    // Extract key fds.
-    let snapshot_fd = get_fd(req.snapshot_fd_idx).unwrap_or(-1);
-    let ack_fd = get_fd(req.ack_fd_idx).unwrap_or(-1);
-    let result_fd = get_fd(req.result_fd_idx);
-    let mux_fd = get_fd(req.mux_fd_idx);
-
-    if snapshot_fd < 0 || ack_fd < 0 {
-        // Close all raw fds before exiting.
-        for &fd in &raw_fds {
-            unsafe { libc::close(fd); }
-        }
-        unsafe { libc::_exit(1); }
-    }
-
-    // Mark key fds as close-on-exec.
-    for fd in [Some(snapshot_fd), Some(ack_fd), result_fd]
-        .into_iter()
-        .flatten()
-    {
-        let _ = set_fd_cloexec(fd);
-    }
-
-    // Read and deserialize the snapshot from the memfd.
-    let snapshot_data = match read_fork_snapshot_from_fd(snapshot_fd) {
-        Ok(data) => data,
-        Err(_) => {
-            for &fd in &raw_fds {
-                unsafe { libc::close(fd); }
-            }
-            unsafe { libc::_exit(1); }
-        }
-    };
-    // snapshot_fd is now closed (read_fork_snapshot_from_fd takes ownership via from_raw_fd).
-
-    let snapshot = match litebox_shim_linux::syscalls::fork_snapshot::ForkSnapshot::deserialize(
-        &snapshot_data,
-    ) {
-        Ok(s) => s,
-        Err(_) => {
-            for &fd in &raw_fds {
-                unsafe { libc::close(fd); }
-            }
-            unsafe { libc::_exit(1); }
-        }
-    };
-
-    // Build filesystem: shim builder, in-mem with /tmp, tar_ro from inherited data.
-    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
-    let litebox_ref = shim_builder.litebox();
-
-    let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox_ref);
-    in_mem.with_root_privileges(|fs| {
-        let mode = litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO;
-        let _ = fs.mkdir("/tmp", mode);
-    });
-
-    let tar_data: &'static [u8] = INHERITED_TAR_DATA
-        .get()
-        .copied()
-        .unwrap_or(litebox::fs::tar_ro::EMPTY_TAR_FILE);
-    let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox_ref, tar_data.into());
-    let default_fs = litebox_shim_linux::default_fs(litebox_ref, in_mem, tar_ro);
-
-    // Build pipe_bridges from request.
-    let pipe_bridges: Vec<PipeBridgeSpec> = req
-        .pipe_bridges
-        .iter()
-        .map(|&(guest_fd, host_fd_idx, is_read)| {
-            let host_fd = if (host_fd_idx as usize) < raw_fds.len() {
-                raw_fds[host_fd_idx as usize]
-            } else {
-                -1
-            };
-            PipeBridgeSpec {
-                guest_fd,
-                host_fd,
-                is_read,
-            }
-        })
-        .collect();
-
-    // Build mux_streams from request.
-    let mux_streams: Vec<MuxStreamSpec> = req
-        .mux_streams
-        .iter()
-        .map(
-            |&(stream_id, guest_fd, direction, stream_type, initial_eof)| MuxStreamSpec {
-                stream_id,
-                guest_fd,
-                direction,
-                stream_type,
-                initial_eof,
-            },
-        )
-        .collect();
-
-    // Build local_pipes from request — read drain data from memfds.
-    let local_pipes: Vec<LocalPipeSpec> = req
-        .local_pipes
-        .iter()
-        .map(|&(write_fd, read_fd, drain_fd_idx, w_flags, r_flags)| {
-            let drained = if drain_fd_idx == 0xFF {
-                Vec::new()
-            } else {
-                let drain_fd = if (drain_fd_idx as usize) < raw_fds.len() {
-                    raw_fds[drain_fd_idx as usize]
+            // Helper to get a raw fd from the array by index (0xFF = not present).
+            let get_fd = |idx: u8| -> Option<i32> {
+                if idx == 0xFF {
+                    return None;
+                }
+                let i = idx as usize;
+                if i < raw_fds.len() {
+                    Some(raw_fds[i])
                 } else {
-                    -1
-                };
-                if drain_fd >= 0 {
-                    use std::io::Read;
-                    // Takes ownership of drain_fd (will close on drop).
-                    let mut f = unsafe { std::fs::File::from_raw_fd(drain_fd) };
-                    let mut data = Vec::new();
-                    let _ = f.read_to_end(&mut data);
-                    data
-                } else {
-                    Vec::new()
+                    None
                 }
             };
-            (write_fd, read_fd, drained, w_flags, r_flags)
-        })
-        .collect();
 
-    // Close fds from the SCM_RIGHTS array that we don't need anymore.
-    // The ones still in use: ack_fd, result_fd, mux_fd, pipe_bridge fds, drain fds (already closed).
-    // Stdio fds were wired in worker_entry already. Snapshot fd was closed by read_fork_snapshot_from_fd.
-    // We should NOT close: ack_fd, result_fd, mux_fd, pipe_bridge host fds.
-    // We SHOULD close: snapshot_fd (already closed), stdio source fds (already duped by worker_entry),
-    //                   ack_write_fd (wait - ack_fd IS the write fd).
-    // Actually, let's just close the stdio-related fds that were already duped by worker_entry.
-    for (i, &fd) in raw_fds.iter().enumerate() {
-        let i_u8 = i as u8;
-        // Skip fds that are still in use.
-        if i_u8 == req.snapshot_fd_idx {
-            continue; // Already closed by read_fork_snapshot_from_fd.
-        }
-        if i_u8 == req.ack_fd_idx || i_u8 == req.result_fd_idx || i_u8 == req.mux_fd_idx {
-            continue; // Still needed.
-        }
-        // Check if it's a pipe_bridge fd.
-        if req.pipe_bridges.iter().any(|&(_, idx, _)| idx == i_u8) {
-            continue; // Still needed.
-        }
-        // Check if it's a drain fd (already closed by from_raw_fd above).
-        if req.local_pipes.iter().any(|&(_, _, idx, _, _)| idx == i_u8) {
-            continue; // Already closed.
-        }
-        // Check if it's a stdio source fd (already duped by worker_entry's dup2).
-        let is_stdio_source = req.stdio.iter().any(|b| {
+            // Extract key fds.
+            let snapshot_fd = get_fd(req.snapshot_fd_idx).unwrap_or(-1);
+            let ack_fd = get_fd(req.ack_fd_idx).unwrap_or(-1);
+            let result_fd = get_fd(req.result_fd_idx);
+            let mux_fd = get_fd(req.mux_fd_idx);
+
+            if snapshot_fd < 0 || ack_fd < 0 {
+                // Close all raw fds before exiting.
+                for &fd in &raw_fds {
+                    unsafe {
+                        libc::close(fd);
+                    }
+                }
+                unsafe {
+                    libc::_exit(1);
+                }
+            }
+
+            // Mark key fds as close-on-exec.
+            for fd in [Some(snapshot_fd), Some(ack_fd), result_fd]
+                .into_iter()
+                .flatten()
+            {
+                let _ = set_fd_cloexec(fd);
+            }
+
+            // Read and deserialize the snapshot from the memfd.
+            let snapshot_data = match read_fork_snapshot_from_fd(snapshot_fd) {
+                Ok(data) => data,
+                Err(_) => {
+                    for &fd in &raw_fds {
+                        unsafe {
+                            libc::close(fd);
+                        }
+                    }
+                    unsafe {
+                        libc::_exit(1);
+                    }
+                }
+            };
+            // snapshot_fd is now closed (read_fork_snapshot_from_fd takes ownership via from_raw_fd).
+
+            let snapshot =
+                match litebox_shim_linux::syscalls::fork_snapshot::ForkSnapshot::deserialize(
+                    &snapshot_data,
+                ) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        for &fd in &raw_fds {
+                            unsafe {
+                                libc::close(fd);
+                            }
+                        }
+                        unsafe {
+                            libc::_exit(1);
+                        }
+                    }
+                };
+
+            // Build filesystem: shim builder, in-mem with /tmp, tar_ro from inherited data.
+            let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
+            let litebox_ref = shim_builder.litebox();
+
+            let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox_ref);
+            in_mem.with_root_privileges(|fs| {
+                let mode =
+                    litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO;
+                let _ = fs.mkdir("/tmp", mode);
+            });
+
+            let tar_data: &'static [u8] = INHERITED_TAR_DATA
+                .get()
+                .copied()
+                .unwrap_or(litebox::fs::tar_ro::EMPTY_TAR_FILE);
+            let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox_ref, tar_data.into());
+            let default_fs = litebox_shim_linux::default_fs(litebox_ref, in_mem, tar_ro);
+
+            // Build pipe_bridges from request.
+            let pipe_bridges: Vec<PipeBridgeSpec> = req
+                .pipe_bridges
+                .iter()
+                .map(|&(guest_fd, host_fd_idx, is_read)| {
+                    let host_fd = if (host_fd_idx as usize) < raw_fds.len() {
+                        raw_fds[host_fd_idx as usize]
+                    } else {
+                        -1
+                    };
+                    PipeBridgeSpec {
+                        guest_fd,
+                        host_fd,
+                        is_read,
+                    }
+                })
+                .collect();
+
+            // Build mux_streams from request.
+            let mux_streams: Vec<MuxStreamSpec> = req
+                .mux_streams
+                .iter()
+                .map(
+                    |&(stream_id, guest_fd, direction, stream_type, initial_eof)| MuxStreamSpec {
+                        stream_id,
+                        guest_fd,
+                        direction,
+                        stream_type,
+                        initial_eof,
+                    },
+                )
+                .collect();
+
+            // Build local_pipes from request — read drain data from memfds.
+            let local_pipes: Vec<LocalPipeSpec> = req
+                .local_pipes
+                .iter()
+                .map(|&(write_fd, read_fd, drain_fd_idx, w_flags, r_flags)| {
+                    let drained = if drain_fd_idx == 0xFF {
+                        Vec::new()
+                    } else {
+                        let drain_fd = if (drain_fd_idx as usize) < raw_fds.len() {
+                            raw_fds[drain_fd_idx as usize]
+                        } else {
+                            -1
+                        };
+                        if drain_fd >= 0 {
+                            use std::io::Read;
+                            // Takes ownership of drain_fd (will close on drop).
+                            let mut f = unsafe { std::fs::File::from_raw_fd(drain_fd) };
+                            let mut data = Vec::new();
+                            let _ = f.read_to_end(&mut data);
+                            data
+                        } else {
+                            Vec::new()
+                        }
+                    };
+                    (write_fd, read_fd, drained, w_flags, r_flags)
+                })
+                .collect();
+
+            // Close fds from the SCM_RIGHTS array that we don't need anymore.
+            // The ones still in use: ack_fd, result_fd, mux_fd, pipe_bridge fds, drain fds (already closed).
+            // Stdio fds were wired in worker_entry already. Snapshot fd was closed by read_fork_snapshot_from_fd.
+            // We should NOT close: ack_fd, result_fd, mux_fd, pipe_bridge host fds.
+            // We SHOULD close: snapshot_fd (already closed), stdio source fds (already duped by worker_entry),
+            //                   ack_write_fd (wait - ack_fd IS the write fd).
+            // Actually, let's just close the stdio-related fds that were already duped by worker_entry.
+            for (i, &fd) in raw_fds.iter().enumerate() {
+                let i_u8 = i as u8;
+                // Skip fds that are still in use.
+                if i_u8 == req.snapshot_fd_idx {
+                    continue; // Already closed by read_fork_snapshot_from_fd.
+                }
+                if i_u8 == req.ack_fd_idx || i_u8 == req.result_fd_idx || i_u8 == req.mux_fd_idx {
+                    continue; // Still needed.
+                }
+                // Check if it's a pipe_bridge fd.
+                if req.pipe_bridges.iter().any(|&(_, idx, _)| idx == i_u8) {
+                    continue; // Still needed.
+                }
+                // Check if it's a drain fd (already closed by from_raw_fd above).
+                if req.local_pipes.iter().any(|&(_, _, idx, _, _)| idx == i_u8) {
+                    continue; // Already closed.
+                }
+                // Check if it's a stdio source fd (already duped by worker_entry's dup2).
+                let is_stdio_source = req.stdio.iter().any(|b| {
             matches!(b, litebox_platform_linux_userland::forker::StdioBinding::FromFdIndex(idx) if *idx == i_u8)
         });
-        if is_stdio_source {
-            // Close the source fd since it was already dup2'd onto the target fd.
-            unsafe { libc::close(fd); }
-            continue;
-        }
-        // Close any remaining unneeded fds.
-        unsafe { libc::close(fd); }
-    }
-
-    // Call fork_restore_and_ack, then run_program.
-    // When a 9P broker is available, layer 9P on top of the default FS.
-    if let Some(broker_addr) = INHERITED_NINE_P_BROKER.get() {
-        let (ring_writer, ring_reader) = match connect_nine_p_channel(broker_addr) {
-            Ok(pair) => pair,
-            Err(_) => unsafe { libc::_exit(1) },
-        };
-
-        let shim = shim_builder.build();
-        let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
-        let net_worker = start_network_worker(&shim, &shutdown);
-
-        let writer = ShmemTransportWriter(ring_writer);
-        let reader = ShmemTransportReader(ring_reader);
-        let litebox2 = shim.litebox();
-        let msize = 4 * 1024 * 1024u32;
-        let (nine_p_fs, mut nine_p_reader) =
-            match litebox::fs::nine_p::FileSystem::new(litebox2, writer, reader, msize, "root", "/") {
-                Ok(pair) => pair,
-                Err(_) => unsafe { libc::_exit(1) },
-            };
-        let worker_handle = nine_p_fs.worker_handle();
-        let _nine_p_worker = litebox_platform_linux_userland::spawn_host_thread(move || {
-            let mut buf = alloc::vec::Vec::with_capacity(msize as usize);
-            while worker_handle.poll_responses(&mut nine_p_reader, &mut buf) {}
-        });
-
-        let combined = litebox::fs::layered::FileSystem::new(
-            litebox2,
-            default_fs,
-            nine_p_fs,
-            litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
-        );
-        let combined_fs = std::sync::Arc::new(combined);
-
-        match fork_restore_and_ack(
-            &shim,
-            snapshot,
-            combined_fs,
-            ack_fd,
-            &pipe_bridges,
-            mux_fd,
-            &mux_streams,
-            &local_pipes,
-        ) {
-            Ok((program, mux_handle)) => {
-                let wait_status = run_program(program, shutdown, net_worker, result_fd, mux_handle);
-                terminate_host_with_guest_wait_status(wait_status);
+                if is_stdio_source {
+                    // Close the source fd since it was already dup2'd onto the target fd.
+                    unsafe {
+                        libc::close(fd);
+                    }
+                    continue;
+                }
+                // Close any remaining unneeded fds.
+                unsafe {
+                    libc::close(fd);
+                }
             }
-            Err(_) => {
-                unsafe { libc::_exit(1); }
-            }
-        }
-    } else {
-        let initial_file_system = std::sync::Arc::new(default_fs);
-        let shim = shim_builder.build();
-        let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
-        let net_worker = start_network_worker(&shim, &shutdown);
 
-        match fork_restore_and_ack(
-            &shim,
-            snapshot,
-            initial_file_system,
-            ack_fd,
-            &pipe_bridges,
-            mux_fd,
-            &mux_streams,
-            &local_pipes,
-        ) {
-            Ok((program, mux_handle)) => {
-                let wait_status = run_program(program, shutdown, net_worker, result_fd, mux_handle);
-                terminate_host_with_guest_wait_status(wait_status);
-            }
-            Err(_) => {
-                unsafe { libc::_exit(1); }
-            }
-        }
-    }
+            // Call fork_restore_and_ack, then run_program.
+            // When a 9P broker is available, layer 9P on top of the default FS.
+            if let Some(broker_addr) = INHERITED_NINE_P_BROKER.get() {
+                let (ring_writer, ring_reader) = match connect_nine_p_channel(broker_addr) {
+                    Ok(pair) => pair,
+                    Err(_) => unsafe { libc::_exit(1) },
+                };
 
+                let shim = shim_builder.build();
+                let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+                let net_worker = start_network_worker(&shim, &shutdown);
+
+                let writer = ShmemTransportWriter(ring_writer);
+                let reader = ShmemTransportReader(ring_reader);
+                let litebox2 = shim.litebox();
+                let msize = 4 * 1024 * 1024u32;
+                let (nine_p_fs, mut nine_p_reader) = match litebox::fs::nine_p::FileSystem::new(
+                    litebox2, writer, reader, msize, "root", "/",
+                ) {
+                    Ok(pair) => pair,
+                    Err(_) => unsafe { libc::_exit(1) },
+                };
+                let worker_handle = nine_p_fs.worker_handle();
+                let _nine_p_worker =
+                    litebox_platform_linux_userland::spawn_host_thread(move || {
+                        let mut buf = alloc::vec::Vec::with_capacity(msize as usize);
+                        while worker_handle.poll_responses(&mut nine_p_reader, &mut buf) {}
+                    });
+
+                let combined = litebox::fs::layered::FileSystem::new(
+                    litebox2,
+                    default_fs,
+                    nine_p_fs,
+                    litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
+                );
+                let combined_fs = std::sync::Arc::new(combined);
+
+                match fork_restore_and_ack(
+                    &shim,
+                    snapshot,
+                    combined_fs,
+                    ack_fd,
+                    &pipe_bridges,
+                    mux_fd,
+                    &mux_streams,
+                    &local_pipes,
+                ) {
+                    Ok((program, mux_handle)) => {
+                        let wait_status =
+                            run_program(program, shutdown, net_worker, result_fd, mux_handle);
+                        terminate_host_with_guest_wait_status(wait_status);
+                    }
+                    Err(_) => unsafe {
+                        libc::_exit(1);
+                    },
+                }
+            } else {
+                let initial_file_system = std::sync::Arc::new(default_fs);
+                let shim = shim_builder.build();
+                let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+                let net_worker = start_network_worker(&shim, &shutdown);
+
+                match fork_restore_and_ack(
+                    &shim,
+                    snapshot,
+                    initial_file_system,
+                    ack_fd,
+                    &pipe_bridges,
+                    mux_fd,
+                    &mux_streams,
+                    &local_pipes,
+                ) {
+                    Ok((program, mux_handle)) => {
+                        let wait_status =
+                            run_program(program, shutdown, net_worker, result_fd, mux_handle);
+                        terminate_host_with_guest_wait_status(wait_status);
+                    }
+                    Err(_) => unsafe {
+                        libc::_exit(1);
+                    },
+                }
+            }
         } // ForkRestore
     } // match req.kind
 }

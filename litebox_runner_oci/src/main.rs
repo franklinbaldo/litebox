@@ -488,8 +488,7 @@ fn main() -> Result<()> {
 
             let extra_env = parse_extra_env(&env, env_file.as_ref())?;
 
-            let exit_code =
-                litebox_runner_oci::run_container(&bundle, None, &extra_env, &network)?;
+            let exit_code = litebox_runner_oci::run_container(&bundle, None, &extra_env, &network)?;
 
             // Save exit code to state (if this was a create+start lifecycle container)
             let sm = StateManager::new(root);

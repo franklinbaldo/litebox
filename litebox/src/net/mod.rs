@@ -1244,12 +1244,9 @@ where
             ProtocolSpecific::Tcp(tcp) => {
                 let server = tcp.server_socket.as_ref()?;
                 let backlog = server.backlog?;
-                let bind_addr = server
-                    .ip_listen_endpoint
-                    .addr
-                    .map(|a| match a {
-                        smoltcp::wire::IpAddress::Ipv4(v4) => v4,
-                    });
+                let bind_addr = server.ip_listen_endpoint.addr.map(|a| match a {
+                    smoltcp::wire::IpAddress::Ipv4(v4) => v4,
+                });
                 Some(ListeningSocketInfo {
                     bind_addr,
                     port: server.ip_listen_endpoint.port,

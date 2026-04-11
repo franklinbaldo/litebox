@@ -19,12 +19,12 @@ mod device;
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, UdpSocket};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::sock_compat::{
-    self, AsRawSock, IpcListener, IpcStream, PollFd, RawSock, POLLERR, POLLHUP, POLLIN, POLLOUT,
+    self, AsRawSock, IpcListener, IpcStream, POLLERR, POLLHUP, POLLIN, POLLOUT, PollFd, RawSock,
 };
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
@@ -32,7 +32,7 @@ use smoltcp::socket::tcp;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpListenEndpoint, Ipv4Address};
 use tracing::{debug, error, info, trace, warn};
 
-use device::{IpcDevice, DEVICE_MTU};
+use device::{DEVICE_MTU, IpcDevice};
 
 /// Broker IP address (gateway from the guest's perspective).
 const BROKER_IP: Ipv4Address = Ipv4Address::new(10, 0, 0, 1);
@@ -2116,14 +2116,14 @@ fn build_udp_packet(
 
     // IPv4 header (20 bytes, no options).
     packet[0] = 0x45; // Version=4, IHL=5
-                      // packet[1] = 0; // DSCP/ECN
+    // packet[1] = 0; // DSCP/ECN
     packet[2] = (total_len >> 8) as u8;
     packet[3] = (total_len & 0xFF) as u8;
     // packet[4..6]: identification (0)
     packet[6] = 0x40; // Don't Fragment
     packet[8] = 64; // TTL
     packet[9] = 17; // Protocol: UDP
-                    // packet[10..12]: header checksum (computed below)
+    // packet[10..12]: header checksum (computed below)
     packet[12..16].copy_from_slice(src_ip);
     packet[16..20].copy_from_slice(dst_ip);
 

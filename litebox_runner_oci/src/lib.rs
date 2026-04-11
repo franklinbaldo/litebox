@@ -7,6 +7,6 @@ pub mod lifecycle;
 mod runner;
 pub mod state;
 
-pub use runner::run_container;
-pub use runner::NetworkConfig;
 pub use runner::CniNetworkConfig;
+pub use runner::NetworkConfig;
+pub use runner::run_container;

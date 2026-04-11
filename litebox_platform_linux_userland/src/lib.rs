@@ -865,13 +865,24 @@ impl LinuxUserland {
     ///
     /// Must be called while the runner is still single-threaded (before shim
     /// threads are created).
-    pub fn spawn_forker(&'static self, dev_null_fd: std::os::fd::RawFd) -> Result<(), &'static str> {
+    pub fn spawn_forker(
+        &'static self,
+        dev_null_fd: std::os::fd::RawFd,
+    ) -> Result<(), &'static str> {
         use std::os::fd::{FromRawFd, OwnedFd};
 
         let broker_fd = self.broker_raw_fd();
 
         let mut fds = [0i32; 2];
-        if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0, fds.as_mut_ptr()) } != 0 {
+        if unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                0,
+                fds.as_mut_ptr(),
+            )
+        } != 0
+        {
             return Err("socketpair failed");
         }
         let runner_sock = unsafe { OwnedFd::from_raw_fd(fds[0]) };
@@ -896,7 +907,9 @@ impl LinuxUserland {
         }
 
         // Runner parent
-        unsafe { libc::close(forker_sock_raw); }
+        unsafe {
+            libc::close(forker_sock_raw);
+        }
         let handle = forker::ForkerHandle::new(runner_sock);
         *self.forker_handle.lock().unwrap() = Some(handle);
         Ok(())
@@ -1191,10 +1204,12 @@ impl LinuxUserland {
         };
 
         // 2. Build WorkerExecParams.
-        let argv_strings: Vec<String> = argv.iter()
+        let argv_strings: Vec<String> = argv
+            .iter()
             .map(|c| c.to_string_lossy().into_owned())
             .collect();
-        let envp_strings: Vec<String> = envp.iter()
+        let envp_strings: Vec<String> = envp
+            .iter()
             .map(|c| c.to_string_lossy().into_owned())
             .collect();
         let infra_flags = {
@@ -1265,7 +1280,9 @@ impl LinuxUserland {
         match &stdio.stdin {
             WorkerExecInputBinding::HostStdio { fd } | WorkerExecInputBinding::HostPipe { fd } => {
                 let duped = unsafe { libc::fcntl(*fd, libc::F_DUPFD_CLOEXEC, 3) };
-                if duped < 0 { return Err(()); }
+                if duped < 0 {
+                    return Err(());
+                }
                 let owned = unsafe { OwnedFd::from_raw_fd(duped) };
                 let idx = fds_array.len() as u8;
                 fds_array.push(owned.as_raw_fd());
@@ -1295,7 +1312,9 @@ impl LinuxUserland {
                 WorkerExecOutputBinding::HostStdio { fd }
                 | WorkerExecOutputBinding::HostPipe { fd } => {
                     let duped = unsafe { libc::fcntl(*fd, libc::F_DUPFD_CLOEXEC, 3) };
-                    if duped < 0 { return Err(()); }
+                    if duped < 0 {
+                        return Err(());
+                    }
                     let owned = unsafe { OwnedFd::from_raw_fd(duped) };
                     let idx = fds_array.len() as u8;
                     fds_array.push(owned.as_raw_fd());
@@ -1347,7 +1366,7 @@ impl LinuxUserland {
             kind: forker::ForkRequestKind::WorkerExec,
             stdio: stdio_bindings,
             num_fds: fds_array.len() as u16,
-            snapshot_fd_idx: params_fd_idx,  // repurposed: metadata memfd
+            snapshot_fd_idx: params_fd_idx, // repurposed: metadata memfd
             ack_fd_idx: 0xFF,               // worker-exec doesn't use ack
             result_fd_idx,
             mux_fd_idx: 0xFF,
@@ -1360,12 +1379,10 @@ impl LinuxUserland {
 
         // 9. Send fork request.
         let sock_guard = forker.sock.lock().unwrap();
-        forker::send_fork_request(sock_guard.as_raw_fd(), &request, &fds_array)
-            .map_err(|_| ())?;
+        forker::send_fork_request(sock_guard.as_raw_fd(), &request, &fds_array).map_err(|_| ())?;
 
         // 10. Receive fork response.
-        let response = forker::recv_fork_response(sock_guard.as_raw_fd())
-            .map_err(|_| ())?;
+        let response = forker::recv_fork_response(sock_guard.as_raw_fd()).map_err(|_| ())?;
         drop(sock_guard);
         drop(forker_guard);
 
@@ -1400,7 +1417,11 @@ impl LinuxUserland {
                             for dp in &direct_pipes {
                                 close_raw_fd(dp.parent_os_fd);
                             }
-                            terminate_worker_after_bridge_spawn_failure(self, child_pid, bridge_threads);
+                            terminate_worker_after_bridge_spawn_failure(
+                                self,
+                                child_pid,
+                                bridge_threads,
+                            );
                             return Err(());
                         }
                     }
@@ -1448,7 +1469,11 @@ impl LinuxUserland {
                             for dp in &direct_pipes {
                                 close_raw_fd(dp.parent_os_fd);
                             }
-                            terminate_worker_after_bridge_spawn_failure(self, child_pid, bridge_threads);
+                            terminate_worker_after_bridge_spawn_failure(
+                                self,
+                                child_pid,
+                                bridge_threads,
+                            );
                             return Err(());
                         }
                     }
@@ -2116,7 +2141,9 @@ impl LinuxUserland {
         let transport = self.network_transport.read().unwrap();
         let is_ipc = matches!(transport.as_ref(), Some(NetworkTransport::Ipc(_)));
         let fd = match transport.as_ref().expect("no network transport configured") {
-            NetworkTransport::Tun(fd) | NetworkTransport::Ipc(fd) | NetworkTransport::AfPacket(fd) => fd.as_raw_fd(),
+            NetworkTransport::Tun(fd)
+            | NetworkTransport::Ipc(fd)
+            | NetworkTransport::AfPacket(fd) => fd.as_raw_fd(),
         };
         let mut pfd = libc::pollfd {
             fd,
@@ -2261,9 +2288,7 @@ fn create_worker_result_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os
 }
 
 /// Parse worker spawn flags from CString pairs back into structured form.
-fn parse_infra_flags_from_cstrings(
-    flags: &[std::ffi::CString],
-) -> Vec<(String, Option<String>)> {
+fn parse_infra_flags_from_cstrings(flags: &[std::ffi::CString]) -> Vec<(String, Option<String>)> {
     let mut result = Vec::new();
     let mut i = 0;
     while i < flags.len() {

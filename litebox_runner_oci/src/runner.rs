@@ -32,6 +32,8 @@ pub struct CniNetworkConfig {
     pub netns_path: Option<PathBuf>,
     /// Name of the CNI network interface (e.g., "eth0").
     pub iface_name: String,
+    /// Interface MAC address.
+    pub mac: [u8; 6],
     /// Container interface IP address.
     pub ip_addr: std::net::Ipv4Addr,
     /// Network prefix length.
@@ -72,7 +74,7 @@ pub fn detect_cni_network(spec: &Spec) -> Option<CniNetworkConfig> {
         let orig_netns = std::fs::File::open("/proc/self/ns/net").ok()?;
 
         let clone_newnet: libc::c_int = 0x40000000; // CLONE_NEWNET
-                                                    // SAFETY: setns is a standard Linux syscall. We pass a valid fd and flag.
+        // SAFETY: setns is a standard Linux syscall. We pass a valid fd and flag.
         let ret = unsafe { libc::setns(netns_file.as_raw_fd(), clone_newnet) };
         if ret != 0 {
             return None;
@@ -134,17 +136,19 @@ fn read_netns_config(netns_path: Option<&PathBuf>) -> Option<CniNetworkConfig> {
     }
     let iface_name = iface_name?;
 
-    // Read MTU from ip link output
-    let mtu: u16 = link_text
-        .lines()
-        .find(|l| l.contains(&iface_name))
-        .and_then(|l| {
-            let mtu_pos = l.find("mtu ")?;
-            let after_mtu = &l[mtu_pos + 4..];
+    // Read MTU and MAC from ip link output
+    let iface_line = link_text.lines().find(|l| l.contains(&iface_name))?;
+
+    let mtu: u16 = iface_line
+        .find("mtu ")
+        .and_then(|pos| {
+            let after_mtu = &iface_line[pos + 4..];
             let end = after_mtu.find(' ').unwrap_or(after_mtu.len());
             after_mtu[..end].parse().ok()
         })
         .unwrap_or(1500);
+
+    let mac = parse_link_mac(iface_line)?;
 
     // Read IP address and prefix
     let ip_output = Command::new("ip")
@@ -169,6 +173,7 @@ fn read_netns_config(netns_path: Option<&PathBuf>) -> Option<CniNetworkConfig> {
     Some(CniNetworkConfig {
         netns_path: netns_path.cloned(),
         iface_name,
+        mac,
         ip_addr,
         prefix_len,
         gateway,
@@ -197,7 +202,29 @@ fn parse_default_gateway(line: &str) -> Option<std::net::Ipv4Addr> {
     gw.parse().ok()
 }
 
+/// Parse MAC address from `ip -o link show` output line.
+///
+/// The line contains `link/ether xx:xx:xx:xx:xx:xx` — extract the MAC.
+fn parse_link_mac(line: &str) -> Option<[u8; 6]> {
+    let marker = "link/ether ";
+    let pos = line.find(marker)?;
+    let after = &line[pos + marker.len()..];
+    let end = after.find(' ').unwrap_or(after.len());
+    let mac_str = &after[..end];
+    let bytes: Vec<u8> = mac_str
+        .split(':')
+        .map(|b| u8::from_str_radix(b, 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    if bytes.len() != 6 {
+        return None;
+    }
+    let mut mac = [0u8; 6];
+    mac.copy_from_slice(&bytes);
+    Some(mac)
+}
+
 /// Read the MAC address of a network interface from sysfs.
+#[cfg(test)]
 fn read_interface_mac(iface: &str) -> Result<[u8; 6]> {
     let path = format!("/sys/class/net/{iface}/address");
     let mac_str = std::fs::read_to_string(&path)
@@ -224,23 +251,41 @@ fn read_interface_mac(iface: &str) -> Result<[u8; 6]> {
 /// Returns the socket fd and a [`litebox::net::NetworkConfig`] for smoltcp
 /// (Ethernet mode with the veth's MAC, IP, prefix, and gateway).
 ///
-/// The caller must already be in the CNI network namespace (via setns).
+/// If the CNI config has a `netns_path`, this function enters that network
+/// namespace via `setns` **and stays there** — the AF_PACKET socket must
+/// remain in the CNI netns, and the runner process should execute inside it.
 fn setup_cni_af_packet(
     cni: &CniNetworkConfig,
 ) -> Result<(std::os::fd::OwnedFd, litebox::net::NetworkConfig)> {
     use std::os::fd::{AsRawFd, FromRawFd};
 
-    // Read the veth MAC address
-    let mac = read_interface_mac(&cni.iface_name)?;
+    // Enter the CNI network namespace if we have an explicit path.
+    // We intentionally do NOT restore the original netns — the runner
+    // process needs to stay in this namespace for the AF_PACKET socket
+    // (and any other network operations) to work.
+    if let Some(netns_path) = &cni.netns_path {
+        let netns_file = std::fs::File::open(netns_path)
+            .with_context(|| format!("failed to open netns {}", netns_path.display()))?;
+        let ret = unsafe { libc::setns(netns_file.as_raw_fd(), libc::CLONE_NEWNET) };
+        if ret != 0 {
+            anyhow::bail!(
+                "setns({}) failed: {}",
+                netns_path.display(),
+                std::io::Error::last_os_error()
+            );
+        }
+        tracing::debug!(netns = %netns_path.display(), "entered CNI network namespace");
+    }
+
+    // Use the MAC address already parsed during CNI detection (from `ip link`
+    // output inside the netns). Reading from sysfs doesn't work after setns
+    // because /sys is bound to the mount namespace, not the network namespace.
+    let mac = cni.mac;
 
     // Open AF_PACKET raw socket
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_PACKET,
-            libc::SOCK_RAW,
-            (libc::ETH_P_ALL as u16).to_be() as i32,
-        )
-    };
+    #[allow(clippy::cast_possible_truncation)] // ETH_P_ALL (0x0003) fits in u16
+    let protocol = i32::from((libc::ETH_P_ALL as u16).to_be());
+    let fd = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, protocol) };
     if fd < 0 {
         anyhow::bail!(
             "socket(AF_PACKET) failed: {}",
@@ -262,15 +307,21 @@ fn setup_cni_af_packet(
     }
 
     let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
-    addr.sll_family = libc::AF_PACKET as u16;
-    addr.sll_protocol = (libc::ETH_P_ALL as u16).to_be();
-    addr.sll_ifindex = ifindex as i32;
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        addr.sll_family = libc::AF_PACKET as u16;
+        addr.sll_protocol = (libc::ETH_P_ALL as u16).to_be();
+    }
+    addr.sll_ifindex = ifindex.cast_signed();
 
     let ret = unsafe {
         libc::bind(
             fd.as_raw_fd(),
-            (&addr as *const libc::sockaddr_ll).cast::<libc::sockaddr>(),
-            std::mem::size_of::<libc::sockaddr_ll>() as u32,
+            (&raw const addr).cast::<libc::sockaddr>(),
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                std::mem::size_of::<libc::sockaddr_ll>() as u32
+            },
         )
     };
     if ret < 0 {
@@ -301,11 +352,18 @@ fn setup_cni_af_packet(
 /// Search order:
 /// 1. Same directory as the current executable
 /// 2. `$PATH`
+///
+/// Tries both `litebox_broker` (cargo default) and `litebox-broker` (installed)
+/// name variants.
 fn find_broker_exe() -> Result<PathBuf> {
+    let names = ["litebox_broker", "litebox-broker"];
+
     // 1. Adjacent to self
-    if let Ok(self_exe) = std::env::current_exe() {
-        if let Some(dir) = self_exe.parent() {
-            let candidate = dir.join("litebox_broker");
+    if let Ok(self_exe) = std::env::current_exe()
+        && let Some(dir) = self_exe.parent()
+    {
+        for name in &names {
+            let candidate = dir.join(name);
             if candidate.is_file() {
                 return Ok(candidate);
             }
@@ -313,13 +371,14 @@ fn find_broker_exe() -> Result<PathBuf> {
     }
 
     // 2. Search $PATH
-    if let Ok(output) = Command::new("which")
-        .arg("litebox_broker")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-    {
-        if output.status.success() {
+    for name in &names {
+        if let Ok(output) = Command::new("which")
+            .arg(name)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            && output.status.success()
+        {
             let path_str = String::from_utf8_lossy(&output.stdout);
             let path = PathBuf::from(path_str.trim());
             if path.is_file() {
@@ -388,7 +447,7 @@ fn spawn_broker(
 
     for (guest_path, host_path) in bind_mounts {
         cmd.arg("--bind");
-        cmd.arg(format!("{}:{}", guest_path, host_path));
+        cmd.arg(format!("{guest_path}:{host_path}"));
     }
 
     let child = cmd
@@ -398,6 +457,45 @@ fn spawn_broker(
         .with_context(|| format!("failed to spawn litebox_broker at {}", broker_exe.display()))?;
 
     Ok(child)
+}
+
+// ---------------------------------------------------------------------------
+// Program path resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve a bare program name against the rootfs using `$PATH`.
+///
+/// Searches each directory in `$PATH` (from the OCI environment) under the
+/// rootfs for an executable file matching `program`. Returns the absolute
+/// guest path (e.g., `/bin/echo`) or `None` if not found.
+fn resolve_program_in_rootfs(
+    rootfs: &Path,
+    program: &str,
+    environment: &[String],
+) -> Option<String> {
+    let path_env = environment.iter().find(|e| e.starts_with("PATH=")).map_or(
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        |e| &e[5..],
+    );
+
+    for dir in path_env.split(':') {
+        let dir = dir.strip_prefix('/').unwrap_or(dir);
+        let host_path = rootfs.join(dir).join(program);
+        if host_path.is_file() {
+            // Return the guest-absolute path
+            let guest_path = format!(
+                "{}/{}",
+                if dir.is_empty() {
+                    String::new()
+                } else {
+                    format!("/{dir}")
+                },
+                program
+            );
+            return Some(guest_path);
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -435,21 +533,17 @@ fn build_cli_args(
 
     // Environment variables: from spec + extra
     let mut environment_variables: Vec<String> =
-        process.env().as_ref().map_or_else(Vec::new, |e| e.clone());
+        process.env().as_ref().map_or_else(Vec::new, Clone::clone);
     environment_variables.extend_from_slice(extra_env);
 
     // Working directory
-    let working_directory = process
-        .cwd()
-        .to_str()
-        .map(|s| {
-            if s.is_empty() {
-                None
-            } else {
-                Some(s.to_string())
-            }
-        })
-        .unwrap_or(None);
+    let working_directory = process.cwd().to_str().and_then(|s| {
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        }
+    });
 
     // Networking: AF_PACKET fd vs TUN device vs broker-based networking
     let (tun_device_name, network_broker) = if af_packet_fd.is_some() {
@@ -467,8 +561,7 @@ fn build_cli_args(
     let has_proc_mount = spec
         .mounts()
         .as_ref()
-        .map(|mounts| mounts.iter().any(|m| m.typ().as_deref() == Some("proc")))
-        .unwrap_or(false);
+        .is_some_and(|mounts| mounts.iter().any(|m| m.typ().as_deref() == Some("proc")));
 
     Ok(CliArgs {
         program_and_arguments,
@@ -537,9 +630,9 @@ pub fn run_container(
                 spec_path.display()
             )
         })?;
-        serde_json::from_reader(file).with_context(|| {
-            "failed to parse config.json. Ensure it is valid OCI runtime spec JSON."
-        })?
+        serde_json::from_reader(file).with_context(
+            || "failed to parse config.json. Ensure it is valid OCI runtime spec JSON.",
+        )?
     };
 
     // 2. Determine rootfs path
@@ -653,7 +746,7 @@ pub fn run_container(
     }
 
     // 9. Build CliArgs
-    let cli_args = match build_cli_args(
+    let mut cli_args = match build_cli_args(
         &spec,
         override_args,
         extra_env,
@@ -671,6 +764,26 @@ pub fn run_container(
         }
     };
 
+    // 9b. Resolve non-absolute program path against rootfs via $PATH.
+    // OCI specs often pass bare command names (e.g., "echo"), which must
+    // be resolved to an absolute path (e.g., "/bin/echo") in the container
+    // rootfs for the 9P-backed filesystem to find the binary.
+    if !cli_args.program_and_arguments.is_empty()
+        && !cli_args.program_and_arguments[0].starts_with('/')
+        && let Some(resolved) = resolve_program_in_rootfs(
+            &rootfs_path,
+            &cli_args.program_and_arguments[0],
+            &cli_args.environment_variables,
+        )
+    {
+        tracing::debug!(
+            original = %cli_args.program_and_arguments[0],
+            resolved = %resolved,
+            "resolved program path via PATH"
+        );
+        cli_args.program_and_arguments[0] = resolved;
+    }
+
     tracing::info!(
         program = ?cli_args.program_and_arguments,
         nine_p = ?cli_args.nine_p_broker,
@@ -686,6 +799,17 @@ pub fn run_container(
     // 11. On error (or if run returns), clean up broker process and socket
     let _ = broker_child.kill();
     let _ = broker_child.wait();
+    // Capture broker stderr for diagnostic info on failure
+    if result.is_err()
+        && let Some(mut stderr) = broker_child.stderr.take()
+    {
+        use std::io::Read;
+        let mut buf = String::new();
+        let _ = stderr.read_to_string(&mut buf);
+        if !buf.is_empty() {
+            tracing::error!(broker_stderr = %buf, "broker stderr output");
+        }
+    }
     let _ = std::fs::remove_file(&broker_socket_path);
 
     match result {
@@ -792,5 +916,38 @@ mod tests {
     fn read_interface_mac_fails_for_nonexistent() {
         let mac = read_interface_mac("nonexistent_iface_xyz");
         assert!(mac.is_err());
+    }
+
+    #[test]
+    fn parse_link_mac_extracts_ethernet_address() {
+        let line = "2: tap0: <BROADCAST,UP,LOWER_UP> mtu 65520 qdisc fq_codel state UNKNOWN qlen 1000\\    link/ether 9a:db:90:ad:d2:33 brd ff:ff:ff:ff:ff:ff";
+        let mac = parse_link_mac(line);
+        assert_eq!(mac, Some([0x9a, 0xdb, 0x90, 0xad, 0xd2, 0x33]));
+    }
+
+    #[test]
+    fn parse_link_mac_returns_none_for_loopback() {
+        let line = "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN qlen 1000\\    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00";
+        // No link/ether marker in loopback
+        let mac = parse_link_mac(line);
+        assert_eq!(mac, None);
+    }
+
+    #[test]
+    fn resolve_program_in_rootfs_finds_binary() {
+        // Use /usr as a fake rootfs — /usr/bin/echo should exist on most systems
+        let rootfs = Path::new("/usr");
+        let env = vec!["PATH=/bin".to_string()];
+        let result = resolve_program_in_rootfs(rootfs, "echo", &env);
+        // Should find /usr/bin/echo -> returns guest path /bin/echo
+        assert_eq!(result, Some("/bin/echo".to_string()));
+    }
+
+    #[test]
+    fn resolve_program_in_rootfs_returns_none_for_missing() {
+        let rootfs = Path::new("/usr");
+        let env = vec!["PATH=/bin".to_string()];
+        let result = resolve_program_in_rootfs(rootfs, "nonexistent_binary_xyz", &env);
+        assert_eq!(result, None);
     }
 }

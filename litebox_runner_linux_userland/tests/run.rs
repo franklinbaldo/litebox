@@ -986,12 +986,7 @@ fn test_nginx_with_wrk() {
 
         // Run wrk: 2 threads, 10 connections, 5 seconds.
         let output = std::process::Command::new(&wrk_path)
-            .args([
-                "-t2",
-                "-c10",
-                "-d5s",
-                "http://10.0.0.2:8080/",
-            ])
+            .args(["-t2", "-c10", "-d5s", "http://10.0.0.2:8080/"])
             .output()
             .expect("Failed to run wrk");
 

@@ -10,7 +10,7 @@
 //!
 //! Frame format on the wire: `[u32 LE length][IP packet]`.
 
-use crate::sock_compat::{self, IpcStream, PollFd, RawSock, MSG_PEEK, POLLOUT};
+use crate::sock_compat::{self, IpcStream, MSG_PEEK, POLLOUT, PollFd, RawSock};
 
 use smoltcp::phy;
 use tracing::error;
