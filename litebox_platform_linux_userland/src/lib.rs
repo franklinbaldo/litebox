@@ -865,6 +865,7 @@ impl LinuxUserland {
     ///
     /// Must be called while the runner is still single-threaded (before shim
     /// threads are created).
+    #[allow(clippy::missing_panics_doc)]
     pub fn spawn_forker(
         &'static self,
         dev_null_fd: std::os::fd::RawFd,
@@ -931,6 +932,7 @@ impl LinuxUserland {
     /// over the forker socket with SCM_RIGHTS, and receives the child PID.
     /// Returns `Ok(pid)` on success, `Err(())` if the forker is not available
     /// or the request fails.
+    #[allow(clippy::cast_possible_truncation)]
     fn try_spawn_via_forker<FS>(
         &'static self,
         snapshot_bytes: &[u8],
@@ -947,9 +949,8 @@ impl LinuxUserland {
 
         // 1. Lock forker handle. If None, return Err.
         let forker_guard = self.forker_handle.lock().unwrap();
-        let forker = match forker_guard.as_ref() {
-            Some(h) => h,
-            None => return Err(()),
+        let Some(forker) = forker_guard.as_ref() else {
+            return Err(());
         };
 
         // 2. Create snapshot memfd.
@@ -1171,7 +1172,12 @@ impl LinuxUserland {
     /// boots a fresh shim and loads the binary from the exec image memfd.
     ///
     /// Returns `Ok(WorkerExecSpawnResult)` on success, `Err(())` if the forker is not available.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::similar_names,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap
+    )]
     fn try_spawn_worker_exec_via_forker<FS>(
         &'static self,
         guest_binary_path: &str,
@@ -1196,11 +1202,8 @@ impl LinuxUserland {
 
         // 1. Lock forker handle.
         let forker_guard = self.forker_handle.lock().unwrap();
-        let forker = match forker_guard.as_ref() {
-            Some(h) => h,
-            None => {
-                return Err(());
-            }
+        let Some(forker) = forker_guard.as_ref() else {
+            return Err(());
         };
 
         // 2. Build WorkerExecParams.
@@ -1402,30 +1405,24 @@ impl LinuxUserland {
         let mut bridge_threads: Vec<DetachedWorkerBridge> = Vec::new();
         let mut direct_pipes: Vec<ExecPipeDirectIo> = Vec::new();
 
-        if let Some(write_fd) = stdin_bridge_write_fd {
-            if let Some(input_source) = collect_worker_exec_input_source(stdio) {
-                if direct_pipe_io && matches!(&input_source, WorkerExecInputSource::Pipe { .. }) {
-                    let raw_fd = write_fd.into_raw_fd();
-                    direct_pipes.push(ExecPipeDirectIo {
-                        child_stdio_fd: 0,
-                        parent_os_fd: raw_fd,
-                    });
-                } else {
-                    match spawn_worker_input_bridge(self, input_source, write_fd) {
-                        Ok(bridge) => bridge_threads.push(bridge),
-                        Err(_) => {
-                            for dp in &direct_pipes {
-                                close_raw_fd(dp.parent_os_fd);
-                            }
-                            terminate_worker_after_bridge_spawn_failure(
-                                self,
-                                child_pid,
-                                bridge_threads,
-                            );
-                            return Err(());
-                        }
-                    }
+        if let (Some(write_fd), Some(input_source)) = (
+            stdin_bridge_write_fd,
+            collect_worker_exec_input_source(stdio),
+        ) {
+            if direct_pipe_io && matches!(&input_source, WorkerExecInputSource::Pipe { .. }) {
+                let raw_fd = write_fd.into_raw_fd();
+                direct_pipes.push(ExecPipeDirectIo {
+                    child_stdio_fd: 0,
+                    parent_os_fd: raw_fd,
+                });
+            } else if let Ok(bridge) = spawn_worker_input_bridge(self, input_source, write_fd) {
+                bridge_threads.push(bridge);
+            } else {
+                for dp in &direct_pipes {
+                    close_raw_fd(dp.parent_os_fd);
                 }
+                terminate_worker_after_bridge_spawn_failure(self, child_pid, bridge_threads);
+                return Err(());
             }
         }
 
@@ -1457,26 +1454,17 @@ impl LinuxUserland {
                         child_stdio_fd: target_fd,
                         parent_os_fd: raw_fd,
                     });
+                } else if let Ok(handle) = spawn_worker_output_bridge(self, sink, read_fd) {
+                    bridge_threads.push(DetachedWorkerBridge {
+                        handle,
+                        input_control: None,
+                    });
                 } else {
-                    match spawn_worker_output_bridge(self, sink, read_fd) {
-                        Ok(handle) => {
-                            bridge_threads.push(DetachedWorkerBridge {
-                                handle,
-                                input_control: None,
-                            });
-                        }
-                        Err(_) => {
-                            for dp in &direct_pipes {
-                                close_raw_fd(dp.parent_os_fd);
-                            }
-                            terminate_worker_after_bridge_spawn_failure(
-                                self,
-                                child_pid,
-                                bridge_threads,
-                            );
-                            return Err(());
-                        }
+                    for dp in &direct_pipes {
+                        close_raw_fd(dp.parent_os_fd);
                     }
+                    terminate_worker_after_bridge_spawn_failure(self, child_pid, bridge_threads);
+                    return Err(());
                 }
             }
         }
@@ -2082,6 +2070,7 @@ impl LinuxUserland {
     ///
     /// This is used for tasks that need to run concurrently with guest
     /// execution, such as waiting for a fork child worker to exit.
+    #[allow(clippy::missing_panics_doc)]
     pub fn spawn_background_task<F>(&self, f: F)
     where
         F: FnOnce() + Send + 'static,
@@ -2093,6 +2082,7 @@ impl LinuxUserland {
     /// Join all background tasks (mux dispatchers, background waiters).
     /// Must be called before `std::process::exit()` to give tasks a
     /// chance to flush buffered data.
+    #[allow(clippy::missing_panics_doc)]
     pub fn join_background_tasks(&self) {
         let handles: Vec<_> = self.background_handles.lock().unwrap().drain(..).collect();
         for handle in handles {
@@ -3842,14 +3832,15 @@ unsafe extern "fastcall" fn switch_to_guest(ctx: &litebox_common_linux::Executio
 
 /// Non-guest threads (e.g., network workers, background tasks) should call this
 /// function at the start of their execution so the kernel only delivers
-/// `SIGALRM` / `SIGINT` to guest threads, which have the proper signal-handler
-/// context to re-enter the shim.
+/// `SIGALRM` / `SIGINT` / `SIGUSR1` to guest threads, which have the proper
+/// signal-handler context to re-enter the shim.
 fn block_guest_signals() {
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&raw mut set);
         libc::sigaddset(&raw mut set, libc::SIGALRM);
         libc::sigaddset(&raw mut set, libc::SIGINT);
+        libc::sigaddset(&raw mut set, libc::SIGUSR1);
         libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut());
     }
 }
@@ -5493,6 +5484,26 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
 static mut NEXT_SA: [libc::sigaction; 64] = unsafe { core::mem::zeroed() };
 static INTERRUPT_SIGNAL_NUMBER: AtomicI32 = AtomicI32::new(0);
 
+/// Path to the container state directory for checkpoint support.
+/// When SIGUSR1 is received and this path is set, the shim will read
+/// `<state_dir>/checkpoint-request` for the output image path, perform a
+/// snapshot, and write the checkpoint to that path.
+static CHECKPOINT_STATE_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Set the container state directory for checkpoint support.
+///
+/// Must be called before entering the sandbox execution loop. When set,
+/// SIGUSR1 triggers a checkpoint: the shim reads `<dir>/checkpoint-request`
+/// for the output path, writes the snapshot there, and exits.
+pub fn set_checkpoint_state_dir(dir: PathBuf) {
+    let _ = CHECKPOINT_STATE_DIR.set(dir);
+}
+
+/// Returns the checkpoint state directory, if configured.
+pub fn checkpoint_state_dir() -> Option<&'static std::path::Path> {
+    CHECKPOINT_STATE_DIR.get().map(PathBuf::as_path)
+}
+
 fn register_exception_handlers() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -5562,7 +5573,7 @@ fn register_exception_handlers() {
         }
 
         // Note that non-guest threads should block these signals, so it always fires on a guest thread.
-        let traditional_signals = &[libc::SIGINT, libc::SIGALRM];
+        let traditional_signals = &[libc::SIGINT, libc::SIGALRM, libc::SIGUSR1];
         for &sig in traditional_signals {
             unsafe {
                 let mut sa: libc::sigaction = core::mem::zeroed();

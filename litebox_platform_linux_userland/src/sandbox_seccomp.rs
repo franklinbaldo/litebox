@@ -101,6 +101,7 @@ fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> BpfInsn {
 }
 
 /// Build the allowlist BPF filter program.
+#[allow(clippy::cast_possible_truncation)] // syscall nrs & BPF jump offsets always fit
 fn build_allowlist_filter() -> Vec<BpfInsn> {
     // Strace-minimal allowlist for forker + forker-spawned workers.
     //
@@ -246,6 +247,7 @@ fn build_allowlist_filter() -> Vec<BpfInsn> {
 }
 
 /// Apply a BPF seccomp filter to the current process.
+#[allow(clippy::cast_possible_truncation)] // insns.len() always fits u16 (BPF max 4096)
 fn apply_bpf_filter(insns: &[BpfInsn]) {
     // First, set PR_SET_NO_NEW_PRIVS (required for unprivileged seccomp).
     // SAFETY: prctl with PR_SET_NO_NEW_PRIVS is always safe.
@@ -266,9 +268,9 @@ fn apply_bpf_filter(insns: &[BpfInsn]) {
     let ret = unsafe {
         libc::syscall(
             libc::SYS_seccomp,
-            SECCOMP_SET_MODE_FILTER as u64,
+            u64::from(SECCOMP_SET_MODE_FILTER),
             0u64, // flags
-            &raw const prog as *const libc::c_void,
+            (&raw const prog).cast::<libc::c_void>(),
         )
     };
     assert!(
@@ -306,6 +308,7 @@ mod tests {
 
     /// Syscalls that must NEVER appear in any filter variant (namespace escapes,
     /// kernel module loading, system control).
+    #[allow(clippy::cast_possible_truncation)] // syscall nrs always fit u32
     fn assert_dangerous_syscalls_blocked(syscall_nrs: &[u32]) {
         let dangerous = [
             (libc::SYS_execve as u32, "execve"),
@@ -339,6 +342,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)] // syscall nrs always fit u32
     fn forker_filter_blocks_dangerous_syscalls() {
         let insns = build_allowlist_filter();
         let syscall_nrs = extract_allowed_syscalls(&insns);

@@ -514,6 +514,7 @@ fn build_cli_args(
     network_config: Option<litebox::net::NetworkConfig>,
     override_cwd: Option<&str>,
     override_user: Option<&(u32, u32)>,
+    state_dir: Option<std::path::PathBuf>,
 ) -> Result<CliArgs> {
     let process = spec
         .process()
@@ -591,6 +592,7 @@ fn build_cli_args(
         proc_mount: has_proc_mount,
         af_packet_fd,
         network_config,
+        state_dir,
         // Internal worker flags — all default/inactive
         worker_exec: false,
         worker_exec_fd: None,
@@ -633,6 +635,7 @@ pub fn run_container(
     network: &NetworkConfig,
     override_cwd: Option<&str>,
     override_user: Option<&(u32, u32)>,
+    state_dir: Option<std::path::PathBuf>,
 ) -> Result<i32> {
     // 1. Parse config.json from bundle
     let spec_path = bundle_path.join("config.json");
@@ -769,6 +772,7 @@ pub fn run_container(
         af_packet_net_config,
         override_cwd,
         override_user,
+        state_dir,
     ) {
         Ok(args) => args,
         Err(e) => {
@@ -810,10 +814,10 @@ pub fn run_container(
 
     // 9c. Apply OCI rlimits to the host process before starting the sandbox.
     // This bounds the litebox runner process itself (fd limits, etc.).
-    if let Some(process) = spec.process().as_ref() {
-        if let Some(rlimits) = process.rlimits() {
-            apply_rlimits(rlimits);
-        }
+    if let Some(process) = spec.process().as_ref()
+        && let Some(rlimits) = process.rlimits()
+    {
+        apply_rlimits(rlimits);
     }
 
     // 10. Call litebox_runner_linux_userland::run() — returns exit code on success
@@ -968,6 +972,7 @@ pub fn exec_container(
         network,
         override_cwd,
         override_user,
+        None, // exec doesn't support checkpoint
     )
 }
 
@@ -1010,7 +1015,7 @@ fn apply_rlimits(rlimits: &[oci_spec::runtime::PosixRlimit]) {
 
         // SAFETY: setrlimit is a standard POSIX call; we provide a valid
         // resource constant and a properly initialised rlimit struct.
-        let rc = unsafe { libc::setrlimit(resource, &lim) };
+        let rc = unsafe { libc::setrlimit(resource, &raw const lim) };
         if rc == 0 {
             tracing::debug!(
                 typ = ?rl.typ(),
@@ -1061,6 +1066,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(args.guest_uid, Some(1000));
@@ -1077,6 +1083,7 @@ mod tests {
             None,
             &[],
             "/tmp/test.sock",
+            None,
             None,
             None,
             None,
@@ -1120,6 +1127,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert!(args.proc_mount);
@@ -1151,6 +1159,7 @@ mod tests {
             None,
             &[],
             "/tmp/test.sock",
+            None,
             None,
             None,
             None,

@@ -217,6 +217,62 @@ enum Command {
 
     /// Show runtime version and features
     Info,
+
+    /// Checkpoint a running container (CRIU-style)
+    Checkpoint {
+        /// Container ID
+        container_id: String,
+
+        /// Directory to write the checkpoint image to
+        #[clap(long = "image-path")]
+        image_path: PathBuf,
+
+        /// Leave the container running after checkpoint (ignored — always stops)
+        #[clap(long)]
+        leave_running: bool,
+
+        /// Path to a CRIU binary (accepted for compat, ignored)
+        #[clap(long)]
+        work_path: Option<PathBuf>,
+    },
+
+    /// Restore a container from a checkpoint image
+    Restore {
+        /// Path to the OCI bundle directory
+        #[clap(short = 'b', long)]
+        bundle: PathBuf,
+
+        /// Container ID
+        container_id: String,
+
+        /// Directory containing the checkpoint image
+        #[clap(long = "image-path")]
+        image_path: PathBuf,
+
+        /// File to write the container PID to
+        #[clap(long)]
+        pid_file: Option<PathBuf>,
+
+        /// Console socket path for TTY support
+        #[clap(long)]
+        console_socket: Option<PathBuf>,
+
+        /// Don't use pivot_root (accepted, we never pivot anyway)
+        #[clap(long)]
+        no_pivot: bool,
+
+        /// Don't create new namespaces (accepted, ignored)
+        #[clap(long)]
+        no_new_keyring: bool,
+
+        /// Detach from the container's process (run in background)
+        #[clap(long, short)]
+        detach: bool,
+
+        /// TUN device name for container networking
+        #[clap(long, value_name = "DEVICE")]
+        tun_device: Option<String>,
+    },
 }
 
 /// Parse a signal name or number into a signal number.
@@ -448,32 +504,30 @@ fn main() -> Result<()> {
                 std::fs::File::open(&config_path)
                     .ok()
                     .and_then(|f| serde_json::from_reader::<_, oci_spec::runtime::Spec>(f).ok())
-                    .map(|spec| {
+                    .map_or((0, 0, 0), |spec| {
                         let (mem, swap, pids) = spec
                             .linux()
                             .as_ref()
                             .and_then(|l| l.resources().as_ref())
-                            .map(|res| {
+                            .map_or((0, 0, 0), |res| {
                                 let mem = res
                                     .memory()
                                     .as_ref()
-                                    .and_then(|m| m.limit())
+                                    .and_then(oci_spec::runtime::LinuxMemory::limit)
                                     .map_or(0_u64, |v| u64::try_from(v).unwrap_or(0));
                                 let swap = res
                                     .memory()
                                     .as_ref()
-                                    .and_then(|m| m.swap())
+                                    .and_then(oci_spec::runtime::LinuxMemory::swap)
                                     .map_or(0_u64, |v| u64::try_from(v).unwrap_or(0));
                                 let pids = res
                                     .pids()
                                     .as_ref()
-                                    .map_or(0_i64, |p| p.limit());
+                                    .map_or(0_i64, oci_spec::runtime::LinuxPids::limit);
                                 (mem, swap, pids)
-                            })
-                            .unwrap_or((0, 0, 0));
+                            });
                         (mem, swap, pids)
                     })
-                    .unwrap_or((0, 0, 0))
             };
 
             // Try to get real stats from /proc if PID is available
@@ -584,8 +638,17 @@ fn main() -> Result<()> {
 
             let extra_env = parse_extra_env(&env, env_file.as_ref())?;
 
-            let exit_code =
-                litebox_runner_oci::run_container(&bundle, None, &extra_env, &network, None, None)?;
+            // Compute state directory for checkpoint support.
+            // The state dir exists when the container was created via
+            // lifecycle create → start → (exec's "litebox-oci run").
+            let state_dir = {
+                let sd = root.join("containers").join(&container_id);
+                if sd.exists() { Some(sd) } else { None }
+            };
+
+            let exit_code = litebox_runner_oci::run_container(
+                &bundle, None, &extra_env, &network, None, None, state_dir,
+            )?;
 
             // Save exit code to state (if this was a create+start lifecycle container)
             let sm = StateManager::new(root);
@@ -667,6 +730,251 @@ fn main() -> Result<()> {
                 proc_user.as_ref(),
             )?;
             std::process::exit(exit_code);
+        }
+
+        Command::Checkpoint {
+            container_id,
+            image_path,
+            leave_running: _,
+            work_path: _,
+        } => {
+            tracing::info!(
+                container_id = %container_id,
+                image_path = %image_path.display(),
+                "checkpointing container"
+            );
+
+            // Load container state to get PID
+            let state = lifecycle.state(&container_id)?;
+            let pid = state.pid.context("container has no PID (not running?)")?;
+
+            if state.status != litebox_runner_oci::state::Status::Running
+                && state.status != litebox_runner_oci::state::Status::Created
+            {
+                anyhow::bail!(
+                    "cannot checkpoint container {}: status is {} (expected running)",
+                    container_id,
+                    state.status
+                );
+            }
+
+            // Ensure image directory exists
+            std::fs::create_dir_all(&image_path).with_context(|| {
+                format!(
+                    "failed to create checkpoint image directory: {}",
+                    image_path.display()
+                )
+            })?;
+
+            // Write the checkpoint request file.
+            // The sandbox monitors this file when it receives SIGUSR1.
+            let state_dir = root.join("containers").join(&container_id);
+            let request_file = state_dir.join("checkpoint-request");
+            let checkpoint_image_file = image_path.join("checkpoint.img");
+            std::fs::write(
+                &request_file,
+                checkpoint_image_file.to_string_lossy().as_ref(),
+            )
+            .with_context(|| {
+                format!(
+                    "failed to write checkpoint request: {}",
+                    request_file.display()
+                )
+            })?;
+
+            // Send SIGUSR1 to the sandbox process to trigger checkpoint.
+            // SAFETY: kill() is a standard POSIX syscall and pid is a valid PID.
+            #[allow(clippy::cast_possible_wrap)]
+            let ret = unsafe { libc::kill(pid as i32, libc::SIGUSR1) };
+            if ret != 0 {
+                // Clean up request file
+                let _ = std::fs::remove_file(&request_file);
+                anyhow::bail!(
+                    "failed to send SIGUSR1 to container process {pid}: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+
+            tracing::info!(pid = pid, "sent SIGUSR1, waiting for process to exit");
+
+            // Wait for the sandbox process to exit (it exits after writing checkpoint).
+            // Use waitpid with WNOHANG in a poll loop — the process is our child
+            // only if we are the original create parent. Otherwise, just poll
+            // /proc/<pid>/stat until it disappears.
+            let start = std::time::Instant::now();
+            let timeout = std::time::Duration::from_secs(60);
+            loop {
+                // Check if process is still alive
+                #[allow(clippy::cast_possible_wrap)]
+                let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+                if !alive {
+                    break;
+                }
+                if start.elapsed() > timeout {
+                    let _ = std::fs::remove_file(&request_file);
+                    anyhow::bail!(
+                        "timeout waiting for container {container_id} to checkpoint (PID {pid})"
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+
+            // Clean up
+            let _ = std::fs::remove_file(&request_file);
+
+            // Update container state to stopped
+            let _ = lifecycle.state_manager().update(&container_id, |s| {
+                s.status = litebox_runner_oci::state::Status::Stopped;
+                s.exit_code = Some(0);
+            });
+
+            // Verify checkpoint file was written
+            if checkpoint_image_file.exists() {
+                let metadata = std::fs::metadata(&checkpoint_image_file)?;
+                tracing::info!(
+                    path = %checkpoint_image_file.display(),
+                    size = metadata.len(),
+                    "checkpoint image written"
+                );
+                eprintln!(
+                    "checkpoint: {} ({} bytes)",
+                    checkpoint_image_file.display(),
+                    metadata.len()
+                );
+            } else {
+                anyhow::bail!(
+                    "checkpoint image not found at {} — sandbox may have failed to write it",
+                    checkpoint_image_file.display()
+                );
+            }
+
+            Ok(())
+        }
+
+        Command::Restore {
+            bundle,
+            container_id,
+            image_path,
+            pid_file,
+            console_socket: _, // TODO: PTY restore
+            no_pivot: _,
+            no_new_keyring: _,
+            detach: _, // TODO: detach support
+            tun_device,
+        } => {
+            tracing::info!(
+                container_id = %container_id,
+                bundle = %bundle.display(),
+                image_path = %image_path.display(),
+                "restoring container from checkpoint"
+            );
+
+            let bundle = bundle
+                .canonicalize()
+                .with_context(|| format!("bundle path not found: {}", bundle.display()))?;
+
+            let checkpoint_image_file = image_path.join("checkpoint.img");
+            if !checkpoint_image_file.exists() {
+                anyhow::bail!(
+                    "checkpoint image not found: {}",
+                    checkpoint_image_file.display()
+                );
+            }
+
+            // Create the container state directory
+            let state_dir = root.join("containers").join(&container_id);
+            std::fs::create_dir_all(&state_dir)?;
+
+            // Fork: child does the restore, parent saves state and exits
+            match unsafe { nix::unistd::fork() } {
+                Ok(nix::unistd::ForkResult::Parent { child }) => {
+                    let pid = child.as_raw().cast_unsigned();
+
+                    // Write PID file if requested
+                    if let Some(ref pf) = pid_file {
+                        std::fs::write(pf, format!("{pid}")).with_context(|| {
+                            format!("failed to write pid file: {}", pf.display())
+                        })?;
+                    }
+
+                    // Save container state
+                    let mut state = litebox_runner_oci::state::ContainerState::new(
+                        container_id.clone(),
+                        bundle.clone(),
+                    );
+                    state.status = litebox_runner_oci::state::Status::Running;
+                    state.pid = Some(pid);
+                    lifecycle.state_manager().save(&state)?;
+
+                    Ok(())
+                }
+                Ok(nix::unistd::ForkResult::Child) => {
+                    // Open checkpoint image and get fd
+                    use std::os::fd::AsRawFd;
+                    let file = std::fs::File::open(&checkpoint_image_file).with_context(|| {
+                        format!(
+                            "failed to open checkpoint image: {}",
+                            checkpoint_image_file.display()
+                        )
+                    })?;
+                    let fd = file.as_raw_fd();
+
+                    // Exec litebox-oci run with fork-restore flags.
+                    // The runner's fork-restore path reads the snapshot from the
+                    // given fd and restores the full sandbox state.
+                    let exe =
+                        std::env::current_exe().context("failed to get current executable")?;
+
+                    // We need the 9P broker for rootfs. Parse OCI spec for rootfs path.
+                    let spec_path = bundle.join("config.json");
+                    let spec: oci_spec::runtime::Spec = serde_json::from_reader(
+                        std::fs::File::open(&spec_path).context("failed to open config.json")?,
+                    )
+                    .context("failed to parse config.json")?;
+
+                    let rootfs_path = bundle.join(
+                        spec.root()
+                            .as_ref()
+                            .map_or(std::path::Path::new("rootfs"), |r| r.path().as_path()),
+                    );
+
+                    // For restore, we launch the runner directly with fork-restore
+                    // args. The runner's CliArgs::fork_restore path handles everything.
+                    let mut cmd = exec::Command::new(&exe);
+                    cmd.arg("run").arg("--bundle").arg(&bundle);
+                    if let Some(ref dev) = tun_device {
+                        cmd.arg("--tun-device").arg(dev);
+                    }
+                    cmd.arg(&container_id);
+
+                    // TODO: The fork-restore path in litebox_runner_linux_userland
+                    // requires --fork-restore and --fork-restore-fd flags on the
+                    // inner runner binary, but we go through the OCI run path here.
+                    // For now, we pass the checkpoint path via environment and let
+                    // run_container handle it (to be completed in a follow-up).
+                    //
+                    // For this initial implementation, we can directly invoke the
+                    // litebox runner binary with the fork-restore flags.
+
+                    // Set the checkpoint fd as an env var for the restore path
+                    // SAFETY: we are in a freshly-forked child with a single
+                    // thread — no concurrent readers of the environment.
+                    unsafe {
+                        std::env::set_var("LITEBOX_RESTORE_FD", format!("{fd}"));
+                        std::env::set_var(
+                            "LITEBOX_RESTORE_ROOTFS",
+                            rootfs_path.to_string_lossy().as_ref(),
+                        );
+                    }
+
+                    let err = cmd.exec();
+                    eprintln!("restore: exec failed: {err}");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    anyhow::bail!("fork failed: {e}");
+                }
+            }
         }
 
         Command::Info => {

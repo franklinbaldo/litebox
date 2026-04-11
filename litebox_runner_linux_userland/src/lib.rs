@@ -142,6 +142,12 @@ pub struct CliArgs {
     #[arg(skip)]
     pub network_config: Option<litebox::net::NetworkConfig>,
 
+    /// OCI state directory for this container.
+    /// When set, checkpoint support is enabled: the shim will monitor for
+    /// SIGUSR1 and read the checkpoint request file from this directory.
+    #[arg(skip)]
+    pub state_dir: Option<PathBuf>,
+
     /// Internal: run as a worker host process for a non-PIE child exec.
     ///
     /// When set, the runner loads the specified binary with the full VA space
@@ -494,6 +500,15 @@ pub fn run(mut cli_args: CliArgs) -> Result<i32> {
 
     litebox_platform_multiplex::set_platform(platform);
 
+    // Configure checkpoint support if a state directory is provided.
+    if let Some(ref state_dir) = cli_args.state_dir {
+        litebox_platform_linux_userland::set_checkpoint_state_dir(state_dir.clone());
+        let request_path = state_dir.join("checkpoint-request");
+        litebox_shim_linux::checkpoint::set_request_path(
+            request_path.to_string_lossy().into_owned(),
+        );
+    }
+
     // Register runner CLI flags that should be forwarded to worker host
     // processes spawned for non-PIE child execs.
     register_worker_spawn_flags(platform, &cli_args);
@@ -510,18 +525,11 @@ pub fn run(mut cli_args: CliArgs) -> Result<i32> {
     litebox_platform_linux_userland::forker::set_worker_callback(run_forked_worker);
 
     // Pre-open /dev/null for the forker to use for stdio wiring.
-    let dev_null_fd = unsafe {
-        libc::open(
-            b"/dev/null\0".as_ptr().cast(),
-            libc::O_RDWR | libc::O_CLOEXEC,
-        )
-    };
-    if dev_null_fd >= 0 {
-        if let Err(e) = platform.spawn_forker(dev_null_fd) {
-            eprintln!(
-                "warning: failed to spawn forker: {e}; fork-restore and worker-exec will fail"
-            );
-        }
+    let dev_null_fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    if dev_null_fd >= 0
+        && let Err(e) = platform.spawn_forker(dev_null_fd)
+    {
+        eprintln!("warning: failed to spawn forker: {e}; fork-restore and worker-exec will fail");
     }
 
     let mut shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
@@ -2726,9 +2734,9 @@ fn build_cli_args_from_exec_params(
 
     for (key, value) in &params.infra_flags {
         match key.as_str() {
-            "--nine-p-broker" => nine_p_broker = value.clone(),
-            "--network-broker" => network_broker = value.clone(),
-            "--tun-device-name" => tun_device_name = value.clone(),
+            "--nine-p-broker" => nine_p_broker.clone_from(value),
+            "--network-broker" => network_broker.clone_from(value),
+            "--tun-device-name" => tun_device_name.clone_from(value),
             "--initial-files" => initial_files = value.as_ref().map(PathBuf::from),
             "--program-from-tar" => program_from_tar = true,
             _ => {}
@@ -2756,6 +2764,7 @@ fn build_cli_args_from_exec_params(
         proc_mount: false,
         af_packet_fd: None,
         network_config: None,
+        state_dir: None,
         worker_exec: true,
         worker_exec_fd: None, // image is passed directly, not via fd
         worker_result_fd: result_fd,
@@ -2810,17 +2819,15 @@ fn run_forked_worker_exec(
             libc::_exit(1);
         }
     }
-    let params_data = match read_fork_snapshot_from_fd(params_fd) {
-        Ok(data) => data,
-        Err(_) => unsafe {
+    let Ok(params_data) = read_fork_snapshot_from_fd(params_fd) else {
+        unsafe {
             libc::_exit(1);
-        },
+        }
     };
-    let params = match WorkerExecParams::deserialize(&params_data) {
-        Ok(p) => p,
-        Err(_) => unsafe {
+    let Ok(params) = WorkerExecParams::deserialize(&params_data) else {
+        unsafe {
             libc::_exit(1);
-        },
+        }
     };
 
     // 2. Read exec image from memfd.
@@ -2830,11 +2837,10 @@ fn run_forked_worker_exec(
             libc::_exit(1);
         }
     }
-    let exec_image = match read_worker_exec_image(exec_image_fd) {
-        Ok(data) => data,
-        Err(_) => unsafe {
+    let Ok(exec_image) = read_worker_exec_image(exec_image_fd) else {
+        unsafe {
             libc::_exit(1);
-        },
+        }
     };
 
     // 3. Read interp image if present.
@@ -2857,6 +2863,7 @@ fn run_forked_worker_exec(
 
     // 5. Close remaining SCM_RIGHTS fds that we no longer need.
     for (i, &fd) in raw_fds.iter().enumerate() {
+        #[allow(clippy::cast_possible_truncation)]
         let i_u8 = i as u8;
         if i_u8 == req.snapshot_fd_idx {
             continue; // Already closed by read_fork_snapshot_from_fd.
@@ -2915,7 +2922,7 @@ fn run_forked_worker(
 
     // Convert the fds vec into raw fds, giving up OwnedFd ownership.
     // This prevents double-close when downstream code does from_raw_fd().
-    let raw_fds: Vec<i32> = fds.into_iter().map(|fd| fd.into_raw_fd()).collect();
+    let raw_fds: Vec<i32> = fds.into_iter().map(IntoRawFd::into_raw_fd).collect();
 
     // Dispatch based on request kind.
     match req.kind {
@@ -2963,37 +2970,32 @@ fn run_forked_worker(
             }
 
             // Read and deserialize the snapshot from the memfd.
-            let snapshot_data = match read_fork_snapshot_from_fd(snapshot_fd) {
-                Ok(data) => data,
-                Err(_) => {
-                    for &fd in &raw_fds {
-                        unsafe {
-                            libc::close(fd);
-                        }
-                    }
+            let Ok(snapshot_data) = read_fork_snapshot_from_fd(snapshot_fd) else {
+                for &fd in &raw_fds {
                     unsafe {
-                        libc::_exit(1);
+                        libc::close(fd);
                     }
+                }
+                unsafe {
+                    libc::_exit(1);
                 }
             };
             // snapshot_fd is now closed (read_fork_snapshot_from_fd takes ownership via from_raw_fd).
 
-            let snapshot =
-                match litebox_shim_linux::syscalls::fork_snapshot::ForkSnapshot::deserialize(
+            let Ok(snapshot) =
+                litebox_shim_linux::syscalls::fork_snapshot::ForkSnapshot::deserialize(
                     &snapshot_data,
-                ) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        for &fd in &raw_fds {
-                            unsafe {
-                                libc::close(fd);
-                            }
-                        }
-                        unsafe {
-                            libc::_exit(1);
-                        }
+                )
+            else {
+                for &fd in &raw_fds {
+                    unsafe {
+                        libc::close(fd);
                     }
-                };
+                }
+                unsafe {
+                    libc::_exit(1);
+                }
+            };
 
             // Build filesystem: shim builder, in-mem with /tmp, tar_ro from inherited data.
             let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
@@ -3082,6 +3084,7 @@ fn run_forked_worker(
             //                   ack_write_fd (wait - ack_fd IS the write fd).
             // Actually, let's just close the stdio-related fds that were already duped by worker_entry.
             for (i, &fd) in raw_fds.iter().enumerate() {
+                #[allow(clippy::cast_possible_truncation)]
                 let i_u8 = i as u8;
                 // Skip fds that are still in use.
                 if i_u8 == req.snapshot_fd_idx {
@@ -3118,9 +3121,8 @@ fn run_forked_worker(
             // Call fork_restore_and_ack, then run_program.
             // When a 9P broker is available, layer 9P on top of the default FS.
             if let Some(broker_addr) = INHERITED_NINE_P_BROKER.get() {
-                let (ring_writer, ring_reader) = match connect_nine_p_channel(broker_addr) {
-                    Ok(pair) => pair,
-                    Err(_) => unsafe { libc::_exit(1) },
+                let Ok((ring_writer, ring_reader)) = connect_nine_p_channel(broker_addr) else {
+                    unsafe { libc::_exit(1) }
                 };
 
                 let shim = shim_builder.build();
@@ -3131,11 +3133,10 @@ fn run_forked_worker(
                 let reader = ShmemTransportReader(ring_reader);
                 let litebox2 = shim.litebox();
                 let msize = 4 * 1024 * 1024u32;
-                let (nine_p_fs, mut nine_p_reader) = match litebox::fs::nine_p::FileSystem::new(
+                let Ok((nine_p_fs, mut nine_p_reader)) = litebox::fs::nine_p::FileSystem::new(
                     litebox2, writer, reader, msize, "root", "/",
-                ) {
-                    Ok(pair) => pair,
-                    Err(_) => unsafe { libc::_exit(1) },
+                ) else {
+                    unsafe { libc::_exit(1) }
                 };
                 let worker_handle = nine_p_fs.worker_handle();
                 let _nine_p_worker =

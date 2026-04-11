@@ -970,8 +970,8 @@ impl FdEntrySnapshot {
             Some(ls) => {
                 w.write_bool(true);
                 w.write_u32(u32::from_be_bytes(ls.bind_addr));
-                w.write_u32(ls.port as u32);
-                w.write_u32(ls.backlog as u32);
+                w.write_u32(u32::from(ls.port));
+                w.write_u32(u32::from(ls.backlog));
             }
             None => {
                 w.write_bool(false);

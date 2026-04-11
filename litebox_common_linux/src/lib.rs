@@ -633,6 +633,7 @@ impl<Platform: litebox::platform::RawPointerProvider> FcntlArg<Platform> {
                 cloexec: true,
                 min_fd: arg.truncate(),
             },
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             F_SETOWN => Self::SETOWN(arg as i32),
             F_GETOWN => Self::GETOWN,
             _ => return None,

@@ -56,17 +56,14 @@ static PLATFORM: AtomicPtr<Platform> = AtomicPtr::new(core::ptr::null_mut());
 /// Panics if invoked more than once (in the same process, without a preceding
 /// [`replace_platform`] call).
 pub fn set_platform(platform: &'static Platform) {
-    let ptr = platform as *const Platform as *mut Platform;
+    let ptr = core::ptr::from_ref(platform).cast_mut();
     let prev = PLATFORM.compare_exchange(
         core::ptr::null_mut(),
         ptr,
         Ordering::Release,
         Ordering::Relaxed,
     );
-    match prev {
-        Ok(_) => {}
-        Err(_) => panic!("set_platform should only be called once per crate"),
-    }
+    prev.expect("set_platform should only be called once per crate");
 }
 
 /// Replace the global platform reference.
@@ -83,7 +80,7 @@ pub fn set_platform(platform: &'static Platform) {
 ///
 /// In a forked single-threaded child these invariants are trivially satisfied.
 pub unsafe fn replace_platform(platform: &'static Platform) {
-    let ptr = platform as *const Platform as *mut Platform;
+    let ptr = core::ptr::from_ref(platform).cast_mut();
     PLATFORM.store(ptr, Ordering::Release);
 }
 
@@ -94,9 +91,10 @@ pub unsafe fn replace_platform(platform: &'static Platform) {
 /// Panics if [`set_platform`] has not been invoked before this
 pub fn platform() -> &'static Platform {
     let ptr = PLATFORM.load(Ordering::Acquire);
-    if ptr.is_null() {
-        panic!("set_platform should have already been called before this point");
-    }
+    assert!(
+        !ptr.is_null(),
+        "set_platform should have already been called before this point"
+    );
     // SAFETY: Non-null pointer was set by `set_platform` or `replace_platform`,
     // both of which require a valid `&'static Platform`.
     unsafe { &*ptr }

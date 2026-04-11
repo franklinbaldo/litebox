@@ -223,6 +223,11 @@ impl Lifecycle {
         Self { state_manager }
     }
 
+    /// Access the underlying state manager.
+    pub fn state_manager(&self) -> &StateManager {
+        &self.state_manager
+    }
+
     /// Create a container without starting it.
     ///
     /// This spawns a child process that waits for the start signal via a Unix socket.

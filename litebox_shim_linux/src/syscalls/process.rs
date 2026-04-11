@@ -1994,6 +1994,7 @@ impl<FS: ShimFS> Task<FS> {
                         delayed_fork_pending: core::cell::Cell::new(false),
                         migrated_to_remote: core::cell::Cell::new(false),
                         mux_pipe_pair_ids: core::cell::RefCell::new(alloc::vec::Vec::new()),
+                        checkpoint_requested: core::cell::Cell::new(false),
                     },
                 }),
             )
@@ -2689,6 +2690,7 @@ impl<FS: ShimFS> Task<FS> {
                         delayed_fork_pending: core::cell::Cell::new(delayed_fork),
                         migrated_to_remote: core::cell::Cell::new(false),
                         mux_pipe_pair_ids: core::cell::RefCell::new(alloc::vec::Vec::new()),
+                        checkpoint_requested: core::cell::Cell::new(false),
                     },
                 }),
             )
@@ -5984,6 +5986,99 @@ impl<FS: ShimFS> Task<FS> {
         Ok(usize::try_from(child_pid).unwrap())
     }
 
+    // ---------------------------------------------------------------------------
+    // Checkpoint: serialize the current task state to a file on disk.
+    // ---------------------------------------------------------------------------
+
+    /// Capture the current task state as a `ForkSnapshot` and write it to `path`.
+    ///
+    /// This is triggered by the OCI checkpoint command via SIGUSR1.  The guest
+    /// thread is already stopped (between syscalls) when this runs, so we have
+    /// a consistent view.
+    ///
+    /// After writing the checkpoint, the task marks itself as exiting so that
+    /// `prepare_to_run_guest()` returns `false` and the sandbox process
+    /// terminates cleanly.
+    pub(crate) fn checkpoint_to_file(
+        &self,
+        ctx: &litebox_common_linux::ExecutionContext,
+        image_path: &str,
+    ) -> bool {
+        use super::fork_snapshot::{ForkRejectReasons, ForkSnapshot};
+
+        // Park sibling threads for a consistent snapshot (same as true fork).
+        let did_park = self.park_other_threads().unwrap_or(false);
+
+        let mut reject = ForkRejectReasons::new();
+
+        // For checkpoint we reuse our own process_id/pid (not allocating a
+        // child), and exit_signal is irrelevant.
+        let identity = self.snapshot_identity(self.process_id, self.pid, 0);
+        let process_wide = self.snapshot_process_wide();
+        // Capture execution context as-is (guest is stopped between syscalls).
+        let thread = self.snapshot_thread_for_checkpoint(ctx);
+        let signal = self.snapshot_signal();
+        let fs = self.snapshot_fs();
+        let fd_table = self.snapshot_fd_table(&mut reject);
+        let memory = self.snapshot_memory(&mut reject);
+
+        if did_park {
+            self.unpark_other_threads();
+        }
+
+        if !reject.is_empty() {
+            litebox::log_println!(
+                self.global.platform,
+                "[CHECKPOINT] pid={}: rejected — {}",
+                self.pid,
+                reject,
+            );
+            return false;
+        }
+
+        let snapshot = ForkSnapshot {
+            identity,
+            process_wide,
+            thread,
+            signal,
+            fs,
+            fd_table,
+            memory,
+            is_delayed_fork: false,
+        };
+
+        let snapshot_bytes = snapshot.serialize();
+
+        litebox::log_println!(
+            self.global.platform,
+            "[CHECKPOINT] pid={}: snapshot serialized ({} bytes), writing to {}",
+            self.pid,
+            snapshot_bytes.len(),
+            image_path,
+        );
+
+        // Write the checkpoint image to disk using raw libc (no_std).
+        if !crate::checkpoint::write_file(image_path, &snapshot_bytes) {
+            litebox::log_println!(
+                self.global.platform,
+                "[CHECKPOINT] pid={}: failed to write checkpoint to {}",
+                self.pid,
+                image_path,
+            );
+            return false;
+        }
+
+        litebox::log_println!(
+            self.global.platform,
+            "[CHECKPOINT] pid={}: checkpoint written successfully",
+            self.pid,
+        );
+
+        // Mark the process for exit so the sandbox terminates after checkpoint.
+        self.exit_group(ExitStatus::Exit(0));
+        true
+    }
+
     /// Capture the calling task's identity for a true-fork snapshot.
     #[allow(dead_code)]
     fn snapshot_identity(
@@ -6084,6 +6179,34 @@ impl<FS: ShimFS> Task<FS> {
             execution_context: ctx.clone(),
             tls_base,
             set_child_tid,
+            clear_child_tid,
+            robust_list,
+        }
+    }
+
+    /// Capture thread state for a checkpoint snapshot (no clone flags needed).
+    fn snapshot_thread_for_checkpoint(
+        &self,
+        ctx: &litebox_common_linux::ExecutionContext,
+    ) -> super::fork_snapshot::ThreadSnapshot {
+        #[cfg(target_arch = "x86_64")]
+        let tls_base = {
+            let punchthrough = litebox_common_linux::PunchthroughSyscall::GetFsBase;
+            self.global
+                .platform
+                .get_punchthrough_token_for(punchthrough)
+                .and_then(|token| token.execute().ok())
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let tls_base: Option<usize> = None;
+
+        let clear_child_tid = self.thread.clear_child_tid.get().map(|ptr| ptr.as_usize());
+        let robust_list = self.thread.robust_list.get().map(|ptr| ptr.as_usize());
+
+        super::fork_snapshot::ThreadSnapshot {
+            execution_context: ctx.clone(),
+            tls_base,
+            set_child_tid: None,
             clear_child_tid,
             robust_list,
         }

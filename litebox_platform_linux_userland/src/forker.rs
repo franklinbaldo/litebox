@@ -73,6 +73,7 @@ pub enum StdioBinding {
 
 impl StdioBinding {
     /// Wire encoding: tag byte followed by optional payload.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
     fn serialize(&self, out: &mut Vec<u8>) {
         match self {
             StdioBinding::FromFdIndex(idx) => {
@@ -199,7 +200,7 @@ impl ForkRequest {
             out.extend_from_slice(&(guest_fd as u64).to_le_bytes());
             out.push(direction);
             out.push(ty);
-            out.push(if initial_eof { 1 } else { 0 });
+            out.push(u8::from(initial_eof));
         }
 
         // Pipe bridges
@@ -209,7 +210,7 @@ impl ForkRequest {
         for &(guest_fd, host_fd_idx, is_read) in &self.pipe_bridges {
             out.extend_from_slice(&(guest_fd as u64).to_le_bytes());
             out.push(host_fd_idx);
-            out.push(if is_read { 1 } else { 0 });
+            out.push(u8::from(is_read));
         }
 
         // Local pipes
@@ -228,6 +229,7 @@ impl ForkRequest {
     }
 
     /// Deserialize from wire format.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn deserialize(data: &[u8]) -> Result<Self, &'static str> {
         let mut pos = 0;
 
@@ -453,16 +455,18 @@ impl ForkResponse {
 ///
 /// `sock` must be a valid, connected Unix-domain socket file descriptor.
 /// All entries in `fds` must be valid, open file descriptors.
+#[allow(clippy::missing_panics_doc, clippy::cast_sign_loss)]
 pub fn send_msg_with_fds(sock: RawFd, data: &[u8], fds: &[RawFd]) -> Result<(), i32> {
     assert!(fds.len() <= MAX_SCMRIGHTS_FDS);
 
-    let fd_payload_size = fds.len() * size_of::<RawFd>();
+    let fd_payload_size = std::mem::size_of_val(fds);
 
     // SAFETY: CMSG_SPACE with a valid payload size returns the correct buffer size.
     #[allow(clippy::cast_possible_truncation)]
     let cmsg_space = unsafe { libc::CMSG_SPACE(fd_payload_size as u32) as usize };
 
     // Guarantees the control-message buffer is aligned for `cmsghdr`.
+    #[allow(clippy::items_after_statements)]
     #[repr(C)]
     struct AlignedBuf {
         _align: [libc::cmsghdr; 0],
@@ -534,12 +538,14 @@ pub fn send_msg_with_fds(sock: RawFd, data: &[u8], fds: &[RawFd]) -> Result<(), 
 ///
 /// `sock` must be a valid, connected Unix-domain socket file descriptor.
 /// `data_buf` must have sufficient capacity for the expected message.
+#[allow(clippy::missing_panics_doc, clippy::cast_sign_loss)]
 pub fn recv_msg_with_fds(sock: RawFd, data_buf: &mut [u8]) -> Result<(usize, Vec<OwnedFd>), i32> {
     // SAFETY: CMSG_SPACE with a valid payload size returns the correct buffer size.
     #[allow(clippy::cast_possible_truncation)]
     let cmsg_space =
         unsafe { libc::CMSG_SPACE((MAX_SCMRIGHTS_FDS * size_of::<RawFd>()) as u32) as usize };
 
+    #[allow(clippy::items_after_statements)]
     #[repr(C)]
     struct AlignedBuf {
         _align: [libc::cmsghdr; 0],
@@ -672,14 +678,11 @@ pub fn forker_main(cmd_sock: RawFd, dev_null_fd: RawFd, broker_fd: Option<RawFd>
 
     loop {
         // Block waiting for a fork request + fds from the runner.
-        let (req, fds) = match recv_fork_request(cmd_sock) {
-            Ok(pair) => pair,
-            Err(_) => {
-                // EOF or error — runner closed the socket, exit cleanly.
-                // SAFETY: _exit is always safe to call.
-                unsafe {
-                    libc::_exit(0);
-                }
+        let Ok((req, fds)) = recv_fork_request(cmd_sock) else {
+            // EOF or error — runner closed the socket, exit cleanly.
+            // SAFETY: _exit is always safe to call.
+            unsafe {
+                libc::_exit(0);
             }
         };
 
@@ -750,6 +753,7 @@ pub fn forker_main(cmd_sock: RawFd, dev_null_fd: RawFd, broker_fd: Option<RawFd>
                 libc::close(pid_pipe_read);
             }
 
+            #[allow(clippy::cast_possible_wrap)]
             let child_pid = if n == std::mem::size_of::<i32>() as isize {
                 // If the intermediate child wrote a negative value, it's -errno
                 // from a failed second fork.
@@ -940,12 +944,14 @@ pub struct WorkerExecParams {
     pub infra_flags: Vec<(String, Option<String>)>,
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn write_string(out: &mut Vec<u8>, s: &str) {
     let bytes = s.as_bytes();
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     out.extend_from_slice(bytes);
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn read_string(data: &[u8], pos: &mut usize) -> Result<String, &'static str> {
     if *pos + 4 > data.len() {
         return Err("WorkerExecParams: truncated string length");
@@ -1041,6 +1047,7 @@ impl WorkerExecParams {
     }
 
     /// Deserialize from wire format.
+    #[allow(clippy::similar_names, clippy::cast_possible_truncation)]
     pub fn deserialize(data: &[u8]) -> Result<Self, &'static str> {
         let mut pos = 0;
 

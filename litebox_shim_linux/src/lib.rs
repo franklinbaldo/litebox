@@ -46,6 +46,7 @@ macro_rules! log_unsupported {
 }
 
 pub(crate) mod channel;
+pub mod checkpoint;
 pub mod loader;
 #[cfg_attr(not(test), allow(dead_code))]
 mod multihost;
@@ -504,6 +505,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 delayed_fork_pending: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
                 mux_pipe_pair_ids: RefCell::new(Vec::new()),
+                checkpoint_requested: Cell::new(false),
             },
         };
         let exec_filename = alloc::ffi::CString::new(exec_filename).ok();
@@ -588,7 +590,11 @@ impl<FS: ShimFS> LinuxShim<FS> {
     ///
     /// Returns an error if restore fails (e.g., the snapshot references
     /// unsupported state).
-    #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        clippy::missing_panics_doc
+    )]
     pub fn restore_process(
         &self,
         snapshot: syscalls::fork_snapshot::ForkSnapshot,
@@ -1200,6 +1206,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 delayed_fork_pending: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
                 mux_pipe_pair_ids: RefCell::new(Vec::new()),
+                checkpoint_requested: Cell::new(false),
             },
         };
 
@@ -3698,6 +3705,12 @@ struct Task<FS: ShimFS> {
     /// `ForkContext.parent_pipe_fds` can exclude them, preventing nested
     /// mux-over-mux bridging that destroys the first mux's endpoints.
     mux_pipe_pair_ids: RefCell<Vec<usize>>,
+    /// Set by `check_for_interrupt` when SIGUSR1 is consumed from the
+    /// pending-signals bitmask.  `prepare_to_run_guest` reads and clears
+    /// this flag to trigger checkpoint.  This prevents SIGUSR1 from being
+    /// forwarded to the guest when the signal arrives during an
+    /// interruptible wait (e.g. nanosleep).
+    checkpoint_requested: Cell<bool>,
 }
 
 impl<FS: ShimFS> Drop for Task<FS> {
@@ -3748,6 +3761,7 @@ mod test_utils {
                 delayed_fork_pending: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
                 mux_pipe_pair_ids: RefCell::new(Vec::new()),
+                checkpoint_requested: Cell::new(false),
                 process_state: self.process_state.into(),
                 global: self.global,
             }
@@ -3784,6 +3798,7 @@ mod test_utils {
                 delayed_fork_pending: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
                 mux_pipe_pair_ids: RefCell::new(Vec::new()),
+                checkpoint_requested: Cell::new(false),
             };
             Some(task)
         }

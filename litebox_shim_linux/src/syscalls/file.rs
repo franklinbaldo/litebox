@@ -477,10 +477,7 @@ impl<FS: ShimFS> Task<FS> {
         let normalised: alloc::borrow::Cow<'_, str> = {
             let prefix = alloc::format!("/proc/{}/", self.pid);
             if path.starts_with(prefix.as_str()) {
-                alloc::borrow::Cow::Owned(alloc::format!(
-                    "/proc/self/{}",
-                    &path[prefix.len()..]
-                ))
+                alloc::borrow::Cow::Owned(alloc::format!("/proc/self/{}", &path[prefix.len()..]))
             } else {
                 alloc::borrow::Cow::Borrowed(path)
             }
@@ -501,7 +498,7 @@ impl<FS: ShimFS> Task<FS> {
     /// Generate `/proc/meminfo` content from `sys_sysinfo()` values.
     fn proc_meminfo_contents(&self) -> alloc::string::String {
         let info = self.sys_sysinfo();
-        let unit = info.mem_unit as u64;
+        let unit = u64::from(info.mem_unit);
         let total_kb = (info.totalram as u64 * unit) / 1024;
         let free_kb = (info.freeram as u64 * unit) / 1024;
         let swap_total_kb = (info.totalswap as u64 * unit) / 1024;
@@ -571,6 +568,7 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Generate `/proc/self/status` content.
+    #[allow(clippy::similar_names)]
     fn proc_self_status_contents(&self) -> alloc::string::String {
         let comm = self.task_comm_preview();
         let pid = self.pid;
@@ -600,16 +598,13 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Generate `/proc/self/stat` content (single line, 52 fields).
+    #[allow(clippy::similar_names)]
     fn proc_self_stat_contents(&self) -> alloc::string::String {
         let comm = self.task_comm_preview();
         let pid = self.pid;
         let ppid = self.ppid;
-        let pgid = self
-            .sys_getpgid(0)
-            .unwrap_or(pid.cast_unsigned());
-        let sid = self
-            .sys_getsid(0)
-            .unwrap_or(pid.cast_unsigned());
+        let pgid = self.sys_getpgid(0).unwrap_or(pid.cast_unsigned());
+        let sid = self.sys_getsid(0).unwrap_or(pid.cast_unsigned());
         let threads = self.process().nr_threads();
         //  1 (pid) 2 (comm) 3 state 4 ppid 5 pgid 6 sid 7 tty 8 tpgid
         //  9 flags 10 minflt 11 cminflt 12 majflt 13 cmajflt
@@ -832,10 +827,10 @@ impl<FS: ShimFS> Task<FS> {
     pub fn sys_open(&self, path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
         let path = self.resolve_path(path)?;
         // Intercept synthetic /proc files before falling through to the real FS.
-        if let Some(path_str) = path.to_str().ok() {
-            if let Some(content) = self.synthetic_proc_content(path_str) {
-                return self.open_synthetic_proc_text(flags, content);
-            }
+        if let Ok(path_str) = path.to_str()
+            && let Some(content) = self.synthetic_proc_content(path_str)
+        {
+            return self.open_synthetic_proc_text(flags, content);
         }
         if path.to_str().ok() == Some("/proc/self/maps") {
             return self.open_synthetic_proc_text(flags, self.proc_self_maps_contents());

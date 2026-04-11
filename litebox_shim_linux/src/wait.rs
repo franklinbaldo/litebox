@@ -47,8 +47,24 @@ impl<FS: ShimFS> Task<FS> {
         self.wait_state.0.prepare_to_run_guest(|| {
             use litebox::platform::SignalProvider as _;
             self.global.platform.take_pending_signals(|signal| {
+                // Intercept SIGUSR1 for checkpoint instead of forwarding
+                // to the guest. All other signals are queued normally.
+                if signal == litebox_common_linux::signal::Signal::SIGUSR1 {
+                    self.checkpoint_requested.set(true);
+                    return;
+                }
                 self.queue_signals(signal);
             });
+            // Check if checkpoint was requested (either from above, or from
+            // check_for_interrupt which may have consumed the signal earlier).
+            if self.checkpoint_requested.get() {
+                self.checkpoint_requested.set(false);
+                if let Some(request_path) = crate::checkpoint::get_request_path()
+                    && let Some(image_path) = crate::checkpoint::read_request_file(&request_path)
+                {
+                    self.checkpoint_to_file(ctx, &image_path);
+                }
+            }
             let _ = self.drain_one_local_control_plane_message();
             self.check_alarm_deadline();
             self.process_signals(ctx);
@@ -198,6 +214,13 @@ impl<FS: ShimFS> litebox::event::wait::CheckForInterrupt for Task<FS> {
     fn check_for_interrupt(&self) -> bool {
         use litebox::platform::SignalProvider as _;
         self.global.platform.take_pending_signals(|sig| {
+            // SIGUSR1 is reserved for checkpoint — set a flag instead of
+            // forwarding to the guest.  prepare_to_run_guest() will read
+            // the flag after the interruptible wait completes.
+            if sig == litebox_common_linux::signal::Signal::SIGUSR1 {
+                self.checkpoint_requested.set(true);
+                return;
+            }
             self.queue_signals(sig);
         });
         self.check_alarm_deadline();
@@ -215,6 +238,9 @@ impl<FS: ShimFS> litebox::event::wait::CheckForInterrupt for Task<FS> {
         // waits.
         self.drain_cross_process_signals();
 
-        self.is_exiting() || self.has_pending_signals() || self.is_suspended()
+        self.is_exiting()
+            || self.has_pending_signals()
+            || self.is_suspended()
+            || self.checkpoint_requested.get()
     }
 }
