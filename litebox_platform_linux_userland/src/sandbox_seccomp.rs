@@ -14,7 +14,7 @@
 //! The forker installs a tight filter before entering its recv loop.  Workers
 //! inherit it across `fork()`.  The runner does NOT install a filter because
 //! its filter would be inherited by exec worker children (spawned via
-//! posix_spawn), which need many init-time syscalls (socket, connect,
+//! the forker process), which need many init-time syscalls (socket, connect,
 //! ftruncate, sendmsg for SCM_RIGHTS, etc).
 //!
 //! # Key syscalls BLOCKED (the security wins for forker-spawned workers)

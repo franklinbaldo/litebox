@@ -484,7 +484,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let dev_null_fd = unsafe { libc::open(b"/dev/null\0".as_ptr().cast(), libc::O_RDWR | libc::O_CLOEXEC) };
     if dev_null_fd >= 0 {
         if let Err(e) = platform.spawn_forker(dev_null_fd) {
-            eprintln!("warning: failed to spawn forker: {e}; fork-restore will use posix_spawn fallback");
+            eprintln!("warning: failed to spawn forker: {e}; fork-restore and worker-exec will fail");
         }
     }
 
@@ -1826,8 +1826,8 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
 
 /// Shared core logic for running a non-PIE worker-exec.
 ///
-/// Used by both the CLI-based `run_worker_exec` (posix_spawn path) and
-/// `run_forked_worker_exec` (forker path). The caller is responsible for
+/// Used by both the CLI-based `run_worker_exec` (forker path) and
+/// `run_forked_worker_exec` (forker grandchild path). The caller is responsible for
 /// reading the exec/interp images from wherever they come from (fd or memfd)
 /// and passing them in.
 #[allow(clippy::similar_names)]
@@ -2006,7 +2006,7 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
     // NOTE: We intentionally do NOT install a seccomp filter on the runner.
     //
     // The runner's seccomp filter would be inherited by exec worker children
-    // (spawned via posix_spawn/clone3+execve), which need full syscall access
+    // (spawned via the forker process), which need full syscall access
     // during their init phase (socket, connect, ftruncate, sendmsg for
     // SCM_RIGHTS, etc.).  Rather than maintaining a fragile allowlist that
     // must track every syscall the exec worker init path might use, we rely
@@ -2014,9 +2014,8 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
     //
     //   - The forker installs a tight filter (no execve, no socket, no connect)
     //     before entering its recv loop.
-    //   - Workers spawned via fork() inherit this filter automatically.
-    //   - Exec workers (non-PIE fallback) run unfiltered — an acceptable
-    //     trade-off since they already require execve.
+    //   - All workers (fork-restore and exec) are spawned via fork() and
+    //     inherit this filter automatically.
 
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();

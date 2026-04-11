@@ -911,7 +911,7 @@ impl LinuxUserland {
 
     /// Attempt to spawn a worker via the forker process.
     ///
-    /// Translates the posix_spawn arguments into a [`ForkRequest`], sends it
+    /// Translates the fork-restore arguments into a [`ForkRequest`], sends it
     /// over the forker socket with SCM_RIGHTS, and receives the child PID.
     /// Returns `Ok(pid)` on success, `Err(())` if the forker is not available
     /// or the request fails.
@@ -1773,8 +1773,8 @@ impl LinuxUserland {
     where
         FS: litebox::fs::FileSystem + Send + Sync + 'static,
     {
-        // Try the forker path first (no execve, no openat).
-        if let Ok(result) = self.try_spawn_worker_exec_via_forker(
+        // Spawn via the forker process (no execve, no openat).
+        self.try_spawn_worker_exec_via_forker(
             guest_binary_path,
             argv,
             envp,
@@ -1789,334 +1789,8 @@ impl LinuxUserland {
             guest_interp_image,
             &stdio,
             direct_pipe_io,
-        ) {
-            return Ok(result);
-        }
-        // Fall through to posix_spawn path.
-
-        use std::os::unix::ffi::OsStrExt;
-
-        // SAFETY: `environ` is the standard C runtime global environment pointer.
-        unsafe extern "C" {
-            static environ: *const *const libc::c_char;
-        }
-
-        struct FileActionsGuard(*mut libc::posix_spawn_file_actions_t);
-        impl Drop for FileActionsGuard {
-            fn drop(&mut self) {
-                // SAFETY: initialized via posix_spawn_file_actions_init in this scope.
-                unsafe {
-                    libc::posix_spawn_file_actions_destroy(self.0);
-                }
-            }
-        }
-
-        let _spawn_guard = self.worker_spawn_serial.lock().unwrap();
-        self.reap_finished_worker_bridge_threads();
-        let exec_image_fd = create_worker_exec_image_fd(guest_exec_image).map_err(|_| -1_i32)?;
-        let (result_read_fd, result_write_fd) = create_worker_result_pipe().map_err(|_| -1_i32)?;
-        let interp_image_fd = guest_interp_image
-            .map(|(_, image)| create_worker_exec_image_fd(image))
-            .transpose()
-            .map_err(|_| -1_i32)?;
-        let host_stdio_temp_sources =
-            duplicate_host_stdio_sources_for_spawn(&stdio).map_err(|_| -1_i32)?;
-
-        // Build the command line for the worker:
-        //   /proc/self/exe -Z --worker-exec [extra_flags...] --cwd <cwd>
-        //       --env K=V ... -- <guest_binary> [original argv...]
-        let self_exe = std::fs::read_link("/proc/self/exe").map_err(|_| -1_i32)?;
-        let mut spawn_argv: Vec<CString> = vec![
-            CString::new(self_exe.as_os_str().as_bytes()).map_err(|_| -1_i32)?,
-            CString::new("-Z").unwrap(),
-            CString::new("--worker-exec").unwrap(),
-            CString::new("--worker-exec-fd").unwrap(),
-            CString::new(exec_image_fd.as_raw_fd().to_string()).map_err(|_| -1_i32)?,
-            CString::new("--worker-result-fd").unwrap(),
-            CString::new(result_write_fd.as_raw_fd().to_string()).map_err(|_| -1_i32)?,
-        ];
-        if let (Some((interp_path, _)), Some(interp_image_fd)) =
-            (guest_interp_image, interp_image_fd.as_ref())
-        {
-            spawn_argv.push(CString::new("--worker-interp-path").unwrap());
-            spawn_argv.push(CString::new(interp_path).map_err(|_| -1_i32)?);
-            spawn_argv.push(CString::new("--worker-interp-fd").unwrap());
-            spawn_argv
-                .push(CString::new(interp_image_fd.as_raw_fd().to_string()).map_err(|_| -1_i32)?);
-        }
-
-        // Include runner flags (--nine-p-broker, --initial-files, etc.)
-        {
-            let flags = self.worker_spawn_flags.read().unwrap();
-            for flag in flags.iter() {
-                spawn_argv.push(flag.clone());
-            }
-        }
-
-        // Forward the guest's current working directory.
-        spawn_argv.push(CString::new("--cwd").unwrap());
-        spawn_argv.push(CString::new(guest_cwd).map_err(|_| -1_i32)?);
-
-        // Forward guest identity via CLI args (safe with concurrent host threads,
-        // unlike std::env::set_var which mutates the global environment).
-        spawn_argv.push(CString::new("--guest-pid").unwrap());
-        spawn_argv.push(CString::new(guest_pid.to_string()).map_err(|_| -1_i32)?);
-        spawn_argv.push(CString::new("--guest-ppid").unwrap());
-        spawn_argv.push(CString::new(guest_ppid.to_string()).map_err(|_| -1_i32)?);
-        spawn_argv.push(CString::new("--guest-uid").unwrap());
-        spawn_argv.push(CString::new(guest_uid.to_string()).map_err(|_| -1_i32)?);
-        spawn_argv.push(CString::new("--guest-euid").unwrap());
-        spawn_argv.push(CString::new(guest_euid.to_string()).map_err(|_| -1_i32)?);
-        spawn_argv.push(CString::new("--guest-gid").unwrap());
-        spawn_argv.push(CString::new(guest_gid.to_string()).map_err(|_| -1_i32)?);
-        spawn_argv.push(CString::new("--guest-egid").unwrap());
-        spawn_argv.push(CString::new(guest_egid.to_string()).map_err(|_| -1_i32)?);
-
-        // Forward guest environment as --env K=V pairs.
-        for env_entry in envp {
-            spawn_argv.push(CString::new("--env").unwrap());
-            spawn_argv.push(env_entry.clone());
-        }
-        spawn_argv.push(CString::new("--").unwrap());
-        // Forward the full original guest argv (argv[0] may differ from
-        // guest_binary_path for symlinks/busybox-style applets).
-        spawn_argv.push(CString::new(guest_binary_path).map_err(|_| -1_i32)?);
-        for arg in argv {
-            spawn_argv.push(arg.clone());
-        }
-
-        let argv_ptrs: Vec<*const libc::c_char> = spawn_argv
-            .iter()
-            .map(|s| s.as_ptr())
-            .chain(core::iter::once(core::ptr::null()))
-            .collect();
-
-        let mut spawn_file_actions =
-            std::mem::MaybeUninit::<libc::posix_spawn_file_actions_t>::uninit();
-        if unsafe { libc::posix_spawn_file_actions_init(spawn_file_actions.as_mut_ptr()) } != 0 {
-            return Err(-1_i32);
-        }
-        let file_actions_ptr = spawn_file_actions.as_mut_ptr();
-        let _file_actions_guard = FileActionsGuard(file_actions_ptr);
-
-        let input_source = collect_worker_exec_input_source(&stdio);
-        let mut output_groups = collect_worker_exec_output_groups(&stdio);
-        match &stdio.stdin {
-            WorkerExecInputBinding::HostStdio { fd } if *fd != 0 => {
-                let Some(source_idx) = worker_host_stdio_index(*fd) else {
-                    return Err(-1_i32);
-                };
-                let Some(source) = host_stdio_temp_sources[source_idx].as_ref() else {
-                    return Err(-1_i32);
-                };
-                let source_fd = source.as_raw_fd();
-                if unsafe { libc::posix_spawn_file_actions_adddup2(file_actions_ptr, source_fd, 0) }
-                    != 0
-                {
-                    return Err(-1_i32);
-                }
-            }
-            WorkerExecInputBinding::HostPipe { fd } => {
-                // dup2 the host pipe fd onto stdin in the child.
-                // The fd has O_CLOEXEC but posix_spawn file actions run
-                // before exec, so dup2 succeeds and fd 0 survives exec.
-                if unsafe { libc::posix_spawn_file_actions_adddup2(file_actions_ptr, *fd, 0) } != 0
-                {
-                    return Err(-1_i32);
-                }
-            }
-            WorkerExecInputBinding::Close => {
-                if unsafe { libc::posix_spawn_file_actions_addclose(file_actions_ptr, 0) } != 0 {
-                    return Err(-1_i32);
-                }
-            }
-            _ => {}
-        }
-        let mut input_bridges = Vec::new();
-        let mut worker_input_read_fds = Vec::new();
-        if let Some(input_source) = input_source {
-            let (read_fd, write_fd) =
-                create_worker_stdio_pipe(false, false, None).map_err(|_| -1_i32)?;
-            if unsafe {
-                libc::posix_spawn_file_actions_adddup2(file_actions_ptr, read_fd.as_raw_fd(), 0)
-            } != 0
-                || unsafe {
-                    libc::posix_spawn_file_actions_addclose(file_actions_ptr, read_fd.as_raw_fd())
-                } != 0
-                || unsafe {
-                    libc::posix_spawn_file_actions_addclose(file_actions_ptr, write_fd.as_raw_fd())
-                } != 0
-            {
-                return Err(-1_i32);
-            }
-            worker_input_read_fds.push(read_fd);
-            input_bridges.push((input_source, write_fd));
-        }
-        for (fd_num, binding) in [(1, &stdio.stdout), (2, &stdio.stderr)] {
-            match binding {
-                WorkerExecOutputBinding::HostStdio { fd } if *fd != fd_num => {
-                    let Some(source_idx) = worker_host_stdio_index(*fd) else {
-                        return Err(-1_i32);
-                    };
-                    let Some(source) = host_stdio_temp_sources[source_idx].as_ref() else {
-                        return Err(-1_i32);
-                    };
-                    let source_fd = source.as_raw_fd();
-                    if unsafe {
-                        libc::posix_spawn_file_actions_adddup2(file_actions_ptr, source_fd, fd_num)
-                    } != 0
-                    {
-                        return Err(-1_i32);
-                    }
-                }
-                WorkerExecOutputBinding::HostPipe { fd } => {
-                    if unsafe {
-                        libc::posix_spawn_file_actions_adddup2(file_actions_ptr, *fd, fd_num)
-                    } != 0
-                    {
-                        return Err(-1_i32);
-                    }
-                }
-                WorkerExecOutputBinding::Close => {
-                    if unsafe { libc::posix_spawn_file_actions_addclose(file_actions_ptr, fd_num) }
-                        != 0
-                    {
-                        return Err(-1_i32);
-                    }
-                }
-                _ => {}
-            }
-        }
-        for temp_fd in host_stdio_temp_sources.iter().flatten() {
-            if unsafe {
-                libc::posix_spawn_file_actions_addclose(file_actions_ptr, temp_fd.as_raw_fd())
-            } != 0
-            {
-                return Err(-1_i32);
-            }
-        }
-        let mut output_bridges = Vec::new();
-        let mut worker_output_write_fds = Vec::new();
-        for group in output_groups.drain(..) {
-            let (write_nonblocking, write_capacity) = match &group.sink {
-                WorkerExecOutputSink::Pipe { pipes, fd } => (
-                    pipes
-                        .get_flags(fd.as_ref())
-                        .map(|flags| flags.contains(litebox::pipes::Flags::NON_BLOCKING))
-                        .unwrap_or(false),
-                    pipes
-                        .writable_bytes(fd.as_ref())
-                        .ok()
-                        .filter(|capacity| supports_bridge_pipe_capacity(*capacity)),
-                ),
-                WorkerExecOutputSink::Fs { .. } | WorkerExecOutputSink::Stream(_) => (false, None),
-            };
-            if write_nonblocking && write_capacity.is_none() {
-                return Err(-1_i32);
-            }
-            let (read_fd, write_fd) =
-                create_worker_stdio_pipe(false, write_nonblocking, write_capacity)
-                    .map_err(|_| -1_i32)?;
-            for &target_fd in &group.target_fds {
-                if unsafe {
-                    libc::posix_spawn_file_actions_adddup2(
-                        file_actions_ptr,
-                        write_fd.as_raw_fd(),
-                        target_fd,
-                    )
-                } != 0
-                {
-                    return Err(-1_i32);
-                }
-            }
-            if unsafe {
-                libc::posix_spawn_file_actions_addclose(file_actions_ptr, write_fd.as_raw_fd())
-            } != 0
-                || unsafe {
-                    libc::posix_spawn_file_actions_addclose(file_actions_ptr, read_fd.as_raw_fd())
-                } != 0
-            {
-                return Err(-1_i32);
-            }
-            worker_output_write_fds.push(write_fd);
-            let first_target_fd = group.target_fds[0];
-            output_bridges.push((group.sink, read_fd, first_target_fd));
-        }
-
-        // The worker inherits the current host environment.
-        let mut pid: libc::pid_t = 0;
-        let ret = unsafe {
-            libc::posix_spawn(
-                core::ptr::addr_of_mut!(pid),
-                spawn_argv[0].as_ptr(),
-                file_actions_ptr,
-                core::ptr::null(),
-                argv_ptrs.as_ptr().cast::<*mut libc::c_char>(),
-                environ.cast::<*mut libc::c_char>(),
-            )
-        };
-        if ret != 0 {
-            return Err(ret);
-        }
-        drop(worker_input_read_fds);
-        drop(worker_output_write_fds);
-        drop(host_stdio_temp_sources);
-        let mut bridge_threads = Vec::new();
-        let mut direct_pipes = Vec::new();
-        for (source, write_fd) in input_bridges {
-            if direct_pipe_io && matches!(&source, WorkerExecInputSource::Pipe { .. }) {
-                // Skip bridge thread: the caller will install a HostPipeFd for
-                // the parent's corresponding pipe endpoint.
-                let raw_fd = write_fd.into_raw_fd();
-                direct_pipes.push(ExecPipeDirectIo {
-                    child_stdio_fd: 0,
-                    parent_os_fd: raw_fd,
-                });
-            } else {
-                let Ok(bridge) = spawn_worker_input_bridge(self, source, write_fd) else {
-                    for dp in &direct_pipes {
-                        close_raw_fd(dp.parent_os_fd);
-                    }
-                    terminate_worker_after_bridge_spawn_failure(self, pid, bridge_threads);
-                    return Err(-1_i32);
-                };
-                bridge_threads.push(bridge);
-            }
-        }
-        for (sink, read_fd, target_fd) in output_bridges {
-            if direct_pipe_io && matches!(&sink, WorkerExecOutputSink::Pipe { .. }) {
-                let raw_fd = read_fd.into_raw_fd();
-                direct_pipes.push(ExecPipeDirectIo {
-                    child_stdio_fd: target_fd,
-                    parent_os_fd: raw_fd,
-                });
-            } else {
-                let bridge = if let Ok(handle) = spawn_worker_output_bridge(self, sink, read_fd) {
-                    DetachedWorkerBridge {
-                        handle,
-                        input_control: None,
-                    }
-                } else {
-                    for dp in &direct_pipes {
-                        close_raw_fd(dp.parent_os_fd);
-                    }
-                    terminate_worker_after_bridge_spawn_failure(self, pid, bridge_threads);
-                    return Err(-1_i32);
-                };
-                bridge_threads.push(bridge);
-            }
-        }
-        self.worker_processes.lock().unwrap().insert(
-            pid,
-            WorkerHostProcess {
-                result_fd: result_read_fd,
-                bridge_threads,
-            },
-        );
-        Ok(WorkerExecSpawnResult {
-            host_pid: pid,
-            direct_pipes,
-        })
+        )
+        .map_err(|()| -1_i32)
     }
 
     /// Read from an arbitrary host file descriptor.
@@ -2223,7 +1897,7 @@ impl LinuxUserland {
     ///
     /// Returns `(fd_a, fd_b)` — both ends are equivalent.  Both FDs have
     /// `O_CLOEXEC` set; the caller must clear it on the end that should
-    /// survive `posix_spawn`.
+    /// survive `exec`.
     pub fn create_host_socketpair(&self) -> Result<(i32, i32), litebox_common_linux::errno::Errno> {
         let mut fds = [0i32; 2];
         // SAFETY: fds points to a valid 2-element array.
@@ -2256,19 +1930,6 @@ impl LinuxUserland {
         }
     }
 
-    /// Clear the `O_CLOEXEC` flag on a host file descriptor so it survives
-    /// `posix_spawn` / `exec`.
-    pub fn clear_cloexec(&self, fd: i32) -> Result<(), litebox_common_linux::errno::Errno> {
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        if flags < 0 {
-            return Err(litebox_common_linux::errno::Errno::EBADF);
-        }
-        if unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
-            return Err(litebox_common_linux::errno::Errno::EBADF);
-        }
-        Ok(())
-    }
-
     /// Set `O_NONBLOCK` on a host file descriptor.
     pub fn set_host_fd_nonblock(&self, fd: i32) -> Result<(), litebox_common_linux::errno::Errno> {
         // SAFETY: fd is a valid host FD.
@@ -2291,7 +1952,7 @@ impl LinuxUserland {
     ///
     /// Writes the serialized snapshot to a memfd, creates an ack pipe for the
     /// child to report restore success/failure, and launches a new host process
-    /// via `posix_spawn`.
+    /// via the forker process.
     ///
     /// The multiplexer socketpair fd (`mux_fd`) and per-stream mappings
     /// (`mux_streams`) replace the old per-fd `--pipe-bridge` arguments.
@@ -2320,340 +1981,19 @@ impl LinuxUserland {
     where
         FS: litebox::fs::FileSystem + Send + Sync + 'static,
     {
-        use std::os::unix::ffi::OsStrExt;
-
-        // SAFETY: `environ` is the standard C runtime global environment pointer.
-        unsafe extern "C" {
-            static environ: *const *const libc::c_char;
-        }
-
-        struct FileActionsGuard(*mut libc::posix_spawn_file_actions_t);
-        impl Drop for FileActionsGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    libc::posix_spawn_file_actions_destroy(self.0);
-                }
-            }
-        }
-
         let _spawn_guard = self.worker_spawn_serial.lock().unwrap();
         self.reap_finished_worker_bridge_threads();
 
-        // Try the forker path first (no execve, no openat).
-        if let Ok(pid) = self.try_spawn_via_forker(
+        // Spawn via the forker process (no execve, no openat).
+        self.try_spawn_via_forker(
             snapshot_bytes,
             &stdio,
             mux_fd,
             mux_streams,
             passthrough_fds,
             local_pipe_pairs,
-        ) {
-            return Ok(pid);
-        }
-        // Fall through to posix_spawn.
-
-        // Create memfd with serialized snapshot.
-        let snapshot_fd = create_worker_fork_snapshot_fd(snapshot_bytes).map_err(|_| -1_i32)?;
-
-        // Create ack pipe: child writes restore status, parent reads it.
-        let (ack_read_fd, ack_write_fd) = create_worker_result_pipe().map_err(|_| -1_i32)?;
-
-        // Create result pipe for exit status (reuses exec infrastructure).
-        let (result_read_fd, result_write_fd) = create_worker_result_pipe().map_err(|_| -1_i32)?;
-
-        let host_stdio_temp_sources =
-            duplicate_host_stdio_sources_for_spawn(&stdio).map_err(|_| -1_i32)?;
-
-        // Build command: /proc/self/exe -Z --fork-restore --fork-restore-fd N
-        //     --fork-restore-ack-fd N --worker-result-fd N
-        let self_exe = std::fs::read_link("/proc/self/exe").map_err(|_| -1_i32)?;
-        let mut spawn_argv: Vec<CString> = vec![
-            CString::new(self_exe.as_os_str().as_bytes()).map_err(|_| -1_i32)?,
-            CString::new("-Z").unwrap(),
-            CString::new("--fork-restore").unwrap(),
-            CString::new("--fork-restore-fd").unwrap(),
-            CString::new(snapshot_fd.as_raw_fd().to_string()).map_err(|_| -1_i32)?,
-            CString::new("--fork-restore-ack-fd").unwrap(),
-            CString::new(ack_write_fd.as_raw_fd().to_string()).map_err(|_| -1_i32)?,
-            CString::new("--worker-result-fd").unwrap(),
-            CString::new(result_write_fd.as_raw_fd().to_string()).map_err(|_| -1_i32)?,
-        ];
-
-        // Forward runner infrastructure flags.
-        {
-            let flags = self.worker_spawn_flags.read().unwrap();
-            for flag in flags.iter() {
-                spawn_argv.push(flag.clone());
-            }
-        }
-
-        // Add --mux-fd if a socketpair was created.
-        if let Some(mux_fd) = mux_fd {
-            let _ = self.clear_cloexec(mux_fd);
-            spawn_argv.push(CString::new("--mux-fd").unwrap());
-            spawn_argv.push(CString::new(mux_fd.to_string()).map_err(|_| -1_i32)?);
-        }
-
-        // Add --mux-stream for each muxed stream.
-        // Format: stream_id:guest_fd:direction:type[:e]
-        // The optional :e suffix marks streams with initial EOF.
-        for &(stream_id, guest_fd, dir, stype, initial_eof) in mux_streams {
-            spawn_argv.push(CString::new("--mux-stream").unwrap());
-            let spec = if initial_eof {
-                format!(
-                    "{}:{}:{}:{}:e",
-                    stream_id, guest_fd, dir as char, stype as char,
-                )
-            } else {
-                format!(
-                    "{}:{}:{}:{}",
-                    stream_id, guest_fd, dir as char, stype as char,
-                )
-            };
-            spawn_argv.push(CString::new(spec).map_err(|_| -1_i32)?);
-        }
-
-        // Add --pipe-bridge for host-pipe passthrough fds (from prior bridges).
-        for &(guest_fd, host_fd, is_read) in passthrough_fds {
-            let _ = self.clear_cloexec(host_fd);
-            let dir_char = if is_read { 'r' } else { 'w' };
-            spawn_argv.push(CString::new("--pipe-bridge").unwrap());
-            spawn_argv.push(
-                CString::new(format!("{guest_fd}:{dir_char}:{host_fd}")).map_err(|_| -1_i32)?,
-            );
-        }
-
-        // Add --local-pipe for child-only pipe pairs (both ends in the
-        // child, not in the parent).  The worker creates a connected
-        // pipe pair and installs both ends at the specified fds.
-        // Format: write_fd:read_fd::w_flags:r_flags or
-        //         write_fd:read_fd:drain_fd:w_flags:r_flags
-        // where drain_fd is a memfd containing buffered data and
-        // w_flags/r_flags are per-end OFlags as decimal integers.
-        // Keep OwnedFds alive until posix_spawn (Drop closes them).
-        // Collected here so early returns automatically close them.
-        let mut drain_owned_fds: Vec<std::os::fd::OwnedFd> = Vec::new();
-        for &(write_fd, read_fd, ref drained, w_flags, r_flags) in local_pipe_pairs {
-            spawn_argv.push(CString::new("--local-pipe").unwrap());
-            if drained.is_empty() {
-                spawn_argv.push(
-                    CString::new(format!("{write_fd}:{read_fd}::{w_flags}:{r_flags}"))
-                        .map_err(|_| -1_i32)?,
-                );
-            } else {
-                // Write drained data to a memfd (avoids E2BIG on large buffers).
-                let drain_fd = create_worker_fork_snapshot_fd(drained).map_err(|_| -1_i32)?;
-                let raw_drain_fd = drain_fd.as_raw_fd();
-                let _ = self.clear_cloexec(raw_drain_fd);
-                // Keep OwnedFd alive until after posix_spawn.
-                drain_owned_fds.push(drain_fd);
-                spawn_argv.push(
-                    CString::new(format!(
-                        "{write_fd}:{read_fd}:{raw_drain_fd}:{w_flags}:{r_flags}"
-                    ))
-                    .map_err(|_| -1_i32)?,
-                );
-            }
-        }
-
-        let argv_ptrs: Vec<*const libc::c_char> = spawn_argv
-            .iter()
-            .map(|s| s.as_ptr())
-            .chain(core::iter::once(core::ptr::null()))
-            .collect();
-
-        // Set up file actions for stdio.
-        let mut spawn_file_actions =
-            std::mem::MaybeUninit::<libc::posix_spawn_file_actions_t>::uninit();
-        if unsafe { libc::posix_spawn_file_actions_init(spawn_file_actions.as_mut_ptr()) } != 0 {
-            return Err(-1_i32);
-        }
-        let file_actions_ptr = spawn_file_actions.as_mut_ptr();
-        let _file_actions_guard = FileActionsGuard(file_actions_ptr);
-
-        // Wire up stdio from bindings (same pattern as exec).
-        match &stdio.stdin {
-            WorkerExecInputBinding::HostStdio { fd } if *fd != 0 => {
-                let Some(source_idx) = worker_host_stdio_index(*fd) else {
-                    return Err(-1_i32);
-                };
-                let Some(source) = host_stdio_temp_sources[source_idx].as_ref() else {
-                    return Err(-1_i32);
-                };
-                if unsafe {
-                    libc::posix_spawn_file_actions_adddup2(file_actions_ptr, source.as_raw_fd(), 0)
-                } != 0
-                {
-                    return Err(-1_i32);
-                }
-            }
-            WorkerExecInputBinding::HostPipe { fd } => {
-                if unsafe { libc::posix_spawn_file_actions_adddup2(file_actions_ptr, *fd, 0) } != 0
-                {
-                    return Err(-1_i32);
-                }
-            }
-            WorkerExecInputBinding::Close => {
-                if unsafe { libc::posix_spawn_file_actions_addclose(file_actions_ptr, 0) } != 0 {
-                    return Err(-1_i32);
-                }
-            }
-            WorkerExecInputBinding::Inherit => {
-                // Let fd 0 pass through from the parent — no file action needed.
-            }
-            // For Pipe/Stream/Fs bindings, the mux handles all
-            // actual data flow via virtual pipes.  Redirect the worker's
-            // host stdin to /dev/null so it cannot read from the terminal.
-            _ => {
-                if unsafe {
-                    libc::posix_spawn_file_actions_addopen(
-                        file_actions_ptr,
-                        0,
-                        b"/dev/null\0".as_ptr().cast::<libc::c_char>(),
-                        libc::O_RDONLY,
-                        0,
-                    )
-                } != 0
-                {
-                    return Err(-1_i32);
-                }
-            }
-        }
-        for (fd_num, binding) in [(1, &stdio.stdout), (2, &stdio.stderr)] {
-            match binding {
-                WorkerExecOutputBinding::HostStdio { fd } if *fd != fd_num => {
-                    let Some(source_idx) = worker_host_stdio_index(*fd) else {
-                        return Err(-1_i32);
-                    };
-                    let Some(source) = host_stdio_temp_sources[source_idx].as_ref() else {
-                        return Err(-1_i32);
-                    };
-                    if unsafe {
-                        libc::posix_spawn_file_actions_adddup2(
-                            file_actions_ptr,
-                            source.as_raw_fd(),
-                            fd_num,
-                        )
-                    } != 0
-                    {
-                        return Err(-1_i32);
-                    }
-                }
-                WorkerExecOutputBinding::HostPipe { fd } => {
-                    if unsafe {
-                        libc::posix_spawn_file_actions_adddup2(file_actions_ptr, *fd, fd_num)
-                    } != 0
-                    {
-                        return Err(-1_i32);
-                    }
-                }
-                WorkerExecOutputBinding::Close => {
-                    if unsafe { libc::posix_spawn_file_actions_addclose(file_actions_ptr, fd_num) }
-                        != 0
-                    {
-                        return Err(-1_i32);
-                    }
-                }
-                WorkerExecOutputBinding::Inherit => {
-                    // Let fd pass through from the parent — no file action needed.
-                }
-                // For Pipe/Stream/Fs bindings, the mux handles all
-                // actual data flow via virtual pipes.  Redirect the worker's
-                // host stdout/stderr to /dev/null so it cannot write to the
-                // terminal.
-                _ => {
-                    if unsafe {
-                        libc::posix_spawn_file_actions_addopen(
-                            file_actions_ptr,
-                            fd_num,
-                            b"/dev/null\0".as_ptr().cast::<libc::c_char>(),
-                            libc::O_WRONLY,
-                            0,
-                        )
-                    } != 0
-                    {
-                        return Err(-1_i32);
-                    }
-                }
-            }
-        }
-        for temp_fd in host_stdio_temp_sources.iter().flatten() {
-            if unsafe {
-                libc::posix_spawn_file_actions_addclose(file_actions_ptr, temp_fd.as_raw_fd())
-            } != 0
-            {
-                return Err(-1_i32);
-            }
-        }
-
-        // Spawn the child process.
-        let mut pid: libc::pid_t = 0;
-        let ret = unsafe {
-            libc::posix_spawn(
-                core::ptr::addr_of_mut!(pid),
-                spawn_argv[0].as_ptr(),
-                file_actions_ptr,
-                core::ptr::null(),
-                argv_ptrs.as_ptr().cast::<*mut libc::c_char>(),
-                environ.cast::<*mut libc::c_char>(),
-            )
-        };
-        if ret != 0 {
-            // Close mux fd — child was never spawned, so caller must not
-            // close it (the function takes ownership).
-            if let Some(mux_fd) = mux_fd {
-                self.close_host_fd(mux_fd);
-            }
-            // drain_owned_fds dropped automatically (OwnedFd::drop closes).
-            return Err(ret);
-        }
-        drop(host_stdio_temp_sources);
-
-        // Close write ends so the parent only reads.
-        drop(ack_write_fd);
-        drop(result_write_fd);
-        drop(snapshot_fd);
-
-        // Close child-side passthrough pipe bridge FDs (child inherited them
-        // via posix_spawn since we cleared CLOEXEC).
-        for &(_, host_fd, _) in passthrough_fds {
-            self.close_host_fd(host_fd);
-        }
-
-        // Close drain memfds (child inherited them via posix_spawn).
-        drop(drain_owned_fds);
-
-        // Close the worker's mux socketpair end (the child inherited it).
-        if let Some(mux_fd) = mux_fd {
-            self.close_host_fd(mux_fd);
-        }
-
-        // Read ack from child: 0 = success, non-zero = error.
-        let ack_status = read_fork_restore_ack(ack_read_fd);
-
-        if ack_status != 0 {
-            // Restore failed. Reap the child synchronously.
-            let mut status: libc::c_int = 0;
-            loop {
-                let ret = unsafe { libc::waitpid(pid, core::ptr::addr_of_mut!(status), 0) };
-                if ret != -1
-                    || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
-                {
-                    break;
-                }
-            }
-            return Err(ack_status);
-        }
-
-        // Register the child worker so it can be reaped later.
-        self.worker_processes.lock().unwrap().insert(
-            pid,
-            WorkerHostProcess {
-                result_fd: result_read_fd,
-                bridge_threads: Vec::new(),
-            },
-        );
-        Ok(pid)
+        )
+        .map_err(|()| -1_i32)
     }
 
     /// Wait for a worker host process to exit and return the exit status.
@@ -2875,64 +2215,6 @@ fn read_fork_restore_ack(ack_fd: std::os::fd::OwnedFd) -> i32 {
         // Pipe closed without data — child exited before acking.
         Err(_) => -1,
     }
-}
-
-fn duplicate_host_stdio_fd_for_spawn(source_fd: i32) -> std::io::Result<std::os::fd::OwnedFd> {
-    let new_raw_fd = unsafe { libc::fcntl(source_fd, libc::F_DUPFD_CLOEXEC, 3) };
-    if new_raw_fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(new_raw_fd) })
-}
-
-fn worker_host_stdio_index(fd: i32) -> Option<usize> {
-    match fd {
-        0..=2 => usize::try_from(fd).ok(),
-        _ => None,
-    }
-}
-
-fn duplicate_host_stdio_sources_for_spawn<FS>(
-    stdio: &WorkerExecStdioBindings<FS, LinuxUserland>,
-) -> std::io::Result<[Option<std::os::fd::OwnedFd>; 3]>
-where
-    FS: litebox::fs::FileSystem + Send + Sync + 'static,
-{
-    let mut needed_sources = [false; 3];
-    for source_fd in [
-        match &stdio.stdin {
-            WorkerExecInputBinding::HostStdio { fd } => Some(*fd),
-            _ => None,
-        },
-        match &stdio.stdout {
-            WorkerExecOutputBinding::HostStdio { fd } => Some(*fd),
-            _ => None,
-        },
-        match &stdio.stderr {
-            WorkerExecOutputBinding::HostStdio { fd } => Some(*fd),
-            _ => None,
-        },
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let Some(source_idx) = worker_host_stdio_index(source_fd) else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "worker HostStdio fd must be 0, 1, or 2",
-            ));
-        };
-        needed_sources[source_idx] = true;
-    }
-    let mut temp_sources: [Option<std::os::fd::OwnedFd>; 3] = [None, None, None];
-    for (source_fd, needed) in needed_sources.into_iter().enumerate() {
-        if needed {
-            temp_sources[source_fd] = Some(duplicate_host_stdio_fd_for_spawn(
-                i32::try_from(source_fd).unwrap(),
-            )?);
-        }
-    }
-    Ok(temp_sources)
 }
 
 fn create_worker_exec_image_fd(guest_exec_image: &[u8]) -> std::io::Result<std::os::fd::OwnedFd> {
@@ -6965,15 +6247,6 @@ mod tests {
         assert_eq!(result.passthrough, b"\x1b]0;title\x07");
         assert!(result.injected_stdin.is_empty());
         assert!(pending.is_empty());
-    }
-
-    #[test]
-    fn worker_host_stdio_index_accepts_only_stdio_range() {
-        assert_eq!(super::worker_host_stdio_index(0), Some(0));
-        assert_eq!(super::worker_host_stdio_index(1), Some(1));
-        assert_eq!(super::worker_host_stdio_index(2), Some(2));
-        assert_eq!(super::worker_host_stdio_index(-1), None);
-        assert_eq!(super::worker_host_stdio_index(3), None);
     }
 
     #[test]

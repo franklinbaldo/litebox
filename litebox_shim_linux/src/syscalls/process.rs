@@ -8917,8 +8917,8 @@ fn worker_exec_input_binding<FS: ShimFS>(
 
     // HostPipeFd: the worker needs this fd dup2'd onto its stdio slot.
     // The pipe bridge mechanism (--pipe-bridge) only applies to fork-restore,
-    // not exec.  For exec, we use posix_spawn file actions to dup2 the host
-    // fd onto the target stdio slot.
+    // not exec.  For exec, the forker sends the host fd via SCM_RIGHTS and
+    // the grandchild dup2's it onto the target stdio slot.
     if let Some(hp_fd) = files.try_host_pipe_fd(raw_fd) {
         let dt = global.litebox.descriptor_table();
         if let Some(host_fd) = dt.with_entry(&hp_fd, |e: &super::host_pipe::HostPipeFd| e.raw_fd())
@@ -9038,7 +9038,7 @@ fn worker_exec_output_binding<FS: ShimFS>(
         return WorkerExecOutputBinding::Close;
     }
 
-    // HostPipeFd: dup2 onto the target stdio slot via posix_spawn.
+    // HostPipeFd: dup2 onto the target stdio slot via the forker grandchild.
     if let Some(hp_fd) = files.try_host_pipe_fd(raw_fd) {
         let dt = global.litebox.descriptor_table();
         if let Some(host_fd) = dt.with_entry(&hp_fd, |e: &super::host_pipe::HostPipeFd| e.raw_fd())
