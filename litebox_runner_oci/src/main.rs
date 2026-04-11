@@ -164,6 +164,27 @@ enum Command {
         /// Container ID
         container_id: String,
 
+        /// Path to OCI process.json with args/env/cwd/user
+        #[clap(short = 'p', long, value_name = "FILE")]
+        process: Option<PathBuf>,
+
+        /// Console socket path for PTY support.
+        /// A PTY is created and the master fd is sent via SCM_RIGHTS.
+        #[clap(long)]
+        console_socket: Option<PathBuf>,
+
+        /// File to write the exec process PID to
+        #[clap(long)]
+        pid_file: Option<PathBuf>,
+
+        /// Fork and have the parent exit immediately (conmon expects this)
+        #[clap(long)]
+        detach: bool,
+
+        /// Allocate a TTY (accepted for compat; actual PTY driven by --console-socket)
+        #[clap(long)]
+        tty: bool,
+
         /// Set environment variables (can be specified multiple times)
         #[clap(short, long, value_name = "KEY=VALUE")]
         env: Vec<String>,
@@ -178,7 +199,7 @@ enum Command {
         tun_device: Option<String>,
 
         /// Command and arguments to execute
-        #[clap(required = true, num_args = 1..)]
+        #[clap(num_args = 0..)]
         command: Vec<String>,
     },
 
@@ -488,7 +509,8 @@ fn main() -> Result<()> {
 
             let extra_env = parse_extra_env(&env, env_file.as_ref())?;
 
-            let exit_code = litebox_runner_oci::run_container(&bundle, None, &extra_env, &network)?;
+            let exit_code =
+                litebox_runner_oci::run_container(&bundle, None, &extra_env, &network, None, None)?;
 
             // Save exit code to state (if this was a create+start lifecycle container)
             let sm = StateManager::new(root);
@@ -504,6 +526,11 @@ fn main() -> Result<()> {
 
         Command::Exec {
             container_id,
+            process,
+            console_socket,
+            pid_file,
+            detach,
+            tty: _,
             env,
             env_file,
             tun_device,
@@ -511,6 +538,10 @@ fn main() -> Result<()> {
         } => {
             tracing::info!(
                 container_id = %container_id,
+                process_json = ?process,
+                console_socket = ?console_socket,
+                pid_file = ?pid_file,
+                detach = detach,
                 command = ?command,
                 tun_device = ?tun_device,
                 "exec in container"
@@ -528,11 +559,38 @@ fn main() -> Result<()> {
                 cni: None,
             };
 
-            let extra_env = parse_extra_env(&env, env_file.as_ref())?;
+            // Parse process.json if provided
+            let (proc_args, proc_env, proc_cwd, proc_user) = if let Some(ref p) = process {
+                let (args, penv, cwd, user) = litebox_runner_oci::parse_process_spec(p)?;
+                (Some(args), penv, cwd, user)
+            } else {
+                (None, vec![], None, None)
+            };
 
-            // Run with overridden command, extra env, and networking
-            let exit_code =
-                litebox_runner_oci::run_container(&bundle, Some(&command), &extra_env, &network)?;
+            // Determine final args: --process overrides, then CLI command
+            let override_args = if let Some(ref args) = proc_args {
+                Some(args.as_slice())
+            } else if !command.is_empty() {
+                Some(command.as_slice())
+            } else {
+                None
+            };
+
+            // Merge env: process.json env first, then env-file, then CLI --env
+            let mut extra_env = proc_env;
+            extra_env.extend(parse_extra_env(&env, env_file.as_ref())?);
+
+            let exit_code = litebox_runner_oci::exec_container(
+                &bundle,
+                override_args,
+                &extra_env,
+                &network,
+                console_socket.as_deref(),
+                pid_file.as_deref(),
+                detach,
+                proc_cwd.as_deref(),
+                proc_user.as_ref(),
+            )?;
             std::process::exit(exit_code);
         }
 

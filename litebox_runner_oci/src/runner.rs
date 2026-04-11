@@ -503,6 +503,7 @@ fn resolve_program_in_rootfs(
 // ---------------------------------------------------------------------------
 
 /// Build `CliArgs` from the OCI spec and runtime options.
+#[allow(clippy::too_many_arguments)]
 fn build_cli_args(
     spec: &Spec,
     override_args: Option<&[String]>,
@@ -511,6 +512,8 @@ fn build_cli_args(
     tun_device: Option<String>,
     af_packet_fd: Option<std::os::fd::OwnedFd>,
     network_config: Option<litebox::net::NetworkConfig>,
+    override_cwd: Option<&str>,
+    override_user: Option<&(u32, u32)>,
 ) -> Result<CliArgs> {
     let process = spec
         .process()
@@ -537,13 +540,21 @@ fn build_cli_args(
     environment_variables.extend_from_slice(extra_env);
 
     // Working directory
-    let working_directory = process.cwd().to_str().and_then(|s| {
-        if s.is_empty() {
+    let working_directory = if let Some(cwd) = override_cwd {
+        if cwd.is_empty() {
             None
         } else {
-            Some(s.to_string())
+            Some(cwd.to_string())
         }
-    });
+    } else {
+        process.cwd().to_str().and_then(|s| {
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.to_string())
+            }
+        })
+    };
 
     // Networking: AF_PACKET fd vs TUN device vs broker-based networking
     let (tun_device_name, network_broker) = if af_packet_fd.is_some() {
@@ -588,10 +599,10 @@ fn build_cli_args(
         worker_interp_path: None,
         guest_pid: None,
         guest_ppid: None,
-        guest_uid: Some(process.user().uid()),
-        guest_euid: Some(process.user().uid()),
-        guest_gid: Some(process.user().gid()),
-        guest_egid: Some(process.user().gid()),
+        guest_uid: Some(override_user.map_or_else(|| process.user().uid(), |u| u.0)),
+        guest_euid: Some(override_user.map_or_else(|| process.user().uid(), |u| u.0)),
+        guest_gid: Some(override_user.map_or_else(|| process.user().gid(), |u| u.1)),
+        guest_egid: Some(override_user.map_or_else(|| process.user().gid(), |u| u.1)),
         fork_restore: false,
         fork_restore_fd: None,
         fork_restore_ack_fd: None,
@@ -620,6 +631,8 @@ pub fn run_container(
     override_args: Option<&[String]>,
     extra_env: &[String],
     network: &NetworkConfig,
+    override_cwd: Option<&str>,
+    override_user: Option<&(u32, u32)>,
 ) -> Result<i32> {
     // 1. Parse config.json from bundle
     let spec_path = bundle_path.join("config.json");
@@ -754,6 +767,8 @@ pub fn run_container(
         tun_device,
         af_packet_fd,
         af_packet_net_config,
+        override_cwd,
+        override_user,
     ) {
         Ok(args) => args,
         Err(e) => {
@@ -818,6 +833,136 @@ pub fn run_container(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Process spec parsing (for `exec --process <file>`)
+// ---------------------------------------------------------------------------
+
+/// Parse an OCI process.json file into (args, env, cwd, user).
+///
+/// The file format matches the `process` section of the OCI runtime spec.
+/// Returns:
+/// - `args`: the command and its arguments
+/// - `env`: environment variables as `KEY=VALUE` strings
+/// - `cwd`: working directory (None if empty/unset)
+/// - `user`: (uid, gid) tuple if present
+#[allow(clippy::type_complexity)]
+pub fn parse_process_spec(
+    path: &Path,
+) -> Result<(Vec<String>, Vec<String>, Option<String>, Option<(u32, u32)>)> {
+    use oci_spec::runtime::Process;
+
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open process spec: {}", path.display()))?;
+    let process: Process = serde_json::from_reader(file)
+        .with_context(|| format!("failed to parse process spec: {}", path.display()))?;
+
+    let args = process
+        .args()
+        .as_ref()
+        .context("process spec missing 'args'")?
+        .clone();
+
+    let env = process.env().as_ref().map_or_else(Vec::new, Clone::clone);
+
+    let cwd = process.cwd().to_str().and_then(|s| {
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        }
+    });
+
+    let user = {
+        let u = process.user();
+        let uid = u.uid();
+        let gid = u.gid();
+        // Only return Some if at least one is non-zero, or if there's
+        // explicit user info (uid=0, gid=0 is valid for root)
+        Some((uid, gid))
+    };
+
+    Ok((args, env, cwd, user))
+}
+
+// ---------------------------------------------------------------------------
+// Exec container (fork/detach/PTY + run)
+// ---------------------------------------------------------------------------
+
+/// Execute a command in an existing container's rootfs.
+///
+/// Handles forking (for `--detach`), PTY setup (for `--console-socket`),
+/// PID file writing, and then delegates to [`run_container`].
+#[allow(clippy::too_many_arguments)]
+pub fn exec_container(
+    bundle_path: &Path,
+    override_args: Option<&[String]>,
+    extra_env: &[String],
+    network: &NetworkConfig,
+    console_socket: Option<&Path>,
+    pid_file: Option<&Path>,
+    detach: bool,
+    override_cwd: Option<&str>,
+    override_user: Option<&(u32, u32)>,
+) -> Result<i32> {
+    if detach {
+        // Fork: parent writes child PID and exits, child continues
+        // SAFETY: fork() is a standard POSIX syscall. We immediately diverge
+        // parent/child paths and avoid async-signal-unsafe calls before exec.
+        let pid = unsafe { libc::fork() };
+        match pid.cmp(&0) {
+            std::cmp::Ordering::Less => {
+                anyhow::bail!("fork() failed: {}", std::io::Error::last_os_error());
+            }
+            std::cmp::Ordering::Greater => {
+                // Parent: write child PID and return success
+                if let Some(pf) = pid_file {
+                    std::fs::write(pf, format!("{pid}"))
+                        .with_context(|| format!("failed to write pid-file: {}", pf.display()))?;
+                }
+                return Ok(0);
+            }
+            std::cmp::Ordering::Equal => {
+                // Child: create new session and continue
+                // SAFETY: setsid is a standard POSIX syscall, safe after fork.
+                unsafe {
+                    libc::setsid();
+                }
+            }
+        }
+    } else if let Some(pf) = pid_file {
+        // Non-detach but pid_file requested: write own PID
+        let pid = std::process::id();
+        std::fs::write(pf, format!("{pid}"))
+            .with_context(|| format!("failed to write pid-file: {}", pf.display()))?;
+    }
+
+    // Set up PTY if console-socket is provided
+    if let Some(cs_path) = console_socket {
+        use std::os::fd::AsRawFd;
+        let slave_fd = crate::lifecycle::setup_console_socket(cs_path)?;
+        let raw = slave_fd.as_raw_fd();
+        // SAFETY: dup2, setsid, ioctl are standard POSIX/Linux syscalls.
+        // The slave_fd is valid (just returned from setup_console_socket).
+        unsafe {
+            libc::setsid();
+            libc::dup2(raw, 0); // stdin
+            libc::dup2(raw, 1); // stdout
+            libc::dup2(raw, 2); // stderr
+            libc::ioctl(raw, libc::TIOCSCTTY, 0);
+        }
+        drop(slave_fd);
+    }
+
+    run_container(
+        bundle_path,
+        override_args,
+        extra_env,
+        network,
+        override_cwd,
+        override_user,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,7 +983,18 @@ mod tests {
     #[test]
     fn build_cli_args_sets_uid_gid_from_spec() {
         let spec = spec_with_user(1000, 1000);
-        let args = build_cli_args(&spec, None, &[], "/tmp/test.sock", None, None, None).unwrap();
+        let args = build_cli_args(
+            &spec,
+            None,
+            &[],
+            "/tmp/test.sock",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(args.guest_uid, Some(1000));
         assert_eq!(args.guest_euid, Some(1000));
         assert_eq!(args.guest_gid, Some(1000));
@@ -848,7 +1004,18 @@ mod tests {
     #[test]
     fn build_cli_args_sets_root_uid_gid_when_zero() {
         let spec = spec_with_user(0, 0);
-        let args = build_cli_args(&spec, None, &[], "/tmp/test.sock", None, None, None).unwrap();
+        let args = build_cli_args(
+            &spec,
+            None,
+            &[],
+            "/tmp/test.sock",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(args.guest_uid, Some(0));
         assert_eq!(args.guest_euid, Some(0));
         assert_eq!(args.guest_gid, Some(0));
@@ -875,7 +1042,18 @@ mod tests {
             .mounts(vec![proc_mount])
             .build()
             .unwrap();
-        let args = build_cli_args(&spec, None, &[], "/tmp/test.sock", None, None, None).unwrap();
+        let args = build_cli_args(
+            &spec,
+            None,
+            &[],
+            "/tmp/test.sock",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(args.proc_mount);
     }
 
@@ -900,7 +1078,18 @@ mod tests {
             .mounts(vec![bind_mount])
             .build()
             .unwrap();
-        let args = build_cli_args(&spec, None, &[], "/tmp/test.sock", None, None, None).unwrap();
+        let args = build_cli_args(
+            &spec,
+            None,
+            &[],
+            "/tmp/test.sock",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(!args.proc_mount);
     }
 
@@ -949,5 +1138,55 @@ mod tests {
         let env = vec!["PATH=/bin".to_string()];
         let result = resolve_program_in_rootfs(rootfs, "nonexistent_binary_xyz", &env);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn parse_process_spec_extracts_args_and_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("process.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "user": {"uid": 1000, "gid": 1000},
+                "args": ["echo", "hello"],
+                "env": ["PATH=/usr/bin", "HOME=/home/user"],
+                "cwd": "/home/user",
+                "capabilities": {}
+            }"#,
+        )
+        .unwrap();
+
+        let (args, env, cwd, user) = parse_process_spec(&path).unwrap();
+        assert_eq!(args, vec!["echo", "hello"]);
+        assert_eq!(env, vec!["PATH=/usr/bin", "HOME=/home/user"]);
+        assert_eq!(cwd, Some("/home/user".to_string()));
+        assert_eq!(user, Some((1000, 1000)));
+    }
+
+    #[test]
+    fn parse_process_spec_handles_minimal_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("process.json");
+        std::fs::write(
+            &path,
+            r#"{"args": ["sh"], "user": {"uid": 0, "gid": 0}, "cwd": "/"}"#,
+        )
+        .unwrap();
+
+        let (args, env, _cwd, user) = parse_process_spec(&path).unwrap();
+        assert_eq!(args, vec!["sh"]);
+        assert!(env.is_empty());
+        assert_eq!(user, Some((0, 0)));
+    }
+
+    #[test]
+    fn parse_process_spec_fails_on_missing_file() {
+        let result = parse_process_spec(Path::new("/nonexistent/process.json"));
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("failed to open process spec"),
+            "unexpected error: {err}"
+        );
     }
 }

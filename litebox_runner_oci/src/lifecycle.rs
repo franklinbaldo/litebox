@@ -21,7 +21,7 @@ use crate::state::{ContainerState, StateManager, Status};
 /// Creates a new pseudoterminal pair. Sends the master fd to the
 /// console-socket via `SCM_RIGHTS` (as runc does per OCI spec).
 /// Returns the slave fd which should be used for container stdio.
-fn setup_console_socket(console_socket_path: &Path) -> Result<std::os::fd::OwnedFd> {
+pub(crate) fn setup_console_socket(console_socket_path: &Path) -> Result<std::os::fd::OwnedFd> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     #[repr(C)]
