@@ -515,6 +515,7 @@ fn build_cli_args(
     override_cwd: Option<&str>,
     override_user: Option<&(u32, u32)>,
     state_dir: Option<std::path::PathBuf>,
+    restore_image: Option<std::path::PathBuf>,
 ) -> Result<CliArgs> {
     let process = spec
         .process()
@@ -593,6 +594,7 @@ fn build_cli_args(
         af_packet_fd,
         network_config,
         state_dir,
+        restore_image,
         // Internal worker flags — all default/inactive
         worker_exec: false,
         worker_exec_fd: None,
@@ -628,6 +630,7 @@ fn build_cli_args(
 /// # Errors
 /// Returns an error if the bundle is invalid, the broker cannot be spawned,
 /// or execution fails.
+#[allow(clippy::too_many_arguments)]
 pub fn run_container(
     bundle_path: &Path,
     override_args: Option<&[String]>,
@@ -636,6 +639,7 @@ pub fn run_container(
     override_cwd: Option<&str>,
     override_user: Option<&(u32, u32)>,
     state_dir: Option<std::path::PathBuf>,
+    restore_image: Option<std::path::PathBuf>,
 ) -> Result<i32> {
     // 1. Parse config.json from bundle
     let spec_path = bundle_path.join("config.json");
@@ -773,6 +777,7 @@ pub fn run_container(
         override_cwd,
         override_user,
         state_dir,
+        restore_image,
     ) {
         Ok(args) => args,
         Err(e) => {
@@ -973,6 +978,7 @@ pub fn exec_container(
         override_cwd,
         override_user,
         None, // exec doesn't support checkpoint
+        None, // exec doesn't support restore
     )
 }
 
@@ -1067,6 +1073,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(args.guest_uid, Some(1000));
@@ -1083,6 +1090,7 @@ mod tests {
             None,
             &[],
             "/tmp/test.sock",
+            None,
             None,
             None,
             None,
@@ -1128,6 +1136,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert!(args.proc_mount);
@@ -1159,6 +1168,7 @@ mod tests {
             None,
             &[],
             "/tmp/test.sock",
+            None,
             None,
             None,
             None,

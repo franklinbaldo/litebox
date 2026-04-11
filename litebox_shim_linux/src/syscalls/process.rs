@@ -6044,7 +6044,13 @@ impl<FS: ShimFS> Task<FS> {
             fs,
             fd_table,
             memory,
-            is_delayed_fork: false,
+            // Use is_delayed_fork = true so that restore_process() preserves
+            // rax as-is rather than overwriting it with 0.  Unlike a true
+            // fork (where the child must see fork() return 0), a checkpoint
+            // captures the execution context between syscalls and the return
+            // value in rax must be kept intact for the guest to resume
+            // correctly.
+            is_delayed_fork: true,
         };
 
         let snapshot_bytes = snapshot.serialize();
@@ -6185,6 +6191,12 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Capture thread state for a checkpoint snapshot (no clone flags needed).
+    ///
+    /// The execution context is adjusted so that on restore the guest replays
+    /// the last intercepted syscall.  The Rewriter backend stores the trampoline
+    /// call-site address in R11 (see litebox_syscall_rewriter), so rewinding
+    /// RIP to R11 makes the guest re-enter the trampoline and re-issue the
+    /// original syscall with the same arguments (still in RDI/RSI/RDX/R10/R8/R9).
     fn snapshot_thread_for_checkpoint(
         &self,
         ctx: &litebox_common_linux::ExecutionContext,
@@ -6203,8 +6215,26 @@ impl<FS: ShimFS> Task<FS> {
         let clear_child_tid = self.thread.clear_child_tid.get().map(|ptr| ptr.as_usize());
         let robust_list = self.thread.robust_list.get().map(|ptr| ptr.as_usize());
 
+        // Rewind execution context so the guest replays the last syscall on
+        // restore, instead of seeing the (potentially confusing) return value
+        // of the interrupted syscall.
+        let mut exec_ctx = ctx.clone();
+        #[cfg(target_arch = "x86_64")]
+        {
+            // R11 holds the trampoline call-site address (set by the Rewriter
+            // backend's trampoline prologue).  Rewinding RIP to R11 makes the
+            // guest re-enter the trampoline, re-issuing the original syscall.
+            if exec_ctx.regs.r11 != 0 {
+                exec_ctx.regs.rip = exec_ctx.regs.r11;
+                // Set RAX to the syscall number so the handler sees it as a
+                // fresh syscall entry (orig_rax is the canonical source but
+                // the trampoline also reads RAX on some paths).
+                exec_ctx.regs.rax = exec_ctx.regs.orig_rax;
+            }
+        }
+
         super::fork_snapshot::ThreadSnapshot {
-            execution_context: ctx.clone(),
+            execution_context: exec_ctx,
             tls_base,
             set_child_tid: None,
             clear_child_tid,
@@ -8715,7 +8745,6 @@ impl<FS: ShimFS> Task<FS> {
                 set_child_tid,
             } => {
                 // Restore the register state from the fork snapshot.
-                // fork() returns 0 in the child (already set in exec_ctx.rax).
                 ctx.regs = exec_ctx.regs;
                 ctx.fp_regs = exec_ctx.fp_regs;
 

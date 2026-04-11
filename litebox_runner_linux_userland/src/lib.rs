@@ -148,6 +148,12 @@ pub struct CliArgs {
     #[arg(skip)]
     pub state_dir: Option<PathBuf>,
 
+    /// Checkpoint image file to restore from.
+    /// When set, the runner restores the sandbox from this snapshot instead of
+    /// starting a fresh program.
+    #[arg(skip)]
+    pub restore_image: Option<PathBuf>,
+
     /// Internal: run as a worker host process for a non-PIE child exec.
     ///
     /// When set, the runner loads the specified binary with the full VA space
@@ -390,6 +396,12 @@ pub fn run(mut cli_args: CliArgs) -> Result<i32> {
     // When running as a worker host for fork-restore, take the restore path.
     if cli_args.fork_restore {
         return run_fork_restore(cli_args);
+    }
+
+    // When restoring from a checkpoint image, skip normal program loading
+    // and go directly to the restore path.
+    if cli_args.restore_image.is_some() {
+        return run_restore_from_image(cli_args);
     }
 
     if !cli_args.insert_files.is_empty() {
@@ -739,6 +751,93 @@ fn finish_run<FS: litebox_shim_linux::ShimFS>(
             program, shutdown, net_worker, None, None,
         )))
     }
+}
+
+/// Complete the run by restoring from a checkpoint snapshot.
+///
+/// Like `finish_run`, but instead of loading a fresh program, restores the
+/// guest process state from the serialized snapshot.
+fn finish_run_restore<FS: litebox_shim_linux::ShimFS>(
+    shim_builder: litebox_shim_linux::LinuxShimBuilder,
+    fs: FS,
+    cli_args: &CliArgs,
+    snapshot: litebox_shim_linux::syscalls::fork_snapshot::ForkSnapshot,
+) -> Result<i32> {
+    let platform = litebox_platform_multiplex::platform();
+
+    match cli_args.interception_backend {
+        InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),
+        InterceptionBackend::Rewriter => {}
+    }
+
+    if cli_args.nine_p_broker.is_some() {
+        finish_run_restore_with_nine_p(shim_builder, fs, cli_args, snapshot)
+    } else {
+        let initial_file_system = std::sync::Arc::new(fs);
+        let shim = shim_builder.build();
+
+        let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let net_worker = start_network_worker(&shim, &shutdown);
+
+        let program = shim
+            .restore_process(snapshot, initial_file_system)
+            .map_err(|e| anyhow!("restore_process failed: {e:?}"))?;
+
+        Ok(guest_wait_status_to_exit_code(run_program(
+            program, shutdown, net_worker, None, None,
+        )))
+    }
+}
+
+/// Restore with a 9P broker providing the lower file system layer.
+fn finish_run_restore_with_nine_p<FS: litebox_shim_linux::ShimFS>(
+    shim_builder: litebox_shim_linux::LinuxShimBuilder,
+    base_fs: FS,
+    cli_args: &CliArgs,
+    snapshot: litebox_shim_linux::syscalls::fork_snapshot::ForkSnapshot,
+) -> Result<i32> {
+    let broker_addr = cli_args.nine_p_broker.as_deref().unwrap();
+    let is_tcp = broker_addr.parse::<core::net::SocketAddr>().is_ok();
+
+    if is_tcp {
+        anyhow::bail!("restore does not support TCP 9P brokers");
+    }
+
+    let (ring_writer, ring_reader) = connect_nine_p_channel(broker_addr)?;
+
+    let shim = shim_builder.build();
+    let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let net_worker = start_network_worker(&shim, &shutdown);
+
+    let writer = ShmemTransportWriter(ring_writer);
+    let reader = ShmemTransportReader(ring_reader);
+    let litebox = shim.litebox();
+    let msize = 4 * 1024 * 1024u32;
+    let (nine_p_fs, mut reader) =
+        litebox::fs::nine_p::FileSystem::new(litebox, writer, reader, msize, "root", "/")
+            .map_err(|e| anyhow!("9P attach failed: {e:?}"))?;
+
+    let worker_handle = nine_p_fs.worker_handle();
+    let _nine_p_worker = litebox_platform_linux_userland::spawn_host_thread(move || {
+        let mut buf = alloc::vec::Vec::with_capacity(msize as usize);
+        while worker_handle.poll_responses(&mut reader, &mut buf) {}
+    });
+
+    let combined = litebox::fs::layered::FileSystem::new(
+        litebox,
+        base_fs,
+        nine_p_fs,
+        litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
+    );
+    let combined_fs = std::sync::Arc::new(combined);
+
+    let program = shim
+        .restore_process(snapshot, combined_fs)
+        .map_err(|e| anyhow!("restore_process failed: {e:?}"))?;
+
+    Ok(guest_wait_status_to_exit_code(run_program(
+        program, shutdown, net_worker, None, None,
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -1275,6 +1374,76 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<i32> {
             mux_handle,
         )))
     }
+}
+
+/// Run by restoring from a checkpoint image file.
+///
+/// This is the OCI restore path: reads a serialized ForkSnapshot from a file,
+/// sets up the platform and filesystem, then restores the guest process state.
+fn run_restore_from_image(cli_args: CliArgs) -> Result<i32> {
+    let image_path = cli_args
+        .restore_image
+        .as_ref()
+        .ok_or_else(|| anyhow!("restore_image must be set"))?;
+
+    // Read and deserialize the snapshot.
+    let snapshot_data = std::fs::read(image_path).map_err(|e| {
+        anyhow!(
+            "failed to read checkpoint image {}: {e}",
+            image_path.display()
+        )
+    })?;
+    let snapshot =
+        litebox_shim_linux::syscalls::fork_snapshot::ForkSnapshot::deserialize(&snapshot_data)
+            .map_err(|e| anyhow!("failed to deserialize checkpoint image: {e}"))?;
+
+    // --- Platform setup (mirrors run_fork_restore / run()) ---
+    let platform = if cli_args.tun_device_name.is_some() {
+        Platform::new(cli_args.tun_device_name.as_deref())
+    } else if let Some(broker_path) = &cli_args.network_broker {
+        use litebox_platform_linux_userland::NetworkTransport;
+        let fd = connect_to_broker_ipc(broker_path)?;
+        Platform::with_network(Some(NetworkTransport::Ipc(fd)))
+    } else {
+        Platform::new(None)
+    };
+
+    litebox_platform_multiplex::set_platform(platform);
+
+    register_worker_spawn_flags(platform, &cli_args);
+
+    // Load tar data if --initial-files was forwarded.
+    let tar_data: &'static [u8] = if let Some(tar_file) = cli_args.initial_files.as_ref() {
+        mmapped_file(tar_file)?.data
+    } else {
+        litebox::fs::tar_ro::EMPTY_TAR_FILE
+    };
+
+    INHERITED_TAR_DATA.set(tar_data).ok();
+    if let Some(ref broker) = cli_args.nine_p_broker {
+        INHERITED_NINE_P_BROKER.set(broker.clone()).ok();
+    }
+    if let Some(ref broker) = cli_args.network_broker {
+        INHERITED_NETWORK_BROKER.set(broker.clone()).ok();
+    }
+
+    litebox_platform_linux_userland::forker::set_worker_callback(run_forked_worker);
+
+    // Pre-open /dev/null for the forker to use for stdio wiring.
+    let dev_null_fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    if dev_null_fd >= 0
+        && let Err(e) = platform.spawn_forker(dev_null_fd)
+    {
+        eprintln!("warning: failed to spawn forker: {e}; fork-restore and worker-exec will fail");
+    }
+
+    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
+    let litebox = shim_builder.litebox();
+
+    let (in_mem, tar_ro) = build_initial_fs(litebox, &cli_args, &[], None, tar_data)?;
+    let default_fs = shim_builder.default_fs(in_mem, tar_ro);
+
+    finish_run_restore(shim_builder, default_fs, &cli_args, snapshot)
 }
 
 /// A parsed pipe bridge specification from the `--pipe-bridge` CLI arg.
@@ -2765,6 +2934,7 @@ fn build_cli_args_from_exec_params(
         af_packet_fd: None,
         network_config: None,
         state_dir: None,
+        restore_image: None,
         worker_exec: true,
         worker_exec_fd: None, // image is passed directly, not via fd
         worker_result_fd: result_fd,
@@ -3224,6 +3394,8 @@ mod tests {
             proc_mount: false,
             af_packet_fd: None,
             network_config: None,
+            state_dir: None,
+            restore_image: None,
             worker_exec: false,
             worker_exec_fd: None,
             worker_result_fd: None,

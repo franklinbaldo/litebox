@@ -647,7 +647,7 @@ fn main() -> Result<()> {
             };
 
             let exit_code = litebox_runner_oci::run_container(
-                &bundle, None, &extra_env, &network, None, None, state_dir,
+                &bundle, None, &extra_env, &network, None, None, state_dir, None,
             )?;
 
             // Save exit code to state (if this was a create+start lifecycle container)
@@ -856,10 +856,10 @@ fn main() -> Result<()> {
             container_id,
             image_path,
             pid_file,
-            console_socket: _, // TODO: PTY restore
+            console_socket: _,
             no_pivot: _,
             no_new_keyring: _,
-            detach: _, // TODO: detach support
+            detach: _,
             tun_device,
         } => {
             tracing::info!(
@@ -881,100 +881,50 @@ fn main() -> Result<()> {
                 );
             }
 
-            // Create the container state directory
+            // Build network config
+            let network = litebox_runner_oci::NetworkConfig {
+                tun_device,
+                ..Default::default()
+            };
+
+            // State directory for the restored container
             let state_dir = root.join("containers").join(&container_id);
             std::fs::create_dir_all(&state_dir)?;
 
-            // Fork: child does the restore, parent saves state and exits
-            match unsafe { nix::unistd::fork() } {
-                Ok(nix::unistd::ForkResult::Parent { child }) => {
-                    let pid = child.as_raw().cast_unsigned();
+            // Save container state as Running before starting
+            let mut state = litebox_runner_oci::state::ContainerState::new(
+                container_id.clone(),
+                bundle.clone(),
+            );
+            state.status = litebox_runner_oci::state::Status::Running;
+            state.pid = Some(std::process::id());
+            lifecycle.state_manager().save(&state)?;
 
-                    // Write PID file if requested
-                    if let Some(ref pf) = pid_file {
-                        std::fs::write(pf, format!("{pid}")).with_context(|| {
-                            format!("failed to write pid file: {}", pf.display())
-                        })?;
-                    }
-
-                    // Save container state
-                    let mut state = litebox_runner_oci::state::ContainerState::new(
-                        container_id.clone(),
-                        bundle.clone(),
-                    );
-                    state.status = litebox_runner_oci::state::Status::Running;
-                    state.pid = Some(pid);
-                    lifecycle.state_manager().save(&state)?;
-
-                    Ok(())
-                }
-                Ok(nix::unistd::ForkResult::Child) => {
-                    // Open checkpoint image and get fd
-                    use std::os::fd::AsRawFd;
-                    let file = std::fs::File::open(&checkpoint_image_file).with_context(|| {
-                        format!(
-                            "failed to open checkpoint image: {}",
-                            checkpoint_image_file.display()
-                        )
-                    })?;
-                    let fd = file.as_raw_fd();
-
-                    // Exec litebox-oci run with fork-restore flags.
-                    // The runner's fork-restore path reads the snapshot from the
-                    // given fd and restores the full sandbox state.
-                    let exe =
-                        std::env::current_exe().context("failed to get current executable")?;
-
-                    // We need the 9P broker for rootfs. Parse OCI spec for rootfs path.
-                    let spec_path = bundle.join("config.json");
-                    let spec: oci_spec::runtime::Spec = serde_json::from_reader(
-                        std::fs::File::open(&spec_path).context("failed to open config.json")?,
-                    )
-                    .context("failed to parse config.json")?;
-
-                    let rootfs_path = bundle.join(
-                        spec.root()
-                            .as_ref()
-                            .map_or(std::path::Path::new("rootfs"), |r| r.path().as_path()),
-                    );
-
-                    // For restore, we launch the runner directly with fork-restore
-                    // args. The runner's CliArgs::fork_restore path handles everything.
-                    let mut cmd = exec::Command::new(&exe);
-                    cmd.arg("run").arg("--bundle").arg(&bundle);
-                    if let Some(ref dev) = tun_device {
-                        cmd.arg("--tun-device").arg(dev);
-                    }
-                    cmd.arg(&container_id);
-
-                    // TODO: The fork-restore path in litebox_runner_linux_userland
-                    // requires --fork-restore and --fork-restore-fd flags on the
-                    // inner runner binary, but we go through the OCI run path here.
-                    // For now, we pass the checkpoint path via environment and let
-                    // run_container handle it (to be completed in a follow-up).
-                    //
-                    // For this initial implementation, we can directly invoke the
-                    // litebox runner binary with the fork-restore flags.
-
-                    // Set the checkpoint fd as an env var for the restore path
-                    // SAFETY: we are in a freshly-forked child with a single
-                    // thread — no concurrent readers of the environment.
-                    unsafe {
-                        std::env::set_var("LITEBOX_RESTORE_FD", format!("{fd}"));
-                        std::env::set_var(
-                            "LITEBOX_RESTORE_ROOTFS",
-                            rootfs_path.to_string_lossy().as_ref(),
-                        );
-                    }
-
-                    let err = cmd.exec();
-                    eprintln!("restore: exec failed: {err}");
-                    std::process::exit(1);
-                }
-                Err(e) => {
-                    anyhow::bail!("fork failed: {e}");
-                }
+            // Write PID file if requested
+            if let Some(ref pf) = pid_file {
+                std::fs::write(pf, format!("{}", std::process::id()))
+                    .with_context(|| format!("failed to write pid file: {}", pf.display()))?;
             }
+
+            // Run the container with the restore image
+            let exit_code = litebox_runner_oci::run_container(
+                &bundle,
+                None,
+                &[],
+                &network,
+                None,
+                None,
+                Some(state_dir),
+                Some(checkpoint_image_file),
+            )?;
+
+            // Update state to stopped after exit
+            let _ = lifecycle.state_manager().update(&container_id, |s| {
+                s.status = litebox_runner_oci::state::Status::Stopped;
+                s.exit_code = Some(exit_code);
+            });
+
+            Ok(())
         }
 
         Command::Info => {
