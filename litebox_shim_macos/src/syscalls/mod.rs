@@ -31,6 +31,7 @@ impl<FS: ShimFS> Task<FS> {
     ) -> Result<usize, Errno> {
         match request {
             MacosSyscallRequest::Exit { status } => {
+
                 self.sys_exit(status);
                 Ok(0)
             }
@@ -141,6 +142,10 @@ impl<FS: ShimFS> Task<FS> {
             MacosSyscallRequest::SharedRegionMapAndSlide2Np => {
                 log_unsupported!("shared_region_map_and_slide_2_np: no-op (cache pre-mapped)");
                 Ok(0)
+            }
+            MacosSyscallRequest::MapWithLinkingNp => {
+                log_unsupported!("map_with_linking_np: returning ENOSYS (dyld will apply fixups in userspace)");
+                Err(Errno::ENOSYS)
             }
             MacosSyscallRequest::Statfs64 { path, buf } => self.sys_statfs64(path, buf),
             MacosSyscallRequest::Stat64 { path, buf } => self.sys_stat64(path, buf),

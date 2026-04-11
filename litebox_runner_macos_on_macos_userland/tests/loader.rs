@@ -1199,9 +1199,8 @@ fn test_run_system_cut() {
 
 /// `/usr/bin/sort /tmp/hello.txt` — sorts input lines.
 ///
-/// Requires MIG task_info (msgh_id 3418) for locale setup.
+/// Requires MIG semaphore_create (msgh_id 3439) and task_info (msgh_id 3418).
 #[test]
-#[ignore = "startup failure: skipped library initializers break locale/collation setup"]
 fn test_run_system_sort() {
     let code = run_system_binary(
         "/usr/bin/sort",
@@ -1210,6 +1209,7 @@ fn test_run_system_sort() {
     );
     assert_eq!(code, 0, "sort exited with code {code}");
 }
+
 
 /// `/usr/bin/uniq /tmp/hello.txt` — filters adjacent duplicate lines.
 #[test]

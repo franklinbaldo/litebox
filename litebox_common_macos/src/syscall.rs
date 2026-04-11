@@ -137,6 +137,8 @@ pub mod nr {
     pub const FUTIMENS: usize = 253;
     /// `utimensat(dirfd, path, times, flag)` — set file timestamps (macOS 547).
     pub const UTIMENSAT: usize = 547;
+    /// `map_with_linking_np(regions, region_count, link_info, link_info_size)` — map with linking (macOS 550).
+    pub const MAP_WITH_LINKING_NP: usize = 550;
 }
 
 /// Mach trap numbers (negative x16 values, stored as positive constants).
@@ -786,6 +788,8 @@ pub enum MacosSyscallRequest {
         times: usize,
         flag: i32,
     },
+    /// `map_with_linking_np(regions, region_count, link_info, link_info_size)` — map regions with linking info.
+    MapWithLinkingNp,
     Unknown {
         number: usize,
     },
@@ -1300,6 +1304,7 @@ impl MacosSyscallRequest {
                 times: a2,
                 flag: a3 as i32,
             },
+            nr::MAP_WITH_LINKING_NP => MacosSyscallRequest::MapWithLinkingNp,
             nr::EXECVE => MacosSyscallRequest::Execve {
                 path: a0,
                 argv: a1,

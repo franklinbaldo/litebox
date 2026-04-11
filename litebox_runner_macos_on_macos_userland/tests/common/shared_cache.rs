@@ -392,10 +392,20 @@ impl CacheMap {
 
     /// Return paths of all system dylibs needed for a basic C program:
     /// `/usr/lib/libSystem.B.dylib` and `/usr/lib/system/*.dylib`.
+    /// Returns paths of system libraries whose __TEXT segments must be
+    /// SVC-patched.  This includes `/usr/lib/system/*` (libsystem_kernel,
+    /// libsystem_pthread, etc.), `/usr/lib/libSystem.B.dylib`, and
+    /// `/usr/lib/dyld`.  The shared cache contains a copy of dyld with
+    /// its own mach trap stubs; without patching those, MIG calls from
+    /// the shared-cache copy (e.g. `semaphore_create`) bypass the shim.
     pub fn system_dylib_paths(&self) -> Vec<String> {
         self.dylibs
             .keys()
-            .filter(|p| *p == "/usr/lib/libSystem.B.dylib" || p.starts_with("/usr/lib/system/"))
+            .filter(|p| {
+                *p == "/usr/lib/libSystem.B.dylib"
+                    || *p == "/usr/lib/dyld"
+                    || p.starts_with("/usr/lib/system/")
+            })
             .cloned()
             .collect()
     }

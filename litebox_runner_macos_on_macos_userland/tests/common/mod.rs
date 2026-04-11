@@ -324,6 +324,7 @@ pub fn run_macho_binary(binary_data: &[u8], argv: &[&str]) -> (i32, Vec<u8>) {
         std::ffi::CString::new("PATH=/bin").unwrap(),
         std::ffi::CString::new("LC_ALL=C").unwrap(),
         std::ffi::CString::new("LANG=C").unwrap(),
+        std::ffi::CString::new("TMPDIR=/tmp").unwrap(),
     ];
 
     let program = shim
@@ -539,10 +540,6 @@ fn run_macho_dynamic_inner(
 ) -> i32 {
     use litebox::fs::{FileSystem as _, Mode, OFlags};
 
-    unsafe {
-        core::ptr::write_volatile(diag_state_ptr, 1);
-    } // entered_inner
-
     // Re-initialize the platform in the child process.  macOS Hypervisor
     // framework state does not survive fork() — we must create a fresh one.
     // The parent's OnceRef is already set (inherited), so we must reset it
@@ -598,6 +595,12 @@ fn run_macho_dynamic_inner(
         let _ = fs.mkdir("/tmp", mode);
         let _ = fs.mkdir("/usr", mode);
         let _ = fs.mkdir("/usr/bin", mode);
+        let _ = fs.mkdir("/dev", mode);
+        // Create /dev/dtracehelper as a regular (empty) file so dtrace
+        // probe registration can open it (the subsequent ioctl is handled
+        // by the shim as a no-op).
+        let _ = fs.open("/dev/dtracehelper", OFlags::CREAT | OFlags::WRONLY, mode)
+            .map(|fd| fs.close(&fd));
         // Populate /tmp with a few files so /bin/ls exercises a non-empty directory.
         for name in ["hello.txt", "world.txt", "data.bin"] {
             let path = format!("/tmp/{name}");
@@ -637,7 +640,12 @@ fn run_macho_dynamic_inner(
     for s in &argv[1..] {
         argv_cstrings.push(std::ffi::CString::new(*s).unwrap());
     }
-    let envp = vec![std::ffi::CString::new("PATH=/bin").unwrap()];
+    let envp = vec![
+        std::ffi::CString::new("PATH=/bin").unwrap(),
+        std::ffi::CString::new("LC_ALL=C").unwrap(),
+        std::ffi::CString::new("LANG=C").unwrap(),
+        std::ffi::CString::new("TMPDIR=/tmp").unwrap(),
+    ];
 
     // Read dyld from the host filesystem.  This MUST happen before
     // install_shared_cache, which patches libsystem_kernel's SVCs —
@@ -726,6 +734,8 @@ fn run_macho_dynamic_inner(
         cache.demand_page_sources.len(),
     );
     eprintln!(">>> about to install_shared_cache");
+
+
     shim.install_shared_cache(
         cache.host_cache_base,
         &regions_for_shim,
@@ -736,7 +746,7 @@ fn run_macho_dynamic_inner(
         litebox_platform_macos_userland::get_sigtramp_addr() as u64,
     );
 
-    // Spawn the network polling thread AFTER install_shared_cache.
+        // Spawn the network polling thread AFTER install_shared_cache.
     // The network thread is NOT registered in the TLS table, so when
     // it hits a patched SVC stub, the trampoline's scan hits the
     // sentinel and falls through to the passthrough path — executing
@@ -782,23 +792,9 @@ fn run_macho_dynamic_inner(
     // not in the TLS table (this thread + the network thread) use the
     // passthrough path, so std::thread::spawn and libc calls work.
     //
-    // Use raw inline asm write(2, ...) for post-install diagnostics.
-    unsafe {
-        let msg = b">>> about to run_thread\n";
-        core::arch::asm!(
-            "mov x0, #2", "mov x1, {buf}", "mov x2, {len}",
-            "mov x16, #0x4", "movk x16, #0x200, lsl #16", "svc #0x80",
-            buf = in(reg) msg.as_ptr(), len = in(reg) msg.len(),
-            out("x0") _, out("x1") _, out("x2") _, out("x16") _,
-            clobber_abi("C"),
-        );
-    }
     unsafe {
         litebox_platform_macos_userland::run_thread(entrypoints, &mut initial_ctx);
     }
-    unsafe {
-        core::ptr::write_volatile(diag_state_ptr, 52);
-    } // run_thread_done
 
     // Signal the network polling thread to shut down.  This is a pure
     // atomic store — no libc call — so it is safe after install_shared_cache.
@@ -819,11 +815,7 @@ fn run_macho_dynamic_inner(
         );
     }
 
-    let exit_code = process.wait();
-    unsafe {
-        core::ptr::write_volatile(diag_state_ptr, 53);
-    } // wait_done
-    exit_code
+    process.wait()
 }
 
 /// Waits for a utun device to appear and configures it with the given IP.

@@ -46,18 +46,18 @@ impl<FS: ShimFS> Task<FS> {
     /// - node: i32 (-1 = HOST_LOCAL_NODE)
     /// - which: i32 (1 = HOST_PORT, 2 = HOST_PRIV_PORT, etc.)
     ///
-    /// Reply (36 bytes total, complex):
-    /// - Header (24): bits=REPLY_BITS_COMPLEX, size=36,
-    ///   remote=request.msgh_local_port, local=0, voucher=0, id=512
+    /// Reply (40 bytes total, complex with 12-byte port descriptor):
+    /// - Header (24): bits=REPLY_BITS_COMPLEX, size=40,
+    ///   remote_port=0, local=0, voucher=0, id=512
     /// - Body (4): descriptor_count=1
-    /// - Port descriptor (8): name=`port`, disposition=MOVE_SEND (17)
+    /// - Port descriptor (12): name=port, pad1=0,
+    ///   disposition=MOVE_SEND(17), type=PORT(0)
     fn mig_host_get_special_port(
         &self,
         msg_addr: usize,
         hdr: &MachMsgHeader,
     ) -> Result<usize, Errno> {
-        // Read the request body: NDR (8 bytes) + node (4) + which (4) = 16 bytes
-        // starting at msg_addr + HEADER_SIZE.
+        // Read the request body: NDR (8 bytes) + node (4) + which (4)
         let body_addr = msg_addr + HEADER_SIZE;
         let which_ptr: ConstPtr<i32> = ConstPtr::from_usize(body_addr + 8 + 4);
         let which: i32 = which_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
@@ -69,7 +69,7 @@ impl<FS: ShimFS> Task<FS> {
 
         // Map `which` to a port name.
         let port = match which {
-            // HOST_PORT (1) / HOST_PRIV_PORT (2) -> HOST_SELF (we are the only task)
+            // HOST_PORT (1) / HOST_PRIV_PORT (2) -> HOST_SELF
             1 | 2 => 0x0503u32,
             // Unknown -- allocate a synthetic port.
             _ => self
@@ -79,15 +79,16 @@ impl<FS: ShimFS> Task<FS> {
         };
 
         // Write the reply in-place at msg_addr.
-        // Total reply size: HEADER(24) + BODY(4) + PORT_DESC(8) = 36 bytes.
+        // Total reply size: HEADER(24) + BODY(4) + PORT_DESC(12) = 40 bytes.
         #[allow(clippy::cast_possible_truncation)]
         let reply_size: u32 = (HEADER_SIZE + BODY_SIZE + PORT_DESC_SIZE) as u32;
 
-        // Write reply header.
+        // Write reply header.  `msgh_remote_port` must be 0 for a
+        // kernel reply (the MIG client checks this).
         let reply_hdr = MachMsgHeader {
             msgh_bits: REPLY_BITS_COMPLEX,
             msgh_size: reply_size,
-            msgh_remote_port: hdr.msgh_local_port,
+            msgh_remote_port: 0,
             msgh_local_port: 0,
             msgh_voucher_port: 0,
             msgh_id: hdr.msgh_id + MIG_REPLY_OFFSET, // 512
@@ -102,7 +103,7 @@ impl<FS: ShimFS> Task<FS> {
         let body_ptr: MutPtr<MachMsgBody> = MutPtr::from_usize(msg_addr + HEADER_SIZE);
         body_ptr.write_at_offset(0, body).ok_or(Errno::EFAULT)?;
 
-        // Write port descriptor (MACH_MSG_TYPE_MOVE_SEND = 17).
+        // Write port descriptor (12 bytes, MACH_MSG_TYPE_MOVE_SEND = 17).
         let desc = MachMsgPortDescriptor::new(port, 17);
         let desc_ptr: MutPtr<MachMsgPortDescriptor> =
             MutPtr::from_usize(msg_addr + HEADER_SIZE + BODY_SIZE);

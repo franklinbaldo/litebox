@@ -534,7 +534,6 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_open(&self, path_addr: usize, flags: i32, mode: u32) -> Result<usize, Errno> {
         let path_ptr: ConstPtr<u8> = ConstPtr::from_usize(path_addr);
         let path = read_cstring_from_guest(path_ptr, 4096).ok_or(Errno::EFAULT)?;
-
         let mut oflags = translate_open_flags(flags);
 
         // Resolve relative paths against the current working directory.
@@ -995,7 +994,6 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_stat64(&self, path_addr: usize, buf_addr: usize) -> Result<usize, Errno> {
         let path_ptr: ConstPtr<u8> = ConstPtr::from_usize(path_addr);
         let path = read_cstring_from_guest(path_ptr, 4096).ok_or(Errno::EFAULT)?;
-
         // Try to open the path read-only
         let cpath = alloc::ffi::CString::new(path.as_bytes()).map_err(|_| Errno::EINVAL)?;
         let typed_fd = self
@@ -1032,7 +1030,6 @@ impl<FS: ShimFS> Task<FS> {
     ) -> Result<usize, Errno> {
         let path_ptr: ConstPtr<u8> = ConstPtr::from_usize(path_addr);
         let path = read_cstring_from_guest(path_ptr, 4096).ok_or(Errno::EFAULT)?;
-
         // AT_FDCWD on macOS is -2
         if dirfd == -2 || path.starts_with('/') {
             // Absolute path or relative to cwd — treat like open()
@@ -1108,8 +1105,9 @@ impl<FS: ShimFS> Task<FS> {
         _flag: i32,
     ) -> Result<usize, Errno> {
         let path_ptr: ConstPtr<u8> = ConstPtr::from_usize(path_addr);
-        let path = read_cstring_from_guest(path_ptr, 4096).ok_or(Errno::EFAULT)?;
-
+        let Some(path) = read_cstring_from_guest(path_ptr, 4096) else {
+            return Err(Errno::EFAULT);
+        };
         // AT_FDCWD on macOS is -2
         if dirfd == -2 || path.starts_with('/') {
             return self.sys_stat64(path_addr, buf_addr);

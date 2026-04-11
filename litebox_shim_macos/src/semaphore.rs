@@ -4,8 +4,8 @@
 //! Mach semaphore emulation.
 //!
 //! Implements counting semaphores using the litebox `Waker` / `WaitContext`
-//! API.  Semaphores are lazily created on first use (since `semaphore_create`
-//! is a MIG call we don't fully emulate).
+//! API.  Semaphores are created via the `semaphore_create` MIG handler
+//! and manipulated via the Mach trap interfaces.
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
@@ -86,6 +86,33 @@ impl MachSemaphoreManager {
             sem.count = 0;
         }
         KERN_SUCCESS
+    }
+
+    /// Register a newly created semaphore with the given port name and
+    /// initial value.  Called by the `semaphore_create` MIG handler.
+    pub(crate) fn create(&self, port: u32, initial_value: i32) {
+        let mut guard = self.semaphores.lock();
+        guard.insert(port, SemaphoreState {
+            count: initial_value,
+            waiters: VecDeque::new(),
+        });
+    }
+
+    /// Destroy a semaphore, waking any blocked waiters.  Called by the
+    /// `semaphore_destroy` MIG handler.  Returns `true` if the semaphore
+    /// existed.
+    pub(crate) fn destroy(&self, port: u32) -> bool {
+        let mut guard = self.semaphores.lock();
+        if let Some(mut sem) = guard.remove(&port) {
+            // Wake all blocked waiters so they don't hang forever.
+            for waiter in sem.waiters.drain(..) {
+                waiter.signaled.store(true, Ordering::Release);
+                waiter.waker.wake();
+            }
+            true
+        } else {
+            false
+        }
     }
 }
 

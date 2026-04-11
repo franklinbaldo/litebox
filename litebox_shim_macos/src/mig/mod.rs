@@ -6,6 +6,20 @@
 //! Provides wire format structs for Mach IPC messages and a dispatcher
 //! that routes incoming MIG requests by `msgh_id` to per-subsystem
 //! handlers.
+//!
+//! # Port descriptor format
+//!
+//! On arm64e with `mach_msg2`, port descriptors are 12 bytes (not the
+//! legacy 8-byte format).  The 12-byte layout is:
+//!
+//! ```text
+//! offset 0: name        (u32) — Mach port name
+//! offset 4: pad1        (u32) — alignment padding
+//! offset 8: pad2+disp+type (u32) — packed:
+//!           bits 0..15  = pad2 (0)
+//!           bits 16..23 = disposition (e.g. 0x11 = MOVE_SEND)
+//!           bits 24..31 = descriptor type (0 = PORT)
+//! ```
 
 pub(crate) mod host_priv;
 pub(crate) mod task;
@@ -38,14 +52,23 @@ pub(crate) struct MachMsgBody {
     pub msgh_descriptor_count: u32,
 }
 
-/// Mach port descriptor (`mach_msg_port_descriptor_t`), 8 bytes.
+/// Mach port descriptor for `mach_msg2` (arm64e), 12 bytes.
 ///
-/// Layout: name (u32) + packed disposition/type (u32).
-/// Disposition is in bits 16..23, type (0 = port) in bits 24..31.
+/// This is the **new** 12-byte format used with `mach_msg2_trap`.
+/// The legacy `mach_msg_trap` used an 8-byte descriptor instead.
+///
+/// Layout:
+/// - `name`: the Mach port name (4 bytes)
+/// - `pad1`: alignment padding (4 bytes, always 0)
+/// - `disposition_type`: packed field (4 bytes):
+///   - bits 0..15:  pad2 (0)
+///   - bits 16..23: disposition (e.g. 17 = `MACH_MSG_TYPE_MOVE_SEND`)
+///   - bits 24..31: descriptor type (0 = `MACH_MSG_PORT_DESCRIPTOR`)
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, IntoBytes)]
 pub(crate) struct MachMsgPortDescriptor {
     pub name: u32,
+    pub pad1: u32,
     /// Bits 16..23 = disposition, bits 24..31 = descriptor type (0 = port).
     pub disposition_type: u32,
 }
@@ -53,11 +76,13 @@ pub(crate) struct MachMsgPortDescriptor {
 impl MachMsgPortDescriptor {
     /// Create a port descriptor with the given name and disposition.
     ///
-    /// Type is always 0 (MACH_MSG_PORT_DESCRIPTOR).
+    /// Type is always 0 (`MACH_MSG_PORT_DESCRIPTOR`).  Padding fields
+    /// are zeroed.
     pub fn new(name: u32, disposition: u8) -> Self {
         Self {
             name,
-            disposition_type: u32::from(disposition) << 0x10,
+            pad1: 0,
+            disposition_type: u32::from(disposition) << 16,
         }
     }
 }
@@ -65,7 +90,6 @@ impl MachMsgPortDescriptor {
 /// NDR record constant (Network Data Representation).
 ///
 /// Little-endian, 2-byte integers, ASCII characters, IEEE 754 floats.
-#[allow(dead_code)] // Used by future MIG subsystem handlers
 pub(crate) const NDR_RECORD: [u8; 8] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00];
 
 // -- Mach message option flags -----------------------------------------
@@ -99,7 +123,7 @@ pub(crate) const HEADER_SIZE: usize = core::mem::size_of::<MachMsgHeader>();
 /// Size of MachMsgBody in bytes.
 pub(crate) const BODY_SIZE: usize = core::mem::size_of::<MachMsgBody>();
 
-/// Size of MachMsgPortDescriptor in bytes.
+/// Size of MachMsgPortDescriptor in bytes (12 for `mach_msg2` format).
 pub(crate) const PORT_DESC_SIZE: usize = core::mem::size_of::<MachMsgPortDescriptor>();
 
 // -- Dispatcher --------------------------------------------------------
@@ -138,11 +162,13 @@ impl<FS: ShimFS> Task<FS> {
         );
 
         // Route by msgh_id to subsystem handlers.
+        //
+        // MIG subsystem ID ranges (from XNU `*.defs`):
+        //   400..499  — host / host_priv
+        //   3400..3499 — task
         if (400..500).contains(&hdr.msgh_id) {
-            // host_priv subsystem: base 400..499
             self.mig_host_priv(msg_addr, &hdr)
         } else if (3400..3500).contains(&hdr.msgh_id) {
-            // task subsystem: base 3400..3499
             self.mig_task(msg_addr, &hdr)
         } else {
             // Unknown MIG subsystem -- return MACH_SEND_INVALID_DEST.
