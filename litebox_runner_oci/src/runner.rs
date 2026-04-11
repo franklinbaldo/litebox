@@ -326,6 +326,7 @@ fn spawn_broker(
     socket_path: &Path,
     rootfs: &Path,
     bind_mounts: &[(String, String)],
+    writable_paths: &[String],
 ) -> Result<Child> {
     let broker_exe = find_broker_exe()?;
 
@@ -343,11 +344,12 @@ fn spawn_broker(
         .arg("--root-dir")
         .arg(rootfs)
         .arg("--rewrite-syscalls")
-        .arg("--read-only")
-        .arg("--writable-path")
-        .arg("/tmp")
-        .arg("--writable-path")
-        .arg("/var");
+        .arg("--read-only");
+
+    for writable_path in writable_paths {
+        cmd.arg("--writable-path");
+        cmd.arg(writable_path);
+    }
 
     for (guest_path, host_path) in bind_mounts {
         cmd.arg("--bind");
@@ -542,7 +544,25 @@ pub fn run_container(
         })
         .unwrap_or_default();
 
-    // 5. Generate broker socket path
+    // 5. Extract writable paths from tmpfs mounts in OCI spec
+    let writable_paths: Vec<String> = spec
+        .mounts()
+        .as_ref()
+        .map(|mounts| {
+            mounts
+                .iter()
+                .filter(|m| m.typ().as_deref() == Some("tmpfs"))
+                .filter_map(|m| m.destination().to_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let writable_paths = if writable_paths.is_empty() {
+        vec!["/tmp".to_string(), "/var".to_string()]
+    } else {
+        writable_paths
+    };
+
+    // 6. Generate broker socket path
     let broker_socket_path = PathBuf::from(format!(
         "/tmp/litebox-oci-broker-{}.sock",
         std::process::id()
@@ -552,10 +572,15 @@ pub fn run_container(
         .context("broker socket path is not valid UTF-8")?
         .to_string();
 
-    // 6. Spawn broker
-    let mut broker_child = spawn_broker(&broker_socket_path, &rootfs_path, &bind_mounts)?;
+    // 7. Spawn broker
+    let mut broker_child = spawn_broker(
+        &broker_socket_path,
+        &rootfs_path,
+        &bind_mounts,
+        &writable_paths,
+    )?;
 
-    // 7. Wait for broker socket to appear (up to 5 seconds)
+    // 8. Wait for broker socket to appear (up to 5 seconds)
     if let Err(e) = wait_for_socket(&broker_socket_path, std::time::Duration::from_secs(5)) {
         // Clean up broker process on timeout
         let _ = broker_child.kill();
@@ -564,7 +589,7 @@ pub fn run_container(
         return Err(e).context("broker failed to start");
     }
 
-    // 8. Build CliArgs
+    // 9. Build CliArgs
     let cli_args = match build_cli_args(
         &spec,
         override_args,
@@ -590,10 +615,10 @@ pub fn run_container(
         "launching sandboxed process"
     );
 
-    // 9. Call litebox_runner_linux_userland::run() — returns exit code on success
+    // 10. Call litebox_runner_linux_userland::run() — returns exit code on success
     let result = litebox_runner_linux_userland::run(cli_args);
 
-    // 10. On error (or if run returns), clean up broker process and socket
+    // 11. On error (or if run returns), clean up broker process and socket
     let _ = broker_child.kill();
     let _ = broker_child.wait();
     let _ = std::fs::remove_file(&broker_socket_path);
