@@ -359,7 +359,6 @@ fn main() -> Result<()> {
             tracing::info!(container_id = %container_id, signal = sig, "killing container");
 
             lifecycle.kill(&container_id, sig)?;
-            println!("Signal sent to container {container_id}");
             Ok(())
         }
 
@@ -370,7 +369,6 @@ fn main() -> Result<()> {
             tracing::info!(container_id = %container_id, force = force, "deleting container");
 
             lifecycle.delete(&container_id, force)?;
-            println!("Container {container_id} deleted");
             Ok(())
         }
 

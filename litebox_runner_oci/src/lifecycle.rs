@@ -303,6 +303,10 @@ impl Lifecycle {
                 let mut state = ContainerState::new(id.to_string(), bundle);
                 state.status = Status::Created;
                 state.pid = Some(pid);
+                // Propagate annotations from OCI spec to state (Podman expects these)
+                if let Some(annotations) = spec.annotations() {
+                    state.annotations.clone_from(annotations);
+                }
                 self.state_manager.save(&state)?;
 
                 // Run createRuntime hooks (OCI spec: after container created, in runtime ns)
@@ -529,14 +533,16 @@ impl Lifecycle {
             anyhow::bail!("failed to send signal {signal} to process {pid}: {e}");
         }
 
-        // Check if process exited and capture exit code
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        if !StateManager::is_process_alive(pid) {
-            let exit_code = StateManager::try_wait_exit_code(pid);
-            self.state_manager.update(id, |s| {
+        // Best-effort: try to collect exit status immediately (non-blocking).
+        // If the signal killed the process synchronously (e.g. SIGKILL), we
+        // capture the exit code now. Otherwise Podman will discover the
+        // stopped state via subsequent `state` calls (refresh_state checks
+        // liveness via kill(pid, 0) + waitpid(WNOHANG)).
+        if let Some(exit_code) = StateManager::try_wait_exit_code(pid) {
+            let _ = self.state_manager.update(id, |s| {
                 s.status = Status::Stopped;
-                s.exit_code = exit_code;
-            })?;
+                s.exit_code = Some(exit_code);
+            });
         }
 
         Ok(())
