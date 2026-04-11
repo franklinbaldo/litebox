@@ -743,13 +743,7 @@ impl Server {
                     // Mount hit: canonicalize the host path
                     match fs::canonicalize(&host_path) {
                         Ok(p) => p,
-                        Err(_) => {
-                            if host_path.exists() {
-                                host_path
-                            } else {
-                                break;
-                            }
-                        }
+                        Err(_) => break,
                     }
                 } else {
                     // No mount match, canonicalize as normal
