@@ -288,6 +288,7 @@ pub struct LinuxShimBuilder {
     platform: &'static Platform,
     litebox: LiteBox<Platform>,
     load_filter: Option<LoadFilter>,
+    network_config: Option<litebox::net::NetworkConfig>,
 }
 
 impl Default for LinuxShimBuilder {
@@ -304,6 +305,7 @@ impl LinuxShimBuilder {
             platform,
             litebox: LiteBox::new(platform),
             load_filter: None,
+            network_config: None,
         }
     }
 
@@ -326,6 +328,14 @@ impl LinuxShimBuilder {
         self.load_filter = Some(callback);
     }
 
+    /// Set the network configuration for the guest network stack.
+    ///
+    /// When not set, the default configuration is used (IP mode, 10.0.0.2/24,
+    /// gateway 10.0.0.1).
+    pub fn set_network_config(&mut self, config: litebox::net::NetworkConfig) {
+        self.network_config = Some(config);
+    }
+
     /// Build the shim.
     ///
     /// # Panics
@@ -334,7 +344,11 @@ impl LinuxShimBuilder {
         use litebox::platform::AddressSpaceProvider;
         use litebox::platform::RawMutex as _;
 
-        let mut net = Network::new(&self.litebox);
+        let mut net = if let Some(config) = self.network_config {
+            Network::with_config(&self.litebox, config)
+        } else {
+            Network::new(&self.litebox)
+        };
         net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
 
         // Allocate the init process's address space (slot 0 on userland).
