@@ -130,7 +130,9 @@ fn build_allowlist_filter() -> Vec<BpfInsn> {
         // ── Signals ────────────────────────────────────────────────
         libc::SYS_rt_sigaction as u32, // 13  [W]  signal handler management
         libc::SYS_rt_sigprocmask as u32, // 14  [W]  signal mask management
+        libc::SYS_rt_sigreturn as u32, // 15  [W]  return from signal handler
         libc::SYS_sigaltstack as u32,  // 131 [W]  alternate signal stack setup
+        libc::SYS_tgkill as u32,       // 234 [W]  thread-directed signal delivery (RT interrupt)
         // ── Synchronization ────────────────────────────────────────
         libc::SYS_futex as u32, // 202 [W]  core sync primitive (mutex/condvar)
         // ── Fd management ──────────────────────────────────────────
@@ -173,8 +175,10 @@ fn build_allowlist_filter() -> Vec<BpfInsn> {
         // win is preserved. These syscalls only allow network/file
         // setup within the virtual sandbox.
         libc::SYS_socket as u32, // 41  [WE] AF_UNIX socket for broker IPC + 9P channel
+        libc::SYS_socketpair as u32, // 53  [WE] AF_UNIX socketpair for mux channel setup
         libc::SYS_connect as u32, // 42  [WE] connect to broker Unix socket
         libc::SYS_poll as u32,   // 7   [WE] non-blocking connect wait
+        libc::SYS_ppoll as u32,  // 271 [WE] ppoll variant used by Rust runtime for I/O wait
         libc::SYS_getsockopt as u32, // 55  [WE] check connect error (SO_ERROR)
         libc::SYS_sendto as u32, // 44  [WE] send() → sendto on x86_64, 9P handshake
         libc::SYS_recvfrom as u32, // 45  [WE] recv() → recvfrom on x86_64, 9P ack
@@ -372,8 +376,8 @@ mod tests {
         let insns = build_allowlist_filter();
         let count = extract_allowed_syscalls(&insns).len();
         assert!(
-            count <= 57,
-            "forker allowlist has {count} syscalls — expected <= 57. \
+            count <= 61,
+            "forker allowlist has {count} syscalls — expected <= 61. \
              Justify any additions with [F]/[W]/[WI]/[WE]/[RT] tags."
         );
     }
