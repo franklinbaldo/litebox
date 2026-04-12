@@ -42,7 +42,7 @@ impl<FS: ShimFS> Task<FS> {
         // If another thread is forking, park this thread until the fork
         // completes. This prevents us from accessing memory pages that are
         // being CoW-protected.
-        self.park_for_vfork_if_requested();
+        self.park_for_vfork_if_requested(ctx);
 
         self.wait_state.0.prepare_to_run_guest(|| {
             use litebox::platform::SignalProvider as _;
@@ -108,7 +108,7 @@ impl<FS: ShimFS> Task<FS> {
     /// sees `vfork_park=1`), but must NOT park — it is the only thread
     /// allowed to run during the vfork window. Identified by having a
     /// `fork_context`.
-    pub(crate) fn park_for_vfork_if_requested(&self) {
+    pub(crate) fn park_for_vfork_if_requested(&self, ctx: &litebox_common_linux::ExecutionContext) {
         use core::sync::atomic::Ordering;
         use litebox::platform::RawMutex as _;
 
@@ -123,6 +123,15 @@ impl<FS: ShimFS> Task<FS> {
         // parked_count (the lie already incremented it).
         if self.deferred_vfork_park.get() {
             let ps = self.process_state.borrow();
+            // If checkpoint mode, save state before blocking.
+            if ps.vfork_parking.checkpoint_mode.load(Ordering::Acquire) {
+                let snapshot = self.snapshot_thread_for_checkpoint(ctx);
+                let inner = self.thread.process.inner.lock();
+                if let Some(remote) = inner.threads.get(&self.tid) {
+                    *remote.checkpoint_snapshot.lock() = Some(snapshot);
+                }
+                drop(inner);
+            }
             loop {
                 let v = ps
                     .vfork_parking
@@ -176,6 +185,16 @@ impl<FS: ShimFS> Task<FS> {
                 break true;
             }
         };
+
+        // If checkpoint mode is active, save our execution state before parking.
+        if ps.vfork_parking.checkpoint_mode.load(Ordering::Acquire) {
+            let snapshot = self.snapshot_thread_for_checkpoint(ctx);
+            let inner = self.thread.process.inner.lock();
+            if let Some(remote) = inner.threads.get(&self.tid) {
+                *remote.checkpoint_snapshot.lock() = Some(snapshot);
+            }
+            drop(inner);
+        }
 
         if !claimed_lie {
             // Normal park: announce that we are parked.

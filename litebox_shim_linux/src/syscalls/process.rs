@@ -50,7 +50,7 @@ type ExecVforkInfo = (
 /// Process-management-related state on [`Task`].
 pub(crate) struct ThreadState {
     pub(crate) init_state: Cell<ThreadInitState>,
-    process: Arc<Process>,
+    pub(crate) process: Arc<Process>,
     /// Thread state that can be accessed from a remote thread.
     remote: Arc<ThreadRemote>,
     attached_tid: Cell<Option<i32>>,
@@ -6081,6 +6081,12 @@ impl<FS: ShimFS> Task<FS> {
     ) -> bool {
         use super::fork_snapshot::{ForkRejectReasons, ForkSnapshot};
 
+        // Signal sibling threads to save their execution state before parking.
+        {
+            let ps = self.process_state.borrow();
+            ps.vfork_parking.checkpoint_mode.store(true, core::sync::atomic::Ordering::Release);
+        }
+
         // Park sibling threads for a consistent snapshot (same as true fork).
         let did_park = self.park_other_threads().unwrap_or(false);
 
@@ -6090,8 +6096,29 @@ impl<FS: ShimFS> Task<FS> {
         // child), and exit_signal is irrelevant.
         let identity = self.snapshot_identity(self.process_id, self.pid, 0);
         let process_wide = self.snapshot_process_wide();
-        // Capture execution context as-is (guest is stopped between syscalls).
-        let thread = self.snapshot_thread_for_checkpoint(ctx);
+        // Snapshot the checkpointing thread first.
+        let mut threads = alloc::vec![self.snapshot_thread_for_checkpoint(ctx)];
+
+        // Collect sibling thread snapshots from ThreadRemote.
+        if did_park {
+            let inner = self.thread.process.inner.lock();
+            for (&tid, thread_remote) in &inner.threads {
+                if tid != self.tid {
+                    let mut snapshot_slot = thread_remote.checkpoint_snapshot.lock();
+                    if let Some(snapshot) = snapshot_slot.take() {
+                        threads.push(snapshot);
+                    } else {
+                        litebox::log_println!(
+                            self.global.platform,
+                            "[CHECKPOINT] pid={}: warning: sibling tid={} did not save snapshot",
+                            self.pid,
+                            tid,
+                        );
+                    }
+                }
+            }
+            drop(inner);
+        }
         let signal = self.snapshot_signal();
         let fs = self.snapshot_fs();
         let fd_table = self.snapshot_fd_table(&mut reject);
@@ -6114,7 +6141,7 @@ impl<FS: ShimFS> Task<FS> {
         let snapshot = ForkSnapshot {
             identity,
             process_wide,
-            threads: alloc::vec![thread],
+            threads,
             signal,
             fs,
             fd_table,
@@ -6275,7 +6302,7 @@ impl<FS: ShimFS> Task<FS> {
     /// call-site address in R11 (see litebox_syscall_rewriter), so rewinding
     /// RIP to R11 makes the guest re-enter the trampoline and re-issue the
     /// original syscall with the same arguments (still in RDI/RSI/RDX/R10/R8/R9).
-    fn snapshot_thread_for_checkpoint(
+    pub(crate) fn snapshot_thread_for_checkpoint(
         &self,
         ctx: &litebox_common_linux::ExecutionContext,
     ) -> super::fork_snapshot::ThreadSnapshot {
@@ -6950,6 +6977,11 @@ impl<FS: ShimFS> Task<FS> {
         self.global
             .transport_interrupt
             .store(false, Ordering::Release);
+
+        // Clear checkpoint mode.
+        ps.vfork_parking
+            .checkpoint_mode
+            .store(false, core::sync::atomic::Ordering::Release);
 
         // Clear the process-wide park futex and wake all parked threads.
         ps.vfork_parking
