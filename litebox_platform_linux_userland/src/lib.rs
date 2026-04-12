@@ -5583,10 +5583,14 @@ fn register_exception_handlers() {
                 libc::sigaddset(&raw mut sa.sa_mask, interrupt_signal);
                 let mut old_sa = core::mem::zeroed();
                 sigaction(sig, Some(&sa), &mut old_sa);
-                assert_eq!(
+                // Accept SIG_DFL or SIG_IGN (inherited from parent shell for
+                // background jobs) as safe previous states.  Only panic if a
+                // custom handler was already installed, which would conflict.
+                assert!(
+                    old_sa.sa_sigaction == libc::SIG_DFL
+                        || old_sa.sa_sigaction == libc::SIG_IGN,
+                    "signal {sig} handler already installed (sa_sigaction={:#x}, expected SIG_DFL or SIG_IGN)",
                     old_sa.sa_sigaction,
-                    libc::SIG_DFL,
-                    "signal {sig} handler already installed",
                 );
             }
         }
