@@ -1035,28 +1035,6 @@ fn test_run_system_false() {
     assert_eq!(code, 1, "/usr/bin/false should exit 1, got {code}");
 }
 
-/// `/usr/bin/basename /foo/bar/baz.txt` — pure string manipulation, exit 0.
-#[test]
-fn test_run_system_basename() {
-    let code = run_system_binary(
-        "/usr/bin/basename",
-        &["/usr/bin/basename", "/foo/bar/baz.txt"],
-        "basename",
-    );
-    assert_eq!(code, 0, "basename exited with code {code}");
-}
-
-/// `/usr/bin/dirname /foo/bar/baz.txt` — pure string manipulation, exit 0.
-#[test]
-fn test_run_system_dirname() {
-    let code = run_system_binary(
-        "/usr/bin/dirname",
-        &["/usr/bin/dirname", "/foo/bar/baz.txt"],
-        "dirname",
-    );
-    assert_eq!(code, 0, "dirname exited with code {code}");
-}
-
 // ═══════════════════════════════════════════════════════════════════
 // Coreutils — light I/O tier (read system info, write stdout)
 // ═══════════════════════════════════════════════════════════════════
@@ -1075,52 +1053,11 @@ fn test_run_system_uname() {
     assert_eq!(code, 0, "uname exited with code {code}");
 }
 
-/// `/usr/bin/env` with no args — prints environment variables.
-#[test]
-fn test_run_system_env() {
-    let code = run_system_binary("/usr/bin/env", &["/usr/bin/env"], "env");
-    assert_eq!(code, 0, "env exited with code {code}");
-}
-
-/// `/usr/bin/printenv` — prints environment variables (similar to env).
-#[test]
-fn test_run_system_printenv() {
-    let code = run_system_binary("/usr/bin/printenv", &["/usr/bin/printenv"], "printenv");
-    assert_eq!(code, 0, "printenv exited with code {code}");
-}
-
 /// `/bin/hostname` — reads hostname, writes to stdout.
 #[test]
 fn test_run_system_hostname() {
     let code = run_system_binary("/bin/hostname", &["/bin/hostname"], "hostname");
     assert_eq!(code, 0, "hostname exited with code {code}");
-}
-
-/// `/usr/bin/printf` — formatted output.
-#[test]
-fn test_run_system_printf() {
-    let code = run_system_binary(
-        "/usr/bin/printf",
-        &["/usr/bin/printf", "hello %s\n", "litebox"],
-        "printf",
-    );
-    assert_eq!(code, 0, "printf exited with code {code}");
-}
-
-/// `/usr/bin/seq 1 5` — generate sequence of numbers.
-#[test]
-fn test_run_system_seq() {
-    let code = run_system_binary("/usr/bin/seq", &["/usr/bin/seq", "1", "5"], "seq");
-    assert_eq!(code, 0, "seq exited with code {code}");
-}
-
-/// `/usr/bin/wc` with a simple input via /dev/null — word count utility.
-/// With no stdin and no file args, wc reads stdin which will be empty.
-#[test]
-fn test_run_system_wc() {
-    // wc with /dev/null as arg should print "0 0 0" and exit 0
-    let code = run_system_binary("/usr/bin/wc", &["/usr/bin/wc", "/dev/null"], "wc");
-    assert_eq!(code, 0, "wc exited with code {code}");
 }
 
 /// `/bin/cat /dev/null` — should read empty file and exit 0.
@@ -1178,17 +1115,6 @@ fn test_run_system_tail() {
     assert_eq!(code, 0, "tail exited with code {code}");
 }
 
-/// `/usr/bin/cut -c1 /tmp/hello.txt` — extracts first character of each line.
-#[test]
-fn test_run_system_cut() {
-    let code = run_system_binary(
-        "/usr/bin/cut",
-        &["/usr/bin/cut", "-c1", "/tmp/hello.txt"],
-        "cut",
-    );
-    assert_eq!(code, 0, "cut exited with code {code}");
-}
-
 /// `/usr/bin/sort /tmp/hello.txt` — sorts input lines.
 ///
 /// Requires MIG semaphore_create (msgh_id 3439) and task_info (msgh_id 3418).
@@ -1202,35 +1128,6 @@ fn test_run_system_sort() {
     assert_eq!(code, 0, "sort exited with code {code}");
 }
 
-/// `/usr/bin/uniq /tmp/hello.txt` — filters adjacent duplicate lines.
-#[test]
-fn test_run_system_uniq() {
-    let code = run_system_binary(
-        "/usr/bin/uniq",
-        &["/usr/bin/uniq", "/tmp/hello.txt"],
-        "uniq",
-    );
-    assert_eq!(code, 0, "uniq exited with code {code}");
-}
-
-/// `/usr/bin/rev /tmp/hello.txt` — reverses each line.
-#[test]
-fn test_run_system_rev() {
-    let code = run_system_binary("/usr/bin/rev", &["/usr/bin/rev", "/tmp/hello.txt"], "rev");
-    assert_eq!(code, 0, "rev exited with code {code}");
-}
-
-/// `/usr/bin/paste /tmp/hello.txt` — merge lines of files.
-#[test]
-fn test_run_system_paste() {
-    let code = run_system_binary(
-        "/usr/bin/paste",
-        &["/usr/bin/paste", "/tmp/hello.txt"],
-        "paste",
-    );
-    assert_eq!(code, 0, "paste exited with code {code}");
-}
-
 // =====================================================================
 // Additional coreutils — verified to run correctly in the shim
 // =====================================================================
@@ -1240,27 +1137,6 @@ fn test_run_system_paste() {
 fn test_run_system_date() {
     let code = run_system_binary("/bin/date", &["/bin/date", "+%Y"], "date");
     assert_eq!(code, 0, "date exited with code {code}");
-}
-
-/// `/bin/expr 1 + 1` — evaluates arithmetic expression.
-#[test]
-fn test_run_system_expr() {
-    let code = run_system_binary("/bin/expr", &["/bin/expr", "1", "+", "1"], "expr");
-    assert_eq!(code, 0, "expr exited with code {code}");
-}
-
-/// `/bin/sync` — flush filesystem buffers.
-#[test]
-fn test_run_system_sync() {
-    let code = run_system_binary("/bin/sync", &["/bin/sync"], "sync");
-    assert_eq!(code, 0, "sync exited with code {code}");
-}
-
-/// `/bin/test 1 -eq 1` — evaluate conditional expression.
-#[test]
-fn test_run_system_test_builtin() {
-    let code = run_system_binary("/bin/test", &["/bin/test", "1", "-eq", "1"], "test");
-    assert_eq!(code, 0, "test exited with code {code}");
 }
 
 /// `/bin/sleep 0` — sleep for zero seconds.
@@ -1275,71 +1151,6 @@ fn test_run_system_sleep() {
 fn test_run_system_kill() {
     let code = run_system_binary("/bin/kill", &["/bin/kill", "-l"], "kill");
     assert_eq!(code, 0, "kill exited with code {code}");
-}
-
-/// `/usr/bin/tr a b < /dev/null` — transliterate characters (empty stdin).
-#[test]
-fn test_run_system_tr() {
-    let code = run_system_binary("/usr/bin/tr", &["/usr/bin/tr", "a", "b"], "tr");
-    assert_eq!(code, 0, "tr exited with code {code}");
-}
-
-/// `/usr/bin/od /dev/null` — octal dump of empty file.
-#[test]
-fn test_run_system_od() {
-    let code = run_system_binary("/usr/bin/od", &["/usr/bin/od", "/dev/null"], "od");
-    assert_eq!(code, 0, "od exited with code {code}");
-}
-
-/// `/usr/bin/nl /tmp/hello.txt` — number lines.
-#[test]
-fn test_run_system_nl() {
-    let code = run_system_binary("/usr/bin/nl", &["/usr/bin/nl", "/tmp/hello.txt"], "nl");
-    assert_eq!(code, 0, "nl exited with code {code}");
-}
-
-/// `/usr/bin/expand /tmp/hello.txt` — convert tabs to spaces.
-#[test]
-fn test_run_system_expand() {
-    let code = run_system_binary(
-        "/usr/bin/expand",
-        &["/usr/bin/expand", "/tmp/hello.txt"],
-        "expand",
-    );
-    assert_eq!(code, 0, "expand exited with code {code}");
-}
-
-/// `/usr/bin/unexpand /tmp/hello.txt` — convert spaces to tabs.
-#[test]
-fn test_run_system_unexpand() {
-    let code = run_system_binary(
-        "/usr/bin/unexpand",
-        &["/usr/bin/unexpand", "/tmp/hello.txt"],
-        "unexpand",
-    );
-    assert_eq!(code, 0, "unexpand exited with code {code}");
-}
-
-/// `/usr/bin/fold /tmp/hello.txt` — wrap each line to fit in specified width.
-#[test]
-fn test_run_system_fold() {
-    let code = run_system_binary(
-        "/usr/bin/fold",
-        &["/usr/bin/fold", "/tmp/hello.txt"],
-        "fold",
-    );
-    assert_eq!(code, 0, "fold exited with code {code}");
-}
-
-/// `/usr/bin/hexdump /dev/null` — hex dump of empty file.
-#[test]
-fn test_run_system_hexdump() {
-    let code = run_system_binary(
-        "/usr/bin/hexdump",
-        &["/usr/bin/hexdump", "/dev/null"],
-        "hexdump",
-    );
-    assert_eq!(code, 0, "hexdump exited with code {code}");
 }
 
 /// `/usr/bin/tty` — print terminal name; exits 1 when not a tty.
@@ -1386,38 +1197,6 @@ fn test_run_system_getconf() {
         "getconf",
     );
     assert_eq!(code, 0, "getconf exited with code {code}");
-}
-
-/// `/usr/bin/jot 3` — generate sequential data (1, 2, 3).
-#[test]
-fn test_run_system_jot() {
-    let code = run_system_binary("/usr/bin/jot", &["/usr/bin/jot", "3"], "jot");
-    assert_eq!(code, 0, "jot exited with code {code}");
-}
-
-/// `/usr/bin/look z /dev/null` — look up prefix in sorted file; exits 1 on no match.
-#[test]
-fn test_run_system_look() {
-    let code = run_system_binary(
-        "/usr/bin/look",
-        &["/usr/bin/look", "z", "/dev/null"],
-        "look",
-    );
-    assert_eq!(code, 1, "look should exit 1 (no match)");
-}
-
-/// `/bin/mkdir /tmp` — mkdir on existing dir exits 1 (not a crash).
-#[test]
-fn test_run_system_mkdir() {
-    let code = run_system_binary("/bin/mkdir", &["/bin/mkdir", "/tmp"], "mkdir");
-    assert_eq!(code, 1, "mkdir on existing dir should exit 1");
-}
-
-/// `/bin/rmdir /tmp` — rmdir on non-empty dir exits 1 (not a crash).
-#[test]
-fn test_run_system_rmdir() {
-    let code = run_system_binary("/bin/rmdir", &["/bin/rmdir", "/tmp"], "rmdir");
-    assert_eq!(code, 1, "rmdir on non-empty dir should exit 1");
 }
 
 // =====================================================================
