@@ -244,36 +244,6 @@ impl Process {
         }
     }
 
-    /// Creates a new process with restored resource limits and thp state.
-    ///
-    /// Used by fork-restore to reconstruct a child process from a snapshot.
-    pub(crate) fn new_with_rlimits(
-        pid: i32,
-        remote: Arc<ThreadRemote>,
-        rlimits: &[(usize, usize); litebox_common_linux::RlimitResource::RLIM_NLIMITS],
-        thp_disabled: bool,
-    ) -> Self {
-        let nr_threads = <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT;
-        nr_threads.underlying_atomic().store(1, Ordering::Relaxed);
-        let limits = ResourceLimits::from_snapshot(rlimits);
-        Self {
-            nr_threads,
-            inner: Mutex::new(ProcessInner {
-                exit_status: ExitStatus::Exit(0),
-                group_exit: false,
-                is_killing_other_threads: false,
-                is_forking: false,
-                threads: BTreeMap::from_iter([(pid, remote)]),
-            }),
-            limits,
-            alarm_timer: Mutex::new(Alarm {
-                handle: None,
-                deadline: None,
-            }),
-            thp_disabled: AtomicBool::new(thp_disabled),
-        }
-    }
-
     /// Creates a new process with restored resource limits and pre-built thread map.
     ///
     /// Used by multi-threaded checkpoint restore.
