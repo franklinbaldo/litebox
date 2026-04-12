@@ -290,6 +290,10 @@ impl<FS: ShimFS> Task<FS> {
             MacosSyscallRequest::Unlinkat { dirfd, path, flag } => {
                 self.sys_unlinkat(dirfd, path, flag)
             }
+            MacosSyscallRequest::Rename {
+                old_path,
+                new_path,
+            } => self.sys_rename(old_path, new_path),
             MacosSyscallRequest::Fchmod { fd, mode } => self.sys_fchmod(fd, mode),
             MacosSyscallRequest::Mkdir { path, mode } => self.sys_mkdir(path, mode),
             MacosSyscallRequest::Rmdir { path } => self.sys_rmdir(path),

@@ -141,6 +141,10 @@ pub mod nr {
     pub const MAP_WITH_LINKING_NP: usize = 550;
     /// `__pthread_sigmask(how, set, oset)` — set/get signal mask for the calling thread.
     pub const PTHREAD_SIGMASK: usize = 329;
+    /// `rename(old_path, new_path)` — rename a file (macOS 128).
+    pub const RENAME: usize = 128;
+    /// `renameat(olddirfd, old_path, newdirfd, new_path)` — rename a file relative to dirs (macOS 526).
+    pub const RENAMEAT: usize = 526;
 }
 
 /// Mach trap numbers (negative x16 values, stored as positive constants).
@@ -725,6 +729,11 @@ pub enum MacosSyscallRequest {
         path: usize,
         flag: i32,
     },
+    /// `rename(old_path, new_path)` — rename a file.
+    Rename {
+        old_path: usize,
+        new_path: usize,
+    },
     Execve {
         path: usize,
         argv: usize,
@@ -1211,6 +1220,10 @@ impl MacosSyscallRequest {
                 dirfd: a0 as i32,
                 path: a1,
                 flag: a2 as i32,
+            },
+            nr::RENAME => MacosSyscallRequest::Rename {
+                old_path: ctx.regs[0],
+                new_path: ctx.regs[1],
             },
             nr::GETRLIMIT => MacosSyscallRequest::Getrlimit {
                 resource: a0 as u32,

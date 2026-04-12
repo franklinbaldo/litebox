@@ -1205,6 +1205,68 @@ impl<FS: ShimFS> Task<FS> {
         Ok(0)
     }
 
+    /// Handle `rename(old_path, new_path)` (BSD syscall 128).
+    ///
+    /// Renames a file in the guest filesystem.  Implemented as
+    /// open-old → read-all → create-new → write-all → close-both → unlink-old
+    /// since the VFS trait does not expose a native rename.
+    pub(crate) fn sys_rename(
+        &self,
+        old_path_addr: usize,
+        new_path_addr: usize,
+    ) -> Result<usize, Errno> {
+        use litebox::fs::{OFlags, Mode};
+
+        let old_ptr: ConstPtr<u8> = ConstPtr::from_usize(old_path_addr);
+        let old_path = read_cstring_from_guest(old_ptr, 4096).ok_or(Errno::EFAULT)?;
+        let new_ptr: ConstPtr<u8> = ConstPtr::from_usize(new_path_addr);
+        let new_path = read_cstring_from_guest(new_ptr, 4096).ok_or(Errno::EFAULT)?;
+
+        let old_cpath =
+            alloc::ffi::CString::new(old_path.as_bytes()).map_err(|_| Errno::EINVAL)?;
+        let new_cpath =
+            alloc::ffi::CString::new(new_path.as_bytes()).map_err(|_| Errno::EINVAL)?;
+
+        // Open the source file and read its entire content.
+        let src_fd = self
+            .global
+            .fs
+            .open(&old_cpath, OFlags::RDONLY, Mode::empty())
+            .map_err(|_| Errno::ENOENT)?;
+        let status = self.global.fs.fd_file_status(&src_fd).map_err(|_| Errno::EIO)?;
+        let size = status.size;
+        let mut buf = alloc::vec![0u8; size];
+        if size > 0 {
+            self.global
+                .fs
+                .read(&src_fd, &mut buf, Some(0))
+                .map_err(|_| Errno::EIO)?;
+        }
+        let _ = self.global.fs.close(&src_fd);
+
+        // Create (or truncate) the destination and write.
+        let dst_fd = self
+            .global
+            .fs
+            .open(
+                &new_cpath,
+                OFlags::WRONLY | OFlags::CREAT | OFlags::TRUNC,
+                Mode::all(),
+            )
+            .map_err(|_| Errno::EIO)?;
+        if !buf.is_empty() {
+            self.global
+                .fs
+                .write(&dst_fd, &buf, Some(0))
+                .map_err(|_| Errno::EIO)?;
+        }
+        let _ = self.global.fs.close(&dst_fd);
+
+        // Remove the source.
+        self.global.fs.unlink(&old_cpath).map_err(|_| Errno::EIO)?;
+        Ok(0)
+    }
+
     /// Handle `unlinkat(dirfd, path, flag)`.
     ///
     /// If `flag` contains `AT_REMOVEDIR` (0x08 on macOS), behaves like `rmdir`.

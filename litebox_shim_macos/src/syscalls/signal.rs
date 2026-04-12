@@ -420,6 +420,17 @@ impl<FS: ShimFS> Task<FS> {
         fault_address: usize,
         handler: &crate::SignalHandler,
     ) {
+        log_unsupported!(
+            "deliver_signal: sig={} fault_addr={:#x} pc={:#x} lr={:#x} sp={:#x} x19={:#x} handler={:#x} tramp={:#x}",
+            signum,
+            fault_address,
+            ctx.pc,
+            ctx.regs[30],
+            ctx.sp,
+            ctx.regs[19],
+            handler.handler,
+            handler.tramp
+        );
         // 1. Compute new stack pointer (with altstack support).
         let frame_size = SIGINFO_SIZE + UCONTEXT_SIZE + MCONTEXT_SIZE; // 976
         let altstack = self.altstack.lock();

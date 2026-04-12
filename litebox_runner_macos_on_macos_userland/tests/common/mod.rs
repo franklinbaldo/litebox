@@ -911,6 +911,18 @@ fn run_macho_dynamic_inner(
             let mut thread_vars_size: Option<u64> = None;
             let mut thread_data_size: Option<u64> = None;
             let mut thread_data_fileoff: Option<u64> = None;
+            let mut thread_data_vmaddr: Option<u64> = None;
+            let mut thread_bss_vmaddr: Option<u64> = None;
+            let mut thread_bss_size: Option<u64> = None;
+            // Section numbers (1-indexed) for TLV sections, and
+            // LC_SYMTAB info for computing TLV descriptor offsets.
+            let mut sect_counter: u8 = 1;
+            let mut tvar_sect_num: Option<u8> = None;
+            let mut tdat_sect_num: Option<u8> = None;
+            let mut tbss_sect_num: Option<u8> = None;
+            let mut symtab_symoff: Option<u64> = None;
+            let mut symtab_nsyms: Option<u32> = None;
+            let mut symtab_stroff: Option<u64> = None;
 
             for _ in 0..ncmds {
                 if cursor + 8 > bin.len() {
@@ -932,6 +944,21 @@ fn run_macho_dynamic_inner(
                     break;
                 }
 
+                // LC_SYMTAB = 0x2
+                if cmd == 0x2 && cmdsize >= 24 {
+                    symtab_symoff = Some(u64::from(u32::from_le_bytes([
+                        bin[cursor + 8], bin[cursor + 9],
+                        bin[cursor + 10], bin[cursor + 11],
+                    ])));
+                    symtab_nsyms = Some(u32::from_le_bytes([
+                        bin[cursor + 12], bin[cursor + 13],
+                        bin[cursor + 14], bin[cursor + 15],
+                    ]));
+                    symtab_stroff = Some(u64::from(u32::from_le_bytes([
+                        bin[cursor + 16], bin[cursor + 17],
+                        bin[cursor + 18], bin[cursor + 19],
+                    ])));
+                }
                 // LC_SEGMENT_64 = 0x19
                 if cmd == 0x19 {
                     // Parse sections within this segment
@@ -980,18 +1007,94 @@ fn run_macho_dynamic_inner(
                             if sectname.starts_with(b"__thread_vars\0") {
                                 thread_vars_vmaddr = Some(sect_addr);
                                 thread_vars_size = Some(sect_size);
+                                tvar_sect_num = Some(sect_counter);
                             } else if sectname.starts_with(b"__thread_data\0") {
                                 thread_data_size = Some(sect_size);
                                 thread_data_fileoff = Some(sect_offset);
+                                thread_data_vmaddr = Some(sect_addr);
+                                tdat_sect_num = Some(sect_counter);
+                            } else if sectname.starts_with(b"__thread_bss\0") {
+                                thread_bss_vmaddr = Some(sect_addr);
+                                thread_bss_size = Some(sect_size);
+                                tbss_sect_num = Some(sect_counter);
                             }
+                            sect_counter += 1;
                         }
                     }
                 }
                 cursor += cmdsize;
             }
 
-            if let (Some(tv_addr), Some(tv_size)) = (thread_vars_vmaddr, thread_vars_size) {
-                let rt_addr = tv_addr.wrapping_add(slide as u64);
+            // Build a map of TLV descriptor vmaddr -> offset in TLS template.
+            // This requires parsing the nlist symbol table to match each
+            // __thread_vars symbol to its corresponding __thread_data or
+            // __thread_bss symbol, then computing offset = data_addr - thread_data_start.
+            let tlv_offset_map: std::collections::HashMap<u64, u32> = {
+                let mut map = std::collections::HashMap::new();
+                if let (Some(tvar_sn), Some(so), Some(ns), Some(stro), Some(tdat_vm)) = (
+                    tvar_sect_num, symtab_symoff, symtab_nsyms, symtab_stroff, thread_data_vmaddr,
+                ) {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let sym_off = so as usize;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let str_off = stro as usize;
+                    // nlist_64: n_strx(4) + n_type(1) + n_sect(1) + n_desc(2) + n_value(8) = 16
+                    let tdat_sn = tdat_sect_num.unwrap_or(0);
+                    let tbss_sn = tbss_sect_num.unwrap_or(0);
+                    // Collect symbols by section: thread_vars and thread_data/bss
+                    let mut tvar_syms: Vec<(u64, usize)> = Vec::new(); // (addr, str_idx)
+                    let mut tdat_syms: Vec<(u64, usize)> = Vec::new(); // (addr, str_idx)
+                    for i in 0..ns as usize {
+                        let noff = sym_off + i * 16;
+                        if noff + 16 > bin.len() { break; }
+                        let n_strx = u32::from_le_bytes([
+                            bin[noff], bin[noff+1], bin[noff+2], bin[noff+3],
+                        ]) as usize;
+                        let n_sect = bin[noff + 5];
+                        let n_value = u64::from_le_bytes([
+                            bin[noff+8], bin[noff+9], bin[noff+10], bin[noff+11],
+                            bin[noff+12], bin[noff+13], bin[noff+14], bin[noff+15],
+                        ]);
+                        if n_sect == tvar_sn {
+                            tvar_syms.push((n_value, n_strx));
+                        } else if (tdat_sn > 0 && n_sect == tdat_sn) || (tbss_sn > 0 && n_sect == tbss_sn) {
+                            tdat_syms.push((n_value, n_strx));
+                        }
+                    }
+                    // Helper: read a NUL-terminated string from the string table
+                    let get_str = |idx: usize| -> &[u8] {
+                        let start = str_off + idx;
+                        if start >= bin.len() { return b""; }
+                        let end = bin[start..].iter().position(|&b| b == 0)
+                            .map_or(bin.len(), |p| start + p);
+                        &bin[start..end]
+                    };
+                    // For each thread_vars symbol, find matching thread_data/bss symbol
+                    for &(tvar_addr, tvar_strx) in &tvar_syms {
+                        let tvar_name = get_str(tvar_strx);
+                        // Try matching: data symbol is either "NAME$tlv$init" or "NAME"
+                        for &(tdat_addr, tdat_strx) in &tdat_syms {
+                            let tdat_name = get_str(tdat_strx);
+                            let matches = if tdat_name.ends_with(b"$tlv$init") {
+                                &tdat_name[..tdat_name.len() - 9] == tvar_name
+                            } else {
+                                tdat_name == tvar_name
+                            };
+                            if matches {
+                                #[allow(clippy::cast_possible_truncation)]
+                                let offset = (tdat_addr.wrapping_sub(tdat_vm)) as u32;
+                                map.insert(tvar_addr, offset);
+                                break;
+                            }
+                        }
+
+                    }
+                }
+                map
+            };
+
+            if let (Some(tvar_addr), Some(tv_size)) = (thread_vars_vmaddr, thread_vars_size) {
+                let rt_addr = tvar_addr.wrapping_add(slide as u64);
                 let num_descs = tv_size / 24; // each TLV descriptor is 24 bytes
                 // Compute the TLS image size and initial data.
                 let tls_init_data: Vec<u8> = if let (Some(td_size), Some(td_off)) =
@@ -1014,23 +1117,55 @@ fn run_macho_dynamic_inner(
                 let mut key: libc::pthread_key_t = 0;
                 let ret = unsafe { libc::pthread_key_create(&raw mut key, None) };
                 if ret == 0 {
-                    // Write the key into each TLV descriptor at byte offset 8 (u32).
+                    // Write the key and offset into each TLV descriptor.
+                    // Descriptor layout: [0:8] thunk, [8:12] key(u32), [12:16] offset(u32)
                     for i in 0..num_descs {
                         let desc_addr = rt_addr + i * 24;
                         let key_ptr = (desc_addr + 8) as *mut u32;
+                        let off_ptr = (desc_addr + 12) as *mut u32;
+                        // Unrelocated descriptor address for offset map lookup
+                        let unrelocated = tvar_addr + i * 24;
+                        let offset = tlv_offset_map.get(&unrelocated).copied().unwrap_or(0);
                         unsafe {
                             #[allow(clippy::cast_possible_truncation)] // pthread keys fit in u32
                             core::ptr::write_volatile(key_ptr, key as u32);
+                            core::ptr::write_volatile(off_ptr, offset);
                         }
                     }
 
                     // Allocate the TLS block for the main thread and fill
                     // with initial data from __thread_data.
-                    let block_size = if tls_init_data.is_empty() {
-                        256
-                    } else {
-                        tls_init_data.len().max(256)
+                    //
+                    // The total TLS template size includes __thread_data
+                    // (initialized) + alignment gap + __thread_bss (zero-
+                    // initialized).  We must allocate enough for both.
+                    // Additionally, scan TLV descriptor offsets to ensure
+                    // the block covers all referenced slots.
+                    let bss_total: usize = match (thread_bss_vmaddr, thread_bss_size, thread_data_vmaddr) {
+                        (Some(bss_addr), Some(bss_sz), Some(tdat_addr)) => {
+                            // BSS end relative to __thread_data start
+                            #[allow(clippy::cast_possible_truncation)]
+                            { (bss_addr + bss_sz - tdat_addr) as usize }
+                        }
+                        _ => 0,
                     };
+                    // Scan descriptors for max offset + 8 (pointer size).
+                    // Offset is at byte 12 of each descriptor (u32), which
+                    // we just wrote above from the tlv_offset_map.
+                    let mut max_desc_end: usize = 0;
+                    for i in 0..num_descs {
+                        let desc_addr = rt_addr + i * 24;
+                        let off_ptr = (desc_addr + 12) as *const u32;
+                        let off = unsafe { core::ptr::read_volatile(off_ptr) } as usize;
+                        if off + 8 > max_desc_end {
+                            max_desc_end = off + 8;
+                        }
+                    }
+                    let block_size = tls_init_data
+                        .len()
+                        .max(bss_total)
+                        .max(max_desc_end)
+                        .max(256);
                     let layout = std::alloc::Layout::from_size_align(block_size, 16).unwrap();
                     let block = unsafe { std::alloc::alloc_zeroed(layout) };
                     if !block.is_null() {
