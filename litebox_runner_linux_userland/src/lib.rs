@@ -729,6 +729,7 @@ fn finish_run<FS: litebox_shim_linux::ShimFS>(
             envp,
             task_override_from_cli_args(cli_args, platform),
             None,
+            false,
         )
     } else {
         let initial_file_system = std::sync::Arc::new(fs);
@@ -882,6 +883,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     envp: Vec<alloc::ffi::CString>,
     task_override: Option<litebox_common_linux::TaskParams>,
     worker_result_fd: Option<i32>,
+    forker_grandchild: bool,
 ) -> Result<i32> {
     let broker_addr = cli_args.nine_p_broker.as_deref().unwrap();
     let is_tcp = broker_addr.parse::<core::net::SocketAddr>().is_ok();
@@ -927,6 +929,12 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
             envp,
             cli_args.working_directory.clone(),
         )?;
+
+        if forker_grandchild {
+            litebox_platform_linux_userland::sandbox_seccomp::install_worker_runtime_filter(
+                litebox_platform_linux_userland::sandbox_seccomp::WorkerKind::Exec,
+            );
+        }
 
         return Ok(guest_wait_status_to_exit_code(run_program(
             program,
@@ -1003,6 +1011,12 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         envp,
         cli_args.working_directory.clone(),
     )?;
+
+    if forker_grandchild {
+        litebox_platform_linux_userland::sandbox_seccomp::install_worker_runtime_filter(
+            litebox_platform_linux_userland::sandbox_seccomp::WorkerKind::Exec,
+        );
+    }
 
     Ok(guest_wait_status_to_exit_code(run_program(
         program,
@@ -2259,6 +2273,7 @@ fn run_worker_exec_core(
             guest_envp,
             Some(guest_task),
             cli_args.worker_result_fd,
+            forker_grandchild,
         )
     } else {
         let initial_file_system = std::sync::Arc::new(default_fs);
@@ -2276,6 +2291,12 @@ fn run_worker_exec_core(
             guest_envp,
             cli_args.working_directory.clone(),
         )?;
+
+        if forker_grandchild {
+            litebox_platform_linux_userland::sandbox_seccomp::install_worker_runtime_filter(
+                litebox_platform_linux_userland::sandbox_seccomp::WorkerKind::Exec,
+            );
+        }
 
         Ok(run_program(
             program,
@@ -3334,6 +3355,9 @@ fn run_forked_worker(
                     &local_pipes,
                 ) {
                     Ok((program, mux_handle)) => {
+                        litebox_platform_linux_userland::sandbox_seccomp::install_worker_runtime_filter(
+                            litebox_platform_linux_userland::sandbox_seccomp::WorkerKind::ForkRestore,
+                        );
                         let wait_status =
                             run_program(program, shutdown, net_worker, result_fd, mux_handle);
                         terminate_host_with_guest_wait_status(wait_status);
@@ -3359,6 +3383,9 @@ fn run_forked_worker(
                     &local_pipes,
                 ) {
                     Ok((program, mux_handle)) => {
+                        litebox_platform_linux_userland::sandbox_seccomp::install_worker_runtime_filter(
+                            litebox_platform_linux_userland::sandbox_seccomp::WorkerKind::ForkRestore,
+                        );
                         let wait_status =
                             run_program(program, shutdown, net_worker, result_fd, mux_handle);
                         terminate_host_with_guest_wait_status(wait_status);
