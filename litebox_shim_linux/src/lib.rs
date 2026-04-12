@@ -909,6 +909,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
         let child_process_state = Arc::new(ProcessState {
             pm: child_pm,
             address_space_id: child_as_id,
+            #[allow(clippy::cast_possible_truncation)]
             thread_count: core::sync::atomic::AtomicI32::new(threads.len() as i32),
             active_vfork_layers: litebox::sync::Mutex::new(Vec::new()),
             elf_patch_cache: litebox::sync::Mutex::new(elf_patch_cache),

@@ -254,9 +254,9 @@ impl Process {
         thp_disabled: bool,
     ) -> Self {
         let nr_threads = <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT;
-        nr_threads
-            .underlying_atomic()
-            .store(thread_count as u32, Ordering::Relaxed);
+        #[allow(clippy::cast_possible_truncation)] // thread count is always small
+        let tc = thread_count as u32;
+        nr_threads.underlying_atomic().store(tc, Ordering::Relaxed);
         let limits = ResourceLimits::from_snapshot(rlimits);
         Self {
             nr_threads,
