@@ -170,6 +170,7 @@ fn build_allowlist_filter() -> Vec<BpfInsn> {
         libc::SYS_tgkill as u32,       // 234 [W]  thread-directed signal delivery (RT interrupt)
         // ── Synchronization ────────────────────────────────────────
         libc::SYS_futex as u32, // 202 [W]  core sync primitive (mutex/condvar)
+        libc::SYS_sched_yield as u32, // 24  [W]  mutex contention fallback (parking_lot/Rust std)
         // ── Fd management ──────────────────────────────────────────
         libc::SYS_dup2 as u32,  // 33  [WI] stdio wiring in worker_entry
         libc::SYS_fcntl as u32, // 72  [W]  F_DUPFD_CLOEXEC, F_SETFD, F_SETFL
@@ -311,6 +312,7 @@ fn build_worker_runtime_filter(kind: WorkerKind) -> Vec<BpfInsn> {
         libc::SYS_tgkill as u32,       // 234 thread-directed signal delivery
         // ── Synchronization ────────────────────────────────────────
         libc::SYS_futex as u32, // 202 mutex/condvar, shmem ring signaling
+        libc::SYS_sched_yield as u32, // 24  mutex contention fallback (parking_lot/Rust std)
         // ── Fd management ──────────────────────────────────────────
         libc::SYS_fcntl as u32, // 72  F_DUPFD_CLOEXEC, F_SETFD, F_SETFL
         // ── Time ───────────────────────────────────────────────────
@@ -500,8 +502,8 @@ mod tests {
         let insns = build_allowlist_filter();
         let count = extract_allowed_syscalls(&insns).len();
         assert!(
-            count <= 61,
-            "forker allowlist has {count} syscalls — expected <= 61. \
+            count <= 62,
+            "forker allowlist has {count} syscalls — expected <= 62. \
              Justify any additions with [F]/[W]/[WI]/[WE]/[RT] tags."
         );
     }
@@ -629,8 +631,8 @@ mod tests {
         let insns = build_worker_runtime_filter(WorkerKind::ForkRestore);
         let count = extract_allowed_syscalls(&insns).len();
         assert!(
-            count <= 35,
-            "ForkRestore runtime allowlist has {count} syscalls — expected <= 35."
+            count <= 36,
+            "ForkRestore runtime allowlist has {count} syscalls — expected <= 36."
         );
     }
 
@@ -639,8 +641,8 @@ mod tests {
         let insns = build_worker_runtime_filter(WorkerKind::Exec);
         let count = extract_allowed_syscalls(&insns).len();
         assert!(
-            count <= 36,
-            "Exec runtime allowlist has {count} syscalls — expected <= 36."
+            count <= 37,
+            "Exec runtime allowlist has {count} syscalls — expected <= 37."
         );
     }
 
