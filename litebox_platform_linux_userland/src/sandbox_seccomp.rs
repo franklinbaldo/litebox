@@ -43,6 +43,30 @@ pub fn install_forker_sandbox_filter() {
     apply_bpf_filter(&prog);
 }
 
+/// The kind of worker, determining which runtime syscall allowlist to use.
+pub enum WorkerKind {
+    /// Fork-restore worker: receives pre-built snapshot, no broker init at runtime.
+    ForkRestore,
+    /// Worker-exec worker: does full platform init (broker IPC, 9P, file loading)
+    /// before entering guest execution.  Needs a slightly wider runtime filter
+    /// because the network worker thread uses ppoll and sched_setaffinity may
+    /// fire slightly late.
+    Exec,
+}
+
+/// Install a second (tighter) seccomp filter for the **worker runtime** phase.
+///
+/// Called by the worker after initialization completes (broker connected, binary
+/// loaded, network worker spawned) but before entering the guest execution loop.
+/// Since seccomp filters stack (kernel ANDs them), this can only restrict further.
+///
+/// The runtime filter drops init-only syscalls like `socket`, `connect`, `openat`,
+/// `ioctl`, `sendto`, `recvfrom`, `memfd_create`, etc.
+pub fn install_worker_runtime_filter(kind: WorkerKind) {
+    let prog = build_worker_runtime_filter(kind);
+    apply_bpf_filter(&prog);
+}
+
 // ---------------------------------------------------------------------------
 // BPF filter construction
 // ---------------------------------------------------------------------------
@@ -250,6 +274,85 @@ fn build_allowlist_filter() -> Vec<BpfInsn> {
     insns
 }
 
+/// Build the runtime allowlist BPF filter for a worker.
+///
+/// This is the second filter installed after worker init completes.
+/// It drops init-only syscalls that are no longer needed.
+#[allow(clippy::cast_possible_truncation)]
+fn build_worker_runtime_filter(kind: WorkerKind) -> Vec<BpfInsn> {
+    let mut allowed: Vec<u32> = vec![
+        // ── Basic I/O ──────────────────────────────────────────────
+        libc::SYS_read as u32,  //  0  pipe I/O, host fd reads
+        libc::SYS_write as u32, //  1  pipe I/O, host fd writes
+        libc::SYS_close as u32, //  3  fd cleanup
+        // ── Memory management ──────────────────────────────────────
+        libc::SYS_mmap as u32,     //  9  guest memory, CoW, thread stacks
+        libc::SYS_mprotect as u32, // 10  guest page permission changes
+        libc::SYS_munmap as u32,   // 11  guest memory deallocation
+        libc::SYS_brk as u32,      // 12  glibc malloc fallback
+        libc::SYS_madvise as u32,  // 28  Rust std thread stack advice
+        // ── Signals ────────────────────────────────────────────────
+        libc::SYS_rt_sigaction as u32, // 13  signal handler management
+        libc::SYS_rt_sigprocmask as u32, // 14  signal mask management
+        libc::SYS_rt_sigreturn as u32, // 15  return from signal handler
+        libc::SYS_sigaltstack as u32,  // 131 alternate signal stack
+        libc::SYS_tgkill as u32,       // 234 thread-directed signal delivery
+        // ── Synchronization ────────────────────────────────────────
+        libc::SYS_futex as u32, // 202 mutex/condvar, shmem ring signaling
+        // ── Fd management ──────────────────────────────────────────
+        libc::SYS_fcntl as u32, // 72  F_DUPFD_CLOEXEC, F_SETFD, F_SETFL
+        // ── Time ───────────────────────────────────────────────────
+        libc::SYS_clock_nanosleep as u32, // 230 mux anti-spin, std::thread::sleep
+        // ── Thread / process lifecycle ─────────────────────────────
+        libc::SYS_clone3 as u32,     // 435 Rust std::thread::spawn
+        libc::SYS_exit as u32,       // 60  thread exit
+        libc::SYS_exit_group as u32, // 231 process exit
+        // ── Thread init (glibc/Rust runtime) ───────────────────────
+        libc::SYS_set_robust_list as u32,   // 273 glibc thread init
+        libc::SYS_rseq as u32,              // 334 glibc restartable sequences
+        libc::SYS_sched_getaffinity as u32, // 204 Rust std thread pool sizing
+        // ── System info ────────────────────────────────────────────
+        libc::SYS_gettid as u32,    // 186 thread ID for tgkill
+        libc::SYS_getrandom as u32, // 318 entropy (Rust HashMap seed)
+        // ── Network worker ─────────────────────────────────────────
+        libc::SYS_ppoll as u32, // 271 TUN/IPC polling on network worker thread
+        // ── Seccomp (needed to install THIS filter) ────────────────
+        libc::SYS_prctl as u32,   // 157 PR_SET_NO_NEW_PRIVS (idempotent)
+        libc::SYS_seccomp as u32, // 317 install this runtime filter
+    ];
+
+    if matches!(kind, WorkerKind::Exec) {
+        allowed.push(libc::SYS_sched_setaffinity as u32); // 203 pin_thread_to_cpu
+    }
+
+    allowed.sort_unstable();
+    allowed.dedup();
+
+    let num_allowed = allowed.len();
+    let mut insns: Vec<BpfInsn> = Vec::with_capacity(4 + num_allowed + 2);
+
+    insns.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_ARCH));
+    insns.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0));
+    insns.push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    insns.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR));
+
+    for (i, &nr) in allowed.iter().enumerate() {
+        let remaining = num_allowed - i - 1;
+        let allow_offset = remaining + 1;
+        insns.push(bpf_jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            nr,
+            allow_offset as u8,
+            0,
+        ));
+    }
+
+    insns.push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    insns.push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+
+    insns
+}
+
 /// Apply a BPF seccomp filter to the current process.
 #[allow(clippy::cast_possible_truncation)] // insns.len() always fits u16 (BPF max 4096)
 fn apply_bpf_filter(insns: &[BpfInsn]) {
@@ -380,5 +483,166 @@ mod tests {
             "forker allowlist has {count} syscalls — expected <= 61. \
              Justify any additions with [F]/[W]/[WI]/[WE]/[RT] tags."
         );
+    }
+
+    // ── Runtime filter tests ───────────────────────────────────────────
+
+    #[test]
+    fn fork_restore_runtime_filter_builds_without_panic() {
+        let insns = build_worker_runtime_filter(WorkerKind::ForkRestore);
+        assert!(insns.len() > 10, "filter too short: {} insns", insns.len());
+        assert!(
+            insns.len() <= 4096,
+            "filter too long: {} insns",
+            insns.len()
+        );
+    }
+
+    #[test]
+    fn exec_runtime_filter_builds_without_panic() {
+        let insns = build_worker_runtime_filter(WorkerKind::Exec);
+        assert!(insns.len() > 10, "filter too short: {} insns", insns.len());
+        assert!(
+            insns.len() <= 4096,
+            "filter too long: {} insns",
+            insns.len()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn runtime_filters_block_dangerous_syscalls() {
+        for kind in [WorkerKind::ForkRestore, WorkerKind::Exec] {
+            let insns = build_worker_runtime_filter(kind);
+            let syscall_nrs = extract_allowed_syscalls(&insns);
+            assert_dangerous_syscalls_blocked(&syscall_nrs);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn runtime_filters_block_init_only_syscalls() {
+        let init_only = [
+            (libc::SYS_socket as u32, "socket"),
+            (libc::SYS_connect as u32, "connect"),
+            (libc::SYS_openat as u32, "openat"),
+            (libc::SYS_ioctl as u32, "ioctl"),
+            (libc::SYS_sendto as u32, "sendto"),
+            (libc::SYS_recvfrom as u32, "recvfrom"),
+            (libc::SYS_memfd_create as u32, "memfd_create"),
+            (libc::SYS_ftruncate as u32, "ftruncate"),
+            (libc::SYS_readlink as u32, "readlink"),
+            (libc::SYS_fstat as u32, "fstat"),
+            (libc::SYS_newfstatat as u32, "newfstatat"),
+            (libc::SYS_statx as u32, "statx"),
+            (libc::SYS_dup2 as u32, "dup2"),
+            (libc::SYS_lseek as u32, "lseek"),
+            (libc::SYS_mremap as u32, "mremap"),
+            (libc::SYS_socketpair as u32, "socketpair"),
+            (libc::SYS_getsockopt as u32, "getsockopt"),
+            (libc::SYS_open as u32, "open"),
+        ];
+        for kind in [WorkerKind::ForkRestore, WorkerKind::Exec] {
+            let insns = build_worker_runtime_filter(kind);
+            let syscall_nrs = extract_allowed_syscalls(&insns);
+            for (nr, name) in &init_only {
+                assert!(
+                    !syscall_nrs.contains(nr),
+                    "init-only syscall {} (nr {}) must not be in runtime filter",
+                    name,
+                    nr
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn runtime_filters_contain_required_runtime_syscalls() {
+        let required = [
+            (libc::SYS_read as u32, "read"),
+            (libc::SYS_write as u32, "write"),
+            (libc::SYS_mmap as u32, "mmap"),
+            (libc::SYS_mprotect as u32, "mprotect"),
+            (libc::SYS_futex as u32, "futex"),
+            (libc::SYS_clone3 as u32, "clone3"),
+            (libc::SYS_exit_group as u32, "exit_group"),
+            (libc::SYS_ppoll as u32, "ppoll"),
+            (libc::SYS_rt_sigaction as u32, "rt_sigaction"),
+        ];
+        for kind in [WorkerKind::ForkRestore, WorkerKind::Exec] {
+            let insns = build_worker_runtime_filter(kind);
+            let syscall_nrs = extract_allowed_syscalls(&insns);
+            for (nr, name) in &required {
+                assert!(
+                    syscall_nrs.contains(nr),
+                    "required runtime syscall {} (nr {}) missing from filter",
+                    name,
+                    nr
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn exec_runtime_filter_has_sched_setaffinity() {
+        let insns = build_worker_runtime_filter(WorkerKind::Exec);
+        let syscall_nrs = extract_allowed_syscalls(&insns);
+        assert!(
+            syscall_nrs.contains(&(libc::SYS_sched_setaffinity as u32)),
+            "Exec runtime filter must include sched_setaffinity"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn fork_restore_runtime_filter_lacks_sched_setaffinity() {
+        let insns = build_worker_runtime_filter(WorkerKind::ForkRestore);
+        let syscall_nrs = extract_allowed_syscalls(&insns);
+        assert!(
+            !syscall_nrs.contains(&(libc::SYS_sched_setaffinity as u32)),
+            "ForkRestore runtime filter must not include sched_setaffinity"
+        );
+    }
+
+    #[test]
+    fn fork_restore_runtime_filter_size_guard() {
+        let insns = build_worker_runtime_filter(WorkerKind::ForkRestore);
+        let count = extract_allowed_syscalls(&insns).len();
+        assert!(
+            count <= 28,
+            "ForkRestore runtime allowlist has {count} syscalls — expected <= 28."
+        );
+    }
+
+    #[test]
+    fn exec_runtime_filter_size_guard() {
+        let insns = build_worker_runtime_filter(WorkerKind::Exec);
+        let count = extract_allowed_syscalls(&insns).len();
+        assert!(
+            count <= 29,
+            "Exec runtime allowlist has {count} syscalls — expected <= 29."
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn runtime_filter_is_subset_of_forker_filter() {
+        let forker_insns = build_allowlist_filter();
+        let forker_syscalls = extract_allowed_syscalls(&forker_insns);
+
+        for kind in [WorkerKind::ForkRestore, WorkerKind::Exec] {
+            let runtime_insns = build_worker_runtime_filter(kind);
+            let runtime_syscalls = extract_allowed_syscalls(&runtime_insns);
+            for nr in &runtime_syscalls {
+                assert!(
+                    forker_syscalls.contains(nr),
+                    "runtime syscall nr {} not found in forker filter — \
+                     runtime filter must be a subset of the forker filter",
+                    nr
+                );
+            }
+        }
     }
 }
