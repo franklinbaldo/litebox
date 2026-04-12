@@ -2323,17 +2323,13 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
 ) -> i32 {
     // NOTE: We intentionally do NOT install a seccomp filter on the runner.
     //
-    // The runner's seccomp filter would be inherited by exec worker children
-    // (spawned via the forker process), which need full syscall access
-    // during their init phase (socket, connect, ftruncate, sendmsg for
-    // SCM_RIGHTS, etc.).  Rather than maintaining a fragile allowlist that
-    // must track every syscall the exec worker init path might use, we rely
-    // on the forker filter for the main security win:
-    //
-    //   - The forker installs a tight filter (no execve, no socket, no connect)
-    //     before entering its recv loop.
-    //   - All workers (fork-restore and exec) are spawned via fork() and
-    //     inherit this filter automatically.
+    // The runner spawns the forker, which installs a Phase 1 filter (wide
+    // allowlist) before its recv loop.  Workers inherit this filter via
+    // fork() and then install a Phase 2 filter (tight runtime allowlist)
+    // after their initialization completes.  The runner itself is not
+    // sandboxed because it needs full syscall access for platform setup,
+    // and its filter would be inherited by workers before their own Phase 2
+    // filter could be installed.
 
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();

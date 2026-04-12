@@ -3,21 +3,38 @@
 
 //! Host-level seccomp sandbox for litebox components.
 //!
-//! This module provides an allowlist-based seccomp-BPF filter that restricts
-//! the host syscalls available to the forker and forker-spawned workers.  The
-//! goal is to minimise the kernel attack surface: if guest code escapes the
-//! virtual syscall layer, it still cannot call dangerous syscalls like
-//! `execve`, `socket`, `connect`, `openat`, etc.
+//! This module provides allowlist-based seccomp-BPF filters that restrict
+//! the host syscalls available to the forker and forker-spawned workers.
+//! The goal is to minimise the kernel attack surface: if guest code escapes
+//! the virtual syscall layer, it still cannot call dangerous syscalls.
 //!
-//! # Filter design
+//! # Two-phase filter design
 //!
-//! The forker installs a tight filter before entering its recv loop.  Workers
-//! inherit it across `fork()`.  The runner does NOT install a filter because
-//! its filter would be inherited by exec worker children (spawned via
-//! the forker process), which need many init-time syscalls (socket, connect,
-//! ftruncate, sendmsg for SCM_RIGHTS, etc).
+//! **Phase 1 (forker filter):** The forker installs a wide filter before
+//! entering its recv loop.  Workers inherit it across `fork()`.  This filter
+//! allows all syscalls needed during worker initialization (socket, connect,
+//! openat, etc.) but blocks `execve`, `bind`, `ptrace`, etc.
 //!
-//! # Key syscalls BLOCKED (the security wins for forker-spawned workers)
+//! **Phase 2 (worker runtime filter):** After initialization completes
+//! (broker connected, binary loaded, network worker spawned), each worker
+//! installs a second, tighter filter that drops ~35 init-only syscalls.
+//! Seccomp filters stack in the kernel (AND semantics), so this can only
+//! restrict further, never widen.  Two variants:
+//!
+//! - **ForkRestore** (~27 syscalls): minimal runtime for snapshot-restored workers
+//! - **Exec** (~28 syscalls): adds `sched_setaffinity` for network worker pinning
+//!
+//! The runner does NOT install a filter — see note in `run_program()`.
+//!
+//! # Key syscalls BLOCKED at runtime (Phase 2 security wins)
+//!
+//! - `socket` / `connect` / `socketpair` — no new network connections
+//! - `openat` / `open` — no new file opens on the host
+//! - `ioctl` — no device control
+//! - `sendto` / `recvfrom` — no socket I/O (9P uses shmem ring + futex)
+//! - `memfd_create` / `ftruncate` — no new shared memory regions
+//!
+//! # Key syscalls BLOCKED always (Phase 1)
 //!
 //! - `execve` / `execveat` — no process replacement (THE main security win)
 //! - `bind` / `listen` / `accept` — no listening servers
@@ -26,12 +43,6 @@
 //! - `init_module` / `finit_module` / `delete_module` — no kernel module loading
 //! - `reboot` / `kexec_load` — no system control
 //! - `keyctl` / `request_key` — no kernel keyring access
-//!
-//! # Syscalls ALLOWED for worker-exec init (widened for forker-routed worker-exec)
-//!
-//! - `socket` / `connect` — needed for broker IPC and 9P channel setup
-//! - `openat` — needed for tar files and mmapped host binaries
-//! - These are safe because `execve` is still blocked.
 
 /// Install the seccomp sandbox filter for the **forker** process.
 ///
