@@ -758,6 +758,27 @@ impl<FS: ShimFS> MacosShim<FS> {
         }));
         all_extents.sort_unstable();
 
+        // Merge overlapping/adjacent extents.  Without this, nested
+        // sub-extents (e.g. patch_in_place_text segments inside a larger
+        // preinstalled extent) create false gaps that the trampoline gap
+        // finder would use, overwriting valid shared cache code.
+        {
+            let mut merged_ext: Vec<(u64, u64)> = Vec::with_capacity(all_extents.len());
+            for &(s, e) in &all_extents {
+                if let Some(last) = merged_ext.last_mut()
+                    && s <= last.1
+                {
+                    // Overlapping or adjacent -- extend.
+                    if e > last.1 {
+                        last.1 = e;
+                    }
+                    continue;
+                }
+                merged_ext.push((s, e));
+            }
+            all_extents = merged_ext;
+        }
+
         // Pass 1: map ALL regions as RW at their fixed addresses.
         // For regions on macOS-on-macOS, the host process may already have
         // these regions mapped from its own shared cache.  Mapping failures
@@ -1143,9 +1164,23 @@ impl<FS: ShimFS> MacosShim<FS> {
                 svc_sites.extend(sites);
             }
 
-            // If no code to patch (all segments were sigtramp), we still
-            // need to MAP_FIXED + copy to avoid leaving a hole.  But we
-            // can skip the trampoline.  Use total_code_len for sizing.
+            // If there are no SVC sites, we still need the plan for
+            // B.1 (MAP_FIXED + copy) and B.2 (mprotect RX), but we do
+            // NOT need a trampoline.  Allocating a trampoline for empty
+            // plans wastes address space and can cause problems when the
+            // trampoline page is never actually mapped by B.3.
+            if svc_sites.is_empty() {
+                plans.push(SegmentPlan {
+                    aligned_start,
+                    aligned_len,
+                    saved,
+                    svc_sites,
+                    tramp_addr: 0,
+                    tramp_size: 0,
+                });
+                continue;
+            }
+
             let code_len_for_tramp = if total_code_len == 0 {
                 aligned_len
             } else {
@@ -1185,10 +1220,13 @@ impl<FS: ShimFS> MacosShim<FS> {
         }
 
         // Record Pass 3 trampoline addresses for future TLS table updates.
+        // Skip plans with no trampoline (svc_sites was empty).
         {
             let mut addrs = self.0.shared_cache_trampoline_addrs.write();
             for plan in &plans {
-                addrs.push((plan.tramp_addr, plan.tramp_size));
+                if plan.tramp_size > 0 {
+                    addrs.push((plan.tramp_addr, plan.tramp_size));
+                }
             }
         }
 
@@ -1428,16 +1466,13 @@ impl<FS: ShimFS> MacosShim<FS> {
         }
 
 
-        // Pass 5: Patch `_tlv_bootstrap` to bypass the error handler.
+        // Pass 5b: Patch `_tlv_bootstrap` to bypass the error handler.
         //
         // On macOS, the shared cache builder patches the first instruction of
         // `_tlv_bootstrap` (the TLS variable resolver) to `B _tlv_bootstrap_error`.
-        // Normally, dyld's `PrebuiltLoader::runInitializers` patches this back
-        // to NOP after TLS infrastructure is set up.  Since we skip shared
-        // cache initializers (our `patch_skip_initializers` NOPs the BL to
-        // `findAndRunAllInitializers` in `PrebuiltLoader`), the TLS init never
-        // runs.  Every TLS access hits the error handler -> `abort()`, causing
-        // SIGABRT (exit code 134) in any binary that uses thread-local storage.
+        // Normally, dyld's initializer for `libdyld.dylib` patches this back
+        // to NOP after TLS infrastructure is set up.  Since we skip shared cache
+        // library initializers (`patch_skip_initializers`), this never happens.
         //
         // The fix: patch the first instruction of `_tlv_bootstrap` from
         // `B _tlv_bootstrap_error` to NOP, allowing the fast-path TLS lookup
