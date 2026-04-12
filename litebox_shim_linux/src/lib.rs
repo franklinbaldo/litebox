@@ -376,6 +376,7 @@ impl LinuxShimBuilder {
                 park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
                 parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
                 deferred_lie_count: core::sync::atomic::AtomicU32::new(0),
+                checkpoint_mode: core::sync::atomic::AtomicBool::new(false),
             }),
         });
         let control_plane = multihost::ControlPlane::new_root_local();
@@ -608,13 +609,15 @@ impl<FS: ShimFS> LinuxShim<FS> {
         let syscalls::fork_snapshot::ForkSnapshot {
             identity: id,
             process_wide: pw,
-            thread: th,
+            threads,
             signal: sig,
             fs: fs_snap,
             fd_table,
             memory: mem,
             is_delayed_fork: _,
         } = snapshot;
+
+        let th = &threads[0];
 
         // Reserve the child's thread ID so future clone() calls don't collide.
         self.global.reserve_thread_id(id.pid);
@@ -913,6 +916,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
                 parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
                 deferred_lie_count: core::sync::atomic::AtomicU32::new(0),
+                checkpoint_mode: core::sync::atomic::AtomicBool::new(false),
             }),
         });
 
@@ -936,18 +940,18 @@ impl<FS: ShimFS> LinuxShim<FS> {
 
         // --- 8. Restore signal state. ---------------------------------------
         let rebased_altstack = litebox_common_linux::signal::SigAltStack {
-            sp: if sig.altstack.sp != 0 {
-                rb(sig.altstack.sp)
+            sp: if th.altstack.sp != 0 {
+                rb(th.altstack.sp)
             } else {
                 0
             },
-            flags: sig.altstack.flags,
+            flags: th.altstack.flags,
             #[cfg(target_pointer_width = "64")]
-            __pad: sig.altstack.__pad,
-            size: sig.altstack.size,
+            __pad: th.altstack.__pad,
+            size: th.altstack.size,
         };
         let child_signals = syscalls::signal::SignalState::new_from_restore(
-            sig.blocked,
+            th.blocked_signals,
             &sig.handlers,
             rebased_altstack,
         );
@@ -1147,7 +1151,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
         });
 
         // --- 11. Build Task with execution context. ---------------------------
-        let mut exec_ctx = th.execution_context;
+        let mut exec_ctx = th.execution_context.clone();
 
         // Rebase all address-valued registers from the snapshot's VA partition
         // to the child's VA partition.
@@ -3419,6 +3423,10 @@ pub(crate) struct VforkParking {
     /// claimed by a task via `park_if_deferred()` before it writes to guest
     /// memory, or at the syscall boundary as a fallback.
     pub deferred_lie_count: core::sync::atomic::AtomicU32,
+    /// When true, threads parking for vfork should save their execution state
+    /// into their ThreadRemote before blocking. Set by the checkpointing thread,
+    /// cleared on unpark.
+    pub checkpoint_mode: core::sync::atomic::AtomicBool,
 }
 
 /// Which virtual subsystem the replaced fd belonged to.

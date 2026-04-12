@@ -26,7 +26,10 @@ use litebox_common_linux::signal::{SaFlags, SigAltStack, SigSet};
 pub struct ForkSnapshot {
     pub identity: ProcessIdentitySnapshot,
     pub process_wide: ProcessWideSnapshot,
-    pub thread: ThreadSnapshot,
+    /// All thread snapshots. First entry is the checkpointing/forking thread.
+    pub threads: Vec<ThreadSnapshot>,
+    /// Process-wide signal state (handlers only — blocked mask and altstack
+    /// are per-thread in each ThreadSnapshot).
     pub signal: SignalSnapshot,
     pub fs: FsSnapshot,
     pub fd_table: FdTableSnapshot,
@@ -101,6 +104,8 @@ pub struct ProcessWideSnapshot {
 ///
 /// A fork child starts as a single-threaded process with this thread.
 pub struct ThreadSnapshot {
+    /// Thread ID (for multi-threaded restore).
+    pub tid: i32,
     /// Full guest execution context (registers + FP state).
     pub execution_context: litebox_common_linux::ExecutionContext,
     /// Guest TLS base address (FS base on x86-64).
@@ -112,6 +117,10 @@ pub struct ThreadSnapshot {
     /// Robust futex list head pointer (inherited across fork per Linux
     /// semantics).
     pub robust_list: Option<usize>,
+    /// Per-thread blocked signal mask.
+    pub blocked_signals: litebox_common_linux::signal::SigSet,
+    /// Per-thread alternate signal stack.
+    pub altstack: litebox_common_linux::signal::SigAltStack,
 }
 
 // ---------------------------------------------------------------------------
@@ -123,12 +132,9 @@ pub struct ThreadSnapshot {
 /// Matches the POSIX / Linux fork semantics: handlers and blocked mask are
 /// inherited, pending signals and fault metadata are not.
 pub struct SignalSnapshot {
-    /// Currently blocked signals.
-    pub blocked: SigSet,
     /// Signal handlers (one per signal, indexed by signal number - 1).
+    /// Process-wide (shared across all threads).
     pub handlers: Vec<SignalHandlerSnapshot>,
-    /// Alternate signal stack.
-    pub altstack: SigAltStack,
 }
 
 /// Plain-data copy of a single signal handler.
@@ -470,7 +476,7 @@ impl ForkRejectReasons {
 /// Wire format magic bytes: "LBFK" (LiteBox ForK).
 const SNAPSHOT_MAGIC: u32 = 0x4B46_424C;
 /// Wire format version.
-const SNAPSHOT_VERSION: u32 = 1;
+const SNAPSHOT_VERSION: u32 = 2;
 
 /// Error returned when deserializing a snapshot from bytes.
 #[derive(Debug)]
@@ -661,7 +667,10 @@ impl ForkSnapshot {
         w.write_u8(u8::from(self.is_delayed_fork));
         self.identity.write(&mut w);
         self.process_wide.write(&mut w);
-        self.thread.write(&mut w);
+        w.write_u32(self.threads.len() as u32);
+        for thread in &self.threads {
+            thread.write(&mut w);
+        }
         self.signal.write(&mut w);
         self.fs.write(&mut w);
         self.fd_table.write(&mut w);
@@ -680,10 +689,17 @@ impl ForkSnapshot {
             return Err(SnapshotDeserializeError::UnsupportedVersion(version));
         }
         let is_delayed_fork = r.read_u8()? != 0;
+        let identity = ProcessIdentitySnapshot::read(&mut r)?;
+        let process_wide = ProcessWideSnapshot::read(&mut r)?;
+        let thread_count = r.read_u32()? as usize;
+        let mut threads = Vec::with_capacity(thread_count);
+        for _ in 0..thread_count {
+            threads.push(ThreadSnapshot::read(&mut r)?);
+        }
         Ok(Self {
-            identity: ProcessIdentitySnapshot::read(&mut r)?,
-            process_wide: ProcessWideSnapshot::read(&mut r)?,
-            thread: ThreadSnapshot::read(&mut r)?,
+            identity,
+            process_wide,
+            threads,
             signal: SignalSnapshot::read(&mut r)?,
             fs: FsSnapshot::read(&mut r)?,
             fd_table: FdTableSnapshot::read(&mut r)?,
@@ -808,6 +824,12 @@ impl ThreadSnapshot {
         w.write_option_usize(self.set_child_tid);
         w.write_option_usize(self.clear_child_tid);
         w.write_option_usize(self.robust_list);
+        // v2 fields: per-thread identity and signal state.
+        w.write_i32(self.tid);
+        w.write_u64(self.blocked_signals.as_u64());
+        w.write_usize(self.altstack.sp);
+        w.write_u32(self.altstack.flags.bits());
+        w.write_usize(self.altstack.size);
     }
 
     fn read(r: &mut SnapshotReader<'_>) -> Result<Self, SnapshotDeserializeError> {
@@ -838,50 +860,51 @@ impl ThreadSnapshot {
         }
         let fp_bytes = r.read_raw_bytes(litebox_common_linux::FP_STATE_SIZE)?;
         ctx.fp_regs.data.copy_from_slice(fp_bytes);
+        let tls_base = r.read_option_usize()?;
+        let set_child_tid = r.read_option_usize()?;
+        let clear_child_tid = r.read_option_usize()?;
+        let robust_list = r.read_option_usize()?;
+        // v2 fields.
+        let tid = r.read_i32()?;
+        let blocked_signals = SigSet::from_u64(r.read_u64()?);
+        let alt_sp = r.read_usize()?;
+        let alt_flags_raw = r.read_u32()?;
+        let alt_size = r.read_usize()?;
+        let altstack = SigAltStack {
+            sp: alt_sp,
+            flags: litebox_common_linux::signal::SsFlags::from_bits_retain(alt_flags_raw),
+            #[cfg(target_pointer_width = "64")]
+            __pad: 0,
+            size: alt_size,
+        };
         Ok(Self {
+            tid,
             execution_context: ctx,
-            tls_base: r.read_option_usize()?,
-            set_child_tid: r.read_option_usize()?,
-            clear_child_tid: r.read_option_usize()?,
-            robust_list: r.read_option_usize()?,
+            tls_base,
+            set_child_tid,
+            clear_child_tid,
+            robust_list,
+            blocked_signals,
+            altstack,
         })
     }
 }
 
 impl SignalSnapshot {
     fn write(&self, w: &mut SnapshotWriter) {
-        w.write_u64(self.blocked.as_u64());
         w.write_u64(self.handlers.len() as u64);
         for h in &self.handlers {
             h.write(w);
         }
-        // SigAltStack
-        w.write_usize(self.altstack.sp);
-        w.write_u32(self.altstack.flags.bits());
-        w.write_usize(self.altstack.size);
     }
 
     fn read(r: &mut SnapshotReader<'_>) -> Result<Self, SnapshotDeserializeError> {
-        let blocked = SigSet::from_u64(r.read_u64()?);
         let handler_count = r.read_u64()? as usize;
         let mut handlers = Vec::with_capacity(handler_count);
         for _ in 0..handler_count {
             handlers.push(SignalHandlerSnapshot::read(r)?);
         }
-        let sp = r.read_usize()?;
-        let flags_raw = r.read_u32()?;
-        let size = r.read_usize()?;
-        Ok(Self {
-            blocked,
-            handlers,
-            altstack: SigAltStack {
-                sp,
-                flags: litebox_common_linux::signal::SsFlags::from_bits_retain(flags_raw),
-                #[cfg(target_pointer_width = "64")]
-                __pad: 0,
-                size,
-            },
-        })
+        Ok(Self { handlers })
     }
 }
 
@@ -1320,7 +1343,8 @@ mod tests {
                 thp_disabled: true,
                 alarm_remaining_ns: Some(5_000_000_000),
             },
-            thread: ThreadSnapshot {
+            threads: vec![ThreadSnapshot {
+                tid: 42,
                 execution_context: {
                     let mut ctx = litebox_common_linux::ExecutionContext::default();
                     ctx.regs.rax = 0xAAAA_BBBB_CCCC_DDDD;
@@ -1342,9 +1366,16 @@ mod tests {
                 set_child_tid: Some(0x7fff_0000_1000),
                 clear_child_tid: Some(0x7fff_0000_1008),
                 robust_list: Some(0x7fff_0000_2000),
-            },
+                blocked_signals: SigSet::empty(),
+                altstack: SigAltStack {
+                    sp: 0x7f00_0000_0000,
+                    flags: SsFlags::empty(),
+                    #[cfg(target_pointer_width = "64")]
+                    __pad: 0,
+                    size: 8192,
+                },
+            }],
             signal: SignalSnapshot {
-                blocked: SigSet::empty(),
                 handlers: vec![
                     SignalHandlerSnapshot {
                         sigaction: 0,
@@ -1359,13 +1390,6 @@ mod tests {
                         mask: SigSet::from_u64(u64::MAX),
                     },
                 ],
-                altstack: SigAltStack {
-                    sp: 0x7f00_0000_0000,
-                    flags: SsFlags::empty(),
-                    #[cfg(target_pointer_width = "64")]
-                    __pad: 0,
-                    size: 8192,
-                },
             },
             fs: FsSnapshot {
                 cwd: String::from("/home/test/"),
@@ -1574,32 +1598,44 @@ mod tests {
 
         // Verify execution context registers survive round-trip.
         assert_eq!(
-            restored.thread.execution_context.regs.rax,
+            restored.threads[0].execution_context.regs.rax,
             0xAAAA_BBBB_CCCC_DDDD
         );
         assert_eq!(
-            restored.thread.execution_context.regs.rbx,
+            restored.threads[0].execution_context.regs.rbx,
             0x1111_2222_3333_4444
         );
         assert_eq!(
-            restored.thread.execution_context.regs.rcx,
+            restored.threads[0].execution_context.regs.rcx,
             0x5555_6666_7777_8888
         );
-        assert_eq!(restored.thread.execution_context.regs.rip, 0x0040_1000);
-        assert_eq!(restored.thread.execution_context.regs.rsp, 0x7FFF_0000_F000);
-        assert_eq!(restored.thread.execution_context.regs.rbp, 0x7FFF_0000_E000);
-        assert_eq!(restored.thread.execution_context.regs.rdi, 42);
-        assert_eq!(restored.thread.execution_context.regs.rsi, 99);
-        assert_eq!(restored.thread.execution_context.regs.r8, 0xDEAD);
-        assert_eq!(restored.thread.execution_context.regs.r15, 0xBEEF);
+        assert_eq!(restored.threads[0].execution_context.regs.rip, 0x0040_1000);
+        assert_eq!(
+            restored.threads[0].execution_context.regs.rsp,
+            0x7FFF_0000_F000
+        );
+        assert_eq!(
+            restored.threads[0].execution_context.regs.rbp,
+            0x7FFF_0000_E000
+        );
+        assert_eq!(restored.threads[0].execution_context.regs.rdi, 42);
+        assert_eq!(restored.threads[0].execution_context.regs.rsi, 99);
+        assert_eq!(restored.threads[0].execution_context.regs.r8, 0xDEAD);
+        assert_eq!(restored.threads[0].execution_context.regs.r15, 0xBEEF);
         // Verify FP state bytes survive round-trip.
-        assert_eq!(restored.thread.execution_context.fp_regs.data[100], 0xAB);
-        assert_eq!(restored.thread.execution_context.fp_regs.data[200], 0xCD);
+        assert_eq!(
+            restored.threads[0].execution_context.fp_regs.data[100],
+            0xAB
+        );
+        assert_eq!(
+            restored.threads[0].execution_context.fp_regs.data[200],
+            0xCD
+        );
 
-        assert_eq!(restored.thread.tls_base, Some(0x7f00_dead_beef));
-        assert_eq!(restored.thread.set_child_tid, Some(0x7fff_0000_1000));
-        assert_eq!(restored.thread.clear_child_tid, Some(0x7fff_0000_1008));
-        assert_eq!(restored.thread.robust_list, Some(0x7fff_0000_2000));
+        assert_eq!(restored.threads[0].tls_base, Some(0x7f00_dead_beef));
+        assert_eq!(restored.threads[0].set_child_tid, Some(0x7fff_0000_1000));
+        assert_eq!(restored.threads[0].clear_child_tid, Some(0x7fff_0000_1008));
+        assert_eq!(restored.threads[0].robust_list, Some(0x7fff_0000_2000));
     }
 
     #[test]
@@ -1608,13 +1644,17 @@ mod tests {
         let bytes = original.serialize();
         let restored = ForkSnapshot::deserialize(&bytes).expect("deserialize failed");
 
-        assert_eq!(restored.signal.blocked.as_u64(), SigSet::empty().as_u64());
+        // blocked_signals and altstack are now per-thread.
+        assert_eq!(
+            restored.threads[0].blocked_signals.as_u64(),
+            SigSet::empty().as_u64()
+        );
         assert_eq!(restored.signal.handlers.len(), 2);
         assert_eq!(restored.signal.handlers[1].sigaction, 0x4000_1000);
         assert_eq!(restored.signal.handlers[1].restorer, 0x4000_2000);
         assert!(restored.signal.handlers[1].flags.contains(SaFlags::SIGINFO));
-        assert_eq!(restored.signal.altstack.sp, 0x7f00_0000_0000);
-        assert_eq!(restored.signal.altstack.size, 8192);
+        assert_eq!(restored.threads[0].altstack.sp, 0x7f00_0000_0000);
+        assert_eq!(restored.threads[0].altstack.size, 8192);
     }
 
     #[test]
@@ -1805,17 +1845,17 @@ mod tests {
     #[test]
     fn snapshot_round_trip_no_tls() {
         let mut snap = make_test_snapshot();
-        snap.thread.tls_base = None;
-        snap.thread.set_child_tid = None;
-        snap.thread.clear_child_tid = None;
-        snap.thread.robust_list = None;
+        snap.threads[0].tls_base = None;
+        snap.threads[0].set_child_tid = None;
+        snap.threads[0].clear_child_tid = None;
+        snap.threads[0].robust_list = None;
 
         let bytes = snap.serialize();
         let restored = ForkSnapshot::deserialize(&bytes).expect("deserialize failed");
-        assert_eq!(restored.thread.tls_base, None);
-        assert_eq!(restored.thread.set_child_tid, None);
-        assert_eq!(restored.thread.clear_child_tid, None);
-        assert_eq!(restored.thread.robust_list, None);
+        assert_eq!(restored.threads[0].tls_base, None);
+        assert_eq!(restored.threads[0].set_child_tid, None);
+        assert_eq!(restored.threads[0].clear_child_tid, None);
+        assert_eq!(restored.threads[0].robust_list, None);
     }
 
     #[test]
@@ -1883,6 +1923,6 @@ mod tests {
         assert!(restored.is_delayed_fork);
         // Other fields still intact.
         assert_eq!(restored.identity.pid, 42);
-        assert_eq!(restored.thread.tls_base, Some(0x7f00_dead_beef));
+        assert_eq!(restored.threads[0].tls_base, Some(0x7f00_dead_beef));
     }
 }

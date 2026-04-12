@@ -155,6 +155,9 @@ pub(crate) struct ThreadRemote {
     pub(crate) pending_signals: Mutex<Platform, crate::syscalls::signal::PendingSignals>,
     /// Handle to interrupt waits on this thread.
     handle: once_cell::race::OnceBox<litebox::event::wait::ThreadHandle<Platform>>,
+    /// Saved thread snapshot for multi-threaded checkpoint.
+    /// Sibling threads populate this before parking when checkpoint_mode is set.
+    pub(crate) checkpoint_snapshot: Mutex<Platform, Option<super::fork_snapshot::ThreadSnapshot>>,
 }
 
 impl ThreadRemote {
@@ -164,6 +167,7 @@ impl ThreadRemote {
             is_suspended: AtomicBool::new(false),
             pending_signals: Mutex::new(crate::syscalls::signal::PendingSignals::new()),
             handle: once_cell::race::OnceBox::new(),
+            checkpoint_snapshot: Mutex::new(None),
         }
     }
 
@@ -2530,6 +2534,7 @@ impl<FS: ShimFS> Task<FS> {
                     park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
                     parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
                     deferred_lie_count: core::sync::atomic::AtomicU32::new(0),
+                    checkpoint_mode: core::sync::atomic::AtomicBool::new(false),
                 }),
             });
             let child_files_state = Arc::new(
@@ -3982,6 +3987,7 @@ impl<FS: ShimFS> Task<FS> {
             }
 
             super::fork_snapshot::ThreadSnapshot {
+                tid: self.tid,
                 execution_context: exec_ctx,
                 tls_base,
                 // set_child_tid was already written when the child started;
@@ -3993,6 +3999,8 @@ impl<FS: ShimFS> Task<FS> {
                     .get()
                     .map(|p: MutPtr<i32>| p.as_usize()),
                 robust_list: self.thread.robust_list.get().map(|ptr| ptr.as_usize()),
+                blocked_signals: self.signals.get_blocked(),
+                altstack: self.signals.altstack(),
             }
         };
 
@@ -5531,7 +5539,7 @@ impl<FS: ShimFS> Task<FS> {
         let snapshot = super::fork_snapshot::ForkSnapshot {
             identity,
             process_wide,
-            thread,
+            threads: alloc::vec![thread],
             signal,
             fs,
             fd_table,
@@ -5878,7 +5886,7 @@ impl<FS: ShimFS> Task<FS> {
         let snapshot = super::fork_snapshot::ForkSnapshot {
             identity,
             process_wide,
-            thread,
+            threads: alloc::vec![thread],
             signal,
             fs,
             fd_table,
@@ -6106,7 +6114,7 @@ impl<FS: ShimFS> Task<FS> {
         let snapshot = ForkSnapshot {
             identity,
             process_wide,
-            thread,
+            threads: alloc::vec![thread],
             signal,
             fs,
             fd_table,
@@ -6249,11 +6257,14 @@ impl<FS: ShimFS> Task<FS> {
         let robust_list = self.thread.robust_list.get().map(|ptr| ptr.as_usize());
 
         super::fork_snapshot::ThreadSnapshot {
+            tid: self.tid,
             execution_context: ctx.clone(),
             tls_base,
             set_child_tid,
             clear_child_tid,
             robust_list,
+            blocked_signals: self.signals.get_blocked(),
+            altstack: self.signals.altstack(),
         }
     }
 
@@ -6301,28 +6312,21 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         super::fork_snapshot::ThreadSnapshot {
+            tid: self.tid,
             execution_context: exec_ctx,
             tls_base,
             set_child_tid: None,
             clear_child_tid,
             robust_list,
+            blocked_signals: self.signals.get_blocked(),
+            altstack: self.signals.altstack(),
         }
     }
 
     /// Capture signal state for a true-fork snapshot.
     fn snapshot_signal(&self) -> super::fork_snapshot::SignalSnapshot {
-        let blocked = self.signals.get_blocked();
         let handlers = self.signals.snapshot_handlers();
-
-        // Linux fork() inherits the parent's alternate signal stack.
-        // Only clone(CLONE_VM) without CLONE_VFORK resets it.
-        let altstack = self.signals.altstack();
-
-        super::fork_snapshot::SignalSnapshot {
-            blocked,
-            handlers,
-            altstack,
-        }
+        super::fork_snapshot::SignalSnapshot { handlers }
     }
 
     /// Capture filesystem state for a true-fork snapshot (deep copy).
@@ -8491,6 +8495,7 @@ impl<FS: ShimFS> Task<FS> {
                         parked_count:
                             <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
                         deferred_lie_count: core::sync::atomic::AtomicU32::new(0),
+                        checkpoint_mode: core::sync::atomic::AtomicBool::new(false),
                     }),
                 });
                 self.process_state.replace(child_ps);
@@ -8568,6 +8573,7 @@ impl<FS: ShimFS> Task<FS> {
                     park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
                     parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
                     deferred_lie_count: core::sync::atomic::AtomicU32::new(0),
+                    checkpoint_mode: core::sync::atomic::AtomicBool::new(false),
                 }),
             });
             self.process_state.replace(child_ps);
