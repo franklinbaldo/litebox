@@ -75,6 +75,28 @@ impl Default for NetworkConfig {
 }
 
 impl NetworkConfig {
+    /// Create a default config appropriate for the given network medium.
+    ///
+    /// For [`Medium::Ethernet`](smoltcp::phy::Medium::Ethernet), uses a locally-administered
+    /// default MAC address (`02:00:00:00:00:01`).  For [`Medium::Ip`](smoltcp::phy::Medium::Ip),
+    /// uses `HardwareAddress::Ip` (no link-layer framing).
+    ///
+    /// This prevents the smoltcp assertion panic that occurs when `HardwareAddress::Ip` is
+    /// paired with an Ethernet-medium device (e.g. fork-restore workers inheriting an
+    /// AF_PACKET platform without an explicit `NetworkConfig`).
+    pub fn default_for_medium(medium: smoltcp::phy::Medium) -> Self {
+        let hardware_addr = match medium {
+            smoltcp::phy::Medium::Ethernet => smoltcp::wire::HardwareAddress::Ethernet(
+                smoltcp::wire::EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]),
+            ),
+            smoltcp::phy::Medium::Ip => smoltcp::wire::HardwareAddress::Ip,
+        };
+        Self {
+            hardware_addr,
+            ..Self::default()
+        }
+    }
+
     /// Create a config for Ethernet mode (AF_PACKET on a veth).
     pub fn ethernet(
         mac: [u8; 6],
@@ -143,8 +165,14 @@ where
     /// This function is expected to only be invoked once per platform, as an initialization step,
     /// and the created `Network` handle is expected to be shared across all usage over the
     /// system.
+    ///
+    /// The hardware address is inferred from the platform's
+    /// [`medium()`](platform::IPInterfaceProvider::medium): Ethernet platforms get a
+    /// locally-administered default MAC, while IP-only platforms use `HardwareAddress::Ip`.
+    /// Callers that need a specific MAC or IP configuration should use
+    /// [`with_config`](Self::with_config) instead.
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
-        Self::with_config(litebox, NetworkConfig::default())
+        Self::with_config(litebox, NetworkConfig::default_for_medium(litebox.x.platform.medium()))
     }
 
     /// Construct a new `Network` with custom configuration.
