@@ -300,6 +300,7 @@ fn build_worker_runtime_filter(kind: WorkerKind) -> Vec<BpfInsn> {
         libc::SYS_mmap as u32,     //  9  guest memory, CoW, thread stacks
         libc::SYS_mprotect as u32, // 10  guest page permission changes
         libc::SYS_munmap as u32,   // 11  guest memory deallocation
+        libc::SYS_mremap as u32,   // 25  Rust Vec reallocation (grow mmap in-place)
         libc::SYS_brk as u32,      // 12  glibc malloc fallback
         libc::SYS_madvise as u32,  // 28  Rust std thread stack advice
         // ── Signals ────────────────────────────────────────────────
@@ -323,10 +324,19 @@ fn build_worker_runtime_filter(kind: WorkerKind) -> Vec<BpfInsn> {
         libc::SYS_rseq as u32,              // 334 glibc restartable sequences
         libc::SYS_sched_getaffinity as u32, // 204 Rust std thread pool sizing
         // ── System info ────────────────────────────────────────────
+        libc::SYS_getpid as u32,    //  39 glibc per-thread getpid() cache
         libc::SYS_gettid as u32,    // 186 thread ID for tgkill
         libc::SYS_getrandom as u32, // 318 entropy (Rust HashMap seed)
         // ── Network worker ─────────────────────────────────────────
         libc::SYS_ppoll as u32, // 271 TUN/IPC polling on network worker thread
+        // ── Device / terminal ──────────────────────────────────────
+        libc::SYS_ioctl as u32, // 16  TUN device I/O, terminal queries at runtime
+        // ── Pipe / thread bookkeeping ──────────────────────────────
+        libc::SYS_pipe2 as u32, // 293 Rust std internal (condvar notify pipe)
+        // ── File access (Rust runtime) ─────────────────────────────
+        libc::SYS_openat as u32, // 257 Rust std thread pool sizing (/proc/stat, /sys/cpu)
+        // ── IPC ────────────────────────────────────────────────────
+        libc::SYS_socketpair as u32, // 53  AF_UNIX socketpair for mux channel setup at runtime
         // ── Seccomp (needed to install THIS filter) ────────────────
         libc::SYS_prctl as u32,   // 157 PR_SET_NO_NEW_PRIVS (idempotent)
         libc::SYS_seccomp as u32, // 317 install this runtime filter
@@ -533,11 +543,10 @@ mod tests {
     #[test]
     #[allow(clippy::cast_possible_truncation)]
     fn runtime_filters_block_init_only_syscalls() {
+        // These syscalls must NOT be in any runtime filter — truly init-only.
         let init_only = [
             (libc::SYS_socket as u32, "socket"),
             (libc::SYS_connect as u32, "connect"),
-            (libc::SYS_openat as u32, "openat"),
-            (libc::SYS_ioctl as u32, "ioctl"),
             (libc::SYS_sendto as u32, "sendto"),
             (libc::SYS_recvfrom as u32, "recvfrom"),
             (libc::SYS_memfd_create as u32, "memfd_create"),
@@ -548,8 +557,6 @@ mod tests {
             (libc::SYS_statx as u32, "statx"),
             (libc::SYS_dup2 as u32, "dup2"),
             (libc::SYS_lseek as u32, "lseek"),
-            (libc::SYS_mremap as u32, "mremap"),
-            (libc::SYS_socketpair as u32, "socketpair"),
             (libc::SYS_getsockopt as u32, "getsockopt"),
             (libc::SYS_open as u32, "open"),
         ];
@@ -622,8 +629,8 @@ mod tests {
         let insns = build_worker_runtime_filter(WorkerKind::ForkRestore);
         let count = extract_allowed_syscalls(&insns).len();
         assert!(
-            count <= 28,
-            "ForkRestore runtime allowlist has {count} syscalls — expected <= 28."
+            count <= 35,
+            "ForkRestore runtime allowlist has {count} syscalls — expected <= 35."
         );
     }
 
@@ -632,8 +639,8 @@ mod tests {
         let insns = build_worker_runtime_filter(WorkerKind::Exec);
         let count = extract_allowed_syscalls(&insns).len();
         assert!(
-            count <= 29,
-            "Exec runtime allowlist has {count} syscalls — expected <= 29."
+            count <= 36,
+            "Exec runtime allowlist has {count} syscalls — expected <= 36."
         );
     }
 
