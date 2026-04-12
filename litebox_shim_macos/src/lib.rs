@@ -288,7 +288,6 @@ pub struct DemandPageSource {
     pub file_offset: u64,
 }
 
-
 // ── Global demand-page handler state (async-signal-safe) ─────────────────
 //
 // These statics mirror the demand-page data from GlobalState but are
@@ -305,27 +304,39 @@ const MAX_DEMAND_PAGE_SOURCES: usize = 256;
 /// Demand-page range entries: (start, end) pairs stored as two separate
 /// arrays of AtomicU64 for async-signal-safe access.
 #[allow(clippy::declare_interior_mutable_const)]
-static DEMAND_RANGE_STARTS: [AtomicU64; MAX_DEMAND_PAGE_RANGES] =
-    { const INIT: AtomicU64 = AtomicU64::new(0); [INIT; MAX_DEMAND_PAGE_RANGES] };
+static DEMAND_RANGE_STARTS: [AtomicU64; MAX_DEMAND_PAGE_RANGES] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_DEMAND_PAGE_RANGES]
+};
 #[allow(clippy::declare_interior_mutable_const)]
-static DEMAND_RANGE_ENDS: [AtomicU64; MAX_DEMAND_PAGE_RANGES] =
-    { const INIT: AtomicU64 = AtomicU64::new(0); [INIT; MAX_DEMAND_PAGE_RANGES] };
+static DEMAND_RANGE_ENDS: [AtomicU64; MAX_DEMAND_PAGE_RANGES] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_DEMAND_PAGE_RANGES]
+};
 /// Number of valid demand-page range entries.
 static DEMAND_RANGE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Demand-page source entries stored as parallel arrays of atomics.
 #[allow(clippy::declare_interior_mutable_const)]
-static DEMAND_SRC_VM_STARTS: [AtomicU64; MAX_DEMAND_PAGE_SOURCES] =
-    { const INIT: AtomicU64 = AtomicU64::new(0); [INIT; MAX_DEMAND_PAGE_SOURCES] };
+static DEMAND_SRC_VM_STARTS: [AtomicU64; MAX_DEMAND_PAGE_SOURCES] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_DEMAND_PAGE_SOURCES]
+};
 #[allow(clippy::declare_interior_mutable_const)]
-static DEMAND_SRC_VM_ENDS: [AtomicU64; MAX_DEMAND_PAGE_SOURCES] =
-    { const INIT: AtomicU64 = AtomicU64::new(0); [INIT; MAX_DEMAND_PAGE_SOURCES] };
+static DEMAND_SRC_VM_ENDS: [AtomicU64; MAX_DEMAND_PAGE_SOURCES] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_DEMAND_PAGE_SOURCES]
+};
 #[allow(clippy::declare_interior_mutable_const)]
-static DEMAND_SRC_FDS: [AtomicI32; MAX_DEMAND_PAGE_SOURCES] =
-    { const INIT: AtomicI32 = AtomicI32::new(-1); [INIT; MAX_DEMAND_PAGE_SOURCES] };
+static DEMAND_SRC_FDS: [AtomicI32; MAX_DEMAND_PAGE_SOURCES] = {
+    const INIT: AtomicI32 = AtomicI32::new(-1);
+    [INIT; MAX_DEMAND_PAGE_SOURCES]
+};
 #[allow(clippy::declare_interior_mutable_const)]
-static DEMAND_SRC_FILE_OFFSETS: [AtomicU64; MAX_DEMAND_PAGE_SOURCES] =
-    { const INIT: AtomicU64 = AtomicU64::new(0); [INIT; MAX_DEMAND_PAGE_SOURCES] };
+static DEMAND_SRC_FILE_OFFSETS: [AtomicU64; MAX_DEMAND_PAGE_SOURCES] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_DEMAND_PAGE_SOURCES]
+};
 /// Number of valid demand-page source entries.
 static DEMAND_SRC_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -333,10 +344,7 @@ static DEMAND_SRC_COUNT: AtomicUsize = AtomicUsize::new(0);
 ///
 /// This must be called exactly once (during `install_shared_cache`).
 /// After this call, `demand_page_handler_fn` can serve faults.
-fn populate_demand_page_globals(
-    ranges: &[(u64, u64)],
-    sources: &[DemandPageSource],
-) {
+fn populate_demand_page_globals(ranges: &[(u64, u64)], sources: &[DemandPageSource]) {
     let range_count = ranges.len().min(MAX_DEMAND_PAGE_RANGES);
     for (i, &(start, end)) in ranges[..range_count].iter().enumerate() {
         DEMAND_RANGE_STARTS[i].store(start, Ordering::Relaxed);
@@ -424,7 +432,9 @@ unsafe fn demand_page_handler_fn(fault_addr: usize) -> bool {
             out("x16") _,
         );
         #[allow(clippy::cast_possible_truncation)]
-        { kr = ret as i32; }
+        {
+            kr = ret as i32;
+        }
     }
     if kr != 0 {
         return false;
@@ -1465,7 +1475,6 @@ impl<FS: ShimFS> MacosShim<FS> {
             }
         }
 
-
         // Pass 5b: Patch `_tlv_bootstrap` to bypass the error handler.
         //
         // On macOS, the shared cache builder patches the first instruction of
@@ -1517,6 +1526,169 @@ impl<FS: ShimFS> MacosShim<FS> {
             }
         }
 
+        // ----- Pass 5c: Manually call libc++ and libc++abi initializers -----
+        //
+        // `patch_skip_initializers` (Pass 4) NOPs the call to
+        // `findAndRunAllInitializers` inside `PrebuiltLoader::runInitializers`,
+        // which means shared-cache library initializers never run.  This is
+        // intentional — most initializers (e.g. libSystem's `__pthread_init`)
+        // are destructive in the host process.
+        //
+        // However, libc++ and libc++abi have idempotent initializers that are
+        // required for typed `operator new` support (TMO — Typed Memory
+        // Operations).  Without them, any binary compiled with
+        // `-ftyped-cxx-new-delete` (e.g. clang) will abort.
+        //
+        // We iterate loaded dyld images at runtime to find these two libraries,
+        // parse their Mach-O headers to locate the `__TEXT,__init_offsets`
+        // section (shared-cache format: array of 32-bit offsets from __TEXT
+        // start), compute function addresses, and call them directly.
+        //
+        // Dependency order: libc++abi first, then libc++.
+        #[cfg(feature = "platform_macos_userland")]
+        {
+            unsafe extern "C" {
+                fn _dyld_image_count() -> u32;
+                fn _dyld_get_image_name(image_index: u32) -> *const u8;
+                fn _dyld_get_image_header(image_index: u32) -> *const u8;
+                fn _dyld_get_image_vmaddr_slide(image_index: u32) -> isize;
+            }
+
+            const MH_MAGIC_64: u32 = 0xFEED_FACF;
+            const LC_SEGMENT_64: u32 = 0x19;
+
+            /// Search a Mach-O image for the `__TEXT,__init_offsets` section
+            /// and return the init function addresses (header + each 32-bit
+            /// offset).
+            ///
+            /// # Safety
+            /// `header` must point to a valid Mach-O 64-bit header in mapped
+            /// memory.  The `__init_offsets` section addresses (after slide)
+            /// must also be readable.
+            #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+            unsafe fn collect_init_addrs(
+                header: *const u8,
+                slide: isize,
+            ) -> alloc::vec::Vec<usize> {
+                unsafe {
+                    let mut result = alloc::vec::Vec::new();
+                    let magic = core::ptr::read_unaligned(header.cast::<u32>());
+                    if magic != MH_MAGIC_64 {
+                        return result;
+                    }
+                    // mach_header_64: 32 bytes total.
+                    // ncmds is at offset 16.
+                    let ncmds = core::ptr::read_unaligned(header.add(16).cast::<u32>());
+                    let mut cmd_ptr = header.add(32);
+
+                    for _ in 0..ncmds {
+                        let cmd = core::ptr::read_unaligned(cmd_ptr.cast::<u32>());
+                        let cmdsize = core::ptr::read_unaligned(cmd_ptr.add(4).cast::<u32>());
+
+                        if cmd == LC_SEGMENT_64 {
+                            // nsects at offset 64 in segment_command_64
+                            let nsects = core::ptr::read_unaligned(cmd_ptr.add(64).cast::<u32>());
+
+                            let mut sect_ptr = cmd_ptr.add(72);
+                            for _ in 0..nsects {
+                                // sectname is 16 bytes at offset 0
+                                let expected = b"__init_offsets\0\0";
+                                let sect_name_ptr = sect_ptr;
+                                let mut name_match = true;
+                                for (k, &ch) in expected.iter().enumerate() {
+                                    if *sect_name_ptr.add(k) != ch {
+                                        name_match = false;
+                                        break;
+                                    }
+                                }
+                                if name_match {
+                                    let sect_addr =
+                                        core::ptr::read_unaligned(sect_ptr.add(32).cast::<u64>());
+                                    let sect_size =
+                                        core::ptr::read_unaligned(sect_ptr.add(40).cast::<u64>());
+                                    // sect_addr is unslid; add slide.
+                                    let actual_addr =
+                                        (sect_addr as isize).wrapping_add(slide) as usize;
+                                    let n_offsets = sect_size as usize / 4;
+                                    for j in 0..n_offsets {
+                                        let off = core::ptr::read_unaligned(
+                                            (actual_addr + j * 4) as *const u32,
+                                        );
+                                        let func_addr = header as usize + off as usize;
+                                        result.push(func_addr);
+                                    }
+                                }
+
+                                sect_ptr = sect_ptr.add(80);
+                            }
+                        }
+
+                        cmd_ptr = cmd_ptr.add(cmdsize as usize);
+                    }
+
+                    result
+                }
+            }
+
+            /// Check if a C string ends with the given suffix.
+            ///
+            /// # Safety
+            /// `name_ptr` must point to a valid NUL-terminated string.
+            unsafe fn cstr_ends_with(name_ptr: *const u8, suffix: &[u8]) -> bool {
+                unsafe {
+                    let mut len = 0usize;
+                    while *name_ptr.add(len) != 0 {
+                        len += 1;
+                    }
+                    if len < suffix.len() {
+                        return false;
+                    }
+                    let start = len - suffix.len();
+                    for (k, &ch) in suffix.iter().enumerate() {
+                        if *name_ptr.add(start + k) != ch {
+                            return false;
+                        }
+                    }
+                    true
+                }
+            }
+
+            /// Find a dyld image by suffix, collect its init offsets, and
+            /// call each init function.
+            ///
+            /// # Safety
+            /// Init functions must be safe to call (idempotent).
+            unsafe fn run_inits_for_image(image_count: u32, suffix: &[u8]) {
+                for i in 0..image_count {
+                    let name_ptr = unsafe { _dyld_get_image_name(i) };
+                    if name_ptr.is_null() {
+                        continue;
+                    }
+                    if unsafe { cstr_ends_with(name_ptr, suffix) } {
+                        let header = unsafe { _dyld_get_image_header(i) };
+                        let slide = unsafe { _dyld_get_image_vmaddr_slide(i) };
+                        let addrs = unsafe { collect_init_addrs(header, slide) };
+                        for addr in addrs {
+                            let func: unsafe extern "C" fn() =
+                                unsafe { core::mem::transmute(addr) };
+                            unsafe { func() };
+                        }
+                        break;
+                    }
+                }
+            }
+
+            let image_count = unsafe { _dyld_image_count() };
+            // libc++abi first (dependency of libc++).
+            unsafe {
+                run_inits_for_image(image_count, b"libc++abi.dylib");
+            }
+            // Then libc++.
+            unsafe {
+                run_inits_for_image(image_count, b"libc++.1.dylib");
+            }
+        }
+
         // Record the cache base address.
         self.0
             .shared_cache_base
@@ -1534,9 +1706,7 @@ impl<FS: ShimFS> MacosShim<FS> {
         populate_demand_page_globals(reserved_extents, demand_page_sources);
         #[cfg(feature = "platform_macos_userland")]
         unsafe {
-            litebox_platform_macos_userland::register_demand_page_handler(
-                demand_page_handler_fn,
-            );
+            litebox_platform_macos_userland::register_demand_page_handler(demand_page_handler_fn);
         }
     }
 
@@ -2132,7 +2302,9 @@ impl<FS: ShimFS> GlobalState<FS> {
                 };
                 if mmap_result.is_err() {
                     // Clean up temp buffer and skip this trampoline.
-                    unsafe { let _ = raw_munmap(save_buf, tramp_size); }
+                    unsafe {
+                        let _ = raw_munmap(save_buf, tramp_size);
+                    }
                     log_unsupported!(
                         "update_shared_cache_tls_addrs: raw_mmap MAP_FIXED failed for tramp at {tramp_addr_usize:#x}"
                     );
@@ -2151,7 +2323,9 @@ impl<FS: ShimFS> GlobalState<FS> {
                 // Step 5 (below): write new TLS + mprotect RX.
 
                 // Step 6: Free temporary buffer.
-                unsafe { let _ = raw_munmap(save_buf, tramp_size); }
+                unsafe {
+                    let _ = raw_munmap(save_buf, tramp_size);
+                }
             }
 
             // Write the new TLS table address at offset 8 using volatile writes

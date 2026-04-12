@@ -9,8 +9,8 @@
 use core::sync::atomic::Ordering;
 
 use crate::mig::{
-    MachMsgBody, MachMsgHeader, MachMsgPortDescriptor, BODY_SIZE, HEADER_SIZE, MACH_MSG_SUCCESS,
-    MACH_SEND_INVALID_DEST, PORT_DESC_SIZE, REPLY_BITS_COMPLEX,
+    BODY_SIZE, HEADER_SIZE, MACH_MSG_SUCCESS, MACH_SEND_INVALID_DEST, MachMsgBody, MachMsgHeader,
+    MachMsgPortDescriptor, PORT_DESC_SIZE, REPLY_BITS_COMPLEX,
 };
 use crate::{ConstPtr, MutPtr, ShimFS, Task};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};

@@ -33,7 +33,6 @@ impl<FS: ShimFS> Task<FS> {
     ) -> Result<usize, Errno> {
         match request {
             MacosSyscallRequest::Exit { status } => {
-
                 self.sys_exit(status);
                 Ok(0)
             }
@@ -56,9 +55,10 @@ impl<FS: ShimFS> Task<FS> {
             MacosSyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),
             MacosSyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
             MacosSyscallRequest::Getegid => Ok(self.sys_getegid() as usize),
-            MacosSyscallRequest::Getgroups { gidsetsize, grouplist } => {
-                self.sys_getgroups(gidsetsize, grouplist)
-            }
+            MacosSyscallRequest::Getgroups {
+                gidsetsize,
+                grouplist,
+            } => self.sys_getgroups(gidsetsize, grouplist),
             MacosSyscallRequest::Issetugid => {
                 #[allow(clippy::cast_sign_loss)] // issetugid returns 0 or 1
                 Ok(self.sys_issetugid() as usize)
@@ -129,11 +129,9 @@ impl<FS: ShimFS> Task<FS> {
             MacosSyscallRequest::Fstat64 { fd, buf } => self.sys_fstat64(fd, buf),
             MacosSyscallRequest::Getentropy { buf, count } => self.sys_getentropy(buf, count),
             MacosSyscallRequest::ThreadSelfid => self.sys_thread_selfid(),
-            MacosSyscallRequest::MachMsg2Trap {
-                data,
-                options,
-                ..
-            } => self.dispatch_mig(data, options),
+            MacosSyscallRequest::MachMsg2Trap { data, options, .. } => {
+                self.dispatch_mig(data, options)
+            }
             MacosSyscallRequest::MachTrap { number } => self.do_mach_trap(number, ctx),
             MacosSyscallRequest::CrossarchTrap | MacosSyscallRequest::KdebugTraceString => Ok(0),
             MacosSyscallRequest::Csrctl => Err(Errno::EPERM),
@@ -150,7 +148,9 @@ impl<FS: ShimFS> Task<FS> {
                 Ok(0)
             }
             MacosSyscallRequest::MapWithLinkingNp => {
-                log_unsupported!("map_with_linking_np: returning ENOSYS (dyld will apply fixups in userspace)");
+                log_unsupported!(
+                    "map_with_linking_np: returning ENOSYS (dyld will apply fixups in userspace)"
+                );
                 Err(Errno::ENOSYS)
             }
             MacosSyscallRequest::Statfs64 { path, buf } => self.sys_statfs64(path, buf),
@@ -181,8 +181,12 @@ impl<FS: ShimFS> Task<FS> {
                 self.sys_exit(1);
                 Ok(0)
             }
-            MacosSyscallRequest::ClockGettime { clock_id, tp } => self.sys_clock_gettime(clock_id, tp),
-            MacosSyscallRequest::ClockGetres { clock_id, res } => self.sys_clock_getres(clock_id, res),
+            MacosSyscallRequest::ClockGettime { clock_id, tp } => {
+                self.sys_clock_gettime(clock_id, tp)
+            }
+            MacosSyscallRequest::ClockGetres { clock_id, res } => {
+                self.sys_clock_getres(clock_id, res)
+            }
             MacosSyscallRequest::Gettimeofday { tv, tz } => self.sys_gettimeofday(tv, tz),
             MacosSyscallRequest::Readv { fd, iov, iovcnt } => self.sys_readv(fd, iov, iovcnt),
             MacosSyscallRequest::Writev { fd, iov, iovcnt } => self.sys_writev(fd, iov, iovcnt),

@@ -990,7 +990,6 @@ fn test_run_system_ls() {
     assert_eq!(exit_code, 0, "/bin/ls /tmp exited with code {exit_code}");
 }
 
-
 /// Run a real system binary under litebox and return its exit code.
 ///
 /// This is a helper to avoid repeating the shared-cache boilerplate in every
@@ -1020,8 +1019,7 @@ fn run_system_binary(bin_path: &str, argv: &[&str], label: &str) -> i32 {
     let binary_data = std::fs::read(path).unwrap_or_else(|e| panic!("read {bin_path}: {e}"));
     eprintln!("Read {bin_path}: {} bytes", binary_data.len());
 
-    let (exit_code, _stdout) =
-        common::run_macho_dynamic(&binary_data, argv, &cache_result, label);
+    let (exit_code, _stdout) = common::run_macho_dynamic(&binary_data, argv, &cache_result, label);
     eprintln!("{bin_path} exited with code {exit_code}");
     exit_code
 }
@@ -1076,8 +1074,6 @@ fn test_run_system_uname() {
     let code = run_system_binary("/usr/bin/uname", &["/usr/bin/uname", "-a"], "uname");
     assert_eq!(code, 0, "uname exited with code {code}");
 }
-
-
 
 /// `/usr/bin/env` with no args — prints environment variables.
 #[test]
@@ -1134,8 +1130,6 @@ fn test_run_system_cat() {
     assert_eq!(code, 0, "cat /dev/null exited with code {code}");
 }
 
-
-
 // =====================================================================
 // Identity / metadata -- require MIG message emulation
 // =====================================================================
@@ -1157,8 +1151,6 @@ fn test_system_binary_stat() {
     let code = run_system_binary("/usr/bin/stat", &["/usr/bin/stat", "/"], "stat");
     assert_eq!(code, 0, "stat should exit 0");
 }
-
-
 
 // =====================================================================
 // File-reading coreutils -- require getrlimit 0x1000 flag fix
@@ -1210,7 +1202,6 @@ fn test_run_system_sort() {
     assert_eq!(code, 0, "sort exited with code {code}");
 }
 
-
 /// `/usr/bin/uniq /tmp/hello.txt` — filters adjacent duplicate lines.
 #[test]
 fn test_run_system_uniq() {
@@ -1225,11 +1216,7 @@ fn test_run_system_uniq() {
 /// `/usr/bin/rev /tmp/hello.txt` — reverses each line.
 #[test]
 fn test_run_system_rev() {
-    let code = run_system_binary(
-        "/usr/bin/rev",
-        &["/usr/bin/rev", "/tmp/hello.txt"],
-        "rev",
-    );
+    let code = run_system_binary("/usr/bin/rev", &["/usr/bin/rev", "/tmp/hello.txt"], "rev");
     assert_eq!(code, 0, "rev exited with code {code}");
 }
 
@@ -1442,7 +1429,13 @@ fn test_run_system_rmdir() {
 fn test_run_system_dd() {
     let code = run_system_binary(
         "/bin/dd",
-        &["/bin/dd", "if=/tmp/hello.txt", "of=/dev/null", "bs=1", "count=1"],
+        &[
+            "/bin/dd",
+            "if=/tmp/hello.txt",
+            "of=/dev/null",
+            "bs=1",
+            "count=1",
+        ],
         "dd",
     );
     assert_eq!(code, 0, "dd exited with code {code}");

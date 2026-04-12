@@ -18,8 +18,8 @@
 use core::sync::atomic::Ordering;
 
 use crate::mig::{
-    MachMsgBody, MachMsgHeader, MachMsgPortDescriptor, BODY_SIZE, HEADER_SIZE, MACH_MSG_SUCCESS,
-    MACH_SEND_INVALID_DEST, NDR_RECORD, PORT_DESC_SIZE, REPLY_BITS_COMPLEX,
+    BODY_SIZE, HEADER_SIZE, MACH_MSG_SUCCESS, MACH_SEND_INVALID_DEST, MachMsgBody, MachMsgHeader,
+    MachMsgPortDescriptor, NDR_RECORD, PORT_DESC_SIZE, REPLY_BITS_COMPLEX,
 };
 use crate::{ConstPtr, MutPtr, ShimFS, Task};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
@@ -64,11 +64,7 @@ impl<FS: ShimFS> Task<FS> {
     /// Dispatch a task subsystem MIG request.
     ///
     /// Routes by `msgh_id` within the 3400..3499 range.
-    pub(crate) fn mig_task(
-        &self,
-        msg_addr: usize,
-        hdr: &MachMsgHeader,
-    ) -> Result<usize, Errno> {
+    pub(crate) fn mig_task(&self, msg_addr: usize, hdr: &MachMsgHeader) -> Result<usize, Errno> {
         match hdr.msgh_id {
             MSGH_ID_TASK_INFO => self.mig_task_info(msg_addr, hdr),
             MSGH_ID_SEMAPHORE_CREATE => self.mig_semaphore_create(msg_addr, hdr),
@@ -98,11 +94,7 @@ impl<FS: ShimFS> Task<FS> {
     /// - Body (4): descriptor_count=1
     /// - Port descriptor (12): name=new_port, pad1=0,
     ///   disposition=MOVE_SEND(17), type=PORT(0)
-    fn mig_semaphore_create(
-        &self,
-        msg_addr: usize,
-        hdr: &MachMsgHeader,
-    ) -> Result<usize, Errno> {
+    fn mig_semaphore_create(&self, msg_addr: usize, hdr: &MachMsgHeader) -> Result<usize, Errno> {
         // Parse request: NDR(8) + policy(4) + value(4) starting at offset 24.
         let value_ptr: ConstPtr<i32> = ConstPtr::from_usize(msg_addr + HEADER_SIZE + 8 + 4);
         let initial_value: i32 = value_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
@@ -114,9 +106,7 @@ impl<FS: ShimFS> Task<FS> {
             .fetch_add(0x100, Ordering::Relaxed);
 
         // Register the semaphore in the manager with the initial count.
-        self.global
-            .semaphore_manager
-            .create(port, initial_value);
+        self.global.semaphore_manager.create(port, initial_value);
 
         log_unsupported!(
             "mig_semaphore_create: created port={port:#x}, initial_value={initial_value}"
@@ -166,22 +156,15 @@ impl<FS: ShimFS> Task<FS> {
     ///   voucher=0, id=3519
     /// - NDR record (8 bytes)
     /// - RetCode: i32 = KERN_SUCCESS (0)
-    fn mig_semaphore_destroy(
-        &self,
-        msg_addr: usize,
-        hdr: &MachMsgHeader,
-    ) -> Result<usize, Errno> {
+    fn mig_semaphore_destroy(&self, msg_addr: usize, hdr: &MachMsgHeader) -> Result<usize, Errno> {
         // The request is a complex message: Header(24) + Body(4) + PortDesc(12).
         // Read the port name from the descriptor.
-        let name_ptr: ConstPtr<u32> =
-            ConstPtr::from_usize(msg_addr + HEADER_SIZE + BODY_SIZE);
+        let name_ptr: ConstPtr<u32> = ConstPtr::from_usize(msg_addr + HEADER_SIZE + BODY_SIZE);
         let port: u32 = name_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
 
         let existed = self.global.semaphore_manager.destroy(port);
 
-        log_unsupported!(
-            "mig_semaphore_destroy: port={port:#x}, existed={existed}"
-        );
+        log_unsupported!("mig_semaphore_destroy: port={port:#x}, existed={existed}");
 
         // Write non-complex reply: Header(24) + NDR(8) + RetCode(4) = 36 bytes.
         #[allow(clippy::cast_possible_truncation)]
@@ -202,7 +185,9 @@ impl<FS: ShimFS> Task<FS> {
 
         // NDR record
         let ndr_ptr: MutPtr<[u8; 8]> = MutPtr::from_usize(body_base);
-        ndr_ptr.write_at_offset(0, NDR_RECORD).ok_or(Errno::EFAULT)?;
+        ndr_ptr
+            .write_at_offset(0, NDR_RECORD)
+            .ok_or(Errno::EFAULT)?;
 
         // RetCode = KERN_SUCCESS (0)
         let ret_ptr: MutPtr<i32> = MutPtr::from_usize(body_base + 8);
@@ -227,11 +212,7 @@ impl<FS: ShimFS> Task<FS> {
     /// - RetCode: i32 = 0 (KERN_SUCCESS)
     /// - task_info_outCnt: i32 = count of i32 words returned
     /// - task_info_out: variable-length data (outCnt * 4 bytes)
-    fn mig_task_info(
-        &self,
-        msg_addr: usize,
-        hdr: &MachMsgHeader,
-    ) -> Result<usize, Errno> {
+    fn mig_task_info(&self, msg_addr: usize, hdr: &MachMsgHeader) -> Result<usize, Errno> {
         // Read flavor from offset 32 (HEADER_SIZE + 8 bytes NDR).
         let flavor_ptr: ConstPtr<i32> = ConstPtr::from_usize(msg_addr + HEADER_SIZE + 8);
         let flavor: i32 = flavor_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
@@ -246,9 +227,7 @@ impl<FS: ShimFS> Task<FS> {
             TASK_DYLD_INFO => self.mig_task_info_dyld(msg_addr, hdr),
             TASK_BASIC_INFO_64 => self.mig_task_info_basic_64(msg_addr, hdr),
             MACH_TASK_BASIC_INFO => self.mig_task_info_basic(msg_addr, hdr),
-            TASK_FLAGS_INFO | TASK_FLAGS_INFO_28 => {
-                self.mig_task_info_flags(msg_addr, hdr)
-            }
+            TASK_FLAGS_INFO | TASK_FLAGS_INFO_28 => self.mig_task_info_flags(msg_addr, hdr),
             _ => {
                 log_unsupported!(
                     "mig_task_info: unknown flavor={flavor}, returning KERN_INVALID_ARGUMENT"
@@ -290,7 +269,9 @@ impl<FS: ShimFS> Task<FS> {
 
         // NDR record
         let ndr_ptr: MutPtr<[u8; 8]> = MutPtr::from_usize(body_base);
-        ndr_ptr.write_at_offset(0, NDR_RECORD).ok_or(Errno::EFAULT)?;
+        ndr_ptr
+            .write_at_offset(0, NDR_RECORD)
+            .ok_or(Errno::EFAULT)?;
 
         // RetCode = KERN_SUCCESS (0)
         let ret_ptr: MutPtr<i32> = MutPtr::from_usize(body_base + 8);
@@ -309,11 +290,7 @@ impl<FS: ShimFS> Task<FS> {
     /// - `all_image_info_addr`: u64 (0 — not tracked by the shim)
     /// - `all_image_info_size`: u64 (0)
     /// - `all_image_info_format`: u64 (2 = 64-bit)
-    fn mig_task_info_dyld(
-        &self,
-        msg_addr: usize,
-        hdr: &MachMsgHeader,
-    ) -> Result<usize, Errno> {
+    fn mig_task_info_dyld(&self, msg_addr: usize, hdr: &MachMsgHeader) -> Result<usize, Errno> {
         // task_dyld_info: 3 × u64 = 24 bytes = 6 i32-words
         let data_offset = self.write_task_info_reply_header(msg_addr, hdr, 24, 6)?;
 
@@ -331,11 +308,7 @@ impl<FS: ShimFS> Task<FS> {
     /// Reply for `MACH_TASK_BASIC_INFO` (flavor 20).
     ///
     /// Returns synthetic task info: 12 i32-words = 48 bytes.
-    fn mig_task_info_basic(
-        &self,
-        msg_addr: usize,
-        hdr: &MachMsgHeader,
-    ) -> Result<usize, Errno> {
+    fn mig_task_info_basic(&self, msg_addr: usize, hdr: &MachMsgHeader) -> Result<usize, Errno> {
         // mach_task_basic_info: 48 bytes = 12 i32-words
         let data_offset = self.write_task_info_reply_header(msg_addr, hdr, 48, 12)?;
 
@@ -346,8 +319,12 @@ impl<FS: ShimFS> Task<FS> {
 
         // Set plausible virtual_size and resident_size (first two u64 fields).
         let data_u64: MutPtr<u64> = MutPtr::from_usize(data_offset);
-        data_u64.write_at_offset(0, 0x1_0000_0000u64).ok_or(Errno::EFAULT)?; // virtual_size
-        data_u64.write_at_offset(1, 0x800_0000u64).ok_or(Errno::EFAULT)?; // resident_size
+        data_u64
+            .write_at_offset(0, 0x1_0000_0000u64)
+            .ok_or(Errno::EFAULT)?; // virtual_size
+        data_u64
+            .write_at_offset(1, 0x800_0000u64)
+            .ok_or(Errno::EFAULT)?; // resident_size
 
         log_unsupported!("mig_task_info_basic: returned synthetic values");
 
@@ -357,11 +334,7 @@ impl<FS: ShimFS> Task<FS> {
     /// Reply for `TASK_FLAGS_INFO` (flavor 22 or 28).
     ///
     /// Returns 1 i32-word = 4 bytes (flags = 0).
-    fn mig_task_info_flags(
-        &self,
-        msg_addr: usize,
-        hdr: &MachMsgHeader,
-    ) -> Result<usize, Errno> {
+    fn mig_task_info_flags(&self, msg_addr: usize, hdr: &MachMsgHeader) -> Result<usize, Errno> {
         let data_offset = self.write_task_info_reply_header(msg_addr, hdr, 4, 1)?;
 
         let flags_ptr: MutPtr<i32> = MutPtr::from_usize(data_offset);
@@ -388,11 +361,7 @@ impl<FS: ShimFS> Task<FS> {
     /// offset 32: system_time.usec (i32)
     /// offset 36: policy         (i32)
     /// ```
-    fn mig_task_info_basic_64(
-        &self,
-        msg_addr: usize,
-        hdr: &MachMsgHeader,
-    ) -> Result<usize, Errno> {
+    fn mig_task_info_basic_64(&self, msg_addr: usize, hdr: &MachMsgHeader) -> Result<usize, Errno> {
         // task_basic_info_64: 40 bytes = 10 i32-words
         let data_offset = self.write_task_info_reply_header(msg_addr, hdr, 40, 10)?;
 
@@ -445,11 +414,7 @@ impl<FS: ShimFS> Task<FS> {
     /// offset 24: system_time.usec (i32)
     /// offset 28: policy         (i32)
     /// ```
-    fn mig_task_info_basic_32(
-        &self,
-        msg_addr: usize,
-        hdr: &MachMsgHeader,
-    ) -> Result<usize, Errno> {
+    fn mig_task_info_basic_32(&self, msg_addr: usize, hdr: &MachMsgHeader) -> Result<usize, Errno> {
         // task_basic_info_32: 32 bytes = 8 i32-words
         let data_offset = self.write_task_info_reply_header(msg_addr, hdr, 32, 8)?;
 
@@ -458,9 +423,13 @@ impl<FS: ShimFS> Task<FS> {
         // suspend_count = 0
         data_ptr.write_at_offset(0, 0u32).ok_or(Errno::EFAULT)?;
         // virtual_size (truncated to 32 bits, ~256 MiB)
-        data_ptr.write_at_offset(1, 0x1000_0000u32).ok_or(Errno::EFAULT)?;
+        data_ptr
+            .write_at_offset(1, 0x1000_0000u32)
+            .ok_or(Errno::EFAULT)?;
         // resident_size (~128 MiB)
-        data_ptr.write_at_offset(2, 0x0800_0000u32).ok_or(Errno::EFAULT)?;
+        data_ptr
+            .write_at_offset(2, 0x0800_0000u32)
+            .ok_or(Errno::EFAULT)?;
         // user_time = {0, 0}
         data_ptr.write_at_offset(3, 0u32).ok_or(Errno::EFAULT)?;
         data_ptr.write_at_offset(4, 0u32).ok_or(Errno::EFAULT)?;
@@ -500,10 +469,14 @@ impl<FS: ShimFS> Task<FS> {
         let body_base = msg_addr + HEADER_SIZE;
 
         let ndr_ptr: MutPtr<[u8; 8]> = MutPtr::from_usize(body_base);
-        ndr_ptr.write_at_offset(0, NDR_RECORD).ok_or(Errno::EFAULT)?;
+        ndr_ptr
+            .write_at_offset(0, NDR_RECORD)
+            .ok_or(Errno::EFAULT)?;
 
         let ret_ptr: MutPtr<i32> = MutPtr::from_usize(body_base + 8);
-        ret_ptr.write_at_offset(0, kern_return).ok_or(Errno::EFAULT)?;
+        ret_ptr
+            .write_at_offset(0, kern_return)
+            .ok_or(Errno::EFAULT)?;
 
         Ok(MACH_MSG_SUCCESS)
     }

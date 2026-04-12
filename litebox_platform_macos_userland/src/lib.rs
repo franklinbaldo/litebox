@@ -2116,12 +2116,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                         let mut addr = inner_start as u64;
                         let size = (inner_end - inner_start) as u64;
                         let kr = unsafe {
-                            mach_vm_allocate(
-                                mach_task_self(),
-                                &raw mut addr,
-                                size,
-                                VM_FLAGS_FIXED,
-                            )
+                            mach_vm_allocate(mach_task_self(), &raw mut addr, size, VM_FLAGS_FIXED)
                         };
                         if kr != 0 {
                             return Err(
@@ -2139,11 +2134,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                             };
                             if r != 0 {
                                 unsafe {
-                                    mach_vm_deallocate(
-                                        mach_task_self(),
-                                        inner_start as u64,
-                                        size,
-                                    );
+                                    mach_vm_deallocate(mach_task_self(), inner_start as u64, size);
                                 }
                                 return Err(
                                     litebox::platform::page_mgmt::AllocationError::AddressInUseByPlatform,
@@ -2833,7 +2824,6 @@ unsafe extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext) {
                         interrupt_handler(thread_ctx);
                         return;
                     }
-
                 }
             }
         }
@@ -4068,8 +4058,7 @@ unsafe extern "C" fn exception_signal_handler(
         if handler_addr != 0 {
             let sigctx_dp = unsafe { &*context.uc_mcontext };
             let fault_addr = sigctx_dp.__es.__far as usize;
-            let handler: unsafe fn(usize) -> bool =
-                unsafe { core::mem::transmute(handler_addr) };
+            let handler: unsafe fn(usize) -> bool = unsafe { core::mem::transmute(handler_addr) };
             if unsafe { handler(fault_addr) } {
                 // Page was served.  If we were in guest code, we must NOT
                 // simply return — macOS sigreturn clobbers TPIDR_EL0 to the

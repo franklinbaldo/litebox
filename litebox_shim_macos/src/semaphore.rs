@@ -92,10 +92,13 @@ impl MachSemaphoreManager {
     /// initial value.  Called by the `semaphore_create` MIG handler.
     pub(crate) fn create(&self, port: u32, initial_value: i32) {
         let mut guard = self.semaphores.lock();
-        guard.insert(port, SemaphoreState {
-            count: initial_value,
-            waiters: VecDeque::new(),
-        });
+        guard.insert(
+            port,
+            SemaphoreState {
+                count: initial_value,
+                waiters: VecDeque::new(),
+            },
+        );
     }
 
     /// Destroy a semaphore, waking any blocked waiters.  Called by the

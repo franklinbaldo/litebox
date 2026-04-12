@@ -380,7 +380,9 @@ pub enum MacosSyscallRequest {
     CrossarchTrap,
     Csrctl,
     /// `dup(fd)` — duplicate a file descriptor.
-    Dup { fd: i32 },
+    Dup {
+        fd: i32,
+    },
     Dup2 {
         oldfd: i32,
         newfd: i32,
@@ -760,9 +762,15 @@ pub enum MacosSyscallRequest {
         rlim: usize,
     },
     /// `__clock_gettime(clock_id, tp)` — get time from specified clock.
-    ClockGettime { clock_id: u32, tp: usize },
+    ClockGettime {
+        clock_id: u32,
+        tp: usize,
+    },
     /// `__clock_getres(clock_id, res)` — get clock resolution.
-    ClockGetres { clock_id: u32, res: usize },
+    ClockGetres {
+        clock_id: u32,
+        res: usize,
+    },
     /// `fchmodat(dirfd, path, mode, flag)` — change file mode relative to dirfd.
     Fchmodat {
         dirfd: i32,

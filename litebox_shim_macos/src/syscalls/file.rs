@@ -519,7 +519,11 @@ impl<FS: ShimFS> Task<FS> {
         drop(paths);
         // Verify it's a directory
         let cpath = alloc::ffi::CString::new(path.as_bytes()).map_err(|_| Errno::EINVAL)?;
-        let status = self.global.fs.file_status(&cpath).map_err(|_| Errno::EBADF)?;
+        let status = self
+            .global
+            .fs
+            .file_status(&cpath)
+            .map_err(|_| Errno::EBADF)?;
         if status.file_type != litebox::fs::FileType::Directory {
             return Err(Errno::ENOTDIR);
         }
@@ -820,9 +824,7 @@ impl<FS: ShimFS> Task<FS> {
                 // F_ADDFILESIGS (61) / F_ADDFILESIGS_INFO (103):
                 // dyld uses these to register code signatures for
                 // loaded dylibs.  We skip validation and return success.
-                log_unsupported!(
-                    "fcntl(fd={fd}, F_ADDFILESIGS variant {cmd}) → ok (stub)"
-                );
+                log_unsupported!("fcntl(fd={fd}, F_ADDFILESIGS variant {cmd}) → ok (stub)");
                 Ok(0)
             }
             97 => {
@@ -836,12 +838,8 @@ impl<FS: ShimFS> Task<FS> {
                 // dyld believes the entire file up to the signature end
                 // has been validated.
                 let user_ptr: MutPtr<u64> = MutPtr::from_usize(arg);
-                let blob_start = user_ptr
-                    .read_at_offset(1)
-                    .unwrap_or(0);
-                let blob_size = user_ptr
-                    .read_at_offset(2)
-                    .unwrap_or(0);
+                let blob_start = user_ptr.read_at_offset(1).unwrap_or(0);
+                let blob_size = user_ptr.read_at_offset(2).unwrap_or(0);
                 let signed_end = blob_start.saturating_add(blob_size);
                 let _ = user_ptr.write_at_offset(0, signed_end);
                 log_unsupported!(
@@ -1004,9 +1002,7 @@ impl<FS: ShimFS> Task<FS> {
         };
 
         if new_fd < min_fd {
-            log_unsupported!(
-                "F_DUPFD: got fd {new_fd} but wanted >= {min_fd} (not yet supported)"
-            );
+            log_unsupported!("F_DUPFD: got fd {new_fd} but wanted >= {min_fd} (not yet supported)");
         }
 
         // Copy the path entry from raw_fd to new_fd for F_GETPATH support.
@@ -1814,7 +1810,8 @@ impl<FS: ShimFS> Task<FS> {
         };
 
         // Verify the path exists.
-        let cpath = alloc::ffi::CString::new(effective_path.as_bytes()).map_err(|_| Errno::EINVAL)?;
+        let cpath =
+            alloc::ffi::CString::new(effective_path.as_bytes()).map_err(|_| Errno::EINVAL)?;
         self.global.fs.file_status(&cpath).map_err(|e| match e {
             litebox::fs::errors::FileStatusError::PathError(ref pe) => {
                 use litebox::fs::errors::PathError;
@@ -1837,7 +1834,11 @@ impl<FS: ShimFS> Task<FS> {
     /// - ATTR_CMN_RETURNED_ATTRS (if FSOPT_REPORT_FULLSIZE or ATTR_CMN_RETURNED_ATTRS requested)
     /// - ATTR_CMN_OBJTYPE
     /// - ATTR_FILE_DATALENGTH (for regular files)
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::items_after_statements)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::items_after_statements
+    )]
     pub(crate) fn sys_getattrlist(
         &self,
         path_addr: usize,
@@ -1876,7 +1877,8 @@ impl<FS: ShimFS> Task<FS> {
             normalize_path(&full)
         };
 
-        let cpath = alloc::ffi::CString::new(effective_path.as_bytes()).map_err(|_| Errno::EINVAL)?;
+        let cpath =
+            alloc::ffi::CString::new(effective_path.as_bytes()).map_err(|_| Errno::EINVAL)?;
         let status = self.global.fs.file_status(&cpath).map_err(|e| match e {
             litebox::fs::errors::FileStatusError::PathError(ref pe) => {
                 use litebox::fs::errors::PathError;
@@ -1912,8 +1914,15 @@ impl<FS: ShimFS> Task<FS> {
         // ATTR_CMN_RETURNED_ATTRS: write back what we're returning.
         // This is a struct attribute_set_t { u32[5] } = 20 bytes.
         if commonattr & ATTR_CMN_RETURNED_ATTRS != 0 {
-            let ret_common = commonattr & (ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_OBJTYPE | ATTR_CMN_CRTIME | ATTR_CMN_MODTIME | ATTR_CMN_ACCTIME | ATTR_CMN_NAME);
-            let ret_file = fileattr & (ATTR_FILE_DATALENGTH | ATTR_FILE_TOTALSIZE | ATTR_FILE_ALLOCSIZE);
+            let ret_common = commonattr
+                & (ATTR_CMN_RETURNED_ATTRS
+                    | ATTR_CMN_OBJTYPE
+                    | ATTR_CMN_CRTIME
+                    | ATTR_CMN_MODTIME
+                    | ATTR_CMN_ACCTIME
+                    | ATTR_CMN_NAME);
+            let ret_file =
+                fileattr & (ATTR_FILE_DATALENGTH | ATTR_FILE_TOTALSIZE | ATTR_FILE_ALLOCSIZE);
             // Write 5 x u32: commonattr, volattr, dirattr, fileattr, forkattr
             buf.extend_from_slice(&ret_common.to_le_bytes());
             buf.extend_from_slice(&0u32.to_le_bytes()); // volattr
@@ -1937,7 +1946,7 @@ impl<FS: ShimFS> Task<FS> {
             let vtype: u32 = match status.file_type {
                 litebox::fs::FileType::Directory => 2,       // VDIR
                 litebox::fs::FileType::CharacterDevice => 4, // VCHR
-                _ => 1,                                       // VREG
+                _ => 1,                                      // VREG
             };
             buf.extend_from_slice(&vtype.to_le_bytes());
         }
@@ -2000,7 +2009,8 @@ impl<FS: ShimFS> Task<FS> {
         let copy_len = buf.len().min(attr_buf_size);
         if copy_len > 0 {
             let dest: MutPtr<u8> = MutPtr::from_usize(attr_buf_addr);
-            dest.copy_from_slice(0, &buf[..copy_len]).ok_or(Errno::EFAULT)?;
+            dest.copy_from_slice(0, &buf[..copy_len])
+                .ok_or(Errno::EFAULT)?;
         }
 
         Ok(0)

@@ -67,11 +67,7 @@ impl<FS: ShimFS> Task<FS> {
     ///
     /// Litebox runs as a single-user environment with gid=0. We report a
     /// single supplementary group (gid 0) to match `sys_getgid()`.
-    pub(crate) fn sys_getgroups(
-        &self,
-        gidsetsize: i32,
-        grouplist: usize,
-    ) -> Result<usize, Errno> {
+    pub(crate) fn sys_getgroups(&self, gidsetsize: i32, grouplist: usize) -> Result<usize, Errno> {
         const NGROUPS: usize = 1;
         let groups: [u32; NGROUPS] = [0]; // gid 0, matching sys_getgid()
 
@@ -94,8 +90,7 @@ impl<FS: ShimFS> Task<FS> {
         let dest: MutPtr<u32> = MutPtr::from_usize(grouplist);
         for (i, &gid) in groups.iter().enumerate() {
             #[allow(clippy::cast_possible_wrap)]
-            dest.write_at_offset(i as isize, gid)
-                .ok_or(Errno::EFAULT)?;
+            dest.write_at_offset(i as isize, gid).ok_or(Errno::EFAULT)?;
         }
 
         Ok(NGROUPS)
@@ -227,9 +222,13 @@ impl<FS: ShimFS> Task<FS> {
 
         if tp_addr != 0 {
             let sec_ptr: MutPtr<i64> = MutPtr::from_usize(tp_addr);
-            sec_ptr.write_at_offset(0, duration.as_secs() as i64).ok_or(Errno::EFAULT)?;
+            sec_ptr
+                .write_at_offset(0, duration.as_secs() as i64)
+                .ok_or(Errno::EFAULT)?;
             let nsec_ptr: MutPtr<i64> = MutPtr::from_usize(tp_addr + 8);
-            nsec_ptr.write_at_offset(0, i64::from(duration.subsec_nanos())).ok_or(Errno::EFAULT)?;
+            nsec_ptr
+                .write_at_offset(0, i64::from(duration.subsec_nanos()))
+                .ok_or(Errno::EFAULT)?;
         }
         Ok(0)
     }
@@ -250,9 +249,13 @@ impl<FS: ShimFS> Task<FS> {
 
         if res_addr != 0 {
             let sec_ptr: MutPtr<i64> = MutPtr::from_usize(res_addr);
-            sec_ptr.write_at_offset(0, resolution.as_secs() as i64).ok_or(Errno::EFAULT)?;
+            sec_ptr
+                .write_at_offset(0, resolution.as_secs() as i64)
+                .ok_or(Errno::EFAULT)?;
             let nsec_ptr: MutPtr<i64> = MutPtr::from_usize(res_addr + 8);
-            nsec_ptr.write_at_offset(0, i64::from(resolution.subsec_nanos())).ok_or(Errno::EFAULT)?;
+            nsec_ptr
+                .write_at_offset(0, i64::from(resolution.subsec_nanos()))
+                .ok_or(Errno::EFAULT)?;
         }
         Ok(0)
     }
@@ -407,8 +410,7 @@ impl<FS: ShimFS> Task<FS> {
         // checking the table address during this window (e.g.,
         // update_host_tls_entry) knows there is no valid table.
         {
-            let old_tls_addr = litebox_common_linux::HOST_TLS_TABLE_ADDR
-                .swap(0, Ordering::Release);
+            let old_tls_addr = litebox_common_linux::HOST_TLS_TABLE_ADDR.swap(0, Ordering::Release);
             if old_tls_addr != 0 {
                 // Write sentinel to entry 0's key (byte offset 0).
                 // SAFETY: old_tls_addr points to a page we allocated; it
@@ -416,10 +418,7 @@ impl<FS: ShimFS> Task<FS> {
                 // We use write_volatile to prevent the compiler from
                 // eliding or reordering this store.
                 unsafe {
-                    core::ptr::write_volatile(
-                        old_tls_addr as *mut u64,
-                        0xFFFF_FFFF_FFFF_FFFFu64,
-                    );
+                    core::ptr::write_volatile(old_tls_addr as *mut u64, 0xFFFF_FFFF_FFFF_FFFFu64);
                 }
             }
         }

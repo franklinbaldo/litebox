@@ -788,10 +788,9 @@ impl<FS: ShimFS> Task<FS> {
                 flags,
                 fd,
                 offset,
-            } => {
-                self.sys_mmap(addr, length, prot, flags, fd, offset)
-                    .map(|ptr| ptr.as_usize())
-            }
+            } => self
+                .sys_mmap(addr, length, prot, flags, fd, offset)
+                .map(|ptr| ptr.as_usize()),
             SyscallRequest::Mprotect { addr, length, prot } => {
                 syscall!(sys_mprotect(addr, length, prot))
             }

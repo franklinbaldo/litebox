@@ -354,7 +354,9 @@ pub(crate) fn load<FS: ShimFS>(
 
     // Update brk past the TLS table.
     brk = brk.max(tls_table_end);
-    log_unsupported!("load_macho: TLS table initialized, HOST_TLS_TABLE_ADDR set to {tls_table_addr:#x}");
+    log_unsupported!(
+        "load_macho: TLS table initialized, HOST_TLS_TABLE_ADDR set to {tls_table_addr:#x}"
+    );
 
     // --- Update shared cache trampoline TLS pointers ---
     //
@@ -462,7 +464,10 @@ pub(crate) fn load<FS: ShimFS>(
         has_dylinker
     );
     if has_dylinker {
-        log_unsupported!("load_macho: has_dylinker=true, dyld_bytes.is_some()={}", dyld_bytes.is_some());
+        log_unsupported!(
+            "load_macho: has_dylinker=true, dyld_bytes.is_some()={}",
+            dyld_bytes.is_some()
+        );
         // Determine the dyld binary data to use.  On initial load the caller
         // passes dyld_bytes directly.  On re-exec (execve) the caller passes
         // None and we retrieve the previously-stored bytes from Global.
@@ -486,7 +491,10 @@ pub(crate) fn load<FS: ShimFS>(
             }
         };
 
-        log_unsupported!("load_macho: dyld_data_owned.is_some()={}", dyld_data_owned.is_some());
+        log_unsupported!(
+            "load_macho: dyld_data_owned.is_some()={}",
+            dyld_data_owned.is_some()
+        );
         // Load dyld fresh — always, even on re-exec.  This ensures dyld's
         // __DATA segments start pristine, matching real macOS kernel behavior
         // where dyld is freshly mapped from disk on every execve().
@@ -495,9 +503,17 @@ pub(crate) fn load<FS: ShimFS>(
             (None, Some(orig)) => orig,
             _ => unreachable!(),
         };
-        log_unsupported!("load_macho: about to call load_dyld (slice len={})", dyld_slice.len());
+        log_unsupported!(
+            "load_macho: about to call load_dyld (slice len={})",
+            dyld_slice.len()
+        );
         let dyld_info = load_dyld(task, dyld_slice)?;
-        log_unsupported!("load_macho: load_dyld OK: entry={:#x} base={:#x} end={:#x}", dyld_info.entry_point, dyld_info.base, dyld_info.end);
+        log_unsupported!(
+            "load_macho: load_dyld OK: entry={:#x} base={:#x} end={:#x}",
+            dyld_info.entry_point,
+            dyld_info.base,
+            dyld_info.end
+        );
         // Store dyld address range so release_memory can skip it if needed,
         // and store entry point for reference.
         task.global
@@ -642,7 +658,10 @@ fn load_dyld<FS: ShimFS>(
     log_unsupported!("load_dyld: rewriting dyld (slice len={})", slice_data.len());
     let mut rewritten = litebox_syscall_rewriter_macho::hook_syscalls_in_macho(slice_data)
         .map_err(|e| MachoLoaderError::ParseError(alloc::format!("dyld rewrite failed: {e}")))?;
-    log_unsupported!("load_dyld: rewrite done (rewritten len={})", rewritten.len());
+    log_unsupported!(
+        "load_dyld: rewrite done (rewritten len={})",
+        rewritten.len()
+    );
 
     // Patch out `restartWithDyldInCache` call.
     //
@@ -804,7 +823,9 @@ fn load_dyld<FS: ShimFS>(
     .as_usize();
 
     let slide = reserved_base.wrapping_sub(page_aligned_min);
-    log_unsupported!("load_dyld: reserved at {reserved_base:#x}, slide={slide:#x}, total_span={total_span:#x}");
+    log_unsupported!(
+        "load_dyld: reserved at {reserved_base:#x}, slide={slide:#x}, total_span={total_span:#x}"
+    );
 
     // Map each segment
     for seg in &segments {
@@ -853,7 +874,9 @@ fn load_dyld<FS: ShimFS>(
                 .ok_or(MachoLoaderError::MemoryError(
                     "failed to copy dyld segment data".into(),
                 ))?;
-            log_unsupported!("load_dyld: copied {file_size:#x} bytes from file offset {file_off:#x}");
+            log_unsupported!(
+                "load_dyld: copied {file_size:#x} bytes from file offset {file_off:#x}"
+            );
         }
 
         if final_prot != litebox_common_linux::ProtFlags::PROT_READ_WRITE {
@@ -1192,7 +1215,6 @@ fn patch_exit_to_host(data: &mut [u8]) {
     log_unsupported!("patch_exit_to_host: signature not found, skipping");
 }
 
-
 /// Patch dyld to always allow `@rpath` / `@loader_path` expansion.
 ///
 /// Dyld gates @path expansion on an AMFI policy flag (bit 0 of a cached
@@ -1252,7 +1274,11 @@ fn patch_allow_at_paths(data: &mut [u8]) {
 }
 
 /// Patch the TBNZ gate that prevents all @-path expansion.
-#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_lossless)]
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless
+)]
 fn patch_at_path_expansion_gate(data: &mut [u8]) {
     let needle = b", (security policy does not allow @ path expansion)";
     let Some(str_off) = data.windows(needle.len()).position(|w| w == needle) else {
@@ -1282,9 +1308,7 @@ fn patch_at_path_expansion_gate(data: &mut [u8]) {
             let pc_page = (i as i64) & !0xFFF;
             let adrp_result = pc_page + (imm21 as i64) * 4096;
 
-            if adrp_result == str_page as i64
-                && (w1 & 0xFFC0_0000) == 0x9100_0000
-            {
+            if adrp_result == str_page as i64 && (w1 & 0xFFC0_0000) == 0x9100_0000 {
                 let add_rn = (w1 >> 5) & 0x1F;
                 let add_imm = (w1 >> 10) & 0xFFF;
                 if add_rn == rd && add_imm == str_page_off as u32 {
@@ -1317,12 +1341,14 @@ fn patch_at_path_expansion_gate(data: &mut [u8]) {
 
     // Reuse the TBNZ branch offset for an unconditional B.
     let imm14 = ((tbnz >> 5) & 0x3FFF) as i32;
-    let imm14 = if imm14 >= (1 << 13) { imm14 - (1 << 14) } else { imm14 };
+    let imm14 = if imm14 >= (1 << 13) {
+        imm14 - (1 << 14)
+    } else {
+        imm14
+    };
     let b_insn = 0x1400_0000_u32 | ((imm14 as u32) & 0x03FF_FFFF);
 
-    log_unsupported!(
-        "patch_allow_at_paths: patching TBNZ at {tbnz_off:#x} → B ({b_insn:#010x})"
-    );
+    log_unsupported!("patch_allow_at_paths: patching TBNZ at {tbnz_off:#x} → B ({b_insn:#010x})");
     data[tbnz_off..tbnz_off + 4].copy_from_slice(&b_insn.to_le_bytes());
 }
 
@@ -1344,12 +1370,14 @@ fn patch_at_path_expansion_gate(data: &mut [u8]) {
 ///
 /// We replace the LDRB at ADRP-12 with `B +8` (jump 8 instructions
 /// forward to the success path at ADRP+20).
-#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_lossless)]
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless
+)]
 fn patch_rpath_security_gate(data: &mut [u8], needle: &[u8], label: &str) {
     let Some(str_off) = data.windows(needle.len()).position(|w| w == needle) else {
-        log_unsupported!(
-            "patch_allow_at_paths: {label} string not found, skipping"
-        );
+        log_unsupported!("patch_allow_at_paths: {label} string not found, skipping");
         return;
     };
 
@@ -1375,9 +1403,7 @@ fn patch_rpath_security_gate(data: &mut [u8], needle: &[u8], label: &str) {
             let pc_page = (i as i64) & !0xFFF;
             let adrp_result = pc_page + (imm21 as i64) * 4096;
 
-            if adrp_result == str_page as i64
-                && (w1 & 0xFFC0_0000) == 0x9100_0000
-            {
+            if adrp_result == str_page as i64 && (w1 & 0xFFC0_0000) == 0x9100_0000 {
                 let add_rn = (w1 >> 5) & 0x1F;
                 let add_imm = (w1 >> 10) & 0xFFF;
                 if add_rn == rd && add_imm == str_page_off as u32 {
@@ -1390,17 +1416,13 @@ fn patch_rpath_security_gate(data: &mut [u8], needle: &[u8], label: &str) {
     }
 
     let Some(adrp) = adrp_off else {
-        log_unsupported!(
-            "patch_allow_at_paths: {label} ADRP+ADD not found, skipping"
-        );
+        log_unsupported!("patch_allow_at_paths: {label} ADRP+ADD not found, skipping");
         return;
     };
 
     // The LDRB is 12 bytes before the ADRP.
     if adrp < 12 {
-        log_unsupported!(
-            "patch_allow_at_paths: {label} ADRP too close to start, skipping"
-        );
+        log_unsupported!("patch_allow_at_paths: {label} ADRP too close to start, skipping");
         return;
     }
     let ldrb_off = adrp - 12;

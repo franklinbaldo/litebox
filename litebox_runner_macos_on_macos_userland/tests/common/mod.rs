@@ -284,8 +284,7 @@ pub fn run_macho_binary(binary_data: &[u8], argv: &[&str]) -> (i32, Vec<u8>) {
     // Print the host process base address for conflict detection.
     eprintln!(
         ">>> [static] host: run_macho_binary={:#x} main={:#x}",
-        run_macho_binary as *const () as usize,
-        ensure_platform as *const () as usize,
+        run_macho_binary as *const () as usize, ensure_platform as *const () as usize,
     );
 
     // Serialize: only one test can use the platform + TLS table at a time.
@@ -339,11 +338,18 @@ pub fn run_macho_binary(binary_data: &[u8], argv: &[&str]) -> (i32, Vec<u8>) {
         slide,
     } = program;
 
-    let tls_table = litebox_common_linux::HOST_TLS_TABLE_ADDR.load(std::sync::atomic::Ordering::Acquire);
+    let tls_table =
+        litebox_common_linux::HOST_TLS_TABLE_ADDR.load(std::sync::atomic::Ordering::Acquire);
     let callback = litebox_platform_multiplex::platform().get_syscall_entry_point();
     eprintln!(
         ">>> [static] load_program done: entry_pc={:#x} sp={:#x} reserved_base={:#x} slide={:#x} binary_len={} tls_table={:#x} callback={:#x}",
-        initial_ctx.pc, initial_ctx.sp, reserved_base, slide, binary_data.len(), tls_table, callback
+        initial_ctx.pc,
+        initial_ctx.sp,
+        reserved_base,
+        slide,
+        binary_data.len(),
+        tls_table,
+        callback
     );
 
     unsafe {
@@ -581,18 +587,26 @@ fn run_macho_dynamic_inner(
     unsafe {
         litebox_platform_multiplex::reset_platform();
     }
-    unsafe { core::ptr::write_volatile(diag_state_ptr, 2); }
+    unsafe {
+        core::ptr::write_volatile(diag_state_ptr, 2);
+    }
 
     unsafe {
         litebox_platform_macos_userland::reset_exception_handler_once();
     }
-    unsafe { core::ptr::write_volatile(diag_state_ptr, 3); }
+    unsafe {
+        core::ptr::write_volatile(diag_state_ptr, 3);
+    }
 
     let platform = litebox_platform_macos_userland::MacosUserland::new(tun_device_name);
-    unsafe { core::ptr::write_volatile(diag_state_ptr, 4); }
+    unsafe {
+        core::ptr::write_volatile(diag_state_ptr, 4);
+    }
 
     litebox_platform_multiplex::set_platform(platform);
-    unsafe { core::ptr::write_volatile(diag_state_ptr, 5); }
+    unsafe {
+        core::ptr::write_volatile(diag_state_ptr, 5);
+    }
 
     litebox_common_linux::HOST_TLS_TABLE_ADDR.store(0, std::sync::atomic::Ordering::Release);
 
@@ -608,10 +622,14 @@ fn run_macho_dynamic_inner(
     // System binaries (fat/universal Mach-Os, or other unsupported formats)
     // may fail to parse — this is fine because they only call libc from the
     // shared cache (whose SVCs pass through to the host kernel).
-    unsafe { core::ptr::write_volatile(diag_state_ptr, 6); }
+    unsafe {
+        core::ptr::write_volatile(diag_state_ptr, 6);
+    }
     let rewritten_data = litebox_syscall_rewriter_macho::hook_syscalls_in_macho(binary_data).ok();
     let effective_binary = rewritten_data.as_deref().unwrap_or(binary_data);
-    unsafe { core::ptr::write_volatile(diag_state_ptr, 7); }
+    unsafe {
+        core::ptr::write_volatile(diag_state_ptr, 7);
+    }
 
     let mut shim_builder =
         litebox_shim_macos::MacosShimBuilder::<litebox_shim_macos::DefaultFS>::new();
@@ -626,7 +644,8 @@ fn run_macho_dynamic_inner(
         // Create /dev/dtracehelper as a regular (empty) file so dtrace
         // probe registration can open it (the subsequent ioctl is handled
         // by the shim as a no-op).
-        let _ = fs.open("/dev/dtracehelper", OFlags::CREAT | OFlags::WRONLY, mode)
+        let _ = fs
+            .open("/dev/dtracehelper", OFlags::CREAT | OFlags::WRONLY, mode)
             .map(|fd| fs.close(&fd));
         // Populate /tmp with a few files so /bin/ls exercises a non-empty directory.
         for name in ["hello.txt", "world.txt", "data.bin"] {
@@ -690,7 +709,9 @@ fn run_macho_dynamic_inner(
     let fs = shim_builder.default_fs(in_mem_fs, tar_ro_fs);
     shim_builder.set_fs(fs);
     let shim = shim_builder.build();
-    unsafe { core::ptr::write_volatile(diag_state_ptr, 8); }
+    unsafe {
+        core::ptr::write_volatile(diag_state_ptr, 8);
+    }
 
     // Use absolute path for argv[0] so dyld can resolve executable_path.
     // If exe_name is already an absolute path, use it as-is — this is
@@ -719,7 +740,9 @@ fn run_macho_dynamic_inner(
     // by the shim and would crash because no TLS entry or TCB exists
     // for the install thread.
     let dyld_data = std::fs::read("/usr/lib/dyld").expect("failed to read /usr/lib/dyld");
-    unsafe { core::ptr::write_volatile(diag_state_ptr, 9); }
+    unsafe {
+        core::ptr::write_volatile(diag_state_ptr, 9);
+    }
 
     // Load the program (parses Mach-O, allocates stack, etc.) before
     // install_shared_cache for the same reason: load_program uses the
@@ -727,11 +750,17 @@ fn run_macho_dynamic_inner(
     let program = shim
         .load_program(effective_binary, argv_cstrings, envp, Some(&dyld_data))
         .expect("load_program failed");
-    unsafe { core::ptr::write_volatile(diag_state_ptr, 10); } // load_program done
+    unsafe {
+        core::ptr::write_volatile(diag_state_ptr, 10);
+    } // load_program done
 
     eprintln!(
         ">>> [dynamic] load_program done: entry_pc={:#x} sp={:#x} reserved_base={:#x} slide={:#x} binary_len={}",
-        program.initial_ctx.pc, program.initial_ctx.sp, program.reserved_base, program.slide, effective_binary.len()
+        program.initial_ctx.pc,
+        program.initial_ctx.sp,
+        program.reserved_base,
+        program.slide,
+        effective_binary.len()
     );
 
     let litebox_shim_macos::LoadedProgram {
@@ -741,7 +770,9 @@ fn run_macho_dynamic_inner(
         reserved_base: _,
         slide,
     } = program;
-    unsafe { core::ptr::write_volatile(diag_state_ptr, 11); } // destructured
+    unsafe {
+        core::ptr::write_volatile(diag_state_ptr, 11);
+    } // destructured
 
     // Synthetically register pthread thread-start addresses.
     //
@@ -752,7 +783,9 @@ fn run_macho_dynamic_inner(
     // pthsize = page_align(0x18E0) on 16K-page aarch64 = 0x4000
     // tsd_offset = 0xA0 (from disassembly of __pthread_bsdthread_init)
     process.register_pthread_info(thread_start_addr, start_wqthread_addr, 0x4000, 0xA0);
-    unsafe { core::ptr::write_volatile(diag_state_ptr, 12); } // register_pthread_info done
+    unsafe {
+        core::ptr::write_volatile(diag_state_ptr, 12);
+    } // register_pthread_info done
 
     // Install shared cache regions into guest address space.
     // Global mapping regions were already mmap'd at guest addresses by
@@ -775,7 +808,10 @@ fn run_macho_dynamic_inner(
     for (i, r) in cache.regions.iter().enumerate().take(5) {
         eprintln!(
             ">>>   region[{}]: guest_addr={:#x} len={:#x} prot={:?}",
-            i, r.guest_addr, r.data().len(), r.prot
+            i,
+            r.guest_addr,
+            r.data().len(),
+            r.prot
         );
     }
     if cache.regions.len() > 5 {
@@ -789,7 +825,9 @@ fn run_macho_dynamic_inner(
             (r.guest_addr, r.data(), is_exec)
         })
         .collect();
-    unsafe { core::ptr::write_volatile(diag_state_ptr, 13); } // regions_for_shim built
+    unsafe {
+        core::ptr::write_volatile(diag_state_ptr, 13);
+    } // regions_for_shim built
 
     eprintln!(
         ">>> [dynamic] regions_for_shim: count={} preinstalled={} patch_text={} reset_data={} demand_pages={}",
@@ -800,7 +838,6 @@ fn run_macho_dynamic_inner(
         cache.demand_page_sources.len(),
     );
     eprintln!(">>> about to install_shared_cache");
-
 
     shim.install_shared_cache(
         cache.host_cache_base,
@@ -835,10 +872,23 @@ fn run_macho_dynamic_inner(
                 let mut found = None;
                 for i in 0..nfat {
                     let off = 8 + i * 20;
-                    if off + 20 > bin.len() { break; }
-                    let cputype = u32::from_be_bytes([bin[off], bin[off+1], bin[off+2], bin[off+3]]);
-                    let file_offset = u32::from_be_bytes([bin[off+8], bin[off+9], bin[off+10], bin[off+11]]) as usize;
-                    let file_size = u32::from_be_bytes([bin[off+12], bin[off+13], bin[off+14], bin[off+15]]) as usize;
+                    if off + 20 > bin.len() {
+                        break;
+                    }
+                    let cputype =
+                        u32::from_be_bytes([bin[off], bin[off + 1], bin[off + 2], bin[off + 3]]);
+                    let file_offset = u32::from_be_bytes([
+                        bin[off + 8],
+                        bin[off + 9],
+                        bin[off + 10],
+                        bin[off + 11],
+                    ]) as usize;
+                    let file_size = u32::from_be_bytes([
+                        bin[off + 12],
+                        bin[off + 13],
+                        bin[off + 14],
+                        bin[off + 15],
+                    ]) as usize;
                     // CPU_TYPE_ARM64 = 0x0100000C
                     if cputype == 0x0100000C {
                         found = Some(&bin[file_offset..file_offset + file_size]);
@@ -863,10 +913,24 @@ fn run_macho_dynamic_inner(
             let mut thread_data_fileoff: Option<u64> = None;
 
             for _ in 0..ncmds {
-                if cursor + 8 > bin.len() { break; }
-                let cmd = u32::from_le_bytes([bin[cursor], bin[cursor+1], bin[cursor+2], bin[cursor+3]]);
-                let cmdsize = u32::from_le_bytes([bin[cursor+4], bin[cursor+5], bin[cursor+6], bin[cursor+7]]) as usize;
-                if cmdsize < 8 || cursor + cmdsize > bin.len() { break; }
+                if cursor + 8 > bin.len() {
+                    break;
+                }
+                let cmd = u32::from_le_bytes([
+                    bin[cursor],
+                    bin[cursor + 1],
+                    bin[cursor + 2],
+                    bin[cursor + 3],
+                ]);
+                let cmdsize = u32::from_le_bytes([
+                    bin[cursor + 4],
+                    bin[cursor + 5],
+                    bin[cursor + 6],
+                    bin[cursor + 7],
+                ]) as usize;
+                if cmdsize < 8 || cursor + cmdsize > bin.len() {
+                    break;
+                }
 
                 // LC_SEGMENT_64 = 0x19
                 if cmd == 0x19 {
@@ -874,24 +938,43 @@ fn run_macho_dynamic_inner(
                     let nsects_off = cursor + 64;
                     if nsects_off + 4 <= bin.len() {
                         let nsects = u32::from_le_bytes([
-                            bin[nsects_off], bin[nsects_off+1],
-                            bin[nsects_off+2], bin[nsects_off+3],
+                            bin[nsects_off],
+                            bin[nsects_off + 1],
+                            bin[nsects_off + 2],
+                            bin[nsects_off + 3],
                         ]) as usize;
                         let sect_start = cursor + 72; // sizeof(segment_command_64)
                         for s in 0..nsects {
                             let soff = sect_start + s * 80; // sizeof(section_64)
-                            if soff + 80 > bin.len() { break; }
-                            let sectname = &bin[soff..soff+16];
+                            if soff + 80 > bin.len() {
+                                break;
+                            }
+                            let sectname = &bin[soff..soff + 16];
                             let sect_addr = u64::from_le_bytes([
-                                bin[soff+32], bin[soff+33], bin[soff+34], bin[soff+35],
-                                bin[soff+36], bin[soff+37], bin[soff+38], bin[soff+39],
+                                bin[soff + 32],
+                                bin[soff + 33],
+                                bin[soff + 34],
+                                bin[soff + 35],
+                                bin[soff + 36],
+                                bin[soff + 37],
+                                bin[soff + 38],
+                                bin[soff + 39],
                             ]);
                             let sect_size = u64::from_le_bytes([
-                                bin[soff+40], bin[soff+41], bin[soff+42], bin[soff+43],
-                                bin[soff+44], bin[soff+45], bin[soff+46], bin[soff+47],
+                                bin[soff + 40],
+                                bin[soff + 41],
+                                bin[soff + 42],
+                                bin[soff + 43],
+                                bin[soff + 44],
+                                bin[soff + 45],
+                                bin[soff + 46],
+                                bin[soff + 47],
                             ]);
                             let sect_offset = u64::from(u32::from_le_bytes([
-                                bin[soff+48], bin[soff+49], bin[soff+50], bin[soff+51],
+                                bin[soff + 48],
+                                bin[soff + 49],
+                                bin[soff + 50],
+                                bin[soff + 51],
                             ]));
 
                             if sectname.starts_with(b"__thread_vars\0") {
@@ -919,7 +1002,7 @@ fn run_macho_dynamic_inner(
                     #[allow(clippy::cast_possible_truncation)] // aarch64-only target
                     let sz = td_size as usize;
                     if off + sz <= bin.len() {
-                        bin[off..off+sz].to_vec()
+                        bin[off..off + sz].to_vec()
                     } else {
                         vec![0u8; sz]
                     }
@@ -943,7 +1026,11 @@ fn run_macho_dynamic_inner(
 
                     // Allocate the TLS block for the main thread and fill
                     // with initial data from __thread_data.
-                    let block_size = if tls_init_data.is_empty() { 256 } else { tls_init_data.len().max(256) };
+                    let block_size = if tls_init_data.is_empty() {
+                        256
+                    } else {
+                        tls_init_data.len().max(256)
+                    };
                     let layout = std::alloc::Layout::from_size_align(block_size, 16).unwrap();
                     let block = unsafe { std::alloc::alloc_zeroed(layout) };
                     if !block.is_null() {
