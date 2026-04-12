@@ -274,6 +274,38 @@ impl Process {
         }
     }
 
+    /// Creates a new process with restored resource limits and pre-built thread map.
+    ///
+    /// Used by multi-threaded checkpoint restore.
+    pub(crate) fn new_with_rlimits_and_threads(
+        thread_count: usize,
+        threads: BTreeMap<i32, Arc<ThreadRemote>>,
+        rlimits: &[(usize, usize); litebox_common_linux::RlimitResource::RLIM_NLIMITS],
+        thp_disabled: bool,
+    ) -> Self {
+        let nr_threads = <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT;
+        nr_threads
+            .underlying_atomic()
+            .store(thread_count as u32, Ordering::Relaxed);
+        let limits = ResourceLimits::from_snapshot(rlimits);
+        Self {
+            nr_threads,
+            inner: Mutex::new(ProcessInner {
+                exit_status: ExitStatus::Exit(0),
+                group_exit: false,
+                is_killing_other_threads: false,
+                is_forking: false,
+                threads,
+            }),
+            limits,
+            alarm_timer: Mutex::new(Alarm {
+                handle: None,
+                deadline: None,
+            }),
+            thp_disabled: AtomicBool::new(thp_disabled),
+        }
+    }
+
     /// Returns the current number of threads in this process.
     pub fn nr_threads(&self) -> u32 {
         self.nr_threads.underlying_atomic().load(Ordering::Relaxed)
@@ -1652,9 +1684,9 @@ type ThreadLocalDescriptor = MutPtr<u8>;
 #[cfg(target_arch = "x86")]
 type ThreadLocalDescriptor = litebox_common_linux::UserDesc;
 
-struct NewThreadArgs<FS: ShimFS> {
+pub(crate) struct NewThreadArgs<FS: ShimFS> {
     /// Task struct that maintains all per-thread data
-    task: Task<FS>,
+    pub(crate) task: Task<FS>,
 }
 
 impl<FS: ShimFS> litebox::shim::InitThread for NewThreadArgs<FS> {

@@ -136,6 +136,31 @@ impl SignalState {
         }
     }
 
+    /// Creates signal state for a restored sibling thread.
+    ///
+    /// Shares the same shared_pending and handlers as the given main thread's
+    /// signal state, but uses the sibling's own blocked mask and altstack.
+    pub fn new_sibling_from_restore(
+        main_signals: &Self,
+        blocked: SigSet,
+        altstack: SigAltStack,
+    ) -> Self {
+        Self {
+            pending: RefCell::new(PendingSignals::new()),
+            shared_pending: main_signals.shared_pending.clone(),
+            blocked: Cell::new(blocked),
+            handlers: main_signals.handlers.clone(),
+            altstack: Cell::new(altstack),
+            last_exception: Cell::new(litebox::shim::ExceptionInfo {
+                exception: litebox::shim::Exception(0),
+                error_code: 0,
+                cr2: 0,
+                kernel_mode: false,
+            }),
+            restore_mask: Cell::new(None),
+        }
+    }
+
     /// Get the current blocked signal mask.
     pub fn get_blocked(&self) -> SigSet {
         self.blocked.get()

@@ -604,6 +604,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
         use litebox::mm::linux::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize, VmFlags};
         use litebox::platform::AddressSpaceProvider;
         use litebox::platform::RawMutex as _;
+        use litebox::platform::ThreadProvider as _;
 
         let is_delayed_fork = snapshot.is_delayed_fork;
         let syscalls::fork_snapshot::ForkSnapshot {
@@ -619,7 +620,10 @@ impl<FS: ShimFS> LinuxShim<FS> {
 
         let th = &threads[0];
 
-        // Reserve the child's thread ID so future clone() calls don't collide.
+        // Reserve all thread IDs so future clone() calls don't collide.
+        for thread_snap in &threads {
+            self.global.reserve_thread_id(thread_snap.tid);
+        }
         self.global.reserve_thread_id(id.pid);
 
         // --- 1. Allocate the same VA partition slot used by the parent. ------
@@ -905,7 +909,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
         let child_process_state = Arc::new(ProcessState {
             pm: child_pm,
             address_space_id: child_as_id,
-            thread_count: core::sync::atomic::AtomicI32::new(1),
+            thread_count: core::sync::atomic::AtomicI32::new(threads.len() as i32),
             active_vfork_layers: litebox::sync::Mutex::new(Vec::new()),
             elf_patch_cache: litebox::sync::Mutex::new(elf_patch_cache),
             shared_file_mappings: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
@@ -920,20 +924,28 @@ impl<FS: ShimFS> LinuxShim<FS> {
             }),
         });
 
-        // --- 6. Build Process with restored rlimits. ------------------------
-        let child_thread_remote = Arc::new(syscalls::process::ThreadRemote::new());
-        let child_process = Arc::new(syscalls::process::Process::new_with_rlimits(
-            id.pid,
-            child_thread_remote.clone(),
+        // --- 6. Build Process with restored rlimits (multi-thread). ----------
+        let mut thread_remotes: Vec<Arc<syscalls::process::ThreadRemote>> =
+            Vec::with_capacity(threads.len());
+        let mut threads_map = alloc::collections::BTreeMap::new();
+        for thread_snap in &threads {
+            let remote = Arc::new(syscalls::process::ThreadRemote::new());
+            threads_map.insert(thread_snap.tid, remote.clone());
+            thread_remotes.push(remote);
+        }
+
+        let child_process = Arc::new(syscalls::process::Process::new_with_rlimits_and_threads(
+            threads.len(),
+            threads_map,
             &pw.rlimits,
             pw.thp_disabled,
         ));
 
-        // --- 7. Build ThreadState. ------------------------------------------
+        // --- 7. Build ThreadState for main thread. --------------------------
         let child_thread = syscalls::process::ThreadState::new_from_restore(
-            id.pid,
+            th.tid,
             child_process.clone(),
-            child_thread_remote,
+            thread_remotes[0].clone(),
             th.clear_child_tid.map(rb),
             th.robust_list.map(rb),
         );
@@ -957,7 +969,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
         );
 
         // --- 9. Restore filesystem state. -----------------------------------
-        let child_fs = {
+        let child_fs_arc = {
             let mut cwd = fs_snap.cwd.clone();
             if !cwd.ends_with('/') {
                 cwd.push('/');
@@ -970,14 +982,14 @@ impl<FS: ShimFS> LinuxShim<FS> {
         };
 
         // --- 10. Restore FD table. -------------------------------------------
-        let child_files = Arc::new(syscalls::file::FilesState::new(fs.clone()));
-        child_files.set_max_fd(
+        let child_files_arc = Arc::new(syscalls::file::FilesState::new(fs.clone()));
+        child_files_arc.set_max_fd(
             child_process
                 .limits
                 .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
                 .saturating_sub(1),
         );
-        child_files.initialize_stdio_in_shared_descriptors_table(&self.global);
+        child_files_arc.initialize_stdio_in_shared_descriptors_table(&self.global);
 
         // Restore terminal fds beyond stdio.  Fds 0/1/2 are already
         // populated by initialize_stdio; skip them to avoid slot collisions.
@@ -1013,13 +1025,13 @@ impl<FS: ShimFS> LinuxShim<FS> {
                     continue;
                 };
 
-                let Ok(fd_handle) = child_files.fs.open(path, flags, Mode::empty()) else {
+                let Ok(fd_handle) = child_files_arc.fs.open(path, flags, Mode::empty()) else {
                     continue;
                 };
 
                 // Attach metadata markers matching the snapshot.
                 let mut dt = self.global.litebox.descriptor_table_mut();
-                let mut rds = child_files.raw_descriptor_store.write();
+                let mut rds = child_files_arc.raw_descriptor_store.write();
                 let status_flags = OFlags::APPEND | flags;
                 dt.set_entry_metadata(&fd_handle, StdioStatusFlags(status_flags));
                 if meta.is_host_tty_alias {
@@ -1066,15 +1078,15 @@ impl<FS: ShimFS> LinuxShim<FS> {
                     2 => OFlags::RDWR,
                     _ => OFlags::RDONLY,
                 };
-                let Ok(fd_handle) = child_files
+                let Ok(fd_handle) = child_files_arc
                     .fs
                     .open(path, flags, Mode::empty())
                     .or_else(|_| {
                         // Try RDONLY if the original mode failed.
-                        child_files.fs.open(path, OFlags::RDONLY, Mode::empty())
+                        child_files_arc.fs.open(path, OFlags::RDONLY, Mode::empty())
                     })
                     .or_else(|_| {
-                        child_files
+                        child_files_arc
                             .fs
                             .open("/dev/null", OFlags::RDWR, Mode::empty())
                     })
@@ -1084,7 +1096,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
 
                 // For stdio slots, consume the pre-populated entry.
                 // For higher fds, the slot is empty.
-                let mut rds = child_files.raw_descriptor_store.write();
+                let mut rds = child_files_arc.raw_descriptor_store.write();
                 if entry.fd <= 2 {
                     let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
                 }
@@ -1131,7 +1143,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 );
 
                 // Place at the correct fd slot.
-                let mut rds = child_files.raw_descriptor_store.write();
+                let mut rds = child_files_arc.raw_descriptor_store.write();
                 let success = rds.fd_into_specific_raw_integer(socket_fd, entry.fd);
                 debug_assert!(
                     success,
@@ -1150,7 +1162,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
             egid: id.credentials.egid,
         });
 
-        // --- 11. Build Task with execution context. ---------------------------
+        // --- 12. Build main thread execution context. -----------------------
         let mut exec_ctx = th.execution_context.clone();
 
         // Rebase all address-valued registers from the snapshot's VA partition
@@ -1185,21 +1197,45 @@ impl<FS: ShimFS> LinuxShim<FS> {
         let mut comm = [0u8; litebox_common_linux::TASK_COMM_LEN];
         comm.copy_from_slice(&id.comm);
 
+        // --- 13. Pre-build sibling signal states. ---------------------------
+        // Must happen before child_signals is moved into the main Task.
+        let mut sibling_signal_states: Vec<syscalls::signal::SignalState> = Vec::new();
+        for sibling_snap in threads.iter().skip(1) {
+            let sibling_altstack = litebox_common_linux::signal::SigAltStack {
+                sp: if sibling_snap.altstack.sp != 0 {
+                    rb(sibling_snap.altstack.sp)
+                } else {
+                    0
+                },
+                flags: sibling_snap.altstack.flags,
+                #[cfg(target_pointer_width = "64")]
+                __pad: 0,
+                size: sibling_snap.altstack.size,
+            };
+            let sibling_signals = syscalls::signal::SignalState::new_sibling_from_restore(
+                &child_signals,
+                sibling_snap.blocked_signals,
+                sibling_altstack,
+            );
+            sibling_signal_states.push(sibling_signals);
+        }
+
+        // --- 14. Build main Task. -------------------------------------------
         let entrypoints = LinuxShimEntrypoints {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.global.clone(),
-                process_state: child_process_state.into(),
+                process_state: RefCell::new(child_process_state.clone()),
                 thread: child_thread,
                 wait_state: wait::WaitState::new(self.global.platform),
                 process_id: litebox::process::ProcessId::INIT,
                 pid: id.pid,
                 ppid: id.ppid,
-                tid: id.tid,
-                credentials: child_credentials,
+                tid: th.tid,
+                credentials: child_credentials.clone(),
                 comm: Cell::new(comm),
-                fs: child_fs.into(),
-                files: child_files.into(),
+                fs: RefCell::new(child_fs_arc.clone()),
+                files: RefCell::new(child_files_arc.clone()),
                 signals: child_signals,
                 fork_context: RefCell::new(None),
                 last_shell_write: RefCell::new(None),
@@ -1225,6 +1261,93 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 tls_base: th.tls_base.map(rb),
                 set_child_tid: th.set_child_tid.map(rb),
             });
+
+        // --- 15. Spawn sibling threads. -------------------------------------
+        for (i, sibling_snap) in threads.iter().enumerate().skip(1) {
+            let sibling_remote = thread_remotes[i].clone();
+
+            let sibling_thread = syscalls::process::ThreadState::new_from_restore(
+                sibling_snap.tid,
+                child_process.clone(),
+                sibling_remote,
+                sibling_snap.clear_child_tid.map(rb),
+                sibling_snap.robust_list.map(rb),
+            );
+
+            let sibling_signals = sibling_signal_states.remove(0);
+
+            // Build execution context with VA rebasing.
+            let mut sibling_exec_ctx = sibling_snap.execution_context.clone();
+            if va_rebase != 0 {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let rb_reg = |v: usize| (v as isize + va_rebase) as usize;
+                    sibling_exec_ctx.regs.rip = rb_reg(sibling_exec_ctx.regs.rip);
+                    sibling_exec_ctx.regs.rsp = rb_reg(sibling_exec_ctx.regs.rsp);
+                    sibling_exec_ctx.regs.rbp = rb_reg(sibling_exec_ctx.regs.rbp);
+                    sibling_exec_ctx.regs.rcx = rb_reg(sibling_exec_ctx.regs.rcx);
+                    sibling_exec_ctx.regs.r11 = rb_reg(sibling_exec_ctx.regs.r11);
+                }
+            }
+
+            if !is_delayed_fork {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    sibling_exec_ctx.rax = 0;
+                }
+                #[cfg(target_arch = "x86")]
+                {
+                    sibling_exec_ctx.eax = 0;
+                }
+            }
+
+            sibling_thread.init_state.set(
+                syscalls::process::ThreadInitState::ForkRestore {
+                    exec_ctx: alloc::boxed::Box::new(sibling_exec_ctx),
+                    tls_base: sibling_snap.tls_base.map(rb),
+                    set_child_tid: sibling_snap.set_child_tid.map(rb),
+                },
+            );
+
+            let sibling_task = Task {
+                global: self.global.clone(),
+                process_state: RefCell::new(child_process_state.clone()),
+                thread: sibling_thread,
+                wait_state: wait::WaitState::new(self.global.platform),
+                process_id: litebox::process::ProcessId::INIT,
+                pid: id.pid,
+                ppid: id.ppid,
+                tid: sibling_snap.tid,
+                credentials: child_credentials.clone(),
+                comm: Cell::new(comm),
+                fs: RefCell::new(child_fs_arc.clone()),
+                files: RefCell::new(child_files_arc.clone()),
+                signals: sibling_signals,
+                fork_context: RefCell::new(None),
+                last_shell_write: RefCell::new(None),
+                last_syscall: Cell::new(None),
+                syscall_restartable: Cell::new(false),
+                in_syscall: Cell::new(false),
+                deferred_vfork_park: Cell::new(false),
+                delayed_fork_pending: Cell::new(false),
+                migrated_to_remote: Cell::new(false),
+                mux_pipe_pair_ids: RefCell::new(Vec::new()),
+                checkpoint_requested: Cell::new(false),
+            };
+
+            let spawn_ctx = litebox_common_linux::ExecutionContext::default();
+            unsafe {
+                self.global
+                    .platform
+                    .spawn_thread(
+                        &spawn_ctx,
+                        alloc::boxed::Box::new(
+                            syscalls::process::NewThreadArgs { task: sibling_task },
+                        ),
+                    )
+                    .expect("failed to spawn restored sibling thread");
+            }
+        }
 
         let process = LinuxShimProcess(child_process);
         Ok(LoadedProgram {
