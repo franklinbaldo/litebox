@@ -7,10 +7,10 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 
 use crate::dockerfile::Instruction;
-use crate::spec_gen::{write_config_json, ImageMetadata};
+use crate::spec_gen::{ImageMetadata, write_config_json};
 
 /// Build an OCI bundle from a parsed Dockerfile.
 ///
@@ -112,9 +112,12 @@ pub fn build(instructions: &[Instruction], context_dir: &Path, output_dir: &Path
 /// traversal attacks in COPY/ADD source arguments.
 fn validate_source_in_context(context_dir: &Path, source: &str) -> Result<PathBuf> {
     let src_path = context_dir.join(source);
-    let canonical_ctx = context_dir
-        .canonicalize()
-        .with_context(|| format!("failed to canonicalize context dir: {}", context_dir.display()))?;
+    let canonical_ctx = context_dir.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize context dir: {}",
+            context_dir.display()
+        )
+    })?;
     let canonical_src = src_path.canonicalize().with_context(|| {
         format!(
             "source does not exist or cannot be resolved: {} (in context {})",
@@ -234,9 +237,7 @@ fn ensure_resolv_conf(rootfs_dir: &Path) -> Result<()> {
     {
         let has_working_ns = content.lines().any(|line| {
             let line = line.trim();
-            line.starts_with("nameserver")
-                && !line.contains("127.0.0")
-                && !line.contains("::1")
+            line.starts_with("nameserver") && !line.contains("127.0.0") && !line.contains("::1")
         });
         if has_working_ns {
             return Ok(());
@@ -554,10 +555,7 @@ fn restore_directory_symlinks(
         if is_empty {
             // Replace empty directory with a symlink.
             fs::remove_dir(&host_path).with_context(|| {
-                format!(
-                    "failed to remove placeholder dir: {}",
-                    host_path.display()
-                )
+                format!("failed to remove placeholder dir: {}", host_path.display())
             })?;
             std::os::unix::fs::symlink(target, &host_path).with_context(|| {
                 format!(

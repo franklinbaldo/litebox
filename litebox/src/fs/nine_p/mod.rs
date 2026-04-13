@@ -1983,7 +1983,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         target: impl crate::path::Arg,
         linkpath: impl crate::path::Arg,
     ) -> Result<(), SymlinkError> {
-        let target_str = target.as_rust_str().map_err(|_| SymlinkError::PathError(PathError::InvalidPathname))?;
+        let target_str = target
+            .as_rust_str()
+            .map_err(|_| SymlinkError::PathError(PathError::InvalidPathname))?;
         let linkpath = self.absolute_path(linkpath)?;
 
         let (parent_fid, name) = self.walk_to_parent(&linkpath)?;

@@ -766,9 +766,7 @@ impl Server {
                 && meta.file_type().is_symlink()
             {
                 // Containment check on the symlink entry itself (not target).
-                if !next.starts_with(&self.root)
-                    && !self.mount_table.is_under_mount(&next)
-                {
+                if !next.starts_with(&self.root) && !self.mount_table.is_under_mount(&next) {
                     break;
                 }
                 readlink_path = Some(next.clone());
@@ -1474,13 +1472,7 @@ impl Server {
     }
 
     /// Handle Tsymlink — create a symbolic link.
-    fn handle_symlink<'a>(
-        &self,
-        fid: u32,
-        name: String,
-        symtgt: String,
-        _gid: u32,
-    ) -> Fcall<'a> {
+    fn handle_symlink<'a>(&self, fid: u32, name: String, symtgt: String, _gid: u32) -> Fcall<'a> {
         let fid_arc = match self.get_fid(fid) {
             Ok(fid_arc) => fid_arc,
             Err(errno) => return error_response(errno),
@@ -1620,16 +1612,18 @@ impl Server {
         if is_fifo {
             // Create a FIFO (named pipe) — this doesn't require CAP_MKNOD.
             let ret = unsafe {
-                let c_path = match std::ffi::CString::new(
-                    target.as_os_str().as_encoded_bytes(),
-                ) {
+                let c_path = match std::ffi::CString::new(target.as_os_str().as_encoded_bytes()) {
                     Ok(c) => c,
                     Err(_) => return error_response(libc::EINVAL as u32),
                 };
                 libc::mkfifo(c_path.as_ptr(), mode & 0o7777)
             };
             if ret != 0 {
-                return error_response(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO) as u32);
+                return error_response(
+                    std::io::Error::last_os_error()
+                        .raw_os_error()
+                        .unwrap_or(libc::EIO) as u32,
+                );
             }
         } else {
             // For device nodes (block/char), create a regular file stub.
@@ -1721,7 +1715,11 @@ impl Server {
 
         let (src_path, src_canonical, src_readlink_path) = {
             let src = read_lock(&src_arc, "fid");
-            (src.path.clone(), src.is_canonical, src.readlink_path.clone())
+            (
+                src.path.clone(),
+                src.is_canonical,
+                src.readlink_path.clone(),
+            )
         };
         let (dst_dir_path, dst_canonical) = {
             let dst = read_lock(&dst_arc, "fid");

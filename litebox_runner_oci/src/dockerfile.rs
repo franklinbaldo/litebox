@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 /// A parsed Dockerfile instruction.
 #[derive(Debug, Clone)]

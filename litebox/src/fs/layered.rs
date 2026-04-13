@@ -1881,7 +1881,9 @@ impl<
         target: impl crate::path::Arg,
         linkpath: impl crate::path::Arg,
     ) -> Result<(), SymlinkError> {
-        let target_str = target.as_rust_str().map_err(|_| SymlinkError::PathError(PathError::InvalidPathname))?;
+        let target_str = target
+            .as_rust_str()
+            .map_err(|_| SymlinkError::PathError(PathError::InvalidPathname))?;
         let linkpath = self.absolute_path(linkpath)?;
         if self.has_tombstoned_ancestor(&linkpath)? {
             return Err(PathError::NoSuchFileOrDirectory)?;

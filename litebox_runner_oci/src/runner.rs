@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use oci_spec::runtime::Spec;
 
 use litebox_runner_linux_userland::{CliArgs, InterceptionBackend};

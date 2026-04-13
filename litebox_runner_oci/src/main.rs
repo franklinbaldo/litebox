@@ -980,11 +980,7 @@ fn main() -> Result<()> {
             }
 
             // Run build
-            if let Err(e) = litebox_runner_oci::build::build(
-                &instructions,
-                &context,
-                &output_dir,
-            ) {
+            if let Err(e) = litebox_runner_oci::build::build(&instructions, &context, &output_dir) {
                 eprintln!("Build failed: {e:#}");
                 std::process::exit(1);
             }
