@@ -86,9 +86,11 @@ impl NetworkConfig {
     /// AF_PACKET platform without an explicit `NetworkConfig`).
     pub fn default_for_medium(medium: smoltcp::phy::Medium) -> Self {
         let hardware_addr = match medium {
-            smoltcp::phy::Medium::Ethernet => smoltcp::wire::HardwareAddress::Ethernet(
-                smoltcp::wire::EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]),
-            ),
+            smoltcp::phy::Medium::Ethernet => {
+                smoltcp::wire::HardwareAddress::Ethernet(smoltcp::wire::EthernetAddress([
+                    0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+                ]))
+            }
             smoltcp::phy::Medium::Ip => smoltcp::wire::HardwareAddress::Ip,
         };
         Self {
@@ -172,7 +174,10 @@ where
     /// Callers that need a specific MAC or IP configuration should use
     /// [`with_config`](Self::with_config) instead.
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
-        Self::with_config(litebox, NetworkConfig::default_for_medium(litebox.x.platform.medium()))
+        Self::with_config(
+            litebox,
+            NetworkConfig::default_for_medium(litebox.x.platform.medium()),
+        )
     }
 
     /// Construct a new `Network` with custom configuration.

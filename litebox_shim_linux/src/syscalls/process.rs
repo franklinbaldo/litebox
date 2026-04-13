@@ -5589,11 +5589,9 @@ impl<FS: ShimFS> Task<FS> {
                     {
                         let files = self.files.borrow();
                         let rds = files.raw_descriptor_store.read();
-                        if let Ok(typed) = rds.fd_from_raw_integer::<
-                            litebox::pipes::Pipes<crate::Platform>,
-                        >(
-                            child_fd
-                        ) {
+                        if let Ok(typed) = rds
+                            .fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(child_fd)
+                        {
                             drop(rds);
                             let _ = self.global.pipes.undrain(&typed, drained);
                         } else {
@@ -5671,11 +5669,9 @@ impl<FS: ShimFS> Task<FS> {
                     {
                         let files = self.files.borrow();
                         let rds = files.raw_descriptor_store.read();
-                        if let Ok(typed) = rds.fd_from_raw_integer::<
-                            litebox::pipes::Pipes<crate::Platform>,
-                        >(
-                            child_fd
-                        ) {
+                        if let Ok(typed) = rds
+                            .fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(child_fd)
+                        {
                             drop(rds);
                             let _ = self.global.pipes.undrain(&typed, drained);
                         } else {
@@ -6076,17 +6072,15 @@ impl<FS: ShimFS> Task<FS> {
     /// After writing the checkpoint, the task marks itself as exiting so that
     /// `prepare_to_run_guest()` returns `false` and the sandbox process
     /// terminates cleanly.
-    pub(crate) fn checkpoint_to_file(
-        &self,
-        ctx: &litebox_common_linux::ExecutionContext,
-        image_path: &str,
-    ) -> bool {
+    pub(crate) fn checkpoint_to_fd(&self, ctx: &litebox_common_linux::ExecutionContext) -> bool {
         use super::fork_snapshot::{ForkRejectReasons, ForkSnapshot};
 
         // Signal sibling threads to save their execution state before parking.
         {
             let ps = self.process_state.borrow();
-            ps.vfork_parking.checkpoint_mode.store(true, core::sync::atomic::Ordering::Release);
+            ps.vfork_parking
+                .checkpoint_mode
+                .store(true, core::sync::atomic::Ordering::Release);
         }
 
         // Park sibling threads for a consistent snapshot (same as true fork).
@@ -6161,19 +6155,17 @@ impl<FS: ShimFS> Task<FS> {
 
         litebox::log_println!(
             self.global.platform,
-            "[CHECKPOINT] pid={}: snapshot serialized ({} bytes), writing to {}",
+            "[CHECKPOINT] pid={}: snapshot serialized ({} bytes), writing to pre-opened fd",
             self.pid,
             snapshot_bytes.len(),
-            image_path,
         );
 
-        // Write the checkpoint image to disk using raw libc (no_std).
-        if !crate::checkpoint::write_file(image_path, &snapshot_bytes) {
+        // Write the checkpoint image to the pre-opened fd (no file open needed).
+        if !crate::checkpoint::write_to_fd(&snapshot_bytes) {
             litebox::log_println!(
                 self.global.platform,
-                "[CHECKPOINT] pid={}: failed to write checkpoint to {}",
+                "[CHECKPOINT] pid={}: failed to write checkpoint to pre-opened fd",
                 self.pid,
-                image_path,
             );
             return false;
         }

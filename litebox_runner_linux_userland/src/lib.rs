@@ -513,12 +513,16 @@ pub fn run(mut cli_args: CliArgs) -> Result<i32> {
     litebox_platform_multiplex::set_platform(platform);
 
     // Configure checkpoint support if a state directory is provided.
+    // Pre-open the checkpoint output file *before* seccomp Phase 2 locks
+    // down open/openat.  The fd is stored globally so the shim can write
+    // the snapshot later using only write+close (both allowed at runtime).
     if let Some(ref state_dir) = cli_args.state_dir {
         litebox_platform_linux_userland::set_checkpoint_state_dir(state_dir.clone());
-        let request_path = state_dir.join("checkpoint-request");
-        litebox_shim_linux::checkpoint::set_request_path(
-            request_path.to_string_lossy().into_owned(),
-        );
+        let ckpt_path = state_dir.join("checkpoint.img");
+        let file = std::fs::File::create(&ckpt_path).expect("failed to create checkpoint.img");
+        litebox_shim_linux::checkpoint::set_checkpoint_fd(std::os::fd::IntoRawFd::into_raw_fd(
+            file,
+        ));
     }
 
     // Register runner CLI flags that should be forwarded to worker host

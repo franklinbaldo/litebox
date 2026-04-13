@@ -331,6 +331,7 @@ fn build_worker_runtime_filter(kind: WorkerKind) -> Vec<BpfInsn> {
         libc::SYS_getrandom as u32, // 318 entropy (Rust HashMap seed)
         // ── Network worker ─────────────────────────────────────────
         libc::SYS_ppoll as u32, // 271 TUN/IPC polling on network worker thread
+        libc::SYS_poll as u32,  //   7 poll() variant (used by some Rust runtimes / libc)
         // ── Device / terminal ──────────────────────────────────────
         libc::SYS_ioctl as u32, // 16  TUN device I/O, terminal queries at runtime
         // ── Pipe / thread bookkeeping ──────────────────────────────
@@ -588,6 +589,7 @@ mod tests {
             (libc::SYS_clone3 as u32, "clone3"),
             (libc::SYS_exit_group as u32, "exit_group"),
             (libc::SYS_ppoll as u32, "ppoll"),
+            (libc::SYS_poll as u32, "poll"),
             (libc::SYS_rt_sigaction as u32, "rt_sigaction"),
         ];
         for kind in [WorkerKind::ForkRestore, WorkerKind::Exec] {
@@ -631,8 +633,8 @@ mod tests {
         let insns = build_worker_runtime_filter(WorkerKind::ForkRestore);
         let count = extract_allowed_syscalls(&insns).len();
         assert!(
-            count <= 36,
-            "ForkRestore runtime allowlist has {count} syscalls — expected <= 36."
+            count <= 37,
+            "ForkRestore runtime allowlist has {count} syscalls — expected <= 37."
         );
     }
 
@@ -641,8 +643,8 @@ mod tests {
         let insns = build_worker_runtime_filter(WorkerKind::Exec);
         let count = extract_allowed_syscalls(&insns).len();
         assert!(
-            count <= 37,
-            "Exec runtime allowlist has {count} syscalls — expected <= 37."
+            count <= 38,
+            "Exec runtime allowlist has {count} syscalls — expected <= 38."
         );
     }
 

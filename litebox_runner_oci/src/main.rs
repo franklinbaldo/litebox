@@ -766,29 +766,18 @@ fn main() -> Result<()> {
                 )
             })?;
 
-            // Write the checkpoint request file.
-            // The sandbox monitors this file when it receives SIGUSR1.
+            // The sandbox pre-opens <state_dir>/checkpoint.img at init time
+            // (before seccomp Phase 2 locks down opens).  We just send SIGUSR1
+            // to trigger the snapshot write, then copy the image out.
             let state_dir = root.join("containers").join(&container_id);
-            let request_file = state_dir.join("checkpoint-request");
-            let checkpoint_image_file = image_path.join("checkpoint.img");
-            std::fs::write(
-                &request_file,
-                checkpoint_image_file.to_string_lossy().as_ref(),
-            )
-            .with_context(|| {
-                format!(
-                    "failed to write checkpoint request: {}",
-                    request_file.display()
-                )
-            })?;
+            let state_checkpoint = state_dir.join("checkpoint.img");
+            let final_checkpoint = image_path.join("checkpoint.img");
 
             // Send SIGUSR1 to the sandbox process to trigger checkpoint.
             // SAFETY: kill() is a standard POSIX syscall and pid is a valid PID.
             #[allow(clippy::cast_possible_wrap)]
             let ret = unsafe { libc::kill(pid as i32, libc::SIGUSR1) };
             if ret != 0 {
-                // Clean up request file
-                let _ = std::fs::remove_file(&request_file);
                 anyhow::bail!(
                     "failed to send SIGUSR1 to container process {pid}: {}",
                     std::io::Error::last_os_error()
@@ -811,7 +800,6 @@ fn main() -> Result<()> {
                     break;
                 }
                 if start.elapsed() > timeout {
-                    let _ = std::fs::remove_file(&request_file);
                     anyhow::bail!(
                         "timeout waiting for container {container_id} to checkpoint (PID {pid})"
                     );
@@ -819,32 +807,39 @@ fn main() -> Result<()> {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
 
-            // Clean up
-            let _ = std::fs::remove_file(&request_file);
-
             // Update container state to stopped
             let _ = lifecycle.state_manager().update(&container_id, |s| {
                 s.status = litebox_runner_oci::state::Status::Stopped;
                 s.exit_code = Some(0);
             });
 
-            // Verify checkpoint file was written
-            if checkpoint_image_file.exists() {
-                let metadata = std::fs::metadata(&checkpoint_image_file)?;
+            // Copy checkpoint from state_dir to the user-specified image path.
+            if state_checkpoint.exists() {
+                std::fs::copy(&state_checkpoint, &final_checkpoint).with_context(|| {
+                    format!(
+                        "failed to copy checkpoint from {} to {}",
+                        state_checkpoint.display(),
+                        final_checkpoint.display()
+                    )
+                })?;
+                // Clean up the state_dir copy.
+                let _ = std::fs::remove_file(&state_checkpoint);
+
+                let metadata = std::fs::metadata(&final_checkpoint)?;
                 tracing::info!(
-                    path = %checkpoint_image_file.display(),
+                    path = %final_checkpoint.display(),
                     size = metadata.len(),
                     "checkpoint image written"
                 );
                 eprintln!(
                     "checkpoint: {} ({} bytes)",
-                    checkpoint_image_file.display(),
+                    final_checkpoint.display(),
                     metadata.len()
                 );
             } else {
                 anyhow::bail!(
                     "checkpoint image not found at {} — sandbox may have failed to write it",
-                    checkpoint_image_file.display()
+                    state_checkpoint.display()
                 );
             }
 

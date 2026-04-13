@@ -59,10 +59,8 @@ impl<FS: ShimFS> Task<FS> {
             // check_for_interrupt which may have consumed the signal earlier).
             if self.checkpoint_requested.get() {
                 self.checkpoint_requested.set(false);
-                if let Some(request_path) = crate::checkpoint::get_request_path()
-                    && let Some(image_path) = crate::checkpoint::read_request_file(&request_path)
-                {
-                    self.checkpoint_to_file(ctx, &image_path);
+                if crate::checkpoint::is_configured() {
+                    self.checkpoint_to_fd(ctx);
                 }
             }
             let _ = self.drain_one_local_control_plane_message();

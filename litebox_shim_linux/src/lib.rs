@@ -1302,13 +1302,13 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 }
             }
 
-            sibling_thread.init_state.set(
-                syscalls::process::ThreadInitState::ForkRestore {
+            sibling_thread
+                .init_state
+                .set(syscalls::process::ThreadInitState::ForkRestore {
                     exec_ctx: alloc::boxed::Box::new(sibling_exec_ctx),
                     tls_base: sibling_snap.tls_base.map(rb),
                     set_child_tid: sibling_snap.set_child_tid.map(rb),
-                },
-            );
+                });
 
             let sibling_task = Task {
                 global: self.global.clone(),
@@ -1342,9 +1342,9 @@ impl<FS: ShimFS> LinuxShim<FS> {
                     .platform
                     .spawn_thread(
                         &spawn_ctx,
-                        alloc::boxed::Box::new(
-                            syscalls::process::NewThreadArgs { task: sibling_task },
-                        ),
+                        alloc::boxed::Box::new(syscalls::process::NewThreadArgs {
+                            task: sibling_task,
+                        }),
                     )
                     .expect("failed to spawn restored sibling thread");
             }
