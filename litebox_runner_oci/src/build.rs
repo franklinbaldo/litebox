@@ -104,6 +104,82 @@ pub fn build(instructions: &[Instruction], context_dir: &Path, output_dir: &Path
 }
 
 // ---------------------------------------------------------------------------
+// Public: prepare a bundle from an OCI image (no Dockerfile needed)
+// ---------------------------------------------------------------------------
+
+/// Pull an OCI container image and prepare a ready-to-run bundle directory.
+///
+/// This is the `--image` path for `litebox-oci run`: pull the image, extract
+/// rootfs, restore directory symlinks, write `/etc/resolv.conf`, build
+/// `config.json` from the image's metadata, and optionally override the
+/// command (ENTRYPOINT+CMD).
+///
+/// Returns the path to the prepared bundle directory (a tempdir under
+/// `output_dir`).
+#[cfg(target_arch = "x86_64")]
+pub fn prepare_image_bundle(
+    image: &str,
+    output_dir: &Path,
+    command_override: Option<&[String]>,
+) -> Result<PathBuf> {
+    eprintln!("[RUN] Pulling image: {image}");
+    let extracted = litebox_packager::oci::pull_and_extract(image, true)
+        .with_context(|| format!("failed to pull image: {image}"))?;
+
+    let bundle_dir = output_dir.to_path_buf();
+    let rootfs_dir = bundle_dir.join("rootfs");
+    fs::create_dir_all(&rootfs_dir)
+        .with_context(|| format!("failed to create rootfs dir: {}", rootfs_dir.display()))?;
+
+    eprintln!("[RUN] Extracting rootfs...");
+    copy_dir_recursive(&extracted.rootfs_path, &rootfs_dir)
+        .context("failed to copy image rootfs")?;
+
+    restore_directory_symlinks(&extracted.symlinks, &rootfs_dir)?;
+    ensure_resolv_conf(&rootfs_dir)?;
+
+    // Build metadata from image config.
+    let config = &extracted.config;
+    let mut metadata = ImageMetadata::default();
+
+    if let Some(ref env) = config.env {
+        metadata.env.clone_from(env);
+    }
+    if let Some(ref working_dir) = config.working_dir {
+        metadata.working_dir = Some(working_dir.clone());
+    }
+    if let Some(ref entrypoint) = config.entrypoint {
+        metadata.entrypoint = Some(entrypoint.clone());
+    }
+    if let Some(ref cmd) = config.cmd {
+        metadata.cmd = Some(cmd.clone());
+    }
+
+    // Apply command override: replaces both ENTRYPOINT and CMD so the user
+    // gets exactly the command they asked for.
+    if let Some(args) = command_override
+        && !args.is_empty()
+    {
+        metadata.entrypoint = None;
+        metadata.cmd = Some(args.to_vec());
+    }
+
+    write_config_json(&bundle_dir, &metadata)?;
+
+    eprintln!("[RUN] Bundle ready at {}", bundle_dir.display());
+    Ok(bundle_dir)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn prepare_image_bundle(
+    image: &str,
+    _output_dir: &Path,
+    _command_override: Option<&[String]>,
+) -> Result<PathBuf> {
+    bail!("pulling images is only supported on x86_64 (requested: {image})");
+}
+
+// ---------------------------------------------------------------------------
 // Helper: validate source path is within build context
 // ---------------------------------------------------------------------------
 

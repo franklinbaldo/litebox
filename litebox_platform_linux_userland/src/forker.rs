@@ -1333,6 +1333,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn fork_request_large_collections() {
         let req = ForkRequest {
             kind: ForkRequestKind::ForkRestore,
@@ -1354,7 +1355,7 @@ mod tests {
             pipe_bridges: (0..10)
                 .map(|i| (i as usize * 5, i as u8, i % 2 == 0))
                 .collect(),
-            local_pipes: (0..5)
+            local_pipes: (0..5u32)
                 .map(|i| (i as usize, i as usize + 100, i as u8, i * 0x100, i * 0x200))
                 .collect(),
         };
@@ -1521,10 +1522,10 @@ mod tests {
     #[test]
     fn worker_exec_params_empty_strings() {
         let params = WorkerExecParams {
-            guest_binary_path: "".to_string(),
+            guest_binary_path: String::new(),
             argv: vec![],
             envp: vec![],
-            cwd: "".to_string(),
+            cwd: String::new(),
             guest_pid: 0,
             guest_ppid: 0,
             guest_uid: 0,

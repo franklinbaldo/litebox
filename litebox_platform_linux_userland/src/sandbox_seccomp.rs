@@ -465,9 +465,7 @@ mod tests {
         for (nr, name) in &dangerous {
             assert!(
                 !syscall_nrs.contains(nr),
-                "{} (nr {}) must not be in allowlist",
-                name,
-                nr
+                "{name} (nr {nr}) must not be in allowlist",
             );
         }
     }
@@ -569,9 +567,7 @@ mod tests {
             for (nr, name) in &init_only {
                 assert!(
                     !syscall_nrs.contains(nr),
-                    "init-only syscall {} (nr {}) must not be in runtime filter",
-                    name,
-                    nr
+                    "init-only syscall {name} (nr {nr}) must not be in runtime filter",
                 );
             }
         }
@@ -598,9 +594,7 @@ mod tests {
             for (nr, name) in &required {
                 assert!(
                     syscall_nrs.contains(nr),
-                    "required runtime syscall {} (nr {}) missing from filter",
-                    name,
-                    nr
+                    "required runtime syscall {name} (nr {nr}) missing from filter",
                 );
             }
         }
@@ -660,9 +654,8 @@ mod tests {
             for nr in &runtime_syscalls {
                 assert!(
                     forker_syscalls.contains(nr),
-                    "runtime syscall nr {} not found in forker filter — \
+                    "runtime syscall nr {nr} not found in forker filter — \
                      runtime filter must be a subset of the forker filter",
-                    nr
                 );
             }
         }

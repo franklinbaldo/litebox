@@ -564,7 +564,7 @@ mod tests {
     #[test]
     fn test_try_wait_exit_code() {
         // Spawn a real child process that exits with code 42
-        let child = std::process::Command::new("/bin/sh")
+        let mut child = std::process::Command::new("/bin/sh")
             .args(["-c", "exit 42"])
             .spawn()
             .unwrap();
@@ -575,17 +575,20 @@ mod tests {
 
         let code = StateManager::try_wait_exit_code(pid);
         assert_eq!(code, Some(42));
+        // Reap the child to avoid zombie.
+        let _ = child.wait();
     }
 
     #[test]
     fn test_try_wait_exit_code_zero() {
-        let child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
         let pid = child.id();
 
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         let code = StateManager::try_wait_exit_code(pid);
         assert_eq!(code, Some(0));
+        let _ = child.wait();
     }
 
     #[test]

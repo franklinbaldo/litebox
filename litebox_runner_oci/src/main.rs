@@ -146,13 +146,21 @@ enum Command {
     },
 
     /// Create and immediately run a container (convenience command)
+    ///
+    /// Either `--bundle` (pre-built OCI bundle) or `--image` (pull and run
+    /// an OCI container image directly) must be provided.
     Run {
         /// Path to the OCI bundle directory
-        #[clap(short, long)]
-        bundle: PathBuf,
+        #[clap(short, long, group = "source")]
+        bundle: Option<PathBuf>,
 
-        /// Container ID
-        container_id: String,
+        /// OCI container image to pull and run directly (e.g., "alpine:3.21",
+        /// "ghcr.io/org/image:tag"). Mutually exclusive with --bundle.
+        #[clap(long, group = "source")]
+        image: Option<String>,
+
+        /// Container ID (auto-generated when using --image if not provided)
+        container_id: Option<String>,
 
         /// Set environment variables (can be specified multiple times)
         #[clap(short, long, value_name = "KEY=VALUE")]
@@ -166,6 +174,12 @@ enum Command {
         /// Requires a pre-configured TUN device on the host.
         #[clap(long, value_name = "DEVICE")]
         tun_device: Option<String>,
+
+        /// Command and arguments to run in the container, overriding the
+        /// image's CMD (or ENTRYPOINT+CMD when using --image).
+        /// Specify after `--`, e.g.: litebox-oci run --image alpine -- /bin/echo hello
+        #[clap(last = true)]
+        command: Vec<String>,
     },
 
     /// Execute a command in a container's rootfs (simplified exec)
@@ -632,21 +646,57 @@ fn main() -> Result<()> {
 
         Command::Run {
             bundle,
+            image,
             container_id,
             env,
             env_file,
             tun_device,
+            command,
         } => {
+            // Resolve container_id: use provided value or auto-generate.
+            let container_id = container_id
+                .unwrap_or_else(|| format!("litebox-{}", &uuid::Uuid::new_v4().to_string()[..8]));
+
+            // Determine the bundle path: either from --bundle or by pulling --image.
+            // A tempdir is used for --image bundles so it is cleaned up on exit.
+            let _temp_dir; // keep alive for the duration of the run
+            let bundle = match (bundle, image) {
+                (Some(b), None) => {
+                    _temp_dir = None;
+                    b.canonicalize()
+                        .with_context(|| format!("bundle path not found: {}", b.display()))?
+                }
+                (None, Some(ref img)) => {
+                    let td = tempfile::tempdir()
+                        .context("failed to create temp dir for image bundle")?;
+                    let cmd_override = if command.is_empty() {
+                        None
+                    } else {
+                        Some(command.as_slice())
+                    };
+                    let bundle_path = litebox_runner_oci::build::prepare_image_bundle(
+                        img,
+                        td.path(),
+                        cmd_override,
+                    )?;
+                    _temp_dir = Some(td);
+                    bundle_path
+                }
+                (None, None) => {
+                    anyhow::bail!("either --bundle or --image must be provided");
+                }
+                (Some(_), Some(_)) => {
+                    // clap's `group` should prevent this, but be defensive.
+                    anyhow::bail!("--bundle and --image are mutually exclusive");
+                }
+            };
+
             tracing::info!(
                 container_id = %container_id,
                 bundle = %bundle.display(),
                 tun_device = ?tun_device,
                 "running container"
             );
-
-            let bundle = bundle
-                .canonicalize()
-                .with_context(|| format!("bundle path not found: {}", bundle.display()))?;
 
             // Set up network configuration
             let network = litebox_runner_oci::NetworkConfig {
