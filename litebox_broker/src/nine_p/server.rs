@@ -253,6 +253,9 @@ impl Server {
                 OwnedRequest::Remove { .. } => "remove",
                 OwnedRequest::Flush => "flush",
                 OwnedRequest::Readlink { .. } => "readlink",
+                OwnedRequest::Symlink { .. } => "symlink",
+                OwnedRequest::Link { .. } => "link",
+                OwnedRequest::Mknod { .. } => "mknod",
                 OwnedRequest::Unknown => "unknown",
             };
             *op_counts.entry(op_name).or_insert(0) += 1;
@@ -560,6 +563,21 @@ impl Server {
             OwnedRequest::Remove { fid } => self.handle_remove(fcall::Tremove { fid }),
             OwnedRequest::Flush => Fcall::Rflush(fcall::Rflush {}),
             OwnedRequest::Readlink { fid } => self.handle_readlink(fid),
+            OwnedRequest::Symlink {
+                fid,
+                name,
+                symtgt,
+                gid,
+            } => self.handle_symlink(fid, name, symtgt, gid),
+            OwnedRequest::Link { dfid, fid, name } => self.handle_link(dfid, fid, name),
+            OwnedRequest::Mknod {
+                dfid,
+                name,
+                mode,
+                major,
+                minor,
+                gid,
+            } => self.handle_mknod(dfid, name, mode, major, minor, gid),
             OwnedRequest::Unknown => error_response(libc::ENOSYS as u32),
         }
     }
@@ -735,11 +753,28 @@ impl Server {
             };
 
             let is_final = wqids.len() + 1 == wnames.len();
+
+            // For the final walk component, if it is a symlink, do NOT
+            // follow it.  Per 9P2000.L semantics the walk should return
+            // the symlink's own QID so that operations like rename/unlink
+            // act on the directory entry (the symlink itself) rather than
+            // its target.  The `readlink_path` is stored so that callers
+            // like handle_readlink can return the target, and
+            // handle_rename can rename the symlink entry.
             if is_final
                 && let Ok(meta) = fs::symlink_metadata(&next)
                 && meta.file_type().is_symlink()
             {
+                // Containment check on the symlink entry itself (not target).
+                if !next.starts_with(&self.root)
+                    && !self.mount_table.is_under_mount(&next)
+                {
+                    break;
+                }
                 readlink_path = Some(next.clone());
+                wqids.push(metadata_to_qid(&meta));
+                current_path = next;
+                continue;
             }
 
             // Try to resolve via mount table before canonicalization.
@@ -795,6 +830,11 @@ impl Server {
         // Phase 3: Write result — only update FID if ALL components were walked
         if wqids.len() == wnames.len() {
             let qid = *wqids.last().unwrap();
+            // When the final walk component is a symlink, `current_path`
+            // is the symlink entry itself (not the resolved target), so
+            // it is NOT canonical.  Mark it accordingly so that
+            // operations like lopen will re-canonicalize before opening.
+            let is_canonical = readlink_path.is_none();
             if fid == new_fid {
                 // In-place update
                 let fids = read_lock(&self.fids, "fids");
@@ -809,7 +849,7 @@ impl Server {
                     state.patched_data = None;
                     state.patched_offset = 0;
                     state.is_open = false;
-                    state.is_canonical = true;
+                    state.is_canonical = is_canonical;
                 }
             } else {
                 let mut fids = write_lock(&self.fids, "fids");
@@ -829,7 +869,7 @@ impl Server {
                         patched_offset: 0,
                         qid,
                         is_open: false,
-                        is_canonical: true,
+                        is_canonical,
                     })),
                 );
             }
@@ -1433,6 +1473,181 @@ impl Server {
         }
     }
 
+    /// Handle Tsymlink — create a symbolic link.
+    fn handle_symlink<'a>(
+        &self,
+        fid: u32,
+        name: String,
+        symtgt: String,
+        _gid: u32,
+    ) -> Fcall<'a> {
+        let fid_arc = match self.get_fid(fid) {
+            Ok(fid_arc) => fid_arc,
+            Err(errno) => return error_response(errno),
+        };
+
+        if name.contains('/') || name.contains('\0') || name == "." || name == ".." {
+            return error_response(libc::EINVAL as u32);
+        }
+
+        let (dir_path, is_canonical) = {
+            let state = read_lock(&fid_arc, "fid");
+            (state.path.clone(), state.is_canonical)
+        };
+
+        let resolved_parent = match self.resolve_fid_path(&dir_path, is_canonical) {
+            Ok(p) => p,
+            Err(errno) => return error_response(errno),
+        };
+        let target = resolved_parent.join(&name);
+        if !target.starts_with(&self.root) {
+            return error_response(libc::EPERM as u32);
+        }
+
+        if self.policy.check(Action::Symlink, Some(&target)) == Decision::Deny {
+            return error_response(libc::EPERM as u32);
+        }
+
+        // Create the symlink.  The target string is stored as-is (may be
+        // relative or absolute from the guest's perspective).
+        if let Err(e) = std::os::unix::fs::symlink(&symtgt, &target) {
+            return io_error_response(e);
+        }
+
+        match path_to_qid(&target) {
+            Ok(qid) => Fcall::Rsymlink(fcall::Rsymlink { qid }),
+            Err(errno) => error_response(errno),
+        }
+    }
+
+    /// Handle Tlink — create a hard link.
+    fn handle_link<'a>(&self, dfid: u32, fid: u32, name: String) -> Fcall<'a> {
+        let dfid_arc = match self.get_fid(dfid) {
+            Ok(fid_arc) => fid_arc,
+            Err(errno) => return error_response(errno),
+        };
+        let fid_arc = match self.get_fid(fid) {
+            Ok(fid_arc) => fid_arc,
+            Err(errno) => return error_response(errno),
+        };
+
+        if name.contains('/') || name.contains('\0') || name == "." || name == ".." {
+            return error_response(libc::EINVAL as u32);
+        }
+
+        let (dir_path, dir_is_canonical) = {
+            let state = read_lock(&dfid_arc, "fid");
+            (state.path.clone(), state.is_canonical)
+        };
+        let (src_path, src_is_canonical) = {
+            let state = read_lock(&fid_arc, "fid");
+            (state.path.clone(), state.is_canonical)
+        };
+
+        let resolved_parent = match self.resolve_fid_path(&dir_path, dir_is_canonical) {
+            Ok(p) => p,
+            Err(errno) => return error_response(errno),
+        };
+        let resolved_src = match self.resolve_fid_path(&src_path, src_is_canonical) {
+            Ok(p) => p,
+            Err(errno) => return error_response(errno),
+        };
+
+        let link_path = resolved_parent.join(&name);
+        if !link_path.starts_with(&self.root) {
+            return error_response(libc::EPERM as u32);
+        }
+        if !resolved_src.starts_with(&self.root) {
+            return error_response(libc::EPERM as u32);
+        }
+
+        if self.policy.check(Action::Link, Some(&link_path)) == Decision::Deny {
+            return error_response(libc::EPERM as u32);
+        }
+
+        if let Err(e) = fs::hard_link(&resolved_src, &link_path) {
+            return io_error_response(e);
+        }
+
+        Fcall::Rlink(fcall::Rlink {})
+    }
+
+    /// Handle Tmknod — create a device special file or FIFO.
+    ///
+    /// In a sandboxed container without real device access we create a regular
+    /// file stub with the right permissions instead of calling the real `mknod`
+    /// syscall (which requires `CAP_MKNOD`).
+    fn handle_mknod<'a>(
+        &self,
+        dfid: u32,
+        name: String,
+        mode: u32,
+        _major: u32,
+        _minor: u32,
+        _gid: u32,
+    ) -> Fcall<'a> {
+        let fid_arc = match self.get_fid(dfid) {
+            Ok(fid_arc) => fid_arc,
+            Err(errno) => return error_response(errno),
+        };
+
+        if name.contains('/') || name.contains('\0') || name == "." || name == ".." {
+            return error_response(libc::EINVAL as u32);
+        }
+
+        let (dir_path, is_canonical) = {
+            let state = read_lock(&fid_arc, "fid");
+            (state.path.clone(), state.is_canonical)
+        };
+
+        let resolved_parent = match self.resolve_fid_path(&dir_path, is_canonical) {
+            Ok(p) => p,
+            Err(errno) => return error_response(errno),
+        };
+        let target = resolved_parent.join(&name);
+        if !target.starts_with(&self.root) {
+            return error_response(libc::EPERM as u32);
+        }
+
+        if self.policy.check(Action::Mknod, Some(&target)) == Decision::Deny {
+            return error_response(libc::EPERM as u32);
+        }
+
+        // Check the file type from mode bits.
+        let s_ifmt = mode & 0o170000;
+        let is_fifo = s_ifmt == 0o010000; // S_IFIFO
+
+        if is_fifo {
+            // Create a FIFO (named pipe) — this doesn't require CAP_MKNOD.
+            let ret = unsafe {
+                let c_path = match std::ffi::CString::new(
+                    target.as_os_str().as_encoded_bytes(),
+                ) {
+                    Ok(c) => c,
+                    Err(_) => return error_response(libc::EINVAL as u32),
+                };
+                libc::mkfifo(c_path.as_ptr(), mode & 0o7777)
+            };
+            if ret != 0 {
+                return error_response(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO) as u32);
+            }
+        } else {
+            // For device nodes (block/char), create a regular file stub.
+            // Real mknod requires CAP_MKNOD which we don't have.
+            if let Err(e) = fs::File::create(&target) {
+                return io_error_response(e);
+            }
+            // Apply permissions
+            let perms = fs_compat::permissions_from_mode(mode & 0o7777);
+            let _ = fs::set_permissions(&target, perms);
+        }
+
+        match path_to_qid(&target) {
+            Ok(qid) => Fcall::Rmknod(fcall::Rmknod { qid }),
+            Err(errno) => error_response(errno),
+        }
+    }
+
     fn handle_unlinkat<'a>(&self, dfid: u32, name: String, flags: u32) -> Fcall<'a> {
         let fid_arc = match self.get_fid(dfid) {
             Ok(fid_arc) => fid_arc,
@@ -1504,19 +1719,33 @@ impl Server {
             (src_arc, dst_arc)
         };
 
-        let (src_path, src_canonical) = {
+        let (src_path, src_canonical, src_readlink_path) = {
             let src = read_lock(&src_arc, "fid");
-            (src.path.clone(), src.is_canonical)
+            (src.path.clone(), src.is_canonical, src.readlink_path.clone())
         };
         let (dst_dir_path, dst_canonical) = {
             let dst = read_lock(&dst_arc, "fid");
             (dst.path.clone(), dst.is_canonical)
         };
 
-        // Resolve symlinks on both source and destination
-        let resolved_src = match self.resolve_fid_path(&src_path, src_canonical) {
-            Ok(p) => p,
-            Err(errno) => return error_response(errno),
+        // For rename, use the original symlink path (readlink_path) if the
+        // source FID refers to a symlink. `rename(2)` operates on directory
+        // entries, not on symlink targets, so we must rename the symlink
+        // itself rather than the file it points to.
+        // The readlink_path is already a valid host-side path set during walk,
+        // so we use it directly without re-canonicalization (which would follow
+        // the symlink and give us the target instead).
+        let resolved_src = if let Some(ref rl_path) = src_readlink_path {
+            if rl_path.starts_with(&self.root) || self.mount_table.is_under_mount(rl_path) {
+                rl_path.clone()
+            } else {
+                return error_response(libc::EPERM as u32);
+            }
+        } else {
+            match self.resolve_fid_path(&src_path, src_canonical) {
+                Ok(p) => p,
+                Err(errno) => return error_response(errno),
+            }
         };
         let resolved_dst_dir = match self.resolve_fid_path(&dst_dir_path, dst_canonical) {
             Ok(p) => p,
@@ -1540,6 +1769,7 @@ impl Server {
                 // Update the FID's path to the new location
                 let mut state = write_lock(&src_arc, "fid");
                 state.path = dst;
+                state.readlink_path = None;
                 Fcall::Rrename(fcall::Rrename {})
             }
             Err(e) => io_error_response(e),
@@ -1915,6 +2145,25 @@ enum OwnedRequest {
     Readlink {
         fid: u32,
     },
+    Symlink {
+        fid: u32,
+        name: String,
+        symtgt: String,
+        gid: u32,
+    },
+    Link {
+        dfid: u32,
+        fid: u32,
+        name: String,
+    },
+    Mknod {
+        dfid: u32,
+        name: String,
+        mode: u32,
+        major: u32,
+        minor: u32,
+        gid: u32,
+    },
     Unknown,
 }
 
@@ -2001,6 +2250,25 @@ impl OwnedRequest {
             Fcall::Tremove(r) => OwnedRequest::Remove { fid: r.fid },
             Fcall::Tflush(_) => OwnedRequest::Flush,
             Fcall::Treadlink(r) => OwnedRequest::Readlink { fid: r.fid },
+            Fcall::Tsymlink(r) => OwnedRequest::Symlink {
+                fid: r.fid,
+                name: String::from_utf8_lossy(&r.name).into_owned(),
+                symtgt: String::from_utf8_lossy(&r.symtgt).into_owned(),
+                gid: r.gid,
+            },
+            Fcall::Tlink(r) => OwnedRequest::Link {
+                dfid: r.dfid,
+                fid: r.fid,
+                name: String::from_utf8_lossy(&r.name).into_owned(),
+            },
+            Fcall::Tmknod(r) => OwnedRequest::Mknod {
+                dfid: r.dfid,
+                name: String::from_utf8_lossy(&r.name).into_owned(),
+                mode: r.mode,
+                major: r.major,
+                minor: r.minor,
+                gid: r.gid,
+            },
             _ => OwnedRequest::Unknown,
         }
     }

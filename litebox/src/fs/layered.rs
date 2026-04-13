@@ -18,9 +18,9 @@ use crate::path::Arg;
 use crate::sync;
 
 use super::errors::{
-    ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RenameError, RmdirError, SeekError, TruncateError, UnlinkError,
-    WriteError,
+    ChmodError, ChownError, CloseError, FileStatusError, LinkError, MkdirError, OpenError,
+    PathError, ReadDirError, ReadError, RenameError, RmdirError, SeekError, SymlinkError,
+    TruncateError, UnlinkError, WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence};
 
@@ -1874,6 +1874,73 @@ impl<
         self.mkdir_migrating_ancestor_dirs(&path)?;
         // And then now we can make the upper directory.
         self.upper.mkdir(path, mode)
+    }
+
+    fn symlink(
+        &self,
+        target: impl crate::path::Arg,
+        linkpath: impl crate::path::Arg,
+    ) -> Result<(), SymlinkError> {
+        let target_str = target.as_rust_str().map_err(|_| SymlinkError::PathError(PathError::InvalidPathname))?;
+        let linkpath = self.absolute_path(linkpath)?;
+        if self.has_tombstoned_ancestor(&linkpath)? {
+            return Err(PathError::NoSuchFileOrDirectory)?;
+        }
+        // When LowerLayerWritableFiles, create symlink on lower layer first
+        // so it persists on the host filesystem.
+        if matches!(
+            self.layering_semantics,
+            LayeringSemantics::LowerLayerWritableFiles
+        ) {
+            match self.lower.symlink(target_str, linkpath.as_str()) {
+                Ok(()) => return Ok(()),
+                Err(
+                    SymlinkError::PathError(
+                        PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                    )
+                    | SymlinkError::ReadOnlyFileSystem
+                    | SymlinkError::NotSupported
+                    | SymlinkError::Io,
+                ) => {
+                    // Fall through to upper layer.
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        self.upper.symlink(target_str, linkpath)
+    }
+
+    fn link(
+        &self,
+        oldpath: impl crate::path::Arg,
+        newpath: impl crate::path::Arg,
+    ) -> Result<(), LinkError> {
+        let oldpath = self.absolute_path(oldpath)?;
+        let newpath = self.absolute_path(newpath)?;
+        if self.has_tombstoned_ancestor(&newpath)? {
+            return Err(PathError::NoSuchFileOrDirectory)?;
+        }
+        // When LowerLayerWritableFiles, create hard link on lower layer first.
+        if matches!(
+            self.layering_semantics,
+            LayeringSemantics::LowerLayerWritableFiles
+        ) {
+            match self.lower.link(oldpath.as_str(), newpath.as_str()) {
+                Ok(()) => return Ok(()),
+                Err(
+                    LinkError::PathError(
+                        PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                    )
+                    | LinkError::ReadOnlyFileSystem
+                    | LinkError::NotSupported
+                    | LinkError::Io,
+                ) => {
+                    // Fall through to upper layer.
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        self.upper.link(oldpath.as_str(), newpath)
     }
 
     fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), RmdirError> {

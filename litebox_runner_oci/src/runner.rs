@@ -1100,7 +1100,7 @@ pub fn run_build_step(
         rewrite_syscalls: false,
         interception_backend: InterceptionBackend::Rewriter,
         tun_device_name: None,
-        network_broker: None,
+        network_broker: Some(broker_socket_str.clone()),
         program_from_tar: false,
         nine_p_broker: Some(broker_socket_str),
         working_directory: working_dir.map(String::from),

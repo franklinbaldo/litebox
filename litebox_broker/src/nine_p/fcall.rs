@@ -650,10 +650,10 @@ Serializer! {
     /// Symlink request
     #[derive(Clone, Debug)]
     pub(crate) struct Tsymlink<'a> {
-        fid: u32,
-        name: FcallStr<'a>,
-        symtgt: FcallStr<'a>,
-        gid: u32,
+        pub(crate) fid: u32,
+        pub(crate) name: FcallStr<'a>,
+        pub(crate) symtgt: FcallStr<'a>,
+        pub(crate) gid: u32,
     }
 }
 
@@ -661,7 +661,7 @@ Serializer! {
     /// Symlink response
     #[derive(Clone, Debug)]
     pub(crate) struct Rsymlink {
-        qid: Qid,
+        pub(crate) qid: Qid,
     }
 }
 
@@ -669,12 +669,12 @@ Serializer! {
     /// Mknod request
     #[derive(Clone, Debug)]
     pub(crate) struct Tmknod<'a> {
-        dfid: u32,
-        name: FcallStr<'a>,
-        mode: u32,
-        major: u32,
-        minor: u32,
-        gid: u32,
+        pub(crate) dfid: u32,
+        pub(crate) name: FcallStr<'a>,
+        pub(crate) mode: u32,
+        pub(crate) major: u32,
+        pub(crate) minor: u32,
+        pub(crate) gid: u32,
     }
 }
 
@@ -682,7 +682,7 @@ Serializer! {
     /// Mknod response
     #[derive(Clone, Debug)]
     pub(crate) struct Rmknod {
-        qid: Qid,
+        pub(crate) qid: Qid,
     }
 }
 
@@ -919,9 +919,9 @@ Serializer! {
     /// Link request
     #[derive(Clone, Debug)]
     pub(crate) struct Tlink<'a> {
-        dfid: u32,
-        fid: u32,
-        name: FcallStr<'a>,
+        pub(crate) dfid: u32,
+        pub(crate) fid: u32,
+        pub(crate) name: FcallStr<'a>,
     }
 }
 

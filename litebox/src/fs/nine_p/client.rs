@@ -18,10 +18,10 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 use crate::utils::id_pool::IdPool;
 
-use super::Error;
 use super::fcall::{self, Fcall, FcallStr, GetattrMask, TaggedFcall};
 use super::pending_table::PendingTable;
 use super::transport::{self, Read, Write};
+use super::Error;
 
 /// Fid generator with thread-safe access
 struct FidGenerator {
@@ -897,6 +897,51 @@ impl<Platform: RawSyncPrimitivesProvider, W: Write> Client<Platform, W> {
             Fcall::Treadlink(fcall::Treadlink { fid }),
             |response| match response {
                 Fcall::Rreadlink(r) => Ok(r.target.into_owned()),
+                Fcall::Rlerror(e) => Err(Error::from(e)),
+                _ => Err(Error::InvalidResponse),
+            },
+        )
+    }
+
+    /// Create a symbolic link.
+    ///
+    /// Creates a symlink named `name` in the directory identified by `dfid`,
+    /// pointing to `symtgt`.
+    pub(super) fn symlink(
+        &self,
+        dfid: fcall::Fid,
+        name: &str,
+        symtgt: &str,
+        gid: u32,
+    ) -> Result<fcall::Qid, Error> {
+        self.fcall(
+            Fcall::Tsymlink(fcall::Tsymlink {
+                fid: dfid,
+                name: fcall::FcallStr::Borrowed(name.as_bytes()),
+                symtgt: fcall::FcallStr::Borrowed(symtgt.as_bytes()),
+                gid,
+            }),
+            |response| match response {
+                Fcall::Rsymlink(fcall::Rsymlink { qid }) => Ok(qid),
+                Fcall::Rlerror(e) => Err(Error::from(e)),
+                _ => Err(Error::InvalidResponse),
+            },
+        )
+    }
+
+    /// Create a hard link.
+    ///
+    /// Creates a new directory entry `name` in the directory identified by
+    /// `dfid` that refers to the existing file identified by `fid`.
+    pub(super) fn link(&self, dfid: fcall::Fid, fid: fcall::Fid, name: &str) -> Result<(), Error> {
+        self.fcall(
+            Fcall::Tlink(fcall::Tlink {
+                dfid,
+                fid,
+                name: fcall::FcallStr::Borrowed(name.as_bytes()),
+            }),
+            |response| match response {
+                Fcall::Rlink(fcall::Rlink {}) => Ok(()),
                 Fcall::Rlerror(e) => Err(Error::from(e)),
                 _ => Err(Error::InvalidResponse),
             },

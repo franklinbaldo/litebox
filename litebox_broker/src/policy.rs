@@ -24,6 +24,9 @@ pub enum Action {
     Truncate,
     Seek,
     Close,
+    Symlink,
+    Link,
+    Mknod,
 }
 
 /// Outcome of a policy check.
@@ -49,8 +52,8 @@ pub trait Policy: Send + Sync {
 
 /// A policy that allows only read-only operations.
 ///
-/// Write, Chmod, Mkdir, Rmdir, Unlink, and Truncate are denied.
-/// Open, Read, Stat, ReadDir, Seek, and Close are permitted.
+/// Write, Chmod, Mkdir, Rmdir, Unlink, Truncate, Symlink, Link, and Mknod are
+/// denied.  Open, Read, Stat, ReadDir, Seek, and Close are permitted.
 #[derive(Debug, Default)]
 pub struct ReadOnlyPolicy;
 
@@ -68,7 +71,10 @@ impl Policy for ReadOnlyPolicy {
             | Action::Mkdir
             | Action::Rmdir
             | Action::Unlink
-            | Action::Truncate => Decision::Deny,
+            | Action::Truncate
+            | Action::Symlink
+            | Action::Link
+            | Action::Mknod => Decision::Deny,
         }
     }
 
@@ -97,9 +103,9 @@ impl Policy for AllowAllPolicy {
 /// A policy that is read-only everywhere except for explicitly listed writable
 /// paths (and their children).
 ///
-/// Write, Chmod, Mkdir, Rmdir, Unlink, and Truncate are permitted only when
-/// the operation's path falls under one of the configured writable prefixes.
-/// Everything else follows [`ReadOnlyPolicy`] semantics.
+/// Write, Chmod, Mkdir, Rmdir, Unlink, Truncate, Symlink, Link, and Mknod are
+/// permitted only when the operation's path falls under one of the configured
+/// writable prefixes.  Everything else follows [`ReadOnlyPolicy`] semantics.
 #[derive(Debug)]
 pub struct ReadOnlyWithWritablePaths {
     writable_prefixes: Vec<std::path::PathBuf>,
@@ -138,7 +144,10 @@ impl Policy for ReadOnlyWithWritablePaths {
             | Action::Mkdir
             | Action::Rmdir
             | Action::Unlink
-            | Action::Truncate => {
+            | Action::Truncate
+            | Action::Symlink
+            | Action::Link
+            | Action::Mknod => {
                 if self.path_is_writable(path) {
                     Decision::Allow
                 } else {

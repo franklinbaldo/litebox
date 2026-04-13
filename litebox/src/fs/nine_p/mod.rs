@@ -18,8 +18,9 @@ use thiserror::Error;
 
 use crate::fs::OFlags;
 use crate::fs::errors::{
-    ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ChmodError, ChownError, FileStatusError, LinkError, MkdirError, OpenError, PathError,
+    ReadDirError, ReadError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError,
+    WriteError,
 };
 use crate::fs::nine_p::fcall::Rlerror;
 use crate::path::Arg;
@@ -44,6 +45,7 @@ const EPERM: u32 = 1;
 const ENOENT: u32 = 2;
 const EACCES: u32 = 13;
 const EEXIST: u32 = 17;
+const EXDEV: u32 = 18;
 const ENOTDIR: u32 = 20;
 const EISDIR: u32 = 21;
 const EINVAL: u32 = 22;
@@ -135,6 +137,44 @@ impl From<Error> for MkdirError {
                 _ => MkdirError::Io,
             },
             Error::Io | Error::InvalidResponse | Error::Interrupted => MkdirError::Io,
+        }
+    }
+}
+
+impl From<Error> for SymlinkError {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::InvalidPathname => SymlinkError::PathError(PathError::InvalidPathname),
+            Error::Remote(errno) => match errno {
+                ENOENT => SymlinkError::PathError(PathError::NoSuchFileOrDirectory),
+                EEXIST => SymlinkError::AlreadyExists,
+                EPERM | EACCES => SymlinkError::NoWritePerms,
+                ENOTDIR => SymlinkError::PathError(PathError::ComponentNotADirectory),
+                ENAMETOOLONG => SymlinkError::PathError(PathError::InvalidPathname),
+                EROFS => SymlinkError::ReadOnlyFileSystem,
+                _ => SymlinkError::Io,
+            },
+            Error::Io | Error::InvalidResponse | Error::Interrupted => SymlinkError::Io,
+        }
+    }
+}
+
+impl From<Error> for LinkError {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::InvalidPathname => LinkError::PathError(PathError::InvalidPathname),
+            Error::Remote(errno) => match errno {
+                ENOENT => LinkError::PathError(PathError::NoSuchFileOrDirectory),
+                EEXIST => LinkError::AlreadyExists,
+                EPERM | EACCES => LinkError::NoWritePerms,
+                ENOTDIR => LinkError::PathError(PathError::ComponentNotADirectory),
+                ENAMETOOLONG => LinkError::PathError(PathError::InvalidPathname),
+                EXDEV => LinkError::CrossDevice,
+                EISDIR => LinkError::IsDirectory,
+                EROFS => LinkError::ReadOnlyFileSystem,
+                _ => LinkError::Io,
+            },
+            Error::Io | Error::InvalidResponse | Error::Interrupted => LinkError::Io,
         }
     }
 }
@@ -1936,6 +1976,59 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         }
 
         result.map(|_| ()).map_err(MkdirError::from)
+    }
+
+    fn symlink(
+        &self,
+        target: impl crate::path::Arg,
+        linkpath: impl crate::path::Arg,
+    ) -> Result<(), SymlinkError> {
+        let target_str = target.as_rust_str().map_err(|_| SymlinkError::PathError(PathError::InvalidPathname))?;
+        let linkpath = self.absolute_path(linkpath)?;
+
+        let (parent_fid, name) = self.walk_to_parent(&linkpath)?;
+
+        let result = self.client.symlink(parent_fid, name, target_str, 0);
+        self.client.clunk_async(parent_fid);
+
+        if result.is_ok() {
+            self.invalidate_negative_stat_cache(&[&linkpath]);
+            self.invalidate_parent_stat_cache(&linkpath);
+        }
+
+        result.map(|_| ()).map_err(SymlinkError::from)
+    }
+
+    fn link(
+        &self,
+        oldpath: impl crate::path::Arg,
+        newpath: impl crate::path::Arg,
+    ) -> Result<(), LinkError> {
+        let oldpath = self.absolute_path(oldpath)?;
+        let newpath = self.absolute_path(newpath)?;
+
+        // Walk to the existing file to get a fid.
+        let (old_fid, _qid) = self.walk_to_with_qid(&oldpath)?;
+
+        // Walk to the parent of the new path.
+        let (parent_fid, name) = match self.walk_to_parent(&newpath) {
+            Ok(v) => v,
+            Err(e) => {
+                self.client.clunk_async(old_fid);
+                return Err(LinkError::from(e));
+            }
+        };
+
+        let result = self.client.link(parent_fid, old_fid, name);
+        self.client.clunk_async(parent_fid);
+        self.client.clunk_async(old_fid);
+
+        if result.is_ok() {
+            self.invalidate_negative_stat_cache(&[&newpath]);
+            self.invalidate_parent_stat_cache(&newpath);
+        }
+
+        result.map_err(LinkError::from)
     }
 
     fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), RmdirError> {

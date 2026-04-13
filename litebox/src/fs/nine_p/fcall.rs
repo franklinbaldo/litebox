@@ -624,10 +624,10 @@ Serializer! {
     /// Symlink request
     #[derive(Clone, Debug)]
     pub(super) struct Tsymlink<'a> {
-        fid: u32,
-        name: FcallStr<'a>,
-        symtgt: FcallStr<'a>,
-        gid: u32,
+        pub(super) fid: u32,
+        pub(super) name: FcallStr<'a>,
+        pub(super) symtgt: FcallStr<'a>,
+        pub(super) gid: u32,
     }
 }
 
@@ -635,7 +635,7 @@ Serializer! {
     /// Symlink response
     #[derive(Clone, Debug)]
     pub(super) struct Rsymlink {
-        qid: Qid,
+        pub(super) qid: Qid,
     }
 }
 
@@ -833,9 +833,9 @@ Serializer! {
     /// Link request
     #[derive(Clone, Debug)]
     pub(super) struct Tlink<'a> {
-        dfid: u32,
-        fid: u32,
-        name: FcallStr<'a>,
+        pub(super) dfid: u32,
+        pub(super) fid: u32,
+        pub(super) name: FcallStr<'a>,
     }
 }
 
