@@ -3,8 +3,11 @@
 
 //! OCI-compliant container runtime using LiteBox sandbox.
 
+pub mod build;
+pub mod dockerfile;
 pub mod lifecycle;
 mod runner;
+pub mod spec_gen;
 pub mod state;
 
 pub use runner::CniNetworkConfig;

@@ -1,0 +1,1 @@
+// OCI spec generator — placeholder

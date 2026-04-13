@@ -1622,7 +1622,7 @@ dependencies = [
  "flate2",
  "litebox_syscall_rewriter",
  "oci-client",
- "oci-spec 0.9.0",
+ "oci-spec",
  "rayon",
  "tar",
  "tempfile",
@@ -1775,13 +1775,16 @@ dependencies = [
  "anyhow",
  "clap",
  "exec",
+ "flate2",
  "libc",
  "litebox",
+ "litebox_packager",
  "litebox_runner_linux_userland",
  "nix",
- "oci-spec 0.8.4",
+ "oci-spec",
  "serde",
  "serde_json",
+ "tar",
  "tempfile",
  "tracing",
  "tracing-subscriber",
@@ -2164,7 +2167,7 @@ dependencies = [
  "http-auth",
  "jsonwebtoken",
  "lazy_static",
- "oci-spec 0.9.0",
+ "oci-spec",
  "olpc-cjson",
  "regex",
  "reqwest",
@@ -2175,23 +2178,6 @@ dependencies = [
  "tokio",
  "tracing",
  "unicase",
-]
-
-[[package]]
-name = "oci-spec"
-version = "0.8.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc3da52b83ce3258fbf29f66ac784b279453c2ac3c22c5805371b921ede0d308"
-dependencies = [
- "const_format",
- "derive_builder",
- "getset",
- "regex",
- "serde",
- "serde_json",
- "strum",
- "strum_macros",
- "thiserror",
 ]
 
 [[package]]
