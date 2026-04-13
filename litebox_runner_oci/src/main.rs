@@ -273,6 +273,24 @@ enum Command {
         #[clap(long, value_name = "DEVICE")]
         tun_device: Option<String>,
     },
+
+    /// Build an OCI bundle from a Dockerfile
+    Build {
+        /// Build context directory
+        context: PathBuf,
+
+        /// Path to Dockerfile (default: CONTEXT/Dockerfile)
+        #[clap(short = 'f', long)]
+        file: Option<PathBuf>,
+
+        /// Name for the output bundle
+        #[clap(short, long)]
+        tag: Option<String>,
+
+        /// Output directory for the OCI bundle
+        #[clap(short, long)]
+        output: Option<PathBuf>,
+    },
 }
 
 /// Parse a signal name or number into a signal number.
@@ -918,6 +936,64 @@ fn main() -> Result<()> {
                 s.status = litebox_runner_oci::state::Status::Stopped;
                 s.exit_code = Some(exit_code);
             });
+
+            Ok(())
+        }
+
+        Command::Build {
+            context,
+            file,
+            tag,
+            output,
+        } => {
+            // Determine Dockerfile path
+            let dockerfile_path = file.unwrap_or_else(|| context.join("Dockerfile"));
+            if !dockerfile_path.exists() {
+                eprintln!(
+                    "Error: Dockerfile not found at {}",
+                    dockerfile_path.display()
+                );
+                std::process::exit(1);
+            }
+
+            // Determine output directory
+            let output_dir = if let Some(out) = output {
+                out
+            } else {
+                let name = tag.as_deref().unwrap_or("litebox-build");
+                root.join("builds").join(name)
+            };
+
+            // Parse Dockerfile
+            let instructions = match litebox_runner_oci::dockerfile::parse_file(&dockerfile_path) {
+                Ok(i) => i,
+                Err(e) => {
+                    eprintln!("Error parsing Dockerfile: {e:#}");
+                    std::process::exit(1);
+                }
+            };
+
+            // Create output directory
+            if let Err(e) = std::fs::create_dir_all(&output_dir) {
+                eprintln!("Error creating output directory: {e}");
+                std::process::exit(1);
+            }
+
+            // Run build
+            if let Err(e) = litebox_runner_oci::build::build(
+                &instructions,
+                &context,
+                &output_dir,
+            ) {
+                eprintln!("Build failed: {e:#}");
+                std::process::exit(1);
+            }
+
+            eprintln!("Build complete: {}", output_dir.display());
+            eprintln!(
+                "Run with: litebox-oci run --bundle {} my-container",
+                output_dir.display()
+            );
 
             Ok(())
         }
