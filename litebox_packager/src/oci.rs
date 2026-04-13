@@ -337,9 +337,9 @@ struct DeferredHardLink {
 /// Tracked symlink from a container image layer.
 pub struct DeferredSymlink {
     /// Relative path inside the rootfs (e.g., `usr/lib64/ld-linux-x86-64.so.2`).
-    rel_path: PathBuf,
+    pub rel_path: PathBuf,
     /// Symlink target as stored in the tar (Unix-style, may be relative or absolute).
-    link_target: PathBuf,
+    pub link_target: PathBuf,
 }
 
 /// Extract a tar archive into the rootfs, handling OCI whiteout files.

@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use oci_spec::runtime::Spec;
 
 use litebox_runner_linux_userland::{CliArgs, InterceptionBackend};
@@ -1129,17 +1129,44 @@ pub fn run_build_step(
         local_pipe: vec![],
     };
 
-    // 5. Run the sandbox
-    let result = litebox_runner_linux_userland::run(cli_args);
+    // 5. Run the sandbox in a child process.
+    //
+    // litebox_runner_linux_userland::run() initialises a global platform
+    // singleton that cannot be re-initialised.  By forking, each RUN step
+    // gets its own address space with a fresh singleton.
+    let child_pid = unsafe { libc::fork() };
+    if child_pid < 0 {
+        let _ = broker_child.kill();
+        let _ = broker_child.wait();
+        let _ = std::fs::remove_file(&broker_socket_path);
+        bail!("fork failed for build step");
+    }
+
+    if child_pid == 0 {
+        // Child: run the sandbox, then _exit with the guest exit code.
+        match litebox_runner_linux_userland::run(cli_args) {
+            Ok(code) => std::process::exit(code),
+            Err(_) => std::process::exit(125),
+        }
+    }
+
+    // Parent: wait for child.
+    let mut status: libc::c_int = 0;
+    let rc = unsafe { libc::waitpid(child_pid, &raw mut status, 0) };
 
     // 6. Cleanup
     let _ = broker_child.kill();
     let _ = broker_child.wait();
     let _ = std::fs::remove_file(&broker_socket_path);
 
-    match result {
-        Ok(exit_code) => Ok(exit_code),
-        Err(e) => Err(e).context("build step failed"),
+    if rc < 0 {
+        bail!("waitpid failed for build step child");
+    }
+
+    if libc::WIFEXITED(status) {
+        Ok(libc::WEXITSTATUS(status))
+    } else {
+        bail!("build step child terminated abnormally (status: {status})")
     }
 }
 

@@ -153,10 +153,16 @@ fn pull_and_extract_base(
         .with_context(|| format!("failed to pull base image: {image}"))?;
 
     // Copy the extracted rootfs into our output rootfs directory.
-    // Symlinks are already materialized by pull_and_extract (via
-    // materialize_symlinks), so a recursive copy captures everything.
+    // materialize_symlinks turns file symlinks into copies but replaces
+    // directory symlinks (e.g. /lib64 -> usr/lib64) with empty directories.
+    // We must restore those as real symlinks so the guest can resolve paths
+    // like /lib64/ld-linux-x86-64.so.2.
     copy_dir_recursive(&extracted.rootfs_path, rootfs_dir)
         .context("failed to copy base image rootfs")?;
+
+    // Restore directory symlinks that materialize_symlinks replaced with
+    // empty placeholder directories.
+    restore_directory_symlinks(&extracted.symlinks, rootfs_dir)?;
 
     // Inherit base image config into metadata.
     let config = &extracted.config;
@@ -434,6 +440,123 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     fs::set_permissions(dst, permissions).ok();
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Helper: restore directory symlinks after copying base image
+// ---------------------------------------------------------------------------
+
+/// Restore directory symlinks that `materialize_symlinks` replaced with empty
+/// placeholder directories.
+///
+/// Debian-style images use top-level symlinks like `/lib64 -> usr/lib64`,
+/// `/bin -> usr/bin`, etc.  The packager's `materialize_symlinks` replaces
+/// these with empty directories (for cross-platform compatibility during
+/// packaging).  For a writable rootfs we need real symlinks so the guest
+/// dynamic linker can resolve `/lib64/ld-linux-x86-64.so.2`.
+#[cfg(target_arch = "x86_64")]
+fn restore_directory_symlinks(
+    symlinks: &[litebox_packager::oci::DeferredSymlink],
+    rootfs_dir: &Path,
+) -> Result<()> {
+    use std::collections::HashMap;
+
+    // Build a symlink map to resolve chains.
+    let symlink_map: HashMap<&Path, &Path> = symlinks
+        .iter()
+        .map(|s| (s.rel_path.as_path(), s.link_target.as_path()))
+        .collect();
+
+    for sym in symlinks {
+        let host_path = rootfs_dir.join(&sym.rel_path);
+
+        // Only fix directory symlinks: the host_path was created as an empty
+        // directory by materialize_symlinks.  Skip file symlinks (already
+        // materialized as copies) and non-existent paths.
+        if !host_path.is_dir() {
+            continue;
+        }
+
+        // Resolve the target to see if it points to a real directory in rootfs.
+        let target = &sym.link_target;
+        let resolved = resolve_symlink_target(target, rootfs_dir, &symlink_map, 16);
+        let resolved_host = if let Some(p) = &resolved {
+            p.clone()
+        } else {
+            // Try absolute target (e.g. /usr/bin -> rootfs/usr/bin).
+            let abs_stripped = target
+                .to_str()
+                .and_then(|s| s.strip_prefix('/'))
+                .unwrap_or_else(|| target.to_str().unwrap_or(""));
+            rootfs_dir.join(abs_stripped)
+        };
+
+        if !resolved_host.is_dir() {
+            continue;
+        }
+
+        // Check the directory is empty (placeholder) or contains nothing
+        // meaningful that wasn't already under the target.
+        let is_empty = fs::read_dir(&host_path)
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(false);
+
+        if is_empty {
+            // Replace empty directory with a symlink.
+            fs::remove_dir(&host_path).with_context(|| {
+                format!(
+                    "failed to remove placeholder dir: {}",
+                    host_path.display()
+                )
+            })?;
+            std::os::unix::fs::symlink(target, &host_path).with_context(|| {
+                format!(
+                    "failed to create directory symlink {} -> {}",
+                    host_path.display(),
+                    target.display()
+                )
+            })?;
+            eprintln!(
+                "[BUILD]   restored symlink: {} -> {}",
+                sym.rel_path.display(),
+                target.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Resolve a symlink target path within the rootfs, following chains.
+#[cfg(target_arch = "x86_64")]
+fn resolve_symlink_target(
+    target: &Path,
+    rootfs_dir: &Path,
+    symlink_map: &std::collections::HashMap<&Path, &Path>,
+    max_depth: u32,
+) -> Option<PathBuf> {
+    let target_str = target.to_str()?;
+    // Strip leading / for rootfs-relative lookup.
+    let rel = target_str.strip_prefix('/').unwrap_or(target_str);
+    let mut current = PathBuf::from(rel);
+
+    for _ in 0..max_depth {
+        let host = rootfs_dir.join(&current);
+        if host.exists() {
+            return Some(host);
+        }
+        // Check if current is itself a symlink in the map.
+        if let Some(&next_target) = symlink_map.get(current.as_path()) {
+            let next_str = next_target.to_str()?;
+            let next_rel = next_str.strip_prefix('/').unwrap_or(next_str);
+            current = PathBuf::from(next_rel);
+        } else {
+            break;
+        }
+    }
+
+    let host = rootfs_dir.join(&current);
+    if host.exists() { Some(host) } else { None }
 }
 
 #[cfg(test)]
