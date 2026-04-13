@@ -7,7 +7,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 
 use crate::dockerfile::Instruction;
 use crate::spec_gen::{write_config_json, ImageMetadata};
@@ -104,6 +104,34 @@ pub fn build(instructions: &[Instruction], context_dir: &Path, output_dir: &Path
 }
 
 // ---------------------------------------------------------------------------
+// Helper: validate source path is within build context
+// ---------------------------------------------------------------------------
+
+/// Ensure that `src_path` (after joining with context_dir) resolves to a
+/// location inside `context_dir`. Prevents `../../../etc/shadow`-style path
+/// traversal attacks in COPY/ADD source arguments.
+fn validate_source_in_context(context_dir: &Path, source: &str) -> Result<PathBuf> {
+    let src_path = context_dir.join(source);
+    let canonical_ctx = context_dir
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize context dir: {}", context_dir.display()))?;
+    let canonical_src = src_path.canonicalize().with_context(|| {
+        format!(
+            "source does not exist or cannot be resolved: {} (in context {})",
+            source,
+            context_dir.display()
+        )
+    })?;
+    ensure!(
+        canonical_src.starts_with(&canonical_ctx),
+        "source path '{}' escapes build context (resolves to {})",
+        source,
+        canonical_src.display()
+    );
+    Ok(canonical_src)
+}
+
+// ---------------------------------------------------------------------------
 // Helper: pull base image
 // ---------------------------------------------------------------------------
 
@@ -116,6 +144,11 @@ fn pull_and_extract_base(
     rootfs_dir: &Path,
     metadata: &mut ImageMetadata,
 ) -> Result<()> {
+    // FROM scratch is a special case: empty rootfs, no image to pull.
+    if image == "scratch" {
+        return Ok(());
+    }
+
     let extracted = litebox_packager::oci::pull_and_extract(image, true)
         .with_context(|| format!("failed to pull base image: {image}"))?;
 
@@ -216,15 +249,7 @@ fn copy_files(
     }
 
     for source in sources {
-        let src_path = context_dir.join(source);
-        if !src_path.exists() {
-            bail!(
-                "COPY source does not exist: {} (in context {})",
-                source,
-                context_dir.display()
-            );
-        }
-
+        let src_path = validate_source_in_context(context_dir, source)?;
         let target = if dest_is_dir {
             let filename = src_path
                 .file_name()
@@ -280,14 +305,7 @@ fn add_files(
     }
 
     for source in sources {
-        let src_path = context_dir.join(source);
-        if !src_path.exists() {
-            bail!(
-                "ADD source does not exist: {} (in context {})",
-                source,
-                context_dir.display()
-            );
-        }
+        let src_path = validate_source_in_context(context_dir, source)?;
 
         // Check if the source is a tar archive that should be auto-extracted.
         if is_tar_archive(source) && src_path.is_file() {
@@ -648,5 +666,80 @@ mod tests {
         let result = build(&instructions, context.path(), output.path());
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("multiple FROM"));
+    }
+
+    #[test]
+    fn copy_files_rejects_path_traversal() {
+        let context = tempfile::tempdir().unwrap();
+        let rootfs = tempfile::tempdir().unwrap();
+
+        // Create a file inside context so the directory is valid.
+        fs::write(context.path().join("legit.txt"), "ok").unwrap();
+
+        let metadata = ImageMetadata::default();
+
+        // Attempt to COPY a source that escapes the build context.
+        let result = copy_files(
+            context.path(),
+            &["../../../etc/passwd".to_string()],
+            "/app/",
+            rootfs.path(),
+            &metadata,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("escapes build context") || err.contains("does not exist"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn add_files_rejects_path_traversal() {
+        let context = tempfile::tempdir().unwrap();
+        let rootfs = tempfile::tempdir().unwrap();
+
+        fs::write(context.path().join("legit.txt"), "ok").unwrap();
+
+        let metadata = ImageMetadata::default();
+
+        let result = add_files(
+            context.path(),
+            &["../../../etc/passwd".to_string()],
+            "/app/",
+            rootfs.path(),
+            &metadata,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("escapes build context") || err.contains("does not exist"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_source_in_context_allows_valid_paths() {
+        let context = tempfile::tempdir().unwrap();
+        fs::write(context.path().join("hello.txt"), "hi").unwrap();
+        fs::create_dir(context.path().join("subdir")).unwrap();
+        fs::write(context.path().join("subdir/nested.txt"), "nested").unwrap();
+
+        // Direct file
+        assert!(validate_source_in_context(context.path(), "hello.txt").is_ok());
+        // Nested file
+        assert!(validate_source_in_context(context.path(), "subdir/nested.txt").is_ok());
+        // Directory
+        assert!(validate_source_in_context(context.path(), "subdir").is_ok());
+    }
+
+    #[test]
+    fn validate_source_in_context_rejects_traversal() {
+        let context = tempfile::tempdir().unwrap();
+        fs::write(context.path().join("legit.txt"), "ok").unwrap();
+
+        // Path traversal via ..
+        let result = validate_source_in_context(context.path(), "../../../etc/passwd");
+        assert!(result.is_err());
     }
 }

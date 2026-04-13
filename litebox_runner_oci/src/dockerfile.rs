@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 /// A parsed Dockerfile instruction.
 #[derive(Debug, Clone)]
@@ -19,7 +19,8 @@ pub enum Instruction {
 
 /// Parse a Dockerfile from a file path.
 pub fn parse_file(path: &Path) -> Result<Vec<Instruction>> {
-    let content = std::fs::read_to_string(path)?;
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read Dockerfile: {}", path.display()))?;
     parse(&content)
 }
 
@@ -74,7 +75,8 @@ pub fn parse(content: &str) -> Result<Vec<Instruction>> {
                 instructions.push(Instruction::Cmd { exec });
             }
             _ => {
-                // Unsupported instructions are silently ignored.
+                // Warn about unsupported instructions so users know what's being skipped.
+                eprintln!("[WARN] Ignoring unsupported Dockerfile instruction: {keyword}");
             }
         }
     }
@@ -130,11 +132,12 @@ fn parse_copy_add_args(rest: &str, keyword: &str) -> Result<(Vec<String>, String
 }
 
 /// Parse ENV arguments. Supports `KEY=VALUE` and `KEY VALUE` forms.
+/// Strips surrounding matching quotes from values (like Docker does).
 fn parse_env_args(rest: &str) -> Result<(String, String)> {
     // Try KEY=VALUE form first.
     if let Some((key, value)) = rest.split_once('=') {
         let key = key.trim().to_string();
-        let value = value.trim().to_string();
+        let value = strip_surrounding_quotes(value.trim());
         return Ok((key, value));
     }
 
@@ -143,7 +146,17 @@ fn parse_env_args(rest: &str) -> Result<(String, String)> {
     if value.is_empty() {
         bail!("ENV requires a key and value");
     }
-    Ok((key.to_string(), value.trim().to_string()))
+    Ok((key.to_string(), strip_surrounding_quotes(value.trim())))
+}
+
+/// Strip matching surrounding single or double quotes from a string.
+fn strip_surrounding_quotes(s: &str) -> String {
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
+        return s[1..s.len() - 1].to_string();
+    }
+    s.to_string()
 }
 
 /// Parse exec form `["arg1", "arg2"]` or shell form `command args...`.
@@ -247,6 +260,30 @@ CMD ["app.py"]
         let instructions = parse(input).unwrap();
         assert!(
             matches!(&instructions[0], Instruction::Copy { sources, dest } if sources == &["file1.txt", "file2.txt"] && dest == "/dest/")
+        );
+    }
+
+    #[test]
+    fn parse_env_strips_surrounding_quotes() {
+        let input = r#"ENV FOO="bar baz""#;
+        let instructions = parse(input).unwrap();
+        assert!(
+            matches!(&instructions[0], Instruction::Env { key, value } if key == "FOO" && value == "bar baz")
+        );
+
+        let input2 = "ENV BAR='single quoted'";
+        let instructions2 = parse(input2).unwrap();
+        assert!(
+            matches!(&instructions2[0], Instruction::Env { key, value } if key == "BAR" && value == "single quoted")
+        );
+    }
+
+    #[test]
+    fn parse_env_preserves_unquoted_value() {
+        let input = "ENV FOO=plain_value";
+        let instructions = parse(input).unwrap();
+        assert!(
+            matches!(&instructions[0], Instruction::Env { key, value } if key == "FOO" && value == "plain_value")
         );
     }
 }

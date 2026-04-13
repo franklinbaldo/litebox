@@ -35,7 +35,7 @@ pub fn generate_spec(metadata: &ImageMetadata) -> Result<String> {
 
     // 3. Build the spec as a serde_json::Value for robustness
     let spec = serde_json::json!({
-        "ociVersion": "1.0.2-dev",
+        "ociVersion": "1.0.2",
         "process": {
             "args": args,
             "env": metadata.env,
