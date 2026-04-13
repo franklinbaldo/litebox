@@ -421,6 +421,7 @@ fn spawn_broker(
     rootfs: &Path,
     bind_mounts: &[(String, String)],
     writable_paths: &[String],
+    read_only: bool,
 ) -> Result<Child> {
     let broker_exe = find_broker_exe()?;
 
@@ -437,8 +438,11 @@ fn spawn_broker(
         .arg(socket_path)
         .arg("--root-dir")
         .arg(rootfs)
-        .arg("--rewrite-syscalls")
-        .arg("--read-only");
+        .arg("--rewrite-syscalls");
+
+    if read_only {
+        cmd.arg("--read-only");
+    }
 
     for writable_path in writable_paths {
         cmd.arg("--writable-path");
@@ -754,6 +758,7 @@ pub fn run_container(
         &rootfs_path,
         &bind_mounts,
         &writable_paths,
+        true, // read_only
     )?;
 
     // 8. Wait for broker socket to appear (up to 5 seconds)
@@ -1039,6 +1044,102 @@ fn apply_rlimits(rlimits: &[oci_spec::runtime::PosixRlimit]) {
                 "failed to apply rlimit (continuing)"
             );
         }
+    }
+}
+
+/// Run a single command inside the sandbox with a writable rootfs.
+///
+/// Used by `litebox-oci build` for executing Dockerfile RUN instructions.
+/// The broker serves the rootfs directory with full write access, so guest
+/// mutations (package installs, file creation, etc.) land on disk directly.
+pub fn run_build_step(
+    rootfs: &Path,
+    command: &[String],
+    env: &[String],
+    working_dir: Option<&str>,
+) -> Result<i32> {
+    // 1. Generate unique broker socket path
+    let broker_socket_path = PathBuf::from(format!(
+        "/tmp/litebox-oci-build-{}-{}.sock",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let broker_socket_str = broker_socket_path
+        .to_str()
+        .context("broker socket path not valid UTF-8")?
+        .to_string();
+
+    // 2. Spawn broker with writable rootfs (read_only = false)
+    let mut broker_child = spawn_broker(
+        &broker_socket_path,
+        rootfs,
+        &[],   // no bind mounts
+        &[],   // no writable_paths needed when not read-only
+        false, // read_only = false — entire rootfs writable
+    )?;
+
+    // 3. Wait for broker socket
+    if let Err(e) = wait_for_socket(&broker_socket_path, std::time::Duration::from_secs(5)) {
+        let _ = broker_child.kill();
+        let _ = broker_child.wait();
+        let _ = std::fs::remove_file(&broker_socket_path);
+        return Err(e).context("broker failed to start for build step");
+    }
+
+    // 4. Build minimal CliArgs
+    let cli_args = CliArgs {
+        program_and_arguments: command.to_vec(),
+        environment_variables: env.to_vec(),
+        forward_environment_variables: false,
+        unstable: true,
+        insert_files: vec![],
+        initial_files: None,
+        rewrite_syscalls: false,
+        interception_backend: InterceptionBackend::Rewriter,
+        tun_device_name: None,
+        network_broker: None,
+        program_from_tar: false,
+        nine_p_broker: Some(broker_socket_str),
+        working_directory: working_dir.map(String::from),
+        proc_mount: true,
+        af_packet_fd: None,
+        network_config: None,
+        state_dir: None,
+        restore_image: None,
+        worker_exec: false,
+        worker_exec_fd: None,
+        worker_result_fd: None,
+        worker_interp_fd: None,
+        worker_interp_path: None,
+        guest_pid: None,
+        guest_ppid: None,
+        guest_uid: Some(0),
+        guest_euid: Some(0),
+        guest_gid: Some(0),
+        guest_egid: Some(0),
+        fork_restore: false,
+        fork_restore_fd: None,
+        fork_restore_ack_fd: None,
+        pipe_bridge: vec![],
+        mux_fd: None,
+        mux_stream: vec![],
+        local_pipe: vec![],
+    };
+
+    // 5. Run the sandbox
+    let result = litebox_runner_linux_userland::run(cli_args);
+
+    // 6. Cleanup
+    let _ = broker_child.kill();
+    let _ = broker_child.wait();
+    let _ = std::fs::remove_file(&broker_socket_path);
+
+    match result {
+        Ok(exit_code) => Ok(exit_code),
+        Err(e) => Err(e).context("build step failed"),
     }
 }
 
