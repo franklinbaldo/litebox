@@ -41,10 +41,18 @@ except: sys.exit(1)
 }
 
 # --- Locate binaries. --------------------------------------------------------
-COPILOT_BIN="$(which copilot 2>/dev/null || true)"
-if [ -z "$COPILOT_BIN" ]; then
-    echo "Error: copilot not found on PATH" >&2
-    exit 1
+# COPILOT_BIN can be set externally (e.g., to an image-extracted binary).
+COPILOT_BIN="${COPILOT_BIN:-$(which copilot 2>/dev/null || true)}"
+# Fallback: check the litebox cache for a binary extracted from the container image.
+if [ -z "$COPILOT_BIN" ] || [ ! -x "$COPILOT_BIN" ]; then
+    CACHE_BIN="${XDG_CACHE_HOME:-$HOME/.cache}/litebox/copilot-from-image"
+    if [ -x "$CACHE_BIN" ]; then
+        COPILOT_BIN="$CACHE_BIN"
+    else
+        echo "Error: copilot not found on PATH or in cache" >&2
+        echo "Either install copilot, or run: ./dev_tools/create_tar_from_image.sh" >&2
+        exit 1
+    fi
 fi
 
 if [ ! -x "$RUNNER" ]; then
