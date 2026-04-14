@@ -644,6 +644,7 @@ pub fn run_container(
     override_user: Option<&(u32, u32)>,
     state_dir: Option<std::path::PathBuf>,
     restore_image: Option<std::path::PathBuf>,
+    extra_bind_mounts: &[(String, String)],
 ) -> Result<i32> {
     // 1. Parse config.json from bundle
     let spec_path = bundle_path.join("config.json");
@@ -702,7 +703,7 @@ pub fn run_container(
     };
 
     // 4. Extract bind mounts from OCI spec
-    let bind_mounts: Vec<(String, String)> = spec
+    let mut bind_mounts: Vec<(String, String)> = spec
         .mounts()
         .as_ref()
         .map(|mounts| {
@@ -723,6 +724,14 @@ pub fn run_container(
                 .collect()
         })
         .unwrap_or_default();
+
+    // 4b. Merge extra bind mounts from CLI -v/--volume flags.
+    // extra_bind_mounts are (host_path, guest_path) pairs; convert to
+    // (guest_path_no_slash, host_path) to match the broker's --bind format.
+    for (host_path, guest_path) in extra_bind_mounts {
+        let guest_rel = guest_path.strip_prefix('/').unwrap_or(guest_path);
+        bind_mounts.push((guest_rel.to_string(), host_path.clone()));
+    }
 
     // 5. Extract writable paths from tmpfs mounts in OCI spec
     let writable_paths: Vec<String> = spec
@@ -997,6 +1006,7 @@ pub fn exec_container(
         override_user,
         None, // exec doesn't support checkpoint
         None, // exec doesn't support restore
+        &[], // exec doesn't support volume mounts (yet)
     )
 }
 

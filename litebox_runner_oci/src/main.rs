@@ -170,6 +170,12 @@ enum Command {
         #[clap(long, value_name = "FILE")]
         env_file: Option<PathBuf>,
 
+        /// Bind mount a host directory into the container (read-only).
+        /// Format: HOST_PATH:GUEST_PATH (e.g., -v /home/user/project:/workspace).
+        /// Can be specified multiple times.
+        #[clap(short, long = "volume", value_name = "HOST:GUEST")]
+        volumes: Vec<String>,
+
         /// TUN device name for container networking (e.g., "tun99").
         /// Requires a pre-configured TUN device on the host.
         #[clap(long, value_name = "DEVICE")]
@@ -364,6 +370,42 @@ fn parse_extra_env(env: &[String], env_file: Option<&PathBuf>) -> Result<Vec<Str
     }
 
     Ok(extra_env)
+}
+
+/// Parse volume mount specifications into (host_path, guest_path) pairs.
+///
+/// Each volume spec must be in the format `HOST_PATH:GUEST_PATH`.
+/// Both paths must be absolute.
+fn parse_volumes(volumes: &[String]) -> Result<Vec<(String, String)>> {
+    let mut mounts = Vec::with_capacity(volumes.len());
+    for vol in volumes {
+        let parts: Vec<&str> = vol.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            anyhow::bail!(
+                "invalid volume spec (expected HOST_PATH:GUEST_PATH): {vol}"
+            );
+        }
+        let host_path = parts[0];
+        let guest_path = parts[1];
+        if !host_path.starts_with('/') {
+            anyhow::bail!(
+                "volume host path must be absolute: {host_path}"
+            );
+        }
+        if !guest_path.starts_with('/') {
+            anyhow::bail!(
+                "volume guest path must be absolute: {guest_path}"
+            );
+        }
+        // Verify host path exists
+        if !std::path::Path::new(host_path).exists() {
+            anyhow::bail!(
+                "volume host path does not exist: {host_path}"
+            );
+        }
+        mounts.push((host_path.to_string(), guest_path.to_string()));
+    }
+    Ok(mounts)
 }
 
 fn main() -> Result<()> {
@@ -650,6 +692,7 @@ fn main() -> Result<()> {
             container_id,
             env,
             env_file,
+            volumes,
             tun_device,
             command,
         } => {
@@ -706,6 +749,9 @@ fn main() -> Result<()> {
 
             let extra_env = parse_extra_env(&env, env_file.as_ref())?;
 
+            // Parse volume mounts (-v HOST:GUEST)
+            let volume_mounts = parse_volumes(&volumes)?;
+
             // Compute state directory for checkpoint support.
             // The state dir exists when the container was created via
             // lifecycle create → start → (exec's "litebox-oci run").
@@ -731,6 +777,7 @@ fn main() -> Result<()> {
                 None,
                 state_dir,
                 None,
+                &volume_mounts,
             )?;
 
             // Save exit code to state (if this was a create+start lifecycle container)
@@ -994,6 +1041,7 @@ fn main() -> Result<()> {
                 None,
                 Some(state_dir),
                 Some(checkpoint_image_file),
+                &[], // no volume mounts for restore
             )?;
 
             // Update state to stopped after exit
