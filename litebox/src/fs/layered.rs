@@ -30,6 +30,7 @@ const DEVICE_ID: usize = 0x4c797273;
 
 /// Possible semantics for layering file systems together
 #[non_exhaustive]
+#[derive(Debug)]
 pub enum LayeringSemantics {
     /// Lower layer is read-only.
     ///
@@ -928,11 +929,18 @@ impl<
                         // None of these can be handled by lower level, just quit out early
                         return Err(e);
                     }
-                    OpenError::PathError(PathError::MissingComponent)
-                        if flags.contains(OFlags::CREAT) =>
+                    OpenError::PathError(
+                        PathError::MissingComponent | PathError::NoSuchFileOrDirectory,
+                    ) if flags.contains(OFlags::CREAT) =>
                     {
-                        // We must check if the lower layer contains all the directories; if it does, we
-                        // can create the same directories and then re-trigger the open.
+                        // The upper layer could not create the file because its
+                        // parent directory is missing.  A simple in-mem upper
+                        // reports `MissingComponent`, but when the upper is
+                        // itself a nested layered FS it may return
+                        // `NoSuchFileOrDirectory` after exhausting all its own
+                        // layers.  In either case we check whether the *lower*
+                        // layer has the parent directory and, if so, migrate
+                        // those ancestor directories to the upper and retry.
                         let dirname = path.rsplit_once('/').unwrap().0;
                         if let Ok(FileType::Directory) = self.ensure_lower_contains(dirname) {
                             // We must migrate the directories above, and then re-trigger the open

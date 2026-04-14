@@ -2,10 +2,10 @@
 // Licensed under the MIT license.
 
 mod in_mem {
-    use crate::LiteBox;
     use crate::fs::in_mem;
     use crate::fs::{FileSystem as _, Mode, OFlags};
     use crate::platform::mock::MockPlatform;
+    use crate::LiteBox;
     use alloc::vec;
     use alloc::vec::Vec;
     extern crate std;
@@ -859,10 +859,10 @@ mod in_mem {
 }
 
 mod tar_ro {
-    use crate::LiteBox;
     use crate::fs::tar_ro;
     use crate::fs::{FileSystem as _, Mode, OFlags};
     use crate::platform::mock::MockPlatform;
+    use crate::LiteBox;
     use alloc::vec;
     use alloc::vec::Vec;
     extern crate std;
@@ -1012,10 +1012,10 @@ mod tar_ro {
 }
 
 mod layered {
-    use crate::LiteBox;
-    use crate::fs::{FileSystem as _, FileType, Mode, OFlags};
     use crate::fs::{in_mem, layered, tar_ro};
+    use crate::fs::{FileSystem as _, FileType, Mode, OFlags};
     use crate::platform::mock::MockPlatform;
+    use crate::LiteBox;
     use alloc::vec;
     use alloc::vec::Vec;
     extern crate std;
@@ -2192,12 +2192,79 @@ mod layered {
             "chown on tombstoned path must fail: {chown_result:?}"
         );
     }
+
+    /// Bug reproduction: when the outermost layered FS uses LowerLayerReadOnly
+    /// and its upper is itself a nested LowerLayerWritableFiles layered FS that
+    /// does NOT have the parent directory, the nested upper returns
+    /// `NoSuchFileOrDirectory` instead of `MissingComponent`. The outer layer's
+    /// O_CREAT handler only matched `MissingComponent`, causing new file
+    /// creation in directories that only exist on the outer lower layer to fail.
+    #[test]
+    fn nested_layered_file_creation_in_outer_lower_only_dir() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        // Inner "device" layer: use an empty tar so bar/ is NOT on any inner layer.
+        let inner_lower = tar_ro::FileSystem::new(&litebox, tar_ro::EMPTY_TAR_FILE.into());
+        let dev_layer = in_mem::FileSystem::new(&litebox);
+        let inner_layered = layered::FileSystem::new(
+            &litebox,
+            dev_layer,
+            inner_lower,
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
+
+        // Middle layer (base_fs): in-mem upper + inner layered lower.
+        // This mimics the `default_fs` structure in the runner.
+        let mut base_upper = in_mem::FileSystem::new(&litebox);
+        base_upper.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+        });
+        let base_fs = layered::FileSystem::new(
+            &litebox,
+            base_upper,
+            inner_layered,
+            layered::LayeringSemantics::LowerLayerWritableFiles,
+        );
+
+        // Outer layer: base_fs on top of a tar that HAS bar/ directory.
+        // This mimics the OCI runner's layout: base_fs upper, 9P lower.
+        let outer_lower = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+        let fs = layered::FileSystem::new(
+            &litebox,
+            base_fs,
+            outer_lower,
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
+
+        // Verify bar/ exists on the outer lower layer
+        let stat = fs.file_status("bar").expect("bar/ should be visible");
+        assert_eq!(stat.file_type, FileType::Directory);
+
+        // Create a NEW file bar/newfile — bar/ only exists on the outer lower layer
+        let fd = fs
+            .open("bar/newfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to create bar/newfile in outer-lower-only dir");
+
+        let data = b"hello from nested COW!";
+        fs.write(&fd, data, None).expect("Failed to write");
+        fs.close(&fd).expect("Failed to close");
+
+        // Read back
+        let fd = fs
+            .open("bar/newfile", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open bar/newfile for reading");
+        let mut buffer = vec![0; 1024];
+        let bytes_read = fs.read(&fd, &mut buffer, None).expect("Failed to read");
+        assert_eq!(&buffer[..bytes_read], data);
+        fs.close(&fd).expect("Failed to close");
+    }
 }
 
 mod stdio {
-    use crate::LiteBox;
     use crate::fs::{FileSystem as _, Mode, OFlags};
     use crate::platform::mock::MockPlatform;
+    use crate::LiteBox;
     use alloc::vec;
     extern crate std;
 
@@ -2264,12 +2331,12 @@ mod stdio {
 }
 
 mod layered_stdio {
-    use crate::LiteBox;
     use crate::fs::errors::ReadError;
     use crate::fs::layered::LayeringSemantics;
-    use crate::fs::{FileSystem as _, Mode, OFlags};
     use crate::fs::{devices, in_mem, layered};
+    use crate::fs::{FileSystem as _, Mode, OFlags};
     use crate::platform::mock::MockPlatform;
+    use crate::LiteBox;
     use alloc::vec;
     extern crate std;
 
@@ -2461,10 +2528,10 @@ mod layered_stdio {
 }
 
 mod in_mem_at {
-    use crate::LiteBox;
     use crate::fs::in_mem;
     use crate::fs::{FileSystem as _, Mode, OFlags};
     use crate::platform::mock::MockPlatform;
+    use crate::LiteBox;
     extern crate std;
 
     /// Helper: set up a filesystem with /dir/ containing a file.
@@ -2581,10 +2648,9 @@ mod in_mem_at {
             fs.close(&dirfd).expect("close dirfd");
 
             // Verify deleted via absolute path.
-            assert!(
-                fs.open("/dir/hello.txt", OFlags::RDONLY, Mode::empty())
-                    .is_err()
-            );
+            assert!(fs
+                .open("/dir/hello.txt", OFlags::RDONLY, Mode::empty())
+                .is_err());
         });
     }
 
@@ -2609,10 +2675,9 @@ mod in_mem_at {
             fs.close(&dst_dirfd).expect("close");
 
             // Old path gone, new path exists.
-            assert!(
-                fs.open("/dir/hello.txt", OFlags::RDONLY, Mode::empty())
-                    .is_err()
-            );
+            assert!(fs
+                .open("/dir/hello.txt", OFlags::RDONLY, Mode::empty())
+                .is_err());
             let fd = fs
                 .open("/dir2/moved.txt", OFlags::RDONLY, Mode::empty())
                 .expect("open moved");
