@@ -130,6 +130,18 @@ pub struct CliArgs {
     #[arg(skip)]
     pub proc_mount: bool,
 
+    /// Whether the 9P rootfs should be treated as read-only by the guest.
+    ///
+    /// When true, the guest layered filesystem uses `LowerLayerReadOnly`
+    /// semantics: reads come from the 9P lower layer, writes go to the
+    /// in-memory upper layer via copy-on-write. The base image is never
+    /// modified. This matches the Docker/OCI container model.
+    ///
+    /// When false (default), `LowerLayerWritableFiles` is used: writes
+    /// pass through 9P to the broker and hit the host filesystem.
+    #[arg(skip)]
+    pub read_only_rootfs: bool,
+
     /// Pre-opened AF_PACKET socket fd for CNI veth networking.
     /// When set, the platform uses `NetworkTransport::AfPacket` and smoltcp
     /// runs in Ethernet mode.
@@ -832,7 +844,11 @@ fn finish_run_restore_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         litebox,
         base_fs,
         nine_p_fs,
-        litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
+        if cli_args.read_only_rootfs {
+            litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly
+        } else {
+            litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles
+        },
     );
     let combined_fs = std::sync::Arc::new(combined);
 
@@ -916,11 +932,15 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
             while worker_handle.poll_responses(&mut reader, &mut buf) {}
         });
 
-        let combined = litebox::fs::layered::FileSystem::new(
-            litebox,
-            base_fs,
-            nine_p_fs,
-            litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
+    let combined = litebox::fs::layered::FileSystem::new(
+        litebox,
+        base_fs,
+        nine_p_fs,
+        if cli_args.read_only_rootfs {
+            litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly
+        } else {
+            litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles
+        },
         );
         let combined_fs = std::sync::Arc::new(combined);
 
@@ -1002,7 +1022,11 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         litebox,
         base_fs,
         nine_p_fs,
-        litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
+        if cli_args.read_only_rootfs {
+            litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly
+        } else {
+            litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles
+        },
     );
     let combined_fs = std::sync::Arc::new(combined);
 
@@ -2952,6 +2976,7 @@ fn build_cli_args_from_exec_params(
         nine_p_broker,
         working_directory: Some(params.cwd.clone()),
         proc_mount: false,
+        read_only_rootfs: false, // worker-exec inherits parent's 9P connection
         af_packet_fd: None,
         network_config: None,
         state_dir: None,
@@ -3419,6 +3444,7 @@ mod tests {
             nine_p_broker: None,
             working_directory: None,
             proc_mount: false,
+            read_only_rootfs: false,
             af_packet_fd: None,
             network_config: None,
             state_dir: None,

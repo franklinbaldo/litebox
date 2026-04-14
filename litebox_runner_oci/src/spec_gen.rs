@@ -44,7 +44,7 @@ pub fn generate_spec(metadata: &ImageMetadata) -> Result<String> {
         },
         "root": {
             "path": "rootfs",
-            "readonly": false
+            "readonly": true
         },
         "mounts": [
             { "destination": "/proc", "type": "proc", "source": "proc" },
@@ -157,16 +157,12 @@ mod tests {
         let json = generate_spec(&metadata).unwrap();
         let spec: serde_json::Value = serde_json::from_str(&json).unwrap();
         let mounts = spec["mounts"].as_array().unwrap();
-        assert!(
-            mounts
-                .iter()
-                .any(|m| m["destination"] == "/proc" && m["type"] == "proc")
-        );
-        assert!(
-            mounts
-                .iter()
-                .any(|m| m["destination"] == "/tmp" && m["type"] == "tmpfs")
-        );
+        assert!(mounts
+            .iter()
+            .any(|m| m["destination"] == "/proc" && m["type"] == "proc"));
+        assert!(mounts
+            .iter()
+            .any(|m| m["destination"] == "/tmp" && m["type"] == "tmpfs"));
     }
 
     #[test]

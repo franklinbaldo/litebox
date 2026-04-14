@@ -595,6 +595,7 @@ fn build_cli_args(
         nine_p_broker: Some(broker_socket.to_string()),
         working_directory,
         proc_mount: has_proc_mount,
+        read_only_rootfs: false, // set by caller after build_cli_args
         af_packet_fd,
         network_config,
         state_dir,
@@ -733,7 +734,9 @@ pub fn run_container(
         bind_mounts.push((guest_rel.to_string(), host_path.clone()));
     }
 
-    // 5. Extract writable paths from tmpfs mounts in OCI spec
+    // 5. Extract writable paths from tmpfs mounts in OCI spec.
+    // These paths are passed to the broker as --writable-path so the broker
+    // allows writes to them even in --read-only mode (e.g. /tmp).
     let writable_paths: Vec<String> = spec
         .mounts()
         .as_ref()
@@ -745,24 +748,19 @@ pub fn run_container(
                 .collect()
         })
         .unwrap_or_default();
+    let writable_paths = if writable_paths.is_empty() {
+        vec!["/tmp".to_string(), "/var".to_string()]
+    } else {
+        writable_paths
+    };
 
-    // Honour the OCI spec's root.readonly field.  When false (e.g. bundles
-    // produced by `--image`), the broker serves the rootfs fully writable
-    // and no writable-path overrides are needed.
+    // Determine whether the guest should treat the rootfs as read-only
+    // (copy-on-write to in-memory upper layer) based on the OCI spec's
+    // root.readonly field.
     let root_readonly = spec
         .root()
         .as_ref()
-        .is_some_and(|r| r.readonly().unwrap_or(false));
-
-    let writable_paths = if root_readonly {
-        if writable_paths.is_empty() {
-            vec!["/tmp".to_string(), "/var".to_string()]
-        } else {
-            writable_paths
-        }
-    } else {
-        vec![] // entire rootfs is writable
-    };
+        .is_some_and(|r| r.readonly().unwrap_or(true));
 
     // 6. Generate broker socket path
     let broker_socket_path = PathBuf::from(format!(
@@ -774,13 +772,16 @@ pub fn run_container(
         .context("broker socket path is not valid UTF-8")?
         .to_string();
 
-    // 7. Spawn broker
+    // 7. Spawn broker — always read-only so the base image is never modified.
+    // Writable paths allow the broker to accept writes for tmpfs destinations.
+    // The guest-side layered filesystem handles remaining writes via COW when
+    // read_only_rootfs is set.
     let mut broker_child = spawn_broker(
         &broker_socket_path,
         &rootfs_path,
         &bind_mounts,
         &writable_paths,
-        root_readonly,
+        true, // always read-only
     )?;
 
     // 8. Wait for broker socket to appear (up to 5 seconds)
@@ -814,6 +815,11 @@ pub fn run_container(
             return Err(e);
         }
     };
+
+    // 9a. Set read_only_rootfs based on the OCI spec's root.readonly field.
+    // When true, the guest uses LowerLayerReadOnly (COW to in-memory upper);
+    // the base image on disk is never modified.
+    cli_args.read_only_rootfs = root_readonly;
 
     // 9b. Resolve non-absolute program path against rootfs via $PATH.
     // OCI specs often pass bare command names (e.g., "echo"), which must
@@ -1128,6 +1134,7 @@ pub fn run_build_step(
         nine_p_broker: Some(broker_socket_str),
         working_directory: working_dir.map(String::from),
         proc_mount: true,
+        read_only_rootfs: false, // build steps need writable rootfs
         af_packet_fd: None,
         network_config: None,
         state_dir: None,
