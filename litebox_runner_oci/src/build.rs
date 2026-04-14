@@ -107,56 +107,115 @@ pub fn build(instructions: &[Instruction], context_dir: &Path, output_dir: &Path
 // Public: prepare a bundle from an OCI image (no Dockerfile needed)
 // ---------------------------------------------------------------------------
 
+/// Cache directory for extracted image rootfs.
+///
+/// Returns `~/.cache/litebox-oci/images/<sanitized>/` where `<sanitized>` is
+/// the image reference with non-alphanumeric characters replaced by `_`.
+fn image_cache_dir(image: &str) -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let sanitized: String = image
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    PathBuf::from(home)
+        .join(".cache")
+        .join("litebox-oci")
+        .join("images")
+        .join(sanitized)
+}
+
 /// Pull an OCI container image and prepare a ready-to-run bundle directory.
 ///
-/// This is the `--image` path for `litebox-oci run`: pull the image, extract
-/// rootfs, restore directory symlinks, write `/etc/resolv.conf`, build
-/// `config.json` from the image's metadata, and optionally override the
-/// command (ENTRYPOINT+CMD).
+/// The extracted rootfs is cached at `~/.cache/litebox-oci/images/<image>/`
+/// so that subsequent runs reuse the cached rootfs without re-downloading.
 ///
-/// Returns the path to the prepared bundle directory (a tempdir under
-/// `output_dir`).
+/// `output_dir` is used for the thin bundle (config.json + rootfs symlink).
+/// When `command_override` is provided, the image's ENTRYPOINT+CMD are
+/// replaced.
+///
+/// Returns the path to the prepared bundle directory.
 #[cfg(target_arch = "x86_64")]
 pub fn prepare_image_bundle(
     image: &str,
     output_dir: &Path,
     command_override: Option<&[String]>,
 ) -> Result<PathBuf> {
-    eprintln!("[RUN] Pulling image: {image}");
-    let extracted = litebox_packager::oci::pull_and_extract(image, true)
-        .with_context(|| format!("failed to pull image: {image}"))?;
+    let cache_dir = image_cache_dir(image);
+    let cached_rootfs = cache_dir.join("rootfs");
+    let cached_metadata = cache_dir.join("metadata.json");
 
+    // Check cache: if rootfs and metadata exist, skip pulling.
+    let metadata = if cached_rootfs.exists() && cached_metadata.exists() {
+        eprintln!("[RUN] Using cached image: {image}");
+        let json = fs::read_to_string(&cached_metadata)
+            .with_context(|| format!("failed to read {}", cached_metadata.display()))?;
+        serde_json::from_str::<ImageMetadata>(&json)
+            .context("failed to parse cached metadata.json")?
+    } else {
+        eprintln!("[RUN] Pulling image: {image}");
+        let extracted = litebox_packager::oci::pull_and_extract(image, true)
+            .with_context(|| format!("failed to pull image: {image}"))?;
+
+        // Create cache directory and copy rootfs into it.
+        fs::create_dir_all(&cached_rootfs)
+            .with_context(|| format!("failed to create cache dir: {}", cached_rootfs.display()))?;
+
+        eprintln!("[RUN] Extracting rootfs to cache...");
+        copy_dir_recursive(&extracted.rootfs_path, &cached_rootfs)
+            .context("failed to copy image rootfs to cache")?;
+
+        restore_directory_symlinks(&extracted.symlinks, &cached_rootfs)?;
+        ensure_resolv_conf(&cached_rootfs)?;
+
+        // Build metadata from image config.
+        let config = &extracted.config;
+        let mut metadata = ImageMetadata::default();
+        if let Some(ref env) = config.env {
+            metadata.env.clone_from(env);
+        }
+        if let Some(ref working_dir) = config.working_dir {
+            metadata.working_dir = Some(working_dir.clone());
+        }
+        if let Some(ref entrypoint) = config.entrypoint {
+            metadata.entrypoint = Some(entrypoint.clone());
+        }
+        if let Some(ref cmd) = config.cmd {
+            metadata.cmd = Some(cmd.clone());
+        }
+
+        // Persist metadata to cache.
+        let json = serde_json::to_string_pretty(&metadata)
+            .context("failed to serialize image metadata")?;
+        fs::write(&cached_metadata, json)
+            .with_context(|| format!("failed to write {}", cached_metadata.display()))?;
+
+        metadata
+    };
+
+    // Build the thin bundle dir: config.json + symlink to cached rootfs.
     let bundle_dir = output_dir.to_path_buf();
-    let rootfs_dir = bundle_dir.join("rootfs");
-    fs::create_dir_all(&rootfs_dir)
-        .with_context(|| format!("failed to create rootfs dir: {}", rootfs_dir.display()))?;
+    fs::create_dir_all(&bundle_dir)
+        .with_context(|| format!("failed to create bundle dir: {}", bundle_dir.display()))?;
 
-    eprintln!("[RUN] Extracting rootfs...");
-    copy_dir_recursive(&extracted.rootfs_path, &rootfs_dir)
-        .context("failed to copy image rootfs")?;
-
-    restore_directory_symlinks(&extracted.symlinks, &rootfs_dir)?;
-    ensure_resolv_conf(&rootfs_dir)?;
-
-    // Build metadata from image config.
-    let config = &extracted.config;
-    let mut metadata = ImageMetadata::default();
-
-    if let Some(ref env) = config.env {
-        metadata.env.clone_from(env);
-    }
-    if let Some(ref working_dir) = config.working_dir {
-        metadata.working_dir = Some(working_dir.clone());
-    }
-    if let Some(ref entrypoint) = config.entrypoint {
-        metadata.entrypoint = Some(entrypoint.clone());
-    }
-    if let Some(ref cmd) = config.cmd {
-        metadata.cmd = Some(cmd.clone());
+    let bundle_rootfs = bundle_dir.join("rootfs");
+    if !bundle_rootfs.exists() {
+        std::os::unix::fs::symlink(&cached_rootfs, &bundle_rootfs).with_context(|| {
+            format!(
+                "failed to symlink {} -> {}",
+                bundle_rootfs.display(),
+                cached_rootfs.display()
+            )
+        })?;
     }
 
-    // Apply command override: replaces both ENTRYPOINT and CMD so the user
-    // gets exactly the command they asked for.
+    // Apply command override if provided.
+    let mut metadata = metadata;
     if let Some(args) = command_override
         && !args.is_empty()
     {
@@ -164,7 +223,11 @@ pub fn prepare_image_bundle(
         metadata.cmd = Some(args.to_vec());
     }
 
-    write_config_json(&bundle_dir, &metadata)?;
+    // Write config.json with extra tmpfs mounts for common writable paths.
+    // The cached rootfs is shared across runs, so the broker serves it
+    // read-only.  Tmpfs mounts give the container writable scratch space
+    // at paths that programs commonly expect to write to.
+    write_config_json_with_extra_mounts(&bundle_dir, &metadata)?;
 
     eprintln!("[RUN] Bundle ready at {}", bundle_dir.display());
     Ok(bundle_dir)
@@ -177,6 +240,52 @@ pub fn prepare_image_bundle(
     _command_override: Option<&[String]>,
 ) -> Result<PathBuf> {
     bail!("pulling images is only supported on x86_64 (requested: {image})");
+}
+
+// ---------------------------------------------------------------------------
+// Helper: write config.json with extra tmpfs mounts for --image mode
+// ---------------------------------------------------------------------------
+
+/// Write an OCI config.json that includes extra tmpfs mounts for common
+/// writable directories (`/root`, `/home`, `/var`, `/run`).
+///
+/// When running from a cached image rootfs, the broker serves the rootfs
+/// read-only (with writable paths restricted to tmpfs mount destinations).
+/// Adding these tmpfs mounts gives the container process writable scratch
+/// space at the paths that programs most commonly expect to write to.
+fn write_config_json_with_extra_mounts(bundle_dir: &Path, metadata: &ImageMetadata) -> Result<()> {
+    let json = crate::spec_gen::generate_spec(metadata)?;
+    let mut spec: serde_json::Value =
+        serde_json::from_str(&json).context("failed to parse generated spec")?;
+
+    // Add extra tmpfs mounts for writable paths.
+    let extra_mounts = ["/root", "/home", "/var", "/run"];
+    if let Some(mounts) = spec["mounts"].as_array_mut() {
+        for dest in &extra_mounts {
+            // Skip if already present.
+            let already = mounts
+                .iter()
+                .any(|m| m["destination"].as_str() == Some(dest));
+            if !already {
+                mounts.push(serde_json::json!({
+                    "destination": dest,
+                    "type": "tmpfs",
+                    "source": "tmpfs"
+                }));
+            }
+        }
+    }
+
+    // Verify round-trip.
+    let json = serde_json::to_string_pretty(&spec).context("failed to serialize OCI spec")?;
+    let _: oci_spec::runtime::Spec =
+        serde_json::from_str(&json).context("generated spec is not valid OCI runtime spec")?;
+
+    let config_path = bundle_dir.join("config.json");
+    fs::write(&config_path, json)
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

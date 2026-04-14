@@ -714,8 +714,23 @@ fn main() -> Result<()> {
                 if sd.exists() { Some(sd) } else { None }
             };
 
+            // Apply command override for --bundle mode too: if the user
+            // passed `-- command args`, override process.args at runtime.
+            let cmd_override = if command.is_empty() {
+                None
+            } else {
+                Some(command.as_slice())
+            };
+
             let exit_code = litebox_runner_oci::run_container(
-                &bundle, None, &extra_env, &network, None, None, state_dir, None,
+                &bundle,
+                cmd_override,
+                &extra_env,
+                &network,
+                None,
+                None,
+                state_dir,
+                None,
             )?;
 
             // Save exit code to state (if this was a create+start lifecycle container)

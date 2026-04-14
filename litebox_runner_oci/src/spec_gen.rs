@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 /// Accumulated metadata from Dockerfile instructions.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ImageMetadata {
     pub env: Vec<String>,
     pub working_dir: Option<String>,
