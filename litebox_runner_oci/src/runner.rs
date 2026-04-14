@@ -736,10 +736,23 @@ pub fn run_container(
                 .collect()
         })
         .unwrap_or_default();
-    let writable_paths = if writable_paths.is_empty() {
-        vec!["/tmp".to_string(), "/var".to_string()]
+
+    // Honour the OCI spec's root.readonly field.  When false (e.g. bundles
+    // produced by `--image`), the broker serves the rootfs fully writable
+    // and no writable-path overrides are needed.
+    let root_readonly = spec
+        .root()
+        .as_ref()
+        .is_some_and(|r| r.readonly().unwrap_or(false));
+
+    let writable_paths = if root_readonly {
+        if writable_paths.is_empty() {
+            vec!["/tmp".to_string(), "/var".to_string()]
+        } else {
+            writable_paths
+        }
     } else {
-        writable_paths
+        vec![] // entire rootfs is writable
     };
 
     // 6. Generate broker socket path
@@ -758,7 +771,7 @@ pub fn run_container(
         &rootfs_path,
         &bind_mounts,
         &writable_paths,
-        true, // read_only
+        root_readonly,
     )?;
 
     // 8. Wait for broker socket to appear (up to 5 seconds)

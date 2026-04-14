@@ -223,11 +223,7 @@ pub fn prepare_image_bundle(
         metadata.cmd = Some(args.to_vec());
     }
 
-    // Write config.json with extra tmpfs mounts for common writable paths.
-    // The cached rootfs is shared across runs, so the broker serves it
-    // read-only.  Tmpfs mounts give the container writable scratch space
-    // at paths that programs commonly expect to write to.
-    write_config_json_with_extra_mounts(&bundle_dir, &metadata)?;
+    write_config_json(&bundle_dir, &metadata)?;
 
     eprintln!("[RUN] Bundle ready at {}", bundle_dir.display());
     Ok(bundle_dir)
@@ -243,51 +239,6 @@ pub fn prepare_image_bundle(
 }
 
 // ---------------------------------------------------------------------------
-// Helper: write config.json with extra tmpfs mounts for --image mode
-// ---------------------------------------------------------------------------
-
-/// Write an OCI config.json that includes extra tmpfs mounts for common
-/// writable directories (`/root`, `/home`, `/var`, `/run`).
-///
-/// When running from a cached image rootfs, the broker serves the rootfs
-/// read-only (with writable paths restricted to tmpfs mount destinations).
-/// Adding these tmpfs mounts gives the container process writable scratch
-/// space at the paths that programs most commonly expect to write to.
-fn write_config_json_with_extra_mounts(bundle_dir: &Path, metadata: &ImageMetadata) -> Result<()> {
-    let json = crate::spec_gen::generate_spec(metadata)?;
-    let mut spec: serde_json::Value =
-        serde_json::from_str(&json).context("failed to parse generated spec")?;
-
-    // Add extra tmpfs mounts for writable paths.
-    let extra_mounts = ["/root", "/home", "/var", "/run"];
-    if let Some(mounts) = spec["mounts"].as_array_mut() {
-        for dest in &extra_mounts {
-            // Skip if already present.
-            let already = mounts
-                .iter()
-                .any(|m| m["destination"].as_str() == Some(dest));
-            if !already {
-                mounts.push(serde_json::json!({
-                    "destination": dest,
-                    "type": "tmpfs",
-                    "source": "tmpfs"
-                }));
-            }
-        }
-    }
-
-    // Verify round-trip.
-    let json = serde_json::to_string_pretty(&spec).context("failed to serialize OCI spec")?;
-    let _: oci_spec::runtime::Spec =
-        serde_json::from_str(&json).context("generated spec is not valid OCI runtime spec")?;
-
-    let config_path = bundle_dir.join("config.json");
-    fs::write(&config_path, json)
-        .with_context(|| format!("failed to write {}", config_path.display()))?;
-
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Helper: validate source path is within build context
 // ---------------------------------------------------------------------------
