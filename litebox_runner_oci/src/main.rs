@@ -170,10 +170,12 @@ enum Command {
         #[clap(long, value_name = "FILE")]
         env_file: Option<PathBuf>,
 
-        /// Bind mount a host directory into the container (read-only).
-        /// Format: HOST_PATH:GUEST_PATH (e.g., -v /home/user/project:/workspace).
+        /// Bind mount a host directory into the container.
+        /// Format: HOST_PATH:GUEST_PATH[:ro|rw] (default: rw).
+        /// Examples: -v /home/user/project:/workspace
+        ///           -v /data:/mnt/data:ro
         /// Can be specified multiple times.
-        #[clap(short, long = "volume", value_name = "HOST:GUEST")]
+        #[clap(short, long = "volume", value_name = "HOST:GUEST[:ro|rw]")]
         volumes: Vec<String>,
 
         /// TUN device name for container networking (e.g., "tun99").
@@ -372,21 +374,28 @@ fn parse_extra_env(env: &[String], env_file: Option<&PathBuf>) -> Result<Vec<Str
     Ok(extra_env)
 }
 
-/// Parse volume mount specifications into (host_path, guest_path) pairs.
+/// Parse volume mount specifications.
 ///
-/// Each volume spec must be in the format `HOST_PATH:GUEST_PATH`.
-/// Both paths must be absolute.
-fn parse_volumes(volumes: &[String]) -> Result<Vec<(String, String)>> {
+/// Each volume spec must be in the format `HOST_PATH:GUEST_PATH[:ro|rw]`.
+/// Both paths must be absolute. Default mode is read-write (`rw`).
+fn parse_volumes(volumes: &[String]) -> Result<Vec<litebox_runner_oci::VolumeMount>> {
     let mut mounts = Vec::with_capacity(volumes.len());
     for vol in volumes {
-        let parts: Vec<&str> = vol.splitn(2, ':').collect();
-        if parts.len() != 2 {
+        let parts: Vec<&str> = vol.splitn(3, ':').collect();
+        if parts.len() < 2 {
             anyhow::bail!(
-                "invalid volume spec (expected HOST_PATH:GUEST_PATH): {vol}"
+                "invalid volume spec (expected HOST_PATH:GUEST_PATH[:ro|rw]): {vol}"
             );
         }
         let host_path = parts[0];
         let guest_path = parts[1];
+        let read_only = match parts.get(2) {
+            Some(&"ro") => true,
+            Some(&"rw") | None => false,
+            Some(mode) => anyhow::bail!(
+                "invalid volume mode '{mode}' (expected 'ro' or 'rw'): {vol}"
+            ),
+        };
         if !host_path.starts_with('/') {
             anyhow::bail!(
                 "volume host path must be absolute: {host_path}"
@@ -403,7 +412,11 @@ fn parse_volumes(volumes: &[String]) -> Result<Vec<(String, String)>> {
                 "volume host path does not exist: {host_path}"
             );
         }
-        mounts.push((host_path.to_string(), guest_path.to_string()));
+        mounts.push(litebox_runner_oci::VolumeMount {
+            host_path: host_path.to_string(),
+            guest_path: guest_path.to_string(),
+            read_only,
+        });
     }
     Ok(mounts)
 }

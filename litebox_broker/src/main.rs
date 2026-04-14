@@ -56,8 +56,9 @@ struct Cli {
     #[arg(long, conflicts_with = "network_proxy_fd")]
     network_proxy_listen: Option<String>,
 
-    /// Bind mount a host directory at a guest path (read-only).
-    /// Format: guest_path:host_path (e.g., /etc/resolv.conf:/run/host-resolv.conf)
+    /// Bind mount a host directory at a guest path.
+    /// Format: guest_path:host_path (e.g., /etc/resolv.conf:/run/host-resolv.conf).
+    /// Writability is controlled by --read-only and --writable-path policy.
     #[arg(long = "bind")]
     binds: Vec<String>,
 }

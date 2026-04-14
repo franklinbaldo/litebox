@@ -16,6 +16,17 @@ use oci_spec::runtime::Spec;
 
 use litebox_runner_linux_userland::{CliArgs, InterceptionBackend};
 
+/// A volume mount binding a host directory into the container.
+#[derive(Debug, Clone)]
+pub struct VolumeMount {
+    /// Absolute path on the host.
+    pub host_path: String,
+    /// Absolute path inside the container.
+    pub guest_path: String,
+    /// If true, the mount is read-only. Default is false (read-write).
+    pub read_only: bool,
+}
+
 /// Network configuration for container.
 #[derive(Debug, Clone, Default)]
 pub struct NetworkConfig {
@@ -645,7 +656,7 @@ pub fn run_container(
     override_user: Option<&(u32, u32)>,
     state_dir: Option<std::path::PathBuf>,
     restore_image: Option<std::path::PathBuf>,
-    extra_bind_mounts: &[(String, String)],
+    extra_bind_mounts: &[VolumeMount],
 ) -> Result<i32> {
     // 1. Parse config.json from bundle
     let spec_path = bundle_path.join("config.json");
@@ -727,17 +738,22 @@ pub fn run_container(
         .unwrap_or_default();
 
     // 4b. Merge extra bind mounts from CLI -v/--volume flags.
-    // extra_bind_mounts are (host_path, guest_path) pairs; convert to
-    // (guest_path_no_slash, host_path) to match the broker's --bind format.
-    for (host_path, guest_path) in extra_bind_mounts {
-        let guest_rel = guest_path.strip_prefix('/').unwrap_or(guest_path);
-        bind_mounts.push((guest_rel.to_string(), host_path.clone()));
+    // Convert VolumeMount to (guest_path_no_slash, host_path) for the broker's
+    // --bind format. Read-write mounts also need their host paths added to the
+    // writable paths so the broker's policy allows writes.
+    let mut volume_writable_paths: Vec<String> = Vec::new();
+    for vol in extra_bind_mounts {
+        let guest_rel = vol.guest_path.strip_prefix('/').unwrap_or(&vol.guest_path);
+        bind_mounts.push((guest_rel.to_string(), vol.host_path.clone()));
+        if !vol.read_only {
+            volume_writable_paths.push(vol.host_path.clone());
+        }
     }
 
     // 5. Extract writable paths from tmpfs mounts in OCI spec.
     // These paths are passed to the broker as --writable-path so the broker
     // allows writes to them even in --read-only mode (e.g. /tmp).
-    let writable_paths: Vec<String> = spec
+    let mut writable_paths: Vec<String> = spec
         .mounts()
         .as_ref()
         .map(|mounts| {
@@ -748,11 +764,12 @@ pub fn run_container(
                 .collect()
         })
         .unwrap_or_default();
-    let writable_paths = if writable_paths.is_empty() {
-        vec!["/tmp".to_string(), "/var".to_string()]
-    } else {
-        writable_paths
-    };
+    if writable_paths.is_empty() {
+        writable_paths.push("/tmp".to_string());
+        writable_paths.push("/var".to_string());
+    }
+    // Add writable volume mount host paths so the broker allows writes to them.
+    writable_paths.extend(volume_writable_paths);
 
     // Determine whether the guest should treat the rootfs as read-only
     // (copy-on-write to in-memory upper layer) based on the OCI spec's
