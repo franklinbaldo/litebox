@@ -607,6 +607,7 @@ fn build_cli_args(
         working_directory,
         proc_mount: has_proc_mount,
         read_only_rootfs: false, // set by caller after build_cli_args
+        passthrough_paths: vec![], // set by caller after build_cli_args
         af_packet_fd,
         network_config,
         state_dir,
@@ -837,6 +838,24 @@ pub fn run_container(
     // When true, the guest uses LowerLayerReadOnly (COW to in-memory upper);
     // the base image on disk is never modified.
     cli_args.read_only_rootfs = root_readonly;
+
+    // 9a-bis. Collect guest-absolute paths for writable volume mounts.
+    // These are registered as passthrough prefixes on the guest-side layered
+    // FS so writes go directly to the 9P lower layer (broker → host) instead
+    // of being captured by the COW upper layer.
+    if root_readonly {
+        for vol in extra_bind_mounts {
+            if !vol.read_only {
+                let guest = if vol.guest_path.starts_with('/') {
+                    vol.guest_path.clone()
+                } else {
+                    format!("/{}", vol.guest_path)
+                };
+                tracing::info!(passthrough = %guest, "registering passthrough prefix for volume mount");
+                cli_args.passthrough_paths.push(guest);
+            }
+        }
+    }
 
     // 9b. Resolve non-absolute program path against rootfs via $PATH.
     // OCI specs often pass bare command names (e.g., "echo"), which must
@@ -1152,6 +1171,7 @@ pub fn run_build_step(
         working_directory: working_dir.map(String::from),
         proc_mount: true,
         read_only_rootfs: false, // build steps need writable rootfs
+        passthrough_paths: vec![],
         af_packet_fd: None,
         network_config: None,
         state_dir: None,

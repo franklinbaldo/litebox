@@ -142,6 +142,12 @@ pub struct CliArgs {
     #[arg(skip)]
     pub read_only_rootfs: bool,
 
+    /// Guest-absolute path prefixes that should pass writes through to the
+    /// 9P lower layer even when `read_only_rootfs` is true.  Used for
+    /// writable volume mounts (e.g. `-v /host/dir:/guest/dir`).
+    #[arg(skip)]
+    pub passthrough_paths: Vec<String>,
+
     /// Pre-opened AF_PACKET socket fd for CNI veth networking.
     /// When set, the platform uses `NetworkTransport::AfPacket` and smoltcp
     /// runs in Ethernet mode.
@@ -840,7 +846,7 @@ fn finish_run_restore_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         while worker_handle.poll_responses(&mut reader, &mut buf) {}
     });
 
-    let combined = litebox::fs::layered::FileSystem::new(
+    let mut combined = litebox::fs::layered::FileSystem::new(
         litebox,
         base_fs,
         nine_p_fs,
@@ -850,6 +856,9 @@ fn finish_run_restore_with_nine_p<FS: litebox_shim_linux::ShimFS>(
             litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles
         },
     );
+    for p in &cli_args.passthrough_paths {
+        combined.add_passthrough_prefix(p);
+    }
     let combined_fs = std::sync::Arc::new(combined);
 
     let program = shim
@@ -932,7 +941,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
             while worker_handle.poll_responses(&mut reader, &mut buf) {}
         });
 
-    let combined = litebox::fs::layered::FileSystem::new(
+    let mut combined = litebox::fs::layered::FileSystem::new(
         litebox,
         base_fs,
         nine_p_fs,
@@ -942,6 +951,9 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
             litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles
         },
         );
+        for p in &cli_args.passthrough_paths {
+            combined.add_passthrough_prefix(p);
+        }
         let combined_fs = std::sync::Arc::new(combined);
 
         let program = shim.load_program_with_exec_filename(
@@ -1018,7 +1030,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         while worker_handle.poll_responses(&mut reader, &mut buf) {}
     });
 
-    let combined = litebox::fs::layered::FileSystem::new(
+    let mut combined = litebox::fs::layered::FileSystem::new(
         litebox,
         base_fs,
         nine_p_fs,
@@ -1028,6 +1040,9 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
             litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles
         },
     );
+    for p in &cli_args.passthrough_paths {
+        combined.add_passthrough_prefix(p);
+    }
     let combined_fs = std::sync::Arc::new(combined);
 
     let program = shim.load_program_with_exec_filename(
@@ -2977,6 +2992,7 @@ fn build_cli_args_from_exec_params(
         working_directory: Some(params.cwd.clone()),
         proc_mount: false,
         read_only_rootfs: false, // worker-exec inherits parent's 9P connection
+        passthrough_paths: vec![],
         af_packet_fd: None,
         network_config: None,
         state_dir: None,
@@ -3445,6 +3461,7 @@ mod tests {
             working_directory: None,
             proc_mount: false,
             read_only_rootfs: false,
+            passthrough_paths: vec![],
             af_packet_fd: None,
             network_config: None,
             state_dir: None,

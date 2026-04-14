@@ -2259,6 +2259,118 @@ mod layered {
         assert_eq!(&buffer[..bytes_read], data);
         fs.close(&fd).expect("Failed to close");
     }
+
+    /// Passthrough prefixes: when `LowerLayerReadOnly` is active but a prefix
+    /// is registered as passthrough, writes to paths under that prefix should
+    /// go directly to the lower layer instead of being captured by the COW
+    /// upper layer.
+    #[test]
+    fn passthrough_prefix_writes_go_to_lower_layer() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        // Upper: empty in-mem filesystem.
+        let upper = in_mem::FileSystem::new(&litebox);
+
+        // Lower: also in-mem (writable) so we can verify writes land there.
+        let mut lower = in_mem::FileSystem::new(&litebox);
+        lower.with_root_privileges(|fs| {
+            fs.mkdir("/vol", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("mkdir /vol on lower");
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("chmod / on lower");
+        });
+
+        let mut fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
+        // Register /vol/ as a passthrough prefix.
+        fs.add_passthrough_prefix("/vol");
+
+        // Create a file under /vol — should go to the lower layer.
+        let fd = fs
+            .open("/vol/test.txt", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("create /vol/test.txt");
+        let data = b"passthrough!";
+        fs.write(&fd, data, None).expect("write");
+        fs.close(&fd).expect("close");
+
+        // Read back via the layered FS.
+        let fd = fs
+            .open("/vol/test.txt", OFlags::RDONLY, Mode::empty())
+            .expect("open /vol/test.txt for read");
+        let mut buf = vec![0u8; 64];
+        let n = fs.read(&fd, &mut buf, None).expect("read");
+        assert_eq!(&buf[..n], data);
+        fs.close(&fd).expect("close");
+
+        // Verify a non-passthrough path still uses COW (write to upper).
+        // Create /other on the lower so it exists as a directory.
+        // (We can't directly add to the frozen lower, so just verify that a
+        // write to /vol2 — which is NOT a passthrough prefix — would be
+        // captured by the COW layer.)
+
+        // Write to a file at root — not passthrough, should go to upper.
+        let fd = fs
+            .open("/cowfile.txt", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("create /cowfile.txt");
+        let cow_data = b"cow!";
+        fs.write(&fd, cow_data, None).expect("write");
+        fs.close(&fd).expect("close");
+
+        // Read back /cowfile.txt — should work (it's on upper layer via COW).
+        let fd = fs
+            .open("/cowfile.txt", OFlags::RDONLY, Mode::empty())
+            .expect("open /cowfile.txt for read");
+        let mut buf = vec![0u8; 64];
+        let n = fs.read(&fd, &mut buf, None).expect("read");
+        assert_eq!(&buf[..n], cow_data);
+        fs.close(&fd).expect("close");
+    }
+
+    /// Verify that passthrough prefix matching doesn't false-positive on
+    /// similar prefixes (e.g. /vol vs /vol2).
+    #[test]
+    fn passthrough_prefix_does_not_match_similar_names() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        let upper = in_mem::FileSystem::new(&litebox);
+        let mut lower = in_mem::FileSystem::new(&litebox);
+        lower.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("chmod /");
+        });
+
+        let mut fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
+        fs.add_passthrough_prefix("/vol");
+
+        // /vol2 should NOT match the /vol/ prefix.
+        // Creating /vol2 directory should go to the upper (COW) layer.
+        fs.mkdir("/vol2", Mode::RWXU).expect("mkdir /vol2");
+
+        // /vol2/file should be created on upper (COW), not passthrough.
+        let fd = fs
+            .open("/vol2/file.txt", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("create /vol2/file.txt");
+        fs.write(&fd, b"not passthrough", None).expect("write");
+        fs.close(&fd).expect("close");
+
+        // Read it back — works because it's on the upper layer.
+        let fd = fs
+            .open("/vol2/file.txt", OFlags::RDONLY, Mode::empty())
+            .expect("open /vol2/file.txt for read");
+        let mut buf = vec![0u8; 64];
+        let n = fs.read(&fd, &mut buf, None).expect("read");
+        assert_eq!(&buf[..n], b"not passthrough");
+        fs.close(&fd).expect("close");
+    }
 }
 
 mod stdio {

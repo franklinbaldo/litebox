@@ -58,6 +58,12 @@ pub enum LayeringSemantics {
 /// doesn't exist in the upper layer, but _does_ exist in the lower layer, this will have
 /// copy-on-write semantics.
 ///
+/// **Passthrough prefixes:** When `LowerLayerReadOnly` is active, certain path
+/// prefixes can be marked as "passthrough". Paths under these prefixes behave
+/// as if `LowerLayerWritableFiles` were in effect — writes go directly to the
+/// lower layer instead of being captured by the COW upper. This is used for
+/// writable volume mounts in the OCI container model.
+///
 /// Future versions of the layering might support other configurable options for the layering.
 pub struct FileSystem<
     Platform: sync::RawSyncPrimitivesProvider,
@@ -71,6 +77,10 @@ pub struct FileSystem<
     // sync-primitives platform, as well as cost of mutexes and such?
     root: sync::RwLock<Platform, RootDir<Upper, Lower>>,
     layering_semantics: LayeringSemantics,
+    /// Path prefixes for which `LowerLayerReadOnly` is overridden to
+    /// `LowerLayerWritableFiles`.  Only consulted when the global semantics is
+    /// `LowerLayerReadOnly`; otherwise all paths are already writable-through.
+    passthrough_prefixes: Vec<String>,
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
     node_info_lookup: sync::RwLock<Platform, HashMap<NodeInfo, usize>>,
@@ -96,8 +106,54 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             root,
             current_working_dir: "/".into(),
             layering_semantics,
+            passthrough_prefixes: Vec::new(),
             node_info_lookup,
         }
+    }
+
+    /// Register a guest-absolute path prefix as "passthrough".
+    ///
+    /// Paths that start with this prefix (including the prefix itself) will
+    /// behave as `LowerLayerWritableFiles` even when the global semantics is
+    /// `LowerLayerReadOnly`.  The prefix should be an absolute guest path
+    /// (e.g. `/mnt/vol`).  A trailing `/` is appended internally if absent so
+    /// that `/mnt/vol2` does not accidentally match a `/mnt/vol` prefix.
+    pub fn add_passthrough_prefix(&mut self, prefix: &str) {
+        let mut p = String::from(prefix);
+        if !p.ends_with('/') {
+            p.push('/');
+        }
+        self.passthrough_prefixes.push(p);
+    }
+
+    /// Return the effective layering semantics for `path`.
+    ///
+    /// If the global semantics is `LowerLayerReadOnly` but `path` falls under
+    /// a registered passthrough prefix, this returns a reference to a
+    /// `LowerLayerWritableFiles`-like decision (returns `true` if the path
+    /// should be treated as writable-through).
+    fn is_passthrough(&self, path: &str) -> bool {
+        if !matches!(self.layering_semantics, LayeringSemantics::LowerLayerReadOnly) {
+            return false; // already writable-through everywhere
+        }
+        // Exact prefix match: the path itself is the mount directory, or the
+        // path starts with "prefix/" (prefix already ends with '/').
+        self.passthrough_prefixes.iter().any(|prefix| {
+            path.starts_with(prefix.as_str())
+                || path.strip_suffix('/').is_some_and(|p| {
+                    let trimmed_prefix = prefix.strip_suffix('/').unwrap_or(prefix.as_str());
+                    p == trimmed_prefix
+                })
+        })
+    }
+
+    /// Whether the lower layer should be treated as read-only for this path.
+    ///
+    /// Returns `true` when `LowerLayerReadOnly` is active AND the path is NOT
+    /// under a passthrough prefix.
+    fn is_lower_readonly_for(&self, path: &str) -> bool {
+        matches!(self.layering_semantics, LayeringSemantics::LowerLayerReadOnly)
+            && !self.is_passthrough(path)
     }
 
     /// (private-only) check if the lower level has the path; if there is an I/O or path failure,
@@ -785,8 +841,10 @@ impl<
                 // removed it for us. We don't need to remove it, and can proceed as normal.
             }
         }
-        // When LowerLayerWritableFiles and O_CREAT for a new file, try the
-        // lower layer first so the file persists on the host filesystem.
+        // When the lower layer is writable for this path (either because the
+        // global semantics is LowerLayerWritableFiles, or the path falls under
+        // a passthrough prefix) and O_CREAT for a new file, try the lower
+        // layer first so the file persists on the host filesystem.
         // Fall back to upper if lower can't create (e.g., parent dir only
         // exists on upper).  Skip if we just removed a tombstone — the file
         // still exists on lower and reopening it would resurrect a hidden entry.
@@ -795,10 +853,7 @@ impl<
         // wrong type), and creating on lower would shadow the upper entry.
         if flags.contains(OFlags::CREAT)
             && !tombstone_removal
-            && matches!(
-                self.layering_semantics,
-                LayeringSemantics::LowerLayerWritableFiles
-            )
+            && !self.is_lower_readonly_for(&path)
             && self.file_status(path.as_str()).is_err()
         {
             // Validate path through upper first. Only soft not-found errors
@@ -938,27 +993,32 @@ impl<
                         // reports `MissingComponent`, but when the upper is
                         // itself a nested layered FS it may return
                         // `NoSuchFileOrDirectory` after exhausting all its own
-                        // layers.  In either case we check whether the *lower*
-                        // layer has the parent directory and, if so, migrate
-                        // those ancestor directories to the upper and retry.
-                        let dirname = path.rsplit_once('/').unwrap().0;
-                        if let Ok(FileType::Directory) = self.ensure_lower_contains(dirname) {
-                            // We must migrate the directories above, and then re-trigger the open
-                            match self.mkdir_migrating_ancestor_dirs(&path) {
-                                Ok(()) => return self.open(path, flags, mode),
-                                Err(MkdirError::NoWritePerms) => {
-                                    return Err(OpenError::NoWritePerms);
+                        // layers.
+                        //
+                        // For passthrough paths, skip the migration — let the
+                        // request fall through to the lower-layer open below
+                        // where it will be created directly on the host via 9P.
+                        if !self.is_passthrough(&path) {
+                            let dirname = path.rsplit_once('/').unwrap().0;
+                            if let Ok(FileType::Directory) = self.ensure_lower_contains(dirname) {
+                                // We must migrate the directories above, and then re-trigger the open
+                                match self.mkdir_migrating_ancestor_dirs(&path) {
+                                    Ok(()) => return self.open(path, flags, mode),
+                                    Err(MkdirError::NoWritePerms) => {
+                                        return Err(OpenError::NoWritePerms);
+                                    }
+                                    Err(MkdirError::ReadOnlyFileSystem) => {
+                                        return Err(OpenError::ReadOnlyFileSystem);
+                                    }
+                                    Err(MkdirError::PathError(e)) => {
+                                        return Err(OpenError::PathError(e));
+                                    }
+                                    Err(_) => return Err(OpenError::Io),
                                 }
-                                Err(MkdirError::ReadOnlyFileSystem) => {
-                                    return Err(OpenError::ReadOnlyFileSystem);
-                                }
-                                Err(MkdirError::PathError(e)) => {
-                                    return Err(OpenError::PathError(e));
-                                }
-                                Err(_) => return Err(OpenError::Io),
                             }
                         }
-                        // Otherwise, handle-able by a lower level, fallthrough
+                        // For passthrough: fallthrough to lower-layer open.
+                        // For non-passthrough: parent not on lower, fallthrough.
                     }
                     OpenError::PathError(
                         PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
@@ -971,29 +1031,24 @@ impl<
         // We must check the lower level, creating an entry if needed
         let original_flags = flags;
         let mut flags = flags;
-        match self.layering_semantics {
-            LayeringSemantics::LowerLayerReadOnly => {
-                // Prevent creation or truncation of files at lower level
-                flags.remove(OFlags::CREAT);
-                flags.remove(OFlags::TRUNC);
-                // Switch the lower level to read-only; the other calls will take care of
-                // copying into the upper level if/when necessary.
-                flags.remove(OFlags::RDWR);
-                flags.remove(OFlags::WRONLY);
-                flags.insert(OFlags::RDONLY);
-            }
-            LayeringSemantics::LowerLayerWritableFiles => {
-                // Preserve O_CREAT so the lower layer can create new files.
-                // O_TRUNC is also preserved — the lower layer handles it directly.
-            }
+        let lower_readonly = self.is_lower_readonly_for(&path);
+        if lower_readonly {
+            // Prevent creation or truncation of files at lower level
+            flags.remove(OFlags::CREAT);
+            flags.remove(OFlags::TRUNC);
+            // Switch the lower level to read-only; the other calls will take care of
+            // copying into the upper level if/when necessary.
+            flags.remove(OFlags::RDWR);
+            flags.remove(OFlags::WRONLY);
+            flags.insert(OFlags::RDONLY);
         }
+        // else: LowerLayerWritableFiles or passthrough —
+        // Preserve O_CREAT so the lower layer can create new files.
+        // O_TRUNC is also preserved — the lower layer handles it directly.
         // Any errors from lower level now _must_ propagate up, so we can just invoke
         // the lower level and set up the relevant descriptor upon success.
         #[cfg(feature = "trace_fs")]
-        if matches!(
-            self.layering_semantics,
-            LayeringSemantics::LowerLayerWritableFiles
-        ) {
+        if !lower_readonly {
             log_println!(
                 self.litebox.x.platform,
                 "[LAYERED-TRACE] trying lower.open path={:?} flags={:?}",
@@ -1005,10 +1060,7 @@ impl<
             Ok(fd) => fd,
             Err(e) => {
                 #[cfg(feature = "trace_fs")]
-                if matches!(
-                    self.layering_semantics,
-                    LayeringSemantics::LowerLayerWritableFiles
-                ) {
+                if !lower_readonly {
                     log_println!(
                         self.litebox.x.platform,
                         "[LAYERED-TRACE] lower.open FAILED path={:?} flags={:?} err={:?}",
@@ -1071,11 +1123,14 @@ impl<
             entry,
             position: 0.into(),
         });
-        if original_flags.contains(OFlags::TRUNC) {
+        if original_flags.contains(OFlags::TRUNC) && lower_readonly {
             // The only scenario where we need to manually trigger truncation is when a file does
             // not exist at the upper level but exists at the lower level; in that case, our
             // `truncate` functionality (at the layered FS itself) should correctly migrate things
             // over and handle them.
+            //
+            // When the lower layer is writable (LowerLayerWritableFiles or passthrough),
+            // O_TRUNC was already preserved in the flags and the lower layer handled it.
             match self.truncate(&fd, 0, true) {
                 Ok(()) | Err(TruncateError::IsTerminalDevice) => {
                     // The terminal device is the one case we need to (due to Linux compatibility)
@@ -1298,19 +1353,15 @@ impl<
                 return Ok(num_bytes);
             }
             EntryX::Lower { fd: lower_fd } => {
-                match self.layering_semantics {
-                    LayeringSemantics::LowerLayerReadOnly => {
-                        // fallthrough
+                if !self.is_lower_readonly_for(&path) {
+                    // LowerLayerWritableFiles or passthrough: direct write to lower layer
+                    let num_bytes = self.lower.write(lower_fd, buf, offset)?;
+                    if let Some(e) = self.litebox.descriptor_table().get_entry(fd) {
+                        e.entry.position.fetch_add(num_bytes, SeqCst);
                     }
-                    LayeringSemantics::LowerLayerWritableFiles => {
-                        // Allow direct write to lower layer
-                        let num_bytes = self.lower.write(lower_fd, buf, offset)?;
-                        if let Some(e) = self.litebox.descriptor_table().get_entry(fd) {
-                            e.entry.position.fetch_add(num_bytes, SeqCst);
-                        }
-                        return Ok(num_bytes);
-                    }
+                    return Ok(num_bytes);
                 }
+                // else: LowerLayerReadOnly — fall through to COW migration
             }
             EntryX::Tombstone => unreachable!(),
         }
@@ -1392,56 +1443,56 @@ impl<
         length: usize,
         reset_offset: bool,
     ) -> Result<(), TruncateError> {
-        let (flags, entry) = self
+        let (flags, entry, trunc_path) = self
             .litebox
             .descriptor_table()
             .with_entry(fd, |descriptor| {
-                (descriptor.entry.flags, Arc::clone(&descriptor.entry.entry))
+                (
+                    descriptor.entry.flags,
+                    Arc::clone(&descriptor.entry.entry),
+                    descriptor.entry.path.clone(),
+                )
             })
             .ok_or(TruncateError::ClosedFd)?;
         let layered_fd = fd;
         match entry.as_ref() {
             EntryX::Upper { fd } => self.upper.truncate(fd, length, reset_offset),
             EntryX::Lower { fd } => {
-                match self.layering_semantics {
-                    LayeringSemantics::LowerLayerWritableFiles => {
-                        self.lower.truncate(fd, length, reset_offset)
-                    }
-                    LayeringSemantics::LowerLayerReadOnly => {
-                        if flags.contains(OFlags::WRONLY) || flags.contains(OFlags::RDWR) {
-                            // We might need to migrate the file up
-                            match self.lower.truncate(fd, length, reset_offset) {
-                                Ok(()) | Err(TruncateError::ClosedFd) => unreachable!(),
-                                Err(TruncateError::IsDirectory) => Err(TruncateError::IsDirectory),
-                                Err(TruncateError::IsTerminalDevice) => {
-                                    Err(TruncateError::IsTerminalDevice)
-                                }
-                                Err(TruncateError::NotForWriting) => {
-                                    // We must actually migrate this file up, and keep it truncated.
-                                    //
-                                    // We must first drop the cloned entry to make sure that the ref
-                                    // counting works out correctly during migration.
-                                    drop(entry);
-                                    let path = self
-                                        .litebox
-                                        .descriptor_table()
-                                        .with_entry(layered_fd, |descriptor| {
-                                            descriptor.entry.path.clone()
-                                        })
-                                        .ok_or(TruncateError::ClosedFd)?;
-                                    match self.migrate_file_up(&path, false) {
-                                        Ok(()) => Ok(()),
-                                        Err(MigrationError::Io | _) => Err(TruncateError::Io),
-                                    }
-                                }
-                                Err(TruncateError::Io) => Err(TruncateError::Io),
-                            }
-                        } else {
-                            // The lower level truncate will correctly identify dir/file and handle
-                            // the difference in erroring.
-                            self.lower.truncate(fd, length, reset_offset)
+                if !self.is_lower_readonly_for(&trunc_path) {
+                    // LowerLayerWritableFiles or passthrough: direct truncate on lower
+                    self.lower.truncate(fd, length, reset_offset)
+                } else if flags.contains(OFlags::WRONLY) || flags.contains(OFlags::RDWR) {
+                    // LowerLayerReadOnly: we might need to migrate the file up
+                    match self.lower.truncate(fd, length, reset_offset) {
+                        Ok(()) | Err(TruncateError::ClosedFd) => unreachable!(),
+                        Err(TruncateError::IsDirectory) => Err(TruncateError::IsDirectory),
+                        Err(TruncateError::IsTerminalDevice) => {
+                            Err(TruncateError::IsTerminalDevice)
                         }
+                        Err(TruncateError::NotForWriting) => {
+                            // We must actually migrate this file up, and keep it truncated.
+                            //
+                            // We must first drop the cloned entry to make sure that the ref
+                            // counting works out correctly during migration.
+                            drop(entry);
+                            let path = self
+                                .litebox
+                                .descriptor_table()
+                                .with_entry(layered_fd, |descriptor| {
+                                    descriptor.entry.path.clone()
+                                })
+                                .ok_or(TruncateError::ClosedFd)?;
+                            match self.migrate_file_up(&path, false) {
+                                Ok(()) => Ok(()),
+                                Err(MigrationError::Io | _) => Err(TruncateError::Io),
+                            }
+                        }
+                        Err(TruncateError::Io) => Err(TruncateError::Io),
                     }
+                } else {
+                    // The lower level truncate will correctly identify dir/file and handle
+                    // the difference in erroring.
+                    self.lower.truncate(fd, length, reset_offset)
                 }
             }
             EntryX::Tombstone => unreachable!(),
@@ -1487,10 +1538,7 @@ impl<
             Err(FileStatusError::PathError(e)) => return Err(ChmodError::PathError(e)),
             Err(FileStatusError::ClosedFd | FileStatusError::NotADirectory) => unreachable!(),
         }
-        if matches!(
-            self.layering_semantics,
-            LayeringSemantics::LowerLayerWritableFiles
-        ) {
+        if !self.is_lower_readonly_for(&path) {
             return self.lower.chmod(path.as_str(), mode);
         }
         match self.migrate_file_up(&path, true) {
@@ -1549,10 +1597,7 @@ impl<
             Err(FileStatusError::PathError(e)) => return Err(ChownError::PathError(e)),
             Err(FileStatusError::ClosedFd | FileStatusError::NotADirectory) => unreachable!(),
         }
-        if matches!(
-            self.layering_semantics,
-            LayeringSemantics::LowerLayerWritableFiles
-        ) {
+        if !self.is_lower_readonly_for(&path) {
             return self.lower.chown(path.as_str(), user, group);
         }
         match self.migrate_file_up(&path, true) {
@@ -1618,12 +1663,28 @@ impl<
                 }
             },
         }
-        // We can now place a tombstone over the lower level file, marking it as deleted, without
-        // actually changing the lower level.
-        self.root
-            .write()
-            .entries
-            .insert(path, Arc::new(EntryX::Tombstone));
+        // For LowerLayerReadOnly (non-passthrough), place a tombstone over the
+        // lower-level file.  For LowerLayerWritableFiles or passthrough, actually
+        // unlink from the lower layer.
+        if self.is_lower_readonly_for(&path) {
+            self.root
+                .write()
+                .entries
+                .insert(path, Arc::new(EntryX::Tombstone));
+        } else {
+            // Writable lower: actually remove from lower layer, suppressing
+            // non-existence errors (the file may have only been on the upper).
+            if let Err(e) = self.lower.unlink(path.as_str()) {
+                match e {
+                    UnlinkError::PathError(
+                        PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                    ) => {
+                        // File doesn't exist on lower — fine, it only existed on upper.
+                    }
+                    _ => return Err(e),
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1659,12 +1720,10 @@ impl<
                 .is_some_and(|e| matches!(e.as_ref(), EntryX::Tombstone));
         }
 
-        // When LowerLayerWritableFiles, try the lower layer first so renames
-        // of host-persisted files stay on the lower layer.
-        if matches!(
-            self.layering_semantics,
-            LayeringSemantics::LowerLayerWritableFiles
-        ) {
+        // When LowerLayerWritableFiles (or passthrough), try the lower layer
+        // first so renames of host-persisted files stay on the lower layer.
+        // For passthrough, we check the *source* path to decide.
+        if !self.is_lower_readonly_for(&old) {
             // Check upper status for both paths, propagating hard ancestor
             // errors (ComponentNotADirectory, NoSearchPerms, etc.) that
             // visible lookup would also reject.
@@ -1812,15 +1871,13 @@ impl<
         if self.has_tombstoned_ancestor(&path)? {
             return Err(PathError::NoSuchFileOrDirectory)?;
         }
-        // When LowerLayerWritableFiles, try lower layer first so directories
-        // persist on the host. Fall back to upper if lower can't create.
-        // But first, check upper for conflicts: if the path already exists,
-        // reject with AlreadyExists; if an ancestor is invalid (non-dir,
-        // no search perms), propagate that error instead of creating on lower.
-        if matches!(
-            self.layering_semantics,
-            LayeringSemantics::LowerLayerWritableFiles
-        ) {
+        // When LowerLayerWritableFiles (or passthrough), try lower layer first
+        // so directories persist on the host. Fall back to upper if lower can't
+        // create.  But first, check upper for conflicts: if the path already
+        // exists, reject with AlreadyExists; if an ancestor is invalid
+        // (non-dir, no search perms), propagate that error instead of creating
+        // on lower.
+        if !self.is_lower_readonly_for(&path) {
             match self.upper.file_status(path.as_str()) {
                 Ok(_) => return Err(MkdirError::AlreadyExists),
                 Err(FileStatusError::PathError(
@@ -1896,12 +1953,9 @@ impl<
         if self.has_tombstoned_ancestor(&linkpath)? {
             return Err(PathError::NoSuchFileOrDirectory)?;
         }
-        // When LowerLayerWritableFiles, create symlink on lower layer first
-        // so it persists on the host filesystem.
-        if matches!(
-            self.layering_semantics,
-            LayeringSemantics::LowerLayerWritableFiles
-        ) {
+        // When LowerLayerWritableFiles (or passthrough), create symlink on
+        // lower layer first so it persists on the host filesystem.
+        if !self.is_lower_readonly_for(&linkpath) {
             match self.lower.symlink(target_str, linkpath.as_str()) {
                 Ok(()) => return Ok(()),
                 Err(
@@ -1930,11 +1984,9 @@ impl<
         if self.has_tombstoned_ancestor(&newpath)? {
             return Err(PathError::NoSuchFileOrDirectory)?;
         }
-        // When LowerLayerWritableFiles, create hard link on lower layer first.
-        if matches!(
-            self.layering_semantics,
-            LayeringSemantics::LowerLayerWritableFiles
-        ) {
+        // When LowerLayerWritableFiles (or passthrough), create hard link on
+        // lower layer first.
+        if !self.is_lower_readonly_for(&newpath) {
             match self.lower.link(oldpath.as_str(), newpath.as_str()) {
                 Ok(()) => return Ok(()),
                 Err(
@@ -2019,13 +2071,14 @@ impl<
             }
         }
 
-        if let LayeringSemantics::LowerLayerReadOnly = self.layering_semantics {
+        if self.is_lower_readonly_for(&path) {
             self.root
                 .write()
                 .entries
                 .insert(path, Arc::new(EntryX::Tombstone));
         } else {
-            // If lower layer is writable, we can just rmdir there too, suppressing non-existence errors.
+            // If lower layer is writable (or passthrough), we can just rmdir there too,
+            // suppressing non-existence errors.
             if let Err(e) = self.lower.rmdir(path.as_str()) {
                 match e {
                     RmdirError::PathError(

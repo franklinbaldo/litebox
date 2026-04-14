@@ -994,7 +994,9 @@ impl Server {
             _ => return error_response(libc::EPERM as u32),
         };
         let resolved_target = resolved_parent.join(&name);
-        if !resolved_target.starts_with(&self.root) {
+        if !resolved_target.starts_with(&self.root)
+            && !self.mount_table.is_under_mount(&resolved_target)
+        {
             return error_response(libc::EPERM as u32);
         }
 
@@ -1443,7 +1445,7 @@ impl Server {
             Err(errno) => return error_response(errno),
         };
         let target = resolved_parent.join(&name);
-        if !target.starts_with(&self.root) {
+        if !target.starts_with(&self.root) && !self.mount_table.is_under_mount(&target) {
             return error_response(libc::EPERM as u32);
         }
 
@@ -1492,7 +1494,7 @@ impl Server {
             Err(errno) => return error_response(errno),
         };
         let target = resolved_parent.join(&name);
-        if !target.starts_with(&self.root) {
+        if !target.starts_with(&self.root) && !self.mount_table.is_under_mount(&target) {
             return error_response(libc::EPERM as u32);
         }
 
@@ -1546,10 +1548,10 @@ impl Server {
         };
 
         let link_path = resolved_parent.join(&name);
-        if !link_path.starts_with(&self.root) {
+        if !link_path.starts_with(&self.root) && !self.mount_table.is_under_mount(&link_path) {
             return error_response(libc::EPERM as u32);
         }
-        if !resolved_src.starts_with(&self.root) {
+        if !resolved_src.starts_with(&self.root) && !self.mount_table.is_under_mount(&resolved_src) {
             return error_response(libc::EPERM as u32);
         }
 
@@ -1597,7 +1599,7 @@ impl Server {
             Err(errno) => return error_response(errno),
         };
         let target = resolved_parent.join(&name);
-        if !target.starts_with(&self.root) {
+        if !target.starts_with(&self.root) && !self.mount_table.is_under_mount(&target) {
             return error_response(libc::EPERM as u32);
         }
 
@@ -1663,7 +1665,7 @@ impl Server {
             Err(errno) => return error_response(errno),
         };
         let target = resolved_parent.join(&name);
-        if !target.starts_with(&self.root) {
+        if !target.starts_with(&self.root) && !self.mount_table.is_under_mount(&target) {
             return error_response(libc::EPERM as u32);
         }
 
@@ -1750,7 +1752,7 @@ impl Server {
             Err(errno) => return error_response(errno),
         };
         let dst = resolved_dst_dir.join(&name);
-        if !dst.starts_with(&self.root) {
+        if !dst.starts_with(&self.root) && !self.mount_table.is_under_mount(&dst) {
             return error_response(libc::EPERM as u32);
         }
 
@@ -1824,7 +1826,9 @@ impl Server {
         let src = resolved_old_dir.join(&oldname);
         let dst = resolved_new_dir.join(&newname);
 
-        if !src.starts_with(&self.root) || !dst.starts_with(&self.root) {
+        if (!src.starts_with(&self.root) && !self.mount_table.is_under_mount(&src))
+            || (!dst.starts_with(&self.root) && !self.mount_table.is_under_mount(&dst))
+        {
             return error_response(libc::EPERM as u32);
         }
 
