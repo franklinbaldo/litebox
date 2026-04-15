@@ -142,11 +142,9 @@ jobs:
             target/*/build/litebox_runner_linux_userland-*/out
           key: custom-out-${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/litebox_syscall_rewriter/**/*.rs') }}
       - run: |
-          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features
-          ./.github/tools/github_actions_run_cargo clippy --manifest-path=litebox_runner_lvbs/Cargo.toml --target x86_64-unknown-none --all-features
+          RUSTFLAGS="-Clink-arg=--script=litebox_runner_lvbs/x86_64_vtl1.ld -Clink-arg=--gc-sections -Clink-arg=--static -Clink-arg=--pie" ./.github/tools/github_actions_run_cargo clippy --manifest-path=litebox_runner_lvbs/Cargo.toml --target x86_64-unknown-none --all-features
       - run: |
-          ./.github/tools/github_actions_run_cargo build
-          ./.github/tools/github_actions_run_cargo build --manifest-path=litebox_runner_lvbs/Cargo.toml --target x86_64-unknown-none
+          RUSTFLAGS="-Clink-arg=--script=litebox_runner_lvbs/x86_64_vtl1.ld -Clink-arg=--gc-sections -Clink-arg=--static -Clink-arg=--pie" ./.github/tools/github_actions_run_cargo build --manifest-path=litebox_runner_lvbs/Cargo.toml --target x86_64-unknown-none
       - run: ./.github/tools/github_actions_run_cargo nextest -p litebox_platform_lvbs
       - run: |
           ./.github/tools/github_actions_run_cargo test --doc
