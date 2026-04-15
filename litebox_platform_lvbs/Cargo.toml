@@ -23,7 +23,7 @@ hashbrown = "0.15.2"
 elf = { version = "0.8.0", default-features = false }
 cms = { version = "0.2.3", default-features = false, features = ["alloc"] }
 rsa = { version = "0.9.10", default-features = false }
-sha2 = { version = "0.10.9", default-features = false, features = ["oid"] }
+sha2 = { version = "0.10.9", default-features = false, features = ["oid", "force-soft"] }
 x509-cert = { version = "0.2.5", default-features = false }
 const-oid = { version = "0.9.6", default-features = false, features = ["db"] }
 authenticode = { version = "0.4.3", default-features = false, features = ["object"] }
@@ -32,6 +32,7 @@ digest = { version = "0.10.7", default-features = false }
 aligned-vec = { version = "0.6.4", default-features = false }
 raw-cpuid = "11.6.0"
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
+sha1 = { version = "0.10.6", default-features = false, features = ["oid", "force-soft"] }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }

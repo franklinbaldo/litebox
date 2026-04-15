@@ -1564,6 +1564,7 @@ dependencies = [
  "rangemap",
  "raw-cpuid",
  "rsa",
+ "sha1",
  "sha2",
  "spin 0.10.0",
  "thiserror",

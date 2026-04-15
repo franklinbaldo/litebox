@@ -41,10 +41,10 @@ command = ["bash", "-c", """
 set -eo pipefail
 set -x
 TOOLCHAIN=$(awk -F'"' '/channel/{print $2}' litebox_runner_lvbs/rust-toolchain.toml)
-cargo +$TOOLCHAIN clippy --lib --bins --examples --no-deps --all-features -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
-cargo +$TOOLCHAIN clippy --lib --bins --examples --no-deps --all-features -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_platform_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
-cargo +$TOOLCHAIN build -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
-cargo +$TOOLCHAIN build -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_platform_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
+cargo +$TOOLCHAIN clippy --lib --bins --examples --no-deps --all-features --manifest-path=litebox_runner_lvbs/Cargo.toml --target x86_64-unknown-none
+cargo +$TOOLCHAIN clippy --lib --bins --examples --no-deps --all-features --manifest-path=litebox_platform_lvbs/Cargo.toml --target x86_64-unknown-none
+cargo +$TOOLCHAIN build --manifest-path=litebox_runner_lvbs/Cargo.toml --target x86_64-unknown-none
+cargo +$TOOLCHAIN build --manifest-path=litebox_platform_lvbs/Cargo.toml --target x86_64-unknown-none
 """]
 need_stdout = false
 

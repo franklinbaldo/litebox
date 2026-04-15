@@ -1,6 +1,5 @@
-[unstable]
-build-std-features = ["compiler-builtins-mem"]
-build-std = ["core", "compiler_builtins", "alloc"]
-
 [build]
-target = "x86_64_vtl1.json"
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+rustflags = ["-Clink-arg=--script=litebox_runner_lvbs/x86_64_vtl1.ld", "-Clink-arg=--gc-sections", "-Clink-arg=--static", "-Clink-arg=--pie"]
