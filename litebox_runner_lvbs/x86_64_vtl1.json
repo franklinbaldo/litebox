@@ -27,5 +27,14 @@
 	"panic-strategy": "abort",
 	"disable-redzone": true,
 	"features": "-avx,-avx2,-avx512f",
-	"dynamic-linking": false
+	"dynamic-linking": false,
+	"plt-by-default": false,
+	"code-model": "small",
+	"crt-objects-fallback": "false",
+	"relro-level": "full",
+	"stack-probes": {
+		"kind": "inline"
+	},
+	"static-position-independent-executables": true,
+	"max-atomic-width": 64
 }

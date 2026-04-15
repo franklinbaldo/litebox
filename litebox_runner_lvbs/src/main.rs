@@ -36,16 +36,6 @@ extern "C" fn release_boot_stack_lock() {
     AP_BOOT_STACK_LOCK.store(false, Ordering::Release);
 }
 
-/// ELF64 relocation entry
-#[repr(C)]
-struct Elf64Rela {
-    offset: u64,
-    info: u64,
-    addend: i64,
-}
-
-const R_X86_64_RELATIVE: u64 = 8;
-
 /// KERNEL_OFFSET: the offset added to PA to get the VTL1 kernel VA.
 const KERNEL_OFFSET: u64 = litebox_platform_lvbs::KERNEL_OFFSET;
 
@@ -56,85 +46,70 @@ const PTE_TABLE_FLAGS: u64 = PageTableFlags::PRESENT.bits() | PageTableFlags::WR
 const ENTRIES_PER_PT_PAGE: usize = 512;
 const CR3_ADDR_MASK: u64 = !(vtl1_mem_layout::PAGE_SIZE as u64 - 1);
 
+// Linker-defined symbols used by apply_relocations
+unsafe extern "C" {
+    static _rela_start: u8;
+    static _rela_end: u8;
+    static _memory_base: u8;
+}
+
 /// Apply ELF relocations to support position-independent execution.
-/// This code has NO dependency on absolute addresses - uses only RIP-relative addressing.
+///
+/// Since this function runs **before** the GOT has been relocated,
+/// it should not have any GOT-indirect references (`GOTPCREL`).
+/// To this end, it is written in assembly (since a compiler might
+/// generate GOT-indirect references for Rust code).
+///
+/// All arithmetic is register only. No stack frame is needed.
 ///
 /// # Safety
 /// - Must be called before any absolute addresses are accessed
-/// - Must be called exactly once at boot
-/// - Requires valid relocation section in the binary
-#[inline(never)]
-unsafe fn apply_relocations() {
-    unsafe extern "C" {
-        static _rela_start: u8;
-        static _rela_end: u8;
-        static _memory_base: u8;
-    }
+/// - Must be called exactly once per relocation pass (Phases 1a and 1b)
+/// - Requires a valid `.rela.dyn` section in the binary
+#[unsafe(naked)]
+unsafe extern "C" fn apply_relocations() {
+    core::arch::naked_asm!(
+        // Load linker symbols via RIP-relative LEA (GOT-free)
+        "lea rax, [rip + {base_sym}]",  // rax = actual _memory_base address
+        "lea rcx, [rip + {start_sym}]", // rcx = _rela_start
+        "lea rdx, [rip + {end_sym}]",   // rdx = _rela_end
 
-    // Calculate load offset using ONLY position-independent code
-    // This works regardless of where we're loaded
+        // offset = actual_base - expected_base (expected base is 0x0)
+        // If already at expected location, nothing to relocate
+        "test rax, rax",
+        "jz 2f",
 
-    // Get actual runtime address (where we ARE)
-    let actual_base: u64;
-    unsafe {
-        asm!(
-            "lea {}, [rip + _memory_base]",
-            out(reg) actual_base,
-            options(nostack, nomem, preserves_flags)
-        );
-    }
+        // Loop over .rela.dyn entries (each 24 bytes: offset + info + addend)
+        "1:",
+        "cmp rcx, rdx",
+        "jae 2f",
 
-    // offset = actual_base - expected_base
-    // The expected base is 0x0, so offset = actual_base
-    let offset = actual_base;
+        // Read Elf64Rela fields
+        "mov rsi, [rcx]",               // rsi = r_offset
+        "mov rdi, [rcx + 16]",          // rdi = r_addend
 
-    // Early return if already at expected location
-    if offset == 0 {
-        return;
-    }
+        // Check if R_X86_64_RELATIVE (type 8): (r_info & 0xffff_ffff) == 8
+        "cmp dword ptr [rcx + 8], 8",   // compare low 32 bits of r_info
 
-    // Get relocation table bounds using RIP-relative addressing
-    let rela_start: u64;
-    let rela_end: u64;
-    unsafe {
-        asm!(
-            "lea {start}, [rip + _rela_start]",
-            "lea {end}, [rip + _rela_end]",
-            start = out(reg) rela_start,
-            end = out(reg) rela_end,
-            options(nostack, nomem, preserves_flags)
-        );
-    }
+        // Advance to next entry (does not affect flags)
+        "lea rcx, [rcx + 24]",
 
-    let mut rela_ptr = rela_start as *const Elf64Rela;
-    let rela_end_ptr = rela_end as *const Elf64Rela;
+        "jne 1b",                       // skip if not R_X86_64_RELATIVE
 
-    // Process each relocation entry
-    while rela_ptr < rela_end_ptr {
-        // SAFETY: rela_ptr is within bounds of relocation section
-        let rela = unsafe { &*rela_ptr };
-        let r_type = rela.info & 0xffffffff;
+        // target_addr = offset + r_offset; value = r_addend + offset
+        "add rsi, rax",                 // rsi = target_addr
+        "add rdi, rax",                 // rdi = relocated value
+        "mov [rsi], rdi",               // *target_addr = value
 
-        // Only handle R_X86_64_RELATIVE relocations
-        if r_type == R_X86_64_RELATIVE {
-            // Calculate target address: original offset + load offset
-            // SAFETY: Target address is valid after offset adjustment
-            let target = (offset.wrapping_add(rela.offset)) as *mut u64;
-            // SAFETY: Target is within the .rela.dyn section and properly aligned
-            unsafe {
-                // Relocation calculation: addend + load_offset
-                // The casts between signed/unsigned are intentional for ELF relocation math
-                #[allow(clippy::cast_possible_wrap)]
-                #[allow(clippy::cast_sign_loss)]
-                let value = rela.addend.wrapping_add(offset as i64) as u64;
-                target.write_volatile(value);
-            }
-        }
+        "jmp 1b",
 
-        // SAFETY: Moving to next entry within bounds
-        rela_ptr = unsafe { rela_ptr.add(1) };
-    }
+        "2:",
+        "ret",
 
+        base_sym = sym _memory_base,
+        start_sym = sym _rela_start,
+        end_sym = sym _rela_end,
+    );
     // NOTE: .rela.dyn section memory is reclaimed later in init() (lib.rs)
     // after the remap to high-canonical VA, so that the allocator receives
     // high-canonical addresses instead of low-canonical (PA-based) ones.
