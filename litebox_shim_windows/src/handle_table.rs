@@ -268,6 +268,11 @@ pub enum NtObject<FS: crate::NtShimFS> {
         /// Pending async AFD_SELECT observers.
         /// Same lifetime semantics as `pending_observers`.
         pending_select_observers: Vec<Arc<SocketSelectIocpObserver>>,
+        /// When `true`, synchronous I/O completions (status != STATUS_PENDING)
+        /// do NOT post an IOCP completion entry.  Set by
+        /// `NtSetInformationFile(FileIoCompletionNotificationInformation)`
+        /// with `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS (0x1)`.
+        skip_completion_on_success: bool,
     },
     /// An NT section object (NtCreateSection).
     Section {

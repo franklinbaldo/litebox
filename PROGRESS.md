@@ -1355,3 +1355,42 @@ WOULDBLOCK path.
   stub, Socket constructor updates, trace logging
 - `litebox_shim_windows/src/syscalls/sync.rs` — IOCP status sign extension fix,
   trace logging
+
+## 2026-04-16: DNS lookup and fetch() body reads fixed
+
+### DNS lookup via c-ares auto-injection
+- `dns.lookup()` uses getaddrinfo → ws2_32 → dnsapi → DNS Client service (RPC/ALPC),
+  which is unavailable in the sandbox.
+- Solution: Embedded a JS preload (`dns_patch.js`) that monkey-patches `dns.lookup`
+  to use c-ares (direct UDP queries through smoltcp). The runner auto-injects it via
+  `--require` for node.exe or `NODE_OPTIONS` for other Node-based executables.
+- Added NSI device stubs (GETPARAMETER, GETALLPARAMETERS, ENUMERATE) and DNS registry
+  entries needed by mswsock/dnsapi initialization path.
+- Added SvcctrlStartEvent pre-signaling in NtOpenEvent for Dnscache service check.
+
+### FILE_SKIP_COMPLETION_PORT_ON_SUCCESS fix (fetch() body read hang)
+- Root cause: libuv sets `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` on sockets via
+  `NtSetInformationFile(FileIoCompletionNotificationInformation)`. The shim's generic
+  IOCP post-handler was posting completions for synchronous results regardless,
+  creating spurious IOCP entries that caused undici's recv to hang.
+- Fix: Store `skip_completion_on_success` flag on socket handles. Check it in the
+  generic IOCP post-handler. Only skip for inline-handled IOCTLs (AFD_RECV 0x12017,
+  AFD_SEND 0x1201F, AFD_RECV_DATAGRAM 0x1201B). AFD_SUPER_CONNECT still posts
+  because connects are completed synchronously while libuv expects async notification.
+
+### What now works
+- `dns.lookup('github.com')` → resolves via c-ares (auto-injected)
+- `fetch('https://api.github.com/copilot_internal/user')` with auth → 2157 bytes
+- `copilot --version` → "GitHub Copilot CLI 1.0.1"
+
+### Remaining copilot blockers
+- Without 9P: auth works, package loading fails (no `.copilot` dir in VFS)
+- With 9P: env not propagated to child processes, auth fails
+
+### Files modified (4 files)
+- `litebox_shim_windows/src/lib.rs` — NSI handlers, DNS registry entries,
+  SvcctrlStartEvent, IOCP skip-completion logic
+- `litebox_shim_windows/src/handle_table.rs` — `skip_completion_on_success` field
+- `litebox_shim_windows/src/syscalls/file.rs` — FileIoCompletionNotificationInfo
+  stores skip flag, NSI device path translation, Socket constructor update
+- `litebox_runner_windows_userland/src/lib.rs` — DNS patch JS injection, NODE_OPTIONS

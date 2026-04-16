@@ -177,6 +177,9 @@ pub(crate) fn translate_nt_path(nt_path: &str) -> Option<TranslatedPath> {
         if upper == "CONIN$" {
             return Some(TranslatedPath::Device(String::from("/dev/stdin")));
         }
+        if upper == "NSI" {
+            return Some(TranslatedPath::Device(String::from("/dev/nsi")));
+        }
 
         // Named pipe path: \??\pipe\<name>
         if let Some(pipe_rest) = rest.strip_prefix("pipe\\") {
@@ -829,7 +832,7 @@ fn try_open_afd_socket<FS: crate::NtShimFS>(
     // Insert the Socket handle into the handle table.
     Some(insert_object_handle(
         handles,
-        NtObject::Socket { socket_fd, proxy, net: alloc::sync::Arc::clone(net_arc), io_completion: None, pending_observers: alloc::vec::Vec::new(), pending_recv_observers: alloc::vec::Vec::new(), pending_dgram_event_observers: alloc::vec::Vec::new(), pending_select_observers: alloc::vec::Vec::new() },
+        NtObject::Socket { socket_fd, proxy, net: alloc::sync::Arc::clone(net_arc), io_completion: None, pending_observers: alloc::vec::Vec::new(), pending_recv_observers: alloc::vec::Vec::new(), pending_dgram_event_observers: alloc::vec::Vec::new(), pending_select_observers: alloc::vec::Vec::new(), skip_completion_on_success: false },
         handle_out_ptr,
         io_status_ptr,
         1, // FILE_OPENED
@@ -863,6 +866,13 @@ fn try_open_special_device<FS: crate::NtShimFS>(
             "SrpDevice",
             NtObject::Stub {
                 kind: String::from("SrpDevice"),
+                io_completion: None,
+            },
+        ),
+        "\\??\\nsi" => (
+            "Nsi",
+            NtObject::Stub {
+                kind: String::from("Nsi"),
                 io_completion: None,
             },
         ),
@@ -2082,22 +2092,37 @@ pub(crate) fn nt_set_information_file<FS: crate::NtShimFS>(
     // Layout: struct { ULONG Flags; } = 4 bytes.
     //   FILE_SKIP_COMPLETION_PORT_ON_SUCCESS = 0x1
     //   FILE_SKIP_SET_EVENT_ON_HANDLE        = 0x2
-    // Used by c-ares (via SetFileCompletionNotificationModes) on its
-    // private \Device\Afd handle.  We accept and store the flags but
-    // do not change behaviour — all our IOCP completions are posted
-    // explicitly, so the "skip" optimisations are already the default.
+    // Used by c-ares and libuv (via SetFileCompletionNotificationModes).
+    //   FILE_SKIP_COMPLETION_PORT_ON_SUCCESS = 0x1
+    //   FILE_SKIP_SET_EVENT_ON_HANDLE        = 0x2
+    // When flag 0x1 is set, synchronous I/O completions (status != PENDING)
+    // must NOT post to the I/O completion port. libuv sets this on sockets
+    // to avoid spurious IOCP notifications for operations that complete
+    // immediately (like zero-byte recv fast-path hits).
     if info_class == 41 {
         if (info_length as usize) < 4 || info_ptr == 0 {
             return NtStatus::STATUS_INVALID_PARAMETER;
         }
-        let _flags = crate::try_read_guest_value_unaligned::<u32>(info_ptr).unwrap_or(0);
+        let flags = crate::try_read_guest_value_unaligned::<u32>(info_ptr).unwrap_or(0);
 
         #[cfg(feature = "trace_debug")]
         {
             use litebox::platform::DebugLogProvider as _;
             litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                "NT shim: NtSetInformationFile FileIoCompletionNotificationInfo handle=0x{file_handle:X} flags=0x{_flags:X}\n"
+                "NT shim: NtSetInformationFile FileIoCompletionNotificationInfo handle=0x{file_handle:X} flags=0x{flags:X}\n"
             ));
+        }
+
+        // Store the skip-completion flag on socket handles.
+        if (flags & 0x1) != 0 {
+            handles.with_mut(file_handle, |entry| {
+                if let crate::handle_table::NtObject::Socket {
+                    ref mut skip_completion_on_success, ..
+                } = entry.object
+                {
+                    *skip_completion_on_success = true;
+                }
+            });
         }
 
         write_iosb(io_status_ptr, NtStatus::STATUS_SUCCESS, 4);

@@ -170,6 +170,135 @@ fn build_guest_command_line(program_name: &str, guest_arguments: &[String]) -> S
         .join(" ")
 }
 
+/// JavaScript preload that patches `dns.lookup` to use c-ares (libuv's
+/// async DNS resolver) instead of the Windows `GetAddrInfoW` syscall.
+///
+/// Windows' `GetAddrInfoW` depends on the DNS Client service (Dnscache)
+/// which communicates via ALPC/RPC — infrastructure that doesn't exist
+/// inside the sandbox.  Node.js's c-ares resolver sends UDP DNS queries
+/// directly, which are handled by the sandbox's smoltcp network stack.
+const DNS_PATCH_JS: &str = r#"
+'use strict';
+const dns = require('dns');
+const { Resolver } = dns;
+const net = require('net');
+const resolver = new Resolver();
+resolver.setServers(['8.8.8.8']);
+dns.lookup = function(hostname, options, callback) {
+    if (typeof options === 'function') { callback = options; options = {}; }
+    if (typeof options === 'number') { options = { family: options }; }
+    options = options || {};
+    if (!hostname || hostname === 'localhost') {
+        const a = (!options.family || options.family === 4) ? '127.0.0.1' : '::1';
+        const f = (!options.family || options.family === 4) ? 4 : 6;
+        return options.all ? callback(null, [{address:a,family:f}]) : callback(null, a, f);
+    }
+    if (net.isIP(hostname)) {
+        const f = net.isIPv4(hostname) ? 4 : 6;
+        return options.all ? callback(null,[{address:hostname,family:f}]) : callback(null,hostname,f);
+    }
+    const wantV4 = !options.family || options.family === 4;
+    const resolve = wantV4 ? resolver.resolve4.bind(resolver) : resolver.resolve6.bind(resolver);
+    resolve(hostname, (err, addrs) => {
+        if (err) {
+            const e = new Error('getaddrinfo ENOTFOUND ' + hostname);
+            e.code = 'ENOTFOUND'; e.errno = -3008; e.hostname = hostname;
+            e.syscall = 'getaddrinfo'; return callback(e);
+        }
+        const fam = wantV4 ? 4 : 6;
+        options.all ? callback(null, addrs.map(a => ({address:a,family:fam}))) : callback(null, addrs[0], fam);
+    });
+};
+if (dns.promises) {
+    dns.promises.lookup = function(hostname, options) {
+        return new Promise((resolve, reject) => {
+            dns.lookup(hostname, options, (err, address, family) => {
+                if (err) return reject(err);
+                (options && options.all) ? resolve(address) : resolve({address,family});
+            });
+        });
+    };
+}
+"#;
+
+/// VFS path where the DNS patch preload script is written.
+const DNS_PATCH_VFS_PATH: &str = "/c/windows/system32/__litebox_dns_patch.js";
+/// Windows path the guest process sees for the DNS patch.
+const DNS_PATCH_WIN_PATH: &str = r"C:\Windows\System32\__litebox_dns_patch.js";
+
+/// Write the embedded DNS patch script into the VFS and return either:
+/// - For `node.exe`: `--require` arguments to prepend to the guest command line.
+/// - For other Node.js-based executables: empty vec (use `NODE_OPTIONS` env var instead).
+///
+/// Only injects for Node.js-based executables when networking is enabled.
+/// Returns `(extra_args, extra_env)`.
+fn inject_dns_patch<FS: litebox::fs::FileSystem>(
+    vfs: &FS,
+    exe_name: &str,
+    has_network: bool,
+) -> (Vec<String>, Option<String>) {
+    if !has_network {
+        return (Vec::new(), None);
+    }
+    // Heuristic: inject for node.exe, copilot.exe, or any electron-like
+    // process that bundles Node.js.
+    let name_lower = exe_name.to_ascii_lowercase();
+    let is_node_based = name_lower == "node.exe"
+        || name_lower == "copilot.exe"
+        || name_lower.contains("node");
+    if !is_node_based {
+        return (Vec::new(), None);
+    }
+
+    // Write the JS file into the VFS.
+    let content = DNS_PATCH_JS.as_bytes();
+    let file_mode = litebox::fs::Mode::RUSR
+        .union(litebox::fs::Mode::WUSR)
+        .union(litebox::fs::Mode::RGRP)
+        .union(litebox::fs::Mode::ROTH);
+    let dir_mode = litebox::fs::Mode::RWXU
+        .union(litebox::fs::Mode::RWXG)
+        .union(litebox::fs::Mode::RWXO);
+    ensure_vfs_parent_dirs(vfs, DNS_PATCH_VFS_PATH, dir_mode);
+    match vfs.open(
+        DNS_PATCH_VFS_PATH,
+        litebox::fs::OFlags::CREAT | litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::TRUNC,
+        file_mode,
+    ) {
+        Ok(fd) => {
+            let mut written = 0;
+            while written < content.len() {
+                match vfs.write(&fd, &content[written..], None) {
+                    Ok(n) if n > 0 => written += n,
+                    _ => break,
+                }
+            }
+            let _ = vfs.close(&fd);
+            if written == content.len() {
+                eprintln!("Injected DNS patch at {DNS_PATCH_WIN_PATH}");
+                if name_lower == "node.exe" {
+                    // For raw node.exe, prepend --require to arguments.
+                    return (vec![
+                        "--require".to_string(),
+                        DNS_PATCH_WIN_PATH.to_string(),
+                    ], None);
+                }
+                // For other Node.js-based executables (copilot.exe, etc.),
+                // use NODE_OPTIONS env var so it doesn't conflict with
+                // the application's own CLI argument parser.
+                return (Vec::new(), Some(
+                    format!("NODE_OPTIONS=--require {DNS_PATCH_WIN_PATH}"),
+                ));
+            }
+            eprintln!("Warning: DNS patch write incomplete ({written}/{} bytes)", content.len());
+        }
+        Err(e) => {
+            eprintln!("Warning: could not inject DNS patch: {e:?}");
+        }
+    }
+    (Vec::new(), None)
+}
+
 fn drive_path_to_vfs(path: &str) -> Option<String> {
     if let Some(unc) = path.strip_prefix("\\\\?\\UNC\\") {
         return Some(format!("//{}", unc.replace('\\', "/").to_ascii_lowercase()));
@@ -1489,8 +1618,20 @@ fn create_shim_and_run<FS: litebox_shim_windows::NtShimFS>(
     };
     trace_debugln!("GDI shared handle table at: 0x{gdi_shared_va:X}");
 
+    // Inject DNS patch for Node.js-based processes when networking is enabled.
+    // This patches dns.lookup to use c-ares (direct UDP) instead of
+    // GetAddrInfoW which requires the Windows DNS Client service.
+    let (dns_patch_args, dns_patch_env) = inject_dns_patch(
+        vfs.as_ref(),
+        &exe_base_name_str,
+        net.is_some(),
+    );
+    let mut effective_guest_args = Vec::new();
+    effective_guest_args.extend(dns_patch_args);
+    effective_guest_args.extend(cli_args.guest_arguments.iter().cloned());
+
     let guest_command_line =
-        build_guest_command_line(&exe_base_name_str, &cli_args.guest_arguments);
+        build_guest_command_line(&exe_base_name_str, &effective_guest_args);
     trace_debugln!("[runner] Guest command line: {guest_command_line}");
 
     let peb_teb_params = PebTebParams {
@@ -1521,29 +1662,35 @@ fn create_shim_and_run<FS: litebox_shim_windows::NtShimFS>(
         thread_id: u64::from(litebox_shim_windows::peb_teb::SYNTHETIC_MAIN_THREAD_ID),
         api_set_map: host_api_set_map,
         gdi_shared_handle_table: gdi_shared_va,
-        env_strings: if cli_args.env_vars.is_empty() {
-            Vec::new() // use default hardcoded env for root process
-        } else {
-            // When extra env vars are provided, we must supply the full
-            // environment because the PEB builder replaces (not merges)
-            // when env_strings is non-empty.
-            let mut env = vec![
-                "SYSTEMROOT=C:\\Windows".into(),
-                "COMSPEC=C:\\Windows\\System32\\cmd.exe".into(),
-                "PATH=C:\\Windows\\System32".into(),
-                "TEMP=C:\\Windows\\Temp".into(),
-                "TMP=C:\\Windows\\Temp".into(),
-                "USERPROFILE=C:\\Users\\sandbox".into(),
-                "HOMEDRIVE=C:".into(),
-                "HOMEPATH=\\Users\\sandbox".into(),
-                "APPDATA=C:\\Users\\sandbox\\AppData".into(),
-                "LOCALAPPDATA=C:\\Users\\sandbox\\AppData\\Local".into(),
-                "PYTHONHASHSEED=0".into(),
-                "PYTHONLEGACYWINDOWSSTDIO=1".into(),
-                "PYTHONUNBUFFERED=1".into(),
-            ];
-            env.extend(cli_args.env_vars.iter().cloned());
-            env
+        env_strings: {
+            let has_explicit_env = !cli_args.env_vars.is_empty() || dns_patch_env.is_some();
+            if !has_explicit_env {
+                Vec::new() // use default hardcoded env for root process
+            } else {
+                // When extra env vars are provided, we must supply the full
+                // environment because the PEB builder replaces (not merges)
+                // when env_strings is non-empty.
+                let mut env = vec![
+                    "SYSTEMROOT=C:\\Windows".into(),
+                    "COMSPEC=C:\\Windows\\System32\\cmd.exe".into(),
+                    "PATH=C:\\Windows\\System32".into(),
+                    "TEMP=C:\\Windows\\Temp".into(),
+                    "TMP=C:\\Windows\\Temp".into(),
+                    "USERPROFILE=C:\\Users\\sandbox".into(),
+                    "HOMEDRIVE=C:".into(),
+                    "HOMEPATH=\\Users\\sandbox".into(),
+                    "APPDATA=C:\\Users\\sandbox\\AppData".into(),
+                    "LOCALAPPDATA=C:\\Users\\sandbox\\AppData\\Local".into(),
+                    "PYTHONHASHSEED=0".into(),
+                    "PYTHONLEGACYWINDOWSSTDIO=1".into(),
+                    "PYTHONUNBUFFERED=1".into(),
+                ];
+                if let Some(dns_env) = dns_patch_env {
+                    env.push(dns_env);
+                }
+                env.extend(cli_args.env_vars.iter().cloned());
+                env
+            }
         },
     };
     let peb_teb_bytes = build_peb_teb_bytes(&peb_teb_layout, &peb_teb_params);

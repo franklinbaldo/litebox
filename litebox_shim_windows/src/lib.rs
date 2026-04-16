@@ -346,6 +346,20 @@ fn encode_reg_sz(value: &str) -> alloc::vec::Vec<u8> {
     bytes
 }
 
+fn encode_reg_multi_sz(values: &[&str]) -> alloc::vec::Vec<u8> {
+    let mut wide = alloc::vec::Vec::<u16>::new();
+    for v in values {
+        wide.extend(v.encode_utf16());
+        wide.push(0u16); // NUL terminator for each string
+    }
+    wide.push(0u16); // Extra NUL terminator for the list
+    let mut bytes = alloc::vec![0u8; wide.len() * 2];
+    unsafe {
+        core::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, bytes.as_mut_ptr(), bytes.len());
+    }
+    bytes
+}
+
 fn encode_reg_dword(value: u32) -> alloc::vec::Vec<u8> {
     alloc::vec::Vec::from(value.to_le_bytes())
 }
@@ -684,6 +698,24 @@ fn lookup_registry_value_bytes(
         && name_lower == "machinepreferreduilanguages"
     {
         Some(("en-US", 1))
+    } else if key_lower.ends_with("\\system\\currentcontrolset\\services\\tcpip\\parameters")
+        && !key_lower.contains("\\interfaces\\")
+    {
+        match name_lower.as_str() {
+            "nameserver" => Some(("8.8.8.8", 1)),
+            "dhcpnameserver" => Some(("8.8.8.8", 1)),
+            "searchlist" => Some(("", 1)),
+            "domain" => Some(("", 1)),
+            "hostname" => Some(("sandbox", 1)),
+            _ => None,
+        }
+    } else if key_lower.contains("\\services\\tcpip\\parameters\\interfaces\\") {
+        match name_lower.as_str() {
+            "nameserver" => Some(("8.8.8.8", 1)),
+            "dhcpnameserver" => Some(("8.8.8.8", 1)),
+            "domain" => Some(("", 1)),
+            _ => None,
+        }
     } else if key_lower.ends_with("\\system\\currentcontrolset\\services\\winsock2\\parameters") {
         match name_lower.as_str() {
             "autodialdll" => Some((r"C:\Windows\System32\rasadhlp.dll", 1)),
@@ -716,6 +748,36 @@ fn lookup_registry_value_bytes(
     ) {
         match name_lower.as_str() {
             "image path" => Some((r"%SystemRoot%\system32\rsaenh.dll", 1)),
+            _ => None,
+        }
+    } else if key_lower
+        .ends_with("\\control\\computername\\activecomputername")
+        || key_lower.ends_with("\\control\\computername\\computername")
+    {
+        match name_lower.as_str() {
+            "computername" => Some(("SANDBOX", 1)),
+            _ => None,
+        }
+    } else if key_lower.ends_with("\\software\\microsoft\\rpc") {
+        match name_lower.as_str() {
+            "dcom protocols" => {
+                // REG_MULTI_SZ: "ncacn_ip_tcp\0\0"
+                let data = encode_reg_multi_sz(&["ncacn_ip_tcp"]);
+                return Some((7, data));
+            }
+            _ => None,
+        }
+    } else if key_lower.ends_with("\\software\\microsoft\\rpc\\clientprotocols") {
+        match name_lower.as_str() {
+            "ncacn_ip_tcp" | "ncacn_np" | "ncadg_ip_udp" | "ncacn_http" => {
+                Some(("rpcrt4.dll", 1))
+            }
+            _ => None,
+        }
+    } else if key_lower.ends_with("\\software\\microsoft\\rpc\\securityservice") {
+        match name_lower.as_str() {
+            "9" | "10" | "16" => Some(("sspicli.dll", 1)),
+            "14" => Some(("schannel.dll", 1)),
             _ => None,
         }
     } else {
@@ -763,6 +825,19 @@ fn lookup_registry_value_bytes(
         match name_lower.as_str() {
             "siginfile" => Some(0),
             "type" => Some(24),
+            _ => None,
+        }
+    } else if key_lower.ends_with("\\software\\microsoft\\rpc") {
+        match name_lower.as_str() {
+            "connectionoptionsflag" => Some(1),
+            "uuidsequencenumber" => Some(0x1234),
+            _ => None,
+        }
+    } else if key_lower.ends_with("\\services\\dnscache\\parameters") {
+        match name_lower.as_str() {
+            // Tell dnsapi.dll to do DNS resolution directly (via UDP)
+            // instead of using RPC to the DNS Client service (Dnscache).
+            "enableinprocessdnsresolution" => Some(1),
             _ => None,
         }
     } else {
@@ -817,6 +892,12 @@ fn enumerate_hardcoded_value_names(key_path: &str) -> alloc::vec::Vec<&'static s
         ]
     } else if key_lower.ends_with("\\control panel\\desktop\\muicached") {
         alloc::vec!["MachinePreferredUILanguages"]
+    } else if key_lower.ends_with("\\system\\currentcontrolset\\services\\tcpip\\parameters")
+        && !key_lower.contains("\\interfaces\\")
+    {
+        alloc::vec!["NameServer", "DhcpNameServer", "SearchList", "Domain", "Hostname"]
+    } else if key_lower.contains("\\services\\tcpip\\parameters\\interfaces\\") {
+        alloc::vec!["NameServer", "DhcpNameServer", "Domain"]
     } else if key_lower
         .ends_with("\\system\\currentcontrolset\\services\\winsock2\\parameters")
     {
@@ -864,6 +945,40 @@ fn enumerate_hardcoded_value_names(key_path: &str) -> alloc::vec::Vec<&'static s
             "Next_Catalog_Entry_Id",
             "Serial_Access_Num",
         ]
+    } else if key_lower.ends_with("\\control\\computername\\activecomputername")
+        || key_lower.ends_with("\\control\\computername\\computername")
+    {
+        alloc::vec!["ComputerName"]
+    } else if key_lower.ends_with("\\software\\microsoft\\rpc") {
+        alloc::vec!["ConnectionOptionsFlag", "UuidSequenceNumber", "DCOM Protocols"]
+    } else if key_lower.ends_with("\\software\\microsoft\\rpc\\clientprotocols") {
+        alloc::vec!["ncacn_ip_tcp", "ncacn_np", "ncadg_ip_udp", "ncacn_http"]
+    } else if key_lower.ends_with("\\software\\microsoft\\rpc\\securityservice") {
+        alloc::vec!["9", "10", "14", "16"]
+    } else {
+        alloc::vec![]
+    }
+}
+
+/// Return the names of hardcoded subkeys for the given registry key path.
+///
+/// This allows `NtEnumerateKey` to include hardcoded subkeys (e.g. the
+/// fake network interface GUID under `Tcpip\Parameters\Interfaces`).
+fn enumerate_hardcoded_subkey_names(key_path: &str) -> alloc::vec::Vec<&'static str> {
+    let key_lower = key_path.to_ascii_lowercase();
+
+    if key_lower
+        .ends_with("\\system\\currentcontrolset\\services\\tcpip\\parameters\\interfaces")
+    {
+        // Fake network interface GUID that dnsapi.dll will enumerate to
+        // find DNS server addresses.
+        alloc::vec!["{00000000-0000-0000-0000-000000000001}"]
+    } else if key_lower.ends_with("\\control\\computername") {
+        alloc::vec!["ActiveComputerName", "ComputerName"]
+    } else if key_lower.ends_with("\\software\\microsoft\\rpc") {
+        alloc::vec!["ClientProtocols", "SecurityService"]
+    } else if key_lower.ends_with("\\services\\dnscache") {
+        alloc::vec!["Parameters"]
     } else {
         alloc::vec![]
     }
@@ -6772,9 +6887,16 @@ impl<FS: NtShimFS> NtShimEntrypoints<FS> {
                     || key_lower == "\\registry\\machine"
                     || key_lower == "\\registry\\user"
                     || key_lower.contains("\\registry\\user\\")
-                    || key_lower.ends_with(".exe");
+                    || key_lower.ends_with(".exe")
+                    || key_lower.ends_with("\\services\\dnscache\\parameters");
 
-                if vfs_key_exists || is_critical_key {
+                // Also check if the key has hardcoded values or subkeys
+                // (e.g. Tcpip\Parameters for DNS configuration).
+                let has_hardcoded_entries =
+                    !enumerate_hardcoded_value_names(&key_name).is_empty()
+                    || !enumerate_hardcoded_subkey_names(&key_name).is_empty();
+
+                if vfs_key_exists || is_critical_key || has_hardcoded_entries {
                     // Dump PEB NLS fields for debugging
                     #[cfg(debug_assertions)]
                     if key_lower.contains("control panel")
@@ -6860,7 +6982,7 @@ impl<FS: NtShimFS> NtShimEntrypoints<FS> {
                         .flatten();
 
                 if let Some(key_path) = key_path {
-                    let subkeys =
+                    let mut subkeys =
                         if let Some(vfs_path) = registry::registry_key_to_vfs_path(&key_path) {
                             if let Some(fs) = self.shared.fs.get() {
                                 registry::enumerate_subkeys(fs.as_ref(), &vfs_path)
@@ -6870,6 +6992,15 @@ impl<FS: NtShimFS> NtShimEntrypoints<FS> {
                         } else {
                             alloc::vec::Vec::new()
                         };
+
+                    // Merge hardcoded subkeys (e.g. the fake network
+                    // interface GUID under Tcpip\Parameters\Interfaces).
+                    for hc_name in enumerate_hardcoded_subkey_names(&key_path) {
+                        let already = subkeys.iter().any(|s| s.eq_ignore_ascii_case(hc_name));
+                        if !already {
+                            subkeys.push(alloc::string::String::from(hc_name));
+                        }
+                    }
 
                     if index >= subkeys.len() {
                         (NtStatus::STATUS_NO_MORE_ENTRIES, false)
@@ -10379,16 +10510,36 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
 
             NtSyscallId::NtOpenEvent => {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let handle_out_va = args.arg0;
                 let obj_attrs_ptr = args.arg2;
                 let name = read_object_attributes_name(obj_attrs_ptr).unwrap_or_default();
-                #[cfg(debug_assertions)]
-                {
+                let name_lower = name.to_ascii_lowercase();
+
+                // Service Control Manager start events: if dnsapi (or any
+                // other service client) is waiting for a service to start,
+                // return a pre-signaled event so it proceeds immediately and
+                // falls back when the actual RPC connection fails.
+                if name_lower.contains("svcctrlstartevent") {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NT shim: NtOpenEvent(name={name:?}) -> returning pre-signaled event\n"
+                    ));
+                    let event = alloc::sync::Arc::new(
+                        handle_table::EventObject::new(true, true),
+                    );
+                    let obj = handle_table::NtObject::Event(event);
+                    let handle = self.shared.handles.lock().insert(obj);
+                    if handle_out_va != 0 {
+                        try_write_guest_value_unaligned::<u32>(handle_out_va, handle);
+                    }
+                    (NtStatus::STATUS_SUCCESS, false)
+                } else {
                     use litebox::platform::DebugLogProvider as _;
                     litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
                         "NT shim: NtOpenEvent(name={name:?}) -> STATUS_OBJECT_NAME_NOT_FOUND\n"
                     ));
+                    (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false)
                 }
-                (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false)
             }
 
             NtSyscallId::NtSetInformationWorkerFactory => {
@@ -11217,6 +11368,8 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                     /// Afd stub handle (e.g., \Device\Afd\AsyncConnectHlp).
                     /// Used for async connect operations.
                     AfdStub,
+                    /// NSI device — Network Store Interface for DNS config.
+                    Nsi,
                 }
                 let target = {
                     let handles = self.shared.handles.lock();
@@ -11241,6 +11394,9 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                         }
                         handle_table::NtObject::Stub { kind, .. } if kind == "Afd" => {
                             Some(IoctlTarget::AfdStub)
+                        }
+                        handle_table::NtObject::Stub { kind, .. } if kind == "Nsi" => {
+                            Some(IoctlTarget::Nsi)
                         }
                         _ => None,
                     }).flatten()
@@ -13929,31 +14085,51 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                         // Synchronous IOCTLs (bind, setsockopt, etc.) use event
                         // handles and have apc_context=0 — they do NOT post IOCP.
                         // STATUS_PENDING means the observer will post the completion.
+                        //
+                        // When FILE_SKIP_COMPLETION_PORT_ON_SUCCESS is set on the
+                        // handle, we must NOT post when the operation completed
+                        // synchronously (status != PENDING means it completed
+                        // inline).  libuv sets this flag on sockets — without
+                        // honouring it, fast-path 0-byte RECVs generate spurious
+                        // IOCP completions that cause undici/fetch to hang.
                         if status != NtStatus::STATUS_PENDING {
                             let apc_context = args.arg3;
                             if apc_context != 0 {
                                 let handles = self.shared.handles.lock();
                                 let iocp_info = handles.with(sock_handle, |entry| match &entry.object {
-                                    handle_table::NtObject::Socket { io_completion: Some((port, key)), .. } => {
-                                        Some((alloc::sync::Arc::clone(port), *key))
+                                    handle_table::NtObject::Socket { io_completion: Some((port, key)), skip_completion_on_success, .. } => {
+                                        Some((alloc::sync::Arc::clone(port), *key, *skip_completion_on_success))
                                     }
                                     _ => None,
                                 }).flatten();
-                                if let Some((port, key)) = iocp_info {
-                                    #[cfg(feature = "trace_debug")]
-                                    {
-                                        use litebox::platform::DebugLogProvider as _;
-                                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                                            "NT shim: AFD Socket posting IOCP completion key=0x{key:X} apc_ctx=0x{apc_context:X} status=0x{:X} info={io_information}\n",
-                                            status.0
-                                        ));
+                                if let Some((port, key, skip)) = iocp_info {
+                                    // With FILE_SKIP_COMPLETION_PORT_ON_SUCCESS,
+                                    // only skip for IOCTLs where the caller truly
+                                    // handles the synchronous result inline.
+                                    // AFD_RECV (0x12017) and AFD_SEND (0x1201F)
+                                    // are the main ones — libuv processes their
+                                    // results immediately when they return SUCCESS.
+                                    // AFD_SUPER_CONNECT must still post because our
+                                    // shim completes it synchronously while libuv
+                                    // expects async IOCP notification (on real
+                                    // Windows, ConnectEx returns STATUS_PENDING).
+                                    let ioctl_skippable = matches!(ioctl_code, 0x12017 | 0x1201F | 0x1201B);
+                                    if !(skip && ioctl_skippable) {
+                                        #[cfg(feature = "trace_debug")]
+                                        {
+                                            use litebox::platform::DebugLogProvider as _;
+                                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                "NT shim: AFD Socket posting IOCP completion key=0x{key:X} apc_ctx=0x{apc_context:X} status=0x{:X} info={io_information}\n",
+                                                status.0
+                                            ));
+                                        }
+                                        port.push(handle_table::IoCompletionEntry {
+                                            key_context: key,
+                                            apc_context,
+                                            status,
+                                            information: io_information,
+                                        });
                                     }
-                                    port.push(handle_table::IoCompletionEntry {
-                                        key_context: key,
-                                        apc_context,
-                                        status,
-                                        information: io_information,
-                                    });
                                 }
                             }
                         }
@@ -14384,6 +14560,392 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                         }
 
                         (status, false)
+                    }
+                    Some(IoctlTarget::Nsi) => {
+                        // NSI (Network Store Interface) device IOCTLs.
+                        // dnsapi.dll uses these to discover DNS server addresses.
+                        const IOCTL_NSI_GETALLPARAMETERS: u32 = 0x12000F;
+                        const IOCTL_NSI_ENUMERATE_OBJECTS_ALL_PARAMETERS: u32 = 0x12001B;
+                        const IOCTL_NSI_GETPARAMETER: u32 = 0x120007;
+
+                        if ioctl_code == IOCTL_NSI_GETPARAMETER && input_length >= 0x50 {
+                            // NSI_GETPARAMETER — single parameter query.
+                            // Wine struct nsi_get_parameter_ex (x64 layout):
+                            //   0x10: module ptr (8)
+                            //   0x18: table (8)
+                            //   0x28: key ptr (8)
+                            //   0x30: key_size (4)
+                            //   0x38: param_type (4)
+                            //   0x40: data ptr (8)
+                            //   0x48: data_size (4)
+                            //   0x4C: data_offset (4)
+                            let table =
+                                crate::try_read_guest_value_unaligned::<u64>(input_buffer + 0x18).unwrap_or(0);
+                            let param_type =
+                                crate::try_read_guest_value_unaligned::<u32>(input_buffer + 0x38).unwrap_or(0);
+                            let data_ptr =
+                                crate::try_read_guest_value_unaligned::<u64>(input_buffer + 0x40).unwrap_or(0);
+                            let data_size =
+                                crate::try_read_guest_value_unaligned::<u32>(input_buffer + 0x48).unwrap_or(0);
+
+                            #[cfg(feature = "trace_debug")]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                    "NT shim: NSI GETPARAMETER table={table} param_type={param_type} data_size={data_size} out_len=0x{output_length:X}\n",
+                                ));
+                            }
+
+                            // Zero the output data buffer if present.
+                            if data_ptr != 0 && data_size > 0 {
+                                let zero_len = core::cmp::min(data_size as usize, 0x100);
+                                for i in 0..zero_len {
+                                    crate::try_write_guest_value_unaligned(data_ptr as usize + i, 0u8);
+                                }
+                            }
+
+                            // Also zero the output buffer if present (some callers
+                            // expect data returned in the output buffer).
+                            if output_buffer != 0 && output_length > 0 {
+                                let zero_len = core::cmp::min(output_length as usize, 0x100);
+                                for i in 0..zero_len {
+                                    crate::try_write_guest_value_unaligned(output_buffer + i, 0u8);
+                                }
+                            }
+
+                            if io_status_ptr != 0 {
+                                crate::try_write_guest_value_unaligned(
+                                    io_status_ptr,
+                                    NtStatus::STATUS_SUCCESS.0 as u64,
+                                );
+                                crate::try_write_guest_value_unaligned(io_status_ptr + 8, output_length as u64);
+                            }
+                            (NtStatus::STATUS_SUCCESS, false)
+                        } else if ioctl_code == IOCTL_NSI_GETALLPARAMETERS && input_length >= 0x58 {
+                            // NSI_GETALLPARAMETERS — return NOT_FOUND so dnsapi
+                            // falls back to the enumerate IOCTL.
+                            // x64 layout: table at offset 0x18 (UINT_PTR).
+                            let table =
+                                crate::try_read_guest_value_unaligned::<u64>(input_buffer + 0x18).unwrap_or(0);
+                            #[cfg(feature = "trace_debug")]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                    "NT shim: NSI GETALLPARAMETERS table={table} → NOT_FOUND\n",
+                                ));
+                            }
+
+                            if io_status_ptr != 0 {
+                                crate::try_write_guest_value_unaligned(
+                                    io_status_ptr,
+                                    NtStatus::STATUS_OBJECT_NAME_NOT_FOUND.0 as u64,
+                                );
+                                crate::try_write_guest_value_unaligned(io_status_ptr + 8, 0u64);
+                            }
+                            (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false)
+                        } else if ioctl_code == IOCTL_NSI_ENUMERATE_OBJECTS_ALL_PARAMETERS
+                            && input_length >= 0x70
+                        {
+                            // NSI_ENUMERATE_OBJECTS_ALL_PARAMETERS
+                            // Wine struct nsi_enumerate_all_ex (x64 layout):
+                            //   0x00: unknown[0]    (8)
+                            //   0x08: unknown[1]    (8)
+                            //   0x10: module ptr     (8) -> NPI_MODULEID
+                            //   0x18: table          (8) UINT_PTR
+                            //   0x20: first_arg      (4)
+                            //   0x24: second_arg     (4)
+                            //   0x28: key_data ptr   (8)
+                            //   0x30: key_size       (4)
+                            //   0x38: rw_data ptr    (8)
+                            //   0x40: rw_size        (4)
+                            //   0x48: dynamic_data   (8)  -- "RO param" for DNS
+                            //   0x50: dynamic_size   (4)
+                            //   0x58: static_data    (8)
+                            //   0x60: static_size    (4)
+                            //   0x68: count          (8) UINT_PTR (in: max, out: actual)
+                            let table =
+                                crate::try_read_guest_value_unaligned::<u64>(input_buffer + 0x18).unwrap_or(0) as u32;
+                            let key_data_ptr =
+                                crate::try_read_guest_value_unaligned::<u64>(input_buffer + 0x28).unwrap_or(0);
+                            let key_size =
+                                crate::try_read_guest_value_unaligned::<u32>(input_buffer + 0x30).unwrap_or(0);
+                            let rw_data_ptr =
+                                crate::try_read_guest_value_unaligned::<u64>(input_buffer + 0x38).unwrap_or(0);
+                            let rw_size =
+                                crate::try_read_guest_value_unaligned::<u32>(input_buffer + 0x40).unwrap_or(0);
+                            let dynamic_data_ptr =
+                                crate::try_read_guest_value_unaligned::<u64>(input_buffer + 0x48).unwrap_or(0);
+                            let dynamic_size =
+                                crate::try_read_guest_value_unaligned::<u32>(input_buffer + 0x50).unwrap_or(0);
+                            let count_ptr = input_buffer + 0x68;
+                            let max_count =
+                                crate::try_read_guest_value_unaligned::<u64>(count_ptr).unwrap_or(0);
+
+                            #[cfg(feature = "trace_debug")]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                let mut hex = alloc::string::String::from("NT shim: NSI ENUMERATE raw[");
+                                let dump_len = core::cmp::min(input_length as usize, 0x70);
+                                hex.push_str(&alloc::format!("{dump_len}]="));
+                                for i in 0..dump_len {
+                                    let b = crate::try_read_guest_value_unaligned::<u8>(input_buffer + i).unwrap_or(0);
+                                    hex.push_str(&alloc::format!("{b:02x}"));
+                                    if i % 8 == 7 { hex.push(' '); }
+                                }
+                                hex.push('\n');
+                                litebox_platform_multiplex::platform().debug_log_print(&hex);
+                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                    "NT shim: NSI ENUMERATE table={table} keySize={key_size} rwSize={rw_size} dynSize={dynamic_size} maxCount={max_count} keyPtr=0x{key_data_ptr:x} rwPtr=0x{rw_data_ptr:x} dynPtr=0x{dynamic_data_ptr:x}\n",
+                                ));
+                            }
+
+                            // For count queries (all buffer ptrs NULL, count=0):
+                            // return count=1 for any table we recognize, so dnsapi
+                            // proceeds to a real data query.
+                            let is_count_query = key_data_ptr == 0 && dynamic_data_ptr == 0 && max_count == 0;
+
+                            if is_count_query {
+                                // Return count=1 for tables we want to fake.
+                                crate::try_write_guest_value_unaligned(count_ptr, 1u64);
+
+                                if io_status_ptr != 0 {
+                                    crate::try_write_guest_value_unaligned(
+                                        io_status_ptr,
+                                        NtStatus::STATUS_SUCCESS.0 as u64,
+                                    );
+                                    crate::try_write_guest_value_unaligned(io_status_ptr + 8, 0u64);
+                                }
+
+                                #[cfg(feature = "trace_debug")]
+                                {
+                                    use litebox::platform::DebugLogProvider as _;
+                                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                        "NT shim: NSI ENUMERATE table={table} count query → returned count=1\n",
+                                    ));
+                                }
+
+                                (NtStatus::STATUS_SUCCESS, false)
+                            } else if table == 7 && key_size >= 8 && max_count >= 1
+                                && key_data_ptr != 0 && rw_data_ptr != 0 && rw_size >= 0x50
+                            {
+                                // DNS server enumeration (table 7).
+                                // Key = 8-byte interface LUID, rw_data = DNS_ADDR_ARRAY.
+                                let luid: u64 = (6u64 << 48) | 1; // type=6 (ethernet), index=1
+                                crate::try_write_guest_value_unaligned(key_data_ptr as usize, luid);
+
+                                // Zero the rw_data buffer then fill DNS_ADDR_ARRAY.
+                                let zero_len = core::cmp::min(rw_size as usize, 0x200);
+                                for i in 0..zero_len {
+                                    crate::try_write_guest_value_unaligned(
+                                        rw_data_ptr as usize + i, 0u8,
+                                    );
+                                }
+                                // DNS_ADDR_ARRAY: MaxCount=1, AddrCount=1
+                                crate::try_write_guest_value_unaligned(rw_data_ptr as usize, 1u32);
+                                crate::try_write_guest_value_unaligned(rw_data_ptr as usize + 0x04, 1u32);
+                                // Family = AF_INET (2)
+                                crate::try_write_guest_value_unaligned(rw_data_ptr as usize + 0x0C, 2u16);
+                                // DNS_ADDR[0] at offset 0x20: SOCKADDR_IN
+                                let addr_off = rw_data_ptr as usize + 0x20;
+                                crate::try_write_guest_value_unaligned(addr_off, 2u16); // sin_family
+                                crate::try_write_guest_value_unaligned(addr_off + 2, 0u16); // sin_port
+                                crate::try_write_guest_value_unaligned(addr_off + 4, 0x08080808u32); // 8.8.8.8
+
+                                crate::try_write_guest_value_unaligned(count_ptr, 1u64);
+
+                                if io_status_ptr != 0 {
+                                    crate::try_write_guest_value_unaligned(
+                                        io_status_ptr, NtStatus::STATUS_SUCCESS.0 as u64,
+                                    );
+                                    crate::try_write_guest_value_unaligned(io_status_ptr + 8, 0u64);
+                                }
+
+                                #[cfg(feature = "trace_debug")]
+                                {
+                                    use litebox::platform::DebugLogProvider as _;
+                                    litebox_platform_multiplex::platform().debug_log_print(
+                                        "NT shim: NSI ENUMERATE table=7 → returned 1 DNS server (8.8.8.8)\n",
+                                    );
+                                }
+
+                                (NtStatus::STATUS_SUCCESS, false)
+                            } else if table == 1 && key_size >= 8 && max_count >= 1 && key_data_ptr != 0 {
+                                // Interface enumeration (table 1).
+                                // Write a fake interface LUID as the key.
+                                let luid: u64 = (6u64 << 48) | 1;
+                                crate::try_write_guest_value_unaligned(key_data_ptr as usize, luid);
+
+                                crate::try_write_guest_value_unaligned(count_ptr, 1u64);
+
+                                if io_status_ptr != 0 {
+                                    crate::try_write_guest_value_unaligned(
+                                        io_status_ptr, NtStatus::STATUS_SUCCESS.0 as u64,
+                                    );
+                                    crate::try_write_guest_value_unaligned(io_status_ptr + 8, 0u64);
+                                }
+
+                                #[cfg(feature = "trace_debug")]
+                                {
+                                    use litebox::platform::DebugLogProvider as _;
+                                    litebox_platform_multiplex::platform().debug_log_print(
+                                        "NT shim: NSI ENUMERATE table=1 → returned 1 fake interface\n",
+                                    );
+                                }
+
+                                (NtStatus::STATUS_SUCCESS, false)
+                            } else if table == 10 && key_size >= 8 && max_count >= 1 && key_data_ptr != 0 {
+                                // Unicast address enumeration (table 10).
+                                // Two variants:
+                                //   keySize=24: 8-byte LUID + 16-byte SOCKADDR_INET (NPI_MS_IPV4 module)
+                                //   keySize=16: 16-byte SOCKADDR_INET only (different module)
+                                let luid: u64 = (6u64 << 48) | 1;
+                                // Zero the key buffer.
+                                for i in 0..(key_size as usize) {
+                                    crate::try_write_guest_value_unaligned(key_data_ptr as usize + i, 0u8);
+                                }
+                                if key_size >= 24 {
+                                    // LUID at key[0..8], SOCKADDR_IN at key[8..24]
+                                    crate::try_write_guest_value_unaligned(key_data_ptr as usize, luid);
+                                    crate::try_write_guest_value_unaligned(key_data_ptr as usize + 8, 2u16); // sin_family
+                                    crate::try_write_guest_value_unaligned(key_data_ptr as usize + 10, 0u16); // sin_port
+                                    crate::try_write_guest_value_unaligned(key_data_ptr as usize + 12, 0x0200000Au32); // 10.0.0.2
+                                } else {
+                                    // SOCKADDR_IN at key[0..16]
+                                    crate::try_write_guest_value_unaligned(key_data_ptr as usize, 2u16); // sin_family
+                                    crate::try_write_guest_value_unaligned(key_data_ptr as usize + 2, 0u16); // sin_port
+                                    crate::try_write_guest_value_unaligned(key_data_ptr as usize + 4, 0x0200000Au32); // 10.0.0.2
+                                }
+
+                                // Fill rw_data if present (prefix length, DAD state, etc.)
+                                if rw_data_ptr != 0 && rw_size >= 4 {
+                                    let rw_zero = core::cmp::min(rw_size as usize, 0x40);
+                                    for i in 0..rw_zero {
+                                        crate::try_write_guest_value_unaligned(rw_data_ptr as usize + i, 0u8);
+                                    }
+                                    // Offset 0: OnLinkPrefixLength = 24 (for 10.0.0.x/24)
+                                    crate::try_write_guest_value_unaligned(rw_data_ptr as usize, 24u32);
+                                }
+
+                                // Fill dynamic_data if present
+                                if dynamic_data_ptr != 0 && dynamic_size >= 4 {
+                                    let dyn_zero = core::cmp::min(dynamic_size as usize, 0x20);
+                                    for i in 0..dyn_zero {
+                                        crate::try_write_guest_value_unaligned(dynamic_data_ptr as usize + i, 0u8);
+                                    }
+                                    // DadState = IpDadStatePreferred (4)
+                                    crate::try_write_guest_value_unaligned(dynamic_data_ptr as usize, 4u32);
+                                }
+
+                                crate::try_write_guest_value_unaligned(count_ptr, 1u64);
+
+                                if io_status_ptr != 0 {
+                                    crate::try_write_guest_value_unaligned(
+                                        io_status_ptr, NtStatus::STATUS_SUCCESS.0 as u64,
+                                    );
+                                    crate::try_write_guest_value_unaligned(io_status_ptr + 8, 0u64);
+                                }
+
+                                #[cfg(feature = "trace_debug")]
+                                {
+                                    use litebox::platform::DebugLogProvider as _;
+                                    litebox_platform_multiplex::platform().debug_log_print(
+                                        "NT shim: NSI ENUMERATE table=10 → returned 1 unicast addr (10.0.0.2)\n",
+                                    );
+                                }
+
+                                (NtStatus::STATUS_SUCCESS, false)
+                            } else if table == 8 && key_size >= 8 && max_count >= 1 && key_data_ptr != 0 {
+                                // IP forward/route table (table 8).
+                                // Two variants:
+                                //   keySize=24: 8-byte LUID + SOCKADDR_INET (IPv4 module)
+                                //   keySize=16: SOCKADDR_INET only (IPv6 module, or no-LUID variant)
+                                // We return a default route: 0.0.0.0/0 via gateway 10.0.0.1.
+                                let luid: u64 = (6u64 << 48) | 1;
+
+                                // Zero the key buffer first.
+                                for i in 0..(key_size as usize) {
+                                    crate::try_write_guest_value_unaligned(key_data_ptr as usize + i, 0u8);
+                                }
+                                if key_size >= 24 {
+                                    // InterfaceLuid at key[0..8], DestinationPrefix at key[8..]
+                                    crate::try_write_guest_value_unaligned(key_data_ptr as usize, luid);
+                                    crate::try_write_guest_value_unaligned(key_data_ptr as usize + 8, 2u16); // sin_family = AF_INET
+                                } else {
+                                    // SOCKADDR_INET at key[0..16]
+                                    crate::try_write_guest_value_unaligned(key_data_ptr as usize, 2u16); // sin_family = AF_INET
+                                }
+
+                                // Fill rw_data if present (MIB_IPFORWARD_ROW2 rw fields).
+                                // The rw portion includes NextHop (SOCKADDR_INET at offset 0).
+                                if rw_data_ptr != 0 && rw_size >= 28 {
+                                    let rw_zero = core::cmp::min(rw_size as usize, 0x40);
+                                    for i in 0..rw_zero {
+                                        crate::try_write_guest_value_unaligned(rw_data_ptr as usize + i, 0u8);
+                                    }
+                                    // NextHop = SOCKADDR_IN(10.0.0.1)
+                                    crate::try_write_guest_value_unaligned(rw_data_ptr as usize, 2u16); // sin_family
+                                    crate::try_write_guest_value_unaligned(rw_data_ptr as usize + 2, 0u16); // sin_port
+                                    crate::try_write_guest_value_unaligned(rw_data_ptr as usize + 4, 0x0100000Au32); // 10.0.0.1
+                                    // SitePrefixLength at +28 = 0 (already zeroed)
+                                }
+
+                                // Fill dynamic_data if present (metric, etc.).
+                                if dynamic_data_ptr != 0 && dynamic_size >= 4 {
+                                    let dyn_zero = core::cmp::min(dynamic_size as usize, 0x20);
+                                    for i in 0..dyn_zero {
+                                        crate::try_write_guest_value_unaligned(dynamic_data_ptr as usize + i, 0u8);
+                                    }
+                                    // Metric = 1 (low metric = preferred route)
+                                    crate::try_write_guest_value_unaligned(dynamic_data_ptr as usize, 1u32);
+                                }
+
+                                crate::try_write_guest_value_unaligned(count_ptr, 1u64);
+
+                                if io_status_ptr != 0 {
+                                    crate::try_write_guest_value_unaligned(
+                                        io_status_ptr, NtStatus::STATUS_SUCCESS.0 as u64,
+                                    );
+                                    crate::try_write_guest_value_unaligned(io_status_ptr + 8, 0u64);
+                                }
+
+                                #[cfg(feature = "trace_debug")]
+                                {
+                                    use litebox::platform::DebugLogProvider as _;
+                                    litebox_platform_multiplex::platform().debug_log_print(
+                                        "NT shim: NSI ENUMERATE table=8 → returned 1 default route (0.0.0.0/0 via 10.0.0.1)\n",
+                                    );
+                                }
+
+                                (NtStatus::STATUS_SUCCESS, false)
+                            } else {
+                                // Unknown table or unsupported query.
+                                if io_status_ptr != 0 {
+                                    crate::try_write_guest_value_unaligned(
+                                        io_status_ptr,
+                                        NtStatus::STATUS_OBJECT_NAME_NOT_FOUND.0 as u64,
+                                    );
+                                    crate::try_write_guest_value_unaligned(io_status_ptr + 8, 0u64);
+                                }
+                                (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false)
+                            }
+                        } else {
+                            // Other NSI IOCTLs — return not found.
+                            #[cfg(feature = "trace_debug")]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                    "NT shim: NSI OTHER IOCTL code=0x{ioctl_code:X} in_len=0x{input_length:X} out_len=0x{output_length:X} → NOT_FOUND\n",
+                                ));
+                            }
+                            if io_status_ptr != 0 {
+                                crate::try_write_guest_value_unaligned(
+                                    io_status_ptr,
+                                    NtStatus::STATUS_OBJECT_NAME_NOT_FOUND.0 as u64,
+                                );
+                                crate::try_write_guest_value_unaligned(io_status_ptr + 8, 0u64);
+                            }
+                            (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false)
+                        }
                     }
                     None => {
                         #[cfg(feature = "trace_debug")]
