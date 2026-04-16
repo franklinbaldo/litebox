@@ -864,6 +864,13 @@ impl Server {
         let mut opts = fs::OpenOptions::new();
         configure_open_options(&mut opts, flags);
 
+        // On Windows, opening a directory requires FILE_FLAG_BACKUP_SEMANTICS.
+        #[cfg(windows)]
+        if resolved.is_dir() {
+            use std::os::windows::fs::OpenOptionsExt;
+            opts.custom_flags(0x02000000); // FILE_FLAG_BACKUP_SEMANTICS
+        }
+
         match opts.open(&resolved) {
             Ok(mut file) => {
                 // Invalidate ELF cache if the open truncates or writes,
