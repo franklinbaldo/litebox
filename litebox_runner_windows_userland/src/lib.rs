@@ -219,6 +219,22 @@ if (dns.promises) {
         });
     };
 }
+// Patch undici's global dispatcher so fetch() uses our patched dns.lookup
+// instead of the native getaddrinfo. Node.js >= 18 uses undici for fetch().
+// In Node.js SEA binaries, require('undici') may not work, but the internal
+// undici module is still accessible.
+try {
+    let undici;
+    try { undici = require('undici'); } catch(e) {
+        try { undici = require('node:undici'); } catch(e2) {}
+    }
+    if (undici && undici.Agent && undici.setGlobalDispatcher) {
+        const agent = new undici.Agent({
+            connect: { lookup: dns.lookup }
+        });
+        undici.setGlobalDispatcher(agent);
+    }
+} catch(e) { /* undici not available */ }
 "#;
 
 /// VFS path where the DNS patch preload script is written.
@@ -283,10 +299,13 @@ fn inject_dns_patch<FS: litebox::fs::FileSystem>(
                         DNS_PATCH_WIN_PATH.to_string(),
                     ], None);
                 }
-                // For other Node.js-based executables (copilot.exe, etc.),
-                // use NODE_OPTIONS env var so it doesn't conflict with
-                // the application's own CLI argument parser.
-                return (Vec::new(), Some(
+                // For SEA binaries like copilot.exe that use
+                // execArgvExtension: "cli", NODE_OPTIONS env var is
+                // ignored.  Pass --node-options= as a CLI argument
+                // AND set NODE_OPTIONS env for non-SEA / kEnv cases.
+                return (vec![
+                    format!("--node-options=--require {DNS_PATCH_WIN_PATH}"),
+                ], Some(
                     format!("NODE_OPTIONS=--require {DNS_PATCH_WIN_PATH}"),
                 ));
             }
@@ -1943,9 +1962,9 @@ fn create_shim_and_run<FS: litebox_shim_windows::NtShimFS>(
                 stall_count = 0;
                 prev_terminated = terminated;
             }
-            // After 5 seconds of no progress (5 checks × 1s), dump state
-            // and force-terminate.
-            if stall_count >= 5 {
+            // After 120 seconds of no progress (120 checks × 1s), dump state
+            // and force-terminate.  LLM streaming can take tens of seconds.
+            if stall_count >= 120 {
                 let states = diag.thread_states();
                 let recent_alert_posts = diag.recent_alert_posts();
                 let recent_chain_events = diag.recent_chain_events();

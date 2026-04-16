@@ -835,8 +835,10 @@ fn lookup_registry_value_bytes(
         }
     } else if key_lower.ends_with("\\services\\dnscache\\parameters") {
         match name_lower.as_str() {
-            // Tell dnsapi.dll to do DNS resolution directly (via UDP)
+            // Tell dnsapi.dll to do DNS resolution directly (in-process)
             // instead of using RPC to the DNS Client service (Dnscache).
+            // The in-process path checks the hosts file, which we populate
+            // with entries resolved on the host side.
             "enableinprocessdnsresolution" => Some(1),
             _ => None,
         }
@@ -14689,6 +14691,13 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                                 for i in 0..zero_len {
                                     crate::try_write_guest_value_unaligned(data_ptr as usize + i, 0u8);
                                 }
+                                // Table 8 (route/forwarding), param_type=0:
+                                // MIB_IPSTATS.dwForwarding.  Return 2
+                                // (MIB_IP_NOT_FORWARDING) so dnsapi sees the
+                                // IP stack as available.
+                                if table == 8 && param_type == 0 && data_size >= 4 {
+                                    crate::try_write_guest_value_unaligned(data_ptr as usize, 2u32);
+                                }
                             }
 
                             // Also zero the output buffer if present (some callers
@@ -14791,8 +14800,12 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                             // proceeds to a real data query.
                             let is_count_query = key_data_ptr == 0 && dynamic_data_ptr == 0 && max_count == 0;
 
-                            if is_count_query {
-                                // Return count=1 for tables we want to fake.
+                            // Tables we support: 1 (interfaces), 7 (DNS servers),
+                            // 8 (routes), 10 (unicast addresses).
+                            let is_known_table = matches!(table, 1 | 7 | 8 | 10);
+
+                            if is_count_query && is_known_table {
+                                // Return count=1 for tables we can provide data for.
                                 crate::try_write_guest_value_unaligned(count_ptr, 1u64);
 
                                 if io_status_ptr != 0 {
@@ -14808,6 +14821,28 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                                     use litebox::platform::DebugLogProvider as _;
                                     litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
                                         "NT shim: NSI ENUMERATE table={table} count query → returned count=1\n",
+                                    ));
+                                }
+
+                                (NtStatus::STATUS_SUCCESS, false)
+                            } else if is_count_query {
+                                // Unknown table — return count=0 so the caller
+                                // doesn't attempt a data query we can't satisfy.
+                                crate::try_write_guest_value_unaligned(count_ptr, 0u64);
+
+                                if io_status_ptr != 0 {
+                                    crate::try_write_guest_value_unaligned(
+                                        io_status_ptr,
+                                        NtStatus::STATUS_SUCCESS.0 as u64,
+                                    );
+                                    crate::try_write_guest_value_unaligned(io_status_ptr + 8, 0u64);
+                                }
+
+                                #[cfg(feature = "trace_debug")]
+                                {
+                                    use litebox::platform::DebugLogProvider as _;
+                                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                        "NT shim: NSI ENUMERATE table={table} count query → returned count=0 (unknown)\n",
                                     ));
                                 }
 
@@ -14861,6 +14896,33 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                                 // Write a fake interface LUID as the key.
                                 let luid: u64 = (6u64 << 48) | 1;
                                 crate::try_write_guest_value_unaligned(key_data_ptr as usize, luid);
+
+                                // Fill dynamic data (nsi_ndis_ifinfo_dynamic) so
+                                // iphlpapi/dnsapi sees the interface as operational.
+                                // Layout (based on Wine's nsi_ndis_ifinfo_dynamic
+                                // and observed Windows behaviour):
+                                //   0x00: oper_status       u32 = 1 (IfOperStatusUp)
+                                //   0x04: oper_status_flags u32 = 0x01 (HardwareInterface)
+                                //   0x08: media_connect_state u32 = 1 (MediaConnectStateConnected)
+                                //   0x0C: mtu               u32 = 1500
+                                //   0x10: xmit_speed        u64 = 1_000_000_000 (1 Gbps)
+                                //   0x18: rcv_speed         u64 = 1_000_000_000 (1 Gbps)
+                                if dynamic_data_ptr != 0 && dynamic_size >= 0x20 {
+                                    // Zero the first portion of the buffer.
+                                    let zero_len = core::cmp::min(dynamic_size as usize, 0x40);
+                                    for i in 0..zero_len {
+                                        crate::try_write_guest_value_unaligned(
+                                            dynamic_data_ptr as usize + i, 0u8,
+                                        );
+                                    }
+                                    let d = dynamic_data_ptr as usize;
+                                    crate::try_write_guest_value_unaligned(d, 1u32); // IfOperStatusUp
+                                    crate::try_write_guest_value_unaligned(d + 0x04, 0x01u32); // HardwareInterface flag
+                                    crate::try_write_guest_value_unaligned(d + 0x08, 1u32); // MediaConnectStateConnected
+                                    crate::try_write_guest_value_unaligned(d + 0x0C, 1500u32); // MTU
+                                    crate::try_write_guest_value_unaligned(d + 0x10, 1_000_000_000u64); // xmit_speed
+                                    crate::try_write_guest_value_unaligned(d + 0x18, 1_000_000_000u64); // rcv_speed
+                                }
 
                                 crate::try_write_guest_value_unaligned(count_ptr, 1u64);
 

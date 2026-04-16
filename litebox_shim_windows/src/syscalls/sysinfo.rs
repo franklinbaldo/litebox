@@ -574,6 +574,34 @@ pub(crate) fn nt_query_information_process<FS: super::super::NtShimFS>(
             }
             NtStatus::STATUS_SUCCESS
         }
+        // ProcessVmCounters (3) — used by libuv's uv_resident_set_memory().
+        3 => {
+            // VM_COUNTERS_EX2 is the largest variant (128 bytes), but callers
+            // may pass the smaller VM_COUNTERS (88 bytes on x64) or
+            // VM_COUNTERS_EX (112 bytes).  Zero-fill whatever they give us and
+            // populate the fields libuv actually reads:
+            //   - WorkingSetSize  (offset 24)  — uv_resident_set_memory reads this
+            //   - PeakWorkingSetSize (offset 16)
+            const VM_COUNTERS_MIN: usize = 88; // sizeof(VM_COUNTERS) on x64
+            if (info_length as usize) < VM_COUNTERS_MIN || info_ptr == 0 {
+                return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
+            }
+            let write_len = core::cmp::min(info_length as usize, 128);
+            if !crate::is_addr_range_writable(info_ptr, write_len) {
+                return NtStatus::STATUS_ACCESS_VIOLATION;
+            }
+            unsafe {
+                core::ptr::write_bytes(info_ptr as *mut u8, 0, write_len);
+            }
+            // PeakWorkingSetSize at offset 16 (SIZE_T = u64)
+            crate::try_write_guest_value_unaligned(info_ptr + 16, 64u64 * 1024 * 1024);
+            // WorkingSetSize at offset 24 (SIZE_T = u64)
+            crate::try_write_guest_value_unaligned(info_ptr + 24, 32u64 * 1024 * 1024);
+            if return_length_ptr != 0 {
+                crate::try_write_guest_value_unaligned(return_length_ptr, write_len as u32);
+            }
+            NtStatus::STATUS_SUCCESS
+        }
         // ProcessDebugPort (7) — no debugger attached.
         7 => {
             if info_ptr != 0 && info_length >= 8 {

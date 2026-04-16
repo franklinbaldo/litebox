@@ -1426,3 +1426,43 @@ to convert device paths back to drive letters.
 ### Remaining issue
 - `copilot -p "say hello"` exits with code 1, no console output. Needs further
   debugging (check copilot log files, network calls, trace analysis).
+
+---
+
+## 2026-04-16: Copilot CLI fully working in sandbox!
+
+### Problem
+`copilot -p "say hello"` exited with code 0 but produced NO stdout output.
+
+### Root causes found and fixed
+
+1. **ProcessVmCounters (class 3) missing in NtQueryInformationProcess**
+   - libuv's `uv_resident_set_memory()` calls NtQueryInformationProcess with
+     class 3, which was not implemented. This caused `EINVAL` errors in
+     copilot's `session.start` and `session.shutdown` event handlers.
+   - Fix: Return a zeroed `VM_COUNTERS` struct (88 bytes min) with plausible
+     `WorkingSetSize` (32 MB) and `PeakWorkingSetSize` (64 MB) values.
+   - File: `litebox_shim_windows/src/syscalls/sysinfo.rs`
+
+2. **Watchdog timeout too aggressive (5 seconds)**
+   - The runner's diagnostic watchdog tracked "progress" solely by thread
+     termination count. When no threads terminated for 5 seconds, it
+     force-killed the process. But copilot legitimately waits 2-7 seconds for
+     the LLM streaming response with all threads alive (blocked on IOCP).
+   - Fix: Increased stall threshold from 5 to 120 seconds.
+   - File: `litebox_runner_windows_userland/src/lib.rs`
+
+### Also cleaned up
+- Reverted debug NtWriteFile preview length from 512 back to 24.
+
+### Verified
+```
+$ copilot -p "say hello"
+Hello! How can I help you today?
+
+Total usage est:        1 Premium request
+API time spent:         2s
+Total session time:     7s
+Breakdown by AI model:
+ claude-sonnet-4.6        19.3k in, 9 out, 0 cached (Est. 1 Premium request)
+```

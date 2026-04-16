@@ -4356,6 +4356,26 @@ pub(crate) fn nt_create_user_process<FS: crate::NtShimFS>(
         .map(|s| alloc::string::String::from(s))
         .unwrap_or_else(|| derive_image_path_from_cmdline(&cmd_line));
 
+    // For Node.js SEA binaries (e.g. copilot.exe) that use
+    // execArgvExtension: "cli", inject --node-options= into the child
+    // command line so the DNS patch is loaded via --require.
+    // The SEA binary strips --node-options= from argv before running JS,
+    // so it won't conflict with the application's CLI parser.
+    let cmd_line = {
+        let image_lower = spawn_image_path.to_ascii_lowercase();
+        let needs_node_options = (image_lower.ends_with("copilot.exe")
+            || image_lower.ends_with("node.exe"))
+            && !cmd_line.contains("--node-options=");
+        if needs_node_options {
+            inject_node_options_into_cmdline(
+                &cmd_line,
+                r#"--require C:\Windows\System32\__litebox_dns_patch.js"#,
+            )
+        } else {
+            cmd_line
+        }
+    };
+
     #[cfg(any(debug_assertions, feature = "trace_debug"))]
     {
         use litebox::platform::DebugLogProvider as _;
@@ -4412,6 +4432,30 @@ pub(crate) fn nt_create_user_process<FS: crate::NtShimFS>(
             NtStatus(status)
         }
     }
+}
+
+/// Insert `--node-options=<value>` after the first token (program name) in a
+/// Windows command line string.  This is consumed by Node.js SEA binaries that
+/// use `execArgvExtension: "cli"`.
+fn inject_node_options_into_cmdline(
+    cmd_line: &str,
+    node_options_value: &str,
+) -> alloc::string::String {
+    // Find the end of the first token (program name).
+    let trimmed = cmd_line.trim_start();
+    let first_end = if trimmed.starts_with('"') {
+        // Quoted program name — find closing quote.
+        trimmed[1..].find('"').map(|i| i + 2).unwrap_or(trimmed.len())
+    } else {
+        trimmed.find(' ').unwrap_or(trimmed.len())
+    };
+    let (prog, rest) = trimmed.split_at(first_end);
+    alloc::format!(
+        "{} \"--node-options={}\"{}",
+        prog,
+        node_options_value,
+        rest,
+    )
 }
 
 /// Check if the target image is cmd.exe based on the image path or command line.
