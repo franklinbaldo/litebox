@@ -1127,6 +1127,20 @@ pub(crate) fn nt_create_file<FS: crate::NtShimFS>(
     // Check for directory opens.
     let is_directory = create_options & file_options::FILE_DIRECTORY_FILE != 0;
 
+    // MountPointManager device — used by GetFinalPathNameByHandleW to map
+    // device paths (\Device\HarddiskVolumeN) to drive letters.
+    if nt_path == "\\??\\MountPointManager" || nt_path == "\\Device\\MountPointManager" {
+        let h = handles.insert(NtObject::Stub {
+            kind: alloc::string::String::from("MountPointManager"),
+            io_completion: None,
+        });
+        crate::try_write_guest_value_unaligned(handle_out_ptr, h as usize);
+        if io_status_ptr != 0 {
+            write_iosb(io_status_ptr, NtStatus::STATUS_SUCCESS, 1 /* FILE_OPENED */);
+        }
+        return NtStatus::STATUS_SUCCESS;
+    }
+
     // Translate NT path using the VFS-aware translator.
     let translated = translate_nt_path(&nt_path);
 
@@ -1915,7 +1929,7 @@ pub(crate) fn nt_query_information_file<FS: crate::NtShimFS>(
                 _ => NtStatus::STATUS_INVALID_INFO_CLASS,
             }
         }
-        NtObject::Directory { .. } => {
+        NtObject::Directory { path, .. } => {
             // Directory handles: return basic metadata.
             match info_class {
                 // FileBasicInformation (4)
@@ -1956,6 +1970,40 @@ pub(crate) fn nt_query_information_file<FS: crate::NtShimFS>(
                     crate::try_write_guest_value_unaligned(info_ptr, attrs);
                     crate::try_write_guest_value_unaligned(info_ptr + 4, reparse_tag);
                     write_iosb(io_status_ptr, NtStatus::STATUS_SUCCESS, 8);
+                    NtStatus::STATUS_SUCCESS
+                }
+                // FileNameInformation (9) — needed by GetFinalPathNameByHandleW
+                9 => {
+                    let nt_path = path;
+                    // Extract the path portion after the drive letter.
+                    // The path is stored as \??\C:\Users\... — we need \Users\...
+                    let file_part = if let Some(rest) = nt_path.strip_prefix("\\??\\") {
+                        if rest.len() >= 2 && rest.as_bytes()[1] == b':' {
+                            &rest[2..]
+                        } else {
+                            rest
+                        }
+                    } else {
+                        nt_path.as_str()
+                    };
+                    let utf16: alloc::vec::Vec<u16> = file_part.encode_utf16().collect();
+                    let name_bytes = utf16.len() * 2;
+                    // FILE_NAME_INFORMATION: u32 FileNameLength + WCHAR FileName[]
+                    let needed = 4 + name_bytes;
+                    if (info_length as usize) < needed || info_ptr == 0 {
+                        return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
+                    }
+                    // FileNameLength (in bytes)
+                    crate::try_write_guest_value_unaligned(info_ptr, name_bytes as u32);
+                    // FileName (UTF-16)
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            utf16.as_ptr() as *const u8,
+                            (info_ptr + 4) as *mut u8,
+                            name_bytes,
+                        );
+                    }
+                    write_iosb(io_status_ptr, NtStatus::STATUS_SUCCESS, needed);
                     NtStatus::STATUS_SUCCESS
                 }
                 _ => NtStatus::STATUS_INVALID_INFO_CLASS,

@@ -1394,3 +1394,35 @@ WOULDBLOCK path.
 - `litebox_shim_windows/src/syscalls/file.rs` — FileIoCompletionNotificationInfo
   stores skip flag, NSI device path translation, Socket constructor update
 - `litebox_runner_windows_userland/src/lib.rs` — DNS patch JS injection, NODE_OPTIONS
+
+---
+
+## 2026-04-16: Implement MountPointManager IOCTL for native realpath
+
+### Problem
+`fs/promises.realpath` and `fs.realpathSync.native` failed for directories in
+the sandbox. libuv's `uv_fs_realpath` calls `GetFinalPathNameByHandleW` which
+uses `NtQueryObject(ObjectNameInformation)` to get device paths and then
+`IOCTL_MOUNTMGR_QUERY_DOS_VOLUME_PATH` (0x6D0030) on `\??\MountPointManager`
+to convert device paths back to drive letters.
+
+### Fix (3 pieces)
+1. **`syscalls/file.rs`**: Open `\??\MountPointManager` as a Stub handle with
+   kind "MountPointManager"; add `FileNameInformation` (class 9) handler for
+   Directory handles (needed by GetFinalPathNameByHandleW).
+2. **`lib.rs`**: Add `NtQueryObject(ObjectNameInformation)` (class 1) handler
+   that returns `\Device\HarddiskVolumeN\...` device paths by querying host
+   `QueryDosDevice`. Add `MountPointManager` variant to `IoctlTarget` enum.
+   Implement `IOCTL_MOUNTMGR_QUERY_DOS_VOLUME_PATH` handler that iterates
+   drive letters to find the matching device, returning `MOUNTMGR_VOLUME_PATHS`
+   struct. Also implement `IOCTL_MOUNTMGR_QUERY_POINTS` (0x6D0008) handler.
+3. **Enabled trace_debug** for `NtQuerySymbolicLinkObject` logging.
+
+### Verified
+- `fs.realpathSync.native('C:\\Users\\wdcui\\litebox')` → OK
+- `fs/promises.realpath('C:\\Users\\wdcui\\litebox')` → OK
+- Copilot gets past the realpath error (no more EISDIR)
+
+### Remaining issue
+- `copilot -p "say hello"` exits with code 1, no console output. Needs further
+  debugging (check copilot log files, network calls, trace analysis).

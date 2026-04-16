@@ -6315,6 +6315,88 @@ impl<FS: NtShimFS> NtShimEntrypoints<FS> {
                     (NtStatus::STATUS_INVALID_HANDLE, false)
                 } else {
                     match info_class {
+                        // ObjectNameInformation (1) — return the NT object name.
+                        // Used by GetFinalPathNameByHandleW (called by libuv's
+                        // uv_fs_realpath).  Structure:
+                        //   UNICODE_STRING Name;  // 16 bytes on x64
+                        //     USHORT Length;
+                        //     USHORT MaximumLength;
+                        //     ULONG  _pad;
+                        //     PWSTR  Buffer;       // points right after this struct
+                        //   WCHAR  NameBuffer[];   // inline UTF-16 data
+                        1 => {
+                            // Try to get the NT path from the handle.
+                            let nt_path_opt: Option<alloc::string::String> = self.shared.handles.lock().with(handle, |entry| {
+                                match &entry.object {
+                                    handle_table::NtObject::File { path, .. } => Some(path.clone()),
+                                    handle_table::NtObject::Directory { path, .. } => Some(path.clone()),
+                                    _ => None,
+                                }
+                            }).flatten();
+
+                            if let Some(nt_path) = nt_path_opt {
+                                // Convert \??\C:\path to \Device\HarddiskVolumeN\path
+                                // GetFinalPathNameByHandleW expects a device path and
+                                // maps it back to a drive letter via QueryDosDevice.
+                                let device_path = if let Some(rest) = nt_path.strip_prefix("\\??\\") {
+                                    if rest.len() >= 2 && rest.as_bytes()[1] == b':' {
+                                        let drive = &rest[..2]; // e.g. "C:"
+                                        if let Some(dev) = query_host_dos_device(drive) {
+                                            alloc::format!("{dev}{}", &rest[2..])
+                                        } else {
+                                            alloc::format!("\\Device\\HarddiskVolume1{}", &rest[2..])
+                                        }
+                                    } else {
+                                        alloc::format!("\\Device\\HarddiskVolume1\\{rest}")
+                                    }
+                                } else {
+                                    nt_path.clone()
+                                };
+
+                                // Encode as UTF-16
+                                let utf16: alloc::vec::Vec<u16> = device_path.encode_utf16().collect();
+                                let name_bytes = utf16.len() * 2;
+                                // UNICODE_STRING header (16 bytes) + name data
+                                let needed = 16 + name_bytes;
+                                if return_len_ptr != 0 {
+                                    crate::try_write_guest_value_unaligned(return_len_ptr, needed as u32);
+                                }
+                                if (info_len as usize) < needed || info_ptr == 0 {
+                                    (NtStatus::STATUS_INFO_LENGTH_MISMATCH, false)
+                                } else {
+                                    if !crate::is_addr_range_writable(info_ptr, needed) {
+                                        return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                                    }
+                                    // Length (USHORT)
+                                    crate::try_write_guest_value_unaligned(info_ptr, name_bytes as u16);
+                                    // MaximumLength (USHORT)
+                                    crate::try_write_guest_value_unaligned(info_ptr + 2, name_bytes as u16);
+                                    // _pad (4 bytes)
+                                    crate::try_write_guest_value_unaligned(info_ptr + 4, 0u32);
+                                    // Buffer pointer — points to info_ptr + 16
+                                    crate::try_write_guest_value_unaligned(info_ptr + 8, (info_ptr + 16) as u64);
+                                    // Write the UTF-16 name data
+                                    unsafe {
+                                        core::ptr::copy_nonoverlapping(
+                                            utf16.as_ptr() as *const u8,
+                                            (info_ptr + 16) as *mut u8,
+                                            name_bytes,
+                                        );
+                                    }
+                                    #[cfg(feature = "trace_debug")]
+                                    {
+                                        use litebox::platform::DebugLogProvider as _;
+                                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                            "NT shim: NtQueryObject(ObjectNameInformation) handle=0x{handle:X} -> \"{device_path}\"\n",
+                                        ));
+                                    }
+                                    (NtStatus::STATUS_SUCCESS, false)
+                                }
+                            } else {
+                                // Non-file/directory handle — not implemented
+                                (NtStatus::STATUS_NOT_IMPLEMENTED, false)
+                            }
+                        }
                         4 => {
                             // OBJECT_HANDLE_FLAG_INFORMATION
                             // typedef struct _OBJECT_HANDLE_FLAG_INFORMATION {
@@ -11327,7 +11409,7 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                 if ret_len_ptr != 0 {
                     crate::try_write_guest_value_unaligned(ret_len_ptr, byte_len as u32);
                 }
-                #[cfg(debug_assertions)]
+                #[cfg(any(debug_assertions, feature = "trace_debug"))]
                 {
                     use litebox::platform::DebugLogProvider as _;
                     litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
@@ -11370,6 +11452,8 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                     AfdStub,
                     /// NSI device — Network Store Interface for DNS config.
                     Nsi,
+                    /// MountPointManager — maps device paths to drive letters.
+                    MountPointManager,
                 }
                 let target = {
                     let handles = self.shared.handles.lock();
@@ -11397,6 +11481,9 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                         }
                         handle_table::NtObject::Stub { kind, .. } if kind == "Nsi" => {
                             Some(IoctlTarget::Nsi)
+                        }
+                        handle_table::NtObject::Stub { kind, .. } if kind == "MountPointManager" => {
+                            Some(IoctlTarget::MountPointManager)
                         }
                         _ => None,
                     }).flatten()
@@ -13446,7 +13533,7 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                                                                     io_information = n;
                                                                     result_status = NtStatus::STATUS_SUCCESS;
 
-                                                                    #[cfg(debug_assertions)]
+                #[cfg(any(debug_assertions, feature = "trace_debug"))]
                                                                     {
                                                                         use litebox::platform::DebugLogProvider as _;
                                                                         litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
@@ -14945,6 +15032,211 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                                 crate::try_write_guest_value_unaligned(io_status_ptr + 8, 0u64);
                             }
                             (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false)
+                        }
+                    }
+                    Some(IoctlTarget::MountPointManager) => {
+                        // MountPointManager device — responds to IOCTL_MOUNTMGR_QUERY_POINTS
+                        // (0x6d0008) to map device paths to drive letters.
+                        // GetFinalPathNameByHandleW uses this to convert \Device\HarddiskVolumeN
+                        // paths back to \\?\C:\ style paths.
+                        const IOCTL_MOUNTMGR_QUERY_POINTS: u32 = 0x6d0008;
+                        const IOCTL_MOUNTMGR_QUERY_DOS_VOLUME_PATH: u32 = 0x6d0030;
+                        if ioctl_code == IOCTL_MOUNTMGR_QUERY_DOS_VOLUME_PATH {
+                            // Input: MOUNTDEV_NAME { USHORT NameLength; WCHAR Name[1]; }
+                            // The device name like \Device\HarddiskVolume4
+                            let name_len_bytes = crate::try_read_guest_value_unaligned::<u16>(input_buffer).unwrap_or(0) as usize;
+                            let device_name = if name_len_bytes > 0 {
+                                let wchar_count = name_len_bytes / 2;
+                                let mut wchars = alloc::vec::Vec::with_capacity(wchar_count);
+                                for i in 0..wchar_count {
+                                    let ch = crate::try_read_guest_value_unaligned::<u16>(input_buffer + 2 + i * 2).unwrap_or(0);
+                                    wchars.push(ch);
+                                }
+                                alloc::string::String::from_utf16_lossy(&wchars)
+                            } else {
+                                alloc::string::String::new()
+                            };
+
+                            #[cfg(feature = "trace_debug")]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                    "NT shim: MountPointManager QUERY_DOS_VOLUME_PATH device=\"{device_name}\" out_len=0x{output_length:X}\n",
+                                ));
+                            }
+
+                            // Find matching drive letter by querying host QueryDosDevice for each letter
+                            let mut found_drive: Option<char> = None;
+                            for letter in b'A'..=b'Z' {
+                                let drive = alloc::format!("{}:", letter as char);
+                                if let Some(dev) = query_host_dos_device(&drive) {
+                                    if device_name.starts_with(&dev) {
+                                        found_drive = Some(letter as char);
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if let Some(drive_letter) = found_drive {
+                                // Output: MOUNTMGR_VOLUME_PATHS { ULONG MultiSzLength; WCHAR MultiSz[1]; }
+                                // MultiSz contains "C:\" followed by double-null terminator
+                                let dos_path = alloc::format!("{}:\\", drive_letter);
+                                let dos_utf16: alloc::vec::Vec<u16> = dos_path.encode_utf16().chain(core::iter::once(0)).chain(core::iter::once(0)).collect();
+                                let multi_sz_bytes = dos_utf16.len() * 2;
+                                // Header: 4 bytes (MultiSzLength)
+                                let total_size = 4 + multi_sz_bytes;
+
+                                if (output_length as usize) < total_size || output_buffer == 0 {
+                                    // Return required size in MultiSzLength field
+                                    if output_buffer != 0 && output_length >= 4 {
+                                        crate::try_write_guest_value_unaligned(output_buffer, multi_sz_bytes as u32);
+                                    }
+                                    if io_status_ptr != 0 {
+                                        crate::try_write_guest_value_unaligned(io_status_ptr, NtStatus::STATUS_BUFFER_OVERFLOW.0 as u64);
+                                        crate::try_write_guest_value_unaligned(io_status_ptr + 8, 4u64);
+                                    }
+                                    (NtStatus::STATUS_BUFFER_OVERFLOW, false)
+                                } else {
+                                    // Write MultiSzLength
+                                    crate::try_write_guest_value_unaligned(output_buffer, multi_sz_bytes as u32);
+                                    // Write MultiSz data
+                                    unsafe {
+                                        core::ptr::copy_nonoverlapping(
+                                            dos_utf16.as_ptr() as *const u8,
+                                            (output_buffer + 4) as *mut u8,
+                                            multi_sz_bytes,
+                                        );
+                                    }
+                                    if io_status_ptr != 0 {
+                                        crate::try_write_guest_value_unaligned(io_status_ptr, NtStatus::STATUS_SUCCESS.0 as u64);
+                                        crate::try_write_guest_value_unaligned(io_status_ptr + 8, total_size as u64);
+                                    }
+                                    #[cfg(feature = "trace_debug")]
+                                    {
+                                        use litebox::platform::DebugLogProvider as _;
+                                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                            "NT shim: MountPointManager QUERY_DOS_VOLUME_PATH -> \"{}\" total_size={}\n",
+                                            dos_path, total_size
+                                        ));
+                                    }
+                                    (NtStatus::STATUS_SUCCESS, false)
+                                }
+                            } else {
+                                if io_status_ptr != 0 {
+                                    crate::try_write_guest_value_unaligned(io_status_ptr, NtStatus::STATUS_OBJECT_NAME_NOT_FOUND.0 as u64);
+                                    crate::try_write_guest_value_unaligned(io_status_ptr + 8, 0u64);
+                                }
+                                (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false)
+                            }
+                        } else if ioctl_code == IOCTL_MOUNTMGR_QUERY_POINTS {
+                            // Input: MOUNTMGR_MOUNT_POINT { SymLinkNameOff, SymLinkNameLen,
+                            //   UniqueIdOff, UniqueIdLen, DeviceNameOff, DeviceNameLen }
+                            // Read DeviceName from input to find the matching drive letter.
+                            let dev_name_off = crate::try_read_guest_value_unaligned::<u32>(input_buffer + 16).unwrap_or(0) as usize;
+                            let dev_name_len = crate::try_read_guest_value_unaligned::<u32>(input_buffer + 20).unwrap_or(0) as usize;
+
+                            let queried_device = if dev_name_len > 0 && dev_name_off + dev_name_len <= input_length as usize {
+                                let mut wchars = alloc::vec::Vec::with_capacity(dev_name_len / 2);
+                                for i in (0..dev_name_len).step_by(2) {
+                                    let ch = crate::try_read_guest_value_unaligned::<u16>(input_buffer + 24 + dev_name_off + i).unwrap_or(0);
+                                    wchars.push(ch);
+                                }
+                                alloc::string::String::from_utf16_lossy(&wchars)
+                            } else {
+                                alloc::string::String::new()
+                            };
+
+                            #[cfg(feature = "trace_debug")]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                    "NT shim: MountPointManager QUERY_POINTS device=\"{queried_device}\" out_len=0x{output_length:X}\n",
+                                ));
+                            }
+
+                            // Find the drive letter for this device by querying the host.
+                            // We check C: (most common) and fall back to iterating A-Z.
+                            let mut found_drive: Option<char> = None;
+                            for letter in b'A'..=b'Z' {
+                                let drive = alloc::format!("{}:", letter as char);
+                                if let Some(dev) = query_host_dos_device(&drive) {
+                                    if queried_device == dev || queried_device.is_empty() {
+                                        found_drive = Some(letter as char);
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if let Some(drive_letter) = found_drive {
+                                // Build MOUNTMGR_MOUNT_POINTS response.
+                                // Layout:
+                                //   u32 Size (total size of response)
+                                //   u32 NumberOfMountPoints
+                                //   MOUNTMGR_MOUNT_POINT[1] { SymLinkNameOff, SymLinkNameLen,
+                                //       UniqueIdOff, UniqueIdLen, DeviceNameOff, DeviceNameLen }
+                                //   Followed by inline string data.
+                                let sym_link = alloc::format!("\\DosDevices\\{}:", drive_letter);
+                                let sym_utf16: alloc::vec::Vec<u16> = sym_link.encode_utf16().collect();
+                                let sym_bytes = sym_utf16.len() * 2;
+
+                                // MOUNTMGR_MOUNT_POINTS header: 8 bytes (Size + NumberOfMountPoints)
+                                // One MOUNTMGR_MOUNT_POINT entry: 24 bytes
+                                // String data: sym_bytes
+                                let header_size: usize = 8 + 24;
+                                let total_size = header_size + sym_bytes;
+
+                                if (output_length as usize) < total_size || output_buffer == 0 {
+                                    // Return STATUS_BUFFER_OVERFLOW with required size.
+                                    if output_buffer != 0 && output_length >= 4 {
+                                        crate::try_write_guest_value_unaligned(output_buffer, total_size as u32);
+                                    }
+                                    if io_status_ptr != 0 {
+                                        crate::try_write_guest_value_unaligned(io_status_ptr, NtStatus::STATUS_BUFFER_OVERFLOW.0 as u64);
+                                        crate::try_write_guest_value_unaligned(io_status_ptr + 8, 4u64);
+                                    }
+                                    (NtStatus::STATUS_BUFFER_OVERFLOW, false)
+                                } else {
+                                    // Size
+                                    crate::try_write_guest_value_unaligned(output_buffer, total_size as u32);
+                                    // NumberOfMountPoints
+                                    crate::try_write_guest_value_unaligned(output_buffer + 4, 1u32);
+                                    // MountPoint[0].SymbolicLinkNameOffset (relative to start of output)
+                                    crate::try_write_guest_value_unaligned(output_buffer + 8, header_size as u32);
+                                    // MountPoint[0].SymbolicLinkNameLength
+                                    crate::try_write_guest_value_unaligned(output_buffer + 12, sym_bytes as u32);
+                                    // MountPoint[0].UniqueIdOffset
+                                    crate::try_write_guest_value_unaligned(output_buffer + 16, 0u32);
+                                    // MountPoint[0].UniqueIdLength
+                                    crate::try_write_guest_value_unaligned(output_buffer + 20, 0u32);
+                                    // MountPoint[0].DeviceNameOffset
+                                    crate::try_write_guest_value_unaligned(output_buffer + 24, 0u32);
+                                    // MountPoint[0].DeviceNameLength
+                                    crate::try_write_guest_value_unaligned(output_buffer + 28, 0u32);
+                                    // Write SymbolicLinkName string data
+                                    unsafe {
+                                        core::ptr::copy_nonoverlapping(
+                                            sym_utf16.as_ptr() as *const u8,
+                                            (output_buffer + header_size) as *mut u8,
+                                            sym_bytes,
+                                        );
+                                    }
+                                    if io_status_ptr != 0 {
+                                        crate::try_write_guest_value_unaligned(io_status_ptr, NtStatus::STATUS_SUCCESS.0 as u64);
+                                        crate::try_write_guest_value_unaligned(io_status_ptr + 8, total_size as u64);
+                                    }
+                                    (NtStatus::STATUS_SUCCESS, false)
+                                }
+                            } else {
+                                // No matching drive letter found.
+                                if io_status_ptr != 0 {
+                                    crate::try_write_guest_value_unaligned(io_status_ptr, NtStatus::STATUS_OBJECT_NAME_NOT_FOUND.0 as u64);
+                                    crate::try_write_guest_value_unaligned(io_status_ptr + 8, 0u64);
+                                }
+                                (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false)
+                            }
+                        } else {
+                            // Other MountPointManager IOCTLs — not implemented.
+                            (NtStatus::STATUS_NOT_IMPLEMENTED, false)
                         }
                     }
                     None => {
