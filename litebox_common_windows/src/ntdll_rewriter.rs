@@ -194,7 +194,7 @@ pub fn rewrite_ntdll(
 
     // ret  (C3) — resume point: pops the caller's actual return address
     trampoline[off] = 0xC3;
-    off += 1;
+    // off += 1; // intentionally not incremented — overwritten below
 
     // Pad to offset 0x20 for alignment.
     off = 0x20;

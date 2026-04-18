@@ -11997,7 +11997,7 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                                 {
                                     use litebox::platform::DebugLogProvider as _;
                                     litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                                        "NT shim: AFD SET_CONTEXT sock_id={sock_id} size={input_length} → accepted\n"
+                                        "NT shim: AFD SET_CONTEXT sock_id={sock_handle} size={input_length} → accepted\n"
                                     ));
                                 }
                                 NtStatus::STATUS_SUCCESS
@@ -12009,7 +12009,7 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                                 {
                                     use litebox::platform::DebugLogProvider as _;
                                     litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                                        "NT shim: AFD SET_INFO sock_id={sock_id} → stub success\n"
+                                        "NT shim: AFD SET_INFO sock_id={sock_handle} → stub success\n"
                                     ));
                                 }
                                 NtStatus::STATUS_SUCCESS
@@ -12073,7 +12073,7 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                                     {
                                         use litebox::platform::DebugLogProvider as _;
                                         litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                                            "NT shim: AFD TRANSPORT_IOCTL sock_id={sock_id} type={} level=0x{:X} code=0x{:X} buf=0x{:X} len={}\n",
+                                            "NT shim: AFD TRANSPORT_IOCTL sock_id={sock_handle} type={} level=0x{:X} code=0x{:X} buf=0x{:X} len={}\n",
                                             tl_info.io_type, tl_info.level, tl_info.io_control_code,
                                             tl_info.input_buffer_ptr, tl_info.input_buffer_length,
                                         ));
@@ -12129,7 +12129,7 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                                         {
                                             use litebox::platform::DebugLogProvider as _;
                                             litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                                                "NT shim: AFD BIND sock_id={sock_id} addr={sock_addr}\n"
+                                                "NT shim: AFD BIND sock_id={sock_handle} addr={sock_addr}\n"
                                             ));
                                         }
 
@@ -12712,7 +12712,7 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                                             {
                                                 use litebox::platform::DebugLogProvider as _;
                                                 litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                                                    "NT shim: AFD GET_PEER_NAME sock_id={sock_id} addr={v4}\n"
+                                                    "NT shim: AFD GET_PEER_NAME sock_id={sock_handle} addr={v4}\n"
                                                 ));
                                             }
 
@@ -12764,7 +12764,7 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                                     {
                                         use litebox::platform::DebugLogProvider as _;
                                         litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                                            "NT shim: AFD SEND sock_id={sock_id} buf_array=0x{buffer_array_ptr:X} count={buffer_count} afd_flags=0x{_afd_flags:X} tdi_flags=0x{_tdi_flags:X}\n"
+                                            "NT shim: AFD SEND sock_id={sock_handle} buf_array=0x{buffer_array_ptr:X} count={buffer_count} afd_flags=0x{_afd_flags:X} tdi_flags=0x{_tdi_flags:X}\n"
                                         ));
                                     }
 
