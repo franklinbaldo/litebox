@@ -291,7 +291,7 @@ fn inject_dns_patch<FS: litebox::fs::FileSystem>(
             }
             let _ = vfs.close(&fd);
             if written == content.len() {
-                eprintln!("Injected DNS patch at {DNS_PATCH_WIN_PATH}");
+                // DNS patch injected at DNS_PATCH_WIN_PATH
                 if name_lower == "node.exe" {
                     // For raw node.exe, prepend --require to arguments.
                     return (vec![
@@ -1414,7 +1414,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // This is needed for large package trees (e.g. copilot) whose paths
     // exceed USTAR's 100-char filename limit.
     if let Some(ref broker_addr) = cli_args.nine_p_broker {
-        eprintln!("Connecting to 9P broker at {broker_addr}...");
+        // 9P broker connecting
         let (ring_writer, ring_reader) = connect_nine_p_channel(broker_addr)?;
 
         let writer = ShmemTransportWriter(ring_writer);
@@ -1423,7 +1423,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         let (nine_p_fs, mut reader) =
             litebox::fs::nine_p::FileSystem::new(&litebox, writer, reader, msize, "root", "/")
                 .map_err(|e| anyhow!("9P attach failed: {e:?}"))?;
-        eprintln!("9P broker connected.");
+        // 9P broker connected
 
         // Spawn background 9P response worker thread.
         let worker_handle = nine_p_fs.worker_handle();
@@ -2024,7 +2024,7 @@ fn create_shim_and_run<FS: litebox_shim_windows::NtShimFS>(
     unsafe {
         litebox_platform_windows_userland::run_thread_ref(&shim, &mut ctx);
     }
-    eprintln!("[runner] run_thread_ref returned");
+    // run_thread_ref returned — normal exit
 
     // Signal network worker to stop and wait for it.
     shutdown.store(true, core::sync::atomic::Ordering::Relaxed);
@@ -2057,8 +2057,9 @@ fn create_shim_and_run<FS: litebox_shim_windows::NtShimFS>(
     );
     #[cfg(all(debug_assertions, feature = "trace_debug"))]
     write_trace_log("runner_exit.txt", msg.as_bytes());
-    // Only print to stderr when there was an error or stuck threads.
-    if exit_code != 0 || live != 0 {
+    // Only print to stderr when there was a non-zero exit code.
+    // Live threads at exit are normal (e.g. Node.js libuv cleanup) and not worth alarming over.
+    if exit_code != 0 {
         eprintln!("{msg}");
         if !recent_chain_events.is_empty() {
             eprintln!("[runner] recent_chain_events={recent_chain_events}");
@@ -2716,16 +2717,13 @@ fn capture_host_nls_data() -> Option<litebox_shim_windows::NlsData> {
                     oem_cp_offset = offset;
                     // Unicode case table starts right after the OEM section.
                     unicode_case_offset = offset + oem_sec.bytes.len();
-                    eprintln!(
-                        "[runner] NLS offsets found: oem_cp=0x{:X} unicode_case=0x{:X}",
-                        oem_cp_offset, unicode_case_offset
-                    );
+                    // NLS offsets found: oem_cp and unicode_case
                     break;
                 }
             }
         }
         if oem_cp_offset == 0 {
-            eprintln!("[runner] WARNING: could not find OEM CP offset in combined NLS section");
+            // OEM CP offset not found — non-fatal, proceeding without it
         }
         Some(litebox_shim_windows::NlsData {
             section,
