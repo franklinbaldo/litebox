@@ -204,7 +204,7 @@ pub const FAST_PEB_LOCK_SIZE: usize = 0x400;
 pub const STATIC_SERVER_DATA_SIZE: usize = 0x1000;
 
 /// Size of the environment block buffer (1 page).
-pub const ENV_BLOCK_SIZE: usize = 0x1000;
+pub const ENV_BLOCK_SIZE: usize = 0x10000;
 
 /// Size of the image path name buffer (1 page).
 pub const IMAGE_PATH_BUFFER_SIZE: usize = 0x1000;

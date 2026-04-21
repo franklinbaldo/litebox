@@ -382,7 +382,6 @@ fn query_nt_path_file_status<FS: crate::NtShimFS>(
         return Err(NtStatus::STATUS_OBJECT_NAME_NOT_FOUND);
     };
 
-    use litebox::fs::FileSystem as _;
     fs.file_status(path.as_str())
         .map_err(|_| NtStatus::STATUS_OBJECT_NAME_NOT_FOUND)
 }
@@ -1155,7 +1154,6 @@ pub(crate) fn nt_create_file<FS: crate::NtShimFS>(
         };
 
         if let Some(path) = vfs_path {
-            use litebox::fs::FileSystem as _;
 
             if is_directory {
                 // Directory operations on VFS-translatable paths stay in VFS.
@@ -1290,7 +1288,6 @@ pub(crate) fn nt_create_file<FS: crate::NtShimFS>(
                     // Check if opened path is a directory — if so, create a
                     // Directory handle instead of File so NtQueryDirectoryFile
                     // can enumerate it (e.g. libuv's readdirSync).
-                    use litebox::fs::FileSystem as _;
                     let is_dir = fs
                         .fd_file_status(&typed_fd)
                         .map(|st| st.file_type == litebox::fs::FileType::Directory)
@@ -1514,7 +1511,6 @@ pub(crate) fn nt_read_file_vfs<FS: crate::NtShimFS>(
         return NtStatus::STATUS_INVALID_HANDLE;
     };
 
-    use litebox::fs::FileSystem as _;
     match fs.read(vfs_fd, buf, read_offset.map(|o| o as usize)) {
         Ok(bytes_read) => {
             if advance_pos {
@@ -1593,7 +1589,6 @@ pub(crate) fn nt_write_file_vfs<FS: crate::NtShimFS>(
         return NtStatus::STATUS_INVALID_HANDLE;
     };
 
-    use litebox::fs::FileSystem as _;
     match fs.write(vfs_fd, buf, write_offset.map(|o| o as usize)) {
         Ok(bytes_written) => {
             if advance_pos {
@@ -1765,7 +1760,6 @@ pub(crate) fn nt_query_information_file<FS: crate::NtShimFS>(
                     }
                     let file_size = (|| -> Option<i64> {
                         let fs = shared.fs.get()?;
-                        use litebox::fs::FileSystem as _;
                         let st = fs.fd_file_status(vfs_fd).ok()?;
                         Some(st.size as i64)
                     })()
@@ -1837,7 +1831,6 @@ pub(crate) fn nt_query_information_file<FS: crate::NtShimFS>(
                     // Get file size from VFS (same pattern as class 5 handler).
                     let file_size = (|| -> Option<i64> {
                         let fs = shared.fs.get()?;
-                        use litebox::fs::FileSystem as _;
                         let st = fs.fd_file_status(vfs_fd).ok()?;
                         Some(st.size as i64)
                     })()
@@ -2278,6 +2271,133 @@ pub(crate) fn nt_set_information_file<FS: crate::NtShimFS>(
         return NtStatus::STATUS_SUCCESS;
     }
 
+    // ── FileRenameInformation (10) / FileRenameInformationEx (65) ───
+    // Rename a file or directory.
+    // Layout (x64):
+    //   offset 0:  union { BOOLEAN ReplaceIfExists; ULONG Flags; } (4 bytes + 4 pad)
+    //   offset 8:  HANDLE  RootDirectory  (8 bytes)
+    //   offset 16: ULONG   FileNameLength (in bytes)
+    //   offset 20: WCHAR   FileName[1]    (new name, UTF-16LE, not null-terminated)
+    if info_class == 10 || info_class == 65 {
+        // Minimum header is 20 bytes + at least 2 bytes for one WCHAR.
+        if (info_length as usize) < 22 || info_ptr == 0 {
+            return NtStatus::STATUS_INVALID_PARAMETER;
+        }
+
+        let _replace_flags =
+            crate::try_read_guest_value_unaligned::<u32>(info_ptr).unwrap_or(0);
+        let root_dir_handle =
+            crate::try_read_guest_value_unaligned::<u64>(info_ptr + 8).unwrap_or(0);
+        let file_name_length =
+            crate::try_read_guest_value_unaligned::<u32>(info_ptr + 16).unwrap_or(0) as usize;
+
+        if file_name_length == 0 || file_name_length > 0x10000 {
+            return NtStatus::STATUS_INVALID_PARAMETER;
+        }
+
+        // Read the UTF-16LE new filename.
+        let wchar_count = file_name_length / 2;
+        let mut new_name_u16 = alloc::vec::Vec::with_capacity(wchar_count);
+        for i in 0..wchar_count {
+            let w = crate::try_read_guest_value_unaligned::<u16>(info_ptr + 20 + i * 2)
+                .unwrap_or(0);
+            new_name_u16.push(w);
+        }
+        let new_name_raw = alloc::string::String::from_utf16_lossy(&new_name_u16);
+
+        // Get the old NT path from the handle.
+        let old_nt_path = handles
+            .with(file_handle, |entry| match &entry.object {
+                NtObject::File { path, .. } => Some(path.clone()),
+                NtObject::Directory { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .flatten();
+        let Some(old_nt_path) = old_nt_path else {
+            return NtStatus::STATUS_INVALID_HANDLE;
+        };
+
+        // Build full new NT path. If RootDirectory handle is set and the name
+        // is relative, resolve against that directory.
+        let full_new_nt_path = if root_dir_handle != 0
+            && !is_absolute_nt_or_dos_path(&new_name_raw)
+        {
+            let root_path = handles
+                .with(root_dir_handle as u32, |entry| match &entry.object {
+                    NtObject::Directory { path, .. } => Some(path.clone()),
+                    NtObject::File { path, .. } => Some(path.clone()),
+                    _ => None,
+                })
+                .flatten();
+            match root_path {
+                Some(rp) => join_nt_paths(&rp, &new_name_raw),
+                None => new_name_raw.clone(),
+            }
+        } else {
+            new_name_raw.clone()
+        };
+
+        // Translate NT paths → VFS paths.
+        let old_vfs = translate_nt_path(&old_nt_path).and_then(|t| match t {
+            TranslatedPath::Vfs(p) => Some(p),
+            _ => None,
+        });
+        let new_vfs = translate_nt_path(&full_new_nt_path).and_then(|t| match t {
+            TranslatedPath::Vfs(p) => Some(p),
+            _ => None,
+        });
+
+        #[cfg(feature = "trace_debug")]
+        {
+            use litebox::platform::DebugLogProvider as _;
+            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                "NT shim: NtSetInformationFile FileRenameInformation handle=0x{file_handle:X} old={old_nt_path:?} new={full_new_nt_path:?} old_vfs={old_vfs:?} new_vfs={new_vfs:?}\n"
+            ));
+        }
+
+        let (Some(old_vfs_path), Some(new_vfs_path)) = (old_vfs, new_vfs) else {
+            return NtStatus::STATUS_OBJECT_NAME_INVALID;
+        };
+
+        if let Some(fs) = shared.fs.get() {
+            match fs.rename(old_vfs_path.as_str(), new_vfs_path.as_str()) {
+                Ok(()) => {
+                    // Update the handle's stored path to reflect the new name.
+                    handles.with_mut(file_handle, |entry| {
+                        match &mut entry.object {
+                            NtObject::File { path, vfs_path, .. } => {
+                                *path = full_new_nt_path.clone();
+                                *vfs_path = Some(new_vfs_path.clone());
+                            }
+                            NtObject::Directory { path, .. } => {
+                                *path = full_new_nt_path.clone();
+                            }
+                            _ => {}
+                        }
+                    });
+                    write_iosb(
+                        io_status_ptr,
+                        NtStatus::STATUS_SUCCESS,
+                        info_length as usize,
+                    );
+                    return NtStatus::STATUS_SUCCESS;
+                }
+                Err(_e) => {
+                    #[cfg(feature = "trace_debug")]
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "NT shim: NtSetInformationFile FileRenameInformation FAILED: {_e:?}\n"
+                        ));
+                    }
+                    return NtStatus::STATUS_ACCESS_DENIED;
+                }
+            }
+        } else {
+            return NtStatus::STATUS_UNSUCCESSFUL;
+        }
+    }
+
     let Some(status) = handles.with(file_handle, |entry| {
     match &entry.object {
         NtObject::File { position, vfs_fd, delete_on_close, .. } => match info_class {
@@ -2338,7 +2458,6 @@ pub(crate) fn nt_set_information_file<FS: crate::NtShimFS>(
                     return NtStatus::STATUS_INVALID_PARAMETER;
                 }
                 if let Some(fs) = shared.fs.get() {
-                    use litebox::fs::FileSystem as _;
                     match fs.truncate(vfs_fd, new_size as usize, false) {
                         Ok(()) => {
                             write_iosb(io_status_ptr, NtStatus::STATUS_SUCCESS, 8);
@@ -3009,7 +3128,6 @@ fn nt_query_directory_file_inner<FS: crate::NtShimFS>(
                     },
                 };
                 let fs = shared.fs.get()?;
-                use litebox::fs::FileSystem as _;
                 let dir_fd = match fs.open(
                     &*vfs_path,
                     litebox::fs::OFlags::DIRECTORY | litebox::fs::OFlags::RDONLY,
@@ -3438,7 +3556,6 @@ pub(crate) fn nt_open_file<FS: crate::NtShimFS>(
             if is_directory {
                 // NtOpenFile is always "open existing" — validate the directory.
                 // VFS-translatable paths must not escape to host.
-                use litebox::fs::FileSystem as _;
                 let is_vfs_dir = fs
                     .file_status(path)
                     .is_ok_and(|s| s.file_type == litebox::fs::FileType::Directory);
@@ -3455,7 +3572,6 @@ pub(crate) fn nt_open_file<FS: crate::NtShimFS>(
                 return NtStatus::STATUS_OBJECT_NAME_NOT_FOUND;
             }
 
-            use litebox::fs::FileSystem as _;
             // NtOpenFile is always "open existing" — determine read/write
             // from DesiredAccess using the same masks as NtCreateFile.
             let want_read = desired_access & 0x8000_0001 != 0; // GENERIC_READ | FILE_READ_DATA
@@ -3477,7 +3593,6 @@ pub(crate) fn nt_open_file<FS: crate::NtShimFS>(
                 Ok(typed_fd) => {
                     // Check if opened path is actually a directory — if so,
                     // create a Directory handle (same logic as NtCreateFile).
-                    use litebox::fs::FileSystem as _;
                     let is_dir = fs
                         .fd_file_status(&typed_fd)
                         .map(|st| st.file_type == litebox::fs::FileType::Directory)
@@ -3661,7 +3776,6 @@ pub(crate) fn nt_delete_file<FS: crate::NtShimFS>(
             TranslatedPath::Registry(_) | TranslatedPath::Pipe(_) => None,
         };
         if let (Some(path), Some(fs)) = (vfs_path, shared.fs.get()) {
-            use litebox::fs::FileSystem as _;
             return match fs.unlink(path) {
                 Ok(()) => NtStatus::STATUS_SUCCESS,
                 Err(litebox::fs::errors::UnlinkError::IsADirectory) => {
@@ -4298,9 +4412,13 @@ pub(crate) fn nt_create_user_process<FS: crate::NtShimFS>(
     #[cfg(any(debug_assertions, feature = "trace_debug"))]
     {
         use litebox::platform::DebugLogProvider as _;
+        let env_keys: alloc::vec::Vec<&str> = child_env_strings
+            .iter()
+            .filter_map(|s| s.split('=').next())
+            .collect();
         litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-            "NT shim: NtCreateUserProcess stdin=0x{:X} stdout=0x{:X} stderr=0x{:X} env_vars={}\n",
-            stdin_handle, stdout_handle, stderr_handle, child_env_strings.len(),
+            "NT shim: NtCreateUserProcess stdin=0x{:X} stdout=0x{:X} stderr=0x{:X} env_vars={} keys={:?}\n",
+            stdin_handle, stdout_handle, stderr_handle, child_env_strings.len(), env_keys,
         ));
     }
 
@@ -4334,6 +4452,76 @@ pub(crate) fn nt_create_user_process<FS: crate::NtShimFS>(
             );
         }
         // Not a recognized builtin — fall through to real spawn.
+    }
+
+    // ── gh auth token interception ───────────────────────────────────
+    //
+    // Copilot (and other GitHub CLI tools) may spawn `gh auth token` to
+    // retrieve auth tokens.  Since the real `gh` CLI is not available in
+    // the sandbox, intercept the command and return the token directly
+    // from the child's environment (GH_TOKEN / GITHUB_TOKEN /
+    // COPILOT_GITHUB_TOKEN).
+    {
+        let is_gh_auth = {
+            let lower_cmd = cmd_line.to_ascii_lowercase();
+            // Match "gh auth token" in the command line (covers both cmd.exe
+            // wrappers and direct gh.exe/gh.com spawns).
+            let cmd_has_gh_auth = lower_cmd.contains("gh auth token")
+                || lower_cmd.contains("gh.exe auth token")
+                || lower_cmd.contains("gh.com auth token");
+            // Also match by image path for direct spawns where the command
+            // line only contains "auth token ..." without the "gh" prefix.
+            let img_is_gh = image_path_nt.as_deref().map_or(false, |img| {
+                let lower = img.to_ascii_lowercase();
+                lower.ends_with("\\gh.exe")
+                    || lower.ends_with("\\gh.com")
+                    || lower.ends_with("/gh.exe")
+                    || lower.ends_with("/gh.com")
+            });
+            cmd_has_gh_auth || (img_is_gh && lower_cmd.contains("auth") && lower_cmd.contains("token"))
+        };
+
+        if is_gh_auth {
+            // Find the token in the child's env block.
+            let token = child_env_strings
+                .iter()
+                .find_map(|s| {
+                    if let Some(rest) = s.strip_prefix("GH_TOKEN=") {
+                        Some(rest)
+                    } else if let Some(rest) = s.strip_prefix("GITHUB_TOKEN=") {
+                        Some(rest)
+                    } else if let Some(rest) = s.strip_prefix("COPILOT_GITHUB_TOKEN=") {
+                        Some(rest)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or("");
+
+            if !token.is_empty() {
+                #[cfg(any(debug_assertions, feature = "trace_debug"))]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NT shim: NtCreateUserProcess intercepted gh auth token, returning token from env (len={})\n",
+                        token.len(),
+                    ));
+                }
+                return finish_inline_process(
+                    shared,
+                    process_handle_out,
+                    thread_handle_out,
+                    process_params_ptr,
+                    create_info_ptr,
+                    attribute_list_ptr,
+                    stdin_handle,
+                    stdout_handle,
+                    stderr_handle,
+                    0,
+                    &alloc::format!("{}\n", token),
+                );
+            }
+        }
     }
 
     // ── Real spawn path ──────────────────────────────────────────────
@@ -4791,7 +4979,6 @@ fn execute_builtin_command<FS: crate::NtShimFS>(
                 filename.replace('\\', "/")
             };
             if let Some(fs) = shared.fs.get() {
-                use litebox::fs::FileSystem as _;
                 use litebox::fs::{OFlags, Mode};
                 match fs.open(&vfs_path, OFlags::RDONLY, Mode::empty()) {
                     Ok(fd) => {
@@ -4845,7 +5032,6 @@ fn execute_builtin_command<FS: crate::NtShimFS>(
                 dirname.replace('\\', "/")
             };
             if let Some(fs) = shared.fs.get() {
-                use litebox::fs::FileSystem as _;
                 use litebox::fs::{OFlags, Mode};
                 match fs.open(&vfs_path, OFlags::RDONLY, Mode::empty()) {
                     Ok(fd) => {
@@ -4891,7 +5077,6 @@ fn execute_builtin_command<FS: crate::NtShimFS>(
                 dirname.replace('\\', "/")
             };
             if let Some(fs) = shared.fs.get() {
-                use litebox::fs::FileSystem as _;
                 use litebox::fs::Mode;
                 match fs.mkdir(&vfs_path, Mode::empty()) {
                     Ok(()) => (0, String::new()),

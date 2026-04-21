@@ -235,6 +235,26 @@ try {
         undici.setGlobalDispatcher(agent);
     }
 } catch(e) { /* undici not available */ }
+// Fix unquoted multi-word arguments in child processes.
+// When Node.js spawns process.execPath it sets windowsVerbatimArguments=true,
+// which tells libuv to skip quoting.  Multi-word args like "say hello" get
+// flattened to separate tokens.  On real Windows the child reads via IPC, but
+// in the sandbox the child parses the command line directly.
+// Fix: parent saves its properly-parsed argv via env var; child restores it.
+if (process.env.__LITEBOX_ARGV) {
+    try {
+        const parentArgs = JSON.parse(Buffer.from(process.env.__LITEBOX_ARGV, 'base64').toString());
+        const flatParent = parentArgs.flatMap(a => a.split(/\s+/));
+        const childArgs = process.argv.slice(1);
+        if (flatParent.length <= childArgs.length && flatParent.every((v, i) => childArgs[i] === v)) {
+            const extra = childArgs.slice(flatParent.length);
+            process.argv = [process.argv[0], ...parentArgs, ...extra];
+        }
+    } catch(e) {}
+    delete process.env.__LITEBOX_ARGV;
+} else {
+    process.env.__LITEBOX_ARGV = Buffer.from(JSON.stringify(process.argv.slice(1))).toString('base64');
+}
 "#;
 
 /// VFS path where the DNS patch preload script is written.
@@ -1741,6 +1761,14 @@ fn create_shim_and_run<FS: litebox_shim_windows::NtShimFS>(
         );
         init_ntdll_loader_globals(pebldr_va, peb_teb_layout.ldr_data_va);
         init_ntdll_loader_hash_table(ldrp_hash_table_va, peb_teb_layout.ldr_data_va);
+
+        // Zero out LdrpForkInProgress (ntdll+0x1D27C8).  When the PE loader
+        // maps ntdll's .data section from disk this byte may carry a non-zero
+        // value (observed: 0x60).  ntdll's LdrpInitialize checks this flag on
+        // every new thread and, if non-zero, sleeps on LdrpForkConditionVariable
+        // waiting for a fork that will never complete — deadlocking the thread.
+        let ntdll_base = guest_va_start + real_dlls::REAL_DLL_OFFSET;
+        core::ptr::write_volatile((ntdll_base + 0x1D27C8) as *mut u8, 0);
     }
     trace_debugln!(
         "[real-dlls] Seeded internal PebLdr at 0x{:X}",
@@ -2675,7 +2703,7 @@ fn capture_host_nls_data() -> Option<litebox_shim_windows::NlsData> {
         // ANSI CP always starts at offset 0. To find where the OEM CP starts, we
         // search for the first bytes of the individually-captured OEM section within
         // the combined section. The Unicode case table follows immediately after.
-        let base_addr = base as usize;
+        let _base_addr = base as usize;
         let mut oem_cp_offset: usize = 0;
         let mut unicode_case_offset: usize = 0;
 

@@ -104,7 +104,6 @@ impl<FS: crate::NtShimFS> NtObjectEntry<FS> {
                 match alloc::sync::Arc::try_unwrap(vfs_fd) {
                     Ok(typed_fd) => {
                         // Last reference — close the fd on the filesystem.
-                        use litebox::fs::FileSystem as _;
                         let _ = fs.close(&typed_fd);
                         // If marked for deletion, unlink the file from VFS now.
                         let should_delete =
@@ -155,7 +154,7 @@ impl<FS: crate::NtShimFS> NtObjectEntry<FS> {
 }
 
 /// Type alias for the typed fd handle to an NT object in the descriptor table.
-pub type NtObjectFd<FS: crate::NtShimFS> = litebox::fd::TypedFd<NtObjectSubsystem<FS>>;
+pub type NtObjectFd<FS> = litebox::fd::TypedFd<NtObjectSubsystem<FS>>;
 
 /// Type alias for thread wakers used by sync object waiters.
 type SyncWaker = litebox::event::wait::Waker<Platform>;
@@ -293,6 +292,17 @@ pub enum NtObject<FS: crate::NtShimFS> {
     DataSection {
         /// Maximum size of the section (in bytes).
         max_size: u64,
+    },
+    /// A file-backed data section (NtCreateSection without SEC_IMAGE, with a file handle).
+    /// The mapped view will be pre-populated with the file's content on map,
+    /// and written back to the file on unmap.
+    FileBackedDataSection {
+        /// Maximum size of the section (in bytes).
+        max_size: u64,
+        /// VFS file descriptor for the backing file.
+        vfs_fd: alloc::sync::Arc<litebox::fd::TypedFd<FS>>,
+        /// Reference to the filesystem for read/write operations.
+        fs: alloc::sync::Arc<FS>,
     },
     /// Current process handle (from duplicating pseudo-handle -1).
     CurrentProcess,
@@ -2397,6 +2407,11 @@ pub fn clone_nt_object<FS: crate::NtShimFS>(obj: &NtObject<FS>) -> Option<NtObje
         },
         NtObject::DataSection { max_size } => NtObject::DataSection {
             max_size: *max_size,
+        },
+        NtObject::FileBackedDataSection { max_size, vfs_fd, fs } => NtObject::FileBackedDataSection {
+            max_size: *max_size,
+            vfs_fd: alloc::sync::Arc::clone(vfs_fd),
+            fs: alloc::sync::Arc::clone(fs),
         },
         NtObject::CurrentProcess => NtObject::CurrentProcess,
         NtObject::CurrentThread => NtObject::CurrentThread,

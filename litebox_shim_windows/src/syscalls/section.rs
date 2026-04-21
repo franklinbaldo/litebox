@@ -70,7 +70,7 @@ pub(crate) fn nt_create_section<FS: crate::NtShimFS>(
     let is_image = alloc_attributes & SEC_IMAGE != 0;
 
     if !is_image {
-        // Non-image (data) section ΓÇö anonymous shared memory.
+        // Non-image (data) section.
         // Read MaximumSize from r9.
         let max_size = if _max_size_ptr != 0 {
             (crate::try_read_guest_value_unaligned::<i64>(_max_size_ptr).unwrap_or(0)) as u64
@@ -78,6 +78,47 @@ pub(crate) fn nt_create_section<FS: crate::NtShimFS>(
             0x10000 // default 64KB
         };
 
+        // Check if there is a backing file handle — if so, create a file-backed
+        // section so the mapped view can be pre-populated and written back.
+        if file_handle != 0 {
+            let file_info = handles.with(file_handle, |entry| match &entry.object {
+                NtObject::File { vfs_fd, fs, .. } => {
+                    Some((alloc::sync::Arc::clone(vfs_fd), alloc::sync::Arc::clone(fs)))
+                }
+                _ => None,
+            }).flatten();
+
+            if let Some((vfs_fd, fs)) = file_info {
+                let effective_max = if max_size > 0 {
+                    max_size
+                } else {
+                    // Use the file's current size, with a minimum of 64 KB.
+                    let file_size = fs.fd_file_status(&vfs_fd).map(|s| s.size as u64).unwrap_or(0);
+                    file_size.max(0x10000)
+                };
+
+                #[cfg(any(debug_assertions, feature = "trace_debug"))]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    let msg = alloc::format!(
+                        "NT shim: NtCreateSection file-backed data (file_handle=0x{file_handle:X}, alloc_attrs=0x{alloc_attributes:X}, max_size=0x{max_size:X}, effective=0x{effective_max:X})\n",
+                    );
+                    litebox_platform_multiplex::platform().debug_log_print(&msg);
+                }
+
+                let handle = handles.insert(NtObject::FileBackedDataSection {
+                    max_size: effective_max,
+                    vfs_fd,
+                    fs,
+                });
+                if !crate::try_write_guest_value_unaligned(section_handle_ptr, handle) {
+                    return NtStatus::STATUS_ACCESS_VIOLATION;
+                }
+                return NtStatus::STATUS_SUCCESS;
+            }
+        }
+
+        // No file handle or handle is not a File — anonymous data section.
         #[cfg(debug_assertions)]
         {
             use litebox::platform::DebugLogProvider as _;
@@ -221,7 +262,6 @@ fn read_pe_from_handle<FS: crate::NtShimFS>(
     // Read from VFS.
     let fs = shared.fs.get()?;
     // Get file size via fd_file_status, then read the entire file.
-    use litebox::fs::FileSystem as _;
     let status = fs.fd_file_status(&vfs_fd).ok()?;
     let size = status.size;
     if size == 0 || size > 256 * 1024 * 1024 {
@@ -370,7 +410,7 @@ pub(crate) fn nt_map_view_of_section<FS: crate::NtShimFS>(
     }
 
     // Determine section type.
-    enum SectionType {
+    enum SectionType<FS: crate::NtShimFS> {
         Image {
             pe_data: Arc<Vec<u8>>,
             module_path: Option<alloc::string::String>,
@@ -380,6 +420,11 @@ pub(crate) fn nt_map_view_of_section<FS: crate::NtShimFS>(
         },
         Data {
             max_size: u64,
+        },
+        FileBackedData {
+            max_size: u64,
+            vfs_fd: alloc::sync::Arc<litebox::fd::TypedFd<FS>>,
+            fs: alloc::sync::Arc<FS>,
         },
         StaticView {
             base: usize,
@@ -406,6 +451,13 @@ pub(crate) fn nt_map_view_of_section<FS: crate::NtShimFS>(
             NtObject::DataSection { max_size } => Some(SectionType::Data {
                 max_size: *max_size,
             }),
+            NtObject::FileBackedDataSection { max_size, vfs_fd, fs } => {
+                Some(SectionType::FileBackedData {
+                    max_size: *max_size,
+                    vfs_fd: alloc::sync::Arc::clone(vfs_fd),
+                    fs: alloc::sync::Arc::clone(fs),
+                })
+            }
             NtObject::Stub { kind, .. } if kind == "CsrSharedSection" => {
                 let csr = *shim_shared.csr_state.lock();
                 Some(SectionType::StaticView {
@@ -432,6 +484,11 @@ pub(crate) fn nt_map_view_of_section<FS: crate::NtShimFS>(
     match section_type {
         SectionType::Data { max_size } => {
             map_data_section(ctx, process_state, base_addr_ptr, view_size_ptr, max_size)
+        }
+        SectionType::FileBackedData { max_size, vfs_fd, fs } => {
+            map_file_backed_data_section(
+                ctx, process_state, shim_shared, base_addr_ptr, view_size_ptr, max_size, &vfs_fd, &fs,
+            )
         }
         SectionType::StaticView { base, size } => {
             if !crate::try_write_guest_value_unaligned(base_addr_ptr, base) {
@@ -512,7 +569,7 @@ pub(crate) fn nt_map_view_of_section_ex<FS: crate::NtShimFS>(
         return NtStatus::STATUS_INVALID_PARAMETER;
     }
 
-    enum SectionType {
+    enum SectionType<FS: crate::NtShimFS> {
         Image {
             pe_data: Arc<Vec<u8>>,
             module_path: Option<alloc::string::String>,
@@ -522,6 +579,11 @@ pub(crate) fn nt_map_view_of_section_ex<FS: crate::NtShimFS>(
         },
         Data {
             max_size: u64,
+        },
+        FileBackedData {
+            max_size: u64,
+            vfs_fd: alloc::sync::Arc<litebox::fd::TypedFd<FS>>,
+            fs: alloc::sync::Arc<FS>,
         },
         StaticView {
             base: usize,
@@ -548,6 +610,13 @@ pub(crate) fn nt_map_view_of_section_ex<FS: crate::NtShimFS>(
             NtObject::DataSection { max_size } => Some(SectionType::Data {
                 max_size: *max_size,
             }),
+            NtObject::FileBackedDataSection { max_size, vfs_fd, fs } => {
+                Some(SectionType::FileBackedData {
+                    max_size: *max_size,
+                    vfs_fd: alloc::sync::Arc::clone(vfs_fd),
+                    fs: alloc::sync::Arc::clone(fs),
+                })
+            }
             NtObject::Stub { kind, .. } if kind == "CsrSharedSection" => {
                 let csr = *shim_shared.csr_state.lock();
                 Some(SectionType::StaticView {
@@ -574,6 +643,11 @@ pub(crate) fn nt_map_view_of_section_ex<FS: crate::NtShimFS>(
     match section_type {
         SectionType::Data { max_size } => {
             map_data_section(ctx, process_state, base_addr_ptr, view_size_ptr, max_size)
+        }
+        SectionType::FileBackedData { max_size, vfs_fd, fs } => {
+            map_file_backed_data_section(
+                ctx, process_state, shim_shared, base_addr_ptr, view_size_ptr, max_size, &vfs_fd, &fs,
+            )
         }
         SectionType::StaticView { base, size } => {
             if !crate::try_write_guest_value_unaligned(base_addr_ptr, base) {
@@ -693,6 +767,97 @@ pub(crate) fn map_data_section_pages(
         }
         Err(_) => Err(NtStatus::STATUS_NO_MEMORY),
     }
+}
+
+/// Map a file-backed data section into guest address space.
+///
+/// Allocates pages, pre-populates them with the file's content, and registers
+/// the mapping in `shared.file_backed_views` so that `NtUnmapViewOfSectionEx`
+/// can write the modified data back to the VFS file.
+fn map_file_backed_data_section<FS: crate::NtShimFS>(
+    ctx: &mut super::super::ExecutionContext,
+    process_state: &Arc<NtProcessState>,
+    shared: &crate::NtSharedState<FS>,
+    base_addr_ptr: usize,
+    view_size_ptr: usize,
+    max_size: u64,
+    vfs_fd: &alloc::sync::Arc<litebox::fd::TypedFd<FS>>,
+    fs: &alloc::sync::Arc<FS>,
+) -> NtStatus {
+    let suggested_base = crate::try_read_guest_value_unaligned::<usize>(base_addr_ptr).unwrap_or(0);
+    let view_size = if view_size_ptr != 0 {
+        let vs = crate::try_read_guest_value_unaligned::<usize>(view_size_ptr).unwrap_or(0);
+        if vs != 0 {
+            vs
+        } else {
+            max_size as usize
+        }
+    } else {
+        max_size as usize
+    };
+
+    let (mapped_addr, aligned_size) =
+        match map_data_section_pages(process_state, suggested_base, view_size) {
+            Ok(mapped) => mapped,
+            Err(status) => return status,
+        };
+
+    // Pre-populate the mapped memory with the file's current content.
+    {
+        let file_size = fs.fd_file_status(vfs_fd).map(|s| s.size).unwrap_or(0);
+        if file_size > 0 {
+            let read_size = core::cmp::min(file_size, aligned_size);
+            let dst = mapped_addr as *mut u8;
+            let mut offset = 0usize;
+            while offset < read_size {
+                let remaining = read_size - offset;
+                let chunk_size = core::cmp::min(remaining, 64 * 1024); // 64 KB chunks
+                let buf = unsafe {
+                    core::slice::from_raw_parts_mut(dst.add(offset), chunk_size)
+                };
+                match fs.read(vfs_fd, buf, Some(offset)) {
+                    Ok(0) => break,
+                    Ok(n) => offset += n,
+                    Err(_) => break,
+                }
+            }
+
+            #[cfg(any(debug_assertions, feature = "trace_debug"))]
+            {
+                use litebox::platform::DebugLogProvider as _;
+                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                    "NT shim: map_file_backed_data_section pre-populated {} bytes from file (file_size={}, view_size=0x{aligned_size:X})\n",
+                    offset, file_size,
+                ));
+            }
+        }
+    }
+
+    // Register this view for write-back on unmap.
+    shared.file_backed_views.lock().insert(mapped_addr, crate::FileBackedViewInfo {
+        vfs_fd: alloc::sync::Arc::clone(vfs_fd),
+        fs: alloc::sync::Arc::clone(fs),
+        view_size: aligned_size,
+        max_size,
+    });
+
+    if !crate::try_write_guest_value_unaligned(base_addr_ptr, mapped_addr) {
+        return NtStatus::STATUS_ACCESS_VIOLATION;
+    }
+    if view_size_ptr != 0 {
+        crate::try_write_guest_value_unaligned(view_size_ptr, aligned_size);
+    }
+
+    #[cfg(any(debug_assertions, feature = "trace_debug"))]
+    {
+        use litebox::platform::DebugLogProvider as _;
+        let msg = alloc::format!(
+            "NT shim: NtMapViewOfSection file-backed data at 0x{mapped_addr:X} (size=0x{aligned_size:X})\n",
+        );
+        litebox_platform_multiplex::platform().debug_log_print(&msg);
+    }
+
+    NtStatus::STATUS_SUCCESS
 }
 
 /// Map an image section (SEC_IMAGE PE) into guest address space.

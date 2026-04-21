@@ -363,14 +363,17 @@ pub(crate) fn nt_create_thread_ex<FS: crate::NtShimFS>(
                 })
                 .map_or(0, |m| m.base_address);
 
-            #[cfg(debug_assertions)]
+            #[cfg(any(debug_assertions, feature = "trace_debug"))]
             {
                 use litebox::platform::DebugLogProvider as _;
                 litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
                     "NT shim: NtCreateThreadEx child LdrInitializeThunk: ctx=0x{context_va:X} \
                      ldr_rsp=0x{ldr_rsp:X} ntdll=0x{ntdll_base:X} \
-                     RtlUTS=0x{:X} start=0x{start_routine:X} arg=0x{argument:X}\n",
+                     RtlUTS=0x{:X} start=0x{start_routine:X} arg=0x{argument:X} \
+                     stack_top=0x{stack_top:X} sentinel_rsp=0x{sentinel_rsp:X} \
+                     ldr_init_thunk=0x{:X}\n",
                     parent_init.rtl_user_thread_start_va,
+                    parent_init.ldr_init_thunk_va,
                 ));
             }
 

@@ -213,6 +213,7 @@ pub enum NtSyscallId {
     NtCancelIoFile,
     NtQueryFullAttributesFile,
     NtQueryDebugFilterState,
+    NtFlushVirtualMemory,
 }
 
 /// Mapping from real Windows syscall numbers to `NtSyscallId`.
@@ -384,6 +385,7 @@ impl NtSyscallMap {
             NtSyscallId::NtCancelIoFile,
             NtSyscallId::NtQueryFullAttributesFile,
             NtSyscallId::NtQueryDebugFilterState,
+            NtSyscallId::NtFlushVirtualMemory,
         ];
         let pairs: alloc::vec::Vec<(u32, NtSyscallId)> =
             all.iter().map(|&id| (id as u32, id)).collect();
@@ -538,6 +540,7 @@ pub fn name_to_syscall_id(name: &str) -> Option<NtSyscallId> {
         "NtCancelIoFile" => NtSyscallId::NtCancelIoFile,
         "NtQueryFullAttributesFile" => NtSyscallId::NtQueryFullAttributesFile,
         "NtQueryDebugFilterState" => NtSyscallId::NtQueryDebugFilterState,
+        "NtFlushVirtualMemory" => NtSyscallId::NtFlushVirtualMemory,
         _ => return None,
     };
     Some(id)

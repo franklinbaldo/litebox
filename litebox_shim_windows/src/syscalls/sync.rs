@@ -1200,11 +1200,46 @@ pub(crate) fn nt_wait_for_alert_by_thread_id<FS: crate::NtShimFS>(
     #[cfg(feature = "trace_debug")]
     {
         use litebox::platform::DebugLogProvider as _;
+        let val_at_addr = crate::try_read_guest_value_unaligned::<u64>(address).unwrap_or(0xDEAD);
+        // ntdll globals (offsets relative to base):
+        //   LdrpForkActiveLock        = +0x1D2458 (= our wait address, approx)
+        //   LdrpForkConditionVariable = +0x1D245C (8 bytes)
+        //   LdrpForkInProgress        = +0x1D27C6 (1 byte)
+        //   LdrpProcessInitialized    = +0x1D29CB (4 bytes)
+        //   LdrpInitCompleteEvent     = +0x1D298B (handle, 8 bytes)
+        let probe_u8 = |off: i64| -> u32 {
+            let a = (address as i64).wrapping_add(off);
+            crate::try_read_guest_value_unaligned::<u8>(a as usize).unwrap_or(0xFF) as u32
+        };
+        let probe_u32 = |off: i64| -> u32 {
+            let a = (address as i64).wrapping_add(off);
+            crate::try_read_guest_value_unaligned::<u32>(a as usize).unwrap_or(0xDEAD)
+        };
+        let probe_u64 = |off: i64| -> u64 {
+            let a = (address as i64).wrapping_add(off);
+            crate::try_read_guest_value_unaligned::<u64>(a as usize).unwrap_or(0xDEAD)
+        };
+        let fork_active = probe_u8(0); // SRWLOCK byte 0
+        let fork_in_progress = probe_u8(0x1D27C8 - 0x1D2458);
+        let proc_initialized = probe_u32(0x1D29E8 - 0x1D2458);
+        let init_complete_event = probe_u64(0x1D29B0 - 0x1D2458);
+        let mut stack = alloc::string::String::new();
+        for i in 0..8 {
+            let sp = ctx.regs.rsp.saturating_add(i * 8);
+            let v = crate::try_read_guest_value_unaligned::<u64>(sp as usize).unwrap_or(0);
+            stack.push_str(&alloc::format!(" [+0x{:X}]=0x{:X}", i * 8, v));
+        }
         litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-            "NT shim: NtWaitForAlertByThreadId(tid={}, addr=0x{:X}, timeout={:?}) waiting\n",
+            "NT shim: NtWaitForAlertByThreadId(tid={}, addr=0x{:X}) waiting rip=0x{:X} val_at_addr=0x{:X} fork_active=0x{:X} fork_in_progress=0x{:X} proc_initialized=0x{:X} init_complete_event=0x{:X} stack:{}\n",
             thread.thread_id,
             address,
-            timeout,
+            ctx.regs.rip,
+            val_at_addr,
+            fork_active,
+            fork_in_progress,
+            proc_initialized,
+            init_complete_event,
+            stack,
         ));
     }
 

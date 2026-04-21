@@ -651,6 +651,13 @@ pub(crate) fn spawn_child_process<FS: crate::NtShimFS>(
         init_child_loader_globals(pebldr_va, peb_teb_layout.ldr_data_va);
         // Only put ntdll in the hash table — not the EXE.
         init_child_loader_hash_table(ldrp_hash_table_va, peb_teb_layout.ldr_data_va);
+
+        // Zero out LdrpForkInProgress (ntdll+0x1D27C8).  When the PE loader
+        // maps ntdll's .data section from disk this byte may carry a non-zero
+        // value (observed: 0x60).  ntdll's LdrpInitialize checks this flag on
+        // every new thread and, if non-zero, sleeps on LdrpForkConditionVariable
+        // waiting for a fork that will never complete — deadlocking the thread.
+        core::ptr::write_volatile((ntdll_load_va + 0x1D27C8) as *mut u8, 0);
     }
 
     #[cfg(any(debug_assertions, feature = "trace_debug"))]
@@ -858,6 +865,7 @@ pub(crate) fn spawn_child_process<FS: crate::NtShimFS>(
         // STATUS_INVALID_HANDLE, forcing the CRT to use the pipe handles
         // from ProcessParameters instead.
         has_console: stdin_pipe.is_none() && stdout_pipe.is_none() && stderr_pipe.is_none(),
+        file_backed_views: spin::Mutex::new(alloc::collections::BTreeMap::new()),
     });
 
     #[cfg(feature = "trace_debug")]
@@ -1300,7 +1308,6 @@ fn nt_path_to_vfs_path(nt_path: &str) -> alloc::string::String {
 
 /// Read a file from VFS into a Vec<u8>.
 fn read_vfs_file<FS: crate::NtShimFS>(fs: &FS, path: &str) -> Result<Vec<u8>, i32> {
-    use litebox::fs::FileSystem as _;
 
     let fd = fs
         .open(path, litebox::fs::OFlags::RDONLY, litebox::fs::Mode::RUSR)

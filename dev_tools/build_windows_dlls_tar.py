@@ -52,6 +52,7 @@ DEFAULT_DLLS = [
     "win32u.dll",
     "winmm.dll",
     "ws2_32.dll",
+    "mswsock.dll",
     "dbgcore.dll",
     "wintypes.dll",
     "cryptbase.dll",
@@ -59,6 +60,7 @@ DEFAULT_DLLS = [
     "rsaenh.dll",
     "bcrypt.dll",
     "bcryptprimitives.dll",
+    "powrprof.dll",
 ]
 
 SYSTEM32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")

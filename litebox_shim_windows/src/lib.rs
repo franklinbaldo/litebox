@@ -2377,6 +2377,22 @@ pub(crate) struct NtSharedState<FS: NtShimFS> {
     /// for `\Device\ConDrv\*` paths returns STATUS_INVALID_HANDLE, matching
     /// real Windows kernel behaviour for console-less processes.
     pub has_console: bool,
+    /// Tracks file-backed section views mapped into guest memory.
+    /// On unmap, the shim reads the mapped memory and writes it back to
+    /// the backing VFS file.  Keyed by the mapped base address.
+    pub file_backed_views: Mutex<alloc::collections::BTreeMap<usize, FileBackedViewInfo<FS>>>,
+}
+
+/// Tracking info for a file-backed data section view mapped into guest memory.
+pub(crate) struct FileBackedViewInfo<FS: NtShimFS> {
+    /// VFS file descriptor for the backing file.
+    pub vfs_fd: alloc::sync::Arc<litebox::fd::TypedFd<FS>>,
+    /// Reference to the filesystem for write-back.
+    pub fs: alloc::sync::Arc<FS>,
+    /// Size of the mapped view (page-aligned).
+    pub view_size: usize,
+    /// Logical file size (from NtCreateSection max_size) — write-back truncates to this.
+    pub max_size: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -2445,6 +2461,91 @@ fn push_recent_vm_teardown(
         q.pop_front();
     }
     q.push_back(event);
+}
+
+/// Write back a file-backed section view's data to its backing VFS file.
+///
+/// Called before `nt_unmap_view_of_section` to flush the mapped memory content
+/// back to the file.  If `base` is not tracked in `file_backed_views`, this is
+/// a no-op (the view was anonymous).
+fn write_back_file_backed_view<FS: NtShimFS>(
+    shared: &NtSharedState<FS>,
+    base: usize,
+) {
+    let view_info = shared.file_backed_views.lock().remove(&base);
+    let Some(info) = view_info else {
+        return;
+    };
+
+    // Read the mapped memory and write it to the backing VFS file.
+
+    // Use the logical file size (max_size from NtCreateSection), NOT the
+    // page-aligned view_size, to avoid writing trailing null padding bytes.
+    let write_size = info.max_size as usize;
+
+    // Truncate the file to the logical size first, then write the data.
+    let _ = info.fs.truncate(&info.vfs_fd, write_size, true);
+
+    let src = base as *const u8;
+    let mut offset = 0usize;
+    while offset < write_size {
+        let remaining = write_size - offset;
+        let chunk_size = core::cmp::min(remaining, 64 * 1024); // 64 KB chunks
+        let buf = unsafe {
+            core::slice::from_raw_parts(src.add(offset), chunk_size)
+        };
+        match info.fs.write(&info.vfs_fd, buf, Some(offset)) {
+            Ok(0) => break,
+            Ok(n) => offset += n,
+            Err(_) => break,
+        }
+    }
+
+    #[cfg(any(debug_assertions, feature = "trace_debug"))]
+    {
+        use litebox::platform::DebugLogProvider as _;
+        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+            "NT shim: write_back_file_backed_view base=0x{base:X} wrote {offset} bytes (max_size=0x{write_size:X}, view_size=0x{:X})\n",
+            info.view_size,
+        ));
+    }
+}
+
+/// Flush a file-backed section view's data to its backing VFS file without
+/// removing the tracking entry (non-destructive).  Called by `NtFlushVirtualMemory`.
+fn flush_file_backed_view<FS: NtShimFS>(
+    shared: &NtSharedState<FS>,
+    base: usize,
+) {
+    // Clone Arcs out of the map entry so we can drop the lock before doing I/O.
+    let (vfs_fd, fs, write_size) = {
+        let views = shared.file_backed_views.lock();
+        let Some(info) = views.get(&base) else {
+            return;
+        };
+        (
+            alloc::sync::Arc::clone(&info.vfs_fd),
+            alloc::sync::Arc::clone(&info.fs),
+            info.max_size as usize,
+        )
+    };
+
+    let _ = fs.truncate(&vfs_fd, write_size, true);
+
+    let src = base as *const u8;
+    let mut offset = 0usize;
+    while offset < write_size {
+        let remaining = write_size - offset;
+        let chunk_size = core::cmp::min(remaining, 64 * 1024);
+        let buf = unsafe {
+            core::slice::from_raw_parts(src.add(offset), chunk_size)
+        };
+        match fs.write(&vfs_fd, buf, Some(offset)) {
+            Ok(0) => break,
+            Ok(n) => offset += n,
+            Err(_) => break,
+        }
+    }
 }
 
 /// Thread-safe diagnostic handle that can be shared with a watchdog thread
@@ -3045,6 +3146,7 @@ impl<FS: NtShimFS> NtShimEntrypoints<FS> {
             next_process_id: Mutex::new(1000),
             exe_directory_vfs: Mutex::new(alloc::string::String::new()),
             has_console: true,
+            file_backed_views: Mutex::new(alloc::collections::BTreeMap::new()),
         });
         let wait_state = WaitState::new(litebox_platform_multiplex::platform());
         shared
@@ -5961,6 +6063,20 @@ impl<FS: NtShimFS> NtShimEntrypoints<FS> {
                 );
                 (status, false)
             }
+            NtSyscallId::NtFlushVirtualMemory => {
+                // NtFlushVirtualMemory(ProcessHandle, *BaseAddress, *RegionSize, IoStatusBlock)
+                // Flush file-backed section data to the VFS file.
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let base_addr_ptr = args.arg1;
+                if base_addr_ptr != 0 {
+                    let base = crate::try_read_guest_value_unaligned::<usize>(base_addr_ptr)
+                        .unwrap_or(0);
+                    if base != 0 {
+                        flush_file_backed_view(&self.shared, base);
+                    }
+                }
+                (NtStatus::STATUS_SUCCESS, false)
+            }
             // Phase 2: System information & time
             NtSyscallId::NtQuerySystemInformation => {
                 let status = syscalls::sysinfo::nt_query_system_information(ctx);
@@ -7895,6 +8011,8 @@ impl<FS: NtShimFS> NtShimEntrypoints<FS> {
                     .thread_obj
                     .as_ref()
                     .map_or(0, |obj| obj.last_caller_ret());
+                // Write back file-backed section data before unmapping.
+                write_back_file_backed_view(&self.shared, unmap_base);
                 let image_mapping = self.shared.process_state.image_mapping_at(unmap_base);
                 let section_view = self.shared.process_state.section_view_at(unmap_base);
                 let nearest_section_view = self
@@ -7979,6 +8097,8 @@ impl<FS: NtShimFS> NtShimEntrypoints<FS> {
                     .thread_obj
                     .as_ref()
                     .map_or(0, |obj| obj.last_caller_ret());
+                // Write back file-backed section data before unmapping.
+                write_back_file_backed_view(&self.shared, unmap_base);
                 let image_mapping = self.shared.process_state.image_mapping_at(unmap_base);
                 let section_view = self.shared.process_state.section_view_at(unmap_base);
                 let nearest_section_view = self
@@ -8091,7 +8211,6 @@ impl<FS: NtShimFS> NtShimEntrypoints<FS> {
                 let is_known_dlls = name.to_lowercase().starts_with("\\knowndlls\\");
                 let found = if dll_name.ends_with(".dll") {
                     if let Some(fs) = self.shared.fs.get() {
-                        use litebox::fs::FileSystem as _;
                         let mut search_paths = alloc::vec![
                             alloc::format!("/c/windows/system32/{dll_name}"),
                         ];
@@ -15906,6 +16025,7 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                 (status, false)
             }
 
+            #[allow(unreachable_patterns)]
             other => {
                 log_unimplemented!("syscall {:?} (nr=0x{:04X})", other, raw_nr);
                 (NtStatus::STATUS_NOT_IMPLEMENTED, false)
@@ -15951,6 +16071,20 @@ impl<FS: NtShimFS> litebox::shim::EnterShim for NtShimEntrypoints<FS> {
             ctx.regs.rsp = state.stack_top;
             ctx.regs.rcx = state.initial_rcx;
             ctx.regs.rdx = state.initial_rdx;
+        }
+        {
+            #[cfg(feature = "trace_debug")]
+            {
+                use litebox::platform::DebugLogProvider as _;
+                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                    "[shim-lifecycle] init-post: tid={} rip=0x{:X} rsp=0x{:X} rcx=0x{:X} rdx=0x{:X}\n",
+                    self.thread_id,
+                    ctx.regs.rip,
+                    ctx.regs.rsp,
+                    ctx.regs.rcx,
+                    ctx.regs.rdx,
+                ));
+            }
         }
         self.resume_guest(ctx)
     }
