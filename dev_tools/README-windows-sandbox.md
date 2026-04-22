@@ -35,10 +35,15 @@ it separately via `--pe-file`.
 ## Step 3: Start the broker
 
 The broker is a single process that provides both network proxying and 9P
-host filesystem access over an AF_UNIX socket:
+host filesystem access over an AF_UNIX socket.
+
+The `--drive c` flag maps the host's `C:\` drive into the 9P namespace so
+the sandbox can load PE binaries and DLLs directly from the host. Combined
+with `--read-only` and `--writable-path`, this gives the sandbox read
+access to the entire drive while restricting writes to a single directory:
 
 ```powershell
-# Create the 9P root directory (files here are visible inside the sandbox)
+# Create the writable workspace (the sandbox can write files here)
 mkdir C:\Users\wdcui\tmp\9p_root -Force
 
 # Delete stale socket from a previous run
@@ -47,17 +52,29 @@ Remove-Item C:\Users\wdcui\tmp\litebox.sock -ErrorAction SilentlyContinue
 # Start the broker in the background
 Start-Process -FilePath "target\release\litebox_broker.exe" `
     -ArgumentList '--network-proxy-listen', 'C:\Users\wdcui\tmp\litebox.sock', `
-                  '--root-dir', 'C:\Users\wdcui\tmp\9p_root' `
+                  '--drive', 'c', `
+                  '--read-only', `
+                  '--writable-path', 'C:\Users\wdcui\tmp\9p_root' `
     -PassThru -WindowStyle Hidden
 ```
 
 **The socket file must be deleted between broker restarts** — the broker
 refuses to bind if it already exists.
 
+### Broker flags reference
+
+| Flag | Description |
+|------|-------------|
+| `--drive c` | Map drive letter `c` → `C:\` in the 9P namespace. Repeatable. |
+| `--drive x=\\server\share` | Explicit mapping with a custom path. |
+| `--read-only` | All paths served via 9P are read-only by default. |
+| `--writable-path <DIR>` | Allow writes under `<DIR>` (repeatable; requires `--read-only`). |
+| `--root-dir <DIR>` | Serve a single host directory (legacy mode, no drive mapping). |
+
 ## Step 4: Run Copilot
 
 ```powershell
-$token = gh auth token
+$token = & gh auth token
 & "target\release\litebox_runner_windows_userland.exe" `
     --dll-tar "C:\Users\wdcui\tmp\node_windows.tar" `
     --pe-file "C:\Users\wdcui\AppData\Local\Microsoft\WinGet\Packages\GitHub.Copilot_Microsoft.Winget.Source_8wekyb3d8bbwe\copilot.exe" `
@@ -70,7 +87,7 @@ $token = gh auth token
 - `--dll-tar` — the system DLLs tar from step 2
 - `--pe-file` — the guest executable (copilot.exe, node.exe, python.exe, etc.)
 - `--network-broker` / `--nine-p-broker` — both point to the same broker socket
-- `--env` — injects environment variables into the sandbox
+- `--env` — injects environment variables into the sandbox (e.g. GH_TOKEN for Copilot auth)
 - Everything after `--` is passed to the guest binary
 
 Drop `-- -p "say hello"` for an interactive Copilot session.
