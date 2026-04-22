@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use clap::Parser;
 use tracing::info;
 
+use litebox_broker::nine_p::server::DriveMapping;
 use litebox_broker::policy::{AllowAllPolicy, ReadOnlyPolicy, ReadOnlyWithWritablePaths};
 use litebox_broker::sock_compat::IpcListener;
 #[cfg(unix)]
@@ -30,7 +31,7 @@ struct Cli {
     listen_addr: SocketAddr,
 
     /// Root directory to expose through the 9P broker.
-    #[arg(long, required_unless_present_any = ["network_proxy_fd", "network_proxy_listen"])]
+    #[arg(long, required_unless_present_any = ["network_proxy_fd", "network_proxy_listen", "drives"])]
     root_dir: Option<PathBuf>,
 
     /// Rewrite syscall instructions in ELF files served to the sandbox.
@@ -55,6 +56,14 @@ struct Cli {
     /// (e.g., 127.0.0.1:9999) or AF_UNIX socket path.
     #[arg(long, conflicts_with = "network_proxy_fd")]
     network_proxy_listen: Option<String>,
+
+    /// Map a host drive letter (or UNC path) into the 9P namespace.
+    ///
+    /// A single letter like `c` auto-maps to `C:\`. An explicit mapping like
+    /// `x=\\server\share` maps the letter `x` to the given path. May be
+    /// specified multiple times.
+    #[arg(long = "drive")]
+    drives: Vec<String>,
 }
 
 fn build_policy(cli: &Cli) -> Arc<dyn litebox_broker::policy::Policy> {
@@ -75,15 +84,71 @@ fn build_policy(cli: &Cli) -> Arc<dyn litebox_broker::policy::Policy> {
     }
 }
 
-/// Build a `LocalServiceRegistry` when `--root-dir` is provided alongside
-/// network proxy flags. The 9P file server is registered on port 5640 so the
-/// guest can reach it at `BROKER_IP:5640` without a real TCP listener.
+/// Parse `--drive` arguments into `DriveMapping` values.
+///
+/// Accepted formats:
+/// - `c`           → letter="c", host_path="C:\" (canonicalized)
+/// - `x=\\server`  → letter="x", host_path="\\server" (canonicalized)
+///
+/// Returns an error string if a spec is malformed or the path cannot be resolved.
+fn parse_drives(specs: &[String]) -> Result<Vec<DriveMapping>, String> {
+    specs
+        .iter()
+        .map(|spec| {
+            let (letter, raw_path) = if let Some((l, p)) = spec.split_once('=') {
+                (l.to_ascii_lowercase(), PathBuf::from(p))
+            } else {
+                let l = spec.to_ascii_lowercase();
+                let host = format!("{}:\\", l.to_ascii_uppercase());
+                (l, PathBuf::from(host))
+            };
+
+            if letter.len() != 1 || !letter.as_bytes()[0].is_ascii_alphabetic() {
+                return Err(format!(
+                    "drive letter must be a single ASCII letter, got '{letter}'"
+                ));
+            }
+
+            let host_path = raw_path.canonicalize().map_err(|e| {
+                format!("cannot resolve drive '{letter}' path '{}': {e}", raw_path.display())
+            })?;
+
+            Ok(DriveMapping { letter, host_path })
+        })
+        .collect()
+}
+
+/// Build a `LocalServiceRegistry` when `--root-dir` or `--drive` is provided
+/// alongside network proxy flags. The 9P file server is registered on port
+/// 5640 so the guest can reach it at `BROKER_IP:5640` without a real TCP listener.
 fn build_local_services(
     cli: &Cli,
     elf_cache: Arc<Mutex<litebox_broker::nine_p::server::ElfCache>>,
 ) -> Option<litebox_broker::net_proxy::LocalServiceRegistry> {
-    let root_dir = cli.root_dir.as_ref()?;
-    let root = root_dir.canonicalize().unwrap_or_else(|_| root_dir.clone());
+    let drives = match parse_drives(&cli.drives) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!("invalid --drive argument: {e}");
+            return None;
+        }
+    };
+    let root = cli
+        .root_dir
+        .as_ref()
+        .map(|r| r.canonicalize().unwrap_or_else(|_| r.clone()));
+
+    // Need at least a root dir or drives to serve files.
+    if root.is_none() && drives.is_empty() {
+        return None;
+    }
+
+    if root.is_some() && !drives.is_empty() {
+        tracing::warn!(
+            "--root-dir is ignored when --drive is specified; \
+             the 9P root becomes a synthetic directory of drive letters"
+        );
+    }
+
     let policy = build_policy(cli);
     let rewrite_syscalls = cli.rewrite_syscalls;
 
@@ -92,18 +157,21 @@ fn build_local_services(
     // Register TCP spawner for smoltcp bridge connections.
     {
         let root = root.clone();
+        let drives = drives.clone();
         let policy = Arc::clone(&policy);
         let elf_cache = Arc::clone(&elf_cache);
         registry.register(
             5640,
             Box::new(move |stream| {
                 let root = root.clone();
+                let drives = drives.clone();
                 let policy = Arc::clone(&policy);
                 let elf_cache = Arc::clone(&elf_cache);
                 std::thread::spawn(move || {
                     let mut stream = stream;
                     let server = litebox_broker::nine_p::server::Server::with_elf_cache(
                         root,
+                        drives,
                         policy,
                         rewrite_syscalls,
                         elf_cache,
@@ -119,17 +187,20 @@ fn build_local_services(
     #[cfg(any(unix, windows))]
     {
         let root = root.clone();
+        let drives = drives.clone();
         let policy = Arc::clone(&policy);
         let elf_cache = Arc::clone(&elf_cache);
         registry.register_ring(
             5640,
             Arc::new(move |writer, reader| {
                 let root = root.clone();
+                let drives = drives.clone();
                 let policy = Arc::clone(&policy);
                 let elf_cache = Arc::clone(&elf_cache);
                 std::thread::spawn(move || {
                     let server = Arc::new(litebox_broker::nine_p::server::Server::with_elf_cache(
                         root,
+                        drives,
                         policy,
                         rewrite_syscalls,
                         elf_cache,
@@ -222,16 +293,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 9P file broker mode (original behavior).
-    let root_dir = cli
+    let drives = parse_drives(&cli.drives)
+        .map_err(|e| format!("invalid --drive argument: {e}"))?;
+    let root = cli
         .root_dir
         .as_ref()
-        .expect("--root-dir is required for 9P mode");
-    let root = root_dir.canonicalize().expect("root directory must exist");
+        .map(|r| r.canonicalize().expect("root directory must exist"));
+
+    if root.is_none() && drives.is_empty() {
+        return Err("--root-dir or --drive is required for 9P mode".into());
+    }
+
+    if root.is_some() && !drives.is_empty() {
+        tracing::warn!(
+            "--root-dir is ignored when --drive is specified; \
+             the 9P root becomes a synthetic directory of drive letters"
+        );
+    }
 
     let policy = build_policy(&cli);
 
     info!(
         ?root,
+        ?drives,
         addr = %cli.listen_addr,
         rewrite = cli.rewrite_syscalls,
         read_only = cli.read_only,
@@ -241,6 +325,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = std::net::TcpListener::bind(cli.listen_addr)?;
     info!(addr = %cli.listen_addr, "9P server listening");
+
+    let elf_cache = litebox_broker::nine_p::server::Server::new_elf_cache();
 
     // Accept connections one at a time (9P is single-stream per guest).
     for stream in listener.incoming() {
@@ -255,10 +341,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        let server = litebox_broker::nine_p::server::Server::new(
+        let server = litebox_broker::nine_p::server::Server::with_elf_cache(
             root.clone(),
+            drives.clone(),
             Arc::clone(&policy),
             cli.rewrite_syscalls,
+            Arc::clone(&elf_cache),
         );
         server.serve(&mut stream);
         info!("9P client disconnected");

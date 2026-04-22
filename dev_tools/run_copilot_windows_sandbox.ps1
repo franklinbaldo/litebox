@@ -77,7 +77,7 @@ function Start-Broker {
     Remove-Item $BrokerSock -ErrorAction SilentlyContinue
 
     $script:BrokerProcess = Start-Process -FilePath $Broker `
-        -ArgumentList '--network-proxy-listen', $BrokerSock, '--root-dir', $NinePRoot `
+        -ArgumentList '--network-proxy-listen', $BrokerSock, '--drive', 'c', '--read-only', '--writable-path', $NinePRoot `
         -PassThru -WindowStyle Hidden
     $script:StartedBroker = $true
 

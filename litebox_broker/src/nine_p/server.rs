@@ -56,6 +56,7 @@ pub type ElfCache = HashMap<PathBuf, (ElfCacheKey, Arc<Vec<u8>>)>;
 struct FidState {
     /// Host-side path this FID refers to. After a successful walk, this
     /// is the fully canonicalized (symlinks resolved) path.
+    /// An empty path indicates the synthetic drive-root directory.
     path: PathBuf,
     /// Unresolved final symlink path from the last successful walk, if any.
     readlink_path: Option<PathBuf>,
@@ -72,12 +73,30 @@ struct FidState {
     /// True when `path` was set by walk and is already canonical.
     /// Allows lopen/lcreate to skip redundant re-canonicalization.
     is_canonical: bool,
+    /// The effective root for containment checks. In single-root mode this
+    /// equals `Server::root`. In drive mode, this is the drive's host path
+    /// (e.g., `C:\`). `None` for the synthetic drive-root directory.
+    effective_root: Option<PathBuf>,
+}
+
+/// A mapping from a virtual drive letter to a host directory.
+#[derive(Clone, Debug)]
+pub struct DriveMapping {
+    /// Lowercase single-letter name used as the first VFS path component
+    /// (e.g., `"c"`).
+    pub letter: String,
+    /// Canonical host path for this drive (e.g., `C:\` or `\\server\share`).
+    pub host_path: PathBuf,
 }
 
 /// 9P2000.L server that serves files from a host directory.
 pub struct Server {
-    /// Root directory on the host filesystem.
+    /// Root directory on the host filesystem. When operating in drive-only
+    /// mode, this is set to a sentinel path that no real file will match.
     root: PathBuf,
+    /// Drive-letter mappings. When non-empty, the 9P root is a synthetic
+    /// directory whose children are the configured drive letters.
+    drives: Vec<DriveMapping>,
     /// Policy engine for access control.
     policy: Arc<dyn Policy>,
     /// FID → state mapping for this connection (two-level locking for interior mutability).
@@ -99,7 +118,7 @@ impl Server {
         fids.get(&fid).cloned().ok_or(libc::EBADF as u32)
     }
 
-    /// Create a new 9P server.
+    /// Create a new 9P server with a single root directory.
     ///
     /// # Arguments
     /// * `root` - Root directory to serve
@@ -107,7 +126,8 @@ impl Server {
     /// * `rewrite_syscalls` - Whether to patch ELF files with syscall trampolines
     pub fn new(root: PathBuf, policy: Arc<dyn Policy>, rewrite_syscalls: bool) -> Self {
         Self::with_elf_cache(
-            root,
+            Some(root),
+            Vec::new(),
             policy,
             rewrite_syscalls,
             Arc::new(Mutex::new(HashMap::new())),
@@ -119,13 +139,19 @@ impl Server {
     /// Use this when multiple server instances serve the same root directory
     /// so that expensive ELF patching work is shared across connections.
     pub fn with_elf_cache(
-        root: PathBuf,
+        root: Option<PathBuf>,
+        drives: Vec<DriveMapping>,
         policy: Arc<dyn Policy>,
         rewrite_syscalls: bool,
         elf_cache: Arc<Mutex<ElfCache>>,
     ) -> Self {
+        // When no root-dir is specified, use a sentinel path that won't match
+        // any real file.  Drive-only mode relies on per-fid effective_root
+        // instead of this field.
+        let root = root.unwrap_or_else(|| PathBuf::from("__litebox_no_root__"));
         Self {
             root,
+            drives,
             policy,
             fids: RwLock::new(HashMap::new()),
             msize: AtomicU32::new(4 * 1024 * 1024),
@@ -139,43 +165,65 @@ impl Server {
         Arc::new(Mutex::new(HashMap::new()))
     }
 
-    /// Canonicalize `path` and verify it is contained within the server root.
+    /// Canonicalize `path` and verify it is contained within the given root.
     ///
     /// Returns the canonical path on success, or an `EPERM` error response
     /// value when the resolved path escapes the root directory (e.g. via a
     /// symlink pointing outside the jail).
-    fn resolve_and_check(&self, path: &Path) -> Result<PathBuf, u32> {
+    fn resolve_and_check_with_root(&self, path: &Path, root: &Path) -> Result<PathBuf, u32> {
         let canonical = fs::canonicalize(path).map_err(io_errno)?;
-        if canonical.starts_with(&self.root) {
+        if canonical.starts_with(root) {
             Ok(canonical)
         } else {
             Err(libc::EPERM as u32)
         }
     }
 
+    /// Resolve and check containment against the server's single root.
+    /// Only valid in single-root mode.
+    fn resolve_and_check(&self, path: &Path) -> Result<PathBuf, u32> {
+        self.resolve_and_check_with_root(path, &self.root)
+    }
+
+    /// Convenience wrapper: resolve a fid path using the server's default root.
+    ///
+    /// In single-root mode every fid is contained under `self.root`.  Drive-aware
+    /// callers should use `resolve_fid_path_with_root` with the fid's own
+    /// `effective_root` instead.
+    fn resolve_fid_path(&self, path: &Path, is_canonical: bool) -> Result<PathBuf, u32> {
+        self.resolve_fid_path_with_root(path, is_canonical, &self.root)
+    }
+
     /// Fast containment check when the path is already canonical (from walk).
     /// Falls back to full canonicalization when `is_canonical` is false.
     ///
-    /// # Safety assumption
-    ///
-    /// The `is_canonical` shortcut assumes the host filesystem under the
-    /// export root does not change between the walk that set the flag and
-    /// this check (e.g. no external process replaces a directory with a
-    /// symlink pointing outside the root). This is a standard TOCTOU
-    /// trade-off: the walk already canonicalized the path, so re-doing it
-    /// on every open/stat would be redundant in the normal case and costly.
-    /// If the export tree is mutated concurrently by untrusted code, this
-    /// shortcut should be disabled.
-    fn resolve_fid_path(&self, path: &Path, is_canonical: bool) -> Result<PathBuf, u32> {
+    /// `effective_root` is the root for containment — either `Server::root`
+    /// or a drive's host path.
+    fn resolve_fid_path_with_root(
+        &self,
+        path: &Path,
+        is_canonical: bool,
+        effective_root: &Path,
+    ) -> Result<PathBuf, u32> {
         if is_canonical {
-            if path.starts_with(&self.root) {
+            if path.starts_with(effective_root) {
                 Ok(path.to_path_buf())
             } else {
                 Err(libc::EPERM as u32)
             }
         } else {
-            self.resolve_and_check(path)
+            self.resolve_and_check_with_root(path, effective_root)
         }
+    }
+
+    /// Look up a drive mapping by letter (lowercase).
+    fn find_drive(&self, letter: &str) -> Option<&DriveMapping> {
+        self.drives.iter().find(|d| d.letter == letter)
+    }
+
+    /// Returns `true` if this fid points to the synthetic drive-root directory.
+    fn is_synthetic_root(state: &FidState) -> bool {
+        state.effective_root.is_none()
     }
 
     /// Run the server loop, reading requests and sending responses.
@@ -596,7 +644,40 @@ impl Server {
             }
         }
 
-        // Resolve the attach path relative to root, preventing traversal attacks
+        // When drives are configured, the 9P root is a synthetic directory
+        // whose children are the drive letters.  The attach point is always
+        // this synthetic root — individual drives are reached via walk.
+        if !self.drives.is_empty() {
+            let qid = fcall::Qid {
+                typ: fcall::QidType::DIR,
+                version: 0,
+                path: 0x_FFFF_FFFF_DEAD_BEEF, // unique sentinel
+            };
+            let mut fids = write_lock(&self.fids, "fids");
+            if fids.contains_key(&fid) {
+                return error_response(libc::EEXIST as u32);
+            }
+            if fids.len() >= MAX_FIDS {
+                return error_response(libc::ENOMEM as u32);
+            }
+            fids.insert(
+                fid,
+                Arc::new(RwLock::new(FidState {
+                    path: PathBuf::new(), // empty = synthetic root
+                    readlink_path: None,
+                    file: None,
+                    patched_data: None,
+                    patched_offset: 0,
+                    qid,
+                    is_open: false,
+                    is_canonical: true,
+                    effective_root: None, // marks this as synthetic
+                })),
+            );
+            return Fcall::Rattach(fcall::Rattach { qid });
+        }
+
+        // Single-root mode: resolve the attach path relative to root.
         let path = if aname.is_empty() || aname == "/" {
             self.root.clone()
         } else {
@@ -631,6 +712,7 @@ impl Server {
                 qid,
                 is_open: false,
                 is_canonical: true,
+                effective_root: Some(self.root.clone()),
             })),
         );
 
@@ -643,7 +725,7 @@ impl Server {
 
     fn handle_walk<'a>(&self, fid: u32, new_fid: u32, wnames: Vec<Vec<u8>>) -> Fcall<'a> {
         // Phase 1: Read source fid data, validate fid constraints
-        let (src_path, src_qid, src_is_canonical, src_readlink_path) = {
+        let (src_path, src_qid, src_is_canonical, src_readlink_path, src_effective_root) = {
             let fids = read_lock(&self.fids, "fids");
             let fid_arc = match fids.get(&fid) {
                 Some(arc) => Arc::clone(arc),
@@ -664,6 +746,7 @@ impl Server {
                 state.qid,
                 state.is_canonical,
                 state.readlink_path.clone(),
+                state.effective_root.clone(),
             )
         };
 
@@ -676,6 +759,7 @@ impl Server {
             let qid = src_qid;
             let is_canonical = src_is_canonical;
             let readlink_path = src_readlink_path;
+            let effective_root = src_effective_root;
             if fid != new_fid {
                 let mut fids = write_lock(&self.fids, "fids");
                 if fids.contains_key(&new_fid) {
@@ -695,6 +779,7 @@ impl Server {
                         qid,
                         is_open: false,
                         is_canonical,
+                        effective_root,
                     })),
                 );
             }
@@ -705,6 +790,7 @@ impl Server {
         // Component-by-component walk with containment check.
         // Symlinks are resolved transparently: we canonicalize after each
         // step so the stored path always points at the real location.
+        let mut effective_root = src_effective_root;
         for name in &wnames {
             let component = match std::str::from_utf8(name) {
                 Ok(s) => s,
@@ -716,15 +802,39 @@ impl Server {
                 break;
             }
 
+            // --- Drive-letter resolution ---
+            // When the current fid is the synthetic root (effective_root is None),
+            // the first walk component must be a drive letter.
+            if effective_root.is_none() {
+                if let Some(drive) = self.find_drive(component) {
+                    // Transition into the drive's host path.
+                    let host = &drive.host_path;
+                    match fs::metadata(host) {
+                        Ok(meta) => {
+                            wqids.push(metadata_to_qid(&meta));
+                            current_path = host.clone();
+                            effective_root = Some(host.clone());
+                            continue;
+                        }
+                        Err(_) => break,
+                    }
+                } else {
+                    // Component doesn't match any drive letter — walk fails.
+                    break;
+                }
+            }
+
+            let root = effective_root.as_deref().unwrap_or(&self.root);
+
             // Handle . and ..
             let next = if component == "." {
                 current_path.clone()
             } else if component == ".." {
                 // Don't go above root
-                if current_path == self.root {
+                if current_path == root {
                     current_path.clone()
                 } else {
-                    current_path.parent().unwrap_or(&self.root).to_path_buf()
+                    current_path.parent().unwrap_or(root).to_path_buf()
                 }
             } else {
                 current_path.join(component)
@@ -746,7 +856,7 @@ impl Server {
             };
 
             // Containment check on the resolved (real) path
-            if !resolved.starts_with(&self.root) {
+            if !resolved.starts_with(root) {
                 break;
             }
 
@@ -784,6 +894,7 @@ impl Server {
                     state.patched_offset = 0;
                     state.is_open = false;
                     state.is_canonical = true;
+                    state.effective_root = effective_root;
                 }
             } else {
                 let mut fids = write_lock(&self.fids, "fids");
@@ -804,6 +915,7 @@ impl Server {
                         qid,
                         is_open: false,
                         is_canonical: true,
+                        effective_root,
                     })),
                 );
             }
@@ -823,10 +935,20 @@ impl Server {
             Err(errno) => return error_response(errno),
         };
 
-        let (is_open, path, is_canonical) = {
+        let (is_open, path, is_canonical, effective_root) = {
             let state = read_lock(&fid_arc, "fid");
-            (state.is_open, state.path.clone(), state.is_canonical)
+            (
+                state.is_open,
+                state.path.clone(),
+                state.is_canonical,
+                state.effective_root.clone(),
+            )
         };
+
+        // Synthetic drive-root cannot be opened.
+        if effective_root.is_none() {
+            return error_response(libc::EISDIR as u32);
+        }
 
         trace!(
             "lopen fid={} path={} flags={:?}",
@@ -843,7 +965,8 @@ impl Server {
         // If the path was already canonicalized by walk, skip the
         // expensive re-canonicalization and just verify containment.
         // Otherwise, resolve symlinks before opening.
-        let resolved = match self.resolve_fid_path(&path, is_canonical) {
+        let root = effective_root.as_deref().unwrap_or(&self.root);
+        let resolved = match self.resolve_fid_path_with_root(&path, is_canonical, root) {
             Ok(p) => p,
             Err(errno) => return error_response(errno),
         };
@@ -923,27 +1046,33 @@ impl Server {
             Err(errno) => return error_response(errno),
         };
 
-        let (parent_path, is_canonical) = {
+        let (parent_path, is_canonical, effective_root) = {
             let state = read_lock(&fid_arc, "fid");
-            (state.path.clone(), state.is_canonical)
+            (state.path.clone(), state.is_canonical, state.effective_root.clone())
         };
+
+        // Cannot create files in the synthetic drive-root.
+        if effective_root.is_none() {
+            return error_response(libc::EPERM as u32);
+        }
 
         // Validate name
         if name.contains('/') || name.contains('\0') || name == "." || name == ".." {
             return error_response(libc::EINVAL as u32);
         }
 
+        let root = effective_root.as_deref().unwrap_or(&self.root);
         let target = parent_path.join(&name);
 
         // Phase 2: I/O — no fid locks held
         // Containment check — resolve the parent directory to catch symlink escapes.
         // Skip re-canonicalization if walk already produced a canonical path.
-        let resolved_parent = match self.resolve_fid_path(&parent_path, is_canonical) {
+        let resolved_parent = match self.resolve_fid_path_with_root(&parent_path, is_canonical, root) {
             Ok(p) => p,
             _ => return error_response(libc::EPERM as u32),
         };
         let resolved_target = resolved_parent.join(&name);
-        if !resolved_target.starts_with(&self.root) {
+        if !resolved_target.starts_with(root) {
             return error_response(libc::EPERM as u32);
         }
 
@@ -1080,7 +1209,7 @@ impl Server {
             Err(errno) => return error_response(errno),
         };
 
-        let (path, file) = {
+        let (path, is_canonical, effective_root, file) = {
             let state = read_lock(&fid_arc, "fid");
             let file = match state.file.as_ref() {
                 Some(file) => match file.try_clone() {
@@ -1089,11 +1218,27 @@ impl Server {
                 },
                 None => None,
             };
-            (state.path.clone(), file)
+            (
+                state.path.clone(),
+                state.is_canonical,
+                state.effective_root.clone(),
+                file,
+            )
         };
 
-        // Policy check for write using the full path
-        if self.policy.check(Action::Write, Some(&path)) == Decision::Deny {
+        if effective_root.is_none() {
+            return error_response(libc::EPERM as u32);
+        }
+        let root = effective_root.as_deref().unwrap_or(&self.root);
+
+        // Resolve to canonical path for accurate policy check and cache invalidation.
+        let resolved = match self.resolve_fid_path_with_root(&path, is_canonical, root) {
+            Ok(p) => p,
+            Err(errno) => return error_response(errno),
+        };
+
+        // Policy check for write using the canonical path
+        if self.policy.check(Action::Write, Some(&resolved)) == Decision::Deny {
             return error_response(libc::EPERM as u32);
         }
 
@@ -1106,7 +1251,7 @@ impl Server {
             Ok(n) => {
                 // Invalidate ELF patch cache for this path — the file content
                 // has changed so any cached patched version is stale.
-                self.invalidate_elf_cache(&path);
+                self.invalidate_elf_cache(&resolved);
                 Fcall::Rwrite(fcall::Rwrite { count: n as u32 })
             }
             Err(e) => io_error_response(e),
@@ -1123,7 +1268,7 @@ impl Server {
             Err(errno) => return error_response(errno),
         };
 
-        let (file, path, patched_size) = {
+        let (file, path, patched_size, effective_root) = {
             let state = read_lock(&fid_arc, "fid");
             let file = match state.file.as_ref() {
                 Some(file) => match file.try_clone() {
@@ -1133,8 +1278,42 @@ impl Server {
                 None => None,
             };
             let patched_size = state.patched_data.as_ref().map(|data| data.len() as u64);
-            (file, state.path.clone(), patched_size)
+            (
+                file,
+                state.path.clone(),
+                patched_size,
+                state.effective_root.clone(),
+            )
         };
+
+        // Synthetic drive-root: return fake directory metadata.
+        if effective_root.is_none() {
+            let qid = fcall::Qid {
+                typ: fcall::QidType::DIR,
+                version: 0,
+                path: 0x_FFFF_FFFF_DEAD_BEEF,
+            };
+            return Fcall::Rgetattr(fcall::Rgetattr {
+                valid: req.req_mask,
+                qid,
+                stat: fcall::Stat {
+                    mode: 0o40555,  // dr-xr-xr-x
+                    uid: 0,
+                    gid: 0,
+                    nlink: 2 + self.drives.len() as u64,
+                    rdev: 0,
+                    size: 0,
+                    blksize: 4096,
+                    blocks: 0,
+                    atime: fcall::Time::default(),
+                    mtime: fcall::Time::default(),
+                    ctime: fcall::Time::default(),
+                    btime: fcall::Time::default(),
+                    generation: 0,
+                    data_version: 0,
+                },
+            });
+        }
 
         // Use fd-based metadata if available (more accurate for open files)
         let meta = if let Some(file) = file {
@@ -1187,14 +1366,20 @@ impl Server {
             Err(errno) => return error_response(errno),
         };
 
-        let (path, is_canonical) = {
+        let (path, is_canonical, effective_root) = {
             let state = read_lock(&fid_arc, "fid");
-            (state.path.clone(), state.is_canonical)
+            (state.path.clone(), state.is_canonical, state.effective_root.clone())
         };
+
+        // Cannot modify synthetic root.
+        if effective_root.is_none() {
+            return error_response(libc::EPERM as u32);
+        }
+        let root = effective_root.as_deref().unwrap_or(&self.root);
 
         // chmod
         if req.valid.contains(fcall::SetattrMask::MODE) {
-            let resolved = match self.resolve_fid_path(&path, is_canonical) {
+            let resolved = match self.resolve_fid_path_with_root(&path, is_canonical, root) {
                 Ok(p) => p,
                 Err(errno) => return error_response(errno),
             };
@@ -1212,7 +1397,7 @@ impl Server {
 
         // truncate
         if req.valid.contains(fcall::SetattrMask::SIZE) {
-            let resolved = match self.resolve_fid_path(&path, is_canonical) {
+            let resolved = match self.resolve_fid_path_with_root(&path, is_canonical, root) {
                 Ok(p) => p,
                 Err(errno) => return error_response(errno),
             };
@@ -1258,7 +1443,45 @@ impl Server {
             Ok(fid_arc) => fid_arc,
             Err(errno) => return error_response(errno),
         };
-        let path = read_lock(&fid_arc, "fid").path.clone();
+        let (path, effective_root) = {
+            let state = read_lock(&fid_arc, "fid");
+            (state.path.clone(), state.effective_root.clone())
+        };
+
+        // Synthetic drive-root: list configured drive letters as directories.
+        if effective_root.is_none() {
+            let max_bytes = req.count as u64;
+            let mut entries = Vec::new();
+            let mut total_size: u64 = 0;
+            let skip_count = req.offset as usize;
+
+            for (i, drive) in self.drives.iter().enumerate() {
+                if i < skip_count {
+                    continue;
+                }
+                let qid = fcall::Qid {
+                    typ: fcall::QidType::DIR,
+                    version: 0,
+                    path: 0x_FFFF_FFFF_0000_0000 | (drive.letter.as_bytes()[0] as u64),
+                };
+                let entry = fcall::DirEntry {
+                    qid,
+                    offset: (i + 1) as u64,
+                    typ: fs_compat::DT_DIR,
+                    name: FcallStr::Owned(drive.letter.as_bytes().to_vec()),
+                };
+                let entry_size = entry.size();
+                if total_size + entry_size > max_bytes && !entries.is_empty() {
+                    break;
+                }
+                total_size += entry_size;
+                entries.push(entry);
+            }
+
+            return Fcall::Rreaddir(fcall::Rreaddir {
+                data: fcall::DirEntryData { data: entries },
+            });
+        }
 
         let read_dir = match fs::read_dir(&path) {
             Ok(rd) => rd,
@@ -1337,18 +1560,23 @@ impl Server {
             return error_response(libc::EINVAL as u32);
         }
 
-        let (dir_path, is_canonical) = {
+        let (dir_path, is_canonical, effective_root) = {
             let state = read_lock(&fid_arc, "fid");
-            (state.path.clone(), state.is_canonical)
+            (state.path.clone(), state.is_canonical, state.effective_root.clone())
         };
 
+        if effective_root.is_none() {
+            return error_response(libc::EPERM as u32);
+        }
+        let root = effective_root.as_deref().unwrap_or(&self.root);
+
         // Resolve parent directory to catch symlink escapes
-        let resolved_parent = match self.resolve_fid_path(&dir_path, is_canonical) {
+        let resolved_parent = match self.resolve_fid_path_with_root(&dir_path, is_canonical, root) {
             Ok(p) => p,
             Err(errno) => return error_response(errno),
         };
         let target = resolved_parent.join(&name);
-        if !target.starts_with(&self.root) {
+        if !target.starts_with(root) {
             return error_response(libc::EPERM as u32);
         }
 
@@ -1386,18 +1614,23 @@ impl Server {
             return error_response(libc::EINVAL as u32);
         }
 
-        let (dir_path, is_canonical) = {
+        let (dir_path, is_canonical, effective_root) = {
             let state = read_lock(&fid_arc, "fid");
-            (state.path.clone(), state.is_canonical)
+            (state.path.clone(), state.is_canonical, state.effective_root.clone())
         };
 
+        if effective_root.is_none() {
+            return error_response(libc::EPERM as u32);
+        }
+        let root = effective_root.as_deref().unwrap_or(&self.root);
+
         // Resolve parent directory to catch symlink escapes
-        let resolved_parent = match self.resolve_fid_path(&dir_path, is_canonical) {
+        let resolved_parent = match self.resolve_fid_path_with_root(&dir_path, is_canonical, root) {
             Ok(p) => p,
             Err(errno) => return error_response(errno),
         };
         let target = resolved_parent.join(&name);
-        if !target.starts_with(&self.root) {
+        if !target.starts_with(root) {
             return error_response(libc::EPERM as u32);
         }
 
@@ -1453,26 +1686,32 @@ impl Server {
             (src_arc, dst_arc)
         };
 
-        let (src_path, src_canonical) = {
+        let (src_path, src_canonical, src_effective_root) = {
             let src = read_lock(&src_arc, "fid");
-            (src.path.clone(), src.is_canonical)
+            (src.path.clone(), src.is_canonical, src.effective_root.clone())
         };
-        let (dst_dir_path, dst_canonical) = {
+        let (dst_dir_path, dst_canonical, dst_effective_root) = {
             let dst = read_lock(&dst_arc, "fid");
-            (dst.path.clone(), dst.is_canonical)
+            (dst.path.clone(), dst.is_canonical, dst.effective_root.clone())
         };
 
+        if src_effective_root.is_none() || dst_effective_root.is_none() {
+            return error_response(libc::EPERM as u32);
+        }
+        let src_root = src_effective_root.as_deref().unwrap_or(&self.root);
+        let dst_root = dst_effective_root.as_deref().unwrap_or(&self.root);
+
         // Resolve symlinks on both source and destination
-        let resolved_src = match self.resolve_fid_path(&src_path, src_canonical) {
+        let resolved_src = match self.resolve_fid_path_with_root(&src_path, src_canonical, src_root) {
             Ok(p) => p,
             Err(errno) => return error_response(errno),
         };
-        let resolved_dst_dir = match self.resolve_fid_path(&dst_dir_path, dst_canonical) {
+        let resolved_dst_dir = match self.resolve_fid_path_with_root(&dst_dir_path, dst_canonical, dst_root) {
             Ok(p) => p,
             Err(errno) => return error_response(errno),
         };
         let dst = resolved_dst_dir.join(&name);
-        if !dst.starts_with(&self.root) {
+        if !dst.starts_with(dst_root) {
             return error_response(libc::EPERM as u32);
         }
 
@@ -1489,9 +1728,13 @@ impl Server {
                 // Invalidate ELF cache for both old and new paths.
                 self.invalidate_elf_cache(&resolved_src);
                 self.invalidate_elf_cache(&dst);
-                // Update the FID's path to the new location
+                // Update the FID's path to the new location.
+                // The joined path is NOT canonical, so mark it accordingly
+                // to force re-canonicalization on the next operation.
                 let mut state = write_lock(&src_arc, "fid");
                 state.path = dst;
+                state.is_canonical = false;
+                state.effective_root = dst_effective_root;
                 Fcall::Rrename(fcall::Rrename {})
             }
             Err(e) => io_error_response(e),
@@ -1526,21 +1769,27 @@ impl Server {
             (old_arc, new_arc)
         };
 
-        let (old_dir_path, old_canonical) = {
+        let (old_dir_path, old_canonical, old_effective_root) = {
             let old = read_lock(&old_arc, "fid");
-            (old.path.clone(), old.is_canonical)
+            (old.path.clone(), old.is_canonical, old.effective_root.clone())
         };
-        let (new_dir_path, new_canonical) = {
+        let (new_dir_path, new_canonical, new_effective_root) = {
             let new = read_lock(&new_arc, "fid");
-            (new.path.clone(), new.is_canonical)
+            (new.path.clone(), new.is_canonical, new.effective_root.clone())
         };
 
+        if old_effective_root.is_none() || new_effective_root.is_none() {
+            return error_response(libc::EPERM as u32);
+        }
+        let old_root = old_effective_root.as_deref().unwrap_or(&self.root);
+        let new_root = new_effective_root.as_deref().unwrap_or(&self.root);
+
         // Resolve symlinks on both parent directories
-        let resolved_old_dir = match self.resolve_fid_path(&old_dir_path, old_canonical) {
+        let resolved_old_dir = match self.resolve_fid_path_with_root(&old_dir_path, old_canonical, old_root) {
             Ok(p) => p,
             Err(errno) => return error_response(errno),
         };
-        let resolved_new_dir = match self.resolve_fid_path(&new_dir_path, new_canonical) {
+        let resolved_new_dir = match self.resolve_fid_path_with_root(&new_dir_path, new_canonical, new_root) {
             Ok(p) => p,
             Err(errno) => return error_response(errno),
         };
@@ -1548,7 +1797,7 @@ impl Server {
         let src = resolved_old_dir.join(&oldname);
         let dst = resolved_new_dir.join(&newname);
 
-        if !src.starts_with(&self.root) || !dst.starts_with(&self.root) {
+        if !src.starts_with(old_root) || !dst.starts_with(new_root) {
             return error_response(libc::EPERM as u32);
         }
 
@@ -1574,7 +1823,11 @@ impl Server {
     // Statfs / Fsync / Clunk / Remove
     // ========================================================================
 
-    fn handle_statfs<'a>(&self, _fid: u32) -> Fcall<'a> {
+    fn handle_statfs<'a>(&self, fid: u32) -> Fcall<'a> {
+        // Validate the fid exists per 9P protocol.
+        if let Err(errno) = self.get_fid(fid) {
+            return error_response(errno);
+        }
         // Return a generic statfs suitable for most operations
         Fcall::Rstatfs(new_rstatfs(fcall::Statfs {
             typ: 0x01021997, // V9FS_MAGIC
@@ -1636,13 +1889,18 @@ impl Server {
             }
         };
 
-        let (path, is_canonical, qid) = {
+        let (path, is_canonical, qid, effective_root) = {
             let state = read_lock(&fid_arc, "fid");
-            (state.path.clone(), state.is_canonical, state.qid)
+            (state.path.clone(), state.is_canonical, state.qid, state.effective_root.clone())
         };
 
+        if effective_root.is_none() {
+            return error_response(libc::EPERM as u32);
+        }
+        let root = effective_root.as_deref().unwrap_or(&self.root);
+
         // Resolve symlinks to prevent jail escape
-        let resolved = match self.resolve_fid_path(&path, is_canonical) {
+        let resolved = match self.resolve_fid_path_with_root(&path, is_canonical, root) {
             Ok(p) => p,
             Err(errno) => return error_response(errno),
         };
@@ -1680,13 +1938,22 @@ impl Server {
             Err(errno) => return error_response(errno),
         };
 
-        let readlink_path = {
+        let (readlink_path, effective_root) = {
             let state = read_lock(&fid_arc, "fid");
-            state
-                .readlink_path
-                .clone()
-                .unwrap_or_else(|| state.path.clone())
+            (
+                state
+                    .readlink_path
+                    .clone()
+                    .unwrap_or_else(|| state.path.clone()),
+                state.effective_root.clone(),
+            )
         };
+
+        // Synthetic root is not a symlink.
+        if effective_root.is_none() {
+            return error_response(libc::EINVAL as u32);
+        }
+
         match fs::read_link(&readlink_path) {
             Ok(target) => Fcall::Rreadlink(fcall::Rreadlink {
                 target: Cow::Owned(target.as_os_str().as_encoded_bytes().to_vec()),
