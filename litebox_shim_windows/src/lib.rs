@@ -10296,6 +10296,105 @@ PEB+0xF8 GdiSharedHandleTable={:#018X?} PEB+3 BitField={:#04X?}\n",
                 (NtStatus::STATUS_SUCCESS, false)
             }
 
+            NtSyscallId::NtCreateTimer => {
+                // NtCreateTimer(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, TIMER_TYPE)
+                // Legacy timer v1 API — reuse Timer2Object for the backing store.
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let handle_ptr = args.arg0; // PHANDLE
+                // args.arg1 = desired access (ignored)
+                // args.arg2 = object attributes (ignored — named timers unsupported)
+                // args.arg3 = timer type: 0 = NotificationTimer, 1 = SynchronizationTimer
+                let timer = alloc::sync::Arc::new(handle_table::Timer2Object::new());
+                self.shared.timer2_list.lock().push(alloc::sync::Arc::clone(&timer));
+                let mut handles = self.shared.handles.lock();
+                let h = handles.insert(handle_table::NtObject::Timer2(timer));
+                if handle_ptr == 0 || !crate::try_write_guest_value_unaligned(handle_ptr, h as u64)
+                {
+                    return (NtStatus::STATUS_ACCESS_VIOLATION, false);
+                }
+                (NtStatus::STATUS_SUCCESS, false)
+            }
+            NtSyscallId::NtSetTimer => {
+                // NtSetTimer(HANDLE, PLARGE_INTEGER DueTime, PTIMER_APC_ROUTINE,
+                //            PVOID ApcContext, BOOLEAN Resume, LONG Period, PBOOLEAN PreviousState)
+                // arg0 = handle, arg1 = due_time_ptr, arg5 = period (milliseconds!)
+                // Note: v1 Period is in milliseconds, unlike v2 which uses 100ns units.
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let handle = args.arg0 as u32;
+                let due_time_ptr = args.arg1;
+                let period_ms = syscalls::NtSyscallArgs::arg5(ctx) as i32;
+                let prev_state_ptr = syscalls::NtSyscallArgs::arg6(ctx);
+
+                let due_time_raw = if due_time_ptr != 0 {
+                    match try_read_guest_value_unaligned::<i64>(due_time_ptr) {
+                        Some(v) => v,
+                        None => { return (NtStatus::STATUS_ACCESS_VIOLATION, false); }
+                    }
+                } else {
+                    return (NtStatus::STATUS_INVALID_PARAMETER, false);
+                };
+
+                let handles = self.shared.handles.lock();
+                let timer = handles.with(handle, |entry| match &entry.object {
+                    handle_table::NtObject::Timer2(t) => Some(alloc::sync::Arc::clone(t)),
+                    _ => None,
+                }).flatten();
+                drop(handles);
+
+                match timer {
+                    Some(t) => {
+                        // Write previous state (was the timer armed?) before re-arming.
+                        let was_armed = t.armed.lock().is_some();
+                        if prev_state_ptr != 0 {
+                            crate::try_write_guest_value_unaligned(prev_state_ptr, was_armed as u8);
+                        }
+
+                        let now = syscalls::sysinfo::windows_filetime_now_pub();
+                        let abs_due_time = if due_time_raw < 0 {
+                            now.saturating_add(due_time_raw.unsigned_abs() as i64)
+                        } else if due_time_raw == 0 {
+                            now
+                        } else {
+                            due_time_raw
+                        };
+
+                        // Convert period from milliseconds to 100ns units.
+                        let period_100ns = (period_ms as i64) * 10_000;
+
+                        *t.armed.lock() = Some(handle_table::Timer2Armed {
+                            due_time: abs_due_time,
+                            period: period_100ns,
+                        });
+
+                        (NtStatus::STATUS_SUCCESS, false)
+                    }
+                    None => (NtStatus::STATUS_INVALID_HANDLE, false),
+                }
+            }
+            NtSyscallId::NtCancelTimer => {
+                // NtCancelTimer(HANDLE, PBOOLEAN CurrentState)
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let handle = args.arg0 as u32;
+                let current_state_ptr = args.arg1;
+                let handles = self.shared.handles.lock();
+                let timer = handles.with(handle, |entry| match &entry.object {
+                    handle_table::NtObject::Timer2(t) => Some(alloc::sync::Arc::clone(t)),
+                    _ => None,
+                }).flatten();
+                drop(handles);
+
+                match timer {
+                    Some(t) => {
+                        let was_armed = t.armed.lock().take().is_some();
+                        if current_state_ptr != 0 {
+                            crate::try_write_guest_value_unaligned(current_state_ptr, was_armed as u8);
+                        }
+                        (NtStatus::STATUS_SUCCESS, false)
+                    }
+                    None => (NtStatus::STATUS_INVALID_HANDLE, false),
+                }
+            }
+
             NtSyscallId::NtCreateTimer2 => {
                 // Timer2 — used by the thread pool for delayed work items.
                 // Create a real Timer2 object that can be armed/disarmed.
