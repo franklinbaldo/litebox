@@ -302,18 +302,10 @@ impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
                         .map_err(ElfLoaderError::ParseError)?;
                     Some(patched)
                 }
-                Err(
-                    litebox_syscall_rewriter::Error::UnsupportedExecutable(_)
-                    | litebox_syscall_rewriter::Error::UnsupportedObjectFile(_)
-                    | litebox_syscall_rewriter::Error::NoTextSectionFound
-                    | litebox_syscall_rewriter::Error::NoSyscallInstructionsFound
-                    | litebox_syscall_rewriter::Error::AlreadyHooked,
-                ) => {
-                    // These are expected non-fatal cases:
-                    // - BUN: can't be statically patched but the runtime mmap
-                    //   hook will patch code segments as they are mapped.
-                    // - Object files / no .text / no syscalls / already hooked:
-                    //   nothing to patch.
+                Err(litebox_syscall_rewriter::Error::UnsupportedExecutable(_)) => {
+                    // Expected non-fatal case (e.g. Bun): can't be statically
+                    // patched but the runtime mmap hook will patch code
+                    // segments as they are mapped.
                     None
                 }
                 Err(e) => {

@@ -105,6 +105,8 @@ pub struct LinuxUserland {
     /// is persistent across multiple process executions, however, it is ephemeral across true
     /// reboots.
     boot_id: std::sync::OnceLock<Vec<u8>>,
+    /// When true, syscall interception uses seccomp/SIGSYS instead of binary rewriting.
+    seccomp_interception_enabled: std::sync::atomic::AtomicBool,
 }
 
 impl core::fmt::Debug for LinuxUserland {
@@ -236,8 +238,16 @@ impl LinuxUserland {
             reserved_pages,
             cow_regions: std::sync::RwLock::new(std::collections::BTreeMap::new()),
             boot_id: std::sync::OnceLock::new(),
+            seccomp_interception_enabled: std::sync::atomic::AtomicBool::new(false),
         };
         Box::leak(Box::new(platform))
+    }
+
+    /// Enables seccomp-based syscall interception. When enabled, syscall
+    /// instructions are trapped via SIGSYS rather than binary rewriting.
+    pub fn enable_seccomp_based_syscall_interception(&self) {
+        self.seccomp_interception_enabled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Initializes support for KDFs by using boot-specific uniqueness.
@@ -1697,7 +1707,6 @@ impl litebox::platform::SystemInfoProvider for LinuxUserland {
     fn get_syscall_entry_point(&self) -> usize {
         // When the seccomp/systrap backend is active, syscall instructions are
         // trapped via SIGSYS — no binary rewriting needed.
-        #[cfg(feature = "systrap_backend")]
         if self
             .seccomp_interception_enabled
             .load(std::sync::atomic::Ordering::SeqCst)

@@ -191,7 +191,7 @@ pub fn hook_syscalls_in_elf(
         let text_sections = match text_sections(&file) {
             Ok(sections) => sections,
             Err(InternalError::NoTextSectionFound) => {
-                return Ok((input_binary.to_vec(), Vec::new()))
+                return Ok((input_binary.to_vec(), Vec::new()));
             }
             Err(InternalError::Public(e)) => return Err(e),
             Err(e) => unreachable!("unexpected internal error: {e:?}"),
@@ -570,7 +570,7 @@ fn hook_syscalls_in_section(
                         i,
                     ) {
                         Ok(()) => {}
-                        Err(Error::InsufficientBytesBeforeOrAfter(_)) => {
+                        Err(InternalError::InsufficientBytesBeforeOrAfter) => {
                             replace_with_trap(section_data, section_base_addr, inst);
                             skipped_addrs.push(inst.ip());
                         }
