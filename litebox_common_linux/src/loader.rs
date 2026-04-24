@@ -377,6 +377,7 @@ impl ElfParsedFile {
         &self,
         mapper: &mut M,
         mem: &mut impl AccessMemory,
+        reserve_trampoline: Option<usize>,
     ) -> Result<MappingInfo, ElfLoadError<M::Error>> {
         let base_addr = if self.header.e_type == elf::abi::ET_DYN {
             // Find an aligned load address that will fit all PT_LOAD segments.
@@ -398,6 +399,8 @@ impl ElfParsedFile {
             if let Some(trampoline) = &self.trampoline {
                 min = min.min(trampoline.vaddr);
                 max = max.max(trampoline.vaddr + trampoline.size);
+            } else if let Some(size) = reserve_trampoline {
+                max += page_align_up(size);
             }
             let min = page_align_down(min);
             let max = page_align_up(max);
@@ -484,6 +487,11 @@ impl ElfParsedFile {
 
         if self.trampoline.is_some() {
             self.load_trampoline(mapper, mem, &mut info)?;
+        } else if let Some(size) = reserve_trampoline {
+            // Reserve space for a runtime trampoline so brk starts past it.
+            // The runtime patching path (do_mmap_file → maybe_patch_exec_segment)
+            // will allocate the actual trampoline in this region via MAP_FIXED.
+            info.brk = page_align_up(info.brk) + page_align_up(size);
         }
 
         Ok(info)
@@ -576,24 +584,6 @@ pub trait ReadAt {
     fn size(&mut self) -> Result<u64, Self::Error>;
 }
 
-impl ReadAt for &[u8] {
-    type Error = Errno;
-
-    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
-        let offset: usize = offset.truncate();
-        let end = offset.checked_add(buf.len()).ok_or(Errno::EINVAL)?;
-        if end > self.len() {
-            return Err(Errno::EINVAL);
-        }
-        buf.copy_from_slice(&self[offset..end]);
-        Ok(())
-    }
-
-    fn size(&mut self) -> Result<u64, Self::Error> {
-        Ok(self.len() as u64)
-    }
-}
-
 pub trait MapMemory {
     type Error;
 
@@ -629,7 +619,7 @@ pub trait MapMemory {
     ///
     /// Fails if any of the parameters are not page-aligned.
     fn protect(&mut self, address: usize, len: usize, prot: &Protection)
-    -> Result<(), Self::Error>;
+        -> Result<(), Self::Error>;
 }
 
 /// Trait for reading and writing memory that has been mapped via [`MapMemory`].

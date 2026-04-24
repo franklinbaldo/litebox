@@ -255,7 +255,6 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
-                suppress_elf_runtime_patch: Cell::new(false),
             },
         };
 
@@ -1049,9 +1048,6 @@ struct Task<FS: ShimFS> {
     files: RefCell<Arc<syscalls::file::FilesState<FS>>>,
     /// Signal state
     signals: syscalls::signal::SignalState,
-    /// Suppresses runtime ELF patching in `do_mmap_file` while the ELF loader
-    /// is actively loading a binary (prevents double-mapping the trampoline).
-    suppress_elf_runtime_patch: Cell<bool>,
 }
 
 impl<FS: ShimFS> Drop for Task<FS> {
@@ -1091,7 +1087,6 @@ mod test_utils {
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
-                suppress_elf_runtime_patch: Cell::new(false),
                 global: self,
             }
         }
@@ -1116,7 +1111,6 @@ mod test_utils {
                 fs: self.fs.clone(),
                 files: self.files.clone(),
                 signals: self.signals.clone_for_new_task(),
-                suppress_elf_runtime_patch: Cell::new(false),
             };
             Some(task)
         }

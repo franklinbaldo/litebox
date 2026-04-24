@@ -115,27 +115,21 @@ impl<FS: ShimFS> Task<FS> {
         };
 
         // Runtime syscall rewriting: patch PROT_EXEC segments in-place.
-        // Suppressed during ELF loader's load() sequence because the loader
-        // maps the trampoline itself via load_trampoline(). Running both
-        // paths would double-map the trampoline, with the second MAP_FIXED
-        // destroying the first mapping.
-        if !self.suppress_elf_runtime_patch.get() {
-            if is_exec {
-                let syscall_entry = self.global.platform.get_syscall_entry_point();
-                if syscall_entry != 0
-                    && !self.maybe_patch_exec_segment(result, len, fd, offset, syscall_entry)
-                {
-                    // Trampoline setup failed for a pre-patched binary whose
-                    // .text already contains JMPs to the trampoline address.
-                    // Continuing would guarantee a SIGSEGV on the first
-                    // rewritten syscall, so fail the mmap instead.
-                    let _ = self.sys_munmap(result, len);
-                    return Err(MappingError::OutOfMemory);
-                }
-            } else if offset == 0 {
-                // First mmap at offset 0: record the base address for later patching.
-                self.init_elf_patch_state(fd, result.as_usize());
+        if is_exec {
+            let syscall_entry = self.global.platform.get_syscall_entry_point();
+            if syscall_entry != 0
+                && !self.maybe_patch_exec_segment(result, len, fd, offset, syscall_entry)
+            {
+                // Trampoline setup failed for a pre-patched binary whose
+                // .text already contains JMPs to the trampoline address.
+                // Continuing would guarantee a SIGSEGV on the first
+                // rewritten syscall, so fail the mmap instead.
+                let _ = self.sys_munmap(result, len);
+                return Err(MappingError::OutOfMemory);
             }
+        } else if offset == 0 {
+            // First mmap at offset 0: record the base address for later patching.
+            self.init_elf_patch_state(fd, result.as_usize());
         }
 
         Ok(result)
