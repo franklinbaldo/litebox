@@ -248,8 +248,8 @@ pub(crate) struct ElfLoader<'a, FS: ShimFS> {
 struct FileAndParsed<'a, FS: ShimFS> {
     file: ElfFile<'a, FS>,
     parsed: ElfParsedFile,
-    /// When the rewriter backend is active and the binary was not pre-patched,
-    /// the loader patches it on the fly and loads from this in-memory copy.
+    /// When the binary was not pre-patched, the loader patches it
+    /// on the fly and loads from this in-memory copy.
     patched_data: Option<Vec<u8>>,
 }
 
@@ -262,11 +262,11 @@ impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
         let syscall_entry_point = task.global.platform.get_syscall_entry_point();
         let trampoline_result = parsed.parse_trampoline(&mut &file, syscall_entry_point);
 
-        // If the rewriter backend is active (syscall_entry_point != 0) and the
-        // binary lacks a trampoline, patch it on the fly so that both the main
+        // If the platform requires syscall rewriting (syscall_entry_point != 0)
+        // and the binary lacks a trampoline, patch it here so that both the main
         // program and the dynamic linker are covered.
         //
-        // Only attempt runtime patching for UnpatchedBinary — other errors
+        // Only attempt patching for UnpatchedBinary — other errors
         // (BadTrampolineVersion, BadTrampoline, Io) indicate a corrupt or
         // incompatible pre-patched binary that should not be re-patched.
         let patched_data = if syscall_entry_point != 0
