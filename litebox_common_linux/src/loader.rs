@@ -274,8 +274,7 @@ impl ElfParsedFile {
             if &header_buf[0..7] == b"LITEBOX" {
                 return Err(ElfParseError::BadTrampolineVersion);
             }
-            // No trampoline found. When using the syscall rewriter backend
-            // (syscall_entry_point != 0), all binaries must be patched.
+            // No trampoline found.
             return Err(ElfParseError::UnpatchedBinary);
         }
 

@@ -62,8 +62,7 @@ def prepare_benchmark(
     Prepare a single benchmark using litebox_packager.
 
     The packager discovers dependencies, rewrites all ELFs, and creates a tar.
-    The rewritten main binary is extracted
-    from the tar and placed alongside it.
+    The rewritten main binary is extracted from the tar and placed alongside it.
 
     Returns True on success.
     """

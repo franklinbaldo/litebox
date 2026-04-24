@@ -284,15 +284,7 @@ impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
                 .map_err(ElfLoaderError::OpenError)?;
 
             match litebox_syscall_rewriter::hook_syscalls_in_elf(&buf, None) {
-                Ok((patched, skipped_addrs)) => {
-                    if !skipped_addrs.is_empty() {
-                        litebox::log_println!(
-                            task.global.platform,
-                            "warning: {} unpatchable syscall instruction(s) (addresses: {:?})",
-                            skipped_addrs.len(),
-                            skipped_addrs,
-                        );
-                    }
+                Ok(patched) => {
                     // Re-parse the patched binary and extract its trampoline.
                     parsed =
                         litebox_common_linux::loader::ElfParsedFile::parse(&mut patched.as_slice())

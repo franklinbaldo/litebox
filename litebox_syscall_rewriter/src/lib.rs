@@ -131,10 +131,7 @@ struct TextSectionInfo {
 /// non-ELF files, already-hooked binaries, binaries without executable
 /// sections or syscall instructions) are returned unchanged with an empty
 /// skipped list — these are not errors.
-pub fn hook_syscalls_in_elf(
-    input_binary: &[u8],
-    trampoline: Option<u64>,
-) -> Result<(Vec<u8>, Vec<u64>)> {
+pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Result<Vec<u8>> {
     if input_binary.ends_with(BUN_FOOTER_MARKER) {
         return Err(Error::UnsupportedExecutable(
             "Bun-packaged executable".into(),
@@ -148,7 +145,7 @@ pub fn hook_syscalls_in_elf(
     if input_binary.len() >= 18 {
         let e_type = u16::from_le_bytes([input_binary[16], input_binary[17]]);
         if e_type == object::elf::ET_REL {
-            return Ok((input_binary.to_vec(), Vec::new()));
+            return Ok(input_binary.to_vec());
         }
     }
 
@@ -179,7 +176,7 @@ pub fn hook_syscalls_in_elf(
         let arch = match file {
             object::File::Elf64(_) => Arch::X86_64,
             object::File::Elf32(_) => Arch::X86_32,
-            _ => return Ok((input_binary.to_vec(), Vec::new())),
+            _ => return Ok(input_binary.to_vec()),
         };
 
         let dl_sysinfo_int80 = if arch == Arch::X86_32 {
@@ -191,14 +188,14 @@ pub fn hook_syscalls_in_elf(
         let text_sections = match text_sections(&file) {
             Ok(sections) => sections,
             Err(InternalError::NoTextSectionFound) => {
-                return Ok((input_binary.to_vec(), Vec::new()));
+                return Ok(input_binary.to_vec());
             }
             Err(InternalError::Public(e)) => return Err(e),
             Err(e) => unreachable!("unexpected internal error: {e:?}"),
         };
 
         if is_already_hooked(&*buf, arch) {
-            return Ok((input_binary.to_vec(), Vec::new()));
+            return Ok(input_binary.to_vec());
         }
 
         let control_transfer_targets = get_control_transfer_targets(arch, &*buf, &text_sections)?;
@@ -228,7 +225,6 @@ pub fn hook_syscalls_in_elf(
         trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
     }
     // Patch syscalls in-place in buf
-    let mut skipped_addrs = Vec::new();
     let mut syscall_insns_found = false;
     for s in &text_sections {
         let section_data = section_slice_mut(buf, s)?;
@@ -242,8 +238,7 @@ pub fn hook_syscalls_in_elf(
             dl_sysinfo_int80,
             &mut trampoline_data,
         ) {
-            Ok(addrs) => {
-                skipped_addrs.extend(addrs);
+            Ok(_skipped_addrs) => {
                 syscall_insns_found = true;
             }
             Err(InternalError::NoSyscallInstructionsFound) => {}
@@ -277,7 +272,7 @@ pub fn hook_syscalls_in_elf(
             };
             out.extend_from_slice(header.as_bytes());
         }
-        return Ok((out, skipped_addrs));
+        return Ok(out);
     }
 
     // Patch fork → vfork: overwrite the first bytes of __libc_fork with a
@@ -335,7 +330,7 @@ pub fn hook_syscalls_in_elf(
         };
         out.extend_from_slice(header.as_bytes());
     }
-    Ok((out, skipped_addrs))
+    Ok(out)
 }
 /// (private) Get metadata for executable sections
 fn text_sections(
