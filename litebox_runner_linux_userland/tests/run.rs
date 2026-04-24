@@ -9,13 +9,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Clone, Copy)]
-#[allow(dead_code)]
-enum Backend {
-    Rewriter,
-    Seccomp,
-}
-
 #[must_use]
 struct Runner {
     command: std::process::Command,
@@ -28,24 +21,17 @@ struct Runner {
 }
 
 impl Runner {
-    fn new(backend: Backend, target: &Path, unique_name: &str) -> Self {
-        let backend_str = match backend {
-            Backend::Rewriter => "rewriter",
-            Backend::Seccomp => "seccomp",
-        };
+    fn new(target: &Path, unique_name: &str) -> Self {
         let dir_path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
-        let path = match backend {
-            Backend::Seccomp => target.to_path_buf(),
-            Backend::Rewriter => {
-                // new path in out_dir with .hooked suffix
-                let out_path = dir_path.join(format!(
-                    "{}.hooked",
-                    target.file_name().unwrap().to_str().unwrap()
-                ));
-                let success = common::rewrite_with_cache(target, &out_path, &[]);
-                assert!(success, "failed to run litebox_syscall_rewriter");
-                out_path
-            }
+        let path = {
+            // new path in out_dir with .hooked suffix
+            let out_path = dir_path.join(format!(
+                "{}.hooked",
+                target.file_name().unwrap().to_str().unwrap()
+            ));
+            let success = common::rewrite_with_cache(target, &out_path, &[]);
+            assert!(success, "failed to run litebox_syscall_rewriter");
+            out_path
         };
 
         // create tar file containing all dependencies
@@ -75,8 +61,6 @@ impl Runner {
         let mut command = std::process::Command::new(binary_path);
         command.args([
             "--unstable",
-            "--interception-backend",
-            backend_str,
             // Tell ld where to find the libraries.
             // See https://man7.org/linux/man-pages/man8/ld.so.8.html for how ld works.
             // Alternatively, we could add a `/etc/ld.so.cache` file to the rootfs.
@@ -202,7 +186,6 @@ fn find_c_test_files(dir: &str) -> Vec<PathBuf> {
     files
 }
 
-// Syscall rewriting does not support x86 yet
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn test_dynamic_lib_with_rewriter() {
@@ -213,7 +196,7 @@ fn test_dynamic_lib_with_rewriter() {
             .expect("failed to get file stem");
         let unique_name = format!("{stem}_rewriter");
         let target = common::compile(path.to_str().unwrap(), &unique_name, false, false);
-        Runner::new(Backend::Rewriter, &target, &unique_name).run();
+        Runner::new(&target, &unique_name).run();
     }
 }
 
@@ -226,7 +209,7 @@ fn test_static_exec_with_rewriter() {
             .expect("failed to get file stem");
         let unique_name = format!("{stem}_exec_rewriter");
         let target = common::compile(path.to_str().unwrap(), &unique_name, true, false);
-        Runner::new(Backend::Rewriter, &target, &unique_name).run();
+        Runner::new(&target, &unique_name).run();
     }
 }
 
@@ -255,7 +238,7 @@ console.log(content);
 ";
 
     let node_path = run_which("node");
-    Runner::new(Backend::Rewriter, &node_path, "hello_node_rewriter")
+    Runner::new(&node_path, "hello_node_rewriter")
         .arg("/out/hello_world.js")
         .with_fs_path(|out_dir| {
             // write the test js file to the output directory
@@ -268,9 +251,7 @@ console.log(content);
 #[test]
 fn test_runner_with_ls() {
     let ls_path = run_which("ls");
-    let output = Runner::new(Backend::Rewriter, &ls_path, "ls_rewriter")
-        .arg("-a")
-        .output();
+    let output = Runner::new(&ls_path, "ls_rewriter").arg("-a").output();
 
     let output_str = String::from_utf8_lossy(&output);
     let normalized = output_str.split_whitespace().collect::<Vec<_>>();
@@ -282,7 +263,7 @@ fn test_runner_with_ls() {
     }
 
     // test `ls` subdir
-    let output = Runner::new(Backend::Rewriter, &ls_path, "ls_lib_rewriter")
+    let output = Runner::new(&ls_path, "ls_lib_rewriter")
         .args(["-a", "/lib/x86_64-linux-gnu"])
         .output();
 
@@ -367,7 +348,7 @@ fn test_runner_with_python() {
     paths_to_stage.insert(python_home_dir);
     paths_to_stage.extend(python_lib_paths.iter().cloned());
 
-    Runner::new(Backend::Rewriter, &python_path, "python_rewriter")
+    Runner::new(&python_path, "python_rewriter")
         .args(["-c", HELLO_WORLD_PY])
         .envs([
             &format!("PYTHONHOME={python_home}"),
@@ -482,7 +463,7 @@ fn test_tun_with_tcp_socket() {
             .status()
             .expect("failed to execute client");
     });
-    Runner::new(Backend::Rewriter, &server_target, unique_name)
+    Runner::new(&server_target, unique_name)
         .arg("10.0.0.2")
         .arg("12345")
         .tun_device_name("tun99")
@@ -539,7 +520,7 @@ fn test_tun_and_runner_with_iperf3() {
             "iperf3 client failed to connect after 50 attempts"
         );
     });
-    let mut runner = Runner::new(Backend::Rewriter, &iperf3_path, "iperf3_server_rewriter");
+    let mut runner = Runner::new(&iperf3_path, "iperf3_server_rewriter");
     runner
         .args([
             "-s", // run in server mode
@@ -582,7 +563,7 @@ fn test_tun_with_curl() {
 
     let curl_path = run_which("curl");
     let url = format!("http://10.0.0.1:{port}/something");
-    let output = Runner::new(Backend::Rewriter, &curl_path, "curl_rewriter")
+    let output = Runner::new(&curl_path, "curl_rewriter")
         .args(["-sS", &url])
         .tun_device_name("tun99")
         .output();

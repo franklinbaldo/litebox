@@ -72,25 +72,6 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub program_from_tar: bool,
-    /// Which backend to use for syscall interception
-    #[arg(
-        long = "interception-backend",
-        value_enum,
-        default_value_t = InterceptionBackend::Seccomp,
-        requires = "unstable",
-        help_heading = "Unstable Options"
-    )]
-    pub interception_backend: InterceptionBackend,
-}
-
-/// Backends supported for intercepting syscalls
-#[non_exhaustive]
-#[derive(Debug, Clone, clap::ValueEnum)]
-pub enum InterceptionBackend {
-    /// Use seccomp-based syscall interception
-    Seccomp,
-    /// Depend purely on rewriten syscalls to intercept them
-    Rewriter,
 }
 
 struct MmappedFile {
@@ -139,17 +120,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         unimplemented!(
             "this should (hopefully soon) have a nicer interface to support loading in files"
         )
-    }
-
-    // --program-from-tar loads pre-rewritten binaries that require the rewriter
-    // backend's runtime trampoline setup.
-    if cli_args.program_from_tar
-        && !matches!(cli_args.interception_backend, InterceptionBackend::Rewriter)
-    {
-        anyhow::bail!(
-            "--program-from-tar requires --interception-backend=rewriter \
-             (the packaged binary is pre-rewritten and needs the rewriter runtime)"
-        );
     }
 
     // When loading from tar, the program path is a guest-internal path and must
@@ -305,12 +275,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             }
         });
 
-        // When using the rewriter backend, the shim's mmap hook handles
-        // syscall patching at runtime — no audit library needed.
-        match cli_args.interception_backend {
-            InterceptionBackend::Rewriter | InterceptionBackend::Seccomp => {}
-        }
-
         let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
         shim_builder.default_fs(in_mem, tar_ro)
     };
@@ -366,13 +330,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     } else {
         None
     };
-
-    match cli_args.interception_backend {
-        InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),
-        InterceptionBackend::Rewriter => {
-            // Runtime patching is handled by the shim's mmap hook — nothing to do here.
-        }
-    }
 
     let argv = cli_args
         .program_and_arguments

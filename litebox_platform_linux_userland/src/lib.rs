@@ -105,8 +105,6 @@ pub struct LinuxUserland {
     /// is persistent across multiple process executions, however, it is ephemeral across true
     /// reboots.
     boot_id: std::sync::OnceLock<Vec<u8>>,
-    /// When true, syscall interception uses seccomp/SIGSYS instead of binary rewriting.
-    seccomp_interception_enabled: std::sync::atomic::AtomicBool,
 }
 
 impl core::fmt::Debug for LinuxUserland {
@@ -238,16 +236,8 @@ impl LinuxUserland {
             reserved_pages,
             cow_regions: std::sync::RwLock::new(std::collections::BTreeMap::new()),
             boot_id: std::sync::OnceLock::new(),
-            seccomp_interception_enabled: std::sync::atomic::AtomicBool::new(false),
         };
         Box::leak(Box::new(platform))
-    }
-
-    /// Enables seccomp-based syscall interception. When enabled, syscall
-    /// instructions are trapped via SIGSYS rather than binary rewriting.
-    pub fn enable_seccomp_based_syscall_interception(&self) {
-        self.seccomp_interception_enabled
-            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Initializes support for KDFs by using boot-specific uniqueness.
@@ -575,7 +565,7 @@ fn get_guest_fsbase() -> usize {
 ///
 /// This saves all non-volatile register state then switches to the guest
 /// context. When the guest makes a syscall, it jumps back into the middle of
-/// this routine, at `syscall_callback`. This code then updates the guest
+/// this routine, at the syscall callback. This code then updates the guest
 /// context structure, switches back to the host stack, and calls the syscall
 /// handler.
 ///
@@ -628,8 +618,11 @@ unsafe extern "C-unwind" fn run_thread_arch(
     // At entry, the register context is the guest context with the
     // return address in rcx. r11 is an available scratch register (it would
     // contain rflags if the syscall instruction had actually been issued).
-    .globl syscall_callback
-syscall_callback:
+    // the trampoline has already reserved 128 bytes below RSP to protect the
+    // SysV red zone.
+    .globl syscall_callback_redzone
+syscall_callback_redzone:
+
     // Clear in_guest flag. This must be the first instruction to match the
     // expectations of `interrupt_signal_handler`.
     mov      BYTE PTR gs:in_guest@tpoff, 0
@@ -642,22 +635,6 @@ syscall_callback:
     mov      gs:saved_restart_addr@tpoff, r11
 
     // Restore host fs base.
-    rdfsbase r11
-    mov      gs:guest_fsbase@tpoff, r11
-    rdgsbase r11
-    wrfsbase r11
-
-    // Switch to the top of the guest context.
-    mov     r11, rsp
-    mov     rsp, fs:guest_context_top@tpoff
-    jmp .Lsyscall_save_regs
-
-    .globl syscall_callback_redzone
-syscall_callback_redzone:
-    // Same as syscall_callback, but the trampoline has already reserved
-    // 128 bytes below RSP to protect the SysV red zone.
-    mov      BYTE PTR gs:in_guest@tpoff, 0
-    mov      gs:saved_restart_addr@tpoff, r11
     rdfsbase r11
     mov      gs:guest_fsbase@tpoff, r11
     rdgsbase r11
@@ -849,7 +826,7 @@ fn thread_start(
     let shim = init_thread.init();
 
     run_thread_inner(shim.as_ref(), &mut ctx, false);
-    // TODO: have syscall_callback return if we need to terminate the process.
+    // TODO: have the syscall callback return if we need to terminate the process.
     // We should return this value to the caller so load_program can return it
     // to the user.
 }
@@ -1622,7 +1599,6 @@ impl litebox::platform::StdioProvider for LinuxUserland {
 
 unsafe extern "C" {
     // Defined in asm blocks above
-    fn syscall_callback() -> isize;
     #[cfg(target_arch = "x86_64")]
     fn syscall_callback_redzone() -> isize;
     fn exception_callback();
@@ -1705,22 +1681,9 @@ impl ThreadContext<'_> {
 
 impl litebox::platform::SystemInfoProvider for LinuxUserland {
     fn get_syscall_entry_point(&self) -> usize {
-        // When the seccomp/systrap backend is active, syscall instructions are
-        // trapped via SIGSYS — no binary rewriting needed.
-        if self
-            .seccomp_interception_enabled
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            return 0;
-        }
-
         #[cfg(target_arch = "x86_64")]
         {
             syscall_callback_redzone as *const () as usize
-        }
-        #[cfg(target_arch = "x86")]
-        {
-            syscall_callback as *const () as usize
         }
     }
 
@@ -2242,12 +2205,8 @@ unsafe fn interrupt_signal_handler(
     // FUTURE: handle trampoline code, too. This is somewhat less important
     // because it's probably fine for the shim to observe a guest context that
     // is inside the trampoline.
-    #[cfg(target_arch = "x86")]
-    let is_at_syscall_callback = ip == syscall_callback as *const () as usize;
     #[cfg(target_arch = "x86_64")]
-    let is_at_syscall_callback = ip == syscall_callback_redzone as *const () as usize
-        || ip == syscall_callback as *const () as usize;
-    if is_at_syscall_callback {
+    if ip == syscall_callback_redzone as *const () as usize {
         // No need to clear `in_guest` or set interrupt; the syscall handler will
         // clear `in_guest` and call into the shim.
         return;
