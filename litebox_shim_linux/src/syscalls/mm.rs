@@ -775,11 +775,9 @@ impl<FS: ShimFS> Task<FS> {
         let patch_result = match patch_result {
             Ok((stubs, addrs)) => {
                 if !addrs.is_empty() {
-                    litebox::log_println!(
-                        self.global.platform,
-                        "warning: {} syscall instruction(s) could not be patched (addresses: {:?})",
-                        addrs.len(),
-                        addrs,
+                    litebox_util_log::warn!(
+                        count:? = addrs.len(), addrs:? = addrs;
+                        "syscall instruction(s) could not be patched"
                     );
                 }
                 Ok(stubs)
