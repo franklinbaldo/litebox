@@ -18,6 +18,11 @@ use crate::MutPtr;
 use crate::ShimFS;
 use crate::Task;
 
+/// ELF program header type for loadable segments.
+const PT_LOAD: u32 = 1;
+/// ELF type for shared objects and position-independent executables (PIE).
+const ET_DYN: u16 = 3;
+
 /// Per-fd state for the shim's runtime ELF syscall rewriter.
 ///
 /// Tracks base address and trampoline write cursor for each ELF file that
@@ -445,7 +450,9 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         // Read program headers to find max PT_LOAD end
-        let phdrs_size = e_phentsize * e_phnum;
+        let Some(phdrs_size) = e_phentsize.checked_mul(e_phnum) else {
+            return;
+        };
         if phdrs_size == 0 || phdrs_size > 0x10000 {
             return; // Sanity check
         }
@@ -460,8 +467,7 @@ impl<FS: ShimFS> Task<FS> {
         for i in 0..e_phnum {
             let ph = &phdrs_buf[i * e_phentsize..][..e_phentsize];
             let p_type = u32::from_le_bytes(ph[0..4].try_into().unwrap());
-            if p_type != 1 {
-                // PT_LOAD = 1
+            if p_type != PT_LOAD {
                 continue;
             }
             let p_vaddr = u64::from_le_bytes(ph[16..24].try_into().unwrap());
@@ -478,7 +484,7 @@ impl<FS: ShimFS> Task<FS> {
 
         // For ET_DYN (PIE/shared libs), p_vaddr is relative to base_addr.
         // For ET_EXEC, p_vaddr is absolute and base_addr is 0.
-        let trampoline_vaddr = if e_type == 3 {
+        let trampoline_vaddr = if e_type == ET_DYN {
             // ET_DYN
             base_addr + (max_load_end as usize).next_multiple_of(PAGE_SIZE)
         } else {
@@ -492,7 +498,7 @@ impl<FS: ShimFS> Task<FS> {
 
         // For pre-patched binaries, use the vaddr from the header instead.
         let trampoline_vaddr = if pre_patched {
-            if e_type == 3 {
+            if e_type == ET_DYN {
                 base_addr + tramp_vaddr as usize
             } else {
                 tramp_vaddr as usize
@@ -518,40 +524,26 @@ impl<FS: ShimFS> Task<FS> {
     /// Check if a file has the LITEBOX trampoline magic at its tail.
     /// Returns (is_pre_patched, file_offset, vaddr, trampoline_size).
     fn check_trampoline_magic(&self, fd: i32) -> (bool, u64, u64, u64) {
-        let header_size: usize = if cfg!(target_pointer_width = "64") {
-            32 // TrampolineHeader64: magic(8) + file_offset(8) + vaddr(8) + size(8)
-        } else {
-            20 // TrampolineHeader32: magic(8) + file_offset(4) + vaddr(4) + size(4)
-        };
+        const HEADER_SIZE: usize = 32; // TrampolineHeader64: magic(8) + file_offset(8) + vaddr(8) + size(8)
         let Ok(stat) = self.sys_fstat(fd) else {
             return (false, 0, 0, 0);
         };
         let file_size = stat.st_size;
-        if file_size < header_size {
+        if file_size < HEADER_SIZE {
             return (false, 0, 0, 0);
         }
-        let mut tail = [0u8; 32]; // max header size
-        let tail = &mut tail[..header_size];
-        match self.sys_read(fd, tail, Some(file_size - header_size)) {
-            Ok(n) if n == tail.len() => {}
+        let mut tail = [0u8; HEADER_SIZE];
+        match self.sys_read(fd, &mut tail, Some(file_size - HEADER_SIZE)) {
+            Ok(n) if n == HEADER_SIZE => {}
             _ => return (false, 0, 0, 0),
         }
         if &tail[0..8] != litebox_syscall_rewriter::TRAMPOLINE_MAGIC {
             return (false, 0, 0, 0);
         }
-        if cfg!(target_pointer_width = "64") {
-            // Parse 64-bit header: magic(8) | file_offset(8) | vaddr(8) | size(8)
-            let file_offset = u64::from_le_bytes(tail[8..16].try_into().unwrap());
-            let vaddr = u64::from_le_bytes(tail[16..24].try_into().unwrap());
-            let trampoline_size = u64::from_le_bytes(tail[24..32].try_into().unwrap());
-            (true, file_offset, vaddr, trampoline_size)
-        } else {
-            // Parse 32-bit header: magic(8) | file_offset(4) | vaddr(4) | size(4)
-            let file_offset = u64::from(u32::from_le_bytes(tail[8..12].try_into().unwrap()));
-            let vaddr = u64::from(u32::from_le_bytes(tail[12..16].try_into().unwrap()));
-            let trampoline_size = u64::from(u32::from_le_bytes(tail[16..20].try_into().unwrap()));
-            (true, file_offset, vaddr, trampoline_size)
-        }
+        let file_offset = u64::from_le_bytes(tail[8..16].try_into().unwrap());
+        let vaddr = u64::from_le_bytes(tail[16..24].try_into().unwrap());
+        let trampoline_size = u64::from_le_bytes(tail[24..32].try_into().unwrap());
+        (true, file_offset, vaddr, trampoline_size)
     }
 
     /// Patch an executable segment in-place after it has been mapped.
@@ -566,6 +558,12 @@ impl<FS: ShimFS> Task<FS> {
     /// fail the mapping because the code already contains JMPs to the
     /// trampoline address.
     #[allow(clippy::cast_possible_truncation)]
+    /// Attempt to patch syscall instructions in a newly-mapped PROT_EXEC segment.
+    ///
+    /// Returns `true` if it is safe to keep the mapping (patching succeeded or
+    /// was skipped/best-effort for unpatched binaries), or `false` if the mmap
+    /// must be failed (trampoline setup failed for a pre-patched binary whose
+    /// .text already contains jumps to the trampoline address).
     fn maybe_patch_exec_segment(
         &self,
         mapped_addr: MutPtr<u8>,
@@ -599,7 +597,9 @@ impl<FS: ShimFS> Task<FS> {
                         Some(tramp_addr),
                         tramp_len,
                         ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                        MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+                        MapFlags::MAP_ANONYMOUS
+                            | MapFlags::MAP_PRIVATE
+                            | MapFlags::MAP_FIXED_NOREPLACE,
                     )
                     .or_else(|_| {
                         self.do_mmap_anonymous(
@@ -675,7 +675,7 @@ impl<FS: ShimFS> Task<FS> {
                     Some(tramp_addr),
                     PAGE_SIZE,
                     ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                    MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+                    MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
                 )
                 .or_else(|_| {
                     self.do_mmap_anonymous(
@@ -685,14 +685,19 @@ impl<FS: ShimFS> Task<FS> {
                         MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
                     )
                 });
-            let actual_addr = match actual_addr {
-                Ok(ptr) => ptr.as_usize(),
-                Err(_) => return true,
+            let Ok(actual_addr_ptr) = actual_addr else {
+                litebox_util_log::warn!("failed to allocate trampoline region");
+                return true;
             };
+            let actual_addr = actual_addr_ptr.as_usize();
 
             // Verify the trampoline is within JMP rel32 range (+-2GB) of the code.
             let distance = actual_addr.abs_diff(addr_usize);
             if distance > 0x7FFF_0000 {
+                litebox_util_log::warn!(
+                    distance:? = distance;
+                    "trampoline too far from code segment, skipping patching"
+                );
                 let _ = self.sys_munmap(MutPtr::<u8>::from_usize(actual_addr), PAGE_SIZE);
                 return true;
             }
@@ -705,6 +710,7 @@ impl<FS: ShimFS> Task<FS> {
                 .copy_from_slice(0, &syscall_entry.to_le_bytes())
                 .is_none()
             {
+                litebox_util_log::warn!("failed to write syscall entry point to trampoline");
                 let _ = self.sys_munmap(MutPtr::<u8>::from_usize(actual_addr), PAGE_SIZE);
                 return true;
             }
@@ -733,10 +739,9 @@ impl<FS: ShimFS> Task<FS> {
                 )
                 .is_err()
         {
+            litebox_util_log::warn!("failed to mprotect trampoline to RW");
             return true;
         }
-
-        // Make the code segment writable for in-place patching.
         if self
             .sys_mprotect(
                 mapped_addr,
@@ -745,12 +750,14 @@ impl<FS: ShimFS> Task<FS> {
             )
             .is_err()
         {
+            litebox_util_log::warn!("failed to mprotect code segment to RW for patching");
             restore_trampoline_rx(self, state);
             return true;
         }
 
         // Read the mapped code into a buffer, patch it, write back.
         let Some(code_owned) = mapped_addr.to_owned_slice(len) else {
+            litebox_util_log::warn!("failed to read code segment for patching");
             let _ = self.sys_mprotect(
                 mapped_addr,
                 len,
@@ -773,10 +780,10 @@ impl<FS: ShimFS> Task<FS> {
             syscall_entry_addr,
         );
         let patch_result = match patch_result {
-            Ok((stubs, addrs)) => {
-                if !addrs.is_empty() {
+            Ok((stubs, skipped_addrs)) => {
+                if !skipped_addrs.is_empty() {
                     litebox_util_log::warn!(
-                        count:? = addrs.len(), addrs:? = addrs;
+                        count:? = skipped_addrs.len(), addrs:? = skipped_addrs;
                         "syscall instruction(s) could not be patched"
                     );
                 }
@@ -787,6 +794,7 @@ impl<FS: ShimFS> Task<FS> {
         match patch_result {
             Ok(stubs) if !stubs.is_empty() => {
                 let Some(new_cursor) = state.trampoline_cursor.checked_add(stubs.len()) else {
+                    litebox_util_log::warn!("trampoline cursor overflow");
                     let _ = self.sys_mprotect(
                         mapped_addr,
                         len,
@@ -808,6 +816,7 @@ impl<FS: ShimFS> Task<FS> {
                         )
                         .is_err()
                     {
+                        litebox_util_log::warn!("failed to expand trampoline region");
                         let _ = self.sys_mprotect(
                             mapped_addr,
                             len,
@@ -824,6 +833,7 @@ impl<FS: ShimFS> Task<FS> {
                 let tramp_write_ptr =
                     MutPtr::<u8>::from_usize(state.trampoline_addr + state.trampoline_cursor);
                 if tramp_write_ptr.copy_from_slice(0, &stubs).is_none() {
+                    litebox_util_log::warn!("failed to write trampoline stubs");
                     let _ = self.sys_mprotect(
                         mapped_addr,
                         len,
@@ -835,6 +845,7 @@ impl<FS: ShimFS> Task<FS> {
 
                 // Write patched code back to the mapped region.
                 if mapped_addr.copy_from_slice(0, &code_buf).is_none() {
+                    litebox_util_log::warn!("failed to write patched code back to code segment");
                     let _ = mapped_addr.copy_from_slice(0, &original_code);
                     let _ = self.sys_mprotect(
                         mapped_addr,
@@ -850,7 +861,8 @@ impl<FS: ShimFS> Task<FS> {
             Ok(_) => {
                 // No syscalls found — no patching needed.
             }
-            Err(_) => {
+            Err(e) => {
+                litebox_util_log::warn!(err:? = e; "failed to patch code segment");
                 let _ = self.sys_mprotect(
                     mapped_addr,
                     len,

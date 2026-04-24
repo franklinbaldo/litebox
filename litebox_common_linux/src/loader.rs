@@ -399,8 +399,6 @@ impl ElfParsedFile {
             if let Some(trampoline) = &self.trampoline {
                 min = min.min(trampoline.vaddr);
                 max = max.max(trampoline.vaddr + trampoline.size);
-            } else if let Some(size) = reserve_trampoline {
-                max += page_align_up(size);
             }
             let min = page_align_down(min);
             let max = page_align_up(max);

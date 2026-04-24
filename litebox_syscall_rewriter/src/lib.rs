@@ -40,6 +40,8 @@ pub enum Error {
     DisassemblyFailure(String),
     #[error("address overflow: {0}")]
     AddressOverflow(String),
+    #[error("unpatchable syscall instruction(s): {0}")]
+    UnpatchableSyscalls(String),
 }
 
 /// Internal-only error variants used for control flow within the crate.
@@ -106,19 +108,19 @@ struct TextSectionInfo {
 /// - trampoline virtual address (8 bytes)
 /// - trampoline size (8 bytes)
 ///
-/// This layout allows loaders to read just the last 32 bytes to get the metadata. Even when
-/// no syscall instructions are patched, the rewriter still appends the header and the initial
+/// This layout allows loaders to read just the last 32/20 bytes to get the metadata. Even when
+/// there is no syscall instruction in the binary, the rewriter still appends the header and the initial
 /// syscall-entry placeholder so the loader/audit path can tell the binary was processed.
 ///
-/// Returns a tuple of (rewritten binary, skipped syscall addresses). Skipped
-/// addresses are syscall instructions that could not be patched because there
-/// is not enough space around the instruction (replaced with `icebp; hlt` so
-/// they trap instead of escaping to the host kernel).
+/// Returns the rewritten binary. Binaries that cannot or do not need to be
+/// patched (relocatable objects, non-ELF files, already-hooked binaries,
+/// binaries without executable sections or syscall instructions) are returned
+/// unchanged — these are not errors.
 ///
-/// Binaries that cannot or do not need to be patched (relocatable objects,
-/// non-ELF files, already-hooked binaries, binaries without executable
-/// sections or syscall instructions) are returned unchanged with an empty
-/// skipped list — these are not errors.
+/// Returns `Err` for genuinely broken inputs (corrupt ELF, unsupported
+/// executables like Bun, arithmetic overflow) and for binaries that contain
+/// syscall instructions that could not be patched (replaced with `icebp; hlt`
+/// so they trap instead of escaping to the host kernel).
 pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Result<Vec<u8>> {
     if input_binary.ends_with(BUN_FOOTER_MARKER) {
         return Err(Error::UnsupportedExecutable(
@@ -189,6 +191,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     let trampoline = trampoline.unwrap_or(0);
     trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
     // Patch syscalls in-place in buf
+    let mut skipped_addrs = Vec::new();
     let mut syscall_insns_found = false;
     for s in &text_sections {
         let section_data = section_slice_mut(buf, s)?;
@@ -200,7 +203,8 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
             trampoline_base_addr, // entry point is at offset 0 of trampoline
             &mut trampoline_data,
         ) {
-            Ok(_skipped_addrs) => {
+            Ok(addrs) => {
+                skipped_addrs.extend(addrs);
                 syscall_insns_found = true;
             }
             Err(InternalError::NoSyscallInstructionsFound) => {}
@@ -248,6 +252,12 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
         trampoline_size: trampoline_size as u64,
     };
     out.extend_from_slice(header.as_bytes());
+    if !skipped_addrs.is_empty() {
+        return Err(Error::UnpatchableSyscalls(format!(
+            "{} unpatchable syscall instruction(s) at {skipped_addrs:?}",
+            skipped_addrs.len(),
+        )));
+    }
     Ok(out)
 }
 /// (private) Get metadata for executable sections
@@ -389,12 +399,11 @@ fn hook_syscalls_in_section(
         let replace_start = replace_start.unwrap();
         let replace_len = usize::try_from(replace_end - replace_start).unwrap();
 
-        let copied_presyscall_insts_have_ip_rel_mem = instruction_slice_has_ip_rel_memory_operand(
-            instructions
-                .iter()
-                .take(i)
-                .skip_while(|prev_inst| prev_inst.ip() < replace_start),
-        );
+        let copied_presyscall_insts_have_ip_rel_mem = instructions
+            .iter()
+            .take(i)
+            .skip_while(|prev_inst| prev_inst.ip() < replace_start)
+            .any(iced_x86::Instruction::is_ip_rel_memory_operand);
 
         let target_addr = checked_add_u64(
             trampoline_base_addr,
@@ -458,30 +467,7 @@ fn hook_syscalls_in_section(
         }
 
         let return_addr = inst.next_ip();
-        // Reserve the SysV red zone before entering the shim so async
-        // guest signal delivery / interrupt handling cannot clobber
-        // stack locals parked below the architectural RSP.
-        // LEA RSP, [RSP - 0x80] = 48 8D 64 24 80
-        trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x64, 0x24, 0x80]);
-
-        // Put the address of the original JMP (call-site) into R11 so
-        // that SA_RESTART can rewind ctx.rip to re-enter the trampoline.
-        // The real `syscall` instruction clobbers R11 with RFLAGS, so
-        // this register is free from the guest's perspective.
-        //
-        // CONTRACT: R11 carries the call-site restart address from this
-        // point until the platform callback saves it to a dedicated TLS
-        // variable (saved_restart_addr). The platform MUST preserve R11
-        // before any clobbering instructions (fsbase swap, TLS lookup).
-        // LEA R11, [RIP + disp32] = 4C 8D 1D <disp32>
-        let r11_rip = checked_add_u64(
-            trampoline_base_addr,
-            trampoline_data.len() as u64 + 7,
-            "trampoline R11 displacement base",
-        )?;
-        let r11_disp = i64::try_from(replace_start).unwrap() - i64::try_from(r11_rip).unwrap();
-        trampoline_data.extend_from_slice(&[0x4C, 0x8D, 0x1D]); // LEA R11, [RIP + disp32]
-        trampoline_data.extend_from_slice(&(i32::try_from(r11_disp).unwrap().to_le_bytes()));
+        emit_trampoline_preamble(trampoline_base_addr, replace_start, trampoline_data)?;
 
         // Put jump back location into rcx.
         let jmp_back_base = checked_add_u64(
@@ -655,14 +641,13 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
 /// Replace an unpatchable syscall instruction with `ICEBP; HLT` (`F1 F4`) so
 /// that reaching it traps instead of silently escaping to the host kernel.
 ///
-/// We avoid `UD2` (`0F 0B`) because it commonly appears in binaries to mark
-/// `unreachable!()` paths.  The `ICEBP; HLT` sequence is a strong, distinctive
-/// indicator of "this syscall was intentionally poisoned" — `ICEBP` alone does
-/// not trap on Linux in userspace, but `HLT` does (SIGILL in ring 3), and the
-/// `F1` prefix makes it easy for a signal handler to distinguish an
-/// intentional break from a spurious one.
+/// `ICEBP` alone does not trap on Linux in userspace, but `HLT` does
+/// (SIGSEGV in ring 3), and the `F1` prefix makes it easy for a signal
+/// handler to identify an intentionally poisoned syscall.
 ///
-/// `syscall` (0F 05) is 2 bytes — same size as `ICEBP; HLT`.
+/// `syscall` (0F 05) and `int 0x80` (CD 80) are both 2 bytes — same size as
+/// `ICEBP; HLT`.  For `call DWORD PTR gs:0x10` (7 bytes), the remaining 5
+/// bytes are filled with NOPs.
 fn replace_with_trap(
     section_data: &mut [u8],
     section_base_addr: u64,
@@ -682,6 +667,42 @@ fn replace_with_trap(
 fn checked_add_u64(base: u64, addend: u64, context: &'static str) -> Result<u64> {
     base.checked_add(addend)
         .ok_or_else(|| Error::AddressOverflow(format!("{context} address overflow")))
+}
+
+/// Emit the trampoline preamble: reserve the SysV red zone and load R11 with
+/// the call-site restart address.
+///
+/// The red zone reservation (`LEA RSP, [RSP - 0x80]`) prevents async guest
+/// signal delivery / interrupt handling from clobbering stack locals parked
+/// below the architectural RSP.
+///
+/// R11 is loaded with `call_site_addr` (the address of the original JMP that
+/// entered the trampoline) so that SA_RESTART can rewind `ctx.rip` to re-enter
+/// the trampoline. The real `syscall` instruction clobbers R11 with RFLAGS, so
+/// this register is free from the guest's perspective.
+///
+/// CONTRACT: R11 carries the call-site restart address from this point until
+/// the platform callback saves it to a dedicated TLS variable
+/// (`saved_restart_addr`). The platform MUST preserve R11 before any clobbering
+/// instructions (fsbase swap, TLS lookup).
+fn emit_trampoline_preamble(
+    trampoline_base_addr: u64,
+    call_site_addr: u64,
+    trampoline_data: &mut Vec<u8>,
+) -> Result<()> {
+    // LEA RSP, [RSP - 0x80]
+    trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x64, 0x24, 0x80]);
+
+    // LEA R11, [RIP + disp32] — disp32 targets call_site_addr
+    let r11_rip = checked_add_u64(
+        trampoline_base_addr,
+        trampoline_data.len() as u64 + 7,
+        "trampoline R11 displacement base",
+    )?;
+    let r11_disp = i64::try_from(call_site_addr).unwrap() - i64::try_from(r11_rip).unwrap();
+    trampoline_data.extend_from_slice(&[0x4C, 0x8D, 0x1D]);
+    trampoline_data.extend_from_slice(&(i32::try_from(r11_disp).unwrap().to_le_bytes()));
+    Ok(())
 }
 
 fn rel32_bytes(target: u64, base: u64, context: &'static str) -> Result<[u8; 4]> {
@@ -704,20 +725,11 @@ fn rel32_bytes(target: u64, base: u64, context: &'static str) -> Result<[u8; 4]>
 /// region — the caller is responsible for making the region writable before
 /// calling and restoring permissions afterwards.
 ///
-/// # Arguments
-///
-/// * `code` — mutable slice of the mapped code segment.
-/// * `code_vaddr` — virtual address of `code[0]` in guest memory.
-/// * `trampoline_write_vaddr` — virtual address where the returned stub bytes
-///   will be placed by the caller.
-/// * `syscall_entry_addr` — address of the 8-byte entry-point value that
-///   each stub's indirect jump targets.
-///
 /// # Returns
 ///
-/// A tuple of (trampoline stub bytes, skipped syscall addresses). The caller
-/// must copy the stubs to `trampoline_write_vaddr`. Returns empty vecs if no
-/// syscall instructions are found in `code`.
+/// `(trampoline_stubs, skipped_addrs)`. The caller must copy the stubs to
+/// `trampoline_write_vaddr`. Returns empty vecs if no syscall instructions
+/// are found in `code`.
 pub fn patch_code_segment(
     code: &mut [u8],
     code_vaddr: u64,
@@ -929,20 +941,8 @@ fn hook_syscall_and_after(
     }
 
     let replace_end = replace_end.unwrap();
-    // This function copies post-syscall instructions to the trampoline as raw
-    // bytes. That only works for position-independent
-    // instructions. If any post-syscall instruction has a RIP-relative memory
-    // operand, the raw bytes would reference the wrong address from the
-    // trampoline's location, so we must treat it as unpatchable.
-    let copied_postsyscall_insts_have_ip_rel_mem = instruction_slice_has_ip_rel_memory_operand(
-        instructions
-            .iter()
-            .skip(inst_index + 1)
-            .take_while(|next_inst| next_inst.ip() < replace_end),
-    );
-    if copied_postsyscall_insts_have_ip_rel_mem {
-        return Err(InternalError::InsufficientBytesBeforeOrAfter);
-    }
+
+    let trampoline_data_checkpoint = trampoline_data.len();
 
     let target_addr = checked_add_u64(
         trampoline_base_addr,
@@ -950,28 +950,7 @@ fn hook_syscall_and_after(
         "syscall trampoline target",
     )?;
 
-    // Reserve the SysV red zone before entering the shim so async guest
-    // signal delivery / interrupt handling cannot clobber stack locals
-    // parked below the architectural RSP.
-    // LEA RSP, [RSP - 0x80] = 48 8D 64 24 80
-    trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x64, 0x24, 0x80]);
-
-    // Put the address of the original JMP (call-site) into R11 so
-    // that SA_RESTART can rewind ctx.rip to re-enter the trampoline.
-    //
-    // CONTRACT: R11 carries the call-site restart address from this
-    // point until the platform callback saves it to a dedicated TLS
-    // variable (saved_restart_addr). The platform MUST preserve R11
-    // before any clobbering instructions (fsbase swap, TLS lookup).
-    // LEA R11, [RIP + disp32] = 4C 8D 1D <disp32>
-    let r11_rip = checked_add_u64(
-        trampoline_base_addr,
-        trampoline_data.len() as u64 + 7,
-        "trampoline R11 displacement base",
-    )?;
-    let r11_disp = i64::try_from(replace_start).unwrap() - i64::try_from(r11_rip).unwrap();
-    trampoline_data.extend_from_slice(&[0x4C, 0x8D, 0x1D]); // LEA R11, [RIP + disp32]
-    trampoline_data.extend_from_slice(&(i32::try_from(r11_disp).unwrap().to_le_bytes()));
+    emit_trampoline_preamble(trampoline_base_addr, replace_start, trampoline_data)?;
 
     // Put jump back location into rcx, via lea rcx, [next instruction]
     trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D]); // LEA RCX, [RIP + disp32]
@@ -991,13 +970,48 @@ fn hook_syscall_and_after(
         "trampoline entry",
     )?);
 
-    // Copy the original instructions to the trampoline
+    // Copy the original post-syscall instructions to the trampoline.
+    // When any instruction has a RIP-relative memory operand, we
+    // re-encode them so the displacement targets the same absolute
+    // address from the new trampoline location.
     let syscall_inst_end = syscall_inst.next_ip();
     if syscall_inst_end < replace_end {
-        trampoline_data.extend_from_slice(
-            &section_data[usize::try_from(syscall_inst_end - section_base_addr).unwrap()
-                ..usize::try_from(replace_end - section_base_addr).unwrap()],
-        );
+        let postsyscall_insts = instructions
+            .iter()
+            .skip(inst_index + 1)
+            .take_while(|next_inst| next_inst.ip() < replace_end);
+        if postsyscall_insts
+            .clone()
+            .any(iced_x86::Instruction::is_ip_rel_memory_operand)
+        {
+            let mut reencoded = Vec::new();
+            let mut ok = true;
+            let mut encoder = iced_x86::Encoder::new(64);
+            for post_inst in postsyscall_insts {
+                let tramp_ip =
+                    trampoline_base_addr + trampoline_data.len() as u64 + reencoded.len() as u64;
+                if encoder.encode(post_inst, tramp_ip).is_err() {
+                    ok = false;
+                    break;
+                }
+                let bytes = encoder.take_buffer();
+                if bytes.len() != post_inst.len() {
+                    ok = false;
+                    break;
+                }
+                reencoded.extend_from_slice(&bytes);
+            }
+            if !ok {
+                trampoline_data.truncate(trampoline_data_checkpoint);
+                return Err(InternalError::InsufficientBytesBeforeOrAfter);
+            }
+            trampoline_data.extend_from_slice(&reencoded);
+        } else {
+            trampoline_data.extend_from_slice(
+                &section_data[usize::try_from(syscall_inst_end - section_base_addr).unwrap()
+                    ..usize::try_from(replace_end - section_base_addr).unwrap()],
+            );
+        }
     }
 
     // Add jmp back to original after syscall
@@ -1030,12 +1044,4 @@ fn hook_syscall_and_after(
     }
 
     Ok(())
-}
-
-fn instruction_slice_has_ip_rel_memory_operand<'a>(
-    instructions: impl IntoIterator<Item = &'a iced_x86::Instruction>,
-) -> bool {
-    instructions
-        .into_iter()
-        .any(iced_x86::Instruction::is_ip_rel_memory_operand)
 }

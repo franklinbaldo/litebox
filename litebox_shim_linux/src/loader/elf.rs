@@ -177,7 +177,7 @@ impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
 
         // Try to parse an embedded trampoline. For pre-patched binaries this
         // succeeds and load_trampoline() will map it. For unpatched binaries
-        // (UnpatchedBinary error), the runtime mmap hook (Path 2) will patch
+        // (UnpatchedBinary error), the runtime patching during mmap will patch
         // code segments as they are mapped.
         if syscall_entry_point != 0 {
             match parsed.parse_trampoline(&mut &file, syscall_entry_point) {
@@ -199,11 +199,10 @@ impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
     ) -> Result<litebox_common_linux::loader::MappingInfo, ElfLoaderError> {
         let syscall_entry_point = self.file.task.global.platform.get_syscall_entry_point();
         // When the platform requires syscall rewriting but the binary has no
-        // embedded trampoline, reserve space (matching DEFAULT_RESERVED_SPACE_SIZE
-        // = 16 MiB used by ensure_space_after) so that brk starts past the
+        // embedded trampoline, reserve space so that brk starts past the
         // runtime trampoline region.
         let reserve = if syscall_entry_point != 0 && !self.parsed.has_trampoline() {
-            Some(0x100_0000) // 16 MiB
+            Some(litebox::mm::linux::DEFAULT_RESERVED_SPACE_SIZE)
         } else {
             None
         };
