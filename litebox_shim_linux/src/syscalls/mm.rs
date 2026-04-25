@@ -605,24 +605,17 @@ impl<FS: ShimFS> Task<FS> {
                 let tramp_addr = state.trampoline_addr;
                 let tramp_len = align_up(state.trampoline_file_size, PAGE_SIZE);
 
-                // Allocate RW region at the trampoline address.
-                let alloc_result = self
-                    .do_mmap_anonymous(
-                        Some(tramp_addr),
-                        tramp_len,
-                        ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                        MapFlags::MAP_ANONYMOUS
-                            | MapFlags::MAP_PRIVATE
-                            | MapFlags::MAP_FIXED_NOREPLACE,
-                    )
-                    .or_else(|_| {
-                        self.do_mmap_anonymous(
-                            Some(tramp_addr),
-                            tramp_len,
-                            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                            MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
-                        )
-                    });
+                // Allocate RW region at the trampoline address. Use MAP_FIXED
+                // because the code already contains JMPs to this exact address
+                // and we MUST map here. The region may already be reserved as
+                // PROT_NONE by the ElfLoader's reserve() call, which would
+                // cause MAP_FIXED_NOREPLACE to fail with EEXIST.
+                let alloc_result = self.do_mmap_anonymous(
+                    Some(tramp_addr),
+                    tramp_len,
+                    ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                    MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+                );
                 let Ok(alloc_ptr) = alloc_result else {
                     return false;
                 };
