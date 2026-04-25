@@ -708,8 +708,12 @@ impl<FS: ShimFS> Task<FS> {
             };
             let actual_addr = actual_addr_ptr.as_usize();
 
-            // Verify the trampoline is within JMP rel32 range (+-2GB) of the code.
-            let distance = actual_addr.abs_diff(addr_usize);
+            // Verify the trampoline is within JMP rel32 range (+-2GB) of the
+            // entire code segment, not just its start.
+            let far_end = addr_usize.saturating_add(len);
+            let distance = actual_addr
+                .abs_diff(addr_usize)
+                .max(actual_addr.abs_diff(far_end));
             if distance > 0x7FFF_0000 {
                 litebox_util_log::warn!(
                     distance:? = distance;
