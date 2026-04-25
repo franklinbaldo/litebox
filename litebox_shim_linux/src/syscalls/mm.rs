@@ -5,6 +5,7 @@
 //! Most of these syscalls which are not backed by files are implemented in [`litebox_common_linux::mm`].
 
 use alloc::collections::BTreeMap;
+use alloc::collections::BTreeSet;
 use litebox::{
     mm::linux::{MappingError, PAGE_SIZE, PageRange},
     platform::{
@@ -44,6 +45,9 @@ pub(crate) struct ElfPatchState {
     /// Whether any runtime-generated stubs were successfully linked from code
     /// in this fd to the trampoline.
     pub runtime_patches_committed: bool,
+    /// File offsets of segments that have already been patched. Guards against
+    /// double-patching if the same segment is re-mapped (e.g. MAP_FIXED).
+    pub patched_offsets: BTreeSet<usize>,
 }
 
 /// Per-process collection of ELF patching state, keyed by fd number.
@@ -528,6 +532,7 @@ impl<FS: ShimFS> Task<FS> {
             trampoline_mapped: false,
             trampoline_mapped_len: 0,
             runtime_patches_committed: false,
+            patched_offsets: BTreeSet::new(),
         });
     }
 
@@ -729,6 +734,13 @@ impl<FS: ShimFS> Task<FS> {
             state.trampoline_cursor = 8; // stubs start after the 8-byte entry
             state.trampoline_mapped = true;
             state.trampoline_mapped_len = PAGE_SIZE;
+        }
+
+        // Guard against double-patching the same segment (e.g. MAP_FIXED
+        // re-mapping). Feeding already-rewritten JMP instructions back into
+        // the rewriter would corrupt code.
+        if !state.patched_offsets.insert(offset) {
+            return true;
         }
 
         let restore_trampoline_rx = |task: &Self, state: &ElfPatchState| {
