@@ -132,8 +132,9 @@ impl<FS: ShimFS> Task<FS> {
                 let _ = self.sys_munmap(result, len);
                 return Err(MappingError::OutOfMemory);
             }
-        } else if offset == 0 {
-            // First mmap at offset 0: record the base address for later patching.
+        } else if !self.global.elf_patch_cache.lock().contains_key(&fd) {
+            // First mmap for this fd (non-exec): record patch state for later
+            // exec segment mappings.
             self.init_elf_patch_state(fd, result.as_usize());
         }
 
@@ -573,7 +574,9 @@ impl<FS: ShimFS> Task<FS> {
         syscall_entry: usize,
     ) -> bool {
         // Initialize patch state if this is the first mmap for this fd.
-        if offset == 0 {
+        // Typically the first mapping is at offset 0 (the ELF header), but
+        // some loaders may map an executable segment at a non-zero offset first.
+        if !self.global.elf_patch_cache.lock().contains_key(&fd) {
             self.init_elf_patch_state(fd, mapped_addr.as_usize());
         }
 
