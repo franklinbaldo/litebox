@@ -545,13 +545,23 @@ pub fn update_optee_msg_args(
             }
             TeeParamType::MemrefOutput | TeeParamType::MemrefInout => {
                 if let Ok(Some((addr, len))) = ta_params.get_values(index) {
+                    let original_buffer_size = match &ta_req_info.params[index] {
+                        UteeParamOwned::MemrefOutput { buffer_size }
+                        | UteeParamOwned::MemrefInout { buffer_size, .. } => *buffer_size,
+                        _ => return Err(OpteeSmcReturnCode::EBadAddr),
+                    };
+                    let copy_len: usize = len.truncate();
+                    if copy_len > original_buffer_size {
+                        return Err(OpteeSmcReturnCode::EBadAddr);
+                    }
+
                     // SAFETY
-                    // `addr` is expected to be a valid address of a TA and `addr + len` does not
+                    // `addr` is expected to be a valid address of a TA and `addr + copy_len` does not
                     // exceed the TA's memory region.
                     use litebox::platform::RawConstPointer;
                     let ptr = crate::UserConstPtr::<u8>::from_usize(addr.truncate());
                     let slice = ptr
-                        .to_owned_slice(len.truncate())
+                        .to_owned_slice(copy_len)
                         .ok_or(OpteeSmcReturnCode::EBadAddr)?;
 
                     // Update the output size in msg_args
