@@ -824,7 +824,9 @@ impl<FS: ShimFS> Task<FS> {
                             Some(extra_start),
                             extra_len,
                             ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                            MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+                            MapFlags::MAP_ANONYMOUS
+                                | MapFlags::MAP_PRIVATE
+                                | MapFlags::MAP_FIXED_NOREPLACE,
                         )
                         .is_err()
                     {
