@@ -477,15 +477,12 @@ impl<FS: ShimFS> Task<FS> {
             }
             let p_vaddr = u64::from_le_bytes(ph[16..24].try_into().unwrap());
             let p_memsz = u64::from_le_bytes(ph[40..48].try_into().unwrap());
-            let end = match p_vaddr.checked_add(p_memsz) {
-                Some(end) => end,
-                None => {
-                    litebox_util_log::warn!(
-                        p_vaddr:? = p_vaddr, p_memsz:? = p_memsz;
-                        "PT_LOAD p_vaddr + p_memsz overflow, skipping segment"
-                    );
-                    continue;
-                }
+            let Some(end) = p_vaddr.checked_add(p_memsz) else {
+                litebox_util_log::warn!(
+                    p_vaddr:? = p_vaddr, p_memsz:? = p_memsz;
+                    "PT_LOAD p_vaddr + p_memsz overflow, skipping segment"
+                );
+                continue;
             };
             if end > max_load_end {
                 max_load_end = end;
