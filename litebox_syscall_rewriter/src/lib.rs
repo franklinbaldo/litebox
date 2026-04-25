@@ -313,7 +313,8 @@ fn is_already_hooked(input_binary: &[u8]) -> bool {
         (header.file_offset, header.vaddr, header.trampoline_size);
 
     if trampoline_size == 0 {
-        return false;
+        // Size=0 sentinel: "checked by rewriter, no syscalls to patch."
+        return true;
     }
     if file_offset % 0x1000 != 0 {
         return false;
