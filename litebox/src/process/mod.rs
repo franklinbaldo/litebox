@@ -163,17 +163,14 @@ struct ProcessEntry<Platform: RawSyncPrimitivesProvider> {
 /// `ProcessRegistry` is parameterized on a platform type for mutex support.
 pub struct ProcessRegistry<Platform: RawSyncPrimitivesProvider> {
     inner: Mutex<Platform, RegistryInner<Platform>>,
-    /// Futex-like primitive: value is `exit_epoch`. Woken on every child exit
-    /// so that blocking `wait_for_any_child_exit` can unblock.
+    /// Futex-like primitive: incremented on every child exit so that
+    /// blocking `wait_for_child_exit_since` can unblock.
     exit_event: <Platform as crate::platform::RawMutexProvider>::RawMutex,
 }
 
 struct RegistryInner<Platform: RawSyncPrimitivesProvider> {
     processes: HashMap<ProcessId, ProcessEntry<Platform>>,
     next_pid: u32,
-    /// Counter incremented on every process exit. Used with `exit_event` futex
-    /// so that `wait_for_any_child_exit` can block efficiently.
-    exit_epoch: u32,
     /// Maximum number of processes allowed. 0 means unlimited.
     max_processes: usize,
 }
@@ -197,7 +194,6 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
             inner: Mutex::new(RegistryInner {
                 processes: HashMap::new(),
                 next_pid: 1,
-                exit_epoch: 0,
                 max_processes,
             }),
             exit_event: <Platform as crate::platform::RawMutexProvider>::RawMutex::INIT,
@@ -282,6 +278,15 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
         Ok(pid)
     }
 
+    /// Ensure the next PID will be at least `min_pid`.
+    /// Used to keep PIDs and TIDs in disjoint ranges when they share a namespace.
+    pub fn advance_next_pid(&self, min_pid: u32) {
+        let mut inner = self.inner.lock();
+        if inner.next_pid < min_pid {
+            inner.next_pid = min_pid;
+        }
+    }
+
     /// Remove a process that was created but never started (e.g., child setup
     /// failed after PID allocation).
     ///
@@ -354,9 +359,6 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
                     None
                 }
             });
-
-            // Bump the exit epoch so blocking waiters unblock.
-            inner.exit_epoch = inner.exit_epoch.wrapping_add(1);
         }
         // Wake any threads blocked in wait_for_any_child_exit.
         self.exit_event
@@ -507,12 +509,13 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
     /// `target` selects which children to consider:
     /// - `> 0`: only the child with that specific PID
     /// - `-1`: any child
-    /// - `0` / other negative: not yet supported (returns `None`)
+    /// - `0`: any child in the caller's process group
+    /// - `< -1`: any child in process group `|target|`
     ///
     /// If a matching exited child is found, it is reaped (removed from the
-    /// registry) and `Some((child_pid, exit_status))` is returned.
-    /// Returns `None` if no matching exited child exists.
-    /// Returns `Some(Err(()))` if the parent has no children matching `target`
+    /// registry) and `Ok(Some((child_pid, exit_status)))` is returned.
+    /// Returns `Ok(None)` if matching children exist but none have exited yet.
+    /// Returns `Err(())` if the parent has no children matching `target`
     /// (i.e., ECHILD condition).
     pub fn try_wait(&self, parent: ProcessId, target: i32) -> Result<Option<(ProcessId, u32)>, ()> {
         let mut inner = self.inner.lock();
@@ -614,11 +617,23 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
         Ok(found)
     }
 
+    /// Snapshot the current exit epoch. Used with `wait_for_child_exit_since`
+    /// to implement the standard futex pattern: snapshot, check, block-on-snapshot.
+    pub fn exit_epoch(&self) -> u32 {
+        self.exit_event.underlying_atomic().load(Ordering::Acquire)
+    }
+
+    /// Block until a child exit occurs after the given epoch snapshot.
+    /// The caller should call `exit_epoch()` BEFORE `try_wait()`, then
+    /// pass the snapshot here if `try_wait` returned `Ok(None)`.
+    pub fn wait_for_child_exit_since(&self, epoch: u32) {
+        let _ = self.exit_event.block(epoch);
+    }
+
     /// Block until any child exit occurs (or return immediately if one has
     /// happened since the last call). Used by blocking wait4.
     pub fn wait_for_any_child_exit(&self) {
         let epoch = self.exit_event.underlying_atomic().load(Ordering::Acquire);
-        // Block until the epoch changes (i.e., a new exit has been recorded).
         let _ = self.exit_event.block(epoch);
     }
 

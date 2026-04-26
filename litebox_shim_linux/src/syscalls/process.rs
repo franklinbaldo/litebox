@@ -678,6 +678,10 @@ impl<FS: ShimFS> Task<FS> {
             // Pick up any cross-process signals (e.g., SIGCHLD from exiting children).
             self.drain_cross_process_signals();
 
+            // Snapshot the exit epoch BEFORE try_wait to avoid a race where a
+            // child exits between try_wait and the blocking call.
+            let epoch = self.global.process_registry.exit_epoch();
+
             match self.global.process_registry.try_wait(parent_pid, pid) {
                 Err(()) => {
                     // No matching children at all — ECHILD.
@@ -695,11 +699,11 @@ impl<FS: ShimFS> Task<FS> {
                     if options & WNOHANG != 0 {
                         return Ok(0);
                     }
-                    // Block: sleep briefly and retry. This is a simple poll loop.
-                    // A proper implementation would use ExitSubject observers,
-                    // but for the minimal multi-process support this suffices.
-                    // Block until some child exits.
-                    self.global.process_registry.wait_for_any_child_exit();
+                    // Block until some child exits (using epoch snapshot from
+                    // before try_wait to avoid missed wakeups).
+                    self.global
+                        .process_registry
+                        .wait_for_child_exit_since(epoch);
                 }
             }
         }
@@ -843,11 +847,12 @@ impl<FS: ShimFS> Task<FS> {
             .map_err(|_| Errno::EAGAIN)?;
         let child_pid = child_process_id.as_u32().cast_signed();
 
-        // Advance the thread ID counter past the child PID to avoid collisions.
+        // Advance the thread ID counter past the child PID to avoid collisions
+        // between PIDs and TIDs. Use saturating_add to prevent overflow.
         let _ = self
             .global
             .next_thread_id
-            .fetch_max(child_pid + 1, Ordering::Relaxed);
+            .fetch_max(child_pid.saturating_add(1), Ordering::Relaxed);
 
         // Clone the FD table for the child, incrementing fork_refcounts in the global descriptor table.
         let child_files = {
@@ -863,8 +868,8 @@ impl<FS: ShimFS> Task<FS> {
                 .global
                 .platform
                 .get_punchthrough_token_for(punchthrough)
-                .expect("Failed to get punchthrough token for GET_FS");
-            token.execute().unwrap()
+                .ok_or(Errno::ENOSYS)?;
+            token.execute().map_err(|_| Errno::EFAULT)?
         };
 
         // Create the vfork synchronization.
@@ -1033,6 +1038,10 @@ impl<FS: ShimFS> Task<FS> {
         };
 
         let child_tid = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);
+        // Keep PID counter in sync with TID counter to avoid namespace collisions.
+        self.global
+            .process_registry
+            .advance_next_pid(child_tid.saturating_add(1).cast_unsigned());
         if let Some(parent_tid_ptr) = set_parent_tid {
             let _ = parent_tid_ptr.write_at_offset(0, child_tid);
         }
