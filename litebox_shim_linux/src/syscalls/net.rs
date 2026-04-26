@@ -751,8 +751,8 @@ impl<FS: ShimFS> GlobalState<FS> {
         let is_nonblock =
             self.get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT);
 
-        let ret = cx
-            .with_timeout(timeout)
+        // Note: SIGPIPE is sent at the Task level (do_sendto/sys_sendmsg)
+        cx.with_timeout(timeout)
             .wait_on_events(
                 is_nonblock,
                 Events::OUT,
@@ -766,9 +766,8 @@ impl<FS: ShimFS> GlobalState<FS> {
                     Err(e) => Err(TryOpError::Other(Errno::from(e))),
                 },
             )
-            .map_err(Errno::from);
+            .map_err(Errno::from)
         // Note: SIGPIPE is sent at the Task level (do_sendto/sys_sendmsg)
-        ret
     }
 
     /// Receive data via socket channel (lock-free path).

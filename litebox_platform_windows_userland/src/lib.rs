@@ -335,8 +335,8 @@ impl litebox::platform::Provider for WindowsUserland {}
 
 impl litebox::platform::AddressSpaceProvider for WindowsUserland {
     type AddressSpaceId = u32;
-    const ADDRESS_SPACE_KIND: litebox::platform::AddressSpaceKind =
-        litebox::platform::AddressSpaceKind::SharedMemory;
+    const ADDRESS_SPACE_KIND: litebox::platform::address_space::AddressSpaceKind =
+        litebox::platform::address_space::AddressSpaceKind::SharedMemory;
 }
 
 impl litebox::platform::SignalProvider for WindowsUserland {

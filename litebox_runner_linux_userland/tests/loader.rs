@@ -100,8 +100,12 @@ impl TestLauncher {
         ];
         let fs = std::sync::Arc::new(self.fs);
         let shim = self.shim_builder.build();
+        let mut task = self.platform.init_task();
+        // Use deterministic guest PID 1 (init) to match process registry.
+        task.pid = 1;
+        task.ppid = 0;
         let program = shim
-            .load_program(fs, self.platform.init_task(), executable_path, argv, envp)
+            .load_program(fs, task, executable_path, argv, envp)
             .unwrap();
         unsafe {
             litebox_platform_linux_userland::run_thread(
