@@ -537,7 +537,37 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
                 }
                 result
             }
-            _ => return Err(()), // process groups not supported
+            0 => {
+                // Wait for any child in the caller's process group.
+                let caller_pgid = parent_entry.context.pgid;
+                let mut result = None;
+                for &child_pid in &children {
+                    if let Some(entry) = inner.processes.get(&child_pid)
+                        && entry.context.pgid == caller_pgid
+                        && let ProcessState::Exited(status) = entry.context.state
+                    {
+                        result = Some((child_pid, status));
+                        break;
+                    }
+                }
+                result
+            }
+            t if t < -1 => {
+                // Wait for any child in process group |t|.
+                let pgid = ProcessId((-t).cast_unsigned());
+                let mut result = None;
+                for &child_pid in &children {
+                    if let Some(entry) = inner.processes.get(&child_pid)
+                        && entry.context.pgid == pgid
+                        && let ProcessState::Exited(status) = entry.context.state
+                    {
+                        result = Some((child_pid, status));
+                        break;
+                    }
+                }
+                result
+            }
+            _ => return Err(()),
         };
 
         // Reap the child if found
