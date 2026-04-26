@@ -1718,6 +1718,40 @@ fn parse_shebang(buf: &[u8]) -> Option<(&str, Option<&str>)> {
 }
 
 impl<FS: ShimFS> Task<FS> {
+    /// Search $PATH for a binary name (no '/' in path).
+    /// Returns the full path if found, or ENOENT.
+    fn resolve_path_lookup(
+        &self,
+        name: &str,
+        envp: &[alloc::ffi::CString],
+    ) -> Result<alloc::string::String, Errno> {
+        let path_env = envp
+            .iter()
+            .find_map(|e| {
+                let s = e.to_str().ok()?;
+                s.strip_prefix("PATH=")
+            })
+            .unwrap_or("/usr/bin:/bin");
+
+        for dir in path_env.split(':') {
+            let candidate = if dir.is_empty() {
+                alloc::format!("./{name}")
+            } else {
+                alloc::format!("{dir}/{name}")
+            };
+            // Check if the file exists by trying to open it.
+            if let Ok(fd) = self.sys_open(
+                candidate.as_str(),
+                litebox::fs::OFlags::RDONLY,
+                litebox::fs::Mode::empty(),
+            ) {
+                let _ = self.do_close(fd as usize);
+                return Ok(candidate);
+            }
+        }
+        Err(Errno::ENOENT)
+    }
+
     /// Resolve shebang (`#!`) chains for the given path and argv if the file starts with a shebang line.
     /// Otherwise, returns the original path and argv.
     pub(crate) fn resolve_shebang(
@@ -1843,6 +1877,13 @@ impl<FS: ShimFS> Task<FS> {
         };
 
         let (path, argv_vec) = self.resolve_shebang(alloc::string::String::from(path), argv_vec)?;
+
+        // PATH resolution: if path doesn't contain '/', search $PATH.
+        let path = if !path.contains('/') {
+            self.resolve_path_lookup(&path, &envp_vec)?
+        } else {
+            path
+        };
 
         let loader = crate::loader::elf::ElfLoader::new(self, &path)?;
 
